@@ -1,6 +1,6 @@
 # NNtrainer
 
-[![Code Coverage](http://ec2-54-180-96-14.ap-northeast-2.compute.amazonaws.com/nntrainer/ci/badge/codecoverage.svg)](http://ec2-54-180-96-14.ap-northeast-2.compute.amazonaws.com/nntrainer/ci/gcov_html/index.html)
+<img src="https://ec2-54-180-96-14.ap-northeast-2.compute.amazonaws.com/nntrainer/ci/badge/codecoverage.svg?branch=master&kill_cache=1" />
 
 NNtrainer is Software Framework for Training Neural Network Models on Devices.
 
