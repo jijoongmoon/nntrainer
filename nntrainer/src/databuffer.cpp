@@ -348,6 +348,7 @@ int DataBuffer::setClassNum(unsigned int num) {
     SET_VALIDATION(false);
     return ML_ERROR_INVALID_PARAMETER;
   }
+  std::cout << class_num << " class: " <<num << std::endl;
   class_num = num;
   return status;
 }

@@ -429,7 +429,7 @@ int main(int argc, char *argv[]) {
   NN.init();
   NN.readModel();
 
-  int status = NN.train();
+  int status = NN.train_run();
 
   if (!TRAINING) {
     std::string img = data_path;

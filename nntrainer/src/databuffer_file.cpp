@@ -68,13 +68,13 @@ static long getFileSize(std::string file_name) {
 int DataBufferFromDataFile::init() {
 
   int status = ML_ERROR_NONE;
-
+  std::cout << "---- "<<class_num<< std::endl;
   if (!class_num) {
     ml_loge("Error: number of class must be set");
     SET_VALIDATION(false);
     return ML_ERROR_INVALID_PARAMETER;
   }
-
+  std::cout << "---- "<<input_size<< std::endl;
   if (!this->input_size) {
     ml_loge("Error: featuer size must be set");
     SET_VALIDATION(false);
@@ -84,13 +84,13 @@ int DataBufferFromDataFile::init() {
   this->cur_train_bufsize = 0;
   this->cur_val_bufsize = 0;
   this->cur_test_bufsize = 0;
-
+  std::cout << "---- "<<mini_batch<< std::endl;
   if (mini_batch == 0) {
     ml_loge("Error: mini batch size must be greater than 0");
     SET_VALIDATION(false);
     return ML_ERROR_INVALID_PARAMETER;
   }
-
+  std::cout << "---- "<<validation[0] << ":"<<validation[1] <<":"<< validation[2]<< ":"<<validation[3]<<std::endl;
   this->rest_train = max_train;
   this->rest_val = max_val;
   this->rest_test = max_test;
@@ -123,6 +123,8 @@ void DataBufferFromDataFile::updateData(BufferType type, int &status) {
     running = &train_running;
     data = &train_data;
     datalabel = &train_data_label;
+    std::cout << "type : "<< train_name <<std::endl;
+    
     std::ifstream train_stream(train_name, std::ios::in | std::ios::binary);
     file.swap(train_stream);
   } break;
@@ -134,6 +136,7 @@ void DataBufferFromDataFile::updateData(BufferType type, int &status) {
     running = &val_running;
     data = &val_data;
     datalabel = &val_data_label;
+    std::cout << "type : "<< val_name <<std::endl;    
     std::ifstream val_stream(val_name, std::ios::in | std::ios::binary);
     file.swap(val_stream);
   } break;
@@ -145,6 +148,7 @@ void DataBufferFromDataFile::updateData(BufferType type, int &status) {
     running = &test_running;
     data = &test_data;
     datalabel = &test_data_label;
+    std::cout << "type : "<< test_name <<std::endl;        
     std::ifstream test_stream(test_name, std::ios::in | std::ios::binary);
     file.swap(test_stream);
   } break;
@@ -169,7 +173,8 @@ void DataBufferFromDataFile::updateData(BufferType type, int &status) {
   for (unsigned int i = 0; i < max_size; ++i) {
     mark[i] = i;
   }
-
+  std::cout << " type : "<< type <<" : " << max_size <<" : "<< *running<< std::endl;
+  std::cout << " type : " <<buf_size <<" = "<<  (*cur_size) <<" = "<< (*rest_size) << std::endl;
   while ((*running) && mark.size() != 0) {
     if (buf_size - (*cur_size) > 0 && (*rest_size) > 0) {
       std::vector<float> vec;
@@ -241,6 +246,7 @@ int DataBufferFromDataFile::setDataFile(std::string path, DataType type) {
 
   switch (type) {
   case DATA_TRAIN: {
+    validation[type] = true;
     if (!data_file.good()) {
       ml_loge(
         "Error: Cannot open data file, Datafile is necessary for training");
@@ -250,6 +256,7 @@ int DataBufferFromDataFile::setDataFile(std::string path, DataType type) {
     train_name = path;
   } break;
   case DATA_VAL: {
+    validation[type] = true;    
     if (!data_file.good()) {
       ml_logw("Warning: Cannot open validation data file. Cannot validate "
               "training result");
@@ -259,6 +266,7 @@ int DataBufferFromDataFile::setDataFile(std::string path, DataType type) {
     val_name = path;
   } break;
   case DATA_TEST: {
+    validation[type] = true;
     if (!data_file.good()) {
       ml_logw(
         "Warning: Cannot open test data file. Cannot test training result");
@@ -269,6 +277,7 @@ int DataBufferFromDataFile::setDataFile(std::string path, DataType type) {
   } break;
   case DATA_LABEL: {
     std::string data;
+    validation[type] = true;    
     if (!data_file.good()) {
       ml_loge("Error: Cannot open label file");
       SET_VALIDATION(false);
@@ -335,7 +344,7 @@ int DataBufferFromDataFile::setFeatureSize(unsigned int size) {
   } else {
     max_test = 0;
   }
-
+  std::cout << max_train << "   "<<max_val << "   "<<max_test << std::endl;
   return status;
 }
 
