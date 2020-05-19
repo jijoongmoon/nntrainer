@@ -638,6 +638,20 @@ int NeuralNetwork::train(
   std::function<bool(float *, float *, int *)> val_func,
   std::function<bool(float *, float *, int *)> test_func) {
 
+  std::vector<std::string> values;
+
+  return train(train_func, val_func, test_func, values);
+}
+
+/**
+ * @brief     Run NeuralNetwork train
+ */
+int NeuralNetwork::train(
+  std::function<bool(float *, float *, int *)> train_func,
+  std::function<bool(float *, float *, int *)> val_func,
+  std::function<bool(float *, float *, int *)> test_func,
+  std::vector<std::string> values) {
+
   int status = ML_ERROR_NONE;
 
   if (data_buffer == nullptr) {
