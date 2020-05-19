@@ -78,7 +78,7 @@ public:
    * @brief     Set Optimizer
    * @retval    Optimizer
    */
-  void setOptimizer(Optimizer optimizer) { opt = optimizer; };
+  void setOptimizer(std::shared_ptr<Optimizer> optimizer) { opt = optimizer; };
 
   /**
    * @brief     Get Learning rate
@@ -117,7 +117,7 @@ public:
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
   int init(std::shared_ptr<Optimizer> optimizer,
-              std::vector<std::string> arg_list);
+           std::vector<std::string> arg_list);
 
   /**
    * @brief     forward propagation
@@ -296,7 +296,7 @@ private:
   /**
    * @brief     Optimizer
    */
-  Optimizer opt;
+  std::shared_ptr<Optimizer> opt;
 
   /**
    * @brief     Network Type
@@ -311,7 +311,7 @@ private:
   /**
    * @brief     Data Buffer to get Input
    */
-  std::shared_ptr<DataBuffer>data_buffer;
+  std::shared_ptr<DataBuffer> data_buffer;
 };
 
 } /* namespace nntrainer */

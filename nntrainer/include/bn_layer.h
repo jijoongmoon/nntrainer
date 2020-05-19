@@ -94,7 +94,7 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
-  int setOptimizer(Optimizer &opt);
+  int setOptimizer(std::shared_ptr<Optimizer> opt);
 
   /**
    * @brief     copy layer

@@ -289,16 +289,17 @@ TEST(nntrainer_InputLayer, setOptimizer_01_p) {
   int status = ML_ERROR_NONE;
   nntrainer::InputLayer layer;
   status = layer.initialize(1, 1, 1, false, true);
-  nntrainer::Optimizer op;
+  std::shared_ptr<nntrainer::Optimizer> op =
+    std::make_shared<nntrainer::Optimizer>();
   nntrainer::OptType t = nntrainer::OptType::adam;
   nntrainer::OptParam p;
-  status = op.setType(t);
+  status = op->setType(t);
   EXPECT_EQ(status, ML_ERROR_NONE);
   p.learning_rate = 0.001;
   p.beta1 = 0.9;
   p.beta2 = 0.9999;
   p.epsilon = 1e-7;
-  status = op.setOptParam(p);
+  status = op->setOptParam(p);
   EXPECT_EQ(status, ML_ERROR_NONE);
   status = layer.setOptimizer(op);
   EXPECT_EQ(status, ML_ERROR_NONE);
@@ -404,16 +405,17 @@ TEST(nntrainer_FullyConnectedLayer, setOptimizer_01_p) {
   int status = ML_ERROR_NONE;
   nntrainer::FullyConnectedLayer layer;
   status = layer.initialize(1, 1, 1, false, true);
-  nntrainer::Optimizer op;
+  std::shared_ptr<nntrainer::Optimizer> op =
+    std::make_shared<nntrainer::Optimizer>();
   nntrainer::OptType t = nntrainer::OptType::adam;
   nntrainer::OptParam p;
-  status = op.setType(t);
+  status = op->setType(t);
   EXPECT_EQ(status, ML_ERROR_NONE);
   p.learning_rate = 0.001;
   p.beta1 = 0.9;
   p.beta2 = 0.9999;
   p.epsilon = 1e-7;
-  status = op.setOptParam(p);
+  status = op->setOptParam(p);
   EXPECT_EQ(status, ML_ERROR_NONE);
   status = layer.setOptimizer(op);
   EXPECT_EQ(status, ML_ERROR_NONE);
@@ -426,16 +428,17 @@ TEST(nntrainer_FullyConnectedLayer, setOptimizer_02_p) {
   int status = ML_ERROR_NONE;
   nntrainer::FullyConnectedLayer layer;
   status = layer.initialize(1, 1, 1, true, true);
-  nntrainer::Optimizer op;
+  std::shared_ptr<nntrainer::Optimizer> op =
+    std::make_shared<nntrainer::Optimizer>();
   nntrainer::OptType t = nntrainer::OptType::adam;
   nntrainer::OptParam p;
-  status = op.setType(t);
+  status = op->setType(t);
   EXPECT_EQ(status, ML_ERROR_NONE);
   p.learning_rate = 0.001;
   p.beta1 = 0.9;
   p.beta2 = 0.9999;
   p.epsilon = 1e-7;
-  status = op.setOptParam(p);
+  status = op->setOptParam(p);
   EXPECT_EQ(status, ML_ERROR_NONE);
   status = layer.setOptimizer(op);
   EXPECT_EQ(status, ML_ERROR_NONE);
@@ -522,16 +525,17 @@ TEST(nntrainer_BatchNormalizationLayer, setOptimizer_01_p) {
   int status = ML_ERROR_NONE;
   nntrainer::BatchNormalizationLayer layer;
   status = layer.initialize(1, 1, 1, 0, true);
-  nntrainer::Optimizer op;
+  std::shared_ptr<nntrainer::Optimizer> op =
+    std::make_shared<nntrainer::Optimizer>();
   nntrainer::OptType t = nntrainer::OptType::adam;
   nntrainer::OptParam p;
-  status = op.setType(t);
+  status = op->setType(t);
   EXPECT_EQ(status, ML_ERROR_NONE);
   p.learning_rate = 0.001;
   p.beta1 = 0.9;
   p.beta2 = 0.9999;
   p.epsilon = 1e-7;
-  status = op.setOptParam(p);
+  status = op->setOptParam(p);
   EXPECT_EQ(status, ML_ERROR_NONE);
   status = layer.setOptimizer(op);
   EXPECT_EQ(status, ML_ERROR_NONE);

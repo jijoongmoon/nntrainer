@@ -99,7 +99,7 @@ NeuralNetwork::NeuralNetwork() {
   cost = COST_UNKNOWN;
   weight_ini = WEIGHT_UNKNOWN;
   net_type = NET_UNKNOWN;
-  data_buffer = NULL;
+  data_buffer = nullptr;
   config = "";
 }
 
@@ -171,7 +171,9 @@ int NeuralNetwork::init() {
   popt.decay_steps = decay_steps;
   popt.decay_rate = decay_rate;
   epoch = iniparser_getint(ini, "Network:Epoch", 100);
-  status = opt.setType((OptType)parseType(
+
+  opt = std::make_shared<Optimizer>();
+  status = opt->setType((OptType)parseType(
     iniparser_getstring(ini, "Network:Optimizer", unknown), TOKEN_OPT));
   NN_INI_RETURN_STATUS();
 
@@ -184,7 +186,7 @@ int NeuralNetwork::init() {
   popt.beta2 = iniparser_getdouble(ini, "Network:beta2", 0.0);
   popt.epsilon = iniparser_getdouble(ini, "Network:epsilon", 0.0);
 
-  status = opt.setOptParam(popt);
+  status = opt->setOptParam(popt);
   NN_INI_RETURN_STATUS();
 
   for (unsigned int i = 0; i < layers_name.size(); i++)
@@ -448,7 +450,7 @@ int NeuralNetwork::init(std::shared_ptr<Optimizer> optimizer,
                         std::vector<std::string> arg_list) {
   int status = ML_ERROR_NONE;
   bool last = false;
-  opt = *optimizer.get();
+  opt = optimizer;
   status = setProperty(arg_list);
   NN_RETURN_STATUS();
 

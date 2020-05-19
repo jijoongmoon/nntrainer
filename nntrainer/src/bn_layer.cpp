@@ -61,9 +61,9 @@ int BatchNormalizationLayer::initialize(int b, int h, int w, bool last,
   return status;
 }
 
-int BatchNormalizationLayer::setOptimizer(Optimizer &opt) {
-  this->opt.setType(opt.getType());
-  this->opt.setOptParam(opt.getOptParam());
+int BatchNormalizationLayer::setOptimizer(std::shared_ptr<Optimizer> opt) {
+  this->opt.setType(opt->getType());
+  this->opt.setOptParam(opt->getOptParam());
 
   this->epsilon = 0.0;
   return this->opt.initialize(dim.height(), dim.width(), false);

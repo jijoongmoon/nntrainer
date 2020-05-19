@@ -68,9 +68,9 @@ int Layer::setActivation(ActiType acti) {
   return status;
 }
 
-int Layer::setOptimizer(Optimizer &opt) {
-  this->opt.setType(opt.getType());
-  this->opt.setOptParam(opt.getOptParam());
+int Layer::setOptimizer(std::shared_ptr<Optimizer> opt) {
+  this->opt.setType(opt->getType());
+  this->opt.setOptParam(opt->getOptParam());
 
   return this->opt.initialize(dim.height(), dim.width(), true);
 }

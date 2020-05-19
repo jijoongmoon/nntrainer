@@ -165,7 +165,7 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
-  virtual int setOptimizer(Optimizer &opt);
+  virtual int setOptimizer(std::shared_ptr<Optimizer> opt);
 
   /**
    * @brief     Activation Setter

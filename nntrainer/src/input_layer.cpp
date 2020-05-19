@@ -28,9 +28,9 @@
 
 namespace nntrainer {
 
-int InputLayer::setOptimizer(Optimizer &opt) {
-  this->opt.setType(opt.getType());
-  this->opt.setOptParam(opt.getOptParam());
+int InputLayer::setOptimizer(std::shared_ptr<Optimizer> opt) {
+  this->opt.setType(opt->getType());
+  this->opt.setOptParam(opt->getOptParam());
 
   return this->opt.initialize(dim.height(), dim.width(), false);
 }

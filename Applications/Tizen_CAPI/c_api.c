@@ -93,7 +93,7 @@ main (int argc, char *argv[])
 
   /* train model with data files : epochs = 10 and store model file named "model.bin" */
   status =
-      ml_nnmodel_train_with_file (model, "epochs=10", "batch_size=32",
+      ml_nnmodel_train_with_file (model, "epochs=2", "batch_size=32",
       "train_data=trainingSet.dat", "val_data=trainingSet.dat",
       "label_data=label.dat", "buffer_size=100", "model_file=model.bin", NULL);
   NN_RETURN_STATUS ();
