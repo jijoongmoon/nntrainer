@@ -85,6 +85,8 @@ Tensor Layer::initializeWeight(TensorDim w_dim, WeightIniType init_type,
                                int &status) {
 
   Tensor w = Tensor(w_dim);
+  w.setZero();
+  return w;
 
   if (init_type == WEIGHT_UNKNOWN) {
     ml_logw("Warning: Weight Initalization Type is not set. "

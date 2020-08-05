@@ -433,23 +433,23 @@ int Tensor::divide_i(Tensor const &m) {
     for (k = 0; k < dim.batch(); ++k) {
       unsigned int b = k * dim.getFeatureLen();
       for (i = 0; i < e * 4; i += 4) {
-        data[b + i + 0] /= mdata[i + 0];
-        data[b + i + 1] /= mdata[i + 1];
-        data[b + i + 2] /= mdata[i + 2];
-        data[b + i + 3] /= mdata[i + 3];
+        data[b + i + 0] /= (mdata[i + 0]+1.0e-20);
+        data[b + i + 1] /= (mdata[i + 1]+1.0e-20);
+        data[b + i + 2] /= (mdata[i + 2]+1.0e-20);
+        data[b + i + 3] /= (mdata[i + 3]+1.0e-20);
       }
       for (unsigned int j = i; j < dim.getFeatureLen(); ++j)
         data[b + j] /= mdata[j];
     }
   } else {
     for (i = 0; i < end * 4; i += 4) {
-      data[i + 0] /= mdata[i + 0];
-      data[i + 1] /= mdata[i + 1];
-      data[i + 2] /= mdata[i + 2];
-      data[i + 3] /= mdata[i + 3];
+      data[i + 0] /= (mdata[i + 0]+1.0e-20);
+      data[i + 1] /= (mdata[i + 1]+1.0e-20);
+      data[i + 2] /= (mdata[i + 2]+1.0e-20);
+      data[i + 3] /= (mdata[i + 3]+1.0e-20);
     }
     for (j = i; j < len; ++j)
-      data[j] /= mdata[j];
+      data[j] /= (mdata[j]+1.0e-20);
   }
 
   return ML_ERROR_NONE;
@@ -805,7 +805,7 @@ void Tensor::print(std::ostream &out) const {
 
   out << dim;
 
-  if (len > 100) {
+  if (len > 100000000) {
     out << '[' << data[0] << ' ' << data[1] << ' ' << data[2] << " ... "
         << data[len - 3] << ' ' << data[len - 2] << ' ' << data[len - 1] << ']'
         << std::endl;

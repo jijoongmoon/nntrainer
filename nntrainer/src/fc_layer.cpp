@@ -138,7 +138,11 @@ sharedConstTensor FullyConnectedLayer::backwarding(sharedConstTensor derivative,
                     weight_decay.lambda)
            .run()
            .sum(0);
-
+  // std::cout <<"tf_logit ======================="<<std::endl;
+  // std::cout << hidden << std::endl;
+  // std::cout <<"bias of fc / grad & weight ======================="<<std::endl;
+  // std::cout << djdb << std::endl;
+  // std::cout << paramsAt(bias_idx).weight << std::endl;
   if (trainable) {
     opt.apply_gradients(params, param_size, iteration);
   }

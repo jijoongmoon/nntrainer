@@ -138,7 +138,7 @@ void ActivationLayer::setActivation(ActiType acti_type) {
     this->setActivation(relu, reluPrime);
     break;
   case ActiType::ACT_NONE:
-    this->setActivation(no_op, no_op);
+    this->setActivation(no_op, no_op_prime);
     break;
   case ActiType::ACT_UNKNOWN:
   default:
@@ -183,7 +183,7 @@ Tensor ActivationLayer::softmax(Tensor const &t) {
     }
 
     // shiftx
-    float sum = 0.0f;
+    float sum = 1.0e-20;
     for (int c = 0; c < channel; c++) {
       for (int i = 0; i < height; i++) {
         for (int j = 0; j < width; j++) {
@@ -282,4 +282,6 @@ float ActivationLayer::reluPrime(float x) {
 }
 
 float ActivationLayer::no_op(float x) { return x; }
+
+float ActivationLayer::no_op_prime(float x) { return 1.0f; }
 }; // namespace nntrainer
