@@ -90,25 +90,68 @@ sharedConstTensor Conv2DLayer::forwarding(sharedConstTensor in) {
   hidden_dim.batch(in->batch());
   hidden = Tensor(hidden_dim);
   hidden.setZero();
+  TensorDim kdim(filter_size, input_dim.channel(), kernel_size[0],
+                 kernel_size[1]);
 
-  std::vector<float> output(output_dim.width() * output_dim.height());
+  // std::vector<float> output(output_dim.width() * output_dim.height());
+  std::vector<float> inCol(kdim.getFeatureLen() * output_dim.width() *
+                           output_dim.height());
+
+  std::vector<float> imKernel(kdim.getFeatureLen()*filter_size);
+
+  std::vector<float> out(filter_size * output_dim.width() *
+                            output_dim.height());
+
+  for (unsigned int i = 0; i < filter_size; ++i) {
+    Tensor &filters = paramsAt(i).weight;
+    float * d = imKernel.data();
+    memcpy(&d[i * kdim.getFeatureLen()], filters.getData(),
+	   kdim.getFeatureLen() * sizeof(float));
+  }
 
   for (unsigned int b = 0; b < input.batch(); ++b) {
     Tensor in_padded = zero_pad(b, input, padding);
+    status = im2col(in_padded, kdim, inCol.data(), inCol.size());
+    if (status != ML_ERROR_NONE)
+      throw std::runtime_error("Forwarding Convolution failed.");
 
-    for (unsigned int i = 0; i < filter_size; ++i) {
-      Tensor &filters = paramsAt(i).weight;
+    float alpha_dgemm = 1.0f;
+    float beta_dgemm = 0.0f;
+    const float *data = imKernel.data();
+    const float *mdata = inCol.data();
+    float *rdata = out.data();
+    memset(rdata, 0, out.size() * sizeof(out[0]));
+
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, filter_size,
+                output_dim.width() * output_dim.height(), kdim.getFeatureLen(),
+                alpha_dgemm, data, kdim.getFeatureLen(), mdata,
+                output_dim.width() * output_dim.height(), beta_dgemm, rdata,
+                output_dim.width() * output_dim.height());
+
+    memcpy(hidden.getAddress(b * hidden.getDim().getFeatureLen()), rdata,
+           out.size() * sizeof(float));
+
+    for (unsigned int i = 0; i < filter_size; i++) {
       Tensor &bias = paramsAt(i + filter_size).weight;
-      status = conv2d(in_padded.getData(), in_padded.getDim(),
-                      filters.getData(), filters.getDim(), output.data(),
-                      stride, bias.getValue(0, 0, 0, 0));
-      if (status != ML_ERROR_NONE)
-        throw std::runtime_error("Forwarding Convolution failed.");
-
-      memcpy(hidden.getAddress(b * hidden.getDim().getFeatureLen() +
-                               i * hidden.height() * hidden.width()),
-             output.data(), output.size() * sizeof(float));
+      Tensor tmp(1, 1, hidden.height(), hidden.width());
+      tmp.setValue(bias.getValue(0, 0, 0, 0));
+      cblas_saxpy(hidden.height() * hidden.width(), 1, tmp.getData(), 1,
+                  hidden.getAddress(i * hidden.height() * hidden.width()), 1);
     }
+
+    // for (unsigned int i = 0; i < filter_size; ++i) {
+    //   Tensor &filters = paramsAt(i).weight;
+    //   Tensor &bias = paramsAt(i + filter_size).weight;
+    //   status = conv2d(in_padded.getData(), in_padded.getDim(),
+    //                   filters.getData(), filters.getDim(), output.data(),
+    //                   stride, bias.getValue(0, 0, 0, 0));
+    //   if (status != ML_ERROR_NONE)
+    //     throw std::runtime_error("Forwarding Convolution failed.");
+
+    //   memcpy(hidden.getAddress(b * hidden.getDim().getFeatureLen() +
+    //                            i * hidden.height() * hidden.width()),
+    //          output.data(), output.size() * sizeof(float));
+    // }
   }
 
   loss = 0.0f;
@@ -370,6 +413,48 @@ int Conv2DLayer::conv2d(float *in, TensorDim indim, const float *kernel,
     }
     I++;
   }
+
+  return status;
+}
+
+int Conv2DLayer::im2col(Tensor in_padded, TensorDim kdim, float *inCol,
+                        unsigned int size) {
+
+  int status = ML_ERROR_NONE;
+  unsigned int count;
+  unsigned int channel = in_padded.channel();
+  unsigned int height = in_padded.height();
+  unsigned int width = in_padded.width();
+  unsigned int k_width = kdim.width();
+  unsigned int k_height = kdim.height();
+
+  if (channel != kdim.channel()) {
+    ml_loge("Error: Input and Kenel Dimension is not match!");
+    return ML_ERROR_INVALID_PARAMETER;
+  }
+
+  // Optimizer This routine : There are lots of dulicated calculations
+  unsigned int I = 0;
+  unsigned int J = 0;
+  count = 0;
+  for (unsigned int j = 0; j <= height - k_height; j += stride[0]) {
+    J = 0;
+    for (unsigned int k = 0; k <= width - k_width; k += stride[1]) {
+      for (unsigned int i = 0; i < channel; ++i) {
+        for (unsigned int ki = 0; ki < k_height; ++ki) {
+          for (unsigned int kj = 0; kj < k_width; ++kj) {
+            inCol[count++] =
+              in_padded.getData()[i * height * width + (j + ki) * width + (k + kj)];
+          }
+        }
+      }
+      J++;
+    }
+    I++;
+  }
+
+  if (count != size)
+    status = ML_ERROR_INVALID_PARAMETER;
 
   return status;
 }

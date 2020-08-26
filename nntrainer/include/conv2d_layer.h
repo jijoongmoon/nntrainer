@@ -163,6 +163,8 @@ public:
    */
   void setProperty(const PropertyType type, const std::string &value = "");
 
+  int im2col(Tensor in_padded, TensorDim kdim, float *inCol, unsigned int size);
+
 private:
   unsigned int filter_size;
   unsigned int kernel_size[CONV2D_DIM];
