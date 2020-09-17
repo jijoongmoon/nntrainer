@@ -33,9 +33,17 @@
 
 #include "neuralnet.h"
 #include "tensor.h"
-#define training true
+#define training false
 
 std::string data_file;
+
+const unsigned int total_train_data_size = 90;
+
+unsigned int train_count=0;
+
+const unsigned int batch_size = 16;
+
+const unsigned int feature_size = 2;
 
 /**
  * @brief     step function
@@ -52,6 +60,55 @@ float stepFunction(float x) {
   }
 
   return x;
+}
+
+bool getData(std::ifstream &F, std::vector<float> &outVec, std::vector<float> &outLabel, unsigned int id){
+  std::string temp;
+  F.clear();
+  F.seekg(0, std::iso_base::beg);
+  char c;
+  int i = 0;
+  while (is.get(c) && i < id)
+    if(c=='\n')
+      ++i;
+  F.putback(c);
+
+  for(int j=0;j<feature_size;++j){
+    
+  }
+}
+
+int getBatch_train(float**outVec, float **outLabel, bool *last, void* user_data){
+  std::ifstream dataFile(data_file);
+  int data_size = total_train_data_size;
+  unsigned int count =0;
+  
+  if( data_size < batch_size){
+    *last = true;
+    train_count = 0;
+    return 0;
+  }
+
+  for(unsigned int i= train_count; i< train_count + batch_size; ++i){
+    std::vector<float> o;
+    std::vector<float> l;
+
+    o.resize (reature_size);
+    l.resize(1);
+
+    getData(F, o, l, i);
+
+    for(unsigned int j =0;j<feature_size;++j)
+      outVec[0][count*feature_size +j] = o[j];
+    outLabel[0][count] = l[0];
+
+    count ++;
+  }
+
+  F.close();
+  *last = false;
+  train_count +=batch_size;
+  return 0;
 }
 
 /**
@@ -102,11 +159,6 @@ int main(int argc, char *argv[]) {
     std::string temp;
     int index = 0;
     while (std::getline(dataFile, temp)) {
-      if (training && index % 10 == 1) {
-        std::cout << temp << std::endl;
-        index++;
-        continue;
-      }
       std::istringstream buffer(temp);
       std::vector<float> line;
       std::vector<float> out;
@@ -148,7 +200,7 @@ int main(int argc, char *argv[]) {
           return -1;
         }
         try {
-          NN.backwarding(MAKE_SHARED_TENSOR(d), MAKE_SHARED_TENSOR(y), i);
+          NN.backwarding(MAKE_SHARED_TENSOR(d), MAKE_SHARED_TENSOR(y), i*100+j);
         } catch (...) {
           std::cerr << "Error during backwarding the model" << std::endl;
           NN.finalize();
@@ -157,7 +209,6 @@ int main(int argc, char *argv[]) {
       }
       std::cout << "#" << i + 1 << "/" << NN.getEpochs()
                 << " - Loss : " << NN.getLoss() << std::endl;
-      NN.setLoss(0.0);
     }
   } else {
     /**
@@ -165,13 +216,19 @@ int main(int argc, char *argv[]) {
      */
     int cn = 0;
     for (unsigned int j = 0; j < inputVector.size(); ++j) {
-      std::vector<std::vector<float>> in, label;
-      in.push_back(inputVector[j]);
-      label.push_back(outputVector[j]);
+      nntrainer::Tensor d;
       try {
-        cn += NN.forwarding(MAKE_SHARED_TENSOR(in))
+	d = nntrainer::Tensor({inputVector[j]});
+      } catch (...) {
+	std::cerr << "Error during tensor construct" << std::endl;
+	NN.finalize();
+	return -1;
+      }
+      
+      try {
+        cn += NN.forwarding(MAKE_SHARED_TENSOR(d))
                 ->apply(stepFunction)
-                .getValue(0, 0, 0, 0) == label[0][0];
+                .getValue(0, 0, 0, 0) == outputVector[j][0];
       } catch (...) {
         std::cerr << "Error during forwarding the model" << std::endl;
         NN.finalize();
