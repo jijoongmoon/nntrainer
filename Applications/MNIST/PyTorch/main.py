@@ -56,7 +56,21 @@ def train(args, model, device, train_loader, optimizer, epoch):
             if args.dry_run:
                 break
 
+def inference(model, device, test_loader):
+    model.eval()
+    correct = 0
+    count =0
+    for data, target in test_loader:
+        data, target = data.to(device), target.to(device)
+        count = count+1
+        break;
+    print(count)
+    output = model(data)
+    prediction = output.data.max(1)[1]
+    correct += prediction.eq(target.data).sum()
 
+    print('Test set: Accuracy: {:.2f}%'.format(100. * correct / len(test_loader.dataset)))
+            
 def test(model, device, test_loader):
     model.eval()
     test_loss = 0
@@ -99,6 +113,9 @@ def main():
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
+    parser.add_argument('--inference', action='store_true', default=False,
+                        help='inference?')
+    
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -127,6 +144,12 @@ def main():
     test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
 
     model = Net().to(device)
+
+    if(inference):
+        model.load_state_dict(torch.load("./mnist_cnn.pt"))
+        inference(model, device, test_loader)
+        return
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
