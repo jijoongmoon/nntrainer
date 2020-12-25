@@ -8,3 +8,7 @@ subdir('VGG/jni')
 subdir('ReinforcementLearning/DeepQ/jni')
 subdir('TransferLearning/CIFAR_Classification/jni')
 subdir('TransferLearning/Draw_Classification/jni')
+# subdir('Custom/LayerClient/jni')
+# subdir('MNIST/Tensorflow/tflite')
+# subdir('VGG/Tensorflow/tflite')
+

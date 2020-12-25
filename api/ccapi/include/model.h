@@ -122,6 +122,9 @@ public:
    */
   virtual int train(std::vector<std::string> values = {}) = 0;
 
+  virtual std::vector<std::vector<float>> inference(std::string dim,
+                                                    std::vector<float> in) = 0;
+
   /**
    * @brief     Run Model train with callback function by user
    * @param[in] dataset set the dataset

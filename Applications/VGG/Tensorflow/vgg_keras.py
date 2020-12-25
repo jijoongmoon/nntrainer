@@ -20,8 +20,14 @@ import struct
 import os
 import sys
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+os.environ["OMP_NUM_THREADS"]= '1'
+os.environ["OMP_THREAD_LIMIT"] = '1'
+os.environ["NUMEXPR_NUM_THREADS"] = '1'
+os.environ["OMP_NUM_THREADS"] = '1'
+os.environ["OCR_THREADS"] = '1'
 
-import tensorflow as tf
+#import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import numpy as np
 import dataset as dataset
 from tensorflow.keras.layers import Input, Dense, Conv2D, Flatten, MaxPooling2D, BatchNormalization, Activation
@@ -29,6 +35,7 @@ from tensorflow.keras import models, layers, optimizers
 from tensorflow.keras.callbacks import Callback
 from tensorflow.keras import initializers
 from tensorflow.keras.models import load_model
+tf.disable_v2_behavior()
 
 np.set_printoptions(threshold=sys.maxsize)
 SEED=1
@@ -104,6 +111,32 @@ def create_model():
     model.add(layers.Dense(100, bias_initializer=initializers.Zeros()))
     return model
 
+def inference_nntrainer(target):
+    train_data_size, val_data_size, label_size, feature_size = dataset.get_data_info(target)
+    InVec, InLabel, ValVec, ValLabel = dataset.load_data(target)
+
+    model = create_model()
+    model.summary()
+    tf.saved_model.save(model, "./")        
+    
+    inputs = tf.placeholder(tf.float32, [None, 32,32,3], name="input_X")
+    labels = tf.placeholder(tf.float32,[None, 100], name = "label")
+    sess=tf.compat.v1.Session()
+
+    tf_logit = model(inputs, training=True)
+    infer_to_run = [tf.reduce_sum(tf.cast(tf.equal(tf.math.argmax(tf.nn.softmax(tf_logit), axis=1), tf.math.argmax(labels, axis=1)), tf.float32))]
+    sess.run(tf.compat.v1.global_variables_initializer())
+    # for x, y in datagen(ValVec, ValLabel, 1):
+    x = ValVec[10]
+    x=np.reshape(x,(1,3,32,32))
+    x=np.transpose(x,[0,2,3,1])
+    y = ValLabel[10]
+    y=np.reshape(y,(1,100))
+    feed_dict = {inputs: x, labels: y}
+    infer_out = sess.run(infer_to_run, feed_dict = feed_dict)
+    print(infer_out)
+    time.sleep(1)
+
 ##
 # @brief training loop
 #        - epochs : 1500
@@ -143,89 +176,89 @@ def train_nntrainer(target):
 
         sess.run(tf.compat.v1.global_variables_initializer())
 
-        conv2_0 = np.transpose(model.get_weights()[0], [3,2,0,1])
-        conv2_1 = np.transpose(model.get_weights()[2], [3,2,0,1])
-        conv2_2 = np.transpose(model.get_weights()[4], [3,2,0,1])
-        conv2_3 = np.transpose(model.get_weights()[6], [3,2,0,1])
-        conv2_4 = np.transpose(model.get_weights()[8], [3,2,0,1])
-        conv2_5 = np.transpose(model.get_weights()[10], [3,2,0,1])
-        conv2_6 = np.transpose(model.get_weights()[12], [3,2,0,1])
-        conv2_7 = np.transpose(model.get_weights()[14], [3,2,0,1])
-        conv2_8 = np.transpose(model.get_weights()[16], [3,2,0,1])
-        conv2_9 = np.transpose(model.get_weights()[18], [3,2,0,1])
-        conv2_10 = np.transpose(model.get_weights()[20], [3,2,0,1])
-        conv2_11 = np.transpose(model.get_weights()[22], [3,2,0,1])
-        conv2_12 = np.transpose(model.get_weights()[24], [3,2,0,1])
+        # conv2_0 = np.transpose(model.get_weights()[0], [3,2,0,1])
+        # conv2_1 = np.transpose(model.get_weights()[2], [3,2,0,1])
+        # conv2_2 = np.transpose(model.get_weights()[4], [3,2,0,1])
+        # conv2_3 = np.transpose(model.get_weights()[6], [3,2,0,1])
+        # conv2_4 = np.transpose(model.get_weights()[8], [3,2,0,1])
+        # conv2_5 = np.transpose(model.get_weights()[10], [3,2,0,1])
+        # conv2_6 = np.transpose(model.get_weights()[12], [3,2,0,1])
+        # conv2_7 = np.transpose(model.get_weights()[14], [3,2,0,1])
+        # conv2_8 = np.transpose(model.get_weights()[16], [3,2,0,1])
+        # conv2_9 = np.transpose(model.get_weights()[18], [3,2,0,1])
+        # conv2_10 = np.transpose(model.get_weights()[20], [3,2,0,1])
+        # conv2_11 = np.transpose(model.get_weights()[22], [3,2,0,1])
+        # conv2_12 = np.transpose(model.get_weights()[24], [3,2,0,1])
 
-        bn_1_0 = np.transpose(model.get_weights()[26])
-        bn_1_1 = np.transpose(model.get_weights()[27])
-        bn_1_2 = np.transpose(model.get_weights()[28])
-        bn_1_3 = np.transpose(model.get_weights()[29])
+        # bn_1_0 = np.transpose(model.get_weights()[26])
+        # bn_1_1 = np.transpose(model.get_weights()[27])
+        # bn_1_2 = np.transpose(model.get_weights()[28])
+        # bn_1_3 = np.transpose(model.get_weights()[29])
 
-        fc_0_0 = np.transpose(model.get_weights()[30])
-        fc_0_1 = np.transpose(model.get_weights()[31])
+        # fc_0_0 = np.transpose(model.get_weights()[30])
+        # fc_0_1 = np.transpose(model.get_weights()[31])
 
-        bn_2_0 = np.transpose(model.get_weights()[32])
-        bn_2_1 = np.transpose(model.get_weights()[33])
-        bn_2_2 = np.transpose(model.get_weights()[34])
-        bn_2_3 = np.transpose(model.get_weights()[35])
+        # bn_2_0 = np.transpose(model.get_weights()[32])
+        # bn_2_1 = np.transpose(model.get_weights()[33])
+        # bn_2_2 = np.transpose(model.get_weights()[34])
+        # bn_2_3 = np.transpose(model.get_weights()[35])
 
-        fc_1_0 = np.transpose(model.get_weights()[36])
-        fc_1_1 = np.transpose(model.get_weights()[37])
+        # fc_1_0 = np.transpose(model.get_weights()[36])
+        # fc_1_1 = np.transpose(model.get_weights()[37])
 
-        bn_3_0 = np.transpose(model.get_weights()[38])
-        bn_3_1 = np.transpose(model.get_weights()[39])
-        bn_3_2 = np.transpose(model.get_weights()[40])
-        bn_3_3 = np.transpose(model.get_weights()[41])
+        # bn_3_0 = np.transpose(model.get_weights()[38])
+        # bn_3_1 = np.transpose(model.get_weights()[39])
+        # bn_3_2 = np.transpose(model.get_weights()[40])
+        # bn_3_3 = np.transpose(model.get_weights()[41])
 
-        fc_2_0 = np.transpose(model.get_weights()[42])
-        fc_2_1 = np.transpose(model.get_weights()[43])
+        # fc_2_0 = np.transpose(model.get_weights()[42])
+        # fc_2_1 = np.transpose(model.get_weights()[43])
 
-        save("model.bin", conv2_0)
-        save("model.bin", model.get_weights()[1])
-        save("model.bin", conv2_1)
-        save("model.bin", model.get_weights()[3])
-        save("model.bin", conv2_2)
-        save("model.bin", model.get_weights()[5])
-        save("model.bin", conv2_3)
-        save("model.bin", model.get_weights()[7])
-        save("model.bin", conv2_4)
-        save("model.bin", model.get_weights()[9])
-        save("model.bin", conv2_5)
-        save("model.bin", model.get_weights()[11])
-        save("model.bin", conv2_6)
-        save("model.bin", model.get_weights()[13])
-        save("model.bin", conv2_7)
-        save("model.bin", model.get_weights()[15])
-        save("model.bin", conv2_8)
-        save("model.bin", model.get_weights()[17])
-        save("model.bin", conv2_9)
-        save("model.bin", model.get_weights()[19])
-        save("model.bin", conv2_10)
-        save("model.bin", model.get_weights()[21])
-        save("model.bin", conv2_11)
-        save("model.bin", model.get_weights()[23])
-        save("model.bin", conv2_12)
-        save("model.bin", model.get_weights()[25])
+        # save("model.bin", conv2_0)
+        # save("model.bin", model.get_weights()[1])
+        # save("model.bin", conv2_1)
+        # save("model.bin", model.get_weights()[3])
+        # save("model.bin", conv2_2)
+        # save("model.bin", model.get_weights()[5])
+        # save("model.bin", conv2_3)
+        # save("model.bin", model.get_weights()[7])
+        # save("model.bin", conv2_4)
+        # save("model.bin", model.get_weights()[9])
+        # save("model.bin", conv2_5)
+        # save("model.bin", model.get_weights()[11])
+        # save("model.bin", conv2_6)
+        # save("model.bin", model.get_weights()[13])
+        # save("model.bin", conv2_7)
+        # save("model.bin", model.get_weights()[15])
+        # save("model.bin", conv2_8)
+        # save("model.bin", model.get_weights()[17])
+        # save("model.bin", conv2_9)
+        # save("model.bin", model.get_weights()[19])
+        # save("model.bin", conv2_10)
+        # save("model.bin", model.get_weights()[21])
+        # save("model.bin", conv2_11)
+        # save("model.bin", model.get_weights()[23])
+        # save("model.bin", conv2_12)
+        # save("model.bin", model.get_weights()[25])
 
-        save("model.bin", bn_1_0)
-        save("model.bin", bn_1_1)
-        save("model.bin", bn_1_2)
-        save("model.bin", bn_1_3)
-        save("model.bin", fc_0_0)
-        save("model.bin", fc_0_1)
-        save("model.bin", bn_2_0)
-        save("model.bin", bn_2_1)
-        save("model.bin", bn_2_2)
-        save("model.bin", bn_2_3)
-        save("model.bin", fc_1_0)
-        save("model.bin", fc_1_1)
-        save("model.bin", bn_3_0)
-        save("model.bin", bn_3_1)
-        save("model.bin", bn_3_2)
-        save("model.bin", bn_3_3)
-        save("model.bin", fc_2_0)
-        save("model.bin", fc_2_1)
+        # save("model.bin", bn_1_0)
+        # save("model.bin", bn_1_1)
+        # save("model.bin", bn_1_2)
+        # save("model.bin", bn_1_3)
+        # save("model.bin", fc_0_0)
+        # save("model.bin", fc_0_1)
+        # save("model.bin", bn_2_0)
+        # save("model.bin", bn_2_1)
+        # save("model.bin", bn_2_2)
+        # save("model.bin", bn_2_3)
+        # save("model.bin", fc_1_0)
+        # save("model.bin", fc_1_1)
+        # save("model.bin", bn_3_0)
+        # save("model.bin", bn_3_1)
+        # save("model.bin", bn_3_2)
+        # save("model.bin", bn_3_3)
+        # save("model.bin", fc_2_0)
+        # save("model.bin", fc_2_1)
 
         for i in range(0, num_epoch):
             count = 0
@@ -273,6 +306,7 @@ def train_nntrainer(target):
                   validation_steps = len(ValVec) // batch_size,
                   shuffle = False)
 
+    tf.saved_model.save(model, "./")
 ##
 # @brief main loop
 
@@ -282,4 +316,9 @@ if __name__ == "__main__":
 
     if target1 == "train":
         train_nntrainer(target)
+        
+    if target1 == "inference":
+    #     Learning = True
+        inference_nntrainer(target)
+        
 

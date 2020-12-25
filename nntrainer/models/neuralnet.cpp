@@ -416,6 +416,21 @@ void NeuralNetwork::setBatchSize(unsigned int batch) {
     throw std::invalid_argument("Error setting batchsize for the dataset");
 }
 
+std::vector<std::vector<float>>
+NeuralNetwork::inference(std::string dim, std::vector<float> in) {
+  std::vector<std::vector<float>> Out;
+  nntrainer::Tensor X = nntrainer::Tensor(nntrainer::TensorDim(dim), in.data());
+  sharedConstTensors out = inference({MAKE_SHARED_TENSOR(X)});
+  for (unsigned int i = 0; i < out.size(); ++i) {
+    std::vector<float> o;
+    for (unsigned int j = 0; j < out[i]->getDim().getDataLen(); ++j) {
+      o.push_back(out[i]->getData()[j]);
+    }
+    Out.push_back(o);
+  }
+  return Out;
+}
+
 sharedConstTensors NeuralNetwork::inference(sharedConstTensors X) {
   if (batch_size != X[0]->batch()) {
     /**

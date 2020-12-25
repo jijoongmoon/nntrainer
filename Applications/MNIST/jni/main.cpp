@@ -23,6 +23,7 @@
 #define APP_VALIDATE
 #endif
 
+#include "bitmap_helpers.h"
 #include <climits>
 #include <cmath>
 #include <fstream>
@@ -255,18 +256,61 @@ TEST(MNIST_training, verify_accuracy) {
  */
 int main(int argc, char *argv[]) {
   int status = 0;
-  if (argc < 2) {
-    std::cout << "./nntrainer_mnist mnist.ini\n";
+  if (argc < 3) {
+    std::cout << "./nntrainer_mnist mnist.ini train/inference\n";
     exit(0);
   }
+  bool inference = false;
 
   const std::vector<std::string> args(argv + 1, argv + argc);
   std::string config = args[0];
+  std::string infer = args[1];
 
   srand(time(NULL));
+
+  if (!strncasecmp(infer.c_str(), "inference", infer.size())) {
+    inference = true;
+  }
+
   std::vector<std::vector<float>> inputVector, outputVector;
   std::vector<std::vector<float>> inputValVector, outputValVector;
   std::vector<std::vector<float>> inputTestVector, outputTestVector;
+
+  std::unique_ptr<ml::train::Model> model;
+  try {
+    /**
+     * @brief     Neural Network Create & Initialization
+     */
+    model = createModel(ml::train::ModelType::NEURAL_NET);
+    model->loadFromConfig(config);
+    // model->compile();
+    // model->initialize();
+    model->init();
+    model->readModel();
+  } catch (...) {
+    std::cerr << "Error during loadFromConfig" << std::endl;
+    return 1;
+  }
+
+  if (inference) {
+    std::string filename = "mnist_trainingSet.dat";
+    std::ifstream F(filename, std::ios::in | std::ios::binary);
+
+    std::vector<float> o;
+    std::vector<float> l;
+    o.resize(feature_size);
+    l.resize(total_label_size);
+
+    getData(F, o, l, 9);
+
+    std::vector<std::vector<float>> O = model->inference("1:1:28:28", o);
+
+    for (unsigned int i = 0; i < 10; ++i) {
+      std::cout << O[0][i] << " : " << l[i] << std::endl;
+    }
+    sleep(2);
+    return 0;
+  }
 
   /**
    * @brief     Data buffer Create & Initialization
@@ -277,20 +321,24 @@ int main(int argc, char *argv[]) {
                             getBatch_train);
   dataset->setGeneratorFunc(ml::train::DatasetDataType::DATA_VAL, getBatch_val);
 
-  /**
-   * @brief     Neural Network Create & Initialization
-   */
-  std::unique_ptr<ml::train::Model> model =
-    createModel(ml::train::ModelType::NEURAL_NET);
-  try {
-    model->loadFromConfig(config);
-  } catch (...) {
-    std::cerr << "Error during loadFromConfig" << std::endl;
-    return 0;
-  }
+// <<<<<<< HEAD
+//   /**
+//    * @brief     Neural Network Create & Initialization
+//    */
+//   std::unique_ptr<ml::train::Model> model =
+//     createModel(ml::train::ModelType::NEURAL_NET);
+//   try {
+//     model->loadFromConfig(config);
+//   } catch (...) {
+//     std::cerr << "Error during loadFromConfig" << std::endl;
+//     return 0;
+//   }
 
+//   try {
+//     model->init();
+// =======
   try {
-    model->init();
+    model->setDataset(dataset);
   } catch (...) {
     std::cerr << "Error during init" << std::endl;
     return 0;
