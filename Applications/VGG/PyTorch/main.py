@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
+import numpy as np
 
 import torchvision
 import torchvision.transforms as transforms
@@ -24,7 +25,7 @@ import os
 import argparse
 import sys
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cpu'
 
 # Data
 print('==> Preparing data..')
@@ -42,13 +43,20 @@ transform_test = transforms.Compose([
 
 trainset = torchvision.datasets.CIFAR100(
         root='./data', train=True, download=True, transform=transform_train)
-trainloader = torch.utils.data.DataLoader(
-        trainset, batch_size=128, shuffle=True, num_workers=4)
 
-testset = torchvision.datasets.CIFAR100(
-        root='./data', train=False, download=True, transform=transform_test)
+indices = np.arange(len(trainset))
+train_indices  = list(range(0,len(trainset), 100))
+test_indices = list(range(0,len(trainset), 101))
+
+# Warp into Subsets and DataLoaders
+train_dataset = torch.utils.data.Subset(trainset, train_indices)
+test_dataset = torch.utils.data.Subset(trainset, test_indices)
+
+trainloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=128, shuffle=True, num_workers=1)
+
 testloader = torch.utils.data.DataLoader(
-        testset, batch_size=128, shuffle=False, num_workers=4)
+        test_dataset, batch_size=128, shuffle=False, num_workers=1)
 
 # Model
 
@@ -89,6 +97,7 @@ if device == 'cuda':
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(net.parameters(), lr=1e-3, weight_decay=5e-4)
 
+
 # Training
 def train(epoch):
     print('\nEpoch: %d' % epoch)
@@ -96,6 +105,7 @@ def train(epoch):
     train_loss = 0
     correct = 0
     total = 0
+
     for batch_idx, (inputs, targets) in enumerate(trainloader):
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
@@ -109,8 +119,24 @@ def train(epoch):
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
-    print('Loss: %.3f | Acc: %.3f%% (%d/%d)'
-            % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        print('Loss: %.3f | Acc: %.3f%% (%d/%d)'
+              % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+
+def inference():
+    net.eval()
+    net.load_state_dict(torch.load("./vgg_cnn.pt"))
+    correct = 0
+    count =0
+    for data, target in testloader:
+        data, target = data.to(device), target.to(device)
+        count = count+1
+        break;
+    print(count)
+    output = net(data)
+    prediction = output.data.max(1)[1]
+    correct += prediction.eq(target.data).sum()
+
+    print('Test set: Accuracy: {:.2f}%'.format(100. * correct / len(testloader.dataset)))
 
 def test(epoch):
     net.eval()
@@ -141,6 +167,19 @@ def test(epoch):
     torch.save(state, './checkpoint/ckpt.pth')
 
 if __name__ == '__main__':
-    for epoch in range(1):
-        train(epoch)
+    parser = argparse.ArgumentParser(description='PyTorch VGG Example')    
+    parser.add_argument('--save-model', action='store_true', default=False,
+                        help='For Saving the current Model')
+    parser.add_argument('--inference', action='store_true', default=False,
+                        help='inference?')
+    args = parser.parse_args()
+
+    if (args.inference):
+        inference()
+    else:
+        for epoch in range(1):
+            train(epoch)
+            if args.save_model:
+                torch.save(net.state_dict(), "vgg_cnn.pt")
+        
     # test(epoch)

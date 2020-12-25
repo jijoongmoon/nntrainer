@@ -70,7 +70,7 @@ def inference(model, device, test_loader):
     correct += prediction.eq(target.data).sum()
 
     print('Test set: Accuracy: {:.2f}%'.format(100. * correct / len(test_loader.dataset)))
-            
+
 def test(model, device, test_loader):
     model.eval()
     test_loss = 0
@@ -115,7 +115,7 @@ def main():
                         help='For Saving the current Model')
     parser.add_argument('--inference', action='store_true', default=False,
                         help='inference?')
-    
+
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -145,7 +145,7 @@ def main():
 
     model = Net().to(device)
 
-    if(inference):
+    if(args.inference):
         model.load_state_dict(torch.load("./mnist_cnn.pt"))
         inference(model, device, test_loader)
         return
