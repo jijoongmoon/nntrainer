@@ -19,7 +19,14 @@ import random
 import struct
 import os
 import sys
+import time
+
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+os.environ["OMP_NUM_THREADS"]= '1'
+os.environ["OMP_THREAD_LIMIT"] = '1'
+os.environ["NUMEXPR_NUM_THREADS"] = '1'
+os.environ["OMP_NUM_THREADS"] = '1'
+os.environ["OCR_THREADS"] = '1'
 
 import tensorflow as tf
 import numpy as np
@@ -41,7 +48,7 @@ np.random.seed(SEED)
 batch_size =32
 Learning = True
 Test = False
-num_epoch = 1500
+num_epoch = 100
 DEBUG = True
 USE_FIT = False
 
@@ -83,6 +90,32 @@ def create_model():
     model.add(layers.Dense(10, bias_initializer=initializers.Zeros()))
     return model
 
+def inference_nntrainer(target):
+    train_data_size, val_data_size, label_size, feature_size = dataset.get_data_info(target)
+    InVec, InLabel, ValVec, ValLabel = dataset.load_data(target)
+
+    model = create_model()
+    model.summary()
+    tf.saved_model.save(model, "./")        
+    
+    inputs = tf.placeholder(tf.float32, [None, 28,28,1], name="input_X")
+    labels = tf.placeholder(tf.float32,[None, 10], name = "label")
+    sess=tf.compat.v1.Session()
+
+    tf_logit = model(inputs, training=True)
+    infer_to_run = [tf.reduce_sum(tf.cast(tf.equal(tf.math.argmax(tf.nn.softmax(tf_logit), axis=1), tf.math.argmax(labels, axis=1)), tf.float32))]
+    sess.run(tf.compat.v1.global_variables_initializer())
+    # for x, y in datagen(ValVec, ValLabel, 1):
+    x = ValVec[10]
+    x=np.reshape(x,(1,1,28,28))
+    x=np.transpose(x,[0,2,3,1])
+    y = ValLabel[10]
+    y=np.reshape(y,(1,10))
+    feed_dict = {inputs: x, labels: y}
+    infer_out = sess.run(infer_to_run, feed_dict = feed_dict)
+    print(infer_out)
+    time.sleep(1)
+
 ##
 # @brief training loop
 #        - epochs : 1500
@@ -117,14 +150,14 @@ def train_nntrainer(target):
 
         sess.run(tf.compat.v1.global_variables_initializer())
 
-        conv2_0 = np.transpose(model.get_weights()[0], [3,2,0,1])
-        conv2_1 = np.transpose(model.get_weights()[2], [3,2,0,1])
-        save("model.bin", conv2_0)
-        save("model.bin", model.get_weights()[1])
-        save("model.bin", conv2_1)
-        save("model.bin", model.get_weights()[3])
-        save("model.bin", model.get_weights()[4])
-        save("model.bin", model.get_weights()[5])
+        # conv2_0 = np.transpose(model.get_weights()[0], [3,2,0,1])
+        # conv2_1 = np.transpose(model.get_weights()[2], [3,2,0,1])
+        # save("model.bin", conv2_0)
+        # save("model.bin", model.get_weights()[1])
+        # save("model.bin", conv2_1)
+        # save("model.bin", model.get_weights()[3])
+        # save("model.bin", model.get_weights()[4])
+        # save("model.bin", model.get_weights()[5])
 
         for i in range(0, num_epoch):
             count = 0
@@ -167,6 +200,7 @@ def train_nntrainer(target):
                   validation_data = datagen(ValVec, ValLabel, batch_size),
                   validation_steps = len(ValVec) // batch_size,
                   shuffle = False)
+    tf.saved_model.save(model, "./")
 
 ##
 # @brief main loop
@@ -182,4 +216,9 @@ if __name__ == "__main__":
     if target1 == "train":
     #     Learning = True
         train_nntrainer(target)
+
+    if target1 == "inference":
+    #     Learning = True
+        inference_nntrainer(target)
+        
 
