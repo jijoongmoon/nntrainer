@@ -236,6 +236,9 @@ public:
    */
   int train(std::vector<std::string> values = {});
 
+  std::vector<std::vector<float>> inference(std::string dim,
+                                            std::vector<float> in);
+
   /**
    * @brief     Run NeuralNetwork inference
    * @param[in] X input tensor
