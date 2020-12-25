@@ -28,7 +28,8 @@ os.environ["NUMEXPR_NUM_THREADS"] = '1'
 os.environ["OMP_NUM_THREADS"] = '1'
 os.environ["OCR_THREADS"] = '1'
 
-import tensorflow as tf
+# import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import numpy as np
 import dataset as dataset
 from tensorflow.keras.layers import Input, Dense, Conv2D, Flatten, AveragePooling2D
@@ -36,6 +37,7 @@ from tensorflow.keras import models, layers, optimizers
 from tensorflow.keras.callbacks import Callback
 from tensorflow.keras import initializers
 from tensorflow.keras.models import load_model
+tf.disable_v2_behavior()
 
 np.set_printoptions(threshold=sys.maxsize)
 SEED=1
