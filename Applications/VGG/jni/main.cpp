@@ -17,6 +17,8 @@
 #include <iostream>
 #include <sstream>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "databuffer.h"
 #include "databuffer_func.h"
@@ -369,8 +371,8 @@ int getBatch_val_file(float **outVec, float **outLabel, bool *last,
 int main(int argc, char *argv[]) {
   int status = 0;
 
-  if (argc < 3) {
-    std::cout << "./nntrainer_vgg vgg.ini resource\n";
+  if (argc < 4) {
+    std::cout << "./nntrainer_vgg vgg.ini resource train/inference\n";
     exit(-1);
   }
 
@@ -380,12 +382,54 @@ int main(int argc, char *argv[]) {
   const std::vector<std::string> args(argv + 1, argv + argc);
   std::string config = args[0];
   resource = args[1];
+  std::string infer = args[2];
+
+  bool inference = false;
 
   srand(time(NULL));
+
+  if (!strncasecmp(infer.c_str(), "inference", infer.size())) {
+    inference = true;
+  }
+
   std::vector<std::vector<float>> inputVector, outputVector;
   std::vector<std::vector<float>> inputValVector, outputValVector;
 
   std::vector<float> input_, label_;
+
+  /**
+   * @brief     Neural Network Create & Initialization
+   */
+  nntrainer::NeuralNetwork NN;
+  try {
+    NN.loadFromConfig(config);
+    NN.compile();
+    NN.initialize();
+    NN.readModel();
+  } catch (...) {
+    std::cerr << "Error during loadFromConfig" << std::endl;
+    return 0;
+  }
+
+  if (inference) {
+    std::string filename = "vgg_trainingSet.dat";
+    std::ifstream F(filename, std::ios::in | std::ios::binary);
+
+    std::vector<float> o;
+    std::vector<float> l;
+    o.resize(feature_size);
+    l.resize(num_class);
+
+    getData(F, o, l, 10);
+
+    std::vector<std::vector<float>> O = NN.inference("1:3:32:32", o);
+
+    for (unsigned int i = 0; i < num_class; ++i) {
+      std::cout << O[0][i] << " : " << l[i] << std::endl;
+    }
+    sleep(2);
+    return 0;
+  }
 
   count_train.remain = num_class * num_train;
   count_train.duplication.resize(count_train.remain);
@@ -404,27 +448,7 @@ int main(int argc, char *argv[]) {
   DB->setGeneratorFunc(nntrainer::BufferType::BUF_TRAIN, getBatch_train_file);
   DB->setGeneratorFunc(nntrainer::BufferType::BUF_VAL, getBatch_val_file);
 
-  /**
-   * @brief     Neural Network Create & Initialization
-   */
-  nntrainer::NeuralNetwork NN;
   try {
-    NN.loadFromConfig(config);
-  } catch (...) {
-    std::cerr << "Error during loadFromConfig" << std::endl;
-    return 0;
-  }
-
-  try {
-    NN.compile();
-    NN.initialize();
-  } catch (...) {
-    std::cerr << "Error during init" << std::endl;
-    return 0;
-  }
-
-  try {
-    NN.readModel();
     NN.setDataBuffer((DB));
     NN.train();
     training_loss = NN.getTrainingLoss();
