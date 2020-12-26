@@ -302,6 +302,7 @@ def train_nntrainer(target):
                   validation_steps = len(ValVec) // batch_size,
                   shuffle = False)
 
+    tf.saved_model.save(model, "./")
 ##
 # @brief main loop
 
