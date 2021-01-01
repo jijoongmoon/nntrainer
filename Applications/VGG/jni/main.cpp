@@ -25,20 +25,28 @@
 #include "neuralnet.h"
 #include "nntrainer_error.h"
 #include "tensor.h"
+#include <chrono>
 #include <vector>
 
 /**
  * @brief     Data size for each category
  */
-const unsigned int num_class = 100;
 
-const unsigned int num_train = 100;
+bool cifar10_160 = false;
 
-const unsigned int num_val = 20;
+bool cifar10_80 = false;
 
-const unsigned int batch_size = 128;
+bool cifar10_32 = false;
 
-const unsigned int feature_size = 3072;
+unsigned int num_class = 100;
+
+unsigned int num_train = 100;
+
+unsigned int num_val = 20;
+
+unsigned int batch_size = 128;
+
+unsigned int feature_size = 3072;
 
 unsigned int train_count = 0;
 unsigned int val_count = 0;
@@ -75,27 +83,37 @@ void ExtractFeatures(std::string p, std::vector<float> &input_img,
                      std::vector<float> &input_label, unsigned int index,
                      std::string type) {
 
-  std::string total_label[100] = {
-    "apple",      "bridge",    "cockroach",  "hamster",      "motorcycle",
-    "plain",      "seal",      "table",      "willow_tree",  "aquarium_fish",
-    "bus",        "couch",     "house",      "mountain",     "plate",
-    "shark",      "tank",      "wolf",       "baby",         "butterfly",
-    "crab",       "kangaroo",  "mouse",      "poppy",        "shrew",
-    "telephone",  "woman",     "bear",       "camel",        "crocodile",
-    "keyboard",   "mushroom",  "porcupine",  "skunk",        "television",
-    "worm",       "beaver",    "can",        "cup",          "lamp",
-    "oak_tree",   "possum",    "skyscraper", "tiger",        "bed",
-    "castle",     "dinosaur",  "lawn_mower", "orange",       "rabbit",
-    "snail",      "tractor",   "bee",        "caterpillar",  "dolphin",
-    "leopard",    "orchid",    "raccoon",    "snake",        "train",
-    "beetle",     "cattle",    "elephant",   "lion",         "otter",
-    "ray",        "spider",    "trout",      "bicycle",      "chair",
-    "flatfish",   "lizard",    "palm_tree",  "road",         "squirrel",
-    "tulip",      "bottle",    "chimpanzee", "forest",       "lobster",
-    "pear",       "rocket",    "streetcar",  "turtle",       "bowl",
-    "clock",      "fox",       "man",        "pickup_truck", "rose",
-    "sunflower",  "wardrobe",  "boy",        "cloud",        "girl",
-    "maple_tree", "pine_tree", "sea",        "sweet_pepper", "whale"};
+  std::string *t_label;
+
+  if (cifar10_160 || cifar10_80 || cifar10_32) {
+    std::string total_label[10] = {"airplane", "automobile", "bird", "cat",
+                                   "deer",     "dog",        "frog", "horse",
+                                   "ship",     "truck"};
+    t_label = total_label;
+  } else {
+    std::string total_label[100] = {
+      "apple",      "bridge",    "cockroach",  "hamster",      "motorcycle",
+      "plain",      "seal",      "table",      "willow_tree",  "aquarium_fish",
+      "bus",        "couch",     "house",      "mountain",     "plate",
+      "shark",      "tank",      "wolf",       "baby",         "butterfly",
+      "crab",       "kangaroo",  "mouse",      "poppy",        "shrew",
+      "telephone",  "woman",     "bear",       "camel",        "crocodile",
+      "keyboard",   "mushroom",  "porcupine",  "skunk",        "television",
+      "worm",       "beaver",    "can",        "cup",          "lamp",
+      "oak_tree",   "possum",    "skyscraper", "tiger",        "bed",
+      "castle",     "dinosaur",  "lawn_mower", "orange",       "rabbit",
+      "snail",      "tractor",   "bee",        "caterpillar",  "dolphin",
+      "leopard",    "orchid",    "raccoon",    "snake",        "train",
+      "beetle",     "cattle",    "elephant",   "lion",         "otter",
+      "ray",        "spider",    "trout",      "bicycle",      "chair",
+      "flatfish",   "lizard",    "palm_tree",  "road",         "squirrel",
+      "tulip",      "bottle",    "chimpanzee", "forest",       "lobster",
+      "pear",       "rocket",    "streetcar",  "turtle",       "bowl",
+      "clock",      "fox",       "man",        "pickup_truck", "rose",
+      "sunflower",  "wardrobe",  "boy",        "cloud",        "girl",
+      "maple_tree", "pine_tree", "sea",        "sweet_pepper", "whale"};
+    t_label = total_label;
+  }
 
   std::string path = p + "/train/";
 
@@ -106,11 +124,11 @@ void ExtractFeatures(std::string p, std::vector<float> &input_img,
 
   if (!type.compare("val")) {
     class_id = index / num_val;
-    path += total_label[class_id];
+    path += t_label[class_id];
     val = true;
   } else {
     class_id = index / num_train;
-    path += total_label[class_id];
+    path += t_label[class_id];
   }
 
   if (val) {
@@ -383,6 +401,33 @@ int main(int argc, char *argv[]) {
   std::string config = args[0];
   resource = args[1];
   std::string infer = args[2];
+  std::string cifar_kind = args[3];
+
+  if (!strncasecmp(cifar_kind.c_str(), "cifar10_160", cifar_kind.size())) {
+    cifar10_160 = true;
+    num_class = 10;
+    num_train = 250;
+    batch_size = 50;
+    feature_size = 76800;
+    width = 160;
+    height = 160;
+  }
+  if (!strncasecmp(cifar_kind.c_str(), "cifar10_80", cifar_kind.size())) {
+    cifar10_80 = true;
+    num_class = 10;
+    num_train = 250;
+    batch_size = 50;
+    feature_size = 19200;
+    width = 80;
+    height = 80;
+  }
+
+  if (!strncasecmp(cifar_kind.c_str(), "cifar10_32", cifar_kind.size())) {
+    cifar10_32 = true;
+    num_class = 10;
+    num_train = 250;
+    batch_size = 50;
+  }
 
   bool inference = false;
 
@@ -412,7 +457,18 @@ int main(int argc, char *argv[]) {
   }
 
   if (inference) {
-    std::string filename = "vgg_trainingSet.dat";
+    std::string filename;
+
+    if (cifar10_160) {
+      filename = "vgg_cifar10_160_trainingSet.dat";
+    } else if (cifar10_80) {
+      filename = "vgg_cifar10_80_trainingSet.dat";
+    } else if (cifar10_32) {
+      filename = "vgg_cifar10_32_trainingSet.dat";
+    } else {
+      filename = "vgg_trainingSet.dat";
+    }
+
     std::ifstream F(filename, std::ios::in | std::ios::binary);
 
     std::vector<float> o;
@@ -420,10 +476,24 @@ int main(int argc, char *argv[]) {
     o.resize(feature_size);
     l.resize(num_class);
 
+    std::chrono::system_clock::time_point start =
+      std::chrono::system_clock::now();
+
     getData(F, o, l, 10);
+    std::vector<std::vector<float>> O;
 
-    std::vector<std::vector<float>> O = NN.inference("1:3:32:32", o);
+    if (cifar10_160) {
+      O = NN.inference("1:3:160:160", o);
+    } else if (cifar10_80) {
+      O = NN.inference("1:3:80:80", o);
+    } else {
+      O = NN.inference("1:3:32:32", o);
+    }
 
+    std::chrono::system_clock::time_point end =
+      std::chrono::system_clock::now();
+    std::chrono::duration<double> sec = end - start;
+    std::cout << "Inference Time : " << sec.count() << " sec" << std::endl;
     for (unsigned int i = 0; i < num_class; ++i) {
       std::cout << O[0][i] << " : " << l[i] << std::endl;
     }
@@ -447,30 +517,6 @@ int main(int argc, char *argv[]) {
     std::make_shared<nntrainer::DataBufferFromCallback>();
   DB->setGeneratorFunc(nntrainer::BufferType::BUF_TRAIN, getBatch_train_file);
   DB->setGeneratorFunc(nntrainer::BufferType::BUF_VAL, getBatch_val_file);
-
-
-  /**
-   * @brief     Neural Network Create & Initialization
-   */
-  // nntrainer::NeuralNetwork NN;
-  // try {
-  //   NN.loadFromConfig(config);
-  // } catch (...) {
-  //   std::cerr << "Error during loadFromConfig" << std::endl;
-  //   return 0;
-  // }
-
-  // try {
-  //   NN.init();
-  // } catch (...) {
-  //   std::cerr << "Error during init" << std::endl;
-  //   return 0;
-  // }
-
-  // NN.readModel();
-  // NN.setDataBuffer((DB));
-
-  // try {
 
   try {
     NN.setDataBuffer((DB));

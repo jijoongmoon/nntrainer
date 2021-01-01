@@ -589,6 +589,8 @@ int NeuralNetwork::train_run() {
     while (true) {
       if (data_buffer->getDataFromBuffer(nntrainer::BufferType::BUF_TRAIN,
                                          in.getData(), label.getData())) {
+        std::chrono::system_clock::time_point start =
+          std::chrono::system_clock::now();
         try {
           forwarding();
           backwarding(iter++);
@@ -597,6 +599,12 @@ int NeuralNetwork::train_run() {
           ml_loge("Error: training error in #%d/%d.", epoch_idx, epochs);
           std::rethrow_exception(std::current_exception());
         }
+        std::chrono::system_clock::time_point end =
+          std::chrono::system_clock::now();
+        std::chrono::duration<double> sec = end - start;
+        std::cout << "Training Time (1 iteration) : " << sec.count() << " sec"
+                  << std::endl;
+
         std::cout << "#" << epoch_idx << "/" << epochs;
         data_buffer->displayProgress(count++, nntrainer::BufferType::BUF_TRAIN,
                                      getLoss());
