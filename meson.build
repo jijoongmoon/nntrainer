@@ -37,9 +37,8 @@ warning_flags = [
   '-Wvla',
   '-Wpointer-arith',
   '-Wno-error=varargs',
-  '-g'
-  # '-O2',
-  # '-ftree-vectorize'
+  '-O2',
+  '-ftree-vectorize'
 ]
 
 warning_c_flags = [
