@@ -15,6 +15,7 @@
 #define __ACTIVATION_LAYER_H__
 #ifdef __cplusplus
 
+#include <acti_func.h>
 #include <layer_internal.h>
 #include <tensor.h>
 
@@ -153,8 +154,7 @@ public:
   static const std::string type;
 
 private:
-  std::function<Tensor &(Tensor const &, Tensor &)> _act_fn;
-  std::function<Tensor &(Tensor &, Tensor &, Tensor const &)> _act_prime_fn;
+  ActiFunc acti_func;
 
   Tensor backup_hidden;
 
