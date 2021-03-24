@@ -65,6 +65,7 @@ int RNNLayer::initialize(Manager &manager) {
                          weight_regularizer_constant, true, "RNN:weight_hh");
     weights.emplace_back(bias_dim, bias_initializer, WeightRegularizer::NONE,
                          1.0f, true, "RNN:bias_h");
+    manager.trackWeights(weights);
   } else {
     weights[RNNParams::weight_xh].reset(dim_xh, weight_initializer,
                                         weight_regularizer,
@@ -89,6 +90,13 @@ void RNNLayer::setProperty(const PropertyType type, const std::string &value) {
       output_dim[0].width(unit);
     }
     break;
+  case PropertyType::activation:
+    if (!value.empty()) {
+      ActivationType acti_type = (ActivationType)parseType(value, TOKEN_ACTI);
+      Layer::activation_type = acti_type;
+      acti_func.setActiFunc(acti_type);
+    }
+    break;
   default:
     Layer::setProperty(type, value);
     break;
@@ -107,23 +115,53 @@ void RNNLayer::forwarding(bool training) {
   Tensor &hidden_ = net_hidden[0]->getVariableRef();
   Tensor &input_ = net_input[0]->getVariableRef();
 
+  Tensor temp;
+
   for (unsigned int b = 0; b < input_dim[0].batch(); ++b) {
     Tensor islice = input_.getBatchSlice(b, 1);
     Tensor oslice = hidden_.getBatchSlice(b, 1);
+    float *hidden_next = oslice.getData();
+
+    if (!training) {
+      if (b > 0) {
+        float *hidden_pre =
+          hidden_.getAddress((b - 1) * hidden_.getDim().getFeatureLen() +
+                             hidden_.width() * (hidden_.height() - 1));
+        std::copy(hidden_pre, hidden_pre + oslice.width(), hidden_next);
+      } else {
+        // TODO : provide option to initialize the first hidden.
+        //        For now, zero initialization
+        std::fill(hidden_next, hidden_next + oslice.width(), 0.0);
+      }
+
+    } else {
+      // TODO : provide option to initialize the first hidden.
+      //        For now, zero initialization
+      std::fill(hidden_next, hidden_next + oslice.width(), 0.0);
+    }
 
     for (unsigned int t = 0; t < islice.height(); ++t) {
-      Tensor xs = Tensor(TensorDim(1, 1, 1, islice.width()),
-                         islice.getAddress(t * islice.width()));
+      Tensor xs = input_.getSharedDataTensor(TensorDim(1, 1, 1, islice.width()),
+                                             t * islice.width());
       unsigned int id = 0;
       if (t > 0) {
         id = t - 1;
       }
-      Tensor hs = Tensor(TensorDim(1, 1, 1, oslice.width()),
-                         oslice.getAddress(t * oslice.width()));
-      Tensor hs_prev = Tensor(TensorDim(1, 1, 1, oslice.width()),
-                              oslice.getAddress(id * oslice.width()));
-      // Calculate hs_t = tanh(Whh*h_(t-1) + Wxh*X_t))
-      hs = xs.dot(weight_xh).add(hs_prev.dot(weight_hh).add(bias_h));
+
+      // Calculate Hidden
+      // activation(xs.dot(weight_xh).add(hs_prev.dot(weight_hh).add(bias_h)));
+      Tensor hs = oslice.getSharedDataTensor(TensorDim(1, 1, 1, oslice.width()),
+                                             t * oslice.width());
+      Tensor hs_prev = oslice.getSharedDataTensor(
+        TensorDim(1, 1, 1, oslice.width()), id * oslice.width());
+
+      hs_prev.dot(weight_hh, temp);
+
+      xs.dot(weight_xh, hs);
+      temp.add_i(bias_h);
+
+      hs.add_i(temp);
+
       acti_func.run_fn(hs, hs);
     }
   }
@@ -142,11 +180,6 @@ void RNNLayer::calcDerivative() {
 
 void RNNLayer::calcGradient() {
   // NYI
-}
-
-void RNNLayer::setActivation(ActivationType acti_type) {
-  Layer::setActivation(acti_type);
-  acti_func.setActiFunc(acti_type);
 }
 
 } // namespace nntrainer
