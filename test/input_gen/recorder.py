@@ -97,12 +97,15 @@ def _debug_print(
 ##
 # @brief generate data using uniform data from a function and save to the file.
 # @note one-hot label is supported for now, this could be extended if needed.
-def prepare_data(model, input_shape, label_shape, writer_fn, **kwargs):
+def prepare_data(model, input_shape, label_shape, writer_fn, is_onehot, **kwargs):
     initial_input = _rand_like(input_shape)
-    label = tf.one_hot(
-        indices=np.random.randint(0, label_shape[1] - 1, label_shape[0]),
-        depth=label_shape[1],
-    )
+    if is_onehot:
+        label = tf.one_hot(
+            indices=np.random.randint(0, label_shape[1] - 1, label_shape[0]),
+            depth=label_shape[1],
+        )
+    else:
+        label=_rand_like(label_shape)
 
     initial_weights = []
     for layer in model.layers:
@@ -150,7 +153,6 @@ def train_step(model, optimizer, loss_fn, initial_input, label, writer_fn, **kwa
             continue
         layer_output = outputs[layer.name]
 
-        # print("generating for %s" % layer.name)
         gradients = tape.gradient(loss, layer.trainable_weights)
         optimizer.apply_gradients(zip(gradients, layer.trainable_weights))
 
@@ -163,7 +165,6 @@ def train_step(model, optimizer, loss_fn, initial_input, label, writer_fn, **kwa
 
         weights = layer.weights.copy()
         dx = tape.gradient(loss, layer_input)
-
         try:
             gradients = layer.to_nntr_trainable_weights(gradients)
         except AttributeError:
@@ -206,7 +207,7 @@ value_only_formatter = lambda key, value: value
 # @param inputs keras inputs to build a model
 # @param outputs keras outputs to build a model
 def generate_recordable_model(
-    loss_fn_str, model=None, inputs=None, outputs=None, **kwargs
+        loss_fn_str, model=None, inputs=None, outputs=None, is_onehot=False, **kwargs
 ):
     if model is not None:
         if isinstance(model, list):
@@ -257,21 +258,21 @@ def record(
     model=None,
     inputs=None,
     outputs=None,
+    is_onehot=True,
     **kwargs
 ):
     if os.path.isfile(file_name):
         print("Warning: the file %s is being truncated and overwritten" % file_name)
 
     loss_fn = _get_loss_fn(loss_fn_str)
-    model = generate_recordable_model(loss_fn_str, model, inputs, outputs, **kwargs)
+    model = generate_recordable_model(loss_fn_str, model, inputs, outputs, is_onehot, **kwargs)
 
     with open(file_name, "wb") as f:
         write = _get_writer(f)
 
         initial_input, label = prepare_data(
-            model, input_shape, label_shape, write, **kwargs
+            model, input_shape, label_shape, write, is_onehot, **kwargs
         )
-
         for _ in range(iteration):
             _debug_print(
                 iteration="\033[1;33m[%d/%d]\033[0m" % (_ + 1, iteration),
