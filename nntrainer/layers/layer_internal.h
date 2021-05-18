@@ -235,6 +235,7 @@ public:
    *            33. in_length : int ( input length for embedding layer )
    *            34. recurrent_activation :  string (type) - lstm
    *            35. distribute : bool
+   *            36. return_sequences :  bool (type) - lstm
    */
   enum class PropertyType {
     input_shape = 0,
@@ -273,6 +274,7 @@ public:
     in_length = 33,
     recurrent_activation = 34,
     distribute = 35,
+    return_sequences = 36,
     unknown
   };
 

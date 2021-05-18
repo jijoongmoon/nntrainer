@@ -110,6 +110,7 @@ public:
    * - out_dim : int ( output dimesion for embedding layer )
    * - in_length : int ( input length for embedding layer )
    * - recurrent_activation : string (type) - used only in lstm
+   * - return_sequences : bool (type) - used only in lstm
    * - distribute : bool
    */
   /**

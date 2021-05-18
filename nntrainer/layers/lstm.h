@@ -32,20 +32,17 @@ public:
   template <typename... Args>
   LSTMLayer(
     unsigned int unit_ = 0,
-    ActivationType recurrent_activation_type_ = ActivationType::ACT_SIGMOID,
-    Args... args) :
+    ActivationType recurrent_activation_type_ = ActivationType::ACT_NONE,
+    bool sequence = false, Args... args) :
     Layer(args...),
-    unit(unit_) {
-    /* Default Activation Type is tanh */
-    if (getActivationType() == ActivationType::ACT_NONE)
-      setActivation(ActivationType::ACT_TANH);
-    setRecurrentActivation(recurrent_activation_type_);
-  }
+    unit(unit_),
+    recurrent_activation_type(recurrent_activation_type_),
+    return_sequences(sequence){};
 
   /**
    * @brief     Destructor of LSTMLayer
    */
-  ~LSTMLayer(){};
+  ~LSTMLayer() = default;
 
   /**
    *  @brief  Move constructor.
@@ -149,8 +146,11 @@ private:
    */
   Tensor c_prev;
 
+  bool return_sequences;
+
   std::shared_ptr<Var_Grad> mem_cell;
   std::shared_ptr<Var_Grad> fgio;
+  std::shared_ptr<Var_Grad> hidden;
 };
 } // namespace nntrainer
 
