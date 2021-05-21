@@ -122,17 +122,17 @@ private:
   unsigned int unit;
 
   /**
-   * @brief     activation function for h_t : default is tanh
+   * @brief     activation function for h_t : default is sigmoid
    */
   ActiFunc acti_func;
 
   /**
-   * @brief     activation type for recurrent : default is sigmoid
+   * @brief     activation type for recurrent : default is tanh
    */
   ActivationType recurrent_activation_type;
 
   /**
-   * @brief     activation function for recurrent : default is sigmoid
+   * @brief     activation function for recurrent : default is tanh
    */
   ActiFunc recurrent_acti_func;
 

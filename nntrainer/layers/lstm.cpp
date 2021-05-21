@@ -117,12 +117,12 @@ int LSTMLayer::initialize(Manager &manager) {
   c_prev.setZero();
 
   if (Layer::activation_type == ActivationType::ACT_NONE) {
-    Layer::activation_type = ActivationType::ACT_SIGMOID;
+    Layer::activation_type = ActivationType::ACT_TANH;
     acti_func.setActiFunc(activation_type);
   }
 
   if (recurrent_activation_type == ActivationType::ACT_NONE) {
-    recurrent_activation_type = ActivationType::ACT_TANH;
+    recurrent_activation_type = ActivationType::ACT_SIGMOID;
     recurrent_acti_func.setActiFunc(recurrent_activation_type);
   }
 
@@ -229,15 +229,15 @@ void LSTMLayer::forwarding(bool training) {
       Tensor hg = fgio_t.getSharedDataTensor({unit}, unit * 2);
       Tensor ho = fgio_t.getSharedDataTensor({unit}, unit * 3);
 
-      acti_func.run_fn(hf, hf);
-      acti_func.run_fn(hi, hi);
-      acti_func.run_fn(ho, ho);
-      recurrent_acti_func.run_fn(hg, hg);
+      recurrent_acti_func.run_fn(hf, hf);
+      recurrent_acti_func.run_fn(hi, hi);
+      recurrent_acti_func.run_fn(ho, ho);
+      acti_func.run_fn(hg, hg);
 
       hf.multiply(cs_prev, cs);
       cs.add_i(hg.multiply(hi));
 
-      recurrent_acti_func.run_fn(cs, hs);
+      acti_func.run_fn(cs, hs);
       hs.multiply_i(ho);
     }
     // size of h_prev and hs size is same : unit.
@@ -370,9 +370,9 @@ void LSTMLayer::calcGradient() {
       Tensor hg = fgio_t.getSharedDataTensor({unit}, unit * 2);
       Tensor ho = fgio_t.getSharedDataTensor({unit}, unit * 3);
 
-      recurrent_acti_func.run_fn(cs, dho);
+      acti_func.run_fn(cs, dho);
       dho.multiply_i(dh);
-      recurrent_acti_func.run_prime_fn(cs, dc, ho);
+      acti_func.run_prime_fn(cs, dc, ho);
       dc.multiply_i(dh);
       dc.add_i(dc_nx);
 
@@ -381,10 +381,10 @@ void LSTMLayer::calcGradient() {
       dc.multiply(hi, dhg);
       dc.multiply(hf, dc_nx);
 
-      acti_func.run_prime_fn(ho, dho, dho);
-      acti_func.run_prime_fn(hf, dhf, dhf);
-      acti_func.run_prime_fn(hi, dhi, dhi);
-      recurrent_acti_func.run_prime_fn(hg, dhg, dhg);
+      recurrent_acti_func.run_prime_fn(ho, dho, dho);
+      recurrent_acti_func.run_prime_fn(hf, dhf, dhf);
+      recurrent_acti_func.run_prime_fn(hi, dhi, dhi);
+      acti_func.run_prime_fn(hg, dhg, dhg);
 
       float alpha = 1.0;
       if (b != 0) {

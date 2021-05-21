@@ -607,6 +607,7 @@ static std::string input_base = "type = input";
 static std::string fc_base = "type = Fully_connected";
 static std::string conv_base = "type = conv2d | stride = 1,1 | padding = 0,0";
 static std::string lstm_base = "type = lstm";
+static std::string rnn_base = "type = rnn";
 static std::string pooling_base = "type = pooling2d | padding = 0,0";
 static std::string preprocess_flip_base = "type = preprocess_flip";
 static std::string preprocess_translate_base = "type = preprocess_translate";
@@ -1024,43 +1025,82 @@ INI lstm_basic(
   }
 );
 
+INI rnn_basic(
+  "rnn_basic",
+  {
+    nn_base + "loss=mse | batch_size=1",
+    sgd_base + "learning_rate = 0.1",
+    I("input") + input_base + "input_shape=1:2:1",
+    I("rnn") + rnn_base +
+      "unit = 2" + "input_layers=input",
+    I("outputlayer") + fc_base + "unit = 1" + "input_layers=rnn"
+  }
+);
+
+// INI rnn_return_sequences(
+//   "rnn_return_sequences",
+//   {
+//     nn_base + "loss=mse | batch_size=1",
+//     sgd_base + "learning_rate = 0.1",
+//     I("input") + input_base + "input_shape=1:1:1",
+//     I("rnn") + rnn_base +
+//       "unit = 1" + "input_layers=input" + "return_sequences=true",
+//     I("outputlayer") + fc_base + "unit = 1" + "input_layers=rnn"
+//   }
+// );
+
+INI rnn_return_sequences(
+  "rnn_return_sequences",
+  {
+    nn_base + "loss=mse | batch_size=1",
+    sgd_base + "learning_rate = 0.1",
+    I("input") + input_base + "input_shape=1:2:1",
+    I("rnn") + rnn_base +
+      "unit = 2" + "input_layers=input" + "return_sequences=true",
+    I("outputlayer") + fc_base + "unit = 1" + "input_layers=rnn"
+  }
+);
+
 INSTANTIATE_TEST_CASE_P(
   nntrainerModelAutoTests, nntrainerModelTest, ::testing::Values(
-    mkModelTc(fc_sigmoid_mse, "3:1:1:10", 10),
-    mkModelTc(fc_sigmoid_cross, "3:1:1:10", 10),
-    mkModelTc(fc_relu_mse, "3:1:1:2", 10),
-    mkModelTc(fc_bn_sigmoid_cross, "3:1:1:10", 10),
-    mkModelTc(fc_bn_sigmoid_mse, "3:1:1:10", 10),
-    mkModelTc(mnist_conv_cross, "3:1:1:10", 10),
-    mkModelTc(mnist_conv_cross_one_input, "1:1:1:10", 10),
-    /**< single conv2d layer test */
-    mkModelTc(conv_1x1, "3:1:1:10", 10),
-    mkModelTc(conv_input_matches_kernel, "3:1:1:10", 10),
-    mkModelTc(conv_basic, "3:1:1:10", 10),
-    mkModelTc(conv_same_padding, "3:1:1:10", 10),
-    mkModelTc(conv_multi_stride, "3:1:1:10", 10),
-    mkModelTc(conv_uneven_strides, "3:1:1:10", 10),
-    mkModelTc(conv_same_padding_multi_stride, "3:1:1:10", 10),
-    mkModelTc(conv_no_loss_validate, "3:1:1:10", 1),
-    mkModelTc(conv_none_loss_validate, "3:1:1:10", 1),
-    /**< single pooling layer test */
-    mkModelTc(pooling_max_same_padding, "3:1:1:10", 10),
-    mkModelTc(pooling_max_same_padding_multi_stride, "3:1:1:10", 10),
-    mkModelTc(pooling_max_valid_padding, "3:1:1:10", 10),
-    mkModelTc(pooling_avg_same_padding, "3:1:1:10", 10),
-    mkModelTc(pooling_avg_same_padding_multi_stride, "3:1:1:10", 10),
-    mkModelTc(pooling_avg_valid_padding, "3:1:1:10", 10),
-    mkModelTc(pooling_global_avg, "3:1:1:10", 10),
-    mkModelTc(pooling_global_max, "3:1:1:10", 10),
-    /**< augmentation layer */
-#if defined(ENABLE_DATA_AUGMENTATION_OPENCV)
-    mkModelTc(preprocess_translate_validate, "3:1:1:10", 10),
-#endif
-    mkModelTc(preprocess_flip_validate, "3:1:1:10", 10),
-    mkModelTc(fc_softmax_mse_distribute_validate, "3:1:5:3", 1),
-    mkModelTc(fc_softmax_cross_distribute_validate, "3:1:5:3", 1),
-    mkModelTc(fc_sigmoid_cross_distribute_validate, "3:1:5:3", 1),
-    mkModelTc(lstm_basic, "1:1:1:1", 1)
+//     mkModelTc(fc_sigmoid_mse, "3:1:1:10", 10),
+//     mkModelTc(fc_sigmoid_cross, "3:1:1:10", 10),
+//     mkModelTc(fc_relu_mse, "3:1:1:2", 10),
+//     mkModelTc(fc_bn_sigmoid_cross, "3:1:1:10", 10),
+//     mkModelTc(fc_bn_sigmoid_mse, "3:1:1:10", 10),
+//     mkModelTc(mnist_conv_cross, "3:1:1:10", 10),
+//     mkModelTc(mnist_conv_cross_one_input, "1:1:1:10", 10),
+//     /**< single conv2d layer test */
+//     mkModelTc(conv_1x1, "3:1:1:10", 10),
+//     mkModelTc(conv_input_matches_kernel, "3:1:1:10", 10),
+//     mkModelTc(conv_basic, "3:1:1:10", 10),
+//     mkModelTc(conv_same_padding, "3:1:1:10", 10),
+//     mkModelTc(conv_multi_stride, "3:1:1:10", 10),
+//     mkModelTc(conv_uneven_strides, "3:1:1:10", 10),
+//     mkModelTc(conv_same_padding_multi_stride, "3:1:1:10", 10),
+//     mkModelTc(conv_no_loss_validate, "3:1:1:10", 1),
+//     mkModelTc(conv_none_loss_validate, "3:1:1:10", 1),
+//     /**< single pooling layer test */
+//     mkModelTc(pooling_max_same_padding, "3:1:1:10", 10),
+//     mkModelTc(pooling_max_same_padding_multi_stride, "3:1:1:10", 10),
+//     mkModelTc(pooling_max_valid_padding, "3:1:1:10", 10),
+//     mkModelTc(pooling_avg_same_padding, "3:1:1:10", 10),
+//     mkModelTc(pooling_avg_same_padding_multi_stride, "3:1:1:10", 10),
+//     mkModelTc(pooling_avg_valid_padding, "3:1:1:10", 10),
+//     mkModelTc(pooling_global_avg, "3:1:1:10", 10),
+//     mkModelTc(pooling_global_max, "3:1:1:10", 10),
+//     /**< augmentation layer */
+// #if defined(ENABLE_DATA_AUGMENTATION_OPENCV)
+//     mkModelTc(preprocess_translate_validate, "3:1:1:10", 10),
+// #endif
+//     mkModelTc(preprocess_flip_validate, "3:1:1:10", 10),
+//     mkModelTc(fc_softmax_mse_distribute_validate, "3:1:5:3", 1),
+//     mkModelTc(fc_softmax_cross_distribute_validate, "3:1:5:3", 1),
+//     mkModelTc(fc_sigmoid_cross_distribute_validate, "3:1:5:3", 1),
+    // mkModelTc(lstm_basic, "1:1:1:1", 1)
+    // mkModelTc(rnn_basic, "1:1:1:1", 1)
+       mkModelTc(rnn_return_sequences, "1:1:2:1", 1)
+       // mkModelTc(rnn_return_sequences, "1:1:1:1", 1)
 // / #if gtest_version <= 1.7.0
 ));
 /// #else gtest_version > 1.8.0
