@@ -148,7 +148,6 @@ def train_step(model, optimizer, loss_fn, initial_input, label, writer_fn, **kwa
     layer_input = initial_input
 
     for layer in model.layers:
-        # print(layer_output)
         if isinstance(layer, K.layers.Permute):
             continue
         layer_output = outputs[layer.name]
@@ -207,7 +206,7 @@ value_only_formatter = lambda key, value: value
 # @param inputs keras inputs to build a model
 # @param outputs keras outputs to build a model
 def generate_recordable_model(
-        loss_fn_str, model=None, inputs=None, outputs=None, is_onehot=False, **kwargs
+    loss_fn_str, model=None, inputs=None, outputs=None, is_onehot=False, **kwargs
 ):
     if model is not None:
         if isinstance(model, list):
