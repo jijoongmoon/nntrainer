@@ -718,10 +718,14 @@ Tensor &Tensor::dot(Tensor const &m, Tensor &result, bool trans, bool trans_m,
     throw exception::not_supported("Error: support only for rank of dot "
                                    "matrix <= 2");
   }
-  if (trans && dim.rank() > 2) {
-    throw exception::not_supported("Error: support only for rank of dot "
-                                   "matrix <= 2 with trans");
-  }
+
+  // Comment out with intension to support the calculation wrt. batch and height
+  // direction of this tensor. It is OK as long as m is 2D
+  //
+  // if (trans && dim.rank() > 2) {
+  //   throw exception::not_supported("Error: support only for rank of dot "
+  //                                  "matrix <= 2 with trans");
+  // }
 
   unsigned int dim1 = batch() * channel() * height();
   unsigned int dim2 = width();
