@@ -295,6 +295,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+
   std::string weight_file_name = optimize
                                    ? "./res/app/PicoGPT/pico_gpt_124.bin"
                                    : "./res/app/PicoGPT/pico_gpt_mha_fp16.bin";
@@ -367,5 +368,6 @@ int main(int argc, char *argv[]) {
   }
 
   std::cout << std::endl;
+
   return 0;
 }
