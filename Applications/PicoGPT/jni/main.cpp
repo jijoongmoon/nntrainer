@@ -295,7 +295,6 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-
   std::string weight_file_name = optimize
                                    ? "./res/app/PicoGPT/pico_gpt_124.bin"
                                    : "./res/app/PicoGPT/pico_gpt_mha_fp16.bin";
@@ -354,6 +353,7 @@ int main(int argc, char *argv[]) {
     for (auto element : ids) {
       token_ids.push_back(static_cast<int64_t>(element));
     }
+
     if (i >= init_input_seq_len) {
       auto decoded_str = tokenizer.decode(token_ids);
       std::cerr << decoded_str << " " << std::flush;
