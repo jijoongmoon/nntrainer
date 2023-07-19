@@ -77,7 +77,7 @@ TEST(nntrainer_TensorDim, setTensorDim_01_nhwc_p) {
   int status = ML_ERROR_NONE;
 
   nntrainer::TensorDim tensor_dim;
-  status = tensor_dim.setTensorDim("1:2:3:4", NHWC_, FP32_);
+  status = tensor_dim.setTensorDim("1:2:3:4", {NHWC_, FP32_});
   EXPECT_EQ(status, ML_ERROR_NONE);
 }
 
@@ -85,7 +85,7 @@ TEST(nntrainer_TensorDim, setTensorDim_02__nhwc_n) {
   int status = ML_ERROR_NONE;
 
   nntrainer::TensorDim tensor_dim;
-  status = tensor_dim.setTensorDim("1:2:3:4:5", NHWC_, FP32_);
+  status = tensor_dim.setTensorDim("1:2:3:4:5", {NHWC_, FP32_});
   EXPECT_EQ(status, ML_ERROR_INVALID_PARAMETER);
 }
 
@@ -140,7 +140,7 @@ TEST(nntrainer_Tensor, Tensor_03_nhwc_p) {
     in.push_back(ttv);
   }
 
-  nntrainer::Tensor tensor = nntrainer::Tensor(in, NHWC_, FP32_);
+  nntrainer::Tensor tensor = nntrainer::Tensor(in, {NHWC_, FP32_});
   ASSERT_NE(nullptr, tensor.getData());
 
   if (tensor.getValue(0, 1, 0, 0) != 1.0)
@@ -1825,7 +1825,7 @@ TEST(nntrainer_Tensor, sum_02_nhwc_p) {
                                                                  {225, 228},
                                                                  {231, 234},
                                                                  {237, 240}}}}),
-    NHWC_, FP32_);
+    {NHWC_, FP32_});
 
   nntrainer::Tensor ans1(
     std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -1844,7 +1844,7 @@ TEST(nntrainer_Tensor, sum_02_nhwc_p) {
          {231},
          {235},
          {239}}}}),
-    NHWC_, FP32_);
+    {NHWC_, FP32_});
 
   nntrainer::Tensor ans2(
     std::vector<std::vector<std::vector<std::vector<float>>>>({{{{22, 24},
@@ -1877,14 +1877,14 @@ TEST(nntrainer_Tensor, sum_02_nhwc_p) {
                                                                  {210, 212},
                                                                  {214, 216},
                                                                  {218, 220}}}}),
-    NHWC_, FP32_);
+    {NHWC_, FP32_});
 
   nntrainer::Tensor ans3(
     std::vector<std::vector<std::vector<std::vector<float>>>>(
       {{{{100, 110}}, {{300, 310}}},
        {{{500, 510}}, {{700, 710}}},
        {{{900, 910}}, {{1100, 1110}}}}),
-    NHWC_, FP32_);
+    {NHWC_, FP32_});
 
   nntrainer::Tensor input(batch, channel, height, width, NHWC_, FP32_);
   GEN_TEST_INPUT_NHWC(input, i * (height * width * channel) +
@@ -1934,7 +1934,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {225, 228},
            {231, 234},
            {237, 240}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_1_1_0(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -1972,7 +1972,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {231},
            {235},
            {239}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_2_1_0(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -2007,14 +2007,14 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {210, 212},
            {214, 216},
            {218, 220}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_3_1_0(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
         {{{{100, 110}}, {{300, 310}}},
          {{{500, 510}}, {{700, 710}}},
          {{{900, 910}}, {{1100, 1110}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor result_0_1_0 = input.sum(0, 1);
     nntrainer::Tensor result_1_1_0 = input.sum(1, 1);
@@ -2051,7 +2051,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {295, 300},
            {305, 310},
            {315, 320}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_1_1_2(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -2097,7 +2097,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {347},
            {353},
            {359}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_2_1_2(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -2131,7 +2131,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {320, 324},
            {328, 332},
            {336, 340}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_3_1_2(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -2139,7 +2139,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
         {{{{102, 114}}, {{306, 318}}},
          {{{510, 522}}, {{714, 726}}},
          {{{918, 930}}, {{1122, 1134}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor output_0_1_2(1, channel, height, width, NHWC_, FP32_);
     {
@@ -2204,7 +2204,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {450, 456},
            {462, 468},
            {474, 480}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_1_2_0(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -2250,7 +2250,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {462},
            {470},
            {478}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_2_2_0(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -2285,7 +2285,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {420, 424},
            {428, 432},
            {436, 440}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_3_2_0(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -2293,7 +2293,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
         {{{{200, 220}}, {{600, 620}}},
          {{{1000, 1020}}, {{1400, 1420}}},
          {{{1800, 1820}}, {{2200, 2220}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor result_0_2_0 = input.sum(0, 2);
     nntrainer::Tensor result_1_2_0 = input.sum(1, 2);
@@ -2330,7 +2330,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {520, 528},
            {536, 544},
            {552, 560}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_1_2_2(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -2385,7 +2385,7 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {578},
            {588},
            {598}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_2_2_2(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
@@ -2419,14 +2419,14 @@ TEST(nntrainer_Tensor, sum_03_nhwc_p) {
            {530, 536},
            {542, 548},
            {554, 560}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor ans_3_2_2(
       std::vector<std::vector<std::vector<std::vector<float>>>>(
         {{{{202, 224}}, {{606, 628}}},
          {{{1010, 1032}}, {{1414, 1436}}},
          {{{1818, 1840}}, {{2222, 2244}}}}),
-      NHWC_, FP32_);
+      {NHWC_, FP32_});
 
     nntrainer::Tensor output_0_2_2(1, channel, height, width, NHWC_, FP32_);
     {
