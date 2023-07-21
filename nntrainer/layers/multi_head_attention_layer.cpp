@@ -372,13 +372,10 @@ void MultiHeadAttentionLayer::forwarding(RunLayerContext &context,
   const TensorDim query_dim = query.getDim();
   const unsigned int batch_size = query_dim.batch();
   const unsigned int query_height = query_dim.height();
-  const unsigned int query_width = query_dim.width();
   const TensorDim key_dim = key.getDim();
   const unsigned int key_height = key_dim.height();
-  const unsigned int input_key_width_size = key_dim.width();
   const TensorDim value_dim = value.getDim();
   const unsigned int value_height = value_dim.height();
-  const unsigned int input_value_width_size = value_dim.width();
 
   query.dot(query_fc_weight, projected_query);
   if (!disable_bias) {
@@ -778,7 +775,6 @@ void MultiHeadAttentionLayer::calcGradient(RunLayerContext &context) {
 
   const TensorDim value_dim = value.getDim();
   const unsigned int value_height = value_dim.height();
-
 
   attention_output.dot_deriv_wrt_2(
     d_fc_weight, incoming_derivative, false, false,

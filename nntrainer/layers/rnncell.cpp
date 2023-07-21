@@ -176,7 +176,6 @@ void RNNCellLayer::forwarding(RunLayerContext &context, bool training) {
     context.getInput(INOUT_INDEX::INPUT_HIDDEN_STATE);
   Tensor &hidden_state = context.getOutput(INOUT_INDEX::OUTPUT_HIDDEN_STATE);
 
-
   const Tensor &weight_ih = context.getWeight(wt_idx[RNNCellParams::weight_ih]);
   const Tensor &weight_hh = context.getWeight(wt_idx[RNNCellParams::weight_hh]);
   Tensor empty;
@@ -259,7 +258,6 @@ void RNNCellLayer::calcGradient(RunLayerContext &context) {
     context.getOutput(INOUT_INDEX::OUTPUT_HIDDEN_STATE);
   const Tensor &d_hidden_state =
     context.getIncomingDerivative(INOUT_INDEX::OUTPUT_HIDDEN_STATE);
-
 
   Tensor &d_weight_ih = context.getWeightGrad(wt_idx[RNNCellParams::weight_ih]);
   Tensor &d_weight_hh = context.getWeightGrad(wt_idx[RNNCellParams::weight_hh]);
