@@ -867,6 +867,7 @@ TEST(nntrainer_Tensor, multiply_i_broadcast_01_fp16_p) {
   }
 }
 
+
 TEST(nntrainer_Tensor, multiply_i_broadcast_not_supported_01_n) {
 
   nntrainer::Tensor target(3, 1, 3, 1, nntrainer::Tformat::NCHW,
