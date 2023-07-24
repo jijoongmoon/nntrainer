@@ -441,11 +441,11 @@ TEST(TensorPool, validate_memory) {
  * @param t2 tensor2
  */
 static void testNoOverlap(nntrainer::Tensor *t1, nntrainer::Tensor *t2) {
-  char *t1_start = t1->getData<char>();
-  char *t1_end = t1_start + t1->bytes();
+  float *t1_start = t1->getData<float>();
+  float *t1_end = t1_start + t1->bytes();
 
-  char *t2_start = t2->getData<char>();
-  char *t2_end = t2_start + t2->bytes();
+  float *t2_start = t2->getData<float>();
+  float *t2_end = t2_start + t2->bytes();
 
   EXPECT_NE(t1_start, nullptr);
   EXPECT_NE(t2_start, nullptr);
@@ -460,11 +460,11 @@ static void testNoOverlap(nntrainer::Tensor *t1, nntrainer::Tensor *t2) {
  * @param t2 t2 tensor 2
  */
 static void testSubset(nntrainer::Tensor *t1, nntrainer::Tensor *t2) {
-  char *t1_start = t1->getData<char>();
-  char *t1_end = t1_start + t1->bytes();
-
-  char *t2_start = t2->getData<char>();
-  char *t2_end = t2_start + t2->bytes();
+  float *t1_start = t1->getData<float>();
+  float *t1_end = t1_start + t1->bytes();
+  
+  float *t2_start = t2->getData<float>();
+  float *t2_end = t2_start + t2->bytes();
 
   EXPECT_NE(t1_start, nullptr);
   EXPECT_NE(t2_start, nullptr);

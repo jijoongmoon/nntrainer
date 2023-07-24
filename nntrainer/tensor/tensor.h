@@ -1613,7 +1613,7 @@ public:
       return nullptr;
 
     data->validate();
-    return (T *)((data->getAddr<T>()) + offset);
+    return (T *)((data->getAddr<T>()) + offset * sizeof(T));
   }
 
   /**
@@ -1625,7 +1625,7 @@ public:
       return nullptr;
 
     data->validate();
-    return (T *)(data->getAddr<T>() + offset);
+    return (T *)(data->getAddr<T>() + offset * sizeof(T));
   }
 
   /**
@@ -1639,7 +1639,7 @@ public:
     size_t index = idx * sizeof(T);
 
     data->validate();
-    return (T *)(data->getAddr<T>() + offset + index);
+    return (T *)(data->getAddr<T>() + (offset + index) * sizeof(T));
   }
 
   void setDataType(Tdatatype d_type) { dim.setDataType(d_type); }
