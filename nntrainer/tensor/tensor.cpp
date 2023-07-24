@@ -895,8 +895,6 @@ int Tensor::add_i(Tensor const &m, float const alpha) {
       ml_loge("%s %s", typeid(err).name(), err.what());
       return ML_ERROR_INVALID_PARAMETER;
     }
-
-    return ML_ERROR_NONE;
   } else if (dim.getDataType() == ml::train::TensorDim::DataType::FP16) {
     auto f = [&](const BroadcastInfo &e, const __fp16 *buf, const __fp16 *m_buf,
                  __fp16 *out_buf) {
@@ -914,9 +912,9 @@ int Tensor::add_i(Tensor const &m, float const alpha) {
       ml_loge("%s %s", typeid(err).name(), err.what());
       return ML_ERROR_INVALID_PARAMETER;
     }
-
-    return ML_ERROR_NONE;
   }
+  
+  return ML_ERROR_NONE;
 }
 
 Tensor Tensor::add(Tensor const &m, float const alpha) const {
@@ -981,11 +979,12 @@ Tensor &Tensor::subtract(float const &value, Tensor &out) const {
   /// @todo add unittest
   if (dim.getDataType() == ml::train::TensorDim::DataType::FP32) {
     auto f = std::bind(std::minus<float>(), std::placeholders::_1, value);
-    return apply(f, out);
+    apply(f, out);
   } else if (dim.getDataType() == ml::train::TensorDim::DataType::FP16) {
     auto f = std::bind(std::minus<__fp16>(), std::placeholders::_1, value);
-    return apply(f, out);
+    apply(f, out);
   }
+  return out;
 }
 
 int Tensor::subtract_i(Tensor const &m) { return add_i(m, -1); }
@@ -1009,12 +1008,13 @@ Tensor Tensor::pow(float exponent) const {
 Tensor &Tensor::pow(float exponent, Tensor &out) const {
   if (dim.getDataType() == ml::train::TensorDim::DataType::FP32) {
     auto f = [exponent](float in) { return powf(in, exponent); };
-    return apply(f, out);
+    apply(f, out);
   }
-  if (dim.getDataType() == ml::train::TensorDim::DataType::FP16) {
+  else if (dim.getDataType() == ml::train::TensorDim::DataType::FP16) {
     auto f = [exponent](__fp16 in) { return powf(in, exponent); };
-    return apply(f, out);
+    apply(f, out);
   }
+  return out;
 }
 
 Tensor Tensor::getBatchSlice(size_t offset, unsigned int size) const {
@@ -1137,6 +1137,8 @@ std::vector<Tensor> Tensor::split(std::vector<size_t> sizes, int axis) {
 
   bool is_format_nchw = (dim.getFormat() == Tformat::NCHW) ? true : false;
 
+  std::vector<Tensor> ret;
+
   if (getDataType() == ml::train::TensorDim::DataType::FP32) {
     auto iter_value = [this, is_format_nchw](
                         std::array<size_t, 4> &loc,
@@ -1155,7 +1157,6 @@ std::vector<Tensor> Tensor::split(std::vector<size_t> sizes, int axis) {
       return value;
     };
 
-    std::vector<Tensor> ret;
     ret.reserve(num_size);
 
     unsigned int accumulated_size = 0;
@@ -1214,8 +1215,6 @@ std::vector<Tensor> Tensor::split(std::vector<size_t> sizes, int axis) {
         return iter_value(loc, end_loc, reset_dim_arr);
       });
     }
-
-    return ret;
   }
   if (getDataType() == ml::train::TensorDim::DataType::FP16) {
     auto iter_value =
@@ -1236,7 +1235,6 @@ std::vector<Tensor> Tensor::split(std::vector<size_t> sizes, int axis) {
       return value;
     };
 
-    std::vector<Tensor> ret;
     ret.reserve(num_size);
 
     unsigned int accumulated_size = 0;
@@ -1295,9 +1293,8 @@ std::vector<Tensor> Tensor::split(std::vector<size_t> sizes, int axis) {
         return iter_value(loc, end_loc, reset_dim_arr);
       });
     }
-
-    return ret;
   }
+  return ret;
 }
 
 Tensor Tensor::cat(const std::vector<Tensor> &tensors, int axis) {
@@ -1329,6 +1326,11 @@ Tensor Tensor::cat(const std::vector<Tensor> &tensors, int axis) {
                                   [axis](unsigned cur, const Tensor &t) {
                                     return cur += t.getDim().getTensorDim(axis);
                                   });
+  auto ret_dim = ref_dim;
+  ret_dim.setTensorDim(axis, axis_dim);
+
+  auto ret = Tensor(ret_dim);
+
   if (ref_dim.getDataType() == ml::train::TensorDim::DataType::FP32) {
     auto iter_value =
       [is_format_nchw](std::array<unsigned, 4> &loc,
@@ -1348,11 +1350,6 @@ Tensor Tensor::cat(const std::vector<Tensor> &tensors, int axis) {
       }
       return value;
     };
-
-    auto ret_dim = ref_dim;
-    ret_dim.setTensorDim(axis, axis_dim);
-
-    auto ret = Tensor(ret_dim);
 
     std::array<unsigned, 4> loc = {0, 0, 0, 0};
     for (auto &t : tensors) {
@@ -1386,8 +1383,6 @@ Tensor Tensor::cat(const std::vector<Tensor> &tensors, int axis) {
         }
       }
     }
-
-    return ret;
   } else if (ref_dim.getDataType() == ml::train::TensorDim::DataType::FP16) {
     auto iter_value =
       [is_format_nchw](std::array<unsigned, 4> &loc,
@@ -1407,11 +1402,6 @@ Tensor Tensor::cat(const std::vector<Tensor> &tensors, int axis) {
       }
       return value;
     };
-
-    auto ret_dim = ref_dim;
-    ret_dim.setTensorDim(axis, axis_dim);
-
-    auto ret = Tensor(ret_dim);
 
     std::array<unsigned, 4> loc = {0, 0, 0, 0};
     for (auto &t : tensors) {
@@ -1445,9 +1435,9 @@ Tensor Tensor::cat(const std::vector<Tensor> &tensors, int axis) {
         }
       }
     }
-
-    return ret;
   }
+  
+  return ret;
 }
 
 void Tensor::makeSharedDataTensor(const Tensor &src, size_t offset) {
@@ -1734,7 +1724,6 @@ Tensor &Tensor::sum(unsigned int axis, Tensor &ret, float alpha,
     default:
       throw std::out_of_range("Error: Dimension cannot exceed 3");
     }
-    return ret;
   } else if (getDataType() == ml::train::TensorDim::DataType::FP16) {
     const __fp16 *data = getData<__fp16>();
 
@@ -1841,8 +1830,8 @@ Tensor &Tensor::sum(unsigned int axis, Tensor &ret, float alpha,
     default:
       throw std::out_of_range("Error: Dimension cannot exceed 3");
     }
-    return ret;
   }
+  return ret;
 }
 
 Tensor Tensor::sum(const std::vector<unsigned int> &axes, float alpha) const {
@@ -2956,33 +2945,39 @@ float Tensor::l2norm() const {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot get l2norm.";
 
+  float ret = 0; // @todo fix ret to template
   unsigned int len = size();
   if (getDataType() == ml::train::TensorDim::DataType::FP32) {
     const float *data = getData<float>();
-    return snrm2(len, data, 1);
+    ret = snrm2(len, data, 1);
   } else if (getDataType() == ml::train::TensorDim::DataType::FP16) {
     const __fp16 *data = getData<__fp16>();
-    return snrm2(len, data, 1);
+    ret = snrm2(len, data, 1);
   }
+
+  return ret;
 }
 
 float Tensor::max_abs() const {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot get max_abs.";
 
+  float ret = 0; // @todo fix ret to template
   unsigned int len = size();
   if (getDataType() == ml::train::TensorDim::DataType::FP32) {
     const float *data = getData<float>();
 
     unsigned int idx = isamax(len, data, 1);
-    return *(data + idx);
+    ret = *(data + idx);
 
   } else if (getDataType() == ml::train::TensorDim::DataType::FP16) {
     const __fp16 *data = getData<__fp16>();
 
     unsigned int idx = isamax(len, data, 1);
-    return *(data + idx);
+    ret = *(data + idx);
   }
+
+  return ret;
 }
 
 Tensor &Tensor::normalization(Tensor &output) const {
@@ -3166,7 +3161,6 @@ Tensor Tensor::rotate_180(Tensor in) {
         }
       }
     }
-    return output;
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
     output.setZero();
     for (unsigned int i = 0; i < in.batch(); ++i) {
@@ -3180,8 +3174,8 @@ Tensor Tensor::rotate_180(Tensor in) {
         }
       }
     }
-    return output;
   }
+  return output;
 }
 
 } /* namespace nntrainer */

@@ -29,18 +29,6 @@
     }                                        \
   } while (0);
 
-// #define sgemv_loop_fp16(ci, cj, cM, cN)      \
-//   do {                                       \
-//     __fp16 y0;                               \
-//     unsigned int i, j;                       \
-//     for (ci = 0; ci != cM; ci++) {           \
-//       y0 = Y[ci * incy] * beta;              \
-//       for (cj = 0; cj != cN; cj++)           \
-//         y0 += A[i + j * lda] * X[cj * incx]; \
-//       Y[ci * incy] = y0;                     \
-//     }                                        \
-//   } while (0);
-
 namespace nntrainer {
 
 #ifndef USE_BLAS
