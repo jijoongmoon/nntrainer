@@ -3753,7 +3753,7 @@ TEST(nntrainer_Tensor, print_small_size_nhwc_p) {
 
   expected << '<' << typeid(target).name() << " at " << &target << ">\n"
            << "data addr: " << target.getData() << '\n'
-           << "Shape: 3:3:1:2\n"
+           << "Shape: 3:3:1:2 [ FP32 : NHWC ]\n"
            << "         1          1          1 \n"
            << "         1          1          1 \n"
            << "\n"
@@ -3801,7 +3801,7 @@ TEST(nntrainer_Tensor, cat_01_nhwc_p) {
     inputs.emplace_back(ranged(2, 2, 1, 1, NHWC_, FP32_));
     inputs.emplace_back(ranged(2, 2, 2, 1, NHWC_, FP32_));
     float answer_data[] = {0, 1, 0, 1, 2, 3, 2, 3, 4, 5, 6, 7};
-    nntrainer::Tensor answer(ml::train::TensorDim({2, 2, 3, 1}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({2, 2, 3, 1}, {NHWC_, FP32_}),
                              answer_data);
     EXPECT_EQ(nntrainer::Tensor::cat(inputs, 2), answer);
   }
@@ -3825,7 +3825,7 @@ TEST(nntrainer_Tensor, cat_01_nhwc_p) {
       45,  46,  47,  48,  49,  50,  51,  52,  53,  54,  55,  56,  57,  58,  59,
       60,  61,  62,  63,  64,  65,  66,  67,  68,  69,  70,  71,  72,  73,  74,
       75,  76,  77,  78,  79};
-    nntrainer::Tensor answer(ml::train::TensorDim({5, 2, 4, 5}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({5, 2, 4, 5}, {NHWC_, FP32_}),
                              answer_data);
     EXPECT_EQ(nntrainer::Tensor::cat(inputs, 0), answer);
   }
@@ -3857,7 +3857,7 @@ TEST(nntrainer_Tensor, cat_01_nhwc_p) {
       86,  87,  88,  89,  90,  91,  92,  93,  94,  95,  96,  97,  98,  99,
       100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113,
       114, 115, 116, 117, 118, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 5, 4}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 5, 4}, {NHWC_, FP32_}),
                              answer_data);
     EXPECT_EQ(nntrainer::Tensor::cat(inputs, 2), answer);
   }
@@ -3872,7 +3872,7 @@ TEST(nntrainer_Tensor, cat_01_nhwc_p) {
       21, 22, 23, 24, 25, 26, 27, 28, 29, 15, 16, 17, 18, 19, 30, 31, 32, 33,
       34, 35, 36, 37, 38, 39, 20, 21, 22, 23, 24, 40, 41, 42, 43, 44, 45, 46,
       47, 48, 49, 25, 26, 27, 28, 29, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 2, 3}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 2, 3}, {NHWC_, FP32_}),
                              answer_data);
     EXPECT_EQ(nntrainer::Tensor::cat(inputs, 3), answer);
   }
@@ -3891,7 +3891,7 @@ TEST(nntrainer_Tensor, cat_01_nhwc_p) {
       15, 45, 46, 47, 30, 31, 16, 48, 49, 50, 32, 33, 17, 51, 52, 53, 34, 35,
       18, 54, 55, 56, 36, 37, 19, 57, 58, 59, 38, 39, 20, 60, 61, 62, 40, 41,
       21, 63, 64, 65, 42, 43, 22, 66, 67, 68, 44, 45, 23, 69, 70, 71, 46, 47};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 6, 2, 4}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 6, 2, 4}, {NHWC_, FP32_}),
                              answer_data);
     EXPECT_EQ(nntrainer::Tensor::cat(inputs, 1), answer);
   }
@@ -4088,7 +4088,7 @@ TEST(nntrainer_Tensor, split_01_nhwc_p) {
                              10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
                              20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
                              30, 31, 32, 33, 34, 35, 36, 37, 38, 39};
-      answer.emplace_back(ml::train::TensorDim({1, 5, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({1, 5, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4096,7 +4096,7 @@ TEST(nntrainer_Tensor, split_01_nhwc_p) {
                              50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
                              60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
                              70, 71, 72, 73, 74, 75, 76, 77, 78, 79};
-      answer.emplace_back(ml::train::TensorDim({1, 5, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({1, 5, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4104,7 +4104,7 @@ TEST(nntrainer_Tensor, split_01_nhwc_p) {
                              90,  91,  92,  93,  94,  95,  96,  97,  98,  99,
                              100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
                              110, 111, 112, 113, 114, 115, 116, 117, 118, 119};
-      answer.emplace_back(ml::train::TensorDim({1, 5, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({1, 5, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split(3, 0), answer);
@@ -4120,7 +4120,7 @@ TEST(nntrainer_Tensor, split_01_nhwc_p) {
                              44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
                              56, 57, 58, 59, 80, 81, 82, 83, 84, 85, 86, 87,
                              88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99};
-      answer.emplace_back(ml::train::TensorDim({3, 5, 1, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 5, 1, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4130,7 +4130,7 @@ TEST(nntrainer_Tensor, split_01_nhwc_p) {
                              70,  71,  72,  73,  74,  75,  76,  77,  78,  79,
                              100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
                              110, 111, 112, 113, 114, 115, 116, 117, 118, 119};
-      answer.emplace_back(ml::train::TensorDim({3, 5, 1, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 5, 1, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split(2, 2), answer);
@@ -4146,7 +4146,7 @@ TEST(nntrainer_Tensor, split_01_nhwc_p) {
         25, 26, 27, 28, 29, 40,  41,  42,  43,  44,  45,  46,  47,  48,  49,
         60, 61, 62, 63, 64, 65,  66,  67,  68,  69,  80,  81,  82,  83,  84,
         85, 86, 87, 88, 89, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109};
-      answer.emplace_back(ml::train::TensorDim({3, 5, 2, 2}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 5, 2, 2}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4155,7 +4155,7 @@ TEST(nntrainer_Tensor, split_01_nhwc_p) {
         35, 36, 37, 38, 39, 50,  51,  52,  53,  54,  55,  56,  57,  58,  59,
         70, 71, 72, 73, 74, 75,  76,  77,  78,  79,  90,  91,  92,  93,  94,
         95, 96, 97, 98, 99, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119};
-      answer.emplace_back(ml::train::TensorDim({3, 5, 2, 2}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 5, 2, 2}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split(2, 3), answer);
@@ -4169,35 +4169,35 @@ TEST(nntrainer_Tensor, split_01_nhwc_p) {
       float answer_data[] = {0,  5,  10, 15, 20,  25,  30,  35,
                              40, 45, 50, 55, 60,  65,  70,  75,
                              80, 85, 90, 95, 100, 105, 110, 115};
-      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
       float answer_data[] = {1,  6,  11, 16, 21,  26,  31,  36,
                              41, 46, 51, 56, 61,  66,  71,  76,
                              81, 86, 91, 96, 101, 106, 111, 116};
-      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
       float answer_data[] = {2,  7,  12, 17, 22,  27,  32,  37,
                              42, 47, 52, 57, 62,  67,  72,  77,
                              82, 87, 92, 97, 102, 107, 112, 117};
-      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
       float answer_data[] = {3,  8,  13, 18, 23,  28,  33,  38,
                              43, 48, 53, 58, 63,  68,  73,  78,
                              83, 88, 93, 98, 103, 108, 113, 118};
-      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
       float answer_data[] = {4,  9,  14, 19, 24,  29,  34,  39,
                              44, 49, 54, 59, 64,  69,  74,  79,
                              84, 89, 94, 99, 104, 109, 114, 119};
-      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split(5, 1), answer);
@@ -4209,12 +4209,12 @@ TEST(nntrainer_Tensor, split_01_nhwc_p) {
     answer.reserve(2);
     {
       float answer_data[] = {0, 1, 2, 6, 7, 8, 12, 13, 14, 18, 19, 20};
-      answer.emplace_back(ml::train::TensorDim({1, 3, 1, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({1, 3, 1, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
       float answer_data[] = {3, 4, 5, 9, 10, 11, 15, 16, 17, 21, 22, 23};
-      answer.emplace_back(ml::train::TensorDim({1, 3, 1, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({1, 3, 1, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split(2, 1), answer);
@@ -4244,7 +4244,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
         32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
         48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
         64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79};
-      answer.emplace_back(ml::train::TensorDim({2, 5, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({2, 5, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4252,7 +4252,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
                              90,  91,  92,  93,  94,  95,  96,  97,  98,  99,
                              100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
                              110, 111, 112, 113, 114, 115, 116, 117, 118, 119};
-      answer.emplace_back(ml::train::TensorDim({1, 5, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({1, 5, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split({2, 1}, 0), answer);
@@ -4268,7 +4268,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
                              44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
                              56, 57, 58, 59, 80, 81, 82, 83, 84, 85, 86, 87,
                              88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99};
-      answer.emplace_back(ml::train::TensorDim({3, 5, 1, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 5, 1, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4278,7 +4278,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
                              70,  71,  72,  73,  74,  75,  76,  77,  78,  79,
                              100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
                              110, 111, 112, 113, 114, 115, 116, 117, 118, 119};
-      answer.emplace_back(ml::train::TensorDim({3, 5, 1, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 5, 1, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split({1, 1}, 2), answer);
@@ -4294,7 +4294,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
         25, 26, 27, 28, 29, 40,  41,  42,  43,  44,  45,  46,  47,  48,  49,
         60, 61, 62, 63, 64, 65,  66,  67,  68,  69,  80,  81,  82,  83,  84,
         85, 86, 87, 88, 89, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109};
-      answer.emplace_back(ml::train::TensorDim({3, 5, 2, 2}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 5, 2, 2}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4303,7 +4303,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
         35, 36, 37, 38, 39, 50,  51,  52,  53,  54,  55,  56,  57,  58,  59,
         70, 71, 72, 73, 74, 75,  76,  77,  78,  79,  90,  91,  92,  93,  94,
         95, 96, 97, 98, 99, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119};
-      answer.emplace_back(ml::train::TensorDim({3, 5, 2, 2}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 5, 2, 2}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split({2, 2}, 3), answer);
@@ -4317,7 +4317,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
       float answer_data[] = {0,  5,  10, 15, 20,  25,  30,  35,
                              40, 45, 50, 55, 60,  65,  70,  75,
                              80, 85, 90, 95, 100, 105, 110, 115};
-      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4327,14 +4327,14 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
         51,  52,  53,  56,  57,  58,  61,  62,  63,  66,  67,  68, 71, 72, 73,
         76,  77,  78,  81,  82,  83,  86,  87,  88,  91,  92,  93, 96, 97, 98,
         101, 102, 103, 106, 107, 108, 111, 112, 113, 116, 117, 118};
-      answer.emplace_back(ml::train::TensorDim({3, 3, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 3, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
       float answer_data[] = {4,  9,  14, 19, 24,  29,  34,  39,
                              44, 49, 54, 59, 64,  69,  74,  79,
                              84, 89, 94, 99, 104, 109, 114, 119};
-      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split({1, 3, 1}, 1), answer);
@@ -4349,7 +4349,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
         0,  1,  5,  6,  10, 11, 15, 16, 20,  21,  25,  26,  30,  31,  35,  36,
         40, 41, 45, 46, 50, 51, 55, 56, 60,  61,  65,  66,  70,  71,  75,  76,
         80, 81, 85, 86, 90, 91, 95, 96, 100, 101, 105, 106, 110, 111, 115, 116};
-      answer.emplace_back(ml::train::TensorDim({3, 2, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 2, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4357,14 +4357,14 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
         2,  3,  7,  8,  12, 13, 17, 18, 22,  23,  27,  28,  32,  33,  37,  38,
         42, 43, 47, 48, 52, 53, 57, 58, 62,  63,  67,  68,  72,  73,  77,  78,
         82, 83, 87, 88, 92, 93, 97, 98, 102, 103, 107, 108, 112, 113, 117, 118};
-      answer.emplace_back(ml::train::TensorDim({3, 2, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 2, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
       float answer_data[] = {4,  9,  14, 19, 24,  29,  34,  39,
                              44, 49, 54, 59, 64,  69,  74,  79,
                              84, 89, 94, 99, 104, 109, 114, 119};
-      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 1, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split({2, 2, 1}, 1), answer);
@@ -4379,7 +4379,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
         0,  1,  5,  6,  10, 11, 15, 16, 20,  21,  25,  26,  30,  31,  35,  36,
         40, 41, 45, 46, 50, 51, 55, 56, 60,  61,  65,  66,  70,  71,  75,  76,
         80, 81, 85, 86, 90, 91, 95, 96, 100, 101, 105, 106, 110, 111, 115, 116};
-      answer.emplace_back(ml::train::TensorDim({3, 2, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 2, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
@@ -4389,7 +4389,7 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
         52,  53,  54,  57,  58,  59,  62,  63,  64,  67,  68,  69, 72, 73, 74,
         77,  78,  79,  82,  83,  84,  87,  88,  89,  92,  93,  94, 97, 98, 99,
         102, 103, 104, 107, 108, 109, 112, 113, 114, 117, 118, 119};
-      answer.emplace_back(ml::train::TensorDim({3, 3, 2, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({3, 3, 2, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split({2, 3}, 1), answer);
@@ -4401,17 +4401,17 @@ TEST(nntrainer_Tensor, split_04_nhwc_p) {
     answer.reserve(3);
     {
       float answer_data[] = {0, 6, 12, 18};
-      answer.emplace_back(ml::train::TensorDim({1, 1, 1, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({1, 1, 1, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
       float answer_data[] = {1, 2, 3, 7, 8, 9, 13, 14, 15, 19, 20, 21};
-      answer.emplace_back(ml::train::TensorDim({1, 3, 1, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({1, 3, 1, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     {
       float answer_data[] = {4, 5, 10, 11, 16, 17, 22, 23};
-      answer.emplace_back(ml::train::TensorDim({1, 2, 1, 4}, NHWC_, FP32_),
+      answer.emplace_back(ml::train::TensorDim({1, 2, 1, 4}, {NHWC_, FP32_}),
                           answer_data);
     }
     EXPECT_EQ(t.split({1, 3, 2}, 1), answer);
@@ -4450,7 +4450,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       84,  85,  86,  87,  88,  89,  90,  91,  92,  93,  94,  95,  96,  97,
       98,  99,  100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
       112, 113, 114, 115, 116, 117, 118, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 2, 4}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 2, 4}, {NHWC_, FP32_}),
                              answer_data);
     nntrainer::Tensor m = t.transpose("0:1:2");
     EXPECT_EQ(answer, m);
@@ -4468,7 +4468,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       81,  86,  91,  96,  82,  87,  92,  97,  83,  88,  93,  98,  84,  89,
       94,  99,  100, 105, 110, 115, 101, 106, 111, 116, 102, 107, 112, 117,
       103, 108, 113, 118, 104, 109, 114, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 4, 2, 5}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 4, 2, 5}, {NHWC_, FP32_}),
                              answer_data);
     nntrainer::Tensor m = t.transpose("2:1:0");
     EXPECT_EQ(answer, m);
@@ -4486,7 +4486,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       84,  100, 101, 102, 103, 104, 85,  86,  87,  88,  89,  105, 106, 107,
       108, 109, 90,  91,  92,  93,  94,  110, 111, 112, 113, 114, 95,  96,
       97,  98,  99,  115, 116, 117, 118, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 4, 2}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 4, 2}, {NHWC_, FP32_}),
                              answer_data);
     nntrainer::Tensor m = t.transpose("0:2:1");
     EXPECT_EQ(answer, m);
@@ -4503,7 +4503,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       80, 100, 81, 101, 82, 102, 83, 103, 84, 104, 85, 105, 86, 106, 87, 107,
       88, 108, 89, 109, 90, 110, 91, 111, 92, 112, 93, 113, 94, 114, 95, 115,
       96, 116, 97, 117, 98, 118, 99, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 2, 4, 5}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 2, 4, 5}, {NHWC_, FP32_}),
                              answer_data);
     nntrainer::Tensor m = t.transpose("1:2:0");
     EXPECT_EQ(answer, m);
@@ -4520,7 +4520,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       59, 64, 69,  74,  79,  80,  85,  90, 95, 100, 105, 110, 115, 81,  86,
       91, 96, 101, 106, 111, 116, 82,  87, 92, 97,  102, 107, 112, 117, 83,
       88, 93, 98,  103, 108, 113, 118, 84, 89, 94,  99,  104, 109, 114, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 4, 5, 2}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 4, 5, 2}, {NHWC_, FP32_}),
                              answer_data);
     nntrainer::Tensor m = t.transpose("2:0:1");
     EXPECT_EQ(answer, m);
@@ -4537,7 +4537,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       80, 100, 85, 105, 90, 110, 95, 115, 81, 101, 86, 106, 91, 111, 96, 116,
       82, 102, 87, 107, 92, 112, 97, 117, 83, 103, 88, 108, 93, 113, 98, 118,
       84, 104, 89, 109, 94, 114, 99, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 2, 5, 4}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 2, 5, 4}, {NHWC_, FP32_}),
                              answer_data);
     nntrainer::Tensor m = t.transpose("1:0:2");
     EXPECT_EQ(answer, m);
@@ -4558,7 +4558,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       84,  85,  86,  87,  88,  89,  90,  91,  92,  93,  94,  95,  96,  97,
       98,  99,  100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
       112, 113, 114, 115, 116, 117, 118, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 2, 4}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 2, 4}, {NHWC_, FP32_}),
                              answer_data);
     t.transpose("0:1:2", m);
     EXPECT_EQ(answer, m);
@@ -4577,7 +4577,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       81,  86,  91,  96,  82,  87,  92,  97,  83,  88,  93,  98,  84,  89,
       94,  99,  100, 105, 110, 115, 101, 106, 111, 116, 102, 107, 112, 117,
       103, 108, 113, 118, 104, 109, 114, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 4, 2, 5}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 4, 2, 5}, {NHWC_, FP32_}),
                              answer_data);
     t.transpose("2:1:0", m);
     EXPECT_EQ(answer, m);
@@ -4596,7 +4596,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       84,  100, 101, 102, 103, 104, 85,  86,  87,  88,  89,  105, 106, 107,
       108, 109, 90,  91,  92,  93,  94,  110, 111, 112, 113, 114, 95,  96,
       97,  98,  99,  115, 116, 117, 118, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 4, 2}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 5, 4, 2}, {NHWC_, FP32_}),
                              answer_data);
     t.transpose("0:2:1", m);
     EXPECT_EQ(answer, m);
@@ -4614,7 +4614,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       80, 100, 81, 101, 82, 102, 83, 103, 84, 104, 85, 105, 86, 106, 87, 107,
       88, 108, 89, 109, 90, 110, 91, 111, 92, 112, 93, 113, 94, 114, 95, 115,
       96, 116, 97, 117, 98, 118, 99, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 2, 4, 5}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 2, 4, 5}, {NHWC_, FP32_}),
                              answer_data);
     t.transpose("1:2:0", m);
     EXPECT_EQ(answer, m);
@@ -4632,7 +4632,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       59, 64, 69,  74,  79,  80,  85,  90, 95, 100, 105, 110, 115, 81,  86,
       91, 96, 101, 106, 111, 116, 82,  87, 92, 97,  102, 107, 112, 117, 83,
       88, 93, 98,  103, 108, 113, 118, 84, 89, 94,  99,  104, 109, 114, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 4, 5, 2}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 4, 5, 2}, {NHWC_, FP32_}),
                              answer_data);
     t.transpose("2:0:1", m);
     EXPECT_EQ(answer, m);
@@ -4650,7 +4650,7 @@ TEST(nntrainer_Tensor, transpose_nhwc_p) {
       80, 100, 85, 105, 90, 110, 95, 115, 81, 101, 86, 106, 91, 111, 96, 116,
       82, 102, 87, 107, 92, 112, 97, 117, 83, 103, 88, 108, 93, 113, 98, 118,
       84, 104, 89, 109, 94, 114, 99, 119};
-    nntrainer::Tensor answer(ml::train::TensorDim({3, 2, 5, 4}, NHWC_, FP32_),
+    nntrainer::Tensor answer(ml::train::TensorDim({3, 2, 5, 4}, {NHWC_, FP32_}),
                              answer_data);
     t.transpose("1:0:2", m);
     EXPECT_EQ(answer, m);
