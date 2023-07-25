@@ -2528,7 +2528,7 @@ TEST(nntrainer_Tensor, average_nhwc_p) {
   EXPECT_EQ(actual, expected);
 
   int idx = 0;
-  t = t.apply([&](float in) { return idx++ % 2; });
+  t = t.apply((std::function<float (float)>)[&](float in) { return idx++ % 2; });
 
   actual = t.average();
   expected = constant(0.5, 1, 1, 1, 1, NHWC_, FP32_);
