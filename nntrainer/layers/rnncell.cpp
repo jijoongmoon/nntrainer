@@ -167,7 +167,6 @@ void RNNCellLayer::forwarding(RunLayerContext &context, bool training) {
   const bool disable_bias =
     std::get<props::DisableBias>(*layer_impl_props).get();
 
-  const unsigned int unit = std::get<props::Unit>(rnncell_props).get();
   const bool integrate_bias =
     std::get<props::IntegrateBias>(rnncell_props).get();
   const float dropout_rate = std::get<props::DropOutRate>(rnncell_props).get();
@@ -177,7 +176,6 @@ void RNNCellLayer::forwarding(RunLayerContext &context, bool training) {
     context.getInput(INOUT_INDEX::INPUT_HIDDEN_STATE);
   Tensor &hidden_state = context.getOutput(INOUT_INDEX::OUTPUT_HIDDEN_STATE);
 
-  const unsigned int batch_size = input.getDim().batch();
 
   const Tensor &weight_ih = context.getWeight(wt_idx[RNNCellParams::weight_ih]);
   const Tensor &weight_hh = context.getWeight(wt_idx[RNNCellParams::weight_hh]);
@@ -250,7 +248,6 @@ void RNNCellLayer::calcGradient(RunLayerContext &context) {
   const bool disable_bias =
     std::get<props::DisableBias>(*layer_impl_props).get();
 
-  const unsigned int unit = std::get<props::Unit>(rnncell_props).get();
   const bool integrate_bias =
     std::get<props::IntegrateBias>(rnncell_props).get();
   const float dropout_rate = std::get<props::DropOutRate>(rnncell_props).get();
@@ -263,7 +260,6 @@ void RNNCellLayer::calcGradient(RunLayerContext &context) {
   const Tensor &d_hidden_state =
     context.getIncomingDerivative(INOUT_INDEX::OUTPUT_HIDDEN_STATE);
 
-  const unsigned int batch_size = input.getDim().batch();
 
   Tensor &d_weight_ih = context.getWeightGrad(wt_idx[RNNCellParams::weight_ih]);
   Tensor &d_weight_hh = context.getWeightGrad(wt_idx[RNNCellParams::weight_hh]);
