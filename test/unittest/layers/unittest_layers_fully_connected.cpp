@@ -39,6 +39,11 @@ auto fc_basic_no_decay = LayerGoldenTestParamType(
   "fc_plain.nnlayergolden", LayerGoldenTestParamOptions::DEFAULT, "nchw",
   "fp32", "fp32");
 
+auto fc_basic_plain_fp16 = LayerGoldenTestParamType(
+  nntrainer::createLayer<nntrainer::FullyConnectedLayer>, {"unit=5"},
+  "3:1:1:10", "fc_plain.nnlayergolden", LayerGoldenTestParamOptions::DEFAULT,
+  "nchw", "fp16", "fp16");
+
 GTEST_PARAMETER_TEST(FullyConnected, LayerGoldenTest,
                      ::testing::Values(fc_basic_plain, fc_basic_single_batch,
-                                       fc_basic_no_decay));
+                                       fc_basic_no_decay, fc_basic_plain_fp16));
