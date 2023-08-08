@@ -97,7 +97,8 @@ void AttentionLayer::calcDerivative(RunLayerContext &context) {
   Tensor &weights = context.getTensor(wt_idx[AttentionParams::weights]);
 
   Tensor dweight = Tensor(
-    TensorDim({derivative.batch(), 1, derivative.height(), value.height()}));
+    TensorDim({derivative.batch(), 1, derivative.height(), value.height()},
+              weights.getTensorType()));
 
   /** derivative for dot 2 */
   dweight.dot_batched_deriv_wrt_1(value, derivative);

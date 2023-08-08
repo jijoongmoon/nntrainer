@@ -202,31 +202,61 @@ Tensor &ActiFunc::softmax(Tensor const &input, Tensor &output) {
   // copy will not executed in inplace case
   output.copy(input);
 
-  float *output_data = output.getData();
+  if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
 
-  // prevent overflow
-  Tensor tmp(width);
-  for (unsigned int i = 0; i < bch_size; i++) {
-    float *ptr = output_data + i * width;
+    float *output_data = output.getData();
 
-    // find max value and subtract it
-    float max_value = *std::max_element(ptr, ptr + width);
+    // prevent overflow
+    Tensor tmp(width);
+    for (unsigned int i = 0; i < bch_size; i++) {
+      float *ptr = output_data + i * width;
 
-    tmp.setValue(max_value);
-    saxpy(width, -1, tmp.getData(), 1, ptr, 1);
-  }
+      // find max value and subtract it
+      float max_value = *std::max_element(ptr, ptr + width);
 
-  // take exp
-  output.apply<float>(exp_util, output);
+      tmp.setValue(max_value);
+      saxpy(width, -1, tmp.getData(), 1, ptr, 1);
+    }
 
-  // take sum over the last dimension
-  Tensor sum = output.sum(3);
+    // take exp
+    output.apply<float>(exp_util<float>, output);
 
-  for (unsigned int i = 0; i < bch_size; i++) {
-    float *ptr = output_data + i * width;
-    std::transform(ptr, ptr + width, ptr,
-                   std::bind(std::divides<float>(), std::placeholders::_1,
-                             sum.getValue<float>(i)));
+    // take sum over the last dimension
+    Tensor sum = output.sum(3);
+
+    for (unsigned int i = 0; i < bch_size; i++) {
+      float *ptr = output_data + i * width;
+      std::transform(ptr, ptr + width, ptr,
+                     std::bind(std::divides<float>(), std::placeholders::_1,
+                               sum.getValue<float>(i)));
+    }
+  } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    _FP16 *output_data = output.getData<_FP16>();
+
+    // prevent overflow
+    Tensor tmp(width, input.getTensorType());
+    for (unsigned int i = 0; i < bch_size; i++) {
+      _FP16 *ptr = output_data + i * width;
+
+      // find max value and subtract it
+      _FP16 max_value = *std::max_element(ptr, ptr + width);
+
+      tmp.setValue(max_value);
+      saxpy(width, -1, tmp.getData<_FP16>(), 1, ptr, 1);
+    }
+
+    // take exp
+    output.apply<_FP16>(exp_util<_FP16>, output);
+
+    // take sum over the last dimension
+    Tensor sum = output.sum(3);
+
+    for (unsigned int i = 0; i < bch_size; i++) {
+      _FP16 *ptr = output_data + i * width;
+      std::transform(ptr, ptr + width, ptr,
+                     std::bind(std::divides<_FP16>(), std::placeholders::_1,
+                               sum.getValue<_FP16>(i)));
+    }
   }
 
   return output;
@@ -251,41 +281,82 @@ Tensor &ActiFunc::softmaxPrime(Tensor const &output,
   if (outgoing_derivative.empty())
     outgoing_derivative = Tensor(output.getDim());
 
-  const float *output_data = output.getData();
-  const float *incoming_derivative_data = incoming_derivative.getData();
-  float *outgoing_derivative_data = outgoing_derivative.getData();
+  if (output.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    const float *output_data = output.getData();
+    const float *incoming_derivative_data = incoming_derivative.getData();
+    float *outgoing_derivative_data = outgoing_derivative.getData();
 
-  Tensor tmp = Tensor(width);
-  float *tmp_data = tmp.getData();
-  unsigned int output_width_stride = output.getStrides()[3];
-  for (unsigned int b = 0; b < batch; ++b) {
-    int b_offset = b * channel * height * width;
-    for (unsigned int c = 0; c < channel; ++c) {
-      int bc_offset = b_offset + c * height * width;
-      for (unsigned int h = 0; h < height; ++h) {
-        int bch_offset = bc_offset + h * width;
-        for (unsigned int w1 = 0; w1 < width; ++w1) {
-          float sum = 0.0f;
-          for (unsigned int w2 = 0; w2 < width; ++w2) {
-            float val;
-            if (w1 == w2) {
-              val = output_data[bch_offset + w2] *
-                    (1.0f - output_data[bch_offset + w1]);
-            } else {
-              val =
-                -output_data[bch_offset + w2] * output_data[bch_offset + w1];
+    Tensor tmp = Tensor(width);
+    float *tmp_data = tmp.getData();
+    unsigned int output_width_stride = output.getStrides()[3];
+    for (unsigned int b = 0; b < batch; ++b) {
+      int b_offset = b * channel * height * width;
+      for (unsigned int c = 0; c < channel; ++c) {
+        int bc_offset = b_offset + c * height * width;
+        for (unsigned int h = 0; h < height; ++h) {
+          int bch_offset = bc_offset + h * width;
+          for (unsigned int w1 = 0; w1 < width; ++w1) {
+            float sum = 0.0f;
+            for (unsigned int w2 = 0; w2 < width; ++w2) {
+              float val;
+              if (w1 == w2) {
+                val = output_data[bch_offset + w2] *
+                      (1.0f - output_data[bch_offset + w1]);
+              } else {
+                val =
+                  -output_data[bch_offset + w2] * output_data[bch_offset + w1];
+              }
+              if (!incoming_derivative.empty())
+                val *= incoming_derivative_data[bch_offset + w2];
+              sum += val;
             }
-            if (!incoming_derivative.empty())
-              val *= incoming_derivative_data[bch_offset + w2];
-            sum += val;
+            tmp.setValue(0, 0, 0, w1, sum);
           }
-          tmp.setValue(0, 0, 0, w1, sum);
+          scopy(width, tmp_data, 1, outgoing_derivative_data + bch_offset,
+                output_width_stride);
         }
-        scopy(width, tmp_data, 1, outgoing_derivative_data + bch_offset,
-              output_width_stride);
+      }
+    }
+  } else if (output.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    const _FP16 *output_data = output.getData<_FP16>();
+    const _FP16 *incoming_derivative_data =
+      incoming_derivative.getData<_FP16>();
+    _FP16 *outgoing_derivative_data = outgoing_derivative.getData<_FP16>();
+
+    Tensor tmp = Tensor(width);
+    tmp.setDataType(output.getDataType());
+    _FP16 *tmp_data = tmp.getData<_FP16>();
+    unsigned int output_width_stride = output.getStrides()[3];
+    for (unsigned int b = 0; b < batch; ++b) {
+      int b_offset = b * channel * height * width;
+      for (unsigned int c = 0; c < channel; ++c) {
+        int bc_offset = b_offset + c * height * width;
+        for (unsigned int h = 0; h < height; ++h) {
+          int bch_offset = bc_offset + h * width;
+          for (unsigned int w1 = 0; w1 < width; ++w1) {
+            _FP16 sum = 0;
+            for (unsigned int w2 = 0; w2 < width; ++w2) {
+              _FP16 val;
+              if (w1 == w2) {
+                val = output_data[bch_offset + w2] *
+                      ((_FP16)1 - output_data[bch_offset + w1]);
+              } else {
+                val =
+                  -output_data[bch_offset + w2] * output_data[bch_offset + w1];
+              }
+              if (!incoming_derivative.empty())
+                val *= incoming_derivative_data[bch_offset + w2];
+              sum += val;
+            }
+            tmp.setValue(0, 0, 0, w1, sum);
+          }
+          scopy(width, tmp_data, 1, outgoing_derivative_data + bch_offset,
+                output_width_stride);
+        }
       }
     }
   }
+
   return outgoing_derivative;
 }
 
@@ -362,7 +433,8 @@ Tensor &ActiFunc::swishPrime(Tensor const &t_in, Tensor const &t_out,
 
 Tensor &ActiFunc::gelu(Tensor const &t_in, Tensor &t_out) {
   float tmp = 1 / sqrt(2);
-  t_in.apply<float>([&](float x) { return 0.5 * x * (1 + erf(x * tmp)); }, t_out);
+  t_in.apply<float>([&](float x) { return 0.5 * x * (1 + erf(x * tmp)); },
+                    t_out);
   return t_out;
 }
 
