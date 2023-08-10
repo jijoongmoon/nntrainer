@@ -55,37 +55,21 @@ warning_c_flags = [
 ]
 
 
-# arm_fp16_flags = [
-#     '-mfp16-format=alternative',
-#     '-mfpu=neon-fp16,
-#     '-mfloat-abi=softfp'
-# ]
-
-# if get_option('enable-fp16')
-#    foreach extra_arg : arm_fp16_flags
-#      if cc.has_argument (extra_arg)
-#        add_project_arguments([extra_arg], language: 'c')
-#      endif
-#      if cxx.has_argument (extra_arg)
-#        add_project_arguments([extra_arg], language: 'cpp')
-#      endif
-#    endforeach
-# enfif
-
 if get_option('enable-fp16')
    arch = target_machine.cpu_family()
-   extra_defines += '-DENABLE_FP16=1'
-
    if get_option('platform') == 'android'
      add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+     extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
    elif arch == 'aarch64' or arch =='arm'
+     extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
    else
      has_avx512fp16 = cc.has_argument('-mavx512fp16')
      if (has_avx512fp16)
        # add_project_arguments(['-mavx512fp16'], language: ['c','cpp'])
        message ('Float16 for x86_64 enabled. Modern gcc-x64 genrally supports float16 with _Float16. -mavx512fp16 added for hardware acceleration')
+       extra_defines += '-DENABLE_FP16=1'
      else
        warning ('Float16 for x86_64 enabled. However, software emulation is applied for fp16, making it slower and inconsistent. Use GCC 12+ for AVX512 FP16 support. This build will probably fail unless you bring a compiler that supports fp16 for x64.')
      endif
