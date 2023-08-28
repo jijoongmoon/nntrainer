@@ -21,7 +21,9 @@
 
 namespace nntrainer {
 
-AttentionLayer::AttentionLayer() {
+AttentionLayer::AttentionLayer() :
+  attention_props(props::ScaledDotProduct(), props::CausalMask()),
+  sm(ActivationType::ACT_SOFTMAX) {
   wt_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -69,17 +71,6 @@ void AttentionLayer::finalize(InitLayerContext &context) {
                           false, TensorLifespan::ITERATION_LIFESPAN);
 
   context.setOutputDimensions({query_dim});
-
-  auto data_type = context.getActivationDataType();
-  if (data_type == ml::train::TensorDim::DataType::FP32) {
-    sm.setActiFunc<float>(ActivationType::ACT_SOFTMAX);
-  } else if (data_type == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    sm.setActiFunc<_FP16>(ActivationType::ACT_SOFTMAX);
-#else
-    throw std::runtime_error("enable-fp16 is not enabled");
-#endif
-  }
 }
 
 void AttentionLayer::forwarding(RunLayerContext &context, bool training) {
@@ -194,8 +185,7 @@ void AttentionLayer::calcDerivative(RunLayerContext &context) {
   Tensor &weights = context.getTensor(wt_idx[AttentionParams::weights]);
 
   Tensor dweight = Tensor(
-    TensorDim({derivative.batch(), 1, derivative.height(), value.height()},
-              weights.getTensorType()));
+    TensorDim({derivative.batch(), 1, derivative.height(), value.height()}));
 
   /** derivative for dot 2 */
   dweight.dot_batched_deriv_wrt_1(value, derivative);
