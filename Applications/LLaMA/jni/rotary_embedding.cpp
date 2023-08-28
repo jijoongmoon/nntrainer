@@ -42,6 +42,7 @@ precompute_freqs_cis(int dim, int seq_len, float theta = 10000.0) {
   return cis;
 }
 
+template <typename T=float>  
 std::tuple<float, float>
 apply_rotary_emb(float real, float imag,
                  std::vector<std::vector<std::complex<float>>> *freqs, int i,
@@ -94,6 +95,7 @@ void RotaryEmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
 void RotaryEmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   // std::throw_with_nested(std::runtime_error("Training is not supported
   // yet."));
+
 }
 
 #ifdef PLUGGABLE

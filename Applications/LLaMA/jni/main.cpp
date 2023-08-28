@@ -242,6 +242,7 @@ std::vector<LayerHandle> createFeedForwardLayer(const int layer_id, int dim,
   std::vector<LayerHandle> layers;
 
   hidden_dim = 2 * multiplier * hidden_dim / 3;
+
   hidden_dim = MULTIPLE_OF * ((hidden_dim + MULTIPLE_OF - 1) / MULTIPLE_OF);
 
   layers.push_back(
@@ -400,11 +401,12 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
     throw std::invalid_argument("model initialization failed!");
   }
 
-  // model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
+  model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 
   std::string weight_path = optimize ? "/home/hs89lee/2ndHDD/llama_v2_att.bin"
                                      : "/home/hs89lee/2ndHDD/llama_v2.bin";
   model->load(weight_path);
+  // model->load("./llama_v2.bin");
 
   std::vector<float *> input;
   std::vector<float *> label;
@@ -459,9 +461,8 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
 }
 
 int main(int argc, char *argv[]) {
-
+  auto &app_context = nntrainer::AppContext::Global();
   try {
-    auto &app_context = nntrainer::AppContext::Global();
     app_context.registerFactory(nntrainer::createLayer<custom::SwiGLULayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
@@ -470,7 +471,7 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    auto &app_context = nntrainer::AppContext::Global();
+    //    auto &app_context = nntrainer::AppContext::Global();
     app_context.registerFactory(nntrainer::createLayer<custom::RMSNormLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
@@ -479,7 +480,7 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    auto &app_context = nntrainer::AppContext::Global();
+    //    auto &app_context = nntrainer::AppContext::Global();
     app_context.registerFactory(
       nntrainer::createLayer<custom::RotaryEmbeddingLayer>);
   } catch (std::invalid_argument &e) {
@@ -489,7 +490,7 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    auto &app_context = nntrainer::AppContext::Global();
+    //    auto &app_context = nntrainer::AppContext::Global();
     app_context.registerFactory(nntrainer::createLayer<custom::TransposeLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
