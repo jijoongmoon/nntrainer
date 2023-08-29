@@ -40,7 +40,7 @@ int const NUM_HEADS = 18;
 
 int const MULTIPLE_OF = 256;
 
-int const NORM_EPS = 0.00001;
+int const NORM_EPS = 0.000001;
 int const NUM_VOCAB = 96000;
 int MAX_SEQ_LEN = 2048;
 
@@ -51,6 +51,7 @@ unsigned int epoch = 1;
 /** cache loss values post training for test */
 float training_loss = 0.0;
 float validation_loss = 0.0;
+bool swap = false;
 
 /**
  * @brief make "key=value" from key and value
@@ -250,11 +251,16 @@ std::vector<LayerHandle> createTransformerDecoder(const int layer_id, std::strin
     "rms_norm", {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"), withKey
     ("input_layers", input_name)}));
 
-  auto att_layer = createAttentionLayer(layer_id, INIT_SEQ_LEN, NUM_HEADS, DIM / NUM_HEADS, "layer" + std::to_string(layer_id) + "_attention_norm", "layer" + std::to_string(layer_id) + "_attention_norm", "layer" + std::to_string(layer_id) + "_attention_norm");
-  layers.insert(layers.end(), att_layer.begin(), att_layer.end());
+  layers.push_back(createLayer("multi_out",{withKey("name","layer"+std::to_string(layer_id)+"/multi_out1")}));
+
+  layers.push_back(createLayer("multi_head_attension",
+			       {withKey("name","layer"+std::to_string(layer_id) + "/multi_head_attention"),
+				withKey("input_layers","layer"+std::to_string(layer_id)+"/multi_out1(0), layer"+std::to_string(layer_id)+"/multi_out1(1), layer"+std::to_string(layer_id) + "/multi_out1(2)"),
+				withKey("num_heads",std::to_string(NUM_HEADS))}));
 
   layers.push_back(createLayer(
-    "addition", {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"), withKey("input_layers", input_name + ",layer" + std::to_string(layer_id) + "_attention_out")}));
+    "addition", {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"), 
+    withKey("input_layers", input_name + ",layer" + std::to_string(layer_id) + "/multi_out1(1), layer"+std::to_string(layer_id)+"/multi_head_attention")}));
 
   layers.push_back(createLayer(
     "rms_norm", {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"), withKey("input_layers", "layer" + std::to_string(layer_id) + "_decoder_add")}));
@@ -320,6 +326,8 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
   ModelHandle model = createLLaMA();
   model->setProperty({withKey("batch_size", batch_size),
                       withKey("epochs", epochs),
+		      "model_tensor_type=FP16-FP16",
+                      swap ? "memory_swap=true" : "memory_swap=false",
                       withKey("save_path", "test_model.bin")});
 
   auto optimizer = ml::train::createOptimizer("adam", {"learning_rate=0.001"});
@@ -337,25 +345,48 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
   
   model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 
-  // model->load("./llama_v2.bin");
+  // model->load("/home/jijoongmoon/llama_v2.bin");
+
+  model->load("./summarization_v2_fp16.bin");
+  // exit(0);
 
   std::vector<float *> input;
   std::vector<float *> label;
 
   int data_size = batch_size * INIT_SEQ_LEN;
 
+  // std::string vocab_file_name = "./vocab.json";
+  // std::string merge_file_name = "./merges.txt";
+
+  // auto tokenizer = unwrap(GPT2Encoder::load(vocab_file_name, merge_file_name),
+  //                         "Error initialising GPT2 tokenizer\n");
+
+  // auto init_input = tokenizer.encode(text);
+
+  // unsigned int init_input_seq_len = init_input.size();  
+
   float* input_sample = (float *)malloc(sizeof(float) * data_size);
 
   input_sample[0] = 5058;
+  
   input_sample[1] = 10832;
   
   input.push_back(input_sample);
 
-  auto output = model->inference(1, input, label);
+  unsigned int init_input_seq_len = 1;
 
-  for (int i = 0; i < (int)10; i++) {
-    std::cout << output[0][i] << " ";
+  for(unsigned int i=1;i<init_input_seq_len+1; ++i){
+    
+    auto output_bufs = model->incremental_inference(1, input, label, init_input_seq_len, i-1);
+    
+    // nntrainer::Tensor output({BATCH_SIZE, 1, 1, NUM_VOCAB}, output_bufs[0]);
+    
+    // std::vector<unsigned int> ids = output.argmax();
+    
   }
+  // for (int i = 0; i < (int)10; i++) {
+  //   std::cout << output_bufs[0][i] << " ";
+  // }
   
 }
 

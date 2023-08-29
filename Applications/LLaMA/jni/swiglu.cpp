@@ -28,6 +28,7 @@ namespace ActivationOp {
  * @retval swish(x)
  */
 float swish(float x) { return x / (1 + nntrainer::exp_util(-x)); }
+// namespace ActivationOp
 } // namespace ActivationOp
 
 void SwiGLULayer::finalize(nntrainer::InitLayerContext &context) {
@@ -40,12 +41,65 @@ void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &in2 = context.getInput(INPUT_IDX_2);
   nntrainer::Tensor &out = context.getOutput(OUT_IDX);
 
-  for (int b = 0; b < (int)in1.batch(); b++) {
-    for (int c = 0; c < (int)in1.channel(); c++) {
-      for (int h = 0; h < (int)in1.height(); h++) {
-        for (int w = 0; w < (int)in1.width(); w++) {
-          out.setValue(b, c, h, w,
-            ActivationOp::swish(in1.getValue(b, c, h, w)) * in2.getValue(b, c, h, w));
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    for (int b = 0; b < (int)in1.batch(); b++) {
+      for (int c = 0; c < (int)in1.channel(); c++) {
+        for (int h = 0; h < (int)in1.height(); h++) {
+          for (int w = 0; w < (int)in1.width(); w++) {
+            float ret;
+            ret = static_cast<float>(in1.getValue(b, c, h, w)) *
+                  static_cast<float>(in2.getValue(b, c, h, w));
+            out.setValue(b, c, h, w, ActivationOp::swish(ret));
+          }
+        }
+      }
+    }
+  } else if (in1.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    for (int b = 0; b < (int)in1.batch(); b++) {
+      for (int c = 0; c < (int)in1.channel(); c++) {
+        for (int h = 0; h < (int)in1.height(); h++) {
+          for (int w = 0; w < (int)in1.width(); w++) {
+            float ret;
+            ret = static_cast<float>(in1.getValue<_FP16>(b, c, h, w)) *
+                  static_cast<float>(in2.getValue<_FP16>(b, c, h, w));
+            out.setValue(b, c, h, w, ActivationOp::swish(ret));
+          }
+        }
+      }
+    }
+  }
+}
+
+void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
+                                         unsigned int from, unsigned int to,
+                                         bool training) {
+  nntrainer::Tensor &in1 = context.getInput(INPUT_IDX_1);
+  nntrainer::Tensor &in2 = context.getInput(INPUT_IDX_2);
+  nntrainer::Tensor &out = context.getOutput(OUT_IDX);
+
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    for (int b = 0; b < (int)in1.batch(); b++) {
+      for (int c = 0; c < (int)in1.channel(); c++) {
+        for (int h = 0; h < (int)in1.height(); h++) {
+          for (int w = 0; w < (int)in1.width(); w++) {
+            float ret;
+            ret = static_cast<float>(in1.getValue(b, c, h, w)) *
+                  static_cast<float>(in2.getValue(b, c, h, w));
+            out.setValue(b, c, h, w, ActivationOp::swish(ret));
+          }
+        }
+      }
+    }
+  } else if (in1.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    for (int b = 0; b < (int)in1.batch(); b++) {
+      for (int c = 0; c < (int)in1.channel(); c++) {
+        for (int h = 0; h < (int)in1.height(); h++) {
+          for (int w = 0; w < (int)in1.width(); w++) {
+            float ret;
+            ret = static_cast<float>(in1.getValue<_FP16>(b, c, h, w)) *
+                  static_cast<float>(in2.getValue<_FP16>(b, c, h, w));
+            out.setValue(b, c, h, w, ActivationOp::swish(ret));
+          }
         }
       }
     }
@@ -53,7 +107,8 @@ void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
 }
 
 void SwiGLULayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  // std::throw_with_nested(std::runtime_error("Training is not supported yet."));
+  // std::throw_with_nested(std::runtime_error("Training is not supported
+  // yet."));
 }
 
 #ifdef PLUGGABLE
@@ -75,5 +130,4 @@ nntrainer::LayerPluggable ml_train_layer_pluggable{create_swiglu_layer,
 }
 
 #endif
-
 } // namespace custom

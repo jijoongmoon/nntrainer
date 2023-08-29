@@ -12,9 +12,9 @@
  */
 
 #include <cmath>
-#include <vector>
 #include <complex>
 #include <iostream>
+#include <vector>
 
 #include "rotary_embedding.h"
 
@@ -22,18 +22,19 @@ namespace custom {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
-std::vector<std::vector<std::complex<float> > >* precompute_freqs_cis(int dim, int seq_len, float theta = 10000.0) {
+std::vector<std::vector<std::complex<float>>> *
+precompute_freqs_cis(int dim, int seq_len, float theta = 10000.0) {
   std::vector<float> freqs(dim / 2);
   for (int i = 0; i < dim / 2; ++i) {
     freqs[i] = 1.0 / (std::pow(theta, (2 * i) / static_cast<float>(dim)));
-  } 
+  }
 
-  auto cis = new std::vector<std::vector<std::complex<float> > >();
-  cis->assign(seq_len, std::vector<std::complex<float> >(dim / 2, 0));
-  
+  auto cis = new std::vector<std::vector<std::complex<float>>>();
+  cis->assign(seq_len, std::vector<std::complex<float>>(dim / 2, 0));
+
   for (int i = 0; i < seq_len; ++i) {
     for (int j = 0; j < dim / 2; ++j) {
-      float angle = i * freqs[j];      
+      float angle = i * freqs[j];
       (*cis)[i][j] = std::polar(1.0f, angle);
     }
   }
@@ -41,10 +42,16 @@ std::vector<std::vector<std::complex<float> > >* precompute_freqs_cis(int dim, i
   return cis;
 }
 
-std::tuple<float, float> apply_rotary_emb(float real, float imag, std::vector<std::vector<std::complex<float> > >* freqs, int i, int j) {
-  std::complex<float> input_complex(real, imag);
-  std::complex<float> output_complex = input_complex * (*freqs)[i][(int)j/2];
-  return std::make_tuple(output_complex.real(), output_complex.imag());
+template <typename T = float>
+std::tuple<T, T>
+apply_rotary_emb(T real, T imag,
+                 std::vector<std::vector<std::complex<float>>> *freqs, int i,
+                 int j) {
+  std::complex<float> input_complex(static_cast<float>(real),
+                                    static_cast<float>(imag));
+  std::complex<float> output_complex = input_complex * (*freqs)[i][(int)j / 2];
+  return std::make_tuple(static_cast<T>(output_complex.real()),
+                         static_cast<T>(output_complex.imag()));
 } // namespace custom
 
 void RotaryEmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
@@ -68,7 +75,7 @@ void RotaryEmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
 }
 
 void RotaryEmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
-                            bool training) {
+                                      bool training) {
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
 
@@ -87,8 +94,56 @@ void RotaryEmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
+void RotaryEmbeddingLayer::incremental_forwarding(
+  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
+  bool training) {
+
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
+
+  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    for (int b = 0; b < (int)in.batch(); b++) {
+      for (int c = 0; c < (int)in.channel(); c++) {
+        for (int h = 0; h < (int)in.height(); h++) {
+          for (int w = 0; w < (int)in.width(); w = w + 2) {
+            float *data = in.getAddress(b, c, h, w);
+            float real = data[0];
+            float imag = data[1];
+            std::tie(real, imag) =
+              apply_rotary_emb(real, imag, freqs_cis, h, w);
+            out.setValue(b, c, h, w, real);
+            out.setValue(b, c, h, w + 1, imag);
+          }
+        }
+      }
+    }
+  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    for (int b = 0; b < (int)in.batch(); b++) {
+      for (int c = 0; c < (int)in.channel(); c++) {
+        for (int h = 0; h < (int)in.height(); h++) {
+          for (int w = 0; w < (int)in.width(); w = w + 2) {
+#ifdef ENABLE_FP16
+            _FP16 *data = in.getAddress<_FP16>(b, c, h, w);
+            _FP16 real = data[0];
+            _FP16 imag = data[1];
+            std::tie(real, imag) =
+              apply_rotary_emb<_FP16>(real, imag, freqs_cis, h, w);
+            out.setValue(b, c, h, w, real);
+            out.setValue(b, c, h, w + 1, imag);
+#else
+            throw std::invalid_argument("enable-fp16 is not set");
+
+#endif
+          }
+        }
+      }
+    }
+  }
+}
+
 void RotaryEmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  // std::throw_with_nested(std::runtime_error("Training is not supported yet."));
+  // std::throw_with_nested(std::runtime_error("Training is not supported
+  // yet."));
 }
 
 #ifdef PLUGGABLE
@@ -105,8 +160,8 @@ void destroy_rotary_embedding_layer(nntrainer::Layer *layer) {
 }
 
 extern "C" {
-nntrainer::LayerPluggable ml_train_layer_pluggable{create_rotary_embedding_layer,
-                                                   destroy_rotary_embedding_layer};
+nntrainer::LayerPluggable ml_train_layer_pluggable{
+  create_rotary_embedding_layer, destroy_rotary_embedding_layer};
 }
 
 #endif
