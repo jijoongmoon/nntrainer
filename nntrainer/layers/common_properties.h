@@ -1190,21 +1190,6 @@ public:
   using prop_tag = bool_prop_tag;
 };
 
-/**
- * @brief scaled dot product property, used to check
- * whether attention layer is a kind of scaled dot product attention
- *
- */
-class ScaledDotProduct : public nntrainer::Property<bool> {
-public:
-  /**
-   * @brief Construct a new ScaledDotProduct object
-   *
-   */
-  ScaledDotProduct(bool value = false);
-  static constexpr const char *key = "scaled_dot_product";
-  using prop_tag = bool_prop_tag;
-};
 
 class Print : public nntrainer::Property<bool> {
 public:
@@ -1214,52 +1199,6 @@ public:
    */
   Print(bool value = false) { set(value); }
   static constexpr const char *key = "print";
-  using prop_tag = bool_prop_tag;
-};
-
-/**
- * @brief causal mask property, used in attention layer
- *
- */
-class CausalMask : public nntrainer::Property<bool> {
-public:
-  /**
-   * @brief Construct a new CausalMask object
-   *
-   */
-  CausalMask(bool value = false);
-  static constexpr const char *key = "causal_mask";
-  using prop_tag = bool_prop_tag;
-};
-
-/**
- * @brief scaled dot product property, used to check
- * whether attention layer is a kind of scaled dot product attention
- *
- */
-class ScaledDotProduct : public nntrainer::Property<bool> {
-public:
-  /**
-   * @brief Construct a new ScaledDotProduct object
-   *
-   */
-  ScaledDotProduct(bool value = false);
-  static constexpr const char *key = "scaled_dot_product";
-  using prop_tag = bool_prop_tag;
-};
-
-/**
- * @brief causal mask property, used in attention layer
- *
- */
-class CausalMask : public nntrainer::Property<bool> {
-public:
-  /**
-   * @brief Construct a new CausalMask object
-   *
-   */
-  CausalMask(bool value = false);
-  static constexpr const char *key = "causal_mask";
   using prop_tag = bool_prop_tag;
 };
 

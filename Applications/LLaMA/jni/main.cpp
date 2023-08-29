@@ -52,6 +52,7 @@ unsigned int epoch = 1;
 /** cache loss values post training for test */
 float training_loss = 0.0;
 float validation_loss = 0.0;
+bool swap = false;
 
 bool optimize = false;
 
@@ -458,6 +459,7 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
       }
     }
   }
+
 }
 
 int main(int argc, char *argv[]) {
