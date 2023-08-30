@@ -16,6 +16,8 @@
 #define __MULTI_HEAD_ATTENTION_LAYER_H__
 #ifdef __cplusplus
 
+#include <complex>
+
 #include <acti_func.h>
 #include <layer_impl.h>
 
@@ -111,12 +113,19 @@ public:
 private:
   std::tuple<props::NumHeads, props::ProjectedKeyDim, props::ProjectedValueDim,
              props::OutputShape, props::DropOutRate,
-             props::ReturnAttentionWeight, props::AverageAttentionWeight>
+             props::ReturnAttentionWeight, props::AverageAttentionWeight,
+             props::MaxTimestep>
     multi_head_attention_props; /**< multi_head_attention layer properties */
 
   ActiFunc sm; /** softmax activation operation */
   std::array<unsigned int, 16>
     weight_idx; /**< indices of the weights and tensors */
+
+#ifdef ENABLE_FP16
+  std::vector<std::vector<std::complex<_FP16>>> *freqs_cis;
+#else
+  std::vector<std::vector<std::complex<float>>> *freqs_cis;
+#endif
 
   /**
    * @brief     to protect overflow

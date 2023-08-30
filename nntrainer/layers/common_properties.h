@@ -1174,6 +1174,17 @@ public:
   using prop_tag = bool_prop_tag;
 };
 
+class Print : public nntrainer::Property<bool> {
+public:
+  /**
+   * @brief Construct a new Print object
+   *
+   */
+  Print(bool value = false) { set(value); }
+  static constexpr const char *key = "print";
+  using prop_tag = bool_prop_tag;
+};
+
 /**
  * @brief causal mask property, used in attention layer
  *
