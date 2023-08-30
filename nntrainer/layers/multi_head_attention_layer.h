@@ -19,7 +19,9 @@
 #include <complex>
 
 #include <acti_func.h>
+#include <complex>
 #include <layer_impl.h>
+#include <utility>
 
 namespace nntrainer {
 
@@ -121,16 +123,12 @@ private:
   std::array<unsigned int, 16>
     weight_idx; /**< indices of the weights and tensors */
 
-#ifdef ENABLE_FP16
-  std::vector<std::vector<std::complex<_FP16>>> *freqs_cis;
-#else
-  std::vector<std::vector<std::complex<float>>> *freqs_cis;
-#endif
-
   /**
    * @brief     to protect overflow
    */
   float epsilon;
+
+  std::vector<std::vector<std::complex<float>>> *freqs_cis;
 
   /**
    * @brief calculate common derivative

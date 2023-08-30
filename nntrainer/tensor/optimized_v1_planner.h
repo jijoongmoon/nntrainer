@@ -61,7 +61,7 @@ public:
     const std::vector<size_t> &memory_size,
     const std::vector<std::pair<unsigned int, unsigned int>> &memory_validity,
     std::vector<size_t> &memory_offset, std::vector<bool> &memory_is_wgrad,
-    size_t n_wgrad = 0) const;
+    size_t n_wgrad = 0,std::string name="" ) const;
 
   /**
    * @copydoc MemoryPlanner::getType() const

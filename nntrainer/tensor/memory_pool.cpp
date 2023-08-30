@@ -64,7 +64,7 @@ unsigned int MemoryPool::requestMemory(size_t bytes, unsigned int start_time,
  * any allocation but rather just plans the layout and stores the layout.
  * Subsequent call to this function will overwrite any existing layout.
  */
-double MemoryPool::planLayout(const MemoryPlanner &planner) {
+double MemoryPool::planLayout(const MemoryPlanner &planner, std::string name) {
   if (mem_pool != nullptr)
     /** mem_pool must be deallocated when planLayout is being called */
     throw std::runtime_error("Planning memory layout after allocation");
@@ -77,7 +77,7 @@ double MemoryPool::planLayout(const MemoryPlanner &planner) {
     min_pool_size = calcMinMemoryRequirement();
 
   pool_size = planner.planLayout(memory_size, memory_validity, memory_offset,
-                                 memory_is_wgrad, n_wgrad);
+                                 memory_is_wgrad, n_wgrad, name);
   if (pool_size < min_pool_size || !validateLayout())
     throw std::runtime_error("Planned layout is not feasible");
 

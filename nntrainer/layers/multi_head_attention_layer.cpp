@@ -23,6 +23,7 @@
 namespace nntrainer {
 
 template <typename T = float>
+
 std::vector<std::vector<std::complex<T>>> *
 precompute_freqs_cis(int dim, int seq_len, float theta = 10000.0) {
   std::vector<float> freqs(dim / 2);
@@ -31,7 +32,7 @@ precompute_freqs_cis(int dim, int seq_len, float theta = 10000.0) {
   }
 
   auto cis = new std::vector<std::vector<std::complex<T>>>();
-  cis->assign(seq_len, std::vector<std::complex<T>>(dim / 2, 0));
+  cis->assign(1024, std::vector<std::complex<T>>(dim / 2, 0));
 
   for (int i = 0; i < seq_len; ++i) {
     for (int j = 0; j < dim / 2; ++j) {
@@ -46,17 +47,20 @@ precompute_freqs_cis(int dim, int seq_len, float theta = 10000.0) {
 template <typename T = float>
 std::tuple<T, T>
 apply_rotary_emb(T real, T imag,
-                 std::vector<std::vector<std::complex<T>>> *freqs, int i,
+                 std::vector<std::vector<std::complex<float>>> *freqs, int i,
                  int j) {
-  std::complex<T> input_complex(real, imag);
-  std::complex<T> output_complex = input_complex * (*freqs)[i][(int)j / 2];
-  return std::make_tuple(output_complex.real(), output_complex.imag());
+
+  std::complex<float> input_complex(static_cast<float>(real),
+                                    static_cast<float>(imag));
+  std::complex<float> output_complex = input_complex * (*freqs)[i][(int)j / 2];
+  return std::make_tuple(static_cast<T>(output_complex.real()),
+                         static_cast<T>(output_complex.imag()));
 }
 
 template <typename T = float>
-Tensor
-apply_rotary_emb_tensor(Tensor in, unsigned int dim, unsigned int from,
-                        std::vector<std::vector<std::complex<T>>> *freqs_cis) {
+Tensor apply_rotary_emb_tensor(
+  Tensor in, unsigned int dim, unsigned int from,
+  std::vector<std::vector<std::complex<float>>> *freqs_cis) {
   Tensor out(in.getDim());
   for (int b = 0; b < (int)in.batch(); b++) {
     for (int c = 0; c < (int)in.channel(); c++) {
@@ -408,16 +412,12 @@ void MultiHeadAttentionLayer::finalize(InitLayerContext &context) {
     context.setOutputDimensions({output_dim});
   }
 
-/**
- * @todo
- * check query width and key width
- *
- */
-#ifdef ENABLE_FP16
-  freqs_cis = precompute_freqs_cis<_FP16>(projected_key_dim_prop, key_height);
-#else
+  /**
+   * @todo
+   * check query width and key width
+   *
+   */
   freqs_cis = precompute_freqs_cis<float>(projected_key_dim_prop, key_height);
-#endif
 }
 
 void MultiHeadAttentionLayer::forwarding(RunLayerContext &context,
@@ -525,7 +525,6 @@ void MultiHeadAttentionLayer::forwarding(RunLayerContext &context,
   projected_key = apply_rotary_emb_tensor<float>(
     projected_key, projected_key_dim_prop, 0, freqs_cis);
 #endif
-
   // std::cerr << projected_query << "\n";
 
   projected_query.reshape(
@@ -911,6 +910,7 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   if (!disable_bias) {
     output.add_i(fc_bias);
   }
+  // output.print(std::cout);
 }
 
 void MultiHeadAttentionLayer::calcCommonDerivative(RunLayerContext &context) {

@@ -17,7 +17,6 @@
 #include <string>
 #include <vector>
 
-#include <cifar_dataloader.h>
 #include <layer.h>
 #include <model.h>
 #include <optimizer.h>
@@ -30,8 +29,6 @@
 
 using LayerHandle = std::shared_ptr<ml::train::Layer>;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
-
-using UserDataType = std::unique_ptr<nntrainer::util::DataLoader>;
 
 // Hyper params for LLaMA
 int const DIM = 2304;
@@ -243,7 +240,6 @@ std::vector<LayerHandle> createFeedForwardLayer(const int layer_id, int dim,
   std::vector<LayerHandle> layers;
 
   hidden_dim = 2 * multiplier * hidden_dim / 3;
-
   hidden_dim = MULTIPLE_OF * ((hidden_dim + MULTIPLE_OF - 1) / MULTIPLE_OF);
 
   layers.push_back(
@@ -251,7 +247,6 @@ std::vector<LayerHandle> createFeedForwardLayer(const int layer_id, int dim,
                 {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_1"),
                  withKey("unit", hidden_dim), withKey("disable_bias", "true"),
                  withKey("input_layers", input_name)}));
-
   layers.push_back(
     createLayer("fully_connected",
                 {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_2"),
@@ -371,13 +366,6 @@ ModelHandle createLLaMA() {
   return model;
 }
 
-int trainData_cb(float **input, float **label, bool *last, void *user_data) {
-  auto data = reinterpret_cast<nntrainer::util::DataLoader *>(user_data);
-
-  data->next(input, label, last);
-  return 0;
-}
-
 void createAndRun(unsigned int epochs, unsigned int batch_size) {
 
   // setup model
@@ -385,7 +373,7 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
   model->setProperty({withKey("batch_size", batch_size),
                       withKey("epochs", epochs),
                       // #ifdef ENABLE_FP16
-                      // withKey("model_tensor_type", "FP16-FP16"),
+                      withKey("model_tensor_type", "FP16-FP16"),
                       // #endif
                       withKey("save_path", "test_model.bin")});
 
@@ -402,12 +390,11 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
     throw std::invalid_argument("model initialization failed!");
   }
 
-  model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
+  // model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 
-  std::string weight_path = optimize ? "/home/hs89lee/2ndHDD/llama_v2_att.bin"
-                                     : "/home/hs89lee/2ndHDD/llama_v2.bin";
+  std::string weight_path =
+    optimize ? "./llama_v2_att.bin" : "./summarization_v2_fp16.bin";
   model->load(weight_path);
-  // model->load("./llama_v2.bin");
 
   std::vector<float *> input;
   std::vector<float *> label;
@@ -447,7 +434,7 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
         model->incremental_inference(1, input, label, INIT_SEQ_LEN, i - 1);
 
       nntrainer::Tensor output_tensor({batch_size, 1, 1, NUM_VOCAB}, output[0]);
-      std::cerr << output_tensor << "\n";
+      std::cerr << output_tensor.argmax()[0] << "\n";
 
       if (i < INIT_SEQ_LEN) {
         ((uint *)(input_sample))[0] = init_data[i];
@@ -459,7 +446,6 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
       }
     }
   }
-
 }
 
 int main(int argc, char *argv[]) {
@@ -473,27 +459,7 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    //    auto &app_context = nntrainer::AppContext::Global();
     app_context.registerFactory(nntrainer::createLayer<custom::RMSNormLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-    return 1;
-  }
-
-  try {
-    //    auto &app_context = nntrainer::AppContext::Global();
-    app_context.registerFactory(
-      nntrainer::createLayer<custom::RotaryEmbeddingLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-    return 1;
-  }
-
-  try {
-    //    auto &app_context = nntrainer::AppContext::Global();
-    app_context.registerFactory(nntrainer::createLayer<custom::TransposeLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;

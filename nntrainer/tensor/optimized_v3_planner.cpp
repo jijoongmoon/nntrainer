@@ -160,7 +160,7 @@ size_t OptimizedV3Planner::planLayout(
   const std::vector<size_t> &memory_size,
   const std::vector<std::pair<unsigned int, unsigned int>> &memory_validity,
   std::vector<size_t> &memory_offset, std::vector<bool> &memory_is_wgrad,
-  size_t n_wgrad) const {
+  size_t n_wgrad,std::string name) const {
 
   /** create memory requests structure array for easier management */
   std::vector<MemoryRequest> requests;

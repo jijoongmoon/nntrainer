@@ -142,7 +142,7 @@ size_t OptimizedV2Planner::planLayout(
   const std::vector<size_t> &memory_size,
   const std::vector<std::pair<unsigned int, unsigned int>> &memory_validity,
   std::vector<size_t> &memory_offset, std::vector<bool> &memory_is_wgrad,
-  size_t n_wgrad) const {
+  size_t n_wgrad, std::string name) const {
 
   std::vector<MemoryRequest> wgrad_requests;
   wgrad_requests.reserve(n_wgrad);

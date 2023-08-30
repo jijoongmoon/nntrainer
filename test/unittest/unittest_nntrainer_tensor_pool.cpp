@@ -253,7 +253,7 @@ TEST(TensorPool, set_batch_03_n) {
     t1 = pool.request("abc", nntrainer::TensorDim({1}), {0},
                       nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN));
   EXPECT_NE(t1, nullptr);
-  EXPECT_NO_THROW(pool.finalize(basic_planner, 0, 1));
+  EXPECT_NO_THROW(pool.finalize(basic_planner, 0, 1, "pool"));
   EXPECT_NO_THROW(pool.allocate());
 
   EXPECT_THROW(pool.setBatchSize("abc", 10), std::invalid_argument);
@@ -278,7 +278,7 @@ TEST(TensorPool, finalize_01_p) {
 
   EXPECT_NE(t1, t2);
 
-  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2));
+  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool"));
   EXPECT_EQ(pool.minMemoryRequirement(), 0u);
 
   EXPECT_FALSE(t1->isAllocated());
@@ -306,7 +306,7 @@ TEST(TensorPool, finalize_02_p) {
 
   EXPECT_NE(t1, t2);
 
-  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2));
+  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool"));
   EXPECT_EQ(pool.minMemoryRequirement(), t1->bytes() + t2->bytes());
 
   EXPECT_FALSE(t1->isAllocated());
@@ -319,7 +319,7 @@ TEST(TensorPool, finalize_02_p) {
 TEST(TensorPool, finalize_03_p) {
   nntrainer::TensorPool pool;
 
-  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2));
+  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool"));
 }
 
 /**
@@ -341,7 +341,7 @@ TEST(TensorPool, allocate_deallocate_01_p) {
 
   EXPECT_NE(t1, t2);
 
-  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2));
+  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool"));
 
   EXPECT_NO_THROW(pool.allocate());
   EXPECT_TRUE(t1->isAllocated());
@@ -389,7 +389,7 @@ TEST(TensorPool, allocate_deallocate_03_p) {
 
   EXPECT_NE(t1, t3);
 
-  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2));
+  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool"));
 
   EXPECT_NO_THROW(pool.allocate());
   EXPECT_TRUE(t1->isAllocated());
@@ -418,7 +418,7 @@ TEST(TensorPool, validate_memory) {
   EXPECT_NO_THROW(
     t2 = pool.request("abc2", nntrainer::TensorDim({100}), {1}, max_ls));
 
-  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2));
+  EXPECT_NO_THROW(pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool"));
   EXPECT_NO_THROW(pool.allocate());
 
   nntrainer::Tensor g1 = nntrainer::Tensor(nntrainer::TensorDim({100}));
@@ -602,7 +602,7 @@ TEST(TensorPool, create_allocate_has_data_p) {
   t1 = pool.request("a", {10}, {0}, max_ls);
   t2 = pool.request("b", {10}, {1}, max_ls);
 
-  pool.finalize(nntrainer::BasicPlanner(), 0, 2);
+  pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool");
   pool.allocate();
 
   testNoOverlap(t1, t2);
@@ -620,7 +620,7 @@ TEST(TensorPool, placeholder_p) {
   nntrainer::TensorPool pool;
   pool.placeholder("a", {10});
   pool.placeholder("b", {10});
-  pool.finalize(nntrainer::BasicPlanner(), 0, 2);
+  pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool");
   EXPECT_NO_THROW(pool.allocate());
 }
 
@@ -637,7 +637,7 @@ TEST(TensorPool, view_is_same_p) {
   // |-------- t2 -------|
   auto t1 = pool.request("t1", {10}, {0}, max_ls);
   auto t2 = pool.view("t2", "t1", {10}, {1}, max_ls);
-  pool.finalize(nntrainer::BasicPlanner(), 0, 2);
+  pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool");
   pool.allocate();
 
   EXPECT_NE(t1, t2);
@@ -654,7 +654,7 @@ TEST(TensorPool, view_is_subset_p) {
   auto t1 = pool.request("t1", {10}, {0}, max_ls);
   auto t2 = pool.view("t2", "t1", {3}, {1}, max_ls);
   auto t3 = pool.view("t3", "t1", {3}, {1}, max_ls, 3);
-  pool.finalize(nntrainer::BasicPlanner(), 0, 2);
+  pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool");
   pool.allocate();
 
   EXPECT_NE(t1, t2);
@@ -684,7 +684,7 @@ TEST(TensorPool, view_is_view_of_view_and_subset_p) {
   auto t1 = pool.request("t1", {10}, {0}, max_ls);
   auto t2 = pool.view("t2", "t1", {3}, {1}, max_ls);
   auto t3 = pool.view("t3", "t2", {3}, {1}, max_ls, 3);
-  pool.finalize(nntrainer::BasicPlanner(), 0, 2);
+  pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool");
   pool.allocate();
 
   EXPECT_NE(t1, t2);
@@ -712,7 +712,7 @@ TEST(TensorPool, view_of_placeholder_p) {
   auto t1 = pool.placeholder("t1", {10});
   auto t2 = pool.view("t2", "t1", {10}, {0}, max_ls);
   auto t3 = pool.view("t3", "t1", {2}, {0}, max_ls, 2);
-  pool.finalize(nntrainer::BasicPlanner(), 0, 2);
+  pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool");
   pool.allocate();
 
   EXPECT_NE(t1, t2);
@@ -849,7 +849,7 @@ TEST(TensorPool, createOrExtend_p) {
   EXPECT_NE(std::find(exec_order.begin(), exec_order.end(), 1),
             exec_order.end());
   EXPECT_EQ(t1, t2);
-  pool.finalize(nntrainer::BasicPlanner(), 0, 2);
+  pool.finalize(nntrainer::BasicPlanner(), 0, 2, "pool");
   pool.allocate();
   EXPECT_EQ(*t1, *t2);
   pool.deallocate();
