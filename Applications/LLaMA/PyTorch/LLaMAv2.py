@@ -30,7 +30,7 @@ torch.manual_seed(seed)
 class ModelArgs:
     dim: int = 2304
     n_layers: int = 28
-    n_heads: int = 18
+    n_heads: int = 1
     n_kv_heads: Optional[int] = None
     vocab_size: int = 96000  # defined later by tokenizer
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
@@ -293,94 +293,101 @@ class Transformer(nn.Module):
         output = self.output(h).float()
         return output
     
-## Load weights from huggingface weights format
+#Load weights from huggingface weights format
 
-# state_dict = torch.load('./pytorch_model.bin')
-# for key in list(state_dict.keys()):
-#     if 'rotary_emb' in key:
-#         state_dict.pop(key)
-#     elif key == 'model.embed_tokens.weight':
-#         state_dict[key.replace('model.embed_tokens.weight', 'tok_embeddings.weight')] = state_dict.pop(key)
-#     elif '_attn.' in key:
-#         state_dict[key.replace('model.', '')\
-#                    .replace('self_attn.q_proj', 'attention.wq')\
-#                    .replace('self_attn.k_proj', 'attention.wk')\
-#                    .replace('self_attn.v_proj', 'attention.wv')\
-#                    .replace('self_attn.o_proj', 'attention.wo')] = state_dict.pop(key)
-#     elif 'mlp.' in key:
-#         state_dict[key.replace('model.', '')\
-#                    .replace('mlp.', 'feed_forward.')\
-#                    .replace('gate_proj', 'w1')\
-#                    .replace('up_proj', 'w3')\
-#                    .replace('down_proj', 'w2')] = state_dict.pop(key)
-#     elif 'input_layernorm' in key or 'post_attention_layernorm' in key:
-#         state_dict[key.replace('model.', '')\
-#                    .replace('input_layernorm', 'attention_norm')\
-#                    .replace('post_attention_layernorm', 'ffn_norm')] = state_dict.pop(key)
-#     elif key in ['model.norm.weight', 'lm_head.weight']:
-#         state_dict[key.replace('model.', '')\
-#                    .replace('lm_head', 'output')] = state_dict.pop(key)    
+state_dict = torch.load('/home/jijoongmoon/v1/pytorch_model.bin')
+for key in list(state_dict.keys()):
+    if 'rotary_emb' in key:
+        state_dict.pop(key)
+    elif key == 'model.embed_tokens.weight':
+        state_dict[key.replace('model.embed_tokens.weight', 'tok_embeddings.weight')] = state_dict.pop(key)
+    elif '_attn.' in key:
+        state_dict[key.replace('model.', '')\
+                   .replace('self_attn.q_proj', 'attention.wq')\
+                   .replace('self_attn.k_proj', 'attention.wk')\
+                   .replace('self_attn.v_proj', 'attention.wv')\
+                   .replace('self_attn.o_proj', 'attention.wo')] = state_dict.pop(key)
+    elif 'mlp.' in key:
+        state_dict[key.replace('model.', '')\
+                   .replace('mlp.', 'feed_forward.')\
+                   .replace('gate_proj', 'w1')\
+                   .replace('up_proj', 'w3')\
+                   .replace('down_proj', 'w2')] = state_dict.pop(key)
+    elif 'input_layernorm' in key or 'post_attention_layernorm' in key:
+        state_dict[key.replace('model.', '')\
+                   .replace('input_layernorm', 'attention_norm')\
+                   .replace('post_attention_layernorm', 'ffn_norm')] = state_dict.pop(key)
+    elif key in ['model.norm.weight', 'lm_head.weight']:
+        state_dict[key.replace('model.', '')\
+                   .replace('lm_head', 'output')] = state_dict.pop(key)    
         
 # # print(state_dict.keys())
 
 params = ModelArgs()
 model = Transformer(params)
 
-# ## Save weights to nntrainer format
+## Save weights to nntrainer format
 
-# import numpy as np
+import numpy as np
 
-# file = open("./llama_v2.bin", "wb")
+file = open("./llama_v2.bin", "wb")
 
-# args = ModelArgs()
+args = ModelArgs()
 
-# def save_llama_to_bin(params, n_layer = 32, n_head = 32, args=[]):
-#     def save_weight(weight):
-#         np.array(weight).tofile(file)
+def save_llama_to_bin(params, n_layer = 32, n_head = 32, args=[]):
+    def save_weight(weight):
+        np.array(weight).tofile(file)
 
-#     def save_embedding(weight):
-#         save_weight(weight)
+    def save_embedding(weight):
+        save_weight(weight)
 
-#     def save_attention(weights, layer_name, n_head = 32):        
-#         save_weight(params[layer_name + 'attention_norm' + '.weight'])
-#         split_size = (args.dim // n_head)
-#         for head_idx in range(1, n_head+1):            
-#             st_idx = (args.dim - split_size * head_idx)
-#             end_idx = st_idx + split_size
-#             save_weight(params[layer_name + 'attention.wv' + '.weight'][st_idx:end_idx, :].permute(1, 0))
+    def save_attention(weights, layer_name, n_head = 32):        
+        save_weight(params[layer_name + 'attention_norm' + '.weight'])
+        
+        # split_size = (args.dim // n_head)
+
+        # for head_idx in range(1, n_head+1):
+        #     st_idx = (args.dim - split_size * head_idx)
+        #     end_idx = st_idx + split_size
+#        save_weight(params[layer_name + 'attention.wq' + '.weight'][st_idx:end_idx, :].permute(1, 0)) # It includes multiple heads
+        save_weight(params[layer_name + 'attention.wq' + '.weight'].permute(1, 0)) # It includes multiple heads
+
+        # for head_idx in range(1, n_head+1):
+        #     st_idx = (args.dim - split_size * head_idx)
+        #     end_idx = st_idx + split_size
+#        save_weight(params[layer_name + 'attention.wk' + '.weight'][st_idx:end_idx, :].permute(1, 0))
+        save_weight(params[layer_name + 'attention.wk' + '.weight'].permute(1, 0)) # It includes multiple heads
+        
+        
+        # for head_idx in range(1, n_head+1):            
+        #     st_idx = (args.dim - split_size * head_idx)
+        #     end_idx = st_idx + split_size
+#        save_weight(params[layer_name + 'attention.wv' + '.weight'][st_idx:end_idx, :].permute(1, 0))
+        save_weight(params[layer_name + 'attention.wv' + '.weight'].permute(1, 0)) # It includes multiple heads
             
-#         for head_idx in range(1, n_head+1):
-#             st_idx = (args.dim - split_size * head_idx)
-#             end_idx = st_idx + split_size
-#             save_weight(params[layer_name + 'attention.wk' + '.weight'][st_idx:end_idx, :].permute(1, 0))
+        save_weight(params[layer_name + 'attention.wo' + '.weight'].permute(1, 0))
 
-#         for head_idx in range(1, n_head+1):
-#             st_idx = (args.dim - split_size * head_idx)
-#             end_idx = st_idx + split_size
-#             save_weight(params[layer_name + 'attention.wq' + '.weight'][st_idx:end_idx, :].permute(1, 0)) # It includes multiple heads
+    def save_feed_forward(weights, layer_name):
+        save_weight(params[layer_name + 'ffn_norm' + '.weight'])        
         
-#         save_weight(params[layer_name + 'attention.wo' + '.weight'].permute(1, 0))
+        save_weight(params[layer_name + 'feed_forward.w3' + '.weight'].permute(1, 0))
+        save_weight(params[layer_name + 'feed_forward.w1' + '.weight'].permute(1, 0))        
+        save_weight(params[layer_name + 'feed_forward.w2' + '.weight'].permute(1, 0))
 
-#     def save_feed_forward(weights, layer_name):
-#         save_weight(params[layer_name + 'ffn_norm' + '.weight'])        
+    # save weights of embedding layer
+    save_embedding(params['tok_embeddings.weight'])
+    
+    # save weights of attention layers
+    for layer_idx in range(n_layer):
+        save_attention(params, 'layers.{}.'.format(layer_idx), n_head)
+        save_feed_forward(params, 'layers.{}.'.format(layer_idx))
         
-#         save_weight(params[layer_name + 'feed_forward.w3' + '.weight'].permute(1, 0))
-#         save_weight(params[layer_name + 'feed_forward.w1' + '.weight'].permute(1, 0))        
-#         save_weight(params[layer_name + 'feed_forward.w2' + '.weight'].permute(1, 0))
+    save_weight(params['norm.weight'])
+    
+    save_weight(params['output.weight'].permute(1, 0))
 
-#     # save weights of embedding layer
-#     save_embedding(params['tok_embeddings.weight'])
-    
-#     # save weights of attention layers
-#     for layer_idx in range(n_layer):
-#         save_attention(params, 'layers.{}.'.format(layer_idx), n_head)
-#         save_feed_forward(params, 'layers.{}.'.format(layer_idx))
-        
-#     save_weight(params['norm.weight'])
-    
-#     save_weight(params['output.weight'].permute(1, 0))
-    
-# save_llama_to_bin(model.state_dict(), n_layer = params.n_layers, n_head = params.n_heads, args=args)
+model.load_state_dict(state_dict);    
+save_llama_to_bin(model.state_dict(), n_layer = params.n_layers, n_head = params.n_heads, args=args)
 
-X = torch.tensor([[ 5058, 10832]], dtype=torch.long)
-print(model(X, 0))
+# X = torch.tensor([[ 5058, 10832]], dtype=torch.long)
+# print(model(X, 0))

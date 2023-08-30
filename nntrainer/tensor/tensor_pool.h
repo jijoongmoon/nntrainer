@@ -83,7 +83,7 @@ public:
    * layout for their allocations.
    */
   void finalize(const MemoryPlanner &planner, unsigned int start_order,
-                unsigned int end_order);
+                unsigned int end_order, std::string name);
 
   /**
    * @brief Set the batch size for the inputs/outputs of the layers

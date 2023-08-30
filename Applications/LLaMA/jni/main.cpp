@@ -208,37 +208,45 @@ std::vector<LayerHandle> createAttentionLayer(const int layer_id, int seq_len, i
   return layers;
 }
 
-std::vector<LayerHandle> createFeedForwardLayer(const int layer_id, int dim, int hidden_dim, std::string input_name, int multiplier=1) {
+std::vector<LayerHandle> createFeedForwardLayer(const int layer_id, int dim,
+                                                int hidden_dim,
+                                                std::string input_name,
+                                                int multiplier = 1) {
   using ml::train::createLayer;
   std::vector<LayerHandle> layers;
 
-  hidden_dim = 2 * multiplier * hidden_dim / 3 ;
+  hidden_dim = 2 * multiplier * hidden_dim / 3;
   hidden_dim = MULTIPLE_OF * ((hidden_dim + MULTIPLE_OF - 1) / MULTIPLE_OF);
+
+  layers.push_back(createLayer(
+    "multiout",
+    {withKey("name", "layer" + std::to_string(layer_id) + "/ff_multiout")}));
 
   layers.push_back(
     createLayer("fully_connected",
                 {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_1"),
-                withKey("unit", hidden_dim),
-                withKey("disable_bias", "true"),
-                withKey("input_layers", input_name)}));
+                 withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+                 withKey("input_layers", "layer" + std::to_string(layer_id) +
+                                           "/ff_multiout(0)")}));
 
   layers.push_back(
     createLayer("fully_connected",
                 {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_2"),
-                withKey("unit", hidden_dim),
-                withKey("disable_bias", "true"),
-                withKey("input_layers", input_name)}));
+                 withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+                 withKey("input_layers", "layer" + std::to_string(layer_id) +
+                                           "/ff_multiout(1)")}));
 
-  layers.push_back(
-    createLayer("swiglu", 
-                {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"), withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_1," + "layer" + std::to_string(layer_id) + "_ffn_2")}));
+  layers.push_back(createLayer(
+    "swiglu",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+     withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_1," +
+                               "layer" + std::to_string(layer_id) +
+                               "_ffn_2")}));
 
-  layers.push_back(
-    createLayer("fully_connected",
-                {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_output"),
-                withKey("unit", dim),
-                withKey("disable_bias", "true"),
-                withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
+  layers.push_back(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_output"),
+     withKey("unit", dim), withKey("disable_bias", "true")}));
 
   return layers;
 }
@@ -248,28 +256,38 @@ std::vector<LayerHandle> createTransformerDecoder(const int layer_id, std::strin
   std::vector<LayerHandle> layers;
 
   layers.push_back(createLayer(
-    "rms_norm", {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"), withKey
-    ("input_layers", input_name)}));
+    "multiout",
+    {withKey("name", "layer" + std::to_string(layer_id) + "/ln_multiout1")}));
 
-  layers.push_back(createLayer("multi_out",{withKey("name","layer"+std::to_string(layer_id)+"/multi_out1")}));
+  layers.push_back(createLayer(
+    "rms_norm",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm")}));
 
-  layers.push_back(createLayer("multi_head_attension",
+  layers.push_back(createLayer("multiout",{withKey("name","layer"+std::to_string(layer_id)+"/multi_out1")}));
+
+  layers.push_back(createLayer("multi_head_attention",
 			       {withKey("name","layer"+std::to_string(layer_id) + "/multi_head_attention"),
 				withKey("input_layers","layer"+std::to_string(layer_id)+"/multi_out1(0), layer"+std::to_string(layer_id)+"/multi_out1(1), layer"+std::to_string(layer_id) + "/multi_out1(2)"),
-				withKey("num_heads",std::to_string(NUM_HEADS))}));
+				withKey("num_heads",std::to_string(NUM_HEADS)), withKey("disable_bias","true")}));
 
   layers.push_back(createLayer(
     "addition", {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"), 
-    withKey("input_layers", input_name + ",layer" + std::to_string(layer_id) + "/multi_out1(1), layer"+std::to_string(layer_id)+"/multi_head_attention")}));
+      withKey("input_layers", "layer" + std::to_string(layer_id) + "/ln_multiout1(1), layer"+std::to_string(layer_id)+"/multi_head_attention")}));
+
 
   layers.push_back(createLayer(
-    "rms_norm", {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"), withKey("input_layers", "layer" + std::to_string(layer_id) + "_decoder_add")}));
+    "multiout",
+    {withKey("name", "layer" + std::to_string(layer_id) + "/ln_multiout2")}));
+
+  layers.push_back(createLayer(
+    "rms_norm", {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm")}));
+  
 
   auto ffn_layer = createFeedForwardLayer(layer_id, DIM, 4 * DIM, "layer" + std::to_string(layer_id) + "_ffn_norm");
   layers.insert(layers.end(), ffn_layer.begin(), ffn_layer.end());
 
   layers.push_back(createLayer(
-    "addition", {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"), withKey("input_layers", "layer" + std::to_string(layer_id) + "_decoder_add,layer" + std::to_string(layer_id) + "_ffn_output")}));
+    "addition", {withKey("name", "layer" + std::to_string(layer_id) + "/add2"), withKey("input_layers", "layer" + std::to_string(layer_id) + "/ln_multiout2(1), layer" + std::to_string(layer_id) + "_ffn_output")}));
 
   return layers;
 }
@@ -285,29 +303,29 @@ ModelHandle createLLaMA() {
     "input", {withKey("name", "input0"), withKey("input_shape", "1:" + std::to_string(INIT_SEQ_LEN) + ":" + std::to_string(INIT_SEQ_LEN))}));
 
   layers.push_back(ml::train::layer::Embedding(
-    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB), "out_dim=" + std::to_string(DIM)}));
+					       {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB), "out_dim=" + std::to_string(DIM)}));
 
   for (int i = 0; i < NUM_LAYERS; i++) {
     std::vector<LayerHandle> transformer;
     if (i == 0) transformer = createTransformerDecoder(i, "embedding0");
-    else transformer = createTransformerDecoder(i, "layer" + std::to_string(i - 1) + "_decoder_output");
-    layers.insert(layers.end(), transformer.begin(), transformer.end());    
+    else transformer = createTransformerDecoder(i, "layer" + std::to_string(i - 1) + "/add2");
+    layers.insert(layers.end(), transformer.begin(), transformer.end());
   }
 
   int last_layer = NUM_LAYERS - 1;
 
   layers.push_back(createLayer(
-    "rms_norm", {withKey("name", "output_norm"), withKey("input_layers", "layer" + std::to_string(last_layer) + "_decoder_output")}));
+    "rms_norm", {withKey("name", "output_norm")}));
 
   layers.push_back(
     createLayer("fully_connected",
                 {withKey("name", "output_of_llama"),
                 withKey("unit", NUM_VOCAB),
-                withKey("disable_bias", "true"),
-                withKey("input_layers", "output_norm")}));
+                withKey("disable_bias", "true")}));
 
   for (auto &layer : layers) {
     model->addLayer(layer);
+    std::cout << layer->getName() <<std::endl;
   }
 
   return model;
@@ -327,8 +345,7 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
   model->setProperty({withKey("batch_size", batch_size),
                       withKey("epochs", epochs),
 		      "model_tensor_type=FP16-FP16",
-                      swap ? "memory_swap=true" : "memory_swap=false",
-                      withKey("save_path", "test_model.bin")});
+                      swap ? "memory_swap=true" : "memory_swap=false"});
 
   auto optimizer = ml::train::createOptimizer("adam", {"learning_rate=0.001"});
   model->setOptimizer(std::move(optimizer));
@@ -338,16 +355,23 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
     throw std::invalid_argument("model compilation failed!");
   }
 
+  std::cout << "compile finished"<<std::endl;
+
   status = model->initialize();
   if (status) {
     throw std::invalid_argument("model initialization failed!");
   }
+
+  std::cout << "initialzied"<<std::endl;  
   
   model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 
-  // model->load("/home/jijoongmoon/llama_v2.bin");
+  exit(0);
 
-  model->load("./summarization_v2_fp16.bin");
+  // model->load("/home/jijoongmoon/WorkSpace1/nntrainer/Applications/LLaMA/PyTorch/llama_v2.bin");
+  model->load("./summarization_v2_fp16.bin");  
+
+  // model->load("./summarization_v2_fp16.bin");
   // exit(0);
 
   std::vector<float *> input;
@@ -391,9 +415,9 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
 }
 
 int main(int argc, char *argv[]) {  
-
+  auto &app_context = nntrainer::AppContext::Global();
+  
   try {
-    auto &app_context = nntrainer::AppContext::Global(); 
     app_context.registerFactory(nntrainer::createLayer<custom::SwiGLULayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
@@ -402,7 +426,6 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    auto &app_context = nntrainer::AppContext::Global();
     app_context.registerFactory(nntrainer::createLayer<custom::RMSNormLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
@@ -411,7 +434,6 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    auto &app_context = nntrainer::AppContext::Global();
     app_context.registerFactory(nntrainer::createLayer<custom::RotaryEmbeddingLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
@@ -420,7 +442,6 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    auto &app_context = nntrainer::AppContext::Global();
     app_context.registerFactory(nntrainer::createLayer<custom::TransposeLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()

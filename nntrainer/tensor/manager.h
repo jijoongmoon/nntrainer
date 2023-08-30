@@ -525,7 +525,7 @@ private:
    * @param end End execution order
    */
   void finalizeTensorPool(TensorPool &pool, unsigned int start,
-                          unsigned int end);
+                          unsigned int end, std::string name);
 };
 
 } // namespace nntrainer

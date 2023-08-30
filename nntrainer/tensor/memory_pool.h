@@ -86,7 +86,7 @@ public:
    * any allocation but rather just plans the layout and stores the layout.
    * Subsequent call to this function will overwrite any existing layout.
    */
-  double planLayout(const MemoryPlanner &planner);
+  double planLayout(const MemoryPlanner &planner, std::string name="");
 
   /**
    * @brief Do the allocation of memory

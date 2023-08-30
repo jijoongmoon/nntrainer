@@ -237,6 +237,8 @@ int NeuralNetwork::initialize() {
     std::vector<Connection>(label_layers.begin(), label_layers.end()));
   NN_RETURN_STATUS();
 
+  std::cout << "network_graph initialzied done" <<std::endl;  
+
   model_graph.setBatchSize(
     std::get<props::TrainingBatchSize>(model_flex_props));
 
@@ -256,6 +258,7 @@ int NeuralNetwork::initialize() {
 
   // Allocate weights
   model_graph.allocateWeights();
+  std::cout << "network_graph allocateWeights" <<std::endl;
 
   initialized = true;
 
@@ -363,7 +366,9 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     PROFILE_MEM_ANNOTATE("Forwarding for layer: " + node->getName());
 
     auto f = std::get<0>(node->getExecutionOrder());
+    std::cout << "flush!!!!"<<std::endl;    
     model_graph.flushCacheExcept(f);
+    std::cout << "flush end!!!!"<<std::endl;        
 
     node->incremental_forwarding(from, to, training);
   };

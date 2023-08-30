@@ -82,10 +82,9 @@ void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       for (int c = 0; c < (int)in1.channel(); c++) {
         for (int h = 0; h < (int)in1.height(); h++) {
           for (int w = 0; w < (int)in1.width(); w++) {
-            float ret;
-            ret = static_cast<float>(in1.getValue(b, c, h, w)) *
-                  static_cast<float>(in2.getValue(b, c, h, w));
-            out.setValue(b, c, h, w, ActivationOp::swish(ret));
+            out.setValue(b, c, h, w,
+                         ActivationOp::swish(in1.getValue(b, c, h, w)) *
+                           in2.getValue(b, c, h, w));
           }
         }
       }
@@ -96,9 +95,10 @@ void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         for (int h = 0; h < (int)in1.height(); h++) {
           for (int w = 0; w < (int)in1.width(); w++) {
             float ret;
-            ret = static_cast<float>(in1.getValue<_FP16>(b, c, h, w)) *
+            ret = ActivationOp::swish(
+                    static_cast<float>(in1.getValue<_FP16>(b, c, h, w))) *
                   static_cast<float>(in2.getValue<_FP16>(b, c, h, w));
-            out.setValue(b, c, h, w, ActivationOp::swish(ret));
+            out.setValue(b, c, h, w, static_cast<_FP16>(ret));
           }
         }
       }

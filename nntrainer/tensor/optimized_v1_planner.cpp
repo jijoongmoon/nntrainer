@@ -16,6 +16,9 @@
 #include <nntrainer_error.h>
 #include <stdexcept>
 #include <vector>
+#include <iostream>
+#include <fstream>
+#include <sstream>
 
 #include <optimized_v1_planner.h>
 
@@ -129,69 +132,92 @@ size_t OptimizedV1Planner::planLayout(
   const std::vector<size_t> &memory_size,
   const std::vector<std::pair<unsigned int, unsigned int>> &memory_validity,
   std::vector<size_t> &memory_offset, std::vector<bool> &memory_is_wgrad,
-  size_t n_wgrad) const {
+  size_t n_wgrad, std::string name) const {
 
-  /** create memory requests structure array for easier management */
-  std::vector<MemoryRequest> requests;
-  requests.reserve(memory_size.size());
-
-  for (unsigned int idx = 0; idx < memory_size.size(); idx++) {
-    requests.emplace_back(memory_size[idx], memory_validity[idx], idx);
-  }
-
-  /**
-   * sort the memory requests with ascending order of start time first, and
-   * then end time
-   */
-  std::sort(requests.begin(), requests.end(),
-            [](auto const &v1, auto const &v2) -> int {
-              if (v1.start == v2.start)
-                return v1.end < v2.end;
-              return v1.start < v2.start;
-              /** TODO: try this */
-              //   if (v1.end == v2.end)
-              //     return v1.start < v2.start;
-              //   return v1.end > v2.end;
-            });
-
-  /** all the memories in use sorted by their assigned offset and size */
-  std::vector<MemoryRequest *> sorted_req;
-
-  /** iterate over the sorted requests and start allocation of the requests */
-  memory_offset.resize(memory_size.size());
   size_t memory_req = 0;
-  for (auto &req : requests) {
-    /** remove expired memories and update offset */
-    while (!sorted_req.empty() && sorted_req.back()->end <= req.start)
-      sorted_req.pop_back();
 
-    /** if there exists an expired memory with same size (not at the edge),
-     * reuse it */
-    bool replace_and_fill = false;
-    for (int idx = sorted_req.size() - 1; idx >= 0; idx--) {
-      auto const &sr = sorted_req[idx];
-      /** TODO: reuse if memory size not exactly match */
-      if (sr->end <= req.start && sr->size == req.size) {
-        req.offset = sr->offset;
-        memory_offset[req.loc] = req.offset;
-        sorted_req[idx] = &req;
-        replace_and_fill = true;
-        break;
+  std::ifstream iFile (name, std::ios::binary | std::ios::in);
+  if(iFile.good()){
+    std::cout << "file good ------ " << name <<std::endl;    
+    memory_offset.resize(memory_size.size());
+    iFile.read(reinterpret_cast<char*>(&memory_offset[0]), memory_offset.size()*sizeof(size_t));
+    iFile.read(reinterpret_cast<char*>(&memory_req), sizeof(size_t));
+    std::cout << "file good : " <<memory_req << std::endl;
+
+    iFile.close();
+
+  } else {
+    std::cout << "file not good ------ " << name <<std::endl;        
+    /** create memory requests structure array for easier management */
+    std::vector<MemoryRequest> requests;
+    requests.reserve(memory_size.size());
+
+    for (unsigned int idx = 0; idx < memory_size.size(); idx++) {
+      requests.emplace_back(memory_size[idx], memory_validity[idx], idx);
+    }
+
+    /**
+     * sort the memory requests with ascending order of start time first, and
+     * then end time
+     */
+    std::sort(requests.begin(), requests.end(),
+              [](auto const &v1, auto const &v2) -> int {
+                if (v1.start == v2.start)
+                  return v1.end < v2.end;
+                return v1.start < v2.start;
+                /** TODO: try this */
+                //   if (v1.end == v2.end)
+                //     return v1.start < v2.start;
+                //   return v1.end > v2.end;
+              });
+
+    /** all the memories in use sorted by their assigned offset and size */
+    std::vector<MemoryRequest *> sorted_req;
+
+    /** iterate over the sorted requests and start allocation of the requests */
+    memory_offset.resize(memory_size.size());
+
+    for (auto &req : requests) {
+      /** remove expired memories and update offset */
+      while (!sorted_req.empty() && sorted_req.back()->end <= req.start)
+        sorted_req.pop_back();
+
+      /** if there exists an expired memory with same size (not at the edge),
+       * reuse it */
+      bool replace_and_fill = false;
+      for (int idx = sorted_req.size() - 1; idx >= 0; idx--) {
+        auto const &sr = sorted_req[idx];
+        /** TODO: reuse if memory size not exactly match */
+        if (sr->end <= req.start && sr->size == req.size) {
+          req.offset = sr->offset;
+          memory_offset[req.loc] = req.offset;
+          sorted_req[idx] = &req;
+          replace_and_fill = true;
+          break;
+        }
       }
-    }
-    if (replace_and_fill) {
-      continue;
-    }
+      if (replace_and_fill) {
+        continue;
+      }
 
-    size_t offset = 0;
-    if (!sorted_req.empty())
-      offset = sorted_req.back()->offset + sorted_req.back()->size;
+      size_t offset = 0;
+      if (!sorted_req.empty())
+        offset = sorted_req.back()->offset + sorted_req.back()->size;
 
-    /** assign offset to the new request and push to queue */
-    req.offset = offset;
-    memory_offset[req.loc] = offset;
-    memory_req = std::max(memory_req, req.offset + req.size);
-    sorted_req.push_back(&req);
+      /** assign offset to the new request and push to queue */
+      req.offset = offset;
+      memory_offset[req.loc] = offset;
+      memory_req = std::max(memory_req, req.offset + req.size);
+      sorted_req.push_back(&req);
+    }
+    
+    std::ofstream wFile;
+    wFile.open(name, std::ios::out | std::ios::binary);
+    wFile.write(reinterpret_cast<char *>(&memory_offset[0]),
+                memory_offset.size() * sizeof(size_t));
+    wFile.write(reinterpret_cast<char *>(&memory_req), sizeof(size_t));
+    std::cout << "file is not good "<< memory_req << std::endl;
+    wFile.close();
   }
 
   //   validateIntervalOverlap(memory_validity, memory_size, memory_offset,

@@ -44,6 +44,7 @@
 #include <time_dist.h>
 #include <tracer.h>
 #include <util_func.h>
+#include <iostream>
 
 #define LNODE(x) std::static_pointer_cast<LayerNode>(x)
 
@@ -1156,6 +1157,8 @@ int NetworkGraph::initialize(const std::vector<Connection> &model_input_names,
     }
   }
 
+  std::cout << "get iput connection" <<std::endl;
+
   for (unsigned int idx = 0; idx < graph.size(); ++idx) {
     auto const &lnode = getSortedLayerNode(idx);
     auto &rc = lnode->getRunContext();
@@ -1199,6 +1202,8 @@ int NetworkGraph::initialize(const std::vector<Connection> &model_input_names,
       }
     }
   }
+
+  std::cout << "gradient clipping" <<std::endl;  
   /**** identify model input / output to be set externally later ****/
   auto identify_as_model_input = [this](LayerNode *node) {
     auto num_input = node->getNumInputs();
@@ -1267,7 +1272,7 @@ int NetworkGraph::initialize(const std::vector<Connection> &model_input_names,
                             identify_as_model_input);
   identify_external_tensors(model_label_names, is_label_node,
                             identify_as_model_label);
-
+  std::cout << "set external tensor" <<std::endl;  
   /** mark the nodes which will be backwarded during the graph operation */
   try {
     markNodesForBackwarding();
@@ -1285,6 +1290,7 @@ int NetworkGraph::initialize(const std::vector<Connection> &model_input_names,
     return w->hasGradient() && w->isGradientLastAccess() &&
            w->isGradientClipByGlobalNorm();
   });
+  std::cout << "clipping weight" <<std::endl;    
 
   return ML_ERROR_NONE;
 }
