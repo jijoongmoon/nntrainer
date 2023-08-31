@@ -1,0 +1,86 @@
+import torch
+import requests
+
+from transformers import GPT2TokenizerFast
+
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+source = "Two Air India pilots have been removed from duty after they reportedly got into a fight inside the cockpit of a plane shortly before it was scheduled to take off. The altercation involving the captain and co-pilot erupted while the plane was being prepared for a 50-minute journey from Delhi to Jaipur last night. Both pilots have been derostered after the captain of flight AI611 complained that the co-pilot had misbehaved and struck him, the Times of India reported. An Air India captain claims a co-pilot misbehaved and struck him during an altercation in the cockpit (file) An Air India spokesman told the newspaper: \u2018Both the pilots have been derostered. An inquiry has been ordered into this.\u2019 The airline insists the altercation was limited to a verbal argument, and there was no physical violence. The Times of India, quoting a source, reported that the captain was assaulted after he asked the co-pilot to record \u2018critical take-off figures\u2019 for the flight, including the number of passengers on board, take-off weight and fuel. Instead of immediately reporting the incident in Delhi, which would have led to the cancellation of the flight, the captain flew the plane to Jaipur and then informed Air India staff. Indian aviation officials have launched an investigation into the incident to determine whether any of the parties involved should be disciplined. Reports suggest that the captain was assaulted after asking the co-pilot to record information before take-off . A report by the Times of India said that the co-pilot has faced similar accusations in the past. Three years ago he told the captain of a flight to exit the cockpit, \u2018remove the stars on his shirt collar\u2019 and fight him, while a complaint filed two years ago from another captain questioned the co-pilot\u2019s mental health and claimed he was \u2018rude and unbecoming\u2019. Last night\u2019s incident comes at a sensitive time for the commercial aviation industry following the tragedy involving Germanwings flight 4U9525. Investigators believe 27-year-old co-pilot Andreas Lubitz deliberately crashed the plane into the French Alps \u2013 killing everyone on board \u2013 after locking the captain out of the cockpit on a flight from Barcelona to Dusseldorf. German newspaper Bild reported that Lubitz searched the internet for information on suicide and depression using the name \u2018Skydevil\u2019.\nPlease summarize this.\n"
+
+inputs = tokenizer(source, return_tensors="pt")
+
+# {'input_ids': tensor([[ 7571,  3701,  3794, 14982,   423,   587,  4615,   422,  7077,   706,
+#            484,  7478,  1392,   656,   257,  1907,  2641,   262, 25762,   286,
+#            257,  6614,  8972,   878,   340,   373,  7530,   284,  1011,   572,
+#             13,   383, 38880,  7411,   262, 10654,   290,   763,    12,    79,
+#          23439, 23681,   981,   262,  6614,   373,   852,  5597,   329,   257,
+#           2026,    12, 11374,  7002,   422, 12517,   284, 13790,   541,   333,
+#            938,  1755,    13,  5747, 14982,   423,   587,  4587,   455,  1068,
+#            706,   262, 10654,   286,  5474,  9552,    21,  1157, 13832,   326,
+#            262,   763,    12,    79, 23439,   550,  2984, 20709,  9586,   290,
+#           7425,   683,    11,   262,  3782,   286,  3794,  2098,    13,  1052,
+#           3701,  3794, 10654,  3667,   257,   763,    12,    79, 23439,  2984,
+#          20709,  9586,   290,  7425,   683,  1141,   281, 38880,   287,   262,
+#          25762,   357,  7753,     8,  1052,  3701,  3794,  6523,  1297,   262,
+#           7533,    25,   564,   246, 10265,   262, 14982,   423,   587,  4587,
+#            455,  1068,    13,  1052, 12069,   468,   587,  6149,   656,   428,
+#             13,   447,   247,   383, 18091, 17424,   262, 38880,   373,  3614,
+#            284,   257, 17755,  4578,    11,   290,   612,   373,   645,  3518,
+#           3685,    13,   383,  3782,   286,  3794,    11, 28411,   257,  2723,
+#             11,  2098,   326,   262, 10654,   373, 18513,   706,   339,  1965,
+#            262,   763,    12,    79, 23439,   284,  1700,   564,   246, 34666,
+#           1011,    12,  2364,  5538,   447,   247,   329,   262,  5474,    11,
+#           1390,   262,  1271,   286, 10405,   319,  3096,    11,  1011,    12,
+#           2364,  3463,   290,  5252,    13,  5455,   286,  3393,  6447,   262,
+#           4519,   287, 12517,    11,   543,   561,   423,  2957,   284,   262,
+#          25395,   286,   262,  5474,    11,   262, 10654, 13112,   262,  6614,
+#            284, 13790,   541,   333,   290,   788,  7981,  3701,  3794,  3085,
+#             13,  3942, 22548,  2828,   423,  5611,   281,  3645,   656,   262,
+#           4519,   284,  5004,  1771,   597,   286,   262,  4671,  2950,   815,
+#            307, 30654,    13, 17905,  1950,   326,   262, 10654,   373, 18513,
+#            706,  4737,   262,   763,    12,    79, 23439,   284,  1700,  1321,
+#            878,  1011,    12,  2364,   764,   317,   989,   416,   262,  3782,
+#            286,  3794,   531,   326,   262,   763,    12,    79, 23439,   468,
+#           7452,  2092, 14227,   287,   262,  1613,    13,  7683,   812,  2084,
+#            339,  1297,   262, 10654,   286,   257,  5474,   284,  8420,   262,
+#          25762,    11,   564,   246, 28956,   262,  5788,   319,   465, 10147,
+#          19908,   447,   247,   290,  1907,   683,    11,   981,   257,  8224,
+#           5717,   734,   812,  2084,   422,  1194, 10654, 11434,   262,   763,
+#             12,    79, 23439,   447,   247,    82,  5110,  1535,   290,  4752,
+#            339,   373,   564,   246,    81,  2507,   290,   555,  9423,  3383,
+#            447,   247,    13,  4586,  1755,   447,   247,    82,  4519,  2058,
+#            379,   257,  8564,   640,   329,   262,  5068, 22548,  2831,  1708,
+#            262, 13574,  7411,  2679, 48819,  5474,   604,    52,  3865,  1495,
+#             13, 40466,  1975,  2681,    12,  1941,    12,   727,   763,    12,
+#             79, 23439, 33728, 40753,  4224, 14593, 14997,   262,  6614,   656,
+#            262,  4141, 46312,   784,  5170,  2506,   319,  3096,   784,   706,
+#          22656,   262, 10654,   503,   286,   262, 25762,   319,   257,  5474,
+#            422, 15142,   284,   360,   385,   325,   335, 24263,    13,  2679,
+#           7533, 44406,  2098,   326, 40753,  4224, 16499,   262,  5230,   329,
+#           1321,   319,  7341,   290,  8862,  1262,   262,  1438,   564,   246,
+#          22308,  7959,   346,   447,   247,    13,   198,  5492, 35743,   428,
+#             13,   198]]), 'attention_mask': tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])}
+
+print(inputs)
+~                                                                                                                                                                                                    
+~                              

@@ -26,6 +26,7 @@
 #include <rotary_embedding.h>
 #include <swiglu.h>
 #include <transpose_layer.h>
+#include "encoder.hpp"
 
 using LayerHandle = std::shared_ptr<ml::train::Layer>;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
@@ -39,10 +40,10 @@ int const MULTIPLE_OF = 256;
 
 float const NORM_EPS = 0.000001;
 int const NUM_VOCAB = 96000;
-int MAX_SEQ_LEN = 1024;
-int NUM_TO_GENERATE = 1;
+int MAX_SEQ_LEN = 1124;
+int NUM_TO_GENERATE = 100;
 
-constexpr unsigned int INIT_SEQ_LEN = 30;
+unsigned int INIT_SEQ_LEN = 1024;
 unsigned int batch_size = 1;
 unsigned int epoch = 1;
 
@@ -52,6 +53,15 @@ float validation_loss = 0.0;
 bool swap = false;
 
 bool optimize = false;
+
+template <typename T>
+T unwrap(std::optional<T> &&value, const std::string &error_msg) {
+  if (value.has_value()) {
+    return value.value();
+  } else {
+    throw std::runtime_error(error_msg);
+  }
+}
 
 /**
  * @brief make "key=value" from key and value
@@ -366,8 +376,7 @@ ModelHandle createLLaMA() {
   return model;
 }
 
-void createAndRun(unsigned int epochs, unsigned int batch_size) {
-
+void createAndRun(unsigned int epochs, unsigned int batch_size, std::string text) {
   // setup model
   ModelHandle model = createLLaMA();
   model->setProperty({withKey("batch_size", batch_size),
@@ -389,6 +398,7 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
   if (status) {
     throw std::invalid_argument("model initialization failed!");
   }
+  std::cout <<text<<std::endl;  
 
   // model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 
@@ -401,15 +411,40 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
 
   int data_size = batch_size * INIT_SEQ_LEN;
 
+
+  std::string vocab_file_name = "./vocab.json";
+  std::string merge_file_name = "./merges.txt";
+  
   float *input_sample = (float *)malloc(sizeof(float) * data_size);
+
+
+  auto tokenizer = unwrap(GPT2Encoder::load(vocab_file_name, merge_file_name),
+			  "Error initializising GPT2 tokenizer\n");
+
+
+    
+
+
+
+  auto init_input = tokenizer.encode(text);
+
+  INIT_SEQ_LEN = init_input.size();
+
+  for (auto t : init_input)
+    std::cout << t<< ", ";
+  std::cout << std::endl;
+
+  exit(0);
+
+  
   // float init_data[INIT_SEQ_LEN] = {5058, 10832};
-  float init_data[INIT_SEQ_LEN] = {
-    0,  1,  2,  3,  4,  5,   6,   7,   8,   9,   10,  20,  30,  40,
-    50, 60, 70, 80, 90, 100, 200, 300, 400, 500, 600, 700, 800, 900};
+  // float init_data[INIT_SEQ_LEN] = {
+  //   0,  1,  2,  3,  4,  5,   6,   7,   8,   9,   10,  20,  30,  40,
+  //   50, 60, 70, 80, 90, 100, 200, 300, 400, 500, 600, 700, 800, 900};
 
   if (optimize) {
     for (unsigned int i = 0; i < INIT_SEQ_LEN; ++i) {
-      input_sample[i] = init_data[i];
+      input_sample[i] = init_input[i];
     }
 
     input.push_back(input_sample);
@@ -425,7 +460,7 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
       std::cerr << output_step << "\n";
     }
   } else {
-    ((uint *)(input_sample))[0] = init_data[0];
+    ((uint *)(input_sample))[0] = init_input[0];
 
     input.push_back(input_sample);
 
@@ -434,15 +469,17 @@ void createAndRun(unsigned int epochs, unsigned int batch_size) {
         model->incremental_inference(1, input, label, INIT_SEQ_LEN, i - 1);
 
       nntrainer::Tensor output_tensor({batch_size, 1, 1, NUM_VOCAB}, output[0]);
-      std::cerr << output_tensor.argmax()[0] << "\n";
+
 
       if (i < INIT_SEQ_LEN) {
-        ((uint *)(input_sample))[0] = init_data[i];
+        ((uint *)(input_sample))[0] = init_input[i];
       } else {
-        int diff = std::distance(
-          output[0], std::max_element(output[0], output[0] + NUM_VOCAB));
+        // int diff = std::distance(
+        //   output[0], std::max_element(output[0], output[0] + NUM_VOCAB));
         // std::cerr << diff << "\n";
-        ((uint *)(input_sample))[0] = diff;
+        // ((uint *)(input_sample))[0] = diff;
+        ((uint *)(input_sample))[0] = output_tensor.argmax()[0];
+	std::cerr << output_tensor.argmax()[0] << "\n";	
       }
     }
   }
@@ -467,7 +504,9 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    createAndRun(epoch, batch_size);
+    const std::vector<std::string> args(argv+1, argv+argc);
+    std::string text = args[0];
+    createAndRun(epoch, batch_size,text);
   } catch (const std::exception &e) {
     std::cerr << "uncaught error while running! details: " << e.what()
               << std::endl;

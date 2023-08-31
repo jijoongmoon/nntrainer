@@ -236,7 +236,7 @@ void TensorPool::allocate() {
     if (!details || details->token == 0) {
       continue;
     }
-    spec.tensor->setData(mem_pool->getMemory(details->token), 0, true);
+    spec.tensor->setData(mem_pool->getMemory(details->token), 0, false);
     syncDependents(spec);
   }
 
