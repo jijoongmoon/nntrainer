@@ -23,6 +23,8 @@
 #include <layer_impl.h>
 #include <utility>
 
+#include <iostream>
+
 namespace nntrainer {
 
 /**
@@ -133,6 +135,7 @@ private:
   template <typename T = float>
   void precompute_freqs_cis(int dim, int seq_len, float theta = 10000.0) {
     if (freqs_cis == nullptr) {
+      std::cerr << "hello\n";
       std::vector<float> freqs(dim / 2);
       for (int i = 0; i < dim / 2; ++i) {
         freqs[i] = 1.0 / (std::pow(theta, (2 * i) / static_cast<float>(dim)));
