@@ -139,7 +139,7 @@ private:
       }
 
       auto cis = new std::vector<std::vector<std::complex<T>>>();
-      cis->assign(1024, std::vector<std::complex<T>>(dim / 2, 0));
+      cis->assign(seq_len, std::vector<std::complex<T>>(dim / 2, 0));
 
       for (int i = 0; i < seq_len; ++i) {
         for (int j = 0; j < dim / 2; ++j) {
@@ -165,7 +165,24 @@ private:
   template <typename T = float>
   Tensor apply_rotary_emb_tensor(Tensor in, unsigned int dim,
                                  unsigned int from) {
-    Tensor out(in.getDim());
+  Tensor out(in.getDim());
+  if(in.getDataType() == ml::train::TensorDim::DataType::FP32){                                  
+    for (int b = 0; b < (int)in.batch(); b++) {
+      for (int c = 0; c < (int)in.channel(); c++) {
+        for (int h = 0; h < (int)in.height(); h++) {
+          for (int w = 0; w < (int)in.width(); w = w + 2) {
+            float real = in.getValue(b, c, h, w);
+            float imag = in.getValue(b, c, h, w + 1);
+            std::tie(real, imag) =
+              apply_rotary_emb<float>(real, imag, from + h, w % dim);
+            out.setValue(b, c, h, w, real);
+            out.setValue(b, c, h, w + 1, imag);
+          }
+        }
+      }
+    }
+  } else if ( in.getDataType() == ml::train::TensorDim::DataType::FP16){
+
     for (int b = 0; b < (int)in.batch(); b++) {
       for (int c = 0; c < (int)in.channel(); c++) {
         for (int h = 0; h < (int)in.height(); h++) {
@@ -175,20 +192,18 @@ private:
             _FP16 imag = in.getValue<_FP16>(b, c, h, w + 1);
             std::tie(real, imag) =
               apply_rotary_emb<_FP16>(real, imag, from + h, w % dim);
-#else
-            float real = in.getValue(b, c, h, w);
-            float imag = in.getValue(b, c, h, w + 1);
-            std::tie(real, imag) =
-              apply_rotary_emb<float>(real, imag, from + h, w % dim);
-#endif
             out.setValue(b, c, h, w, real);
             out.setValue(b, c, h, w + 1, imag);
+#else
+            throw std::invalid_argument("Error: enable-fp16 is not enabled");
+#endif
           }
         }
       }
-    }
-    return out;
+    }  
   }
+  return out;
+}
 
   /**
    * @brief calculate common derivative

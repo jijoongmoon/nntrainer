@@ -44,11 +44,16 @@ void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
 
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
-#ifndef ENABLE_FP16
+
+  if(in.getDataType() == ml::train::TensorDim::DataType::FP32){
   std::function<float(float)> f = [](float x) { return 1 / std::sqrt(x); };
   auto t = in.multiply(in).average(3).add(epsilon);
   t.apply_i(f);
-#else
+  in.multiply(t, out);
+  out.multiply_i(gamma);
+
+  } else if( in.getDataType() == ml::train::TensorDim::DataType::FP16){
+#ifdef ENABLE_FP16
   ml::train::TensorDim d = in.getDim();
   d.width(1);
   nntrainer::Tensor t(d, true);
@@ -61,10 +66,13 @@ void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
     }
     t.setValue(0, 0, i, 0, 1.0 / sqrt(sum / axis_dim + epsilon));
   }
-#endif
-
   in.multiply(t, out);
   out.multiply_i(gamma);
+
+#else
+  throw std::invalid_argument("Error: enable-fp16 is not set");
+#endif
+  }
 }
 
 void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
