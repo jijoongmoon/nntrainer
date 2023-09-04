@@ -13,12 +13,15 @@
  */
 
 #include <cmath>
-
+#include <algorithm>
 #include <layer_context.h>
 #include <multi_head_attention_layer.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <thread>
+#include <vector>
+#include <ctime>
 
 namespace nntrainer {
 
@@ -750,6 +753,41 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   const unsigned int key_height = key_dim.height();
   const unsigned int value_height = value_dim.height();
 
+  // clock_t start, finish;
+
+  // start = clock();
+  // This is multi threading 
+  // std::vector<std::thread> workers;
+
+  // auto query_job = [&]() {
+  //   query.dot(query_fc_weight, projected_query_step);
+  //   if (!disable_bias) {
+  //     projected_query_step.add_i(query_fc_bias);
+  //   }
+  // };
+
+  // auto key_job = [&]() {
+  //   key.dot(key_fc_weight, cache_key_step);
+  //   if (!disable_bias) {
+  //     cache_key_step.add_i(key_fc_bias);
+  //   }
+  // };
+  
+  // auto value_job = [&]() {
+  //   value.dot(value_fc_weight, cache_value_step);
+  //   if (!disable_bias) {
+  //     cache_value_step.add_i(value_fc_bias);
+  //   }
+  // };
+
+  // workers.push_back(std::thread(query_job));
+  // workers.push_back(std::thread(key_job));
+  // workers.push_back(std::thread(value_job));
+  
+
+  // std::for_each(workers.begin(), workers.end(),
+  //               std::mem_fn(&std::thread::join));
+
   query.dot(query_fc_weight, projected_query_step);
   if (!disable_bias) {
     projected_query_step.add_i(query_fc_bias);
@@ -762,7 +800,18 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   if (!disable_bias) {
     cache_value_step.add_i(value_fc_bias);
   }
+  //  finish = clock();
 
+  // std::cout << (double)(finish-start)<<std::endl;
+  
+  if (projected_query_step.getDataType() ==
+      ml::train::TensorDim::DataType::FP32) {
+    projected_query_step = apply_rotary_emb_tensor<float>(
+      projected_query_step, projected_key_dim_prop, from);
+    nntrainer::Tensor cache_key_step_temp = apply_rotary_emb_tensor<float>(
+      cache_key_step, projected_key_dim_prop, from);
+    cache_key_step.copyData(cache_key_step_temp);
+} else if(projected_query_step.getDataType() == ml::train::TensorDim::DataType::FP16){
 #ifdef ENABLE_FP16
   projected_query_step = apply_rotary_emb_tensor<_FP16>(
     projected_query_step, projected_key_dim_prop, from);
@@ -770,12 +819,10 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
     cache_key_step, projected_key_dim_prop, from);
   cache_key_step.copyData(cache_key_step_temp);
 #else
-  projected_query_step = apply_rotary_emb_tensor<float>(
-    projected_query_step, projected_key_dim_prop, from);
-  nntrainer::Tensor cache_key_step_temp = apply_rotary_emb_tensor<float>(
-    cache_key_step, projected_key_dim_prop, from);
-  cache_key_step.copyData(cache_key_step_temp);
+  throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif
+
+}
 
   projected_query_step.reshape(
     TensorDim({batch_size, 1, num_heads, projected_query_dim_prop}));

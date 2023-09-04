@@ -398,12 +398,14 @@ void createAndRun(unsigned int epochs, unsigned int batch_size, std::string text
   if (status) {
     throw std::invalid_argument("model initialization failed!");
   }
-  std::cout <<text<<std::endl;  
 
   // model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 
-  std::string weight_path =
-    optimize ? "./llama_v2_att.bin" : "./summarization_v2_fp16.bin";
+  // std::string weight_path =
+  //   optimize ? "./llama_v2.bin" : "./summarization_v2_fp16.bin";
+  // std::string weight_path ="./llama_v2.bin";
+  std::string weight_path ="./summarization_v2_fp16.bin";
+  
   model->load(weight_path);
 
   std::vector<float *> input;
@@ -418,34 +420,82 @@ void createAndRun(unsigned int epochs, unsigned int batch_size, std::string text
   float *input_sample = (float *)malloc(sizeof(float) * data_size);
 
 
-  auto tokenizer = unwrap(GPT2Encoder::load(vocab_file_name, merge_file_name),
+   auto tokenizer = unwrap(GPT2Encoder::load(vocab_file_name, merge_file_name),
 			  "Error initializising GPT2 tokenizer\n");
 
-
-    
-
-
-
   auto init_input = tokenizer.encode(text);
-
-  INIT_SEQ_LEN = init_input.size();
-
-  for (auto t : init_input)
-    std::cout << t<< ", ";
   std::cout << std::endl;
+  // float init_input[485] = {101,  2048,  2250,  2634,  8221,  2031,  2042,  3718,  2013,  4611,
+  // 			   2044,  2027,  7283,  2288,  2046,  1037,  2954,  2503,  1996, 13828,
+  // 			   1997,  1037,  4946,  3859,  2077,  2009,  2001,  5115,  2000,  2202,
+  // 			   2125,  1012,  1996, 11477, 10719,  5994,  1996,  2952,  1998,  2522,
+  // 			   1011,  4405, 12591,  2096,  1996,  4946,  2001,  2108,  4810,  2005,
+  // 			   1037,  2753,  1011,  3371,  4990,  2013,  6768,  2000, 28355,  2197,
+  // 			   2305,  1012,  2119,  8221,  2031,  2042,  4315, 14122,  6850,  2044,
+  // 			   1996,  2952,  1997,  3462,  9932,  2575, 14526, 10865,  2008,  1996,
+  // 			   2522,  1011,  4405,  2018, 28616,  4783,  3270,  7178,  1998,  4930,
+  // 			   2032,  1010,  1996,  2335,  1997,  2634,  2988,  1012,  2019,  2250,
+  // 			   2634,  2952,  4447,  1037,  2522,  1011,  4405, 28616,  4783,  3270,
+  // 			   7178,  1998,  4930,  2032,  2076,  2019, 11477, 10719,  1999,  1996,
+  // 			   13828,  1006,  5371,  1007,  2019,  2250,  2634, 14056,  2409,  1996,
+  // 			   3780,  1024,  1520,  2119,  1996,  8221,  2031,  2042,  4315, 14122,
+  // 			   6850,  1012,  2019,  9934,  2038,  2042,  3641,  2046,  2023,  1012,
+  // 			   1521,  1996,  8582, 16818,  1996, 11477, 10719,  2001,  3132,  2000,
+  // 			   1037, 12064,  6685,  1010,  1998,  2045,  2001,  2053,  3558,  4808,
+  // 			   1012,  1996,  2335,  1997,  2634,  1010, 27394,  1037,  3120,  1010,
+  // 			   2988,  2008,  1996,  2952,  2001, 17536,  2044,  2002,  2356,  1996,
+  // 			   2522,  1011,  4405,  2000,  2501,  1520,  4187,  2202,  1011,  2125,
+  // 			   4481,  1521,  2005,  1996,  3462,  1010,  2164,  1996,  2193,  1997,
+  // 			   5467,  2006,  2604,  1010,  2202,  1011,  2125,  3635,  1998,  4762,
+  // 			   1012,  2612,  1997,  3202,  7316,  1996,  5043,  1999,  6768,  1010,
+  // 			   2029,  2052,  2031,  2419,  2000,  1996, 16990,  1997,  1996,  3462,
+  // 			   1010,  1996,  2952,  5520,  1996,  4946,  2000, 28355,  1998,  2059,
+  // 			   6727,  2250,  2634,  3095,  1012,  2796,  5734,  4584,  2031,  3390,
+  // 			   2019,  4812,  2046,  1996,  5043,  2000,  5646,  3251,  2151,  1997,
+  // 			   1996,  4243,  2920,  2323,  2022, 28675,  1012,  4311,  6592,  2008,
+  // 			   1996,  2952,  2001, 17536,  2044,  4851,  1996,  2522,  1011,  4405,
+  // 			   2000,  2501,  2592,  2077,  2202,  1011,  2125,  1012,  1037,  3189,
+  // 			   2011,  1996,  2335,  1997,  2634,  2056,  2008,  1996,  2522,  1011,
+  // 			   4405,  2038,  4320,  2714, 13519,  1999,  1996,  2627,  1012,  2093,
+  // 			   2086,  3283,  2002,  2409,  1996,  2952,  1997,  1037,  3462,  2000,
+  // 			   6164,  1996, 13828,  1010,  1520,  6366,  1996,  3340,  2006,  2010,
+  // 			   3797,  9127,  1521,  1998,  2954,  2032,  1010,  2096,  1037, 12087,
+  // 			   6406,  2048,  2086,  3283,  2013,  2178,  2952,  8781,  1996,  2522,
+  // 			   1011,  4405,  1521,  1055,  5177,  2740,  1998,  3555,  2002,  2001,
+  // 			   1520, 12726,  1998,  4895,  4783, 18935,  1521,  1012,  2197,  2305,
+  // 			   1521,  1055,  5043,  3310,  2012,  1037,  7591,  2051,  2005,  1996,
+  // 			   3293,  5734,  3068,  2206,  1996, 10576,  5994,  2446,  9328,  2015,
+  // 			   3462,  1018,  2226,  2683, 25746,  2629,  1012, 14766,  2903,  2676,
+  // 			   1011,  2095,  1011,  2214,  2522,  1011,  4405, 12460, 11320, 16313,
+  // 			   2480,  9969,  8007,  1996,  4946,  2046,  1996,  2413, 13698,  1516,
+  // 			   4288,  3071,  2006,  2604,  1516,  2044, 14889,  1996,  2952,  2041,
+  // 			   1997,  1996, 13828,  2006,  1037,  3462,  2013,  7623,  2000, 18160,
+  // 			   1012,  2446,  3780, 12170,  6392,  2988,  2008, 11320, 16313,  2480,
+  // 			   9022,  1996,  4274,  2005,  2592,  2006,  5920,  1998,  6245,  2478,
+  // 			   1996,  2171,  1520,  3712, 24844,  4014,  1521,  1012,  3531,  7680,
+  // 			   7849,  4697,  2023,  1012,   102};
 
-  exit(0);
+  // for (auto element: init_input){
+  //   std::vector<int64_t> tokens;
+  //   tokens.push_back(element);
+  //   std::cerr << tokenizer.decode(tokens) << "("<<element<<") "<< std::flush;
+  // }
 
-  
+  // exit(0);
+
+  // INIT_SEQ_LEN = init_input.size();
+  unsigned int input_len = init_input.size();
+  /* INIT_SEQ_LEN=490; */
+
   // float init_data[INIT_SEQ_LEN] = {5058, 10832};
   // float init_data[INIT_SEQ_LEN] = {
   //   0,  1,  2,  3,  4,  5,   6,   7,   8,   9,   10,  20,  30,  40,
   //   50, 60, 70, 80, 90, 100, 200, 300, 400, 500, 600, 700, 800, 900};
 
   if (optimize) {
-    for (unsigned int i = 0; i < INIT_SEQ_LEN; ++i) {
-      input_sample[i] = init_input[i];
-    }
+    //    for (unsigned int i = 0; i < INIT_SEQ_LEN; ++i) {
+    //      input_sample[i] = init_input[i];
+    //    }
 
     input.push_back(input_sample);
 
@@ -460,29 +510,60 @@ void createAndRun(unsigned int epochs, unsigned int batch_size, std::string text
       std::cerr << output_step << "\n";
     }
   } else {
+    
     ((uint *)(input_sample))[0] = init_input[0];
 
     input.push_back(input_sample);
 
-    for (unsigned int i = 1; i < INIT_SEQ_LEN + NUM_TO_GENERATE; ++i) {
+    for (unsigned int i = 1; i < iniput_len + NUM_TO_GENERATE; ++i) {
+
+      unsgined int from = i;
+      
+      if (i >= INIT_SEQ_LEN)
+	from = INIT_SEQ_LEN-1;
+	
       auto output =
-        model->incremental_inference(1, input, label, INIT_SEQ_LEN, i - 1);
+        model->incremental_inference(1, input, label, INIT_SEQ_LEN, from - 1);
 
-      nntrainer::Tensor output_tensor({batch_size, 1, 1, NUM_VOCAB}, output[0]);
+      // nntrainer::Tensor output_tensor({batch_size, 1, 1, NUM_VOCAB}, output[0]);
 
 
+      long diff = std::distance(
+          output[0], std::max_element(output[0], output[0] + NUM_VOCAB));
+      
+      // std::vector<unsigned int> ids = output_tensor.argmax();
+      
+      std::vector<int64_t> token_ids;
+      
       if (i < INIT_SEQ_LEN) {
         ((uint *)(input_sample))[0] = init_input[i];
+	
+	// for(auto element:ids){
+	// token_ids.push_back(static_cast<int64_t>(init_input[i]));
+	// }
+	// token_ids.push_back(static_cast<int64_t>(diff));
+	
+	// std::cout<<tokenizer.decode(token_ids) << "("<<((uint*)(input_sample))[0] << "), ";
       } else {
-        // int diff = std::distance(
-        //   output[0], std::max_element(output[0], output[0] + NUM_VOCAB));
-        // std::cerr << diff << "\n";
-        // ((uint *)(input_sample))[0] = diff;
-        ((uint *)(input_sample))[0] = output_tensor.argmax()[0];
-	std::cerr << output_tensor.argmax()[0] << "\n";	
+        // ((uint *)(input_sample))[0] = ids[0];
+        ((uint *)(input_sample))[0] = diff;
+	// for (unsigned int j=0;j<2; j++)
+	//    std::cout << output[0][j] << " ";
+	// std::cout<<std::endl << "output :                     "<< ids[0] << std::endl;
+	
+	// for(auto element:ids){
+	//   token_ids.push_back(static_cast<int64_t>(ids[0]));
+	// }
+	token_ids.push_back(static_cast<int64_t>(diff));
+      }
+
+      if (i >= INIT_SEQ_LEN) {
+	auto decoded_str = tokenizer.decode(token_ids);
+	std::cerr << decoded_str << " " << std::flush;
       }
     }
   }
+  std::cout << std::endl;   
 }
 
 int main(int argc, char *argv[]) {

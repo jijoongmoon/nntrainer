@@ -1,23 +1,102 @@
 import torch
+#import evaluate
+
+import os
+os.environ['HTTP_PROXY'] = 'http://10.112.1.184:8080'
+os.environ['HTTPS_PROXY'] = 'http://10.112.1.184:8080'
+os.environ['NO_PROXY']="127.0.0.1, localhost"
+os.environ['SSL_CERT_FILE'] = '/etc/ssl/certs/ca-certtificates.crt'
+os.environ['REQUESTS_CA_BUNDLE']='/etc/ssl/certs/ca-certificates.crt'
+
+os.environ['SSL_CERT_FILE']='/etc/ssl/certs/ca-certificates.crt'
+
+os.environ['CURL_CA_BUNDLE']='/etc/ssl/certs/ca-certificates.crt'
+
+os.environ['DEFAULT_CA_BUNDLE_PATH']='/etc/ssl/certs/ca-certificates.crt'
+# export no_proxy
+
+import ssl
+import urllib.request
 import requests
 
 from transformers import GPT2TokenizerFast
+import jsonlines
+import pandas as pd
+import argparse
 
-tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+tokenizer = GPT2TokenizerFast.from_pretrained("bert-based-uncased")
 
 source = "Two Air India pilots have been removed from duty after they reportedly got into a fight inside the cockpit of a plane shortly before it was scheduled to take off. The altercation involving the captain and co-pilot erupted while the plane was being prepared for a 50-minute journey from Delhi to Jaipur last night. Both pilots have been derostered after the captain of flight AI611 complained that the co-pilot had misbehaved and struck him, the Times of India reported. An Air India captain claims a co-pilot misbehaved and struck him during an altercation in the cockpit (file) An Air India spokesman told the newspaper: \u2018Both the pilots have been derostered. An inquiry has been ordered into this.\u2019 The airline insists the altercation was limited to a verbal argument, and there was no physical violence. The Times of India, quoting a source, reported that the captain was assaulted after he asked the co-pilot to record \u2018critical take-off figures\u2019 for the flight, including the number of passengers on board, take-off weight and fuel. Instead of immediately reporting the incident in Delhi, which would have led to the cancellation of the flight, the captain flew the plane to Jaipur and then informed Air India staff. Indian aviation officials have launched an investigation into the incident to determine whether any of the parties involved should be disciplined. Reports suggest that the captain was assaulted after asking the co-pilot to record information before take-off . A report by the Times of India said that the co-pilot has faced similar accusations in the past. Three years ago he told the captain of a flight to exit the cockpit, \u2018remove the stars on his shirt collar\u2019 and fight him, while a complaint filed two years ago from another captain questioned the co-pilot\u2019s mental health and claimed he was \u2018rude and unbecoming\u2019. Last night\u2019s incident comes at a sensitive time for the commercial aviation industry following the tragedy involving Germanwings flight 4U9525. Investigators believe 27-year-old co-pilot Andreas Lubitz deliberately crashed the plane into the French Alps \u2013 killing everyone on board \u2013 after locking the captain out of the cockpit on a flight from Barcelona to Dusseldorf. German newspaper Bild reported that Lubitz searched the internet for information on suicide and depression using the name \u2018Skydevil\u2019.\nPlease summarize this.\n"
 
 inputs = tokenizer(source, return_tensors="pt")
 
+
+
+
+# 101,  2048,  2250,  2634,  8221,  2031,  2042,  3718,  2013,  4611,
+#           2044,  2027,  7283,  2288,  2046,  1037,  2954,  2503,  1996, 13828,
+#           1997,  1037,  4946,  3859,  2077,  2009,  2001,  5115,  2000,  2202,
+#           2125,  1012,  1996, 11477, 10719,  5994,  1996,  2952,  1998,  2522,
+#           1011,  4405, 12591,  2096,  1996,  4946,  2001,  2108,  4810,  2005,
+#           1037,  2753,  1011,  3371,  4990,  2013,  6768,  2000, 28355,  2197,
+#           2305,  1012,  2119,  8221,  2031,  2042,  4315, 14122,  6850,  2044,
+#           1996,  2952,  1997,  3462,  9932,  2575, 14526, 10865,  2008,  1996,
+#           2522,  1011,  4405,  2018, 28616,  4783,  3270,  7178,  1998,  4930,
+#           2032,  1010,  1996,  2335,  1997,  2634,  2988,  1012,  2019,  2250,
+#           2634,  2952,  4447,  1037,  2522,  1011,  4405, 28616,  4783,  3270,
+#           7178,  1998,  4930,  2032,  2076,  2019, 11477, 10719,  1999,  1996,
+#          13828,  1006,  5371,  1007,  2019,  2250,  2634, 14056,  2409,  1996,
+#           3780,  1024,  1520,  2119,  1996,  8221,  2031,  2042,  4315, 14122,
+#           6850,  1012,  2019,  9934,  2038,  2042,  3641,  2046,  2023,  1012,
+#           1521,  1996,  8582, 16818,  1996, 11477, 10719,  2001,  3132,  2000,
+#           1037, 12064,  6685,  1010,  1998,  2045,  2001,  2053,  3558,  4808,
+#           1012,  1996,  2335,  1997,  2634,  1010, 27394,  1037,  3120,  1010,
+#           2988,  2008,  1996,  2952,  2001, 17536,  2044,  2002,  2356,  1996,
+#           2522,  1011,  4405,  2000,  2501,  1520,  4187,  2202,  1011,  2125,
+#           4481,  1521,  2005,  1996,  3462,  1010,  2164,  1996,  2193,  1997,
+#           5467,  2006,  2604,  1010,  2202,  1011,  2125,  3635,  1998,  4762,
+#           1012,  2612,  1997,  3202,  7316,  1996,  5043,  1999,  6768,  1010,
+#           2029,  2052,  2031,  2419,  2000,  1996, 16990,  1997,  1996,  3462,
+#           1010,  1996,  2952,  5520,  1996,  4946,  2000, 28355,  1998,  2059,
+#           6727,  2250,  2634,  3095,  1012,  2796,  5734,  4584,  2031,  3390,
+#           2019,  4812,  2046,  1996,  5043,  2000,  5646,  3251,  2151,  1997,
+#           1996,  4243,  2920,  2323,  2022, 28675,  1012,  4311,  6592,  2008,
+#           1996,  2952,  2001, 17536,  2044,  4851,  1996,  2522,  1011,  4405,
+#           2000,  2501,  2592,  2077,  2202,  1011,  2125,  1012,  1037,  3189,
+#           2011,  1996,  2335,  1997,  2634,  2056,  2008,  1996,  2522,  1011,
+#           4405,  2038,  4320,  2714, 13519,  1999,  1996,  2627,  1012,  2093,
+#           2086,  3283,  2002,  2409,  1996,  2952,  1997,  1037,  3462,  2000,
+#           6164,  1996, 13828,  1010,  1520,  6366,  1996,  3340,  2006,  2010,
+#           3797,  9127,  1521,  1998,  2954,  2032,  1010,  2096,  1037, 12087,
+#           6406,  2048,  2086,  3283,  2013,  2178,  2952,  8781,  1996,  2522,
+#           1011,  4405,  1521,  1055,  5177,  2740,  1998,  3555,  2002,  2001,
+#           1520, 12726,  1998,  4895,  4783, 18935,  1521,  1012,  2197,  2305,
+#           1521,  1055,  5043,  3310,  2012,  1037,  7591,  2051,  2005,  1996,
+#           3293,  5734,  3068,  2206,  1996, 10576,  5994,  2446,  9328,  2015,
+#           3462,  1018,  2226,  2683, 25746,  2629,  1012, 14766,  2903,  2676,
+#           1011,  2095,  1011,  2214,  2522,  1011,  4405, 12460, 11320, 16313,
+#           2480,  9969,  8007,  1996,  4946,  2046,  1996,  2413, 13698,  1516,
+#           4288,  3071,  2006,  2604,  1516,  2044, 14889,  1996,  2952,  2041,
+#           1997,  1996, 13828,  2006,  1037,  3462,  2013,  7623,  2000, 18160,
+#           1012,  2446,  3780, 12170,  6392,  2988,  2008, 11320, 16313,  2480,
+#           9022,  1996,  4274,  2005,  2592,  2006,  5920,  1998,  6245,  2478,
+#           1996,  2171,  1520,  3712, 24844,  4014,  1521,  1012,  3531,  7680,
+#           7849,  4697,  2023,  1012,   102
+
 # {'input_ids': tensor([[ 7571,  3701,  3794, 14982,   423,   587,  4615,   422,  7077,   706,
 #            484,  7478,  1392,   656,   257,  1907,  2641,   262, 25762,   286,
 #            257,  6614,  8972,   878,   340,   373,  7530,   284,  1011,   572,
-#             13,   383, 38880,  7411,   262, 10654,   290,   763,    12,    79,
+#             13,
+
+# 59(.), 77(\n) ???
+
+#383, 38880,  7411,   262, 10654,   290,   763,    12,    79,
 #          23439, 23681,   981,   262,  6614,   373,   852,  5597,   329,   257,
 #           2026,    12, 11374,  7002,   422, 12517,   284, 13790,   541,   333,
 #            938,  1755,    13,  5747, 14982,   423,   587,  4587,   455,  1068,
 #            706,   262, 10654,   286,  5474,  9552,    21,  1157, 13832,   326,
-#            262,   763,    12,    79, 23439,   550,  2984, 20709,  9586,   290,
+#            262,   763,    12(-),    79, 23439,   550,  2984, 20709,  9586,   290,
 #           7425,   683,    11,   262,  3782,   286,  3794,  2098,    13,  1052,
 #           3701,  3794, 10654,  3667,   257,   763,    12,    79, 23439,  2984,
 #          20709,  9586,   290,  7425,   683,  1141,   281, 38880,   287,   262,
@@ -25,7 +104,7 @@ inputs = tokenizer(source, return_tensors="pt")
 #           7533,    25,   564,   246, 10265,   262, 14982,   423,   587,  4587,
 #            455,  1068,    13,  1052, 12069,   468,   587,  6149,   656,   428,
 #             13,   447,   247,   383, 18091, 17424,   262, 38880,   373,  3614,
-#            284,   257, 17755,  4578,    11,   290,   612,   373,   645,  3518,
+#            284,   257, 17755,  4578,    11(,),   290,   612,   373,   645,  3518,
 #           3685,    13,   383,  3782,   286,  3794,    11, 28411,   257,  2723,
 #             11,  2098,   326,   262, 10654,   373, 18513,   706,   339,  1965,
 #            262,   763,    12,    79, 23439,   284,  1700,   564,   246, 34666,
@@ -57,8 +136,8 @@ inputs = tokenizer(source, return_tensors="pt")
 #          22656,   262, 10654,   503,   286,   262, 25762,   319,   257,  5474,
 #            422, 15142,   284,   360,   385,   325,   335, 24263,    13,  2679,
 #           7533, 44406,  2098,   326, 40753,  4224, 16499,   262,  5230,   329,
-#           1321,   319,  7341,   290,  8862,  1262,   262,  1438,   564,   246,
-#          22308,  7959,   346,   447,   247,    13,   198,  5492, 35743,   428,
+#           1321,   319,  7341,   290,  8862,  1262,   262,  1438,   564(\u),   246,
+#          22308,  7959,   346,   447,   247,    13(.),   198(\n),  5492, 35743,   428,
 #             13,   198]]), 'attention_mask': tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 #          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 #          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -81,6 +160,4 @@ inputs = tokenizer(source, return_tensors="pt")
 #          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 #          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])}
 
-print(inputs)
-~                                                                                                                                                                                                    
-~                              
+print(inputs)                  
