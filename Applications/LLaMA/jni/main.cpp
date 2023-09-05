@@ -21,12 +21,12 @@
 #include <model.h>
 #include <optimizer.h>
 
+#include "encoder.hpp"
 #include <app_context.h>
 #include <rms_norm.h>
 #include <rotary_embedding.h>
 #include <swiglu.h>
 #include <transpose_layer.h>
-#include "encoder.hpp"
 
 using LayerHandle = std::shared_ptr<ml::train::Layer>;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
@@ -40,8 +40,9 @@ int const MULTIPLE_OF = 256;
 
 float const NORM_EPS = 0.000001;
 int const NUM_VOCAB = 96000;
-int MAX_SEQ_LEN = 1124;
-int NUM_TO_GENERATE = 100;
+int MAX_SEQ_LEN = 1024;
+
+int NUM_TO_GENERATE = 1;
 
 unsigned int INIT_SEQ_LEN = 1024;
 unsigned int batch_size = 1;
@@ -376,13 +377,14 @@ ModelHandle createLLaMA() {
   return model;
 }
 
-void createAndRun(unsigned int epochs, unsigned int batch_size, std::string text) {
+void createAndRun(unsigned int epochs, unsigned int batch_size,
+                  std::string text) {
   // setup model
   ModelHandle model = createLLaMA();
   model->setProperty({withKey("batch_size", batch_size),
                       withKey("epochs", epochs),
                       // #ifdef ENABLE_FP16
-                      withKey("model_tensor_type", "FP16-FP16"),
+                      // withKey("model_tensor_type", "FP16-FP16"),
                       // #endif
                       withKey("save_path", "test_model.bin")});
 
@@ -403,77 +405,83 @@ void createAndRun(unsigned int epochs, unsigned int batch_size, std::string text
 
   // std::string weight_path =
   //   optimize ? "./llama_v2.bin" : "./summarization_v2_fp16.bin";
-  // std::string weight_path ="./llama_v2.bin";
-  std::string weight_path ="./summarization_v2_fp16.bin";
-  
+  std::string weight_path = "./llama_v2.bin";
+  // std::string weight_path ="./summarization_v2_fp16.bin";
+
   model->load(weight_path);
 
   std::vector<float *> input;
   std::vector<float *> label;
 
-  int data_size = batch_size * INIT_SEQ_LEN;
+  unsigned int input_len = 5;
 
+  int data_size = batch_size * input_len;
 
   std::string vocab_file_name = "./vocab.json";
   std::string merge_file_name = "./merges.txt";
-  
+
   float *input_sample = (float *)malloc(sizeof(float) * data_size);
 
+  auto tokenizer = unwrap(GPT2Encoder::load(vocab_file_name, merge_file_name),
+                          "Error initializising GPT2 tokenizer\n");
 
-   auto tokenizer = unwrap(GPT2Encoder::load(vocab_file_name, merge_file_name),
-			  "Error initializising GPT2 tokenizer\n");
+  // auto init_input = tokenizer.encode(text);
+  // std::cout << std::endl;
 
-  auto init_input = tokenizer.encode(text);
-  std::cout << std::endl;
-  // float init_input[485] = {101,  2048,  2250,  2634,  8221,  2031,  2042,  3718,  2013,  4611,
-  // 			   2044,  2027,  7283,  2288,  2046,  1037,  2954,  2503,  1996, 13828,
-  // 			   1997,  1037,  4946,  3859,  2077,  2009,  2001,  5115,  2000,  2202,
-  // 			   2125,  1012,  1996, 11477, 10719,  5994,  1996,  2952,  1998,  2522,
-  // 			   1011,  4405, 12591,  2096,  1996,  4946,  2001,  2108,  4810,  2005,
-  // 			   1037,  2753,  1011,  3371,  4990,  2013,  6768,  2000, 28355,  2197,
-  // 			   2305,  1012,  2119,  8221,  2031,  2042,  4315, 14122,  6850,  2044,
-  // 			   1996,  2952,  1997,  3462,  9932,  2575, 14526, 10865,  2008,  1996,
-  // 			   2522,  1011,  4405,  2018, 28616,  4783,  3270,  7178,  1998,  4930,
-  // 			   2032,  1010,  1996,  2335,  1997,  2634,  2988,  1012,  2019,  2250,
-  // 			   2634,  2952,  4447,  1037,  2522,  1011,  4405, 28616,  4783,  3270,
-  // 			   7178,  1998,  4930,  2032,  2076,  2019, 11477, 10719,  1999,  1996,
-  // 			   13828,  1006,  5371,  1007,  2019,  2250,  2634, 14056,  2409,  1996,
-  // 			   3780,  1024,  1520,  2119,  1996,  8221,  2031,  2042,  4315, 14122,
-  // 			   6850,  1012,  2019,  9934,  2038,  2042,  3641,  2046,  2023,  1012,
-  // 			   1521,  1996,  8582, 16818,  1996, 11477, 10719,  2001,  3132,  2000,
-  // 			   1037, 12064,  6685,  1010,  1998,  2045,  2001,  2053,  3558,  4808,
-  // 			   1012,  1996,  2335,  1997,  2634,  1010, 27394,  1037,  3120,  1010,
-  // 			   2988,  2008,  1996,  2952,  2001, 17536,  2044,  2002,  2356,  1996,
-  // 			   2522,  1011,  4405,  2000,  2501,  1520,  4187,  2202,  1011,  2125,
-  // 			   4481,  1521,  2005,  1996,  3462,  1010,  2164,  1996,  2193,  1997,
-  // 			   5467,  2006,  2604,  1010,  2202,  1011,  2125,  3635,  1998,  4762,
-  // 			   1012,  2612,  1997,  3202,  7316,  1996,  5043,  1999,  6768,  1010,
-  // 			   2029,  2052,  2031,  2419,  2000,  1996, 16990,  1997,  1996,  3462,
-  // 			   1010,  1996,  2952,  5520,  1996,  4946,  2000, 28355,  1998,  2059,
-  // 			   6727,  2250,  2634,  3095,  1012,  2796,  5734,  4584,  2031,  3390,
-  // 			   2019,  4812,  2046,  1996,  5043,  2000,  5646,  3251,  2151,  1997,
-  // 			   1996,  4243,  2920,  2323,  2022, 28675,  1012,  4311,  6592,  2008,
-  // 			   1996,  2952,  2001, 17536,  2044,  4851,  1996,  2522,  1011,  4405,
-  // 			   2000,  2501,  2592,  2077,  2202,  1011,  2125,  1012,  1037,  3189,
-  // 			   2011,  1996,  2335,  1997,  2634,  2056,  2008,  1996,  2522,  1011,
-  // 			   4405,  2038,  4320,  2714, 13519,  1999,  1996,  2627,  1012,  2093,
-  // 			   2086,  3283,  2002,  2409,  1996,  2952,  1997,  1037,  3462,  2000,
-  // 			   6164,  1996, 13828,  1010,  1520,  6366,  1996,  3340,  2006,  2010,
-  // 			   3797,  9127,  1521,  1998,  2954,  2032,  1010,  2096,  1037, 12087,
-  // 			   6406,  2048,  2086,  3283,  2013,  2178,  2952,  8781,  1996,  2522,
-  // 			   1011,  4405,  1521,  1055,  5177,  2740,  1998,  3555,  2002,  2001,
-  // 			   1520, 12726,  1998,  4895,  4783, 18935,  1521,  1012,  2197,  2305,
-  // 			   1521,  1055,  5043,  3310,  2012,  1037,  7591,  2051,  2005,  1996,
-  // 			   3293,  5734,  3068,  2206,  1996, 10576,  5994,  2446,  9328,  2015,
-  // 			   3462,  1018,  2226,  2683, 25746,  2629,  1012, 14766,  2903,  2676,
-  // 			   1011,  2095,  1011,  2214,  2522,  1011,  4405, 12460, 11320, 16313,
-  // 			   2480,  9969,  8007,  1996,  4946,  2046,  1996,  2413, 13698,  1516,
-  // 			   4288,  3071,  2006,  2604,  1516,  2044, 14889,  1996,  2952,  2041,
-  // 			   1997,  1996, 13828,  2006,  1037,  3462,  2013,  7623,  2000, 18160,
-  // 			   1012,  2446,  3780, 12170,  6392,  2988,  2008, 11320, 16313,  2480,
-  // 			   9022,  1996,  4274,  2005,  2592,  2006,  5920,  1998,  6245,  2478,
-  // 			   1996,  2171,  1520,  3712, 24844,  4014,  1521,  1012,  3531,  7680,
-  // 			   7849,  4697,  2023,  1012,   102};
+  float init_input[5] = {1648, 4286, 39, 12330, 6835};
+
+  // float init_input[502]={ 1648,  4286,    39, 12330,  6835,  7840, 50444,
+  // 679,  1260, 10224,
+  //         663, 17124,  1783,  1014, 40994,  3097,  1324,   277,  8422,  5192,
+  //         288, 82847,   330,   277, 14989, 26464,  2011,   484,   641, 15764,
+  //         321,  2047,  1117,    27,   592, 18835, 72083, 18735,   288, 28383,
+  //         329,  1579,    26,    93, 56094, 49342,   311,  2137,   288, 14989,
+  //         641,  2139, 10326,   412,   277,   885,    29,    26, 22953, 10019,
+  //         663, 28669,   321, 35595, 56502,  2255,  3848,    27, 13126, 50444,
+  //         679,  1260,  3080,   728,  1929,  1783,   288, 28383,   330, 13042,
+  //       15888,    35,    30,    30, 55580,   467,   288,  1579,    26,    93,
+  //       56094,  1206,  7738, 64975, 13889,   329, 23171,  1909,    25,   288,
+  //       15500,   330,  7840,  8264,    27,  2268,  6835,  7840, 28383, 12017,
+  //         277,  1579,    26,    93, 56094,  7738, 64975, 13889,   329, 23171,
+  //        1909,  2776,   499, 18835, 72083,   322,   288, 82847,   433,  3085,
+  //          22,  2268,  6835,  7840, 50631,  5486,   288, 22569,    39,  2046,
+  //       25007,   288, 50444,   679,  1260,  3080,   728,  1929,    27,  2268,
+  //       38035,   898,  1260, 14615,  1324,   611, 26522,   592, 33948, 78076,
+  //         288, 18835, 72083,   641,  7560,   321,   277, 49478,  9835,    25,
+  //         329,  1248,   641,  1350,  7242, 17312,    27,   592, 15500,   330,
+  //        7840,    25, 85873,   277,  4267,    25,  8264,   467,   288, 28383,
+  //         641, 29914,   311,  1783,   501,  5685,   288,  1579,    26,    93,
+  //       56094,   321,  3505,  2046, 52358,  2047,    26,  3516, 16195,   554,
+  //         412,   288, 13042,    25,  2877,   288,  1881,   330, 25977,   426,
+  //        6618,    25,  2047,    26,  3516,  6067,   329, 12782,    27, 14084,
+  //         330,  8244, 17053,   288, 17674,   322, 28669,    25,  1004,  1263,
+  //         679,  7300,   321,   288, 28319,   330,   288, 13042,    25,   288,
+  //       28383, 38291,   288, 14989,   321, 35595, 56502,   329,  1574, 16366,
+  //        6835,  7840,  5553,    27,  9312, 49543, 15243,   679, 14264,   499,
+  //       16697,  1324,   288, 17674,   321,  8931,  4381,  1092,   330,   288,
+  //       10544,  7009,  1640,   428, 91085,    27, 47723,  4694,   467,   288,
+  //       28383,   641, 29914,   311,  1783, 12608,   288,  1579,    26,    93,
+  //       56094,   321,  3505,  2060,  2011,  2047,    26,  3516,  1151,   425,
+  //        3061,   667,   288, 15500,   330,  7840,  1811,   467,   288,  1579,
+  //          26,    93, 56094,   898, 20635,  4929, 82423,   322,   288,  3691,
+  //          27, 19113,  1911,  5870,   501,  5486,   288, 28383,   330,   277,
+  //       13042,   321, 14282,   288, 82847,    25,  2046,  8455,   288, 11756,
+  //         426,  1083, 21155, 37853,   554,   329,  8422,  1909,    25,  2137,
+  //         277, 28249, 17974,  1598,  1911,  5870,   663,  2785, 28383, 50343,
+  //         288,  1579,    26,    93, 56094,   554,    96, 12753,  2938,   329,
+  //       19807,   501,   641,  2046,    95,  4948,   329, 71906,  5835, 15600,
+  //       14416,  3848,   554,    96, 17674,  4148,   596,   277, 17508,  1099,
+  //         412,   288,  8089, 49543,  4753,  3220,   288, 44915, 18735, 11151,
+  //         100,  1130, 13042,   845,    66,    38,    34,    31,    34,    27,
+  //       60685,  4285,  5213,   458,    36,    26,  6132,    26,  1214,  1579,
+  //          26,    93, 56094, 76955, 58893, 11055, 51646, 54343,   288, 14989,
+  //        1324,   288,  8972, 86227,  1573, 24947,  5681,   426,  6618,  1573,
+  //        1783, 45497,   288, 28383,   907,   330,   288, 82847,   426,   277,
+  //       13042,   663, 32635,   321,   552,  2504, 13298, 31517,    27, 11151,
+  //       22569, 59262,  8264,   467, 58893, 11055, 35184,   288,  8867,   412,
+  //        2060,   426, 33586,   329, 22371,  1941,   288,  1431,  2046, 14074,
+  //        4920, 92896, 15600,   212,  9384, 61438,   611,    27,   212,  1648,
+  // 			   5231,    39   };
 
   // for (auto element: init_input){
   //   std::vector<int64_t> tokens;
@@ -483,9 +491,10 @@ void createAndRun(unsigned int epochs, unsigned int batch_size, std::string text
 
   // exit(0);
 
-  // INIT_SEQ_LEN = init_input.size();
-  unsigned int input_len = init_input.size();
-  /* INIT_SEQ_LEN=490; */
+  //  INIT_SEQ_LEN = init_input.size();
+  // unsigned int input_len = 502;
+  // std::cout << input_len << std::endl;
+  // unsigned int input_len = 5;
 
   // float init_data[INIT_SEQ_LEN] = {5058, 10832};
   // float init_data[INIT_SEQ_LEN] = {
@@ -510,60 +519,39 @@ void createAndRun(unsigned int epochs, unsigned int batch_size, std::string text
       std::cerr << output_step << "\n";
     }
   } else {
-    
-    ((uint *)(input_sample))[0] = init_input[0];
+
+    input_sample[0] = static_cast<float>(init_input[0]);
 
     input.push_back(input_sample);
 
-    for (unsigned int i = 1; i < iniput_len + NUM_TO_GENERATE; ++i) {
+    for (unsigned int i = 1; i < input_len + NUM_TO_GENERATE; ++i) {
 
-      unsgined int from = i;
-      
-      if (i >= INIT_SEQ_LEN)
-	from = INIT_SEQ_LEN-1;
-	
       auto output =
-        model->incremental_inference(1, input, label, INIT_SEQ_LEN, from - 1);
+        model->incremental_inference(1, input, label, MAX_SEQ_LEN, i - 1);
 
-      // nntrainer::Tensor output_tensor({batch_size, 1, 1, NUM_VOCAB}, output[0]);
+      nntrainer::Tensor output_tensor({batch_size, 1, 1, NUM_VOCAB}, output[0]);
 
+      std::cout << i << " - " << output[0][0] << " " << output[0][1] << " "
+                << output[0][2] << " ----> ";
 
-      long diff = std::distance(
-          output[0], std::max_element(output[0], output[0] + NUM_VOCAB));
-      
-      // std::vector<unsigned int> ids = output_tensor.argmax();
-      
       std::vector<int64_t> token_ids;
-      
-      if (i < INIT_SEQ_LEN) {
-        ((uint *)(input_sample))[0] = init_input[i];
-	
-	// for(auto element:ids){
-	// token_ids.push_back(static_cast<int64_t>(init_input[i]));
-	// }
-	// token_ids.push_back(static_cast<int64_t>(diff));
-	
-	// std::cout<<tokenizer.decode(token_ids) << "("<<((uint*)(input_sample))[0] << "), ";
+
+      if (i < input_len) {
+        input_sample[0] = static_cast<float>(init_input[i]);
+        std::cout << init_input[i] << std::endl;
       } else {
-        // ((uint *)(input_sample))[0] = ids[0];
-        ((uint *)(input_sample))[0] = diff;
-	// for (unsigned int j=0;j<2; j++)
-	//    std::cout << output[0][j] << " ";
-	// std::cout<<std::endl << "output :                     "<< ids[0] << std::endl;
+
+        std::vector<unsigned int> ids = output_tensor.argmax();
+        input_sample[0] = static_cast<float>(ids[0]);
 	
-	// for(auto element:ids){
-	//   token_ids.push_back(static_cast<int64_t>(ids[0]));
-	// }
-	token_ids.push_back(static_cast<int64_t>(diff));
+        token_ids.push_back(static_cast<int64_t>(ids[0]));
+      	auto decoded_str = tokenizer.decode(token_ids);
+      	std::cerr << decoded_str << " " << std::flush;
       }
 
-      if (i >= INIT_SEQ_LEN) {
-	auto decoded_str = tokenizer.decode(token_ids);
-	std::cerr << decoded_str << " " << std::flush;
-      }
     }
   }
-  std::cout << std::endl;   
+  std::cout << std::endl;
 }
 
 int main(int argc, char *argv[]) {
@@ -585,9 +573,9 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    const std::vector<std::string> args(argv+1, argv+argc);
+    const std::vector<std::string> args(argv + 1, argv + argc);
     std::string text = args[0];
-    createAndRun(epoch, batch_size,text);
+    createAndRun(epoch, batch_size, text);
   } catch (const std::exception &e) {
     std::cerr << "uncaught error while running! details: " << e.what()
               << std::endl;

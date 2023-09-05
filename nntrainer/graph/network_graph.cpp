@@ -379,6 +379,7 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
     forwarding_op(*iter, training);
+    std::cout << ln->getName() << " : "<<ln->getOutput(0).getData()[0] << " " << ln->getOutput(0).getData()[1] << " " << ln->getOutput(0).getData()[2] << std::endl;
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
   }
 
