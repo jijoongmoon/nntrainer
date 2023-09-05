@@ -164,9 +164,8 @@ private:
     }
   }
 
-  template <typename T = float>
-  Tensor apply_rotary_emb_tensor(Tensor in, unsigned int dim,
-                                 unsigned int from) {
+  void apply_rotary_emb_tensor(Tensor &in, unsigned int dim,
+                               unsigned int from) {
     Tensor out(in.getDim());
     float value = 0;
     float transformed_value = 0.0;
@@ -189,6 +188,7 @@ private:
                 }
                 value = value * (*freqs_cos)[from][k] +
                         transformed_value * (*freqs_sin)[from][k];
+
                 out.setValue(b, c, h, span, value);
               }
             }
@@ -229,7 +229,7 @@ private:
         }
       }
     }
-    return out;
+    in.copy(out);
   }
 
   /**
