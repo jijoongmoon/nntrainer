@@ -64,7 +64,7 @@ void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
     for (unsigned int j = 0; j < axis_dim; ++j) {
       sum += powf(static_cast<float>(data[j]), 2.0f);
     }
-    t.setValue(0, 0, i, 0, 1.0 / sqrt(sum / axis_dim + epsilon));
+    t.setValue(0, 0, i, 0, static_cast<_FP16>(1.0 / sqrt(sum / axis_dim + epsilon)));
   }
   in.multiply(t, out);
   out.multiply_i(gamma);
@@ -73,6 +73,12 @@ void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
   throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif
   }
+/*   out.print(std::cout);
+  std::ofstream f;
+f.open("./fp16_rms_file");
+out.save(f);
+f.close();
+ */
 }
 
 void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {

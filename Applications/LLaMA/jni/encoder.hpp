@@ -188,10 +188,10 @@ private:
 
 /**
  * @brief load vocab and merges file and return GPT2Encoder
- * 
- * @param vocab_file 
- * @param merges_file 
- * @return std::optional<GPT2Encoder> 
+ *
+ * @param vocab_file
+ * @param merges_file
+ * @return std::optional<GPT2Encoder>
  */
 std::optional<GPT2Encoder> GPT2Encoder::load(std::string_view vocab_file,
                                              std::string_view merges_file) {
@@ -245,9 +245,9 @@ std::optional<GPT2Encoder> GPT2Encoder::load(std::string_view vocab_file,
 
 /**
  * @brief encode text to ids
- * 
- * @param text 
- * @return std::vector<int64_t> 
+ *
+ * @param text
+ * @return std::vector<int64_t>
  */
 std::vector<int64_t> GPT2Encoder::encode(const std::string &text) {
   std::vector<std::string> tokens = tokenize(text);
@@ -255,7 +255,112 @@ std::vector<int64_t> GPT2Encoder::encode(const std::string &text) {
   token_ids.reserve(tokens.size());
   std::transform(tokens.begin(), tokens.end(), std::back_inserter(token_ids),
                  [this](const std::string &token) { return m_encoder[token]; });
-  return token_ids;
+
+  std::vector<int64_t> processed_result;
+
+  for (unsigned int i = 0; i < token_ids.size(); i++) {
+    // encoding unicode text to bytes
+    if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+        token_ids[i + 2] == 261) {
+      processed_result.push_back(554);
+      i = i + 2;
+    } else if (token_ids[i] == 140 && token_ids[i + 1] == 268) {
+      processed_result.push_back(786);
+      i = i + 1;
+    } else if (token_ids[i] == 141 && token_ids[i + 1] == 116) {
+      processed_result.push_back(1152);
+      i = i + 1;
+    } else if (token_ids[i] == 141 && token_ids[i + 1] == 237) {
+      processed_result.push_back(63218);
+      i = i + 1;
+    } else if (token_ids[i] == 140 && token_ids[i + 1] == 269) {
+      processed_result.push_back(9933);
+      i = i + 1;
+    } else if (token_ids[i] == 140 && token_ids[i + 1] == 108) {
+      processed_result.push_back(2235);
+      i = i + 1;
+    } else if (token_ids[i] == 140 && token_ids[i + 1] == 116) {
+      processed_result.push_back(9063);
+      i = i + 1;
+    } else if (token_ids[i] == 141 && token_ids[i + 1] == 269) {
+      processed_result.push_back(2486);
+      i = i + 1;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 389) {
+      processed_result.push_back(23613);
+      i = i + 1;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 260) {
+      processed_result.push_back(8256);
+      i = i + 2;
+    } else if (token_ids[i] == 140 && token_ids[i + 1] == 120) {
+      processed_result.push_back(10130);
+      i = i + 1;
+    } else if (token_ids[i] == 141 && token_ids[i + 1] == 111) {
+      processed_result.push_back(2832);
+      i = i + 1;
+    } else if (token_ids[i] == 141 && token_ids[i + 1] == 268) {
+      processed_result.push_back(7292);
+      i = i + 1;
+    } else if (token_ids[i] == 143 && token_ids[i + 1] == 249) {
+      processed_result.push_back(28458);
+      i = i + 1;
+    } else if (token_ids[i] == 141 && token_ids[i + 1] == 115) {
+      processed_result.push_back(4368);
+      i = i + 1;
+    } else if (token_ids[i] == 141 && token_ids[i + 1] == 109) {
+      processed_result.push_back(10490);
+      i = i + 1;
+    } else if (token_ids[i] == 141 && token_ids[i + 1] == 114) {
+      processed_result.push_back(5674);
+      i = i + 1;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 255) {
+      processed_result.push_back(2815);
+      i = i + 2;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 256) {
+      processed_result.push_back(2241);
+      i = i + 2;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 264) {
+      processed_result.push_back(3193);
+      i = i + 2;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 109) {
+      processed_result.push_back(6316);
+      i = i + 2;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 250) {
+      processed_result.push_back(85994);
+      i = i + 2;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 237 &&
+               token_ids[i + 2] == 122) {
+      processed_result.push_back(39634);
+      processed_result.push_back(122);
+      processed_result.push_back(234);
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 113) {
+      processed_result.push_back(2643);
+      i = i + 2;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 265) {
+      processed_result.push_back(1185);
+      i = i + 2;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 247) {
+      processed_result.push_back(9234);
+      i = i + 2;
+    } else if (token_ids[i] == 172 && token_ids[i + 1] == 236 &&
+               token_ids[i + 2] == 253) {
+      processed_result.push_back(396);
+      processed_result.push_back(253);
+      i = i + 1;
+    } else {
+      processed_result.push_back(token_ids[i]);
+    }
+  }
+
+  return processed_result;
 }
 
 size_t codepoint_length(const char c) {
@@ -271,9 +376,9 @@ size_t codepoint_length(const char c) {
 
 /**
  * @brief decode ids to text
- * 
- * @param token_ids 
- * @return std::string 
+ *
+ * @param token_ids
+ * @return std::string
  */
 std::string GPT2Encoder::decode(const std::vector<int64_t> &token_ids) {
   std::string decoded_string;
@@ -290,12 +395,13 @@ std::string GPT2Encoder::decode(const std::vector<int64_t> &token_ids) {
 
 /**
  * @brief tokenize text
- * 
- * @param text 
- * @return std::vector<std::string> 
+ *
+ * @param text
+ * @return std::vector<std::string>
  */
 std::vector<std::string> GPT2Encoder::tokenize(const std::string &text) {
   std::vector<std::string> result;
+
   for (auto match : ctre::range<pattern>(text)) {
     std::string token = match.to_string();
     std::string byte_token;
@@ -312,9 +418,9 @@ std::vector<std::string> GPT2Encoder::tokenize(const std::string &text) {
 
 /**
  * @brief apply bpe to token
- * 
- * @param token 
- * @return std::vector<std::string> 
+ *
+ * @param token
+ * @return std::vector<std::string>
  */
 std::vector<std::string> GPT2Encoder::bpe(const std::string &token) {
 

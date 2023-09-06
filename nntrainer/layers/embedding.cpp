@@ -20,6 +20,7 @@
 #include <util_func.h>
 
 #include <iostream>
+#include <fstream>
 
 namespace nntrainer {
 
@@ -130,6 +131,11 @@ void EmbeddingLayer::forwarding(RunLayerContext &context, bool training) {
       // std::copy(weight_data, weight_data + out_dim, out_data);
     }
   }
+/* hidden_.print(std::cout);  
+std::ofstream f;
+f.open("./fp16_file");
+hidden_.save(f);
+f.close(); */
 }
 
 // void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,

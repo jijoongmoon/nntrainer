@@ -40,12 +40,18 @@ void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
     }
   }
 
-  bool print = std::get<props::Print>(add_props).get();
+/*   bool print = std::get<props::Print>(add_props).get();
   if (print) {
     // std::cerr << input_ << "\n";
     // std::cerr << weight << "\n";
     // std::cerr << hidden_ << "\n";
   }
+  hidden_.print(std::cout);
+        std::ofstream f;
+f.open("./fp16_addition_file");
+hidden_.save(f);
+f.close(); */
+
 }
 
 void AdditionLayer::calcDerivative(RunLayerContext &context) {

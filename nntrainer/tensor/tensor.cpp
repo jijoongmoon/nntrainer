@@ -3124,16 +3124,23 @@ void Tensor::save(std::ostream &file) {
   NNTR_THROW_IF(sz < 0, std::invalid_argument)
     << "save size: " << bytes()
     << " is too big. It cannot be represented by std::streamsize";
-
-  checkedWrite(file, (char *)getData(), sz, "[Tensor::save] operation failed");
-  /*  std::vector<_FP16> temp(size());
+  if (this->getDataType() == ml::train::TensorDim::DataType::FP32) {
+    checkedWrite(file, (char *)getData(), sz,
+                 "[Tensor::save] operation failed");
+  } else if (this->getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    std::vector<_FP16> temp(size());
     for (unsigned int i = 0; i < size(); ++i) {
       temp[i] = static_cast<_FP16>(getData()[i]);
     }
 
     checkedWrite(file, (char *)temp.data(),
                  static_cast<std::streamsize>(size() * sizeof(_FP16)),
-                 "[Tensor::save] operation failed");*/
+                 "[Tensor::save] operation failed");
+#else
+    throw std::invalid_argument("Error: enable-fp16 is not enabled");
+#endif
+  }
   putData();
 }
 

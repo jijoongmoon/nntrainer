@@ -129,13 +129,11 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
     hidden_.add_i(bias);
   }
 
-  bool print = std::get<props::Print>(*layer_impl_props).get();
-  if (print) {
-    // std::cerr << input_ << "\n";
-    // std::cerr << weight << "\n";
-    // std::cerr << weight.bytes() << "\n";
-    // std::cerr << hidden_ << "\n";
-  }
+/*   hidden_.print(std::cout);
+        std::ofstream f;
+f.open("./fp16_fc_file");
+hidden_.save(f);
+f.close();   */
 }
 
 void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {
