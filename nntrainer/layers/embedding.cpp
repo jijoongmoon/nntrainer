@@ -19,8 +19,8 @@
 #include <node_exporter.h>
 #include <util_func.h>
 
-#include <iostream>
 #include <fstream>
+#include <iostream>
 
 namespace nntrainer {
 
@@ -90,7 +90,8 @@ void EmbeddingLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &weight = context.getWeight(weight_idx);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  TensorDim out_tensor_dim = TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
+  TensorDim out_tensor_dim =
+    TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
 
   for (unsigned int b = 0; b < input_.batch(); ++b) {
     float *in_data =
@@ -131,16 +132,11 @@ void EmbeddingLayer::forwarding(RunLayerContext &context, bool training) {
       // std::copy(weight_data, weight_data + out_dim, out_data);
     }
   }
-/* hidden_.print(std::cout);  
-std::ofstream f;
-f.open("./fp16_file");
-hidden_.save(f);
-f.close(); */
 }
 
 // void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
-//                                             unsigned int from, unsigned int to,
-//                                             bool training) {
+//                                             unsigned int from, unsigned int
+//                                             to, bool training) {
 //   /// @todo get input and output dimension from input_ and hidden itself
 //   unsigned int in_dim = std::get<props::InDim>(embedding_props);
 //   unsigned int out_dim = std::get<props::OutDim>(embedding_props);

@@ -73,11 +73,6 @@ void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
   }
-/*   out.print(std::cout);
-          std::ofstream f;
-f.open("./fp16_swiglu_file");
-out.save(f);
-f.close(); */
 }
 
 void SwiGLULayer::calcDerivative(nntrainer::RunLayerContext &context) {
