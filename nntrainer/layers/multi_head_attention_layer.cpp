@@ -351,6 +351,15 @@ void MultiHeadAttentionLayer::finalize(InitLayerContext &context) {
   } else {
     context.setOutputDimensions({output_dim});
   }
+
+  /**
+   * @todo
+   * check query width and key width
+   *
+   */
+  // precompute_freqs_cis<float>(projected_key_dim_prop, key_height);
+  if (freqs_cos == nullptr)
+    precompute_freqs(projected_key_dim_prop, max_timestep);
 }
 
 void MultiHeadAttentionLayer::forwarding(RunLayerContext &context,
@@ -596,7 +605,6 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
                                                      unsigned int _to,
                                                      bool training) {
 
-
   unsigned int max_timestep =
     std::get<props::MaxTimestep>(multi_head_attention_props).get();
 
@@ -628,15 +636,6 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   const bool provide_attention_mask = context.getNumInputs() == 4;
   const unsigned int projected_query_dim_prop = projected_key_dim_prop;
   const bool enable_dropout = dropout_rate > epsilon;
-
-  /**
-   * @todo
-   * check query width and key width
-   *
-   */
-  // precompute_freqs_cis<float>(projected_key_dim_prop, key_height);
-  if (freqs_cos == nullptr)
-    precompute_freqs(projected_key_dim_prop, max_timestep);
 
   /** get inputs/outputs */
   Tensor &query = context.getInput(INOUT_INDEX::QUERY);
@@ -881,17 +880,8 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   if (!disable_bias) {
     output.add_i(fc_bias);
   }
-  // output.print(std::cout);
-  if (cache_shift) {
-    /*
-        TensorDim d = cache_key.getDim();
-        d.height(max_timestep-1);
-        Tensor shifted_key = cache_key.getSharedDataTensor(d, max_timestep,
-       true); cache_key.copyData(shifted_key);
 
-        Tensor shifted_value = cache_value.getSharedDataTensor(d, max_timestep,
-       true); cache_value.copyData(shifted_key);
-        */
+  if (cache_shift) {
     if (cache_key.getDataType() == ml::train::TensorDim::DataType::FP32) {
       float *buf = cache_key.getAddress<float>(0, 0, 1, 0);
       float *dbuf = cache_key.getAddress<float>(0, 0, 0, 0);
@@ -904,27 +894,21 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
                ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
 
-    for(unsigned int i=1;i<cache_key.height();i++){
-      _FP16 *buf = cache_key.getAddress<_FP16>(0, 0, i, 0);
-      _FP16 *dbuf = cache_key.getAddress<_FP16>(0, 0, i-1, 0);
-      memcpy(dbuf, buf,
-             cache_key.width() * sizeof(_FP16));
+      for (unsigned int i = 1; i < cache_key.height(); i++) {
+        _FP16 *buf = cache_key.getAddress<_FP16>(0, 0, i, 0);
+        _FP16 *dbuf = cache_key.getAddress<_FP16>(0, 0, i - 1, 0);
 
-      _FP16 *vbuf = cache_value.getAddress<_FP16>(0, 0, i, 0);
-      _FP16 *dvbuf = cache_value.getAddress<_FP16>(0, 0, i-1, 0);
-      memcpy(dvbuf, vbuf,
-             cache_value.width() * sizeof(_FP16));
-    }
+        memcpy(dbuf, buf, cache_key.width() * sizeof(_FP16));
+
+        _FP16 *vbuf = cache_value.getAddress<_FP16>(0, 0, i, 0);
+        _FP16 *dvbuf = cache_value.getAddress<_FP16>(0, 0, i - 1, 0);
+        memcpy(dvbuf, vbuf, cache_value.width() * sizeof(_FP16));
+      }
 #else
       throw std::invalid_argument("enable-fp16 is not set");
 #endif
     }
   }
-/*   output.print(std::cout);
-      std::ofstream f;
-f.open("./fp16_mha_file");
-output.save(f);
-f.close(); */
 }
 
 void MultiHeadAttentionLayer::calcCommonDerivative(RunLayerContext &context) {

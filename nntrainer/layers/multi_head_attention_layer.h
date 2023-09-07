@@ -131,15 +131,15 @@ private:
   unsigned int cache_index;
 
   inline static std::vector<std::vector<float>> *freqs_cos = {};
-
   inline static std::vector<std::vector<float>> *freqs_sin = {};
+  inline static std::vector<float> freqs;
 
   void precompute_freqs(int dim, unsigned int seq_len, float theta = 10000.0) {
     if (freqs_cos == nullptr) {
       unsigned int half_ = dim / 2;
-      std::vector<float> freqs(half_);
       for (unsigned int i = 0; i < half_; ++i) {
-        freqs[i] = 1.0 / (std::pow(theta, (2 * i) / static_cast<float>(dim)));
+        freqs.push_back(1.0 /
+                        (std::pow(theta, (2 * i) / static_cast<float>(dim))));
       }
 
       auto cos = new std::vector<std::vector<float>>();
@@ -170,6 +170,30 @@ private:
     float value = 0;
     float transformed_value = 0.0;
     unsigned int half_ = dim / 2;
+    unsigned int max_timestep =
+      std::get<props::MaxTimestep>(multi_head_attention_props).get();
+
+    std::vector<float> *cos_;
+    std::vector<float> *sin_;
+
+    if (from >= max_timestep) {
+      std::cout << from << " " << max_timestep << std::endl;
+      cos_ = new std::vector<float>(dim);
+      sin_ = new std::vector<float>(dim);
+
+      for (unsigned int i = 0; i < half_; ++i) {
+        float angle = from * freqs[i];
+        (*cos_)[i] = std::cos(angle);
+        (*cos_)[i + half_] = std::cos(angle); // repeated 2 times
+
+        (*sin_)[i] = std::sin(angle);
+        (*sin_)[i + half_] = std::sin(angle); // repeated 2 times
+      }
+
+    } else {
+      cos_ = &(*freqs_cos)[from];
+      sin_ = &(*freqs_sin)[from];
+    }
 
     if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
       for (unsigned int b = 0; b < in.batch(); b++) {
@@ -186,8 +210,7 @@ private:
                 } else {
                   transformed_value = in.getValue<float>(b, c, h, span - half_);
                 }
-                value = value * (*freqs_cos)[from][k] +
-                        transformed_value * (*freqs_sin)[from][k];
+                value = value * (*cos_)[k] + transformed_value * (*sin_)[k];
 
                 out.setValue(b, c, h, span, value);
               }
@@ -214,10 +237,10 @@ private:
                   transformed_value = static_cast<float>(
                     in.getValue<_FP16>(b, c, h, span - half_));
                 }
-                out.setValue(b, c, h, span,
-                             static_cast<_FP16>(value * (*freqs_cos)[from][k] +
-                                                transformed_value *
-                                                  (*freqs_sin)[from][k]));
+                out.setValue(
+                  b, c, h, span,
+                  static_cast<_FP16>(value * (*cos_)[k] +
+                                     transformed_value * (*sin_)[k]));
 
 #else
                 throw std::invalid_argument(
@@ -229,6 +252,11 @@ private:
         }
       }
     }
+    if (from >= max_timestep) {
+      delete cos_;
+      delete sin_;
+    }
+
     in.copy(out);
   }
 

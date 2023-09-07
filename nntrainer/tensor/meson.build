@@ -22,7 +22,8 @@ tensor_sources = [
 tensor_headers = [
   'memory_data.h',
   'tensor.h',
-  'tensor_wrap_specs.h'
+  'tensor_wrap_specs.h',
+  'blas_interface.h'
 ]
 
 arch = target_machine.cpu_family()
