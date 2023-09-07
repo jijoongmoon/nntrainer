@@ -10,6 +10,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="b78dfbab-89c8-40be-8d53-4ace7cd06096" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/../PicoGPTJNI/.gradle/7.5/checksums/checksums.lock" beforeDir="false" afterPath="$PROJECT_DIR$/../PicoGPTJNI/.gradle/7.5/checksums/checksums.lock" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/../PicoGPTJNI/.gradle/7.5/fileHashes/fileHashes.lock" beforeDir="false" afterPath="$PROJECT_DIR$/../PicoGPTJNI/.gradle/7.5/fileHashes/fileHashes.lock" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/../PicoGPTJNI/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/../PicoGPTJNI/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/../../LLaMA/jni/main.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/../../LLaMA/jni/main.cpp" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/../../../nntrainer/layers/multi_head_attention_layer.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/../../../nntrainer/layers/multi_head_attention_layer.cpp" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/../../../nntrainer/layers/multi_head_attention_layer.h" beforeDir="false" afterPath="$PROJECT_DIR$/../../../nntrainer/layers/multi_head_attention_layer.h" afterDir="false" />
@@ -20,7 +23,7 @@
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
-  <component name="ExecutionTargetManager" SELECTED_TARGET="device_and_snapshot_combo_box_target[R3CW808LKAE]" />
+  <component name="ExecutionTargetManager" SELECTED_TARGET="device_and_snapshot_combo_box_target[]" />
   <component name="ExternalProjectsData">
     <projectState path="$PROJECT_DIR$">
       <ProjectState />
@@ -60,18 +63,18 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;AnalyzeApkAction.lastApkPath&quot;: &quot;/home/jijoongmoon/WorkSpace1/NNTrainer-java/Android_Demo_PicoGpt/Android_Application/PicoGptJNI&quot;,
-    &quot;RunOnceActivity.OpenProjectViewOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.cidr.known.project.marker&quot;: &quot;true&quot;,
-    &quot;cidr.known.project.marker&quot;: &quot;true&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/home/jijoongmoon/WorkSpace1/nntrainer/Applications/Android/PicoGPTJNI&quot;,
-    &quot;memory.settings.postsync.last.time.stamp&quot;: &quot;1686724550880&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;reference.settingsdialog.IDE.editor.colors.Java&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "AnalyzeApkAction.lastApkPath": "/home/jijoongmoon/WorkSpace1/NNTrainer-java/Android_Demo_PicoGpt/Android_Application/PicoGptJNI",
+    "RunOnceActivity.OpenProjectViewOnStart": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.cidr.known.project.marker": "true",
+    "cidr.known.project.marker": "true",
+    "last_opened_file_path": "/home/jijoongmoon/WorkSpace1/nntrainer/Applications/Android/LLaMA2JNI",
+    "memory.settings.postsync.last.time.stamp": "1694093654846",
+    "settings.editor.selected.configurable": "reference.settingsdialog.IDE.editor.colors.Java"
   }
-}</component>
+}]]></component>
   <component name="RunManager">
     <configuration name="app" type="AndroidRunConfigurationType" factoryName="Android App">
       <module name="PicoGPTJNI.app.main" />
@@ -129,6 +132,19 @@
       <option name="SKIP_ACTIVITY_VALIDATION" value="false" />
       <method v="2">
         <option name="Android.Gradle.BeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration default="true" type="JetRunConfigurationType">
+      <module name="LLaMA2JNI" />
+      <method v="2">
+        <option name="Make" enabled="true" />
+      </method>
+    </configuration>
+    <configuration default="true" type="KotlinStandaloneScriptRunConfigurationType">
+      <module name="LLaMA2JNI" />
+      <option name="filePath" />
+      <method v="2">
+        <option name="Make" enabled="true" />
       </method>
     </configuration>
   </component>
