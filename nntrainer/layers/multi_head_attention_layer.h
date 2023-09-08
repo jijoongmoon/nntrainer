@@ -68,6 +68,14 @@ public:
    * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
    * int from, unsigned int to, bool training)
    */
+  void initial_incremental_forwarding(RunLayerContext &context, unsigned int from,
+                              unsigned int to, bool training);
+  
+
+  /**
+   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
+   * int from, unsigned int to, bool training)
+   */
   void incremental_forwarding(RunLayerContext &context, unsigned int from,
                               unsigned int to, bool training) override;
 
@@ -130,6 +138,8 @@ private:
 
   unsigned int cache_index;
 
+  inline static unsigned int layer_progress;
+
   inline static std::vector<std::vector<float>> *freqs_cos = {};
   inline static std::vector<std::vector<float>> *freqs_sin = {};
   inline static std::vector<float> freqs;
@@ -189,16 +199,17 @@ private:
         (*sin_)[i] = std::sin(angle);
         (*sin_)[i + half_] = std::sin(angle); // repeated 2 times
       }
-
-    } else {
-      cos_ = &(*freqs_cos)[from];
-      sin_ = &(*freqs_sin)[from];
     }
 
     if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
       for (unsigned int b = 0; b < in.batch(); b++) {
         for (unsigned int c = 0; c < in.channel(); c++) {
           for (unsigned int h = 0; h < in.height(); h++) {
+            if (from < max_timestep) {
+              cos_ = &(*freqs_cos)[from + h];
+              sin_ = &(*freqs_sin)[from + h];
+            }
+
             for (unsigned int w = 0; w < in.width(); w = w + dim) {
               for (unsigned int k = 0; k < dim; k++) {
                 unsigned int span = w + k;
@@ -223,6 +234,11 @@ private:
       for (unsigned int b = 0; b < in.batch(); b++) {
         for (unsigned int c = 0; c < in.channel(); c++) {
           for (unsigned int h = 0; h < in.height(); h++) {
+            if (from < max_timestep) {
+              cos_ = &(*freqs_cos)[from + h];
+              sin_ = &(*freqs_sin)[from + h];
+            }
+
             for (unsigned int w = 0; w < in.width(); w = w + dim) {
               for (unsigned int k = 0; k < dim; k++) {
 #ifdef ENABLE_FP16

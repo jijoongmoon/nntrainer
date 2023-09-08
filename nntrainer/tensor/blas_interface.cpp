@@ -13,6 +13,7 @@
 
 #include <blas_interface.h>
 #include <nntrainer_error.h>
+#include <iostream>
 
 #ifdef USE__FP16
 #include <blas_neon.h>
@@ -218,10 +219,10 @@ static void sgemm_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
                                      TransA == CblasTrans,
                                      TransB == CblasTrans);
   } else {
-    sgemm_loop_fp16();
+     sgemm_loop_fp16();
   }
 #else
-  sgemm_loop_fp16();
+   sgemm_loop_fp16();
 #endif
 }
 
@@ -266,7 +267,7 @@ void sgemm(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
            const float alpha, const _FP16 *A, const unsigned int lda,
            const _FP16 *B, const unsigned int ldb, const float beta, _FP16 *C,
            const unsigned int ldc) {
-  sgemm_FP16(order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C,
+    sgemm_FP16(order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C,
              ldc);
 }
 
@@ -528,6 +529,7 @@ void sgemm(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
 
   } else if (d_type == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
+    std::cout << "sgemm_FP16 called 2 " << std::endl;
     sgemm_FP16(
       order, TransA, TransB, M, N, K, alpha, static_cast<const _FP16 *>(A), lda,
       static_cast<const _FP16 *>(B), ldb, beta, static_cast<_FP16 *>(C), ldc);
