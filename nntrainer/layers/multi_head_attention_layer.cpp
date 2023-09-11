@@ -822,8 +822,9 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   }
   //  finish = clock();
 
-  apply_rotary_emb_tensor(projected_query_step, projected_query_dim_prop, from);
-  apply_rotary_emb_tensor(cache_key_step, projected_key_dim_prop, from);
+  apply_rotary_emb_tensor(projected_query_step, projected_query_dim_prop,
+                          _from);
+  apply_rotary_emb_tensor(cache_key_step, projected_key_dim_prop, _from);
 
   projected_query_step.reshape(
     TensorDim({batch_size, to, num_heads, projected_query_dim_prop}));
@@ -898,7 +899,8 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
     layer_progress = 0;
   layer_progress++;
 
-  std::cout << "Process Reading: " << (int)((layer_progress / 28.0)*100.0 )<< " % \r";
+  std::cout << "Process Reading: " << (int)((layer_progress / 28.0) * 100.0)
+            << " % \r";
   std::cout.flush();
 }
 
@@ -1133,8 +1135,9 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   }
   //  finish = clock();
 
-  apply_rotary_emb_tensor(projected_query_step, projected_query_dim_prop, from);
-  apply_rotary_emb_tensor(cache_key_step, projected_key_dim_prop, from);
+  apply_rotary_emb_tensor(projected_query_step, projected_query_dim_prop,
+                          _from);
+  apply_rotary_emb_tensor(cache_key_step, projected_key_dim_prop, _from);
 
   projected_query_step.reshape(
     TensorDim({batch_size, 1, num_heads, projected_query_dim_prop}));
@@ -1207,18 +1210,20 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
 
   if (cache_shift) {
     if (cache_key.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      float *buf = cache_key.getAddress<float>(0, 0, 1, 0);
-      float *dbuf = cache_key.getAddress<float>(0, 0, 0, 0);
-      memcpy(dbuf, buf, (cache_key.size() - cache_key.width()) * sizeof(float));
-      buf = cache_value.getAddress<float>(0, 0, 1, 0);
-      dbuf = cache_value.getAddress<float>(0, 0, 0, 0);
-      memcpy(dbuf, buf,
-             (cache_value.size() - cache_value.width()) * sizeof(float));
+
+      for (unsigned int i = 5; i < cache_key.height(); ++i) {
+        float *buf = cache_key.getAddress<float>(0, 0, i, 0);
+        float *dbuf = cache_key.getAddress<float>(0, 0, i - 1, 0);
+        memcpy(dbuf, buf, cache_key.width() * sizeof(float));
+
+        buf = cache_value.getAddress<float>(0, 0, i, 0);
+        dbuf = cache_value.getAddress<float>(0, 0, i - 1, 0);
+        memcpy(dbuf, buf, cache_value.width() * sizeof(float));
+      }
     } else if (cache_key.getDataType() ==
                ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-
-      for (unsigned int i = 1; i < cache_key.height(); i++) {
+      for (unsigned int i = 5; i < cache_key.height(); i++) {
         _FP16 *buf = cache_key.getAddress<_FP16>(0, 0, i, 0);
         _FP16 *dbuf = cache_key.getAddress<_FP16>(0, 0, i - 1, 0);
 

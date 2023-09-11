@@ -187,7 +187,6 @@ private:
     std::vector<float> *sin_;
 
     if (from >= max_timestep) {
-      std::cout << from << " " << max_timestep << std::endl;
       cos_ = new std::vector<float>(dim);
       sin_ = new std::vector<float>(dim);
 
