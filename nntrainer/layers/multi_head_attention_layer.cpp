@@ -778,48 +778,48 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
 
   // start = clock();
   // This is multi threading
-  // std::vector<std::thread> workers;
+  std::vector<std::thread> workers;
 
-  // auto query_job = [&]() {
-  //   query.dot(query_fc_weight, projected_query_step);
-  //   if (!disable_bias) {
-  //     projected_query_step.add_i(query_fc_bias);
-  //   }
-  // };
+  auto query_job = [&]() {
+    query.dot(query_fc_weight, projected_query_step);
+    if (!disable_bias) {
+      projected_query_step.add_i(query_fc_bias);
+    }
+  };
 
-  // auto key_job = [&]() {
-  //   key.dot(key_fc_weight, cache_key_step);
-  //   if (!disable_bias) {
-  //     cache_key_step.add_i(key_fc_bias);
-  //   }
-  // };
+  auto key_job = [&]() {
+    key.dot(key_fc_weight, cache_key_step);
+    if (!disable_bias) {
+      cache_key_step.add_i(key_fc_bias);
+    }
+  };
 
-  // auto value_job = [&]() {
-  //   value.dot(value_fc_weight, cache_value_step);
-  //   if (!disable_bias) {
-  //     cache_value_step.add_i(value_fc_bias);
-  //   }
-  // };
+  auto value_job = [&]() {
+    value.dot(value_fc_weight, cache_value_step);
+    if (!disable_bias) {
+      cache_value_step.add_i(value_fc_bias);
+    }
+  };
 
-  // workers.push_back(std::thread(query_job));
-  // workers.push_back(std::thread(key_job));
-  // workers.push_back(std::thread(value_job));
+  workers.push_back(std::thread(query_job));
+  workers.push_back(std::thread(key_job));
+  workers.push_back(std::thread(value_job));
 
-  // std::for_each(workers.begin(), workers.end(),
-  //               std::mem_fn(&std::thread::join));
+  std::for_each(workers.begin(), workers.end(),
+                std::mem_fn(&std::thread::join));
 
-  query_step.dot(query_fc_weight, projected_query_step);
-  if (!disable_bias) {
-    projected_query_step.add_i(query_fc_bias);
-  }
-  key_step.dot(key_fc_weight, cache_key_step);
-  if (!disable_bias) {
-    cache_key_step.add_i(key_fc_bias);
-  }
-  value_step.dot(value_fc_weight, cache_value_step);
-  if (!disable_bias) {
-    cache_value_step.add_i(value_fc_bias);
-  }
+  // query_step.dot(query_fc_weight, projected_query_step);
+  // if (!disable_bias) {
+  //   projected_query_step.add_i(query_fc_bias);
+  // }
+  // key_step.dot(key_fc_weight, cache_key_step);
+  // if (!disable_bias) {
+  //   cache_key_step.add_i(key_fc_bias);
+  // }
+  // value_step.dot(value_fc_weight, cache_value_step);
+  // if (!disable_bias) {
+  //   cache_value_step.add_i(value_fc_bias);
+  // }
   //  finish = clock();
 
   apply_rotary_emb_tensor(projected_query_step, projected_query_dim_prop,
@@ -1133,6 +1133,7 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   if (!disable_bias) {
     cache_value_step.add_i(value_fc_bias);
   }
+  //
   //  finish = clock();
 
   apply_rotary_emb_tensor(projected_query_step, projected_query_dim_prop,
