@@ -392,7 +392,8 @@ std::vector<LayerHandle> createTransformerDecoder(const int layer_id,
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
      withKey("input_layers", input_name),
-     withKey("epsilon", std::to_string(NORM_EPS))}));
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("packed", "false")}));
 
   auto att_layer = createAttentionLayer(
     layer_id, INIT_SEQ_LEN, NUM_HEADS, DIM / NUM_HEADS,
@@ -412,7 +413,8 @@ std::vector<LayerHandle> createTransformerDecoder(const int layer_id,
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
      withKey("input_layers",
              "layer" + std::to_string(layer_id) + "_decoder_add"),
-     withKey("epsilon", std::to_string(NORM_EPS))}));
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("packed", "false")}));
 
   auto ffn_layer = createFeedForwardLayer(
     layer_id, DIM, 4 * DIM, "layer" + std::to_string(layer_id) + "_ffn_norm");
@@ -451,7 +453,7 @@ ModelHandle createLLaMA() {
   }
 
   layers.push_back(ml::train::layer::Embedding(
-    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
+    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB), "packed=false",
      "out_dim=" + std::to_string(DIM)}));
 
   for (int i = 0; i < NUM_LAYERS; i++) {
@@ -470,12 +472,14 @@ ModelHandle createLLaMA() {
     "rms_norm", {withKey("name", "output_norm"),
                  withKey("epsilon", std::to_string(NORM_EPS)),
                  withKey("input_layers", "layer" + std::to_string(last_layer) +
-                                           "_decoder_output")}));
+                                           "_decoder_output"),
+                 withKey("packed", "false")}));
 
   layers.push_back(createLayer(
     "fully_connected",
     {withKey("name", "output_of_llama"), withKey("unit", NUM_VOCAB),
-     withKey("disable_bias", "true"), withKey("input_layers", "output_norm")}));
+     withKey("disable_bias", "true"), withKey("input_layers", "output_norm"),
+     withKey("packed", "false")}));
 
   for (auto &layer : layers) {
     model->addLayer(layer);
@@ -586,7 +590,8 @@ void run(std::string text, bool apply_temperature) {
       auto output_interval =
         g_model->incremental_inference(1, input, label, MAX_SEQ_LEN, i - 1, i);
 
-      unsigned int ids = generate(output_interval[0], apply_temperature, NUM_VOCAB);
+      unsigned int ids =
+        generate(output_interval[0], apply_temperature, NUM_VOCAB);
 
       // ids = std::distance(
       //   output_interval[0],
@@ -676,7 +681,7 @@ int main(int argc, char *argv[]) {
   try {
     const std::vector<std::string> args(argv + 1, argv + argc);
 
-    bool apply_temp = (strcasecmp("true", args[1].c_str())==0);
+    bool apply_temp = (strcasecmp("true", args[1].c_str()) == 0);
 
     createAndRun(epoch, batch_size);
 
@@ -688,7 +693,7 @@ int main(int argc, char *argv[]) {
     //    texts.push_back("(CNN)Ever had a headache so big, you felt like drilling a hole in your head to let the pain out? In Neolithic times trepanation -- or drilling a hole into the skull -- was thought to be a cure for everything from epilepsy to migraines. It could even have been a form of emergency surgery for battle wounds. But while there is still conjecture about the real reasons behind the mysterious procedure, what is known is that the implement often used to carry out the primitive surgery was made from one of the sharpest substances found in nature -- obsidian. Obsidian -- a type of volcanic glass -- can produce cutting edges many times finer than even the best steel scalpels. At 30 angstroms -- a unit of measurement equal to one hundred millionth of a centimeter -- an obsidian scalpel can rival diamond in the fineness of its edge. When you consider that most household razor blades are 300-600 angstroms, obsidian can still cut it with the sharpest materials nano-technology can produce. Even today, a small number of surgeons are using an ancient technology to carry out fine incisions that they say heal with minimal scarring. Dr. Lee Green, professor and chair of the Department of Family Medicine at the University of Alberta, says he routinely uses obsidian blades. \"The biggest advantage with obsidian is that it is the sharpest edge there is, it causes very little trauma to tissue, it heals faster and more importantly it heals with less scarring,\" he said. \"It makes for the best cosmetic outcome.\" He explained that steel scalpels at a microscopic level have a rough cutting edge that tears into tissue, a function of the crystals that make up the metal. Obsidian, meanwhile, cleaves into a fine and continuous edge when properly cut. Dr. Green said he once helped documentary makers produce a program on surgical technology in ancient Egyptian, setting up a blind test on the cutting power of obsidian. Using cultured-skin burn dressing, a substance composed of skin cells, he made an incision with a modern scalpel and a parallel incision with an obsidian scalpel. The host of the program was then invited to look at the cuts under a video microscope and tell the difference. \"It wasn't hard to tell the difference at all -- as soon as he turned around everyone in the studio was like 'Ohhh',\" Dr. Green said. \"Under the microscope you could see the obsidian scalpel had divided individual cells in half, and next to it the steel scalpel incision looked like it had been made by a chainsaw.\" Modern obsidian scalpels look nothing like the decorative flint-knapped knives of Neolithic man, often resembling their modern counterparts in everything except for the blade edge, but Dr. Green said they are a very different animal. \"The feel is very different because obsidian has no 'bite,'\" he said. \"If you look under the microscope at a steel scalpel edge it looks almost like a saw, it has teeth, whereas obsidian is smooth even microscopically. \"It's a very different feel to work with and you have to practice before you start using it in surgery. \"You also have to be careful not to nick yourself with it because you don't even feel it!\" And Dr. Green believes incisions made with these blades heal faster. He said a colleague who needed a mole removed agreed to undergo an experiment where half the procedure was carried out with an obsidian scalpel and the other half was removed with steel. \"What's really fun is seeing it heal,\" he said. \"Four weeks later the difference was quite remarkable -- there was very much a difference in scarring.\" In Germany, the manufacturer Fine Science Tools produces obsidian scalpels which can be used in situations where the patient may have an allergy to steel or metal. \"For studies where trace metals from ordinary scalpel blades cannot be tolerated, these very special obsidian scalpels may provide the answer,\" the company says. At \u20ac99 per scalpel ($107.40), they represent a considerable saving on their diamond cousins which the company prices at \u20ac712.50 ($772.60). But there has been little academic research into the efficacy of obsidian blades compared to steel scalpels, and they do have disadvantages: Obsidian scalpels are not Food and Drug Administration (FDA) approved, and they are extremely brittle and prone to breaking if lateral forces are applied -- meaning they are unlikely to ever be in widespread use. Dr. Green, whose scalpels were manufactured for him by an expert flint-knapper and archaeologist Errett Callahan, concedes the Stone Age scalpels are not for everyone. \"If it was let loose on the market there'd be far too many injuries from it,\" he said. \"It's very fragile and it's very easy to break pieces off.\"");
     //    texts.push_back("It may not be a looker, but the Lusitanian toadfish can do much more than croak. The fish, which lives in rocky crevices in the Mediterranean Sea and Atlantic Ocean and glides over the muddy sea floor, can whistle, croak and grunt. Scientists have found that\u00a0Halobatrachus didactylus makes five types of calls not only to attract a mate, but to warn off rivals too may be trying to swipe their nesting site. Lusitanian toadfish (pictured) make five types of calls and males can even sing in choruses to attract mates.\u00a0The fish woo females with long, rhythmical boatwhistles, which also act as a deterrent to love rivals, . Male fish woo females with long, rhythmical noises that sound like boat whistles, which also act as a deterrent to love rivals,\u00a0New Scientist reported. They build nests under rocks during mating season, which runs from May to July and sing to attract female visitors. If they are successful, the pair mate and the male looks after young that hatch from sticky eggs until they are ready to fend for themselves after around a month. Because males, which grow up to 20 inches (50cm) long, are fiercely territorial, their song also serves as a warning for rivals to stay away. Males build nests under rocks during mating season (pictured), which runs from May to July and sing to attract female visitors. The creature is well camouflaged so sound is the best way to get attention . This is important because males nest close together to one another and form singing choruses like frogs or toads to demonstrate their virility and strength. The whistles vary according to the size of the fish, meaning that specific calls from larger specimens are particularly effective at deterring another fish from picking a fight and stealing a nest. Lusitanian toadfish typically weigh more than four lbs (2kg) and their large, flat heads and wide mouths, make them look like toads, giving their their name. Portuguese scientists discovered that the sounds made by Lusitanian toadfish indicate who they are, their motivation and information about their nest. If they are successful, the pair mate and the male looks after young that hatch from sticky eggs until they are ready to fend for themselves after around a month. Here, a female lays eggs, which stick to the roof of a nest . The experts analysed the frequencies of different songs. \u00a0Water temperature, tide level, fish motivation and the level of social interactions affected most acoustic parameters analysed (shown above). For example, during low tide, the sounds made by the fish were shorter in duration and had lower main frequencies . Male mice sing to woo females, scientists claim. They also change their tune depending on whether she is within sight or not. The females, meanwhile, seem to like some of the songs more than others. In a quirky study that could shed help shed light on autism and other conditions that involve difficulties in communication, researchers from Duke University in North Carolina studied male mice that were either placed in a cage with a female \u2013 or one with just her scent. Special equipment was used to record and analyse their squeaks, which are so high-pitched that people can\u2019t hear them. This revealed that they sang one song when they could simply smell a female and another one when they could see her. When they could merely smell a potential mate, they belted out an extremely shrill and complex song, perhaps in an attempt to make themselves known. But when she was within sight, they serenaded her more softly. These songs also had a more simple structure and were longer. Clara Amorim of ISPA University Institute in Portugal studied the different sounds made by the fish, which contracts muscles in its swim bladders to release air, a little like bagpipe. It makes different sounds by contracting its bladders in various ways. To prove that 'boatwhistles' are used as a deterrent as well as for seduction, her team deflated the swim bladders of fish under anaesthesia, so that the creatures could still contract their muscles, but were rendered silent. The team found that mute males were more likely to face intruders in their nests, suggesting that 'boatwhistles' are an effective warning siren. \u2018Boatwhistles are a cheap way to exclude intruders without engaging in a fight,\u2019 Dr Amorim said. \u2018Seeing that a nest is occupied is not as effective as hearing that there is a male in the nest eager to defend its territory.\u2019 The sounds are modified by environmental factors such as tide level and water temperature as well as courtship motivation and by social interactions. For example, during low tide, the water temperature rises slightly and it's harder for sound to travel in shallow waters, which means that fewer fish sing and their noises are shorter in length and lower in pitch. They found that males that are desperate to mate sing a lot more at higher frequencies with longer notes. Males singing as part of a chorus sing more than they do when they are alone. Fish that sing the most, were found to be capable of a contracting their sound-producing muscles more and therefore showed that their body is in good condition. This means that males that can sing for longer have more energy reserves to defend the nest and to care for the eggs, and could enjoy higher social status and reproductive success as a result. Other fish sing too, such as clownfish, which click their jaws together to scare off intruders. Male Lusitanian toadfish\u00a0build nests under rocks during mating season, which runs from May to July and sing to attract female visitors. Other\u00a0fish sing too, such as clownfish (pictured), which click their jaws together to scare off intruders .");
     // clang-format on
-    
+
     for (auto t : texts)
       run(t, apply_temp);
   } catch (const std::exception &e) {

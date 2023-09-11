@@ -67,10 +67,10 @@ enum class TensorLifespan {
  *
  * @details The tuple values are dimension, initializer, regularizer,
  * regularizer_constant, decay, clip gradient constant, need_gradient property
- * amd name of the tensor object.
+ * ,name and outout axis of the tensor object.
  */
 typedef std::tuple<TensorDim, Tensor::Initializer, WeightRegularizer, float,
-                   float, float, bool, const std::string>
+                   float, float, bool, const std::string, unsigned int>
   WeightSpec;
 
 /**

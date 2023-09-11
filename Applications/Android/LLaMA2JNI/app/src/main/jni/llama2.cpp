@@ -483,7 +483,7 @@ std::string inferModel(std::string path, std::string sentence,
   for (unsigned int i = 1; i < input_len + NUM_TO_GENERATE; ++i) {
 
     auto output =
-      model_->incremental_inference(1, input, label, MAX_SEQ_LEN, i - 1);
+      model_->incremental_inference(1, input, label, MAX_SEQ_LEN, i - 1, i);
 
     nntrainer::Tensor output_tensor({batch_size, 1, 1, NUM_VOCAB}, output[0]);
     std::vector<unsigned int> ids = output_tensor.argmax();

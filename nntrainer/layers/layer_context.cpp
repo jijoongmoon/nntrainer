@@ -36,10 +36,12 @@ static void suffixSpec(VarGradSpecV2 &spec, unsigned int idx) {
   }
 }
 
-InitLayerContext::InitLayerContext(
-  const std::vector<TensorDim> &dim, const std::vector<bool> &req_out_connected,
-  bool in_place_, const std::string &n, const std::string &prefix_,
-  const float max_norm, std::array<const std::string, 3> tensor_type_) :
+InitLayerContext::InitLayerContext(const std::vector<TensorDim> &dim,
+                                   const std::vector<bool> &req_out_connected,
+                                   bool in_place_, const std::string &n,
+                                   const std::string &prefix_,
+                                   const float max_norm,
+                                   std::array<std::string, 3> tensor_type_) :
   input_dim(dim),
   in_place(in_place_),
   clip_by_global_norm(max_norm),
@@ -67,20 +69,20 @@ void InitLayerContext::setOutputDimensions(
   for (unsigned i = 0u, sz = out_dim.size(); i < sz; ++i) {
     auto spec = outSpec(out_dim.at(i));
 
-/*     spec.variable_spec.dim.setFormat(
-      str_converter<enum_class_prop_tag,
-                    nntrainer::TensorFormatInfo>::from_string(tensor_type[0]));
-    spec.variable_spec.dim.setDataType(
-      str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
-        from_string(tensor_type[2]));
+    /*     spec.variable_spec.dim.setFormat(
+          str_converter<enum_class_prop_tag,
+                        nntrainer::TensorFormatInfo>::from_string(tensor_type[0]));
+        spec.variable_spec.dim.setDataType(
+          str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
+            from_string(tensor_type[2]));
 
-    spec.gradient_spec->dim.setFormat(
-      str_converter<enum_class_prop_tag,
-                    nntrainer::TensorFormatInfo>::from_string(tensor_type[0]));
-    spec.gradient_spec->dim.setDataType(
-      str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
-        from_string(tensor_type[2]));
- */
+        spec.gradient_spec->dim.setFormat(
+          str_converter<enum_class_prop_tag,
+                        nntrainer::TensorFormatInfo>::from_string(tensor_type[0]));
+        spec.gradient_spec->dim.setDataType(
+          str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
+            from_string(tensor_type[2]));
+     */
     specs.push_back(std::move(spec));
   }
 
@@ -144,7 +146,7 @@ RunLayerContext::RunLayerContext(const std::string &name, bool trainable,
   weights(w),
   inputs(in),
   outputs(out),
-  tensors(t) {
+  tensors(t){
   std::get<props::Name>(props).set(name);
   std::get<props::Trainable>(props).set(trainable);
   NNTR_THROW_IF(!readyToUse(), std::invalid_argument)
