@@ -396,6 +396,28 @@ public:
                   const std::vector<Var_Grad *> &out,
                   const std::vector<Var_Grad *> &t);
 
+  void getWeight(Tensor &w, unsigned int idx) {
+    Tensor &t_w = weights[idx]->getVariableRef();
+
+    if (t_w.getDataType() == Tdatatype::FP32 ||
+        t_w.getDataType() == Tdatatype::FP16) {
+      w = t_w;
+      return;
+    }
+
+    Tdatatype o_t = getOutput(idx).getDataType();
+
+    if (w.empty()) {
+      w = Tensor(t_w.getDim());
+      w.setDataType(o_t);
+    }
+    unsigned int o_ax = getWeightObject(idx).getOutputAxis();
+
+    t_w.dequantize(w, o_ax);
+
+    return;
+  }
+
   /**
    * @brief Get the Weight tensor object
    *

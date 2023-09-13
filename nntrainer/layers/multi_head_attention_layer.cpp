@@ -604,6 +604,8 @@ void MultiHeadAttentionLayer::forwarding(RunLayerContext &context,
 void MultiHeadAttentionLayer::initial_incremental_forwarding(
   RunLayerContext &context, unsigned int _from, unsigned int _to,
   bool training) {
+
+  std::cout << _from<<" "  << _to<<std::endl;
   unsigned int max_timestep =
     std::get<props::MaxTimestep>(multi_head_attention_props).get();
 
@@ -677,26 +679,33 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   /** get weights */
   Tensor &query_fc_weight =
     context.getWeight(weight_idx[AttentionParams::query_fc_weight]);
+
   Tensor &query_fc_bias =
     disable_bias
       ? empty_tensor
       : context.getWeight(weight_idx[AttentionParams::query_fc_bias]);
+  
   Tensor &key_fc_weight =
     context.getWeight(weight_idx[AttentionParams::key_fc_weight]);
+  
   Tensor &key_fc_bias =
     disable_bias ? empty_tensor
                  : context.getWeight(weight_idx[AttentionParams::key_fc_bias]);
+  
   Tensor &value_fc_weight =
     context.getWeight(weight_idx[AttentionParams::value_fc_weight]);
+  
   Tensor &value_fc_bias =
     disable_bias
       ? empty_tensor
       : context.getWeight(weight_idx[AttentionParams::value_fc_bias]);
+  
   Tensor &fc_weight = context.getWeight(weight_idx[AttentionParams::fc_weight]);
+  
   Tensor &fc_bias = disable_bias
                       ? empty_tensor
                       : context.getWeight(weight_idx[AttentionParams::fc_bias]);
-
+  std::cout << "done get Weight" <<std::endl;
   /** get tensors */
   Tensor &projected_query =
     context.getTensor(weight_idx[AttentionParams::projected_query]);
@@ -773,7 +782,7 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   const unsigned int query_height = query_dim.height();
   const unsigned int key_height = key_dim.height();
   const unsigned int value_height = value_dim.height();
-
+  std::cout << "ready to copute" <<std::endl;
   // clock_t start, finish;
 
   // start = clock();
