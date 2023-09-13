@@ -2671,6 +2671,9 @@ void Tensor::print(std::ostream &out) const {
 
     std::ios init(NULL);
     init.copyfmt(out);
+    float max_ = 0.0;
+    float min_ = 10000000;
+    
     if (getFormat() == Tformat::NCHW) {
       for (unsigned int k = 0; k < batch(); k++) {
         for (unsigned int l = 0; l < channel(); l++) {
@@ -3125,8 +3128,17 @@ void Tensor::save(std::ostream &file) {
     << "save size: " << bytes()
     << " is too big. It cannot be represented by std::streamsize";
   if (this->getDataType() == ml::train::TensorDim::DataType::FP32) {
-    checkedWrite(file, (char *)getData(), sz,
-                 "[Tensor::save] operation failed");
+    std::vector<_FP16> temp(size());
+    for (unsigned int i = 0; i < size(); ++i) {
+      temp[i] = static_cast<_FP16>(getData()[i]);
+    }
+
+    checkedWrite(file, (char *)temp.data(),
+                 static_cast<std::streamsize>(size() * sizeof(_FP16)),
+                 "[Tensor::save] operation failed");    
+    
+    // checkedWrite(file, (char *)getData(), sz,
+    //              "[Tensor::save] operation failed");
   } else if (this->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     std::vector<_FP16> temp(size());

@@ -22,6 +22,8 @@ tensor_sources = [
 tensor_headers = [
   'memory_data.h',
   'tensor.h',
+  'weight.h',
+  'var_grad.h',    
   'tensor_wrap_specs.h',
   'blas_interface.h'
 ]

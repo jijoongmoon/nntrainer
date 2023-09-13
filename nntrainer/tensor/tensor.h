@@ -1998,14 +1998,14 @@ public:
    * @brief     Dequantize Tensor
    * @retval    Dequantized Tensor
    */
-  template <typename T = float> Tensor dequantize(unsigned int axis) const {
+  template <typename T = float> Tensor dequantize() const {
     Tdatatype dtype =
       (typeid(T) == typeid(float)) ? Tdatatype::FP32 : Tdatatype::FP16;
 
     Tensor t =
       Tensor(batch(), channel(), height(), width(), getFormat(), dtype);
 
-    return dequantize<T>(t, axis);
+    return dequantize<T>(t);
   }
 
   /**
@@ -2014,7 +2014,7 @@ public:
    * @retval     Dequantized Tensor
    */
   template <typename T>
-  Tensor &dequantize(Tensor &output, unsigned int axis) const {
+  Tensor &dequantize(Tensor &output) const {
     if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
       throw std::invalid_argument("Error: Tensor cannot be dequantized");
     }

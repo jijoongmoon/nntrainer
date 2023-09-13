@@ -777,7 +777,7 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   // clock_t start, finish;
 
   // start = clock();
-  // This is multi threading
+  //  This is multi threading
   // std::vector<std::thread> workers;
 
   // auto query_job = [&]() {
@@ -794,12 +794,24 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   //   }
   // };
 
-  // auto value_job = [&]() {
-  //   value.dot(value_fc_weight, cache_value_step);
-  //   if (!disable_bias) {
-  //     cache_value_step.add_i(value_fc_bias);
-  //   }
-  // };
+  auto value_job = [&]() {
+  
+  value_step.dot(value_fc_weight, cache_value_step);
+  if (!disable_bias) {
+    cache_value_step.add_i(value_fc_bias);
+  }
+
+  cached_value.reshape(
+    TensorDim({batch_size, to, num_heads, projected_value_dim_prop}));
+
+  cached_value.transpose("1:0:2", projected_value_step);
+
+  projected_value_step.reshape(
+    TensorDim({batch_size * num_heads, 1, to, projected_value_dim_prop}));
+  };
+
+  // std::thread t1(value_job);
+  value_job();
 
   // workers.push_back(std::thread(query_job));
   // workers.push_back(std::thread(key_job));
@@ -816,43 +828,35 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   if (!disable_bias) {
     cache_key_step.add_i(key_fc_bias);
   }
-  value_step.dot(value_fc_weight, cache_value_step);
-  if (!disable_bias) {
-    cache_value_step.add_i(value_fc_bias);
-  }
-  // finish = clock();
-  // std::cout << (double) (finish - start) << std::endl;
+
 
   apply_rotary_emb_tensor(projected_query_step, projected_query_dim_prop,
                           _from);
   apply_rotary_emb_tensor(cache_key_step, projected_key_dim_prop, _from);
 
+
   projected_query_step.reshape(
     TensorDim({batch_size, to, num_heads, projected_query_dim_prop}));
   cached_key.reshape(
     TensorDim({batch_size, to, num_heads, projected_key_dim_prop}));
-  cached_value.reshape(
-    TensorDim({batch_size, to, num_heads, projected_value_dim_prop}));
 
   projected_query_step.transpose("1:0:2", projected_query_step);
   cached_key.transpose("1:0:2", projected_key_step);
-  cached_value.transpose("1:0:2", projected_value_step);
+
 
   projected_query_step.reshape(
     TensorDim({batch_size * num_heads, 1, to, projected_query_dim_prop}));
   projected_key_step.reshape(
     TensorDim({batch_size * num_heads, 1, to, projected_key_dim_prop}));
-  projected_value_step.reshape(
-    TensorDim({batch_size * num_heads, 1, to, projected_value_dim_prop}));
-
+  
   attention_weight_step.reshape(TensorDim({batch_size * num_heads, 1, to, to}));
-  attention_output_step.reshape(
-    TensorDim({batch_size * num_heads, 1, to, projected_value_dim_prop}));
 
   /** scaled dot product attention */
   projected_query_step.dotBatched(projected_key_step, attention_weight_step,
                                   false, true);
+  
   attention_weight_step.multiply_i(1 / sqrt((float)projected_query_dim_prop));
+
 
   if (!from) {
     unsigned int mask_size = attention_weight_step.getDim().width();
@@ -880,6 +884,14 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   }
 
   sm.run_fn(attention_weight_step, attention_weight_step);
+  
+  attention_output_step.reshape(
+    TensorDim({batch_size * num_heads, 1, to, projected_value_dim_prop}));
+  
+  // t1.join();
+
+  // finish = clock();
+  // std::cout << (double) (finish - start) << std::endl;
 
   attention_weight_step.dotBatched(projected_value_step, attention_output_step);
 
