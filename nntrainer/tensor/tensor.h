@@ -1417,8 +1417,7 @@ public:
    */
   size_t bytes() const {
     if (getDataType() == Tdatatype::QINT4) {
-      return (dim.batch() + 1) * (dim.channel() + 1) * (dim.height() + 1) *
-             (dim.width() + 1) / 16 * dim.getDataTypeSize();
+      return (size() * dim.getDataTypeSize() + 1) / 2;
     }
     return size() * dim.getDataTypeSize();
   }
@@ -1672,8 +1671,9 @@ public:
   /**
    * @brief     Read the Tensor from file
    * @param[in] file input file stream
+   * @param[in] s_type scale factor data type
    */
-  void read(std::ifstream &file);
+  void read(std::ifstream &file, Tdatatype s_type = Tdatatype::FP32);
 
   /**
    * @brief     return argument index which value is max by batch
@@ -1954,19 +1954,6 @@ public:
   Tdatatype getDataType() const { return dim.getDataType(); }
 
   /**
-   * @brief Set output axis of the tensor
-   * @param[in] axis output axis (0: batch, 1: channel, 2: height, 3: width)
-   */
-  void setOutputAxis(int axis);
-
-  /**
-   * @brief Get output axis of the tensor
-   *
-   * @return output axis of the tensor
-   */
-  int getOutputAxis() const;
-
-  /**
    * @brief     Set scale factors of the tensor
    * @param[in] scales scale factors
    */
@@ -1996,14 +1983,14 @@ public:
    * @brief     Dequantize Tensor
    * @retval    Dequantized Tensor
    */
-  template <typename T = float> Tensor dequantize() const {
+  template <typename T = float> Tensor dequantize(unsigned int axis) const {
     Tdatatype dtype =
       (typeid(T) == typeid(float)) ? Tdatatype::FP32 : Tdatatype::FP16;
 
     Tensor t =
       Tensor(batch(), channel(), height(), width(), getFormat(), dtype);
 
-    return dequantize<T>(t);
+    return dequantize<T>(t, axis);
   }
 
   /**
@@ -2012,7 +1999,7 @@ public:
    * @retval     Dequantized Tensor
    */
   template <typename T>
-  Tensor &dequantize(Tensor &output) const {
+  Tensor &dequantize(Tensor &output, unsigned int axis) const {
     if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
       throw std::invalid_argument("Error: Tensor cannot be dequantized");
     }
@@ -2033,18 +2020,42 @@ public:
       throw std::invalid_argument("Error: No scale factors");
     }
 
+    if (zero_points.empty()) {
+      throw std::invalid_argument("Error: No zero points");
+    }
+
+    if (axis == 0 && scale_factors.size() != batch() &&
+        zero_points.size() != batch()) {
+      throw std::invalid_argument("Error: output axis do not match ");
+    }
+
+    if (axis == 1 && scale_factors.size() != channel() &&
+        zero_points.size() != channel()) {
+      throw std::invalid_argument("Error: output axis do not match ");
+    }
+
+    if (axis == 2 && scale_factors.size() != height() &&
+        zero_points.size() != height()) {
+      throw std::invalid_argument("Error: output axis do not match ");
+    }
+
+    if (axis == 3 && scale_factors.size() != width() &&
+        zero_points.size() != width()) {
+      throw std::invalid_argument("Error: output axis do not match ");
+    }
+
     int idx;
     for (unsigned int b = 0; b < batch(); ++b) {
       for (unsigned int c = 0; c < channel(); ++c) {
         for (unsigned int h = 0; h < height(); ++h) {
           for (unsigned int w = 0; w < width(); ++w) {
-            if (output_axis == 0)
+            if (axis == 0)
               idx = b;
-            else if (output_axis == 1)
+            else if (axis == 1)
               idx = c;
-            else if (output_axis == 2)
+            else if (axis == 2)
               idx = h;
-            else if (output_axis == 3)
+            else if (axis == 3)
               idx = w;
 
             if (getDataType() == Tdatatype::QINT8) {
@@ -2077,7 +2088,6 @@ private:
   std::string name; /**< name of the tensor */
   std::shared_ptr<MemoryData> data;
   size_t offset;
-  int output_axis;
   std::vector<float> scale_factors;
   std::vector<uint8_t> zero_points;
 
