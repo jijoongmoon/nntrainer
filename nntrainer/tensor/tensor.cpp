@@ -3156,7 +3156,7 @@ void Tensor::save(std::ostream &file) {
   putData();
 }
 
-void Tensor::read(std::ifstream &file) {
+void Tensor::read(std::ifstream &file, Tdatatype s_type) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot read.";
 
@@ -3165,6 +3165,54 @@ void Tensor::read(std::ifstream &file) {
   NNTR_THROW_IF(sz < 0, std::invalid_argument)
     << "read size: " << bytes()
     << " is too big. It cannot be represented by std::streamsize";
+
+  if (getDataType() == Tdatatype::QINT4 || getDataType() == Tdatatype::QINT8) {
+    uint8_t axis, zp;
+    unsigned int len;
+
+    file.read((char *)&axis, sizeof(uint8_t));
+
+    if (axis == 0)
+      len = batch();
+    else if (axis == 1) {
+      len = channel();
+    } else if (axis == 2) {
+      len = height();
+    } else if (axis == 3) {
+      len = width();
+    }
+
+    // read scale factors
+    for (unsigned int i = 0; i < len; ++i) {
+      if (s_type == Tdatatype::FP32) {
+        float scale;
+        file.read((char *)&scale, sizeof(float));
+        scale_factors.push_back(scale);
+      } else if (s_type == Tdatatype::FP16) {
+#ifdef ENABLE_FP16
+        _FP16 scale;
+        file.read((char *)&scale, sizeof(_FP16));
+        scale_factors.push_back((float)scale);
+#else
+        throw std::invalid_argument("Error: enable-fp16 is not enabled");
+#endif
+      }
+    }
+
+    // read zero points and parse if needed
+    if (getDataType() == Tdatatype::QINT4) {
+      for (unsigned int i = 0; i < (len + 1) / 2; ++i) {
+        file.read((char *)&zp, sizeof(uint8_t));
+        zero_points.push_back(decode_qint(zp, true));
+        zero_points.push_back(decode_qint(zp, false));
+      }
+    } else if (getDataType() == Tdatatype::QINT8) {
+      for (unsigned int i = 0; i < len; ++i) {
+        file.read((char *)&zp, sizeof(uint8_t));
+        zero_points.push_back(zp);
+      }
+    }
+  }
 
   checkedRead(file, (char *)getData(), sz, "[Tensor::read] operation failed");
   putData();
@@ -3597,34 +3645,9 @@ uint8_t Tensor::decode_qint(uint8_t val, bool isHigh) const {
   return val;
 }
 
-void Tensor::setOutputAxis(int axis) {
-  if (axis < 0 || axis > 3) {
-    throw std::invalid_argument("Error: invalid parameter");
-  }
-  output_axis = axis;
-}
-
-int Tensor::getOutputAxis() const { return output_axis; }
-
 void Tensor::setScaleFactors(std::vector<float> scales) {
   if (scales.empty()) {
     throw std::invalid_argument("Error: invalid parameter");
-  }
-
-  if (output_axis == 0 && scales.size() != batch()) {
-    throw std::invalid_argument("Error: scale_factors.size() != batch() ");
-  }
-
-  if (output_axis == 1 && scales.size() != channel()) {
-    throw std::invalid_argument("Error: scale_factors.size() != channel() ");
-  }
-
-  if (output_axis == 2 && scales.size() != height()) {
-    throw std::invalid_argument("Error: scale_factors.size() != height() ");
-  }
-
-  if (output_axis == 3 && scales.size() != width()) {
-    throw std::invalid_argument("Error: scale_factors.size() != width() ");
   }
 
   scale_factors = scales;
@@ -3635,22 +3658,6 @@ std::vector<float> Tensor::getScaleFactors() const { return scale_factors; }
 void Tensor::setZeroPoints(std::vector<uint8_t> zp) {
   if (zp.empty()) {
     throw std::invalid_argument("Error: invalid parameter");
-  }
-
-  if (output_axis == 0 && zp.size() != batch()) {
-    throw std::invalid_argument("Error: zero_points.size() != batch() ");
-  }
-
-  if (output_axis == 1 && zp.size() != channel()) {
-    throw std::invalid_argument("Error: zero_points.size() != channel() ");
-  }
-
-  if (output_axis == 2 && zp.size() != height()) {
-    throw std::invalid_argument("Error: zero_points.size() != height() ");
-  }
-
-  if (output_axis == 3 && zp.size() != width()) {
-    throw std::invalid_argument("Error: zero_points.size() != width() ");
   }
 
   zero_points = zp;
