@@ -1990,7 +1990,8 @@ public:
     Tensor t =
       Tensor(batch(), channel(), height(), width(), getFormat(), dtype);
 
-    return dequantize<T>(t, axis);
+    dequantize<T>(t, axis);
+    return t;
   }
 
   /**
@@ -1998,8 +1999,7 @@ public:
    * @param[out] output Tensor to store the result
    * @retval     Dequantized Tensor
    */
-  template <typename T>
-  Tensor &dequantize(Tensor &output, unsigned int axis) const {
+  void dequantize(Tensor &output, unsigned int axis) const {
     if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
       throw std::invalid_argument("Error: Tensor cannot be dequantized");
     }
@@ -2044,37 +2044,76 @@ public:
       throw std::invalid_argument("Error: output axis do not match ");
     }
 
-    int idx;
-    for (unsigned int b = 0; b < batch(); ++b) {
-      for (unsigned int c = 0; c < channel(); ++c) {
-        for (unsigned int h = 0; h < height(); ++h) {
-          for (unsigned int w = 0; w < width(); ++w) {
-            if (axis == 0)
-              idx = b;
-            else if (axis == 1)
-              idx = c;
-            else if (axis == 2)
-              idx = h;
-            else if (axis == 3)
-              idx = w;
+    if (output.getDataType() == Tdatatype::FP16) {
 
-            if (getDataType() == Tdatatype::QINT8) {
-              output.setValue(
-                b, c, h, w,
-                (T)(getValue<uint8_t>(b, c, h, w) - zero_points[idx]) *
-                  scale_factors[idx]);
-            } else {
-              output.setValue(
-                b, c, h, w,
-                (T)(getValueQint4(b, c, h, w) - zero_points[idx]) *
-                  scale_factors[idx]);
+#ifdef ENABLE_FP16
+      int idx;
+      for (unsigned int b = 0; b < batch(); ++b) {
+        for (unsigned int c = 0; c < channel(); ++c) {
+          for (unsigned int h = 0; h < height(); ++h) {
+            for (unsigned int w = 0; w < width(); ++w) {
+              if (axis == 0)
+                idx = b;
+              else if (axis == 1)
+                idx = c;
+              else if (axis == 2)
+                idx = h;
+              else if (axis == 3)
+                idx = w;
+
+              if (getDataType() == Tdatatype::QINT8) {
+                output.setValue(
+                  b, c, h, w,
+                  (_FP16)(getValue<uint8_t>(b, c, h, w) - zero_points[idx]) *
+                    scale_factors[idx]);
+              } else {
+                output.setValue(
+                  b, c, h, w,
+                  (_FP16)(getValueQint4(b, c, h, w) - zero_points[idx]) *
+                    scale_factors[idx]);
+              }
+            }
+          }
+        }
+      }
+#else
+      throw std::invalid_argument("enble-fp16 is not set");
+#endif
+    } else if (output.getDataType() == Tdatatype::FP32) {
+
+      int idx;
+      for (unsigned int b = 0; b < batch(); ++b) {
+        for (unsigned int c = 0; c < channel(); ++c) {
+          for (unsigned int h = 0; h < height(); ++h) {
+            for (unsigned int w = 0; w < width(); ++w) {
+              if (axis == 0)
+                idx = b;
+              else if (axis == 1)
+                idx = c;
+              else if (axis == 2)
+                idx = h;
+              else if (axis == 3)
+                idx = w;
+
+              if (getDataType() == Tdatatype::QINT8) {
+                output.setValue(
+                  b, c, h, w,
+                  (float)(getValue<uint8_t>(b, c, h, w) - zero_points[idx]) *
+                    scale_factors[idx]);
+              } else {
+                output.setValue(
+                  b, c, h, w,
+                  (float)(getValueQint4(b, c, h, w) - zero_points[idx]) *
+                    scale_factors[idx]);
+              }
             }
           }
         }
       }
     }
 
-    return output;
+
+    return;
   }
 
   static constexpr float epsilon = 1e-5;

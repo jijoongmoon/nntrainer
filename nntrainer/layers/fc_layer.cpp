@@ -134,7 +134,13 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
                                                  unsigned int from,
                                                  unsigned int to,
                                                  bool training) {
-  Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
+
+  Tensor w;
+  Tensor &weight_ = w;
+  // Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
+  std::cout << "getWeight"<<std::endl;
+  context.getWeight(weight_, weight_idx[FCParams::weight]);
+    std::cout << "getWeight end"<<std::endl;
 
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -159,26 +165,6 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   // size is 1
   Tensor input_step = input_.getSharedDataTensor(input_step_dim, 0, true);
   Tensor hidden_step = hidden_.getSharedDataTensor(hidden_step_dim, 0, true);
-  Tensor weight_;
-
-  if (weight.getDataType() == nntrainer::Tdatatype::QINT4 ||
-      weight.getDataType() == nntrainer::Tdatatype::QINT8) {
-    Tdatatype dtype = input_step.getDataType();
-
-    unsigned int axis =
-      context.getWeightObject(weight_idx[FCParams::weight]).getOutputAxis();
-
-    if (dtype == nntrainer::Tdatatype::FP32)
-      weight_ = weight.dequantize<float>(axis);
-    else if (dtype == nntrainer::Tdatatype::FP16)
-#ifdef ENABLE_FP16
-      weight_ = weight.dequantize<_FP16>(axis);
-#else
-      ml_loge("%s", "Error: enable-fp16 is not enabled");
-#endif
-  } else {
-    weight_ = weight;
-  }
 
   input_step.dot(weight_, hidden_step, false, false);
 
