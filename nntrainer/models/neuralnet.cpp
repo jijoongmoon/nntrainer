@@ -562,10 +562,25 @@ void NeuralNetwork::load(const std::string &file_path,
         }
       }
 
-      checkedRead(model_file, (char *)&epoch_idx, sizeof(epoch_idx),
-                  "[NeuralNetwork::readModel] failed to read epoch_idx");
-      checkedRead(model_file, (char *)&iter, sizeof(iter),
-                  "[NeuralNetwork::readModel] failed to read iteration");
+      // @note temporary set to 0 since 4bit bin file do not have these info
+      epoch_idx = 0;
+      iter = 0;
+      // std::cout << "read epoch_idx" << std::endl;
+
+      // checkedRead(model_file, (char *)&epoch_idx, sizeof(epoch_idx),
+      //             "[NeuralNetwork::readModel] failed to read epoch_idx");
+
+      // std::cout << "epoch_idx: " << epoch_idx << std::endl;
+
+      // std::cout << "read iter" << std::endl;
+
+      // checkedRead(model_file, (char *)&iter, sizeof(iter),
+      //             "[NeuralNetwork::readModel] failed to read iteration");
+
+      // std::cout << "iter: " << iter << std::endl;
+
+      // std::cout << "finished read" << std::endl;
+
     } catch (...) {
       std::cerr << "failed to read additional data like optimizer variable, "
                    "iteration, proceeding with default\n";

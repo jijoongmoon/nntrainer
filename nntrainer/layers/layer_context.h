@@ -397,9 +397,7 @@ public:
       w = t_w;
       return;
     }
-
-    Tdatatype o_t = getOutput(idx).getDataType();
-
+    Tdatatype o_t = getOutput(0).getDataType(); // @note idx temporary set to 0 (outputs.size() == 1)
     if (w.empty()) {
       w = Tensor(t_w.getDim());
       w.setDataType(o_t);

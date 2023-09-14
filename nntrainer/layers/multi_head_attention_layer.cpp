@@ -677,31 +677,36 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
       : empty_tensor;
 
   /** get weights */
-  Tensor &query_fc_weight =
-    context.getWeight(weight_idx[AttentionParams::query_fc_weight]);
+  Tensor qWeight, kWeight, vWeight, fWeight;
+
+  Tensor &query_fc_weight = qWeight;
+  context.getWeight(query_fc_weight,
+                    weight_idx[AttentionParams::query_fc_weight]);
 
   Tensor &query_fc_bias =
     disable_bias
       ? empty_tensor
       : context.getWeight(weight_idx[AttentionParams::query_fc_bias]);
-  
-  Tensor &key_fc_weight =
-    context.getWeight(weight_idx[AttentionParams::key_fc_weight]);
-  
+
+  Tensor &key_fc_weight = kWeight;
+  context.getWeight(key_fc_weight, weight_idx[AttentionParams::key_fc_weight]);
+
   Tensor &key_fc_bias =
     disable_bias ? empty_tensor
                  : context.getWeight(weight_idx[AttentionParams::key_fc_bias]);
-  
-  Tensor &value_fc_weight =
-    context.getWeight(weight_idx[AttentionParams::value_fc_weight]);
-  
+
+  Tensor &value_fc_weight = vWeight;
+  context.getWeight(value_fc_weight,
+                    weight_idx[AttentionParams::value_fc_weight]);
+
   Tensor &value_fc_bias =
     disable_bias
       ? empty_tensor
       : context.getWeight(weight_idx[AttentionParams::value_fc_bias]);
-  
-  Tensor &fc_weight = context.getWeight(weight_idx[AttentionParams::fc_weight]);
-  
+
+  Tensor &fc_weight = fWeight;
+  context.getWeight(fc_weight, weight_idx[AttentionParams::fc_weight]);
+
   Tensor &fc_bias = disable_bias
                       ? empty_tensor
                       : context.getWeight(weight_idx[AttentionParams::fc_bias]);
@@ -782,7 +787,7 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   const unsigned int query_height = query_dim.height();
   const unsigned int key_height = key_dim.height();
   const unsigned int value_height = value_dim.height();
-  std::cout << "ready to copute" <<std::endl;
+
   // clock_t start, finish;
 
   // start = clock();
@@ -1010,24 +1015,31 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
       : empty_tensor;
 
   /** get weights */
-  Tensor &query_fc_weight =
-    context.getWeight(weight_idx[AttentionParams::query_fc_weight]);
+  Tensor qw, kw, vw, fw;
+
+  Tensor &query_fc_weight = qw;
+  context.getWeight(query_fc_weight,
+                    weight_idx[AttentionParams::query_fc_weight]);
   Tensor &query_fc_bias =
     disable_bias
       ? empty_tensor
       : context.getWeight(weight_idx[AttentionParams::query_fc_bias]);
-  Tensor &key_fc_weight =
-    context.getWeight(weight_idx[AttentionParams::key_fc_weight]);
+
+  Tensor &key_fc_weight = kw;
+  context.getWeight(key_fc_weight, weight_idx[AttentionParams::key_fc_weight]);
   Tensor &key_fc_bias =
     disable_bias ? empty_tensor
                  : context.getWeight(weight_idx[AttentionParams::key_fc_bias]);
-  Tensor &value_fc_weight =
-    context.getWeight(weight_idx[AttentionParams::value_fc_weight]);
+  Tensor &value_fc_weight = vw;
+
+  context.getWeight(value_fc_weight,
+                    weight_idx[AttentionParams::value_fc_weight]);
   Tensor &value_fc_bias =
     disable_bias
       ? empty_tensor
       : context.getWeight(weight_idx[AttentionParams::value_fc_bias]);
-  Tensor &fc_weight = context.getWeight(weight_idx[AttentionParams::fc_weight]);
+  Tensor &fc_weight = fw;
+  context.getWeight(fc_weight, weight_idx[AttentionParams::fc_weight]);
   Tensor &fc_bias = disable_bias
                       ? empty_tensor
                       : context.getWeight(weight_idx[AttentionParams::fc_bias]);

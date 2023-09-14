@@ -448,7 +448,7 @@ void LayerNode::read(std::ifstream &file, bool opt_var) {
     for (unsigned int i = 0; i < run_context->getNumWeights(); ++i) {
       /// @note shared weights are only be read at the first acecss
       if (run_context->isGradientLastAccess(i)) {
-        run_context->getWeight(i).read(file);
+        run_context->getWeight(i).read(file, Tdatatype::FP16); // @note temporary set to read FP16 scale factors
       }
     }
   }

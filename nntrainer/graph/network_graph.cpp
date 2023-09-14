@@ -379,6 +379,7 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
     std::cout << ln->getName() << " start"<< std::endl;
+    // @note layer0_decoder_add start (Segmentation fault)
     forwarding_op(*iter, training);
     std::cout << ln->getName() << " end"<<std::endl;    
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
