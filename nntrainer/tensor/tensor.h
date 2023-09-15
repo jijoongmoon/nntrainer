@@ -2018,7 +2018,11 @@ public:
         width() != output.width() || height() != output.height())
       throw std::invalid_argument("Error: TensorDim do not match");
 
-    if (scale_factors.empty()) {
+    if (output.getDataType() == Tdatatype::FP32 && scale_factors_32.empty()) {
+      throw std::invalid_argument("Error: No scale factors");
+    }
+
+    if (output.getDataType() == Tdatatype::FP16 && scale_factors_16.empty()) {
       throw std::invalid_argument("Error: No scale factors");
     }
 
@@ -2026,97 +2030,66 @@ public:
       throw std::invalid_argument("Error: No zero points");
     }
 
-    if (axis == 0 && scale_factors.size() != batch() &&
-        zero_points.size() != batch()) {
+    if (axis == 0 && zero_points.size() != batch()) {
       throw std::invalid_argument("Error: output axis do not match ");
     }
 
-    if (axis == 1 && scale_factors.size() != channel() &&
-        zero_points.size() != channel()) {
+    if (axis == 1 && zero_points.size() != channel()) {
       throw std::invalid_argument("Error: output axis do not match ");
     }
 
-    if (axis == 2 && scale_factors.size() != height() &&
-        zero_points.size() != height()) {
+    if (axis == 2 && zero_points.size() != height()) {
       throw std::invalid_argument("Error: output axis do not match ");
     }
 
-    if (axis == 3 && scale_factors.size() != width() &&
-        zero_points.size() != width()) {
+    if (axis == 3 && zero_points.size() != width()) {
       throw std::invalid_argument("Error: output axis do not match ");
     }
 
     if (output.getDataType() == Tdatatype::FP16) {
-
 #ifdef ENABLE_FP16
-      int idx;
-      for (unsigned int b = 0; b < batch(); ++b) {
-        for (unsigned int c = 0; c < channel(); ++c) {
-          for (unsigned int h = 0; h < height(); ++h) {
-            for (unsigned int w = 0; w < width(); ++w) {
-              if (axis == 0)
-                idx = b;
-              else if (axis == 1)
-                idx = c;
-              else if (axis == 2)
-                idx = h;
-              else if (axis == 3)
-                idx = w;
+      _FP16 *o_data = output.getData<_FP16>();
+      if (getDataType() == Tdatatype::QINT4) {
+        const uint8_t *data = getData<uint8_t>();
+        for (unsigned int i = 0; i < (output.getDim().getDataLen() + 1) / 2;
+             ++i) {
 
-              if (getDataType() == Tdatatype::QINT8) {
-                output.setValue(
-                  b, c, h, w,
-                  (_FP16)(getValue<uint8_t>(b, c, h, w) - zero_points[idx]) *
-                    scale_factors[idx]);
-              } else {
-                output.setValue(
-                  b, c, h, w,
-                  (_FP16)(getValueQint4(b, c, h, w) - zero_points[idx]) *
-                    scale_factors[idx]);
-              }
-            }
-          }
+          unsigned int idx = i * 2;
+          o_data[idx] =
+            ((data[i] >> 4) - zero_points[idx % zero_points.size()]) *
+            scale_factors_16[idx % scale_factors_16.size()];
+          if (idx + 1 < output.getDim().getDataLen())
+            o_data[idx + 1] =
+              ((data[i] & 0x0f) - zero_points[(idx + 1) % zero_points.size()]) *
+              scale_factors_16[(idx + 1) % scale_factors_16.size()];
         }
       }
 #else
       throw std::invalid_argument("enble-fp16 is not set");
 #endif
     } else if (output.getDataType() == Tdatatype::FP32) {
+      float *o_data = output.getData<float>();
+      if (getDataType() == Tdatatype::QINT4) {
+        const uint8_t *data = getData<uint8_t>();
+        for (unsigned int i = 0; i < (output.getDim().getDataLen() + 1) / 2;
+             ++i) {
 
-      int idx;
-      for (unsigned int b = 0; b < batch(); ++b) {
-        for (unsigned int c = 0; c < channel(); ++c) {
-          for (unsigned int h = 0; h < height(); ++h) {
-            for (unsigned int w = 0; w < width(); ++w) {
-              if (axis == 0)
-                idx = b;
-              else if (axis == 1)
-                idx = c;
-              else if (axis == 2)
-                idx = h;
-              else if (axis == 3)
-                idx = w;
-
-              if (getDataType() == Tdatatype::QINT8) {
-                output.setValue(
-                  b, c, h, w,
-                  (float)(getValue<uint8_t>(b, c, h, w) - zero_points[idx]) *
-                    scale_factors[idx]);
-              } else {
-                output.setValue(
-                  b, c, h, w,
-                  (float)(getValueQint4(b, c, h, w) - zero_points[idx]) *
-                    scale_factors[idx]);
-              }
-            }
-          }
+          unsigned int idx = i * 2;
+          o_data[idx] =
+            ((data[i] >> 4) - zero_points[idx % zero_points.size()]) *
+            scale_factors_32[idx % scale_factors_32.size()];
+          if (idx + 1 < output.getDim().getDataLen())
+            o_data[idx + 1] =
+              ((data[i] & 0x0f) - zero_points[(idx + 1) % zero_points.size()]) *
+              scale_factors_32[(idx + 1) % scale_factors_32.size()];
         }
       }
     }
 
-
     return;
   }
+
+  void flate(Tensor &output) const;
 
   static constexpr float epsilon = 1e-5;
 
@@ -2129,7 +2102,8 @@ private:
   std::string name; /**< name of the tensor */
   std::shared_ptr<MemoryData> data;
   size_t offset;
-  std::vector<float> scale_factors;
+  std::vector<float> scale_factors_32;
+  std::vector<_FP16> scale_factors_16;
   std::vector<uint8_t> zero_points;
 
   /**<
