@@ -127,8 +127,7 @@ public:
   SrcSharedTensor() : src(nullptr), off(0) {}
 
   SrcSharedTensor(const Tensor *tensor, size_t offset) :
-    src(tensor),
-    off(offset) {}
+    src(tensor), off(offset) {}
 
   /**
    * @brief   Get the allocated src tensor
@@ -2660,7 +2659,7 @@ void Tensor::print(std::ostream &out) const {
     out << "data addr: " << data << '\n';
     out << dim;
 
-    if (len > 10000000) {
+    if (len > 100) {
       out << '[' << (float)data[0] << ' ' << (float)data[1] << ' '
           << (float)data[2] << " ... " << (float)data[len - 3] << ' '
           << (float)data[len - 2] << ' ' << (float)data[len - 1] << ']'
@@ -2672,7 +2671,7 @@ void Tensor::print(std::ostream &out) const {
     init.copyfmt(out);
     float max_ = 0.0;
     float min_ = 10000000;
-    
+
     if (getFormat() == Tformat::NCHW) {
       for (unsigned int k = 0; k < batch(); k++) {
         for (unsigned int l = 0; l < channel(); l++) {
@@ -2760,14 +2759,17 @@ void Tensor::print(std::ostream &out) const {
     }
   } else if (getDataType() == ml::train::TensorDim::DataType::QINT4) {
     const uint8_t *data = getData<uint8_t>();
-    unsigned int len = size();
+    unsigned int len = (size() + 1) / 2;
     out << "data addr: " << (float *)data << '\n';
     out << dim;
 
     if (len > 100) {
-      out << '[' << (int)data[0] << ' ' << (int)data[1] << ' ' << (int)data[2]
-          << " ... " << (int)data[len - 3] << ' ' << (int)data[len - 2] << ' '
-          << (int)data[len - 1] << ']' << std::endl;
+      out << '[' << (int)decode_qint(data[0], true) << ' '
+          << (int)decode_qint(data[0], false) << ' '
+          << (int)decode_qint(data[1], true) << " ... "
+          << (int)decode_qint(data[len - 2], false) << ' '
+          << (int)decode_qint(data[len - 1], true) << ' '
+          << (int)decode_qint(data[len - 1], false) << ']' << std::endl;
       return;
     }
 
@@ -3133,8 +3135,8 @@ void Tensor::save(std::ostream &file) {
 
     checkedWrite(file, (char *)temp.data(),
                  static_cast<std::streamsize>(size() * sizeof(_FP16)),
-                 "[Tensor::save] operation failed");    
-    
+                 "[Tensor::save] operation failed");
+
     // checkedWrite(file, (char *)getData(), sz,
     //              "[Tensor::save] operation failed");
   } else if (this->getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -3185,12 +3187,12 @@ void Tensor::read(std::ifstream &file, Tdatatype s_type) {
       if (s_type == Tdatatype::FP32) {
         float scale;
         file.read((char *)&scale, sizeof(float));
-        scale_factors.push_back(scale);
+        scale_factors_32.push_back(scale);
       } else if (s_type == Tdatatype::FP16) {
 #ifdef ENABLE_FP16
         _FP16 scale;
         file.read((char *)&scale, sizeof(_FP16));
-        scale_factors.push_back((float)scale);
+        scale_factors_16.push_back(scale);
 #else
         throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif
@@ -3648,10 +3650,10 @@ void Tensor::setScaleFactors(std::vector<float> scales) {
     throw std::invalid_argument("Error: invalid parameter");
   }
 
-  scale_factors = scales;
+  scale_factors_32 = scales;
 }
 
-std::vector<float> Tensor::getScaleFactors() const { return scale_factors; }
+std::vector<float> Tensor::getScaleFactors() const { return scale_factors_32; }
 
 void Tensor::setZeroPoints(std::vector<uint8_t> zp) {
   if (zp.empty()) {
@@ -3659,6 +3661,30 @@ void Tensor::setZeroPoints(std::vector<uint8_t> zp) {
   }
 
   zero_points = zp;
+}
+
+void Tensor::flate(Tensor &output) const {
+  if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
+    throw std::invalid_argument("Error: Tensor cannot be dequantized");
+  }
+  if (output.getDataType() == Tdatatype::FP16) {
+#ifdef ENABLE_FP16
+    _FP16 *o_data = output.getData<_FP16>();
+    if (getDataType() == Tdatatype::QINT4) {
+      const uint8_t *data = getData<uint8_t>();
+      for (unsigned int i = 0; i < (output.getDim().getDataLen() + 1) / 2;
+           ++i) {
+
+        unsigned int idx = i * 2;
+        o_data[idx] = decode_qint(data[i], true);
+        if (idx + 1 < output.getDim().getDataLen())
+          o_data[idx + 1] = decode_qint(data[i], false);
+      }
+    }
+#else
+    ml_loge("%s", "Error: enable-fp16 is not enabled");
+#endif
+  }
 }
 
 std::vector<uint8_t> Tensor::getZeroPoints() const { return zero_points; }
