@@ -250,6 +250,7 @@ static void sgemm_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
                                      TransA == CblasTrans,
                                      TransB == CblasTrans);
 
+
 #else
   sgemm_loop_fp16();
 #endif

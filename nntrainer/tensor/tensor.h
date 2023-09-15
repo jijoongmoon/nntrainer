@@ -40,6 +40,7 @@
 #include <nntrainer_log.h>
 #include <tensor_dim.h>
 #include <util_func.h>
+#include <ctime>
 
 #include <chrono>
 
@@ -1957,6 +1958,20 @@ public:
    */
   Tdatatype getDataType() const { return dim.getDataType(); }
 
+
+  // /**
+  //  * @brief Set output axis of the tensor
+  //  * @param[in] axis output axis (0: batch, 1: channel, 2: height, 3: width)
+  //  */
+  // void setOutputAxis(int axis);
+
+  // /**
+  //  * @brief Get output axis of the tensor
+  //  *
+  //  * @return output axis of the tensor
+  //  */
+  // int getOutputAxis() const;
+
   /**
    * @brief     Set scale factors of the tensor
    * @param[in] scales scale factors
@@ -1983,6 +1998,7 @@ public:
    */
   std::vector<uint8_t> getZeroPoints() const;
 
+
   /**
    * @brief     Dequantize Tensor
    * @retval    Dequantized Tensor
@@ -1994,18 +2010,117 @@ public:
     Tensor t =
       Tensor(batch(), channel(), height(), width(), getFormat(), dtype);
 
-    dequantize<T>(t, axis);
-    return t;
+
+    return dequantize<T>(t, axis);
   }
 
-  /**
+ /**
    * @brief      Dequantize Tensor to output tensor datatype
    * @param[out] output Tensor to store the result
    * @retval     Dequantized Tensor
    */
-  void dequantize(Tensor &output, unsigned int axis) const;
+  void dequantize(Tensor &output, unsigned int axis) const {
+    if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
+      throw std::invalid_argument("Error: Tensor cannot be dequantized");
+    }
+    if (output.getDataType() == Tdatatype::QINT8 ||
+        output.getDataType() == Tdatatype::QINT4) {
+      throw std::invalid_argument("Error: Target datatype is quantized type");
+    }
+    if (getFormat() != output.getFormat())
+      throw std::invalid_argument("Error: TensorType do not match");
+    if (batch() != output.batch() || channel() != output.channel() ||
+        width() != output.width() || height() != output.height())
+      throw std::invalid_argument("Error: TensorDim do not match");
+
+    if (output.getDataType() == Tdatatype::FP32 && scale_factors_32.empty()) {
+      throw std::invalid_argument("Error: No scale factors");
+    }
+
+    if (output.getDataType() == Tdatatype::FP16 && scale_factors_16.empty()) {
+      throw std::invalid_argument("Error: No scale factors");
+    }
+
+    if (zero_points.empty()) {
+      throw std::invalid_argument("Error: No zero points");
+    }
+
+    if (axis == 0 && zero_points.size() != batch()) {
+      throw std::invalid_argument("Error: output axis do not match ");
+    }
+
+    if (axis == 1 && zero_points.size() != channel()) {
+      throw std::invalid_argument("Error: output axis do not match ");
+    }
+
+    if (axis == 2 && zero_points.size() != height()) {
+      throw std::invalid_argument("Error: output axis do not match ");
+    }
+
+    if (axis == 3 && zero_points.size() != width()) {
+      throw std::invalid_argument("Error: output axis do not match ");
+    }
+
+    if (output.getDataType() == Tdatatype::FP16) {
+#ifdef ENABLE_FP16
+      clock_t allstart, start, finish;
+
+      start = clock();
+      // allstart = start;
+      
+      flate(output);
+      // finish = clock();
+      // std::cout << "    flate "<<(double) (finish-start) <<std::endl;
+      // start =clock();
+      
+      std::vector<_FP16> zero_points_16(zero_points.begin(), zero_points.end());
+      Tensor zero_points_fp16(
+        {{1, 1, 1, zero_points.size()}, {getFormat(), Tdatatype::FP16}},
+        zero_points_16.data());
+
+      Tensor scale_factors_fp16(
+        {{1, 1, 1, scale_factors_16.size()}, {getFormat(), Tdatatype::FP16}},
+        scale_factors_16.data());
+      // finish = clock();
+      // std::cout << "    make tensor "<<(double) (finish-start) <<std::endl;
+      // start =clock();
+      output.subtract_i(zero_points_fp16);
+      // finish = clock();
+      // std::cout << "    substract "<<(double) (finish-start) <<std::endl;
+      // start =clock();
+      // ;      
+      output.multiply_i(scale_factors_fp16);
+      // finish = clock();
+      // std::cout << "    mul "<<(double) (finish-start) <<std::endl;
+      // std::cout << (double)(finish - allstart)<<std::endl;
+
+      
+#else
+      throw std::invalid_argument("enble-fp16 is not set");
+#endif
+    } else if (output.getDataType() == Tdatatype::FP32) {
+
+      flate(output);
+
+      std::vector<float> zero_points_32(zero_points.begin(), zero_points.end());
+      Tensor zero_points_fp32(
+        {{1, 1, 1, zero_points.size()}, {getFormat(), Tdatatype::FP32}},
+        zero_points_32.data());
+      Tensor scale_factors_fp32(
+        {{1, 1, 1, scale_factors_32.size()}, {getFormat(), Tdatatype::FP32}},
+        scale_factors_32.data());
+
+      output.subtract_i(zero_points_fp32);
+      output.multiply_i(scale_factors_fp32);
+    }
+
+    return;
+  }
+
 
   void flate(Tensor &output) const;
+
+  void parallel_flate(Tensor &output, unsigned int start, unsigned int end) const;
 
   static constexpr float epsilon = 1e-5;
 
@@ -2018,8 +2133,13 @@ private:
   std::string name; /**< name of the tensor */
   std::shared_ptr<MemoryData> data;
   size_t offset;
+
+  // int output_axis;
   std::vector<float> scale_factors_32;
+#ifdef ENABLE_FP16  
   std::vector<_FP16> scale_factors_16;
+#endif
+
   std::vector<uint8_t> zero_points;
 
   /**<
