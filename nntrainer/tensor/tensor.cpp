@@ -3158,6 +3158,7 @@ void Tensor::save(std::ostream &file) {
 }
 
 void Tensor::read(std::ifstream &file, Tdatatype s_type) {
+
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot read.";
 
@@ -3779,6 +3780,7 @@ void Tensor::dequantize(Tensor &output, unsigned int axis) const {
 }
 
 std::vector<uint8_t> Tensor::getZeroPoints() const { return zero_points; }
+
 
 // namespace nntrainer
 

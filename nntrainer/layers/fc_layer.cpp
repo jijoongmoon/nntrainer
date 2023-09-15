@@ -134,13 +134,11 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
                                                  unsigned int from,
                                                  unsigned int to,
                                                  bool training) {
+  // Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
 
   Tensor w;
-  Tensor &weight_ = w;
-  // Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
-  std::cout << "getWeight"<<std::endl;
-  context.getWeight(weight_, weight_idx[FCParams::weight]);
-    std::cout << "getWeight end"<<std::endl;
+  Tensor &weight = w;
+  context.getWeight(weight, weight_idx[FCParams::weight]);
 
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -166,7 +164,7 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   Tensor input_step = input_.getSharedDataTensor(input_step_dim, 0, true);
   Tensor hidden_step = hidden_.getSharedDataTensor(hidden_step_dim, 0, true);
 
-  input_step.dot(weight_, hidden_step, false, false);
+  input_step.dot(weight, hidden_step, false, false);
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
