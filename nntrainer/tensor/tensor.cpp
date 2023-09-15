@@ -34,6 +34,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <stdio.h>
+#include <future>
+#include <thread>
 
 #include <lazy_tensor.h>
 #include <tensor.h>
@@ -2713,14 +2715,17 @@ void Tensor::print(std::ostream &out) const {
 #endif
   } else if (getDataType() == ml::train::TensorDim::DataType::QINT8) {
     const uint8_t *data = getData<uint8_t>();
-    unsigned int len = size();
+    unsigned int len = (size()+1)/2;
     out << "data addr: " << reinterpret_cast<const float *>(data) << '\n';
     out << dim;
 
     if (len > 100) {
-      out << '[' << (int)data[0] << ' ' << (int)data[1] << ' ' << (int)data[2]
-          << " ... " << (int)data[len - 3] << ' ' << (int)data[len - 2] << ' '
-          << (int)data[len - 1] << ']' << std::endl;
+      out << '[' << (int)decode_qint(data[0], true) << ' '
+          << (int)decode_qint(data[0], false) << ' '
+          << (int)decode_qint(data[1], true) << " ... "
+          << (int)decode_qint(data[len - 2], false) << ' '
+          << (int)decode_qint(data[len - 1], true) << ' '
+          << (int)decode_qint(data[len - 1], false) << ']' << std::endl;
       return;
     }
 
@@ -3587,7 +3592,7 @@ Tensor::BroadcastInfo Tensor::computeBroadcastInfo(const Tensor &m) const {
     if (inner_loop_size > e.buffer_size) {
       e.buffer_axis = axis;
       e.buffer_size = inner_loop_size;
-      e.strides[3] = 0;
+      e.strides[3] = 0; 
     }
   }
 
@@ -3645,84 +3650,62 @@ uint8_t Tensor::decode_qint(uint8_t val, bool isHigh) const {
   return val;
 }
 
-void Tensor::setScaleFactors(std::vector<float> scales) {
-  if (scales.empty()) {
-    throw std::invalid_argument("Error: invalid parameter");
-  }
+// void Tensor::setOutputAxis(int axis) {
+//   if (axis < 0 || axis > 3) {
+//     throw std::invalid_argument("Error: invalid parameter");
+//   }
+//   output_axis = axis;
+// }
 
-  scale_factors_32 = scales;
-}
-
-std::vector<float> Tensor::getScaleFactors() const { return scale_factors_32; }
+// int Tensor::getOutputAxis() const { return output_axis; }
 
 void Tensor::setZeroPoints(std::vector<uint8_t> zp) {
   if (zp.empty()) {
     throw std::invalid_argument("Error: invalid parameter");
   }
 
-  zero_points = zp;
+
+  // if (output_axis == 0 && scales.size() != batch()) {
+  //   throw std::invalid_argument("Error: scale_factors.size() != batch() ");
+  // }
+
+  // if (output_axis == 1 && scales.size() != channel()) {
+  //   throw std::invalid_argument("Error: scale_factors.size() != channel() ");
+  // }
+
+  // if (output_axis == 2 && scales.size() != height()) {
+  //   throw std::invalid_argument("Error: scale_factors.size() != height() ");
+  // }
+
+  // if (output_axis == 3 && scales.size() != width()) {
+  //   throw std::invalid_argument("Error: scale_factors.size() != width() ");
+  // }
+
+  scale_factors_32 = scales;
 }
 
-void Tensor::flate(Tensor &output) const {
-  if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
-    throw std::invalid_argument("Error: Tensor cannot be dequantized");
-  }
-  if (output.getDataType() == Tdatatype::FP16) {
-#ifdef ENABLE_FP16
-    _FP16 *o_data = output.getData<_FP16>();
-    if (getDataType() == Tdatatype::QINT4) {
-      const uint8_t *data = getData<uint8_t>();
-      for (unsigned int i = 0; i < (output.getDim().getDataLen() + 1) / 2;
-           ++i) {
-
-        unsigned int idx = i * 2;
-        o_data[idx] = data[i] >> 4;
-        if (idx + 1 < output.getDim().getDataLen())
-          o_data[idx + 1] = data[i] & 0x0f;
-      }
-    }
-#else
-    ml_loge("%s", "Error: enable-fp16 is not enabled");
-#endif
-  }
-}
-
-void Tensor::dequantize(Tensor &output, unsigned int axis) const {
-  if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
-    throw std::invalid_argument("Error: Tensor cannot be dequantized");
-  }
-
-  if (output.getDataType() == Tdatatype::QINT8 ||
-      output.getDataType() == Tdatatype::QINT4) {
-    throw std::invalid_argument("Error: Target datatype is quantized type");
-  }
-
-  if (getFormat() != output.getFormat())
-    throw std::invalid_argument("Error: TensorType do not match");
-
-  if (batch() != output.batch() || channel() != output.channel() ||
-      width() != output.width() || height() != output.height())
-    throw std::invalid_argument("Error: TensorDim do not match");
+std::vector<float> Tensor::getScaleFactors() const { return scale_factors_32; }
 
   if (output.getDataType() == Tdatatype::FP32 && scale_factors_32.empty()) {
     throw std::invalid_argument("Error: No scale factors");
   }
 
-  if (output.getDataType() == Tdatatype::FP16 && scale_factors_16.empty()) {
-    throw std::invalid_argument("Error: No scale factors");
-  }
 
-  if (zero_points.empty()) {
-    throw std::invalid_argument("Error: No zero points");
-  }
+  // if (output_axis == 0 && zp.size() != batch()) {
+  //   throw std::invalid_argument("Error: zero_points.size() != batch() ");
+  // }
 
-  if (axis == 0 && zero_points.size() != batch()) {
-    throw std::invalid_argument("Error: output axis do not match ");
-  }
+  // if (output_axis == 1 && zp.size() != channel()) {
+  //   throw std::invalid_argument("Error: zero_points.size() != channel() ");
+  // }
 
-  if (axis == 1 && zero_points.size() != channel()) {
-    throw std::invalid_argument("Error: output axis do not match ");
-  }
+  // if (output_axis == 2 && zp.size() != height()) {
+  //   throw std::invalid_argument("Error: zero_points.size() != height() ");
+  // }
+
+  // if (output_axis == 3 && zp.size() != width()) {
+  //   throw std::invalid_argument("Error: zero_points.size() != width() ");
+  // }
 
   if (axis == 2 && zero_points.size() != height()) {
     throw std::invalid_argument("Error: output axis do not match ");
@@ -3777,8 +3760,61 @@ void Tensor::dequantize(Tensor &output, unsigned int axis) const {
   return;
 }
 
-std::vector<uint8_t> Tensor::getZeroPoints() const { return zero_points; }
+void Tensor::flate(Tensor &output) const {
+  if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
+    throw std::invalid_argument("Error: Tensor cannot be dequantized");
+  }
 
+  if (output.getDataType() == Tdatatype::FP16) {
+#ifdef ENABLE_FP16
+    _FP16 *o_data = output.getData<_FP16>();
+    if (getDataType() == Tdatatype::QINT4) {
+
+      const uint8_t *data = getData<uint8_t>();
+      auto copy_job = [&](unsigned int start, unsigned int end) {
+        for (unsigned int i = start; i < end; ++i) {
+
+          unsigned int idx = i * 2;
+	  o_data[idx] = (_FP16)(data[i] >> 4);
+	  // uint8_t v = data[i] <<4;
+	  // o_data[idx+1] = (_FP16)(v>>4);
+	  o_data[idx+1] = (_FP16)(data[i]  &0x0f);
+          // o_data[idx] = decode_qint(data[i], true);
+          // if (idx + 1 < output.getDim().getDataLen())
+          //   o_data[idx + 1] = decode_qint(data[i], false);
+	}
+      }; 
+  
+      unsigned int end = (output.getDim().getDataLen() + 1) / 2;
+      
+      // auto asy0=std::async(std::launch::async, copy_job, 0, end/2);
+      // auto asy1=std::async(std::launch::async, copy_job, end/2, end);
+
+      // asy0.wait();
+      // asy1.wait();      
+ 
+      // for (unsigned int i = 0; i < (output.getDim().getDataLen() + 1) / 2;
+      //      ++i) {
+
+      //   unsigned int idx = i * 2;
+      //   o_data[idx] = decode_qint(data[i], true);
+      //   if (idx + 1 < output.getDim().getDataLen())
+      //     o_data[idx + 1] = decode_qint(data[i], false);
+      // }
+
+
+
+      copy_job(0, end);
+
+      
+    }
+#else
+    ml_loge("%s", "Error: enable-fp16 is not enabled");
+#endif
+  }
+}
+
+std::vector<uint8_t> Tensor::getZeroPoints() const { return zero_points; }
 
 // namespace nntrainer
 

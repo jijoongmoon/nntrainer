@@ -375,6 +375,9 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
+  
+
+  std::chrono::system_clock::time_point start = std::chrono::system_clock::now();      
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
@@ -391,7 +394,9 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
       out.push_back(MAKE_SHARED_TENSOR(output_layer_node->getOutput(j)));
     }
   }
-
+  std::chrono::system_clock::time_point end = std::chrono::system_clock::now();      
+ 
+  std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count()<<std::endl;
   return out;
 }
 

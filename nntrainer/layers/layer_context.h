@@ -398,11 +398,13 @@ public:
       return;
     }
 
-    Tdatatype o_t = getOutput(idx).getDataType();
+    unsigned int base_idx =0;
+    Tdatatype o_t = getOutput(base_idx).getDataType();
 
     if (w.empty()) {
-      w = Tensor(t_w.getDim());
-      w.setDataType(o_t);
+      TensorDim d = t_w.getDim();
+      d.setDataType(o_t);
+      w = Tensor(d,true);
     }
     unsigned int o_ax = getWeightObject(idx).getOutputAxis();
 
