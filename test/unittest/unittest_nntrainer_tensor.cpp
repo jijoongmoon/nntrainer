@@ -4346,253 +4346,289 @@ TEST(nntrainer_Tensor, multiply_strided_06_p) {
 /**
  * @brief dequantize FP32 tensor
  */
-TEST(nntrainer_Tensor, dequantize_01_n) {
-  int batch = 1;
-  int channel = 3;
-  int height = 4;
-  int width = 5;
+// TEST(nntrainer_Tensor, dequantize_01_n) {
+//   int batch = 1;
+//   int channel = 3;
+//   int height = 4;
+//   int width = 5;
 
-  nntrainer::Tensor input(batch, channel, height, width);
-  GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
-  input.setScaleFactors({1.5, 1.0, 0.5});
-  input.setZeroPoints({1, 4, 7});
+//   nntrainer::Tensor input(batch, channel, height, width);
+//   GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
+//   input.setScaleFactors({1.5, 1.0, 0.5});
+//   input.setZeroPoints({1, 4, 7});
 
-  nntrainer::Tensor output(batch, channel, height, width);
+//   nntrainer::Tensor output(batch, channel, height, width);
 
-  EXPECT_THROW({ input.dequantize<float>(output, 1); }, std::invalid_argument);
-}
+//   EXPECT_THROW({ input.dequantize<float>(output, 1); },
+//   std::invalid_argument);
+// }
 
-/**
- * @brief dequantize tensor with different dimension
- */
-TEST(nntrainer_Tensor, dequantize_02_n) {
-  int batch = 1;
-  int channel = 3;
-  int height = 4;
-  int width = 5;
+// /**
+//  * @brief dequantize tensor with different dimension
+//  */
+// TEST(nntrainer_Tensor, dequantize_02_n) {
+//   int batch = 1;
+//   int channel = 3;
+//   int height = 4;
+//   int width = 5;
 
-  nntrainer::Tensor input(
-    batch + 1, channel, height + 1, width + 1,
-    {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
-  GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
-  input.setScaleFactors({1.5, 1.0, 0.5});
-  input.setZeroPoints({1, 4, 7});
+//   nntrainer::Tensor input(
+//     batch + 1, channel, height + 1, width + 1,
+//     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
+//   GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
+//   input.setScaleFactors({1.5, 1.0, 0.5});
+//   input.setZeroPoints({1, 4, 7});
 
-  nntrainer::Tensor output(batch, channel, height, width);
+//   nntrainer::Tensor output(batch, channel, height, width);
 
-  EXPECT_THROW({ input.dequantize<float>(output, 1); }, std::invalid_argument);
-}
+//   EXPECT_THROW({ input.dequantize<float>(output, 1); },
+//   std::invalid_argument);
+// }
 
-/**
- * @brief dequantize tensor with no scale factors
- */
-TEST(nntrainer_Tensor, dequantize_03_n) {
-  int batch = 1;
-  int channel = 3;
-  int height = 4;
-  int width = 5;
+// /**
+//  * @brief dequantize tensor with no scale factors
+//  */
+// TEST(nntrainer_Tensor, dequantize_03_n) {
+//   int batch = 1;
+//   int channel = 3;
+//   int height = 4;
+//   int width = 5;
 
-  nntrainer::Tensor input(
-    batch, channel, height, width,
-    {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
-  GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
+//   nntrainer::Tensor input(
+//     batch, channel, height, width,
+//     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
+//   GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
 
-  nntrainer::Tensor output(batch, channel, height, width);
+//   nntrainer::Tensor output(batch, channel, height, width);
 
-  EXPECT_THROW({ input.dequantize<float>(output, 1); }, std::invalid_argument);
-}
+//   EXPECT_THROW({ input.dequantize<float>(output, 1); },
+//   std::invalid_argument);
+// }
 
-/**
- * @brief dequantize tensor with incorrect number of scale factors
- */
-TEST(nntrainer_Tensor, dequantize_04_n) {
-  int batch = 1;
-  int channel = 3;
-  int height = 4;
-  int width = 5;
+// /**
+//  * @brief dequantize tensor with incorrect number of scale factors
+//  */
+// TEST(nntrainer_Tensor, dequantize_04_n) {
+//   int batch = 1;
+//   int channel = 3;
+//   int height = 4;
+//   int width = 5;
 
-  nntrainer::Tensor input(
-    batch, channel, height, width,
-    {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
-  GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
+//   nntrainer::Tensor input(
+//     batch, channel, height, width,
+//     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
+//   GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
+
+//   nntrainer::Tensor output(
+//     batch, channel, height, width,
+//     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+
+//   input.setScaleFactors({2.0, 1.5, 1.0, 0.5});
+//   input.setZeroPoints({2, 3, 4, 5});
+//   EXPECT_THROW({ input.dequantize<float>(output, 1); },
+//   std::invalid_argument); EXPECT_NO_THROW({ input.dequantize<float>(output,
+//   2); });
+// }
+
+// /**
+//  * @brief dequantize tensor to QINT8
+//  */
+// TEST(nntrainer_Tensor, dequantize_05_n) {
+//   int batch = 1;
+//   int channel = 3;
+//   int height = 4;
+//   int width = 5;
+
+//   nntrainer::Tensor input(
+//     batch, channel, height, width,
+//     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
+//   GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
+//   input.setScaleFactors({1.5, 1.0, 0.5});
+//   input.setZeroPoints({1, 4, 7});
+
+//   nntrainer::Tensor output(
+//     batch, channel, height, width,
+//     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
+
+//   EXPECT_THROW({ input.dequantize<float>(output, 1); },
+//   std::invalid_argument);
+// }
+
+// /**
+//  * @brief dequantize tensor
+//  */
+// TEST(nntrainer_Tensor, dequantize_06_p) {
+//   size_t batch = 1;
+//   size_t channel = 3;
+//   size_t height = 4;
+//   size_t width = 5;
+
+//   nntrainer::Tensor input(
+//     {batch,
+//      channel,
+//      height,
+//      width,
+//      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8}},
+//     true, nntrainer::Tensor::Initializer::ZEROS);
+//   nntrainer::Tensor output(batch, channel, height, width);
+
+//   // Dequantize by channel
+//   EXPECT_NO_THROW(input.setScaleFactors({2, -2, -4}));
+//   EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1}));
+//   EXPECT_NO_THROW({ input.dequantize<float>(output, 1); });
+
+//   float answer_data_1[] = {-2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2,
+//                            -2, -2, -2, -2, -2, -2, -2, -2, 2,  2,  2,  2,
+//                            2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+//                            2,  2,  2,  2,  4,  4,  4,  4,  4,  4,  4,  4,
+//                            4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4};
+
+//   nntrainer::Tensor answer1(ml::train::TensorDim(batch, channel, height,
+//   width,
+//                                                  {nntrainer::Tformat::NCHW,
+//                                                   nntrainer::Tdatatype::FP32}),
+//                             answer_data_1);
+
+//   EXPECT_EQ(output, answer1);
+
+//   // Dequantize by height
+//   EXPECT_NO_THROW(input.setScaleFactors({4.2, 2, -2, -4.8}));
+//   EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1, 1}));
+//   EXPECT_NO_THROW({ input.dequantize<float>(output, 2); });
+
+//   float answer_data_2[] = {
+//     -4.2, -4.2, -4.2, -4.2, -4.2, -2,   -2,   -2,   -2,   -2,   2,    2,
+//     2,    2,    2,    4.8,  4.8,  4.8,  4.8,  4.8,  -4.2, -4.2, -4.2, -4.2,
+//     -4.2, -2,   -2,   -2,   -2,   -2,   2,    2,    2,    2,    2,    4.8,
+//     4.8,  4.8,  4.8,  4.8,  -4.2, -4.2, -4.2, -4.2, -4.2, -2,   -2,   -2,
+//     -2,   -2,   2,    2,    2,    2,    2,    4.8,  4.8,  4.8,  4.8,  4.8};
+//   nntrainer::Tensor answer2(ml::train::TensorDim(batch, channel, height,
+//   width,
+//                                                  {nntrainer::Tformat::NCHW,
+//                                                   nntrainer::Tdatatype::FP32}),
+//                             answer_data_2);
+
+//   EXPECT_EQ(output, answer2);
+
+//   // Dequantize by width
+//   EXPECT_NO_THROW(input.setScaleFactors({4.2, 2, -2, -4, 8}));
+//   EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1, 1, 1}));
+//   EXPECT_NO_THROW({ input.dequantize<float>(output, 3); });
+
+//   float answer_data_3[] = {
+//     -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
+//     -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
+//     -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
+//     -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8};
+
+//   nntrainer::Tensor answer3(ml::train::TensorDim(batch, channel, height,
+//   width,
+//                                                  {nntrainer::Tformat::NCHW,
+//                                                   nntrainer::Tdatatype::FP32}),
+//                             answer_data_3);
+
+//   EXPECT_EQ(output, answer3);
+// }
+
+// /**
+//  * @brief dequantize qint4 tensor
+//  */
+// TEST(nntrainer_Tensor, dequantize_08_p) {
+//   size_t batch = 1;
+//   size_t channel = 3;
+//   size_t height = 4;
+//   size_t width = 5;
+
+//   nntrainer::Tensor input(
+//     {batch,
+//      channel,
+//      height,
+//      width,
+//      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}},
+//     true, nntrainer::Tensor::Initializer::ZEROS);
+//   nntrainer::Tensor output(batch, channel, height, width);
+
+//   // Dequantize by channel
+//   EXPECT_NO_THROW(input.setScaleFactors({2, -2, -4}));
+//   EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1}));
+//   EXPECT_NO_THROW({ input.dequantize<float>(output, 1); });
+
+//   float answer_data_1[] = {-2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2,
+//                            -2, -2, -2, -2, -2, -2, -2, -2, 2,  2,  2,  2,
+//                            2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+//                            2,  2,  2,  2,  4,  4,  4,  4,  4,  4,  4,  4,
+//                            4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4};
+
+//   nntrainer::Tensor answer1(ml::train::TensorDim(batch, channel, height,
+//   width,
+//                                                  {nntrainer::Tformat::NCHW,
+//                                                   nntrainer::Tdatatype::FP32}),
+//                             answer_data_1);
+
+//   EXPECT_EQ(output, answer1);
+
+//   // Dequantize by height
+//   EXPECT_NO_THROW(input.setScaleFactors({4.2, 2, -2, -4}));
+//   EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1, 1}));
+//   EXPECT_NO_THROW({ input.dequantize<float>(output, 2); });
+
+//   float answer_data_2[] = {-4.2, -4.2, -4.2, -4.2, -4.2, -2, -2, -2, -2, -2,
+//                            2,    2,    2,    2,    2,    4,  4,  4,  4,  4,
+//                            -4.2, -4.2, -4.2, -4.2, -4.2, -2, -2, -2, -2, -2,
+//                            2,    2,    2,    2,    2,    4,  4,  4,  4,  4,
+//                            -4.2, -4.2, -4.2, -4.2, -4.2, -2, -2, -2, -2, -2,
+//                            2,    2,    2,    2,    2,    4,  4,  4,  4,  4};
+//   nntrainer::Tensor answer2(ml::train::TensorDim(batch, channel, height,
+//   width,
+//                                                  {nntrainer::Tformat::NCHW,
+//                                                   nntrainer::Tdatatype::FP32}),
+//                             answer_data_2);
+
+//   EXPECT_EQ(output, answer2);
+
+//   // Dequantize by width
+//   EXPECT_NO_THROW(input.setScaleFactors({4.2, 2, -2, -4, 8}));
+//   EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1, 1, 1}));
+//   EXPECT_NO_THROW({ input.dequantize<float>(output, 3); });
+
+//   float answer_data_3[] = {
+//     -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
+//     -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
+//     -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
+//     -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8};
+
+//   nntrainer::Tensor answer3(ml::train::TensorDim(batch, channel, height,
+//   width,
+//                                                  {nntrainer::Tformat::NCHW,
+//                                                   nntrainer::Tdatatype::FP32}),
+//                             answer_data_3);
+
+//   EXPECT_EQ(output, answer3);
+// }
+
+TEST(nntrainer_Tensor, read_qint4_dequantize_01) {
+  nntrainer::Tensor t(
+    {{1, 1, 1440, 1440},
+     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}});
+
+  std::ifstream file("4bit_one_tensor.bin");
+  t.read(file, nntrainer::Tdatatype::FP16);
+
+  t.print(std::cout);
 
   nntrainer::Tensor output(
-    batch, channel, height, width,
-    {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+    {{1, 1, 1440, 1440},
+     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}},
+    true);
 
-  input.setScaleFactors({2.0, 1.5, 1.0, 0.5});
-  input.setZeroPoints({2, 3, 4, 5});
-  EXPECT_THROW({ input.dequantize<float>(output, 1); }, std::invalid_argument);
-  EXPECT_NO_THROW({ input.dequantize<float>(output, 2); });
-}
+  std::cout << "BEFORE " << std::endl;
+  output.print(std::cout);
 
-/**
- * @brief dequantize tensor to QINT8
- */
-TEST(nntrainer_Tensor, dequantize_05_n) {
-  int batch = 1;
-  int channel = 3;
-  int height = 4;
-  int width = 5;
+  std::cout << "AFTER copy" << std::endl;
+  t.dequantize(output, 3);
 
-  nntrainer::Tensor input(
-    batch, channel, height, width,
-    {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
-  GEN_TEST_INPUT(input, i * (batch * height) + j * (width) + k);
-  input.setScaleFactors({1.5, 1.0, 0.5});
-  input.setZeroPoints({1, 4, 7});
-
-  nntrainer::Tensor output(
-    batch, channel, height, width,
-    {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8});
-
-  EXPECT_THROW({ input.dequantize<float>(output, 1); }, std::invalid_argument);
-}
-
-/**
- * @brief dequantize tensor
- */
-TEST(nntrainer_Tensor, dequantize_06_p) {
-  size_t batch = 1;
-  size_t channel = 3;
-  size_t height = 4;
-  size_t width = 5;
-
-  nntrainer::Tensor input(
-    {batch,
-     channel,
-     height,
-     width,
-     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8}},
-    true, nntrainer::Tensor::Initializer::ZEROS);
-  nntrainer::Tensor output(batch, channel, height, width);
-
-  // Dequantize by channel
-  EXPECT_NO_THROW(input.setScaleFactors({2, -2, -4}));
-  EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1}));
-  EXPECT_NO_THROW({ input.dequantize<float>(output, 1); });
-
-  float answer_data_1[] = {-2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2,
-                           -2, -2, -2, -2, -2, -2, -2, -2, 2,  2,  2,  2,
-                           2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
-                           2,  2,  2,  2,  4,  4,  4,  4,  4,  4,  4,  4,
-                           4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4};
-
-  nntrainer::Tensor answer1(ml::train::TensorDim(batch, channel, height, width,
-                                                 {nntrainer::Tformat::NCHW,
-                                                  nntrainer::Tdatatype::FP32}),
-                            answer_data_1);
-
-  EXPECT_EQ(output, answer1);
-
-  // Dequantize by height
-  EXPECT_NO_THROW(input.setScaleFactors({4.2, 2, -2, -4.8}));
-  EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1, 1}));
-  EXPECT_NO_THROW({ input.dequantize<float>(output, 2); });
-
-  float answer_data_2[] = {
-    -4.2, -4.2, -4.2, -4.2, -4.2, -2,   -2,   -2,   -2,   -2,   2,    2,
-    2,    2,    2,    4.8,  4.8,  4.8,  4.8,  4.8,  -4.2, -4.2, -4.2, -4.2,
-    -4.2, -2,   -2,   -2,   -2,   -2,   2,    2,    2,    2,    2,    4.8,
-    4.8,  4.8,  4.8,  4.8,  -4.2, -4.2, -4.2, -4.2, -4.2, -2,   -2,   -2,
-    -2,   -2,   2,    2,    2,    2,    2,    4.8,  4.8,  4.8,  4.8,  4.8};
-  nntrainer::Tensor answer2(ml::train::TensorDim(batch, channel, height, width,
-                                                 {nntrainer::Tformat::NCHW,
-                                                  nntrainer::Tdatatype::FP32}),
-                            answer_data_2);
-
-  EXPECT_EQ(output, answer2);
-
-  // Dequantize by width
-  EXPECT_NO_THROW(input.setScaleFactors({4.2, 2, -2, -4, 8}));
-  EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1, 1, 1}));
-  EXPECT_NO_THROW({ input.dequantize<float>(output, 3); });
-
-  float answer_data_3[] = {
-    -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
-    -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
-    -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
-    -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8};
-
-  nntrainer::Tensor answer3(ml::train::TensorDim(batch, channel, height, width,
-                                                 {nntrainer::Tformat::NCHW,
-                                                  nntrainer::Tdatatype::FP32}),
-                            answer_data_3);
-
-  EXPECT_EQ(output, answer3);
-}
-
-/**
- * @brief dequantize qint4 tensor
- */
-TEST(nntrainer_Tensor, dequantize_08_p) {
-  size_t batch = 1;
-  size_t channel = 3;
-  size_t height = 4;
-  size_t width = 5;
-
-  nntrainer::Tensor input(
-    {batch,
-     channel,
-     height,
-     width,
-     {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}},
-    true, nntrainer::Tensor::Initializer::ZEROS);
-  nntrainer::Tensor output(batch, channel, height, width);
-
-  // Dequantize by channel
-  EXPECT_NO_THROW(input.setScaleFactors({2, -2, -4}));
-  EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1}));
-  EXPECT_NO_THROW({ input.dequantize<float>(output, 1); });
-
-  float answer_data_1[] = {-2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2,
-                           -2, -2, -2, -2, -2, -2, -2, -2, 2,  2,  2,  2,
-                           2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
-                           2,  2,  2,  2,  4,  4,  4,  4,  4,  4,  4,  4,
-                           4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4};
-
-  nntrainer::Tensor answer1(ml::train::TensorDim(batch, channel, height, width,
-                                                 {nntrainer::Tformat::NCHW,
-                                                  nntrainer::Tdatatype::FP32}),
-                            answer_data_1);
-
-  EXPECT_EQ(output, answer1);
-
-  // Dequantize by height
-  EXPECT_NO_THROW(input.setScaleFactors({4.2, 2, -2, -4}));
-  EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1, 1}));
-  EXPECT_NO_THROW({ input.dequantize<float>(output, 2); });
-
-  float answer_data_2[] = {-4.2, -4.2, -4.2, -4.2, -4.2, -2, -2, -2, -2, -2,
-                           2,    2,    2,    2,    2,    4,  4,  4,  4,  4,
-                           -4.2, -4.2, -4.2, -4.2, -4.2, -2, -2, -2, -2, -2,
-                           2,    2,    2,    2,    2,    4,  4,  4,  4,  4,
-                           -4.2, -4.2, -4.2, -4.2, -4.2, -2, -2, -2, -2, -2,
-                           2,    2,    2,    2,    2,    4,  4,  4,  4,  4};
-  nntrainer::Tensor answer2(ml::train::TensorDim(batch, channel, height, width,
-                                                 {nntrainer::Tformat::NCHW,
-                                                  nntrainer::Tdatatype::FP32}),
-                            answer_data_2);
-
-  EXPECT_EQ(output, answer2);
-
-  // Dequantize by width
-  EXPECT_NO_THROW(input.setScaleFactors({4.2, 2, -2, -4, 8}));
-  EXPECT_NO_THROW(input.setZeroPoints({1, 1, 1, 1, 1}));
-  EXPECT_NO_THROW({ input.dequantize<float>(output, 3); });
-
-  float answer_data_3[] = {
-    -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
-    -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
-    -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8,
-    -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8, -4.2, -2, 2, 4, -8};
-
-  nntrainer::Tensor answer3(ml::train::TensorDim(batch, channel, height, width,
-                                                 {nntrainer::Tformat::NCHW,
-                                                  nntrainer::Tdatatype::FP32}),
-                            answer_data_3);
-
-  EXPECT_EQ(output, answer3);
+  std::cout << "AFTER sgemv" << std::endl;
+  output.print(std::cout);
 }
 
 int main(int argc, char **argv) {

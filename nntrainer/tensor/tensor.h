@@ -41,6 +41,8 @@
 #include <tensor_dim.h>
 #include <util_func.h>
 
+#include <chrono>
+
 #ifdef DEBUG
 #define EXCEPT_WHEN_DEBUG
 #else
@@ -1999,93 +2001,7 @@ public:
    * @param[out] output Tensor to store the result
    * @retval     Dequantized Tensor
    */
-  void dequantize(Tensor &output, unsigned int axis) const {
-    if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
-      throw std::invalid_argument("Error: Tensor cannot be dequantized");
-    }
-
-    if (output.getDataType() == Tdatatype::QINT8 ||
-        output.getDataType() == Tdatatype::QINT4) {
-      throw std::invalid_argument("Error: Target datatype is quantized type");
-    }
-
-    if (getFormat() != output.getFormat())
-      throw std::invalid_argument("Error: TensorType do not match");
-
-    if (batch() != output.batch() || channel() != output.channel() ||
-        width() != output.width() || height() != output.height())
-      throw std::invalid_argument("Error: TensorDim do not match");
-
-    if (output.getDataType() == Tdatatype::FP32 && scale_factors_32.empty()) {
-      throw std::invalid_argument("Error: No scale factors");
-    }
-
-    if (output.getDataType() == Tdatatype::FP16 && scale_factors_16.empty()) {
-      throw std::invalid_argument("Error: No scale factors");
-    }
-
-    if (zero_points.empty()) {
-      throw std::invalid_argument("Error: No zero points");
-    }
-
-    if (axis == 0 && zero_points.size() != batch()) {
-      throw std::invalid_argument("Error: output axis do not match ");
-    }
-
-    if (axis == 1 && zero_points.size() != channel()) {
-      throw std::invalid_argument("Error: output axis do not match ");
-    }
-
-    if (axis == 2 && zero_points.size() != height()) {
-      throw std::invalid_argument("Error: output axis do not match ");
-    }
-
-    if (axis == 3 && zero_points.size() != width()) {
-      throw std::invalid_argument("Error: output axis do not match ");
-    }
-
-    if (output.getDataType() == Tdatatype::FP16) {
-#ifdef ENABLE_FP16
-      _FP16 *o_data = output.getData<_FP16>();
-      if (getDataType() == Tdatatype::QINT4) {
-        const uint8_t *data = getData<uint8_t>();
-        for (unsigned int i = 0; i < (output.getDim().getDataLen() + 1) / 2;
-             ++i) {
-
-          unsigned int idx = i * 2;
-          o_data[idx] =
-            ((data[i] >> 4) - zero_points[idx % zero_points.size()]) *
-            scale_factors_16[idx % scale_factors_16.size()];
-          if (idx + 1 < output.getDim().getDataLen())
-            o_data[idx + 1] =
-              ((data[i] & 0x0f) - zero_points[(idx + 1) % zero_points.size()]) *
-              scale_factors_16[(idx + 1) % scale_factors_16.size()];
-        }
-      }
-#else
-      throw std::invalid_argument("enble-fp16 is not set");
-#endif
-    } else if (output.getDataType() == Tdatatype::FP32) {
-      float *o_data = output.getData<float>();
-      if (getDataType() == Tdatatype::QINT4) {
-        const uint8_t *data = getData<uint8_t>();
-        for (unsigned int i = 0; i < (output.getDim().getDataLen() + 1) / 2;
-             ++i) {
-
-          unsigned int idx = i * 2;
-          o_data[idx] =
-            ((data[i] >> 4) - zero_points[idx % zero_points.size()]) *
-            scale_factors_32[idx % scale_factors_32.size()];
-          if (idx + 1 < output.getDim().getDataLen())
-            o_data[idx + 1] =
-              ((data[i] & 0x0f) - zero_points[(idx + 1) % zero_points.size()]) *
-              scale_factors_32[(idx + 1) % scale_factors_32.size()];
-        }
-      }
-    }
-
-    return;
-  }
+  void dequantize(Tensor &output, unsigned int axis) const;
 
   void flate(Tensor &output) const;
 

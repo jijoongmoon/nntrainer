@@ -35,8 +35,8 @@ enum CBLAS_TRANSPOSE {
 #include <helper_functions.h>
 #endif
 
+#include <cstdint>
 #include <tensor_dim.h>
-
 namespace nntrainer {
 
 #ifdef ENABLE_FP16
@@ -44,8 +44,10 @@ void sscal(const unsigned int N, const float alpha, _FP16 *X, const int incX);
 _FP16 snrm2(const int N, const _FP16 *X, const int incX);
 void scopy(const unsigned int N, const _FP16 *X, const int incX, _FP16 *Y,
            const int intY);
+void scopy(const unsigned int N, const uint8_t *X, const int incX, _FP16 *Y,
+           const int intY);
 _FP16 sdot(const unsigned int N, const _FP16 *X, const unsigned int incX,
-            const _FP16 *Y, const unsigned int incY);
+           const _FP16 *Y, const unsigned int incY);
 void saxpy(const unsigned int N, const float alpha, const _FP16 *X,
            const int incX, _FP16 *Y, const int incY);
 void sgemm(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
@@ -57,6 +59,7 @@ void sgemv(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, const unsigned int M,
            const unsigned int N, const float alpha, const _FP16 *A,
            const unsigned int lda, const _FP16 *X, const int incX,
            const float beta, _FP16 *Y, const int incY);
+void ewvm(const unsigned int N, const _FP16 *X, const _FP16 *Y, _FP16 *Z);
 unsigned int isamax(const unsigned int N, const _FP16 *X, const int incX);
 #endif
 
