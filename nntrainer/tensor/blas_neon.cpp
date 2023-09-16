@@ -288,6 +288,8 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
                      uint32_t cols, float alpha, float beta) {
   const __fp16 *__restrict x;
 
+  // std::cout << rows << " X " << cols << std::endl;
+
   float16x8_t v_beta = vmovq_n_f16(beta);
 
   for (unsigned int i = 0; i < rows; i += 8) {
@@ -298,6 +300,12 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
 
   float16x8_t v_alpha = vmovq_n_f16(alpha);
 
+  float16x8_t x0_7 = vld1q_f16(&X[0]);
+  std::cout << "x0_7" << std::endl;
+  for (int i = 0; i < 8; ++i) {
+    std::cout << float(x0_7[i]) << "\t";
+  }
+  std::cout << std::endl;
   if (cols % 32 == 0) {
     for (unsigned i = 0; i < cols; i += 32) {
       float16x8_t x0_7 = vld1q_f16(&X[i]);
@@ -321,6 +329,16 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
 
       float16x4_t y0_high;
       float16x4_t y0_low;
+      if (i == 0) {
+        w = &A[0 * cols + i];
+        wvec0_7 = vld1q_f16(&w[0]);
+        std::cout << "w0_7" << std::endl;
+        for (int z = 0; z < 8; ++z) {
+          std::cout << float(wvec0_7[z]) << "\t";
+        }
+        std::cout << std::endl;
+      }
+
       for (unsigned int j = 0; j < rows; ++j) {
         w = &A[j * cols + i];
         y0 = vmovq_n_f16(0);
@@ -331,6 +349,13 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
         wvec24_31 = vld1q_f16(&w[24]);
 
         y0 = vfmaq_f16(y0, wvec0_7, x0_7);
+        if (i == 0 && j == 0) {
+          std::cout << "y0" << std::endl;
+          for (int z = 0; z < 8; ++z) {
+            std::cout << y0[z] << "\t";
+          }
+          std::cout << std::endl;
+        }
         y0 = vfmaq_f16(y0, wvec8_15, x8_15);
         y0 = vfmaq_f16(y0, wvec16_23, x16_23);
         y0 = vfmaq_f16(y0, wvec24_31, x24_31);
@@ -425,12 +450,17 @@ void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
   const float16x8_t v_alpha = vmovq_n_f16(alpha);
 
   if (cols % 32 == 0) {
-
     for (unsigned int j = 0; j < cols; j += 8) {
       float16x8_t y0_7 = vld1q_f16(&Y[j]);
       y0_7 = vmulq_f16(y0_7, v_beta);
       vst1q_f16(&Y[j], y0_7);
     }
+    std::cout << "X[0] : " << float(X[0]) << std::endl;
+    float16x8_t wvec0_7 = vld1q_f16(&A[0]);
+    for (int z = 0; z < 8; ++z) {
+      std::cout << "Wvec : " << wvec0_7[z] << "\t";
+    }
+    std::cout << std::endl;
 
     for (unsigned int i = 0; i < rows; ++i) {
       __fp16 x = alpha * X[i];
@@ -457,6 +487,13 @@ void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
         y8_15 = vfmaq_n_f16(y8_15, wvec8_15, x);
         y16_23 = vfmaq_n_f16(y16_23, wvec16_23, x);
         y24_31 = vfmaq_n_f16(y24_31, wvec24_31, x);
+
+        if (i == 0 && j == 0) {
+          for (int z = 0; z < 8; ++z) {
+            std::cout << "y0_7 : " << y0_7[z] << "\t";
+          }
+          std::cout << std::endl;
+        }
 
         vst1q_f16(&y[0], y0_7);
         vst1q_f16(&y[8], y8_15);
@@ -701,6 +738,84 @@ void scopy_neon_fp16(const unsigned int N, const __fp16 *X, __fp16 *Y) {
     Y[idx] = X[idx];
 }
 
+void scopy_neon_int4(const unsigned int N, const uint8_t *X, __fp16 *Y) {
+
+  unsigned int idx = 0;
+  std::cout << "changed" << std::endl;
+
+  // keep in mind that : len(X) = N, and len(Y) = 2*N
+
+  // processing batch of 16
+
+  float16x8_t y0, y1, y2, y3;
+  float16x4_t yh0, yh1;
+
+  uint8_t low0, low1, high0, high1;
+
+  for (; (N - idx) >= 16; idx += 16) {
+    uint8x16_t batch = vld1q_u8(&X[idx]);
+
+    uint8x8_t low = vget_low_u8(batch);
+    uint8x8_t high = vget_high_u8(batch);
+
+    for (int i = 0; i < 8; ++i) {
+      low0 = low[i] >> 4;
+      low1 = low[i] & 0x0f;
+
+      high0 = high[i] >> 4;
+      high1 = high[i] & 0x0f;
+
+      if (i < 4) {
+        y0[2 * i] = low0;
+        y0[2 * i + 1] = low1;
+      } else {
+        y1[2 * (i - 4)] = low0;
+        y1[2 * (i - 4) + 1] = low1;
+      }
+
+      if (i < 4) {
+        y2[2 * i] = high0;
+        y2[2 * i + 1] = high1;
+      } else {
+        y3[2 * (i - 4)] = high0;
+        y3[2 * (i - 4) + 1] = high1;
+      }
+    }
+
+    vst1q_f16(&Y[2 * idx], y0);
+    vst1q_f16(&Y[2 * idx + 8], y1);
+    vst1q_f16(&Y[2 * idx + 16], y2);
+    vst1q_f16(&Y[2 * idx + 24], y3);
+  }
+
+  // processing remaining batch of 8
+  for (; (N - idx) >= 8; idx += 8) {
+    int8x8_t batch = vld1_u8(&X[idx]);
+
+    for (int i = 0; i < 8; ++i) {
+      low0 = batch[i] >> 4;
+      low1 = batch[i] & 0x0f;
+
+      if (i < 4) {
+        y0[2 * i] = low0;
+        y0[2 * i + 1] = low1;
+      } else {
+        y1[2 * (i - 4)] = low0;
+        y1[2 * (i - 4) + 1] = low1;
+      }
+    }
+
+    vst1q_f16(&Y[2 * idx], y0);
+    vst1q_f16(&Y[2 * idx + 8], y1);
+  }
+
+  // pocessing remaining values
+  for (; idx < N; idx++) {
+    Y[2 * idx] = X[idx] >> 4;
+    Y[2 * idx + 1] = X[idx] & 0x0f;
+  }
+}
+
 unsigned int isamax_neon_fp16(const unsigned int N, const __fp16 *X) {
 
   unsigned int retIdx;
@@ -787,7 +902,7 @@ void sgemm_neon_fp16(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
 void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
                              uint32_t M, uint32_t N, uint32_t K, float alpha,
                              float beta) {
-  if (N%8 == 0 && K % 16 == 0) {
+  if (N % 8 == 0 && K % 16 == 0) {
     for (unsigned int k = 0; k < K; k += 16) {
       for (unsigned int m = 0; m < M; m++) {
         __fp16 a0 = alpha * A[m * K + k];
@@ -1081,7 +1196,6 @@ void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, __fp16 *C,
         c = vfmaq_n_f16(c, b, a);
         vst1q_f16(valsC, c);
 
-
         for (unsigned int idx = n; idx < N; idx++) {
           C[m * N + idx] = valsC[idx - n];
         }
@@ -1203,6 +1317,23 @@ void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B, __fp16 *C,
     }
   }
 }
+
+void elementwise_vector_multiplication_neon_fp16(const unsigned int N, const __fp16 *X,
+                                                 const __fp16 *Y, __fp16 *Z) {
+  int i = 0;
+  for (; N - i >= 8; i += 8) {
+    float16x8_t x0_7 = vld1q_f16(&X[i]);
+    float16x8_t y0_7 = vld1q_f16(&Y[i]);
+    float16x8_t z0_7 = vmulq_f16(x0_7, y0_7);
+
+    vst1q_f16(&Z[i], z0_7);
+  }
+  while (i < N){
+    Z[i] = X[i] * Y[i];
+    ++i;
+  }
+}
+
 #endif
 } // namespace nntrainer::neon
 

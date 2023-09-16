@@ -853,8 +853,7 @@ Tensor &Tensor::multiply(Tensor const &m, Tensor &output,
                  _FP16 *out_buf) {
       if (e.strides[3] == 1 && output.strides[3] == 1 && strides[3] == 1 &&
           beta == 0.0) {
-        std::transform(buf, buf + e.buffer_size, m_buf, out_buf,
-                       std::multiplies<_FP16>());
+        ewvm(e.buffer_size, buf, m_buf, out_buf);
       } else {
         for (unsigned int i = 0; i < e.buffer_size; ++i) {
           *out_buf = *buf * *m_buf + static_cast<_FP16>(beta) * *out_buf;
@@ -3678,15 +3677,105 @@ void Tensor::flate(Tensor &output) const {
            ++i) {
 
         unsigned int idx = i * 2;
-        o_data[idx] = decode_qint(data[i], true);
+        o_data[idx] = data[i] >> 4;
         if (idx + 1 < output.getDim().getDataLen())
-          o_data[idx + 1] = decode_qint(data[i], false);
+          o_data[idx + 1] = data[i] & 0x0f;
       }
     }
 #else
     ml_loge("%s", "Error: enable-fp16 is not enabled");
 #endif
   }
+}
+
+void Tensor::dequantize(Tensor &output, unsigned int axis) const {
+  if (getDataType() == Tdatatype::FP32 || getDataType() == Tdatatype::FP16) {
+    throw std::invalid_argument("Error: Tensor cannot be dequantized");
+  }
+
+  if (output.getDataType() == Tdatatype::QINT8 ||
+      output.getDataType() == Tdatatype::QINT4) {
+    throw std::invalid_argument("Error: Target datatype is quantized type");
+  }
+
+  if (getFormat() != output.getFormat())
+    throw std::invalid_argument("Error: TensorType do not match");
+
+  if (batch() != output.batch() || channel() != output.channel() ||
+      width() != output.width() || height() != output.height())
+    throw std::invalid_argument("Error: TensorDim do not match");
+
+  if (output.getDataType() == Tdatatype::FP32 && scale_factors_32.empty()) {
+    throw std::invalid_argument("Error: No scale factors");
+  }
+
+  if (output.getDataType() == Tdatatype::FP16 && scale_factors_16.empty()) {
+    throw std::invalid_argument("Error: No scale factors");
+  }
+
+  if (zero_points.empty()) {
+    throw std::invalid_argument("Error: No zero points");
+  }
+
+  if (axis == 0 && zero_points.size() != batch()) {
+    throw std::invalid_argument("Error: output axis do not match ");
+  }
+
+  if (axis == 1 && zero_points.size() != channel()) {
+    throw std::invalid_argument("Error: output axis do not match ");
+  }
+
+  if (axis == 2 && zero_points.size() != height()) {
+    throw std::invalid_argument("Error: output axis do not match ");
+  }
+
+  if (axis == 3 && zero_points.size() != width()) {
+    throw std::invalid_argument("Error: output axis do not match ");
+  }
+
+  if (output.getDataType() == Tdatatype::FP16) {
+#ifdef ENABLE_FP16
+    auto start = std::chrono::high_resolution_clock::now();
+    // flate(output);
+    // _FP16 *o_data =
+    scopy((size() + 1) / 2, getData<uint8_t>(), 1, output.getData<_FP16>(), 1);
+
+    std::vector<_FP16> zero_points_16(zero_points.begin(), zero_points.end());
+    Tensor zero_points_fp16(
+      {{1, 1, 1, zero_points.size()}, {getFormat(), Tdatatype::FP16}},
+      zero_points_16.data());
+
+    Tensor scale_factors_fp16(
+      {{1, 1, 1, scale_factors_16.size()}, {getFormat(), Tdatatype::FP16}},
+      scale_factors_16.data());
+
+    output.subtract_i(zero_points_fp16);
+
+    output.multiply_i(scale_factors_fp16);
+
+    auto stop = std::chrono::high_resolution_clock::now();
+    auto duration =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start);
+    std::cout << duration.count() << " ns" << std::endl;
+#else
+    throw std::invalid_argument("enble-fp16 is not set");
+#endif
+  } else if (output.getDataType() == Tdatatype::FP32) {
+    flate(output);
+
+    std::vector<float> zero_points_32(zero_points.begin(), zero_points.end());
+    Tensor zero_points_fp32(
+      {{1, 1, 1, zero_points.size()}, {getFormat(), Tdatatype::FP32}},
+      zero_points_32.data());
+    Tensor scale_factors_fp32(
+      {{1, 1, 1, scale_factors_32.size()}, {getFormat(), Tdatatype::FP32}},
+      scale_factors_32.data());
+
+    output.subtract_i(zero_points_fp32);
+    output.multiply_i(scale_factors_fp32);
+  }
+
+  return;
 }
 
 std::vector<uint8_t> Tensor::getZeroPoints() const { return zero_points; }

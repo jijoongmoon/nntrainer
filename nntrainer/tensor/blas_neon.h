@@ -61,6 +61,8 @@ void sgemv_transpose_neon(const float *A, const float *X, float *Y,
 void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
                      uint32_t cols, float alpha, float beta);
 
+void elementwise_vector_multiplication_neon_fp16(const unsigned N, const __fp16 *X, const __fp16 *Y, __fp16 *Z);
+
 /**
  * @brief     transposed sgemv computation with neon
  *            Y = alpha*transpose(A)*X
@@ -119,6 +121,14 @@ void sscal_neon_fp16(const unsigned int N, __fp16 *X, const float alpha);
 void scopy_neon_fp16(const unsigned int N, const __fp16 *X, __fp16 *Y);
 
 /**
+ * @brief     copy function with neon: Y = X
+ * @param[in] N number of elements in X
+ * @param[in] X __fp16 * for Vector X
+ * @param[in] Y uint8_t * for Vector Y
+ */
+void scopy_neon_int4(const unsigned int N, const uint8_t *X, __fp16 *Y);
+
+/**
  * @brief     isamax function with neon: index of firt maxima
  * @param[in] N number of elements in X
  * @param[in] X __fp16 * for Vector X
@@ -153,8 +163,8 @@ void sgemm_neon_fp16(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
  * @param[in] beta float number
  */
 void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
-                            uint32_t M, uint32_t N, uint32_t K, float alpha,
-                            float beta);
+                             uint32_t M, uint32_t N, uint32_t K, float alpha,
+                             float beta);
 /**
  * @brief     sgemm computation with neon : Y = alpha*op(A)*op(B) + beta*C,
  * where op(X) is one of X or X**T
@@ -198,8 +208,8 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
  * @param[in] beta float number
  */
 void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B, __fp16 *C,
-                            uint32_t M, uint32_t N, uint32_t K, float alpha,
-                            float beta, uint32_t idx);
+                             uint32_t M, uint32_t N, uint32_t K, float alpha,
+                             float beta, uint32_t idx);
 #endif
 
 } // namespace nntrainer::neon

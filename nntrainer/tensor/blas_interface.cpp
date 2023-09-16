@@ -12,8 +12,8 @@
  */
 
 #include <blas_interface.h>
-#include <nntrainer_error.h>
 #include <iostream>
+#include <nntrainer_error.h>
 
 #ifdef USE__FP16
 #include <blas_neon.h>
@@ -104,6 +104,8 @@ static void sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
   if (TransA == CblasTrans) {
 #ifdef USE__FP16
     if (incX == 1 && incY == 1 && (N % 16 == 0 || N % 8 == 0)) {
+      std::cout << M << " X " << N << " Trans" << std::endl;
+
       nntrainer::neon::sgemv_transpose_neon_fp16(A, X, Y, M, N, alpha, beta);
     } else {
       sgemv_loop_fp16(i, j, N, M);
@@ -114,6 +116,7 @@ static void sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
   } else {
 #ifdef USE__FP16
     if (incX == 1 && incY == 1 && (N % 16 == 0 || N % 8 == 0)) {
+      std::cout << M << " X " << N << " noTrans" << std::endl;
       nntrainer::neon::sgemv_neon_fp16(A, X, Y, M, N, alpha, beta);
     } else {
       sgemv_loop_fp16(j, i, M, N);
@@ -167,6 +170,35 @@ static void scopy_FP16(const unsigned int N, const _FP16 *X, const int incX,
 #endif
 }
 
+static void scopy_INT4(const unsigned int N, const uint8_t *X, const int incX,
+                       _FP16 *Y, const int incY) {
+  unsigned int incy = abs(incY);
+  unsigned int incx = abs(incX);
+
+#ifdef USE__FP16
+  if (incX == 1 && incY == 1) {
+    nntrainer::neon::scopy_neon_int4(N, X, Y);
+  } else {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incy] = X[i * incx];
+  }
+#else
+  for (unsigned int i = 0; i < N; ++i)
+    Y[i * incy] = X[i * incx];
+#endif
+}
+
+static void ewvm_FP16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                      _FP16 *Z) {
+#ifdef USE__FP16
+  if (N % 8 == 0) {
+    nntrainer::neon::elementwise_vector_multiplication_neon_fp16(N, X, Y, Z);
+  } else {
+    throw std::invalid_argument("Error: 8-divisible case is supported only!");
+  }
+#endif
+}
+
 void sscal(const unsigned int N, const float alpha, _FP16 *X, const int incX) {
   unsigned int incx = abs(incX);
 
@@ -215,15 +247,15 @@ static void sgemm_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
 
 #ifdef USE__FP16
   if ((N % 8 == 0) && (K % 8 == 0)) {
-  nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
-				   TransA == CblasTrans,
-				   TransB == CblasTrans);
+    nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
+                                     TransA == CblasTrans,
+                                     TransB == CblasTrans);
   } else {
-    std::cout << M << " " << K << " "<< N<<std::endl;
-     sgemm_loop_fp16();
+    std::cout << M << " " << K << " " << N << std::endl;
+    sgemm_loop_fp16();
   }
 #else
-   sgemm_loop_fp16();
+  sgemm_loop_fp16();
 #endif
 }
 
@@ -268,7 +300,7 @@ void sgemm(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
            const float alpha, const _FP16 *A, const unsigned int lda,
            const _FP16 *B, const unsigned int ldb, const float beta, _FP16 *C,
            const unsigned int ldc) {
-    sgemm_FP16(order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C,
+  sgemm_FP16(order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C,
              ldc);
 }
 
@@ -276,6 +308,16 @@ void scopy(const unsigned int N, const _FP16 *X, const int incX, _FP16 *Y,
            const int incY) {
   scopy_FP16(N, X, incX, Y, incY);
 
+} // namespace nntrainer
+
+void scopy(const unsigned int N, const uint8_t *X, const int incX, _FP16 *Y,
+           const int incY) {
+  scopy_INT4(N, X, incX, Y, incY);
+
+} 
+
+void ewvm(const unsigned int N, const _FP16 *X, const _FP16 *Y, _FP16 *Z) {
+  ewvm_FP16(N, X, Y, Z);
 } // namespace nntrainer
 
 _FP16 snrm2(const int N, const _FP16 *X, const int incX) {
