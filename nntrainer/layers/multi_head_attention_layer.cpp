@@ -607,7 +607,6 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   RunLayerContext &context, unsigned int _from, unsigned int _to,
   bool training) {
 
-  std::cout << _from<<" "  << _to<<std::endl;
   unsigned int max_timestep =
     std::get<props::MaxTimestep>(multi_head_attention_props).get();
 
@@ -804,7 +803,6 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   const unsigned int query_height = query_dim.height();
   const unsigned int key_height = key_dim.height();
   const unsigned int value_height = value_dim.height();
-  std::cout << "ready to copute" <<std::endl;
   // clock_t start, finish;
 
   // start = clock();
@@ -960,7 +958,7 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
     initial_incremental_forwarding(context, _from, _to, training);
     return;
   }
-
+  // auto start = std::chrono::high_resolution_clock::now();
   unsigned int max_timestep =
     std::get<props::MaxTimestep>(multi_head_attention_props).get();
 
@@ -1335,6 +1333,11 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
 #endif
     }
   }
+
+    // auto stop = std::chrono::high_resolution_clock::now();
+    // auto duration =
+    //   std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+    // std::cout << "Compute MHA : "<< duration.count() << " ms" << std::endl;  
   // finish=clock();
   // std::cout<<"MHA finish: " << (double)(finish-allstart)<<std::endl;
 }

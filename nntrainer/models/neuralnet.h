@@ -240,7 +240,7 @@ public:
    */
   sharedConstTensors
   incremental_forwarding(unsigned int from, unsigned int to,
-                         bool training = true,
+                         bool training = true, 
                          std::function<bool(void *userdata)> stop_cb =
                            [](void *user_data) { return false; },
                          void *user_data = nullptr);
@@ -375,7 +375,7 @@ s   * @retval shared_ptr<const Tensor>
    */
   sharedConstTensors incremental_inference(sharedConstTensors X,
                                            unsigned int init_seq_len,
-                                           unsigned int from, unsigned int to);
+                                           unsigned int from, unsigned int to );
 
   /**
    * @brief     Run NeuralNetwork incremental inference
@@ -619,6 +619,11 @@ s   * @retval shared_ptr<const Tensor>
    */
   void exports(const ml::train::ExportMethods &method,
                const std::string file_path) override;
+
+
+  float getCompleteness(){
+    return model_graph.getCompleteness();
+  }
 
 private:
   using FlexiblePropTypes =

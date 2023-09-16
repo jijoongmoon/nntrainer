@@ -189,14 +189,22 @@ static void scopy_INT4(const unsigned int N, const uint8_t *X, const int incX,
 static void ewvm_FP16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
                       _FP16 *Z) {
 #ifdef USE__FP16
-  if (N % 8 == 0) {
     nntrainer::neon::elementwise_vector_multiplication_neon_fp16(N, X, Y, Z);
-  } else {
-    throw std::invalid_argument("Error: 8-divisible case is supported only!");
-  }
+#else
+  for (unsigned int i = 0; i < N; ++i)
+    Z[i] = X[i] * Y[i];
 #endif
 }
 
+static void ewva_FP16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                      _FP16 *Z) {
+#ifdef USE__FP16
+    nntrainer::neon::elementwise_vector_addition_neon_fp16(N, X, Y, Z);
+#else
+  for (unsigned int i = 0; i < N; ++i)
+    Z[i] = X[i] + Y[i];
+#endif
+}
 void sscal(const unsigned int N, const float alpha, _FP16 *X, const int incX) {
   unsigned int incx = abs(incX);
 
@@ -247,8 +255,6 @@ static void sgemm_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
     nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
                                      TransA == CblasTrans,
                                      TransB == CblasTrans);
-
-
 #else
   sgemm_loop_fp16();
 #endif
@@ -314,6 +320,11 @@ void scopy(const unsigned int N, const uint8_t *X, const int incX, _FP16 *Y,
 void ewvm(const unsigned int N, const _FP16 *X, const _FP16 *Y, _FP16 *Z) {
   ewvm_FP16(N, X, Y, Z);
 } // namespace nntrainer
+
+void ewva(const unsigned int N, const _FP16 *X, const _FP16 *Y, _FP16 *Z) {
+  ewva_FP16(N, X, Y, Z);
+} // namespace nntrainer
+  
 
 _FP16 snrm2(const int N, const _FP16 *X, const int incX) {
   return snrm2_FP16(N, X, incX);

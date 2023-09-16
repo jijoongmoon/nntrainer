@@ -60,6 +60,9 @@ void sgemv(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, const unsigned int M,
            const unsigned int lda, const _FP16 *X, const int incX,
            const float beta, _FP16 *Y, const int incY);
 void ewvm(const unsigned int N, const _FP16 *X, const _FP16 *Y, _FP16 *Z);
+  
+void ewva(const unsigned int N, const _FP16 *X, const _FP16 *Y, _FP16 *Z);
+  
 unsigned int isamax(const unsigned int N, const _FP16 *X, const int incX);
 #endif
 
