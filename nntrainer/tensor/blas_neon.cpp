@@ -1309,6 +1309,23 @@ void elementwise_vector_multiplication_neon_fp16(const unsigned int N, const __f
   }
 }
 
+void elementwise_vector_addition_neon_fp16(const unsigned int N, const __fp16 *X,
+                                                 const __fp16 *Y, __fp16 *Z) {
+  int i = 0;
+  for (; N - i >= 8; i += 8) {
+    float16x8_t x0_7 = vld1q_f16(&X[i]);
+    float16x8_t y0_7 = vld1q_f16(&Y[i]);
+    float16x8_t z0_7 = vaddq_f16(x0_7, y0_7);
+
+    vst1q_f16(&Z[i], z0_7);
+  }
+  while (i < N){
+    Z[i] = X[i] * Y[i];
+    ++i;
+  }
+}
+  
+
 #endif
 } // namespace nntrainer::neon
 

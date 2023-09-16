@@ -1097,8 +1097,9 @@ Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
                  _FP16 *out_buf) {
       if (e.strides[3] == 1 && strides[3] == 1 && strides[3] == 1 &&
           alpha == 0) {
-        std::transform(buf, buf + e.buffer_size, m_buf, out_buf,
-                       std::plus<_FP16>());
+        ewva(e.buffer_size, buf, m_buf, out_buf);	
+        // std::transform(buf, buf + e.buffer_size, m_buf, out_buf,
+        //                std::plus<_FP16>());
       } else {
         for (unsigned int i = 0; i < e.buffer_size; ++i) {
           *out_buf = *buf + *m_buf * static_cast<_FP16>(alpha);
@@ -3771,7 +3772,7 @@ void Tensor::dequantize(Tensor &output, unsigned int axis) const {
 
   if (output.getDataType() == Tdatatype::FP16) {
 #ifdef ENABLE_FP16
-    // auto start = std::chrono::high_resolution_clock::now();
+    auto start = std::chrono::high_resolution_clock::now();
     // flate(output);
     // _FP16 *o_data =
     scopy((size() + 1) / 2, getData<uint8_t>(), 1, output.getData<_FP16>(), 1);
@@ -3789,10 +3790,10 @@ void Tensor::dequantize(Tensor &output, unsigned int axis) const {
 
     output.multiply_i(scale_factors_fp16);
 
-    // auto stop = std::chrono::high_resolution_clock::now();
-    // auto duration =
-    //   std::chrono::duration_cast<std::chrono::miliseconds>(stop - start);
-    // std::cout << duration.count() << " ns" << std::endl;
+    auto stop = std::chrono::high_resolution_clock::now();
+    auto duration =
+      std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+    std::cout << duration.count() << " ms" << std::endl;
 #else
     throw std::invalid_argument("enble-fp16 is not set");
 #endif
