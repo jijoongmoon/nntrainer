@@ -301,11 +301,8 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
   float16x8_t v_alpha = vmovq_n_f16(alpha);
 
   float16x8_t x0_7 = vld1q_f16(&X[0]);
-  std::cout << "x0_7" << std::endl;
   for (int i = 0; i < 8; ++i) {
-    std::cout << float(x0_7[i]) << "\t";
   }
-  std::cout << std::endl;
   if (cols % 32 == 0) {
     for (unsigned i = 0; i < cols; i += 32) {
       float16x8_t x0_7 = vld1q_f16(&X[i]);
@@ -332,11 +329,8 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
       if (i == 0) {
         w = &A[0 * cols + i];
         wvec0_7 = vld1q_f16(&w[0]);
-        std::cout << "w0_7" << std::endl;
         for (int z = 0; z < 8; ++z) {
-          std::cout << float(wvec0_7[z]) << "\t";
         }
-        std::cout << std::endl;
       }
 
       for (unsigned int j = 0; j < rows; ++j) {
@@ -350,11 +344,8 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
 
         y0 = vfmaq_f16(y0, wvec0_7, x0_7);
         if (i == 0 && j == 0) {
-          std::cout << "y0" << std::endl;
           for (int z = 0; z < 8; ++z) {
-            std::cout << y0[z] << "\t";
           }
-          std::cout << std::endl;
         }
         y0 = vfmaq_f16(y0, wvec8_15, x8_15);
         y0 = vfmaq_f16(y0, wvec16_23, x16_23);
@@ -455,12 +446,9 @@ void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
       y0_7 = vmulq_f16(y0_7, v_beta);
       vst1q_f16(&Y[j], y0_7);
     }
-    std::cout << "X[0] : " << float(X[0]) << std::endl;
     float16x8_t wvec0_7 = vld1q_f16(&A[0]);
     for (int z = 0; z < 8; ++z) {
-      std::cout << "Wvec : " << wvec0_7[z] << "\t";
     }
-    std::cout << std::endl;
 
     for (unsigned int i = 0; i < rows; ++i) {
       __fp16 x = alpha * X[i];
@@ -490,9 +478,7 @@ void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
 
         if (i == 0 && j == 0) {
           for (int z = 0; z < 8; ++z) {
-            std::cout << "y0_7 : " << y0_7[z] << "\t";
           }
-          std::cout << std::endl;
         }
 
         vst1q_f16(&y[0], y0_7);
@@ -741,7 +727,6 @@ void scopy_neon_fp16(const unsigned int N, const __fp16 *X, __fp16 *Y) {
 void scopy_neon_int4(const unsigned int N, const uint8_t *X, __fp16 *Y) {
 
   unsigned int idx = 0;
-  std::cout << "changed" << std::endl;
 
   // keep in mind that : len(X) = N, and len(Y) = 2*N
 

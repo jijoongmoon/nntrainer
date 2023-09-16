@@ -104,7 +104,6 @@ static void sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
   if (TransA == CblasTrans) {
 #ifdef USE__FP16
     if (incX == 1 && incY == 1 && (N % 16 == 0 || N % 8 == 0)) {
-      std::cout << M << " X " << N << " Trans" << std::endl;
 
       nntrainer::neon::sgemv_transpose_neon_fp16(A, X, Y, M, N, alpha, beta);
     } else {
@@ -116,7 +115,6 @@ static void sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
   } else {
 #ifdef USE__FP16
     if (incX == 1 && incY == 1 && (N % 16 == 0 || N % 8 == 0)) {
-      std::cout << M << " X " << N << " noTrans" << std::endl;
       nntrainer::neon::sgemv_neon_fp16(A, X, Y, M, N, alpha, beta);
     } else {
       sgemv_loop_fp16(j, i, M, N);
@@ -569,7 +567,6 @@ void sgemm(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
 
   } else if (d_type == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    std::cout << "sgemm_FP16 called 2 " << std::endl;
     sgemm_FP16(
       order, TransA, TransB, M, N, K, alpha, static_cast<const _FP16 *>(A), lda,
       static_cast<const _FP16 *>(B), ldb, beta, static_cast<_FP16 *>(C), ldc);
