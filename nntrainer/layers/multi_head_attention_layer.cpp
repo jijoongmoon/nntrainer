@@ -606,7 +606,7 @@ void MultiHeadAttentionLayer::forwarding(RunLayerContext &context,
 void MultiHeadAttentionLayer::initial_incremental_forwarding(
   RunLayerContext &context, unsigned int _from, unsigned int _to,
   bool training) {
-
+  std::cout << "initial_incremental_forwarding " << _from<< " " << _to << std::endl;
   unsigned int max_timestep =
     std::get<props::MaxTimestep>(multi_head_attention_props).get();
 
@@ -803,52 +803,8 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   const unsigned int query_height = query_dim.height();
   const unsigned int key_height = key_dim.height();
   const unsigned int value_height = value_dim.height();
-  // clock_t start, finish;
 
-  // start = clock();
-  //  This is multi threading
-  // std::vector<std::thread> workers;
-
-  // auto query_job = [&]() {
-  //   query.dot(query_fc_weight, projected_query_step);
-  //   if (!disable_bias) {
-  //     projected_query_step.add_i(query_fc_bias);
-  //   }
-  // };
-
-  // auto key_job = [&]() {
-  //   key.dot(key_fc_weight, cache_key_step);
-  //   if (!disable_bias) {
-  //     cache_key_step.add_i(key_fc_bias);
-  //   }
-  // };
-
-  auto value_job = [&]() {
   
-  value_step.dot(value_fc_weight, cache_value_step);
-  if (!disable_bias) {
-    cache_value_step.add_i(value_fc_bias);
-  }
-
-  cached_value.reshape(
-    TensorDim({batch_size, to, num_heads, projected_value_dim_prop}));
-
-  cached_value.transpose("1:0:2", projected_value_step);
-
-  projected_value_step.reshape(
-    TensorDim({batch_size * num_heads, 1, to, projected_value_dim_prop}));
-  };
-
-  // std::thread t1(value_job);
-  value_job();
-
-  // workers.push_back(std::thread(query_job));
-  // workers.push_back(std::thread(key_job));
-  // workers.push_back(std::thread(value_job));
-
-  // std::for_each(workers.begin(), workers.end(),
-  //               std::mem_fn(&std::thread::join));
-
   query_step.dot(query_fc_weight, projected_query_step);
   if (!disable_bias) {
     projected_query_step.add_i(query_fc_bias);
@@ -857,28 +813,43 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   if (!disable_bias) {
     cache_key_step.add_i(key_fc_bias);
   }
-
+  value_step.dot(value_fc_weight, cache_value_step);
+  if (!disable_bias) {
+    cache_value_step.add_i(value_fc_bias);
+  }
 
   apply_rotary_emb_tensor(projected_query_step, projected_query_dim_prop,
                           _from);
   apply_rotary_emb_tensor(cache_key_step, projected_key_dim_prop, _from);
+  
 
 
   projected_query_step.reshape(
     TensorDim({batch_size, to, num_heads, projected_query_dim_prop}));
+  
   cached_key.reshape(
     TensorDim({batch_size, to, num_heads, projected_key_dim_prop}));
 
+  cached_value.reshape(
+    TensorDim({batch_size, to, num_heads, projected_value_dim_prop}));
+
+
+
   projected_query_step.transpose("1:0:2", projected_query_step);
   cached_key.transpose("1:0:2", projected_key_step);
-
+  cached_value.transpose("1:0:2", projected_value_step);
 
   projected_query_step.reshape(
     TensorDim({batch_size * num_heads, 1, to, projected_query_dim_prop}));
   projected_key_step.reshape(
     TensorDim({batch_size * num_heads, 1, to, projected_key_dim_prop}));
+  projected_value_step.reshape(
+    TensorDim({batch_size * num_heads, 1, to, projected_value_dim_prop}));
+
   
   attention_weight_step.reshape(TensorDim({batch_size * num_heads, 1, to, to}));
+  attention_output_step.reshape(
+    TensorDim({batch_size * num_heads, 1, to, projected_value_dim_prop}));
 
   /** scaled dot product attention */
   projected_query_step.dotBatched(projected_key_step, attention_weight_step,
@@ -913,14 +884,6 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
   }
 
   sm.run_fn(attention_weight_step, attention_weight_step);
-  
-  attention_output_step.reshape(
-    TensorDim({batch_size * num_heads, 1, to, projected_value_dim_prop}));
-  
-  // t1.join();
-
-  // finish = clock();
-  // std::cout << (double) (finish - start) << std::endl;
 
   attention_weight_step.dotBatched(projected_value_step, attention_output_step);
 
@@ -937,13 +900,13 @@ void MultiHeadAttentionLayer::initial_incremental_forwarding(
     output_step.add_i(fc_bias);
   }
 
-  if (layer_progress == 28)
-    layer_progress = 0;
-  layer_progress++;
+  // if (layer_progress == 28)
+  //   layer_progress = 0;
+  // layer_progress++;
 
-  std::cout << "Process Reading: " << (int)((layer_progress / 28.0) * 100.0)
-            << " % \r";
-  std::cout.flush();
+  // std::cout << "Process Reading: " << (int)((layer_progress / 28.0) * 100.0)
+  //           << " % \r";
+  // std::cout.flush();
 }
 
 void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,

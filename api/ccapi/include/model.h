@@ -28,6 +28,7 @@
 #include <layer.h>
 #include <optimizer.h>
 #include <tensor_dim.h>
+#include <execution_mode.h>
 
 namespace nntrainer {
 class RunLayerContext;
@@ -385,6 +386,8 @@ public:
    * @retval    test statstics
    */
   virtual RunStats getTestStats() = 0;
+
+  virtual int allocate(nntrainer::ExecutionMode mode = nntrainer::ExecutionMode::TRAIN)=0;  
 
   /**
    * @brief export the model according to given export method
