@@ -3133,17 +3133,18 @@ void Tensor::save(std::ostream &file) {
     << "save size: " << bytes()
     << " is too big. It cannot be represented by std::streamsize";
   if (this->getDataType() == ml::train::TensorDim::DataType::FP32) {
-    std::vector<_FP16> temp(size());
-    for (unsigned int i = 0; i < size(); ++i) {
-      temp[i] = static_cast<_FP16>(getData()[i]);
-    }
+    
+    // std::vector<_FP16> temp(size());
+    // for (unsigned int i = 0; i < size(); ++i) {
+    //   temp[i] = static_cast<_FP16>(getData()[i]);
+    // }
 
-    checkedWrite(file, (char *)temp.data(),
-                 static_cast<std::streamsize>(size() * sizeof(_FP16)),
-                 "[Tensor::save] operation failed");
-
-    // checkedWrite(file, (char *)getData(), sz,
+    // checkedWrite(file, (char *)temp.data(),
+    //              static_cast<std::streamsize>(size() * sizeof(_FP16)),
     //              "[Tensor::save] operation failed");
+
+    checkedWrite(file, (char *)getData(), sz,
+                 "[Tensor::save] operation failed");
   } else if (this->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     std::vector<_FP16> temp(size());
@@ -3745,10 +3746,11 @@ void Tensor::dequantize(Tensor &output, unsigned int axis) const {
   if (output.getDataType() == Tdatatype::FP32 && scale_factors_32.empty()) {
     throw std::invalid_argument("Error: No scale factors");
   }
-
+#ifdef ENABLE_FP16
   if (output.getDataType() == Tdatatype::FP16 && scale_factors_16.empty()) {
     throw std::invalid_argument("Error: No scale factors");
   }
+#endif  
 
   if (zero_points.empty()) {
     throw std::invalid_argument("Error: No zero points");

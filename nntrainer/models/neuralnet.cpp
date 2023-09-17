@@ -354,7 +354,7 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
 }
 
 sharedConstTensors NeuralNetwork::incremental_forwarding(
-  unsigned int from, unsigned int to, bool training,
+							 unsigned int from, unsigned int to, bool training,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op =
     [this, from, to, stop_cb, userdata](std::shared_ptr<LayerNode> node,
@@ -771,13 +771,13 @@ NeuralNetwork::inference(unsigned int batch_size,
 sharedConstTensors
 NeuralNetwork::incremental_inference(sharedConstTensors X,
                                      unsigned int init_seq_len,
-                                     unsigned int from, unsigned int to) {
+                                     unsigned int from, unsigned int to ) {
   return incremental_inference(X, {}, init_seq_len, from, to);
 }
 
 sharedConstTensors NeuralNetwork::incremental_inference(
   sharedConstTensors X, sharedConstTensors label, unsigned int init_seq_len,
-  unsigned int from, unsigned int to) {
+  unsigned int from, unsigned int to ) {
   if (model_graph.getBatchSize() != X[0]->batch()) {
     model_graph.setBatchSize(X[0]->batch());
   }
@@ -794,7 +794,7 @@ sharedConstTensors NeuralNetwork::incremental_inference(
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
   PROFILE_TIME_START(nn_foward);
 
-  out = incremental_forwarding(from, to, X, label, false);
+  out = incremental_forwarding(from, to ,  X, label, false);
 
   PROFILE_TIME_END(nn_foward);
 
@@ -808,7 +808,7 @@ sharedConstTensors NeuralNetwork::incremental_inference(
 std::vector<float *> NeuralNetwork::incremental_inference(
   unsigned int batch_size, const std::vector<float *> &input,
   const std::vector<float *> &label, unsigned int init_seq_len,
-  unsigned int from, unsigned int to) {
+  unsigned int from, unsigned int to ) {
   sharedConstTensors input_tensors, output_tensors;
   auto in_dim = getInputDimension();
 

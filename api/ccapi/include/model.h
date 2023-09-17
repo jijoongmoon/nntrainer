@@ -316,6 +316,8 @@ public:
                         unsigned int init_seq_len, unsigned int from,
                         unsigned int to) = 0;
 
+  virtual float getCompleteness()=0;
+
   /**
    * @brief     Summarize the model
    * @param out std::ostream to get the model summary

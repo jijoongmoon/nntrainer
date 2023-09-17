@@ -145,7 +145,6 @@ void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
       }
-
       Tensor cur_weight =
         weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
 

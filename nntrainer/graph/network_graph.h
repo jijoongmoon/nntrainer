@@ -118,6 +118,14 @@ public:
    */
   bool empty() const { return graph.empty(); }
 
+
+  /**
+   * @brief get completness status
+   * @param[out] float completness (%)
+   */
+  float getCompleteness() const { return completeness; }
+  
+
   /**
    * @brief     Swap function for the class
    */
@@ -479,6 +487,7 @@ private:
     profile_keys; /**< profile keys based on the layer type */
   std::vector<Weight *>
     clip_weights; /**< weights with global norm based clipping enabled */
+  float completeness;
 
   /**
    * @brief     topological sort
