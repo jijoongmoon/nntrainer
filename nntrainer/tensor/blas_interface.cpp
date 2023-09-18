@@ -177,19 +177,21 @@ static void scopy_INT4(const unsigned int N, const uint8_t *X, const int incX,
   if (incX == 1 && incY == 1) {
     nntrainer::neon::scopy_neon_int4(N, X, Y);
   } else {
-    for (unsigned int i = 0; i < N; ++i)
-      Y[i * incy] = X[i * incx];
+    throw std::invalid_argument(
+      "Error: incX == 1 && incY == 1 is supported only");
   }
 #else
-  for (unsigned int i = 0; i < N; ++i)
-    Y[i * incy] = X[i * incx];
+  for (unsigned int idx = 0; idx < N; idx++) {
+    Y[2 * idx] = X[idx] >> 4;
+    Y[2 * idx + 1] = X[idx] & 0x0f;
+  }
 #endif
 }
 
 static void ewvm_FP16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
                       _FP16 *Z) {
 #ifdef USE__FP16
-    nntrainer::neon::elementwise_vector_multiplication_neon_fp16(N, X, Y, Z);
+  nntrainer::neon::elementwise_vector_multiplication_neon_fp16(N, X, Y, Z);
 #else
   for (unsigned int i = 0; i < N; ++i)
     Z[i] = X[i] * Y[i];
@@ -199,7 +201,7 @@ static void ewvm_FP16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
 static void ewva_FP16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
                       _FP16 *Z) {
 #ifdef USE__FP16
-    nntrainer::neon::elementwise_vector_addition_neon_fp16(N, X, Y, Z);
+  nntrainer::neon::elementwise_vector_addition_neon_fp16(N, X, Y, Z);
 #else
   for (unsigned int i = 0; i < N; ++i)
     Z[i] = X[i] + Y[i];
@@ -252,9 +254,8 @@ static void sgemm_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
                        const unsigned int ldc) {
 
 #ifdef USE__FP16
-    nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
-                                     TransA == CblasTrans,
-                                     TransB == CblasTrans);
+  nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
+                                   TransA == CblasTrans, TransB == CblasTrans);
 #else
   sgemm_loop_fp16();
 #endif
@@ -314,8 +315,7 @@ void scopy(const unsigned int N, const _FP16 *X, const int incX, _FP16 *Y,
 void scopy(const unsigned int N, const uint8_t *X, const int incX, _FP16 *Y,
            const int incY) {
   scopy_INT4(N, X, incX, Y, incY);
-
-} 
+}
 
 void ewvm(const unsigned int N, const _FP16 *X, const _FP16 *Y, _FP16 *Z) {
   ewvm_FP16(N, X, Y, Z);
@@ -324,7 +324,6 @@ void ewvm(const unsigned int N, const _FP16 *X, const _FP16 *Y, _FP16 *Z) {
 void ewva(const unsigned int N, const _FP16 *X, const _FP16 *Y, _FP16 *Z) {
   ewva_FP16(N, X, Y, Z);
 } // namespace nntrainer
-  
 
 _FP16 snrm2(const int N, const _FP16 *X, const int incX) {
   return snrm2_FP16(N, X, incX);
