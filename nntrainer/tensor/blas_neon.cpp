@@ -874,7 +874,6 @@ void sgemm_neon_fp16(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
   }
 }
 
-
 void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
                              uint32_t M, uint32_t N, uint32_t K, float alpha,
                              float beta) {
@@ -1097,7 +1096,6 @@ void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, __fp16 *C,
   }
 }
 
-
 void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
                             uint32_t M, uint32_t N, uint32_t K, float alpha,
                             float beta) {
@@ -1126,17 +1124,25 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
         float32x4_t sum_high_32 = vcvt_f32_f16(sum_high);
         float32x4_t sum_low_32 = vcvt_f32_f16(sum_low);
 
-        float32x2_t sum_high_32_two = vpadd_f32(vget_low_f32(sum_high_32), vget_high_f32(sum_high_32));
-        float32x2_t sum_low_32_two = vpadd_f32(vget_low_f32(sum_low_32), vget_low_f32(sum_low_32));
+        sum_low_32 = vaddq_f32(sum_high_32, sum_low_32);
 
-        float32x2_t sum_high_32_one = vpadd_f32(sum_high_32_two, sum_high_32_two);
-        float32x2_t sum_low_32_one = vpadd_f32(sum_low_32_two, sum_low_32_two);
+        // float32x2_t sum_high_32_two =
+        //   vpadd_f32(vget_low_f32(sum_high_32), vget_high_f32(sum_high_32));
+        // float32x2_t sum_low_32_two =
+        //   vpadd_f32(vget_low_f32(sum_low_32), vget_low_f32(sum_low_32));
 
-        float result_high, result_low;
-        vst1_lane_f32(&result_high, sum_high_32_one, 0);
-        vst1_lane_f32(&result_low, sum_low_32_one, 0);
+        // float32x2_t sum_high_32_one =
+        //   vpadd_f32(sum_high_32_two, sum_high_32_two);
+        // float32x2_t sum_low_32_one = vpadd_f32(sum_low_32_two,
+        // sum_low_32_two);
 
-        C[m * N + n] += result_high + result_low;
+        // float result_high, result_low;
+        // vst1_lane_f32(&result_high, sum_high_32_one, 0);
+        // vst1_lane_f32(&result_low, sum_low_32_one, 0);
+
+        // C[m * N + n] += result_high + result_low;
+
+        C[m * N + n] += vaddvq_f32(sum_low_32);
       }
     }
   } else {
@@ -1179,17 +1185,25 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
         float32x4_t sum_high_32 = vcvt_f32_f16(sum_high);
         float32x4_t sum_low_32 = vcvt_f32_f16(sum_low);
 
-        float32x2_t sum_high_32_two = vpadd_f32(vget_low_f32(sum_high_32), vget_high_f32(sum_high_32));
-        float32x2_t sum_low_32_two = vpadd_f32(vget_low_f32(sum_low_32), vget_low_f32(sum_low_32));
+        sum_low_32 = vaddq_f32(sum_high_32, sum_low_32);
 
-        float32x2_t sum_high_32_one = vpadd_f32(sum_high_32_two, sum_high_32_two);
-        float32x2_t sum_low_32_one = vpadd_f32(sum_low_32_two, sum_low_32_two);
+        // float32x2_t sum_high_32_two =
+        //   vpadd_f32(vget_low_f32(sum_high_32), vget_high_f32(sum_high_32));
+        // float32x2_t sum_low_32_two =
+        //   vpadd_f32(vget_low_f32(sum_low_32), vget_low_f32(sum_low_32));
 
-        float result_high, result_low;
-        vst1_lane_f32(&result_high, sum_high_32_one, 0);
-        vst1_lane_f32(&result_low, sum_low_32_one, 0);
+        // float32x2_t sum_high_32_one =
+        //   vpadd_f32(sum_high_32_two, sum_high_32_two);
+        // float32x2_t sum_low_32_one = vpadd_f32(sum_low_32_two,
+        // sum_low_32_two);
 
-        C[m * N + n] += result_high + result_low;
+        // float result_high, result_low;
+        // vst1_lane_f32(&result_high, sum_high_32_one, 0);
+        // vst1_lane_f32(&result_low, sum_low_32_one, 0);
+
+        // C[m * N + n] += result_high + result_low;
+
+        C[m * N + n] += vaddvq_f32(sum_low_32);
       }
     }
   }
@@ -1232,7 +1246,8 @@ void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B, __fp16 *C,
   }
 }
 
-void elementwise_vector_multiplication_neon_fp16(const unsigned int N, const __fp16 *X,
+void elementwise_vector_multiplication_neon_fp16(const unsigned int N,
+                                                 const __fp16 *X,
                                                  const __fp16 *Y, __fp16 *Z) {
   int i = 0;
   for (; N - i >= 8; i += 8) {
@@ -1242,14 +1257,15 @@ void elementwise_vector_multiplication_neon_fp16(const unsigned int N, const __f
 
     vst1q_f16(&Z[i], z0_7);
   }
-  while (i < N){
+  while (i < N) {
     Z[i] = X[i] * Y[i];
     ++i;
   }
 }
 
-void elementwise_vector_addition_neon_fp16(const unsigned int N, const __fp16 *X,
-                                                 const __fp16 *Y, __fp16 *Z) {
+void elementwise_vector_addition_neon_fp16(const unsigned int N,
+                                           const __fp16 *X, const __fp16 *Y,
+                                           __fp16 *Z) {
   int i = 0;
   for (; N - i >= 8; i += 8) {
     float16x8_t x0_7 = vld1q_f16(&X[i]);
@@ -1258,12 +1274,11 @@ void elementwise_vector_addition_neon_fp16(const unsigned int N, const __fp16 *X
 
     vst1q_f16(&Z[i], z0_7);
   }
-  while (i < N){
+  while (i < N) {
     Z[i] = X[i] * Y[i];
     ++i;
   }
 }
-  
 
 #endif
 } // namespace nntrainer::neon
