@@ -316,7 +316,7 @@ void MultiHeadAttentionLayer::finalize(InitLayerContext &context) {
     //   attention_mask_dim, "attention_mask", Tensor::Initializer::NONE, false,
     //   TensorLifespan::FORWARD_FUNC_LIFESPAN);
   }
-  /** tensor for attention weight */
+  /** tensor for attention weight */ 
   TensorDim attention_weight_dim(
     {batch_size, num_heads, query_height, key_height}, activation_type);
   weight_idx[AttentionParams::attention_weight] = context.requestTensor(
@@ -954,10 +954,10 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   // clock_t start , allstart, finish;
   // start = clock();
   // allstart = start;
-  if (!_from) {
-    initial_incremental_forwarding(context, _from, _to, training);
-    return;
-  }
+  //if (!_from) {
+  //  initial_incremental_forwarding(context, _from, _to, training);
+  //  return;
+  //}
   // auto start = std::chrono::high_resolution_clock::now();
   unsigned int max_timestep =
     std::get<props::MaxTimestep>(multi_head_attention_props).get();
@@ -1302,6 +1302,8 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   if (!disable_bias) {
     output_step.add_i(fc_bias);
   }
+
+  //std::cout <<from << " : "<< output_step.getData<_FP16>()[0] <<" " <<output_step.getData<_FP16>()[1] <<" "<<output_step.getData<_FP16>()[2]<< std::endl;
 
   if (cache_shift) {
     if (cache_key.getDataType() == ml::train::TensorDim::DataType::FP32) {

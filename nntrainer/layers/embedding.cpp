@@ -142,6 +142,8 @@ void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
     Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
     for (unsigned int i = from; i < to; ++i) {
       uint embed_idx = static_cast<uint>(in_data[i]);
+
+      std::cout << embed_idx <<"----"<< std::endl;
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
       }
@@ -152,6 +154,7 @@ void EmbeddingLayer::incremental_forwarding(RunLayerContext &context,
         out_tensor_dim, out_dim * (i - from));
 
       out_tensor.copyData(cur_weight);
+      //std::cout << "embedding out : " << out_tensor.getData<_FP16>()[0]<<" "<< out_tensor.getData<_FP16>()[1]<< " "<< out_tensor.getData<_FP16>()[2]<<std::endl;
     }
   }
 }

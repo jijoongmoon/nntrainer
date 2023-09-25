@@ -152,38 +152,59 @@ public:
 
     unsigned int width = input.width();
     unsigned int bch_size = input.getDim().getDataLen() / width;
-
+    Tensor a;
+    Tensor &out_fp32=a;
     // copy will not executed in inplace case
-    output.copy(input);
+    if(output.getDataType()==Tdatatype::FP16){
+      TensorDim d = output.getDim();
+      d.setDataType(Tdatatype::FP32);
+      out_fp32 = Tensor(d);
+      float * out_ = out_fp32.getData<float>();
+      const _FP16 * input_ = input.getData<_FP16>();
+      for(unsigned int i=0;i<out_fp32.getDim().getDataLen();++i){
+        out_[i] = static_cast<float>(input_[i]);
+      }
+    }else {   
+       output.copy(input);
+       out_fp32 = output;
+    }
 
-    T *output_data = output.getData<T>();
+    float *output_data = out_fp32.getData<float>();
 
     // prevent overflow
-    Tensor tmp(width, input.getTensorType());
+    Tensor tmp(width);
     for (unsigned int i = 0; i < bch_size; i++) {
-      T *ptr = output_data + i * width;
+      float *ptr = output_data + i * width;
 
       // find max value and subtract it
-      T max_value = *std::max_element(ptr, ptr + width);
+      float max_value = *std::max_element(ptr, ptr + width);
 
       tmp.setValue(max_value);
-      saxpy(width, -1, tmp.getData<T>(), 1, ptr, 1);
+      saxpy(width, -1, tmp.getData<float>(), 1, ptr, 1);
     }
 
     // take exp
-    output.apply<T>(exp_util<T>, output);
+    out_fp32.apply<float>(exp_util<float>, out_fp32);
 
     // take sum over the last dimension
-    Tensor sum = output.sum(3);
+    Tensor sum = out_fp32.sum(3);
 
     for (unsigned int i = 0; i < bch_size; i++) {
-      T *ptr = output_data + i * width;
+      float *ptr = output_data + i * width;
       std::transform(ptr, ptr + width, ptr,
-                     std::bind(std::divides<T>(), std::placeholders::_1,
-                               sum.getValue<T>(i)));
+                     std::bind(std::divides<float>(), std::placeholders::_1,
+                               sum.getValue<float>(i)));
     }
 
-    return output;
+    if(output.getDataType()==Tdatatype::FP16){
+      _FP16* out_ = output.getData<_FP16>();
+      for(unsigned int i=0;i<output.getDim().getDataLen();++i){
+        out_[i] = static_cast<_FP16>(output_data[i]);
+      }
+      return output;
+    } else {
+      return output;
+    }
   }
 
   /**
