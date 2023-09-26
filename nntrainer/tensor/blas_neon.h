@@ -60,10 +60,15 @@ void sgemv_transpose_neon(const float *A, const float *X, float *Y,
  */
 void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
                      uint32_t cols, float alpha, float beta);
+void sgemv_neon_fp16_pad(const __fp16 *A, const __fp16 *X, __fp16 *Y,
+                         uint32_t rows, uint32_t cols, float alpha,
+                         float beta);
+void elementwise_vector_multiplication_neon_fp16(const unsigned N,
+                                                 const __fp16 *X,
+                                                 const __fp16 *Y, __fp16 *Z);
 
-void elementwise_vector_multiplication_neon_fp16(const unsigned N, const __fp16 *X, const __fp16 *Y, __fp16 *Z);
-
-void elementwise_vector_addition_neon_fp16(const unsigned N, const __fp16 *X, const __fp16 *Y, __fp16 *Z); 
+void elementwise_vector_addition_neon_fp16(const unsigned N, const __fp16 *X,
+                                           const __fp16 *Y, __fp16 *Z);
 
 /**
  * @brief     transposed sgemv computation with neon
@@ -80,16 +85,22 @@ void elementwise_vector_addition_neon_fp16(const unsigned N, const __fp16 *X, co
 void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
                                uint32_t rows, uint32_t cols, float alpha,
                                float beta);
+void sgemv_transpose_neon_fp16_32copy(const __fp16 *A, const __fp16 *X,
+                                      __fp16 *Y, uint32_t rows, uint32_t cols,
+                                      float alpha, float beta);
+void sgemv_neon_fp16_f32copy(const __fp16 *A, const __fp16 *X, __fp16 *Y,
+                             uint32_t rows, uint32_t cols, float alpha,
+                             float beta);
 
-/**
- * @brief     saxpy computation with neon: Y = alpha*X + Y
- * @param[in] N number of elements in Y
- * @param[in] alpha float number
- * @param[in] X __fp16 * for Vector X
- * @param[in] Y __fp16 * for Vector Y
- */
-void saxpy_neon_fp16(const unsigned int N, const float alpha, const __fp16 *X,
-                     __fp16 *Y);
+  /**
+   * @brief     saxpy computation with neon: Y = alpha*X + Y
+   * @param[in] N number of elements in Y
+   * @param[in] alpha float number
+   * @param[in] X __fp16 * for Vector X
+   * @param[in] Y __fp16 * for Vector Y
+   */
+  void saxpy_neon_fp16(const unsigned int N, const float alpha, const __fp16 *X,
+                       __fp16 *Y);
 
 /**
  * @brief     sdot computation with neon: sum of all X * Y
@@ -129,6 +140,22 @@ void scopy_neon_fp16(const unsigned int N, const __fp16 *X, __fp16 *Y);
  * @param[in] Y uint8_t * for Vector Y
  */
 void scopy_neon_int4(const unsigned int N, const uint8_t *X, __fp16 *Y);
+
+/**
+ * @brief     copy function with neon: Y = X
+ * @param[in] N number of elements in X
+ * @param[in] X float * for Vector X
+ * @param[in] Y __fp16 * for Vector Y
+ */
+void scopy_neon_fp32_to_fp16(const unsigned int N, const float *X, __fp16 *Y);
+
+/**
+ * @brief     copy function with neon: Y = X
+ * @param[in] N number of elements in X
+ * @param[in] X __fp16 * for Vector X
+ * @param[in] Y float * for Vector Y
+ */
+void scopy_neon_fp16_to_fp32(const unsigned int N, const __fp16 *X, float *Y);
 
 /**
  * @brief     isamax function with neon: index of firt maxima

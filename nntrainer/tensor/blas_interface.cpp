@@ -103,9 +103,9 @@ static void sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
 
   if (TransA == CblasTrans) {
 #ifdef USE__FP16
-    if (incX == 1 && incY == 1 && (N % 16 == 0 || N % 8 == 0)) {
-
-      nntrainer::neon::sgemv_transpose_neon_fp16(A, X, Y, M, N, alpha, beta);
+    if (incX == 1 && incY == 1 && (N % 8 == 0)) {
+      nntrainer::neon::sgemv_transpose_neon_fp16_32copy(A, X, Y, M, N, alpha, beta);
+      // nntrainer::neon::sgemv_transpose_neon_fp16(A, X, Y, M, N, alpha, beta);
     } else {
       sgemv_loop_fp16(i, j, N, M);
     }
@@ -114,11 +114,43 @@ static void sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
 #endif
   } else {
 #ifdef USE__FP16
-    if (incX == 1 && incY == 1 && (N % 16 == 0 || N % 8 == 0)) {
-      nntrainer::neon::sgemv_neon_fp16(A, X, Y, M, N, alpha, beta);
-    } else {
-      sgemv_loop_fp16(j, i, M, N);
-    }
+  // std::cout << M << " X " << N << " sgemv \n"; 
+
+    // if (incX == 1 && incY == 1 && (N % 4 == 0)) {
+    //   nntrainer::neon::sgemv_neon_fp16_pad(A, X, Y, M, N, alpha, beta);
+    //   // nntrainer::neon::sgemv_neon_fp16_f32copy(A, X, Y, M, N, alpha, beta);
+    //   // nntrainer::neon::sgemv_neon_fp16(A, X, Y, M, N, alpha, beta);
+    // } else {
+    //   sgemv_loop_fp16(j, i, M, N);
+    // }
+
+    nntrainer::neon::sgemv_neon_fp16_pad(A, X, Y, M, N, alpha, beta);
+
+#else
+    sgemv_loop_fp16(j, i, M, N);
+#endif
+  }
+}
+
+static void naive_sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
+                       const unsigned int M, const unsigned int N,
+                       const float alpha, const _FP16 *A,
+                       const unsigned int lda, const _FP16 *X, const int incX,
+                       const float beta, _FP16 *Y, const int incY) {
+
+  unsigned int incy = abs(incY);
+  unsigned int incx = abs(incX);
+  std::cout << "naive_sgemv_FP16\n ";
+
+  if (TransA == CblasTrans) {
+#ifdef USE__FP16
+    sgemv_loop_fp16(i, j, N, M);
+#else
+    sgemv_loop_fp16(i, j, N, M);
+#endif
+  } else {
+#ifdef USE__FP16
+    sgemv_loop_fp16(j, i, M, N);
 #else
     sgemv_loop_fp16(j, i, M, N);
 #endif
@@ -185,6 +217,37 @@ static void scopy_INT4(const unsigned int N, const uint8_t *X, const int incX,
     Y[2 * idx] = X[idx] >> 4;
     Y[2 * idx + 1] = X[idx] & 0x0f;
   }
+#endif
+}
+
+static void naive_sgemm_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
+                             CBLAS_TRANSPOSE TransB, const unsigned int M,
+                             const unsigned int N, const unsigned int K,
+                             const float alpha, const _FP16 *A,
+                             const unsigned int lda, const _FP16 *B,
+                             const unsigned int ldb, const float beta, _FP16 *C,
+                             const unsigned int ldc) {
+
+#ifdef USE__FP16
+  // std::cout << "naive_sgemm_FP16" << std::endl;
+
+  // if ((N % 8 == 0) && (K % 8 == 0)) {
+  //   nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
+  //                                    TransA == CblasTrans,
+  //                                    TransB == CblasTrans);
+  //   // // std::cout<< "M : " << M << " K : " << K << " N : "<< N<<std::endl;
+  //   // // std::cout<< "A[0] : " << float(A[0]) << " B[0] : " << float(B[0]) << "
+  //   // A[1] : "<< float(A[1])<<std::endl;
+
+  // } else {
+  //   // std::cout << M << " " << K << " "<< N<<std::endl;
+  //   sgemm_loop_fp16();
+  // }
+
+  sgemm_loop_fp16();
+
+#else
+  sgemm_loop_fp16();
 #endif
 }
 
@@ -341,6 +404,13 @@ void sgemv(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, const unsigned int M,
            const float beta, _FP16 *Y, const int incY) {
   sgemv_FP16(order, TransA, M, N, alpha, A, lda, X, incX, beta, Y, incY);
 }
+void naive_sgemv(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, const unsigned int M,
+           const unsigned int N, const float alpha, const _FP16 *A,
+           const unsigned int lda, const _FP16 *X, const int incX,
+           const float beta, _FP16 *Y, const int incY){
+  naive_sgemv_FP16(order, TransA, M, N, alpha, A, lda, X, incX, beta, Y, incY);
+
+           }
 
 unsigned int isamax(const unsigned int N, const _FP16 *X, const int incX) {
   /// @todo isamax_FP16 for BLAS_NUM_THREADS
@@ -630,7 +700,15 @@ void sgemm(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
             ldc);
 #endif
 }
-
+void naive_sgemm(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
+                 CBLAS_TRANSPOSE TransB, const unsigned int M,
+                 const unsigned int N, const unsigned int K, const float alpha,
+                 const _FP16 *A, const unsigned int lda, const _FP16 *B,
+                 const unsigned int ldb, const float beta, _FP16 *C,
+                 const unsigned int ldc) {
+  naive_sgemm_FP16(order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta,
+                   C, ldc);
+}
 void scopy(const unsigned int N, const void *X, const int incX, void *Y,
            const int incY, ml::train::TensorDim::DataType d_type) {
 
