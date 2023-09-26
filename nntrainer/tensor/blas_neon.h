@@ -164,7 +164,7 @@ void sgemm_neon_fp16(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
  * @param[in] alpha float number
  * @param[in] beta float number
  */
-void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
+void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, float *C,
                              uint32_t M, uint32_t N, uint32_t K, float alpha,
                              float beta);
 /**
@@ -179,7 +179,7 @@ void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
  * @param[in] alpha float number
  * @param[in] beta float number
  */
-void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, __fp16 *C,
+void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, float *C,
                             uint32_t M, uint32_t N, uint32_t K, float alpha,
                             float beta);
 /**
@@ -194,7 +194,7 @@ void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, __fp16 *C,
  * @param[in] alpha float number
  * @param[in] beta float number
  */
-void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
+void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, float *C,
                             uint32_t M, uint32_t N, uint32_t K, float alpha,
                             float beta);
 /**
@@ -209,7 +209,7 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
  * @param[in] alpha float number
  * @param[in] beta float number
  */
-void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B, __fp16 *C,
+void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B, float *C,
                              uint32_t M, uint32_t N, uint32_t K, float alpha,
                              float beta, uint32_t idx);
 #endif

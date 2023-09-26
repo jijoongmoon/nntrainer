@@ -983,6 +983,31 @@ void scopy_neon_int4(const unsigned int N, const uint8_t *X, __fp16 *Y) {
   }
 }
 
+void scopy_neon_fp32_to_fp16(const unsigned int N, const float *X, __fp16 *Y) {
+  int idx = 0;
+
+  for (; N - idx >= 8; idx += 8) {
+    float32x4_t x1 = vld1q_f32(&X[idx]);
+    float32x4_t x2 = vld1q_f32(&X[idx + 4]);
+
+    float16x8_t y1 = vcombine_f16(vcvt_f16_f32(x1), vcvt_f16_f32(x2));
+
+    vst1q_f16(&Y[idx], y1);
+  }
+
+  for (; N - idx >= 4; idx += 4) {
+    float32x4_t x1 = vld1q_f32(&X[idx]);
+
+    float16x4_t y1 = vcvt_f16_f32(x1);
+
+    vst1_f16(&Y[idx], y1);
+  }
+
+  for (; idx < N; ++idx) {
+    Y[idx] = static_cast<__fp16>(X[idx]);
+  }
+}
+
 unsigned int isamax_neon_fp16(const unsigned int N, const __fp16 *X) {
 
   unsigned int retIdx;
@@ -1035,9 +1060,11 @@ unsigned int isamax_neon_fp16(const unsigned int N, const __fp16 *X) {
   return retIdx;
 }
 
-void sgemm_neon_fp16(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
-                     uint32_t N, uint32_t K, float alpha, float beta,
-                     bool TransA, bool TransB) {
+void sgemm_neon_fp16(const __fp16 *A, const __fp16 *B, __fp16 *C,
+                              uint32_t M, uint32_t N, uint32_t K, float alpha,
+                              float beta, bool TransA, bool TransB) {
+
+  float C32[M * N];
 
   float16x8_t v_beta = vmovq_n_f16(beta);
 
@@ -1046,29 +1073,46 @@ void sgemm_neon_fp16(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
   unsigned int size = M * N;
   for (; idx < (size - idx) >= 8; idx += 8) {
     float16x8_t c = vld1q_f16(&C[idx]);
-    c = vmulq_f16(v_beta, c);
-    vst1q_f16(&C[idx], c);
+    float32x4_t c0_3 = vcvt_f32_f16(vget_low_f16(c));
+    float32x4_t c4_7 = vcvt_f32_f16(vget_high_f16(c));
+
+    c0_3 = vmulq_n_f32(c0_3, beta);
+    c4_7 = vmulq_n_f32(c4_7, beta);
+
+    vst1q_f32(&C32[idx], c0_3);
+    vst1q_f32(&C32[idx + 4], c4_7);
+  }
+  // remaining 4
+  for (; idx < (size - idx) >= 4; idx += 4) {
+    float16x4_t c = vld1_f16(&C[idx]);
+    float32x4_t c0_3 = vcvt_f32_f16(c);
+
+    c0_3 = vmulq_n_f32(c0_3, beta);
+
+    vst1q_f32(&C32[idx], c0_3);
   }
 
   // remaining values if dimensions not a multiple of 8
   for (; idx < size; idx++) {
-    C[idx] *= beta;
+    C32[idx] = C[idx] * beta;
   }
 
   if (!TransA && TransB) {
-    sgemm_neon_fp16_transB(A, B, C, M, N, K, alpha, beta);
+    sgemm_neon_fp16_transB(A, B, C32, M, N, K, alpha, beta);
   } else if (TransA && !TransB) {
-    sgemm_neon_fp16_transA(A, B, C, M, N, K, alpha, beta);
+    sgemm_neon_fp16_transA(A, B, C32, M, N, K, alpha, beta);
   } else if (!TransA && !TransB) {
-    sgemm_neon_fp16_noTrans(A, B, C, M, N, K, alpha, beta);
+    sgemm_neon_fp16_noTrans(A, B, C32, M, N, K, alpha, beta);
   } else { // TransA && TransB
-    sgemm_neon_fp16_transAB(A, B, C, M, N, K, alpha, beta, idx);
+    sgemm_neon_fp16_transAB(A, B, C32, M, N, K, alpha, beta, idx);
   }
+
+  scopy_neon_fp32_to_fp16(M * N, C32, C);
 }
 
-void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
-                             uint32_t M, uint32_t N, uint32_t K, float alpha,
-                             float beta) {
+void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B,
+                                      float *C, uint32_t M, uint32_t N,
+                                      uint32_t K, float alpha, float beta) {
 
   unsigned int k = 0, n = 0;
 
@@ -1117,9 +1161,8 @@ void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
         float32x4_t b0_7_7_low = vcvt_f32_f16(vget_low_f16(b0_7_7));
         float32x4_t b0_7_7_high = vcvt_f32_f16(vget_high_f16(b0_7_7));
 
-        float16x8_t c0_7 = vld1q_f16(&C[m * N + n]);
-        float32x4_t c0_7_low_32 = vcvt_f32_f16(vget_low_f16(c0_7));
-        float32x4_t c0_7_high_32 = vcvt_f32_f16(vget_high_f16(c0_7));
+        float32x4_t c0_7_low_32 = vld1q_f32(&C[m * N + n]);
+        float32x4_t c0_7_high_32 = vld1q_f32(&C[m * N + n + 4]);
 
         c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a0);
         c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a0);
@@ -1145,12 +1188,8 @@ void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
         c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_7_low, a7);
         c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_7_high, a7);
 
-        float16x4_t c0_7_low_16 = vcvt_f16_f32(c0_7_low_32);
-        float16x4_t c0_7_high_16 = vcvt_f16_f32(c0_7_high_32);
-
-        c0_7 = vcombine_f16(c0_7_low_16, c0_7_high_16);
-
-        vst1q_f16(&C[m * N + n], c0_7);
+        vst1q_f32(&C[m * N + n], c0_7_low_32);
+        vst1q_f32(&C[m * N + n + 4], c0_7_high_32);
       }
     }
   }
@@ -1180,9 +1219,8 @@ void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
         float32x4_t b0_7_3_low = vcvt_f32_f16(vget_low_f16(b0_7_3));
         float32x4_t b0_7_3_high = vcvt_f32_f16(vget_high_f16(b0_7_3));
 
-        float16x8_t c0_7 = vld1q_f16(&C[m * N + n]);
-        float32x4_t c0_7_low_32 = vcvt_f32_f16(vget_low_f16(c0_7));
-        float32x4_t c0_7_high_32 = vcvt_f32_f16(vget_high_f16(c0_7));
+        float32x4_t c0_7_low_32 = vld1q_f32(&C[m * N + n]);
+        float32x4_t c0_7_high_32 = vld1q_f32(&C[m * N + n + 4]);
 
         c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a0);
         c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a0);
@@ -1196,12 +1234,8 @@ void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
         c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_3_low, a3);
         c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_3_high, a3);
 
-        float16x4_t c0_7_low_16 = vcvt_f16_f32(c0_7_low_32);
-        float16x4_t c0_7_high_16 = vcvt_f16_f32(c0_7_high_32);
-
-        c0_7 = vcombine_f16(c0_7_low_16, c0_7_high_16);
-
-        vst1q_f16(&C[m * N + n], c0_7);
+        vst1q_f32(&C[m * N + n], c0_7_low_32);
+        vst1q_f32(&C[m * N + n + 4], c0_7_high_32);
       }
     }
   }
@@ -1209,37 +1243,50 @@ void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
   // remaining K values
   for (; k < K; k++) {
     for (unsigned int m = 0; m < M; m++) {
-      __fp16 a0 = alpha * A[m * K + k];
+      float a0 = alpha * A[m * K + k];
 
       for (n = 0; (N - n) >= 8; n += 8) {
         float16x8_t b0_7 = vld1q_f16(&B[k * N + n]);
+        float32x4_t b0_7_0_low = vcvt_f32_f16(vget_low_f16(b0_7));
+        float32x4_t b0_7_0_high = vcvt_f32_f16(vget_high_f16(b0_7));
 
-        float16x8_t c0_7 = vld1q_f16(&C[m * N + n]);
+        float32x4_t c0_7_low_32 = vld1q_f32(&C[m * N + n]);
+        float32x4_t c0_7_high_32 = vld1q_f32(&C[m * N + n + 4]);
 
-        c0_7 = vfmaq_n_f16(c0_7, b0_7, a0);
+        c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a0);
+        c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a0);
 
-        vst1q_f16(&C[m * N + n], c0_7);
+        vst1q_f32(&C[m * N + n], c0_7_low_32);
+        vst1q_f32(&C[m * N + n + 4], c0_7_high_32);
       }
     }
   }
 
-  // remaining N values (can be optimized by putting inside previous loops)
+  // remaining N values
   if (n < N) {
-    __fp16 valsB[8];
-    __fp16 valsC[8];
+    float valsB[8];
+    float valsC[8];
     for (k = 0; k < K; k++) {
       for (unsigned int m = 0; m < M; m++) {
-        __fp16 a = alpha * A[m * K + k];
+        float a = alpha * A[m * K + k];
         for (unsigned int idx = n; idx < N; idx++) {
           valsB[idx - n] = B[k * N + idx];
 
           // load previously calculated C
           valsC[idx - n] = C[m * N + idx];
         }
-        float16x8_t b = vld1q_f16(valsB);
-        float16x8_t c = vld1q_f16(valsC);
-        c = vfmaq_n_f16(c, b, a);
-        vst1q_f16(valsC, c);
+
+        float32x4_t b0_7_0_low = vld1q_f32(valsB);
+        float32x4_t b0_7_0_high = vld1q_f32(valsB + 4);
+
+        float32x4_t c0_7_low_32 = vld1q_f32(valsC);
+        float32x4_t c0_7_high_32 = vld1q_f32(valsC + 4);
+
+        c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a);
+        c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a);
+
+        vst1q_f32(valsC, c0_7_low_32);
+        vst1q_f32(valsC + 4, c0_7_high_32);
 
         for (unsigned int idx = n; idx < N; idx++) {
           C[m * N + idx] = valsC[idx - n];
@@ -1249,22 +1296,30 @@ void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B, __fp16 *C,
   }
 }
 
-void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, __fp16 *C,
-                            uint32_t M, uint32_t N, uint32_t K, float alpha,
-                            float beta) {
-  __fp16 valsB[8];
-  __fp16 valsC[8];
+void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, float *C,
+                                     uint32_t M, uint32_t N, uint32_t K,
+                                     float alpha, float beta) {
+  float valsB[8];
+  float valsC[8];
   for (unsigned int k = 0; k < K; k++) {
     for (unsigned int m = 0; m < M; m++) {
-      __fp16 a = alpha * A[k * M + m];
+      float a = alpha * A[k * M + m];
       unsigned int n = 0;
       for (; (N - n) >= 8; n += 8) {
         float16x8_t b = vld1q_f16(&B[k * N + n]);
 
+        float32x4_t b0_7_0_low = vcvt_f32_f16(vget_low_f16(b));
+        float32x4_t b0_7_0_high = vcvt_f32_f16(vget_high_f16(b));
+
         // load previously calculated C
-        float16x8_t c = vld1q_f16(&C[m * N + n]);
-        c = vfmaq_n_f16(c, b, a);
-        vst1q_f16(&C[m * N + n], c);
+        float32x4_t c0_7_low_32 = vld1q_f32(&C[m * N + n]);
+        float32x4_t c0_7_high_32 = vld1q_f32(&C[m * N + n + 4]);
+
+        c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a);
+        c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a);
+
+        vst1q_f32(&C[m * N + n], c0_7_low_32);
+        vst1q_f32(&C[m * N + n + 4], c0_7_high_32);
       }
 
       // remaining N values
@@ -1275,10 +1330,18 @@ void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, __fp16 *C,
           // load previously calculated C
           valsC[idx - n] = C[m * N + idx];
         }
-        float16x8_t b = vld1q_f16(valsB);
-        float16x8_t c = vld1q_f16(valsC);
-        c = vfmaq_n_f16(c, b, a);
-        vst1q_f16(valsC, c);
+
+        float32x4_t b0_7_0_low = vld1q_f32(valsB);
+        float32x4_t b0_7_0_high = vld1q_f32(valsB + 4);
+
+        float32x4_t c0_7_low_32 = vld1q_f32(valsC);
+        float32x4_t c0_7_high_32 = vld1q_f32(valsC + 4);
+
+        c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a);
+        c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a);
+
+        vst1q_f32(valsC, c0_7_low_32);
+        vst1q_f32(valsC + 4, c0_7_high_32);
 
         for (unsigned int idx = n; idx < N; idx++) {
           C[m * N + idx] = valsC[idx - n];
@@ -1288,15 +1351,12 @@ void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, __fp16 *C,
   }
 }
 
-void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
-                            uint32_t M, uint32_t N, uint32_t K, float alpha,
-                            float beta) {
-  __fp16 r[4];
-  float16x8_t v_alpha = vmovq_n_f16(alpha);
+void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, float *C,
+                                     uint32_t M, uint32_t N, uint32_t K,
+                                     float alpha, float beta) {
   if (K % 16 == 0) {
     for (unsigned int m = 0; m < M; m++) {
       for (unsigned int n = 0; n < N; n++) {
-        // float16x8_t sum = vmovq_n_f16(0);
         float32x4_t sum = vmovq_n_f32(0.0f);
         unsigned int k = 0;
         for (; (K - k) >= 16; k += 16) {
@@ -1317,9 +1377,6 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
           float32x4_t b8_15_low = vcvt_f32_f16(vget_low_f16(b8_15));
           float32x4_t b8_15_high = vcvt_f32_f16(vget_high_f16(b8_15));
 
-          // sum = vfmaq_f16(sum, a, b);
-          // sum = vfmaq_f16(sum, a8_15, b8_15);
-
           sum = vfmaq_f32(sum, a_low, b_low);
           sum = vfmaq_f32(sum, a_high, b_high);
           sum = vfmaq_f32(sum, a8_15_low, b8_15_low);
@@ -1327,34 +1384,6 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
         }
 
         sum = vmulq_n_f32(sum, alpha);
-
-        // sum = vmulq_f16(v_alpha, sum);
-
-        // float16x4_t sum_high = vget_high_f16(sum);
-        // float16x4_t sum_low = vget_low_f16(sum);
-
-        // float32x4_t sum_high_32 = vcvt_f32_f16(sum_high);
-        // float32x4_t sum_low_32 = vcvt_f32_f16(sum_low);
-
-        // sum_low_32 = vaddq_f32(sum_high_32, sum_low_32);
-
-        // float32x2_t sum_high_32_two =
-        //   vpadd_f32(vget_low_f32(sum_high_32), vget_high_f32(sum_high_32));
-        // float32x2_t sum_low_32_two =
-        //   vpadd_f32(vget_low_f32(sum_low_32), vget_low_f32(sum_low_32));
-
-        // float32x2_t sum_high_32_one =
-        //   vpadd_f32(sum_high_32_two, sum_high_32_two);
-        // float32x2_t sum_low_32_one = vpadd_f32(sum_low_32_two,
-        // sum_low_32_two);
-
-        // float result_high, result_low;
-        // vst1_lane_f32(&result_high, sum_high_32_one, 0);
-        // vst1_lane_f32(&result_low, sum_low_32_one, 0);
-
-        // C[m * N + n] += result_high + result_low;
-
-        // C[m * N + n] += vaddvq_f32(sum_low_32);
 
         C[m * N + n] += vaddvq_f32(sum);
       }
@@ -1364,7 +1393,6 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
     __fp16 valsA[8];
     for (unsigned int m = 0; m < M; m++) {
       for (unsigned int n = 0; n < N; n++) {
-        // float16x8_t sum = vmovq_n_f16(0);
         float32x4_t sum = vmovq_n_f32(0.0f);
         unsigned int k = 0;
         for (; (K - k) >= 8; k += 8) {
@@ -1412,53 +1440,31 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, __fp16 *C,
 
         sum = vmulq_n_f32(sum, alpha);
 
-        // sum = vmulq_f16(v_alpha, sum);
-
-        // float16x4_t sum_high = vget_high_f16(sum);
-        // float16x4_t sum_low = vget_low_f16(sum);
-
-        // float32x4_t sum_high_32 = vcvt_f32_f16(sum_high);
-        // float32x4_t sum_low_32 = vcvt_f32_f16(sum_low);
-
-        // sum_low_32 = vaddq_f32(sum_high_32, sum_low_32);
-
-        // float32x2_t sum_high_32_two =
-        //   vpadd_f32(vget_low_f32(sum_high_32), vget_high_f32(sum_high_32));
-        // float32x2_t sum_low_32_two =
-        //   vpadd_f32(vget_low_f32(sum_low_32), vget_low_f32(sum_low_32));
-
-        // float32x2_t sum_high_32_one =
-        //   vpadd_f32(sum_high_32_two, sum_high_32_two);
-        // float32x2_t sum_low_32_one = vpadd_f32(sum_low_32_two,
-        // sum_low_32_two);
-
-        // float result_high, result_low;
-        // vst1_lane_f32(&result_high, sum_high_32_one, 0);
-        // vst1_lane_f32(&result_low, sum_low_32_one, 0);
-
-        // C[m * N + n] += result_high + result_low;
-
-        // C[m * N + n] += vaddvq_f32(sum_low_32);
-
         C[m * N + n] += vaddvq_f32(sum);
       }
     }
   }
 }
 
-void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B, __fp16 *C,
-                             uint32_t M, uint32_t N, uint32_t K, float alpha,
-                             float beta, uint32_t idx) {
-  __fp16 vals[8];
+void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B,
+                                      float *C, uint32_t M, uint32_t N,
+                                      uint32_t K, float alpha, float beta,
+                                      uint32_t idx) {
+  float vals[8];
   for (unsigned int n = 0; n < N; n++) {
     for (unsigned int k = 0; k < K; k++) {
 
-      __fp16 b = alpha * B[n * K + k];
+      float b = alpha * B[n * K + k];
       unsigned int m = 0;
       for (; (M - m) >= 8; m += 8) {
         float16x8_t a = vld1q_f16(&A[k * M + m]);
-        a = vmulq_n_f16(a, b);
-        vst1q_f16(vals, a);
+
+        float32x4_t a_low = vcvt_f32_f16(vget_low_f16(a));
+        float32x4_t a_high = vcvt_f32_f16(vget_high_f16(a));
+        a_low = vmulq_n_f32(a_low, b);
+        a_high = vmulq_n_f32(a_high, b);
+        vst1q_f32(vals, a_low);
+        vst1q_f32(vals + 4, a_high);
 
         // calculations for all M values
         for (unsigned int idx = m; idx < m + 8; idx++)
@@ -1471,9 +1477,12 @@ void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B, __fp16 *C,
           vals[idx - m] = A[k * M + idx];
         }
 
-        float16x8_t a = vld1q_f16(vals);
-        a = vmulq_n_f16(a, b);
-        vst1q_f16(vals, a);
+        float32x4_t a_low = vld1q_f32(vals);
+        float32x4_t a_high = vld1q_f32(vals + 4);
+        a_low = vmulq_n_f32(a_low, b);
+        a_high = vmulq_n_f32(a_high, b);
+        vst1q_f32(vals, a_low);
+        vst1q_f32(vals + 4, a_high);
 
         // calculations for all remaining M values
         for (idx = m; idx < M; idx++)
