@@ -103,27 +103,19 @@ static void sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
 
   if (TransA == CblasTrans) {
 #ifdef USE__FP16
-    if (incX == 1 && incY == 1 && (N % 16 == 0 || N % 8 == 0)) {
-
-      nntrainer::neon::sgemv_transpose_neon_fp16(A, X, Y, M, N, alpha, beta);
-    } else {
-      sgemv_loop_fp16(i, j, N, M);
-    }
+    nntrainer::neon::sgemv_transpose_neon_fp16(A, X, Y, M, N, alpha, beta);
 #else
     sgemv_loop_fp16(i, j, N, M);
 #endif
   } else {
 #ifdef USE__FP16
-    if (incX == 1 && incY == 1 && (N % 16 == 0 || N % 8 == 0)) {
-      nntrainer::neon::sgemv_neon_fp16(A, X, Y, M, N, alpha, beta);
-    } else {
-      sgemv_loop_fp16(j, i, M, N);
-    }
+    nntrainer::neon::sgemv_neon_fp16(A, X, Y, M, N, alpha, beta);
 #else
     sgemv_loop_fp16(j, i, M, N);
 #endif
   }
 }
+
 
 static _FP16 sdot_FP16(const unsigned int N, const _FP16 *X,
                        const unsigned int incX, const _FP16 *Y,
@@ -175,7 +167,7 @@ static void scopy_INT4(const unsigned int N, const uint8_t *X, const int incX,
 
 #ifdef USE__FP16
   if (incX == 1 && incY == 1) {
-    nntrainer::neon::scopy_neon_int4(N, X, Y);
+    nntrainer::neon::scopy_neon_int4_to_fp16(N, X, Y);
   } else {
     throw std::invalid_argument(
       "Error: incX == 1 && incY == 1 is supported only");
@@ -187,6 +179,7 @@ static void scopy_INT4(const unsigned int N, const uint8_t *X, const int incX,
   }
 #endif
 }
+
 
 static void ewvm_FP16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
                       _FP16 *Z) {
@@ -341,6 +334,7 @@ void sgemv(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, const unsigned int M,
            const float beta, _FP16 *Y, const int incY) {
   sgemv_FP16(order, TransA, M, N, alpha, A, lda, X, incX, beta, Y, incY);
 }
+
 
 unsigned int isamax(const unsigned int N, const _FP16 *X, const int incX) {
   /// @todo isamax_FP16 for BLAS_NUM_THREADS

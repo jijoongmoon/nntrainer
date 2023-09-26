@@ -61,9 +61,12 @@ void sgemv_transpose_neon(const float *A, const float *X, float *Y,
 void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
                      uint32_t cols, float alpha, float beta);
 
-void elementwise_vector_multiplication_neon_fp16(const unsigned N, const __fp16 *X, const __fp16 *Y, __fp16 *Z);
+void elementwise_vector_multiplication_neon_fp16(const unsigned N,
+                                                 const __fp16 *X,
+                                                 const __fp16 *Y, __fp16 *Z);
 
-void elementwise_vector_addition_neon_fp16(const unsigned N, const __fp16 *X, const __fp16 *Y, __fp16 *Z); 
+void elementwise_vector_addition_neon_fp16(const unsigned N, const __fp16 *X,
+                                           const __fp16 *Y, __fp16 *Z);
 
 /**
  * @brief     transposed sgemv computation with neon
@@ -128,7 +131,23 @@ void scopy_neon_fp16(const unsigned int N, const __fp16 *X, __fp16 *Y);
  * @param[in] X __fp16 * for Vector X
  * @param[in] Y uint8_t * for Vector Y
  */
-void scopy_neon_int4(const unsigned int N, const uint8_t *X, __fp16 *Y);
+void scopy_neon_int4_to_fp16(const unsigned int N, const uint8_t *X, __fp16 *Y);
+
+/**
+ * @brief     copy function with neon: Y = X
+ * @param[in] N number of elements in X
+ * @param[in] X float * for Vector X
+ * @param[in] Y __fp16 * for Vector Y
+ */
+void scopy_neon_fp32_to_fp16(const unsigned int N, const float *X, __fp16 *Y);
+
+/**
+ * @brief     copy function with neon: Y = X
+ * @param[in] N number of elements in X
+ * @param[in] X __fp16 * for Vector X
+ * @param[in] Y float * for Vector Y
+ */
+void scopy_neon_fp16_to_fp32(const unsigned int N, const __fp16 *X, float *Y);
 
 /**
  * @brief     isamax function with neon: index of firt maxima
