@@ -1389,8 +1389,8 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, float *C,
       }
     }
   } else {
-    __fp16 valsB[8];
-    __fp16 valsA[8];
+    float valsB[8];
+    float valsA[8];
     for (unsigned int m = 0; m < M; m++) {
       for (unsigned int n = 0; n < N; n++) {
         float32x4_t sum = vmovq_n_f32(0.0f);
@@ -1405,7 +1405,6 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, float *C,
           float32x4_t b_low = vcvt_f32_f16(vget_low_f16(b));
           float32x4_t b_high = vcvt_f32_f16(vget_high_f16(b));
 
-          // sum = vfmaq_f16(sum, a, b);
           sum = vfmaq_f32(sum, a_low, b_low);
           sum = vfmaq_f32(sum, a_high, b_high);
         }
@@ -1424,15 +1423,11 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, float *C,
             idx++;
           }
           // updating sum
-          float16x8_t a = vld1q_f16(valsA);
-          float16x8_t b = vld1q_f16(valsB);
-          // sum = vfmaq_f16(sum, a, b);
+          float32x4_t a_low = vld1q_f32(valsA);
+          float32x4_t a_high = vld1q_f32(valsA + 4);
 
-          float32x4_t a_low = vcvt_f32_f16(vget_low_f16(a));
-          float32x4_t a_high = vcvt_f32_f16(vget_high_f16(a));
-
-          float32x4_t b_low = vcvt_f32_f16(vget_low_f16(b));
-          float32x4_t b_high = vcvt_f32_f16(vget_high_f16(b));
+          float32x4_t b_low = vld1q_f32(valsB);
+          float32x4_t b_high = vld1q_f32(valsB + 4);
 
           sum = vfmaq_f32(sum, a_low, b_low);
           sum = vfmaq_f32(sum, a_high, b_high);
