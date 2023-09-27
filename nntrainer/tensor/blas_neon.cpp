@@ -275,19 +275,16 @@ void sgemv_transpose_neon(const float *A, const float *X, float *Y,
 
 #ifdef ENABLE_FP16
 
-
-void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
-                             uint32_t rows, uint32_t cols, float alpha,
-                             float beta) {
+void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t rows,
+                     uint32_t cols, float alpha, float beta) {
   const __fp16 *__restrict x;
   const float32x4_t v_beta_32 = vmovq_n_f32(beta);
   float Y32[rows];
 
   unsigned int idx = 0;
   for (; rows - idx >= 8; idx += 8) {
-    float16x8_t y0_7 = vld1q_f16(&Y[idx]);
-    float32x4_t y0_3 = vcvt_f32_f16(vget_low_f16(y0_7));
-    float32x4_t y4_7 = vcvt_f32_f16(vget_high_f16(y0_7));
+    float32x4_t y0_3 = vcvt_f32_f16(vld1_f16(&Y[idx]));
+    float32x4_t y4_7 = vcvt_f32_f16(vld1_f16(&Y[idx+4]));
     y0_3 = vmulq_f32(y0_3, v_beta_32);
     y4_7 = vmulq_f32(y4_7, v_beta_32);
 
@@ -295,8 +292,7 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
     vst1q_f32(&Y32[idx + 4], y4_7);
   }
   for (; rows - idx >= 4; idx += 4) {
-    float16x4_t y0_3_16 = vld1_f16(&Y[idx]);
-    float32x4_t y0_3_32 = vcvt_f32_f16(y0_3_16);
+    float32x4_t y0_3_32 = vcvt_f32_f16(vld1_f16(&Y[idx]));
     y0_3_32 = vmulq_f32(y0_3_32, v_beta_32);
 
     vst1q_f32(&Y32[idx], y0_3_32);
@@ -306,27 +302,16 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
     ++idx;
   }
 
-  float16x8_t v_alpha = vmovq_n_f16(alpha);
-
   idx = 0;
   for (; cols - idx >= 32; idx += 32) {
-    float16x4_t x0_3 = vld1_f16(&X[idx]);
-    float16x4_t x4_7 = vld1_f16(&X[idx + 4]);
-    float16x4_t x8_11 = vld1_f16(&X[idx + 8]);
-    float16x4_t x12_15 = vld1_f16(&X[idx + 12]);
-    float16x4_t x16_19 = vld1_f16(&X[idx + 16]);
-    float16x4_t x20_23 = vld1_f16(&X[idx + 20]);
-    float16x4_t x24_27 = vld1_f16(&X[idx + 24]);
-    float16x4_t x28_31 = vld1_f16(&X[idx + 28]);
-
-    float32x4_t x0_3_f32 = vcvt_f32_f16(x0_3);
-    float32x4_t x4_7_f32 = vcvt_f32_f16(x4_7);
-    float32x4_t x8_11_f32 = vcvt_f32_f16(x8_11);
-    float32x4_t x12_15_f32 = vcvt_f32_f16(x12_15);
-    float32x4_t x16_19_f32 = vcvt_f32_f16(x16_19);
-    float32x4_t x20_23_f32 = vcvt_f32_f16(x20_23);
-    float32x4_t x24_27_f32 = vcvt_f32_f16(x24_27);
-    float32x4_t x28_31_f32 = vcvt_f32_f16(x28_31);
+    float32x4_t x0_3_f32 = vcvt_f32_f16(vld1_f16(&X[idx]));
+    float32x4_t x4_7_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 4]));
+    float32x4_t x8_11_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 8]));
+    float32x4_t x12_15_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 12]));
+    float32x4_t x16_19_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 16]));
+    float32x4_t x20_23_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 20]));
+    float32x4_t x24_27_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 24]));
+    float32x4_t x28_31_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 28]));
 
     if (alpha != 1.0) {
       x0_3_f32 = vmulq_n_f32(x0_3_f32, alpha);
@@ -345,24 +330,14 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
 
     for (unsigned int j = 0; j < rows; ++j) {
       w = &A[j * cols + idx];
-
-      float16x4_t wvec0_3 = vld1_f16(&w[0]);
-      float16x4_t wvec4_7 = vld1_f16(&w[4]);
-      float16x4_t wvec8_11 = vld1_f16(&w[8]);
-      float16x4_t wvec12_15 = vld1_f16(&w[12]);
-      float16x4_t wvec16_19 = vld1_f16(&w[16]);
-      float16x4_t wvec20_23 = vld1_f16(&w[20]);
-      float16x4_t wvec24_27 = vld1_f16(&w[24]);
-      float16x4_t wvec28_31 = vld1_f16(&w[28]);
-
-      float32x4_t wvec0_3_f32 = vcvt_f32_f16(wvec0_3);
-      float32x4_t wvec4_7_f32 = vcvt_f32_f16(wvec4_7);
-      float32x4_t wvec8_11_f32 = vcvt_f32_f16(wvec8_11);
-      float32x4_t wvec12_15_f32 = vcvt_f32_f16(wvec12_15);
-      float32x4_t wvec16_19_f32 = vcvt_f32_f16(wvec16_19);
-      float32x4_t wvec20_23_f32 = vcvt_f32_f16(wvec20_23);
-      float32x4_t wvec24_27_f32 = vcvt_f32_f16(wvec24_27);
-      float32x4_t wvec28_31_f32 = vcvt_f32_f16(wvec28_31);
+      float32x4_t wvec0_3_f32 = vcvt_f32_f16(vld1_f16(&w[0]));
+      float32x4_t wvec4_7_f32 = vcvt_f32_f16(vld1_f16(&w[4]));
+      float32x4_t wvec8_11_f32 = vcvt_f32_f16(vld1_f16(&w[8]));
+      float32x4_t wvec12_15_f32 = vcvt_f32_f16( vld1_f16(&w[12]));
+      float32x4_t wvec16_19_f32 = vcvt_f32_f16(vld1_f16(&w[16]));
+      float32x4_t wvec20_23_f32 = vcvt_f32_f16(vld1_f16(&w[20]));
+      float32x4_t wvec24_27_f32 = vcvt_f32_f16(vld1_f16(&w[24]));
+      float32x4_t wvec28_31_f32 = vcvt_f32_f16(vld1_f16(&w[28]));
 
       float32x4_t y0 = vmulq_f32(wvec0_3_f32, x0_3_f32);
       y0 = vfmaq_f32(y0, wvec4_7_f32, x4_7_f32);
@@ -379,15 +354,10 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
     }
   }
   for (; cols - idx >= 16; idx += 16) {
-    float16x4_t x0_3 = vld1_f16(&X[idx]);
-    float16x4_t x4_7 = vld1_f16(&X[idx + 4]);
-    float16x4_t x8_11 = vld1_f16(&X[idx + 8]);
-    float16x4_t x12_15 = vld1_f16(&X[idx + 12]);
-
-    float32x4_t x0_3_f32 = vcvt_f32_f16(x0_3);
-    float32x4_t x4_7_f32 = vcvt_f32_f16(x4_7);
-    float32x4_t x8_11_f32 = vcvt_f32_f16(x8_11);
-    float32x4_t x12_15_f32 = vcvt_f32_f16(x12_15);
+    float32x4_t x0_3_f32 = vcvt_f32_f16(vld1_f16(&X[idx]));
+    float32x4_t x4_7_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 4]));
+    float32x4_t x8_11_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 8]));
+    float32x4_t x12_15_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 12]));
 
     if (alpha != 1.0) {
       x0_3_f32 = vmulq_n_f32(x0_3_f32, alpha);
@@ -402,16 +372,10 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
 
     for (unsigned int j = 0; j < rows; ++j) {
       w = &A[j * cols + idx];
-
-      float16x4_t wvec0_3 = vld1_f16(&w[0]);
-      float16x4_t wvec4_7 = vld1_f16(&w[4]);
-      float16x4_t wvec8_11 = vld1_f16(&w[8]);
-      float16x4_t wvec12_15 = vld1_f16(&w[12]);
-
-      float32x4_t wvec0_3_f32 = vcvt_f32_f16(wvec0_3);
-      float32x4_t wvec4_7_f32 = vcvt_f32_f16(wvec4_7);
-      float32x4_t wvec8_11_f32 = vcvt_f32_f16(wvec8_11);
-      float32x4_t wvec12_15_f32 = vcvt_f32_f16(wvec12_15);
+      float32x4_t wvec0_3_f32 = vcvt_f32_f16(vld1_f16(&w[0]));
+      float32x4_t wvec4_7_f32 = vcvt_f32_f16( vld1_f16(&w[4]));
+      float32x4_t wvec8_11_f32 = vcvt_f32_f16(vld1_f16(&w[8]));
+      float32x4_t wvec12_15_f32 = vcvt_f32_f16(vld1_f16(&w[12]));
 
       float32x4_t y0 = vmulq_f32(wvec0_3_f32, x0_3_f32);
       y0 = vfmaq_f32(y0, wvec4_7_f32, x4_7_f32);
@@ -424,12 +388,8 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
     }
   }
   for (; cols - idx >= 8; idx += 8) {
-
-    float16x4_t x0_3 = vld1_f16(&X[idx]);
-    float16x4_t x4_7 = vld1_f16(&X[idx + 4]);
-
-    float32x4_t x0_3_f32 = vcvt_f32_f16(x0_3);
-    float32x4_t x4_7_f32 = vcvt_f32_f16(x4_7);
+    float32x4_t x0_3_f32 = vcvt_f32_f16(vld1_f16(&X[idx]));
+    float32x4_t x4_7_f32 = vcvt_f32_f16(vld1_f16(&X[idx + 4]));
 
     if (alpha != 1.0) {
       x0_3_f32 = vmulq_n_f32(x0_3_f32, alpha);
@@ -442,11 +402,8 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
 
     for (unsigned int j = 0; j < rows; ++j) {
       w = &A[j * cols + idx];
-      float16x4_t wvec0_3 = vld1_f16(&w[0]);
-      float16x4_t wvec4_7 = vld1_f16(&w[4]);
-
-      float32x4_t wvec0_3_f32 = vcvt_f32_f16(wvec0_3);
-      float32x4_t wvec4_7_f32 = vcvt_f32_f16(wvec4_7);
+      float32x4_t wvec0_3_f32 = vcvt_f32_f16(vld1_f16(&w[0]));
+      float32x4_t wvec4_7_f32 = vcvt_f32_f16(vld1_f16(&w[4]));
 
       float32x4_t y0 = vmulq_f32(wvec0_3_f32, x0_3_f32);
       y0 = vfmaq_f32(y0, wvec4_7_f32, x4_7_f32);
@@ -457,10 +414,7 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
     }
   }
   for (; cols - idx >= 4; idx += 4) {
-
-    float16x4_t x0_3 = vld1_f16(&X[idx]);
-
-    float32x4_t x0_3_f32 = vcvt_f32_f16(x0_3);
+    float32x4_t x0_3_f32 = vcvt_f32_f16(vld1_f16(&X[idx]));
 
     if (alpha != 1.0) {
       x0_3_f32 = vmulq_n_f32(x0_3_f32, alpha);
@@ -472,10 +426,7 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
 
     for (unsigned int j = 0; j < rows; ++j) {
       w = &A[j * cols + idx];
-      float16x4_t wvec0_3 = vld1_f16(&w[0]);
-
-      float32x4_t wvec0_3_f32 = vcvt_f32_f16(wvec0_3);
-
+      float32x4_t wvec0_3_f32 = vcvt_f32_f16(vld1_f16(&w[0]));
       float32x4_t y0 = vmulq_f32(wvec0_3_f32, x0_3_f32);
 
       yVal = vaddvq_f32(y0);
@@ -523,20 +474,17 @@ void sgemv_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
   return;
 }
 
-void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X,
-                                      __fp16 *Y, uint32_t rows, uint32_t cols,
-                                      float alpha, float beta) {
+void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X, __fp16 *Y,
+                               uint32_t rows, uint32_t cols, float alpha,
+                               float beta) {
   float Y32[cols];
   const float32x4_t v_beta_32 = vmovq_n_f32(beta);
 
   unsigned int idx = 0;
 
   for (; cols - idx >= 8; idx += 8) {
-    float16x4_t y0_3 = vld1_f16(&Y[idx]);
-    float16x4_t y4_7 = vld1_f16(&Y[idx + 4]);
-
-    float32x4_t y0_3_32 = vcvt_f32_f16(y0_3);
-    float32x4_t y4_7_32 = vcvt_f32_f16(y4_7);
+    float32x4_t y0_3_32 = vcvt_f32_f16(vld1_f16(&Y[idx]));
+    float32x4_t y4_7_32 = vcvt_f32_f16(vld1_f16(&Y[idx + 4]));
 
     y0_3_32 = vmulq_f32(y0_3_32, v_beta_32);
     y4_7_32 = vmulq_f32(y4_7_32, v_beta_32);
@@ -545,12 +493,11 @@ void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X,
     vst1q_f32(&Y32[idx + 4], y4_7_32);
   }
   for (; cols - idx >= 4; idx += 4) {
-    float16x4_t y0_3 = vld1_f16(&Y[idx]);
-    float32x4_t y0_3_32 = vcvt_f32_f16(y0_3);
+    float32x4_t y0_3_32 = vcvt_f32_f16(vld1_f16(&Y[idx]));
     y0_3_32 = vmulq_f32(y0_3_32, v_beta_32);
     vst1q_f32(&Y32[idx], y0_3_32);
   }
-  for (;idx < cols; ++idx) {
+  for (; idx < cols; ++idx) {
     Y32[idx] = beta * Y[idx];
   }
 
@@ -573,27 +520,17 @@ void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X,
 
       w = &A[i * cols + idx];
 
-      float16x4_t wvec0_3 = vld1_f16(&w[0]);
-      float16x4_t wvec4_7 = vld1_f16(&w[4]);
-      float16x4_t wvec8_11 = vld1_f16(&w[8]);
-      float16x4_t wvec12_15 = vld1_f16(&w[12]);
-      float16x4_t wvec16_19 = vld1_f16(&w[16]);
-      float16x4_t wvec20_23 = vld1_f16(&w[20]);
-      float16x4_t wvec24_27 = vld1_f16(&w[24]);
-      float16x4_t wvec28_31 = vld1_f16(&w[28]);
+      float32x4_t wvec0_3_f32 = vcvt_f32_f16(vld1_f16(&w[0]));
+      float32x4_t wvec4_7_f32 = vcvt_f32_f16(vld1_f16(&w[4]));
 
+      float32x4_t wvec8_11_f32 = vcvt_f32_f16(vld1_f16(&w[8]));
+      float32x4_t wvec12_15_f32 = vcvt_f32_f16(vld1_f16(&w[12]));
 
-      float32x4_t wvec0_3_f32 = vcvt_f32_f16(wvec0_3);
-      float32x4_t wvec4_7_f32 = vcvt_f32_f16(wvec4_7);
+      float32x4_t wvec16_19_f32 = vcvt_f32_f16(vld1_f16(&w[16]));
+      float32x4_t wvec20_23_f32 = vcvt_f32_f16(vld1_f16(&w[20]));
 
-      float32x4_t wvec8_11_f32 = vcvt_f32_f16(wvec8_11);
-      float32x4_t wvec12_15_f32 = vcvt_f32_f16(wvec12_15);
-
-      float32x4_t wvec16_19_f32 = vcvt_f32_f16(wvec16_19);
-      float32x4_t wvec20_23_f32 = vcvt_f32_f16(wvec20_23);
-
-      float32x4_t wvec24_27_f32 = vcvt_f32_f16(wvec24_27);
-      float32x4_t wvec28_31_f32 = vcvt_f32_f16(wvec28_31);
+      float32x4_t wvec24_27_f32 = vcvt_f32_f16(vld1_f16(&w[24]));
+      float32x4_t wvec28_31_f32 = vcvt_f32_f16(vld1_f16(&w[28]));
 
       y0_3 = vfmaq_n_f32(y0_3, wvec0_3_f32, x);
       y4_7 = vfmaq_n_f32(y4_7, wvec4_7_f32, x);
@@ -628,16 +565,11 @@ void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X,
 
       w = &A[i * cols + idx];
 
-      float16x4_t wvec0_3 = vld1_f16(&w[0]);
-      float16x4_t wvec4_7 = vld1_f16(&w[4]);
-      float16x4_t wvec8_11 = vld1_f16(&w[8]);
-      float16x4_t wvec12_15 = vld1_f16(&w[12]);
+      float32x4_t wvec0_3_f32 = vcvt_f32_f16(vld1_f16(&w[0]));
+      float32x4_t wvec4_7_f32 = vcvt_f32_f16(vld1_f16(&w[4]));
 
-      float32x4_t wvec0_3_f32 = vcvt_f32_f16(wvec0_3);
-      float32x4_t wvec4_7_f32 = vcvt_f32_f16(wvec4_7);
-
-      float32x4_t wvec8_11_f32 = vcvt_f32_f16(wvec8_11);
-      float32x4_t wvec12_15_f32 = vcvt_f32_f16(wvec12_15);
+      float32x4_t wvec8_11_f32 = vcvt_f32_f16(vld1_f16(&w[8]));
+      float32x4_t wvec12_15_f32 = vcvt_f32_f16(vld1_f16(&w[12]));
 
       y0_3 = vfmaq_n_f32(y0_3, wvec0_3_f32, x);
       y4_7 = vfmaq_n_f32(y4_7, wvec4_7_f32, x);
@@ -656,11 +588,8 @@ void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X,
       float32x4_t y0_3 = vld1q_f32(&Y32[idx]);
       float32x4_t y4_7 = vld1q_f32(&Y32[idx + 4]);
 
-      float16x4_t wvec0_3 = vld1_f16(&A[i * cols + idx]);
-      float16x4_t wvec4_7 = vld1_f16(&A[i * cols + idx]);
-
-      float32x4_t wvec0_3_f32 = vcvt_f32_f16(wvec0_3);
-      float32x4_t wvec3_7_f32 = vcvt_f32_f16(wvec4_7);
+      float32x4_t wvec0_3_f32 = vcvt_f32_f16(vld1_f16(&A[i * cols + idx]));
+      float32x4_t wvec3_7_f32 = vcvt_f32_f16(vld1_f16(&A[i * cols + idx]));
 
       y0_3 = vfmaq_n_f32(y0_3, wvec0_3_f32, x);
       y4_7 = vfmaq_n_f32(y4_7, wvec3_7_f32, x);
@@ -673,9 +602,7 @@ void sgemv_transpose_neon_fp16(const __fp16 *A, const __fp16 *X,
 
       float32x4_t y0_3 = vld1q_f32(&Y32[idx]);
 
-      float16x4_t wvec0_3 = vld1_f16(&A[i * cols + idx]);
-
-      float32x4_t wvec0_3_32 = vcvt_f32_f16(wvec0_3);
+      float32x4_t wvec0_3_32 = vcvt_f32_f16(vld1_f16(&A[i * cols + idx]));
 
       y0_3 = vfmaq_n_f32(y0_3, wvec0_3_32, x);
 
@@ -882,7 +809,8 @@ void scopy_neon_fp16(const unsigned int N, const __fp16 *X, __fp16 *Y) {
     Y[idx] = X[idx];
 }
 
-void scopy_neon_int4_to_fp16(const unsigned int N, const uint8_t *X, __fp16 *Y) {
+void scopy_neon_int4_to_fp16(const unsigned int N, const uint8_t *X,
+                             __fp16 *Y) {
 
   unsigned int idx = 0;
 
