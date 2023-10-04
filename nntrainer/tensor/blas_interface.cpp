@@ -33,16 +33,16 @@
     }                                        \
   } while (0);
 
-#define sgemv_loop_fp16(ci, cj, cM, cN)             \
-  do {                                              \
-    _FP16 y0;                                       \
-    unsigned int i, j;                              \
-    for (ci = 0; ci != cM; ci++) {                  \
-      y0 = Y[ci * incy] * static_cast<_FP16>(beta); \
-      for (cj = 0; cj != cN; cj++)                  \
-        y0 += A[i + j * lda] * X[cj * incx];        \
-      Y[ci * incy] = y0;                            \
-    }                                               \
+#define sgemv_loop_fp16(ci, cj, cM, cN)                                 \
+  do {                                                                  \
+    float y0;                                                           \
+    unsigned int i, j;                                                  \
+    for (ci = 0; ci != cM; ci++) {                                      \
+      y0 = static_cast<float>(Y[ci * incy] * static_cast<_FP16>(beta)); \
+      for (cj = 0; cj != cN; cj++)                                      \
+        y0 += static_cast<float>(A[i + j * lda] * X[cj * incx]);        \
+      Y[ci * incy] = static_cast<_FP16>(y0);                            \
+    }                                                                   \
   } while (0);
 
 #define saxpy_loop_fp16()                                                  \
@@ -56,15 +56,15 @@
   do {                                                                    \
     for (unsigned int m = 0; m < M; ++m) {                                \
       for (unsigned int n = 0; n < N; ++n) {                              \
-        _FP16 c = 0;                                                      \
+        float c = 0;                                                      \
         _FP16 c_old = C[m * ldc + n];                                     \
         for (unsigned int k = 0; k < K; ++k) {                            \
           _FP16 a, b;                                                     \
           a = ((TransA == CblasTrans) ? A[k * lda + m] : A[m * lda + k]); \
           b = ((TransB == CblasTrans) ? B[n * ldb + k] : B[k * ldb + n]); \
-          c += a * b;                                                     \
+          c += static_cast<float>(a * b);                                 \
         }                                                                 \
-        C[m * ldc + n] = static_cast<_FP16>(alpha) * c;                   \
+        C[m * ldc + n] = alpha * c;                                       \
         if (beta != 0.0)                                                  \
           C[m * ldc + n] += static_cast<_FP16>(beta) * c_old;             \
       }                                                                   \
@@ -115,7 +115,6 @@ static void sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
 #endif
   }
 }
-
 
 static _FP16 sdot_FP16(const unsigned int N, const _FP16 *X,
                        const unsigned int incX, const _FP16 *Y,
@@ -179,7 +178,6 @@ static void scopy_INT4(const unsigned int N, const uint8_t *X, const int incX,
   }
 #endif
 }
-
 
 static void ewvm_FP16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
                       _FP16 *Z) {
@@ -247,9 +245,8 @@ static void sgemm_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
                        const unsigned int ldc) {
 
 #ifdef USE__FP16
-    nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
-                                     TransA == CblasTrans,
-                                     TransB == CblasTrans);
+  nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
+                                   TransA == CblasTrans, TransB == CblasTrans);
 #else
   sgemm_loop_fp16();
 #endif
@@ -334,7 +331,6 @@ void sgemv(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, const unsigned int M,
            const float beta, _FP16 *Y, const int incY) {
   sgemv_FP16(order, TransA, M, N, alpha, A, lda, X, incX, beta, Y, incY);
 }
-
 
 unsigned int isamax(const unsigned int N, const _FP16 *X, const int incX) {
   /// @todo isamax_FP16 for BLAS_NUM_THREADS
