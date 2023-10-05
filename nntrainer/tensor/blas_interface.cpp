@@ -33,16 +33,16 @@
     }                                        \
   } while (0);
 
-#define sgemv_loop_fp16(ci, cj, cM, cN)             \
-  do {                                              \
-    _FP16 y0;                                       \
-    unsigned int i, j;                              \
-    for (ci = 0; ci != cM; ci++) {                  \
-      y0 = Y[ci * incy] * static_cast<_FP16>(beta); \
-      for (cj = 0; cj != cN; cj++)                  \
-        y0 += A[i + j * lda] * X[cj * incx];        \
-      Y[ci * incy] = y0;                            \
-    }                                               \
+#define sgemv_loop_fp16(ci, cj, cM, cN)                                 \
+  do {                                                                  \
+    float y0;                                                           \
+    unsigned int i, j;                                                  \
+    for (ci = 0; ci != cM; ci++) {                                      \
+      y0 = static_cast<float>(Y[ci * incy] * static_cast<_FP16>(beta)); \
+      for (cj = 0; cj != cN; cj++)                                      \
+        y0 += static_cast<float>(A[i + j * lda] * X[cj * incx]);        \
+      Y[ci * incy] = static_cast<_FP16>(y0);                            \
+    }                                                                   \
   } while (0);
 
 #define saxpy_loop_fp16()                                                  \
@@ -56,15 +56,15 @@
   do {                                                                    \
     for (unsigned int m = 0; m < M; ++m) {                                \
       for (unsigned int n = 0; n < N; ++n) {                              \
-        _FP16 c = 0;                                                      \
+        float c = 0;                                                      \
         _FP16 c_old = C[m * ldc + n];                                     \
         for (unsigned int k = 0; k < K; ++k) {                            \
           _FP16 a, b;                                                     \
           a = ((TransA == CblasTrans) ? A[k * lda + m] : A[m * lda + k]); \
           b = ((TransB == CblasTrans) ? B[n * ldb + k] : B[k * ldb + n]); \
-          c += a * b;                                                     \
+          c += static_cast<float>(a * b);                                 \
         }                                                                 \
-        C[m * ldc + n] = static_cast<_FP16>(alpha) * c;                   \
+        C[m * ldc + n] = alpha * c;                                       \
         if (beta != 0.0)                                                  \
           C[m * ldc + n] += static_cast<_FP16>(beta) * c_old;             \
       }                                                                   \
@@ -103,54 +103,13 @@ static void sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
 
   if (TransA == CblasTrans) {
 #ifdef USE__FP16
-    if (incX == 1 && incY == 1 && (N % 8 == 0)) {
-      nntrainer::neon::sgemv_transpose_neon_fp16_32copy(A, X, Y, M, N, alpha, beta);
-      // nntrainer::neon::sgemv_transpose_neon_fp16(A, X, Y, M, N, alpha, beta);
-    } else {
-      sgemv_loop_fp16(i, j, N, M);
-    }
+    nntrainer::neon::sgemv_transpose_neon_fp16(A, X, Y, M, N, alpha, beta);
 #else
     sgemv_loop_fp16(i, j, N, M);
 #endif
   } else {
 #ifdef USE__FP16
-  // std::cout << M << " X " << N << " sgemv \n"; 
-
-    // if (incX == 1 && incY == 1 && (N % 4 == 0)) {
-    //   nntrainer::neon::sgemv_neon_fp16_pad(A, X, Y, M, N, alpha, beta);
-    //   // nntrainer::neon::sgemv_neon_fp16_f32copy(A, X, Y, M, N, alpha, beta);
-    //   // nntrainer::neon::sgemv_neon_fp16(A, X, Y, M, N, alpha, beta);
-    // } else {
-    //   sgemv_loop_fp16(j, i, M, N);
-    // }
-
-    nntrainer::neon::sgemv_neon_fp16_pad(A, X, Y, M, N, alpha, beta);
-
-#else
-    sgemv_loop_fp16(j, i, M, N);
-#endif
-  }
-}
-
-static void naive_sgemv_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
-                       const unsigned int M, const unsigned int N,
-                       const float alpha, const _FP16 *A,
-                       const unsigned int lda, const _FP16 *X, const int incX,
-                       const float beta, _FP16 *Y, const int incY) {
-
-  unsigned int incy = abs(incY);
-  unsigned int incx = abs(incX);
-  std::cout << "naive_sgemv_FP16\n ";
-
-  if (TransA == CblasTrans) {
-#ifdef USE__FP16
-    sgemv_loop_fp16(i, j, N, M);
-#else
-    sgemv_loop_fp16(i, j, N, M);
-#endif
-  } else {
-#ifdef USE__FP16
-    sgemv_loop_fp16(j, i, M, N);
+    nntrainer::neon::sgemv_neon_fp16(A, X, Y, M, N, alpha, beta);
 #else
     sgemv_loop_fp16(j, i, M, N);
 #endif
@@ -207,7 +166,7 @@ static void scopy_INT4(const unsigned int N, const uint8_t *X, const int incX,
 
 #ifdef USE__FP16
   if (incX == 1 && incY == 1) {
-    nntrainer::neon::scopy_neon_int4(N, X, Y);
+    nntrainer::neon::scopy_neon_int4_to_fp16(N, X, Y);
   } else {
     throw std::invalid_argument(
       "Error: incX == 1 && incY == 1 is supported only");
@@ -217,37 +176,6 @@ static void scopy_INT4(const unsigned int N, const uint8_t *X, const int incX,
     Y[2 * idx] = X[idx] >> 4;
     Y[2 * idx + 1] = X[idx] & 0x0f;
   }
-#endif
-}
-
-static void naive_sgemm_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
-                             CBLAS_TRANSPOSE TransB, const unsigned int M,
-                             const unsigned int N, const unsigned int K,
-                             const float alpha, const _FP16 *A,
-                             const unsigned int lda, const _FP16 *B,
-                             const unsigned int ldb, const float beta, _FP16 *C,
-                             const unsigned int ldc) {
-
-#ifdef USE__FP16
-  // std::cout << "naive_sgemm_FP16" << std::endl;
-
-  // if ((N % 8 == 0) && (K % 8 == 0)) {
-  //   nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
-  //                                    TransA == CblasTrans,
-  //                                    TransB == CblasTrans);
-  //   // // std::cout<< "M : " << M << " K : " << K << " N : "<< N<<std::endl;
-  //   // // std::cout<< "A[0] : " << float(A[0]) << " B[0] : " << float(B[0]) << "
-  //   // A[1] : "<< float(A[1])<<std::endl;
-
-  // } else {
-  //   // std::cout << M << " " << K << " "<< N<<std::endl;
-  //   sgemm_loop_fp16();
-  // }
-
-  sgemm_loop_fp16();
-
-#else
-  sgemm_loop_fp16();
 #endif
 }
 
@@ -317,9 +245,8 @@ static void sgemm_FP16(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
                        const unsigned int ldc) {
 
 #ifdef USE__FP16
-    nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
-                                     TransA == CblasTrans,
-                                     TransB == CblasTrans);
+  nntrainer::neon::sgemm_neon_fp16(A, B, C, M, N, K, alpha, beta,
+                                   TransA == CblasTrans, TransB == CblasTrans);
 #else
   sgemm_loop_fp16();
 #endif
@@ -404,13 +331,6 @@ void sgemv(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, const unsigned int M,
            const float beta, _FP16 *Y, const int incY) {
   sgemv_FP16(order, TransA, M, N, alpha, A, lda, X, incX, beta, Y, incY);
 }
-void naive_sgemv(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, const unsigned int M,
-           const unsigned int N, const float alpha, const _FP16 *A,
-           const unsigned int lda, const _FP16 *X, const int incX,
-           const float beta, _FP16 *Y, const int incY){
-  naive_sgemv_FP16(order, TransA, M, N, alpha, A, lda, X, incX, beta, Y, incY);
-
-           }
 
 unsigned int isamax(const unsigned int N, const _FP16 *X, const int incX) {
   /// @todo isamax_FP16 for BLAS_NUM_THREADS
@@ -700,15 +620,7 @@ void sgemm(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
             ldc);
 #endif
 }
-void naive_sgemm(CBLAS_ORDER order, CBLAS_TRANSPOSE TransA,
-                 CBLAS_TRANSPOSE TransB, const unsigned int M,
-                 const unsigned int N, const unsigned int K, const float alpha,
-                 const _FP16 *A, const unsigned int lda, const _FP16 *B,
-                 const unsigned int ldb, const float beta, _FP16 *C,
-                 const unsigned int ldc) {
-  naive_sgemm_FP16(order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta,
-                   C, ldc);
-}
+
 void scopy(const unsigned int N, const void *X, const int incX, void *Y,
            const int incY, ml::train::TensorDim::DataType d_type) {
 
