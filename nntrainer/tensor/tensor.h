@@ -34,13 +34,13 @@
 #include <vector>
 
 #include <blas_interface.h>
+#include <ctime>
 #include <iostream>
 #include <memory_data.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <tensor_dim.h>
 #include <util_func.h>
-#include <ctime>
 
 #include <chrono>
 
@@ -101,7 +101,6 @@ public:
     name(name_),
     data(nullptr),
     offset(0),
-    output_axis(3),
     src_tensor() {}
 
   /**
@@ -235,7 +234,6 @@ public:
     offset = 0;
     contiguous = true;
     initializer = Initializer::NONE;
-    output_axis = 3;
     // if fm == Tformat::NCHW, then dim[0] == batch , dim[1] == channel, dim[2]
     // == height, dim[3] == width. and if fm == Tformat::NHWC, dim[0] == batch,
     // dim[1] == height, dim[2] == width, dim[3] == channel
@@ -396,7 +394,6 @@ public:
     offset = 0;
     contiguous = true;
     initializer = Initializer::NONE;
-    output_axis = 3;
 
     // if fm == Tformat::NCHW, then dim[0] == batch , dim[1] == channel, dim[2]
     // == height, dim[3] == width. and if fm == Tformat::NHWC, dim[0] == batch,
@@ -1958,7 +1955,6 @@ public:
    */
   Tdatatype getDataType() const { return dim.getDataType(); }
 
-
   // /**
   //  * @brief Set output axis of the tensor
   //  * @param[in] axis output axis (0: batch, 1: channel, 2: height, 3: width)
@@ -1998,7 +1994,6 @@ public:
    */
   std::vector<uint8_t> getZeroPoints() const;
 
-
   /**
    * @brief     Dequantize Tensor
    * @retval    Dequantized Tensor
@@ -2010,15 +2005,15 @@ public:
     Tensor t =
       Tensor(batch(), channel(), height(), width(), getFormat(), dtype);
 
-
     return dequantize<T>(t, axis);
   }
 
-  void dequantize(Tensor &output, unsigned int axis) const ;
+  void dequantize(Tensor &output, unsigned int axis) const;
 
   void flate(Tensor &output) const;
 
-  void parallel_flate(Tensor &output, unsigned int start, unsigned int end) const;
+  void parallel_flate(Tensor &output, unsigned int start,
+                      unsigned int end) const;
 
   static constexpr float epsilon = 1e-5;
 
@@ -2032,9 +2027,8 @@ private:
   std::shared_ptr<MemoryData> data;
   size_t offset;
 
-  // int output_axis;
   std::vector<float> scale_factors_32;
-#ifdef ENABLE_FP16  
+#ifdef ENABLE_FP16
   std::vector<_FP16> scale_factors_16;
 #endif
 

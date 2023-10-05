@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -34,7 +35,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <stdio.h>
-#include <future>
 #include <thread>
 
 #include <lazy_tensor.h>
@@ -105,7 +105,6 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Tensor::Initializer init,
     dim = d;
     strides = d.computeStrides();
     initializer = init;
-    output_axis = 3;
     if (alloc_now)
       allocate();
   }
@@ -130,7 +129,8 @@ public:
   SrcSharedTensor() : src(nullptr), off(0) {}
 
   SrcSharedTensor(const Tensor *tensor, size_t offset) :
-    src(tensor), off(offset) {}
+    src(tensor),
+    off(offset) {}
 
   /**
    * @brief   Get the allocated src tensor
@@ -1098,7 +1098,7 @@ Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
                  _FP16 *out_buf) {
       if (e.strides[3] == 1 && strides[3] == 1 && strides[3] == 1 &&
           alpha == 0) {
-        ewva(e.buffer_size, buf, m_buf, out_buf);	
+        ewva(e.buffer_size, buf, m_buf, out_buf);
         // std::transform(buf, buf + e.buffer_size, m_buf, out_buf,
         //                std::plus<_FP16>());
       } else {
@@ -2717,7 +2717,7 @@ void Tensor::print(std::ostream &out) const {
 #endif
   } else if (getDataType() == ml::train::TensorDim::DataType::QINT8) {
     const uint8_t *data = getData<uint8_t>();
-    unsigned int len = (size()+1)/2;
+    unsigned int len = (size() + 1) / 2;
     out << "data addr: " << reinterpret_cast<const float *>(data) << '\n';
     out << dim;
 
@@ -3135,7 +3135,7 @@ void Tensor::save(std::ostream &file) {
     << "save size: " << bytes()
     << " is too big. It cannot be represented by std::streamsize";
   if (this->getDataType() == ml::train::TensorDim::DataType::FP32) {
-    
+
     // std::vector<_FP16> temp(size());
     // for (unsigned int i = 0; i < size(); ++i) {
     //   temp[i] = static_cast<_FP16>(getData()[i]);
@@ -3596,7 +3596,7 @@ Tensor::BroadcastInfo Tensor::computeBroadcastInfo(const Tensor &m) const {
     if (inner_loop_size > e.buffer_size) {
       e.buffer_axis = axis;
       e.buffer_size = inner_loop_size;
-      e.strides[3] = 0; 
+      e.strides[3] = 0;
     }
   }
 
@@ -3654,39 +3654,6 @@ uint8_t Tensor::decode_qint(uint8_t val, bool isHigh) const {
   return val;
 }
 
-// void Tensor::setOutputAxis(int axis) {
-//   if (axis < 0 || axis > 3) {
-//     throw std::invalid_argument("Error: invalid parameter");
-//   }
-//   output_axis = axis;
-// }
-
-// int Tensor::getOutputAxis() const { return output_axis; }
-
-// void Tensor::setZeroPoints(std::vector<uint8_t> zp) {
-//   if (zp.empty()) {
-//     throw std::invalid_argument("Error: invalid parameter");
-//   }
-
-
-  // if (output_axis == 0 && scales.size() != batch()) {
-  //   throw std::invalid_argument("Error: scale_factors.size() != batch() ");
-  // }
-
-  // if (output_axis == 1 && scales.size() != channel()) {
-  //   throw std::invalid_argument("Error: scale_factors.size() != channel() ");
-  // }
-
-  // if (output_axis == 2 && scales.size() != height()) {
-  //   throw std::invalid_argument("Error: scale_factors.size() != height() ");
-  // }
-
-  // if (output_axis == 3 && scales.size() != width()) {
-  //   throw std::invalid_argument("Error: scale_factors.size() != width() ");
-  // }
-
-  // scale_factors_32 = scales;
-// }
 void Tensor::setScaleFactors(std::vector<float> scales) {
   if (scales.empty()) {
     throw std::invalid_argument("Error: invalid parameter");
@@ -3752,7 +3719,7 @@ void Tensor::dequantize(Tensor &output, unsigned int axis) const {
   if (output.getDataType() == Tdatatype::FP16 && scale_factors_16.empty()) {
     throw std::invalid_argument("Error: No scale factors");
   }
-#endif  
+#endif
 
   if (zero_points.empty()) {
     throw std::invalid_argument("Error: No zero points");
