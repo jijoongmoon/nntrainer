@@ -1247,14 +1247,9 @@ void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B,
 
       for (n = 0; (N - n) >= 8; n += 8) {
         float16x8_t b0_7 = vld1q_f16(&B[k * N + n]);
-        float32x4_t b0_7_0_low = vcvt_f32_f16(vget_low_f16(b0_7));
-        float32x4_t b0_7_0_high = vcvt_f32_f16(vget_high_f16(b0_7));
-
-        float32x4_t c0_7_low_32 = vld1q_f32(&C[m * N + n]);
-        float32x4_t c0_7_high_32 = vld1q_f32(&C[m * N + n + 4]);
-
-        c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a0);
-        c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a0);
+        
+        float32x4_t c0_7_low_32 = vfmaq_n_f32(vld1q_f32(&C[m * N + n]), vcvt_f32_f16(vget_low_f16(b0_7)), a0);
+        float32x4_t c0_7_high_32 = vfmaq_n_f32(vld1q_f32(&C[m * N + n + 4]), vcvt_f32_f16(vget_high_f16(b0_7)), a0);
 
         vst1q_f32(&C[m * N + n], c0_7_low_32);
         vst1q_f32(&C[m * N + n + 4], c0_7_high_32);
@@ -1276,14 +1271,8 @@ void sgemm_neon_fp16_noTrans(const __fp16 *A, const __fp16 *B,
           valsC[idx - n] = C[m * N + idx];
         }
 
-        float32x4_t b0_7_0_low = vld1q_f32(valsB);
-        float32x4_t b0_7_0_high = vld1q_f32(valsB + 4);
-
-        float32x4_t c0_7_low_32 = vld1q_f32(valsC);
-        float32x4_t c0_7_high_32 = vld1q_f32(valsC + 4);
-
-        c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a);
-        c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a);
+        float32x4_t c0_7_low_32 = vfmaq_n_f32(vld1q_f32(valsC), vld1q_f32(valsB), a);
+        float32x4_t c0_7_high_32 = vfmaq_n_f32(vld1q_f32(valsC + 4), vld1q_f32(valsB + 4), a);
 
         vst1q_f32(valsC, c0_7_low_32);
         vst1q_f32(valsC + 4, c0_7_high_32);
@@ -1308,15 +1297,9 @@ void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, float *C,
       for (; (N - n) >= 8; n += 8) {
         float16x8_t b = vld1q_f16(&B[k * N + n]);
 
-        float32x4_t b0_7_0_low = vcvt_f32_f16(vget_low_f16(b));
-        float32x4_t b0_7_0_high = vcvt_f32_f16(vget_high_f16(b));
-
         // load previously calculated C
-        float32x4_t c0_7_low_32 = vld1q_f32(&C[m * N + n]);
-        float32x4_t c0_7_high_32 = vld1q_f32(&C[m * N + n + 4]);
-
-        c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a);
-        c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a);
+        float32x4_t c0_7_low_32 = vfmaq_n_f32(vld1q_f32(&C[m * N + n]), vcvt_f32_f16(vget_low_f16(b)), a);
+        float32x4_t c0_7_high_32 = vfmaq_n_f32(vld1q_f32(&C[m * N + n + 4]), vcvt_f32_f16(vget_high_f16(b)), a);
 
         vst1q_f32(&C[m * N + n], c0_7_low_32);
         vst1q_f32(&C[m * N + n + 4], c0_7_high_32);
@@ -1331,14 +1314,8 @@ void sgemm_neon_fp16_transA(const __fp16 *A, const __fp16 *B, float *C,
           valsC[idx - n] = C[m * N + idx];
         }
 
-        float32x4_t b0_7_0_low = vld1q_f32(valsB);
-        float32x4_t b0_7_0_high = vld1q_f32(valsB + 4);
-
-        float32x4_t c0_7_low_32 = vld1q_f32(valsC);
-        float32x4_t c0_7_high_32 = vld1q_f32(valsC + 4);
-
-        c0_7_low_32 = vfmaq_n_f32(c0_7_low_32, b0_7_0_low, a);
-        c0_7_high_32 = vfmaq_n_f32(c0_7_high_32, b0_7_0_high, a);
+        float32x4_t c0_7_low_32 = vfmaq_n_f32(vld1q_f32(valsC), vld1q_f32(valsB), a);
+        float32x4_t c0_7_high_32 = vfmaq_n_f32(vld1q_f32(valsC + 4), vld1q_f32(valsB + 4), a);
 
         vst1q_f32(valsC, c0_7_low_32);
         vst1q_f32(valsC + 4, c0_7_high_32);
@@ -1423,14 +1400,8 @@ void sgemm_neon_fp16_transB(const __fp16 *A, const __fp16 *B, float *C,
             idx++;
           }
           // updating sum
-          float32x4_t a_low = vld1q_f32(valsA);
-          float32x4_t a_high = vld1q_f32(valsA + 4);
-
-          float32x4_t b_low = vld1q_f32(valsB);
-          float32x4_t b_high = vld1q_f32(valsB + 4);
-
-          sum = vfmaq_f32(sum, a_low, b_low);
-          sum = vfmaq_f32(sum, a_high, b_high);
+          sum = vfmaq_f32(sum, vld1q_f32(valsA), vld1q_f32(valsB));
+          sum = vfmaq_f32(sum, vld1q_f32(valsA + 4), vld1q_f32(valsB + 4));
         }
 
         sum = vmulq_n_f32(sum, alpha);
@@ -1454,10 +1425,8 @@ void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B,
       for (; (M - m) >= 8; m += 8) {
         float16x8_t a = vld1q_f16(&A[k * M + m]);
 
-        float32x4_t a_low = vcvt_f32_f16(vget_low_f16(a));
-        float32x4_t a_high = vcvt_f32_f16(vget_high_f16(a));
-        a_low = vmulq_n_f32(a_low, b);
-        a_high = vmulq_n_f32(a_high, b);
+        float32x4_t a_low = vmulq_n_f32(vcvt_f32_f16(vget_low_f16(a)), b);
+        float32x4_t a_high = vmulq_n_f32(vcvt_f32_f16(vget_high_f16(a)), b);
         vst1q_f32(vals, a_low);
         vst1q_f32(vals + 4, a_high);
 
@@ -1472,10 +1441,8 @@ void sgemm_neon_fp16_transAB(const __fp16 *A, const __fp16 *B,
           vals[idx - m] = A[k * M + idx];
         }
 
-        float32x4_t a_low = vld1q_f32(vals);
-        float32x4_t a_high = vld1q_f32(vals + 4);
-        a_low = vmulq_n_f32(a_low, b);
-        a_high = vmulq_n_f32(a_high, b);
+        float32x4_t a_low = vmulq_n_f32(vld1q_f32(vals), b);
+        float32x4_t a_high = vmulq_n_f32(vld1q_f32(vals + 4), b);
         vst1q_f32(vals, a_low);
         vst1q_f32(vals + 4, a_high);
 
