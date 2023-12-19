@@ -32,7 +32,8 @@ tensor_headers = [
   'weight.h',
   'var_grad.h',    
   'tensor_wrap_specs.h',
-  'blas_interface.h'
+  'blas_interface.h',
+  'BiQGEMM.h',
 ]
 
 arch = target_machine.cpu_family()
@@ -52,3 +53,5 @@ endforeach
 foreach h : tensor_headers
   nntrainer_headers += meson.current_source_dir() / h
 endforeach
+
+install_subdir('BiQGEMM', install_dir : nntrainer_prefix / 'include' / 'nntrainer')
