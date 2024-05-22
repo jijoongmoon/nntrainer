@@ -842,10 +842,12 @@ void scopy(const unsigned int N, const float *X, const int incX, float *Y,
 #ifdef BLAS_NUM_THREADS
   openblas_set_num_threads(BLAS_NUM_THREADS);
 #endif
-  // cblas_scopy(N, (float*)(X), incX, (float*)(Y), incY);
-  // replace cblas scopy with raw temporary.
-  for (unsigned int i = 0; i < N; ++i)
-    Y[i * incY] = X[i * incX];
+#ifdef USE_AVX
+  nntrainer::avx::scopy_avx2(N, X, incX, Y, incY);
+#else
+  // leave for NEON
+  scopy_cblas(N, X, incX, Y, incY);
+#endif
 #else
   scopy_raw(N, X, incX, Y, incY);
 #endif

@@ -60,6 +60,18 @@ bool isValid(const size_t N, const _Float16 *X);
  */
 bool isValid(const size_t N, const float *X);
 
+/**
+ * @brief Hand-written scopy using AVX2
+ * @note scopy_cblas occasionally fails. Thus implemented explicit function for
+ * that.
+ * @param[in] N  length of the vector
+ * @param[in] input float * for Vector input
+ * @param[in] incX incremental index of input vector X
+ * @param[in] output float * for Vector output
+ * @param[in] incY incremental index of input vector Y
+ */
+void scopy_avx2(size_t N, const float *input, unsigned int incX, float *output,
+                unsigned int incY);
 } // namespace nntrainer::avx
 
 #endif /* __cplusplus */

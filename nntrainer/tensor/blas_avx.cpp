@@ -274,4 +274,51 @@ bool isValid(const size_t N, const float *input) {
   return true;
 }
 
+static inline void scopy_fallback(size_t N, const float *input,
+                                  unsigned int incX, float *output,
+                                  unsigned int incY) {
+  for (unsigned int i = 0; i < N; ++i)
+    output[i * incY] = input[i * incX];
+}
+
+void scopy_avx2(size_t N, const float *input, unsigned int incX, float *output,
+                unsigned int incY) {
+  assert(N != 0);
+  assert(input != NULL);
+  assert(output != NULL);
+
+  /// @note This fallback will be refactored in cpu_backend refactorization
+  /// project
+  if (incX != 1 || incY != 1) {
+    scopy_fallback(N, input, incX, output, incY);
+  }
+
+  unsigned int idx = 0;
+  unsigned int N16 = (N >> 4) << 4;
+  unsigned int N8 = (N >> 3) << 3;
+  float *out_data = (float *)output;
+
+  for (; idx < N16; idx += 16) {
+    __m256 vec0 = _mm256_loadu_ps(input);
+    __m256 vec1 = _mm256_loadu_ps(input + 8);
+    input += 16;
+
+    _mm256_storeu_ps(out_data, (vec0));
+    _mm256_storeu_ps((out_data + 8), (vec1));
+    out_data += 16;
+  }
+  for (; idx < N8; idx += 8) {
+    __m256 vec = _mm256_loadu_ps(input);
+    input += 8;
+
+    _mm256_storeu_ps(out_data, (vec));
+    out_data += 8;
+  }
+
+  while (idx < N) {
+    *out_data++ = *input++;
+    ++idx;
+  }
+}
+
 } // namespace nntrainer::avx
