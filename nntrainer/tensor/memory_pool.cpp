@@ -96,16 +96,18 @@ void MemoryPool::allocate() {
   if (mem_pool != nullptr)
     throw std::runtime_error("Memory pool is already allocated");
 
-#ifdef ENABLE_QNN
-  std::map<size_t, void *> offset_ptr;
-
+#if defined(__ANDROID__)
   int i = 0;
+#define RPCMEM_HEAP_ID_SYSTEM 25
+#define RPCMEM_DEFAULT_FLAGS 1
+  std::map<size_t, void *> offset_ptr;
   for (auto &s : memory_offset) {
     auto it = offset_ptr.find(s);
     if (it == offset_ptr.end()) {
-      void *ptr;
-      allocators.at("qnn")->alloc(&ptr, memory_size.at(i), 1);
+      void *ptr = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS,
+                               memory_size.at(i));
       memory_ptrs.push_back(ptr);
+      mem_ptr_map.insert(ptr);
       offset_ptr.insert(std::make_pair(s, ptr));
     } else {
       memory_ptrs.push_back(it->second);
@@ -113,7 +115,6 @@ void MemoryPool::allocate() {
     i++;
   }
 
-  // temp change for isAllocate() true
   mem_pool = calloc(1, 1);
 #else
   mem_pool = calloc(pool_size, 1);
@@ -125,6 +126,36 @@ void MemoryPool::allocate() {
     idx++;
   }
 #endif
+
+  // if(istrequal(allocators.getName(), "qnn")){
+  //   std::map<size_t, void *> offset_ptr;
+
+  //   int i = 0;
+  //   for (auto &s : memory_offset) {
+  //     auto it = offset_ptr.find(s);
+  //     if (it == offset_ptr.end()) {
+  // 	void *ptr;
+  // 	allocators.at("qnn")->alloc(&ptr, memory_size.at(i), 1);
+  // 	memory_ptrs.push_back(ptr);
+  // 	offset_ptr.insert(std::make_pair(s, ptr));
+  //     } else {
+  // 	memory_ptrs.push_back(it->second);
+  //     }
+  //     i++;
+  //   }
+
+  //   // temp change for isAllocate() true
+  //   mem_pool = calloc(1, 1);
+  // } else if (istrequal(allocators.getName(), "cpu")){
+  //   mem_pool = calloc(pool_size, 1);
+
+  //   unsigned int idx = 1;
+  //   for (auto &s : memory_offset) {
+  //     char *ptr = static_cast<char *>(mem_pool) + memory_offset.at(idx - 1);
+  //     memory_ptrs.push_back(ptr);
+  //     idx++;
+  //   }
+  // }
 
 #ifdef PROFILE
   static long long seq = 0;
@@ -140,15 +171,10 @@ void MemoryPool::allocate() {
  *
  */
 std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
-  // if (mem_pool == nullptr)
-  //   throw std::invalid_argument("Getting memory before allocation");
 
-  // char *ptr = static_cast<char *>(mem_pool) + memory_offset.at(idx - 1);
-  // void *ptr;
-  // allocators.at("qnn")->alloc(ptr, memory_size.at(idx-1), 1);
-
-#ifdef ENABLE_QNN
+#if defined(__ANDROID__)
   auto mem_data = std::make_shared<MemoryData>((void *)memory_ptrs.at(idx - 1));
+  std::cout << idx << " : " << memory_ptrs.at(idx - 1) << std::endl;
 #else
   if (mem_pool == nullptr)
     throw std::invalid_argument("Getting memory before allocation");
@@ -164,7 +190,7 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
  *
  */
 void MemoryPool::deallocate() {
-#ifdef ENABLE_QNN
+  // #ifdef ENABLE_QNN
   if (mem_pool != nullptr) {
     memory_size.clear();
     memory_validity.clear();
@@ -174,16 +200,19 @@ void MemoryPool::deallocate() {
     PROFILE_MEM_DEALLOC(mem_pool);
     free(mem_pool);
 
+#if defined(__ANDROID__)
     int i = 0;
     for (auto &s : memory_ptrs) {
       if (s)
-        allocators.at("qnn")->free(s);
+        // allocators.at("qnn")->free(s);
+        rpcmem_free(s);
     }
   }
-#else
-  if(mem_pool != nullptr)
-    free(mem_pool);
 #endif
+  // #else
+  //   if(mem_pool != nullptr)
+  //     free(mem_pool);
+  // #endif
 
   mem_pool = nullptr;
 }
