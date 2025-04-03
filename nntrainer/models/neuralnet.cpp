@@ -24,21 +24,21 @@
 #include "layer_context.h"
 #include "model.h"
 #include "model_common_properties.h"
-#include <cmath>
-#include <cstring>
-#include <fstream>
-#include <future>
-#include <iomanip>
-#include <sstream>
-
 #include <activation_realizer.h>
 #include <adamw.h>
+#include <bits/fs_fwd.h>
+#include <bits/fs_path.h>
+#include <cmath>
 #include <common_properties.h>
+#include <cstring>
 #include <databuffer.h>
 #include <flatten_realizer.h>
+#include <fstream>
+#include <future>
 #include <ini_interpreter.h>
 #include <ini_wrapper.h>
 #include <input_realizer.h>
+#include <iomanip>
 #include <model_loader.h>
 #include <multiout_realizer.h>
 #include <neuralnet.h>
@@ -52,6 +52,9 @@
 #include <recurrent_realizer.h>
 #include <remap_realizer.h>
 #include <slice_realizer.h>
+#include <sstream>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <util_func.h>
 
 #ifdef ENABLE_TFLITE_INTERPRETER
@@ -433,6 +436,26 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   return forwarding(training);
 }
 
+void NeuralNetwork::InvalidAllFSU() { model_graph.inActive(0); }
+
+size_t getMemoryUsage() {
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+
+    return usage.ru_maxrss;
+  }
+  return 0;
+}
+
+void print_rss() {
+  sleep(1);
+  std::cout << "Memory Usage : " << getMemoryUsage() << " KB   | ";
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+    std::cout << usage.ru_ixrss << " KB" << std::endl;
+  }
+}
+
 sharedConstTensors NeuralNetwork::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
@@ -617,6 +640,10 @@ void NeuralNetwork::backwarding(int iteration,
   }
 }
 
+long long alignToPageSize(long long size) {
+  return (((size + 4096 - 1) / 4096) * 4096) - size;
+}
+
 void NeuralNetwork::save(const std::string &file_path,
                          ml::train::ModelFormat format) {
   NNTR_THROW_IF(!initialized, std::runtime_error)
@@ -633,6 +660,11 @@ void NeuralNetwork::save(const std::string &file_path,
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
       (*iter)->save(model_file, false, exec_mode);
     }
+
+    // std::streampos after_info = model_file.tellp();
+    // auto calc_diff = alignToPageSize(after_info);
+    // std::vector<char> buffer2(calc_diff, '1');
+    // model_file.write(buffer2.data(), calc_diff);
 
     if (opt && istrequal(opt->getType(), "adam")) {
       std::string adam = "adam";

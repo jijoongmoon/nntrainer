@@ -608,7 +608,6 @@ Manager::requestInputs(const GraphNode &node,
   } else {
     var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
   }
-
   grad_common_spec.ls = TensorLifespan::CALC_DERIV_LIFESPAN;
   /// @todo handle this inside layer
   if (node.getType() == ActivationLayer::type or

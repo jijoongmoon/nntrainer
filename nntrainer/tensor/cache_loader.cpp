@@ -256,5 +256,4 @@ bool CacheLoader::checkUnloadComplete(unsigned int id) {
   }
   return true;
 }
-
 } // namespace nntrainer

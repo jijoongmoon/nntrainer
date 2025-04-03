@@ -481,6 +481,7 @@ public:
    * @param order execution order
    */
   bool checkLoadComplete(const unsigned int order);
+  bool Inactive(unsigned int order);
 
   /**
    * @brief inactive the elem

@@ -67,9 +67,7 @@ void CacheElem::swapOut(Options opt) {
   bool dealloc_only = checkDeallocOnly(policy, opt);
   void *buf = (void *)mem_data->getAddr();
   initial_opt = static_cast<Options>(initial_opt & ~Options::FIRST_WRITE);
-  device->putBuffer(buf, dealloc_only);
-  mem_data->setAddr(nullptr);
-  mem_data->setValid(false);
+  // mem_data->setValid(false);
   active = false;
 #ifdef PROFILE
   PROFILE_CACHE_DEALLOC(buf, policyToStr[policy], !dealloc_only);

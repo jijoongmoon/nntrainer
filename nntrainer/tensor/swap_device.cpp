@@ -16,6 +16,8 @@
 #include <malloc.h>
 #include <profiler.h>
 #include <stdlib.h>
+#include <sys/resource.h>
+#include <sys/types.h>
 
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -109,8 +111,10 @@ void *SwapDevice::getBuffer(off_t offset, size_t size, void *memory_ptr,
     size_t off = (offset / page_size) * page_size;
     size_t diff = offset - off;
     size_t len = size + diff;
+
     const size_t error_buflen = 100;
     char error_buf[error_buflen];
+
     char *ptr = static_cast<char *>(
       mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, off));
     NNTR_THROW_IF(ptr == MAP_FAILED, std::runtime_error)
