@@ -175,6 +175,7 @@ static Tensor *requestTensor_(const TensorSpecV2 &spec,
 
   std::vector<unsigned> order = spec.additional_exec_order;
   if (expose) {
+    std::cout << "expoed ------------" << std::endl;
     order.push_back(TensorPool::PERSIST_END_ORDER);
   }
 
@@ -456,6 +457,7 @@ std::vector<Weight *> Manager::requestWeights(
           TensorDim var32_dim(dim_v);
           var32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
           std::vector<unsigned int> var32_exec_order;
+          std::cout << " PERSIS_END_ORDER :VAR32 " << std::endl;
           var32_exec_order.push_back(TensorPool::PERSIST_END_ORDER);
 
           var32 = weight_pool.requestOrExtend(shared_name + ":var32", var32_dim,
@@ -734,6 +736,7 @@ std::vector<Tensor *> Manager::requestWeightOptimizerVariables(
   std::vector<unsigned int> exec;
   exec.reserve(1);
   if (is_grad_clip || is_mixed_precision) {
+    std::cout << "is_grad_clip || is_mixed" << std::endl;
     exec.emplace_back(TensorPool::PERSIST_END_ORDER);
   } else {
     exec.emplace_back(getMinMaxTensorExecutionOrder(name, true).second);

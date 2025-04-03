@@ -150,6 +150,9 @@ void TensorPool::finalize(const MemoryPlanner &planner,
        * */
       if (details->exec_order[idx] > old_end_order &&
           details->exec_order[idx] != PERSIST_END_ORDER) {
+        std::cout << spec.tensor->getName() << " : end order : " << end_order
+                  << " details->exec_order " << idx << " -- "
+                  << details->exec_order[idx] << std::endl;
         details->exec_order[idx] = PERSIST_END_ORDER - 1;
       }
     }
