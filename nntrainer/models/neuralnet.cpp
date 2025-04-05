@@ -26,8 +26,6 @@
 #include "model_common_properties.h"
 #include <activation_realizer.h>
 #include <adamw.h>
-#include <bits/fs_fwd.h>
-#include <bits/fs_path.h>
 #include <cmath>
 #include <common_properties.h>
 #include <cstring>
@@ -402,6 +400,10 @@ sharedConstTensors NeuralNetwork::forwarding(
 
       **/
       model_graph.checkLoadComplete(f);
+
+      std::cout << ">>>>>>>>>>>>>>>>>>> Forwarding Start " << node->getName()
+                << std::endl;
+      // std::cout << "Layer : " << node->getName() << std::endl;
       node->forwarding(training);
       model_graph.inActive(f);
       model_graph.LoadTensors(f + lookahead);

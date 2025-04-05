@@ -204,12 +204,10 @@ void MemoryPool::allocate() {
   msg.append(std::to_string(seq++));
   PROFILE_MEM_ALLOC(mem_pool, pool_size, msg);
 #endif
-  // std::cout << "-------------------------- mem pool_size : " << pool_size << std::endl;
-
+  // std::cout << "-------------------------- mem pool_size : " << pool_size <<
+  // std::endl;
 }
-size_t aligned_size (size_t size) {
-  return (((size + 4096 - 1) / 4096) * 4096);
-}
+size_t aligned_size(size_t size) { return (((size + 4096 - 1) / 4096) * 4096); }
 void MemoryPool::allocateFSU() {
   std::cout << "Allocate in FSU" << std::endl;
   if (pool_size == 0)
@@ -231,7 +229,6 @@ void MemoryPool::allocateFSU() {
     current_size = current_size;
     auto it = offset_ptr.find(s);
     if (it == offset_ptr.end()) {
-      // if there are
       void *ptr = ALIGNED_ALLOC(current_size);
       memory_ptrs.push_back(ptr);
 
@@ -273,8 +270,8 @@ void MemoryPool::allocateFSU() {
   if (mem_pool == nullptr)
     throw std::runtime_error(
       "Failed to allocate memory: " + std::to_string(pool_size) + "bytes");
-  // std::cout << "-------------------------- FSU mem pool_size : " << pool_size << std::endl;
-
+  // std::cout << "-------------------------- FSU mem pool_size : " << pool_size
+  // << std::endl;
 }
 
 /**

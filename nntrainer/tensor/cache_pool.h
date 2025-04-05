@@ -36,9 +36,11 @@ public:
     std::unordered_map<unsigned int,
                        std::unique_ptr<CacheElem>>; /**< cache id, cache elem */
   using CacheElemsIter = CacheElems::iterator;
+
+  // using ExecIds = std::vector<unsigned int>;
+
   using ExecIds = std::set<unsigned int>;
   using ExecIdsIter = ExecIds::iterator;
-
   /**
    * @brief CachePool default constructor
    *

@@ -635,12 +635,6 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
   return output;
 }
 
-Tensor &FloatTensor::abs(Tensor &output) const {
-  auto f = [](float in) { return std::abs(in); };
-  apply(f, output);
-  return output;
-}
-
 float FloatTensor::l2norm() const {
   return snrm2(size(), (float *)getData(), 1);
 }
@@ -708,11 +702,6 @@ void FloatTensor::cos(Tensor &out, float alpha) {
   } else {
     cosine(size(), (float *)getData(), out.getData<float>(), alpha);
   }
-}
-
-void FloatTensor::tan(Tensor &output, float alpha) {
-  auto f = [alpha](float val) -> float { return std::tan(alpha * val); };
-  apply(f, output);
 }
 
 void FloatTensor::inv_sqrt(Tensor &out) {
@@ -835,8 +824,8 @@ Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
   //                                  "matrix <= 2");
   // }
 
-  // Comment out with intension to support the calculation wrt. batch and
-  // height direction of this tensor. It is OK as long as input is 2D
+  // Comment out with intension to support the calculation wrt. batch and height
+  // direction of this tensor. It is OK as long as input is 2D
   if (trans && dim.rank() > 2) {
     ml_logw("Warning: support only for rank of dot matrix <= 2 with trans");
   }

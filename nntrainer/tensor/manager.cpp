@@ -807,7 +807,6 @@ bool Manager::checkUnloadComplete(unsigned int order) {
 
 void Manager::LoadTensors(unsigned int order,
                           unsigned int remainder_lookahead) {
-
   auto loadTensorsAsync = [&](TensorPool &pool, unsigned int order) {
     return pool.loadCacheExecAsync(
       order, [&](int id, TaskExecutor::CompleteStatus status,
@@ -821,7 +820,6 @@ void Manager::LoadTensors(unsigned int order,
     auto load_weight = loadTensorsAsync(weight_pool, o);
     ml_logd("load weight is requested in LoadTensors with order - %d", o);
     int load_tensor = 0;
-
     if (exec_mode != ml::train::ExecutionMode::INFERENCE) {
       load_tensor = loadTensorsAsync(tensor_pool, o);
       ml_logd("load tensor is requested in LoadTensors with order - %d", o);

@@ -45,6 +45,8 @@ void SwapDevice::start(size_t size, ml::train::ExecutionMode _execution_mode) {
 
   off_t off;
 
+  // std::cout << "path: "<<dev_path.c_str() << std::endl;
+
   /* make sparse file */
   off = lseek(fd, size - 1, SEEK_SET);
   NNTR_THROW_IF(off < 0, std::runtime_error)

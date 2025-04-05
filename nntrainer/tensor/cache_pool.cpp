@@ -176,7 +176,6 @@ void CachePool::validate(unsigned int id) {
   // std::cout << "---------------------------!elems[id]->isActive() == " <<
   // (!elems[id]->isActive() ? "true" : "false") << std::endl;
   if (!elems[id]->isActive()) {
-    // std::cout << "-----------------[ Swap IN  ] !!!!!!!!!!!!!! "<< std::endl;
     elems[id]->swapIn();
     std::lock_guard<std::mutex> lock(mutex);
     actives.insert(id);
