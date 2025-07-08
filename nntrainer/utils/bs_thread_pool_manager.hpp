@@ -16,6 +16,12 @@
 #pragma once
 #include "bs_thread_pool.h"
 
+#if defined(_WIN32)
+#define NNTR_API __declspec(dllexport)
+#else
+#define NNTR_API
+#endif
+
 namespace nntrainer {
 class ThreadPoolManager {
 public:
@@ -28,7 +34,8 @@ public:
   ThreadPoolManager& operator=(ThreadPoolManager&&) = delete;  
 
 private:  
-  ThreadPoolManager() = default; // Prevent instantiation  
+  ThreadPoolManager() = default; // Prevent instantiation
+
 };
 }
 

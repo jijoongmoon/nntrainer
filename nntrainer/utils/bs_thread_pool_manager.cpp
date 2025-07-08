@@ -17,7 +17,6 @@
 #include <algorithm>
 #include <cmath>
 namespace nntrainer {
-
 BS::thread_pool<>& ThreadPoolManager::getInstance() {
   // Constructed on first call, reused thereafter
   static BS::thread_pool<> instance{std::thread::hardware_concurrency() / 2};
