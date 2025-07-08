@@ -1953,7 +1953,7 @@ private:
    * @param[in] buf buffer
    * @param[in] offset offset to be used
    */
-  void setTensorVar(TensorDim d, void *buf, size_t offset);
+  NNTR_API void setTensorVar(TensorDim d, void *buf, size_t offset);
 
   /**
    * @brief Calculate the output tensor dimension of the concatenating a list of
@@ -1962,14 +1962,14 @@ private:
    * @param[in] tensors tensors to be concatenated to the first tensor
    * @param[in] axis axis
    */
-  static TensorDim calculateConcatOutputDim(const std::vector<Tensor> &tensors,
-                                            int axis);
+  NNTR_API static TensorDim
+  calculateConcatOutputDim(const std::vector<Tensor> &tensors, int axis);
 };
 
 /**
  * @brief   Overriding output stream
  */
-std::ostream &operator<<(std::ostream &out, Tensor const &input);
+NNTR_API std::ostream &operator<<(std::ostream &out, Tensor const &input);
 
 typedef std::shared_ptr<Tensor> sharedTensor;
 
