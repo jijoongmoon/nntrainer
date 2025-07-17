@@ -7,9 +7,14 @@ project('nntrainer', 'c', 'cpp',
     'warning_level=1',
     'c_std=gnu89',
     'cpp_std=c++17',
-    'buildtype=release'
+    'buildtype=release',
+    'cpp_args=/MT'
   ]
 )
+common_win_subproject_cmake_defines = {
+  'CMAKE_MSVC_RUNTIME_LIBRARY': 'MultiThreaded',
+  'CMAKE_BUILD_TYPE': 'Release',
+}
 
 # Set version info
 nntrainer_version = meson.project_version()
@@ -408,10 +413,28 @@ endif
 
 extra_defines += '-DNNTR_NUM_THREADS=@0@'.format(get_option('nntr-num-threads'))
 message('set nntrainer num threads=@0@'.format(get_option('nntr-num-threads')))
-
 openmp_dep = dummy_dep
 if get_option('enable-openmp')
-  openmp_dep = dependency('openmp')
+ if cxx_compiler_id == 'msvc'
+    libiomp_root_opt = get_option('libiomp_root')
+    libiomp_root = join_paths(meson.project_source_root(), libiomp_root_opt)
+    omp_libdir = libiomp_root
+    omp_incdir = join_paths(libiomp_root_opt, 'include')
+
+    add_project_arguments('/openmp', language: ['cpp','c'])
+    cpp = meson.get_compiler('cpp')
+    libiomp = cpp.find_library('libiomp5md', dirs: omp_libdir, required: true)
+
+    openmp_dep = declare_dependency(
+      include_directories : include_directories(omp_incdir),
+      compile_args : ['/openmp'],
+      link_args : ['/NODEFAULTLIB:vcomp'],
+      dependencies : [libiomp])
+
+  message('set openmp with libiomp5md for windows-----------------')               
+else
+    openmp_dep = dependency('openmp')
+endif
   if get_option('omp-num-threads') > 0
     extra_defines += '-DOMP_NUM_THREADS=@0@'.format(get_option('omp-num-threads'))
     message('set nntrainer omp threads=@0@'.format(get_option('omp-num-threads')))

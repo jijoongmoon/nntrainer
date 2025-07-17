@@ -24,6 +24,8 @@
 #include <rmsnorm_layer_cl.h>
 #include <swiglu_cl.h>
 #include <transpose_cl.h>
+#include <iostream>
+#include <windows.h>
 
 namespace nntrainer {
 
@@ -75,10 +77,10 @@ static void add_default_object(ClContext &cc) {
 static void registerer(ClContext &cc) noexcept {
   try {
     cc.setMemAllocator(std::make_shared<MemAllocator>());
-
     cc.initBlasClKernels();
     cc.initAttentionClKernels();
     add_default_object(cc);
+
   } catch (std::exception &e) {
     ml_loge("cl_context: registering layers failed!!, reason: %s", e.what());
   } catch (...) {
@@ -92,12 +94,9 @@ ClContext &ClContext::Global() {
   if (!clInit()) {
     ml_loge("cl_context: opencl command queue creation failed");
   }
-
-  std::cout << "ClContext::Global()"
-            << "this: " << (long long)this << std::endl;
-
+  
   if (cl_initialized != init) {
-    std::cout << "************** registerer ****************" << std::endl;
+    //std::cout << "************** registerer ****************" << std::endl;
     registerer(*this);
   }
   return *this;

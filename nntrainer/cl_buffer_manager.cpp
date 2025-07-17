@@ -11,6 +11,7 @@
  */
 
 #include <cl_buffer_manager.h>
+#include <iostream>
 
 namespace nntrainer {
 
@@ -22,11 +23,13 @@ ClBufferManager &ClBufferManager::getInstance() {
 // to-do: Implementation to be updated with array of Buffer objects if required
 // fp16 Buffer objects to be added in future
 void ClBufferManager::initBuffers() {
-  inBufferA = new opencl::Buffer(context_inst_, buffer_size_bytes, true);
-  inBufferB = new opencl::Buffer(context_inst_, buffer_size_bytes, true);
-  inBufferC = new opencl::Buffer(context_inst_, buffer_size_bytes, true);
-  outBufferA = new opencl::Buffer(context_inst_, buffer_size_bytes, false);
-  outBufferB = new opencl::Buffer(context_inst_, buffer_size_bytes, false);
+  std::cout << "buffer_size_bytes: "<< buffer_size_bytes <<std::endl;
+
+  inBufferA = new opencl::Buffer(context_inst_, 4, true);
+  inBufferB = new opencl::Buffer(context_inst_, 4, true);
+  inBufferC = new opencl::Buffer(context_inst_, 4, true);
+  outBufferA = new opencl::Buffer(context_inst_, 4, false);
+  outBufferB = new opencl::Buffer(context_inst_, 4, false);
   ml_logi("ClBufferManager: Buffers initialized");
 }
 
