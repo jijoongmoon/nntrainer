@@ -26,7 +26,6 @@ void sgemv_q6_k_cl(void *matAdata, float *vecXdata, float *vecYdata,
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-
   kernel_q6_k_sgemv_ptr =
     blas_cc->registerClKernel(getQ6KSgemvClKernel(), "kernel_mul_mv_q6_K_f32");
 

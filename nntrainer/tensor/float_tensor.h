@@ -397,6 +397,9 @@ public:
   Tensor &dot(Tensor const &input, Tensor &output, bool trans, bool trans_in,
               float beta) const override;
 
+  void dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
+                    bool trans, bool trans_in, float beta) const override;
+
   /**
    * @copydoc Tensor::dropout_mask(float dropout)
    */
@@ -449,6 +452,11 @@ public:
    * @copydoc Tensor::argmin()
    */
   std::vector<unsigned int> argmin() const override;
+
+  /**
+   * @copydoc TensorBase::top_k()
+   */
+  void topK(unsigned int k, void *output_data, uint32_t *indices) override;
 
   /**
    * @copydoc Tensor::max_abs()
@@ -540,9 +548,9 @@ private:
    * @brief Float.dot(Q4K/Q6K)
    * @return Tensor& reference to the output tensor
    */
-  Tensor &dotQnK(Tensor const &input, Tensor &output, bool trans, bool trans_in,
-                 float beta, Tdatatype dtype) const;
-};
+  Tensor &dotQnK(Tensor const &input, Tensor &output, bool trans,
+                          bool trans_in, float beta, Tdatatype dtype) const;
+  };
 
 } // namespace nntrainer
 

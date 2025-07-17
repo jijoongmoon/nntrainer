@@ -289,7 +289,6 @@ private:
     bool result = command_queue_inst_.CreateCommandQueue();
     // initialize device buffers
     clbuffInstance.initBuffers();
-
     cl_initialized = result;
     return cl_initialized;
   };

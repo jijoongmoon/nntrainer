@@ -429,8 +429,6 @@ static void registerer(AppContext &ac) noexcept {
 };
 
 AppContext &AppContext::Global() {
-  std::cout << "AppContext::Global()"
-            << "this: " << (long long)this << std::endl;
   registerer(*this);
   return *this;
 }

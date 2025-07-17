@@ -17,10 +17,6 @@
 #include "bs_thread_pool.h"
 
 namespace nntrainer {
-/**
- * @brief ThreadPoolManager is a singleton class that manages a thread pool
- *
- */
 class ThreadPoolManager {
 protected:
   static BS::thread_pool<> pool;
@@ -58,6 +54,7 @@ private:
    */
   ~ThreadPoolManager() = default;
 };
-} // namespace nntrainer
+}
 
 #endif // THREAD_POOL_MANAGER_HPP
+

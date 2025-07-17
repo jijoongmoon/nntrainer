@@ -25,6 +25,10 @@
 #include <swiglu_cl.h>
 #include <transpose_cl.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 namespace nntrainer {
 
 std::mutex cl_factory_mutex;
@@ -75,10 +79,10 @@ static void add_default_object(ClContext &cc) {
 static void registerer(ClContext &cc) noexcept {
   try {
     cc.setMemAllocator(std::make_shared<MemAllocator>());
-
     cc.initBlasClKernels();
     cc.initAttentionClKernels();
     add_default_object(cc);
+
   } catch (std::exception &e) {
     ml_loge("cl_context: registering layers failed!!, reason: %s", e.what());
   } catch (...) {
@@ -93,11 +97,7 @@ ClContext &ClContext::Global() {
     ml_loge("cl_context: opencl command queue creation failed");
   }
 
-  std::cout << "ClContext::Global()"
-            << "this: " << (long long)this << std::endl;
-
   if (cl_initialized != init) {
-    std::cout << "************** registerer ****************" << std::endl;
     registerer(*this);
   }
   return *this;
