@@ -116,6 +116,7 @@ public:
    *
    */
   NNTR_API ~ContextManager();
+
 };
 } // namespace nntrainer::opencl
 #endif // __OPENCL_CONTEXT_MANAGER_H__

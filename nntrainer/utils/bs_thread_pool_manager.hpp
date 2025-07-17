@@ -49,7 +49,8 @@ public:
    * @return BS::thread_pool<>&
    */
   NNTR_API static BS::thread_pool<> &getInstance() {
-    static BS::thread_pool<> pool(std::thread::hardware_concurrency());
+    static BS::thread_pool<> pool(8);
+    // static BS::thread_pool<> pool(std::thread::hardware_concurrency());
     return pool;
   }
 

@@ -40,8 +40,8 @@ void Engine::add_default_object(Engine *eg) {
   /// @note all layers should be added to the app_context to guarantee that
   /// createLayer/createOptimizer class is created
 
-  std::cout << "Engine::add_default_object, addr:" << (long long)&eg
-            << std::endl;
+  //std::cout << "Engine::add_default_object, addr:" << (long long)&eg
+            //<< std::endl;
 
   nntrainer::AppContext *app_context = new nntrainer::AppContext();
   app_context->Global();

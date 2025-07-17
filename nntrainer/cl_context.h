@@ -36,6 +36,8 @@
 #include <opencl_context_manager.h>
 #include <opencl_kernel.h>
 #include <opencl_program.h>
+#include <windows.h>
+#include <iostream>
 
 namespace nntrainer {
 
@@ -289,7 +291,6 @@ private:
     bool result = command_queue_inst_.CreateCommandQueue();
     // initialize device buffers
     clbuffInstance.initBuffers();
-
     cl_initialized = result;
     return cl_initialized;
   };

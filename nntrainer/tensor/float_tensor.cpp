@@ -17,6 +17,7 @@
 #include <float_tensor.h>
 #include <tensor.h>
 #include <util_func.h>
+#include <chrono>
 
 #ifdef ENABLE_OPENCL
 #include "blas_kernels.h"
@@ -68,10 +69,11 @@ void FloatTensor::allocate() {
     /// allocate new memory for the tensor data
     MemoryData *mem_data;
 
-#ifdef ENABLE_OPENCL
+/*#ifdef ENABLE_OPENCL
     auto *blas_cc =
       static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
     if (blas_cc != nullptr) {
+      auto start_time = std::chrono::high_resolution_clock::now();
       mem_data = new MemoryData(blas_cc->context_inst_.createSVMRegion(
         dim.getDataLen() * sizeof(float)));
 
@@ -85,6 +87,9 @@ void FloatTensor::allocate() {
       blas_cc->command_queue_inst_.enqueueSVMMap(
         mem_data->template getAddr<float>(), dim.getDataLen() * sizeof(float),
         false);
+      auto end_time = std::chrono::high_resolution_clock::now();
+      auto ms = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+      std::cout <<"******* alloc with cl: "<< ms<<" ns\n"<<std::endl;
     } else {
       mem_data = new MemoryData((void *)(new float[dim.getDataLen()]{}));
       data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
@@ -92,13 +97,13 @@ void FloatTensor::allocate() {
         delete mem_data;
       });
     }
-#else
-    mem_data = new MemoryData((void *)(new float[dim.getDataLen()]{}));
+#else*/
+    mem_data = new MemoryData((void *)(new float[dim.getDataLen()]));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<float>();
       delete mem_data;
     });
-#endif
+//#endif
 
     offset = 0;
     initialize();
