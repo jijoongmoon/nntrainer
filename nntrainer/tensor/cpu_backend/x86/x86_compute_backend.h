@@ -770,6 +770,12 @@ NNTR_API void gemm_q4_K(const unsigned int M, const unsigned int N,
                         const unsigned int ldb, float *C,
                         const unsigned int ldc);
 
+NNTR_API void gemm_q4_K(const unsigned int M, std::vector<unsigned int> Ns,
+                        const unsigned int K, const float *A,
+                        const unsigned int lda, std::vector<void *> Bs,
+                        std::vector<unsigned int> ldbs, std::vector<float *> Cs,
+                        std::vector<unsigned int> ldc);
+
 /**
  * @brief q6_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *

@@ -431,6 +431,10 @@ public:
   NNTR_API virtual Tensor &dot(Tensor const &input, Tensor &output, bool trans,
                                bool trans_in, float beta) const;
 
+  NNTR_API virtual void dot(std::vector<Tensor *> input,
+                            std::vector<Tensor *> output, bool trans,
+                            bool trans_in, float beta) const;
+
   /**
    * @copydoc Tensor::dropout_mask(float dropout)
    */
@@ -549,7 +553,7 @@ public:
    *         - k is 0 or exceeds width dimension size
    *         - Called on non-floating point tensor (UINT8/UINT16/etc)
    */
-  virtual void topK(unsigned int k, void *output_data, uint32_t *indices);
+  NNTR_API virtual void topK(unsigned int k, void *output_data, uint32_t *indices);
 
   /**
    * @copydoc Tensor::max_abs()

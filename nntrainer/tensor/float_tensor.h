@@ -402,6 +402,9 @@ public:
   NNTR_API Tensor &dot(Tensor const &input, Tensor &output, bool trans,
                        bool trans_in, float beta) const override;
 
+  NNTR_API void dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
+                    bool trans, bool trans_in, float beta) const override;
+
   /**
    * @copydoc Tensor::dropout_mask(float dropout)
    */

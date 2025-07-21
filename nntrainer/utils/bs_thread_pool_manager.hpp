@@ -25,18 +25,17 @@
 namespace nntrainer {
 class ThreadPoolManager {
 public:
-  static BS::thread_pool<>& getInstance();
+  NNTR_API static BS::thread_pool<> &getInstance();
 
-  // Prevent copying and moving  
-  ThreadPoolManager(const ThreadPoolManager&) = delete;  
-  ThreadPoolManager& operator=(const ThreadPoolManager&) = delete;  
-  ThreadPoolManager(ThreadPoolManager&&) = delete;  
-  ThreadPoolManager& operator=(ThreadPoolManager&&) = delete;  
+  // Prevent copying and moving
+  ThreadPoolManager(const ThreadPoolManager &) = delete;
+  ThreadPoolManager &operator=(const ThreadPoolManager &) = delete;
+  ThreadPoolManager(ThreadPoolManager &&) = delete;
+  ThreadPoolManager &operator=(ThreadPoolManager &&) = delete;
 
-private:  
+private:
   ThreadPoolManager() = default; // Prevent instantiation
-
 };
-}
+} // namespace nntrainer
 
 #endif // THREAD_POOL_MANAGER_HPP

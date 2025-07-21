@@ -7,8 +7,7 @@ project('nntrainer', 'c', 'cpp',
     'warning_level=1',
     'c_std=gnu89',
     'cpp_std=c++17',
-    'buildtype=release',
-    'cpp_args=/MT'
+    'buildtype=release'
   ]
 )
 common_win_subproject_cmake_defines = {
@@ -573,7 +572,8 @@ if get_option('enable-ggml')
     ggml_options = cmake.subproject_options()
     ggml_root = subprojects_dir_absolute / 'ggml'
     ggml_flags = [
-      '-Wno-error=pointer-to-int-cast'
+      '-Wno-error=pointer-to-int-cast',
+      '-Wno-stringop-overflow',
       ]
     if cxx_compiler_id == 'clang'
       ggml_flags += '-Wno-error=uninitialized'
@@ -581,6 +581,7 @@ if get_option('enable-ggml')
       ggml_flags += '-Wno-error=maybe-uninitialized'
     endif
     ggml_options.append_compile_args('c', ggml_flags)
+    ggml_options.append_compile_args('cpp', ggml_flags)
     ggml_options.add_cmake_defines({'BUILD_SHARED_LIBS': true})
     ggml_options.add_cmake_defines({'GGML_BUILD_TESTS': false})
     ggml_options.add_cmake_defines({'GGML_BUILD_EXAMPLES': false})
