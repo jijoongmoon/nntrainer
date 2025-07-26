@@ -139,6 +139,7 @@ public:
     name = rhs.name;
     data = rhs.data;
     offset = rhs.offset;
+    file_offset = rhs.file_offset;
     src_tensor = rhs.src_tensor;
   }
 
@@ -430,6 +431,10 @@ public:
   NNTR_API virtual Tensor &dot(Tensor const &input, Tensor &output, bool trans,
                                bool trans_in, float beta) const;
 
+  NNTR_API virtual void dot(std::vector<Tensor *> input,
+                            std::vector<Tensor *> output, bool trans,
+                            bool trans_in, float beta) const;
+
   /**
    * @copydoc Tensor::dropout_mask(float dropout)
    */
@@ -527,6 +532,28 @@ public:
    * @copydoc Tensor::argmin()
    */
   NNTR_API virtual std::vector<unsigned int> argmin() const;
+
+  /**
+   * @brief Compute top-K maximum values along the width dimension
+   *
+   * @details This function computes the top-K maximum values and their
+   * corresponding indices along the **width** dimension for each batch,
+   * channel, and height slice. The operation preserves the original tensor
+   * format (NCHW/NHWC) while reducing the width dimension to size K. The
+   * indices are stored in the provided `indices` array, and the top-K values
+   *          are stored in the provided `output_data` buffer.
+   *
+   * @param[in] k Number of largest elements to select (1 <= k <= width_size)
+   * @param[out] output_data Buffer to store top-K values (must be
+   * pre-allocated)
+   * @param[out] indices Array to store corresponding indices (must be
+   * pre-allocated)
+   *
+   * @throw std::invalid_argument If:
+   *         - k is 0 or exceeds width dimension size
+   *         - Called on non-floating point tensor (UINT8/UINT16/etc)
+   */
+  NNTR_API virtual void topK(unsigned int k, void *output_data, uint32_t *indices);
 
   /**
    * @copydoc Tensor::max_abs()

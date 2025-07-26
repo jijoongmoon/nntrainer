@@ -497,7 +497,7 @@ int Tensor::multiply_i(Tensor const &m, const float beta) {
 }
 
 Tensor Tensor::multiply(Tensor const &m, const float beta) const {
-  Tensor t("", this->getFormat());
+  Tensor t("", getFormat(), getDataType());
   return multiply(m, t, beta);
 }
 
@@ -664,7 +664,7 @@ Tensor &Tensor::subtract(float const &value, Tensor &output) const {
 int Tensor::subtract_i(Tensor const &m) { return add_i(m, -1); }
 
 Tensor Tensor::subtract(Tensor const &m) const {
-  Tensor t;
+  Tensor t("", getFormat(), getDataType());
   return this->subtract(m, t);
 }
 
@@ -941,7 +941,7 @@ void Tensor::standardization_i() {
 }
 
 Tensor Tensor::dot(Tensor const &input, bool trans, bool trans_in) const {
-  Tensor output("", this->getFormat(), this->getDataType());
+  Tensor output("", getFormat(), getDataType());
   dot(input, output, trans, trans_in);
 
   return output;
@@ -960,6 +960,20 @@ Tensor &Tensor::dot(Tensor const &input, Tensor &output, bool trans,
 
   itensor_->dot(input, output, trans, trans_in, beta);
   return output;
+}
+
+void Tensor::dot(std::vector<Tensor *> input,
+                 std::vector<Tensor *> output, bool trans, bool trans_in,
+                 float beta) const {
+  NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
+    << getName() << " is not contiguous. Cannot dot product.";
+
+  itensor_->dot(input, output, trans, trans_in, beta);
+
+  // for(unsigned int i=0;i<input.size();++i){
+  //   itensor_->dot(*(input[i]), *(output[i]), trans, trans_in, beta);
+  // }
+
 }
 
 Tensor &Tensor::dot_deriv_wrt_1(Tensor const &m, Tensor const &output_deriv,
@@ -1270,6 +1284,39 @@ std::vector<unsigned int> Tensor::argmin() const {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot get argmin.";
   return itensor_->argmin();
+}
+
+std::pair<Tensor, Tensor> Tensor::topK(unsigned int k) const {
+
+  // Create output tensor with modified W dimension
+  TensorDim output_dim = getDim();
+  TensorDim indices_dim = getDim();
+  Tformat format = output_dim.getFormat();
+
+  // Validate k is within width dimension size
+  unsigned int width_size = output_dim.width();
+  NNTR_THROW_IF(k == 0 || k > width_size, std::invalid_argument)
+    << "k must be between 1 and width dimension size (" << width_size << ")";
+
+  // Set new width dimension to k
+  output_dim.width(k);
+  indices_dim.width(k);
+  indices_dim.setDataType(Tdatatype::UINT32); // Set indices data type to UINT32
+
+  // Create output tensor
+  Tensor output(output_dim);
+  output.allocate();
+  Tensor indices(indices_dim);
+  indices.allocate();
+
+  // Prepare output buffer
+  void *output_data = output.getData<void>();
+  uint32_t *indices_data = indices.getData<uint32_t>();
+
+  // Call TopK implementation
+  itensor_->topK(k, output_data, indices_data);
+
+  return {output, indices};
 }
 
 float Tensor::max_abs() const {

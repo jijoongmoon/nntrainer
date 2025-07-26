@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <vector>
 
 namespace nntrainer {
 
@@ -122,6 +123,14 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int lda, const void *B,
                                const unsigned int ldb, float *C,
                                const unsigned int ldc);
+
+void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M,
+                               std::vector<unsigned int> Ns,
+                               const unsigned int K, const float *A,
+                               const unsigned int lda, std::vector<void *> Bs,
+                               std::vector<unsigned int> ldbs,
+                               std::vector<float *> C,
+                               std::vector<unsigned int> ldcs);
 /**
  * @brief A(M, K) * W.T(N, K) = (M, N)
  *

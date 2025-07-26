@@ -402,6 +402,9 @@ public:
   NNTR_API Tensor &dot(Tensor const &input, Tensor &output, bool trans,
                        bool trans_in, float beta) const override;
 
+  NNTR_API void dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
+                    bool trans, bool trans_in, float beta) const override;
+
   /**
    * @copydoc Tensor::dropout_mask(float dropout)
    */
@@ -455,6 +458,11 @@ public:
    * @copydoc Tensor::argmin()
    */
   NNTR_API std::vector<unsigned int> argmin() const override;
+
+  /**
+   * @copydoc TensorBase::top_k()
+   */
+  void topK(unsigned int k, void *output_data, uint32_t *indices) override;
 
   /**
    * @copydoc Tensor::max_abs()
@@ -549,7 +557,7 @@ private:
    */
   NNTR_API Tensor &dotQnK(Tensor const &input, Tensor &output, bool trans,
                           bool trans_in, float beta, Tdatatype dtype) const;
-};
+  };
 
 } // namespace nntrainer
 

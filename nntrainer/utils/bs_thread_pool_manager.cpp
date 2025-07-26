@@ -14,15 +14,16 @@
 #define THREAD_POOL_MANAGER_CPP
 
 #include "bs_thread_pool_manager.hpp"
-
+#include <algorithm>
+#include <cmath>
 namespace nntrainer {
-/**
- * @brief Instantiate thread pool with the number of hardware concurrency.
- *
- * @return BS::thread_pool<>
- */
-// BS::thread_pool<>
-// ThreadPoolManager::pool(std::thread::hardware_concurrency());
+BS::thread_pool<>& ThreadPoolManager::getInstance() {
+  // Constructed on first call, reused thereafter
+  static BS::thread_pool<> instance{std::thread::hardware_concurrency()};
+  // static BS::thread_pool<> instance{std::thread::hardware_concurrency()};
+  return instance;
+}
+
 } // namespace nntrainer
 
 #endif // THREAD_POOL_MANAGER_CPP

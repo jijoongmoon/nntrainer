@@ -737,6 +737,26 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   return output;
 }
 
+void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
+                      bool trans, bool trans_in, float beta) const {
+
+  float *data = (float*)getData();
+  unsigned int M = getDim().height();
+  unsigned int K = getDim().width();
+
+  std::vector<unsigned int> Ns;
+  std::vector<void*> mdatas;
+  std::vector<float*> rdatas;
+  
+  for(unsigned int i=0;i<input.size();++i){
+    Ns.push_back(input[i]->getDim().width());
+    mdatas.push_back((void*)input[i]->getData<uint8_t>());
+    rdatas.push_back(output[i]->getData<float>());
+  }
+  
+  gemm_q4_K(M, Ns, K, data, K,  mdatas, Ns, rdatas, Ns);
+}
+
 Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
                               bool trans_in, float beta) const {
   // Comment out with intension to support the calculation wrt. batch and
@@ -771,7 +791,8 @@ Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
   /// (1 * K) X (1 * M) can be a case
   /// case1: (1 * K) X (K * 1)
   if (M == 1 && N == 1) {
-    *rdata = sdot(K, data, 1, mdata, 1) + beta * (*rdata);
+    *rdata =
+      sdot(K, data, 1, mdata, 1) + ((0.0f == beta) ? 0.0f : beta * *rdata);
   }
   /// case2: (M * K) X (K * 1)
   else if (N == 1) {
@@ -917,6 +938,73 @@ std::vector<unsigned int> FloatTensor::argmin() const {
     result[b] = std::distance(data, min_iter) - (b * feature_len);
   }
   return result;
+}
+
+void FloatTensor::topK(unsigned int k, void *output_data,
+                       uint32_t *indices_data) {
+  const auto &input_dim = getDim();
+  const Tformat format = input_dim.getFormat();
+  const auto batch = input_dim.batch();
+  const auto channel = input_dim.channel();
+  const auto height = input_dim.height();
+  const auto width = input_dim.width();
+
+  if (k == 0 || k > width) {
+    throw std::invalid_argument(
+      "k must be greater than 0 and less than or equal to width");
+  }
+
+  float *output_buffer = static_cast<float *>(output_data);
+
+  // Calculate strides for input and output
+  const auto input_strides = input_dim.computeStrides();
+  TensorDim output_dim = input_dim;
+  output_dim.width(k);
+  const auto output_strides = output_dim.computeStrides();
+
+#pragma omp parallel for collapse(3)
+  for (int b = 0; b < static_cast<int>(batch); ++b) {
+    for (int c = 0; c < static_cast<int>(channel); ++c) {
+      for (int h = 0; h < static_cast<int>(height); ++h) {
+
+        size_t offset;
+        if (format == Tformat::NCHW) {
+          // NCHW: [b][c][h][i]
+          offset =
+            b * input_strides[0] + c * input_strides[1] + h * input_strides[2];
+        } else {
+          // NHWC: [b][h][i][c]
+          offset = b * input_strides[0] + h * input_strides[1] + c;
+        }
+
+        const unsigned int width_stride =
+          format == Tformat::NHWC ? input_strides[2] : 1;
+        const float *B = static_cast<const float *>(getData()) + offset;
+        std::vector<size_t> idx(width);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                          [&B, width_stride](size_t i1, size_t i2) {
+                            return B[i1 * width_stride] > B[i2 * width_stride];
+                          });
+
+        // write top-k values and their indices to output
+        for (unsigned int i = 0; i < k; ++i) {
+          size_t output_idx;
+          if (format == Tformat::NCHW) {
+            // NCHW: [b][c][h][i]
+            output_idx = b * output_strides[0] + c * output_strides[1] +
+                         h * output_strides[2] + i;
+          } else {
+            // NHWC: [b][h][i][c]
+            output_idx = b * output_strides[0] + h * output_strides[1] +
+                         i * output_strides[2] + c;
+          }
+          output_buffer[output_idx] = B[idx[i]];
+          indices_data[output_idx] = static_cast<uint32_t>(idx[i]);
+        }
+      }
+    }
+  }
 }
 
 float FloatTensor::max_abs() const {
