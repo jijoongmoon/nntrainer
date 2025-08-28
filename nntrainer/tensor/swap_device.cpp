@@ -65,6 +65,8 @@ void SwapDevice::start(size_t size, ml::train::ExecutionMode _execution_mode) {
 
 void *SwapDevice::getBuffer(off_t offset, size_t size, void *memory_ptr,
                             unsigned int id, bool alloc_only) {
+  std::cout << "swapdefice::getbuffer" << offset << " " << size << " "
+            << memory_ptr << " " << id << std::endl;
   NNTR_THROW_IF(fd <= 0, std::runtime_error)
     << "SwapDevice: Device is not started";
 
@@ -101,6 +103,8 @@ void *SwapDevice::getBuffer(off_t offset, size_t size, void *memory_ptr,
 
     void *buf = static_cast<void *>(ptr + diff);
 
+    std::cout << "memcpy(" << memory_ptr << ", " << buf << ", "
+              << len_offset.second << ")" << std::endl;
     memcpy(memory_ptr, buf, len_offset.second);
     const auto ret = munmap(ptr, len);
 

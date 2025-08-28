@@ -712,6 +712,7 @@ void NeuralNetwork::save(const std::string &file_path,
 
 void NeuralNetwork::load(const std::string &file_path,
                          ml::train::ModelFormat format) {
+  std::cout << "NeuralNetwork::load" << std::endl;
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
 
@@ -931,14 +932,18 @@ void NeuralNetwork::load(const std::string &file_path,
       throw_status(ret);
     });
 
+    int last_idx = v.size() - 1;
     if (!fsu_mode && v.size() > 1) {
-      NNTR_THROW_IF(!isFileExist(props::FilePath(v[1])), std::invalid_argument)
+      NNTR_THROW_IF(!isFileExist(props::FilePath(v[last_idx])),
+                    std::invalid_argument)
         << "Cannot open weight bin file";
-      load(props::FilePath(v[1]), ml::train::ModelFormat::MODEL_FORMAT_BIN);
+      load(props::FilePath(v[last_idx]),
+           ml::train::ModelFormat::MODEL_FORMAT_BIN);
     } else if (fsu_mode) {
       NNTR_THROW_IF(v.size() <= 1, std::invalid_argument)
         << "Swap mode should run with loading a weight-bin file";
-      NNTR_THROW_IF(!isFileExist(props::FilePath(v[1])), std::invalid_argument)
+      NNTR_THROW_IF(!isFileExist(props::FilePath(v[last_idx])),
+                    std::invalid_argument)
         << "Cannot open weight bin file";
       // model_graph.setFsuWeightPath(v[1]);
     }
@@ -1057,7 +1062,7 @@ sharedConstTensors NeuralNetwork::inference(sharedConstTensors X,
   if (!validateInput(X))
     throw std::invalid_argument("Input validation failed.");
 
-  allocate(ExecutionMode::INFERENCE);
+  // allocate(ExecutionMode::INFERENCE);
 
   int nn_foward;
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
@@ -1113,7 +1118,11 @@ NeuralNetwork::inference(unsigned int batch_size,
 
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
-    output.push_back(out_t.getData());
+    float *float_out = (float *)malloc(out_t.size() * sizeof(float));
+    for (int i = 0; i < out_t.size(); i++) {
+      float_out[i] = (float)(out_t.getData<uint16_t>()[i]);
+    }
+    output.push_back(float_out);
   }
 
   return output;
