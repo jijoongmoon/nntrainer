@@ -784,9 +784,10 @@ public:
             bool fsu = false, size_t start_offset = 0,
             bool read_from_offset = false);
 
-  void read_quantization_info(std::ifstream &file, bool opt_var = false,
-            ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN,
-            bool swap = false);
+  void read_quantization_info(
+    std::ifstream &file, bool opt_var = false,
+    ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN,
+    bool swap = false);
   /**
    * @brief     save layer Weight & Bias data from file
    * @param file output file stream
@@ -797,10 +798,10 @@ public:
        ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN) const;
 
   /**
-     * @brief     save layer quantization_info
-     * @param file output file stream
-     * @param bool save optimizer variables
-     */
+   * @brief     save layer quantization_info
+   * @param file output file stream
+   * @param bool save optimizer variables
+   */
   void save_quantization_info(std::ofstream &file, bool opt_var,
                               ml::train::ExecutionMode mode) const;
 
@@ -1059,7 +1060,8 @@ properties in the context/graph unless intended. */
                std::vector<props::InputConnection>,
                std::vector<props::InputShape>, props::SharedFrom,
                props::ClipGradByGlobalNorm, props::Packed, props::WeightDtype,
-               props::LossScaleForMixed, props::ComputeEngine>;
+               props::LossScaleForMixed, props::ComputeEngine,
+               props::InputTensorDataType>;
 
   using RealizationPropsType = std::tuple<props::Flatten, props::Activation>;
   /** these realization properties results in addition of new layers, hence
