@@ -201,13 +201,15 @@ int getValues(int n_str, std::string str, int *value) {
 
 std::vector<std::string> split(const std::string &s, const std::regex &reg) {
   std::vector<std::string> out;
-  const int NUM_SKIP_CHAR = 3;
-  char char_to_remove[NUM_SKIP_CHAR] = {' ', '[', ']'};
-  std::string str = s;
+  std::string str = s;  
+  
+  /*const int NUM_SKIP_CHAR = 0;
+  char char_to_remove[NUM_SKIP_CHAR] = {'[', ']'};
+  
   for (unsigned int i = 0; i < NUM_SKIP_CHAR; ++i) {
     str.erase(std::remove(str.begin(), str.end(), char_to_remove[i]),
               str.end());
-  }
+  }*/
 
   std::regex_token_iterator<std::string::iterator> end;
   std::regex_token_iterator<std::string::iterator> iter(str.begin(), str.end(),
