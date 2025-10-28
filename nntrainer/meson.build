@@ -91,40 +91,41 @@ if get_option('platform') == 'android'
 else
   # Build libraries
 
-  nntrainer_static = static_library('nntrainer',
-    nntrainer_sources,
-    dependencies: nntrainer_base_deps,
-    include_directories: nntrainer_inc,
-    install: true,
-    install_dir: nntrainer_libdir
-  )
-
   if get_option('platform') == 'windows'
-    nntrainer_def = custom_target('nntrainer_def',
-    command : ['python', meson.source_root() / 'generate_def.py', '--objects_dir', meson.build_root() / 'nntrainer' / 'libnntrainer.a.p', '--working_dir', meson.current_build_dir()],
-    output: 'nntrainer.def',
-    depends: nntrainer_static,
-    )
+    if get_option('default_library') == 'static'
+      nntrainer_static = static_library('nntrainer',
+        nntrainer_sources,
+        dependencies: nntrainer_base_deps,
+        include_directories: nntrainer_inc,
+        install: true,
+        install_dir: nntrainer_libdir
+      )
+    else
+      nntrainer_def = custom_target('nntrainer_def',
+      command : ['python', meson.source_root() / 'generate_def.py', '--objects_dir', meson.build_root() / 'nntrainer' / 'libnntrainer.a.p', '--working_dir', meson.current_build_dir()],
+      output: 'nntrainer.def',
+      depends: nntrainer_static,
+      )
 
-    nntrainer_shared = shared_library('nntrainer',
-      nntrainer_sources,
-      dependencies: nntrainer_base_deps,
-      include_directories: nntrainer_inc,
-      install: true,
-      install_dir: nntrainer_libdir,
-      vs_module_defs : nntrainer_def
-    )
+      nntrainer_shared = shared_library('nntrainer',
+        nntrainer_sources,
+        dependencies: nntrainer_base_deps,
+        include_directories: nntrainer_inc,
+        install: true,
+        install_dir: nntrainer_libdir,
+        vs_module_defs : nntrainer_def
+      )
+    endif  
   else
     nntrainer_shared = shared_library('nntrainer',
       nntrainer_sources,
       dependencies: nntrainer_base_deps,
       include_directories: nntrainer_inc,
       install: true,
-      install_dir: nntrainer_libdir
+      install_dir: nntrainer_libdir,
     )
   endif
 
-  nntrainer_lib = nntrainer_shared
   if get_option('default_library') == 'static'
     nntrainer_lib = nntrainer_static
   endif

@@ -10,9 +10,17 @@ project('nntrainer', 'c', 'cpp',
     'buildtype=release'
   ]
 )
+
+build_type = get_option('buildtype')
+cmake_build_type = 'Release'
+
+if build_type == 'debug'
+  cmake_build_type = 'Debug'
+endif  
+
 common_win_subproject_cmake_defines = {
   'CMAKE_MSVC_RUNTIME_LIBRARY': 'MultiThreaded',
-  'CMAKE_BUILD_TYPE': 'Release',
+  'CMAKE_BUILD_TYPE': cmake_build_type,
 }
 
 # Set version info
@@ -211,15 +219,17 @@ if get_option('enable-opencl')
     opencl_root = meson.build_root() / 'opencl'
     clblast_dep = declare_dependency()
   elif get_option('platform') == 'windows'
-    clblast_lib_dir_absolute = windows_resource_dir_absolute / 'CLBlast'
-    clblast_lib_dir_absolute_win = clblast_lib_dir_absolute.replace('/', '\\')
-    run_command(['xcopy', '/C', '/Y', clblast_lib_dir_absolute_win, meson.current_build_dir()], check: true)
-    clblast_dir_relative = subprojects_dir_relative / 'CLBlast'
-    clblast_include = include_directories(clblast_dir_relative / 'include')
-    clblast_dep = declare_dependency(include_directories: clblast_include, link_args:['clblast.lib'])
-  else 
+    if get_option('default_library') != 'static'
+      clblast_lib_dir_absolute = windows_resource_dir_absolute / 'CLBlast'
+      clblast_lib_dir_absolute_win = clblast_lib_dir_absolute.replace('/', '\\')
+      run_command(['xcopy', '/C', '/Y', clblast_lib_dir_absolute_win, meson.current_build_dir()], check: true)
+      clblast_dir_relative = subprojects_dir_relative / 'CLBlast'
+      clblast_include = include_directories(clblast_dir_relative / 'include')
+      clblast_dep = declare_dependency(include_directories: clblast_include, link_args:['libclblast.lib'])
+    endif  
+  else
     clblast_options = cmake.subproject_options()
-    clblast_options.add_cmake_defines({'CMAKE_POLICY_VERSION_MINIMUM': '3.10'})
+    clblast_options.add_cmake_defines({'CMAKE_POLICY_VERSION_MINIMUM': '3.10', 'OPENCL_ROOT': 'C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2', 'CMAKE_BUILD_TYPE': ''})
     clblast_proj = cmake.subproject('clblast', options: clblast_options, required: true)
     clblast_dep = clblast_proj.dependency('clblast')
   endif
@@ -396,7 +406,7 @@ if get_option('enable-blas')
         message('Skip compiling OpenBLAS (using previous build)')
       else
         message('Setup OpenBLAS')
-        openblas_setup_command = ['cmake', '-B', openblas_build_dir_absolute, '-DNUM_THREADS=' + get_option('openblas-num-threads').to_string(), '-DBUILD_TESTING=False', '-DBUILD_BENCHMARKS=False', '-DBUILD_WITHOUT_LAPACK=True', '-DNOFORTRAN=True', '-DCMAKE_BUILD_TYPE=Release']
+        openblas_setup_command = ['cmake', '-B', openblas_build_dir_absolute, '-DNUM_THREADS=' + get_option('openblas-num-threads').to_string(), '-DBUILD_TESTING=False', '-DBUILD_BENCHMARKS=False', '-DBUILD_WITHOUT_LAPACK=True', '-DNOFORTRAN=True', '-DCMAKE_BUILD_TYPE='+cmake_build_type]
         openblas_setup_command += '-DBUILD_SHARED_LIBS=True'
 
         if cxx_compiler_id == 'clang'
@@ -410,7 +420,7 @@ if get_option('enable-blas')
         run_command(openblas_setup_command, check: true)
 
         message('Compile OpenBLAS')
-        openblas_compile_command = ['cmake' , '--build', openblas_build_dir_absolute, '--config', 'Release', '-j']
+        openblas_compile_command = ['cmake' , '--build', openblas_build_dir_absolute, '--config', cmake_build_type, '-j']
         run_command(openblas_compile_command, check: true)
       endif
 
@@ -553,13 +563,15 @@ thread_dep = dependency('threads') # pthread for tensorflow-lite
 if get_option('platform') == 'android'
   iniparser_root = subprojects_dir_absolute / 'iniparser'
   iniparser_dep = declare_dependency()
-elif get_option('platform') == 'windows'
-  iniparser_lib_dir_absolute = windows_resource_dir_absolute / 'iniparser'
-  iniparser_lib_dir_absolute_win = iniparser_lib_dir_absolute.replace('/', '\\')
-  run_command(['xcopy', '/C', '/Y', iniparser_lib_dir_absolute_win, meson.current_build_dir()], check: true)
-  iniparser_dir_relative = subprojects_dir_relative / 'iniparser'
-  iniparser_include = include_directories(iniparser_dir_relative / 'src')
-  iniparser_dep = declare_dependency(include_directories: iniparser_include, link_args:['iniparser.lib'])
+elif get_option('platform') == 'windows'  
+  if get_option('default_library') !='static'  
+    iniparser_lib_dir_absolute = windows_resource_dir_absolute / 'iniparser'
+    iniparser_lib_dir_absolute_win = iniparser_lib_dir_absolute.replace('/', '\\')
+    run_command(['xcopy', '/C', '/Y', iniparser_lib_dir_absolute_win, meson.current_build_dir()], check: true)
+    iniparser_dir_relative = subprojects_dir_relative / 'iniparser'
+    iniparser_include = include_directories(iniparser_dir_relative / 'src')
+    iniparser_dep = declare_dependency(include_directories: iniparser_include, link_args:['libiniparser.lib'])    
+  endif    
 else
   iniparser_dep = dependency('iniparser', required : false, version : '>=3.2') # iniparser
 
@@ -569,6 +581,7 @@ else
     iniparser_options.add_cmake_defines({'BUILD_EXAMPLES': false})
     iniparser_options.add_cmake_defines({'BUILD_TESTING': false})
     iniparser_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
+    iniparser_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
     iniparser_subproject = cmake.subproject('iniparser', options: iniparser_options, required: true)
     iniparser_dep = iniparser_subproject.dependency('iniparser-static')
   endif
