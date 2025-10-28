@@ -26,6 +26,8 @@ namespace nntrainer {
  * The first four bits represent the first int4 value, while the last four bits
  * represent the second int4 value.
  * E.g., 01011001 (89) represents 0101 (+5) and 1001 (-1)
+ *
+ * @todo Remove variable `group_size` and add PER_GROUP_AFFINE_32,64,128
  */
 class Int4QTensor : public TensorBase {
 public:
@@ -33,7 +35,8 @@ public:
    * @brief     Basic Constructor of Tensor
    */
   Int4QTensor(std::string name_ = "", Tformat fm = Tformat::NCHW,
-              QScheme qscheme_ = QScheme::PER_TENSOR_AFFINE);
+              QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
+              size_t g_size = 32);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -46,7 +49,8 @@ public:
    */
   Int4QTensor(const TensorDim &d, bool alloc_now,
               Initializer init = Initializer::NONE, std::string name = "",
-              QScheme qscheme_ = QScheme::PER_TENSOR_AFFINE);
+              QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
+              size_t g_size = 32);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -56,7 +60,8 @@ public:
    * @param qscheme_ quantization scheme of the tensor
    */
   Int4QTensor(const TensorDim &d, const void *buf = nullptr,
-              QScheme qscheme_ = QScheme::PER_TENSOR_AFFINE);
+              QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
+              size_t g_size = 32);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -68,14 +73,15 @@ public:
    */
   Int4QTensor(
     std::vector<std::vector<std::vector<std::vector<int8_t>>>> const &d,
-    std::vector<float> const &scales, Tformat fm, QScheme qscheme_);
+    std::vector<float> const &scales, Tformat fm, QScheme qscheme_,
+    size_t g_size = 32);
 
   /**
    * @brief Construct a new Int4QTensor object
    * @param rhs TensorBase object to copy
    */
   Int4QTensor(TensorBase &rhs) :
-    TensorBase(rhs), qscheme(QScheme::PER_TENSOR_AFFINE) {}
+    TensorBase(rhs), qscheme(QScheme::PER_CHANNEL_AFFINE) {}
 
   /**
    * @brief Basic Destructor
@@ -227,6 +233,13 @@ public:
             bool read_from_offset) override;
 
   /**
+   * @brief     Read the Tensor from file
+   * @param[in] src input file stream
+   */
+  void read(ReadSource src, size_t start_offset = 0,
+            bool read_from_offset = false) override;
+
+  /**
    * @copydoc Tensor::argmax()
    */
   std::vector<unsigned int> argmax() const override;
@@ -268,6 +281,11 @@ public:
                               bool read_from_offset) override;
 
   /**
+   * @copydoc TensorBase::read_quantization_info()
+   */
+  void read_quantization_info(ReadSource src, size_t start_offset,
+                              bool read_from_offset) override;
+  /**
    * @copydoc Tensor::getMemoryBytes()
    */
   size_t getMemoryBytes() const override;
@@ -282,11 +300,23 @@ public:
    */
   QScheme q_scheme() const override;
 
+  /**
+   * @brief Returns quantization group size
+   */
+  static size_t getGroupSize();
+
 private:
   /**
    * @brief quantization scheme
    */
   QScheme qscheme;
+
+  /**
+   * @brief Quantization group size
+   *
+   * @note need to properly define this
+   */
+  static size_t group_size;
 
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is

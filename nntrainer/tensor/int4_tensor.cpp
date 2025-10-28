@@ -17,19 +17,25 @@
 
 namespace nntrainer {
 
-Int4QTensor::Int4QTensor(std::string name_, Tformat fm, QScheme qscheme_) :
-  TensorBase(name_, fm, Tdatatype::QINT4), qscheme(qscheme_) {}
+size_t Int4QTensor::group_size = 32;
+
+Int4QTensor::Int4QTensor(std::string name_, Tformat fm, QScheme qscheme_,
+                         size_t g_size) :
+  TensorBase(name_, fm, Tdatatype::QINT4), qscheme(qscheme_) {
+  group_size = g_size;
+}
 
 Int4QTensor::Int4QTensor(const TensorDim &d, bool alloc_now, Initializer init,
-                         std::string name, QScheme qscheme_) :
+                         std::string name, QScheme qscheme_, size_t g_size) :
   TensorBase(d, alloc_now, init, name), qscheme(qscheme_) {
+  group_size = g_size;
   if (alloc_now)
     allocate();
 }
 
-Int4QTensor::Int4QTensor(const TensorDim &d, const void *buf,
-                         QScheme qscheme_) :
-  Int4QTensor(d, true, Initializer::NONE, "", qscheme_) {
+Int4QTensor::Int4QTensor(const TensorDim &d, const void *buf, QScheme qscheme_,
+                         size_t g_size) :
+  Int4QTensor(d, true, Initializer::NONE, "", qscheme_, g_size) {
   if (d.getDataLen() != 0) {
     if (buf != nullptr)
       copy(buf);
@@ -38,8 +44,10 @@ Int4QTensor::Int4QTensor(const TensorDim &d, const void *buf,
 
 Int4QTensor::Int4QTensor(
   std::vector<std::vector<std::vector<std::vector<int8_t>>>> const &d,
-  std::vector<float> const &scales, Tformat fm, QScheme qscheme_) :
+  std::vector<float> const &scales, Tformat fm, QScheme qscheme_,
+  size_t g_size) :
   qscheme(qscheme_) {
+  group_size = g_size;
   if (d.empty() || d[0].empty() || d[0][0].empty() || d[0][0][0].empty()) {
     throw std::out_of_range(
       "[Tensor] trying to initialize Int4QTensor from empty vector");
@@ -369,6 +377,29 @@ void Int4QTensor::read(std::ifstream &file, size_t start_offset,
   putData();
 }
 
+void Int4QTensor::read(ReadSource src, size_t start_offset,
+                       bool read_from_offset) {
+  if (start_offset == std::numeric_limits<size_t>::max()) {
+    start_offset = file_offset;
+  }
+  read_quantization_info(src, start_offset, read_from_offset);
+
+  std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
+
+  NNTR_THROW_IF(sz < 0, std::invalid_argument)
+    << "read size: " << getMemoryBytes()
+    << " is too big. It cannot be represented by std::streamsize";
+
+  if (read_from_offset) {
+    start_offset += sizeof(uint16_t);
+  }
+
+  checkedRead(src, (char *)getData(), sz,
+              "[Int4QTensor::read] operation failed", start_offset,
+              read_from_offset);
+  putData();
+}
+
 std::vector<unsigned int> Int4QTensor::argmax() const {
   std::vector<unsigned int> result;
   const int8_t *data = (int8_t *)getData();
@@ -524,7 +555,7 @@ void Int4QTensor::print(std::ostream &out) const {
 
 size_t Int4QTensor::getMemoryBytes() const {
   return ((size() + 1) / 2) * dim.getDataTypeSize() +
-         scale_size() * sizeof(float);
+         scale_size() * sizeof(uint16_t);
 }
 
 size_t Int4QTensor::scale_size() const {
@@ -533,7 +564,10 @@ size_t Int4QTensor::scale_size() const {
     return 1;
     break;
   case QScheme::PER_CHANNEL_AFFINE:
-    return height();
+    /// @todo fix me
+    /// @note Need to support PER_GROUP_32, PER_GROUP_64, PER_GROUP_128
+    // return height();
+    return height() * width() / 32;
     break;
   default:
     break;
@@ -569,6 +603,17 @@ void Int4QTensor::read_quantization_info(std::ifstream &file,
   checkedRead(file, (char *)&qscheme, sizeof(uint16_t),
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
+  group_size = 32; /// Remove me
 }
+
+void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
+                                         bool read_from_offset) {
+  checkedRead(src, (char *)&qscheme, sizeof(uint16_t),
+              "[Int4QTensor::read] failed to read quantization information",
+              start_offset, read_from_offset);
+  group_size = 32; /// Remove me
+}
+
+size_t Int4QTensor::getGroupSize() { return group_size; }
 
 } // namespace nntrainer

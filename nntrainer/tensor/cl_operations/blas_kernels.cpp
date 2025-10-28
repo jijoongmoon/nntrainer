@@ -14,7 +14,212 @@
 #include "blas_kernels_templates.h"
 #include <cl_kernels/cl_kernels.h>
 
+#include <fp16.h>
+
 namespace nntrainer {
+
+void gemv_int4_async_cl(std::vector<void *> weights,
+                        std::vector<uint16_t *> scales, uint16_t *input,
+                        std::vector<uint16_t *> outputs, unsigned int K,
+                        std::vector<unsigned int> Ns,
+                        unsigned int quantization_group_size) {
+  bool result = false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  auto &clbuffInstance = ClBufferManager::Global();
+
+  const bool scale_row_major = false;
+  std::string compile_options =
+    " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size) +
+    " -D SCALE_ROW_MAJOR=" + std::to_string(scale_row_major);
+
+  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+    int4_gemv_kernel, "fully_connected_gpu_int4_gemv", compile_options);
+  if (!kernel_ptr) {
+    throw std::runtime_error(
+      "Failed to get kernel_ptr for fully_connected_gpu_int4_gemv");
+    return;
+  }
+
+  const int work_group_size[3] = {16, 1, 16};
+
+  for (unsigned int i = 0; i < Ns.size(); ++i) {
+    int arg = 0;
+    int N = Ns[i];
+    void *weight = weights[i];
+    uint16_t *scale = scales[i];
+    uint16_t *output = outputs[i];
+    result = kernel_ptr->SetKernelSVMArguments(arg++, input);
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 0 for fully_connected_gpu_int4_gemv");
+
+    kernel_ptr->SetKernelSVMArguments(arg++, scale);
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 1 for fully_connected_gpu_int4_gemv");
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 2 for fully_connected_gpu_int4_gemv");
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, weight);
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 3 for fully_connected_gpu_int4_gemv");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &K, sizeof(int));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 4 for fully_connected_gpu_int4_gemv");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &N, sizeof(int));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 5 for fully_connected_gpu_int4_gemv");
+
+    const int work_groups_count[3] = {(int)(N / 2), 1, 16};
+    result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size);
+    if (!result) {
+      throw std::runtime_error(
+        "Failed to dispatch kernel for fully_connected_gpu_int4_gemv");
+      return;
+    }
+  }
+
+  for (unsigned int i = 0; i < Ns.size(); ++i) {
+    blas_cc->command_queue_inst_.enqueueSVMMap(outputs[i],
+                                               Ns[i] * sizeof(uint16_t), true);
+  }
+  if (!result) {
+    throw std::runtime_error(
+      "Failed to read output data for fully_connected_gpu_int4_gemv");
+    return;
+  }
+}
+
+void gemv_int4_cl(char *weight, uint16_t *scale, uint16_t *input,
+                  uint16_t *output, unsigned int K, unsigned int N,
+                  unsigned int quantization_group_size) {
+  bool result = false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  auto &clbuffInstance = ClBufferManager::Global();
+
+  const bool scale_row_major = false;
+  std::string compile_options =
+    " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size) +
+    " -D SCALE_ROW_MAJOR=" + std::to_string(scale_row_major);
+
+  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+    int4_gemv_kernel, "fully_connected_gpu_int4_gemv", compile_options);
+  if (!kernel_ptr) {
+    throw std::runtime_error(
+      "Failed to get kernel_ptr for fully_connected_gpu_int4_gemv");
+    return;
+  }
+
+  int arg = 0;
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, input);
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 0 for fully_connected_gpu_int4_gemv");
+
+  kernel_ptr->SetKernelSVMArguments(arg++, scale);
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 1 for fully_connected_gpu_int4_gemv");
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 2 for fully_connected_gpu_int4_gemv");
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, weight);
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 3 for fully_connected_gpu_int4_gemv");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &K, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 4 for fully_connected_gpu_int4_gemv");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &N, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 5 for fully_connected_gpu_int4_gemv");
+
+  const int work_groups_count[3] = {(int)(N / 2), 1, 16};
+  const int work_group_size[3] = {16, 1, 16};
+
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+    kernel_ptr, work_groups_count, work_group_size);
+  if (!result) {
+    throw std::runtime_error(
+      "Failed to dispatch kernel for fully_connected_gpu_int4_gemv");
+    return;
+  }
+
+  /// @todo synchronize when only needed
+  blas_cc->command_queue_inst_.enqueueSVMMap(output, N * sizeof(uint16_t),
+                                             true);
+  if (!result) {
+    throw std::runtime_error(
+      "Failed to read output data for fully_connected_gpu_int4_gemv");
+    return;
+  }
+}
+
+void gemv_int4_async_cl(std::vector<void *> weights,
+                        std::vector<uint16_t *> scales, float *input,
+                        std::vector<float *> outputs, unsigned int K,
+                        std::vector<unsigned int> Ns,
+                        unsigned int quantization_group_size) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  auto &clbuffInstance = ClBufferManager::Global();
+
+  // copy fp32 input to fp16
+  copy_fp32_u16(K, input, (uint16_t *)clbuffInstance.getSVMInput());
+  std::vector<uint16_t *> output_vec;
+
+  for (int i = 0; i < Ns.size(); ++i) {
+    output_vec.push_back((uint16_t *)clbuffInstance.getSVMOutput(i));
+  }
+
+  gemv_int4_async_cl(weights, scales, (uint16_t *)clbuffInstance.getSVMInput(),
+                     output_vec, K, Ns, quantization_group_size);
+
+  for (int i = 0; i < Ns.size(); ++i) {
+    copy_u16_fp32(Ns[i], (uint16_t *)clbuffInstance.getSVMOutput(i),
+                  outputs[i]);
+  }
+}
+
+void gemv_int4_cl(char *weight, uint16_t *scale, float *input, float *output,
+                  unsigned int K, unsigned int N,
+                  unsigned int quantization_group_size) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  auto &clbuffInstance = ClBufferManager::Global();
+
+  // copy fp32 input to fp16
+  copy_fp32_u16(K, input, (uint16_t *)clbuffInstance.getSVMInput());
+
+  // perform int4 matmul
+  gemv_int4_cl(weight, scale, (uint16_t *)clbuffInstance.getSVMInput(),
+               (uint16_t *)clbuffInstance.getSVMOutput(), K, N,
+               quantization_group_size);
+
+  // copy fp16 output to fp32
+  copy_u16_fp32(N, (uint16_t *)clbuffInstance.getSVMOutput(), output);
+}
 
 void gemm_q4_0_async_cl(std::vector<void *> matAdata, float *matBdata,
                         std::vector<float *> matCdata, unsigned int M,
@@ -213,6 +418,309 @@ void gemm_q4_0_cl(void *matAdata, float *matBdata, float *matCdata,
   if (!result) {
     throw std::runtime_error(
       "Failed to read output data for kernel_mul_mat_Ab_Bi_8x4");
+    return;
+  }
+}
+
+void openvino_gemm_async_cl(float *input, std::vector<void *> weights,
+                            std::vector<uint16_t *> scales,
+                            std::vector<float *> matCdata, unsigned int M,
+                            std::vector<unsigned int> Ns, unsigned int K,
+                            unsigned int quantization_group_size) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  auto &clbuffInstance = ClBufferManager::Global();
+
+  bool result = false;
+
+  auto ceil_div = [](unsigned int a, unsigned int b) -> unsigned int {
+    return (a + b - 1) / b;
+  };
+
+  auto align = [](unsigned int a, unsigned int b) -> unsigned int {
+    return (a % b == 0) ? a : a - a % b + b;
+  };
+
+  // copy fp32 input to fp16
+  copy_fp32_u16(M * K, input, (uint16_t *)clbuffInstance.getSVMInput());
+
+  std::vector<cl_event> quantize_event(1);
+  {
+    std::string compile_options =
+      " -D SIZE_N=" + std::to_string(Ns[0]) +
+      " -D SIZE_K=" + std::to_string(K) +
+      " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size);
+
+    ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+      openvino_gemm_kernel, "quantize_input", compile_options);
+    if (!kernel_ptr) {
+      throw std::runtime_error("Failed to get kernel_ptr for quantize_input");
+      return;
+    }
+
+    int arg = 0;
+
+    result =
+      kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMInput());
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 0 for "
+                               "quantize_input");
+
+    result =
+      kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMQuant());
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 1 for "
+                               "quantize_input");
+
+    result =
+      kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMScale());
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 2 for "
+                               "quantize_input");
+
+    const int work_groups_count[3] = {
+      (int)align((M * K) / quantization_group_size, 64), 1, 1};
+    const int work_group_size[3] = {64, 1, 1};
+
+    result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size, &quantize_event.front());
+    if (!result) {
+      throw std::runtime_error("Failed to dispatch kernel for quantize_input");
+      return;
+    }
+  }
+
+  for (unsigned int i = 0; i < Ns.size(); ++i) {
+    int N = Ns[i];
+
+    const bool scale_row_major = false;
+    std::string compile_options =
+      " -D SIZE_N=" + std::to_string(N) + " -D SIZE_K=" + std::to_string(K) +
+      " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size) +
+      " -D SCALE_ROW_MAJOR=" + std::to_string(scale_row_major);
+
+    ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+      openvino_gemm_kernel, "fc_bf_tiled_kernel_default", compile_options);
+    if (!kernel_ptr) {
+      throw std::runtime_error(
+        "Failed to get kernel_ptr for fc_bf_tiled_kernel_default");
+      return;
+    }
+
+    int arg = 0;
+
+    result =
+      kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMInput());
+
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 0 for fc_bf_tiled_kernel_default");
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, scales[i]);
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 1 for fc_bf_tiled_kernel_default");
+
+    result =
+      kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMOutput(i));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 2 for fc_bf_tiled_kernel_default");
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, weights[i]);
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 3 for fc_bf_tiled_kernel_default");
+
+    result =
+      kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMQuant());
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 4 for fc_bf_tiled_kernel_default");
+
+    result =
+      kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMScale());
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 5 for fc_bf_tiled_kernel_default");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &M, sizeof(int));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 6 for fc_bf_tiled_kernel_default");
+
+    const int work_groups_count[3] = {(int)(N / 2),
+                                      (int)(align(ceil_div(M, 8), 8)), 1};
+    const int work_group_size[3] = {16, 8, 1};
+
+    result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size, nullptr, quantize_event);
+    if (!result) {
+      throw std::runtime_error(
+        "Failed to dispatch kernel for fc_bf_tiled_kernel_default");
+      return;
+    }
+  }
+
+  for (unsigned int i = 0; i < Ns.size(); ++i) {
+    blas_cc->command_queue_inst_.enqueueSVMMap(
+      clbuffInstance.getSVMOutput(i), M * Ns[i] * sizeof(uint16_t), true);
+
+    // copy fp16 output to fp32
+    copy_u16_fp32(M * Ns[i], (uint16_t *)clbuffInstance.getSVMOutput(i),
+                  matCdata[i]);
+  }
+}
+
+///  @note remove this when fp16 is enabled on Windows
+void openvino_sgemm_cl(float *input, char *weight, uint16_t *scale,
+                       float *output, unsigned int M, unsigned int N,
+                       unsigned int K, unsigned int quantization_group_size) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  auto &clbuffInstance = ClBufferManager::Global();
+
+  // copy fp32 input to fp16
+  copy_fp32_u16(M * K, input, (uint16_t *)clbuffInstance.getSVMInput());
+
+  // perform int4 matmul
+  openvino_gemm_cl(clbuffInstance.getSVMInput(), weight, scale,
+                   clbuffInstance.getSVMOutput(), M, N, K,
+                   quantization_group_size);
+
+  // copy fp16 output to fp32
+  copy_u16_fp32(M * N, (uint16_t *)clbuffInstance.getSVMOutput(), output);
+}
+
+void openvino_gemm_cl(void *input, void *weights, void *scales, void *output,
+                      unsigned int M, unsigned int N, unsigned int K,
+                      unsigned int quantization_group_size) {
+  bool result = false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  auto &clbuffInstance = ClBufferManager::Global();
+  const bool scale_row_major = false;
+  std::string compile_options =
+    " -D SIZE_N=" + std::to_string(N) + " -D SIZE_K=" + std::to_string(K) +
+    " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size) +
+    " -D SCALE_ROW_MAJOR=" + std::to_string(scale_row_major);
+
+  auto ceil_div = [](unsigned int a, unsigned int b) -> unsigned int {
+    return (a + b - 1) / b;
+  };
+
+  auto align = [](unsigned int a, unsigned int b) -> unsigned int {
+    return (a % b == 0) ? a : a - a % b + b;
+  };
+
+  std::vector<cl_event> quantize_event(1);
+  {
+    ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+      openvino_gemm_kernel, "quantize_input", compile_options);
+    if (!kernel_ptr) {
+      throw std::runtime_error("Failed to get kernel_ptr for quantize_input");
+      return;
+    }
+
+    int arg = 0;
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, input);
+
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 0 for "
+                               "quantize_input");
+
+    result =
+      kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMQuant());
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 1 for "
+                               "quantize_input");
+
+    result =
+      kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMScale());
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 2 for "
+                               "quantize_input");
+
+    const int work_groups_count[3] = {
+      (int)align((M * K) / quantization_group_size, 64), 1, 1};
+    const int work_group_size[3] = {64, 1, 1};
+
+    result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size, &quantize_event.front());
+    if (!result) {
+      throw std::runtime_error("Failed to dispatch kernel for quantize_input");
+      return;
+    }
+  }
+
+  // 3. Perform Matrix Multiplication
+  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+    openvino_gemm_kernel, "fc_bf_tiled_kernel_default", compile_options);
+  if (!kernel_ptr) {
+    throw std::runtime_error(
+      "Failed to get kernel_ptr for fc_bf_tiled_kernel_default");
+    return;
+  }
+
+  int arg = 0;
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, input);
+
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 0 for fc_bf_tiled_kernel_default");
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, scales);
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 1 for fc_bf_tiled_kernel_default");
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 2 for fc_bf_tiled_kernel_default");
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, weights);
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 3 for fc_bf_tiled_kernel_default");
+
+  result =
+    kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMQuant());
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 4 for fc_bf_tiled_kernel_default");
+
+  result =
+    kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMScale());
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 5 for fc_bf_tiled_kernel_default");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &M, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 6 for fc_bf_tiled_kernel_default");
+
+  const int work_groups_count[3] = {(int)(N / 2),
+                                    (int)(align(ceil_div(M, 8), 8)), 1};
+  const int work_group_size[3] = {16, 8, 1};
+
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+    kernel_ptr, work_groups_count, work_group_size, nullptr, quantize_event);
+  if (!result) {
+    throw std::runtime_error(
+      "Failed to dispatch kernel for fc_bf_tiled_kernel_default");
+    return;
+  }
+
+  /// @todo synchronize when only needed
+  blas_cc->command_queue_inst_.enqueueSVMMap(output, M * N * sizeof(uint16_t),
+                                             true);
+  if (!result) {
+    throw std::runtime_error(
+      "Failed to read output data for fc_bf_tiled_kernel_default");
     return;
   }
 }

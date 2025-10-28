@@ -30,6 +30,8 @@
 #include <windows.h>
 #endif
 
+#define KERNEL_CACHE_ENABLED 0
+
 namespace nntrainer {
 
 std::mutex cl_factory_mutex;
@@ -69,7 +71,9 @@ void ClContext::initialize() noexcept {
       ml_loge("Error: ClContext::initialize() failed");
       return;
     }
-    std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH);
+
+   if (KERNEL_CACHE_ENABLED)
+      std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH);
 
     initBlasClKernels();
     initAttentionClKernels();
@@ -190,6 +194,9 @@ void ClContext::initBlasClKernels() {
   registerClKernel(transpose_32bit_16bit_kernel, "kernel_transpose_32_16");
   registerClKernel(q4_0_ab_bi_8x4_kernel, "kernel_mul_mat_Ab_Bi_8x4");
 
+  // register INT4 computation kernels
+  registerClKernel(int4_gemv_kernel, "fully_connected_gpu_int4_gemv");
+
 #ifdef ENABLE_FP16
   registerClKernel(hgemv_kernel, "sgemv_cl_fp16");
   registerClKernel(hgemv_no_trans_kernel, "sgemv_cl_noTrans_fp16");
@@ -220,26 +227,28 @@ void ClContext::initAttentionClKernels() {
 }
 
 const ClContext::SharedPtrClKernel
-ClContext::registerClKernel(std::string kernel_string,
-                            std::string kernel_name) {
+ClContext::registerClKernel(std::string kernel_string, std::string kernel_name,
+                            std::string compile_options) {
   // check if created before
-  if (ocl_kernel_map.find(kernel_name) != ocl_kernel_map.end()) {
-    return ocl_kernel_map[kernel_name];
+  if (ocl_kernel_map.find(kernel_name + compile_options) !=
+      ocl_kernel_map.end()) {
+    return ocl_kernel_map[kernel_name + compile_options];
   }
 
   // creating shared_ptr for kernel object
   SharedPtrClKernel kernelPtr = std::make_shared<opencl::Kernel>();
-  if (!clCreateKernel(kernel_string, kernel_name, kernelPtr)) {
+  if (!clCreateKernel(kernel_string, kernel_name, compile_options, kernelPtr)) {
     ml_loge("Failed to register kernel %s", kernel_name.c_str());
     return nullptr;
   }
   // add to map
-  ocl_kernel_map.emplace(kernel_name, kernelPtr);
-  return ocl_kernel_map[kernel_name];
+  ocl_kernel_map.emplace(kernel_name + compile_options, kernelPtr);
+  return ocl_kernel_map[kernel_name + compile_options];
 }
 
 bool ClContext::clCreateKernel(std::string &kernel_string,
                                std::string &kernel_name,
+                               std::string &compile_options,
                                const SharedPtrClKernel &kernel_ptr_) {
 
   ml_logi("Kernel initializing: %s", kernel_name.c_str());
@@ -251,10 +260,11 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   // reading binary
   std::string binary_file_path =
     opencl::Program::DEFAULT_KERNEL_PATH + "/" +
-    std::to_string(program.GetKernelHash(kernel_string, "")) + ".cl.bin";
+    std::to_string(program.GetKernelHash(kernel_string, compile_options)) +
+    ".cl.bin";
   auto binary_data = readBinaryFile(binary_file_path);
 
-  if (!binary_data.empty()) {
+  if (KERNEL_CACHE_ENABLED && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
             kernel_name.c_str(), binary_file_path.c_str());
     result = program.CreateCLProgramWithBinary(
@@ -264,11 +274,12 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   } else {
     ml_logi("Binary for kernel %s not found, compiling from source...",
             kernel_name.c_str());
-    result = program.CreateCLProgram(
-      opencl::ContextManager::Global().GetContext(),
-      opencl::ContextManager::Global().GetDeviceId(), kernel_string, "");
+    result =
+      program.CreateCLProgram(opencl::ContextManager::Global().GetContext(),
+                              opencl::ContextManager::Global().GetDeviceId(),
+                              kernel_string, compile_options);
 
-    if (result) {
+    if (KERNEL_CACHE_ENABLED && result) {
       auto binary = program.GetProgramBinary(
         opencl::ContextManager::Global().GetDeviceId());
 

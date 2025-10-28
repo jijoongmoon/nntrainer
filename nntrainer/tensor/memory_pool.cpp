@@ -35,7 +35,7 @@
 
 #define ALIGNED_ALLOC(size) _aligned_malloc(size, GET_SYSTEM_ALIGMENT())
 #define ALIGNED_FREE(ptr) _aligned_free(ptr)
-#elif defined(__ANDROID__)
+#elif defined(__ANDROID__) && ENABLE_NPU
 #define RPCMEM_HEAP_ID_SYSTEM 25
 #define RPCMEM_DEFAULT_FLAGS 1
 #define ALIGNED_ALLOC(size)                                                    \
@@ -172,10 +172,9 @@ void MemoryPool::allocate() {
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   mem_pool = cl_context->context_inst_.createSVMRegion(pool_size);
 
-  // If SVM allocation fails, use calloc()
   if (mem_pool == nullptr) {
-    svm_allocation = false;
-    mem_pool = calloc(pool_size, 1);
+    throw std::runtime_error("Failed to allocate SVM memory pool of size " +
+                             std::to_string(pool_size) + " bytes");
   }
 #else
   mem_pool = calloc(pool_size, 1);
@@ -252,20 +251,11 @@ void MemoryPool::allocateFSU() {
  *
  */
 std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
-
 #if defined(__ANDROID__)
   auto mem_data = std::make_shared<MemoryData>((void *)memory_ptrs.at(idx - 1));
 #else
   if (mem_pool == nullptr)
     throw std::invalid_argument("Getting memory before allocation");
-
-#ifdef ENABLE_OPENCL
-  if (svm_allocation) {
-    auto mem_data =
-      std::make_shared<MemoryData>((void *)memory_ptrs.at(idx - 1), true);
-    return mem_data;
-  }
-#endif
 
   auto mem_data = std::make_shared<MemoryData>((void *)memory_ptrs.at(idx - 1));
 #endif
@@ -279,13 +269,9 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
 void MemoryPool::deallocate() {
   if (mem_pool != nullptr) {
 #ifdef ENABLE_OPENCL
-    if (svm_allocation) {
-      auto *cl_context =
-        static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-      cl_context->context_inst_.releaseSVMRegion(mem_pool);
-    } else {
-      free(mem_pool);
-    }
+    auto *cl_context =
+      static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+    cl_context->context_inst_.releaseSVMRegion(mem_pool);
 #else
     free(mem_pool);
 #endif

@@ -24,6 +24,71 @@
 
 namespace nntrainer {
 
+/**
+ * @brief     signed 4-bit integer gemv async computation : C = A*B
+ * @param[in] weight std::vector<void *> for int4 quantized weight
+ * @param[in] scale std::vector<uint16_t *> for scales
+ * @param[in] input uint16_t * for input
+ * @param[in] output std::vector<uint16_t *> for output
+ * @param[in] K hidden dimension
+ * @param[in] Ns output dimensions
+ */
+void gemv_int4_async_cl(std::vector<void *> weights,
+                        std::vector<uint16_t *> scales, uint16_t *input,
+                        std::vector<uint16_t *> outputs, unsigned int K,
+                        std::vector<unsigned int> Ns,
+                        unsigned int quantization_group_size);
+
+/**
+ * @brief     signed 4-bit integer gemv async computation : C = A*B
+ * @param[in] weight std::vector<void *> for int4 quantized weight
+ * @param[in] scale std::vector<uint16_t *> for scales
+ * @param[in] input float * for input
+ * @param[in] output std::vector<float *> for output
+ * @param[in] K hidden dimension
+ * @param[in] Ns output dimensions
+ */
+void gemv_int4_async_cl(std::vector<void *> weights,
+                        std::vector<uint16_t *> scales, float *input,
+                        std::vector<float *> outputs, unsigned int K,
+                        std::vector<unsigned int> Ns,
+                        unsigned int quantization_group_size);
+
+/**
+ * @brief     signed 4-bit integer gemv computation : C = A*B
+ * @param[in] weight char * for int4 quantized weight
+ * @param[in] scale uint16_t * for scales
+ * @param[in] input uint16_t * for input
+ * @param[in] output uint16_t * for output
+ * @param[in] K hidden dimension
+ * @param[in] N output dimension
+ */
+void gemv_int4_cl(char *weight, uint16_t *scale, uint16_t *input,
+                  uint16_t *output, unsigned int K, unsigned int N,
+                  unsigned int quantization_group_size);
+
+/**
+ * @brief     signed 4-bit integer gemv computation : C = A*B
+ * @param[in] weight char * for int4 quantized weight
+ * @param[in] scale uint16_t * for scales
+ * @param[in] input float * for input
+ * @param[in] output float * for output
+ * @param[in] K hidden dimension
+ * @param[in] N output dimension
+ */
+void gemv_int4_cl(char *weight, uint16_t *scale, float *input, float *output,
+                  unsigned int K, unsigned int N,
+                  unsigned int quantization_group_size);
+
+/**
+ * @brief     Q4_0 gemm async computation : C = A*B
+ * @param[in] matAdata std::vector<void *> for Matrix A
+ * @param[in] matBdata float * for Matrix B
+ * @param[in] matCdata std::vector<float *> for Matrix C
+ * @param[in] M input dimension
+ * @param[in] N output dimensions of As
+ * @param[in] K hidden dimension
+ */
 void gemm_q4_0_async_cl(std::vector<void *> matAdata, float *matBdata,
                         std::vector<float *> matCdata, unsigned int M,
                         std::vector<unsigned int> N, unsigned int K);
@@ -39,6 +104,28 @@ void gemm_q4_0_async_cl(std::vector<void *> matAdata, float *matBdata,
  */
 void gemm_q4_0_cl(void *matAdata, float *matBdata, float *matCdata,
                   unsigned int M, unsigned int N, unsigned int K);
+
+/**
+ * @brief INT4 GEMM computation for float input / output
+ */
+void openvino_sgemm_cl(float *input, char *weight, uint16_t *scale,
+                       float *output, unsigned int M, unsigned int N,
+                       unsigned int K, unsigned int quantization_group_size);
+/**
+ * @brief INT4 GEMM computation for fp16 input / output
+ */
+void openvino_gemm_cl(void *input, void *weights, void *scales, void *output,
+                      unsigned int M, unsigned int N, unsigned int K,
+                      unsigned int quantization_group_size);
+
+/**
+ * @brief INT4 GEMM async computation
+ */
+void openvino_gemm_async_cl(float *input, std::vector<void *> weights,
+                            std::vector<uint16_t *> scales,
+                            std::vector<float *> matCdata, unsigned int M,
+                            std::vector<unsigned int> Ns, unsigned int K,
+                            unsigned int quantization_group_size);
 
 /**
  * @brief     Q6_K sgemv computation : Y = A*X

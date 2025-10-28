@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cpu_backend.h>
 #include <float_tensor.h>
+#include <int4_tensor.h>
 #include <tensor.h>
 #include <util_func.h>
 
@@ -705,6 +706,11 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::Q4_0:
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
+  case Tdatatype::QINT16:
+  case Tdatatype::QINT8:
+  case Tdatatype::QINT4:
+    dotQInteger(input, output, trans, trans_in, beta, input.getDataType());
+    break;
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
@@ -713,7 +719,6 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
 
 void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
                       bool trans, bool trans_in, float beta) const {
-
   float *data = (float *)getData();
   unsigned int M = getDim().height();
   unsigned int K = getDim().width();
@@ -722,33 +727,60 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   std::vector<void *> mdatas;
   std::vector<float *> rdatas;
 
-  for (unsigned int i = 0; i < input.size(); ++i) {
-    int N = input[i]->getDim().width();
-    void *mdata = (void *)input[i]->getData<uint8_t>();
-    float *rdata = output[i]->getData<float>();
+  if (input[0]->getDataType() == Tdatatype::Q4_0) {
+    for (unsigned int i = 0; i < input.size(); ++i) {
+      int N = input[i]->getDim().width();
+      void *mdata = (void *)input[i]->getData<uint8_t>();
+      float *rdata = output[i]->getData<float>();
 #ifdef ENABLE_OPENCL
-    if (input[i]->getMemoryData()->isSVM() &&
-        output[i]->getMemoryData()->isSVM() && getMemoryData()->isSVM() &&
-        M != 1) {
+      if (M == 1) {
+        gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
+      } else {
+        Ns.push_back(N);
+        mdatas.push_back(mdata);
+        rdatas.push_back(rdata);
+      }
+#else
+      /// @todo Support multi-weight q4_0 for x64
+      gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
+#endif
+    }
+
+#ifdef ENABLE_OPENCL
+    if (M != 1) {
+      gemm_q4_0_async_cl(mdatas, data, rdatas, M, Ns, K);
+    }
+#endif
+  } else if (input[0]->getDataType() == Tdatatype::QINT4) {
+#ifndef ENABLE_OPENCL
+    throw std::runtime_error("Error: QINT4 Dot is not supported on CPU");
+#else
+    std::vector<uint16_t *> scales;
+
+    for (unsigned int i = 0; i < input.size(); ++i) {
+      int N = input[i]->getDim().width();
+      void *mdata = (void *)input[i]->getData<uint8_t>();
+      float *rdata = output[i]->getData<float>();
+      uint16_t *scale = input[i]->getScale<uint16_t>();
+
       Ns.push_back(N);
       mdatas.push_back(mdata);
       rdatas.push_back(rdata);
-    } else {
-      gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
+      scales.push_back(scale);
     }
-#else
-    /// @todo Support multi-weight q4_0 for x64
-    gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
-#endif
-  }
 
-#ifdef ENABLE_OPENCL
-  if (input[0]->getMemoryData()->isSVM() &&
-      output[0]->getMemoryData()->isSVM() && getMemoryData()->isSVM() &&
-      M != 1) {
-    gemm_q4_0_async_cl(mdatas, data, rdatas, M, Ns, K);
-  }
+    /// Asynchronous execution
+    if (M == 1) {
+      gemv_int4_async_cl(mdatas, scales, data, rdatas, K, Ns,
+                         Int4QTensor::getGroupSize());
+    } else {
+      openvino_gemm_async_cl(data, mdatas, scales, rdatas, M, Ns, K,
+                             Int4QTensor::getGroupSize());
+    }
 #endif
+  } else {
+    throw std::runtime_error("unsupported data type");
+  }
 }
 
 Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
@@ -905,11 +937,10 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     K = getDim().width();
     N = input.getDim().width();
 #ifdef ENABLE_OPENCL
-    if (input.getMemoryData()->isSVM() && output.getMemoryData()->isSVM() &&
-        getMemoryData()->isSVM() && M != 1) {
-      gemm_q4_0_cl((void *)mdata, data, rdata, M, N, K);
-    } else {
+    if (M == 1) {
       gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    } else {
+      gemm_q4_0_cl((void *)mdata, data, rdata, M, N, K);
     }
 #else
     gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
@@ -919,6 +950,34 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
+
+  return output;
+}
+
+Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
+                                 bool trans, bool trans_in, float beta,
+                                 Tdatatype dtype) const {
+#ifndef ENABLE_OPENCL
+  throw std::runtime_error("Error: QINT4 Dot is not supported on CPU");
+#else
+
+  float *data = (float *)getData();
+  char *mdata = input.getData<char>();
+  float *rdata = output.getData<float>();
+
+  unsigned int M = getDim().height();
+  unsigned int K = getDim().width();
+  unsigned int N = input.getDim().width();
+
+  /// @note this should be if (M == 1) else
+  if (M == 1) {
+    gemv_int4_cl(mdata, input.getScale<uint16_t>(), data, rdata, K, N,
+                 Int4QTensor::getGroupSize());
+  } else {
+    openvino_sgemm_cl(data, mdata, input.getScale<uint16_t>(), rdata, M, N, K,
+                      Int4QTensor::getGroupSize());
+  }
+#endif
 
   return output;
 }

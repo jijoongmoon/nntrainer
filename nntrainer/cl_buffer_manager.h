@@ -47,9 +47,8 @@ private:
 
   /// @note this size might be changed
   const size_t scale_q4_0_size =
-    3072 * (8192 / 32) * 2; /** buffer size of quants */
-  const size_t quant_q4_0_size =
-    3072 * (8192 / 32) * 16; /** buffer size of scales */
+    3072 * (8192 / 32) * 2;                   /** buffer size of quants */
+  const size_t quant_q4_0_size = 3072 * 8192; /** buffer size of scales */
 
   opencl::Buffer *inBufferA = nullptr;
   opencl::Buffer *inBufferB = nullptr;
@@ -60,6 +59,7 @@ private:
   void *data_input = nullptr;
   std::vector<void *> scale_vec;
   std::vector<void *> quant_vec;
+  std::vector<void *> output_vec;
 
 public:
   /**
@@ -101,6 +101,18 @@ public:
    * @brief Get the SVM pointer to data_input
    */
   void *getSVMInput() { return data_input; }
+
+  /**
+   * @brief Get the SVM pointer to data_input
+   *
+   * @note remove this when fp16 is enabled on Windows
+   */
+  void *getSVMOutput(unsigned int idx = 0) {
+    if (idx >= output_vec.size())
+      return nullptr;
+
+    return output_vec[idx];
+  }
 
   /**
    * @brief Get the SVM pointer to data_input

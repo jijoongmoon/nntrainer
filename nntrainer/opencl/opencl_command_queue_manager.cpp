@@ -331,28 +331,31 @@ bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event) {
  * or wait for this command to complete
  * @return true if command queue execution is successful or false otherwise
  */
-bool CommandQueueManager::DispatchCommand(Kernel kernel,
-                                          const int (&work_groups_count)[3],
-                                          const int (&work_group_size)[3],
-                                          cl_event *event) {
+bool CommandQueueManager::DispatchCommand(
+  Kernel kernel, const int (&work_groups_count)[3],
+  const int (&work_group_size)[3], cl_event *event,
+  std::vector<cl_event> events_to_wait) {
 
   // work_dim of 2 has been hardcoded, might be modified later based on
   // requirements
 
   // setting the local_work_size referred to as the size of the
   // work-group
-  const size_t local[2] = {static_cast<size_t>(work_group_size[0]),
-                           static_cast<size_t>(work_group_size[1])};
+  const size_t local[3] = {static_cast<size_t>(work_group_size[0]),
+                           static_cast<size_t>(work_group_size[1]),
+                           static_cast<size_t>(work_group_size[2])};
 
   // setting the global_work_size that describe the number of global work-items
-  const size_t global[2] = {static_cast<size_t>(work_groups_count[0]),
-                            static_cast<size_t>(work_groups_count[1])};
+  const size_t global[3] = {static_cast<size_t>(work_groups_count[0]),
+                            static_cast<size_t>(work_groups_count[1]),
+                            static_cast<size_t>(work_groups_count[2])};
 
   cl_kernel kernel_ = kernel.GetKernel();
 
   // returns NULL with error code if fails
-  const int error_code = clEnqueueNDRangeKernel(
-    command_queue_, kernel_, 2, nullptr, global, local, 0, nullptr, event);
+  const int error_code =
+    clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
+                           events_to_wait.size(), events_to_wait.data(), event);
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
@@ -364,25 +367,29 @@ bool CommandQueueManager::DispatchCommand(Kernel kernel,
 
 bool CommandQueueManager::DispatchCommand(
   const std::shared_ptr<Kernel> &kernel_ptr, const int (&work_groups_count)[3],
-  const int (&work_group_size)[3], cl_event *event) {
+  const int (&work_group_size)[3], cl_event *event,
+  std::vector<cl_event> events_to_wait) {
 
   // work_dim of 2 has been hardcoded, might be modified later based on
   // requirements
 
   // setting the local_work_size referred to as the size of the
   // work-group
-  const size_t local[2] = {static_cast<size_t>(work_group_size[0]),
-                           static_cast<size_t>(work_group_size[1])};
+  const size_t local[3] = {static_cast<size_t>(work_group_size[0]),
+                           static_cast<size_t>(work_group_size[1]),
+                           static_cast<size_t>(work_group_size[2])};
 
   // setting the global_work_size that describe the number of global work-items
-  const size_t global[2] = {static_cast<size_t>(work_groups_count[0]),
-                            static_cast<size_t>(work_groups_count[1])};
+  const size_t global[3] = {static_cast<size_t>(work_groups_count[0]),
+                            static_cast<size_t>(work_groups_count[1]),
+                            static_cast<size_t>(work_groups_count[2])};
 
   cl_kernel kernel_ = kernel_ptr->GetKernel();
 
   // returns NULL with error code if fails
-  const int error_code = clEnqueueNDRangeKernel(
-    command_queue_, kernel_, 2, nullptr, global, local, 0, nullptr, event);
+  const int error_code =
+    clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
+                           events_to_wait.size(), events_to_wait.data(), event);
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
