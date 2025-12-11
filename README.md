@@ -31,7 +31,7 @@ NNTrainer enables running large-scale Mixture of Experts (MoE) models directly o
 
 | GPT-OSS 20B | Qwen3 MoE 30B-A3B |
 |:-----------:|:-----------------:|
-| <video src="docs/videos/GPT_OSS_20B_Demo.mp4" autoplay loop muted playsinline width="320"></video> | <video src="docs/videos/Qwen_30B_Demo.mp4" autoplay loop muted playsinline width="320"></video> |
+| <video src="./docs/videos/GPT_OSS_20B_Demo.mp4" autoplay loop muted playsinline width="320"></video> | <video src="./docs/videos/Qwen_30B_Demo.mp4" autoplay loop muted playsinline width="320"></video> |
 | Running GPT-OSS 20B model on device | Running Qwen3 MoE 30B-A3B model on device |
 
 ## Official Releases
