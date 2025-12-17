@@ -25,14 +25,16 @@ The committers are:
 * Jijoong Moon @jijoongmoon :beer: (maintainer)
 * MyungJoo Ham @myungjoo :beer:
 * Hyeonseok Lee @lhs8928
-* Mete Ozay @meteozay
-* Hyunil Park @songgot
 * Donghak Park @DonghakPark
 * Seungbaek Hong @baek2sm
 * Sungsik Kong @skykongkong8
 * Donghyeon Jeong @djeong20
 * Daekyung Jung @dkjung
-* Eunyu Yang @EunjuYang
+* Eunju Yang @EunjuYang
+* Haehun Yang @haehun
+* Ellen @Seunghui98
+* Junbong Yu @junbong-yu
+* HyeongGwon Hong @h0g1
 
 ## Merging a pull-request
 
