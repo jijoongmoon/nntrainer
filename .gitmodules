@@ -24,4 +24,4 @@
 	
 [submodule "nntrainer-windows-resource"]
 	path = nntrainer-windows-resource
-	url = https://github.com/nnstreamer/nntrainer-windows-resource.git
+	url = https://github.com/nntrainer/nntrainer-windows-resource.git
