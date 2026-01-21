@@ -44,6 +44,8 @@ using json = nlohmann::json;
 static std::unique_ptr<causallm::Transformer> g_model;
 static std::mutex g_mutex;
 static bool g_initialized = false;
+static std::string g_architecture = "";
+static bool g_use_chat_template = false;
 
 // Helper to register models (similar to main.cpp)
 // ensuring factory is populated.
@@ -104,9 +106,33 @@ static void register_models() {
   });
 }
 
+static std::string apply_chat_template(const std::string &architecture,
+                                       const std::string &input) {
+  if (architecture == "LlamaForCausalLM") {
+    // Llama 2/3 chat format: [INST] {prompt} [/INST]
+    return "[INST] " + input + " [/INST]";
+  } else if (architecture == "Qwen2ForCausalLM" ||
+             architecture == "Qwen3ForCausalLM" ||
+             architecture == "Qwen3MoeForCausalLM" ||
+             architecture == "Qwen3SlimMoeForCausalLM" ||
+             architecture == "Qwen3CachedSlimMoeForCausalLM") {
+    // Qwen chat format
+    // <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+    // Note: assuming model handles tokenizer specific special tokens or we
+    // might need to handle them raw if tokenizer enabled
+    return "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
+  } else if (architecture == "Gemma3ForCausalLM") {
+    // Gemma chat format:
+    // <start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
+    return "<start_of_turn>user\n" + input +
+           "<end_of_turn>\n<start_of_turn>model\n";
+  }
+  return input;
+}
+
 ErrorCode setOptions(Config config) {
   // Currently no options are being handled
-  (void)config;
+  g_use_chat_template = config.use_chat_template;
   return CAUSAL_LM_ERROR_NONE;
 }
 
@@ -182,6 +208,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     g_model->load_weight(weight_file);
 
     g_initialized = true;
+    g_architecture = architecture;
 
   } catch (const std::exception &e) {
     std::cerr << "Exception in loadModel: " << e.what() << std::endl;
@@ -204,6 +231,10 @@ ErrorCode runModel(const char *inputTextPrompt, char *outputText,
     std::lock_guard<std::mutex> lock(g_mutex);
 
     std::string input(inputTextPrompt);
+
+    if (g_use_chat_template) {
+      input = apply_chat_template(g_architecture, input);
+    }
 
 // We assume single batch request for this API
 #if defined(_WIN32)

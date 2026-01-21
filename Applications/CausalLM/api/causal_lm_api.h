@@ -73,6 +73,7 @@ typedef enum {
 typedef struct {
   // Add configuration options here as needed
   int reserved;
+  bool use_chat_template; /// < @brief Whther to apply chat template to input
 } Config;
 
 /**
