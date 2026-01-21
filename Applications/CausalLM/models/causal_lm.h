@@ -72,6 +72,13 @@ public:
   void run(const WSTR prompt, bool do_sample = false,
            const WSTR system_prompt = "", const WSTR tail_prompt = "") override;
 
+  /**
+   * @brief Get the generated output text
+   * @param batch_idx Index of the batch item
+   * @return Generated text string
+   */
+  std::string getOutput(int batch_idx = 0) const;
+
 protected:
   /**
    * @brief Setup the parameters for the CausalLM model

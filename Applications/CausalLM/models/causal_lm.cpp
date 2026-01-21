@@ -528,6 +528,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             << ((double)generation_cnt / generation_duration.count() * 1000)
             << " TPS\n";
   std::cout << "==========================================================\n";
-};
+}
+
+std::string CausalLM::getOutput(int batch_idx) const {
+  if (batch_idx < 0 || batch_idx >= static_cast<int>(output_list.size())) {
+    return "";
+  }
+  return output_list[batch_idx];
+}
 
 } // namespace causallm
