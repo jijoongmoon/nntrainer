@@ -94,6 +94,23 @@ WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
                                const char *path);
 
 /**
+ * @brief Performance Metrics
+ */
+typedef struct {
+  unsigned int prefill_tokens;
+  double prefill_duration_ms;
+  unsigned int generation_tokens;
+  double generation_duration_ms;
+} PerformanceMetrics;
+
+/**
+ * @brief Get performance metrics of the last run
+ * @param metrics Pointer to PerformanceMetrics struct to be filled
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
+
+/**
  * @brief Run inference
  * @param inputTextPrompt Input prompt
  * @param outputText Buffer to store output text

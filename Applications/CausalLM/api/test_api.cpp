@@ -55,5 +55,24 @@ int main(int argc, char *argv[]) {
 
   std::cout << "Output: " << outputBuffer << std::endl;
 
+  // 4. Get Metrics
+  // 4. Get Metrics
+  PerformanceMetrics metrics;
+  err = getPerformanceMetrics(&metrics);
+  if (err != CAUSAL_LM_ERROR_NONE) {
+    std::cerr << "Failed to get metrics: " << err << std::endl;
+  } else {
+    std::cout << "\nPerformance Metrics:" << std::endl;
+    std::cout << "  Prefill: " << metrics.prefill_tokens << " tokens in "
+              << metrics.prefill_duration_ms << " ms ("
+              << (metrics.prefill_tokens / metrics.prefill_duration_ms * 1000.0)
+              << " TPS)" << std::endl;
+    std::cout << "  Generation: " << metrics.generation_tokens << " tokens in "
+              << metrics.generation_duration_ms << " ms ("
+              << (metrics.generation_tokens / metrics.generation_duration_ms *
+                  1000.0)
+              << " TPS)" << std::endl;
+  }
+
   return 0;
 }

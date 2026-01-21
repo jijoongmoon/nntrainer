@@ -528,6 +528,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             << ((double)generation_cnt / generation_duration.count() * 1000)
             << " TPS\n";
   std::cout << "==========================================================\n";
+
+  performance_metrics.prefill_tokens = init_len;
+  performance_metrics.prefill_duration_ms = prefill_duration.count();
+  performance_metrics.generation_tokens = generation_cnt;
+  performance_metrics.generation_duration_ms = generation_duration.count();
 }
 
 std::string CausalLM::getOutput(int batch_idx) const {

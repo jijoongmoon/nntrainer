@@ -39,6 +39,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include "../api/causal_lm_api.h"
 #include <transformer.h>
 
 namespace causallm {
@@ -78,6 +79,13 @@ public:
    * @return Generated text string
    */
   std::string getOutput(int batch_idx = 0) const;
+
+  /**
+   * @brief Get PerformanceMetrics
+   */
+  PerformanceMetrics getPerformanceMetrics() const {
+    return performance_metrics;
+  }
 
 protected:
   /**
@@ -145,6 +153,9 @@ protected:
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
   unsigned int global_token_len;
+
+  // Performance metrics
+  PerformanceMetrics performance_metrics;
 
   std::mt19937 rng; /**< Random Number Gen */
 };

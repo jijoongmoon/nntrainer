@@ -264,3 +264,34 @@ ErrorCode runModel(const char *inputTextPrompt, char *outputText,
 
   return CAUSAL_LM_ERROR_NONE;
 }
+
+ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
+  if (!g_initialized || !g_model) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+  if (metrics == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
+
+    if (causal_lm_model) {
+      auto m = causal_lm_model->getPerformanceMetrics();
+      metrics->prefill_tokens = m.prefill_tokens;
+      metrics->prefill_duration_ms = m.prefill_duration_ms;
+      metrics->generation_tokens = m.generation_tokens;
+      metrics->generation_duration_ms = m.generation_duration_ms;
+    } else {
+      return CAUSAL_LM_ERROR_UNKNOWN;
+    }
+
+  } catch (const std::exception &e) {
+    std::cerr << "Exception in getPerformanceMetrics: " << e.what()
+              << std::endl;
+    return CAUSAL_LM_ERROR_UNKNOWN;
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
