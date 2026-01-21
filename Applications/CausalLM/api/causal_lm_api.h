@@ -115,11 +115,10 @@ WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
  * @brief Run inference
  * @param inputTextPrompt Input prompt
  * @param outputText Buffer to store output text
- * @param output_size Size of the output buffer
  * @return ErrorCode
  */
-WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt, char *outputText,
-                              size_t output_size);
+WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
+                              const char **outputText);
 
 #ifdef __cplusplus
 }

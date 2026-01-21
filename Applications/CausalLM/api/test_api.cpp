@@ -56,16 +56,20 @@ int main(int argc, char *argv[]) {
   std::cout << "Model loaded successfully." << std::endl;
 
   // 3. Run Inference
-  char outputBuffer[1024];
+  const char *outputText = nullptr;
   std::cout << "Running inference with prompt: " << prompt << std::endl;
 
-  err = runModel(prompt, outputBuffer, sizeof(outputBuffer));
+  err = runModel(prompt, &outputText);
   if (err != CAUSAL_LM_ERROR_NONE) {
     std::cerr << "Failed to run model: " << err << std::endl;
     return 1;
   }
 
-  std::cout << "Output: " << outputBuffer << std::endl;
+  if (outputText) {
+    std::cout << "Output: " << outputText << std::endl;
+  } else {
+    std::cout << "Output: (null)" << std::endl;
+  }
 
   // 4. Get Metrics
   // 4. Get Metrics

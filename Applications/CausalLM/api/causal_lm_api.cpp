@@ -46,6 +46,7 @@ static std::mutex g_mutex;
 static bool g_initialized = false;
 static std::string g_architecture = "";
 static bool g_use_chat_template = false;
+static std::string g_last_output = "";
 
 // Helper to register models (similar to main.cpp)
 // ensuring factory is populated.
@@ -218,12 +219,11 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
   return CAUSAL_LM_ERROR_NONE;
 }
 
-ErrorCode runModel(const char *inputTextPrompt, char *outputText,
-                   size_t output_size) {
+ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
   if (!g_initialized || !g_model) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
-  if (inputTextPrompt == nullptr || outputText == nullptr || output_size == 0) {
+  if (inputTextPrompt == nullptr || outputText == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
@@ -245,18 +245,12 @@ ErrorCode runModel(const char *inputTextPrompt, char *outputText,
 #endif
 
     auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
-    std::string output = "";
+    g_last_output = ""; // Reset last output
     if (causal_lm_model) {
-      output = causal_lm_model->getOutput(0);
+      g_last_output = causal_lm_model->getOutput(0);
     }
 
-    if (output.length() >= output_size) {
-      // Truncate if buffer is too small
-      std::memcpy(outputText, output.c_str(), output_size - 1);
-      outputText[output_size - 1] = '\0';
-    } else {
-      std::strcpy(outputText, output.c_str());
-    }
+    *outputText = g_last_output.c_str();
 
   } catch (const std::exception &e) {
     std::cerr << "Exception in runModel: " << e.what() << std::endl;
