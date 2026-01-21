@@ -180,24 +180,27 @@ void SentenceTransformer::addModule(const std::string &type, int idx) {
 
 void SentenceTransformer::run(const WSTR prompt, bool do_sample,
                               const WSTR system_prompt,
-                              const WSTR tail_prompt) {
+                              const WSTR tail_prompt, bool log_output) {
 
   try {
     std::vector<float *> results = encode(prompt, system_prompt, tail_prompt);
 
-    std::cout << "Embedding Result (" << BATCH_SIZE
-              << " batch(es)):" << std::endl;
-    for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-      std::cout << "Batch " << b << ": [";
-      // Print first few elements as sample
-      int print_dim = (DIM > 10) ? 10 : DIM;
-      for (int i = 0; i < print_dim; ++i) {
-        std::cout << results[0][b * DIM + i]
-                  << (i == print_dim - 1 ? "" : ", ");
+    if (log_output) {
+
+      std::cout << "Embedding Result (" << BATCH_SIZE
+                << " batch(es)):" << std::endl;
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+        std::cout << "Batch " << b << ": [";
+        // Print first few elements as sample
+        int print_dim = (DIM > 10) ? 10 : DIM;
+        for (int i = 0; i < print_dim; ++i) {
+          std::cout << results[0][b * DIM + i]
+                    << (i == print_dim - 1 ? "" : ", ");
+        }
+        if (DIM > 10)
+          std::cout << ", ...";
+        std::cout << "] (Total DIM: " << DIM << ")" << std::endl;
       }
-      if (DIM > 10)
-        std::cout << ", ...";
-      std::cout << "] (Total DIM: " << DIM << ")" << std::endl;
     }
   } catch (const std::exception &e) {
     std::cerr << "Error during embedding run: " << e.what() << std::endl;

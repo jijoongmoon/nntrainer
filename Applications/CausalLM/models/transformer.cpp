@@ -253,7 +253,8 @@ void Transformer::save_weight(const std::string &weight_path) {
 };
 
 void Transformer::run(const WSTR prompt, bool do_sample,
-                      const WSTR system_prompt, const WSTR tail_prompt) {
+                      const WSTR system_prompt, const WSTR tail_prompt,
+                      bool log_output) {
   if (!is_initialized) {
     throw std::runtime_error(
       "Transformer model is not initialized. Please call "

@@ -44,7 +44,8 @@ public:
    * @brief run the SentenceTransformer model
    */
   void run(const WSTR prompt, bool do_sample = false,
-           const WSTR system_prompt = "", const WSTR tail_prmopt = "") override;
+           const WSTR system_prompt = "", const WSTR tail_prmopt = "",
+           bool log_output = true) override;
 
   /**
    * @brief Encode the prompt and return the embedding

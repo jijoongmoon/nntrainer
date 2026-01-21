@@ -238,9 +238,10 @@ ErrorCode runModel(const char *inputTextPrompt, char *outputText,
 
 // We assume single batch request for this API
 #if defined(_WIN32)
-    g_model->run(std::wstring(input.begin(), input.end()));
+    g_model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
+                 false);
 #else
-    g_model->run(input);
+    g_model->run(input, false, "", "", false);
 #endif
 
     auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());

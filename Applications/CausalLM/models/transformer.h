@@ -98,7 +98,8 @@ public:
    * @brief run the Transformer model
    */
   virtual void run(const WSTR prompt, bool do_sample = false,
-                   const WSTR system_prompt = "", const WSTR tail_prompt = "");
+                   const WSTR system_prompt = "", const WSTR tail_prompt = "",
+                   bool log_output = true);
 
 protected:
   /**

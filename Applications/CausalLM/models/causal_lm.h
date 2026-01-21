@@ -71,7 +71,8 @@ public:
    * @brief run the CausalLM model
    */
   void run(const WSTR prompt, bool do_sample = false,
-           const WSTR system_prompt = "", const WSTR tail_prompt = "") override;
+           const WSTR system_prompt = "", const WSTR tail_prompt = "",
+           bool log_output = true) override;
 
   /**
    * @brief Get the generated output text
@@ -110,7 +111,7 @@ protected:
   virtual void
   registerOutputs(std::unique_ptr<tokenizers::Tokenizer> &tokenizer,
                   std::vector<unsigned int> ids, unsigned int pos,
-                  const std::vector<bool> &eos_list);
+                  const std::vector<bool> &eos_list, bool log_output = true);
 
   /**
    * @brief save kv cache
