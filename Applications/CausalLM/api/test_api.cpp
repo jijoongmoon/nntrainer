@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
+
+ * @file   test_api.cpp
+ * @date   21 Jan 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Eunju Yang <ej.yang@samsung.com>
+ * @brief  Simple application to test CausalLM API
+ * @bug    No known bugs except for NYI items
+ *
+ */
 
 #include "causal_lm_api.h"
 #include <iostream>
