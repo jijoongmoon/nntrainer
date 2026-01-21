@@ -278,11 +278,10 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
     auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
 
     if (causal_lm_model) {
-      auto m = causal_lm_model->getPerformanceMetrics();
-      metrics->prefill_tokens = m.prefill_tokens;
-      metrics->prefill_duration_ms = m.prefill_duration_ms;
-      metrics->generation_tokens = m.generation_tokens;
-      metrics->generation_duration_ms = m.generation_duration_ms;
+      if (!causal_lm_model->hasRun()) {
+        return CAUSAL_LM_ERROR_INFERENCE_NOT_RUN;
+      }
+      *metrics = causal_lm_model->getPerformanceMetrics();
     } else {
       return CAUSAL_LM_ERROR_UNKNOWN;
     }

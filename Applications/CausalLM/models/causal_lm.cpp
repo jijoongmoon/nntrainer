@@ -291,6 +291,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                              "initialize() before run().");
   }
 
+  has_run_ = false;
+
   output_list.clear();
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
     output_list.push_back("");
@@ -533,6 +535,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   performance_metrics.prefill_duration_ms = prefill_duration.count();
   performance_metrics.generation_tokens = generation_cnt;
   performance_metrics.generation_duration_ms = generation_duration.count();
+
+  has_run_ = true;
 }
 
 std::string CausalLM::getOutput(int batch_idx) const {
