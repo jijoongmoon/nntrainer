@@ -64,6 +64,20 @@ static void register_qwen3_0_6b() {
   rc.top_p = 0.95f;
   rc.temperature = 0.7f;
 
+  registerModel("Qwen3-0.6B-W4A32", "Qwen3-0.6B-Arch", rc);
+
+  // Example for W32A32 (FP32)
+  ModelRuntimeConfig rc_fp32 = rc;
+  strncpy(rc_fp32.model_tensor_type, "FP32-FP32",
+          sizeof(rc_fp32.model_tensor_type) - 1);
+  strncpy(rc_fp32.fc_layer_dtype, "FP32", sizeof(rc_fp32.fc_layer_dtype) - 1);
+  strncpy(rc_fp32.embedding_dtype, "FP32", sizeof(rc_fp32.embedding_dtype) - 1);
+  strncpy(rc_fp32.lmhead_dtype, "FP32", sizeof(rc_fp32.lmhead_dtype) - 1);
+  strncpy(rc_fp32.model_file_name, "qwen3-0.6b-fp32.bin",
+          sizeof(rc_fp32.model_file_name) - 1);
+  registerModel("Qwen3-0.6B-W32A32", "Qwen3-0.6B-Arch", rc_fp32);
+
+  // Register default alias
   registerModel("Qwen3-0.6B", "Qwen3-0.6B-Arch", rc);
 }
 

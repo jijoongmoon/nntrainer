@@ -85,13 +85,26 @@ typedef struct {
 WIN_EXPORT ErrorCode setOptions(Config config);
 
 /**
+ * @brief Model Quantization type
+ */
+typedef enum {
+  CAUSAL_LM_QUANTIZATION_UNKNOWN = 0,
+  CAUSAL_LM_QUANTIZATION_W4A32 = 1,  ///< 4-bit weights, 32-bit activations
+  CAUSAL_LM_QUANTIZATION_W16A16 = 2, ///< 16-bit weights, 16-bit activations
+  CAUSAL_LM_QUANTIZATION_W8A16 = 3,  ///< 8-bit weights, 16-bit activations
+  CAUSAL_LM_QUANTIZATION_W32A32 = 4, ///< 32-bit weights, 32-bit activations
+} ModelQuantizationType;
+
+/**
  * @brief Load a model
  * @param compute Backend compute type
  * @param modeltype Model type
+ * @param quant_type Model quantization type
  * @param model_name_or_path Path to the model directory
  * @return ErrorCode
  */
 WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
+                               ModelQuantizationType quant_type,
                                const char *model_name_or_path);
 
 /**

@@ -31,9 +31,24 @@ int main(int argc, char *argv[]) {
       (std::string(argv[3]) == "1" || std::string(argv[3]) == "true");
   }
 
+  std::string quant_str = "UNKNOWN";
+  ModelQuantizationType quant_type = CAUSAL_LM_QUANTIZATION_UNKNOWN;
+  if (argc >= 5) {
+    quant_str = std::string(argv[4]);
+    if (quant_str == "W4A32")
+      quant_type = CAUSAL_LM_QUANTIZATION_W4A32;
+    else if (quant_str == "W16A16")
+      quant_type = CAUSAL_LM_QUANTIZATION_W16A16;
+    else if (quant_str == "W8A16")
+      quant_type = CAUSAL_LM_QUANTIZATION_W8A16;
+    else if (quant_str == "W32A32")
+      quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
+  }
+
   std::cout << "Loading model from: " << model_path << std::endl;
   std::cout << "Use chat template: " << (use_chat_template ? "true" : "false")
             << std::endl;
+  std::cout << "Quantization: " << quant_str << std::endl;
 
   // 1. Set Options (Optional)
   Config config;
@@ -49,7 +64,8 @@ int main(int argc, char *argv[]) {
   // Auto-detect model type or assume one. For test, we pass UNKNOWN or a
   // specific one if known. The implementation falls back to config.json
   // architecture if provided.
-  err = loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_UNKNOWN, model_path);
+  err = loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_UNKNOWN, quant_type,
+                  model_path);
   if (err != CAUSAL_LM_ERROR_NONE) {
     std::cerr << "Failed to load model: " << err << std::endl;
     return 1;

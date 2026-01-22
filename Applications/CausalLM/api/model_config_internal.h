@@ -5,6 +5,7 @@
  *         This file should NOT be exposed to the public API users.
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Eunju Yang <ej.yang@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #ifndef __MODEL_CONFIG_INTERNAL_H__

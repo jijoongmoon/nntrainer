@@ -146,25 +146,61 @@ static std::string apply_chat_template(const std::string &architecture,
   return input;
 }
 
-static std::string resolve_model_path(const std::string &model_name_or_path) {
+static std::string get_quantization_suffix(ModelQuantizationType type) {
+  switch (type) {
+  case CAUSAL_LM_QUANTIZATION_W4A32:
+    return "-w4a32";
+  case CAUSAL_LM_QUANTIZATION_W16A16:
+    return "-w16a16";
+  case CAUSAL_LM_QUANTIZATION_W8A16:
+    return "-w8a16";
+  case CAUSAL_LM_QUANTIZATION_W32A32:
+    return "-w32a32";
+  default:
+    return "";
+  }
+}
+
+static std::string resolve_model_path(const std::string &model_name_or_path,
+                                      ModelQuantizationType quant_type) {
   std::string model_path = model_name_or_path;
   std::string path_upper = model_path;
   std::transform(path_upper.begin(), path_upper.end(), path_upper.begin(),
                  ::toupper);
 
+  std::string base_dir_name = "";
+
+  // 1. Try to find base directory name from map
   if (g_model_path_map.find(path_upper) != g_model_path_map.end()) {
-    model_path = "./models/" + g_model_path_map[path_upper];
+    base_dir_name = g_model_path_map[path_upper];
   } else {
     for (auto const &[key, val] : g_model_path_map) {
       std::string key_upper = key;
       std::transform(key_upper.begin(), key_upper.end(), key_upper.begin(),
                      ::toupper);
       if (path_upper == key_upper) {
-        model_path = "./models/" + val;
+        model_path = val;
         break;
       }
     }
   }
+
+  // 2. If found in map, append suffix. If not, treat input as path but still
+  // append suffix if it's just a name? If user provided a full path "/foo/bar",
+  // we shouldn't append suffix unless requested. Heuristic: if we found a match
+  // in map, we assume it's a registered model name and we construct path
+  // "./models/<name>-<suffix>" If not in map, we assume it's a direct path.
+  // However, if quant_type is set and user passed a name, maybe we should still
+  // append? Current requirement: "model name + model dtype ... decide folder
+  // name". This implies we use the mapped name as base.
+  if (!base_dir_name.empty()) {
+    model_path =
+      "./models/" + base_dir_name + get_quantization_suffix(quant_type);
+  }
+  // If not in map, rely on original behavior (just path), or potentially append
+  // suffix if it looks like a name? For now, only modifying the map-based
+  // resolution path as requested.
+
   return model_path;
 }
 
@@ -201,6 +237,7 @@ ErrorCode registerModel(const char *model_name, const char *arch_name,
 }
 
 ErrorCode loadModel(BackendType compute, ModelType modeltype,
+                    ModelQuantizationType quant_type,
                     const char *model_name_or_path) {
 
   if (model_name_or_path == nullptr) {
@@ -219,19 +256,38 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     std::transform(input_name_upper.begin(), input_name_upper.end(),
                    input_name_upper.begin(), ::toupper);
 
+    std::string quant_suffix = "";
+    switch (quant_type) {
+    case CAUSAL_LM_QUANTIZATION_W4A32:
+      quant_suffix = "-W4A32";
+      break;
+    case CAUSAL_LM_QUANTIZATION_W16A16:
+      quant_suffix = "-W16A16";
+      break;
+    case CAUSAL_LM_QUANTIZATION_W8A16:
+      quant_suffix = "-W8A16";
+      break;
+    case CAUSAL_LM_QUANTIZATION_W32A32:
+      quant_suffix = "-W32A32";
+      break;
+    default:
+      break;
+    }
+    std::string lookup_name = input_name_upper + quant_suffix;
+
     json cfg;
     json generation_cfg;
     json nntr_cfg;
     std::string model_dir_path;
 
     // Check in-memory map first
-    if (g_model_registry.find(input_name_upper) != g_model_registry.end()) {
-      RegisteredModel &rm = g_model_registry[input_name_upper];
+    if (g_model_registry.find(lookup_name) != g_model_registry.end()) {
+      RegisteredModel &rm = g_model_registry[lookup_name];
 
       // Find architecture config
       if (g_arch_config_map.find(rm.arch_name) == g_arch_config_map.end()) {
         std::cerr << "Architecture '" << rm.arch_name
-                  << "' not found for model '" << input_name << "'"
+                  << "' not found for model '" << lookup_name << "'"
                   << std::endl;
         return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
       }
@@ -239,7 +295,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       ModelRuntimeConfig &rc = rm.config;
 
       // Strategy: Try to resolve path even if config found.
-      model_dir_path = resolve_model_path(model_name_or_path);
+      model_dir_path = resolve_model_path(model_name_or_path, quant_type);
 
       // Populate JSONs from Arch Struct
       cfg["vocab_size"] = ac.vocab_size;
@@ -315,7 +371,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
 
     } else {
       // Fallback to file-based loading
-      model_dir_path = resolve_model_path(model_name_or_path);
+      model_dir_path = resolve_model_path(model_name_or_path, quant_type);
 
       // Load configuration files
       cfg = causallm::LoadJsonFile(model_dir_path + "/config.json");
