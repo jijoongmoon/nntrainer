@@ -190,14 +190,7 @@ static std::string resolve_model_path(const std::string &model_name_or_path,
     }
   }
 
-  // 2. If found in map, append suffix. If not, treat input as path but still
-  // append suffix if it's just a name? If user provided a full path "/foo/bar",
-  // we shouldn't append suffix unless requested. Heuristic: if we found a match
-  // in map, we assume it's a registered model name and we construct path
-  // "./models/<name>-<suffix>" If not in map, we assume it's a direct path.
-  // However, if quant_type is set and user passed a name, maybe we should still
-  // append? Current requirement: "model name + model dtype ... decide folder
-  // name". This implies we use the mapped name as base.
+  // 2. If found in map, append suffix.
   if (!base_dir_name.empty()) {
     model_path =
       "./models/" + base_dir_name + get_quantization_suffix(quant_type);
@@ -371,18 +364,6 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       for (unsigned int i = 0; i < rc.num_bad_word_ids; ++i)
         bad_ids.push_back(rc.bad_word_ids[i]);
       nntr_cfg["bad_word_ids"] = bad_ids;
-
-      // For weight loading, we still need a path.
-      // We assume resolved path logic applies for finding the DIRECTORY where
-      // weights are. If the user provided a name that maps to a path in
-      // g_model_path_map, use it? Or if they provided a path that we registered
-      // config for? The Prompt implies: "Values in config... defined by user...
-      // load THIS model's config" But weights come from file. We will assume
-      // resolve_model_path works to find the directory, OR we rely on the
-      // caller to have set up the 'model_name' to map to a valid folder via
-      // g_model_path_map if they want automatic directory resolution. If
-      // input_name is NOT in g_model_path_map, we treat it as a directory. But
-      // here we matched Config Map.
 
     } else {
       // Fallback to file-based loading
