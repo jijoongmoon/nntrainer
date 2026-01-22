@@ -116,6 +116,7 @@ LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__F
 # Source files
 LOCAL_SRC_FILES := ../api/test_api.cpp \
     ../api/causal_lm_api.cpp \
+    ../api/model_config.cpp \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/embedding.cpp \

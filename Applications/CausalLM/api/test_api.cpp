@@ -12,6 +12,7 @@
  */
 
 #include "causal_lm_api.h"
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>

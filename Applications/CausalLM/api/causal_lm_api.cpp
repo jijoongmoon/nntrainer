@@ -1,15 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *   http://www.apache.org/licenses/LICENSE-2.0
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
  *
  * @file    causal_lm_api.cpp
  * @date    21 Jan 2026
@@ -34,6 +25,7 @@
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
 #include "json.hpp"
+#include "model_config_internal.h"
 #include "qwen2_causallm.h"
 #include "qwen3_cached_slim_moe_causallm.h"
 #include "qwen3_causallm.h"
@@ -57,6 +49,16 @@ static std::map<std::string, std::string> g_model_path_map = {
   {"GEMMA-2B", "gemma-2b"},     // Example
   {"LLAMA3-8B", "llama3-8b"}    // Example
 };
+
+/**
+ * @brief RegisteredModel
+ */
+struct RegisteredModel {
+  std::string arch_name;
+  ModelRuntimeConfig config;
+};
+static std::map<std::string, RegisteredModel> g_model_registry;
+static std::map<std::string, ModelArchConfig> g_arch_config_map;
 
 // Helper to register models (similar to main.cpp)
 // ensuring factory is populated.
@@ -114,6 +116,9 @@ static void register_models() {
         return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
                                                           nntr_cfg);
       });
+
+    // Register built-in configurations
+    register_builtin_model_configs();
   });
 }
 
@@ -169,24 +174,155 @@ ErrorCode setOptions(Config config) {
   return CAUSAL_LM_ERROR_NONE;
 }
 
+ErrorCode registerModelArchitecture(const char *arch_name,
+                                    ModelArchConfig config) {
+  if (arch_name == nullptr)
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  std::string name(arch_name);
+  std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+  g_arch_config_map[name] = config;
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode registerModel(const char *model_name, const char *arch_name,
+                        ModelRuntimeConfig config) {
+  if (model_name == nullptr || arch_name == nullptr)
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  std::string name(model_name);
+  std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+
+  std::string aname(arch_name);
+  std::transform(aname.begin(), aname.end(), aname.begin(), ::toupper);
+
+  g_model_registry[name] = {aname, config};
+  return CAUSAL_LM_ERROR_NONE;
+}
+
 ErrorCode loadModel(BackendType compute, ModelType modeltype,
                     const char *model_name_or_path) {
-  std::lock_guard<std::mutex> lock(g_mutex);
 
   if (model_name_or_path == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
+  // Ensure models/configs are registered (thread-safe via call_once)
+  register_models();
+
+  std::lock_guard<std::mutex> lock(g_mutex);
   try {
-    register_models();
 
-    std::string model_path = resolve_model_path(model_name_or_path);
+    // Check if it's a registered in-memory config
+    std::string input_name = model_name_or_path;
+    std::string input_name_upper = input_name;
+    std::transform(input_name_upper.begin(), input_name_upper.end(),
+                   input_name_upper.begin(), ::toupper);
 
-    // Load configuration files
-    json cfg = causallm::LoadJsonFile(model_path + "/config.json");
-    json generation_cfg =
-      causallm::LoadJsonFile(model_path + "/generation_config.json");
-    json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+    json cfg;
+    json generation_cfg;
+    json nntr_cfg;
+    std::string model_dir_path;
+
+    // Check in-memory map first
+    if (g_model_registry.find(input_name_upper) != g_model_registry.end()) {
+      RegisteredModel &rm = g_model_registry[input_name_upper];
+
+      // Find architecture config
+      if (g_arch_config_map.find(rm.arch_name) == g_arch_config_map.end()) {
+        std::cerr << "Architecture '" << rm.arch_name
+                  << "' not found for model '" << input_name << "'"
+                  << std::endl;
+        return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+      }
+      ModelArchConfig &ac = g_arch_config_map[rm.arch_name];
+      ModelRuntimeConfig &rc = rm.config;
+
+      // Strategy: Try to resolve path even if config found.
+      model_dir_path = resolve_model_path(model_name_or_path);
+
+      // Populate JSONs from Arch Struct
+      cfg["vocab_size"] = ac.vocab_size;
+      cfg["hidden_size"] = ac.hidden_size;
+      cfg["intermediate_size"] = ac.intermediate_size;
+      cfg["num_hidden_layers"] = ac.num_hidden_layers;
+      cfg["num_attention_heads"] = ac.num_attention_heads;
+      cfg["head_dim"] = ac.head_dim;
+      cfg["num_key_value_heads"] = ac.num_key_value_heads > 0
+                                     ? ac.num_key_value_heads
+                                     : ac.num_attention_heads;
+      cfg["max_position_embeddings"] = ac.max_position_embeddings;
+      cfg["rope_theta"] = ac.rope_theta;
+      cfg["rms_norm_eps"] = ac.rms_norm_eps;
+      cfg["tie_word_embeddings"] = ac.tie_word_embeddings;
+      if (ac.sliding_window != UINT_MAX) {
+        cfg["sliding_window"] = ac.sliding_window;
+      } else {
+        cfg["sliding_window"] = nullptr;
+      }
+      cfg["sliding_window_pattern"] = ac.sliding_window_pattern;
+      cfg["architectures"] = {std::string(ac.architecture)};
+
+      if (ac.num_eos_token_ids > 0) {
+        std::vector<unsigned int> eos_ids;
+        for (unsigned int i = 0; i < ac.num_eos_token_ids; ++i)
+          eos_ids.push_back(ac.eos_token_ids[i]);
+        generation_cfg["eos_token_id"] = eos_ids;
+      }
+      generation_cfg["bos_token_id"] = ac.bos_token_id;
+
+      // Populate JSONs from Runtime Struct
+      generation_cfg["top_k"] = rc.top_k;
+      generation_cfg["top_p"] = rc.top_p;
+      generation_cfg["temperature"] = rc.temperature;
+      generation_cfg["do_sample"] = false;
+
+      nntr_cfg["batch_size"] = rc.batch_size;
+      nntr_cfg["model_type"] = std::string(rc.model_type);
+      nntr_cfg["model_tensor_type"] = std::string(rc.model_tensor_type);
+      nntr_cfg["init_seq_len"] = rc.init_seq_len;
+      nntr_cfg["max_seq_len"] = rc.max_seq_len;
+      nntr_cfg["num_to_generate"] = rc.num_to_generate;
+      nntr_cfg["fsu"] = rc.fsu;
+      nntr_cfg["fsu_lookahead"] = rc.fsu_lookahead;
+      nntr_cfg["embedding_dtype"] = std::string(rc.embedding_dtype);
+      nntr_cfg["fc_layer_dtype"] = std::string(rc.fc_layer_dtype);
+      nntr_cfg["model_file_name"] = std::string(rc.model_file_name);
+
+      std::string t_file = rc.tokenizer_file;
+      nntr_cfg["tokenizer_file"] = t_file;
+
+      if (strlen(rc.lmhead_dtype) > 0) {
+        nntr_cfg["lmhead_dtype"] = std::string(rc.lmhead_dtype);
+      }
+
+      std::vector<unsigned int> bad_ids;
+      for (unsigned int i = 0; i < rc.num_bad_word_ids; ++i)
+        bad_ids.push_back(rc.bad_word_ids[i]);
+      nntr_cfg["bad_word_ids"] = bad_ids;
+
+      // For weight loading, we still need a path.
+      // We assume resolved path logic applies for finding the DIRECTORY where
+      // weights are. If the user provided a name that maps to a path in
+      // g_model_path_map, use it? Or if they provided a path that we registered
+      // config for? The Prompt implies: "Values in config... defined by user...
+      // load THIS model's config" But weights come from file. We will assume
+      // resolve_model_path works to find the directory, OR we rely on the
+      // caller to have set up the 'model_name' to map to a valid folder via
+      // g_model_path_map if they want automatic directory resolution. If
+      // input_name is NOT in g_model_path_map, we treat it as a directory. But
+      // here we matched Config Map.
+
+    } else {
+      // Fallback to file-based loading
+      model_dir_path = resolve_model_path(model_name_or_path);
+
+      // Load configuration files
+      cfg = causallm::LoadJsonFile(model_dir_path + "/config.json");
+      generation_cfg =
+        causallm::LoadJsonFile(model_dir_path + "/generation_config.json");
+      nntr_cfg = causallm::LoadJsonFile(model_dir_path + "/nntr_config.json");
+    }
 
     // Construct weight file path
     std::string weight_file_name;
@@ -197,7 +333,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
         "pytorch_model.bin"; // Default fallback if not specified
     }
 
-    const std::string weight_file = model_path + "/" + weight_file_name;
+    const std::string weight_file = model_dir_path + "/" + weight_file_name;
 
     // Determine architecture from config or ModelType
     // Priority: Config file architecture > ModelType mapping (fallback)
@@ -245,6 +381,9 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
 
   } catch (const std::exception &e) {
     std::cerr << "Exception in loadModel: " << e.what() << std::endl;
+    return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+  } catch (...) {
+    std::cerr << "Unknown exception in loadModel" << std::endl;
     return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
   }
 
