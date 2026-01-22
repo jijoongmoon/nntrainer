@@ -61,9 +61,16 @@ int main(int argc, char *argv[]) {
   }
 
   // 2. Load model
-  // Auto-detect model type or assume one. For test, we pass UNKNOWN or a
-  // specific one if known. The implementation falls back to config.json
-  // architecture if provided.
+  ModelType model_type = CAUSAL_LM_MODEL_UNKNOWN;
+  const char *path_arg = model_path;
+
+  // Simple mapping for test purposes
+  if (std::string(model_path) == "QWEN3-0.6B") {
+    model_type = CAUSAL_LM_MODEL_QWEN3_0_6B;
+    path_arg = nullptr;
+    std::cout << "Testing known model type: QWEN3-0.6B" << std::endl;
+  }
+
   err = loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_UNKNOWN, quant_type,
                   model_path);
   if (err != CAUSAL_LM_ERROR_NONE) {

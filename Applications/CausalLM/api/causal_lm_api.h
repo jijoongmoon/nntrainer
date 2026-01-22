@@ -57,15 +57,12 @@ typedef enum {
 
 /**
  * @brief Model type
+ * @note  Enable only when your library supports the model
  */
 typedef enum {
   CAUSAL_LM_MODEL_UNKNOWN = 0,
-  CAUSAL_LM_MODEL_LLAMA = 1,
-  CAUSAL_LM_MODEL_QWEN2 = 2,
-  CAUSAL_LM_MODEL_QWEN3 = 3,
-  CAUSAL_LM_MODEL_QWEN3_MOE = 4,
-  CAUSAL_LM_MODEL_GPT_OSS = 5,
-  CAUSAL_LM_MODEL_GEMMA3 = 6
+  CAUSAL_LM_MODEL_QWEN3_0_6B = 2,
+  // CAUSAL_LM_MODEL_GEMMA_2B = 3,
 } ModelType;
 
 /**

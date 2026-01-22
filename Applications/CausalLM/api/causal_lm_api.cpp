@@ -44,10 +44,6 @@ static std::string g_last_output = "";
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
-  {"QWEN2-0.5B", "qwen2-0.5b"}, // Example
-  {"QWEN2-1.5B", "qwen2-1.5b"}, // Example
-  {"GEMMA-2B", "gemma-2b"},     // Example
-  {"LLAMA3-8B", "llama3-8b"}    // Example
 };
 
 /**
@@ -120,6 +116,15 @@ static void register_models() {
     // Register built-in configurations
     register_builtin_model_configs();
   });
+}
+
+static const char *get_model_name_from_type(ModelType type) {
+  switch (type) {
+  case CAUSAL_LM_MODEL_QWEN3_0_6B:
+    return "QWEN3-0.6B";
+  default:
+    return nullptr;
+  }
 }
 
 static std::string apply_chat_template(const std::string &architecture,
@@ -240,8 +245,18 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
                     ModelQuantizationType quant_type,
                     const char *model_name_or_path) {
 
-  if (model_name_or_path == nullptr) {
-    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  const char *target_model_name = nullptr;
+
+  if (modeltype != CAUSAL_LM_MODEL_UNKNOWN) {
+    target_model_name = get_model_name_from_type(modeltype);
+    if (target_model_name == nullptr) {
+      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+    }
+  } else {
+    if (model_name_or_path == nullptr) {
+      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+    }
+    target_model_name = model_name_or_path;
   }
 
   // Ensure models/configs are registered (thread-safe via call_once)
@@ -251,7 +266,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
   try {
 
     // Check if it's a registered in-memory config
-    std::string input_name = model_name_or_path;
+    std::string input_name = std::string(target_model_name);
     std::string input_name_upper = input_name;
     std::transform(input_name_upper.begin(), input_name_upper.end(),
                    input_name_upper.begin(), ::toupper);
@@ -371,7 +386,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
 
     } else {
       // Fallback to file-based loading
-      model_dir_path = resolve_model_path(model_name_or_path, quant_type);
+      model_dir_path = resolve_model_path(target_model_name, quant_type);
 
       // Load configuration files
       cfg = causallm::LoadJsonFile(model_dir_path + "/config.json");
@@ -398,29 +413,10 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
         !cfg["architectures"].empty()) {
       architecture = cfg["architectures"].get<std::vector<std::string>>()[0];
     } else {
-      // Fallback mapping
-      switch (modeltype) {
-      case CAUSAL_LM_MODEL_LLAMA:
-        architecture = "LlamaForCausalLM";
-        break;
-      case CAUSAL_LM_MODEL_QWEN2:
-        architecture = "Qwen2ForCausalLM";
-        break;
-      case CAUSAL_LM_MODEL_QWEN3:
-        architecture = "Qwen3ForCausalLM";
-        break;
-      case CAUSAL_LM_MODEL_QWEN3_MOE:
-        architecture = "Qwen3MoeForCausalLM";
-        break;
-      case CAUSAL_LM_MODEL_GPT_OSS:
-        architecture = "GptOssForCausalLM";
-        break;
-      case CAUSAL_LM_MODEL_GEMMA3:
-        architecture = "Gemma3ForCausalLM";
-        break;
-      default:
-        return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-      }
+      // No fallback mapping from specific ModelType instances to generic
+      // architecture strings for now, as specific types should have config or
+      // be loaded from valid file with config.json
+      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
     }
 
     g_model = causallm::Factory::Instance().create(architecture, cfg,
