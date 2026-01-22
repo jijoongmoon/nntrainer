@@ -32,6 +32,9 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include <factory.h>
+#include <fstream>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using json = nlohmann::json;
 
@@ -202,9 +205,97 @@ static std::string resolve_model_path(const std::string &model_name_or_path,
   return model_path;
 }
 
+static bool check_file_exists(const std::string &path) {
+  struct stat buffer;
+  return (stat(path.c_str(), &buffer) == 0);
+}
+
+static void validate_models() {
+  std::cout << "[DEBUG] Validating model files..." << std::endl;
+  // Iterate over all known model names in map
+  for (auto const &[key, val] : g_model_path_map) {
+    // We want to check for each Quantization Type if it exists
+    // List of quant types to check: UNKNOWN (default), W4A32, W16A16, W32A32
+    std::vector<ModelQuantizationType> quant_types = {
+      CAUSAL_LM_QUANTIZATION_UNKNOWN, CAUSAL_LM_QUANTIZATION_W4A32,
+      CAUSAL_LM_QUANTIZATION_W16A16, CAUSAL_LM_QUANTIZATION_W32A32};
+
+    for (auto qt : quant_types) {
+      std::string quant_suffix = get_quantization_suffix(qt);
+      // Wait, get_quantization_suffix returns lowercase "-w4a32"
+      // But g_model_registry keys are UPPERCASE ("QWEN3-0.6B-W4A32")
+      // We need to match the registry key format.
+
+      std::string lookup_key = key; // "QWEN3-0.6B"
+      if (qt != CAUSAL_LM_QUANTIZATION_UNKNOWN) {
+        std::transform(quant_suffix.begin(), quant_suffix.end(),
+                       quant_suffix.begin(), ::toupper); // "-W4A32"
+        lookup_key += quant_suffix;
+      }
+
+      // Resolve path for this combination
+      std::string resolved_path = resolve_model_path(key, qt);
+
+      if (g_model_registry.find(lookup_key) != g_model_registry.end()) {
+        // CASE 1: Configuration is registered
+        RegisteredModel &rm = g_model_registry[lookup_key];
+        std::string bin_file_name = rm.config.model_file_name;
+        std::string full_path = resolved_path + "/" + bin_file_name;
+
+        if (check_file_exists(full_path)) {
+          std::cout << "  [OK] Reg Config: " << lookup_key << " -> "
+                    << full_path << std::endl;
+        } else {
+          std::cout << "  [FAIL] Reg Config: " << lookup_key
+                    << " -> Missing binary: " << full_path << std::endl;
+        }
+
+      } else {
+        // CASE 2: No config, but model type exists (via map iteration). Check
+        // if folder has valid structure
+        if (check_file_exists(resolved_path)) {
+          bool has_config = check_file_exists(resolved_path + "/config.json");
+          bool has_nntr =
+            check_file_exists(resolved_path + "/nntr_config.json");
+
+          if (has_config && has_nntr) {
+            std::cout << "  [OK] Detected: " << lookup_key << " -> "
+                      << resolved_path << std::endl;
+            // Optional: Parse nntr_config to check bin
+            try {
+              json nntr =
+                causallm::LoadJsonFile(resolved_path + "/nntr_config.json");
+              if (nntr.contains("model_file_name")) {
+                std::string bin = nntr["model_file_name"];
+                if (check_file_exists(resolved_path + "/" + bin)) {
+                  std::cout << "       (Binary confirmed: " << bin << ")"
+                            << std::endl;
+                } else {
+                  std::cout << "       (MISSING BINARY: " << bin << ")"
+                            << std::endl;
+                }
+              }
+            } catch (...) {
+            }
+          } else {
+            std::cout << "  [FAIL] Detected: " << lookup_key
+                      << " -> Missing configs in " << resolved_path
+                      << std::endl;
+          }
+        }
+      }
+    }
+  }
+}
+
 ErrorCode setOptions(Config config) {
   // Currently no options are being handled
   g_use_chat_template = config.use_chat_template;
+  if (config.debug_mode) {
+    // Ensure models are registered so we can validate them
+    register_models();
+    validate_models();
+  }
   return CAUSAL_LM_ERROR_NONE;
 }
 

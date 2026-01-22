@@ -61,8 +61,8 @@ typedef enum {
  */
 typedef struct {
   // Add configuration options here as needed
-  int reserved;
   bool use_chat_template; /// < @brief Whther to apply chat template to input
+  bool debug_mode; /// < @brief Check model file validity during initialization
 } Config;
 
 /**

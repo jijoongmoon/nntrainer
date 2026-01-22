@@ -52,8 +52,8 @@ int main(int argc, char *argv[]) {
 
   // 1. Set Options (Optional)
   Config config;
-  config.reserved = 0;
   config.use_chat_template = use_chat_template;
+  config.debug_mode = true; // Enable validation for test
   ErrorCode err = setOptions(config);
   if (err != CAUSAL_LM_ERROR_NONE) {
     std::cerr << "Failed to set options: " << err << std::endl;
