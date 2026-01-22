@@ -88,11 +88,11 @@ WIN_EXPORT ErrorCode setOptions(Config config);
  * @brief Load a model
  * @param compute Backend compute type
  * @param modeltype Model type
- * @param path Path to the model directory
+ * @param model_name_or_path Path to the model directory
  * @return ErrorCode
  */
 WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
-                               const char *path);
+                               const char *model_name_or_path);
 
 /**
  * @brief Performance Metrics

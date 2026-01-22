@@ -20,8 +20,10 @@
  */
 
 #include "causal_lm_api.h"
+#include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -47,6 +49,14 @@ static bool g_initialized = false;
 static std::string g_architecture = "";
 static bool g_use_chat_template = false;
 static std::string g_last_output = "";
+
+static std::map<std::string, std::string> g_model_path_map = {
+  {"QWEN3-0.6B", "qwen3-0.6b"},
+  {"QWEN2-0.5B", "qwen2-0.5b"}, // Example
+  {"QWEN2-1.5B", "qwen2-1.5b"}, // Example
+  {"GEMMA-2B", "gemma-2b"},     // Example
+  {"LLAMA3-8B", "llama3-8b"}    // Example
+};
 
 // Helper to register models (similar to main.cpp)
 // ensuring factory is populated.
@@ -131,6 +141,28 @@ static std::string apply_chat_template(const std::string &architecture,
   return input;
 }
 
+static std::string resolve_model_path(const std::string &model_name_or_path) {
+  std::string model_path = model_name_or_path;
+  std::string path_upper = model_path;
+  std::transform(path_upper.begin(), path_upper.end(), path_upper.begin(),
+                 ::toupper);
+
+  if (g_model_path_map.find(path_upper) != g_model_path_map.end()) {
+    model_path = "./models/" + g_model_path_map[path_upper];
+  } else {
+    for (auto const &[key, val] : g_model_path_map) {
+      std::string key_upper = key;
+      std::transform(key_upper.begin(), key_upper.end(), key_upper.begin(),
+                     ::toupper);
+      if (path_upper == key_upper) {
+        model_path = "./models/" + val;
+        break;
+      }
+    }
+  }
+  return model_path;
+}
+
 ErrorCode setOptions(Config config) {
   // Currently no options are being handled
   g_use_chat_template = config.use_chat_template;
@@ -138,17 +170,17 @@ ErrorCode setOptions(Config config) {
 }
 
 ErrorCode loadModel(BackendType compute, ModelType modeltype,
-                    const char *path) {
+                    const char *model_name_or_path) {
   std::lock_guard<std::mutex> lock(g_mutex);
 
-  if (path == nullptr) {
+  if (model_name_or_path == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
   try {
     register_models();
 
-    std::string model_path = path;
+    std::string model_path = resolve_model_path(model_name_or_path);
 
     // Load configuration files
     json cfg = causallm::LoadJsonFile(model_path + "/config.json");
