@@ -1,0 +1,60 @@
+LOCAL_PATH := $(call my-dir)
+
+include $(CLEAR_VARS)
+
+# ndk path
+ifndef ANDROID_NDK
+$(error ANDROID_NDK is not defined!)
+endif
+
+ifndef NNTRAINER_ROOT
+NNTRAINER_ROOT := $(LOCAL_PATH)/../../..
+endif
+
+NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/builddir/android_build_result/include/nntrainer
+
+# Prebuilt nntrainer libraries
+include $(CLEAR_VARS)
+LOCAL_MODULE := nntrainer
+LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/android_build_result/lib/$(TARGET_ARCH_ABI)/libnntrainer.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := ccapi-nntrainer
+LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/android_build_result/lib/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+# Prebuilt causallm library (uses prebuilt libcausallm.so)
+include $(CLEAR_VARS)
+LOCAL_MODULE := causallm
+LOCAL_SRC_FILES := $(LOCAL_PATH)/libs/$(TARGET_ARCH_ABI)/libcausallm.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+# Tokenizer library
+include $(CLEAR_VARS)
+LOCAL_MODULE := tokenizers_c
+LOCAL_SRC_FILES := ../lib/libtokenizers_android_c.a
+include $(PREBUILT_STATIC_LIBRARY)
+
+# Build test_causal_lm executable (NEW)
+include $(CLEAR_VARS)
+
+LOCAL_ARM_NEON := true
+LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_CXXFLAGS += -std=c++17 -frtti
+LOCAL_CFLAGS += -pthread -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_LDFLAGS += -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_ARM_MODE := arm
+LOCAL_MODULE := test_causal_lm
+LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
+
+LOCAL_SRC_FILES := ../api/test_api.cpp
+
+LOCAL_SHARED_LIBRARIES := causallm nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := tokenizers_c
+
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
+    $(LOCAL_PATH)/.. \
+    $(LOCAL_PATH)/../api
+
+include $(BUILD_EXECUTABLE)
