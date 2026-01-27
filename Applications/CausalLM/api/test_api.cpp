@@ -71,12 +71,12 @@ void printInfo(const std::string &label, const std::string &value) {
 void printLogo() {
   std::cout << "\n";
   std::cout << COLOR_BOLD << COLOR_MAGENTA;
-  std::cout << "  ███╗   ██╗███╗   ██╗\n";
-  std::cout << "  ████╗  ██║████╗  ██║\n";
-  std::cout << "  ██╔██╗ ██║██╔██╗ ██║\n";
-  std::cout << "  ██║╚██╗██║██║╚██╗██║\n";
-  std::cout << "  ██║ ╚████║██║ ╚████║\n";
-  std::cout << "  ╚═╝  ╚═══╝╚═╝  ╚═══╝\n";
+  std::cout << "  ███╗   ██╗███╗   ██╗████████╗██████╗ \n";
+  std::cout << "  ████╗  ██║████╗  ██║╚══██╔══╝██╔══██╗\n";
+  std::cout << "  ██╔██╗ ██║██╔██╗ ██║   ██║   ██████╔╝\n";
+  std::cout << "  ██║╚██╗██║██║╚██╗██║   ██║   ██╔══██╗\n";
+  std::cout << "  ██║ ╚████║██║ ╚████║   ██║   ██║  ██║\n";
+  std::cout << "  ╚═╝  ╚═══╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝\n";
   std::cout << COLOR_RESET;
   std::cout << COLOR_BOLD << COLOR_CYAN
             << "  ────────────────────────────────\n";

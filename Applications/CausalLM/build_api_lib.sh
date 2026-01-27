@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Build script for CausalLM Test Application
-# This script builds test_api executable only
+# Build script for CausalLM API Library
+# This script builds libcausallm_api.so only
 set -e
 
 # Color codes
@@ -80,49 +80,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NNTRAINER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export NNTRAINER_ROOT
 
-log_header "Build CausalLM Test Application"
+log_header "Build CausalLM API Library"
 echo "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 echo "ANDROID_NDK: $ANDROID_NDK"
 echo "Working directory: $(pwd)"
 
-# Check required libraries
-log_step "1/2" "Check Dependencies"
+# Check if CausalLM Core is built
+log_step "1/2" "Check CausalLM Core"
 
-MISSING_DEPS=false
-
-# Check Core Lib
-if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_core.so" ]; then
-    echo -e "  ${GREEN}[OK]${NC} libcausallm_core.so found"
-else
-    echo -e "  ${RED}[MISSING]${NC} libcausallm_core.so"
-    echo "    -> Run ./build_android.sh first"
-    MISSING_DEPS=true
-fi
-
-# Check API Lib
-if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_api.so" ]; then
-    echo -e "  ${GREEN}[OK]${NC} libcausallm_api.so found"
-else
-    echo -e "  ${RED}[MISSING]${NC} libcausallm_api.so"
-    echo "    -> Run ./build_api_lib.sh first"
-    MISSING_DEPS=true
-fi
-
-if [ "$MISSING_DEPS" = true ]; then
-    echo ""
-    log_error "Missing dependencies. Please build required libraries first."
+if [ ! -f "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_core.so" ]; then
+    log_error "libcausallm_core.so not found."
+    echo "Please run build_android.sh first to build the core library."
     exit 1
 fi
+log_success "CausalLM Core found"
 
-log_success "All dependencies found"
-
-# Step 2: Build Test App
-log_step "2/2" "Build Test App"
+# Step 2: Build CausalLM API
+log_step "2/2" "Build CausalLM API Library"
 
 cd "$SCRIPT_DIR/jni"
 
-log_info "Building with ndk-build (builds test_api)..."
-if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk test_api -j $(nproc); then
+log_info "Building with ndk-build (builds libcausallm_api.so)..."
+if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_api -j $(nproc); then
     log_success "Build completed successfully"
 else
     log_error "Build failed"
@@ -133,7 +112,7 @@ fi
 echo ""
 echo "Build artifacts:"
 
-check_artifact "test_api" || exit 1
+check_artifact "libcausallm_api.so" || exit 1
 
 # Summary
 log_header "Build Summary"
@@ -141,9 +120,9 @@ log_success "Build completed successfully!"
 echo ""
 echo "Output files are in: $SCRIPT_DIR/jni/libs/arm64-v8a/"
 echo ""
-echo "Executables:"
-echo "  - test_api (API test application)"
+echo "Libraries:"
+echo "  - libcausallm_api.so (CausalLM API library)"
 echo ""
-echo "To install and run:"
-echo "  ./install_android.sh"
+echo "To build test app, run:"
+echo "  ./build_test_app.sh"
 echo ""

@@ -6,7 +6,8 @@ It supports *inference* mode (text generation) on various devices, including And
 ## Features
 
 - **Standalone Application (`nntr_causallm`)**: A command-line tool to load models and generate text.
-- **C API (Optional)**: A lightweight C interface (`libcausallm.so`) for integrating LLM capabilities into other applications (e.g., Android JNI, iOS, or other C/C++ apps).
+- **C API (Optional)**: A lightweight C interface (`libcausallm_api.so`) for integrating LLM capabilities into other applications (e.g., Android JNI, iOS, or other C/C++ apps).
+- **Core Library**: The core implementation is separated into `libcausallm_core.so` for modularity.
 - **Supported Backends**: CPU (OpenMP), with GPU/NPU support planned.
 
 ## Supported models
@@ -63,7 +64,7 @@ $ ./build/Applications/CausalLM/nntr_causallm /tmp/nntrainer/Applications/Causal
 
 ### 3. Android Build & Test
 
-The Android build process has been updated to simplify the compilation of the CausalLM library and executable, along with its dependencies (nntrainer, tokenizers-cpp).
+The Android build process is modularized to support building the core library, API library, and test applications independently.
 
 #### Prerequisites
 - Android NDK (e.g., r21d or later)
@@ -75,24 +76,25 @@ The Android build process has been updated to simplify the compilation of the Ca
 
 The following scripts are provided in `Applications/CausalLM/` to handle the build process:
 
-1.  **`build_android.sh`**:
-    - This is the main build script.
-    - It automates the entire process:
-        - Builds `nntrainer` core library for Android.
-        - Builds `tokenizers-cpp` static library (`libtokenizers_android_c.a`) if missing.
-        - Downloads `json.hpp` dependency.
-        - Compiles `libcausallm.so` (Shared Library for API) and `nntrainer_causallm` (Executable).
+1.  **`build_android.sh`** (Core + App):
+    - Builds `nntrainer` core library for Android.
+    - Builds `tokenizers-cpp` dependency if missing.
+    - Compiles **`libcausallm_core.so`** (Core logic) and **`nntrainer_causallm`** (Main Executable).
     - **Usage**: `./build_android.sh`
 
-2.  **`build_tokenizer_android.sh`**:
-    - Specifically builds the `tokenizers-cpp` library for Android (arm64-v8a by default).
-    - It clones `mlc-ai/tokenizers-cpp`, configures it with CMake, and builds it using Rust toolchain.
-    - Called automatically by `build_android.sh` if needed.
+2.  **`build_api_lib.sh`** (API Library):
+    - Requires `libcausallm_core.so` (run `build_android.sh` first).
+    - Compiles **`libcausallm_api.so`** (C-API wrapper).
+    - **Usage**: `./build_api_lib.sh`
 
-3.  **`install_android.sh`**:
-    - Installs the built artifacts to a connected Android device.
-    - Pushes libraries (`libcausallm.so`, `libnntrainer.so`, etc.) and the executable.
-    - Creates a helper script `run_causallm.sh` on the device.
+3.  **`build_test_app.sh`** (Test App):
+    - Requires both Core and API libraries.
+    - Compiles **`test_api`** (Simple C++ test app for API).
+    - **Usage**: `./build_test_app.sh`
+
+4.  **`install_android.sh`**:
+    - Installs all built artifacts to a connected Android device.
+    - Creates helper scripts (`run_causallm.sh`, `run_test_api.sh`) on the device.
     - **Usage**: `./install_android.sh`
 
 #### Build Instructions
@@ -102,27 +104,40 @@ The following scripts are provided in `Applications/CausalLM/` to handle the bui
     export ANDROID_NDK=/path/to/your/android-ndk
     ```
 
-2.  **Run Build Script**:
+2.  **Build Core & Main App**:
     ```bash
     cd Applications/CausalLM
     ./build_android.sh
     ```
-    This will generate the following in `jni/libs/arm64-v8a/`:
-    - `libcausallm.so`: The CausalLM API shared library.
-    - `nntrainer_causallm`: The command-line executable.
-    - `libnntrainer.so` & `libccapi-nntrainer.so`: NNTrainer core libraries.
+    Artifacts in `jni/libs/arm64-v8a/`:
+    - `libcausallm_core.so`
+    - `nntrainer_causallm`
 
-3.  **Install to Device**:
-    Connect your Android device via ADB.
+3.  **Build API Library (Optional)**:
+    ```bash
+    ./build_api_lib.sh
+    ```
+    Artifacts:
+    - `libcausallm_api.so`
+
+4.  **Build Test App (Optional)**:
+    ```bash
+    ./build_test_app.sh
+    ```
+    Artifacts:
+    - `test_api`
+
+5.  **Install & Run**:
     ```bash
     ./install_android.sh
     ```
-
-4.  **Run on Device**:
-    You need to push your model files to the device first (e.g., to `/data/local/tmp/nntrainer/causallm/models/`).
     
+    **Run Main App:**
     ```bash
-    adb shell
-    cd /data/local/tmp/nntrainer/causallm
-    ./run_causallm.sh ./models/your-model-folder
+    adb shell /data/local/tmp/nntrainer/causallm/run_causallm.sh [model_path]
+    ```
+
+    **Run API Test:**
+    ```bash
+    adb shell /data/local/tmp/nntrainer/causallm/run_test_api.sh [model_name] [prompt]
     ```

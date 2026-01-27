@@ -13,6 +13,20 @@ endif
 
 NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/builddir/android_build_result/include/nntrainer
 
+# Common Includes Definition
+CAUSALLM_COMMON_INCLUDES := \
+    $(LOCAL_PATH)/.. \
+    $(LOCAL_PATH)/../layers \
+    $(LOCAL_PATH)/../models \
+    $(LOCAL_PATH)/../models/gpt_oss \
+    $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
+    $(LOCAL_PATH)/../models/qwen2 \
+    $(LOCAL_PATH)/../models/qwen3 \
+    $(LOCAL_PATH)/../models/qwen3_moe \
+    $(LOCAL_PATH)/../models/qwen3_slim_moe \
+    $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma3 
+
 # Prebuilt nntrainer libraries
 include $(CLEAR_VARS)
 LOCAL_MODULE := nntrainer
@@ -30,7 +44,7 @@ LOCAL_MODULE := tokenizers_c
 LOCAL_SRC_FILES := ../lib/libtokenizers_android_c.a
 include $(PREBUILT_STATIC_LIBRARY)
 
-# Build libcausallm.so (shared library - same as Android.mk.lib)
+# Build libcausallm_core.so (shared library - without api)
 include $(CLEAR_VARS)
 
 LOCAL_ARM_NEON := true
@@ -40,12 +54,10 @@ LOCAL_CXXFLAGS += -std=c++17 -frtti
 LOCAL_CFLAGS += -pthread -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
 LOCAL_LDFLAGS += -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
 LOCAL_ARM_MODE := arm
-LOCAL_MODULE := causallm
+LOCAL_MODULE := causallm_core
 LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
 
 LOCAL_SRC_FILES := \
-    ../api/causal_lm_api.cpp \
-    ../api/model_config.cpp \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/sentence_transformer.cpp \
@@ -83,19 +95,31 @@ LOCAL_SRC_FILES := \
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
-    $(LOCAL_PATH)/.. \
-    $(LOCAL_PATH)/../api \
-    $(LOCAL_PATH)/../layers \
-    $(LOCAL_PATH)/../models \
-    $(LOCAL_PATH)/../models/gpt_oss \
-    $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
-    $(LOCAL_PATH)/../models/qwen2 \
-    $(LOCAL_PATH)/../models/qwen3 \
-    $(LOCAL_PATH)/../models/qwen3_moe \
-    $(LOCAL_PATH)/../models/qwen3_slim_moe \
-    $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
-    $(LOCAL_PATH)/../models/gemma3
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES)
+
+include $(BUILD_SHARED_LIBRARY)
+
+# Build libcausallm_api.so (shared library - api only)
+include $(CLEAR_VARS)
+
+LOCAL_ARM_NEON := true
+LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_CXXFLAGS += -std=c++17 -frtti
+LOCAL_CFLAGS += -pthread -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_LDFLAGS += -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_ARM_MODE := arm
+LOCAL_MODULE := causallm_api
+LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
+
+LOCAL_SRC_FILES := \
+    ../api/causal_lm_api.cpp \
+    ../api/model_config.cpp
+
+LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := tokenizers_c
+
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES) \
+    $(LOCAL_PATH)/../api
 
 include $(BUILD_SHARED_LIBRARY)
 
@@ -114,21 +138,32 @@ LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__F
 
 LOCAL_SRC_FILES := ../main.cpp
 
-LOCAL_SHARED_LIBRARIES := causallm nntrainer ccapi-nntrainer
+LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
-    $(LOCAL_PATH)/.. \
-    $(LOCAL_PATH)/../api \
-    $(LOCAL_PATH)/../layers \
-    $(LOCAL_PATH)/../models \
-    $(LOCAL_PATH)/../models/gpt_oss \
-    $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
-    $(LOCAL_PATH)/../models/qwen2 \
-    $(LOCAL_PATH)/../models/qwen3 \
-    $(LOCAL_PATH)/../models/qwen3_moe \
-    $(LOCAL_PATH)/../models/qwen3_slim_moe \
-    $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
-    $(LOCAL_PATH)/../models/gemma3
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES)
+
+include $(BUILD_EXECUTABLE)
+
+# Build test_api executable
+include $(CLEAR_VARS)
+
+LOCAL_ARM_NEON := true
+LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_CXXFLAGS += -std=c++17 -frtti
+LOCAL_CFLAGS += -pthread -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_LDFLAGS += -fexceptions -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_MODULE_TAGS := optional
+LOCAL_ARM_MODE := arm
+LOCAL_MODULE := test_api
+LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
+
+LOCAL_SRC_FILES := ../api/test_api.cpp
+
+LOCAL_SHARED_LIBRARIES := causallm_api causallm_core nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := tokenizers_c
+
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES) \
+    $(LOCAL_PATH)/../api
 
 include $(BUILD_EXECUTABLE)

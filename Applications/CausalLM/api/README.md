@@ -10,6 +10,22 @@ The API provides functionality to:
 - Run inference (text generation) given a prompt.
 - Retrieve performance metrics (token counts, duration).
 
+## Build & Integration
+
+The CausalLM API is built as a separate shared library `libcausallm_api.so`, which depends on the core logic in `libcausallm_core.so`.
+
+### Build Artifacts (Android)
+
+- **`libcausallm_core.so`**: Contains the core LLM implementation (Model, Layers, etc.).
+- **`libcausallm_api.so`**: Contains the C API implementation (`causal_lm_api.cpp`) and configuration helpers (`model_config.cpp`).
+
+### Linking
+
+When integrating this API into your application (e.g., via JNI), you must link against both libraries:
+1.  `libcausallm_api.so`
+2.  `libcausallm_core.so`
+3.  `libnntrainer.so` (Dependency)
+
 ## Directory Structure & Model Loading
 
 The API strictly relies on registered model types and quantization settings to locate model files. There are two modes of loading, depending on how the model is registered within the library.
