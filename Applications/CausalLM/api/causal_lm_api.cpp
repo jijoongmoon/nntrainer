@@ -164,15 +164,14 @@ static std::string get_quantization_suffix(ModelQuantizationType type) {
     return "-w8a16";
   case CAUSAL_LM_QUANTIZATION_W32A32:
     return "-w32a32";
-  default:
-    return "";
+  default: // W4A32 by default
+    return "-w4a32";
   }
 }
 
-static std::string resolve_model_path(const std::string &model_name_or_path,
+static std::string resolve_model_path(const std::string &model_key,
                                       ModelQuantizationType quant_type) {
-  std::string model_path = model_name_or_path;
-  std::string path_upper = model_path;
+  std::string path_upper = model_key;
   std::transform(path_upper.begin(), path_upper.end(), path_upper.begin(),
                  ::toupper);
 
@@ -182,25 +181,16 @@ static std::string resolve_model_path(const std::string &model_name_or_path,
   if (g_model_path_map.find(path_upper) != g_model_path_map.end()) {
     base_dir_name = g_model_path_map[path_upper];
   } else {
-    for (auto const &[key, val] : g_model_path_map) {
-      std::string key_upper = key;
-      std::transform(key_upper.begin(), key_upper.end(), key_upper.begin(),
-                     ::toupper);
-      if (path_upper == key_upper) {
-        model_path = val;
-        break;
-      }
-    }
+    // Fallback: use lowercased key as base dir name if not found in map
+    // or just return empty? For restricted API, we should probabily fail
+    // earlier, but here we can return constructed path.
+    base_dir_name = path_upper;
+    std::transform(base_dir_name.begin(), base_dir_name.end(),
+                   base_dir_name.begin(), ::tolower);
   }
 
-  // 2. If found in map, append suffix.
-  if (!base_dir_name.empty()) {
-    model_path =
-      "./models/" + base_dir_name + get_quantization_suffix(quant_type);
-  }
-  // If not in map, rely on original behavior (just path), or potentially append
-  // suffix if it looks like a name? For now, only modifying the map-based
-  // resolution path as requested.
+  std::string model_path =
+    "./models/" + base_dir_name + get_quantization_suffix(quant_type);
 
   return model_path;
 }
@@ -222,11 +212,8 @@ static void validate_models() {
 
     for (auto qt : quant_types) {
       std::string quant_suffix = get_quantization_suffix(qt);
-      // Wait, get_quantization_suffix returns lowercase "-w4a32"
-      // But g_model_registry keys are UPPERCASE ("QWEN3-0.6B-W4A32")
-      // We need to match the registry key format.
 
-      std::string lookup_key = key; // "QWEN3-0.6B"
+      std::string lookup_key = key;
       if (qt != CAUSAL_LM_QUANTIZATION_UNKNOWN) {
         std::transform(quant_suffix.begin(), quant_suffix.end(),
                        quant_suffix.begin(), ::toupper); // "-W4A32"
@@ -237,7 +224,9 @@ static void validate_models() {
       std::string resolved_path = resolve_model_path(key, qt);
 
       if (g_model_registry.find(lookup_key) != g_model_registry.end()) {
-        // CASE 1: Configuration is registered
+        // CASE 1: Configuration is registered in model_config.cpp
+        // For these models, we only check if the binary weight file exists.
+        // The configurations (config.json, etc.) are embedded in the library.
         RegisteredModel &rm = g_model_registry[lookup_key];
         std::string bin_file_name = rm.config.model_file_name;
         std::string full_path = resolved_path + "/" + bin_file_name;
@@ -251,15 +240,16 @@ static void validate_models() {
         }
 
       } else {
-        // CASE 2: No config, but model type exists (via map iteration). Check
-        // if folder has valid structure
+        // CASE 2: No internal config, but model type exists (via map
+        // iteration). For these models, we require external configuration files
+        // (config.json, nntr_config.json) to be present in the directory.
         if (check_file_exists(resolved_path)) {
           bool has_config = check_file_exists(resolved_path + "/config.json");
           bool has_nntr =
             check_file_exists(resolved_path + "/nntr_config.json");
 
           if (has_config && has_nntr) {
-            std::cout << "  [OK] Detected: " << lookup_key << " -> "
+            std::cout << "  [OK] External Config: " << lookup_key << " -> "
                       << resolved_path << std::endl;
             // Optional: Parse nntr_config to check bin
             try {
@@ -278,7 +268,7 @@ static void validate_models() {
             } catch (...) {
             }
           } else {
-            std::cout << "  [FAIL] Detected: " << lookup_key
+            std::cout << "  [FAIL] External Config: " << lookup_key
                       << " -> Missing configs in " << resolved_path
                       << std::endl;
           }
@@ -326,21 +316,11 @@ ErrorCode registerModel(const char *model_name, const char *arch_name,
 }
 
 ErrorCode loadModel(BackendType compute, ModelType modeltype,
-                    ModelQuantizationType quant_type,
-                    const char *model_name_or_path) {
+                    ModelQuantizationType quant_type) {
 
-  const char *target_model_name = nullptr;
-
-  if (modeltype != CAUSAL_LM_MODEL_UNKNOWN) {
-    target_model_name = get_model_name_from_type(modeltype);
-    if (target_model_name == nullptr) {
-      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-    }
-  } else {
-    if (model_name_or_path == nullptr) {
-      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-    }
-    target_model_name = model_name_or_path;
+  const char *target_model_name = get_model_name_from_type(modeltype);
+  if (target_model_name == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
   // Ensure models/configs are registered (thread-safe via call_once)
@@ -381,6 +361,12 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
 
     // Check in-memory map first
     if (g_model_registry.find(lookup_name) != g_model_registry.end()) {
+      // ------------------------------------------------------------------------
+      // CASE 1: Model Configuration is Internal (Registered in
+      // model_config.cpp)
+      // ------------------------------------------------------------------------
+      // In this case, we do NOT load config.json or nntr_config.json from disk.
+      // We only locate the binary weight file.
       RegisteredModel &rm = g_model_registry[lookup_name];
 
       // Find architecture config
@@ -393,8 +379,8 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       ModelArchConfig &ac = g_arch_config_map[rm.arch_name];
       ModelRuntimeConfig &rc = rm.config;
 
-      // Strategy: Try to resolve path even if config found.
-      model_dir_path = resolve_model_path(model_name_or_path, quant_type);
+      // Strategy: Resolve path to find the weight file
+      model_dir_path = resolve_model_path(target_model_name, quant_type);
 
       // Populate JSONs from Arch Struct
       cfg["vocab_size"] = ac.vocab_size;
@@ -457,7 +443,12 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       nntr_cfg["bad_word_ids"] = bad_ids;
 
     } else {
-      // Fallback to file-based loading
+      // --------------------------------------------------
+      // CASE 2: External Model Configuration (File-based)
+      // --------------------------------------------------
+      // The model type is registered (enum), but specific configuration for
+      // this quantization is not in memory. We must load config.json and
+      // nntr_config.json from the model directory
       model_dir_path = resolve_model_path(target_model_name, quant_type);
 
       // Load configuration files

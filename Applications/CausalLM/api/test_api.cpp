@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
-
+ *
  * @file   test_api.cpp
  * @date   21 Jan 2026
  * @see    https://github.com/nntrainer/nntrainer
@@ -92,7 +92,7 @@ void printUsage(const char *program_name) {
 
   std::cout << COLOR_CYAN << "Arguments:" << COLOR_RESET << "\n";
   std::cout << "  model_name        " << COLOR_BOLD << "REQUIRED" << COLOR_RESET
-            << "  - Model name (e.g., QWEN3-0.6B-W4A32, QWEN3-0.6B)\n";
+            << "  - Model name (e.g., QWEN3-0.6B)\n";
   std::cout << "  prompt            " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET
             << "  - Input prompt (default: 'Hello, how are you?')\n";
@@ -104,9 +104,9 @@ void printUsage(const char *program_name) {
 
   std::cout << COLOR_YELLOW << "Examples:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B-W4A32 \"Tell me a joke\"\n";
+            << " QWEN3-0.6B \"Tell me a joke\" 1 W4A32\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B \"Write a poem\" 1 W4A32\n\n";
+            << " QWEN3-0.6B \"Write a poem\" 1 W32A32\n\n";
 }
 } // namespace
 
@@ -164,8 +164,20 @@ int main(int argc, char *argv[]) {
   std::cout << COLOR_CYAN << "⏳ " << COLOR_RESET
             << "Loading model: " << COLOR_BOLD << model_name << COLOR_RESET
             << "\n";
-  err = loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_UNKNOWN, quant_type,
-                  model_name);
+
+  // Map string to ModelType
+  ModelType model_type = CAUSAL_LM_MODEL_QWEN3_0_6B;
+  std::string model_name_str(model_name);
+  if (model_name_str == "QWEN3-0.6B") {
+    model_type = CAUSAL_LM_MODEL_QWEN3_0_6B;
+  } else {
+    std::cout << COLOR_YELLOW << "⚠ Warning: Unknown model name '"
+              << model_name_str << "'. Defaulting to QWEN3-0.6B." << COLOR_RESET
+              << "\n";
+  }
+
+  err = loadModel(CAUSAL_LM_BACKEND_CPU, model_type, quant_type);
+
   if (err != CAUSAL_LM_ERROR_NONE) {
     printError("Failed to load model");
     std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
