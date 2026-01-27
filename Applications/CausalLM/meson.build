@@ -2,6 +2,7 @@ causallm_src = [
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
+    meson.current_source_dir() / 'api' / 'model_config.cpp',
 ]
 
 executable_src = [
@@ -19,6 +20,7 @@ subdir('layers')
 causallm_layer_dependencies += [
     causallm_rms_norm_dep,
     causallm_tie_word_embedding_dep,
+    causallm_lm_head_dep,
     causallm_swiglu_dep,
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
@@ -71,4 +73,16 @@ e = executable('nntr_causallm',
     executable_src,
     include_directories: causallm_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)
+
+test_api_src = [
+    meson.current_source_dir() / 'api' / 'test_api.cpp',
+]
+
+test_api = executable('test_api',
+    test_api_src,
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+    build_by_default: true,
+    install: false,
 )
