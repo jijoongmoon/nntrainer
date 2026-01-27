@@ -431,7 +431,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       nntr_cfg["model_file_name"] = std::string(rc.model_file_name);
 
       std::string t_file = rc.tokenizer_file;
-      nntr_cfg["tokenizer_file"] = t_file;
+      nntr_cfg["tokenizer_file"] = model_dir_path + "/" + t_file;
 
       if (strlen(rc.lmhead_dtype) > 0) {
         nntr_cfg["lmhead_dtype"] = std::string(rc.lmhead_dtype);
@@ -456,6 +456,11 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       generation_cfg =
         causallm::LoadJsonFile(model_dir_path + "/generation_config.json");
       nntr_cfg = causallm::LoadJsonFile(model_dir_path + "/nntr_config.json");
+
+      if (nntr_cfg.contains("tokenizer_file")) {
+        std::string t_file = nntr_cfg["tokenizer_file"];
+        nntr_cfg["tokenizer_file"] = model_dir_path + "/" + t_file;
+      }
     }
 
     // Construct weight file path
