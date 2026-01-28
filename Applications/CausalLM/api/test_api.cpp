@@ -286,7 +286,10 @@ int main(int argc, char *argv[]) {
 
     std::cout << COLOR_CYAN << "  📊 " << COLOR_RESET << COLOR_BOLD
               << "Total Stats" << COLOR_RESET << "\n";
-    std::cout << COLOR_CYAN << "    Duration (run):" << COLOR_RESET << "     "
+    std::cout << COLOR_CYAN << "    Init time:" << COLOR_RESET << "    "
+              << std::fixed << std::setprecision(2)
+              << metrics.initialization_duration_ms << " ms\n";
+    std::cout << COLOR_CYAN << "    Duration :" << COLOR_RESET << "    "
               << std::fixed << std::setprecision(2) << metrics.total_duration_ms
               << " ms\n";
     std::cout << COLOR_CYAN << "    Peak Mem:" << COLOR_RESET << "     "

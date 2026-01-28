@@ -45,6 +45,7 @@ static std::string g_architecture = "";
 static bool g_use_chat_template = false;
 static bool g_verbose = false;
 static std::string g_last_output = "";
+static double g_initialization_duration_ms = 0.0;
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
@@ -320,6 +321,8 @@ ErrorCode registerModel(const char *model_name, const char *arch_name,
 ErrorCode loadModel(BackendType compute, ModelType modeltype,
                     ModelQuantizationType quant_type) {
 
+  auto start_init = std::chrono::high_resolution_clock::now();
+
   const char *target_model_name = get_model_name_from_type(modeltype);
   if (target_model_name == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
@@ -501,6 +504,11 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     g_initialized = true;
     g_architecture = architecture;
 
+    auto finish_init = std::chrono::high_resolution_clock::now();
+    auto init_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      finish_init - start_init);
+    g_initialization_duration_ms = init_duration.count();
+
   } catch (const std::exception &e) {
     std::cerr << "Exception in loadModel: " << e.what() << std::endl;
     return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
@@ -570,6 +578,8 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
         return CAUSAL_LM_ERROR_INFERENCE_NOT_RUN;
       }
       *metrics = causal_lm_model->getPerformanceMetrics();
+      // Overwrite init duration with the one measured in loadModel API
+      metrics->initialization_duration_ms = g_initialization_duration_ms;
     } else {
       return CAUSAL_LM_ERROR_UNKNOWN;
     }
