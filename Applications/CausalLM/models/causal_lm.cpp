@@ -37,8 +37,30 @@
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
+#ifdef _WIN32
+#include <psapi.h>
+#include <windows.h>
+#else
+#include <sys/resource.h>
+#endif
 
 namespace causallm {
+
+size_t getPeakMemoryKb() {
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS pmc;
+  if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+    return (size_t)(pmc.PeakWorkingSetSize / 1024);
+  }
+  return 0;
+#else
+  struct rusage rusage;
+  if (getrusage(RUSAGE_SELF, &rusage) == 0) {
+    return (size_t)(rusage.ru_maxrss);
+  }
+  return 0;
+#endif
+}
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
@@ -288,6 +310,7 @@ void CausalLM::registerCustomLayers() {
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
+  auto start_total = std::chrono::high_resolution_clock::now();
   if (!is_initialized) {
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
@@ -530,6 +553,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::chrono::duration_cast<std::chrono::milliseconds>(finish_generation -
                                                           start_generation);
 
+  auto finish_total = std::chrono::high_resolution_clock::now();
+  auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_total - start_total);
+  size_t peak_memory = getPeakMemoryKb();
+
   if (log_output) {
 
     std::cout << "\n\n";
@@ -542,6 +570,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
               << generation_duration.count() << " ms, "
               << ((double)generation_cnt / generation_duration.count() * 1000)
               << " TPS\n";
+    std::cout << "total: " << total_duration.count() << " ms\n";
+    std::cout << "peak memory: " << peak_memory << " KB\n";
     std::cout << "==========================================================\n";
   }
 
@@ -549,6 +579,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   performance_metrics.prefill_duration_ms = prefill_duration.count();
   performance_metrics.generation_tokens = generation_cnt;
   performance_metrics.generation_duration_ms = generation_duration.count();
+  performance_metrics.total_duration_ms = total_duration.count();
+  performance_metrics.peak_memory_kb = peak_memory;
 
   has_run_ = true;
 }

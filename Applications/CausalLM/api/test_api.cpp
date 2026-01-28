@@ -283,6 +283,14 @@ int main(int argc, char *argv[]) {
     std::cout << COLOR_CYAN << "    Throughput:" << COLOR_RESET << "   "
               << COLOR_BOLD << COLOR_GREEN << std::fixed << std::setprecision(1)
               << gen_tps << COLOR_RESET << " tokens/sec\n\n";
+
+    std::cout << COLOR_CYAN << "  📊 " << COLOR_RESET << COLOR_BOLD
+              << "Total Stats" << COLOR_RESET << "\n";
+    std::cout << COLOR_CYAN << "    Duration (run):" << COLOR_RESET << "     "
+              << std::fixed << std::setprecision(2) << metrics.total_duration_ms
+              << " ms\n";
+    std::cout << COLOR_CYAN << "    Peak Mem:" << COLOR_RESET << "     "
+              << metrics.peak_memory_kb / 1024 << " MB\n\n";
   }
 
   printLine("═", 63);
