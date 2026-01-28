@@ -43,6 +43,7 @@ static std::mutex g_mutex;
 static bool g_initialized = false;
 static std::string g_architecture = "";
 static bool g_use_chat_template = false;
+static bool g_verbose = false;
 static std::string g_last_output = "";
 
 static std::map<std::string, std::string> g_model_path_map = {
@@ -281,6 +282,7 @@ static void validate_models() {
 ErrorCode setOptions(Config config) {
   // Currently no options are being handled
   g_use_chat_template = config.use_chat_template;
+  g_verbose = config.verbose;
   if (config.debug_mode) {
     // Ensure models are registered so we can validate them
     register_models();
@@ -530,9 +532,9 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
 // We assume single batch request for this API
 #if defined(_WIN32)
     g_model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
-                 false);
+                 g_verbose);
 #else
-    g_model->run(input, false, "", "", false);
+    g_model->run(input, false, "", "", g_verbose);
 #endif
 
     auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());

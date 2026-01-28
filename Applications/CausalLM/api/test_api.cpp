@@ -29,6 +29,7 @@ constexpr const char *COLOR_YELLOW = "\033[33m";
 constexpr const char *COLOR_BLUE = "\033[34m";
 constexpr const char *COLOR_RED = "\033[31m";
 constexpr const char *COLOR_MAGENTA = "\033[35m";
+constexpr const char *COLOR_GRAY = "\033[90m";
 
 void printLine(const std::string &s, int length = 80) {
   for (int i = 0; i < length; ++i)
@@ -88,7 +89,8 @@ void printLogo() {
 void printUsage(const char *program_name) {
   std::cout << COLOR_YELLOW << "Usage:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " <model_name> [prompt] [use_chat_template] [quantization]\n\n";
+            << " <model_name> [prompt] [use_chat_template] [quantization] "
+               "[verbose] \n\n";
 
   std::cout << COLOR_CYAN << "Arguments:" << COLOR_RESET << "\n";
   std::cout << "  model_name        " << COLOR_BOLD << "REQUIRED" << COLOR_RESET
@@ -100,13 +102,15 @@ void printUsage(const char *program_name) {
             << COLOR_RESET << "  - 0/1 or true/false (default: 1)\n";
   std::cout << "  quantization      " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET
-            << "  - W4A32/W16A16/W8A16/W32A32/UNKNOWN (default: UNKNOWN)\n\n";
+            << "  - W4A32/W16A16/W8A16/W32A32/UNKNOWN (default: UNKNOWN)\n";
+  std::cout << "  verbose           " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET << "  - 0/1 or true/false (default: 0)\n\n";
 
   std::cout << COLOR_YELLOW << "Examples:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " QWEN3-0.6B \"Tell me a joke\" 1 W4A32\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B \"Write a poem\" 1 W32A32\n\n";
+            << " QWEN3-0.6B \"Write a poem\" 1 W32A32 1\n\n";
 }
 } // namespace
 
@@ -141,10 +145,16 @@ int main(int argc, char *argv[]) {
       quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
   }
 
+  bool verbose = true;
+  if (argc >= 6) {
+    verbose = (std::string(argv[5]) == "1" || std::string(argv[5]) == "true");
+  }
+
   printSection("Configuration");
   printInfo("Model Name", model_name);
   printInfo("Use Chat Template", use_chat_template ? "true" : "false");
   printInfo("Quantization", quant_str);
+  printInfo("Verbose", verbose ? "true" : "false");
   std::cout << "\n";
 
   printSection("Initialization");
@@ -152,6 +162,7 @@ int main(int argc, char *argv[]) {
   Config config;
   config.use_chat_template = use_chat_template;
   config.debug_mode = true;
+  config.verbose = verbose;
   ErrorCode err = setOptions(config);
   if (err != CAUSAL_LM_ERROR_NONE) {
     printError("Failed to set options");
@@ -193,7 +204,18 @@ int main(int argc, char *argv[]) {
   std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET << "Running inference...\n\n";
 
   const char *outputText = nullptr;
+
+  if (verbose) {
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+    std::cout << COLOR_BOLD << COLOR_GRAY;
+  }
+
   err = runModel(prompt, &outputText);
+
+  if (verbose) {
+    std::cout << COLOR_RESET << "\n\n";
+  }
+
   if (err != CAUSAL_LM_ERROR_NONE) {
     printError("Failed to run model");
     std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
