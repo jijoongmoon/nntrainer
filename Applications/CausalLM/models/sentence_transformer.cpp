@@ -179,8 +179,8 @@ void SentenceTransformer::addModule(const std::string &type, int idx) {
 }
 
 void SentenceTransformer::run(const WSTR prompt, bool do_sample,
-                              const WSTR system_prompt,
-                              const WSTR tail_prompt, bool log_output) {
+                              const WSTR system_prompt, const WSTR tail_prompt,
+                              bool log_output) {
 
   try {
     std::vector<float *> results = encode(prompt, system_prompt, tail_prompt);

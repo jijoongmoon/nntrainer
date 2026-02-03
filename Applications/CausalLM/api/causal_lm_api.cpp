@@ -184,7 +184,7 @@ static std::string resolve_model_path(const std::string &model_key,
     base_dir_name = g_model_path_map[path_upper];
   } else {
     // Fallback: use lowercased key as base dir name if not found in map
-    // or just return empty? For restricted API, we should probabily fail
+    // or just return empty? For restricted API, we should probably fail
     // earlier, but here we can return constructed path.
     base_dir_name = path_upper;
     std::transform(base_dir_name.begin(), base_dir_name.end(),
