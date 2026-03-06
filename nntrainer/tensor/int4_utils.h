@@ -69,6 +69,9 @@ public:
                       const size_t groups_per_row, const size_t group_size,
                       const size_t rows_count, const size_t columns_count);
 
+  static uint8_t pack_adreno(const float *weights, const float *scales,
+                        const size_t n_id, const size_t k_id, const size_t group_size,
+                        const size_t N, const size_t K);
   /**
    * @brief Quantize weights float* matrix to OpenVINO layout:
    * OS_IS_YX_OSV32_ISV2, osv32_isv2 layout for int4 packed weight:
@@ -89,13 +92,19 @@ public:
                                 std::vector<uint8_t> &out_weights,
                                 std::vector<uint16_t> &out_scales);
 
+  static void quantizeAndRepackAdreno(const float *weights, const size_t rows_count,
+                                const size_t columns_count,
+                                const size_t group_size,
+                                std::vector<uint16_t> &out_weights,
+                                std::vector<uint16_t> &out_scales);
+
   /**
    * @brief     Quantize one float value to 4-bits integer
    * @param[in] weight input weight
    * @param[in] scale input scale
    * @return 4-bit integer
    */
-  static uint8_t quantizeToInt4(const float weight, const float scale);
+  static uint8_t quantizeToInt4(const float weight, const float scale, bool convert_with_add8=false);
 
   /**
    * @brief     Convert 4-bit integer value to 32-bit integer

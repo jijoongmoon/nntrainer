@@ -805,7 +805,7 @@ void gemm_int4_cl(void *input, void *weights, void *scales, void *output,
 }
 
 
-void gemm_int4_cl_adreno(void *input, void *weights, void *scales, void *output,
+void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, void *scales, void *output,
                   unsigned int M, unsigned int N, unsigned int K,
                   unsigned int quantization_group_size) {
   int alignK = align(K, quantization_group_size);
@@ -817,7 +817,145 @@ void gemm_int4_cl_adreno(void *input, void *weights, void *scales, void *output,
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   auto &clbuffInstance = ClBufferManager::Global();
 
+
+
+
+
+
+
+
+
+
+  cl_int err;
+  size_t input_size = M * alignK * sizeof(uint16_t);
+
+  cl_mem input_buf = clCreateBuffer(
+    blas_cc->context_inst_.GetContext(),
+    CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+    input_size,
+    input,
+    &err
+  );
+
+  if (err!=CL_SUCCESS){
+    throw std::runtime_error("Failed to create input_transposed buffer");
+  }
+
+  cl_image_format image_format;
+  image_format.image_channel_order = CL_RGBA;
+  image_format.image_channel_data_type = CL_HALF_FLOAT;
+
+  cl_image_desc image_desc;
+  memset(&image_desc, 0, sizeof(image_desc));
+  image_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+  image_desc.image_width = (M * alignK)/4;
+  image_desc.buffer = input_buf;
+
+  cl_mem input_img = clCreateImage(
+    blas_cc->context_inst_.GetContext(),
+    CL_MEM_READ_ONLY,
+    &image_format,
+    &image_desc,
+    nullptr,
+    &err
+  );
+
+  if (err!=CL_SUCCESS){
+    throw std::runtime_error("Failed to create image1d_buffer for input_transposed");
+  }
+
+
+  input_buf = clCreateBuffer(
+    blas_cc->context_inst_.GetContext(),
+    CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+    input_size,
+    input_transposed,
+    &err
+  );
+
+  if (err!=CL_SUCCESS){
+    throw std::runtime_error("Failed to create input_transposed buffer");
+  }
+
+  image_format.image_channel_order = CL_RGBA;
+  image_format.image_channel_data_type = CL_HALF_FLOAT;
+
+  memset(&image_desc, 0, sizeof(image_desc));
+  image_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+  image_desc.image_width = (M * alignK)/4;
+  image_desc.buffer = input_buf;
+
+  cl_mem input_transposed_img = clCreateImage(
+    blas_cc->context_inst_.GetContext(),
+    CL_MEM_READ_ONLY,
+    &image_format,
+    &image_desc,
+    nullptr,
+    &err
+  );
+
+  if (err!=CL_SUCCESS){
+    throw std::runtime_error("Failed to create image1d_buffer for input_transposed");
+  }
+
+
+
   ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+    input_transpose_kernel, "input_transpose");
+  if (!kernel_ptr) {
+    throw std::runtime_error(
+      "Failed to get kernel_ptr for input_transpose");
+    return;
+  }
+
+  int arg = 0;
+
+  // result = kernel_ptr->SetKernelSVMArguments(arg++, input);
+  result = kernel_ptr->SetKernelArguments(arg++, &input_img, sizeof(cl_mem));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 0 for "
+                              "input_transpose");
+
+  // result = kernel_ptr->SetKernelSVMArguments(arg++, input_transposed);
+  result = kernel_ptr->SetKernelArguments(arg++, &input_transposed_img, sizeof(cl_mem));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 1 for "
+                              "input_transpose");
+  int alignK_4 = alignK>>2;
+  result = kernel_ptr->SetKernelArguments(arg++, &alignK_4, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 2 for input_transpose");
+
+  int M_4 = M>>2;
+  result = kernel_ptr->SetKernelArguments(arg++, &M_4, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 3 for input_transpose");
+
+  const int work_groups_count[3] = {(int) alignK_4, (int) M_4, 1};
+  const int work_group_size[3] = {1, 128, 1};
+
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size);
+  if (!result) {
+    throw std::runtime_error(
+      "Failed to dispatch kernel for input_transpose");
+    return;
+  }
+
+  blas_cc->command_queue_inst_.enqueueSVMMap(output, M * alignK * sizeof(uint16_t),
+                                            true);
+  if (!result) {
+    throw std::runtime_error(
+      "Failed to read output data for input_transpose");
+    return;
+  }
+
+
+
+  
+  kernel_ptr = blas_cc->registerClKernel(
     int4_gemm_adreno_kernel, "fully_connected_gpu_int4_gemm_adreno");
   if (!kernel_ptr) {
     throw std::runtime_error(
@@ -825,9 +963,9 @@ void gemm_int4_cl_adreno(void *input, void *weights, void *scales, void *output,
     return;
   }
 
-  int arg = 0;
+  arg = 0;
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, input);
+  result = kernel_ptr->SetKernelArguments(arg++, &input_transposed_img, sizeof(cl_mem));
   if (!result)
     throw std::runtime_error("Failed to set kernel argument 0 for "
                               "fully_connected_gpu_int4_gemm_adreno");
@@ -869,16 +1007,16 @@ void gemm_int4_cl_adreno(void *input, void *weights, void *scales, void *output,
     throw std::runtime_error(
       "Failed to set kernel argument 7 for fully_connected_gpu_int4_gemm_adreno");
       
-  const int work_groups_count[3] = {(int)align(ceilDiv(M,4),16), (int)align(ceilDiv(N,8),16), 1};
-  const int work_group_size[3] = {16, 16, 1}; // RTSM, RTSN
+  const int work_groups_count_mm[3] = {(int)ceilDiv(M,8), (int)N/4, 1};
+  const int work_group_size_mm[3] = {1, 128, 1}; // RTSM, RTSN
 
-    result = blas_cc->command_queue_inst_.DispatchCommand(
-      kernel_ptr, work_groups_count, work_group_size);
-    if (!result) {
-      throw std::runtime_error(
-        "Failed to dispatch kernel for fully_connected_gpu_int4_gemm_adreno");
-      return;
-    }
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count_mm, work_group_size_mm);
+  if (!result) {
+    throw std::runtime_error(
+      "Failed to dispatch kernel for fully_connected_gpu_int4_gemm_adreno");
+    return;
+  }
 
   blas_cc->command_queue_inst_.enqueueSVMMap(output, M * N * sizeof(uint16_t),
                                             true);
