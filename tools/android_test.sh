@@ -31,7 +31,9 @@ if [ ! -d $ANDROID_NDK ]; then
   exit 1
 fi
 
-cp -r $ANDROID_NDK/sources/third_party/googletest .
+if [ ! -d googletest ]; then
+  cp -r $ANDROID_NDK/sources/third_party/googletest .
+fi
 
 if [[ $enable_gpu -eq 1 ]]; then  
   ndk-build -j$(nproc) MESON_ENABLE_OPENCL=1

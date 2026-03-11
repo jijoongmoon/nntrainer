@@ -12,7 +12,7 @@ using namespace nntrainer;
 #define Q4_0 32
 
 static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K, 
-                                const uint32_t N, int scale_group_size, bool debug = false) {
+                                const uint32_t N, int scale_group_size) {
   auto *blas_cc = static_cast<nntrainer::ClContext *>(
     nntrainer::Engine::Global().getRegisteredContext("gpu"));
 
@@ -26,37 +26,36 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
 
 
 
-  if (debug){
-    float ones_ratio = 0.1f;
-    input_orig = generate_01_vector(M * K, ones_ratio);
-    weight_fp32 = generate_01_vector(N * K, ones_ratio);
-  }
-  else {
-    input_orig = generate_random_vector<float, false>(M * K, -1.0, 1.0);
-    weight_fp32 = generate_random_vector<float, false>(N * K, -1.0, 1.0);
-  }
+  #ifdef DEBUG
+  float ones_ratio = 0.1f;
+  input_orig = generate_01_vector(M * K, ones_ratio);
+  weight_fp32 = generate_01_vector(N * K, ones_ratio);
+  #else
+  input_orig = generate_random_vector<float, false>(M * K, -1.0, 1.0);
+  weight_fp32 = generate_random_vector<float, false>(N * K, -1.0, 1.0);
+  #endif
 
   std::vector<float> ref_dst(M * N, 0.0f);
   nntrainer::sgemm(0, false, true, M, N, K, 1.F, input_orig.data(), K,
                    weight_fp32.data(), K, 0.F, ref_dst.data(), N);
 
 
-  if (debug) {
-    for (int x = 0; x < M; x++) {
-      for (int y = 0; y < K; y++) {
-        printf("%4.0f ", input_orig[x * K + y]);
-      }
-      printf("\n");
+  #ifdef DEBUG
+  for (int x = 0; x < M; x++) {
+    for (int y = 0; y < K; y++) {
+      printf("%4.0f ", input_orig[x * K + y]);
     }
-    printf("---------------------------\n");
-    for (int x = 0; x < K; x++) {
-      for (int y = 0; y < N; y++) {
-        printf("%4.0f ", weight_fp32[y * K + x]);
-      }
-      printf("\n");
-    }
-    printf("---------------------------\n");
+    printf("\n");
   }
+  printf("---------------------------\n");
+  for (int x = 0; x < K; x++) {
+    for (int y = 0; y < N; y++) {
+      printf("%4.0f ", weight_fp32[y * K + x]);
+    }
+    printf("\n");
+  }
+  printf("---------------------------\n");
+  #endif
 
   std::vector<float> input(M *alignK, 0.0f);
   for (int x = 0; x < M; x++) {
@@ -66,12 +65,11 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
   }
 
   unsigned int run_count;
-  if (debug){
+  #ifdef DEBUG
     run_count = 1;
-  }
-  else{
+  #else
     run_count = 100;
-  }
+  #endif
 
   float mse_q4 = 0.0f;
 
@@ -86,12 +84,12 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
     nntrainer::repack_q4_0(q4_weight_repack.data(), q4_weight.data(),
                            q4_data_size, N, K);
 
-    if (not debug){
-      for (unsigned int i = 0; i < 10; ++i) {
-        nntrainer::gemm_q4_0(M, N, K, input.data(), K, q4_weight_repack.data(), N,
-                          q4_output_fp32.data(), N);
-      }
+    #ifndef DEBUG
+    for (unsigned int i = 0; i < 10; ++i) {
+      nntrainer::gemm_q4_0(M, N, K, input.data(), K, q4_weight_repack.data(), N,
+                        q4_output_fp32.data(), N);
     }
+    #endif
     auto t1 = std::chrono::high_resolution_clock::now();
     for (unsigned int i = 0; i < run_count; ++i) {
       nntrainer::gemm_q4_0(M, N, K, input.data(), K, q4_weight_repack.data(), N,
@@ -109,15 +107,15 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
 
   std::cout << "MSE int4: " << mse_q4 << std::endl;
 
-  if (debug) {
-    for (int x = 0; x < M; x++) {
-      for (int y = 0; y < N; y++) {
-        printf("%3.0f ",q4_output_fp32[x * N + y]);
-      }
-      printf("\n");
+  #ifdef DEBUG
+  for (int x = 0; x < M; x++) {
+    for (int y = 0; y < N; y++) {
+      printf("%3.0f ",q4_output_fp32[x * N + y]);
     }
-    printf("-------------------------------------------------\n");
+    printf("\n");
   }
+  printf("-------------------------------------------------\n");
+  #endif
 
   uint16_t *input_ptr = (uint16_t *)allocateSVM(M * alignK * sizeof(uint16_t));
   uint16_t *input_transpose_ptr = (uint16_t *)allocateSVM(M * alignK * sizeof(uint16_t));
@@ -137,7 +135,7 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
 
   std::vector<uint16_t> quantized_scales;
   std::vector<uint16_t> quantized_weights;
-  Int4Utils::quantizeAndRepackAdreno(weight_fp32.data(), N, K, scale_group_size,
+  Int4Utils::quantizeAndRepackSimpleLayout(weight_fp32.data(), N, K, scale_group_size,
                                quantized_weights, quantized_scales);
 
   for (unsigned int i = 0; i < M * alignK; ++i) {
@@ -157,12 +155,12 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
   blas_cc->command_queue_inst_.enqueueSVMUnmap(weight_ptr);
   blas_cc->command_queue_inst_.enqueueSVMUnmap(scale_ptr);
 
-  if (not debug){
-    for (unsigned int i = 0; i < 10; ++i) {
-      nntrainer::gemm_int4_cl_adreno(input_ptr, input_transpose_ptr, weight_ptr, scale_ptr, output_ptr, M,
-                                  N, K, scale_group_size);
-    }
+  #ifndef DEBUG
+  for (unsigned int i = 0; i < 10; ++i) {
+    nntrainer::gemm_int4_cl_adreno(input_ptr, input_transpose_ptr, weight_ptr, scale_ptr, output_ptr, M,
+                                N, K, scale_group_size);
   }
+  #endif
   auto t3 = std::chrono::high_resolution_clock::now();
   for (unsigned int i = 0; i < run_count; ++i) {
     nntrainer::gemm_int4_cl_adreno(input_ptr, input_transpose_ptr, weight_ptr, scale_ptr, output_ptr, M,
@@ -181,14 +179,14 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
   std::cout << " - time : GPU = " << gpu_dt / (run_count * 1.0f) << " ms"
             << std::endl <<"\n";
 
-  if (debug) {
-    for (int x = 0; x < M; x++) {
-      for (int y = 0; y < N; y++) {
-        printf("%3.0f ",output_fp32[x * N + y]);
-      }
-      printf("\n");
+  #ifdef DEBUG
+  for (int x = 0; x < M; x++) {
+    for (int y = 0; y < N; y++) {
+      printf("%3.0f ",output_fp32[x * N + y]);
     }
+    printf("\n");
   }
+  #endif
 
   float mse_int4_err =
     mse<float>(ref_dst.data(), output_fp32.data(), M*N);
@@ -208,14 +206,9 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
     run_int4_gemm_adreno_test_(M, K, N, G);                                           \
   }
 
-#define DECLARE_int4_gemm_adreno_test_M_K_N_DEBUG(M, K, N, G)                               \
-  TEST(nntrainer_opencl_adreno_kernels_int4,                                          \
-       int4_gemm_adreno_test_##M##_##K##_##N##_Group##G) {                            \
-    run_int4_gemm_adreno_test_(M, K, N, G, true);                                           \
-  }
-
-DECLARE_int4_gemm_adreno_test_M_K_N_DEBUG(32, 32, 32, 32);
-
+#ifdef DEBUG
+DECLARE_int4_gemm_adreno_test_M_K_N(32, 32, 32, 32);
+#else
 DECLARE_int4_gemm_adreno_test_M_K_N(1024, 1024, 1024, 32);
 DECLARE_int4_gemm_adreno_test_M_K_N(1028, 1024, 1024, 32);
 DECLARE_int4_gemm_adreno_test_M_K_N(1024, 1028, 1024, 32);
@@ -223,6 +216,7 @@ DECLARE_int4_gemm_adreno_test_M_K_N(1024, 1024, 1028, 32);
 DECLARE_int4_gemm_adreno_test_M_K_N(4096, 1024, 1024, 32);
 DECLARE_int4_gemm_adreno_test_M_K_N(1024, 4096, 4096, 32);
 DECLARE_int4_gemm_adreno_test_M_K_N(4096, 4096, 4096, 32);
+#endif
 
 
 GTEST_API_ int main(int argc, char **argv) {

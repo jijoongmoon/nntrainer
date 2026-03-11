@@ -956,10 +956,10 @@ void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, voi
 
   
   kernel_ptr = blas_cc->registerClKernel(
-    int4_gemm_adreno_kernel, "fully_connected_gpu_int4_gemm_adreno");
+    int4_gemm_adreno_kernel, "gpu_int4_gemm_adreno");
   if (!kernel_ptr) {
     throw std::runtime_error(
-      "Failed to get kernel_ptr for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to get kernel_ptr for gpu_int4_gemm_adreno");
     return;
   }
 
@@ -968,44 +968,44 @@ void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, voi
   result = kernel_ptr->SetKernelArguments(arg++, &input_transposed_img, sizeof(cl_mem));
   if (!result)
     throw std::runtime_error("Failed to set kernel argument 0 for "
-                              "fully_connected_gpu_int4_gemm_adreno");
+                              "gpu_int4_gemm_adreno");
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, scales);
   if (!result)
     throw std::runtime_error(
-      "Failed to set kernel argument 1 for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to set kernel argument 1 for gpu_int4_gemm_adreno");
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, output);
 
   if (!result)
     throw std::runtime_error(
-      "Failed to set kernel argument 2 for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to set kernel argument 2 for gpu_int4_gemm_adreno");
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, weights);
   if (!result)
     throw std::runtime_error(
-      "Failed to set kernel argument 3 for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to set kernel argument 3 for gpu_int4_gemm_adreno");
 
   result = kernel_ptr->SetKernelArguments(arg++, &K, sizeof(int));
   if (!result)
     throw std::runtime_error(
-      "Failed to set kernel argument 4 for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to set kernel argument 4 for gpu_int4_gemm_adreno");
 
   result = kernel_ptr->SetKernelArguments(arg++, &N, sizeof(int));
   if (!result)
     throw std::runtime_error(
-      "Failed to set kernel argument 5 for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to set kernel argument 5 for gpu_int4_gemm_adreno");
 
   result = kernel_ptr->SetKernelArguments(arg++, &M, sizeof(int));
   if (!result)
     throw std::runtime_error(
-      "Failed to set kernel argument 6 for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to set kernel argument 6 for gpu_int4_gemm_adreno");
 
   int q_group_size = quantization_group_size;
   result = kernel_ptr->SetKernelArguments(arg++, &q_group_size, sizeof(int));
   if (!result)
     throw std::runtime_error(
-      "Failed to set kernel argument 7 for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to set kernel argument 7 for gpu_int4_gemm_adreno");
       
   const int work_groups_count_mm[3] = {(int)ceilDiv(M,8), (int)N/4, 1};
   const int work_group_size_mm[3] = {1, 128, 1}; // RTSM, RTSN
@@ -1014,7 +1014,7 @@ void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, voi
       kernel_ptr, work_groups_count_mm, work_group_size_mm);
   if (!result) {
     throw std::runtime_error(
-      "Failed to dispatch kernel for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to dispatch kernel for gpu_int4_gemm_adreno");
     return;
   }
 
@@ -1022,7 +1022,7 @@ void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, voi
                                             true);
   if (!result) {
     throw std::runtime_error(
-      "Failed to read output data for fully_connected_gpu_int4_gemm_adreno");
+      "Failed to read output data for gpu_int4_gemm_adreno");
     return;
   }
 }

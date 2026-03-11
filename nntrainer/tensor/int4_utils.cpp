@@ -83,25 +83,13 @@ void Int4Utils::computeScales(const float *weights, const size_t rows_count,
 uint8_t Int4Utils::pack(const float *weights, const float *scales,
                         const size_t row_id, const size_t column_id,
                         const size_t groups_per_row, const size_t group_size,
-                        const size_t rows_count, const size_t columns_count) {
+                        const size_t rows_count, const size_t columns_count, const bool convert_with_add8) {
   {
     const auto rows_count_pad = align(rows_count, ROW_BLOCK_SIZE);
     const float scale =
       scales[row_id + ((column_id / group_size) * rows_count_pad)];
     const float weight = weights[(row_id * columns_count) + column_id];
-    return quantizeToInt4(weight, scale);
-  }
-}
-
-uint8_t Int4Utils::pack_adreno(const float *weights, const float *scales,
-                        const size_t n_id, const size_t k_id, const size_t group_size,
-                        const size_t N, const size_t K) {
-  {
-    const auto alignN = align(N, ROW_BLOCK_SIZE);
-    const float scale =
-      scales[n_id + ((k_id / group_size) * alignN)];
-    const float weight = weights[(n_id * K) + k_id];
-    return quantizeToInt4(weight, scale, true);
+    return quantizeToInt4(weight, scale, convert_with_add8);
   }
 }
 
@@ -176,7 +164,7 @@ void Int4Utils::quantizeAndRepack(const float *weights, const size_t rows_count,
   }
 }
 
-void Int4Utils::quantizeAndRepackAdreno(const float *weights, const size_t N,
+void Int4Utils::quantizeAndRepackSimpleLayout(const float *weights, const size_t N,
                                   const size_t K,
                                   const size_t group_size,
                                   std::vector<uint16_t> &out_weights,
@@ -216,16 +204,16 @@ void Int4Utils::quantizeAndRepackAdreno(const float *weights, const size_t N,
       if (n < N) {
         const auto k_id = k * COLUMN_BLOCK_SIZE_ADRENO;
         if (k_id < K) {
-          bits0 = pack_adreno(weights, scales_fp32.data(), n_id, k_id, group_size, N, K);
+          bits0 = pack(weights, scales_fp32.data(), n_id, k_id, 0, group_size, N, K,true);
         }
         if (k_id+1 < K) {
-          bits1 = pack_adreno(weights, scales_fp32.data(), n_id, k_id+1, group_size, N, K);
+          bits1 = pack(weights, scales_fp32.data(), n_id, k_id+1, 0, group_size, N, K,true);
         }
         if (k_id+2 < K) {
-          bits2 = pack_adreno(weights, scales_fp32.data(), n_id, k_id+2, group_size, N, K);
+          bits2 = pack(weights, scales_fp32.data(), n_id, k_id+2, 0, group_size, N, K,true);
         }
         if (k_id+3 < K) {
-          bits3 = pack_adreno(weights, scales_fp32.data(), n_id, k_id+3, group_size, N, K);
+          bits3 = pack(weights, scales_fp32.data(), n_id, k_id+3, 0, group_size, N, K,true);
         }
       }
 
@@ -235,6 +223,9 @@ void Int4Utils::quantizeAndRepackAdreno(const float *weights, const size_t N,
 }
 
 uint8_t Int4Utils::quantizeToInt4(const float weight, const float scale, bool convert_with_add8) {
+  // convert_with_add8=true : [-8,-7,...,7] -> [0,1,2,...15]
+  // convert_with_add8=false : [-8,-7,..,-1,0,1,...,7] -> [8,9,...,15,0,1,...,7]
+
   auto div = std::nearbyintf(weight / scale);
 
   if (std::isnan(div)) {
