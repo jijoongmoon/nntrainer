@@ -74,10 +74,26 @@ def _is_rmsnorm(module):
 
     HuggingFace models define their own RMSNorm classes with model-specific
     prefixes (LlamaRMSNorm, Qwen2RMSNorm, MistralRMSNorm, etc.).
-    We detect them by class name pattern.
+
+    T5/mT5 use classes named *LayerNorm (T5LayerNorm, MT5LayerNorm) but these
+    are actually RMSNorm (no mean subtraction, no bias). We detect them by
+    checking for variance_epsilon attribute AND absence of bias parameter.
     """
     cls_name = type(module).__name__
-    return "RMSNorm" in cls_name or "rmsnorm" in cls_name.lower()
+
+    # Direct RMSNorm naming
+    if "RMSNorm" in cls_name or "rmsnorm" in cls_name.lower():
+        return True
+
+    # T5/mT5 style: named *LayerNorm but is actually RMSNorm
+    # Detected by: has variance_epsilon, has weight, but NO bias parameter
+    if hasattr(module, "variance_epsilon") and hasattr(module, "weight"):
+        # True LayerNorm has bias; T5LayerNorm does not
+        has_bias = any(name == "bias" for name, _ in module.named_parameters())
+        if not has_bias:
+            return True
+
+    return False
 
 
 def _build_leaf_check(leaf_modules):

@@ -1,0 +1,252 @@
+"""Test tracer and node mapper with multiple architectures:
+  1. Encoder-only: BERT
+  2. Encoder-decoder: mT5
+  3. Sentence transformer / KaLM-style: Qwen2 (base of KaLM-Embedding)
+"""
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+from tracer import Tracer
+from node_mapper import NodeMapper
+
+
+def test_bert():
+    """Test encoder-only: BERT"""
+    from transformers import BertConfig, BertModel
+
+    print("=" * 70)
+    print("TEST: BERT (Encoder-only)")
+    print("=" * 70)
+
+    config = BertConfig(
+        vocab_size=30522,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=128,
+        max_position_embeddings=512,
+        type_vocab_size=2,
+    )
+    model = BertModel(config)
+    model.eval()
+
+    # Show architecture
+    print("\n--- Model Architecture ---")
+    for name, module in model.named_modules():
+        if name.count(".") <= 2:
+            print(f"  {name}: {type(module).__name__}")
+
+    # Trace
+    input_ids = torch.randint(0, config.vocab_size, (1, 16))
+    attention_mask = torch.ones(1, 16, dtype=torch.long)
+
+    tracer = Tracer(model)
+    with tracer:
+        with torch.no_grad():
+            out = model(input_ids, attention_mask=attention_mask)
+
+    tracer.print_graph_summary()
+
+    # Map
+    mapper = NodeMapper(model, tracer.graph, config)
+    layers = mapper.map_all()
+
+    type_counts = {}
+    for layer in layers:
+        type_counts[layer.layer_type] = type_counts.get(layer.layer_type, 0) + 1
+
+    print(f"\nTotal mapped layers: {len(layers)}")
+    print(f"Layer type counts: {type_counts}")
+
+    # Print leaf module layers
+    print("\n--- Key Leaf Module Layers ---")
+    for layer in layers:
+        if layer.hf_module_name:
+            props_str = ", ".join(f"{k}={v}" for k, v in layer.properties.items())
+            print(f"  {layer.layer_type:25s} {layer.name:50s} {{{props_str}}}")
+
+    # Verify BERT-specific structures
+    assert "embedding_layer" in type_counts, "BERT should have embeddings"
+    assert "fully_connected" in type_counts, "BERT should have FC layers (attention projections)"
+    assert "layer_normalization" in type_counts, "BERT should have LayerNorm (not RMSNorm)"
+
+    # BERT has LayerNorm, not RMSNorm
+    assert "rms_norm" not in type_counts, "BERT should NOT have RMSNorm"
+
+    print("\nBERT: PASSED!\n")
+    return layers
+
+
+def test_mt5():
+    """Test encoder-decoder: mT5"""
+    from transformers import MT5Config, MT5ForConditionalGeneration
+
+    print("=" * 70)
+    print("TEST: mT5 (Encoder-Decoder)")
+    print("=" * 70)
+
+    config = MT5Config(
+        vocab_size=250112,
+        d_model=64,
+        d_kv=16,
+        d_ff=128,
+        num_heads=4,
+        num_layers=2,
+        num_decoder_layers=2,
+        is_encoder_decoder=True,
+        relative_attention_num_buckets=32,
+        relative_attention_max_distance=128,
+        tie_word_embeddings=False,
+    )
+    model = MT5ForConditionalGeneration(config)
+    model.eval()
+
+    # Show architecture
+    print("\n--- Model Architecture (top-level) ---")
+    for name, module in model.named_modules():
+        if name.count(".") <= 2:
+            print(f"  {name}: {type(module).__name__}")
+
+    # Trace - encoder-decoder needs both input_ids and decoder_input_ids
+    input_ids = torch.randint(0, config.vocab_size, (1, 8))
+    decoder_input_ids = torch.randint(0, config.vocab_size, (1, 4))
+
+    tracer = Tracer(model)
+    with tracer:
+        with torch.no_grad():
+            out = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
+
+    tracer.print_graph_summary()
+
+    # Map
+    mapper = NodeMapper(model, tracer.graph, config)
+    layers = mapper.map_all()
+
+    type_counts = {}
+    for layer in layers:
+        type_counts[layer.layer_type] = type_counts.get(layer.layer_type, 0) + 1
+
+    print(f"\nTotal mapped layers: {len(layers)}")
+    print(f"Layer type counts: {type_counts}")
+
+    # Print encoder vs decoder layers
+    print("\n--- Key Layers (Encoder) ---")
+    for layer in layers:
+        if layer.hf_module_name and "encoder" in layer.hf_module_name:
+            if layer.layer_type in ("fully_connected", "rms_norm", "layer_normalization", "embedding_layer"):
+                print(f"  {layer.layer_type:25s} {layer.hf_module_name}")
+
+    print("\n--- Key Layers (Decoder) ---")
+    for layer in layers:
+        if layer.hf_module_name and "decoder" in layer.hf_module_name:
+            if layer.layer_type in ("fully_connected", "rms_norm", "layer_normalization", "embedding_layer"):
+                print(f"  {layer.layer_type:25s} {layer.hf_module_name}")
+
+    # Verify encoder-decoder structure
+    assert "fully_connected" in type_counts, "mT5 should have FC layers"
+    assert "embedding_layer" in type_counts, "mT5 should have embeddings"
+
+    # mT5 uses RMSNorm (T5LayerNorm is actually RMSNorm)
+    # Check for either rms_norm or layer_normalization
+    has_norm = "rms_norm" in type_counts or "layer_normalization" in type_counts
+    assert has_norm, "mT5 should have normalization layers"
+
+    # Encoder-decoder should have cross-attention layers
+    encoder_fc = [l for l in layers if l.hf_module_name and "encoder" in l.hf_module_name and l.layer_type == "fully_connected"]
+    decoder_fc = [l for l in layers if l.hf_module_name and "decoder" in l.hf_module_name and l.layer_type == "fully_connected"]
+    print(f"\nEncoder FC layers: {len(encoder_fc)}")
+    print(f"Decoder FC layers: {len(decoder_fc)}")
+
+    # Decoder should have more FC layers than encoder (self-attn + cross-attn + FFN)
+    assert len(decoder_fc) > len(encoder_fc), \
+        f"Decoder ({len(decoder_fc)} FC) should have more FC than encoder ({len(encoder_fc)} FC) due to cross-attention"
+
+    print("\nmT5: PASSED!\n")
+    return layers
+
+
+def test_qwen2_embedding():
+    """Test sentence transformer / KaLM-style: Qwen2 base model.
+
+    KaLM-Embedding is based on Qwen2 with bidirectional attention.
+    We test Qwen2Model (base, not ForCausalLM) to simulate this.
+    """
+    from transformers import Qwen2Config, Qwen2Model
+
+    print("=" * 70)
+    print("TEST: Qwen2 base model (KaLM-Embedding style)")
+    print("=" * 70)
+
+    config = Qwen2Config(
+        vocab_size=151936,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=2048,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=True,
+        rope_theta=1000000.0,
+        sliding_window=None,
+    )
+    model = Qwen2Model(config)
+    model.eval()
+
+    print("\n--- Model Architecture ---")
+    for name, module in model.named_modules():
+        if name.count(".") <= 2:
+            print(f"  {name}: {type(module).__name__}")
+
+    # Trace
+    input_ids = torch.randint(0, config.vocab_size, (1, 8))
+
+    tracer = Tracer(model)
+    with tracer:
+        with torch.no_grad():
+            out = model(input_ids)
+
+    tracer.print_graph_summary()
+
+    # Map
+    mapper = NodeMapper(model, tracer.graph, config)
+    layers = mapper.map_all()
+
+    type_counts = {}
+    for layer in layers:
+        type_counts[layer.layer_type] = type_counts.get(layer.layer_type, 0) + 1
+
+    print(f"\nTotal mapped layers: {len(layers)}")
+    print(f"Layer type counts: {type_counts}")
+
+    print("\n--- Key Leaf Module Layers ---")
+    for layer in layers:
+        if layer.hf_module_name:
+            props_str = ", ".join(f"{k}={v}" for k, v in layer.properties.items())
+            print(f"  {layer.layer_type:25s} {layer.hf_module_name:50s} {{{props_str}}}")
+
+    # Verify Qwen2 structure (similar to Qwen3 but no Q/K norms)
+    assert "embedding_layer" in type_counts
+    assert "fully_connected" in type_counts
+    assert "rms_norm" in type_counts
+    # Qwen2 has RMSNorm, not LayerNorm
+    assert "layer_normalization" not in type_counts
+
+    print("\nQwen2 (KaLM-style): PASSED!\n")
+    return layers
+
+
+if __name__ == "__main__":
+    print("\n" + "#" * 70)
+    print("# Multi-Architecture Tracer + Node Mapper Validation")
+    print("#" * 70 + "\n")
+
+    test_bert()
+    test_mt5()
+    test_qwen2_embedding()
+
+    print("=" * 70)
+    print("ALL ARCHITECTURE TESTS PASSED!")
+    print("=" * 70)
