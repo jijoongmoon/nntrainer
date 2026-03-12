@@ -75,42 +75,126 @@ NNTrainer examples for a variety of networks
 
 This component defines layers which consist of a neural network model. Layers have their own properties to be set.
 
+#### Neural Network Layers
+
  | Keyword | Layer Class Name | Description |
  |:-------:|:---:|:---|
- | conv1d | Conv1DLayer | Convolution 1-Dimentional Layer |
- | conv2d | Conv2DLayer |Convolution 2-Dimentional Layer |
- | pooling2d | Pooling2DLayer |Pooling 2-Dimentional Layer. Support average / max / global average / global max pooling |
+ | conv1d | Conv1DLayer | Convolution 1-Dimensional Layer |
+ | conv2d | Conv2DLayer | Convolution 2-Dimensional Layer |
+ | conv2dtranspose | Conv2DTransposeLayer | Transposed Convolution 2-Dimensional Layer |
+ | depthwiseconv2d | DepthwiseConv2DLayer | Depthwise Convolution 2-Dimensional Layer |
+ | pooling2d | Pooling2DLayer | Pooling 2-Dimensional Layer. Support average / max / global average / global max pooling |
  | flatten | FlattenLayer | Flatten layer |
  | fully_connected | FullyConnectedLayer | Fully connected layer |
- | input | InputLayer | Input Layer.  This is not always required. |
+ | input | InputLayer | Input Layer. This is not always required |
  | batch_normalization | BatchNormalizationLayer | Batch normalization layer |
  | layer_normalization | LayerNormalizationLayer | Layer normalization layer |
  | activation | ActivationLayer | Set by layer property |
- | addition | AdditionLayer | Add input input layers |
- | attention | AttentionLayer | Attenstion layer |
- | centroid_knn | CentroidKNN | Centroid K-nearest neighbor layer |
- | concat | ConcatLayer | Concatenate input layers |
- | multiout | MultiOutLayer | Multi-Output Layer |
- | backbone_nnstreamer | NNStreamerLayer | Encapsulate NNStreamer layer |
- | backbone_tflite | TfLiteLayer | Encapsulate tflite as a layer |
- | permute | PermuteLayer | Permute layer for transpose |
- | preprocess_flip | PreprocessFlipLayer | Preprocess random flip layer |
- | preprocess_l2norm | PreprocessL2NormLayer | Preprocess simple l2norm layer to normalize |
- | preprocess_translate | PreprocessTranslateLayer | Preprocess translate layer |
- | reshape | ReshapeLayer | Reshape tensor dimension layer |
- | split | SplitLayer | Split layer |
  | dropout | DropOutLayer | Dropout Layer |
  | embedding | EmbeddingLayer | Embedding Layer |
  | positional_encoding | PositionalEncodingLayer | Positional Encoding Layer |
+
+#### Recurrent Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
  | rnn | RNNLayer | Recurrent Layer |
  | rnncell | RNNCellLayer | Recurrent Cell Layer |
  | gru | GRULayer | Gated Recurrent Unit Layer |
  | grucell | GRUCellLayer | Gated Recurrent Unit Cell Layer |
  | lstm | LSTMLayer | Long Short-Term Memory Layer |
  | lstmcell | LSTMCellLayer | Long Short-Term Memory Cell Layer |
- | zoneoutlstmcell | ZoneoutLSTMCellLayer | Zoneout Long Short-Term Memory Cell Layer |
+ | zoneout_lstmcell | ZoneoutLSTMCellLayer | Zoneout Long Short-Term Memory Cell Layer |
  | time_dist | TimeDistLayer | Time distributed Layer |
+
+#### Attention Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
+ | attention | AttentionLayer | Attention layer |
  | multi_head_attention | MultiHeadAttentionLayer | Multi Head Attention Layer |
+ | mol_attention | MolAttentionLayer | Mixture of Logistic Attention Layer |
+
+#### Tensor Operation Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
+ | add | AddLayer | Element-wise addition layer |
+ | addition | AdditionLayer | Add input layers |
+ | subtract | SubtractLayer | Element-wise subtraction layer |
+ | multiply | MultiplyLayer | Element-wise multiplication layer |
+ | divide | DivideLayer | Element-wise division layer |
+ | negative | NegativeLayer | Unary negation layer |
+ | matmul | MatMulLayer | Matrix multiplication layer |
+ | gather | GatherLayer | Gather (indexing) layer |
+ | cast | CastLayer | Type casting layer |
+
+#### Mathematical Function Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
+ | sin | SineLayer | Sine function layer |
+ | cos | CosineLayer | Cosine function layer |
+ | tan | TangentLayer | Tangent function layer |
+ | sqrt | SQRTLayer | Square root function layer |
+ | pow | PowLayer | Power/exponentiation function layer |
+
+#### Reduction Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
+ | reduce_mean | ReduceMeanLayer | Mean reduction across dimensions |
+ | reduce_sum | ReduceSumLayer | Sum reduction across dimensions |
+
+#### Shape Manipulation Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
+ | reshape | ReshapeLayer | Reshape tensor dimension layer |
+ | permute | PermuteLayer | Permute layer for transpose |
+ | flatten | FlattenLayer | Flatten layer |
+ | slice | SliceLayer | Slice layer to extract tensor portions |
+ | concat | ConcatLayer | Concatenate input layers |
+ | split | SplitLayer | Split layer |
+ | upsample2d | Upsample2dLayer | 2D upsampling layer |
+
+#### Utility Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
+ | identity | IdentityLayer | Identity layer (pass-through) |
+ | weight | WeightLayer | Trainable weight tensor layer |
+ | tensor | TensorLayer | QNN Tensor layer |
+ | multiout | MultiOutLayer | Multi-Output Layer |
+ | centroid_knn | CentroidKNN | Centroid K-nearest neighbor layer |
+ | channel_shuffle | ChannelShuffle | Channel shuffle layer |
+
+#### Preprocessing Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
+ | preprocess_flip | PreprocessFlipLayer | Preprocess random flip layer |
+ | preprocess_l2norm | PreprocessL2NormLayer | Preprocess simple l2norm layer to normalize |
+ | preprocess_translate | PreprocessTranslateLayer | Preprocess translate layer |
+
+#### Backbone Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
+ | backbone_nnstreamer | NNStreamerLayer | Encapsulate NNStreamer layer |
+ | backbone_tflite | TfLiteLayer | Encapsulate tflite as a layer |
+
+#### OpenCL Accelerated Layers
+
+ | Keyword | Layer Class Name | Description |
+ |:-------:|:---:|:---|
+ | fully_connected | FullyConnectedLayerCl | Fully connected layer (OpenCL) |
+ | reshape | ReshapeLayerCl | Reshape layer (OpenCL) |
+ | concat | ConcatLayerCl | Concatenation layer (OpenCL) |
+ | addition | AdditionLayerCl | Addition layer (OpenCL) |
+ | transpose | TransposeLayerCl | Transpose layer (OpenCL) |
+ | swiglu | SwiGLULayerCl | SwiGLU activation layer (OpenCL) |
+ | rmsnorm | RMSNormLayerCl | RMS Normalization layer (OpenCL) |
 
 
 ### Supported Optimizers
@@ -135,6 +219,7 @@ NNTrainer provides
 
  | Keyword | Class Name | Description |
  |:-------:|:---:|:---:|
+ | cross | CrossEntropyLossLayer | Cross entropy loss layer |
  | cross_sigmoid | CrossEntropySigmoidLossLayer | Cross entropy sigmoid loss layer |
  | cross_softmax | CrossEntropySoftmaxLossLayer | Cross entropy softmax loss layer |
  | constant_derivative | ConstantDerivativeLossLayer | Constant derivative loss layer |
@@ -162,17 +247,38 @@ NNTrainer provides
 
 ### Tensor
 
-Tensor is responsible for calculation of a layer. It executes several operations such as addition, division, multiplication, dot production, data averaging and so on. In order to accelerate  calculation speed, CBLAS (C-Basic Linear Algebra: CPU) and CUBLAS (CUDA: Basic Linear Algebra) for PC (Especially NVIDIA GPU) are implemented for some of the operations. Later, these calculations will be optimized.
+Tensor is responsible for calculation of a layer. It executes several operations such as addition, division, multiplication, dot production, data averaging and so on. In order to accelerate calculation speed, CBLAS (C-Basic Linear Algebra: CPU) and CUBLAS (CUDA: Basic Linear Algebra) for PC (Especially NVIDIA GPU) are implemented for some of the operations. Later, these calculations will be optimized.
 Currently, we support lazy calculation mode to reduce complexity for copying tensors during calculations.
 
- | Keyword | Description |
- |:-------:|:---:|
- | 4D Tensor | B, C, H, W|
- | Add/sub/mul/div | - |
- | sum, average, argmax | - |
- | Dot, Transpose | - |
- | normalization, standardization | - |
- | save, read | - |
+#### Supported Data Types
+
+ | Type | Description |
+ |:----:|:---|
+ | FP32 | 32-bit floating point (FloatTensor) |
+ | FP16 | 16-bit floating point (HalfTensor) |
+ | Quantized | QInt4, QInt8, QInt16, Q4K, Q6K, UINT4, UINT8 |
+
+#### Supported Formats
+
+ | Format | Description |
+ |:------:|:---|
+ | NCHW | Batch, Channel, Height, Width (default) |
+ | NHWC | Batch, Height, Width, Channel |
+
+#### Tensor Operations
+
+ | Category | Operations |
+ |:--------:|:---|
+ | Shape | 4D Tensor (B, C, H, W), reshape, transpose, split, concat/cat |
+ | Arithmetic (element-wise) | add, subtract, multiply, divide (with in-place and strided variants) |
+ | Linear Algebra | dot, dotBatched (with transpose flags and beta scaling), derivative support |
+ | Reduction | sum (single/multi axis, by batch), average, max/min, argmax, argmin, topK |
+ | Mathematical Functions | pow, sqrt, inv_sqrt, abs, erf, sin, cos, tan |
+ | Normalization | normalization, standardization, l2norm |
+ | Masking | dropout_mask, zoneout_mask, filter_mask |
+ | Initialization | setZero, setValue, setRandNormal, setRandUniform, setRandBernoulli, Xavier/LeCun/HE initializers |
+ | Data Management | save, read, copy, clone, getBatchSlice, getSharedDataTensor |
+ | Function Application | apply (element-wise function), chain (lazy evaluation) |
 
 ### Others
 
