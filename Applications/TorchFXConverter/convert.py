@@ -3,20 +3,19 @@
 """
 TorchFX to NNTrainer Converter CLI.
 
-Converts HuggingFace PyTorch models to NNTrainer format.
+Converts any HuggingFace CausalLM model to NNTrainer format by inspecting
+the model's module hierarchy — no per-model converter files needed.
 
 Usage:
     python convert.py --model Qwen/Qwen3-0.6B --output ./output/
+    python convert.py --model google/gemma-3-1b --output ./output/
 
     # With custom runtime params:
     python convert.py --model Qwen/Qwen3-0.6B --output ./output/ \
         --init-seq-len 1024 --num-to-generate 512 --max-seq-len 2048
 
-    # Generate weight converter only (no model download needed):
+    # From local config file (config-only mode, no model download):
     python convert.py --model Qwen/Qwen3-0.6B --output ./output/ --config-only
-
-    # From local config file:
-    python convert.py --config ./config.json --output ./output/
 """
 
 import argparse
@@ -24,49 +23,39 @@ import json
 import os
 import sys
 
-from qwen3_converter import (
-    Qwen3Config,
-    generate_qwen3_layers,
-    generate_nntr_config,
+from model_inspector import (
+    inspect_model,
+    generate_layers,
     generate_weight_order,
+    generate_nntr_config,
     generate_weight_converter_script,
 )
 
 
-def detect_architecture(hf_config) -> str:
-    """Detect the model architecture from HuggingFace config."""
-    architectures = getattr(hf_config, "architectures", None) or []
-    model_type = getattr(hf_config, "model_type", "") or ""
-
-    if "Qwen3ForCausalLM" in architectures or model_type == "qwen3":
-        return "qwen3"
-
-    return "unknown"
-
-
-def convert_qwen3(hf_config, args, output_dir):
-    """Convert a Qwen3 model."""
-    cfg = Qwen3Config.from_hf_config(hf_config)
+def convert_model(model, args, output_dir):
+    """Convert any HuggingFace CausalLM model to NNTrainer format."""
+    # Inspect model structure generically
+    structure = inspect_model(model)
 
     # Override with CLI args
     if args.init_seq_len:
-        cfg.init_seq_len = args.init_seq_len
+        structure.init_seq_len = args.init_seq_len
     if args.num_to_generate:
-        cfg.num_to_generate = args.num_to_generate
+        structure.num_to_generate = args.num_to_generate
     if args.max_seq_len:
-        cfg.max_seq_len = args.max_seq_len
+        structure.max_seq_len = args.max_seq_len
     if args.batch_size:
-        cfg.batch_size = args.batch_size
+        structure.batch_size = args.batch_size
     if args.fc_dtype:
-        cfg.fc_layer_dtype = args.fc_dtype
+        structure.fc_layer_dtype = args.fc_dtype
     if args.embedding_dtype:
-        cfg.embedding_dtype = args.embedding_dtype
+        structure.embedding_dtype = args.embedding_dtype
 
-    model_name = args.model.split("/")[-1] if args.model else "qwen3"
+    model_name = args.model.split("/")[-1] if args.model else "model"
     safe_name = model_name.lower().replace("-", "_")
 
     # 1. Generate NNTrainer layers
-    layers = generate_qwen3_layers(cfg)
+    layers = generate_layers(structure)
     print(f"Generated {len(layers)} NNTrainer layers")
 
     # 2. Save layer definitions as JSON
@@ -80,7 +69,7 @@ def convert_qwen3(hf_config, args, output_dir):
     tokenizer_file = args.tokenizer_file or f"/path/to/{model_name}/tokenizer.json"
     sample_input = args.sample_input or ""
     nntr_config = generate_nntr_config(
-        cfg,
+        structure,
         model_file=f"nntr_{safe_name}_fp32.bin",
         tokenizer_file=tokenizer_file,
         sample_input=sample_input,
@@ -91,14 +80,14 @@ def convert_qwen3(hf_config, args, output_dir):
     print(f"Saved nntr_config.json to {config_path}")
 
     # 4. Generate weight conversion order
-    weight_order = generate_weight_order(cfg)
+    weight_order = generate_weight_order(structure)
     weight_order_path = os.path.join(output_dir, "weight_order.json")
     with open(weight_order_path, "w") as f:
         json.dump(weight_order, f, indent=2)
     print(f"Saved weight order to {weight_order_path}")
 
     # 5. Generate weight converter script
-    script = generate_weight_converter_script(cfg, model_name)
+    script = generate_weight_converter_script(structure, model_name)
     script_path = os.path.join(output_dir, "weight_converter.py")
     with open(script_path, "w") as f:
         f.write(script)
@@ -121,14 +110,20 @@ def convert_qwen3(hf_config, args, output_dir):
     # Summary
     print(f"\n{'='*60}")
     print(f"Conversion complete for {model_name}")
-    print(f"  Architecture: Qwen3 CausalLM")
-    print(f"  Hidden size: {cfg.hidden_size}")
-    print(f"  Layers: {cfg.num_hidden_layers}")
-    print(f"  Attention heads: {cfg.num_attention_heads} (KV: {cfg.num_key_value_heads})")
-    print(f"  Head dim: {cfg.head_dim}")
-    print(f"  Intermediate size: {cfg.intermediate_size}")
-    print(f"  Vocab size: {cfg.vocab_size}")
-    print(f"  Tie embeddings: {cfg.tie_word_embeddings}")
+    print(f"  Hidden size: {structure.hidden_size}")
+    print(f"  Layers: {structure.num_layers}")
+    print(f"  Attention heads: {structure.num_attention_heads} "
+          f"(KV: {structure.num_key_value_heads})")
+    print(f"  Head dim: {structure.head_dim}")
+    print(f"  Intermediate size: {structure.intermediate_size}")
+    print(f"  Vocab size: {structure.vocab_size}")
+    print(f"  Tie embeddings: {structure.tie_word_embeddings}")
+    if structure.layers:
+        info = structure.layers[0]
+        print(f"  Q/K norms: {info.has_qk_norm}")
+        print(f"  Activation: {info.mlp_activation}")
+        if info.has_post_attn_norm:
+            print(f"  Post-attention norm: yes (Gemma3 style)")
     print(f"  NNTrainer layers: {len(layers)}")
     print(f"  Weight entries: {len(weight_order)}")
     print(f"\nOutput files in {output_dir}/:")
@@ -142,7 +137,7 @@ def convert_qwen3(hf_config, args, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert HuggingFace PyTorch models to NNTrainer format",
+        description="Convert HuggingFace CausalLM models to NNTrainer format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -180,27 +175,32 @@ def main():
     # Create output directory
     os.makedirs(args.output, exist_ok=True)
 
-    # Load config
+    # Load model
+    from transformers import AutoModelForCausalLM, AutoConfig
+
     if args.config:
-        from transformers import AutoConfig
         hf_config = AutoConfig.from_pretrained(args.config)
     else:
-        from transformers import AutoConfig
         hf_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
 
-    # Detect architecture
-    arch = detect_architecture(hf_config)
-    print(f"Detected architecture: {arch}")
-
-    if arch == "qwen3":
-        convert_qwen3(hf_config, args, args.output)
+    if args.config_only:
+        # Config-only mode: create model from config without downloading weights
+        model = AutoModelForCausalLM.from_config(hf_config, trust_remote_code=True)
     else:
-        print(f"Error: Unsupported architecture '{arch}'")
-        print(f"  model_type: {getattr(hf_config, 'model_type', 'unknown')}")
-        print(f"  architectures: {getattr(hf_config, 'architectures', [])}")
-        print(f"\nCurrently supported: qwen3")
-        sys.exit(1)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model or args.config,
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+        )
+
+    model.eval()
+
+    model_type = getattr(hf_config, "model_type", "unknown")
+    print(f"Loaded model: {args.model or args.config} (type: {model_type})")
+
+    convert_model(model, args, args.output)
 
 
 if __name__ == "__main__":
+    import torch
     main()
