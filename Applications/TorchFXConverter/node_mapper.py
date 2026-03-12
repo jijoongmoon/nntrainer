@@ -25,8 +25,11 @@ from nntrainer_layers import (
     LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_CONCAT,
     LAYER_RESHAPE, LAYER_PERMUTE, LAYER_MATMUL,
     LAYER_CONV1D, LAYER_CONV2D, LAYER_BATCH_NORM, LAYER_POOLING2D,
-    LAYER_ADD, LAYER_MULTIPLY,
+    LAYER_ADD, LAYER_MULTIPLY, LAYER_SUBTRACT, LAYER_DIVIDE,
+    LAYER_POW, LAYER_SQRT, LAYER_NEGATIVE,
+    LAYER_SIN, LAYER_COS, LAYER_GATHER, LAYER_SLICE,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
+    OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE, OP_SDPA, OP_NOOP,
 )
 from tracer import _is_rmsnorm
 
@@ -273,38 +276,49 @@ class NodeMapper:
             hf_module_type=module_type,
         )
 
+    def _make_scoped_name(self, scope, node, suffix=""):
+        """Generate a scoped layer name for function/method nodes."""
+        if scope:
+            name = f"{_sanitize_name(scope)}_{node.name}"
+        else:
+            name = node.name
+        if suffix:
+            name = f"{name}_{suffix}"
+        return name
+
     def _map_function_node(self, node) -> Optional[NNTrainerLayerDef]:
         """Map a call_function node to NNTrainer layer def."""
         func = node.target
         scope = node.meta.get("scope", "")
         input_names = _get_input_node_names(node)
-
-        # Skip internal torch functions
         func_name = getattr(func, "__name__", str(func))
-        if func_name in ("_set_grad_enabled", "tensor", "arange"):
-            return None
+
+        # === No-ops: internal torch/runtime functions ===
+        if func_name in ("_set_grad_enabled", "tensor", "arange",
+                          "zeros", "zeros_like", "ones", "ones_like",
+                          "full_like", "empty_like"):
+            return NNTrainerLayerDef(
+                layer_type=OP_NOOP,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # === Arithmetic: map to NNTrainer element-wise tensor ops ===
 
         # torch.add / operator.add -> addition
         if func in (torch.add, operator.add):
             return NNTrainerLayerDef(
                 layer_type=LAYER_ADDITION,
-                name=f"{_sanitize_name(scope)}_{node.name}" if scope else node.name,
+                name=self._make_scoped_name(scope, node),
                 input_layers=input_names,
             )
 
-        # torch.cat -> concat
-        if func is torch.cat:
+        # torch.sub / operator.sub -> subtract
+        if func in (torch.sub, operator.sub):
             return NNTrainerLayerDef(
-                layer_type=LAYER_CONCAT,
-                name=f"{_sanitize_name(scope)}_{node.name}" if scope else node.name,
-                input_layers=input_names,
-            )
-
-        # torch.matmul -> matmul
-        if func is torch.matmul:
-            return NNTrainerLayerDef(
-                layer_type=LAYER_MATMUL,
-                name=f"{_sanitize_name(scope)}_{node.name}" if scope else node.name,
+                layer_type=LAYER_SUBTRACT,
+                name=self._make_scoped_name(scope, node),
                 input_layers=input_names,
             )
 
@@ -312,61 +326,197 @@ class NodeMapper:
         if func in (torch.mul, operator.mul):
             return NNTrainerLayerDef(
                 layer_type=LAYER_MULTIPLY,
-                name=f"{_sanitize_name(scope)}_{node.name}" if scope else node.name,
+                name=self._make_scoped_name(scope, node),
                 input_layers=input_names,
             )
 
-        # F.silu -> activation(swish)
+        # torch.div / operator.truediv -> divide
+        if func in (torch.div, operator.truediv):
+            return NNTrainerLayerDef(
+                layer_type=LAYER_DIVIDE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.matmul -> matmul
+        if func is torch.matmul:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_MATMUL,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.pow -> pow
+        if func is torch.pow:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_POW,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.sqrt -> sqrt
+        if func is torch.sqrt:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_SQRT,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.abs -> pow (abs can be represented as sqrt(x^2) or kept as-is)
+        if func is torch.abs:
+            return NNTrainerLayerDef(
+                layer_type="abs",  # Will need custom handling or decomposition
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.neg / operator.neg -> negative
+        if func in (torch.neg, operator.neg):
+            return NNTrainerLayerDef(
+                layer_type=LAYER_NEGATIVE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # === Trigonometric / math functions ===
+
+        # torch.sin -> sin
+        if func is torch.sin:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_SIN,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.cos -> cos
+        if func is torch.cos:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_COS,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.log -> needs decomposition or custom op
+        if func_name == "log":
+            return NNTrainerLayerDef(
+                layer_type="log",  # Not directly in NNTrainer; pattern_detector may handle
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # === Shape / structure ops ===
+
+        # torch.cat -> concat
+        if func is torch.cat:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_CONCAT,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.gather -> gather
+        if func is torch.gather:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_GATHER,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # === Activation functions ===
+
         if func is F.silu:
             return NNTrainerLayerDef(
                 layer_type=LAYER_ACTIVATION,
-                name=f"{_sanitize_name(scope)}_silu" if scope else node.name,
+                name=self._make_scoped_name(scope, node, "silu"),
                 properties={"activation": ACT_SWISH},
                 input_layers=input_names,
             )
 
-        # F.gelu -> activation(gelu)
         if func is F.gelu:
             return NNTrainerLayerDef(
                 layer_type=LAYER_ACTIVATION,
-                name=f"{_sanitize_name(scope)}_gelu" if scope else node.name,
+                name=self._make_scoped_name(scope, node, "gelu"),
                 properties={"activation": ACT_GELU},
                 input_layers=input_names,
             )
 
-        # F.relu -> activation(relu)
         if func is F.relu:
             return NNTrainerLayerDef(
                 layer_type=LAYER_ACTIVATION,
-                name=f"{_sanitize_name(scope)}_relu" if scope else node.name,
+                name=self._make_scoped_name(scope, node, "relu"),
                 properties={"activation": ACT_RELU},
                 input_layers=input_names,
             )
 
-        # F.softmax -> activation(softmax)
         if func is F.softmax:
             return NNTrainerLayerDef(
                 layer_type=LAYER_ACTIVATION,
-                name=f"{_sanitize_name(scope)}_softmax" if scope else node.name,
+                name=self._make_scoped_name(scope, node, "softmax"),
                 properties={"activation": ACT_SOFTMAX},
                 input_layers=input_names,
             )
 
-        # F.scaled_dot_product_attention -> will be pattern-matched to mha_core
+        # torch.tanh / F.tanh -> activation(tanh)
+        if func is torch.tanh or func_name == "tanh":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_ACTIVATION,
+                name=self._make_scoped_name(scope, node, "tanh"),
+                properties={"activation": ACT_TANH},
+                input_layers=input_names,
+            )
+
+        # torch.sigmoid -> activation(sigmoid)
+        if func is torch.sigmoid:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_ACTIVATION,
+                name=self._make_scoped_name(scope, node, "sigmoid"),
+                properties={"activation": ACT_SIGMOID},
+                input_layers=input_names,
+            )
+
+        # F.dropout -> dropout (skipped in inference)
+        if func is F.dropout:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_DROPOUT,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # === Attention ===
+
+        # F.scaled_dot_product_attention -> intermediate sdpa (pattern_detector -> mha_core)
         if func_name == "scaled_dot_product_attention":
             return NNTrainerLayerDef(
-                layer_type="sdpa",  # Intermediate type; pattern_detector converts to mha_core
-                name=f"{_sanitize_name(scope)}_sdpa" if scope else node.name,
+                layer_type=OP_SDPA,
+                name=self._make_scoped_name(scope, node, "sdpa"),
                 input_layers=input_names,
                 hf_module_name=scope,
             )
+
+        # === Pass-through / no-op ===
 
         # operator.getitem -> pass-through (tuple unpacking)
         if func is operator.getitem:
             return None
 
-        # Skip other internal functions we don't need
-        return None
+        # Comparison / conditional ops -> noop for inference graph structure
+        # (where, min, max are used in relative position bias computation in T5)
+        if func_name in ("where", "min", "max"):
+            return NNTrainerLayerDef(
+                layer_type=OP_NOOP,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # Anything else: record as unknown with a warning
+        print(f"  [WARNING] Unmapped function: {func_name} in scope={scope}")
+        return NNTrainerLayerDef(
+            layer_type=f"unknown_func({func_name})",
+            name=self._make_scoped_name(scope, node),
+            input_layers=input_names,
+            hf_module_name=scope,
+        )
 
     def _map_method_node(self, node) -> Optional[NNTrainerLayerDef]:
         """Map a call_method node to NNTrainer layer def."""
@@ -374,19 +524,37 @@ class NodeMapper:
         scope = node.meta.get("scope", "")
         input_names = _get_input_node_names(node)
 
-        # Tensor.add -> addition (residual connections)
-        if method_name == "add":
+        # === Arithmetic tensor ops -> NNTrainer element-wise layers ===
+
+        # Tensor.add / add_ -> addition
+        if method_name in ("add", "add_"):
             return NNTrainerLayerDef(
                 layer_type=LAYER_ADDITION,
-                name=f"{_sanitize_name(scope)}_add_{node.name}" if scope else node.name,
+                name=self._make_scoped_name(scope, node),
                 input_layers=input_names,
             )
 
-        # Tensor.mul -> multiply (used in RoPE, SwiGLU)
-        if method_name == "mul":
+        # Tensor.sub / sub_ -> subtract
+        if method_name in ("sub", "sub_"):
+            return NNTrainerLayerDef(
+                layer_type=LAYER_SUBTRACT,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # Tensor.mul / mul_ -> multiply
+        if method_name in ("mul", "mul_"):
             return NNTrainerLayerDef(
                 layer_type=LAYER_MULTIPLY,
-                name=f"{_sanitize_name(scope)}_mul_{node.name}" if scope else node.name,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # Tensor.div / div_ -> divide
+        if method_name in ("div", "div_"):
+            return NNTrainerLayerDef(
+                layer_type=LAYER_DIVIDE,
+                name=self._make_scoped_name(scope, node),
                 input_layers=input_names,
             )
 
@@ -394,15 +562,55 @@ class NodeMapper:
         if method_name == "matmul":
             return NNTrainerLayerDef(
                 layer_type=LAYER_MATMUL,
-                name=f"{_sanitize_name(scope)}_matmul_{node.name}" if scope else node.name,
+                name=self._make_scoped_name(scope, node),
                 input_layers=input_names,
             )
 
-        # Shape operations - these are intermediate; pattern_detector handles them
-        # We record them for pattern detection but they won't appear in final output
+        # Tensor.neg -> negative
+        if method_name == "neg":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_NEGATIVE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # Tensor.pow -> pow
+        if method_name == "pow":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_POW,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # Tensor.sqrt -> sqrt
+        if method_name == "sqrt":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_SQRT,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # === Trigonometric -> NNTrainer sin/cos layers ===
+
+        if method_name == "cos":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_COS,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        if method_name == "sin":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_SIN,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # === Shape operations -> intermediate (collapsed by pattern_detector) ===
+
         if method_name in ("view", "reshape"):
             return NNTrainerLayerDef(
-                layer_type="reshape_op",  # Intermediate
+                layer_type=OP_RESHAPE,
                 name=node.name,
                 input_layers=input_names,
                 hf_module_name=scope,
@@ -410,7 +618,7 @@ class NodeMapper:
 
         if method_name == "permute":
             return NNTrainerLayerDef(
-                layer_type="permute_op",  # Intermediate
+                layer_type=OP_PERMUTE,
                 name=node.name,
                 input_layers=input_names,
                 hf_module_name=scope,
@@ -418,19 +626,58 @@ class NodeMapper:
 
         if method_name == "transpose":
             return NNTrainerLayerDef(
-                layer_type="transpose_op",  # Intermediate
+                layer_type=OP_TRANSPOSE,
                 name=node.name,
                 input_layers=input_names,
                 hf_module_name=scope,
             )
 
-        # Skip no-op methods
-        if method_name in ("contiguous", "detach", "clone", "to", "float",
-                           "expand", "unsqueeze", "squeeze",
-                           "__getitem__", "cos", "sin", "neg"):
-            return None
+        # Tensor.__getitem__ (indexing/slicing) -> slice
+        if method_name == "__getitem__":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_SLICE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
 
-        return None
+        # Tensor.unsqueeze / squeeze -> reshape (shape manipulation)
+        if method_name in ("unsqueeze", "squeeze"):
+            return NNTrainerLayerDef(
+                layer_type=OP_RESHAPE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # === No-ops: dtype/memory operations (safe to skip in inference) ===
+        if method_name in ("contiguous", "detach", "clone", "to", "float",
+                           "half", "bfloat16", "type_as", "expand",
+                           "size", "dim", "numel",
+                           "__bool__", "all", "any", "item"):
+            return NNTrainerLayerDef(
+                layer_type=OP_NOOP,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # === Comparison ops (used in T5 relative position bias) ===
+        if method_name in ("gt", "lt", "le", "ge", "eq", "ne"):
+            return NNTrainerLayerDef(
+                layer_type=OP_NOOP,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # Anything else: record as unknown with a warning
+        print(f"  [WARNING] Unmapped method: {method_name} in scope={scope}")
+        return NNTrainerLayerDef(
+            layer_type=f"unknown_method({method_name})",
+            name=self._make_scoped_name(scope, node),
+            input_layers=input_names,
+            hf_module_name=scope,
+        )
 
     def _make_activation(self, module_name, module_type, act_type, input_names):
         """Helper to create an activation layer def."""

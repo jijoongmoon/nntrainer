@@ -99,10 +99,27 @@ LAYER_RESHAPE = "reshape"
 LAYER_PERMUTE = "permute"
 LAYER_SPLIT = "split"
 
-# Math operations
+# Math operations (element-wise)
 LAYER_MATMUL = "matmul"
 LAYER_ADD = "add"
 LAYER_MULTIPLY = "multiply"
+LAYER_SUBTRACT = "subtract"
+LAYER_DIVIDE = "divide"
+LAYER_POW = "pow"
+LAYER_SQRT = "sqrt"
+LAYER_NEGATIVE = "negative"
+
+# Trigonometric / math functions
+LAYER_SIN = "sin"
+LAYER_COS = "cos"
+
+# Reduction operations
+LAYER_REDUCE_MEAN = "reduce_mean"
+LAYER_REDUCE_SUM = "reduce_sum"
+
+# Indexing / selection
+LAYER_GATHER = "gather"
+LAYER_SLICE = "slice"
 
 # Convolution & pooling
 LAYER_CONV1D = "conv1d"
@@ -117,3 +134,11 @@ ACT_SWISH = "swish"  # SiLU = Swish
 ACT_SIGMOID = "sigmoid"
 ACT_TANH = "tanh"
 ACT_SOFTMAX = "softmax"
+
+# Intermediate/internal op types (used during mapping, collapsed by pattern_detector)
+# These are not final NNTrainer layer types but help track graph structure
+OP_RESHAPE = "reshape_op"
+OP_TRANSPOSE = "transpose_op"
+OP_PERMUTE = "permute_op"
+OP_SDPA = "sdpa"
+OP_NOOP = "noop"  # No-op (skipped in final output)
