@@ -85,49 +85,123 @@ class IniEmitter:
             sections.append("")
 
         # Transformer blocks
-        for i in range(s.num_layers):
-            first_input = "embedding0" if s.embedding else "input0"
-            input_name = (first_input if i == 0
-                          else f"layer{i-1}_decoder_output")
-            sections.extend(
-                self._emit_block_ini(i, input_name, s))
-            sections.append("")
+        first_input = "embedding0" if s.embedding else "input0"
+        norm_type = self._norm_type(s)
 
-        # Final norm
-        if s.final_norm:
-            norm_type = self._norm_type(s)
-            last_block = f"layer{s.num_layers - 1}_decoder_output"
-            sections.append("[output_norm]")
+        if s.arch_type == "encoder_decoder":
+            # Encoder blocks
+            enc_blocks = s.encoder_blocks
+            enc_b0 = enc_blocks[0] if enc_blocks else None
+            for i in range(s.num_encoder_layers):
+                input_name = (first_input if i == 0
+                              else f"enc_layer{i-1}_block_output")
+                sections.extend(
+                    self._emit_block_ini(i, input_name, s,
+                                         block=enc_b0, prefix=f"enc_layer{i}"))
+                sections.append("")
+
+            # Encoder final norm
+            enc_last = f"enc_layer{s.num_encoder_layers - 1}_block_output"
+            sections.append("[encoder_output_norm]")
             sections.append(f"Type = {norm_type}")
-            sections.append(f"input_layers = {last_block}")
+            sections.append(f"input_layers = {enc_last}")
             sections.append(f"epsilon = {s.norm_eps}")
             if norm_type == "rms_norm":
                 sections.append("packed = false")
             sections.append("")
 
-        # LM head
-        if s.lm_head:
-            lm_type = ("tie_word_embeddings" if s.tie_word_embeddings
-                        else "fully_connected")
-            sections.append("[lm_head]")
-            sections.append(f"Type = {lm_type}")
-            sections.append("input_layers = output_norm")
-            sections.append(f"unit = {s.vocab_size}")
-            sections.append("disable_bias = true")
-            if s.tie_word_embeddings:
-                sections.append("shared_from = embedding0")
-            sections.append("")
+            # Decoder blocks (with cross-attention)
+            dec_blocks = s.decoder_blocks
+            dec_b0 = dec_blocks[0] if dec_blocks else None
+            for i in range(s.num_decoder_layers):
+                input_name = (first_input if i == 0
+                              else f"dec_layer{i-1}_block_output")
+                sections.extend(
+                    self._emit_block_ini(
+                        i, input_name, s,
+                        block=dec_b0, prefix=f"dec_layer{i}",
+                        encoder_output="encoder_output_norm"))
+                sections.append("")
+
+            # Decoder final norm
+            if s.final_norm:
+                dec_last = (f"dec_layer{s.num_decoder_layers - 1}"
+                            f"_block_output")
+                sections.append("[decoder_output_norm]")
+                sections.append(f"Type = {norm_type}")
+                sections.append(f"input_layers = {dec_last}")
+                sections.append(f"epsilon = {s.norm_eps}")
+                if norm_type == "rms_norm":
+                    sections.append("packed = false")
+                sections.append("")
+
+            # LM head
+            if s.lm_head:
+                lm_type = ("tie_word_embeddings" if s.tie_word_embeddings
+                            else "fully_connected")
+                sections.append("[lm_head]")
+                sections.append(f"Type = {lm_type}")
+                sections.append("input_layers = decoder_output_norm")
+                sections.append(f"unit = {s.vocab_size}")
+                sections.append("disable_bias = true")
+                if s.tie_word_embeddings:
+                    sections.append("shared_from = embedding0")
+                sections.append("")
+        else:
+            # Single-stack (decoder_only / encoder_only)
+            for i in range(s.num_layers):
+                input_name = (first_input if i == 0
+                              else f"layer{i-1}_decoder_output")
+                sections.extend(
+                    self._emit_block_ini(i, input_name, s))
+                sections.append("")
+
+            # Final norm
+            if s.final_norm:
+                last_block = f"layer{s.num_layers - 1}_decoder_output"
+                sections.append("[output_norm]")
+                sections.append(f"Type = {norm_type}")
+                sections.append(f"input_layers = {last_block}")
+                sections.append(f"epsilon = {s.norm_eps}")
+                if norm_type == "rms_norm":
+                    sections.append("packed = false")
+                sections.append("")
+
+            # LM head
+            if s.lm_head:
+                lm_type = ("tie_word_embeddings" if s.tie_word_embeddings
+                            else "fully_connected")
+                sections.append("[lm_head]")
+                sections.append(f"Type = {lm_type}")
+                sections.append("input_layers = output_norm")
+                sections.append(f"unit = {s.vocab_size}")
+                sections.append("disable_bias = true")
+                if s.tie_word_embeddings:
+                    sections.append("shared_from = embedding0")
+                sections.append("")
 
         return "\n".join(sections)
 
-    def _emit_block_ini(self, layer_id, input_name, s):
-        """Emit a single transformer block as INI sections."""
+    def _emit_block_ini(self, layer_id, input_name, s,
+                        block=None, prefix=None, encoder_output=None):
+        """Emit a single transformer block as INI sections.
+
+        Args:
+            layer_id: Block index.
+            input_name: Name of the input layer.
+            s: ModelStructure.
+            block: TransformerBlockPattern to use (default: s.blocks[0]).
+            prefix: Layer name prefix (default: "layer{layer_id}").
+            encoder_output: Encoder output for cross-attention (decoder only).
+        """
         lines = []
-        prefix = f"layer{layer_id}"
-        b0 = s.blocks[0] if s.blocks else None
+        if prefix is None:
+            prefix = f"layer{layer_id}"
+        b0 = block if block is not None else (s.blocks[0] if s.blocks else None)
         norm_type = self._norm_type(s)
 
-        lines.append(f"# --- Block {layer_id} ---")
+        role = f" [{b0.block_role}]" if b0 and b0.block_role else ""
+        lines.append(f"# --- Block {layer_id}{role} ---")
 
         # Pre-attention norm
         if b0 and b0.pre_attn_norm:
@@ -214,15 +288,84 @@ class IniEmitter:
             lines.append("disable_bias = true")
             lines.append("")
 
-        # Attention residual
+        # Self-attention residual
+        is_enc_dec = (b0 and b0.block_role in ("encoder", "decoder"))
+        attn_add_name = "self_attn_add" if is_enc_dec else "decoder_add"
+        block_out_name = "block_output" if is_enc_dec else "decoder_output"
+
         if b0 and b0.attn_residual:
-            lines.append(f"[{prefix}_decoder_add]")
+            lines.append(f"[{prefix}_{attn_add_name}]")
             lines.append("Type = addition")
             lines.append(f"input_layers = {input_name},{prefix}_attention_out")
             lines.append("")
-            ffn_norm_input = f"{prefix}_decoder_add"
+            last_residual = f"{prefix}_{attn_add_name}"
         else:
-            ffn_norm_input = f"{prefix}_attention_out"
+            last_residual = f"{prefix}_attention_out"
+
+        # Cross-attention (decoder blocks in encoder-decoder models)
+        if b0 and b0.cross_attention and encoder_output:
+            # Cross-attention norm
+            if b0.cross_attn_norm:
+                lines.append(f"[{prefix}_cross_attn_norm]")
+                lines.append(f"Type = {norm_type}")
+                lines.append(f"input_layers = {last_residual}")
+                lines.append(f"epsilon = {s.norm_eps}")
+                if norm_type == "rms_norm":
+                    lines.append("packed = false")
+                lines.append("")
+                cross_q = f"{prefix}_cross_attn_norm"
+            else:
+                cross_q = last_residual
+
+            # Cross-attention Q/K/V (Q from decoder, K/V from encoder)
+            q_unit = s.head_dim * s.num_heads
+            kv_unit = s.head_dim * s.num_kv_heads
+            lines.append(f"[{prefix}_cross_wq]")
+            lines.append("Type = fully_connected")
+            lines.append(f"input_layers = {cross_q}")
+            lines.append(f"unit = {q_unit}")
+            lines.append("disable_bias = true")
+            lines.append("")
+
+            lines.append(f"[{prefix}_cross_wk]")
+            lines.append("Type = fully_connected")
+            lines.append(f"input_layers = {encoder_output}")
+            lines.append(f"unit = {kv_unit}")
+            lines.append("disable_bias = true")
+            lines.append("")
+
+            lines.append(f"[{prefix}_cross_wv]")
+            lines.append("Type = fully_connected")
+            lines.append(f"input_layers = {encoder_output}")
+            lines.append(f"unit = {kv_unit}")
+            lines.append("disable_bias = true")
+            lines.append("")
+
+            lines.append(f"[{prefix}_cross_attention]")
+            lines.append("Type = mha_core")
+            lines.append(f"input_layers = {prefix}_cross_wq,"
+                         f"{prefix}_cross_wk,{prefix}_cross_wv")
+            lines.append(f"num_heads = {s.num_heads}")
+            lines.append(f"num_heads_kv = {s.num_kv_heads}")
+            lines.append("")
+
+            lines.append(f"[{prefix}_cross_attention_out]")
+            lines.append("Type = fully_connected")
+            lines.append(f"input_layers = {prefix}_cross_attention")
+            lines.append(f"unit = {s.hidden_size}")
+            lines.append("disable_bias = true")
+            lines.append("")
+
+            # Cross-attention residual
+            if b0.cross_attn_residual:
+                lines.append(f"[{prefix}_cross_attn_add]")
+                lines.append("Type = addition")
+                lines.append(f"input_layers = {last_residual},"
+                             f"{prefix}_cross_attention_out")
+                lines.append("")
+                last_residual = f"{prefix}_cross_attn_add"
+
+        ffn_norm_input = last_residual
 
         # Pre-FFN norm
         if b0 and b0.pre_ffn_norm:
@@ -289,11 +432,9 @@ class IniEmitter:
 
         # FFN residual
         if b0 and b0.ffn_residual:
-            res_input = (f"{prefix}_decoder_add" if b0.attn_residual
-                         else input_name)
-            lines.append(f"[{prefix}_decoder_output]")
+            lines.append(f"[{prefix}_{block_out_name}]")
             lines.append("Type = addition")
-            lines.append(f"input_layers = {res_input},{prefix}_ffn_down")
+            lines.append(f"input_layers = {last_residual},{prefix}_ffn_down")
             lines.append("")
 
         return lines

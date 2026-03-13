@@ -147,15 +147,34 @@ class CppEmitter:
         L.append(f"")
         L.append(f"protected:")
 
-        # createTransformerBlock
-        block_type = "DecoderBlock" if s.arch_type == "decoder_only" else "Block"
-        L.append(f"  /**")
-        L.append(f"   * @brief Create a Transformer {block_type}")
-        L.append(f"   */")
-        L.append(f"  virtual std::vector<LayerHandle>")
-        L.append(f"  createTransformer{block_type}("
-                 f"const int layer_id, std::string input_name);")
-        L.append(f"")
+        # createTransformerBlock(s) - encoder-decoder gets both
+        if s.arch_type == "encoder_decoder":
+            L.append(f"  /**")
+            L.append(f"   * @brief Create a Transformer Encoder Block")
+            L.append(f"   */")
+            L.append(f"  virtual std::vector<LayerHandle>")
+            L.append(f"  createEncoderBlock("
+                     f"const int layer_id, std::string input_name);")
+            L.append(f"")
+            L.append(f"  /**")
+            L.append(f"   * @brief Create a Transformer Decoder Block")
+            L.append(f"   */")
+            L.append(f"  virtual std::vector<LayerHandle>")
+            L.append(f"  createDecoderBlock("
+                     f"const int layer_id, std::string input_name,")
+            L.append(f"                     "
+                     f"std::string encoder_output);")
+            L.append(f"")
+        else:
+            block_type = ("DecoderBlock" if s.arch_type == "decoder_only"
+                          else "Block")
+            L.append(f"  /**")
+            L.append(f"   * @brief Create a Transformer {block_type}")
+            L.append(f"   */")
+            L.append(f"  virtual std::vector<LayerHandle>")
+            L.append(f"  createTransformer{block_type}("
+                     f"const int layer_id, std::string input_name);")
+            L.append(f"")
 
         # createAttention
         L.append(f"  /**")
@@ -191,6 +210,9 @@ class CppEmitter:
         L.append(f"  // Model constants")
         L.append(f"  unsigned int NUM_VOCAB = {s.vocab_size};")
         L.append(f"  int DIM = {s.hidden_size};")
+        if s.arch_type == "encoder_decoder":
+            L.append(f"  int NUM_ENCODER_LAYERS = {s.num_encoder_layers};")
+            L.append(f"  int NUM_DECODER_LAYERS = {s.num_decoder_layers};")
         L.append(f"  int NUM_LAYERS = {s.num_layers};")
         L.append(f"  int NUM_HEADS = {s.num_heads};")
         L.append(f"  int NUM_KV_HEADS = {s.num_kv_heads};")
@@ -260,18 +282,41 @@ class CppEmitter:
         L.append("")
 
         # constructModel
+        if s.arch_type == "encoder_decoder":
+            block_type = None  # handled separately
+        else:
+            block_type = ("DecoderBlock" if s.arch_type == "decoder_only"
+                          else "Block")
         L.append(self._emit_construct_model(cname, block_type))
 
-        # createTransformerBlock
-        if s.blocks:
+        # createTransformerBlock / encoder+decoder blocks
+        if s.arch_type == "encoder_decoder":
+            enc_blocks = s.encoder_blocks
+            dec_blocks = s.decoder_blocks
+            enc_b0 = enc_blocks[0] if enc_blocks else None
+            dec_b0 = dec_blocks[0] if dec_blocks else None
+
+            if enc_b0:
+                L.append(self._emit_block_method(
+                    cname, "EncoderBlock", enc_b0, is_encoder=True))
+            if dec_b0:
+                L.append(self._emit_block_method(
+                    cname, "DecoderBlock", dec_b0, is_encoder=False))
+
+            # Attention (use encoder block, decoder overrides with cross-attn)
+            representative = enc_b0 or dec_b0
+            if representative and representative.attention:
+                L.append(self._emit_attention_method(cname, representative))
+
+            # FFN
+            if representative and representative.ffn:
+                L.append(self._emit_ffn_method(cname, representative))
+        elif s.blocks:
             b0 = s.blocks[0]
             L.append(self._emit_block_method(cname, block_type, b0))
 
-            # createAttention
             if b0.attention:
                 L.append(self._emit_attention_method(cname, b0))
-
-            # createMlp
             if b0.ffn:
                 L.append(self._emit_ffn_method(cname, b0))
 
@@ -323,31 +368,90 @@ class CppEmitter:
             L.append(f"")
 
         # Transformer blocks loop
-        L.append(f"  // Transformer blocks")
-        L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
         first_in = '"embedding0"' if s.embedding else '"input0"'
-        L.append(f'    std::string input_name = (i == 0) ? {first_in}')
-        L.append(f'      : "layer" + std::to_string(i - 1) + "_decoder_output";')
-        L.append(f"    auto block = createTransformer{block_type}(i, input_name);")
-        L.append(f"    layers.insert(layers.end(), block.begin(), block.end());")
-        L.append(f"  }}")
-        L.append(f"")
 
-        # Final norm
-        if s.final_norm:
-            norm_type = ("rms_norm" if s.model_type not in ("bert", "roberta")
-                         else "layer_normalization")
-            L.append(f"  // Final normalization")
-            norm_props = [
-                'withKey("name", "output_norm")',
-                'withKey("input_layers", "layer" + std::to_string(NUM_LAYERS - 1)'
-                ' + "_decoder_output")',
+        if s.arch_type == "encoder_decoder":
+            # Encoder blocks
+            L.append(f"  // Encoder blocks")
+            L.append(f"  for (int i = 0; i < NUM_ENCODER_LAYERS; ++i) {{")
+            L.append(f'    std::string enc_in = (i == 0) ? {first_in}')
+            L.append(f'      : "enc_layer" + std::to_string(i - 1) '
+                     f'+ "_block_output";')
+            L.append(f"    auto block = createEncoderBlock(i, enc_in);")
+            L.append(f"    layers.insert(layers.end(), "
+                     f"block.begin(), block.end());")
+            L.append(f"  }}")
+            L.append(f"")
+
+            # Encoder final norm
+            norm_type = self._get_norm_type()
+            L.append(f"  // Encoder final normalization")
+            enc_norm_props = [
+                'withKey("name", "encoder_output_norm")',
+                'withKey("input_layers", "enc_layer" + '
+                'std::to_string(NUM_ENCODER_LAYERS - 1) + "_block_output")',
                 'withKey("epsilon", NORM_EPS)',
             ]
             if norm_type == "rms_norm":
-                norm_props.append('withKey("packed", "false")')
-            L.extend(_cpp_layer(norm_type, norm_props))
+                enc_norm_props.append('withKey("packed", "false")')
+            L.extend(_cpp_layer(norm_type, enc_norm_props))
             L.append(f"")
+
+            # Decoder blocks
+            L.append(f"  // Decoder blocks")
+            L.append(f"  for (int i = 0; i < NUM_DECODER_LAYERS; ++i) {{")
+            L.append(f'    std::string dec_in = (i == 0) ? {first_in}')
+            L.append(f'      : "dec_layer" + std::to_string(i - 1) '
+                     f'+ "_block_output";')
+            L.append(f'    auto block = createDecoderBlock(i, dec_in, '
+                     f'"encoder_output_norm");')
+            L.append(f"    layers.insert(layers.end(), "
+                     f"block.begin(), block.end());")
+            L.append(f"  }}")
+            L.append(f"")
+
+            # Decoder final norm
+            if s.final_norm:
+                L.append(f"  // Decoder final normalization")
+                dec_norm_props = [
+                    'withKey("name", "decoder_output_norm")',
+                    'withKey("input_layers", "dec_layer" + '
+                    'std::to_string(NUM_DECODER_LAYERS - 1) '
+                    '+ "_block_output")',
+                    'withKey("epsilon", NORM_EPS)',
+                ]
+                if norm_type == "rms_norm":
+                    dec_norm_props.append('withKey("packed", "false")')
+                L.extend(_cpp_layer(norm_type, dec_norm_props))
+                L.append(f"")
+        else:
+            L.append(f"  // Transformer blocks")
+            L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
+            L.append(f'    std::string input_name = (i == 0) ? {first_in}')
+            L.append(f'      : "layer" + std::to_string(i - 1) '
+                     f'+ "_decoder_output";')
+            L.append(f"    auto block = createTransformer{block_type}"
+                     f"(i, input_name);")
+            L.append(f"    layers.insert(layers.end(), "
+                     f"block.begin(), block.end());")
+            L.append(f"  }}")
+            L.append(f"")
+
+            # Final norm
+            if s.final_norm:
+                norm_type = self._get_norm_type()
+                L.append(f"  // Final normalization")
+                norm_props = [
+                    'withKey("name", "output_norm")',
+                    'withKey("input_layers", "layer" + '
+                    'std::to_string(NUM_LAYERS - 1)'
+                    ' + "_decoder_output")',
+                    'withKey("epsilon", NORM_EPS)',
+                ]
+                if norm_type == "rms_norm":
+                    norm_props.append('withKey("packed", "false")')
+                L.extend(_cpp_layer(norm_type, norm_props))
+                L.append(f"")
 
         # LM head
         if s.lm_head:
@@ -359,11 +463,13 @@ class CppEmitter:
             else:
                 L.append(f'  const std::string lmhead_type = '
                          f'"fully_connected";')
+            lm_input = ("decoder_output_norm" if s.arch_type == "encoder_decoder"
+                        else "output_norm")
             lm_props = [
                 'withKey("name", "output_of_causallm")',
                 'withKey("unit", NUM_VOCAB)',
                 'withKey("disable_bias", "true")',
-                'withKey("input_layers", "output_norm")',
+                f'withKey("input_layers", "{lm_input}")',
             ]
             if s.tie_word_embeddings:
                 lm_props.append('withKey("shared_from", "embedding0")')
@@ -383,26 +489,51 @@ class CppEmitter:
     # createTransformerBlock()
     # =========================================================================
 
-    def _emit_block_method(self, cname, block_type, block):
+    def _get_norm_type(self):
+        """Return the norm layer type for this model."""
+        return ("rms_norm" if self.structure.model_type not in
+                ("bert", "roberta") else "layer_normalization")
+
+    def _emit_block_method(self, cname, block_type, block,
+                           is_encoder=None):
         s = self.structure
-        norm_type = ("rms_norm" if s.model_type not in ("bert", "roberta")
-                     else "layer_normalization")
+        norm_type = self._get_norm_type()
         L = []
 
+        # Determine prefix for layer names: enc_layer / dec_layer / layer
+        if is_encoder is True:
+            prefix_expr = '"enc_layer" + std::to_string(layer_id)'
+        elif is_encoder is False:
+            prefix_expr = '"dec_layer" + std::to_string(layer_id)'
+        else:
+            prefix_expr = '"layer" + std::to_string(layer_id)'
+
+        # Method signature
         L.append(f"std::vector<LayerHandle>")
-        L.append(f"{cname}::createTransformer{block_type}("
-                 f"const int layer_id,")
-        L.append(f"  std::string input_name) {{")
+        if block_type in ("EncoderBlock",):
+            L.append(f"{cname}::create{block_type}("
+                     f"const int layer_id,")
+            L.append(f"  std::string input_name) {{")
+        elif block_type == "DecoderBlock" and is_encoder is False:
+            L.append(f"{cname}::create{block_type}("
+                     f"const int layer_id,")
+            L.append(f"  std::string input_name, "
+                     f"std::string encoder_output) {{")
+        else:
+            L.append(f"{cname}::createTransformer{block_type}("
+                     f"const int layer_id,")
+            L.append(f"  std::string input_name) {{")
+
         L.append(f"")
         L.append(f"  std::vector<LayerHandle> layers;")
+        L.append(f"  auto prefix = {prefix_expr};")
         L.append(f"")
 
         # Pre-attention norm
         if block.pre_attn_norm:
             L.append(f"  // Pre-attention normalization")
             norm_props = [
-                'withKey("name", "layer" + std::to_string(layer_id) '
-                '+ "_attention_norm")',
+                'withKey("name", prefix + "_attention_norm")',
                 'withKey("input_layers", input_name)',
                 'withKey("epsilon", NORM_EPS)',
             ]
@@ -411,9 +542,9 @@ class CppEmitter:
             L.extend(_cpp_layer(norm_type, norm_props))
             L.append(f"")
 
-        # Attention
+        # Self-attention
         if block.attention:
-            attn_in = ('"layer" + std::to_string(layer_id) + "_attention_norm"'
+            attn_in = ('prefix + "_attention_norm"'
                        if block.pre_attn_norm else "input_name")
             L.append(f"  auto att_layer =")
             L.append(f"    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, "
@@ -426,40 +557,87 @@ class CppEmitter:
                      f"att_layer.end());")
             L.append(f"")
 
-        # Attention residual
+        # Self-attention residual
         if block.attn_residual:
-            L.append(f"  // Attention residual connection")
+            L.append(f"  // Self-attention residual connection")
             L.extend(_cpp_layer("addition", [
-                'withKey("name", "layer" + std::to_string(layer_id) '
-                '+ "_decoder_add")',
-                'withKey("input_layers", input_name + ",layer" + '
-                'std::to_string(layer_id) + "_attention_out")',
+                'withKey("name", prefix + "_self_attn_add")',
+                'withKey("input_layers", input_name + "," + '
+                'prefix + "_attention_out")',
             ]))
             L.append(f"")
+            last_residual = 'prefix + "_self_attn_add"'
+        else:
+            last_residual = 'prefix + "_attention_out"'
+
+        # Cross-attention (decoder blocks in encoder-decoder models)
+        if block.cross_attention and is_encoder is False:
+            # Cross-attention norm
+            if block.cross_attn_norm:
+                L.append(f"  // Cross-attention normalization")
+                cross_norm_props = [
+                    'withKey("name", prefix + "_cross_attn_norm")',
+                    f'withKey("input_layers", {last_residual})',
+                    'withKey("epsilon", NORM_EPS)',
+                ]
+                if norm_type == "rms_norm":
+                    cross_norm_props.append('withKey("packed", "false")')
+                L.extend(_cpp_layer(norm_type, cross_norm_props))
+                L.append(f"")
+                cross_q = 'prefix + "_cross_attn_norm"'
+            else:
+                cross_q = last_residual
+
+            # Cross-attention layers (Q from decoder, K/V from encoder)
+            L.append(f"  auto cross_att =")
+            L.append(f"    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, "
+                     f"HEAD_DIM,")
+            L.append(f"                    {cross_q},")
+            L.append(f"                    encoder_output,")
+            L.append(f"                    encoder_output);")
+            L.append(f"")
+            L.append(f"  layers.insert(layers.end(), cross_att.begin(), "
+                     f"cross_att.end());")
+            L.append(f"")
+
+            # Cross-attention residual
+            if block.cross_attn_residual:
+                L.append(f"  // Cross-attention residual")
+                L.extend(_cpp_layer("addition", [
+                    'withKey("name", prefix + "_cross_attn_add")',
+                    f'withKey("input_layers", {last_residual} + "," + '
+                    f'prefix + "_attention_out")',
+                ]))
+                L.append(f"")
+                last_residual = 'prefix + "_cross_attn_add"'
+
+        # Rename for decoder_only compatibility
+        if is_encoder is None:
+            # Single-stack model: use _decoder_add / _decoder_output naming
+            attn_add_name = '"_decoder_add"'
+            block_out_name = '"_decoder_output"'
+        else:
+            attn_add_name = '"_self_attn_add"'
+            block_out_name = '"_block_output"'
 
         # Pre-FFN norm
         if block.pre_ffn_norm:
-            ffn_norm_in = ('"layer" + std::to_string(layer_id) + "_decoder_add"'
-                           if block.attn_residual
-                           else '"layer" + std::to_string(layer_id) '
-                                '+ "_attention_out"')
             L.append(f"  // Pre-FFN normalization")
             norm_props = [
-                'withKey("name", "layer" + std::to_string(layer_id) '
-                '+ "_ffn_norm")',
-                f'withKey("input_layers", {ffn_norm_in})',
+                'withKey("name", prefix + "_ffn_norm")',
+                f'withKey("input_layers", {last_residual})',
                 'withKey("epsilon", NORM_EPS)',
             ]
             if norm_type == "rms_norm":
                 norm_props.append('withKey("packed", "false")')
             L.extend(_cpp_layer(norm_type, norm_props))
             L.append(f"")
+            ffn_in = 'prefix + "_ffn_norm"'
+        else:
+            ffn_in = last_residual
 
         # FFN
         if block.ffn:
-            ffn_in = ('"layer" + std::to_string(layer_id) + "_ffn_norm"'
-                      if block.pre_ffn_norm
-                      else '"layer" + std::to_string(layer_id) + "_decoder_add"')
             L.append(f"  auto ffn_layer = createMlp(layer_id, DIM, "
                      f"INTERMEDIATE_SIZE,")
             L.append(f"                             {ffn_in});")
@@ -469,14 +647,11 @@ class CppEmitter:
 
         # FFN residual
         if block.ffn_residual:
-            res_in = ('"layer" + std::to_string(layer_id) + "_decoder_add"'
-                      if block.attn_residual else "input_name")
             L.append(f"  // FFN residual connection")
             L.extend(_cpp_layer("addition", [
-                'withKey("name", "layer" + std::to_string(layer_id) '
-                '+ "_decoder_output")',
-                f'withKey("input_layers", {res_in} + ",layer" + '
-                f'std::to_string(layer_id) + "_ffn_down")',
+                f'withKey("name", prefix + {block_out_name})',
+                f'withKey("input_layers", {last_residual} + "," + '
+                f'prefix + "_ffn_down")',
             ]))
             L.append(f"")
 

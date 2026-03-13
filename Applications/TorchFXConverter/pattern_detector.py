@@ -80,6 +80,7 @@ class FFNPattern:
 class TransformerBlockPattern:
     """Detected transformer block (norm + attn + residual + norm + ffn + residual)."""
     block_idx: int
+    block_role: str = ""                    # "encoder", "decoder", or "" (single-stack)
     pre_attn_norm: str = ""                 # Pre-attention normalization
     attention: Optional[AttentionPattern] = None
     attn_residual: str = ""                 # Attention residual addition
@@ -113,6 +114,18 @@ class ModelStructure:
     rope_theta: float = 0.0
     norm_eps: float = 0.0
     max_position_embeddings: int = 0
+    num_encoder_layers: int = 0
+    num_decoder_layers: int = 0
+
+    @property
+    def encoder_blocks(self):
+        """Return only encoder blocks."""
+        return [b for b in self.blocks if b.block_role == "encoder"]
+
+    @property
+    def decoder_blocks(self):
+        """Return only decoder blocks."""
+        return [b for b in self.blocks if b.block_role == "decoder"]
 
     def summary(self):
         """Print detected model structure."""
@@ -141,7 +154,8 @@ class ModelStructure:
 
 def _print_block(block):
     """Print a single transformer block."""
-    print(f"\n  Block {block.block_idx}:")
+    role = f" [{block.block_role}]" if block.block_role else ""
+    print(f"\n  Block {block.block_idx}{role}:")
     print(f"    Norm type: {block.norm_type}")
     if block.pre_attn_norm:
         print(f"    Pre-attn norm: {block.pre_attn_norm}")
@@ -222,7 +236,34 @@ class PatternDetector:
 
         # Step 3: Detect transformer blocks
         block_scopes = self._find_block_scopes()
-        for block_idx, scope in enumerate(block_scopes):
+
+        # Separate encoder and decoder scopes for proper numbering
+        encoder_scopes = [s for s in block_scopes if "encoder" in s]
+        decoder_scopes = [s for s in block_scopes if "decoder" in s]
+        other_scopes = [s for s in block_scopes
+                        if "encoder" not in s and "decoder" not in s]
+
+        # Process encoder blocks first, then decoder blocks
+        enc_idx = 0
+        for scope in encoder_scopes:
+            block = self._detect_block(enc_idx, scope)
+            if block:
+                block.block_role = "encoder"
+                structure.blocks.append(block)
+                enc_idx += 1
+        structure.num_encoder_layers = enc_idx
+
+        dec_idx = 0
+        for scope in decoder_scopes:
+            block = self._detect_block(dec_idx, scope)
+            if block:
+                block.block_role = "decoder"
+                structure.blocks.append(block)
+                dec_idx += 1
+        structure.num_decoder_layers = dec_idx
+
+        # Single-stack models (Qwen3, BERT, GPT-2, etc.)
+        for block_idx, scope in enumerate(other_scopes):
             block = self._detect_block(block_idx, scope)
             if block:
                 structure.blocks.append(block)
