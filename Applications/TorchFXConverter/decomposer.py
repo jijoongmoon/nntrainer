@@ -32,6 +32,7 @@ from nntrainer_layers import (
 )
 from tracer import Tracer, LEAF_MODULES
 from node_mapper import NodeMapper
+from pattern_detector import detect_patterns
 
 
 # =============================================================================
@@ -357,6 +358,9 @@ class AdaptiveConverter:
             print(f"  [LAZY] Found {len(lazy_chains)} LazyTensor chain "
                   f"opportunities (total {sum(c.chain_length for c in lazy_chains)} ops)")
 
+        # Pass 5: Detect structural patterns (attention, FFN, blocks)
+        model_structure = detect_patterns(layers, self.config)
+
         # Collect diagnostics
         remaining_unknowns = [l for l in layers
                               if l.layer_type.startswith("unknown")
@@ -374,6 +378,7 @@ class AdaptiveConverter:
             tensor_ops=tensor_ops,
             lazy_chains=lazy_chains,
             graph=tracer.graph,
+            model_structure=model_structure,
         )
 
 
@@ -381,7 +386,8 @@ class ConversionResult:
     """Result of adaptive conversion pipeline."""
 
     def __init__(self, layers, decomposed_module_types, unsupported_ops,
-                 unknown_layers, tensor_ops, lazy_chains, graph):
+                 unknown_layers, tensor_ops, lazy_chains, graph,
+                 model_structure=None):
         self.layers = layers
         self.decomposed_module_types = decomposed_module_types
         self.unsupported_ops = unsupported_ops
@@ -389,6 +395,7 @@ class ConversionResult:
         self.tensor_ops = tensor_ops
         self.lazy_chains = lazy_chains
         self.graph = graph
+        self.model_structure = model_structure
 
     @property
     def is_fully_mapped(self):
