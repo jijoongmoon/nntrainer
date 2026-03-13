@@ -33,13 +33,25 @@ The converter should work for:
 Applications/TorchFXConverter/
 ├── tracer.py              # FX graph tracer (callback-based)
 ├── node_mapper.py         # Maps FX nodes → NNTrainer layer definitions
+├── decomposer.py          # Adaptive multi-pass conversion pipeline
 ├── pattern_detector.py    # Detects attention/FFN/residual patterns
-├── emitter.py             # Generates C++ code, JSON config, weight_converter.py
-├── converter.py           # Main CLI entry point
+├── emitter_cpp.py         # Generates C++ model construction code
+├── emitter_ini.py         # Generates NNTrainer .ini configuration
+├── emitter_json.py        # Generates JSON model config + weight map
+├── weight_converter.py    # HF → NNTrainer binary weight conversion
+├── converter.py           # Main CLI entry point (Phase 6)
 ├── nntrainer_layers.py    # NNTrainer layer type definitions & registry
 ├── DESIGN.md              # This file
 └── tests/
-    └── test_converter.py  # End-to-end tests
+    ├── test_tracer_simple.py
+    ├── test_tracer_qwen3.py
+    ├── test_node_mapper.py
+    ├── test_decomposer.py
+    ├── test_pattern_detector.py
+    ├── test_coverage.py
+    ├── test_multi_arch.py
+    ├── test_unmapped_ops.py
+    └── test_emitters.py   # C++, INI, JSON, weight converter tests
 ```
 
 ## NNTrainer Layer Type Mapping
@@ -107,10 +119,11 @@ we detect patterns from **module hierarchy** and **data flow**:
 - Task 3.6: Full encoder block assembly (for BERT/T5-encoder)
 - Task 3.7: Encoder-decoder assembly (for T5/BART)
 
-### Phase 4: Emitter
-- Task 4.1: C++ code emitter (createLayer calls)
-- Task 4.2: JSON config emitter (nntr_config.json)
-- Task 4.3: Weight converter emitter (weight_converter.py)
+### Phase 4: Emitter ✓
+- Task 4.1: C++ code emitter (emitter_cpp.py) ✓
+- Task 4.2: INI config emitter (emitter_ini.py) ✓
+- Task 4.3: JSON config emitter (emitter_json.py) ✓
+- Task 4.4: Weight converter (weight_converter.py) ✓
 
 ### Phase 5: End-to-End Validation
 - Task 5.1: Qwen3-0.6B full pipeline test
