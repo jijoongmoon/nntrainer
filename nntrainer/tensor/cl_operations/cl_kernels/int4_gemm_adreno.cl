@@ -18,7 +18,7 @@ gpu_int4_gemm_adreno(
 
     const int m = get_global_id(0) * 2;
     const int n = get_global_id(1) * 4;
-    const int M_4 = M>>2;
+    const int M_4 = CEIL_DIV(M,4);
 
     half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     half8 input_reg;
@@ -27,7 +27,7 @@ gpu_int4_gemm_adreno(
     half4 scale;
 
     for(int k=0; k<K; k+=4){
-        if (k%32==0){
+        if((k&0x1F) == 0) {
             scale = vload4(0,scales + (k/quantization_group_size)*align_N + n);
         }
         packed_w = vload4(0,weights + (k/4) * N + n);

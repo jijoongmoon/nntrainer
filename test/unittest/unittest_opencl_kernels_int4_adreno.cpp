@@ -118,7 +118,7 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
   #endif
 
   uint16_t *input_ptr = (uint16_t *)allocateSVM(M * alignK * sizeof(uint16_t));
-  uint16_t *input_transpose_ptr = (uint16_t *)allocateSVM(M * alignK * sizeof(uint16_t));
+  uint16_t *input_transpose_ptr = (uint16_t *)allocateSVM(align(M,4) * alignK * sizeof(uint16_t));
   uint16_t *weight_ptr = (uint16_t *)allocateSVM(alignK * N * sizeof(uint16_t) / 4);
   uint16_t *scale_ptr = (uint16_t *)allocateSVM(ceilDiv(K, scale_group_size) *
                                                 alignN * sizeof(uint16_t));
@@ -127,7 +127,7 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
   blas_cc->command_queue_inst_.enqueueSVMMap(
     input_ptr, M * alignK * sizeof(uint16_t), false);
   blas_cc->command_queue_inst_.enqueueSVMMap(
-    input_transpose_ptr, M * alignK * sizeof(uint16_t), false);
+    input_transpose_ptr, align(M,4) * alignK * sizeof(uint16_t), false);
   blas_cc->command_queue_inst_.enqueueSVMMap(weight_ptr, alignK * N * sizeof(uint16_t) / 4,
                                              false);
   blas_cc->command_queue_inst_.enqueueSVMMap(
@@ -210,7 +210,7 @@ static void run_int4_gemm_adreno_test_(const uint32_t M, const uint32_t K,
 DECLARE_int4_gemm_adreno_test_M_K_N(32, 32, 32, 32);
 #else
 DECLARE_int4_gemm_adreno_test_M_K_N(1024, 1024, 1024, 32);
-DECLARE_int4_gemm_adreno_test_M_K_N(1028, 1024, 1024, 32);
+DECLARE_int4_gemm_adreno_test_M_K_N(1025, 1024, 1024, 32);
 DECLARE_int4_gemm_adreno_test_M_K_N(1024, 1028, 1024, 32);
 DECLARE_int4_gemm_adreno_test_M_K_N(1024, 1024, 1028, 32);
 DECLARE_int4_gemm_adreno_test_M_K_N(4096, 1024, 1024, 32);

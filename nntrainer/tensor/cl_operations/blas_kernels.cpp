@@ -16,6 +16,7 @@
 
 #include "util_func.h"
 #include <fp16.h>
+#include <cassert>
 
 namespace nntrainer {
 
@@ -808,6 +809,11 @@ void gemm_int4_cl(void *input, void *weights, void *scales, void *output,
 void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, void *scales, void *output,
                   unsigned int M, unsigned int N, unsigned int K,
                   unsigned int quantization_group_size) {
+  if (((N%4)!=0) | ((K%4)!=0)){
+    printf("N and K should be divisible by 4, this error is occured in File : %s, Line : %d\n", __FILE__,__LINE__);
+    fflush(stdout);
+    abort();
+  }
   int alignK = align(K, quantization_group_size);
   const auto N_GROUP_SIZE = 32; // due to input data format
   int alignN = align(N, N_GROUP_SIZE);
@@ -816,15 +822,6 @@ void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, voi
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   auto &clbuffInstance = ClBufferManager::Global();
-
-
-
-
-
-
-
-
-
 
   cl_int err;
   size_t input_size = M * alignK * sizeof(uint16_t);
@@ -864,6 +861,7 @@ void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, voi
     throw std::runtime_error("Failed to create image1d_buffer for input_transposed");
   }
 
+  input_size = align(M,4) * alignK * sizeof(uint16_t);
 
   input_buf = clCreateBuffer(
     blas_cc->context_inst_.GetContext(),
@@ -882,7 +880,7 @@ void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, voi
 
   memset(&image_desc, 0, sizeof(image_desc));
   image_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-  image_desc.image_width = (M * alignK)/4;
+  image_desc.image_width = (align(M,4) * alignK)/4;
   image_desc.buffer = input_buf;
 
   cl_mem input_transposed_img = clCreateImage(
@@ -927,7 +925,7 @@ void gemm_int4_cl_adreno(void *input, void *input_transposed, void *weights, voi
     throw std::runtime_error(
       "Failed to set kernel argument 2 for input_transpose");
 
-  int M_4 = M>>2;
+ int M_4 = ceilDiv(M,4);
   result = kernel_ptr->SetKernelArguments(arg++, &M_4, sizeof(int));
   if (!result)
     throw std::runtime_error(
