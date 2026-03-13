@@ -88,7 +88,7 @@ class IniEmitter:
         for i in range(s.num_layers):
             first_input = "embedding0" if s.embedding else "input0"
             input_name = (first_input if i == 0
-                          else f"layer{i-1}_block_output")
+                          else f"layer{i-1}_decoder_output")
             sections.extend(
                 self._emit_block_ini(i, input_name, s))
             sections.append("")
@@ -96,7 +96,7 @@ class IniEmitter:
         # Final norm
         if s.final_norm:
             norm_type = self._norm_type(s)
-            last_block = f"layer{s.num_layers - 1}_block_output"
+            last_block = f"layer{s.num_layers - 1}_decoder_output"
             sections.append("[output_norm]")
             sections.append(f"Type = {norm_type}")
             sections.append(f"input_layers = {last_block}")
@@ -216,11 +216,11 @@ class IniEmitter:
 
         # Attention residual
         if b0 and b0.attn_residual:
-            lines.append(f"[{prefix}_attn_add]")
+            lines.append(f"[{prefix}_decoder_add]")
             lines.append("Type = addition")
             lines.append(f"input_layers = {input_name},{prefix}_attention_out")
             lines.append("")
-            ffn_norm_input = f"{prefix}_attn_add"
+            ffn_norm_input = f"{prefix}_decoder_add"
         else:
             ffn_norm_input = f"{prefix}_attention_out"
 
@@ -289,9 +289,9 @@ class IniEmitter:
 
         # FFN residual
         if b0 and b0.ffn_residual:
-            res_input = (f"{prefix}_attn_add" if b0.attn_residual
+            res_input = (f"{prefix}_decoder_add" if b0.attn_residual
                          else input_name)
-            lines.append(f"[{prefix}_block_output]")
+            lines.append(f"[{prefix}_decoder_output]")
             lines.append("Type = addition")
             lines.append(f"input_layers = {res_input},{prefix}_ffn_down")
             lines.append("")

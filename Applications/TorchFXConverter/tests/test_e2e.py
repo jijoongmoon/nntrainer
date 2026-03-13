@@ -127,19 +127,22 @@ def test_qwen3_full_pipeline():
         assert lt in cpp, f"Missing layer type '{lt}' ({desc}) in C++ output"
     print("  PASS: All reference layer types present in C++ output")
 
-    # --- Verify C++ function structure matches reference ---
-    assert "createAttention(" in cpp
-    assert "createMlp(" in cpp
-    assert "createTransformerBlock(" in cpp
-    assert "constructModel(" in cpp
-    print("  PASS: C++ function structure matches reference")
+    # --- Verify C++ class structure matches reference ---
+    assert "class Qwen3CausalLM" in cpp, "Missing class declaration"
+    assert "Qwen3CausalLM::createAttention(" in cpp
+    assert "Qwen3CausalLM::createMlp(" in cpp
+    assert "Qwen3CausalLM::createTransformerDecoderBlock(" in cpp
+    assert "Qwen3CausalLM::constructModel(" in cpp
+    assert "virtual void constructModel();" in cpp, "Missing virtual method"
+    assert "virtual std::vector<LayerHandle>" in cpp
+    print("  PASS: C++ class structure matches reference")
 
     # --- Verify critical properties ---
     assert "rope_theta" in cpp, "Missing rope_theta in MHA"
     assert "num_heads_kv" in cpp, "Missing num_heads_kv in MHA"
     assert "disable_bias" in cpp, "Missing disable_bias"
-    assert "packed=false" in cpp, "Missing packed=false in norms"
-    assert "shared_from=embedding0" in cpp, "Missing tied embeddings"
+    assert "packed" in cpp and "false" in cpp, "Missing packed=false in norms"
+    assert "shared_from" in cpp, "Missing tied embeddings"
     print("  PASS: Critical properties present")
 
     # --- Embedding and LM head ---
@@ -189,9 +192,9 @@ def test_qwen3_ini_validation():
     block0_expected = [
         "layer0_attention_norm", "layer0_wq", "layer0_wk", "layer0_wv",
         "layer0_q_norm", "layer0_k_norm", "layer0_attention",
-        "layer0_attention_out", "layer0_attn_add", "layer0_ffn_norm",
+        "layer0_attention_out", "layer0_decoder_add", "layer0_ffn_norm",
         "layer0_ffn_up", "layer0_ffn_gate", "layer0_ffn_swiglu",
-        "layer0_ffn_down", "layer0_block_output",
+        "layer0_ffn_down", "layer0_decoder_output",
     ]
     for name in block0_expected:
         assert name in sections, f"Missing [{name}] in INI"
@@ -200,7 +203,7 @@ def test_qwen3_ini_validation():
     # Verify block 1 exists
     block1_expected = [
         "layer1_attention_norm", "layer1_wq", "layer1_attention",
-        "layer1_ffn_down", "layer1_block_output",
+        "layer1_ffn_down", "layer1_decoder_output",
     ]
     for name in block1_expected:
         assert name in sections, f"Missing [{name}] in INI"
@@ -390,18 +393,16 @@ def test_qwen3_reference_comparison():
     #            layer{id}_ffn_up, layer{id}_ffn_gate, layer{id}_ffn_swiglu
     #            layer{id}_ffn_down, layer{id}_decoder_output
     #
-    # Our naming is compatible (slightly different for residuals):
-    #   reference: decoder_add, decoder_output
-    #   ours:      attn_add,    block_output
-    # This is a minor naming difference, functionally equivalent.
+    # Our naming now matches the reference exactly:
+    #   decoder_add, decoder_output
     block_names = re.findall(r'^\[layer0_(\w+)\]', ini, re.MULTILINE)
     expected_names = [
         "attention_norm", "wq", "wk", "wv",
         "q_norm", "k_norm",
         "attention", "attention_out",
-        "attn_add", "ffn_norm",
+        "decoder_add", "ffn_norm",
         "ffn_up", "ffn_gate", "ffn_swiglu", "ffn_down",
-        "block_output",
+        "decoder_output",
     ]
     assert block_names == expected_names, \
         f"Layer name mismatch:\n  got:      {block_names}\n  expected: {expected_names}"

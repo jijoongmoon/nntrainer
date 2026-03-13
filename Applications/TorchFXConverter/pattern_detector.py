@@ -112,6 +112,7 @@ class ModelStructure:
     intermediate_size: int = 0
     rope_theta: float = 0.0
     norm_eps: float = 0.0
+    max_position_embeddings: int = 0
 
     def summary(self):
         """Print detected model structure."""
@@ -271,6 +272,8 @@ class PatternDetector:
                                      getattr(cfg, "layer_norm_eps",
                                              getattr(cfg, "layer_norm_epsilon", 0.0)))
         structure.tie_word_embeddings = getattr(cfg, "tie_word_embeddings", False)
+        structure.max_position_embeddings = getattr(
+            cfg, "max_position_embeddings", 2048)
 
     # =========================================================================
     # Embedding & Head Detection

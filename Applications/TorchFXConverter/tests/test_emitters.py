@@ -83,7 +83,7 @@ def test_cpp_emitter_qwen3():
     assert "reshaped_rms_norm" in cpp_code, "No Q/K norms"
     print("  PASS: All expected layer types present")
 
-    # Constants
+    # Member variables
     assert "NUM_VOCAB = 151936" in cpp_code
     assert "DIM = 64" in cpp_code
     assert "NUM_LAYERS = 2" in cpp_code
@@ -92,14 +92,16 @@ def test_cpp_emitter_qwen3():
     assert "HEAD_DIM = 16" in cpp_code
     assert "INTERMEDIATE_SIZE = 128" in cpp_code
     assert "ROPE_THETA" in cpp_code
-    print("  PASS: Model constants correct")
+    print("  PASS: Member variables correct")
 
-    # Function structure
-    assert "createAttention" in cpp_code
-    assert "createMlp" in cpp_code
-    assert "createTransformerBlock" in cpp_code
-    assert "constructModel" in cpp_code
-    print("  PASS: Helper functions generated")
+    # Class structure
+    assert "class Qwen3CausalLM" in cpp_code, "No class declaration"
+    assert "Qwen3CausalLM::createAttention" in cpp_code
+    assert "Qwen3CausalLM::createMlp" in cpp_code
+    assert "Qwen3CausalLM::createTransformerDecoderBlock" in cpp_code
+    assert "Qwen3CausalLM::constructModel" in cpp_code
+    assert "virtual void constructModel();" in cpp_code
+    print("  PASS: Class-based structure generated")
 
     # Attention details
     assert "rope_theta" in cpp_code, "RoPE theta not in MHA"
@@ -123,6 +125,7 @@ def test_cpp_emitter_bert():
     layers, structure, config, model = _convert_bert()
     cpp_code = emit_cpp(layers, structure)
 
+    assert "class BertModel" in cpp_code, "No BERT class"
     assert "createLayer" in cpp_code
     assert "fully_connected" in cpp_code
     assert "encoder_only" in cpp_code
@@ -167,13 +170,13 @@ def test_ini_emitter_qwen3_structured():
     assert "[layer0_wv]" in ini_text, "No V projection"
     assert "[layer0_attention]" in ini_text, "No attention core"
     assert "[layer0_attention_out]" in ini_text, "No O projection"
-    assert "[layer0_attn_add]" in ini_text, "No attention residual"
+    assert "[layer0_decoder_add]" in ini_text, "No attention residual"
     assert "[layer0_ffn_norm]" in ini_text, "No FFN norm"
     assert "[layer0_ffn_up]" in ini_text, "No FFN up"
     assert "[layer0_ffn_gate]" in ini_text, "No FFN gate"
     assert "[layer0_ffn_swiglu]" in ini_text, "No SwiGLU"
     assert "[layer0_ffn_down]" in ini_text, "No FFN down"
-    assert "[layer0_block_output]" in ini_text, "No block output"
+    assert "[layer0_decoder_output]" in ini_text, "No block output"
     print("  PASS: Block 0 sections complete")
 
     # Block 1

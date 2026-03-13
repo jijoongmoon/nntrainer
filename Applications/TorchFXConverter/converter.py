@@ -42,7 +42,7 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     """
     from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
     from decomposer import AdaptiveConverter
-    from emitter_cpp import emit_cpp
+    from emitter_cpp import emit_cpp, emit_cpp_header, emit_cpp_source
     from emitter_ini import emit_ini
     from emitter_json import emit_json_string
     from weight_converter import WeightConverter
@@ -112,13 +112,19 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     outputs = {}
 
     if "cpp" in formats:
-        cpp_code = emit_cpp(layers, structure)
-        cpp_path = os.path.join(output_dir, "model.cpp")
-        with open(cpp_path, "w") as f:
-            f.write(cpp_code)
-        outputs["cpp"] = cpp_path
+        header_code = emit_cpp_header(layers, structure)
+        source_code = emit_cpp_source(layers, structure)
+        header_path = os.path.join(output_dir, "model.h")
+        source_path = os.path.join(output_dir, "model.cpp")
+        with open(header_path, "w") as f:
+            f.write(header_code)
+        with open(source_path, "w") as f:
+            f.write(source_code)
+        outputs["cpp_header"] = header_path
+        outputs["cpp_source"] = source_path
         if verbose:
-            print(f"  C++ code: {cpp_path} ({len(cpp_code)} bytes)")
+            print(f"  C++ header: {header_path} ({len(header_code)} bytes)")
+            print(f"  C++ source: {source_path} ({len(source_code)} bytes)")
 
     if "ini" in formats:
         ini_text = emit_ini(layers, structure, batch_size=batch_size,
