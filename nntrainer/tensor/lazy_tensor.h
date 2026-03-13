@@ -109,6 +109,26 @@ public:
   LazyTensor &erf_i();
 
   /**
+   * @brief     Wrapper method of exp_i. see tensor.h for more detail
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &exp_i();
+
+  /**
+   * @brief     Wrapper method of log_i. see tensor.h for more detail
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &log_i();
+
+  /**
+   * @brief     Wrapper method of clamp_i. see tensor.h for more detail
+   * @param[in] min minimum value
+   * @param[in] max maximum value
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &clamp_i(float min, float max);
+
+  /**
    * @brief     Wrapper method of inv_sqrt_i. see tensor.h for more detail
    * @retval    LazyTensor *this
    */

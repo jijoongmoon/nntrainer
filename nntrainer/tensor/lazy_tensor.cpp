@@ -134,6 +134,40 @@ LazyTensor &LazyTensor::erf_i() {
 }
 
 /**
+ * @brief     Wrapper method of exp_i. see tensor.h for more detail
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::exp_i() {
+  auto f = [](Tensor &t) mutable -> int { return t.exp_i(); };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of log_i. see tensor.h for more detail
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::log_i() {
+  auto f = [](Tensor &t) mutable -> int { return t.log_i(); };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of clamp_i. see tensor.h for more detail
+ * @param[in] min minimum value
+ * @param[in] max maximum value
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::clamp_i(float min, float max) {
+  auto f = [min, max](Tensor &t) mutable -> int {
+    return t.clamp_i(min, max);
+  };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
  * @brief     Wrapper method of inv_sqrt_i. see tensor.h for more detail
  * @retval    LazyTensor *this
  */

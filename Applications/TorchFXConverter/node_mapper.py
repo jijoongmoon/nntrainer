@@ -27,6 +27,7 @@ from nntrainer_layers import (
     LAYER_CONV1D, LAYER_CONV2D, LAYER_BATCH_NORM, LAYER_POOLING2D,
     LAYER_ADD, LAYER_MULTIPLY, LAYER_SUBTRACT, LAYER_DIVIDE,
     LAYER_POW, LAYER_SQRT, LAYER_NEGATIVE,
+    LAYER_EXP, LAYER_LOG, LAYER_CLAMP,
     LAYER_SIN, LAYER_COS, LAYER_TAN, LAYER_GATHER, LAYER_SLICE,
     LAYER_REDUCE_MEAN, LAYER_REDUCE_SUM,
     LAYER_FLATTEN, LAYER_TRANSPOSE, LAYER_IDENTITY, LAYER_CAST,
@@ -315,6 +316,35 @@ class NodeMapper:
             name = f"{name}_{suffix}"
         return name
 
+    @staticmethod
+    def _extract_clamp_params(node, op_name, props):
+        """Extract min/max parameters from clamp/clip FX node."""
+        import math
+        args = node.args
+        kwargs = node.kwargs or {}
+
+        if op_name == "clamp_min":
+            props["min"] = str(args[1] if len(args) > 1 else kwargs.get("min", 0))
+            props["max"] = str(math.inf)
+        elif op_name == "clamp_max":
+            props["min"] = str(-math.inf)
+            props["max"] = str(args[1] if len(args) > 1 else kwargs.get("max", 0))
+        else:
+            # clamp(input, min=None, max=None) or clamp(input, min, max)
+            if len(args) > 1:
+                props["min"] = str(args[1])
+            elif "min" in kwargs and kwargs["min"] is not None:
+                props["min"] = str(kwargs["min"])
+            else:
+                props["min"] = str(-math.inf)
+
+            if len(args) > 2:
+                props["max"] = str(args[2])
+            elif "max" in kwargs and kwargs["max"] is not None:
+                props["max"] = str(kwargs["max"])
+            else:
+                props["max"] = str(math.inf)
+
     def _map_function_node(self, node) -> Optional[NNTrainerLayerDef]:
         """Map a call_function node to NNTrainer layer def."""
         func = node.target
@@ -490,22 +520,20 @@ class NodeMapper:
                 hf_module_name=scope,
             )
 
-        # torch.exp(x) -> unsupported, needs decomposition
+        # torch.exp(x) -> Tensor::exp()
         if func_name == "exp":
             return NNTrainerLayerDef(
-                layer_type=OP_UNSUPPORTED,
+                layer_type=LAYER_EXP,
                 name=self._make_scoped_name(scope, node),
-                properties={"original_op": "exp"},
                 input_layers=input_names,
                 hf_module_name=scope,
             )
 
-        # torch.log(x) -> unsupported, needs decomposition
+        # torch.log(x) -> Tensor::log()
         if func_name == "log":
             return NNTrainerLayerDef(
-                layer_type=OP_UNSUPPORTED,
+                layer_type=LAYER_LOG,
                 name=self._make_scoped_name(scope, node),
-                properties={"original_op": "log"},
                 input_layers=input_names,
                 hf_module_name=scope,
             )
@@ -520,12 +548,15 @@ class NodeMapper:
                 hf_module_name=scope,
             )
 
-        # torch.clamp / torch.clip -> unsupported
+        # torch.clamp / torch.clip -> Tensor::clamp()
         if func_name in ("clamp", "clip", "clamp_min", "clamp_max"):
+            props = {"original_op": func_name}
+            # Extract min/max from node args/kwargs
+            self._extract_clamp_params(node, func_name, props)
             return NNTrainerLayerDef(
-                layer_type=OP_UNSUPPORTED,
+                layer_type=LAYER_CLAMP,
                 name=self._make_scoped_name(scope, node),
-                properties={"original_op": func_name},
+                properties=props,
                 input_layers=input_names,
                 hf_module_name=scope,
             )
@@ -802,22 +833,20 @@ class NodeMapper:
                 hf_module_name=scope,
             )
 
-        # Tensor.exp -> unsupported (decompose)
+        # Tensor.exp -> Tensor::exp()
         if method_name == "exp":
             return NNTrainerLayerDef(
-                layer_type=OP_UNSUPPORTED,
+                layer_type=LAYER_EXP,
                 name=self._make_scoped_name(scope, node),
-                properties={"original_op": "exp"},
                 input_layers=input_names,
                 hf_module_name=scope,
             )
 
-        # Tensor.log -> unsupported (decompose)
+        # Tensor.log -> Tensor::log()
         if method_name == "log":
             return NNTrainerLayerDef(
-                layer_type=OP_UNSUPPORTED,
+                layer_type=LAYER_LOG,
                 name=self._make_scoped_name(scope, node),
-                properties={"original_op": "log"},
                 input_layers=input_names,
                 hf_module_name=scope,
             )
@@ -832,12 +861,14 @@ class NodeMapper:
                 hf_module_name=scope,
             )
 
-        # Tensor.clamp / clip -> unsupported
+        # Tensor.clamp / clip -> Tensor::clamp()
         if method_name in ("clamp", "clip", "clamp_", "clamp_min", "clamp_max"):
+            props = {"original_op": method_name}
+            self._extract_clamp_params(node, method_name, props)
             return NNTrainerLayerDef(
-                layer_type=OP_UNSUPPORTED,
+                layer_type=LAYER_CLAMP,
                 name=self._make_scoped_name(scope, node),
-                properties={"original_op": method_name},
+                properties=props,
                 input_layers=input_names,
                 hf_module_name=scope,
             )

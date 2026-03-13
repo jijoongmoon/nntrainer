@@ -108,6 +108,9 @@ LAYER_DIVIDE = "divide"
 LAYER_POW = "pow"
 LAYER_SQRT = "sqrt"
 LAYER_NEGATIVE = "negative"
+LAYER_EXP = "exp"
+LAYER_LOG = "log"
+LAYER_CLAMP = "clamp"
 
 # Trigonometric / math functions
 LAYER_SIN = "sin"
@@ -162,7 +165,7 @@ OP_UNSUPPORTED = "unsupported"
 #
 # NNTrainer Tensor class supports these methods directly:
 #   Arithmetic (in-place): add_i, subtract_i, multiply_i, divide_i
-#   Element-wise math:     pow, sqrt, abs, neg, erf, inv_sqrt
+#   Element-wise math:     pow, sqrt, abs, neg, erf, exp, log, clamp, inv_sqrt
 #   Trigonometric:         sin, cos, tan
 #   Reduction:             sum, average, sum_by_batch
 #   Matrix:                dot (matmul)
@@ -183,6 +186,7 @@ LAZY_TENSOR_OPS = frozenset({
     LAYER_MULTIPLY, LAYER_DIVIDE,
     # Math
     LAYER_POW, LAYER_SQRT, LAYER_NEGATIVE,
+    LAYER_EXP, LAYER_LOG, LAYER_CLAMP,
     LAYER_SIN, LAYER_COS, LAYER_TAN,
 })
 
@@ -190,6 +194,7 @@ LAZY_TENSOR_OPS = frozenset({
 # These can be used for single-op resolution or within a LazyTensor chain.
 TENSOR_METHOD_OPS = frozenset({
     LAYER_POW, LAYER_SQRT, LAYER_NEGATIVE,
+    LAYER_EXP, LAYER_LOG, LAYER_CLAMP,
     LAYER_SIN, LAYER_COS, LAYER_TAN,
     LAYER_REDUCE_MEAN, LAYER_REDUCE_SUM,
     LAYER_MATMUL,  # dot()
@@ -204,6 +209,12 @@ TENSOR_DIRECT_METHODS = {
     "erf": ("erf", False),           # Tensor::erf(out)
     "pow": ("pow", False),           # Tensor::pow(exponent, out)
     "sqrt": ("sqrt", False),         # Tensor::sqrt(out)
+    "exp": ("exp", False),           # Tensor::exp(out) or exp_i()
+    "log": ("log", False),           # Tensor::log(out) or log_i()
+    "clamp": ("clamp", True),        # Tensor::clamp(min, max, out) or clamp_i()
+    "clip": ("clamp", True),         # Alias for clamp
+    "clamp_min": ("clamp", True),    # clamp with max=FLT_MAX
+    "clamp_max": ("clamp", True),    # clamp with min=-FLT_MAX
     "sin": ("sin", False),           # Tensor::sin(out)
     "cos": ("cos", False),           # Tensor::cos(out)
     "tan": ("tan", False),           # Tensor::tan(out)

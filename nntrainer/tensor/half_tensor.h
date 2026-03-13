@@ -371,6 +371,21 @@ public:
   Tensor &erf(Tensor &output) const override;
 
   /**
+   * @copydoc TensorBase::exp(Tensor &output)
+   */
+  Tensor &exp(Tensor &output) const override;
+
+  /**
+   * @copydoc TensorBase::log(Tensor &output)
+   */
+  Tensor &log(Tensor &output) const override;
+
+  /**
+   * @copydoc TensorBase::clamp(float min, float max, Tensor &output)
+   */
+  Tensor &clamp(float min, float max, Tensor &output) const override;
+
+  /**
    * @copydoc Tensor::tan(Tensor &output, float alpha)
    */
   void tan(Tensor &output, float alpha) override;

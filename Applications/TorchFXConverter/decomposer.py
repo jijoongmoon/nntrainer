@@ -136,6 +136,8 @@ class LazyTensorChain:
         _UNARY_OPS = {
             "sqrt": "sqrt_i",
             "negative": "neg",
+            "exp": "exp_i",
+            "log": "log_i",
             "sin": "sin",
             "cos": "cos",
             "tan": "tan",
@@ -154,6 +156,10 @@ class LazyTensorChain:
             elif lt == "pow":
                 exp = layer.properties.get("exponent", "2.0")
                 parts.append(f"pow_i({exp}f)")
+            elif lt == "clamp":
+                mn = layer.properties.get("min", "-inf")
+                mx = layer.properties.get("max", "inf")
+                parts.append(f"clamp_i({mn}f, {mx}f)")
             elif lt in _UNARY_OPS:
                 parts.append(f"{_UNARY_OPS[lt]}()")
         parts.append("run()")

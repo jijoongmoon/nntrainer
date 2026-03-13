@@ -203,6 +203,49 @@ TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_neg_abs_01_p) {
   EXPECT_TRUE(target.chain().neg().abs().run() == expected);
 }
 
+// exp_i: exp(0) = 1, exp(1) ≈ 2.71828
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_exp_01_p) {
+  target = constant_(0.0f);
+  expected = constant_(1.0f);
+  EXPECT_TRUE(target.chain().exp_i().run() == expected);
+}
+
+// log_i: log(1) = 0
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_log_01_p) {
+  target = constant_(1.0f);
+  expected = constant_(0.0f);
+  EXPECT_TRUE(target.chain().log_i().run() == expected);
+}
+
+// exp then log should be identity
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_exp_log_01_p) {
+  target = constant_(2.0f);
+  expected = constant_(2.0f);
+  EXPECT_TRUE(target.chain().exp_i().log_i().run() == expected);
+}
+
+// clamp_i
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_clamp_01_p) {
+  target = constant_(10.0f);
+  expected = constant_(5.0f);
+  EXPECT_TRUE(target.chain().clamp_i(-5.0f, 5.0f).run() == expected);
+}
+
+// clamp_i lower bound
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_clamp_02_p) {
+  target = constant_(-10.0f);
+  expected = constant_(-3.0f);
+  EXPECT_TRUE(target.chain().clamp_i(-3.0f, 3.0f).run() == expected);
+}
+
+// clamp in chain: exp(0) = 1, clamp(0.5, 2.0) -> 1.0
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_clamp_chain_01_p) {
+  target = constant_(0.0f);
+  expected = constant_(1.0f);
+  EXPECT_TRUE(
+    target.chain().exp_i().clamp_i(0.5f, 2.0f).run() == expected);
+}
+
 // sum()
 TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_08_p) {
   target = constant(1.0f, 4, 4, 4, 4);

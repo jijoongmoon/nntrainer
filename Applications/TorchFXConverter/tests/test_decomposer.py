@@ -276,16 +276,17 @@ def test_reciprocal_layer_decomposition():
 
 def test_unsupported_op_preserved():
     """Ops without any resolution should be preserved with warning."""
+    # Use a truly unsupported op (not exp/log/clamp which are now supported)
     layer = NNTrainerLayerDef(
         layer_type=OP_UNSUPPORTED,
-        name="test_exp",
-        properties={"original_op": "exp"},
+        name="test_bitwise_and",
+        properties={"original_op": "bitwise_and"},
         input_layers=["input"],
     )
     result = resolve_unsupported_ops([layer])
     assert len(result) == 1
     assert result[0].layer_type == OP_UNSUPPORTED
-    print("  PASS: exp preserved as unsupported (no resolution available)")
+    print("  PASS: bitwise_and preserved as unsupported (no resolution available)")
 
 
 # ============================================================================

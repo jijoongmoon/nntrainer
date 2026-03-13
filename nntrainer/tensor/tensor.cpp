@@ -930,6 +930,51 @@ void Tensor::tan(Tensor &output, float alpha) const {
   itensor_->tan(output, alpha);
 }
 
+int Tensor::exp_i() {
+  exp(*this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::exp() const {
+  Tensor output("", getFormat(), getDataType());
+  return exp(output);
+}
+
+Tensor &Tensor::exp(Tensor &output) const {
+  itensor_->exp(output);
+  return output;
+}
+
+int Tensor::log_i() {
+  log(*this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::log() const {
+  Tensor output("", getFormat(), getDataType());
+  return log(output);
+}
+
+Tensor &Tensor::log(Tensor &output) const {
+  itensor_->log(output);
+  return output;
+}
+
+int Tensor::clamp_i(float min, float max) {
+  clamp(min, max, *this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::clamp(float min, float max) const {
+  Tensor output("", getFormat(), getDataType());
+  return clamp(min, max, output);
+}
+
+Tensor &Tensor::clamp(float min, float max, Tensor &output) const {
+  itensor_->clamp(min, max, output);
+  return output;
+}
+
 void Tensor::inv_sqrt_i() { itensor_->inv_sqrt(*this); }
 
 Tensor Tensor::inv_sqrt(Tensor &out) const {
