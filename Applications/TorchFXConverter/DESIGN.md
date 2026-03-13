@@ -125,15 +125,19 @@ we detect patterns from **module hierarchy** and **data flow**:
 - Task 4.3: JSON config emitter (emitter_json.py) ✓
 - Task 4.4: Weight converter (weight_converter.py) ✓
 
-### Phase 5: End-to-End Validation
-- Task 5.1: Qwen3-0.6B full pipeline test
-- Task 5.2: BERT-base test
-- Task 5.3: T5-small test (encoder-decoder)
-- Task 5.4: Layer-by-layer comparison with reference
+### Phase 5: End-to-End Validation ✓
+- Task 5.1: Qwen3 full pipeline + reference comparison ✓
+- Task 5.2: BERT encoder-only test ✓
+- Task 5.3: mT5 encoder-decoder test ✓
+- Task 5.4: Layer-by-layer comparison with CausalLM reference ✓
+- Task 5.5: INI section validation + connectivity check ✓
+- Task 5.6: JSON schema validation + roundtrip ✓
+- Task 5.7: Weight binary roundtrip verification ✓
 
-### Phase 6: CLI
-- Task 6.1: converter.py main entry point
-- Task 6.2: Conversion report generation
+### Phase 6: CLI ✓
+- Task 6.1: converter.py main entry point ✓
+- Task 6.2: Multi-format output (--format cpp ini json) ✓
+- Task 6.3: Weight conversion (--weights --dtype float16) ✓
 
 ## Weight Conversion Rules
 
