@@ -1,10 +1,11 @@
-"""Test adaptive decomposition pipeline.
+"""Test adaptive decomposition pipeline with LazyTensor support.
 
 Tests:
   1. Known models (Qwen3, BERT, mT5) pass through without decomposition
   2. Custom unknown modules are automatically decomposed into tensor ops
-  3. Unsupported ops (rsqrt, abs) are decomposed into supported primitives
-  4. The full pipeline produces zero unknowns for standard architectures
+  3. Unsupported ops resolved via Tensor methods or layer decomposition
+  4. LazyTensor chain detection for consecutive arithmetic ops
+  5. Exclude leaf types in tracer
 """
 import sys
 import os
@@ -12,8 +13,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
-from decomposer import AdaptiveConverter, decompose_unsupported_ops, DECOMPOSITION_REGISTRY
-from nntrainer_layers import NNTrainerLayerDef, OP_UNSUPPORTED, LAYER_POW, LAYER_SQRT, LAYER_MULTIPLY
+from decomposer import (
+    AdaptiveConverter, resolve_unsupported_ops, detect_lazy_chains,
+    LazyTensorChain,
+)
+from nntrainer_layers import (
+    NNTrainerLayerDef, OP_UNSUPPORTED, LAYER_POW, LAYER_SQRT,
+    LAYER_MULTIPLY, LAYER_DIVIDE, LAYER_ADD, LAYER_ADDITION, LAYER_SUBTRACT,
+    TENSOR_DIRECT_METHODS,
+)
+
+# backward compat alias
+decompose_unsupported_ops = resolve_unsupported_ops
 
 
 # ============================================================================
@@ -200,48 +211,129 @@ def test_forced_leaf_decomposition():
 # Test 3: Op-level decomposition (rsqrt, abs)
 # ============================================================================
 
-def test_rsqrt_decomposition():
-    """rsqrt should decompose to pow(x, -0.5)."""
+def test_rsqrt_tensor_method():
+    """rsqrt should resolve to Tensor::inv_sqrt() (direct method)."""
     layer = NNTrainerLayerDef(
         layer_type=OP_UNSUPPORTED,
         name="test_rsqrt",
         properties={"original_op": "rsqrt"},
         input_layers=["input"],
     )
-    result = decompose_unsupported_ops([layer])
+    result = resolve_unsupported_ops([layer])
     assert len(result) == 1
-    assert result[0].layer_type == LAYER_POW
-    assert result[0].properties.get("exponent") == -0.5
-    print("  PASS: rsqrt -> pow(x, -0.5)")
+    assert result[0].layer_type == "tensor_op:rsqrt"
+    assert result[0].properties["tensor_method"] == "inv_sqrt"
+    print("  PASS: rsqrt -> Tensor::inv_sqrt() (direct method)")
 
 
-def test_abs_decomposition():
-    """abs(x) should decompose to sqrt(x * x)."""
+def test_abs_tensor_method():
+    """abs should resolve to Tensor::abs() (direct method)."""
     layer = NNTrainerLayerDef(
         layer_type=OP_UNSUPPORTED,
         name="test_abs",
         properties={"original_op": "abs"},
         input_layers=["input"],
     )
-    result = decompose_unsupported_ops([layer])
-    assert len(result) == 2
-    assert result[0].layer_type == LAYER_MULTIPLY  # x * x
-    assert result[1].layer_type == LAYER_SQRT       # sqrt(x*x)
-    print("  PASS: abs(x) -> sqrt(x * x)")
+    result = resolve_unsupported_ops([layer])
+    assert len(result) == 1
+    assert result[0].layer_type == "tensor_op:abs"
+    assert result[0].properties["tensor_method"] == "abs"
+    print("  PASS: abs -> Tensor::abs() (direct method)")
+
+
+def test_all_tensor_direct_methods():
+    """All ops in TENSOR_DIRECT_METHODS should resolve to tensor_op: types."""
+    for op_name, (method_name, _) in TENSOR_DIRECT_METHODS.items():
+        layer = NNTrainerLayerDef(
+            layer_type=OP_UNSUPPORTED,
+            name=f"test_{op_name}",
+            properties={"original_op": op_name},
+            input_layers=["input"],
+        )
+        result = resolve_unsupported_ops([layer])
+        assert len(result) == 1, f"{op_name}: expected 1 result, got {len(result)}"
+        assert result[0].layer_type == f"tensor_op:{op_name}", \
+            f"{op_name}: expected tensor_op:{op_name}, got {result[0].layer_type}"
+        assert result[0].properties["tensor_method"] == method_name, \
+            f"{op_name}: expected method {method_name}"
+    print(f"  PASS: All {len(TENSOR_DIRECT_METHODS)} Tensor direct methods resolve correctly")
+
+
+def test_reciprocal_layer_decomposition():
+    """reciprocal should decompose to divide(1, x) via layer decomposition."""
+    layer = NNTrainerLayerDef(
+        layer_type=OP_UNSUPPORTED,
+        name="test_reciprocal",
+        properties={"original_op": "reciprocal"},
+        input_layers=["input"],
+    )
+    result = resolve_unsupported_ops([layer])
+    assert len(result) == 1
+    assert result[0].layer_type == LAYER_DIVIDE
+    assert result[0].properties.get("numerator") == 1.0
+    print("  PASS: reciprocal -> divide(1, x) (layer decomposition)")
 
 
 def test_unsupported_op_preserved():
-    """Ops without decomposition should be preserved with warning."""
+    """Ops without any resolution should be preserved with warning."""
     layer = NNTrainerLayerDef(
         layer_type=OP_UNSUPPORTED,
         name="test_exp",
         properties={"original_op": "exp"},
         input_layers=["input"],
     )
-    result = decompose_unsupported_ops([layer])
+    result = resolve_unsupported_ops([layer])
     assert len(result) == 1
     assert result[0].layer_type == OP_UNSUPPORTED
-    print("  PASS: exp preserved as unsupported (no decomposition available)")
+    print("  PASS: exp preserved as unsupported (no resolution available)")
+
+
+# ============================================================================
+# Test 3b: LazyTensor chain detection
+# ============================================================================
+
+def test_lazy_chain_detection():
+    """Consecutive arithmetic ops should be detected as LazyTensor chains."""
+    layers = [
+        NNTrainerLayerDef(layer_type="embedding_layer", name="embed", input_layers=[]),
+        NNTrainerLayerDef(layer_type=LAYER_ADD, name="add1", input_layers=["embed"]),
+        NNTrainerLayerDef(layer_type=LAYER_MULTIPLY, name="mul1", input_layers=["add1"]),
+        NNTrainerLayerDef(layer_type=LAYER_SUBTRACT, name="sub1", input_layers=["mul1"]),
+        NNTrainerLayerDef(layer_type="fully_connected", name="fc", input_layers=["sub1"]),
+        NNTrainerLayerDef(layer_type=LAYER_ADDITION, name="residual", input_layers=["fc"]),
+        NNTrainerLayerDef(layer_type=LAYER_DIVIDE, name="div1", input_layers=["residual"]),
+    ]
+
+    chains = detect_lazy_chains(layers)
+    assert len(chains) == 2, f"Expected 2 chains, got {len(chains)}"
+
+    # First chain: add1 -> mul1 -> sub1 (3 ops)
+    assert chains[0].chain_length == 3
+    assert chains[0].start_idx == 1
+
+    # Second chain: residual -> div1 (2 ops)
+    assert chains[1].chain_length == 2
+    assert chains[1].start_idx == 5
+
+    print(f"  PASS: LazyTensor chains detected: {chains}")
+
+
+def test_lazy_chain_cpp_generation():
+    """LazyTensor chain should generate valid C++ code."""
+    layers = [
+        NNTrainerLayerDef(layer_type=LAYER_ADD, name="add1",
+                          input_layers=["x", "bias"]),
+        NNTrainerLayerDef(layer_type=LAYER_MULTIPLY, name="mul1",
+                          input_layers=["add1", "scale"]),
+    ]
+
+    chain = LazyTensorChain(layers, 0)
+    cpp = chain.to_cpp_chain("hidden")
+    assert "hidden.chain()" in cpp
+    assert "add_i(bias)" in cpp
+    assert "multiply_i(scale)" in cpp
+    assert "run()" in cpp
+    print(f"  PASS: LazyTensor C++ code: {cpp}")
 
 
 # ============================================================================
@@ -286,11 +378,19 @@ def test_exclude_leaf_types():
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("TEST: Op-level decomposition")
+    print("TEST: Tensor method resolution (rsqrt, abs, etc.)")
     print("=" * 70)
-    test_rsqrt_decomposition()
-    test_abs_decomposition()
+    test_rsqrt_tensor_method()
+    test_abs_tensor_method()
+    test_all_tensor_direct_methods()
+    test_reciprocal_layer_decomposition()
     test_unsupported_op_preserved()
+
+    print("\n" + "=" * 70)
+    print("TEST: LazyTensor chain detection")
+    print("=" * 70)
+    test_lazy_chain_detection()
+    test_lazy_chain_cpp_generation()
 
     print("\n" + "=" * 70)
     print("TEST: Tracer exclude_leaf_types")

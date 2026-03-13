@@ -152,3 +152,50 @@ OP_NOOP = "noop"  # No-op (skipped in final output)
 
 # Unsupported op marker (for ops requiring decomposition into supported primitives)
 OP_UNSUPPORTED = "unsupported"
+
+# =============================================================================
+# NNTrainer Tensor & LazyTensor method mappings
+# =============================================================================
+# These define which operations can be expressed as Tensor methods or
+# LazyTensor chains in generated C++ code. Used by the decomposer to choose
+# the most efficient emission strategy.
+#
+# NNTrainer Tensor class supports these methods directly:
+#   Arithmetic (in-place): add_i, subtract_i, multiply_i, divide_i
+#   Element-wise math:     pow, sqrt, abs, neg, erf, inv_sqrt
+#   Trigonometric:         sin, cos, tan
+#   Reduction:             sum, average, sum_by_batch
+#   Matrix:                dot (matmul)
+#   Shape:                 transpose
+#
+# LazyTensor (Tensor::chain()) supports chaining these in-place ops:
+#   add_i, subtract_i, multiply_i, divide_i, dot, transpose, sum, average
+
+# Ops that can be chained via LazyTensor (in-place, no shape change)
+LAZY_TENSOR_OPS = frozenset({
+    LAYER_ADD, LAYER_ADDITION, LAYER_SUBTRACT,
+    LAYER_MULTIPLY, LAYER_DIVIDE,
+})
+
+# Ops that are available as direct Tensor methods (not in LazyTensor but
+# available on Tensor itself - can be used for single-op decomposition)
+TENSOR_METHOD_OPS = frozenset({
+    LAYER_POW, LAYER_SQRT, LAYER_NEGATIVE,
+    LAYER_SIN, LAYER_COS, LAYER_TAN,
+    LAYER_REDUCE_MEAN, LAYER_REDUCE_SUM,
+    LAYER_MATMUL,  # dot()
+})
+
+# Direct Tensor methods for ops that would otherwise need decomposition.
+# Maps PyTorch op name -> (NNTrainer Tensor method, is_in_place)
+TENSOR_DIRECT_METHODS = {
+    "rsqrt": ("inv_sqrt", False),    # Tensor::inv_sqrt(out) or inv_sqrt_i()
+    "abs": ("abs", False),           # Tensor::abs(out)
+    "neg": ("neg", False),           # Tensor::neg(out)
+    "erf": ("erf", False),           # Tensor::erf(out)
+    "pow": ("pow", False),           # Tensor::pow(exponent, out)
+    "sqrt": ("sqrt", False),         # Tensor::sqrt(out)
+    "sin": ("sin", False),           # Tensor::sin(out)
+    "cos": ("cos", False),           # Tensor::cos(out)
+    "tan": ("tan", False),           # Tensor::tan(out)
+}
