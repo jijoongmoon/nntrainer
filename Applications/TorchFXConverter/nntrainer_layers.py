@@ -112,6 +112,7 @@ LAYER_NEGATIVE = "negative"
 # Trigonometric / math functions
 LAYER_SIN = "sin"
 LAYER_COS = "cos"
+LAYER_TAN = "tan"
 
 # Reduction operations
 LAYER_REDUCE_MEAN = "reduce_mean"
@@ -120,6 +121,12 @@ LAYER_REDUCE_SUM = "reduce_sum"
 # Indexing / selection
 LAYER_GATHER = "gather"
 LAYER_SLICE = "slice"
+
+# Tensor manipulation
+LAYER_FLATTEN = "flatten"
+LAYER_TRANSPOSE = "transpose"
+LAYER_IDENTITY = "identity"
+LAYER_CAST = "cast"
 
 # Convolution & pooling
 LAYER_CONV1D = "conv1d"
@@ -142,3 +149,6 @@ OP_TRANSPOSE = "transpose_op"
 OP_PERMUTE = "permute_op"
 OP_SDPA = "sdpa"
 OP_NOOP = "noop"  # No-op (skipped in final output)
+
+# Unsupported op marker (for ops requiring decomposition into supported primitives)
+OP_UNSUPPORTED = "unsupported"

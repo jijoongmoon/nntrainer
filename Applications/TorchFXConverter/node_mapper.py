@@ -27,9 +27,11 @@ from nntrainer_layers import (
     LAYER_CONV1D, LAYER_CONV2D, LAYER_BATCH_NORM, LAYER_POOLING2D,
     LAYER_ADD, LAYER_MULTIPLY, LAYER_SUBTRACT, LAYER_DIVIDE,
     LAYER_POW, LAYER_SQRT, LAYER_NEGATIVE,
-    LAYER_SIN, LAYER_COS, LAYER_GATHER, LAYER_SLICE,
+    LAYER_SIN, LAYER_COS, LAYER_TAN, LAYER_GATHER, LAYER_SLICE,
+    LAYER_REDUCE_MEAN, LAYER_REDUCE_SUM,
+    LAYER_FLATTEN, LAYER_TRANSPOSE, LAYER_IDENTITY, LAYER_CAST,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
-    OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE, OP_SDPA, OP_NOOP,
+    OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE, OP_SDPA, OP_NOOP, OP_UNSUPPORTED,
 )
 from tracer import _is_rmsnorm
 
@@ -75,8 +77,7 @@ class NodeMapper:
     def map_all(self):
         """Map all graph nodes to NNTrainer layer definitions.
 
-        Returns a list of NNTrainerLayerDef objects in graph order,
-        plus a dict mapping node names to layer defs.
+        Returns a list of NNTrainerLayerDef objects in graph order.
         """
         layers = []
         for node in self.graph.nodes:
@@ -85,6 +86,34 @@ class NodeMapper:
                 layers.append(layer_def)
                 self._node_to_layer[node.name] = layer_def
         return layers
+
+    def get_unknown_layers(self, layers=None):
+        """Return layers that could not be mapped to NNTrainer types.
+
+        Returns:
+            List of NNTrainerLayerDef with unknown layer_type.
+        """
+        if layers is None:
+            layers = self.map_all()
+        return [l for l in layers if l.layer_type.startswith("unknown")
+                or l.layer_type == OP_UNSUPPORTED]
+
+    def get_unknown_module_types(self, layers=None):
+        """Return set of module class names that could not be mapped.
+
+        These modules should be excluded from LEAF_MODULES on re-trace,
+        allowing the tracer to decompose them into tensor ops.
+
+        Returns:
+            Set of class name strings (e.g. {"CustomAttention", "MyNorm"}).
+        """
+        unknowns = self.get_unknown_layers(layers)
+        module_types = set()
+        for layer in unknowns:
+            if layer.layer_type.startswith("unknown("):
+                # Extract module type from "unknown(SomeModule)"
+                module_types.add(layer.layer_type[8:-1])
+        return module_types
 
     def _map_node(self, node) -> Optional[NNTrainerLayerDef]:
         """Map a single FX node to an NNTrainer layer definition."""
@@ -362,14 +391,6 @@ class NodeMapper:
                 input_layers=input_names,
             )
 
-        # torch.abs -> pow (abs can be represented as sqrt(x^2) or kept as-is)
-        if func is torch.abs:
-            return NNTrainerLayerDef(
-                layer_type="abs",  # Will need custom handling or decomposition
-                name=self._make_scoped_name(scope, node),
-                input_layers=input_names,
-            )
-
         # torch.neg / operator.neg -> negative
         if func in (torch.neg, operator.neg):
             return NNTrainerLayerDef(
@@ -396,12 +417,127 @@ class NodeMapper:
                 input_layers=input_names,
             )
 
-        # torch.log -> needs decomposition or custom op
-        if func_name == "log":
+        # torch.tan -> tan
+        if func is torch.tan:
             return NNTrainerLayerDef(
-                layer_type="log",  # Not directly in NNTrainer; pattern_detector may handle
+                layer_type=LAYER_TAN,
                 name=self._make_scoped_name(scope, node),
                 input_layers=input_names,
+            )
+
+        # torch.mean -> reduce_mean
+        if func is torch.mean:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_REDUCE_MEAN,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.sum -> reduce_sum
+        if func is torch.sum:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_REDUCE_SUM,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.flatten -> flatten
+        if func is torch.flatten:
+            return NNTrainerLayerDef(
+                layer_type=LAYER_FLATTEN,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # torch.reshape -> reshape_op (intermediate)
+        if func is torch.reshape:
+            return NNTrainerLayerDef(
+                layer_type=OP_RESHAPE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # torch.transpose -> transpose_op (intermediate)
+        if func is torch.transpose:
+            return NNTrainerLayerDef(
+                layer_type=OP_TRANSPOSE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # torch.unsqueeze / torch.squeeze -> reshape_op
+        if func_name in ("unsqueeze", "squeeze"):
+            return NNTrainerLayerDef(
+                layer_type=OP_RESHAPE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # === Ops without direct NNTrainer support -> decompose ===
+        # These are marked as unsupported and will be decomposed by the
+        # decomposer into sequences of supported NNTrainer tensor ops.
+
+        # torch.rsqrt(x) -> decompose to: pow(x, -0.5) or 1/sqrt(x)
+        if func_name == "rsqrt":
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": "rsqrt", "decompose_to": "pow(x, -0.5)"},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # torch.exp(x) -> unsupported, needs decomposition
+        if func_name == "exp":
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": "exp"},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # torch.log(x) -> unsupported, needs decomposition
+        if func_name == "log":
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": "log"},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # torch.abs(x) -> decompose to: sqrt(pow(x, 2))
+        if func is torch.abs:
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": "abs", "decompose_to": "sqrt(pow(x, 2))"},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # torch.clamp / torch.clip -> unsupported
+        if func_name in ("clamp", "clip", "clamp_min", "clamp_max"):
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": func_name},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # torch.reciprocal(x) -> decompose to: divide(1, x)
+        if func_name == "reciprocal":
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": "reciprocal", "decompose_to": "divide(1, x)"},
+                input_layers=input_names,
+                hf_module_name=scope,
             )
 
         # === Shape / structure ops ===
@@ -632,6 +768,80 @@ class NodeMapper:
                 hf_module_name=scope,
             )
 
+        # Tensor.mean -> reduce_mean
+        if method_name == "mean":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_REDUCE_MEAN,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # Tensor.sum -> reduce_sum
+        if method_name == "sum":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_REDUCE_SUM,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # Tensor.flatten -> flatten
+        if method_name == "flatten":
+            return NNTrainerLayerDef(
+                layer_type=LAYER_FLATTEN,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+            )
+
+        # Tensor.abs -> unsupported (decompose)
+        if method_name == "abs":
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": "abs", "decompose_to": "sqrt(pow(x, 2))"},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # Tensor.exp -> unsupported (decompose)
+        if method_name == "exp":
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": "exp"},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # Tensor.log -> unsupported (decompose)
+        if method_name == "log":
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": "log"},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # Tensor.rsqrt -> unsupported (decompose to pow(x, -0.5))
+        if method_name == "rsqrt":
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": "rsqrt", "decompose_to": "pow(x, -0.5)"},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # Tensor.clamp / clip -> unsupported
+        if method_name in ("clamp", "clip", "clamp_", "clamp_min", "clamp_max"):
+            return NNTrainerLayerDef(
+                layer_type=OP_UNSUPPORTED,
+                name=self._make_scoped_name(scope, node),
+                properties={"original_op": method_name},
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
         # Tensor.__getitem__ (indexing/slicing) -> slice
         if method_name == "__getitem__":
             return NNTrainerLayerDef(
@@ -644,6 +854,24 @@ class NodeMapper:
         if method_name in ("unsqueeze", "squeeze"):
             return NNTrainerLayerDef(
                 layer_type=OP_RESHAPE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # Tensor.repeat / expand_as -> reshape (broadcasting)
+        if method_name in ("repeat", "expand_as"):
+            return NNTrainerLayerDef(
+                layer_type=OP_RESHAPE,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # Tensor.chunk / split -> split
+        if method_name in ("chunk", "split"):
+            return NNTrainerLayerDef(
+                layer_type="split",
                 name=self._make_scoped_name(scope, node),
                 input_layers=input_names,
                 hf_module_name=scope,

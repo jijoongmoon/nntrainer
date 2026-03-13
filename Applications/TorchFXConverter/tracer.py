@@ -96,9 +96,21 @@ def _is_rmsnorm(module):
     return False
 
 
-def _build_leaf_check(leaf_modules):
-    """Build a function that checks if a module should be a leaf node."""
+def _build_leaf_check(leaf_modules, exclude_leaf_types=None):
+    """Build a function that checks if a module should be a leaf node.
+
+    Args:
+        leaf_modules: Tuple of module classes to treat as leaves.
+        exclude_leaf_types: Optional set of class name strings to force-decompose.
+            When a module's class name is in this set, it will NOT be treated as
+            a leaf even if it matches leaf_modules or RMSNorm detection. This
+            allows the tracer to decompose unknown modules into tensor ops.
+    """
+    exclude = exclude_leaf_types or set()
     def is_leaf(module):
+        cls_name = type(module).__name__
+        if cls_name in exclude:
+            return False  # Force decomposition into tensor ops
         if isinstance(module, leaf_modules):
             return True
         if _is_rmsnorm(module):
@@ -119,10 +131,20 @@ class Tracer(TorchFunctionMode):
         tracer.graph.print_tabular()
     """
 
-    def __init__(self, root: nn.Module, leaf_modules=LEAF_MODULES):
+    def __init__(self, root: nn.Module, leaf_modules=LEAF_MODULES,
+                 exclude_leaf_types=None):
+        """
+        Args:
+            root: The model to trace.
+            leaf_modules: Tuple of module classes to treat as atomic nodes.
+            exclude_leaf_types: Optional set of class name strings to force-decompose.
+                Modules matching these names will be traced through (not treated
+                as leaves), so their forward() is decomposed into tensor ops.
+        """
         self.root = root
         self.leaf_modules = leaf_modules
-        self._is_leaf = _build_leaf_check(leaf_modules)
+        self.exclude_leaf_types = exclude_leaf_types or set()
+        self._is_leaf = _build_leaf_check(leaf_modules, self.exclude_leaf_types)
         self.graph = torch.fx.Graph()
         self.module_stack = []
         self._tensor_to_node = {}
