@@ -355,8 +355,14 @@ class AdaptiveConverter:
         # Pass 4: Detect LazyTensor chain opportunities
         lazy_chains = detect_lazy_chains(layers)
         if lazy_chains:
+            total_ops = sum(c.chain_length for c in lazy_chains)
             print(f"  [LAZY] Found {len(lazy_chains)} LazyTensor chain "
-                  f"opportunities (total {sum(c.chain_length for c in lazy_chains)} ops)")
+                  f"opportunities (total {total_ops} ops)")
+            print(f"  [LAZY] Note: These chains are decomposed forms of "
+                  f"higher-level ops (e.g. GELU activation, relative "
+                  f"position bias) that NNTrainer handles internally via "
+                  f"built-in layers (activation, mha_core). No C++ "
+                  f"LazyTensor code generation needed for weight conversion.")
 
         # Pass 5: Detect structural patterns (attention, FFN, blocks)
         model_structure = detect_patterns(layers, self.config)
@@ -427,6 +433,9 @@ class ConversionResult:
                   f"({sum(c.chain_length for c in self.lazy_chains)} ops fusible)")
             for i, chain in enumerate(self.lazy_chains):
                 print(f"  chain[{i}]: {chain}")
+            print(f"  (Info: These are decomposed higher-level ops like GELU "
+                  f"and position bias. NNTrainer built-in layers handle "
+                  f"them; no LazyTensor C++ code needed.)")
         if self.unsupported_ops:
             print(f"Unsupported ops (no NNTrainer equivalent): "
                   f"{len(self.unsupported_ops)}")
