@@ -171,14 +171,23 @@ OP_UNSUPPORTED = "unsupported"
 # LazyTensor (Tensor::chain()) supports chaining these in-place ops:
 #   add_i, subtract_i, multiply_i, divide_i, dot, transpose, sum, average
 
-# Ops that can be chained via LazyTensor (in-place, no shape change)
+# Ops that can be chained via LazyTensor (all now supported in LazyTensor).
+# Arithmetic (in-place): add_i, subtract_i, multiply_i, divide_i
+# Math (in-place): pow_i, sqrt_i, erf_i, inv_sqrt_i
+# Element-wise (memcopy): neg, abs, sin, cos, tan
+# Matrix/shape: dot, transpose
+# Reduction: sum, sum_by_batch, average
 LAZY_TENSOR_OPS = frozenset({
+    # Arithmetic
     LAYER_ADD, LAYER_ADDITION, LAYER_SUBTRACT,
     LAYER_MULTIPLY, LAYER_DIVIDE,
+    # Math
+    LAYER_POW, LAYER_SQRT, LAYER_NEGATIVE,
+    LAYER_SIN, LAYER_COS, LAYER_TAN,
 })
 
-# Ops that are available as direct Tensor methods (not in LazyTensor but
-# available on Tensor itself - can be used for single-op decomposition)
+# Ops available as direct Tensor methods AND now also in LazyTensor.
+# These can be used for single-op resolution or within a LazyTensor chain.
 TENSOR_METHOD_OPS = frozenset({
     LAYER_POW, LAYER_SQRT, LAYER_NEGATIVE,
     LAYER_SIN, LAYER_COS, LAYER_TAN,

@@ -123,35 +123,39 @@ class LazyTensorChain:
         """Generate C++ LazyTensor chain code.
 
         Returns a string like:
-            input.chain().add_i(a).multiply_i(2.0f).run()
+            input.chain().add_i(a).multiply_i(2.0f).sqrt_i().run()
         """
+        # Map layer_type -> LazyTensor method for binary ops (with tensor/scalar)
+        _BINARY_OPS = {
+            "add": "add_i", "addition": "add_i",
+            "subtract": "subtract_i",
+            "multiply": "multiply_i",
+            "divide": "divide_i",
+        }
+        # Map layer_type -> LazyTensor method for unary ops (no args)
+        _UNARY_OPS = {
+            "sqrt": "sqrt_i",
+            "negative": "neg",
+            "sin": "sin",
+            "cos": "cos",
+            "tan": "tan",
+        }
+
         parts = [f"{input_var}.chain()"]
         for layer in self.layers:
             lt = layer.layer_type
-            if lt in ("add", "addition"):
+            if lt in _BINARY_OPS:
+                method = _BINARY_OPS[lt]
                 if layer.input_layers:
-                    parts.append(f"add_i({layer.input_layers[-1]})")
+                    parts.append(f"{method}({layer.input_layers[-1]})")
                 else:
                     val = layer.properties.get("value", "0")
-                    parts.append(f"add_i({val}f)")
-            elif lt == "subtract":
-                if layer.input_layers:
-                    parts.append(f"subtract_i({layer.input_layers[-1]})")
-                else:
-                    val = layer.properties.get("value", "0")
-                    parts.append(f"subtract_i({val}f)")
-            elif lt == "multiply":
-                if layer.input_layers:
-                    parts.append(f"multiply_i({layer.input_layers[-1]})")
-                else:
-                    val = layer.properties.get("value", "1")
-                    parts.append(f"multiply_i({val}f)")
-            elif lt == "divide":
-                if layer.input_layers:
-                    parts.append(f"divide_i({layer.input_layers[-1]})")
-                else:
-                    val = layer.properties.get("value", "1")
-                    parts.append(f"divide_i({val}f)")
+                    parts.append(f"{method}({val}f)")
+            elif lt == "pow":
+                exp = layer.properties.get("exponent", "2.0")
+                parts.append(f"pow_i({exp}f)")
+            elif lt in _UNARY_OPS:
+                parts.append(f"{_UNARY_OPS[lt]}()")
         parts.append("run()")
         return ".".join(parts)
 

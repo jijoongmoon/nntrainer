@@ -142,6 +142,67 @@ TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_07_n) {
                std::runtime_error);
 }
 
+// pow_i
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_pow_01_p) {
+  target = constant_(2.0f);
+  expected = constant_(8.0f);
+  EXPECT_TRUE(target.chain().pow_i(3.0f).run() == expected);
+}
+
+// sqrt_i
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_sqrt_01_p) {
+  target = constant_(4.0f);
+  expected = constant_(2.0f);
+  EXPECT_TRUE(target.chain().sqrt_i().run() == expected);
+}
+
+// inv_sqrt_i
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_inv_sqrt_01_p) {
+  target = constant_(4.0f);
+  expected = constant_(0.5f);
+  EXPECT_TRUE(target.chain().inv_sqrt_i().run() == expected);
+}
+
+// neg
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_neg_01_p) {
+  target = constant_(3.0f);
+  expected = constant_(-3.0f);
+  EXPECT_TRUE(target.chain().neg().run() == expected);
+}
+
+// abs
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_abs_01_p) {
+  target = constant_(-5.0f);
+  expected = constant_(5.0f);
+  EXPECT_TRUE(target.chain().abs().run() == expected);
+}
+
+// chaining new ops with arithmetic
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_chain_new_01_p) {
+  // sqrt(4) * 3 + 1 = 7
+  target = constant_(4.0f);
+  expected = constant_(7.0f);
+  EXPECT_TRUE(
+    target.chain().sqrt_i().multiply_i(3.0f).add_i(1.0f).run() == expected);
+}
+
+// chaining pow with arithmetic
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_chain_new_02_p) {
+  // (2^3 - 1) / 2 = 3.5
+  target = constant_(2.0f);
+  expected = constant_(3.5f);
+  EXPECT_TRUE(
+    target.chain().pow_i(3.0f).subtract_i(1.0f).divide_i(2.0f).run() ==
+    expected);
+}
+
+// neg then abs should give positive
+TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_neg_abs_01_p) {
+  target = constant_(7.0f);
+  expected = constant_(7.0f);
+  EXPECT_TRUE(target.chain().neg().abs().run() == expected);
+}
+
 // sum()
 TEST_F(nntrainer_LazyTensorOpsTest, LazyTensorOps_08_p) {
   target = constant(1.0f, 4, 4, 4, 4);
