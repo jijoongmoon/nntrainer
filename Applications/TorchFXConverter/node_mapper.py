@@ -171,7 +171,13 @@ class NodeMapper:
             }
             # Gemma3 scaled embedding: record scale factor for weight conversion
             if hasattr(module, "scalar_embed_scale"):
-                props["embed_scale"] = module.scalar_embed_scale
+                val = module.scalar_embed_scale
+                if isinstance(val, (int, float)):
+                    props["embed_scale"] = float(val)
+                elif hasattr(val, 'item'):  # torch.Tensor scalar
+                    props["embed_scale"] = float(val.item())
+                else:
+                    props["embed_scale"] = str(val)
             return NNTrainerLayerDef(
                 layer_type=LAYER_EMBEDDING,
                 name=_sanitize_name(module_name),
