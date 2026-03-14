@@ -14,6 +14,7 @@ NNTrainer models. The emitter is split into focused sub-modules:
 import sys
 import os
 
+from emitter_base import BaseEmitter
 from .helpers import (
     _q, _cpp_layer, _with_key,
     _class_name, _file_basename, _header_guard,
@@ -37,17 +38,14 @@ sys.modules.setdefault(
 )
 
 
-class CppEmitter:
+class CppEmitter(BaseEmitter):
     """Generates class-based C++ header and source code from converter output.
 
     Orchestrates the sub-modules to produce the complete C++ output.
     """
 
     def __init__(self, layers, structure, model_name=None):
-        self.layers = layers
-        self.structure = structure
-        self._by_name = {l.name: l for l in layers}
-        self._model_name = model_name
+        super().__init__(layers, structure, model_name=model_name)
 
     def emit(self):
         """Generate combined C++ code (header + source)."""

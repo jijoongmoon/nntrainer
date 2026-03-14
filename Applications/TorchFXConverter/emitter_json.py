@@ -34,6 +34,7 @@ def _safe_properties(props):
     return {k: _json_safe(v) for k, v in props.items()}
 
 
+from emitter_base import BaseEmitter
 from pattern_detector import ModelStructure
 from nntrainer_layers import NNTrainerLayerDef
 
@@ -42,7 +43,7 @@ from nntrainer_layers import NNTrainerLayerDef
 # JSON Emitter
 # =============================================================================
 
-class JsonEmitter:
+class JsonEmitter(BaseEmitter):
     """Generates JSON model configuration from converter output.
 
     Args:
@@ -50,9 +51,8 @@ class JsonEmitter:
         structure: ModelStructure from pattern detection.
     """
 
-    def __init__(self, layers, structure):
-        self.layers = layers
-        self.structure = structure
+    def __init__(self, layers, structure, model_name=None):
+        super().__init__(layers, structure, model_name=model_name)
 
     def emit(self):
         """Generate JSON configuration dict.

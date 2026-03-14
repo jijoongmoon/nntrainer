@@ -30,3 +30,16 @@ class BaseEmitter(ABC):
     def emit(self) -> str:
         """Generate the complete output string."""
         ...
+
+    @staticmethod
+    def format_property(key, value):
+        """Format a layer property value for text output (INI/JSON).
+
+        Handles bool, list/tuple, and scalar types.
+        """
+        if isinstance(value, bool):
+            return f"{key} = {'true' if value else 'false'}"
+        elif isinstance(value, (list, tuple)):
+            return f"{key} = {','.join(str(x) for x in value)}"
+        else:
+            return f"{key} = {value}"
