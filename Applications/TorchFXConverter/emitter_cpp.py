@@ -88,7 +88,8 @@ def _class_name(model_type, arch_type):
     # actually transformer-based (avoids "ExtractorCausalLM" etc.)
     if model_type not in ("qwen3", "qwen2", "llama", "mistral", "gemma",
                           "gemma2", "gemma3_text", "phi", "gpt2",
-                          "gpt_neo", "gpt_neox", "starcoder2", "codegen"):
+                          "gpt_neo", "gpt_neox", "starcoder2", "codegen",
+                          "lfm2"):
         return model_type.capitalize() + "Model"
     return model_type.capitalize() + suffix.get(arch_type, "Model")
 

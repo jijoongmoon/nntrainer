@@ -81,6 +81,7 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     causal_types = {
         "qwen3", "qwen2", "llama", "mistral", "gpt2", "gpt_neo", "gpt_neox",
         "phi", "gemma", "gemma2", "gemma3_text", "starcoder2", "codegen",
+        "lfm2",
     }
     encoder_decoder_types = {
         "t5", "mt5", "bart", "mbart", "pegasus", "marian",
