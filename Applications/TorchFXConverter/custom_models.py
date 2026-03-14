@@ -181,13 +181,10 @@ def _build_span_marker_from_weights(
 # GLiNER / GLiNER2 loader  (model_type = "extractor")
 # ---------------------------------------------------------------------------
 
-class _ExtractorCore(nn.Module):
-    """Traceable core of a GLiNER-family model (post-preprocessing).
+class _ExtractorPromptCore(nn.Module):
+    """Traceable core: SpanMarker + prompt projection + einsum scoring.
 
-    Contains only the parts expressible as a static computation graph:
-    BiLSTM + SpanMarker + prompt projection + einsum scoring.
-    The transformer encoder and data-dependent token extraction are
-    handled outside the NNTrainer graph.
+    Variant used by original GLiNER (prompt-based scoring).
     """
 
     def __init__(self, rnn, span_marker, prompt_proj, has_rnn=True):
@@ -205,6 +202,33 @@ class _ExtractorCore(nn.Module):
         prompts_embedding = self.prompt_proj(prompts_embedding)
         scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embedding)
         return scores
+
+
+class _ExtractorClassifierCore(nn.Module):
+    """Traceable core: SpanMarker + classifier scoring.
+
+    Variant used by GLiNER2 (learned classifier instead of prompt projection).
+    Scoring: element-wise product of span and class representations,
+    then classifier MLP to produce per-(span, class) scalar scores.
+    """
+
+    def __init__(self, span_marker, classifier):
+        super().__init__()
+        self.span_marker = span_marker
+        self.classifier = classifier
+
+    def forward(self, words_embedding, span_idx, prompts_embedding):
+        span_rep = self.span_marker(words_embedding, span_idx)
+        # span_rep: [B, L, K, D], prompts_embedding: [B, C, D]
+        B, L, K, D = span_rep.shape
+        C = prompts_embedding.shape[1]
+        span_flat = span_rep.view(B, L * K, D)
+        # Element-wise product for each (span, class) pair
+        span_exp = span_flat.unsqueeze(2).expand(B, L * K, C, D)
+        prompt_exp = prompts_embedding.unsqueeze(1).expand(B, L * K, C, D)
+        combined = span_exp * prompt_exp  # [B, L*K, C, D]
+        scores = self.classifier(combined).squeeze(-1)  # [B, L*K, C]
+        return scores.view(B, L, K, C)
 
 
 def _find_prefix(state, leaf_pattern):
@@ -238,26 +262,38 @@ def _load_extractor(model_dir, config, seq_len, verbose):
     # Find module prefixes by searching for known leaf key patterns
     lstm_prefix = _find_prefix(state, "lstm.weight_ih_l0")
     span_prefix = _find_prefix(state, "project_start.0.weight")
-    # Prompt projection: find any key with "prompt" and ".0.weight"
+
+    # Detect scoring variant: prompt-based or classifier-based
     prompt_prefix = None
     for key in state:
         if "prompt" in key and key.endswith(".0.weight"):
-            # e.g. "prompt_rep.0.weight" -> prefix = "prompt_rep."
-            # e.g. "model.prompt_rep_layer.0.weight" -> prefix = "model.prompt_rep_layer."
             prompt_prefix = key[:-len("0.weight")]
             break
+
+    classifier_prefix = _find_prefix(state, "classifier.0.weight")
+    if classifier_prefix is not None:
+        classifier_prefix = classifier_prefix + "classifier."
+
+    variant = "prompt" if prompt_prefix is not None else \
+              "classifier" if classifier_prefix is not None else None
 
     if verbose:
         top = sorted({k.split(".")[0] for k in state})
         print(f"  Weight prefixes: lstm={lstm_prefix!r}, "
-              f"span={span_prefix!r}, prompt={prompt_prefix!r}")
+              f"span={span_prefix!r}, prompt={prompt_prefix!r}, "
+              f"classifier={classifier_prefix!r}")
         print(f"  Top-level keys: {top}")
+        print(f"  Scoring variant: {variant}")
 
-    # --- Build RNN ---
+    if variant is None:
+        raise RuntimeError(
+            "Could not detect scoring variant (no prompt_rep or classifier "
+            f"weights found) in {model_dir}")
+
+    # --- Build RNN (optional) ---
     has_rnn = num_rnn_layers > 0 and lstm_prefix is not None
     rnn = None
     if has_rnn:
-        # Infer sizes from weight shape
         w = state[f"{lstm_prefix}lstm.weight_ih_l0"]
         input_size = w.shape[1]
         lstm_hidden = w.shape[0] // 4  # 4 gates
@@ -265,7 +301,6 @@ def _load_extractor(model_dir, config, seq_len, verbose):
             input_size=input_size, hidden_size=lstm_hidden,
             num_layers=num_rnn_layers, bidirectional=True, batch_first=True,
         )
-        # Load RNN weights
         rnn_state = {}
         full_prefix = f"{lstm_prefix}lstm."
         for key, val in state.items():
@@ -280,7 +315,6 @@ def _load_extractor(model_dir, config, seq_len, verbose):
             f"in {model_dir}")
     span_marker = _build_span_marker_from_weights(state, span_prefix,
                                                   max_width)
-    # Load span weights
     span_state = {}
     for key, val in state.items():
         if key.startswith(span_prefix) and any(
@@ -289,29 +323,36 @@ def _load_extractor(model_dir, config, seq_len, verbose):
             span_state[key[len(span_prefix):]] = val
     span_marker.load_state_dict(span_state)
 
-    # --- Build prompt projection ---
-    if prompt_prefix is None:
-        raise RuntimeError(
-            "Could not find prompt projection weights "
-            f"(prompt_rep.0.weight or prompt_rep_layer.0.weight) "
-            f"in {model_dir}")
-    prompt_proj = _build_sequential_from_weights(state, prompt_prefix)
-    prompt_state = {}
-    for key, val in state.items():
-        if key.startswith(prompt_prefix):
-            suffix = key[len(prompt_prefix):]
-            # Only take direct children (e.g. "0.weight", "3.bias")
-            if suffix and suffix[0].isdigit():
-                prompt_state[suffix] = val
-    prompt_proj.load_state_dict(prompt_state)
+    # --- Build scoring module and assemble core ---
+    if variant == "prompt":
+        prompt_proj = _build_sequential_from_weights(state, prompt_prefix)
+        prompt_state = {}
+        for key, val in state.items():
+            if key.startswith(prompt_prefix):
+                suffix = key[len(prompt_prefix):]
+                if suffix and suffix[0].isdigit():
+                    prompt_state[suffix] = val
+        prompt_proj.load_state_dict(prompt_state)
+        model = _ExtractorPromptCore(rnn, span_marker, prompt_proj,
+                                     has_rnn=has_rnn)
+    else:
+        # classifier variant
+        classifier = _build_sequential_from_weights(state, classifier_prefix)
+        cls_state = {}
+        for key, val in state.items():
+            if key.startswith(classifier_prefix):
+                suffix = key[len(classifier_prefix):]
+                if suffix and suffix[0].isdigit():
+                    cls_state[suffix] = val
+        classifier.load_state_dict(cls_state)
+        model = _ExtractorClassifierCore(span_marker, classifier)
 
-    # --- Assemble core model ---
-    model = _ExtractorCore(rnn, span_marker, prompt_proj, has_rnn=has_rnn)
     model.eval()
 
     if verbose:
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"  Extractor core built: {n_params / 1e6:.1f}M params, "
+        print(f"  Extractor core built ({variant}): "
+              f"{n_params / 1e6:.1f}M params, "
               f"hidden={hidden_size}, max_width={max_width}, "
               f"rnn={'yes' if has_rnn else 'no'}")
 
