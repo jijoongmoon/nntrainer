@@ -413,6 +413,103 @@ def test_gemma3_text_embedding():
     print("\nGemma3 (embeddinggemma): PASSED!\n")
 
 
+def test_functiongemma_causal():
+    """Test FunctionGemma (Gemma3-based CausalLM for function calling).
+
+    FunctionGemma-270m-it is architecturally identical to Gemma3 270M
+    but fine-tuned for function calling.  It uses Gemma3ForCausalLM with
+    model_type="gemma3_text".
+
+    Tests: Gemma3ForCausalLM with Q/K norms, 4 norms per block, scaled
+    embedding, GeGLU activation, GQA with RoPE, and LM head.
+    """
+    from transformers import Gemma3TextConfig, Gemma3ForCausalLM
+    from decomposer import AdaptiveConverter
+
+    print("=" * 70)
+    print("TEST: FunctionGemma (Gemma3 CausalLM for function calling)")
+    print("=" * 70)
+
+    # Tiny config matching FunctionGemma-270m-it architecture
+    config = Gemma3TextConfig(
+        vocab_size=1000,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=1024,
+    )
+    config.architectures = ["Gemma3ForCausalLM"]
+    model = Gemma3ForCausalLM(config)
+    model.eval()
+
+    print("\n--- Model Architecture ---")
+    for name, module in model.named_modules():
+        if name.count(".") <= 2:
+            print(f"  {name}: {type(module).__name__}")
+
+    # Trace via AdaptiveConverter
+    input_ids = torch.randint(0, config.vocab_size, (1, 8))
+    converter = AdaptiveConverter(model, config)
+    result = converter.convert({"input_ids": input_ids})
+
+    layers = result.layers
+    structure = result.model_structure
+
+    type_counts = {}
+    for layer in layers:
+        type_counts[layer.layer_type] = type_counts.get(layer.layer_type, 0) + 1
+
+    print(f"\nTotal mapped layers: {len(layers)}")
+    print(f"Layer type counts: {type_counts}")
+
+    # Verify basic structure
+    assert result.is_fully_mapped, "All ops should be mapped"
+    assert structure is not None
+    assert structure.arch_type == "decoder_only"
+    assert structure.model_type == "gemma3_text"
+    assert structure.num_layers == 2
+
+    # Verify Gemma3-specific features
+    for block in structure.blocks:
+        # Q/K norms
+        assert block.attention.has_qk_norm, "Gemma3 should have Q/K norms"
+        assert block.attention.q_norm, "Q norm should be detected"
+        assert block.attention.k_norm, "K norm should be detected"
+
+        # GQA
+        assert block.attention.attention_type == "gqa"
+        assert block.attention.num_kv_heads == 2
+
+        # GeGLU
+        assert block.ffn.ffn_type == "geglu"
+
+        # 4 norms per block (Gemma3 specific)
+        assert block.pre_attn_norm, "Should have pre-attention norm"
+        assert block.post_attn_norm, "Should have post-attention norm"
+        assert block.pre_ffn_norm, "Should have pre-FFN norm"
+        assert block.post_ffn_norm, "Should have post-FFN norm"
+
+    # Verify scaled embedding
+    emb_layers = [l for l in layers if l.layer_type == "embedding_layer"]
+    assert len(emb_layers) == 1
+    assert emb_layers[0].properties.get("embed_scale") == 8.0, \
+        "Gemma3 scaled embedding should capture embed_scale"
+
+    # Verify LM head (CausalLM should have one)
+    assert structure.lm_head, "CausalLM should have LM head"
+
+    # Verify GELU activations
+    gelu_layers = [l for l in layers if l.layer_type == "activation"
+                   and l.properties.get("activation") == "gelu"]
+    assert len(gelu_layers) == 2, \
+        f"Expected 2 GELU activations, got {len(gelu_layers)}"
+
+    print("\nFunctionGemma (Gemma3 CausalLM): PASSED!\n")
+
+
 if __name__ == "__main__":
     print("\n" + "#" * 70)
     print("# Multi-Architecture Tracer + Node Mapper Validation")
@@ -423,6 +520,7 @@ if __name__ == "__main__":
     test_qwen2_embedding()
     test_gemma_embedding()
     test_gemma3_text_embedding()
+    test_functiongemma_causal()
 
     print("=" * 70)
     print("ALL ARCHITECTURE TESTS PASSED!")
