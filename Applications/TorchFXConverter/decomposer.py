@@ -27,6 +27,7 @@ from typing import Optional
 from nntrainer_layers import (
     NNTrainerLayerDef,
     LAYER_POW, LAYER_SQRT, LAYER_MULTIPLY, LAYER_DIVIDE, LAYER_NEGATIVE,
+    LAYER_DROPOUT,
     LAZY_TENSOR_OPS, TENSOR_DIRECT_METHODS,
     OP_UNSUPPORTED, OP_NOOP,
 )
@@ -301,9 +302,18 @@ class AdaptiveConverter:
         result.summary()
     """
 
-    def __init__(self, model, model_config=None):
+    def __init__(self, model, model_config=None, training=False):
+        """
+        Args:
+            model: The HuggingFace model to convert.
+            model_config: HuggingFace model config (optional).
+            training: If False (default), dropout layers are removed from
+                the output since they are no-ops during inference. If True,
+                dropout layers are preserved for training use.
+        """
         self.model = model
         self.config = model_config
+        self.training = training
 
     def convert(self, input_kwargs, max_passes=3):
         """Run the adaptive conversion pipeline.
@@ -352,6 +362,16 @@ class AdaptiveConverter:
         # Pass 3: Resolve unsupported ops (Tensor methods > layer decomposition)
         layers = resolve_unsupported_ops(layers)
 
+        # Pass 3.5: Remove dropout layers for inference mode
+        if not self.training:
+            dropout_count = sum(1 for l in layers
+                                if l.layer_type == LAYER_DROPOUT)
+            if dropout_count > 0:
+                layers = [l for l in layers
+                          if l.layer_type != LAYER_DROPOUT]
+                print(f"  [INFERENCE] Removed {dropout_count} dropout layers "
+                      f"(not needed for inference)")
+
         # Pass 4: Detect LazyTensor chain opportunities
         lazy_chains = detect_lazy_chains(layers)
         if lazy_chains:
@@ -385,6 +405,7 @@ class AdaptiveConverter:
             lazy_chains=lazy_chains,
             graph=tracer.graph,
             model_structure=model_structure,
+            training=self.training,
         )
 
 
@@ -393,7 +414,7 @@ class ConversionResult:
 
     def __init__(self, layers, decomposed_module_types, unsupported_ops,
                  unknown_layers, tensor_ops, lazy_chains, graph,
-                 model_structure=None):
+                 model_structure=None, training=False):
         self.layers = layers
         self.decomposed_module_types = decomposed_module_types
         self.unsupported_ops = unsupported_ops
@@ -402,6 +423,7 @@ class ConversionResult:
         self.lazy_chains = lazy_chains
         self.graph = graph
         self.model_structure = model_structure
+        self.training = training
 
     @property
     def is_fully_mapped(self):
@@ -414,11 +436,14 @@ class ConversionResult:
         for layer in self.layers:
             type_counts[layer.layer_type] = type_counts.get(layer.layer_type, 0) + 1
 
+        mode = "training" if self.training else "inference"
         print(f"\n{'='*70}")
-        print(f"CONVERSION SUMMARY")
+        print(f"CONVERSION SUMMARY ({mode} mode)")
         print(f"{'='*70}")
         print(f"Total layers: {len(self.layers)}")
         print(f"Fully mapped: {self.is_fully_mapped}")
+        if not self.training:
+            print(f"Dropout layers: removed (inference mode)")
 
         if self.decomposed_module_types:
             print(f"Decomposed module types: "
