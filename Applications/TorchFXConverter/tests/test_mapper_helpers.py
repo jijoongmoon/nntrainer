@@ -206,3 +206,87 @@ def test_node_mapper_backward_compat_aliases():
     from mapper_helpers import get_input_node_names, sanitize_name
     assert _get_input_node_names is get_input_node_names
     assert _sanitize_name is sanitize_name
+
+
+# ============================================================================
+# Test op_registry cumsum noop mapping
+# ============================================================================
+
+def test_cumsum_in_function_noop_names():
+    from op_registry import FUNCTION_NOOP_NAMES
+    assert "cumsum" in FUNCTION_NOOP_NAMES
+
+
+def test_cumsum_in_method_noop_names():
+    from op_registry import METHOD_NOOP_NAMES
+    assert "cumsum" in METHOD_NOOP_NAMES
+
+
+# ============================================================================
+# Test decomposer position ID chain removal
+# ============================================================================
+
+def test_remove_position_id_chains():
+    """Position ID arithmetic chains feeding only into embeddings are removed."""
+    from nntrainer_layers import NNTrainerLayerDef, LAYER_ADDITION, LAYER_MULTIPLY
+    from decomposer import _remove_position_id_chains
+
+    layers = [
+        NNTrainerLayerDef(layer_type="embedding_layer", name="token_emb",
+                          input_layers=["input_ids"]),
+        NNTrainerLayerDef(layer_type=LAYER_ADDITION, name="pos_add_1",
+                          input_layers=["input_ids"]),
+        NNTrainerLayerDef(layer_type=LAYER_MULTIPLY, name="pos_mul",
+                          input_layers=["pos_add_1"]),
+        NNTrainerLayerDef(layer_type=LAYER_ADDITION, name="pos_add_2",
+                          input_layers=["pos_mul"]),
+        NNTrainerLayerDef(layer_type="embedding_layer", name="pos_emb",
+                          input_layers=["pos_add_2"]),
+        NNTrainerLayerDef(layer_type=LAYER_ADDITION, name="hidden_add",
+                          input_layers=["token_emb", "pos_emb"]),
+    ]
+    result = _remove_position_id_chains(layers)
+    result_names = [l.name for l in result]
+    # Position ID arithmetic (pos_add_1, pos_mul, pos_add_2) should be removed
+    assert "pos_add_1" not in result_names
+    assert "pos_mul" not in result_names
+    assert "pos_add_2" not in result_names
+    # Embeddings and hidden state layers should remain
+    assert "token_emb" in result_names
+    assert "pos_emb" in result_names
+    assert "hidden_add" in result_names
+
+
+def test_remove_position_id_chains_preserves_shared_ops():
+    """Arithmetic ops used by non-embedding consumers are NOT removed."""
+    from nntrainer_layers import NNTrainerLayerDef, LAYER_ADDITION
+    from decomposer import _remove_position_id_chains
+
+    layers = [
+        NNTrainerLayerDef(layer_type=LAYER_ADDITION, name="shared_add",
+                          input_layers=["x"]),
+        NNTrainerLayerDef(layer_type="embedding_layer", name="pos_emb",
+                          input_layers=["shared_add"]),
+        # shared_add also feeds into a non-embedding layer
+        NNTrainerLayerDef(layer_type=LAYER_ADDITION, name="other_add",
+                          input_layers=["shared_add", "y"]),
+    ]
+    result = _remove_position_id_chains(layers)
+    result_names = [l.name for l in result]
+    # shared_add feeds into both embedding and non-embedding, so it stays
+    assert "shared_add" in result_names
+
+
+def test_remove_position_id_chains_noop_when_no_chains():
+    """No-op when there are no position ID chains."""
+    from nntrainer_layers import NNTrainerLayerDef, LAYER_ADDITION
+    from decomposer import _remove_position_id_chains
+
+    layers = [
+        NNTrainerLayerDef(layer_type=LAYER_ADDITION, name="add_1",
+                          input_layers=["x", "y"]),
+        NNTrainerLayerDef(layer_type=LAYER_ADDITION, name="add_2",
+                          input_layers=["add_1", "z"]),
+    ]
+    result = _remove_position_id_chains(layers)
+    assert len(result) == len(layers)

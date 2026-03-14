@@ -27,9 +27,10 @@ from typing import Optional
 from nntrainer_layers import (
     NNTrainerLayerDef,
     LAYER_POW, LAYER_SQRT, LAYER_MULTIPLY, LAYER_DIVIDE, LAYER_NEGATIVE,
-    LAYER_DROPOUT,
+    LAYER_ADDITION, LAYER_SUBTRACT,
+    LAYER_DROPOUT, LAYER_EMBEDDING,
     LAZY_TENSOR_OPS, TENSOR_DIRECT_METHODS,
-    OP_UNSUPPORTED, OP_NOOP,
+    OP_UNSUPPORTED, OP_NOOP, OP_RESHAPE,
 )
 from tracer import Tracer, LEAF_MODULES
 from node_mapper import NodeMapper
@@ -312,6 +313,79 @@ def _remove_passthrough_layers(layers, layer_type, label):
 
 
 # =============================================================================
+# Position ID Chain Removal
+# =============================================================================
+
+# Layer types that are part of position ID computation chains.
+# These are arithmetic/reshape ops used to compute position indices
+# from attention masks before feeding into position embedding.
+_POSITION_CHAIN_OPS = frozenset({
+    LAYER_ADDITION, LAYER_SUBTRACT, LAYER_MULTIPLY, LAYER_DIVIDE,
+    OP_RESHAPE,
+})
+
+
+def _remove_position_id_chains(layers):
+    """Remove position ID computation chains (XLM-RoBERTa, etc.).
+
+    In models like XLM-RoBERTa, position IDs are computed from input masks:
+        input_ids → ne → int → cumsum → type_as → add → mul → add → Embedding
+
+    After noop removal (ne, int, cumsum, type_as are all noops), the remaining
+    arithmetic layers (add, mul, add) only serve to compute position indices.
+    NNTrainer handles position IDs internally, so these are redundant.
+
+    This function detects arithmetic layers that exclusively feed into
+    embedding layers (directly or through other arithmetic layers) and
+    removes them. It uses iterative fixed-point analysis to correctly
+    handle chains of arbitrary length.
+
+    Returns the filtered layer list.
+    """
+    by_name = {l.name: l for l in layers}
+
+    # Build consumer graph: layer_name -> set of consumer layer names
+    consumers = {}
+    for l in layers:
+        for inp in (l.input_layers or []):
+            consumers.setdefault(inp, set()).add(l.name)
+
+    embedding_names = {l.name for l in layers if l.layer_type == LAYER_EMBEDDING}
+
+    # Iterative fixed-point: mark arithmetic layers whose ALL consumers
+    # are either embedding layers or already-marked removable layers.
+    removable = set()
+    changed = True
+    while changed:
+        changed = False
+        for l in layers:
+            if l.name in removable or l.layer_type not in _POSITION_CHAIN_OPS:
+                continue
+            layer_consumers = consumers.get(l.name, set())
+            if not layer_consumers:
+                continue
+            if all(c in embedding_names or c in removable
+                   for c in layer_consumers):
+                removable.add(l.name)
+                changed = True
+
+    if not removable:
+        return layers
+
+    # Rewire embedding inputs past the removed chain
+    for l in layers:
+        if l.name not in removable and l.input_layers:
+            l.input_layers = [
+                inp for inp in l.input_layers if inp not in removable
+            ]
+
+    filtered = [l for l in layers if l.name not in removable]
+    print(f"  [CLEANUP] Removed {len(removable)} position ID "
+          f"computation layers")
+    return filtered
+
+
+# =============================================================================
 # Adaptive Converter Pipeline
 # =============================================================================
 
@@ -410,6 +484,10 @@ class AdaptiveConverter:
 
         # Pass 3.6: Remove noop layers (expand, size, _set_grad_enabled, etc.)
         layers = _remove_passthrough_layers(layers, OP_NOOP, "noop")
+
+        # Pass 3.7: Remove position ID computation chains
+        # (arithmetic ops that exclusively feed position embeddings)
+        layers = _remove_position_id_chains(layers)
 
         # Pass 4: Detect LazyTensor chain opportunities
         lazy_chains = detect_lazy_chains(layers)

@@ -73,7 +73,12 @@ FUNCTION_NOOP_NAMES = frozenset({
     "custom_function_call",
     # Comparison / conditional ops (T5 relative position bias)
     "where", "min", "max",
-    # Cumulative ops used in position embedding generation
+    # Position ID computation (XLM-RoBERTa, etc.)
+    # cumsum is used exclusively for computing position IDs from attention
+    # masks in transformer models. NNTrainer handles position IDs internally,
+    # so the entire position ID chain (cumsum → arithmetic → embedding) is
+    # redundant. The decomposer's _remove_position_id_chains() cleans up
+    # the remaining arithmetic layers in the chain.
     "cumsum",
 })
 
@@ -196,6 +201,8 @@ METHOD_NOOP_NAMES = frozenset({
     "all", "any", "item",
     # Comparison ops (T5 relative position bias)
     "gt", "lt", "le", "ge", "eq", "ne",
+    # Position ID computation (see FUNCTION_NOOP_NAMES comment for cumsum)
+    "cumsum",
 })
 
 # Method ops that map to "split"
