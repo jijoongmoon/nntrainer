@@ -138,8 +138,8 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     )
 
     if "cpp" in formats:
-        header_code = emit_cpp_header(layers, structure)
-        source_code = emit_cpp_source(layers, structure)
+        header_code = emit_cpp_header(layers, structure, model_name=effective_name)
+        source_code = emit_cpp_source(layers, structure, model_name=effective_name)
         header_path = os.path.join(output_dir, filenames["header"])
         source_path = os.path.join(output_dir, filenames["source"])
         with open(header_path, "w") as f:
