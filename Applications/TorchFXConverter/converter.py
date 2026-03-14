@@ -181,48 +181,65 @@ def _build_gliner_core_from_config(model_dir, config):
             f"(looked for model.safetensors and pytorch_model.bin)")
 
     # Extract only the keys that belong to our core modules.
-    # The actual key prefix varies by model packaging:
-    #   Direct:  rnn.lstm.*, span_rep_layer.*, prompt_rep_layer.*
-    #   Wrapped: model.rnn.lstm.*, model.span_rep_layer.*, ...
-    # Auto-detect the prefix by searching for a known key pattern.
-    model_prefix = ""
+    # Key naming varies between GLiNER versions:
+    #   Original GLiNER: rnn.lstm.*, span_rep_layer.*, prompt_rep_layer.*
+    #   GLiNER2:         rnn.lstm.*, span_rep.*, prompt_rep.*
+    #   With wrapper:    model.<above>.*
+    # We auto-detect by finding the top-level prefix for each module.
+
+    # Find the actual key prefix for each core module by searching for
+    # known leaf patterns (e.g. "lstm.weight_ih_l0", "project_start.0.weight").
+    rnn_prefix = None
+    span_prefix = None
+    prompt_prefix = None
     for key in full_state:
-        if "rnn.lstm." in key or "span_rep_layer." in key:
-            # Extract everything before the known suffix
-            for marker in ("rnn.lstm.", "span_rep_layer."):
-                idx = key.find(marker)
-                if idx >= 0:
-                    model_prefix = key[:idx]
-                    break
-            if model_prefix:
-                break
+        if rnn_prefix is None and "lstm." in key and "weight_ih_l0" in key:
+            # e.g. "model.rnn.lstm.weight_ih_l0" -> prefix = "model.rnn.lstm."
+            idx = key.find("lstm.")
+            rnn_prefix = key[:idx + len("lstm.")]
+        if span_prefix is None and "project_start.0.weight" in key:
+            # e.g. "span_rep.span_rep_layer.project_start.0.weight"
+            #   -> prefix = "span_rep.span_rep_layer."
+            # e.g. "span_rep_layer.span_rep_layer.project_start.0.weight"
+            #   -> prefix = "span_rep_layer.span_rep_layer."
+            idx = key.find("project_start.")
+            span_prefix = key[:idx]
+        if prompt_prefix is None and key.endswith(".0.weight"):
+            # prompt projection: <prefix>.0.weight (nn.Sequential index)
+            # Must NOT be a span_rep key (which also has .0.weight)
+            candidate = key[:-len("0.weight")]
+            if "span_rep" not in candidate and "project" not in candidate:
+                prompt_prefix = candidate
 
-    prefix_map = {
-        f"{model_prefix}rnn.lstm.": "rnn.",
-        f"{model_prefix}span_rep_layer.": "span_rep_layer.",
-        f"{model_prefix}prompt_rep_layer.": "prompt_rep_layer.",
-    }
-
+    # Map weight keys to our core model keys:
+    #   rnn_prefix + * -> rnn.*
+    #   span_prefix + * -> span_rep_layer.span_rep_layer.*
+    #   prompt_prefix + * -> prompt_rep_layer.*
     core_state = {}
     for key, value in full_state.items():
-        for src_prefix, dst_prefix in prefix_map.items():
-            if key.startswith(src_prefix):
-                new_key = dst_prefix + key[len(src_prefix):]
-                core_state[new_key] = value
-                break
+        new_key = None
+        if rnn_prefix and key.startswith(rnn_prefix):
+            new_key = "rnn." + key[len(rnn_prefix):]
+        elif span_prefix and key.startswith(span_prefix):
+            new_key = "span_rep_layer.span_rep_layer." + key[len(span_prefix):]
+        elif prompt_prefix and key.startswith(prompt_prefix):
+            new_key = "prompt_rep_layer." + key[len(prompt_prefix):]
+
+        if new_key is not None:
+            core_state[new_key] = value
 
     missing, unexpected = core.load_state_dict(core_state, strict=False)
     real_missing = [k for k in missing if not (
         not has_rnn and k.startswith("rnn.")
     )]
     if real_missing:
-        # Show actual keys for debugging
-        sample_keys = [k for k in sorted(full_state.keys())
-                       if any(s in k for s in ("rnn", "span_rep", "prompt_rep"))][:10]
+        top_prefixes = sorted({k.split(".")[0] for k in full_state})
         raise RuntimeError(
             f"Missing weights for GLiNER core: {real_missing}\n"
-            f"  Detected prefix: '{model_prefix}'\n"
-            f"  Sample keys in weights file: {sample_keys}")
+            f"  Detected prefixes: rnn={rnn_prefix!r}, span={span_prefix!r}, "
+            f"prompt={prompt_prefix!r}\n"
+            f"  Top-level key prefixes in weights: {top_prefixes}\n"
+            f"  Mapped {len(core_state)} / {len(full_state)} keys")
 
     return core
 
