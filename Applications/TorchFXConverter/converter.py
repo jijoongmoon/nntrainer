@@ -25,18 +25,50 @@ import torch
 import torch.nn as nn
 
 
+def _gliner_projection(hidden_size, dropout, out_dim=None):
+    """Two-layer projection (matches GLiNER create_projection_layer)."""
+    if out_dim is None:
+        out_dim = hidden_size
+    return nn.Sequential(
+        nn.Linear(hidden_size, out_dim * 4), nn.ReLU(),
+        nn.Dropout(dropout), nn.Linear(out_dim * 4, out_dim),
+    )
+
+
+class _SpanMarkerV0(nn.Module):
+    """Span endpoint marker (matches GLiNER SpanMarkerV0)."""
+
+    def __init__(self, hidden_size, max_width, dropout=0.4):
+        super().__init__()
+        self.max_width = max_width
+        self.project_start = _gliner_projection(hidden_size, dropout)
+        self.project_end = _gliner_projection(hidden_size, dropout)
+        self.out_project = _gliner_projection(hidden_size * 2, dropout,
+                                              hidden_size)
+
+    def forward(self, h, span_idx):
+        B, L, D = h.size()
+        start_rep = self.project_start(h)
+        end_rep = self.project_end(h)
+        # gather start/end representations
+        idx_s = span_idx[:, :, 0].unsqueeze(2).expand(-1, -1, D)
+        idx_e = span_idx[:, :, 1].unsqueeze(2).expand(-1, -1, D)
+        start_span = torch.gather(start_rep, 1, idx_s)
+        end_span = torch.gather(end_rep, 1, idx_e)
+        cat = torch.cat([start_span, end_span], dim=-1).relu()
+        return self.out_project(cat).view(B, L, self.max_width, D)
+
+
 class _GLiNERCore(nn.Module):
     """Traceable core of a GLiNER/GLiNER2 model (post-preprocessing).
 
-    Wraps the BiLSTM, SpanRepLayer, prompt projection, and einsum scoring
-    sub-modules extracted from a full GLiNER model.  The DeBERTa encoder
-    and the data-dependent ``_extract_prompt_features_and_word_embeddings``
-    step are intentionally excluded because they require dynamic indexing
-    that cannot be expressed in a static NNTrainer graph.
+    Wraps the BiLSTM, SpanMarkerV0, prompt projection, and einsum scoring.
+    The DeBERTa encoder and data-dependent preprocessing are excluded
+    (handled outside the NNTrainer graph).
 
-    Note: The original ``LstmSeq2SeqEncoder`` uses ``pack_padded_sequence``
-    which is not traceable by torch.fx.  We extract the raw ``nn.LSTM``
-    instead and call it directly (without packing).
+    This class can be built either by extracting sub-modules from a loaded
+    GLiNER model, or by constructing from scratch using config + state_dict
+    (no ``gliner`` package dependency).
     """
 
     def __init__(self, rnn_lstm, span_rep_layer, prompt_rep_layer,
@@ -58,20 +90,15 @@ class _GLiNERCore(nn.Module):
 
 
 def _build_gliner_core(gliner_model, config):
-    """Extract the core computation sub-modules from a GLiNER model."""
-    # The actual nn.Module lives at different levels depending on the
-    # GLiNER wrapper.  Try common locations.
+    """Extract the core sub-modules from a loaded GLiNER model."""
     model = gliner_model
     if hasattr(model, "model") and isinstance(model.model, nn.Module):
-        model = model.model  # GLiNER wrapper -> inner BaseModel
+        model = model.model
 
-    # Extract the raw nn.LSTM from LstmSeq2SeqEncoder (which uses
-    # pack_padded_sequence that can't be traced by torch.fx).
     has_rnn = hasattr(model, "rnn")
     rnn_lstm = None
     if has_rnn:
         rnn_module = model.rnn
-        # LstmSeq2SeqEncoder wraps nn.LSTM as self.lstm
         if hasattr(rnn_module, "lstm"):
             rnn_lstm = rnn_module.lstm
         elif isinstance(rnn_module, nn.LSTM):
@@ -91,6 +118,96 @@ def _build_gliner_core(gliner_model, config):
 
     return _GLiNERCore(rnn_lstm, span_rep_layer, prompt_rep_layer,
                        has_rnn=has_rnn)
+
+
+def _build_gliner_core_from_config(model_dir, config):
+    """Build GLiNER core directly from config + weights (no gliner package).
+
+    Reconstructs only the traceable core modules (BiLSTM, SpanMarkerV0,
+    prompt projection) from the saved weights, bypassing the need for
+    the ``gliner`` or ``gliner2`` Python packages.
+    """
+    hidden_size = getattr(config, "hidden_size", 768)
+    max_width = getattr(config, "max_width", 12)
+    dropout = getattr(config, "dropout", 0.4)
+    num_rnn_layers = getattr(config, "num_rnn_layers", 1)
+    span_mode = getattr(config, "span_mode", "markerV0")
+
+    if span_mode != "markerV0":
+        raise NotImplementedError(
+            f"GLiNER span_mode '{span_mode}' not yet supported in "
+            f"standalone loader.  Only 'markerV0' is supported.")
+
+    # Build core modules matching GLiNER's parameter layout
+    has_rnn = num_rnn_layers > 0
+    rnn_lstm = None
+    if has_rnn:
+        rnn_lstm = nn.LSTM(
+            input_size=hidden_size, hidden_size=hidden_size // 2,
+            num_layers=num_rnn_layers, bidirectional=True, batch_first=True,
+        )
+
+    # SpanRepLayer -> SpanMarkerV0 (nested as span_rep_layer.span_rep_layer)
+    inner_span = _SpanMarkerV0(hidden_size, max_width, dropout)
+    span_rep_layer = nn.Module()
+    span_rep_layer.add_module("span_rep_layer", inner_span)
+    # Make it callable by forwarding
+    span_rep_layer.forward = lambda x, idx: inner_span(x, idx)
+
+    prompt_rep_layer = _gliner_projection(hidden_size, dropout)
+
+    core = _GLiNERCore(rnn_lstm, span_rep_layer, prompt_rep_layer,
+                       has_rnn=has_rnn)
+
+    # Load weights from model file
+    model_dir_path = os.path.join(model_dir) if isinstance(model_dir, str) \
+        else str(model_dir)
+    safetensors_path = os.path.join(model_dir_path, "model.safetensors")
+    bin_path = os.path.join(model_dir_path, "pytorch_model.bin")
+
+    if os.path.isfile(safetensors_path):
+        try:
+            from safetensors.torch import load_file
+            full_state = load_file(safetensors_path)
+        except ImportError:
+            full_state = torch.load(bin_path, map_location="cpu",
+                                    weights_only=True)
+    elif os.path.isfile(bin_path):
+        full_state = torch.load(bin_path, map_location="cpu",
+                                weights_only=True)
+    else:
+        raise FileNotFoundError(
+            f"No model weights found in {model_dir_path} "
+            f"(looked for model.safetensors and pytorch_model.bin)")
+
+    # Extract only the keys that belong to our core modules.
+    # GLiNER state_dict uses prefixes like:
+    #   rnn.lstm.*  -> our rnn.*
+    #   span_rep_layer.span_rep_layer.*  -> same
+    #   prompt_rep_layer.*  -> same
+    core_state = {}
+    prefix_map = {
+        "rnn.lstm.": "rnn.",           # LstmSeq2SeqEncoder.lstm -> raw LSTM
+        "span_rep_layer.": "span_rep_layer.",
+        "prompt_rep_layer.": "prompt_rep_layer.",
+    }
+    for key, value in full_state.items():
+        for src_prefix, dst_prefix in prefix_map.items():
+            if key.startswith(src_prefix):
+                new_key = dst_prefix + key[len(src_prefix):]
+                core_state[new_key] = value
+                break
+
+    missing, unexpected = core.load_state_dict(core_state, strict=False)
+    # Filter out expected missing keys (e.g. if no RNN)
+    real_missing = [k for k in missing if not (
+        not has_rnn and k.startswith("rnn.")
+    )]
+    if real_missing:
+        raise RuntimeError(
+            f"Missing weights for GLiNER core: {real_missing}")
+
+    return core
 
 
 def convert_model(model_name_or_path, output_dir, formats=None,
@@ -179,29 +296,66 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     is_custom = model_type in custom_model_types
 
     if is_custom and model_type == "extractor":
-        # GLiNER2 / GLiNER models use a custom Extractor class
+        # GLiNER/GLiNER2: we only need the core computation graph
+        # (BiLSTM + SpanRep + Projection + Einsum).  Try loading via
+        # the gliner packages first; fall back to standalone loading
+        # from config + weights (no package dependency).
+        gliner_config = config  # already loaded from config.json
+        # Also try to load gliner_config.json which has span_mode etc.
+        gliner_cfg_path = os.path.join(model_name_or_path,
+                                       "gliner_config.json")
+        if os.path.isfile(gliner_cfg_path):
+            with open(gliner_cfg_path) as f:
+                gcfg = json.load(f)
+            # Merge gliner-specific fields into config
+            for k, v in gcfg.items():
+                if not hasattr(gliner_config, k):
+                    setattr(gliner_config, k, v)
+            if verbose:
+                print(f"  Loaded gliner_config.json "
+                      f"(span_mode={gcfg.get('span_mode', 'unknown')})")
+
+        loaded_via_package = False
+        # Try gliner2 package
         try:
             from gliner2 import Extractor, ExtractorConfig
-            gliner_config = ExtractorConfig.from_pretrained(model_name_or_path)
-            model = Extractor.from_pretrained(model_name_or_path)
-            config = gliner_config
+            ec = ExtractorConfig.from_pretrained(model_name_or_path)
+            full_model = Extractor.from_pretrained(model_name_or_path)
+            config = ec
+            model = _build_gliner_core(full_model, config)
+            loaded_via_package = True
         except ImportError:
+            pass
+
+        # Try gliner package
+        if not loaded_via_package:
             try:
                 from gliner.model import GLiNER
-                model = GLiNER.from_pretrained(model_name_or_path)
-                config = model.config
+                full_model = GLiNER.from_pretrained(model_name_or_path)
+                config = full_model.config
+                model = _build_gliner_core(full_model, config)
+                loaded_via_package = True
             except ImportError:
-                raise ImportError(
-                    "GLiNER2 model detected (model_type='extractor') but "
-                    "neither 'gliner2' nor 'gliner' package is installed. "
-                    "Install with: pip install gliner2")
+                pass
+
+        # Standalone: build core from config + weights (no package needed)
+        if not loaded_via_package:
+            if verbose:
+                print("  No gliner package found; loading core from "
+                      "config + weights directly")
+            model = _build_gliner_core_from_config(
+                model_name_or_path, gliner_config)
+            config = gliner_config
+
+        model.eval()
     elif is_causal:
         model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path, torch_dtype=torch.float32)
+        model.eval()
     else:
         model = AutoModel.from_pretrained(
             model_name_or_path, torch_dtype=torch.float32)
-    model.eval()
+        model.eval()
 
     if verbose:
         print(f"Model type: {model_type}, Parameters: "
@@ -209,9 +363,7 @@ def convert_model(model_name_or_path, output_dir, formats=None,
 
     # Step 2: Prepare trace inputs
     if is_custom and model_type == "extractor":
-        # GLiNER/GLiNER2: trace only the core computation graph
-        # (post-preprocessing).  The preprocessing step uses
-        # data-dependent indexing and is handled outside NNTrainer.
+        # GLiNER/GLiNER2: trace the core computation graph.
         hidden_size = getattr(config, "hidden_size", 768)
         max_width = getattr(config, "max_width", 12)
         num_classes = 5  # dummy entity type count
@@ -221,13 +373,8 @@ def convert_model(model_name_or_path, output_dir, formats=None,
             "span_idx": torch.randint(0, W, (1, W * max_width, 2)),
             "prompts_embedding": torch.randn(1, num_classes, hidden_size),
         }
-        # Extract the core sub-modules (rnn + span_rep + prompt_rep)
-        # into a standalone nn.Module for tracing.
-        core_model = _build_gliner_core(model, config)
-        core_model.eval()
-        model = core_model
         if verbose:
-            print(f"  GLiNER core extracted: hidden={hidden_size}, "
+            print(f"  GLiNER core: hidden={hidden_size}, "
                   f"max_width={max_width}")
     else:
         vocab_size = getattr(config, "vocab_size", 30000)
