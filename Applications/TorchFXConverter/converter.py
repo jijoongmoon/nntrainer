@@ -42,7 +42,7 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     """
     from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
     from decomposer import AdaptiveConverter
-    from emitter_cpp import emit_cpp, emit_cpp_header, emit_cpp_source
+    from emitter_cpp import emit_cpp, emit_cpp_header, emit_cpp_source, get_output_filenames
     from emitter_ini import emit_ini
     from emitter_json import emit_json_string
     from weight_converter import WeightConverter
@@ -126,11 +126,17 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     # Step 4: Emit outputs
     outputs = {}
 
+    # Derive filenames from model type (e.g. "gemma3_embedding_model.h")
+    filenames = get_output_filenames(
+        structure.model_type if structure else model_type,
+        structure.arch_type if structure else "decoder_only",
+    )
+
     if "cpp" in formats:
         header_code = emit_cpp_header(layers, structure)
         source_code = emit_cpp_source(layers, structure)
-        header_path = os.path.join(output_dir, "model.h")
-        source_path = os.path.join(output_dir, "model.cpp")
+        header_path = os.path.join(output_dir, filenames["header"])
+        source_path = os.path.join(output_dir, filenames["source"])
         with open(header_path, "w") as f:
             f.write(header_code)
         with open(source_path, "w") as f:
@@ -144,7 +150,7 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     if "ini" in formats:
         ini_text = emit_ini(layers, structure, batch_size=batch_size,
                             mode="structured")
-        ini_path = os.path.join(output_dir, "model.ini")
+        ini_path = os.path.join(output_dir, filenames["ini"])
         with open(ini_path, "w") as f:
             f.write(ini_text)
         outputs["ini"] = ini_path
@@ -153,7 +159,7 @@ def convert_model(model_name_or_path, output_dir, formats=None,
 
     if "json" in formats:
         json_str = emit_json_string(layers, structure, indent=2)
-        json_path = os.path.join(output_dir, "model.json")
+        json_path = os.path.join(output_dir, filenames["json"])
         with open(json_path, "w") as f:
             f.write(json_str)
         outputs["json"] = json_path
