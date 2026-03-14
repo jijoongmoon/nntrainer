@@ -117,8 +117,11 @@ def _sanitize_model_name(model_name):
          "Qwen/Qwen3-0.6B"     -> "qwen3_0_6b"
     """
     import re
-    # Take last component if it contains a slash (e.g. "org/model" -> "model")
-    name = model_name.rsplit("/", 1)[-1]
+    # Strip trailing slashes, then take last path component
+    # e.g. "./gliner2-multi-v1/" -> "gliner2-multi-v1"
+    #      "Qwen/Qwen3-0.6B"    -> "Qwen3-0.6B"
+    name = model_name.rstrip("/")
+    name = name.rsplit("/", 1)[-1]
     # Replace hyphens, dots, spaces with underscores
     name = re.sub(r'[-.\s]+', '_', name)
     # Collapse multiple underscores and strip leading/trailing
