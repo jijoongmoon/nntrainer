@@ -22,6 +22,75 @@ import sys
 import json
 
 import torch
+import torch.nn as nn
+
+
+class _GLiNERCore(nn.Module):
+    """Traceable core of a GLiNER/GLiNER2 model (post-preprocessing).
+
+    Wraps the BiLSTM, SpanRepLayer, prompt projection, and einsum scoring
+    sub-modules extracted from a full GLiNER model.  The DeBERTa encoder
+    and the data-dependent ``_extract_prompt_features_and_word_embeddings``
+    step are intentionally excluded because they require dynamic indexing
+    that cannot be expressed in a static NNTrainer graph.
+
+    Note: The original ``LstmSeq2SeqEncoder`` uses ``pack_padded_sequence``
+    which is not traceable by torch.fx.  We extract the raw ``nn.LSTM``
+    instead and call it directly (without packing).
+    """
+
+    def __init__(self, rnn_lstm, span_rep_layer, prompt_rep_layer,
+                 has_rnn=True):
+        super().__init__()
+        self.has_rnn = has_rnn
+        if has_rnn and rnn_lstm is not None:
+            self.rnn = rnn_lstm  # raw nn.LSTM (not LstmSeq2SeqEncoder)
+        self.span_rep_layer = span_rep_layer
+        self.prompt_rep_layer = prompt_rep_layer
+
+    def forward(self, words_embedding, span_idx, prompts_embedding):
+        if self.has_rnn:
+            words_embedding, _ = self.rnn(words_embedding)
+        span_rep = self.span_rep_layer(words_embedding, span_idx)
+        prompts_embedding = self.prompt_rep_layer(prompts_embedding)
+        scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embedding)
+        return scores
+
+
+def _build_gliner_core(gliner_model, config):
+    """Extract the core computation sub-modules from a GLiNER model."""
+    # The actual nn.Module lives at different levels depending on the
+    # GLiNER wrapper.  Try common locations.
+    model = gliner_model
+    if hasattr(model, "model") and isinstance(model.model, nn.Module):
+        model = model.model  # GLiNER wrapper -> inner BaseModel
+
+    # Extract the raw nn.LSTM from LstmSeq2SeqEncoder (which uses
+    # pack_padded_sequence that can't be traced by torch.fx).
+    has_rnn = hasattr(model, "rnn")
+    rnn_lstm = None
+    if has_rnn:
+        rnn_module = model.rnn
+        # LstmSeq2SeqEncoder wraps nn.LSTM as self.lstm
+        if hasattr(rnn_module, "lstm"):
+            rnn_lstm = rnn_module.lstm
+        elif isinstance(rnn_module, nn.LSTM):
+            rnn_lstm = rnn_module
+        else:
+            raise RuntimeError(
+                f"Unexpected RNN module type: {type(rnn_module).__name__}")
+
+    span_rep_layer = getattr(model, "span_rep_layer", None)
+    prompt_rep_layer = getattr(model, "prompt_rep_layer", None)
+
+    if span_rep_layer is None or prompt_rep_layer is None:
+        raise RuntimeError(
+            "Could not locate span_rep_layer / prompt_rep_layer in the "
+            f"GLiNER model ({type(model).__name__}).  Available sub-modules: "
+            f"{[n for n, _ in model.named_children()]}")
+
+    return _GLiNERCore(rnn_lstm, span_rep_layer, prompt_rep_layer,
+                       has_rnn=has_rnn)
 
 
 def convert_model(model_name_or_path, output_dir, formats=None,
@@ -59,7 +128,25 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     if verbose:
         print(f"Loading model: {model_name_or_path}")
 
-    config = AutoConfig.from_pretrained(model_name_or_path)
+    # Try standard AutoConfig first; fall back for custom model types
+    # (e.g. GLiNER2's model_type="extractor") that aren't registered in
+    # HuggingFace transformers.
+    try:
+        config = AutoConfig.from_pretrained(model_name_or_path)
+    except ValueError:
+        # Load config.json manually for unregistered model types
+        config_path = os.path.join(model_name_or_path, "config.json")
+        if os.path.isfile(config_path):
+            with open(config_path) as f:
+                config_dict = json.load(f)
+            # Create a simple namespace so attribute access works
+            config = argparse.Namespace(**config_dict)
+            if verbose:
+                print(f"  Loaded custom config (model_type="
+                      f"{getattr(config, 'model_type', 'unknown')})")
+        else:
+            raise
+
     model_type = getattr(config, "model_type", "")
 
     # Choose model class based on architecture
@@ -69,6 +156,10 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     }
     encoder_decoder_types = {
         "t5", "mt5", "bart", "mbart", "pegasus", "marian",
+    }
+    # Custom model types that require their own loading logic
+    custom_model_types = {
+        "extractor",  # GLiNER / GLiNER2
     }
 
     # Detect if this is an embedding/feature-extraction model by checking
@@ -85,8 +176,26 @@ def convert_model(model_name_or_path, output_dir, formats=None,
 
     is_causal = model_type in causal_types and not is_embedding_model
     is_encoder_decoder = model_type in encoder_decoder_types
+    is_custom = model_type in custom_model_types
 
-    if is_causal:
+    if is_custom and model_type == "extractor":
+        # GLiNER2 / GLiNER models use a custom Extractor class
+        try:
+            from gliner2 import Extractor, ExtractorConfig
+            gliner_config = ExtractorConfig.from_pretrained(model_name_or_path)
+            model = Extractor.from_pretrained(model_name_or_path)
+            config = gliner_config
+        except ImportError:
+            try:
+                from gliner.model import GLiNER
+                model = GLiNER.from_pretrained(model_name_or_path)
+                config = model.config
+            except ImportError:
+                raise ImportError(
+                    "GLiNER2 model detected (model_type='extractor') but "
+                    "neither 'gliner2' nor 'gliner' package is installed. "
+                    "Install with: pip install gliner2")
+    elif is_causal:
         model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path, torch_dtype=torch.float32)
     else:
@@ -99,13 +208,35 @@ def convert_model(model_name_or_path, output_dir, formats=None,
               f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
     # Step 2: Prepare trace inputs
-    vocab_size = getattr(config, "vocab_size", 30000)
-    input_kwargs = {"input_ids": torch.randint(0, vocab_size, (1, seq_len))}
-    if not is_causal and not is_encoder_decoder:
-        input_kwargs["attention_mask"] = torch.ones(1, seq_len, dtype=torch.long)
-    if is_encoder_decoder:
-        input_kwargs["decoder_input_ids"] = torch.randint(
-            0, min(vocab_size, 1000), (1, max(1, seq_len // 2)))
+    if is_custom and model_type == "extractor":
+        # GLiNER/GLiNER2: trace only the core computation graph
+        # (post-preprocessing).  The preprocessing step uses
+        # data-dependent indexing and is handled outside NNTrainer.
+        hidden_size = getattr(config, "hidden_size", 768)
+        max_width = getattr(config, "max_width", 12)
+        num_classes = 5  # dummy entity type count
+        W = seq_len  # word-level sequence length
+        input_kwargs = {
+            "words_embedding": torch.randn(1, W, hidden_size),
+            "span_idx": torch.randint(0, W, (1, W * max_width, 2)),
+            "prompts_embedding": torch.randn(1, num_classes, hidden_size),
+        }
+        # Extract the core sub-modules (rnn + span_rep + prompt_rep)
+        # into a standalone nn.Module for tracing.
+        core_model = _build_gliner_core(model, config)
+        core_model.eval()
+        model = core_model
+        if verbose:
+            print(f"  GLiNER core extracted: hidden={hidden_size}, "
+                  f"max_width={max_width}")
+    else:
+        vocab_size = getattr(config, "vocab_size", 30000)
+        input_kwargs = {"input_ids": torch.randint(0, vocab_size, (1, seq_len))}
+        if not is_causal and not is_encoder_decoder:
+            input_kwargs["attention_mask"] = torch.ones(1, seq_len, dtype=torch.long)
+        if is_encoder_decoder:
+            input_kwargs["decoder_input_ids"] = torch.randint(
+                0, min(vocab_size, 1000), (1, max(1, seq_len // 2)))
 
     # Step 3: Run conversion pipeline
     if verbose:
