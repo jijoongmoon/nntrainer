@@ -700,6 +700,53 @@ class NodeMapper:
                 input_layers=input_names,
             )
 
+        # F.pad -> noop (padding is a shape adjustment, usually folded into layers)
+        if func is F.pad:
+            return NNTrainerLayerDef(
+                layer_type=OP_NOOP,
+                name=self._make_scoped_name(scope, node),
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
+        # torch.stack -> concat (stacking is concat along a new dimension)
+        if func is torch.stack:
+            stack_inputs = []
+            if node.args:
+                tensor_list = node.args[0]
+                if isinstance(tensor_list, (list, tuple)):
+                    stack_inputs = [a.name for a in tensor_list
+                                    if hasattr(a, 'name')]
+            if not stack_inputs:
+                stack_inputs = input_names
+            dim = node.kwargs.get('dim', 0)
+            if len(node.args) > 1 and isinstance(node.args[1], int):
+                dim = node.args[1]
+            return NNTrainerLayerDef(
+                layer_type=LAYER_CONCAT,
+                name=self._make_scoped_name(scope, node),
+                properties={"concat_dimension": dim, "stack": True},
+                input_layers=stack_inputs,
+            )
+
+        # === Einsum ===
+
+        # torch.einsum -> matmul (for contraction patterns)
+        # Common patterns in NER/NLU models:
+        #   'BLKD,BCD->BLKC' (GLiNER2 scoring: span_rep @ prompts^T)
+        #   'bld,ds->blsd'   (SpanQuery: einsum projection)
+        if func is torch.einsum:
+            # Extract the equation string from args[0]
+            equation = node.args[0] if len(node.args) > 0 else ""
+            props = {"equation": equation}
+            return NNTrainerLayerDef(
+                layer_type=LAYER_MATMUL,
+                name=self._make_scoped_name(scope, node),
+                properties=props,
+                input_layers=input_names,
+                hf_module_name=scope,
+            )
+
         # === Attention ===
 
         # F.scaled_dot_product_attention -> intermediate sdpa (pattern_detector -> mha_core)

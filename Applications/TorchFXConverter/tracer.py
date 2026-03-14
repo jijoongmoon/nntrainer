@@ -167,6 +167,7 @@ class Tracer(TorchFunctionMode):
         self.module_stack = []
         self._tensor_to_node = {}
         self._data_ptr_to_node = {}  # Fallback: data_ptr -> node (for detach/clone)
+        self._tensor_refs = []  # Keep tensors alive to prevent id() reuse during tracing
         self.handles = []
         self.tracing_enabled = True
         self._obj_to_path = {}
@@ -210,9 +211,11 @@ class Tracer(TorchFunctionMode):
             return node
         return obj
 
-    def _register_output(self, out, node):
+    def _register_output(self, out, node, track_data_ptr=False):
         for path, item in pytree.tree_flatten_with_path(out)[0]:
             if isinstance(item, Tensor):
+                # Pin tensor to prevent GC and id() reuse during tracing
+                self._tensor_refs.append(item)
                 cur_node = node
                 for key in path:
                     if isinstance(key, pytree.SequenceKey):
@@ -226,11 +229,16 @@ class Tracer(TorchFunctionMode):
                     cur_node = self.graph.call_function(
                         operator.getitem, args=(cur_node, key), kwargs={}
                     )
-                    self._tensor_to_node[id(item)] = cur_node
-                # Also track by data_ptr for detach/clone resolution
-                dptr = item.data_ptr()
-                if dptr != 0:
-                    self._data_ptr_to_node[dptr] = cur_node
+                # Always register id -> node (including single tensor outputs
+                # where path is empty and the for-key loop doesn't execute)
+                self._tensor_to_node[id(item)] = cur_node
+                # Track data_ptr only for leaf module outputs (not intermediate
+                # views from __torch_function__), because view/reshape creates
+                # tensors sharing the same data_ptr, which would clobber entries.
+                if track_data_ptr:
+                    dptr = item.data_ptr()
+                    if dptr != 0:
+                        self._data_ptr_to_node[dptr] = cur_node
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -292,16 +300,16 @@ class Tracer(TorchFunctionMode):
                             name_hint = f"arg_{i}"
                             node = self.graph.placeholder(name_hint)
                             node.meta["type"] = type(item)
-                            self._register_output(item, node)
+                            self._register_output(item, node, track_data_ptr=True)
                     elif param and param.kind == inspect.Parameter.VAR_KEYWORD:
                         for key, item in arg_value.items():
                             node = self.graph.placeholder(key)
                             node.meta["type"] = type(item)
-                            self._register_output(item, node)
+                            self._register_output(item, node, track_data_ptr=True)
                     else:
                         node = self.graph.placeholder(arg_name)
                         node.meta["type"] = type(arg_value)
-                        self._register_output(arg_value, node)
+                        self._register_output(arg_value, node, track_data_ptr=True)
 
             if self._is_leaf(module):
                 self.tracing_enabled = False
@@ -368,7 +376,7 @@ class Tracer(TorchFunctionMode):
                     node.meta["dropout"] = module.dropout
                     node.meta["is_rnn_module"] = True
 
-                self._register_output(output, node)
+                self._register_output(output, node, track_data_ptr=True)
             elif self.module_stack:
                 self.module_stack.pop()
 

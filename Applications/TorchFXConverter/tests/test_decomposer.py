@@ -613,6 +613,143 @@ def test_multi_head_with_detach():
 
 
 # ============================================================================
+# Test 7: GLiNER2 core model conversion
+# ============================================================================
+
+def _create_projection_layer(hidden_size, dropout, out_dim=None):
+    """GLiNER2 projection layer factory (matches gliner.modeling.layers)."""
+    if out_dim is None:
+        out_dim = hidden_size
+    return nn.Sequential(
+        nn.Linear(hidden_size, out_dim * 4), nn.ReLU(),
+        nn.Dropout(dropout), nn.Linear(out_dim * 4, out_dim),
+    )
+
+
+def _extract_elements(sequence, indices):
+    """GLiNER2 gather helper (matches gliner.modeling.span_rep)."""
+    D = sequence.size(-1)
+    expanded_indices = indices.unsqueeze(2).expand(-1, -1, D)
+    return torch.gather(sequence, 1, expanded_indices)
+
+
+class _SpanMarkerV0(nn.Module):
+    """GLiNER2 SpanMarkerV0 (matches gliner.modeling.span_rep.SpanMarkerV0)."""
+    def __init__(self, hidden_size, max_width, dropout=0.4):
+        super().__init__()
+        self.max_width = max_width
+        self.project_start = _create_projection_layer(hidden_size, dropout)
+        self.project_end = _create_projection_layer(hidden_size, dropout)
+        self.out_project = _create_projection_layer(hidden_size * 2, dropout, hidden_size)
+
+    def forward(self, h, span_idx):
+        B, L, D = h.size()
+        start_rep = self.project_start(h)
+        end_rep = self.project_end(h)
+        start_span_rep = _extract_elements(start_rep, span_idx[:, :, 0])
+        end_span_rep = _extract_elements(end_rep, span_idx[:, :, 1])
+        cat = torch.cat([start_span_rep, end_span_rep], dim=-1).relu()
+        return self.out_project(cat).view(B, L, self.max_width, D)
+
+
+class GLiNER2Core(nn.Module):
+    """GLiNER2 core computation graph (post-preprocessing).
+
+    This replicates the actual GLiNER2 UniEncoderSpanModel architecture:
+      1. BiLSTM encoder (words_embedding -> rnn_out)
+      2. SpanMarkerV0 (rnn_out + span_idx -> span_rep)
+      3. Prompt projection (prompts_embedding -> projected prompts)
+      4. Einsum scoring (span_rep @ prompts^T -> scores)
+
+    The preprocessing step (extract_prompt_features_and_word_embeddings)
+    uses data-dependent indexing and is handled outside the NNTrainer graph.
+    """
+    def __init__(self, hidden_size=64, max_width=8, dropout=0.4):
+        super().__init__()
+        self.max_width = max_width
+        self.rnn = nn.LSTM(
+            input_size=hidden_size, hidden_size=hidden_size // 2,
+            num_layers=1, bidirectional=True, batch_first=True,
+        )
+        self.span_rep = _SpanMarkerV0(hidden_size, max_width, dropout)
+        self.prompt_proj = _create_projection_layer(hidden_size, dropout)
+
+    def forward(self, words_embedding, span_idx, prompts_embedding):
+        rnn_out, _ = self.rnn(words_embedding)
+        span_rep = self.span_rep(rnn_out, span_idx)
+        prompts_embedding = self.prompt_proj(prompts_embedding)
+        scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embedding)
+        return scores
+
+
+def test_gliner2_core_conversion():
+    """GLiNER2 core model should be fully converted without unknowns.
+
+    Validates the complete GLiNER2 inference pipeline conversion:
+    - LSTM layer mapping with bidirectional + tuple output
+    - SpanMarkerV0 auto-decomposition (gather, concat, MLPs)
+    - torch.einsum mapped to matmul
+    - No broken tensor references (_tensor_constant_*)
+    - Dropout layers removed in inference mode
+    """
+    model = GLiNER2Core(hidden_size=64, max_width=8)
+    model.eval()
+
+    converter = AdaptiveConverter(model, training=False)
+    B, L, D, K, C = 2, 16, 64, 8, 5
+    result = converter.convert({
+        "words_embedding": torch.randn(B, L, D),
+        "span_idx": torch.randint(0, L, (B, L * K, 2)),
+        "prompts_embedding": torch.randn(B, C, D),
+    })
+
+    # No unknowns or unsupported
+    assert len(result.unknown_layers) == 0, \
+        f"GLiNER2 has unknowns: {[l.layer_type for l in result.unknown_layers]}"
+    assert len(result.unsupported_ops) == 0, \
+        f"GLiNER2 has unsupported ops: {[l.properties.get('original_op') for l in result.unsupported_ops]}"
+
+    # No broken tensor references
+    for layer in result.layers:
+        for inp in layer.input_layers:
+            assert "_tensor_constant" not in inp, \
+                f"Layer '{layer.name}' has broken reference: {inp}"
+
+    # Verify key components
+    layer_types = [l.layer_type for l in result.layers]
+
+    # LSTM
+    assert "lstm" in layer_types, "Missing LSTM layer"
+
+    # SpanMarkerV0: 2 gather, 1 concat, 6 FC (start_mlp=2, end_mlp=2, out_mlp=2)
+    gather_layers = [l for l in result.layers if l.layer_type == "gather"]
+    assert len(gather_layers) == 2, f"Expected 2 gather ops, got {len(gather_layers)}"
+    for g in gather_layers:
+        assert g.properties.get("axis") == 1
+
+    concat_layers = [l for l in result.layers if l.layer_type == "concat"]
+    assert len(concat_layers) == 1
+    assert len(concat_layers[0].input_layers) == 2
+
+    # FC layers: 6 (SpanMarkerV0) + 2 (prompt_proj) = 8
+    fc_layers = [l for l in result.layers if l.layer_type == "fully_connected"]
+    assert len(fc_layers) == 8, f"Expected 8 FC layers, got {len(fc_layers)}"
+
+    # Einsum -> matmul
+    matmul_layers = [l for l in result.layers if l.layer_type == "matmul"]
+    assert len(matmul_layers) == 1
+    assert matmul_layers[0].properties.get("equation") == "BLKD,BCD->BLKC"
+
+    print("  PASS: GLiNER2 core model fully converted")
+    print(f"    LSTM: 1 (bidirectional)")
+    print(f"    FC layers: {len(fc_layers)}")
+    print(f"    Gather ops: {len(gather_layers)} (axis=1)")
+    print(f"    Concat ops: {len(concat_layers)}")
+    print(f"    Einsum/matmul: {len(matmul_layers)} (BLKD,BCD->BLKC)")
+    print(f"    Total layers: {len(result.layers)}")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -653,6 +790,11 @@ if __name__ == "__main__":
     print("=" * 70)
     test_multi_head_fan_out()
     test_multi_head_with_detach()
+
+    print("\n" + "=" * 70)
+    print("TEST: GLiNER2 core model conversion")
+    print("=" * 70)
+    test_gliner2_core_conversion()
 
     print("\n" + "=" * 70)
     print("TEST: Known models (no decomposition needed)")
