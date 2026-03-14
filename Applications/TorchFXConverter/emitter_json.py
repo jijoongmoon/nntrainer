@@ -14,6 +14,12 @@ Phase 4.3 of the TorchFX converter pipeline (DESIGN.md).
 import json
 
 
+class _SafeEncoder(json.JSONEncoder):
+    """JSON encoder that converts non-serializable objects to strings."""
+    def default(self, o):
+        return str(o)
+
+
 def _json_safe(obj):
     """Convert non-JSON-serializable objects to strings."""
     try:
@@ -68,7 +74,8 @@ class JsonEmitter:
         Returns:
             str: JSON-formatted string.
         """
-        return json.dumps(self.emit(), indent=indent, ensure_ascii=False)
+        return json.dumps(self.emit(), indent=indent, ensure_ascii=False,
+                          cls=_SafeEncoder)
 
     # =========================================================================
     # Model Info

@@ -288,39 +288,57 @@ class PatternDetector:
     # Config Metadata Extraction
     # =========================================================================
 
+    @staticmethod
+    def _safe_cfg_int(cfg, *attrs, default=0):
+        """Safely get an int config value, falling back through attrs."""
+        for attr in attrs:
+            val = getattr(cfg, attr, None)
+            if val is not None and isinstance(val, (int, float)):
+                return int(val)
+        return default
+
+    @staticmethod
+    def _safe_cfg_float(cfg, *attrs, default=0.0):
+        """Safely get a float config value, falling back through attrs."""
+        for attr in attrs:
+            val = getattr(cfg, attr, None)
+            if val is not None and isinstance(val, (int, float)):
+                return float(val)
+        return default
+
     def _extract_config_metadata(self, structure):
         """Extract model metadata from HF config."""
         cfg = self.config
         if cfg is None:
             return
 
-        structure.model_type = getattr(cfg, "model_type", "")
-        structure.vocab_size = getattr(cfg, "vocab_size", 0)
-        structure.hidden_size = getattr(cfg, "hidden_size",
-                                        getattr(cfg, "d_model", 0))
-        structure.num_heads = getattr(cfg, "num_attention_heads",
-                                      getattr(cfg, "num_heads", 0))
-        structure.num_kv_heads = getattr(cfg, "num_key_value_heads",
-                                         structure.num_heads)
-        structure.head_dim = getattr(cfg, "head_dim",
-                                     getattr(cfg, "d_kv",
-                                             structure.hidden_size // structure.num_heads
-                                             if structure.num_heads else 0))
-        structure.intermediate_size = getattr(cfg, "intermediate_size",
-                                              getattr(cfg, "d_ff", 0))
+        model_type = getattr(cfg, "model_type", "")
+        structure.model_type = model_type if isinstance(model_type, str) else str(model_type)
+        structure.vocab_size = self._safe_cfg_int(cfg, "vocab_size")
+        structure.hidden_size = self._safe_cfg_int(cfg, "hidden_size", "d_model")
+        structure.num_heads = self._safe_cfg_int(cfg, "num_attention_heads", "num_heads")
+        structure.num_kv_heads = self._safe_cfg_int(
+            cfg, "num_key_value_heads", default=structure.num_heads)
+        structure.head_dim = self._safe_cfg_int(
+            cfg, "head_dim", "d_kv",
+            default=(structure.hidden_size // structure.num_heads
+                     if structure.num_heads else 0))
+        structure.intermediate_size = self._safe_cfg_int(
+            cfg, "intermediate_size", "d_ff")
         # rope_theta may be in config directly or in rope_parameters dict
-        structure.rope_theta = getattr(cfg, "rope_theta", 0.0)
+        structure.rope_theta = self._safe_cfg_float(cfg, "rope_theta")
         if not structure.rope_theta:
             rope_params = getattr(cfg, "rope_parameters", None)
             if isinstance(rope_params, dict):
-                structure.rope_theta = rope_params.get(
-                    "rope_theta", rope_params.get("base", 0.0))
-        structure.norm_eps = getattr(cfg, "rms_norm_eps",
-                                     getattr(cfg, "layer_norm_eps",
-                                             getattr(cfg, "layer_norm_epsilon", 0.0)))
-        structure.tie_word_embeddings = getattr(cfg, "tie_word_embeddings", False)
-        structure.max_position_embeddings = getattr(
-            cfg, "max_position_embeddings", 2048)
+                rt = rope_params.get("rope_theta", rope_params.get("base", None))
+                if isinstance(rt, (int, float)):
+                    structure.rope_theta = float(rt)
+        structure.norm_eps = self._safe_cfg_float(
+            cfg, "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon")
+        tie = getattr(cfg, "tie_word_embeddings", False)
+        structure.tie_word_embeddings = bool(tie) if not callable(tie) else False
+        structure.max_position_embeddings = self._safe_cfg_int(
+            cfg, "max_position_embeddings", default=2048)
 
     # =========================================================================
     # Embedding & Head Detection
