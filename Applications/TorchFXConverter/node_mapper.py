@@ -87,6 +87,20 @@ class NodeMapper:
             if layer_def is not None:
                 layers.append(layer_def)
                 self._node_to_layer[node.name] = layer_def
+
+        # Remap input references: FX node names -> actual layer names.
+        # Layer names may differ from FX node names due to scoping
+        # (e.g. _make_scoped_name adds module scope prefix).
+        fx_to_layer = {node_name: ldef.name
+                       for node_name, ldef in self._node_to_layer.items()
+                       if node_name != ldef.name}
+        if fx_to_layer:
+            for layer in layers:
+                if layer.input_layers:
+                    layer.input_layers = [
+                        fx_to_layer.get(inp, inp) for inp in layer.input_layers
+                    ]
+
         return layers
 
     def get_unknown_layers(self, layers=None):

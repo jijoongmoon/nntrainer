@@ -270,6 +270,47 @@ def resolve_unsupported_ops(layers):
 decompose_unsupported_ops = resolve_unsupported_ops
 
 
+def _remove_passthrough_layers(layers, layer_type, label):
+    """Remove layers of a given type and rewire downstream inputs.
+
+    For each removed layer, downstream layers that referenced it are
+    rewired to point at the removed layer's own input instead.
+    Handles chains (e.g. noop -> noop -> real layer).
+
+    Returns the filtered layer list.
+    """
+    target_names = {l.name for l in layers if l.layer_type == layer_type}
+    if not target_names:
+        return layers
+
+    # Build bypass map: removed_name -> its input (or None)
+    bypass = {}
+    for l in layers:
+        if l.layer_type == layer_type:
+            bypass[l.name] = l.input_layers[0] if l.input_layers else None
+
+    # Resolve chains
+    def _resolve(name):
+        visited = set()
+        while name in bypass and name not in visited:
+            visited.add(name)
+            name = bypass[name]
+        return name
+
+    # Rewire inputs of surviving layers
+    for l in layers:
+        if l.layer_type != layer_type and l.input_layers:
+            l.input_layers = [
+                _resolve(inp) if inp in target_names else inp
+                for inp in l.input_layers
+            ]
+            l.input_layers = [x for x in l.input_layers if x]
+
+    filtered = [l for l in layers if l.layer_type != layer_type]
+    print(f"  [CLEANUP] Removed {len(target_names)} {label} layers")
+    return filtered
+
+
 # =============================================================================
 # Adaptive Converter Pipeline
 # =============================================================================
@@ -364,13 +405,11 @@ class AdaptiveConverter:
 
         # Pass 3.5: Remove dropout layers for inference mode
         if not self.training:
-            dropout_count = sum(1 for l in layers
-                                if l.layer_type == LAYER_DROPOUT)
-            if dropout_count > 0:
-                layers = [l for l in layers
-                          if l.layer_type != LAYER_DROPOUT]
-                print(f"  [INFERENCE] Removed {dropout_count} dropout layers "
-                      f"(not needed for inference)")
+            layers = _remove_passthrough_layers(
+                layers, LAYER_DROPOUT, "dropout")
+
+        # Pass 3.6: Remove noop layers (expand, size, _set_grad_enabled, etc.)
+        layers = _remove_passthrough_layers(layers, OP_NOOP, "noop")
 
         # Pass 4: Detect LazyTensor chain opportunities
         lazy_chains = detect_lazy_chains(layers)
