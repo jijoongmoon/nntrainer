@@ -374,6 +374,137 @@ def test_exclude_leaf_types():
 
 
 # ============================================================================
+# Test 5: SpanRepLayer-like custom module auto-decomposition
+# ============================================================================
+
+class SpanRepLayer(nn.Module):
+    """GLiNER2 SpanRepLayer (markerV0) equivalent for testing.
+
+    This module is NOT in LEAF_MODULES, so the tracer should automatically
+    decompose its forward() into basic tensor ops:
+      Linear -> ReLU -> Dropout -> Linear (start MLP)
+      Linear -> ReLU -> Dropout -> Linear (end MLP)
+      __getitem__ (slice span indices)
+      unsqueeze + expand (prepare gather indices)
+      torch.gather (extract span representations)
+      torch.cat (concat start + end)
+      Tensor.relu() (activation)
+      Linear -> ReLU -> Dropout -> Linear (output MLP)
+      Tensor.view (reshape to span width)
+    """
+    def __init__(self, hidden_size=64, max_width=8):
+        super().__init__()
+        self.max_width = max_width
+        self.start_mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.end_mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.out_mlp = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    def forward(self, h, span_idx):
+        B, L, D = h.shape
+        num_spans = span_idx.shape[1]
+        start_rep = self.start_mlp(h)
+        end_rep = self.end_mlp(h)
+        start_idx = span_idx[:, :, 0].unsqueeze(-1).expand(B, num_spans, D)
+        end_idx = span_idx[:, :, 1].unsqueeze(-1).expand(B, num_spans, D)
+        start_span = torch.gather(start_rep, 1, start_idx)
+        end_span = torch.gather(end_rep, 1, end_idx)
+        cat = torch.cat([start_span, end_span], dim=-1)
+        cat = cat.relu()
+        output = self.out_mlp(cat)
+        output = output.view(B, -1, self.max_width, D)
+        return output
+
+
+class ModelWithSpanRep(nn.Module):
+    """Model that wraps SpanRepLayer for testing."""
+    def __init__(self, hidden_size=64, max_width=8):
+        super().__init__()
+        self.embed = nn.Embedding(100, hidden_size)
+        self.span_rep = SpanRepLayer(hidden_size, max_width)
+
+    def forward(self, input_ids, span_idx):
+        h = self.embed(input_ids)
+        return self.span_rep(h, span_idx)
+
+
+def test_span_rep_auto_decomposition():
+    """SpanRepLayer should be fully decomposed into supported tensor ops.
+
+    Verifies that all ops from SpanRepLayer's forward() are mappable:
+    - gather with correct axis extraction
+    - concat with proper input list and dim extraction
+    - Tensor.relu() method mapped to activation layer
+    - All MLPs decomposed into fully_connected + activation + dropout
+    """
+    model = ModelWithSpanRep(hidden_size=64, max_width=8)
+    model.eval()
+
+    converter = AdaptiveConverter(model)
+    result = converter.convert({
+        "input_ids": torch.randint(0, 100, (2, 16)),
+        "span_idx": torch.randint(0, 16, (2, 128, 2)),
+    })
+
+    result.summary()
+
+    # No unknown or unsupported layers should remain
+    assert len(result.unknown_layers) == 0, \
+        f"SpanRepLayer has unknown layers: {[l.layer_type for l in result.unknown_layers]}"
+    assert len(result.unsupported_ops) == 0, \
+        f"SpanRepLayer has unsupported ops: {[l.properties.get('original_op') for l in result.unsupported_ops]}"
+
+    # Verify critical ops are present in the decomposed output
+    layer_types = [l.layer_type for l in result.layers]
+    assert "gather" in layer_types, "gather op missing from decomposition"
+    assert "concat" in layer_types, "concat op missing from decomposition"
+    assert "fully_connected" in layer_types, "FC layers missing from decomposition"
+
+    # Verify gather layers have axis property
+    gather_layers = [l for l in result.layers if l.layer_type == "gather"]
+    assert len(gather_layers) == 2, f"Expected 2 gather ops, got {len(gather_layers)}"
+    for g in gather_layers:
+        assert "axis" in g.properties, f"Gather layer missing axis property: {g.name}"
+        assert g.properties["axis"] == 1, f"Expected axis=1, got {g.properties['axis']}"
+
+    # Verify concat has proper inputs (not empty)
+    concat_layers = [l for l in result.layers if l.layer_type == "concat"]
+    assert len(concat_layers) == 1, f"Expected 1 concat op, got {len(concat_layers)}"
+    assert len(concat_layers[0].input_layers) == 2, \
+        f"Concat should have 2 inputs, got {len(concat_layers[0].input_layers)}"
+
+    # Verify relu activation exists (from Tensor.relu() method)
+    activation_layers = [l for l in result.layers
+                         if l.layer_type == "activation"
+                         and l.properties.get("activation") == "relu"]
+    assert len(activation_layers) >= 1, "Missing relu activation from Tensor.relu()"
+
+    # Count FC layers: 2 in start_mlp + 2 in end_mlp + 2 in out_mlp = 6
+    fc_layers = [l for l in result.layers if l.layer_type == "fully_connected"]
+    assert len(fc_layers) == 6, f"Expected 6 FC layers, got {len(fc_layers)}"
+
+    print("  PASS: SpanRepLayer fully decomposed into supported tensor ops")
+    print(f"    gather ops: {len(gather_layers)} (axis={gather_layers[0].properties['axis']})")
+    print(f"    concat ops: {len(concat_layers)} (inputs={concat_layers[0].input_layers})")
+    print(f"    FC layers:  {len(fc_layers)}")
+    print(f"    Total layers: {len(result.layers)}")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -403,6 +534,11 @@ if __name__ == "__main__":
     print("=" * 70)
     test_custom_module_auto_decomposition()
     test_forced_leaf_decomposition()
+
+    print("\n" + "=" * 70)
+    print("TEST: SpanRepLayer decomposition (GLiNER2)")
+    print("=" * 70)
+    test_span_rep_auto_decomposition()
 
     print("\n" + "=" * 70)
     print("TEST: Known models (no decomposition needed)")

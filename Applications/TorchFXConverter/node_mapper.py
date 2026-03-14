@@ -604,19 +604,39 @@ class NodeMapper:
 
         # === Shape / structure ops ===
 
-        # torch.cat -> concat
+        # torch.cat(tensors, dim=0) -> concat
         if func is torch.cat:
+            # First arg is a list of tensors, extract names from inside the list
+            cat_inputs = []
+            if node.args:
+                tensor_list = node.args[0]
+                if isinstance(tensor_list, (list, tuple)):
+                    cat_inputs = [a.name for a in tensor_list
+                                  if hasattr(a, 'name')]
+            if not cat_inputs:
+                cat_inputs = input_names
+            # Extract dim
+            dim = node.kwargs.get('dim', 0)
+            if len(node.args) > 1 and isinstance(node.args[1], int):
+                dim = node.args[1]
+            props = {}
+            if dim != 0:
+                props["concat_dimension"] = dim
             return NNTrainerLayerDef(
                 layer_type=LAYER_CONCAT,
                 name=self._make_scoped_name(scope, node),
-                input_layers=input_names,
+                properties=props,
+                input_layers=cat_inputs,
             )
 
-        # torch.gather -> gather
+        # torch.gather(input, dim, index) -> gather
         if func is torch.gather:
+            # Extract dim from args[1] (int, not a proxy)
+            dim = node.args[1] if len(node.args) > 1 else node.kwargs.get('dim', 0)
             return NNTrainerLayerDef(
                 layer_type=LAYER_GATHER,
                 name=self._make_scoped_name(scope, node),
+                properties={"axis": dim},
                 input_layers=input_names,
             )
 
@@ -819,6 +839,24 @@ class NodeMapper:
                 name=self._make_scoped_name(scope, node),
                 input_layers=input_names,
             )
+
+        # === Tensor activation methods ===
+
+        # Tensor.relu / relu_ -> activation(relu)
+        if method_name in ("relu", "relu_"):
+            return self._make_activation(scope, "Tensor", ACT_RELU, input_names)
+
+        # Tensor.sigmoid / sigmoid_ -> activation(sigmoid)
+        if method_name in ("sigmoid", "sigmoid_"):
+            return self._make_activation(scope, "Tensor", ACT_SIGMOID, input_names)
+
+        # Tensor.tanh / tanh_ -> activation(tanh)
+        if method_name in ("tanh", "tanh_"):
+            return self._make_activation(scope, "Tensor", ACT_TANH, input_names)
+
+        # Tensor.softmax -> activation(softmax)
+        if method_name == "softmax":
+            return self._make_activation(scope, "Tensor", ACT_SOFTMAX, input_names)
 
         # === Shape operations -> intermediate (collapsed by pattern_detector) ===
 
