@@ -238,6 +238,92 @@ def test_qwen2_embedding():
     return layers
 
 
+def test_gemma_embedding():
+    """Test Gemma base model (embedding-gemma style).
+
+    Tests: GemmaModel with GeGLU activation, MQA, RoPE, and no LM head.
+    """
+    from transformers import GemmaConfig, GemmaModel
+    from decomposer import AdaptiveConverter
+    from pattern_detector import detect_patterns
+
+    print("=" * 70)
+    print("TEST: Gemma base model (embedding-gemma style)")
+    print("=" * 70)
+
+    config = GemmaConfig(
+        vocab_size=256128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        max_position_embeddings=8192,
+    )
+    config.architectures = ["GemmaModel"]
+    model = GemmaModel(config)
+    model.eval()
+
+    print("\n--- Model Architecture ---")
+    for name, module in model.named_modules():
+        if name.count(".") <= 2:
+            print(f"  {name}: {type(module).__name__}")
+
+    # Trace via AdaptiveConverter (full pipeline)
+    input_ids = torch.randint(0, config.vocab_size, (1, 8))
+    converter = AdaptiveConverter(model, config)
+    result = converter.convert({"input_ids": input_ids})
+
+    layers = result.layers
+    structure = result.model_structure
+
+    type_counts = {}
+    for layer in layers:
+        type_counts[layer.layer_type] = type_counts.get(layer.layer_type, 0) + 1
+
+    print(f"\nTotal mapped layers: {len(layers)}")
+    print(f"Layer type counts: {type_counts}")
+
+    # Verify Gemma structure
+    assert "embedding_layer" in type_counts, "Gemma should have embeddings"
+    assert "fully_connected" in type_counts, "Gemma should have FC layers"
+    assert "rms_norm" in type_counts, "Gemma should have RMSNorm"
+    assert "activation" in type_counts, "Gemma should have activation layers (GELU)"
+    assert result.is_fully_mapped, "All ops should be mapped"
+
+    # Verify model structure detection
+    assert structure is not None, "Structure should be detected"
+    assert structure.arch_type == "embedding", \
+        f"Expected 'embedding' arch, got '{structure.arch_type}'"
+    assert structure.model_type == "gemma"
+    assert structure.num_layers == 2, \
+        f"Expected 2 blocks, got {structure.num_layers}"
+
+    # Verify block detection
+    for block in structure.blocks:
+        assert block.attention is not None, "Block should have attention"
+        assert block.attention.attention_type == "mqa", \
+            f"Gemma should use MQA, got {block.attention.attention_type}"
+        assert block.attention.has_rope, "Gemma should have RoPE"
+        assert block.ffn is not None, "Block should have FFN"
+        assert block.ffn.ffn_type == "geglu", \
+            f"Gemma should use GeGLU, got {block.ffn.ffn_type}"
+        assert block.pre_attn_norm, "Block should have pre-attention norm"
+        assert block.pre_ffn_norm, "Block should have pre-FFN norm"
+
+    # Verify GELU activation is properly detected (not decomposed)
+    gelu_layers = [l for l in layers if l.layer_type == "activation"
+                   and l.properties.get("activation") == "gelu"]
+    assert len(gelu_layers) == 2, \
+        f"Expected 2 GELU activations (one per block), got {len(gelu_layers)}"
+
+    # Verify no LM head detected
+    assert not structure.lm_head, "Embedding model should not have LM head"
+
+    print("\nGemma (embedding): PASSED!\n")
+
+
 if __name__ == "__main__":
     print("\n" + "#" * 70)
     print("# Multi-Architecture Tracer + Node Mapper Validation")
@@ -246,6 +332,7 @@ if __name__ == "__main__":
     test_bert()
     test_mt5()
     test_qwen2_embedding()
+    test_gemma_embedding()
 
     print("=" * 70)
     print("ALL ARCHITECTURE TESTS PASSED!")

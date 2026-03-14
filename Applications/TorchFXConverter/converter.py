@@ -62,13 +62,28 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     model_type = getattr(config, "model_type", "")
 
     # Choose model class based on architecture
-    is_causal = model_type in (
+    causal_types = {
         "qwen3", "qwen2", "llama", "mistral", "gpt2", "gpt_neo", "gpt_neox",
         "phi", "gemma", "gemma2", "starcoder2", "codegen",
-    )
-    is_encoder_decoder = model_type in (
+    }
+    encoder_decoder_types = {
         "t5", "mt5", "bart", "mbart", "pegasus", "marian",
-    )
+    }
+
+    # Detect if this is an embedding/feature-extraction model by checking
+    # the architectures field in the config (e.g. ["GemmaModel"] vs
+    # ["GemmaForCausalLM"])
+    architectures = getattr(config, "architectures", []) or []
+    is_embedding_model = any(
+        not arch.endswith(("ForCausalLM", "ForConditionalGeneration",
+                           "ForSeq2SeqLM", "ForMaskedLM",
+                           "ForSequenceClassification",
+                           "ForTokenClassification"))
+        for arch in architectures
+    ) if architectures else False
+
+    is_causal = model_type in causal_types and not is_embedding_model
+    is_encoder_decoder = model_type in encoder_decoder_types
 
     if is_causal:
         model = AutoModelForCausalLM.from_pretrained(

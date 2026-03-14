@@ -75,7 +75,9 @@ class IniEmitter:
 
         # Embedding
         if s.embedding:
-            emb_type = ("tie_word_embeddings" if s.tie_word_embeddings
+            # Only use tie_word_embeddings if there's an LM head to tie to
+            emb_type = ("tie_word_embeddings"
+                        if s.tie_word_embeddings and s.lm_head
                         else "embedding_layer")
             sections.append("[embedding0]")
             sections.append(f"Type = {emb_type}")

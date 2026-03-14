@@ -34,7 +34,7 @@ from nntrainer_layers import (
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
     OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE, OP_SDPA, OP_NOOP, OP_UNSUPPORTED,
 )
-from tracer import _is_rmsnorm
+from tracer import _is_rmsnorm, _is_gelu_variant
 
 
 def _get_input_node_names(node):
@@ -227,6 +227,10 @@ class NodeMapper:
             return self._make_activation(module_name, module_type, ACT_TANH, input_names)
         if isinstance(module, nn.Softmax):
             return self._make_activation(module_name, module_type, ACT_SOFTMAX, input_names)
+
+        # HuggingFace custom GELU variants (GELUTanh, NewGELU, FastGELU, etc.)
+        if _is_gelu_variant(module):
+            return self._make_activation(module_name, module_type, ACT_GELU, input_names)
 
         # Dropout -> skip in inference, but record for completeness
         if isinstance(module, nn.Dropout):

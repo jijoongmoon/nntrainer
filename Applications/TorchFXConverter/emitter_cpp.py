@@ -63,6 +63,20 @@ def _class_name(model_type, arch_type):
         "t5": "T5Model",
         "mt5": "MT5Model",
     }
+    # For embedding models, override the class name suffix
+    if arch_type == "embedding":
+        embed_names = {
+            "gemma": "GemmaEmbeddingModel",
+            "gemma2": "Gemma2EmbeddingModel",
+            "llama": "LlamaEmbeddingModel",
+            "qwen3": "Qwen3EmbeddingModel",
+            "qwen2": "Qwen2EmbeddingModel",
+            "bert": "BertEmbeddingModel",
+        }
+        if model_type in embed_names:
+            return embed_names[model_type]
+        return model_type.capitalize() + "EmbeddingModel"
+
     if model_type in name_map:
         return name_map[model_type]
     # Fallback: capitalize model_type + arch suffix

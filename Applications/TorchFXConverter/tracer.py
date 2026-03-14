@@ -69,6 +69,18 @@ LEAF_MODULES = (
 )
 
 
+def _is_gelu_variant(module):
+    """Check if a module is any variant of GELU activation.
+
+    HuggingFace models may use custom GELU classes (GELUTanh, NewGELU,
+    FastGELU, etc.) that are not subclasses of nn.GELU.
+    """
+    cls_name = type(module).__name__
+    if "GELU" in cls_name or "gelu" in cls_name.lower():
+        return True
+    return False
+
+
 def _is_rmsnorm(module):
     """Check if a module is any variant of RMSNorm.
 
@@ -114,6 +126,8 @@ def _build_leaf_check(leaf_modules, exclude_leaf_types=None):
         if isinstance(module, leaf_modules):
             return True
         if _is_rmsnorm(module):
+            return True
+        if _is_gelu_variant(module):
             return True
         return False
     return is_leaf

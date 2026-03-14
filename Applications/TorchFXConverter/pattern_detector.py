@@ -184,7 +184,7 @@ def _print_block(block):
     if block.ffn:
         ffn = block.ffn
         print(f"    FFN ({ffn.ffn_type}):")
-        if ffn.ffn_type == "swiglu":
+        if ffn.ffn_type in ("swiglu", "geglu") or ffn.ffn_type.startswith("gated_"):
             print(f"      gate: {ffn.gate_proj}, up: {ffn.up_proj}, "
                   f"down: {ffn.down_proj}")
         else:
@@ -362,6 +362,8 @@ class PatternDetector:
         block_patterns = [
             # Qwen3/LLaMA/Mistral: model.layers.N
             r"(model\.layers\.\d+)",
+            # Gemma/LLaMA base model (AutoModel): layers.N (no model. prefix)
+            r"(layers\.\d+)",
             # BERT: encoder.layer.N / bert.encoder.layer.N
             r"((?:bert\.)?encoder\.layer\.\d+)",
             # T5/mT5: encoder.block.N / decoder.block.N
@@ -671,6 +673,12 @@ class PatternDetector:
                     and layer.hf_module_name.startswith(ffn_scope)):
                     ffn.activation = layer.name
                     ffn.layer_names.append(layer.name)
+                    # Distinguish GeGLU from SwiGLU based on activation
+                    act_type = layer.properties.get("activation", "")
+                    if act_type == "gelu":
+                        ffn.ffn_type = "geglu"
+                    elif act_type in ("relu", "tanh", "sigmoid"):
+                        ffn.ffn_type = f"gated_{act_type}"
                 elif (layer.layer_type == LAYER_MULTIPLY
                       and layer.hf_module_name.startswith(ffn_scope)):
                     ffn.gate_multiply = layer.name
@@ -818,6 +826,18 @@ class PatternDetector:
             elif model_type in ("t5", "mt5", "bart", "mbart",
                                 "pegasus", "marian"):
                 structure.arch_type = "encoder_decoder"
+                return
+
+            # Check if it's an embedding model (base model without LM head)
+            # These use decoder-like architecture but serve as encoders
+            architectures = getattr(self.config, "architectures", []) or []
+            is_base_model = any(
+                arch.endswith("Model") and not arch.endswith(("ForCausalLM",
+                    "ForConditionalGeneration", "ForSeq2SeqLM"))
+                for arch in architectures
+            )
+            if is_base_model and not structure.lm_head:
+                structure.arch_type = "embedding"
                 return
 
         if has_cross_attn:
