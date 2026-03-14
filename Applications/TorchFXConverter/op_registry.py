@@ -19,7 +19,7 @@ from nntrainer_layers import (
     LAYER_SIN, LAYER_COS, LAYER_TAN,
     LAYER_EXP, LAYER_LOG, LAYER_CLAMP,
     LAYER_REDUCE_MEAN, LAYER_REDUCE_SUM, LAYER_FLATTEN,
-    LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_CONCAT,
+    LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_CONCAT, LAYER_POOLING2D,
     LAYER_GATHER, LAYER_SLICE,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
     OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE, OP_SDPA, OP_NOOP, OP_UNSUPPORTED,
@@ -117,6 +117,12 @@ FUNCTION_IDENTITY_OPS = {
 # Function-based clamp names (matching METHOD_CLAMP_NAMES pattern)
 FUNCTION_CLAMP_NAMES = frozenset({
     "clamp", "clip", "clamp_min", "clamp_max",
+})
+
+# Function-based pooling names: maps func_name -> layer_type
+FUNCTION_POOLING_NAMES = frozenset({
+    "max_pool2d", "avg_pool2d", "adaptive_avg_pool2d", "adaptive_max_pool2d",
+    "max_pool1d", "avg_pool1d",
 })
 
 # Layer types that produce tuple outputs (for operator.getitem handling)

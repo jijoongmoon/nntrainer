@@ -10,7 +10,7 @@ from nntrainer_layers import (
     NNTrainerLayerDef,
     LAYER_FC, LAYER_EMBEDDING, LAYER_RMS_NORM, LAYER_LAYER_NORM,
     LAYER_ACTIVATION, LAYER_DROPOUT,
-    LAYER_CONV1D, LAYER_CONV2D, LAYER_BATCH_NORM,
+    LAYER_CONV1D, LAYER_CONV2D, LAYER_POOLING2D, LAYER_BATCH_NORM,
     LAYER_GRU, LAYER_LSTM, LAYER_RNN,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
 )
@@ -155,6 +155,44 @@ def map_module_node(node, modules, node_to_layer):
 
     if isinstance(module, nn.Conv2d):
         return _map_conv2d(module, module_name, module_type, input_names)
+
+    # Pooling layers
+    if isinstance(module, (nn.MaxPool2d, nn.AvgPool2d)):
+        ks = module.kernel_size if isinstance(module.kernel_size, tuple) else (module.kernel_size, module.kernel_size)
+        st = module.stride if isinstance(module.stride, tuple) else (module.stride, module.stride)
+        pd = module.padding if isinstance(module.padding, tuple) else (module.padding, module.padding)
+        pool_type = "max" if isinstance(module, nn.MaxPool2d) else "average"
+        return NNTrainerLayerDef(
+            layer_type=LAYER_POOLING2D,
+            name=_sanitize_name(module_name),
+            properties={
+                "pooling": pool_type,
+                "pool_size": f"{ks[0]},{ks[1]}",
+                "stride": f"{st[0]},{st[1]}",
+                "padding": f"{pd[0]},{pd[1]}",
+            },
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+        )
+
+    if isinstance(module, (nn.AdaptiveAvgPool2d, nn.AdaptiveMaxPool2d)):
+        out = module.output_size
+        if isinstance(out, int):
+            out = (out, out)
+        pool_type = "average" if isinstance(module, nn.AdaptiveAvgPool2d) else "max"
+        return NNTrainerLayerDef(
+            layer_type=LAYER_POOLING2D,
+            name=_sanitize_name(module_name),
+            properties={
+                "pooling": pool_type,
+                "pool_size": f"{out[0]},{out[1]}",
+                "adaptive": True,
+            },
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+        )
 
     # BatchNorm
     if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):

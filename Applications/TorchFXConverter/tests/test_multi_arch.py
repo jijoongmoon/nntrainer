@@ -599,6 +599,64 @@ def test_granite4_causal():
     print("\nGranite 4.0: PASSED!\n")
 
 
+def test_resnet18():
+    """Test CNN: ResNet-18.
+
+    Tests: Conv2d, BatchNorm2d, ReLU, MaxPool2d, AdaptiveAvgPool2d,
+    residual (addition), Linear, flatten.
+    """
+    from torchvision.models import resnet18
+    from decomposer import AdaptiveConverter
+
+    print("=" * 70)
+    print("TEST: ResNet-18 (CNN)")
+    print("=" * 70)
+
+    model = resnet18(weights=None)
+    model.eval()
+
+    print("\n--- Model Architecture ---")
+    for name, module in model.named_modules():
+        if name.count(".") <= 1:
+            print(f"  {name}: {type(module).__name__}")
+
+    # Trace via AdaptiveConverter
+    input_tensor = torch.randn(1, 3, 224, 224)
+    converter = AdaptiveConverter(model, None)
+    result = converter.convert({"x": input_tensor})
+
+    layers = result.layers
+
+    type_counts = {}
+    for layer in layers:
+        type_counts[layer.layer_type] = type_counts.get(layer.layer_type, 0) + 1
+
+    print(f"\nTotal mapped layers: {len(layers)}")
+    print(f"Layer type counts: {type_counts}")
+
+    # Verify basic structure
+    assert result.is_fully_mapped, \
+        f"All ops should be mapped, unknowns: {result.unknown_layers}, unsupported: {result.unsupported_ops}"
+
+    # Verify ResNet components
+    assert type_counts.get("conv2d", 0) == 20, \
+        f"ResNet-18 should have 20 conv2d layers, got {type_counts.get('conv2d', 0)}"
+    assert type_counts.get("batch_normalization", 0) == 20, \
+        f"ResNet-18 should have 20 batchnorm layers, got {type_counts.get('batch_normalization', 0)}"
+    assert type_counts.get("activation", 0) == 17, \
+        f"ResNet-18 should have 17 activation (ReLU) layers, got {type_counts.get('activation', 0)}"
+    assert type_counts.get("pooling2d", 0) == 2, \
+        f"ResNet-18 should have 2 pooling layers, got {type_counts.get('pooling2d', 0)}"
+    assert type_counts.get("addition", 0) == 8, \
+        f"ResNet-18 should have 8 residual additions, got {type_counts.get('addition', 0)}"
+    assert type_counts.get("fully_connected", 0) == 1, \
+        f"ResNet-18 should have 1 FC layer, got {type_counts.get('fully_connected', 0)}"
+    assert type_counts.get("flatten", 0) == 1, \
+        f"ResNet-18 should have 1 flatten, got {type_counts.get('flatten', 0)}"
+
+    print("\nResNet-18: PASSED!\n")
+
+
 if __name__ == "__main__":
     print("\n" + "#" * 70)
     print("# Multi-Architecture Tracer + Node Mapper Validation")
@@ -611,6 +669,7 @@ if __name__ == "__main__":
     test_gemma3_text_embedding()
     test_functiongemma_causal()
     test_granite4_causal()
+    test_resnet18()
 
     print("=" * 70)
     print("ALL ARCHITECTURE TESTS PASSED!")
