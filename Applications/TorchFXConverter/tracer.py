@@ -66,6 +66,10 @@ LEAF_MODULES = (
     # Batch norm
     nn.BatchNorm1d,
     nn.BatchNorm2d,
+    # Recurrent layers -> gru / lstm / rnn
+    nn.GRU,
+    nn.LSTM,
+    nn.RNN,
 )
 
 
@@ -340,6 +344,15 @@ class Tracer(TorchFunctionMode):
                         node.meta["eps"] = module.eps
                     elif hasattr(module, "variance_epsilon"):
                         node.meta["eps"] = module.variance_epsilon
+                elif isinstance(module, (nn.GRU, nn.LSTM, nn.RNN)):
+                    node.meta["hidden_size"] = module.hidden_size
+                    node.meta["input_size"] = module.input_size
+                    node.meta["num_layers"] = module.num_layers
+                    node.meta["bias"] = module.bias
+                    node.meta["batch_first"] = module.batch_first
+                    node.meta["bidirectional"] = module.bidirectional
+                    node.meta["dropout"] = module.dropout
+                    node.meta["is_rnn_module"] = True
 
                 self._register_output(output, node)
             elif self.module_stack:

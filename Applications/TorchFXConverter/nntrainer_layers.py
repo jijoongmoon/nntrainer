@@ -131,6 +131,14 @@ LAYER_TRANSPOSE = "transpose"
 LAYER_IDENTITY = "identity"
 LAYER_CAST = "cast"
 
+# Recurrent layers
+LAYER_GRU = "gru"
+LAYER_LSTM = "lstm"
+LAYER_RNN = "rnn"
+LAYER_GRUCELL = "grucell"
+LAYER_LSTMCELL = "lstmcell"
+LAYER_RNNCELL = "rnncell"
+
 # Convolution & pooling
 LAYER_CONV1D = "conv1d"
 LAYER_CONV2D = "conv2d"

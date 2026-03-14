@@ -25,6 +25,7 @@ from nntrainer_layers import (
     LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_CONCAT,
     LAYER_RESHAPE, LAYER_PERMUTE, LAYER_MATMUL,
     LAYER_CONV1D, LAYER_CONV2D, LAYER_BATCH_NORM, LAYER_POOLING2D,
+    LAYER_GRU, LAYER_LSTM, LAYER_RNN,
     LAYER_ADD, LAYER_MULTIPLY, LAYER_SUBTRACT, LAYER_DIVIDE,
     LAYER_POW, LAYER_SQRT, LAYER_NEGATIVE,
     LAYER_EXP, LAYER_LOG, LAYER_CLAMP,
@@ -309,6 +310,21 @@ class NodeMapper:
                 weight_hf_key=f"{module_name}.weight" if module.affine else "",
                 bias_hf_key=f"{module_name}.bias" if module.affine else "",
             )
+
+        # nn.GRU -> gru
+        if isinstance(module, nn.GRU):
+            return self._map_rnn_module(module, module_name, module_type,
+                                        input_names, LAYER_GRU)
+
+        # nn.LSTM -> lstm
+        if isinstance(module, nn.LSTM):
+            return self._map_rnn_module(module, module_name, module_type,
+                                        input_names, LAYER_LSTM)
+
+        # nn.RNN -> rnn
+        if isinstance(module, nn.RNN):
+            return self._map_rnn_module(module, module_name, module_type,
+                                        input_names, LAYER_RNN)
 
         # Unknown module type - record as-is for debugging
         print(f"  [WARNING] Unknown module type: {module_type} at {module_name}")
@@ -678,7 +694,23 @@ class NodeMapper:
         # === Pass-through / no-op ===
 
         # operator.getitem -> pass-through (tuple unpacking)
+        # For multi-output modules (GRU/LSTM/RNN), getitem[0] extracts
+        # the sequence output. Map as identity pass-through so downstream
+        # layers can reference it.
         if func is operator.getitem:
+            if len(node.args) >= 2 and hasattr(node.args[0], 'name'):
+                parent_name = node.args[0].name
+                parent_layer = self._node_to_layer.get(parent_name)
+                idx = node.args[1]
+                if (parent_layer and
+                        parent_layer.layer_type in self._MULTI_OUTPUT_LAYER_TYPES
+                        and idx == 0):
+                    return NNTrainerLayerDef(
+                        layer_type=LAYER_IDENTITY,
+                        name=node.name,
+                        input_layers=[parent_name],
+                        hf_module_name=scope,
+                    )
             return None
 
         # Comparison / conditional ops -> noop for inference graph structure
@@ -967,3 +999,74 @@ class NodeMapper:
             hf_module_name=module_name,
             hf_module_type=module_type,
         )
+
+    # Set of layer types that return tuple outputs (output, hidden_state)
+    _MULTI_OUTPUT_LAYER_TYPES = frozenset({LAYER_GRU, LAYER_LSTM, LAYER_RNN})
+
+    def _map_rnn_module(self, module, module_name, module_type, input_names,
+                        layer_type):
+        """Helper to map nn.GRU/LSTM/RNN to NNTrainer layer def.
+
+        PyTorch RNN weights layout:
+          weight_ih_l{k}: [gate_size, input_size]  (k = layer index)
+          weight_hh_l{k}: [gate_size, hidden_size]
+          bias_ih_l{k}:   [gate_size]
+          bias_hh_l{k}:   [gate_size]
+
+        NNTrainer expects transposed weights:
+          weight_ih: [input_size, gate_size]
+          weight_hh: [hidden_size, gate_size]
+
+        gate_size = 3*hidden_size (GRU), 4*hidden_size (LSTM), hidden_size (RNN)
+
+        Currently supports single-layer (num_layers=1) only.
+        Multi-layer RNNs would need to be expanded into multiple single layers.
+        """
+        if module.num_layers != 1:
+            print(f"  [WARNING] Multi-layer {module_type} (num_layers="
+                  f"{module.num_layers}) not yet supported, mapping layer 0 only")
+
+        props = {
+            "unit": module.hidden_size,
+            "return_sequences": True,
+        }
+
+        if hasattr(module, 'dropout') and module.dropout > 0:
+            props["dropout_rate"] = module.dropout
+
+        if module.bidirectional:
+            if layer_type == LAYER_LSTM:
+                props["bidirectional"] = True
+            else:
+                print(f"  [WARNING] Bidirectional {module_type} not supported "
+                      f"in NNTrainer, using forward-only")
+
+        # Determine weight keys for layer 0
+        weight_keys = {
+            "weight_ih": f"{module_name}.weight_ih_l0",
+            "weight_hh": f"{module_name}.weight_hh_l0",
+        }
+        bias_keys = {}
+        if module.bias:
+            bias_keys["bias_ih"] = f"{module_name}.bias_ih_l0"
+            bias_keys["bias_hh"] = f"{module_name}.bias_hh_l0"
+
+        layer_def = NNTrainerLayerDef(
+            layer_type=layer_type,
+            name=_sanitize_name(module_name),
+            properties=props,
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+            has_weight=True,
+            has_bias=module.bias,
+            weight_hf_key=weight_keys["weight_ih"],
+            bias_hf_key=bias_keys.get("bias_ih", ""),
+            transpose_weight=True,  # PyTorch [gate, in] -> NNTrainer [in, gate]
+        )
+        # Store additional weight keys for the weight converter
+        layer_def.properties["_weight_hh_key"] = weight_keys["weight_hh"]
+        if module.bias:
+            layer_def.properties["_bias_hh_key"] = bias_keys["bias_hh"]
+
+        return layer_def
