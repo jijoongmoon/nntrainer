@@ -73,6 +73,8 @@ FUNCTION_NOOP_NAMES = frozenset({
     "custom_function_call",
     # Comparison / conditional ops (T5 relative position bias)
     "where", "min", "max",
+    # Cumulative ops used in position embedding generation
+    "cumsum",
 })
 
 # Functions that map to OP_RESHAPE
@@ -184,7 +186,8 @@ METHOD_CLAMP_NAMES = frozenset({
 # Method ops that are no-ops in inference
 METHOD_NOOP_NAMES = frozenset({
     "contiguous", "detach", "clone", "to", "float",
-    "half", "bfloat16", "type_as", "expand",
+    "half", "bfloat16", "int", "long", "short", "bool",
+    "type_as", "expand",
     "size", "dim", "numel",
     "new_ones", "new_zeros", "new_full", "new_empty",
     "fill_", "zero_", "masked_fill", "masked_fill_",
