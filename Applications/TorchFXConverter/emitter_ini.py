@@ -159,8 +159,16 @@ class IniEmitter:
             for i in range(s.num_layers):
                 input_name = (first_input if i == 0
                               else f"layer{i-1}_decoder_output")
-                sections.extend(
-                    self._emit_block_ini(i, input_name, s))
+                block_i = s.blocks[i] if i < len(s.blocks) else None
+                is_conv_block = block_i and block_i.attention is None
+                if is_conv_block:
+                    sections.extend(
+                        self._emit_conv_block_ini(i, input_name, s,
+                                                  block=block_i))
+                else:
+                    sections.extend(
+                        self._emit_block_ini(i, input_name, s,
+                                             block=block_i))
                 sections.append("")
 
             # Final norm
@@ -440,6 +448,135 @@ class IniEmitter:
         # FFN residual
         if b0 and b0.ffn_residual:
             lines.append(f"[{prefix}_{block_out_name}]")
+            lines.append("Type = addition")
+            lines.append(f"input_layers = {last_residual},{prefix}_ffn_down")
+            lines.append("")
+
+        return lines
+
+    def _emit_conv_block_ini(self, layer_id, input_name, s,
+                             block=None, prefix=None):
+        """Emit a conv block (no attention) as INI sections."""
+        lines = []
+        if prefix is None:
+            prefix = f"layer{layer_id}"
+        b0 = block if block is not None else (s.blocks[0] if s.blocks else None)
+        norm_type = self._norm_type(s)
+        conv_l_cache = s.conv_l_cache or 3
+
+        lines.append(f"# --- Conv Block {layer_id} ---")
+
+        # Pre-conv norm
+        if b0 and b0.pre_attn_norm:
+            lines.append(f"[{prefix}_conv_norm]")
+            lines.append(f"Type = {norm_type}")
+            lines.append(f"input_layers = {input_name}")
+            lines.append(f"epsilon = {s.norm_eps}")
+            if norm_type == "rms_norm":
+                lines.append("packed = false")
+            lines.append("")
+            conv_input = f"{prefix}_conv_norm"
+        else:
+            conv_input = input_name
+
+        # Short conv: in_proj -> short_conv -> out_proj
+        lines.append(f"[{prefix}_conv_in_proj]")
+        lines.append("Type = fully_connected")
+        lines.append(f"input_layers = {conv_input}")
+        lines.append(f"unit = {s.hidden_size * 3}")
+        lines.append("disable_bias = true")
+        lines.append("")
+
+        lines.append(f"[{prefix}_conv_op]")
+        lines.append("Type = short_conv")
+        lines.append(f"input_layers = {prefix}_conv_in_proj")
+        lines.append(f"kernel_size = {conv_l_cache}")
+        lines.append(f"hidden_size = {s.hidden_size}")
+        lines.append("")
+
+        lines.append(f"[{prefix}_conv_out]")
+        lines.append("Type = fully_connected")
+        lines.append(f"input_layers = {prefix}_conv_op")
+        lines.append(f"unit = {s.hidden_size}")
+        lines.append("disable_bias = true")
+        lines.append("")
+
+        # Conv residual
+        if b0 and b0.attn_residual:
+            lines.append(f"[{prefix}_conv_add]")
+            lines.append("Type = addition")
+            lines.append(f"input_layers = {input_name},{prefix}_conv_out")
+            lines.append("")
+            last_residual = f"{prefix}_conv_add"
+        else:
+            last_residual = f"{prefix}_conv_out"
+
+        # Pre-FFN norm
+        if b0 and b0.pre_ffn_norm:
+            lines.append(f"[{prefix}_ffn_norm]")
+            lines.append(f"Type = {norm_type}")
+            lines.append(f"input_layers = {last_residual}")
+            lines.append(f"epsilon = {s.norm_eps}")
+            if norm_type == "rms_norm":
+                lines.append("packed = false")
+            lines.append("")
+            ffn_input = f"{prefix}_ffn_norm"
+        else:
+            ffn_input = last_residual
+
+        # FFN (reuse from block pattern)
+        if b0 and b0.ffn:
+            ffn = b0.ffn
+            if ffn.ffn_type == "swiglu":
+                lines.append(f"[{prefix}_ffn_up]")
+                lines.append("Type = fully_connected")
+                lines.append(f"input_layers = {ffn_input}")
+                lines.append(f"unit = {s.intermediate_size}")
+                lines.append("disable_bias = true")
+                lines.append("")
+
+                lines.append(f"[{prefix}_ffn_gate]")
+                lines.append("Type = fully_connected")
+                lines.append(f"input_layers = {ffn_input}")
+                lines.append(f"unit = {s.intermediate_size}")
+                lines.append("disable_bias = true")
+                lines.append("")
+
+                lines.append(f"[{prefix}_ffn_swiglu]")
+                lines.append("Type = swiglu")
+                lines.append(f"input_layers = {prefix}_ffn_up,"
+                             f"{prefix}_ffn_gate")
+                lines.append("")
+
+                lines.append(f"[{prefix}_ffn_down]")
+                lines.append("Type = fully_connected")
+                lines.append(f"input_layers = {prefix}_ffn_swiglu")
+                lines.append(f"unit = {s.hidden_size}")
+                lines.append("disable_bias = true")
+                lines.append("")
+            else:
+                act = "gelu" if ffn.ffn_type == "gelu_ffn" else "relu"
+                lines.append(f"[{prefix}_ffn_fc1]")
+                lines.append("Type = fully_connected")
+                lines.append(f"input_layers = {ffn_input}")
+                lines.append(f"unit = {s.intermediate_size}")
+                lines.append("")
+
+                lines.append(f"[{prefix}_ffn_act]")
+                lines.append("Type = activation")
+                lines.append(f"input_layers = {prefix}_ffn_fc1")
+                lines.append(f"Activation = {act}")
+                lines.append("")
+
+                lines.append(f"[{prefix}_ffn_down]")
+                lines.append("Type = fully_connected")
+                lines.append(f"input_layers = {prefix}_ffn_act")
+                lines.append(f"unit = {s.hidden_size}")
+                lines.append("")
+
+        # FFN residual
+        if b0 and b0.ffn_residual:
+            lines.append(f"[{prefix}_decoder_output]")
             lines.append("Type = addition")
             lines.append(f"input_layers = {last_residual},{prefix}_ffn_down")
             lines.append("")

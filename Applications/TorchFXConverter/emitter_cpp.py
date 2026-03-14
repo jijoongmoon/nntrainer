@@ -194,6 +194,29 @@ class CppEmitter:
         s = self.structure
         return not s.blocks
 
+    def _is_hybrid_model(self):
+        """Return True if this model has a mix of attention and conv blocks."""
+        s = self.structure
+        if not s.blocks:
+            return False
+        has_attn = any(b.attention is not None for b in s.blocks)
+        has_conv = any(b.attention is None for b in s.blocks)
+        return has_attn and has_conv
+
+    def _get_attn_block(self):
+        """Return the first block that has attention (representative)."""
+        for b in self.structure.blocks:
+            if b.attention is not None:
+                return b
+        return None
+
+    def _get_conv_block(self):
+        """Return the first block that has no attention (conv block)."""
+        for b in self.structure.blocks:
+            if b.attention is None:
+                return b
+        return None
+
     def emit_header(self):
         """Generate C++ header file (.h) content."""
         if self._is_flat_model():
@@ -262,8 +285,8 @@ class CppEmitter:
         L.append(f"")
 
         # Conditional includes for derived classes with custom layers
-        has_qk_norm = (s.blocks and s.blocks[0].attention
-                       and s.blocks[0].attention.has_qk_norm)
+        attn_block = self._get_attn_block()
+        has_qk_norm = attn_block and attn_block.attention.has_qk_norm
         if has_qk_norm:
             L.append(f"#include <reshaped_rms_norm.h>")
             L.append(f"")
@@ -291,6 +314,7 @@ class CppEmitter:
         L.append(f"protected:")
 
         # createTransformerBlock(s) - encoder-decoder gets both
+        is_hybrid = self._is_hybrid_model()
         if s.arch_type == "encoder_decoder":
             L.append(f"  /**")
             L.append(f"   * @brief Create a Transformer Encoder Block")
@@ -319,17 +343,37 @@ class CppEmitter:
                      f"const int layer_id, std::string input_name);")
             L.append(f"")
 
-        # createAttention
-        L.append(f"  /**")
-        L.append(f"   * @brief Create Attention layers")
-        L.append(f"   */")
-        L.append(f"  virtual std::vector<LayerHandle>")
-        L.append(f"  createAttention(const int layer_id, int seq_len, "
-                 f"int n_heads, int head_dim,")
-        L.append(f"                  std::string query_name, "
-                 f"std::string key_name,")
-        L.append(f"                  std::string value_name);")
-        L.append(f"")
+            if is_hybrid:
+                L.append(f"  /**")
+                L.append(f"   * @brief Create a Conv {block_type}")
+                L.append(f"   */")
+                L.append(f"  virtual std::vector<LayerHandle>")
+                L.append(f"  createConv{block_type}("
+                         f"const int layer_id, std::string input_name);")
+                L.append(f"")
+
+        # createAttention (only if model has attention blocks)
+        if self._get_attn_block():
+            L.append(f"  /**")
+            L.append(f"   * @brief Create Attention layers")
+            L.append(f"   */")
+            L.append(f"  virtual std::vector<LayerHandle>")
+            L.append(f"  createAttention(const int layer_id, int seq_len, "
+                     f"int n_heads, int head_dim,")
+            L.append(f"                  std::string query_name, "
+                     f"std::string key_name,")
+            L.append(f"                  std::string value_name);")
+            L.append(f"")
+
+        # createShortConv (only for hybrid models with conv blocks)
+        if is_hybrid:
+            L.append(f"  /**")
+            L.append(f"   * @brief Create Short Convolution layers")
+            L.append(f"   */")
+            L.append(f"  virtual std::vector<LayerHandle>")
+            L.append(f"  createShortConv(const int layer_id, int dim,")
+            L.append(f"                  std::string input_name);")
+            L.append(f"")
 
         # createMlp
         L.append(f"  /**")
@@ -373,13 +417,18 @@ class CppEmitter:
             L.append(f"  int GQA_SIZE = {gqa};")
 
         # Sliding window
-        if s.blocks and s.blocks[0].attention:
+        if attn_block:
             L.append(f"  unsigned int SLIDING_WINDOW = UINT_MAX;")
+
+        # Conv parameters (for hybrid models)
+        if is_hybrid:
+            conv_l_cache = s.conv_l_cache or 3
+            L.append(f"  int CONV_KERNEL_SIZE = {conv_l_cache};")
 
         # Runtime parameters (set externally)
         L.append(f"  unsigned int INIT_SEQ_LEN = 0;")
         L.append(f"  unsigned int NUM_TO_GENERATE = 0;")
-        if s.blocks and s.blocks[0].attention and s.blocks[0].attention.has_rope:
+        if attn_block and attn_block.attention.has_rope:
             L.append(f"  unsigned int MAX_POSITION_EMBEDDINGS = "
                      f"{s.max_position_embeddings or 2048};")
 
@@ -510,13 +559,38 @@ class CppEmitter:
             if representative and representative.ffn:
                 L.append(self._emit_ffn_method(cname, representative))
         elif s.blocks:
-            b0 = s.blocks[0]
-            L.append(self._emit_block_method(cname, block_type, b0))
+            if self._is_hybrid_model():
+                # Hybrid model: emit both attention and conv block methods
+                attn_block = self._get_attn_block()
+                conv_block = self._get_conv_block()
 
-            if b0.attention:
-                L.append(self._emit_attention_method(cname, b0))
-            if b0.ffn:
-                L.append(self._emit_ffn_method(cname, b0))
+                # Attention block method
+                L.append(self._emit_block_method(
+                    cname, block_type, attn_block))
+
+                # Conv block method
+                L.append(self._emit_conv_block_method(
+                    cname, block_type, conv_block))
+
+                # Attention
+                if attn_block and attn_block.attention:
+                    L.append(self._emit_attention_method(cname, attn_block))
+
+                # ShortConv
+                L.append(self._emit_short_conv_method(cname))
+
+                # FFN (use attn block as representative — same FFN for both)
+                representative = attn_block or conv_block
+                if representative and representative.ffn:
+                    L.append(self._emit_ffn_method(cname, representative))
+            else:
+                b0 = s.blocks[0]
+                L.append(self._emit_block_method(cname, block_type, b0))
+
+                if b0.attention:
+                    L.append(self._emit_attention_method(cname, b0))
+                if b0.ffn:
+                    L.append(self._emit_ffn_method(cname, b0))
 
         # registerCustomLayers
         L.append(self._emit_register_custom_layers(cname))
@@ -623,17 +697,45 @@ class CppEmitter:
                 L.extend(_cpp_layer(norm_type, dec_norm_props))
                 L.append(f"")
         else:
-            L.append(f"  // Transformer blocks")
-            L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
-            L.append(f'    std::string input_name = (i == 0) ? {first_in}')
-            L.append(f'      : "layer" + std::to_string(i - 1) '
-                     f'+ "_decoder_output";')
-            L.append(f"    auto block = createTransformer{block_type}"
-                     f"(i, input_name);")
-            L.append(f"    layers.insert(layers.end(), "
-                     f"block.begin(), block.end());")
-            L.append(f"  }}")
-            L.append(f"")
+            if self._is_hybrid_model():
+                # Hybrid: dispatch based on layer type
+                layer_types = self._get_layer_types()
+                L.append(f"  // Layer types: {layer_types}")
+                L.append(f"  const std::vector<std::string> LAYER_TYPES = {{")
+                for i, lt in enumerate(layer_types):
+                    comma = "," if i < len(layer_types) - 1 else ""
+                    L.append(f'    "{lt}"{comma}')
+                L.append(f"  }};")
+                L.append(f"")
+                L.append(f"  // Hybrid blocks (attention + conv)")
+                L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
+                L.append(f'    std::string input_name = (i == 0) ? {first_in}')
+                L.append(f'      : "layer" + std::to_string(i - 1) '
+                         f'+ "_decoder_output";')
+                L.append(f'    std::vector<LayerHandle> block;')
+                L.append(f'    if (LAYER_TYPES[i] == "full_attention") {{')
+                L.append(f"      block = createTransformer{block_type}"
+                         f"(i, input_name);")
+                L.append(f"    }} else {{")
+                L.append(f"      block = createConv{block_type}"
+                         f"(i, input_name);")
+                L.append(f"    }}")
+                L.append(f"    layers.insert(layers.end(), "
+                         f"block.begin(), block.end());")
+                L.append(f"  }}")
+                L.append(f"")
+            else:
+                L.append(f"  // Transformer blocks")
+                L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
+                L.append(f'    std::string input_name = (i == 0) ? {first_in}')
+                L.append(f'      : "layer" + std::to_string(i - 1) '
+                         f'+ "_decoder_output";')
+                L.append(f"    auto block = createTransformer{block_type}"
+                         f"(i, input_name);")
+                L.append(f"    layers.insert(layers.end(), "
+                         f"block.begin(), block.end());")
+                L.append(f"  }}")
+                L.append(f"")
 
             # Final norm
             if s.final_norm:
@@ -691,6 +793,17 @@ class CppEmitter:
         """Return the norm layer type for this model."""
         return ("rms_norm" if self.structure.model_type not in
                 ("bert", "roberta") else "layer_normalization")
+
+    def _get_layer_types(self):
+        """Return list of layer type strings for hybrid models."""
+        s = self.structure
+        types = []
+        for block in s.blocks:
+            if block.attention is not None:
+                types.append("full_attention")
+            else:
+                types.append("conv")
+        return types
 
     def _emit_block_method(self, cname, block_type, block,
                            is_encoder=None):
@@ -853,6 +966,157 @@ class CppEmitter:
             ]))
             L.append(f"")
 
+        L.append(f"  return layers;")
+        L.append(f"}}")
+        L.append(f"")
+        return "\n".join(L)
+
+    # =========================================================================
+    # createConvBlock() — for hybrid models
+    # =========================================================================
+
+    def _emit_conv_block_method(self, cname, block_type, block):
+        """Emit a conv block method for hybrid models.
+
+        Conv blocks: norm -> shortConv -> residual -> norm -> ffn -> residual
+        Same structure as attention blocks but with ShortConv instead of MHA.
+        """
+        s = self.structure
+        norm_type = self._get_norm_type()
+        L = []
+
+        prefix_expr = '"layer" + std::to_string(layer_id)'
+
+        L.append(f"std::vector<LayerHandle>")
+        L.append(f"{cname}::createConv{block_type}("
+                 f"const int layer_id,")
+        L.append(f"  std::string input_name) {{")
+        L.append(f"")
+        L.append(f"  std::vector<LayerHandle> layers;")
+        L.append(f"  auto prefix = {prefix_expr};")
+        L.append(f"")
+
+        # Pre-conv norm (uses operator_norm, same position as pre-attn norm)
+        if block.pre_attn_norm:
+            L.append(f"  // Pre-conv normalization")
+            norm_props = [
+                'withKey("name", prefix + "_conv_norm")',
+                'withKey("input_layers", input_name)',
+                'withKey("epsilon", NORM_EPS)',
+            ]
+            if norm_type == "rms_norm":
+                norm_props.append('withKey("packed", "false")')
+            L.extend(_cpp_layer(norm_type, norm_props))
+            L.append(f"")
+
+        # Short convolution
+        conv_in = ('prefix + "_conv_norm"' if block.pre_attn_norm
+                   else "input_name")
+        L.append(f"  auto conv_layer = createShortConv(layer_id, DIM,")
+        L.append(f"                                    {conv_in});")
+        L.append(f"  layers.insert(layers.end(), conv_layer.begin(), "
+                 f"conv_layer.end());")
+        L.append(f"")
+
+        # Conv residual connection
+        if block.attn_residual:
+            L.append(f"  // Conv residual connection")
+            L.extend(_cpp_layer("addition", [
+                'withKey("name", prefix + "_conv_add")',
+                'withKey("input_layers", input_name + "," + '
+                'prefix + "_conv_out")',
+            ]))
+            L.append(f"")
+            last_residual = 'prefix + "_conv_add"'
+        else:
+            last_residual = 'prefix + "_conv_out"'
+
+        # Pre-FFN norm
+        if block.pre_ffn_norm:
+            L.append(f"  // Pre-FFN normalization")
+            norm_props = [
+                'withKey("name", prefix + "_ffn_norm")',
+                f'withKey("input_layers", {last_residual})',
+                'withKey("epsilon", NORM_EPS)',
+            ]
+            if norm_type == "rms_norm":
+                norm_props.append('withKey("packed", "false")')
+            L.extend(_cpp_layer(norm_type, norm_props))
+            L.append(f"")
+            ffn_in = 'prefix + "_ffn_norm"'
+        else:
+            ffn_in = last_residual
+
+        # FFN
+        if block.ffn:
+            L.append(f"  auto ffn_layer = createMlp(layer_id, DIM, "
+                     f"INTERMEDIATE_SIZE,")
+            L.append(f"                             {ffn_in});")
+            L.append(f"  layers.insert(layers.end(), ffn_layer.begin(), "
+                     f"ffn_layer.end());")
+            L.append(f"")
+
+        # FFN residual
+        if block.ffn_residual:
+            L.append(f"  // FFN residual connection")
+            L.extend(_cpp_layer("addition", [
+                'withKey("name", prefix + "_decoder_output")',
+                f'withKey("input_layers", {last_residual} + "," + '
+                f'prefix + "_ffn_down")',
+            ]))
+            L.append(f"")
+
+        L.append(f"  return layers;")
+        L.append(f"}}")
+        L.append(f"")
+        return "\n".join(L)
+
+    # =========================================================================
+    # createShortConv() — gated short convolution
+    # =========================================================================
+
+    def _emit_short_conv_method(self, cname):
+        """Emit ShortConv method: in_proj -> gated_conv1d -> out_proj."""
+        L = []
+
+        L.append(f"std::vector<LayerHandle> {cname}::createShortConv(")
+        L.append(f"  const int layer_id, int dim,")
+        L.append(f"  std::string input_name) {{")
+        L.append(f"")
+        L.append(f"  std::vector<LayerHandle> layers;")
+        L.append(f"  auto prefix = \"layer\" + std::to_string(layer_id);")
+        L.append(f"")
+
+        # in_proj: dim -> 3*dim (projects to B, C, x)
+        L.append(f"  // Input projection (-> B, C, x)")
+        L.extend(_cpp_layer("fully_connected", [
+            'withKey("name", prefix + "_conv_in_proj")',
+            'withKey("unit", 3 * dim)',
+            'withKey("disable_bias", "true")',
+            'withKey("input_layers", input_name)',
+        ]))
+
+        # Conv1d (depthwise, causal)
+        L.append(f"")
+        L.append(f"  // Gated short convolution")
+        L.extend(_cpp_layer("short_conv", [
+            'withKey("name", prefix + "_conv_op")',
+            'withKey("input_layers", prefix + "_conv_in_proj")',
+            'withKey("kernel_size", CONV_KERNEL_SIZE)',
+            'withKey("hidden_size", dim)',
+        ]))
+
+        # out_proj: dim -> dim
+        L.append(f"")
+        L.append(f"  // Output projection")
+        L.extend(_cpp_layer("fully_connected", [
+            'withKey("name", prefix + "_conv_out")',
+            'withKey("unit", dim)',
+            'withKey("disable_bias", "true")',
+            'withKey("input_layers", prefix + "_conv_op")',
+        ]))
+
+        L.append(f"")
         L.append(f"  return layers;")
         L.append(f"}}")
         L.append(f"")
@@ -1075,8 +1339,8 @@ class CppEmitter:
 
     def _emit_register_custom_layers(self, cname):
         s = self.structure
-        has_qk_norm = (s.blocks and s.blocks[0].attention
-                       and s.blocks[0].attention.has_qk_norm)
+        attn_block = self._get_attn_block()
+        has_qk_norm = attn_block and attn_block.attention.has_qk_norm
         L = []
 
         L.append(f"void {cname}::registerCustomLayers() {{")
@@ -1097,6 +1361,10 @@ class CppEmitter:
         if has_qk_norm:
             L.append(f"    app_context->registerFactory("
                      f"nntrainer::createLayer<ReshapedRMSNormLayer>);")
+
+        if self._is_hybrid_model():
+            L.append(f"    app_context->registerFactory("
+                     f"nntrainer::createLayer<ShortConvLayer>);")
 
         L.append(f"  }} catch (std::invalid_argument &e) {{")
         L.append(f'    std::cerr << "failed to register factory, reason: " '

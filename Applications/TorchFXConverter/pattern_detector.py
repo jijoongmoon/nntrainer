@@ -118,6 +118,7 @@ class ModelStructure:
     max_position_embeddings: int = 0
     num_encoder_layers: int = 0
     num_decoder_layers: int = 0
+    conv_l_cache: int = 0                   # Conv kernel size (LFM2-style)
 
     @property
     def encoder_blocks(self):
@@ -334,11 +335,14 @@ class PatternDetector:
                 if isinstance(rt, (int, float)):
                     structure.rope_theta = float(rt)
         structure.norm_eps = self._safe_cfg_float(
-            cfg, "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon")
+            cfg, "rms_norm_eps", "norm_eps", "layer_norm_eps",
+            "layer_norm_epsilon")
         tie = getattr(cfg, "tie_word_embeddings", False)
         structure.tie_word_embeddings = bool(tie) if not callable(tie) else False
         structure.max_position_embeddings = self._safe_cfg_int(
             cfg, "max_position_embeddings", default=2048)
+        structure.conv_l_cache = self._safe_cfg_int(
+            cfg, "conv_L_cache", default=0)
 
     # =========================================================================
     # Embedding & Head Detection
@@ -665,13 +669,19 @@ class PatternDetector:
 
         # Detect SwiGLU pattern: gate_proj + up_proj + down_proj
         gate = up = down = None
+        w1_layer = None  # track w1 separately for LFM2-style remap
         for layer, suffix in fc_layers:
             if suffix in ("gate_proj", "gate"):
                 gate = layer
             elif suffix in ("up_proj", "up", "wi_1", "w1"):
                 up = layer
+                if suffix == "w1":
+                    w1_layer = layer
             elif suffix in ("down_proj", "down", "wo", "w2"):
                 down = layer
+            elif suffix in ("w3",):
+                # LFM2-style: w3 is the up projection
+                up = layer
             # BERT/T5 style: wi_0 = gate, wi = up (T5 DenseReluDense)
             elif suffix in ("wi_0",):
                 gate = layer
@@ -682,6 +692,11 @@ class PatternDetector:
                 up = layer
             elif suffix in ("output.dense",):
                 down = layer
+
+        # LFM2-style remap: when w1, w3, w2 all present, w1 is the gate
+        # (silu activation), w3 is up, w2 is down
+        if w1_layer and not gate and up and up is not w1_layer and down:
+            gate = w1_layer
 
         if gate and up and down:
             ffn.ffn_type = "swiglu"
