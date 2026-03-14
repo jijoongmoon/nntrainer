@@ -18,67 +18,67 @@ LEAF MODULE NODES:
     meta.is_rmsnorm = True
     meta.eps = 1e-06
   model.layers.0.self_attn.q_proj                    type=Linear
-    args: ['_tensor_constant_3']
+    args: ['_tensor_constant_4']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
     meta.out_features = 64
   model.layers.0.self_attn.q_norm                    type=Qwen3RMSNorm
-    args: ['_tensor_constant_82']
+    args: ['_tensor_constant_83']
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
     meta.eps = 1e-06
   model.layers.0.self_attn.k_proj                    type=Linear
-    args: ['_tensor_constant_3']
+    args: ['_tensor_constant_4']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
     meta.out_features = 32
   model.layers.0.self_attn.k_norm                    type=Qwen3RMSNorm
-    args: ['_tensor_constant_86']
+    args: ['_tensor_constant_88']
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
     meta.eps = 1e-06
   model.layers.0.self_attn.v_proj                    type=Linear
-    args: ['_tensor_constant_3']
+    args: ['_tensor_constant_4']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
     meta.out_features = 32
   model.layers.0.self_attn.o_proj                    type=Linear
-    args: ['_tensor_constant_111']
+    args: ['_tensor_constant_109']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
     meta.out_features = 64
   model.layers.0.post_attention_layernorm            type=Qwen3RMSNorm
-    args: ['_tensor_constant_114']
+    args: ['_tensor_constant_112']
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
     meta.eps = 1e-06
   model.layers.0.mlp.gate_proj                       type=Linear
-    args: ['_tensor_constant_10']
+    args: ['_tensor_constant_11']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
     meta.out_features = 128
   model.layers.0.mlp.up_proj                         type=Linear
-    args: ['_tensor_constant_10']
+    args: ['_tensor_constant_11']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
     meta.out_features = 128
   model.layers.0.mlp.down_proj                       type=Linear
-    args: ['_tensor_constant_123']
+    args: ['_tensor_constant_74']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 128
     meta.out_features = 64
   model.layers.1.input_layernorm                     type=Qwen3RMSNorm
-    args: ['_tensor_constant_10']
+    args: ['_tensor_constant_103']
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -90,7 +90,7 @@ LEAF MODULE NODES:
     meta.in_features = 64
     meta.out_features = 64
   model.layers.1.self_attn.q_norm                    type=Qwen3RMSNorm
-    args: ['_tensor_constant_128']
+    args: ['_tensor_constant_123']
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -102,7 +102,7 @@ LEAF MODULE NODES:
     meta.in_features = 64
     meta.out_features = 32
   model.layers.1.self_attn.k_norm                    type=Qwen3RMSNorm
-    args: ['_tensor_constant_131']
+    args: ['_tensor_constant_127']
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -114,31 +114,31 @@ LEAF MODULE NODES:
     meta.in_features = 64
     meta.out_features = 32
   model.layers.1.self_attn.o_proj                    type=Linear
-    args: ['_tensor_constant_148']
+    args: ['_tensor_constant_145']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
     meta.out_features = 64
   model.layers.1.post_attention_layernorm            type=Qwen3RMSNorm
-    args: ['_tensor_constant_149']
+    args: ['_tensor_constant_74']
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
     meta.eps = 1e-06
   model.layers.1.mlp.gate_proj                       type=Linear
-    args: ['_tensor_constant_18']
+    args: ['_tensor_constant_136']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
     meta.out_features = 128
   model.layers.1.mlp.up_proj                         type=Linear
-    args: ['_tensor_constant_18']
+    args: ['_tensor_constant_136']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
     meta.out_features = 128
   model.layers.1.mlp.down_proj                       type=Linear
-    args: ['_tensor_constant_157']
+    args: ['_tensor_constant_150']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 128
@@ -150,7 +150,7 @@ LEAF MODULE NODES:
     meta.is_rmsnorm = True
     meta.eps = 1e-06
   lm_head                                            type=Linear
-    args: ['_tensor_constant_161']
+    args: ['_tensor_constant_156']
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -175,282 +175,277 @@ ALL NODES:
   [call_function  ] model_arange                             target=arange                                   args=(0, 8)
   [get_attr       ] _tensor_constant_67                      target=_tensor_constant_67                      args=()
   [call_method    ] model_unsqueeze                          target=unsqueeze                                args=(_tensor_constant_67, 0)
+  [get_attr       ] _tensor_constant_68                      target=_tensor_constant_68                      args=()
+  [call_method    ] model_rotary_emb_detach                  target=detach                                   args=(_tensor_constant_68)
+  [get_attr       ] _tensor_constant_69                      target=_tensor_constant_69                      args=()
+  [call_method    ] model_rotary_emb_clone                   target=clone                                    args=(_tensor_constant_69)
+  [get_attr       ] _tensor_constant_3                       target=_tensor_constant_68                      args=()
   [call_function  ] model_rotary_emb__set_grad_enabled       target=_set_grad_enabled                        args=(False)
   [get_attr       ] model_rotary_emb_inv_freq                target=model.rotary_emb.inv_freq                args=()
   [call_method    ] model_rotary_emb___getitem__             target=__getitem__                              args=(model_rotary_emb_inv_freq, (None, slice(None, None, None), None))
-  [get_attr       ] _tensor_constant_68                      target=_tensor_constant_68                      args=()
-  [call_method    ] model_rotary_emb_float                   target=float                                    args=(_tensor_constant_68)
-  [call_method    ] model_rotary_emb_expand                  target=expand                                   args=(_tensor_constant_68, 1, -1, 1)
-  [get_attr       ] _tensor_constant_69                      target=_tensor_constant_69                      args=()
-  [call_method    ] model_rotary_emb_to                      target=to                                       args=(_tensor_constant_69, cpu)
-  [call_method    ] model_rotary_emb___getitem___1           target=__getitem__                              args=(_tensor_constant_66, (slice(None, None, None), None, slice(None, None, None)))
-  [call_method    ] model_rotary_emb_float_1                 target=float                                    args=(_tensor_constant_68)
-  [call_method    ] model_rotary_emb_float_2                 target=float                                    args=(_tensor_constant_69)
   [get_attr       ] _tensor_constant_70                      target=_tensor_constant_70                      args=()
-  [call_method    ] model_rotary_emb_float_3                 target=float                                    args=(_tensor_constant_70)
-  [call_method    ] model_rotary_emb_matmul                  target=matmul                                   args=(_tensor_constant_69, _tensor_constant_70)
+  [call_method    ] model_rotary_emb_float                   target=float                                    args=(_tensor_constant_70)
+  [call_method    ] model_rotary_emb_expand                  target=expand                                   args=(_tensor_constant_70, 1, -1, 1)
   [get_attr       ] _tensor_constant_71                      target=_tensor_constant_71                      args=()
-  [call_method    ] model_rotary_emb_transpose               target=transpose                                args=(_tensor_constant_71, 1, 2)
+  [call_method    ] model_rotary_emb_to                      target=to                                       args=(_tensor_constant_71, cpu)
+  [call_method    ] model_rotary_emb___getitem___1           target=__getitem__                              args=(_tensor_constant_3, (slice(None, None, None), None, slice(None, None, None)))
   [get_attr       ] _tensor_constant_72                      target=_tensor_constant_72                      args=()
-  [call_function  ] model_rotary_emb_cat                     target=cat                                      args=((_tensor_constant_72, _tensor_constant_72))
+  [call_method    ] model_rotary_emb_float_1                 target=float                                    args=(_tensor_constant_72)
+  [call_method    ] model_rotary_emb_float_2                 target=float                                    args=(_tensor_constant_71)
   [get_attr       ] _tensor_constant_73                      target=_tensor_constant_73                      args=()
-  [call_method    ] model_rotary_emb_cos                     target=cos                                      args=(_tensor_constant_73)
+  [call_method    ] model_rotary_emb_float_3                 target=float                                    args=(_tensor_constant_73)
+  [call_method    ] model_rotary_emb_matmul                  target=matmul                                   args=(_tensor_constant_71, _tensor_constant_73)
   [get_attr       ] _tensor_constant_74                      target=_tensor_constant_74                      args=()
-  [call_method    ] model_rotary_emb_mul                     target=mul                                      args=(_tensor_constant_74, 1.0)
-  [call_method    ] model_rotary_emb_sin                     target=sin                                      args=(_tensor_constant_73)
+  [call_method    ] model_rotary_emb_transpose               target=transpose                                args=(_tensor_constant_74, 1, 2)
   [get_attr       ] _tensor_constant_75                      target=_tensor_constant_75                      args=()
-  [call_method    ] model_rotary_emb_mul_1                   target=mul                                      args=(_tensor_constant_75, 1.0)
+  [call_function  ] model_rotary_emb_cat                     target=cat                                      args=((_tensor_constant_75, _tensor_constant_75))
   [get_attr       ] _tensor_constant_76                      target=_tensor_constant_76                      args=()
-  [call_method    ] model_rotary_emb_to_1                    target=to                                       args=(_tensor_constant_76)
+  [call_method    ] model_rotary_emb_cos                     target=cos                                      args=(_tensor_constant_76)
   [get_attr       ] _tensor_constant_77                      target=_tensor_constant_77                      args=()
-  [call_method    ] model_rotary_emb_to_2                    target=to                                       args=(_tensor_constant_77)
+  [call_method    ] model_rotary_emb_mul                     target=mul                                      args=(_tensor_constant_77, 1.0)
+  [call_method    ] model_rotary_emb_sin                     target=sin                                      args=(_tensor_constant_76)
+  [call_method    ] model_rotary_emb_mul_1                   target=mul                                      args=(_tensor_constant_77, 1.0)
+  [get_attr       ] _tensor_constant_78                      target=_tensor_constant_78                      args=()
+  [call_method    ] model_rotary_emb_to_1                    target=to                                       args=(_tensor_constant_78)
+  [get_attr       ] _tensor_constant_79                      target=_tensor_constant_79                      args=()
+  [call_method    ] model_rotary_emb_to_2                    target=to                                       args=(_tensor_constant_79)
   [call_function  ] model_rotary_emb__set_grad_enabled_1     target=_set_grad_enabled                        args=(False)
   [call_module    ] model_layers_0_input_layernorm           target=model.layers.0.input_layernorm           args=(_tensor_constant_2)
-  [get_attr       ] _tensor_constant_78                      target=_tensor_constant_78                      args=()
-  [call_method    ] model_layers_0_detach                    target=detach                                   args=(_tensor_constant_78)
-  [get_attr       ] _tensor_constant_79                      target=_tensor_constant_79                      args=()
-  [call_method    ] model_layers_0_clone                     target=clone                                    args=(_tensor_constant_79)
-  [get_attr       ] _tensor_constant_3                       target=_tensor_constant_78                      args=()
-  [call_module    ] model_layers_0_self_attn_q_proj          target=model.layers.0.self_attn.q_proj          args=(_tensor_constant_3)
   [get_attr       ] _tensor_constant_80                      target=_tensor_constant_80                      args=()
-  [call_method    ] model_layers_0_self_attn_detach          target=detach                                   args=(_tensor_constant_80)
+  [call_method    ] model_layers_0_detach                    target=detach                                   args=(_tensor_constant_80)
   [get_attr       ] _tensor_constant_81                      target=_tensor_constant_81                      args=()
-  [call_method    ] model_layers_0_self_attn_clone           target=clone                                    args=(_tensor_constant_81)
+  [call_method    ] model_layers_0_clone                     target=clone                                    args=(_tensor_constant_81)
   [get_attr       ] _tensor_constant_4                       target=_tensor_constant_80                      args=()
-  [call_method    ] model_layers_0_self_attn_view            target=view                                     args=(_tensor_constant_4, (1, 8, -1, 16))
+  [call_module    ] model_layers_0_self_attn_q_proj          target=model.layers.0.self_attn.q_proj          args=(_tensor_constant_4)
   [get_attr       ] _tensor_constant_82                      target=_tensor_constant_82                      args=()
-  [call_module    ] model_layers_0_self_attn_q_norm          target=model.layers.0.self_attn.q_norm          args=(_tensor_constant_82)
+  [call_method    ] model_layers_0_self_attn_detach          target=detach                                   args=(_tensor_constant_82)
   [get_attr       ] _tensor_constant_83                      target=_tensor_constant_83                      args=()
-  [call_method    ] model_layers_0_self_attn_detach_1        target=detach                                   args=(_tensor_constant_83)
+  [call_method    ] model_layers_0_self_attn_clone           target=clone                                    args=(_tensor_constant_83)
+  [get_attr       ] _tensor_constant_5                       target=_tensor_constant_82                      args=()
+  [call_method    ] model_layers_0_self_attn_view            target=view                                     args=(_tensor_constant_5, (1, 8, -1, 16))
+  [call_module    ] model_layers_0_self_attn_q_norm          target=model.layers.0.self_attn.q_norm          args=(_tensor_constant_83)
   [get_attr       ] _tensor_constant_84                      target=_tensor_constant_84                      args=()
-  [call_method    ] model_layers_0_self_attn_clone_1         target=clone                                    args=(_tensor_constant_84)
-  [get_attr       ] _tensor_constant_5                       target=_tensor_constant_83                      args=()
-  [call_method    ] model_layers_0_self_attn_transpose       target=transpose                                args=(_tensor_constant_5, 1, 2)
-  [call_module    ] model_layers_0_self_attn_k_proj          target=model.layers.0.self_attn.k_proj          args=(_tensor_constant_3)
+  [call_method    ] model_layers_0_self_attn_detach_1        target=detach                                   args=(_tensor_constant_84)
   [get_attr       ] _tensor_constant_85                      target=_tensor_constant_85                      args=()
-  [call_method    ] model_layers_0_self_attn_detach_2        target=detach                                   args=(_tensor_constant_85)
+  [call_method    ] model_layers_0_self_attn_clone_1         target=clone                                    args=(_tensor_constant_85)
+  [get_attr       ] _tensor_constant_6                       target=_tensor_constant_84                      args=()
+  [call_method    ] model_layers_0_self_attn_transpose       target=transpose                                args=(_tensor_constant_6, 1, 2)
+  [call_module    ] model_layers_0_self_attn_k_proj          target=model.layers.0.self_attn.k_proj          args=(_tensor_constant_4)
   [get_attr       ] _tensor_constant_86                      target=_tensor_constant_86                      args=()
-  [call_method    ] model_layers_0_self_attn_clone_2         target=clone                                    args=(_tensor_constant_86)
-  [get_attr       ] _tensor_constant_6                       target=_tensor_constant_85                      args=()
-  [call_method    ] model_layers_0_self_attn_view_1          target=view                                     args=(_tensor_constant_6, (1, 8, -1, 16))
-  [call_module    ] model_layers_0_self_attn_k_norm          target=model.layers.0.self_attn.k_norm          args=(_tensor_constant_86)
+  [call_method    ] model_layers_0_self_attn_detach_2        target=detach                                   args=(_tensor_constant_86)
   [get_attr       ] _tensor_constant_87                      target=_tensor_constant_87                      args=()
-  [call_method    ] model_layers_0_self_attn_detach_3        target=detach                                   args=(_tensor_constant_87)
+  [call_method    ] model_layers_0_self_attn_clone_2         target=clone                                    args=(_tensor_constant_87)
+  [get_attr       ] _tensor_constant_7                       target=_tensor_constant_86                      args=()
+  [call_method    ] model_layers_0_self_attn_view_1          target=view                                     args=(_tensor_constant_7, (1, 8, -1, 16))
   [get_attr       ] _tensor_constant_88                      target=_tensor_constant_88                      args=()
-  [call_method    ] model_layers_0_self_attn_clone_3         target=clone                                    args=(_tensor_constant_88)
-  [get_attr       ] _tensor_constant_7                       target=_tensor_constant_87                      args=()
-  [call_method    ] model_layers_0_self_attn_transpose_1     target=transpose                                args=(_tensor_constant_7, 1, 2)
-  [call_module    ] model_layers_0_self_attn_v_proj          target=model.layers.0.self_attn.v_proj          args=(_tensor_constant_3)
+  [call_module    ] model_layers_0_self_attn_k_norm          target=model.layers.0.self_attn.k_norm          args=(_tensor_constant_88)
   [get_attr       ] _tensor_constant_89                      target=_tensor_constant_89                      args=()
-  [call_method    ] model_layers_0_self_attn_detach_4        target=detach                                   args=(_tensor_constant_89)
+  [call_method    ] model_layers_0_self_attn_detach_3        target=detach                                   args=(_tensor_constant_89)
   [get_attr       ] _tensor_constant_90                      target=_tensor_constant_90                      args=()
-  [call_method    ] model_layers_0_self_attn_clone_4         target=clone                                    args=(_tensor_constant_90)
+  [call_method    ] model_layers_0_self_attn_clone_3         target=clone                                    args=(_tensor_constant_90)
   [get_attr       ] _tensor_constant_8                       target=_tensor_constant_89                      args=()
-  [call_method    ] model_layers_0_self_attn_view_2          target=view                                     args=(_tensor_constant_8, (1, 8, -1, 16))
-  [call_method    ] model_layers_0_self_attn_transpose_2     target=transpose                                args=(_tensor_constant_90, 1, 2)
-  [call_method    ] model_layers_0_self_attn_unsqueeze       target=unsqueeze                                args=(_tensor_constant_76, 1)
-  [call_method    ] model_layers_0_self_attn_unsqueeze_1     target=unsqueeze                                args=(_tensor_constant_77, 1)
+  [call_method    ] model_layers_0_self_attn_transpose_1     target=transpose                                args=(_tensor_constant_8, 1, 2)
+  [call_module    ] model_layers_0_self_attn_v_proj          target=model.layers.0.self_attn.v_proj          args=(_tensor_constant_4)
   [get_attr       ] _tensor_constant_91                      target=_tensor_constant_91                      args=()
-  [call_method    ] model_layers_0_self_attn_mul             target=mul                                      args=(_tensor_constant_82, _tensor_constant_91)
-  [call_method    ] model_layers_0_self_attn___getitem__     target=__getitem__                              args=(_tensor_constant_82, (Ellipsis, slice(None, 8, None)))
-  [call_method    ] model_layers_0_self_attn___getitem___1   target=__getitem__                              args=(_tensor_constant_82, (Ellipsis, slice(8, None, None)))
+  [call_method    ] model_layers_0_self_attn_detach_4        target=detach                                   args=(_tensor_constant_91)
   [get_attr       ] _tensor_constant_92                      target=_tensor_constant_92                      args=()
-  [call_method    ] model_layers_0_self_attn_neg             target=neg                                      args=(_tensor_constant_92)
+  [call_method    ] model_layers_0_self_attn_clone_4         target=clone                                    args=(_tensor_constant_92)
+  [get_attr       ] _tensor_constant_9                       target=_tensor_constant_91                      args=()
+  [call_method    ] model_layers_0_self_attn_view_2          target=view                                     args=(_tensor_constant_9, (1, 8, -1, 16))
+  [call_method    ] model_layers_0_self_attn_transpose_2     target=transpose                                args=(_tensor_constant_92, 1, 2)
+  [call_method    ] model_layers_0_self_attn_unsqueeze       target=unsqueeze                                args=(_tensor_constant_78, 1)
+  [call_method    ] model_layers_0_self_attn_unsqueeze_1     target=unsqueeze                                args=(_tensor_constant_79, 1)
   [get_attr       ] _tensor_constant_93                      target=_tensor_constant_93                      args=()
+  [call_method    ] model_layers_0_self_attn_mul             target=mul                                      args=(_tensor_constant_5, _tensor_constant_93)
+  [call_method    ] model_layers_0_self_attn___getitem__     target=__getitem__                              args=(_tensor_constant_5, (Ellipsis, slice(None, 8, None)))
+  [call_method    ] model_layers_0_self_attn___getitem___1   target=__getitem__                              args=(_tensor_constant_5, (Ellipsis, slice(8, None, None)))
   [get_attr       ] _tensor_constant_94                      target=_tensor_constant_94                      args=()
-  [call_function  ] model_layers_0_self_attn_cat             target=cat                                      args=((_tensor_constant_93, _tensor_constant_94))
+  [call_method    ] model_layers_0_self_attn_neg             target=neg                                      args=(_tensor_constant_94)
   [get_attr       ] _tensor_constant_95                      target=_tensor_constant_95                      args=()
+  [call_function  ] model_layers_0_self_attn_cat             target=cat                                      args=((_tensor_constant_95, _tensor_constant_83))
   [get_attr       ] _tensor_constant_96                      target=_tensor_constant_96                      args=()
-  [call_method    ] model_layers_0_self_attn_mul_1           target=mul                                      args=(_tensor_constant_95, _tensor_constant_96)
   [get_attr       ] _tensor_constant_97                      target=_tensor_constant_97                      args=()
+  [call_method    ] model_layers_0_self_attn_mul_1           target=mul                                      args=(_tensor_constant_96, _tensor_constant_97)
   [get_attr       ] _tensor_constant_98                      target=_tensor_constant_98                      args=()
-  [call_method    ] model_layers_0_self_attn_add             target=add                                      args=(_tensor_constant_97, _tensor_constant_98)
-  [call_method    ] model_layers_0_self_attn_mul_2           target=mul                                      args=(_tensor_constant_6, _tensor_constant_91)
-  [call_method    ] model_layers_0_self_attn___getitem___2   target=__getitem__                              args=(_tensor_constant_6, (Ellipsis, slice(None, 8, None)))
-  [call_method    ] model_layers_0_self_attn___getitem___3   target=__getitem__                              args=(_tensor_constant_6, (Ellipsis, slice(8, None, None)))
   [get_attr       ] _tensor_constant_99                      target=_tensor_constant_99                      args=()
-  [call_method    ] model_layers_0_self_attn_neg_1           target=neg                                      args=(_tensor_constant_99)
+  [call_method    ] model_layers_0_self_attn_add             target=add                                      args=(_tensor_constant_98, _tensor_constant_99)
   [get_attr       ] _tensor_constant_100                     target=_tensor_constant_100                     args=()
+  [call_method    ] model_layers_0_self_attn_mul_2           target=mul                                      args=(_tensor_constant_100, _tensor_constant_93)
+  [call_method    ] model_layers_0_self_attn___getitem___2   target=__getitem__                              args=(_tensor_constant_100, (Ellipsis, slice(None, 8, None)))
+  [call_method    ] model_layers_0_self_attn___getitem___3   target=__getitem__                              args=(_tensor_constant_100, (Ellipsis, slice(8, None, None)))
+  [call_method    ] model_layers_0_self_attn_neg_1           target=neg                                      args=(_tensor_constant_75)
   [get_attr       ] _tensor_constant_101                     target=_tensor_constant_101                     args=()
-  [call_function  ] model_layers_0_self_attn_cat_1           target=cat                                      args=((_tensor_constant_100, _tensor_constant_101))
   [get_attr       ] _tensor_constant_102                     target=_tensor_constant_102                     args=()
-  [call_method    ] model_layers_0_self_attn_mul_3           target=mul                                      args=(_tensor_constant_102, _tensor_constant_96)
-  [call_method    ] model_layers_0_self_attn_add_1           target=add                                      args=(_tensor_constant_98, _tensor_constant_100)
+  [call_function  ] model_layers_0_self_attn_cat_1           target=cat                                      args=((_tensor_constant_101, _tensor_constant_102))
+  [get_attr       ] _tensor_constant_103                     target=_tensor_constant_103                     args=()
+  [call_method    ] model_layers_0_self_attn_mul_3           target=mul                                      args=(_tensor_constant_103, _tensor_constant_97)
+  [call_method    ] model_layers_0_self_attn_add_1           target=add                                      args=(_tensor_constant_99, _tensor_constant_75)
   [call_function  ] model_layers_0_self_attn_tensor          target=tensor                                   args=([])
   [call_function  ] model_layers_0_self_attn_tensor_1        target=tensor                                   args=([])
-  [get_attr       ] _tensor_constant_103                     target=_tensor_constant_103                     args=()
-  [call_function  ] model_layers_0_self_attn_cat_2           target=cat                                      args=([_tensor_constant_5, _tensor_constant_103])
+  [call_function  ] model_layers_0_self_attn_cat_2           target=cat                                      args=([_tensor_constant_8, _tensor_constant_103])
   [get_attr       ] _tensor_constant_104                     target=_tensor_constant_104                     args=()
   [get_attr       ] _tensor_constant_105                     target=_tensor_constant_105                     args=()
   [call_function  ] model_layers_0_self_attn_cat_3           target=cat                                      args=([_tensor_constant_104, _tensor_constant_105])
   [get_attr       ] _tensor_constant_106                     target=_tensor_constant_106                     args=()
   [get_attr       ] _tensor_constant_107                     target=_tensor_constant_107                     args=()
+  [call_function  ] model_layers_0_self_attn_scaled_dot_product_attention target=scaled_dot_product_attention             args=(_tensor_constant_106, _tensor_constant_107, _tensor_constant_8)
   [get_attr       ] _tensor_constant_108                     target=_tensor_constant_108                     args=()
-  [call_function  ] model_layers_0_self_attn_scaled_dot_product_attention target=scaled_dot_product_attention             args=(_tensor_constant_106, _tensor_constant_107, _tensor_constant_108)
+  [call_method    ] model_layers_0_self_attn_transpose_3     target=transpose                                args=(_tensor_constant_108, 1, 2)
+  [call_method    ] model_layers_0_self_attn_contiguous      target=contiguous                               args=(_tensor_constant_104)
+  [call_method    ] model_layers_0_self_attn_reshape         target=reshape                                  args=(_tensor_constant_104, 1, 8, -1)
   [get_attr       ] _tensor_constant_109                     target=_tensor_constant_109                     args=()
-  [call_method    ] model_layers_0_self_attn_transpose_3     target=transpose                                args=(_tensor_constant_109, 1, 2)
+  [call_method    ] model_layers_0_self_attn_contiguous_1    target=contiguous                               args=(_tensor_constant_109)
+  [call_module    ] model_layers_0_self_attn_o_proj          target=model.layers.0.self_attn.o_proj          args=(_tensor_constant_109)
   [get_attr       ] _tensor_constant_110                     target=_tensor_constant_110                     args=()
-  [call_method    ] model_layers_0_self_attn_contiguous      target=contiguous                               args=(_tensor_constant_110)
-  [call_method    ] model_layers_0_self_attn_reshape         target=reshape                                  args=(_tensor_constant_110, 1, 8, -1)
+  [call_method    ] model_layers_0_self_attn_detach_5        target=detach                                   args=(_tensor_constant_110)
   [get_attr       ] _tensor_constant_111                     target=_tensor_constant_111                     args=()
-  [call_method    ] model_layers_0_self_attn_contiguous_1    target=contiguous                               args=(_tensor_constant_111)
-  [call_module    ] model_layers_0_self_attn_o_proj          target=model.layers.0.self_attn.o_proj          args=(_tensor_constant_111)
+  [call_method    ] model_layers_0_self_attn_clone_5         target=clone                                    args=(_tensor_constant_111)
+  [get_attr       ] _tensor_constant_10                      target=_tensor_constant_110                     args=()
+  [call_method    ] model_layers_0_add                       target=add                                      args=(_tensor_constant_2, _tensor_constant_10)
   [get_attr       ] _tensor_constant_112                     target=_tensor_constant_112                     args=()
-  [call_method    ] model_layers_0_self_attn_detach_5        target=detach                                   args=(_tensor_constant_112)
+  [call_module    ] model_layers_0_post_attention_layernorm  target=model.layers.0.post_attention_layernorm  args=(_tensor_constant_112)
   [get_attr       ] _tensor_constant_113                     target=_tensor_constant_113                     args=()
-  [call_method    ] model_layers_0_self_attn_clone_5         target=clone                                    args=(_tensor_constant_113)
-  [get_attr       ] _tensor_constant_9                       target=_tensor_constant_112                     args=()
-  [call_method    ] model_layers_0_add                       target=add                                      args=(_tensor_constant_2, _tensor_constant_9)
+  [call_method    ] model_layers_0_detach_1                  target=detach                                   args=(_tensor_constant_113)
   [get_attr       ] _tensor_constant_114                     target=_tensor_constant_114                     args=()
-  [call_module    ] model_layers_0_post_attention_layernorm  target=model.layers.0.post_attention_layernorm  args=(_tensor_constant_114)
+  [call_method    ] model_layers_0_clone_1                   target=clone                                    args=(_tensor_constant_114)
+  [get_attr       ] _tensor_constant_11                      target=_tensor_constant_113                     args=()
+  [call_module    ] model_layers_0_mlp_gate_proj             target=model.layers.0.mlp.gate_proj             args=(_tensor_constant_11)
   [get_attr       ] _tensor_constant_115                     target=_tensor_constant_115                     args=()
-  [call_method    ] model_layers_0_detach_1                  target=detach                                   args=(_tensor_constant_115)
+  [call_method    ] model_layers_0_mlp_detach                target=detach                                   args=(_tensor_constant_115)
   [get_attr       ] _tensor_constant_116                     target=_tensor_constant_116                     args=()
-  [call_method    ] model_layers_0_clone_1                   target=clone                                    args=(_tensor_constant_116)
-  [get_attr       ] _tensor_constant_10                      target=_tensor_constant_115                     args=()
-  [call_module    ] model_layers_0_mlp_gate_proj             target=model.layers.0.mlp.gate_proj             args=(_tensor_constant_10)
+  [call_method    ] model_layers_0_mlp_clone                 target=clone                                    args=(_tensor_constant_116)
+  [get_attr       ] _tensor_constant_12                      target=_tensor_constant_115                     args=()
+  [call_function  ] model_layers_0_mlp_act_fn_silu           target=silu                                     args=(_tensor_constant_12)
+  [call_module    ] model_layers_0_mlp_up_proj               target=model.layers.0.mlp.up_proj               args=(_tensor_constant_11)
   [get_attr       ] _tensor_constant_117                     target=_tensor_constant_117                     args=()
-  [call_method    ] model_layers_0_mlp_detach                target=detach                                   args=(_tensor_constant_117)
+  [call_method    ] model_layers_0_mlp_detach_1              target=detach                                   args=(_tensor_constant_117)
   [get_attr       ] _tensor_constant_118                     target=_tensor_constant_118                     args=()
-  [call_method    ] model_layers_0_mlp_clone                 target=clone                                    args=(_tensor_constant_118)
-  [get_attr       ] _tensor_constant_11                      target=_tensor_constant_117                     args=()
-  [call_function  ] model_layers_0_mlp_act_fn_silu           target=silu                                     args=(_tensor_constant_11)
+  [call_method    ] model_layers_0_mlp_clone_1               target=clone                                    args=(_tensor_constant_118)
+  [get_attr       ] _tensor_constant_13                      target=_tensor_constant_117                     args=()
+  [call_method    ] model_layers_0_mlp_mul                   target=mul                                      args=(_tensor_constant_108, _tensor_constant_13)
+  [call_module    ] model_layers_0_mlp_down_proj             target=model.layers.0.mlp.down_proj             args=(_tensor_constant_74)
+  [call_method    ] model_layers_0_add_1                     target=add                                      args=(_tensor_constant_112, _tensor_constant_13)
+  [call_module    ] model_layers_1_input_layernorm           target=model.layers.1.input_layernorm           args=(_tensor_constant_103)
   [get_attr       ] _tensor_constant_119                     target=_tensor_constant_119                     args=()
-  [call_method    ] model_layers_0_mlp_detach_1              target=detach                                   args=(_tensor_constant_119)
+  [call_method    ] model_layers_1_detach                    target=detach                                   args=(_tensor_constant_119)
   [get_attr       ] _tensor_constant_120                     target=_tensor_constant_120                     args=()
-  [call_method    ] model_layers_0_mlp_clone_1               target=clone                                    args=(_tensor_constant_120)
-  [get_attr       ] _tensor_constant_12                      target=_tensor_constant_119                     args=()
-  [call_module    ] model_layers_0_mlp_up_proj               target=model.layers.0.mlp.up_proj               args=(_tensor_constant_10)
-  [get_attr       ] _tensor_constant_121                     target=_tensor_constant_121                     args=()
-  [call_method    ] model_layers_0_mlp_detach_2              target=detach                                   args=(_tensor_constant_121)
-  [get_attr       ] _tensor_constant_122                     target=_tensor_constant_122                     args=()
-  [call_method    ] model_layers_0_mlp_clone_2               target=clone                                    args=(_tensor_constant_122)
-  [get_attr       ] _tensor_constant_13                      target=_tensor_constant_121                     args=()
-  [call_method    ] model_layers_0_mlp_mul                   target=mul                                      args=(_tensor_constant_12, _tensor_constant_13)
-  [get_attr       ] _tensor_constant_123                     target=_tensor_constant_123                     args=()
-  [call_module    ] model_layers_0_mlp_down_proj             target=model.layers.0.mlp.down_proj             args=(_tensor_constant_123)
-  [call_method    ] model_layers_0_add_1                     target=add                                      args=(_tensor_constant_114, _tensor_constant_13)
-  [call_module    ] model_layers_1_input_layernorm           target=model.layers.1.input_layernorm           args=(_tensor_constant_10)
-  [get_attr       ] _tensor_constant_124                     target=_tensor_constant_124                     args=()
-  [call_method    ] model_layers_1_detach                    target=detach                                   args=(_tensor_constant_124)
-  [get_attr       ] _tensor_constant_125                     target=_tensor_constant_125                     args=()
-  [call_method    ] model_layers_1_clone                     target=clone                                    args=(_tensor_constant_125)
-  [get_attr       ] _tensor_constant_14                      target=_tensor_constant_124                     args=()
+  [call_method    ] model_layers_1_clone                     target=clone                                    args=(_tensor_constant_120)
+  [get_attr       ] _tensor_constant_14                      target=_tensor_constant_119                     args=()
   [call_module    ] model_layers_1_self_attn_q_proj          target=model.layers.1.self_attn.q_proj          args=(_tensor_constant_14)
-  [get_attr       ] _tensor_constant_126                     target=_tensor_constant_126                     args=()
-  [call_method    ] model_layers_1_self_attn_detach          target=detach                                   args=(_tensor_constant_126)
-  [get_attr       ] _tensor_constant_127                     target=_tensor_constant_127                     args=()
-  [call_method    ] model_layers_1_self_attn_clone           target=clone                                    args=(_tensor_constant_127)
-  [get_attr       ] _tensor_constant_15                      target=_tensor_constant_126                     args=()
+  [get_attr       ] _tensor_constant_121                     target=_tensor_constant_121                     args=()
+  [call_method    ] model_layers_1_self_attn_detach          target=detach                                   args=(_tensor_constant_121)
+  [get_attr       ] _tensor_constant_122                     target=_tensor_constant_122                     args=()
+  [call_method    ] model_layers_1_self_attn_clone           target=clone                                    args=(_tensor_constant_122)
+  [get_attr       ] _tensor_constant_15                      target=_tensor_constant_121                     args=()
   [call_method    ] model_layers_1_self_attn_view            target=view                                     args=(_tensor_constant_15, (1, 8, -1, 16))
-  [get_attr       ] _tensor_constant_128                     target=_tensor_constant_128                     args=()
-  [call_module    ] model_layers_1_self_attn_q_norm          target=model.layers.1.self_attn.q_norm          args=(_tensor_constant_128)
-  [get_attr       ] _tensor_constant_129                     target=_tensor_constant_129                     args=()
-  [call_method    ] model_layers_1_self_attn_detach_1        target=detach                                   args=(_tensor_constant_129)
-  [get_attr       ] _tensor_constant_130                     target=_tensor_constant_130                     args=()
-  [call_method    ] model_layers_1_self_attn_clone_1         target=clone                                    args=(_tensor_constant_130)
-  [get_attr       ] _tensor_constant_16                      target=_tensor_constant_129                     args=()
+  [get_attr       ] _tensor_constant_123                     target=_tensor_constant_123                     args=()
+  [call_module    ] model_layers_1_self_attn_q_norm          target=model.layers.1.self_attn.q_norm          args=(_tensor_constant_123)
+  [get_attr       ] _tensor_constant_124                     target=_tensor_constant_124                     args=()
+  [call_method    ] model_layers_1_self_attn_detach_1        target=detach                                   args=(_tensor_constant_124)
+  [get_attr       ] _tensor_constant_125                     target=_tensor_constant_125                     args=()
+  [call_method    ] model_layers_1_self_attn_clone_1         target=clone                                    args=(_tensor_constant_125)
+  [get_attr       ] _tensor_constant_16                      target=_tensor_constant_124                     args=()
   [call_method    ] model_layers_1_self_attn_transpose       target=transpose                                args=(_tensor_constant_16, 1, 2)
   [call_module    ] model_layers_1_self_attn_k_proj          target=model.layers.1.self_attn.k_proj          args=(_tensor_constant_14)
-  [call_method    ] model_layers_1_self_attn_view_1          target=view                                     args=(_tensor_constant_130, (1, 8, -1, 16))
-  [get_attr       ] _tensor_constant_131                     target=_tensor_constant_131                     args=()
-  [call_module    ] model_layers_1_self_attn_k_norm          target=model.layers.1.self_attn.k_norm          args=(_tensor_constant_131)
-  [get_attr       ] _tensor_constant_132                     target=_tensor_constant_132                     args=()
-  [call_method    ] model_layers_1_self_attn_detach_2        target=detach                                   args=(_tensor_constant_132)
-  [get_attr       ] _tensor_constant_133                     target=_tensor_constant_133                     args=()
-  [call_method    ] model_layers_1_self_attn_clone_2         target=clone                                    args=(_tensor_constant_133)
-  [get_attr       ] _tensor_constant_17                      target=_tensor_constant_132                     args=()
-  [call_method    ] model_layers_1_self_attn_transpose_1     target=transpose                                args=(_tensor_constant_17, 1, 2)
+  [get_attr       ] _tensor_constant_126                     target=_tensor_constant_126                     args=()
+  [call_method    ] model_layers_1_self_attn_detach_2        target=detach                                   args=(_tensor_constant_126)
+  [get_attr       ] _tensor_constant_127                     target=_tensor_constant_127                     args=()
+  [call_method    ] model_layers_1_self_attn_clone_2         target=clone                                    args=(_tensor_constant_127)
+  [get_attr       ] _tensor_constant_17                      target=_tensor_constant_126                     args=()
+  [call_method    ] model_layers_1_self_attn_view_1          target=view                                     args=(_tensor_constant_17, (1, 8, -1, 16))
+  [call_module    ] model_layers_1_self_attn_k_norm          target=model.layers.1.self_attn.k_norm          args=(_tensor_constant_127)
+  [get_attr       ] _tensor_constant_128                     target=_tensor_constant_128                     args=()
+  [call_method    ] model_layers_1_self_attn_detach_3        target=detach                                   args=(_tensor_constant_128)
+  [get_attr       ] _tensor_constant_129                     target=_tensor_constant_129                     args=()
+  [call_method    ] model_layers_1_self_attn_clone_3         target=clone                                    args=(_tensor_constant_129)
+  [get_attr       ] _tensor_constant_18                      target=_tensor_constant_128                     args=()
+  [call_method    ] model_layers_1_self_attn_transpose_1     target=transpose                                args=(_tensor_constant_18, 1, 2)
   [call_module    ] model_layers_1_self_attn_v_proj          target=model.layers.1.self_attn.v_proj          args=(_tensor_constant_14)
-  [call_method    ] model_layers_1_self_attn_view_2          target=view                                     args=(_tensor_constant_133, (1, 8, -1, 16))
+  [call_method    ] model_layers_1_self_attn_view_2          target=view                                     args=(_tensor_constant_15, (1, 8, -1, 16))
+  [get_attr       ] _tensor_constant_130                     target=_tensor_constant_130                     args=()
+  [call_method    ] model_layers_1_self_attn_transpose_2     target=transpose                                args=(_tensor_constant_130, 1, 2)
+  [call_method    ] model_layers_1_self_attn_unsqueeze       target=unsqueeze                                args=(_tensor_constant_78, 1)
+  [call_method    ] model_layers_1_self_attn_unsqueeze_1     target=unsqueeze                                args=(_tensor_constant_79, 1)
+  [get_attr       ] _tensor_constant_131                     target=_tensor_constant_131                     args=()
+  [get_attr       ] _tensor_constant_132                     target=_tensor_constant_132                     args=()
+  [call_method    ] model_layers_1_self_attn_mul             target=mul                                      args=(_tensor_constant_131, _tensor_constant_132)
+  [call_method    ] model_layers_1_self_attn___getitem__     target=__getitem__                              args=(_tensor_constant_131, (Ellipsis, slice(None, 8, None)))
+  [call_method    ] model_layers_1_self_attn___getitem___1   target=__getitem__                              args=(_tensor_constant_131, (Ellipsis, slice(8, None, None)))
+  [call_method    ] model_layers_1_self_attn_neg             target=neg                                      args=(_tensor_constant_130)
+  [get_attr       ] _tensor_constant_133                     target=_tensor_constant_133                     args=()
   [get_attr       ] _tensor_constant_134                     target=_tensor_constant_134                     args=()
-  [call_method    ] model_layers_1_self_attn_transpose_2     target=transpose                                args=(_tensor_constant_134, 1, 2)
-  [call_method    ] model_layers_1_self_attn_unsqueeze       target=unsqueeze                                args=(_tensor_constant_76, 1)
-  [call_method    ] model_layers_1_self_attn_unsqueeze_1     target=unsqueeze                                args=(_tensor_constant_77, 1)
+  [call_function  ] model_layers_1_self_attn_cat             target=cat                                      args=((_tensor_constant_133, _tensor_constant_134))
   [get_attr       ] _tensor_constant_135                     target=_tensor_constant_135                     args=()
-  [call_method    ] model_layers_1_self_attn_mul             target=mul                                      args=(_tensor_constant_15, _tensor_constant_135)
-  [call_method    ] model_layers_1_self_attn___getitem__     target=__getitem__                              args=(_tensor_constant_15, (Ellipsis, slice(None, 8, None)))
-  [call_method    ] model_layers_1_self_attn___getitem___1   target=__getitem__                              args=(_tensor_constant_15, (Ellipsis, slice(8, None, None)))
-  [call_method    ] model_layers_1_self_attn_neg             target=neg                                      args=(_tensor_constant_111)
   [get_attr       ] _tensor_constant_136                     target=_tensor_constant_136                     args=()
+  [call_method    ] model_layers_1_self_attn_mul_1           target=mul                                      args=(_tensor_constant_135, _tensor_constant_136)
   [get_attr       ] _tensor_constant_137                     target=_tensor_constant_137                     args=()
-  [call_function  ] model_layers_1_self_attn_cat             target=cat                                      args=((_tensor_constant_136, _tensor_constant_137))
+  [call_method    ] model_layers_1_self_attn_add             target=add                                      args=(_tensor_constant_137, _tensor_constant_130)
+  [call_method    ] model_layers_1_self_attn_mul_2           target=mul                                      args=(_tensor_constant_127, _tensor_constant_132)
+  [call_method    ] model_layers_1_self_attn___getitem___2   target=__getitem__                              args=(_tensor_constant_127, (Ellipsis, slice(None, 8, None)))
+  [call_method    ] model_layers_1_self_attn___getitem___3   target=__getitem__                              args=(_tensor_constant_127, (Ellipsis, slice(8, None, None)))
   [get_attr       ] _tensor_constant_138                     target=_tensor_constant_138                     args=()
-  [call_method    ] model_layers_1_self_attn_mul_1           target=mul                                      args=(_tensor_constant_99, _tensor_constant_138)
+  [call_method    ] model_layers_1_self_attn_neg_1           target=neg                                      args=(_tensor_constant_138)
   [get_attr       ] _tensor_constant_139                     target=_tensor_constant_139                     args=()
-  [call_method    ] model_layers_1_self_attn_add             target=add                                      args=(_tensor_constant_139, _tensor_constant_111)
-  [call_method    ] model_layers_1_self_attn_mul_2           target=mul                                      args=(_tensor_constant_130, _tensor_constant_135)
-  [call_method    ] model_layers_1_self_attn___getitem___2   target=__getitem__                              args=(_tensor_constant_130, (Ellipsis, slice(None, 8, None)))
-  [call_method    ] model_layers_1_self_attn___getitem___3   target=__getitem__                              args=(_tensor_constant_130, (Ellipsis, slice(8, None, None)))
   [get_attr       ] _tensor_constant_140                     target=_tensor_constant_140                     args=()
-  [call_method    ] model_layers_1_self_attn_neg_1           target=neg                                      args=(_tensor_constant_140)
+  [call_function  ] model_layers_1_self_attn_cat_1           target=cat                                      args=((_tensor_constant_139, _tensor_constant_140))
   [get_attr       ] _tensor_constant_141                     target=_tensor_constant_141                     args=()
-  [call_function  ] model_layers_1_self_attn_cat_1           target=cat                                      args=((_tensor_constant_141, _tensor_constant_109))
-  [get_attr       ] _tensor_constant_142                     target=_tensor_constant_142                     args=()
-  [call_method    ] model_layers_1_self_attn_mul_3           target=mul                                      args=(_tensor_constant_142, _tensor_constant_138)
-  [get_attr       ] _tensor_constant_143                     target=_tensor_constant_143                     args=()
-  [call_method    ] model_layers_1_self_attn_add_1           target=add                                      args=(_tensor_constant_111, _tensor_constant_143)
+  [call_method    ] model_layers_1_self_attn_mul_3           target=mul                                      args=(_tensor_constant_141, _tensor_constant_136)
+  [call_method    ] model_layers_1_self_attn_add_1           target=add                                      args=(_tensor_constant_130, _tensor_constant_140)
   [call_function  ] model_layers_1_self_attn_tensor          target=tensor                                   args=([])
   [call_function  ] model_layers_1_self_attn_tensor_1        target=tensor                                   args=([])
+  [call_function  ] model_layers_1_self_attn_cat_2           target=cat                                      args=([_tensor_constant_16, _tensor_constant_141])
+  [get_attr       ] _tensor_constant_142                     target=_tensor_constant_142                     args=()
+  [call_function  ] model_layers_1_self_attn_cat_3           target=cat                                      args=([_tensor_constant_18, _tensor_constant_142])
+  [get_attr       ] _tensor_constant_143                     target=_tensor_constant_143                     args=()
   [get_attr       ] _tensor_constant_144                     target=_tensor_constant_144                     args=()
-  [call_function  ] model_layers_1_self_attn_cat_2           target=cat                                      args=([_tensor_constant_138, _tensor_constant_144])
+  [call_function  ] model_layers_1_self_attn_scaled_dot_product_attention target=scaled_dot_product_attention             args=(_tensor_constant_135, _tensor_constant_143, _tensor_constant_144)
+  [call_method    ] model_layers_1_self_attn_transpose_3     target=transpose                                args=(_tensor_constant_141, 1, 2)
+  [call_method    ] model_layers_1_self_attn_contiguous      target=contiguous                               args=(_tensor_constant_18)
+  [call_method    ] model_layers_1_self_attn_reshape         target=reshape                                  args=(_tensor_constant_18, 1, 8, -1)
   [get_attr       ] _tensor_constant_145                     target=_tensor_constant_145                     args=()
+  [call_method    ] model_layers_1_self_attn_contiguous_1    target=contiguous                               args=(_tensor_constant_145)
+  [call_module    ] model_layers_1_self_attn_o_proj          target=model.layers.1.self_attn.o_proj          args=(_tensor_constant_145)
   [get_attr       ] _tensor_constant_146                     target=_tensor_constant_146                     args=()
-  [call_function  ] model_layers_1_self_attn_cat_3           target=cat                                      args=([_tensor_constant_145, _tensor_constant_146])
+  [call_method    ] model_layers_1_self_attn_detach_4        target=detach                                   args=(_tensor_constant_146)
   [get_attr       ] _tensor_constant_147                     target=_tensor_constant_147                     args=()
-  [call_function  ] model_layers_1_self_attn_scaled_dot_product_attention target=scaled_dot_product_attention             args=(_tensor_constant_99, _tensor_constant_147, _tensor_constant_138)
-  [call_method    ] model_layers_1_self_attn_transpose_3     target=transpose                                args=(_tensor_constant_133, 1, 2)
-  [call_method    ] model_layers_1_self_attn_contiguous      target=contiguous                               args=(_tensor_constant_146)
-  [call_method    ] model_layers_1_self_attn_reshape         target=reshape                                  args=(_tensor_constant_146, 1, 8, -1)
+  [call_method    ] model_layers_1_self_attn_clone_4         target=clone                                    args=(_tensor_constant_147)
+  [get_attr       ] _tensor_constant_19                      target=_tensor_constant_146                     args=()
+  [call_method    ] model_layers_1_add                       target=add                                      args=(_tensor_constant_103, _tensor_constant_19)
+  [call_module    ] model_layers_1_post_attention_layernorm  target=model.layers.1.post_attention_layernorm  args=(_tensor_constant_74)
+  [call_module    ] model_layers_1_mlp_gate_proj             target=model.layers.1.mlp.gate_proj             args=(_tensor_constant_136)
   [get_attr       ] _tensor_constant_148                     target=_tensor_constant_148                     args=()
-  [call_method    ] model_layers_1_self_attn_contiguous_1    target=contiguous                               args=(_tensor_constant_148)
-  [call_module    ] model_layers_1_self_attn_o_proj          target=model.layers.1.self_attn.o_proj          args=(_tensor_constant_148)
-  [call_method    ] model_layers_1_add                       target=add                                      args=(_tensor_constant_10, _tensor_constant_146)
+  [call_method    ] model_layers_1_mlp_detach                target=detach                                   args=(_tensor_constant_148)
   [get_attr       ] _tensor_constant_149                     target=_tensor_constant_149                     args=()
-  [call_module    ] model_layers_1_post_attention_layernorm  target=model.layers.1.post_attention_layernorm  args=(_tensor_constant_149)
+  [call_method    ] model_layers_1_mlp_clone                 target=clone                                    args=(_tensor_constant_149)
+  [get_attr       ] _tensor_constant_20                      target=_tensor_constant_148                     args=()
+  [call_function  ] model_layers_1_mlp_act_fn_silu           target=silu                                     args=(_tensor_constant_20)
+  [call_module    ] model_layers_1_mlp_up_proj               target=model.layers.1.mlp.up_proj               args=(_tensor_constant_136)
+  [call_method    ] model_layers_1_mlp_mul                   target=mul                                      args=(_tensor_constant_149, _tensor_constant_116)
   [get_attr       ] _tensor_constant_150                     target=_tensor_constant_150                     args=()
-  [call_method    ] model_layers_1_detach_1                  target=detach                                   args=(_tensor_constant_150)
+  [call_module    ] model_layers_1_mlp_down_proj             target=model.layers.1.mlp.down_proj             args=(_tensor_constant_150)
   [get_attr       ] _tensor_constant_151                     target=_tensor_constant_151                     args=()
-  [call_method    ] model_layers_1_clone_1                   target=clone                                    args=(_tensor_constant_151)
-  [get_attr       ] _tensor_constant_18                      target=_tensor_constant_150                     args=()
-  [call_module    ] model_layers_1_mlp_gate_proj             target=model.layers.1.mlp.gate_proj             args=(_tensor_constant_18)
+  [call_method    ] model_layers_1_mlp_detach_1              target=detach                                   args=(_tensor_constant_151)
   [get_attr       ] _tensor_constant_152                     target=_tensor_constant_152                     args=()
-  [call_method    ] model_layers_1_mlp_detach                target=detach                                   args=(_tensor_constant_152)
+  [call_method    ] model_layers_1_mlp_clone_1               target=clone                                    args=(_tensor_constant_152)
+  [get_attr       ] _tensor_constant_21                      target=_tensor_constant_151                     args=()
+  [call_method    ] model_layers_1_add_1                     target=add                                      args=(_tensor_constant_74, _tensor_constant_21)
   [get_attr       ] _tensor_constant_153                     target=_tensor_constant_153                     args=()
-  [call_method    ] model_layers_1_mlp_clone                 target=clone                                    args=(_tensor_constant_153)
-  [get_attr       ] _tensor_constant_19                      target=_tensor_constant_152                     args=()
-  [call_function  ] model_layers_1_mlp_act_fn_silu           target=silu                                     args=(_tensor_constant_19)
-  [get_attr       ] _tensor_constant_154                     target=_tensor_constant_154                     args=()
-  [call_method    ] model_layers_1_mlp_detach_1              target=detach                                   args=(_tensor_constant_154)
-  [call_method    ] model_layers_1_mlp_clone_1               target=clone                                    args=(_tensor_constant_96)
-  [get_attr       ] _tensor_constant_20                      target=_tensor_constant_154                     args=()
-  [call_module    ] model_layers_1_mlp_up_proj               target=model.layers.1.mlp.up_proj               args=(_tensor_constant_18)
-  [get_attr       ] _tensor_constant_155                     target=_tensor_constant_155                     args=()
-  [call_method    ] model_layers_1_mlp_detach_2              target=detach                                   args=(_tensor_constant_155)
-  [get_attr       ] _tensor_constant_156                     target=_tensor_constant_156                     args=()
-  [call_method    ] model_layers_1_mlp_clone_2               target=clone                                    args=(_tensor_constant_156)
-  [get_attr       ] _tensor_constant_21                      target=_tensor_constant_155                     args=()
-  [call_method    ] model_layers_1_mlp_mul                   target=mul                                      args=(_tensor_constant_20, _tensor_constant_21)
-  [get_attr       ] _tensor_constant_157                     target=_tensor_constant_157                     args=()
-  [call_module    ] model_layers_1_mlp_down_proj             target=model.layers.1.mlp.down_proj             args=(_tensor_constant_157)
-  [call_method    ] model_layers_1_add_1                     target=add                                      args=(_tensor_constant_149, _tensor_constant_21)
-  [get_attr       ] _tensor_constant_158                     target=_tensor_constant_158                     args=()
-  [call_method    ] model_detach_1                           target=detach                                   args=(_tensor_constant_158)
+  [call_method    ] model_detach_1                           target=detach                                   args=(_tensor_constant_153)
   [call_method    ] model_clone_1                            target=clone                                    args=(_tensor_constant_21)
-  [get_attr       ] _tensor_constant_22                      target=_tensor_constant_158                     args=()
+  [get_attr       ] _tensor_constant_22                      target=_tensor_constant_153                     args=()
   [call_module    ] model_norm                               target=model.norm                               args=(_tensor_constant_22)
-  [get_attr       ] _tensor_constant_159                     target=_tensor_constant_159                     args=()
-  [call_method    ] model_detach_2                           target=detach                                   args=(_tensor_constant_159)
-  [get_attr       ] _tensor_constant_160                     target=_tensor_constant_160                     args=()
-  [call_method    ] model_clone_2                            target=clone                                    args=(_tensor_constant_160)
-  [get_attr       ] _tensor_constant_23                      target=_tensor_constant_159                     args=()
+  [get_attr       ] _tensor_constant_154                     target=_tensor_constant_154                     args=()
+  [call_method    ] model_detach_2                           target=detach                                   args=(_tensor_constant_154)
+  [get_attr       ] _tensor_constant_155                     target=_tensor_constant_155                     args=()
+  [call_method    ] model_clone_2                            target=clone                                    args=(_tensor_constant_155)
+  [get_attr       ] _tensor_constant_23                      target=_tensor_constant_154                     args=()
   [call_method    ] getitem                                  target=__getitem__                              args=(_tensor_constant_23, (slice(None, None, None), slice(0, None, None), slice(None, None, None)))
-  [get_attr       ] _tensor_constant_161                     target=_tensor_constant_161                     args=()
-  [call_module    ] lm_head                                  target=lm_head                                  args=(_tensor_constant_161)
-  [get_attr       ] _tensor_constant_162                     target=_tensor_constant_162                     args=()
-  [call_method    ] detach_1                                 target=detach                                   args=(_tensor_constant_162)
-  [get_attr       ] _tensor_constant_163                     target=_tensor_constant_163                     args=()
-  [call_method    ] clone_1                                  target=clone                                    args=(_tensor_constant_163)
-  [get_attr       ] _tensor_constant_24                      target=_tensor_constant_162                     args=()
+  [get_attr       ] _tensor_constant_156                     target=_tensor_constant_156                     args=()
+  [call_module    ] lm_head                                  target=lm_head                                  args=(_tensor_constant_156)
+  [get_attr       ] _tensor_constant_157                     target=_tensor_constant_157                     args=()
+  [call_method    ] detach_1                                 target=detach                                   args=(_tensor_constant_157)
+  [get_attr       ] _tensor_constant_158                     target=_tensor_constant_158                     args=()
+  [call_method    ] clone_1                                  target=clone                                    args=(_tensor_constant_158)
+  [get_attr       ] _tensor_constant_24                      target=_tensor_constant_157                     args=()
   [output         ] output                                   target=output                                   args=({'logits': _tensor_constant_24, 'past_key_values': DynamicCache(layers=[DynamicLayer, DynamicLayer])})
   [call_function  ] _set_grad_enabled_1                      target=_set_grad_enabled                        args=(True)
