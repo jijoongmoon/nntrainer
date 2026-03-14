@@ -22,226 +22,6 @@ import sys
 import json
 
 import torch
-import torch.nn as nn
-
-
-def _gliner_projection(hidden_size, dropout, out_dim=None):
-    """Two-layer projection (matches GLiNER create_projection_layer)."""
-    if out_dim is None:
-        out_dim = hidden_size
-    return nn.Sequential(
-        nn.Linear(hidden_size, out_dim * 4), nn.ReLU(),
-        nn.Dropout(dropout), nn.Linear(out_dim * 4, out_dim),
-    )
-
-
-class _SpanMarkerV0(nn.Module):
-    """Span endpoint marker (matches GLiNER SpanMarkerV0)."""
-
-    def __init__(self, hidden_size, max_width, dropout=0.4):
-        super().__init__()
-        self.max_width = max_width
-        self.project_start = _gliner_projection(hidden_size, dropout)
-        self.project_end = _gliner_projection(hidden_size, dropout)
-        self.out_project = _gliner_projection(hidden_size * 2, dropout,
-                                              hidden_size)
-
-    def forward(self, h, span_idx):
-        B, L, D = h.size()
-        start_rep = self.project_start(h)
-        end_rep = self.project_end(h)
-        # gather start/end representations
-        idx_s = span_idx[:, :, 0].unsqueeze(2).expand(-1, -1, D)
-        idx_e = span_idx[:, :, 1].unsqueeze(2).expand(-1, -1, D)
-        start_span = torch.gather(start_rep, 1, idx_s)
-        end_span = torch.gather(end_rep, 1, idx_e)
-        cat = torch.cat([start_span, end_span], dim=-1).relu()
-        return self.out_project(cat).view(B, L, self.max_width, D)
-
-
-class _GLiNERCore(nn.Module):
-    """Traceable core of a GLiNER/GLiNER2 model (post-preprocessing).
-
-    Wraps the BiLSTM, SpanMarkerV0, prompt projection, and einsum scoring.
-    The DeBERTa encoder and data-dependent preprocessing are excluded
-    (handled outside the NNTrainer graph).
-
-    This class can be built either by extracting sub-modules from a loaded
-    GLiNER model, or by constructing from scratch using config + state_dict
-    (no ``gliner`` package dependency).
-    """
-
-    def __init__(self, rnn_lstm, span_rep_layer, prompt_rep_layer,
-                 has_rnn=True):
-        super().__init__()
-        self.has_rnn = has_rnn
-        if has_rnn and rnn_lstm is not None:
-            self.rnn = rnn_lstm  # raw nn.LSTM (not LstmSeq2SeqEncoder)
-        self.span_rep_layer = span_rep_layer
-        self.prompt_rep_layer = prompt_rep_layer
-
-    def forward(self, words_embedding, span_idx, prompts_embedding):
-        if self.has_rnn:
-            words_embedding, _ = self.rnn(words_embedding)
-        span_rep = self.span_rep_layer(words_embedding, span_idx)
-        prompts_embedding = self.prompt_rep_layer(prompts_embedding)
-        scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embedding)
-        return scores
-
-
-def _build_gliner_core(gliner_model, config):
-    """Extract the core sub-modules from a loaded GLiNER model."""
-    model = gliner_model
-    if hasattr(model, "model") and isinstance(model.model, nn.Module):
-        model = model.model
-
-    has_rnn = hasattr(model, "rnn")
-    rnn_lstm = None
-    if has_rnn:
-        rnn_module = model.rnn
-        if hasattr(rnn_module, "lstm"):
-            rnn_lstm = rnn_module.lstm
-        elif isinstance(rnn_module, nn.LSTM):
-            rnn_lstm = rnn_module
-        else:
-            raise RuntimeError(
-                f"Unexpected RNN module type: {type(rnn_module).__name__}")
-
-    span_rep_layer = getattr(model, "span_rep_layer", None)
-    prompt_rep_layer = getattr(model, "prompt_rep_layer", None)
-
-    if span_rep_layer is None or prompt_rep_layer is None:
-        raise RuntimeError(
-            "Could not locate span_rep_layer / prompt_rep_layer in the "
-            f"GLiNER model ({type(model).__name__}).  Available sub-modules: "
-            f"{[n for n, _ in model.named_children()]}")
-
-    return _GLiNERCore(rnn_lstm, span_rep_layer, prompt_rep_layer,
-                       has_rnn=has_rnn)
-
-
-def _build_gliner_core_from_config(model_dir, config):
-    """Build GLiNER core directly from config + weights (no gliner package).
-
-    Reconstructs only the traceable core modules (BiLSTM, SpanMarkerV0,
-    prompt projection) from the saved weights, bypassing the need for
-    the ``gliner`` or ``gliner2`` Python packages.
-    """
-    hidden_size = getattr(config, "hidden_size", 768)
-    max_width = getattr(config, "max_width", 12)
-    dropout = getattr(config, "dropout", 0.4)
-    num_rnn_layers = getattr(config, "num_rnn_layers", 1)
-    span_mode = getattr(config, "span_mode", "markerV0")
-
-    if span_mode != "markerV0":
-        raise NotImplementedError(
-            f"GLiNER span_mode '{span_mode}' not yet supported in "
-            f"standalone loader.  Only 'markerV0' is supported.")
-
-    # Build core modules matching GLiNER's parameter layout
-    has_rnn = num_rnn_layers > 0
-    rnn_lstm = None
-    if has_rnn:
-        rnn_lstm = nn.LSTM(
-            input_size=hidden_size, hidden_size=hidden_size // 2,
-            num_layers=num_rnn_layers, bidirectional=True, batch_first=True,
-        )
-
-    # SpanRepLayer -> SpanMarkerV0 (nested as span_rep_layer.span_rep_layer)
-    inner_span = _SpanMarkerV0(hidden_size, max_width, dropout)
-    span_rep_layer = nn.Module()
-    span_rep_layer.add_module("span_rep_layer", inner_span)
-    # Make it callable by forwarding
-    span_rep_layer.forward = lambda x, idx: inner_span(x, idx)
-
-    prompt_rep_layer = _gliner_projection(hidden_size, dropout)
-
-    core = _GLiNERCore(rnn_lstm, span_rep_layer, prompt_rep_layer,
-                       has_rnn=has_rnn)
-
-    # Load weights from model file
-    model_dir_path = os.path.join(model_dir) if isinstance(model_dir, str) \
-        else str(model_dir)
-    safetensors_path = os.path.join(model_dir_path, "model.safetensors")
-    bin_path = os.path.join(model_dir_path, "pytorch_model.bin")
-
-    if os.path.isfile(safetensors_path):
-        try:
-            from safetensors.torch import load_file
-            full_state = load_file(safetensors_path)
-        except ImportError:
-            full_state = torch.load(bin_path, map_location="cpu",
-                                    weights_only=True)
-    elif os.path.isfile(bin_path):
-        full_state = torch.load(bin_path, map_location="cpu",
-                                weights_only=True)
-    else:
-        raise FileNotFoundError(
-            f"No model weights found in {model_dir_path} "
-            f"(looked for model.safetensors and pytorch_model.bin)")
-
-    # Extract only the keys that belong to our core modules.
-    # Key naming varies between GLiNER versions:
-    #   Original GLiNER: rnn.lstm.*, span_rep_layer.*, prompt_rep_layer.*
-    #   GLiNER2:         rnn.lstm.*, span_rep.*, prompt_rep.*
-    #   With wrapper:    model.<above>.*
-    # We auto-detect by finding the top-level prefix for each module.
-
-    # Find the actual key prefix for each core module by searching for
-    # known leaf patterns (e.g. "lstm.weight_ih_l0", "project_start.0.weight").
-    rnn_prefix = None
-    span_prefix = None
-    prompt_prefix = None
-    for key in full_state:
-        if rnn_prefix is None and "lstm." in key and "weight_ih_l0" in key:
-            # e.g. "model.rnn.lstm.weight_ih_l0" -> prefix = "model.rnn.lstm."
-            idx = key.find("lstm.")
-            rnn_prefix = key[:idx + len("lstm.")]
-        if span_prefix is None and "project_start.0.weight" in key:
-            # e.g. "span_rep.span_rep_layer.project_start.0.weight"
-            #   -> prefix = "span_rep.span_rep_layer."
-            # e.g. "span_rep_layer.span_rep_layer.project_start.0.weight"
-            #   -> prefix = "span_rep_layer.span_rep_layer."
-            idx = key.find("project_start.")
-            span_prefix = key[:idx]
-        if prompt_prefix is None and key.endswith(".0.weight"):
-            # prompt projection: <prefix>.0.weight (nn.Sequential index)
-            # Must NOT be a span_rep key (which also has .0.weight)
-            candidate = key[:-len("0.weight")]
-            if "span_rep" not in candidate and "project" not in candidate:
-                prompt_prefix = candidate
-
-    # Map weight keys to our core model keys:
-    #   rnn_prefix + * -> rnn.*
-    #   span_prefix + * -> span_rep_layer.span_rep_layer.*
-    #   prompt_prefix + * -> prompt_rep_layer.*
-    core_state = {}
-    for key, value in full_state.items():
-        new_key = None
-        if rnn_prefix and key.startswith(rnn_prefix):
-            new_key = "rnn." + key[len(rnn_prefix):]
-        elif span_prefix and key.startswith(span_prefix):
-            new_key = "span_rep_layer.span_rep_layer." + key[len(span_prefix):]
-        elif prompt_prefix and key.startswith(prompt_prefix):
-            new_key = "prompt_rep_layer." + key[len(prompt_prefix):]
-
-        if new_key is not None:
-            core_state[new_key] = value
-
-    missing, unexpected = core.load_state_dict(core_state, strict=False)
-    real_missing = [k for k in missing if not (
-        not has_rnn and k.startswith("rnn.")
-    )]
-    if real_missing:
-        top_prefixes = sorted({k.split(".")[0] for k in full_state})
-        raise RuntimeError(
-            f"Missing weights for GLiNER core: {real_missing}\n"
-            f"  Detected prefixes: rnn={rnn_prefix!r}, span={span_prefix!r}, "
-            f"prompt={prompt_prefix!r}\n"
-            f"  Top-level key prefixes in weights: {top_prefixes}\n"
-            f"  Mapped {len(core_state)} / {len(full_state)} keys")
-
-    return core
 
 
 def convert_model(model_name_or_path, output_dir, formats=None,
@@ -280,17 +60,14 @@ def convert_model(model_name_or_path, output_dir, formats=None,
         print(f"Loading model: {model_name_or_path}")
 
     # Try standard AutoConfig first; fall back for custom model types
-    # (e.g. GLiNER2's model_type="extractor") that aren't registered in
-    # HuggingFace transformers.
+    # (e.g. model_type values not registered in HuggingFace transformers).
     try:
         config = AutoConfig.from_pretrained(model_name_or_path)
     except ValueError:
-        # Load config.json manually for unregistered model types
         config_path = os.path.join(model_name_or_path, "config.json")
         if os.path.isfile(config_path):
             with open(config_path) as f:
                 config_dict = json.load(f)
-            # Create a simple namespace so attribute access works
             config = argparse.Namespace(**config_dict)
             if verbose:
                 print(f"  Loaded custom config (model_type="
@@ -308,14 +85,8 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     encoder_decoder_types = {
         "t5", "mt5", "bart", "mbart", "pegasus", "marian",
     }
-    # Custom model types that require their own loading logic
-    custom_model_types = {
-        "extractor",  # GLiNER / GLiNER2
-    }
 
-    # Detect if this is an embedding/feature-extraction model by checking
-    # the architectures field in the config (e.g. ["GemmaModel"] vs
-    # ["GemmaForCausalLM"])
+    # Detect if this is an embedding/feature-extraction model
     architectures = getattr(config, "architectures", []) or []
     is_embedding_model = any(
         not arch.endswith(("ForCausalLM", "ForConditionalGeneration",
@@ -327,61 +98,15 @@ def convert_model(model_name_or_path, output_dir, formats=None,
 
     is_causal = model_type in causal_types and not is_embedding_model
     is_encoder_decoder = model_type in encoder_decoder_types
-    is_custom = model_type in custom_model_types
 
-    if is_custom and model_type == "extractor":
-        # GLiNER/GLiNER2: we only need the core computation graph
-        # (BiLSTM + SpanRep + Projection + Einsum).  Try loading via
-        # the gliner packages first; fall back to standalone loading
-        # from config + weights (no package dependency).
-        gliner_config = config  # already loaded from config.json
-        # Also try to load gliner_config.json which has span_mode etc.
-        gliner_cfg_path = os.path.join(model_name_or_path,
-                                       "gliner_config.json")
-        if os.path.isfile(gliner_cfg_path):
-            with open(gliner_cfg_path) as f:
-                gcfg = json.load(f)
-            # Merge gliner-specific fields into config
-            for k, v in gcfg.items():
-                if not hasattr(gliner_config, k):
-                    setattr(gliner_config, k, v)
-            if verbose:
-                print(f"  Loaded gliner_config.json "
-                      f"(span_mode={gcfg.get('span_mode', 'unknown')})")
+    # Check for custom model types (handled by custom_models.py)
+    from custom_models import CUSTOM_LOADERS
+    is_custom = model_type in CUSTOM_LOADERS
 
-        loaded_via_package = False
-        # Try gliner2 package
-        try:
-            from gliner2 import Extractor, ExtractorConfig
-            ec = ExtractorConfig.from_pretrained(model_name_or_path)
-            full_model = Extractor.from_pretrained(model_name_or_path)
-            config = ec
-            model = _build_gliner_core(full_model, config)
-            loaded_via_package = True
-        except ImportError:
-            pass
-
-        # Try gliner package
-        if not loaded_via_package:
-            try:
-                from gliner.model import GLiNER
-                full_model = GLiNER.from_pretrained(model_name_or_path)
-                config = full_model.config
-                model = _build_gliner_core(full_model, config)
-                loaded_via_package = True
-            except ImportError:
-                pass
-
-        # Standalone: build core from config + weights (no package needed)
-        if not loaded_via_package:
-            if verbose:
-                print("  No gliner package found; loading core from "
-                      "config + weights directly")
-            model = _build_gliner_core_from_config(
-                model_name_or_path, gliner_config)
-            config = gliner_config
-
-        model.eval()
+    if is_custom:
+        from custom_models import load_custom_model
+        model, config, input_kwargs = load_custom_model(
+            model_type, model_name_or_path, config, seq_len, verbose)
     elif is_causal:
         model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path, torch_dtype=torch.float32)
@@ -395,22 +120,8 @@ def convert_model(model_name_or_path, output_dir, formats=None,
         print(f"Model type: {model_type}, Parameters: "
               f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
-    # Step 2: Prepare trace inputs
-    if is_custom and model_type == "extractor":
-        # GLiNER/GLiNER2: trace the core computation graph.
-        hidden_size = getattr(config, "hidden_size", 768)
-        max_width = getattr(config, "max_width", 12)
-        num_classes = 5  # dummy entity type count
-        W = seq_len  # word-level sequence length
-        input_kwargs = {
-            "words_embedding": torch.randn(1, W, hidden_size),
-            "span_idx": torch.randint(0, W, (1, W * max_width, 2)),
-            "prompts_embedding": torch.randn(1, num_classes, hidden_size),
-        }
-        if verbose:
-            print(f"  GLiNER core: hidden={hidden_size}, "
-                  f"max_width={max_width}")
-    else:
+    # Step 2: Prepare trace inputs (for non-custom models)
+    if not is_custom:
         vocab_size = getattr(config, "vocab_size", 30000)
         input_kwargs = {"input_ids": torch.randint(0, vocab_size, (1, seq_len))}
         if not is_causal and not is_encoder_decoder:
@@ -439,9 +150,7 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     # Step 4: Emit outputs
     outputs = {}
 
-    # Derive filenames: use explicit model_name if provided, otherwise fall
-    # back to the model ID (last path component) so that e.g.
-    # "KaLM-embedding-v2.5" produces "kalm_embedding_v2_5.cpp".
+    # Derive filenames
     effective_name = model_name or model_name_or_path
     filenames = get_output_filenames(
         structure.model_type if structure else model_type,
