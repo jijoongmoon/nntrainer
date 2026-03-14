@@ -510,6 +510,95 @@ def test_functiongemma_causal():
     print("\nFunctionGemma (Gemma3 CausalLM): PASSED!\n")
 
 
+def test_granite4_causal():
+    """Test Granite 4.0 (IBM dense transformer, GraniteMoeHybrid with no MoE).
+
+    Granite-4.0-350M uses GraniteMoeHybridForCausalLM with num_experts=0,
+    making it a pure dense transformer. Architecture: GQA, SwiGLU, RMSNorm,
+    RoPE, shared embeddings, with scaling multipliers.
+    """
+    from transformers import GraniteMoeHybridConfig, GraniteMoeHybridForCausalLM
+    from decomposer import AdaptiveConverter
+
+    print("=" * 70)
+    print("TEST: Granite 4.0 (dense transformer, GraniteMoeHybrid)")
+    print("=" * 70)
+
+    num_layers = 2
+    config = GraniteMoeHybridConfig(
+        vocab_size=100544,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=num_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32768,
+        rms_norm_eps=1e-5,
+        hidden_act='silu',
+        tie_word_embeddings=True,
+        embedding_multiplier=12.0,
+        logits_scaling=0.08838834764831845,
+        residual_multiplier=0.22360679774997896,
+        attention_multiplier=0.08838834764831845,
+        num_local_experts=0,
+        num_experts_per_tok=0,
+        position_embedding_type='rope',
+        layer_types=['attention'] * num_layers,
+    )
+    config.architectures = ["GraniteMoeHybridForCausalLM"]
+    model = GraniteMoeHybridForCausalLM(config)
+    model.eval()
+
+    print("\n--- Model Architecture ---")
+    for name, module in model.named_modules():
+        if name.count(".") <= 2:
+            print(f"  {name}: {type(module).__name__}")
+
+    # Trace via AdaptiveConverter
+    input_ids = torch.randint(0, config.vocab_size, (1, 8))
+    converter = AdaptiveConverter(model, config)
+    result = converter.convert({"input_ids": input_ids})
+
+    layers = result.layers
+    structure = result.model_structure
+
+    type_counts = {}
+    for layer in layers:
+        type_counts[layer.layer_type] = type_counts.get(layer.layer_type, 0) + 1
+
+    print(f"\nTotal mapped layers: {len(layers)}")
+    print(f"Layer type counts: {type_counts}")
+
+    # Verify basic structure
+    assert result.is_fully_mapped, \
+        f"All ops should be mapped, unknowns: {result.unknown_layers}, unsupported: {result.unsupported_ops}"
+    assert structure is not None
+    assert structure.arch_type == "decoder_only"
+    assert structure.num_layers == num_layers
+
+    # Verify Granite-specific features
+    assert "rms_norm" in type_counts, "Granite should have RMSNorm"
+    assert "fully_connected" in type_counts, "Granite should have FC layers"
+    assert "embedding_layer" in type_counts, "Granite should have embeddings"
+    assert "activation" in type_counts, "Granite should have activation layers (SiLU)"
+
+    # Verify SwiGLU activation (SiLU gate)
+    silu_layers = [l for l in layers if l.layer_type == "activation"
+                   and l.properties.get("activation") == "swish"]
+    assert len(silu_layers) == num_layers, \
+        f"Expected {num_layers} SiLU activations (one per block), got {len(silu_layers)}"
+
+    # Verify block structure
+    for block in structure.blocks:
+        assert block.attention is not None, "Block should have attention"
+        assert block.attention.attention_type == "gqa", \
+            f"Granite should use GQA, got {block.attention.attention_type}"
+        assert block.attention.has_rope, "Granite should have RoPE"
+        assert block.ffn is not None, "Block should have FFN"
+
+    print("\nGranite 4.0: PASSED!\n")
+
+
 if __name__ == "__main__":
     print("\n" + "#" * 70)
     print("# Multi-Architecture Tracer + Node Mapper Validation")
@@ -521,6 +610,7 @@ if __name__ == "__main__":
     test_gemma_embedding()
     test_gemma3_text_embedding()
     test_functiongemma_causal()
+    test_granite4_causal()
 
     print("=" * 70)
     print("ALL ARCHITECTURE TESTS PASSED!")

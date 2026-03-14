@@ -99,7 +99,7 @@ def find_cross_attention_scope(block_scope, block_layers):
 
 def find_ffn_scope(block_scope, block_layers):
     """Find the FFN/MLP scope within a block."""
-    ffn_patterns = ["mlp", "feed_forward", "ffn", "DenseReluDense"]
+    ffn_patterns = ["mlp", "shared_mlp", "feed_forward", "ffn", "DenseReluDense"]
     for pat in ffn_patterns:
         full = f"{block_scope}.{pat}"
         for layer in block_layers:
