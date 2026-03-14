@@ -160,15 +160,9 @@ class IniEmitter:
                 input_name = (first_input if i == 0
                               else f"layer{i-1}_decoder_output")
                 block_i = s.blocks[i] if i < len(s.blocks) else None
-                is_conv_block = block_i and block_i.attention is None
-                if is_conv_block:
-                    sections.extend(
-                        self._emit_conv_block_ini(i, input_name, s,
-                                                  block=block_i))
-                else:
-                    sections.extend(
-                        self._emit_block_ini(i, input_name, s,
-                                             block=block_i))
+                sections.extend(
+                    self._emit_block_ini(i, input_name, s,
+                                         block=block_i))
                 sections.append("")
 
             # Final norm
@@ -199,7 +193,10 @@ class IniEmitter:
 
     def _emit_block_ini(self, layer_id, input_name, s,
                         block=None, prefix=None, encoder_output=None):
-        """Emit a single transformer block as INI sections.
+        """Emit a single block as INI sections.
+
+        Handles both attention blocks and non-attention operator blocks
+        (conv, ssm, etc.) generically using block.operator_layers.
 
         Args:
             layer_id: Block index.
@@ -214,13 +211,17 @@ class IniEmitter:
             prefix = f"layer{layer_id}"
         b0 = block if block is not None else (s.blocks[0] if s.blocks else None)
         norm_type = self._norm_type(s)
+        op_type = b0.operator_type if b0 else "attention"
 
         role = f" [{b0.block_role}]" if b0 and b0.block_role else ""
-        lines.append(f"# --- Block {layer_id}{role} ---")
+        op_label = op_type.capitalize() if op_type != "attention" else ""
+        lines.append(f"# --- {op_label+' ' if op_label else ''}Block {layer_id}{role} ---")
 
-        # Pre-attention norm
+        # Pre-operator norm
+        norm_suffix = ("_attention_norm" if op_type == "attention"
+                       else f"_{op_type}_norm")
         if b0 and b0.pre_attn_norm:
-            norm_name = f"{prefix}_attention_norm"
+            norm_name = f"{prefix}{norm_suffix}"
             lines.append(f"[{norm_name}]")
             lines.append(f"Type = {norm_type}")
             lines.append(f"input_layers = {input_name}")
@@ -228,12 +229,13 @@ class IniEmitter:
             if norm_type == "rms_norm":
                 lines.append("packed = false")
             lines.append("")
-            attn_input = norm_name
+            op_input = norm_name
         else:
-            attn_input = input_name
+            op_input = input_name
 
-        # Attention sub-layers
+        # Operator layers
         if b0 and b0.attention:
+            # Attention sub-layers
             attn = b0.attention
             has_qk_norm = attn.has_qk_norm
             q_unit = s.head_dim * s.num_heads
@@ -242,7 +244,7 @@ class IniEmitter:
             # Q projection
             lines.append(f"[{prefix}_wq]")
             lines.append("Type = fully_connected")
-            lines.append(f"input_layers = {attn_input}")
+            lines.append(f"input_layers = {op_input}")
             lines.append(f"unit = {q_unit}")
             lines.append("disable_bias = true")
             lines.append("")
@@ -250,7 +252,7 @@ class IniEmitter:
             # K projection
             lines.append(f"[{prefix}_wk]")
             lines.append("Type = fully_connected")
-            lines.append(f"input_layers = {attn_input}")
+            lines.append(f"input_layers = {op_input}")
             lines.append(f"unit = {kv_unit}")
             lines.append("disable_bias = true")
             lines.append("")
@@ -258,7 +260,7 @@ class IniEmitter:
             # V projection
             lines.append(f"[{prefix}_wv]")
             lines.append("Type = fully_connected")
-            lines.append(f"input_layers = {attn_input}")
+            lines.append(f"input_layers = {op_input}")
             lines.append(f"unit = {kv_unit}")
             lines.append("disable_bias = true")
             lines.append("")
@@ -303,19 +305,30 @@ class IniEmitter:
             lines.append("disable_bias = true")
             lines.append("")
 
-        # Self-attention residual
+            op_output = f"{prefix}_attention_out"
+        elif b0 and b0.operator_layers:
+            # Generic operator layers (auto-generated from model)
+            op_output = self._emit_operator_layers_ini(
+                lines, b0, op_input, prefix)
+        else:
+            op_output = op_input
+
+        # Operator residual
         is_enc_dec = (b0 and b0.block_role in ("encoder", "decoder"))
-        attn_add_name = "self_attn_add" if is_enc_dec else "decoder_add"
         block_out_name = "block_output" if is_enc_dec else "decoder_output"
 
         if b0 and b0.attn_residual:
-            lines.append(f"[{prefix}_{attn_add_name}]")
+            residual_suffix = (f"_{op_type}_add" if op_type != "attention"
+                               else ("_self_attn_add" if is_enc_dec
+                                     else "_decoder_add"))
+            residual_name = f"{prefix}{residual_suffix}"
+            lines.append(f"[{residual_name}]")
             lines.append("Type = addition")
-            lines.append(f"input_layers = {input_name},{prefix}_attention_out")
+            lines.append(f"input_layers = {input_name},{op_output}")
             lines.append("")
-            last_residual = f"{prefix}_{attn_add_name}"
+            last_residual = residual_name
         else:
-            last_residual = f"{prefix}_attention_out"
+            last_residual = op_output
 
         # Cross-attention (decoder blocks in encoder-decoder models)
         if b0 and b0.cross_attention and encoder_output:
@@ -454,134 +467,46 @@ class IniEmitter:
 
         return lines
 
-    def _emit_conv_block_ini(self, layer_id, input_name, s,
-                             block=None, prefix=None):
-        """Emit a conv block (no attention) as INI sections."""
-        lines = []
-        if prefix is None:
-            prefix = f"layer{layer_id}"
-        b0 = block if block is not None else (s.blocks[0] if s.blocks else None)
-        norm_type = self._norm_type(s)
-        conv_l_cache = s.conv_l_cache or 3
+    def _emit_operator_layers_ini(self, lines, block, op_input, prefix):
+        """Emit non-attention operator layers as INI sections.
 
-        lines.append(f"# --- Conv Block {layer_id} ---")
+        Takes learnable layers from block.operator_layers and emits them
+        with parameterized names (replacing block index with prefix).
 
-        # Pre-conv norm
-        if b0 and b0.pre_attn_norm:
-            lines.append(f"[{prefix}_conv_norm]")
-            lines.append(f"Type = {norm_type}")
-            lines.append(f"input_layers = {input_name}")
-            lines.append(f"epsilon = {s.norm_eps}")
-            if norm_type == "rms_norm":
-                lines.append("packed = false")
-            lines.append("")
-            conv_input = f"{prefix}_conv_norm"
-        else:
-            conv_input = input_name
+        Returns the name of the last emitted layer (for residual connection).
+        """
+        scope = block.operator_scope
+        # Block-level scope (e.g. "model.layers.0")
+        block_scope = scope.rsplit(".", 1)[0] if "." in scope else scope
+        block_scope_san = block_scope.replace(".", "_")
 
-        # Short conv: in_proj -> short_conv -> out_proj
-        lines.append(f"[{prefix}_conv_in_proj]")
-        lines.append("Type = fully_connected")
-        lines.append(f"input_layers = {conv_input}")
-        lines.append(f"unit = {s.hidden_size * 3}")
-        lines.append("disable_bias = true")
-        lines.append("")
+        prev_name = op_input
+        last_name = op_input
 
-        lines.append(f"[{prefix}_conv_op]")
-        lines.append("Type = short_conv")
-        lines.append(f"input_layers = {prefix}_conv_in_proj")
-        lines.append(f"kernel_size = {conv_l_cache}")
-        lines.append(f"hidden_size = {s.hidden_size}")
-        lines.append("")
-
-        lines.append(f"[{prefix}_conv_out]")
-        lines.append("Type = fully_connected")
-        lines.append(f"input_layers = {prefix}_conv_op")
-        lines.append(f"unit = {s.hidden_size}")
-        lines.append("disable_bias = true")
-        lines.append("")
-
-        # Conv residual
-        if b0 and b0.attn_residual:
-            lines.append(f"[{prefix}_conv_add]")
-            lines.append("Type = addition")
-            lines.append(f"input_layers = {input_name},{prefix}_conv_out")
-            lines.append("")
-            last_residual = f"{prefix}_conv_add"
-        else:
-            last_residual = f"{prefix}_conv_out"
-
-        # Pre-FFN norm
-        if b0 and b0.pre_ffn_norm:
-            lines.append(f"[{prefix}_ffn_norm]")
-            lines.append(f"Type = {norm_type}")
-            lines.append(f"input_layers = {last_residual}")
-            lines.append(f"epsilon = {s.norm_eps}")
-            if norm_type == "rms_norm":
-                lines.append("packed = false")
-            lines.append("")
-            ffn_input = f"{prefix}_ffn_norm"
-        else:
-            ffn_input = last_residual
-
-        # FFN (reuse from block pattern)
-        if b0 and b0.ffn:
-            ffn = b0.ffn
-            if ffn.ffn_type == "swiglu":
-                lines.append(f"[{prefix}_ffn_up]")
-                lines.append("Type = fully_connected")
-                lines.append(f"input_layers = {ffn_input}")
-                lines.append(f"unit = {s.intermediate_size}")
-                lines.append("disable_bias = true")
-                lines.append("")
-
-                lines.append(f"[{prefix}_ffn_gate]")
-                lines.append("Type = fully_connected")
-                lines.append(f"input_layers = {ffn_input}")
-                lines.append(f"unit = {s.intermediate_size}")
-                lines.append("disable_bias = true")
-                lines.append("")
-
-                lines.append(f"[{prefix}_ffn_swiglu]")
-                lines.append("Type = swiglu")
-                lines.append(f"input_layers = {prefix}_ffn_up,"
-                             f"{prefix}_ffn_gate")
-                lines.append("")
-
-                lines.append(f"[{prefix}_ffn_down]")
-                lines.append("Type = fully_connected")
-                lines.append(f"input_layers = {prefix}_ffn_swiglu")
-                lines.append(f"unit = {s.hidden_size}")
-                lines.append("disable_bias = true")
-                lines.append("")
+        for layer in block.operator_layers:
+            # Compute layer name suffix relative to block scope
+            if layer.name.startswith(block_scope_san + "_"):
+                suffix = layer.name[len(block_scope_san):]
             else:
-                act = "gelu" if ffn.ffn_type == "gelu_ffn" else "relu"
-                lines.append(f"[{prefix}_ffn_fc1]")
-                lines.append("Type = fully_connected")
-                lines.append(f"input_layers = {ffn_input}")
-                lines.append(f"unit = {s.intermediate_size}")
-                lines.append("")
+                suffix = "_" + layer.name
+            layer_name = f"{prefix}{suffix}"
 
-                lines.append(f"[{prefix}_ffn_act]")
-                lines.append("Type = activation")
-                lines.append(f"input_layers = {prefix}_ffn_fc1")
-                lines.append(f"Activation = {act}")
-                lines.append("")
-
-                lines.append(f"[{prefix}_ffn_down]")
-                lines.append("Type = fully_connected")
-                lines.append(f"input_layers = {prefix}_ffn_act")
-                lines.append(f"unit = {s.hidden_size}")
-                lines.append("")
-
-        # FFN residual
-        if b0 and b0.ffn_residual:
-            lines.append(f"[{prefix}_decoder_output]")
-            lines.append("Type = addition")
-            lines.append(f"input_layers = {last_residual},{prefix}_ffn_down")
+            lines.append(f"[{layer_name}]")
+            lines.append(f"Type = {layer.layer_type}")
+            lines.append(f"input_layers = {prev_name}")
+            for k, v in layer.properties.items():
+                if isinstance(v, bool):
+                    lines.append(f"{k} = {'true' if v else 'false'}")
+                elif isinstance(v, (list, tuple)):
+                    lines.append(f"{k} = {','.join(str(x) for x in v)}")
+                else:
+                    lines.append(f"{k} = {v}")
             lines.append("")
 
-        return lines
+            prev_name = layer_name
+            last_name = layer_name
+
+        return last_name
 
     def _norm_type(self, s):
         """Determine norm type string for INI."""

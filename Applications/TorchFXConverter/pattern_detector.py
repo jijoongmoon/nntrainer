@@ -94,6 +94,10 @@ class TransformerBlockPattern:
     cross_attention: Optional[AttentionPattern] = None
     cross_attn_norm: str = ""
     cross_attn_residual: str = ""
+    # Auto-detected operator (the core operation between pre-norm and residual)
+    operator_type: str = ""                 # e.g. "attention", "conv", "ssm"
+    operator_scope: str = ""                # HF scope prefix for operator
+    operator_layers: list = field(default_factory=list)  # NNTrainerLayerDef objects
 
 
 @dataclass
@@ -460,6 +464,9 @@ class PatternDetector:
 
         # Detect norms and residuals
         self._detect_norms_and_residuals(block, scope, block_layers)
+
+        # Auto-detect operator type and layers
+        self._detect_operator(block, scope, block_layers)
 
         return block
 
@@ -838,6 +845,107 @@ class PatternDetector:
                 block.norm_type = "pre_norm"
             else:
                 block.norm_type = "post_norm"
+
+    # =========================================================================
+    # Operator Detection (auto-detect block operator type and layers)
+    # =========================================================================
+
+    def _detect_operator(self, block, scope, block_layers):
+        """Auto-detect the operator type and its learnable layers.
+
+        The "operator" is the core computation between pre-norm and residual,
+        e.g. attention, conv, SSM.  This method identifies what kind of operator
+        each block uses and collects its learnable layers (nn.Module layers
+        with distinct HF module names, excluding internal FX ops).
+
+        For attention blocks, the operator is already captured in
+        block.attention.  For non-attention blocks, the operator type is
+        inferred from the HF module scope (e.g. "conv", "ssm") and its
+        learnable layers are stored in block.operator_layers.
+        """
+        if block.attention:
+            block.operator_type = "attention"
+            block.operator_scope = self._find_attention_scope(
+                scope, block_layers) or ""
+            # operator_layers not needed — attention pattern handles these
+            return
+
+        # Build set of known layer names (norms, FFN, residuals)
+        known = set()
+        if block.pre_attn_norm:
+            known.add(block.pre_attn_norm)
+        if block.post_attn_norm:
+            known.add(block.post_attn_norm)
+        if block.pre_ffn_norm:
+            known.add(block.pre_ffn_norm)
+        if block.post_ffn_norm:
+            known.add(block.post_ffn_norm)
+        if block.attn_residual:
+            known.add(block.attn_residual)
+        if block.ffn_residual:
+            known.add(block.ffn_residual)
+        if block.ffn:
+            known.update(block.ffn.layer_names)
+
+        # Collect operator layers: block layers not in known set
+        operator_layers = [l for l in block_layers if l.name not in known]
+
+        # Filter to learnable layers only (layers that correspond to actual
+        # nn.Module submodules, i.e. have a unique leaf-level hf_module_name).
+        # This excludes internal FX ops like transpose, split, multiply, etc.
+        seen_hf = set()
+        learnable = []
+        for l in operator_layers:
+            hf = l.hf_module_name
+            if not hf:
+                continue
+            # Must be a leaf module (has a distinct submodule path under scope)
+            suffix = hf[len(scope):].lstrip(".")
+            if "." not in suffix:
+                # Direct child of block scope (e.g. "operator_norm") — skip
+                continue
+            # Deduplicate: some FX ops share the parent scope
+            # Only keep layers with unique leaf-level hf_module_name
+            if hf in seen_hf:
+                continue
+            # Skip if this is a method-level trace (same scope as parent)
+            parts = suffix.split(".")
+            if len(parts) < 2:
+                continue
+            # Check if this is an actual parameter-bearing layer
+            # (FC, conv, norm, embedding — not just scope references)
+            if l.layer_type in ("fully_connected", "conv1d", "conv2d",
+                                "rms_norm", "layer_normalization",
+                                "embedding"):
+                seen_hf.add(hf)
+                learnable.append(l)
+
+        block.operator_layers = learnable
+
+        # Detect operator type from the sub-scope keyword
+        # e.g. "model.layers.0.conv.in_proj" → sub-scope = "conv"
+        op_scopes = set()
+        for l in learnable:
+            suffix = l.hf_module_name[len(scope):].lstrip(".")
+            parts = suffix.split(".")
+            if parts:
+                op_scopes.add(parts[0])
+
+        if len(op_scopes) == 1:
+            block.operator_type = op_scopes.pop()
+            block.operator_scope = scope + "." + block.operator_type
+        elif op_scopes:
+            # Multiple sub-scopes — pick the most common one
+            from collections import Counter
+            counts = Counter()
+            for l in learnable:
+                suffix = l.hf_module_name[len(scope):].lstrip(".")
+                counts[suffix.split(".")[0]] += 1
+            block.operator_type = counts.most_common(1)[0][0]
+            block.operator_scope = scope + "." + block.operator_type
+        else:
+            block.operator_type = "unknown"
+            block.operator_scope = scope
 
     # =========================================================================
     # Final Norm Detection
