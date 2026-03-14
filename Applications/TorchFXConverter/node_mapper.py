@@ -165,13 +165,17 @@ class NodeMapper:
 
         # nn.Embedding -> embedding_layer
         if isinstance(module, nn.Embedding):
+            props = {
+                "in_dim": module.num_embeddings,
+                "out_dim": module.embedding_dim,
+            }
+            # Gemma3 scaled embedding: record scale factor for weight conversion
+            if hasattr(module, "scalar_embed_scale"):
+                props["embed_scale"] = module.scalar_embed_scale
             return NNTrainerLayerDef(
                 layer_type=LAYER_EMBEDDING,
                 name=_sanitize_name(module_name),
-                properties={
-                    "in_dim": module.num_embeddings,
-                    "out_dim": module.embedding_dim,
-                },
+                properties=props,
                 input_layers=input_names,
                 hf_module_name=module_name,
                 hf_module_type=module_type,

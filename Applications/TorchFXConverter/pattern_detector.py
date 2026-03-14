@@ -83,9 +83,11 @@ class TransformerBlockPattern:
     block_role: str = ""                    # "encoder", "decoder", or "" (single-stack)
     pre_attn_norm: str = ""                 # Pre-attention normalization
     attention: Optional[AttentionPattern] = None
+    post_attn_norm: str = ""                # Post-attention norm (Gemma3 style)
     attn_residual: str = ""                 # Attention residual addition
     pre_ffn_norm: str = ""                  # Pre-FFN normalization
     ffn: Optional[FFNPattern] = None
+    post_ffn_norm: str = ""                 # Post-FFN norm (Gemma3 style)
     ffn_residual: str = ""                  # FFN residual addition
     norm_type: str = "pre_norm"             # "pre_norm" or "post_norm"
     # For encoder-decoder models
@@ -159,6 +161,8 @@ def _print_block(block):
     print(f"    Norm type: {block.norm_type}")
     if block.pre_attn_norm:
         print(f"    Pre-attn norm: {block.pre_attn_norm}")
+    if block.post_attn_norm:
+        print(f"    Post-attn norm: {block.post_attn_norm}")
     if block.attention:
         attn = block.attention
         print(f"    Attention ({attn.attention_type}):")
@@ -181,6 +185,8 @@ def _print_block(block):
 
     if block.pre_ffn_norm:
         print(f"    Pre-FFN norm: {block.pre_ffn_norm}")
+    if block.post_ffn_norm:
+        print(f"    Post-FFN norm: {block.post_ffn_norm}")
     if block.ffn:
         ffn = block.ffn
         print(f"    FFN ({ffn.ffn_type}):")
@@ -746,8 +752,13 @@ class PatternDetector:
                                            "layer.0.layer_norm",
                                            "pre_attention")):
                 block.pre_attn_norm = norm.name
-            elif any(kw in suffix for kw in ("post_attention_layernorm",
-                                             "pre_ffn", "final_layer_norm")):
+            elif "post_attention_layernorm" in suffix:
+                block.post_attn_norm = norm.name
+            elif "pre_feedforward_layernorm" in suffix:
+                block.pre_ffn_norm = norm.name
+            elif "post_feedforward_layernorm" in suffix:
+                block.post_ffn_norm = norm.name
+            elif any(kw in suffix for kw in ("pre_ffn", "final_layer_norm")):
                 block.pre_ffn_norm = norm.name
             elif "layer.1.layer_norm" in suffix:
                 # T5: layer.1 = cross-attn norm (decoder) or FFN norm (encoder)
@@ -761,6 +772,12 @@ class PatternDetector:
                 block.pre_attn_norm = norm.name
             elif any(kw in suffix for kw in ("output.LayerNorm",)):
                 block.pre_ffn_norm = norm.name
+
+        # For models with only post_attn_norm (no separate pre_ffn_norm),
+        # use post_attn_norm as pre_ffn_norm (e.g. Qwen3, Gemma1, LLaMA)
+        if block.post_attn_norm and not block.pre_ffn_norm:
+            block.pre_ffn_norm = block.post_attn_norm
+            block.post_attn_norm = ""  # It's not a separate post-attn norm
 
         # If we couldn't assign by name, assign by position
         if not block.pre_attn_norm and not block.pre_ffn_norm and len(norms) >= 2:

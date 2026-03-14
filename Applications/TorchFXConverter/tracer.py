@@ -328,6 +328,9 @@ class Tracer(TorchFunctionMode):
                 elif isinstance(module, nn.Embedding):
                     node.meta["num_embeddings"] = module.num_embeddings
                     node.meta["embedding_dim"] = module.embedding_dim
+                    # Gemma3 scaled embedding: captures embed_scale factor
+                    if hasattr(module, "scalar_embed_scale"):
+                        node.meta["embed_scale"] = module.scalar_embed_scale
                 elif isinstance(module, nn.LayerNorm):
                     node.meta["normalized_shape"] = module.normalized_shape
                     node.meta["eps"] = module.eps
