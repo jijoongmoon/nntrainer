@@ -51,15 +51,25 @@ class NodeMapper:
         Returns a list of NNTrainerLayerDef objects in graph order.
         """
         layers = []
+        seen_names = {}  # layer_name -> count (for deduplication)
+
         for node in self.graph.nodes:
             layer_def = self._map_node(node)
             if layer_def is not None:
+                # Deduplicate layer names: sanitize_name("a.b") and "a_b"
+                # can collide. Append _1, _2, etc. to make names unique.
+                if layer_def.name in seen_names:
+                    seen_names[layer_def.name] += 1
+                    layer_def.name = f"{layer_def.name}_{seen_names[layer_def.name]}"
+                else:
+                    seen_names[layer_def.name] = 0
+
                 layers.append(layer_def)
                 self._node_to_layer[node.name] = layer_def
 
         # Remap input references: FX node names -> actual layer names.
         # Layer names may differ from FX node names due to scoping
-        # (e.g. _make_scoped_name adds module scope prefix).
+        # (e.g. _make_scoped_name adds module scope prefix) or dedup.
         fx_to_layer = {node_name: ldef.name
                        for node_name, ldef in self._node_to_layer.items()
                        if node_name != ldef.name}
