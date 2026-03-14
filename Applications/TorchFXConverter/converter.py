@@ -26,7 +26,8 @@ import torch
 
 def convert_model(model_name_or_path, output_dir, formats=None,
                   batch_size=1, seq_len=8, dtype="float32",
-                  convert_weights=False, verbose=True):
+                  convert_weights=False, verbose=True,
+                  model_name=None):
     """Run the full conversion pipeline.
 
     Args:
@@ -126,10 +127,14 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     # Step 4: Emit outputs
     outputs = {}
 
-    # Derive filenames from model type (e.g. "gemma3_embedding_model.h")
+    # Derive filenames: use explicit model_name if provided, otherwise fall
+    # back to the model ID (last path component) so that e.g.
+    # "KaLM-embedding-v2.5" produces "kalm_embedding_v2_5.cpp".
+    effective_name = model_name or model_name_or_path
     filenames = get_output_filenames(
         structure.model_type if structure else model_type,
         structure.arch_type if structure else "decoder_only",
+        model_name=effective_name,
     )
 
     if "cpp" in formats:
@@ -220,6 +225,9 @@ Examples:
                         help="Batch size for INI config (default: 1)")
     parser.add_argument("--seq-len", type=int, default=8,
                         help="Sequence length for tracing (default: 8)")
+    parser.add_argument("--model-name", default=None,
+                        help="Override output file naming (default: derived "
+                             "from --model). e.g. --model-name KaLM-embedding")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress progress messages")
 
@@ -238,6 +246,7 @@ Examples:
         dtype=args.dtype,
         convert_weights=args.weights,
         verbose=not args.quiet,
+        model_name=args.model_name,
     )
 
 

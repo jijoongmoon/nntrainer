@@ -110,14 +110,39 @@ def _header_guard(class_name):
     return f"__{basename.upper()}_H__"
 
 
-def get_output_filenames(model_type, arch_type):
+def _sanitize_model_name(model_name):
+    """Sanitize a model name (e.g. HF model ID) into a file-safe snake_case basename.
+
+    e.g. "KaLM-embedding-v2.5" -> "kalm_embedding_v2_5"
+         "Qwen/Qwen3-0.6B"     -> "qwen3_0_6b"
+    """
+    import re
+    # Take last component if it contains a slash (e.g. "org/model" -> "model")
+    name = model_name.rsplit("/", 1)[-1]
+    # Replace hyphens, dots, spaces with underscores
+    name = re.sub(r'[-.\s]+', '_', name)
+    # Collapse multiple underscores and strip leading/trailing
+    name = re.sub(r'_+', '_', name).strip('_')
+    return name.lower()
+
+
+def get_output_filenames(model_type, arch_type, model_name=None):
     """Get output filenames for a given model.
+
+    Args:
+        model_type: HF config model_type (e.g. "qwen2").
+        arch_type: Architecture type (e.g. "embedding", "decoder_only").
+        model_name: Optional model name/ID to use for file naming instead of
+                    model_type.  e.g. "KaLM-embedding-v2.5".
 
     Returns:
         dict with keys: "header", "source", "ini", "json"
     """
-    cname = _class_name(model_type, arch_type)
-    base = _file_basename(cname)
+    if model_name:
+        base = _sanitize_model_name(model_name)
+    else:
+        cname = _class_name(model_type, arch_type)
+        base = _file_basename(cname)
     return {
         "header": f"{base}.h",
         "source": f"{base}.cpp",
