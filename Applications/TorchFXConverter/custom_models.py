@@ -123,17 +123,26 @@ def _build_sequential_from_weights(
         raise RuntimeError(
             f"No linear layers found with prefix '{prefix}' in state_dict")
 
-    # Build layers in index order
-    modules = []
-    for idx in sorted(linears.keys()):
-        # Insert ReLU + Dropout between linear layers
-        if modules:
-            modules.append(nn.ReLU())
-            modules.append(nn.Dropout(0.0))  # placeholder, removed at eval
+    # Build layers matching the original indices exactly.
+    # The gap between consecutive linear indices tells us what non-linear
+    # layers sit between them:
+    #   gap=2 (e.g. 0,2): Linear – ReLU – Linear
+    #   gap=3 (e.g. 0,3): Linear – ReLU – Dropout – Linear
+    sorted_indices = sorted(linears.keys())
+    modules = {}
+    for i, idx in enumerate(sorted_indices):
         in_f, out_f = linears[idx]
-        modules.append(nn.Linear(in_f, out_f))
+        modules[idx] = nn.Linear(in_f, out_f)
+        if i < len(sorted_indices) - 1:
+            next_idx = sorted_indices[i + 1]
+            gap = next_idx - idx
+            modules[idx + 1] = nn.ReLU()
+            if gap >= 3:
+                modules[idx + 2] = nn.Dropout(0.0)
 
-    return nn.Sequential(*modules)
+    max_idx = max(modules.keys())
+    ordered = [modules[i] for i in range(max_idx + 1) if i in modules]
+    return nn.Sequential(*ordered)
 
 
 # ---------------------------------------------------------------------------
