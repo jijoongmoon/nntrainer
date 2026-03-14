@@ -40,11 +40,16 @@ class IniEmitter:
         Args:
             mode: "structured" uses pattern-detected structure for clean output.
                   "flat" emits every layer from the flat list verbatim.
+                  When structured mode is requested but no transformer blocks
+                  are detected, falls back to flat mode automatically.
 
         Returns:
             str: Complete INI file content.
         """
         if mode == "flat":
+            return self._emit_flat()
+        # Fall back to flat mode for non-transformer models
+        if not self.structure.blocks:
             return self._emit_flat()
         return self._emit_structured()
 
