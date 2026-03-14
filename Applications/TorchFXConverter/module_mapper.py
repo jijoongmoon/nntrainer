@@ -15,18 +15,11 @@ from nntrainer_layers import (
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
 )
 from tracer import _is_rmsnorm, _is_gelu_variant
+from mapper_helpers import get_input_node_names, sanitize_name
 
-
-def _sanitize_name(name: str) -> str:
-    return name.replace(".", "_")
-
-
-def _get_input_node_names(node):
-    names = []
-    for arg in node.args:
-        if hasattr(arg, 'name'):
-            names.append(arg.name)
-    return names
+# Backward-compatible aliases
+_sanitize_name = sanitize_name
+_get_input_node_names = get_input_node_names
 
 
 # Set of layer types that return tuple outputs (output, hidden_state)

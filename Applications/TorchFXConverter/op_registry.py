@@ -99,6 +99,22 @@ FUNCTION_ACTIVATION_NAMES = {
     "tanh": ACT_TANH,
 }
 
+# Function-based identity ops: callable -> layer_type
+# These are checked by `func is <target>` and need special handling
+# (e.g. multi-input extraction or parameter extraction).
+FUNCTION_IDENTITY_OPS = {
+    F.dropout:  LAYER_DROPOUT,
+    F.pad:      OP_NOOP,
+}
+
+# Function-based clamp names (matching METHOD_CLAMP_NAMES pattern)
+FUNCTION_CLAMP_NAMES = frozenset({
+    "clamp", "clip", "clamp_min", "clamp_max",
+})
+
+# Layer types that produce tuple outputs (for operator.getitem handling)
+MULTI_OUTPUT_LAYER_TYPES = frozenset({"gru", "lstm", "rnn"})
+
 # ---------------------------------------------------------------------------
 # Method-based ops: maps method_name (str) -> layer_type
 # Simple ops that only need layer_type + standard input_layers.

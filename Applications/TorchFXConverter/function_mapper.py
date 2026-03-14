@@ -5,7 +5,6 @@ Handles torch.* functions (torch.add, torch.matmul, etc.), operator.*
 """
 
 import operator
-import math
 
 import torch
 import torch.nn.functional as F
@@ -21,60 +20,22 @@ from op_registry import (
     FUNCTION_SIMPLE_OPS, FUNCTION_NAME_SIMPLE_OPS,
     FUNCTION_NOOP_NAMES, FUNCTION_RESHAPE_NAMES, FUNCTION_DECOMPOSE_OPS,
     FUNCTION_ACTIVATION_OPS, FUNCTION_ACTIVATION_NAMES,
+    FUNCTION_IDENTITY_OPS, FUNCTION_CLAMP_NAMES,
+    MULTI_OUTPUT_LAYER_TYPES,
+)
+from mapper_helpers import (
+    get_input_node_names, sanitize_name, make_scoped_name,
+    extract_clamp_params,
 )
 
-
-def _get_input_node_names(node):
-    names = []
-    for arg in node.args:
-        if hasattr(arg, 'name'):
-            names.append(arg.name)
-    return names
-
-
-def _sanitize_name(name: str) -> str:
-    return name.replace(".", "_")
-
-
-def _make_scoped_name(scope, node, suffix=""):
-    if scope:
-        name = f"{_sanitize_name(scope)}_{node.name}"
-    else:
-        name = node.name
-    if suffix:
-        name = f"{name}_{suffix}"
-    return name
-
-
-def _extract_clamp_params(node, op_name, props):
-    """Extract min/max parameters from clamp/clip FX node."""
-    args = node.args
-    kwargs = node.kwargs or {}
-
-    if op_name == "clamp_min":
-        props["min"] = str(args[1] if len(args) > 1 else kwargs.get("min", 0))
-        props["max"] = str(math.inf)
-    elif op_name == "clamp_max":
-        props["min"] = str(-math.inf)
-        props["max"] = str(args[1] if len(args) > 1 else kwargs.get("max", 0))
-    else:
-        if len(args) > 1:
-            props["min"] = str(args[1])
-        elif "min" in kwargs and kwargs["min"] is not None:
-            props["min"] = str(kwargs["min"])
-        else:
-            props["min"] = str(-math.inf)
-
-        if len(args) > 2:
-            props["max"] = str(args[2])
-        elif "max" in kwargs and kwargs["max"] is not None:
-            props["max"] = str(kwargs["max"])
-        else:
-            props["max"] = str(math.inf)
-
+# Backward-compatible aliases
+_get_input_node_names = get_input_node_names
+_sanitize_name = sanitize_name
+_make_scoped_name = make_scoped_name
+_extract_clamp_params = extract_clamp_params
 
 # Layer types that produce tuple outputs (for operator.getitem handling)
-_MULTI_OUTPUT_LAYER_TYPES = frozenset({"gru", "lstm", "rnn"})
+_MULTI_OUTPUT_LAYER_TYPES = MULTI_OUTPUT_LAYER_TYPES
 
 
 def map_function_node(node, node_to_layer):
@@ -89,14 +50,14 @@ def map_function_node(node, node_to_layer):
     """
     func = node.target
     scope = node.meta.get("scope", "")
-    input_names = _get_input_node_names(node)
+    input_names = get_input_node_names(node)
     func_name = getattr(func, "__name__", str(func))
 
     # === No-ops ===
     if func_name in FUNCTION_NOOP_NAMES:
         return NNTrainerLayerDef(
             layer_type=OP_NOOP,
-            name=_make_scoped_name(scope, node),
+            name=make_scoped_name(scope, node),
             input_layers=input_names,
             hf_module_name=scope,
         )
@@ -106,7 +67,7 @@ def map_function_node(node, node_to_layer):
     if layer_type is not None:
         return NNTrainerLayerDef(
             layer_type=layer_type,
-            name=_make_scoped_name(scope, node),
+            name=make_scoped_name(scope, node),
             input_layers=input_names,
             hf_module_name=scope if layer_type.endswith("_op") else "",
         )
@@ -116,7 +77,7 @@ def map_function_node(node, node_to_layer):
     if layer_type is not None:
         return NNTrainerLayerDef(
             layer_type=layer_type,
-            name=_make_scoped_name(scope, node),
+            name=make_scoped_name(scope, node),
             input_layers=input_names,
             hf_module_name=scope,
         )
@@ -125,7 +86,7 @@ def map_function_node(node, node_to_layer):
     if func_name in FUNCTION_RESHAPE_NAMES:
         return NNTrainerLayerDef(
             layer_type=OP_RESHAPE,
-            name=_make_scoped_name(scope, node),
+            name=make_scoped_name(scope, node),
             input_layers=input_names,
             hf_module_name=scope,
         )
@@ -139,7 +100,7 @@ def map_function_node(node, node_to_layer):
         else:
             return NNTrainerLayerDef(
                 layer_type=OP_UNSUPPORTED,
-                name=_make_scoped_name(scope, node),
+                name=make_scoped_name(scope, node),
                 properties=dict(decompose_props),
                 input_layers=input_names,
                 hf_module_name=scope,
@@ -149,19 +110,19 @@ def map_function_node(node, node_to_layer):
     if func is torch.abs:
         return NNTrainerLayerDef(
             layer_type=OP_UNSUPPORTED,
-            name=_make_scoped_name(scope, node),
+            name=make_scoped_name(scope, node),
             properties={"original_op": "abs", "decompose_to": "sqrt(pow(x, 2))"},
             input_layers=input_names,
             hf_module_name=scope,
         )
 
-    # === Clamp ===
-    if func_name in ("clamp", "clip", "clamp_min", "clamp_max"):
+    # === Clamp (registry-based) ===
+    if func_name in FUNCTION_CLAMP_NAMES:
         props = {"original_op": func_name}
-        _extract_clamp_params(node, func_name, props)
+        extract_clamp_params(node, func_name, props)
         return NNTrainerLayerDef(
             layer_type=LAYER_CLAMP,
-            name=_make_scoped_name(scope, node),
+            name=make_scoped_name(scope, node),
             properties=props,
             input_layers=input_names,
             hf_module_name=scope,
@@ -172,7 +133,7 @@ def map_function_node(node, node_to_layer):
     if act_type is not None:
         return NNTrainerLayerDef(
             layer_type=LAYER_ACTIVATION,
-            name=_make_scoped_name(scope, node, act_type),
+            name=make_scoped_name(scope, node, act_type),
             properties={"activation": act_type},
             input_layers=input_names,
         )
@@ -182,26 +143,19 @@ def map_function_node(node, node_to_layer):
     if act_type is not None:
         return NNTrainerLayerDef(
             layer_type=LAYER_ACTIVATION,
-            name=_make_scoped_name(scope, node, func_name),
+            name=make_scoped_name(scope, node, func_name),
             properties={"activation": act_type},
             input_layers=input_names,
         )
 
-    # === F.dropout ===
-    if func is F.dropout:
+    # === Identity-based ops (F.dropout, F.pad, etc.) ===
+    identity_type = FUNCTION_IDENTITY_OPS.get(func)
+    if identity_type is not None:
         return NNTrainerLayerDef(
-            layer_type=LAYER_DROPOUT,
-            name=_make_scoped_name(scope, node),
+            layer_type=identity_type,
+            name=make_scoped_name(scope, node),
             input_layers=input_names,
-        )
-
-    # === F.pad -> noop ===
-    if func is F.pad:
-        return NNTrainerLayerDef(
-            layer_type=OP_NOOP,
-            name=_make_scoped_name(scope, node),
-            input_layers=input_names,
-            hf_module_name=scope,
+            hf_module_name=scope if identity_type == OP_NOOP else "",
         )
 
     # === torch.cat ===
@@ -217,7 +171,7 @@ def map_function_node(node, node_to_layer):
         dim = node.args[1] if len(node.args) > 1 else node.kwargs.get('dim', 0)
         return NNTrainerLayerDef(
             layer_type=LAYER_GATHER,
-            name=_make_scoped_name(scope, node),
+            name=make_scoped_name(scope, node),
             properties={"axis": dim},
             input_layers=input_names,
         )
@@ -227,7 +181,7 @@ def map_function_node(node, node_to_layer):
         equation = node.args[0] if len(node.args) > 0 else ""
         return NNTrainerLayerDef(
             layer_type=LAYER_MATMUL,
-            name=_make_scoped_name(scope, node),
+            name=make_scoped_name(scope, node),
             properties={"equation": equation},
             input_layers=input_names,
             hf_module_name=scope,
@@ -237,7 +191,7 @@ def map_function_node(node, node_to_layer):
     if func_name == "scaled_dot_product_attention":
         return NNTrainerLayerDef(
             layer_type=OP_SDPA,
-            name=_make_scoped_name(scope, node, "sdpa"),
+            name=make_scoped_name(scope, node, "sdpa"),
             input_layers=input_names,
             hf_module_name=scope,
         )
@@ -250,7 +204,7 @@ def map_function_node(node, node_to_layer):
     print(f"  [WARNING] Unmapped function: {func_name} in scope={scope}")
     return NNTrainerLayerDef(
         layer_type=f"unknown_func({func_name})",
-        name=_make_scoped_name(scope, node),
+        name=make_scoped_name(scope, node),
         input_layers=input_names,
         hf_module_name=scope,
     )
@@ -273,7 +227,7 @@ def _map_cat(node, scope, input_names):
         props["concat_dimension"] = dim
     return NNTrainerLayerDef(
         layer_type=LAYER_CONCAT,
-        name=_make_scoped_name(scope, node),
+        name=make_scoped_name(scope, node),
         properties=props,
         input_layers=cat_inputs,
     )
@@ -293,7 +247,7 @@ def _map_stack(node, scope, input_names):
         dim = node.args[1]
     return NNTrainerLayerDef(
         layer_type=LAYER_CONCAT,
-        name=_make_scoped_name(scope, node),
+        name=make_scoped_name(scope, node),
         properties={"concat_dimension": dim, "stack": True},
         input_layers=stack_inputs,
     )
@@ -306,7 +260,7 @@ def _map_getitem(node, scope, node_to_layer):
         parent_layer = node_to_layer.get(parent_name)
         idx = node.args[1]
         if (parent_layer and
-                parent_layer.layer_type in _MULTI_OUTPUT_LAYER_TYPES
+                parent_layer.layer_type in MULTI_OUTPUT_LAYER_TYPES
                 and idx == 0):
             return NNTrainerLayerDef(
                 layer_type=LAYER_IDENTITY,

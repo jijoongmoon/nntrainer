@@ -17,23 +17,11 @@ from nntrainer_layers import NNTrainerLayerDef, OP_UNSUPPORTED
 from module_mapper import map_module_node, MULTI_OUTPUT_LAYER_TYPES
 from function_mapper import map_function_node
 from method_mapper import map_method_node
+from mapper_helpers import get_input_node_names, sanitize_name
 
-
-def _get_input_node_names(node):
-    """Get names of input nodes for a given FX node."""
-    names = []
-    for arg in node.args:
-        if hasattr(arg, 'name'):
-            names.append(arg.name)
-    return names
-
-
-def _sanitize_name(name: str) -> str:
-    """Convert HF module path to NNTrainer-compatible layer name.
-
-    e.g. 'model.layers.0.self_attn.q_proj' -> 'layer0_wq'
-    """
-    return name.replace(".", "_")
+# Backward-compatible aliases
+_get_input_node_names = get_input_node_names
+_sanitize_name = sanitize_name
 
 
 class NodeMapper:
