@@ -166,6 +166,7 @@ class Tracer(TorchFunctionMode):
         self.graph = torch.fx.Graph()
         self.module_stack = []
         self._tensor_to_node = {}
+        self._data_ptr_to_node = {}  # Fallback: data_ptr -> node (for detach/clone)
         self.handles = []
         self.tracing_enabled = True
         self._obj_to_path = {}
@@ -185,6 +186,15 @@ class Tracer(TorchFunctionMode):
         if isinstance(obj, Tensor):
             if id(obj) in self._tensor_to_node:
                 return self._tensor_to_node[id(obj)]
+
+            # Fallback: detach()/clone() creates new tensor objects with new
+            # id() values but the same underlying data storage. Use data_ptr()
+            # to resolve these back to their producing node.
+            dptr = obj.data_ptr()
+            if dptr != 0 and dptr in self._data_ptr_to_node:
+                node = self._data_ptr_to_node[dptr]
+                self._tensor_to_node[id(obj)] = node
+                return node
 
             if id(obj) in self._obj_to_path:
                 name = self._obj_to_path[id(obj)]
@@ -217,6 +227,10 @@ class Tracer(TorchFunctionMode):
                         operator.getitem, args=(cur_node, key), kwargs={}
                     )
                     self._tensor_to_node[id(item)] = cur_node
+                # Also track by data_ptr for detach/clone resolution
+                dptr = item.data_ptr()
+                if dptr != 0:
+                    self._data_ptr_to_node[dptr] = cur_node
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -228,8 +242,8 @@ class Tracer(TorchFunctionMode):
         if getattr(func, "__name__", None) == "__get__":
             return func(*args, **kwargs)
 
-        # Filter out __repr__
-        if func == Tensor.__repr__:
+        # Filter out __repr__ and data_ptr (used internally by tracer)
+        if func == Tensor.__repr__ or func == Tensor.data_ptr:
             return func(*args, **kwargs)
 
         out = func(*args, **kwargs)

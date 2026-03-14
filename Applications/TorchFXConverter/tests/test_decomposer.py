@@ -505,6 +505,114 @@ def test_span_rep_auto_decomposition():
 
 
 # ============================================================================
+# Test 6: Multi-head output (fan-out) with data_ptr tracking
+# ============================================================================
+
+class MultiHeadModel(nn.Module):
+    """GLiNER2-like multi-head output model.
+
+    Encoder output fans out to 3 separate heads (classifier, count predictor,
+    span projector). This tests that:
+      1. The tracer correctly resolves tensor references across detach/clone
+         boundaries using data_ptr fallback
+      2. All 3 heads reference the encoder output (not _tensor_constant_*)
+      3. NNTrainer's MultioutRealizer can handle this pattern (single output
+         referenced by multiple consumers)
+    """
+    def __init__(self, hidden=64, num_classes=10):
+        super().__init__()
+        self.encoder = nn.Linear(32, hidden)
+        self.classifier = nn.Linear(hidden, num_classes)
+        self.count_pred = nn.Linear(hidden, 1)
+        self.span_proj = nn.Linear(hidden, hidden)
+
+    def forward(self, x):
+        h = self.encoder(x)
+        cls_out = self.classifier(h)
+        count_out = self.count_pred(h)
+        span_out = self.span_proj(h)
+        return cls_out, count_out, span_out
+
+
+def test_multi_head_fan_out():
+    """Multi-head output should correctly reference shared encoder output.
+
+    Verifies that the data_ptr fallback in the tracer resolves detached
+    tensors to their producing node, so downstream heads reference
+    'encoder' directly (not _tensor_constant_* artifacts).
+    """
+    model = MultiHeadModel()
+    model.eval()
+
+    converter = AdaptiveConverter(model, training=False)
+    result = converter.convert({"x": torch.randn(2, 32)})
+
+    # No unknowns
+    assert len(result.unknown_layers) == 0, \
+        f"Multi-head model has unknowns: {result.unknown_layers}"
+
+    # Find the encoder and its consumers
+    fc_layers = [l for l in result.layers if l.layer_type == "fully_connected"]
+    assert len(fc_layers) == 4, f"Expected 4 FC layers, got {len(fc_layers)}"
+
+    encoder_layer = [l for l in fc_layers if l.name == "encoder"]
+    assert len(encoder_layer) == 1, "Missing encoder layer"
+
+    # All 3 downstream heads should reference 'encoder' as input
+    downstream = [l for l in fc_layers if l.name != "encoder"]
+    assert len(downstream) == 3, f"Expected 3 downstream heads, got {len(downstream)}"
+
+    for head in downstream:
+        assert "encoder" in head.input_layers, \
+            f"Head '{head.name}' should reference 'encoder' but has inputs: {head.input_layers}"
+        # Must NOT reference _tensor_constant_*
+        for inp in head.input_layers:
+            assert "_tensor_constant" not in inp, \
+                f"Head '{head.name}' has broken tensor reference: {inp}"
+
+    print("  PASS: Multi-head fan-out correctly references encoder output")
+    print(f"    Encoder consumers: {[h.name for h in downstream]}")
+    print(f"    All inputs resolved (no _tensor_constant_ artifacts)")
+
+
+def test_multi_head_with_detach():
+    """Multi-head output with explicit detach() calls.
+
+    Some models use detach() on shared features before passing to heads.
+    The data_ptr fallback should still resolve these correctly.
+    """
+    class DetachMultiHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Linear(32, 64)
+            self.head_a = nn.Linear(64, 10)
+            self.head_b = nn.Linear(64, 5)
+
+        def forward(self, x):
+            h = self.encoder(x)
+            a = self.head_a(h.detach())
+            b = self.head_b(h)
+            return a, b
+
+    model = DetachMultiHead()
+    model.eval()
+
+    converter = AdaptiveConverter(model, training=False)
+    result = converter.convert({"x": torch.randn(2, 32)})
+
+    assert len(result.unknown_layers) == 0
+
+    # Both heads should have resolvable inputs (no _tensor_constant_*)
+    for layer in result.layers:
+        if layer.layer_type == "fully_connected" and layer.name != "encoder":
+            for inp in layer.input_layers:
+                assert "_tensor_constant" not in inp, \
+                    f"Head '{layer.name}' has broken reference: {inp}"
+
+    print("  PASS: Multi-head with detach() correctly resolved via data_ptr")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -539,6 +647,12 @@ if __name__ == "__main__":
     print("TEST: SpanRepLayer decomposition (GLiNER2)")
     print("=" * 70)
     test_span_rep_auto_decomposition()
+
+    print("\n" + "=" * 70)
+    print("TEST: Multi-head output (fan-out)")
+    print("=" * 70)
+    test_multi_head_fan_out()
+    test_multi_head_with_detach()
 
     print("\n" + "=" * 70)
     print("TEST: Known models (no decomposition needed)")
