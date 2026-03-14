@@ -13,6 +13,21 @@ Phase 4.3 of the TorchFX converter pipeline (DESIGN.md).
 
 import json
 
+
+def _json_safe(obj):
+    """Convert non-JSON-serializable objects to strings."""
+    try:
+        json.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
+
+
+def _safe_properties(props):
+    """Return a copy of properties dict with all values JSON-serializable."""
+    return {k: _json_safe(v) for k, v in props.items()}
+
+
 from pattern_detector import ModelStructure
 from nntrainer_layers import NNTrainerLayerDef
 
@@ -93,7 +108,7 @@ class JsonEmitter:
             if layer.input_layers:
                 entry["input_layers"] = layer.input_layers
             if layer.properties:
-                entry["properties"] = dict(layer.properties)
+                entry["properties"] = _safe_properties(layer.properties)
             if layer.hf_module_name:
                 entry["hf_module_name"] = layer.hf_module_name
             if layer.hf_module_type:
@@ -148,6 +163,10 @@ class JsonEmitter:
                 "pre_ffn_norm": block.pre_ffn_norm,
                 "ffn_residual": block.ffn_residual,
             }
+            if block.post_attn_norm:
+                b["post_attn_norm"] = block.post_attn_norm
+            if block.post_ffn_norm:
+                b["post_ffn_norm"] = block.post_ffn_norm
 
             if block.attention:
                 attn = block.attention
@@ -184,7 +203,7 @@ class JsonEmitter:
                     "type": ffn.ffn_type,
                     "intermediate_size": ffn.intermediate_size,
                 }
-                if ffn.ffn_type == "swiglu":
+                if ffn.ffn_type in ("swiglu", "geglu") or ffn.ffn_type.startswith("gated_"):
                     b["ffn"]["gate_proj"] = ffn.gate_proj
                     b["ffn"]["up_proj"] = ffn.up_proj
                     b["ffn"]["down_proj"] = ffn.down_proj

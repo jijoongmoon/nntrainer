@@ -363,7 +363,8 @@ class NodeMapper:
         # === No-ops: internal torch/runtime functions ===
         if func_name in ("_set_grad_enabled", "tensor", "arange",
                           "zeros", "zeros_like", "ones", "ones_like",
-                          "full_like", "empty_like"):
+                          "full_like", "empty_like",
+                          "custom_function_call"):
             return NNTrainerLayerDef(
                 layer_type=OP_NOOP,
                 name=self._make_scoped_name(scope, node),
@@ -916,11 +917,15 @@ class NodeMapper:
                 hf_module_name=scope,
             )
 
-        # === No-ops: dtype/memory operations (safe to skip in inference) ===
+        # === No-ops: dtype/memory/creation operations (safe to skip in inference) ===
         if method_name in ("contiguous", "detach", "clone", "to", "float",
                            "half", "bfloat16", "type_as", "expand",
                            "size", "dim", "numel",
-                           "__bool__", "all", "any", "item"):
+                           "new_ones", "new_zeros", "new_full", "new_empty",
+                           "fill_", "zero_", "masked_fill", "masked_fill_",
+                           "__bool__", "__or__", "__and__",
+                           "__xor__", "__invert__",
+                           "all", "any", "item"):
             return NNTrainerLayerDef(
                 layer_type=OP_NOOP,
                 name=self._make_scoped_name(scope, node),
