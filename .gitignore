@@ -71,3 +71,4 @@ test/jni/googletest/
 ctre-unicode.hpp
 encoder.hpp
 json.hpp
+subprojects/.wraplock
