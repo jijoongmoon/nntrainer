@@ -191,7 +191,12 @@ class Tracer(TorchFunctionMode):
             # Fallback: detach()/clone() creates new tensor objects with new
             # id() values but the same underlying data storage. Use data_ptr()
             # to resolve these back to their producing node.
-            dptr = obj.data_ptr()
+            # Some tensors (meta tensors, nested tensors) have no storage,
+            # so data_ptr() raises RuntimeError — skip the fallback for those.
+            try:
+                dptr = obj.data_ptr()
+            except RuntimeError:
+                dptr = 0
             if dptr != 0 and dptr in self._data_ptr_to_node:
                 node = self._data_ptr_to_node[dptr]
                 self._tensor_to_node[id(obj)] = node
@@ -236,7 +241,10 @@ class Tracer(TorchFunctionMode):
                 # views from __torch_function__), because view/reshape creates
                 # tensors sharing the same data_ptr, which would clobber entries.
                 if track_data_ptr:
-                    dptr = item.data_ptr()
+                    try:
+                        dptr = item.data_ptr()
+                    except RuntimeError:
+                        dptr = 0
                     if dptr != 0:
                         self._data_ptr_to_node[dptr] = cur_node
 
