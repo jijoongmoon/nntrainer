@@ -181,16 +181,29 @@ def _build_gliner_core_from_config(model_dir, config):
             f"(looked for model.safetensors and pytorch_model.bin)")
 
     # Extract only the keys that belong to our core modules.
-    # GLiNER state_dict uses prefixes like:
-    #   rnn.lstm.*  -> our rnn.*
-    #   span_rep_layer.span_rep_layer.*  -> same
-    #   prompt_rep_layer.*  -> same
-    core_state = {}
+    # The actual key prefix varies by model packaging:
+    #   Direct:  rnn.lstm.*, span_rep_layer.*, prompt_rep_layer.*
+    #   Wrapped: model.rnn.lstm.*, model.span_rep_layer.*, ...
+    # Auto-detect the prefix by searching for a known key pattern.
+    model_prefix = ""
+    for key in full_state:
+        if "rnn.lstm." in key or "span_rep_layer." in key:
+            # Extract everything before the known suffix
+            for marker in ("rnn.lstm.", "span_rep_layer."):
+                idx = key.find(marker)
+                if idx >= 0:
+                    model_prefix = key[:idx]
+                    break
+            if model_prefix:
+                break
+
     prefix_map = {
-        "rnn.lstm.": "rnn.",           # LstmSeq2SeqEncoder.lstm -> raw LSTM
-        "span_rep_layer.": "span_rep_layer.",
-        "prompt_rep_layer.": "prompt_rep_layer.",
+        f"{model_prefix}rnn.lstm.": "rnn.",
+        f"{model_prefix}span_rep_layer.": "span_rep_layer.",
+        f"{model_prefix}prompt_rep_layer.": "prompt_rep_layer.",
     }
+
+    core_state = {}
     for key, value in full_state.items():
         for src_prefix, dst_prefix in prefix_map.items():
             if key.startswith(src_prefix):
@@ -199,13 +212,17 @@ def _build_gliner_core_from_config(model_dir, config):
                 break
 
     missing, unexpected = core.load_state_dict(core_state, strict=False)
-    # Filter out expected missing keys (e.g. if no RNN)
     real_missing = [k for k in missing if not (
         not has_rnn and k.startswith("rnn.")
     )]
     if real_missing:
+        # Show actual keys for debugging
+        sample_keys = [k for k in sorted(full_state.keys())
+                       if any(s in k for s in ("rnn", "span_rep", "prompt_rep"))][:10]
         raise RuntimeError(
-            f"Missing weights for GLiNER core: {real_missing}")
+            f"Missing weights for GLiNER core: {real_missing}\n"
+            f"  Detected prefix: '{model_prefix}'\n"
+            f"  Sample keys in weights file: {sample_keys}")
 
     return core
 
