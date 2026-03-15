@@ -337,7 +337,13 @@ def map_module_node(node, modules, node_to_layer):
             hf_module_type=module_type,
         )
 
-    # Unknown module type
+    # Unknown module type -- try plugin registry as last resort
+    from plugin_registry import get_global_registry
+    plugin_registry = get_global_registry()
+    plugin_result = plugin_registry.map_module(module, module_name, input_names)
+    if plugin_result is not None:
+        return plugin_result
+
     print(f"  [WARNING] Unknown module type: {module_type} at {module_name}")
     return NNTrainerLayerDef(
         layer_type=f"unknown({module_type})",

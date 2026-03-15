@@ -27,7 +27,7 @@ import torch
 def convert_model(model_name_or_path, output_dir, formats=None,
                   batch_size=1, seq_len=8, dtype="float32",
                   convert_weights=False, verbose=True,
-                  model_name=None):
+                  model_name=None, plugin_config=None):
     """Run the full conversion pipeline.
 
     Args:
@@ -131,11 +131,21 @@ def convert_model(model_name_or_path, output_dir, formats=None,
             input_kwargs["decoder_input_ids"] = torch.randint(
                 0, min(vocab_size, 1000), (1, max(1, seq_len // 2)))
 
+    # Step 2.5: Load plugin registry (custom layer mappings)
+    plugin_registry = None
+    if plugin_config:
+        from plugin_registry import PluginRegistry
+        plugin_registry = PluginRegistry.from_config(plugin_config)
+        if verbose:
+            print(f"Loaded {len(plugin_registry)} custom layer plugin(s) "
+                  f"from {plugin_config}")
+
     # Step 3: Run conversion pipeline
     if verbose:
         print("Running conversion pipeline...")
 
-    converter = AdaptiveConverter(model, config)
+    converter = AdaptiveConverter(model, config,
+                                 plugin_registry=plugin_registry)
     result = converter.convert(input_kwargs)
 
     layers = result.layers
@@ -250,6 +260,8 @@ Examples:
     parser.add_argument("--model-name", default=None,
                         help="Override output file naming (default: derived "
                              "from --model). e.g. --model-name KaLM-embedding")
+    parser.add_argument("--plugin-config",
+                        help="JSON/YAML config file for custom layer plugins")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress progress messages")
 
@@ -269,6 +281,7 @@ Examples:
         convert_weights=args.weights,
         verbose=not args.quiet,
         model_name=args.model_name,
+        plugin_config=args.plugin_config,
     )
 
 

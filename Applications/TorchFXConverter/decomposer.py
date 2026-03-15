@@ -419,7 +419,8 @@ class AdaptiveConverter:
         result.summary()
     """
 
-    def __init__(self, model, model_config=None, training=False):
+    def __init__(self, model, model_config=None, training=False,
+                 plugin_registry=None):
         """
         Args:
             model: The HuggingFace model to convert.
@@ -427,10 +428,18 @@ class AdaptiveConverter:
             training: If False (default), dropout layers are removed from
                 the output since they are no-ops during inference. If True,
                 dropout layers are preserved for training use.
+            plugin_registry: Optional PluginRegistry for custom layer mappings.
+                If provided, registered custom module types are treated as
+                leaf modules (not decomposed) and mapped via the registry.
         """
         self.model = model
         self.config = model_config
         self.training = training
+        if plugin_registry is not None:
+            from plugin_registry import get_global_registry, _global_registry
+            # Merge into global registry so module_mapper can find them
+            for matcher, spec in plugin_registry._entries:
+                _global_registry.register(matcher, spec)
 
     def convert(self, input_kwargs, max_passes=3):
         """Run the adaptive conversion pipeline.

@@ -155,6 +155,10 @@ def _build_leaf_check(leaf_modules, exclude_leaf_types=None):
             return True
         if _is_gelu_variant(module):
             return True
+        # Check plugin registry for custom module types
+        from plugin_registry import get_global_registry
+        if get_global_registry().lookup(module) is not None:
+            return True
         return False
     return is_leaf
 
