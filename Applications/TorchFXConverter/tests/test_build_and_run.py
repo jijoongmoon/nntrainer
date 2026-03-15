@@ -26,9 +26,10 @@ import unittest
 CONVERTER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, CONVERTER_DIR)
 
-# Path to the nntrainer source root
+# Path to the nntrainer source root and build output
 NNTRAINER_ROOT = os.path.abspath(os.path.join(CONVERTER_DIR, "..", ".."))
 BUILD_DIR = os.path.join(NNTRAINER_ROOT, "builddir")
+JNI_DIR = os.path.join(CONVERTER_DIR, "jni")
 
 # ---- Tiny model configurations for offline testing ----
 
@@ -271,6 +272,23 @@ MODEL_CONFIGS = {
     "t5gemma2": T5GEMMA2_CONFIG,
 }
 
+# Mapping: config_name -> meson executable target name.
+# Must match the entries in TorchFXConverter/jni/meson.build.
+MODEL_BUILD_TARGETS = {
+    "qwen3": "converter_qwen3_gen_test",
+    "llama": "converter_llama_test",
+    "qwen3_tied": "converter_qwen3_tied_test",
+    "qwen3_06b": "converter_qwen3_06b_test",
+    "qwen3_17b": "converter_qwen3_17b_test",
+    "granite_40": "converter_granite_40_test",
+    "lfm_700m": "converter_lfm_700m_test",
+    "qwen3_embedding": "converter_qwen3_embedding_test",
+    "embedding_gemma": "converter_embedding_gemma_test",
+    "kalm_embedding": "converter_kalm_embedding_test",
+    "multilingual_e5": "converter_multilingual_e5_test",
+    "gliner2": "converter_gliner2_test",
+}
+
 
 # ---- Model creation helpers ----
 
@@ -500,6 +518,14 @@ def _run_test(build_dir, executable):
     return result.returncode == 0, result.stdout, result.stderr
 
 
+def _meson_reconfigure(build_dir):
+    """Reconfigure meson to pick up new/removed source files."""
+    cmd = ["meson", "setup", "--reconfigure", build_dir]
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            timeout=120, cwd=NNTRAINER_ROOT)
+    return result.returncode == 0, result.stdout, result.stderr
+
+
 class TestConverterBuildAndRun(unittest.TestCase):
     """Test that converter output compiles and runs with NNTrainer."""
 
@@ -578,32 +604,80 @@ class TestConverterBuildAndRun(unittest.TestCase):
     # ---- Common pipeline ----
 
     def _run_model_test(self, config_name):
-        """Run full pipeline for a model config."""
+        """Run full pipeline: create model -> convert -> build -> run.
+
+        Steps:
+          1. Create a tiny HuggingFace model in a temp directory
+          2. Run converter.py to generate C++ header + source
+          3. Copy generated files to jni/ directory
+          4. Reconfigure meson to detect the new source files
+          5. Build the model-specific test executable with ninja
+          6. Run the executable and verify NNTrainer initializes it
+        """
         config = MODEL_CONFIGS[config_name]
+        generated_files = []
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model_dir = os.path.join(tmpdir, "model")
-            output_dir = os.path.join(tmpdir, "output")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                model_dir = os.path.join(tmpdir, "model")
+                output_dir = os.path.join(tmpdir, "output")
 
-            # Step 1: Create local model
-            if not _create_local_model(config, model_dir):
-                self.skipTest("transformers not available or model "
-                              "creation failed")
+                # Step 1: Create local model
+                if not _create_local_model(config, model_dir):
+                    self.skipTest("transformers not available or model "
+                                  "creation failed")
 
-            # Step 2: Convert
-            ok, stdout, stderr = _run_converter(
-                model_dir, output_dir, model_name=config_name)
-            self.assertTrue(ok, f"Converter failed:\n{stderr}")
+                # Step 2: Convert
+                ok, stdout, stderr = _run_converter(
+                    model_dir, output_dir, model_name=config_name)
+                self.assertTrue(ok, f"Converter failed:\n{stderr}")
 
-            # Step 3: Verify output files exist
-            cpp_files = [f for f in os.listdir(output_dir)
-                         if f.endswith(('.h', '.cpp'))]
-            self.assertGreaterEqual(len(cpp_files), 2,
-                                    f"Expected .h and .cpp, got: {cpp_files}")
+                # Step 3: Verify output files exist
+                cpp_files = [f for f in os.listdir(output_dir)
+                             if f.endswith(('.h', '.cpp'))]
+                self.assertGreaterEqual(len(cpp_files), 2,
+                                        f"Expected .h and .cpp, got: "
+                                        f"{cpp_files}")
 
-            # Log the output
-            print(f"\n[{config_name}] Converter output:")
-            print(stdout)
+                print(f"\n[{config_name}] Converter output:")
+                print(stdout)
+
+                # Step 4: Copy generated C++ files to jni/ for meson build
+                if config_name not in MODEL_BUILD_TARGETS:
+                    return  # no build target defined, conversion-only test
+
+                for f in cpp_files:
+                    src = os.path.join(output_dir, f)
+                    dst = os.path.join(JNI_DIR, f)
+                    shutil.copy2(src, dst)
+                    generated_files.append(dst)
+
+            # Step 5: Reconfigure meson to pick up the new files
+            ok, stdout, stderr = _meson_reconfigure(BUILD_DIR)
+            self.assertTrue(ok,
+                            f"meson reconfigure failed:\n{stderr[-500:]}")
+
+            # Step 6: Build the test executable
+            target_name = MODEL_BUILD_TARGETS[config_name]
+            target = (f"Applications/TorchFXConverter/jni/"
+                      f"{target_name}")
+            ok, stdout, stderr = _build_test(BUILD_DIR, target)
+            self.assertTrue(ok, f"Build failed for {config_name}:\n"
+                            f"stdout: {stdout[-1000:]}\n"
+                            f"stderr: {stderr[-1000:]}")
+
+            # Step 7: Run the executable
+            ok, stdout, stderr = _run_test(BUILD_DIR, target)
+            self.assertTrue(ok,
+                            f"Run failed for {config_name}:\n"
+                            f"stdout: {stdout}\nstderr: {stderr}")
+            self.assertIn("Model initialized successfully", stdout)
+
+        finally:
+            # Cleanup: remove generated files from jni/
+            for f in generated_files:
+                if os.path.exists(f):
+                    os.remove(f)
 
     def test_prebuilt_qwen3_executable(self):
         """Run the pre-built converter_qwen3_test executable."""

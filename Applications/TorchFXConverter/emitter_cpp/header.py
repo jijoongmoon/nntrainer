@@ -85,6 +85,7 @@ def emit_structured_header(structure, blocks_info, model_name=None):
     L.append(f"#ifndef {guard}")
     L.append(f"#define {guard}")
     L.append(f"")
+    L.append(f"#include <climits>")
     L.append(f"#include <layer.h>")
     L.append(f"#include <model.h>")
     L.append(f"")

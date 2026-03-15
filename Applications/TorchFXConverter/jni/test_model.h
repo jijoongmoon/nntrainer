@@ -4,6 +4,7 @@
 #ifndef __TEST_MODEL_H__
 #define __TEST_MODEL_H__
 
+#include <climits>
 #include <layer.h>
 #include <model.h>
 

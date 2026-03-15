@@ -44,6 +44,7 @@ _CLASS_NAME_MAP = {
     "phi": "PhiCausalLM",
     "bert": "BertModel",
     "roberta": "RobertaModel",
+    "xlm-roberta": "XlmRobertaModel",
     "t5": "T5Model",
     "mt5": "MT5Model",
     "lfm2": "Lfm2CausalLM",
