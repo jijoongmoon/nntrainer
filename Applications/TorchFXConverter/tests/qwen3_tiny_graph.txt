@@ -7,6 +7,7 @@ LEAF MODULE NODES:
 ====================================================================================================
   model.embed_tokens                                 type=Embedding
     args: ['input_ids']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.num_embeddings = 151936
@@ -15,6 +16,7 @@ LEAF MODULE NODES:
     meta.consumer_module = [('model.rotary_emb', 0), ('model.layers.0', 0), ('model.layers.0.input_layernorm', 0)]
   model.layers.0.input_layernorm                     type=Qwen3RMSNorm
     args: ['model_embed_tokens']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -23,6 +25,7 @@ LEAF MODULE NODES:
     meta.consumer_module = [('model.layers.0.self_attn', 'hidden_states'), ('model.layers.0.self_attn.q_proj', 0), ('model.layers.0.self_attn.k_proj', 0), ('model.layers.0.self_attn.v_proj', 0)]
   model.layers.0.self_attn.q_proj                    type=Linear
     args: ['model_layers_0_input_layernorm']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -30,6 +33,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.0.self_attn.q_proj
   model.layers.0.self_attn.q_norm                    type=Qwen3RMSNorm
     args: ['model_layers_0_self_attn_view']
+    meta.output_shape = (1, 8, 4, 16)
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -37,6 +41,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.0.self_attn.q_norm
   model.layers.0.self_attn.k_proj                    type=Linear
     args: ['model_layers_0_input_layernorm']
+    meta.output_shape = (1, 8, 32)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -44,6 +49,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.0.self_attn.k_proj
   model.layers.0.self_attn.k_norm                    type=Qwen3RMSNorm
     args: ['model_layers_0_self_attn_view_1']
+    meta.output_shape = (1, 8, 2, 16)
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -51,6 +57,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.0.self_attn.k_norm
   model.layers.0.self_attn.v_proj                    type=Linear
     args: ['model_layers_0_input_layernorm']
+    meta.output_shape = (1, 8, 32)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -58,6 +65,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.0.self_attn.v_proj
   model.layers.0.self_attn.o_proj                    type=Linear
     args: ['model_layers_0_self_attn_contiguous_1']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -65,6 +73,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.0.self_attn.o_proj
   model.layers.0.post_attention_layernorm            type=Qwen3RMSNorm
     args: ['model_layers_0_add']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -73,6 +82,7 @@ LEAF MODULE NODES:
     meta.consumer_module = [('model.layers.0.mlp', 0), ('model.layers.0.mlp.gate_proj', 0), ('model.layers.0.mlp.up_proj', 0)]
   model.layers.0.mlp.gate_proj                       type=Linear
     args: ['model_layers_0_post_attention_layernorm']
+    meta.output_shape = (1, 8, 128)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -81,6 +91,7 @@ LEAF MODULE NODES:
     meta.consumer_module = [('model.layers.0.mlp.act_fn', 0)]
   model.layers.0.mlp.up_proj                         type=Linear
     args: ['model_layers_0_post_attention_layernorm']
+    meta.output_shape = (1, 8, 128)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -88,6 +99,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.0.mlp.up_proj
   model.layers.0.mlp.down_proj                       type=Linear
     args: ['model_layers_0_mlp_mul']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 128
@@ -95,6 +107,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.0.mlp.down_proj
   model.layers.1.input_layernorm                     type=Qwen3RMSNorm
     args: ['model_layers_0_add_1']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -103,6 +116,7 @@ LEAF MODULE NODES:
     meta.consumer_module = [('model.layers.1.self_attn', 'hidden_states'), ('model.layers.1.self_attn.q_proj', 0), ('model.layers.1.self_attn.k_proj', 0), ('model.layers.1.self_attn.v_proj', 0)]
   model.layers.1.self_attn.q_proj                    type=Linear
     args: ['model_layers_1_input_layernorm']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -110,6 +124,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.1.self_attn.q_proj
   model.layers.1.self_attn.q_norm                    type=Qwen3RMSNorm
     args: ['model_layers_1_self_attn_view']
+    meta.output_shape = (1, 8, 4, 16)
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -117,6 +132,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.1.self_attn.q_norm
   model.layers.1.self_attn.k_proj                    type=Linear
     args: ['model_layers_1_input_layernorm']
+    meta.output_shape = (1, 8, 32)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -124,6 +140,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.1.self_attn.k_proj
   model.layers.1.self_attn.k_norm                    type=Qwen3RMSNorm
     args: ['model_layers_1_self_attn_view_1']
+    meta.output_shape = (1, 8, 2, 16)
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -131,6 +148,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.1.self_attn.k_norm
   model.layers.1.self_attn.v_proj                    type=Linear
     args: ['model_layers_1_input_layernorm']
+    meta.output_shape = (1, 8, 32)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -138,6 +156,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.1.self_attn.v_proj
   model.layers.1.self_attn.o_proj                    type=Linear
     args: ['model_layers_1_self_attn_contiguous_1']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -145,6 +164,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.1.self_attn.o_proj
   model.layers.1.post_attention_layernorm            type=Qwen3RMSNorm
     args: ['model_layers_1_add']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -153,6 +173,7 @@ LEAF MODULE NODES:
     meta.consumer_module = [('model.layers.1.mlp', 0), ('model.layers.1.mlp.gate_proj', 0), ('model.layers.1.mlp.up_proj', 0)]
   model.layers.1.mlp.gate_proj                       type=Linear
     args: ['model_layers_1_post_attention_layernorm']
+    meta.output_shape = (1, 8, 128)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -161,6 +182,7 @@ LEAF MODULE NODES:
     meta.consumer_module = [('model.layers.1.mlp.act_fn', 0)]
   model.layers.1.mlp.up_proj                         type=Linear
     args: ['model_layers_1_post_attention_layernorm']
+    meta.output_shape = (1, 8, 128)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
@@ -168,6 +190,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.1.mlp.up_proj
   model.layers.1.mlp.down_proj                       type=Linear
     args: ['model_layers_1_mlp_mul']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 128
@@ -175,6 +198,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.layers.1.mlp.down_proj
   model.norm                                         type=Qwen3RMSNorm
     args: ['model_layers_1_add_1']
+    meta.output_shape = (1, 8, 64)
     meta.has_weight = True
     meta.has_bias = False
     meta.is_rmsnorm = True
@@ -182,6 +206,7 @@ LEAF MODULE NODES:
     meta.producer_module = model.norm
   lm_head                                            type=Linear
     args: ['getitem']
+    meta.output_shape = (1, 8, 151936)
     meta.has_weight = True
     meta.has_bias = False
     meta.in_features = 64
