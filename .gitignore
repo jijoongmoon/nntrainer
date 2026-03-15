@@ -72,3 +72,11 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 subprojects/.wraplock
+
+# meson subprojects (fetched during build)
+subprojects/googletest/
+subprojects/iniparser/
+
+# TorchFXConverter generated output
+Applications/TorchFXConverter/output/
+Applications/TorchFXConverter/test_model/*.safetensors
