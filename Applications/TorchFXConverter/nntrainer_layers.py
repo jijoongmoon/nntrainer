@@ -143,6 +143,14 @@ LAYER_RNN = "rnn"
 LAYER_GRUCELL = "grucell"
 LAYER_LSTMCELL = "lstmcell"
 LAYER_RNNCELL = "rnncell"
+LAYER_ZONEOUT_LSTMCELL = "zoneout_lstmcell"
+
+# Loss layers
+LAYER_LOSS_MSE = "mse"
+LAYER_LOSS_CROSS_ENTROPY_SOFTMAX = "cross_softmax"
+LAYER_LOSS_CROSS_ENTROPY_SIGMOID = "cross_sigmoid"
+LAYER_LOSS_KLD = "kld"
+LAYER_LOSS_CONSTANT_DERIVATIVE = "constant_derivative"
 
 # Convolution & pooling
 LAYER_CONV1D = "conv1d"

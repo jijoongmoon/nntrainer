@@ -21,6 +21,8 @@ from nntrainer_layers import (
     LAYER_REDUCE_MEAN, LAYER_REDUCE_SUM, LAYER_FLATTEN,
     LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_CONCAT, LAYER_POOLING2D,
     LAYER_GATHER, LAYER_SLICE, LAYER_TOPK, LAYER_ARGSORT,
+    LAYER_LOSS_MSE, LAYER_LOSS_CROSS_ENTROPY_SOFTMAX,
+    LAYER_LOSS_CROSS_ENTROPY_SIGMOID, LAYER_LOSS_KLD,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
     OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE, OP_SDPA, OP_NOOP, OP_UNSUPPORTED,
 )
@@ -106,6 +108,25 @@ FUNCTION_ACTIVATION_OPS = {
 # Function activation by name (for torch.tanh / F.tanh ambiguity)
 FUNCTION_ACTIVATION_NAMES = {
     "tanh": ACT_TANH,
+    "log_softmax": ACT_SOFTMAX,  # log_softmax ≈ softmax for NNTrainer mapping
+}
+
+# Function-based loss ops: callable -> layer_type
+FUNCTION_LOSS_OPS = {
+    F.cross_entropy:        LAYER_LOSS_CROSS_ENTROPY_SOFTMAX,
+    F.mse_loss:             LAYER_LOSS_MSE,
+    F.kl_div:               LAYER_LOSS_KLD,
+    F.binary_cross_entropy_with_logits: LAYER_LOSS_CROSS_ENTROPY_SIGMOID,
+}
+
+# Loss function name mappings (for name-based lookup)
+FUNCTION_LOSS_NAMES = {
+    "cross_entropy":        LAYER_LOSS_CROSS_ENTROPY_SOFTMAX,
+    "mse_loss":             LAYER_LOSS_MSE,
+    "kl_div":               LAYER_LOSS_KLD,
+    "binary_cross_entropy_with_logits": LAYER_LOSS_CROSS_ENTROPY_SIGMOID,
+    "l1_loss":              LAYER_LOSS_MSE,  # L1 mapped to MSE as closest
+    "nll_loss":             LAYER_LOSS_CROSS_ENTROPY_SOFTMAX,  # NLL after log_softmax
 }
 
 # Function-based identity ops: callable -> layer_type
@@ -137,7 +158,7 @@ FUNCTION_POOLING_NAMES = frozenset({
 })
 
 # Layer types that produce tuple outputs (for operator.getitem handling)
-MULTI_OUTPUT_LAYER_TYPES = frozenset({"gru", "lstm", "rnn"})
+MULTI_OUTPUT_LAYER_TYPES = frozenset({"gru", "lstm", "rnn", "lstmcell"})
 
 # ---------------------------------------------------------------------------
 # Method-based ops: maps method_name (str) -> layer_type

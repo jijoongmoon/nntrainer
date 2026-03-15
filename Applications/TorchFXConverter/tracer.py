@@ -81,6 +81,17 @@ LEAF_MODULES = (
     nn.GRU,
     nn.LSTM,
     nn.RNN,
+    # Recurrent cell layers -> grucell / lstmcell / rnncell
+    nn.GRUCell,
+    nn.LSTMCell,
+    nn.RNNCell,
+    # Identity (passthrough)
+    nn.Identity,
+    # Loss layers
+    nn.CrossEntropyLoss,
+    nn.MSELoss,
+    nn.KLDivLoss,
+    nn.BCEWithLogitsLoss,
 )
 
 

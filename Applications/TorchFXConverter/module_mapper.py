@@ -9,12 +9,15 @@ import torch.nn as nn
 from nntrainer_layers import (
     NNTrainerLayerDef,
     LAYER_FC, LAYER_EMBEDDING, LAYER_RMS_NORM, LAYER_LAYER_NORM,
-    LAYER_ACTIVATION, LAYER_DROPOUT,
+    LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_IDENTITY,
     LAYER_CONV1D, LAYER_CONV2D, LAYER_CONV2D_TRANSPOSE, LAYER_DEPTHWISE_CONV2D,
     LAYER_POOLING2D, LAYER_UPSAMPLE2D, LAYER_BATCH_NORM,
     LAYER_GROUP_NORM, LAYER_INSTANCE_NORM,
     LAYER_CHANNEL_SHUFFLE, LAYER_L2NORM, LAYER_MHA,
     LAYER_GRU, LAYER_LSTM, LAYER_RNN,
+    LAYER_GRUCELL, LAYER_LSTMCELL, LAYER_RNNCELL,
+    LAYER_LOSS_MSE, LAYER_LOSS_CROSS_ENTROPY_SOFTMAX,
+    LAYER_LOSS_CROSS_ENTROPY_SIGMOID, LAYER_LOSS_KLD,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
 )
 from tracer import _is_rmsnorm, _is_gelu_variant
@@ -26,7 +29,10 @@ _get_input_node_names = get_input_node_names
 
 
 # Set of layer types that return tuple outputs (output, hidden_state)
-MULTI_OUTPUT_LAYER_TYPES = frozenset({LAYER_GRU, LAYER_LSTM, LAYER_RNN})
+MULTI_OUTPUT_LAYER_TYPES = frozenset({
+    LAYER_GRU, LAYER_LSTM, LAYER_RNN,
+    LAYER_LSTMCELL,  # LSTMCell returns (h, c) tuple
+})
 
 # Activation module type -> activation constant
 _MODULE_ACTIVATIONS = [
@@ -279,6 +285,58 @@ def map_module_node(node, modules, node_to_layer):
     if isinstance(module, nn.RNN):
         return _map_rnn_module(module, module_name, module_type, input_names, LAYER_RNN)
 
+    # RNN cell family
+    if isinstance(module, nn.GRUCell):
+        return _map_rnn_cell(module, module_name, module_type, input_names, LAYER_GRUCELL)
+    if isinstance(module, nn.LSTMCell):
+        return _map_rnn_cell(module, module_name, module_type, input_names, LAYER_LSTMCELL)
+    if isinstance(module, nn.RNNCell):
+        return _map_rnn_cell(module, module_name, module_type, input_names, LAYER_RNNCELL)
+
+    # Identity (passthrough)
+    if isinstance(module, nn.Identity):
+        return NNTrainerLayerDef(
+            layer_type=LAYER_IDENTITY,
+            name=_sanitize_name(module_name),
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+        )
+
+    # Loss layers
+    if isinstance(module, nn.CrossEntropyLoss):
+        return NNTrainerLayerDef(
+            layer_type=LAYER_LOSS_CROSS_ENTROPY_SOFTMAX,
+            name=_sanitize_name(module_name),
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+        )
+    if isinstance(module, nn.MSELoss):
+        return NNTrainerLayerDef(
+            layer_type=LAYER_LOSS_MSE,
+            name=_sanitize_name(module_name),
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+        )
+    if isinstance(module, nn.KLDivLoss):
+        return NNTrainerLayerDef(
+            layer_type=LAYER_LOSS_KLD,
+            name=_sanitize_name(module_name),
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+        )
+    if isinstance(module, nn.BCEWithLogitsLoss):
+        return NNTrainerLayerDef(
+            layer_type=LAYER_LOSS_CROSS_ENTROPY_SIGMOID,
+            name=_sanitize_name(module_name),
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+        )
+
     # Unknown module type
     print(f"  [WARNING] Unknown module type: {module_type} at {module_name}")
     return NNTrainerLayerDef(
@@ -481,6 +539,42 @@ def _map_rnn_module(module, module_name, module_type, input_names, layer_type):
     )
     layer_def.properties["_weight_hh_key"] = weight_keys["weight_hh"]
     if module.bias:
+        layer_def.properties["_bias_hh_key"] = bias_keys["bias_hh"]
+
+    return layer_def
+
+
+def _map_rnn_cell(module, module_name, module_type, input_names, layer_type):
+    """Map nn.GRUCell/LSTMCell/RNNCell to NNTrainer cell layer def."""
+    props = {
+        "unit": module.hidden_size,
+    }
+
+    has_bias = module.bias
+    weight_keys = {
+        "weight_ih": f"{module_name}.weight_ih",
+        "weight_hh": f"{module_name}.weight_hh",
+    }
+    bias_keys = {}
+    if has_bias:
+        bias_keys["bias_ih"] = f"{module_name}.bias_ih"
+        bias_keys["bias_hh"] = f"{module_name}.bias_hh"
+
+    layer_def = NNTrainerLayerDef(
+        layer_type=layer_type,
+        name=_sanitize_name(module_name),
+        properties=props,
+        input_layers=input_names,
+        hf_module_name=module_name,
+        hf_module_type=module_type,
+        has_weight=True,
+        has_bias=has_bias,
+        weight_hf_key=weight_keys["weight_ih"],
+        bias_hf_key=bias_keys.get("bias_ih", ""),
+        transpose_weight=True,
+    )
+    layer_def.properties["_weight_hh_key"] = weight_keys["weight_hh"]
+    if has_bias:
         layer_def.properties["_bias_hh_key"] = bias_keys["bias_hh"]
 
     return layer_def

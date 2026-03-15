@@ -24,6 +24,7 @@ from op_registry import (
     FUNCTION_IDENTITY_OPS, FUNCTION_CLAMP_NAMES,
     FUNCTION_POOLING_NAMES, FUNCTION_INTERPOLATE_NAMES,
     FUNCTION_NORMALIZE_NAMES,
+    FUNCTION_LOSS_OPS, FUNCTION_LOSS_NAMES,
     MULTI_OUTPUT_LAYER_TYPES,
 )
 from mapper_helpers import (
@@ -149,6 +150,26 @@ def map_function_node(node, node_to_layer):
             name=make_scoped_name(scope, node, func_name),
             properties={"activation": act_type},
             input_layers=input_names,
+        )
+
+    # === Loss functions (table lookup by callable) ===
+    loss_type = FUNCTION_LOSS_OPS.get(func)
+    if loss_type is not None:
+        return NNTrainerLayerDef(
+            layer_type=loss_type,
+            name=make_scoped_name(scope, node),
+            input_layers=input_names,
+            hf_module_name=scope,
+        )
+
+    # === Loss functions (by name) ===
+    loss_type = FUNCTION_LOSS_NAMES.get(func_name)
+    if loss_type is not None:
+        return NNTrainerLayerDef(
+            layer_type=loss_type,
+            name=make_scoped_name(scope, node),
+            input_layers=input_names,
+            hf_module_name=scope,
         )
 
     # === Identity-based ops (F.dropout, F.pad, etc.) ===
