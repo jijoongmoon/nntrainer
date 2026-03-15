@@ -1,17 +1,29 @@
-"""C++ registerCustomLayers() method generation."""
+"""C++ registerCustomLayers() and initialize() method generation."""
 
 from .helpers import _class_name
 
 
 # Known NNTrainer layer type -> C++ class name mapping
+# These must match the actual class names in CausalLM/layers/
 CUSTOM_LAYER_CLASS = {
     "embedding_layer": "EmbeddingLayer",
-    "tie_word_embeddings": "TieWordEmbeddingLayer",
+    "tie_word_embeddings": "TieWordEmbedding",
     "rms_norm": "RMSNormLayer",
     "reshaped_rms_norm": "ReshapedRMSNormLayer",
-    "mha_core": "MHACore",
+    "mha_core": "MHACoreLayer",
     "swiglu": "SwiGLULayer",
     "short_conv": "ShortConvLayer",
+}
+
+# C++ class name -> header file mapping
+CUSTOM_LAYER_HEADER = {
+    "EmbeddingLayer": "embedding_layer.h",
+    "TieWordEmbedding": "tie_word_embedding.h",
+    "RMSNormLayer": "rms_norm.h",
+    "ReshapedRMSNormLayer": "reshaped_rms_norm.h",
+    "MHACoreLayer": "mha_core.h",
+    "SwiGLULayer": "swiglu.h",
+    "ShortConvLayer": "short_conv.h",
 }
 
 
@@ -32,12 +44,12 @@ def collect_custom_layer_classes(structure, norm_type, attn_block):
     if s.embedding:
         classes.add("EmbeddingLayer")
     if s.tie_word_embeddings:
-        classes.add("TieWordEmbeddingLayer")
+        classes.add("TieWordEmbedding")
     if norm_type == "rms_norm":
         classes.add("RMSNormLayer")
 
     if attn_block:
-        classes.add("MHACore")
+        classes.add("MHACoreLayer")
         if attn_block.attention.has_qk_norm:
             classes.add("ReshapedRMSNormLayer")
 
@@ -53,6 +65,23 @@ def collect_custom_layer_classes(structure, norm_type, attn_block):
                 classes.add(cls)
 
     return sorted(classes)
+
+
+def emit_custom_layer_includes(custom_classes):
+    """Generate #include directives for custom layer headers.
+
+    Args:
+        custom_classes: sorted list of custom layer class names
+
+    Returns:
+        String of #include lines.
+    """
+    L = []
+    for cls in custom_classes:
+        header = CUSTOM_LAYER_HEADER.get(cls)
+        if header:
+            L.append(f"#include <{header}>")
+    return "\n".join(L)
 
 
 def emit_register_custom_layers(cname, custom_classes):
@@ -74,11 +103,47 @@ def emit_register_custom_layers(cname, custom_classes):
 
     for cls in custom_classes:
         L.append(f"    app_context->registerFactory("
-                 f"nntrainer::createLayer<{cls}>);")
+                 f"nntrainer::createLayer<causallm::{cls}>);")
 
     L.append(f"  }} catch (std::invalid_argument &e) {{")
     L.append(f'    std::cerr << "failed to register factory, reason: " '
              f'<< e.what() << std::endl;')
+    L.append(f"  }}")
+    L.append(f"}}")
+    L.append(f"")
+    return "\n".join(L)
+
+
+def emit_initialize(cname):
+    """Generate initialize() method that wires up the full model pipeline.
+
+    Calls registerCustomLayers() -> constructModel() -> compile -> initialize.
+
+    Args:
+        cname: C++ class name
+    """
+    L = []
+    L.append(f"void {cname}::initialize() {{")
+    L.append(f"  // Set default sequence length if not configured")
+    L.append(f"  if (INIT_SEQ_LEN == 0) {{")
+    L.append(f"    INIT_SEQ_LEN = 8;")
+    L.append(f"  }}")
+    L.append(f"")
+    L.append(f"  registerCustomLayers();")
+    L.append(f"  constructModel();")
+    L.append(f"")
+    L.append(f"  model->setProperty({{")
+    L.append(f'    withKey("batch_size", 1),')
+    L.append(f'    withKey("epochs", "1"),')
+    L.append(f'    withKey("model_tensor_type", "FP32-FP32")')
+    L.append(f"  }});")
+    L.append(f"")
+    L.append(f"  if (model->compile(ml::train::ExecutionMode::INFERENCE)) {{")
+    L.append(f'    throw std::invalid_argument("Model compilation failed.");')
+    L.append(f"  }}")
+    L.append(f"")
+    L.append(f"  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {{")
+    L.append(f'    throw std::invalid_argument("Model initialization failed.");')
     L.append(f"  }}")
     L.append(f"}}")
     L.append(f"")

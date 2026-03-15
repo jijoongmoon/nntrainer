@@ -105,7 +105,7 @@ def emit_attention_method(cname, block):
             'withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS)')
     mha_props.append('withKey("max_new_tokens", NUM_TO_GENERATE)')
     mha_props.append(
-        f'withKey("input_layers", {{{q_in}, {k_in}, V}})')
+        f'withKey("input_layers", {q_in} + "," + {k_in} + "," + V)')
     L.extend(_cpp_layer("mha_core", mha_props))
 
     # O layer
