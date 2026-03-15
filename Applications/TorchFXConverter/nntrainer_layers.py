@@ -143,8 +143,16 @@ LAYER_RNNCELL = "rnncell"
 # Convolution & pooling
 LAYER_CONV1D = "conv1d"
 LAYER_CONV2D = "conv2d"
+LAYER_CONV2D_TRANSPOSE = "conv2dtranspose"
+LAYER_DEPTHWISE_CONV2D = "depthwiseconv2d"
 LAYER_POOLING2D = "pooling2d"
+LAYER_UPSAMPLE2D = "upsample2d"
 LAYER_BATCH_NORM = "batch_normalization"
+
+# Utility layers
+LAYER_CHANNEL_SHUFFLE = "channel_shuffle"
+LAYER_L2NORM = "preprocess_l2norm"
+LAYER_MHA = "multi_head_attention"
 
 # Activation type strings (for LAYER_ACTIVATION)
 ACT_RELU = "relu"

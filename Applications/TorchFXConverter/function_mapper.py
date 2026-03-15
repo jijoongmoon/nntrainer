@@ -13,6 +13,7 @@ from nntrainer_layers import (
     NNTrainerLayerDef,
     LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_CONCAT, LAYER_MATMUL,
     LAYER_CLAMP, LAYER_IDENTITY, LAYER_GATHER, LAYER_POOLING2D,
+    LAYER_UPSAMPLE2D, LAYER_L2NORM,
     ACT_SWISH,
     OP_SDPA, OP_NOOP, OP_RESHAPE, OP_UNSUPPORTED,
 )
@@ -21,7 +22,8 @@ from op_registry import (
     FUNCTION_NOOP_NAMES, FUNCTION_RESHAPE_NAMES, FUNCTION_DECOMPOSE_OPS,
     FUNCTION_ACTIVATION_OPS, FUNCTION_ACTIVATION_NAMES,
     FUNCTION_IDENTITY_OPS, FUNCTION_CLAMP_NAMES,
-    FUNCTION_POOLING_NAMES,
+    FUNCTION_POOLING_NAMES, FUNCTION_INTERPOLATE_NAMES,
+    FUNCTION_NORMALIZE_NAMES,
     MULTI_OUTPUT_LAYER_TYPES,
 )
 from mapper_helpers import (
@@ -201,6 +203,14 @@ def map_function_node(node, node_to_layer):
     if func_name in FUNCTION_POOLING_NAMES:
         return _map_pooling(node, scope, func_name, input_names)
 
+    # === F.interpolate -> upsample2d ===
+    if func_name in FUNCTION_INTERPOLATE_NAMES or func is F.interpolate:
+        return _map_interpolate(node, scope, input_names)
+
+    # === F.normalize -> preprocess_l2norm ===
+    if func_name in FUNCTION_NORMALIZE_NAMES or func is F.normalize:
+        return _map_normalize(node, scope, input_names)
+
     # === operator.getitem (tuple unpacking for multi-output modules) ===
     if func is operator.getitem:
         return _map_getitem(node, scope, node_to_layer)
@@ -299,6 +309,60 @@ def _map_pooling(node, scope, func_name, input_names):
         layer_type=LAYER_POOLING2D,
         name=make_scoped_name(scope, node),
         properties=props,
+        input_layers=input_names,
+        hf_module_name=scope,
+    )
+
+
+def _map_interpolate(node, scope, input_names):
+    """Map F.interpolate to NNTrainer upsample2d layer."""
+    # F.interpolate(input, size=None, scale_factor=None, mode='nearest', ...)
+    mode = node.kwargs.get('mode', 'nearest')
+    if len(node.args) > 3:
+        mode = node.args[3]
+    if mode not in ("nearest", "bilinear"):
+        mode = "nearest"
+
+    props = {"upsample": mode}
+
+    scale_factor = node.kwargs.get('scale_factor')
+    if len(node.args) > 2 and node.args[2] is not None:
+        scale_factor = node.args[2]
+
+    size = node.kwargs.get('size')
+    if len(node.args) > 1 and node.args[1] is not None:
+        size = node.args[1]
+
+    if scale_factor is not None:
+        if isinstance(scale_factor, (tuple, list)):
+            props["kernel_size"] = f"{int(scale_factor[0])},{int(scale_factor[1])}"
+        else:
+            props["kernel_size"] = f"{int(scale_factor)},{int(scale_factor)}"
+    elif size is not None:
+        if isinstance(size, int):
+            props["kernel_size"] = f"{size},{size}"
+        elif isinstance(size, (tuple, list)) and len(size) >= 2:
+            props["kernel_size"] = f"{size[0]},{size[1]}"
+
+    return NNTrainerLayerDef(
+        layer_type=LAYER_UPSAMPLE2D,
+        name=make_scoped_name(scope, node),
+        properties=props,
+        input_layers=input_names,
+        hf_module_name=scope,
+    )
+
+
+def _map_normalize(node, scope, input_names):
+    """Map F.normalize to NNTrainer preprocess_l2norm layer."""
+    # F.normalize(input, p=2.0, dim=1, eps=1e-12)
+    eps = node.kwargs.get('eps', 1e-12)
+    if len(node.args) > 3:
+        eps = node.args[3]
+    return NNTrainerLayerDef(
+        layer_type=LAYER_L2NORM,
+        name=make_scoped_name(scope, node),
+        properties={"epsilon": eps},
         input_layers=input_names,
         hf_module_name=scope,
     )

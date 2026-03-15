@@ -10,7 +10,9 @@ from nntrainer_layers import (
     NNTrainerLayerDef,
     LAYER_FC, LAYER_EMBEDDING, LAYER_RMS_NORM, LAYER_LAYER_NORM,
     LAYER_ACTIVATION, LAYER_DROPOUT,
-    LAYER_CONV1D, LAYER_CONV2D, LAYER_POOLING2D, LAYER_BATCH_NORM,
+    LAYER_CONV1D, LAYER_CONV2D, LAYER_CONV2D_TRANSPOSE, LAYER_DEPTHWISE_CONV2D,
+    LAYER_POOLING2D, LAYER_UPSAMPLE2D, LAYER_BATCH_NORM,
+    LAYER_CHANNEL_SHUFFLE, LAYER_L2NORM, LAYER_MHA,
     LAYER_GRU, LAYER_LSTM, LAYER_RNN,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
 )
@@ -153,8 +155,18 @@ def map_module_node(node, modules, node_to_layer):
     if isinstance(module, nn.Conv1d):
         return _map_conv1d(module, module_name, module_type, input_names)
 
+    if isinstance(module, nn.ConvTranspose2d):
+        return _map_conv2d_transpose(module, module_name, module_type, input_names)
+
     if isinstance(module, nn.Conv2d):
+        # Depthwise conv: groups == in_channels and out_channels == in_channels
+        if module.groups == module.in_channels and module.out_channels == module.in_channels:
+            return _map_depthwise_conv2d(module, module_name, module_type, input_names)
         return _map_conv2d(module, module_name, module_type, input_names)
+
+    # Upsample
+    if isinstance(module, nn.Upsample):
+        return _map_upsample2d(module, module_name, module_type, input_names)
 
     # Pooling layers
     if isinstance(module, (nn.MaxPool2d, nn.AvgPool2d)):
@@ -207,6 +219,21 @@ def map_module_node(node, modules, node_to_layer):
             has_bias=module.affine,
             weight_hf_key=f"{module_name}.weight" if module.affine else "",
             bias_hf_key=f"{module_name}.bias" if module.affine else "",
+        )
+
+    # MultiheadAttention
+    if isinstance(module, nn.MultiheadAttention):
+        return _map_multihead_attention(module, module_name, module_type, input_names)
+
+    # ChannelShuffle
+    if isinstance(module, nn.ChannelShuffle):
+        return NNTrainerLayerDef(
+            layer_type=LAYER_CHANNEL_SHUFFLE,
+            name=_sanitize_name(module_name),
+            properties={"split_number": module.groups},
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
         )
 
     # RNN family
@@ -276,6 +303,101 @@ def _map_conv2d(module, module_name, module_type, input_names):
         has_bias=module.bias is not None,
         weight_hf_key=f"{module_name}.weight",
         bias_hf_key=f"{module_name}.bias" if module.bias is not None else "",
+    )
+
+
+def _map_conv2d_transpose(module, module_name, module_type, input_names):
+    """Map nn.ConvTranspose2d to NNTrainer conv2dtranspose layer."""
+    return NNTrainerLayerDef(
+        layer_type=LAYER_CONV2D_TRANSPOSE,
+        name=_sanitize_name(module_name),
+        properties={
+            "filters": module.out_channels,
+            "kernel_size": f"{module.kernel_size[0]},{module.kernel_size[1]}",
+            "stride": f"{module.stride[0]},{module.stride[1]}",
+            "padding": f"{module.padding[0]},{module.padding[1]}",
+            "dilation": f"{module.dilation[0]},{module.dilation[1]}",
+        },
+        input_layers=input_names,
+        hf_module_name=module_name,
+        hf_module_type=module_type,
+        has_weight=True,
+        has_bias=module.bias is not None,
+        weight_hf_key=f"{module_name}.weight",
+        bias_hf_key=f"{module_name}.bias" if module.bias is not None else "",
+    )
+
+
+def _map_depthwise_conv2d(module, module_name, module_type, input_names):
+    """Map nn.Conv2d with groups==in_channels to NNTrainer depthwiseconv2d layer."""
+    return NNTrainerLayerDef(
+        layer_type=LAYER_DEPTHWISE_CONV2D,
+        name=_sanitize_name(module_name),
+        properties={
+            "filters": module.out_channels,
+            "kernel_size": f"{module.kernel_size[0]},{module.kernel_size[1]}",
+            "stride": f"{module.stride[0]},{module.stride[1]}",
+            "padding": f"{module.padding[0]},{module.padding[1]}",
+            "dilation": f"{module.dilation[0]},{module.dilation[1]}",
+        },
+        input_layers=input_names,
+        hf_module_name=module_name,
+        hf_module_type=module_type,
+        has_weight=True,
+        has_bias=module.bias is not None,
+        weight_hf_key=f"{module_name}.weight",
+        bias_hf_key=f"{module_name}.bias" if module.bias is not None else "",
+    )
+
+
+def _map_upsample2d(module, module_name, module_type, input_names):
+    """Map nn.Upsample to NNTrainer upsample2d layer."""
+    mode = module.mode if module.mode in ("nearest", "bilinear") else "nearest"
+    props = {"upsample": mode}
+    if module.scale_factor is not None:
+        sf = module.scale_factor
+        if isinstance(sf, (tuple, list)):
+            props["kernel_size"] = f"{int(sf[0])},{int(sf[1])}"
+        else:
+            props["kernel_size"] = f"{int(sf)},{int(sf)}"
+    elif module.size is not None:
+        # For fixed output size, encode as kernel_size (best-effort)
+        sz = module.size
+        if isinstance(sz, int):
+            props["kernel_size"] = f"{sz},{sz}"
+        else:
+            props["kernel_size"] = f"{sz[0]},{sz[1]}"
+    return NNTrainerLayerDef(
+        layer_type=LAYER_UPSAMPLE2D,
+        name=_sanitize_name(module_name),
+        properties=props,
+        input_layers=input_names,
+        hf_module_name=module_name,
+        hf_module_type=module_type,
+    )
+
+
+def _map_multihead_attention(module, module_name, module_type, input_names):
+    """Map nn.MultiheadAttention to NNTrainer multi_head_attention layer."""
+    props = {
+        "num_heads": module.num_heads,
+        "projected_key_dim": module.kdim // module.num_heads,
+        "projected_value_dim": module.vdim // module.num_heads,
+        "output_shape": module.embed_dim,
+    }
+    if module.dropout > 0:
+        props["dropout_rate"] = module.dropout
+    return NNTrainerLayerDef(
+        layer_type=LAYER_MHA,
+        name=_sanitize_name(module_name),
+        properties=props,
+        input_layers=input_names,
+        hf_module_name=module_name,
+        hf_module_type=module_type,
+        has_weight=True,
+        has_bias=module.in_proj_bias is not None,
+        weight_hf_key=f"{module_name}.in_proj_weight",
+        bias_hf_key=f"{module_name}.in_proj_bias" if module.in_proj_bias is not None else "",
     )
 
 

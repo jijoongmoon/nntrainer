@@ -53,9 +53,12 @@ LEAF_MODULES = (
     nn.Softmax,
     # Dropout (will be skipped in inference output)
     nn.Dropout,
-    # Conv layers (for future models that use convolutions)
+    # Conv layers
     nn.Conv1d,
     nn.Conv2d,
+    nn.ConvTranspose2d,
+    # Upsampling
+    nn.Upsample,
     # Pooling
     nn.AdaptiveAvgPool1d,
     nn.AdaptiveAvgPool2d,
@@ -66,6 +69,10 @@ LEAF_MODULES = (
     # Batch norm
     nn.BatchNorm1d,
     nn.BatchNorm2d,
+    # Multi-head attention
+    nn.MultiheadAttention,
+    # Channel shuffle
+    nn.ChannelShuffle,
     # Recurrent layers -> gru / lstm / rnn
     nn.GRU,
     nn.LSTM,

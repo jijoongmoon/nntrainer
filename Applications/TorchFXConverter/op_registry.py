@@ -114,6 +114,15 @@ FUNCTION_IDENTITY_OPS = {
     F.pad:      OP_NOOP,
 }
 
+# Function names requiring special handling (not simple table lookups)
+FUNCTION_INTERPOLATE_NAMES = frozenset({
+    "interpolate",
+})
+
+FUNCTION_NORMALIZE_NAMES = frozenset({
+    "normalize",
+})
+
 # Function-based clamp names (matching METHOD_CLAMP_NAMES pattern)
 FUNCTION_CLAMP_NAMES = frozenset({
     "clamp", "clip", "clamp_min", "clamp_max",
