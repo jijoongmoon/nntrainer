@@ -41,6 +41,8 @@ Applications/TorchFXConverter/
 ├── weight_converter.py    # HF → NNTrainer binary weight conversion
 ├── converter.py           # Main CLI entry point (Phase 6)
 ├── nntrainer_layers.py    # NNTrainer layer type definitions & registry
+├── plugin_registry.py     # Custom layer plugin registration system
+├── plugin_codegen.py      # C++ LayerPluggable boilerplate generator
 ├── DESIGN.md              # This file
 └── tests/
     ├── test_tracer_simple.py
@@ -64,10 +66,23 @@ Applications/TorchFXConverter/
 | *RMSNorm                    | rms_norm                 | epsilon, packed                        |
 | *RMSNorm (reshaped, Q/K)    | reshaped_rms_norm        | epsilon, feature_size                  |
 | nn.LayerNorm                | layer_norm               | (for BERT/T5)                          |
+| nn.Conv2d                   | conv2d                   | filters, kernel_size, stride, padding  |
+| nn.ConvTranspose2d          | conv2dtranspose          | filters, kernel_size, stride, padding  |
+| nn.Conv2d (depthwise)       | depthwiseconv2d          | filters, kernel_size, stride, padding  |
+| nn.GroupNorm                 | group_normalization      | num_groups, epsilon                    |
+| nn.InstanceNorm1d/2d        | instance_normalization   | epsilon                                |
+| nn.MultiheadAttention       | multi_head_attention     | num_heads, projected_key_dim           |
+| nn.GRUCell/LSTMCell/RNNCell | grucell/lstmcell/rnncell | unit                                   |
+| nn.Identity                 | identity                 | —                                      |
+| nn.CrossEntropyLoss         | cross_softmax            | —                                      |
+| nn.MSELoss                  | mse                      | —                                      |
+| nn.KLDivLoss                | kld                      | —                                      |
+| nn.BCEWithLogitsLoss        | cross_sigmoid            | —                                      |
 | Attention pattern           | mha_core                 | num_heads, num_heads_kv, rope_theta... |
 | SwiGLU pattern              | swiglu                   | input_layers                           |
 | Residual add                | addition                 | input_layers                           |
 | Input placeholder           | input                    | input_shape                            |
+| Custom (via plugin)         | user-defined             | via PluginRegistry                     |
 
 ## Pattern Detection Strategy
 

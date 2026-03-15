@@ -21,6 +21,7 @@ graph TB
         FunctionMapper["function_mapper<br/>(torch.* → Layer)"]
         MethodMapper["method_mapper<br/>(Tensor.* → Layer)"]
         OpRegistry["op_registry<br/>(Lookup Tables)"]
+        PluginRegistry["plugin_registry<br/>(Custom Layer Plugins)"]
     end
 
     subgraph "Pattern Detection"
@@ -43,10 +44,16 @@ graph TB
         CustomLoaders["custom_models.py<br/>(GLiNER2, etc.)"]
     end
 
+    subgraph "Plugin System"
+        PluginCodegen["plugin_codegen<br/>(C++ Plugin Generator)"]
+        PluginConfig["custom_layers.json<br/>(Plugin Config)"]
+    end
+
     subgraph "NNTrainer Runtime (C++)"
         NNTrainerLib["libnntrainer.so"]
         JNI["jni/main.cpp<br/>(Test Driver)"]
         MesonBuild["jni/meson.build"]
+        LayerPluggable["LayerPluggable<br/>(Custom .so Plugins)"]
     end
 
     CLI --> Tracer
@@ -115,7 +122,7 @@ classDiagram
         -model: nn.Module
         -model_config: Any
         -training: bool
-        +__init__(model, model_config, training)
+        +__init__(model, model_config, training, plugin_registry)
         +convert(input_kwargs, max_passes) ConversionResult
         -_remove_passthrough_layers(layers, type, label)
         -_remove_position_id_chains(layers)
@@ -286,6 +293,36 @@ classDiagram
         +__len__()
     }
 
+    class PluginRegistry {
+        -_entries: list
+        +register(matcher, spec)
+        +register_simple(matcher, type, kwargs)
+        +lookup(module) CustomLayerSpec
+        +map_module(module, name, inputs) NNTrainerLayerDef
+        +registered_types: list
+        +from_config(path)$ PluginRegistry
+    }
+
+    class CustomLayerSpec {
+        +nntrainer_type: str
+        +property_mapper: Callable
+        +weight_keys: dict
+        +has_weight: bool
+        +has_bias: bool
+        +transpose_weight: bool
+        +supports_training: bool
+        +description: str
+        +pluggable_so: str
+    }
+
+    class PluginCodegen {
+        <<module>>
+        +generate_header(type, class_name, properties) str
+        +generate_source(type, class_name, properties) str
+        +generate_meson_build(type) str
+        +generate_plugin_code(type, output_dir) dict
+    }
+
     %% Relationships
     AdaptiveConverter --> Tracer : creates & uses
     AdaptiveConverter --> NodeMapper : creates & uses
@@ -308,6 +345,10 @@ classDiagram
     BaseEmitter --> ModelStructure : uses
     WeightConverter --> WeightMap : creates
     WeightConverter --> NNTrainerLayerDef : reads
+    AdaptiveConverter --> PluginRegistry : optional
+    PluginRegistry --> CustomLayerSpec : contains 0..*
+    PluginRegistry --> NNTrainerLayerDef : produces
+    PluginCodegen --> CustomLayerSpec : reads
 ```
 
 ### Mapper Dispatch Detail
@@ -325,6 +366,14 @@ classDiagram
         <<module>>
         +map_module_node(node, modules, node_to_layer) NNTrainerLayerDef
         +MULTI_OUTPUT_LAYER_TYPES: frozenset
+        -_map_rnn_cell(module, name, type, inputs, layer_type)
+    }
+
+    class PluginRegistry {
+        <<singleton>>
+        +lookup(module) CustomLayerSpec
+        +map_module(module, name, inputs) NNTrainerLayerDef
+        +from_config(path) PluginRegistry
     }
 
     class function_mapper {
@@ -366,6 +415,8 @@ classDiagram
     module_mapper --> mapper_helpers : name utilities
     function_mapper --> mapper_helpers : name utilities
     method_mapper --> mapper_helpers : name utilities
+    module_mapper --> PluginRegistry : custom fallback
+    PluginRegistry --> PluginCodegen : generates C++
 ```
 
 ## 3. Sequence Diagram — Full Conversion Pipeline
@@ -385,11 +436,15 @@ sequenceDiagram
     participant CE as CppEmitter
     participant WC as WeightConverter
 
-    User->>CLI: python converter.py --model X --output Y
+    User->>CLI: python converter.py --model X --output Y [--plugin-config Z]
     CLI->>HF: Load model & config
     HF-->>CLI: model, config, trace_inputs
 
-    CLI->>AC: AdaptiveConverter(model, config)
+    opt --plugin-config provided
+        CLI->>CLI: PluginRegistry.from_config(Z)
+    end
+
+    CLI->>AC: AdaptiveConverter(model, config, plugin_registry)
     CLI->>AC: convert(trace_inputs)
 
     Note over AC: === Pass 1: Trace ===
@@ -563,10 +618,29 @@ Key PyTorch → NNTrainer layer type mappings used by the converter:
 | `nn.LayerNorm` | `layer_normalization` | axis=3, epsilon |
 | `RMSNorm` | `rms_norm` | epsilon, packed |
 | `nn.Conv1d` | `conv1d` | filters, kernel_size, stride, padding |
+| `nn.Conv2d` | `conv2d` | filters, kernel_size, stride, padding |
+| `nn.ConvTranspose2d` | `conv2dtranspose` | filters, kernel_size, stride, padding |
+| `nn.Conv2d` (depthwise) | `depthwiseconv2d` | filters, kernel_size, stride, padding |
+| `nn.Upsample` | `upsample2d` | upsample, kernel_size |
+| `nn.MaxPool2d/AvgPool2d` | `pooling2d` | pooling, pool_size, stride |
+| `nn.BatchNorm1d/2d` | `batch_normalization` | epsilon, momentum |
+| `nn.GroupNorm` | `group_normalization` | num_groups, epsilon |
+| `nn.InstanceNorm1d/2d` | `instance_normalization` | epsilon |
 | `nn.Dropout` | `dropout` | dropout_rate |
 | `nn.ReLU/GELU/SiLU` | `activation` | activation type |
+| `nn.MultiheadAttention` | `multi_head_attention` | num_heads, projected_key_dim |
+| `nn.ChannelShuffle` | `channel_shuffle` | split_number |
+| `nn.GRU/LSTM/RNN` | `gru`/`lstm`/`rnn` | unit, return_sequences |
+| `nn.GRUCell/LSTMCell/RNNCell` | `grucell`/`lstmcell`/`rnncell` | unit |
+| `nn.Identity` | `identity` | — |
+| `nn.CrossEntropyLoss` | `cross_softmax` | — |
+| `nn.MSELoss` | `mse` | — |
+| `nn.KLDivLoss` | `kld` | — |
+| `nn.BCEWithLogitsLoss` | `cross_sigmoid` | — |
 | `torch.cat` | `concat` | axis |
 | `torch.gather` | `gather` | axis (1-3, NCHW) |
+| `torch.topk` | `topk` | — |
+| `Tensor.argsort` | `argsort` | — |
 | `Tensor.view/reshape` | `reshape` | target_shape (C:H:W) |
 | `Tensor.__getitem__` | `slice` | axis, start_index, end_index |
 | `Tensor.mul` | `multiply` | (broadcasting supported) |
@@ -574,6 +648,10 @@ Key PyTorch → NNTrainer layer type mappings used by the converter:
 | `Tensor.softmax` | `activation` | activation=softmax |
 | `Tensor.permute` | `permute` | — |
 | `Tensor.transpose` | `transpose` | — |
+| `F.cross_entropy` | `cross_softmax` | — |
+| `F.mse_loss` | `mse` | — |
+| `F.normalize` | `preprocess_l2norm` | epsilon |
+| Custom (via plugin) | user-defined | user-defined |
 
 ### NCHW Dimension Convention
 
@@ -586,3 +664,123 @@ NNTrainer uses 4D `[Batch, Channel, Height, Width]` tensors. PyTorch tensors are
 | 2D `[B,W]` | `[B, 1, 1, W]` | +2 |
 
 Formula: `nchw_axis = pytorch_dim + (4 - tensor_rank)` for dims > 0.
+
+## 6. Plugin System — Custom LayerPluggable Support
+
+The converter supports user-defined custom layer mappings via the Plugin System,
+which integrates with NNTrainer's `LayerPluggable` interface for dynamic layer loading.
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph "User Space"
+        PyModule["Custom PyTorch Module<br/>(e.g. MyPowLayer)"]
+        PluginJSON["custom_layers.json<br/>(Plugin Config)"]
+    end
+
+    subgraph "Converter Plugin System"
+        Registry["PluginRegistry<br/>• register(class/name/predicate, spec)<br/>• lookup(module) → spec<br/>• from_config(json)"]
+        Spec["CustomLayerSpec<br/>• nntrainer_type<br/>• property_mapper<br/>• weight_keys<br/>• has_weight/bias"]
+        Codegen["PluginCodegen<br/>• generate_header()<br/>• generate_source()<br/>• generate_meson_build()"]
+    end
+
+    subgraph "Conversion Pipeline Integration"
+        Tracer2["Tracer<br/>is_leaf() checks registry"]
+        ModMapper["module_mapper<br/>fallback to registry"]
+    end
+
+    subgraph "Generated C++ Plugin"
+        Header[".h header<br/>(Layer class declaration)"]
+        Source[".cpp source<br/>(forwarding, calcDerivative)"]
+        Meson["meson.build<br/>(shared_library)"]
+    end
+
+    subgraph "NNTrainer Runtime"
+        PlugEntry["extern C<br/>ml_train_layer_pluggable"]
+        DynLoad["AppContext::registerLayer()<br/>dlopen + dlsym"]
+    end
+
+    PluginJSON --> Registry
+    PyModule --> Registry
+    Registry --> Spec
+    Spec --> ModMapper
+    Spec --> Codegen
+
+    Registry --> Tracer2
+    ModMapper -->|NNTrainerLayerDef| Codegen
+
+    Codegen --> Header
+    Codegen --> Source
+    Codegen --> Meson
+
+    Source --> PlugEntry
+    PlugEntry --> DynLoad
+```
+
+### Usage
+
+**Method 1: Programmatic Registration**
+
+```python
+from plugin_registry import PluginRegistry, CustomLayerSpec
+from decomposer import AdaptiveConverter
+
+registry = PluginRegistry()
+registry.register(MyPowLayer, CustomLayerSpec(
+    nntrainer_type="custom_pow",
+    property_mapper=lambda m: {"exponent": m.exponent},
+))
+
+converter = AdaptiveConverter(model, plugin_registry=registry)
+result = converter.convert(inputs)
+```
+
+**Method 2: JSON Config File**
+
+```json
+{
+  "custom_layers": [
+    {
+      "match_class_name": "MyPowLayer",
+      "nntrainer_type": "custom_pow",
+      "properties": {"exponent": 2},
+      "has_weight": false
+    }
+  ]
+}
+```
+
+```bash
+python converter.py --model ./my_model --output ./out --plugin-config custom_layers.json
+```
+
+**Method 3: Generate C++ Plugin Boilerplate**
+
+```python
+from plugin_codegen import generate_plugin_code
+
+generate_plugin_code(
+    layer_type="custom_pow",
+    properties={"exponent": "float"},
+    has_weight=False,
+    output_dir="./my_plugin/",
+)
+# Generates: custom_pow_layer.h, custom_pow_layer.cpp, meson.build
+```
+
+### NNTrainer LayerPluggable Interface
+
+Custom layers must implement:
+
+| Method | Purpose |
+|---|---|
+| `getType()` | Return layer type string (e.g. `"custom_pow"`) |
+| `finalize(InitLayerContext&)` | Set output dimensions, request weights |
+| `forwarding(RunLayerContext&, bool)` | Forward propagation |
+| `calcDerivative(RunLayerContext&)` | Backward propagation |
+| `setProperty(vector<string>&)` | Parse `key=value` properties |
+| `supportBackwarding()` | Whether layer supports training |
+
+The generated `.so` plugin exposes `extern "C" LayerPluggable ml_train_layer_pluggable`
+which NNTrainer discovers via `AppContext::registerLayer()` (dlopen/dlsym).
