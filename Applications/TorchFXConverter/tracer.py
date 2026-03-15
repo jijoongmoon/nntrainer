@@ -291,6 +291,10 @@ class Tracer(TorchFunctionMode):
             node.meta["scope"] = self.module_stack[-1]
             node.meta["output_type"] = type(out)
 
+        # Store output shape for shape-dependent operations (reshape, etc.)
+        if isinstance(out, Tensor):
+            node.meta["output_shape"] = tuple(out.shape)
+
         self._register_output(out, node)
 
         return out
@@ -308,15 +312,21 @@ class Tracer(TorchFunctionMode):
                             name_hint = f"arg_{i}"
                             node = self.graph.placeholder(name_hint)
                             node.meta["type"] = type(item)
+                            if isinstance(item, Tensor):
+                                node.meta["output_shape"] = tuple(item.shape)
                             self._register_output(item, node, track_data_ptr=True)
                     elif param and param.kind == inspect.Parameter.VAR_KEYWORD:
                         for key, item in arg_value.items():
                             node = self.graph.placeholder(key)
                             node.meta["type"] = type(item)
+                            if isinstance(item, Tensor):
+                                node.meta["output_shape"] = tuple(item.shape)
                             self._register_output(item, node, track_data_ptr=True)
                     else:
                         node = self.graph.placeholder(arg_name)
                         node.meta["type"] = type(arg_value)
+                        if isinstance(arg_value, Tensor):
+                            node.meta["output_shape"] = tuple(arg_value.shape)
                         self._register_output(arg_value, node, track_data_ptr=True)
 
             if self._is_leaf(module):
@@ -343,6 +353,8 @@ class Tracer(TorchFunctionMode):
                 node = self.graph.call_module(name, args=node_args, kwargs=node_kwargs)
                 node.meta["scope"] = name
                 node.meta["output_type"] = type(output)
+                if isinstance(output, Tensor):
+                    node.meta["output_shape"] = tuple(output.shape)
                 node.meta["leaf_module"] = True
                 node.meta["module_type"] = type(module).__name__
                 node.meta["module_class"] = type(module)

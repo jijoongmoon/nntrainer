@@ -55,12 +55,19 @@ void GatherLayer::forwarding_operation(const Tensor &input, const Tensor &index,
   unsigned int out_h = output.height();
   unsigned int out_w = output.width();
 
+  // Support index broadcasting: if index is smaller than output along
+  // non-gather dimensions, use modulo to broadcast (repeat) the index.
+  unsigned int idx_c = index.channel();
+  unsigned int idx_h = index.height();
+  unsigned int idx_w = index.width();
+
   for (unsigned int b = 0; b < out_b; ++b) {
     for (unsigned int c = 0; c < out_c; ++c) {
       for (unsigned int h = 0; h < out_h; ++h) {
         for (unsigned int w = 0; w < out_w; ++w) {
           unsigned int idx =
-            static_cast<unsigned int>(index.getValue<float>(b, c, h, w));
+            static_cast<unsigned int>(index.getValue<float>(
+              b, c % idx_c, h % idx_h, w % idx_w));
 
           unsigned int src_c = c, src_h = h, src_w = w;
           switch (axis) {

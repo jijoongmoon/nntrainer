@@ -56,6 +56,9 @@ class NodeMapper:
         for node in self.graph.nodes:
             layer_def = self._map_node(node)
             if layer_def is not None:
+                # Store original FX node name for shape metadata lookup
+                layer_def.fx_node_name = node.name
+
                 # Deduplicate layer names: sanitize_name("a.b") and "a_b"
                 # can collide. Append _1, _2, etc. to make names unique.
                 if layer_def.name in seen_names:

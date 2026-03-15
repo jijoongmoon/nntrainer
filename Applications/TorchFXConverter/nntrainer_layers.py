@@ -43,6 +43,7 @@ class NNTrainerLayerDef:
     input_layers: list = field(default_factory=list) # Input layer name(s)
 
     # Source information (from HF model)
+    fx_node_name: str = ""                    # Original FX graph node name
     hf_module_name: str = ""                  # e.g. "model.layers.0.self_attn.q_proj"
     hf_module_type: str = ""                  # e.g. "Linear", "Qwen3RMSNorm"
 

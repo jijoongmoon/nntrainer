@@ -26,6 +26,7 @@ from typing import Optional
 
 from nntrainer_layers import (
     NNTrainerLayerDef,
+    LAYER_INPUT,
     LAYER_POW, LAYER_SQRT, LAYER_MULTIPLY, LAYER_DIVIDE, LAYER_NEGATIVE,
     LAYER_ADDITION, LAYER_SUBTRACT,
     LAYER_DROPOUT, LAYER_EMBEDDING,
@@ -500,6 +501,11 @@ class AdaptiveConverter:
             if layer.layer_type in _OP_TO_LAYER:
                 layer.layer_type = _OP_TO_LAYER[layer.layer_type]
 
+        # Pass 3.9: Add input layers for external inputs and extract
+        # reshape/slice parameters from FX graph metadata
+        layers = _add_input_layers_and_shape_info(
+            layers, tracer.graph, input_kwargs)
+
         # Pass 4: Detect LazyTensor chain opportunities
         lazy_chains = detect_lazy_chains(layers)
         if lazy_chains:
@@ -535,6 +541,173 @@ class AdaptiveConverter:
             model_structure=model_structure,
             training=self.training,
         )
+
+
+def _add_input_layers_and_shape_info(layers, graph, input_kwargs):
+    """Add input layers for external inputs and extract shape metadata.
+
+    1. Detects external inputs (referenced but not defined) and creates
+       NNTrainer input layers with proper input_shape.
+    2. Extracts target_shape for reshape/view operations from FX graph args.
+    3. Extracts slice parameters (start_index, end_index, axis) for
+       __getitem__ operations from FX graph args.
+
+    Args:
+        layers: List of NNTrainerLayerDef
+        graph: FX graph from tracer
+        input_kwargs: Dict of model inputs with tensor shapes
+
+    Returns:
+        Updated layers list with input layers prepended.
+    """
+    import torch
+
+    # Build name->node lookup from FX graph
+    fx_nodes = {node.name: node for node in graph.nodes}
+
+    # Detect external inputs
+    defined = set(l.name for l in layers)
+    external_inputs = []
+    seen = set()
+    for l in layers:
+        for inp in l.input_layers:
+            if inp not in defined and inp not in seen:
+                seen.add(inp)
+                external_inputs.append(inp)
+
+    # Create input layers for external inputs
+    input_layers = []
+    for inp_name in external_inputs:
+        tensor = input_kwargs.get(inp_name)
+        if tensor is not None and isinstance(tensor, torch.Tensor):
+            # Convert PyTorch shape to NNTrainer input_shape (C:H:W).
+            # Strip batch dimension (dim 0); pad to 3D if needed.
+            dims = list(tensor.shape[1:])  # skip batch
+            while len(dims) < 3:
+                dims.insert(0, 1)
+            input_shape = ":".join(str(d) for d in dims[-3:])
+        else:
+            input_shape = "1:1:1"  # fallback
+
+        input_layers.append(NNTrainerLayerDef(
+            layer_type=LAYER_INPUT,
+            name=inp_name,
+            properties={"input_shape": input_shape},
+        ))
+
+    if input_layers:
+        count = len(input_layers)
+        names = ", ".join(l.name for l in input_layers)
+        print(f"  [CLEANUP] Added {count} input layers: {names}")
+
+    # Extract shape info for reshape/view/unsqueeze/squeeze layers
+    for layer in layers:
+        if layer.layer_type not in (LAYER_RESHAPE, OP_RESHAPE):
+            continue
+        # Look up FX node by fx_node_name (preferred) or layer name
+        node = fx_nodes.get(layer.fx_node_name) or fx_nodes.get(layer.name)
+        if node is None:
+            continue
+
+        target = getattr(node, 'target', '')
+
+        if target in ('view', 'reshape'):
+            # node.args = (input_node, dim1, dim2, ...) or
+            # node.args = (input_node, (dim1, dim2, ...))
+            shape_args = node.args[1:]
+            if len(shape_args) == 1 and isinstance(shape_args[0], (list, tuple)):
+                shape_args = shape_args[0]
+            # Strip batch dim (first dim), convert to C:H:W
+            dims = [a for a in shape_args if isinstance(a, int)]
+            if dims:
+                dims = dims[1:]  # skip batch
+                while len(dims) < 3:
+                    dims.insert(0, 1)
+                layer.properties["target_shape"] = \
+                    ":".join(str(d) for d in dims[-3:])
+
+        else:
+            # For unsqueeze, squeeze, or any other reshape variant:
+            # use output_shape captured during tracing
+            out_shape = node.meta.get('output_shape')
+            if out_shape is not None:
+                dims = list(out_shape[1:])  # skip batch
+                while len(dims) < 3:
+                    dims.insert(0, 1)
+                layer.properties["target_shape"] = \
+                    ":".join(str(d) for d in dims[-3:])
+
+    # Extract slice parameters for __getitem__ layers
+    for layer in layers:
+        if layer.layer_type != "slice":
+            continue
+        node = fx_nodes.get(layer.fx_node_name) or fx_nodes.get(layer.name)
+        if node is None or len(node.args) < 2:
+            continue
+
+        # Determine input tensor rank for PyTorch→NCHW axis conversion
+        input_node = node.args[0] if hasattr(node.args[0], 'name') else None
+        input_rank = 4  # default
+        if input_node:
+            in_shape = input_node.meta.get('output_shape')
+            if in_shape:
+                input_rank = len(in_shape)
+
+        index_arg = node.args[1]
+        # Handle multi-dimensional indexing: tensor[..., idx]
+        # e.g. span_idx[:, :, 0] → args[1] = (slice(None), slice(None), 0)
+        if isinstance(index_arg, (list, tuple)):
+            # Find the axis being indexed (first non-slice(None) element)
+            for ax, idx in enumerate(index_arg):
+                if isinstance(idx, int):
+                    # Convert PyTorch dim to NCHW axis (1-3).
+                    # For a tensor of rank R mapped to 4D NCHW:
+                    #   nchw_dim = pytorch_dim + (4 - R) for dims > 0
+                    nn_axis = ax + (4 - input_rank)
+                    nn_axis = max(1, min(3, nn_axis))  # clamp to 1-3
+                    if idx < 0:
+                        # Need input shape to resolve negative index
+                        in_shape = input_node.meta.get('output_shape') \
+                            if input_node else None
+                        if in_shape and ax < len(in_shape):
+                            idx = in_shape[ax] + idx  # resolve negative
+                        else:
+                            break
+                    # NNTrainer slice: 1-based, end is exclusive
+                    layer.properties["axis"] = nn_axis
+                    layer.properties["start_index"] = idx + 1
+                    layer.properties["end_index"] = idx + 2
+                    break
+        elif isinstance(index_arg, int):
+            # Simple integer indexing on first non-batch dim
+            nn_axis = 1 + (4 - input_rank)
+            nn_axis = max(1, min(3, nn_axis))
+            layer.properties["axis"] = nn_axis
+            layer.properties["start_index"] = index_arg + 1
+            layer.properties["end_index"] = index_arg + 2
+
+    # Fix gather axis: convert PyTorch dim to NCHW axis (1-3)
+    for layer in layers:
+        if layer.layer_type != "gather":
+            continue
+        if "axis" not in layer.properties:
+            continue
+        node = fx_nodes.get(layer.fx_node_name) or fx_nodes.get(layer.name)
+        if node is None:
+            continue
+        # Gather's first input is the data tensor; get its rank
+        data_node = node.args[0] if hasattr(node.args[0], 'name') else None
+        if data_node:
+            data_shape = data_node.meta.get('output_shape')
+            if data_shape:
+                data_rank = len(data_shape)
+                pytorch_axis = layer.properties["axis"]
+                # Convert: nchw_dim = pytorch_dim + (4 - rank) for dim > 0
+                nn_axis = pytorch_axis + (4 - data_rank)
+                nn_axis = max(1, min(3, nn_axis))
+                layer.properties["axis"] = nn_axis
+
+    return input_layers + layers
 
 
 class ConversionResult:
