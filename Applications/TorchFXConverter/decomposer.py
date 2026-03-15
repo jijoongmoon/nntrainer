@@ -29,8 +29,9 @@ from nntrainer_layers import (
     LAYER_POW, LAYER_SQRT, LAYER_MULTIPLY, LAYER_DIVIDE, LAYER_NEGATIVE,
     LAYER_ADDITION, LAYER_SUBTRACT,
     LAYER_DROPOUT, LAYER_EMBEDDING,
+    LAYER_RESHAPE, LAYER_PERMUTE, LAYER_TRANSPOSE,
     LAZY_TENSOR_OPS, TENSOR_DIRECT_METHODS,
-    OP_UNSUPPORTED, OP_NOOP, OP_RESHAPE,
+    OP_UNSUPPORTED, OP_NOOP, OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE,
 )
 from tracer import Tracer, LEAF_MODULES
 from node_mapper import NodeMapper
@@ -488,6 +489,16 @@ class AdaptiveConverter:
         # Pass 3.7: Remove position ID computation chains
         # (arithmetic ops that exclusively feed position embeddings)
         layers = _remove_position_id_chains(layers)
+
+        # Pass 3.8: Convert intermediate op types to final NNTrainer types
+        _OP_TO_LAYER = {
+            OP_RESHAPE: LAYER_RESHAPE,
+            OP_TRANSPOSE: LAYER_TRANSPOSE,
+            OP_PERMUTE: LAYER_PERMUTE,
+        }
+        for layer in layers:
+            if layer.layer_type in _OP_TO_LAYER:
+                layer.layer_type = _OP_TO_LAYER[layer.layer_type]
 
         # Pass 4: Detect LazyTensor chain opportunities
         lazy_chains = detect_lazy_chains(layers)

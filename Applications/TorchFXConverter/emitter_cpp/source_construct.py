@@ -5,6 +5,7 @@ from .helpers import _cpp_layer, _class_name, get_file_base, get_norm_type
 
 def emit_flat_source(layers, structure, model_name=None):
     """Generate source for non-transformer models (flat layer list)."""
+    from .source_custom import emit_register_custom_layers
     s = structure
     cname = _class_name(s.model_type, s.arch_type)
     header_file = get_file_base(s, model_name) + ".h"
@@ -15,8 +16,28 @@ def emit_flat_source(layers, structure, model_name=None):
     L.append(f"")
     L.append(f'#include "{header_file}"')
     L.append(f"#include <model.h>")
+    L.append(f"#include <app_context.h>")
+    L.append(f"#include <engine.h>")
     L.append(f"")
     L.append(f"using ml::train::createLayer;")
+    L.append(f"")
+
+    # withKey helpers (needed for initialize)
+    L.append("template <typename T>")
+    L.append("__attribute__((unused))")
+    L.append('static std::string withKey(const std::string &key, T val) {')
+    L.append('  return key + "=" + std::to_string(val);')
+    L.append("}")
+    L.append("")
+    L.append("__attribute__((unused))")
+    L.append("static std::string withKey(const std::string &key, "
+             "const char *val) {")
+    L.append('  return key + "=" + std::string(val);')
+    L.append("}")
+    L.append("")
+
+    # Default constructor
+    L.append(f"{cname}::{cname}() = default;")
     L.append(f"")
 
     L.append(f"void {cname}::constructModel() {{")
@@ -42,6 +63,31 @@ def emit_flat_source(layers, structure, model_name=None):
     L.append(f"  }}")
     L.append(f"}}")
     L.append(f"")
+
+    # registerCustomLayers (empty for flat models)
+    L.append(emit_register_custom_layers(cname, []))
+
+    # initialize (simplified for flat models - no INIT_SEQ_LEN)
+    L.append(f"void {cname}::initialize() {{")
+    L.append(f"  registerCustomLayers();")
+    L.append(f"  constructModel();")
+    L.append(f"")
+    L.append(f"  model->setProperty({{")
+    L.append(f'    withKey("batch_size", 1),')
+    L.append(f'    withKey("epochs", "1"),')
+    L.append(f'    withKey("model_tensor_type", "FP32-FP32")')
+    L.append(f"  }});")
+    L.append(f"")
+    L.append(f"  if (model->compile(ml::train::ExecutionMode::INFERENCE)) {{")
+    L.append(f'    throw std::invalid_argument("Model compilation failed.");')
+    L.append(f"  }}")
+    L.append(f"")
+    L.append(f"  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {{")
+    L.append(f'    throw std::invalid_argument("Model initialization failed.");')
+    L.append(f"  }}")
+    L.append(f"}}")
+    L.append(f"")
+
     return "\n".join(L)
 
 
@@ -149,6 +195,8 @@ def _emit_encoder_decoder_blocks(L, s, first_in, norm_type):
     ]
     if norm_type == "rms_norm":
         enc_norm_props.append('withKey("packed", "false")')
+    elif norm_type == "layer_normalization":
+        enc_norm_props.append('withKey("axis", 3)')
     L.extend(_cpp_layer(norm_type, enc_norm_props))
     L.append(f"")
 
@@ -177,6 +225,8 @@ def _emit_encoder_decoder_blocks(L, s, first_in, norm_type):
         ]
         if norm_type == "rms_norm":
             dec_norm_props.append('withKey("packed", "false")')
+        elif norm_type == "layer_normalization":
+            dec_norm_props.append('withKey("axis", 3)')
         L.extend(_cpp_layer(norm_type, dec_norm_props))
         L.append(f"")
 
@@ -242,6 +292,8 @@ def _emit_final_norm(L, norm_type):
     ]
     if norm_type == "rms_norm":
         norm_props.append('withKey("packed", "false")')
+    elif norm_type == "layer_normalization":
+        norm_props.append('withKey("axis", 3)')
     L.extend(_cpp_layer(norm_type, norm_props))
     L.append(f"")
 

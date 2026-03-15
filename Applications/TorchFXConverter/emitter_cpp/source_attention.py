@@ -3,9 +3,10 @@
 from .helpers import _cpp_layer, _class_name
 
 
-def emit_attention_method(cname, block):
+def emit_attention_method(cname, block, arch_type="decoder_only"):
     """Generate createAttention() method body."""
     attn = block.attention
+    is_decoder = arch_type in ("decoder_only", "encoder_decoder")
     has_qk_norm = attn.has_qk_norm
     has_rope = attn.has_rope
     L = []
@@ -95,15 +96,21 @@ def emit_attention_method(cname, block):
         'withKey("name", A)',
         'withKey("num_heads", n_heads)',
         'withKey("num_heads_kv", n_heads / GQA_SIZE)',
-        'withKey("max_timestep", std::to_string(INIT_SEQ_LEN + '
-        'NUM_TO_GENERATE))',
     ]
-    mha_props.append('withKey("sliding_window", SLIDING_WINDOW)')
+    if is_decoder:
+        mha_props.append(
+            'withKey("max_timestep", std::to_string(INIT_SEQ_LEN + '
+            'NUM_TO_GENERATE))')
+        mha_props.append('withKey("sliding_window", SLIDING_WINDOW)')
+    else:
+        mha_props.append(
+            'withKey("max_timestep", std::to_string(INIT_SEQ_LEN))')
     if has_rope:
         mha_props.append('withKey("rope_theta", ROPE_THETA)')
         mha_props.append(
             'withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS)')
-    mha_props.append('withKey("max_new_tokens", NUM_TO_GENERATE)')
+    if is_decoder:
+        mha_props.append('withKey("max_new_tokens", NUM_TO_GENERATE)')
     mha_props.append(
         f'withKey("input_layers", {q_in} + "," + {k_in} + "," + V)')
     L.extend(_cpp_layer("mha_core", mha_props))

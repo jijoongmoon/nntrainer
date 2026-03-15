@@ -130,6 +130,8 @@ def _emit_pre_norm(L, norm_type, norm_suffix, op_type):
     ]
     if norm_type == "rms_norm":
         norm_props.append('withKey("packed", "false")')
+    elif norm_type == "layer_normalization":
+        norm_props.append('withKey("axis", 3)')
     L.extend(_cpp_layer(norm_type, norm_props))
     L.append(f"")
 
@@ -170,6 +172,8 @@ def _emit_cross_attention(L, block, norm_type, last_residual):
         ]
         if norm_type == "rms_norm":
             cross_norm_props.append('withKey("packed", "false")')
+        elif norm_type == "layer_normalization":
+            cross_norm_props.append('withKey("axis", 3)')
         L.extend(_cpp_layer(norm_type, cross_norm_props))
         L.append(f"")
         cross_q = 'prefix + "_cross_attn_norm"'
@@ -209,6 +213,8 @@ def _emit_pre_ffn_norm(L, norm_type, last_residual):
     ]
     if norm_type == "rms_norm":
         norm_props.append('withKey("packed", "false")')
+    elif norm_type == "layer_normalization":
+        norm_props.append('withKey("axis", 3)')
     L.extend(_cpp_layer(norm_type, norm_props))
     L.append(f"")
 

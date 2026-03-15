@@ -164,7 +164,8 @@ class CppEmitter(BaseEmitter):
 
         representative = enc_b0 or dec_b0
         if representative and representative.attention:
-            L.append(emit_attention_method(cname, representative))
+            L.append(emit_attention_method(
+                cname, representative, arch_type=s.arch_type))
         if representative and representative.ffn:
             L.append(emit_ffn_method(cname, representative))
 
@@ -177,7 +178,8 @@ class CppEmitter(BaseEmitter):
 
         attn_block = self._get_attn_block()
         if attn_block:
-            L.append(emit_attention_method(cname, attn_block))
+            L.append(emit_attention_method(
+                cname, attn_block, arch_type=s.arch_type))
 
         representative = next((b for b in s.blocks if b.ffn), None)
         if representative:

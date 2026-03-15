@@ -220,7 +220,7 @@ def _emit_member_variables(L, s, attn_block):
     L.append(f"  int NUM_KV_HEADS = {s.num_kv_heads};")
     L.append(f"  int HEAD_DIM = {s.head_dim};")
     L.append(f"  int INTERMEDIATE_SIZE = {s.intermediate_size};")
-    L.append(f"  float NORM_EPS = {s.norm_eps or 1e-6}f;")
+    L.append(f"  std::string NORM_EPS = \"{s.norm_eps or 1e-6}\";")
     if s.rope_theta:
         L.append(f"  unsigned int ROPE_THETA = {int(s.rope_theta)};")
     L.append(f"  bool TIE_WORD_EMBEDDINGS = "
@@ -230,14 +230,17 @@ def _emit_member_variables(L, s, attn_block):
         gqa = s.num_heads // s.num_kv_heads
         L.append(f"  int GQA_SIZE = {gqa};")
 
-    if attn_block:
+    is_decoder = s.arch_type in ("decoder_only", "encoder_decoder")
+
+    if attn_block and is_decoder:
         L.append(f"  unsigned int SLIDING_WINDOW = UINT_MAX;")
 
     if s.conv_l_cache:
         L.append(f"  int CONV_KERNEL_SIZE = {s.conv_l_cache};")
 
     L.append(f"  unsigned int INIT_SEQ_LEN = 0;")
-    L.append(f"  unsigned int NUM_TO_GENERATE = 0;")
+    if is_decoder:
+        L.append(f"  unsigned int NUM_TO_GENERATE = 0;")
     if attn_block and attn_block.attention.has_rope:
         L.append(f"  unsigned int MAX_POSITION_EMBEDDINGS = "
                  f"{s.max_position_embeddings or 2048};")

@@ -229,7 +229,10 @@ def _map_cat(node, scope, input_names):
         dim = node.args[1]
     props = {}
     if dim != 0:
-        props["concat_dimension"] = dim
+        # NNTrainer ConcatDimension uses key "axis" with NCHW indices (1-3).
+        # Convert negative PyTorch dims: -1 → 3 (width), -2 → 2 (height), etc.
+        nn_dim = dim if dim > 0 else (4 + dim)
+        props["axis"] = nn_dim
     return NNTrainerLayerDef(
         layer_type=LAYER_CONCAT,
         name=make_scoped_name(scope, node),
@@ -250,10 +253,11 @@ def _map_stack(node, scope, input_names):
     dim = node.kwargs.get('dim', 0)
     if len(node.args) > 1 and isinstance(node.args[1], int):
         dim = node.args[1]
+    nn_dim = dim if dim > 0 else (4 + dim)
     return NNTrainerLayerDef(
         layer_type=LAYER_CONCAT,
         name=make_scoped_name(scope, node),
-        properties={"concat_dimension": dim, "stack": True},
+        properties={"axis": nn_dim},
         input_layers=stack_inputs,
     )
 

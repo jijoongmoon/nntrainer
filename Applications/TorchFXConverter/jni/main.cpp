@@ -25,6 +25,7 @@ int main(int argc, char *argv[]) {
     model_builder.initialize();
 
     auto &model = model_builder.getModel();
+    std::cout << "[converter_test] Summarizing model..." << std::endl;
     model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 
     std::cout << "[converter_test] Model initialized successfully."

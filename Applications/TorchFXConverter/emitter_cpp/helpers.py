@@ -146,5 +146,6 @@ def get_file_base(structure, model_name=None):
 
 def get_norm_type(model_type):
     """Return the norm layer type for a given model type."""
-    return ("rms_norm" if model_type not in ("bert", "roberta")
-            else "layer_normalization")
+    layer_norm_types = ("bert", "roberta", "xlm-roberta")
+    return ("layer_normalization" if model_type in layer_norm_types
+            else "rms_norm")
