@@ -126,6 +126,10 @@ LAYER_REDUCE_SUM = "reduce_sum"
 LAYER_GATHER = "gather"
 LAYER_SLICE = "slice"
 
+# Selection / sorting
+LAYER_TOPK = "topk"
+LAYER_ARGSORT = "argsort"
+
 # Tensor manipulation
 LAYER_FLATTEN = "flatten"
 LAYER_TRANSPOSE = "transpose"
@@ -148,6 +152,8 @@ LAYER_DEPTHWISE_CONV2D = "depthwiseconv2d"
 LAYER_POOLING2D = "pooling2d"
 LAYER_UPSAMPLE2D = "upsample2d"
 LAYER_BATCH_NORM = "batch_normalization"
+LAYER_GROUP_NORM = "group_normalization"
+LAYER_INSTANCE_NORM = "instance_normalization"
 
 # Utility layers
 LAYER_CHANNEL_SHUFFLE = "channel_shuffle"

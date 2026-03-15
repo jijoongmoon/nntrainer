@@ -12,6 +12,7 @@ from nntrainer_layers import (
     LAYER_ACTIVATION, LAYER_DROPOUT,
     LAYER_CONV1D, LAYER_CONV2D, LAYER_CONV2D_TRANSPOSE, LAYER_DEPTHWISE_CONV2D,
     LAYER_POOLING2D, LAYER_UPSAMPLE2D, LAYER_BATCH_NORM,
+    LAYER_GROUP_NORM, LAYER_INSTANCE_NORM,
     LAYER_CHANNEL_SHUFFLE, LAYER_L2NORM, LAYER_MHA,
     LAYER_GRU, LAYER_LSTM, LAYER_RNN,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
@@ -219,6 +220,40 @@ def map_module_node(node, modules, node_to_layer):
             has_bias=module.affine,
             weight_hf_key=f"{module_name}.weight" if module.affine else "",
             bias_hf_key=f"{module_name}.bias" if module.affine else "",
+        )
+
+    # GroupNorm
+    if isinstance(module, nn.GroupNorm):
+        return NNTrainerLayerDef(
+            layer_type=LAYER_GROUP_NORM,
+            name=_sanitize_name(module_name),
+            properties={
+                "num_groups": module.num_groups,
+                "epsilon": module.eps,
+            },
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+            has_weight=module.affine,
+            has_bias=module.affine,
+            weight_hf_key=f"{module_name}.weight" if module.affine else "",
+            bias_hf_key=f"{module_name}.bias" if module.affine else "",
+        )
+
+    # InstanceNorm
+    if isinstance(module, (nn.InstanceNorm1d, nn.InstanceNorm2d)):
+        affine = module.affine if hasattr(module, 'affine') else False
+        return NNTrainerLayerDef(
+            layer_type=LAYER_INSTANCE_NORM,
+            name=_sanitize_name(module_name),
+            properties={"epsilon": module.eps},
+            input_layers=input_names,
+            hf_module_name=module_name,
+            hf_module_type=module_type,
+            has_weight=affine,
+            has_bias=affine,
+            weight_hf_key=f"{module_name}.weight" if affine else "",
+            bias_hf_key=f"{module_name}.bias" if affine else "",
         )
 
     # MultiheadAttention

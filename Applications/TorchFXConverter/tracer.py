@@ -69,6 +69,10 @@ LEAF_MODULES = (
     # Batch norm
     nn.BatchNorm1d,
     nn.BatchNorm2d,
+    # Group norm / Instance norm
+    nn.GroupNorm,
+    nn.InstanceNorm1d,
+    nn.InstanceNorm2d,
     # Multi-head attention
     nn.MultiheadAttention,
     # Channel shuffle

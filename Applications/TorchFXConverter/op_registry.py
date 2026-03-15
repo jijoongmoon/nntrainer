@@ -20,7 +20,7 @@ from nntrainer_layers import (
     LAYER_EXP, LAYER_LOG, LAYER_CLAMP,
     LAYER_REDUCE_MEAN, LAYER_REDUCE_SUM, LAYER_FLATTEN,
     LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_CONCAT, LAYER_POOLING2D,
-    LAYER_GATHER, LAYER_SLICE,
+    LAYER_GATHER, LAYER_SLICE, LAYER_TOPK, LAYER_ARGSORT,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
     OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE, OP_SDPA, OP_NOOP, OP_UNSUPPORTED,
 )
@@ -63,6 +63,8 @@ FUNCTION_SIMPLE_OPS = {
 FUNCTION_NAME_SIMPLE_OPS = {
     "exp":  LAYER_EXP,
     "log":  LAYER_LOG,
+    "topk": LAYER_TOPK,
+    "argsort": LAYER_ARGSORT,
 }
 
 # Functions that map to OP_NOOP (internal torch/runtime functions)
@@ -168,6 +170,9 @@ METHOD_SIMPLE_OPS = {
     "log":    LAYER_LOG,
     # Indexing
     "__getitem__": LAYER_SLICE,
+    # Selection / sorting
+    "topk":    LAYER_TOPK,
+    "argsort": LAYER_ARGSORT,
 }
 
 # Method-based activation mappings: method_name -> activation type
