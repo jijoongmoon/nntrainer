@@ -46,6 +46,8 @@ _CLASS_NAME_MAP = {
     "roberta": "RobertaModel",
     "t5": "T5Model",
     "mt5": "MT5Model",
+    "lfm2": "Lfm2CausalLM",
+    "granitemoehybrid": "GraniteCausalLM",
 }
 
 _EMBED_NAME_MAP = {
@@ -56,13 +58,14 @@ _EMBED_NAME_MAP = {
     "qwen3": "Qwen3EmbeddingModel",
     "qwen2": "Qwen2EmbeddingModel",
     "bert": "BertEmbeddingModel",
+    "xlm-roberta": "XlmRobertaEmbeddingModel",
 }
 
 _KNOWN_CAUSAL_TYPES = frozenset({
     "qwen3", "qwen2", "llama", "mistral", "gemma",
     "gemma2", "gemma3_text", "phi", "gpt2",
     "gpt_neo", "gpt_neox", "starcoder2", "codegen",
-    "lfm2",
+    "lfm2", "granitemoehybrid",
 })
 
 
