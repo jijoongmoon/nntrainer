@@ -692,159 +692,634 @@ input.setData(image_data);
 
 ## 10. Applications 마이그레이션
 
-### 10.1 마이그레이션 전략
+### 10.1 핵심 원칙: 내부 Layer API는 변경하지 않는다
 
-| 패턴 | 대상 | 변경 필요 여부 |
-|------|------|---------------|
-| **A. INI 기반** | MNIST, AlexNet, VGG, Resnet 등 | 변경 불필요 (Tensor API 미사용) |
-| **B. createLayer API** | PicoGPT, LLaMA, Layers 등 | MHA 외부 캐시 옵트인 시만 변경 |
-| **C. KV cache 직접 관리** | CausalLM | 가장 큰 변경 필요 |
+**변경되는 것:** Public API (`ml::train::Tensor`, `Model::compile` 패턴)
+**변경되지 않는 것:** 내부 Layer API (`InitLayerContext`, `RunLayerContext`, `nntrainer::Tensor`)
 
-### 10.2 CausalLM 마이그레이션 (가장 큰 변경)
+```
+변경 O (Public API)                변경 X (Internal API)
+─────────────────                  ─────────────────────
+ml::train::Tensor (Pimpl 재구현)    nntrainer::Tensor (그대로)
+ml::train::Model::compile()        InitLayerContext::requestWeight()
+ml::train::Layer::operator()       InitLayerContext::requestTensor()
+                                   RunLayerContext::getInput/getOutput()
+                                   RunLayerContext::getTensor/getWeight()
+                                   nntrainer::Tensor::getSharedDataTensor()
+                                   nntrainer::Tensor::multiply_i/add_i()
+```
+
+커스텀 레이어 (`mha_core`, `rms_norm`, `embedding_layer`, `qwen_moe_layer` 등)의 `finalize()`, `forwarding()`, `incremental_forwarding()` 내부 로직은 **수정할 필요 없음**. MHA 외부 캐시 지원을 위한 `finalize()` 입력 개수 분기만 추가.
+
+### 10.2 영향도 분석
+
+| 카테고리 | Applications | 영향도 | 이유 |
+|----------|-------------|--------|------|
+| **INI 기반** | MNIST, VGG, Resnet, TransferLearning | 없음 | Tensor API 미사용, INI 설정 파일로 모델 구성 |
+| **createLayer+addLayer** | SimpleFC, Resnet (C++ API) | 없음 | `createLayer()` + `model->addLayer()` + 문자열 속성 패턴 유지 |
+| **createLayer+addLayer+커스텀 레이어** | PicoGPT, LLaMA | 없음~최소 | 기존 3-4 입력 MHA 하위 호환. 외부 cache 전환은 선택적 |
+| **KV cache 직접 관리** | CausalLM | **큼** | `forEachLayer()` 콜백으로 내부 텐서 접근 → 외부 버퍼 직접 관리로 전환 |
+| **커스텀 옵티마이저** | Custom/momentum.cpp | 없음 | `RunOptimizerContext` API 변경 없음 |
+
+### 10.3 변경 없는 Applications (확인용)
+
+#### SimpleFC (`Applications/SimpleFC/jni/main.cpp`)
+```cpp
+// 현재 코드 — 변경 불필요
+model->setProperty({withKey("batch_size", batch_size), withKey("epochs", epochs)});
+auto optimizer = ml::train::createOptimizer("sgd", {"learning_rate=0.001"});
+model->setOptimizer(std::move(optimizer));
+status = model->compile();       // ← 기존 오버로드 유지
+status = model->initialize();    // ← 기존 오버로드 유지
+```
+
+#### Resnet (`Applications/Resnet/jni/main.cpp`)
+```cpp
+// 현재 코드 — 변경 불필요
+using ml::train::createLayer;
+auto resnetBlock = [](/* ... */) {
+  return createLayer("conv2d", {withKey("filters", filters), ...});
+};
+for (auto &layer : layers) model->addLayer(layer);
+model->compile();
+```
+
+#### PicoGPT (`Applications/PicoGPT/jni/main.cpp`)
+```cpp
+// 현재 코드 — 변경 불필요
+// MHA에 3개 입력: query, key, value
+layers.push_back(createLayer("multi_head_attention", {
+  withKey("name", "attention" + std::to_string(i)),
+  withKey("num_heads", NUM_HEADS),
+  withKey("input_layers", qkv_name)  // ← 3 inputs, 하위 호환
+}));
+```
+
+#### LLaMA (`Applications/LLaMA/jni/main.cpp`)
+```cpp
+// 현재 코드 — 변경 불필요 (커스텀 MHA 사용)
+layers.push_back(createLayer("custom_multi_head_attention", {
+  withKey("name", attn_name),
+  withKey("input_layers", q_name + "," + k_name + "," + v_name)
+}));
+```
+
+#### Custom Optimizer (`Applications/Custom/momentum.cpp`)
+```cpp
+// 현재 코드 — 변경 불필요
+void Momentum::applyGradient(nntrainer::RunOptimizerContext &context) {
+  nntrainer::Tensor &x_grad = context.getGradient();        // 내부 API
+  nntrainer::Tensor &accumulated = context.getOptimizerVariable(0);
+  accumulated.multiply_i(m);
+  accumulated.add_i(x_grad);
+  x_grad.fill(accumulated);
+}
+```
+
+### 10.4 CausalLM 마이그레이션 (가장 큰 변경)
+
+#### 현재 구현 분석
+
+**모델 구성** (`causal_lm.cpp:174-233`):
+```cpp
+// 현재: createLayer + addLayer 패턴 (문자열 기반)
+void CausalLM::constructModel() {
+  std::vector<LayerHandle> layers;
+  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+
+  layers.push_back(createLayer("input", {
+    withKey("name", "input0"),
+    withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))
+  }));
+  layers.push_back(createLayer(embedding_type, {
+    "name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB), ...
+  }));
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    auto transformer = createTransformerDecoderBlock(i, ...);
+    layers.insert(layers.end(), transformer.begin(), transformer.end());
+  }
+
+  for (auto &layer : layers) model->addLayer(layer);
+}
+```
+
+**KV cache save/load** (`causal_lm.cpp:764-821`) — **가장 큰 변경 포인트**:
+```cpp
+// 현재: forEachLayer 콜백으로 내부 RunLayerContext 접근
+void CausalLM::save_kvcache(std::string path, int to_) {
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)> fn =
+    [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *idx) {
+      if (l.getType() == causallm::MHACoreLayer::type) {
+        auto k_cache = context.getTensor(0);    // ← 내부 인덱스로 직접 접근
+        auto v_cache = context.getTensor(1);
+        ml::train::TensorDim k_dim = k_cache.getDim();
+        k_dim.height(to);
+        nntrainer::Tensor k_cache_prompt = k_cache.getSharedDataTensor(k_dim, 0, true);
+        k_cache_prompt.save(f);
+      }
+    };
+  model->forEachLayer(fn, arg);
+}
+```
+
+**Attention 레이어** (`causal_lm.cpp:565-670`):
+```cpp
+// 현재: mha_core에 3개 입력 (Q, K, V)
+std::vector<LayerHandle> CausalLM::createAttention(const int layer_id, ...) {
+  layers.push_back(createLayer("fully_connected", v_params));
+  layers.push_back(createLayer("fully_connected", k_params));
+  layers.push_back(createLayer("fully_connected", q_params));
+  layers.push_back(createLayer("mha_core", {
+    withKey("name", A),
+    withKey("num_heads", n_heads),
+    withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+    withKey("input_layers", Q_norm + "," + K_norm + "," + V)  // ← 3 inputs
+  }));
+  layers.push_back(createLayer("fully_connected", o_params));
+  return layers;
+}
+```
+
+**Compile/Initialize** (`causal_lm.cpp:140-172`):
+```cpp
+// 현재: ExecutionMode 지정
+model->setProperty({withKey("batch_size", BATCH_SIZE), ...});
+model->compile(ml::train::ExecutionMode::INFERENCE);
+model->initialize(ml::train::ExecutionMode::INFERENCE);
+```
+
+**Incremental Inference** (`causal_lm.cpp:396-420`):
+```cpp
+// 현재: incremental_inference API
+output = model->incremental_inference(BATCH_SIZE, input, label,
+                                      input_len, from, to, false);
+```
+
+#### 변경 후 CausalLM
+
+**핵심 변경: KV cache를 외부 버퍼로 관리, mha_core에 5개 입력**
 
 ```cpp
+// ──── causal_lm.h 변경 ────
 class CausalLM {
 private:
+  // 새로 추가: 외부 KV cache 버퍼
   struct KVCacheBuffers {
-    std::vector<float *> key_bufs;
+    std::vector<float *> key_bufs;   // 사용자가 할당한 메모리
     std::vector<float *> val_bufs;
   };
   KVCacheBuffers kv_cache;
-  std::vector<nntrainer::Tensor> key_cache_tensors;
-  std::vector<nntrainer::Tensor> val_cache_tensors;
+  std::vector<ml::train::Tensor> key_cache_tensors;  // fromData 텐서
+  std::vector<ml::train::Tensor> val_cache_tensors;
+
+  // 기존 멤버 유지
+  ModelHandle model;
+  // ...
 };
+```
 
+```cpp
+// ──── causal_lm.cpp constructModel() 변경 ────
 void CausalLM::constructModel() {
+  std::vector<LayerHandle> layers;
+  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+
+  // 입력, 임베딩 등은 기존과 동일
+  layers.push_back(createLayer("input", { ... }));
+  layers.push_back(createLayer(embedding_type, { ... }));
+
+  // 변경: 각 레이어마다 외부 KV cache 버퍼 할당
   for (int i = 0; i < NUM_LAYERS; i++) {
-    kv_cache.key_bufs.push_back(
-      new float[BATCH * MAX_SEQ * NUM_KV_HEADS * HEAD_DIM]);
-    kv_cache.val_bufs.push_back(
-      new float[BATCH * MAX_SEQ * NUM_KV_HEADS * HEAD_DIM]);
+    size_t cache_size = BATCH_SIZE * MAX_SEQ * NUM_KV_HEADS * HEAD_DIM;
+    kv_cache.key_bufs.push_back(new float[cache_size]());
+    kv_cache.val_bufs.push_back(new float[cache_size]());
 
-    TensorDim cache_dim = {BATCH, 1, MAX_SEQ, NUM_KV_HEADS * HEAD_DIM};
+    ml::train::TensorDim cache_dim(
+      {BATCH_SIZE, 1, MAX_SEQ, NUM_KV_HEADS * HEAD_DIM});
     key_cache_tensors.push_back(
-      Tensor::fromData(cache_dim, kv_cache.key_bufs[i],
-                       "layer" + std::to_string(i) + "_ext_k_cache"));
+      ml::train::Tensor::fromData(cache_dim, kv_cache.key_bufs[i]));
     val_cache_tensors.push_back(
-      Tensor::fromData(cache_dim, kv_cache.val_bufs[i],
-                       "layer" + std::to_string(i) + "_ext_v_cache"));
-
-    // MHA core에 5개 입력으로 전달
-    model->addLayer(createLayer("mha_core", {
-      "name=layer" + std::to_string(i) + "_attention",
-      "input_layers=" + q_name + "," + k_name + "," + v_name + ","
-        + key_cache_tensors.back().getName() + ","
-        + val_cache_tensors.back().getName(),
-      "num_heads=" + std::to_string(NUM_HEADS),
-    }));
+      ml::train::Tensor::fromData(cache_dim, kv_cache.val_bufs[i]));
   }
-}
 
-// save/load 간소화 — 외부 버퍼에 직접 접근
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    auto transformer = createTransformerDecoderBlock(i, ...);
+    layers.insert(layers.end(), transformer.begin(), transformer.end());
+  }
+
+  for (auto &layer : layers) model->addLayer(layer);
+}
+```
+
+```cpp
+// ──── createAttention() 변경 ────
+std::vector<LayerHandle> CausalLM::createAttention(const int layer_id, ...) {
+  // V, K, Q projections — 동일
+  layers.push_back(createLayer("fully_connected", v_params));
+  layers.push_back(createLayer("fully_connected", k_params));
+  layers.push_back(createLayer("fully_connected", q_params));
+
+  // 변경: mha_core에 5개 입력 (Q, K, V, cache_key, cache_value)
+  auto cache_k_name = key_cache_tensors[layer_id].name();
+  auto cache_v_name = val_cache_tensors[layer_id].name();
+
+  layers.push_back(createLayer("mha_core", {
+    withKey("name", A),
+    withKey("num_heads", n_heads),
+    withKey("num_heads_kv", n_heads_kv),
+    withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+    withKey("input_layers", Q_norm + "," + K_norm + "," + V
+            + "," + cache_k_name + "," + cache_v_name)  // ← 5 inputs
+  }));
+
+  layers.push_back(createLayer("fully_connected", o_params));
+  return layers;
+}
+```
+
+```cpp
+// ──── save/load_kvcache() 대폭 간소화 ────
+
+// 현재: forEachLayer + RunLayerContext 콜백 (30줄+)
+// 변경 후: 외부 버퍼 직접 접근 (10줄)
+
 void CausalLM::save_kvcache(std::string path, int to) {
   auto f = checkedOpenStream<std::ofstream>(path, std::ios::binary);
   for (int i = 0; i < NUM_LAYERS; i++) {
-    size_t bytes = BATCH * to * NUM_KV_HEADS * HEAD_DIM * sizeof(float);
+    size_t bytes = BATCH_SIZE * to * NUM_KV_HEADS * HEAD_DIM * sizeof(float);
     f.write(reinterpret_cast<char*>(kv_cache.key_bufs[i]), bytes);
     f.write(reinterpret_cast<char*>(kv_cache.val_bufs[i]), bytes);
   }
 }
+
+void CausalLM::load_kvcache(std::string path, int to) {
+  auto f = checkedOpenStream<std::ifstream>(path, std::ios::binary);
+  for (int i = 0; i < NUM_LAYERS; i++) {
+    size_t bytes = BATCH_SIZE * to * NUM_KV_HEADS * HEAD_DIM * sizeof(float);
+    f.read(reinterpret_cast<char*>(kv_cache.key_bufs[i]), bytes);
+    f.read(reinterpret_cast<char*>(kv_cache.val_bufs[i]), bytes);
+  }
+  // 내부 fillPlaceholder가 이미 연결되어 있으므로
+  // model->allocate() 재호출 불필요
+}
 ```
 
-### 10.3 PicoGPT / LLaMA — 변경 없음 (하위 호환)
+```cpp
+// ──── compile/initialize — 기존 오버로드 유지 ────
+// model->compile(ExecutionMode::INFERENCE) 와
+// model->compile(input_tensor, output_tensor) 를 둘 다 지원
+// CausalLM은 기존 addLayer 패턴이므로 기존 compile 사용 가능
+model->compile(ml::train::ExecutionMode::INFERENCE);
+model->initialize(ml::train::ExecutionMode::INFERENCE);
+```
 
-기존 3-4개 입력 MHA 그대로 동작. 외부 cache 전환은 선택적.
+#### MHACoreLayer 변경 (`layers/mha_core.cpp`)
 
-### 10.4 마이그레이션 우선순위
+```cpp
+// mha_core.cpp finalize() — 입력 수에 따른 분기 추가
+void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
+  auto num_inputs = context.getNumInputs();
 
-| 순서 | 대상 | 변경 범위 | 이유 |
-|------|------|-----------|------|
-| 1 | CausalLM | 큼 | KV cache 직접 관리, 가장 큰 수혜자 |
-| 2 | PicoGPT | 작음 | 내장 MHA 사용, 선택적 전환 |
-| 3 | LLaMA | 작음 | 커스텀 어텐션, 선택적 전환 |
-| 4 | 나머지 | 없음 | INI 기반 또는 Tensor API 미사용 |
+  // 기존: 3개 (query, key, value)
+  // 변경: 3-5개 (query, key, value, [cache_key], [cache_value])
+  if (num_inputs >= 4) {
+    use_external_cache = true;
+    // 외부 입력이 cache 역할 → requestTensor() 호출 안 함
+  } else {
+    use_external_cache = false;
+    // 기존: 내부 requestTensor()
+    ml::train::TensorDim cache_key_dim(
+      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+      {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+    tensor_idx[AttentionParams::cache_key] = context.requestTensor(
+      cache_key_dim, "cache_key", nntrainer::Tensor::Initializer::NONE,
+      false, TensorLifespan::MAX_LIFESPAN);
+    tensor_idx[AttentionParams::cache_value] = context.requestTensor(
+      cache_value_dim, "cache_value", nntrainer::Tensor::Initializer::NONE,
+      false, TensorLifespan::MAX_LIFESPAN);
+  }
+
+  // 나머지 (projected_query, attention_weight 등) 동일
+}
+```
+
+```cpp
+// mha_core.cpp incremental_forwarding() — 캐시 접근 분기만 추가
+void MHACoreLayer::incremental_forwarding(
+    nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
+    bool training) {
+  // 캐시 텐서 참조 — 외부/내부 분기
+  nntrainer::Tensor &cache_key = use_external_cache
+    ? context.getInput(3)   // 4번째 입력 = 외부 cache_key
+    : context.getTensor(tensor_idx[AttentionParams::cache_key]);
+  nntrainer::Tensor &cache_value = use_external_cache
+    ? context.getInput(4)   // 5번째 입력 = 외부 cache_value
+    : context.getTensor(tensor_idx[AttentionParams::cache_value]);
+
+  // 이후 로직 100% 동일:
+  // cache_key_step = cache_key.getSharedDataTensor(step_dim, offset);
+  // ...
+}
+```
+
+### 10.5 하위 호환성 보장 요약
+
+| Application | compile() 패턴 | 변경 | 이유 |
+|-------------|----------------|------|------|
+| CausalLM | `compile(ExecutionMode)` | 유지 | addLayer 패턴 그대로, 새 compile(input, output) 추가 |
+| PicoGPT | `compile(ExecutionMode)` | 없음 | 3-input MHA 그대로 동작 |
+| LLaMA | `compile(ExecutionMode)` | 없음 | 커스텀 MHA, 내부 cache |
+| Resnet | `compile()` | 없음 | 기본 오버로드 유지 |
+| SimpleFC | `compile()` | 없음 | 기본 오버로드 유지 |
+| MNIST | INI 파일 | 없음 | API 미사용 |
+| VGG | INI 파일 | 없음 | API 미사용 |
+| test/ccapi | 둘 다 | 없음 | 기존 오버로드 유지 |
+
+**`compile()` 오버로드 전략:**
+```cpp
+class Model {
+  // 기존 (유지) — addLayer 패턴용
+  int compile(ExecutionMode mode = ExecutionMode::TRAIN);
+  int initialize(ExecutionMode mode = ExecutionMode::TRAIN);
+
+  // 새로 추가 — 심볼릭 Tensor 그래프용
+  int compile(const Tensor &input, const Tensor &output,
+              ExecutionMode mode = ExecutionMode::TRAIN);
+};
+```
 
 ---
 
 ## 11. TorchFXConverter 업데이트
 
-### 11.1 변경 이유
+### 11.1 현재 생성 패턴 분석
 
-TorchFXConverter가 생성하는 C++ 코드에서 외부 KV cache를 선택적으로 지원:
+TorchFXConverter는 HuggingFace 모델을 NNTrainer C++ 코드로 변환한다. 생성되는 코드의 핵심 패턴:
+
+**헤더 (`emitter_cpp/header.py` 생성):**
+```cpp
+class Qwen3CausalLM {
+public:
+  void constructModel();
+  void initialize();
+  ModelHandle &getModel() { return model; }
+
+protected:
+  std::vector<LayerHandle> createTransformerDecoderBlock(
+    const int layer_id, std::string input_name);
+  std::vector<LayerHandle> createAttention(
+    const int layer_id, int seq_len, int n_heads, int head_dim,
+    std::string query_name, std::string key_name, std::string value_name);
+  std::vector<LayerHandle> createMlp(
+    const int layer_id, int dim, int hidden_dim, std::string input_name);
+  void registerCustomLayers();
+
+  ModelHandle model;
+
+  // Model constants (HF config에서 추출)
+  unsigned int NUM_VOCAB = 1000;
+  int DIM = 64;
+  int NUM_LAYERS = 2;
+  // ...
+};
+```
+
+**소스 — constructModel() (`emitter_cpp/source_construct.py` 생성):**
+```cpp
+void Qwen3CausalLM::constructModel() {
+  std::vector<LayerHandle> layers;
+  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+
+  layers.push_back(createLayer("input", {
+    withKey("name", "input0"),
+    withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))
+  }));
+  layers.push_back(createLayer("embedding_layer", { ... }));
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    auto block = createTransformerDecoderBlock(i, input_name);
+    layers.insert(layers.end(), block.begin(), block.end());
+  }
+
+  // 최종 norm + LM head
+  layers.push_back(createLayer("rms_norm", { ... }));
+  layers.push_back(createLayer("fully_connected", { ... }));
+
+  for (auto &layer : layers) model->addLayer(layer);
+}
+```
+
+**소스 — createAttention() (`emitter_cpp/source_attention.py` 생성):**
+```cpp
+// 현재: mha_core에 3개 입력, KV cache는 레이어 속성으로 암묵적 할당
+layers.push_back(createLayer("mha_core", {
+  withKey("name", A),
+  withKey("num_heads", n_heads),
+  withKey("num_heads_kv", n_heads / GQA_SIZE),
+  withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+  withKey("sliding_window", SLIDING_WINDOW),
+  withKey("rope_theta", ROPE_THETA),
+  withKey("max_new_tokens", NUM_TO_GENERATE),
+  withKey("input_layers", Q_norm + "," + K_norm + "," + V)  // ← 3 inputs
+}));
+```
+
+**소스 — initialize() (`emitter_cpp/source_custom.py` 생성):**
+```cpp
+void Qwen3CausalLM::initialize() {
+  registerCustomLayers();
+  constructModel();
+  model->setProperty({
+    withKey("batch_size", 1),
+    withKey("epochs", "1"),
+    withKey("model_tensor_type", "FP32-FP32")
+  });
+  model->compile(ml::train::ExecutionMode::INFERENCE);
+  model->initialize(ml::train::ExecutionMode::INFERENCE);
+}
+```
+
+**코드 생성 유틸리티 (`emitter_cpp/helpers.py`):**
+```python
+def _cpp_layer(layer_type, props, indent=2):
+    """createLayer() 호출 코드 생성"""
+    pad = "  " * indent
+    lines = []
+    lines.append(pad + 'layers.push_back(createLayer("' + layer_type + '", {')
+    for i, p in enumerate(props):
+        comma = "," if i < len(props) - 1 else ""
+        lines.append(pad + "  " + p + comma)
+    lines.append(pad + "}));")
+    return lines
+```
+
+### 11.2 변경 계획: `--external-kv-cache` 옵션
 
 ```bash
+# 기존 (기본값) — 내부 cache (하위 호환)
+python converter.py --model Qwen/Qwen3-0.6B
+
+# 새 옵션 — 외부 cache
 python converter.py --model Qwen/Qwen3-0.6B --external-kv-cache
 ```
 
-### 11.2 변경 파일
+### 11.3 변경 파일별 상세
 
-| 파일 | 변경 내용 |
-|------|-----------|
-| `converter.py` | `--external-kv-cache` CLI 옵션 추가 |
-| `emitter_cpp/header.py` | 외부 cache 멤버 변수 선언 |
-| `emitter_cpp/source_construct.py` | `allocateKVCache()`, cache 텐서 생성 |
-| `emitter_cpp/source_attention.py` | mha_core 5-input 모드 생성 |
-| `emitter_ini/` | 변경 없음 |
-| `weight_converter.py` | 변경 없음 |
-| `patterns/` | 변경 없음 |
+#### `converter.py` — CLI 옵션 추가
+```python
+parser.add_argument("--external-kv-cache", action="store_true",
+                    help="Generate external KV cache management code")
+```
 
-### 11.3 생성 코드 비교
-
+#### `emitter_cpp/header.py` — 멤버 변수 추가 (external-kv-cache 모드)
 ```cpp
-// 기존 (내부 cache) — mha_core에 3개 입력
-layers.push_back(createLayer("mha_core", {
-  withKey("name", A),
-  withKey("num_heads", n_heads),
-  withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
-  withKey("input_layers", Q_norm + "," + K_norm + "," + V)
-}));
+// 기존 멤버에 추가
+protected:
+  // External KV cache (--external-kv-cache)
+  struct KVCacheBuffers {
+    std::vector<float *> key_bufs;
+    std::vector<float *> val_bufs;
+  };
+  KVCacheBuffers kv_cache;
+  std::vector<ml::train::Tensor> key_cache_tensors;
+  std::vector<ml::train::Tensor> val_cache_tensors;
 
-// 새 API (--external-kv-cache) — mha_core에 5개 입력
+  void allocateKVCache();
+```
+
+#### `emitter_cpp/source_construct.py` — cache 할당 메서드 + constructModel 변경
+```cpp
+// 새로 생성되는 메서드
+void Qwen3CausalLM::allocateKVCache() {
+  ml::train::TensorDim cache_dim({1, 1,
+    INIT_SEQ_LEN + NUM_TO_GENERATE,
+    NUM_KV_HEADS * HEAD_DIM});
+
+  for (int i = 0; i < NUM_LAYERS; i++) {
+    size_t cache_size = cache_dim.getFeatureLen();
+    kv_cache.key_bufs.push_back(new float[cache_size]());
+    kv_cache.val_bufs.push_back(new float[cache_size]());
+
+    key_cache_tensors.push_back(
+      ml::train::Tensor::fromData(cache_dim, kv_cache.key_bufs[i]));
+    val_cache_tensors.push_back(
+      ml::train::Tensor::fromData(cache_dim, kv_cache.val_bufs[i]));
+  }
+}
+```
+
+#### `emitter_cpp/source_attention.py` — 5-input mha_core 생성
+```cpp
+// --external-kv-cache 모드에서 생성되는 코드
+auto cache_k_name = key_cache_tensors[layer_id].name();
+auto cache_v_name = val_cache_tensors[layer_id].name();
+
 layers.push_back(createLayer("mha_core", {
   withKey("name", A),
   withKey("num_heads", n_heads),
+  withKey("num_heads_kv", n_heads / GQA_SIZE),
+  withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
   withKey("input_layers", Q_norm + "," + K_norm + "," + V
-          + "," + cache_key_name + "," + cache_value_name)
+          + "," + cache_k_name + "," + cache_v_name)  // ← 5 inputs
 }));
+```
+
+#### `emitter_cpp/source_custom.py` — initialize 변경
+```cpp
+void Qwen3CausalLM::initialize() {
+  registerCustomLayers();
+  allocateKVCache();    // ← 새로 추가 (--external-kv-cache 모드)
+  constructModel();
+  model->setProperty({ ... });
+  model->compile(ml::train::ExecutionMode::INFERENCE);
+  model->initialize(ml::train::ExecutionMode::INFERENCE);
+}
+```
+
+### 11.4 변경되지 않는 파일
+
+| 파일 | 이유 |
+|------|------|
+| `emitter_cpp/source_block.py` | 블록 구조는 동일 (norm → attention → residual → ffn → residual) |
+| `emitter_cpp/source_ffn.py` | FFN은 KV cache와 무관 |
+| `emitter_ini/` | INI 형식은 Tensor API와 무관 |
+| `emitter_json.py` | JSON 메타데이터는 Tensor API와 무관 |
+| `weight_converter.py` | 가중치 변환은 Tensor API와 무관 |
+| `patterns/` | 패턴 감지는 Tensor API와 무관 |
+| `node_mapper.py`, `module_mapper.py` 등 | FX 그래프 분석은 Tensor API와 무관 |
+
+### 11.5 기존 생성 코드와의 호환성
+
+```
+--external-kv-cache 없음 (기본):
+  → 현재와 100% 동일한 코드 생성
+  → mha_core 3-input, 내부 cache
+
+--external-kv-cache 있음:
+  → header.py: KVCacheBuffers 멤버 추가
+  → source_construct.py: allocateKVCache() 추가
+  → source_attention.py: mha_core 5-input
+  → source_custom.py: initialize()에 allocateKVCache() 호출 추가
 ```
 
 ---
 
 ## 12. 전체 변경 파일 요약
 
-### Core (Phase 1)
+### Core (Phase 1) — Tensor API
 | 파일 | 변경 |
 |------|------|
+| `api/ccapi/include/tensor_api.h` | Pimpl 기반 재구현 (Var_Grad 상속 제거), `fromData()`, `isExternal()`, 연산 메서드 |
 | `nntrainer/tensor/tensor.h` | `fromData()`, `isExternal()`, `isMaterialized()`, `external_` 멤버 |
 | `nntrainer/tensor/tensor.cpp` | 위 메서드 구현 |
 | `nntrainer/tensor/tensor_pool.h` | `requestOrPlaceholder()` |
 | `nntrainer/tensor/tensor_pool.cpp` | `requestOrPlaceholder()` 구현 |
-| `api/ccapi/include/tensor_api.h` | Pimpl 기반 재구현, `fromData()`, `isExternal()`, 연산 메서드 |
 
-### Layers (Phase 2)
+### Core (Phase 2) — Layer 연동
+| 파일 | 변경 |
+|------|------|
+| `api/ccapi/include/layer.h` | `operator()(Tensor)` 추가 |
+| `api/ccapi/include/model.h` | `compile(Tensor, Tensor)` 오버로드 추가 |
+| `nntrainer/graph/network_graph.cpp` | `finalizeContext()` 외부 텐서 PLACEHOLDER 처리 |
+
+### Layers (Phase 3) — MHA 외부 캐시
 | 파일 | 변경 |
 |------|------|
 | `nntrainer/layers/multi_head_attention_layer.h` | `use_external_cache` 멤버 |
-| `nntrainer/layers/multi_head_attention_layer.cpp` | `finalize()`, `incremental_forwarding()`, `forwarding()` 분기 |
-| `nntrainer/graph/network_graph.cpp` | `finalizeContext()` 외부 텐서 PLACEHOLDER 처리 |
+| `nntrainer/layers/multi_head_attention_layer.cpp` | `finalize()` 입력 수 분기, `forwarding()`/`incremental_forwarding()` 캐시 접근 분기 |
 
-### Applications (Phase 3)
+### Applications (Phase 4) — CausalLM
 | 파일 | 변경 |
 |------|------|
-| `Applications/CausalLM/causal_lm.h` | 외부 cache 버퍼/텐서 멤버 |
-| `Applications/CausalLM/causal_lm.cpp` | `constructModel()`, `save/load_kvcache()` |
+| `Applications/CausalLM/causal_lm.h` | `KVCacheBuffers` 구조체, `key/val_cache_tensors` 멤버 |
+| `Applications/CausalLM/causal_lm.cpp` | `constructModel()` 외부 cache 할당, `createAttention()` 5-input, `save/load_kvcache()` 간소화 |
 | `Applications/CausalLM/layers/mha_core.h` | `use_external_cache` 멤버 |
-| `Applications/CausalLM/layers/mha_core.cpp` | `finalize()`, `incremental_forwarding()` 분기 |
-| `Applications/PicoGPT/jni/main.cpp` | 변경 없음 (하위 호환) |
-| `Applications/LLaMA/jni/main.cpp` | 변경 없음 (하위 호환) |
+| `Applications/CausalLM/layers/mha_core.cpp` | `finalize()` 입력 수 분기, `incremental_forwarding()` 캐시 접근 분기 |
+| `Applications/PicoGPT/jni/main.cpp` | **변경 없음** (하위 호환) |
+| `Applications/LLaMA/jni/main.cpp` | **변경 없음** (하위 호환) |
+| `Applications/Resnet/jni/main.cpp` | **변경 없음** |
+| `Applications/SimpleFC/jni/main.cpp` | **변경 없음** |
+| `Applications/MNIST/jni/main.cpp` | **변경 없음** |
+| `Applications/VGG/jni/main.cpp` | **변경 없음** |
+| `Applications/Custom/momentum.cpp` | **변경 없음** |
 
-### TorchFXConverter (Phase 4)
+### TorchFXConverter (Phase 5)
 | 파일 | 변경 |
 |------|------|
-| `Applications/TorchFXConverter/converter.py` | `--external-kv-cache` 옵션 |
-| `Applications/TorchFXConverter/emitter_cpp/header.py` | 외부 cache 멤버 선언 |
-| `Applications/TorchFXConverter/emitter_cpp/source_construct.py` | cache 할당/텐서 생성 코드 |
-| `Applications/TorchFXConverter/emitter_cpp/source_attention.py` | 5-input mha_core 생성 |
+| `Applications/TorchFXConverter/converter.py` | `--external-kv-cache` CLI 옵션 |
+| `Applications/TorchFXConverter/emitter_cpp/header.py` | 외부 cache 멤버 선언 (조건부) |
+| `Applications/TorchFXConverter/emitter_cpp/source_construct.py` | `allocateKVCache()` 메서드 생성 (조건부) |
+| `Applications/TorchFXConverter/emitter_cpp/source_attention.py` | mha_core 5-input 생성 (조건부) |
+| `Applications/TorchFXConverter/emitter_cpp/source_custom.py` | `initialize()`에 cache 할당 호출 (조건부) |
+| 기타 (ini, json, weight, patterns, mapper) | **변경 없음** |
+
+### Tests
+| 파일 | 변경 |
+|------|------|
+| `test/ccapi/unittest_ccapi.cpp` | **변경 없음** (기존 `compile()` 오버로드 유지) |
+| `test/ccapi/unittest_ccapi_tensor.cpp` | 새 Tensor API 테스트 추가 (Pimpl, fromData, 연산 등) |
+| 신규: `test/ccapi/unittest_tensor_graph.cpp` | 심볼릭 그래프 구축 + compile 테스트 |
 
 ---
 
@@ -853,30 +1328,42 @@ layers.push_back(createLayer("mha_core", {
 ```
 Phase 1: Core Tensor API (Pimpl 기반 재구현)
   ├── tensor_api.h: Var_Grad 상속 제거, Pimpl 패턴 도입
-  ├── tensor.h/cpp: fromData(), isExternal(), isMaterialized()
-  ├── tensor_pool: requestOrPlaceholder()
-  └── Tensor 연산 메서드 (add, matmul, reshape 등)
+  ├── Tensor(dim), fromData(), zeros(), ones() 구현
+  ├── isExternal(), isMaterialized(), shape(), dtype() 구현
+  ├── data<T>(), mutable_data<T>(), getValue/setValue 구현
+  ├── setData() (외부 포인터 교체) 구현
+  ├── tensor_pool: requestOrPlaceholder() 추가
+  └── 테스트: unittest_ccapi_tensor.cpp 업데이트
 
-Phase 2: Layer 연동
-  ├── Layer::operator()(Tensor) — 심볼릭 그래프 구축
-  ├── Model::compile(input, output) — 그래프 추출 + 내부 매핑
-  └── Lazy chaining (chain/eval)
+Phase 2: Layer 연동 + 심볼릭 그래프
+  ├── Layer::operator()(Tensor) — 심볼릭 그래프 edge 기록
+  ├── Tensor::add/matmul/reshape — 암묵적 레이어 생성
+  ├── Model::compile(Tensor, Tensor) — 그래프 추출 + addLayer + 기존 compile
+  ├── _bind() — API Tensor ↔ 내부 Var_Grad 바인딩
+  ├── Lazy chaining: chain/add_i/multiply_i/eval
+  └── 테스트: unittest_tensor_graph.cpp 신규
 
 Phase 3: MHA 외부 캐시 지원
-  ├── multi_head_attention_layer: finalize/forwarding 분기
-  ├── mha_core (CausalLM): 동일 패턴
-  └── network_graph: finalizeContext PLACEHOLDER 처리
+  ├── multi_head_attention_layer: finalize() 입력 수 분기
+  ├── multi_head_attention_layer: forwarding/incremental_forwarding 캐시 접근 분기
+  ├── network_graph: finalizeContext() fromData 텐서 → PLACEHOLDER 처리
+  └── 테스트: MHA 3-input (기존 호환) + 5-input (외부 cache) 검증
 
 Phase 4: Applications 마이그레이션
-  ├── CausalLM: 외부 cache 버퍼 관리로 전환
-  ├── PicoGPT: 하위 호환 확인 (변경 없음)
-  └── LLaMA: 하위 호환 확인 (변경 없음)
+  ├── CausalLM/layers/mha_core: finalize/incremental_forwarding 분기 추가
+  ├── CausalLM/causal_lm: constructModel 외부 cache 할당, createAttention 5-input
+  ├── CausalLM/causal_lm: save/load_kvcache 간소화
+  ├── PicoGPT: 하위 호환 검증 (변경 없음)
+  ├── LLaMA: 하위 호환 검증 (변경 없음)
+  └── 기타 (Resnet, SimpleFC, MNIST): 하위 호환 검증 (변경 없음)
 
 Phase 5: TorchFXConverter
-  ├── converter.py: --external-kv-cache 옵션
-  ├── source_attention.py: 5-input mha_core
-  ├── source_construct.py: cache 할당 코드
-  └── header.py: 외부 cache 멤버 선언
+  ├── converter.py: --external-kv-cache 옵션 추가
+  ├── header.py: KVCacheBuffers 멤버 생성 (조건부)
+  ├── source_construct.py: allocateKVCache() 생성 (조건부)
+  ├── source_attention.py: 5-input mha_core 생성 (조건부)
+  ├── source_custom.py: initialize()에 cache 할당 추가 (조건부)
+  └── 기본 모드 (--external-kv-cache 없음) 기존 코드와 동일 출력 검증
 ```
 
 ---
