@@ -267,6 +267,35 @@ public:
    */
   std::vector<Tensor> getInputTensors() const;
 
+  // --- Lazy chaining ---
+
+  /**
+   * @brief Start a lazy operation chain (clears any pending chain)
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &chain();
+
+  /**
+   * @brief Queue in-place addition (lazy, applied on eval())
+   * @param value Scalar to add
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &add_i(float value);
+
+  /**
+   * @brief Queue in-place multiplication (lazy, applied on eval())
+   * @param value Scalar to multiply
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &multiply_i(float value);
+
+  /**
+   * @brief Execute all queued operations on the materialized tensor
+   * @return Reference to this tensor
+   * @throws std::runtime_error if tensor is not materialized
+   */
+  Tensor &eval();
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

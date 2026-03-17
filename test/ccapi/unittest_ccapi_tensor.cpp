@@ -803,3 +803,55 @@ TEST(nntrainer_ccapi_graph, multi_layer_bind_p) {
   // Output shape should be fc2's output
   EXPECT_EQ(y.shape().width(), 2u);
 }
+
+// ===== Step 2-5: Lazy chaining (chain/eval) =====
+
+/**
+ * @brief chain().multiply_i().add_i().eval() executes in order
+ */
+TEST(nntrainer_ccapi_tensor, lazy_chain_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  t.chain().multiply_i(2.0f).add_i(1.0f).eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 3.0f);  // 1*2+1
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 3.0f);
+}
+
+/**
+ * @brief Operation order matters: add then multiply
+ */
+TEST(nntrainer_ccapi_tensor, lazy_chain_order_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 1});
+  t.chain().add_i(3.0f).multiply_i(2.0f).eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 8.0f);  // (1+3)*2
+}
+
+/**
+ * @brief eval on non-materialized tensor throws
+ */
+TEST(nntrainer_ccapi_tensor, lazy_eval_on_symbolic_n) {
+  ml::train::Tensor t({1, 1, 2, 2});
+  t.chain().add_i(1.0f);
+  EXPECT_THROW(t.eval(), std::runtime_error);
+}
+
+/**
+ * @brief chain() clears previous pending ops
+ */
+TEST(nntrainer_ccapi_tensor, lazy_chain_reset_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 1});
+  t.chain().add_i(100.0f);  // queued but not eval'd
+  t.chain().add_i(5.0f).eval();  // chain() clears, only +5 applied
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 6.0f);  // 1+5
+}
+
+/**
+ * @brief eval clears the chain after execution
+ */
+TEST(nntrainer_ccapi_tensor, lazy_eval_clears_chain_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 1});
+  t.chain().multiply_i(3.0f).eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 3.0f);
+  // eval again should be no-op (chain is empty)
+  t.eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 3.0f);
+}

@@ -48,6 +48,9 @@ struct Tensor::Impl {
   // Bound internal tensor (set after model compile+initialize)
   nntrainer::Tensor *bound_tensor = nullptr;
 
+  // Lazy operation chain
+  std::vector<std::function<void(nntrainer::Tensor &)>> call_chain;
+
   Impl() = default;
 
   Impl(const TensorDim &d, const std::string &n) : dim(d), name(n), valid(true) {}
@@ -214,6 +217,49 @@ void Tensor::setData(void *new_ptr) {
   impl_->external_ptr = new_ptr;
   impl_->eager_data->setData(
     std::make_shared<nntrainer::MemoryData>(new_ptr), 0, false);
+}
+
+// --- Lazy chaining ---
+
+Tensor &Tensor::chain() {
+  if (!impl_) {
+    throw std::runtime_error("Cannot chain on invalid tensor");
+  }
+  impl_->call_chain.clear();
+  return *this;
+}
+
+Tensor &Tensor::add_i(float value) {
+  if (!impl_) {
+    throw std::runtime_error("Cannot add_i on invalid tensor");
+  }
+  impl_->call_chain.push_back(
+    [value](nntrainer::Tensor &t) { t.add_i(value); });
+  return *this;
+}
+
+Tensor &Tensor::multiply_i(float value) {
+  if (!impl_) {
+    throw std::runtime_error("Cannot multiply_i on invalid tensor");
+  }
+  impl_->call_chain.push_back(
+    [value](nntrainer::Tensor &t) { t.multiply_i(value); });
+  return *this;
+}
+
+Tensor &Tensor::eval() {
+  if (!impl_ || !isMaterialized()) {
+    throw std::runtime_error(
+      "Cannot eval: tensor is not materialized");
+  }
+  nntrainer::Tensor *target = impl_->bound_tensor
+                                ? impl_->bound_tensor
+                                : impl_->eager_data.get();
+  for (auto &op : impl_->call_chain) {
+    op(*target);
+  }
+  impl_->call_chain.clear();
+  return *this;
 }
 
 // --- Factory methods ---
