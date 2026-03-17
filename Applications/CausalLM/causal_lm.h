@@ -48,6 +48,7 @@
 #include <layer.h>
 #include <model.h>
 #include <random>
+#include <vector>
 
 #include <limits.h>
 
@@ -63,6 +64,24 @@ using LayerHandle = std::shared_ptr<ml::train::Layer>;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 
 using json = nlohmann::json;
+
+/**
+ * @brief KV cache buffer storage for external cache mode.
+ *        Each layer has a pair of (key_cache, value_cache) raw buffers.
+ */
+struct KVCacheBuffers {
+  std::vector<std::vector<float>> key_buffers;   /**< per-layer key cache */
+  std::vector<std::vector<float>> value_buffers;  /**< per-layer value cache */
+
+  void allocate(unsigned int num_layers, size_t cache_size) {
+    key_buffers.resize(num_layers);
+    value_buffers.resize(num_layers);
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      key_buffers[i].resize(cache_size, 0.0f);
+      value_buffers[i].resize(cache_size, 0.0f);
+    }
+  }
+};
 
 /**
  * @brief CausalLM Class
@@ -221,6 +240,12 @@ protected:
   unsigned int global_token_len;
 
   std::mt19937 rng; /**< Random Number Gen */
+
+  KVCacheBuffers kv_cache_buffers; /**< External KV cache buffers */
+  std::vector<std::string>
+    key_cache_tensor_names; /**< input layer names for external key caches */
+  std::vector<std::string>
+    val_cache_tensor_names; /**< input layer names for external value caches */
 };
 
 /**

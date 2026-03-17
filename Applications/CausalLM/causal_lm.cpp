@@ -194,6 +194,31 @@ void CausalLM::constructModel() {
     {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
      "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM)}));
 
+  // allocate external KV cache buffers and create input layers for them
+  size_t max_timestep = INIT_SEQ_LEN + NUM_TO_GENERATE;
+  size_t kv_heads = NUM_HEADS / GQA_SIZE;
+  size_t cache_size = BATCH_SIZE * kv_heads * max_timestep * HEAD_DIM;
+  kv_cache_buffers.allocate(NUM_LAYERS, cache_size);
+  key_cache_tensor_names.resize(NUM_LAYERS);
+  val_cache_tensor_names.resize(NUM_LAYERS);
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    std::string k_name = "ext_cache_key_" + std::to_string(i);
+    std::string v_name = "ext_cache_val_" + std::to_string(i);
+    key_cache_tensor_names[i] = k_name;
+    val_cache_tensor_names[i] = v_name;
+
+    std::string cache_shape = std::to_string(kv_heads) + ":" +
+                              std::to_string(max_timestep) + ":" +
+                              std::to_string(HEAD_DIM);
+    layers.push_back(
+      createLayer("input", {withKey("name", k_name),
+                            withKey("input_shape", cache_shape)}));
+    layers.push_back(
+      createLayer("input", {withKey("name", v_name),
+                            withKey("input_shape", cache_shape)}));
+  }
+
   // create transformer layers
   for (int i = 0; i < NUM_LAYERS; ++i) {
     std::vector<LayerHandle> transformer;
@@ -645,7 +670,7 @@ CausalLM::createAttention(const int layer_id, int seq_len, int n_heads,
     withKey("weight_initializer", "ones")};
   layers.push_back(createLayer("fully_connected", q_params));
 
-  // Attention core layer
+  // Attention core layer (5-input: Q, K, V, ext_cache_key, ext_cache_val)
   std::vector<std::string> a_params = {
     withKey("name", A),
     withKey("num_heads", n_heads),
@@ -656,7 +681,9 @@ CausalLM::createAttention(const int layer_id, int seq_len, int n_heads,
                                 : UINT_MAX),
     withKey("rope_theta", ROPE_THETA),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-    withKey("input_layers", {Q, K, V})};
+    withKey("input_layers",
+            {Q, K, V, key_cache_tensor_names[layer_id],
+             val_cache_tensor_names[layer_id]})};
   layers.push_back(createLayer("mha_core", a_params));
 
   // O layer
