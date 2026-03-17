@@ -20,112 +20,113 @@
 #endif // __cpluscplus
 
 #include <layer.h>
-#include <tensor.h>
-#include <tuple>
-#include <var_grad.h>
-
-using iTensor = nntrainer::Tensor;
+#include <memory>
+#include <string>
+#include <tensor_dim.h>
 
 namespace ml {
 namespace train {
 
 /**
  * @class   Tensor
- * @brief   Tensor extends over Var_Grad for the API
+ * @brief   Public Tensor API using Pimpl pattern.
+ *
+ * Symbolic tensors (constructed with dim) represent graph placeholders.
+ * Eager tensors (fromData/zeros/ones) hold actual data immediately.
+ * After model compile, symbolic tensors get bound to internal storage.
  */
-class Tensor : public nntrainer::Var_Grad {
+class Tensor {
 public:
   /**
-   * @brief Weight default constructor
+   * @brief Default constructor — creates an invalid/empty tensor
    */
-  Tensor() : nntrainer::Var_Grad() {}
+  Tensor();
 
   /**
-   * @brief Construct a new Tensor object
+   * @brief Construct a symbolic tensor with given dimensions
    *
-   * @param dim Variable and gradient tensor dimension
-   * @param init Initializer for the Tensor
-   * @param needg If the tensor needs gradient
-   * @param name Name for this tensor
+   * @param dim Tensor dimensions
+   * @param name Optional name for graph identification
    */
-  explicit Tensor(
-    const TensorDim &dim,
-    const nntrainer::Initializer init = nntrainer::Initializer::ZEROS,
-    bool ng = false, std::string name = ""){};
+  explicit Tensor(const TensorDim &dim, const std::string &name = "");
 
   /**
-   * @brief Swap for weight
-   *
-   * @param lhs Swap to
-   * @param rhs Swap from
-   * @note Only swap gradient if need gradient
+   * @brief Destructor
    */
-  friend void swap(Tensor &lhs, Tensor &rhs) noexcept {
-    using std::swap;
-    swap(static_cast<Var_Grad &>(lhs), static_cast<Var_Grad &>(rhs));
-  }
+  ~Tensor();
 
   /**
-   * @brief Copy constructor for weight
-   *
-   * @param rhs weight to construct from
+   * @brief Move constructor
    */
-  Tensor(const Tensor &rhs) = default;
+  Tensor(Tensor &&rhs) noexcept;
 
   /**
-   * @brief Move constructor for weight
-   *
-   * @param rhs weight to construct from
+   * @brief Move assignment
    */
-  Tensor(Tensor &&rhs) = default;
+  Tensor &operator=(Tensor &&rhs) noexcept;
 
   /**
-   * @brief copy assigment
-   *
-   * @param rhs copy from
-   * @return Tensor& Updated weight
+   * @brief Copy constructor (shallow — shares the same graph node)
    */
-  Tensor &operator=(const Tensor &rhs) = default;
+  Tensor(const Tensor &rhs);
 
   /**
-   * @brief move assignment
-   *
-   * @param rhs move from
-   * @return Tensor& Updated weight
+   * @brief Copy assignment (shallow)
    */
-  Tensor &operator=(Tensor &&rhs) = default;
+  Tensor &operator=(const Tensor &rhs);
 
   /**
-   * @brief Clone the currnet object
+   * @brief Clone with deep copy of data (for eager tensors)
    *
-   * @return Cloned copy
+   * @return Deep-copied Tensor
    */
-  Tensor clone() const {
-    Tensor t(*this);
-    if (!this->var->empty())
-      t.var = std::make_shared<iTensor>(this->var->clone());
-    if (!this->grad->empty())
-      t.grad = std::make_shared<iTensor>(this->grad->clone());
-
-    return t;
-  }
+  Tensor clone() const;
 
   /**
-   * @brief source layer setter
+   * @brief Check if this tensor is valid (has been properly constructed)
    *
+   * @return true if tensor has been constructed with dim or data
    */
-  void setSrcLayer(std::shared_ptr<Layer> l) { src_layer = l; }
+  bool isValid() const;
 
   /**
-   * @brief source layer getter
+   * @brief Get tensor dimensions
    *
-   * @return Layer
+   * @return TensorDim
    */
-  std::shared_ptr<Layer> getSrcLayer() { return src_layer; }
+  const TensorDim &shape() const;
+
+  /**
+   * @brief Get tensor name
+   *
+   * @return name string
+   */
+  const std::string &name() const;
+
+  /**
+   * @brief Get data type
+   *
+   * @return TensorDim::DataType
+   */
+  TensorDim::DataType dtype() const;
+
+  /**
+   * @brief Set the source layer that produced this tensor
+   *
+   * @param l Source layer
+   */
+  void setSrcLayer(std::shared_ptr<Layer> l);
+
+  /**
+   * @brief Get the source layer that produced this tensor
+   *
+   * @return Source layer (may be nullptr)
+   */
+  std::shared_ptr<Layer> getSrcLayer() const;
 
 private:
-  std::shared_ptr<Layer>
-    src_layer; /**< source layer which create this Tensor */
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 } // namespace train

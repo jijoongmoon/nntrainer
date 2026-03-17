@@ -19,13 +19,10 @@
 #include <tensor_api.h>
 
 /**
- * @brief Tensor Construct Test
+ * @brief Original test — backward compatibility with Pimpl
  */
-
 TEST(nntrainer_ccapi, tensor_01_p) {
-
   std::shared_ptr<ml::train::Layer> layer;
-
   ml::train::Tensor a;
 
   EXPECT_NO_THROW(layer =
@@ -36,4 +33,152 @@ TEST(nntrainer_ccapi, tensor_01_p) {
 
   std::shared_ptr<ml::train::Layer> layer_b = a.getSrcLayer();
   EXPECT_EQ(layer_b->getName(), "input0");
+}
+
+/**
+ * @brief Default constructed tensor is invalid
+ */
+TEST(nntrainer_ccapi_tensor, default_construct_p) {
+  ml::train::Tensor t;
+  EXPECT_FALSE(t.isValid());
+}
+
+/**
+ * @brief Symbolic tensor with dimension is valid
+ */
+TEST(nntrainer_ccapi_tensor, symbolic_construct_p) {
+  ml::train::TensorDim dim({1, 1, 28, 28});
+  ml::train::Tensor t(dim, "input");
+
+  EXPECT_TRUE(t.isValid());
+  EXPECT_EQ(t.name(), "input");
+  EXPECT_EQ(t.shape().batch(), 1);
+  EXPECT_EQ(t.shape().channel(), 1);
+  EXPECT_EQ(t.shape().height(), 28);
+  EXPECT_EQ(t.shape().width(), 28);
+}
+
+/**
+ * @brief Symbolic tensor without name
+ */
+TEST(nntrainer_ccapi_tensor, symbolic_construct_no_name_p) {
+  ml::train::TensorDim dim({1, 3, 32, 32});
+  ml::train::Tensor t(dim);
+
+  EXPECT_TRUE(t.isValid());
+  EXPECT_EQ(t.name(), "");
+  EXPECT_EQ(t.shape().channel(), 3);
+}
+
+/**
+ * @brief dtype defaults to FP32
+ */
+TEST(nntrainer_ccapi_tensor, dtype_default_p) {
+  ml::train::TensorDim dim({1, 1, 2, 2});
+  ml::train::Tensor t(dim);
+
+  EXPECT_EQ(t.dtype(), ml::train::TensorDim::DataType::FP32);
+}
+
+/**
+ * @brief Move constructor transfers ownership
+ */
+TEST(nntrainer_ccapi_tensor, move_construct_p) {
+  ml::train::TensorDim dim({1, 1, 28, 28});
+  ml::train::Tensor a(dim, "original");
+  ml::train::Tensor b(std::move(a));
+
+  EXPECT_TRUE(b.isValid());
+  EXPECT_EQ(b.name(), "original");
+  EXPECT_EQ(b.shape().height(), 28);
+  // moved-from tensor should be invalid
+  EXPECT_FALSE(a.isValid());
+}
+
+/**
+ * @brief Move assignment transfers ownership
+ */
+TEST(nntrainer_ccapi_tensor, move_assign_p) {
+  ml::train::TensorDim dim({1, 1, 10, 10});
+  ml::train::Tensor a(dim, "src");
+  ml::train::Tensor b;
+
+  b = std::move(a);
+  EXPECT_TRUE(b.isValid());
+  EXPECT_EQ(b.name(), "src");
+  EXPECT_FALSE(a.isValid());
+}
+
+/**
+ * @brief Copy constructor creates independent copy
+ */
+TEST(nntrainer_ccapi_tensor, copy_construct_p) {
+  ml::train::TensorDim dim({1, 1, 28, 28});
+  ml::train::Tensor a(dim, "shared");
+  ml::train::Tensor b(a);
+
+  EXPECT_TRUE(b.isValid());
+  EXPECT_EQ(b.name(), "shared");
+  EXPECT_EQ(b.shape().width(), 28);
+  // both should be valid
+  EXPECT_TRUE(a.isValid());
+}
+
+/**
+ * @brief Copy assignment creates independent copy
+ */
+TEST(nntrainer_ccapi_tensor, copy_assign_p) {
+  ml::train::TensorDim dim({1, 1, 5, 5});
+  ml::train::Tensor a(dim, "orig");
+  ml::train::Tensor b;
+
+  b = a;
+  EXPECT_TRUE(b.isValid());
+  EXPECT_EQ(b.name(), "orig");
+  EXPECT_TRUE(a.isValid());
+}
+
+/**
+ * @brief Clone creates independent copy
+ */
+TEST(nntrainer_ccapi_tensor, clone_p) {
+  ml::train::TensorDim dim({1, 1, 3, 3});
+  ml::train::Tensor a(dim, "cloneable");
+  ml::train::Tensor b = a.clone();
+
+  EXPECT_TRUE(b.isValid());
+  EXPECT_EQ(b.name(), "cloneable");
+  EXPECT_EQ(b.shape().height(), 3);
+}
+
+/**
+ * @brief Accessing shape on invalid tensor throws
+ */
+TEST(nntrainer_ccapi_tensor, invalid_shape_n) {
+  ml::train::Tensor t;
+  EXPECT_THROW(t.shape(), std::runtime_error);
+}
+
+/**
+ * @brief Accessing name on invalid tensor throws
+ */
+TEST(nntrainer_ccapi_tensor, invalid_name_n) {
+  ml::train::Tensor t;
+  EXPECT_THROW(t.name(), std::runtime_error);
+}
+
+/**
+ * @brief Accessing dtype on invalid tensor throws
+ */
+TEST(nntrainer_ccapi_tensor, invalid_dtype_n) {
+  ml::train::Tensor t;
+  EXPECT_THROW(t.dtype(), std::runtime_error);
+}
+
+/**
+ * @brief setSrcLayer / getSrcLayer on default tensor
+ */
+TEST(nntrainer_ccapi_tensor, src_layer_default_p) {
+  ml::train::Tensor t;
+  EXPECT_EQ(t.getSrcLayer(), nullptr);
 }
