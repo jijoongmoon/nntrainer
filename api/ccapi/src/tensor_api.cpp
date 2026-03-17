@@ -464,6 +464,14 @@ int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
     output_layer_name = output_producer->getName();
   }
 
+  // Track additional leaf tensors (e.g., fromData external caches)
+  // Maps leaf name → (dim, pointer to API tensor or nullptr)
+  struct LeafInfo {
+    TensorDim dim;
+  };
+  std::map<std::string, LeafInfo> additional_leaves;
+  int unnamed_leaf_counter = 0;
+
   // DFS: visit all inputs first (post-order = topological order)
   std::function<void(const Tensor &)> dfs = [&](const Tensor &t) {
     auto producer = t.getProducingLayer();
@@ -487,7 +495,21 @@ int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
       if (inp_producer) {
         input_names.push_back(inp_producer->getName());
       } else {
-        input_names.push_back(input_layer_name);
+        // Leaf tensor — determine which input layer it maps to
+        std::string leaf_name = inp.name();
+        if (leaf_name.empty()) {
+          leaf_name = "ext_input_" + std::to_string(unnamed_leaf_counter++);
+        }
+        if (leaf_name == input_layer_name) {
+          // Main input tensor
+          input_names.push_back(input_layer_name);
+        } else {
+          // Additional leaf (e.g., fromData tensor)
+          if (additional_leaves.find(leaf_name) == additional_leaves.end()) {
+            additional_leaves[leaf_name] = {inp.shape()};
+          }
+          input_names.push_back(leaf_name);
+        }
       }
     }
 
@@ -496,7 +518,7 @@ int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
 
   dfs(output);
 
-  // 1. Create and add the input layer
+  // 1. Create and add the main input layer
   const TensorDim &dim = input.shape();
   std::string shape_str = std::to_string(dim.channel()) + ":" +
                            std::to_string(dim.height()) + ":" +
@@ -507,6 +529,19 @@ int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
   int status = addLayer(std::move(input_layer));
   if (status != ML_ERROR_NONE) {
     return status;
+  }
+
+  // 1b. Create input layers for additional leaf tensors
+  for (auto &[leaf_name, leaf_info] : additional_leaves) {
+    std::string leaf_shape = std::to_string(leaf_info.dim.channel()) + ":" +
+                              std::to_string(leaf_info.dim.height()) + ":" +
+                              std::to_string(leaf_info.dim.width());
+    auto leaf_layer = createLayer(
+      "input", {"name=" + leaf_name, "input_shape=" + leaf_shape});
+    status = addLayer(std::move(leaf_layer));
+    if (status != ML_ERROR_NONE) {
+      return status;
+    }
   }
 
   // 2. Add each layer in topological order with input_layers set

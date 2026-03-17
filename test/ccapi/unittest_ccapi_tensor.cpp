@@ -855,3 +855,65 @@ TEST(nntrainer_ccapi_tensor, lazy_eval_clears_chain_p) {
   t.eval();
   EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 3.0f);
 }
+
+// ===== Step 3-3: Integration test — fromData + MHA + Model =====
+
+/**
+ * @brief Graph with external cache tensors compiles and materializes
+ */
+TEST(nntrainer_ccapi_graph, external_cache_mha_compile_p) {
+  using namespace ml::train;
+
+  auto input = Tensor({1, 1, 4, 64}, "input");
+
+  float key_buf[1 * 1 * 32 * 64] = {};
+  float val_buf[1 * 1 * 32 * 64] = {};
+  auto key_cache = Tensor::fromData({1, 1, 32, 64}, key_buf, "key_cache");
+  auto val_cache = Tensor::fromData({1, 1, 32, 64}, val_buf, "val_cache");
+
+  LayerHandle q_proj = createLayer("fully_connected", {"unit=64", "name=q_proj"});
+  LayerHandle k_proj = createLayer("fully_connected", {"unit=64", "name=k_proj"});
+  LayerHandle v_proj = createLayer("fully_connected", {"unit=64", "name=v_proj"});
+
+  auto q = q_proj(input);
+  auto k = k_proj(input);
+  auto v = v_proj(input);
+
+  LayerHandle mha = createLayer("multi_head_attention",
+                                {"name=mha", "num_heads=4"});
+  auto attn = mha({q, k, v, key_cache, val_cache});
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(input, attn), ML_ERROR_NONE);
+
+  // Input should be materialized after compile
+  EXPECT_TRUE(input.isMaterialized());
+
+  // External cache tensors remain external and materialized
+  EXPECT_TRUE(key_cache.isExternal());
+  EXPECT_TRUE(key_cache.isMaterialized());
+  EXPECT_TRUE(val_cache.isExternal());
+  EXPECT_TRUE(val_cache.isMaterialized());
+}
+
+/**
+ * @brief Graph with additional leaf tensors (non-fromData) works
+ */
+TEST(nntrainer_ccapi_graph, multiple_leaf_inputs_p) {
+  using namespace ml::train;
+
+  auto x1 = Tensor({1, 1, 1, 4}, "x1");
+  auto x2 = Tensor({1, 1, 1, 4}, "x2");
+
+  // Two separate inputs go into an add layer
+  auto sum = x1.add(x2);
+
+  LayerHandle fc = createLayer("fully_connected", {"unit=2", "name=fc"});
+  auto y = fc(sum);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x1, y), ML_ERROR_NONE);
+
+  EXPECT_TRUE(x1.isMaterialized());
+  EXPECT_TRUE(y.isMaterialized());
+}
