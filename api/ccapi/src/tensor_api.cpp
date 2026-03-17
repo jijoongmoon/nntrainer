@@ -14,6 +14,9 @@
 
 #include <tensor_api.h>
 
+#include <tensor.h>
+
+#include <cstring>
 #include <stdexcept>
 
 namespace ml {
@@ -26,6 +29,10 @@ struct Tensor::Impl {
   TensorDim dim;
   std::string name;
   bool valid = false;
+  bool external = false;
+
+  std::shared_ptr<nntrainer::Tensor> eager_data;
+  void *external_ptr = nullptr;
 
   std::shared_ptr<Layer> src_layer;
 
@@ -61,6 +68,10 @@ Tensor Tensor::clone() const {
   Tensor t;
   if (impl_) {
     t.impl_ = std::make_unique<Impl>(*impl_);
+    if (impl_->eager_data && !impl_->external) {
+      t.impl_->eager_data =
+        std::make_shared<nntrainer::Tensor>(impl_->eager_data->clone());
+    }
   }
   return t;
 }
@@ -90,6 +101,58 @@ TensorDim::DataType Tensor::dtype() const {
     throw std::runtime_error("Cannot get dtype of invalid tensor");
   }
   return impl_->dim.getDataType();
+}
+
+// --- State queries ---
+
+bool Tensor::isExternal() const {
+  return impl_ && impl_->external;
+}
+
+bool Tensor::isMaterialized() const {
+  return impl_ && (impl_->eager_data != nullptr);
+}
+
+// --- Factory methods ---
+
+Tensor Tensor::fromData(const TensorDim &dim, void *data,
+                        const std::string &name) {
+  if (!data) {
+    throw std::invalid_argument("fromData: data pointer must not be null");
+  }
+  Tensor t;
+  t.impl_->dim = dim;
+  t.impl_->name = name;
+  t.impl_->valid = true;
+  t.impl_->external = true;
+  t.impl_->external_ptr = data;
+  t.impl_->eager_data =
+    std::make_shared<nntrainer::Tensor>(dim, data);
+  return t;
+}
+
+Tensor Tensor::zeros(const TensorDim &dim, const std::string &name) {
+  Tensor t;
+  t.impl_->dim = dim;
+  t.impl_->name = name;
+  t.impl_->valid = true;
+  t.impl_->external = false;
+  t.impl_->eager_data =
+    std::make_shared<nntrainer::Tensor>(dim, true, nntrainer::Initializer::ZEROS, name);
+  t.impl_->eager_data->initialize();
+  return t;
+}
+
+Tensor Tensor::ones(const TensorDim &dim, const std::string &name) {
+  Tensor t;
+  t.impl_->dim = dim;
+  t.impl_->name = name;
+  t.impl_->valid = true;
+  t.impl_->external = false;
+  t.impl_->eager_data =
+    std::make_shared<nntrainer::Tensor>(dim, true, nntrainer::Initializer::ONES, name);
+  t.impl_->eager_data->initialize();
+  return t;
 }
 
 // --- Source layer (backward compatible) ---

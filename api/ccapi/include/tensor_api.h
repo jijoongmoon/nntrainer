@@ -111,6 +111,49 @@ public:
   TensorDim::DataType dtype() const;
 
   /**
+   * @brief Check if this tensor wraps external (user-managed) memory
+   *
+   * @return true if created via fromData()
+   */
+  bool isExternal() const;
+
+  /**
+   * @brief Check if this tensor has actual data (eager or bound after compile)
+   *
+   * @return true if data is accessible via data<T>() / getValue()
+   */
+  bool isMaterialized() const;
+
+  /**
+   * @brief Create a tensor wrapping external user-managed memory (zero-copy)
+   *
+   * @param dim Tensor dimensions
+   * @param data Pointer to user-managed buffer (must outlive the tensor)
+   * @param name Optional name
+   * @return Tensor wrapping the external buffer
+   */
+  static Tensor fromData(const TensorDim &dim, void *data,
+                          const std::string &name = "");
+
+  /**
+   * @brief Create a zero-initialized eager tensor
+   *
+   * @param dim Tensor dimensions
+   * @param name Optional name
+   * @return Tensor with all elements set to 0
+   */
+  static Tensor zeros(const TensorDim &dim, const std::string &name = "");
+
+  /**
+   * @brief Create an eager tensor initialized to ones
+   *
+   * @param dim Tensor dimensions
+   * @param name Optional name
+   * @return Tensor with all elements set to 1
+   */
+  static Tensor ones(const TensorDim &dim, const std::string &name = "");
+
+  /**
    * @brief Set the source layer that produced this tensor
    *
    * @param l Source layer
