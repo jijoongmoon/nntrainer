@@ -14,6 +14,7 @@
 
 #include <tensor_api.h>
 
+#include <memory_data.h>
 #include <tensor.h>
 
 #include <cstring>
@@ -113,6 +114,64 @@ bool Tensor::isMaterialized() const {
   return impl_ && (impl_->eager_data != nullptr);
 }
 
+// --- Data access ---
+
+template <typename T> const T *Tensor::data() const {
+  if (!impl_ || !impl_->eager_data) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  return impl_->eager_data->getData<T>();
+}
+
+template <typename T> T *Tensor::mutable_data() {
+  if (!impl_ || !impl_->eager_data) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  return impl_->eager_data->getData<T>();
+}
+
+// Explicit instantiations
+template const float *Tensor::data<float>() const;
+template float *Tensor::mutable_data<float>();
+
+float Tensor::getValue(unsigned int b, unsigned int c, unsigned int h,
+                       unsigned int w) const {
+  if (!impl_ || !impl_->eager_data) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  return impl_->eager_data->getValue<float>(b, c, h, w);
+}
+
+void Tensor::setValue(unsigned int b, unsigned int c, unsigned int h,
+                      unsigned int w, float value) {
+  if (!impl_ || !impl_->eager_data) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  impl_->eager_data->setValue(b, c, h, w, value);
+}
+
+void Tensor::copyFrom(const void *src) {
+  if (!src) {
+    throw std::invalid_argument("copyFrom: source pointer must not be null");
+  }
+  if (!impl_ || !impl_->eager_data) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  std::memcpy(impl_->eager_data->getData(), src, impl_->eager_data->bytes());
+}
+
+void Tensor::setData(void *new_ptr) {
+  if (!impl_ || !impl_->external) {
+    throw std::runtime_error("setData: only supported for fromData tensors");
+  }
+  if (!new_ptr) {
+    throw std::invalid_argument("setData: pointer must not be null");
+  }
+  impl_->external_ptr = new_ptr;
+  impl_->eager_data->setData(
+    std::make_shared<nntrainer::MemoryData>(new_ptr), 0, false);
+}
+
 // --- Factory methods ---
 
 Tensor Tensor::fromData(const TensorDim &dim, void *data,
@@ -126,8 +185,11 @@ Tensor Tensor::fromData(const TensorDim &dim, void *data,
   t.impl_->valid = true;
   t.impl_->external = true;
   t.impl_->external_ptr = data;
+  // Create internal tensor structure, then point to external memory (zero-copy)
   t.impl_->eager_data =
-    std::make_shared<nntrainer::Tensor>(dim, data);
+    std::make_shared<nntrainer::Tensor>(dim, true);
+  t.impl_->eager_data->setData(
+    std::make_shared<nntrainer::MemoryData>(data), 0, false);
   return t;
 }
 

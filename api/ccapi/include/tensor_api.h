@@ -125,6 +125,66 @@ public:
   bool isMaterialized() const;
 
   /**
+   * @brief Get read-only pointer to the underlying data
+   *
+   * @tparam T Data type (default: float)
+   * @return Pointer to data buffer
+   * @throws std::runtime_error if tensor is not materialized
+   */
+  template <typename T = float> const T *data() const;
+
+  /**
+   * @brief Get mutable pointer to the underlying data
+   *
+   * @tparam T Data type (default: float)
+   * @return Pointer to mutable data buffer
+   * @throws std::runtime_error if tensor is not materialized
+   */
+  template <typename T = float> T *mutable_data();
+
+  /**
+   * @brief Get value at specific location
+   *
+   * @param b batch index
+   * @param c channel index
+   * @param h height index
+   * @param w width index
+   * @return float value
+   * @throws std::runtime_error if tensor is not materialized
+   */
+  float getValue(unsigned int b, unsigned int c, unsigned int h,
+                 unsigned int w) const;
+
+  /**
+   * @brief Set value at specific location
+   *
+   * @param b batch index
+   * @param c channel index
+   * @param h height index
+   * @param w width index
+   * @param value value to set
+   * @throws std::runtime_error if tensor is not materialized
+   */
+  void setValue(unsigned int b, unsigned int c, unsigned int h,
+                unsigned int w, float value);
+
+  /**
+   * @brief Copy data from external buffer into this tensor
+   *
+   * @param src Source buffer (must have at least shape().getDataLen() bytes)
+   * @throws std::runtime_error if tensor is not materialized
+   */
+  void copyFrom(const void *src);
+
+  /**
+   * @brief Replace the external data pointer (fromData tensors only)
+   *
+   * @param new_ptr New data pointer (must outlive the tensor)
+   * @throws std::runtime_error if tensor is not external
+   */
+  void setData(void *new_ptr);
+
+  /**
    * @brief Create a tensor wrapping external user-managed memory (zero-copy)
    *
    * @param dim Tensor dimensions

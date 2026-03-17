@@ -265,3 +265,150 @@ TEST(nntrainer_ccapi_tensor, default_not_materialized_p) {
   EXPECT_FALSE(t.isMaterialized());
   EXPECT_FALSE(t.isExternal());
 }
+
+// ===== Step 1-3: data access =====
+
+/**
+ * @brief data<float>() on fromData returns the original pointer (zero-copy)
+ */
+TEST(nntrainer_ccapi_tensor, data_from_data_zero_copy_p) {
+  float buf[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  auto t = ml::train::Tensor::fromData({1, 1, 2, 3}, buf);
+  EXPECT_EQ(t.data<float>(), buf);
+}
+
+/**
+ * @brief getValue on fromData tensor
+ */
+TEST(nntrainer_ccapi_tensor, get_value_from_data_p) {
+  float buf[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  auto t = ml::train::Tensor::fromData({1, 1, 2, 3}, buf);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 2), 3.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 2), 6.0f);
+}
+
+/**
+ * @brief getValue on zeros tensor
+ */
+TEST(nntrainer_ccapi_tensor, get_value_zeros_p) {
+  auto t = ml::train::Tensor::zeros({1, 1, 2, 2});
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 0.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 0.0f);
+}
+
+/**
+ * @brief getValue on ones tensor
+ */
+TEST(nntrainer_ccapi_tensor, get_value_ones_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 1.0f);
+}
+
+/**
+ * @brief setValue modifies value in-place
+ */
+TEST(nntrainer_ccapi_tensor, set_value_p) {
+  auto t = ml::train::Tensor::zeros({1, 1, 2, 2});
+  t.setValue(0, 0, 1, 1, 42.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 42.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 0.0f);
+}
+
+/**
+ * @brief mutable_data allows direct writes
+ */
+TEST(nntrainer_ccapi_tensor, mutable_data_p) {
+  auto t = ml::train::Tensor::zeros({1, 1, 1, 4});
+  float *ptr = t.mutable_data<float>();
+  ptr[0] = 10.0f;
+  ptr[3] = 99.0f;
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 10.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 3), 99.0f);
+}
+
+/**
+ * @brief setData replaces external pointer
+ */
+TEST(nntrainer_ccapi_tensor, set_data_replace_ptr_p) {
+  float buf1[4] = {1, 2, 3, 4};
+  float buf2[4] = {5, 6, 7, 8};
+  auto t = ml::train::Tensor::fromData({1, 1, 2, 2}, buf1);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 1.0f);
+
+  t.setData(buf2);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 5.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 8.0f);
+  EXPECT_EQ(t.data<float>(), buf2);
+}
+
+/**
+ * @brief setData on non-external (zeros) tensor throws
+ */
+TEST(nntrainer_ccapi_tensor, set_data_on_non_external_n) {
+  auto t = ml::train::Tensor::zeros({1, 1, 2, 2});
+  float buf[4] = {};
+  EXPECT_THROW(t.setData(buf), std::runtime_error);
+}
+
+/**
+ * @brief setData on symbolic tensor throws
+ */
+TEST(nntrainer_ccapi_tensor, set_data_on_symbolic_n) {
+  ml::train::Tensor t({1, 1, 2, 2});
+  float buf[4] = {};
+  EXPECT_THROW(t.setData(buf), std::runtime_error);
+}
+
+/**
+ * @brief setData with null throws
+ */
+TEST(nntrainer_ccapi_tensor, set_data_null_n) {
+  float buf[4] = {1, 2, 3, 4};
+  auto t = ml::train::Tensor::fromData({1, 1, 2, 2}, buf);
+  EXPECT_THROW(t.setData(nullptr), std::invalid_argument);
+}
+
+/**
+ * @brief copyFrom copies data into materialized tensor
+ */
+TEST(nntrainer_ccapi_tensor, copy_from_p) {
+  float src[4] = {10, 20, 30, 40};
+  auto t = ml::train::Tensor::zeros({1, 1, 2, 2});
+  t.copyFrom(src);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 10.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 40.0f);
+}
+
+/**
+ * @brief copyFrom with null throws
+ */
+TEST(nntrainer_ccapi_tensor, copy_from_null_n) {
+  auto t = ml::train::Tensor::zeros({1, 1, 2, 2});
+  EXPECT_THROW(t.copyFrom(nullptr), std::invalid_argument);
+}
+
+/**
+ * @brief data access on unmaterialized (symbolic) tensor throws
+ */
+TEST(nntrainer_ccapi_tensor, data_access_unmaterialized_n) {
+  ml::train::Tensor t({1, 1, 28, 28});
+  EXPECT_THROW(t.data<float>(), std::runtime_error);
+  EXPECT_THROW(t.mutable_data<float>(), std::runtime_error);
+  EXPECT_THROW(t.getValue(0, 0, 0, 0), std::runtime_error);
+  EXPECT_THROW(t.setValue(0, 0, 0, 0, 1.0f), std::runtime_error);
+}
+
+/**
+ * @brief clone of eager tensor creates independent copy
+ */
+TEST(nntrainer_ccapi_tensor, clone_eager_independent_p) {
+  auto orig = ml::train::Tensor::zeros({1, 1, 2, 2});
+  orig.setValue(0, 0, 0, 0, 99.0f);
+  auto cloned = orig.clone();
+
+  cloned.setValue(0, 0, 0, 0, 1.0f);
+  EXPECT_FLOAT_EQ(orig.getValue(0, 0, 0, 0), 99.0f);
+  EXPECT_FLOAT_EQ(cloned.getValue(0, 0, 0, 0), 1.0f);
+}
