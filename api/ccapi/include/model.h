@@ -36,6 +36,8 @@ class RunLayerContext;
 namespace ml {
 namespace train {
 
+class Tensor; // Forward declaration for graph-based compile
+
 /**
  * @brief     Statistics from running or training a model
  */
@@ -140,6 +142,21 @@ public:
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
   virtual int compile(ExecutionMode exec_mode_ = ExecutionMode::TRAIN) = 0;
+
+  /**
+   * @brief     Compile from symbolic tensor graph.
+   *
+   * Extracts the computation graph by walking backwards from output to input,
+   * then adds all discovered layers (with input_layers connections) and
+   * compiles. This replaces manual addLayer() + input_layers strings.
+   *
+   * @param input  Leaf symbolic tensor (model input)
+   * @param output Output symbolic tensor (model output)
+   * @param mode   Execution mode (default: TRAIN)
+   * @retval #ML_ERROR_NONE Successful.
+   */
+  int compile(const Tensor &input, const Tensor &output,
+              ExecutionMode mode = ExecutionMode::TRAIN);
 
   /**
    * @brief     Initialize Network. This should be called after setting the

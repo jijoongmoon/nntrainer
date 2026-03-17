@@ -14,6 +14,7 @@
 #include <iostream>
 
 #include <layer.h>
+#include <model.h>
 #include <nntrainer_error.h>
 #include <nntrainer_test_util.h>
 #include <tensor_api.h>
@@ -654,4 +655,66 @@ TEST(nntrainer_ccapi_tensor, chained_ops_p) {
   EXPECT_EQ(mul_inputs.size(), 2u);
   // First input to multiply is the add result
   EXPECT_EQ(mul_inputs[0].getProducingLayer()->getType(), "addition");
+}
+
+// ===== Step 2-3: Model::compile(Tensor, Tensor) — graph extraction =====
+
+/**
+ * @brief Simple single FC layer compile from tensor graph
+ */
+TEST(nntrainer_ccapi_graph, simple_fc_compile_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 784}, "input");
+  LayerHandle fc = createLayer("fully_connected", {"unit=10", "name=fc"});
+  auto y = fc(x);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+}
+
+/**
+ * @brief Multi-layer compile: fc1 -> relu -> fc2
+ */
+TEST(nntrainer_ccapi_graph, multi_layer_compile_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 784}, "input");
+  LayerHandle fc1 = createLayer("fully_connected", {"unit=128", "name=fc1"});
+  LayerHandle relu = createLayer("activation", {"activation=relu", "name=relu1"});
+  LayerHandle fc2 = createLayer("fully_connected", {"unit=10", "name=fc2"});
+
+  auto h = fc1(x);
+  h = relu(h);
+  auto y = fc2(h);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+}
+
+/**
+ * @brief Residual connection compile: x -> fc1 -> add(x, fc1_out) -> fc_out
+ */
+TEST(nntrainer_ccapi_graph, residual_compile_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 256}, "input");
+  LayerHandle fc1 = createLayer("fully_connected", {"unit=256", "name=fc1"});
+  auto h = fc1(x);
+  auto out = x.add(h);
+  LayerHandle fc_out = createLayer("fully_connected", {"unit=10", "name=fc_out"});
+  auto y = fc_out(out);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+}
+
+/**
+ * @brief Existing addLayer-based workflow still works
+ */
+TEST(nntrainer_ccapi_graph, existing_add_layer_still_works_p) {
+  using namespace ml::train;
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  model->addLayer(
+    createLayer("input", {"name=in", "input_shape=1:1:784"}));
+  model->addLayer(
+    createLayer("fully_connected", {"name=fc", "unit=10", "input_layers=in"}));
+  EXPECT_EQ(model->compile(), ML_ERROR_NONE);
 }

@@ -13,12 +13,15 @@
  */
 
 #include <tensor_api.h>
+#include <model.h>
 
 #include <memory_data.h>
 #include <tensor.h>
 
 #include <cstring>
+#include <functional>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace ml {
 namespace train {
@@ -354,6 +357,86 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
   output.impl_->input_tensors = inputs;
 
   return output;
+}
+
+// --- Model::compile(Tensor, Tensor) — graph extraction ---
+
+int Model::compile(const Tensor &input, const Tensor &output,
+                   ExecutionMode mode) {
+  struct LayerInfo {
+    std::shared_ptr<Layer> layer;
+    std::vector<std::string> input_layer_names;
+  };
+
+  std::vector<LayerInfo> layers_in_order;
+  std::unordered_set<Layer *> visited;
+
+  // Name for the auto-created input layer
+  std::string input_layer_name =
+    input.name().empty() ? "graph_input" : input.name();
+
+  // DFS: visit all inputs first (post-order = topological order)
+  std::function<void(const Tensor &)> dfs = [&](const Tensor &t) {
+    auto producer = t.getProducingLayer();
+    if (!producer) {
+      return; // leaf tensor
+    }
+    if (visited.count(producer.get())) {
+      return;
+    }
+    visited.insert(producer.get());
+
+    auto t_inputs = t.getInputTensors();
+    for (auto &inp : t_inputs) {
+      dfs(inp);
+    }
+
+    // Build input_layers names for this layer
+    std::vector<std::string> input_names;
+    for (auto &inp : t_inputs) {
+      auto inp_producer = inp.getProducingLayer();
+      if (inp_producer) {
+        input_names.push_back(inp_producer->getName());
+      } else {
+        input_names.push_back(input_layer_name);
+      }
+    }
+
+    layers_in_order.push_back({producer, input_names});
+  };
+
+  dfs(output);
+
+  // 1. Create and add the input layer
+  const TensorDim &dim = input.shape();
+  std::string shape_str = std::to_string(dim.channel()) + ":" +
+                           std::to_string(dim.height()) + ":" +
+                           std::to_string(dim.width());
+
+  auto input_layer = createLayer(
+    "input", {"name=" + input_layer_name, "input_shape=" + shape_str});
+  int status = addLayer(std::move(input_layer));
+  if (status != ML_ERROR_NONE) {
+    return status;
+  }
+
+  // 2. Add each layer in topological order with input_layers set
+  for (auto &info : layers_in_order) {
+    std::string input_layers_str;
+    for (size_t i = 0; i < info.input_layer_names.size(); ++i) {
+      if (i > 0)
+        input_layers_str += ",";
+      input_layers_str += info.input_layer_names[i];
+    }
+    info.layer->setProperty({"input_layers=" + input_layers_str});
+    status = addLayer(info.layer);
+    if (status != ML_ERROR_NONE) {
+      return status;
+    }
+  }
+
+  // 3. Compile the model
+  return compile(mode);
 }
 
 } // namespace train
