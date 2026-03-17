@@ -1323,47 +1323,716 @@ void Qwen3CausalLM::initialize() {
 
 ---
 
-## 13. 구현 순서
+## 13. 구현 순서 (세부 단계 + 테스트)
+
+각 Step은 독립적으로 빌드/테스트 가능한 단위. 한 Step 완료 후 다음 Step 진행.
+
+---
+
+### Phase 1: Core Tensor API (Pimpl 기반 재구현)
+
+#### Step 1-1: Pimpl 구조 + 기본 생성자
+
+**구현:**
+```
+api/ccapi/include/tensor_api.h
+  - Var_Grad 상속 제거
+  - class Tensor { struct Impl; std::unique_ptr<Impl> impl_; }
+  - 기본 생성자: Tensor()
+  - 심볼릭 생성자: Tensor(TensorDim dim, std::string name = "")
+  - 소멸자, 이동 생성자/대입 (unique_ptr 때문에 명시 필요)
+  - 복사 생성자/대입 (shallow copy — 같은 그래프 노드 공유)
+  - 기본 접근자: shape(), name(), dtype(), isValid()
+
+api/ccapi/src/tensor_api.cpp (신규)
+  - Impl 정의: { TensorDim dim; string name; bool external; ... }
+  - 위 메서드 구현
+
+api/ccapi/meson.build
+  - ccapi_src에 'src/tensor_api.cpp' 추가
+```
+
+**테스트 (unittest_ccapi_tensor.cpp):**
+```cpp
+// 기존 tensor_01_p 유지 (하위 호환 확인)
+
+TEST(nntrainer_ccapi_tensor, default_construct_p) {
+  ml::train::Tensor t;
+  EXPECT_FALSE(t.isValid());
+}
+
+TEST(nntrainer_ccapi_tensor, symbolic_construct_p) {
+  ml::train::Tensor t({1, 1, 28, 28}, "input");
+  EXPECT_TRUE(t.isValid());
+  EXPECT_EQ(t.name(), "input");
+  EXPECT_EQ(t.shape().batch(), 1);
+  EXPECT_EQ(t.shape().width(), 28);
+}
+
+TEST(nntrainer_ccapi_tensor, move_construct_p) {
+  ml::train::Tensor a({1, 1, 28, 28});
+  ml::train::Tensor b(std::move(a));
+  EXPECT_TRUE(b.isValid());
+  EXPECT_FALSE(a.isValid());
+}
+
+TEST(nntrainer_ccapi_tensor, copy_construct_p) {
+  ml::train::Tensor a({1, 1, 28, 28}, "shared");
+  ml::train::Tensor b(a);
+  EXPECT_EQ(a.name(), b.name());
+}
+```
+
+**빌드 확인:** `meson test -C builddir unittest_ccapi`
+
+---
+
+#### Step 1-2: fromData, zeros, ones (Eager 텐서)
+
+**구현:**
+```
+api/ccapi/include/tensor_api.h
+  - static Tensor fromData(TensorDim dim, void *data, std::string name = "")
+  - static Tensor zeros(TensorDim dim, std::string name = "")
+  - static Tensor ones(TensorDim dim, std::string name = "")
+  - bool isExternal() const
+  - bool isMaterialized() const
+
+api/ccapi/src/tensor_api.cpp
+  - fromData: impl_->external = true, impl_->eager_data = shared_ptr<nntrainer::Tensor>(외부 포인터 매핑)
+  - zeros/ones: impl_->eager_data = make_shared<nntrainer::Tensor>(dim, Initializer::ZEROS/ONES)
+  - isMaterialized: eager_data != nullptr || bound_internal != nullptr
+```
+
+**테스트:**
+```cpp
+TEST(nntrainer_ccapi_tensor, from_data_p) {
+  float buf[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+  ml::train::Tensor t = ml::train::Tensor::fromData({1, 1, 3, 4}, buf);
+  EXPECT_TRUE(t.isExternal());
+  EXPECT_TRUE(t.isMaterialized());
+  EXPECT_EQ(t.shape().height(), 3);
+  EXPECT_EQ(t.shape().width(), 4);
+}
+
+TEST(nntrainer_ccapi_tensor, zeros_p) {
+  auto t = ml::train::Tensor::zeros({1, 1, 2, 3});
+  EXPECT_FALSE(t.isExternal());
+  EXPECT_TRUE(t.isMaterialized());
+}
+
+TEST(nntrainer_ccapi_tensor, ones_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 3});
+  EXPECT_TRUE(t.isMaterialized());
+}
+
+TEST(nntrainer_ccapi_tensor, symbolic_not_materialized_p) {
+  ml::train::Tensor t({1, 1, 28, 28});
+  EXPECT_FALSE(t.isMaterialized());  // 심볼릭 텐서는 compile 전까지 미실체화
+  EXPECT_FALSE(t.isExternal());
+}
+```
+
+---
+
+#### Step 1-3: 데이터 접근 메서드
+
+**구현:**
+```
+api/ccapi/include/tensor_api.h
+  - template<typename T> const T *data() const
+  - template<typename T> T *mutable_data()
+  - float getValue(unsigned int batch, unsigned int c, unsigned int h, unsigned int w) const
+  - void setValue(unsigned int batch, unsigned int c, unsigned int h, unsigned int w, float value)
+  - void copyFrom(const void *src)
+  - void setData(void *new_ptr)  // 외부 포인터 교체 (fromData 텐서만)
+```
+
+**테스트:**
+```cpp
+TEST(nntrainer_ccapi_tensor, data_access_from_data_p) {
+  float buf[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  auto t = ml::train::Tensor::fromData({1, 1, 2, 3}, buf);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 2), 6.0f);
+  EXPECT_EQ(t.data<float>(), buf);  // zero-copy 확인
+}
+
+TEST(nntrainer_ccapi_tensor, set_value_p) {
+  auto t = ml::train::Tensor::zeros({1, 1, 2, 2});
+  t.setValue(0, 0, 1, 1, 42.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 42.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, set_data_replace_ptr_p) {
+  float buf1[4] = {1, 2, 3, 4};
+  float buf2[4] = {5, 6, 7, 8};
+  auto t = ml::train::Tensor::fromData({1, 1, 2, 2}, buf1);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 1.0f);
+  t.setData(buf2);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 5.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, set_data_on_symbolic_n) {
+  ml::train::Tensor t({1, 1, 2, 2});
+  EXPECT_THROW(t.setData(nullptr), std::runtime_error);
+}
+
+TEST(nntrainer_ccapi_tensor, copy_from_p) {
+  float src[4] = {10, 20, 30, 40};
+  auto t = ml::train::Tensor::zeros({1, 1, 2, 2});
+  t.copyFrom(src);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 10.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 40.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, data_access_unmaterialized_n) {
+  ml::train::Tensor t({1, 1, 28, 28});
+  EXPECT_THROW(t.data<float>(), std::runtime_error);
+  EXPECT_THROW(t.getValue(0, 0, 0, 0), std::runtime_error);
+}
+```
+
+---
+
+#### Step 1-4: 기존 API 하위 호환
+
+**구현:**
+```
+api/ccapi/include/tensor_api.h
+  - setSrcLayer(shared_ptr<Layer>) — 기존 유지
+  - getSrcLayer() — 기존 유지
+  - clone() — Pimpl 기반 deep copy
+```
+
+**테스트:**
+```cpp
+// 기존 tensor_01_p 그대로 통과해야 함
+TEST(nntrainer_ccapi, tensor_01_p) {
+  ml::train::Tensor a;
+  std::shared_ptr<ml::train::Layer> layer = ml::train::layer::Input(
+    {ml::train::withKey("name", "input0"),
+     ml::train::withKey("input_shape", "1:1:62720")});
+  a.setSrcLayer(layer);
+  EXPECT_EQ(a.getSrcLayer()->getName(), "input0");
+}
+
+TEST(nntrainer_ccapi_tensor, clone_eager_p) {
+  auto orig = ml::train::Tensor::zeros({1, 1, 2, 2});
+  orig.setValue(0, 0, 0, 0, 99.0f);
+  auto cloned = orig.clone();
+  cloned.setValue(0, 0, 0, 0, 1.0f);
+  EXPECT_FLOAT_EQ(orig.getValue(0, 0, 0, 0), 99.0f);  // 원본 불변
+  EXPECT_FLOAT_EQ(cloned.getValue(0, 0, 0, 0), 1.0f);
+}
+```
+
+**Phase 1 완료 기준:**
+- `meson test -C builddir unittest_ccapi` 전체 통과
+- 기존 `unittest_ccapi.cpp` 테스트들 회귀 없음
+- Pimpl Tensor가 `Var_Grad`에 의존하지 않음
+
+---
+
+### Phase 2: Layer 연동 + 심볼릭 그래프
+
+#### Step 2-1: Layer::operator()(Tensor) — 그래프 edge 기록
+
+**구현:**
+```
+api/ccapi/include/tensor_api.h (내부 구조)
+  - Impl에 추가:
+    struct GraphNode {
+      std::shared_ptr<Layer> producing_layer;
+      unsigned int output_index;
+      std::vector<GraphNode *> inputs;
+    };
+    std::shared_ptr<GraphNode> graph_node;
+
+api/ccapi/include/layer.h
+  - Tensor operator()(const Tensor &input)
+  - Tensor operator()(const std::vector<Tensor> &inputs)
+  // LayerHandle = shared_ptr<Layer> 이므로 free function 또는 wrapper 필요
+  // → LayerHandle을 감싸는 CallableLayer 또는 free function
+
+api/ccapi/src/tensor_api.cpp
+  - operator() 구현: 새 Tensor 생성, graph_node에 producing_layer + inputs 기록
+```
+
+**테스트 (unittest_ccapi_tensor.cpp에 추가):**
+```cpp
+TEST(nntrainer_ccapi_tensor, layer_call_symbolic_p) {
+  using namespace ml::train;
+  auto input = Tensor({1, 1, 784}, "input");
+  auto fc = createLayer("fully_connected", {"unit=256", "name=fc1"});
+  auto output = fc(input);
+  EXPECT_TRUE(output.isValid());
+  EXPECT_FALSE(output.isMaterialized());  // 심볼릭
+  EXPECT_EQ(output.shape().width(), 256);
+}
+
+TEST(nntrainer_ccapi_tensor, layer_chain_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 784}, "x");
+  auto h = createLayer("fully_connected", {"unit=128", "name=fc1"})(x);
+  auto y = createLayer("fully_connected", {"unit=10", "name=fc2"})(h);
+  EXPECT_TRUE(y.isValid());
+}
+
+TEST(nntrainer_ccapi_tensor, multi_input_layer_p) {
+  using namespace ml::train;
+  auto a = Tensor({1, 1, 1, 256}, "a");
+  auto b = Tensor({1, 1, 1, 256}, "b");
+  auto added = createLayer("Addition", {"name=add1"})({a, b});
+  EXPECT_TRUE(added.isValid());
+}
+```
+
+---
+
+#### Step 2-2: Tensor 연산 → 암묵적 레이어
+
+**구현:**
+```
+api/ccapi/include/tensor_api.h
+  - Tensor add(const Tensor &other) const       // → Addition 레이어
+  - Tensor multiply(const Tensor &other) const   // → Multiply 레이어
+  - Tensor reshape(TensorDim new_shape) const     // → Reshape 레이어
+
+api/ccapi/src/tensor_api.cpp
+  - add: createLayer("Addition") 생성 → operator()({*this, other})
+  - multiply: createLayer("Multiply") 생성
+  - reshape: createLayer("Reshape", {"target_shape=..."}) 생성
+```
+
+**테스트:**
+```cpp
+TEST(nntrainer_ccapi_tensor, add_symbolic_p) {
+  using namespace ml::train;
+  auto a = Tensor({1, 1, 1, 256}, "a");
+  auto b = Tensor({1, 1, 1, 256}, "b");
+  auto c = a.add(b);
+  EXPECT_TRUE(c.isValid());
+  EXPECT_EQ(c.shape().width(), 256);
+}
+
+TEST(nntrainer_ccapi_tensor, residual_connection_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 256}, "x");
+  auto h = createLayer("fully_connected", {"unit=256", "name=fc1"})(x);
+  auto out = x.add(h);  // skip connection
+  EXPECT_TRUE(out.isValid());
+}
+```
+
+---
+
+#### Step 2-3: Model::compile(Tensor, Tensor) — 그래프 추출
+
+**구현:**
+```
+api/ccapi/include/model.h
+  - virtual int compile(const Tensor &input, const Tensor &output,
+                        ExecutionMode mode = ExecutionMode::TRAIN) = 0;
+  // 기존 compile(ExecutionMode) 유지
+
+nntrainer/models/neuralnet.h / neuralnet.cpp
+  - compile(Tensor, Tensor) 구현:
+    1. output의 graph_node에서 BFS/DFS로 모든 레이어 수집
+    2. 위상 정렬
+    3. 각 레이어에 대해 addLayer() 호출 + input_layers 설정
+    4. 기존 compile(mode) 호출
+    5. _bind(): API Tensor ↔ 내부 Var_Grad 바인딩
+```
+
+**테스트 (신규: test/ccapi/unittest_tensor_graph.cpp):**
+```cpp
+TEST(nntrainer_ccapi_graph, simple_fc_compile_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 784}, "input");
+  auto y = createLayer("fully_connected", {"unit=10", "name=fc"})(x);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+  EXPECT_EQ(model->initialize(), ML_ERROR_NONE);
+}
+
+TEST(nntrainer_ccapi_graph, multi_layer_compile_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 784}, "input");
+  auto h = createLayer("fully_connected", {"unit=128", "name=fc1"})(x);
+  h = createLayer("activation", {"activation=relu", "name=relu1"})(h);
+  auto y = createLayer("fully_connected", {"unit=10", "name=fc2"})(h);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+  EXPECT_EQ(model->initialize(), ML_ERROR_NONE);
+}
+
+TEST(nntrainer_ccapi_graph, residual_compile_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 256}, "input");
+  auto h = createLayer("fully_connected", {"unit=256", "name=fc1"})(x);
+  auto out = x.add(h);
+  auto y = createLayer("fully_connected", {"unit=10", "name=fc_out"})(out);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+}
+
+TEST(nntrainer_ccapi_graph, existing_add_layer_still_works_p) {
+  // 기존 addLayer 방식 여전히 동작 확인
+  using namespace ml::train;
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  model->addLayer(createLayer("input", {"name=in", "input_shape=1:1:784"}));
+  model->addLayer(createLayer("fully_connected", {"name=fc", "unit=10", "input_layers=in"}));
+  EXPECT_EQ(model->compile(), ML_ERROR_NONE);
+}
+```
+
+**meson.build 변경 (test/ccapi/meson.build):**
+```meson
+ccapi_targets = [
+  'unittest_ccapi.cpp',
+  'unittest_ccapi_tensor.cpp',
+  'unittest_tensor_graph.cpp'     # 새로 추가
+]
+```
+
+---
+
+#### Step 2-4: _bind() + 데이터 주입/추출
+
+**구현:**
+```
+api/ccapi/src/tensor_api.cpp
+  - _bind(Var_Grad *internal): compile 후 API Tensor가 내부 Var_Grad를 참조
+  - copyFrom: bound_internal이 있으면 내부 텐서에 복사
+  - data<T>: bound_internal이 있으면 내부 텐서 포인터 반환
+```
+
+**테스트:**
+```cpp
+TEST(nntrainer_ccapi_graph, data_injection_after_compile_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 4}, "input");
+  auto y = createLayer("fully_connected", {"unit=2", "name=fc"})(x);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  model->compile(x, y);
+  model->initialize();
+
+  // compile 후 x는 materialized
+  EXPECT_TRUE(x.isMaterialized());
+  float input_data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  x.copyFrom(input_data);
+  EXPECT_FLOAT_EQ(x.getValue(0, 0, 0, 0), 1.0f);
+}
+```
+
+---
+
+#### Step 2-5: Lazy chaining (chain/eval)
+
+**구현:**
+```
+api/ccapi/include/tensor_api.h
+  - Tensor &chain()
+  - Tensor &add_i(float value)
+  - Tensor &multiply_i(float value)
+  - Tensor eval()
+
+api/ccapi/src/tensor_api.cpp
+  - Impl에 std::vector<std::function<void(nntrainer::Tensor&)>> call_chain
+  - chain(): call_chain.clear()
+  - add_i/multiply_i: call_chain.push_back(lambda)
+  - eval(): isMaterialized 확인 → 체인 순차 실행 → clear
+```
+
+**테스트:**
+```cpp
+TEST(nntrainer_ccapi_tensor, lazy_chain_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  t.chain().multiply_i(2.0f).add_i(1.0f).eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 3.0f);  // 1*2+1
+}
+
+TEST(nntrainer_ccapi_tensor, lazy_chain_order_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 1});
+  t.chain().add_i(3.0f).multiply_i(2.0f).eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 8.0f);  // (1+3)*2
+}
+
+TEST(nntrainer_ccapi_tensor, lazy_eval_on_symbolic_n) {
+  ml::train::Tensor t({1, 1, 2, 2});
+  t.chain().add_i(1.0f);
+  EXPECT_THROW(t.eval(), std::runtime_error);
+}
+```
+
+**Phase 2 완료 기준:**
+- `unittest_ccapi` 전체 통과 (기존 회귀 없음)
+- `unittest_tensor_graph` 전체 통과
+- 심볼릭 → compile → 내부 매핑 → 데이터 주입 full cycle 동작
+
+---
+
+### Phase 3: MHA 외부 캐시 지원
+
+#### Step 3-1: MultiHeadAttentionLayer 입력 수 분기
+
+**구현:**
+```
+nntrainer/layers/multi_head_attention_layer.h
+  - bool use_external_cache = false;
+
+nntrainer/layers/multi_head_attention_layer.cpp
+  - finalize(): num_inputs >= 5 → use_external_cache = true, requestTensor() 스킵
+  - forwarding(): cache 접근 분기 (getInput vs getTensor)
+  - incremental_forwarding(): 동일 분기
+```
+
+**테스트 (test/unittest/ 기존 MHA 테스트에 추가):**
+```cpp
+// 기존 MHA 테스트가 여전히 통과하는지 확인 (회귀 테스트)
+// → 기존 unittest_nntrainer_layers에서 MHA 관련 테스트 실행
+
+// 새 테스트: 5-input MHA (외부 cache)
+TEST(nntrainer_mha, external_cache_finalize_p) {
+  // MHA 레이어에 5개 입력 설정 → use_external_cache = true 확인
+  // (단위 테스트로 InitLayerContext mock 필요할 수 있음)
+}
+```
+
+---
+
+#### Step 3-2: TensorPool PLACEHOLDER 처리
+
+**구현:**
+```
+nntrainer/tensor/tensor_pool.h
+  - int requestOrPlaceholder(const std::string &name, const TensorDim &dim,
+                             bool is_external)
+
+nntrainer/tensor/tensor_pool.cpp
+  - is_external=true → SourceDetails{lifespan=UNMANAGED}, MemoryPool 할당 안 함
+  - fillPlaceholder(name, external_tensor) + syncDependents()
+
+nntrainer/graph/network_graph.cpp
+  - finalizeContext(): fromData 텐서 → requestOrPlaceholder(is_external=true)
+```
+
+**테스트 (test/unittest/unittest_nntrainer_tensor_pool.cpp에 추가):**
+```cpp
+TEST(nntrainer_tensor_pool, placeholder_request_p) {
+  TensorPool pool;
+  float ext_buf[12] = {};
+  auto idx = pool.requestOrPlaceholder("ext_tensor", {1,1,3,4}, true);
+  pool.fillPlaceholder("ext_tensor", ext_buf);
+  // 실제 데이터가 외부 버퍼를 가리키는지 확인
+}
+
+TEST(nntrainer_tensor_pool, placeholder_no_alloc_p) {
+  // PLACEHOLDER 텐서는 MemoryPool에서 할당하지 않는지 확인
+}
+```
+
+---
+
+#### Step 3-3: 통합 테스트 — fromData + MHA + Model
+
+**테스트 (test/ccapi/unittest_tensor_graph.cpp에 추가):**
+```cpp
+TEST(nntrainer_ccapi_graph, external_cache_mha_compile_p) {
+  using namespace ml::train;
+
+  auto input = Tensor({1, 1, 4, 64}, "input");   // [batch, 1, seq, dim]
+
+  float key_buf[1 * 1 * 32 * 64] = {};
+  float val_buf[1 * 1 * 32 * 64] = {};
+  auto key_cache = Tensor::fromData({1, 1, 32, 64}, key_buf);
+  auto val_cache = Tensor::fromData({1, 1, 32, 64}, val_buf);
+
+  auto q = createLayer("fully_connected", {"unit=64", "name=q_proj"})(input);
+  auto k = createLayer("fully_connected", {"unit=64", "name=k_proj"})(input);
+  auto v = createLayer("fully_connected", {"unit=64", "name=v_proj"})(input);
+
+  auto attn = createLayer("multi_head_attention", {
+    "name=mha", "num_heads=4"
+  })({q, k, v, key_cache, val_cache});
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(input, attn, ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  EXPECT_EQ(model->initialize(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+
+  // key_cache는 외부 → PLACEHOLDER, 내부 할당 안 함
+  EXPECT_TRUE(key_cache.isExternal());
+  EXPECT_TRUE(key_cache.isMaterialized());
+}
+```
+
+**Phase 3 완료 기준:**
+- 기존 MHA 테스트 (3-4 input) 전체 통과
+- 5-input MHA (외부 cache) compile + initialize 성공
+- TensorPool placeholder 텐서가 MemoryPool 할당 안 함 확인
+
+---
+
+### Phase 4: Applications 마이그레이션
+
+#### Step 4-1: MHACoreLayer (CausalLM) 외부 캐시 분기
+
+**구현:**
+```
+Applications/CausalLM/layers/mha_core.h
+  - bool use_external_cache = false;
+
+Applications/CausalLM/layers/mha_core.cpp
+  - finalize(): num_inputs >= 4 분기
+  - incremental_forwarding(): getInput(3)/getInput(4) vs getTensor() 분기
+```
+
+**테스트:**
+```
+- CausalLM 빌드 성공 확인
+- 기존 3-input 모드로 compile + initialize 테스트 (하위 호환)
+```
+
+---
+
+#### Step 4-2: CausalLM constructModel + createAttention 변경
+
+**구현:**
+```
+Applications/CausalLM/causal_lm.h
+  - KVCacheBuffers 구조체, key/val_cache_tensors 멤버 추가
+
+Applications/CausalLM/causal_lm.cpp
+  - constructModel(): 외부 cache 버퍼 할당 + fromData 텐서 생성
+  - createAttention(): 5-input mha_core
+```
+
+**테스트:**
+```
+- CausalLM 빌드 성공
+- constructModel() + compile(INFERENCE) + initialize(INFERENCE) 성공
+```
+
+---
+
+#### Step 4-3: CausalLM save/load_kvcache 간소화
+
+**구현:**
+```
+Applications/CausalLM/causal_lm.cpp
+  - save_kvcache: forEachLayer 제거 → 외부 버퍼 직접 write
+  - load_kvcache: forEachLayer 제거 → 외부 버퍼 직접 read
+```
+
+**테스트:**
+```
+- save_kvcache → load_kvcache round-trip 테스트
+- 저장한 데이터가 외부 버퍼에 올바르게 로드되는지 확인
+```
+
+---
+
+#### Step 4-4: 하위 호환 검증
+
+**테스트:**
+```
+- PicoGPT: 빌드 성공 확인 (코드 변경 없음)
+- LLaMA: 빌드 성공 확인 (코드 변경 없음)
+- Resnet: 빌드 성공 확인
+- SimpleFC: 빌드 성공 확인
+- unittest_ccapi 전체 통과 (기존 addLayer 패턴)
+```
+
+**Phase 4 완료 기준:**
+- CausalLM 빌드 + 외부 cache 모드 동작
+- 기타 Applications 전부 빌드 성공 (코드 변경 없음)
+- `meson test -C builddir` 전체 통과
+
+---
+
+### Phase 5: TorchFXConverter
+
+#### Step 5-1: --external-kv-cache CLI 옵션
+
+**구현:**
+```
+Applications/TorchFXConverter/converter.py
+  - argparse에 --external-kv-cache 추가
+  - config dict에 'external_kv_cache' 플래그 전달
+```
+
+**테스트:**
+```python
+# test_converter.py 또는 수동 검증
+# 기본 모드: 기존과 동일한 코드 출력
+python converter.py --model test_model --output /tmp/test_default
+diff /tmp/test_default /tmp/expected_default  # 차이 없어야 함
+```
+
+---
+
+#### Step 5-2: header.py + source 파일 변경
+
+**구현:**
+```
+emitter_cpp/header.py
+  - external_kv_cache=True → KVCacheBuffers 멤버 + allocateKVCache() 선언 추가
+
+emitter_cpp/source_construct.py
+  - external_kv_cache=True → allocateKVCache() 메서드 생성
+
+emitter_cpp/source_attention.py
+  - external_kv_cache=True → mha_core input_layers에 cache 텐서 추가
+
+emitter_cpp/source_custom.py
+  - external_kv_cache=True → initialize()에 allocateKVCache() 호출
+```
+
+**테스트:**
+```python
+# --external-kv-cache 모드 출력 검증
+python converter.py --model test_model --external-kv-cache --output /tmp/test_ext
+# 생성된 코드에 KVCacheBuffers, allocateKVCache, 5-input mha_core 존재 확인
+grep -q "KVCacheBuffers" /tmp/test_ext/header.h
+grep -q "allocateKVCache" /tmp/test_ext/source.cpp
+grep -q "cache_k_name" /tmp/test_ext/source.cpp
+```
+
+---
+
+#### Step 5-3: 생성 코드 빌드 검증
+
+**테스트:**
+```
+- --external-kv-cache로 생성된 C++ 코드가 NNTrainer와 링크하여 빌드 성공
+- 기본 모드로 생성된 C++ 코드도 여전히 빌드 성공
+```
+
+**Phase 5 완료 기준:**
+- 기본 모드: 기존과 100% 동일한 코드 생성
+- --external-kv-cache: 올바른 외부 cache 코드 생성
+- 두 모드 모두 생성 코드 빌드 성공
+
+---
+
+### 전체 완료 기준
 
 ```
-Phase 1: Core Tensor API (Pimpl 기반 재구현)
-  ├── tensor_api.h: Var_Grad 상속 제거, Pimpl 패턴 도입
-  ├── Tensor(dim), fromData(), zeros(), ones() 구현
-  ├── isExternal(), isMaterialized(), shape(), dtype() 구현
-  ├── data<T>(), mutable_data<T>(), getValue/setValue 구현
-  ├── setData() (외부 포인터 교체) 구현
-  ├── tensor_pool: requestOrPlaceholder() 추가
-  └── 테스트: unittest_ccapi_tensor.cpp 업데이트
-
-Phase 2: Layer 연동 + 심볼릭 그래프
-  ├── Layer::operator()(Tensor) — 심볼릭 그래프 edge 기록
-  ├── Tensor::add/matmul/reshape — 암묵적 레이어 생성
-  ├── Model::compile(Tensor, Tensor) — 그래프 추출 + addLayer + 기존 compile
-  ├── _bind() — API Tensor ↔ 내부 Var_Grad 바인딩
-  ├── Lazy chaining: chain/add_i/multiply_i/eval
-  └── 테스트: unittest_tensor_graph.cpp 신규
-
-Phase 3: MHA 외부 캐시 지원
-  ├── multi_head_attention_layer: finalize() 입력 수 분기
-  ├── multi_head_attention_layer: forwarding/incremental_forwarding 캐시 접근 분기
-  ├── network_graph: finalizeContext() fromData 텐서 → PLACEHOLDER 처리
-  └── 테스트: MHA 3-input (기존 호환) + 5-input (외부 cache) 검증
-
-Phase 4: Applications 마이그레이션
-  ├── CausalLM/layers/mha_core: finalize/incremental_forwarding 분기 추가
-  ├── CausalLM/causal_lm: constructModel 외부 cache 할당, createAttention 5-input
-  ├── CausalLM/causal_lm: save/load_kvcache 간소화
-  ├── PicoGPT: 하위 호환 검증 (변경 없음)
-  ├── LLaMA: 하위 호환 검증 (변경 없음)
-  └── 기타 (Resnet, SimpleFC, MNIST): 하위 호환 검증 (변경 없음)
-
-Phase 5: TorchFXConverter
-  ├── converter.py: --external-kv-cache 옵션 추가
-  ├── header.py: KVCacheBuffers 멤버 생성 (조건부)
-  ├── source_construct.py: allocateKVCache() 생성 (조건부)
-  ├── source_attention.py: 5-input mha_core 생성 (조건부)
-  ├── source_custom.py: initialize()에 cache 할당 추가 (조건부)
-  └── 기본 모드 (--external-kv-cache 없음) 기존 코드와 동일 출력 검증
+✅ meson test -C builddir 전체 통과
+✅ unittest_ccapi (기존 테스트 회귀 없음)
+✅ unittest_ccapi_tensor (Pimpl, fromData, data 접근, lazy chain)
+✅ unittest_tensor_graph (심볼릭 그래프, compile, bind, 외부 cache)
+✅ unittest_nntrainer_tensor_pool (PLACEHOLDER)
+✅ 기존 MHA 테스트 (3-4 input 하위 호환)
+✅ CausalLM 빌드 + 외부 cache 동작
+✅ PicoGPT, LLaMA, Resnet, SimpleFC 빌드 성공 (변경 없음)
+✅ TorchFXConverter 기본 모드 동일 출력
+✅ TorchFXConverter --external-kv-cache 모드 빌드 성공
 ```
 
 ---
