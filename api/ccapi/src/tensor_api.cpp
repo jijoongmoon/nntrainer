@@ -37,6 +37,10 @@ struct Tensor::Impl {
 
   std::shared_ptr<Layer> src_layer;
 
+  // Graph edge info (for symbolic graph construction)
+  std::shared_ptr<Layer> producing_layer;
+  std::vector<Tensor> input_tensors;
+
   Impl() = default;
 
   Impl(const TensorDim &d, const std::string &n) : dim(d), name(n), valid(true) {}
@@ -227,6 +231,95 @@ void Tensor::setSrcLayer(std::shared_ptr<Layer> l) {
 
 std::shared_ptr<Layer> Tensor::getSrcLayer() const {
   return impl_ ? impl_->src_layer : nullptr;
+}
+
+// --- Graph info accessors ---
+
+std::shared_ptr<Layer> Tensor::getProducingLayer() const {
+  return impl_ ? impl_->producing_layer : nullptr;
+}
+
+std::vector<Tensor> Tensor::getInputTensors() const {
+  if (impl_) {
+    return impl_->input_tensors;
+  }
+  return {};
+}
+
+// --- LayerHandle graph construction ---
+
+/**
+ * @brief Try to infer output dimensions from layer type and properties.
+ *
+ * This is a best-effort inference for common layer types.
+ * Full shape inference happens during model.compile().
+ */
+static TensorDim inferOutputDim(const std::shared_ptr<Layer> &layer,
+                                const std::vector<Tensor> &inputs) {
+  if (inputs.empty() || !inputs[0].isValid()) {
+    return TensorDim();
+  }
+
+  const TensorDim &in_dim = inputs[0].shape();
+  std::string layer_type = layer->getType();
+
+  // Fully connected: output = {batch, 1, 1, unit}
+  if (layer_type == "fully_connected") {
+    try {
+      std::string unit_str = layer->getProperty("unit");
+      if (!unit_str.empty()) {
+        unsigned int unit = static_cast<unsigned int>(std::stoul(unit_str));
+        return TensorDim({in_dim.batch(), 1, 1, unit});
+      }
+    } catch (...) {
+      // Fall through to default
+    }
+  }
+
+  // Most layers preserve shape (activation, normalization, dropout, etc.)
+  return in_dim;
+}
+
+Tensor LayerHandle::operator()(const Tensor &input) {
+  return (*this)(std::vector<Tensor>{input});
+}
+
+Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
+  if (!ptr_) {
+    throw std::runtime_error("LayerHandle: layer is null");
+  }
+  if (inputs.empty()) {
+    throw std::invalid_argument("LayerHandle: at least one input required");
+  }
+
+  // Infer output dimensions
+  TensorDim out_dim = inferOutputDim(ptr_, inputs);
+
+  // Build output name from layer name
+  std::string out_name;
+  try {
+    out_name = ptr_->getName();
+    if (!out_name.empty()) {
+      out_name += ":output";
+    }
+  } catch (...) {
+    // getName() might throw if layer isn't fully initialized
+  }
+
+  // Create symbolic output tensor
+  Tensor output;
+  if (out_dim.batch() > 0 && out_dim.width() > 0) {
+    output = Tensor(out_dim, out_name);
+  } else {
+    // Couldn't infer shape — create a valid but shapeless tensor
+    output = Tensor(TensorDim(), out_name);
+  }
+
+  // Record graph edge
+  output.impl_->producing_layer = ptr_;
+  output.impl_->input_tensors = inputs;
+
+  return output;
 }
 
 } // namespace train

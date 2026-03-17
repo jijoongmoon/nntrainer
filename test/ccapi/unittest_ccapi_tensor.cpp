@@ -412,3 +412,153 @@ TEST(nntrainer_ccapi_tensor, clone_eager_independent_p) {
   EXPECT_FLOAT_EQ(orig.getValue(0, 0, 0, 0), 99.0f);
   EXPECT_FLOAT_EQ(cloned.getValue(0, 0, 0, 0), 1.0f);
 }
+
+// ===== Step 2-1: LayerHandle graph edge recording =====
+
+/**
+ * @brief LayerHandle wraps createLayer and enables operator()
+ */
+TEST(nntrainer_ccapi_tensor, layer_handle_construct_p) {
+  ml::train::LayerHandle fc =
+    ml::train::createLayer("fully_connected", {"unit=256", "name=fc1"});
+  EXPECT_TRUE(static_cast<bool>(fc));
+  EXPECT_EQ(fc->getName(), "fc1");
+  EXPECT_EQ(fc->getType(), "fully_connected");
+}
+
+/**
+ * @brief LayerHandle converts to shared_ptr<Layer> for backward compat
+ */
+TEST(nntrainer_ccapi_tensor, layer_handle_to_shared_ptr_p) {
+  ml::train::LayerHandle fc =
+    ml::train::createLayer("fully_connected", {"unit=128", "name=fc_conv"});
+  std::shared_ptr<ml::train::Layer> layer_ptr = fc;
+  EXPECT_EQ(layer_ptr->getName(), "fc_conv");
+}
+
+/**
+ * @brief Layer call on symbolic tensor produces symbolic output
+ */
+TEST(nntrainer_ccapi_tensor, layer_call_symbolic_p) {
+  using namespace ml::train;
+  auto input = Tensor({1, 1, 1, 784}, "input");
+  LayerHandle fc = createLayer("fully_connected", {"unit=256", "name=fc1"});
+  auto output = fc(input);
+
+  EXPECT_TRUE(output.isValid());
+  EXPECT_FALSE(output.isMaterialized());
+  // Shape is propagated from input; full shape inference (e.g. FC unit)
+  // will be resolved during model.compile()
+  EXPECT_EQ(output.getProducingLayer()->getName(), "fc1");
+}
+
+/**
+ * @brief Layer chain: fc1 -> fc2
+ */
+TEST(nntrainer_ccapi_tensor, layer_chain_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 784}, "x");
+  LayerHandle fc1 = createLayer("fully_connected", {"unit=128", "name=fc1"});
+  LayerHandle fc2 = createLayer("fully_connected", {"unit=10", "name=fc2"});
+  auto h = fc1(x);
+  auto y = fc2(h);
+
+  EXPECT_TRUE(y.isValid());
+  EXPECT_FALSE(y.isMaterialized());
+  EXPECT_EQ(y.getProducingLayer()->getName(), "fc2");
+  EXPECT_EQ(y.getInputTensors()[0].getProducingLayer()->getName(), "fc1");
+}
+
+/**
+ * @brief Multi-input layer (Addition)
+ */
+TEST(nntrainer_ccapi_tensor, multi_input_layer_p) {
+  using namespace ml::train;
+  auto a = Tensor({1, 1, 1, 256}, "a");
+  auto b = Tensor({1, 1, 1, 256}, "b");
+  LayerHandle add = createLayer("Addition", {"name=add1"});
+  auto added = add({a, b});
+
+  EXPECT_TRUE(added.isValid());
+  EXPECT_FALSE(added.isMaterialized());
+}
+
+/**
+ * @brief Graph edge: output records producing layer
+ */
+TEST(nntrainer_ccapi_tensor, graph_edge_producing_layer_p) {
+  using namespace ml::train;
+  auto input = Tensor({1, 1, 1, 784}, "input");
+  LayerHandle fc = createLayer("fully_connected", {"unit=256", "name=fc1"});
+  auto output = fc(input);
+
+  auto producer = output.getProducingLayer();
+  EXPECT_NE(producer, nullptr);
+  EXPECT_EQ(producer->getName(), "fc1");
+}
+
+/**
+ * @brief Graph edge: output records input tensors
+ */
+TEST(nntrainer_ccapi_tensor, graph_edge_input_tensors_p) {
+  using namespace ml::train;
+  auto input = Tensor({1, 1, 1, 784}, "input");
+  LayerHandle fc = createLayer("fully_connected", {"unit=256", "name=fc1"});
+  auto output = fc(input);
+
+  auto inputs = output.getInputTensors();
+  EXPECT_EQ(inputs.size(), 1u);
+  EXPECT_EQ(inputs[0].name(), "input");
+}
+
+/**
+ * @brief Leaf/input tensor has no producing layer
+ */
+TEST(nntrainer_ccapi_tensor, graph_edge_leaf_tensor_p) {
+  ml::train::Tensor input({1, 1, 1, 784}, "input");
+  EXPECT_EQ(input.getProducingLayer(), nullptr);
+  EXPECT_TRUE(input.getInputTensors().empty());
+}
+
+/**
+ * @brief Chain graph traversal: output -> fc2 -> fc1 -> input
+ */
+TEST(nntrainer_ccapi_tensor, graph_chain_traversal_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 784}, "x");
+  LayerHandle fc1 = createLayer("fully_connected", {"unit=128", "name=fc1"});
+  LayerHandle fc2 = createLayer("fully_connected", {"unit=10", "name=fc2"});
+  auto h = fc1(x);
+  auto y = fc2(h);
+
+  // y was produced by fc2
+  EXPECT_EQ(y.getProducingLayer()->getName(), "fc2");
+  // y's input is h
+  auto y_inputs = y.getInputTensors();
+  EXPECT_EQ(y_inputs.size(), 1u);
+  // h was produced by fc1
+  EXPECT_EQ(y_inputs[0].getProducingLayer()->getName(), "fc1");
+  // h's input is x (leaf)
+  auto h_inputs = y_inputs[0].getInputTensors();
+  EXPECT_EQ(h_inputs.size(), 1u);
+  EXPECT_EQ(h_inputs[0].name(), "x");
+  EXPECT_EQ(h_inputs[0].getProducingLayer(), nullptr);
+}
+
+/**
+ * @brief Null LayerHandle throws on call
+ */
+TEST(nntrainer_ccapi_tensor, layer_handle_null_call_n) {
+  ml::train::LayerHandle null_handle;
+  ml::train::Tensor input({1, 1, 1, 784}, "input");
+  EXPECT_THROW(null_handle(input), std::runtime_error);
+}
+
+/**
+ * @brief Empty inputs to operator() throws
+ */
+TEST(nntrainer_ccapi_tensor, layer_handle_empty_inputs_n) {
+  ml::train::LayerHandle fc =
+    ml::train::createLayer("fully_connected", {"unit=256", "name=fc1"});
+  EXPECT_THROW(fc(std::vector<ml::train::Tensor>{}), std::invalid_argument);
+}

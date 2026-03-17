@@ -227,9 +227,91 @@ public:
    */
   std::shared_ptr<Layer> getSrcLayer() const;
 
+  /**
+   * @brief Get the layer that produced this tensor (graph edge info)
+   *
+   * @return Producing layer (nullptr if this is an input/leaf tensor)
+   */
+  std::shared_ptr<Layer> getProducingLayer() const;
+
+  /**
+   * @brief Get the input tensors that were fed to the producing layer
+   *
+   * @return Vector of input tensors (empty if this is an input/leaf tensor)
+   */
+  std::vector<Tensor> getInputTensors() const;
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  friend class LayerHandle;
+};
+
+/**
+ * @class   LayerHandle
+ * @brief   Callable wrapper around a Layer for graph construction.
+ *
+ * Wraps a shared_ptr<Layer> and provides operator() to create symbolic
+ * tensor connections (graph edges). Implicitly constructible from
+ * unique_ptr<Layer> so it works with createLayer() results.
+ *
+ * Usage:
+ *   LayerHandle fc = createLayer("fully_connected", {"unit=256", "name=fc1"});
+ *   auto output = fc(input);
+ */
+class LayerHandle {
+public:
+  LayerHandle() = default;
+
+  /**
+   * @brief Construct from unique_ptr<Layer> (implicit, works with createLayer)
+   */
+  LayerHandle(std::unique_ptr<Layer> p) : ptr_(std::move(p)) {}
+
+  /**
+   * @brief Construct from shared_ptr<Layer>
+   */
+  LayerHandle(std::shared_ptr<Layer> p) : ptr_(std::move(p)) {}
+
+  /**
+   * @brief Implicit conversion to shared_ptr<Layer> for backward compatibility
+   */
+  operator std::shared_ptr<Layer>() const { return ptr_; }
+
+  /**
+   * @brief Access the underlying Layer
+   */
+  Layer *get() const { return ptr_.get(); }
+  Layer &operator*() const { return *ptr_; }
+  Layer *operator->() const { return ptr_.get(); }
+  explicit operator bool() const { return static_cast<bool>(ptr_); }
+
+  /**
+   * @brief Get the underlying shared_ptr
+   */
+  std::shared_ptr<Layer> layer() const { return ptr_; }
+
+  /**
+   * @brief Call the layer with a single input tensor (graph construction)
+   *
+   * Creates a new symbolic output Tensor connected to this layer.
+   *
+   * @param input Input tensor
+   * @return Output tensor with graph edge info
+   */
+  Tensor operator()(const Tensor &input);
+
+  /**
+   * @brief Call the layer with multiple input tensors (graph construction)
+   *
+   * @param inputs Vector of input tensors
+   * @return Output tensor with graph edge info
+   */
+  Tensor operator()(const std::vector<Tensor> &inputs);
+
+private:
+  std::shared_ptr<Layer> ptr_;
 };
 
 } // namespace train
