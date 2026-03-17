@@ -718,3 +718,88 @@ TEST(nntrainer_ccapi_graph, existing_add_layer_still_works_p) {
     createLayer("fully_connected", {"name=fc", "unit=10", "input_layers=in"}));
   EXPECT_EQ(model->compile(), ML_ERROR_NONE);
 }
+
+// ===== Step 2-4: _bind + data injection/extraction =====
+
+/**
+ * @brief After compile, input tensor is materialized and writable
+ */
+TEST(nntrainer_ccapi_graph, data_injection_after_compile_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 4}, "input");
+  LayerHandle fc = createLayer("fully_connected", {"unit=2", "name=fc"});
+  auto y = fc(x);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+
+  // After compile (which includes initialize + bind), x is materialized
+  EXPECT_TRUE(x.isMaterialized());
+  EXPECT_TRUE(y.isMaterialized());
+
+  // Can inject data
+  float input_data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  x.copyFrom(input_data);
+  EXPECT_FLOAT_EQ(x.getValue(0, 0, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(x.getValue(0, 0, 0, 3), 4.0f);
+}
+
+/**
+ * @brief Can use setValue/getValue on bound tensors
+ */
+TEST(nntrainer_ccapi_graph, set_get_value_bound_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 4}, "input");
+  LayerHandle fc = createLayer("fully_connected", {"unit=2", "name=fc"});
+  auto y = fc(x);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+
+  x.setValue(0, 0, 0, 0, 42.0f);
+  EXPECT_FLOAT_EQ(x.getValue(0, 0, 0, 0), 42.0f);
+
+  // data() and mutable_data() should work
+  const float *ptr = x.data<float>();
+  EXPECT_FLOAT_EQ(ptr[0], 42.0f);
+
+  float *mptr = x.mutable_data<float>();
+  mptr[1] = 99.0f;
+  EXPECT_FLOAT_EQ(x.getValue(0, 0, 0, 1), 99.0f);
+}
+
+/**
+ * @brief Symbolic tensors are not materialized before compile
+ */
+TEST(nntrainer_ccapi_graph, not_materialized_before_compile_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 4}, "input");
+  LayerHandle fc = createLayer("fully_connected", {"unit=2", "name=fc"});
+  auto y = fc(x);
+
+  EXPECT_FALSE(x.isMaterialized());
+  EXPECT_FALSE(y.isMaterialized());
+}
+
+/**
+ * @brief Multi-layer compile with bind
+ */
+TEST(nntrainer_ccapi_graph, multi_layer_bind_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 8}, "input");
+  LayerHandle fc1 = createLayer("fully_connected", {"unit=4", "name=fc1"});
+  LayerHandle fc2 = createLayer("fully_connected", {"unit=2", "name=fc2"});
+  auto h = fc1(x);
+  auto y = fc2(h);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+
+  EXPECT_TRUE(x.isMaterialized());
+  EXPECT_TRUE(y.isMaterialized());
+
+  // Input shape should match
+  EXPECT_EQ(x.shape().width(), 8u);
+  // Output shape should be fc2's output
+  EXPECT_EQ(y.shape().width(), 2u);
+}

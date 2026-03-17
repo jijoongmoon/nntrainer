@@ -155,8 +155,8 @@ public:
    * @param mode   Execution mode (default: TRAIN)
    * @retval #ML_ERROR_NONE Successful.
    */
-  int compile(const Tensor &input, const Tensor &output,
-              ExecutionMode mode = ExecutionMode::TRAIN);
+  int compile(Tensor &input, Tensor &output,
+              ExecutionMode mode = ExecutionMode::INFERENCE);
 
   /**
    * @brief     Initialize Network. This should be called after setting the

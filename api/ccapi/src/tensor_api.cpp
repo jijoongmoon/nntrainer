@@ -15,6 +15,7 @@
 #include <tensor_api.h>
 #include <model.h>
 
+#include <layer_context.h>
 #include <memory_data.h>
 #include <tensor.h>
 
@@ -43,6 +44,9 @@ struct Tensor::Impl {
   // Graph edge info (for symbolic graph construction)
   std::shared_ptr<Layer> producing_layer;
   std::vector<Tensor> input_tensors;
+
+  // Bound internal tensor (set after model compile+initialize)
+  nntrainer::Tensor *bound_tensor = nullptr;
 
   Impl() = default;
 
@@ -118,20 +122,32 @@ bool Tensor::isExternal() const {
 }
 
 bool Tensor::isMaterialized() const {
-  return impl_ && (impl_->eager_data != nullptr);
+  return impl_ && (impl_->eager_data != nullptr || impl_->bound_tensor != nullptr);
 }
 
 // --- Data access ---
 
 template <typename T> const T *Tensor::data() const {
-  if (!impl_ || !impl_->eager_data) {
+  if (!impl_) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  if (impl_->bound_tensor) {
+    return impl_->bound_tensor->getData<T>();
+  }
+  if (!impl_->eager_data) {
     throw std::runtime_error("Tensor is not materialized");
   }
   return impl_->eager_data->getData<T>();
 }
 
 template <typename T> T *Tensor::mutable_data() {
-  if (!impl_ || !impl_->eager_data) {
+  if (!impl_) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  if (impl_->bound_tensor) {
+    return impl_->bound_tensor->getData<T>();
+  }
+  if (!impl_->eager_data) {
     throw std::runtime_error("Tensor is not materialized");
   }
   return impl_->eager_data->getData<T>();
@@ -143,7 +159,13 @@ template float *Tensor::mutable_data<float>();
 
 float Tensor::getValue(unsigned int b, unsigned int c, unsigned int h,
                        unsigned int w) const {
-  if (!impl_ || !impl_->eager_data) {
+  if (!impl_) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  if (impl_->bound_tensor) {
+    return impl_->bound_tensor->getValue<float>(b, c, h, w);
+  }
+  if (!impl_->eager_data) {
     throw std::runtime_error("Tensor is not materialized");
   }
   return impl_->eager_data->getValue<float>(b, c, h, w);
@@ -151,7 +173,14 @@ float Tensor::getValue(unsigned int b, unsigned int c, unsigned int h,
 
 void Tensor::setValue(unsigned int b, unsigned int c, unsigned int h,
                       unsigned int w, float value) {
-  if (!impl_ || !impl_->eager_data) {
+  if (!impl_) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  if (impl_->bound_tensor) {
+    impl_->bound_tensor->setValue(b, c, h, w, value);
+    return;
+  }
+  if (!impl_->eager_data) {
     throw std::runtime_error("Tensor is not materialized");
   }
   impl_->eager_data->setValue(b, c, h, w, value);
@@ -161,7 +190,15 @@ void Tensor::copyFrom(const void *src) {
   if (!src) {
     throw std::invalid_argument("copyFrom: source pointer must not be null");
   }
-  if (!impl_ || !impl_->eager_data) {
+  if (!impl_) {
+    throw std::runtime_error("Tensor is not materialized");
+  }
+  if (impl_->bound_tensor) {
+    std::memcpy(impl_->bound_tensor->getData(), src,
+                impl_->bound_tensor->bytes());
+    return;
+  }
+  if (!impl_->eager_data) {
     throw std::runtime_error("Tensor is not materialized");
   }
   std::memcpy(impl_->eager_data->getData(), src, impl_->eager_data->bytes());
@@ -361,8 +398,7 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
 
 // --- Model::compile(Tensor, Tensor) — graph extraction ---
 
-int Model::compile(const Tensor &input, const Tensor &output,
-                   ExecutionMode mode) {
+int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
   struct LayerInfo {
     std::shared_ptr<Layer> layer;
     std::vector<std::string> input_layer_names;
@@ -374,6 +410,13 @@ int Model::compile(const Tensor &input, const Tensor &output,
   // Name for the auto-created input layer
   std::string input_layer_name =
     input.name().empty() ? "graph_input" : input.name();
+
+  // Name of the layer that produces the output tensor
+  std::string output_layer_name;
+  auto output_producer = output.getProducingLayer();
+  if (output_producer) {
+    output_layer_name = output_producer->getName();
+  }
 
   // DFS: visit all inputs first (post-order = topological order)
   std::function<void(const Tensor &)> dfs = [&](const Tensor &t) {
@@ -436,7 +479,51 @@ int Model::compile(const Tensor &input, const Tensor &output,
   }
 
   // 3. Compile the model
-  return compile(mode);
+  status = compile(mode);
+  if (status != ML_ERROR_NONE) {
+    return status;
+  }
+
+  // 4. Initialize the model
+  status = initialize(mode);
+  if (status != ML_ERROR_NONE) {
+    return status;
+  }
+
+  // 5. Allocate tensor memory
+  status = allocate(mode);
+  if (status != ML_ERROR_NONE) {
+    return status;
+  }
+
+  // 6. Materialize API tensors with allocated buffers
+  //    Input tensor: allocate buffer for user to write input data
+  //    Output tensor: allocate buffer to receive inference results
+  {
+    const TensorDim &in_dim = input.shape();
+    input.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
+      in_dim, true, nntrainer::Initializer::ZEROS, input_layer_name);
+    input.impl_->eager_data->initialize();
+  }
+  if (!output_layer_name.empty()) {
+    // Get real output dim from the compiled model's internal graph
+    TensorDim out_dim;
+    forEachLayer(
+      [&](Layer &layer, nntrainer::RunLayerContext &rc, void *) {
+        if (layer.getName() == output_layer_name && rc.getNumOutputs() > 0) {
+          out_dim = rc.getOutput(0).getDim();
+        }
+      },
+      nullptr);
+    if (out_dim.getDataLen() > 0) {
+      output.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
+        out_dim, true, nntrainer::Initializer::ZEROS, output_layer_name);
+      output.impl_->eager_data->initialize();
+      output.impl_->dim = out_dim;
+    }
+  }
+
+  return ML_ERROR_NONE;
 }
 
 } // namespace train

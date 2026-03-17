@@ -272,6 +272,7 @@ private:
   std::unique_ptr<Impl> impl_;
 
   friend class LayerHandle;
+  friend class Model;
 };
 
 /**
