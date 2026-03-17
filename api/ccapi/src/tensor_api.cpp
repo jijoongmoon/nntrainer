@@ -246,6 +246,40 @@ std::vector<Tensor> Tensor::getInputTensors() const {
   return {};
 }
 
+// --- Symbolic tensor operations (implicit layers) ---
+
+static unsigned int implicit_layer_counter = 0;
+
+static std::string nextImplicitName(const std::string &prefix) {
+  return prefix + "_auto_" + std::to_string(implicit_layer_counter++);
+}
+
+Tensor Tensor::add(const Tensor &other) const {
+  LayerHandle layer =
+    createLayer("Addition", {"name=" + nextImplicitName("add")});
+  return layer({*this, other});
+}
+
+Tensor Tensor::multiply(const Tensor &other) const {
+  LayerHandle layer =
+    createLayer("Multiply", {"name=" + nextImplicitName("mul")});
+  return layer({*this, other});
+}
+
+Tensor Tensor::reshape(const TensorDim &new_shape) const {
+  std::string target = std::to_string(new_shape.channel()) + ":" +
+                       std::to_string(new_shape.height()) + ":" +
+                       std::to_string(new_shape.width());
+  LayerHandle layer = createLayer(
+    "reshape", {"name=" + nextImplicitName("reshape"),
+                "target_shape=" + target});
+  Tensor output = layer({*this});
+  // Override shape to match requested dimensions
+  output.impl_->dim = TensorDim({shape().batch(), new_shape.channel(),
+                                  new_shape.height(), new_shape.width()});
+  return output;
+}
+
 // --- LayerHandle graph construction ---
 
 /**

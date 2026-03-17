@@ -562,3 +562,96 @@ TEST(nntrainer_ccapi_tensor, layer_handle_empty_inputs_n) {
     ml::train::createLayer("fully_connected", {"unit=256", "name=fc1"});
   EXPECT_THROW(fc(std::vector<ml::train::Tensor>{}), std::invalid_argument);
 }
+
+// ===== Step 2-2: Tensor ops → implicit layers =====
+
+/**
+ * @brief add() creates implicit Addition layer
+ */
+TEST(nntrainer_ccapi_tensor, add_symbolic_p) {
+  using namespace ml::train;
+  auto a = Tensor({1, 1, 1, 256}, "a");
+  auto b = Tensor({1, 1, 1, 256}, "b");
+  auto c = a.add(b);
+
+  EXPECT_TRUE(c.isValid());
+  EXPECT_FALSE(c.isMaterialized());
+  EXPECT_EQ(c.shape().width(), 256u);
+  // Verify graph: c produced by Addition layer with 2 inputs
+  EXPECT_NE(c.getProducingLayer(), nullptr);
+  EXPECT_EQ(c.getProducingLayer()->getType(), "addition");
+  EXPECT_EQ(c.getInputTensors().size(), 2u);
+  EXPECT_EQ(c.getInputTensors()[0].name(), "a");
+  EXPECT_EQ(c.getInputTensors()[1].name(), "b");
+}
+
+/**
+ * @brief multiply() creates implicit Multiply layer
+ */
+TEST(nntrainer_ccapi_tensor, multiply_symbolic_p) {
+  using namespace ml::train;
+  auto a = Tensor({1, 1, 1, 128}, "ma");
+  auto b = Tensor({1, 1, 1, 128}, "mb");
+  auto c = a.multiply(b);
+
+  EXPECT_TRUE(c.isValid());
+  EXPECT_FALSE(c.isMaterialized());
+  EXPECT_EQ(c.shape().width(), 128u);
+  EXPECT_NE(c.getProducingLayer(), nullptr);
+  EXPECT_EQ(c.getProducingLayer()->getType(), "multiply");
+  EXPECT_EQ(c.getInputTensors().size(), 2u);
+}
+
+/**
+ * @brief reshape() creates implicit Reshape layer
+ */
+TEST(nntrainer_ccapi_tensor, reshape_symbolic_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 784}, "flat");
+  auto y = x.reshape(TensorDim({1, 1, 28, 28}));
+
+  EXPECT_TRUE(y.isValid());
+  EXPECT_FALSE(y.isMaterialized());
+  EXPECT_EQ(y.shape().channel(), 1u);
+  EXPECT_EQ(y.shape().height(), 28u);
+  EXPECT_EQ(y.shape().width(), 28u);
+  EXPECT_NE(y.getProducingLayer(), nullptr);
+  EXPECT_EQ(y.getInputTensors().size(), 1u);
+  EXPECT_EQ(y.getInputTensors()[0].name(), "flat");
+}
+
+/**
+ * @brief Residual (skip) connection: x + fc(x)
+ */
+TEST(nntrainer_ccapi_tensor, residual_connection_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 256}, "x");
+  LayerHandle fc = createLayer("fully_connected", {"unit=256", "name=fc_res"});
+  auto h = fc(x);
+  auto out = x.add(h);
+
+  EXPECT_TRUE(out.isValid());
+  // out -> Addition -> [x, h]; h -> fc -> [x]
+  auto inputs = out.getInputTensors();
+  EXPECT_EQ(inputs.size(), 2u);
+  EXPECT_EQ(inputs[0].name(), "x");
+  EXPECT_EQ(inputs[1].getProducingLayer()->getName(), "fc_res");
+}
+
+/**
+ * @brief Chained ops: a.add(b).multiply(c)
+ */
+TEST(nntrainer_ccapi_tensor, chained_ops_p) {
+  using namespace ml::train;
+  auto a = Tensor({1, 1, 1, 64}, "a");
+  auto b = Tensor({1, 1, 1, 64}, "b");
+  auto c = Tensor({1, 1, 1, 64}, "c");
+  auto result = a.add(b).multiply(c);
+
+  EXPECT_TRUE(result.isValid());
+  EXPECT_EQ(result.getProducingLayer()->getType(), "multiply");
+  auto mul_inputs = result.getInputTensors();
+  EXPECT_EQ(mul_inputs.size(), 2u);
+  // First input to multiply is the add result
+  EXPECT_EQ(mul_inputs[0].getProducingLayer()->getType(), "addition");
+}

@@ -227,6 +227,32 @@ public:
    */
   std::shared_ptr<Layer> getSrcLayer() const;
 
+  // --- Symbolic tensor operations (create implicit layers) ---
+
+  /**
+   * @brief Element-wise addition (creates implicit Addition layer)
+   *
+   * @param other Tensor to add
+   * @return Output tensor connected to an Addition layer
+   */
+  Tensor add(const Tensor &other) const;
+
+  /**
+   * @brief Element-wise multiplication (creates implicit Multiply layer)
+   *
+   * @param other Tensor to multiply
+   * @return Output tensor connected to a Multiply layer
+   */
+  Tensor multiply(const Tensor &other) const;
+
+  /**
+   * @brief Reshape tensor (creates implicit Reshape layer)
+   *
+   * @param new_shape Target dimensions
+   * @return Output tensor connected to a Reshape layer
+   */
+  Tensor reshape(const TensorDim &new_shape) const;
+
   /**
    * @brief Get the layer that produced this tensor (graph edge info)
    *
