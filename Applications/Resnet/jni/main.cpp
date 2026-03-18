@@ -5,7 +5,7 @@
  * @file   main.cpp
  * @date   24 Jun 2021
  * @todo   move resnet model creating to separate sourcefile
- * @brief  task runner for the resnet
+ * @brief  task runner for the resnet using ccapi layer construction
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -27,7 +27,6 @@
 #include <optimizer.h>
 
 #include <cifar_dataloader.h>
-#include <util_func.h>
 
 #ifdef PROFILE
 #include <profiler.h>
@@ -61,24 +60,22 @@ std::vector<LayerHandle> resnetBlock(const std::string &block_name,
   auto scoped_name = [&block_name](const std::string &layer_name) {
     return block_name + "/" + layer_name;
   };
-  auto with_name = [&scoped_name](const std::string &layer_name) {
-    return nntrainer::withKey("name", scoped_name(layer_name));
-  };
 
-  auto create_conv = [&with_name, filters,
-                      pre_trained](const std::string &name, int k_size,
-                                   int stride, const std::string &padding,
-                                   const std::string &input_layer) {
-    std::vector<std::string> props{
-      with_name(name),
-      nntrainer::withKey("stride", {stride, stride}),
-      nntrainer::withKey("filters", filters),
-      nntrainer::withKey("kernel_size", {k_size, k_size}),
-      nntrainer::withKey("padding", padding),
-      nntrainer::withKey("input_layers", input_layer),
-      nntrainer::withKey("trainable", pre_trained ? "true" : "false")};
+  std::string trainable_str = pre_trained ? "true" : "false";
+  std::string filters_str = std::to_string(filters);
+  std::string ks_str =
+    std::to_string(kernel_size) + "," + std::to_string(kernel_size);
 
-    return createLayer("conv2d", props);
+  auto create_conv = [&](const std::string &name, int k_size, int stride,
+                         const std::string &padding,
+                         const std::string &input_layer) {
+    std::string k = std::to_string(k_size) + "," + std::to_string(k_size);
+    std::string s = std::to_string(stride) + "," + std::to_string(stride);
+    return createLayer(
+      "conv2d", {"name=" + scoped_name(name), "filters=" + filters_str,
+                 "kernel_size=" + k, "stride=" + s, "padding=" + padding,
+                 "input_layers=" + input_layer,
+                 "trainable=" + trainable_str});
   };
 
 /** residual path */
@@ -91,11 +88,10 @@ std::vector<LayerHandle> resnetBlock(const std::string &block_name,
 #endif
   LayerHandle a2 = createLayer(
     "batch_normalization",
-    {with_name("a2"), nntrainer::withKey("activation", "relu"),
-     nntrainer::withKey("momentum", "0.9"),
-     nntrainer::withKey("epsilon", "0.00001"),
-     nntrainer::withKey("trainable", pre_trained ? "true" : "false")});
-  LayerHandle a3 = create_conv("a3", kernel_size, 1, "same", scoped_name("a2"));
+    {"name=" + scoped_name("a2"), "activation=relu", "momentum=0.9",
+     "epsilon=0.00001", "trainable=" + trainable_str});
+  LayerHandle a3 =
+    create_conv("a3", kernel_size, 1, "same", scoped_name("a2"));
 
   /** skip path */
   LayerHandle b1 = nullptr;
@@ -110,16 +106,13 @@ std::vector<LayerHandle> resnetBlock(const std::string &block_name,
   const std::string skip_name = b1 ? scoped_name("b1") : input_name;
 
   LayerHandle c1 = createLayer(
-    "Addition",
-    {with_name("c1"),
-     nntrainer::withKey("input_layers", {scoped_name("a3"), skip_name})});
+    "Addition", {"name=" + scoped_name("c1"),
+                 "input_layers=" + scoped_name("a3") + "," + skip_name});
 
-  LayerHandle c2 = createLayer("batch_normalization",
-                               {nntrainer::withKey("name", block_name),
-                                nntrainer::withKey("activation", "relu"),
-                                nntrainer::withKey("momentum", "0.9"),
-                                nntrainer::withKey("epsilon", "0.00001"),
-                                nntrainer::withKey("trainable", "false")});
+  LayerHandle c2 =
+    createLayer("batch_normalization",
+                {"name=" + block_name, "activation=relu", "momentum=0.9",
+                 "epsilon=0.00001", "trainable=false"});
 
   if (downsample) {
     return {b1, a1, a2, a3, c1, c2};
@@ -136,29 +129,23 @@ std::vector<LayerHandle> resnetBlock(const std::string &block_name,
 std::vector<LayerHandle> createResnet18Graph(bool pre_trained) {
   using ml::train::createLayer;
 
+  std::string trainable_str = pre_trained ? "true" : "false";
+
   std::vector<LayerHandle> layers;
 
   layers.push_back(
-    createLayer("input", {nntrainer::withKey("name", "input0"),
-                          nntrainer::withKey("input_shape", "3:32:32")}));
+    createLayer("input", {"name=input0", "input_shape=3:32:32"}));
 
   layers.push_back(createLayer(
     "conv2d",
-    {nntrainer::withKey("name", "conv0"), nntrainer::withKey("filters", 64),
-     nntrainer::withKey("kernel_size", {3, 3}),
-     nntrainer::withKey("stride", {1, 1}),
-     nntrainer::withKey("padding", "same"),
-     nntrainer::withKey("bias_initializer", "zeros"),
-     nntrainer::withKey("weight_initializer", "xavier_uniform"),
-     nntrainer::withKey("trainable", pre_trained ? "true" : "false")}));
+    {"name=conv0", "filters=64", "kernel_size=3,3", "stride=1,1",
+     "padding=same", "bias_initializer=zeros",
+     "weight_initializer=xavier_uniform", "trainable=" + trainable_str}));
 
   layers.push_back(createLayer(
     "batch_normalization",
-    {nntrainer::withKey("name", "first_bn_relu"),
-     nntrainer::withKey("activation", "relu"),
-     nntrainer::withKey("momentum", "0.9"),
-     nntrainer::withKey("epsilon", "0.00001"),
-     nntrainer::withKey("trainable", pre_trained ? "true" : "false")}));
+    {"name=first_bn_relu", "activation=relu", "momentum=0.9",
+     "epsilon=0.00001", "trainable=" + trainable_str}));
 
   std::vector<std::vector<LayerHandle>> blocks;
 
@@ -183,17 +170,13 @@ std::vector<LayerHandle> createResnet18Graph(bool pre_trained) {
     layers.insert(layers.end(), block.begin(), block.end());
   }
 
-  layers.push_back(
-    createLayer("pooling2d", {nntrainer::withKey("name", "last_p1"),
-                              nntrainer::withKey("pooling", "average"),
-                              nntrainer::withKey("pool_size", {4, 4}),
-                              nntrainer::withKey("stride", "4,4")}));
+  layers.push_back(createLayer(
+    "pooling2d",
+    {"name=last_p1", "pooling=average", "pool_size=4,4", "stride=4,4"}));
 
-  layers.push_back(
-    createLayer("flatten", {nntrainer::withKey("name", "last_f1")}));
-  layers.push_back(createLayer("fully_connected",
-                               {nntrainer::withKey("unit", 100),
-                                nntrainer::withKey("activation", "softmax")}));
+  layers.push_back(createLayer("flatten", {"name=last_f1"}));
+  layers.push_back(createLayer(
+    "fully_connected", {"unit=100", "activation=softmax"}));
 
   return layers;
 }
@@ -203,10 +186,10 @@ ModelHandle createResnet18(bool pre_trained = false) {
 /// @todo support "LOSS : cross" for TF_Lite Exporter
 #if (defined(ENABLE_TFLITE_INTERPRETER) && !defined(ENABLE_TEST))
   ModelHandle model = ml::train::createModel(
-    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
+    ml::train::ModelType::NEURAL_NET, {"loss=mse"});
 #else
   ModelHandle model = ml::train::createModel(
-    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "cross")});
+    ml::train::ModelType::NEURAL_NET, {"loss=cross"});
 #endif
 
   for (auto &layer : createResnet18Graph(pre_trained)) {
@@ -232,8 +215,8 @@ int validData_cb(float **input, float **label, bool *last, void *user_data) {
 
 #if defined(ENABLE_TEST)
 TEST(Resnet_Training, verify_accuracy) {
-  EXPECT_FLOAT_EQ(training_loss, 4.389328);
-  EXPECT_FLOAT_EQ(validation_loss, 11.611803);
+  EXPECT_FLOAT_EQ(training_loss, 4.5230851f);
+  EXPECT_FLOAT_EQ(validation_loss, 4.0114694f);
 }
 #endif
 
@@ -247,9 +230,9 @@ void createAndRun(unsigned int epochs, unsigned int batch_size,
 
   // setup model
   ModelHandle model = createResnet18(transfer_learning);
-  model->setProperty({nntrainer::withKey("batch_size", batch_size),
-                      nntrainer::withKey("epochs", epochs),
-                      nntrainer::withKey("save_path", "resnet_full.bin")});
+  model->setProperty({"batch_size=" + std::to_string(batch_size),
+                      "epochs=" + std::to_string(epochs),
+                      "save_path=resnet_full.bin"});
 
   auto optimizer = ml::train::createOptimizer("adam", {"learning_rate=0.001"});
   int status = model->setOptimizer(std::move(optimizer));
