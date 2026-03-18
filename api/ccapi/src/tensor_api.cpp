@@ -28,14 +28,16 @@ namespace ml {
 namespace train {
 
 /**
- * @brief Graph edge node for symbolic tensor graph construction.
+ * @brief Lightweight graph node for API-level symbolic graph construction.
  *
- * Stored as shared_ptr so Tensor copies share graph structure without
- * recursive deep copies (which caused O(N!) memory for deep graphs).
+ * Unlike the internal GraphNode (used for execution with LayerNode),
+ * this only holds connection info needed to build the graph before
+ * model.compile(). Stored as shared_ptr so Tensor copies share graph
+ * structure without recursive deep copies (O(N!) memory explosion).
  */
-struct GraphEdge {
+struct SymbolicGraphNode {
   std::shared_ptr<Layer> producing_layer;
-  std::vector<std::shared_ptr<GraphEdge>> inputs;
+  std::vector<std::shared_ptr<SymbolicGraphNode>> inputs;
   TensorDim dim;
   std::string name;
 };
@@ -55,7 +57,7 @@ struct Tensor::Impl {
   std::shared_ptr<Layer> src_layer;
 
   // Graph edge (shared_ptr to avoid O(N!) deep-copy on Tensor copy)
-  std::shared_ptr<GraphEdge> graph_edge;
+  std::shared_ptr<SymbolicGraphNode> graph_edge;
 
   // Bound internal tensor (set after model compile+initialize)
   nntrainer::Tensor *bound_tensor = nullptr;
@@ -763,7 +765,7 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
   }
 
   // Record graph edge (shared, no deep copies)
-  auto edge = std::make_shared<GraphEdge>();
+  auto edge = std::make_shared<SymbolicGraphNode>();
   edge->producing_layer = ptr_;
   edge->dim = out_dim;
   edge->name = out_name;
@@ -772,7 +774,7 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
       edge->inputs.push_back(inp.impl_->graph_edge);
     } else {
       // Leaf tensor — create a leaf edge with no producer
-      auto leaf = std::make_shared<GraphEdge>();
+      auto leaf = std::make_shared<SymbolicGraphNode>();
       leaf->dim = inp.shape();
       leaf->name = inp.name();
       edge->inputs.push_back(leaf);
@@ -813,9 +815,9 @@ int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
   std::map<std::string, LeafInfo> additional_leaves;
   int unnamed_leaf_counter = 0;
 
-  // DFS on GraphEdge (post-order = topological order)
-  std::function<void(const std::shared_ptr<GraphEdge> &)> dfs =
-    [&](const std::shared_ptr<GraphEdge> &edge) {
+  // DFS on SymbolicGraphNode (post-order = topological order)
+  std::function<void(const std::shared_ptr<SymbolicGraphNode> &)> dfs =
+    [&](const std::shared_ptr<SymbolicGraphNode> &edge) {
       if (!edge || !edge->producing_layer) {
         return; // leaf
       }
