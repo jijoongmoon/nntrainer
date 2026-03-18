@@ -238,12 +238,116 @@ Tensor &Tensor::add_i(float value) {
   return *this;
 }
 
+Tensor &Tensor::add_i(const Tensor &other, float alpha) {
+  if (!impl_) {
+    throw std::runtime_error("Cannot add_i on invalid tensor");
+  }
+  auto other_impl = other.impl_.get();
+  impl_->call_chain.push_back(
+    [other_impl, alpha](nntrainer::Tensor &t) {
+      nntrainer::Tensor *src = other_impl->bound_tensor
+                                 ? other_impl->bound_tensor
+                                 : other_impl->eager_data.get();
+      if (!src)
+        throw std::runtime_error("add_i: other tensor not materialized");
+      t.add_i(*src, alpha);
+    });
+  return *this;
+}
+
+Tensor &Tensor::subtract_i(float value) {
+  if (!impl_) {
+    throw std::runtime_error("Cannot subtract_i on invalid tensor");
+  }
+  impl_->call_chain.push_back(
+    [value](nntrainer::Tensor &t) { t.subtract_i(value); });
+  return *this;
+}
+
+Tensor &Tensor::subtract_i(const Tensor &other) {
+  if (!impl_) {
+    throw std::runtime_error("Cannot subtract_i on invalid tensor");
+  }
+  auto other_impl = other.impl_.get();
+  impl_->call_chain.push_back(
+    [other_impl](nntrainer::Tensor &t) {
+      nntrainer::Tensor *src = other_impl->bound_tensor
+                                 ? other_impl->bound_tensor
+                                 : other_impl->eager_data.get();
+      if (!src)
+        throw std::runtime_error("subtract_i: other tensor not materialized");
+      t.subtract_i(*src);
+    });
+  return *this;
+}
+
 Tensor &Tensor::multiply_i(float value) {
   if (!impl_) {
     throw std::runtime_error("Cannot multiply_i on invalid tensor");
   }
   impl_->call_chain.push_back(
     [value](nntrainer::Tensor &t) { t.multiply_i(value); });
+  return *this;
+}
+
+Tensor &Tensor::multiply_i(const Tensor &other) {
+  if (!impl_) {
+    throw std::runtime_error("Cannot multiply_i on invalid tensor");
+  }
+  auto other_impl = other.impl_.get();
+  impl_->call_chain.push_back(
+    [other_impl](nntrainer::Tensor &t) {
+      nntrainer::Tensor *src = other_impl->bound_tensor
+                                 ? other_impl->bound_tensor
+                                 : other_impl->eager_data.get();
+      if (!src)
+        throw std::runtime_error("multiply_i: other tensor not materialized");
+      t.multiply_i(*src);
+    });
+  return *this;
+}
+
+Tensor &Tensor::divide_i(float value) {
+  if (!impl_) {
+    throw std::runtime_error("Cannot divide_i on invalid tensor");
+  }
+  impl_->call_chain.push_back(
+    [value](nntrainer::Tensor &t) { t.divide_i(value); });
+  return *this;
+}
+
+Tensor &Tensor::divide_i(const Tensor &other) {
+  if (!impl_) {
+    throw std::runtime_error("Cannot divide_i on invalid tensor");
+  }
+  auto other_impl = other.impl_.get();
+  impl_->call_chain.push_back(
+    [other_impl](nntrainer::Tensor &t) {
+      nntrainer::Tensor *src = other_impl->bound_tensor
+                                 ? other_impl->bound_tensor
+                                 : other_impl->eager_data.get();
+      if (!src)
+        throw std::runtime_error("divide_i: other tensor not materialized");
+      t.divide_i(*src);
+    });
+  return *this;
+}
+
+Tensor &Tensor::pow_i(float exponent) {
+  if (!impl_) {
+    throw std::runtime_error("Cannot pow_i on invalid tensor");
+  }
+  impl_->call_chain.push_back(
+    [exponent](nntrainer::Tensor &t) { t.pow_i(exponent); });
+  return *this;
+}
+
+Tensor &Tensor::inv_sqrt_i() {
+  if (!impl_) {
+    throw std::runtime_error("Cannot inv_sqrt_i on invalid tensor");
+  }
+  impl_->call_chain.push_back(
+    [](nntrainer::Tensor &t) { t.inv_sqrt_i(); });
   return *this;
 }
 
@@ -260,6 +364,201 @@ Tensor &Tensor::eval() {
   }
   impl_->call_chain.clear();
   return *this;
+}
+
+// --- Private helpers ---
+
+void *Tensor::getInternalPtr() const {
+  if (!impl_)
+    throw std::runtime_error("Tensor is not materialized");
+  if (impl_->bound_tensor)
+    return impl_->bound_tensor;
+  if (impl_->eager_data)
+    return impl_->eager_data.get();
+  throw std::runtime_error("Tensor is not materialized");
+}
+
+Tensor Tensor::wrapResult(const void *internal_tensor) {
+  const auto &internal =
+    *static_cast<const nntrainer::Tensor *>(internal_tensor);
+  Tensor result;
+  result.impl_->dim = internal.getDim();
+  result.impl_->valid = true;
+  result.impl_->external = false;
+  result.impl_->eager_data =
+    std::make_shared<nntrainer::Tensor>(internal);
+  return result;
+}
+
+// Convenience: cast getInternalPtr to nntrainer::Tensor*
+static inline nntrainer::Tensor *asInternal(void *ptr) {
+  return static_cast<nntrainer::Tensor *>(ptr);
+}
+
+// --- Eager operations returning new tensors ---
+
+Tensor Tensor::add(float value) const {
+  auto r = asInternal(getInternalPtr())->add(value);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::subtract(float value) const {
+  auto r = asInternal(getInternalPtr())->subtract(value);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::subtract(const Tensor &other) const {
+  auto r = asInternal(getInternalPtr())->subtract(
+    *asInternal(other.getInternalPtr()));
+  return wrapResult(&r);
+}
+
+Tensor Tensor::multiply(float value) const {
+  auto r = asInternal(getInternalPtr())->multiply(value);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::divide(float value) const {
+  auto r = asInternal(getInternalPtr())->divide(value);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::divide(const Tensor &other) const {
+  auto r = asInternal(getInternalPtr())->divide(
+    *asInternal(other.getInternalPtr()));
+  return wrapResult(&r);
+}
+
+Tensor Tensor::dot(const Tensor &other, bool trans, bool trans_in) const {
+  auto r = asInternal(getInternalPtr())->dot(
+    *asInternal(other.getInternalPtr()), trans, trans_in);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::transpose(const std::string &direction) const {
+  auto r = asInternal(getInternalPtr())->transpose(direction);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::pow(float exponent) const {
+  auto r = asInternal(getInternalPtr())->pow(exponent);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::sum(unsigned int axis, float alpha) const {
+  auto r = asInternal(getInternalPtr())->sum(axis, alpha);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::average(unsigned int axis) const {
+  auto r = asInternal(getInternalPtr())->average(axis);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::average() const {
+  auto r = asInternal(getInternalPtr())->average();
+  return wrapResult(&r);
+}
+
+float Tensor::l2norm() const {
+  return asInternal(getInternalPtr())->l2norm();
+}
+
+// --- Tensor manipulation ---
+
+Tensor Tensor::getBatchSlice(unsigned int offset, unsigned int size) const {
+  auto r = asInternal(getInternalPtr())->getBatchSlice(offset, size);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::getSharedDataTensor(const TensorDim &dim,
+                                    size_t offset) const {
+  auto r =
+    asInternal(getInternalPtr())->getSharedDataTensor(dim, offset, false);
+  return wrapResult(&r);
+}
+
+Tensor Tensor::apply(std::function<float(float)> f) const {
+  auto *internal = asInternal(getInternalPtr());
+  nntrainer::Tensor r = internal->clone();
+  float *d = r.getData<float>();
+  size_t len = r.size();
+  for (size_t i = 0; i < len; ++i) {
+    d[i] = f(d[i]);
+  }
+  return wrapResult(&r);
+}
+
+void Tensor::apply_i(std::function<float(float)> f) {
+  auto *internal = asInternal(getInternalPtr());
+  float *d = internal->getData<float>();
+  size_t len = internal->size();
+  for (size_t i = 0; i < len; ++i) {
+    d[i] = f(d[i]);
+  }
+}
+
+Tensor Tensor::cat(const std::vector<Tensor> &tensors, int axis) {
+  if (tensors.empty()) {
+    throw std::invalid_argument("cat: tensors must not be empty");
+  }
+
+  std::vector<nntrainer::Tensor> internals;
+  internals.reserve(tensors.size());
+  for (auto &t : tensors) {
+    internals.push_back(*asInternal(t.getInternalPtr()));
+  }
+
+  nntrainer::Tensor output;
+  internals[0].concat(
+    std::vector<nntrainer::Tensor>(internals.begin() + 1, internals.end()),
+    axis, output);
+  return wrapResult(&output);
+}
+
+// --- Immediate in-place operations ---
+
+void Tensor::setZero() {
+  asInternal(getInternalPtr())->setZero();
+}
+
+void Tensor::fill(const Tensor &from) {
+  asInternal(getInternalPtr())->fill(
+    *asInternal(from.getInternalPtr()));
+}
+
+void Tensor::copyData(const Tensor &from) {
+  asInternal(getInternalPtr())->copyData(
+    *asInternal(from.getInternalPtr()));
+}
+
+// --- Convenience dimension accessors ---
+
+size_t Tensor::size() const {
+  if (!impl_ || !impl_->valid) {
+    throw std::runtime_error("Cannot get size of invalid tensor");
+  }
+  return impl_->dim.getDataLen();
+}
+
+bool Tensor::empty() const {
+  return !impl_ || !impl_->valid || impl_->dim.getDataLen() == 0;
+}
+
+size_t Tensor::batch() const {
+  return shape().batch();
+}
+
+size_t Tensor::channel() const {
+  return shape().channel();
+}
+
+size_t Tensor::height() const {
+  return shape().height();
+}
+
+size_t Tensor::width() const {
+  return shape().width();
 }
 
 // --- Factory methods ---

@@ -917,3 +917,300 @@ TEST(nntrainer_ccapi_graph, multiple_leaf_inputs_p) {
   EXPECT_TRUE(x1.isMaterialized());
   EXPECT_TRUE(y.isMaterialized());
 }
+
+// ===== Phase 1: Extended eager tensor operations =====
+
+// --- Convenience dimension accessors ---
+
+TEST(nntrainer_ccapi_tensor, size_p) {
+  auto t = ml::train::Tensor::zeros({2, 3, 4, 5});
+  EXPECT_EQ(t.size(), 2u * 3u * 4u * 5u);
+}
+
+TEST(nntrainer_ccapi_tensor, batch_channel_height_width_p) {
+  auto t = ml::train::Tensor::zeros({2, 3, 4, 5});
+  EXPECT_EQ(t.batch(), 2u);
+  EXPECT_EQ(t.channel(), 3u);
+  EXPECT_EQ(t.height(), 4u);
+  EXPECT_EQ(t.width(), 5u);
+}
+
+TEST(nntrainer_ccapi_tensor, empty_p) {
+  ml::train::Tensor t;
+  EXPECT_TRUE(t.empty());
+  auto z = ml::train::Tensor::zeros({1, 1, 2, 2});
+  EXPECT_FALSE(z.empty());
+}
+
+// --- Scalar eager operations ---
+
+TEST(nntrainer_ccapi_tensor, add_scalar_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  auto r = t.add(5.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 6.0f);
+  // Original unchanged
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 1.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, subtract_scalar_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  auto r = t.subtract(0.5f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 0.5f);
+}
+
+TEST(nntrainer_ccapi_tensor, multiply_scalar_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  auto r = t.multiply(3.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 3.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, divide_scalar_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  t.setValue(0, 0, 0, 0, 6.0f);
+  auto r = t.divide(2.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 3.0f);
+}
+
+// --- Tensor-tensor eager operations ---
+
+TEST(nntrainer_ccapi_tensor, subtract_tensor_p) {
+  auto a = ml::train::Tensor::ones({1, 1, 2, 2});
+  auto b = ml::train::Tensor::ones({1, 1, 2, 2});
+  a.setValue(0, 0, 0, 0, 5.0f);
+  auto r = a.subtract(b);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 4.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 1), 0.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, divide_tensor_p) {
+  auto a = ml::train::Tensor::ones({1, 1, 2, 2});
+  auto b = ml::train::Tensor::ones({1, 1, 2, 2});
+  a.setValue(0, 0, 0, 0, 6.0f);
+  b.setValue(0, 0, 0, 0, 3.0f);
+  auto r = a.divide(b);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 2.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 1), 1.0f);
+}
+
+// --- Dot product ---
+
+TEST(nntrainer_ccapi_tensor, dot_p) {
+  // [1,1,1,2] dot [1,1,2,1] = [1,1,1,1]
+  auto a = ml::train::Tensor::ones({1, 1, 1, 2});
+  auto b = ml::train::Tensor::ones({1, 1, 2, 1});
+  a.setValue(0, 0, 0, 0, 2.0f);
+  a.setValue(0, 0, 0, 1, 3.0f);
+  auto r = a.dot(b);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 5.0f); // 2*1 + 3*1
+}
+
+// --- Transpose ---
+
+TEST(nntrainer_ccapi_tensor, transpose_p) {
+  auto t = ml::train::Tensor::zeros({1, 1, 2, 3});
+  t.setValue(0, 0, 0, 0, 1.0f);
+  t.setValue(0, 0, 0, 1, 2.0f);
+  t.setValue(0, 0, 0, 2, 3.0f);
+  t.setValue(0, 0, 1, 0, 4.0f);
+  t.setValue(0, 0, 1, 1, 5.0f);
+  t.setValue(0, 0, 1, 2, 6.0f);
+  auto r = t.transpose("0:2:1"); // swap h and w
+  EXPECT_EQ(r.height(), 3u);
+  EXPECT_EQ(r.width(), 2u);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 1, 0), 2.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 1), 4.0f);
+}
+
+// --- Power ---
+
+TEST(nntrainer_ccapi_tensor, pow_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 2});
+  t.setValue(0, 0, 0, 0, 3.0f);
+  t.setValue(0, 0, 0, 1, 2.0f);
+  auto r = t.pow(2.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 9.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 1), 4.0f);
+}
+
+// --- Sum and average ---
+
+TEST(nntrainer_ccapi_tensor, sum_axis_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 3});
+  t.setValue(0, 0, 0, 0, 1.0f);
+  t.setValue(0, 0, 0, 1, 2.0f);
+  t.setValue(0, 0, 0, 2, 3.0f);
+  t.setValue(0, 0, 1, 0, 4.0f);
+  t.setValue(0, 0, 1, 1, 5.0f);
+  t.setValue(0, 0, 1, 2, 6.0f);
+  // Sum along axis 3 (width) -> {1,1,2,1}
+  auto r = t.sum(3);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 6.0f);  // 1+2+3
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 1, 0), 15.0f); // 4+5+6
+}
+
+TEST(nntrainer_ccapi_tensor, average_axis_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  t.setValue(0, 0, 0, 0, 2.0f);
+  t.setValue(0, 0, 0, 1, 4.0f);
+  t.setValue(0, 0, 1, 0, 6.0f);
+  t.setValue(0, 0, 1, 1, 8.0f);
+  // Average along axis 3 (width) -> {1,1,2,1}
+  auto r = t.average(3);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 3.0f); // (2+4)/2
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 1, 0), 7.0f); // (6+8)/2
+}
+
+TEST(nntrainer_ccapi_tensor, average_global_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  t.setValue(0, 0, 0, 0, 2.0f);
+  t.setValue(0, 0, 0, 1, 4.0f);
+  t.setValue(0, 0, 1, 0, 6.0f);
+  t.setValue(0, 0, 1, 1, 8.0f);
+  auto r = t.average();
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 5.0f); // (2+4+6+8)/4
+}
+
+// --- L2 norm ---
+
+TEST(nntrainer_ccapi_tensor, l2norm_p) {
+  auto t = ml::train::Tensor::zeros({1, 1, 1, 2});
+  t.setValue(0, 0, 0, 0, 3.0f);
+  t.setValue(0, 0, 0, 1, 4.0f);
+  EXPECT_FLOAT_EQ(t.l2norm(), 5.0f); // sqrt(9+16)
+}
+
+// --- setZero ---
+
+TEST(nntrainer_ccapi_tensor, set_zero_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 2, 2});
+  t.setZero();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 0.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 0.0f);
+}
+
+// --- copyData ---
+
+TEST(nntrainer_ccapi_tensor, copy_data_p) {
+  auto src = ml::train::Tensor::ones({1, 1, 2, 2});
+  src.setValue(0, 0, 0, 0, 42.0f);
+  auto dst = ml::train::Tensor::zeros({1, 1, 2, 2});
+  dst.copyData(src);
+  EXPECT_FLOAT_EQ(dst.getValue(0, 0, 0, 0), 42.0f);
+  EXPECT_FLOAT_EQ(dst.getValue(0, 0, 0, 1), 1.0f);
+}
+
+// --- fill ---
+
+TEST(nntrainer_ccapi_tensor, fill_p) {
+  auto src = ml::train::Tensor::ones({1, 1, 2, 2});
+  src.setValue(0, 0, 0, 0, 99.0f);
+  auto dst = ml::train::Tensor::zeros({1, 1, 2, 2});
+  dst.fill(src);
+  EXPECT_FLOAT_EQ(dst.getValue(0, 0, 0, 0), 99.0f);
+}
+
+// --- apply / apply_i ---
+
+TEST(nntrainer_ccapi_tensor, apply_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 3});
+  t.setValue(0, 0, 0, 0, 1.0f);
+  t.setValue(0, 0, 0, 1, 4.0f);
+  t.setValue(0, 0, 0, 2, 9.0f);
+  auto r = t.apply([](float x) { return x * x; });
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 1), 16.0f);
+  EXPECT_FLOAT_EQ(r.getValue(0, 0, 0, 2), 81.0f);
+  // Original unchanged
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 1), 4.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, apply_i_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 2});
+  t.setValue(0, 0, 0, 0, 3.0f);
+  t.setValue(0, 0, 0, 1, 5.0f);
+  t.apply_i([](float x) { return x + 10.0f; });
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 13.0f);
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 1), 15.0f);
+}
+
+// --- Extended lazy chain ---
+
+TEST(nntrainer_ccapi_tensor, lazy_subtract_i_scalar_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 1});
+  t.setValue(0, 0, 0, 0, 10.0f);
+  t.chain().subtract_i(3.0f).eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 7.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, lazy_divide_i_scalar_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 1});
+  t.setValue(0, 0, 0, 0, 12.0f);
+  t.chain().divide_i(4.0f).eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 3.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, lazy_pow_i_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 1});
+  t.setValue(0, 0, 0, 0, 3.0f);
+  t.chain().pow_i(2.0f).eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 9.0f);
+}
+
+TEST(nntrainer_ccapi_tensor, lazy_tensor_add_i_p) {
+  auto a = ml::train::Tensor::ones({1, 1, 1, 2});
+  auto b = ml::train::Tensor::ones({1, 1, 1, 2});
+  a.setValue(0, 0, 0, 0, 3.0f);
+  b.setValue(0, 0, 0, 0, 7.0f);
+  a.chain().add_i(b).eval();
+  EXPECT_FLOAT_EQ(a.getValue(0, 0, 0, 0), 10.0f); // 3+7
+  EXPECT_FLOAT_EQ(a.getValue(0, 0, 0, 1), 2.0f);  // 1+1
+}
+
+TEST(nntrainer_ccapi_tensor, lazy_tensor_multiply_i_p) {
+  auto a = ml::train::Tensor::ones({1, 1, 1, 2});
+  auto b = ml::train::Tensor::ones({1, 1, 1, 2});
+  a.setValue(0, 0, 0, 0, 3.0f);
+  b.setValue(0, 0, 0, 0, 4.0f);
+  a.chain().multiply_i(b).eval();
+  EXPECT_FLOAT_EQ(a.getValue(0, 0, 0, 0), 12.0f); // 3*4
+  EXPECT_FLOAT_EQ(a.getValue(0, 0, 0, 1), 1.0f);  // 1*1
+}
+
+TEST(nntrainer_ccapi_tensor, lazy_complex_chain_p) {
+  auto t = ml::train::Tensor::ones({1, 1, 1, 1});
+  t.setValue(0, 0, 0, 0, 10.0f);
+  // (10 + 2) * 3 - 1 = 35
+  t.chain().add_i(2.0f).multiply_i(3.0f).subtract_i(1.0f).eval();
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 35.0f);
+}
+
+// --- getBatchSlice ---
+
+TEST(nntrainer_ccapi_tensor, get_batch_slice_p) {
+  auto t = ml::train::Tensor::zeros({2, 1, 1, 3});
+  t.setValue(0, 0, 0, 0, 1.0f);
+  t.setValue(0, 0, 0, 1, 2.0f);
+  t.setValue(0, 0, 0, 2, 3.0f);
+  t.setValue(1, 0, 0, 0, 4.0f);
+  t.setValue(1, 0, 0, 1, 5.0f);
+  t.setValue(1, 0, 0, 2, 6.0f);
+
+  auto s = t.getBatchSlice(1, 1); // second batch
+  EXPECT_EQ(s.batch(), 1u);
+  EXPECT_FLOAT_EQ(s.getValue(0, 0, 0, 0), 4.0f);
+  EXPECT_FLOAT_EQ(s.getValue(0, 0, 0, 2), 6.0f);
+}
+
+// --- Eager ops on unmaterialized tensor throw ---
+
+TEST(nntrainer_ccapi_tensor, eager_ops_unmaterialized_n) {
+  ml::train::Tensor t({1, 1, 2, 2});
+  EXPECT_THROW(t.add(1.0f), std::runtime_error);
+  EXPECT_THROW(t.subtract(1.0f), std::runtime_error);
+  EXPECT_THROW(t.multiply(1.0f), std::runtime_error);
+  EXPECT_THROW(t.divide(1.0f), std::runtime_error);
+  EXPECT_THROW(t.pow(2.0f), std::runtime_error);
+  EXPECT_THROW(t.l2norm(), std::runtime_error);
+  EXPECT_THROW(t.setZero(), std::runtime_error);
+}

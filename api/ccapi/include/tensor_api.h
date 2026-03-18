@@ -20,8 +20,10 @@
 #endif // __cpluscplus
 
 #include <layer.h>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 #include <tensor_dim.h>
 
 namespace ml {
@@ -283,11 +285,67 @@ public:
   Tensor &add_i(float value);
 
   /**
+   * @brief Queue in-place tensor addition (lazy, applied on eval())
+   * @param other Tensor to add
+   * @param alpha Scaling factor for other (default 1.0)
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &add_i(const Tensor &other, float alpha = 1.0f);
+
+  /**
+   * @brief Queue in-place subtraction (lazy, applied on eval())
+   * @param value Scalar to subtract
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &subtract_i(float value);
+
+  /**
+   * @brief Queue in-place tensor subtraction (lazy, applied on eval())
+   * @param other Tensor to subtract
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &subtract_i(const Tensor &other);
+
+  /**
    * @brief Queue in-place multiplication (lazy, applied on eval())
    * @param value Scalar to multiply
    * @return Reference to this tensor for chaining
    */
   Tensor &multiply_i(float value);
+
+  /**
+   * @brief Queue in-place tensor multiplication (lazy, applied on eval())
+   * @param other Tensor to multiply element-wise
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &multiply_i(const Tensor &other);
+
+  /**
+   * @brief Queue in-place division (lazy, applied on eval())
+   * @param value Scalar divisor
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &divide_i(float value);
+
+  /**
+   * @brief Queue in-place tensor division (lazy, applied on eval())
+   * @param other Tensor divisor (element-wise)
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &divide_i(const Tensor &other);
+
+  /**
+   * @brief Queue in-place power (lazy, applied on eval())
+   * @param exponent Power exponent
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &pow_i(float exponent);
+
+  /**
+   * @brief Queue in-place inverse square root (lazy, applied on eval())
+   * @return Reference to this tensor for chaining
+   */
+  Tensor &inv_sqrt_i();
 
   /**
    * @brief Execute all queued operations on the materialized tensor
@@ -296,9 +354,201 @@ public:
    */
   Tensor &eval();
 
+  // --- Eager operations returning new tensors (requires materialized) ---
+
+  /**
+   * @brief Element-wise scalar addition
+   * @param value Scalar to add
+   * @return New tensor with result
+   */
+  Tensor add(float value) const;
+
+  /**
+   * @brief Element-wise scalar subtraction
+   * @param value Scalar to subtract
+   * @return New tensor with result
+   */
+  Tensor subtract(float value) const;
+
+  /**
+   * @brief Element-wise tensor subtraction
+   * @param other Tensor to subtract
+   * @return New tensor with result
+   */
+  Tensor subtract(const Tensor &other) const;
+
+  /**
+   * @brief Element-wise scalar multiplication
+   * @param value Scalar to multiply
+   * @return New tensor with result
+   */
+  Tensor multiply(float value) const;
+
+  /**
+   * @brief Element-wise scalar division
+   * @param value Scalar divisor
+   * @return New tensor with result
+   */
+  Tensor divide(float value) const;
+
+  /**
+   * @brief Element-wise tensor division
+   * @param other Tensor divisor
+   * @return New tensor with result
+   */
+  Tensor divide(const Tensor &other) const;
+
+  /**
+   * @brief Matrix multiplication (dot product)
+   * @param other Right-hand tensor
+   * @param trans Whether to transpose other (default false)
+   * @param trans_in Whether to transpose this (default false)
+   * @return New tensor with result
+   */
+  Tensor dot(const Tensor &other, bool trans = false,
+             bool trans_in = false) const;
+
+  /**
+   * @brief Transpose tensor
+   * @param direction Permutation string (e.g., "0:2:1")
+   * @return New transposed tensor
+   */
+  Tensor transpose(const std::string &direction) const;
+
+  /**
+   * @brief Power operation
+   * @param exponent Exponent value
+   * @return New tensor with result
+   */
+  Tensor pow(float exponent) const;
+
+  /**
+   * @brief Sum along axis
+   * @param axis Axis to sum over
+   * @param alpha Scaling factor (default 1.0)
+   * @return New tensor with result
+   */
+  Tensor sum(unsigned int axis, float alpha = 1.0f) const;
+
+  /**
+   * @brief Average along axis
+   * @param axis Axis to average over
+   * @return New tensor with result
+   */
+  Tensor average(unsigned int axis) const;
+
+  /**
+   * @brief Global average of all elements
+   * @return New 1-element tensor with result
+   */
+  Tensor average() const;
+
+  /**
+   * @brief L2 norm of the tensor
+   * @return L2 norm value
+   */
+  float l2norm() const;
+
+  // --- Tensor manipulation ---
+
+  /**
+   * @brief Get a slice along the batch dimension
+   * @param offset Batch offset
+   * @param size Number of batches
+   * @return New tensor sharing data (view)
+   */
+  Tensor getBatchSlice(unsigned int offset, unsigned int size) const;
+
+  /**
+   * @brief Get a view of this tensor with different dimensions (shared data)
+   * @param dim New dimensions for the view
+   * @param offset Offset in elements from start
+   * @return New tensor sharing data with different shape
+   */
+  Tensor getSharedDataTensor(const TensorDim &dim, size_t offset) const;
+
+  /**
+   * @brief Apply element-wise function returning new tensor
+   * @param f Function mapping float to float
+   * @return New tensor with transformed values
+   */
+  Tensor apply(std::function<float(float)> f) const;
+
+  /**
+   * @brief Apply element-wise function in-place
+   * @param f Function mapping float to float
+   */
+  void apply_i(std::function<float(float)> f);
+
+  /**
+   * @brief Concatenate multiple tensors along an axis
+   * @param tensors Tensors to concatenate
+   * @param axis Concatenation axis
+   * @return Concatenated tensor
+   */
+  static Tensor cat(const std::vector<Tensor> &tensors, int axis);
+
+  // --- Immediate in-place operations (no lazy chain) ---
+
+  /**
+   * @brief Set all elements to zero
+   */
+  void setZero();
+
+  /**
+   * @brief Fill this tensor with data from another tensor
+   * @param from Source tensor
+   */
+  void fill(const Tensor &from);
+
+  /**
+   * @brief Copy data from another tensor
+   * @param from Source tensor
+   */
+  void copyData(const Tensor &from);
+
+  // --- Convenience dimension accessors ---
+
+  /**
+   * @brief Get total number of elements
+   * @return Total element count
+   */
+  size_t size() const;
+
+  /**
+   * @brief Check if tensor is empty (no elements)
+   * @return true if empty
+   */
+  bool empty() const;
+
+  /**
+   * @brief Get batch dimension
+   */
+  size_t batch() const;
+
+  /**
+   * @brief Get channel dimension
+   */
+  size_t channel() const;
+
+  /**
+   * @brief Get height dimension
+   */
+  size_t height() const;
+
+  /**
+   * @brief Get width dimension
+   */
+  size_t width() const;
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  /// Get internal nntrainer::Tensor pointer (throws if not materialized)
+  void *getInternalPtr() const;
+  /// Wrap an internal tensor result into a public Tensor
+  static Tensor wrapResult(const void *internal_tensor);
 
   friend class LayerHandle;
   friend class Model;
