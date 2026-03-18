@@ -270,6 +270,8 @@ MODEL_CONFIGS = {
     "gliner2": GLINER2_CONFIG,
     # Encoder-decoder
     "t5gemma2": T5GEMMA2_CONFIG,
+    # External KV cache mode (reuses qwen3 config)
+    "qwen3_ext": QWEN3_CONFIG,
 }
 
 # Mapping: config_name -> meson executable target name.
@@ -287,6 +289,7 @@ MODEL_BUILD_TARGETS = {
     "kalm_embedding": "converter_kalm_embedding_test",
     "multilingual_e5": "converter_multilingual_e5_test",
     "gliner2": "converter_gliner2_test",
+    "qwen3_ext": "converter_qwen3_ext_test",
 }
 
 
@@ -482,7 +485,8 @@ def _create_t5gemma2_model(config, model_dir):
 
 # ---- Test infrastructure ----
 
-def _run_converter(model_dir, output_dir, model_name=None):
+def _run_converter(model_dir, output_dir, model_name=None,
+                    external_kv_cache=False):
     """Run converter.py and return (success, output_files)."""
     cmd = [
         sys.executable, os.path.join(CONVERTER_DIR, "converter.py"),
@@ -492,6 +496,8 @@ def _run_converter(model_dir, output_dir, model_name=None):
     ]
     if model_name:
         cmd += ["--model-name", model_name]
+    if external_kv_cache:
+        cmd += ["--external-kv-cache"]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     return result.returncode == 0, result.stdout, result.stderr
@@ -593,6 +599,12 @@ class TestConverterBuildAndRun(unittest.TestCase):
         """GLiNER2-multi-v1: custom extractor model (NER)."""
         self._run_model_test("gliner2")
 
+    # ---- External KV cache mode ----
+
+    def test_qwen3_external_kv_cache(self):
+        """Qwen3 with --external-kv-cache: convert -> build -> initialize."""
+        self._run_model_test("qwen3_ext", external_kv_cache=True)
+
     # ---- Encoder-Decoder ----
 
     @unittest.skip("T5Gemma2 is multimodal (text+vision) with deeply nested "
@@ -603,7 +615,7 @@ class TestConverterBuildAndRun(unittest.TestCase):
 
     # ---- Common pipeline ----
 
-    def _run_model_test(self, config_name):
+    def _run_model_test(self, config_name, external_kv_cache=False):
         """Run full pipeline: create model -> convert -> build -> run.
 
         Steps:
@@ -629,7 +641,8 @@ class TestConverterBuildAndRun(unittest.TestCase):
 
                 # Step 2: Convert
                 ok, stdout, stderr = _run_converter(
-                    model_dir, output_dir, model_name=config_name)
+                    model_dir, output_dir, model_name=config_name,
+                    external_kv_cache=external_kv_cache)
                 self.assertTrue(ok, f"Converter failed:\n{stderr}")
 
                 # Step 3: Verify output files exist

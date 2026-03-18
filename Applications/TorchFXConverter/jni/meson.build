@@ -38,6 +38,8 @@ converter_test_models = [
   ['multilingual_e5', 'converter_multilingual_e5_test', 'XlmRobertaModel'],
   # Custom models
   ['gliner2', 'converter_gliner2_test', 'ExtractorEmbeddingModel'],
+  # External KV cache mode
+  ['qwen3_ext', 'converter_qwen3_ext_test', 'Qwen3CausalLM'],
 ]
 
 foreach m : converter_test_models
