@@ -10,6 +10,7 @@
  * @bug         No known bugs
  */
 
+#include <cstring>
 #include <gtest/gtest.h>
 #include <iostream>
 
@@ -916,6 +917,148 @@ TEST(nntrainer_ccapi_graph, multiple_leaf_inputs_p) {
 
   EXPECT_TRUE(x1.isMaterialized());
   EXPECT_TRUE(y.isMaterialized());
+}
+
+/**
+ * @brief PicoGPT-style transformer graph: 2 inputs, skip connections, fan-out
+ *
+ * Tests the graph pattern used in PicoGPT: dual inputs → embeddings → add →
+ * transformer blocks (LN + MHA + skip + LN + FFN + skip) → final LN.
+ * Uses 1 layer with small dims to keep memory low.
+ */
+TEST(nntrainer_ccapi_graph, picogpt_style_transformer_p) {
+  using namespace ml::train;
+
+  const unsigned int MODEL_DIM = 32;
+  const unsigned int FF_DIM = 64;
+  const unsigned int NUM_HEADS = 4;
+
+  // Two symbolic inputs (like wte_input, wpe_input)
+  Tensor wte_in({1, 1, 1, 1}, "wte_input");
+  Tensor wpe_in({1, 1, 1, 1}, "wpe_input");
+
+  LayerHandle wte = createLayer("embedding",
+    {"name=wte", "in_dim=100", "out_dim=" + std::to_string(MODEL_DIM)});
+  LayerHandle wpe = createLayer("embedding",
+    {"name=wpe", "in_dim=100", "out_dim=" + std::to_string(MODEL_DIM)});
+  auto wte_out = wte(wte_in);
+  auto wpe_out = wpe(wpe_in);
+
+  LayerHandle add_emb = createLayer("Addition", {"name=add"});
+  auto prev = add_emb({wte_out, wpe_out});
+
+  // Single transformer block
+  LayerHandle ln1 = createLayer("layer_normalization",
+    {"name=layer0/ln1", "axis=3", "epsilon=1e-5"});
+  auto ln1_out = ln1(prev);
+
+  // MHA with same tensor as Q, K, V (fan-out test)
+  LayerHandle mha = createLayer("multi_head_attention",
+    {"name=layer0/multi_head_attention",
+     "num_heads=" + std::to_string(NUM_HEADS)});
+  auto attn_out = mha({ln1_out, ln1_out, ln1_out});
+
+  // Skip connection 1: prev + attn_out (prev used twice = fan-out)
+  LayerHandle add1 = createLayer("Addition", {"name=layer0/add1"});
+  auto add1_out = add1({prev, attn_out});
+
+  LayerHandle ln2 = createLayer("layer_normalization",
+    {"name=layer0/ln2", "axis=3", "epsilon=1e-5"});
+  auto ln2_out = ln2(add1_out);
+
+  LayerHandle fc1 = createLayer("fully_connected",
+    {"name=layer0/fc1", "unit=" + std::to_string(FF_DIM), "activation=gelu"});
+  auto fc1_out = fc1(ln2_out);
+
+  LayerHandle fc2 = createLayer("fully_connected",
+    {"name=layer0/fc2", "unit=" + std::to_string(MODEL_DIM)});
+  auto fc2_out = fc2(fc1_out);
+
+  // Skip connection 2: add1_out + fc2_out (add1_out used twice = fan-out)
+  LayerHandle add2 = createLayer("Addition", {"name=layer0/add2"});
+  auto block_out = add2({add1_out, fc2_out});
+
+  LayerHandle final_ln = createLayer("layer_normalization",
+    {"name=layer_normalization", "axis=3", "epsilon=1e-5"});
+  auto output = final_ln(block_out);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(wte_in, output), ML_ERROR_NONE);
+
+  EXPECT_TRUE(wte_in.isMaterialized());
+  EXPECT_TRUE(output.isMaterialized());
+}
+
+/**
+ * @brief PicoGPT-style graph compile + inference with random weights
+ *
+ * Verifies no segfault during forward pass through the graph-compiled model.
+ */
+TEST(nntrainer_ccapi_graph, picogpt_style_inference_p) {
+  using namespace ml::train;
+
+  const unsigned int MODEL_DIM = 16;
+  const unsigned int FF_DIM = 32;
+  const unsigned int NUM_HEADS = 2;
+
+  Tensor wte_in({1, 1, 1, 1}, "wte_input");
+  Tensor wpe_in({1, 1, 1, 1}, "wpe_input");
+
+  LayerHandle wte = createLayer("embedding",
+    {"name=wte", "in_dim=50", "out_dim=" + std::to_string(MODEL_DIM)});
+  LayerHandle wpe = createLayer("embedding",
+    {"name=wpe", "in_dim=50", "out_dim=" + std::to_string(MODEL_DIM)});
+  auto wte_out = wte(wte_in);
+  auto wpe_out = wpe(wpe_in);
+
+  LayerHandle add_emb = createLayer("Addition", {"name=add"});
+  auto prev = add_emb({wte_out, wpe_out});
+
+  // 1 transformer block
+  LayerHandle ln1 = createLayer("layer_normalization",
+    {"name=layer0/ln1", "axis=3", "epsilon=1e-5"});
+  auto ln1_out = ln1(prev);
+
+  LayerHandle mha = createLayer("multi_head_attention",
+    {"name=layer0/mha", "num_heads=" + std::to_string(NUM_HEADS)});
+  auto attn_out = mha({ln1_out, ln1_out, ln1_out});
+
+  LayerHandle add1 = createLayer("Addition", {"name=layer0/add1"});
+  auto add1_out = add1({prev, attn_out});
+
+  LayerHandle ln2 = createLayer("layer_normalization",
+    {"name=layer0/ln2", "axis=3", "epsilon=1e-5"});
+  auto ln2_out = ln2(add1_out);
+
+  LayerHandle fc1 = createLayer("fully_connected",
+    {"name=layer0/fc1", "unit=" + std::to_string(FF_DIM), "activation=gelu"});
+  auto fc1_out = fc1(ln2_out);
+
+  LayerHandle fc2 = createLayer("fully_connected",
+    {"name=layer0/fc2", "unit=" + std::to_string(MODEL_DIM)});
+  auto fc2_out = fc2(fc1_out);
+
+  LayerHandle add2 = createLayer("Addition", {"name=layer0/add2"});
+  auto block_out = add2({add1_out, fc2_out});
+
+  LayerHandle final_ln = createLayer("layer_normalization",
+    {"name=final_ln", "axis=3", "epsilon=1e-5"});
+  auto output = final_ln(block_out);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  ASSERT_EQ(model->compile(wte_in, output), ML_ERROR_NONE);
+
+  // Run inference with dummy input (token id=1 for both inputs)
+  float wte_input_data[1];
+  float wpe_input_data[1];
+  unsigned int wte_token = 1, wpe_token = 0;
+  std::memcpy(wte_input_data, &wte_token, sizeof(unsigned int));
+  std::memcpy(wpe_input_data, &wpe_token, sizeof(unsigned int));
+
+  std::vector<float *> output_bufs;
+  EXPECT_NO_THROW(
+    output_bufs = model->inference(1, {wte_input_data, wpe_input_data}));
+  EXPECT_FALSE(output_bufs.empty());
 }
 
 // ===== Phase 1: Extended eager tensor operations =====
