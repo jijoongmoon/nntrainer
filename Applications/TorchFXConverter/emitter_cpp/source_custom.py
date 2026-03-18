@@ -114,13 +114,31 @@ def emit_register_custom_layers(cname, custom_classes):
     return "\n".join(L)
 
 
-def emit_initialize(cname):
+def emit_allocate_kv_cache(cname):
+    """Generate allocateKVCache() method body.
+
+    Args:
+        cname: C++ class name
+    """
+    L = []
+    L.append(f"void {cname}::allocateKVCache() {{")
+    L.append(f"  size_t max_timestep = INIT_SEQ_LEN + NUM_TO_GENERATE;")
+    L.append(f"  size_t kv_heads = NUM_KV_HEADS;")
+    L.append(f"  size_t cache_size = 1 * kv_heads * max_timestep * HEAD_DIM;")
+    L.append(f"  kv_cache_buffers.allocate(NUM_LAYERS, cache_size);")
+    L.append(f"}}")
+    L.append(f"")
+    return "\n".join(L)
+
+
+def emit_initialize(cname, external_kv_cache=False):
     """Generate initialize() method that wires up the full model pipeline.
 
     Calls registerCustomLayers() -> constructModel() -> compile -> initialize.
 
     Args:
         cname: C++ class name
+        external_kv_cache: whether to call allocateKVCache()
     """
     L = []
     L.append(f"void {cname}::initialize() {{")
@@ -131,6 +149,8 @@ def emit_initialize(cname):
     L.append(f"")
     L.append(f"  registerCustomLayers();")
     L.append(f"  constructModel();")
+    if external_kv_cache:
+        L.append(f"  allocateKVCache();")
     L.append(f"")
     L.append(f"  model->setProperty({{")
     L.append(f'    withKey("batch_size", 1),')

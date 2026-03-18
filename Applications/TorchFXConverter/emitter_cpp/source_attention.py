@@ -3,7 +3,8 @@
 from .helpers import _cpp_layer, _class_name
 
 
-def emit_attention_method(cname, block, arch_type="decoder_only"):
+def emit_attention_method(cname, block, arch_type="decoder_only",
+                          external_kv_cache=False):
     """Generate createAttention() method body."""
     attn = block.attention
     is_decoder = arch_type in ("decoder_only", "encoder_decoder")
@@ -111,8 +112,14 @@ def emit_attention_method(cname, block, arch_type="decoder_only"):
             'withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS)')
     if is_decoder:
         mha_props.append('withKey("max_new_tokens", NUM_TO_GENERATE)')
-    mha_props.append(
-        f'withKey("input_layers", {q_in} + "," + {k_in} + "," + V)')
+    if external_kv_cache:
+        mha_props.append(
+            f'withKey("input_layers", {q_in} + "," + {k_in} + "," + V'
+            f' + "," + key_cache_tensor_names[layer_id]'
+            f' + "," + val_cache_tensor_names[layer_id])')
+    else:
+        mha_props.append(
+            f'withKey("input_layers", {q_in} + "," + {k_in} + "," + V)')
     L.extend(_cpp_layer("mha_core", mha_props))
 
     # O layer

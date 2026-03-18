@@ -128,6 +128,10 @@ def emit_construct_model(structure, block_type, is_hybrid, blocks_info):
 
     first_in = '"embedding0"' if s.embedding else '"input0"'
 
+    # External KV cache input layers
+    if s.external_kv_cache:
+        _emit_external_kv_cache_inputs(L, s)
+
     if s.arch_type == "encoder_decoder":
         _emit_encoder_decoder_blocks(L, s, first_in, norm_type)
     elif is_hybrid:
@@ -151,6 +155,35 @@ def emit_construct_model(structure, block_type, is_hybrid, blocks_info):
     L.append(f"}}")
     L.append(f"")
     return "\n".join(L)
+
+
+def _emit_external_kv_cache_inputs(L, s):
+    """Emit external KV cache allocation and input layer creation."""
+    L.append(f"  // External KV cache buffers")
+    L.append(f"  size_t max_timestep = INIT_SEQ_LEN + NUM_TO_GENERATE;")
+    L.append(f"  size_t kv_heads = NUM_KV_HEADS;")
+    L.append(f"  size_t cache_size = 1 * kv_heads * max_timestep * HEAD_DIM;")
+    L.append(f"  kv_cache_buffers.allocate(NUM_LAYERS, cache_size);")
+    L.append(f"  key_cache_tensor_names.resize(NUM_LAYERS);")
+    L.append(f"  val_cache_tensor_names.resize(NUM_LAYERS);")
+    L.append(f"")
+    L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
+    L.append(f'    std::string k_name = "ext_cache_key_" + std::to_string(i);')
+    L.append(f'    std::string v_name = "ext_cache_val_" + std::to_string(i);')
+    L.append(f"    key_cache_tensor_names[i] = k_name;")
+    L.append(f"    val_cache_tensor_names[i] = v_name;")
+    L.append(f"")
+    L.append(f'    std::string cache_shape = std::to_string(kv_heads) + ":" +')
+    L.append(f'      std::to_string(max_timestep) + ":" +')
+    L.append(f'      std::to_string(HEAD_DIM);')
+    L.append(f'    layers.push_back(')
+    L.append(f'      createLayer("input", {{withKey("name", k_name),')
+    L.append(f'                             withKey("input_shape", cache_shape)}}));')
+    L.append(f'    layers.push_back(')
+    L.append(f'      createLayer("input", {{withKey("name", v_name),')
+    L.append(f'                             withKey("input_shape", cache_shape)}}));')
+    L.append(f"  }}")
+    L.append(f"")
 
 
 def _emit_embedding(L, s):

@@ -29,7 +29,7 @@ from .source_ffn import emit_ffn_method
 from .source_custom import (
     collect_custom_layer_classes, emit_register_custom_layers,
     emit_custom_layer_includes, emit_initialize,
-    CUSTOM_LAYER_CLASS,
+    emit_allocate_kv_cache, CUSTOM_LAYER_CLASS,
 )
 
 # Re-export for backward compatibility
@@ -143,8 +143,13 @@ class CppEmitter(BaseEmitter):
         # registerCustomLayers (custom_classes already collected above)
         L.append(emit_register_custom_layers(cname, custom_classes))
 
+        # allocateKVCache (external mode)
+        if s.external_kv_cache:
+            L.append(emit_allocate_kv_cache(cname))
+
         # initialize()
-        L.append(emit_initialize(cname))
+        L.append(emit_initialize(cname,
+                                 external_kv_cache=s.external_kv_cache))
 
         return "\n".join(L)
 
@@ -165,7 +170,8 @@ class CppEmitter(BaseEmitter):
         representative = enc_b0 or dec_b0
         if representative and representative.attention:
             L.append(emit_attention_method(
-                cname, representative, arch_type=s.arch_type))
+                cname, representative, arch_type=s.arch_type,
+                external_kv_cache=s.external_kv_cache))
         if representative and representative.ffn:
             L.append(emit_ffn_method(cname, representative))
 
@@ -179,7 +185,8 @@ class CppEmitter(BaseEmitter):
         attn_block = self._get_attn_block()
         if attn_block:
             L.append(emit_attention_method(
-                cname, attn_block, arch_type=s.arch_type))
+                cname, attn_block, arch_type=s.arch_type,
+                external_kv_cache=s.external_kv_cache))
 
         representative = next((b for b in s.blocks if b.ffn), None)
         if representative:

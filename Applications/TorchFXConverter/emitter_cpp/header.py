@@ -99,6 +99,25 @@ def emit_structured_header(structure, blocks_info, model_name=None):
     L.append(f"using ModelHandle = std::unique_ptr<ml::train::Model>;")
     L.append(f"")
 
+    if s.external_kv_cache:
+        L.append(f"/**")
+        L.append(f" * @brief External KV cache buffers (owned by the model class)")
+        L.append(f" */")
+        L.append(f"struct KVCacheBuffers {{")
+        L.append(f"  std::vector<std::vector<float>> key_buffers;")
+        L.append(f"  std::vector<std::vector<float>> value_buffers;")
+        L.append(f"")
+        L.append(f"  void allocate(unsigned int num_layers, size_t cache_size) {{")
+        L.append(f"    key_buffers.resize(num_layers);")
+        L.append(f"    value_buffers.resize(num_layers);")
+        L.append(f"    for (unsigned int i = 0; i < num_layers; ++i) {{")
+        L.append(f"      key_buffers[i].resize(cache_size, 0.0f);")
+        L.append(f"      value_buffers[i].resize(cache_size, 0.0f);")
+        L.append(f"    }}")
+        L.append(f"  }}")
+        L.append(f"}};")
+        L.append(f"")
+
     L.append(f"/**")
     L.append(f" * @brief {cname} Class")
     L.append(f" * @note Auto-generated from HuggingFace {s.model_type} model")
@@ -168,6 +187,14 @@ def emit_structured_header(structure, blocks_info, model_name=None):
     L.append(f"            std::string input_name);")
     L.append(f"")
 
+    # allocateKVCache (external mode)
+    if s.external_kv_cache:
+        L.append(f"  /**")
+        L.append(f"   * @brief Allocate external KV cache buffers")
+        L.append(f"   */")
+        L.append(f"  void allocateKVCache();")
+        L.append(f"")
+
     # registerCustomLayers
     L.append(f"  /**")
     L.append(f"   * @brief Register custom layers")
@@ -209,6 +236,13 @@ def _emit_member_variables(L, s, attn_block):
     """Emit class member variable declarations."""
     L.append(f"  ModelHandle model;")
     L.append(f"")
+
+    if s.external_kv_cache:
+        L.append(f"  KVCacheBuffers kv_cache_buffers;")
+        L.append(f"  std::vector<std::string> key_cache_tensor_names;")
+        L.append(f"  std::vector<std::string> val_cache_tensor_names;")
+        L.append(f"")
+
     L.append(f"  // Model constants")
     L.append(f"  unsigned int NUM_VOCAB = {s.vocab_size};")
     L.append(f"  int DIM = {s.hidden_size};")

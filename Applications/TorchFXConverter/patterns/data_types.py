@@ -97,6 +97,7 @@ class ModelStructure:
     num_encoder_layers: int = 0
     num_decoder_layers: int = 0
     conv_l_cache: int = 0
+    external_kv_cache: bool = False
 
     @property
     def encoder_blocks(self):

@@ -27,7 +27,8 @@ import torch
 def convert_model(model_name_or_path, output_dir, formats=None,
                   batch_size=1, seq_len=8, dtype="float32",
                   convert_weights=False, verbose=True,
-                  model_name=None, plugin_config=None):
+                  model_name=None, plugin_config=None,
+                  external_kv_cache=False):
     """Run the full conversion pipeline.
 
     Args:
@@ -150,6 +151,8 @@ def convert_model(model_name_or_path, output_dir, formats=None,
 
     layers = result.layers
     structure = result.model_structure
+    if structure:
+        structure.external_kv_cache = external_kv_cache
 
     if verbose:
         print(f"Converted: {len(layers)} layers, "
@@ -262,6 +265,10 @@ Examples:
                              "from --model). e.g. --model-name KaLM-embedding")
     parser.add_argument("--plugin-config",
                         help="JSON/YAML config file for custom layer plugins")
+    parser.add_argument("--external-kv-cache", action="store_true",
+                        help="Generate code with external KV cache buffers "
+                             "(owned by the generated class instead of "
+                             "internal MHA tensors)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress progress messages")
 
@@ -282,6 +289,7 @@ Examples:
         verbose=not args.quiet,
         model_name=args.model_name,
         plugin_config=args.plugin_config,
+        external_kv_cache=args.external_kv_cache,
     )
 
 
