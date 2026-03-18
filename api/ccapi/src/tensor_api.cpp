@@ -28,6 +28,19 @@ namespace ml {
 namespace train {
 
 /**
+ * @brief Graph edge node for symbolic tensor graph construction.
+ *
+ * Stored as shared_ptr so Tensor copies share graph structure without
+ * recursive deep copies (which caused O(N!) memory for deep graphs).
+ */
+struct GraphEdge {
+  std::shared_ptr<Layer> producing_layer;
+  std::vector<std::shared_ptr<GraphEdge>> inputs;
+  TensorDim dim;
+  std::string name;
+};
+
+/**
  * @brief Internal implementation of Tensor
  */
 struct Tensor::Impl {
@@ -41,9 +54,8 @@ struct Tensor::Impl {
 
   std::shared_ptr<Layer> src_layer;
 
-  // Graph edge info (for symbolic graph construction)
-  std::shared_ptr<Layer> producing_layer;
-  std::vector<Tensor> input_tensors;
+  // Graph edge (shared_ptr to avoid O(N!) deep-copy on Tensor copy)
+  std::shared_ptr<GraphEdge> graph_edge;
 
   // Bound internal tensor (set after model compile+initialize)
   nntrainer::Tensor *bound_tensor = nullptr;
@@ -625,14 +637,26 @@ std::shared_ptr<Layer> Tensor::getSrcLayer() const {
 // --- Graph info accessors ---
 
 std::shared_ptr<Layer> Tensor::getProducingLayer() const {
-  return impl_ ? impl_->producing_layer : nullptr;
+  return (impl_ && impl_->graph_edge) ? impl_->graph_edge->producing_layer
+                                      : nullptr;
 }
 
 std::vector<Tensor> Tensor::getInputTensors() const {
-  if (impl_) {
-    return impl_->input_tensors;
+  if (!impl_ || !impl_->graph_edge) {
+    return {};
   }
-  return {};
+  std::vector<Tensor> result;
+  for (auto &edge : impl_->graph_edge->inputs) {
+    Tensor t;
+    t.impl_->graph_edge = edge;
+    if (edge) {
+      t.impl_->dim = edge->dim;
+      t.impl_->name = edge->name;
+      t.impl_->valid = true;
+    }
+    result.push_back(std::move(t));
+  }
+  return result;
 }
 
 // --- Symbolic tensor operations (implicit layers) ---
@@ -738,9 +762,23 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
     output = Tensor(TensorDim(), out_name);
   }
 
-  // Record graph edge
-  output.impl_->producing_layer = ptr_;
-  output.impl_->input_tensors = inputs;
+  // Record graph edge (shared, no deep copies)
+  auto edge = std::make_shared<GraphEdge>();
+  edge->producing_layer = ptr_;
+  edge->dim = out_dim;
+  edge->name = out_name;
+  for (auto &inp : inputs) {
+    if (inp.impl_ && inp.impl_->graph_edge) {
+      edge->inputs.push_back(inp.impl_->graph_edge);
+    } else {
+      // Leaf tensor — create a leaf edge with no producer
+      auto leaf = std::make_shared<GraphEdge>();
+      leaf->dim = inp.shape();
+      leaf->name = inp.name();
+      edge->inputs.push_back(leaf);
+    }
+  }
+  output.impl_->graph_edge = edge;
 
   return output;
 }
@@ -775,51 +813,49 @@ int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
   std::map<std::string, LeafInfo> additional_leaves;
   int unnamed_leaf_counter = 0;
 
-  // DFS: visit all inputs first (post-order = topological order)
-  std::function<void(const Tensor &)> dfs = [&](const Tensor &t) {
-    auto producer = t.getProducingLayer();
-    if (!producer) {
-      return; // leaf tensor
-    }
-    if (visited.count(producer.get())) {
-      return;
-    }
-    visited.insert(producer.get());
+  // DFS on GraphEdge (post-order = topological order)
+  std::function<void(const std::shared_ptr<GraphEdge> &)> dfs =
+    [&](const std::shared_ptr<GraphEdge> &edge) {
+      if (!edge || !edge->producing_layer) {
+        return; // leaf
+      }
+      if (visited.count(edge->producing_layer.get())) {
+        return;
+      }
+      visited.insert(edge->producing_layer.get());
 
-    auto t_inputs = t.getInputTensors();
-    for (auto &inp : t_inputs) {
-      dfs(inp);
-    }
+      for (auto &inp : edge->inputs) {
+        dfs(inp);
+      }
 
-    // Build input_layers names for this layer
-    std::vector<std::string> input_names;
-    for (auto &inp : t_inputs) {
-      auto inp_producer = inp.getProducingLayer();
-      if (inp_producer) {
-        input_names.push_back(inp_producer->getName());
-      } else {
-        // Leaf tensor — determine which input layer it maps to
-        std::string leaf_name = inp.name();
-        if (leaf_name.empty()) {
-          leaf_name = "ext_input_" + std::to_string(unnamed_leaf_counter++);
-        }
-        if (leaf_name == input_layer_name) {
-          // Main input tensor
-          input_names.push_back(input_layer_name);
+      // Build input_layers names
+      std::vector<std::string> input_names;
+      for (auto &inp : edge->inputs) {
+        if (inp && inp->producing_layer) {
+          input_names.push_back(inp->producing_layer->getName());
         } else {
-          // Additional leaf (e.g., fromData tensor)
-          if (additional_leaves.find(leaf_name) == additional_leaves.end()) {
-            additional_leaves[leaf_name] = {inp.shape()};
+          // Leaf tensor
+          std::string leaf_name = inp ? inp->name : "";
+          if (leaf_name.empty()) {
+            leaf_name = "ext_input_" + std::to_string(unnamed_leaf_counter++);
           }
-          input_names.push_back(leaf_name);
+          if (leaf_name == input_layer_name) {
+            input_names.push_back(input_layer_name);
+          } else {
+            if (additional_leaves.find(leaf_name) == additional_leaves.end()) {
+              additional_leaves[leaf_name] = {inp ? inp->dim : TensorDim()};
+            }
+            input_names.push_back(leaf_name);
+          }
         }
       }
-    }
 
-    layers_in_order.push_back({producer, input_names});
-  };
+      layers_in_order.push_back({edge->producing_layer, input_names});
+    };
 
-  dfs(output);
+  if (output.impl_ && output.impl_->graph_edge) {
+    dfs(output.impl_->graph_edge);
+  }
 
   // 1. Create and add the main input layer
   const TensorDim &dim = input.shape();
