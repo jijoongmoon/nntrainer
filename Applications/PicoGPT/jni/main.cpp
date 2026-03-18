@@ -15,7 +15,7 @@
 #include <fstream>
 #include <model.h>
 #include <string.h>
-#include <tensor.h>
+#include <tensor_api.h>
 
 #if defined(ENABLE_TRANSFORMER)
 #include "encoder.hpp"
@@ -345,24 +345,25 @@ int main(int argc, char *argv[]) {
     model->getLayer("wte", &wte_embedding_layer);
     const std::vector<float *> wte_weights_buf =
       wte_embedding_layer->getWeights();
-    nntrainer::Tensor wte_weight =
-      nntrainer::Tensor({NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
+    auto wte_weight = ml::train::Tensor::fromData(
+      {NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
 
     for (unsigned int i = 1; i < init_input_seq_len + NUM_TOKENS_TO_GENERATE;
          ++i) {
       output_bufs = model->incremental_inference(
         BATCH_SIZE, {wte_input, wpe_input}, {}, init_input_seq_len, i - 1, i);
 
-      nntrainer::Tensor output({BATCH_SIZE, 1, i, MODEL_DIM}, output_bufs[0]);
+      auto output = ml::train::Tensor::fromData(
+        {BATCH_SIZE, 1, i, MODEL_DIM}, output_bufs[0]);
 
       std::shared_ptr<ml::train::Layer> wte_embedding_layer;
       model->getLayer("wte", &wte_embedding_layer);
       const std::vector<float *> wte_weights_buf =
         wte_embedding_layer->getWeights();
-      nntrainer::Tensor wte_weight =
-        nntrainer::Tensor({NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
-      nntrainer::Tensor logits = output.dot(wte_weight, false, true);
-      nntrainer::Tensor next = logits.getSharedDataTensor(
+      auto wte_weight = ml::train::Tensor::fromData(
+        {NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
+      auto logits = output.dot(wte_weight, false, true);
+      auto next = logits.getSharedDataTensor(
         {1, NUM_VOCAB}, BATCH_SIZE * (i - 1) * NUM_VOCAB);
 
       std::vector<unsigned int> ids = next.argmax();

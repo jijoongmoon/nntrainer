@@ -464,6 +464,10 @@ float Tensor::l2norm() const {
   return asInternal(getInternalPtr())->l2norm();
 }
 
+std::vector<unsigned int> Tensor::argmax() const {
+  return asInternal(getInternalPtr())->argmax();
+}
+
 // --- Tensor manipulation ---
 
 Tensor Tensor::getBatchSlice(unsigned int offset, unsigned int size) const {

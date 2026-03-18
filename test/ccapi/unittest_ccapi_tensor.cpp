@@ -1214,3 +1214,21 @@ TEST(nntrainer_ccapi_tensor, eager_ops_unmaterialized_n) {
   EXPECT_THROW(t.l2norm(), std::runtime_error);
   EXPECT_THROW(t.setZero(), std::runtime_error);
 }
+
+// --- argmax ---
+
+TEST(nntrainer_ccapi_tensor, argmax_p) {
+  // shape [2, 1, 1, 3] — 2 batch elements, each with 3 values
+  auto t = ml::train::Tensor::zeros({2, 1, 1, 3});
+  t.setValue(0, 0, 0, 0, 1.0f);
+  t.setValue(0, 0, 0, 1, 5.0f);
+  t.setValue(0, 0, 0, 2, 3.0f);
+  t.setValue(1, 0, 0, 0, 9.0f);
+  t.setValue(1, 0, 0, 1, 2.0f);
+  t.setValue(1, 0, 0, 2, 7.0f);
+
+  auto ids = t.argmax();
+  EXPECT_EQ(ids.size(), 2u);
+  EXPECT_EQ(ids[0], 1u); // max at index 1 (value 5.0)
+  EXPECT_EQ(ids[1], 0u); // max at index 0 (value 9.0)
+}

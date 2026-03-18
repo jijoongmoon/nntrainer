@@ -449,6 +449,12 @@ public:
    */
   float l2norm() const;
 
+  /**
+   * @brief Get indices of maximum values along the last axis
+   * @return Vector of indices (one per batch element)
+   */
+  std::vector<unsigned int> argmax() const;
+
   // --- Tensor manipulation ---
 
   /**

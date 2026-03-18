@@ -18,7 +18,7 @@
 #include "tensor_dim.h"
 #include <ctime>
 #include <sstream>
-#include <tensor.h>
+#include <tensor_api.h>
 
 const unsigned int BATCH_SIZE = 1;
 const unsigned int NUM_LAYERS = 12;
@@ -351,8 +351,8 @@ std::string inferModel(std::string path, std::string sentence,
   model_->getLayer("wte", &wte_embedding_layer);
   const std::vector<float *> wte_weights_buf =
     wte_embedding_layer->getWeights();
-  nntrainer::Tensor wte_weight =
-    nntrainer::Tensor({NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
+  auto wte_weight = ml::train::Tensor::fromData(
+    {NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
 
   std::vector<float *> output_bufs;
 
@@ -361,10 +361,11 @@ std::string inferModel(std::string path, std::string sentence,
     output_bufs = model_->incremental_inference(
       BATCH_SIZE, {wte_input, wpe_input}, {}, init_input_seq_len, i - 1);
 
-    nntrainer::Tensor output({BATCH_SIZE, 1, i, MODEL_DIM}, output_bufs[0]);
-    nntrainer::Tensor incremented_output = output.getSharedDataTensor(
+    auto output = ml::train::Tensor::fromData(
+      {BATCH_SIZE, 1, i, MODEL_DIM}, output_bufs[0]);
+    auto incremented_output = output.getSharedDataTensor(
       {BATCH_SIZE, 1, 1, MODEL_DIM}, BATCH_SIZE * (i - 1) * MODEL_DIM);
-    nntrainer::Tensor next = incremented_output.dot(wte_weight, false, true);
+    auto next = incremented_output.dot(wte_weight, false, true);
 
     std::vector<unsigned int> ids = next.argmax();
 
