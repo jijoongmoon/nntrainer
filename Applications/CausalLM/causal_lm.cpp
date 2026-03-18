@@ -792,27 +792,17 @@ void CausalLM::save_kvcache(std::string path, int to_) {
   auto f = nntrainer::checkedOpenStream<std::ofstream>(
     path, std::ios::out | std::ios::binary | std::ios::trunc);
 
-  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
-              void *idx) {
-      if (l.getType() == causallm::MHACoreLayer::type) {
-        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
-        auto k_cache = context.getTensor(0);
-        auto v_cache = context.getTensor(1);
-        ml::train::TensorDim k_dim = k_cache.getDim();
-        ml::train::TensorDim v_dim = v_cache.getDim();
-        k_dim.height(to);
-        v_dim.height(to);
-        nntrainer::Tensor k_cache_prompt =
-          k_cache.getSharedDataTensor(k_dim, 0, true);
-        nntrainer::Tensor v_cache_prompt =
-          v_cache.getSharedDataTensor(v_dim, 0, true);
-        k_cache_prompt.save(f);
-        v_cache_prompt.save(f);
-      }
-    };
-  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
-  model->forEachLayer(fn, arg);
+  size_t kv_heads = NUM_HEADS / GQA_SIZE;
+  size_t partial_size = BATCH_SIZE * kv_heads * to_ * HEAD_DIM;
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    f.write(reinterpret_cast<const char *>(
+              kv_cache_buffers.key_buffers[i].data()),
+            partial_size * sizeof(float));
+    f.write(reinterpret_cast<const char *>(
+              kv_cache_buffers.value_buffers[i].data()),
+            partial_size * sizeof(float));
+  }
   f.close();
 }
 
@@ -822,28 +812,15 @@ void CausalLM::load_kvcache(std::string path, int to_) {
 
   model->allocate(ml::train::ExecutionMode::INFERENCE);
 
-  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
-              void *idx) {
-      if (l.getType() == causallm::MHACoreLayer::type) {
-        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
-        auto k_cache = context.getTensor(0);
-        auto v_cache = context.getTensor(1);
-        ml::train::TensorDim k_dim = k_cache.getDim();
-        ml::train::TensorDim v_dim = v_cache.getDim();
-        k_dim.height(to);
-        v_dim.height(to);
-        nntrainer::Tensor k_cache_prompt =
-          k_cache.getSharedDataTensor(k_dim, 0, true);
-        nntrainer::Tensor v_cache_prompt =
-          v_cache.getSharedDataTensor(v_dim, 0, true);
-        k_cache_prompt.read(f);
-        v_cache_prompt.read(f);
-      }
-    };
-  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
+  size_t kv_heads = NUM_HEADS / GQA_SIZE;
+  size_t partial_size = BATCH_SIZE * kv_heads * to_ * HEAD_DIM;
 
-  model->forEachLayer(fn, arg);
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    f.read(reinterpret_cast<char *>(kv_cache_buffers.key_buffers[i].data()),
+           partial_size * sizeof(float));
+    f.read(reinterpret_cast<char *>(kv_cache_buffers.value_buffers[i].data()),
+           partial_size * sizeof(float));
+  }
   f.close();
 }
 
