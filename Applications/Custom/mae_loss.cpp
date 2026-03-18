@@ -15,7 +15,7 @@
 #include <cmath>
 
 #include <iostream>
-#include <tensor_api.h>
+#include <tensor.h>
 
 constexpr const float EPSILON_ = 1e-7;
 namespace custom {
@@ -24,30 +24,26 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void MaeLossLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
-  auto predicted =
-    ml::train::Tensor::bindRef(&context.getInput(SINGLE_INOUT_IDX));
-  auto output =
-    ml::train::Tensor::bindRef(&context.getOutput(SINGLE_INOUT_IDX));
+  nntrainer::Tensor &predicted = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
 
   if (!context.getInPlace())
     output.fill(predicted);
 }
 
 void MaeLossLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  auto predicted =
-    ml::train::Tensor::bindRef(&context.getInput(SINGLE_INOUT_IDX));
-  auto label =
-    ml::train::Tensor::bindRef(&context.getLabel(SINGLE_INOUT_IDX));
-  auto deriv =
-    ml::train::Tensor::bindRef(&context.getOutgoingDerivative(SINGLE_INOUT_IDX));
+  nntrainer::Tensor &predicted = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &label = context.getLabel(SINGLE_INOUT_IDX);
+
+  nntrainer::Tensor &deriv = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
 
   /// This can be saved at MaeLossLayer::forwarding, but this is done here on
   /// purpose for demonstration purpose
-  deriv.copyData(predicted.subtract(label));
+  predicted.subtract(label, deriv);
   unsigned int size = predicted.size();
   float deriv_val = 1.0f / (float)size;
 
-  deriv.apply_i([deriv_val](float x) {
+  deriv.apply_i<float>([deriv_val](float x) {
     if (fabs(x) < EPSILON_) {
       return 0.0f;
     }

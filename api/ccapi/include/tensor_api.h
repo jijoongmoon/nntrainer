@@ -216,30 +216,6 @@ public:
   static Tensor ones(const TensorDim &dim, const std::string &name = "");
 
   /**
-   * @brief Create a tensor bound to an internal engine tensor (zero-copy).
-   *
-   * This is intended for layer implementations that receive tensors from
-   * RunLayerContext and want to use the public Tensor API on them.
-   * The caller must ensure the internal tensor outlives this wrapper.
-   *
-   * @param internal_tensor Pointer to an nntrainer::Tensor (passed as void*)
-   * @return Tensor bound to the internal tensor
-   */
-  static Tensor bindRef(void *internal_tensor);
-
-  /**
-   * @brief Create a read-only tensor bound to an internal engine tensor.
-   *
-   * Same as bindRef(void*) but for const tensors (e.g., from
-   * getIncomingDerivative). Mutations via mutable_data/setValue will modify
-   * the underlying tensor despite const origin — caller's responsibility.
-   *
-   * @param internal_tensor Pointer to a const nntrainer::Tensor (as const void*)
-   * @return Tensor bound to the internal tensor
-   */
-  static Tensor bindRef(const void *internal_tensor);
-
-  /**
    * @brief Set the source layer that produced this tensor
    *
    * @param l Source layer
