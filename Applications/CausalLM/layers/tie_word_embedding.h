@@ -122,6 +122,16 @@ public:
                        int file_fd = -1) override;
 
   /**
+   * @copydoc Layer::read() (ReadSource/mmap variant)
+   */
+  WIN_EXPORT void read(nntrainer::ReadSource src,
+                       nntrainer::RunLayerContext &context, bool opt_var,
+                       ml::train::ExecutionMode mode, bool trainable,
+                       nntrainer::TensorDim::DataType definedWeightDataType,
+                       bool fsu, size_t start_offset = 0,
+                       bool read_from_offset = false) override;
+
+  /**
    * @copydic Layer::save()
    */
   WIN_EXPORT void

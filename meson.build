@@ -143,12 +143,7 @@ if get_option('enable-npu')
 endif
 
 if get_option('mmap-read')
-  if get_option('enable-transformer')
-    message('mmap-read cannot be enabled with enable-transformer. mmap-read is turned off.')
-    extra_defines += '-DMMAP_READ=0'
-  else
     extra_defines += '-DMMAP_READ=1'
-  endif
 else
     extra_defines += '-DMMAP_READ=0'
 endif

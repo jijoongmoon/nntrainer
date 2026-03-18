@@ -359,6 +359,27 @@ void TieWordEmbedding::read(
   }
 }
 
+void TieWordEmbedding::read(
+  nntrainer::ReadSource src, nntrainer::RunLayerContext &context, bool opt_var,
+  ml::train::ExecutionMode mode, bool trainable,
+  nntrainer::TensorDim::DataType definedWeightDataType, bool fsu,
+  size_t start_offset, bool read_from_offset) {
+
+  // Only read when mode is embedding
+  if (mode_ == mode::embedding) {
+    for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
+      /// @note shared weights are only be read at the first acecss
+      if (context.isGradientFirstAccess(i)) {
+        context.getWeight(i).read(src);
+        if (context.isMixedPrecision(i) && trainable &&
+            !context.getWeightFP32(i).empty()) {
+          context.getWeightFP32(i).copyData(context.getWeight(i));
+        }
+      }
+    }
+  }
+}
+
 void TieWordEmbedding::save(
   std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
   ml::train::ExecutionMode mode, bool trainable,

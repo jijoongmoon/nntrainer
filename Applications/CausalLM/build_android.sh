@@ -25,7 +25,7 @@ if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrai
     if [ -d "$NNTRAINER_ROOT/builddir" ]; then
         rm -rf builddir
     fi
-    ./tools/package_android.sh -Dmmap-read=false
+    ./tools/package_android.sh
 else
     echo "nntrainer for Android already built."
 fi
