@@ -22,21 +22,23 @@
 namespace nntrainer {
 
 void MultiplyLayer::finalize(InitLayerContext &context) {
-  TensorDim dim0 = context.getInputDimensions()[0];
-  TensorDim dim1 = context.getInputDimensions()[1];
+  auto const &input_dims = context.getInputDimensions();
+  TensorDim out_dim = input_dims[0];
 
-  // Compute broadcast output shape: for each dimension, take the max
-  // when one of the inputs has size 1 (standard broadcasting rules).
-  TensorDim out_dim = dim0;
-  for (unsigned int i = 0; i < 4; ++i) {
-    if (dim0[i] != dim1[i]) {
-      if (dim0[i] == 1) {
-        out_dim.setTensorDim(i, dim1[i]);
-      } else if (dim1[i] != 1) {
-        throw std::invalid_argument(
-          "MultiplyLayer: incompatible shapes for broadcasting at dim " +
-          std::to_string(i) + " (" + std::to_string(dim0[i]) + " vs " +
-          std::to_string(dim1[i]) + ")");
+  if (input_dims.size() > 1) {
+    TensorDim dim1 = input_dims[1];
+    // Compute broadcast output shape: for each dimension, take the max
+    // when one of the inputs has size 1 (standard broadcasting rules).
+    for (unsigned int i = 0; i < 4; ++i) {
+      if (out_dim[i] != dim1[i]) {
+        if (out_dim[i] == 1) {
+          out_dim.setTensorDim(i, dim1[i]);
+        } else if (dim1[i] != 1) {
+          throw std::invalid_argument(
+            "MultiplyLayer: incompatible shapes for broadcasting at dim " +
+            std::to_string(i) + " (" + std::to_string(out_dim[i]) + " vs " +
+            std::to_string(dim1[i]) + ")");
+        }
       }
     }
   }

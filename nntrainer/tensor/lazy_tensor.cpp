@@ -208,7 +208,7 @@ LazyTensor &LazyTensor::neg() {
 LazyTensor &LazyTensor::abs() {
   auto f = [](Tensor &t) mutable -> int {
     try {
-      Tensor out;
+      Tensor out(t.getDim());
       t.abs(out);
       t = out;
       return ML_ERROR_NONE;

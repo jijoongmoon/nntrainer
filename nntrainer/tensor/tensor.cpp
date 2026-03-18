@@ -876,7 +876,7 @@ Tensor &Tensor::sqrt(Tensor &output) const {
 };
 
 Tensor Tensor::neg() const {
-  Tensor output("", getFormat(), getDataType());
+  Tensor output(getDim());
   return neg(output);
 };
 
@@ -884,7 +884,7 @@ Tensor &Tensor::neg(Tensor &output) const {
   if (size() != output.size() || getDataType() != output.getDataType() ||
       getFormat() != output.getFormat())
     throw std::invalid_argument(
-      "Error: Tensor::sqrt requires output tensor to be same size, data type "
+      "Error: Tensor::neg requires output tensor to be same size, data type "
       "and format as input tensor.");
 
   itensor_->multiply(-1, output);
