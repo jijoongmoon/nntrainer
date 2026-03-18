@@ -15,6 +15,7 @@
 #include <regex>
 
 #include "pow.h"
+#include <tensor_api.h>
 
 namespace custom {
 
@@ -91,9 +92,12 @@ void PowLayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
   std::cout << "pow layer forward is called\n";
 #endif
 
-  /// net hidden are used to save var,
-  context.getInput(SINGLE_INOUT_IDX)
-    .pow(exponent, context.getOutput(SINGLE_INOUT_IDX));
+  auto input =
+    ml::train::Tensor::bindRef(&context.getInput(SINGLE_INOUT_IDX));
+  auto output =
+    ml::train::Tensor::bindRef(&context.getOutput(SINGLE_INOUT_IDX));
+
+  output.copyData(input.pow(exponent));
 
 #ifdef DEBUG
   std::cout << "input: " << context.getInput(SINGLE_INOUT_IDX);
@@ -108,11 +112,12 @@ void PowLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   std::cout << "pow layer backward is called\n";
 #endif
 
-  const nntrainer::Tensor &derivative_ =
-    context.getIncomingDerivative(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+  auto derivative_internal = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  auto derivative = ml::train::Tensor::bindRef(&derivative_internal);
+  auto dx =
+    ml::train::Tensor::bindRef(&context.getOutgoingDerivative(SINGLE_INOUT_IDX));
 
-  derivative_.multiply(exponent, dx);
+  dx.copyData(derivative.multiply(exponent));
 
 #ifdef DEBUG
   std::cout << "input: " << context.getOutput(SINGLE_INOUT_IDX);

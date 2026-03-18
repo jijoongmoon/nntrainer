@@ -563,6 +563,26 @@ size_t Tensor::width() const {
 
 // --- Factory methods ---
 
+Tensor Tensor::bindRef(void *internal_tensor) {
+  if (!internal_tensor) {
+    throw std::invalid_argument("bindRef: pointer must not be null");
+  }
+  auto *internal = static_cast<nntrainer::Tensor *>(internal_tensor);
+  Tensor t;
+  t.impl_->dim = internal->getDim();
+  t.impl_->name = internal->getName();
+  t.impl_->valid = true;
+  t.impl_->external = false;
+  t.impl_->bound_tensor = internal;
+  return t;
+}
+
+Tensor Tensor::bindRef(const void *internal_tensor) {
+  // Cast away const — the bound_tensor is non-const but the caller
+  // is expected to use this for read-only access on const tensors.
+  return bindRef(const_cast<void *>(internal_tensor));
+}
+
 Tensor Tensor::fromData(const TensorDim &dim, void *data,
                         const std::string &name) {
   if (!data) {

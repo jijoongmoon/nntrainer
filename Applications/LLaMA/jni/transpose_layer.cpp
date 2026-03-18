@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "transpose_layer.h"
+#include <tensor_api.h>
 
 namespace custom {
 
@@ -40,10 +41,10 @@ void TransposeLayer::finalize(nntrainer::InitLayerContext &context) {
 
 void TransposeLayer::forwarding(nntrainer::RunLayerContext &context,
                                 bool training) {
-  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
+  auto in = ml::train::Tensor::bindRef(&context.getInput(SINGLE_INOUT_IDX));
+  auto out = ml::train::Tensor::bindRef(&context.getOutput(SINGLE_INOUT_IDX));
 
-  in.transpose("1:0:2", out);
+  out.copyData(in.transpose("1:0:2"));
 }
 
 void TransposeLayer::calcDerivative(nntrainer::RunLayerContext &context) {
