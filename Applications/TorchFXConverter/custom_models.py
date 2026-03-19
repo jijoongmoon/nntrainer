@@ -435,3 +435,91 @@ def _load_mamba(model_dir, config, seq_len, verbose):
 
 CUSTOM_LOADERS["mamba"] = _load_mamba
 CUSTOM_LOADERS["mamba2"] = _load_mamba
+
+
+# ---------------------------------------------------------------------------
+# FLUX loader  (model_type = "flux")
+# ---------------------------------------------------------------------------
+# FLUX is a Diffusion Transformer (DiT) model from Black Forest Labs.
+# It uses diffusers FluxTransformer2DModel, not standard HuggingFace
+# AutoModel. This loader creates a tiny or full FLUX model for tracing.
+
+def _load_flux(model_dir, config, seq_len, verbose):
+    """Load FLUX diffusion transformer model for tracing.
+
+    Supports both local paths (with diffusers model_index.json) and
+    tiny model creation for testing.
+    """
+    from diffusers.models.transformers.transformer_flux import (
+        FluxTransformer2DModel,
+    )
+
+    # Extract config params
+    in_channels = getattr(config, "in_channels", 64)
+    num_layers = getattr(config, "num_layers", 19)
+    num_single_layers = getattr(config, "num_single_layers", 38)
+    attention_head_dim = getattr(config, "attention_head_dim", 128)
+    num_attention_heads = getattr(config, "num_attention_heads", 24)
+    joint_attention_dim = getattr(config, "joint_attention_dim", 4096)
+    pooled_projection_dim = getattr(config, "pooled_projection_dim", 768)
+    guidance_embeds = getattr(config, "guidance_embeds", False)
+    axes_dims_rope = tuple(getattr(config, "axes_dims_rope", (16, 56, 56)))
+
+    # Check if this is a local diffusers model directory
+    transformer_dir = os.path.join(model_dir, "transformer")
+    if os.path.isdir(transformer_dir):
+        model = FluxTransformer2DModel.from_pretrained(
+            transformer_dir, torch_dtype=torch.float32)
+    elif os.path.isfile(os.path.join(model_dir, "config.json")):
+        # Direct transformer directory
+        model = FluxTransformer2DModel.from_pretrained(
+            model_dir, torch_dtype=torch.float32)
+    else:
+        # Create model from config (for testing with tiny configs)
+        model = FluxTransformer2DModel(
+            patch_size=getattr(config, "patch_size", 1),
+            in_channels=in_channels,
+            num_layers=num_layers,
+            num_single_layers=num_single_layers,
+            attention_head_dim=attention_head_dim,
+            num_attention_heads=num_attention_heads,
+            joint_attention_dim=joint_attention_dim,
+            pooled_projection_dim=pooled_projection_dim,
+            guidance_embeds=guidance_embeds,
+            axes_dims_rope=axes_dims_rope,
+        )
+
+    model.eval()
+
+    if verbose:
+        n_params = sum(p.numel() for p in model.parameters())
+        hidden = num_attention_heads * attention_head_dim
+        print(f"  FLUX model loaded: {n_params / 1e6:.1f}M params")
+        print(f"    hidden_size={hidden}, layers={num_layers}+"
+              f"{num_single_layers}, heads={num_attention_heads}, "
+              f"head_dim={attention_head_dim}")
+        print(f"    joint_attention_dim={joint_attention_dim}, "
+              f"in_channels={in_channels}")
+
+    # Prepare trace inputs matching FluxTransformer2DModel.forward()
+    hidden_size = num_attention_heads * attention_head_dim
+    # Spatial dims: small patch count for tracing
+    h_patches = 2
+    w_patches = 2
+    num_patches = h_patches * w_patches
+    txt_len = min(seq_len, 4)
+
+    input_kwargs = {
+        "hidden_states": torch.randn(1, num_patches, in_channels),
+        "encoder_hidden_states": torch.randn(1, txt_len,
+                                             joint_attention_dim),
+        "pooled_projections": torch.randn(1, pooled_projection_dim),
+        "timestep": torch.tensor([1.0]),
+        "img_ids": torch.zeros(num_patches, 3),
+        "txt_ids": torch.zeros(txt_len, 3),
+    }
+
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["flux"] = _load_flux

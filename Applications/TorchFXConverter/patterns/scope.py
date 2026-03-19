@@ -15,6 +15,9 @@ def find_block_scopes(layers):
         r"((?:bert\.)?encoder\.layer\.\d+)",
         r"((?:encoder|decoder)\.block\.\d+)",
         r"((?:transformer\.)?h\.\d+)",
+        # Diffusion Transformer (DiT) patterns: FLUX, etc.
+        r"(transformer_blocks\.\d+)",
+        r"(single_transformer_blocks\.\d+)",
     ]
 
     for layer in layers:
@@ -119,7 +122,8 @@ def find_ssm_scope(block_scope, block_layers):
 
 def find_ffn_scope(block_scope, block_layers):
     """Find the FFN/MLP scope within a block."""
-    ffn_patterns = ["mlp", "shared_mlp", "feed_forward", "ffn", "DenseReluDense"]
+    ffn_patterns = ["mlp", "shared_mlp", "feed_forward", "ffn", "ff",
+                    "DenseReluDense"]
     for pat in ffn_patterns:
         full = f"{block_scope}.{pat}"
         for layer in block_layers:

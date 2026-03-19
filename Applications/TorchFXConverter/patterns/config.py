@@ -110,6 +110,9 @@ def infer_arch_type(structure, config, find_block_scopes_fn):
         elif model_type in ("mamba", "mamba2"):
             structure.arch_type = "decoder_only"
             return
+        elif model_type in ("flux",):
+            structure.arch_type = "diffusion_transformer"
+            return
 
         architectures = getattr(config, "architectures", []) or []
         is_base_model = any(

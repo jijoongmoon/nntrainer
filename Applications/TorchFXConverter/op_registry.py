@@ -58,6 +58,7 @@ FUNCTION_SIMPLE_OPS = {
     torch.flatten:     LAYER_FLATTEN,
     torch.reshape:     OP_RESHAPE,
     torch.transpose:   OP_TRANSPOSE,
+    torch.outer:       LAYER_MATMUL,
 }
 
 # Function ops looked up by name (func.__name__) rather than identity.
@@ -67,6 +68,7 @@ FUNCTION_NAME_SIMPLE_OPS = {
     "log":  LAYER_LOG,
     "topk": LAYER_TOPK,
     "argsort": LAYER_ARGSORT,
+    "outer": LAYER_MATMUL,  # torch.outer(a, b) ≈ matmul for 1D vectors
 }
 
 # Functions that map to OP_NOOP (internal torch/runtime functions)
@@ -174,9 +176,12 @@ METHOD_SIMPLE_OPS = {
     "mul_":   LAYER_MULTIPLY,
     "div":    LAYER_DIVIDE,
     "div_":   LAYER_DIVIDE,
+    "__rdiv__":   LAYER_DIVIDE,    # reverse divide (scalar / tensor)
+    "__rtruediv__": LAYER_DIVIDE,
     "matmul": LAYER_MATMUL,
     "neg":    LAYER_NEGATIVE,
     "pow":    LAYER_POW,
+    "__rpow__":   LAYER_POW,       # reverse pow (scalar ** tensor)
     "sqrt":   LAYER_SQRT,
     # Trigonometric
     "cos":    LAYER_COS,
@@ -211,12 +216,15 @@ METHOD_ACTIVATION_OPS = {
 METHOD_SHAPE_OPS = {
     "view":      OP_RESHAPE,
     "reshape":   OP_RESHAPE,
+    "unflatten": OP_RESHAPE,
     "permute":   OP_PERMUTE,
     "transpose": OP_TRANSPOSE,
 }
 
 # Method ops that map to OP_RESHAPE
-METHOD_RESHAPE_NAMES = frozenset({"unsqueeze", "squeeze", "repeat", "expand_as"})
+METHOD_RESHAPE_NAMES = frozenset({
+    "unsqueeze", "squeeze", "repeat", "expand_as", "repeat_interleave",
+})
 
 # Method ops that map to OP_UNSUPPORTED with decomposition info
 METHOD_DECOMPOSE_OPS = {
@@ -247,4 +255,4 @@ METHOD_NOOP_NAMES = frozenset({
 })
 
 # Method ops that map to "split"
-METHOD_SPLIT_NAMES = frozenset({"chunk", "split"})
+METHOD_SPLIT_NAMES = frozenset({"chunk", "split", "split_with_sizes", "unbind"})
