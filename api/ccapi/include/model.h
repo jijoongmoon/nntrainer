@@ -174,6 +174,22 @@ public:
               ExecutionMode mode = ExecutionMode::INFERENCE);
 
   /**
+   * @brief     Compile from symbolic tensor graph with multiple inputs and
+   *            multiple outputs.
+   *
+   * Extracts the computation graph by walking backwards from each output to
+   * discover all layers. Supports models with multiple input heads and
+   * multiple output heads.
+   *
+   * @param inputs  Vector of leaf symbolic tensors (model inputs)
+   * @param outputs Vector of output symbolic tensors
+   * @param mode    Execution mode (default: TRAIN)
+   * @retval #ML_ERROR_NONE Successful.
+   */
+  int compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
+              ExecutionMode mode = ExecutionMode::INFERENCE);
+
+  /**
    * @brief     Initialize Network. This should be called after setting the
    * property and compiling.
    * @retval #ML_ERROR_NONE Successful.

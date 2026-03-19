@@ -22,6 +22,7 @@
 #include <cstring>
 #include <functional>
 #include <stdexcept>
+#include <set>
 #include <unordered_set>
 
 namespace ml {
@@ -788,6 +789,24 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
 // --- Model::compile(Tensor, Tensor) — graph extraction ---
 
 int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
+  std::vector<Tensor> inputs = {input};
+  std::vector<Tensor> outputs = {output};
+  int status = compile(inputs, outputs, mode);
+  input = inputs[0];
+  output = outputs[0];
+  return status;
+}
+
+int Model::compile(Tensor &input, std::vector<Tensor> &outputs,
+                   ExecutionMode mode) {
+  std::vector<Tensor> inputs = {input};
+  int status = compile(inputs, outputs, mode);
+  input = inputs[0];
+  return status;
+}
+
+int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
+                   ExecutionMode mode) {
   struct LayerInfo {
     std::shared_ptr<Layer> layer;
     std::vector<std::string> input_layer_names;
@@ -796,19 +815,18 @@ int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
   std::vector<LayerInfo> layers_in_order;
   std::unordered_set<Layer *> visited;
 
-  // Name for the auto-created input layer
-  std::string input_layer_name =
-    input.name().empty() ? "graph_input" : input.name();
-
-  // Name of the layer that produces the output tensor
-  std::string output_layer_name;
-  auto output_producer = output.getProducingLayer();
-  if (output_producer) {
-    output_layer_name = output_producer->getName();
+  // Collect input leaf names
+  std::set<std::string> input_leaf_names;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    std::string name = inputs[i].name();
+    if (name.empty()) {
+      name = (inputs.size() == 1) ? "graph_input"
+                                  : "graph_input_" + std::to_string(i);
+    }
+    input_leaf_names.insert(name);
   }
 
   // Track additional leaf tensors (e.g., fromData external caches)
-  // Maps leaf name → (dim, pointer to API tensor or nullptr)
   struct LeafInfo {
     TensorDim dim;
   };
@@ -841,161 +859,8 @@ int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
           if (leaf_name.empty()) {
             leaf_name = "ext_input_" + std::to_string(unnamed_leaf_counter++);
           }
-          if (leaf_name == input_layer_name) {
-            input_names.push_back(input_layer_name);
-          } else {
-            if (additional_leaves.find(leaf_name) == additional_leaves.end()) {
-              additional_leaves[leaf_name] = {inp ? inp->dim : TensorDim()};
-            }
+          if (input_leaf_names.count(leaf_name)) {
             input_names.push_back(leaf_name);
-          }
-        }
-      }
-
-      layers_in_order.push_back({edge->producing_layer, input_names});
-    };
-
-  if (output.impl_ && output.impl_->graph_edge) {
-    dfs(output.impl_->graph_edge);
-  }
-
-  // 1. Create and add the main input layer
-  const TensorDim &dim = input.shape();
-  std::string shape_str = std::to_string(dim.channel()) + ":" +
-                           std::to_string(dim.height()) + ":" +
-                           std::to_string(dim.width());
-
-  auto input_layer = createLayer(
-    "input", {"name=" + input_layer_name, "input_shape=" + shape_str});
-  int status = addLayer(std::move(input_layer));
-  if (status != ML_ERROR_NONE) {
-    return status;
-  }
-
-  // 1b. Create input layers for additional leaf tensors
-  for (auto &[leaf_name, leaf_info] : additional_leaves) {
-    std::string leaf_shape = std::to_string(leaf_info.dim.channel()) + ":" +
-                              std::to_string(leaf_info.dim.height()) + ":" +
-                              std::to_string(leaf_info.dim.width());
-    auto leaf_layer = createLayer(
-      "input", {"name=" + leaf_name, "input_shape=" + leaf_shape});
-    status = addLayer(std::move(leaf_layer));
-    if (status != ML_ERROR_NONE) {
-      return status;
-    }
-  }
-
-  // 2. Add each layer in topological order with input_layers set
-  for (auto &info : layers_in_order) {
-    std::string input_layers_str;
-    for (size_t i = 0; i < info.input_layer_names.size(); ++i) {
-      if (i > 0)
-        input_layers_str += ",";
-      input_layers_str += info.input_layer_names[i];
-    }
-    info.layer->setProperty({"input_layers=" + input_layers_str});
-    status = addLayer(info.layer);
-    if (status != ML_ERROR_NONE) {
-      return status;
-    }
-  }
-
-  // 3. Compile the model
-  status = compile(mode);
-  if (status != ML_ERROR_NONE) {
-    return status;
-  }
-
-  // 4. Initialize the model
-  status = initialize(mode);
-  if (status != ML_ERROR_NONE) {
-    return status;
-  }
-
-  // 5. Allocate tensor memory
-  status = allocate(mode);
-  if (status != ML_ERROR_NONE) {
-    return status;
-  }
-
-  // 6. Materialize API tensors with allocated buffers
-  //    Input tensor: allocate buffer for user to write input data
-  //    Output tensor: allocate buffer to receive inference results
-  {
-    const TensorDim &in_dim = input.shape();
-    input.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
-      in_dim, true, nntrainer::Initializer::ZEROS, input_layer_name);
-    input.impl_->eager_data->initialize();
-  }
-  if (!output_layer_name.empty()) {
-    // Get real output dim from the compiled model's internal graph
-    TensorDim out_dim;
-    forEachLayer(
-      [&](Layer &layer, nntrainer::RunLayerContext &rc, void *) {
-        if (layer.getName() == output_layer_name && rc.getNumOutputs() > 0) {
-          out_dim = rc.getOutput(0).getDim();
-        }
-      },
-      nullptr);
-    if (out_dim.getDataLen() > 0) {
-      output.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
-        out_dim, true, nntrainer::Initializer::ZEROS, output_layer_name);
-      output.impl_->eager_data->initialize();
-      output.impl_->dim = out_dim;
-    }
-  }
-
-  return ML_ERROR_NONE;
-}
-
-int Model::compile(Tensor &input, std::vector<Tensor> &outputs,
-                   ExecutionMode mode) {
-  struct LayerInfo {
-    std::shared_ptr<Layer> layer;
-    std::vector<std::string> input_layer_names;
-  };
-
-  std::vector<LayerInfo> layers_in_order;
-  std::unordered_set<Layer *> visited;
-
-  // Name for the auto-created input layer
-  std::string input_layer_name =
-    input.name().empty() ? "graph_input" : input.name();
-
-  // Track additional leaf tensors
-  struct LeafInfo {
-    TensorDim dim;
-  };
-  std::map<std::string, LeafInfo> additional_leaves;
-  int unnamed_leaf_counter = 0;
-
-  // DFS on SymbolicGraphNode (post-order = topological order)
-  std::function<void(const std::shared_ptr<SymbolicGraphNode> &)> dfs =
-    [&](const std::shared_ptr<SymbolicGraphNode> &edge) {
-      if (!edge || !edge->producing_layer) {
-        return; // leaf
-      }
-      if (visited.count(edge->producing_layer.get())) {
-        return;
-      }
-      visited.insert(edge->producing_layer.get());
-
-      for (auto &inp : edge->inputs) {
-        dfs(inp);
-      }
-
-      // Build input_layers names
-      std::vector<std::string> input_names;
-      for (auto &inp : edge->inputs) {
-        if (inp && inp->producing_layer) {
-          input_names.push_back(inp->producing_layer->getName());
-        } else {
-          std::string leaf_name = inp ? inp->name : "";
-          if (leaf_name.empty()) {
-            leaf_name = "ext_input_" + std::to_string(unnamed_leaf_counter++);
-          }
-          if (leaf_name == input_layer_name) {
-            input_names.push_back(input_layer_name);
           } else {
             if (additional_leaves.find(leaf_name) == additional_leaves.end()) {
               additional_leaves[leaf_name] = {inp ? inp->dim : TensorDim()};
@@ -1015,17 +880,26 @@ int Model::compile(Tensor &input, std::vector<Tensor> &outputs,
     }
   }
 
-  // 1. Create and add the main input layer
-  const TensorDim &dim = input.shape();
-  std::string shape_str = std::to_string(dim.channel()) + ":" +
-                           std::to_string(dim.height()) + ":" +
-                           std::to_string(dim.width());
-
-  auto input_layer = createLayer(
-    "input", {"name=" + input_layer_name, "input_shape=" + shape_str});
-  int status = addLayer(std::move(input_layer));
-  if (status != ML_ERROR_NONE) {
-    return status;
+  // 1. Create and add input layers
+  int status;
+  for (auto &inp : inputs) {
+    std::string inp_name = inp.name();
+    if (inp_name.empty()) {
+      inp_name =
+        (inputs.size() == 1)
+          ? "graph_input"
+          : "graph_input_" + std::to_string(&inp - &inputs[0]);
+    }
+    const TensorDim &dim = inp.shape();
+    std::string shape_str = std::to_string(dim.channel()) + ":" +
+                             std::to_string(dim.height()) + ":" +
+                             std::to_string(dim.width());
+    auto input_layer = createLayer(
+      "input", {"name=" + inp_name, "input_shape=" + shape_str});
+    status = addLayer(std::move(input_layer));
+    if (status != ML_ERROR_NONE) {
+      return status;
+    }
   }
 
   // 1b. Create input layers for additional leaf tensors
@@ -1075,11 +949,18 @@ int Model::compile(Tensor &input, std::vector<Tensor> &outputs,
   }
 
   // 6. Materialize API tensors with allocated buffers
-  {
-    const TensorDim &in_dim = input.shape();
-    input.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
-      in_dim, true, nntrainer::Initializer::ZEROS, input_layer_name);
-    input.impl_->eager_data->initialize();
+  for (auto &inp : inputs) {
+    std::string inp_name = inp.name();
+    if (inp_name.empty()) {
+      inp_name =
+        (inputs.size() == 1)
+          ? "graph_input"
+          : "graph_input_" + std::to_string(&inp - &inputs[0]);
+    }
+    const TensorDim &in_dim = inp.shape();
+    inp.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
+      in_dim, true, nntrainer::Initializer::ZEROS, inp_name);
+    inp.impl_->eager_data->initialize();
   }
   for (auto &output : outputs) {
     auto output_producer = output.getProducingLayer();
