@@ -303,6 +303,30 @@ ZIPFORMER_CONFIG = {
     "encoder_unmasked_dim": [32, 32],
 }
 
+# Gemma3n: Google's efficient multimodal model (text-only for testing)
+# Features: AltUp, Laurel (low-rank residual), per-layer input embeddings
+GEMMA3N_CONFIG = {
+    "model_type": "gemma3n_text",
+    "architectures": ["Gemma3nTextModel"],
+    "vocab_size": 500,
+    "vocab_size_per_layer_input": 500,
+    "hidden_size": 64,
+    "hidden_size_per_layer_input": 32,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_dim": 32,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "max_position_embeddings": 64,
+    "rms_norm_eps": 1e-6,
+    "sliding_window": 32,
+    "altup_num_inputs": 2,
+    "altup_active_idx": 0,
+    "num_kv_shared_layers": 1,
+    "laurel_rank": 8,
+}
+
 # --- Encoder-Decoder models ---
 
 # T5Gemma2-270M: Gemma2-based encoder-decoder (multimodal)
@@ -700,6 +724,10 @@ class TestConverterBuildAndRun(unittest.TestCase):
         """Zipformer: FX trace and full layer mapping."""
         self._run_custom_conversion_test("zipformer", ZIPFORMER_CONFIG)
 
+    def test_gemma3n_conversion(self):
+        """Gemma3n: FX trace and full layer mapping (AltUp + Laurel)."""
+        self._run_custom_conversion_test("gemma3n", GEMMA3N_CONFIG)
+
     def _run_custom_conversion_test(self, name, config_dict):
         """Run conversion-only test for custom (non-HF) models.
 
@@ -717,6 +745,9 @@ class TestConverterBuildAndRun(unittest.TestCase):
         # Special handling per model type (uses HF classes, not custom loader)
         if model_type == "siglip":
             self._test_siglip_conversion(config)
+            return
+        if model_type == "gemma3n_text":
+            self._test_gemma3n_conversion(config)
             return
 
         if model_type not in CUSTOM_LOADERS:
@@ -795,6 +826,59 @@ class TestConverterBuildAndRun(unittest.TestCase):
                         f"layers: {[l.layer_type for l in result.unknown_layers]}")
         self.assertGreater(len(result.layers), 0,
                            "siglip produced no layers")
+
+    def _test_gemma3n_conversion(self, config):
+        """Gemma3n needs Gemma3nTextModel from transformers."""
+        try:
+            from transformers.models.gemma3n.modeling_gemma3n import (
+                Gemma3nTextModel,
+            )
+            from transformers import Gemma3nTextConfig
+        except ImportError:
+            self.skipTest("transformers Gemma3nTextModel not available")
+
+        import torch
+        from decomposer import AdaptiveConverter
+
+        cfg = Gemma3nTextConfig(
+            vocab_size=config.vocab_size,
+            vocab_size_per_layer_input=config.vocab_size_per_layer_input,
+            hidden_size=config.hidden_size,
+            hidden_size_per_layer_input=config.hidden_size_per_layer_input,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            hidden_activation=config.hidden_activation,
+            max_position_embeddings=config.max_position_embeddings,
+            rms_norm_eps=config.rms_norm_eps,
+            sliding_window=config.sliding_window,
+            altup_num_inputs=config.altup_num_inputs,
+            altup_active_idx=config.altup_active_idx,
+            num_kv_shared_layers=config.num_kv_shared_layers,
+            laurel_rank=config.laurel_rank,
+        )
+        model = Gemma3nTextModel(cfg)
+        model.eval()
+
+        input_kwargs = {
+            "input_ids": torch.randint(0, config.vocab_size, (1, 8)),
+        }
+
+        converter = AdaptiveConverter(model, cfg)
+        result = converter.convert(input_kwargs)
+
+        print(f"\n[gemma3n] Conversion result:")
+        print(f"  Total layers: {len(result.layers)}")
+        print(f"  Unknown layers: {len(result.unknown_layers)}")
+        print(f"  Fully mapped: {result.is_fully_mapped}")
+
+        self.assertTrue(result.is_fully_mapped,
+                        f"gemma3n has {len(result.unknown_layers)} unknown "
+                        f"layers: {[l.layer_type for l in result.unknown_layers]}")
+        self.assertGreater(len(result.layers), 0,
+                           "gemma3n produced no layers")
 
     # ---- Common pipeline ----
 

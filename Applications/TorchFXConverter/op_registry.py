@@ -67,6 +67,7 @@ FUNCTION_NAME_SIMPLE_OPS = {
     "exp":  LAYER_EXP,
     "log":  LAYER_LOG,
     "pow":  LAYER_POW,
+    "multiply": LAYER_MULTIPLY,  # torch.multiply (alias for torch.mul)
     "topk": LAYER_TOPK,
     "argsort": LAYER_ARGSORT,
     "outer": LAYER_MATMUL,  # torch.outer(a, b) ≈ matmul for 1D vectors
@@ -79,7 +80,7 @@ FUNCTION_NOOP_NAMES = frozenset({
     "full_like", "empty_like",
     "custom_function_call",
     # Comparison / conditional ops (T5 relative position bias)
-    "where", "min", "max",
+    "where", "min", "max", "maximum", "minimum",
     # Position ID computation (XLM-RoBERTa, etc.)
     # cumsum is used exclusively for computing position IDs from attention
     # masks in transformer models. NNTrainer handles position IDs internally,
@@ -252,7 +253,7 @@ METHOD_NOOP_NAMES = frozenset({
     "new_ones", "new_zeros", "new_full", "new_empty",
     "fill_", "zero_", "masked_fill", "masked_fill_",
     "__bool__", "__or__", "__and__",
-    "__xor__", "__invert__", "__eq__",
+    "__xor__", "__invert__", "__eq__", "__setitem__",
     "all", "any", "item",
     "stride",  # tensor metadata query (used in as_strided patterns)
     # Comparison ops (T5 relative position bias)
