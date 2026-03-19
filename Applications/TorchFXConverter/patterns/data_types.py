@@ -53,6 +53,24 @@ class FFNPattern:
 
 
 @dataclass
+class SSMPattern:
+    """Detected State Space Model (Mamba) pattern."""
+    block_idx: int
+    in_proj: str = ""          # Linear: input projection (expand dim)
+    conv1d: str = ""           # Conv1d: causal temporal convolution
+    x_proj: str = ""           # Linear: compute selection params (B, C)
+    dt_proj: str = ""          # Linear: compute time step delta
+    out_proj: str = ""         # Linear: output projection (contract dim)
+    norm: str = ""             # Optional inner normalization
+    ssm_type: str = "mamba"    # "mamba", "mamba2", etc.
+    state_size: int = 0        # N: SSM state dimension
+    conv_kernel: int = 0       # d_conv: causal conv kernel size
+    expand: int = 0            # expansion factor (inner_dim / hidden_dim)
+    dt_rank: int = 0           # rank of dt projection
+    layer_names: list = field(default_factory=list)
+
+
+@dataclass
 class TransformerBlockPattern:
     """Detected transformer block."""
     block_idx: int
@@ -66,10 +84,11 @@ class TransformerBlockPattern:
     post_ffn_norm: str = ""
     ffn_residual: str = ""
     norm_type: str = "pre_norm"             # "pre_norm" or "post_norm"
+    ssm: Optional[SSMPattern] = None
     cross_attention: Optional[AttentionPattern] = None
     cross_attn_norm: str = ""
     cross_attn_residual: str = ""
-    operator_type: str = ""                 # e.g. "attention", "conv", "ssm"
+    operator_type: str = ""                 # e.g. "attention", "conv", "mixer"
     operator_scope: str = ""
     operator_layers: list = field(default_factory=list)
 
@@ -98,6 +117,11 @@ class ModelStructure:
     num_decoder_layers: int = 0
     conv_l_cache: int = 0
     external_kv_cache: bool = False
+    # SSM / Mamba config
+    ssm_state_size: int = 0       # N: SSM state dimension
+    ssm_conv_kernel: int = 0      # d_conv: causal conv kernel size
+    ssm_expand: int = 0           # expansion factor
+    ssm_dt_rank: int = 0          # rank of dt projection
 
     @property
     def encoder_blocks(self):
@@ -119,6 +143,10 @@ class ModelStructure:
               f"vocab: {self.vocab_size}")
         if self.rope_theta:
             print(f"RoPE theta: {self.rope_theta}")
+        if self.ssm_state_size:
+            print(f"SSM: state_size={self.ssm_state_size}, "
+                  f"conv_kernel={self.ssm_conv_kernel}, "
+                  f"expand={self.ssm_expand}, dt_rank={self.ssm_dt_rank}")
         print(f"Embedding: {self.embedding}")
         if self.final_norm:
             print(f"Final norm: {self.final_norm}")
@@ -159,6 +187,15 @@ def print_block(block):
         print(f"    Cross-attention ({xattn.attention_type}):")
         print(f"      Q: {xattn.q_proj}, K: {xattn.k_proj}, V: {xattn.v_proj}")
         print(f"      O: {xattn.o_proj}")
+
+    if block.ssm:
+        ssm = block.ssm
+        print(f"    SSM ({ssm.ssm_type}):")
+        print(f"      in_proj: {ssm.in_proj}, conv1d: {ssm.conv1d}")
+        print(f"      x_proj: {ssm.x_proj}, dt_proj: {ssm.dt_proj}")
+        print(f"      out_proj: {ssm.out_proj}")
+        print(f"      state_size={ssm.state_size}, conv_kernel={ssm.conv_kernel}, "
+              f"expand={ssm.expand}, dt_rank={ssm.dt_rank}")
 
     if block.pre_ffn_norm:
         print(f"    Pre-FFN norm: {block.pre_ffn_norm}")

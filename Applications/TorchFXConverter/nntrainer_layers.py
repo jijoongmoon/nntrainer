@@ -145,6 +145,9 @@ LAYER_LSTMCELL = "lstmcell"
 LAYER_RNNCELL = "rnncell"
 LAYER_ZONEOUT_LSTMCELL = "zoneout_lstmcell"
 
+# State Space Model (Mamba) layers
+LAYER_SSM = "ssm"  # Selective State Space Model (MambaMixer)
+
 # Loss layers
 LAYER_LOSS_MSE = "mse"
 LAYER_LOSS_CROSS_ENTROPY_SOFTMAX = "cross_softmax"

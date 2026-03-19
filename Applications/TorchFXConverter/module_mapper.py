@@ -16,6 +16,7 @@ from nntrainer_layers import (
     LAYER_CHANNEL_SHUFFLE, LAYER_L2NORM, LAYER_MHA,
     LAYER_GRU, LAYER_LSTM, LAYER_RNN,
     LAYER_GRUCELL, LAYER_LSTMCELL, LAYER_RNNCELL,
+    LAYER_SSM,
     LAYER_LOSS_MSE, LAYER_LOSS_CROSS_ENTROPY_SOFTMAX,
     LAYER_LOSS_CROSS_ENTROPY_SIGMOID, LAYER_LOSS_KLD,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
@@ -337,6 +338,10 @@ def map_module_node(node, modules, node_to_layer):
             hf_module_type=module_type,
         )
 
+    # MambaMixer / SSM (when used as leaf module)
+    if _is_mamba_mixer(module):
+        return _map_mamba_mixer(module, module_name, module_type, input_names)
+
     # Unknown module type -- try plugin registry as last resort
     from plugin_registry import get_global_registry
     plugin_registry = get_global_registry()
@@ -584,3 +589,47 @@ def _map_rnn_cell(module, module_name, module_type, input_names, layer_type):
         layer_def.properties["_bias_hh_key"] = bias_keys["bias_hh"]
 
     return layer_def
+
+
+def _is_mamba_mixer(module):
+    """Check if a module is a Mamba mixer (SSM) module.
+
+    HuggingFace Mamba uses classes named MambaMixer, Mamba2Mixer, etc.
+    """
+    cls_name = type(module).__name__
+    return "MambaMixer" in cls_name or "Mamba2Mixer" in cls_name
+
+
+def _map_mamba_mixer(module, module_name, module_type, input_names):
+    """Map MambaMixer to NNTrainer SSM layer def.
+
+    This is used when MambaMixer is kept as a leaf module.
+    Extracts SSM configuration from the module attributes.
+    """
+    props = {}
+    # Extract SSM parameters from the module
+    if hasattr(module, "d_state"):
+        props["state_size"] = module.d_state
+    if hasattr(module, "d_conv"):
+        props["conv_kernel"] = module.d_conv
+    if hasattr(module, "expand"):
+        props["expand"] = module.expand
+    if hasattr(module, "d_inner"):
+        props["inner_dim"] = module.d_inner
+    if hasattr(module, "dt_rank"):
+        dt_rank = module.dt_rank
+        if isinstance(dt_rank, str):  # "auto"
+            dt_rank = max(1, getattr(module, "d_model", 0) // 16)
+        props["dt_rank"] = dt_rank
+
+    return NNTrainerLayerDef(
+        layer_type=LAYER_SSM,
+        name=_sanitize_name(module_name),
+        properties=props,
+        input_layers=input_names,
+        hf_module_name=module_name,
+        hf_module_type=module_type,
+        has_weight=True,
+        has_bias=False,
+        weight_hf_key=f"{module_name}.in_proj.weight",
+    )

@@ -14,5 +14,6 @@ from patterns import (                          # noqa: F401
     TransformerBlockPattern,
     AttentionPattern,
     FFNPattern,
+    SSMPattern,
     print_block as _print_block,
 )

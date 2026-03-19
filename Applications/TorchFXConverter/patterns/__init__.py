@@ -18,7 +18,7 @@ Sub-modules:
 from nntrainer_layers import LAYER_RMS_NORM, LAYER_LAYER_NORM
 
 from .data_types import (
-    AttentionPattern, FFNPattern, TransformerBlockPattern,
+    AttentionPattern, FFNPattern, SSMPattern, TransformerBlockPattern,
     ModelStructure, print_block,
 )
 from .config import extract_config_metadata, detect_embedding_and_head, infer_arch_type

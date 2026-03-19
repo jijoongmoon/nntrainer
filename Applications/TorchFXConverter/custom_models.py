@@ -379,3 +379,59 @@ def _load_extractor(model_dir, config, seq_len, verbose):
 
 # Register the loader
 CUSTOM_LOADERS["extractor"] = _load_extractor
+
+
+# ---------------------------------------------------------------------------
+# Mamba loader (model_type = "mamba")
+# ---------------------------------------------------------------------------
+# HuggingFace Mamba models normally load via AutoModelForCausalLM, but the
+# mamba_ssm CUDA package may not be available. This loader patches the model
+# to force the pure-PyTorch slow_forward path which is fully traceable by
+# our FX tracer.
+
+def _patch_mamba_slow_forward(model):
+    """Patch MambaMixer modules to use slow_forward (pure PyTorch).
+
+    The HuggingFace MambaMixer.forward() tries to use mamba_ssm CUDA
+    kernels first, falling back to slow_forward(). For tracing we need
+    the slow path which is decomposable into standard tensor ops.
+    """
+    for name, module in model.named_modules():
+        cls_name = type(module).__name__
+        if "MambaMixer" in cls_name or "Mamba2Mixer" in cls_name:
+            if hasattr(module, "slow_forward"):
+                # Replace forward with slow_forward so the tracer
+                # decomposes the SSM into tensor operations
+                module.forward = module.slow_forward
+    return model
+
+
+def _load_mamba(model_dir, config, seq_len, verbose):
+    """Load Mamba model with pure-PyTorch forward for tracing."""
+    from transformers import AutoModelForCausalLM, AutoConfig
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, torch_dtype=torch.float32)
+    model.eval()
+
+    # Patch to use slow_forward (pure PyTorch, no CUDA kernels)
+    _patch_mamba_slow_forward(model)
+
+    if verbose:
+        n_params = sum(p.numel() for p in model.parameters())
+        state_size = getattr(config, "state_size", "?")
+        d_conv = getattr(config, "conv_kernel",
+                 getattr(config, "d_conv", "?"))
+        expand = getattr(config, "expand", "?")
+        print(f"  Mamba model loaded: {n_params / 1e6:.1f}M params, "
+              f"state_size={state_size}, d_conv={d_conv}, expand={expand}")
+        print(f"  Patched MambaMixer to use slow_forward (pure PyTorch)")
+
+    vocab_size = getattr(config, "vocab_size", 30000)
+    input_kwargs = {"input_ids": torch.randint(0, vocab_size, (1, seq_len))}
+
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["mamba"] = _load_mamba
+CUSTOM_LOADERS["mamba2"] = _load_mamba

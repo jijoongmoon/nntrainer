@@ -6,10 +6,11 @@ from nntrainer_layers import (
 from .data_types import TransformerBlockPattern
 from .scope import (
     get_layers_in_scope, find_attention_scope,
-    find_cross_attention_scope, find_ffn_scope,
+    find_cross_attention_scope, find_ffn_scope, find_ssm_scope,
 )
 from .attention import detect_attention
 from .ffn import detect_ffn
+from .ssm import detect_ssm
 
 
 def detect_block(block_idx, scope, layers, all_layers, config, by_name,
@@ -45,6 +46,11 @@ def detect_block(block_idx, scope, layers, all_layers, config, by_name,
     if cross_attn_scope:
         block.cross_attention = detect_attention(
             block_idx, cross_attn_scope, block_layers, all_layers, config)
+
+    # Detect SSM (Mamba mixer)
+    ssm_scope = find_ssm_scope(scope, block_layers)
+    if ssm_scope:
+        block.ssm = detect_ssm(block_idx, ssm_scope, block_layers, config)
 
     # Detect FFN
     ffn_scope = find_ffn_scope(scope, block_layers)
@@ -134,6 +140,11 @@ def detect_norms_and_residuals(block, scope, block_layers, idx_by_name):
             block.norm_type = "pre_norm"
         else:
             block.norm_type = "post_norm"
+    elif block.pre_attn_norm and block.ssm and block.ssm.in_proj:
+        # Mamba: norm before mixer is always pre_norm
+        norm_idx = idx_by_name.get(block.pre_attn_norm, 0)
+        proj_idx = idx_by_name.get(block.ssm.in_proj, 0)
+        block.norm_type = "pre_norm" if norm_idx < proj_idx else "post_norm"
 
 
 def detect_operator(block, scope, block_layers, all_layers):
@@ -142,6 +153,14 @@ def detect_operator(block, scope, block_layers, all_layers):
         block.operator_type = "attention"
         block.operator_scope = find_attention_scope(
             scope, block_layers) or ""
+        return
+
+    if block.ssm:
+        block.operator_type = "mixer"
+        block.operator_scope = find_ssm_scope(scope, block_layers) or ""
+        block.operator_layers = [
+            l for l in block_layers
+            if l.name in block.ssm.layer_names]
         return
 
     # Build set of known layer names

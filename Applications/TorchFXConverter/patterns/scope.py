@@ -97,6 +97,26 @@ def find_cross_attention_scope(block_scope, block_layers):
     return None
 
 
+def find_ssm_scope(block_scope, block_layers):
+    """Find the SSM/Mamba mixer scope within a block.
+
+    HuggingFace Mamba uses 'mixer' as the sub-module name:
+        model.layers.0.mixer.in_proj
+        model.layers.0.mixer.conv1d
+        model.layers.0.mixer.x_proj
+        model.layers.0.mixer.dt_proj
+        model.layers.0.mixer.out_proj
+    """
+    ssm_keywords = ["mixer", "mamba", "ssm"]
+    for kw in ssm_keywords:
+        full = f"{block_scope}.{kw}"
+        for layer in block_layers:
+            name = layer.hf_module_name
+            if name.startswith(full + ".") or name == full:
+                return full
+    return None
+
+
 def find_ffn_scope(block_scope, block_layers):
     """Find the FFN/MLP scope within a block."""
     ffn_patterns = ["mlp", "shared_mlp", "feed_forward", "ffn", "DenseReluDense"]

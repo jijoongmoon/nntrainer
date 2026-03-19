@@ -56,6 +56,21 @@ def extract_config_metadata(structure, config):
     structure.conv_l_cache = safe_cfg_int(
         config, "conv_L_cache", default=0)
 
+    # SSM / Mamba config
+    structure.ssm_state_size = safe_cfg_int(
+        config, "state_size", "ssm_state_size", default=0)
+    structure.ssm_conv_kernel = safe_cfg_int(
+        config, "conv_kernel", "d_conv", default=0)
+    structure.ssm_expand = safe_cfg_int(
+        config, "expand", "ssm_expand", default=0)
+    # dt_rank can be "auto" in Mamba config
+    dt_rank_val = getattr(config, "time_step_rank",
+                  getattr(config, "dt_rank", 0))
+    if isinstance(dt_rank_val, str) and dt_rank_val == "auto":
+        hidden = structure.hidden_size
+        dt_rank_val = max(1, hidden // 16) if hidden else 0
+    structure.ssm_dt_rank = int(dt_rank_val) if isinstance(dt_rank_val, (int, float)) else 0
+
 
 def detect_embedding_and_head(structure, layers):
     """Find embedding layer and LM head."""
@@ -91,6 +106,9 @@ def infer_arch_type(structure, config, find_block_scopes_fn):
         elif model_type in ("t5", "mt5", "bart", "mbart",
                             "pegasus", "marian"):
             structure.arch_type = "encoder_decoder"
+            return
+        elif model_type in ("mamba", "mamba2"):
+            structure.arch_type = "decoder_only"
             return
 
         architectures = getattr(config, "architectures", []) or []
