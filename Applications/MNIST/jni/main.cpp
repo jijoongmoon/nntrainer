@@ -7,7 +7,7 @@
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  MNIST CNN example using ccapi layer construction.
+ * @brief  MNIST CNN example using symbolic tensor graph construction.
  *
  * Input 28x28
  * Conv2D 5x5 : 6 filters, stride 1x1, padding=0,0, sigmoid
@@ -39,9 +39,9 @@
 #endif
 
 #include <dataset.h>
-#include <layer.h>
 #include <model.h>
 #include <optimizer.h>
+#include <tensor_api.h>
 
 #ifdef PROFILE
 #include <profiler.h>
@@ -154,48 +154,47 @@ TEST(MNIST_training, verify_accuracy) {
 #endif
 
 /**
- * @brief Build the MNIST CNN model using ccapi layer construction.
+ * @brief Build the MNIST CNN model using symbolic tensor graph.
  *
- * Replaces the INI-based configuration with explicit createLayer calls.
+ * Returns {input_tensor, output_tensor} for compile(Tensor, Tensor).
  */
-static std::unique_ptr<ml::train::Model> buildModel() {
+static std::pair<ml::train::Tensor, ml::train::Tensor> buildGraph() {
   using ml::train::createLayer;
+  using ml::train::LayerHandle;
+  using ml::train::Tensor;
 
-  auto model = ml::train::createModel(ml::train::ModelType::NEURAL_NET,
-                                      {"epochs=1500", "loss=cross",
-                                       "batch_size=32"});
+  auto x = Tensor({1, 1, 28, 28}, "inputlayer");
 
-  model->addLayer(
-    createLayer("input", {"name=inputlayer", "input_shape=1:28:28"}));
-
-  model->addLayer(createLayer(
+  LayerHandle conv1(createLayer(
     "conv2d", {"name=conv2d_c1_layer", "kernel_size=5,5",
                "bias_initializer=zeros", "activation=sigmoid",
                "weight_initializer=xavier_uniform", "filters=6",
                "stride=1,1", "padding=0,0"}));
-
-  model->addLayer(createLayer(
+  LayerHandle pool1(createLayer(
     "pooling2d", {"name=pooling2d_p1", "pool_size=2,2", "stride=2,2",
                   "padding=0,0", "pooling=average"}));
-
-  model->addLayer(createLayer(
+  LayerHandle conv2(createLayer(
     "conv2d", {"name=conv2d_c2_layer", "kernel_size=5,5",
                "bias_initializer=zeros", "activation=sigmoid",
                "weight_initializer=xavier_uniform", "filters=12",
                "stride=1,1", "padding=0,0"}));
-
-  model->addLayer(createLayer(
+  LayerHandle pool2(createLayer(
     "pooling2d", {"name=pooling2d_p2", "pool_size=2,2", "stride=2,2",
                   "padding=0,0", "pooling=average"}));
-
-  model->addLayer(createLayer("flatten", {"name=flatten"}));
-
-  model->addLayer(createLayer(
+  LayerHandle flat(createLayer("flatten", {"name=flatten"}));
+  LayerHandle fc(createLayer(
     "fully_connected", {"name=outputlayer", "unit=10",
                         "weight_initializer=xavier_uniform",
                         "bias_initializer=zeros", "activation=softmax"}));
 
-  return model;
+  auto h = conv1(x);
+  h = pool1(h);
+  h = conv2(h);
+  h = pool2(h);
+  h = flat(h);
+  auto y = fc(h);
+
+  return {x, y};
 }
 
 /**
@@ -248,13 +247,12 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  std::unique_ptr<ml::train::Model> model;
-  try {
-    model = buildModel();
-  } catch (const std::exception &e) {
-    std::cerr << "Error during model construction " << e.what() << std::endl;
-    return 1;
-  }
+  // Build symbolic graph
+  auto [x, y] = buildGraph();
+
+  auto model = ml::train::createModel(ml::train::ModelType::NEURAL_NET,
+                                      {"epochs=1500", "loss=cross",
+                                       "batch_size=32"});
 
   try {
     auto optimizer = ml::train::createOptimizer("adam");
@@ -271,8 +269,8 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    model->compile();
-    model->initialize();
+    // compile(Tensor, Tensor) internally calls compile + initialize + allocate
+    model->compile(x, y, ml::train::ExecutionMode::TRAIN);
     model->setDataset(ml::train::DatasetModeType::MODE_TRAIN, dataset_train);
     model->setDataset(ml::train::DatasetModeType::MODE_VALID, dataset_val);
   } catch (const std::exception &e) {
