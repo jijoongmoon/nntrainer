@@ -32,65 +32,67 @@
 
 namespace causallm {
 
-std::vector<LayerHandle> NNTRQwen3CausalLM::createAttention(
-  const int layer_id, int seq_len, int n_heads, int head_dim,
-  std::string query_name, std::string key_name, std::string value_name) {
+Tensor NNTRQwen3CausalLM::createAttention(const int layer_id, int seq_len,
+                                           int n_heads, int head_dim,
+                                           Tensor query, Tensor key,
+                                           Tensor value) {
 
-  std::vector<LayerHandle> layers;
-  auto QKV = "layer" + std::to_string(layer_id) + "_qkv";
-  auto Q = QKV + "(0)";
-  auto K = QKV + "(1)";
-  auto V = QKV + "(2)";
-  auto K_norm = "layer" + std::to_string(layer_id) + "_k_norm";
-  auto Q_norm = "layer" + std::to_string(layer_id) + "_q_norm";
-  auto A = "layer" + std::to_string(layer_id) + "_attention";
-  auto O = "layer" + std::to_string(layer_id) + "_attention_out";
+  using ml::train::createLayer;
 
-  std::vector<std::string> qkv_params = {
-    withKey("name", QKV),
-    withKey("q_unit", head_dim * n_heads),
-    withKey("k_unit", head_dim * n_heads / GQA_SIZE),
-    withKey("v_unit", head_dim * n_heads / GQA_SIZE),
-    withKey("input_layers", query_name),
-  };
-  layers.push_back(createLayer("qkv_layer", qkv_params));
+  auto QKV_name = "layer" + std::to_string(layer_id) + "_qkv";
+  auto K_norm_name = "layer" + std::to_string(layer_id) + "_k_norm";
+  auto Q_norm_name = "layer" + std::to_string(layer_id) + "_q_norm";
+  auto A_name = "layer" + std::to_string(layer_id) + "_attention";
+  auto O_name = "layer" + std::to_string(layer_id) + "_attention_out";
 
-  // K-reshaped-norm layer
-  // k_norm(k_proj.view(hidden_shape))
-  std::vector<std::string> k_norm_params = {
-    withKey("name", K_norm), withKey("input_layers", K),
-    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(head_dim))};
-  layers.push_back(createLayer("reshaped_rms_norm", k_norm_params));
+  // QKV fused layer (3 outputs)
+  LayerHandle qkv_layer = createLayer(
+    "qkv_layer",
+    {withKey("name", QKV_name),
+     withKey("q_unit", head_dim * n_heads),
+     withKey("k_unit", head_dim * n_heads / GQA_SIZE),
+     withKey("v_unit", head_dim * n_heads / GQA_SIZE)});
+  Tensor qkv = qkv_layer(query);
+  Tensor q = qkv.output(0);
+  Tensor k = qkv.output(1);
+  Tensor v = qkv.output(2);
 
-  // Q-reshaped-norm layer
-  // q_norm(q_proj.view(hidden_shape))
-  std::vector<std::string> q_norm_params = {
-    withKey("name", Q_norm), withKey("input_layers", Q),
-    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(head_dim))};
-  layers.push_back(createLayer("reshaped_rms_norm", q_norm_params));
+  // K reshaped norm
+  LayerHandle k_norm = createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", K_norm_name), withKey("packed", "false"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(head_dim))});
+  Tensor k_normed = k_norm(k);
+
+  // Q reshaped norm
+  LayerHandle q_norm = createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", Q_norm_name), withKey("packed", "false"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(head_dim))});
+  Tensor q_normed = q_norm(q);
 
   // Attention core layer
-  std::vector<std::string> a_params = {
-    withKey("name", A),
-    withKey("num_heads", n_heads),
-    withKey("num_heads_kv", n_heads / GQA_SIZE),
-    withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
-    withKey("sliding_window", SLIDING_WINDOW),
-    withKey("rope_theta", ROPE_THETA),
-    withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
-    withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-    withKey("input_layers", {Q_norm, K_norm, V})};
-  layers.push_back(createLayer("mha_core", a_params));
+  LayerHandle attn = createLayer(
+    "mha_core",
+    {withKey("name", A_name), withKey("num_heads", n_heads),
+     withKey("num_heads_kv", n_heads / GQA_SIZE),
+     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+     withKey("sliding_window", SLIDING_WINDOW),
+     withKey("rope_theta", ROPE_THETA),
+     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE))});
+  Tensor a = attn({q_normed, k_normed, v});
 
-  // O layer
-  std::vector<std::string> o_params = {
-    withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "true"),
-    withKey("input_layers", A), withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", o_params));
+  // O projection
+  LayerHandle o_proj = createLayer(
+    "fully_connected",
+    {withKey("name", O_name), withKey("unit", DIM),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor o = o_proj(a);
 
-  return layers;
+  return o;
 }
 
 void NNTRQwen3CausalLM::registerCustomLayers() {
