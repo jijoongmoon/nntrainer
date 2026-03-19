@@ -234,6 +234,75 @@ GLINER2_CONFIG = {
     "span_mode": "markerV0",
 }
 
+# --- Non-HuggingFace models (conversion-only tests) ---
+# These use custom loaders and don't go through _create_local_model.
+# They are tested for successful FX tracing and full layer mapping only.
+
+# FLUX: Diffusion Transformer (Black Forest Labs)
+FLUX_CONFIG = {
+    "model_type": "flux",
+    "architectures": ["FluxTransformer2DModel"],
+    "in_channels": 4,
+    "num_layers": 1,
+    "num_single_layers": 1,
+    "attention_head_dim": 32,
+    "num_attention_heads": 2,
+    "joint_attention_dim": 64,
+    "pooled_projection_dim": 32,
+    "guidance_embeds": False,
+    "axes_dims_rope": [4, 14, 14],
+    "patch_size": 1,
+    "hidden_size": 64,
+}
+
+# SigLIP: Vision-Language contrastive model (Google)
+SIGLIP_CONFIG = {
+    "model_type": "siglip",
+    "architectures": ["SiglipModel"],
+    "vision_hidden_size": 64,
+    "vision_intermediate_size": 128,
+    "vision_num_hidden_layers": 1,
+    "vision_num_attention_heads": 2,
+    "vision_image_size": 32,
+    "vision_patch_size": 16,
+    "text_hidden_size": 64,
+    "text_intermediate_size": 128,
+    "text_num_hidden_layers": 1,
+    "text_num_attention_heads": 2,
+    "text_vocab_size": 100,
+    "text_max_position_embeddings": 16,
+}
+
+# Conformer: Speech recognition model (torchaudio)
+CONFORMER_CONFIG = {
+    "model_type": "conformer",
+    "architectures": ["Conformer"],
+    "input_dim": 64,
+    "num_attention_heads": 2,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "depthwise_conv_kernel_size": 3,
+    "hidden_size": 64,
+}
+
+# Zipformer: Speech recognition model (k2-fsa/icefall)
+ZIPFORMER_CONFIG = {
+    "model_type": "zipformer",
+    "architectures": ["Zipformer2"],
+    "hidden_size": 64,
+    "num_attention_heads": 2,
+    "intermediate_size": 128,
+    "num_hidden_layers": 1,
+    "num_stacks": 2,
+    "downsampling_factor": [1, 2],
+    "cnn_module_kernel": [3, 3],
+    "query_head_dim": 8,
+    "pos_head_dim": 2,
+    "value_head_dim": 4,
+    "pos_dim": 16,
+    "encoder_unmasked_dim": [32, 32],
+}
+
 # --- Encoder-Decoder models ---
 
 # T5Gemma2-270M: Gemma2-based encoder-decoder (multimodal)
@@ -612,6 +681,120 @@ class TestConverterBuildAndRun(unittest.TestCase):
     def test_t5gemma2(self):
         """T5Gemma2-270M: Gemma2-based encoder-decoder."""
         self._run_model_test("t5gemma2")
+
+    # ---- Non-HuggingFace models (conversion-only) ----
+
+    def test_flux_conversion(self):
+        """FLUX DiT: FX trace and full layer mapping."""
+        self._run_custom_conversion_test("flux", FLUX_CONFIG)
+
+    def test_siglip_conversion(self):
+        """SigLIP: FX trace and full layer mapping."""
+        self._run_custom_conversion_test("siglip", SIGLIP_CONFIG)
+
+    def test_conformer_conversion(self):
+        """Conformer: FX trace and full layer mapping."""
+        self._run_custom_conversion_test("conformer", CONFORMER_CONFIG)
+
+    def test_zipformer_conversion(self):
+        """Zipformer: FX trace and full layer mapping."""
+        self._run_custom_conversion_test("zipformer", ZIPFORMER_CONFIG)
+
+    def _run_custom_conversion_test(self, name, config_dict):
+        """Run conversion-only test for custom (non-HF) models.
+
+        Creates a model via the custom loader, runs AdaptiveConverter,
+        and verifies all layers are fully mapped (no unknowns).
+        """
+        import argparse
+        import torch
+        from decomposer import AdaptiveConverter
+        from custom_models import CUSTOM_LOADERS
+
+        model_type = config_dict["model_type"]
+        config = argparse.Namespace(**config_dict)
+
+        # Special handling per model type (uses HF classes, not custom loader)
+        if model_type == "siglip":
+            self._test_siglip_conversion(config)
+            return
+
+        if model_type not in CUSTOM_LOADERS:
+            self.skipTest(f"No custom loader for {model_type}")
+
+        # Generic custom loader path
+        loader = CUSTOM_LOADERS[model_type]
+        try:
+            model, config, input_kwargs = loader(
+                "/tmp/test_" + name, config, seq_len=16, verbose=True)
+        except ImportError as e:
+            self.skipTest(f"Missing dependency for {name}: {e}")
+
+        converter = AdaptiveConverter(model, config)
+        result = converter.convert(input_kwargs)
+
+        print(f"\n[{name}] Conversion result:")
+        print(f"  Total layers: {len(result.layers)}")
+        print(f"  Unknown layers: {len(result.unknown_layers)}")
+        print(f"  Fully mapped: {result.is_fully_mapped}")
+
+        self.assertTrue(result.is_fully_mapped,
+                        f"{name} has {len(result.unknown_layers)} unknown "
+                        f"layers: {[l.layer_type for l in result.unknown_layers]}")
+        self.assertGreater(len(result.layers), 0,
+                           f"{name} produced no layers")
+
+    def _test_siglip_conversion(self, config):
+        """SigLIP needs transformers SiglipModel, not custom loader."""
+        try:
+            from transformers import SiglipConfig, SiglipModel
+        except ImportError:
+            self.skipTest("transformers SiglipModel not available")
+
+        import torch
+        from decomposer import AdaptiveConverter
+
+        siglip_config = SiglipConfig(
+            vision_config=dict(
+                hidden_size=config.vision_hidden_size,
+                intermediate_size=config.vision_intermediate_size,
+                num_hidden_layers=config.vision_num_hidden_layers,
+                num_attention_heads=config.vision_num_attention_heads,
+                image_size=config.vision_image_size,
+                patch_size=config.vision_patch_size,
+                num_channels=3,
+            ),
+            text_config=dict(
+                hidden_size=config.text_hidden_size,
+                intermediate_size=config.text_intermediate_size,
+                num_hidden_layers=config.text_num_hidden_layers,
+                num_attention_heads=config.text_num_attention_heads,
+                vocab_size=config.text_vocab_size,
+                max_position_embeddings=config.text_max_position_embeddings,
+            ),
+        )
+        model = SiglipModel(siglip_config)
+        model.eval()
+
+        input_kwargs = {
+            "input_ids": torch.randint(0, config.text_vocab_size, (1, 8)),
+            "pixel_values": torch.randn(
+                1, 3, config.vision_image_size, config.vision_image_size),
+        }
+
+        converter = AdaptiveConverter(model, siglip_config)
+        result = converter.convert(input_kwargs)
+
+        print(f"\n[siglip] Conversion result:")
+        print(f"  Total layers: {len(result.layers)}")
+        print(f"  Unknown layers: {len(result.unknown_layers)}")
+        print(f"  Fully mapped: {result.is_fully_mapped}")
+
+        self.assertTrue(result.is_fully_mapped,
+                        f"siglip has {len(result.unknown_layers)} unknown "
+                        f"layers: {[l.layer_type for l in result.unknown_layers]}")
+        self.assertGreater(len(result.layers), 0,
+                           "siglip produced no layers")
 
     # ---- Common pipeline ----
 
