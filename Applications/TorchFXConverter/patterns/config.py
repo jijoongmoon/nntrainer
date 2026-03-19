@@ -134,6 +134,9 @@ def infer_arch_type(structure, config, find_block_scopes_fn):
         elif model_type in ("siglip", "clip", "blip"):
             structure.arch_type = "vision_language"
             return
+        elif model_type in ("conformer",):
+            structure.arch_type = "conformer"
+            return
 
         architectures = getattr(config, "architectures", []) or []
         is_base_model = any(

@@ -523,3 +523,49 @@ def _load_flux(model_dir, config, seq_len, verbose):
 
 
 CUSTOM_LOADERS["flux"] = _load_flux
+
+
+# ---------------------------------------------------------------------------
+# Conformer loader  (model_type = "conformer")
+# ---------------------------------------------------------------------------
+# Conformer is a speech/audio model combining convolution and transformer.
+# It uses torchaudio's Conformer implementation, not HuggingFace AutoModel.
+
+def _load_conformer(model_dir, config, seq_len, verbose):
+    """Load Conformer model for tracing."""
+    from torchaudio.models import Conformer
+
+    input_dim = getattr(config, "input_dim", getattr(config, "hidden_size", 80))
+    num_heads = getattr(config, "num_attention_heads", getattr(config, "num_heads", 4))
+    ffn_dim = getattr(config, "intermediate_size", getattr(config, "ffn_dim", 256))
+    num_layers = getattr(config, "num_hidden_layers", getattr(config, "num_layers", 12))
+    depthwise_conv_kernel_size = getattr(config, "depthwise_conv_kernel_size", 31)
+
+    model = Conformer(
+        input_dim=input_dim,
+        num_heads=num_heads,
+        ffn_dim=ffn_dim,
+        num_layers=num_layers,
+        depthwise_conv_kernel_size=depthwise_conv_kernel_size,
+    )
+    model.eval()
+
+    if verbose:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"  Conformer model loaded: {n_params / 1e6:.1f}M params")
+        print(f"    input_dim={input_dim}, layers={num_layers}, "
+              f"heads={num_heads}, ffn_dim={ffn_dim}, "
+              f"conv_kernel={depthwise_conv_kernel_size}")
+
+    # Conformer.forward(input, lengths) -> (output, lengths)
+    # input shape: (batch, time, input_dim)
+    time_steps = max(seq_len, 16)
+    input_kwargs = {
+        "input": torch.randn(1, time_steps, input_dim),
+        "lengths": torch.tensor([time_steps]),
+    }
+
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["conformer"] = _load_conformer

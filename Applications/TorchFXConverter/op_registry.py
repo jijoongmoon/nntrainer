@@ -111,6 +111,7 @@ FUNCTION_ACTIVATION_OPS = {
 FUNCTION_ACTIVATION_NAMES = {
     "tanh": ACT_TANH,
     "log_softmax": ACT_SOFTMAX,  # log_softmax ≈ softmax for NNTrainer mapping
+    "glu": ACT_SIGMOID,  # GLU(x) = x_a * sigmoid(x_b); map to sigmoid activation
 }
 
 # Function-based loss ops: callable -> layer_type
