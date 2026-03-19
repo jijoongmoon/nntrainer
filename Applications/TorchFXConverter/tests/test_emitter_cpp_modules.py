@@ -171,9 +171,9 @@ def test_custom_layer_collection():
 
     classes = collect_custom_layer_classes(structure, "rms_norm", attn_block)
     assert "EmbeddingLayer" in classes
-    assert "TieWordEmbeddingLayer" in classes
+    assert "TieWordEmbedding" in classes
     assert "RMSNormLayer" in classes
-    assert "MHACore" in classes
+    assert "MHACoreLayer" in classes
     assert "ReshapedRMSNormLayer" in classes  # Qwen3 has QK norm
     assert "SwiGLULayer" in classes
 
@@ -182,10 +182,10 @@ def test_register_custom_layers_output():
     """Test registerCustomLayers() C++ code generation."""
     from emitter_cpp.source_custom import emit_register_custom_layers
 
-    code = emit_register_custom_layers("TestModel", ["MHACore", "RMSNormLayer"])
+    code = emit_register_custom_layers("TestModel", ["MHACoreLayer", "RMSNormLayer"])
     assert "TestModel::registerCustomLayers()" in code
-    assert "nntrainer::createLayer<MHACore>" in code
-    assert "nntrainer::createLayer<RMSNormLayer>" in code
+    assert "nntrainer::createLayer<causallm::MHACoreLayer>" in code
+    assert "nntrainer::createLayer<causallm::RMSNormLayer>" in code
     assert "try {" in code
 
 
@@ -222,7 +222,7 @@ def test_backward_compat_output():
     assert "fully_connected" in cpp_code
     assert "rms_norm" in cpp_code
     assert "swiglu" in cpp_code
-    assert "addition" in cpp_code
+    assert ".add(" in cpp_code
     assert "tie_word_embeddings" in cpp_code
     assert "reshaped_rms_norm" in cpp_code
     assert "class Qwen3CausalLM" in cpp_code
@@ -242,7 +242,7 @@ def test_backward_compat_internal_methods():
     assert emitter._get_norm_type() == "rms_norm"
     assert emitter._file_base() == "qwen3_causal_lm"
     assert len(emitter._collect_custom_layer_classes()) > 0
-    assert emitter._CUSTOM_LAYER_CLASS["mha_core"] == "MHACore"
+    assert emitter._CUSTOM_LAYER_CLASS["mha_core"] == "MHACoreLayer"
 
 
 # ============================================================================

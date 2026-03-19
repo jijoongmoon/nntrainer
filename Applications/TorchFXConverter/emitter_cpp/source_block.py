@@ -1,21 +1,44 @@
-"""C++ createTransformerBlock() and operator layer generation."""
+"""C++ createTransformerBlock() generation using symbolic Tensor graph."""
 
-from .helpers import _cpp_layer, get_norm_type
+from .helpers import _cpp_tensor_layer, get_norm_type
 
 
 def emit_block_method(cname, block_type, block, structure, is_encoder=None):
-    """Emit a block method for any operator type.
+    """Emit a block method using symbolic Tensor graph pattern.
 
-    The method structure is always:
-      norm -> operator -> residual -> norm -> FFN -> residual
-
-    For attention blocks, the operator is emitted via createAttention.
-    For other blocks (conv, ssm, etc.), the operator layers are emitted
-    directly from block.operator_layers.
+    Methods accept Tensor input and return Tensor output.
+    Residuals use Tensor::add() instead of Addition layers.
     """
     norm_type = get_norm_type(structure.model_type)
     op_type = block.operator_type
     L = []
+
+    # Method signature - returns Tensor, accepts Tensor
+    if block_type in ("EncoderBlock",):
+        L.append(f"Tensor")
+        L.append(f"{cname}::create{block_type}("
+                 f"const int layer_id,")
+        L.append(f"  Tensor input) {{")
+    elif block_type == "DecoderBlock" and is_encoder is False:
+        L.append(f"Tensor")
+        L.append(f"{cname}::create{block_type}("
+                 f"const int layer_id,")
+        L.append(f"  Tensor input, "
+                 f"Tensor encoder_output) {{")
+    else:
+        op_label = (op_type.capitalize() if op_type != "attention"
+                    else "Transformer")
+        method_name = (f"createTransformer{block_type}"
+                       if op_type == "attention"
+                       else f"create{op_label}{block_type}")
+        L.append(f"Tensor")
+        L.append(f"{cname}::{method_name}("
+                 f"const int layer_id,")
+        L.append(f"  Tensor input) {{")
+
+    L.append(f"")
+    L.append(f"  using ml::train::createLayer;")
+    L.append(f"")
 
     # Determine prefix for layer names
     if is_encoder is True:
@@ -25,214 +48,166 @@ def emit_block_method(cname, block_type, block, structure, is_encoder=None):
     else:
         prefix_expr = '"layer" + std::to_string(layer_id)'
 
-    # Method signature
-    L.append(f"std::vector<LayerHandle>")
-    if block_type in ("EncoderBlock",):
-        L.append(f"{cname}::create{block_type}("
-                 f"const int layer_id,")
-        L.append(f"  std::string input_name) {{")
-    elif block_type == "DecoderBlock" and is_encoder is False:
-        L.append(f"{cname}::create{block_type}("
-                 f"const int layer_id,")
-        L.append(f"  std::string input_name, "
-                 f"std::string encoder_output) {{")
-    else:
-        op_label = (op_type.capitalize() if op_type != "attention"
-                    else "Transformer")
-        method_name = (f"createTransformer{block_type}"
-                       if op_type == "attention"
-                       else f"create{op_label}{block_type}")
-        L.append(f"{cname}::{method_name}("
-                 f"const int layer_id,")
-        L.append(f"  std::string input_name) {{")
-
-    L.append(f"")
-    L.append(f"  std::vector<LayerHandle> layers;")
     L.append(f"  auto prefix = {prefix_expr};")
     L.append(f"")
 
     norm_suffix = ("_attention_norm" if op_type == "attention"
                    else f"_{op_type}_norm")
 
+    # Track current tensor variable name
+    current_input = "input"
+
     # Pre-operator norm
     if block.pre_attn_norm:
-        _emit_pre_norm(L, norm_type, norm_suffix, op_type)
+        norm_var = _emit_pre_norm(L, norm_type, norm_suffix, op_type,
+                                  current_input)
+        op_input = norm_var
+    else:
+        op_input = current_input
 
     # Operator
-    op_input = (f'prefix + "{norm_suffix}"'
-                if block.pre_attn_norm else "input_name")
     if block.attention:
-        _emit_attention_call(L, op_input)
-        op_output_suffix = "_attention_out"
+        L.append(f"  // Self attention")
+        L.append(f"  Tensor att_out =")
+        L.append(f"    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, "
+                 f"HEAD_DIM,")
+        L.append(f"                    {op_input}, {op_input}, {op_input});")
+        L.append(f"")
+        op_output = "att_out"
     elif block.operator_layers:
-        op_output_suffix = _emit_operator_layers(L, block, op_input, prefix_expr)
+        op_output = _emit_operator_layers(L, block, op_input, prefix_expr)
     else:
-        op_output_suffix = norm_suffix
+        op_output = op_input
 
-    # Operator residual
+    # Operator residual using Tensor::add()
     if block.attn_residual:
-        residual_suffix = (f"_{op_type}_add" if op_type != "attention"
-                           else "_self_attn_add")
-        _emit_residual(L, op_type, residual_suffix, op_output_suffix)
-        last_residual = f'prefix + "{residual_suffix}"'
+        L.append(f"  // {op_type.capitalize()} residual connection")
+        L.append(f"  Tensor residual = {current_input}.add({op_output});")
+        L.append(f"")
+        last_residual = "residual"
     else:
-        last_residual = f'prefix + "{op_output_suffix}"'
+        last_residual = op_output
 
     # Cross-attention (decoder blocks in encoder-decoder)
     if block.cross_attention and is_encoder is False:
-        last_residual = _emit_cross_attention(L, block, norm_type, last_residual)
-
-    # Block output naming
-    if is_encoder is None:
-        block_out_name = '"_decoder_output"'
-    else:
-        block_out_name = '"_block_output"'
+        last_residual = _emit_cross_attention(L, block, norm_type,
+                                              last_residual)
 
     # Pre-FFN norm
     if block.pre_ffn_norm:
-        _emit_pre_ffn_norm(L, norm_type, last_residual)
-        ffn_in = 'prefix + "_ffn_norm"'
+        ffn_norm_var = _emit_pre_ffn_norm(L, norm_type, last_residual)
+        ffn_input = ffn_norm_var
     else:
-        ffn_in = last_residual
+        ffn_input = last_residual
 
     # FFN
     if block.ffn:
-        L.append(f"  auto ffn_layer = createMlp(layer_id, DIM, "
-                 f"INTERMEDIATE_SIZE,")
-        L.append(f"                             {ffn_in});")
-        L.append(f"  layers.insert(layers.end(), ffn_layer.begin(), "
-                 f"ffn_layer.end());")
+        L.append(f"  // Feed forward")
+        L.append(f"  Tensor ffn_out = createMlp(layer_id, DIM, "
+                 f"INTERMEDIATE_SIZE, {ffn_input});")
         L.append(f"")
 
-    # FFN residual
+    # FFN residual using Tensor::add()
     if block.ffn_residual:
         L.append(f"  // FFN residual connection")
-        L.extend(_cpp_layer("addition", [
-            f'withKey("name", prefix + {block_out_name})',
-            f'withKey("input_layers", {last_residual} + "," + '
-            f'prefix + "_ffn_down")',
-        ]))
+        L.append(f"  Tensor block_out = {last_residual}.add(ffn_out);")
         L.append(f"")
+        final_output = "block_out"
+    else:
+        final_output = "ffn_out" if block.ffn else last_residual
 
-    L.append(f"  return layers;")
+    L.append(f"  return {final_output};")
     L.append(f"}}")
     L.append(f"")
     return "\n".join(L)
 
 
-def _emit_pre_norm(L, norm_type, norm_suffix, op_type):
-    """Emit pre-operator normalization."""
+def _emit_pre_norm(L, norm_type, norm_suffix, op_type, input_var):
+    """Emit pre-operator normalization. Returns output variable name."""
     L.append(f"  // Pre-{op_type} normalization")
     norm_props = [
         f'withKey("name", prefix + "{norm_suffix}")',
-        'withKey("input_layers", input_name)',
         'withKey("epsilon", NORM_EPS)',
     ]
     if norm_type == "rms_norm":
         norm_props.append('withKey("packed", "false")')
     elif norm_type == "layer_normalization":
         norm_props.append('withKey("axis", 3)')
-    L.extend(_cpp_layer(norm_type, norm_props))
+
+    lines, out_var = _cpp_tensor_layer("att_norm", norm_type, norm_props,
+                                       input_var)
+    L.extend(lines)
     L.append(f"")
+    return out_var
 
 
-def _emit_attention_call(L, op_input):
-    """Emit createAttention() call."""
-    L.append(f"  auto att_layer =")
-    L.append(f"    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, "
-             f"HEAD_DIM,")
-    L.append(f"                    {op_input},")
-    L.append(f"                    {op_input},")
-    L.append(f"                    {op_input});")
+def _emit_pre_ffn_norm(L, norm_type, input_var):
+    """Emit pre-FFN normalization. Returns output variable name."""
+    L.append(f"  // Pre-FFN normalization")
+    norm_props = [
+        'withKey("name", prefix + "_ffn_norm")',
+        'withKey("epsilon", NORM_EPS)',
+    ]
+    if norm_type == "rms_norm":
+        norm_props.append('withKey("packed", "false")')
+    elif norm_type == "layer_normalization":
+        norm_props.append('withKey("axis", 3)')
+
+    lines, out_var = _cpp_tensor_layer("ffn_norm", norm_type, norm_props,
+                                       input_var)
+    L.extend(lines)
     L.append(f"")
-    L.append(f"  layers.insert(layers.end(), att_layer.begin(), "
-             f"att_layer.end());")
-    L.append(f"")
+    return out_var
 
 
-def _emit_residual(L, op_type, residual_suffix, op_output_suffix):
-    """Emit operator residual connection."""
-    L.append(f"  // {op_type.capitalize()} residual connection")
-    L.extend(_cpp_layer("addition", [
-        f'withKey("name", prefix + "{residual_suffix}")',
-        f'withKey("input_layers", input_name + "," + '
-        f'prefix + "{op_output_suffix}")',
-    ]))
-    L.append(f"")
+def _emit_cross_attention(L, block, norm_type, input_var):
+    """Emit cross-attention section. Returns updated tensor variable name."""
+    q_input = input_var
 
-
-def _emit_cross_attention(L, block, norm_type, last_residual):
-    """Emit cross-attention section. Returns updated last_residual."""
     if block.cross_attn_norm:
         L.append(f"  // Cross-attention normalization")
         cross_norm_props = [
             'withKey("name", prefix + "_cross_attn_norm")',
-            f'withKey("input_layers", {last_residual})',
             'withKey("epsilon", NORM_EPS)',
         ]
         if norm_type == "rms_norm":
             cross_norm_props.append('withKey("packed", "false")')
         elif norm_type == "layer_normalization":
             cross_norm_props.append('withKey("axis", 3)')
-        L.extend(_cpp_layer(norm_type, cross_norm_props))
+        lines, q_input = _cpp_tensor_layer(
+            "cross_norm", norm_type, cross_norm_props, input_var)
+        L.extend(lines)
         L.append(f"")
-        cross_q = 'prefix + "_cross_attn_norm"'
-    else:
-        cross_q = last_residual
 
-    L.append(f"  auto cross_att =")
+    L.append(f"  // Cross-attention")
+    L.append(f"  Tensor cross_att_out =")
     L.append(f"    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, "
              f"HEAD_DIM,")
-    L.append(f"                    {cross_q},")
-    L.append(f"                    encoder_output,")
-    L.append(f"                    encoder_output);")
-    L.append(f"")
-    L.append(f"  layers.insert(layers.end(), cross_att.begin(), "
-             f"cross_att.end());")
+    L.append(f"                    {q_input}, encoder_output, "
+             f"encoder_output);")
     L.append(f"")
 
     if block.cross_attn_residual:
         L.append(f"  // Cross-attention residual")
-        L.extend(_cpp_layer("addition", [
-            'withKey("name", prefix + "_cross_attn_add")',
-            f'withKey("input_layers", {last_residual} + "," + '
-            f'prefix + "_attention_out")',
-        ]))
+        L.append(f"  Tensor cross_residual = "
+                 f"{input_var}.add(cross_att_out);")
         L.append(f"")
-        return 'prefix + "_cross_attn_add"'
-    return last_residual
+        return "cross_residual"
+    return input_var
 
 
-def _emit_pre_ffn_norm(L, norm_type, last_residual):
-    """Emit pre-FFN normalization."""
-    L.append(f"  // Pre-FFN normalization")
-    norm_props = [
-        'withKey("name", prefix + "_ffn_norm")',
-        f'withKey("input_layers", {last_residual})',
-        'withKey("epsilon", NORM_EPS)',
-    ]
-    if norm_type == "rms_norm":
-        norm_props.append('withKey("packed", "false")')
-    elif norm_type == "layer_normalization":
-        norm_props.append('withKey("axis", 3)')
-    L.extend(_cpp_layer(norm_type, norm_props))
-    L.append(f"")
+def _emit_operator_layers(L, block, input_var, prefix_expr):
+    """Emit non-attention operator layers using Tensor flow.
 
-
-def _emit_operator_layers(L, block, op_input, prefix_expr):
-    """Emit non-attention operator layers (auto-generated from model).
-
-    Returns the suffix of the last emitted layer's name (for residual).
+    Returns the variable name of the last emitted tensor.
     """
     op_type = block.operator_type
     scope = block.operator_scope
-    scope_san = scope.replace(".", "_")
     block_scope = scope.rsplit(".", 1)[0] if "." in scope else scope
     block_scope_san = block_scope.replace(".", "_")
 
     L.append(f"  // {op_type.capitalize()} operator (auto-generated)")
-    last_suffix = ""
-    prev_suffix = None
+    prev_var = input_var
 
     for i, layer in enumerate(block.operator_layers):
         if layer.name.startswith(block_scope_san + "_"):
@@ -240,11 +215,7 @@ def _emit_operator_layers(L, block, op_input, prefix_expr):
         else:
             suffix = "_" + layer.name
 
-        if i == 0:
-            input_expr = op_input
-        else:
-            input_expr = f'prefix + "{prev_suffix}"'
-
+        var_name = f"op_{i}"
         props = [f'withKey("name", prefix + "{suffix}")']
         for k, v in layer.properties.items():
             if isinstance(v, bool):
@@ -254,11 +225,10 @@ def _emit_operator_layers(L, block, op_input, prefix_expr):
                 props.append(f'withKey("{k}", "{v}")')
             else:
                 props.append(f'withKey("{k}", {v})')
-        props.append(f'withKey("input_layers", {input_expr})')
-        L.extend(_cpp_layer(layer.layer_type, props))
+
+        lines, prev_var = _cpp_tensor_layer(
+            var_name, layer.layer_type, props, prev_var)
+        L.extend(lines)
         L.append(f"")
 
-        prev_suffix = suffix
-        last_suffix = suffix
-
-    return last_suffix
+    return prev_var

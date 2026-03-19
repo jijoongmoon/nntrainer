@@ -78,7 +78,7 @@ def test_cpp_emitter_qwen3():
     assert "fully_connected" in cpp_code, "No fully_connected layer"
     assert "rms_norm" in cpp_code, "No rms_norm layer"
     assert "swiglu" in cpp_code, "No swiglu layer"
-    assert "addition" in cpp_code, "No addition layer (residual)"
+    assert ".add(" in cpp_code, "No Tensor::add() residual connection"
     assert "tie_word_embeddings" in cpp_code, "No tied embeddings"
     assert "reshaped_rms_norm" in cpp_code, "No Q/K norms"
     print("  PASS: All expected layer types present")

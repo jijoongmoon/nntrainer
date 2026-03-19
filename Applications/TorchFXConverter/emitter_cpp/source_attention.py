@@ -1,100 +1,99 @@
-"""C++ createAttention() method generation."""
+"""C++ createAttention() method generation using symbolic Tensor graph."""
 
-from .helpers import _cpp_layer, _class_name
+from .helpers import _cpp_tensor_layer, _class_name
 
 
 def emit_attention_method(cname, block, arch_type="decoder_only",
                           external_kv_cache=False):
-    """Generate createAttention() method body."""
+    """Generate createAttention() method body using Tensor flow."""
     attn = block.attention
     is_decoder = arch_type in ("decoder_only", "encoder_decoder")
     has_qk_norm = attn.has_qk_norm
     has_rope = attn.has_rope
     L = []
 
-    L.append(f"std::vector<LayerHandle>")
+    L.append(f"Tensor")
     L.append(f"{cname}::createAttention(const int layer_id, int seq_len, "
              f"int n_heads,")
     L.append(f"                         int head_dim, "
-             f"std::string query_name,")
-    L.append(f"                         std::string key_name, "
-             f"std::string value_name) {{")
+             f"Tensor query,")
+    L.append(f"                         Tensor key, "
+             f"Tensor value) {{")
     L.append(f"")
-    L.append(f"  std::vector<LayerHandle> layers;")
+    L.append(f"  using ml::train::createLayer;")
     L.append(f"")
-    L.append(f'  auto Q = "layer" + std::to_string(layer_id) + "_wq";')
-    L.append(f'  auto K = "layer" + std::to_string(layer_id) + "_wk";')
-    L.append(f'  auto V = "layer" + std::to_string(layer_id) + "_wv";')
+    L.append(f'  auto V_name = "layer" + std::to_string(layer_id) + "_wv";')
+    L.append(f'  auto K_name = "layer" + std::to_string(layer_id) + "_wk";')
+    L.append(f'  auto Q_name = "layer" + std::to_string(layer_id) + "_wq";')
     if has_qk_norm:
-        L.append(f'  auto Q_norm = "layer" + std::to_string(layer_id) '
-                 f'+ "_q_norm";')
-        L.append(f'  auto K_norm = "layer" + std::to_string(layer_id) '
+        L.append(f'  auto K_norm_name = "layer" + std::to_string(layer_id) '
                  f'+ "_k_norm";')
-    L.append(f'  auto A = "layer" + std::to_string(layer_id) '
+        L.append(f'  auto Q_norm_name = "layer" + std::to_string(layer_id) '
+                 f'+ "_q_norm";')
+    L.append(f'  auto A_name = "layer" + std::to_string(layer_id) '
              f'+ "_attention";')
-    L.append(f'  auto O = "layer" + std::to_string(layer_id) '
+    L.append(f'  auto O_name = "layer" + std::to_string(layer_id) '
              f'+ "_attention_out";')
     L.append(f"")
 
-    # V layer
-    L.append(f"  // V layer")
-    L.extend(_cpp_layer("fully_connected", [
-        'withKey("name", V)',
+    # V projection
+    L.append(f"  // V projection")
+    lines, v_out = _cpp_tensor_layer("v_proj", "fully_connected", [
+        'withKey("name", V_name)',
         'withKey("unit", head_dim * n_heads / GQA_SIZE)',
         'withKey("disable_bias", "true")',
-        'withKey("input_layers", value_name)',
-    ]))
-
-    # K layer
+    ], "value")
+    L.extend(lines)
     L.append(f"")
-    L.append(f"  // K layer")
-    L.extend(_cpp_layer("fully_connected", [
-        'withKey("name", K)',
+
+    # K projection
+    L.append(f"  // K projection")
+    lines, k_out = _cpp_tensor_layer("k_proj", "fully_connected", [
+        'withKey("name", K_name)',
         'withKey("unit", head_dim * n_heads / GQA_SIZE)',
         'withKey("disable_bias", "true")',
-        'withKey("input_layers", key_name)',
-    ]))
-
-    # Q layer
+    ], "key")
+    L.extend(lines)
     L.append(f"")
-    L.append(f"  // Q layer")
-    L.extend(_cpp_layer("fully_connected", [
-        'withKey("name", Q)',
+
+    # Q projection
+    L.append(f"  // Q projection")
+    lines, q_out = _cpp_tensor_layer("q_proj", "fully_connected", [
+        'withKey("name", Q_name)',
         'withKey("unit", head_dim * n_heads)',
         'withKey("disable_bias", "true")',
-        'withKey("input_layers", query_name)',
-    ]))
+    ], "query")
+    L.extend(lines)
 
     # Q/K norms (Qwen3-style)
+    q_in = q_out
+    k_in = k_out
     if has_qk_norm:
         L.append(f"")
         L.append(f"  // K norm (reshaped RMS norm)")
-        L.extend(_cpp_layer("reshaped_rms_norm", [
-            'withKey("name", K_norm)',
-            'withKey("input_layers", K)',
+        lines, k_in = _cpp_tensor_layer("k_norm", "reshaped_rms_norm", [
+            'withKey("name", K_norm_name)',
             'withKey("packed", "false")',
             'withKey("epsilon", NORM_EPS)',
             'withKey("feature_size", head_dim)',
-        ]))
+        ], k_out)
+        L.extend(lines)
 
         L.append(f"")
         L.append(f"  // Q norm (reshaped RMS norm)")
-        L.extend(_cpp_layer("reshaped_rms_norm", [
-            'withKey("name", Q_norm)',
-            'withKey("input_layers", Q)',
+        lines, q_in = _cpp_tensor_layer("q_norm", "reshaped_rms_norm", [
+            'withKey("name", Q_norm_name)',
             'withKey("packed", "false")',
             'withKey("epsilon", NORM_EPS)',
             'withKey("feature_size", head_dim)',
-        ]))
+        ], q_out)
+        L.extend(lines)
 
     # MHA core
     L.append(f"")
     L.append(f"  // Attention core layer")
-    q_in = "Q_norm" if has_qk_norm else "Q"
-    k_in = "K_norm" if has_qk_norm else "K"
-
     mha_props = [
-        'withKey("name", A)',
+        'withKey("name", A_name)',
         'withKey("num_heads", n_heads)',
         'withKey("num_heads_kv", n_heads / GQA_SIZE)',
     ]
@@ -112,28 +111,29 @@ def emit_attention_method(cname, block, arch_type="decoder_only",
             'withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS)')
     if is_decoder:
         mha_props.append('withKey("max_new_tokens", NUM_TO_GENERATE)')
-    if external_kv_cache:
-        mha_props.append(
-            f'withKey("input_layers", {q_in} + "," + {k_in} + "," + V'
-            f' + "," + key_cache_tensor_names[layer_id]'
-            f' + "," + val_cache_tensor_names[layer_id])')
-    else:
-        mha_props.append(
-            f'withKey("input_layers", {q_in} + "," + {k_in} + "," + V)')
-    L.extend(_cpp_layer("mha_core", mha_props))
 
-    # O layer
+    if external_kv_cache:
+        mha_input = (f'{{{q_in}, {k_in}, {v_out}, '
+                     f'key_cache_tensors[layer_id], '
+                     f'val_cache_tensors[layer_id]}}')
+    else:
+        mha_input = f'{{{q_in}, {k_in}, {v_out}}}'
+
+    lines, a_out = _cpp_tensor_layer("attn", "mha_core", mha_props, mha_input)
+    L.extend(lines)
+
+    # O projection
     L.append(f"")
-    L.append(f"  // O layer")
-    L.extend(_cpp_layer("fully_connected", [
-        'withKey("name", O)',
+    L.append(f"  // O projection")
+    lines, o_out = _cpp_tensor_layer("o_proj", "fully_connected", [
+        'withKey("name", O_name)',
         'withKey("unit", DIM)',
         'withKey("disable_bias", "true")',
-        'withKey("input_layers", A)',
-    ]))
+    ], a_out)
+    L.extend(lines)
 
     L.append(f"")
-    L.append(f"  return layers;")
+    L.append(f"  return {o_out};")
     L.append(f"}}")
     L.append(f"")
     return "\n".join(L)

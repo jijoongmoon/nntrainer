@@ -16,7 +16,7 @@ import os
 
 from emitter_base import BaseEmitter
 from .helpers import (
-    _q, _cpp_layer, _with_key,
+    _q, _cpp_layer, _cpp_tensor_layer, _with_key,
     _class_name, _file_basename, _header_guard,
     _sanitize_model_name, get_output_filenames,
     get_file_base, get_norm_type,
@@ -90,6 +90,7 @@ class CppEmitter(BaseEmitter):
         L.append(f"")
         L.append(f'#include "{header_file}"')
         L.append(f"#include <model.h>")
+        L.append(f"#include <tensor_api.h>")
         L.append(f"#include <app_context.h>")
         L.append(f"#include <engine.h>")
         L.append(f"")
@@ -98,6 +99,8 @@ class CppEmitter(BaseEmitter):
             L.append(includes)
             L.append(f"")
         L.append(f"using ml::train::createLayer;")
+        L.append(f"using ml::train::Tensor;")
+        L.append(f"using LayerHandle = ml::train::LayerHandle;")
         L.append(f"")
 
         # withKey helper templates

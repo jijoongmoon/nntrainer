@@ -19,8 +19,10 @@ def emit_flat_header(structure, model_name=None):
     L.append(f"")
     L.append(f"#include <layer.h>")
     L.append(f"#include <model.h>")
+    L.append(f"#include <tensor_api.h>")
     L.append(f"")
-    L.append(f"using LayerHandle = std::shared_ptr<ml::train::Layer>;")
+    L.append(f"using LayerHandle = ml::train::LayerHandle;")
+    L.append(f"using Tensor = ml::train::Tensor;")
     L.append(f"using ModelHandle = std::unique_ptr<ml::train::Model>;")
     L.append(f"")
     L.append(f"/**")
@@ -88,6 +90,7 @@ def emit_structured_header(structure, blocks_info, model_name=None):
     L.append(f"#include <climits>")
     L.append(f"#include <layer.h>")
     L.append(f"#include <model.h>")
+    L.append(f"#include <tensor_api.h>")
     L.append(f"")
 
     has_qk_norm = attn_block and attn_block.attention.has_qk_norm
@@ -95,7 +98,8 @@ def emit_structured_header(structure, blocks_info, model_name=None):
         L.append(f"#include <reshaped_rms_norm.h>")
         L.append(f"")
 
-    L.append(f"using LayerHandle = std::shared_ptr<ml::train::Layer>;")
+    L.append(f"using LayerHandle = ml::train::LayerHandle;")
+    L.append(f"using Tensor = ml::train::Tensor;")
     L.append(f"using ModelHandle = std::unique_ptr<ml::train::Model>;")
     L.append(f"")
 
@@ -145,7 +149,7 @@ def emit_structured_header(structure, blocks_info, model_name=None):
     L.append(f"")
     L.append(f"protected:")
 
-    # Block creation methods
+    # Block creation methods - now return Tensor and accept Tensor
     if s.arch_type == "encoder_decoder":
         _emit_enc_dec_block_decls(L)
     else:
@@ -157,34 +161,33 @@ def emit_structured_header(structure, blocks_info, model_name=None):
             L.append(f"  /**")
             L.append(f"   * @brief Create a {op_label} {block_type}")
             L.append(f"   */")
-            L.append(f"  virtual std::vector<LayerHandle>")
             method_name = (f"createTransformer{block_type}"
                            if op_type == "attention"
                            else f"create{op_label}{block_type}")
+            L.append(f"  virtual Tensor")
             L.append(f"  {method_name}("
-                     f"const int layer_id, std::string input_name);")
+                     f"const int layer_id, Tensor input);")
             L.append(f"")
 
-    # createAttention
+    # createAttention - now accepts/returns Tensor
     if attn_block:
         L.append(f"  /**")
         L.append(f"   * @brief Create Attention layers")
         L.append(f"   */")
-        L.append(f"  virtual std::vector<LayerHandle>")
+        L.append(f"  virtual Tensor")
         L.append(f"  createAttention(const int layer_id, int seq_len, "
                  f"int n_heads, int head_dim,")
-        L.append(f"                  std::string query_name, "
-                 f"std::string key_name,")
-        L.append(f"                  std::string value_name);")
+        L.append(f"                  Tensor query, "
+                 f"Tensor key, Tensor value);")
         L.append(f"")
 
-    # createMlp
+    # createMlp - now accepts/returns Tensor
     L.append(f"  /**")
     L.append(f"   * @brief Create Feed Forward layers")
     L.append(f"   */")
-    L.append(f"  virtual std::vector<LayerHandle>")
+    L.append(f"  virtual Tensor")
     L.append(f"  createMlp(const int layer_id, int dim, int hidden_dim,")
-    L.append(f"            std::string input_name);")
+    L.append(f"            Tensor input);")
     L.append(f"")
 
     # allocateKVCache (external mode)
@@ -217,18 +220,18 @@ def _emit_enc_dec_block_decls(L):
     L.append(f"  /**")
     L.append(f"   * @brief Create a Transformer Encoder Block")
     L.append(f"   */")
-    L.append(f"  virtual std::vector<LayerHandle>")
+    L.append(f"  virtual Tensor")
     L.append(f"  createEncoderBlock("
-             f"const int layer_id, std::string input_name);")
+             f"const int layer_id, Tensor input);")
     L.append(f"")
     L.append(f"  /**")
     L.append(f"   * @brief Create a Transformer Decoder Block")
     L.append(f"   */")
-    L.append(f"  virtual std::vector<LayerHandle>")
+    L.append(f"  virtual Tensor")
     L.append(f"  createDecoderBlock("
-             f"const int layer_id, std::string input_name,")
+             f"const int layer_id, Tensor input,")
     L.append(f"                     "
-             f"std::string encoder_output);")
+             f"Tensor encoder_output);")
     L.append(f"")
 
 
@@ -239,8 +242,8 @@ def _emit_member_variables(L, s, attn_block):
 
     if s.external_kv_cache:
         L.append(f"  KVCacheBuffers kv_cache_buffers;")
-        L.append(f"  std::vector<std::string> key_cache_tensor_names;")
-        L.append(f"  std::vector<std::string> val_cache_tensor_names;")
+        L.append(f"  std::vector<Tensor> key_cache_tensors;")
+        L.append(f"  std::vector<Tensor> val_cache_tensors;")
         L.append(f"")
 
     L.append(f"  // Model constants")

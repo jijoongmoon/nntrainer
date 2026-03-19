@@ -120,7 +120,7 @@ def test_qwen3_full_pipeline():
         ("fully_connected", "Q/K/V/O projections"),
         ("reshaped_rms_norm", "Q/K norms"),
         ("mha_core", "attention core"),
-        ("addition", "residual connections"),
+        (".add(", "residual connections via Tensor::add()"),
         ("swiglu", "SwiGLU activation"),
     ]
     for lt, desc in ref_layer_types:
@@ -134,7 +134,7 @@ def test_qwen3_full_pipeline():
     assert "Qwen3CausalLM::createTransformerDecoderBlock(" in cpp
     assert "Qwen3CausalLM::constructModel(" in cpp
     assert "virtual void constructModel();" in cpp, "Missing virtual method"
-    assert "virtual std::vector<LayerHandle>" in cpp
+    assert "virtual Tensor" in cpp
     print("  PASS: C++ class structure matches reference")
 
     # --- Verify critical properties ---
