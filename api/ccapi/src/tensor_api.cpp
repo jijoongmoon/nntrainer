@@ -41,6 +41,7 @@ struct SymbolicGraphNode {
   std::vector<std::shared_ptr<SymbolicGraphNode>> inputs;
   TensorDim dim;
   std::string name;
+  int output_index = -1; ///< >=0 means indexed output, e.g. split(0)
 };
 
 /**
@@ -644,6 +645,30 @@ std::shared_ptr<Layer> Tensor::getProducingLayer() const {
                                       : nullptr;
 }
 
+Tensor Tensor::output(unsigned int index) const {
+  Tensor result;
+  result.impl_ = std::make_unique<Impl>();
+  result.impl_->valid = true;
+
+  // Create a new graph edge that shares the same producing layer but with index
+  auto indexed_edge = std::make_shared<SymbolicGraphNode>();
+  if (impl_ && impl_->graph_edge) {
+    indexed_edge->producing_layer = impl_->graph_edge->producing_layer;
+    indexed_edge->inputs = impl_->graph_edge->inputs;
+    indexed_edge->dim = impl_->graph_edge->dim;
+    indexed_edge->name = impl_->graph_edge->name;
+  }
+  indexed_edge->output_index = static_cast<int>(index);
+  result.impl_->graph_edge = indexed_edge;
+
+  if (impl_) {
+    result.impl_->src_layer = impl_->src_layer;
+    result.impl_->dim = impl_->dim;
+  }
+
+  return result;
+}
+
 std::vector<Tensor> Tensor::getInputTensors() const {
   if (!impl_ || !impl_->graph_edge) {
     return {};
@@ -852,7 +877,11 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
       std::vector<std::string> input_names;
       for (auto &inp : edge->inputs) {
         if (inp && inp->producing_layer) {
-          input_names.push_back(inp->producing_layer->getName());
+          std::string layer_ref = inp->producing_layer->getName();
+          if (inp->output_index >= 0) {
+            layer_ref += "(" + std::to_string(inp->output_index) + ")";
+          }
+          input_names.push_back(layer_ref);
         } else {
           // Leaf tensor
           std::string leaf_name = inp ? inp->name : "";

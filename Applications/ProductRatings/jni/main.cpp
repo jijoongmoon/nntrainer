@@ -21,7 +21,6 @@
 #include <sstream>
 
 #include <model.h>
-#include <layer.h>
 #include <dataset.h>
 #include <optimizer.h>
 #include <tensor_api.h>
@@ -30,6 +29,8 @@ using ml::train::createLayer;
 using ml::train::createModel;
 using ml::train::createDataset;
 using ml::train::createOptimizer;
+using ml::train::LayerHandle;
+using ml::train::Tensor;
 
 std::string data_file;
 
@@ -104,72 +105,57 @@ int getSample_train(float **outVec, float **outLabel, bool *last,
 }
 
 /**
- * @brief Build the model using ccapi layer construction.
+ * @brief Build the model using symbolic tensor graph.
  *
- * Replaces the INI-based configuration with explicit layer creation,
- * matching the original topology:
+ * Topology:
  *   input → split → [user_embed, product_embed] → concat →
  *   flatten → fc1(128,relu) → fc2(32,relu) → output(1)
  */
-static std::unique_ptr<ml::train::Model> buildModel() {
-  auto model = createModel(ml::train::ModelType::NEURAL_NET,
-                           {"epochs=100", "loss=mse", "batch_size=20"});
-
-  auto optimizer = createOptimizer(
-    "adam", {"learning_rate=0.001", "beta1=0.9", "beta2=0.999",
-             "epsilon=1e-7"});
-  model->setOptimizer(std::move(optimizer));
-
-  // input: 1:1:2 (user_id, product_id packed as two integers)
-  auto input_layer =
-    createLayer("input", {"name=input", "input_shape=1:1:2"});
-  model->addLayer(std::move(input_layer));
+static std::pair<Tensor, Tensor> buildGraph() {
+  auto x = Tensor({1, 1, 1, 2}, "input");
 
   // split along width axis into two scalars
-  auto split_layer =
-    createLayer("split", {"name=split", "axis=3"});
-  model->addLayer(std::move(split_layer));
+  LayerHandle split(createLayer("split", {"name=split", "axis=3"}));
+  auto split_out = split(x);
+
+  auto user_id = split_out.output(0);
+  auto product_id = split_out.output(1);
 
   // user embedding: vocab=6, dim=5
-  auto user_embed = createLayer(
-    "embedding",
-    {"name=user_embed", "input_layers=split(0)", "in_dim=6", "out_dim=5"});
-  model->addLayer(std::move(user_embed));
+  LayerHandle user_embed(createLayer(
+    "embedding", {"name=user_embed", "in_dim=6", "out_dim=5"}));
+  auto user_emb = user_embed(user_id);
 
   // product embedding: vocab=6, dim=5
-  auto product_embed = createLayer(
-    "embedding",
-    {"name=product_embed", "input_layers=split(1)", "in_dim=6", "out_dim=5"});
-  model->addLayer(std::move(product_embed));
+  LayerHandle product_embed(createLayer(
+    "embedding", {"name=product_embed", "in_dim=6", "out_dim=5"}));
+  auto prod_emb = product_embed(product_id);
 
   // concat user + product embeddings
-  auto concat_layer = createLayer(
-    "concat", {"name=concat", "input_layers=user_embed,product_embed"});
-  model->addLayer(std::move(concat_layer));
+  LayerHandle concat(createLayer("concat", {"name=concat"}));
+  auto h = concat({user_emb, prod_emb});
 
   // flatten
-  auto flatten_layer = createLayer("flatten", {"name=flatten"});
-  model->addLayer(std::move(flatten_layer));
+  LayerHandle flatten(createLayer("flatten", {"name=flatten"}));
+  h = flatten(h);
 
   // fc1: 128 units, relu
-  auto fc1 = createLayer(
-    "fully_connected",
-    {"name=fc1", "unit=128", "activation=relu"});
-  model->addLayer(std::move(fc1));
+  LayerHandle fc1(createLayer(
+    "fully_connected", {"name=fc1", "unit=128", "activation=relu"}));
+  h = fc1(h);
 
   // fc2: 32 units, relu
-  auto fc2 = createLayer(
-    "fully_connected",
-    {"name=fc2", "unit=32", "activation=relu"});
-  model->addLayer(std::move(fc2));
+  LayerHandle fc2(createLayer(
+    "fully_connected", {"name=fc2", "unit=32", "activation=relu"}));
+  h = fc2(h);
 
   // output: 1 unit
-  auto output_layer = createLayer(
+  LayerHandle output_fc(createLayer(
     "fully_connected",
-    {"name=outputlayer", "unit=1", "bias_initializer=zeros"});
-  model->addLayer(std::move(output_layer));
+    {"name=outputlayer", "unit=1", "bias_initializer=zeros"}));
+  auto y = output_fc(h);
 
-  return model;
+  return {x, y};
 }
 
 /**
@@ -200,18 +186,20 @@ int main(int argc, char *argv[]) {
     std::iota(train_idxes.begin(), train_idxes.end(), 0);
     rng.seed(SEED);
 
-    // Build model using ccapi layer construction (no INI file needed)
-    auto model = buildModel();
+    // Build symbolic graph
+    auto [x, y] = buildGraph();
 
-    auto status = model->compile();
+    auto model = createModel(ml::train::ModelType::NEURAL_NET,
+                             {"epochs=100", "loss=mse", "batch_size=20"});
+
+    auto optimizer = createOptimizer(
+      "adam", {"learning_rate=0.001", "beta1=0.9", "beta2=0.999",
+               "epsilon=1e-7"});
+    model->setOptimizer(std::move(optimizer));
+
+    auto status = model->compile(x, y);
     if (status != 0) {
       std::cerr << "Error during compile" << std::endl;
-      return 1;
-    }
-
-    status = model->initialize();
-    if (status != 0) {
-      std::cerr << "Error during initialize" << std::endl;
       return 1;
     }
 

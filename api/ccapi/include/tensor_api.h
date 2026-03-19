@@ -263,6 +263,22 @@ public:
   std::shared_ptr<Layer> getProducingLayer() const;
 
   /**
+   * @brief Get an indexed output of a multi-output layer (e.g., split)
+   *
+   * Creates a symbolic tensor referencing a specific output index of the
+   * producing layer. Used for layers like split that produce multiple outputs.
+   *
+   * Example:
+   *   auto split_out = split_layer(input);
+   *   auto first = split_out.output(0);   // split(0)
+   *   auto second = split_out.output(1);  // split(1)
+   *
+   * @param index Output index (0-based)
+   * @return New tensor referencing the indexed output
+   */
+  Tensor output(unsigned int index) const;
+
+  /**
    * @brief Get the input tensors that were fed to the producing layer
    *
    * @return Vector of input tensors (empty if this is an input/leaf tensor)
