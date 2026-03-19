@@ -569,3 +569,116 @@ def _load_conformer(model_dir, config, seq_len, verbose):
 
 
 CUSTOM_LOADERS["conformer"] = _load_conformer
+
+
+# ---------------------------------------------------------------------------
+# Zipformer loader  (model_type = "zipformer")
+# ---------------------------------------------------------------------------
+# Zipformer is a speech recognition model from k2-fsa/icefall.
+# It requires the icefall source (zipformer.py + scaling.py) to be
+# available in sys.path.
+
+def _load_zipformer(model_dir, config, seq_len, verbose):
+    """Load Zipformer2 model for tracing.
+
+    Expects either:
+    - A directory containing zipformer.py + scaling.py (icefall-style), or
+    - Config with Zipformer parameters to create a model from scratch.
+    """
+    import sys
+
+    # Try to import from model_dir first, then from well-known locations
+    zipformer_paths = [
+        model_dir,
+        os.path.join(model_dir, "zipformer"),
+        "/tmp/zipformer_standalone",
+    ]
+    for p in zipformer_paths:
+        if os.path.isfile(os.path.join(p, "zipformer.py")):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+            break
+
+    from zipformer import Zipformer2
+
+    # Extract config — Zipformer uses tuple params for multi-stack
+    num_stacks = getattr(config, "num_stacks", 2)
+    encoder_dim = getattr(config, "encoder_dim", None)
+    if encoder_dim is None:
+        hidden = getattr(config, "hidden_size", 384)
+        encoder_dim = tuple([hidden] * num_stacks)
+    elif isinstance(encoder_dim, int):
+        encoder_dim = tuple([encoder_dim] * num_stacks)
+
+    num_encoder_layers = getattr(config, "num_encoder_layers", None)
+    if num_encoder_layers is None:
+        n_layers = getattr(config, "num_hidden_layers", 4)
+        num_encoder_layers = tuple([n_layers] * num_stacks)
+    elif isinstance(num_encoder_layers, int):
+        num_encoder_layers = tuple([num_encoder_layers] * num_stacks)
+
+    ffn_dim = getattr(config, "feedforward_dim", None)
+    if ffn_dim is None:
+        inter = getattr(config, "intermediate_size", 1536)
+        ffn_dim = tuple([inter] * num_stacks)
+    elif isinstance(ffn_dim, int):
+        ffn_dim = tuple([ffn_dim] * num_stacks)
+
+    downsampling = getattr(config, "downsampling_factor", (1, 2))
+    if isinstance(downsampling, int):
+        downsampling = tuple([downsampling] * num_stacks)
+
+    cnn_kernel = getattr(config, "cnn_module_kernel", (31, 31))
+    if isinstance(cnn_kernel, int):
+        cnn_kernel = tuple([cnn_kernel] * num_stacks)
+
+    num_heads = getattr(config, "num_attention_heads",
+                        getattr(config, "num_heads", 8))
+    query_head_dim = getattr(config, "query_head_dim", 24)
+    pos_head_dim = getattr(config, "pos_head_dim", 4)
+    value_head_dim = getattr(config, "value_head_dim", 12)
+    pos_dim = getattr(config, "pos_dim", 192)
+
+    model = Zipformer2(
+        output_downsampling_factor=getattr(
+            config, "output_downsampling_factor", 2),
+        downsampling_factor=downsampling,
+        encoder_dim=encoder_dim,
+        num_encoder_layers=num_encoder_layers,
+        encoder_unmasked_dim=getattr(
+            config, "encoder_unmasked_dim",
+            tuple([min(256, d) for d in encoder_dim])),
+        query_head_dim=query_head_dim,
+        pos_head_dim=pos_head_dim,
+        value_head_dim=value_head_dim,
+        num_heads=num_heads,
+        feedforward_dim=ffn_dim,
+        cnn_module_kernel=cnn_kernel,
+        pos_dim=pos_dim,
+        dropout=0.0,
+        causal=False,
+    )
+    model.eval()
+
+    if verbose:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"  Zipformer model loaded: {n_params / 1e6:.1f}M params")
+        print(f"    encoder_dim={encoder_dim}, "
+              f"layers={num_encoder_layers}, heads={num_heads}")
+        print(f"    ffn_dim={ffn_dim}, "
+              f"downsampling={downsampling}, "
+              f"cnn_kernel={cnn_kernel}")
+
+    # Zipformer2.forward(x, x_lens) -> (output, output_lens)
+    # x shape: (batch, time, encoder_dim[0])
+    input_dim = encoder_dim[0] if isinstance(encoder_dim, tuple) else encoder_dim
+    time_steps = max(seq_len, 32)
+    input_kwargs = {
+        "x": torch.randn(1, time_steps, input_dim),
+        "x_lens": torch.tensor([time_steps]),
+    }
+
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["zipformer"] = _load_zipformer

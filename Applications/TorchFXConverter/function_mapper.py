@@ -13,7 +13,7 @@ from nntrainer_layers import (
     NNTrainerLayerDef,
     LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_CONCAT, LAYER_MATMUL,
     LAYER_SPLIT, LAYER_CLAMP, LAYER_IDENTITY, LAYER_GATHER, LAYER_POOLING2D,
-    LAYER_UPSAMPLE2D, LAYER_L2NORM,
+    LAYER_UPSAMPLE2D, LAYER_L2NORM, LAYER_FC,
     ACT_SWISH,
     OP_SDPA, OP_NOOP, OP_RESHAPE, OP_UNSUPPORTED,
 )
@@ -231,6 +231,15 @@ def map_function_node(node, node_to_layer):
     # === F.normalize -> preprocess_l2norm ===
     if func_name in FUNCTION_NORMALIZE_NAMES or func is F.normalize:
         return _map_normalize(node, scope, input_names)
+
+    # === F.linear (functional linear / fully connected) ===
+    if func_name == "linear":
+        return NNTrainerLayerDef(
+            layer_type=LAYER_FC,
+            name=make_scoped_name(scope, node),
+            input_layers=input_names,
+            hf_module_name=scope,
+        )
 
     # === torch.chunk / torch.split ===
     if func_name in ("chunk", "split"):

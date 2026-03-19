@@ -134,7 +134,7 @@ def infer_arch_type(structure, config, find_block_scopes_fn):
         elif model_type in ("siglip", "clip", "blip"):
             structure.arch_type = "vision_language"
             return
-        elif model_type in ("conformer",):
+        elif model_type in ("conformer", "zipformer"):
             structure.arch_type = "conformer"
             return
 

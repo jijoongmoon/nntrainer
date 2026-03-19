@@ -66,6 +66,7 @@ FUNCTION_SIMPLE_OPS = {
 FUNCTION_NAME_SIMPLE_OPS = {
     "exp":  LAYER_EXP,
     "log":  LAYER_LOG,
+    "pow":  LAYER_POW,
     "topk": LAYER_TOPK,
     "argsort": LAYER_ARGSORT,
     "outer": LAYER_MATMUL,  # torch.outer(a, b) ≈ matmul for 1D vectors
@@ -179,6 +180,7 @@ METHOD_SIMPLE_OPS = {
     "div_":   LAYER_DIVIDE,
     "__rdiv__":   LAYER_DIVIDE,    # reverse divide (scalar / tensor)
     "__rtruediv__": LAYER_DIVIDE,
+    "__floordiv__": LAYER_DIVIDE,  # floor division (integer division)
     "matmul": LAYER_MATMUL,
     "neg":    LAYER_NEGATIVE,
     "pow":    LAYER_POW,
@@ -227,6 +229,7 @@ METHOD_SHAPE_OPS = {
 # Method ops that map to OP_RESHAPE
 METHOD_RESHAPE_NAMES = frozenset({
     "unsqueeze", "squeeze", "repeat", "expand_as", "repeat_interleave",
+    "as_strided",  # advanced view manipulation (Zipformer attention)
 })
 
 # Method ops that map to OP_UNSUPPORTED with decomposition info
@@ -249,8 +252,9 @@ METHOD_NOOP_NAMES = frozenset({
     "new_ones", "new_zeros", "new_full", "new_empty",
     "fill_", "zero_", "masked_fill", "masked_fill_",
     "__bool__", "__or__", "__and__",
-    "__xor__", "__invert__",
+    "__xor__", "__invert__", "__eq__",
     "all", "any", "item",
+    "stride",  # tensor metadata query (used in as_strided patterns)
     # Comparison ops (T5 relative position bias)
     "gt", "lt", "le", "ge", "eq", "ne",
     # Position ID computation (see FUNCTION_NOOP_NAMES comment for cumsum)

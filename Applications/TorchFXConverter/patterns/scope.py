@@ -18,8 +18,9 @@ def find_block_scopes(layers):
         # Diffusion Transformer (DiT) patterns: FLUX, etc.
         r"(transformer_blocks\.\d+)",
         r"(single_transformer_blocks\.\d+)",
-        # Conformer (speech/audio) patterns
+        # Conformer / Zipformer (speech/audio) patterns
         r"(conformer_layers\.\d+)",
+        r"(encoders\.\d+\.(?:encoder\.)?layers\.\d+)",
     ]
 
     for layer in layers:
