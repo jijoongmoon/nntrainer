@@ -13,7 +13,7 @@ def _q(s):
 
 
 def _cpp_layer(layer_type, props, indent=2):
-    """Generate a createLayer() call as a list of C++ lines."""
+    """Generate a createLayer() call as a list of C++ lines (legacy string-based)."""
     pad = "  " * indent
     lines = []
     lines.append(pad + 'layers.push_back(createLayer("' + layer_type + '", {')
@@ -21,6 +21,42 @@ def _cpp_layer(layer_type, props, indent=2):
         comma = "," if i < len(props) - 1 else ""
         lines.append(pad + "  " + p + comma)
     lines.append(pad + "}));")
+    return lines
+
+
+def _cpp_tensor_layer(layer_type, var_name, props, input_expr, indent=1):
+    """Generate a symbolic tensor layer: create + call with input(s).
+
+    Generates code like:
+        LayerHandle var_lh = createLayer("type", {props...});
+        auto var = var_lh(input);
+    Or for multi-input (input_expr is a list):
+        auto var = var_lh({in1, in2});
+
+    Args:
+        layer_type: NNTrainer layer type string
+        var_name: C++ variable name for the output tensor
+        props: list of withKey() property strings (no input_layers!)
+        input_expr: single input expression string, or list of input
+                    expression strings for multi-input layers
+        indent: indentation level (default 1 = 2 spaces)
+
+    Returns:
+        list of C++ lines
+    """
+    pad = "  " * indent
+    lh_name = var_name + "_lh"
+    lines = []
+    lines.append(pad + f'LayerHandle {lh_name} = createLayer("{layer_type}", {{')
+    for i, p in enumerate(props):
+        comma = "," if i < len(props) - 1 else ""
+        lines.append(pad + "  " + p + comma)
+    lines.append(pad + "});")
+    if isinstance(input_expr, list):
+        inputs_str = ", ".join(input_expr)
+        lines.append(pad + f"auto {var_name} = {lh_name}({{{inputs_str}}});")
+    else:
+        lines.append(pad + f"auto {var_name} = {lh_name}({input_expr});")
     return lines
 
 

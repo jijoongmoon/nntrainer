@@ -1,6 +1,7 @@
-"""C++ constructModel() method generation."""
+"""C++ constructModel() method generation using symbolic Tensor API."""
 
-from .helpers import _cpp_layer, _class_name, get_file_base, get_norm_type
+from .helpers import (_cpp_layer, _cpp_tensor_layer, _class_name,
+                      get_file_base, get_norm_type)
 
 
 def emit_flat_source(layers, structure, model_name=None):
@@ -42,13 +43,17 @@ def emit_flat_source(layers, structure, model_name=None):
 
     L.append(f"void {cname}::constructModel() {{")
     L.append(f"")
-    L.append(f"  std::vector<std::shared_ptr<ml::train::Layer>> layers;")
-    L.append(f"")
     L.append(f"  // Create model")
     L.append(f"  model = ml::train::createModel("
              f"ml::train::ModelType::NEURAL_NET);")
     L.append(f"")
 
+    # Build symbolic tensor graph from flat layer list
+    L.append(f"  // Build symbolic tensor graph")
+    # For flat models, we still use addLayer since layers have explicit
+    # input_layers strings already set
+    L.append(f"  std::vector<std::shared_ptr<ml::train::Layer>> layers;")
+    L.append(f"")
     for layer in layers:
         L.append(f"  // {layer.layer_type}: {layer.name}")
         props = []
@@ -92,7 +97,7 @@ def emit_flat_source(layers, structure, model_name=None):
 
 
 def emit_construct_model(structure, block_type, is_hybrid, blocks_info):
-    """Generate constructModel() method body.
+    """Generate constructModel() method body using symbolic Tensor API.
 
     Args:
         structure: ModelStructure
@@ -107,37 +112,32 @@ def emit_construct_model(structure, block_type, is_hybrid, blocks_info):
 
     L.append(f"void {cname}::constructModel() {{")
     L.append(f"")
-    L.append(f"  std::vector<LayerHandle> layers;")
-    L.append(f"")
     L.append(f"  // Create model")
     L.append(f"  model = ml::train::createModel("
              f"ml::train::ModelType::NEURAL_NET);")
     L.append(f"")
 
-    # Input layer
-    L.append(f"  // Input layer")
-    L.extend(_cpp_layer("input", [
-        'withKey("name", "input0")',
-        'withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))',
-    ]))
+    # Symbolic input tensor
+    L.append(f"  // Symbolic input tensor")
+    L.append(f'  model_input_ = Tensor({{1, 1, 1, INIT_SEQ_LEN}}, "input0");')
     L.append(f"")
 
     # Embedding
     if s.embedding:
         _emit_embedding(L, s)
 
-    first_in = '"embedding0"' if s.embedding else '"input0"'
+    first_var = "embedded" if s.embedding else "model_input_"
 
     # External KV cache input layers
     if s.external_kv_cache:
         _emit_external_kv_cache_inputs(L, s)
 
     if s.arch_type == "encoder_decoder":
-        _emit_encoder_decoder_blocks(L, s, first_in, norm_type)
+        _emit_encoder_decoder_blocks(L, s, first_var, norm_type)
     elif is_hybrid:
-        _emit_hybrid_blocks(L, s, first_in, block_type, blocks_info)
+        _emit_hybrid_blocks(L, s, first_var, block_type, blocks_info)
     else:
-        _emit_standard_blocks(L, first_in, block_type)
+        _emit_standard_blocks(L, first_var, block_type)
 
     # Final norm (non-encoder-decoder)
     if s.arch_type != "encoder_decoder" and s.final_norm:
@@ -147,18 +147,15 @@ def emit_construct_model(structure, block_type, is_hybrid, blocks_info):
     if s.lm_head:
         _emit_lm_head(L, s)
 
-    # Add all layers
-    L.append(f"  // Add layers to model")
-    L.append(f"  for (auto &layer : layers) {{")
-    L.append(f"    model->addLayer(layer);")
-    L.append(f"  }}")
+    # Store model output (last computed tensor)
+    # model_output_ is set by _emit_lm_head or _emit_final_norm
     L.append(f"}}")
     L.append(f"")
     return "\n".join(L)
 
 
 def _emit_external_kv_cache_inputs(L, s):
-    """Emit external KV cache allocation and input layer creation."""
+    """Emit external KV cache allocation and input tensor creation."""
     L.append(f"  // External KV cache buffers")
     L.append(f"  size_t max_timestep = INIT_SEQ_LEN + NUM_TO_GENERATE;")
     L.append(f"  size_t kv_heads = NUM_KV_HEADS;")
@@ -172,49 +169,35 @@ def _emit_external_kv_cache_inputs(L, s):
     L.append(f'    std::string v_name = "ext_cache_val_" + std::to_string(i);')
     L.append(f"    key_cache_tensor_names[i] = k_name;")
     L.append(f"    val_cache_tensor_names[i] = v_name;")
-    L.append(f"")
-    L.append(f'    std::string cache_shape = std::to_string(kv_heads) + ":" +')
-    L.append(f'      std::to_string(max_timestep) + ":" +')
-    L.append(f'      std::to_string(HEAD_DIM);')
-    L.append(f'    layers.push_back(')
-    L.append(f'      createLayer("input", {{withKey("name", k_name),')
-    L.append(f'                             withKey("input_shape", cache_shape)}}));')
-    L.append(f'    layers.push_back(')
-    L.append(f'      createLayer("input", {{withKey("name", v_name),')
-    L.append(f'                             withKey("input_shape", cache_shape)}}));')
     L.append(f"  }}")
     L.append(f"")
 
 
 def _emit_embedding(L, s):
-    """Emit embedding layer section."""
+    """Emit embedding layer section using symbolic tensor API."""
     L.append(f"  // Embedding layer")
     if s.tie_word_embeddings:
         L.append(f'  const std::string embedding_type = '
                  f'TIE_WORD_EMBEDDINGS ? '
                  f'"tie_word_embeddings" : "embedding_layer";')
+        L.append(f"  LayerHandle embed_lh = createLayer(embedding_type, {{")
     else:
-        L.append(f'  const std::string embedding_type = '
-                 f'"embedding_layer";')
-    L.extend(_cpp_layer("\" + embedding_type + \"", [
-        'withKey("name", "embedding0")',
-        'withKey("in_dim", NUM_VOCAB)',
-        'withKey("out_dim", DIM)',
-    ]))
+        L.append(f'  LayerHandle embed_lh = createLayer("embedding_layer", {{')
+    L.append(f'    withKey("name", "embedding0"),')
+    L.append(f'    withKey("in_dim", NUM_VOCAB),')
+    L.append(f'    withKey("out_dim", DIM)')
+    L.append(f"  }});")
+    L.append(f"  auto embedded = embed_lh(model_input_);")
     L.append(f"")
 
 
-def _emit_encoder_decoder_blocks(L, s, first_in, norm_type):
-    """Emit encoder + decoder block loops."""
+def _emit_encoder_decoder_blocks(L, s, first_var, norm_type):
+    """Emit encoder + decoder block loops using symbolic tensors."""
     # Encoder blocks
     L.append(f"  // Encoder blocks")
+    L.append(f"  auto enc_x = {first_var};")
     L.append(f"  for (int i = 0; i < NUM_ENCODER_LAYERS; ++i) {{")
-    L.append(f'    std::string enc_in = (i == 0) ? {first_in}')
-    L.append(f'      : "enc_layer" + std::to_string(i - 1) '
-             f'+ "_block_output";')
-    L.append(f"    auto block = createEncoderBlock(i, enc_in);")
-    L.append(f"    layers.insert(layers.end(), "
-             f"block.begin(), block.end());")
+    L.append(f"    enc_x = createEncoderBlock(i, enc_x);")
     L.append(f"  }}")
     L.append(f"")
 
@@ -222,27 +205,21 @@ def _emit_encoder_decoder_blocks(L, s, first_in, norm_type):
     L.append(f"  // Encoder final normalization")
     enc_norm_props = [
         'withKey("name", "encoder_output_norm")',
-        'withKey("input_layers", "enc_layer" + '
-        'std::to_string(NUM_ENCODER_LAYERS - 1) + "_block_output")',
         'withKey("epsilon", NORM_EPS)',
     ]
     if norm_type == "rms_norm":
         enc_norm_props.append('withKey("packed", "false")')
     elif norm_type == "layer_normalization":
         enc_norm_props.append('withKey("axis", 3)')
-    L.extend(_cpp_layer(norm_type, enc_norm_props))
+    L.extend(_cpp_tensor_layer(norm_type, "encoder_normed",
+                               enc_norm_props, "enc_x"))
     L.append(f"")
 
     # Decoder blocks
     L.append(f"  // Decoder blocks")
+    L.append(f"  auto dec_x = {first_var};")
     L.append(f"  for (int i = 0; i < NUM_DECODER_LAYERS; ++i) {{")
-    L.append(f'    std::string dec_in = (i == 0) ? {first_in}')
-    L.append(f'      : "dec_layer" + std::to_string(i - 1) '
-             f'+ "_block_output";')
-    L.append(f'    auto block = createDecoderBlock(i, dec_in, '
-             f'"encoder_output_norm");')
-    L.append(f"    layers.insert(layers.end(), "
-             f"block.begin(), block.end());")
+    L.append(f"    dec_x = createDecoderBlock(i, dec_x, encoder_normed);")
     L.append(f"  }}")
     L.append(f"")
 
@@ -251,21 +228,18 @@ def _emit_encoder_decoder_blocks(L, s, first_in, norm_type):
         L.append(f"  // Decoder final normalization")
         dec_norm_props = [
             'withKey("name", "decoder_output_norm")',
-            'withKey("input_layers", "dec_layer" + '
-            'std::to_string(NUM_DECODER_LAYERS - 1) '
-            '+ "_block_output")',
             'withKey("epsilon", NORM_EPS)',
         ]
         if norm_type == "rms_norm":
             dec_norm_props.append('withKey("packed", "false")')
         elif norm_type == "layer_normalization":
             dec_norm_props.append('withKey("axis", 3)')
-        L.extend(_cpp_layer(norm_type, dec_norm_props))
+        L.extend(_cpp_tensor_layer(norm_type, "x", dec_norm_props, "dec_x"))
         L.append(f"")
 
 
-def _emit_hybrid_blocks(L, s, first_in, block_type, blocks_info):
-    """Emit hybrid block loop (multiple operator types)."""
+def _emit_hybrid_blocks(L, s, first_var, block_type, blocks_info):
+    """Emit hybrid block loop (multiple operator types) using symbolic tensors."""
     op_type_list = blocks_info["op_type_list"]
     L.append(f"  // Layer types: {op_type_list}")
     L.append(f"  const std::vector<std::string> LAYER_TYPES = {{")
@@ -275,11 +249,8 @@ def _emit_hybrid_blocks(L, s, first_in, block_type, blocks_info):
     L.append(f"  }};")
     L.append(f"")
     L.append(f"  // Hybrid blocks ({' + '.join(sorted(set(op_type_list)))})")
+    L.append(f"  auto x = {first_var};")
     L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
-    L.append(f'    std::string input_name = (i == 0) ? {first_in}')
-    L.append(f'      : "layer" + std::to_string(i - 1) '
-             f'+ "_decoder_output";')
-    L.append(f'    std::vector<LayerHandle> block;')
 
     for idx, op_type in enumerate(sorted(set(op_type_list))):
         op_label = op_type.capitalize() if op_type != "attention" \
@@ -289,50 +260,40 @@ def _emit_hybrid_blocks(L, s, first_in, block_type, blocks_info):
                   else f"create{op_label}{block_type}")
         keyword = "if" if idx == 0 else "} else if"
         L.append(f'    {keyword} (LAYER_TYPES[i] == "{op_type}") {{')
-        L.append(f"      block = {method}(i, input_name);")
+        L.append(f"      x = {method}(i, x);")
     L.append(f"    }}")
 
-    L.append(f"    layers.insert(layers.end(), "
-             f"block.begin(), block.end());")
     L.append(f"  }}")
     L.append(f"")
 
 
-def _emit_standard_blocks(L, first_in, block_type):
-    """Emit standard transformer block loop."""
+def _emit_standard_blocks(L, first_var, block_type):
+    """Emit standard transformer block loop using symbolic tensors."""
     L.append(f"  // Transformer blocks")
+    L.append(f"  auto x = {first_var};")
     L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
-    L.append(f'    std::string input_name = (i == 0) ? {first_in}')
-    L.append(f'      : "layer" + std::to_string(i - 1) '
-             f'+ "_decoder_output";')
-    L.append(f"    auto block = createTransformer{block_type}"
-             f"(i, input_name);")
-    L.append(f"    layers.insert(layers.end(), "
-             f"block.begin(), block.end());")
+    L.append(f"    x = createTransformer{block_type}(i, x);")
     L.append(f"  }}")
     L.append(f"")
 
 
 def _emit_final_norm(L, norm_type):
-    """Emit final normalization layer."""
+    """Emit final normalization layer using symbolic tensor API."""
     L.append(f"  // Final normalization")
     norm_props = [
         'withKey("name", "output_norm")',
-        'withKey("input_layers", "layer" + '
-        'std::to_string(NUM_LAYERS - 1)'
-        ' + "_decoder_output")',
         'withKey("epsilon", NORM_EPS)',
     ]
     if norm_type == "rms_norm":
         norm_props.append('withKey("packed", "false")')
     elif norm_type == "layer_normalization":
         norm_props.append('withKey("axis", 3)')
-    L.extend(_cpp_layer(norm_type, norm_props))
+    L.extend(_cpp_tensor_layer(norm_type, "x", norm_props, "x"))
     L.append(f"")
 
 
 def _emit_lm_head(L, s):
-    """Emit LM head layer."""
+    """Emit LM head layer using symbolic tensor API."""
     L.append(f"  // LM head")
     if s.tie_word_embeddings:
         L.append(f'  const std::string lmhead_type = '
@@ -341,15 +302,20 @@ def _emit_lm_head(L, s):
     else:
         L.append(f'  const std::string lmhead_type = '
                  f'"fully_connected";')
-    lm_input = ("decoder_output_norm" if s.arch_type == "encoder_decoder"
-                else "output_norm")
     lm_props = [
         'withKey("name", "output_of_causallm")',
         'withKey("unit", NUM_VOCAB)',
         'withKey("disable_bias", "true")',
-        f'withKey("input_layers", "{lm_input}")',
     ]
     if s.tie_word_embeddings:
         lm_props.append('withKey("shared_from", "embedding0")')
-    L.extend(_cpp_layer("\" + lmhead_type + \"", lm_props))
+    if s.tie_word_embeddings:
+        L.append(f"  LayerHandle lm_head_lh = createLayer(lmhead_type, {{")
+    else:
+        L.append(f'  LayerHandle lm_head_lh = createLayer(lmhead_type, {{')
+    for i, p in enumerate(lm_props):
+        comma = "," if i < len(lm_props) - 1 else ""
+        L.append(f"    {p}{comma}")
+    L.append(f"  }});")
+    L.append(f"  model_output_ = lm_head_lh(x);")
     L.append(f"")

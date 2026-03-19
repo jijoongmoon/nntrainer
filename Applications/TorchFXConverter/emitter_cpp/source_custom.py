@@ -134,7 +134,8 @@ def emit_allocate_kv_cache(cname):
 def emit_initialize(cname, external_kv_cache=False):
     """Generate initialize() method that wires up the full model pipeline.
 
-    Calls registerCustomLayers() -> constructModel() -> compile -> initialize.
+    Uses symbolic Tensor API: constructModel() builds the tensor graph,
+    then model->compile(input, output) extracts and compiles the graph.
 
     Args:
         cname: C++ class name
@@ -158,12 +159,10 @@ def emit_initialize(cname, external_kv_cache=False):
     L.append(f'    withKey("model_tensor_type", "FP32-FP32")')
     L.append(f"  }});")
     L.append(f"")
-    L.append(f"  if (model->compile(ml::train::ExecutionMode::INFERENCE)) {{")
+    L.append(f"  // Compile from symbolic tensor graph")
+    L.append(f"  if (model->compile(model_input_, model_output_, "
+             f"ml::train::ExecutionMode::INFERENCE)) {{")
     L.append(f'    throw std::invalid_argument("Model compilation failed.");')
-    L.append(f"  }}")
-    L.append(f"")
-    L.append(f"  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {{")
-    L.append(f'    throw std::invalid_argument("Model initialization failed.");')
     L.append(f"  }}")
     L.append(f"}}")
     L.append(f"")
