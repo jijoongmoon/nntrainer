@@ -142,11 +142,10 @@ def emit_flat_source(layers, structure, model_name=None):
     # initialize
     L.append(f"void {cname}::initialize() {{")
     L.append(f"  registerCustomLayers();")
+    L.append(f"  // constructModel() builds symbolic tensor graph,")
+    L.append(f"  // compile and initialize are done internally by")
+    L.append(f"  // model->compile(inputs, outputs, mode)")
     L.append(f"  constructModel();")
-    L.append(f"")
-    L.append(f"  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {{")
-    L.append(f'    throw std::invalid_argument("Model initialization failed.");')
-    L.append(f"  }}")
     L.append(f"}}")
     L.append(f"")
 
