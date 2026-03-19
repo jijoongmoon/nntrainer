@@ -20,7 +20,7 @@ from nntrainer_layers import (
     LAYER_EXP, LAYER_LOG, LAYER_CLAMP,
     LAYER_REDUCE_MEAN, LAYER_REDUCE_SUM, LAYER_FLATTEN,
     LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_CONCAT, LAYER_POOLING2D,
-    LAYER_GATHER, LAYER_SLICE, LAYER_TOPK, LAYER_ARGSORT,
+    LAYER_GATHER, LAYER_SLICE, LAYER_TOPK, LAYER_ARGSORT, LAYER_L2NORM,
     LAYER_LOSS_MSE, LAYER_LOSS_CROSS_ENTROPY_SOFTMAX,
     LAYER_LOSS_CROSS_ENTROPY_SIGMOID, LAYER_LOSS_KLD,
     ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
@@ -183,6 +183,7 @@ METHOD_SIMPLE_OPS = {
     "pow":    LAYER_POW,
     "__rpow__":   LAYER_POW,       # reverse pow (scalar ** tensor)
     "sqrt":   LAYER_SQRT,
+    "norm":   LAYER_L2NORM,     # tensor.norm() computes L2 norm
     # Trigonometric
     "cos":    LAYER_COS,
     "sin":    LAYER_SIN,
@@ -219,6 +220,7 @@ METHOD_SHAPE_OPS = {
     "unflatten": OP_RESHAPE,
     "permute":   OP_PERMUTE,
     "transpose": OP_TRANSPOSE,
+    "t":         OP_TRANSPOSE,    # .t() is 2D transpose
 }
 
 # Method ops that map to OP_RESHAPE

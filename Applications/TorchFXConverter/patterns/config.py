@@ -56,6 +56,24 @@ def extract_config_metadata(structure, config):
     structure.conv_l_cache = safe_cfg_int(
         config, "conv_L_cache", default=0)
 
+    # Vision-language models (SigLIP, CLIP, BLIP) have nested sub-configs.
+    # Extract vision_config metadata if main config has no hidden_size.
+    if not structure.hidden_size:
+        vision_cfg = getattr(config, "vision_config", None)
+        if vision_cfg is not None:
+            structure.hidden_size = safe_cfg_int(
+                vision_cfg, "hidden_size")
+            structure.num_heads = safe_cfg_int(
+                vision_cfg, "num_attention_heads")
+            structure.num_kv_heads = structure.num_heads
+            structure.head_dim = (
+                structure.hidden_size // structure.num_heads
+                if structure.num_heads else 0)
+            structure.intermediate_size = safe_cfg_int(
+                vision_cfg, "intermediate_size")
+            structure.norm_eps = safe_cfg_float(
+                vision_cfg, "layer_norm_eps", "rms_norm_eps")
+
     # SSM / Mamba config
     structure.ssm_state_size = safe_cfg_int(
         config, "state_size", "ssm_state_size", default=0)
@@ -112,6 +130,9 @@ def infer_arch_type(structure, config, find_block_scopes_fn):
             return
         elif model_type in ("flux",):
             structure.arch_type = "diffusion_transformer"
+            return
+        elif model_type in ("siglip", "clip", "blip"):
+            structure.arch_type = "vision_language"
             return
 
         architectures = getattr(config, "architectures", []) or []
