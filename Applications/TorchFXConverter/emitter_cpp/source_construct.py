@@ -47,6 +47,12 @@ def emit_flat_source(layers, structure, model_name=None):
     L.append(f"  model = ml::train::createModel("
              f"ml::train::ModelType::NEURAL_NET);")
     L.append(f"")
+    L.append(f'  model->setProperty({{')
+    L.append(f'    withKey("batch_size", 1),')
+    L.append(f'    withKey("epochs", "1"),')
+    L.append(f'    withKey("model_tensor_type", "FP32-FP32")')
+    L.append(f"  }});")
+    L.append(f"")
 
     # Build symbolic Tensor graph for flat models
     # Find input layers and regular layers
@@ -165,6 +171,12 @@ def emit_construct_model(structure, block_type, is_hybrid, blocks_info):
     L.append(f"  // Create model")
     L.append(f"  model = ml::train::createModel("
              f"ml::train::ModelType::NEURAL_NET);")
+    L.append(f"")
+    L.append(f'  model->setProperty({{')
+    L.append(f'    withKey("batch_size", 1),')
+    L.append(f'    withKey("epochs", "1"),')
+    L.append(f'    withKey("model_tensor_type", "FP32-FP32")')
+    L.append(f"  }});")
     L.append(f"")
 
     # Input tensor (symbolic)

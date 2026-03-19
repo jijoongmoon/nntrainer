@@ -731,12 +731,36 @@ Tensor Tensor::reshape(const TensorDim &new_shape) const {
  */
 static TensorDim inferOutputDim(const std::shared_ptr<Layer> &layer,
                                 const std::vector<Tensor> &inputs) {
+  std::string layer_type = layer->getType();
+
+  // Input layer: parse shape from input_shape property
+  if (layer_type == "input") {
+    try {
+      std::string shape_str = layer->getProperty("input_shape");
+      if (!shape_str.empty()) {
+        // Parse "B:C:H:W" or "C:H:W" format
+        std::vector<unsigned int> dims;
+        std::stringstream ss(shape_str);
+        std::string token;
+        while (std::getline(ss, token, ':')) {
+          dims.push_back(static_cast<unsigned int>(std::stoul(token)));
+        }
+        if (dims.size() == 4) {
+          return TensorDim({dims[0], dims[1], dims[2], dims[3]});
+        } else if (dims.size() == 3) {
+          return TensorDim({1, dims[0], dims[1], dims[2]});
+        }
+      }
+    } catch (...) {
+      // Fall through
+    }
+  }
+
   if (inputs.empty() || !inputs[0].isValid()) {
     return TensorDim();
   }
 
   const TensorDim &in_dim = inputs[0].shape();
-  std::string layer_type = layer->getType();
 
   // Fully connected: output = {batch, 1, 1, unit}
   if (layer_type == "fully_connected") {
@@ -801,8 +825,10 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
     } else {
       // Leaf tensor — create a leaf edge with no producer
       auto leaf = std::make_shared<SymbolicGraphNode>();
-      leaf->dim = inp.shape();
-      leaf->name = inp.name();
+      if (inp.isValid()) {
+        leaf->dim = inp.shape();
+        leaf->name = inp.name();
+      }
       edge->inputs.push_back(leaf);
     }
   }
@@ -886,6 +912,18 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
           // Leaf tensor
           std::string leaf_name = inp ? inp->name : "";
           if (leaf_name.empty()) {
+            // Empty leaf from Tensor() — this is the sentinel input to an
+            // input layer. Check if the current edge's producing layer is an
+            // input layer; if so, skip this leaf entirely since the input
+            // layer itself serves as the graph entry point (no input_layers).
+            if (edge->producing_layer) {
+              try {
+                if (edge->producing_layer->getType() == "input") {
+                  // Input layer's sentinel leaf — skip, no input_layers needed
+                  continue;
+                }
+              } catch (...) {}
+            }
             leaf_name = "ext_input_" + std::to_string(unnamed_leaf_counter++);
           }
           if (input_leaf_names.count(leaf_name)) {
@@ -909,7 +947,17 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
     }
   }
 
-  // 1. Create and add input layers
+  // 1. Create and add input layers (skip if already in DFS-discovered graph)
+  //    When constructModel() already creates input layers via
+  //    LayerHandle(createLayer("input",...)), the DFS walk will have found
+  //    them. In that case, skip creating duplicate input layers.
+  std::set<std::string> discovered_layer_names;
+  for (auto &li : layers_in_order) {
+    try {
+      discovered_layer_names.insert(li.layer->getName());
+    } catch (...) {}
+  }
+
   int status;
   for (auto &inp : inputs) {
     std::string inp_name = inp.name();
@@ -919,6 +967,35 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
           ? "graph_input"
           : "graph_input_" + std::to_string(&inp - &inputs[0]);
     }
+
+    // If this input's producing layer was already discovered by DFS, skip
+    if (inp.impl_ && inp.impl_->graph_edge &&
+        inp.impl_->graph_edge->producing_layer) {
+      std::string prod_name;
+      try {
+        prod_name = inp.impl_->graph_edge->producing_layer->getName();
+      } catch (...) {}
+      if (!prod_name.empty() && discovered_layer_names.count(prod_name)) {
+        continue;  // Input layer already in the graph
+      }
+    }
+
+    // Also skip if a layer with the same name was already discovered
+    // (handles the case where inp_name matches an output name like "input0:output")
+    bool already_has_input = false;
+    for (auto &li : layers_in_order) {
+      try {
+        if (li.layer->getType() == "input" &&
+            li.layer->getName() == inp_name) {
+          already_has_input = true;
+          break;
+        }
+      } catch (...) {}
+    }
+    if (already_has_input) continue;
+
+    if (!inp.isValid()) continue;  // skip invalid tensors
+
     const TensorDim &dim = inp.shape();
     std::string shape_str = std::to_string(dim.channel()) + ":" +
                              std::to_string(dim.height()) + ":" +
@@ -946,13 +1023,15 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
 
   // 2. Add each layer in topological order with input_layers set
   for (auto &info : layers_in_order) {
-    std::string input_layers_str;
-    for (size_t i = 0; i < info.input_layer_names.size(); ++i) {
-      if (i > 0)
-        input_layers_str += ",";
-      input_layers_str += info.input_layer_names[i];
+    if (!info.input_layer_names.empty()) {
+      std::string input_layers_str;
+      for (size_t i = 0; i < info.input_layer_names.size(); ++i) {
+        if (i > 0)
+          input_layers_str += ",";
+        input_layers_str += info.input_layer_names[i];
+      }
+      info.layer->setProperty({"input_layers=" + input_layers_str});
     }
-    info.layer->setProperty({"input_layers=" + input_layers_str});
     status = addLayer(info.layer);
     if (status != ML_ERROR_NONE) {
       return status;
