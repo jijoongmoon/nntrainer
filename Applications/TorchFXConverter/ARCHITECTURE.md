@@ -607,7 +607,321 @@ flowchart LR
     Structure --> JSON
 ```
 
-## 5. NNTrainer Layer Type Mapping
+## 5. NNTrainer Symbolic Tensor Graph — Class Diagram
+
+The generated C++ code uses the symbolic tensor graph API. This diagram shows
+the runtime class relationships in NNTrainer (C++ side).
+
+```mermaid
+classDiagram
+    direction TB
+
+    class Tensor {
+        -unique_ptr~Impl~ impl_
+        +Tensor()
+        +Tensor(TensorDim dim, string name)
+        +isValid() bool
+        +isMaterialized() bool
+        +isExternal() bool
+        +shape() TensorDim
+        +name() string
+        +getProducingLayer() shared_ptr~Layer~
+        +getInputTensors() vector~Tensor~
+        +output(unsigned index) Tensor
+        +add(Tensor other) Tensor
+        +multiply(Tensor other) Tensor
+        +reshape(TensorDim dim) Tensor
+        +dot(Tensor other, bool trans, bool trans_in) Tensor
+        +sum(unsigned axis) Tensor
+        +average(unsigned axis) Tensor
+        +chain() Tensor
+        +add_i(float) Tensor
+        +multiply_i(float) Tensor
+        +eval() Tensor
+        +clone() Tensor
+        +data~T~() T*
+        +mutable_data~T~() T*
+        +size() size_t
+        +fromData(TensorDim, void*)$ Tensor
+        +zeros(TensorDim)$ Tensor
+        +ones(TensorDim)$ Tensor
+    }
+
+    class TensorImpl["Tensor::Impl"] {
+        +TensorDim dim
+        +string name
+        +bool valid
+        +bool external
+        +shared_ptr~nntrainer_Tensor~ eager_data
+        +void* external_ptr
+        +shared_ptr~Layer~ src_layer
+        +shared_ptr~SymbolicGraphNode~ graph_edge
+        +nntrainer_Tensor* bound_tensor
+        +vector~function~ call_chain
+    }
+
+    class SymbolicGraphNode {
+        +shared_ptr~Layer~ producing_layer
+        +vector~shared_ptr_SymbolicGraphNode~ inputs
+        +TensorDim dim
+        +string name
+        +int output_index
+    }
+
+    class LayerHandle {
+        -shared_ptr~Layer~ ptr_
+        +LayerHandle()
+        +LayerHandle(unique_ptr~Layer~ p)
+        +LayerHandle(shared_ptr~Layer~ p)
+        +operator()(Tensor input) Tensor
+        +operator()(vector~Tensor~ inputs) Tensor
+        +operator shared_ptr~Layer~()
+        +get() Layer*
+        +layer() shared_ptr~Layer~
+    }
+
+    class Layer {
+        <<abstract>>
+        +getType() string*
+        +initialize()*
+        +setProperty(vector~string~)*
+        +getProperty(string key) string*
+        +getName() string*
+        +getWeights() vector~float_ptr~*
+        +setWeights(vector~float_ptr~)*
+    }
+
+    class Model {
+        <<abstract>>
+        +compile(ExecutionMode) int*
+        +compile(Tensor input, Tensor output, ExecutionMode) int
+        +compile(Tensor input, vector~Tensor~ outputs, ExecutionMode) int
+        +compile(vector~Tensor~ inputs, vector~Tensor~ outputs, ExecutionMode) int
+        +addLayer(shared_ptr~Layer~) int*
+        +initialize(ExecutionMode) int*
+        +allocate(ExecutionMode) int*
+        +train() int*
+        +save(string path, ModelFormat)*
+        +load(string path, ModelFormat)*
+        +forEachLayer(function fn)*
+    }
+
+    class NeuralNetwork {
+        -NetworkGraphType model_graph
+        -GraphType layers
+        +compile(ExecutionMode) int
+        +initialize(ExecutionMode) int
+        +allocate(ExecutionMode) int
+        +addLayer(shared_ptr~Layer~) int
+    }
+
+    class Connection {
+        -unsigned index
+        -string name
+        +Connection(string layer_name, unsigned idx)
+        +toString() string
+        +getName() string
+        +getIndex() unsigned
+    }
+
+    %% Composition & Association
+    Tensor *-- TensorImpl : impl_ (pimpl)
+    TensorImpl o-- SymbolicGraphNode : graph_edge (shared)
+    SymbolicGraphNode --> Layer : producing_layer
+    SymbolicGraphNode --> SymbolicGraphNode : inputs[]
+    LayerHandle --> Layer : ptr_
+    LayerHandle ..> Tensor : creates via operator()
+    LayerHandle ..> SymbolicGraphNode : builds graph edges
+    Model --> Layer : addLayer()
+    Model ..> Tensor : compile(Tensor, Tensor)
+    NeuralNetwork --|> Model : implements
+    NeuralNetwork --> Connection : internal wiring
+
+    %% Factory
+    Layer <.. createLayer : «creates»
+```
+
+### Key Design Patterns
+
+| Pattern | Where | Why |
+|---|---|---|
+| **Pimpl** | `Tensor → Impl` | Hide C++ internals from public API |
+| **Shared graph edges** | `shared_ptr<SymbolicGraphNode>` | Avoid O(N!) deep copy on Tensor copy |
+| **Callable wrapper** | `LayerHandle::operator()` | Enable `h = fc(x)` graph construction syntax |
+| **Two-phase compile** | Symbolic graph → `compile(Tensor,Tensor)` | Decouple graph definition from execution |
+
+## 6. NNTrainer Symbolic Tensor Graph — Sequence Diagrams
+
+### 6.1 Model Construction (Graph Building Phase)
+
+```mermaid
+sequenceDiagram
+    participant App as Application Code
+    participant LH as LayerHandle
+    participant CF as createLayer()
+    participant L as Layer
+    participant T as Tensor
+    participant SGN as SymbolicGraphNode
+
+    Note over App: === Build Symbolic Graph ===
+
+    App->>T: Tensor({1,1,28,28}, "input0")
+    T->>T: Create Impl with dim, name, valid=true
+    Note over T: Symbolic input tensor (no data)
+
+    App->>CF: createLayer("conv2d", {"filters=32", ...})
+    CF-->>LH: LayerHandle(unique_ptr<Layer>)
+
+    App->>LH: conv(input_tensor)
+    LH->>L: inferOutputDim(input.shape())
+    L-->>LH: output_dim
+    LH->>SGN: new SymbolicGraphNode
+    Note over SGN: producing_layer = conv_layer<br/>inputs = [input.graph_edge]<br/>dim = output_dim
+    LH->>T: Create output Tensor
+    T->>T: impl_->graph_edge = SGN
+    LH-->>App: output Tensor
+
+    App->>CF: createLayer("fully_connected", {"unit=10"})
+    CF-->>LH: LayerHandle(fc_layer)
+
+    App->>LH: fc(conv_output)
+    LH->>SGN: new SymbolicGraphNode
+    Note over SGN: producing_layer = fc_layer<br/>inputs = [conv_output.graph_edge]
+    LH-->>App: fc_output Tensor
+
+    Note over App: Graph is now:<br/>input → conv2d → fc
+```
+
+### 6.2 Model Construction — Multi-Input (Residual / Concat)
+
+```mermaid
+sequenceDiagram
+    participant App as Application Code
+    participant LH as LayerHandle
+    participant T as Tensor
+    participant SGN as SymbolicGraphNode
+
+    Note over App: === Branch & Merge ===
+
+    App->>App: Tensor x = backbone(input)
+
+    Note over App: Branch A
+    App->>LH: conv_a(x)
+    LH-->>App: branch_a Tensor
+
+    Note over App: Branch B
+    App->>LH: conv_b(x)
+    LH-->>App: branch_b Tensor
+
+    Note over App: Merge via multi-input call
+    App->>LH: add_layer({branch_a, branch_b})
+    LH->>SGN: new SymbolicGraphNode
+    Note over SGN: producing_layer = Addition<br/>inputs = [branch_a.edge, branch_b.edge]
+    LH-->>App: merged Tensor
+
+    Note over App: Graph is now a DAG:<br/>x → conv_a ─┐<br/>x → conv_b ─┤<br/>            └→ Addition → merged
+```
+
+### 6.3 Model Compilation (Graph Extraction Phase)
+
+```mermaid
+sequenceDiagram
+    participant App as Application Code
+    participant M as Model (NeuralNetwork)
+    participant T as Tensor
+    participant SGN as SymbolicGraphNode
+    participant NG as NetworkGraph
+
+    Note over App: === Compile from Tensor Graph ===
+
+    App->>M: model->compile(input, output, INFERENCE)
+
+    Note over M: Phase 1: DFS backward from output
+    M->>T: output.getProducingLayer()
+    T->>SGN: graph_edge->producing_layer
+    SGN-->>M: fc_layer
+
+    M->>T: output.getInputTensors()
+    T->>SGN: graph_edge->inputs
+    SGN-->>M: [conv_output Tensor]
+
+    M->>T: conv_output.getProducingLayer()
+    SGN-->>M: conv_layer
+
+    M->>T: conv_output.getInputTensors()
+    SGN-->>M: [input Tensor]
+    Note over M: Reached input → stop DFS<br/>Collected: [conv_layer, fc_layer]<br/>Topological order established
+
+    Note over M: Phase 2: Create input layers
+    M->>M: addLayer("input", name="input0",<br/>  input_shape="1:28:28")
+
+    Note over M: Phase 3: Add computation layers
+    M->>M: addLayer(conv_layer,<br/>  input_layers="input0")
+    M->>M: addLayer(fc_layer,<br/>  input_layers="conv_layer_name")
+
+    Note over M: Phase 4–6: Standard compilation
+    M->>NG: compile(INFERENCE)
+    NG->>NG: Validate shapes, build execution graph
+    M->>NG: initialize(INFERENCE)
+    NG->>NG: Initialize layer weights
+    M->>NG: allocate(INFERENCE)
+    NG->>NG: Allocate tensor memory buffers
+
+    Note over M: Phase 7: Bind API Tensors
+    M->>T: input.impl_->eager_data = allocated buffer
+    M->>T: output.impl_->bound_tensor = output buffer
+
+    M-->>App: status = ML_ERROR_NONE
+    Note over App: Model ready for inference
+```
+
+### 6.4 End-to-End: TorchFXConverter → C++ Build → Inference
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Conv as TorchFXConverter<br/>(Python)
+    participant Emitter as CppEmitter
+    participant FS as Generated Files
+    participant Build as meson + ninja
+    participant App as Generated C++ App
+    participant NNTR as libnntrainer.so
+
+    User->>Conv: converter.py --model qwen3 --format cpp
+
+    Note over Conv: Trace → Map → Detect Patterns
+    Conv->>Emitter: emit(layers, structure)
+
+    Note over Emitter: Generate symbolic tensor graph code
+    Emitter->>FS: model.h (class decl)
+    Emitter->>FS: model.cpp containing:
+
+    Note over FS: constructModel() {<br/>  Tensor input = input_layer(Tensor());<br/>  Tensor x = embedding(input);<br/>  for (i : layers)<br/>    x = createBlock(i, x);<br/>  Tensor out = lmhead(x);<br/>  model->compile(input, out);<br/>}
+
+    Conv->>FS: weights.bin (optional)
+
+    User->>Build: meson setup && ninja
+    Build->>Build: Compile model.cpp + main.cpp
+    Build->>NNTR: Link libnntrainer.so
+
+    User->>App: ./model_test
+
+    Note over App: 1. constructModel()
+    App->>App: Build symbolic Tensor graph
+    App->>NNTR: model->compile(input, output)
+
+    Note over NNTR: DFS graph extraction<br/>→ addLayer() for each<br/>→ compile → init → allocate
+
+    NNTR-->>App: Model compiled
+
+    Note over App: 2. Inference
+    App->>App: Fill input tensor with token IDs
+    App->>NNTR: model->incremental_inference()
+    NNTR-->>App: Output logits
+    App->>App: argmax → next token
+```
+
+## 7. NNTrainer Layer Type Mapping
 
 Key PyTorch → NNTrainer layer type mappings used by the converter:
 
@@ -665,7 +979,7 @@ NNTrainer uses 4D `[Batch, Channel, Height, Width]` tensors. PyTorch tensors are
 
 Formula: `nchw_axis = pytorch_dim + (4 - tensor_rank)` for dims > 0.
 
-## 6. Plugin System — Custom LayerPluggable Support
+## 8. Plugin System — Custom LayerPluggable Support
 
 The converter supports user-defined custom layer mappings via the Plugin System,
 which integrates with NNTrainer's `LayerPluggable` interface for dynamic layer loading.
