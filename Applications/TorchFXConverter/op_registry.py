@@ -23,7 +23,7 @@ from nntrainer_layers import (
     LAYER_GATHER, LAYER_SLICE, LAYER_TOPK, LAYER_ARGSORT, LAYER_L2NORM,
     LAYER_LOSS_MSE, LAYER_LOSS_CROSS_ENTROPY_SOFTMAX,
     LAYER_LOSS_CROSS_ENTROPY_SIGMOID, LAYER_LOSS_KLD,
-    ACT_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
+    ACT_RELU, ACT_LEAKY_RELU, ACT_GELU, ACT_SWISH, ACT_SIGMOID, ACT_TANH, ACT_SOFTMAX,
     OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE, OP_SDPA, OP_NOOP, OP_UNSUPPORTED,
 )
 
@@ -105,6 +105,7 @@ FUNCTION_ACTIVATION_OPS = {
     F.silu:     ACT_SWISH,
     F.gelu:     ACT_GELU,
     F.relu:     ACT_RELU,
+    F.leaky_relu: ACT_LEAKY_RELU,
     F.softmax:  ACT_SOFTMAX,
     torch.sigmoid: ACT_SIGMOID,
 }
@@ -112,6 +113,7 @@ FUNCTION_ACTIVATION_OPS = {
 # Function activation by name (for torch.tanh / F.tanh ambiguity)
 FUNCTION_ACTIVATION_NAMES = {
     "tanh": ACT_TANH,
+    "leaky_relu": ACT_LEAKY_RELU,
     "log_softmax": ACT_SOFTMAX,  # log_softmax ≈ softmax for NNTrainer mapping
     "glu": ACT_SIGMOID,  # GLU(x) = x_a * sigmoid(x_b); map to sigmoid activation
 }

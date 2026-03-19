@@ -327,6 +327,23 @@ GEMMA3N_CONFIG = {
     "laurel_rank": 8,
 }
 
+# --- Object Detection models ---
+
+# YOLOv2: 13-layer CNN backbone with branching (reorg + concat)
+YOLOV2_CONFIG = {
+    "model_type": "yolov2",
+    "num_classes": 5,
+    "num_anchors": 5,
+    "image_size": 416,
+}
+
+# YOLOv3: Darknet53 backbone + Feature Pyramid Network + 3 detection heads
+YOLOV3_CONFIG = {
+    "model_type": "yolov3",
+    "num_classes": 5,
+    "image_size": 416,
+}
+
 # --- Encoder-Decoder models ---
 
 # T5Gemma2-270M: Gemma2-based encoder-decoder (multimodal)
@@ -727,6 +744,14 @@ class TestConverterBuildAndRun(unittest.TestCase):
     def test_gemma3n_conversion(self):
         """Gemma3n: FX trace and full layer mapping (AltUp + Laurel)."""
         self._run_custom_conversion_test("gemma3n", GEMMA3N_CONFIG)
+
+    def test_yolov2_conversion(self):
+        """YOLOv2: FX trace and full layer mapping (CNN + reorg + concat)."""
+        self._run_custom_conversion_test("yolov2", YOLOV2_CONFIG)
+
+    def test_yolov3_conversion(self):
+        """YOLOv3: FX trace and full layer mapping (Darknet53 + FPN)."""
+        self._run_custom_conversion_test("yolov3", YOLOV3_CONFIG)
 
     def _run_custom_conversion_test(self, name, config_dict):
         """Run conversion-only test for custom (non-HF) models.

@@ -173,6 +173,7 @@ LAYER_MHA = "multi_head_attention"
 
 # Activation type strings (for LAYER_ACTIVATION)
 ACT_RELU = "relu"
+ACT_LEAKY_RELU = "leaky_relu"
 ACT_GELU = "gelu"
 ACT_SWISH = "swish"  # SiLU = Swish
 ACT_SIGMOID = "sigmoid"

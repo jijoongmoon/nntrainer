@@ -682,3 +682,93 @@ def _load_zipformer(model_dir, config, seq_len, verbose):
 
 
 CUSTOM_LOADERS["zipformer"] = _load_zipformer
+
+
+# ─── YOLOv2 ───────────────────────────────────────────────────────────
+
+def _load_yolov2(model_dir, config, seq_len, verbose):
+    """Load YOLOv2 model from nntrainer Applications/YOLOv2."""
+    import sys as _sys
+    import os as _os
+    import importlib as _il
+
+    yolov2_path = _os.path.abspath(
+        _os.path.join(_os.path.dirname(__file__), "..", "YOLOv2", "PyTorch"))
+    # Ensure correct yolo module is loaded (avoid name clash with YOLOv3)
+    _sys.modules.pop("yolo", None)
+    if yolov2_path not in _sys.path:
+        _sys.path.insert(0, yolov2_path)
+    else:
+        # Move to front so YOLOv2's yolo.py is found first
+        _sys.path.remove(yolov2_path)
+        _sys.path.insert(0, yolov2_path)
+
+    import yolo as _yolo_mod
+    _il.reload(_yolo_mod)
+    YoloV2 = _yolo_mod.YoloV2
+
+    num_classes = getattr(config, "num_classes", 5)
+    num_anchors = getattr(config, "num_anchors", 5)
+    image_size = getattr(config, "image_size", 416)
+
+    model = YoloV2(num_classes=num_classes, num_anchors=num_anchors)
+    model.eval()
+
+    if verbose:
+        n = sum(p.numel() for p in model.parameters())
+        print(f"  [yolov2] {n/1e6:.2f}M params, "
+              f"classes={num_classes}, anchors={num_anchors}, "
+              f"img={image_size}")
+
+    input_kwargs = {"x": torch.randn(1, 3, image_size, image_size)}
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["yolov2"] = _load_yolov2
+
+
+# ─── YOLOv3 ───────────────────────────────────────────────────────────
+
+def _load_yolov3(model_dir, config, seq_len, verbose):
+    """Load YOLOv3 model from nntrainer Applications/YOLOv3."""
+    import sys as _sys
+    import os as _os
+    import types as _types
+    import importlib as _il
+
+    # YOLOv3's yolo.py imports torchconverter (a local util); mock it out
+    if "torchconverter" not in _sys.modules:
+        _mock = _types.ModuleType("torchconverter")
+        _mock.save_bin = lambda *a, **kw: None
+        _sys.modules["torchconverter"] = _mock
+
+    yolov3_path = _os.path.abspath(
+        _os.path.join(_os.path.dirname(__file__), "..", "YOLOv3", "PyTorch"))
+    # Ensure correct yolo module is loaded (avoid name clash with YOLOv2)
+    _sys.modules.pop("yolo", None)
+    if yolov3_path not in _sys.path:
+        _sys.path.insert(0, yolov3_path)
+    else:
+        _sys.path.remove(yolov3_path)
+        _sys.path.insert(0, yolov3_path)
+
+    import yolo as _yolo_mod
+    _il.reload(_yolo_mod)
+    YoloV3 = _yolo_mod.YoloV3
+
+    num_classes = getattr(config, "num_classes", 5)
+    image_size = getattr(config, "image_size", 416)
+
+    model = YoloV3(num_classes=num_classes)
+    model.eval()
+
+    if verbose:
+        n = sum(p.numel() for p in model.parameters())
+        print(f"  [yolov3] {n/1e6:.2f}M params, "
+              f"classes={num_classes}, img={image_size}")
+
+    input_kwargs = {"x": torch.randn(1, 3, image_size, image_size)}
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["yolov3"] = _load_yolov3
