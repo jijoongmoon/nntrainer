@@ -61,10 +61,11 @@ MHACoreLayer::~MHACoreLayer() {}
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 4,
+  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
                 std::invalid_argument)
-    << "Multi head Attention layer needs 3 or 4 inputs. (query, key, value and "
-       "mask is optional)";
+    << "MHACoreLayer needs 3-5 inputs. (query, key, value, and optional "
+       "external cache_key, cache_value)";
+  use_external_cache = context.getNumInputs() >= 4;
   ml::train::TensorDim::TensorType activation_type = {
     context.getFormat(), context.getActivationDataType()};
   ml::train::TensorDim empty_dim(activation_type);
@@ -152,12 +153,14 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
 #endif
 
-  tensor_idx[AttentionParams::cache_key] = context.requestTensor(
-    cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
+  if (!use_external_cache) {
+    tensor_idx[AttentionParams::cache_key] = context.requestTensor(
+      cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::MAX_LIFESPAN);
+    tensor_idx[AttentionParams::cache_value] = context.requestTensor(
+      cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::MAX_LIFESPAN);
-  tensor_idx[AttentionParams::cache_value] = context.requestTensor(
-    cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
-    nntrainer::TensorLifespan::MAX_LIFESPAN);
+  }
 
   theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
 
@@ -230,10 +233,16 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &output =
     context.getOutput(INOUT_INDEX::OUTPUT); // output to be projected
 
+  const unsigned int ext_cache_key_idx = context.getNumInputs() - 2;
+  const unsigned int ext_cache_value_idx = context.getNumInputs() - 1;
   nntrainer::Tensor &cache_key =
-    context.getTensor(tensor_idx[AttentionParams::cache_key]);
+    use_external_cache
+      ? context.getInput(ext_cache_key_idx)
+      : context.getTensor(tensor_idx[AttentionParams::cache_key]);
   nntrainer::Tensor &cache_value =
-    context.getTensor(tensor_idx[AttentionParams::cache_value]);
+    use_external_cache
+      ? context.getInput(ext_cache_value_idx)
+      : context.getTensor(tensor_idx[AttentionParams::cache_value]);
 
   nntrainer::Tensor sink;
   if (use_sink) {
@@ -1063,9 +1072,10 @@ void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
 
   const float dropout_rate =
     std::get<nntrainer::props::DropOutRate>(mha_core_props).get();
-  context.updateTensor(tensor_idx[AttentionParams::cache_key], batch);
-  context.updateTensor(tensor_idx[AttentionParams::cache_value], batch);
-  // context.updateTensor(tensor_idx[AttentionParams::attention_weight], batch);
+  if (!use_external_cache) {
+    context.updateTensor(tensor_idx[AttentionParams::cache_key], batch);
+    context.updateTensor(tensor_idx[AttentionParams::cache_value], batch);
+  }
   if (dropout_rate > epsilon) {
     context.updateTensor(tensor_idx[AttentionParams::dropout_mask], batch);
   }
@@ -1101,8 +1111,10 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   context.updateInput(INOUT_INDEX::VALUE, kv_dim);
   context.updateOutput(0, input_dimensions[0]);
 
-  context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
-  context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
+  if (!use_external_cache) {
+    context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
+    context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
+  }
 }
 
 void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}

@@ -295,6 +295,12 @@ private:
   float epsilon;            /** to avoid overflow */
   unsigned int cache_index; /** idx of kv cache */
 
+  /**
+   * @brief Whether to use externally provided cache tensors
+   *        (true when num_inputs >= 4, i.e., Q, K, V + ext caches)
+   */
+  bool use_external_cache = false;
+
   /** intermal info */
   size_t num_heads_Q;
   size_t num_heads_KV;

@@ -28,6 +28,7 @@
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
+#include <tensor_api.h>
 #include <tokenizers_cpp.h>
 
 #include <embedding_layer.h>
@@ -142,10 +143,9 @@ void CausalLM::initialize() {
   // RegisterCustomLayers
   registerCustomLayers();
 
-  // construct causalLM model
-  constructModel();
+  // setup model property (must be set before constructModel which calls compile)
+  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
 
-  // setup model property
   std::vector<std::string> model_props = {
     withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
     withKey("model_tensor_type", MODEL_TENSOR_TYPE)};
@@ -156,9 +156,8 @@ void CausalLM::initialize() {
 
   model->setProperty(model_props);
 
-  if (model->compile(ml::train::ExecutionMode::INFERENCE)) {
-    throw std::invalid_argument("Model compilation failed.");
-  }
+  // construct and compile causalLM model via symbolic tensor graph
+  constructModel();
 
   if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {
     throw std::invalid_argument("Model initialization failed.");
@@ -173,63 +172,80 @@ void CausalLM::initialize() {
 
 void CausalLM::constructModel() {
 
-  // layers used in the model
-  std::vector<LayerHandle> layers;
+  using ml::train::createLayer;
 
-  // create model
-  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
-
-  // create input layer
-  layers.push_back(createLayer(
+  // create input tensor
+  LayerHandle input_layer = createLayer(
     "input", {withKey("name", "input0"),
-              withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
+              withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))});
+  Tensor input = input_layer(Tensor());
 
   // create embedding layer
   const std::string embedding_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
   const std::string lmhead_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "fully_connected";
-  layers.push_back(createLayer(
+  LayerHandle embedding = createLayer(
     embedding_type,
     {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
-     "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM)}));
+     "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM)});
+  Tensor x = embedding(input);
+
+  // allocate external KV cache buffers and create input tensors for them
+  size_t max_timestep = INIT_SEQ_LEN + NUM_TO_GENERATE;
+  size_t kv_heads = NUM_HEADS / GQA_SIZE;
+  size_t cache_size = BATCH_SIZE * kv_heads * max_timestep * HEAD_DIM;
+  kv_cache_buffers.allocate(NUM_LAYERS, cache_size);
+  key_cache_tensors.resize(NUM_LAYERS);
+  val_cache_tensors.resize(NUM_LAYERS);
+
+  std::vector<Tensor> all_inputs;
+  all_inputs.push_back(input);
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    std::string k_name = "ext_cache_key_" + std::to_string(i);
+    std::string v_name = "ext_cache_val_" + std::to_string(i);
+
+    std::string cache_shape = std::to_string(kv_heads) + ":" +
+                              std::to_string(max_timestep) + ":" +
+                              std::to_string(HEAD_DIM);
+    LayerHandle k_input = createLayer(
+      "input", {withKey("name", k_name), withKey("input_shape", cache_shape)});
+    LayerHandle v_input = createLayer(
+      "input", {withKey("name", v_name), withKey("input_shape", cache_shape)});
+    key_cache_tensors[i] = k_input(Tensor());
+    val_cache_tensors[i] = v_input(Tensor());
+    all_inputs.push_back(key_cache_tensors[i]);
+    all_inputs.push_back(val_cache_tensors[i]);
+  }
 
   // create transformer layers
   for (int i = 0; i < NUM_LAYERS; ++i) {
-    std::vector<LayerHandle> transformer;
-    if (i == 0)
-      transformer = createTransformerDecoderBlock(0, "embedding0");
-    else
-      transformer = createTransformerDecoderBlock(
-        i, "layer" + std::to_string(i - 1) + "_decoder_output");
-    layers.insert(layers.end(), transformer.begin(), transformer.end());
+    x = createTransformerDecoderBlock(i, x);
   }
 
   // create rms_norm
-  layers.push_back(createLayer(
-    "rms_norm",
-    {withKey("name", "output_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("input_layers",
-             "layer" + std::to_string(NUM_LAYERS - 1) + "_decoder_output"),
-     withKey("packed", "false")}));
+  LayerHandle output_norm = createLayer(
+    "rms_norm", {withKey("name", "output_norm"),
+                 withKey("epsilon", std::to_string(NORM_EPS)),
+                 withKey("packed", "false")});
+  x = output_norm(x);
 
   // add lmhead
   std::vector<std::string> lmhead_prop = {
     withKey("name", "output_of_causallm"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
-    withKey("input_layers", "output_norm"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
   if (TIE_WORD_EMBEDDINGS)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
-  layers.push_back(createLayer(lmhead_type, lmhead_prop));
+  LayerHandle lmhead = createLayer(lmhead_type, lmhead_prop);
+  Tensor output = lmhead(x);
 
-  // add created layers into the model
-  for (auto &layer : layers) {
-    model->addLayer(layer);
-  }
+  // compile model from symbolic tensor graph
+  std::vector<Tensor> outputs = {output};
+  model->compile(all_inputs, outputs, ml::train::ExecutionMode::INFERENCE);
 };
 
 void CausalLM::load_weight(const std::string &weight_path) {
@@ -562,147 +578,133 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
   return outputs;
 };
 
-std::vector<LayerHandle>
-CausalLM::createTransformerDecoderBlock(const int layer_id,
-                                        std::string input_name) {
+Tensor CausalLM::createTransformerDecoderBlock(const int layer_id,
+                                                Tensor input) {
 
-  std::vector<LayerHandle> layers;
+  using ml::train::createLayer;
 
-  layers.push_back(createLayer(
+  // attention norm
+  LayerHandle att_norm = createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-     withKey("input_layers", input_name),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("packed", "false")});
+  Tensor normed = att_norm(input);
 
-  auto att_layer =
-    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
-                    "layer" + std::to_string(layer_id) + "_attention_norm",
-                    "layer" + std::to_string(layer_id) + "_attention_norm",
-                    "layer" + std::to_string(layer_id) + "_attention_norm");
+  // self attention
+  Tensor att_out =
+    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM, normed,
+                    normed, normed);
 
-  layers.insert(layers.end(), att_layer.begin(), att_layer.end());
+  // residual add
+  Tensor residual = input.add(att_out);
 
-  layers.push_back(createLayer(
-    "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"),
-     withKey("input_layers", input_name + ",layer" + std::to_string(layer_id) +
-                               "_attention_out")}));
-
-  layers.push_back(createLayer(
+  // ffn norm
+  LayerHandle ffn_norm = createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_decoder_add"),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("packed", "false")});
+  Tensor ffn_normed = ffn_norm(residual);
 
-  auto ffn_layer = createMlp(layer_id, DIM, INTERMEDIATE_SIZE,
-                             "layer" + std::to_string(layer_id) + "_ffn_norm");
-  layers.insert(layers.end(), ffn_layer.begin(), ffn_layer.end());
+  // feed forward
+  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
 
-  layers.push_back(createLayer(
-    "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) +
-                               "_decoder_add,layer" + std::to_string(layer_id) +
-                               "_ffn_down")}));
+  // residual add
+  Tensor decoder_out = residual.add(ffn_out);
 
-  return layers;
+  return decoder_out;
 }
 
-std::vector<LayerHandle>
-CausalLM::createAttention(const int layer_id, int seq_len, int n_heads,
-                          int head_dim, std::string query_name,
-                          std::string key_name, std::string value_name) {
+Tensor CausalLM::createAttention(const int layer_id, int seq_len, int n_heads,
+                                  int head_dim, Tensor query, Tensor key,
+                                  Tensor value) {
 
-  std::vector<LayerHandle> layers;
+  using ml::train::createLayer;
 
-  auto Q = "layer" + std::to_string(layer_id) + "_wq";
-  auto K = "layer" + std::to_string(layer_id) + "_wk";
-  auto V = "layer" + std::to_string(layer_id) + "_wv";
-  auto A = "layer" + std::to_string(layer_id) + "_attention";
-  auto O = "layer" + std::to_string(layer_id) + "_attention_out";
+  auto Q_name = "layer" + std::to_string(layer_id) + "_wq";
+  auto K_name = "layer" + std::to_string(layer_id) + "_wk";
+  auto V_name = "layer" + std::to_string(layer_id) + "_wv";
+  auto A_name = "layer" + std::to_string(layer_id) + "_attention";
+  auto O_name = "layer" + std::to_string(layer_id) + "_attention_out";
 
-  // V layer
-  std::vector<std::string> v_params = {
-    withKey("name", V), withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true"), withKey("input_layers", value_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", v_params));
+  // V projection
+  LayerHandle v_proj = createLayer(
+    "fully_connected",
+    {withKey("name", V_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor v = v_proj(value);
 
-  // K layer
-  std::vector<std::string> k_params = {
-    withKey("name", K), withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true"), withKey("input_layers", key_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", k_params));
+  // K projection
+  LayerHandle k_proj = createLayer(
+    "fully_connected",
+    {withKey("name", K_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor k = k_proj(key);
 
-  // Q layer
-  std::vector<std::string> q_params = {
-    withKey("name", Q), withKey("unit", head_dim * n_heads),
-    withKey("disable_bias", "true"), withKey("input_layers", query_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", q_params));
+  // Q projection
+  LayerHandle q_proj = createLayer(
+    "fully_connected",
+    {withKey("name", Q_name), withKey("unit", head_dim * n_heads),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor q = q_proj(query);
 
-  // Attention core layer
-  std::vector<std::string> a_params = {
-    withKey("name", A),
-    withKey("num_heads", n_heads),
-    withKey("num_heads_kv", n_heads / GQA_SIZE),
-    withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
-    withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
-                                ? SLIDING_WINDOW
-                                : UINT_MAX),
-    withKey("rope_theta", ROPE_THETA),
-    withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-    withKey("input_layers", {Q, K, V})};
-  layers.push_back(createLayer("mha_core", a_params));
+  // Attention core layer (5-input: Q, K, V, ext_cache_key, ext_cache_val)
+  LayerHandle attn = createLayer(
+    "mha_core",
+    {withKey("name", A_name), withKey("num_heads", n_heads),
+     withKey("num_heads_kv", n_heads / GQA_SIZE),
+     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+     withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
+                                 ? SLIDING_WINDOW
+                                 : UINT_MAX),
+     withKey("rope_theta", ROPE_THETA),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE))});
+  Tensor a = attn({q, k, v, key_cache_tensors[layer_id],
+                   val_cache_tensors[layer_id]});
 
-  // O layer
-  std::vector<std::string> o_params = {
-    withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "true"),
-    withKey("input_layers", A), withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", o_params));
+  // O projection
+  LayerHandle o_proj = createLayer(
+    "fully_connected",
+    {withKey("name", O_name), withKey("unit", DIM),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor o = o_proj(a);
 
-  return layers;
+  return o;
 }
 
-std::vector<LayerHandle> CausalLM::createMlp(const int layer_id, int dim,
-                                             int hidden_dim,
-                                             std::string input_name) {
+Tensor CausalLM::createMlp(const int layer_id, int dim, int hidden_dim,
+                            Tensor input) {
 
-  std::vector<LayerHandle> layers;
+  using ml::train::createLayer;
 
-  layers.push_back(createLayer(
+  LayerHandle ffn_up = createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("input_layers", input_name),
-     withKey("weight_initializer", "ones")}));
-  layers.push_back(createLayer(
+     withKey("weight_initializer", "ones")});
+  Tensor up = ffn_up(input);
+
+  LayerHandle ffn_gate = createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("input_layers", input_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones")});
+  Tensor gate = ffn_gate(input);
 
-  layers.push_back(createLayer(
+  LayerHandle swiglu = createLayer(
     "swiglu",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_up," +
-                               "layer" + std::to_string(layer_id) +
-                               "_ffn_gate")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")});
+  Tensor activated = swiglu({up, gate});
 
-  layers.push_back(createLayer(
+  LayerHandle ffn_down = createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones")});
+  Tensor down = ffn_down(activated);
 
-  return layers;
+  return down;
 }
 
 void CausalLM::registerCustomLayers() {
@@ -765,27 +767,17 @@ void CausalLM::save_kvcache(std::string path, int to_) {
   auto f = nntrainer::checkedOpenStream<std::ofstream>(
     path, std::ios::out | std::ios::binary | std::ios::trunc);
 
-  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
-              void *idx) {
-      if (l.getType() == causallm::MHACoreLayer::type) {
-        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
-        auto k_cache = context.getTensor(0);
-        auto v_cache = context.getTensor(1);
-        ml::train::TensorDim k_dim = k_cache.getDim();
-        ml::train::TensorDim v_dim = v_cache.getDim();
-        k_dim.height(to);
-        v_dim.height(to);
-        nntrainer::Tensor k_cache_prompt =
-          k_cache.getSharedDataTensor(k_dim, 0, true);
-        nntrainer::Tensor v_cache_prompt =
-          v_cache.getSharedDataTensor(v_dim, 0, true);
-        k_cache_prompt.save(f);
-        v_cache_prompt.save(f);
-      }
-    };
-  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
-  model->forEachLayer(fn, arg);
+  size_t kv_heads = NUM_HEADS / GQA_SIZE;
+  size_t partial_size = BATCH_SIZE * kv_heads * to_ * HEAD_DIM;
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    f.write(reinterpret_cast<const char *>(
+              kv_cache_buffers.key_buffers[i].data()),
+            partial_size * sizeof(float));
+    f.write(reinterpret_cast<const char *>(
+              kv_cache_buffers.value_buffers[i].data()),
+            partial_size * sizeof(float));
+  }
   f.close();
 }
 
@@ -795,28 +787,15 @@ void CausalLM::load_kvcache(std::string path, int to_) {
 
   model->allocate(ml::train::ExecutionMode::INFERENCE);
 
-  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
-              void *idx) {
-      if (l.getType() == causallm::MHACoreLayer::type) {
-        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
-        auto k_cache = context.getTensor(0);
-        auto v_cache = context.getTensor(1);
-        ml::train::TensorDim k_dim = k_cache.getDim();
-        ml::train::TensorDim v_dim = v_cache.getDim();
-        k_dim.height(to);
-        v_dim.height(to);
-        nntrainer::Tensor k_cache_prompt =
-          k_cache.getSharedDataTensor(k_dim, 0, true);
-        nntrainer::Tensor v_cache_prompt =
-          v_cache.getSharedDataTensor(v_dim, 0, true);
-        k_cache_prompt.read(f);
-        v_cache_prompt.read(f);
-      }
-    };
-  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
+  size_t kv_heads = NUM_HEADS / GQA_SIZE;
+  size_t partial_size = BATCH_SIZE * kv_heads * to_ * HEAD_DIM;
 
-  model->forEachLayer(fn, arg);
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    f.read(reinterpret_cast<char *>(kv_cache_buffers.key_buffers[i].data()),
+           partial_size * sizeof(float));
+    f.read(reinterpret_cast<char *>(kv_cache_buffers.value_buffers[i].data()),
+           partial_size * sizeof(float));
+  }
   f.close();
 }
 
