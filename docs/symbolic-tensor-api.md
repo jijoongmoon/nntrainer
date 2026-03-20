@@ -3,26 +3,26 @@
 > **Status**: Experimental (`ml::train` namespace)
 > **Minimum C++ Version**: C++17
 
-NNTrainer의 Symbolic Tensor API는 PyTorch/Keras 스타일의 함수형 모델 정의를 C++에서 가능하게 합니다. 기존의 문자열 기반 `addLayer()` 방식 대신, **텐서를 인자로 레이어를 호출**하여 연산 그래프를 구성하고, `Model::compile(input, output)`으로 자동 추출합니다.
+NNTrainer's Symbolic Tensor API enables PyTorch/Keras-style functional model definition in C++. Instead of the traditional string-based `addLayer()` approach, you **call layers with tensors as arguments** to construct a computation graph, then extract it automatically via `Model::compile(input, output)`.
 
-## 목차
+## Table of Contents
 
 - [Quick Start](#quick-start)
-- [핵심 개념](#핵심-개념)
+- [Core Concepts](#core-concepts)
 - [API Reference](#api-reference)
   - [Tensor](#tensor)
   - [LayerHandle](#layerhandle)
-  - [Model::compile 오버로드](#modelcompile-오버로드)
+  - [Model::compile Overloads](#modelcompile-overloads)
 - [Lazy Chaining](#lazy-chaining)
-- [아키텍처 다이어그램](#아키텍처-다이어그램)
+- [Architecture Diagrams](#architecture-diagrams)
   - [Class Diagram](#class-diagram)
-  - [Tensor 생명주기 (State Diagram)](#tensor-생명주기)
-  - [그래프 구성 및 컴파일 (Sequence Diagram)](#그래프-구성-및-컴파일)
+  - [Tensor Lifecycle (State Diagram)](#tensor-lifecycle)
+  - [Graph Construction & Compilation (Sequence Diagram)](#graph-construction--compilation)
   - [Lazy Chaining (Sequence Diagram)](#lazy-chaining-sequence)
-  - [API 레벨 비교 (Component Diagram)](#api-레벨-비교)
-  - [String-based vs Symbolic 비교](#string-based-vs-symbolic-비교)
-- [실전 예제](#실전-예제)
-- [파일 위치](#파일-위치)
+  - [API Level Comparison (Component Diagram)](#api-level-comparison)
+  - [String-based vs Symbolic](#string-based-vs-symbolic)
+- [Examples](#examples)
+- [File Locations](#file-locations)
 
 ---
 
@@ -34,10 +34,10 @@ NNTrainer의 Symbolic Tensor API는 PyTorch/Keras 스타일의 함수형 모델 
 
 using namespace ml::train;
 
-// 1. 심볼릭 입력 텐서 생성
+// 1. Create symbolic input tensor
 Tensor input({1, 1, 1, 784}, "input");
 
-// 2. 레이어를 LayerHandle로 감싸서 호출
+// 2. Wrap layers in LayerHandle and call them
 LayerHandle fc1 = createLayer("fully_connected", {"unit=128", "name=fc1"});
 LayerHandle relu = createLayer("activation", {"activation=relu", "name=relu1"});
 LayerHandle fc2 = createLayer("fully_connected", {"unit=10", "name=fc2"});
@@ -46,11 +46,11 @@ auto h = fc1(input);
 h = relu(h);
 auto output = fc2(h);
 
-// 3. 모델에 입출력 텐서를 전달하여 그래프 자동 추출 + 컴파일
+// 3. Pass input/output tensors to auto-extract graph + compile
 auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-model->compile(input, output);  // compile + initialize + allocate 한번에
+model->compile(input, output);  // compile + initialize + allocate in one call
 
-// 4. 추론
+// 4. Run inference
 float data[784] = { /* ... */ };
 input.copyFrom(data);
 auto results = model->inference(1, {data});
@@ -58,16 +58,16 @@ auto results = model->inference(1, {data});
 
 ---
 
-## 핵심 개념
+## Core Concepts
 
-| 개념 | 설명 |
-|------|------|
-| **Symbolic Tensor** | 차원과 이름만 가진 플레이스홀더. 실제 데이터 없음 |
-| **Eager Tensor** | `zeros()`, `ones()`, `fromData()`로 생성. 즉시 데이터 보유 |
-| **LayerHandle** | `createLayer()` 결과를 감싸고, `operator()`로 그래프 엣지 생성 |
-| **SymbolicGraphNode** | 내부 DAG 노드. producing_layer + inputs로 그래프 구성 |
-| **Materialization** | `Model::compile()` 후 심볼릭 텐서가 실제 메모리에 바인딩됨 |
-| **Lazy Chaining** | `chain().add_i().multiply_i().eval()`로 연산을 지연 실행 |
+| Concept | Description |
+|---------|-------------|
+| **Symbolic Tensor** | A placeholder with only shape and name. No actual data. |
+| **Eager Tensor** | Created via `zeros()`, `ones()`, `fromData()`. Holds data immediately. |
+| **LayerHandle** | Wraps `createLayer()` result; `operator()` creates graph edges. |
+| **SymbolicGraphNode** | Internal DAG node. Stores producing_layer + inputs. |
+| **Materialization** | After `Model::compile()`, symbolic tensors are bound to real memory. |
+| **Lazy Chaining** | Deferred execution via `chain().add_i().multiply_i().eval()`. |
 
 ---
 
@@ -75,104 +75,104 @@ auto results = model->inference(1, {data});
 
 ### Tensor
 
-#### 생성
+#### Construction
 
 ```cpp
-// 심볼릭 텐서 (그래프 플레이스홀더)
+// Symbolic tensor (graph placeholder)
 Tensor input(TensorDim({1, 1, 28, 28}), "input");
 
-// Eager 텐서 (즉시 데이터 보유)
+// Eager tensors (immediate data)
 auto zeros = Tensor::zeros({1, 1, 3, 3});
 auto ones  = Tensor::ones({1, 1, 3, 3});
 
-// 외부 메모리 래핑 (zero-copy)
+// Wrap external memory (zero-copy)
 float buf[12];
 auto ext = Tensor::fromData({1, 1, 3, 4}, buf, "cache");
 ```
 
-#### 상태 조회
+#### State Queries
 
-| 메서드 | 반환 | 설명 |
-|--------|------|------|
-| `isValid()` | `bool` | 유효하게 생성되었는지 |
-| `isMaterialized()` | `bool` | 실제 데이터에 접근 가능한지 |
-| `isExternal()` | `bool` | `fromData()`로 생성된 외부 메모리인지 |
-| `shape()` | `TensorDim` | 텐서 차원 |
-| `name()` | `string` | 텐서 이름 |
-| `dtype()` | `DataType` | 데이터 타입 (기본 FP32) |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `isValid()` | `bool` | Whether the tensor has been properly constructed |
+| `isMaterialized()` | `bool` | Whether actual data is accessible |
+| `isExternal()` | `bool` | Whether it wraps user-managed memory via `fromData()` |
+| `shape()` | `TensorDim` | Tensor dimensions |
+| `name()` | `string` | Tensor name |
+| `dtype()` | `DataType` | Data type (default FP32) |
 
-#### 데이터 접근 (Materialized 상태 필요)
+#### Data Access (Requires Materialized State)
 
 ```cpp
-const float *ptr = tensor.data<float>();      // 읽기 전용
-float *mptr = tensor.mutable_data<float>();    // 쓰기 가능
-float val = tensor.getValue(b, c, h, w);       // 개별 값 읽기
-tensor.setValue(b, c, h, w, 42.0f);            // 개별 값 쓰기
-tensor.copyFrom(src_buffer);                    // 외부 버퍼에서 복사
+const float *ptr = tensor.data<float>();      // Read-only access
+float *mptr = tensor.mutable_data<float>();    // Mutable access
+float val = tensor.getValue(b, c, h, w);       // Read single value
+tensor.setValue(b, c, h, w, 42.0f);            // Write single value
+tensor.copyFrom(src_buffer);                    // Copy from external buffer
 ```
 
-#### 심볼릭 연산 (암시적 레이어 생성)
+#### Symbolic Operations (Create Implicit Layers)
 
 ```cpp
-auto c = a.add(b);       // Addition 레이어 자동 생성
-auto c = a.multiply(b);  // Multiply 레이어 자동 생성
-auto y = x.reshape(dim); // Reshape 레이어 자동 생성
+auto c = a.add(b);       // Creates an implicit Addition layer
+auto c = a.multiply(b);  // Creates an implicit Multiply layer
+auto y = x.reshape(dim); // Creates an implicit Reshape layer
 ```
 
-#### Eager 연산 (새 텐서 반환)
+#### Eager Operations (Return New Tensors)
 
 ```cpp
-auto r = t.add(5.0f);           // 스칼라 덧셈
-auto r = t.subtract(other);     // 텐서 뺄셈
-auto r = t.multiply(3.0f);      // 스칼라 곱셈
-auto r = t.divide(other);       // 텐서 나눗셈
-auto r = t.dot(other);          // 행렬 곱
-auto r = t.transpose("0:2:1");  // 전치
-auto r = t.pow(2.0f);           // 거듭제곱
-auto r = t.sum(axis);           // 축 합산
-auto r = t.average();           // 전체 평균
-float n = t.l2norm();           // L2 노름
-auto ids = t.argmax();          // 최대값 인덱스
+auto r = t.add(5.0f);           // Scalar addition
+auto r = t.subtract(other);     // Tensor subtraction
+auto r = t.multiply(3.0f);      // Scalar multiplication
+auto r = t.divide(other);       // Tensor division
+auto r = t.dot(other);          // Matrix multiplication
+auto r = t.transpose("0:2:1");  // Transpose
+auto r = t.pow(2.0f);           // Power
+auto r = t.sum(axis);           // Sum along axis
+auto r = t.average();           // Global average
+float n = t.l2norm();           // L2 norm
+auto ids = t.argmax();          // Argmax indices
 ```
 
-#### 그래프 탐색
+#### Graph Traversal
 
 ```cpp
-auto layer = output.getProducingLayer();   // 이 텐서를 생성한 레이어
-auto inputs = output.getInputTensors();    // 입력 텐서들
-auto out0 = split_out.output(0);           // 다중 출력 레이어의 i번째 출력
+auto layer = output.getProducingLayer();   // Layer that produced this tensor
+auto inputs = output.getInputTensors();    // Input tensors to producing layer
+auto out0 = split_out.output(0);           // i-th output of a multi-output layer
 ```
 
 ### LayerHandle
 
 ```cpp
-// createLayer 결과를 직접 대입 (암시적 변환)
+// Directly assign from createLayer (implicit conversion)
 LayerHandle fc = createLayer("fully_connected", {"unit=256", "name=fc1"});
 
-// 단일 입력
+// Single input
 auto output = fc(input);
 
-// 다중 입력 (MHA 등)
+// Multiple inputs (e.g., MHA)
 auto attn = mha({q, k, v});
 
-// Layer 속성 접근
+// Access layer properties
 fc->getName();   // "fc1"
 fc->getType();   // "fully_connected"
 ```
 
-### Model::compile 오버로드
+### Model::compile Overloads
 
 ```cpp
-// 단일 입력, 단일 출력
+// Single input, single output
 model->compile(input, output);
 
-// 단일 입력, 다중 출력
+// Single input, multiple outputs
 model->compile(input, {out1, out2});
 
-// 다중 입력, 다중 출력
+// Multiple inputs, multiple outputs
 model->compile({in1, in2}, {out1, out2});
 
-// ExecutionMode 지정
+// Specify execution mode
 model->compile(input, output, ExecutionMode::INFERENCE);
 ```
 
@@ -180,7 +180,7 @@ model->compile(input, output, ExecutionMode::INFERENCE);
 
 ## Lazy Chaining
 
-Materialized 텐서에 대해 여러 in-place 연산을 **지연 실행**할 수 있습니다.
+Queue multiple in-place operations on a materialized tensor for **deferred batch execution**.
 
 ```cpp
 auto t = Tensor::ones({1, 1, 2, 2});
@@ -190,23 +190,23 @@ t.chain()
   .add_i(2.0f)
   .multiply_i(3.0f)
   .subtract_i(1.0f)
-  .eval();  // 여기서 일괄 실행
+  .eval();  // All operations execute here
 
-// 텐서 간 연산도 가능
+// Tensor-tensor operations are also supported
 auto other = Tensor::ones({1, 1, 2, 2});
 t.chain().add_i(other, 0.5f).eval();
 ```
 
-**지원 연산**: `add_i`, `subtract_i`, `multiply_i`, `divide_i`, `pow_i`, `inv_sqrt_i`
+**Supported operations**: `add_i`, `subtract_i`, `multiply_i`, `divide_i`, `pow_i`, `inv_sqrt_i`
 
-**규칙**:
-- `chain()`은 이전 대기 연산을 초기화
-- `eval()`은 대기열의 연산을 순서대로 실행한 후 대기열을 비움
-- Materialized 상태가 아닌 텐서에 `eval()`을 호출하면 예외 발생
+**Rules**:
+- `chain()` clears any previously queued operations
+- `eval()` executes queued operations in order, then clears the queue
+- Calling `eval()` on a non-materialized tensor throws `std::runtime_error`
 
 ---
 
-## 아키텍처 다이어그램
+## Architecture Diagrams
 
 ### Class Diagram
 
@@ -298,7 +298,7 @@ classDiagram
     Model ..> Tensor : compile(in, out)
 ```
 
-### Tensor 생명주기
+### Tensor Lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -308,44 +308,44 @@ stateDiagram-v2
     Invalid --> Eager : zeros() / ones()
     Invalid --> External : fromData(dim, ptr)
 
-    Symbolic --> SymbolicWithEdge : LayerHandle 호출
-    SymbolicWithEdge --> SymbolicWithEdge : 추가 LayerHandle 호출
+    Symbolic --> SymbolicWithEdge : LayerHandle call
+    SymbolicWithEdge --> SymbolicWithEdge : Additional LayerHandle calls
 
     SymbolicWithEdge --> Materialized : Model compile
-    Eager --> Materialized : 이미 데이터 보유
-    External --> Materialized : 외부 메모리 바인딩
+    Eager --> Materialized : Already has data
+    External --> Materialized : External memory bound
 
     Materialized --> LazyChaining : chain()
-    LazyChaining --> LazyChaining : add_i / multiply_i 등
+    LazyChaining --> LazyChaining : add_i / multiply_i / etc
     LazyChaining --> Materialized : eval()
 
     note right of Invalid
-        기본 생성자
+        Default constructor
         isValid() == false
     end note
 
     note right of Symbolic
-        dim과 name만 보유
+        Only dim and name
         isMaterialized() == false
     end note
 
     note right of SymbolicWithEdge
-        graph_edge 보유
-        DAG에 레이어 연결
+        Has graph_edge
+        Layer connected in DAG
     end note
 
     note right of Materialized
-        data 접근 가능
-        getValue / setValue 사용 가능
+        data() accessible
+        getValue / setValue available
     end note
 
     note right of LazyChaining
-        call_chain에 연산 축적
-        eval()시 일괄 실행
+        Operations queued in call_chain
+        Batch executed on eval()
     end note
 ```
 
-### 그래프 구성 및 컴파일
+### Graph Construction & Compilation
 
 ```mermaid
 sequenceDiagram
@@ -355,30 +355,30 @@ sequenceDiagram
     participant SG as SymbolicGraphNode
     participant M as Model
 
-    Note over C,M: 1. Symbolic Tensor 생성
+    Note over C,M: 1. Create symbolic tensor
     C->>T: Tensor input({1,1,1,8}, "input0")
 
-    Note over C,M: 2. LayerHandle 생성
+    Note over C,M: 2. Create LayerHandle
     C->>LH: LayerHandle fc = createLayer("fc", props)
 
-    Note over C,M: 3. Layer 호출 - 그래프 엣지 생성
+    Note over C,M: 3. Call layer - creates graph edge
     C->>LH: auto out = fc(input)
     LH->>SG: new SymbolicGraphNode
     Note right of SG: producing_layer = fc
     LH->>T: return Tensor(out_dim)
 
-    Note over C,M: 4. 연쇄 호출
+    Note over C,M: 4. Chained calls
     C->>LH: auto y = relu(fc2(out))
     LH->>SG: node(fc2, inputs=[node(fc)])
     LH->>SG: node(relu, inputs=[node(fc2)])
 
-    Note over C,M: 5. 암시적 레이어 (Tensor 메서드)
+    Note over C,M: 5. Implicit layers (Tensor methods)
     C->>T: auto z = x.add(y)
     T->>LH: create Addition LayerHandle
     LH->>SG: node(Addition, inputs=[x, y])
     T-->>C: return Tensor z
 
-    Note over C,M: 6. Model compile (그래프 추출)
+    Note over C,M: 6. Model compile (graph extraction)
     C->>M: model.compile(input, output)
 
     rect rgb(240, 248, 255)
@@ -392,7 +392,7 @@ sequenceDiagram
     M->>T: bind tensors to allocated buffers
     M-->>C: return ML_ERROR_NONE
 
-    Note over C,M: 7. 추론 실행
+    Note over C,M: 7. Run inference
     C->>T: input.copyFrom(data)
     C->>M: model.inference(...)
     C->>T: output.data()
@@ -407,7 +407,7 @@ sequenceDiagram
     participant I as Impl
     participant N as nntrainer Tensor
 
-    Note over C,N: Tensor가 이미 materialized 상태
+    Note over C,N: Tensor is already materialized
 
     C->>T: chain()
     T->>I: call_chain.clear()
@@ -433,16 +433,16 @@ sequenceDiagram
     T-->>C: return this
 ```
 
-### API 레벨 비교
+### API Level Comparison
 
 ```mermaid
 flowchart TB
     subgraph PUBLIC["Public API - ml::train"]
         direction TB
 
-        subgraph SYMBOLIC["Symbolic Tensor API - 신규"]
+        subgraph SYMBOLIC["Symbolic Tensor API - New"]
             T[Tensor - symbolic placeholder]
-            LH[LayerHandle - operator 호출]
+            LH[LayerHandle - operator call]
             SGN[SymbolicGraphNode - DAG]
             T -->|"fc(input)"| LH
             LH -->|creates| SGN
@@ -450,12 +450,12 @@ flowchart TB
         end
 
         subgraph COMPILE["Model::compile - Tensor, Tensor"]
-            DFS[DFS 순회 - output에서 input]
-            EXTRACT[레이어 추출 - topological order]
+            DFS[DFS traversal - output to input]
+            EXTRACT[Layer extraction - topological order]
             DFS --> EXTRACT
         end
 
-        subgraph LEGACY["기존 API"]
+        subgraph LEGACY["Legacy API"]
             CL["createLayer(type, props)"]
             AL["model.addLayer(layer)"]
             CP["model.compile(mode)"]
@@ -469,9 +469,9 @@ flowchart TB
 
     subgraph INTERNAL["Internal - nntrainer namespace"]
         direction LR
-        NT[nntrainer::Tensor - 실제 데이터]
-        MP[MemoryPool - 메모리 할당]
-        GN[GraphNode - 실행 그래프]
+        NT[nntrainer::Tensor - actual data]
+        MP[MemoryPool - memory allocation]
+        GN[GraphNode - execution graph]
         LT[LazyTensor - legacy lazy eval]
         LT --> NT
         MP --> NT
@@ -485,18 +485,18 @@ flowchart TB
     style INTERNAL fill:#e8f5e9,stroke:#388e3c
 ```
 
-### String-based vs Symbolic 비교
+### String-based vs Symbolic
 
 ```mermaid
 flowchart LR
-    subgraph OLD["기존: String-based"]
+    subgraph OLD["Legacy: String-based"]
         direction TB
         O1["createLayer('fc',
         name=fc1,
         input_layers=input0,
         unit=256)"]
         O2["layers.push_back(layer)"]
-        O3["... 모든 레이어 반복 ..."]
+        O3["... repeat for all layers ..."]
         O4["for each layer:
         model.addLayer(l)"]
         O5["model.compile(mode)"]
@@ -504,19 +504,19 @@ flowchart LR
         O1 --> O2 --> O3 --> O4 --> O5 --> O6
     end
 
-    subgraph NEW["신규: Symbolic Tensor"]
+    subgraph NEW["New: Symbolic Tensor"]
         direction TB
         N1["Tensor input({1,1,1,8})"]
         N2["LayerHandle fc = createLayer(...)"]
         N3["auto out = fc(input)
-        // 자동 연결"]
-        N4["... 체인 계속 ..."]
+        // auto-connected!"]
+        N4["... continue chaining ..."]
         N5["model.compile(input, output)
-        // 그래프 자동 추출"]
+        // auto graph extraction"]
         N1 --> N2 --> N3 --> N4 --> N5
     end
 
-    OLD -.->|변환| NEW
+    OLD -.->|migration| NEW
 
     style OLD fill:#ffebee,stroke:#c62828
     style NEW fill:#e8f5e9,stroke:#2e7d32
@@ -524,7 +524,7 @@ flowchart LR
 
 ---
 
-## 실전 예제
+## Examples
 
 ### Residual Connection (Skip Connection)
 
@@ -541,7 +541,7 @@ auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
 model->compile(x, out);
 ```
 
-### Transformer Decoder Block (CausalLM 패턴)
+### Transformer Decoder Block (CausalLM Pattern)
 
 ```cpp
 using namespace ml::train;
@@ -555,7 +555,7 @@ LayerHandle embedding = createLayer("fully_connected",
     {"name=embedding0", "unit=" + std::to_string(DIM), "disable_bias=true"});
 Tensor x = embedding(input);
 
-// Decoder block (반복 가능)
+// Decoder blocks (can be repeated)
 for (int i = 0; i < NUM_LAYERS; ++i) {
     std::string p = "layer" + std::to_string(i);
 
@@ -637,25 +637,25 @@ model->compile(input, attn);
 ### Lazy Chaining (Post-processing)
 
 ```cpp
-// 추론 후 결과 후처리
+// Post-process inference results
 auto logits = /* model output tensor */;
 
-// 지연 체인: (logits / temperature) + bias
+// Deferred chain: (logits / temperature) + bias
 logits.chain()
     .divide_i(temperature)
     .add_i(bias_tensor)
     .eval();
 
-// softmax 등 추가 처리
+// Further processing (e.g., softmax)
 auto probs = logits.apply([](float x) { return std::exp(x); });
 ```
 
 ---
 
-## 파일 위치
+## File Locations
 
-| 컴포넌트 | 헤더 | 구현 |
-|---------|------|------|
+| Component | Header | Implementation |
+|-----------|--------|----------------|
 | Tensor, LayerHandle | `api/ccapi/include/tensor_api.h` | `api/ccapi/src/tensor_api.cpp` |
 | SymbolicGraphNode | (internal) | `api/ccapi/src/tensor_api.cpp` |
 | Model::compile (Tensor) | `api/ccapi/include/model.h` | `api/ccapi/src/tensor_api.cpp` |
