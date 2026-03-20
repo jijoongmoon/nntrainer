@@ -15,11 +15,12 @@ from nntrainer_layers import (
     LAYER_SPLIT, LAYER_CLAMP, LAYER_IDENTITY, LAYER_GATHER, LAYER_POOLING2D,
     LAYER_UPSAMPLE2D, LAYER_L2NORM, LAYER_FC,
     ACT_SWISH,
-    OP_SDPA, OP_NOOP, OP_RESHAPE, OP_UNSUPPORTED,
+    OP_SDPA, OP_NOOP, OP_RESHAPE, OP_PERMUTE, OP_TRANSPOSE, OP_UNSUPPORTED,
 )
 from op_registry import (
     FUNCTION_SIMPLE_OPS, FUNCTION_NAME_SIMPLE_OPS,
     FUNCTION_NOOP_NAMES, FUNCTION_RESHAPE_NAMES, FUNCTION_DECOMPOSE_OPS,
+    FUNCTION_PERMUTE_NAMES, FUNCTION_TRANSPOSE_NAMES,
     FUNCTION_ACTIVATION_OPS, FUNCTION_ACTIVATION_NAMES,
     FUNCTION_IDENTITY_OPS, FUNCTION_CLAMP_NAMES,
     FUNCTION_POOLING_NAMES, FUNCTION_INTERPOLATE_NAMES,
@@ -81,6 +82,23 @@ def map_function_node(node, node_to_layer):
     if layer_type is not None:
         return NNTrainerLayerDef(
             layer_type=layer_type,
+            name=make_scoped_name(scope, node),
+            input_layers=input_names,
+            hf_module_name=scope,
+        )
+
+    # === Permute / transpose by name (torch.permute, torch.swapaxes, etc.) ===
+    if func_name in FUNCTION_PERMUTE_NAMES:
+        return NNTrainerLayerDef(
+            layer_type=OP_PERMUTE,
+            name=make_scoped_name(scope, node),
+            input_layers=input_names,
+            hf_module_name=scope,
+        )
+
+    if func_name in FUNCTION_TRANSPOSE_NAMES:
+        return NNTrainerLayerDef(
+            layer_type=OP_TRANSPOSE,
             name=make_scoped_name(scope, node),
             input_layers=input_names,
             hf_module_name=scope,

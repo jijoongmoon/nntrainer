@@ -403,6 +403,50 @@ PIX2PIX_CONFIG = {
     "image_size": 256,
 }
 
+# --- torchvision CNN / Hybrid models ---
+
+# MobileNetV2: Inverted residual + hardtanh (ReLU6)
+MOBILENET_V2_CONFIG = {
+    "model_type": "mobilenet_v2",
+    "image_size": 224,
+}
+
+# MobileNetV3-Small: Inverted residual + hardswish/hardsigmoid (SE blocks)
+MOBILENET_V3_CONFIG = {
+    "model_type": "mobilenet_v3_small",
+    "image_size": 224,
+}
+
+# DenseNet121: Dense connections (each layer concatenates all previous)
+DENSENET121_CONFIG = {
+    "model_type": "densenet121",
+    "image_size": 224,
+}
+
+# InceptionV3: Multi-branch parallel convolutions
+INCEPTION_V3_CONFIG = {
+    "model_type": "inception_v3",
+    "image_size": 299,
+}
+
+# ConvNeXt-Tiny: Modernized ConvNet (LayerNorm + GELU + permute)
+CONVNEXT_CONFIG = {
+    "model_type": "convnext",
+    "image_size": 224,
+}
+
+# Swin Transformer Tiny: Shifted window attention + torch.roll
+SWIN_CONFIG = {
+    "model_type": "swin",
+    "image_size": 224,
+}
+
+# MaxViT-T: Multi-axis attention (block + grid) + swapaxes
+MAXVIT_CONFIG = {
+    "model_type": "maxvit",
+    "image_size": 224,
+}
+
 # --- Encoder-Decoder models ---
 
 # T5Gemma2-270M: Gemma2-based encoder-decoder (multimodal)
@@ -839,6 +883,34 @@ class TestConverterBuildAndRun(unittest.TestCase):
     def test_pix2pix_conversion(self):
         """Pix2Pix U-Net: FX trace and full layer mapping (skip connections)."""
         self._run_custom_conversion_test("pix2pix", PIX2PIX_CONFIG)
+
+    def test_mobilenet_v2_conversion(self):
+        """MobileNetV2: FX trace and full layer mapping (inverted residual + hardtanh)."""
+        self._run_custom_conversion_test("mobilenet_v2", MOBILENET_V2_CONFIG)
+
+    def test_mobilenet_v3_conversion(self):
+        """MobileNetV3-Small: FX trace (hardswish + hardsigmoid + SE blocks)."""
+        self._run_custom_conversion_test("mobilenet_v3", MOBILENET_V3_CONFIG)
+
+    def test_densenet121_conversion(self):
+        """DenseNet121: FX trace and full layer mapping (dense connections)."""
+        self._run_custom_conversion_test("densenet121", DENSENET121_CONFIG)
+
+    def test_inception_v3_conversion(self):
+        """InceptionV3: FX trace (multi-branch parallel convolutions)."""
+        self._run_custom_conversion_test("inception_v3", INCEPTION_V3_CONFIG)
+
+    def test_convnext_conversion(self):
+        """ConvNeXt-Tiny: FX trace (LayerNorm + GELU + permute function)."""
+        self._run_custom_conversion_test("convnext", CONVNEXT_CONFIG)
+
+    def test_swin_conversion(self):
+        """Swin Transformer: FX trace (shifted window attention + roll)."""
+        self._run_custom_conversion_test("swin", SWIN_CONFIG)
+
+    def test_maxvit_conversion(self):
+        """MaxViT-T: FX trace (multi-axis attention + swapaxes)."""
+        self._run_custom_conversion_test("maxvit", MAXVIT_CONFIG)
 
     def _run_custom_conversion_test(self, name, config_dict):
         """Run conversion-only test for custom (non-HF) models.

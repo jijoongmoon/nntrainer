@@ -1054,3 +1054,40 @@ def _load_pix2pix(model_dir, config, seq_len, verbose):
 
 
 CUSTOM_LOADERS["pix2pix"] = _load_pix2pix
+
+
+# ─── torchvision CNN models ──────────────────────────────────────────
+
+def _make_torchvision_loader(factory_name, default_image_size=224):
+    """Create a generic loader for torchvision models."""
+    def _loader(model_dir, config, seq_len, verbose):
+        from torchvision import models as tv
+        factory = getattr(tv, factory_name)
+        num_classes = getattr(config, "num_classes", 100)
+        image_size = getattr(config, "image_size", default_image_size)
+        kwargs = {"weights": None}
+        # Some models accept num_classes, some don't
+        try:
+            model = factory(num_classes=num_classes, **kwargs)
+        except TypeError:
+            model = factory(**kwargs)
+        model.eval()
+        if verbose:
+            n = sum(p.numel() for p in model.parameters())
+            print(f"  [{factory_name}] {n/1e6:.2f}M params, img={image_size}")
+        input_kwargs = {"x": torch.randn(1, 3, image_size, image_size)}
+        return model, config, input_kwargs
+    return _loader
+
+
+CUSTOM_LOADERS["mobilenet_v2"] = _make_torchvision_loader("mobilenet_v2")
+CUSTOM_LOADERS["mobilenet_v3_small"] = _make_torchvision_loader("mobilenet_v3_small")
+CUSTOM_LOADERS["mobilenet_v3_large"] = _make_torchvision_loader("mobilenet_v3_large")
+CUSTOM_LOADERS["squeezenet"] = _make_torchvision_loader("squeezenet1_1")
+CUSTOM_LOADERS["shufflenet_v2"] = _make_torchvision_loader("shufflenet_v2_x1_0")
+CUSTOM_LOADERS["densenet121"] = _make_torchvision_loader("densenet121")
+CUSTOM_LOADERS["inception_v3"] = _make_torchvision_loader("inception_v3", 299)
+CUSTOM_LOADERS["regnet"] = _make_torchvision_loader("regnet_y_400mf")
+CUSTOM_LOADERS["convnext"] = _make_torchvision_loader("convnext_tiny")
+CUSTOM_LOADERS["swin"] = _make_torchvision_loader("swin_t")
+CUSTOM_LOADERS["maxvit"] = _make_torchvision_loader("maxvit_t")

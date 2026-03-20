@@ -95,6 +95,12 @@ FUNCTION_NOOP_NAMES = frozenset({
 # Functions that map to OP_RESHAPE
 FUNCTION_RESHAPE_NAMES = frozenset({"unsqueeze", "squeeze"})
 
+# Functions that map to OP_PERMUTE
+FUNCTION_PERMUTE_NAMES = frozenset({"permute", "roll"})
+
+# Functions that map to OP_TRANSPOSE
+FUNCTION_TRANSPOSE_NAMES = frozenset({"swapaxes", "swapdims", "movedim"})
+
 # Functions that map to OP_UNSUPPORTED with decomposition info
 FUNCTION_DECOMPOSE_OPS = {
     "rsqrt":      {"original_op": "rsqrt",      "decompose_to": "pow(x, -0.5)"},
@@ -118,6 +124,11 @@ FUNCTION_ACTIVATION_NAMES = {
     "leaky_relu": ACT_LEAKY_RELU,
     "log_softmax": ACT_SOFTMAX,  # log_softmax ≈ softmax for NNTrainer mapping
     "glu": ACT_SIGMOID,  # GLU(x) = x_a * sigmoid(x_b); map to sigmoid activation
+    # Hard activation approximations: NNTrainer doesn't have native hard variants,
+    # but the smooth counterparts are functionally equivalent for inference.
+    "hardswish": ACT_SWISH,      # hardswish ≈ swish (x * sigmoid(x))
+    "hardsigmoid": ACT_SIGMOID,  # hardsigmoid ≈ sigmoid
+    "hardtanh": ACT_TANH,        # hardtanh(x) = clamp(x, -1, 1) ≈ tanh
 }
 
 # Function-based loss ops: callable -> layer_type
@@ -226,6 +237,9 @@ METHOD_SHAPE_OPS = {
     "view":      OP_RESHAPE,
     "reshape":   OP_RESHAPE,
     "unflatten": OP_RESHAPE,
+    "roll":      OP_PERMUTE,
+    "swapaxes":  OP_TRANSPOSE,
+    "swapdims":  OP_TRANSPOSE,
     "permute":   OP_PERMUTE,
     "transpose": OP_TRANSPOSE,
     "t":         OP_TRANSPOSE,    # .t() is 2D transpose
