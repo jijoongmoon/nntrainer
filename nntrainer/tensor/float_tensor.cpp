@@ -663,6 +663,24 @@ Tensor &FloatTensor::erf(Tensor &output) const {
   return output;
 }
 
+Tensor &FloatTensor::exp(Tensor &output) const {
+  auto f = [](float in) { return std::exp(in); };
+  apply(f, output);
+  return output;
+}
+
+Tensor &FloatTensor::log(Tensor &output) const {
+  auto f = [](float in) { return std::log(in); };
+  apply(f, output);
+  return output;
+}
+
+Tensor &FloatTensor::clamp(float min, float max, Tensor &output) const {
+  auto f = [min, max](float in) { return std::min(std::max(in, min), max); };
+  apply(f, output);
+  return output;
+}
+
 void FloatTensor::sin(Tensor &out, float alpha) {
   if (!contiguous) {
     auto f = [alpha](float val) -> float { return std::sin(alpha * val); };

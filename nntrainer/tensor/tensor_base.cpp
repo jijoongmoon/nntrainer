@@ -539,6 +539,24 @@ Tensor &TensorBase::erf(Tensor &output) const {
     getStringDataType());
 }
 
+Tensor &TensorBase::exp(Tensor &output) const {
+  throw std::invalid_argument(
+    "Tensor::exp() is currently not supported in tensor data type " +
+    getStringDataType());
+}
+
+Tensor &TensorBase::log(Tensor &output) const {
+  throw std::invalid_argument(
+    "Tensor::log() is currently not supported in tensor data type " +
+    getStringDataType());
+}
+
+Tensor &TensorBase::clamp(float min, float max, Tensor &output) const {
+  throw std::invalid_argument(
+    "Tensor::clamp() is currently not supported in tensor data type " +
+    getStringDataType());
+}
+
 void TensorBase::sin(Tensor &out, float alpha) {
   throw std::invalid_argument(
     "Tensor::sin() is currently not supported in tensor data type " +
