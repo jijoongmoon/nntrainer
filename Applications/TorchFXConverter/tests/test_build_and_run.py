@@ -344,6 +344,20 @@ YOLOV3_CONFIG = {
     "image_size": 416,
 }
 
+# ResNet18: BasicBlock residual CNN (from nntrainer Applications/Resnet)
+RESNET18_CONFIG = {
+    "model_type": "resnet18",
+    "num_classes": 100,
+    "image_size": 32,
+}
+
+# ResNet50: Bottleneck residual CNN (from torchvision)
+RESNET50_CONFIG = {
+    "model_type": "resnet50",
+    "num_classes": 100,
+    "image_size": 224,
+}
+
 # --- Encoder-Decoder models ---
 
 # T5Gemma2-270M: Gemma2-based encoder-decoder (multimodal)
@@ -752,6 +766,14 @@ class TestConverterBuildAndRun(unittest.TestCase):
     def test_yolov3_conversion(self):
         """YOLOv3: FX trace and full layer mapping (Darknet53 + FPN)."""
         self._run_custom_conversion_test("yolov3", YOLOV3_CONFIG)
+
+    def test_resnet18_conversion(self):
+        """ResNet18: FX trace and full layer mapping (BasicBlock residual)."""
+        self._run_custom_conversion_test("resnet18", RESNET18_CONFIG)
+
+    def test_resnet50_conversion(self):
+        """ResNet50: FX trace and full layer mapping (Bottleneck residual)."""
+        self._run_custom_conversion_test("resnet50", RESNET50_CONFIG)
 
     def _run_custom_conversion_test(self, name, config_dict):
         """Run conversion-only test for custom (non-HF) models.

@@ -772,3 +772,67 @@ def _load_yolov3(model_dir, config, seq_len, verbose):
 
 
 CUSTOM_LOADERS["yolov3"] = _load_yolov3
+
+
+# ─── ResNet18 (nntrainer) ─────────────────────────────────────────────
+
+def _load_resnet18(model_dir, config, seq_len, verbose):
+    """Load ResNet18 from nntrainer Applications/Resnet."""
+    import sys as _sys
+    import os as _os
+    import types as _types
+    import importlib.util as _ilu
+
+    # Mock torchconverter (used by the Resnet main.py at import time)
+    if "torchconverter" not in _sys.modules:
+        _mock = _types.ModuleType("torchconverter")
+        _mock.save_bin = lambda *a, **kw: None
+        _sys.modules["torchconverter"] = _mock
+
+    main_path = _os.path.abspath(
+        _os.path.join(_os.path.dirname(__file__), "..", "Resnet", "PyTorch", "main.py"))
+    spec = _ilu.spec_from_file_location("resnet_main", main_path)
+    mod = _ilu.module_from_spec(spec)
+    mod.__name__ = "resnet_main"          # avoid __main__ guard
+    spec.loader.exec_module(mod)
+
+    num_classes = getattr(config, "num_classes", 100)
+    image_size = getattr(config, "image_size", 32)
+
+    model = mod.ResNet(mod.BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+    model.eval()
+
+    if verbose:
+        n = sum(p.numel() for p in model.parameters())
+        print(f"  [resnet18] {n/1e6:.2f}M params, "
+              f"classes={num_classes}, img={image_size}")
+
+    input_kwargs = {"x": torch.randn(1, 3, image_size, image_size)}
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["resnet18"] = _load_resnet18
+
+
+# ─── ResNet50 (torchvision) ───────────────────────────────────────────
+
+def _load_resnet50(model_dir, config, seq_len, verbose):
+    """Load ResNet50 from torchvision."""
+    from torchvision.models import resnet50
+
+    num_classes = getattr(config, "num_classes", 100)
+    image_size = getattr(config, "image_size", 224)
+
+    model = resnet50(weights=None, num_classes=num_classes)
+    model.eval()
+
+    if verbose:
+        n = sum(p.numel() for p in model.parameters())
+        print(f"  [resnet50] {n/1e6:.2f}M params, "
+              f"classes={num_classes}, img={image_size}")
+
+    input_kwargs = {"x": torch.randn(1, 3, image_size, image_size)}
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["resnet50"] = _load_resnet50
