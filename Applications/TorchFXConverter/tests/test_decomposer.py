@@ -479,7 +479,7 @@ def test_span_rep_auto_decomposition():
     assert len(gather_layers) == 2, f"Expected 2 gather ops, got {len(gather_layers)}"
     for g in gather_layers:
         assert "axis" in g.properties, f"Gather layer missing axis property: {g.name}"
-        assert g.properties["axis"] == 1, f"Expected axis=1, got {g.properties['axis']}"
+        assert g.properties["axis"] == 2, f"Expected axis=2, got {g.properties['axis']}"
 
     # Verify concat has proper inputs (not empty)
     concat_layers = [l for l in result.layers if l.layer_type == "concat"]
@@ -725,7 +725,7 @@ def test_gliner2_core_conversion():
     gather_layers = [l for l in result.layers if l.layer_type == "gather"]
     assert len(gather_layers) == 2, f"Expected 2 gather ops, got {len(gather_layers)}"
     for g in gather_layers:
-        assert g.properties.get("axis") == 1
+        assert g.properties.get("axis") == 2
 
     concat_layers = [l for l in result.layers if l.layer_type == "concat"]
     assert len(concat_layers) == 1
