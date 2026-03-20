@@ -836,3 +836,221 @@ def _load_resnet50(model_dir, config, seq_len, verbose):
 
 
 CUSTOM_LOADERS["resnet50"] = _load_resnet50
+
+
+# ─── ViT-B/16 (torchvision) ──────────────────────────────────────────
+
+def _load_vit(model_dir, config, seq_len, verbose):
+    """Load ViT-B/16 from torchvision."""
+    from torchvision.models import vit_b_16
+
+    num_classes = getattr(config, "num_classes", 100)
+    image_size = getattr(config, "image_size", 224)
+
+    model = vit_b_16(weights=None, num_classes=num_classes, image_size=image_size)
+    model.eval()
+
+    if verbose:
+        n = sum(p.numel() for p in model.parameters())
+        print(f"  [vit_b_16] {n/1e6:.2f}M params, "
+              f"classes={num_classes}, img={image_size}")
+
+    input_kwargs = {"x": torch.randn(1, 3, image_size, image_size)}
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["vit"] = _load_vit
+
+
+# ─── DeiT (HuggingFace) ──────────────────────────────────────────────
+
+def _load_deit(model_dir, config, seq_len, verbose):
+    """Load DeiT (Data-efficient Image Transformer) from HuggingFace."""
+    from transformers import DeiTModel, DeiTConfig
+
+    hf_config = DeiTConfig(
+        hidden_size=getattr(config, "hidden_size", 192),
+        num_hidden_layers=getattr(config, "num_hidden_layers", 4),
+        num_attention_heads=getattr(config, "num_attention_heads", 3),
+        intermediate_size=getattr(config, "intermediate_size", 768),
+        image_size=getattr(config, "image_size", 224),
+        patch_size=getattr(config, "patch_size", 16),
+        num_channels=3,
+    )
+
+    model = DeiTModel(hf_config)
+    model.eval()
+
+    if verbose:
+        n = sum(p.numel() for p in model.parameters())
+        print(f"  [deit] {n/1e6:.2f}M params, "
+              f"layers={hf_config.num_hidden_layers}, "
+              f"img={hf_config.image_size}")
+
+    input_kwargs = {"pixel_values": torch.randn(
+        1, 3, hf_config.image_size, hf_config.image_size)}
+    return model, hf_config, input_kwargs
+
+
+CUSTOM_LOADERS["deit"] = _load_deit
+
+
+# ─── DCGAN Generator + Discriminator ─────────────────────────────────
+
+class _DCGANGenerator(nn.Module):
+    """Classic DCGAN Generator (Radford et al., 2015)."""
+    def __init__(self, nz=100, ngf=64, nc=3):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8), nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 4), nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 2), nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf), nn.ReLU(True),
+            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
+            nn.Tanh(),
+        )
+
+    def forward(self, x):
+        return self.main(x)
+
+
+class _DCGANDiscriminator(nn.Module):
+    """Classic DCGAN Discriminator (Radford et al., 2015)."""
+    def __init__(self, nc=3, ndf=64):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 2), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 4), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf * 8), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.main(x)
+
+
+def _load_dcgan_gen(model_dir, config, seq_len, verbose):
+    """Load DCGAN Generator."""
+    nz = getattr(config, "nz", 100)
+    ngf = getattr(config, "ngf", 64)
+    nc = getattr(config, "nc", 3)
+
+    model = _DCGANGenerator(nz=nz, ngf=ngf, nc=nc)
+    model.eval()
+
+    if verbose:
+        n = sum(p.numel() for p in model.parameters())
+        print(f"  [dcgan_gen] {n/1e6:.2f}M params, nz={nz}, ngf={ngf}")
+
+    input_kwargs = {"x": torch.randn(1, nz, 1, 1)}
+    return model, config, input_kwargs
+
+
+def _load_dcgan_disc(model_dir, config, seq_len, verbose):
+    """Load DCGAN Discriminator."""
+    nc = getattr(config, "nc", 3)
+    ndf = getattr(config, "ndf", 64)
+    image_size = getattr(config, "image_size", 64)
+
+    model = _DCGANDiscriminator(nc=nc, ndf=ndf)
+    model.eval()
+
+    if verbose:
+        n = sum(p.numel() for p in model.parameters())
+        print(f"  [dcgan_disc] {n/1e6:.2f}M params, ndf={ndf}, img={image_size}")
+
+    input_kwargs = {"x": torch.randn(1, nc, image_size, image_size)}
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["dcgan_gen"] = _load_dcgan_gen
+CUSTOM_LOADERS["dcgan_disc"] = _load_dcgan_disc
+
+
+# ─── Pix2Pix U-Net Generator ─────────────────────────────────────────
+
+class _UNetBlock(nn.Module):
+    """Encoder/decoder block for Pix2Pix U-Net."""
+    def __init__(self, in_ch, out_ch, down=True, use_bn=True, use_dropout=False):
+        super().__init__()
+        if down:
+            self.conv = nn.Conv2d(in_ch, out_ch, 4, 2, 1, bias=False)
+        else:
+            self.conv = nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch) if use_bn else nn.Identity()
+        self.act = nn.LeakyReLU(0.2) if down else nn.ReLU()
+        self.dropout = nn.Dropout(0.5) if use_dropout else nn.Identity()
+
+    def forward(self, x):
+        return self.dropout(self.bn(self.act(self.conv(x))))
+
+
+class _Pix2PixGenerator(nn.Module):
+    """Pix2Pix U-Net Generator (Isola et al., 2017)."""
+    def __init__(self, in_ch=3, out_ch=3, ngf=64):
+        super().__init__()
+        self.e1 = _UNetBlock(in_ch, ngf, down=True, use_bn=False)
+        self.e2 = _UNetBlock(ngf, ngf * 2, down=True)
+        self.e3 = _UNetBlock(ngf * 2, ngf * 4, down=True)
+        self.e4 = _UNetBlock(ngf * 4, ngf * 8, down=True)
+        self.e5 = _UNetBlock(ngf * 8, ngf * 8, down=True)
+        self.e6 = _UNetBlock(ngf * 8, ngf * 8, down=True)
+        self.e7 = _UNetBlock(ngf * 8, ngf * 8, down=True, use_bn=False)
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(ngf * 8, ngf * 8, 4, 2, 1, bias=False), nn.ReLU())
+        self.d7 = _UNetBlock(ngf * 8, ngf * 8, down=False, use_dropout=True)
+        self.d6 = _UNetBlock(ngf * 8 * 2, ngf * 8, down=False, use_dropout=True)
+        self.d5 = _UNetBlock(ngf * 8 * 2, ngf * 8, down=False, use_dropout=True)
+        self.d4 = _UNetBlock(ngf * 8 * 2, ngf * 8, down=False)
+        self.d3 = _UNetBlock(ngf * 8 * 2, ngf * 4, down=False)
+        self.d2 = _UNetBlock(ngf * 4 * 2, ngf * 2, down=False)
+        self.d1 = _UNetBlock(ngf * 2 * 2, ngf, down=False)
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(ngf * 2, out_ch, 4, 2, 1), nn.Tanh())
+
+    def forward(self, x):
+        e1 = self.e1(x)
+        e2 = self.e2(e1)
+        e3 = self.e3(e2)
+        e4 = self.e4(e3)
+        e5 = self.e5(e4)
+        e6 = self.e6(e5)
+        e7 = self.e7(e6)
+        b = self.bottleneck(e7)
+        d7 = self.d7(b)
+        d6 = self.d6(torch.cat([d7, e7], 1))
+        d5 = self.d5(torch.cat([d6, e6], 1))
+        d4 = self.d4(torch.cat([d5, e5], 1))
+        d3 = self.d3(torch.cat([d4, e4], 1))
+        d2 = self.d2(torch.cat([d3, e3], 1))
+        d1 = self.d1(torch.cat([d2, e2], 1))
+        return self.final(torch.cat([d1, e1], 1))
+
+
+def _load_pix2pix(model_dir, config, seq_len, verbose):
+    """Load Pix2Pix U-Net Generator."""
+    ngf = getattr(config, "ngf", 64)
+    image_size = getattr(config, "image_size", 256)
+
+    model = _Pix2PixGenerator(in_ch=3, out_ch=3, ngf=ngf)
+    model.eval()
+
+    if verbose:
+        n = sum(p.numel() for p in model.parameters())
+        print(f"  [pix2pix] {n/1e6:.2f}M params, ngf={ngf}, img={image_size}")
+
+    input_kwargs = {"x": torch.randn(1, 3, image_size, image_size)}
+    return model, config, input_kwargs
+
+
+CUSTOM_LOADERS["pix2pix"] = _load_pix2pix

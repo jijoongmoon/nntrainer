@@ -358,6 +358,51 @@ RESNET50_CONFIG = {
     "image_size": 224,
 }
 
+# --- Vision Transformer models ---
+
+# ViT-B/16: Vision Transformer (torchvision, 12 encoder layers)
+VIT_CONFIG = {
+    "model_type": "vit",
+    "num_classes": 100,
+    "image_size": 224,
+}
+
+# DeiT: Data-efficient Image Transformer (HuggingFace, tiny config)
+DEIT_CONFIG = {
+    "model_type": "deit",
+    "hidden_size": 192,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 3,
+    "intermediate_size": 768,
+    "image_size": 224,
+    "patch_size": 16,
+}
+
+# --- GAN models ---
+
+# DCGAN Generator: ConvTranspose2d stack (Radford et al., 2015)
+DCGAN_GEN_CONFIG = {
+    "model_type": "dcgan_gen",
+    "nz": 100,
+    "ngf": 64,
+    "nc": 3,
+}
+
+# DCGAN Discriminator: Conv2d stack with LeakyReLU
+DCGAN_DISC_CONFIG = {
+    "model_type": "dcgan_disc",
+    "nc": 3,
+    "ndf": 64,
+    "image_size": 64,
+}
+
+# Pix2Pix: U-Net Generator with skip connections (Isola et al., 2017)
+PIX2PIX_CONFIG = {
+    "model_type": "pix2pix",
+    "ngf": 64,
+    "image_size": 256,
+}
+
 # --- Encoder-Decoder models ---
 
 # T5Gemma2-270M: Gemma2-based encoder-decoder (multimodal)
@@ -774,6 +819,26 @@ class TestConverterBuildAndRun(unittest.TestCase):
     def test_resnet50_conversion(self):
         """ResNet50: FX trace and full layer mapping (Bottleneck residual)."""
         self._run_custom_conversion_test("resnet50", RESNET50_CONFIG)
+
+    def test_vit_conversion(self):
+        """ViT-B/16: FX trace and full layer mapping (patch embed + MHA)."""
+        self._run_custom_conversion_test("vit", VIT_CONFIG)
+
+    def test_deit_conversion(self):
+        """DeiT: FX trace and full layer mapping (distillation token + SDPA)."""
+        self._run_custom_conversion_test("deit", DEIT_CONFIG)
+
+    def test_dcgan_gen_conversion(self):
+        """DCGAN Generator: FX trace and full layer mapping (ConvTranspose2d)."""
+        self._run_custom_conversion_test("dcgan_gen", DCGAN_GEN_CONFIG)
+
+    def test_dcgan_disc_conversion(self):
+        """DCGAN Discriminator: FX trace and full layer mapping (LeakyReLU)."""
+        self._run_custom_conversion_test("dcgan_disc", DCGAN_DISC_CONFIG)
+
+    def test_pix2pix_conversion(self):
+        """Pix2Pix U-Net: FX trace and full layer mapping (skip connections)."""
+        self._run_custom_conversion_test("pix2pix", PIX2PIX_CONFIG)
 
     def _run_custom_conversion_test(self, name, config_dict):
         """Run conversion-only test for custom (non-HF) models.

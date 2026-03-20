@@ -81,6 +81,8 @@ FUNCTION_NOOP_NAMES = frozenset({
     "custom_function_call",
     # Comparison / conditional ops (T5 relative position bias)
     "where", "min", "max", "maximum", "minimum",
+    # Debug / shape assertions (torchvision ViT, etc.)
+    "_assert",
     # Position ID computation (XLM-RoBERTa, etc.)
     # cumsum is used exclusively for computing position IDs from attention
     # masks in transformer models. NNTrainer handles position IDs internally,
