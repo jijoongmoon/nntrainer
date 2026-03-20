@@ -688,9 +688,19 @@ void NeuralNetwork::load(const std::string &file_path,
 
   size_t start_from = 0;
   std::vector<std::pair<size_t, size_t>> file_offset;
+  std::unordered_set<const Tensor *> visited_weights;
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
     auto weights = (*iter)->getRunContext().getWeights();
     for (auto weight : weights) {
+      // Shared weights (e.g., TieWordEmbedding) reference the same Tensor
+      // object via requestOrExtend. Calling setFileOffset on the second
+      // occurrence overwrites the correct offset by the first.
+      // Skip duplicates so that:
+      // 1. file_offset is only set once (at the positin where save writes)
+      // 2. start_from is only advanced once (matching actual file layout)
+      if (!visited_weights.insert(&weight->getVariableRef()).second) {
+        continue;
+      }
       size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
       weight->getVariableRef().setFileOffset(start_from);
