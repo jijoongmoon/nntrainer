@@ -124,6 +124,12 @@ private:
   float epsilon;
 
   /**
+   * @brief     Whether to use externally provided cache tensors
+   *            (true when num_inputs >= 5)
+   */
+  bool use_external_cache = false;
+
+  /**
    * @brief calculate common derivative
    * @param context Context of the layer
    */

@@ -62,7 +62,9 @@ layer_sources = [
   'positional_encoding_layer.cpp',
   'identity_layer.cpp',
   'upsample2d_layer.cpp',
-  'channel_shuffle.cpp'
+  'channel_shuffle.cpp',
+  'group_normalization_layer.cpp',
+  'instance_normalization_layer.cpp'
 ]
 
 layer_headers = [

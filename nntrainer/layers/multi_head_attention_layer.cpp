@@ -67,11 +67,13 @@ enum AttentionParams {
 };
 
 void MultiHeadAttentionLayer::finalize(InitLayerContext &context) {
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 4,
+  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 6,
                 std::invalid_argument)
-    << "Multi head Attention layer needs 3 or 4 inputs. (query, key, value and "
-       "mask is optional";
-  const bool provide_attention_mask = context.getNumInputs() == 4;
+    << "Multi head Attention layer needs 3-6 inputs. (query, key, value, "
+       "optional mask, optional external cache_key and cache_value)";
+  use_external_cache = context.getNumInputs() >= 5;
+  const bool provide_attention_mask =
+    (context.getNumInputs() == 4 || context.getNumInputs() == 6);
 
   TensorDim::TensorType weight_type = {context.getFormat(),
                                        context.getWeightDataType()};
@@ -278,13 +280,15 @@ void MultiHeadAttentionLayer::finalize(InitLayerContext &context) {
     projected_value_dim, "projected_value", Initializer::NONE, true,
     TensorLifespan::ITERATION_LIFESPAN);
 
-  weight_idx[AttentionParams::cache_key] =
-    context.requestTensor(projected_key_dim, "cache_key", Initializer::NONE,
-                          true, TensorLifespan::MAX_LIFESPAN);
+  if (!use_external_cache) {
+    weight_idx[AttentionParams::cache_key] =
+      context.requestTensor(projected_key_dim, "cache_key", Initializer::NONE,
+                            true, TensorLifespan::MAX_LIFESPAN);
 
-  weight_idx[AttentionParams::cache_value] =
-    context.requestTensor(projected_value_dim, "cache_value", Initializer::NONE,
-                          true, TensorLifespan::MAX_LIFESPAN);
+    weight_idx[AttentionParams::cache_value] = context.requestTensor(
+      projected_value_dim, "cache_value", Initializer::NONE, true,
+      TensorLifespan::MAX_LIFESPAN);
+  }
 
   if (provide_attention_mask) {
     /** Intended comment for bool type mask */
@@ -348,7 +352,8 @@ void MultiHeadAttentionLayer::forwarding(RunLayerContext &context,
   const bool average_attention_weight =
     std::get<props::AverageAttentionWeight>(multi_head_attention_props).get();
 
-  const bool provide_attention_mask = context.getNumInputs() == 4;
+  const bool provide_attention_mask =
+    (context.getNumInputs() == 4 || context.getNumInputs() == 6);
   const unsigned int projected_query_dim_prop = projected_key_dim_prop;
   const bool enable_dropout = dropout_rate > epsilon;
 
@@ -562,7 +567,8 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
   const bool average_attention_weight =
     std::get<props::AverageAttentionWeight>(multi_head_attention_props).get();
 
-  const bool provide_attention_mask = context.getNumInputs() == 4;
+  const bool provide_attention_mask =
+    (context.getNumInputs() == 4 || context.getNumInputs() == 6);
   const unsigned int projected_query_dim_prop = projected_key_dim_prop;
   const bool enable_dropout = dropout_rate > epsilon;
 
@@ -618,9 +624,16 @@ void MultiHeadAttentionLayer::incremental_forwarding(RunLayerContext &context,
     context.getTensor(weight_idx[AttentionParams::projected_key]);
   Tensor &projected_value =
     context.getTensor(weight_idx[AttentionParams::projected_value]);
-  Tensor &cache_key = context.getTensor(weight_idx[AttentionParams::cache_key]);
+  const unsigned int ext_cache_key_idx = provide_attention_mask ? 4 : 3;
+  const unsigned int ext_cache_value_idx = provide_attention_mask ? 5 : 4;
+  Tensor &cache_key =
+    use_external_cache
+      ? context.getInput(ext_cache_key_idx)
+      : context.getTensor(weight_idx[AttentionParams::cache_key]);
   Tensor &cache_value =
-    context.getTensor(weight_idx[AttentionParams::cache_value]);
+    use_external_cache
+      ? context.getInput(ext_cache_value_idx)
+      : context.getTensor(weight_idx[AttentionParams::cache_value]);
 
   TensorDim projected_query_dim = projected_query.getDim();
   TensorDim projected_key_dim = projected_key.getDim();
@@ -1105,9 +1118,10 @@ void MultiHeadAttentionLayer::setBatch(RunLayerContext &context,
   context.updateTensor(weight_idx[AttentionParams::projected_query], batch);
   context.updateTensor(weight_idx[AttentionParams::projected_key], batch);
   context.updateTensor(weight_idx[AttentionParams::projected_value], batch);
-  context.updateTensor(weight_idx[AttentionParams::cache_key], batch);
-  context.updateTensor(weight_idx[AttentionParams::cache_value], batch);
-  // context.updateTensor(weight_idx[AttentionParams::cache_value], batch);
+  if (!use_external_cache) {
+    context.updateTensor(weight_idx[AttentionParams::cache_key], batch);
+    context.updateTensor(weight_idx[AttentionParams::cache_value], batch);
+  }
   context.updateTensor(weight_idx[AttentionParams::attention_weight], batch);
   if (dropout_rate > epsilon) {
     context.updateTensor(weight_idx[AttentionParams::dropout_mask], batch);
