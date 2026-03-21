@@ -245,18 +245,13 @@ void TensorPool::allocate(bool init) {
     syncDependents(spec);
   }
 
-  if (cache_loader) {
-    cache_loader->init();
-  }
+  // ThreadManager is a global singleton — no init needed for FSU
 }
 
 /**
  * @brief Deallocate memory for all the managed tensors
  */
 void TensorPool::deallocate() {
-  if (cache_loader)
-    cache_loader->finish();
-
   mem_pool->deallocate();
 
   /** nullify the data pointers for the tensors */
@@ -476,43 +471,71 @@ void TensorPool::flushCacheExcept(unsigned int order) {
 }
 
 void TensorPool::loadCacheExec(unsigned int order) {
-  if (dynamic_cast<CachePool *>(mem_pool.get()))
-    cache_loader->loadAllinOrder(order);
+  auto pool = dynamic_cast<CachePool *>(mem_pool.get());
+  if (!pool)
+    return;
+
+  auto &tm = ThreadManager::Global();
+  std::set<unsigned int> exec_ids = pool->getExecIDs(order);
+  for (auto &id : exec_ids) {
+    auto &elem = pool->getCacheElem(id);
+    elem.waitUnload(); // ensure previous unload is done
+    auto token = tm.submit([pool, id] { pool->loadTensor(id); });
+    elem.setLoadToken(std::move(token));
+  }
 }
 
 int TensorPool::loadCacheExecAsync(
-  unsigned int order, TaskExecutor::CompleteCallback complete_callback) {
-
-  if (dynamic_cast<CachePool *>(mem_pool.get()))
-    return cache_loader->loadAllinOrder(order);
-  else
-    return 0;
+  unsigned int order, std::function<void(int)>) {
+  loadCacheExec(order);
+  return 0;
 }
 
 bool TensorPool::checkLoadComplete(unsigned int order) {
-  if (dynamic_cast<CachePool *>(mem_pool.get()))
-    return cache_loader->checkAllLoadComplete(order);
-  else
+  auto pool = dynamic_cast<CachePool *>(mem_pool.get());
+  if (!pool)
     return true;
+
+  std::set<unsigned int> exec_ids = pool->getExecIDs(order);
+  for (auto &id : exec_ids) {
+    pool->getCacheElem(id).waitLoad();
+  }
+  return true;
 }
 
 int TensorPool::flushCacheExecAsync(
-  unsigned int order, TaskExecutor::CompleteCallback complete_callback) {
-  if (dynamic_cast<CachePool *>(mem_pool.get()))
-    return cache_loader->unloadAllinOrder(order);
-  else
+  unsigned int order, std::function<void(int)>) {
+  auto pool = dynamic_cast<CachePool *>(mem_pool.get());
+  if (!pool)
     return 0;
+
+  auto &tm = ThreadManager::Global();
+  std::set<unsigned int> exec_ids = pool->getExecIDs(order);
+  for (auto &id : exec_ids) {
+    auto &elem = pool->getCacheElem(id);
+    elem.waitLoad(); // ensure load is done before unloading
+    auto token = tm.submit([pool, id] { pool->unloadTensor(id); });
+    elem.setUnloadToken(std::move(token));
+  }
+  return 0;
 }
 
-void TensorPool::loadCacheCancel(int id) {
-  if (dynamic_cast<CachePool *>(mem_pool.get()) == nullptr)
-    return;
-
-  cache_loader->cancelAsync(id);
+void TensorPool::loadCacheCancel(int) {
+  // no-op: ThreadManager handles cancellation via CompletionToken
 }
 
 unsigned int TensorPool::inActive(unsigned int order) {
-  return cache_loader->inActive(order);
+  auto pool = dynamic_cast<CachePool *>(mem_pool.get());
+  if (!pool)
+    return 0;
+
+  std::set<unsigned int> exec_ids = pool->getExecIDs(order);
+  for (auto &id : exec_ids) {
+    auto &elem = pool->getCacheElem(id);
+    elem.waitLoad(); // wait for any pending load
+    pool->inActive(id);
+  }
+  return 0;
 }
 
 } // namespace nntrainer
