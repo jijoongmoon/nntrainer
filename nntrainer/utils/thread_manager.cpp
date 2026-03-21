@@ -137,6 +137,7 @@ void ThreadManager::initialize() noexcept {
 
   // start compute workers
   compute_workers_.reserve(config.compute_threads);
+  worker_tasks_.resize(config.compute_threads);
   for (unsigned int i = 0; i < config.compute_threads; ++i) {
     compute_workers_.emplace_back([this, i] { computeWorkerLoop(i); });
   }
@@ -239,13 +240,10 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
 
     // only active workers do real work
     if (worker_id < active_workers_.load(std::memory_order_acquire)) {
-      size_t end = task_end_.load(std::memory_order_relaxed);
-      while (true) {
-        size_t idx = chunk_counter_.fetch_add(1, std::memory_order_relaxed);
-        if (idx >= end)
-          break;
-        current_task_(idx);
-      }
+      size_t wb = worker_tasks_[worker_id].begin;
+      size_t we = worker_tasks_[worker_id].end;
+      for (size_t i = wb; i < we; ++i)
+        current_task_(i);
     }
 
     // all workers signal done + readiness
