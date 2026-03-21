@@ -4,28 +4,28 @@
 
 ### 1.1 Purpose
 
-nntrainer에 통합 스레드 관리자(ThreadManager)를 도입하여, 기존 분산된 4개의
-스레딩 메커니즘(TaskExecutor, BS::thread_pool, ParallelBatch, OpenMP)을
-하나의 lightweight thread pool로 대체한다.
+Introduce a unified thread manager (ThreadManager) to nntrainer, replacing
+the four existing scattered threading mechanisms (TaskExecutor, BS::thread_pool,
+ParallelBatch, OpenMP) with a single lightweight thread pool.
 
 ### 1.2 Goals
 
-- **통합**: 4개 스레딩 메커니즘 → 1개 ThreadManager
-- **GGML 수준 성능**: llama.cpp threadpool과 동등한 성능 달성
-- **Zero-overhead parallel_for**: spin-wait barrier, atomic chunk counter
-- **안전한 비동기 I/O**: CompletionToken으로 race condition 해결
-- **Compute/I/O 물리적 분리**: GEMM 성능에 FSU I/O 간섭 없음
-- **CPU Affinity**: big.LITTLE 인식, 코어 1:1 바인딩
+- **Unification**: 4 threading mechanisms → 1 ThreadManager
+- **GGML-level performance**: On par with llama.cpp threadpool
+- **Zero-overhead parallel_for**: Spin-wait barrier, atomic chunk counter
+- **Safe async I/O**: Race conditions resolved via CompletionToken
+- **Physical compute/I/O separation**: No FSU I/O interference on GEMM performance
+- **CPU Affinity**: big.LITTLE aware, 1:1 core pinning
 
 ### 1.3 Migration Status
 
-| Phase | 내용 | 상태 |
-|-------|------|------|
-| Phase 1 | ThreadManager Core | ✅ 완료 |
-| Phase 2 | BS::thread_pool → ThreadManager | ✅ 완료 |
-| Phase 3 | ParallelBatch + OpenMP → ThreadManager | ✅ 완료 |
-| Phase 4 | FSU CacheLoader → ThreadManager::submit | ✅ 완료 |
-| Phase 5 | 레거시 파일 삭제 (-4,868줄) | ✅ 완료 |
+| Phase | Description | Status |
+|-------|-------------|--------|
+| Phase 1 | ThreadManager Core | ✅ Done |
+| Phase 2 | BS::thread_pool → ThreadManager | ✅ Done |
+| Phase 3 | ParallelBatch + OpenMP → ThreadManager | ✅ Done |
+| Phase 4 | FSU CacheLoader → ThreadManager::submit | ✅ Done |
+| Phase 5 | Legacy file removal (-4,868 lines) | ✅ Done |
 
 ---
 
@@ -218,8 +218,8 @@ graph LR
 
 ### 3.1 Compute: Spin-Wait Barrier (GGML-style)
 
-Compute worker 동기화에 GGML의 spin-wait barrier 패턴을 사용한다.
-llama.cpp issue #9588의 false sharing 수정도 적용 (alignas(64)).
+Uses GGML's spin-wait barrier pattern for compute worker synchronization.
+Also applies the false sharing fix from llama.cpp issue #9588 (alignas(64)).
 
 ```mermaid
 sequenceDiagram
@@ -254,8 +254,8 @@ sequenceDiagram
 
 ### 3.2 I/O: Condition Variable (FSU path)
 
-I/O worker는 blocking I/O (disk read/write)를 수행하므로 spin-wait가 부적합.
-Condition variable로 대기하며, CompletionToken으로 완료 추적.
+I/O workers perform blocking I/O (disk read/write), making spin-wait unsuitable.
+They wait on a condition variable, and completion is tracked via CompletionToken.
 
 ```mermaid
 sequenceDiagram
@@ -286,15 +286,15 @@ sequenceDiagram
     Note over Caller: Load confirmed
 ```
 
-### 3.3 Barrier vs Condition Variable 비교
+### 3.3 Barrier vs Condition Variable Comparison
 
-| 항목 | Barrier (Compute) | Condition Variable (I/O) |
-|------|-------------------|--------------------------|
-| 대기 방식 | Spin-wait (cpu_relax) | OS sleep (futex) |
-| Wake 레이턴시 | ~1-5 us | ~50-100 us |
-| CPU 사용 | 100% (대기 중) | 0% (대기 중) |
-| 적합한 작업 | GEMM, Conv2D (짧고 빈번) | Disk I/O (길고 드뭄) |
-| 동기화 대상 | 모든 worker 동시 완료 | 개별 task 완료 |
+| Aspect | Barrier (Compute) | Condition Variable (I/O) |
+|--------|-------------------|--------------------------|
+| Wait mode | Spin-wait (cpu_relax) | OS sleep (futex) |
+| Wake latency | ~1-5 us | ~50-100 us |
+| CPU usage | 100% (while waiting) | 0% (while waiting) |
+| Suitable for | GEMM, Conv2D (short & frequent) | Disk I/O (long & infrequent) |
+| Sync target | All workers complete together | Individual task completion |
 
 ---
 
@@ -358,17 +358,17 @@ sequenceDiagram
 
 ### 4.3 Look-ahead Test Coverage
 
-FSU look-ahead 파이프라인의 정확성을 검증하는 5개 테스트:
+5 tests verifying correctness of the FSU look-ahead pipeline:
 
-| 테스트 | 검증 내용 |
-|--------|-----------|
-| `lookahead_basic_pipeline` | lookahead=2로 5개 레이어 전체 파이프라인 시뮬레이션. pre-load → waitLoad → compute(parallel_for) → unload → prefetch next 순서 검증 |
-| `lookahead_overlap_verification` | I/O와 compute의 실제 오버랩 검증. compute 완료 후 prefetch된 레이어의 `isLoadDone()` == true 확인 |
-| `lookahead_multi_epoch` | 3 epoch 반복 시 CompletionToken이 매 epoch마다 정상 재설정되는지 확인 |
-| `lookahead_async_unload_pipeline` | load + unload + compute 3가지 비동기 파이프라인. `asyncUnload(f)` + `asyncLoad(f+2)` + `parallel_for` 동시 실행 |
-| `lookahead_token_polling` | `isDone()` 비차단 폴링과 `waitLoad()` 차단 대기를 혼합 사용하는 패턴 검증 |
+| Test | Verification |
+|------|-------------|
+| `lookahead_basic_pipeline` | Full pipeline simulation with lookahead=2 across 5 layers. Verifies pre-load → waitLoad → compute(parallel_for) → unload → prefetch next ordering |
+| `lookahead_overlap_verification` | Verifies actual I/O and compute overlap. Checks `isLoadDone()` == true for prefetched layer after compute completes |
+| `lookahead_multi_epoch` | Verifies CompletionToken properly resets across 3 repeated epochs |
+| `lookahead_async_unload_pipeline` | 3-way async pipeline with load + unload + compute. Concurrent `asyncUnload(f)` + `asyncLoad(f+2)` + `parallel_for` execution |
+| `lookahead_token_polling` | Verifies mixed usage of `isDone()` non-blocking polling and `waitLoad()` blocking wait patterns |
 
-#### Look-ahead Pipeline Sequence (테스트 기준)
+#### Look-ahead Pipeline Sequence (test-based)
 
 ```mermaid
 sequenceDiagram
@@ -448,13 +448,13 @@ sequenceDiagram
 ### 5.1 parallel_for
 
 ```cpp
-// 모든 compute worker 사용
+// Use all compute workers
 tm.parallel_for(0, N, [&](size_t i) { compute(i); });
 
-// n_workers개 worker만 사용 (나머지는 skip)
+// Use only n_workers workers (rest are skipped)
 tm.parallel_for(0, N, 4u, [&](size_t i) { compute(i); });
 
-// chunked: 스레드 인덱스 기반 (GEMM column 분할용)
+// Chunked: thread-index based (for GEMM column partitioning)
 tm.parallel_for_chunked(n_threads, [&](size_t tid) {
   size_t start = (tid * N) / n_threads;
   size_t end = ((tid + 1) * N) / n_threads;
@@ -500,12 +500,12 @@ ThreadManager::setConfig(config);  // must call before Global()
 | Chunked 4x4096 | 678,894 us | 279,222 us | 289,521 us | 191,057 us | **1.02x** |
 | 50 rapid dispatch | 26 us | 77,929 us | 4,153 us | 89 us | **0.02x** |
 
-*Large GEMM과 Chunked GEMM에서 GGML과 동등 성능 달성.
-Rapid dispatch에서 ThreadManager가 50x 빠름 (inactive worker skip).*
+*Achieves parity with GGML on Large GEMM and Chunked GEMM.
+ThreadManager is 50x faster on rapid dispatch (inactive worker skip).*
 
 ### 6.2 Cache Line Isolation
 
-llama.cpp issue #9588의 false sharing 문제를 동일하게 적용:
+Applies the same false sharing fix from llama.cpp issue #9588:
 
 ```cpp
 alignas(64) std::atomic<unsigned int> generation_{0};
@@ -516,7 +516,8 @@ alignas(64) std::atomic<unsigned int> active_workers_{0};
 alignas(64) std::atomic<bool> stop_{false};
 ```
 
-각 atomic이 별도 cache line (64 bytes)에 위치하여 코어 간 cache bouncing 방지.
+Each atomic resides on a separate cache line (64 bytes), preventing
+inter-core cache bouncing.
 
 ---
 
@@ -598,9 +599,9 @@ graph TD
 
 ### 8.2 Thread Safety Rules
 
-1. `parallel_for`는 **재진입 불가** (한 번에 하나의 parallel_for만 실행)
-2. `submit`은 **다중 스레드에서 안전** (mutex-protected queue)
-3. `CompletionToken`은 **다중 스레드에서 wait 가능** (shared_ptr + cv)
-4. Compute workers는 **I/O 태스크를 실행하지 않음** (간섭 없음)
-5. I/O workers는 **parallel_for에 참여하지 않음** (deadlock 방지)
-6. CPU affinity: **compute와 I/O는 다른 코어** (cache 오염 없음)
+1. `parallel_for` is **non-reentrant** (only one parallel_for at a time)
+2. `submit` is **thread-safe** (mutex-protected queue)
+3. `CompletionToken` is **safe for multi-threaded wait** (shared_ptr + cv)
+4. Compute workers **never execute I/O tasks** (no interference)
+5. I/O workers **never participate in parallel_for** (deadlock prevention)
+6. CPU affinity: **compute and I/O on separate cores** (no cache pollution)
