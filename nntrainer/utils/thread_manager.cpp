@@ -59,7 +59,6 @@ void ThreadManager::initialize() noexcept {
 }
 
 void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
-  (void)worker_id;
   unsigned int my_gen = compute_generation_.load(std::memory_order_acquire);
 
   // signal initial readiness
@@ -78,22 +77,23 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
     }
 
     if (stop_.load(std::memory_order_acquire)) {
-      // signal done so destructor's waitComputeDone unblocks
       workers_done_.fetch_add(1, std::memory_order_release);
       done_cv_.notify_one();
       return;
     }
 
-    // grab chunks via atomic counter
-    size_t end = task_end_.load(std::memory_order_relaxed);
-    while (true) {
-      size_t idx = chunk_counter_.fetch_add(1, std::memory_order_relaxed);
-      if (idx >= end)
-        break;
-      current_task_(idx);
+    // only active workers do real work
+    if (worker_id < active_workers_.load(std::memory_order_acquire)) {
+      size_t end = task_end_.load(std::memory_order_relaxed);
+      while (true) {
+        size_t idx = chunk_counter_.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= end)
+          break;
+        current_task_(idx);
+      }
     }
 
-    // signal that this worker is done
+    // all workers (active or not) signal done
     workers_done_.fetch_add(1, std::memory_order_release);
     done_cv_.notify_one();
 
