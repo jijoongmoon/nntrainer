@@ -13,7 +13,7 @@
 
 #include <layer_context.h>
 #include <lstm.h>
-#include <nntr_threads.h>
+#include <thread_manager.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -183,153 +183,43 @@ void LSTMLayer::calcGradientBatchFirstLSTM(
     d_hidden_state_.multiply_i(mask_);
   }
 
-  auto workers = ParallelBatch(batch_size);
+  auto &tm = nntrainer::ThreadManager::Global();
+  size_t num_workers =
+    static_cast<size_t>(tm.getComputeThreadCount()) + 1;
 
-  if (workers.getNumWorkers() > 1) {
+  TensorDim weight_ih_d = d_weight_ih.getDim();
+  TensorDim weight_hh_d = d_weight_hh.getDim();
 
-    TensorDim weight_ih_d = d_weight_ih.getDim();
-    TensorDim weight_hh_d = d_weight_hh.getDim();
+  TensorDim bias_ih_d = d_bias_ih.getDim();
+  TensorDim bias_hh_d = d_bias_hh.getDim();
+  TensorDim bias_h_d = d_bias_h.getDim();
 
-    TensorDim bias_ih_d = d_bias_ih.getDim();
-    TensorDim bias_hh_d = d_bias_hh.getDim();
-    TensorDim bias_h_d = d_bias_h.getDim();
+  weight_ih_d.batch(num_workers);
+  weight_hh_d.batch(num_workers);
+  bias_ih_d.batch(num_workers);
+  bias_hh_d.batch(num_workers);
+  bias_h_d.batch(num_workers);
 
-    weight_ih_d.batch(workers.getNumWorkers());
-    weight_hh_d.batch(workers.getNumWorkers());
-    bias_ih_d.batch(workers.getNumWorkers());
-    bias_hh_d.batch(workers.getNumWorkers());
-    bias_h_d.batch(workers.getNumWorkers());
+  Tensor sub_d_weight_ih = Tensor(weight_ih_d);
+  Tensor sub_d_weight_hh = Tensor(weight_hh_d);
+  Tensor sub_d_bias_ih = Tensor(bias_ih_d);
+  Tensor sub_d_bias_hh = Tensor(bias_hh_d);
+  Tensor sub_d_bias_h = Tensor(bias_h_d);
 
-    Tensor sub_d_weight_ih = Tensor(weight_ih_d);
-    Tensor sub_d_weight_hh = Tensor(weight_hh_d);
-    Tensor sub_d_bias_ih = Tensor(bias_ih_d);
-    Tensor sub_d_bias_hh = Tensor(bias_hh_d);
-    Tensor sub_d_bias_h = Tensor(bias_h_d);
+  sub_d_weight_ih.setZero();
+  sub_d_weight_hh.setZero();
+  sub_d_bias_ih.setZero();
+  sub_d_bias_hh.setZero();
+  sub_d_bias_h.setZero();
 
-    sub_d_weight_ih.setZero();
-    sub_d_weight_hh.setZero();
-    sub_d_bias_ih.setZero();
-    sub_d_bias_hh.setZero();
-    sub_d_bias_h.setZero();
-
-    auto batch_job = [&](unsigned int s, unsigned int e, unsigned int pid,
-                         void *user_data) {
-      for (unsigned int batch = s; batch < e; ++batch) {
-        const Tensor input_sample = input_.getBatchSlice(batch, 1);
-
-        const Tensor hidden_state_sample =
-          hidden_state_.getBatchSlice(batch, 1);
-        Tensor d_hidden_state_sample = d_hidden_state_.getBatchSlice(batch, 1);
-        const Tensor cell_state_sample = cell_state_.getBatchSlice(batch, 1);
-        Tensor d_cell_state_sample = d_cell_state_.getBatchSlice(batch, 1);
-
-        const Tensor ifgo_sample = ifgo_.getBatchSlice(batch, 1);
-        Tensor d_ifgo_sample = d_ifgo_.getBatchSlice(batch, 1);
-
-        Tensor input;
-        Tensor prev_hidden_state;
-        Tensor d_prev_hidden_state;
-        Tensor prev_cell_state;
-        Tensor d_prev_cell_state;
-        Tensor d_hidden_state;
-        Tensor cell_state;
-        Tensor d_cell_state;
-
-        Tensor p_d_weight_ih = sub_d_weight_ih.getBatchSlice(pid, 1);
-        Tensor p_d_weight_hh = sub_d_weight_hh.getBatchSlice(pid, 1);
-        Tensor p_d_bias_ih = sub_d_bias_ih.getBatchSlice(pid, 1);
-        Tensor p_d_bias_hh = sub_d_bias_hh.getBatchSlice(pid, 1);
-        Tensor p_d_bias_h = sub_d_bias_h.getBatchSlice(pid, 1);
-
-        for (int t = max_timestep - 1; t > -1; t--) {
-          input = input_sample.getSharedDataTensor(
-            feature_size_tensor_dim,
-            (reverse ? max_timestep - 1 - t : t) * feature_size);
-
-          if (!t) {
-            prev_hidden_state = Tensor(unit, tensor_type);
-            prev_hidden_state.setZero();
-            d_prev_hidden_state = Tensor(unit, tensor_type);
-            d_prev_hidden_state.setZero();
-          } else {
-            prev_hidden_state = hidden_state_sample.getSharedDataTensor(
-              unit_tensor_dim, (reverse ? (max_timestep - t) : (t - 1)) * unit);
-            d_prev_hidden_state = d_hidden_state_sample.getSharedDataTensor(
-              unit_tensor_dim, (reverse ? (max_timestep - t) : (t - 1)) * unit);
-          }
-          d_hidden_state = d_hidden_state_sample.getSharedDataTensor(
-            unit_tensor_dim, (reverse ? max_timestep - 1 - t : t) * unit);
-
-          if (!t) {
-            prev_cell_state = Tensor(unit, tensor_type);
-            prev_cell_state.setZero();
-            d_prev_cell_state = Tensor(unit, tensor_type);
-            d_prev_cell_state.setZero();
-          } else {
-            prev_cell_state = cell_state_sample.getSharedDataTensor(
-              unit_tensor_dim, (reverse ? (max_timestep - t) : (t - 1)) * unit);
-            d_prev_cell_state = d_cell_state_sample.getSharedDataTensor(
-              unit_tensor_dim, (reverse ? (max_timestep - t) : (t - 1)) * unit);
-          }
-          cell_state = cell_state_sample.getSharedDataTensor(
-            unit_tensor_dim, (reverse ? max_timestep - 1 - t : t) * unit);
-          d_cell_state = d_cell_state_sample.getSharedDataTensor(
-            unit_tensor_dim, (reverse ? max_timestep - 1 - t : t) * unit);
-
-          Tensor ifgo = ifgo_sample.getSharedDataTensor(
-            num_gate_tensor_dim,
-            (reverse ? max_timestep - 1 - t : t) * NUM_GATE * unit);
-          Tensor d_ifgo = d_ifgo_sample.getSharedDataTensor(
-            num_gate_tensor_dim,
-            (reverse ? max_timestep - 1 - t : t) * NUM_GATE * unit);
-
-          // Temporary variable for d_prev_hidden_state. d_prev_hidden_state
-          // already have precalculated values from incomming derivatives
-          Tensor d_prev_hidden_state_temp =
-            Tensor("d_prev_hidden_state_temp", tensor_type.format,
-                   tensor_type.data_type);
-
-          calcGradientLSTM(
-            1, unit, disable_bias, integrate_bias, acti_func,
-            recurrent_acti_func, input, prev_hidden_state,
-            d_prev_hidden_state_temp, prev_cell_state, d_prev_cell_state,
-            d_hidden_state, cell_state, d_cell_state, p_d_weight_ih, weight_hh,
-            p_d_weight_hh, p_d_bias_h, p_d_bias_ih, p_d_bias_hh, ifgo, d_ifgo);
-
-          d_prev_hidden_state.add_i(d_prev_hidden_state_temp);
-        }
-      }
-    };
-
-    workers.setCallback(batch_job, nullptr);
-    workers.run();
-
-    for (unsigned int b = 0; b < workers.getNumWorkers(); ++b) {
-
-      Tensor p_d_weight_ih = sub_d_weight_ih.getBatchSlice(b, 1);
-      Tensor p_d_weight_hh = sub_d_weight_hh.getBatchSlice(b, 1);
-      Tensor p_d_bias_ih = sub_d_bias_ih.getBatchSlice(b, 1);
-      Tensor p_d_bias_hh = sub_d_bias_hh.getBatchSlice(b, 1);
-      Tensor p_d_bias_h = sub_d_bias_h.getBatchSlice(b, 1);
-
-      d_weight_ih.add_i(p_d_weight_ih);
-      d_weight_hh.add_i(p_d_weight_hh);
-
-      if (!disable_bias) {
-        if (integrate_bias) {
-          d_bias_h.add_i(p_d_bias_h);
-        } else {
-          d_bias_ih.add_i(p_d_bias_ih);
-          d_bias_hh.add_i(p_d_bias_hh);
-        }
-      }
-    }
-
-  } else {
-    for (unsigned int batch = 0; batch < batch_size; ++batch) {
+  tm.parallel_for_chunked(num_workers, [&](size_t pid) {
+    size_t s = pid * batch_size / num_workers;
+    size_t e = (pid + 1) * batch_size / num_workers;
+    for (size_t batch = s; batch < e; ++batch) {
       const Tensor input_sample = input_.getBatchSlice(batch, 1);
 
-      const Tensor hidden_state_sample = hidden_state_.getBatchSlice(batch, 1);
+      const Tensor hidden_state_sample =
+        hidden_state_.getBatchSlice(batch, 1);
       Tensor d_hidden_state_sample = d_hidden_state_.getBatchSlice(batch, 1);
       const Tensor cell_state_sample = cell_state_.getBatchSlice(batch, 1);
       Tensor d_cell_state_sample = d_cell_state_.getBatchSlice(batch, 1);
@@ -345,6 +235,12 @@ void LSTMLayer::calcGradientBatchFirstLSTM(
       Tensor d_hidden_state;
       Tensor cell_state;
       Tensor d_cell_state;
+
+      Tensor p_d_weight_ih = sub_d_weight_ih.getBatchSlice(pid, 1);
+      Tensor p_d_weight_hh = sub_d_weight_hh.getBatchSlice(pid, 1);
+      Tensor p_d_bias_ih = sub_d_bias_ih.getBatchSlice(pid, 1);
+      Tensor p_d_bias_hh = sub_d_bias_hh.getBatchSlice(pid, 1);
+      Tensor p_d_bias_h = sub_d_bias_h.getBatchSlice(pid, 1);
 
       for (int t = max_timestep - 1; t > -1; t--) {
         input = input_sample.getSharedDataTensor(
@@ -394,13 +290,35 @@ void LSTMLayer::calcGradientBatchFirstLSTM(
           Tensor("d_prev_hidden_state_temp", tensor_type.format,
                  tensor_type.data_type);
 
-        calcGradientLSTM(1, unit, disable_bias, integrate_bias, acti_func,
-                         recurrent_acti_func, input, prev_hidden_state,
-                         d_prev_hidden_state_temp, prev_cell_state,
-                         d_prev_cell_state, d_hidden_state, cell_state,
-                         d_cell_state, d_weight_ih, weight_hh, d_weight_hh,
-                         d_bias_h, d_bias_ih, d_bias_hh, ifgo, d_ifgo);
+        calcGradientLSTM(
+          1, unit, disable_bias, integrate_bias, acti_func,
+          recurrent_acti_func, input, prev_hidden_state,
+          d_prev_hidden_state_temp, prev_cell_state, d_prev_cell_state,
+          d_hidden_state, cell_state, d_cell_state, p_d_weight_ih, weight_hh,
+          p_d_weight_hh, p_d_bias_h, p_d_bias_ih, p_d_bias_hh, ifgo, d_ifgo);
+
         d_prev_hidden_state.add_i(d_prev_hidden_state_temp);
+      }
+    }
+  });
+
+  for (size_t b = 0; b < num_workers; ++b) {
+
+    Tensor p_d_weight_ih = sub_d_weight_ih.getBatchSlice(b, 1);
+    Tensor p_d_weight_hh = sub_d_weight_hh.getBatchSlice(b, 1);
+    Tensor p_d_bias_ih = sub_d_bias_ih.getBatchSlice(b, 1);
+    Tensor p_d_bias_hh = sub_d_bias_hh.getBatchSlice(b, 1);
+    Tensor p_d_bias_h = sub_d_bias_h.getBatchSlice(b, 1);
+
+    d_weight_ih.add_i(p_d_weight_ih);
+    d_weight_hh.add_i(p_d_weight_hh);
+
+    if (!disable_bias) {
+      if (integrate_bias) {
+        d_bias_h.add_i(p_d_bias_h);
+      } else {
+        d_bias_ih.add_i(p_d_bias_ih);
+        d_bias_hh.add_i(p_d_bias_hh);
       }
     }
   }
