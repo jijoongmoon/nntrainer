@@ -75,10 +75,13 @@ void ThreadManager::initialize() noexcept {
   if (hw_threads == 0)
     hw_threads = 1;
 
-  // cap compute threads to physical cores minus 1 (caller thread uses a core)
-  unsigned int max_workers = hw_threads > 1 ? hw_threads - 1 : 1;
-  if (config.compute_threads > max_workers)
-    config.compute_threads = max_workers;
+  // Reserve cores: core 0 = caller, then compute, then I/O
+  // Layout: [caller | compute_0 .. compute_N | io_0 .. io_M]
+  unsigned int reserved = 1 + config.io_threads; // caller + I/O
+  unsigned int max_compute =
+    hw_threads > reserved ? hw_threads - reserved : 1;
+  if (config.compute_threads > max_compute)
+    config.compute_threads = max_compute;
 
   // start compute workers
   compute_workers_.reserve(config.compute_threads);
@@ -86,18 +89,27 @@ void ThreadManager::initialize() noexcept {
     compute_workers_.emplace_back([this, i] { computeWorkerLoop(i); });
   }
 
-  // pin compute workers to cores (worker i → core i+1, core 0 for caller)
+  // start I/O workers
+  io_workers_.reserve(config.io_threads);
+  for (unsigned int i = 0; i < config.io_threads; ++i) {
+    io_workers_.emplace_back([this] { ioWorkerLoop(); });
+  }
+
+  // Pin threads to cores: compute and I/O on separate cores
+  // Core 0: caller thread (not pinned here, user can pin if needed)
+  // Core 1..N: compute workers
+  // Core N+1..N+M: I/O workers
   if (config.enable_affinity) {
     for (unsigned int i = 0; i < compute_workers_.size(); ++i) {
       unsigned int core = (i + 1) % hw_threads;
       pinThreadToCore(compute_workers_[i], core);
     }
-  }
-
-  // start I/O workers (not pinned — they do blocking I/O)
-  io_workers_.reserve(config.io_threads);
-  for (unsigned int i = 0; i < config.io_threads; ++i) {
-    io_workers_.emplace_back([this] { ioWorkerLoop(); });
+    unsigned int io_core_start =
+      static_cast<unsigned int>(compute_workers_.size()) + 1;
+    for (unsigned int i = 0; i < io_workers_.size(); ++i) {
+      unsigned int core = (io_core_start + i) % hw_threads;
+      pinThreadToCore(io_workers_[i], core);
+    }
   }
 }
 
