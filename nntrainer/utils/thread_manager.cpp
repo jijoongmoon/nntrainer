@@ -62,6 +62,10 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
   (void)worker_id;
   unsigned int my_gen = compute_generation_.load(std::memory_order_acquire);
 
+  // signal initial readiness
+  workers_ready_.fetch_add(1, std::memory_order_release);
+  done_cv_.notify_one();
+
   while (true) {
     // wait for new work (generation change) or stop
     {
@@ -92,6 +96,10 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
     // signal that this worker is done
     workers_done_.fetch_add(1, std::memory_order_release);
     done_cv_.notify_one();
+
+    // signal readiness for next round
+    workers_ready_.fetch_add(1, std::memory_order_release);
+    done_cv_.notify_one();
   }
 }
 
@@ -101,7 +109,6 @@ void ThreadManager::waitComputeDone() {
   done_cv_.wait(lock, [this, n] {
     return workers_done_.load(std::memory_order_acquire) >= n;
   });
-  workers_done_.store(0, std::memory_order_release);
 }
 
 void ThreadManager::ioWorkerLoop() {
