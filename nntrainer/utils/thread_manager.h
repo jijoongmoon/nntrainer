@@ -188,20 +188,36 @@ private:
   void ioWorkerLoop();
   void waitComputeDone();
 
-  // Compute workers
+  // ─── Compute workers ───────────────────────────────────
+  // Each frequently-written atomic on its own cache line to prevent
+  // false sharing (same fix as llama.cpp #9598: +21% on 80-core ARM).
+
   std::vector<std::thread> compute_workers_;
   std::vector<WorkerTask> worker_tasks_; /**< per-worker range, cache aligned */
+  std::function<void(size_t)> current_task_;
+
+  // generation: written by caller, read by all workers (wake signal)
+  alignas(64) std::atomic<unsigned int> compute_generation_{0};
+
+  // workers_done: written by each worker, read by caller (completion signal)
+  alignas(64) std::atomic<unsigned int> workers_done_{0};
+
+  // workers_ready: written by each worker, read by caller (readiness check)
+  alignas(64) std::atomic<unsigned int> workers_ready_{0};
+
+  // active_workers: written by caller, read by workers (activation check)
+  alignas(64) std::atomic<unsigned int> active_workers_{0};
+
+  // stop: written by destructor, read by all workers
+  alignas(64) std::atomic<bool> stop_{false};
+
+  // mutexes and CVs (not contended atomically, grouping is fine)
   std::mutex compute_mutex_;
   std::condition_variable compute_cv_;
-  std::function<void(size_t)> current_task_;
-  std::atomic<unsigned int> compute_generation_{0};
-  std::atomic<unsigned int> workers_done_{0};
-  std::atomic<unsigned int> workers_ready_{0};
-  std::atomic<unsigned int> active_workers_{0};
   std::mutex done_mutex_;
   std::condition_variable done_cv_;
 
-  // I/O workers
+  // ─── I/O workers ─────────────────────────────────────
   std::vector<std::thread> io_workers_;
   std::queue<std::pair<std::function<void()>,
                        std::shared_ptr<CompletionToken::SharedState>>>
@@ -209,8 +225,7 @@ private:
   std::mutex io_mutex_;
   std::condition_variable io_cv_;
 
-  // Shared
-  std::atomic<bool> stop_{false};
+  // ─── Config ──────────────────────────────────────────
   ThreadManagerConfig config_;
 
   static ThreadManagerConfig pending_config_;
