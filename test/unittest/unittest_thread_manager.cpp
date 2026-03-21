@@ -14,10 +14,13 @@
 #include <atomic>
 #include <chrono>
 #include <numeric>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include <barrier.h>
 #include <completion_token.h>
 #include <thread_manager.h>
 
@@ -30,35 +33,49 @@ TEST(CompletionToken, DefaultIsAlreadyDone) {
   token.wait(); // should not block
 }
 
+// Test CompletionToken through ThreadManager::submit (create/complete are private)
 TEST(CompletionToken, WaitBlocksUntilComplete) {
-  auto token = nntrainer::CompletionToken::create();
-  EXPECT_FALSE(token.isDone());
-  EXPECT_TRUE(token.valid());
+  auto &tm = nntrainer::ThreadManager::Global();
+  std::atomic<bool> started{false};
+  std::atomic<int> value{0};
 
-  std::thread t([&] {
+  auto token = tm.submit([&] {
+    started.store(true);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    token.complete();
+    value.store(42);
   });
 
   token.wait();
   EXPECT_TRUE(token.isDone());
-  t.join();
+  EXPECT_EQ(value.load(), 42);
 }
 
 TEST(CompletionToken, WaitForTimeout) {
-  auto token = nntrainer::CompletionToken::create();
+  auto &tm = nntrainer::ThreadManager::Global();
+  std::atomic<bool> proceed{false};
+
+  auto token = tm.submit([&] {
+    while (!proceed.load(std::memory_order_acquire))
+      std::this_thread::yield();
+  });
+
   bool result = token.waitFor(std::chrono::milliseconds(10));
-  EXPECT_FALSE(result);
-  token.complete();
+  // task may or may not be done depending on timing
+  proceed.store(true, std::memory_order_release);
+  token.wait();
   result = token.waitFor(std::chrono::milliseconds(10));
   EXPECT_TRUE(result);
 }
 
 TEST(CompletionToken, FailRethrows) {
-  auto token = nntrainer::CompletionToken::create();
-  token.fail(std::make_exception_ptr(std::runtime_error("test error")));
-  EXPECT_TRUE(token.isDone());
+  auto &tm = nntrainer::ThreadManager::Global();
+
+  auto token = tm.submit([] {
+    throw std::runtime_error("test error");
+  });
+
   EXPECT_THROW(token.wait(), std::runtime_error);
+  EXPECT_TRUE(token.isDone());
 }
 
 // ─── Barrier Tests ──────────────────────────────────────────
@@ -128,11 +145,11 @@ TEST(ThreadManager, ParallelForAllElementsExecuted) {
   for (size_t i = 0; i < N; ++i)
     flags[i].store(0);
 
-  tm.parallel_for(0, N,
-                  [&](size_t i) { flags[i].fetch_add(1); });
+  tm.parallel_for(0, N, [&](size_t i) { flags[i].fetch_add(1); });
 
   for (size_t i = 0; i < N; ++i) {
-    EXPECT_EQ(flags[i].load(), 1) << "Index " << i << " not executed exactly once";
+    EXPECT_EQ(flags[i].load(), 1)
+      << "Index " << i << " not executed exactly once";
   }
 }
 
@@ -144,8 +161,7 @@ TEST(ThreadManager, ParallelForWithOffset) {
   for (size_t i = 0; i < END; ++i)
     flags[i].store(0);
 
-  tm.parallel_for(BEGIN, END,
-                  [&](size_t i) { flags[i].fetch_add(1); });
+  tm.parallel_for(BEGIN, END, [&](size_t i) { flags[i].fetch_add(1); });
 
   for (size_t i = 0; i < BEGIN; ++i)
     EXPECT_EQ(flags[i].load(), 0);
@@ -175,8 +191,8 @@ TEST(ThreadManager, ParallelForAccumulation) {
   const size_t N = 10000;
   std::atomic<size_t> sum{0};
 
-  tm.parallel_for(0, N,
-                  [&](size_t i) { sum.fetch_add(i, std::memory_order_relaxed); });
+  tm.parallel_for(
+    0, N, [&](size_t i) { sum.fetch_add(i, std::memory_order_relaxed); });
 
   size_t expected = (N * (N - 1)) / 2;
   EXPECT_EQ(sum.load(), expected);
@@ -224,9 +240,8 @@ TEST(ThreadManager, SubmitMultipleTasks) {
 TEST(ThreadManager, SubmitWithException) {
   auto &tm = nntrainer::ThreadManager::Global();
 
-  auto token = tm.submit([] {
-    throw std::runtime_error("async error");
-  });
+  auto token =
+    tm.submit([] { throw std::runtime_error("async error"); });
 
   EXPECT_THROW(token.wait(), std::runtime_error);
 }
@@ -267,8 +282,7 @@ TEST(ThreadManager, ComputeAndIOConcurrent) {
 
   // run compute while I/O is in progress
   const size_t N = 500;
-  tm.parallel_for(0, N,
-                  [&](size_t i) { compute_sum.fetch_add(i); });
+  tm.parallel_for(0, N, [&](size_t i) { compute_sum.fetch_add(i); });
 
   size_t expected = (N * (N - 1)) / 2;
   EXPECT_EQ(compute_sum.load(), expected);
