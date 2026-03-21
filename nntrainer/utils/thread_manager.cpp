@@ -121,7 +121,8 @@ ThreadManager::~ThreadManager() {
 }
 
 void ThreadManager::initialize() noexcept {
-  auto config = pending_config_;
+  config_ = pending_config_;
+  auto config = config_;
 
   unsigned int hw_threads = std::thread::hardware_concurrency();
   if (hw_threads == 0)
@@ -179,21 +180,56 @@ void ThreadManager::initialize() noexcept {
 
 void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
   unsigned int my_gen = compute_generation_.load(std::memory_order_acquire);
+  const auto policy = config_.wait_policy;
+  const unsigned int spin_count = config_.spin_count;
 
   // signal initial readiness
   workers_ready_.fetch_add(1, std::memory_order_release);
   done_cv_.notify_one();
 
   while (true) {
-    // wait for new work (generation change) or stop
-    {
+    // ─── Wait for new work: Spin → Yield → Sleep ───
+    bool got_work = false;
+
+    // Phase 1: Spin (lowest latency, for inference hot path)
+    if (policy == WaitPolicy::Spin || policy == WaitPolicy::Adaptive) {
+      for (unsigned int s = 0; s < spin_count; ++s) {
+        if (compute_generation_.load(std::memory_order_acquire) != my_gen ||
+            stop_.load(std::memory_order_acquire)) {
+          got_work = true;
+          break;
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield");
+#endif
+      }
+    }
+
+    // Phase 2: Yield (give up timeslice but stay runnable)
+    if (!got_work &&
+        (policy == WaitPolicy::Spin || policy == WaitPolicy::Adaptive)) {
+      for (unsigned int y = 0; y < 32; ++y) {
+        if (compute_generation_.load(std::memory_order_acquire) != my_gen ||
+            stop_.load(std::memory_order_acquire)) {
+          got_work = true;
+          break;
+        }
+        std::this_thread::yield();
+      }
+    }
+
+    // Phase 3: Sleep on condition variable (saves CPU)
+    if (!got_work) {
       std::unique_lock<std::mutex> lock(compute_mutex_);
       compute_cv_.wait(lock, [this, &my_gen] {
         return compute_generation_.load(std::memory_order_acquire) != my_gen ||
                stop_.load(std::memory_order_acquire);
       });
-      my_gen = compute_generation_.load(std::memory_order_acquire);
     }
+
+    my_gen = compute_generation_.load(std::memory_order_acquire);
 
     if (stop_.load(std::memory_order_acquire)) {
       workers_done_.fetch_add(1, std::memory_order_release);
@@ -212,11 +248,9 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
       }
     }
 
-    // all workers (active or not) signal done
+    // all workers signal done + readiness
     workers_done_.fetch_add(1, std::memory_order_release);
     done_cv_.notify_one();
-
-    // signal readiness for next round
     workers_ready_.fetch_add(1, std::memory_order_release);
     done_cv_.notify_one();
   }

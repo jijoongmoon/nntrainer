@@ -31,11 +31,23 @@ namespace nntrainer {
  * @struct ThreadManagerConfig
  * @brief  Configuration for ThreadManager initialization
  */
+/**
+ * @enum WaitPolicy
+ * @brief How compute workers wait for work between parallel_for calls.
+ */
+enum class WaitPolicy {
+  Sleep,    /**< condition_variable only (lowest CPU, highest latency) */
+  Adaptive, /**< spin briefly, then yield, then sleep (balanced) */
+  Spin      /**< busy-wait only (lowest latency, highest CPU usage) */
+};
+
 struct ThreadManagerConfig {
   unsigned int compute_threads =
     std::thread::hardware_concurrency(); /**< compute worker count */
   unsigned int io_threads = 3;           /**< I/O worker count */
   bool enable_affinity = false;          /**< pin workers to cores 1:1 */
+  WaitPolicy wait_policy = WaitPolicy::Adaptive; /**< compute worker wait */
+  unsigned int spin_count = 1000; /**< spin iterations before yield/sleep */
 };
 
 /**
@@ -214,6 +226,7 @@ private:
 
   // Shared
   std::atomic<bool> stop_{false};
+  ThreadManagerConfig config_;
 
   static ThreadManagerConfig pending_config_;
 };
