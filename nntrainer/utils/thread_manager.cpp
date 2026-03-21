@@ -128,12 +128,17 @@ void ThreadManager::initialize() noexcept {
   if (hw_threads == 0)
     hw_threads = 1;
 
-  // Reserve cores: 1 for caller + io_threads for I/O
-  unsigned int reserved = 1 + config.io_threads;
-  unsigned int max_compute =
-    hw_threads > reserved ? hw_threads - reserved : 1;
-  if (config.compute_threads > max_compute)
-    config.compute_threads = max_compute;
+  // Priority: caller(1) > compute > I/O
+  // Compute gets at least 1 core, I/O gets remainder
+  unsigned int available = hw_threads > 1 ? hw_threads - 1 : 1; // minus caller
+  if (config.compute_threads > available)
+    config.compute_threads = available;
+
+  unsigned int remaining = available > config.compute_threads
+                             ? available - config.compute_threads
+                             : 0;
+  if (config.io_threads > remaining)
+    config.io_threads = remaining > 0 ? remaining : 1;
 
   // start compute workers
   compute_workers_.reserve(config.compute_threads);

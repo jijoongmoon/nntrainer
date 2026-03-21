@@ -39,8 +39,10 @@ enum class WaitPolicy {
 
 struct ThreadManagerConfig {
   unsigned int compute_threads =
-    std::thread::hardware_concurrency(); /**< compute worker count */
-  unsigned int io_threads = 3;           /**< I/O worker count */
+    std::thread::hardware_concurrency() > 2
+      ? std::thread::hardware_concurrency() - 2
+      : 1; /**< compute worker count (hw - caller - 1 io) */
+  unsigned int io_threads = 1; /**< I/O worker count */
   bool enable_affinity = false;          /**< pin workers to cores 1:1 */
   WaitPolicy wait_policy = WaitPolicy::Adaptive; /**< compute worker wait */
   unsigned int spin_count = 1000; /**< spin iterations before yield/sleep */
