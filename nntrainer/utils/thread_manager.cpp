@@ -13,7 +13,33 @@
 
 #include <thread_manager.h>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 namespace nntrainer {
+
+/**
+ * @brief Pin a thread to a specific CPU core.
+ * @param thread the thread to pin
+ * @param core_id the core index to pin to
+ * @return true if successful or not supported on this platform
+ */
+static bool pinThreadToCore(std::thread &thread, unsigned int core_id) {
+#if defined(__linux__)
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(core_id, &cpuset);
+  int rc =
+    pthread_setaffinity_np(thread.native_handle(), sizeof(cpu_set_t), &cpuset);
+  return rc == 0;
+#else
+  (void)thread;
+  (void)core_id;
+  return true; // no-op on non-Linux
+#endif
+}
 
 ThreadManagerConfig ThreadManager::pending_config_ = {};
 
@@ -45,13 +71,30 @@ ThreadManager::~ThreadManager() {
 void ThreadManager::initialize() noexcept {
   auto config = pending_config_;
 
+  unsigned int hw_threads = std::thread::hardware_concurrency();
+  if (hw_threads == 0)
+    hw_threads = 1;
+
+  // cap compute threads to physical cores minus 1 (caller thread uses a core)
+  unsigned int max_workers = hw_threads > 1 ? hw_threads - 1 : 1;
+  if (config.compute_threads > max_workers)
+    config.compute_threads = max_workers;
+
   // start compute workers
   compute_workers_.reserve(config.compute_threads);
   for (unsigned int i = 0; i < config.compute_threads; ++i) {
     compute_workers_.emplace_back([this, i] { computeWorkerLoop(i); });
   }
 
-  // start I/O workers
+  // pin compute workers to cores (worker i → core i+1, core 0 for caller)
+  if (config.enable_affinity) {
+    for (unsigned int i = 0; i < compute_workers_.size(); ++i) {
+      unsigned int core = (i + 1) % hw_threads;
+      pinThreadToCore(compute_workers_[i], core);
+    }
+  }
+
+  // start I/O workers (not pinned — they do blocking I/O)
   io_workers_.reserve(config.io_threads);
   for (unsigned int i = 0; i < config.io_threads; ++i) {
     io_workers_.emplace_back([this] { ioWorkerLoop(); });

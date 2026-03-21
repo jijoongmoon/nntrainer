@@ -35,6 +35,7 @@ struct ThreadManagerConfig {
   unsigned int compute_threads =
     std::thread::hardware_concurrency(); /**< compute worker count */
   unsigned int io_threads = 3;           /**< I/O worker count */
+  bool enable_affinity = false;          /**< pin workers to cores 1:1 */
 };
 
 /**

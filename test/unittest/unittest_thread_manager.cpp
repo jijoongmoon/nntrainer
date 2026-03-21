@@ -369,6 +369,12 @@ TEST(ThreadManager, ThreadCounts) {
   auto &tm = nntrainer::ThreadManager::Global();
   EXPECT_GT(tm.getComputeThreadCount(), 0u);
   EXPECT_GT(tm.getIOThreadCount(), 0u);
+
+  // compute workers should be <= hardware_concurrency - 1 (caller uses a core)
+  unsigned int hw = std::thread::hardware_concurrency();
+  if (hw > 1) {
+    EXPECT_LE(tm.getComputeThreadCount(), hw - 1);
+  }
 }
 
 int main(int argc, char **argv) {
