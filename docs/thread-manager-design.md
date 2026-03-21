@@ -356,6 +356,91 @@ sequenceDiagram
     end
 ```
 
+### 4.3 Look-ahead Test Coverage
+
+FSU look-ahead 파이프라인의 정확성을 검증하는 5개 테스트:
+
+| 테스트 | 검증 내용 |
+|--------|-----------|
+| `lookahead_basic_pipeline` | lookahead=2로 5개 레이어 전체 파이프라인 시뮬레이션. pre-load → waitLoad → compute(parallel_for) → unload → prefetch next 순서 검증 |
+| `lookahead_overlap_verification` | I/O와 compute의 실제 오버랩 검증. compute 완료 후 prefetch된 레이어의 `isLoadDone()` == true 확인 |
+| `lookahead_multi_epoch` | 3 epoch 반복 시 CompletionToken이 매 epoch마다 정상 재설정되는지 확인 |
+| `lookahead_async_unload_pipeline` | load + unload + compute 3가지 비동기 파이프라인. `asyncUnload(f)` + `asyncLoad(f+2)` + `parallel_for` 동시 실행 |
+| `lookahead_token_polling` | `isDone()` 비차단 폴링과 `waitLoad()` 차단 대기를 혼합 사용하는 패턴 검증 |
+
+#### Look-ahead Pipeline Sequence (테스트 기준)
+
+```mermaid
+sequenceDiagram
+    participant Test as Test (Caller)
+    participant TM as ThreadManager
+    participant IO as I/O Worker
+    participant CW as Compute Workers
+
+    Note over Test: Pre-load layers 1, 2, 3 (lookahead=2)
+    Test->>TM: submit(loadTensor layer 1)
+    Test->>TM: submit(loadTensor layer 2)
+    Test->>TM: submit(loadTensor layer 3)
+    TM->>IO: queue 3 load tasks
+
+    loop For each layer f = 1..5
+        Test->>Test: waitLoad(f)
+        Note over IO: I/O Worker: loadTensor(f) → swapIn()
+
+        IO-->>Test: CompletionToken.complete()
+        Note over Test: Layer f data ready
+
+        par Compute + Prefetch
+            Test->>CW: parallel_for(0, 100)
+            Note over CW: Simulate GEMM on compute workers
+
+            Test->>Test: unload(f) [sync]
+            Note over Test: Layer f memory freed
+
+            Test->>TM: submit(loadTensor f+3)
+            Note over IO: I/O Worker starts loading f+3<br/>while compute runs
+        end
+
+        CW-->>Test: barrier (compute done)
+    end
+
+    Note over Test: All 5 layers processed<br/>with overlapped I/O
+```
+
+#### Async Unload Pipeline (lookahead_async_unload_pipeline)
+
+```mermaid
+sequenceDiagram
+    participant Test as Test (Caller)
+    participant TM as ThreadManager
+    participant IO as I/O Worker
+    participant CW as Compute Workers
+
+    Note over Test: Pre-load layers 1, 2
+
+    loop For each layer f = 1..5
+        Test->>Test: waitLoad(f)
+
+        alt f > 1
+            Test->>Test: waitUnload(f-1)
+            Note over Test: Previous layer fully freed
+        end
+
+        Test->>TM: submit(loadTensor f+2)
+
+        par Concurrent operations
+            Test->>CW: parallel_for (compute)
+            IO->>IO: loadTensor(f+2)
+        end
+
+        Test->>TM: submit(unloadTensor f)
+        Note over IO: Async unload queued<br/>(happens in background)
+    end
+
+    Test->>Test: waitUnload(5)
+    Note over Test: Final cleanup complete
+```
+
 ---
 
 ## 5. API Reference
@@ -456,7 +541,7 @@ test/unittest/
 ├── unittest_thread_manager.cpp        # 24 tests
 ├── unittest_threading_benchmark.cpp   # 4-way benchmark
 └── memory/
-    └── unittest_fsu_threadmanager.cpp # 6 FSU tests
+    └── unittest_fsu_threadmanager.cpp # 11 FSU tests (6 basic + 5 look-ahead)
 ```
 
 ### Deleted Files (-4,868 lines)
