@@ -92,10 +92,22 @@ public:
       return;
     }
 
+    unsigned int n = static_cast<unsigned int>(compute_workers_.size());
+
+    // wait for all workers to be ready (back in wait loop)
+    {
+      std::unique_lock<std::mutex> lock(done_mutex_);
+      done_cv_.wait(lock, [this, n] {
+        return workers_ready_.load(std::memory_order_acquire) >= n;
+      });
+    }
+
     // setup task for workers
     current_task_ = [&fn](size_t i) { fn(i); };
     task_end_.store(end, std::memory_order_relaxed);
     chunk_counter_.store(begin, std::memory_order_release);
+    workers_done_.store(0, std::memory_order_release);
+    workers_ready_.store(0, std::memory_order_release);
 
     // wake workers
     {
@@ -208,6 +220,7 @@ private:
   std::atomic<size_t> task_end_{0};
   std::atomic<unsigned int> compute_generation_{0};
   std::atomic<unsigned int> workers_done_{0};
+  std::atomic<unsigned int> workers_ready_{0};
   std::mutex done_mutex_;
   std::condition_variable done_cv_;
 

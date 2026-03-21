@@ -450,7 +450,7 @@ void Conv2DTransposeLayer::calcGradient(RunLayerContext &context) {
   auto &tm = nntrainer::ThreadManager::Global();
   /// input -(im2col)-> column_matrix -> filter x (column_matrix) = output
   /// so delK = dy x column_matrix ^ T;
-  if (tm.num_workers() > 1) {
+  if (input_.batch() > 1) {
 
     TensorDim delK_ext = filter_dim_squeezed;
     delK_ext.batch(input_.batch());
