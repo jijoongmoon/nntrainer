@@ -8,7 +8,6 @@
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
- *
  */
 
 #ifndef __NNTRAINER_THREAD_MANAGER_H__
@@ -27,46 +26,22 @@
 
 namespace nntrainer {
 
-/**
- * @enum WaitPolicy
- * @brief How compute workers wait for work between parallel_for calls.
- */
-enum class WaitPolicy {
-  Sleep,    /**< condition_variable only (lowest CPU, highest latency) */
-  Adaptive, /**< spin briefly, then yield, then sleep (balanced) */
-  Spin      /**< busy-wait only (lowest latency, highest CPU usage) */
-};
-
 struct ThreadManagerConfig {
   unsigned int compute_threads =
     std::thread::hardware_concurrency() > 2
       ? std::thread::hardware_concurrency() - 2
-      : 1; /**< compute worker count (hw - caller - 1 io) */
-  unsigned int io_threads = 1; /**< I/O worker count */
-  bool enable_affinity = false;          /**< pin workers to cores 1:1 */
-  WaitPolicy wait_policy = WaitPolicy::Adaptive; /**< compute worker wait */
-  unsigned int spin_count = 1000; /**< spin iterations before yield/sleep */
-};
-
-/**
- * @struct WorkerTask
- * @brief Per-worker task assignment. Each worker gets its own range.
- *        Padded to cache line to prevent false sharing.
- */
-struct alignas(64) WorkerTask {
-  size_t begin{0};
-  size_t end{0};
+      : 1;
+  unsigned int io_threads = 1;
+  bool enable_affinity = false;
 };
 
 /**
  * @class ThreadManager
- * @brief Unified thread pool managing both compute and I/O workers.
+ * @brief Unified thread pool with GGML-style spin-wait barrier.
  *
- * Compute workers: Each worker has its own task range assigned by the
- * caller. No atomic contention on the hot path. Workers spin-wait
- * (configurable) for new generations.
- *
- * I/O workers: Condition variable based queue. Independent from compute.
+ * Compute workers spin-wait for work and synchronize via atomic barrier.
+ * No condition variables on the hot path — minimal dispatch latency.
+ * I/O workers use condition variable (blocking I/O is fine).
  */
 class ThreadManager : public Singleton<ThreadManager> {
   friend class Singleton<ThreadManager>;
@@ -78,9 +53,14 @@ public:
    * @brief Parallel for using all compute workers + caller.
    */
   template <typename F> void parallel_for(size_t begin, size_t end, F &&fn) {
-    parallel_for_with(begin, end,
-                      static_cast<unsigned int>(compute_workers_.size()),
-                      std::forward<F>(fn));
+    if (begin >= end)
+      return;
+    if (end - begin == 1 || compute_workers_.empty()) {
+      for (size_t i = begin; i < end; ++i)
+        fn(i);
+      return;
+    }
+    dispatchAndJoin(begin, end, std::forward<F>(fn));
   }
 
   /**
@@ -88,20 +68,28 @@ public:
    */
   template <typename F>
   void parallel_for(size_t begin, size_t end, unsigned int n_workers, F &&fn) {
-    parallel_for_with(begin, end, n_workers, std::forward<F>(fn));
+    if (begin >= end)
+      return;
+    unsigned int total = static_cast<unsigned int>(compute_workers_.size());
+    if (n_workers > total)
+      n_workers = total;
+    if (end - begin == 1 || n_workers == 0 || compute_workers_.empty()) {
+      for (size_t i = begin; i < end; ++i)
+        fn(i);
+      return;
+    }
+    dispatchAndJoin(begin, end, std::forward<F>(fn), n_workers);
   }
 
   /**
    * @brief Parallel for with thread-index based chunking.
-   * Each index [0, n_threads) is passed to fn.
    */
   template <typename F> void parallel_for_chunked(size_t n_threads, F &&fn) {
     if (n_threads <= 1) {
       fn(0);
       return;
     }
-    unsigned int workers_needed = static_cast<unsigned int>(n_threads) - 1;
-    parallel_for_with(0, n_threads, workers_needed, std::forward<F>(fn));
+    parallel_for(0, n_threads, std::forward<F>(fn));
   }
 
   CompletionToken submit(std::function<void()> task);
@@ -123,103 +111,88 @@ protected:
   void initialize() noexcept override;
 
 private:
+  static inline void cpuRelax() {
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#endif
+  }
+
   /**
-   * @brief Core parallel_for with per-worker task assignment.
+   * @brief GGML-style spin-wait barrier.
+   * Last thread to arrive resets counter and bumps pass count.
+   * Other threads spin on pass count with cpu_relax.
+   */
+  void barrier() {
+    int n_threads =
+      active_threads_.load(std::memory_order_relaxed);
+    int n_passed =
+      n_barrier_passed_.load(std::memory_order_relaxed);
+    int n = n_barrier_.fetch_add(1, std::memory_order_seq_cst);
+    if (n == n_threads - 1) {
+      n_barrier_.store(0, std::memory_order_relaxed);
+      n_barrier_passed_.fetch_add(1, std::memory_order_seq_cst);
+      return;
+    }
+    while (n_barrier_passed_.load(std::memory_order_relaxed) == n_passed) {
+      cpuRelax();
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+  }
+
+  /**
+   * @brief Dispatch work to workers and join via barrier.
    */
   template <typename F>
-  void parallel_for_with(size_t begin, size_t end, unsigned int n_workers,
-                         F &&fn) {
-    if (begin >= end)
-      return;
-
-    size_t range = end - begin;
+  void dispatchAndJoin(size_t begin, size_t end, F &&fn,
+                       unsigned int n_workers = 0) {
     unsigned int total = static_cast<unsigned int>(compute_workers_.size());
-
-    if (n_workers > total)
+    if (n_workers == 0 || n_workers > total)
       n_workers = total;
 
-    // serial fallback
-    if (range == 1 || n_workers == 0 || compute_workers_.empty()) {
-      for (size_t i = begin; i < end; ++i)
-        fn(i);
-      return;
-    }
+    // all workers participate in barrier (even inactive ones)
+    active_threads_.store(static_cast<int>(total + 1),
+                          std::memory_order_relaxed);
 
-    // total threads = n_workers + 1 (caller)
-    unsigned int n_threads = n_workers + 1;
-
-    // wait for all workers to be ready
-    {
-      std::unique_lock<std::mutex> lock(done_mutex_);
-      done_cv_.wait(lock, [this, total] {
-        return workers_ready_.load(std::memory_order_acquire) >= total;
-      });
-    }
-
-    // assign per-worker ranges (no atomic contention)
     current_task_ = [&fn](size_t i) { fn(i); };
-    for (unsigned int t = 0; t < n_workers; ++t) {
-      size_t w_begin = begin + ((t + 1) * range) / n_threads;
-      size_t w_end = begin + ((t + 2) * range) / n_threads;
-      worker_tasks_[t].begin = w_begin;
-      worker_tasks_[t].end = w_end;
-    }
-
-    workers_done_.store(0, std::memory_order_release);
-    workers_ready_.store(0, std::memory_order_release);
+    task_end_ = end;
+    current_chunk_.store(begin, std::memory_order_relaxed);
     active_workers_.store(n_workers, std::memory_order_release);
 
     // wake workers
-    {
-      std::lock_guard<std::mutex> lock(compute_mutex_);
-      compute_generation_.fetch_add(1, std::memory_order_release);
+    generation_.fetch_add(1, std::memory_order_seq_cst);
+
+    // caller participates (work-stealing via atomic counter)
+    while (true) {
+      size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
+      if (idx >= end)
+        break;
+      fn(idx);
     }
-    compute_cv_.notify_all();
 
-    // caller handles chunk 0: [begin, begin + range/n_threads)
-    size_t caller_end = begin + range / n_threads;
-    for (size_t i = begin; i < caller_end; ++i)
-      fn(i);
-
-    // wait for all compute workers to finish
-    waitComputeDone();
+    // barrier: wait for all threads
+    barrier();
     current_task_ = nullptr;
   }
 
   void computeWorkerLoop(unsigned int worker_id);
   void ioWorkerLoop();
-  void waitComputeDone();
 
-  // ─── Compute workers ───────────────────────────────────
-  // Each frequently-written atomic on its own cache line to prevent
-  // false sharing (same fix as llama.cpp #9598: +21% on 80-core ARM).
-
+  // ─── Compute (all cache-line isolated) ───────────────
   std::vector<std::thread> compute_workers_;
-  std::vector<WorkerTask> worker_tasks_; /**< per-worker range, cache aligned */
   std::function<void(size_t)> current_task_;
+  size_t task_end_{0};
 
-  // generation: written by caller, read by all workers (wake signal)
-  alignas(64) std::atomic<unsigned int> compute_generation_{0};
-
-  // workers_done: written by each worker, read by caller (completion signal)
-  alignas(64) std::atomic<unsigned int> workers_done_{0};
-
-  // workers_ready: written by each worker, read by caller (readiness check)
-  alignas(64) std::atomic<unsigned int> workers_ready_{0};
-
-  // active_workers: written by caller, read by workers (activation check)
+  alignas(64) std::atomic<unsigned int> generation_{0};
+  alignas(64) std::atomic<int> n_barrier_{0};
+  alignas(64) std::atomic<int> n_barrier_passed_{0};
+  alignas(64) std::atomic<size_t> current_chunk_{0};
   alignas(64) std::atomic<unsigned int> active_workers_{0};
-
-  // stop: written by destructor, read by all workers
+  alignas(64) std::atomic<int> active_threads_{1};
   alignas(64) std::atomic<bool> stop_{false};
 
-  // mutexes and CVs (not contended atomically, grouping is fine)
-  std::mutex compute_mutex_;
-  std::condition_variable compute_cv_;
-  std::mutex done_mutex_;
-  std::condition_variable done_cv_;
-
-  // ─── I/O workers ─────────────────────────────────────
+  // ─── I/O ─────────────────────────────────────────────
   std::vector<std::thread> io_workers_;
   std::queue<std::pair<std::function<void()>,
                        std::shared_ptr<CompletionToken::SharedState>>>
@@ -229,7 +202,6 @@ private:
 
   // ─── Config ──────────────────────────────────────────
   ThreadManagerConfig config_;
-
   static ThreadManagerConfig pending_config_;
 };
 
