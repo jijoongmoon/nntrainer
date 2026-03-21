@@ -14,6 +14,7 @@
 #include <thread_manager.h>
 
 #if defined(__linux__)
+#include <fstream>
 #include <pthread.h>
 #include <sched.h>
 #endif
@@ -22,9 +23,6 @@ namespace nntrainer {
 
 /**
  * @brief Pin a thread to a specific CPU core.
- * @param thread the thread to pin
- * @param core_id the core index to pin to
- * @return true if successful or not supported on this platform
  */
 static bool pinThreadToCore(std::thread &thread, unsigned int core_id) {
 #if defined(__linux__)
@@ -37,8 +35,62 @@ static bool pinThreadToCore(std::thread &thread, unsigned int core_id) {
 #else
   (void)thread;
   (void)core_id;
-  return true; // no-op on non-Linux
+  return true;
 #endif
+}
+
+/**
+ * @brief Get sorted core indices by max frequency (descending).
+ *
+ * On big.LITTLE (e.g. Android), returns big cores first, then LITTLE.
+ * On homogeneous systems, returns cores in order (0, 1, 2, ...).
+ *
+ * @param hw_threads total number of hardware threads
+ * @return vector of core indices sorted by performance (fastest first)
+ */
+static std::vector<unsigned int>
+getCoresByPerformance(unsigned int hw_threads) {
+  std::vector<std::pair<unsigned long, unsigned int>> freq_core;
+  freq_core.reserve(hw_threads);
+
+#if defined(__linux__)
+  for (unsigned int i = 0; i < hw_threads; ++i) {
+    std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(i) +
+                       "/cpufreq/cpuinfo_max_freq";
+    std::ifstream f(path);
+    unsigned long freq = 0;
+    if (f.is_open())
+      f >> freq;
+    freq_core.push_back({freq, i});
+  }
+#endif
+
+  // check if we got any frequency info
+  bool has_freq = false;
+  for (auto &p : freq_core) {
+    if (p.first > 0) {
+      has_freq = true;
+      break;
+    }
+  }
+
+  if (!has_freq) {
+    // homogeneous: just return 0, 1, 2, ...
+    std::vector<unsigned int> cores(hw_threads);
+    for (unsigned int i = 0; i < hw_threads; ++i)
+      cores[i] = i;
+    return cores;
+  }
+
+  // sort by frequency descending (big cores first)
+  std::sort(freq_core.begin(), freq_core.end(),
+            [](const auto &a, const auto &b) { return a.first > b.first; });
+
+  std::vector<unsigned int> cores;
+  cores.reserve(hw_threads);
+  for (auto &p : freq_core)
+    cores.push_back(p.second);
+  return cores;
 }
 
 ThreadManagerConfig ThreadManager::pending_config_ = {};
@@ -75,9 +127,8 @@ void ThreadManager::initialize() noexcept {
   if (hw_threads == 0)
     hw_threads = 1;
 
-  // Reserve cores: core 0 = caller, then compute, then I/O
-  // Layout: [caller | compute_0 .. compute_N | io_0 .. io_M]
-  unsigned int reserved = 1 + config.io_threads; // caller + I/O
+  // Reserve cores: 1 for caller + io_threads for I/O
+  unsigned int reserved = 1 + config.io_threads;
   unsigned int max_compute =
     hw_threads > reserved ? hw_threads - reserved : 1;
   if (config.compute_threads > max_compute)
@@ -95,20 +146,33 @@ void ThreadManager::initialize() noexcept {
     io_workers_.emplace_back([this] { ioWorkerLoop(); });
   }
 
-  // Pin threads to cores: compute and I/O on separate cores
-  // Core 0: caller thread (not pinned here, user can pin if needed)
-  // Core 1..N: compute workers
-  // Core N+1..N+M: I/O workers
+  // Pin threads to cores sorted by performance (big cores first).
+  //
+  // On big.LITTLE (Android):
+  //   sorted = [big_0, big_1, big_2, big_3, LITTLE_0, LITTLE_1, ...]
+  //   caller  → sorted[0] (fastest big core)
+  //   compute → sorted[1..N] (remaining big cores)
+  //   I/O     → sorted[N+1..N+M] (big if available, else LITTLE)
+  //
+  // On homogeneous:
+  //   sorted = [0, 1, 2, 3, ...]
+  //   Same layout, just sequential cores.
   if (config.enable_affinity) {
+    auto sorted_cores = getCoresByPerformance(hw_threads);
+
+    // sorted[0] = fastest core → caller (not pinned here)
+    // sorted[1..N] → compute workers
     for (unsigned int i = 0; i < compute_workers_.size(); ++i) {
-      unsigned int core = (i + 1) % hw_threads;
-      pinThreadToCore(compute_workers_[i], core);
+      unsigned int idx = (i + 1) % sorted_cores.size();
+      pinThreadToCore(compute_workers_[i], sorted_cores[idx]);
     }
-    unsigned int io_core_start =
+
+    // sorted[N+1..N+M] → I/O workers (overflow to slower cores)
+    unsigned int io_start =
       static_cast<unsigned int>(compute_workers_.size()) + 1;
     for (unsigned int i = 0; i < io_workers_.size(); ++i) {
-      unsigned int core = (io_core_start + i) % hw_threads;
-      pinThreadToCore(io_workers_[i], core);
+      unsigned int idx = (io_start + i) % sorted_cores.size();
+      pinThreadToCore(io_workers_[i], sorted_cores[idx]);
     }
   }
 }
