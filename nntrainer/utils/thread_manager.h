@@ -28,10 +28,6 @@
 namespace nntrainer {
 
 /**
- * @struct ThreadManagerConfig
- * @brief  Configuration for ThreadManager initialization
- */
-/**
  * @enum WaitPolicy
  * @brief How compute workers wait for work between parallel_for calls.
  */
@@ -51,15 +47,24 @@ struct ThreadManagerConfig {
 };
 
 /**
+ * @struct WorkerTask
+ * @brief Per-worker task assignment. Each worker gets its own range.
+ *        Padded to cache line to prevent false sharing.
+ */
+struct alignas(64) WorkerTask {
+  size_t begin{0};
+  size_t end{0};
+};
+
+/**
  * @class ThreadManager
  * @brief Unified thread pool managing both compute and I/O workers.
  *
- * Compute workers: Used by parallel_for(). Supports specifying the number
- * of threads per call — only the requested workers are activated.
- * The calling thread also participates (N+1 way parallelism).
+ * Compute workers: Each worker has its own task range assigned by the
+ * caller. No atomic contention on the hot path. Workers spin-wait
+ * (configurable) for new generations.
  *
- * I/O workers: Used by submit(). Returns CompletionToken for sync.
- * Physically separate from compute workers.
+ * I/O workers: Condition variable based queue. Independent from compute.
  */
 class ThreadManager : public Singleton<ThreadManager> {
   friend class Singleton<ThreadManager>;
@@ -78,14 +83,6 @@ public:
 
   /**
    * @brief Parallel for using at most n_workers compute workers + caller.
-   *
-   * If n_workers > total compute workers, uses all available.
-   * If n_workers == 0, runs serially on calling thread.
-   *
-   * @param begin start index (inclusive)
-   * @param end end index (exclusive)
-   * @param n_workers number of compute workers to activate (not counting caller)
-   * @param fn callable with signature void(size_t)
    */
   template <typename F>
   void parallel_for(size_t begin, size_t end, unsigned int n_workers, F &&fn) {
@@ -94,42 +91,27 @@ public:
 
   /**
    * @brief Parallel for with thread-index based chunking.
-   *
-   * Each index [0, n_threads) is passed to fn. Uses n_threads-1 workers
-   * + the calling thread.
+   * Each index [0, n_threads) is passed to fn.
    */
   template <typename F> void parallel_for_chunked(size_t n_threads, F &&fn) {
     if (n_threads <= 1) {
       fn(0);
       return;
     }
-    unsigned int workers_needed =
-      static_cast<unsigned int>(n_threads) - 1; // caller is one thread
+    unsigned int workers_needed = static_cast<unsigned int>(n_threads) - 1;
     parallel_for_with(0, n_threads, workers_needed, std::forward<F>(fn));
   }
 
-  /**
-   * @brief Submit an async task to I/O workers.
-   */
   CompletionToken submit(std::function<void()> task);
 
-  /**
-   * @brief Get the number of compute worker threads (not counting caller)
-   */
   unsigned int getComputeThreadCount() const {
     return static_cast<unsigned int>(compute_workers_.size());
   }
 
-  /**
-   * @brief Get the number of I/O worker threads
-   */
   unsigned int getIOThreadCount() const {
     return static_cast<unsigned int>(io_workers_.size());
   }
 
-  /**
-   * @brief Configure thread counts before initialization.
-   */
   static void setConfig(const ThreadManagerConfig &config) {
     pending_config_ = config;
   }
@@ -140,7 +122,7 @@ protected:
 
 private:
   /**
-   * @brief Core parallel_for implementation with worker count control.
+   * @brief Core parallel_for with per-worker task assignment.
    */
   template <typename F>
   void parallel_for_with(size_t begin, size_t end, unsigned int n_workers,
@@ -151,7 +133,6 @@ private:
     size_t range = end - begin;
     unsigned int total = static_cast<unsigned int>(compute_workers_.size());
 
-    // clamp n_workers to available
     if (n_workers > total)
       n_workers = total;
 
@@ -162,7 +143,10 @@ private:
       return;
     }
 
-    // wait for needed workers to be ready
+    // total threads = n_workers + 1 (caller)
+    unsigned int n_threads = n_workers + 1;
+
+    // wait for all workers to be ready
     {
       std::unique_lock<std::mutex> lock(done_mutex_);
       done_cv_.wait(lock, [this, total] {
@@ -170,28 +154,30 @@ private:
       });
     }
 
-    // setup task
+    // assign per-worker ranges (no atomic contention)
     current_task_ = [&fn](size_t i) { fn(i); };
-    task_end_.store(end, std::memory_order_relaxed);
-    chunk_counter_.store(begin, std::memory_order_release);
+    for (unsigned int t = 0; t < n_workers; ++t) {
+      size_t w_begin = begin + ((t + 1) * range) / n_threads;
+      size_t w_end = begin + ((t + 2) * range) / n_threads;
+      worker_tasks_[t].begin = w_begin;
+      worker_tasks_[t].end = w_end;
+    }
+
     workers_done_.store(0, std::memory_order_release);
     workers_ready_.store(0, std::memory_order_release);
     active_workers_.store(n_workers, std::memory_order_release);
 
-    // wake all workers (inactive ones will immediately signal done)
+    // wake workers
     {
       std::lock_guard<std::mutex> lock(compute_mutex_);
       compute_generation_.fetch_add(1, std::memory_order_release);
     }
     compute_cv_.notify_all();
 
-    // calling thread participates
-    while (true) {
-      size_t idx = chunk_counter_.fetch_add(1, std::memory_order_relaxed);
-      if (idx >= end)
-        break;
-      fn(idx);
-    }
+    // caller handles chunk 0: [begin, begin + range/n_threads)
+    size_t caller_end = begin + range / n_threads;
+    for (size_t i = begin; i < caller_end; ++i)
+      fn(i);
 
     // wait for all compute workers to finish
     waitComputeDone();
@@ -204,11 +190,10 @@ private:
 
   // Compute workers
   std::vector<std::thread> compute_workers_;
+  std::vector<WorkerTask> worker_tasks_; /**< per-worker range, cache aligned */
   std::mutex compute_mutex_;
   std::condition_variable compute_cv_;
   std::function<void(size_t)> current_task_;
-  std::atomic<size_t> chunk_counter_{0};
-  std::atomic<size_t> task_end_{0};
   std::atomic<unsigned int> compute_generation_{0};
   std::atomic<unsigned int> workers_done_{0};
   std::atomic<unsigned int> workers_ready_{0};
