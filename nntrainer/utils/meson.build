@@ -4,11 +4,9 @@ util_sources = [
   'ini_wrapper.cpp',
   'node_exporter.cpp',
   'base_properties.cpp',
-  'nntr_threads.cpp',
   'fp16.cpp',
   'util_simd.cpp',
   'mman_windows.cpp',
-  'bs_thread_pool_manager.cpp',
   'thread_manager.cpp'
 ]
 
@@ -17,13 +15,10 @@ util_headers = [
   'node_exporter.h',
   'util_func.h',
   'profiler.h',
-  'nntr_threads.h',
   'fp16.h',
   'util_simd.h',
   'dynamic_library_loader.h',
   'mman_windows.h',
-  'bs_thread_pool.h',
-  'bs_thread_pool_manager.hpp',
   'singleton.h',
   'nonmovable.h',
   'noncopyable.h',
