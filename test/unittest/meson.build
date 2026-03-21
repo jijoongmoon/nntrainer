@@ -73,6 +73,7 @@ test_target = [
   ['unittest_nntrainer_lr_scheduler', []],
   #['unittest_nntrainer_task', []],
   ['unittest_thread_manager', []],
+  ['unittest_threading_benchmark', []],
 ]
 
 if host_machine.system() != 'windows'
