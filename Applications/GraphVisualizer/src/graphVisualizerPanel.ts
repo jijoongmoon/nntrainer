@@ -192,6 +192,44 @@ export class GraphVisualizerPanel {
         .node .type { color: var(--vscode-descriptionForeground); font-size: 10px; }
         .node .shape { color: #61afef; font-size: 10px; }
 
+        /* Source code panel */
+        .source-pane {
+            flex: 1;
+            overflow: auto;
+            display: none;
+            border-right: 1px solid var(--vscode-panel-border);
+        }
+        .source-pane.visible { display: block; }
+        .source-pane .pane-header { position: sticky; top: 0; z-index: 10; padding: 6px 12px; font-size: 12px; font-weight: 600; background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-panel-border); }
+        .source-pane .pane-header.torch-src { color: #e5c07b; }
+        .source-pane .pane-header.cpp-src { color: #61afef; }
+        .source-code {
+            padding: 8px 12px;
+            font-family: var(--vscode-editor-fontFamily, 'Consolas, monospace');
+            font-size: 12px;
+            white-space: pre;
+            line-height: 1.5;
+            tab-size: 4;
+            counter-reset: line;
+        }
+        .source-code .line {
+            display: block;
+            padding: 0 8px 0 48px;
+            position: relative;
+        }
+        .source-code .line::before {
+            content: counter(line);
+            counter-increment: line;
+            position: absolute;
+            left: 0;
+            width: 40px;
+            text-align: right;
+            color: var(--vscode-editorLineNumber-foreground);
+            font-size: 11px;
+        }
+        .source-code .line:hover { background: var(--vscode-editor-hoverHighlightBackground); }
+        .source-code .line.highlighted { background: rgba(255, 213, 79, 0.15); }
+
         /* Verification panel */
         .verification-panel {
             width: 280px;
@@ -234,9 +272,16 @@ export class GraphVisualizerPanel {
         <button id="btn-torch-only">Torch FX Only</button>
         <div class="separator"></div>
         <button id="btn-verify">Verification</button>
+        <div class="separator"></div>
+        <button id="btn-torch-source">PyTorch Source</button>
+        <button id="btn-cpp-source">C++ Output</button>
         <div class="stats" id="stats"></div>
     </div>
     <div class="main-container">
+        <div class="source-pane" id="torch-source-pane">
+            <div class="pane-header torch-src">PyTorch Source Code</div>
+            <div class="source-code" id="torch-source-code"></div>
+        </div>
         <div class="graph-pane" id="torch-pane">
             <div class="pane-header torch">PyTorch FX Graph</div>
             <div class="graph-canvas" id="torch-canvas"></div>
@@ -244,6 +289,10 @@ export class GraphVisualizerPanel {
         <div class="graph-pane" id="nntrainer-pane">
             <div class="pane-header nntrainer">NNTrainer Graph</div>
             <div class="graph-canvas" id="nntrainer-canvas"></div>
+        </div>
+        <div class="source-pane" id="cpp-source-pane">
+            <div class="pane-header cpp-src">Generated C++ Code</div>
+            <div class="source-code" id="cpp-source-code"></div>
         </div>
         <div class="verification-panel" id="verification-panel"></div>
     </div>
@@ -256,6 +305,8 @@ export class GraphVisualizerPanel {
         let selectedNode = null;
         let viewMode = 'side-by-side';
         let verificationVisible = false;
+        let torchSourceVisible = false;
+        let cppSourceVisible = false;
 
         // Build node lookup maps
         const fxNodeMap = new Map();
@@ -456,10 +507,41 @@ export class GraphVisualizerPanel {
             panel.innerHTML = html;
         }
 
+        // Source code rendering
+        function escapeHtml(text) {
+            return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function renderSourceCode(containerId, code) {
+            const container = document.getElementById(containerId);
+            if (!code) {
+                container.innerHTML = '<div style="padding:16px;color:var(--vscode-descriptionForeground)">No source code available</div>';
+                return;
+            }
+            const lines = code.split('\\n');
+            container.innerHTML = lines.map((line, i) =>
+                '<span class="line" data-line="' + (i+1) + '">' + escapeHtml(line) + '</span>'
+            ).join('\\n');
+        }
+
+        // Source toggle buttons
+        document.getElementById('btn-torch-source').addEventListener('click', () => {
+            torchSourceVisible = !torchSourceVisible;
+            document.getElementById('torch-source-pane').classList.toggle('visible', torchSourceVisible);
+            document.getElementById('btn-torch-source').classList.toggle('active', torchSourceVisible);
+        });
+        document.getElementById('btn-cpp-source').addEventListener('click', () => {
+            cppSourceVisible = !cppSourceVisible;
+            document.getElementById('cpp-source-pane').classList.toggle('visible', cppSourceVisible);
+            document.getElementById('btn-cpp-source').classList.toggle('active', cppSourceVisible);
+        });
+
         // Init
         renderTorchGraph();
         renderNNTrainerGraph();
         renderVerification();
+        renderSourceCode('torch-source-code', data.torchSourceCode || '');
+        renderSourceCode('cpp-source-code', data.cppSource || '');
     </script>
 </body>
 </html>`;
