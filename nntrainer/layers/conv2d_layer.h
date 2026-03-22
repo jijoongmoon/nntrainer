@@ -115,6 +115,9 @@ private:
              std::array<props::Dilation, CONV2D_DIM>>
     conv_props;
 
+  TensorDim kernel_dim; /**< original 4D kernel dim (filters, in_ch, k_h, k_w)
+                             for im2col/col2im operations */
+
   std::array<unsigned int, 5> wt_idx; /**< indices of the weights and tensors */
 };
 
