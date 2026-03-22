@@ -13,6 +13,7 @@
   ],
   "activationEvents": [
     "onCommand:nntrainerGraph.convert",
+    "onCommand:nntrainerGraph.convertLocalModel",
     "onCommand:nntrainerGraph.openVisualizer"
   ],
   "main": "./out/extension.js",
@@ -22,6 +23,11 @@
         "command": "nntrainerGraph.convert",
         "title": "NNTrainer: Convert Model",
         "icon": "$(play)"
+      },
+      {
+        "command": "nntrainerGraph.convertLocalModel",
+        "title": "NNTrainer: Convert Local PyTorch Model (.py)",
+        "icon": "$(file-code)"
       },
       {
         "command": "nntrainerGraph.openVisualizer",

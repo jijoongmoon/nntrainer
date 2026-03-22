@@ -107,6 +107,10 @@ export interface ConversionResult {
     // Generated code (for cross-check)
     cppSource: string;
     iniConfig: string;
+
+    // Source code (for local .py model conversion)
+    torchSourceCode: string;
+    torchSourcePath: string;
 }
 
 /** Mapping between fx node and nntrainer layer */

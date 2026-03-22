@@ -152,6 +152,125 @@ export class ConverterRunner {
         );
     }
 
+    /** Run conversion on a local .py file containing an nn.Module */
+    async runLocalConversion(
+        pyFilePath: string,
+        className: string,
+        inputDescJson?: string
+    ): Promise<ConversionResult | null> {
+        const converterPath = this.getConverterPath();
+        const pythonPath = this.getPythonPath();
+        const seqLen = vscode.workspace
+            .getConfiguration('nntrainerGraph')
+            .get<number>('defaultSeqLen') || 8;
+
+        const tmpDir = path.join(
+            this.context.globalStorageUri.fsPath,
+            'conversions',
+            Date.now().toString()
+        );
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        const wrapperScript = path.join(converterPath, 'vscode_bridge.py');
+        if (!fs.existsSync(wrapperScript)) {
+            await this.createBridgeScript(converterPath);
+        }
+
+        // Read the source code to include in result
+        const torchSourceCode = fs.readFileSync(pyFilePath, 'utf-8');
+
+        return vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Converting local model...',
+                cancellable: true,
+            },
+            async (progress, token) => {
+                return new Promise<ConversionResult | null>((resolve) => {
+                    const args = [
+                        wrapperScript,
+                        '--local-model', pyFilePath,
+                        '--class-name', className,
+                        '--output', tmpDir,
+                        '--seq-len', seqLen.toString(),
+                        '--format', 'all',
+                    ];
+                    if (inputDescJson) {
+                        args.push('--input-desc', inputDescJson);
+                    }
+
+                    progress.report({ message: `Loading ${className} from ${path.basename(pyFilePath)}` });
+
+                    const proc = spawn(pythonPath, args, {
+                        cwd: converterPath,
+                        env: {
+                            ...process.env,
+                            PYTHONPATH: [
+                                converterPath,
+                                path.dirname(pyFilePath),
+                            ].join(path.delimiter),
+                        },
+                    });
+
+                    let stdout = '';
+                    let stderr = '';
+
+                    proc.stdout.on('data', (data: Buffer) => {
+                        stdout += data.toString();
+                        const lines = data.toString().split('\n');
+                        for (const line of lines) {
+                            if (line.startsWith('PROGRESS:')) {
+                                progress.report({ message: line.substring(9).trim() });
+                            }
+                        }
+                    });
+
+                    proc.stderr.on('data', (data: Buffer) => {
+                        stderr += data.toString();
+                    });
+
+                    token.onCancellationRequested(() => {
+                        proc.kill('SIGTERM');
+                        resolve(null);
+                    });
+
+                    proc.on('close', (code) => {
+                        if (code !== 0) {
+                            vscode.window.showErrorMessage(
+                                `Local conversion failed (exit ${code}): ${stderr.slice(-500)}`
+                            );
+                            resolve(null);
+                            return;
+                        }
+
+                        const resultPath = path.join(tmpDir, 'conversion_result.json');
+                        if (!fs.existsSync(resultPath)) {
+                            vscode.window.showErrorMessage(
+                                'Conversion produced no result file'
+                            );
+                            resolve(null);
+                            return;
+                        }
+
+                        try {
+                            const raw = fs.readFileSync(resultPath, 'utf-8');
+                            const result = JSON.parse(raw) as ConversionResult;
+                            // Attach torch source code
+                            result.torchSourceCode = torchSourceCode;
+                            result.torchSourcePath = pyFilePath;
+                            resolve(result);
+                        } catch (e) {
+                            vscode.window.showErrorMessage(
+                                `Failed to parse conversion result: ${e}`
+                            );
+                            resolve(null);
+                        }
+                    });
+                });
+            }
+        );
+    }
+
     /** Load a previously saved conversion result */
     async loadFromJson(filePath: string): Promise<ConversionResult | null> {
         try {
@@ -167,18 +286,22 @@ export class ConverterRunner {
     private async createBridgeScript(converterPath: string): Promise<void> {
         const script = `#!/usr/bin/env python3
 """VS Code bridge for TorchFXConverter.
-Runs conversion and outputs full result as JSON for the visualizer."""
+Runs conversion and outputs full result as JSON for the visualizer.
+Supports both HuggingFace models and local .py files with nn.Module classes."""
 
 import sys
 import os
 import json
 import argparse
+import importlib.util
+import inspect
+
+import torch
+import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from converter import load_model, prepare_input_kwargs, get_config
 from decomposer import AdaptiveConverter
-from emitter_json import JsonEmitter
 from emitter_ini import emit_ini
 from emitter_cpp import emit_cpp_source, emit_cpp_header
 from nntrainer_layers import NNTrainerLayerDef
@@ -198,7 +321,6 @@ def serialize_fx_graph(graph):
             "scope": node.meta.get("scope", ""),
             "meta": {}
         }
-        # Serialize safe meta keys
         safe_keys = [
             "leaf_module", "has_weight", "has_bias",
             "in_features", "out_features", "num_embeddings", "embedding_dim",
@@ -260,7 +382,6 @@ def build_node_mapping(layers, fx_graph):
             })
             mapped_fx.add(layer.fx_node_name)
 
-    # Find unmapped fx nodes (skipped or no-op nodes)
     for node in fx_graph.nodes:
         if node.name not in mapped_fx and node.op not in ("placeholder", "output"):
             mappings.append({
@@ -336,9 +457,162 @@ def serialize_structure(structure):
     }
 
 
+# ---------------------------------------------------------------------------
+# Local .py model loading
+# ---------------------------------------------------------------------------
+
+def load_local_model(py_path, class_name):
+    """Dynamically load an nn.Module class from a local .py file."""
+    module_dir = os.path.dirname(os.path.abspath(py_path))
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+
+    module_name = os.path.splitext(os.path.basename(py_path))[0]
+    spec = importlib.util.spec_from_file_location(module_name, py_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+
+    if not hasattr(mod, class_name):
+        # Try to find nn.Module subclasses if exact name not found
+        candidates = [
+            name for name, obj in inspect.getmembers(mod)
+            if inspect.isclass(obj) and issubclass(obj, nn.Module) and obj is not nn.Module
+        ]
+        raise ValueError(
+            f"Class '{class_name}' not found in {py_path}. "
+            f"Available nn.Module classes: {candidates}"
+        )
+
+    cls = getattr(mod, class_name)
+    if not (inspect.isclass(cls) and issubclass(cls, nn.Module)):
+        raise ValueError(f"'{class_name}' is not an nn.Module subclass")
+
+    return cls, mod
+
+
+def infer_constructor_args(cls):
+    """Try to infer reasonable default constructor arguments."""
+    sig = inspect.signature(cls.__init__)
+    kwargs = {}
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+        if param.default is not inspect.Parameter.empty:
+            kwargs[name] = param.default
+        else:
+            # Guess common parameter names
+            guesses = {
+                "vocab_size": 1000, "num_embeddings": 1000,
+                "hidden_size": 256, "d_model": 256, "embed_dim": 256,
+                "num_heads": 4, "nhead": 4, "num_attention_heads": 4,
+                "num_layers": 2, "num_hidden_layers": 2,
+                "intermediate_size": 512, "dim_feedforward": 512,
+                "num_classes": 10, "output_size": 10,
+                "input_size": 256, "in_features": 256, "in_channels": 3,
+                "out_features": 256, "out_channels": 64,
+                "kernel_size": 3, "dropout": 0.0,
+                "max_seq_len": 512, "max_position_embeddings": 512,
+                "bias": True, "batch_first": True,
+            }
+            if name in guesses:
+                kwargs[name] = guesses[name]
+            else:
+                raise ValueError(
+                    f"Cannot infer constructor arg '{name}' for {cls.__name__}. "
+                    f"Provide --input-desc with constructor args."
+                )
+    return kwargs
+
+
+def build_trace_inputs(model, input_desc, seq_len):
+    """Build trace input tensors from user description or by inference."""
+    if input_desc:
+        desc = json.loads(input_desc)
+
+        # Check if desc has constructor args vs input shapes
+        if "trace_inputs" in desc:
+            inputs = {}
+            for key, shape in desc["trace_inputs"].items():
+                if "int" in key or "ids" in key or "mask" in key:
+                    inputs[key] = torch.randint(0, 100, shape)
+                else:
+                    inputs[key] = torch.randn(*shape)
+            return inputs
+
+        # Assume desc is {name: shape} for trace inputs
+        inputs = {}
+        for key, shape in desc.items():
+            if "int" in key or "ids" in key or "mask" in key:
+                inputs[key] = torch.randint(0, 100, shape)
+            else:
+                inputs[key] = torch.randn(*shape)
+        return inputs
+
+    # Auto-detect from forward() signature
+    sig = inspect.signature(model.forward)
+    inputs = {}
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+        if name in ("input_ids", "src", "tgt"):
+            inputs[name] = torch.randint(0, 100, (1, seq_len))
+        elif name in ("attention_mask", "src_mask", "mask"):
+            inputs[name] = torch.ones(1, seq_len, dtype=torch.long)
+        elif name in ("x", "input", "inputs"):
+            # Try to guess from first layer
+            first_param = next(model.parameters(), None)
+            if first_param is not None:
+                in_dim = first_param.shape[-1] if first_param.dim() >= 2 else first_param.shape[0]
+                inputs[name] = torch.randn(1, seq_len, in_dim)
+            else:
+                inputs[name] = torch.randn(1, seq_len, 256)
+        elif param.default is inspect.Parameter.empty:
+            inputs[name] = torch.randn(1, seq_len, 256)
+        # Skip optional params with defaults
+
+    if not inputs:
+        inputs = {"x": torch.randn(1, seq_len, 256)}
+
+    return inputs
+
+
+def build_dummy_config(model, class_name):
+    """Build a minimal config namespace for the converter."""
+    config = argparse.Namespace()
+    config.model_type = class_name.lower()
+    config.architectures = [class_name]
+
+    # Try to extract common attributes from the model
+    for attr in ["vocab_size", "hidden_size", "num_heads", "num_layers",
+                 "num_attention_heads", "num_hidden_layers", "intermediate_size",
+                 "max_position_embeddings"]:
+        if hasattr(model, attr):
+            setattr(config, attr, getattr(model, attr))
+        elif hasattr(model, "config") and hasattr(model.config, attr):
+            setattr(config, attr, getattr(model.config, attr))
+
+    if not hasattr(config, "vocab_size"):
+        # Estimate from embedding layer
+        for m in model.modules():
+            if isinstance(m, nn.Embedding):
+                config.vocab_size = m.num_embeddings
+                break
+        else:
+            config.vocab_size = 1000
+
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser(description="VS Code bridge for TorchFXConverter")
-    parser.add_argument("--model", required=True, help="HuggingFace model ID or local path")
+    # HuggingFace model mode
+    parser.add_argument("--model", default=None, help="HuggingFace model ID or local path")
+    # Local .py file mode
+    parser.add_argument("--local-model", default=None, help="Path to local .py file")
+    parser.add_argument("--class-name", default=None, help="nn.Module class name in the .py file")
+    parser.add_argument("--input-desc", default=None, help="JSON describing input shapes or constructor args")
+    # Common options
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--seq-len", type=int, default=8, help="Sequence length")
     parser.add_argument("--format", nargs="+", default=["all"], help="Output formats")
@@ -347,12 +621,85 @@ def main():
     parser.add_argument("--plugin-config", default=None, help="Plugin config path")
     args = parser.parse_args()
 
-    print("PROGRESS: Loading model...", flush=True)
-    model, hf_config = load_model(args.model)
+    torch_source_code = ""
+    torch_source_path = ""
 
-    print("PROGRESS: Preparing inputs...", flush=True)
-    config = get_config(hf_config, seq_len=args.seq_len)
-    input_kwargs = prepare_input_kwargs(model, config)
+    if args.local_model:
+        # ---- Local .py model mode ----
+        print(f"PROGRESS: Loading local model from {args.local_model}...", flush=True)
+        torch_source_path = os.path.abspath(args.local_model)
+        with open(torch_source_path) as f:
+            torch_source_code = f.read()
+
+        cls, mod = load_local_model(args.local_model, args.class_name)
+
+        # Parse input-desc for possible constructor args
+        constructor_kwargs = {}
+        input_desc_for_trace = args.input_desc
+        if args.input_desc:
+            try:
+                desc = json.loads(args.input_desc)
+                if "constructor_args" in desc:
+                    constructor_kwargs = desc["constructor_args"]
+                    input_desc_for_trace = json.dumps(desc.get("trace_inputs", {})) if "trace_inputs" in desc else None
+            except json.JSONDecodeError:
+                pass
+
+        if constructor_kwargs:
+            model = cls(**constructor_kwargs)
+        else:
+            try:
+                model = cls()
+            except TypeError:
+                print("PROGRESS: Inferring constructor arguments...", flush=True)
+                constructor_kwargs = infer_constructor_args(cls)
+                model = cls(**constructor_kwargs)
+
+        model.eval()
+        print(f"PROGRESS: Model loaded: {args.class_name} "
+              f"({sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params)", flush=True)
+
+        config = build_dummy_config(model, args.class_name)
+        input_kwargs = build_trace_inputs(model, input_desc_for_trace, args.seq_len)
+        model_name = args.model_name or args.class_name
+
+    elif args.model:
+        # ---- HuggingFace model mode ----
+        from converter import convert_model
+        print("PROGRESS: Loading HuggingFace model...", flush=True)
+        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+        try:
+            config = AutoConfig.from_pretrained(args.model)
+        except ValueError:
+            config_path = os.path.join(args.model, "config.json")
+            if os.path.isfile(config_path):
+                with open(config_path) as f:
+                    config_dict = json.load(f)
+                config = argparse.Namespace(**config_dict)
+            else:
+                raise
+
+        model_type = getattr(config, "model_type", "")
+        causal_types = {
+            "qwen3", "qwen2", "llama", "mistral", "gpt2", "gpt_neo", "gpt_neox",
+            "phi", "gemma", "gemma2", "gemma3_text", "gemma3n_text", "starcoder2",
+            "codegen", "lfm2", "granitemoehybrid", "mamba", "mamba2",
+        }
+        is_causal = model_type in causal_types
+
+        if is_causal:
+            model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
+        else:
+            model = AutoModel.from_pretrained(args.model, torch_dtype=torch.float32)
+        model.eval()
+
+        vocab_size = getattr(config, "vocab_size", 30000)
+        input_kwargs = {"input_ids": torch.randint(0, vocab_size, (1, args.seq_len))}
+        model_name = args.model_name or args.model.replace("/", "_").replace("-", "_")
+
+    else:
+        parser.error("Either --model or --local-model is required")
 
     print("PROGRESS: Running adaptive conversion...", flush=True)
     converter = AdaptiveConverter(model, config)
@@ -361,12 +708,8 @@ def main():
     layers = result.layers
     structure = result.model_structure
 
-    # Determine model name
-    model_name = args.model_name or args.model.replace("/", "_").replace("-", "_")
-
     print("PROGRESS: Generating outputs...", flush=True)
 
-    # Generate C++ and INI
     cpp_source = ""
     ini_config = ""
     try:
@@ -378,7 +721,6 @@ def main():
     except Exception as e:
         print(f"Warning: INI emission failed: {e}", file=sys.stderr)
 
-    # Build weight map
     weight_map = []
     for layer in layers:
         if layer.has_weight and layer.weight_hf_key:
@@ -402,6 +744,8 @@ def main():
         "decomposedModules": list(result.decomposed_module_types),
         "cppSource": cpp_source,
         "iniConfig": ini_config,
+        "torchSourceCode": torch_source_code,
+        "torchSourcePath": torch_source_path,
     }
 
     os.makedirs(args.output, exist_ok=True)
