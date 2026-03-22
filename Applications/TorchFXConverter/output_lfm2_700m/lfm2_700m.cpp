@@ -184,12 +184,12 @@ Lfm2CausalLM::createConvDecoderBlock(const int layer_id,
   }));
   Tensor op_0_out = op_0(att_norm_out);
 
-  LayerHandle op_1(createLayer("conv1d", {
+  LayerHandle op_1(createLayer("depthwiseconv1d", {
     withKey("name", prefix + "_conv_conv"),
-    withKey("filters", 1536),
     withKey("kernel_size", 3),
     withKey("stride", 1),
-    withKey("padding", 2)
+    withKey("padding", "2,2"),
+    withKey("dilation", 1)
   }));
   Tensor op_1_out = op_1(op_0_out);
 

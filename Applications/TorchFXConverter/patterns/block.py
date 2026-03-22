@@ -190,7 +190,8 @@ def detect_operator(block, scope, block_layers, all_layers):
         parts = suffix.split(".")
         if len(parts) < 2:
             continue
-        if l.layer_type in ("fully_connected", "conv1d", "conv2d",
+        if l.layer_type in ("fully_connected", "conv1d", "depthwiseconv1d",
+                            "conv2d", "depthwiseconv2d",
                             "rms_norm", "layer_normalization",
                             "embedding"):
             seen_hf.add(hf)

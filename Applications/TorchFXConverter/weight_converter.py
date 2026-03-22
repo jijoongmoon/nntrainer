@@ -82,6 +82,8 @@ def build_weight_map(layers):
         if layer.has_weight and layer.weight_hf_key:
             if layer.reshape_weight_2d:
                 transform = "reshape_2d"
+            elif layer.squeeze_weight_3d:
+                transform = "squeeze_3d"
             elif layer.transpose_weight:
                 transform = "transpose"
             else:
@@ -143,6 +145,9 @@ class WeightConverter:
                     # Conv2D: (filters, in_ch, k_h, k_w) -> (filters, in_ch*k_h*k_w)
                     filters = tensor.shape[0]
                     tensor = tensor.reshape(filters, -1).contiguous()
+                elif entry["transform"] == "squeeze_3d" and tensor.dim() == 3:
+                    # Depthwise Conv1D: (channels, 1, ksize) -> (channels, ksize)
+                    tensor = tensor.squeeze(1).contiguous()
 
                 # Write raw bytes
                 data = tensor.cpu().numpy().tobytes()
@@ -213,6 +218,9 @@ class WeightConverter:
                      "t.dim() == 4:")
         lines.append("                t = t.reshape(t.shape[0], "
                      "-1).contiguous()")
+        lines.append("            elif transform == 'squeeze_3d' and "
+                     "t.dim() == 3:")
+        lines.append("                t = t.squeeze(1).contiguous()")
         lines.append("            f.write(t.cpu().numpy().tobytes())")
         lines.append("")
         lines.append("    print(f'Saved {len(WEIGHT_MAP)} weight tensors "

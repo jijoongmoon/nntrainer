@@ -438,15 +438,15 @@
     },
     {
       "name": "model_layers_0_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_0_conv_model_layers_0_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.0.conv.conv",
       "hf_module_type": "Conv1d"
@@ -642,15 +642,15 @@
     },
     {
       "name": "model_layers_1_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_1_conv_model_layers_1_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.1.conv.conv",
       "hf_module_type": "Conv1d"
@@ -1243,15 +1243,15 @@
     },
     {
       "name": "model_layers_3_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_3_conv_model_layers_3_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.3.conv.conv",
       "hf_module_type": "Conv1d"
@@ -1447,15 +1447,15 @@
     },
     {
       "name": "model_layers_4_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_4_conv_model_layers_4_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.4.conv.conv",
       "hf_module_type": "Conv1d"
@@ -2048,15 +2048,15 @@
     },
     {
       "name": "model_layers_6_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_6_conv_model_layers_6_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.6.conv.conv",
       "hf_module_type": "Conv1d"
@@ -2252,15 +2252,15 @@
     },
     {
       "name": "model_layers_7_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_7_conv_model_layers_7_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.7.conv.conv",
       "hf_module_type": "Conv1d"
@@ -2853,15 +2853,15 @@
     },
     {
       "name": "model_layers_9_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_9_conv_model_layers_9_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.9.conv.conv",
       "hf_module_type": "Conv1d"
@@ -3454,15 +3454,15 @@
     },
     {
       "name": "model_layers_11_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_11_conv_model_layers_11_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.11.conv.conv",
       "hf_module_type": "Conv1d"
@@ -4055,15 +4055,15 @@
     },
     {
       "name": "model_layers_13_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_13_conv_model_layers_13_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.13.conv.conv",
       "hf_module_type": "Conv1d"
@@ -4656,15 +4656,15 @@
     },
     {
       "name": "model_layers_15_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_15_conv_model_layers_15_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.15.conv.conv",
       "hf_module_type": "Conv1d"
@@ -4860,15 +4860,15 @@
     },
     {
       "name": "model_layers_16_conv_conv",
-      "type": "conv1d",
+      "type": "depthwiseconv1d",
       "input_layers": [
         "model_layers_16_conv_model_layers_16_conv_mul"
       ],
       "properties": {
-        "filters": 1536,
         "kernel_size": 3,
         "stride": 1,
-        "padding": 2
+        "padding": "2,2",
+        "dilation": 1
       },
       "hf_module_name": "model.layers.16.conv.conv",
       "hf_module_type": "Conv1d"
@@ -5050,7 +5050,7 @@
     },
     {
       "layer_name": "model_layers_0_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.0.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5098,7 +5098,7 @@
     },
     {
       "layer_name": "model_layers_1_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.1.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5212,7 +5212,7 @@
     },
     {
       "layer_name": "model_layers_3_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.3.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5260,7 +5260,7 @@
     },
     {
       "layer_name": "model_layers_4_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.4.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5374,7 +5374,7 @@
     },
     {
       "layer_name": "model_layers_6_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.6.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5422,7 +5422,7 @@
     },
     {
       "layer_name": "model_layers_7_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.7.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5536,7 +5536,7 @@
     },
     {
       "layer_name": "model_layers_9_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.9.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5650,7 +5650,7 @@
     },
     {
       "layer_name": "model_layers_11_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.11.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5764,7 +5764,7 @@
     },
     {
       "layer_name": "model_layers_13_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.13.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5878,7 +5878,7 @@
     },
     {
       "layer_name": "model_layers_15_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.15.conv.conv.weight",
       "transpose_weight": false
     },
@@ -5926,7 +5926,7 @@
     },
     {
       "layer_name": "model_layers_16_conv_conv",
-      "layer_type": "conv1d",
+      "layer_type": "depthwiseconv1d",
       "weight_key": "model.layers.16.conv.conv.weight",
       "transpose_weight": false
     },
