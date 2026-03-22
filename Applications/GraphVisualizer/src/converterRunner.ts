@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { spawn } from 'child_process';
-import { ConversionResult } from './types';
+import { ConversionResult, ProfileData } from './types';
 
 export class ConverterRunner {
     private context: vscode.ExtensionContext;
@@ -280,6 +280,96 @@ export class ConverterRunner {
             vscode.window.showErrorMessage(`Failed to load: ${e}`);
             return null;
         }
+    }
+
+    /** Run profiling on a model and return per-layer timing data */
+    async runProfile(modelId: string): Promise<ProfileData | null> {
+        const converterPath = this.getConverterPath();
+        const pythonPath = this.getPythonPath();
+        const seqLen = vscode.workspace
+            .getConfiguration('nntrainerGraph')
+            .get<number>('defaultSeqLen') || 8;
+
+        const tmpDir = path.join(this.context.globalStorageUri.fsPath, 'profiles', Date.now().toString());
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        const profileScript = path.join(converterPath, 'vscode_profile.py');
+        if (!fs.existsSync(profileScript)) {
+            vscode.window.showErrorMessage('vscode_profile.py not found in ' + converterPath);
+            return null;
+        }
+
+        return vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Profiling model...',
+                cancellable: true,
+            },
+            async (progress, token) => {
+                return new Promise<ProfileData | null>((resolve) => {
+                    const args = [
+                        profileScript,
+                        '--model', modelId,
+                        '--output', tmpDir,
+                        '--seq-len', seqLen.toString(),
+                        '--num-runs', '5',
+                    ];
+
+                    progress.report({ message: `Profiling: ${modelId}` });
+
+                    const proc = spawn(pythonPath, args, {
+                        cwd: converterPath,
+                        env: { ...process.env, PYTHONPATH: converterPath },
+                    });
+
+                    let stderr = '';
+
+                    proc.stdout.on('data', (data: Buffer) => {
+                        const lines = data.toString().split('\n');
+                        for (const line of lines) {
+                            if (line.startsWith('PROGRESS:')) {
+                                progress.report({ message: line.substring(9).trim() });
+                            }
+                        }
+                    });
+
+                    proc.stderr.on('data', (data: Buffer) => {
+                        stderr += data.toString();
+                    });
+
+                    token.onCancellationRequested(() => {
+                        proc.kill('SIGTERM');
+                        resolve(null);
+                    });
+
+                    proc.on('close', (code) => {
+                        if (code !== 0) {
+                            vscode.window.showErrorMessage(
+                                `Profiling failed (exit ${code}): ${stderr.slice(-500)}`
+                            );
+                            resolve(null);
+                            return;
+                        }
+
+                        const resultPath = path.join(tmpDir, 'profile_result.json');
+                        if (!fs.existsSync(resultPath)) {
+                            vscode.window.showErrorMessage('Profiling produced no result file');
+                            resolve(null);
+                            return;
+                        }
+
+                        try {
+                            const raw = fs.readFileSync(resultPath, 'utf-8');
+                            const result = JSON.parse(raw) as ProfileData;
+                            resolve(result);
+                        } catch (e) {
+                            vscode.window.showErrorMessage(`Failed to parse profile result: ${e}`);
+                            resolve(null);
+                        }
+                    });
+                });
+            }
+        );
     }
 
     /** Create the Python bridge script that serializes full ConversionResult */

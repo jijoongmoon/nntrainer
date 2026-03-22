@@ -120,3 +120,24 @@ export interface NodeMapping {
     hfModuleName: string;
     mappingType: 'direct' | 'decomposed' | 'skipped' | 'unmapped';
 }
+
+/** Per-layer profiling data */
+export interface LayerProfile {
+    name: string;
+    layer_type: string;
+    time_ms: number;
+    memory_mb: number;
+    flops: number;
+    pct_of_total: number;
+}
+
+/** Model profiling result */
+export interface ProfileData {
+    model_name: string;
+    total_time_ms: number;
+    total_memory_mb: number;
+    num_runs: number;
+    seq_len: number;
+    layers: LayerProfile[];
+    bottlenecks: string[];
+}

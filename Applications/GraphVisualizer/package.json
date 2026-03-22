@@ -14,7 +14,8 @@
   "activationEvents": [
     "onCommand:nntrainerGraph.convert",
     "onCommand:nntrainerGraph.convertLocalModel",
-    "onCommand:nntrainerGraph.openVisualizer"
+    "onCommand:nntrainerGraph.openVisualizer",
+    "onCommand:nntrainerGraph.profile"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -33,6 +34,11 @@
         "command": "nntrainerGraph.openVisualizer",
         "title": "NNTrainer: Open Graph Visualizer",
         "icon": "$(graph)"
+      },
+      {
+        "command": "nntrainerGraph.profile",
+        "title": "NNTrainer: Profile Model",
+        "icon": "$(dashboard)"
       }
     ],
     "viewsContainers": {

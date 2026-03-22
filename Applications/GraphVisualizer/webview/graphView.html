@@ -166,6 +166,30 @@
         .itab { padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; background: var(--vscode-editor-background); }
         .itab.active { background: var(--vscode-focusBorder); color: var(--vscode-button-foreground); }
         .empty-msg { padding: 16px; text-align: center; color: var(--vscode-descriptionForeground); font-size: 11px; }
+
+        /* Profile heatmap overlay */
+        .nd.profiled { position: relative; }
+        .nd .pbar { position: absolute; bottom: 0; left: 0; height: 3px; border-radius: 0 0 3px 3px; transition: width .3s; }
+        .nd .ptime { position: absolute; top: -14px; right: 0; font-size: 8px; background: rgba(0,0,0,.7); color: #fff; padding: 0 3px; border-radius: 2px; white-space: nowrap; display: none; }
+        .nd.profiled:hover .ptime { display: block; }
+        .nd.bottleneck { box-shadow: 0 0 8px #e06c75; }
+        .nd.bottleneck .pbar { height: 4px; }
+
+        /* Profile panel */
+        .ppanel {
+            width: 280px; min-width: 280px; overflow-y: auto;
+            background: var(--vscode-sideBar-background);
+            border-left: 1px solid var(--vscode-panel-border);
+            padding: 8px; font-size: 11px; display: none;
+        }
+        .ppanel.vis { display: block; }
+        .ppanel h3 { font-size: 12px; margin: 8px 0 4px; }
+        .prow { display: flex; align-items: center; gap: 4px; margin: 2px 0; font-size: 10px; cursor: pointer; padding: 2px 4px; border-radius: 3px; }
+        .prow:hover { background: var(--vscode-list-hoverBackground); }
+        .prow .pname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .prow .pval { font-family: var(--vscode-editor-fontFamily, monospace); font-size: 9px; min-width: 50px; text-align: right; }
+        .prow .pbar-h { flex: 0 0 60px; height: 8px; background: var(--vscode-editor-background); border-radius: 2px; overflow: hidden; }
+        .prow .pbar-fill { height: 100%; border-radius: 2px; }
     </style>
 </head>
 <body>
@@ -177,6 +201,7 @@
         <button id="b-map">Mapping Lines</button>
         <button id="b-ver">Verification</button>
         <div class="sep"></div>
+        <button id="b-prof">Profile</button>
         <button id="b-insp">Inspector</button>
         <div class="sep"></div>
         <button id="b-tsrc">PyTorch Source</button>
@@ -205,6 +230,7 @@
             <div class="src-code" id="sc-cpp"></div>
         </div>
         <div class="vpanel" id="vpanel"></div>
+        <div class="ppanel" id="ppanel"></div>
         <div class="inspector" id="inspector"></div>
         <svg class="moverlay" id="moverlay"></svg>
     </div>
@@ -793,6 +819,176 @@
         }
 
         /* ==================================================================
+         * Profile Heatmap & Bottleneck (Phase 5)
+         * ================================================================== */
+        let profileData = null;
+        let showProf = false;
+
+        // Receive profile data from extension via postMessage
+        window.addEventListener('message', evt => {
+            const msg = evt.data;
+            if (msg.command === 'profileData') {
+                profileData = msg.data;
+                applyProfileHeatmap();
+                renderProfilePanel();
+                // Auto-show profile panel
+                showProf = true;
+                document.getElementById('ppanel').classList.add('vis');
+                document.getElementById('b-prof').classList.add('active');
+            }
+        });
+
+        document.getElementById('b-prof').onclick = () => {
+            showProf = !showProf;
+            document.getElementById('ppanel').classList.toggle('vis', showProf);
+            document.getElementById('b-prof').classList.toggle('active', showProf);
+        };
+
+        // Color scale: green (fast) -> yellow -> red (slow)
+        function profColor(pct) {
+            const r = pct < 50 ? Math.round(pct / 50 * 255) : 255;
+            const g = pct < 50 ? 255 : Math.round((1 - (pct - 50) / 50) * 255);
+            return 'rgb(' + r + ',' + g + ',60)';
+        }
+
+        function applyProfileHeatmap() {
+            if (!profileData) return;
+
+            // Build name lookup: profile layer name -> node name mapping
+            // Profile uses torch module names (e.g., "model.layers.0.self_attn.q_proj")
+            // FX nodes use flattened names (e.g., "model_layers_0_self_attn_q_proj")
+            // NN layers also use flattened names
+            const profByName = new Map();
+            profileData.layers.forEach(lp => {
+                profByName.set(lp.name, lp);
+                // Also store with flattened name
+                const flat = lp.name.replace(/\./g, '_');
+                profByName.set(flat, lp);
+            });
+
+            const bottleneckSet = new Set(profileData.bottlenecks);
+            const bottleneckFlat = new Set(profileData.bottlenecks.map(b => b.replace(/\./g, '_')));
+
+            const maxPct = Math.max(...profileData.layers.map(l => l.pct_of_total), 1);
+
+            // Apply to FX graph nodes
+            document.querySelectorAll('[data-fx]').forEach(el => {
+                const fxName = el.dataset.fx;
+                const fxNode = fxMap.get(fxName);
+                // Try matching by fx_node_name, scope, or flattened name
+                let lp = profByName.get(fxName);
+                if (!lp && fxNode) lp = profByName.get(fxNode.scope);
+                if (!lp && fxNode) lp = profByName.get(fxNode.target);
+                if (!lp) return;
+
+                el.classList.add('profiled');
+                const pct = lp.pct_of_total / maxPct * 100;
+                const color = profColor(lp.pct_of_total);
+
+                // Add bar
+                let bar = el.querySelector('.pbar');
+                if (!bar) { bar = document.createElement('div'); bar.className = 'pbar'; el.appendChild(bar); }
+                bar.style.width = Math.max(pct, 5) + '%';
+                bar.style.background = color;
+
+                // Add time label
+                let tlbl = el.querySelector('.ptime');
+                if (!tlbl) { tlbl = document.createElement('div'); tlbl.className = 'ptime'; el.appendChild(tlbl); }
+                tlbl.textContent = lp.time_ms.toFixed(3) + 'ms (' + lp.pct_of_total.toFixed(1) + '%)';
+
+                // Bottleneck highlight
+                if (bottleneckSet.has(lp.name) || bottleneckFlat.has(fxName)) {
+                    el.classList.add('bottleneck');
+                }
+            });
+
+            // Apply to NN graph nodes (match via hf_module_name)
+            document.querySelectorAll('[data-nn]').forEach(el => {
+                const nnName = el.dataset.nn;
+                const nnLayer = nnMap.get(nnName);
+                let lp = profByName.get(nnName);
+                if (!lp && nnLayer) lp = profByName.get(nnLayer.hf_module_name);
+                if (!lp) return;
+
+                el.classList.add('profiled');
+                const pct = lp.pct_of_total / maxPct * 100;
+                const color = profColor(lp.pct_of_total);
+
+                let bar = el.querySelector('.pbar');
+                if (!bar) { bar = document.createElement('div'); bar.className = 'pbar'; el.appendChild(bar); }
+                bar.style.width = Math.max(pct, 5) + '%';
+                bar.style.background = color;
+
+                let tlbl = el.querySelector('.ptime');
+                if (!tlbl) { tlbl = document.createElement('div'); tlbl.className = 'ptime'; el.appendChild(tlbl); }
+                tlbl.textContent = lp.time_ms.toFixed(3) + 'ms (' + lp.pct_of_total.toFixed(1) + '%)';
+
+                if (bottleneckSet.has(lp.name) || bottleneckFlat.has(nnName)) {
+                    el.classList.add('bottleneck');
+                }
+            });
+        }
+
+        function renderProfilePanel() {
+            const p = document.getElementById('ppanel');
+            if (!profileData) {
+                p.innerHTML = '<div class="empty-msg">Run "NNTrainer: Profile Model" to see results</div>';
+                return;
+            }
+
+            let h = '<h3>Profile Results</h3>';
+            h += '<div class="vi">Total: <b>' + profileData.total_time_ms.toFixed(2) + ' ms</b> (avg of ' + profileData.num_runs + ' runs)</div>';
+            h += '<div class="vi">Layers: <b>' + profileData.layers.length + '</b>, Seq len: <b>' + profileData.seq_len + '</b></div>';
+            if (profileData.total_memory_mb > 0) {
+                h += '<div class="vi">Memory: <b>' + profileData.total_memory_mb.toFixed(2) + ' MB</b></div>';
+            }
+
+            // Bottleneck section
+            if (profileData.bottlenecks.length) {
+                h += '<h3>Bottlenecks <span class="badge err">' + profileData.bottlenecks.length + '</span></h3>';
+                profileData.bottlenecks.forEach(b => {
+                    const lp = profileData.layers.find(l => l.name === b);
+                    const flat = b.replace(/\./g, '_');
+                    h += '<div class="prow" data-prof-pick="' + esc(flat) + '">';
+                    h += '<span class="pname" style="color:#e06c75">' + esc(b.split('.').pop()) + '</span>';
+                    h += '<span class="pval">' + (lp ? lp.time_ms.toFixed(3) + 'ms' : '') + '</span>';
+                    h += '</div>';
+                });
+            }
+
+            // All layers sorted by time
+            h += '<h3>All Layers (by time)</h3>';
+            const maxPct = Math.max(...profileData.layers.map(l => l.pct_of_total), 1);
+            profileData.layers.forEach(lp => {
+                const color = profColor(lp.pct_of_total);
+                const flat = lp.name.replace(/\./g, '_');
+                const isBot = profileData.bottlenecks.includes(lp.name);
+                h += '<div class="prow" data-prof-pick="' + esc(flat) + '">';
+                h += '<span class="pname"' + (isBot ? ' style="color:#e06c75;font-weight:600"' : '') + '>' + esc(lp.name.split('.').pop()) + '</span>';
+                h += '<div class="pbar-h"><div class="pbar-fill" style="width:' + (lp.pct_of_total / maxPct * 100) + '%;background:' + color + '"></div></div>';
+                h += '<span class="pval">' + lp.time_ms.toFixed(3) + 'ms</span>';
+                h += '</div>';
+            });
+
+            p.innerHTML = h;
+
+            // Click handlers -> navigate to node
+            p.querySelectorAll('[data-prof-pick]').forEach(el => {
+                el.onclick = () => {
+                    const name = el.dataset.profPick;
+                    // Try FX first, then NN
+                    if (fxMap.has(name)) pickFx(name);
+                    else if (nnMap.has(name)) pickNn(name);
+                    else {
+                        // Fuzzy match
+                        for (const [k] of fxMap) { if (k.includes(name) || name.includes(k)) { pickFx(k); return; } }
+                        for (const [k] of nnMap) { if (k.includes(name) || name.includes(k)) { pickNn(k); return; } }
+                    }
+                };
+            });
+        }
+
+        /* ==================================================================
          * Property Inspector (Phase 4)
          * ================================================================== */
 
@@ -1122,6 +1318,7 @@
         renderInspector();
         document.getElementById('inspector').classList.add('vis');
         document.getElementById('b-insp').classList.add('active');
+        renderProfilePanel();
         renderSrc('sc-torch', D.torchSourceCode||'');
         renderSrc('sc-cpp', D.cppSource||'');
     })();
