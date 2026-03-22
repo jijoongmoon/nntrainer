@@ -328,8 +328,8 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   auto in_t_type = in_dim.getTensorType();
   in_t_type.data_type = context.getWeightDataType();
 
-  TensorDim kernel_dim = TensorDim(filter_size, in_dim.channel(),
-                                   kernel_size[0], kernel_size[1], in_t_type);
+  kernel_dim = TensorDim(filter_size, in_dim.channel(), kernel_size[0],
+                         kernel_size[1], in_t_type);
 
   TensorDim bias_dim = TensorDim(1, filter_size, 1, 1, in_t_type);
 
@@ -337,8 +337,13 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
               .compute(in_dim, kernel_dim, {stride[0], stride[1]},
                        {dilation[0], dilation[1]});
 
+  /** Store weight in matrix form (filters, in_ch * k_h * k_w) to avoid
+   * repeated reshape during forward/backward passes */
+  TensorDim kernel_dim_squeezed{filter_size, kernel_dim.getFeatureLen()};
+  kernel_dim_squeezed.setTensorType(in_t_type);
+
   wt_idx[ConvParams::weight] = context.requestWeight(
-    kernel_dim, weight_initializer, weight_regularizer,
+    kernel_dim_squeezed, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "filter", true, 0);
 
   if (disable_bias.empty() || disable_bias.get() == false) {
@@ -428,13 +433,6 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
    */
   const TensorDim &in_dim = input_.getDim();
   const TensorDim &out_dim = hidden_.getDim();
-  const TensorDim &filter_dim = filter_kernel.getDim();
-  TensorDim filter_dim_squeezed{filter_kernel.batch(),
-                                filter_kernel.getDim().getFeatureLen()};
-
-  filter_dim_squeezed.setTensorType(filter_kernel.getTensorType());
-
-  filter_kernel.reshape(filter_dim_squeezed);
 
   /**
    * Below sets the pad area values to zero
@@ -442,14 +440,14 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
    */
   auto forwarding_job = [&](unsigned int s, unsigned int e, unsigned int pid,
                             void *user_data) {
-    Tensor result = Tensor(calcCol2ImOutputDim(out_dim, filter_dim));
+    Tensor result = Tensor(calcCol2ImOutputDim(out_dim, kernel_dim));
     result.setZero();
     for (unsigned int b = s; b < e; ++b) {
       Tensor out = hidden_.getBatchSlice(b, 1);
       out.reshape({filter_size, out_dim.width() * out_dim.height()});
       Tensor in_sub = input_.getBatchSlice(b, 1);
 
-      im2col(in_sub, filter_dim, padding, stride, dilation, result);
+      im2col(in_sub, kernel_dim, padding, stride, dilation, result);
       // filter kernel is (K, CRS), result is (CRS, OH*OW)
       filter_kernel.dot(result, out, false, true);
     }
@@ -463,8 +461,6 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
   } else {
     forwarding_job(0, in_dim.batch(), 0, nullptr);
   }
-
-  filter_kernel.reshape(filter_dim);
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias_kernel = context.getWeight(wt_idx[ConvParams::bias]);
@@ -485,12 +481,6 @@ void Conv2DLayer::calcDerivative(RunLayerContext &context) {
   Tensor &input_derivative = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
   Tensor &filter_kernel = context.getWeight(wt_idx[ConvParams::weight]);
 
-  TensorDim filter_dim = filter_kernel.getDim();
-  TensorDim filter_dim_squeezed{filter_kernel.batch(),
-                                filter_kernel.getDim().getFeatureLen()};
-
-  filter_kernel.reshape(filter_dim_squeezed);
-
   /// for each batch
   /// filter_kernel^T X derivaitive  -> column matrix
   /// col2im(column matrix) to reconstruct the original image
@@ -498,7 +488,7 @@ void Conv2DLayer::calcDerivative(RunLayerContext &context) {
   auto compute_derivative = [&](unsigned int s, unsigned int e,
                                 unsigned int pid, void *user_data) {
     Tensor result =
-      Tensor(calcCol2ImOutputDim(derivative.getDim(), filter_dim));
+      Tensor(calcCol2ImOutputDim(derivative.getDim(), kernel_dim));
 
     for (unsigned int b = s; b < e; ++b) {
       Tensor deriv_sub = derivative.getBatchSlice(b, 1);
@@ -508,7 +498,7 @@ void Conv2DLayer::calcDerivative(RunLayerContext &context) {
       // filter_kernel is (K, CRS), deriv_sub is (K, OH*OW), result is (CRS,
       // OH*OW)
       filter_kernel.dot(deriv_sub, result, true, false);
-      col2im(result, filter_dim, padding, stride, dilation, in_deriv_sub);
+      col2im(result, kernel_dim, padding, stride, dilation, in_deriv_sub);
       // in_derv_sub is (C,H,W)
     }
     result.deallocate();
@@ -521,8 +511,6 @@ void Conv2DLayer::calcDerivative(RunLayerContext &context) {
   } else {
     compute_derivative(0, derivative.batch(), 0, nullptr);
   }
-
-  filter_kernel.reshape(filter_dim);
 }
 
 void Conv2DLayer::calcGradient(RunLayerContext &context) {
@@ -537,10 +525,7 @@ void Conv2DLayer::calcGradient(RunLayerContext &context) {
   Tensor &delK = context.getWeightGrad(wt_idx[ConvParams::weight]);
   delK.setZero();
 
-  TensorDim filter_dim = delK.getDim();
-  TensorDim filter_dim_squeezed{filter_dim.batch(), filter_dim.getFeatureLen()};
-
-  delK.reshape(filter_dim_squeezed);
+  TensorDim delK_dim = delK.getDim();
 
   /**
    * no need to set zero for im2col_result, as its lifespan is ITERATION,
@@ -554,7 +539,7 @@ void Conv2DLayer::calcGradient(RunLayerContext &context) {
   /// so delK = dy x column_matrix ^ T;
   if (workers.getNumWorkers() > 1) {
 
-    TensorDim delK_ext = filter_dim_squeezed;
+    TensorDim delK_ext = delK_dim;
     delK_ext.batch(input_.batch());
 
     Tensor delK_par = Tensor(delK_ext);
@@ -563,7 +548,7 @@ void Conv2DLayer::calcGradient(RunLayerContext &context) {
     auto calc_grad_job = [&](unsigned int s, unsigned int e, unsigned int pid,
                              void *user_data) {
       Tensor result =
-        Tensor(calcCol2ImOutputDim(derivative.getDim(), filter_dim));
+        Tensor(calcCol2ImOutputDim(derivative.getDim(), kernel_dim));
       result.setZero();
       for (unsigned int b = s; b < e; ++b) {
         Tensor deriv_sub = derivative.getBatchSlice(b, 1);
@@ -578,7 +563,7 @@ void Conv2DLayer::calcGradient(RunLayerContext &context) {
          * saved for the whole batch. try this while benchmarking.
          */
         // deriv_sub is (K, OH*OW) and result is (CRS, OH*OW)
-        im2col(in_sub, filter_dim, padding, stride, dilation, result);
+        im2col(in_sub, kernel_dim, padding, stride, dilation, result);
         deriv_sub.dot(result, delK_sub, false, false);
       }
       result.deallocate();
@@ -595,7 +580,7 @@ void Conv2DLayer::calcGradient(RunLayerContext &context) {
 
   } else {
     Tensor result =
-      Tensor(calcCol2ImOutputDim(derivative.getDim(), filter_dim));
+      Tensor(calcCol2ImOutputDim(derivative.getDim(), kernel_dim));
     result.setZero();
 
     for (unsigned int b = 0; b < input_.batch(); ++b) {
@@ -609,12 +594,11 @@ void Conv2DLayer::calcGradient(RunLayerContext &context) {
        * expense of memory. In this case, memory of im2col_result must be saved
        * for the whole batch. try this while benchmarking.
        */
-      im2col(in_sub, filter_dim, padding, stride, dilation, result);
+      im2col(in_sub, kernel_dim, padding, stride, dilation, result);
       deriv_sub.dot(result, delK, false, false, b == 0 ? 0.0f : 1.0f);
     }
     result.deallocate();
   }
-  delK.reshape(filter_dim);
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &delBias = context.getWeightGrad(wt_idx[ConvParams::bias]);
