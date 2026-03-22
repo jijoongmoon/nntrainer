@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{{NONCE}}';">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NNTrainer Graph Visualizer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: var(--vscode-font-family);
+            color: var(--vscode-foreground);
+            background: var(--vscode-editor-background);
+            overflow: hidden;
+        }
+        .toolbar {
+            display: flex; align-items: center; gap: 8px;
+            padding: 8px 12px;
+            background: var(--vscode-titleBar-activeBackground);
+            border-bottom: 1px solid var(--vscode-panel-border);
+            flex-wrap: wrap;
+        }
+        .toolbar button {
+            padding: 4px 12px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none; border-radius: 3px; cursor: pointer; font-size: 12px;
+        }
+        .toolbar button:hover { background: var(--vscode-button-hoverBackground); }
+        .toolbar button.active { background: var(--vscode-focusBorder); }
+        .toolbar .sep { width: 1px; height: 20px; background: var(--vscode-panel-border); }
+        .toolbar .stats { margin-left: auto; font-size: 11px; color: var(--vscode-descriptionForeground); }
+
+        .main { display: flex; height: calc(100vh - 40px); position: relative; }
+
+        .graph-pane {
+            flex: 1; overflow: auto; position: relative;
+            border-right: 1px solid var(--vscode-panel-border);
+        }
+        .pane-hdr {
+            position: sticky; top: 0; z-index: 10;
+            padding: 6px 12px; font-size: 12px; font-weight: 600;
+            background: var(--vscode-sideBar-background);
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .pane-hdr.torch { color: #e06c75; }
+        .pane-hdr.nn { color: #61afef; }
+        .legend { display: inline-flex; gap: 10px; font-size: 10px; color: var(--vscode-descriptionForeground); margin-left: 12px; }
+        .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle; margin-right: 2px; }
+
+        .gcanvas { position: relative; min-height: 100%; }
+        .gcanvas svg.edges { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 1; }
+        .gcanvas .ncont { position: relative; z-index: 2; }
+
+        /* Nodes */
+        .nd {
+            position: absolute; display: flex; flex-direction: column;
+            padding: 4px 6px; border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px; font-size: 10px; cursor: pointer;
+            background: var(--vscode-editor-background);
+            white-space: nowrap; text-align: center; overflow: hidden;
+            transition: border-color .12s, box-shadow .12s;
+        }
+        .nd:hover { border-color: var(--vscode-focusBorder); box-shadow: 0 0 5px var(--vscode-focusBorder); z-index: 5; }
+        .nd.sel { border-color: var(--vscode-focusBorder); background: var(--vscode-list-activeSelectionBackground); z-index: 5; }
+        .nd.hl { box-shadow: 0 0 8px #98c379; z-index: 5; }
+        .nd.mapped { border-left: 3px solid #98c379; }
+        .nd.unmapped { border-left: 3px solid #e06c75; }
+        .nd.skipped { border-left: 3px solid #d19a66; opacity: .7; }
+        .nd .nm { font-weight: 600; font-size: 9px; }
+        .nd .tp { color: var(--vscode-descriptionForeground); font-size: 9px; }
+
+        /* FX op colors */
+        .nd.op-call_module { border-top: 2px solid #98c379; }
+        .nd.op-call_function { border-top: 2px solid #e5c07b; }
+        .nd.op-call_method { border-top: 2px solid #c678dd; }
+        .nd.op-get_attr { border-top: 2px solid #56b6c2; }
+        /* NN layer type colors */
+        .nd.lt-input { border-top: 2px solid #61afef; }
+        .nd.lt-fully_connected { border-top: 2px solid #98c379; }
+        .nd.lt-mha_core { border-top: 2px solid #c678dd; }
+        .nd.lt-rms_norm,.nd.lt-layer_norm { border-top: 2px solid #e5c07b; }
+        .nd.lt-addition { border-top: 2px solid #56b6c2; }
+        .nd.lt-embedding { border-top: 2px solid #d19a66; }
+
+        /* Edges */
+        .eline { stroke: var(--vscode-panel-border); stroke-width: 1; fill: none; }
+        .eline.hl { stroke: var(--vscode-focusBorder); stroke-width: 2; }
+        .earr { fill: var(--vscode-panel-border); }
+        .earr.hl { fill: var(--vscode-focusBorder); }
+
+        /* Mapping overlay */
+        svg.moverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 20; }
+        .mline { stroke: #98c379; stroke-width: 1; stroke-dasharray: 4 3; opacity: .3; fill: none; }
+        .mline.act { stroke-width: 2.5; opacity: .85; stroke-dasharray: none; }
+
+        /* Source panes */
+        .src-pane { flex: 1; overflow: auto; display: none; border-right: 1px solid var(--vscode-panel-border); }
+        .src-pane.vis { display: block; }
+        .src-code {
+            padding: 8px 12px; font-family: var(--vscode-editor-fontFamily, monospace);
+            font-size: 12px; white-space: pre; line-height: 1.5; counter-reset: line;
+        }
+        .src-code .ln { display: block; padding: 0 8px 0 48px; position: relative; }
+        .src-code .ln::before {
+            content: counter(line); counter-increment: line;
+            position: absolute; left: 0; width: 40px; text-align: right;
+            color: var(--vscode-editorLineNumber-foreground); font-size: 11px;
+        }
+        .src-code .ln:hover { background: var(--vscode-editor-hoverHighlightBackground); }
+
+        /* Verification */
+        .vpanel {
+            width: 260px; min-width: 260px; overflow-y: auto;
+            background: var(--vscode-sideBar-background);
+            border-left: 1px solid var(--vscode-panel-border);
+            padding: 8px; font-size: 11px; display: none;
+        }
+        .vpanel.vis { display: block; }
+        .vpanel h3 { font-size: 12px; margin: 8px 0 4px; }
+        .badge { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; }
+        .badge.ok { background: #2d4a2d; color: #98c379; }
+        .badge.warn { background: #4a3d2d; color: #d19a66; }
+        .badge.err { background: #4a2d2d; color: #e06c75; }
+        .vi { padding: 3px 6px; margin: 2px 0; border-radius: 3px; background: var(--vscode-editor-background); }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <button id="b-sbs" class="active">Side by Side</button>
+        <button id="b-nn">NNTrainer Only</button>
+        <button id="b-fx">Torch FX Only</button>
+        <div class="sep"></div>
+        <button id="b-map">Mapping Lines</button>
+        <button id="b-ver">Verification</button>
+        <div class="sep"></div>
+        <button id="b-tsrc">PyTorch Source</button>
+        <button id="b-csrc">C++ Output</button>
+        <span class="stats" id="stats"></span>
+    </div>
+    <div class="main" id="main">
+        <div class="src-pane" id="sp-torch">
+            <div class="pane-hdr" style="color:#e5c07b">PyTorch Source</div>
+            <div class="src-code" id="sc-torch"></div>
+        </div>
+        <div class="graph-pane" id="p-fx">
+            <div class="pane-hdr torch">PyTorch FX Graph
+                <span class="legend"><span><i style="background:#98c379"></i>module</span><span><i style="background:#e5c07b"></i>function</span><span><i style="background:#c678dd"></i>method</span></span>
+            </div>
+            <div class="gcanvas" id="gc-fx"><svg class="edges" id="eg-fx"></svg><div class="ncont" id="nc-fx"></div></div>
+        </div>
+        <div class="graph-pane" id="p-nn">
+            <div class="pane-hdr nn">NNTrainer Graph
+                <span class="legend"><span><i style="background:#98c379"></i>mapped</span><span><i style="background:#e06c75"></i>unmapped</span><span><i style="background:#d19a66"></i>skip</span></span>
+            </div>
+            <div class="gcanvas" id="gc-nn"><svg class="edges" id="eg-nn"></svg><div class="ncont" id="nc-nn"></div></div>
+        </div>
+        <div class="src-pane" id="sp-cpp">
+            <div class="pane-hdr" style="color:#61afef">Generated C++</div>
+            <div class="src-code" id="sc-cpp"></div>
+        </div>
+        <div class="vpanel" id="vpanel"></div>
+        <svg class="moverlay" id="moverlay"></svg>
+    </div>
+
+    <script nonce="{{NONCE}}">
+    (function() {
+        const vscode = acquireVsCodeApi();
+        const D = {{DATA}};
+
+        /* ---- constants ---- */
+        const NW = 150, NH = 40, HG = 18, VG = 14, PAD = 16;
+
+        /* ---- lookup maps ---- */
+        const fxMap = new Map(), nnMap = new Map();
+        D.fxGraph.forEach(n => fxMap.set(n.name, n));
+        D.nntrainerLayers.forEach(l => nnMap.set(l.name, l));
+        const mByFx = new Map(), mByNn = new Map();
+        D.nodeMapping.forEach(m => {
+            mByFx.set(m.fxNodeName, m);
+            if (m.nntrainerLayerName) mByNn.set(m.nntrainerLayerName, m);
+        });
+
+        /* ---- stats ---- */
+        const nMapped = D.nodeMapping.filter(m => m.mappingType === 'direct').length;
+        const nSkip = D.nodeMapping.filter(m => m.mappingType === 'skipped').length;
+        const nUnmap = D.unsupportedOps.length + D.unknownLayers.length;
+        document.getElementById('stats').textContent =
+            'FX:' + D.fxGraph.length + ' | NN:' + D.nntrainerLayers.length +
+            ' | Map:' + nMapped + ' | Skip:' + nSkip + (nUnmap ? ' | Unmap:' + nUnmap : '');
+
+        /* ---- state ---- */
+        let selFx = null, selNn = null, viewMode = 'sbs';
+        let showMap = false, showVer = false, showTSrc = false, showCSrc = false;
+
+        /* ==================================================================
+         * DAG Layout (longest-path layering)
+         * ================================================================== */
+        function dagLayout(nodes, getInputs) {
+            const nameSet = new Set(nodes.map(n => n.id));
+            const depth = new Map();
+            function d(id) {
+                if (depth.has(id)) return depth.get(id);
+                depth.set(id, 0);
+                const inp = getInputs(id).filter(i => nameSet.has(i));
+                if (!inp.length) return 0;
+                const v = 1 + Math.max(...inp.map(d));
+                depth.set(id, v);
+                return v;
+            }
+            nodes.forEach(n => d(n.id));
+
+            const layers = [];
+            nodes.forEach(n => { const dd = depth.get(n.id)||0; (layers[dd]||(layers[dd]=[])).push(n); });
+
+            let maxW = 0;
+            layers.forEach(l => { if (l && l.length > maxW) maxW = l.length; });
+
+            const pos = new Map();
+            const mxTot = maxW * NW + (maxW - 1) * HG;
+            layers.forEach((layer, li) => {
+                if (!layer) return;
+                const tot = layer.length * NW + (layer.length - 1) * HG;
+                const sx = PAD + (mxTot - tot) / 2;
+                layer.forEach((n, ci) => {
+                    pos.set(n.id, { x: sx + ci * (NW + HG), y: PAD + li * (NH + VG) });
+                });
+            });
+            return { pos, h: PAD*2 + layers.length*(NH+VG), w: PAD*2 + mxTot };
+        }
+
+        /* ==================================================================
+         * SVG helpers
+         * ================================================================== */
+        function esc(t) { return t ? String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') : ''; }
+        const SVG_NS = 'http://www.w3.org/2000/svg';
+        function mkPath(svg, x1,y1,x2,y2,cls,marker,dfrom,dto) {
+            const p = document.createElementNS(SVG_NS,'path');
+            const my = (y1+y2)/2;
+            p.setAttribute('d','M'+x1+','+y1+' C'+x1+','+my+' '+x2+','+my+' '+x2+','+y2);
+            p.setAttribute('class','eline '+cls);
+            p.setAttribute('marker-end','url(#'+marker+')');
+            p.dataset.from = dfrom; p.dataset.to = dto;
+            svg.appendChild(p);
+        }
+        function initSvg(svg, w, h, prefix) {
+            svg.setAttribute('width', w); svg.setAttribute('height', h);
+            svg.innerHTML = '<defs>' +
+                '<marker id="'+prefix+'a" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto"><path d="M0,0 L0,5 L5,2.5Z" class="earr"/></marker>' +
+                '<marker id="'+prefix+'ah" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto"><path d="M0,0 L0,5 L5,2.5Z" class="earr hl"/></marker>' +
+                '</defs>';
+        }
+
+        /* ==================================================================
+         * Render FX Graph
+         * ================================================================== */
+        function renderFx() {
+            const nc = document.getElementById('nc-fx');
+            const svg = document.getElementById('eg-fx');
+            nc.innerHTML = '';
+            const vis = D.fxGraph.filter(n => n.op!=='placeholder' && n.op!=='output');
+            const ln = vis.map(n => ({id:n.name, d:n}));
+            const {pos,h,w} = dagLayout(ln, id => { const n=fxMap.get(id); return n?(n.args||[]):[]; });
+            nc.style.width = w+'px'; nc.style.height = h+'px';
+            initSvg(svg, w, h, 'fx');
+
+            vis.forEach(n => {
+                const tp = pos.get(n.name); if(!tp) return;
+                (n.args||[]).forEach(a => {
+                    const fp = pos.get(a); if(!fp) return;
+                    mkPath(svg, fp.x+NW/2, fp.y+NH, tp.x+NW/2, tp.y, '', 'fxa', a, n.name);
+                });
+            });
+
+            vis.forEach(n => {
+                const p = pos.get(n.name); if(!p) return;
+                const m = mByFx.get(n.name);
+                const mc = m ? (m.mappingType==='direct'?'mapped':m.mappingType==='skipped'?'skipped':'unmapped') : 'unmapped';
+                const div = document.createElement('div');
+                div.className = 'nd '+mc+' op-'+n.op;
+                div.dataset.fx = n.name;
+                div.style.cssText = 'left:'+p.x+'px;top:'+p.y+'px;width:'+NW+'px;height:'+NH+'px';
+                const st = (n.target||'').split('.').pop();
+                div.innerHTML = '<span class="nm">'+esc(n.name)+'</span><span class="tp">'+esc(n.op+': '+st)+'</span>';
+                div.title = n.name+'\n'+n.op+': '+n.target+(n.module_type?'\n'+n.module_type:'');
+                div.onclick = e => { e.stopPropagation(); pickFx(n.name); };
+                nc.appendChild(div);
+            });
+        }
+
+        /* ==================================================================
+         * Render NNTrainer Graph
+         * ================================================================== */
+        function renderNn() {
+            const nc = document.getElementById('nc-nn');
+            const svg = document.getElementById('eg-nn');
+            nc.innerHTML = '';
+            const ln = D.nntrainerLayers.map(l => ({id:l.name, d:l}));
+            const {pos,h,w} = dagLayout(ln, id => { const l=nnMap.get(id); return l?(l.input_layers||[]):[]; });
+            nc.style.width = w+'px'; nc.style.height = h+'px';
+            initSvg(svg, w, h, 'nn');
+
+            D.nntrainerLayers.forEach(l => {
+                const tp = pos.get(l.name); if(!tp) return;
+                (l.input_layers||[]).forEach(inp => {
+                    const fp = pos.get(inp); if(!fp) return;
+                    mkPath(svg, fp.x+NW/2, fp.y+NH, tp.x+NW/2, tp.y, '', 'nna', inp, l.name);
+                });
+            });
+
+            D.nntrainerLayers.forEach(l => {
+                const p = pos.get(l.name); if(!p) return;
+                const m = mByNn.get(l.name);
+                const mc = m ? 'mapped' : '';
+                const lt = 'lt-'+l.layer_type.replace(/[^a-zA-Z0-9_]/g,'_');
+                const div = document.createElement('div');
+                div.className = 'nd '+mc+' '+lt;
+                div.dataset.nn = l.name;
+                div.style.cssText = 'left:'+p.x+'px;top:'+p.y+'px;width:'+NW+'px;height:'+NH+'px';
+                div.innerHTML = '<span class="nm">'+esc(l.name)+'</span><span class="tp">'+esc(l.layer_type)+'</span>';
+                div.title = l.name+'\n'+l.layer_type+'\nIn: ['+(l.input_layers||[]).join(', ')+']';
+                div.onclick = e => { e.stopPropagation(); pickNn(l.name); };
+                nc.appendChild(div);
+            });
+        }
+
+        /* ==================================================================
+         * Cross-panel mapping lines
+         * ================================================================== */
+        function drawMap() {
+            const svg = document.getElementById('moverlay');
+            const main = document.getElementById('main');
+            svg.innerHTML = '';
+            if (!showMap || viewMode !== 'sbs') return;
+            const mr = main.getBoundingClientRect();
+            svg.setAttribute('width', mr.width); svg.setAttribute('height', mr.height);
+
+            D.nodeMapping.forEach(m => {
+                if (m.mappingType !== 'direct') return;
+                const fe = document.querySelector('[data-fx="'+m.fxNodeName+'"]');
+                const ne = document.querySelector('[data-nn="'+m.nntrainerLayerName+'"]');
+                if (!fe || !ne) return;
+                const fr = fe.getBoundingClientRect(), nr = ne.getBoundingClientRect();
+                const pfx = document.getElementById('p-fx').getBoundingClientRect();
+                const pnn = document.getElementById('p-nn').getBoundingClientRect();
+                if (fr.bottom < pfx.top+30 && nr.bottom < pnn.top+30) return;
+                if (fr.top > pfx.bottom && nr.top > pnn.bottom) return;
+
+                const x1 = fr.right - mr.left, y1 = fr.top + fr.height/2 - mr.top;
+                const x2 = nr.left - mr.left, y2 = nr.top + nr.height/2 - mr.top;
+                const act = (selFx===m.fxNodeName || selNn===m.nntrainerLayerName);
+                const p = document.createElementNS(SVG_NS, 'path');
+                const mx = (x1+x2)/2;
+                p.setAttribute('d','M'+x1+','+y1+' C'+mx+','+y1+' '+mx+','+y2+' '+x2+','+y2);
+                p.setAttribute('class','mline'+(act?' act':''));
+                svg.appendChild(p);
+            });
+        }
+
+        let mapTimer = null;
+        function schedMap() { if(!mapTimer) mapTimer = requestAnimationFrame(()=>{ mapTimer=null; drawMap(); }); }
+        document.getElementById('p-fx').addEventListener('scroll', schedMap);
+        document.getElementById('p-nn').addEventListener('scroll', schedMap);
+
+        /* ==================================================================
+         * Selection / cross-highlight
+         * ================================================================== */
+        function hlEdges(svgId, name) {
+            const svg = document.getElementById(svgId);
+            const pre = svgId === 'eg-fx' ? 'fx' : 'nn';
+            svg.querySelectorAll('path[data-from]').forEach(p => {
+                if (p.dataset.from===name || p.dataset.to===name) {
+                    p.classList.add('hl'); p.setAttribute('marker-end','url(#'+pre+'ah)');
+                } else {
+                    p.classList.remove('hl'); p.setAttribute('marker-end','url(#'+pre+'a)');
+                }
+            });
+        }
+        function clearHl() {
+            ['eg-fx','eg-nn'].forEach(id => {
+                const pre = id==='eg-fx'?'fx':'nn';
+                document.getElementById(id).querySelectorAll('path.hl').forEach(p => {
+                    p.classList.remove('hl'); p.setAttribute('marker-end','url(#'+pre+'a)');
+                });
+            });
+        }
+        function clearSel() {
+            selFx=null; selNn=null;
+            document.querySelectorAll('.nd.sel,.nd.hl').forEach(e => { e.classList.remove('sel','hl'); });
+            clearHl();
+        }
+
+        function pickFx(name) {
+            clearSel(); selFx = name;
+            const el = document.querySelector('[data-fx="'+name+'"]');
+            if (el) el.classList.add('sel');
+            hlEdges('eg-fx', name);
+            const m = mByFx.get(name);
+            if (m && m.nntrainerLayerName) {
+                selNn = m.nntrainerLayerName;
+                const ne = document.querySelector('[data-nn="'+m.nntrainerLayerName+'"]');
+                if (ne) { ne.classList.add('sel','hl'); ne.scrollIntoView({behavior:'smooth',block:'center'}); }
+                hlEdges('eg-nn', m.nntrainerLayerName);
+            }
+            drawMap();
+            vscode.postMessage({command:'nodeSelected',data:{layerName:name,source:'fx'}});
+        }
+        function pickNn(name) {
+            clearSel(); selNn = name;
+            const el = document.querySelector('[data-nn="'+name+'"]');
+            if (el) el.classList.add('sel');
+            hlEdges('eg-nn', name);
+            const m = mByNn.get(name);
+            if (m && m.fxNodeName) {
+                selFx = m.fxNodeName;
+                const fe = document.querySelector('[data-fx="'+m.fxNodeName+'"]');
+                if (fe) { fe.classList.add('sel','hl'); fe.scrollIntoView({behavior:'smooth',block:'center'}); }
+                hlEdges('eg-fx', m.fxNodeName);
+            }
+            drawMap();
+            vscode.postMessage({command:'nodeSelected',data:{layerName:name,source:'nntrainer'}});
+        }
+
+        document.querySelectorAll('.gcanvas').forEach(c => c.addEventListener('click', e => {
+            if (e.target===c||e.target.classList.contains('ncont')) { clearSel(); drawMap(); }
+        }));
+
+        /* ==================================================================
+         * View controls
+         * ================================================================== */
+        function setView(m) {
+            viewMode = m;
+            document.querySelectorAll('.toolbar button').forEach(b => b.classList.remove('active'));
+            const fx = document.getElementById('p-fx'), nn = document.getElementById('p-nn');
+            if (m==='sbs') { fx.style.display='block'; nn.style.display='block'; document.getElementById('b-sbs').classList.add('active'); }
+            else if (m==='nn') { fx.style.display='none'; nn.style.display='block'; document.getElementById('b-nn').classList.add('active'); }
+            else { fx.style.display='block'; nn.style.display='none'; document.getElementById('b-fx').classList.add('active'); }
+            if (showMap) document.getElementById('b-map').classList.add('active');
+            if (showVer) document.getElementById('b-ver').classList.add('active');
+            drawMap();
+        }
+        document.getElementById('b-sbs').onclick = () => setView('sbs');
+        document.getElementById('b-nn').onclick = () => setView('nn');
+        document.getElementById('b-fx').onclick = () => setView('torch');
+        document.getElementById('b-map').onclick = () => { showMap=!showMap; document.getElementById('b-map').classList.toggle('active',showMap); drawMap(); };
+        document.getElementById('b-ver').onclick = () => { showVer=!showVer; document.getElementById('vpanel').classList.toggle('vis',showVer); document.getElementById('b-ver').classList.toggle('active',showVer); };
+        document.getElementById('b-tsrc').onclick = () => { showTSrc=!showTSrc; document.getElementById('sp-torch').classList.toggle('vis',showTSrc); document.getElementById('b-tsrc').classList.toggle('active',showTSrc); };
+        document.getElementById('b-csrc').onclick = () => { showCSrc=!showCSrc; document.getElementById('sp-cpp').classList.toggle('vis',showCSrc); document.getElementById('b-csrc').classList.toggle('active',showCSrc); };
+
+        /* ==================================================================
+         * Verification panel
+         * ================================================================== */
+        function renderVer() {
+            const p = document.getElementById('vpanel');
+            const total = D.fxGraph.filter(n=>n.op!=='placeholder'&&n.op!=='output').length;
+            const mc = D.nodeMapping.filter(m=>m.mappingType==='direct').length;
+            const r = total>0?Math.round(mc/total*100):0;
+            const bc = r===100?'ok':r>80?'warn':'err';
+            let h = '<h3>Verification</h3><div class="vi">Coverage: <span class="badge '+bc+'">'+r+'%</span> ('+mc+'/'+total+')</div>';
+            if (D.unsupportedOps.length) {
+                h+='<h3>Unsupported <span class="badge err">'+D.unsupportedOps.length+'</span></h3>';
+                D.unsupportedOps.forEach(o => h+='<div class="vi">'+esc(o)+'</div>');
+            }
+            if (D.unknownLayers.length) {
+                h+='<h3>Unknown <span class="badge warn">'+D.unknownLayers.length+'</span></h3>';
+                D.unknownLayers.forEach(l => h+='<div class="vi">'+esc(l)+'</div>');
+            }
+            if (D.decomposedModules.length) {
+                h+='<h3>Decomposed <span class="badge warn">'+D.decomposedModules.length+'</span></h3>';
+                D.decomposedModules.forEach(m => h+='<div class="vi">'+esc(m)+'</div>');
+            }
+            const sk = D.nodeMapping.filter(m=>m.mappingType==='skipped');
+            if (sk.length) {
+                h+='<h3>Skipped <span class="badge warn">'+sk.length+'</span></h3>';
+                sk.slice(0,20).forEach(m => h+='<div class="vi">'+esc(m.fxNodeName)+'</div>');
+                if (sk.length>20) h+='<div class="vi">...+'+(sk.length-20)+' more</div>';
+            }
+            p.innerHTML = h;
+        }
+
+        /* Source code */
+        function renderSrc(id, code) {
+            const c = document.getElementById(id);
+            if (!code) { c.innerHTML='<div style="padding:16px;opacity:.5">No source</div>'; return; }
+            c.innerHTML = code.split('\n').map(l => '<span class="ln">'+esc(l)+'</span>').join('\n');
+        }
+
+        /* ---- Init ---- */
+        renderFx();
+        renderNn();
+        renderVer();
+        renderSrc('sc-torch', D.torchSourceCode||'');
+        renderSrc('sc-cpp', D.cppSource||'');
+    })();
+    </script>
+</body>
+</html>
