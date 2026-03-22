@@ -699,6 +699,200 @@ def test_weight_binary_roundtrip():
 
 
 # ============================================================================
+# Test 9: Conv2D Weight 2D Matrix Form Conversion
+# ============================================================================
+
+def test_conv2d_weight_2d_matrix():
+    """Validate conv2d weights are reshaped to 2D matrix form (filters, C*H*W).
+
+    NNTrainer stores conv2d weights as (filters, in_ch * k_h * k_w)
+    instead of PyTorch's (filters, in_ch, k_h, k_w) to avoid repeated
+    reshape during forward/backward passes.
+    """
+    print("\n" + "=" * 70)
+    print("TEST 9: Conv2D Weight 2D Matrix Form Conversion")
+    print("=" * 70)
+
+    from weight_converter import WeightConverter, build_weight_map
+    from nntrainer_layers import NNTrainerLayerDef, LAYER_CONV2D, LAYER_FC
+    import numpy as np
+
+    # Create mock layers: one conv2d, one linear
+    layers = [
+        NNTrainerLayerDef(
+            layer_type=LAYER_CONV2D,
+            name="conv1",
+            has_weight=True,
+            has_bias=True,
+            weight_hf_key="conv1.weight",
+            bias_hf_key="conv1.bias",
+            reshape_weight_2d=True,
+        ),
+        NNTrainerLayerDef(
+            layer_type=LAYER_FC,
+            name="fc1",
+            has_weight=True,
+            has_bias=False,
+            weight_hf_key="fc1.weight",
+            transpose_weight=True,
+        ),
+    ]
+
+    # Verify weight map transforms
+    wmap = build_weight_map(layers)
+    entries = list(wmap)
+    assert entries[0]["transform"] == "reshape_2d", \
+        f"Expected reshape_2d for conv2d, got {entries[0]['transform']}"
+    assert entries[1]["transform"] == "none", \
+        f"Expected none for conv2d bias, got {entries[1]['transform']}"
+    assert entries[2]["transform"] == "transpose", \
+        f"Expected transpose for fc, got {entries[2]['transform']}"
+    print("  PASS: Weight map has correct transforms (reshape_2d, none, transpose)")
+
+    # Create mock state_dict with 4D conv weight
+    filters, in_ch, k_h, k_w = 8, 3, 3, 3
+    conv_weight = torch.randn(filters, in_ch, k_h, k_w)
+    conv_bias = torch.randn(filters)
+    fc_weight = torch.randn(64, 32)
+
+    state_dict = {
+        "conv1.weight": conv_weight,
+        "conv1.bias": conv_bias,
+        "fc1.weight": fc_weight,
+    }
+
+    # Convert to binary
+    converter = WeightConverter(layers)
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        output_path = f.name
+
+    try:
+        converter.convert(state_dict, output_path, dtype="float32")
+
+        with open(output_path, "rb") as f:
+            # Read conv2d weight: should be 2D (filters, in_ch*k_h*k_w)
+            conv_expected = conv_weight.reshape(filters, -1).contiguous()
+            conv_bytes = f.read(conv_expected.numel() * 4)
+            conv_actual = np.frombuffer(conv_bytes, dtype=np.float32).reshape(
+                filters, in_ch * k_h * k_w)
+            np.testing.assert_array_equal(
+                conv_actual, conv_expected.numpy(),
+                "Conv2D weight not correctly reshaped to 2D matrix form")
+            print(f"  PASS: Conv2D weight reshaped from "
+                  f"({filters},{in_ch},{k_h},{k_w}) -> "
+                  f"({filters},{in_ch*k_h*k_w})")
+
+            # Read conv2d bias: unchanged
+            bias_bytes = f.read(conv_bias.numel() * 4)
+            bias_actual = np.frombuffer(bias_bytes, dtype=np.float32)
+            np.testing.assert_array_equal(
+                bias_actual, conv_bias.numpy(),
+                "Conv2D bias should not be transformed")
+            print("  PASS: Conv2D bias unchanged")
+
+            # Read fc weight: should be transposed
+            fc_expected = fc_weight.t().contiguous()
+            fc_bytes = f.read(fc_expected.numel() * 4)
+            fc_actual = np.frombuffer(fc_bytes, dtype=np.float32).reshape(
+                32, 64)
+            np.testing.assert_array_equal(
+                fc_actual, fc_expected.numpy(),
+                "FC weight not correctly transposed")
+            print("  PASS: FC weight correctly transposed")
+
+    finally:
+        os.unlink(output_path)
+
+    print("  PASS: Conv2D weight 2D matrix form conversion PASSED")
+
+
+# ============================================================================
+# Test 10: LFM2-700M Weight Conversion (full-attention only)
+# ============================================================================
+
+def test_lfm2_weight_conversion():
+    """Validate LFM2-700M weight map: all weights are 2D (Linear only).
+
+    LFM2-700M is a full-attention model with no conv/SSM layers.
+    All weight transforms should be 'transpose' (Linear) or 'none'.
+    """
+    print("\n" + "=" * 70)
+    print("TEST 10: LFM2-700M Weight Conversion Verification")
+    print("=" * 70)
+
+    try:
+        from transformers import Lfm2Config, Lfm2ForCausalLM
+    except ImportError:
+        print("  SKIP: transformers does not have Lfm2 support")
+        return
+
+    from weight_converter import WeightConverter, build_weight_map
+    from decomposer import AdaptiveConverter
+
+    config = Lfm2Config(
+        hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, vocab_size=1000,
+        max_position_embeddings=128, norm_eps=1e-5,
+        tie_word_embeddings=True,
+        layer_types=["full_attention", "full_attention"],
+        conv_L_cache=3,
+    )
+    model = Lfm2ForCausalLM(config)
+    model.eval()
+
+    converter = AdaptiveConverter(model, config)
+    inputs = {"input_ids": torch.randint(0, 1000, (1, 8))}
+    result = converter.convert(inputs)
+
+    wmap = build_weight_map(result.layers)
+    entries = list(wmap)
+
+    # Verify no reshape_2d transforms (no conv2d layers in LFM2)
+    reshape_entries = [e for e in entries if e["transform"] == "reshape_2d"]
+    assert len(reshape_entries) == 0, \
+        f"LFM2 should have no conv2d weights, found reshape_2d: {reshape_entries}"
+    print("  PASS: No reshape_2d transforms (no conv2d in LFM2)")
+
+    # Verify all weight transforms are transpose or none
+    for entry in entries:
+        assert entry["transform"] in ("transpose", "none"), \
+            f"Unexpected transform '{entry['transform']}' for {entry['hf_key']}"
+    print(f"  PASS: All {len(entries)} weight entries use transpose/none")
+
+    # Verify Linear weights are 2D in state_dict
+    state_dict = model.state_dict()
+    transpose_count = 0
+    for entry in entries:
+        if entry["transform"] == "transpose":
+            tensor = state_dict[entry["hf_key"]]
+            assert tensor.dim() == 2, \
+                f"Transpose weight {entry['hf_key']} is not 2D: {tensor.shape}"
+            transpose_count += 1
+    print(f"  PASS: All {transpose_count} transposed weights are 2D matrices")
+
+    # Verify binary roundtrip
+    wconv = WeightConverter(result.layers)
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        output_path = f.name
+
+    try:
+        wconv.convert(state_dict, output_path, dtype="float32")
+        total_size = os.path.getsize(output_path)
+        expected_size = sum(
+            state_dict[e["hf_key"]].numel() * 4
+            for e in entries if e["hf_key"] in state_dict
+        )
+        assert total_size == expected_size, \
+            f"Size mismatch: {total_size} vs {expected_size}"
+        print(f"  PASS: Binary output size correct ({total_size} bytes)")
+    finally:
+        os.unlink(output_path)
+
+    print("  PASS: LFM2-700M weight conversion PASSED")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -711,6 +905,8 @@ if __name__ == "__main__":
     test_mt5_full_pipeline()
     test_json_schema()
     test_weight_binary_roundtrip()
+    test_conv2d_weight_2d_matrix()
+    test_lfm2_weight_conversion()
 
     print("\n" + "=" * 70)
     print("ALL END-TO-END TESTS PASSED!")
