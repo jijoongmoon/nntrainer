@@ -53,6 +53,7 @@ class NNTrainerLayerDef:
     weight_hf_key: str = ""                   # HF state_dict key for weight
     bias_hf_key: str = ""                     # HF state_dict key for bias
     transpose_weight: bool = False            # Whether to transpose weight [out,in]->[in,out]
+    reshape_weight_2d: bool = False           # Whether to reshape weight from 4D to 2D (conv2d)
     shared_from: str = ""                     # For tied weights (e.g. tie_word_embeddings)
 
     def to_properties_list(self) -> list:

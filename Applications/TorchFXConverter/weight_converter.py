@@ -8,6 +8,8 @@ NNTrainer weight format:
   - Each layer's weights are stored contiguously:
     [weight_data] [bias_data] (if has_bias)
   - Linear layer weights need transposition: [out, in] -> [in, out]
+  - Conv2D weights are reshaped to 2D matrix form:
+    [filters, in_ch, k_h, k_w] -> [filters, in_ch * k_h * k_w]
   - Embedding weights are kept as-is: [vocab, dim]
   - RMSNorm / LayerNorm weights are single vectors
   - Tied embeddings share weight reference (stored once)
@@ -31,7 +33,7 @@ class WeightMap:
     Each entry describes:
       - hf_key: HuggingFace state_dict key (e.g. "model.layers.0.self_attn.q_proj.weight")
       - nntr_layer: NNTrainer layer name
-      - transform: "transpose" | "none" | "skip"
+      - transform: "transpose" | "reshape_2d" | "none" | "skip"
       - dtype: target data type
     """
 
@@ -78,7 +80,12 @@ def build_weight_map(layers):
 
         # Weight
         if layer.has_weight and layer.weight_hf_key:
-            transform = "transpose" if layer.transpose_weight else "none"
+            if layer.reshape_weight_2d:
+                transform = "reshape_2d"
+            elif layer.transpose_weight:
+                transform = "transpose"
+            else:
+                transform = "none"
             wmap.add(layer.weight_hf_key, layer.name, transform)
 
         # Bias
@@ -132,6 +139,10 @@ class WeightConverter:
                 # Apply transformation
                 if entry["transform"] == "transpose" and tensor.dim() == 2:
                     tensor = tensor.t().contiguous()
+                elif entry["transform"] == "reshape_2d" and tensor.dim() == 4:
+                    # Conv2D: (filters, in_ch, k_h, k_w) -> (filters, in_ch*k_h*k_w)
+                    filters = tensor.shape[0]
+                    tensor = tensor.reshape(filters, -1).contiguous()
 
                 # Write raw bytes
                 data = tensor.cpu().numpy().tobytes()
@@ -198,6 +209,10 @@ class WeightConverter:
         lines.append("            if transform == 'transpose' and "
                      "t.dim() == 2:")
         lines.append("                t = t.t().contiguous()")
+        lines.append("            elif transform == 'reshape_2d' and "
+                     "t.dim() == 4:")
+        lines.append("                t = t.reshape(t.shape[0], "
+                     "-1).contiguous()")
         lines.append("            f.write(t.cpu().numpy().tobytes())")
         lines.append("")
         lines.append("    print(f'Saved {len(WEIGHT_MAP)} weight tensors "

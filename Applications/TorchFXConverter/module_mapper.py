@@ -407,6 +407,7 @@ def _map_conv2d(module, module_name, module_type, input_names):
         has_bias=module.bias is not None,
         weight_hf_key=f"{module_name}.weight",
         bias_hf_key=f"{module_name}.bias" if module.bias is not None else "",
+        reshape_weight_2d=True,  # NNTrainer stores conv2d weight as (filters, in_ch*k_h*k_w)
     )
 
 
@@ -429,6 +430,7 @@ def _map_conv2d_transpose(module, module_name, module_type, input_names):
         has_bias=module.bias is not None,
         weight_hf_key=f"{module_name}.weight",
         bias_hf_key=f"{module_name}.bias" if module.bias is not None else "",
+        reshape_weight_2d=True,  # NNTrainer stores conv2d weight as (filters, in_ch*k_h*k_w)
     )
 
 
@@ -450,6 +452,7 @@ def _map_depthwise_conv2d(module, module_name, module_type, input_names):
         has_weight=True,
         has_bias=module.bias is not None,
         weight_hf_key=f"{module_name}.weight",
+        reshape_weight_2d=True,  # NNTrainer stores conv2d weight as (filters, in_ch*k_h*k_w)
         bias_hf_key=f"{module_name}.bias" if module.bias is not None else "",
     )
 
