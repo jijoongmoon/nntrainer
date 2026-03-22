@@ -335,12 +335,67 @@
         const SVG_NS = 'http://www.w3.org/2000/svg';
         function mkPath(svg, x1,y1,x2,y2,cls,marker,dfrom,dto) {
             const p = document.createElementNS(SVG_NS,'path');
-            const my = (y1+y2)/2;
-            p.setAttribute('d','M'+x1+','+y1+' C'+x1+','+my+' '+x2+','+my+' '+x2+','+y2);
+            const dy = y2 - y1;
+            // Use cubic bezier with 40% control point offset for smooth curves
+            const cy = Math.max(Math.abs(dy) * 0.4, 20);
+            p.setAttribute('d','M'+x1+','+y1+' C'+x1+','+(y1+cy)+' '+x2+','+(y2-cy)+' '+x2+','+y2);
             p.setAttribute('class','eline '+cls);
             p.setAttribute('marker-end','url(#'+marker+')');
             p.dataset.from = dfrom; p.dataset.to = dto;
             svg.appendChild(p);
+        }
+
+        /** Compute fanned x-offsets for edges sharing a node port.
+         *  Returns Map<edgeKey, {srcX, dstX}> */
+        function computeFanOffsets(edges, pos) {
+            // Group outgoing edges by source node, incoming edges by dest node
+            const outgoing = new Map(); // srcId -> [dstId, ...]
+            const incoming = new Map(); // dstId -> [srcId, ...]
+            edges.forEach(([src, dst]) => {
+                if (!outgoing.has(src)) outgoing.set(src, []);
+                outgoing.get(src).push(dst);
+                if (!incoming.has(dst)) incoming.set(dst, []);
+                incoming.get(dst).push(src);
+            });
+
+            const fanMap = new Map(); // "src->dst" -> {srcX, dstX}
+            const SPREAD = Math.min(NW * 0.7, 80); // max fan width
+
+            // Fan outgoing edges at source bottom
+            outgoing.forEach((dsts, src) => {
+                const sp = pos.get(src); if (!sp) return;
+                const n = dsts.length;
+                dsts.sort((a,b) => {
+                    const pa = pos.get(a), pb = pos.get(b);
+                    if (!pa || !pb) return 0;
+                    return pa.x - pb.x; // sort by target x position
+                });
+                dsts.forEach((dst, i) => {
+                    const key = src+'->'+dst;
+                    const offset = n === 1 ? 0 : (i / (n - 1) - 0.5) * SPREAD;
+                    if (!fanMap.has(key)) fanMap.set(key, { srcX: 0, dstX: 0 });
+                    fanMap.get(key).srcX = sp.x + NW/2 + offset;
+                });
+            });
+
+            // Fan incoming edges at dest top
+            incoming.forEach((srcs, dst) => {
+                const dp = pos.get(dst); if (!dp) return;
+                const n = srcs.length;
+                srcs.sort((a,b) => {
+                    const pa = pos.get(a), pb = pos.get(b);
+                    if (!pa || !pb) return 0;
+                    return pa.x - pb.x;
+                });
+                srcs.forEach((src, i) => {
+                    const key = src+'->'+dst;
+                    const offset = n === 1 ? 0 : (i / (n - 1) - 0.5) * SPREAD;
+                    if (!fanMap.has(key)) fanMap.set(key, { srcX: dp.x + NW/2, dstX: 0 });
+                    fanMap.get(key).dstX = dp.x + NW/2 + offset;
+                });
+            });
+
+            return fanMap;
         }
         function initSvg(svg, w, h, prefix) {
             svg.setAttribute('width', w); svg.setAttribute('height', h);
@@ -363,11 +418,22 @@
             nc.style.width = w+'px'; nc.style.height = h+'px';
             initSvg(svg, w, h, 'fx');
 
+            // Collect all edges and compute fan offsets
+            const edges = [];
+            vis.forEach(n => {
+                (n.args||[]).forEach(a => { if(pos.has(a)) edges.push([a, n.name]); });
+            });
+            const fan = computeFanOffsets(edges, pos);
+
             vis.forEach(n => {
                 const tp = pos.get(n.name); if(!tp) return;
                 (n.args||[]).forEach(a => {
                     const fp = pos.get(a); if(!fp) return;
-                    mkPath(svg, fp.x+NW/2, fp.y+NH, tp.x+NW/2, tp.y, '', 'fxa', a, n.name);
+                    const key = a+'->'+n.name;
+                    const f = fan.get(key);
+                    const sx = f ? f.srcX : fp.x+NW/2;
+                    const dx = f ? f.dstX : tp.x+NW/2;
+                    mkPath(svg, sx, fp.y+NH, dx, tp.y, '', 'fxa', a, n.name);
                 });
             });
 
@@ -399,11 +465,22 @@
             nc.style.width = w+'px'; nc.style.height = h+'px';
             initSvg(svg, w, h, 'nn');
 
+            // Collect all edges and compute fan offsets
+            const edges = [];
+            D.nntrainerLayers.forEach(l => {
+                (l.input_layers||[]).forEach(inp => { if(pos.has(inp)) edges.push([inp, l.name]); });
+            });
+            const fan = computeFanOffsets(edges, pos);
+
             D.nntrainerLayers.forEach(l => {
                 const tp = pos.get(l.name); if(!tp) return;
                 (l.input_layers||[]).forEach(inp => {
                     const fp = pos.get(inp); if(!fp) return;
-                    mkPath(svg, fp.x+NW/2, fp.y+NH, tp.x+NW/2, tp.y, '', 'nna', inp, l.name);
+                    const key = inp+'->'+l.name;
+                    const f = fan.get(key);
+                    const sx = f ? f.srcX : fp.x+NW/2;
+                    const dx = f ? f.dstX : tp.x+NW/2;
+                    mkPath(svg, sx, fp.y+NH, dx, tp.y, '', 'nna', inp, l.name);
                 });
             });
 
