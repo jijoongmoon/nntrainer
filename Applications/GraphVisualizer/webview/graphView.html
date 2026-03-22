@@ -49,9 +49,25 @@
         .legend { display: inline-flex; gap: 10px; font-size: 10px; color: var(--vscode-descriptionForeground); margin-left: 12px; }
         .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle; margin-right: 2px; }
 
-        .gcanvas { position: relative; min-height: 100%; }
+        .gcanvas { position: relative; min-height: 100%; transform-origin: 0 0; }
         .gcanvas svg.edges { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 1; }
         .gcanvas .ncont { position: relative; z-index: 2; }
+
+        /* Zoom controls */
+        .zoom-ctrl {
+            position: absolute; bottom: 12px; right: 12px; z-index: 30;
+            display: flex; gap: 4px; align-items: center;
+            background: var(--vscode-sideBar-background);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 6px; padding: 3px 6px; box-shadow: 0 2px 6px rgba(0,0,0,.2);
+        }
+        .zoom-ctrl button {
+            width: 24px; height: 24px; border: none; border-radius: 4px;
+            background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+            cursor: pointer; font-size: 14px; line-height: 1; display: flex; align-items: center; justify-content: center;
+        }
+        .zoom-ctrl button:hover { background: var(--vscode-button-hoverBackground); }
+        .zoom-ctrl .zoom-pct { font-size: 10px; min-width: 36px; text-align: center; color: var(--vscode-descriptionForeground); }
 
         /* Nodes (Netron-inspired) */
         .nd {
@@ -269,12 +285,26 @@
                 <span class="legend"><span><i style="background:#98c379"></i>module</span><span><i style="background:#e5c07b"></i>function</span><span><i style="background:#c678dd"></i>method</span></span>
             </div>
             <div class="gcanvas" id="gc-fx"><svg class="edges" id="eg-fx"></svg><div class="ncont" id="nc-fx"></div></div>
+            <div class="zoom-ctrl" data-pane="fx">
+                <button data-z="out" title="Zoom Out (-)">-</button>
+                <span class="zoom-pct">100%</span>
+                <button data-z="in" title="Zoom In (+)">+</button>
+                <button data-z="fit" title="Fit to View">Fit</button>
+                <button data-z="reset" title="Reset Zoom">1:1</button>
+            </div>
         </div>
         <div class="graph-pane" id="p-nn">
             <div class="pane-hdr nn">NNTrainer Graph
                 <span class="legend"><span><i style="background:#98c379"></i>mapped</span><span><i style="background:#e06c75"></i>unmapped</span><span><i style="background:#d19a66"></i>skip</span></span>
             </div>
             <div class="gcanvas" id="gc-nn"><svg class="edges" id="eg-nn"></svg><div class="ncont" id="nc-nn"></div></div>
+            <div class="zoom-ctrl" data-pane="nn">
+                <button data-z="out" title="Zoom Out (-)">-</button>
+                <span class="zoom-pct">100%</span>
+                <button data-z="in" title="Zoom In (+)">+</button>
+                <button data-z="fit" title="Fit to View">Fit</button>
+                <button data-z="reset" title="Reset Zoom">1:1</button>
+            </div>
         </div>
         <div class="src-pane" id="sp-cpp">
             <div class="pane-hdr" style="color:#61afef">Generated C++</div>
@@ -317,6 +347,82 @@
         let showMap = false, showVer = false, showInsp = true, showTSrc = false, showCSrc = false;
         let showGroups = true;
         let inspTab = 'props';
+
+        /* ---- zoom state ---- */
+        const zoomState = { fx: 1.0, nn: 1.0 };
+        const ZOOM_MIN = 0.15, ZOOM_MAX = 3.0, ZOOM_STEP = 0.15;
+        // Track canvas dimensions for fit-to-view
+        const canvasDims = { fx: { w: 0, h: 0 }, nn: { w: 0, h: 0 } };
+
+        function applyZoom(paneId) {
+            const z = zoomState[paneId];
+            const gc = document.getElementById('gc-' + paneId);
+            gc.style.transform = 'scale(' + z + ')';
+            // Update the scrollable area so scroll works correctly with scale
+            const dims = canvasDims[paneId];
+            gc.style.width = (dims.w * z) + 'px';
+            gc.style.height = (dims.h * z) + 'px';
+            gc.style.transformOrigin = '0 0';
+            // Undo the scaled internal size so children stay correct
+            gc.children[0].setAttribute('width', dims.w);
+            gc.children[0].setAttribute('height', dims.h);
+            // Update percentage label
+            const ctrl = document.querySelector('.zoom-ctrl[data-pane="'+paneId+'"]');
+            if (ctrl) ctrl.querySelector('.zoom-pct').textContent = Math.round(z * 100) + '%';
+            schedMap();
+        }
+
+        function zoomTo(paneId, newZ) {
+            zoomState[paneId] = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZ));
+            applyZoom(paneId);
+        }
+
+        function zoomFit(paneId) {
+            const pane = document.getElementById('p-' + paneId);
+            const dims = canvasDims[paneId];
+            if (!dims.w || !dims.h) return;
+            const pw = pane.clientWidth - 8;
+            const ph = pane.clientHeight - 40; // minus header
+            const z = Math.min(pw / dims.w, ph / dims.h, 1.0);
+            zoomTo(paneId, z);
+        }
+
+        // Zoom controls click handler
+        document.querySelectorAll('.zoom-ctrl').forEach(ctrl => {
+            const paneId = ctrl.dataset.pane;
+            ctrl.querySelectorAll('button').forEach(btn => {
+                btn.onclick = e => {
+                    e.stopPropagation();
+                    const action = btn.dataset.z;
+                    if (action === 'in') zoomTo(paneId, zoomState[paneId] + ZOOM_STEP);
+                    else if (action === 'out') zoomTo(paneId, zoomState[paneId] - ZOOM_STEP);
+                    else if (action === 'fit') zoomFit(paneId);
+                    else if (action === 'reset') zoomTo(paneId, 1.0);
+                };
+            });
+        });
+
+        // Mouse wheel zoom (Ctrl+scroll)
+        ['fx', 'nn'].forEach(paneId => {
+            document.getElementById('p-' + paneId).addEventListener('wheel', e => {
+                if (!e.ctrlKey && !e.metaKey) return;
+                e.preventDefault();
+                const delta = e.deltaY > 0 ? -ZOOM_STEP : ZOOM_STEP;
+                zoomTo(paneId, zoomState[paneId] + delta);
+            }, { passive: false });
+        });
+
+        // Keyboard zoom: +/- when graph pane focused
+        document.addEventListener('keydown', e => {
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+            const panes = [];
+            if (viewMode === 'sbs') panes.push('fx', 'nn');
+            else if (viewMode === 'fx') panes.push('fx');
+            else if (viewMode === 'nn') panes.push('nn');
+            if (e.key === '=' || e.key === '+') { panes.forEach(p => zoomTo(p, zoomState[p] + ZOOM_STEP)); e.preventDefault(); }
+            else if (e.key === '-') { panes.forEach(p => zoomTo(p, zoomState[p] - ZOOM_STEP)); e.preventDefault(); }
+            else if (e.key === '0') { panes.forEach(p => zoomTo(p, 1.0)); e.preventDefault(); }
+        });
 
         /* ==================================================================
          * DAG Layout (longest-path layering)
@@ -442,6 +548,7 @@
             const ln = vis.map(n => ({id:n.name, d:n}));
             const {pos,h,w} = dagLayout(ln, id => { const n=fxMap.get(id); return n?(n.args||[]):[]; });
             nc.style.width = w+'px'; nc.style.height = h+'px';
+            canvasDims.fx = { w, h };
             initSvg(svg, w, h, 'fx');
 
             // Collect all edges and compute fan offsets
@@ -489,6 +596,7 @@
             const ln = D.nntrainerLayers.map(l => ({id:l.name, d:l}));
             const {pos,h,w} = dagLayout(ln, id => { const l=nnMap.get(id); return l?(l.input_layers||[]):[]; });
             nc.style.width = w+'px'; nc.style.height = h+'px';
+            canvasDims.nn = { w, h };
             initSvg(svg, w, h, 'nn');
 
             // Collect all edges and compute fan offsets
