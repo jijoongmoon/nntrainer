@@ -167,6 +167,29 @@
         .itab.active { background: var(--vscode-focusBorder); color: var(--vscode-button-foreground); }
         .empty-msg { padding: 16px; text-align: center; color: var(--vscode-descriptionForeground); font-size: 11px; }
 
+        /* Group boxes (Phase 6) */
+        .group-box {
+            position: absolute; border: 1.5px dashed; border-radius: 6px;
+            pointer-events: none; z-index: 0;
+        }
+        .group-box.attn { border-color: rgba(198,120,221,.4); background: rgba(198,120,221,.03); }
+        .group-box.ffn { border-color: rgba(97,175,239,.4); background: rgba(97,175,239,.03); }
+        .group-box.embed { border-color: rgba(209,154,102,.4); background: rgba(209,154,102,.03); }
+        .group-label {
+            position: absolute; font-size: 9px; font-weight: 600; padding: 1px 5px;
+            border-radius: 3px; pointer-events: auto; cursor: pointer; z-index: 3;
+            opacity: .8;
+        }
+        .group-label.attn { background: rgba(198,120,221,.2); color: #c678dd; }
+        .group-label.ffn { background: rgba(97,175,239,.2); color: #61afef; }
+        .group-label.embed { background: rgba(209,154,102,.2); color: #d19a66; }
+        .group-label:hover { opacity: 1; }
+        .nd.grouped-hidden { display: none !important; }
+        .eline.grouped-hidden { display: none !important; }
+
+        /* C++ source highlight */
+        .src-code .ln.cpp-hl { background: rgba(97,175,239,.15); border-left: 2px solid #61afef; }
+
         /* Profile heatmap overlay */
         .nd.profiled { position: relative; }
         .nd .pbar { position: absolute; bottom: 0; left: 0; height: 3px; border-radius: 0 0 3px 3px; transition: width .3s; }
@@ -201,11 +224,13 @@
         <button id="b-map">Mapping Lines</button>
         <button id="b-ver">Verification</button>
         <div class="sep"></div>
+        <button id="b-group">Groups</button>
         <button id="b-prof">Profile</button>
         <button id="b-insp">Inspector</button>
         <div class="sep"></div>
         <button id="b-tsrc">PyTorch Source</button>
         <button id="b-csrc">C++ Output</button>
+        <button id="b-export">Export</button>
         <span class="stats" id="stats"></span>
     </div>
     <div class="main" id="main">
@@ -264,6 +289,7 @@
         /* ---- state ---- */
         let selFx = null, selNn = null, viewMode = 'sbs';
         let showMap = false, showVer = false, showInsp = true, showTSrc = false, showCSrc = false;
+        let showGroups = true;
         let inspTab = 'props';
 
         /* ==================================================================
@@ -477,6 +503,9 @@
             }
             drawMap();
             renderInspector();
+            // C++ source linking: find NN layer from FX mapping
+            const fxm = mByFx.get(name);
+            if (fxm && fxm.nntrainerLayerName) highlightCppLine(fxm.nntrainerLayerName);
             vscode.postMessage({command:'nodeSelected',data:{layerName:name,source:'fx'}});
         }
         function pickNn(name) {
@@ -493,6 +522,7 @@
             }
             drawMap();
             renderInspector();
+            highlightCppLine(name);
             vscode.postMessage({command:'nodeSelected',data:{layerName:name,source:'nntrainer'}});
         }
 
@@ -838,6 +868,14 @@
             }
         });
 
+        document.getElementById('b-group').onclick = () => {
+            showGroups = !showGroups;
+            document.getElementById('b-group').classList.toggle('active', showGroups);
+            drawGroups();
+        };
+
+        document.getElementById('b-export').onclick = () => exportReport();
+
         document.getElementById('b-prof').onclick = () => {
             showProf = !showProf;
             document.getElementById('ppanel').classList.toggle('vis', showProf);
@@ -986,6 +1024,261 @@
                     }
                 };
             });
+        }
+
+        /* ==================================================================
+         * Phase 6-1: Pattern Grouping
+         * ================================================================== */
+        function detectGroups(nodes, nameKey) {
+            // Detect Attention and FFN blocks by name patterns
+            const groups = [];
+            const blockMap = new Map(); // blockId -> {type, nodes[]}
+
+            nodes.forEach(n => {
+                const name = typeof n === 'string' ? n : (n.dataset ? n.dataset[nameKey] : n.name || '');
+                // Match patterns like model_layers_0_self_attn_* or model_layers_0_mlp_*
+                let m = name.match(/^(model_layers_(\d+)_self_attn)/);
+                if (m) {
+                    const bid = m[1];
+                    if (!blockMap.has(bid)) blockMap.set(bid, {type:'attn', label:'Attn L'+m[2], names:[]});
+                    blockMap.get(bid).names.push(name);
+                    return;
+                }
+                m = name.match(/^(model_layers_(\d+)_(mlp|ffn))/);
+                if (m) {
+                    const bid = m[1];
+                    if (!blockMap.has(bid)) blockMap.set(bid, {type:'ffn', label:'FFN L'+m[2], names:[]});
+                    blockMap.get(bid).names.push(name);
+                    return;
+                }
+                m = name.match(/^(model_(rotary_emb|embed))/);
+                if (m) {
+                    const bid = m[1];
+                    if (!blockMap.has(bid)) blockMap.set(bid, {type:'embed', label:m[2]==='embed'?'Embed':'RoPE', names:[]});
+                    blockMap.get(bid).names.push(name);
+                }
+            });
+
+            blockMap.forEach((info, bid) => {
+                if (info.names.length >= 2) {
+                    groups.push(info);
+                }
+            });
+            return groups;
+        }
+
+        function drawGroups() {
+            // Remove existing group elements
+            document.querySelectorAll('.group-box,.group-label').forEach(e => e.remove());
+            if (!showGroups) return;
+
+            // Draw groups on NN graph
+            const nnNc = document.getElementById('nc-nn');
+            const nnGroups = detectGroups(D.nntrainerLayers, 'nn');
+            nnGroups.forEach(g => {
+                let minX=Infinity, minY=Infinity, maxX=0, maxY=0, found=0;
+                g.names.forEach(name => {
+                    const el = document.querySelector('[data-nn="'+name+'"]');
+                    if (!el) return;
+                    const x = parseInt(el.style.left)||0, y = parseInt(el.style.top)||0;
+                    const w = parseInt(el.style.width)||NW, h = parseInt(el.style.height)||NH;
+                    if (x < minX) minX = x;
+                    if (y < minY) minY = y;
+                    if (x+w > maxX) maxX = x+w;
+                    if (y+h > maxY) maxY = y+h;
+                    found++;
+                });
+                if (found < 2) return;
+                const pad = 6;
+                const box = document.createElement('div');
+                box.className = 'group-box '+g.type;
+                box.style.cssText = 'left:'+(minX-pad)+'px;top:'+(minY-pad)+'px;width:'+(maxX-minX+pad*2)+'px;height:'+(maxY-minY+pad*2)+'px';
+                nnNc.appendChild(box);
+                const lbl = document.createElement('div');
+                lbl.className = 'group-label '+g.type;
+                lbl.textContent = g.label;
+                lbl.style.cssText = 'left:'+(minX-pad)+'px;top:'+(minY-pad-14)+'px';
+                nnNc.appendChild(lbl);
+            });
+
+            // Draw groups on FX graph
+            const fxNc = document.getElementById('nc-fx');
+            const fxGroups = detectGroups(D.fxGraph.filter(n=>n.op!=='placeholder'&&n.op!=='output'), 'fx');
+            fxGroups.forEach(g => {
+                let minX=Infinity, minY=Infinity, maxX=0, maxY=0, found=0;
+                g.names.forEach(name => {
+                    const el = document.querySelector('[data-fx="'+name+'"]');
+                    if (!el) return;
+                    const x = parseInt(el.style.left)||0, y = parseInt(el.style.top)||0;
+                    const w = parseInt(el.style.width)||NW, h = parseInt(el.style.height)||NH;
+                    if (x < minX) minX = x;
+                    if (y < minY) minY = y;
+                    if (x+w > maxX) maxX = x+w;
+                    if (y+h > maxY) maxY = y+h;
+                    found++;
+                });
+                if (found < 2) return;
+                const pad = 6;
+                const box = document.createElement('div');
+                box.className = 'group-box '+g.type;
+                box.style.cssText = 'left:'+(minX-pad)+'px;top:'+(minY-pad)+'px;width:'+(maxX-minX+pad*2)+'px;height:'+(maxY-minY+pad*2)+'px';
+                fxNc.appendChild(box);
+                const lbl = document.createElement('div');
+                lbl.className = 'group-label '+g.type;
+                lbl.textContent = g.label;
+                lbl.style.cssText = 'left:'+(minX-pad)+'px;top:'+(minY-pad-14)+'px';
+                fxNc.appendChild(lbl);
+            });
+        }
+
+        /* ==================================================================
+         * Phase 6-2: C++ Source Linking
+         * ================================================================== */
+        // Build line index: NN layer name -> C++ line number
+        const cppLineMap = new Map();
+        if (D.cppSource) {
+            const cppLines = D.cppSource.split('\n');
+
+            // Index: for each C++ line with createLayer, extract the variable name
+            // e.g., "LayerHandle q_proj(createLayer..." -> "q_proj"
+            const cppHandles = []; // [{line, varName, layerType}]
+            cppLines.forEach((line, i) => {
+                let m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*"([^"]+)"/);
+                if (!m) m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*(\w+)/);
+                if (m) cppHandles.push({line: i+1, varName: m[1], layerType: m[2]});
+            });
+
+            // Match NN layers to C++ handles by suffix matching
+            // e.g., "model_layers_0_self_attn_q_proj" -> matches "q_proj"
+            D.nntrainerLayers.forEach(l => {
+                const parts = l.name.split('_');
+                // Try progressively longer suffixes
+                for (let len = 1; len <= Math.min(3, parts.length); len++) {
+                    const suffix = parts.slice(-len).join('_');
+                    const match = cppHandles.find(h => h.varName === suffix);
+                    if (match) { cppLineMap.set(l.name, match.line); return; }
+                }
+                // Try layer_type match (first occurrence not yet used)
+                const typeAlias = {'embedding_layer':'embedding','rms_norm':'output_norm'};
+                const lt = l.layer_type;
+                const match = cppHandles.find(h =>
+                    h.layerType === lt ||
+                    h.varName === (typeAlias[lt]||'')
+                );
+                if (match && !cppLineMap.has(l.name)) {
+                    cppLineMap.set(l.name, match.line);
+                }
+            });
+        }
+
+        function highlightCppLine(layerName) {
+            // Clear previous highlights
+            document.querySelectorAll('.src-code .ln.cpp-hl').forEach(el => el.classList.remove('cpp-hl'));
+            const lineNum = cppLineMap.get(layerName);
+            if (!lineNum) return;
+            const lineEl = document.querySelector('#sc-cpp .ln[data-line="'+lineNum+'"]');
+            if (lineEl) {
+                lineEl.classList.add('cpp-hl');
+                lineEl.scrollIntoView({behavior:'smooth', block:'center'});
+                // Auto-show C++ panel if hidden
+                if (!showCSrc) {
+                    showCSrc = true;
+                    document.getElementById('sp-cpp').classList.add('vis');
+                    document.getElementById('b-csrc').classList.add('active');
+                }
+            }
+        }
+
+        /* ==================================================================
+         * Phase 6-3: Export
+         * ================================================================== */
+        function exportReport() {
+            // Build comprehensive verification report
+            const mv = verifyMapping();
+            const tv = verifyTopology();
+            const cv = verifyCpp();
+
+            let report = '# NNTrainer Conversion Report\n';
+            report += '## Model\n';
+            report += '- FX Nodes: ' + D.fxGraph.length + '\n';
+            report += '- NNTrainer Layers: ' + D.nntrainerLayers.length + '\n';
+            report += '- Mapping Coverage: ' + mv.coverage + '%\n\n';
+
+            report += '## Mapping Summary\n';
+            report += '- Direct mapped: ' + mv.directMapped.length + '\n';
+            report += '- Skipped: ' + mv.skipped.length + '\n';
+            report += '- Unmapped FX: ' + mv.unmappedFx.length + '\n';
+            report += '- Unmapped NN: ' + mv.unmappedNn.length + '\n\n';
+
+            if (mv.unmappedFx.length) {
+                report += '### Unmapped FX Nodes\n';
+                mv.unmappedFx.forEach(n => report += '- ' + n.name + ' (' + n.op + ': ' + n.target + ')\n');
+                report += '\n';
+            }
+
+            report += '## Topology\n';
+            report += '- Mismatches: ' + tv.length + '\n';
+            tv.forEach(i => report += '- ' + i.msg + '\n');
+            report += '\n';
+
+            report += '## C++ Cross-check\n';
+            report += '- createLayer calls: ' + cv.layerCalls.length + '\n';
+            report += '- Layer types: ' + cv.cppTypes.join(', ') + '\n';
+            report += '- Issues: ' + cv.issues.length + '\n';
+            cv.issues.forEach(i => report += '- ' + i.msg + '\n');
+            report += '\n';
+
+            if (D.unsupportedOps.length) {
+                report += '## Unsupported Ops\n';
+                D.unsupportedOps.forEach(o => report += '- ' + o + '\n');
+                report += '\n';
+            }
+
+            if (profileData) {
+                report += '## Profile\n';
+                report += '- Total: ' + profileData.total_time_ms.toFixed(2) + ' ms\n';
+                report += '- Bottlenecks: ' + profileData.bottlenecks.join(', ') + '\n';
+                report += '### Top 10 Layers\n';
+                profileData.layers.slice(0, 10).forEach(l => {
+                    report += '- ' + l.name + ': ' + l.time_ms.toFixed(3) + ' ms (' + l.pct_of_total.toFixed(1) + '%)\n';
+                });
+                report += '\n';
+            }
+
+            report += '## Layer Details\n';
+            report += '| NN Layer | Type | FX Node | HF Module | Weight |\n';
+            report += '|----------|------|---------|-----------|--------|\n';
+            D.nntrainerLayers.forEach(l => {
+                report += '| ' + l.name + ' | ' + l.layer_type + ' | ' + (l.fx_node_name||'-') + ' | ' + (l.hf_module_name||'-') + ' | ' + (l.has_weight?'yes':'no') + ' |\n';
+            });
+
+            // Send to extension for saving
+            vscode.postMessage({command:'exportReport', data:{content:report, format:'md'}});
+
+            // Also generate graph SVG export
+            const nnSvg = document.getElementById('eg-nn');
+            const nnNodes = document.getElementById('nc-nn');
+            if (nnSvg && nnNodes) {
+                // Create a combined SVG with nodes as foreignObject
+                const w = parseInt(nnNodes.style.width) || 800;
+                const h = parseInt(nnNodes.style.height) || 600;
+                let svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="'+w+'" height="'+h+'">';
+                svgStr += '<style>.eline{stroke:#666;stroke-width:1;fill:none}.earr{fill:#666}</style>';
+                svgStr += nnSvg.innerHTML;
+                // Add node rectangles
+                document.querySelectorAll('[data-nn]').forEach(el => {
+                    const x = parseInt(el.style.left)||0, y = parseInt(el.style.top)||0;
+                    const nw = parseInt(el.style.width)||NW, nh = parseInt(el.style.height)||NH;
+                    const name = el.dataset.nn;
+                    const layer = nnMap.get(name);
+                    const color = el.classList.contains('mapped') ? '#98c379' : '#e06c75';
+                    svgStr += '<rect x="'+x+'" y="'+y+'" width="'+nw+'" height="'+nh+'" rx="4" fill="#1e1e1e" stroke="'+color+'" stroke-width="1"/>';
+                    svgStr += '<text x="'+(x+nw/2)+'" y="'+(y+14)+'" fill="#ccc" font-size="9" text-anchor="middle" font-family="monospace">'+esc(name)+'</text>';
+                    if (layer) svgStr += '<text x="'+(x+nw/2)+'" y="'+(y+26)+'" fill="#888" font-size="8" text-anchor="middle" font-family="monospace">'+esc(layer.layer_type)+'</text>';
+                });
+                svgStr += '</svg>';
+                vscode.postMessage({command:'exportSvg', data:{content:svgStr}});
+            }
         }
 
         /* ==================================================================
@@ -1321,6 +1614,8 @@
         renderProfilePanel();
         renderSrc('sc-torch', D.torchSourceCode||'');
         renderSrc('sc-cpp', D.cppSource||'');
+        drawGroups();
+        document.getElementById('b-group').classList.add('active');
     })();
     </script>
 </body>

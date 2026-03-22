@@ -79,12 +79,32 @@ export class GraphVisualizerPanel {
             }
             case 'openCppSource': {
                 const data = message.data as { lineHint: string };
-                // Future: open generated C++ and jump to line
                 vscode.window.showInformationMessage(
                     `C++ source: ${data.lineHint}`
                 );
                 break;
             }
+            case 'exportReport': {
+                const data = message.data as { content: string; format: string };
+                this.saveExport(data.content, 'conversion-report.md', 'Markdown');
+                break;
+            }
+            case 'exportSvg': {
+                const data = message.data as { content: string };
+                this.saveExport(data.content, 'graph.svg', 'SVG');
+                break;
+            }
+        }
+    }
+
+    private async saveExport(content: string, defaultName: string, label: string) {
+        const uri = await vscode.window.showSaveDialog({
+            defaultUri: vscode.Uri.file(defaultName),
+            filters: { [label]: [defaultName.split('.').pop() || 'txt'] },
+        });
+        if (uri) {
+            fs.writeFileSync(uri.fsPath, content, 'utf-8');
+            vscode.window.showInformationMessage(`Exported ${label} to ${uri.fsPath}`);
         }
     }
 
