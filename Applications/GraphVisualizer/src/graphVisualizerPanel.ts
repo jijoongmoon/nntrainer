@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { ConversionResult } from './types';
+import { ConversionResult, ProfileData } from './types';
 
 export class GraphVisualizerPanel {
     public static currentPanel: GraphVisualizerPanel | undefined;
@@ -55,6 +55,16 @@ export class GraphVisualizerPanel {
 
     public update(result: ConversionResult) {
         this.panel.webview.html = this.getHtml(result);
+    }
+
+    /** Send profile data to the webview via postMessage */
+    public static sendProfileData(profileData: ProfileData): void {
+        if (GraphVisualizerPanel.currentPanel) {
+            GraphVisualizerPanel.currentPanel.panel.webview.postMessage({
+                command: 'profileData',
+                data: profileData,
+            });
+        }
     }
 
     private handleMessage(message: { command: string; data?: unknown }) {

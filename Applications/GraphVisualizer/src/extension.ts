@@ -87,6 +87,29 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Command: Profile Model
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nntrainerGraph.profile', async () => {
+            const modelId = await vscode.window.showInputBox({
+                prompt: 'Enter model to profile (HuggingFace ID or local path)',
+                placeHolder: 'e.g., Qwen/Qwen3-0.6B, ./test_model',
+            });
+            if (!modelId) {
+                return;
+            }
+
+            const profileData = await converterRunner.runProfile(modelId);
+            if (profileData) {
+                // Send profile data to the existing visualizer panel
+                GraphVisualizerPanel.sendProfileData(profileData);
+                vscode.window.showInformationMessage(
+                    `Profiling complete: ${profileData.layers.length} layers, ` +
+                    `${profileData.total_time_ms.toFixed(2)} ms total`
+                );
+            }
+        })
+    );
+
     // Command: Open Visualizer (from existing JSON)
     context.subscriptions.push(
         vscode.commands.registerCommand('nntrainerGraph.openVisualizer', async () => {
