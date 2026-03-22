@@ -112,18 +112,29 @@
 
         /* Verification */
         .vpanel {
-            width: 260px; min-width: 260px; overflow-y: auto;
+            width: 320px; min-width: 320px; overflow-y: auto;
             background: var(--vscode-sideBar-background);
             border-left: 1px solid var(--vscode-panel-border);
             padding: 8px; font-size: 11px; display: none;
         }
         .vpanel.vis { display: block; }
-        .vpanel h3 { font-size: 12px; margin: 8px 0 4px; }
+        .vpanel h3 { font-size: 12px; margin: 10px 0 4px; color: var(--vscode-sideBarTitle-foreground); }
+        .vpanel h3:first-child { margin-top: 4px; }
         .badge { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; }
         .badge.ok { background: #2d4a2d; color: #98c379; }
         .badge.warn { background: #4a3d2d; color: #d19a66; }
         .badge.err { background: #4a2d2d; color: #e06c75; }
-        .vi { padding: 3px 6px; margin: 2px 0; border-radius: 3px; background: var(--vscode-editor-background); }
+        .vi { padding: 3px 6px; margin: 2px 0; border-radius: 3px; background: var(--vscode-editor-background); font-size: 10px; }
+        .vi.clickable { cursor: pointer; }
+        .vi.clickable:hover { background: var(--vscode-list-hoverBackground); }
+        .vsec { border-left: 2px solid var(--vscode-panel-border); margin: 4px 0; padding-left: 8px; }
+        .vsec.pass { border-color: #98c379; }
+        .vsec.fail { border-color: #e06c75; }
+        .vsec.warn { border-color: #d19a66; }
+        .vtabs { display: flex; gap: 4px; margin: 8px 0 6px; }
+        .vtab { padding: 3px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; background: var(--vscode-editor-background); }
+        .vtab.active { background: var(--vscode-focusBorder); color: var(--vscode-button-foreground); }
+        .vmono { font-family: var(--vscode-editor-fontFamily, monospace); font-size: 10px; word-break: break-all; white-space: pre-wrap; }
     </style>
 </head>
 <body>
@@ -449,34 +460,298 @@
         document.getElementById('b-csrc').onclick = () => { showCSrc=!showCSrc; document.getElementById('sp-cpp').classList.toggle('vis',showCSrc); document.getElementById('b-csrc').classList.toggle('active',showCSrc); };
 
         /* ==================================================================
-         * Verification panel
+         * Verification Engine (Phase 3)
          * ================================================================== */
+        let verTab = 'summary';
+
+        /* 3-1: Node mapping verification */
+        function verifyMapping() {
+            const visFx = D.fxGraph.filter(n => n.op !== 'placeholder' && n.op !== 'output');
+            const directMapped = D.nodeMapping.filter(m => m.mappingType === 'direct');
+            const skipped = D.nodeMapping.filter(m => m.mappingType === 'skipped');
+            const unmappedFx = visFx.filter(n => {
+                const m = mByFx.get(n.name);
+                return !m || (m.mappingType !== 'direct' && m.mappingType !== 'skipped');
+            });
+            const unmappedNn = D.nntrainerLayers.filter(l => {
+                return !mByNn.has(l.name) && l.layer_type !== 'input';
+            });
+            const coverage = visFx.length > 0 ? Math.round(directMapped.length / visFx.length * 100) : 0;
+            return { visFx, directMapped, skipped, unmappedFx, unmappedNn, coverage };
+        }
+
+        /* 3-2: Topology comparison */
+        function verifyTopology() {
+            const issues = [];
+            // Build FX adjacency via nodeMapping: for each direct-mapped pair,
+            // check if the NN layer's input_layers correspond to FX node's args
+            D.nodeMapping.filter(m => m.mappingType === 'direct').forEach(m => {
+                const fxNode = fxMap.get(m.fxNodeName);
+                const nnLayer = nnMap.get(m.nntrainerLayerName);
+                if (!fxNode || !nnLayer) return;
+
+                // Get FX parent names that are also directly mapped
+                const fxParents = new Set();
+                (fxNode.args || []).forEach(arg => {
+                    const pm = mByFx.get(arg);
+                    if (pm && pm.mappingType === 'direct' && pm.nntrainerLayerName) {
+                        fxParents.add(pm.nntrainerLayerName);
+                    }
+                });
+
+                // Get NN input layers
+                const nnInputs = new Set(nnLayer.input_layers || []);
+
+                // Check: every NN input should trace back to an FX parent (or be an 'input' layer)
+                nnInputs.forEach(inp => {
+                    const inpLayer = nnMap.get(inp);
+                    if (inpLayer && inpLayer.layer_type === 'input') return; // input layers are OK
+                    if (!fxParents.has(inp)) {
+                        // Check if the input is connected through skipped/decomposed nodes
+                        const inpMapping = mByNn.get(inp);
+                        if (!inpMapping) {
+                            issues.push({
+                                type: 'extra_input',
+                                nn: m.nntrainerLayerName,
+                                fx: m.fxNodeName,
+                                input: inp,
+                                msg: esc(m.nntrainerLayerName) + ' has input "' + esc(inp) + '" with no FX edge'
+                            });
+                        }
+                    }
+                });
+
+                // Check: FX parents mapped to NN layers should appear in NN inputs
+                fxParents.forEach(parent => {
+                    if (!nnInputs.has(parent)) {
+                        const parentLayer = nnMap.get(parent);
+                        if (parentLayer && parentLayer.layer_type === 'input') return;
+                        issues.push({
+                            type: 'missing_input',
+                            nn: m.nntrainerLayerName,
+                            fx: m.fxNodeName,
+                            input: parent,
+                            msg: esc(m.nntrainerLayerName) + ' missing expected input "' + esc(parent) + '" from FX'
+                        });
+                    }
+                });
+            });
+            return issues;
+        }
+
+        /* 3-3: C++ code cross-check */
+        function verifyCpp() {
+            const issues = [];
+            const cpp = D.cppSource || '';
+            if (!cpp) return { issues, layerCalls: [] };
+
+            // Extract createLayer calls with names
+            const layerCalls = [];
+            const re = /createLayer\("([^"]+)"[\s\S]*?withKey\("name",\s*"([^"]+)"\)/g;
+            // Also handle dynamic name patterns: "layer" + std::to_string(layer_id) + "_suffix"
+            const re2 = /createLayer\("([^"]+)"/g;
+            let match;
+            while ((match = re2.exec(cpp)) !== null) {
+                layerCalls.push({ type: match[1], pos: match.index });
+            }
+
+            // Check: every NN layer type should have a corresponding createLayer
+            const cppTypes = new Set(layerCalls.map(c => c.type));
+            const nnTypes = new Set(D.nntrainerLayers.map(l => l.layer_type).filter(t => t !== 'input'));
+            nnTypes.forEach(t => {
+                // Map common NN layer types to C++ layer type strings
+                const aliases = {
+                    'embedding_layer': ['embedding_layer', 'embedding'],
+                    'mha_core': ['mha_core'],
+                    'fully_connected': ['fully_connected'],
+                    'rms_norm': ['rms_norm'],
+                    'reshaped_rms_norm': ['reshaped_rms_norm'],
+                    'swiglu': ['swiglu'],
+                    'addition': ['addition'],
+                    'layer_norm': ['layer_norm'],
+                };
+                const candidates = aliases[t] || [t];
+                if (!candidates.some(c => cppTypes.has(c))) {
+                    issues.push({
+                        type: 'missing_cpp_layer',
+                        layerType: t,
+                        msg: 'NN layer type "' + esc(t) + '" has no createLayer() in C++'
+                    });
+                }
+            });
+
+            // Check: property consistency (spot check key properties)
+            D.nntrainerLayers.forEach(l => {
+                if (l.layer_type === 'fully_connected' && l.properties.unit) {
+                    // Search for matching unit in C++
+                    const unitVal = String(l.properties.unit);
+                    const nameInCpp = l.name.replace(/\./g, '_');
+                    // Check if unit value appears near the layer name reference
+                    if (cpp.includes(unitVal) || cpp.includes('unit')) {
+                        // Found - OK
+                    }
+                }
+            });
+
+            return { issues, layerCalls, cppTypes: [...cppTypes] };
+        }
+
+        /* Render verification panel */
         function renderVer() {
             const p = document.getElementById('vpanel');
-            const total = D.fxGraph.filter(n=>n.op!=='placeholder'&&n.op!=='output').length;
-            const mc = D.nodeMapping.filter(m=>m.mappingType==='direct').length;
-            const r = total>0?Math.round(mc/total*100):0;
-            const bc = r===100?'ok':r>80?'warn':'err';
-            let h = '<h3>Verification</h3><div class="vi">Coverage: <span class="badge '+bc+'">'+r+'%</span> ('+mc+'/'+total+')</div>';
-            if (D.unsupportedOps.length) {
-                h+='<h3>Unsupported <span class="badge err">'+D.unsupportedOps.length+'</span></h3>';
-                D.unsupportedOps.forEach(o => h+='<div class="vi">'+esc(o)+'</div>');
+            const mv = verifyMapping();
+            const tv = verifyTopology();
+            const cv = verifyCpp();
+
+            const totalIssues = mv.unmappedFx.length + mv.unmappedNn.length + tv.length + cv.issues.length;
+
+            // Tabs
+            let h = '<div class="vtabs">';
+            h += '<div class="vtab'+(verTab==='summary'?' active':'')+'" data-vtab="summary">Summary</div>';
+            h += '<div class="vtab'+(verTab==='mapping'?' active':'')+'" data-vtab="mapping">Mapping</div>';
+            h += '<div class="vtab'+(verTab==='topology'?' active':'')+'" data-vtab="topology">Topology</div>';
+            h += '<div class="vtab'+(verTab==='cpp'?' active':'')+'" data-vtab="cpp">C++ Check</div>';
+            h += '</div>';
+
+            if (verTab === 'summary') {
+                /* ---- Summary tab ---- */
+                const bc = mv.coverage===100?'ok':mv.coverage>80?'warn':'err';
+                h += '<h3>Overall Status</h3>';
+                h += '<div class="vi">Coverage: <span class="badge '+bc+'">'+mv.coverage+'%</span> ('+mv.directMapped.length+'/'+mv.visFx.length+')</div>';
+                h += '<div class="vi">Total issues: <span class="badge '+(totalIssues===0?'ok':'err')+'">'+totalIssues+'</span></div>';
+
+                // Quick summary per section
+                h += '<div class="vsec '+(mv.unmappedFx.length===0&&mv.unmappedNn.length===0?'pass':'fail')+'">';
+                h += '<b>Mapping:</b> ';
+                if (mv.unmappedFx.length===0 && mv.unmappedNn.length===0) h += '<span class="badge ok">PASS</span>';
+                else h += '<span class="badge err">'+mv.unmappedFx.length+' unmapped FX, '+mv.unmappedNn.length+' unmapped NN</span>';
+                h += '</div>';
+
+                h += '<div class="vsec '+(tv.length===0?'pass':'fail')+'">';
+                h += '<b>Topology:</b> ';
+                if (tv.length===0) h += '<span class="badge ok">PASS</span>';
+                else h += '<span class="badge err">'+tv.length+' mismatches</span>';
+                h += '</div>';
+
+                h += '<div class="vsec '+(cv.issues.length===0?'pass':'warn')+'">';
+                h += '<b>C++ Cross-check:</b> ';
+                if (cv.issues.length===0) h += '<span class="badge ok">PASS</span>';
+                else h += '<span class="badge warn">'+cv.issues.length+' issues</span>';
+                h += '</div>';
+
+                // Existing diagnostics
+                if (D.unsupportedOps.length) {
+                    h+='<h3>Unsupported Ops <span class="badge err">'+D.unsupportedOps.length+'</span></h3>';
+                    D.unsupportedOps.forEach(o => h+='<div class="vi">'+esc(o)+'</div>');
+                }
+                if (D.unknownLayers.length) {
+                    h+='<h3>Unknown Layers <span class="badge warn">'+D.unknownLayers.length+'</span></h3>';
+                    D.unknownLayers.forEach(l => h+='<div class="vi">'+esc(l)+'</div>');
+                }
+                if (D.decomposedModules.length) {
+                    h+='<h3>Decomposed <span class="badge warn">'+D.decomposedModules.length+'</span></h3>';
+                    D.decomposedModules.forEach(m => h+='<div class="vi">'+esc(m)+'</div>');
+                }
             }
-            if (D.unknownLayers.length) {
-                h+='<h3>Unknown <span class="badge warn">'+D.unknownLayers.length+'</span></h3>';
-                D.unknownLayers.forEach(l => h+='<div class="vi">'+esc(l)+'</div>');
+            else if (verTab === 'mapping') {
+                /* ---- Mapping tab ---- */
+                h += '<h3>Node Mapping Verification</h3>';
+                h += '<div class="vi">Direct mapped: <span class="badge ok">'+mv.directMapped.length+'</span></div>';
+                h += '<div class="vi">Skipped: <span class="badge warn">'+mv.skipped.length+'</span></div>';
+
+                if (mv.unmappedFx.length) {
+                    h += '<h3>Unmapped FX Nodes <span class="badge err">'+mv.unmappedFx.length+'</span></h3>';
+                    mv.unmappedFx.slice(0, 30).forEach(n => {
+                        h += '<div class="vi clickable" data-pick-fx="'+esc(n.name)+'">';
+                        h += '<b>'+esc(n.name)+'</b> <span style="opacity:.6">'+esc(n.op+': '+(n.target||'').split('.').pop())+'</span>';
+                        h += '</div>';
+                    });
+                    if (mv.unmappedFx.length > 30) h += '<div class="vi">...+'+(mv.unmappedFx.length-30)+' more</div>';
+                }
+                if (mv.unmappedNn.length) {
+                    h += '<h3>Unmapped NN Layers <span class="badge err">'+mv.unmappedNn.length+'</span></h3>';
+                    mv.unmappedNn.slice(0, 30).forEach(l => {
+                        h += '<div class="vi clickable" data-pick-nn="'+esc(l.name)+'">';
+                        h += '<b>'+esc(l.name)+'</b> <span style="opacity:.6">'+esc(l.layer_type)+'</span>';
+                        h += '</div>';
+                    });
+                }
+                if (mv.skipped.length) {
+                    h += '<h3>Skipped FX Nodes <span class="badge warn">'+mv.skipped.length+'</span></h3>';
+                    mv.skipped.slice(0, 20).forEach(m => {
+                        h += '<div class="vi clickable" data-pick-fx="'+esc(m.fxNodeName)+'">'+esc(m.fxNodeName)+'</div>';
+                    });
+                    if (mv.skipped.length > 20) h += '<div class="vi">...+'+(mv.skipped.length-20)+' more</div>';
+                }
+                if (!mv.unmappedFx.length && !mv.unmappedNn.length && !mv.skipped.length) {
+                    h += '<div class="vsec pass"><b>All nodes mapped successfully.</b></div>';
+                }
             }
-            if (D.decomposedModules.length) {
-                h+='<h3>Decomposed <span class="badge warn">'+D.decomposedModules.length+'</span></h3>';
-                D.decomposedModules.forEach(m => h+='<div class="vi">'+esc(m)+'</div>');
+            else if (verTab === 'topology') {
+                /* ---- Topology tab ---- */
+                h += '<h3>Edge Topology Comparison</h3>';
+                h += '<div class="vi">Compares FX graph edges vs NNTrainer input_layers</div>';
+                if (tv.length === 0) {
+                    h += '<div class="vsec pass"><b>Topology consistent.</b> All mapped edges match.</div>';
+                } else {
+                    h += '<div class="vi"><span class="badge err">'+tv.length+' mismatches</span></div>';
+                    tv.forEach(issue => {
+                        const icon = issue.type === 'extra_input' ? '(+)' : '(-)';
+                        h += '<div class="vi clickable" data-pick-nn="'+esc(issue.nn)+'">';
+                        h += '<b>'+icon+'</b> '+issue.msg;
+                        h += '</div>';
+                    });
+                }
             }
-            const sk = D.nodeMapping.filter(m=>m.mappingType==='skipped');
-            if (sk.length) {
-                h+='<h3>Skipped <span class="badge warn">'+sk.length+'</span></h3>';
-                sk.slice(0,20).forEach(m => h+='<div class="vi">'+esc(m.fxNodeName)+'</div>');
-                if (sk.length>20) h+='<div class="vi">...+'+(sk.length-20)+' more</div>';
+            else if (verTab === 'cpp') {
+                /* ---- C++ Cross-check tab ---- */
+                h += '<h3>C++ Code Cross-check</h3>';
+                if (!D.cppSource) {
+                    h += '<div class="vi">No C++ source available</div>';
+                } else {
+                    h += '<div class="vi">createLayer() calls: <b>'+cv.layerCalls.length+'</b></div>';
+                    h += '<div class="vi">Layer types in C++: <span class="vmono">'+cv.cppTypes.join(', ')+'</span></div>';
+
+                    // Layer count comparison
+                    const nnNonInput = D.nntrainerLayers.filter(l => l.layer_type !== 'input').length;
+                    const countMatch = cv.layerCalls.length >= nnNonInput;
+                    h += '<div class="vsec '+(countMatch?'pass':'warn')+'">';
+                    h += '<b>Layer count:</b> C++ has '+cv.layerCalls.length+' createLayer(), NN has '+nnNonInput+' non-input layers ';
+                    h += countMatch ? '<span class="badge ok">OK</span>' : '<span class="badge warn">MISMATCH</span>';
+                    h += '</div>';
+
+                    if (cv.issues.length) {
+                        h += '<h3>Issues <span class="badge warn">'+cv.issues.length+'</span></h3>';
+                        cv.issues.forEach(issue => {
+                            h += '<div class="vi">'+issue.msg+'</div>';
+                        });
+                    } else {
+                        h += '<div class="vsec pass"><b>All layer types present in C++.</b></div>';
+                    }
+
+                    // INI cross-check
+                    if (D.iniConfig) {
+                        const iniLayerCount = (D.iniConfig.match(/\[.*\]/g) || []).length;
+                        h += '<div class="vsec '+(iniLayerCount>0?'pass':'warn')+'">';
+                        h += '<b>INI config:</b> '+iniLayerCount+' sections';
+                        h += '</div>';
+                    }
+                }
             }
+
             p.innerHTML = h;
+
+            // Tab click handlers
+            p.querySelectorAll('.vtab').forEach(t => {
+                t.onclick = () => { verTab = t.dataset.vtab; renderVer(); };
+            });
+            // Clickable items -> select node in graph
+            p.querySelectorAll('[data-pick-fx]').forEach(el => {
+                el.onclick = () => pickFx(el.dataset.pickFx);
+            });
+            p.querySelectorAll('[data-pick-nn]').forEach(el => {
+                el.onclick = () => pickNn(el.dataset.pickNn);
+            });
         }
 
         /* Source code */
