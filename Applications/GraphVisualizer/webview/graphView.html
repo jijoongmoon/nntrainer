@@ -53,42 +53,58 @@
         .gcanvas svg.edges { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 1; }
         .gcanvas .ncont { position: relative; z-index: 2; }
 
-        /* Nodes */
+        /* Nodes (Netron-inspired) */
         .nd {
             position: absolute; display: flex; flex-direction: column;
-            padding: 4px 6px; border: 1px solid var(--vscode-panel-border);
-            border-radius: 4px; font-size: 10px; cursor: pointer;
+            border: 1.5px solid var(--vscode-panel-border);
+            border-radius: 8px; font-size: 10px; cursor: pointer;
             background: var(--vscode-editor-background);
             white-space: nowrap; text-align: center; overflow: hidden;
             transition: border-color .12s, box-shadow .12s;
+            box-shadow: 0 1px 3px rgba(0,0,0,.15);
         }
-        .nd:hover { border-color: var(--vscode-focusBorder); box-shadow: 0 0 5px var(--vscode-focusBorder); z-index: 5; }
-        .nd.sel { border-color: var(--vscode-focusBorder); background: var(--vscode-list-activeSelectionBackground); z-index: 5; }
-        .nd.hl { box-shadow: 0 0 8px #98c379; z-index: 5; }
+        .nd:hover { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 2px var(--vscode-focusBorder), 0 2px 8px rgba(0,0,0,.2); z-index: 5; }
+        .nd.sel { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 2px var(--vscode-focusBorder); z-index: 5; }
+        .nd.hl { box-shadow: 0 0 0 2px #98c379, 0 0 10px rgba(152,195,121,.3); z-index: 5; }
         .nd.mapped { border-left: 3px solid #98c379; }
         .nd.unmapped { border-left: 3px solid #e06c75; }
-        .nd.skipped { border-left: 3px solid #d19a66; opacity: .7; }
-        .nd .nm { font-weight: 600; font-size: 9px; }
-        .nd .tp { color: var(--vscode-descriptionForeground); font-size: 9px; }
+        .nd.skipped { border-left: 3px solid #d19a66; opacity: .65; }
 
-        /* FX op colors */
-        .nd.op-call_module { border-top: 2px solid #98c379; }
-        .nd.op-call_function { border-top: 2px solid #e5c07b; }
-        .nd.op-call_method { border-top: 2px solid #c678dd; }
-        .nd.op-get_attr { border-top: 2px solid #56b6c2; }
-        /* NN layer type colors */
-        .nd.lt-input { border-top: 2px solid #61afef; }
-        .nd.lt-fully_connected { border-top: 2px solid #98c379; }
-        .nd.lt-mha_core { border-top: 2px solid #c678dd; }
-        .nd.lt-rms_norm,.nd.lt-layer_norm { border-top: 2px solid #e5c07b; }
-        .nd.lt-addition { border-top: 2px solid #56b6c2; }
-        .nd.lt-embedding { border-top: 2px solid #d19a66; }
+        /* Node header (type badge) */
+        .nd .nd-hdr {
+            padding: 3px 6px; font-size: 9px; font-weight: 700;
+            letter-spacing: .3px; text-transform: uppercase;
+            border-bottom: 1px solid rgba(128,128,128,.2);
+            border-radius: 6px 6px 0 0;
+        }
+        /* Node body (name) */
+        .nd .nm {
+            padding: 4px 6px; font-weight: 500; font-size: 10px;
+            overflow: hidden; text-overflow: ellipsis;
+        }
 
-        /* Edges */
-        .eline { stroke: var(--vscode-panel-border); stroke-width: 1; fill: none; }
-        .eline.hl { stroke: var(--vscode-focusBorder); stroke-width: 2; }
-        .earr { fill: var(--vscode-panel-border); }
-        .earr.hl { fill: var(--vscode-focusBorder); }
+        /* FX op colors - header background */
+        .nd.op-call_module .nd-hdr { background: rgba(152,195,121,.15); color: #98c379; }
+        .nd.op-call_function .nd-hdr { background: rgba(229,192,123,.15); color: #e5c07b; }
+        .nd.op-call_method .nd-hdr { background: rgba(198,120,221,.15); color: #c678dd; }
+        .nd.op-get_attr .nd-hdr { background: rgba(86,182,194,.15); color: #56b6c2; }
+        /* NN layer type colors - header background */
+        .nd.lt-input .nd-hdr { background: rgba(97,175,239,.15); color: #61afef; }
+        .nd.lt-fully_connected .nd-hdr { background: rgba(152,195,121,.15); color: #98c379; }
+        .nd.lt-mha_core .nd-hdr { background: rgba(198,120,221,.15); color: #c678dd; }
+        .nd.lt-rms_norm .nd-hdr,.nd.lt-layer_norm .nd-hdr { background: rgba(229,192,123,.15); color: #e5c07b; }
+        .nd.lt-addition .nd-hdr { background: rgba(86,182,194,.15); color: #56b6c2; }
+        .nd.lt-embedding .nd-hdr { background: rgba(209,154,102,.15); color: #d19a66; }
+        .nd.lt-multi_head_attention .nd-hdr { background: rgba(198,120,221,.15); color: #c678dd; }
+        .nd.lt-positional_encoding .nd-hdr { background: rgba(229,192,123,.15); color: #e5c07b; }
+        .nd.lt-reshape .nd-hdr,.nd.lt-concat .nd-hdr { background: rgba(86,182,194,.15); color: #56b6c2; }
+        .nd.lt-activation .nd-hdr { background: rgba(224,108,117,.15); color: #e06c75; }
+
+        /* Edges (smoother, Netron-style) */
+        .eline { stroke: var(--vscode-panel-border); stroke-width: 1.2; fill: none; opacity: .55; }
+        .eline.hl { stroke: var(--vscode-focusBorder); stroke-width: 2.5; opacity: 1; }
+        .earr { fill: var(--vscode-panel-border); opacity: .55; }
+        .earr.hl { fill: var(--vscode-focusBorder); opacity: 1; }
 
         /* Mapping overlay */
         svg.moverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 20; }
@@ -190,6 +206,16 @@
         /* C++ source highlight */
         .src-code .ln.cpp-hl { background: rgba(97,175,239,.15); border-left: 2px solid #61afef; }
 
+        /* Syntax highlighting (One Dark inspired) */
+        .src-code .kw { color: #c678dd; }          /* keywords */
+        .src-code .ty { color: #e5c07b; }          /* types */
+        .src-code .fn { color: #61afef; }          /* function calls */
+        .src-code .st { color: #98c379; }          /* strings */
+        .src-code .nu { color: #d19a66; }          /* numbers */
+        .src-code .cm { color: #5c6370; font-style: italic; } /* comments */
+        .src-code .pp { color: #c678dd; }          /* preprocessor */
+        .src-code .op { color: #56b6c2; }          /* operators :: -> */
+
         /* Profile heatmap overlay */
         .nd.profiled { position: relative; }
         .nd .pbar { position: absolute; bottom: 0; left: 0; height: 3px; border-radius: 0 0 3px 3px; transition: width .3s; }
@@ -265,8 +291,8 @@
         const vscode = acquireVsCodeApi();
         const D = {{DATA}};
 
-        /* ---- constants ---- */
-        const NW = 150, NH = 40, HG = 18, VG = 14, PAD = 16;
+        /* ---- constants (Netron-inspired sizing) ---- */
+        const NW = 160, NH = 52, HG = 24, VG = 28, PAD = 24;
 
         /* ---- lookup maps ---- */
         const fxMap = new Map(), nnMap = new Map();
@@ -446,7 +472,7 @@
                 div.dataset.fx = n.name;
                 div.style.cssText = 'left:'+p.x+'px;top:'+p.y+'px;width:'+NW+'px;height:'+NH+'px';
                 const st = (n.target||'').split('.').pop();
-                div.innerHTML = '<span class="nm">'+esc(n.name)+'</span><span class="tp">'+esc(n.op+': '+st)+'</span>';
+                div.innerHTML = '<div class="nd-hdr">'+esc(n.op==='call_module'?'module':n.op==='call_function'?'function':n.op==='call_method'?'method':n.op)+'</div><span class="nm">'+esc(st||n.name)+'</span>';
                 div.title = n.name+'\n'+n.op+': '+n.target+(n.module_type?'\n'+n.module_type:'');
                 div.onclick = e => { e.stopPropagation(); pickFx(n.name); };
                 nc.appendChild(div);
@@ -493,7 +519,7 @@
                 div.className = 'nd '+mc+' '+lt;
                 div.dataset.nn = l.name;
                 div.style.cssText = 'left:'+p.x+'px;top:'+p.y+'px;width:'+NW+'px;height:'+NH+'px';
-                div.innerHTML = '<span class="nm">'+esc(l.name)+'</span><span class="tp">'+esc(l.layer_type)+'</span>';
+                div.innerHTML = '<div class="nd-hdr">'+esc(l.layer_type)+'</div><span class="nm">'+esc(l.name)+'</span>';
                 div.title = l.name+'\n'+l.layer_type+'\nIn: ['+(l.input_layers||[]).join(', ')+']';
                 div.onclick = e => { e.stopPropagation(); pickNn(l.name); };
                 nc.appendChild(div);
@@ -1674,11 +1700,65 @@
             return h;
         }
 
-        /* Source code */
-        function renderSrc(id, code) {
+        /* Source code with syntax highlighting */
+        function highlightCpp(line) {
+            let h = esc(line);
+            // Comments (// ...)
+            h = h.replace(/^(\s*)(\/\/.*)$/, '$1<span class="cm">$2</span>');
+            if (h.includes('<span class="cm">')) return h;
+            // Preprocessor (#include, #ifndef, etc.)
+            h = h.replace(/^(\s*)(#\w+.*)$/, '$1<span class="pp">$2</span>');
+            if (h.includes('<span class="pp">')) return h;
+            // Strings
+            h = h.replace(/(&quot;[^&]*?&quot;|"[^"]*?")/g, '<span class="st">$1</span>');
+            // Numbers (integers, floats)
+            h = h.replace(/\b(\d+\.?\d*[fF]?)\b/g, '<span class="nu">$1</span>');
+            // Keywords
+            h = h.replace(/\b(auto|bool|break|case|catch|class|const|constexpr|continue|default|delete|do|else|enum|explicit|extern|false|for|friend|goto|if|inline|mutable|namespace|new|noexcept|nullptr|operator|override|private|protected|public|return|sizeof|static|static_cast|struct|switch|template|this|throw|true|try|typedef|typeid|typename|using|virtual|void|volatile|while)\b/g, '<span class="kw">$1</span>');
+            // Types (common C++ and NNTrainer types)
+            h = h.replace(/\b(int|float|double|char|unsigned|long|short|size_t|uint32_t|int32_t|std::string|std::vector|std::map|std::shared_ptr|std::unique_ptr|std::make_shared|std::make_unique|string|vector|map|shared_ptr|unique_ptr|NeuralNetwork|LayerNode|ModelLoader|Tensor)\b/g, '<span class="ty">$1</span>');
+            // Scope/arrow operators
+            h = h.replace(/::/g, '<span class="op">::</span>');
+            h = h.replace(/-&gt;/g, '<span class="op">-&gt;</span>');
+            // Function calls: word followed by (
+            h = h.replace(/\b([a-zA-Z_]\w*)\s*\(/g, function(m, fn) {
+                if (m.includes('<span')) return m;
+                return '<span class="fn">'+fn+'</span>(';
+            });
+            return h;
+        }
+
+        function highlightPython(line) {
+            let h = esc(line);
+            // Comments
+            h = h.replace(/^(\s*)(#.*)$/, '$1<span class="cm">$2</span>');
+            if (h.includes('<span class="cm">')) return h;
+            // Strings (single and double quoted)
+            h = h.replace(/(&#39;[^&#]*?&#39;|&quot;[^&]*?&quot;|'[^']*?'|"[^"]*?")/g, '<span class="st">$1</span>');
+            // Numbers
+            h = h.replace(/\b(\d+\.?\d*)\b/g, '<span class="nu">$1</span>');
+            // Keywords
+            h = h.replace(/\b(and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield|None|True|False|self)\b/g, '<span class="kw">$1</span>');
+            // Types
+            h = h.replace(/\b(int|float|str|bool|list|dict|tuple|set|type|object|nn\.Module|torch\.Tensor)\b/g, '<span class="ty">$1</span>');
+            // Decorators
+            h = h.replace(/^(\s*)(@\w+)/g, '$1<span class="pp">$2</span>');
+            // Function calls
+            h = h.replace(/\b([a-zA-Z_]\w*)\s*\(/g, function(m, fn) {
+                if (m.includes('<span')) return m;
+                return '<span class="fn">'+fn+'</span>(';
+            });
+            return h;
+        }
+
+        function renderSrc(id, code, lang) {
             const c = document.getElementById(id);
             if (!code) { c.innerHTML='<div style="padding:16px;opacity:.5">No source</div>'; return; }
-            c.innerHTML = code.split('\n').map(l => '<span class="ln">'+esc(l)+'</span>').join('\n');
+            const hl = lang === 'python' ? highlightPython : highlightCpp;
+            c.innerHTML = code.split('\n').map((l,i) => {
+                const span = document.createElement('span');
+                return '<span class="ln" data-line="'+(i+1)+'">'+hl(l)+'</span>';
+            }).join('\n');
         }
 
         /* ---- Init ---- */
@@ -1689,8 +1769,8 @@
         document.getElementById('inspector').classList.add('vis');
         document.getElementById('b-insp').classList.add('active');
         renderProfilePanel();
-        renderSrc('sc-torch', D.torchSourceCode||'');
-        renderSrc('sc-cpp', D.cppSource||'');
+        renderSrc('sc-torch', D.torchSourceCode||'', 'python');
+        renderSrc('sc-cpp', D.cppSource||'', 'cpp');
         drawGroups();
         document.getElementById('b-group').classList.add('active');
     })();
