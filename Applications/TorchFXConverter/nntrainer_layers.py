@@ -54,6 +54,7 @@ class NNTrainerLayerDef:
     bias_hf_key: str = ""                     # HF state_dict key for bias
     transpose_weight: bool = False            # Whether to transpose weight [out,in]->[in,out]
     reshape_weight_2d: bool = False           # Whether to reshape weight from 4D to 2D (conv2d)
+    squeeze_weight_3d: bool = False           # Whether to squeeze weight from 3D to 2D (depthwise conv1d)
     shared_from: str = ""                     # For tied weights (e.g. tie_word_embeddings)
 
     def to_properties_list(self) -> list:
@@ -160,6 +161,7 @@ LAYER_LOSS_CONSTANT_DERIVATIVE = "constant_derivative"
 LAYER_CONV1D = "conv1d"
 LAYER_CONV2D = "conv2d"
 LAYER_CONV2D_TRANSPOSE = "conv2dtranspose"
+LAYER_DEPTHWISE_CONV1D = "depthwiseconv1d"
 LAYER_DEPTHWISE_CONV2D = "depthwiseconv2d"
 LAYER_POOLING2D = "pooling2d"
 LAYER_UPSAMPLE2D = "upsample2d"
