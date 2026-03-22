@@ -135,6 +135,37 @@
         .vtab { padding: 3px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; background: var(--vscode-editor-background); }
         .vtab.active { background: var(--vscode-focusBorder); color: var(--vscode-button-foreground); }
         .vmono { font-family: var(--vscode-editor-fontFamily, monospace); font-size: 10px; word-break: break-all; white-space: pre-wrap; }
+
+        /* Property Inspector (Phase 4) */
+        .inspector {
+            width: 340px; min-width: 340px; overflow-y: auto;
+            background: var(--vscode-sideBar-background);
+            border-left: 1px solid var(--vscode-panel-border);
+            padding: 8px; font-size: 11px; display: none;
+        }
+        .inspector.vis { display: block; }
+        .inspector h3 { font-size: 12px; margin: 8px 0 4px; color: var(--vscode-sideBarTitle-foreground); }
+        .inspector h3:first-child { margin-top: 2px; }
+        .prop-table { width: 100%; border-collapse: collapse; font-size: 10px; margin: 4px 0; }
+        .prop-table th { text-align: left; padding: 2px 4px; background: var(--vscode-editor-background); font-weight: 600; border-bottom: 1px solid var(--vscode-panel-border); }
+        .prop-table td { padding: 2px 4px; border-bottom: 1px solid var(--vscode-panel-border); vertical-align: top; }
+        .prop-table td.k { color: var(--vscode-descriptionForeground); width: 35%; font-family: var(--vscode-editor-fontFamily, monospace); }
+        .prop-table td.v { font-family: var(--vscode-editor-fontFamily, monospace); word-break: break-all; }
+        .prop-table td.match { color: #98c379; }
+        .prop-table td.diff { color: #e06c75; }
+        .shape-flow { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 10px; }
+        .shape-box { padding: 2px 6px; border-radius: 3px; background: var(--vscode-editor-background); font-family: var(--vscode-editor-fontFamily, monospace); }
+        .shape-box.warn { border: 1px solid #d19a66; }
+        .shape-arrow { color: var(--vscode-descriptionForeground); }
+        .wmap-row { display: flex; gap: 6px; align-items: center; margin: 2px 0; font-size: 10px; }
+        .wmap-key { flex: 1; padding: 2px 4px; background: var(--vscode-editor-background); border-radius: 3px; font-family: var(--vscode-editor-fontFamily, monospace); word-break: break-all; }
+        .wmap-xform { padding: 1px 4px; border-radius: 3px; font-size: 9px; font-weight: 600; }
+        .wmap-xform.transpose { background: #4a3d2d; color: #d19a66; }
+        .wmap-xform.direct { background: #2d4a2d; color: #98c379; }
+        .itabs { display: flex; gap: 3px; margin: 6px 0 4px; }
+        .itab { padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; background: var(--vscode-editor-background); }
+        .itab.active { background: var(--vscode-focusBorder); color: var(--vscode-button-foreground); }
+        .empty-msg { padding: 16px; text-align: center; color: var(--vscode-descriptionForeground); font-size: 11px; }
     </style>
 </head>
 <body>
@@ -145,6 +176,8 @@
         <div class="sep"></div>
         <button id="b-map">Mapping Lines</button>
         <button id="b-ver">Verification</button>
+        <div class="sep"></div>
+        <button id="b-insp">Inspector</button>
         <div class="sep"></div>
         <button id="b-tsrc">PyTorch Source</button>
         <button id="b-csrc">C++ Output</button>
@@ -172,6 +205,7 @@
             <div class="src-code" id="sc-cpp"></div>
         </div>
         <div class="vpanel" id="vpanel"></div>
+        <div class="inspector" id="inspector"></div>
         <svg class="moverlay" id="moverlay"></svg>
     </div>
 
@@ -203,7 +237,8 @@
 
         /* ---- state ---- */
         let selFx = null, selNn = null, viewMode = 'sbs';
-        let showMap = false, showVer = false, showTSrc = false, showCSrc = false;
+        let showMap = false, showVer = false, showInsp = true, showTSrc = false, showCSrc = false;
+        let inspTab = 'props';
 
         /* ==================================================================
          * DAG Layout (longest-path layering)
@@ -415,6 +450,7 @@
                 hlEdges('eg-nn', m.nntrainerLayerName);
             }
             drawMap();
+            renderInspector();
             vscode.postMessage({command:'nodeSelected',data:{layerName:name,source:'fx'}});
         }
         function pickNn(name) {
@@ -430,11 +466,12 @@
                 hlEdges('eg-fx', m.fxNodeName);
             }
             drawMap();
+            renderInspector();
             vscode.postMessage({command:'nodeSelected',data:{layerName:name,source:'nntrainer'}});
         }
 
         document.querySelectorAll('.gcanvas').forEach(c => c.addEventListener('click', e => {
-            if (e.target===c||e.target.classList.contains('ncont')) { clearSel(); drawMap(); }
+            if (e.target===c||e.target.classList.contains('ncont')) { clearSel(); drawMap(); renderInspector(); }
         }));
 
         /* ==================================================================
@@ -456,6 +493,7 @@
         document.getElementById('b-fx').onclick = () => setView('torch');
         document.getElementById('b-map').onclick = () => { showMap=!showMap; document.getElementById('b-map').classList.toggle('active',showMap); drawMap(); };
         document.getElementById('b-ver').onclick = () => { showVer=!showVer; document.getElementById('vpanel').classList.toggle('vis',showVer); document.getElementById('b-ver').classList.toggle('active',showVer); };
+        document.getElementById('b-insp').onclick = () => { showInsp=!showInsp; document.getElementById('inspector').classList.toggle('vis',showInsp); document.getElementById('b-insp').classList.toggle('active',showInsp); };
         document.getElementById('b-tsrc').onclick = () => { showTSrc=!showTSrc; document.getElementById('sp-torch').classList.toggle('vis',showTSrc); document.getElementById('b-tsrc').classList.toggle('active',showTSrc); };
         document.getElementById('b-csrc').onclick = () => { showCSrc=!showCSrc; document.getElementById('sp-cpp').classList.toggle('vis',showCSrc); document.getElementById('b-csrc').classList.toggle('active',showCSrc); };
 
@@ -754,6 +792,322 @@
             });
         }
 
+        /* ==================================================================
+         * Property Inspector (Phase 4)
+         * ================================================================== */
+
+        // Build weight map lookup: NN layer name -> weight entries
+        const wMapByLayer = new Map();
+        (D.weightMap||[]).forEach(w => {
+            if (!wMapByLayer.has(w.layer_name)) wMapByLayer.set(w.layer_name, []);
+            wMapByLayer.get(w.layer_name).push(w);
+        });
+
+        function renderInspector() {
+            const el = document.getElementById('inspector');
+            if (!selFx && !selNn) {
+                el.innerHTML = '<div class="empty-msg">Click a node to inspect</div>';
+                return;
+            }
+
+            // Find the paired nodes
+            let fxNode = selFx ? fxMap.get(selFx) : null;
+            let nnLayer = selNn ? nnMap.get(selNn) : null;
+            // Try to find the pair via mapping
+            if (fxNode && !nnLayer) {
+                const m = mByFx.get(fxNode.name);
+                if (m && m.nntrainerLayerName) nnLayer = nnMap.get(m.nntrainerLayerName);
+            }
+            if (nnLayer && !fxNode) {
+                const m = mByNn.get(nnLayer.name);
+                if (m && m.fxNodeName) fxNode = fxMap.get(m.fxNodeName);
+            }
+
+            // Tabs
+            let h = '<div class="itabs">';
+            h += '<div class="itab'+(inspTab==='props'?' active':'')+'" data-itab="props">Properties</div>';
+            h += '<div class="itab'+(inspTab==='shape'?' active':'')+'" data-itab="shape">Shapes</div>';
+            h += '<div class="itab'+(inspTab==='weight'?' active':'')+'" data-itab="weight">Weights</div>';
+            h += '</div>';
+
+            if (inspTab === 'props') {
+                h += renderPropsTab(fxNode, nnLayer);
+            } else if (inspTab === 'shape') {
+                h += renderShapeTab(fxNode, nnLayer);
+            } else if (inspTab === 'weight') {
+                h += renderWeightTab(fxNode, nnLayer);
+            }
+
+            el.innerHTML = h;
+
+            // Tab handlers
+            el.querySelectorAll('.itab').forEach(t => {
+                t.onclick = () => { inspTab = t.dataset.itab; renderInspector(); };
+            });
+        }
+
+        /* 4-1: Property comparison */
+        function renderPropsTab(fxNode, nnLayer) {
+            let h = '';
+
+            if (fxNode) {
+                h += '<h3 style="color:#e06c75">FX Node: '+esc(fxNode.name)+'</h3>';
+                h += '<table class="prop-table"><tr><th>Key</th><th>Value</th></tr>';
+                h += '<tr><td class="k">op</td><td class="v">'+esc(fxNode.op)+'</td></tr>';
+                h += '<tr><td class="k">target</td><td class="v">'+esc(fxNode.target)+'</td></tr>';
+                if (fxNode.module_type) h += '<tr><td class="k">module_type</td><td class="v">'+esc(fxNode.module_type)+'</td></tr>';
+                h += '<tr><td class="k">scope</td><td class="v">'+esc(fxNode.scope)+'</td></tr>';
+                h += '<tr><td class="k">args</td><td class="v">'+esc((fxNode.args||[]).join(', '))+'</td></tr>';
+                if (fxNode.output_shape) h += '<tr><td class="k">output_shape</td><td class="v">'+esc(JSON.stringify(fxNode.output_shape))+'</td></tr>';
+                // Meta properties
+                const meta = fxNode.meta || {};
+                Object.keys(meta).forEach(k => {
+                    h += '<tr><td class="k">meta.'+esc(k)+'</td><td class="v">'+esc(JSON.stringify(meta[k]))+'</td></tr>';
+                });
+                h += '</table>';
+            }
+
+            if (nnLayer) {
+                h += '<h3 style="color:#61afef">NN Layer: '+esc(nnLayer.name)+'</h3>';
+                h += '<table class="prop-table"><tr><th>Key</th><th>Value</th></tr>';
+                h += '<tr><td class="k">layer_type</td><td class="v">'+esc(nnLayer.layer_type)+'</td></tr>';
+                h += '<tr><td class="k">input_layers</td><td class="v">'+esc((nnLayer.input_layers||[]).join(', '))+'</td></tr>';
+                h += '<tr><td class="k">hf_module</td><td class="v">'+esc(nnLayer.hf_module_name)+'</td></tr>';
+                h += '<tr><td class="k">hf_type</td><td class="v">'+esc(nnLayer.hf_module_type)+'</td></tr>';
+                Object.entries(nnLayer.properties||{}).forEach(([k,v]) => {
+                    h += '<tr><td class="k">'+esc(k)+'</td><td class="v">'+esc(String(v))+'</td></tr>';
+                });
+                h += '</table>';
+            }
+
+            // Side-by-side comparison if both exist
+            if (fxNode && nnLayer) {
+                h += '<h3>Parameter Comparison</h3>';
+                h += '<table class="prop-table"><tr><th>Parameter</th><th>FX (torch)</th><th>NN (nntrainer)</th></tr>';
+                const fxMeta = fxNode.meta || {};
+                const nnProps = nnLayer.properties || {};
+
+                // Common parameter pairs to compare
+                const pairs = [
+                    ['num_embeddings', 'in_dim'],
+                    ['embedding_dim', 'out_dim'],
+                    ['in_features', 'unit'], ['out_features', 'unit'],
+                    ['num_heads', 'num_heads'],
+                    ['num_kv_heads', 'num_kv_heads'],
+                    ['head_dim', 'head_dim'],
+                    ['normalized_shape', 'epsilon'],
+                ];
+                let shown = new Set();
+                pairs.forEach(([fk, nk]) => {
+                    const fv = fxMeta[fk];
+                    const nv = nnProps[nk];
+                    if (fv !== undefined || nv !== undefined) {
+                        const fStr = fv !== undefined ? String(fv) : '-';
+                        const nStr = nv !== undefined ? String(nv) : '-';
+                        const cls = (fv !== undefined && nv !== undefined && String(fv) === String(nv)) ? 'match' : (fv !== undefined && nv !== undefined) ? 'diff' : '';
+                        h += '<tr><td class="k">'+esc(fk)+' / '+esc(nk)+'</td><td class="v '+cls+'">'+esc(fStr)+'</td><td class="v '+cls+'">'+esc(nStr)+'</td></tr>';
+                        shown.add(fk); shown.add(nk);
+                    }
+                });
+                // Show remaining unmatched FX meta
+                Object.keys(fxMeta).forEach(k => {
+                    if (!shown.has(k)) {
+                        h += '<tr><td class="k">'+esc(k)+'</td><td class="v">'+esc(String(fxMeta[k]))+'</td><td class="v" style="opacity:.4">-</td></tr>';
+                    }
+                });
+                // Show remaining unmatched NN props
+                Object.keys(nnProps).forEach(k => {
+                    if (!shown.has(k)) {
+                        h += '<tr><td class="k">'+esc(k)+'</td><td class="v" style="opacity:.4">-</td><td class="v">'+esc(String(nnProps[k]))+'</td></tr>';
+                    }
+                });
+                h += '</table>';
+            }
+
+            if (!fxNode && !nnLayer) h += '<div class="empty-msg">No node selected</div>';
+            return h;
+        }
+
+        /* 4-2: Tensor dimension tracking */
+        function renderShapeTab(fxNode, nnLayer) {
+            let h = '';
+
+            if (fxNode) {
+                h += '<h3 style="color:#e06c75">FX: '+esc(fxNode.name)+'</h3>';
+                // Input shapes from args
+                const argNodes = (fxNode.args||[]).map(a => fxMap.get(a)).filter(Boolean);
+                if (argNodes.length) {
+                    h += '<div style="margin:4px 0;font-size:10px;color:var(--vscode-descriptionForeground)">Inputs:</div>';
+                    argNodes.forEach(a => {
+                        const shape = a.output_shape ? JSON.stringify(a.output_shape) : '?';
+                        h += '<div class="shape-flow"><span class="shape-box">'+esc(a.name)+'</span><span class="shape-arrow">['+esc(shape)+']</span></div>';
+                    });
+                }
+                // Output shape
+                h += '<div style="margin:4px 0;font-size:10px;color:var(--vscode-descriptionForeground)">Output:</div>';
+                if (fxNode.output_shape) {
+                    h += '<div class="shape-flow"><span class="shape-box">'+esc(JSON.stringify(fxNode.output_shape))+'</span></div>';
+                } else {
+                    h += '<div class="shape-flow"><span class="shape-box warn">shape unknown</span></div>';
+                }
+            }
+
+            if (nnLayer) {
+                h += '<h3 style="color:#61afef">NN: '+esc(nnLayer.name)+'</h3>';
+                // Input layers
+                const inputs = (nnLayer.input_layers||[]);
+                if (inputs.length) {
+                    h += '<div style="margin:4px 0;font-size:10px;color:var(--vscode-descriptionForeground)">Inputs:</div>';
+                    inputs.forEach(inp => {
+                        // Try to find corresponding FX node shape
+                        const inpLayer = nnMap.get(inp);
+                        const inpMapping = inpLayer ? mByNn.get(inp) : null;
+                        const inpFx = inpMapping ? fxMap.get(inpMapping.fxNodeName) : null;
+                        const shape = inpFx && inpFx.output_shape ? JSON.stringify(inpFx.output_shape) : '?';
+                        h += '<div class="shape-flow"><span class="shape-box">'+esc(inp)+'</span><span class="shape-arrow">['+esc(shape)+']</span></div>';
+                    });
+                }
+                // Inferred output shape from properties
+                const props = nnLayer.properties || {};
+                h += '<div style="margin:4px 0;font-size:10px;color:var(--vscode-descriptionForeground)">Layer properties (shape-related):</div>';
+                const shapeKeys = ['unit','in_dim','out_dim','num_heads','head_dim','input_shape','epsilon'];
+                let hasAny = false;
+                shapeKeys.forEach(k => {
+                    if (props[k] !== undefined) {
+                        hasAny = true;
+                        h += '<div class="shape-flow"><span style="width:80px;font-size:10px">'+esc(k)+':</span><span class="shape-box">'+esc(String(props[k]))+'</span></div>';
+                    }
+                });
+                if (!hasAny) h += '<div class="shape-flow"><span class="shape-box" style="opacity:.5">no shape properties</span></div>';
+            }
+
+            // Shape consistency check
+            if (fxNode && nnLayer) {
+                h += '<h3>Shape Consistency</h3>';
+                const fxMeta = fxNode.meta || {};
+                const nnProps = nnLayer.properties || {};
+                const checks = [];
+
+                // Check output dimension matches
+                if (fxNode.output_shape && nnProps.unit) {
+                    const fxOut = fxNode.output_shape[fxNode.output_shape.length - 1];
+                    const nnUnit = Number(nnProps.unit);
+                    if (fxOut === nnUnit) {
+                        checks.push({ok:true, msg:'Output dim: FX['+fxOut+'] = NN unit['+nnUnit+']'});
+                    } else {
+                        checks.push({ok:false, msg:'Output dim mismatch: FX['+fxOut+'] != NN unit['+nnUnit+']'});
+                    }
+                }
+                // Embedding check
+                if (fxMeta.num_embeddings && nnProps.in_dim) {
+                    const match = String(fxMeta.num_embeddings) === String(nnProps.in_dim);
+                    checks.push({ok:match, msg:'Vocab: FX['+fxMeta.num_embeddings+'] '+(match?'=':'!=') +' NN['+nnProps.in_dim+']'});
+                }
+                if (fxMeta.embedding_dim && nnProps.out_dim) {
+                    const match = String(fxMeta.embedding_dim) === String(nnProps.out_dim);
+                    checks.push({ok:match, msg:'Embed dim: FX['+fxMeta.embedding_dim+'] '+(match?'=':'!=')+' NN['+nnProps.out_dim+']'});
+                }
+
+                if (checks.length) {
+                    checks.forEach(c => {
+                        h += '<div class="vsec '+(c.ok?'pass':'fail')+'">'+esc(c.msg)+'</div>';
+                    });
+                } else {
+                    h += '<div class="vi" style="opacity:.5">No comparable shape parameters</div>';
+                }
+            }
+
+            if (!fxNode && !nnLayer) h += '<div class="empty-msg">No node selected</div>';
+            return h;
+        }
+
+        /* 4-3: Weight mapping view */
+        function renderWeightTab(fxNode, nnLayer) {
+            let h = '';
+
+            if (nnLayer) {
+                h += '<h3 style="color:#61afef">'+esc(nnLayer.name)+'</h3>';
+                h += '<table class="prop-table"><tr><th>Property</th><th>Value</th></tr>';
+                h += '<tr><td class="k">has_weight</td><td class="v">'+(nnLayer.has_weight?'<span style="color:#98c379">yes</span>':'no')+'</td></tr>';
+                h += '<tr><td class="k">has_bias</td><td class="v">'+(nnLayer.has_bias?'<span style="color:#98c379">yes</span>':'no')+'</td></tr>';
+                if (nnLayer.shared_from) h += '<tr><td class="k">shared_from</td><td class="v">'+esc(nnLayer.shared_from)+'</td></tr>';
+                h += '</table>';
+
+                // Weight mapping
+                if (nnLayer.has_weight || nnLayer.has_bias) {
+                    h += '<h3>HF State Dict Mapping</h3>';
+
+                    if (nnLayer.weight_hf_key) {
+                        h += '<div style="margin:4px 0;font-size:10px"><b>Weight:</b></div>';
+                        h += '<div class="wmap-row">';
+                        h += '<div class="wmap-key">'+esc(nnLayer.weight_hf_key)+'</div>';
+                        h += '<span class="shape-arrow">-></span>';
+                        h += '<div class="wmap-key">'+esc(nnLayer.name)+'.weight</div>';
+                        h += '</div>';
+                        h += '<div style="margin:2px 0">';
+                        if (nnLayer.transpose_weight) {
+                            h += '<span class="wmap-xform transpose">TRANSPOSE</span>';
+                        } else {
+                            h += '<span class="wmap-xform direct">DIRECT COPY</span>';
+                        }
+                        h += '</div>';
+                    }
+
+                    if (nnLayer.bias_hf_key) {
+                        h += '<div style="margin:4px 0;font-size:10px"><b>Bias:</b></div>';
+                        h += '<div class="wmap-row">';
+                        h += '<div class="wmap-key">'+esc(nnLayer.bias_hf_key)+'</div>';
+                        h += '<span class="shape-arrow">-></span>';
+                        h += '<div class="wmap-key">'+esc(nnLayer.name)+'.bias</div>';
+                        h += '</div>';
+                        h += '<div style="margin:2px 0"><span class="wmap-xform direct">DIRECT COPY</span></div>';
+                    }
+                }
+
+                // Show from weightMap data
+                const wEntries = wMapByLayer.get(nnLayer.name) || [];
+                if (wEntries.length) {
+                    h += '<h3>Weight Map Entries</h3>';
+                    h += '<table class="prop-table"><tr><th>HF Key</th><th>Transpose</th></tr>';
+                    wEntries.forEach(w => {
+                        h += '<tr><td class="v" style="font-size:9px">'+esc(w.weight_key)+'</td>';
+                        h += '<td class="v">'+(w.transpose_weight?'<span style="color:#d19a66">yes</span>':'<span style="color:#98c379">no</span>')+'</td></tr>';
+                    });
+                    h += '</table>';
+                }
+            }
+
+            if (fxNode && !nnLayer) {
+                h += '<h3 style="color:#e06c75">FX: '+esc(fxNode.name)+'</h3>';
+                const meta = fxNode.meta || {};
+                if (meta.has_weight) {
+                    h += '<div class="vi">Has weight: <span style="color:#98c379">yes</span></div>';
+                    if (meta.has_bias) h += '<div class="vi">Has bias: <span style="color:#98c379">yes</span></div>';
+                    h += '<div class="vi" style="opacity:.5">No NN layer mapping - weight details unavailable</div>';
+                } else {
+                    h += '<div class="vi">This node has no weights</div>';
+                }
+            }
+
+            if (!fxNode && !nnLayer) h += '<div class="empty-msg">No node selected</div>';
+
+            // Global weight summary
+            h += '<h3>Weight Summary</h3>';
+            const withWeight = D.nntrainerLayers.filter(l => l.has_weight);
+            const withBias = D.nntrainerLayers.filter(l => l.has_bias);
+            const transposed = D.nntrainerLayers.filter(l => l.transpose_weight);
+            const shared = D.nntrainerLayers.filter(l => l.shared_from);
+            h += '<table class="prop-table"><tr><th>Metric</th><th>Count</th></tr>';
+            h += '<tr><td class="k">Layers with weight</td><td class="v">'+withWeight.length+'</td></tr>';
+            h += '<tr><td class="k">Layers with bias</td><td class="v">'+withBias.length+'</td></tr>';
+            h += '<tr><td class="k">Transposed weights</td><td class="v">'+(transposed.length?'<span style="color:#d19a66">'+transposed.length+'</span>':'0')+'</td></tr>';
+            h += '<tr><td class="k">Shared weights</td><td class="v">'+(shared.length?shared.length:'0')+'</td></tr>';
+            h += '<tr><td class="k">Total weight map entries</td><td class="v">'+(D.weightMap||[]).length+'</td></tr>';
+            h += '</table>';
+
+            return h;
+        }
+
         /* Source code */
         function renderSrc(id, code) {
             const c = document.getElementById(id);
@@ -765,6 +1119,9 @@
         renderFx();
         renderNn();
         renderVer();
+        renderInspector();
+        document.getElementById('inspector').classList.add('vis');
+        document.getElementById('b-insp').classList.add('active');
         renderSrc('sc-torch', D.torchSourceCode||'');
         renderSrc('sc-cpp', D.cppSource||'');
     })();
