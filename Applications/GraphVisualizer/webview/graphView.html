@@ -203,22 +203,32 @@
         .empty-msg { padding: 16px; text-align: center; color: var(--vscode-descriptionForeground); font-size: 11px; }
 
         /* Group boxes (Phase 6) */
+        /* Block-level groups (Transformer Layer N) */
         .group-box {
-            position: absolute; border: 1.5px dashed; border-radius: 6px;
+            position: absolute; border-radius: 8px;
             pointer-events: none; z-index: 0;
         }
-        .group-box.attn { border-color: rgba(198,120,221,.4); background: rgba(198,120,221,.03); }
-        .group-box.ffn { border-color: rgba(97,175,239,.4); background: rgba(97,175,239,.03); }
-        .group-box.embed { border-color: rgba(209,154,102,.4); background: rgba(209,154,102,.03); }
+        .group-box.block { border: 2px solid #e0e0e0; background: #f8f9fa; border-radius: 10px; }
+        .group-box.embed { border: 1.5px solid #ffe0b2; background: #fff8e1; }
+        .group-box.head { border: 1.5px solid #bbdefb; background: #e3f2fd; }
+        /* Sub-group boxes (Attn, FFN, Norm inside block) */
+        .group-box.sub { border: 1.5px dashed; border-radius: 6px; }
+        .group-box.sub.attn { border-color: #ce93d8; background: rgba(206,147,216,.08); }
+        .group-box.sub.ffn { border-color: #64b5f6; background: rgba(100,181,246,.08); }
+        .group-box.sub.norm { border-color: #ffb74d; background: rgba(255,183,77,.08); }
+
         .group-label {
-            position: absolute; font-size: 9px; font-weight: 600; padding: 1px 5px;
+            position: absolute; font-weight: 700; padding: 2px 6px;
             border-radius: 3px; pointer-events: auto; cursor: pointer; z-index: 3;
-            opacity: .8;
         }
-        .group-label.attn { background: rgba(198,120,221,.2); color: #c678dd; }
-        .group-label.ffn { background: rgba(97,175,239,.2); color: #61afef; }
-        .group-label.embed { background: rgba(209,154,102,.2); color: #d19a66; }
-        .group-label:hover { opacity: 1; }
+        .group-label.block { font-size: 11px; background: #e0e0e0; color: #424242; border-radius: 4px; }
+        .group-label.embed { font-size: 10px; background: #ffe0b2; color: #e65100; }
+        .group-label.head { font-size: 10px; background: #bbdefb; color: #1565c0; }
+        .group-label.sub { font-size: 8px; font-weight: 600; }
+        .group-label.sub.attn { background: rgba(206,147,216,.25); color: #7b1fa2; }
+        .group-label.sub.ffn { background: rgba(100,181,246,.25); color: #1565c0; }
+        .group-label.sub.norm { background: rgba(255,183,77,.25); color: #e65100; }
+        .group-label:hover { opacity: .85; }
         .nd.grouped-hidden { display: none !important; }
         .eline.grouped-hidden { display: none !important; }
 
@@ -428,7 +438,7 @@
         });
 
         /* ==================================================================
-         * DAG Layout (longest-path layering)
+         * DAG Layout (longest-path layering + barycenter ordering)
          * ================================================================== */
         function dagLayout(nodes, getInputs) {
             const nameSet = new Set(nodes.map(n => n.id));
@@ -444,8 +454,60 @@
             }
             nodes.forEach(n => d(n.id));
 
+            // Build adjacency for children lookup
+            const children = new Map(); // parent -> [child, ...]
+            nodes.forEach(n => {
+                const inp = getInputs(n.id).filter(i => nameSet.has(i));
+                inp.forEach(p => {
+                    if (!children.has(p)) children.set(p, []);
+                    children.get(p).push(n.id);
+                });
+            });
+
             const layers = [];
             nodes.forEach(n => { const dd = depth.get(n.id)||0; (layers[dd]||(layers[dd]=[])).push(n); });
+
+            // Barycenter ordering: reduce edge crossings by placing nodes
+            // close to the average position of their connected nodes
+            // Run multiple passes for better results
+            for (let pass = 0; pass < 4; pass++) {
+                // Forward pass: order each layer by avg position of parents
+                for (let li = 1; li < layers.length; li++) {
+                    if (!layers[li]) continue;
+                    const prevLayer = layers[li-1];
+                    if (!prevLayer) continue;
+                    const prevPos = new Map();
+                    prevLayer.forEach((n, i) => prevPos.set(n.id, i));
+
+                    layers[li].forEach(n => {
+                        const parents = getInputs(n.id).filter(i => nameSet.has(i) && prevPos.has(i));
+                        if (parents.length > 0) {
+                            n._bary = parents.reduce((s, p) => s + prevPos.get(p), 0) / parents.length;
+                        } else {
+                            n._bary = Infinity;
+                        }
+                    });
+                    layers[li].sort((a, b) => a._bary - b._bary);
+                }
+                // Backward pass: order each layer by avg position of children
+                for (let li = layers.length - 2; li >= 0; li--) {
+                    if (!layers[li]) continue;
+                    const nextLayer = layers[li+1];
+                    if (!nextLayer) continue;
+                    const nextPos = new Map();
+                    nextLayer.forEach((n, i) => nextPos.set(n.id, i));
+
+                    layers[li].forEach(n => {
+                        const kids = (children.get(n.id) || []).filter(c => nextPos.has(c));
+                        if (kids.length > 0) {
+                            n._bary = kids.reduce((s, c) => s + nextPos.get(c), 0) / kids.length;
+                        } else {
+                            n._bary = Infinity;
+                        }
+                    });
+                    layers[li].sort((a, b) => a._bary - b._bary);
+                }
+            }
 
             let maxW = 0;
             layers.forEach(l => { if (l && l.length > maxW) maxW = l.length; });
@@ -1244,37 +1306,73 @@
          * Phase 6-1: Pattern Grouping
          * ================================================================== */
         function detectGroups(nodes, nameKey) {
-            // Detect Attention and FFN blocks by name patterns
-            const groups = [];
-            const blockMap = new Map(); // blockId -> {type, nodes[]}
+            // Detect groups at multiple levels:
+            // 1. Transformer block level (Layer N)
+            // 2. Sub-block level (Attn, FFN, Norm, Embed)
+            const blockMap = new Map();
 
             nodes.forEach(n => {
                 const name = typeof n === 'string' ? n : (n.dataset ? n.dataset[nameKey] : n.name || '');
-                // Match patterns like model_layers_0_self_attn_* or model_layers_0_mlp_*
-                let m = name.match(/^(model_layers_(\d+)_self_attn)/);
+
+                // Transformer block level: model_layers_N_*
+                let m = name.match(/^(model_layers_(\d+))_/);
                 if (m) {
-                    const bid = m[1];
-                    if (!blockMap.has(bid)) blockMap.set(bid, {type:'attn', label:'Attn L'+m[2], names:[]});
-                    blockMap.get(bid).names.push(name);
+                    const blockId = m[1];
+                    if (!blockMap.has(blockId)) blockMap.set(blockId, {type:'block', label:'Layer '+m[2], names:[], children: new Map()});
+                    blockMap.get(blockId).names.push(name);
+
+                    // Sub-block detection within this layer
+                    const block = blockMap.get(blockId);
+                    let sub = name.match(/^model_layers_\d+_(self_attn)/);
+                    if (sub) {
+                        const subId = blockId+'_self_attn';
+                        if (!block.children.has(subId)) block.children.set(subId, {type:'attn', label:'Self Attention', names:[]});
+                        block.children.get(subId).names.push(name);
+                        return;
+                    }
+                    sub = name.match(/^model_layers_\d+_(mlp|ffn)/);
+                    if (sub) {
+                        const subId = blockId+'_'+sub[1];
+                        if (!block.children.has(subId)) block.children.set(subId, {type:'ffn', label:sub[1].toUpperCase(), names:[]});
+                        block.children.get(subId).names.push(name);
+                        return;
+                    }
+                    sub = name.match(/^model_layers_\d+_(input_layernorm|post_attention_layernorm|rms_norm|layer_norm)/);
+                    if (sub) {
+                        const subId = blockId+'_norm';
+                        if (!block.children.has(subId)) block.children.set(subId, {type:'norm', label:'Norm', names:[]});
+                        block.children.get(subId).names.push(name);
+                        return;
+                    }
                     return;
                 }
-                m = name.match(/^(model_layers_(\d+)_(mlp|ffn))/);
-                if (m) {
-                    const bid = m[1];
-                    if (!blockMap.has(bid)) blockMap.set(bid, {type:'ffn', label:'FFN L'+m[2], names:[]});
-                    blockMap.get(bid).names.push(name);
-                    return;
-                }
+
+                // Embedding / RoPE (top-level group)
                 m = name.match(/^(model_(rotary_emb|embed))/);
                 if (m) {
                     const bid = m[1];
-                    if (!blockMap.has(bid)) blockMap.set(bid, {type:'embed', label:m[2]==='embed'?'Embed':'RoPE', names:[]});
+                    if (!blockMap.has(bid)) blockMap.set(bid, {type:'embed', label:m[2]==='embed'?'Embedding':'RoPE', names:[], children: new Map()});
                     blockMap.get(bid).names.push(name);
+                    return;
+                }
+
+                // Output head (lm_head, model_norm, etc.)
+                m = name.match(/^(lm_head|model_norm)/);
+                if (m) {
+                    if (!blockMap.has('output_head')) blockMap.set('output_head', {type:'head', label:'Output Head', names:[], children: new Map()});
+                    blockMap.get('output_head').names.push(name);
                 }
             });
 
-            blockMap.forEach((info, bid) => {
+            const groups = [];
+            blockMap.forEach((info) => {
                 if (info.names.length >= 2) {
+                    // Convert children map to array
+                    info.subGroups = [];
+                    info.children.forEach(sub => {
+                        if (sub.names.length >= 2) info.subGroups.push(sub);
+                    });
+                    delete info.children;
                     groups.push(info);
                 }
             });
@@ -1286,13 +1384,10 @@
             document.querySelectorAll('.group-box,.group-label').forEach(e => e.remove());
             if (!showGroups) return;
 
-            // Draw groups on NN graph
-            const nnNc = document.getElementById('nc-nn');
-            const nnGroups = detectGroups(D.nntrainerLayers, 'nn');
-            nnGroups.forEach(g => {
+            function getBounds(names, dataAttr) {
                 let minX=Infinity, minY=Infinity, maxX=0, maxY=0, found=0;
-                g.names.forEach(name => {
-                    const el = document.querySelector('[data-nn="'+name+'"]');
+                names.forEach(name => {
+                    const el = document.querySelector('[data-'+dataAttr+'="'+name+'"]');
                     if (!el) return;
                     const x = parseInt(el.style.left)||0, y = parseInt(el.style.top)||0;
                     const w = parseInt(el.style.width)||NW, h = parseInt(el.style.height)||NH;
@@ -1302,47 +1397,61 @@
                     if (y+h > maxY) maxY = y+h;
                     found++;
                 });
-                if (found < 2) return;
-                const pad = 6;
-                const box = document.createElement('div');
-                box.className = 'group-box '+g.type;
-                box.style.cssText = 'left:'+(minX-pad)+'px;top:'+(minY-pad)+'px;width:'+(maxX-minX+pad*2)+'px;height:'+(maxY-minY+pad*2)+'px';
-                nnNc.appendChild(box);
-                const lbl = document.createElement('div');
-                lbl.className = 'group-label '+g.type;
-                lbl.textContent = g.label;
-                lbl.style.cssText = 'left:'+(minX-pad)+'px;top:'+(minY-pad-14)+'px';
-                nnNc.appendChild(lbl);
-            });
+                return { minX, minY, maxX, maxY, found };
+            }
 
-            // Draw groups on FX graph
-            const fxNc = document.getElementById('nc-fx');
-            const fxGroups = detectGroups(D.fxGraph.filter(n=>n.op!=='placeholder'&&n.op!=='output'), 'fx');
-            fxGroups.forEach(g => {
-                let minX=Infinity, minY=Infinity, maxX=0, maxY=0, found=0;
-                g.names.forEach(name => {
-                    const el = document.querySelector('[data-fx="'+name+'"]');
-                    if (!el) return;
-                    const x = parseInt(el.style.left)||0, y = parseInt(el.style.top)||0;
-                    const w = parseInt(el.style.width)||NW, h = parseInt(el.style.height)||NH;
-                    if (x < minX) minX = x;
-                    if (y < minY) minY = y;
-                    if (x+w > maxX) maxX = x+w;
-                    if (y+h > maxY) maxY = y+h;
-                    found++;
+            function renderGroupsOnPane(nc, groups, dataAttr) {
+                groups.forEach(g => {
+                    const b = getBounds(g.names, dataAttr);
+                    if (b.found < 2) return;
+
+                    // Outer block box (larger padding for block-level groups)
+                    const isBlock = g.type === 'block';
+                    const pad = isBlock ? 12 : 6;
+                    const box = document.createElement('div');
+                    box.className = 'group-box '+g.type;
+                    box.style.cssText = 'left:'+(b.minX-pad)+'px;top:'+(b.minY-pad-18)+'px;width:'+(b.maxX-b.minX+pad*2)+'px;height:'+(b.maxY-b.minY+pad*2+18)+'px';
+                    nc.appendChild(box);
+
+                    // Label
+                    const lbl = document.createElement('div');
+                    lbl.className = 'group-label '+g.type;
+                    lbl.textContent = g.label;
+                    lbl.style.cssText = 'left:'+(b.minX-pad+4)+'px;top:'+(b.minY-pad-16)+'px';
+                    nc.appendChild(lbl);
+
+                    // Sub-groups within block
+                    if (g.subGroups) {
+                        g.subGroups.forEach(sub => {
+                            const sb = getBounds(sub.names, dataAttr);
+                            if (sb.found < 2) return;
+                            const sp = 5;
+                            const sbox = document.createElement('div');
+                            sbox.className = 'group-box sub '+sub.type;
+                            sbox.style.cssText = 'left:'+(sb.minX-sp)+'px;top:'+(sb.minY-sp-14)+'px;width:'+(sb.maxX-sb.minX+sp*2)+'px;height:'+(sb.maxY-sb.minY+sp*2+14)+'px';
+                            nc.appendChild(sbox);
+                            const slbl = document.createElement('div');
+                            slbl.className = 'group-label sub '+sub.type;
+                            slbl.textContent = sub.label;
+                            slbl.style.cssText = 'left:'+(sb.minX-sp+2)+'px;top:'+(sb.minY-sp-13)+'px';
+                            nc.appendChild(slbl);
+                        });
+                    }
                 });
-                if (found < 2) return;
-                const pad = 6;
-                const box = document.createElement('div');
-                box.className = 'group-box '+g.type;
-                box.style.cssText = 'left:'+(minX-pad)+'px;top:'+(minY-pad)+'px;width:'+(maxX-minX+pad*2)+'px;height:'+(maxY-minY+pad*2)+'px';
-                fxNc.appendChild(box);
-                const lbl = document.createElement('div');
-                lbl.className = 'group-label '+g.type;
-                lbl.textContent = g.label;
-                lbl.style.cssText = 'left:'+(minX-pad)+'px;top:'+(minY-pad-14)+'px';
-                fxNc.appendChild(lbl);
-            });
+            }
+
+            // Draw groups on NN graph
+            renderGroupsOnPane(
+                document.getElementById('nc-nn'),
+                detectGroups(D.nntrainerLayers, 'nn'),
+                'nn'
+            );
+            // Draw groups on FX graph
+            renderGroupsOnPane(
+                document.getElementById('nc-fx'),
+                detectGroups(D.fxGraph.filter(n=>n.op!=='placeholder'&&n.op!=='output'), 'fx'),
+                'fx'
+            );
         }
 
         /* ==================================================================
