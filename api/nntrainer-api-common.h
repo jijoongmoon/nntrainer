@@ -93,6 +93,8 @@ typedef enum {
   ML_TRAIN_LAYER_TYPE_RESHAPE = 52, /**< Reshape Layer type (Since 10.0) */
   ML_TRAIN_LAYER_TYPE_UPSAMPLE2D =
     53, /**< Upsample2D Layer type (Since 10.0) */
+  ML_TRAIN_LAYER_TYPE_DEPTHWISE_CONV1D =
+    54, /**< Depthwise Convolution 1D Layer type */
   ML_TRAIN_LAYER_TYPE_PREPROCESS_FLIP =
     300, /**< Preprocess flip Layer (Since 6.5) */
   ML_TRAIN_LAYER_TYPE_PREPROCESS_TRANSLATE =

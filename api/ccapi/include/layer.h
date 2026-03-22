@@ -125,6 +125,9 @@ enum LayerType {
   LAYER_RESHAPE = ML_TRAIN_LAYER_TYPE_RESHAPE, /**< Reshape Layer type */
   LAYER_UPSAMPLE2D =
     ML_TRAIN_LAYER_TYPE_UPSAMPLE2D, /**< Upsample 2D Layer type */
+  LAYER_DEPTHWISE_CONV1D =
+    ML_TRAIN_LAYER_TYPE_DEPTHWISE_CONV1D, /**< Depthwise Convolution 1D Layer
+                                             type */
 
   LAYER_UNKNOWN = ML_TRAIN_LAYER_TYPE_UNKNOWN, /**< Unknown */
 
