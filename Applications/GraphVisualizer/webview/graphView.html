@@ -87,7 +87,6 @@
         .nd.mapped { border-left: 3.5px solid #98c379; }
         .nd.unmapped { border-left: 3.5px solid #e06c75; }
         .nd.skipped { border-left: 3.5px solid #d19a66; opacity: .6; }
-        .nd.collapsed_rope { border-left: 3.5px solid #c678dd; opacity: .55; }
 
         /* Node header (type badge) */
         .nd .nd-hdr {
@@ -642,7 +641,7 @@
             vis.forEach(n => {
                 const p = pos.get(n.name); if(!p) return;
                 const m = mByFx.get(n.name);
-                const mc = m ? (m.mappingType==='direct'?'mapped':m.mappingType==='skipped'?'skipped':m.mappingType==='collapsed_rope'?'collapsed_rope':'unmapped') : 'unmapped';
+                const mc = m ? (m.mappingType==='direct'||m.mappingType==='collapsed_rope'?'mapped':m.mappingType==='skipped'?'skipped':'unmapped') : 'unmapped';
                 const div = document.createElement('div');
                 div.className = 'nd '+mc+' op-'+n.op;
                 div.dataset.fx = n.name;

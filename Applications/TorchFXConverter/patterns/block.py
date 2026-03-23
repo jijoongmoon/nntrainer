@@ -45,6 +45,12 @@ def detect_block(block_idx, scope, layers, all_layers, config, by_name,
         if layer_types and block_idx < len(layer_types):
             if "sliding" in str(layer_types[block_idx]).lower():
                 block.attention.use_sliding_window = True
+        # Global sliding_window (Gemma2, etc.)
+        if config and not block.attention.use_sliding_window:
+            sw = getattr(config, "sliding_window", None)
+            use_sw = getattr(config, "use_sliding_window", False)
+            if sw and (use_sw or not hasattr(config, "use_sliding_window")):
+                block.attention.use_sliding_window = True
 
     # Detect cross-attention
     cross_attn_scope = find_cross_attention_scope(scope, block_layers)
