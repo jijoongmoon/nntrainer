@@ -118,7 +118,7 @@ export interface NodeMapping {
     fxNodeName: string;
     nntrainerLayerName: string;
     hfModuleName: string;
-    mappingType: 'direct' | 'decomposed' | 'skipped' | 'unmapped';
+    mappingType: 'direct' | 'decomposed' | 'skipped' | 'collapsed_rope' | 'unmapped';
 }
 
 /** Per-layer profiling data */
