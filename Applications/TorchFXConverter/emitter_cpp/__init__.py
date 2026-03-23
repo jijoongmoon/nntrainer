@@ -47,6 +47,7 @@ class CppEmitter(BaseEmitter):
 
     def __init__(self, layers, structure, model_name=None):
         super().__init__(layers, structure, model_name=model_name)
+        self._layers_by_name = {l.name: l for l in layers}
 
     def emit(self):
         """Generate combined C++ code (header + source)."""
@@ -176,7 +177,8 @@ class CppEmitter(BaseEmitter):
                 cname, representative, arch_type=s.arch_type,
                 external_kv_cache=s.external_kv_cache))
         if representative and representative.ffn:
-            L.append(emit_ffn_method(cname, representative))
+            L.append(emit_ffn_method(
+                cname, representative, self._layers_by_name))
 
     def _emit_standard_blocks(self, L, cname, block_type, s):
         """Emit standard block methods."""
@@ -193,7 +195,8 @@ class CppEmitter(BaseEmitter):
 
         representative = next((b for b in s.blocks if b.ffn), None)
         if representative:
-            L.append(emit_ffn_method(cname, representative))
+            L.append(emit_ffn_method(
+                cname, representative, self._layers_by_name))
 
     # ----- Internal helpers -----
 

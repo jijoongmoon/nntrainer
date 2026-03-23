@@ -197,38 +197,20 @@ def _emit_cross_attention(L, block, norm_type, input_var):
 
 
 def _emit_operator_layers(L, block, input_var, prefix_expr):
-    """Emit non-attention operator layers using Tensor flow.
+    """Emit non-attention operator layers using generic tensor-op emitter.
 
+    Uses actual input_layers connectivity instead of linear chaining.
     Returns the variable name of the last emitted tensor.
     """
+    from .source_generic import emit_generic_tensor_ops
+
     op_type = block.operator_type
     scope = block.operator_scope
     block_scope = scope.rsplit(".", 1)[0] if "." in scope else scope
-    block_scope_san = block_scope.replace(".", "_")
+    block_scope_san = block_scope.replace(".", "_") + "_"
 
     L.append(f"  // {op_type.capitalize()} operator (auto-generated)")
-    prev_var = input_var
-
-    for i, layer in enumerate(block.operator_layers):
-        if layer.name.startswith(block_scope_san + "_"):
-            suffix = layer.name[len(block_scope_san):]
-        else:
-            suffix = "_" + layer.name
-
-        var_name = f"op_{i}"
-        props = [f'withKey("name", prefix + "{suffix}")']
-        for k, v in layer.properties.items():
-            if isinstance(v, bool):
-                props.append(f'withKey("{k}", '
-                             f'"{str(v).lower()}")')
-            elif isinstance(v, str):
-                props.append(f'withKey("{k}", "{v}")')
-            else:
-                props.append(f'withKey("{k}", {v})')
-
-        lines, prev_var = _cpp_tensor_layer(
-            var_name, layer.layer_type, props, prev_var)
-        L.extend(lines)
-        L.append(f"")
-
-    return prev_var
+    lines, last_var = emit_generic_tensor_ops(
+        block.operator_layers, input_var, "prefix", block_scope_san)
+    L.extend(lines)
+    return last_var
