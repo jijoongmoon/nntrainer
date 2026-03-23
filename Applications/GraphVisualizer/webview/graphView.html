@@ -1473,9 +1473,19 @@
                 if (ma) cppAddLines.push({line: i+1, varName: ma[1]});
             });
 
-            // Build handle lookup by varName
-            const handleByVar = new Map();
-            cppHandles.forEach(h => { if (!handleByVar.has(h.varName)) handleByVar.set(h.varName, h.line); });
+            // Build handle lookups
+            const handleByVar = new Map();   // varName -> line
+            const handlesByType = new Map();  // layerType -> [{line, varName}]
+            cppHandles.forEach(h => {
+                if (!handleByVar.has(h.varName)) handleByVar.set(h.varName, h.line);
+                // Also index without _layer suffix (flat model emitter adds it)
+                if (h.varName.endsWith('_layer')) {
+                    const base = h.varName.slice(0, -6);
+                    if (!handleByVar.has(base)) handleByVar.set(base, h.line);
+                }
+                if (!handlesByType.has(h.layerType)) handlesByType.set(h.layerType, []);
+                handlesByType.get(h.layerType).push(h);
+            });
 
             // Alias: NN layer name suffix -> C++ handle variable name
             // Covers naming differences between HF module paths and C++ emitter
@@ -1516,6 +1526,9 @@
                 'ln_f': 'output_norm',
             };
 
+            // Track type-based match index per type for sequential matching
+            const typeMatchIdx = new Map();
+
             let addIdx = 0;
             D.nntrainerLayers.forEach(l => {
                 // Addition layers map to .add() calls in block methods
@@ -1529,7 +1542,7 @@
                 const maxSuffix = Math.min(4, parts.length);
                 for (let len = 1; len <= maxSuffix; len++) {
                     const suffix = parts.slice(-len).join('_');
-                    // Direct match
+                    // Direct match (handles both exact and _layer-stripped names)
                     if (handleByVar.has(suffix)) {
                         cppLineMap.set(l.name, handleByVar.get(suffix));
                         return;
@@ -1541,16 +1554,16 @@
                         return;
                     }
                 }
-                // Fallback: type-based match for unique global layers
-                const typeToHandle = {
-                    'embedding_layer': 'embedding',
-                    'tie_word_embeddings': 'embedding',
-                    'rms_norm': 'output_norm',
-                    'layer_normalization': 'output_norm',
-                };
-                const fallbackVar = typeToHandle[l.layer_type];
-                if (fallbackVar && handleByVar.has(fallbackVar) && !cppLineMap.has(l.name)) {
-                    cppLineMap.set(l.name, handleByVar.get(fallbackVar));
+                // Fallback: match by layer type (handles flat models and
+                // any layers not covered by suffix/alias matching)
+                const typeHandles = handlesByType.get(l.layer_type);
+                if (typeHandles && typeHandles.length > 0) {
+                    // Use sequential index so each layer of the same type
+                    // maps to a different C++ handle (wraps around)
+                    const idx = typeMatchIdx.get(l.layer_type) || 0;
+                    cppLineMap.set(l.name, typeHandles[idx % typeHandles.length].line);
+                    typeMatchIdx.set(l.layer_type, idx + 1);
+                    return;
                 }
             });
         }
