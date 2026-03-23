@@ -46,6 +46,8 @@ def extract_config_metadata(structure, config):
             rt = rope_params.get("rope_theta", rope_params.get("base", None))
             if isinstance(rt, (int, float)):
                 structure.rope_theta = float(rt)
+    structure.sliding_window = safe_cfg_int(config, "sliding_window",
+                                            default=0)
     structure.norm_eps = safe_cfg_float(
         config, "rms_norm_eps", "norm_eps", "layer_norm_eps",
         "layer_norm_epsilon")

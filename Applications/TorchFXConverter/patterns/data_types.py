@@ -111,6 +111,7 @@ class ModelStructure:
     head_dim: int = 0
     intermediate_size: int = 0
     rope_theta: float = 0.0
+    sliding_window: int = 0
     norm_eps: float = 0.0
     max_position_embeddings: int = 0
     num_encoder_layers: int = 0
