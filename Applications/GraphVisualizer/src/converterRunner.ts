@@ -271,15 +271,108 @@ export class ConverterRunner {
         );
     }
 
-    /** Load a previously saved conversion result */
+    /** Load a previously saved conversion result.
+     *  Supports two JSON formats:
+     *  1. conversion_result.json (from vscode_bridge.py) - has nntrainerLayers, fxGraph, etc.
+     *  2. converter.py output (e.g. lfm2_700m.json) - has model, layers, structure, weight_map
+     */
     async loadFromJson(filePath: string): Promise<ConversionResult | null> {
         try {
             const raw = fs.readFileSync(filePath, 'utf-8');
-            return JSON.parse(raw) as ConversionResult;
+            const data = JSON.parse(raw);
+
+            // If it already has nntrainerLayers, it's a conversion_result.json
+            if (data.nntrainerLayers) {
+                return data as ConversionResult;
+            }
+
+            // If it has 'layers' and 'model', it's a converter.py output JSON
+            if (data.layers && data.model) {
+                return this.adaptConverterJson(data, filePath);
+            }
+
+            vscode.window.showErrorMessage(
+                'Unrecognized JSON format. Expected conversion_result.json or converter output JSON.'
+            );
+            return null;
         } catch (e) {
             vscode.window.showErrorMessage(`Failed to load: ${e}`);
             return null;
         }
+    }
+
+    /** Adapt converter.py output JSON into ConversionResult for the graph visualizer */
+    private adaptConverterJson(data: any, filePath: string): ConversionResult {
+        // Convert layers to NNTrainerLayer format
+        const nntrainerLayers = data.layers.map((l: any) => ({
+            name: l.name,
+            layer_type: l.type || 'unknown',
+            properties: l.properties || {},
+            input_layers: l.input_layers || [],
+            fx_node_name: l.fx_node_name || '',
+            hf_module_name: l.hf_module_name || '',
+            hf_module_type: l.hf_module_type || '',
+            has_weight: !!l.hf_module_name,
+            has_bias: false,
+            weight_hf_key: l.weight_hf_key || '',
+            bias_hf_key: '',
+            transpose_weight: false,
+            shared_from: l.shared_from || '',
+        }));
+
+        // Build synthetic fxGraph from layers (converter output doesn't have FX graph)
+        // Create nodes that mirror the NN layers so both panes show something useful
+        const fxGraph = data.layers
+            .filter((l: any) => l.type !== 'input')
+            .map((l: any) => ({
+                name: l.name,
+                op: l.hf_module_name ? 'call_module' : 'call_function',
+                target: l.hf_module_name || l.type,
+                args: l.input_layers || [],
+                output_shape: null,
+                module_type: l.hf_module_type || null,
+                scope: '',
+                meta: {},
+            }));
+
+        // Build node mapping: each non-input layer maps to itself
+        const nodeMapping = data.layers
+            .filter((l: any) => l.type !== 'input')
+            .map((l: any) => ({
+                fxNodeName: l.name,
+                nntrainerLayerName: l.name,
+                hfModuleName: l.hf_module_name || '',
+                mappingType: 'direct' as const,
+            }));
+
+        // Load companion .cpp and .ini files if they exist in the same directory
+        const dir = path.dirname(filePath);
+        const baseName = path.basename(filePath, '.json');
+        let cppSource = '';
+        let iniConfig = '';
+        const cppPath = path.join(dir, baseName + '.cpp');
+        const iniPath = path.join(dir, baseName + '.ini');
+        if (fs.existsSync(cppPath)) {
+            cppSource = fs.readFileSync(cppPath, 'utf-8');
+        }
+        if (fs.existsSync(iniPath)) {
+            iniConfig = fs.readFileSync(iniPath, 'utf-8');
+        }
+
+        return {
+            nntrainerLayers: nntrainerLayers,
+            fxGraph: fxGraph,
+            modelStructure: data.structure || data.model || null,
+            weightMap: data.weight_map || [],
+            nodeMapping: nodeMapping,
+            unsupportedOps: [],
+            unknownLayers: [],
+            decomposedModules: [],
+            cppSource: cppSource,
+            iniConfig: iniConfig,
+            torchSourceCode: '',
+            torchSourcePath: '',
+        };
     }
 
     /** Run profiling on a model and return per-layer timing data */
