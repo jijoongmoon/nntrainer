@@ -11,6 +11,10 @@ export class ModelExplorerProvider implements vscode.TreeDataProvider<ExplorerIt
         this._onDidChangeTreeData.fire(undefined);
     }
 
+    getConversionResult(): ConversionResult | null {
+        return this.result;
+    }
+
     getTreeItem(element: ExplorerItem): vscode.TreeItem {
         return element;
     }
