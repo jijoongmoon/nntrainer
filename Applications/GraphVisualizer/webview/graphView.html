@@ -1929,8 +1929,12 @@
             // Preprocessor (#include, #ifndef, etc.)
             h = h.replace(/^(\s*)(#\w+.*)$/, '$1<span class="pp">$2</span>');
             if (h.includes('<span class="pp">')) return h;
-            // Strings
-            h = h.replace(/(&quot;[^&]*?&quot;|"[^"]*?")/g, '<span class="st">$1</span>');
+            // Extract strings into placeholders to prevent keyword regex
+            // from matching "class" etc. inside <span class="st"> tags
+            const strs = [];
+            h = h.replace(/(&quot;[^&]*?&quot;|"[^"]*?")/g, function(m) {
+                strs.push(m); return '\x00S'+(strs.length-1)+'\x00';
+            });
             // Numbers (integers, floats)
             h = h.replace(/\b(\d+\.?\d*[fF]?)\b/g, '<span class="nu">$1</span>');
             // Keywords
@@ -1945,6 +1949,10 @@
                 if (m.includes('<span')) return m;
                 return '<span class="fn">'+fn+'</span>(';
             });
+            // Restore strings with highlighting
+            h = h.replace(/\x00S(\d+)\x00/g, function(m, idx) {
+                return '<span class="st">'+strs[parseInt(idx)]+'</span>';
+            });
             return h;
         }
 
@@ -1953,8 +1961,11 @@
             // Comments
             h = h.replace(/^(\s*)(#.*)$/, '$1<span class="cm">$2</span>');
             if (h.includes('<span class="cm">')) return h;
-            // Strings (single and double quoted)
-            h = h.replace(/(&#39;[^&#]*?&#39;|&quot;[^&]*?&quot;|'[^']*?'|"[^"]*?")/g, '<span class="st">$1</span>');
+            // Extract strings into placeholders
+            const strs = [];
+            h = h.replace(/(&#39;[^&#]*?&#39;|&quot;[^&]*?&quot;|'[^']*?'|"[^"]*?")/g, function(m) {
+                strs.push(m); return '\x00S'+(strs.length-1)+'\x00';
+            });
             // Numbers
             h = h.replace(/\b(\d+\.?\d*)\b/g, '<span class="nu">$1</span>');
             // Keywords
@@ -1967,6 +1978,10 @@
             h = h.replace(/\b([a-zA-Z_]\w*)\s*\(/g, function(m, fn) {
                 if (m.includes('<span')) return m;
                 return '<span class="fn">'+fn+'</span>(';
+            });
+            // Restore strings with highlighting
+            h = h.replace(/\x00S(\d+)\x00/g, function(m, idx) {
+                return '<span class="st">'+strs[parseInt(idx)]+'</span>';
             });
             return h;
         }
