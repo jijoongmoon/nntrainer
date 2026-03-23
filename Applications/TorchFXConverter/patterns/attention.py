@@ -109,7 +109,14 @@ def _detect_rope(attn, attn_scope, all_layers, config):
                 attn.has_rope = True
                 break
     if not attn.has_rope and config:
-        if getattr(config, "rope_theta", 0) > 0:
+        rope_theta = getattr(config, "rope_theta", 0)
+        if not rope_theta:
+            # Newer transformers store rope_theta inside rope_parameters dict
+            rope_params = getattr(config, "rope_parameters", None)
+            if isinstance(rope_params, dict):
+                rope_theta = rope_params.get("rope_theta",
+                                             rope_params.get("base", 0))
+        if rope_theta and rope_theta > 0:
             attn.has_rope = True
 
 

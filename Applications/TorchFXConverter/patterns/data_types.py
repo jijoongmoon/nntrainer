@@ -142,7 +142,8 @@ class ModelStructure:
         print(f"Intermediate: {self.intermediate_size}, "
               f"vocab: {self.vocab_size}")
         if self.rope_theta:
-            print(f"RoPE theta: {self.rope_theta}")
+            print(f"RoPE theta: {self.rope_theta:g} "
+                  f"(collapsed -> mha_core, NEON/AVX2)")
         if self.ssm_state_size:
             print(f"SSM: state_size={self.ssm_state_size}, "
                   f"conv_kernel={self.ssm_conv_kernel}, "
@@ -178,7 +179,7 @@ def print_block(block):
         print(f"      heads={attn.num_heads}, kv_heads={attn.num_kv_heads}, "
               f"head_dim={attn.head_dim}")
         if attn.has_rope:
-            print(f"      RoPE: yes")
+            print(f"      RoPE: yes (collapsed -> mha_core)")
     if block.attn_residual:
         print(f"    Attn residual: {block.attn_residual}")
 
