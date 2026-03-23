@@ -87,6 +87,7 @@
         .nd.mapped { border-left: 3.5px solid #98c379; }
         .nd.unmapped { border-left: 3.5px solid #e06c75; }
         .nd.skipped { border-left: 3.5px solid #d19a66; opacity: .6; }
+        .nd.collapsed_rope { border-left: 3.5px solid #c678dd; opacity: .55; }
 
         /* Node header (type badge) */
         .nd .nd-hdr {
@@ -350,10 +351,13 @@
         /* ---- stats ---- */
         const nMapped = D.nodeMapping.filter(m => m.mappingType === 'direct').length;
         const nSkip = D.nodeMapping.filter(m => m.mappingType === 'skipped').length;
+        const nRope = D.nodeMapping.filter(m => m.mappingType === 'collapsed_rope').length;
         const nUnmap = D.unsupportedOps.length + D.unknownLayers.length;
         document.getElementById('stats').textContent =
             'FX:' + D.fxGraph.length + ' | NN:' + D.nntrainerLayers.length +
-            ' | Map:' + nMapped + ' | Skip:' + nSkip + (nUnmap ? ' | Unmap:' + nUnmap : '');
+            ' | Map:' + nMapped + ' | Skip:' + nSkip +
+            (nRope ? ' | RoPE:' + nRope : '') +
+            (nUnmap ? ' | Unmap:' + nUnmap : '');
 
         /* ---- state ---- */
         let selFx = null, selNn = null, viewMode = 'sbs';
@@ -638,7 +642,7 @@
             vis.forEach(n => {
                 const p = pos.get(n.name); if(!p) return;
                 const m = mByFx.get(n.name);
-                const mc = m ? (m.mappingType==='direct'?'mapped':m.mappingType==='skipped'?'skipped':'unmapped') : 'unmapped';
+                const mc = m ? (m.mappingType==='direct'?'mapped':m.mappingType==='skipped'?'skipped':m.mappingType==='collapsed_rope'?'collapsed_rope':'unmapped') : 'unmapped';
                 const div = document.createElement('div');
                 div.className = 'nd '+mc+' op-'+n.op;
                 div.dataset.fx = n.name;
@@ -841,7 +845,7 @@
             const skipped = D.nodeMapping.filter(m => m.mappingType === 'skipped');
             const unmappedFx = visFx.filter(n => {
                 const m = mByFx.get(n.name);
-                return !m || (m.mappingType !== 'direct' && m.mappingType !== 'skipped');
+                return !m || (m.mappingType !== 'direct' && m.mappingType !== 'skipped' && m.mappingType !== 'collapsed_rope');
             });
             const unmappedNn = D.nntrainerLayers.filter(l => {
                 return !mByNn.has(l.name) && l.layer_type !== 'input';
