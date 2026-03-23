@@ -426,18 +426,54 @@ def _map_normalize(node, scope, input_names):
 
 
 def _map_getitem(node, scope, node_to_layer):
-    """Map operator.getitem for multi-output module tuple unpacking."""
-    if len(node.args) >= 2 and hasattr(node.args[0], 'name'):
-        parent_name = node.args[0].name
-        parent_layer = node_to_layer.get(parent_name)
-        idx = node.args[1]
-        if (parent_layer and
-                parent_layer.layer_type in MULTI_OUTPUT_LAYER_TYPES
-                and idx == 0):
-            return NNTrainerLayerDef(
-                layer_type=LAYER_IDENTITY,
-                name=node.name,
-                input_layers=[parent_name],
-                hf_module_name=scope,
-            )
+    """Map operator.getitem for multi-output module tuple unpacking.
+
+    When a module returns a tuple (e.g. Conv1D → (output, state), LSTM →
+    (output, hidden)), FX creates operator.getitem nodes to extract each
+    element.  We detect this by checking if the parent FX node is a
+    call_module whose output is a tuple/list.
+
+    - idx == 0:  LAYER_IDENTITY → points to parent (the primary output)
+    - idx >= 1:  LAYER_IDENTITY → points to parent (secondary output,
+                 will often be pruned as dead code for inference)
+    """
+    if len(node.args) < 2 or not hasattr(node.args[0], 'name'):
+        return None
+
+    parent_node = node.args[0]
+    parent_name = parent_node.name
+    parent_layer = node_to_layer.get(parent_name)
+    idx = node.args[1]
+
+    if not isinstance(idx, int):
+        return None
+
+    # Check if parent is a module call that returns a tuple
+    is_multi_output = False
+
+    # Case 1: Known multi-output layer types (LSTM, GRU, RNN, etc.)
+    if parent_layer and parent_layer.layer_type in MULTI_OUTPUT_LAYER_TYPES:
+        is_multi_output = True
+
+    # Case 2: Any call_module whose output is a tuple/list.
+    # The tracer stores output_type in meta for leaf modules.
+    if not is_multi_output and parent_node.op == "call_module":
+        out_type = parent_node.meta.get('output_type')
+        if out_type in (tuple, list):
+            is_multi_output = True
+        # Fallback: check if output_shape is a list of shapes
+        if not is_multi_output:
+            out_shape = parent_node.meta.get('output_shape')
+            if isinstance(out_shape, (list, tuple)) and out_shape:
+                if isinstance(out_shape[0], (list, tuple)):
+                    is_multi_output = True
+
+    if is_multi_output:
+        return NNTrainerLayerDef(
+            layer_type=LAYER_IDENTITY,
+            name=node.name,
+            input_layers=[parent_name],
+            hf_module_name=scope,
+        )
+
     return None
