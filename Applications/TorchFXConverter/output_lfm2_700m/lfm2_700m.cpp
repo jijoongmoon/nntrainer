@@ -107,7 +107,7 @@ void Lfm2CausalLM::constructModel() {
   // LM head
   const std::string lmhead_type = TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "fully_connected";
   std::vector<std::string> lmhead_props = {
-    withKey("name", "output_of_causallm"),
+    withKey("name", "lm_head"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true")
     , withKey("shared_from", "embedding0")
