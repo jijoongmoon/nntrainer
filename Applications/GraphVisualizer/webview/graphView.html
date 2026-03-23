@@ -1508,10 +1508,12 @@
                 // Cross-attention norm (encoder-decoder)
                 'cross_attn_norm': 'cross_norm',
                 'encoder_attn_layer_norm': 'cross_norm',
-                // FFN projections (SwiGLU)
+                // FFN projections (SwiGLU / GeGLU / gated)
                 'up_proj': 'ffn_up',
                 'gate_proj': 'ffn_gate',
                 'down_proj': 'ffn_down',
+                'act_fn': 'ffn_act',
+                'activation_post_process': 'ffn_act',
                 // FFN projections (standard GELU/ReLU)
                 'fc1': 'ffn_fc1',
                 'fc2': 'ffn_down',
