@@ -28,6 +28,7 @@ class AttentionPattern:
     head_dim: int = 0
     has_rope: bool = False
     has_qk_norm: bool = False
+    use_sliding_window: bool = False
     layer_names: list = field(default_factory=list)
 
     @property
@@ -181,6 +182,8 @@ def print_block(block):
               f"head_dim={attn.head_dim}")
         if attn.has_rope:
             print(f"      RoPE: yes (collapsed -> mha_core)")
+        if attn.use_sliding_window:
+            print(f"      Sliding window: yes")
     if block.attn_residual:
         print(f"    Attn residual: {block.attn_residual}")
 

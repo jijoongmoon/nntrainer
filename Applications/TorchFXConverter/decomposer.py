@@ -639,14 +639,22 @@ def _collapse_rope_chains(layers):
                 # else: input is removable with no bypass → skip
             l.input_layers = new_inputs
 
-    # Phase 5: Remove
+    # Phase 5: Remove and collect FX node names for VS Code bridge
+    collapsed_fx_names = set()
+    for name in removable:
+        layer = by_name.get(name)
+        if layer:
+            # Prefer fx_node_name (matches FX graph); fall back to layer name
+            fx_name = layer.fx_node_name or layer.name
+            collapsed_fx_names.add(fx_name)
+
     filtered = [l for l in layers if l.name not in removable]
     comp_count = len(rope_comp)
     app_count = len(removable) - comp_count
     print(f"  [ROPE] Collapsed {len(removable)} RoPE layers "
           f"({comp_count} computation + {app_count} application)")
 
-    return filtered, removable
+    return filtered, collapsed_fx_names
 
 
 # =============================================================================
