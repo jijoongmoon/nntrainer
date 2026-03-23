@@ -1495,7 +1495,9 @@
                 'pre_attn_norm': 'att_norm',
                 'attention_norm': 'att_norm',
                 'ln_1': 'att_norm',
-                // MHA core
+                // MHA core (SDPA in NN model → attn handle in C++)
+                'sdpa': 'attn',
+                'scaled_dot_product_attention_sdpa': 'attn',
                 'attention': 'attn',
                 'self_attention': 'attn',
                 'self_attn': 'attn',
@@ -1556,7 +1558,10 @@
                 }
                 // Fallback: match by layer type (handles flat models and
                 // any layers not covered by suffix/alias matching)
-                const typeHandles = handlesByType.get(l.layer_type);
+                // NN model uses different type names than C++ emitter in some cases
+                const typeAlias = {'sdpa': 'mha_core'};
+                const lookupType = typeAlias[l.layer_type] || l.layer_type;
+                const typeHandles = handlesByType.get(lookupType) || handlesByType.get(l.layer_type);
                 if (typeHandles && typeHandles.length > 0) {
                     // Use sequential index so each layer of the same type
                     // maps to a different C++ handle (wraps around)
