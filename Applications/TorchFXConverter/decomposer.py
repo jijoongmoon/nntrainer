@@ -33,6 +33,7 @@ from nntrainer_layers import (
     LAYER_RESHAPE, LAYER_PERMUTE, LAYER_TRANSPOSE,
     LAZY_TENSOR_OPS, TENSOR_DIRECT_METHODS,
     OP_UNSUPPORTED, OP_NOOP, OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE,
+    OP_SDPA,
 )
 from tracer import Tracer, LEAF_MODULES
 from node_mapper import NodeMapper
@@ -449,6 +450,206 @@ def _remove_position_id_chains(layers):
 
 
 # =============================================================================
+# RoPE Chain Collapse (llama.cpp-style single op)
+# =============================================================================
+# RoPE is handled internally by mha_core (NEON/AVX2 optimized), so the
+# decomposed sin/cos/rotate_half ops from torch.fx are redundant.
+#
+# Computation chain (shared): inv_freq → matmul → cat → cos/sin
+# Application chain (per layer): Q*cos + rotate_half(Q)*sin
+#
+# This pass removes both chains and relies on mha_core's rope_theta parameter.
+
+# Layer types that appear in RoPE application chains (rotate_half + apply).
+_ROPE_APP_TYPES = frozenset({
+    LAYER_MULTIPLY, LAYER_ADDITION, LAYER_NEGATIVE, LAYER_SUBTRACT,
+    "slice", "concat",
+    LAYER_RESHAPE, LAYER_PERMUTE, LAYER_TRANSPOSE,
+    OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE,
+})
+
+
+def _is_rope_computation(layer):
+    """Check if a layer is part of the RoPE frequency computation chain.
+
+    Matches layers whose name or HF scope contains 'rotary_emb' or 'rope'.
+    These layers compute cos/sin embeddings from inv_freq and positions.
+    """
+    name = layer.name.lower()
+    scope = layer.hf_module_name.lower()
+    return ("rotary_emb" in name or "rotary_emb" in scope
+            or "rotary_embedding" in name or "rotary_embedding" in scope
+            or ("rope" in name and "rope" not in "properties"))
+
+
+def _is_rope_app_type(layer_type):
+    """Check if a layer type can appear in a RoPE application chain."""
+    return layer_type in _ROPE_APP_TYPES or layer_type.startswith("tensor_op:")
+
+
+def _find_pre_rope_input(layer_name, by_name, removable):
+    """Trace backward through RoPE chain to find the pre-rotation input.
+
+    For Q*cos + rotate_half(Q)*sin, returns Q (the tensor before rotation).
+    Walks through removable layers, prioritizing paths through multiply ops
+    that have a non-removable input (the original Q/K tensor).
+    """
+    visited = set()
+
+    def walk(name):
+        if name in visited:
+            return None
+        visited.add(name)
+        layer = by_name.get(name)
+        if not layer:
+            return None
+
+        rope_inputs = []
+        non_rope_inputs = []
+        for inp in (layer.input_layers or []):
+            if inp in removable:
+                rope_inputs.append(inp)
+            else:
+                non_rope_inputs.append(inp)
+
+        # multiply(Q, cos): Q is non-rope, cos is rope → return Q
+        if layer.layer_type in (LAYER_MULTIPLY, "multiply") and non_rope_inputs:
+            return non_rope_inputs[0]
+
+        # For other types (addition, concat): trace through rope inputs first
+        for inp in rope_inputs:
+            result = walk(inp)
+            if result:
+                return result
+
+        # Fallback: return first non-rope input
+        return non_rope_inputs[0] if non_rope_inputs else None
+
+    return walk(layer_name)
+
+
+def _collapse_rope_chains(layers):
+    """Remove RoPE computation and application chains from the layer graph.
+
+    RoPE is handled internally by mha_core using the rope_theta parameter
+    with NEON/AVX2 optimized kernels, making the decomposed sin/cos/
+    rotate_half ops redundant.
+
+    Uses iterative fixed-point analysis (like _remove_position_id_chains):
+    1. Identify computation chain layers by scope (rotary_emb/rope)
+    2. Forward-propagate to find application chain layers
+    3. Build bypass map to rewire downstream consumers
+    4. Remove all RoPE layers
+
+    Returns:
+        Tuple of (filtered layers, set of collapsed layer names).
+    """
+    by_name = {l.name: l for l in layers}
+
+    # Build consumer graph: layer_name -> set of consumer layer names
+    consumers = {}
+    for l in layers:
+        for inp in (l.input_layers or []):
+            consumers.setdefault(inp, set()).add(l.name)
+
+    # Phase 1: Identify RoPE computation layers by scope
+    rope_comp = set()
+    for l in layers:
+        if _is_rope_computation(l):
+            rope_comp.add(l.name)
+
+    if not rope_comp:
+        return layers, set()
+
+    # Phase 2a: Forward-propagate from rope_comp to find all
+    # "rope-connected" layers (transitively consume rope outputs).
+    rope_connected = set(rope_comp)
+    changed = True
+    while changed:
+        changed = False
+        for l in layers:
+            if l.name in rope_connected:
+                continue
+            if not _is_rope_app_type(l.layer_type):
+                continue
+            if any(inp in rope_connected for inp in (l.input_layers or [])):
+                rope_connected.add(l.name)
+                changed = True
+
+    # Phase 2b: Backward pressure — mark rope-connected layers as removable
+    # if ALL their consumers are also rope-connected or SDPA.
+    # Uses rope_connected for reachability, removable for convergence.
+    removable = set(rope_comp)
+    changed = True
+    while changed:
+        changed = False
+        for name in rope_connected:
+            if name in removable:
+                continue
+            lc = consumers.get(name, set())
+            if not lc:
+                # No consumers - dead node, safe to remove
+                removable.add(name)
+                changed = True
+                continue
+            if all(c in removable
+                   or (c in by_name and by_name[c].layer_type == OP_SDPA)
+                   for c in lc):
+                removable.add(name)
+                changed = True
+
+    # Phase 2c: Backward propagation — catch layers that exclusively
+    # feed into removable layers (e.g. rotate_half: slice → neg → concat
+    # that feed into the mul(rotated, sin) which is already removable).
+    changed = True
+    while changed:
+        changed = False
+        for l in layers:
+            if l.name in removable:
+                continue
+            if not _is_rope_app_type(l.layer_type):
+                continue
+            lc = consumers.get(l.name, set())
+            if not lc:
+                continue
+            if all(c in removable for c in lc):
+                removable.add(l.name)
+                changed = True
+
+    # Phase 3: Build bypass map for final RoPE outputs
+    # For each removable layer consumed by a non-removable layer,
+    # find the pre-RoPE input to route to instead.
+    bypass = {}
+    for name in removable:
+        lc = consumers.get(name, set())
+        if any(c not in removable for c in lc):
+            source = _find_pre_rope_input(name, by_name, removable)
+            if source:
+                bypass[name] = source
+
+    # Phase 4: Rewire downstream layers
+    for l in layers:
+        if l.name not in removable and l.input_layers:
+            new_inputs = []
+            for inp in l.input_layers:
+                if inp in bypass:
+                    new_inputs.append(bypass[inp])
+                elif inp not in removable:
+                    new_inputs.append(inp)
+                # else: input is removable with no bypass → skip
+            l.input_layers = new_inputs
+
+    # Phase 5: Remove
+    filtered = [l for l in layers if l.name not in removable]
+    comp_count = len(rope_comp)
+    app_count = len(removable) - comp_count
+    print(f"  [ROPE] Collapsed {len(removable)} RoPE layers "
+          f"({comp_count} computation + {app_count} application)")
+
+    return filtered, removable
+
+
+# =============================================================================
 # Adaptive Converter Pipeline
 # =============================================================================
 
@@ -586,6 +787,14 @@ class AdaptiveConverter:
         # modules).  Iterates to handle chains of dead layers.
         layers = _remove_dead_layers(layers)
 
+        # Pass 3.96: Collapse RoPE chains — remove decomposed
+        # sin/cos/rotate_half ops that mha_core handles internally
+        # via rope_theta parameter (NEON/AVX2 optimized).
+        layers, collapsed_rope = _collapse_rope_chains(layers)
+        if collapsed_rope:
+            # Clean up any orphaned layers after RoPE removal
+            layers = _remove_dead_layers(layers)
+
         # Pass 4: Detect LazyTensor chain opportunities
         lazy_chains = detect_lazy_chains(layers)
         if lazy_chains:
@@ -620,6 +829,7 @@ class AdaptiveConverter:
             graph=tracer.graph,
             model_structure=model_structure,
             training=self.training,
+            collapsed_rope_layers=collapsed_rope,
         )
 
 
@@ -795,7 +1005,8 @@ class ConversionResult:
 
     def __init__(self, layers, decomposed_module_types, unsupported_ops,
                  unknown_layers, tensor_ops, lazy_chains, graph,
-                 model_structure=None, training=False):
+                 model_structure=None, training=False,
+                 collapsed_rope_layers=None):
         self.layers = layers
         self.decomposed_module_types = decomposed_module_types
         self.unsupported_ops = unsupported_ops
@@ -805,6 +1016,7 @@ class ConversionResult:
         self.graph = graph
         self.model_structure = model_structure
         self.training = training
+        self.collapsed_rope_layers = collapsed_rope_layers or set()
 
     @property
     def is_fully_mapped(self):
@@ -826,6 +1038,9 @@ class ConversionResult:
         if not self.training:
             print(f"Dropout layers: removed (inference mode)")
 
+        if self.collapsed_rope_layers:
+            print(f"RoPE: collapsed {len(self.collapsed_rope_layers)} layers "
+                  f"-> mha_core (NEON/AVX2 optimized)")
         if self.decomposed_module_types:
             print(f"Decomposed module types: "
                   f"{', '.join(sorted(self.decomposed_module_types))}")

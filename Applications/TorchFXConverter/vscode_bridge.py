@@ -80,11 +80,12 @@ def serialize_layer(layer):
     }
 
 
-def build_node_mapping(layers, fx_graph):
+def build_node_mapping(layers, fx_graph, collapsed_rope_layers=None):
     """Build mapping between fx nodes and nntrainer layers."""
     mappings = []
     fx_node_names = {node.name for node in fx_graph.nodes}
     mapped_fx = set()
+    rope_names = collapsed_rope_layers or set()
 
     for layer in layers:
         if layer.fx_node_name and layer.fx_node_name in fx_node_names:
@@ -98,11 +99,13 @@ def build_node_mapping(layers, fx_graph):
 
     for node in fx_graph.nodes:
         if node.name not in mapped_fx and node.op not in ("placeholder", "output"):
+            # Mark RoPE nodes as collapsed (handled by mha_core)
+            is_rope = node.name in rope_names
             mappings.append({
                 "fxNodeName": node.name,
                 "nntrainerLayerName": "",
                 "hfModuleName": "",
-                "mappingType": "skipped"
+                "mappingType": "collapsed_rope" if is_rope else "skipped"
             })
 
     return mappings
@@ -487,7 +490,8 @@ def main():
         "fxGraph": serialize_fx_graph(result.graph),
         "modelStructure": serialize_structure(structure),
         "weightMap": weight_map,
-        "nodeMapping": build_node_mapping(layers, result.graph),
+        "nodeMapping": build_node_mapping(layers, result.graph,
+                                          result.collapsed_rope_layers),
         "unsupportedOps": [l.name for l in result.unsupported_ops],
         "unknownLayers": [l.name for l in result.unknown_layers],
         "decomposedModules": list(result.decomposed_module_types),
