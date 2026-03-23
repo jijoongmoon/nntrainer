@@ -270,7 +270,8 @@ def _emit_member_variables(L, s, attn_block):
     is_decoder = s.arch_type in ("decoder_only", "encoder_decoder")
 
     if attn_block and is_decoder:
-        L.append(f"  unsigned int SLIDING_WINDOW = UINT_MAX;")
+        sw = s.sliding_window if s.sliding_window else "UINT_MAX"
+        L.append(f"  unsigned int SLIDING_WINDOW = {sw};")
 
     if s.conv_l_cache:
         L.append(f"  int CONV_KERNEL_SIZE = {s.conv_l_cache};")
