@@ -41,16 +41,29 @@ def detect_block(block_idx, scope, layers, all_layers, config, by_name,
         block.attention = detect_attention(
             block_idx, attn_scope, block_layers, all_layers, config)
         # Per-layer sliding window (Qwen3 layer_types)
+        # Qwen3 uses layer_types list + sliding_window config value.
+        # When use_sliding_window=False, HF sets config.sliding_window=None,
+        # so we read the raw default (4096) from the class init signature.
         layer_types = getattr(config, "layer_types", None) if config else None
         if layer_types and block_idx < len(layer_types):
+            # layer_types explicitly controls per-layer; skip global fallback
             if "sliding" in str(layer_types[block_idx]).lower():
                 block.attention.use_sliding_window = True
-        # Global sliding_window (Gemma2, etc.)
-        if config and not block.attention.use_sliding_window:
+                sw = getattr(config, "sliding_window", None)
+                if not sw:
+                    import inspect
+                    sig = inspect.signature(type(config).__init__)
+                    p = sig.parameters.get("sliding_window")
+                    sw = p.default if p and p.default != inspect.Parameter.empty else None
+                if sw:
+                    block.attention.sliding_window = int(sw)
+        elif config:
+            # Global sliding_window (Gemma2, etc.) - only when no layer_types
             sw = getattr(config, "sliding_window", None)
             use_sw = getattr(config, "use_sliding_window", False)
             if sw and (use_sw or not hasattr(config, "use_sliding_window")):
                 block.attention.use_sliding_window = True
+                block.attention.sliding_window = int(sw)
 
     # Detect cross-attention
     cross_attn_scope = find_cross_attention_scope(scope, block_layers)
