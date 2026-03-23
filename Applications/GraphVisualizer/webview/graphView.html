@@ -1929,14 +1929,16 @@
             // Preprocessor (#include, #ifndef, etc.)
             h = h.replace(/^(\s*)(#\w+.*)$/, '$1<span class="pp">$2</span>');
             if (h.includes('<span class="pp">')) return h;
-            // Extract strings into placeholders to prevent keyword regex
-            // from matching "class" etc. inside <span class="st"> tags
-            const strs = [];
+            // Extract strings and numbers into placeholders so that
+            // subsequent regexes never see "class" inside <span class=".."> tags
+            const toks = [];
+            function tok(v) { toks.push(v); return '\x00T'+(toks.length-1)+'\x00'; }
             h = h.replace(/(&quot;[^&]*?&quot;|"[^"]*?")/g, function(m) {
-                strs.push(m); return '\x00S'+(strs.length-1)+'\x00';
+                return tok('<span class="st">'+m+'</span>');
             });
-            // Numbers (integers, floats)
-            h = h.replace(/\b(\d+\.?\d*[fF]?)\b/g, '<span class="nu">$1</span>');
+            h = h.replace(/\b(\d+\.?\d*[fF]?)\b/g, function(m) {
+                return tok('<span class="nu">'+m+'</span>');
+            });
             // Keywords
             h = h.replace(/\b(auto|bool|break|case|catch|class|const|constexpr|continue|default|delete|do|else|enum|explicit|extern|false|for|friend|goto|if|inline|mutable|namespace|new|noexcept|nullptr|operator|override|private|protected|public|return|sizeof|static|static_cast|struct|switch|template|this|throw|true|try|typedef|typeid|typename|using|virtual|void|volatile|while)\b/g, '<span class="kw">$1</span>');
             // Types (common C++ and NNTrainer types)
@@ -1946,12 +1948,12 @@
             h = h.replace(/-&gt;/g, '<span class="op">-&gt;</span>');
             // Function calls: word followed by (
             h = h.replace(/\b([a-zA-Z_]\w*)\s*\(/g, function(m, fn) {
-                if (m.includes('<span')) return m;
+                if (m.includes('<span') || m.includes('\x00')) return m;
                 return '<span class="fn">'+fn+'</span>(';
             });
-            // Restore strings with highlighting
-            h = h.replace(/\x00S(\d+)\x00/g, function(m, idx) {
-                return '<span class="st">'+strs[parseInt(idx)]+'</span>';
+            // Restore all placeholders
+            h = h.replace(/\x00T(\d+)\x00/g, function(m, idx) {
+                return toks[parseInt(idx)];
             });
             return h;
         }
@@ -1961,13 +1963,15 @@
             // Comments
             h = h.replace(/^(\s*)(#.*)$/, '$1<span class="cm">$2</span>');
             if (h.includes('<span class="cm">')) return h;
-            // Extract strings into placeholders
-            const strs = [];
+            // Extract strings and numbers into placeholders
+            const toks = [];
+            function tok(v) { toks.push(v); return '\x00T'+(toks.length-1)+'\x00'; }
             h = h.replace(/(&#39;[^&#]*?&#39;|&quot;[^&]*?&quot;|'[^']*?'|"[^"]*?")/g, function(m) {
-                strs.push(m); return '\x00S'+(strs.length-1)+'\x00';
+                return tok('<span class="st">'+m+'</span>');
             });
-            // Numbers
-            h = h.replace(/\b(\d+\.?\d*)\b/g, '<span class="nu">$1</span>');
+            h = h.replace(/\b(\d+\.?\d*)\b/g, function(m) {
+                return tok('<span class="nu">'+m+'</span>');
+            });
             // Keywords
             h = h.replace(/\b(and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield|None|True|False|self)\b/g, '<span class="kw">$1</span>');
             // Types
@@ -1976,12 +1980,12 @@
             h = h.replace(/^(\s*)(@\w+)/g, '$1<span class="pp">$2</span>');
             // Function calls
             h = h.replace(/\b([a-zA-Z_]\w*)\s*\(/g, function(m, fn) {
-                if (m.includes('<span')) return m;
+                if (m.includes('<span') || m.includes('\x00')) return m;
                 return '<span class="fn">'+fn+'</span>(';
             });
-            // Restore strings with highlighting
-            h = h.replace(/\x00S(\d+)\x00/g, function(m, idx) {
-                return '<span class="st">'+strs[parseInt(idx)]+'</span>';
+            // Restore all placeholders
+            h = h.replace(/\x00T(\d+)\x00/g, function(m, idx) {
+                return toks[parseInt(idx)];
             });
             return h;
         }
