@@ -40,6 +40,11 @@ def detect_block(block_idx, scope, layers, all_layers, config, by_name,
     if attn_scope:
         block.attention = detect_attention(
             block_idx, attn_scope, block_layers, all_layers, config)
+        # Per-layer sliding window (Qwen3 layer_types)
+        layer_types = getattr(config, "layer_types", None) if config else None
+        if layer_types and block_idx < len(layer_types):
+            if "sliding" in str(layer_types[block_idx]).lower():
+                block.attention.use_sliding_window = True
 
     # Detect cross-attention
     cross_attn_scope = find_cross_attention_scope(scope, block_layers)
