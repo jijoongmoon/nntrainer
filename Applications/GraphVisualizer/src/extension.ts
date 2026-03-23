@@ -110,6 +110,42 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Command: Node selected (from webview)
+    context.subscriptions.push(
+        vscode.commands.registerCommand('nntrainerGraph.nodeSelected', (data: { layerName: string; source: string }) => {
+            if (!data) { return; }
+            const result = modelExplorer.getConversionResult();
+            if (!result) { return; }
+
+            // Find the layer/node info and show in properties panel
+            const props: Array<{ key: string; value: string }> = [];
+            if (data.source === 'nntrainer') {
+                const layer = result.nntrainerLayers.find(l => l.name === data.layerName);
+                if (layer) {
+                    props.push({ key: 'Name', value: layer.name });
+                    props.push({ key: 'Type', value: layer.layer_type });
+                    props.push({ key: 'Inputs', value: (layer.input_layers || []).join(', ') || '(none)' });
+                    if (layer.hf_module_name) { props.push({ key: 'HF Module', value: layer.hf_module_name }); }
+                    if (layer.hf_module_type) { props.push({ key: 'HF Type', value: layer.hf_module_type }); }
+                    for (const [k, v] of Object.entries(layer.properties || {})) {
+                        props.push({ key: k, value: String(v) });
+                    }
+                }
+            } else {
+                const node = result.fxGraph.find(n => n.name === data.layerName);
+                if (node) {
+                    props.push({ key: 'Name', value: node.name });
+                    props.push({ key: 'Op', value: node.op });
+                    props.push({ key: 'Target', value: node.target });
+                    props.push({ key: 'Args', value: (node.args || []).join(', ') || '(none)' });
+                    if (node.module_type) { props.push({ key: 'Module Type', value: node.module_type }); }
+                    if (node.output_shape) { props.push({ key: 'Output Shape', value: JSON.stringify(node.output_shape) }); }
+                }
+            }
+            nodeProperties.setProperties(props);
+        })
+    );
+
     // Command: Open Visualizer (from existing JSON)
     context.subscriptions.push(
         vscode.commands.registerCommand('nntrainerGraph.openVisualizer', async () => {
