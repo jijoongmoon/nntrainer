@@ -6,6 +6,15 @@ from nntrainer_layers import (
 from .data_types import FFNPattern
 
 
+def _inputs_reference(layer, known_names):
+    """Check if any of the layer's inputs reference a known FFN layer.
+
+    Used as fallback when hf_module_name is empty (intermediate ops like
+    multiply that don't correspond to a named HF module).
+    """
+    return any(inp in known_names for inp in layer.input_layers)
+
+
 def detect_ffn(block_idx, ffn_scope, block_layers, by_name):
     """Detect FFN pattern within the given scope.
 
@@ -78,20 +87,28 @@ def _build_gated_ffn(ffn, gate, up, down, ffn_scope, block_layers):
     ffn.intermediate_size = int(gate.properties.get("unit", 0))
     ffn.layer_names = [gate.name, up.name, down.name]
 
+    # Collect layer names for scope matching (name-based fallback when
+    # hf_module_name is empty, which happens for intermediate ops like mul)
+    ffn_layer_names = {gate.name, up.name, down.name}
+
     for layer in block_layers:
-        if (layer.layer_type == LAYER_ACTIVATION
-            and layer.hf_module_name.startswith(ffn_scope)):
+        in_scope = (layer.hf_module_name.startswith(ffn_scope)
+                    if layer.hf_module_name
+                    else _inputs_reference(layer, ffn_layer_names))
+
+        if layer.layer_type == LAYER_ACTIVATION and in_scope:
             ffn.activation = layer.name
             ffn.layer_names.append(layer.name)
+            ffn_layer_names.add(layer.name)
             act_type = layer.properties.get("activation", "")
             if act_type == "gelu":
                 ffn.ffn_type = "geglu"
             elif act_type in ("relu", "tanh", "sigmoid"):
                 ffn.ffn_type = f"gated_{act_type}"
-        elif (layer.layer_type == LAYER_MULTIPLY
-              and layer.hf_module_name.startswith(ffn_scope)):
+        elif layer.layer_type == LAYER_MULTIPLY and in_scope:
             ffn.gate_multiply = layer.name
             ffn.layer_names.append(layer.name)
+            ffn_layer_names.add(layer.name)
 
 
 def _build_standard_ffn(ffn, fc_layers, up, down, ffn_scope,

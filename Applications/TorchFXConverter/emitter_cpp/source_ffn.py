@@ -1,10 +1,16 @@
 """C++ createMlp() method generation using symbolic Tensor graph."""
 
 from .helpers import _cpp_tensor_layer, _class_name
+from .source_generic import emit_generic_tensor_ops
 
 
-def emit_ffn_method(cname, block):
-    """Generate createMlp() method body using Tensor flow."""
+def emit_ffn_method(cname, block, layers_by_name=None):
+    """Generate createMlp() method body using Tensor flow.
+
+    Uses pattern-specific emitters for known FFN types (SwiGLU, GeGLU,
+    standard). Falls back to generic tensor-op emission when the FFN type
+    is unrecognized, preserving the original layer graph connectivity.
+    """
     ffn = block.ffn
     L = []
 
@@ -22,6 +28,10 @@ def emit_ffn_method(cname, block):
         last_var = _emit_swiglu_ffn(L)
     elif is_gated:
         last_var = _emit_gated_ffn(L, ffn)
+    elif ffn.ffn_type in ("gelu_ffn", "standard"):
+        last_var = _emit_standard_ffn(L, ffn)
+    elif layers_by_name and ffn.layer_names:
+        last_var = _emit_generic_ffn(L, ffn, layers_by_name)
     else:
         last_var = _emit_standard_ffn(L, ffn)
 
@@ -150,3 +160,69 @@ def _emit_standard_ffn(L, ffn):
     L.extend(lines)
 
     return down_out
+
+
+def _emit_generic_ffn(L, ffn, layers_by_name):
+    """Emit unrecognized FFN as generic tensor ops using layer graph.
+
+    Falls back to emitting individual NNTrainer layers with their actual
+    properties and input_layers connectivity.  Also pulls in any
+    intermediate layers (e.g. multiply) that are referenced in
+    input_layers but missing from ffn.layer_names.
+    """
+    prefix_expr = '"layer" + std::to_string(layer_id)'
+
+    # Start with explicitly listed layers, then chase missing references
+    layer_set = set(ffn.layer_names)
+    queue = list(ffn.layer_names)
+    while queue:
+        name = queue.pop(0)
+        layer = layers_by_name.get(name)
+        if not layer:
+            continue
+        for inp in layer.input_layers:
+            if inp in layers_by_name and inp not in layer_set:
+                # Check that this intermediate layer belongs to the FFN
+                # (its inputs reference other FFN layers)
+                inp_layer = layers_by_name[inp]
+                if any(i in layer_set for i in inp_layer.input_layers):
+                    layer_set.add(inp)
+                    queue.append(inp)
+
+    # Topological sort: emit layers whose inputs are already emitted
+    remaining = {n: layers_by_name[n] for n in layer_set
+                 if n in layers_by_name}
+    ffn_layers = []
+    emitted = set()
+    changed = True
+    while remaining and changed:
+        changed = False
+        for name in list(remaining):
+            layer = remaining[name]
+            deps = [i for i in layer.input_layers if i in layer_set]
+            if all(d in emitted for d in deps):
+                ffn_layers.append(layer)
+                emitted.add(name)
+                del remaining[name]
+                changed = True
+    # Append any remaining (circular deps or unresolved - shouldn't happen)
+    ffn_layers.extend(remaining.values())
+
+    if not ffn_layers:
+        return "input"
+
+    # Determine block scope for clean variable naming
+    block_scope = ""
+    name = ffn_layers[0].name
+    parts = name.split("_")
+    for end in range(len(parts) - 1, 0, -1):
+        candidate = "_".join(parts[:end]) + "_"
+        if all(l.name.startswith(candidate) for l in ffn_layers):
+            block_scope = candidate
+            break
+
+    L.append(f"  // FFN (generic tensor-op fallback: {ffn.ffn_type})")
+    lines, last_var = emit_generic_tensor_ops(
+        ffn_layers, "input", prefix_expr, block_scope)
+    L.extend(lines)
+    return last_var
