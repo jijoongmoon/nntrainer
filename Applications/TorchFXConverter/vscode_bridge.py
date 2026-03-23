@@ -85,7 +85,6 @@ def build_node_mapping(layers, fx_graph, collapsed_rope_layers=None):
     mappings = []
     fx_node_names = {node.name for node in fx_graph.nodes}
     mapped_fx = set()
-    rope_names = collapsed_rope_layers or set()
 
     for layer in layers:
         if layer.fx_node_name and layer.fx_node_name in fx_node_names:
@@ -99,19 +98,15 @@ def build_node_mapping(layers, fx_graph, collapsed_rope_layers=None):
 
     for node in fx_graph.nodes:
         if node.name not in mapped_fx and node.op not in ("placeholder", "output"):
-            # Mark RoPE nodes as collapsed (handled by mha_core).
-            # Check both the explicit set AND scope-based detection
-            # (noop-removed rotary nodes like float/expand/to won't be
-            # in rope_names since they were removed before RoPE collapse).
-            is_rope = node.name in rope_names
-            if not is_rope:
-                is_rope = ("rotary_emb" in node.name.lower()
-                           or "rotary_embedding" in node.name.lower())
+            # RoPE nodes are collapsed into mha_core on the NNTrainer side,
+            # but in the FX graph they should be visible as raw tensor ops
+            # (sin, cos, mul, cat, matmul, etc.) so the user can see the
+            # original PyTorch computation graph unchanged.
             mappings.append({
                 "fxNodeName": node.name,
                 "nntrainerLayerName": "",
                 "hfModuleName": "",
-                "mappingType": "collapsed_rope" if is_rope else "skipped"
+                "mappingType": "skipped"
             })
 
     return mappings

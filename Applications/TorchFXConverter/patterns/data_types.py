@@ -29,6 +29,7 @@ class AttentionPattern:
     has_rope: bool = False
     has_qk_norm: bool = False
     use_sliding_window: bool = False
+    sliding_window: int = 0                 # Per-layer window size
     layer_names: list = field(default_factory=list)
 
     @property
