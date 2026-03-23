@@ -1462,23 +1462,60 @@
         if (D.cppSource) {
             const cppLines = D.cppSource.split('\n');
 
-            // Index: for each C++ line with createLayer, extract the variable name
-            // e.g., "LayerHandle q_proj(createLayer..." -> "q_proj"
+            // Index C++ LayerHandle declarations and Tensor::add() calls
             const cppHandles = []; // [{line, varName, layerType}]
-            // Also index Tensor::add() lines for addition layer mapping
-            // e.g., "Tensor residual = input.add(att_out);" -> residual add
-            const cppAddLines = []; // [{line, varName, comment}]
+            const cppAddLines = []; // [{line, varName}]
             cppLines.forEach((line, i) => {
                 let m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*"([^"]+)"/);
                 if (!m) m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*(\w+)/);
                 if (m) cppHandles.push({line: i+1, varName: m[1], layerType: m[2]});
-                // Match .add() calls: "Tensor varName = something.add(other);"
                 let ma = line.match(/Tensor\s+(\w+)\s*=\s*\w+\.add\s*\(/);
                 if (ma) cppAddLines.push({line: i+1, varName: ma[1]});
             });
 
-            // Match NN layers to C++ handles by suffix matching
-            // e.g., "model_layers_0_self_attn_q_proj" -> matches "q_proj"
+            // Build handle lookup by varName
+            const handleByVar = new Map();
+            cppHandles.forEach(h => { if (!handleByVar.has(h.varName)) handleByVar.set(h.varName, h.line); });
+
+            // Alias: NN layer name suffix -> C++ handle variable name
+            // Covers naming differences between HF module paths and C++ emitter
+            const suffixAlias = {
+                // Pre-attention norm (various naming conventions)
+                'input_layernorm': 'att_norm',
+                'pre_attn_norm': 'att_norm',
+                'attention_norm': 'att_norm',
+                'ln_1': 'att_norm',
+                // MHA core
+                'attention': 'attn',
+                'self_attention': 'attn',
+                'self_attn': 'attn',
+                // Post-attention / pre-FFN norm
+                'post_attention_layernorm': 'ffn_norm',
+                'pre_ffn_norm': 'ffn_norm',
+                'ln_2': 'ffn_norm',
+                // Cross-attention norm (encoder-decoder)
+                'cross_attn_norm': 'cross_norm',
+                'encoder_attn_layer_norm': 'cross_norm',
+                // FFN projections (SwiGLU)
+                'up_proj': 'ffn_up',
+                'gate_proj': 'ffn_gate',
+                'down_proj': 'ffn_down',
+                // FFN projections (standard GELU/ReLU)
+                'fc1': 'ffn_fc1',
+                'fc2': 'ffn_down',
+                'c_fc': 'ffn_fc1',
+                'c_proj': 'ffn_down',
+                // Embedding and LM head
+                'embed_tokens': 'embedding',
+                'word_embeddings': 'embedding',
+                'wte': 'embedding',
+                'lm_head': 'lmhead',
+                // Encoder/decoder output norm
+                'final_layer_norm': 'output_norm',
+                'final_layernorm': 'output_norm',
+                'ln_f': 'output_norm',
+            };
+
             let addIdx = 0;
             D.nntrainerLayers.forEach(l => {
                 // Addition layers map to .add() calls in block methods
@@ -1488,21 +1525,32 @@
                     return;
                 }
                 const parts = l.name.split('_');
-                // Try progressively longer suffixes
-                for (let len = 1; len <= Math.min(3, parts.length); len++) {
+                // Try progressively longer suffixes (up to 4 for post_attention_layernorm)
+                const maxSuffix = Math.min(4, parts.length);
+                for (let len = 1; len <= maxSuffix; len++) {
                     const suffix = parts.slice(-len).join('_');
-                    const match = cppHandles.find(h => h.varName === suffix);
-                    if (match) { cppLineMap.set(l.name, match.line); return; }
+                    // Direct match
+                    if (handleByVar.has(suffix)) {
+                        cppLineMap.set(l.name, handleByVar.get(suffix));
+                        return;
+                    }
+                    // Alias match
+                    const alias = suffixAlias[suffix];
+                    if (alias && handleByVar.has(alias)) {
+                        cppLineMap.set(l.name, handleByVar.get(alias));
+                        return;
+                    }
                 }
-                // Try layer_type match (first occurrence not yet used)
-                const typeAlias = {'embedding_layer':'embedding','rms_norm':'output_norm'};
-                const lt = l.layer_type;
-                const match = cppHandles.find(h =>
-                    h.layerType === lt ||
-                    h.varName === (typeAlias[lt]||'')
-                );
-                if (match && !cppLineMap.has(l.name)) {
-                    cppLineMap.set(l.name, match.line);
+                // Fallback: type-based match for unique global layers
+                const typeToHandle = {
+                    'embedding_layer': 'embedding',
+                    'tie_word_embeddings': 'embedding',
+                    'rms_norm': 'output_norm',
+                    'layer_normalization': 'output_norm',
+                };
+                const fallbackVar = typeToHandle[l.layer_type];
+                if (fallbackVar && handleByVar.has(fallbackVar) && !cppLineMap.has(l.name)) {
+                    cppLineMap.set(l.name, handleByVar.get(fallbackVar));
                 }
             });
         }
