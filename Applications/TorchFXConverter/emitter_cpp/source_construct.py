@@ -412,17 +412,9 @@ def _emit_lm_head(L, s):
 
     lm_input = "norm_out"
 
-    lm_props = [
-        '"name=output_of_causallm"',
-        'withKey("unit", NUM_VOCAB)',
-        'withKey("disable_bias", "true")',
-    ]
-    if s.tie_word_embeddings:
-        lm_props.append('withKey("shared_from", "embedding0")')
-
     L.append(f"  std::vector<std::string> lmhead_props = {{")
     # Use explicit prop list since type is dynamic
-    L.append(f'    withKey("name", "output_of_causallm"),')
+    L.append(f'    withKey("name", "lm_head"),')
     L.append(f'    withKey("unit", NUM_VOCAB),')
     L.append(f'    withKey("disable_bias", "true")')
     if s.tie_word_embeddings:

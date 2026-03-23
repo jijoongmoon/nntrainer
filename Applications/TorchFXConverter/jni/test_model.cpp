@@ -71,7 +71,7 @@ void Qwen3CausalLM::constructModel() {
   // LM head
   const std::string lmhead_type = "fully_connected";
     layers.push_back(createLayer("" + lmhead_type + "", {
-      withKey("name", "output_of_causallm"),
+      withKey("name", "lm_head"),
       withKey("unit", NUM_VOCAB),
       withKey("disable_bias", "true"),
       withKey("input_layers", "output_norm")
