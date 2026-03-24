@@ -357,18 +357,39 @@ export class ConverterRunner {
                 }));
         }
 
-        // Load companion .cpp and .ini files if they exist in the same directory
-        const dir = path.dirname(filePath);
-        const baseName = path.basename(filePath, '.json');
-        let cppSource = '';
-        let iniConfig = '';
-        const cppPath = path.join(dir, baseName + '.cpp');
-        const iniPath = path.join(dir, baseName + '.ini');
-        if (fs.existsSync(cppPath)) {
-            cppSource = fs.readFileSync(cppPath, 'utf-8');
-        }
-        if (fs.existsSync(iniPath)) {
-            iniConfig = fs.readFileSync(iniPath, 'utf-8');
+        // Use embedded sources from JSON if available; fall back to companion files
+        let cppSource = data.cppSource || '';
+        let iniConfig = data.iniConfig || '';
+        if (!cppSource || !iniConfig) {
+            const dir = path.dirname(filePath);
+            // Try companion files with same basename, then scan directory
+            const baseName = path.basename(filePath, '.json');
+            const cppPath = path.join(dir, baseName + '.cpp');
+            const iniPath = path.join(dir, baseName + '.ini');
+            if (!cppSource && fs.existsSync(cppPath)) {
+                cppSource = fs.readFileSync(cppPath, 'utf-8');
+            }
+            if (!iniConfig && fs.existsSync(iniPath)) {
+                iniConfig = fs.readFileSync(iniPath, 'utf-8');
+            }
+            // If still not found, look for any .cpp/.ini in the same directory
+            if (!cppSource || !iniConfig) {
+                try {
+                    const files = fs.readdirSync(dir);
+                    if (!cppSource) {
+                        const cppFile = files.find(f => f.endsWith('.cpp'));
+                        if (cppFile) {
+                            cppSource = fs.readFileSync(path.join(dir, cppFile), 'utf-8');
+                        }
+                    }
+                    if (!iniConfig) {
+                        const iniFile = files.find(f => f.endsWith('.ini'));
+                        if (iniFile) {
+                            iniConfig = fs.readFileSync(path.join(dir, iniFile), 'utf-8');
+                        }
+                    }
+                } catch { /* ignore */ }
+            }
         }
 
         return {
