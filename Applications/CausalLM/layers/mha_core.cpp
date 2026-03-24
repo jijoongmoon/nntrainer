@@ -124,6 +124,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
        "num_heads_* are set correctly so that the `head_dim`s are all same for "
        "query / key / value";
 
+  /** Bidirectional attention (T5 encoder) */
+  bidirectional_ = std::get<props::Bidirectional>(mha_core_props).get();
+
   /** Weight for Sink */
   use_sink = std::get<props::UseSink>(mha_core_props).get();
   if (use_sink) {
@@ -309,7 +312,14 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor output_step = output.getSharedDataTensor(
       output_step_dim, batch * output_dim.getFeatureLen(), true);
 
-    if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    if (bidirectional_) {
+      // T5 encoder: bidirectional (full) attention — use standard matmul path
+      one_batch_bidirectional_forwarding(
+        batch, _from, from, to, query_step, key_step, value_step, output_step,
+        cache_key, cache_value, cache_key_dim, cache_key_step_dim,
+        cache_value_dim, cache_value_step_dim);
+    } else if (query_step.getDataType() ==
+               ml::train::TensorDim::DataType::FP32) {
 #if ENABLE_FP16 && defined(__ANDROID__)
       nntrainer::TensorDim Q_step_dim = query_step_dim;
       nntrainer::TensorDim K_step_dim = key_step_dim;
@@ -580,34 +590,52 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                   gqa_size, head_dim, pool);
 
   // Add position bias to attention scores before softmax (T5-style).
-  // out_ shape: (1, 1, key_len, num_heads) for single token.
   // position_bias shape: (B, num_heads, query_len, key_len).
-  // For single token: extract (1, num_heads, 1, key_len) → transpose to
-  // (1, 1, key_len, num_heads) and add.
-  if (position_bias_ptr && (to - from) == 1) {
+  if (position_bias_ptr &&
+      out_.getDataType() == ml::train::TensorDim::DataType::FP32) {
     auto bias_dim = position_bias_ptr->getDim();
-    unsigned int key_len = to;
-    // Extract bias for this batch and query position
-    // bias shape: (B, num_heads, query_len, key_len)
-    // For incremental (seq=1): use bias[:, :, _from, :key_len]
-    // Reshape to match out_ layout: (1, 1, key_len, num_heads)
     unsigned int n_heads = bias_dim.channel();
+    unsigned int bias_qlen = bias_dim.height();
     unsigned int bias_klen = bias_dim.width();
-    unsigned int q_pos = _from < bias_dim.height() ? _from : bias_dim.height() - 1;
+    float *out_data = out_.getData<float>();
+    const float *bias_data = position_bias_ptr->getData<float>();
+    unsigned int bias_batch_offset =
+      batch * n_heads * bias_qlen * bias_klen;
 
-    if (out_.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      float *out_data = out_.getData<float>();
-      const float *bias_data = position_bias_ptr->getData<float>();
-      // bias layout: [batch][num_heads][query_len][key_len]
-      unsigned int bias_batch_offset = batch * n_heads * bias_dim.height() * bias_klen;
+    unsigned int seq_len = to - from;
+
+    if (seq_len == 1) {
+      // Single-token incremental: out_ = (1, 1, to, num_heads_Q)
+      unsigned int key_len = to;
+      unsigned int q_pos =
+        _from < bias_qlen ? _from : bias_qlen - 1;
       for (unsigned int k = 0; k < key_len && k < bias_klen; ++k) {
         for (unsigned int h = 0; h < n_heads && h < num_heads_Q; ++h) {
-          // bias index: batch_offset + h * (q_len * k_len) + q_pos * k_len + k
           float bias_val = bias_data[bias_batch_offset +
-                                     h * bias_dim.height() * bias_klen +
+                                     h * bias_qlen * bias_klen +
                                      q_pos * bias_klen + k];
-          // out_ index: k * num_heads_Q + h
           out_data[k * num_heads_Q + h] += bias_val;
+        }
+      }
+    } else {
+      // Full-sequence (initial forwarding): out_ uses triangular layout.
+      // For causal attention, query q attends to keys 0..from+q.
+      // out_ rows for query q: [calc_attn_index(from+q) -
+      //   calc_attn_index(from)] .. [calc_attn_index(from+q+1) -
+      //   calc_attn_index(from))
+      for (unsigned int q = 0; q < seq_len; ++q) {
+        size_t start_row =
+          calc_attn_index(from + q) - calc_attn_index(from);
+        unsigned int key_len = from + q + 1;
+        unsigned int q_pos =
+          (_from + q) < bias_qlen ? (_from + q) : bias_qlen - 1;
+        for (unsigned int k = 0; k < key_len && k < bias_klen; ++k) {
+          for (unsigned int h = 0; h < n_heads && h < num_heads_Q; ++h) {
+            float bias_val = bias_data[bias_batch_offset +
+                                       h * bias_qlen * bias_klen +
+                                       q_pos * bias_klen + k];
+            out_data[(start_row + k) * num_heads_Q + h] += bias_val;
+          }
         }
       }
     }
@@ -728,6 +756,168 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 from, num_heads_KV, gqa_size, head_dim, to,
                                 pool);
+}
+
+void MHACoreLayer::one_batch_bidirectional_forwarding(
+  const unsigned int batch, const unsigned int _from, const unsigned int from,
+  const unsigned int to, nntrainer::Tensor &query_step,
+  nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
+  nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_key,
+  nntrainer::Tensor &cache_value, ml::train::TensorDim &cache_key_dim,
+  ml::train::TensorDim &cache_key_step_dim,
+  ml::train::TensorDim &cache_value_dim,
+  ml::train::TensorDim &cache_value_step_dim) {
+
+  /**
+   * Bidirectional (full) attention — no causal mask.
+   * Used for T5 encoder where every position attends to all positions.
+   *
+   * Steps:
+   *   1. Store K/V in cache (no RoPE for T5)
+   *   2. Reshape Q/K per head: (seq, num_heads*head_dim) →
+   *      per-head view
+   *   3. Q @ K^T → attention scores (full matrix, NOT triangular)
+   *   4. Add position bias if available
+   *   5. Softmax (full row, no causal masking)
+   *   6. scores @ V → output
+   */
+
+  /** 1. Store K/V in cache (copy, no RoPE) */
+  nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
+    cache_key_step_dim,
+    batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);
+  nntrainer::Tensor b_cache_value_step = cache_value.getSharedDataTensor(
+    cache_value_step_dim,
+    batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
+    true);
+
+  b_cache_key_step.copyData(key_step);
+  b_cache_value_step.copyData(value_step);
+
+  ml::train::TensorDim cached_key_dim = cache_key_dim;
+  ml::train::TensorDim cached_value_dim = cache_value_dim;
+  cached_key_dim.height(to);
+  cached_value_dim.height(to);
+
+  nntrainer::Tensor b_cached_key = cache_key.getSharedDataTensor(
+    cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
+  nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
+    cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
+
+  unsigned int query_len = to - from;
+  unsigned int key_len = to;
+  unsigned int gqa_size = num_heads_Q / num_heads_KV;
+
+  /** 2-3. Compute Q @ K^T per head using standard matmul.
+   *
+   * query_step: (1, 1, query_len, num_heads_Q * head_dim)
+   * b_cached_key: (1, 1, key_len, num_heads_KV * head_dim)
+   *
+   * We compute attention scores in layout:
+   *   (1, 1, query_len * key_len, num_heads_Q)
+   * matching the convention in compute_kcaches for consistency.
+   */
+  float inv_sqrt_head_dim = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  nntrainer::Tensor scores(
+    1, 1, query_len * key_len, num_heads_Q,
+    query_step.getTensorType());
+
+  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    float *q_data = query_step.getData<float>();
+    float *k_data = b_cached_key.getData<float>();
+    float *s_data = scores.getData<float>();
+
+    // For each query position and key position, compute dot product per head
+    for (unsigned int q = 0; q < query_len; ++q) {
+      for (unsigned int k = 0; k < key_len; ++k) {
+        for (unsigned int h = 0; h < num_heads_Q; ++h) {
+          unsigned int kv_h = h / gqa_size;  // GQA mapping
+          float dot = 0.0f;
+          const float *q_ptr =
+            q_data + q * num_heads_Q * head_dim + h * head_dim;
+          const float *k_ptr =
+            k_data + k * num_heads_KV * head_dim + kv_h * head_dim;
+          for (unsigned int d = 0; d < head_dim; ++d) {
+            dot += q_ptr[d] * k_ptr[d];
+          }
+          s_data[(q * key_len + k) * num_heads_Q + h] =
+            dot * inv_sqrt_head_dim;
+        }
+      }
+    }
+  }
+
+  /** 4. Add position bias if available */
+  if (position_bias_ptr &&
+      scores.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    auto bias_dim = position_bias_ptr->getDim();
+    unsigned int n_heads = bias_dim.channel();
+    unsigned int bias_qlen = bias_dim.height();
+    unsigned int bias_klen = bias_dim.width();
+    float *s_data = scores.getData<float>();
+    const float *bias_data = position_bias_ptr->getData<float>();
+    unsigned int bias_batch_offset =
+      batch * n_heads * bias_qlen * bias_klen;
+
+    for (unsigned int q = 0; q < query_len; ++q) {
+      unsigned int q_pos =
+        (_from + q) < bias_qlen ? (_from + q) : bias_qlen - 1;
+      for (unsigned int k = 0; k < key_len && k < bias_klen; ++k) {
+        for (unsigned int h = 0; h < n_heads && h < num_heads_Q; ++h) {
+          float bias_val = bias_data[bias_batch_offset +
+                                     h * bias_qlen * bias_klen +
+                                     q_pos * bias_klen + k];
+          s_data[(q * key_len + k) * num_heads_Q + h] += bias_val;
+        }
+      }
+    }
+  }
+
+  /** 5. Full softmax (no causal masking) — per query row */
+  if (scores.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    float *s_data = scores.getData<float>();
+    for (unsigned int q = 0; q < query_len; ++q) {
+      // Softmax over key_len entries, for each head independently.
+      // scores layout: [q * key_len + k] * num_heads_Q + h
+      size_t row_start = q * key_len * num_heads_Q;
+      nntrainer::softmax_row_inplace(
+        s_data + row_start, 0, key_len, num_heads_Q);
+    }
+  }
+
+  /** 6. Compute scores @ V → output per head
+   *
+   * scores: (query_len * key_len, num_heads_Q) — row-major by (q,k)
+   * b_cached_value: (1, 1, key_len, num_heads_KV * head_dim)
+   * output: (1, 1, query_len, num_heads_Q * head_dim)
+   */
+  if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    float *s_data = scores.getData<float>();
+    float *v_data = b_cached_value.getData<float>();
+    float *o_data = attention_output_step.getData<float>();
+
+    // Zero output
+    std::memset(o_data, 0,
+                query_len * num_heads_Q * head_dim * sizeof(float));
+
+    for (unsigned int q = 0; q < query_len; ++q) {
+      for (unsigned int k = 0; k < key_len; ++k) {
+        for (unsigned int h = 0; h < num_heads_Q; ++h) {
+          unsigned int kv_h = h / gqa_size;
+          float attn_weight =
+            s_data[(q * key_len + k) * num_heads_Q + h];
+          const float *v_ptr =
+            v_data + k * num_heads_KV * head_dim + kv_h * head_dim;
+          float *o_ptr =
+            o_data + q * num_heads_Q * head_dim + h * head_dim;
+          for (unsigned int d = 0; d < head_dim; ++d) {
+            o_ptr[d] += attn_weight * v_ptr[d];
+          }
+        }
+      }
+    }
+  }
 }
 
 /************************************************************** */

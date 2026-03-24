@@ -359,6 +359,8 @@ def _emit_attention_layers(lines, b0, s, prefix, op_input, norm_type):
     lines.append(f"num_heads_kv = {s.num_kv_heads}")
     if attn.has_rope and s.rope_theta:
         lines.append(f"rope_theta = {int(s.rope_theta)}")
+    if b0.block_role == "encoder":
+        lines.append("bidirectional = true")
     if attn.use_sliding_window:
         sw = attn.sliding_window or s.sliding_window
         if sw:
