@@ -189,6 +189,10 @@ class JsonEmitter(BaseEmitter):
                     "num_kv_heads": attn.num_kv_heads,
                     "head_dim": attn.head_dim,
                 }
+                if attn.use_sliding_window:
+                    b["attention"]["use_sliding_window"] = True
+                    if attn.sliding_window:
+                        b["attention"]["sliding_window"] = attn.sliding_window
                 if attn.q_norm:
                     b["attention"]["q_norm"] = attn.q_norm
                 if attn.k_norm:

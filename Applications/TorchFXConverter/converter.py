@@ -199,13 +199,26 @@ def convert_model(model_name_or_path, output_dir, formats=None,
             print(f"  INI config: {ini_path} ({len(ini_text)} bytes)")
 
     if "json" in formats:
+        from vscode_bridge import serialize_fx_graph, build_node_mapping
         json_str = emit_json_string(layers, structure, indent=2)
         json_path = os.path.join(output_dir, filenames["json"])
         with open(json_path, "w") as f:
             f.write(json_str)
         outputs["json"] = json_path
+
+        # Also emit visualizer-ready JSON with FX graph + node mapping
+        viz_data = json.loads(json_str)
+        viz_data["fxGraph"] = serialize_fx_graph(result.graph)
+        viz_data["nodeMapping"] = build_node_mapping(
+            layers, result.graph, result.collapsed_rope_layers)
+        viz_path = os.path.join(output_dir, "conversion_result.json")
+        with open(viz_path, "w") as f:
+            json.dump(viz_data, f, indent=2, default=str)
+        outputs["visualizer_json"] = viz_path
+
         if verbose:
             print(f"  JSON config: {json_path} ({len(json_str)} bytes)")
+            print(f"  Visualizer JSON: {viz_path} (with FX graph)")
 
     if "weights" in formats:
         wc = WeightConverter(layers)

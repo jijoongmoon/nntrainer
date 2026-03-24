@@ -320,30 +320,42 @@ export class ConverterRunner {
             shared_from: l.shared_from || '',
         }));
 
-        // Build synthetic fxGraph from layers (converter output doesn't have FX graph)
-        // Create nodes that mirror the NN layers so both panes show something useful
-        const fxGraph = data.layers
-            .filter((l: any) => l.type !== 'input')
-            .map((l: any) => ({
-                name: l.name,
-                op: l.hf_module_name ? 'call_module' : 'call_function',
-                target: l.hf_module_name || l.type,
-                args: l.input_layers || [],
-                output_shape: null,
-                module_type: l.hf_module_type || null,
-                scope: '',
-                meta: {},
-            }));
-
-        // Build node mapping: each non-input layer maps to itself
-        const nodeMapping = data.layers
-            .filter((l: any) => l.type !== 'input')
-            .map((l: any) => ({
-                fxNodeName: l.name,
-                nntrainerLayerName: l.name,
-                hfModuleName: l.hf_module_name || '',
-                mappingType: 'direct' as const,
-            }));
+        // Use real FX graph if available (converter.py now emits it);
+        // otherwise build a synthetic graph mirroring the NN layers
+        let fxGraph: any[];
+        let nodeMapping: any[];
+        if (data.fxGraph && Array.isArray(data.fxGraph)) {
+            fxGraph = data.fxGraph;
+            nodeMapping = data.nodeMapping || data.layers
+                .filter((l: any) => l.type !== 'input')
+                .map((l: any) => ({
+                    fxNodeName: l.name,
+                    nntrainerLayerName: l.name,
+                    hfModuleName: l.hf_module_name || '',
+                    mappingType: 'direct' as const,
+                }));
+        } else {
+            fxGraph = data.layers
+                .filter((l: any) => l.type !== 'input')
+                .map((l: any) => ({
+                    name: l.name,
+                    op: l.hf_module_name ? 'call_module' : 'call_function',
+                    target: l.hf_module_name || l.type,
+                    args: l.input_layers || [],
+                    output_shape: null,
+                    module_type: l.hf_module_type || null,
+                    scope: '',
+                    meta: {},
+                }));
+            nodeMapping = data.layers
+                .filter((l: any) => l.type !== 'input')
+                .map((l: any) => ({
+                    fxNodeName: l.name,
+                    nntrainerLayerName: l.name,
+                    hfModuleName: l.hf_module_name || '',
+                    mappingType: 'direct' as const,
+                }));
+        }
 
         // Load companion .cpp and .ini files if they exist in the same directory
         const dir = path.dirname(filePath);
