@@ -150,6 +150,19 @@ public:
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
 };
 
+/**
+ * @brief Bidirectional property — enables full (non-causal) attention.
+ * When true, the layer computes attention over ALL positions (no causal mask).
+ * Used for T5/mT5 encoder blocks.
+ */
+class Bidirectional : public nntrainer::Property<bool> {
+public:
+  Bidirectional(bool value = false) { set(value); };
+  static constexpr const char *key =
+    "bidirectional";                          /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag; /**< property type */
+};
+
 }; // namespace props
 
 /**
@@ -286,7 +299,8 @@ private:
     nntrainer::props::AverageAttentionWeight, nntrainer::props::MaxTimestep,
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
-    props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings>
+    props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
+    props::Bidirectional>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -303,6 +317,7 @@ private:
   float theta;
   size_t local_window_size;
   bool use_sink = false;
+  bool bidirectional_ = false;
 
   enum INOUT_INDEX {
     /** input index */
@@ -393,6 +408,21 @@ private:
   void compute(const float *A, const BType *B, float *output, int num_rows,
                int N, int chunk_size, int group_size, int tile_size,
                bool process_all);
+
+  /**
+   * @brief Bidirectional (full) attention for one batch.
+   * Used when bidirectional_=true (e.g. T5 encoder).
+   * Uses standard matmul: Q@K^T → +bias → softmax → @V
+   */
+  void one_batch_bidirectional_forwarding(
+    const unsigned int batch, const unsigned int _from, const unsigned int from,
+    const unsigned int to, nntrainer::Tensor &query_step,
+    nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
+    nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_key,
+    nntrainer::Tensor &cache_value, ml::train::TensorDim &cache_key_dim,
+    ml::train::TensorDim &cache_key_step_dim,
+    ml::train::TensorDim &cache_value_dim,
+    ml::train::TensorDim &cache_value_step_dim);
 
   void compute_kcaches(nntrainer::Tensor &in, nntrainer::Tensor &cache,
                        nntrainer::Tensor &out, unsigned int from,

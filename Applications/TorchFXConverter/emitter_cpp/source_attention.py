@@ -142,6 +142,9 @@ def emit_attention_method(cname, block, arch_type="decoder_only",
         mha_props.append('withKey("rope_theta", ROPE_THETA)')
         mha_props.append(
             'withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS)')
+    if not is_decoder:
+        # Encoder attention: bidirectional (full, non-causal)
+        mha_props.append('withKey("bidirectional", "true")')
     if is_decoder:
         mha_props.append('withKey("max_new_tokens", NUM_TO_GENERATE)')
 
