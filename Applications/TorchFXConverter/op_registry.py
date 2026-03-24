@@ -269,6 +269,7 @@ METHOD_NOOP_NAMES = frozenset({
     "type_as", "expand",
     "size", "dim", "numel",
     "new_ones", "new_zeros", "new_full", "new_empty",
+    "copy_",  # in-place state buffer update (e.g. LFM2 conv state)
     "fill_", "zero_", "masked_fill", "masked_fill_",
     "__bool__", "__or__", "__and__",
     "__xor__", "__invert__", "__eq__", "__setitem__",
