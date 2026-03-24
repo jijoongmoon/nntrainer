@@ -76,6 +76,25 @@ def extract_config_metadata(structure, config):
             structure.norm_eps = safe_cfg_float(
                 vision_cfg, "layer_norm_eps", "rms_norm_eps")
 
+    # T5 relative position bias config
+    structure.relative_attention_num_buckets = safe_cfg_int(
+        config, "relative_attention_num_buckets", default=0)
+    structure.relative_attention_max_distance = safe_cfg_int(
+        config, "relative_attention_max_distance", default=0)
+
+    # Encoder-decoder layer counts
+    num_layers = safe_cfg_int(config, "num_layers", "num_hidden_layers",
+                              default=0)
+    num_decoder_layers = safe_cfg_int(config, "num_decoder_layers", default=0)
+    if structure.model_type in ("t5", "mt5", "bart", "mbart",
+                                "pegasus", "marian"):
+        structure.num_encoder_layers = num_layers or structure.num_layers
+        structure.num_decoder_layers = (num_decoder_layers
+                                        or structure.num_encoder_layers)
+        if not structure.num_layers:
+            structure.num_layers = (structure.num_encoder_layers
+                                    + structure.num_decoder_layers)
+
     # SSM / Mamba config
     structure.ssm_state_size = safe_cfg_int(
         config, "state_size", "ssm_state_size", default=0)

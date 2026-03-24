@@ -13,6 +13,7 @@ CUSTOM_LAYER_CLASS = {
     "mha_core": "MHACoreLayer",
     "swiglu": "SwiGLULayer",
     "short_conv": "ShortConvLayer",
+    "relative_position_bias": "RelativePositionBiasLayer",
 }
 
 # C++ class name -> header file mapping
@@ -24,6 +25,7 @@ CUSTOM_LAYER_HEADER = {
     "MHACoreLayer": "mha_core.h",
     "SwiGLULayer": "swiglu.h",
     "ShortConvLayer": "short_conv.h",
+    "RelativePositionBiasLayer": "relative_position_bias.h",
 }
 
 
@@ -52,6 +54,8 @@ def collect_custom_layer_classes(structure, norm_type, attn_block):
         classes.add("MHACoreLayer")
         if attn_block.attention.has_qk_norm:
             classes.add("ReshapedRMSNormLayer")
+        if attn_block.attention.has_relative_position_bias:
+            classes.add("RelativePositionBiasLayer")
 
     for b in s.blocks:
         if b.ffn and b.ffn.ffn_type == "swiglu":

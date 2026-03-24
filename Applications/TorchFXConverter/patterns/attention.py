@@ -40,6 +40,9 @@ def detect_attention(block_idx, attn_scope, block_layers, all_layers, config):
     # RoPE detection
     _detect_rope(attn, attn_scope, all_layers, config)
 
+    # T5-style relative position bias detection
+    _detect_relative_position_bias(attn, config)
+
     # Attention type classification
     _classify_attention_type(attn, config)
 
@@ -118,6 +121,16 @@ def _detect_rope(attn, attn_scope, all_layers, config):
                                              rope_params.get("base", 0))
         if rope_theta and rope_theta > 0:
             attn.has_rope = True
+
+
+def _detect_relative_position_bias(attn, config):
+    """Detect T5-style relative position bias from config."""
+    if config is None:
+        return
+    num_buckets = getattr(config, "relative_attention_num_buckets", 0)
+    max_distance = getattr(config, "relative_attention_max_distance", 0)
+    if num_buckets and max_distance:
+        attn.has_relative_position_bias = True
 
 
 def _classify_attention_type(attn, config):

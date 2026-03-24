@@ -976,6 +976,37 @@ def _add_input_layers_and_shape_info(layers, graph, input_kwargs):
                     layer.properties["start_index"] = idx + 1
                     layer.properties["end_index"] = idx + 2
                     break
+                elif isinstance(idx, slice) and idx != slice(None):
+                    # Range slicing: tensor[:, :seq_len] →
+                    # slice(None, seq_len) or slice(start, stop)
+                    nn_axis = ax + (4 - input_rank)
+                    nn_axis = max(1, min(3, nn_axis))
+                    start = idx.start if idx.start is not None else 0
+                    stop = idx.stop
+                    if stop is None:
+                        # open-ended slice like tensor[start:] — need
+                        # input shape to resolve
+                        in_shape = (input_node.meta.get('output_shape')
+                                    if input_node else None)
+                        if in_shape and ax < len(in_shape):
+                            stop = in_shape[ax]
+                        else:
+                            break
+                    if start < 0 or stop < 0:
+                        in_shape = (input_node.meta.get('output_shape')
+                                    if input_node else None)
+                        if in_shape and ax < len(in_shape):
+                            if start < 0:
+                                start = in_shape[ax] + start
+                            if stop < 0:
+                                stop = in_shape[ax] + stop
+                        else:
+                            break
+                    # NNTrainer slice: 1-based, end is exclusive
+                    layer.properties["axis"] = nn_axis
+                    layer.properties["start_index"] = start + 1
+                    layer.properties["end_index"] = stop + 1
+                    break
         elif isinstance(index_arg, int):
             # Simple integer indexing on first non-batch dim
             nn_axis = 1 + (4 - input_rank)
@@ -983,6 +1014,22 @@ def _add_input_layers_and_shape_info(layers, graph, input_kwargs):
             layer.properties["axis"] = nn_axis
             layer.properties["start_index"] = index_arg + 1
             layer.properties["end_index"] = index_arg + 2
+        elif isinstance(index_arg, slice) and index_arg != slice(None):
+            # Simple 1D range slice: tensor[start:stop]
+            nn_axis = 1 + (4 - input_rank)
+            nn_axis = max(1, min(3, nn_axis))
+            start = index_arg.start if index_arg.start is not None else 0
+            stop = index_arg.stop
+            if stop is None:
+                in_shape = (input_node.meta.get('output_shape')
+                            if input_node else None)
+                if in_shape and len(in_shape) > 0:
+                    stop = in_shape[0]
+                else:
+                    continue
+            layer.properties["axis"] = nn_axis
+            layer.properties["start_index"] = start + 1
+            layer.properties["end_index"] = stop + 1
 
     # Fix gather axis: convert PyTorch dim to NCHW axis (1-3)
     for layer in layers:

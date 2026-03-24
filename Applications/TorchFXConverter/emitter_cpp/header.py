@@ -260,6 +260,11 @@ def _emit_member_variables(L, s, attn_block):
     L.append(f"  std::string NORM_EPS = \"{s.norm_eps or 1e-6}\";")
     if s.rope_theta:
         L.append(f"  unsigned int ROPE_THETA = {int(s.rope_theta)};")
+    if s.relative_attention_num_buckets:
+        L.append(f"  unsigned int REL_ATTENTION_NUM_BUCKETS = "
+                 f"{s.relative_attention_num_buckets};")
+        L.append(f"  unsigned int REL_ATTENTION_MAX_DISTANCE = "
+                 f"{s.relative_attention_max_distance};")
     L.append(f"  bool TIE_WORD_EMBEDDINGS = "
              f"{'true' if s.tie_word_embeddings else 'false'};")
 
