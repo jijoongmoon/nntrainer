@@ -81,7 +81,7 @@ protected:
   int GQA_SIZE = 2;
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int INIT_SEQ_LEN = 0;
-  unsigned int NUM_TO_GENERATE = 0;
+  unsigned int NUM_TO_GENERATE = 1;
   unsigned int MAX_POSITION_EMBEDDINGS = 128;
 };
 

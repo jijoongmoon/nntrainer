@@ -97,6 +97,14 @@ def emit_register_custom_layers(cname, custom_classes):
     """
     L = []
 
+    # Emit static factory wrappers to resolve SFINAE template deduction
+    for cls in custom_classes:
+        L.append(f"static std::unique_ptr<nntrainer::Layer>")
+        L.append(f"_make_{cls}(const std::vector<std::string> &p) {{")
+        L.append(f"  return nntrainer::createLayer<causallm::{cls}>(p);")
+        L.append(f"}}")
+
+    L.append(f"")
     L.append(f"void {cname}::registerCustomLayers() {{")
     L.append(f"  auto &ct_engine = nntrainer::Engine::Global();")
     L.append(f'  auto app_context =')
@@ -106,8 +114,8 @@ def emit_register_custom_layers(cname, custom_classes):
     L.append(f"  try {{")
 
     for cls in custom_classes:
-        L.append(f"    app_context->registerFactory("
-                 f"nntrainer::createLayer<causallm::{cls}>);")
+        L.append(f"    app_context->registerFactory<nntrainer::Layer>"
+                 f"(_make_{cls});")
 
     L.append(f"  }} catch (std::invalid_argument &e) {{")
     L.append(f'    std::cerr << "failed to register factory, reason: " '

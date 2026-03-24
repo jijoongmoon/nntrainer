@@ -249,17 +249,39 @@ std::vector<LayerHandle> Qwen3CausalLM::createMlp(
   return layers;
 }
 
+// Static factory wrappers to resolve SFINAE template deduction
+static std::unique_ptr<nntrainer::Layer>
+_make_EmbeddingLayer(const std::vector<std::string> &p) {
+  return nntrainer::createLayer<causallm::EmbeddingLayer>(p);
+}
+static std::unique_ptr<nntrainer::Layer>
+_make_MHACoreLayer(const std::vector<std::string> &p) {
+  return nntrainer::createLayer<causallm::MHACoreLayer>(p);
+}
+static std::unique_ptr<nntrainer::Layer>
+_make_RMSNormLayer(const std::vector<std::string> &p) {
+  return nntrainer::createLayer<causallm::RMSNormLayer>(p);
+}
+static std::unique_ptr<nntrainer::Layer>
+_make_ReshapedRMSNormLayer(const std::vector<std::string> &p) {
+  return nntrainer::createLayer<causallm::ReshapedRMSNormLayer>(p);
+}
+static std::unique_ptr<nntrainer::Layer>
+_make_SwiGLULayer(const std::vector<std::string> &p) {
+  return nntrainer::createLayer<causallm::SwiGLULayer>(p);
+}
+
 void Qwen3CausalLM::registerCustomLayers() {
   auto &ct_engine = nntrainer::Engine::Global();
   auto app_context =
     static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
   try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::EmbeddingLayer>);
-    app_context->registerFactory(nntrainer::createLayer<causallm::MHACoreLayer>);
-    app_context->registerFactory(nntrainer::createLayer<causallm::RMSNormLayer>);
-    app_context->registerFactory(nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-    app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
+    app_context->registerFactory<nntrainer::Layer>(_make_EmbeddingLayer);
+    app_context->registerFactory<nntrainer::Layer>(_make_MHACoreLayer);
+    app_context->registerFactory<nntrainer::Layer>(_make_RMSNormLayer);
+    app_context->registerFactory<nntrainer::Layer>(_make_ReshapedRMSNormLayer);
+    app_context->registerFactory<nntrainer::Layer>(_make_SwiGLULayer);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what() << std::endl;
   }

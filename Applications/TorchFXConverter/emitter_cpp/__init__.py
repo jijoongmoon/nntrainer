@@ -101,7 +101,7 @@ class CppEmitter(BaseEmitter):
             L.append(f"")
         L.append(f"using ml::train::createLayer;")
         L.append(f"using ml::train::Tensor;")
-        L.append(f"using LayerHandle = ml::train::LayerHandle;")
+        L.append(f"using LayerHandle = std::shared_ptr<ml::train::Layer>;")
         L.append(f"")
 
         # withKey helper templates
@@ -111,12 +111,14 @@ class CppEmitter(BaseEmitter):
         L.append("}")
         L.append("")
         L.append("template <>")
+        L.append('[[maybe_unused]]')
         L.append('std::string withKey(const std::string &key, '
                  'std::string val) {')
         L.append('  return key + "=" + val;')
         L.append("}")
         L.append("")
         L.append("template <>")
+        L.append('[[maybe_unused]]')
         L.append('std::string withKey(const std::string &key, '
                  'const char *val) {')
         L.append('  return key + "=" + std::string(val);')

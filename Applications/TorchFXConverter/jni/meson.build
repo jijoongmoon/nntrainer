@@ -59,3 +59,20 @@ foreach m : converter_test_models
     )
   endif
 endforeach
+
+# Inference verification executable (uses pre-built test_model for now)
+_inf_src = meson.current_source_dir() / 'test_model.cpp'
+if fs.exists(_inf_src)
+  executable('converter_qwen3_verify_inference',
+    [
+      meson.current_source_dir() / 'main_inference.cpp',
+      _inf_src,
+    ],
+    include_directories: converter_test_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, converter_layer_deps],
+    cpp_args: [
+      '-DGENERATED_MODEL_CLASS=Qwen3CausalLM',
+      '-DGENERATED_MODEL_HEADER="test_model.h"',
+    ],
+  )
+endif
