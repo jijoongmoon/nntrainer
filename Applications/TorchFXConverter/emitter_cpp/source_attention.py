@@ -4,12 +4,20 @@ from .helpers import _cpp_tensor_layer, _class_name
 
 
 def emit_attention_method(cname, block, arch_type="decoder_only",
-                          external_kv_cache=False):
+                          external_kv_cache=False, structure=None):
     """Generate createAttention() method body using Tensor flow."""
     attn = block.attention
     is_decoder = arch_type in ("decoder_only", "encoder_decoder")
     has_qk_norm = attn.has_qk_norm
     has_rope = attn.has_rope
+    # Detect mixed sliding/full attention (e.g. Qwen3 layer_types)
+    has_mixed_sliding = False
+    if structure and structure.blocks:
+        sliding_flags = [
+            bool(b.attention and b.attention.use_sliding_window)
+            for b in structure.blocks
+        ]
+        has_mixed_sliding = any(sliding_flags) and not all(sliding_flags)
     L = []
 
     L.append(f"Tensor")
@@ -101,10 +109,17 @@ def emit_attention_method(cname, block, arch_type="decoder_only",
         mha_props.append(
             'withKey("max_timestep", std::to_string(INIT_SEQ_LEN + '
             'NUM_TO_GENERATE))')
-        mha_props.append('withKey("sliding_window", SLIDING_WINDOW)')
     else:
         mha_props.append(
             'withKey("max_timestep", std::to_string(INIT_SEQ_LEN))')
+    if has_mixed_sliding:
+        # Per-layer sliding window: use LAYER_TYPES to decide at runtime
+        mha_props.append(
+            'withKey("sliding_window", '
+            '(LAYER_TYPES[layer_id] == "sliding_attention") '
+            '? SLIDING_WINDOW : UINT_MAX)')
+    elif attn.use_sliding_window:
+        mha_props.append('withKey("sliding_window", SLIDING_WINDOW)')
     if has_rope:
         mha_props.append('withKey("rope_theta", ROPE_THETA)')
         mha_props.append(

@@ -175,7 +175,8 @@ class CppEmitter(BaseEmitter):
         if representative and representative.attention:
             L.append(emit_attention_method(
                 cname, representative, arch_type=s.arch_type,
-                external_kv_cache=s.external_kv_cache))
+                external_kv_cache=s.external_kv_cache,
+                structure=s))
         if representative and representative.ffn:
             L.append(emit_ffn_method(
                 cname, representative, self._layers_by_name))
@@ -191,7 +192,8 @@ class CppEmitter(BaseEmitter):
         if attn_block:
             L.append(emit_attention_method(
                 cname, attn_block, arch_type=s.arch_type,
-                external_kv_cache=s.external_kv_cache))
+                external_kv_cache=s.external_kv_cache,
+                structure=s))
 
         representative = next((b for b in s.blocks if b.ffn), None)
         if representative:
