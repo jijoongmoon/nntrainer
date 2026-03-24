@@ -199,26 +199,13 @@ def convert_model(model_name_or_path, output_dir, formats=None,
             print(f"  INI config: {ini_path} ({len(ini_text)} bytes)")
 
     if "json" in formats:
-        from vscode_bridge import serialize_fx_graph, build_node_mapping
         json_str = emit_json_string(layers, structure, indent=2)
         json_path = os.path.join(output_dir, filenames["json"])
         with open(json_path, "w") as f:
             f.write(json_str)
         outputs["json"] = json_path
-
-        # Also emit visualizer-ready JSON with FX graph + node mapping
-        viz_data = json.loads(json_str)
-        viz_data["fxGraph"] = serialize_fx_graph(result.graph)
-        viz_data["nodeMapping"] = build_node_mapping(
-            layers, result.graph, result.collapsed_rope_layers)
-        viz_path = os.path.join(output_dir, "conversion_result.json")
-        with open(viz_path, "w") as f:
-            json.dump(viz_data, f, indent=2, default=str)
-        outputs["visualizer_json"] = viz_path
-
         if verbose:
             print(f"  JSON config: {json_path} ({len(json_str)} bytes)")
-            print(f"  Visualizer JSON: {viz_path} (with FX graph)")
 
     if "weights" in formats:
         wc = WeightConverter(layers)
@@ -238,6 +225,30 @@ def convert_model(model_name_or_path, output_dir, formats=None,
         outputs["weight_script"] = script_path
         if verbose:
             print(f"  Weight script: {script_path}")
+
+    # Emit visualizer-ready JSON (conversion_result.json) with FX graph,
+    # node mapping, and generated C++/INI sources for the VS Code plugin
+    from vscode_bridge import serialize_fx_graph, build_node_mapping
+    viz_data = json.loads(emit_json_string(layers, structure, indent=2))
+    viz_data["fxGraph"] = serialize_fx_graph(result.graph)
+    viz_data["nodeMapping"] = build_node_mapping(
+        layers, result.graph, result.collapsed_rope_layers)
+    # Include generated sources so visualizer shows them
+    if "cpp" in formats:
+        viz_data["cppSource"] = (
+            emit_cpp_header(layers, structure, model_name=effective_name)
+            + "\n\n"
+            + emit_cpp_source(layers, structure, model_name=effective_name)
+        )
+    if "ini" in formats:
+        viz_data["iniConfig"] = emit_ini(
+            layers, structure, batch_size=batch_size, mode="structured")
+    viz_path = os.path.join(output_dir, "conversion_result.json")
+    with open(viz_path, "w") as f:
+        json.dump(viz_data, f, indent=2, default=str)
+    outputs["visualizer_json"] = viz_path
+    if verbose:
+        print(f"  Visualizer JSON: {viz_path}")
 
     if verbose:
         print(f"\nConversion complete! Output: {output_dir}")
