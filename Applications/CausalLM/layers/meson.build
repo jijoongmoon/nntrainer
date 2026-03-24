@@ -8,6 +8,7 @@ causallm_lmhead_src_abs = [meson.current_source_dir() / 'lm_head.cpp']
 causallm_mha_core_abs = [meson.current_source_dir()/ 'mha_core.cpp']
 causallm_embedding_src_abs = [meson.current_source_dir() / 'embedding_layer.cpp']
 causallm_reshaped_rms_norm_src_abs = [meson.current_source_dir() / 'reshaped_rms_norm.cpp']
+causallm_relative_position_bias_src_abs = [meson.current_source_dir() / 'relative_position_bias.cpp']
 causallm_qkv_layer_src_abs = [meson.current_source_dir() / 'qkv_layer.cpp']
 causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_pooling_layer.cpp']
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
@@ -131,6 +132,18 @@ causallm_reshaped_rms_norm_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
+causallm_relative_position_bias = shared_library(
+    'relative_position_bias_layer',
+    causallm_relative_position_bias_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_relative_position_bias_dep = declare_dependency(
+    link_with: causallm_relative_position_bias,
+    include_directories: causallm_layer_inc
+)
 causallm_qkv_layer = shared_library(
     'qkv_layer',
     causallm_qkv_layer_src_abs,
