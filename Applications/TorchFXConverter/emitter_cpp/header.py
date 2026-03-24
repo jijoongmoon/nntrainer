@@ -269,9 +269,30 @@ def _emit_member_variables(L, s, attn_block):
 
     is_decoder = s.arch_type in ("decoder_only", "encoder_decoder")
 
-    if attn_block and is_decoder:
+    # Emit SLIDING_WINDOW if any block uses sliding window attention
+    has_sliding = attn_block and any(
+        b.attention and b.attention.use_sliding_window
+        for b in s.blocks
+    ) if s.blocks else False
+    if has_sliding or (attn_block and is_decoder):
         sw = s.sliding_window if s.sliding_window else "UINT_MAX"
         L.append(f"  unsigned int SLIDING_WINDOW = {sw};")
+
+    # For mixed sliding/full attention (e.g. Qwen3 layer_types), emit
+    # LAYER_TYPES array so createAttention can select per-block window
+    if s.blocks and attn_block:
+        sliding_flags = [
+            bool(b.attention and b.attention.use_sliding_window)
+            for b in s.blocks
+        ]
+        has_mixed = any(sliding_flags) and not all(sliding_flags)
+        if has_mixed:
+            types_str = ", ".join(
+                '"sliding_attention"' if f else '"full_attention"'
+                for f in sliding_flags
+            )
+            L.append(f"  std::vector<std::string> LAYER_TYPES = "
+                     f"{{{types_str}}};")
 
     if s.conv_l_cache:
         L.append(f"  int CONV_KERNEL_SIZE = {s.conv_l_cache};")
