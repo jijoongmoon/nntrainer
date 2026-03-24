@@ -365,6 +365,11 @@ private:
   float scale = 1.0f;
   unsigned int original_max_position_embeddings = 4096;
 
+  /** Optional position bias tensor (T5-style relative position bias).
+   *  Set by incremental_forwarding when 4th input is provided.
+   *  Shape: (B, num_heads, query_len, key_len) */
+  nntrainer::Tensor *position_bias_ptr = nullptr;
+
   /****************** ROTARY EMBEDDING *****************/
   /** static variable - they are all expected to be initialized once */
   inline static std::vector<std::vector<float>> *freqs_cos = {};

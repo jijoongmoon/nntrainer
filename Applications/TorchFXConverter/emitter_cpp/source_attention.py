@@ -97,6 +97,24 @@ def emit_attention_method(cname, block, arch_type="decoder_only",
         ], q_out)
         L.extend(lines)
 
+    # Relative position bias (T5-style)
+    has_position_bias = attn.has_relative_position_bias
+    bias_var = None
+    if has_position_bias and structure:
+        L.append(f"")
+        L.append(f"  // Relative position bias (T5-style)")
+        L.append(f'  auto Bias_name = "layer" + std::to_string(layer_id) '
+                 f'+ "_position_bias";')
+        bias_props = [
+            'withKey("name", Bias_name)',
+            f'withKey("num_heads", n_heads)',
+            f'withKey("num_buckets", REL_ATTENTION_NUM_BUCKETS)',
+            f'withKey("max_distance", REL_ATTENTION_MAX_DISTANCE)',
+        ]
+        bias_lines, bias_var = _cpp_tensor_layer(
+            "pos_bias", "relative_position_bias", bias_props, q_in)
+        L.extend(bias_lines)
+
     # MHA core
     L.append(f"")
     L.append(f"  // Attention core layer")
@@ -131,6 +149,8 @@ def emit_attention_method(cname, block, arch_type="decoder_only",
         mha_input = (f'{{{q_in}, {k_in}, {v_out}, '
                      f'key_cache_tensors[layer_id], '
                      f'val_cache_tensors[layer_id]}}')
+    elif bias_var:
+        mha_input = f'{{{q_in}, {k_in}, {v_out}, {bias_var}}}'
     else:
         mha_input = f'{{{q_in}, {k_in}, {v_out}}}'
 

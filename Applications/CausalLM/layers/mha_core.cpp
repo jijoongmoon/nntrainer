@@ -175,6 +175,12 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
 
+  /** precompute_freqs will be invoked only once.
+   *  Skip when theta is 0 (T5-style models use relative position bias
+   *  instead of RoPE). */
+  if (theta > 0.0f && freqs_cos == nullptr)
+    precompute_freqs(head_dim, max_position_embeddings, theta);
+
   /** set Output dimension! - one output */
   std::vector<nntrainer::TensorDim> output_dims(1);
   output_dims[0] = input_dims[0];
@@ -239,6 +245,17 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     context.getInput(INOUT_INDEX::VALUE); // projected value
   nntrainer::Tensor &output =
     context.getOutput(INOUT_INDEX::OUTPUT); // output to be projected
+
+  /** Optional position bias input (T5-style relative position bias).
+   *  Shape: (B, num_heads, query_len, key_len) */
+  const bool has_position_bias = context.getNumInputs() >= 4;
+  nntrainer::Tensor position_bias;
+  if (has_position_bias) {
+    position_bias = context.getInput(INOUT_INDEX::MASK);
+    position_bias_ptr = &position_bias;
+  } else {
+    position_bias_ptr = nullptr;
+  }
 
   nntrainer::Tensor &cache_key =
     context.getTensor(tensor_idx[AttentionParams::cache_key]);
@@ -516,14 +533,22 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
     true);
 
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
-
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from,
-                             false);
+  // Skip RoPE when using relative position bias (T5-style)
+  if (!position_bias_ptr) {
+    apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
+    apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from,
+                               false);
+  } else {
+    b_cache_key_step.copyData(key_step);
+  }
 
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
-                               true);
+    if (!position_bias_ptr) {
+      apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+                                 _from, true);
+    } else {
+      b_cache_value_step.copyData(value_step);
+    }
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     b_cache_value_step.copyData(value_step);
@@ -553,6 +578,40 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   compute_kcaches(query_step, b_cached_key, out_, _from, to - from, num_heads_Q,
                   gqa_size, head_dim, pool);
+
+  // Add position bias to attention scores before softmax (T5-style).
+  // out_ shape: (1, 1, key_len, num_heads) for single token.
+  // position_bias shape: (B, num_heads, query_len, key_len).
+  // For single token: extract (1, num_heads, 1, key_len) → transpose to
+  // (1, 1, key_len, num_heads) and add.
+  if (position_bias_ptr && (to - from) == 1) {
+    auto bias_dim = position_bias_ptr->getDim();
+    unsigned int key_len = to;
+    // Extract bias for this batch and query position
+    // bias shape: (B, num_heads, query_len, key_len)
+    // For incremental (seq=1): use bias[:, :, _from, :key_len]
+    // Reshape to match out_ layout: (1, 1, key_len, num_heads)
+    unsigned int n_heads = bias_dim.channel();
+    unsigned int bias_klen = bias_dim.width();
+    unsigned int q_pos = _from < bias_dim.height() ? _from : bias_dim.height() - 1;
+
+    if (out_.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      float *out_data = out_.getData<float>();
+      const float *bias_data = position_bias_ptr->getData<float>();
+      // bias layout: [batch][num_heads][query_len][key_len]
+      unsigned int bias_batch_offset = batch * n_heads * bias_dim.height() * bias_klen;
+      for (unsigned int k = 0; k < key_len && k < bias_klen; ++k) {
+        for (unsigned int h = 0; h < n_heads && h < num_heads_Q; ++h) {
+          // bias index: batch_offset + h * (q_len * k_len) + q_pos * k_len + k
+          float bias_val = bias_data[bias_batch_offset +
+                                     h * bias_dim.height() * bias_klen +
+                                     q_pos * bias_klen + k];
+          // out_ index: k * num_heads_Q + h
+          out_data[k * num_heads_Q + h] += bias_val;
+        }
+      }
+    }
+  }
 
   softmax_triangle(out_, to - from, num_heads_Q, from, pool);
 
@@ -596,14 +655,22 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
     true);
 
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
-
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from,
-                             false);
+  // Skip RoPE when using relative position bias (T5-style)
+  if (!position_bias_ptr) {
+    apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
+    apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from,
+                               false);
+  } else {
+    b_cache_key_step.copyData(key_step);
+  }
 
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
-                               true);
+    if (!position_bias_ptr) {
+      apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+                                 _from, true);
+    } else {
+      b_cache_value_step.copyData(value_step);
+    }
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     b_cache_value_step.copyData(value_step);
@@ -633,6 +700,28 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   compute_kcaches(query_step, b_cached_key, out_, _from, to - from, num_heads_Q,
                   gqa_size, head_dim, pool);
+
+  // Add position bias (same logic as non-sink variant)
+  if (position_bias_ptr && (to - from) == 1) {
+    auto bias_dim = position_bias_ptr->getDim();
+    unsigned int key_len = to;
+    unsigned int n_heads = bias_dim.channel();
+    unsigned int bias_klen = bias_dim.width();
+    unsigned int q_pos = _from < bias_dim.height() ? _from : bias_dim.height() - 1;
+    if (out_.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      float *out_data = out_.getData<float>();
+      const float *bias_data = position_bias_ptr->getData<float>();
+      unsigned int bias_batch_offset = batch * n_heads * bias_dim.height() * bias_klen;
+      for (unsigned int k = 0; k < key_len && k < bias_klen; ++k) {
+        for (unsigned int h = 0; h < n_heads && h < num_heads_Q; ++h) {
+          float bias_val = bias_data[bias_batch_offset +
+                                     h * bias_dim.height() * bias_klen +
+                                     q_pos * bias_klen + k];
+          out_data[k * num_heads_Q + h] += bias_val;
+        }
+      }
+    }
+  }
 
   softmax_triangle(out_, to - from, num_heads_Q, from, pool, sink_step);
 

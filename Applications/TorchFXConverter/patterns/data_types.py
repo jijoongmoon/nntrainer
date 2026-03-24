@@ -28,6 +28,7 @@ class AttentionPattern:
     head_dim: int = 0
     has_rope: bool = False
     has_qk_norm: bool = False
+    has_relative_position_bias: bool = False
     use_sliding_window: bool = False
     sliding_window: int = 0                 # Per-layer window size
     layer_names: list = field(default_factory=list)
@@ -125,6 +126,9 @@ class ModelStructure:
     ssm_conv_kernel: int = 0      # d_conv: causal conv kernel size
     ssm_expand: int = 0           # expansion factor
     ssm_dt_rank: int = 0          # rank of dt projection
+    # T5 relative position bias config
+    relative_attention_num_buckets: int = 0
+    relative_attention_max_distance: int = 0
 
     @property
     def encoder_blocks(self):

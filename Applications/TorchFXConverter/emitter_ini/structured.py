@@ -334,10 +334,27 @@ def _emit_attention_layers(lines, b0, s, prefix, op_input, norm_type):
         q_input = f"{prefix}_q_norm"
         k_input = f"{prefix}_k_norm"
 
+    # Relative position bias (T5-style)
+    bias_input = ""
+    if attn.has_relative_position_bias and s.relative_attention_num_buckets:
+        lines.append(f"[{prefix}_position_bias]")
+        lines.append("Type = relative_position_bias")
+        lines.append(f"num_heads = {s.num_heads}")
+        lines.append(
+            f"num_buckets = {s.relative_attention_num_buckets}")
+        lines.append(
+            f"max_distance = {s.relative_attention_max_distance}")
+        is_bidirectional = (b0.block_role != "decoder")
+        lines.append(
+            f"bidirectional = {str(is_bidirectional).lower()}")
+        lines.append("")
+        bias_input = f",{prefix}_position_bias"
+
     # MHA core
     lines.append(f"[{prefix}_attention]")
     lines.append("Type = mha_core")
-    lines.append(f"input_layers = {q_input},{k_input},{prefix}_wv")
+    lines.append(
+        f"input_layers = {q_input},{k_input},{prefix}_wv{bias_input}")
     lines.append(f"num_heads = {s.num_heads}")
     lines.append(f"num_heads_kv = {s.num_kv_heads}")
     if attn.has_rope and s.rope_theta:
