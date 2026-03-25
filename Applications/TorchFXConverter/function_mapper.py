@@ -486,9 +486,9 @@ def _map_getitem(node, scope, node_to_layer):
             hf_module_name=scope,
         )
 
-    # Case 4: Parent is a call_function that returns a tuple/list
-    # (e.g. torch.split, custom ops returning tuples).
-    if parent_node.op == "call_function":
+    # Case 4: Parent is a call_function or call_method that returns a
+    # tuple/list (e.g. torch.split, torch.chunk, Tensor.chunk, etc.).
+    if parent_node.op in ("call_function", "call_method"):
         out_type = parent_node.meta.get('output_type')
         if out_type in (tuple, list):
             return NNTrainerLayerDef(
