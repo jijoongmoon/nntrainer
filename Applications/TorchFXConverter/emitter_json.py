@@ -152,6 +152,8 @@ class JsonEmitter(BaseEmitter):
                 entry["bias_key"] = layer.bias_hf_key
             if layer.shared_from:
                 entry["shared_from"] = layer.shared_from
+            if layer.weight_split:
+                entry["weight_split"] = layer.weight_split
             weight_map.append(entry)
         return weight_map
 

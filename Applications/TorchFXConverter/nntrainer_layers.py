@@ -56,6 +56,7 @@ class NNTrainerLayerDef:
     reshape_weight_2d: bool = False           # Whether to reshape weight from 4D to 2D (conv2d)
     squeeze_weight_3d: bool = False           # Whether to squeeze weight from 3D to 2D (depthwise conv1d)
     shared_from: str = ""                     # For tied weights (e.g. tie_word_embeddings)
+    weight_split: str = ""                    # "first_half" or "second_half" for fused weight splitting
 
     def to_properties_list(self) -> list:
         """Convert to NNTrainer property string list for createLayer()."""

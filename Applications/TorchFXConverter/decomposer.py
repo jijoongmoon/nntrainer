@@ -584,6 +584,139 @@ def _find_pre_rope_input(layer_name, by_name, removable):
     return walk(layer_name)
 
 
+def _decompose_fused_swiglu(layers):
+    """Decompose fused gate+up SwiGLU into standard gate/up/swiglu/down.
+
+    Detects the pattern: FC(2N) → split → silu → multiply → FC(out)
+    and replaces it with: gate_proj(N) → up_proj(N) → swiglu → down_proj
+
+    This converts Granite-style fused shared_mlp into NNTrainer's standard
+    SwiGLU which uses separate gate/up FC layers + SwiGLU custom layer.
+    """
+    from nntrainer_layers import LAYER_FC, LAYER_ACTIVATION, NNTrainerLayerDef
+
+    by_name = {l.name: l for l in layers}
+    consumers = {}
+    for l in layers:
+        for inp in l.input_layers:
+            consumers.setdefault(inp, []).append(l.name)
+
+    replacements = []  # list of (fused_fc_name, split_name, act_name, mul_name)
+
+    for layer in layers:
+        if layer.layer_type != "split":
+            continue
+        # split's input should be a FC layer
+        if not layer.input_layers:
+            continue
+        fc_name = layer.input_layers[0]
+        fc = by_name.get(fc_name)
+        if not fc or fc.layer_type != LAYER_FC:
+            continue
+        fc_unit = int(fc.properties.get("unit", 0))
+        if fc_unit <= 0 or fc_unit % 2 != 0:
+            continue
+
+        # split's consumers should include activation and multiply
+        split_consumers = consumers.get(layer.name, [])
+        act_name = None
+        mul_name = None
+        for c_name in split_consumers:
+            c = by_name.get(c_name)
+            if not c:
+                continue
+            if c.layer_type == LAYER_ACTIVATION:
+                act_name = c_name
+            elif c.layer_type == LAYER_MULTIPLY:
+                mul_name = c_name
+
+        if not act_name or not mul_name:
+            # Also check: activation → multiply chain
+            if act_name and not mul_name:
+                act_consumers = consumers.get(act_name, [])
+                for c_name in act_consumers:
+                    c = by_name.get(c_name)
+                    if c and c.layer_type == LAYER_MULTIPLY:
+                        mul_name = c_name
+                        break
+
+        if not act_name or not mul_name:
+            continue
+
+        replacements.append((fc_name, layer.name, act_name, mul_name))
+
+    if not replacements:
+        return layers
+
+    remove_names = set()
+    new_layers = {}
+
+    for fc_name, split_name, act_name, mul_name in replacements:
+        fc = by_name[fc_name]
+        mul = by_name[mul_name]
+        half_unit = int(fc.properties.get("unit", 0)) // 2
+
+        # Determine the FFN scope for naming
+        scope = fc.hf_module_name.rsplit(".", 1)[0] if fc.hf_module_name else ""
+        prefix = fc.name.rsplit("_", 1)[0] if "_" in fc.name else fc.name
+
+        # Create gate_proj (first half of fused weight)
+        gate = NNTrainerLayerDef(
+            layer_type=LAYER_FC, name=prefix + "_gate_proj")
+        gate.properties["unit"] = str(half_unit)
+        gate.properties["disable_bias"] = "true"
+        gate.input_layers = list(fc.input_layers)
+        gate.has_weight = True
+        gate.transpose_weight = True
+        gate.weight_hf_key = fc.weight_hf_key
+        gate.weight_split = "first_half"  # custom marker
+        # Set hf_module_name so _match_fc_roles recognizes gate/up suffixes
+        gate.hf_module_name = scope + ".gate_proj"
+
+        # Create up_proj (second half of fused weight)
+        up = NNTrainerLayerDef(
+            layer_type=LAYER_FC, name=prefix + "_up_proj")
+        up.properties["unit"] = str(half_unit)
+        up.properties["disable_bias"] = "true"
+        up.input_layers = list(fc.input_layers)
+        up.has_weight = True
+        up.transpose_weight = True
+        up.weight_hf_key = fc.weight_hf_key
+        up.weight_split = "second_half"  # custom marker
+        up.hf_module_name = scope + ".up_proj"
+
+        # Create swiglu layer
+        swiglu = NNTrainerLayerDef(
+            layer_type="swiglu", name=prefix + "_swiglu")
+        swiglu.input_layers = [gate.name, up.name]
+        swiglu.hf_module_name = scope
+
+        # Rewire multiply's consumers to point to swiglu
+        for l in layers:
+            l.input_layers = [
+                swiglu.name if inp == mul_name else inp
+                for inp in l.input_layers
+            ]
+
+        new_layers[fc_name] = [gate, up, swiglu]
+        remove_names.update({fc_name, split_name, act_name, mul_name})
+
+    # Rebuild layer list
+    result = []
+    for layer in layers:
+        if layer.name in remove_names:
+            if layer.name in new_layers:
+                result.extend(new_layers[layer.name])
+            continue
+        result.append(layer)
+
+    if replacements:
+        print(f"  [FUSED-SWIGLU] Decomposed {len(replacements)} fused "
+              f"gate+up SwiGLU patterns into standard SwiGLU")
+
+    return result
+
+
 def _collapse_rope_chains(layers):
     """Remove RoPE computation and application chains from the layer graph.
 
@@ -879,6 +1012,12 @@ class AdaptiveConverter:
         if collapsed_rope:
             # Clean up any orphaned layers after RoPE removal
             layers = _remove_dead_layers(layers)
+
+        # Pass 3.97: Decompose fused gate+up SwiGLU patterns
+        # (FC → chunk/split → silu → multiply → FC) into standard SwiGLU
+        # (gate_proj + up_proj → SwiGLU → down_proj) by splitting the
+        # fused FC layer into two separate layers with halved weights.
+        layers = _decompose_fused_swiglu(layers)
 
         # Pass 4: Detect LazyTensor chain opportunities
         lazy_chains = detect_lazy_chains(layers)

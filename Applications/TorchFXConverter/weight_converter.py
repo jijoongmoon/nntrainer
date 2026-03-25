@@ -88,6 +88,9 @@ def build_weight_map(layers):
                 transform = "transpose"
             else:
                 transform = "none"
+            # Handle fused weight splitting (e.g., Granite fused gate+up)
+            if layer.weight_split:
+                transform = transform + "+" + layer.weight_split
             wmap.add(layer.weight_hf_key, layer.name, transform)
 
         # Bias
@@ -139,15 +142,34 @@ class WeightConverter:
                 tensor = state_dict[hf_key].to(target_dtype)
 
                 # Apply transformation
-                if entry["transform"] == "transpose" and tensor.dim() == 2:
+                transform = entry["transform"]
+
+                # Handle composite transforms (e.g., "transpose+first_half")
+                split_mode = None
+                if "+first_half" in transform:
+                    split_mode = "first_half"
+                    transform = transform.replace("+first_half", "")
+                elif "+second_half" in transform:
+                    split_mode = "second_half"
+                    transform = transform.replace("+second_half", "")
+
+                if transform == "transpose" and tensor.dim() == 2:
                     tensor = tensor.t().contiguous()
-                elif entry["transform"] == "reshape_2d" and tensor.dim() == 4:
+                elif transform == "reshape_2d" and tensor.dim() == 4:
                     # Conv2D: (filters, in_ch, k_h, k_w) -> (filters, in_ch*k_h*k_w)
                     filters = tensor.shape[0]
                     tensor = tensor.reshape(filters, -1).contiguous()
-                elif entry["transform"] == "squeeze_3d" and tensor.dim() == 3:
+                elif transform == "squeeze_3d" and tensor.dim() == 3:
                     # Depthwise Conv1D: (channels, 1, ksize) -> (channels, ksize)
                     tensor = tensor.squeeze(1).contiguous()
+
+                # Apply weight splitting (fused gate+up decomposition)
+                if split_mode:
+                    half = tensor.shape[0] // 2
+                    if split_mode == "first_half":
+                        tensor = tensor[:half].contiguous()
+                    else:
+                        tensor = tensor[half:].contiguous()
 
                 # Write raw bytes
                 data = tensor.cpu().numpy().tobytes()

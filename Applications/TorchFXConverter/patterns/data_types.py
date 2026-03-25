@@ -53,6 +53,7 @@ class FFNPattern:
     gate_multiply: str = ""
     intermediate_size: int = 0
     layer_names: list = field(default_factory=list)
+    fused_gate_up: str = ""                 # fused gate+up layer (Granite-style)
 
 
 @dataclass

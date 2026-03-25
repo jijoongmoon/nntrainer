@@ -154,6 +154,10 @@ def _build_standard_ffn(ffn, fc_layers, up, down, ffn_scope,
             has_split_or_multiply = True
 
     # If split/multiply ops exist (fused gate+up like Granite's shared_mlp),
-    # use generic emission to preserve the actual graph topology
+    # decompose into standard SwiGLU: the fused FC is logically
+    # gate_proj + up_proj concatenated, so halve the intermediate_size.
     if has_split_or_multiply:
-        ffn.ffn_type = "generic"
+        ffn.ffn_type = "swiglu"
+        ffn.fused_gate_up = ffn.up_proj  # remember the fused layer name
+        ffn.gate_proj = ffn.up_proj  # will be emitted as separate gate/up
+        ffn.intermediate_size = ffn.intermediate_size // 2
