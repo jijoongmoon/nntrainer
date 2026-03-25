@@ -274,6 +274,62 @@ def resolve_unsupported_ops(layers):
 decompose_unsupported_ops = resolve_unsupported_ops
 
 
+def _propagate_noop_forward(layers):
+    """Propagate NOOP status through layers whose ALL inputs are NOOP.
+
+    In models like T5/mT5, position computation chains (arange → __getitem__
+    → add → sub → ...) produce NOOP-derived values.  The initial mapping only
+    marks the root ops (arange, zeros_like, etc.) as NOOP.  Downstream ops
+    like slice, addition, subtract remain as their original types, which
+    causes them to survive NOOP removal and become disconnected nodes.
+
+    This pass iteratively converts such layers to NOOP so they are cleanly
+    removed in the subsequent NOOP removal pass.
+    """
+    # Layer types safe to convert to NOOP when all inputs are NOOP.
+    # These are pure arithmetic/indexing ops that cannot produce meaningful
+    # outputs from position-only inputs.  Module layers with learned weights
+    # (embedding, fully_connected, norm) are excluded.
+    _NOOP_PROPAGATABLE = frozenset({
+        "slice", LAYER_ADDITION, LAYER_SUBTRACT, LAYER_MULTIPLY,
+        LAYER_DIVIDE, LAYER_NEGATIVE, LAYER_POW, LAYER_SQRT,
+        "log", "concat",
+        OP_RESHAPE, OP_TRANSPOSE, OP_PERMUTE,
+        LAYER_RESHAPE, LAYER_PERMUTE, LAYER_TRANSPOSE,
+    })
+
+    def _is_propagatable(layer_type):
+        if layer_type in _NOOP_PROPAGATABLE:
+            return True
+        # tensor_op:abs, tensor_op:neg, etc. — resolved direct Tensor methods
+        if layer_type.startswith("tensor_op:"):
+            return True
+        return False
+
+    noop_names = {l.name for l in layers if l.layer_type == OP_NOOP}
+    total_converted = 0
+    changed = True
+    while changed:
+        changed = False
+        for l in layers:
+            if l.name in noop_names:
+                continue
+            if not _is_propagatable(l.layer_type):
+                continue
+            if l.input_layers and all(
+                inp in noop_names for inp in l.input_layers
+            ):
+                l.layer_type = OP_NOOP
+                noop_names.add(l.name)
+                total_converted += 1
+                changed = True
+
+    if total_converted:
+        print(f"  [CLEANUP] Propagated NOOP to {total_converted} "
+              f"position-derived layers")
+    return layers
+
+
 def _remove_passthrough_layers(layers, layer_type, label):
     """Remove layers of a given type and rewire downstream inputs.
 
@@ -768,8 +824,29 @@ class AdaptiveConverter:
         layers = _remove_passthrough_layers(
             layers, LAYER_IDENTITY, "identity")
 
+        # Pass 3.58: Propagate NOOP forward through position-derived chains
+        # (T5/mT5 relative position bias computation, seq-length arithmetic)
+        layers = _propagate_noop_forward(layers)
+
         # Pass 3.6: Remove noop layers (expand, size, _set_grad_enabled, etc.)
         layers = _remove_passthrough_layers(layers, OP_NOOP, "noop")
+
+        # Pass 3.65: Convert single-input arithmetic ops to identity.
+        # After NOOP removal, some additions/subtractions lose their
+        # mask/zero operand and become single-input passthrough ops
+        # (e.g. attn_scores + causal_mask → just attn_scores).
+        _ARITH_TYPES = frozenset({
+            LAYER_ADDITION, LAYER_SUBTRACT,
+        })
+        collapsed = 0
+        for layer in layers:
+            if (layer.layer_type in _ARITH_TYPES
+                    and len(layer.input_layers) <= 1):
+                layer.layer_type = LAYER_IDENTITY
+                collapsed += 1
+        if collapsed:
+            layers = _remove_passthrough_layers(
+                layers, LAYER_IDENTITY, "identity (post-noop)")
 
         # Pass 3.7: Remove position ID computation chains
         # (arithmetic ops that exclusively feed position embeddings)
