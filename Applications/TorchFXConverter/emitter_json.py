@@ -62,10 +62,16 @@ class JsonEmitter(BaseEmitter):
         """
         config = {}
         config["model"] = self._emit_model_info()
-        config["layers"] = self._emit_layers()
+
+        # Build layer groups (attention → mha_core, FFN → mlp, etc.)
+        layer_to_group, groups = self._build_layer_groups()
+
+        config["layers"] = self._emit_layers(layer_to_group)
         config["weight_map"] = self._emit_weight_map()
         if self.structure and self.structure.blocks:
             config["structure"] = self._emit_structure()
+        if groups:
+            config["groups"] = groups
         return config
 
     def emit_string(self, indent=2):
@@ -104,7 +110,7 @@ class JsonEmitter(BaseEmitter):
     # Layer Definitions
     # =========================================================================
 
-    def _emit_layers(self):
+    def _emit_layers(self, layer_to_group=None):
         """Emit all layers as JSON objects."""
         result = []
         for layer in self.layers:
@@ -120,6 +126,8 @@ class JsonEmitter(BaseEmitter):
                 entry["hf_module_name"] = layer.hf_module_name
             if layer.hf_module_type:
                 entry["hf_module_type"] = layer.hf_module_type
+            if layer_to_group and layer.name in layer_to_group:
+                entry["group"] = layer_to_group[layer.name]
             result.append(entry)
         return result
 
@@ -146,6 +154,165 @@ class JsonEmitter(BaseEmitter):
                 entry["shared_from"] = layer.shared_from
             weight_map.append(entry)
         return weight_map
+
+    # =========================================================================
+    # Layer Groups (collapsible attention / FFN groups)
+    # =========================================================================
+
+    def _build_layer_groups(self):
+        """Build collapsible layer groups from detected model structure.
+
+        Identifies which graph layers belong to each attention and FFN block,
+        so viewers can collapse individual ops (matmul, softmax, reshape, ...)
+        into higher-level NNTrainer layers (mha_core, mlp).
+
+        Returns:
+            (layer_to_group, groups):
+                layer_to_group: dict mapping layer_name -> group_id
+                groups: list of group descriptor dicts
+        """
+        s = self.structure
+        if not s or not s.blocks:
+            return {}, []
+
+        layer_to_group = {}
+        groups = []
+        layer_names_set = {l.name for l in self.layers}
+
+        for block in s.blocks:
+            role = block.block_role or "block"
+            bid = block.block_idx
+
+            # --- Self-Attention group ---
+            if block.attention:
+                grp = self._make_attention_group(
+                    block.attention, bid, role, "self_attention",
+                    layer_names_set, layer_to_group)
+                if grp:
+                    groups.append(grp)
+
+            # --- Cross-Attention group ---
+            if block.cross_attention:
+                grp = self._make_attention_group(
+                    block.cross_attention, bid, role, "cross_attention",
+                    layer_names_set, layer_to_group)
+                if grp:
+                    groups.append(grp)
+
+            # --- FFN group ---
+            if block.ffn:
+                grp = self._make_ffn_group(
+                    block.ffn, bid, role,
+                    layer_names_set, layer_to_group)
+                if grp:
+                    groups.append(grp)
+
+        return layer_to_group, groups
+
+    @staticmethod
+    def _common_prefix(a, b):
+        """Find the longest common prefix up to a '_' scope boundary.
+
+        For 'DenseReluDense_wi_0' vs 'DenseReluDense_wo', the raw prefix
+        is 'DenseReluDense_w'.  We trim back to the last '_' to get
+        'DenseReluDense' (the module scope).
+        """
+        i = 0
+        while i < len(a) and i < len(b) and a[i] == b[i]:
+            i += 1
+        prefix = a[:i]
+        # Trim to last '_' boundary for clean module scope
+        last_sep = prefix.rfind("_")
+        if last_sep > 0:
+            return prefix[:last_sep]
+        return prefix
+
+    def _collect_members_by_prefix(self, prefix, layer_names_set,
+                                   layer_to_group):
+        """Collect all layers whose name starts with prefix + '_'.
+
+        Skips layers already assigned to another group.
+        """
+        members = []
+        prefix_u = prefix + "_"
+        for l in self.layers:
+            if l.name in layer_to_group:
+                continue
+            if l.name.startswith(prefix_u) and l.name in layer_names_set:
+                members.append(l.name)
+        return members
+
+    def _make_attention_group(self, attn, block_idx, role, attn_kind,
+                              layer_names_set, layer_to_group):
+        """Build a group descriptor for an attention pattern."""
+        if not attn.q_proj or not attn.k_proj:
+            return None
+
+        scope_prefix = self._common_prefix(attn.q_proj, attn.k_proj)
+        if not scope_prefix:
+            return None
+
+        members = self._collect_members_by_prefix(
+            scope_prefix, layer_names_set, layer_to_group)
+        if not members:
+            return None
+
+        group_id = f"{role}_{block_idx}_{attn_kind}"
+        for m in members:
+            layer_to_group[m] = group_id
+
+        grp = {
+            "id": group_id,
+            "type": attn_kind,
+            "collapsed_as": "mha_core",
+            "block_idx": block_idx,
+            "block_type": role,
+            "members": members,
+            "properties": {
+                "num_heads": attn.num_heads,
+                "num_kv_heads": attn.num_kv_heads,
+                "head_dim": attn.head_dim,
+                "has_rope": attn.has_rope,
+                "has_relative_position_bias": attn.has_relative_position_bias,
+            },
+        }
+        return grp
+
+    def _make_ffn_group(self, ffn, block_idx, role,
+                        layer_names_set, layer_to_group):
+        """Build a group descriptor for an FFN pattern."""
+        # Find common prefix from two known FFN layers
+        a = ffn.gate_proj or ffn.up_proj
+        b = ffn.down_proj
+        if not a or not b:
+            return None
+
+        scope_prefix = self._common_prefix(a, b)
+        if not scope_prefix:
+            return None
+
+        members = self._collect_members_by_prefix(
+            scope_prefix, layer_names_set, layer_to_group)
+        if not members:
+            return None
+
+        group_id = f"{role}_{block_idx}_ffn"
+        for m in members:
+            layer_to_group[m] = group_id
+
+        grp = {
+            "id": group_id,
+            "type": "ffn",
+            "collapsed_as": "mlp",
+            "block_idx": block_idx,
+            "block_type": role,
+            "members": members,
+            "properties": {
+                "ffn_type": ffn.ffn_type,
+                "intermediate_size": ffn.intermediate_size,
+            },
+        }
+        return grp
 
     # =========================================================================
     # Structure (from pattern detection)
