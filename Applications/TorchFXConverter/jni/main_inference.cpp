@@ -22,7 +22,9 @@
 #include <string>
 #include <vector>
 
+#include <functional>
 #include <model.h>
+#include <layer_context.h>
 
 #include GENERATED_MODEL_HEADER
 
@@ -30,6 +32,7 @@ struct Args {
   std::string weight_path;
   std::string input_path;
   std::string output_path;
+  std::string dump_weight_order; // if set, dump layer weight order to this file
   unsigned int seq_len = 8;
   unsigned int vocab_size = 1000;
 };
@@ -48,6 +51,8 @@ static Args parse_args(int argc, char *argv[]) {
       args.seq_len = std::stoul(argv[++i]);
     else if (arg == "--vocab-size" && i + 1 < argc)
       args.vocab_size = std::stoul(argv[++i]);
+    else if (arg == "--dump-weight-order" && i + 1 < argc)
+      args.dump_weight_order = argv[++i];
   }
   return args;
 }
@@ -75,6 +80,38 @@ int main(int argc, char *argv[]) {
     auto &model = model_builder.getModel();
     std::cout << "[inference] Model initialized successfully." << std::endl;
     model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
+
+    // Optional: dump weight order for Python weight converter alignment
+    if (!args.dump_weight_order.empty()) {
+      // Save model weights (zero-initialized) to binary template
+      std::string template_path = args.dump_weight_order + ".bin";
+      model->save(template_path,
+                  ml::train::ModelFormat::MODEL_FORMAT_BIN);
+
+      // Also output layer weight order as text for Python alignment
+      // Format: one line per weight-bearing layer with name and sizes
+      std::ofstream order_file(args.dump_weight_order);
+      std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
+                         void *)>
+        fn = [&order_file](ml::train::Layer &l,
+                           nntrainer::RunLayerContext &context, void *) {
+          unsigned int num_weights = context.getNumWeights();
+          for (unsigned int i = 0; i < num_weights; ++i) {
+            const auto &tensor = context.getWeight(i);
+            order_file << context.getName() << "\t"
+                       << tensor.getDim().batch() << ":"
+                       << tensor.getDim().channel() << ":"
+                       << tensor.getDim().height() << ":"
+                       << tensor.getDim().width() << "\t"
+                       << tensor.bytes() << "\n";
+          }
+        };
+      model->forEachLayer(fn, nullptr);
+
+      std::cout << "[inference] Weight order dumped to: "
+                << args.dump_weight_order << std::endl;
+      return 0;
+    }
 
     // Step 2: Load weights
     // Note: compile(Tensor, Tensor) already does compile+initialize+allocate
