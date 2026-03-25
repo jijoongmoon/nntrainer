@@ -94,6 +94,14 @@ class PatternDetector:
 
         structure.num_layers = len(structure.blocks)
 
+        # Step 3b: Override intermediate_size from detected FFN pattern
+        # The config's intermediate_size may differ from the actual FFN
+        # dimensions (e.g., Granite fused gate+up, LFM2 doubled intermediate).
+        if structure.blocks:
+            ffn = structure.blocks[0].ffn
+            if ffn and ffn.intermediate_size:
+                structure.intermediate_size = ffn.intermediate_size
+
         # Step 4: Final normalization
         self._detect_final_norm(structure)
 

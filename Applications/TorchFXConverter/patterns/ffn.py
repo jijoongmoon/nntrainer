@@ -66,9 +66,9 @@ def _match_fc_roles(fc_layers):
             gate = layer
         elif suffix in ("wi",):
             up = layer
-        elif suffix in ("intermediate.dense",):
+        elif suffix in ("intermediate.dense", "input_linear"):
             up = layer
-        elif suffix in ("output.dense",):
+        elif suffix in ("output.dense", "output_linear"):
             down = layer
 
     # LFM2-style remap: w1 is gate, w3 is up, w2 is down
@@ -126,13 +126,34 @@ def _build_standard_ffn(ffn, fc_layers, up, down, ffn_scope,
             layer_type="", name="")).properties.get("unit", 0))
     ffn.layer_names = [ffn.up_proj, ffn.down_proj]
 
+    # Collect additional ops within the FFN scope
+    has_split_or_multiply = False
+    ffn_layer_names = {ffn.up_proj, ffn.down_proj}
+
     for layer in block_layers:
-        if (layer.layer_type == LAYER_ACTIVATION
-            and layer.hf_module_name.startswith(ffn_scope)):
+        in_scope = (layer.hf_module_name.startswith(ffn_scope)
+                    if layer.hf_module_name
+                    else _inputs_reference(layer, ffn_layer_names))
+
+        if layer.layer_type == LAYER_ACTIVATION and in_scope:
             ffn.activation = layer.name
             ffn.layer_names.append(layer.name)
+            ffn_layer_names.add(layer.name)
             act_type = layer.properties.get("activation", "")
             if act_type == "gelu":
                 ffn.ffn_type = "gelu_ffn"
             elif act_type == "relu":
                 ffn.ffn_type = "standard"
+        elif layer.layer_type == LAYER_MULTIPLY and in_scope:
+            ffn.layer_names.append(layer.name)
+            ffn_layer_names.add(layer.name)
+            has_split_or_multiply = True
+        elif layer.layer_type == "split" and in_scope:
+            ffn.layer_names.append(layer.name)
+            ffn_layer_names.add(layer.name)
+            has_split_or_multiply = True
+
+    # If split/multiply ops exist (fused gate+up like Granite's shared_mlp),
+    # use generic emission to preserve the actual graph topology
+    if has_split_or_multiply:
+        ffn.ffn_type = "generic"

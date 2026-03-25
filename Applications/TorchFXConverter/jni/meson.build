@@ -68,6 +68,7 @@ converter_inference_models = [
   ['qwen3_tied_verify', 'converter_qwen3_tied_verify_inference', 'Qwen3CausalLM'],
   ['qwen3_06b_verify', 'converter_qwen3_06b_verify_inference', 'Qwen3CausalLM'],
   ['qwen3_17b_verify', 'converter_qwen3_17b_verify_inference', 'Qwen3CausalLM'],
+  ['lfm_700m_verify', 'converter_lfm_700m_verify_inference', 'Lfm2CausalLM'],
 ]
 
 foreach m : converter_inference_models
