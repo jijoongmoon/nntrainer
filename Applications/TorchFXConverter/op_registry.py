@@ -275,6 +275,7 @@ METHOD_NOOP_NAMES = frozenset({
     "__xor__", "__invert__", "__eq__", "__setitem__",
     "all", "any", "item",
     "stride",  # tensor metadata query (used in as_strided patterns)
+    "is_floating_point",  # dtype query (returns bool, no tensor output)
     # Comparison ops (T5 relative position bias)
     "gt", "lt", "le", "ge", "eq", "ne",
     # Position ID computation (see FUNCTION_NOOP_NAMES comment for cumsum)

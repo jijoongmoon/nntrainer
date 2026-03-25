@@ -476,4 +476,36 @@ def _map_getitem(node, scope, node_to_layer):
             hf_module_name=scope,
         )
 
+    # Case 3: Parent is a NOOP (e.g. getitem on arange output, comparison
+    # results, etc.) — propagate NOOP.
+    if parent_layer and parent_layer.layer_type == OP_NOOP:
+        return NNTrainerLayerDef(
+            layer_type=OP_NOOP,
+            name=node.name,
+            input_layers=[parent_name],
+            hf_module_name=scope,
+        )
+
+    # Case 4: Parent is a call_function that returns a tuple/list
+    # (e.g. torch.split, custom ops returning tuples).
+    if parent_node.op == "call_function":
+        out_type = parent_node.meta.get('output_type')
+        if out_type in (tuple, list):
+            return NNTrainerLayerDef(
+                layer_type=LAYER_IDENTITY,
+                name=node.name,
+                input_layers=[parent_name],
+                hf_module_name=scope,
+            )
+        # Fallback: check output_shape for tuple of shapes
+        out_shape = parent_node.meta.get('output_shape')
+        if isinstance(out_shape, (list, tuple)) and out_shape:
+            if isinstance(out_shape[0], (list, tuple)):
+                return NNTrainerLayerDef(
+                    layer_type=LAYER_IDENTITY,
+                    name=node.name,
+                    input_layers=[parent_name],
+                    hf_module_name=scope,
+                )
+
     return None
