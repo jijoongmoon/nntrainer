@@ -366,7 +366,7 @@ void UIntTensor<T>::copy_with_stride(const Tensor &input, Tensor &output) {
 
 template <typename T> void UIntTensor<T>::save(std::ostream &file) {
   /// @note Save quantization information
-  // save_quantization_info(file);
+  save_quantization_info(file);
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -385,7 +385,6 @@ void UIntTensor<T>::read(std::ifstream &file, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
-  // TODO This line should be skipped if tensor is QNN
   read_quantization_info(file, start_offset, read_from_offset);
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
@@ -410,7 +409,12 @@ void UIntTensor<T>::read(ReadSource src, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
+#ifdef ENABLE_NPU
+  start_offset = 0;
+  read_from_offset = false;
+#else
   read_quantization_info(src, start_offset, read_from_offset);
+#endif
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -552,8 +556,12 @@ template <typename T> void UIntTensor<T>::print(std::ostream &out) const {
 }
 
 template <typename T> size_t UIntTensor<T>::getMemoryBytes() const {
-  return bytes(); // + scale_size() * sizeof(float) +
-                  // scale_size() * sizeof(unsigned int);
+#ifdef ENABLE_NPU
+  return bytes();
+#else
+  return bytes() + scale_size() * sizeof(float) +
+         scale_size() * sizeof(unsigned int);
+#endif
 }
 
 template <typename T>

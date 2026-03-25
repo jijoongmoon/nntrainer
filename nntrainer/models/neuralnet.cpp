@@ -1061,7 +1061,9 @@ sharedConstTensors NeuralNetwork::inference(sharedConstTensors X,
   if (!validateInput(X))
     throw std::invalid_argument("Input validation failed.");
 
-  // allocate(ExecutionMode::INFERENCE);
+#ifndef ENABLE_NPU
+  allocate(ExecutionMode::INFERENCE);
+#endif
 
   int nn_foward;
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
@@ -1201,9 +1203,7 @@ NeuralNetwork::inference(unsigned int batch_size,
 
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
-    float *float_out = (float *)malloc(out_t.size() * sizeof(float));
-    memcpy(float_out, out_t.getData(), out_t.size() * sizeof(uint16_t));
-    output.push_back(float_out);
+    output.push_back(out_t.getData());
   }
 
   return output;

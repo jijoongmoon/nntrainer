@@ -1062,23 +1062,20 @@ Tensor &Tensor::dotBatched(Tensor const &m, Tensor &result, bool trans,
     throw std::invalid_argument(
       "Output tensor must be preallocated for dotBatched operation");
 
-  auto dot_batch_job = [&](unsigned int s, unsigned int e, unsigned int pid,
-                           void *user_data) {
-    for (unsigned int b = s; b < e; ++b) {
-      const Tensor this_b = this->getBatchSlice(b, 1);
-      Tensor m_b = m.getBatchSlice(b, 1);
-      Tensor result_b = result.getBatchSlice(b, 1);
+  size_t lcm = std::lcm(batch(), m.batch());
+  size_t group_size = lcm / batch();
+  size_t m_group_size = lcm / m.batch();
 
-      this_b.dot(m_b, result_b, trans, trans_m, beta);
-    }
-  };
+  NNTR_THROW_IF(!((lcm == batch() || lcm == m.batch())), std::invalid_argument)
+    << "The batch size of the given twon tensors must be the same"
+       "or the bigger one should be a multiple of the smaller one";
 
-  auto workers = ParallelBatch(dot_batch_job, batch(), nullptr);
+  for (unsigned int b = 0; b < lcm; b++) {
+    const Tensor this_b = this->getBatchSlice(b / group_size, 1);
+    Tensor m_b = m.getBatchSlice(b / m_group_size, 1);
+    Tensor result_b = result.getBatchSlice(b, 1);
 
-  if (workers.getNumWorkers() > 1) {
-    workers.run();
-  } else {
-    dot_batch_job(0, batch(), 0, nullptr);
+    this_b.dot(m_b, result_b, trans, trans_m, beta);
   }
 
   // for (unsigned int b = 0; b < batch(); b++) {
