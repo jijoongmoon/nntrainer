@@ -121,7 +121,7 @@ def emit_attention_method(cname, block, arch_type="decoder_only",
     mha_props = [
         'withKey("name", A_name)',
         'withKey("num_heads", n_heads)',
-        'withKey("num_heads_kv", n_heads / GQA_SIZE)',
+        'withKey("num_heads_KV", n_heads / GQA_SIZE)',
     ]
     if is_decoder:
         mha_props.append(

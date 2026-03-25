@@ -620,6 +620,31 @@ Tensor &HalfTensor::erf(Tensor &output) const {
   return output;
 }
 
+Tensor &HalfTensor::exp(Tensor &output) const {
+  auto f = [](_FP16 in) {
+    return static_cast<_FP16>(std::exp(static_cast<float>(in)));
+  };
+  apply(f, output);
+  return output;
+}
+
+Tensor &HalfTensor::log(Tensor &output) const {
+  auto f = [](_FP16 in) {
+    return static_cast<_FP16>(std::log(static_cast<float>(in)));
+  };
+  apply(f, output);
+  return output;
+}
+
+Tensor &HalfTensor::clamp(float min, float max, Tensor &output) const {
+  auto f = [min, max](_FP16 in) {
+    float val = static_cast<float>(in);
+    return static_cast<_FP16>(std::min(std::max(val, min), max));
+  };
+  apply(f, output);
+  return output;
+}
+
 void HalfTensor::tan(Tensor &output, float alpha) {
   auto f = [alpha](_FP16 in) -> _FP16 {
     return static_cast<_FP16>(std::tan(static_cast<float>(alpha * in)));

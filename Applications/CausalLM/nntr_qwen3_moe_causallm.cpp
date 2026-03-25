@@ -12,7 +12,7 @@
  * limitations under the License.
  *
  *
- * @file	qwen3_moe_causallm.cpp
+ * @file	nntr_qwen3_moe_causallm.cpp
  * @date	23 July 2025
  * @brief	This defines a qwen3_moe causal language model.
  * @see		https://github.com/nnstreamer/
@@ -22,7 +22,7 @@
  */
 #include <llm_util.hpp>
 #include <model.h>
-#include <qwen3_slim_moe_causallm.h>
+#include <nntr_qwen3_moe_causallm.h>
 
 #include <app_context.h>
 #include <engine.h>
@@ -30,9 +30,9 @@
 
 namespace causallm {
 
-void Qwen3SlimMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
+void NNTRQwen3MoECausalLM::setupParameters(json &cfg, json &generation_cfg,
                                            json &nntr_cfg) {
-  Qwen3CausalLM(cfg, generation_cfg, nntr_cfg);
+  NNTRQwen3CausalLM(cfg, generation_cfg, nntr_cfg);
 
   // parameters for Qwen3MoE model
   try {
@@ -45,7 +45,7 @@ void Qwen3SlimMoECausalLM::setupParameters(json &cfg, json &generation_cfg,
   }
 }
 
-Tensor Qwen3SlimMoECausalLM::createMlp(const int layer_id, int dim,
+Tensor NNTRQwen3MoECausalLM::createMlp(const int layer_id, int dim,
                                         int hidden_dim, Tensor input) {
 
   using ml::train::createLayer;
@@ -59,9 +59,9 @@ Tensor Qwen3SlimMoECausalLM::createMlp(const int layer_id, int dim,
   return moe(input);
 }
 
-void Qwen3SlimMoECausalLM::registerCustomLayers() {
+void NNTRQwen3MoECausalLM::registerCustomLayers() {
 
-  Qwen3CausalLM::registerCustomLayers();
+  NNTRQwen3CausalLM::registerCustomLayers();
   auto &ct_engine = nntrainer::Engine::Global();
   auto app_context =
     static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));

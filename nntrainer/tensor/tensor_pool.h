@@ -164,6 +164,25 @@ public:
   Tensor *placeholder(const std::string &name, const TensorDim &dim);
 
   /**
+   * @brief Request a tensor or a placeholder depending on whether it is
+   * externally managed.
+   *
+   * @param name Name of this tensor.
+   * @param dim Tensor dimension.
+   * @param exec_order The execution orders for this tensor.
+   * @param lifespan Lifespan of this tensor (used only when is_external=false).
+   * @param is_external If true, creates a placeholder (UNMANAGED, no
+   *        MemoryPool allocation); if false, creates a normal managed tensor.
+   * @param init Initializer of the tensor (used only when is_external=false).
+   *
+   * @return ptr to the created tensor
+   */
+  Tensor *requestOrPlaceholder(const std::string &name, const TensorDim &dim,
+                               const std::vector<unsigned int> &exec_order,
+                               TensorLifespan lifespan, bool is_external,
+                               const Initializer &init = Initializer::NONE);
+
+  /**
    * @brief     create a new tensor with the given spec.
    *
    * @param name Name of this tensor.

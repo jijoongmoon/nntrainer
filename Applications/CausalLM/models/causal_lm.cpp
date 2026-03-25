@@ -7,7 +7,7 @@
  *
  * @file   causal_lm.cpp
  * @date   10 July 2025
- * @see    https://github.com/nntrainer/nntrainer
+ * @see    https://github.com/nnstreamer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
@@ -20,33 +20,33 @@
  *          - Llama
  */
 
-#include <algorithm>
-#include <app_context.h>
-#include <cmath>
-#include <engine.h>
 #include <fstream>
-#include <iostream>
-#include <limits>
-#include <vector>
 
-#include <common.h>
-#include <layer_context.h>
-#include <lm_head.h>
-#include <mha_core.h>
-#include <tensor.h>
+#include <app_context.h>
+#include <engine.h>
+#include <model.h>
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
+#include <tensor_api.h>
+#include <tokenizers_cpp.h>
+
+#include <embedding_layer.h>
+#include <mha_core.h>
+#include <rms_norm.h>
+#include <swiglu.h>
+#include <tie_word_embedding.h>
 
 namespace causallm {
 
-CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
-  Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
-  setupParameters(cfg, generation_cfg, nntr_cfg);
-}
+std::string LoadBytesFromFile(const std::string &path);
 
-void CausalLM::setupParameters(json &cfg, json &generation_cfg,
-                               json &nntr_cfg) {
+CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) {
+
+  // Initialize the model with the provided configurations
+  // This is where you would set up the model layers, parameters, etc.
+  setupParameters(cfg, generation_cfg, nntr_cfg);
+
   // Initialize output list
   for (unsigned int i = 0; i < BATCH_SIZE; ++i)
     output_list.push_back("");
@@ -55,12 +55,32 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   ids_history = (unsigned int *)malloc(static_cast<size_t>(BATCH_SIZE) *
                                        MAX_SEQ_LEN * sizeof(unsigned int));
 
+  // prep tokenizer
+  tokenizer = tokenizers::Tokenizer::FromBlobJSON(
+    LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+};
+
+void CausalLM::setupParameters(json &cfg, json &generation_cfg,
+                               json &nntr_cfg) {
+
+  /** Initialize nntr prameters */
+  BATCH_SIZE = nntr_cfg["batch_size"].get<unsigned int>();
+  MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"].get<std::string>();
+  INIT_SEQ_LEN = nntr_cfg["init_seq_len"];
+  MAX_SEQ_LEN = nntr_cfg["max_seq_len"];
+  NUM_TO_GENERATE = nntr_cfg["num_to_generate"];
+  MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"];
   BAD_WORD_IDS = nntr_cfg["bad_word_ids"].get<std::vector<unsigned int>>();
   NUM_BADWORDS = BAD_WORD_IDS.size();
-
+  MEMORY_SWAP = nntr_cfg.contains("fsu") ? nntr_cfg["fsu"].get<bool>() : false;
+  FSU_LOOKAHEAD = nntr_cfg.contains("fsu_lookahead")
+                    ? nntr_cfg["fsu_lookahead"].get<unsigned int>()
+                    : 1;
+  EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   LMHEAD_DTYPE = nntr_cfg.contains("lmhead_dtype")
                    ? nntr_cfg["lmhead_dtype"]
                    : nntr_cfg["embedding_dtype"];
+  FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
 
   USE_KVCACHE = false;
   PRE_COMPUTED_CACHE_PATH = "";
@@ -77,18 +97,34 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
           .get<unsigned int>();
   }
 
-  if (generation_cfg["eos_token_id"].is_array()) {
-    EOS_TOKEN_ID =
-      generation_cfg["eos_token_id"].empty()
-        ? cfg["eos_token_id"].get<std::vector<unsigned int>>()
-        : generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
-  } else {
-    EOS_TOKEN_ID.clear();
-    EOS_TOKEN_ID.push_back(generation_cfg["eos_token_id"].get<unsigned int>());
-  }
-  BOS_TOKEN_ID = generation_cfg["bos_token_id"].empty()
-                   ? cfg["bos_token_id"].get<unsigned int>()
-                   : generation_cfg["bos_token_id"].get<unsigned int>();
+  /** Initialize model parameters */
+  NUM_VOCAB = cfg["vocab_size"];
+  DIM = cfg["hidden_size"];
+  INTERMEDIATE_SIZE = cfg["intermediate_size"];
+  NUM_LAYERS = cfg["num_hidden_layers"];
+  NUM_HEADS = cfg["num_attention_heads"];
+  HEAD_DIM = cfg.contains("head_dim")
+               ? cfg["head_dim"].get<int>()
+               : DIM / NUM_HEADS; // default value is hidden_size / num_heads
+  NUM_KEY_VALUE_HEADS = cfg.contains("num_key_value_heads")
+                          ? cfg["num_key_value_heads"].get<int>()
+                          : NUM_HEADS;
+  SLIDING_WINDOW =
+    cfg.contains("sliding_window") && !cfg["sliding_window"].is_null()
+      ? cfg["sliding_window"].get<unsigned int>()
+      : UINT_MAX;
+  SLIDING_WINDOW_PATTERN = cfg.contains("sliding_window_pattern")
+                             ? cfg["sliding_window_pattern"].get<unsigned int>()
+                             : 1;
+  MAX_POSITION_EMBEDDINGS = cfg["max_position_embeddings"].get<unsigned int>();
+  ROPE_THETA = cfg["rope_theta"].get<unsigned int>();
+  TIE_WORD_EMBEDDINGS = cfg["tie_word_embeddings"].get<bool>();
+  NORM_EPS = cfg["rms_norm_eps"];
+  GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
+
+  EOS_TOKEN_ID =
+    generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
+  BOS_TOKEN_ID = generation_cfg["bos_token_id"].get<unsigned int>();
   TOP_K = generation_cfg.contains("top_k")
             ? generation_cfg["top_k"].get<unsigned int>()
             : 20;
@@ -99,189 +135,148 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                   ? generation_cfg["temperature"].get<float>()
                   : 0.7;
   global_token_len = 0;
+  return;
+};
+
+void CausalLM::initialize() {
+
+  // RegisterCustomLayers
+  registerCustomLayers();
+
+  // setup model property (must be set before constructModel which calls compile)
+  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+
+  std::vector<std::string> model_props = {
+    withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
+    withKey("model_tensor_type", MODEL_TENSOR_TYPE)};
+  if (MEMORY_SWAP) {
+    model_props.emplace_back(withKey("fsu", "true"));
+    model_props.emplace_back(withKey("fsu_lookahead", FSU_LOOKAHEAD));
+  }
+
+  model->setProperty(model_props);
+
+  // construct and compile causalLM model via symbolic tensor graph
+  constructModel();
+
+  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {
+    throw std::invalid_argument("Model initialization failed.");
+  }
+
+  is_initialized = true;
+
+#ifdef DEBUG
+  model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
+#endif
 }
 
 void CausalLM::constructModel() {
 
-  // It adds all transformer model's block to model
-  Transformer::constructModel();
+  using ml::train::createLayer;
 
+  // create input tensor
+  LayerHandle input_layer = createLayer(
+    "input", {withKey("name", "input0"),
+              withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))});
+  Tensor input = input_layer(Tensor());
+
+  // create embedding layer
+  const std::string embedding_type =
+    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
   const std::string lmhead_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
+    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "fully_connected";
+  LayerHandle embedding = createLayer(
+    embedding_type,
+    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
+     "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM)});
+  Tensor x = embedding(input);
+
+  // allocate external KV cache buffers and create input tensors for them
+  size_t max_timestep = INIT_SEQ_LEN + NUM_TO_GENERATE;
+  size_t kv_heads = NUM_HEADS / GQA_SIZE;
+  size_t cache_size = BATCH_SIZE * kv_heads * max_timestep * HEAD_DIM;
+  kv_cache_buffers.allocate(NUM_LAYERS, cache_size);
+  key_cache_tensors.resize(NUM_LAYERS);
+  val_cache_tensors.resize(NUM_LAYERS);
+
+  std::vector<Tensor> all_inputs;
+  all_inputs.push_back(input);
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    std::string k_name = "ext_cache_key_" + std::to_string(i);
+    std::string v_name = "ext_cache_val_" + std::to_string(i);
+
+    std::string cache_shape = std::to_string(kv_heads) + ":" +
+                              std::to_string(max_timestep) + ":" +
+                              std::to_string(HEAD_DIM);
+    LayerHandle k_input = createLayer(
+      "input", {withKey("name", k_name), withKey("input_shape", cache_shape)});
+    LayerHandle v_input = createLayer(
+      "input", {withKey("name", v_name), withKey("input_shape", cache_shape)});
+    key_cache_tensors[i] = k_input(Tensor());
+    val_cache_tensors[i] = v_input(Tensor());
+    all_inputs.push_back(key_cache_tensors[i]);
+    all_inputs.push_back(val_cache_tensors[i]);
+  }
+
+  // create transformer layers
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    x = createTransformerDecoderBlock(i, x);
+  }
+
+  // create rms_norm
+  LayerHandle output_norm = createLayer(
+    "rms_norm", {withKey("name", "output_norm"),
+                 withKey("epsilon", std::to_string(NORM_EPS)),
+                 withKey("packed", "false")});
+  x = output_norm(x);
 
   // add lmhead
   std::vector<std::string> lmhead_prop = {
     withKey("name", "output_of_causallm"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
-    withKey("input_layers", "output_norm"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
-
   if (TIE_WORD_EMBEDDINGS)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
+  LayerHandle lmhead = createLayer(lmhead_type, lmhead_prop);
+  Tensor output = lmhead(x);
 
-  model->addLayer(createLayer(lmhead_type, lmhead_prop));
-}
-
-void CausalLM::registerOutputs(
-  std::unique_ptr<tokenizers::Tokenizer> &tokenizer,
-  std::vector<unsigned int> ids, unsigned int pos,
-  const std::vector<bool> &eos_list) {
-
-  static const std::vector<char> puncts{',', '!', ':', ';', '?'};
-  for (size_t b = 0; b < ids.size(); ++b) {
-    if (!eos_list[b]) {
-      pending_ids_.push_back(static_cast<int>(ids[b]));
-      ids_history[b * MAX_SEQ_LEN + pos] = ids[b];
-      std::string decoded_str = tokenizer->Decode(pending_ids_);
-
-      if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
-          puncts.end()) {
-        // last symbol is a punctuation, hold on
-      } else if (decoded_str.size() >= 3 &&
-                 decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
-        // ends with an incomplete token, hold on
-      } else {
-#if defined(_WIN32)
-        std::wcout << L"" << utf8_to_wstring(decoded_str);
-        std::wcout.flush();
-#else
-        std::cout << decoded_str;
-        std::cout.flush();
-#endif
-        output_list[b].append(decoded_str);
-        pending_ids_.clear();
-      }
-    }
-  }
-}
-
-void CausalLM::save_kvcache(std::string path, int to_) {
-  auto f = nntrainer::checkedOpenStream<std::ofstream>(
-    path, std::ios::out | std::ios::binary | std::ios::trunc);
-
-  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
-              void *idx) {
-      if (l.getType() == causallm::MHACoreLayer::type) {
-        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
-        auto k_cache = context.getTensor(0);
-        auto v_cache = context.getTensor(1);
-        ml::train::TensorDim k_dim = k_cache.getDim();
-        ml::train::TensorDim v_dim = v_cache.getDim();
-        k_dim.height(to);
-        v_dim.height(to);
-        nntrainer::Tensor k_cache_prompt =
-          k_cache.getSharedDataTensor(k_dim, 0, true);
-        nntrainer::Tensor v_cache_prompt =
-          v_cache.getSharedDataTensor(v_dim, 0, true);
-        k_cache_prompt.save(f);
-        v_cache_prompt.save(f);
-      }
-    };
-  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
-  model->forEachLayer(fn, arg);
-  f.close();
-}
-
-void CausalLM::load_kvcache(std::string path, int to_) {
-  auto f = nntrainer::checkedOpenStream<std::ifstream>(
-    path, std::ios::in | std::ios::binary);
-
-  model->allocate(ml::train::ExecutionMode::INFERENCE);
-
-  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
-              void *idx) {
-      if (l.getType() == causallm::MHACoreLayer::type) {
-        auto k_cache = context.getTensor(0);
-        auto v_cache = context.getTensor(1);
-        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
-        ml::train::TensorDim k_dim = k_cache.getDim();
-        ml::train::TensorDim v_dim = v_cache.getDim();
-        k_dim.height(to);
-        v_dim.height(to);
-        nntrainer::Tensor k_cache_prompt =
-          k_cache.getSharedDataTensor(k_dim, 0, true);
-        nntrainer::Tensor v_cache_prompt =
-          v_cache.getSharedDataTensor(v_dim, 0, true);
-        k_cache_prompt.read(f);
-        v_cache_prompt.read(f);
-      }
-    };
-  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
-  model->forEachLayer(fn, arg);
-  f.close();
-}
-
-std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
-                                             float repetition_penalty,
-                                             unsigned int *input_ids,
-                                             unsigned int NUM_INPUT_IDS) {
-
-  std::vector<unsigned int> outputs;
-  for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
-
-    // apply repetition penalty
-    if (repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0) {
-      applyRepetitionPenalty(logits, input_ids, NUM_INPUT_IDS,
-                             repetition_penalty);
-    }
-
-    // apply bad words penalty
-    if (BAD_WORD_IDS.size() != 0 && NUM_BADWORDS != 0) {
-      applyBadWordsPenalty(logits, BAD_WORD_IDS.data(), NUM_BADWORDS);
-    }
-
-    // return argmax if do_sample is false
-    if (do_sample == false) {
-      unsigned int argmax_idx =
-        std::distance(logits, std::max_element(logits, logits + NUM_VOCAB));
-      outputs.push_back(argmax_idx);
-    } else {
-      // apply temperature & top-k & top-p to logits
-      float max_logits = applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P);
-      // transform logits to softmax
-      float sum_exp_logits = 0;
-      for (unsigned int i = 0; i < NUM_VOCAB; i++) {
-        float exp_x = exp(logits[i] - max_logits);
-        sum_exp_logits += exp_x;
-        logits[i] = exp_x;
-      }
-
-      for (unsigned int i = 0; i < NUM_VOCAB; ++i) {
-        logits[i] /= sum_exp_logits;
-      }
-
-      // sample from final logits
-      std::discrete_distribution<int> dist(logits, logits + NUM_VOCAB);
-      unsigned int sampled_idx = dist(rng);
-
-      // add sampled word
-      outputs.push_back(sampled_idx);
-    }
-
-    // set batch offset
-    logits = logits + NUM_VOCAB;
-    input_ids = input_ids + MAX_SEQ_LEN;
-  }
-
-  return outputs;
+  // compile model from symbolic tensor graph
+  std::vector<Tensor> outputs = {output};
+  model->compile(all_inputs, outputs, ml::train::ExecutionMode::INFERENCE);
 };
 
-void CausalLM::registerCustomLayers() {
-  Transformer::registerCustomLayers();
-  const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
-  try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::LmHeadLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
+void CausalLM::load_weight(const std::string &weight_path) {
+
+  if (!is_initialized) {
+    throw std::runtime_error("CausalLM model is not initialized. Please call "
+                             "initialize() before load_weight().");
   }
-}
+
+  try {
+    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+  } catch (const std::exception &e) {
+    throw std::runtime_error("Failed to load model weights: " +
+                             std::string(e.what()));
+  }
+};
+
+void CausalLM::save_weight(const std::string &weight_path) {
+
+  if (!is_initialized) {
+    throw std::runtime_error("CausalLM model is not initialized. Please call "
+                             "initialize() before save_weight().");
+  }
+
+  try {
+    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+  } catch (const std::exception &e) {
+    throw std::runtime_error("Failed to save model weights: " +
+                             std::string(e.what()));
+  }
+};
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt) {
@@ -345,8 +340,6 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
 
   auto _input = tokenizer->Encode(prompt_);
-  ///@note insert bos token at the beginning of the input
-  // _input.insert(_input.begin(), BOS_TOKEN_ID);
 #endif
 
   // | <------------------- MAX_SEQ_LEN -------------------> |
@@ -528,6 +521,297 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             << ((double)generation_cnt / generation_duration.count() * 1000)
             << " TPS\n";
   std::cout << "==========================================================\n";
+};
+
+std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
+                                             float repetition_penalty,
+                                             unsigned int *input_ids,
+                                             unsigned int NUM_INPUT_IDS) {
+
+  std::vector<unsigned int> outputs;
+  for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
+
+    // apply repetition penalty
+    if (repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0) {
+      applyRepetitionPenalty(logits, input_ids, NUM_INPUT_IDS,
+                             repetition_penalty);
+    }
+
+    // apply bad words penalty
+    if (BAD_WORD_IDS.size() != 0 && NUM_BADWORDS != 0) {
+      applyBadWordsPenalty(logits, BAD_WORD_IDS.data(), NUM_BADWORDS);
+    }
+
+    // return argmax if do_sample is false
+    if (do_sample == false) {
+      unsigned int argmax_idx =
+        std::distance(logits, std::max_element(logits, logits + NUM_VOCAB));
+      outputs.push_back(argmax_idx);
+    } else {
+      // apply temperature & top-k & top-p to logits
+      float max_logits = applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P);
+      // transform logits to softmax
+      float sum_exp_logits = 0;
+      for (unsigned int i = 0; i < NUM_VOCAB; i++) {
+        float exp_x = exp(logits[i] - max_logits);
+        sum_exp_logits += exp_x;
+        logits[i] = exp_x;
+      }
+
+      for (unsigned int i = 0; i < NUM_VOCAB; ++i) {
+        logits[i] /= sum_exp_logits;
+      }
+
+      // sample from final logits
+      std::discrete_distribution<int> dist(logits, logits + NUM_VOCAB);
+      unsigned int sampled_idx = dist(rng);
+
+      // add sampled word
+      outputs.push_back(sampled_idx);
+    }
+
+    // set batch offset
+    logits = logits + NUM_VOCAB;
+    input_ids = input_ids + MAX_SEQ_LEN;
+  }
+
+  return outputs;
+};
+
+Tensor CausalLM::createTransformerDecoderBlock(const int layer_id,
+                                                Tensor input) {
+
+  using ml::train::createLayer;
+
+  // attention norm
+  LayerHandle att_norm = createLayer(
+    "rms_norm",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("packed", "false")});
+  Tensor normed = att_norm(input);
+
+  // self attention
+  Tensor att_out =
+    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM, normed,
+                    normed, normed);
+
+  // residual add
+  Tensor residual = input.add(att_out);
+
+  // ffn norm
+  LayerHandle ffn_norm = createLayer(
+    "rms_norm",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("packed", "false")});
+  Tensor ffn_normed = ffn_norm(residual);
+
+  // feed forward
+  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
+
+  // residual add
+  Tensor decoder_out = residual.add(ffn_out);
+
+  return decoder_out;
+}
+
+Tensor CausalLM::createAttention(const int layer_id, int seq_len, int n_heads,
+                                  int head_dim, Tensor query, Tensor key,
+                                  Tensor value) {
+
+  using ml::train::createLayer;
+
+  auto Q_name = "layer" + std::to_string(layer_id) + "_wq";
+  auto K_name = "layer" + std::to_string(layer_id) + "_wk";
+  auto V_name = "layer" + std::to_string(layer_id) + "_wv";
+  auto A_name = "layer" + std::to_string(layer_id) + "_attention";
+  auto O_name = "layer" + std::to_string(layer_id) + "_attention_out";
+
+  // V projection
+  LayerHandle v_proj = createLayer(
+    "fully_connected",
+    {withKey("name", V_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor v = v_proj(value);
+
+  // K projection
+  LayerHandle k_proj = createLayer(
+    "fully_connected",
+    {withKey("name", K_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor k = k_proj(key);
+
+  // Q projection
+  LayerHandle q_proj = createLayer(
+    "fully_connected",
+    {withKey("name", Q_name), withKey("unit", head_dim * n_heads),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor q = q_proj(query);
+
+  // Attention core layer (5-input: Q, K, V, ext_cache_key, ext_cache_val)
+  LayerHandle attn = createLayer(
+    "mha_core",
+    {withKey("name", A_name), withKey("num_heads", n_heads),
+     withKey("num_heads_kv", n_heads / GQA_SIZE),
+     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+     withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
+                                 ? SLIDING_WINDOW
+                                 : UINT_MAX),
+     withKey("rope_theta", ROPE_THETA),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE))});
+  Tensor a = attn({q, k, v, key_cache_tensors[layer_id],
+                   val_cache_tensors[layer_id]});
+
+  // O projection
+  LayerHandle o_proj = createLayer(
+    "fully_connected",
+    {withKey("name", O_name), withKey("unit", DIM),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
+  Tensor o = o_proj(a);
+
+  return o;
+}
+
+Tensor CausalLM::createMlp(const int layer_id, int dim, int hidden_dim,
+                            Tensor input) {
+
+  using ml::train::createLayer;
+
+  LayerHandle ffn_up = createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
+     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones")});
+  Tensor up = ffn_up(input);
+
+  LayerHandle ffn_gate = createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
+     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones")});
+  Tensor gate = ffn_gate(input);
+
+  LayerHandle swiglu = createLayer(
+    "swiglu",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")});
+  Tensor activated = swiglu({up, gate});
+
+  LayerHandle ffn_down = createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
+     withKey("unit", dim), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones")});
+  Tensor down = ffn_down(activated);
+
+  return down;
+}
+
+void CausalLM::registerCustomLayers() {
+  ///
+  const auto &ct_engine = nntrainer::Engine::Global();
+  const auto app_context =
+    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+
+  try {
+    app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::RMSNormLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::MHACoreLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::TieWordEmbedding>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::EmbeddingLayer>);
+
+  } catch (std::invalid_argument &e) {
+    std::cerr << "failed to register factory, reason: " << e.what()
+              << std::endl;
+  }
+}
+
+void CausalLM::registerOutputs(
+  std::unique_ptr<tokenizers::Tokenizer> &tokenizer,
+  std::vector<unsigned int> ids, unsigned int pos,
+  const std::vector<bool> &eos_list) {
+
+  static const std::vector<char> puncts{',', '!', ':', ';', '?'};
+  for (size_t b = 0; b < ids.size(); ++b) {
+    if (!eos_list[b]) {
+      pending_ids_.push_back(static_cast<int>(ids[b]));
+      ids_history[b * MAX_SEQ_LEN + pos] = ids[b];
+      std::string decoded_str = tokenizer->Decode(pending_ids_);
+
+      if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
+          puncts.end()) {
+        // last symbol is a punctuation, hold on
+      } else if (decoded_str.size() >= 3 &&
+                 decoded_str.compare(decoded_str.size() - 3, 3, "�") == 0) {
+        // ends with an incomplete token, hold on
+      } else {
+#if defined(_WIN32)
+        std::wcout << L"" << utf8_to_wstring(decoded_str);
+        std::wcout.flush();
+#else
+        std::cout << decoded_str;
+        std::cout.flush();
+#endif
+        output_list[b].append(decoded_str);
+        pending_ids_.clear();
+      }
+    }
+  }
+}
+
+void CausalLM::save_kvcache(std::string path, int to_) {
+  auto f = nntrainer::checkedOpenStream<std::ofstream>(
+    path, std::ios::out | std::ios::binary | std::ios::trunc);
+
+  size_t kv_heads = NUM_HEADS / GQA_SIZE;
+  size_t partial_size = BATCH_SIZE * kv_heads * to_ * HEAD_DIM;
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    f.write(reinterpret_cast<const char *>(
+              kv_cache_buffers.key_buffers[i].data()),
+            partial_size * sizeof(float));
+    f.write(reinterpret_cast<const char *>(
+              kv_cache_buffers.value_buffers[i].data()),
+            partial_size * sizeof(float));
+  }
+  f.close();
+}
+
+void CausalLM::load_kvcache(std::string path, int to_) {
+  auto f = nntrainer::checkedOpenStream<std::ifstream>(
+    path, std::ios::in | std::ios::binary);
+
+  model->allocate(ml::train::ExecutionMode::INFERENCE);
+
+  size_t kv_heads = NUM_HEADS / GQA_SIZE;
+  size_t partial_size = BATCH_SIZE * kv_heads * to_ * HEAD_DIM;
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    f.read(reinterpret_cast<char *>(kv_cache_buffers.key_buffers[i].data()),
+           partial_size * sizeof(float));
+    f.read(reinterpret_cast<char *>(kv_cache_buffers.value_buffers[i].data()),
+           partial_size * sizeof(float));
+  }
+  f.close();
+}
+
+std::string LoadBytesFromFile(const std::string &path) {
+  std::ifstream fs(path, std::ios::in | std::ios::binary);
+  if (fs.fail()) {
+    std::cerr << "Cannot open " << path << std::endl;
+    exit(1);
+  }
+  std::string data;
+  fs.seekg(0, std::ios::end);
+  size_t size = static_cast<size_t>(fs.tellg());
+  fs.seekg(0, std::ios::beg);
+  data.resize(size);
+  fs.read(data.data(), size);
+  return data;
 };
 
 } // namespace causallm

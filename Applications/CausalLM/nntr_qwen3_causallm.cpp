@@ -15,6 +15,7 @@
  * @file	qwen3_causallm.cpp
  * @date	23 July 2025
  * @brief	This defines a qwen3 causal language model.
+ *          This model uses nntrainer's optimized layers.
  * @see		https://github.com/nnstreamer/
  * @author	Eunju Yang <ej.yang@samsung.com>
  * @bug		No known bugs except for NYI items
@@ -22,41 +23,39 @@
  */
 #include <llm_util.hpp>
 #include <model.h>
-#include <qwen3_causallm.h>
+#include <nntr_qwen3_causallm.h>
 
 #include <app_context.h>
 #include <engine.h>
+#include <qkv_layer.h>
 #include <reshaped_rms_norm.h>
 
 namespace causallm {
 
-Tensor Qwen3CausalLM::createAttention(const int layer_id, int seq_len,
-                                       int n_heads, int head_dim, Tensor query,
-                                       Tensor key, Tensor value) {
+Tensor NNTRQwen3CausalLM::createAttention(const int layer_id, int seq_len,
+                                           int n_heads, int head_dim,
+                                           Tensor query, Tensor key,
+                                           Tensor value) {
 
   using ml::train::createLayer;
 
-  auto Q_name = "layer" + std::to_string(layer_id) + "_wq";
-  auto Q_norm_name = "layer" + std::to_string(layer_id) + "_q_norm";
-  auto K_name = "layer" + std::to_string(layer_id) + "_wk";
+  auto QKV_name = "layer" + std::to_string(layer_id) + "_qkv";
   auto K_norm_name = "layer" + std::to_string(layer_id) + "_k_norm";
-  auto V_name = "layer" + std::to_string(layer_id) + "_wv";
+  auto Q_norm_name = "layer" + std::to_string(layer_id) + "_q_norm";
   auto A_name = "layer" + std::to_string(layer_id) + "_attention";
   auto O_name = "layer" + std::to_string(layer_id) + "_attention_out";
 
-  // V projection
-  LayerHandle v_proj = createLayer(
-    "fully_connected",
-    {withKey("name", V_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
-  Tensor v = v_proj(value);
-
-  // K projection
-  LayerHandle k_proj = createLayer(
-    "fully_connected",
-    {withKey("name", K_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
-  Tensor k = k_proj(key);
+  // QKV fused layer (3 outputs)
+  LayerHandle qkv_layer = createLayer(
+    "qkv_layer",
+    {withKey("name", QKV_name),
+     withKey("q_unit", head_dim * n_heads),
+     withKey("k_unit", head_dim * n_heads / GQA_SIZE),
+     withKey("v_unit", head_dim * n_heads / GQA_SIZE)});
+  Tensor qkv = qkv_layer(query);
+  Tensor q = qkv.output(0);
+  Tensor k = qkv.output(1);
+  Tensor v = qkv.output(2);
 
   // K reshaped norm
   LayerHandle k_norm = createLayer(
@@ -65,13 +64,6 @@ Tensor Qwen3CausalLM::createAttention(const int layer_id, int seq_len,
      withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("feature_size", std::to_string(head_dim))});
   Tensor k_normed = k_norm(k);
-
-  // Q projection
-  LayerHandle q_proj = createLayer(
-    "fully_connected",
-    {withKey("name", Q_name), withKey("unit", head_dim * n_heads),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
-  Tensor q = q_proj(query);
 
   // Q reshaped norm
   LayerHandle q_norm = createLayer(
@@ -103,7 +95,7 @@ Tensor Qwen3CausalLM::createAttention(const int layer_id, int seq_len,
   return o;
 }
 
-void Qwen3CausalLM::registerCustomLayers() {
+void NNTRQwen3CausalLM::registerCustomLayers() {
   CausalLM::registerCustomLayers();
   ///
   auto &ct_engine = nntrainer::Engine::Global();
@@ -113,6 +105,7 @@ void Qwen3CausalLM::registerCustomLayers() {
   try {
     app_context->registerFactory(
       nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    app_context->registerFactory(nntrainer::createLayer<causallm::QKVLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;

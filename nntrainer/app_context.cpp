@@ -44,7 +44,6 @@
 #include <constant_derivative_loss_layer.h>
 #include <conv1d_layer.h>
 #include <conv2d_layer.h>
-#include <depthwise_conv1d_layer.h>
 #include <conv2d_transpose_layer.h>
 #include <cosine_layer.h>
 #include <cross_entropy_sigmoid_loss_layer.h>
@@ -56,10 +55,12 @@
 #include <fc_layer.h>
 #include <flatten_layer.h>
 #include <gather_layer.h>
+#include <group_normalization_layer.h>
 #include <gru.h>
 #include <grucell.h>
 #include <identity_layer.h>
 #include <input_layer.h>
+#include <instance_normalization_layer.h>
 #include <layer_normalization_layer.h>
 #include <lr_scheduler_constant.h>
 #include <lr_scheduler_cosine.h>
@@ -322,6 +323,12 @@ void AppContext::add_default_object() {
   registerFactory(nntrainer::createLayer<LayerNormalizationLayer>,
                   LayerNormalizationLayer::type,
                   LayerType::LAYER_LAYER_NORMALIZATION);
+  registerFactory(nntrainer::createLayer<GroupNormalizationLayer>,
+                  GroupNormalizationLayer::type,
+                  LayerType::LAYER_GROUP_NORMALIZATION);
+  registerFactory(nntrainer::createLayer<InstanceNormalizationLayer>,
+                  InstanceNormalizationLayer::type,
+                  LayerType::LAYER_INSTANCE_NORMALIZATION);
   registerFactory(nntrainer::createLayer<Conv2DLayer>, Conv2DLayer::type,
                   LayerType::LAYER_CONV2D);
   registerFactory(nntrainer::createLayer<Conv2DTransposeLayer>,
@@ -329,9 +336,6 @@ void AppContext::add_default_object() {
                   LayerType::LAYER_CONV2D_TRANSPOSE);
   registerFactory(nntrainer::createLayer<Conv1DLayer>, Conv1DLayer::type,
                   LayerType::LAYER_CONV1D);
-  registerFactory(nntrainer::createLayer<DepthwiseConv1DLayer>,
-                  DepthwiseConv1DLayer::type,
-                  LayerType::LAYER_DEPTHWISE_CONV1D);
   registerFactory(nntrainer::createLayer<Pooling2DLayer>, Pooling2DLayer::type,
                   LayerType::LAYER_POOLING2D);
   registerFactory(nntrainer::createLayer<FlattenLayer>, FlattenLayer::type,

@@ -53,6 +53,16 @@ Tensor *TensorPool::placeholder(const std::string &name, const TensorDim &dim) {
   return request(name, dim, {}, TensorLifespan::UNMANAGED);
 }
 
+Tensor *TensorPool::requestOrPlaceholder(
+  const std::string &name, const TensorDim &dim,
+  const std::vector<unsigned int> &exec_order, TensorLifespan lifespan,
+  bool is_external, const Initializer &init) {
+  if (is_external) {
+    return placeholder(name, dim);
+  }
+  return request(name, dim, exec_order, lifespan, init);
+}
+
 /**
  * @brief     Request tensor which has been already requested with the given
  * spec

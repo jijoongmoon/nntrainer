@@ -22,7 +22,7 @@ def emit_flat_header(structure, model_name=None):
     L.append(f"#include <model.h>")
     L.append(f"#include <tensor_api.h>")
     L.append(f"")
-    L.append(f"using LayerHandle = std::shared_ptr<ml::train::Layer>;")
+    L.append(f"using LayerHandle = ml::train::LayerHandle;")
     L.append(f"using Tensor = ml::train::Tensor;")
     L.append(f"using ModelHandle = std::unique_ptr<ml::train::Model>;")
     L.append(f"")
@@ -99,7 +99,7 @@ def emit_structured_header(structure, blocks_info, model_name=None):
         L.append(f"#include <reshaped_rms_norm.h>")
         L.append(f"")
 
-    L.append(f"using LayerHandle = std::shared_ptr<ml::train::Layer>;")
+    L.append(f"using LayerHandle = ml::train::LayerHandle;")
     L.append(f"using Tensor = ml::train::Tensor;")
     L.append(f"using ModelHandle = std::unique_ptr<ml::train::Model>;")
     L.append(f"")
@@ -305,7 +305,7 @@ def _emit_member_variables(L, s, attn_block):
 
     L.append(f"  unsigned int INIT_SEQ_LEN = 0;")
     if is_decoder:
-        L.append(f"  unsigned int NUM_TO_GENERATE = 0;")
+        L.append(f"  unsigned int NUM_TO_GENERATE = 1;")
     if attn_block and attn_block.attention.has_rope:
         L.append(f"  unsigned int MAX_POSITION_EMBEDDINGS = "
                  f"{s.max_position_embeddings or 2048};")

@@ -74,12 +74,10 @@ int main(int argc, char *argv[]) {
 
     auto &model = model_builder.getModel();
     std::cout << "[inference] Model initialized successfully." << std::endl;
+    model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 
-    // Step 2: Allocate memory
-    model->allocate(ml::train::ExecutionMode::INFERENCE);
-    std::cout << "[inference] Memory allocated." << std::endl;
-
-    // Step 3: Load weights
+    // Step 2: Load weights
+    // Note: compile(Tensor, Tensor) already does compile+initialize+allocate
     std::cout << "[inference] Loading weights from: " << args.weight_path
               << std::endl;
     model->load(args.weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);

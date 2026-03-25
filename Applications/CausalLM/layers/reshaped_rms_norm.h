@@ -128,4 +128,4 @@ private:
 
 } // namespace causallm
 
-#endif /* __RESHAPED_RMS_NORM_LAYER_H__ */
+#endif /* __CAUSALLM_RMS_NORM_LAYER_H__ */

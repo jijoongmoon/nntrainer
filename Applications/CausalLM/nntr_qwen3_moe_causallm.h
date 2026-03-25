@@ -2,38 +2,37 @@
 /**
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
- * @file   qwen3_moe_causallm.h
+ * @file   nntr_qwen3_moe_causallm.h
  * @date   15 July 2025
- * @see    https://github.com/nntrainer/nntrainer
+ * @see    https://github.com/nnstreamer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
 
-#ifndef __QWEN_CACHED_SLIM_MOE_CAUSAL_LM_H__
-#define __QWEN_CACHED_SLIM_MOE_CAUSAL_LM_H__
+#ifndef __NNTR_QWEN_MOE_CAUSAL_LM_H__
+#define __NNTR_QWEN_MOE_CAUSAL_LM_H__
 
 #include <causal_lm.h>
-#include <qwen3_causallm.h>
+#include <nntr_qwen3_causallm.h>
 
 namespace causallm {
 
 /**
- * @brief Qwen3CachedSlimMoECausalLM class
+ * @brief Qwen3MoECausalLM class
  * @note  This class inherits Qwewn3CaUSALlm
  */
-class Qwen3CachedSlimMoECausalLM : public Qwen3CausalLM {
+class NNTRQwen3MoECausalLM : public NNTRQwen3CausalLM {
 
 public:
-  static constexpr const char *architectures = "Qwen3CachedSlimMoeForCausalLM";
+  static constexpr const char *architectures = "NNTRQwen3MoeCausalLM";
 
-  Qwen3CachedSlimMoECausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
-    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
-    Qwen3CausalLM(cfg, generation_cfg, nntr_cfg) {
+  NNTRQwen3MoECausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
+    NNTRQwen3CausalLM(cfg, generation_cfg, nntr_cfg) {
     setupParameters(cfg, generation_cfg, nntr_cfg);
   }
 
-  virtual ~Qwen3CachedSlimMoECausalLM() = default;
+  virtual ~NNTRQwen3MoECausalLM() = default;
 
   Tensor createMlp(const int layer_id, int dim, int hidden_dim,
                     Tensor input) override;
@@ -49,4 +48,4 @@ private:
 };
 }; // namespace causallm
 
-#endif /* __QWEN_MOE_CAUSAL_LM_H__ */
+#endif /* __NNTR_QWEN_MOE_CAUSAL_LM_H__ */
