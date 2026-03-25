@@ -1050,29 +1050,35 @@ class AdaptiveConverter:
         # Pass 5: Detect structural patterns (attention, FFN, blocks)
         model_structure = detect_patterns(layers, self.config)
 
-        # Store fused_ops in structure for emitter to use
-        model_structure.fused_ops = self.fused_ops
+        # Pass 5.5: Pattern-based fused op compatibility check
+        # Compare FX-traced op sequences against NNTrainer fused op patterns
+        # to determine which fused ops are safe to use.
+        from fused_op_patterns import (
+            check_fused_op_compatibility, print_compatibility_report)
+        compat_results = check_fused_op_compatibility(layers)
+        print_compatibility_report(compat_results)
 
-        # Optimization notifications
-        if model_structure.blocks:
-            available_opts = []
-            if "attention" not in self.fused_ops:
-                has_attn = any(b.attention for b in model_structure.blocks)
-                if has_attn:
-                    available_opts.append(
-                        "attention -> mha_core (requires verification)")
-            if "swiglu" not in self.fused_ops:
-                has_swiglu = any(
-                    b.ffn and b.ffn.ffn_type == "swiglu"
-                    for b in model_structure.blocks)
-                if has_swiglu:
-                    available_opts.append(
-                        "SwiGLU FFN -> swiglu custom layer (requires verification)")
-            if available_opts:
-                print(f"  [OPT] Optimization opportunities (use --fused-ops "
-                      f"to enable after verification):")
-                for opt in available_opts:
-                    print(f"    - {opt}")
+        # Auto-enable verified fused ops
+        auto_fused = set()
+        for op_name, result in compat_results.items():
+            if result.matched:
+                auto_fused.add(op_name)
+
+        # Merge with explicitly requested fused_ops
+        effective_fused = self.fused_ops | auto_fused
+        model_structure.fused_ops = effective_fused
+
+        if auto_fused:
+            print(f"  [FUSED] Auto-enabled: {', '.join(sorted(auto_fused))}")
+
+        # If attention is now fused, collapse RoPE (was skipped in accurate mode)
+        if "attention" in effective_fused and "attention" not in self.fused_ops:
+            layers, extra_rope = _collapse_rope_chains(layers)
+            if extra_rope:
+                collapsed_rope |= extra_rope
+                layers = _remove_dead_layers(layers)
+                print(f"  [ROPE] Collapsed RoPE chains (auto-enabled with "
+                      f"mha_core)")
 
         # Collect diagnostics
         remaining_unknowns = [l for l in layers
