@@ -130,6 +130,8 @@ class ModelStructure:
     # T5 relative position bias config
     relative_attention_num_buckets: int = 0
     relative_attention_max_distance: int = 0
+    # Fused ops control (set by converter pipeline)
+    fused_ops: set = field(default_factory=set)
 
     @property
     def encoder_blocks(self):

@@ -856,6 +856,16 @@ class AdaptiveConverter:
     This is the main entry point for converting any HuggingFace model to
     NNTrainer layer definitions.
 
+    Args:
+        model: HuggingFace model.
+        config: HuggingFace model config.
+        plugin_registry: Optional custom layer plugin registry.
+        fused_ops: Set of op types to use fused (optimized) versions.
+                   Default: {"attention", "swiglu"} for verified models,
+                   empty set for unverified models (decomposed ops).
+                   "attention" -> mha_core + RoPE collapse
+                   "swiglu" -> SwiGLU custom layer
+
     Pipeline:
         Pass 1: Trace with full LEAF_MODULES
                 -> Map to NNTrainer layers
@@ -894,6 +904,7 @@ class AdaptiveConverter:
         self.model = model
         self.config = model_config
         self.training = training
+        self.fused_ops = set()  # default: no fused ops (accurate mode)
         if plugin_registry is not None:
             from plugin_registry import get_global_registry, _global_registry
             # Merge into global registry so module_mapper can find them
@@ -1005,13 +1016,18 @@ class AdaptiveConverter:
         # modules).  Iterates to handle chains of dead layers.
         layers = _remove_dead_layers(layers)
 
-        # Pass 3.96: Collapse RoPE chains — remove decomposed
-        # sin/cos/rotate_half ops that mha_core handles internally
-        # via rope_theta parameter (NEON/AVX2 optimized).
-        layers, collapsed_rope = _collapse_rope_chains(layers)
-        if collapsed_rope:
-            # Clean up any orphaned layers after RoPE removal
-            layers = _remove_dead_layers(layers)
+        # Pass 3.96: Collapse RoPE chains — only when fused attention is enabled,
+        # because mha_core handles RoPE internally via rope_theta.
+        # In accurate mode (no fused attention), RoPE ops are preserved as
+        # individual tensor ops for exact computation.
+        collapsed_rope = set()
+        if "attention" in self.fused_ops:
+            layers, collapsed_rope = _collapse_rope_chains(layers)
+            if collapsed_rope:
+                layers = _remove_dead_layers(layers)
+        else:
+            print("  [MODE] Accurate mode: RoPE preserved as individual ops "
+                  "(mha_core not used)")
 
         # Pass 3.97: Decompose fused gate+up SwiGLU patterns
         # (FC → chunk/split → silu → multiply → FC) into standard SwiGLU
@@ -1033,6 +1049,30 @@ class AdaptiveConverter:
 
         # Pass 5: Detect structural patterns (attention, FFN, blocks)
         model_structure = detect_patterns(layers, self.config)
+
+        # Store fused_ops in structure for emitter to use
+        model_structure.fused_ops = self.fused_ops
+
+        # Optimization notifications
+        if model_structure.blocks:
+            available_opts = []
+            if "attention" not in self.fused_ops:
+                has_attn = any(b.attention for b in model_structure.blocks)
+                if has_attn:
+                    available_opts.append(
+                        "attention -> mha_core (requires verification)")
+            if "swiglu" not in self.fused_ops:
+                has_swiglu = any(
+                    b.ffn and b.ffn.ffn_type == "swiglu"
+                    for b in model_structure.blocks)
+                if has_swiglu:
+                    available_opts.append(
+                        "SwiGLU FFN -> swiglu custom layer (requires verification)")
+            if available_opts:
+                print(f"  [OPT] Optimization opportunities (use --fused-ops "
+                      f"to enable after verification):")
+                for opt in available_opts:
+                    print(f"    - {opt}")
 
         # Collect diagnostics
         remaining_unknowns = [l for l in layers

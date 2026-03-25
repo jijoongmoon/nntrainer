@@ -66,14 +66,21 @@ def emit_block_method(cname, block_type, block, structure, is_encoder=None):
         op_input = current_input
 
     # Operator
-    if block.attention:
-        L.append(f"  // Self attention")
+    use_fused_attn = (block.attention
+                      and structure.fused_ops
+                      and "attention" in structure.fused_ops)
+    if block.attention and use_fused_attn:
+        L.append(f"  // Self attention (fused: mha_core)")
         L.append(f"  Tensor att_out =")
         L.append(f"    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, "
                  f"HEAD_DIM,")
         L.append(f"                    {op_input}, {op_input}, {op_input});")
         L.append(f"")
         op_output = "att_out"
+    elif block.attention and not use_fused_attn:
+        # Decomposed attention: emit individual ops from layer graph
+        op_output = _emit_operator_layers(L, block, op_input, prefix_expr,
+                                          use_attn_layers=True)
     elif block.operator_layers:
         op_output = _emit_operator_layers(L, block, op_input, prefix_expr)
     else:
