@@ -65,6 +65,7 @@ endforeach
 converter_inference_models = [
   ['qwen3_verify', 'converter_qwen3_verify_inference', 'Qwen3CausalLM'],
   ['llama_verify', 'converter_llama_verify_inference', 'LlamaCausalLM'],
+  ['qwen3_tied_verify', 'converter_qwen3_tied_verify_inference', 'Qwen3CausalLM'],
 ]
 
 foreach m : converter_inference_models
