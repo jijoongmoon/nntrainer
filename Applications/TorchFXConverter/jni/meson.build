@@ -64,6 +64,7 @@ endforeach
 # Each entry: [file_basename, executable_name, class_name]
 converter_inference_models = [
   ['qwen3_verify', 'converter_qwen3_verify_inference', 'Qwen3CausalLM'],
+  ['llama_verify', 'converter_llama_verify_inference', 'LlamaCausalLM'],
 ]
 
 foreach m : converter_inference_models
