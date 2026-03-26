@@ -4,7 +4,7 @@
  *
  * @file   memory_pool.h
  * @date   10 August 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Memory Pool Class
@@ -28,7 +28,7 @@
 #include <memory_planner.h>
 #include <tensor_wrap_specs.h>
 
-#ifdef ENABLE_OPENCL
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
 #include <cl_context.h>
 #endif
 

@@ -4,7 +4,7 @@
  *
  * @file   layer_node.h
  * @date   1 April 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @author Debadri Samaddar <s.debadri@samsung.com>
  * @bug    No known bugs except for NYI items

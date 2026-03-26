@@ -5,7 +5,7 @@
  * @file unittest_layers_mol_attention.cpp
  * @date 13 July 2022
  * @brief Multi Head Attention Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author hyeonseok Lee <hs89.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

@@ -5,7 +5,7 @@
  * @file unittest_models_multiout.cpp
  * @date 22 November 2021
  * @brief unittest models to cover multiinput, multioutput scenario
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

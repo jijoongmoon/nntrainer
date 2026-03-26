@@ -5,7 +5,7 @@
  * @file unittest_layers_concat_cl.cpp
  * @date 2 July 2024
  * @brief Concat Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Niket Agarwal <niket.a@samsung.com>
  * @bug No known bugs except for NYI items
  */

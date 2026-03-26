@@ -4,12 +4,14 @@
  *
  * @file   cpu_backend.h
  * @date   16 August 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Conditional header file to support unsupported intrinsics on armv7l
  *
  */
+#ifndef ARMV7_NEON_
+#define ARMV7_NEON_
 
 #include <arm_neon.h>
 #include <cmath>
@@ -121,4 +123,5 @@ static inline float16_t vmaxvq_f16(float16x8_t a) {
   }
   return ret;
 }
+#endif
 #endif

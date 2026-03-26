@@ -5,7 +5,7 @@
  * @file nntrainer_error.h
  * @date 03 April 2020
  * @brief NNTrainer Error Codes
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug No known bugs except for NYI items
  */

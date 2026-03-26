@@ -6,7 +6,7 @@
  * @date   27 December 2024
  * @brief  This file contains engine context related functions and classes that
  * manages the engines (NPU, GPU, CPU) of the current environment
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  *
@@ -45,7 +45,7 @@ void Engine::add_default_object() {
   init_backend(); // initialize cpu backend
   registerContext("cpu", &app_context);
 
-#ifdef ENABLE_OPENCL
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
   auto &cl_context = nntrainer::ClContext::Global();
 
   registerContext("gpu", &cl_context);
@@ -61,6 +61,8 @@ void Engine::initialize() noexcept {
     ml_loge("registering layer failed due to unknown reason");
   }
 };
+
+void Engine::release() { thread_pool_manager_.reset(); }
 
 std::string
 Engine::parseComputeEngine(const std::vector<std::string> &props) const {
@@ -168,6 +170,16 @@ int Engine::registerContext(const std::string &library_path,
   registerContext(type, context);
 
   return 0;
+}
+
+ThreadPoolManager *Engine::getThreadPoolManager() {
+  std::lock_guard<std::mutex> lock(thread_pool_manager_mutex_);
+
+  if (!thread_pool_manager_) {
+    thread_pool_manager_ = std::make_unique<ThreadPoolManager>();
+  }
+
+  return thread_pool_manager_.get();
 }
 
 } // namespace nntrainer

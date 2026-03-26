@@ -5,7 +5,7 @@
  * @file main.h
  * @date 14 May 2020
  * @brief TIZEN Native Example App main entry with NNTrainer/CAPI.
- * @see  https://github.com/nnstreamer/nntrainer
+ * @see  https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

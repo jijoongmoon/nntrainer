@@ -4,7 +4,7 @@
  *
  * @file   hgemm_pack.h
  * @date   01 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @author Debadri Samaddar <s.debadri@samsung.com>
  * @bug    No known bugs except for NYI items

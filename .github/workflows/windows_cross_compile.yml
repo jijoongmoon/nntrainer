@@ -1,0 +1,96 @@
+name: "Build Test - Windows Cross Compile ARM64"
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  cross-build:
+    runs-on: windows-latest
+    name: Cross Build (x64 -> ARM64)
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: ${{ github.event.pull_request.commits }}
+          submodules: recursive
+
+      - name: Install Python Dependencies
+        run: pip install meson==1.7.2 ninja
+
+      - name: Setup MSVC for Cross Compilation
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
+      - name: Prepare Build
+        # Using the CI-specific cross file
+        run: meson setup build_cross --cross-file configurations/windows-cross-arm-ci.ini
+
+      - name: Run Build
+        run: meson compile -C build_cross
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: build_cross/
+          retention-days: 1
+
+  test-on-arm:
+    needs: cross-build
+    runs-on: windows-11-arm
+    name: Test on ARM64
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: ${{ github.event.pull_request.commits }}
+          submodules: recursive
+
+      - name: Install Python Dependencies
+        run: pip install meson==1.7.2 ninja
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: build_cross
+
+      - name: Add build dir to PATH
+        run: echo "${{ github.workspace }}\build_cross" >> $env:GITHUB_PATH
+
+      - name: Prepare Test Environment
+        run: |
+          # Meson build directories are not relocatable (absolute paths are baked in).
+          # To use 'meson test', we must recreate the build metadata on this runner.
+          
+          # 1. Move the downloaded artifacts to a temporary location
+          Rename-Item -Path build_cross -NewName binaries_backup
+          
+          # 2. Create a fresh build configuration for the current runner
+          # We use the native config because we are running on the target architecture (ARM64)
+          meson setup build_cross --native-file configurations/windows-native.ini
+          
+          # 3. Overlay the cross-compiled binaries into the fresh build directory
+          # We use robocopy to exclude build system files (build.ninja, meson-*, etc.)
+          # so we don't overwrite the valid local configuration with the stale cross-configuration.
+          $exclude_files = @("build.ninja", "compile_commands.json", ".ninja_log")
+          $exclude_dirs = @("meson-private", "meson-info", "meson-logs")
+          
+          # Robocopy returns exit code < 8 on success
+          robocopy binaries_backup build_cross /E /XF $exclude_files /XD $exclude_dirs
+          if ($LASTEXITCODE -ge 8) { 
+            Write-Error "Robocopy failed with exit code $LASTEXITCODE"
+            exit 1 
+          }
+          # Reset exit code because robocopy returns non-zero on success (e.g. 1 = files copied)
+          if ($LASTEXITCODE -lt 8) { $global:LASTEXITCODE = 0 }
+
+      - name: Debug File Listing
+        run: Get-ChildItem -Path build_cross\test\unittest -Recurse
+
+      - name: Run Test Suite
+        run: meson test -C build_cross --no-rebuild

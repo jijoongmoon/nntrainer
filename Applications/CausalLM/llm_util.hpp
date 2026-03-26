@@ -4,7 +4,7 @@
  * @file   llm_util.hpp
  * @brief  util functions for llm (refactored from main.cpp)
  * @date   21 August 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @author Eunju Yang <ej.yang@samsung.com>

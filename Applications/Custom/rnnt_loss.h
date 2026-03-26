@@ -5,7 +5,7 @@
  * @file   rnnt_loss.h
  * @date   22 July 2021
  * @brief  This file contains the rnnt loss
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  *

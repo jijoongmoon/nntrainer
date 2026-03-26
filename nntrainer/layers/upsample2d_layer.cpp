@@ -6,7 +6,7 @@
  * @date   15 June 2024
  * @brief  It is a implementation of upsample layer for given size and
  * interpolation method
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author heka1024 <heka1024@gmail.com>
  * @bug    No known bugs except for NYI items
  */

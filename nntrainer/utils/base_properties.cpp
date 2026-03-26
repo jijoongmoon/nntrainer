@@ -5,7 +5,7 @@
  * @file base_properties.cpp
  * @date 03 May 2021
  * @brief Convenient property type definition for automated serialization
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

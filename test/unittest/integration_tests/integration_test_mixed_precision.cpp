@@ -5,7 +5,7 @@
  * @file integration_test_mixed_precision.cpp
  * @date 26 Nov 2024
  * @brief Mixed Precision integration test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug No known bugs except for NYI items
  */

@@ -15,7 +15,7 @@
  * @file	qkv_layer.cpp
  * @date	14 May 2020
  * @brief	This is Fully Connected Layer Class for Neural Network
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Eunju Yang <ej.yang@samsung.com>
  * @bug		No known bugs except for NYI items
  *
@@ -23,7 +23,8 @@
 
 #include <qkv_layer.h>
 
-#include <thread_manager.h>
+#include <bs_thread_pool_manager.hpp>
+#include <engine.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -145,6 +146,9 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::TensorDim input_step_dim = input_dim;
   input_step_dim.batch(1);
   input_step_dim.height(to - from);
+
+  auto &pool =
+    nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
 
   nntrainer::Tensor input_step =
     input_.getSharedDataTensor(input_step_dim, 0, true);

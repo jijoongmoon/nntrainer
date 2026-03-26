@@ -4,7 +4,7 @@
  *
  * @file    cl_context.h
  * @date    23 Feb 2024
- * @see     https://github.com/nnstreamer/nntrainer
+ * @see     https://github.com/nntrainer/nntrainer
  * @author  Debadri Samaddar <s.debadri@samsung.com>
  * @author  Niket Agarwal <niket.a@samsung.com>
  * @author  Thummala Pallavi <t.pallavi@samsung.com>

@@ -15,7 +15,7 @@
  * @file genModelExeOrder.cpp
  * @date 14 February 2023
  * @brief Generate execution order golden data for models
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jiho Chu <jiho.chu@samsung.com>
  * @bug No known bugs except for NYI items
  */

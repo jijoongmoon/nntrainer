@@ -5,7 +5,7 @@
  * @file   upsample2d_layer.h
  * @date   15 June 2024
  * @brief  This is Upsample2d Layer Class of Neural Network
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author heka1024 <heka1024@gmail.com>
  * @bug    No known bugs except for NYI items
  *

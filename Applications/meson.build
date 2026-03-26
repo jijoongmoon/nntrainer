@@ -60,3 +60,5 @@ if get_option('enable-transformer')
     subdir('TorchFXConverter/jni')
   endif
 endif
+
+subdir('Optimizers/jni')

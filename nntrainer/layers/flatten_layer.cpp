@@ -4,7 +4,7 @@
  *
  * @file   flatten_layer.cpp
  * @date   16 June 2020
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author hyeonseok Lee <hs89.lee@samsung.com>
  * @bug	   No known bugs except for NYI items

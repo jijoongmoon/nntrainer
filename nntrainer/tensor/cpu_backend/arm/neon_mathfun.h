@@ -2,7 +2,7 @@
  * @file   neon_mathfun.h
  * @date   15 Jan 2024
  * @brief  This is collection of sin, cos, exp, log function with NEON SIMD
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Julien Pommier
  * @bug    No known bugs except for NYI items
  *

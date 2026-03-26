@@ -5,7 +5,7 @@
  * @file unittest_layers_pow.cpp
  * @date 20 Nov 2024
  * @brief Pow Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author SeungBaek Hong <sb92.hong@samsung.com>
  * @bug No known bugs except for NYI items
  */

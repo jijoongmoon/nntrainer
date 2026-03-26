@@ -5,7 +5,7 @@
  * @file   utils.h
  * @date   08 Jan 2021
  * @brief  This file contains simple utilities used across the application
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *
@@ -16,6 +16,9 @@ namespace simpleshot {
 
 namespace util {
 
+/**
+ * @brief Entry structure
+ */
 struct Entry {
   std::string key;
   std::string value;

@@ -3,7 +3,7 @@
  * @file	util_simd.h
  * @date	09 Jan 2024
  * @brief	This is a collection of simd util functions
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Sungsik Kong <ss.kong@samsung.com>
  * @bug		No known bugs except for NYI items
  */

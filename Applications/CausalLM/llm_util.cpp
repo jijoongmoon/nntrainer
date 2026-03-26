@@ -4,7 +4,7 @@
  * @file   llm_util.cpp
  * @brief  util functions for llm (refactored from main.cpp)
  * @date   21 August 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @author Eunju Yang <ej.yang@samsung.com>
@@ -35,8 +35,10 @@ std::vector<unsigned int> generate_multi_tokens(
   for (unsigned int i = 0; i < NUM_VOCAB; ++i) {
     top_indices_and_logits.push_back({i, logits[i]});
   }
-  sort(top_indices_and_logits.begin(), top_indices_and_logits.end(),
-       [](auto &a, auto &b) { return a.second > b.second; });
+  std::partial_sort(top_indices_and_logits.begin(),
+                    top_indices_and_logits.begin() + NUM_TARGET_TOKENS,
+                    top_indices_and_logits.end(),
+                    [](auto &a, auto &b) { return a.second > b.second; });
 
   // add sampled words
   for (unsigned int i = 0; i < NUM_TARGET_TOKENS; ++i) {
@@ -79,8 +81,10 @@ float applyTKP(float *logits, int len, float temperature, unsigned int top_k,
       logits[i] = logits[i] / temperature;
     top_indices_and_logits.push_back({i, logits[i]});
   }
-  sort(top_indices_and_logits.begin(), top_indices_and_logits.end(),
-       [](auto &a, auto &b) { return a.second > b.second; });
+  std::partial_sort(top_indices_and_logits.begin(),
+                    top_indices_and_logits.begin() + 1,
+                    top_indices_and_logits.end(),
+                    [](auto &a, auto &b) { return a.second > b.second; });
 
   return top_indices_and_logits[0].second;
 }

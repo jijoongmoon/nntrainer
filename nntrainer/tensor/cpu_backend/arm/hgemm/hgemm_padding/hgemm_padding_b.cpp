@@ -4,7 +4,7 @@
  *
  * @file   hgemm_padding_b.cpp
  * @date   05 July 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is a source file for padding function used in hgemm

@@ -7,7 +7,7 @@
  * @brief This patch contains constant derivative loss implementation
  * @note This is special type of loss to feed an arbitrary derivative value to
  * the last layer.
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

@@ -5,7 +5,7 @@
  * @file unittest_layers_fully_connected_cl.cpp
  * @date 7 June 2024
  * @brief Fully Connected Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Debadri Samaddar <s.debadri@samsung.com>
  * @bug No known bugs except for NYI items
  */

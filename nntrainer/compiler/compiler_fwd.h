@@ -5,7 +5,7 @@
  * @file compiler_fwd.h
  * @date 09 October 2021
  * @brief NNTrainer graph compiler related forward declarations
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

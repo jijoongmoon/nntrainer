@@ -4,7 +4,7 @@
  *
  * @file   unittest_layers_reshape_cl.cpp
  * @date   18 June 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Reshape Layer Test

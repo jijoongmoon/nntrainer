@@ -4,7 +4,7 @@
  *
  * @file   pooling2d_layer.h
  * @date   12 June 2020
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is 2 Dimensional Pooling Layer Class for Neural Network

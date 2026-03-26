@@ -4,7 +4,7 @@
  *
  * @file   TFLite_export.cpp
  * @date   18 July 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  TF Lite Export Example

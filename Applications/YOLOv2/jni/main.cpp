@@ -6,7 +6,7 @@
  * @date   03 March 2023
  * @todo   replace backbone to original darknet of yolo v2
  * @brief  application example for YOLO v2
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  */

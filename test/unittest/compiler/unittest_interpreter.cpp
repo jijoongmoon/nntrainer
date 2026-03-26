@@ -5,7 +5,7 @@
  * @file unittest_interpreter.cpp
  * @date 02 April 2021
  * @brief interpreter test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug No known bugs except for NYI items

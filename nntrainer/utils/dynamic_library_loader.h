@@ -5,7 +5,7 @@
  * @file   dynamic_library_loader.h
  * @date   14 January 2025
  * @brief  Wrapper for loading dynamic libraries on multiple operating systems
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Grzegorz Kisala <g.kisala@samsung.com>
  * @bug    No known bugs except for NYI items
  *

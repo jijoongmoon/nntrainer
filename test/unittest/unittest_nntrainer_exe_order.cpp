@@ -16,7 +16,7 @@
  * @file        unittest_nntrainer_exe_order.cpp
  * @date        10 February 2023
  * @brief       execution order test
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Jiho Chu <jiho.chu@samsung.com>
  * @bug         No known bugs
  */

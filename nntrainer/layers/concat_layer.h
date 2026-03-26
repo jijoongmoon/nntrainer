@@ -4,7 +4,7 @@
  *
  * @file   concat_layer.h
  * @date   27 Oct 2020
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Concat Layer Class for Neural Network

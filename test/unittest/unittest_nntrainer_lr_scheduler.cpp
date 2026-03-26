@@ -5,7 +5,7 @@
  * @file   unittest_nntrainer_lr_scheduler.cpp
  * @date   09 December 2021
  * @brief  This is unittests for learning rate schedulers
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  *

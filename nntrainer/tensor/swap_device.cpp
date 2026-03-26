@@ -4,7 +4,7 @@
  *
  * @file   swap_device.cpp
  * @date   01 July 2022
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jiho Chu <jiho.chu@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Swap device class implementation

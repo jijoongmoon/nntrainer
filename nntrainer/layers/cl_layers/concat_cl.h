@@ -5,7 +5,7 @@
  * @file   concat_cl.h
  * @date   2 July 2024
  * @brief  Implementation of Concat Layer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  *

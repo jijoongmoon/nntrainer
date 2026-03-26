@@ -5,7 +5,7 @@
  * @file	unittest_attention_kernels_cl.cpp
  * @date	28 August 2024
  * @brief	Test setup for blas OpenCL kernels
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Yash Singh <yash.singh@samsung.com>
  * @bug		No known bugs except for NYI items
  */

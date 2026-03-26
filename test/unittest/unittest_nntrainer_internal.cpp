@@ -16,7 +16,7 @@
  * @file        unittest_nntrainer_internal.cpp
  * @date        10 April 2020
  * @brief       Unit test utility.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Jijoong Moon <jijoong.moon@samsung.com>
  * @bug         No known bugs
  */

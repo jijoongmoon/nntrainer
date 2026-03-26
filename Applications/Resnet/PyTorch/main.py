@@ -3,7 +3,7 @@
 #
 # @file   main.cpp
 # @date   26 Jan 2023
-# @see    https://github.com/nnstreamer/nntrainer
+# @see    https://github.com/nntrainer/nntrainer
 # @author Donghak Park <donghak.park@samsung.com>
 # @bug	  No known bugs except for NYI items
 # @brief  This is Resnet Example for PyTorch (only training)

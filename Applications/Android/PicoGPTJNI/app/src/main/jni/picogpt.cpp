@@ -4,7 +4,7 @@
  *
  * @file   picogpt.cpp
  * @date   20 March 2023
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Hyeonseok Lee <hs89.lee@samsung.com>

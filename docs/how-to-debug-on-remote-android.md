@@ -2,7 +2,7 @@
 By following this tutorial, users can learn how to install and run a cross-compiled unittest executable with the lldb-server debugger attached.
 
 ## Install lldb from ndk
-- This tutorial assumes that the user has already installed the NDK as a prerequisite. Follow [here](https://github.com/nnstreamer/nntrainer/blob/main/docs/how-to-run-example-android.md) if not installed.
+- This tutorial assumes that the user has already installed the NDK as a prerequisite. Follow [here](https://github.com/nntrainer/nntrainer/blob/main/docs/how-to-run-example-android.md) if not installed.
 - Then you can get the lldb-server from the NDK. (Skip if already installed)
 
 1. On your terminal, find where your lldb at by:

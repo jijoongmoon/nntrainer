@@ -5,7 +5,7 @@
  * @file   swiglu_cl.h
  * @date   6th June 2024
  * @brief  Implementation of SwiGLU activation function
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Niket Agarwal <niket.a@samsung.com>
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items

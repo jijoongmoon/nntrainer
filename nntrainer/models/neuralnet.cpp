@@ -15,7 +15,7 @@
  * @file	neuralnet.cpp
  * @date	04 December 2019
  * @brief	This is Neural Network Class
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @bug		No known bugs except for NYI items
  *
@@ -1159,7 +1159,9 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   // auto end_increment = std::chrono::high_resolution_clock::now();
   std::vector<float *> output;
 
-  unsigned int step = ((to - from) == 0) ? 0 : (to - from) - 1;
+  ///@note Always we take the first position of output
+  // unsigned int step = ((to - from) == 0) ? 0 : (to - from) - 1;
+  unsigned int step = 0;
 
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
@@ -1173,6 +1175,7 @@ std::vector<float *> NeuralNetwork::incremental_inference(
       for (unsigned int batch = 0; batch < batch_size; ++batch) {
         if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
+
           const _FP16 *out_t_batch_ptr =
             out_t.getData<_FP16>() + batch * out_t.getDim().getFeatureLen() +
             step * out_t.width();
@@ -1183,6 +1186,7 @@ std::vector<float *> NeuralNetwork::incremental_inference(
           throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif
         } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
+
           const float *out_t_batch_ptr =
             out_t.getData() + batch * out_t.getDim().getFeatureLen() +
             step * out_t.width();

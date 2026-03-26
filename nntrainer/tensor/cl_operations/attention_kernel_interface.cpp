@@ -5,7 +5,7 @@
  * @file	attention_kernel_interface.cpp
  * @date	28 August 2024
  * @brief	Interface for attention OpenCL kernels
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Yash Singh <yash.singh@samsung.com>
  * @bug		No known bugs except for NYI items
  *

@@ -4,7 +4,7 @@
  *
  * @file   layer_node.cpp
  * @date   1 April 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @author Debadri Samaddar <s.debadri@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -34,7 +34,7 @@
 #include <tracer.h>
 #include <util_func.h>
 
-#ifdef ENABLE_OPENCL
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
 #include <cl_context.h>
 #endif
 

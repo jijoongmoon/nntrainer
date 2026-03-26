@@ -3,7 +3,7 @@
  * @file	q4_k_tensor.h
  * @date	23 April 2025
  * @brief	This is Q4_K_Tensor class for Q4_K quantized tensor.
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
  */

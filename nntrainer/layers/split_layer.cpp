@@ -4,7 +4,7 @@
  *
  * @file   split_layer.cpp
  * @date   21 May 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Split Layer Class for Neural Network

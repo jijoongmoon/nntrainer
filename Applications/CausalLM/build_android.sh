@@ -25,7 +25,7 @@ if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrai
     if [ -d "$NNTRAINER_ROOT/builddir" ]; then
         rm -rf builddir
     fi
-    ./tools/package_android.sh -Domp-num-threads=4 -Dggml-thread-backend=omp -Dmmap-read=false
+    ./tools/package_android.sh -Dmmap-read=false
 else
     echo "nntrainer for Android already built."
 fi
@@ -53,7 +53,20 @@ if [ ! -f "lib/libtokenizers_android_c.a" ]; then
 fi
 echo "Tokenizer Library Built Successfully"
 
-# Step 3: Build CausalLM application
+# Step 3: Prepare json.hpp if not present
+if [ ! -f "$SCRIPT_DIR/json.hpp" ]; then
+    echo "json.hpp not found. Downloading..."
+    # prepare_encoder.sh expects target directory as first argument and version as second
+    # It copies json.hpp to ../Applications/CausalLM/ if version is 0.2
+    "$NNTRAINER_ROOT/jni/prepare_encoder.sh" "$NNTRAINER_ROOT/builddir" "0.2"
+    
+    if [ ! -f "$SCRIPT_DIR/json.hpp" ]; then
+        echo "Error: Failed to download json.hpp"
+        exit 1
+    fi
+fi
+
+# Step 4: Build CausalLM application
 echo "Building CausalLM application..."
 cd "$SCRIPT_DIR/jni"
 

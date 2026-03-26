@@ -3,7 +3,7 @@
  * @file	bcq_tensor.h
  * @date	06 December 2024
  * @brief	This is BCQTensor class for binary-code-based quantization
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
  */

@@ -5,7 +5,7 @@
  * @file  model_loader.cpp
  * @date  5 August 2020
  * @brief This is model loader class for the Neural Network
- * @see   https://github.com/nnstreamer/nntrainer
+ * @see   https://github.com/nntrainer/nntrainer
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @author  Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug   No known bugs except for NYI items

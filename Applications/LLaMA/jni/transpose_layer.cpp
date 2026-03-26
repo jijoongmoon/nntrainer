@@ -5,7 +5,7 @@
  * @file   transpose_layer.cpp
  * @date   21 August 2023
  * @brief  Implementation of transpose layer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  *

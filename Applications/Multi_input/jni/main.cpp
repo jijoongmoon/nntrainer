@@ -5,7 +5,7 @@
  * @file   main.cpp
  * @date   5 July 2023
  * @brief  Example of multi-input dataloader
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author SeungBaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items

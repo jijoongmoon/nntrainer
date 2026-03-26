@@ -5,7 +5,7 @@
  * @file   main.cpp
  * @date   19 May 2023
  * @brief  task runner for the pico gpt
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  *         https://github.com/jaymody/picoGPT
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @bug    No known bugs except for NYI items

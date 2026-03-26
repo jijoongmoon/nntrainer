@@ -5,7 +5,7 @@
  * @file   main.cpp
  * @date   01 Jul 2024
  * @brief  Resnet Mixed Precision example
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug    No known bugs except for NYI items
  */

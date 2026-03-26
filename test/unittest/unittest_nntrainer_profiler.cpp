@@ -5,7 +5,7 @@
  * @file   unittest_nntrainer_profiler.cpp
  * @date   09 December 2020
  * @brief  Profiler Tester
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

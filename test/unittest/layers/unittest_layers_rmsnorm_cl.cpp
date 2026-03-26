@@ -5,7 +5,7 @@
  * @file unittest_layers_rmsnorm_cl.cpp
  * @date 7 June 2024
  * @brief RMS Norm Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Thummala Pallavi <t.pallavi@samsung.com>
  * @bug No known bugs except for NYI items
  */

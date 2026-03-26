@@ -4,7 +4,7 @@
  *
  * @file   hgemm_padding.h
  * @date   05 July 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is a header file for including both padding matrix A and B

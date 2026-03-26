@@ -5,7 +5,7 @@
  * @file   singleton.h
  * @date   11 July 2025
  * @brief  Base class making derived class singleton
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Grzegorz Kisala <g.kisala@samsung.com>
  * @bug    No known bugs except for NYI items
  *

@@ -15,7 +15,7 @@
  * @file	cartpole.cpp
  * @date	04 December 2019
  * @brief	This is environment class for cartpole example
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @bug		No known bugs except for NYI items
  *
@@ -58,6 +58,7 @@ CartPole::CartPole() {
   steps_beyond_done = -1;
   count = 0;
   action_dim = 2;
+  S = {};
 }
 
 void CartPole::init() {

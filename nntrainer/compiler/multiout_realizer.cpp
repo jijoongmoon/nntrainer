@@ -5,7 +5,7 @@
  * @file multiout_realizer.h
  * @date 17 November 2021
  * @brief NNTrainer graph realizer which realizes multiout to actual node
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

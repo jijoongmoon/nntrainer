@@ -4,7 +4,7 @@
  *
  * @file   nntr_ggml_impl.h
  * @date   13 August 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Custom-implemented functions to support ggml functions for internal

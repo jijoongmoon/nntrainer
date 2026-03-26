@@ -3,7 +3,7 @@
  * @file	quantizer.cpp
  * @date	10 December 2024
  * @brief	This defines quantizers for different types of quantization schemes
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
  */

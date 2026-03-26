@@ -4,7 +4,7 @@
  *
  * @file   reduce_sum_layer.cpp
  * @date   24 July 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sumon Nath <sumon.nath@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Reduce Sum Layer Class for Neural Network

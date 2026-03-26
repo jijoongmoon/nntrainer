@@ -5,7 +5,7 @@
  * @file   lstm.h
  * @date   31 March 2021
  * @brief  This is Long Short-Term Memory Layer Class of Neural Network
- * @see	   https://github.com/nnstreamer/nntrainer
+ * @see	   https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  *

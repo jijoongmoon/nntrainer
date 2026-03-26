@@ -1,7 +1,7 @@
 # Getting started
 
 ## Installation and build method
-Please refer to the https://github.com/nnstreamer/nntrainer/blob/main/docs/getting-started.md link for the NNTrainer installation and meson build.
+Please refer to the https://github.com/nntrainer/nntrainer/blob/main/docs/getting-started.md link for the NNTrainer installation and meson build.
 
 ## Setting dataset and code modification
 Folders containing training data must include "images" and "annotations" folders.

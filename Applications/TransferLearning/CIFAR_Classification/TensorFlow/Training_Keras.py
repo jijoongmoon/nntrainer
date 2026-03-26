@@ -16,7 +16,7 @@
 # @file	Training_Keras.py
 # @date	13 March 2020
 # @brief	This is Simple Classification Example using Keras
-# @see		https://github.com/nnstreamer/nntrainer
+# @see		https://github.com/nntrainer/nntrainer
 # @author	Jijoong Moon <jijoong.moon@samsung.com>
 # @bug		No known bugs except for NYI items
 #

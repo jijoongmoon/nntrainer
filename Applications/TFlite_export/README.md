@@ -1,6 +1,6 @@
 ## Setup
 
-Please Follow install guide : https://github.com/nnstreamer/nntrainer/blob/main/docs/getting-started.md
+Please Follow install guide : https://github.com/nntrainer/nntrainer/blob/main/docs/getting-started.md
 
 ## Run TFlite export example
 in nntrainer root directory

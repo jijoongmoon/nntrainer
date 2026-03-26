@@ -4,7 +4,7 @@
  *
  * @file   x86_compute_backend.h
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Compute backend for x86
@@ -506,7 +506,7 @@ void calc_trigonometric_vals_dup(unsigned int N_half, T *angle, T *cos_,
                                  T *sin_, unsigned int from = 0,
                                  float attention_scaling = 1.0f);
 /**
- * @brief swiglu function with neon : X = (Y / (1 + exp( -Y ))) * Z
+ * @brief swiglu function : X = (Y / (1 + exp( -Y ))) * Z
  *
  * @param N number of elements in X
  * @param X float * for Vector X
@@ -524,6 +524,52 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z);
  * @param alpha float
  */
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha);
+
+/**
+ * @brief tanh_gelu function
+ * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *     + 0.044715 * X^3)))
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void tanh_gelu(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu function
+ * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *     + 0.044715 * X^3))) with x4 loop unrolling
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu function with neon but as
+ * X = Y / (1 + exp(-pi/4*(Y
+ *     + 0.044715Y^3)) * Z
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output)
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector Z (input)
+ */
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z);
+
+/**
+ * @brief tanh_gelu function with neon but as
+ * X = Y / (1 + exp(-pi/4*(Y
+ *     + 0.044715Y^3)) * Z
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output)
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector Z (input)
+ */
+void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
  * @brief returns maximum value of the vector X
@@ -1140,12 +1186,19 @@ void softmax_row(T *qk_out, size_t start_row, size_t end_row, size_t num_heads,
  * @param[in] gqa_size size of group
  * @param[in] head_dim head dimension
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
                                         const uint16_t *vcache, float *output,
                                         int num_cache_head, int gqa_size,
                                         int head_dim,
-                                        size_t local_window_size = UINT_MAX);
+                                        size_t local_window_size = UINT_MAX,
+                                        int head_start = 0, int head_end = -1);
 
 /**
  * @brief Compute kcaches
@@ -1159,12 +1212,19 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
  * @param[in] gqa_size size of group
  * @param[in] tile_size size of tile
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 template <typename BType>
 void compute_kcaches(const float *in, const BType *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,
                      int gqa_size, int tile_size,
-                     size_t local_window_size = UINT_MAX);
+                     size_t local_window_size = UINT_MAX, int head_start = 0,
+                     int head_end = -1);
 
 /**
  * @brief Compute rotary embedding value
@@ -1255,9 +1315,11 @@ void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight);
  * @param scale_group_size group size (32 or 64 or 128)
  * @param dst_q4_0x void * output data in block_q4_0x8 or block_q4_0x4 layout
  */
-void transform_q4_0x_from_int4(size_t N, size_t K, const uint8_t *osv32_weights,
-                               const uint16_t *osv32_scales,
-                               size_t scale_group_size, void *dst_q4_0x);
+void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
+                                       const uint8_t *osv32_weights,
+                                       const uint16_t *osv32_scales,
+                                       size_t scale_group_size,
+                                       void *dst_q4_0x);
 
 } /* namespace nntrainer */
 #endif /* __cplusplus */

@@ -5,7 +5,7 @@
  * @file nnstreamer-capi-tizen-feature-check.cpp
  * @date 7 August 2020
  * @brief NNTrainer/C-API Tizen dependent functions.
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author MyungJoo Ham <myungjoo.ham@samsung.com>
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items

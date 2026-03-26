@@ -6,7 +6,7 @@
  * @date   09 April 2021
  * @brief  This file contains list of common properties widely used across
  * layers
- * @see	   https://github.com/nnstreamer/nntrainer
+ * @see	   https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  */
@@ -1323,6 +1323,15 @@ public:
   static constexpr const char *key =
     "target_shape";                    /**< unique key to access */
   using prop_tag = dimension_prop_tag; /**< property type */
+};
+
+/**
+ * @brief Scale, Scaling factor property
+ */
+class Scale : public nntrainer::Property<float> {
+public:
+  static constexpr const char *key = "scale"; /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
 };
 
 /**

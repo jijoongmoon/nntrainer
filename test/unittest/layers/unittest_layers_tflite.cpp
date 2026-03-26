@@ -5,7 +5,7 @@
  * @file unittest_layers_tflite.cpp
  * @date 12 June 2021
  * @brief TfLite Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

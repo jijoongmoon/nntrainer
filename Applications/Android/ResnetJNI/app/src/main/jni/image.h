@@ -4,7 +4,7 @@
  *
  * @file    image.h
  * @date    28 Feb 2023
- * @see     https://github.com/nnstreamer/nntrainer
+ * @see     https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is simple image converter for android

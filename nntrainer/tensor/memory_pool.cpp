@@ -4,7 +4,7 @@
  *
  * @file   memory_pool.cpp
  * @date   11 August 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Memory Pool Class
@@ -124,6 +124,8 @@ void MemoryPool::allocate() {
   if (mem_pool != nullptr)
     throw std::runtime_error("Memory pool is already allocated");
 
+  ml_logi("MemoryPool::allocate size: %zu", pool_size);
+
 #if defined(__ANDROID__) && ENABLE_NPU
   int i = 0;
 #define RPCMEM_HEAP_ID_SYSTEM 25
@@ -167,7 +169,7 @@ void MemoryPool::allocate() {
 
 #else
 
-#ifdef ENABLE_OPENCL
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
   auto *cl_context =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   mem_pool = cl_context->context_inst_.createSVMRegion(pool_size);
@@ -201,6 +203,8 @@ void MemoryPool::allocate() {
 void MemoryPool::allocateFSU() {
   if (pool_size == 0)
     throw std::runtime_error("Allocating memory pool with size 0");
+
+  ml_logi("MemoryPool::allocateFSU size: %zu", pool_size);
 
   if (mem_pool != nullptr)
     throw std::runtime_error("Memory pool is already allocated");
@@ -266,7 +270,7 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
  */
 void MemoryPool::deallocate() {
   if (mem_pool != nullptr) {
-#ifdef ENABLE_OPENCL
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
     if (svm_allocation) {
       auto *cl_context =
         static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));

@@ -5,7 +5,7 @@
  * @file   opencl_device_info.cpp
  * @date   18 August 2025
  * @brief  Read and store OpenCL Device Info
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Grzegorz Kisala <g.kisala@samsung.com>
  * @bug    No known bugs except for NYI items
  *

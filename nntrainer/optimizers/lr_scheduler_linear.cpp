@@ -5,7 +5,7 @@
  * @file   lr_scheduler_linear.cpp
  * @date   11 November 2024
  * @brief  This is Linear Learning Rate Scheduler class
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Hyunwoo LEE <dlgusdn0414@snu.ac.kr>
  * @bug    No known bugs except for NYI items
  *

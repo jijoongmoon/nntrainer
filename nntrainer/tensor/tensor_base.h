@@ -3,7 +3,7 @@
  * @file	tensor_base.h
  * @date	01 December 2023
  * @brief	This is Tensor base class
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
@@ -389,6 +389,12 @@ public:
    * @copydoc Tensor::l2norm
    */
   virtual float l2norm() const;
+
+  /**
+   * @copydoc Tensor::normalization_i(unsigned int dim, float p, float epsilon)
+   */
+  virtual void normalization_i(unsigned int dim, float p = 2.0,
+                               float epsilon = 1e-12);
 
   /**
    * @copydoc Tensor::pow(float exponent, Tensor &output)

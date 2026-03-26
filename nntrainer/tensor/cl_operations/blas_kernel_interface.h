@@ -5,7 +5,7 @@
  * @file	blas_kernel_interface.h
  * @date	5 June 2024
  * @brief	Interface for blas OpenCL kernels
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Debadri Samaddar <s.debadri@samsung.com>
  * @bug		No known bugs except for NYI items
  *

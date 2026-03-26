@@ -7,7 +7,7 @@
  * @date   24 Jun 2021
  * @todo   move picogpt model creating to separate sourcefile
  * @brief  task runner for the picogpt
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items

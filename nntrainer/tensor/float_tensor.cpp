@@ -3,7 +3,7 @@
  * @file	float_tensor.cpp
  * @date	01 December 2023
  * @brief	This is FloatTensor class for 32-bit floating point calculation
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
@@ -22,7 +22,7 @@
 #include <tensor.h>
 #include <util_func.h>
 
-#ifdef ENABLE_OPENCL
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
 #include "blas_kernels.h"
 #endif
 
@@ -645,6 +645,35 @@ float FloatTensor::l2norm() const {
   return snrm2(size(), (float *)getData(), 1);
 }
 
+void FloatTensor::normalization_i(unsigned int dim, float p, float epsilon) {
+  NNTR_THROW_IF(!contiguous, std::invalid_argument)
+    << getName() << " is not contiguous, cannot do normalization.";
+
+  NNTR_THROW_IF(p != 2.0f, std::invalid_argument)
+    << "Only L2 norm (p=2.0) is supported currently";
+
+  float *data = (float *)getData();
+  size_t dim_size = this->dim.getTensorDim(dim);
+  size_t stride = strides[dim];
+
+  if (dim == 3 && stride == 1) {
+    size_t total_elements = size();
+    int num_vectors = static_cast<int>(total_elements / dim_size);
+
+#pragma omp parallel for
+    for (int i = 0; i < num_vectors; ++i) {
+      float *vec_ptr = data + i * dim_size;
+      float norm = snrm2(dim_size, vec_ptr, 1);
+      float scale = 1.0f / std::max(norm, epsilon);
+      sscal(dim_size, scale, vec_ptr, 1);
+    }
+  } else {
+    throw nntrainer::exception::not_supported(
+      "FloatTensor::normalization_i currently only optimizes for the last "
+      "dimension (dim=3) with stride 1.");
+  }
+}
+
 Tensor &FloatTensor::pow(float exponent, Tensor &output) const {
   auto f = [exponent](float in) { return powf(in, exponent); };
   apply(f, output);
@@ -764,7 +793,7 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
     rdatas.push_back(output[i]->getData<float>());
   }
 
-#ifdef ENABLE_OPENCL
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
   if (input_dtype == Tdatatype::Q4_0) {
     if (M == 1) {
       for (unsigned int i = 0; i < input.size(); ++i) {
@@ -785,8 +814,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
         gemv_int4_async_cl(mdatas, scales, data, rdatas, K, Ns,
                            Int4QTensor::getGroupSize());
       } else {
-        openvino_gemm_async_cl(data, mdatas, scales, rdatas, M, Ns, K,
-                               Int4QTensor::getGroupSize());
+        gemm_int4_async_cl(data, mdatas, scales, rdatas, M, Ns, K,
+                           Int4QTensor::getGroupSize());
       }
     } else {
       /// @todo This should be replaced with standard CPU INT4 computation
@@ -968,7 +997,7 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     M = getDim().height();
     K = getDim().width();
     N = input.getDim().width();
-#ifdef ENABLE_OPENCL
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
     if (M == 1) {
       gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
     } else {
@@ -1022,8 +1051,8 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
       gemv_int4_cl(mdata, input.getScale<uint16_t>(), data, rdata, K, N,
                    Int4QTensor::getGroupSize());
     } else {
-      openvino_sgemm_cl(data, mdata, input.getScale<uint16_t>(), rdata, M, N, K,
-                        Int4QTensor::getGroupSize());
+      sgemm_int4_cl(data, mdata, input.getScale<uint16_t>(), rdata, M, N, K,
+                    Int4QTensor::getGroupSize());
     }
   } else {
     /// @todo This should be replaced with standard CPU INT4 computation

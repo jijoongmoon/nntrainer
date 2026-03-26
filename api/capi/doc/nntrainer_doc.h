@@ -5,7 +5,7 @@
  * @file nntrainer_doc.h
  * @date 10 July 2020
  * @brief Tizen C-API Declaration for Tizen SDK
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

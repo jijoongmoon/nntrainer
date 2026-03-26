@@ -5,7 +5,7 @@
  * @file   lstmcell.cpp
  * @date   17 March 2021
  * @brief  This is LSTMCell Layer Class of Neural Network
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  *

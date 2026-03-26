@@ -3,7 +3,7 @@
  * @file	q4_0_utils.cpp
  * @date	15 October 2025
  * @brief	This is Q4_0Utils class for utils for Q4_0 quantization format.
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Maciej Nalewaj <m.nalewaj@samsung.com>
  * @bug		No known bugs
  */
@@ -17,10 +17,6 @@
 #include "nntrainer_error.h"
 #include "q4_0_utils.h"
 #include "util_func.h"
-
-#ifdef __AVX2__
-#include <immintrin.h>
-#endif
 
 namespace nntrainer {
 

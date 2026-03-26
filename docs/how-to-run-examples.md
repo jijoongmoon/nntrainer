@@ -20,7 +20,7 @@ Note that this may install Tensorflow-Lite packaged by us.
 
 ## Build examples (Ubuntu 18.04)
 
-Refer <https://github.com/nnstreamer/nntrainer/blob/master/docs/getting-started.md> for more info.
+Refer <https://github.com/nntrainer/nntrainer/blob/master/docs/getting-started.md> for more info.
 
 Install related packages before building nntrainer and examples.
 
@@ -69,7 +69,7 @@ $ source ~/.bashrc
 
 # Download source, then compile it.
 # Build and install nntrainer
-$ git clone https://github.com/nnstreamer/nntrainer.git nntrainer.git
+$ git clone https://github.com/nntrainer/nntrainer.git nntrainer.git
 $ meson --prefix=${NNTRAINER_ROOT} --sysconfdir=${NNTRAINER_ROOT} --libdir=lib --bindir=bin --includedir=include build
 $ ninja -C build install
 $ cd ..

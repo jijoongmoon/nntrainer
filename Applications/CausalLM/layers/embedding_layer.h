@@ -5,7 +5,7 @@
  * @file   embedding.h
  * @date   04 March 2021
  * @brief  This is Embedding Layer Class of Neural Network
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -117,7 +117,9 @@ public:
   inline static const std::string type = "embedding_layer";
 
 private:
-  std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim> embedding_props;
+  std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
+             nntrainer::props::Scale>
+    embedding_props;
   unsigned int weight_idx;
 };
 } // namespace causallm

@@ -3,7 +3,7 @@
  * @file	tensor.h
  * @date	01 December 2023
  * @brief	This is a Tensor class
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
@@ -1391,10 +1391,18 @@ public:
   Tensor &standardization(Tensor &output) const;
 
   /**
-   * @brief     Normalize the Tensor elements in-place
-   * @retval    Calculated Tensor
+   * @brief     Normalize the Tensor elements (in-place)
+   * @note      min-max normalization
    */
   void normalization_i();
+
+  /**
+   * @brief     Normalize the Tensor along dimension (in-place)
+   * @param[in] dim Dimension to normalize
+   * @param[in] p Norm order (default 2.0)
+   * @param[in] epsilon Epsilon for stability
+   */
+  void normalization_i(unsigned int dim, float p = 2.0, float epsilon = 1e-12);
 
   /**
    * @brief     Standardize the Tensor elements in-place

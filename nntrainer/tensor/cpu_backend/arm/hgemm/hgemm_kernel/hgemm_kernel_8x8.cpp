@@ -4,7 +4,7 @@
  *
  * @file   hgemm_kernel_8x8.cpp
  * @date   01 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is half-precision GEMM 8x8 kernel

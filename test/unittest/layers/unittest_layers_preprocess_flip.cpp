@@ -5,7 +5,7 @@
  * @file unittest_layers_preprocess_flip.cpp
  * @date 11 June Flip
  * @brief Preprocess flip Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

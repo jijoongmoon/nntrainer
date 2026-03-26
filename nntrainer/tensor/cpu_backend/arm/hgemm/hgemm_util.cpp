@@ -4,7 +4,7 @@
  *
  * @file   hgemm_util.cpp
  * @date   01 August 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is for util functions for half-precision GEMM

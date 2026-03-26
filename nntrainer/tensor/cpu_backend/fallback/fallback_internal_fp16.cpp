@@ -4,7 +4,7 @@
  *
  * @file fallback_internal.cpp
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Fallback half-precision computation functions (raw implementation)
@@ -219,6 +219,26 @@ void __fallback_swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z) {
       (Y[i] / static_cast<_FP16>(1.f + std::exp(static_cast<float>(-Y[i])))) *
       Z[i];
     ++i;
+  }
+}
+
+void __fallback_tanh_gelu(const unsigned int N, const _FP16 *X, _FP16 *Y) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float x = static_cast<float>(X[i]);
+    Y[i] = static_cast<_FP16>(
+      0.5f * x *
+      (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x))));
+  }
+}
+
+void __fallback_tanh_gelu_mul(const unsigned int N, _FP16 *X, _FP16 *Y,
+                              _FP16 *Z) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float y = static_cast<float>(Y[i]);
+    float z = static_cast<float>(Z[i]);
+    X[i] = static_cast<_FP16>(
+      0.5f * y *
+      (1.0f + std::tanh(0.7978845608f * (y + 0.044715f * y * y * y))) * z);
   }
 }
 

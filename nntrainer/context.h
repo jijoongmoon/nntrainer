@@ -4,7 +4,7 @@
  *
  * @file    context.h
  * @date    10 Dec 2024
- * @see     https://github.com/nnstreamer/nntrainer
+ * @see     https://github.com/nntrainer/nntrainer
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @bug     No known bugs except for NYI items
  * @brief   This file contains app context related functions and classes that

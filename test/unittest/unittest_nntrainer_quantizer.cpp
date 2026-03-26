@@ -5,7 +5,7 @@
  * @file        unittest_nntrainer_quantizer.cpp
  * @date        16 December 2024
  * @brief       Unit test utility for quantizer.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug         No known bugs
  */

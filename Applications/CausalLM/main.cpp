@@ -30,14 +30,18 @@
 #include <factory.h>
 
 #include "causal_lm.h"
+#include "embedding_gemma.h"
+#include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
-#include "nntr_qwen3_causallm.h"
-#include "nntr_qwen3_moe_causallm.h"
+#include "qwen2_causallm.h"
+#include "qwen2_embedding.h"
 #include "qwen3_cached_slim_moe_causallm.h"
 #include "qwen3_causallm.h"
+#include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
+#include <models/gemma3/function.h>
 #include <sys/resource.h>
 
 #include <atomic>
@@ -103,13 +107,47 @@ void stop_and_print_peak() {
             << std::endl;
 }
 
+std::string resolve_architecture(std::string model_type,
+                                 const std::string &architecture) {
+  std::transform(model_type.begin(), model_type.end(), model_type.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+
+  if (model_type == "embedding") {
+    if (architecture == "Qwen3ForCausalLM") {
+      return "Qwen3Embedding";
+    } else if (architecture == "Gemma3ForCausalLM" ||
+               architecture == "Gemma3TextModel") {
+      return "EmbeddingGemma";
+    } else if (architecture == "Qwen2Model") {
+      return "Qwen2Embedding";
+    } else {
+      throw std::invalid_argument(
+        "Unsupported architecture for embedding model: " + architecture);
+    }
+  }
+
+  return architecture;
+}
+
 int main(int argc, char *argv[]) {
+
+  auto start_time = std::chrono::high_resolution_clock::now();
 
   /** Register all runnable causallm models to factory */
   causallm::Factory::Instance().registerModel(
     "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
                                                   nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen2CausalLM>(cfg, generation_cfg,
+                                                       nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen2Embedding", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen2Embedding>(cfg, generation_cfg,
+                                                        nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
     "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
@@ -134,14 +172,9 @@ int main(int argc, char *argv[]) {
         cfg, generation_cfg, nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
-    "NNTRQwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::NNTRQwen3CausalLM>(cfg, generation_cfg,
-                                                           nntr_cfg);
-    });
-  causallm::Factory::Instance().registerModel(
-    "NNTRQwen3MoECausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::NNTRQwen3MoECausalLM>(
-        cfg, generation_cfg, nntr_cfg);
+    "Qwen3Embedding", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen3Embedding>(cfg, generation_cfg,
+                                                        nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
     "GptOssForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
@@ -154,13 +187,23 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::GptOssCachedSlimCausalLM>(
         cfg, generation_cfg, nntr_cfg);
     });
+  causallm::Factory::Instance().registerModel(
+    "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
+                                                        nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "EmbeddingGemma", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::EmbeddingGemma>(cfg, generation_cfg,
+                                                        nntr_cfg);
+    });
 
   // Validate arguments
   if (argc < 2) {
     std::cerr << "Usage: " << argv[0] << " <model_path> [input_prompt]\n"
               << "  <model_path>   : Path to model directory\n"
-              << "  [input_prompt] : Optional input text (uses sample_input if "
-                 "omitted)\n";
+              << "  [input_prompt] : Optional input text (uses sample_input or "
+                 "chat_input if omitted)\n";
     return EXIT_FAILURE;
   }
 
@@ -178,13 +221,6 @@ int main(int argc, char *argv[]) {
       causallm::LoadJsonFile(model_path + "/generation_config.json");
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
 
-    // Determine input text
-    if (argc >= 3) {
-      input_text = argv[2];
-    } else {
-      input_text = nntr_cfg["sample_input"].get<std::string>();
-    }
-
     if (nntr_cfg.contains("system_prompt")) {
       system_head_prompt =
         nntr_cfg["system_prompt"]["head_prompt"].get<std::string>();
@@ -199,25 +235,58 @@ int main(int argc, char *argv[]) {
     std::cout << weight_file << std::endl;
 
     // Initialize and run model
-    auto model = causallm::Factory::Instance().create(
-      cfg["architectures"].get<std::vector<std::string>>()[0], cfg,
-      generation_cfg, nntr_cfg);
+    std::string architecture =
+      cfg["architectures"].get<std::vector<std::string>>()[0];
+
+    if (nntr_cfg.contains("model_type")) {
+      std::string model_type = nntr_cfg["model_type"].get<std::string>();
+      architecture = resolve_architecture(model_type, architecture);
+    }
+
+    // Determine input text
+    if (argc >= 3) {
+      input_text = argv[2];
+    } else {
+      if (nntr_cfg.contains("chat_input")) {
+        if (architecture == "Gemma3ForCausalLM") {
+          input_text = causallm::gemma3::apply_function_gemma_template(
+            nntr_cfg["chat_input"]);
+        } else {
+          std::cerr << "[Warning] 'chat_input' is set but support for model "
+                       "architecture '"
+                    << architecture
+                    << "' is not implemented. Falling back to 'sample_input'."
+                    << std::endl;
+          input_text = nntr_cfg["sample_input"].get<std::string>();
+        }
+      } else {
+        input_text = nntr_cfg["sample_input"].get<std::string>();
+      }
+    }
+
+    auto model = causallm::Factory::Instance().create(architecture, cfg,
+                                                      generation_cfg, nntr_cfg);
     model->initialize();
     model->load_weight(weight_file);
+
+    bool do_sample = generation_cfg.value("do_sample", false);
 
 #ifdef PROFILE
     start_peak_tracker();
 #endif
 #if defined(_WIN32)
-    model->run(input_text.c_str(), generation_cfg["do_sample"],
-               system_head_prompt.c_str(), system_tail_prompt.c_str());
+    model->run(input_text.c_str(), do_sample, system_head_prompt.c_str(),
+               system_tail_prompt.c_str());
 #else
-    model->run(input_text, generation_cfg["do_sample"], system_head_prompt,
-               system_tail_prompt);
+    model->run(input_text, do_sample, system_head_prompt, system_tail_prompt);
 #endif
 #ifdef PROFILE
     stop_and_print_peak();
 #endif
+    auto finish_time = std::chrono::high_resolution_clock::now();
+    auto e2e_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      finish_time - start_time);
+    std::cout << "[e2e time]: " << e2e_duration.count() << " ms \n";
     printMemoryUsage();
 
   } catch (const std::exception &e) {

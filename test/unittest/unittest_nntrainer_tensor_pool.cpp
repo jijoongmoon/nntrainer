@@ -5,7 +5,7 @@
  * @file unittest_nntrainer_tensor_pool.cpp
  * @date 20 August 2021
  * @brief Tensor Pool Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

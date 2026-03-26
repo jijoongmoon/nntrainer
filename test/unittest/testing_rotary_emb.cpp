@@ -5,7 +5,7 @@
  * @file	testing_rotary_emb.cpp
  * @date	28 August 2024
  * @brief	Rotary Embedding CPU code
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Yash Singh <yash.singh@samsung.com>
  * @bug		No known bugs except for NYI items
  *

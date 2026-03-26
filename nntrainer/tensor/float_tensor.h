@@ -3,7 +3,7 @@
  * @file	float_tensor.h
  * @date	01 December 2023
  * @brief	This is FloatTensor class for 32-bit floating point calculation
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
@@ -354,6 +354,12 @@ public:
    * @copydoc Tensor::l2norm
    */
   float l2norm() const override;
+
+  /**
+   * @copydoc Tensor::normalization_i
+   */
+  void normalization_i(unsigned int dim, float p = 2.0,
+                       float epsilon = 1e-12) override;
 
   /**
    * @copydoc Tensor::pow(float exponent, Tensor &output)

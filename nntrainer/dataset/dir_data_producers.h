@@ -6,7 +6,7 @@
  * @date   24 Feb 2023
  * @brief  This file contains dir data producers, reading from the files in
  * directory
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  *

@@ -4,7 +4,7 @@
  *
  * @file   addition_layer_cl.h
  * @date   28 May 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Yash Singh yash.singh@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief	 This is Addition Layer Class Class for Neural Network with OpenCl

@@ -5,7 +5,7 @@
  * @file   kld_loss_layer.cpp
  * @date   25 November 2021
  * @brief  KLD (Kullback-Leibler Divergence) loss implementation
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug    No known bugs except for NYI items

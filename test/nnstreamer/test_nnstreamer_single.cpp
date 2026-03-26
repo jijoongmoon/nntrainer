@@ -5,7 +5,7 @@
  * @file test_nnstreamer_single.cpp
  * @date 10 November 2021
  * @brief NNTrainer filter integrated test with nnstreamer
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

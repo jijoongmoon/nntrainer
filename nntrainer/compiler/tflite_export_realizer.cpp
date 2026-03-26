@@ -5,7 +5,7 @@
  * @file tflite_export_realizer.cpp
  * @date 18 July 2025
  * @brief NNTrainer graph realizer which remove loss layer for inference
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author seongwoo <mhs4670go@naver.com>
  * @author donghak park <donghak.park@samsung.com>
  * @bug No known bugs except for NYI items

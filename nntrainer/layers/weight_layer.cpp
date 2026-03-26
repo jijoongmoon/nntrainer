@@ -6,7 +6,7 @@
  * @date   2 August 2024
  * @brief  This is a layer that simply stores a weight tensor without any
  * operation.
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author SeungBaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  *

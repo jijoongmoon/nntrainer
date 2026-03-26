@@ -15,7 +15,7 @@
  * @file	fc_layer.cpp
  * @date	14 May 2020
  * @brief	This is Fully Connected Layer Class for Neural Network
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @bug		No known bugs except for NYI items
  *
@@ -259,9 +259,11 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   TensorDim hidden_step_dim = hidden_dim;
 
   input_step_dim.batch(1);
-  input_step_dim.height(to - from);
+  if (input_dim.height() > 1)
+    input_step_dim.height(to - from);
   hidden_step_dim.batch(1);
-  hidden_step_dim.height(to - from);
+  if (hidden_dim.height() > 1)
+    hidden_step_dim.height(to - from);
 
   // @todo make it parallelized with batch axis
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
@@ -275,10 +277,13 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
     if (!std::get<props::LoraRank>(fc_props).empty()) {
       nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora.getDim();
       hidden_tmp_lora_step_dim.batch(1);
-      hidden_tmp_lora_step_dim.height(to - from);
+      if (hidden_tmp_lora_step_dim.height() > 1)
+        hidden_tmp_lora_step_dim.height(to - from);
+
       nntrainer::TensorDim hidden_out_lora_step_dim = hidden_out_lora.getDim();
       hidden_out_lora_step_dim.batch(1);
-      hidden_out_lora_step_dim.height(to - from);
+      if (hidden_out_lora_step_dim.height() > 1)
+        hidden_out_lora_step_dim.height(to - from);
 
       nntrainer::Tensor hidden_tmp_lora_step =
         hidden_tmp_lora.getSharedDataTensor(

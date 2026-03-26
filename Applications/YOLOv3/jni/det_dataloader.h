@@ -5,7 +5,7 @@
  * @file   det_dataloader.h
  * @date   22 March 2023
  * @brief  dataloader for object detection dataset
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items

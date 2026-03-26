@@ -3,7 +3,7 @@
  * @file	char_tensor.cpp
  * @date	02 April 2024
  * @brief	This is CharTensor class for 8-bit integer calculation
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
  */

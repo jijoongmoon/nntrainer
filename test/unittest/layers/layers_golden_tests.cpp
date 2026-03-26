@@ -5,7 +5,7 @@
  * @file layer_golden_tests.cpp
  * @date 09 Sept 2021
  * @brief Common golden test for nntrainer layers (Param Tests)
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug No known bugs except for NYI items

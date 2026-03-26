@@ -4,7 +4,7 @@
  *
  * @file neon_impl.h
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Single-precision computation functions based on NEON
@@ -297,31 +297,55 @@ void transpose_matrix(const unsigned int M, const unsigned int N,
  * @param[in] gqa_size size of group
  * @param[in] head_dim head dimension
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0).
+ *            Used for head-direction parallelization during decoding.
+ * @param[in] head_end end index (exclusive) of KV heads to process.
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
                                         const __fp16 *vcache, float *output,
                                         int num_cache_head, int gqa_size,
                                         int head_dim,
-                                        size_t local_window_size = UINT_MAX);
+                                        size_t local_window_size = UINT_MAX,
+                                        int head_start = 0, int head_end = -1);
 
 /**
- * @brief Compute kcaches
- * @tparam BType type of B vector element
- * @param[in] in float* input vector
+ * @brief Compute Key Cache Dot Products (Attention Scores)
+ *
+ * Perform: Output = (Query * Key_cache) / sqrt(head_dim)
+ *
+ * Input Shapes:
+ * - in: [Batch, 1, 1, num_cache_head * gqa_size * head_dim] (Query)
+ * - kcache: [ Batch, 1, Max_Timestep, num_cache_head * head_dim] (Key Cache)
+ * - output: [Batch, 1, 1, num_cache_head * gqa_size * Context_Len] (Scores)
+ *
+ * @tparam BType Data type of Key Cache (e.g., uint16_t, __fp)
+ * @param[in] in float* input vector (Query)
  * @param[in] kcache BType* input vector with keys cache
- * @param[out] output float* output float vector
- * @param[in] num_rows number of row
- * @param[in] num_cache_head number head of cache
- * @param[in] head_dim head dimension
- * @param[in] gqa_size size of group
- * @param[in] tile_size size of tile
- * @param[in] local_window_size windows size for local attention
+ * @param[out] output float* output float vector (Scores)
+ * @param[in] num_rows Number of row to process (Context Length)
+ * @param[in] num_cache_head Number of KV heads
+ * @param[in] head_dim Dimension of each head
+ * @param[in] gqa_size Group Size for GQA
+ * @param[in] tile_size Tile size for loop blocking optimization
+ * @param[in] local_window_size Sliding window size
+ * @param[in] head_start start index of KV heads to process (default 0).
+ *            Used for head-direction parallelization during decoding.
+ * @param[in] head_end end index (exclusive) of KV heads to process.
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 template <typename BType>
 void compute_kcaches(const float *in, const BType *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,
                      int gqa_size, int tile_size,
-                     size_t local_window_size = UINT_MAX);
+                     size_t local_window_size = UINT_MAX, int head_start = 0,
+                     int head_end = -1);
 
 /**
  * @brief Compute rotary embedding value
@@ -351,14 +375,22 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
  * @param[in] num_cache_head number head of cache
  * @param[in] gqa_size size of group
  * @param[in] head_dim head dimension
- * @param[in] chunk_size size of chunk
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0).
+ *            Used for head-direction parallelization during decoding.
+ * @param[in] head_end end index (exclusive) of KV heads to process.
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
+ * num_cache_head.
  */
 void compute_fp16vcache_transposed(int row_num, const __fp16 *in,
                                    const __fp16 *vcache, __fp16 *output,
                                    int num_cache_head, int gqa_size,
-                                   int head_dim, int chunk_size,
-                                   size_t local_window_size = UINT_MAX);
+                                   int head_dim,
+                                   size_t local_window_size = UINT_MAX,
+                                   int head_start = 0, int head_end = -1);
 
 /**
  * @brief Compute kcaches
@@ -369,14 +401,20 @@ void compute_fp16vcache_transposed(int row_num, const __fp16 *in,
  * @param[in] num_cache_head number head of cache
  * @param[in] head_dim head dimension
  * @param[in] gqa_size size of group
- * @param[in] tile_off offset of tile
  * @param[in] tile_size size of tile
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void compute_kcaches(const __fp16 *in, const __fp16 *kcache, __fp16 *output,
                      int num_rows, int num_cache_head, int head_dim,
-                     int gqa_size, int tile_off, int tile_size,
-                     size_t local_window_size = UINT_MAX);
+                     int gqa_size, int tile_size,
+                     size_t local_window_size = UINT_MAX, int head_start = 0,
+                     int head_end = -1);
 
 /**
  * @brief Compute rotary embedding value
@@ -438,8 +476,9 @@ void calc_trigonometric_vals_dup(unsigned int N_half, T *angle, T *cos_,
 void swiglu(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
- * @brief swiglu function with alpha and neon : X = (Y / (1 + exp(- alpha * Y)))
- * * Z
+ * @brief swiglu function with alpha and neon
+ * X = (Y / (1 + exp(- alpha * Y)))
+ *      * Z with loop unrolling x4
  * @param N number of elements in X
  * @param X float* for Vector X
  * @param Y float* for Vector Y
@@ -447,6 +486,54 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z);
  * @param alpha float
  */
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha);
+
+/**
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with loop unrolling x4
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+
+void tanh_gelu(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu function with neon but with polynomial approximation
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+
+void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with multiplication with loop unrolling x4
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output) - for consistency with SwiGLU
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector
+ */
+
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z);
+
+/**
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with multiplication
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output) - for consistency with SwiGLU
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector
+ */
+
+void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
  * @brief returns maximum value of the vector X
@@ -591,6 +678,13 @@ void custom_scopy(const unsigned int N, const float *X, const int incX,
  * @param[in] Y uint8_t * for Vector Y
  */
 void copy_int4_to_fp32(const unsigned int N, const uint8_t *X, float *Y);
+
+/**
+ * @brief     Create Q4_0 weights from int4 weights using NEON optimization
+ * @param[in] int4_weight uint8_t* input int4 weights (16 bytes)
+ * @param[out] q4_0_weight uint8_t* output Q4_0 weights (16 bytes)
+ */
+void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight);
 
 /**
  * @brief     sine with neon: Y = sin(alpha * X)
@@ -801,12 +895,19 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
  * @param[in] gqa_size size of group
  * @param[in] head_dim head dimension
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
                                         const uint16_t *vcache, float *output,
                                         int num_cache_head, int gqa_size,
                                         int head_dim,
-                                        size_t local_window_size = UINT_MAX);
+                                        size_t local_window_size = UINT_MAX,
+                                        int head_start = 0, int head_end = -1);
 
 /**
  * @brief Compute kcaches
@@ -820,11 +921,18 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
  * @param[in] gqa_size size of group
  * @param[in] tile_size size of tile
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void compute_kcaches_uint16(const float *in, const uint16_t *kcache,
                             float *output, int num_rows, int num_cache_head,
                             int head_dim, int gqa_size, int tile_size,
-                            size_t local_window_size = UINT_MAX);
+                            size_t local_window_size = UINT_MAX,
+                            int head_start = 0, int head_end = -1);
 
 /**
  * @brief Compute rotary embedding value

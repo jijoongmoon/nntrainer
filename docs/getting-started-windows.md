@@ -19,7 +19,7 @@ The following dependencies are needed to compile/build/run.
 
 1. Clone repository:
 ```
-git clone https://github.com/nnstreamer/nntrainer
+git clone https://github.com/nntrainer/nntrainer
 ```
 
 2. Clone sub-repositories:
@@ -32,7 +32,7 @@ git submodule update --init --recursive
 
 1. Setup:
 ```
-meson setup --native-file windows-native.ini builddir
+meson setup --native-file configurations/windows-native.ini builddir
 ```
 
 2. Build:
@@ -47,7 +47,7 @@ Make sure that path to  llvm tools are added to "Path", example path: C:\Program
 
 1. Setup:
 ```
-meson setup --native-file windows-native-clang.ini builddir
+meson setup --native-file configurations/windows-native-clang.ini builddir
 ```
 
 2. Build:

@@ -3,7 +3,7 @@
  * @file	tensor.cpp
  * @date	01 December 2023
  * @brief	This is a Tensor class
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
@@ -1000,6 +1000,10 @@ void Tensor::normalization_i() {
     this->subtract_i(min);
     this->divide_i(max - min);
   }
+}
+
+void Tensor::normalization_i(unsigned int dim, float p, float epsilon) {
+  itensor_->normalization_i(dim, p, epsilon);
 }
 
 void Tensor::standardization_i() {

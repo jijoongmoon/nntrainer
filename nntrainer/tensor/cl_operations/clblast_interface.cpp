@@ -5,7 +5,7 @@
  * @file	clblast_interface.cpp
  * @date	12 May 2025
  * @brief	CLBlast library interface
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
  */

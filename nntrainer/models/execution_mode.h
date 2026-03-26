@@ -4,7 +4,7 @@
  *
  * @file   execution_mode.h
  * @date   25 June 2020
- * @see	   https://github.com/nnstreamer/nntrainer
+ * @see	   https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug	   No known bugs except for NYI items
  * @brief  This is mode of executions

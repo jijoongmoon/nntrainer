@@ -5,7 +5,7 @@
  * @file   functions.h
  * @date   15 March 2024
  * @brief  NNTrainer API for IR graph configurations.
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author SeungBaek Hong <sb92.hong@samsung.com>
  * @bug	   No known bugs except for NYI items
  *

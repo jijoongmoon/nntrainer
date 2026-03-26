@@ -4,7 +4,7 @@
  *
  * @file   memory_planner.h
  * @date   10 August 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is interface for the Memory Planner

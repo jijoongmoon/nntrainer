@@ -5,7 +5,7 @@
  * @file	timer.h
  * @date	22 Aug 2025
  * @brief	Timer class wrapping std::chrono...
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Michal Wlasiuk <testmailsmtp12345@gmail.com>
  * @bug		No known bugs except for NYI items
  *

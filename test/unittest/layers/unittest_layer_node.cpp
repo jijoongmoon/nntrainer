@@ -5,7 +5,7 @@
  * @file        unittest_layer_node.cpp
  * @date        02 July 2021
  * @brief       Unit test utility for layer node
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug         No known bugs
  */

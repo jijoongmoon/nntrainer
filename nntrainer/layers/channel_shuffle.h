@@ -4,7 +4,7 @@
  *
  * @file   channel_shuffle.h
  * @date   23 April 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Donghoon Kang <dhkang01@snu.ac.kr>
  * @bug    No known bugs except for NYI items
  * @brief  This is Channel Shuffle Layer Class for Neural Network

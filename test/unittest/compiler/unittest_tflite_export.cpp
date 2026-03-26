@@ -5,7 +5,7 @@
  * @file unittest_tflite_export.cpp
  * @date 23 November 2023
  * @brief export test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug No known bugs except for NYI items
  */

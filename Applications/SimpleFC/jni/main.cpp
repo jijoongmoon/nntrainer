@@ -5,7 +5,7 @@
  * @file   main.cpp
  * @date   10 Dec 2024
  * @brief  Test Application for Asynch FSU
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  */

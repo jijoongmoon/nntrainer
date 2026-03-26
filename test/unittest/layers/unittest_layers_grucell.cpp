@@ -5,7 +5,7 @@
  * @file unittest_layers_grucell.cpp
  * @date 09 November 2021
  * @brief GRUCell Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author hyeonseok lee <hs89.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

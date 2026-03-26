@@ -16,7 +16,7 @@
  * @file        unittest_nntrainer_activations.cpp
  * @date        21 July 2020
  * @brief       Unit test for static functions in activation_layer.cpp.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Jijoong Moon <jijoong.moon@samsung.com>
  * @author      Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug         No known bugs

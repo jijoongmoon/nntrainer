@@ -4,7 +4,7 @@
  *
  * @file   negative_layer.cpp
  * @date   3 July 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sumon Nath <sumon.nath@samsung.com>
  * @author SeungBaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items

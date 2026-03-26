@@ -5,7 +5,7 @@
  * @file unittest_layers_fully_connected.cpp
  * @date 15 June 2021
  * @brief Input Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

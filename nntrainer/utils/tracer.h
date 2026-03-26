@@ -5,7 +5,7 @@
  * @file   tracer.h
  * @date   23 December 2022
  * @brief  Trace abstract class
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jiho Chu <jiho.chu@samsung.com>
  * @bug    No known bugs except for NYI items
  *

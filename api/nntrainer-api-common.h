@@ -5,7 +5,7 @@
  * @file nntrainer-api-common.h
  * @date 02 April 2020
  * @brief NNTrainer Common-API Header.
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */
@@ -120,6 +120,7 @@ typedef enum {
 typedef enum {
   ML_TRAIN_OPTIMIZER_TYPE_ADAM = 0,  /**< Adam Optimizer */
   ML_TRAIN_OPTIMIZER_TYPE_ADAMW = 2, /**< AdamW Optimizer */
+  ML_TRAIN_OPTIMIZER_TYPE_LION = 3,  /**< Lion Optimizer */
   ML_TRAIN_OPTIMIZER_TYPE_SGD = 1, /**< Stochastic Gradient Descent Optimizer */
   ML_TRAIN_OPTIMIZER_TYPE_UNKNOWN = 999 /**< Unknown Optimizer */
 } ml_train_optimizer_type_e;

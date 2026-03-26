@@ -62,10 +62,5 @@ if get_option('enable-nnstreamer-tensor-filter').enabled() and nnstreamer_test_d
   subdir('nnstreamer')
 endif
 
-if get_option('enable-tflite-interpreter') or get_option('enable-nnstreamer-tensor-filter').enabled()
-  run_command(['cp','-lr',
-    meson.current_source_dir() / 'test_models/',
-    nntrainer_test_resdir],
-    check: true
-  )
-endif
+run_command('sh', '-c', 'rm -rf "@0@" && cp -lr "@1@" "@0@"'.format(nntrainer_test_resdir / 'test_models',
+meson.current_source_dir() / 'test_models/'), check: true)

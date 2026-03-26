@@ -16,7 +16,7 @@
  * @date 02 April 2020
  * @brief NNTrainer Logger
  *        This allows to logging nntrainer logs.
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug No known bugs except for NYI items
  */

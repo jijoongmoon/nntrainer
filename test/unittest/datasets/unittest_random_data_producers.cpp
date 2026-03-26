@@ -5,7 +5,7 @@
  * @file unittest_random_data_producers.cpp
  * @date 12 July 2021
  * @brief Random data producers test (Param Tests)
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

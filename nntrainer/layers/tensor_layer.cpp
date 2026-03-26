@@ -5,7 +5,7 @@
  * @file   tensor_layer.cpp
  * @date   17 Jan 2025
  * @brief  This is QNN Tensor Layer Class of Neural Network
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  *

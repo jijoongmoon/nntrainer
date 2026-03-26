@@ -5,7 +5,7 @@
  * @file   model_common_properties.h
  * @date   27 Aug 2021
  * @brief  This file contains common properties for model
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

@@ -5,7 +5,7 @@
  * @file unittest_layers_attention.cpp
  * @date 1 October 2021
  * @brief Attention Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

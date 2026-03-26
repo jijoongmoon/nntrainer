@@ -4,7 +4,7 @@
  *
  * @file   matrix_transpose_kernels_neon.h
  * @date   09 May 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  These are internal util functions for transposing matrix with NEON

@@ -5,7 +5,7 @@
  * @file unittest_layers_zoneout_lstmcell.cpp
  * @date 14 June 2022
  * @brief ZoneoutLSTMCell Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

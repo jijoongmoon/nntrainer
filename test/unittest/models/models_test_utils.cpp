@@ -5,7 +5,7 @@
  * @file   models_test_utils.cpp
  * @date   15 Oct 2020
  * @brief  Models test utils
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

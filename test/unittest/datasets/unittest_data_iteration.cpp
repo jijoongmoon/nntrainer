@@ -5,7 +5,7 @@
  * @file unittest_data_iteration.cpp
  * @date 11 Aug 2021
  * @brief Sample Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

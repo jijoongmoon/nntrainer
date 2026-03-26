@@ -5,7 +5,7 @@
  *
  * @file   ggml_interface_bs_threadpool.cpp
  * @date   15 April 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Michal Wlasiuk <testmailsmtp12345@gmail.com>
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <thread_manager.h>
 #include <cmath>
+#include <engine.h>
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>

@@ -1,0 +1,46 @@
+name: "CausalLM Android Build"
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    name: Build CausalLM for Android (arm64-v8a)
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26d
+        link-to-sdk: true
+
+    - name: Install required packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tar wget gzip libglib2.0-dev libjson-glib-dev \
+          libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libunwind-dev \
+          googletest liborc-0.4-dev flex bison libopencv-dev pkg-config \
+          python3-dev python3-numpy python3 meson ninja-build \
+          libflatbuffers-dev flatbuffers-compiler protobuf-compiler
+
+    - name: Install submodules
+      run: git submodule sync && git submodule update --init --recursive
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: aarch64-linux-android
+        override: true
+        components: rustfmt, clippy
+
+    - name: Build CausalLM for Android
+      run: |
+        chmod +x Applications/CausalLM/build_android.sh
+        chmod +x Applications/CausalLM/build_tokenizer_android.sh
+        ./Applications/CausalLM/build_android.sh

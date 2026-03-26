@@ -15,7 +15,7 @@
  * @file        unittest_tizen_capi_lr_scheduler.cpp
  * @date        13 April 2023
  * @brief       Unit test utility for learning rate scheduler.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Hyeonseok Lee <hs89.lee@samsung.com>
  * @bug         No known bugs
  */

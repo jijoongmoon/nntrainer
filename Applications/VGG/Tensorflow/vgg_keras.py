@@ -6,7 +6,7 @@
 # @file	  vgg_keras.py
 # @date	  08 Oct 2020
 # @brief  This is VGG16 Example using Keras
-# @see    https://github.com/nnstreamer/nntrainer
+# @see    https://github.com/nntrainer/nntrainer
 # @author Jijoong Moon <jijoong.moon@samsung.com>
 # @bug    No known bugs except for NYI items
 #

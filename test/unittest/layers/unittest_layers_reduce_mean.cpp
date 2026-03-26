@@ -5,7 +5,7 @@
  * @file unittest_layers_reduce_mean.cpp
  * @date 25 November 2021
  * @brief Reduce Mean Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

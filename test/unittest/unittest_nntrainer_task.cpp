@@ -5,7 +5,7 @@
  * @file        unittest_nntrainer_task.cpp
  * @date        04 Nov 2022
  * @brief       Unit test utility for task
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Jiho Chu <jiho.chu@samsung.com>
  * @bug         No known bugs
  */

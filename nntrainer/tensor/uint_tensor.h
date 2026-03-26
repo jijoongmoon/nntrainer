@@ -3,7 +3,7 @@
  * @file	uint_tensor.h
  * @date	02 April 2024
  * @brief	This is UIntTensor class for unsigned integer calculation
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @author	Eunju Yang <ej.yang@samsung.com>
  * @bug		No known bugs except for NYI items

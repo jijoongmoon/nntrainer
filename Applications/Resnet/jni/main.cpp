@@ -6,7 +6,7 @@
  * @date   24 Jun 2021
  * @todo   move resnet model creating to separate sourcefile
  * @brief  task runner for the resnet using symbolic graph construction
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  */

@@ -5,7 +5,7 @@
  * @file unittest_models.cpp
  * @date 25 Nov 2021
  * @brief unittest models for v2 version
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

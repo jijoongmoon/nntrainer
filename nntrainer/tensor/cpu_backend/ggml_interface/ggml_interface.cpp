@@ -4,7 +4,7 @@
  *
  * @file   ggml_interface.cpp
  * @date   13 August 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Function interface to use ggml lib from cpu_backend

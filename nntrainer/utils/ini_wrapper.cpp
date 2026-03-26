@@ -6,7 +6,7 @@
  * @date 08 April 2021
  * @brief NNTrainer Ini Wrapper helps to save ini
  * @note this is to be used with ini_interpreter
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

@@ -3,7 +3,7 @@
  * @file	short_tensor.h
  * @date	10 January 2025
  * @brief	This is ShortTensor class for 16-bit signed integer calculation
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
  */

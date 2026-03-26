@@ -4,7 +4,7 @@
  *
  * @file   avx2_impl.cpp
  * @date   20 Feb 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -32,8 +32,11 @@
 #include <version>
 #endif
 #include <fallback_internal.h>
+#include <nntrainer_error.h>
 #include <util_func.h>
 #include <vector>
+
+#include "nntr_ggml_impl_common.h"
 
 #if !defined(__has_constexpr_builtin)
 #define __has_constexpr_builtin(x) (0)
@@ -1512,25 +1515,23 @@ static inline void load_fp16_8_to_chunk(const uint16_t *src, float *dst,
 void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
                                         const uint16_t *vcache, float *output,
                                         int num_cache_head, int gqa_size,
-                                        int head_dim,
-                                        size_t local_window_size) {
-  // cpu_set_t cpu_set;
-  // CPU_ZERO(&cpu_set);
-  // std::vector<bool> affinity(8, false);
-  // affinity[i % affinity.size()] = true;
+                                        int head_dim, size_t local_window_size,
+                                        int head_start, int head_end) {
 
-  // for (std::size_t j = 0;
-  //      j < std::min<std::size_t>(affinity.size(), CPU_SETSIZE); ++j) {
-  //   if (affinity[j])
-  //     CPU_SET(j, &cpu_set);
-  // }
-  // pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_set);
+  // If head_end is -1, process all heads from head_start to num_cache_head.
+  // No other negative values are accepted for head_end.
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+
+  // Validate head range: head_start must be less than actual_head_end
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
 
   std::vector<float> tmp_fp32(head_dim);
   int num_blocks = head_dim / 8;
   __m256 *sumVec = new __m256[std::max(1, num_blocks * gqa_size)];
 
-  for (int n = 0; n < num_cache_head; ++n) {
+  for (int n = head_start; n < actual_head_end; ++n) {
     int rem = head_dim % 8;
 
     /* Declaration: std::vector<__m256> sumVec(num_blocks * gqa_size,
@@ -1594,15 +1595,25 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
 template <>
 void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,
-                     int gqa_size, int tile_size, size_t local_window_size) {
+                     int gqa_size, int tile_size, size_t local_window_size,
+                     int head_start, int head_end) {
   std::vector<float> tmp_fp32(head_dim);
+
+  // If head_end is -1, process all heads from head_start to num_cache_head.
+  // No other negative values are accepted for head_end.
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+
+  // Validate head range: head_start must be less than actual_head_end
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
 
   int start_row =
     num_rows < local_window_size ? 0 : num_rows - local_window_size;
   int row_cnt = num_rows < local_window_size ? num_rows : local_window_size;
   const int tile_count = (row_cnt + tile_size - 1) / tile_size;
 
-  for (int n = 0; n < num_cache_head; ++n) {
+  for (int n = head_start; n < actual_head_end; ++n) {
     for (int t = 0; t < tile_count; ++t) {
       int row_tile_start = t * tile_size;
       int tile_rows = std::min(tile_size, row_cnt - row_tile_start);
@@ -1940,6 +1951,204 @@ void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight) {
 
   // Store the 16 bytes result
   _mm_storeu_si128((__m128i *)q4_0_weight, result);
+}
+
+static inline void transpose_matrix_16x16(const uint8_t *input,
+                                          int input_stride, uint8_t *output,
+                                          int output_stride) {
+  const uint8_t *src = input;
+  uint8_t *dst = output;
+
+  __m256i rows[8];
+  for (int i = 0; i < 8; ++i) {
+    rows[i] =
+      _mm256_loadu2_m128i((const __m128i *)(src + (8 + i) * input_stride),
+                          (const __m128i *)(src + i * input_stride));
+  }
+
+  // Step 1: Transpose within 2x2 sub-blocks
+  __m256i temp0 = _mm256_unpacklo_epi8(rows[0], rows[1]);
+  __m256i temp1 = _mm256_unpackhi_epi8(rows[0], rows[1]);
+  __m256i temp2 = _mm256_unpacklo_epi8(rows[2], rows[3]);
+  __m256i temp3 = _mm256_unpackhi_epi8(rows[2], rows[3]);
+  __m256i temp4 = _mm256_unpacklo_epi8(rows[4], rows[5]);
+  __m256i temp5 = _mm256_unpackhi_epi8(rows[4], rows[5]);
+  __m256i temp6 = _mm256_unpacklo_epi8(rows[6], rows[7]);
+  __m256i temp7 = _mm256_unpackhi_epi8(rows[6], rows[7]);
+
+  // Step 2: Transpose within 4x4 sub-blocks
+  __m256i interleave0 = _mm256_unpacklo_epi16(temp0, temp2);
+  __m256i interleave1 = _mm256_unpackhi_epi16(temp0, temp2);
+  __m256i interleave2 = _mm256_unpacklo_epi16(temp1, temp3);
+  __m256i interleave3 = _mm256_unpackhi_epi16(temp1, temp3);
+  __m256i interleave4 = _mm256_unpacklo_epi16(temp4, temp6);
+  __m256i interleave5 = _mm256_unpackhi_epi16(temp4, temp6);
+  __m256i interleave6 = _mm256_unpacklo_epi16(temp5, temp7);
+  __m256i interleave7 = _mm256_unpackhi_epi16(temp5, temp7);
+
+  // Step 3: Transpose within 8x8 block
+  __m256i final0 = _mm256_unpacklo_epi32(interleave0, interleave4);
+  __m256i final1 = _mm256_unpackhi_epi32(interleave0, interleave4);
+  __m256i final2 = _mm256_unpacklo_epi32(interleave1, interleave5);
+  __m256i final3 = _mm256_unpackhi_epi32(interleave1, interleave5);
+  __m256i final4 = _mm256_unpacklo_epi32(interleave2, interleave6);
+  __m256i final5 = _mm256_unpackhi_epi32(interleave2, interleave6);
+  __m256i final6 = _mm256_unpacklo_epi32(interleave3, interleave7);
+  __m256i final7 = _mm256_unpackhi_epi32(interleave3, interleave7);
+
+  // Step 4: Transpose within 16x16 block
+  __m256i res[8];
+  res[0] = _mm256_unpacklo_epi64(final0, final4);
+  res[1] = _mm256_unpackhi_epi64(final0, final4);
+  res[2] = _mm256_unpacklo_epi64(final1, final5);
+  res[3] = _mm256_unpackhi_epi64(final1, final5);
+  res[4] = _mm256_unpacklo_epi64(final2, final6);
+  res[5] = _mm256_unpackhi_epi64(final2, final6);
+  res[6] = _mm256_unpacklo_epi64(final3, final7);
+  res[7] = _mm256_unpackhi_epi64(final3, final7);
+
+  const int perm_0213 = 0xd8; // 0, 2, 1, 3
+  const int perm_02 = 0x20;   // 0, 2
+  const int perm_13 = 0x31;   // 1, 3
+  for (int i = 0; i < 4; i++) {
+    __m256i a128x2 = _mm256_permute4x64_epi64(res[2 * i], perm_0213);
+    __m256i b128x2 = _mm256_permute4x64_epi64(res[2 * i + 1], perm_0213);
+    _mm256_storeu_si256((__m256i *)&dst[2 * i * output_stride],
+                        _mm256_permute2x128_si256(a128x2, b128x2, perm_02));
+    _mm256_storeu_si256((__m256i *)&dst[(8 + 2 * i) * output_stride],
+                        _mm256_permute2x128_si256(a128x2, b128x2, perm_13));
+  }
+}
+
+static inline void create_q4_0_weights_x8(const uint8_t *int4_weight,
+                                          __m256i *q4_blocks) {
+  constexpr const size_t ROW_BLOCK_BYTE_SIZE = 16;
+
+  // Create masks for extracting low and high nibbles
+  const __m256i low_nibble_mask = _mm256_set1_epi8(0x0F);
+  const __m256i high_nibble_mask = _mm256_set1_epi8(0xF0);
+
+  // Create two blocks in one iteration
+  for (int i = 0; i < 4; ++i) {
+    // Load 16 bytes of input data
+    __m256i input = _mm256_loadu_si256(
+      (const __m256i *)(int4_weight + 2 * ROW_BLOCK_BYTE_SIZE * i));
+
+    // A = input & low_nibble_mask
+    __m256i A = _mm256_and_si256(input, low_nibble_mask);
+
+    // B = (input & high_nibble_mask) >> 4
+    __m256i B = _mm256_srli_epi16(_mm256_and_si256(input, high_nibble_mask), 4);
+
+    // input_shifted = input >> 8 bytes
+    __m256i input_shifted = _mm256_bsrli_epi128(input, 8);
+    // C = input_shifted & low_nibble_mask
+    __m256i C = _mm256_and_si256(input_shifted, low_nibble_mask);
+
+    // D = (input_shifted & high_nibble_mask) >> 4
+    __m256i D =
+      _mm256_srli_epi16(_mm256_and_si256(input_shifted, high_nibble_mask), 4);
+
+    // AC = A | (C << 4)
+    __m256i AC = _mm256_or_si256(A, _mm256_slli_epi16(C, 4));
+
+    // BD = B | (D << 4)
+    __m256i BD = _mm256_or_si256(B, _mm256_slli_epi16(D, 4));
+
+    // Interleave AC and BD
+    __m256i result = _mm256_unpacklo_epi8(AC, BD);
+
+    _mm256_store_si256(&q4_blocks[i], result);
+  }
+}
+
+inline static void nntr_make_block_q4_0x8(const __m256i *in, block_q4_0x8 *out,
+                                          const uint16_t *scales) {
+  constexpr size_t IN_CNT = 8;
+  memcpy(out->d, scales, IN_CNT * sizeof(uint16_t));
+
+  const int perm_0213 = 0xd8; // 0, 2, 1, 3
+  const int perm_02 = 0x20;   // 0, 2
+  const int perm_13 = 0x31;   // 1, 3
+  __m256i a128x2 = _mm256_permute4x64_epi64(*(__m256i *)&in[0], perm_0213);
+  __m256i b128x2 = _mm256_permute4x64_epi64(*(__m256i *)&in[1], perm_0213);
+  __m256i c128x2 = _mm256_permute4x64_epi64(*(__m256i *)&in[2], perm_0213);
+  __m256i d128x2 = _mm256_permute4x64_epi64(*(__m256i *)&in[3], perm_0213);
+  _mm256_storeu_si256((__m256i *)&out->qs[0],
+                      _mm256_permute2x128_si256(a128x2, b128x2, perm_02));
+  _mm256_storeu_si256((__m256i *)&out->qs[32],
+                      _mm256_permute2x128_si256(c128x2, d128x2, perm_02));
+  _mm256_storeu_si256((__m256i *)&out->qs[64],
+                      _mm256_permute2x128_si256(a128x2, b128x2, perm_13));
+  _mm256_storeu_si256((__m256i *)&out->qs[96],
+                      _mm256_permute2x128_si256(c128x2, d128x2, perm_13));
+}
+
+void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
+                                         const uint8_t *osv32_weights,
+                                         const uint16_t *osv32_scales,
+                                         size_t scale_group_size,
+                                         void *dst_q4_0x) {
+
+  NNTR_THROW_IF((!(scale_group_size == 32 || scale_group_size == 64 ||
+                   scale_group_size == 128)),
+                std::invalid_argument)
+    << "Scale group size must be 32/64/128";
+  NNTR_THROW_IF(K % QK4_0 != 0, std::invalid_argument)
+    << "K size must be divisable by QK4_0 (32)";
+  NNTR_THROW_IF(N % 8 != 0, std::invalid_argument)
+    << "N size must be divisable by 8";
+
+  static constexpr const size_t NUM_Q4_0_BLOCKS = 8;
+  static constexpr const size_t ROW_BLOCK_SIZE = 32;
+  static constexpr const size_t COLUMN_BLOCK_SIZE = 2;
+  static constexpr const size_t ROW_BLOCK_BYTE_SIZE = 16;
+
+  static constexpr const size_t dst_tmp_size =
+    (8 * ROW_BLOCK_BYTE_SIZE) / sizeof(__m256i);
+  uint8_t *dst_ = reinterpret_cast<uint8_t *>(dst_q4_0x);
+
+  // --- Layout ---
+  const size_t rows_count_pad = align(N, ROW_BLOCK_SIZE);
+  const size_t columns_count_pad = align(K, ROW_BLOCK_SIZE);
+  const size_t column_blocks_count =
+    columns_count_pad / COLUMN_BLOCK_SIZE; // COLUMN_BLOCK_SIZE == 2
+  const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
+  const int column_blocks_cnt = K / QK4_0;
+
+  alignas(32) static thread_local __m256i dst_tmp[dst_tmp_size];
+  alignas(32) static thread_local uint8_t mx16x16[16 * 16];
+
+#pragma omp parallel for schedule(guided)
+  for (int row_id = 0; row_id < (int)N; row_id += 16) {
+    const size_t row_in_block_id = row_id / ROW_BLOCK_SIZE;
+    size_t i_in_block = row_id % ROW_BLOCK_SIZE;
+    for (int column_out_block_id = 0; column_out_block_id < column_blocks_cnt;
+         column_out_block_id++) {
+      int column_idx = column_out_block_id * QK4_0;
+      int scale_offset = (column_idx / scale_group_size) * rows_count_pad;
+      const size_t row_block_base =
+        row_in_block_id * bytes_per_row_block_span + i_in_block;
+      int src_offset =
+        row_block_base + column_out_block_id * 16 * ROW_BLOCK_SIZE;
+      transpose_matrix_16x16(&osv32_weights[src_offset], ROW_BLOCK_SIZE,
+                             mx16x16, 16);
+      int max_r = std::min((size_t)16, N - row_id);
+      size_t row_out_block_id = row_id / NUM_Q4_0_BLOCKS;
+      int dst_offset =
+        (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) *
+        (column_out_block_id + row_out_block_id * column_blocks_cnt);
+      for (int r = 0; r < max_r; r += NUM_Q4_0_BLOCKS) {
+        create_q4_0_weights_x8(&mx16x16[16 * r], dst_tmp);
+
+        nntr_make_block_q4_0x8(dst_tmp, (block_q4_0x8 *)(dst_ + dst_offset),
+                               &osv32_scales[scale_offset + row_id + r]);
+        row_out_block_id++;
+        dst_offset +=
+          (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) * column_blocks_cnt;
+      }
+    }
+  }
 }
 
 } // namespace nntrainer::avx2

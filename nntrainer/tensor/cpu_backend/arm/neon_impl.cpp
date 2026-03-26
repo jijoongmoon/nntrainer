@@ -4,7 +4,7 @@
  *
  * @file neon_impl.cpp
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Single-precision computation functions based on NEON
@@ -30,6 +30,8 @@
 #include "nntr_ggml_impl_common.h"
 #include <fallback_internal.h>
 #include <util_func.h>
+
+#include "nntr_ggml_impl_common.h"
 
 #ifdef ARMV7
 #define VFMAQ_F32(_X, _Y, _Z) vaddq_f32(_X, vmulq_f32(_Y, _Z))
@@ -552,6 +554,38 @@ void copy_int8_or_int4(const unsigned int N, const uint8_t *X, uint8_t *Y) {
   }
 }
 
+void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight) {
+  // Load 16 bytes of input data (8 bytes for each half)
+  uint8x8_t input_low = vld1_u8(&int4_weight[0]);
+  uint8x8_t input_high = vld1_u8(&int4_weight[8]);
+
+  // Create masks for extracting low and high nibbles
+  const uint8x8_t low_nibble_mask = vdup_n_u8(0x0F);
+  const uint8x8_t high_nibble_mask = vdup_n_u8(0xF0);
+
+  // A = input_low & low_nibble_mask
+  uint8x8_t A = vand_u8(input_low, low_nibble_mask);
+  // B = (input_low & high_nibble_mask) >> 4
+  uint8x8_t B = vshr_n_u8(vand_u8(input_low, high_nibble_mask), 4);
+
+  // C = input_high & low_nibble_mask
+  uint8x8_t C = vand_u8(input_high, low_nibble_mask);
+  // D = (input_high & high_nibble_mask) >> 4
+  uint8x8_t D = vshr_n_u8(vand_u8(input_high, high_nibble_mask), 4);
+
+  // AC = A | (C << 4)
+  uint8x8_t AC = vorr_u8(A, vshl_n_u8(C, 4));
+
+  // BD = B | (D << 4)
+  uint8x8_t BD = vorr_u8(B, vshl_n_u8(D, 4));
+
+  // Interleave AC and BD and store
+  uint8x8x2_t result;
+  result.val[0] = AC;
+  result.val[1] = BD;
+  vst2_u8(q4_0_weight, result);
+}
+
 template <>
 void sine(const unsigned int N, float *X, float *Y, float alpha, float beta) {
   unsigned int i = 0;
@@ -912,14 +946,82 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z) {
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   unsigned int i = 0;
   float32x4_t neg_alpha_vec = vmovq_n_f32(-alpha);
+  float32x4_t one = vdupq_n_f32(1.0f);
+
+  for (; N - i >= 16; i += 16) {
+    float32x4_t y0 = vld1q_f32(&Y[i]);
+    float32x4_t y1 = vld1q_f32(&Y[i + 4]);
+    float32x4_t y2 = vld1q_f32(&Y[i + 8]);
+    float32x4_t y3 = vld1q_f32(&Y[i + 12]);
+
+    float32x4_t z0 = vld1q_f32(&Z[i]);
+    float32x4_t z1 = vld1q_f32(&Z[i + 4]);
+    float32x4_t z2 = vld1q_f32(&Z[i + 8]);
+    float32x4_t z3 = vld1q_f32(&Z[i + 12]);
+
+    float32x4_t alpha_y0 = vmulq_f32(y0, neg_alpha_vec);
+    float32x4_t alpha_y1 = vmulq_f32(y1, neg_alpha_vec);
+    float32x4_t alpha_y2 = vmulq_f32(y2, neg_alpha_vec);
+    float32x4_t alpha_y3 = vmulq_f32(y3, neg_alpha_vec);
+
+    float32x4_t exp0 = exp_ps(alpha_y0);
+    float32x4_t exp1 = exp_ps(alpha_y1);
+    float32x4_t exp2 = exp_ps(alpha_y2);
+    float32x4_t exp3 = exp_ps(alpha_y3);
+
+    exp0 = vaddq_f32(exp0, one);
+    exp1 = vaddq_f32(exp1, one);
+    exp2 = vaddq_f32(exp2, one);
+    exp3 = vaddq_f32(exp3, one);
+
+    exp0 = vdivq_f32(y0, exp0);
+    exp1 = vdivq_f32(y1, exp1);
+    exp2 = vdivq_f32(y2, exp2);
+    exp3 = vdivq_f32(y3, exp3);
+
+    exp0 = vmulq_f32(exp0, z0);
+    exp1 = vmulq_f32(exp1, z1);
+    exp2 = vmulq_f32(exp2, z2);
+    exp3 = vmulq_f32(exp3, z3);
+
+    vst1q_f32(&X[i], exp0);
+    vst1q_f32(&X[i + 4], exp1);
+    vst1q_f32(&X[i + 8], exp2);
+    vst1q_f32(&X[i + 12], exp3);
+  }
+
+  for (; N - i >= 8; i += 8) {
+    float32x4_t y0 = vld1q_f32(&Y[i]);
+    float32x4_t y1 = vld1q_f32(&Y[i + 4]);
+
+    float32x4_t z0 = vld1q_f32(&Z[i]);
+    float32x4_t z1 = vld1q_f32(&Z[i + 4]);
+
+    float32x4_t alpha_y0 = vmulq_f32(y0, neg_alpha_vec);
+    float32x4_t alpha_y1 = vmulq_f32(y1, neg_alpha_vec);
+
+    float32x4_t exp0 = exp_ps(alpha_y0);
+    float32x4_t exp1 = exp_ps(alpha_y1);
+
+    exp0 = vaddq_f32(exp0, one);
+    exp1 = vaddq_f32(exp1, one);
+
+    exp0 = vdivq_f32(y0, exp0);
+    exp1 = vdivq_f32(y1, exp1);
+
+    exp0 = vmulq_f32(exp0, z0);
+    exp1 = vmulq_f32(exp1, z1);
+
+    vst1q_f32(&X[i], exp0);
+    vst1q_f32(&X[i + 4], exp1);
+  }
 
   for (; N - i >= 4; i += 4) {
     float32x4_t y0_3 = vld1q_f32(&Y[i]);
     float32x4_t z0_3 = vld1q_f32(&Z[i]);
     float32x4_t alpha_y0_3 = vmulq_f32(y0_3, neg_alpha_vec);
     float32x4_t exp0_3 = exp_ps(alpha_y0_3);
-
-    exp0_3 = vaddq_f32(exp0_3, vmovq_n_f32(1.f));
+    exp0_3 = vaddq_f32(exp0_3, one);
     exp0_3 = vdivq_f32(y0_3, exp0_3);
     exp0_3 = vmulq_f32(exp0_3, z0_3);
 
@@ -927,6 +1029,347 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   }
   while (i < N) {
     X[i] = (Y[i] / (1.f + std::exp(-alpha * Y[i]))) * Z[i];
+    ++i;
+  }
+}
+
+void tanh_gelu(const unsigned int N, const float *X, float *Y) {
+  unsigned int i = 0;
+  float32x4_t one = vdupq_n_f32(1.0f);
+  float32x4_t const_0_044715 = vdupq_n_f32(0.044715f);
+  float32x4_t two_sqrt_two_pi = vdupq_n_f32(-1.595769121f);
+
+  for (; N - i >= 16; i += 16) {
+    float32x4_t x0 = vld1q_f32(&X[i]);
+    float32x4_t x1 = vld1q_f32(&X[i + 4]);
+    float32x4_t x2 = vld1q_f32(&X[i + 8]);
+    float32x4_t x3 = vld1q_f32(&X[i + 12]);
+
+    float32x4_t cube0 = vmulq_f32(x0, vmulq_f32(x0, x0));
+    float32x4_t cube1 = vmulq_f32(x1, vmulq_f32(x1, x1));
+    float32x4_t cube2 = vmulq_f32(x2, vmulq_f32(x2, x2));
+    float32x4_t cube3 = vmulq_f32(x3, vmulq_f32(x3, x3));
+
+    float32x4_t inner0 = vmlaq_f32(x0, const_0_044715, cube0);
+    float32x4_t inner1 = vmlaq_f32(x1, const_0_044715, cube1);
+    float32x4_t inner2 = vmlaq_f32(x2, const_0_044715, cube2);
+    float32x4_t inner3 = vmlaq_f32(x3, const_0_044715, cube3);
+
+    inner0 = vmulq_f32(two_sqrt_two_pi, inner0);
+    inner1 = vmulq_f32(two_sqrt_two_pi, inner1);
+    inner2 = vmulq_f32(two_sqrt_two_pi, inner2);
+    inner3 = vmulq_f32(two_sqrt_two_pi, inner3);
+
+    float32x4_t exp_res0 = exp_ps(inner0);
+    float32x4_t exp_res1 = exp_ps(inner1);
+    float32x4_t exp_res2 = exp_ps(inner2);
+    float32x4_t exp_res3 = exp_ps(inner3);
+
+    float32x4_t res0 = vaddq_f32(one, exp_res0);
+    float32x4_t res1 = vaddq_f32(one, exp_res1);
+    float32x4_t res2 = vaddq_f32(one, exp_res2);
+    float32x4_t res3 = vaddq_f32(one, exp_res3);
+
+    res0 = vdivq_f32(x0, res0);
+    res1 = vdivq_f32(x1, res1);
+    res2 = vdivq_f32(x2, res2);
+    res3 = vdivq_f32(x3, res3);
+
+    vst1q_f32(&Y[i], res0);
+    vst1q_f32(&Y[i + 4], res1);
+    vst1q_f32(&Y[i + 8], res2);
+    vst1q_f32(&Y[i + 12], res3);
+  }
+
+  for (; N - i >= 8; i += 8) {
+    float32x4_t x0 = vld1q_f32(&X[i]);
+    float32x4_t x1 = vld1q_f32(&X[i + 4]);
+
+    float32x4_t cube0 = vmulq_f32(x0, vmulq_f32(x0, x0));
+    float32x4_t cube1 = vmulq_f32(x1, vmulq_f32(x1, x1));
+
+    float32x4_t inner0 = vmlaq_f32(x0, const_0_044715, cube0);
+    float32x4_t inner1 = vmlaq_f32(x1, const_0_044715, cube1);
+
+    inner0 = vmulq_f32(two_sqrt_two_pi, inner0);
+    inner1 = vmulq_f32(two_sqrt_two_pi, inner1);
+
+    float32x4_t exp_res0 = exp_ps(inner0);
+    float32x4_t exp_res1 = exp_ps(inner1);
+
+    float32x4_t res0 = vaddq_f32(one, exp_res0);
+    float32x4_t res1 = vaddq_f32(one, exp_res1);
+
+    res0 = vdivq_f32(x0, res0);
+    res1 = vdivq_f32(x1, res1);
+
+    vst1q_f32(&Y[i], res0);
+    vst1q_f32(&Y[i + 4], res1);
+  }
+
+  // Handle remaining blocks need to use >=4 check
+  for (; N - i >= 4; i += 4) {
+    float32x4_t x = vld1q_f32(&X[i]);
+    float32x4_t x3 = vmulq_f32(x, vmulq_f32(x, x));
+    float32x4_t inner = vmlaq_f32(x, const_0_044715, x3);
+
+    inner = vmulq_f32(two_sqrt_two_pi, inner);
+    float32x4_t exp_res = exp_ps(inner);
+
+    float32x4_t res = vaddq_f32(one, exp_res);
+    res = vdivq_f32(x, res);
+
+    vst1q_f32(&Y[i], res);
+  }
+
+  // This part will be modified to more efficient version
+
+  while (i < N) {
+    float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+    ++i;
+  }
+}
+
+#define gelu_start -4.38086284326899
+#define gelu_end 4.38086284326899
+
+#define c_gelu_p0 5.91303808E-6
+#define c_gelu_p1 5.00000000E-1
+#define c_gelu_p2 3.98865869E-1
+#define c_gelu_p4 -6.66574676E-2
+#define c_gelu_p6 1.00712610E-2
+#define c_gelu_p8 -1.19336340E-3
+#define c_gelu_p10 1.09543224E-4
+#define c_gelu_p12 -7.55788500E-6
+#define c_gelu_p14 3.73374142E-7
+#define c_gelu_p16 -1.23162678E-8
+#define c_gelu_p18 2.40940960E-10
+#define c_gelu_p20 -2.10237709E-12
+
+void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
+  unsigned int i = 0;
+
+  // Handle remaining blocks need to use >=4 check
+  for (; N - i >= 4; i += 4) {
+    float32x4_t x = vld1q_f32(&X[i]);
+    float32x4_t x2 = vmulq_f32(x, x);
+
+    uint32x4_t x_gt = vcgtq_f32(x, vdupq_n_f32(gelu_start));
+    uint32x4_t x_ls = vcleq_f32(x, vdupq_n_f32(gelu_end));
+    uint32x4_t x_gt2 = vcgtq_f32(x, vdupq_n_f32(gelu_end));
+
+    float32x4_t y = vmulq_f32(x2, vdupq_n_f32(c_gelu_p20));
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p18));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p16));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p14));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p12));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p10));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p8));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p6));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p4));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p2));
+    y = vmulq_f32(x2, y);
+
+    float32x4_t z = vmulq_f32(x, vdupq_n_f32(c_gelu_p1));
+    z = vaddq_f32(z, vdupq_n_f32(c_gelu_p0));
+
+    y = vaddq_f32(y, z);
+
+    y = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(y), x_gt));
+    y = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(y), x_ls));
+    x = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(x), x_gt2));
+
+    y = vaddq_f32(y, x);
+    vst1q_f32(&Y[i], y);
+  }
+
+  while (i < N) {
+    float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+    ++i;
+  }
+}
+
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {
+  unsigned int i = 0;
+  float32x4_t one = vdupq_n_f32(1.0f);
+  float32x4_t const_0_044715 = vdupq_n_f32(0.044715f);
+  float32x4_t two_sqrt_two_pi = vdupq_n_f32(-1.595769121f);
+
+  for (; N - i >= 16; i += 16) {
+    float32x4_t y0 = vld1q_f32(&Y[i]);
+    float32x4_t y1 = vld1q_f32(&Y[i + 4]);
+    float32x4_t y2 = vld1q_f32(&Y[i + 8]);
+    float32x4_t y3 = vld1q_f32(&Y[i + 12]);
+
+    float32x4_t z0 = vld1q_f32(&Z[i]);
+    float32x4_t z1 = vld1q_f32(&Z[i + 4]);
+    float32x4_t z2 = vld1q_f32(&Z[i + 8]);
+    float32x4_t z3 = vld1q_f32(&Z[i + 12]);
+
+    float32x4_t cube0 = vmulq_f32(y0, vmulq_f32(y0, y0));
+    float32x4_t cube1 = vmulq_f32(y1, vmulq_f32(y1, y1));
+    float32x4_t cube2 = vmulq_f32(y2, vmulq_f32(y2, y2));
+    float32x4_t cube3 = vmulq_f32(y3, vmulq_f32(y3, y3));
+
+    float32x4_t inner0 = vmlaq_f32(y0, const_0_044715, cube0);
+    float32x4_t inner1 = vmlaq_f32(y1, const_0_044715, cube1);
+    float32x4_t inner2 = vmlaq_f32(y2, const_0_044715, cube2);
+    float32x4_t inner3 = vmlaq_f32(y3, const_0_044715, cube3);
+
+    inner0 = vmulq_f32(two_sqrt_two_pi, inner0);
+    inner1 = vmulq_f32(two_sqrt_two_pi, inner1);
+    inner2 = vmulq_f32(two_sqrt_two_pi, inner2);
+    inner3 = vmulq_f32(two_sqrt_two_pi, inner3);
+
+    float32x4_t exp_res0 = exp_ps(inner0);
+    float32x4_t exp_res1 = exp_ps(inner1);
+    float32x4_t exp_res2 = exp_ps(inner2);
+    float32x4_t exp_res3 = exp_ps(inner3);
+
+    float32x4_t res0 = vaddq_f32(one, exp_res0);
+    float32x4_t res1 = vaddq_f32(one, exp_res1);
+    float32x4_t res2 = vaddq_f32(one, exp_res2);
+    float32x4_t res3 = vaddq_f32(one, exp_res3);
+
+    res0 = vdivq_f32(y0, res0);
+    res1 = vdivq_f32(y1, res1);
+    res2 = vdivq_f32(y2, res2);
+    res3 = vdivq_f32(y3, res3);
+
+    res0 = vmulq_f32(z0, res0);
+    res1 = vmulq_f32(z1, res1);
+    res2 = vmulq_f32(z2, res2);
+    res3 = vmulq_f32(z3, res3);
+
+    vst1q_f32(&X[i], res0);
+    vst1q_f32(&X[i + 4], res1);
+    vst1q_f32(&X[i + 8], res2);
+    vst1q_f32(&X[i + 12], res3);
+  }
+
+  for (; N - i >= 8; i += 8) {
+    float32x4_t y0 = vld1q_f32(&Y[i]);
+    float32x4_t y1 = vld1q_f32(&Y[i + 4]);
+    float32x4_t z0 = vld1q_f32(&Z[i]);
+    float32x4_t z1 = vld1q_f32(&Z[i + 4]);
+
+    float32x4_t cube0 = vmulq_f32(y0, vmulq_f32(y0, y0));
+    float32x4_t cube1 = vmulq_f32(y1, vmulq_f32(y1, y1));
+
+    float32x4_t inner0 = vmlaq_f32(y0, const_0_044715, cube0);
+    float32x4_t inner1 = vmlaq_f32(y1, const_0_044715, cube1);
+
+    inner0 = vmulq_f32(two_sqrt_two_pi, inner0);
+    inner1 = vmulq_f32(two_sqrt_two_pi, inner1);
+
+    float32x4_t exp_res0 = exp_ps(inner0);
+    float32x4_t exp_res1 = exp_ps(inner1);
+
+    float32x4_t res0 = vaddq_f32(one, exp_res0);
+    float32x4_t res1 = vaddq_f32(one, exp_res1);
+
+    res0 = vdivq_f32(y0, res0);
+    res1 = vdivq_f32(y1, res1);
+
+    res0 = vmulq_f32(z0, res0);
+    res1 = vmulq_f32(z1, res1);
+
+    vst1q_f32(&X[i], res0);
+    vst1q_f32(&X[i + 4], res1);
+  }
+
+  // Handle remaining blocks need to use >=4 check
+  for (; N - i >= 4; i += 4) {
+    float32x4_t y = vld1q_f32(&Y[i]);
+    float32x4_t z = vld1q_f32(&Z[i]);
+    float32x4_t y3 = vmulq_f32(y, vmulq_f32(y, y));
+    float32x4_t inner = vmlaq_f32(y, const_0_044715, y3);
+
+    inner = vmulq_f32(two_sqrt_two_pi, inner);
+    float32x4_t exp_res = exp_ps(inner);
+
+    float32x4_t res = vaddq_f32(one, exp_res);
+    res = vdivq_f32(y, res);
+    res = vmulq_f32(z, res);
+
+    vst1q_f32(&X[i], res);
+  }
+
+  // This part will be modified to more efficient version
+
+  while (i < N) {
+    float y = Y[i];
+    float z = Z[i];
+    X[i] = 0.5f * y *
+           (1.0f + std::tanh(0.7978845608f * (y + 0.044715f * y * y * y))) * z;
+    ++i;
+  }
+}
+
+void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z) {
+  unsigned int i = 0;
+
+  // Handle remaining blocks need to use >=4 check
+  for (; N - i >= 4; i += 4) {
+    float32x4_t x = vld1q_f32(&Y[i]); // Changed from X to Y
+    float32x4_t z2 = vld1q_f32(&Z[i]);
+    float32x4_t x2 = vmulq_f32(x, x);
+
+    uint32x4_t x_gt = vcgtq_f32(x, vdupq_n_f32(gelu_start));
+    uint32x4_t x_ls = vcleq_f32(x, vdupq_n_f32(gelu_end));
+    uint32x4_t x_gt2 = vcgtq_f32(x, vdupq_n_f32(gelu_end));
+
+    float32x4_t y = vmulq_f32(x2, vdupq_n_f32(c_gelu_p20));
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p18));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p16));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p14));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p12));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p10));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p8));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p6));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p4));
+    y = vmulq_f32(x2, y);
+    y = vaddq_f32(y, vdupq_n_f32(c_gelu_p2));
+    y = vmulq_f32(x2, y);
+
+    float32x4_t z = vmulq_f32(x, vdupq_n_f32(c_gelu_p1));
+    z = vaddq_f32(z, vdupq_n_f32(c_gelu_p0));
+
+    y = vaddq_f32(y, z);
+
+    y = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(y), x_gt));
+    y = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(y), x_ls));
+    x = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(x), x_gt2));
+
+    y = vaddq_f32(y, x);
+    y = vmulq_f32(y, z2);
+
+    vst1q_f32(&X[i], y); // Changed from Y to X
+  }
+
+  while (i < N) {
+    float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
     ++i;
   }
 }
@@ -1341,50 +1784,68 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
   }
 }
 
-/**
- * @brief Highly optimized version - processes 4 rows simultaneously
- * and writes directly to output block, eliminating intermediate copies.
- * Uses 128-bit NEON operations and prefetching for maximum throughput.
- */
-inline static void neon_transform_4rows_to_q4_0x4(
-  const uint8_t *__restrict row0_ptr, const uint8_t *__restrict row1_ptr,
-  const uint8_t *__restrict row2_ptr, const uint8_t *__restrict row3_ptr,
-  uint16_t scale0, uint16_t scale1, uint16_t scale2, uint16_t scale3,
-  block_q4_0x4 *__restrict out) {
-
-  // Prefetch next cache lines
-#ifndef _MSC_VER
-  __builtin_prefetch(row0_ptr + 64, 0, 3);
-  __builtin_prefetch(row1_ptr + 64, 0, 3);
-  __builtin_prefetch(row2_ptr + 64, 0, 3);
-  __builtin_prefetch(row3_ptr + 64, 0, 3);
-#endif
-
-  // Store scales directly
-  out->d[0] = scale0;
-  out->d[1] = scale1;
-  out->d[2] = scale2;
-  out->d[3] = scale3;
-
-  // Load 16 bytes from each row (strided by 32 bytes in source)
-  // For each row: load bytes at offsets 0, 32, 64, ..., 480 (16 values)
-  uint8_t r0[16], r1[16], r2[16], r3[16];
-
-  // Gather 16 bytes per row with stride 32
-  for (int j = 0; j < 16; j++) {
-    r0[j] = row0_ptr[j * 32];
-    r1[j] = row1_ptr[j * 32];
-    r2[j] = row2_ptr[j * 32];
-    r3[j] = row3_ptr[j * 32];
+static inline void transpose_matrix_16x8(const uint8_t *input, int input_stride,
+                                         uint8_t *output, int output_stride) {
+  uint8x8_t rows[16];
+  for (int i = 0; i < 8; i++) {
+    rows[2 * i] = vld1_u8(&input[2 * i * input_stride]);
+    rows[2 * i + 1] = vld1_u8(&input[(2 * i + 1) * input_stride]);
   }
+
+  uint8x16_t rows2[8];
+  rows2[0] = vcombine_u8(rows[0], rows[8]);
+  rows2[1] = vcombine_u8(rows[1], rows[9]);
+  rows2[2] = vcombine_u8(rows[2], rows[10]);
+  rows2[3] = vcombine_u8(rows[3], rows[11]);
+  rows2[4] = vcombine_u8(rows[4], rows[12]);
+  rows2[5] = vcombine_u8(rows[5], rows[13]);
+  rows2[6] = vcombine_u8(rows[6], rows[14]);
+  rows2[7] = vcombine_u8(rows[7], rows[15]);
+
+  uint8x16x2_t trn01 = vtrnq_u8(rows2[0], rows2[1]);
+  uint8x16x2_t trn23 = vtrnq_u8(rows2[2], rows2[3]);
+  uint8x16x2_t trn45 = vtrnq_u8(rows2[4], rows2[5]);
+  uint8x16x2_t trn67 = vtrnq_u8(rows2[6], rows2[7]);
+
+  uint16x8x2_t trn0123a = vtrnq_u16(vreinterpretq_u16_u8(trn01.val[0]),
+                                    vreinterpretq_u16_u8(trn23.val[0]));
+  uint16x8x2_t trn0123b = vtrnq_u16(vreinterpretq_u16_u8(trn01.val[1]),
+                                    vreinterpretq_u16_u8(trn23.val[1]));
+  uint16x8x2_t trn4567a = vtrnq_u16(vreinterpretq_u16_u8(trn45.val[0]),
+                                    vreinterpretq_u16_u8(trn67.val[0]));
+  uint16x8x2_t trn4567b = vtrnq_u16(vreinterpretq_u16_u8(trn45.val[1]),
+                                    vreinterpretq_u16_u8(trn67.val[1]));
+
+  uint32x4x2_t last0 = vtrnq_u32(vreinterpretq_u32_u16(trn0123a.val[0]),
+                                 vreinterpretq_u32_u16(trn4567a.val[0]));
+  uint32x4x2_t last1 = vtrnq_u32(vreinterpretq_u32_u16(trn0123b.val[0]),
+                                 vreinterpretq_u32_u16(trn4567b.val[0]));
+  uint32x4x2_t last2 = vtrnq_u32(vreinterpretq_u32_u16(trn0123a.val[1]),
+                                 vreinterpretq_u32_u16(trn4567a.val[1]));
+  uint32x4x2_t last3 = vtrnq_u32(vreinterpretq_u32_u16(trn0123b.val[1]),
+                                 vreinterpretq_u32_u16(trn4567b.val[1]));
+
+  vst1q_u8(&output[0 * output_stride], vreinterpretq_u8_u32(last0.val[0]));
+  vst1q_u8(&output[1 * output_stride], vreinterpretq_u8_u32(last1.val[0]));
+  vst1q_u8(&output[2 * output_stride], vreinterpretq_u8_u32(last2.val[0]));
+  vst1q_u8(&output[3 * output_stride], vreinterpretq_u8_u32(last3.val[0]));
+  vst1q_u8(&output[4 * output_stride], vreinterpretq_u8_u32(last0.val[1]));
+  vst1q_u8(&output[5 * output_stride], vreinterpretq_u8_u32(last1.val[1]));
+  vst1q_u8(&output[6 * output_stride], vreinterpretq_u8_u32(last2.val[1]));
+  vst1q_u8(&output[7 * output_stride], vreinterpretq_u8_u32(last3.val[1]));
+}
+
+inline static void
+neon_transform_transposed_4rows_to_q4_0x4(const uint8_t *__restrict in,
+                                          block_q4_0x4 *__restrict out) {
 
   // Process all 4 rows with NEON
   const uint8x8_t mask = vdup_n_u8(0x0F);
 
   // Row 0
   {
-    uint8x8_t lo = vld1_u8(r0);
-    uint8x8_t hi = vld1_u8(r0 + 8);
+    uint8x8_t lo = vld1_u8(in);
+    uint8x8_t hi = vld1_u8(in + 8);
     uint8x8_t v0 = vand_u8(lo, mask);
     uint8x8_t v1 = vshr_n_u8(lo, 4);
     uint8x8_t v2 = vand_u8(hi, mask);
@@ -1399,8 +1860,8 @@ inline static void neon_transform_4rows_to_q4_0x4(
 
   // Row 1
   {
-    uint8x8_t lo = vld1_u8(r1);
-    uint8x8_t hi = vld1_u8(r1 + 8);
+    uint8x8_t lo = vld1_u8(in + 16);
+    uint8x8_t hi = vld1_u8(in + 24);
     uint8x8_t v0 = vand_u8(lo, mask);
     uint8x8_t v1 = vshr_n_u8(lo, 4);
     uint8x8_t v2 = vand_u8(hi, mask);
@@ -1414,8 +1875,8 @@ inline static void neon_transform_4rows_to_q4_0x4(
 
   // Row 2
   {
-    uint8x8_t lo = vld1_u8(r2);
-    uint8x8_t hi = vld1_u8(r2 + 8);
+    uint8x8_t lo = vld1_u8(in + 32);
+    uint8x8_t hi = vld1_u8(in + 40);
     uint8x8_t v0 = vand_u8(lo, mask);
     uint8x8_t v1 = vshr_n_u8(lo, 4);
     uint8x8_t v2 = vand_u8(hi, mask);
@@ -1429,8 +1890,8 @@ inline static void neon_transform_4rows_to_q4_0x4(
 
   // Row 3
   {
-    uint8x8_t lo = vld1_u8(r3);
-    uint8x8_t hi = vld1_u8(r3 + 8);
+    uint8x8_t lo = vld1_u8(in + 48);
+    uint8x8_t hi = vld1_u8(in + 56);
     uint8x8_t v0 = vand_u8(lo, mask);
     uint8x8_t v1 = vshr_n_u8(lo, 4);
     uint8x8_t v2 = vand_u8(hi, mask);
@@ -1447,62 +1908,69 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
                                          const uint8_t *osv32_weights,
                                          const uint16_t *osv32_scales,
                                          size_t scale_group_size,
-                                         void *dst_q4_0x4) {
+                                         void *dst_q4_0x) {
+
   NNTR_THROW_IF((!(scale_group_size == 32 || scale_group_size == 64 ||
                    scale_group_size == 128)),
                 std::invalid_argument)
     << "Scale group size must be 32/64/128";
   NNTR_THROW_IF(K % QK4_0 != 0, std::invalid_argument)
-    << "K size must be divisible by QK4_0 (32)";
-  NNTR_THROW_IF(N % 4 != 0, std::invalid_argument)
-    << "N size must be divisible by 4";
-  constexpr size_t ROW_BLOCK_SIZE = 32;
-  constexpr size_t Q4_0X_BLOCK_SIZE = 4;
+    << "K size must be divisable by QK4_0 (32)";
+  NNTR_THROW_IF(N % 8 != 0, std::invalid_argument)
+    << "N size must be divisable by 8";
 
+  static constexpr const size_t NUM_Q4_0_BLOCKS = 4;
+  static constexpr const size_t ROW_BLOCK_SIZE = 32;
+  static constexpr const size_t COLUMN_BLOCK_SIZE = 2;
+  static constexpr const size_t ROW_BLOCK_BYTE_SIZE = 16;
+
+  uint8_t *dst_ = reinterpret_cast<uint8_t *>(dst_q4_0x);
+
+  // --- Layout ---
   const size_t rows_count_pad = align(N, ROW_BLOCK_SIZE);
   const size_t columns_count_pad = align(K, ROW_BLOCK_SIZE);
-  const size_t column_blocks_count = columns_count_pad / 2;
+  const size_t column_blocks_count =
+    columns_count_pad / COLUMN_BLOCK_SIZE; // COLUMN_BLOCK_SIZE == 2
   const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
-  const size_t num_blocks_per_row = K / QK4_0;
+  const int column_blocks_cnt = K / QK4_0;
 
-  block_q4_0x4 *dst_ptr = reinterpret_cast<block_q4_0x4 *>(dst_q4_0x4);
+#pragma omp parallel for schedule(dynamic)
+  for (int column_out_block_id = 0; column_out_block_id < column_blocks_cnt;
+       column_out_block_id++) {
+    uint8_t mx8x16[8 * 16];
+    const int column_idx = column_out_block_id * QK4_0;
+    const int scale_offset = (column_idx / scale_group_size) * rows_count_pad;
+    for (size_t row_id = 0; row_id < N; row_id += 8) {
+      const size_t row_in_block_id = row_id / ROW_BLOCK_SIZE;
+      const size_t i_in_block = row_id % ROW_BLOCK_SIZE;
+      const size_t row_block_base =
+        row_in_block_id * bytes_per_row_block_span + i_in_block;
+      const int src_offset =
+        row_block_base + column_out_block_id * 16 * ROW_BLOCK_SIZE;
 
-#pragma omp parallel for schedule(static)
-  for (long long row_id = 0; row_id < static_cast<long long>(N);
-       row_id += Q4_0X_BLOCK_SIZE) {
-    const size_t row_block_id = row_id / ROW_BLOCK_SIZE;
-    const size_t i_in_block = row_id % ROW_BLOCK_SIZE;
-    const size_t row_base =
-      row_block_id * bytes_per_row_block_span + i_in_block;
+      transpose_matrix_16x8(&osv32_weights[src_offset], ROW_BLOCK_SIZE, mx8x16,
+                            16);
+      const size_t row_out_block_id = row_id / NUM_Q4_0_BLOCKS;
+      int dst_offset =
+        (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) *
+        (column_out_block_id + row_out_block_id * column_blocks_cnt);
 
-    // Output pointer for this row group
-    block_q4_0x4 *out =
-      dst_ptr + (row_id / Q4_0X_BLOCK_SIZE) * num_blocks_per_row;
+      block_q4_0x4 *out = (block_q4_0x4 *)(dst_ + dst_offset);
+      const uint16_t *s_ptr = &osv32_scales[scale_offset + row_id];
+      out->d[0] = s_ptr[0];
+      out->d[1] = s_ptr[1];
+      out->d[2] = s_ptr[2];
+      out->d[3] = s_ptr[3];
+      neon_transform_transposed_4rows_to_q4_0x4(mx8x16, out);
 
-    // Precompute row pointers for fast inner loop
-    const uint8_t *row0_base = osv32_weights + row_base;
-    const uint8_t *row1_base = osv32_weights + row_base + 1;
-    const uint8_t *row2_base = osv32_weights + row_base + 2;
-    const uint8_t *row3_base = osv32_weights + row_base + 3;
+      dst_offset += (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) * column_blocks_cnt;
+      out = (block_q4_0x4 *)(dst_ + dst_offset);
 
-    for (size_t col_idx = 0; col_idx < K; col_idx += QK4_0) {
-      // Calculate weight offset: (col_idx / 2) * 32 = col_idx * 16
-      const size_t weight_offset = (col_idx / 2) * ROW_BLOCK_SIZE;
-
-      // Get scales for all 4 rows
-      const size_t scale_col = col_idx / scale_group_size;
-      const size_t scale_base = scale_col * rows_count_pad;
-      uint16_t s0 = osv32_scales[row_id + 0 + scale_base];
-      uint16_t s1 = osv32_scales[row_id + 1 + scale_base];
-      uint16_t s2 = osv32_scales[row_id + 2 + scale_base];
-      uint16_t s3 = osv32_scales[row_id + 3 + scale_base];
-
-      // Transform 4 rows directly to output
-      neon_transform_4rows_to_q4_0x4(
-        row0_base + weight_offset, row1_base + weight_offset,
-        row2_base + weight_offset, row3_base + weight_offset, s0, s1, s2, s3,
-        out);
-      out++;
+      out->d[0] = s_ptr[4];
+      out->d[1] = s_ptr[5];
+      out->d[2] = s_ptr[6];
+      out->d[3] = s_ptr[7];
+      neon_transform_transposed_4rows_to_q4_0x4(&mx8x16[64], out);
     }
   }
 }
@@ -1525,15 +1993,25 @@ static inline void load_fp16_4_to_chunk(const uint16_t *src, float *dst,
 void compute_kcaches_uint16(const float *in, const uint16_t *kcache,
                             float *output, int num_rows, int num_cache_head,
                             int head_dim, int gqa_size, int tile_size,
-                            size_t local_window_size) {
+                            size_t local_window_size, int head_start,
+                            int head_end) {
   std::vector<float> tmp_fp32(head_dim);
+
+  // If head_end is -1, process all heads from num_cache_head
+  // No other negative values are accepted for head_end.
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+
+  // Validate head range: head_start must be less than actual_head_end
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
 
   int start_row =
     num_rows < local_window_size ? 0 : num_rows - local_window_size;
   int row_cnt = num_rows < local_window_size ? num_rows : local_window_size;
   const int tile_count = (row_cnt + tile_size - 1) / tile_size;
 
-  for (int n = 0; n < num_cache_head; ++n) {
+  for (int n = head_start; n < actual_head_end; ++n) {
     for (int t = 0; t < tile_count; ++t) {
       int row_tile_start = t * tile_size;
       int tile_rows = std::min(tile_size, row_cnt - row_tile_start);
@@ -1581,11 +2059,20 @@ void compute_kcaches_uint16(const float *in, const uint16_t *kcache,
 void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
                                         const uint16_t *vcache, float *output,
                                         int num_cache_head, int gqa_size,
-                                        int head_dim,
-                                        size_t local_window_size) {
+                                        int head_dim, size_t local_window_size,
+                                        int head_start, int head_end) {
   std::vector<float> tmp_fp32(head_dim);
 
-  for (int n = 0; n < num_cache_head; ++n) {
+  // If head_end is -1, process all heads from head_start to num_cache_head.
+  // No other negative values are accepted for head_end.
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+
+  // Validate head range: head_start must be less than actual_head_end
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+
+  for (int n = head_start; n < actual_head_end; ++n) {
     int num_blocks = head_dim / 4;
     int rem = head_dim % 4;
 
@@ -1723,5 +2210,4 @@ void compute_rotary_emb_value_uint16(unsigned int width, unsigned int dim,
   }
 }
 #endif
-
 } // namespace nntrainer::neon

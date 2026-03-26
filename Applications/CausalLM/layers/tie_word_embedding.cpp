@@ -5,7 +5,7 @@
  * @file   tie_word_embedding.cpp
  * @date   21 May 2025
  * @brief  This is Embedding Layer Class of Neural Network
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items
  *
@@ -35,7 +35,7 @@ enum TieWordEmbeddingParams {
 TieWordEmbedding::TieWordEmbedding() :
   LayerImpl(),
   tieword_embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
-                          nntrainer::props::Unit()) {
+                          nntrainer::props::Unit(), nntrainer::props::Scale()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -130,6 +130,7 @@ void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
   auto const &in_dim = context.getInputDimensions()[0];
   output_dims[0] = in_dim;
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
+  output_dims[0].height(1);
 
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});
@@ -192,7 +193,10 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     std::get<nntrainer::props::InDim>(tieword_embedding_props);
   unsigned int out_dim =
     std::get<nntrainer::props::OutDim>(tieword_embedding_props);
-
+  float scale =
+    std::get<nntrainer::props::Scale>(tieword_embedding_props).empty()
+      ? 1.0f
+      : std::get<nntrainer::props::Scale>(tieword_embedding_props).get();
   unsigned int _from = from;
 
   nntrainer::Tensor &weight =
@@ -239,6 +243,10 @@ void TieWordEmbedding::incremental_forwarding_embedding(
       } else {
         out_tensor.copyData(cur_weight);
       }
+
+      if (scale != 1.0f) {
+        out_tensor.multiply_i(scale);
+      }
     }
 
 #ifdef DEBUG
@@ -267,7 +275,6 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
   input_step_dim.batch(1);
   input_step_dim.height(1);
   hidden_step_dim.batch(1);
-  hidden_step_dim.height(1);
 
   unsigned int b_size = input_dim.batch();
 
@@ -278,10 +285,7 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
         (to - from == 1 ? 0 : (to - 1) * input_.width()),
       true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
-      hidden_step_dim,
-      b * hidden_dim.getFeatureLen() +
-        (to - from == 1 ? 0 : (to - 1) * hidden_.width()),
-      true);
+      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
     ///@note Since tieword embedding shares the weight with embedding,
     /// the weight is transposed. Thus, the dot product should be consider

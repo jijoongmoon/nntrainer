@@ -8,7 +8,7 @@
  * coordinate from index of buffer memory. then we can use reorganizePos and
  * restorePos func
  * @brief  This file contains the mean absolute error loss as a sample layer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  */

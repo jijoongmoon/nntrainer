@@ -5,7 +5,7 @@
  * @file unittest_compiler.cpp
  * @date 01 April 2021
  * @brief compiler test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

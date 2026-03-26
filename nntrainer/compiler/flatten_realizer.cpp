@@ -5,7 +5,7 @@
  * @file flatten_realizer.cpp
  * @date 09 October 2021
  * @brief NNTrainer graph realizer which realizes flatten=true to actual node
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

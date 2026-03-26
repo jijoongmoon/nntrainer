@@ -5,7 +5,7 @@
  * @file previous_input_realizer.cpp
  * @date 18 November 2021
  * @brief NNTrainer graph realizer which connects input to previous one if empty
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

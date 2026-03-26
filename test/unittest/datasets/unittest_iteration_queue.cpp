@@ -5,7 +5,7 @@
  * @file unittest_iteration_queue.cpp
  * @date 12 July 2021
  * @brief Iteration Queue Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

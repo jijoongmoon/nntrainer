@@ -5,7 +5,7 @@
  * @file unittest_nntrainer_graph.cpp
  * @date 29 Oct 2020
  * @brief NNTrainer graph test.
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug No known bugs except for NYI items
  */

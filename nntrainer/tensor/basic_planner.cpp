@@ -4,7 +4,7 @@
  *
  * @file   basic_planner.cpp
  * @date   11 August 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Naive Memory Planner

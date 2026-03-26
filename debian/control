@@ -13,7 +13,7 @@ Build-Depends: gcc-13 | gcc-12 | gcc-11 | gcc-10 | gcc-9 | gcc-8 | gcc-7 (>=7.5)
  gstreamer1.0-tools, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good,
  ml-api-common-dev, ml-inference-api-dev
 Standards-Version: 3.9.6
-Homepage: https://github.com/nnstreamer/nntrainer
+Homepage: https://github.com/nntrainer/nntrainer
 
 Package: nntrainer
 Architecture: any

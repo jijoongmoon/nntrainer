@@ -4,7 +4,7 @@
  *
  * @file   mha_core.h
  * @date   02 September 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  *         https://arxiv.org/abs/1706.03762
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -113,6 +113,27 @@ public:
   UseSink(bool value = false) { set(value); };
   static constexpr const char *key = "use_sink"; /**< unique key to access */
   using prop_tag = nntrainer::bool_prop_tag;     /**< property type */
+};
+
+/**
+ * @brief AttnLogitSoftcapping
+ */
+class AttnLogitSoftcapping : public nntrainer::Property<float> {
+public:
+  AttnLogitSoftcapping(float value = 0.0f) { set(value); };
+  static constexpr const char *key =
+    "attn_logit_softcapping";                 /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
+ * @brief IsCausal property
+ */
+class IsCausal : public nntrainer::Property<bool> {
+public:
+  IsCausal(bool value = true) { set(value); };
+  static constexpr const char *key = "is_causal"; /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag;      /**< property type */
 };
 
 /**
@@ -286,7 +307,8 @@ private:
     nntrainer::props::AverageAttentionWeight, nntrainer::props::MaxTimestep,
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
-    props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings>
+    props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
+    props::AttnLogitSoftcapping, props::IsCausal>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -309,6 +331,8 @@ private:
   float theta;
   size_t local_window_size;
   bool use_sink = false;
+  float attn_logit_softcapping = 0.0f;
+  bool is_causal;
 
   enum INOUT_INDEX {
     /** input index */
@@ -349,10 +373,9 @@ private:
 
   /****************** ROTARY EMBEDDING *****************/
   /** static variable - they are all expected to be initialized once */
-
-  inline static std::vector<float> thetas;
   inline static std::vector<std::vector<float>> *freqs_cos = {};
   inline static std::vector<std::vector<float>> *freqs_sin = {};
+  inline static std::vector<float> thetas;
 #ifdef ENABLE_FP16
   inline static std::vector<std::vector<_FP16>> *freqs_cos_fp16 = {};
   inline static std::vector<std::vector<_FP16>> *freqs_sin_fp16 = {};
@@ -366,7 +389,7 @@ private:
    * @param[in] theta base of theta (default = 10000)
    */
   void precompute_freqs(int head_dim, unsigned int seq_len,
-                        float theta = 10000.0);
+                        float theta = 10000.0, bool is_fp16 = false);
 
   /**
    * @brief _compute frequency parameters for default ROPE

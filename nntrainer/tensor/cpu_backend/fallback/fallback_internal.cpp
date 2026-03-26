@@ -4,7 +4,7 @@
  *
  * @file fallback_internal.cpp
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Fallback computation functions (raw implementation)
@@ -431,6 +431,24 @@ void __fallback_swiglu(const unsigned int N, float *X, float *Y, float *Z,
   }
 }
 
+void __fallback_tanh_gelu(const unsigned int N, const float *X, float *Y) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+  }
+}
+
+void __fallback_tanh_gelu_mul(const unsigned int N, float *X, float *Y,
+                              float *Z) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float y = Y[i];
+    float z = Z[i];
+    X[i] = 0.5f * y *
+           (1.0f + std::tanh(0.7978845608f * (y + 0.044715f * y * y * y))) * z;
+  }
+}
+
 float __fallback_max(const unsigned int N, float *X) {
   std::vector<float> v(X, X + N);
   return *std::max_element(v.begin(), v.end());
@@ -569,7 +587,8 @@ void __fallback_softmax_row(float *qk_out, size_t start_row, size_t end_row,
 
 void __fallback_compute_fp16vcache_fp32_transposed(
   int row_num, const float *in, const uint16_t *vcache, float *output,
-  int num_cache_head, int gqa_size, int head_dim, size_t local_window_size) {
+  int num_cache_head, int gqa_size, int head_dim, size_t local_window_size,
+  int head_start, int head_end) {
   throw std::runtime_error(
     "NYI : __fallback_compute_fp16vcache_fp32_transposed");
 }
@@ -578,7 +597,8 @@ template <>
 void __fallback_compute_kcaches(const float *in, const uint16_t *kcache,
                                 float *output, int num_rows, int num_cache_head,
                                 int head_dim, int gqa_size, int tile_size,
-                                size_t local_window_size) {
+                                size_t local_window_size, int head_start,
+                                int head_end) {
   throw std::runtime_error("NYI : __fallback_compute_kcaches");
 }
 
@@ -625,13 +645,15 @@ void __fallback_create_q4_0_weights(const uint8_t *int4_weight,
   }
 }
 
-void __fallback_transform_q4_0x_from_int4(size_t N, size_t K,
-                                          const uint8_t *osv32_weights,
-                                          const uint16_t *osv32_scales,
-                                          size_t scale_group_size,
-                                          void *dst_q4_0x) {
+void __fallback_transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
+                                                  const uint8_t *osv32_weights,
+                                                  const uint16_t *osv32_scales,
+                                                  size_t scale_group_size,
+                                                  int q4_0x_block_size,
+                                                  void *dst_q4_0x) {
   Q4_0Utils::transformQ4_0x_FromInt4(N, K, osv32_weights, osv32_scales,
-                                     scale_group_size, 8, dst_q4_0x);
+                                     scale_group_size, q4_0x_block_size,
+                                     dst_q4_0x);
 }
 
 } // namespace nntrainer

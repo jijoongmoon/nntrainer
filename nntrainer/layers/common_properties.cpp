@@ -6,7 +6,7 @@
  * @date   14 May 2021
  * @brief  This file contains implementation of common properties widely used
  * across layers
- * @see	   https://github.com/nnstreamer/nntrainer
+ * @see	   https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  */

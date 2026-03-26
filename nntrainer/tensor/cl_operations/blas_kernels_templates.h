@@ -7,7 +7,7 @@
  * @date	07 July 2025
  * @brief	Common blas OpenCL kernels (common templates used by
  * blas_kernels_fp16.cpp and blas_kernels.cpp)
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Debadri Samaddar <s.debadri@samsung.com>
  * @author	Michal Wlasiuk <testmailsmtp12345@gmail.com>
  * @bug		No known bugs except for NYI items

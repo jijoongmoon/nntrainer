@@ -5,7 +5,7 @@
  * @file   simpleshot_centroid_knn.cpp
  * @date   08 Jan 2021
  * @brief  test for simpleshot centering layer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  */

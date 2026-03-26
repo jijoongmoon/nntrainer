@@ -10,7 +10,7 @@ cl_op_kernels = [
   'dot.cl',
   'int4_gemv.cl',
   'int4_quantize_input.cl',
-  'openvino_gemm.cl',
+  'int4_gemm.cl',
   'q4_0_ab_bi_8x4.cl',
   'q6_k_sgemv.cl',
   'restore_block_q4_0.cl',
@@ -63,10 +63,14 @@ foreach k : cl_op_kernels
   foreach line : kernel_code
     modified_code += ('R"(' + line + ')"' + ' "\\n"')
   endforeach
+  variable_name = basename + '_kernel'
+  if basename == 'int4_gemm'
+    variable_name = 'gemm_int4_kernel'
+  endif
   conf_data = configuration_data(
     {
       'namespace': 'nntrainer',
-      'variable_name': basename + '_kernel',
+      'variable_name': variable_name,
       'header_path': basename + '.h',
       'kernel_code': '\n'.join(modified_code),
     },

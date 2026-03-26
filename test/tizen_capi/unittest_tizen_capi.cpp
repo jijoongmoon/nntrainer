@@ -15,7 +15,7 @@
  * @file        unittest_tizen_capi.cc
  * @date        03 April 2020
  * @brief       Unit test utility.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Jijoong Moon <jijoong.moon@samsung.com>
  * @bug         No known bugs
  */

@@ -5,7 +5,7 @@
  * @file   ini_interpreter.cpp
  * @date   02 April 2021
  * @brief  NNTrainer Ini Interpreter (partly moved from model_loader.c)
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>

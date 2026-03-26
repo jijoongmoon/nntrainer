@@ -4,7 +4,7 @@
  *
  * @file    network_graph.h
  * @date    19 Oct 2020
- * @see     https://github.com/nnstreamer/nntrainer
+ * @see     https://github.com/nntrainer/nntrainer
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @bug     No known bugs except for NYI items
  * @brief   This is Network Graph Class for Neural Network

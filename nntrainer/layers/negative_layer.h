@@ -4,7 +4,7 @@
  *
  * @file   negative_layer.h
  * @date   3 July 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sumon Nath <sumon.nath@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is negative layer class (operation layer)

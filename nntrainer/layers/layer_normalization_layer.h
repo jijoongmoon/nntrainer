@@ -4,7 +4,7 @@
  *
  * @file   layer_normalization_layer.h
  * @date   25 July 2022
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  *         https://arxiv.org/abs/1607.06450
  * @author hyeonseok Lee <hs89.lee@samsung.com>
  * @bug    No known bugs except for NYI items

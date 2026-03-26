@@ -4,7 +4,7 @@
  *
  * @file   pow_layer.cpp
  * @date   20 Nov 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author SeungBaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is pow layer class (operation layer)

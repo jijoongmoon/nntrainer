@@ -14,7 +14,7 @@
  * @file	util_func.cpp
  * @date	08 April 2020
  * @brief	This is collection of math functions
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @bug		No known bugs except for NYI items
  *

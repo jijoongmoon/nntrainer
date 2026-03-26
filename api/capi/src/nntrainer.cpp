@@ -16,7 +16,7 @@
  * @date 02 April 2020
  * @brief NNTrainer C-API Wrapper.
  *        This allows to construct and control NNTrainer Model.
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items

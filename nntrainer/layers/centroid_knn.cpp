@@ -5,7 +5,7 @@
  * @file   centroid_knn.cpp
  * @date   09 Jan 2021
  * @brief  This file contains the simple nearest neighbor layer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

@@ -3,7 +3,7 @@
  * @file	int4_tensor.h
  * @date	23 January 2025
  * @brief	This is Int4QTensor class for quantized 4-bit integer calculation
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
  */

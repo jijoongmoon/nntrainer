@@ -5,7 +5,7 @@
  * @file   embedding.cpp
  * @date   04 March 2021
  * @brief  This is Embedding Layer Class of Neural Network
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This embedding layer supports FP32/FP16/Q6_K data type only.
@@ -26,7 +26,8 @@ enum EmbeddingParams { weight };
 
 EmbeddingLayer::EmbeddingLayer() :
   LayerImpl(),
-  embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim()),
+  embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
+                  nntrainer::props::Scale()),
   weight_idx(std::numeric_limits<unsigned>::max()) {}
 
 void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
@@ -92,7 +93,9 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
   unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
-
+  float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
+                  ? 1.0f
+                  : std::get<nntrainer::props::Scale>(embedding_props).get();
   unsigned int _from = from;
 
   nntrainer::Tensor &weight = context.getWeight(weight_idx);
@@ -139,6 +142,10 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           out_tensor.getData(), out_dim);
       } else {
         out_tensor.copyData(cur_weight);
+      }
+
+      if (scale != 1.0f) {
+        out_tensor.multiply_i(scale);
       }
     }
 

@@ -5,7 +5,7 @@
  * @file   optimizer_plugin_common_test.cpp
  * @date   30 March 2023
  * @brief  This file contains the parameterized common test of optimizer plugin
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  *

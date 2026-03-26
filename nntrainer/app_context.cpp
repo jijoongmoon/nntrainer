@@ -6,7 +6,7 @@
  * @date   10 November 2020
  * @brief  This file contains app context related functions and classes that
  * manages the global configuration of the current environment
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *
@@ -29,6 +29,7 @@
 
 #include <adam.h>
 #include <adamw.h>
+#include <lion.h>
 #include <sgd.h>
 
 #include <activation_layer.h>
@@ -261,6 +262,7 @@ void AppContext::add_default_object() {
   registerFactory(nntrainer::createOptimizer<Adam>, Adam::type, OptType::ADAM);
   registerFactory(nntrainer::createOptimizer<AdamW>, AdamW::type,
                   OptType::ADAMW);
+  registerFactory(nntrainer::createOptimizer<Lion>, Lion::type, OptType::LION);
   registerFactory(AppContext::unknownFactory<nntrainer::Optimizer>, "unknown",
                   OptType::UNKNOWN);
 

@@ -28,10 +28,9 @@ jobs:
     - name: gcc version change
       run: |
         sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
-        sudo apt-get install build-essential
-        sudo apt update
-        sudo apt install -y gcc-13
-        sudo apt install -y g++-13
+        sudo apt-get update
+        sudo apt-get install -y --fix-broken build-essential
+        sudo apt-get install -y gcc-13 g++-13 libcc1-0 libgcc-13-dev
         sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 1000 
         sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 1000
         sudo update-alternatives --set gcc /usr/bin/gcc-13

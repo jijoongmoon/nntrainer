@@ -5,7 +5,7 @@
  * @file   iteration_queue.h
  * @date   13 July 2021
  * @brief  This file contains thread safe queue for a single iteration
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

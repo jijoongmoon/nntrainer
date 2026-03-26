@@ -6,7 +6,7 @@
  * @date   30 March 2023
  * @brief  This file contains the execution part of momentum optimizer in
  * LayerPlugin example
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  *

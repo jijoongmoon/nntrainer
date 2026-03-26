@@ -4,7 +4,7 @@
  *
  * @file arm_compute_backend_fp16.cpp
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Compute backend for arm
@@ -13,9 +13,10 @@
 #include <arm_compute_backend.h>
 #include <assert.h>
 #include <fallback_internal.h>
+#include <fallback_kleidiai.h>
 #include <ggml_interface.h>
+#include <kleidiai_interface.h>
 #include <neon_impl.h>
-#include <neon_kleidiai.h>
 #include <nntrainer_error.h>
 #ifdef USE_BLAS
 #include <cblas_interface.h>
@@ -378,20 +379,20 @@ void softmax_row(__fp16 *qk_out, size_t start_row, size_t end_row,
 void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
                                    const _FP16 *vcache, _FP16 *output,
                                    int num_cache_head, int gqa_size,
-                                   int head_dim, int chunk_size,
-                                   size_t local_window_size) {
+                                   int head_dim, size_t local_window_size,
+                                   int head_start, int head_end) {
   neon::compute_fp16vcache_transposed(row_num, in, vcache, output,
                                       num_cache_head, gqa_size, head_dim,
-                                      chunk_size, local_window_size);
+                                      local_window_size, head_start, head_end);
 }
 
 void compute_kcaches(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
                      int num_rows, int num_cache_head, int head_dim,
-                     int gqa_size, int tile_off, int tile_size,
-                     size_t local_window_size) {
+                     int gqa_size, int tile_size, size_t local_window_size,
+                     int head_start, int head_end) {
   nntrainer::neon::compute_kcaches(in, kcache, output, num_rows, num_cache_head,
-                                   head_dim, gqa_size, tile_off, tile_size,
-                                   local_window_size);
+                                   head_dim, gqa_size, tile_size,
+                                   local_window_size, head_start, head_end);
 }
 
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,
@@ -439,6 +440,13 @@ void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
                                   rhs_native_mtx_qs4cx, rhs_scales_f32, transB);
 }
 
+void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
+                           void *rhs_native_mtx_f32,
+                           void *rhs_native_mtx_qs4c32) {
+  nntr_kai_quant_qs4c32_f32(n, k, bl, (const float *)rhs_native_mtx_f32,
+                            (uint8_t *)rhs_native_mtx_qs4c32);
+}
+
 template <>
 uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
@@ -474,6 +482,49 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
                                       uint32_t idx_variant, bool transB,
                                       float lower_bound, float upper_bound) {
   nntr_kai_gemm_qai8dxp_qsi4cxp_olp(
+    m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
+    idx_variant, transB, lower_bound, upper_bound);
+}
+
+} /* namespace nntrainer */
+
+namespace nntrainer {
+
+size_t nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(size_t n, size_t k,
+                                                  uint32_t idx_variant,
+                                                  bool transB) {
+  return nntr_kai_get_rhs_packed_size_qsi8d32p_qsi4c32p(n, k, idx_variant,
+                                                        transB);
+}
+
+void nntr_qsi8d32p_qsi4c32p_rhs_pack(size_t n, size_t k,
+                                     void *rhs_packed_mtx_qs4cx,
+                                     void *rhs_native_mtx_qs4cx,
+                                     void *rhs_scales_f32, uint32_t idx_variant,
+                                     bool transB) {
+  nntr_kai_qsi8d32p_qsi4c32p_rhs_pack(n, k, rhs_packed_mtx_qs4cx,
+                                      rhs_native_mtx_qs4cx, rhs_scales_f32,
+                                      idx_variant, transB);
+}
+
+template <>
+uint32_t nntr_gemm_qsi8d32p_qsi4c32p_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_mtx_f32,
+  bool transB, float lower_bound, float upper_bound) {
+  return nntr_kai_gemm_qsi8d32p_qsi4c32p_rtp(
+    m, n, k, lhs_native_mtx_f32, rhs_native_mtx_qs4cx, rhs_scales_f32,
+    dst_mtx_f32, transB, lower_bound, upper_bound);
+}
+
+template <>
+void nntr_gemm_qsi8d32p_qsi4c32p_packed(size_t m, size_t n, size_t k,
+                                        void *lhs_native_mtx_f32,
+                                        void *rhs_packed_mtx_qs4cx,
+                                        float *dst_act_mtx_f32,
+                                        uint32_t idx_variant, bool transB,
+                                        float lower_bound, float upper_bound) {
+  nntr_kai_gemm_qsi8d32p_qsi4c32p_olp(
     m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
     idx_variant, transB, lower_bound, upper_bound);
 }

@@ -5,7 +5,7 @@
  * @file        unittest_ccapi_tensor.cpp
  * @date        11 December 2023
  * @brief       cc API Tensor Unit tests.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Jijoong Moon <jijoong.moon@samsung.com>
  * @bug         No known bugs
  */

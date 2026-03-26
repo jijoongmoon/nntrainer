@@ -5,7 +5,7 @@
  * @file   tensor_pool.cpp
  * @date   19 Aug 2021
  * @brief  This is TensorPool for all requested tensors
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug	   No known bugs except for NYI items
@@ -241,6 +241,9 @@ void TensorPool::allocate(bool init) {
       continue;
     }
     spec.tensor->setData(mem_pool->getMemory(details->token), 0, init);
+    ml_logi("Memory Alloc Details (Tensor): %s : %zu : address %p",
+            spec.tensor->getName().c_str(), spec.tensor->getMemoryBytes(),
+            spec.tensor->getData());
 
     syncDependents(spec);
   }

@@ -5,7 +5,7 @@
  * @file   random_data_producers.h
  * @date   09 July 2021
  * @brief  This file contains various random data producers
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

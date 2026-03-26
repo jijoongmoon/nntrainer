@@ -6,7 +6,7 @@ Copyright (C) 2020 Jijoong Moon <jijoong.moon@samsung.com>
 @file   dataset.py
 @date   15 July 2020
 @brief  This is for mnist input generation
-@see    https://github.com/nnstreamer/nntrainer
+@see    https://github.com/nntrainer/nntrainer
 @author Jijoong Moon <jijoong.moon@samsung.com>
 @bug    No known bugs except for NYI items
 """

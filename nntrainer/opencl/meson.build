@@ -1,5 +1,6 @@
 opencl_sources = [
     'opencl_buffer.cpp',
+    'opencl_buffer_manager.cpp',
     'opencl_command_queue_manager.cpp',
     'opencl_context_manager.cpp',
     'opencl_device_info.cpp',
@@ -10,6 +11,7 @@ opencl_sources = [
 
 opencl_headers = [
   'CL/cl_platform.h',
+  'opencl_buffer_manager.h',
   'opencl_command_queue_manager.h',
   'opencl_context_manager.h',
   'opencl_kernel.h',

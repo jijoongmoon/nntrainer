@@ -1,7 +1,7 @@
 ### How to run
-1. you should compile nntrainer with this page --> [Getting Started](https://github.com/nnstreamer/nntrainer/blob/main/docs/getting-started.md)
+1. you should compile nntrainer with this page --> [Getting Started](https://github.com/nntrainer/nntrainer/blob/main/docs/getting-started.md)
 
-2. you need to make Dataset(.dat file) with this page --> [Datagen](https://github.com/nnstreamer/nntrainer/blob/main/Applications/utils/datagen/cifar/How-to-gen-data.md)
+2. you need to make Dataset(.dat file) with this page --> [Datagen](https://github.com/nntrainer/nntrainer/blob/main/Applications/utils/datagen/cifar/How-to-gen-data.md)
 
 Once you compile the codes, you can run with
 ``` bash

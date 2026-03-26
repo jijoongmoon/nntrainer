@@ -4,7 +4,7 @@
  *
  * @file   common.h
  * @date   18 May 2022
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author seongwoo <mhs4670go@naver.com>
  * @bug	   No known bugs except for NYI items
  * @brief  This is common interface for c++ API

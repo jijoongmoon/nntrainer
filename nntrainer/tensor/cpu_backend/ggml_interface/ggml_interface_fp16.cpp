@@ -4,12 +4,13 @@
  *
  * @file   ggml_impl_fp16.cpp
  * @date   23 July 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  GGML kernels for FP16 activation flow
  */
 
+#include <engine.h>
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_common.h>

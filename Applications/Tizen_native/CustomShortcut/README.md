@@ -22,7 +22,7 @@ If you want to do in CLI, you first need to [convert the project to CLI](https:/
 
 ### Prerequisite
 
-- [NNTrainer Prerequisite](https://github.com/nnstreamer/nntrainer#prerequisites)
+- [NNTrainer Prerequisite](https://github.com/nntrainer/nntrainer#prerequisites)
 - tizen studio 3.7 with build environment set (eg. certificates)
 - wearable 6.0 rootstrap (built after Oct 08 2020)
 - appropriate wearable tizen device with tizen 6.0 installed (built after Oct 08 2020)

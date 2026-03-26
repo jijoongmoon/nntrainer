@@ -6,7 +6,7 @@
  * @date 13 April 2022
  * @brief NNTrainer graph realizer which remove batch normalization layer for
  * inference
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug No known bugs except for NYI items
  */

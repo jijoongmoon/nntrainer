@@ -4,7 +4,7 @@
  *
  * @file   fallback_kleidiai.cpp
  * @date   15 September 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @brief  Modified computational backend components of kleidiai. Portions of
  * this file are derived from Arm Limited code licensed under the Apache
@@ -27,6 +27,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <string>
 
 #include <fallback_kleidiai.h>
@@ -396,3 +397,20 @@ void ref_matmul_f32_qa8dx_qs4cx(size_t m, size_t n, size_t k, rhs_format format,
                                            scalar_max);
   }
 };
+
+void quant_qs4c32_f32(size_t n, size_t k, size_t bl, const float *rhs_f32,
+                      uint8_t *rhs_qs4c32) {
+  throw std::runtime_error("NYI : quant_qs4c32_f32 (fallback)");
+}
+
+void ref_quant_qs8d32_f32(size_t n, size_t k, size_t bl, const float *rhs_f32,
+                          uint8_t *rhs_qs8c32) {
+  throw std::runtime_error("NYI : ref_quant_qs8d32_f32 (fallback)");
+}
+
+void ref_matmul_f32_qs8d32_qs4c32(size_t m, size_t n, size_t k, size_t bl,
+                                  const int8_t *lhs_qa8d32,
+                                  const uint8_t *rhs_qs4c32, float *dst_f32,
+                                  float scalar_min, float scalar_max) {
+  throw std::runtime_error("NYI : ref_matmul_f32_qs8d32_qs4c32 (fallback)");
+}

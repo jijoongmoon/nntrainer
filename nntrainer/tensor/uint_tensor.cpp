@@ -6,7 +6,7 @@
  *          This uint_tensor.cpp contains some codes to define
  *          UIntTensor template methods. This file cannot be used directly but
  *          included by uint_tensor.h only.
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @author	Eunju Yang <ej.yang@samsung.com>
  * @bug		No known bugs except for NYI items

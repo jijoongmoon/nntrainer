@@ -5,7 +5,7 @@
  * @file unittest_nntrainer_tensor_pool_fp16.cpp
  * @date 23 August 2023
  * @brief Mixed Tensor Pool Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug No known bugs except for NYI items
  */

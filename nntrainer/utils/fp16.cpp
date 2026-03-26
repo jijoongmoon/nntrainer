@@ -8,7 +8,7 @@
  * @file   fp16.cpp
  * @date   03 Nov 2023
  * @brief  This is collection of FP16 and FP32 conversion
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Marat Dukhan <maratek@gmail.com>
  * @bug    No known bugs except for NYI items
  *

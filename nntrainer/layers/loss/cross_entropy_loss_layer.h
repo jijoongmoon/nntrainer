@@ -5,7 +5,7 @@
  * @file   cross_entropy_loss_layer.h
  * @date   24 June 2021
  * @brief  This is Cross Entropy Loss Layer Class of Neural Network
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  *

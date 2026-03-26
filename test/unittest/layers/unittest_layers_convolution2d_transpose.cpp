@@ -5,7 +5,7 @@
  * @file unittest_layers_convolution.cpp
  * @date 21 November 2024
  * @brief Conv2dTranspose Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author UGyeong Song <thddnrud@snu.ac.kr>
  * @bug No known bugs except for NYI items
  */

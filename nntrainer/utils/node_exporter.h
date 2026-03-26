@@ -5,7 +5,7 @@
  * @file node_exporter.h
  * @date 09 April 2021
  * @brief NNTrainer Node exporter
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug No known bugs except for NYI items

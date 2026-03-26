@@ -6,7 +6,7 @@
 # @file	  convert.py
 # @date	  12 Oct 2020
 # @brief  This is script to convert cifar100 data set for vgg model
-# @see    https://github.com/nnstreamer/nntrainer
+# @see    https://github.com/nntrainer/nntrainer
 # @author Jijoong Moon <jijoong.moon@samsung.com>
 # @bug    No known bugs except for NYI items
 #

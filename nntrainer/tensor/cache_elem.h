@@ -4,7 +4,7 @@
  *
  * @file   cache_elem.h
  * @date   28 Nov 2022
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jiho Chu <jiho.chu@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Cache elem class

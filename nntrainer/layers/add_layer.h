@@ -4,7 +4,7 @@
  *
  * @file   add_layer.h
  * @date   7 Oct 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author SeungBaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is add layer class (operation layer)

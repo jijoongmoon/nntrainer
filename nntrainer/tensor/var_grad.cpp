@@ -4,7 +4,7 @@
  *
  * @file   var_grad.cpp
  * @date   13 November 2020
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Var_Grad Class for Neural Network

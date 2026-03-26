@@ -5,7 +5,7 @@
  * @file   flatbuffer_opnode.h
  * @date   10 February 2023
  * @brief  NNTrainer flatbuffer opnode
- * @see	   https://github.com/nnstreamer/nntrainer
+ * @see	   https://github.com/nntrainer/nntrainer
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug    No known bugs except for NYI items
  */

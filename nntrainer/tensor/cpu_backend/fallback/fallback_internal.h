@@ -4,7 +4,7 @@
  *
  * @file fallback_internal.h
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Fallback interface
@@ -493,6 +493,28 @@ void __fallback_compute_rotary_embedding_value(unsigned int dim,
 void __fallback_swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z);
 
 /**
+ * @brief tanh_gelu function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *                                  + 0.044715 * X^3)))
+ *
+ * @param N number of elements in X
+ * @param X const _FP16 * for Vector X (input)
+ * @param Y _FP16 * for Vector Y (output)
+ */
+void __fallback_tanh_gelu(const unsigned int N, const _FP16 *X, _FP16 *Y);
+
+/**
+ * @brief tanh_gelu mul function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *                                      + 0.044715 * X^3))) * Z
+ *
+ * @param N number of elements in X
+ * @param X _FP16 * for Vector X (output)
+ * @param Y _FP16 * for Vector Y (input)
+ * @param Z _FP16 * for Vector Z (input)
+ */
+void __fallback_tanh_gelu_mul(const unsigned int N, _FP16 *X, _FP16 *Y,
+                              _FP16 *Z);
+
+/**
  * @brief returns maximum value of the vector X
  *
  * @param N number of elements in X
@@ -539,7 +561,7 @@ void __fallback_calc_trigonometric_vals_dup(unsigned int N_half, T *angle,
                                             unsigned int from = 0,
                                             float attention_scaling = 1.0f);
 /**
- * @brief swiglu function with neon : X = (Y / (1 + exp( -Y ))) * Z
+ * @brief swiglu function: X = (Y / (1 + exp( -Y ))) * Z
  *
  * @param N number of elements in X
  * @param X float * for Vector X
@@ -558,6 +580,28 @@ void __fallback_swiglu(const unsigned int N, float *X, float *Y, float *Z);
  */
 void __fallback_swiglu(const unsigned int N, float *X, float *Y, float *Z,
                        float alpha);
+
+/**
+ * @brief tanh_gelu function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *                                  + 0.044715 * X^3)))
+ *
+ * @param N number of elements in X
+ * @param X const float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void __fallback_tanh_gelu(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu mul function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *                                      + 0.044715 * X^3))) * Z
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output)
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector Z (input)
+ */
+void __fallback_tanh_gelu_mul(const unsigned int N, float *X, float *Y,
+                              float *Z);
 
 /**
  * @brief returns maximum value of the vector X
@@ -1148,11 +1192,17 @@ void __fallback_softmax_row(float *qk_out, size_t start_row, size_t end_row,
  * @param[in] gqa_size size of group
  * @param[in] head_dim head dimension
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void __fallback_compute_fp16vcache_fp32_transposed(
   int row_num, const float *in, const uint16_t *vcache, float *output,
   int num_cache_head, int gqa_size, int head_dim,
-  size_t local_window_size = UINT_MAX);
+  size_t local_window_size = UINT_MAX, int head_start = 0, int head_end = -1);
 
 /**
  * @brief Compute kcaches
@@ -1166,12 +1216,19 @@ void __fallback_compute_fp16vcache_fp32_transposed(
  * @param[in] gqa_size size of group
  * @param[in] tile_size size of tile
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 template <typename BType>
 void __fallback_compute_kcaches(const float *in, const BType *kcache,
                                 float *output, int num_rows, int num_cache_head,
                                 int head_dim, int gqa_size, int tile_size,
-                                size_t local_window_size = UINT_MAX);
+                                size_t local_window_size = UINT_MAX,
+                                int head_start = 0, int head_end = -1);
 
 /**
  * @brief Compute rotary embedding value
@@ -1262,13 +1319,15 @@ void __fallback_create_q4_0_weights(const uint8_t *int4_weight,
  * @param osv32_weights uint8_t* data of weights in osv32_isv2 layout
  * @param osv32_scales fp16* scales
  * @param scale_group_size group size (32 or 64 or 128)
+ * @param q4_0x_block_size output q4_0x block size - number of rows (4 or 8)
  * @param dst_q4_0x void * output data in block_q4_0x8 or block_q4_0x4 layout
  */
-void __fallback_transform_q4_0x_from_int4(size_t N, size_t K,
-                                          const uint8_t *osv32_weights,
-                                          const uint16_t *osv32_scales,
-                                          size_t scale_group_size,
-                                          void *dst_q4_0x);
+void __fallback_transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
+                                                  const uint8_t *osv32_weights,
+                                                  const uint16_t *osv32_scales,
+                                                  size_t scale_group_size,
+                                                  int q4_0x_block_size,
+                                                  void *dst_q4_0x);
 
 } // namespace nntrainer
 #endif

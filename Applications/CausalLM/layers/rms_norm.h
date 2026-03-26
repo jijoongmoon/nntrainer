@@ -5,7 +5,7 @@
  * @file   rms_norm.h
  * @date   11 July 2025
  * @brief  Implementation of RMS normalization function
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This layer only supports inference mode.
@@ -43,7 +43,7 @@ public:
    * @brief Construct a new custom RMS normalization layer object
    *
    */
-  WIN_EXPORT RMSNormLayer() : Layer() {}
+  WIN_EXPORT RMSNormLayer() : Layer(), wt_idx({0}) {}
 
   /**
    * @brief Destroy the custom RMS normalization layer object

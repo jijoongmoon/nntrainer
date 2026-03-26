@@ -7,7 +7,7 @@
  * @date	07 July 2025
  * @brief	Common attention OpenCL kernels (common templates used by
  * attention_kernels_fp16.cpp and attention_kernels.cpp)
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Yash Singh <yash.singh@samsung.com>
  * @author	Michal Wlasiuk <testmailsmtp12345@gmail.com>
  * @bug		No known bugs except for NYI items

@@ -5,7 +5,7 @@
  * @file unittest_layers_sqrt.cpp
  * @date 19 March 2025
  * @brief Sqrt Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author SeungBaek Hong <sb92.hong@samsung.com>
  * @bug No known bugs except for NYI items
  */

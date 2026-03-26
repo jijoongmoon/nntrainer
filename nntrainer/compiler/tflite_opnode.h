@@ -5,7 +5,7 @@
  * @file tflite_opnode.h
  * @date 28 April 2021
  * @brief contains tflite opnode which has information to convert to tflite file
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug No known bugs except for NYI items

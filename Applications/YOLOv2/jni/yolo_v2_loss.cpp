@@ -5,7 +5,7 @@
  * @file   yolo_v2_loss.cpp
  * @date   07 March 2023
  * @brief  This file contains the yolo v2 loss layer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

@@ -5,7 +5,7 @@
  * @file        unittest_nntrainer_tensor_neon_fp16.cpp
  * @date        03 August 2023
  * @brief       Unit test utility for tensor with NEON __fp16 support for ARM.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Debadri Samaddar <s.debadri@samsung.com>
  * @author      Sungsik Kong <ss.kong@samsung.com>
  * @bug         No known bugs

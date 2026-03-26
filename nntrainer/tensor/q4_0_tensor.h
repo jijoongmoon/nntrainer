@@ -3,7 +3,7 @@
  * @file	q4_0_tensor.h
  * @date	22 July 2025
  * @brief	This is Q4_0_Tensor class for Q4_0 quantized tensor.
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Eunju Yang <ej.yang@samsung.com>
  * @bug		No known bugs except for NYI items
  */

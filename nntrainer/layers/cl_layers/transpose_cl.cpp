@@ -5,7 +5,7 @@
  * @file   transpose_cl.cpp
  * @date   31 July 2024
  * @brief  Implementation of transpose layer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  *

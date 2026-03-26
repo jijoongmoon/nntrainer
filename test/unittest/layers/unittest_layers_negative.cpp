@@ -5,7 +5,7 @@
  * @file unittest_layers_neg.cpp
  * @date 5 July 2025
  * @brief Neg Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Sumon Nath <sumon.nath@samsung.com>
  * @bug No known bugs except for NYI items
  */

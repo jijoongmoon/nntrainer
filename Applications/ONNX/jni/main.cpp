@@ -5,7 +5,7 @@
  * @file   main.cpp
  * @date   26 Feb 2025
  * @brief  onnx example using nntrainer-onnx-api
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.honge@samsung.com>
  * @bug    No known bugs except for NYI items
  */

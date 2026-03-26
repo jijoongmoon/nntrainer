@@ -5,7 +5,7 @@
  * @file	attention_kernels.h
  * @date	28 August 2024
  * @brief	Common attention OpenCL kernels
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Yash Singh <yash.singh@samsung.com>
  * @bug		No known bugs except for NYI items
  *

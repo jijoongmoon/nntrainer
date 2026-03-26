@@ -4,7 +4,7 @@
  *
  * @file   matrix_transpose_neon_f16.cpp
  * @date   23 Jan 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is source file for matrix transpose using NEON

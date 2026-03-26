@@ -5,7 +5,7 @@
  * @file   layer_plugin_common_test.h
  * @date   11 June 2021
  * @brief  This file contains the parameterized common test of layer plugin
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

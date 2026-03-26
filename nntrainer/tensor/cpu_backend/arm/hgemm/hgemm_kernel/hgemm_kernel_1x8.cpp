@@ -4,7 +4,7 @@
  *
  * @file   hgemm_kernel_1x8.cpp
  * @date   05 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Debadri Samaddar <s.debadri@samsung.com>
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items

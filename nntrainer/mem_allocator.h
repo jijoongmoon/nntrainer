@@ -4,7 +4,7 @@
  *
  * @file    mem_allocator.h
  * @date    13 Jan 2025
- * @see     https://github.com/nnstreamer/nntrainer
+ * @see     https://github.com/nntrainer/nntrainer
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @bug     No known bugs except for NYI items
  * @brief   This is memory allocator for memory pool

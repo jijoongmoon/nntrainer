@@ -4,7 +4,7 @@
  *
  * @file   multi_head_attention_layer.h
  * @date   08 July 2022
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  *         https://arxiv.org/abs/1706.03762
  * @author hyeonseok Lee <hs89.lee@samsung.com>
  * @bug    No known bugs except for NYI items

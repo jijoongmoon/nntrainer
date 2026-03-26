@@ -4,7 +4,7 @@
  *
  * @file fallback.cpp
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Fallback interface (Raw implementations)
@@ -192,6 +192,10 @@ void compute_rotary_embedding_value(unsigned int dim, unsigned int half_,
 
 void swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z) {
   __fallback_swiglu(N, X, Y, Z);
+}
+
+void tanh_gelu(const unsigned int N, const _FP16 *X, _FP16 *Y) {
+  __fallback_tanh_gelu(N, X, Y);
 }
 
 _FP16 max_val(const unsigned int N, _FP16 *X) { return __fallback_max(N, X); }

@@ -5,7 +5,7 @@
  * @file unittest_raw_file_data_producer.cpp
  * @date 12 July 2021
  * @brief raw file data producers (Param Tests)
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

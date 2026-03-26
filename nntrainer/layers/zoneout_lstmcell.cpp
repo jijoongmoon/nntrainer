@@ -5,7 +5,7 @@
  * @file   zoneout_lstmcell.cpp
  * @date   30 November 2021
  * @brief  This is ZoneoutLSTMCell Layer Class of Neural Network
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  *         https://arxiv.org/pdf/1606.01305.pdf
  *         https://github.com/teganmaharaj/zoneout
  * @author hyeonseok lee <hs89.lee@samsung.com>

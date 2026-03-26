@@ -4,7 +4,7 @@
  *
  * @file   optimzied_v3_planner.h
  * @date   2 January 2023
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Optimized V3 Memory Planner

@@ -5,7 +5,7 @@
  * @file unittest_layers_mol_attention.cpp
  * @date 26 November 2021
  * @brief MoL Attention Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

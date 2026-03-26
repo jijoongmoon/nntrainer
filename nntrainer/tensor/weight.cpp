@@ -4,7 +4,7 @@
  *
  * @file   weight.cpp
  * @date   22 September 2020
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Weight Class for Neural Network
@@ -137,7 +137,8 @@ void Weight::applyGradient(double lr, Tensor &updated_grad) {
     quantizeWeight();
     return;
   } else {
-    return applyGradient(lr);
+    /** FP32 (or matching dtype) path: apply the provided updated_grad directly */
+    var->add_i(updated_grad, -lr);
   }
 }
 

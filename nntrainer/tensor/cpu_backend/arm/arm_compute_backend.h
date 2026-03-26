@@ -4,7 +4,7 @@
  *
  * @file ARM_compute_backend.h
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Compute backend for ARM
@@ -393,7 +393,7 @@ void transpose_matrix(const unsigned int M, const unsigned int N,
                       unsigned int ld_dst);
 
 /**
- * @brief Compute vcache for one row transposed
+ * @brief Compute Value Cache aggregation
  * @param[in] row_num row number
  * @param[in] in _FP16* input vector
  * @param[in] vcache _FP16* input vector
@@ -401,14 +401,20 @@ void transpose_matrix(const unsigned int M, const unsigned int N,
  * @param[in] num_cache_head number head of cache
  * @param[in] gqa_size size of group
  * @param[in] head_dim head dimension
- * @param[in] chunk_size size of chunk
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
                                    const _FP16 *vcache, _FP16 *output,
                                    int num_cache_head, int gqa_size,
-                                   int head_dim, int chunk_size,
-                                   size_t local_window_size = UINT_MAX);
+                                   int head_dim,
+                                   size_t local_window_size = UINT_MAX,
+                                   int head_start = 0, int head_end = -1);
 
 /**
  * @brief Compute kcaches
@@ -419,14 +425,20 @@ void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
  * @param[in] num_cache_head number head of cache
  * @param[in] head_dim head dimension
  * @param[in] gqa_size size of group
- * @param[in] tile_off offset of tile
  * @param[in] tile_size size of tile
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void compute_kcaches(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
                      int num_rows, int num_cache_head, int head_dim,
-                     int gqa_size, int tile_off, int tile_size,
-                     size_t local_window_size = UINT_MAX);
+                     int gqa_size, int tile_size,
+                     size_t local_window_size = UINT_MAX, int head_start = 0,
+                     int head_end = -1);
 
 /**
  * @brief Compute rotary embedding value
@@ -528,6 +540,94 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(
   void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
   T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief get size of memory to allocate for rhs weight packing of qsi8d32p to
+ * qsi4c32p
+ *
+ * @param n row length if not transposed
+ * @param k col length if not transposed
+ * @param idx_variant idx of kernel variant
+ * @param transB rather the weight matrix is transposed or not
+ * @return size_t size of memory to allocate
+ */
+size_t nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(size_t n, size_t k,
+                                                  uint32_t idx_variant,
+                                                  bool transB);
+
+/**
+ * @brief rhs matrix packing for qsi8d32p_qsi4c32p format
+ *
+ * @param n row length if not transposed
+ * @param k col length if not transposed
+ * @param rhs_packed_mtx_qs4cx dst* to store results
+ * @param rhs_native_mtx_qs4cx input matrix data
+ * @param rhs_scales_f32 input qparam data
+ * @param transB rather the matrix is transposed or not
+ */
+void nntr_qsi8d32p_qsi4c32p_rhs_pack(size_t n, size_t k,
+                                     void *rhs_packed_mtx_qs4cx,
+                                     void *rhs_native_mtx_qs4cx,
+                                     void *rhs_scales_f32, uint32_t idx_variant,
+                                     bool transB);
+
+/**
+ * @brief qs4c32 quantization of (n*k) matrix with block size 32.
+ * qsi4c32p refers to quantized symmetric 4-bit quantization with block size 32.
+ *
+ * @param n N length of the matrix
+ * @param k K length of the matrix (must be divisible by bl)
+ * @param bl block length (typically 32)
+ * @param rhs_native_mtx_f32 matrix data before quantization to load
+ * @param rhs_native_mtx_qs4c32 matrix data after quantization to store
+ */
+void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
+                           void *rhs_native_mtx_f32,
+                           void *rhs_native_mtx_qs4c32);
+
+/**
+ * @brief GEMM of qsi8d32p runtime-quantized activation and offline qsi4c32p
+ * quantized weight
+ *
+ * @tparam T dataType of input activation and output matrices
+ * @param m M length of the matrix
+ * @param n N length of the matrix
+ * @param k K length of the matrix
+ * @param lhs_native_mtx activation (not quantized)
+ * @param rhs_native_mtx_qs4cx offline quantized weight
+ * @param rhs_scales scale factor vector of quantized weight
+ * @param dst_mtx dst matrix
+ * @param lower_bound lower bound to clamp
+ * @param upper_bound upper bound to clamp
+ * @param transB Choose weight data to be transposed or not. Default value
+ * regards the weight to be transpoed.
+ */
+template <typename T = float>
+uint32_t nntr_gemm_qsi8d32p_qsi4c32p_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales, T *dst_mtx, bool transB = true,
+  T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief run qsi8d32p_qsi4c32p GEMM with offline weight packing
+ *
+ * @param m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param lhs_native_mtx_f32 activation
+ * @param rhs_packed_mtx_qs4cx qs4cx quantized weight, packed already
+ * @param dst_act_mtx_f32 dst data
+ * @param transB rather the weight matrix is transposed or not
+ * @param lower_bound clipping param
+ * @param upper_bound clipping param
+ */
+template <typename T = float>
+void nntr_gemm_qsi8d32p_qsi4c32p_packed(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
+  bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
 #endif
 /**
  * @brief Multihead softmax, exp(x_i) / sum(exp(x_i)), inplace version
@@ -585,12 +685,19 @@ void softmax_row(__fp16 *qk_out, size_t start_row, size_t end_row,
  * @param[in] gqa_size size of group
  * @param[in] head_dim head dimension
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
                                         const uint16_t *vcache, float *output,
                                         int num_cache_head, int gqa_size,
                                         int head_dim,
-                                        size_t local_window_size = UINT_MAX);
+                                        size_t local_window_size = UINT_MAX,
+                                        int head_start = 0, int head_end = -1);
 
 /**
  * @brief Compute kcaches
@@ -604,12 +711,19 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
  * @param[in] gqa_size size of group
  * @param[in] tile_size size of tile
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 template <typename BType>
 void compute_kcaches(const float *in, const BType *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,
                      int gqa_size, int tile_size,
-                     size_t local_window_size = UINT_MAX);
+                     size_t local_window_size = UINT_MAX, int head_start = 0,
+                     int head_end = -1);
 
 /**
  * @brief Compute rotary embedding value
@@ -667,7 +781,9 @@ void calc_trigonometric_vals_dup(unsigned int N_half, T *angle, T *cos_,
 void swiglu(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
- * @brief swiglu function with alpha : X = (Y / (1 + exp(- alpha * Y))) * Z
+ * @brief swiglu function with alpha and neon
+ *  X = (Y / (1 + exp(- alpha * Y)))
+ *        * Z with loop unrolling x4
  * @param N number of elements in X
  * @param X float* for Vector X
  * @param Y float* for Vector Y
@@ -675,6 +791,50 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z);
  * @param alpha float
  */
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha);
+
+/**
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with loop unrolling x4
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void tanh_gelu(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu function with neon but with polynoial approximation
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu function with neon but as
+ * X = Y / (1 + exp(-pi/4*(Y + 0.04
+ *      4715Y^3)) * Z with loop unrolling x4
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output)
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector Z (input)
+ */
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z);
+
+/**
+ * @brief tanh_gelu function with neon but as
+ * X = Y / (1 + exp(-pi/4*(Y + 0.04
+ *      4715Y^3)) * Z
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output)
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector Z (input)
+ */
+void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
  * @brief returns maximum value of the vector X
@@ -987,8 +1147,7 @@ void ele_sub(const unsigned N, const float *X, const float *Y, float *Z,
              unsigned int o_stride = 1);
 
 /**
- * @brief     elementwise vector division with neon : Z = X / (alpha * Y) + beta
- * * Z
+ * @brief elementwise vector division with neon : Z = X / (alpha * Y) + beta * Z
  * @note ZeroDivisionError is not guaranteed in this function
  * @param[in] N  length of the vector
  * @param[in] X float * for Vector X
@@ -1327,9 +1486,11 @@ void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight);
  * @param scale_group_size group size (32 or 64 or 128)
  * @param dst_q4_0x void * output data in block_q4_0x8 or block_q4_0x4 layout
  */
-void transform_q4_0x_from_int4(size_t N, size_t K, const uint8_t *osv32_weights,
-                               const uint16_t *osv32_scales,
-                               size_t scale_group_size, void *dst_q4_0x);
+void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
+                                       const uint8_t *osv32_weights,
+                                       const uint16_t *osv32_scales,
+                                       size_t scale_group_size,
+                                       void *dst_q4_0x);
 
 } /* namespace nntrainer */
 #endif /* __cplusplus */

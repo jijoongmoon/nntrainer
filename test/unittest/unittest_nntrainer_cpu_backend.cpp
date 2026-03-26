@@ -3,7 +3,7 @@
  * @file	unittest_nntrainer_cpu_backend.cpp
  * @date	03 April 2025
  * @brief	This is unittest for cpu_backend standalone
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Sungsik Kong <ss.kong@samsung.com>
  * @bug		No known bugs except for NYI items
  */
@@ -27,25 +27,6 @@ using std::chrono::microseconds;
 using std::chrono::milliseconds;
 using std::chrono::nanoseconds;
 using std::chrono::seconds;
-
-#define EXPECT_IN_RANGE(VAL, MIN, MAX)                                         \
-  EXPECT_GE((VAL), (MIN));                                                     \
-  EXPECT_LE((VAL), (MAX))
-
-template <typename T, bool random_init = false>
-static inline std::vector<T>
-generate_random_vector(size_t size, float min_val = -1.F, float max_val = 1.F) {
-  std::random_device rd;
-  auto init_val = random_init ? rd() : 42;
-  std::mt19937 gen(init_val);
-  // std::mt19937 gen(rd());
-  std::uniform_real_distribution<float> dist(min_val, max_val);
-  std::vector<T> vec(size);
-  for (auto &val : vec) {
-    val = static_cast<T>(dist(gen));
-  }
-  return vec;
-}
 
 #if defined(ENABLE_FP16) || defined(__AVX2__)
 static inline std::vector<uint16_t>
@@ -979,16 +960,42 @@ TEST(nntrainer_cpu_backend_standalone, softmax_row_inplace_fp16) {
   }
 }
 
+TEST(nntrainer_cpu_backend_standalone, softmax_row_fp16) {
+  size_t start_row = 0;
+  size_t end_row = 3;
+  size_t num_heads = 10;
+  size_t qk_out_size = num_heads * end_row;
+  // auto qk_out = generate_random_vector<float>(qk_out_size, -10, 10);
+  std::vector<__fp16> qk_out = {
+    -2.509198, 5.930860,  9.014286,  -6.331305, 4.639878,  5.593820,
+    1.973170,  1.937003,  -6.879627, -1.083345, -6.880110, -8.000502,
+    -8.838327, -0.815022, 7.323523,  -3.325828, 2.022300,  -7.142663,
+    4.161452,  3.017770,  -9.588310, -8.871769, 9.398197,  4.439975,
+    6.648853,  8.771055,  -5.753218, -9.984425, -6.363501, 9.844232};
+  std::vector<__fp16> ref_out = {
+    0.986697, 0.999999, 0.405184, 0.000021, 0.043301, 0.040031,
+    0.487615, 0.999879, 0.000016, 0.000018, 0.012472, 0.000001,
+    0.000000, 0.005194, 0.633859, 0.000005, 0.512170, 0.000114,
+    0.999957, 0.001083, 0.000831, 0.000000, 0.594816, 0.994785,
+    0.322840, 0.959963, 0.000215, 0.000007, 0.000027, 0.998899};
+
+  nntrainer::softmax_row(qk_out.data(), start_row, end_row, num_heads);
+
+  for (size_t i = 0; i < qk_out_size; i++) {
+    EXPECT_NEAR(ref_out[i], qk_out[i], 0.0005f);
+  }
+}
+
 TEST(nntrainer_cpu_backend_standalone, compute_kcaches_fp16) {
   int num_rows = 1;
-  int num_cache_head = 2;
+  int N = 2;
   int head_dim = 10;
   int group_size = 4;
   int tile_size = 16;
-  int tile_offset = 0;
-  size_t in_size = num_cache_head * group_size * head_dim;
-  size_t kcache_size = num_rows * num_cache_head * head_dim;
-  size_t output_size = num_rows * num_cache_head * group_size;
+  size_t in_size = N * group_size * head_dim;
+  size_t kcache_size = num_rows * N * head_dim;
+  size_t output_size = num_rows * N * group_size;
+
   std::vector<__fp16> in = {
     -2.509198, 5.930860,  9.014286,  -6.331305, 4.639878,  5.593820,  1.973170,
     1.937003,  -6.879627, -1.083345, -6.880110, -8.000502, -8.838327, -0.815022,
@@ -1009,14 +1016,9 @@ TEST(nntrainer_cpu_backend_standalone, compute_kcaches_fp16) {
   std::vector<__fp16> ref_out = {0.089252,  -0.072949, 0.058948,  -0.045583,
                                  -0.025812, -0.002068, -0.014971, -0.028027};
   std::vector<__fp16> output(output_size);
-  for (int n = 0; n < num_cache_head; ++n) {
-    const __fp16 *in_ptr = in.data() + n * group_size * head_dim;
-    const __fp16 *kcache_ptr = kcache.data() + n * head_dim;
-    __fp16 *out_ptr = output.data() + n * group_size;
-    nntrainer::compute_kcaches(in_ptr, kcache_ptr, out_ptr, num_rows,
-                               num_cache_head, head_dim, group_size,
-                               tile_offset, tile_size);
-  }
+
+  nntrainer::compute_kcaches(in.data(), kcache.data(), output.data(), num_rows,
+                             N, head_dim, group_size, tile_size);
 
   for (size_t i = 0; i < output_size; i++) {
     EXPECT_NEAR(ref_out[i], output[i], 0.0001f);
@@ -1098,7 +1100,6 @@ TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_transposed_fp16) {
   int gqa_size = 2;
   int head_dim = 9;
   int max_iter = 2;
-  int chunk_size = 9;
   size_t in_size = max_iter * max_iter * num_cache_head * gqa_size;
   size_t vcache_size = max_iter * num_cache_head * head_dim;
   size_t output_size = num_cache_head * gqa_size * head_dim;
@@ -1122,15 +1123,9 @@ TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_transposed_fp16) {
     0.494638,  -0.060525, -0.078396, 0.019140,  -0.078680, 0.571263};
   std::vector<__fp16> output(output_size);
 
-  for (int n = 0; n < num_cache_head; ++n) {
-    int chunk_size = head_dim;
-    const _FP16 *in_ptr = in.data() + n * gqa_size;
-    const _FP16 *vcache_ptr = vcache.data() + n * head_dim;
-    _FP16 *out_ptr = output.data() + n * gqa_size * head_dim;
-    nntrainer::compute_fp16vcache_transposed(row_num, in_ptr, vcache_ptr,
-                                             out_ptr, num_cache_head, gqa_size,
-                                             head_dim, chunk_size);
-  }
+  nntrainer::compute_fp16vcache_transposed(row_num, in.data(), vcache.data(),
+                                           output.data(), num_cache_head,
+                                           gqa_size, head_dim);
 
   for (size_t i = 0; i < output.size(); i++) {
     EXPECT_NEAR(ref_out[i], output[i], 0.0004f);
@@ -1190,42 +1185,10 @@ TEST(nntrainer_cpu_backend_standalone, clamp_3072_0_1) {
   run_clamp_test(N, lower_bound, upper_bound, false);
 }
 
-static inline void printMatrixI(const char *name, float *data, int Y, int X) {
-  printf("%s :\n", name);
-  for (int y = 0; y < Y; y++) {
-    // printf("[");
-    for (int x = 0; x < X; x++) {
-      if (x % 10 == 0) {
-        printf("| ");
-      }
-      std::cout << (int)(0.5f + data[y * X + x]) << " ";
-    }
-    printf("\n");
-  }
-}
-
-static inline std::vector<float> generate_01_vector(const size_t size,
-                                                    const float ones_ratio) {
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_real_distribution<float> dist(0.0f, (float)size);
-  if (ones_ratio >= 1.0) {
-    std::vector<float> vec(size, 1.0f);
-    return vec;
-  } else {
-    std::vector<float> vec(size, 0.0f);
-    size_t ones_cnt = (size_t)(size * ones_ratio);
-    for (size_t i = 0; i < ones_cnt; i++) {
-      int pos = static_cast<int>(dist(gen));
-      vec[pos] = 1.0f;
-    }
-    return vec;
-  }
-}
-
 static void run_transform_int4_test_(const uint32_t K, const uint32_t N,
                                      const int scale_group_size,
                                      bool use_ones = false) {
+  nntrainer::init_backend();
   const size_t q4_data_size = K * N / Q4_0 * sizeof(block_q4_0);
   std::vector<float> weight_fp32;
   if (use_ones) {
@@ -1246,15 +1209,18 @@ static void run_transform_int4_test_(const uint32_t K, const uint32_t N,
     weight_fp32.data(), N, K, scale_group_size, osv32_weights, osv32_scales);
 
   // MAIN TEST - direct transform Int4 data (osv32_isv2) ---> Q4_0x
+  int run_cnt = 100;
   std::vector<uint8_t> dst_q4_0x(q4_data_size);
   auto t0 = std::chrono::high_resolution_clock::now();
-  nntrainer::transform_q4_0x_from_int4(N, K, osv32_weights.data(),
-                                       osv32_scales.data(), scale_group_size,
-                                       dst_q4_0x.data());
+  for (int i = 0; i < run_cnt; i++) {
+    nntrainer::transform_int4_osv32_isv2_to_q4_0(
+      N, K, osv32_weights.data(), osv32_scales.data(), scale_group_size,
+      dst_q4_0x.data());
+  }
   auto t1 = std::chrono::high_resolution_clock::now();
   auto exec_time =
     std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
-  std::cout << "Time: " << (double)exec_time.count() / 1000 << " ms"
+  std::cout << "Time: " << (double)exec_time.count() / (1000 * run_cnt) << " ms"
             << std::endl;
 
   // Check MSE quantized values

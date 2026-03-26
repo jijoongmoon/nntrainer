@@ -5,7 +5,7 @@
  * @file unittest_layers_reduce_sum.cpp
  * @date 29 July 2025
  * @brief Reduce Sum Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Sumon Nath <sumon.nath@samsung.com>
  * @bug No known bugs except for NYI items
  */

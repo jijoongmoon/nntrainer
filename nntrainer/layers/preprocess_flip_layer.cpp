@@ -4,7 +4,7 @@
  *
  * @file   preprocess_flip_layer.cpp
  * @date   20 January 2020
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Preprocess Random Flip Layer Class for Neural Network

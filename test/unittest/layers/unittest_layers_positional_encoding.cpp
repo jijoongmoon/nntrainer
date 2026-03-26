@@ -5,7 +5,7 @@
  * @file unittest_layers_positional_encoding.cpp
  * @date 24 August 2022
  * @brief PositionalEncodingLayer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

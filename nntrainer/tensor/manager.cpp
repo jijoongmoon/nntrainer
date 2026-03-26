@@ -6,7 +6,7 @@
  * @date   2 Dec 2020
  * @brief  This is NNtrainer manager for all weights, i/o and intermediate
  * tensors
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items

@@ -5,7 +5,7 @@
  * @file   positional_encoding_layer.cpp
  * @date   16 August 2022
  * @brief  This file contains the positional encoding layer in transformer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  *         https://arxiv.org/abs/1607.06450
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @bug    No known bugs except for NYI items

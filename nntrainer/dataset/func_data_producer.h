@@ -5,7 +5,7 @@
  * @file   func_data_producer.h
  * @date   12 July 2021
  * @brief  This file contains various data producers from a callback
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

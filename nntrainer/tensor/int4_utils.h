@@ -3,7 +3,7 @@
  * @file	int4_utils.h
  * @date	15 October 2025
  * @brief	This is Int4Utils class for utils for INT4 quantization format.
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Grzegorz Kisala <gkisala@gmail.com>
  * @bug		No known bugs
  */

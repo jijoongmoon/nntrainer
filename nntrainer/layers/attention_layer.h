@@ -4,7 +4,7 @@
  *
  * @file   attention_layer.h
  * @date   1 October 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is Attention Layer Class for Neural Network

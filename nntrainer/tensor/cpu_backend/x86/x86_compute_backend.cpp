@@ -4,7 +4,7 @@
  *
  * @file   x86_compute_backend.cpp
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Compute backend for x86
@@ -28,7 +28,11 @@
 
 namespace nntrainer {
 
-void init_backend() { __ggml_init(); }
+void init_backend() {
+  __ggml_init();
+  // Do not repeatedly call set_num_threads. It's a global config.
+  __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
+}
 
 void scopy_int4_to_float32(const unsigned int N, const uint8_t *X,
                            const unsigned int incX, float *Y,
@@ -291,6 +295,23 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   nntrainer::avx2::swiglu(N, X, Y, Z, alpha);
 }
 
+void tanh_gelu(const unsigned int N, const float *X, float *Y) {
+  // AVX implmenetation will be implemented, now fallback instead
+  __fallback_tanh_gelu(N, X, Y);
+}
+
+void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
+  __fallback_tanh_gelu(N, X, Y);
+}
+
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {
+  __fallback_tanh_gelu_mul(N, X, Y, Z);
+}
+
+void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z) {
+  __fallback_tanh_gelu_mul(N, X, Y, Z);
+}
+
 float max_val(const unsigned int N, float *X) { return __fallback_max(N, X); }
 
 void softmax(const unsigned int N, float *X, float *Y) {
@@ -417,20 +438,21 @@ void softmax_row(float *qk_out, size_t start_row, size_t end_row,
 void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
                                         const uint16_t *vcache, float *output,
                                         int num_cache_head, int gqa_size,
-                                        int head_dim,
-                                        size_t local_window_size) {
+                                        int head_dim, size_t local_window_size,
+                                        int head_start, int head_end) {
   nntrainer::avx2::compute_fp16vcache_fp32_transposed(
     row_num, in, vcache, output, num_cache_head, gqa_size, head_dim,
-    local_window_size);
+    local_window_size, head_start, head_end);
 }
 
 template <>
 void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,
-                     int gqa_size, int tile_size, size_t local_window_size) {
-  nntrainer::avx2::compute_kcaches<uint16_t>(in, kcache, output, num_rows,
-                                             num_cache_head, head_dim, gqa_size,
-                                             tile_size, local_window_size);
+                     int gqa_size, int tile_size, size_t local_window_size,
+                     int head_start, int head_end) {
+  nntrainer::avx2::compute_kcaches<uint16_t>(
+    in, kcache, output, num_rows, num_cache_head, head_dim, gqa_size, tile_size,
+    local_window_size, head_start, head_end);
 }
 
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,
@@ -464,10 +486,17 @@ void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight) {
   nntrainer::avx2::create_q4_0_weights(int4_weight, q4_0_weight);
 }
 
-void transform_q4_0x_from_int4(size_t N, size_t K, const uint8_t *osv32_weights,
-                               const uint16_t *osv32_scales,
-                               size_t scale_group_size, void *dst_q4_0x) {
-  Q4_0Utils::transformQ4_0x_FromInt4(N, K, osv32_weights, osv32_scales,
-                                     scale_group_size, 8, dst_q4_0x);
+void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
+                                       const uint8_t *osv32_weights,
+                                       const uint16_t *osv32_scales,
+                                       size_t scale_group_size,
+                                       void *dst_q4_0x) {
+#ifdef __AVX2__
+  nntrainer::avx2::transform_int4_osv32_isv2_to_q4_0x8(
+    N, K, osv32_weights, osv32_scales, scale_group_size, dst_q4_0x);
+#else
+  __fallback_transform_int4_osv32_isv2_to_q4_0(
+    N, K, osv32_weights, osv32_scales, scale_group_size, 8, dst_q4_0x);
+#endif
 }
 } /* namespace nntrainer */

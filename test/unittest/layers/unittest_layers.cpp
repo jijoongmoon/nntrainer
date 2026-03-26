@@ -5,7 +5,7 @@
  * @file unittest_layers.cpp
  * @date 17 August 2023
  * @brief layers test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug No known bugs except for NYI items
  */

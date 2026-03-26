@@ -4,7 +4,7 @@
  *
  * @file   pooling2d_layer.cpp
  * @date   12 June 2020
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Donghak Park <donghak.park@samsung.com>
  * @author Jiho Chu <jiho.chu@samsung.com>

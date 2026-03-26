@@ -5,7 +5,7 @@
  * @file   mae_loss.h
  * @date   10 June 2021
  * @brief  This file contains the mean absolute error loss as a sample layer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

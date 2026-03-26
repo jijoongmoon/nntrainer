@@ -5,7 +5,7 @@
  * @file   lazy_tensor.cpp
  * @date   05 Jun 2020
  * @brief  A lazy evaluation calculator for tensors
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

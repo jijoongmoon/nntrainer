@@ -5,7 +5,7 @@
  * @file   layer_impl.h
  * @date   21 June 2021
  * @brief  This is base layer implementation class
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

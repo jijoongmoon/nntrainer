@@ -5,7 +5,7 @@
  * @file   unittest_nntrainer_models.cpp
  * @date   19 Oct 2020
  * @brief  Model multi iteration, itegrated test
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

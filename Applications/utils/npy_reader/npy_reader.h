@@ -5,7 +5,7 @@
  * @file   npy_reader.h
  * @date   28 Feb 2024
  * @brief  reader for npy file
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug    No known bugs except for NYI items
  */

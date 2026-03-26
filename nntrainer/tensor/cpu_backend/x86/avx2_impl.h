@@ -4,7 +4,7 @@
  *
  * @file   avx2_impl.h
  * @date   20 Feb 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is a header for AVX implementation
@@ -187,12 +187,20 @@ void softmax_row(float *qk_out, size_t start_row, size_t end_row,
  * @param[in] gqa_size size of group
  * @param[in] head_dim head dimension
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0)
+ *            Used for head-direction parallelization during decoding.
+ * @param[in] head_end end index of KV heads to process (default num_cache_head)
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
                                         const uint16_t *vcache, float *output,
                                         int num_cache_head, int gqa_size,
                                         int head_dim,
-                                        size_t local_window_size = UINT_MAX);
+                                        size_t local_window_size = UINT_MAX,
+                                        int head_start = 0, int head_end = -1);
 
 /**
  * @brief Compute kcaches
@@ -206,12 +214,20 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
  * @param[in] gqa_size size of group
  * @param[in] tile_size size of tile
  * @param[in] local_window_size windows size for local attention
+ * @param[in] head_start start index of KV heads to process (default 0).
+ *            Used for head-direction parallelization during decoding.
+ * @param[in] head_end end index (exclusive) of KV heads to process.
+ *            The range is [head_start, head_end), i.e., head_end is exclusive.
+ *            Default -1 means process all heads from head_start to
+ *            num_cache_head. No other negative values are accepted.
+ * @note Caller must ensure head_start < head_end when head_end != -1.
  */
 template <typename BType>
 void compute_kcaches(const float *in, const BType *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,
                      int gqa_size, int tile_size,
-                     size_t local_window_size = UINT_MAX);
+                     size_t local_window_size = UINT_MAX, int head_start = 0,
+                     int head_end = -1);
 
 /**
  * @brief Compute rotary embedding value
@@ -296,6 +312,23 @@ void copy_f32_f16(unsigned int N, const float *input, uint16_t *output);
  *         | A, C | B, D | A, C | B, D | ...          ... | A, C | B, D |
  */
 void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight);
+
+/**
+ * @brief Transform data from in-memory layout osv32_isv2 to block_q4_0x8
+ * in-memory layout.
+ *
+ * @param N number of rows
+ * @param K number of columns
+ * @param osv32_weights uint8_t* data of weights in osv32_isv2 layout
+ * @param osv32_scales fp16* scales
+ * @param scale_group_size group size (32 or 64 or 128)
+ * @param dst_q4_0x void * output data in block_q4_0x8 or block_q4_0x4 layout
+ */
+void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
+                                         const uint8_t *osv32_weights,
+                                         const uint16_t *osv32_scales,
+                                         size_t scale_group_size,
+                                         void *dst_q4_0x);
 
 } // namespace nntrainer::avx2
 

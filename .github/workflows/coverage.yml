@@ -50,6 +50,7 @@ jobs:
           '*/subprojects/*' \
           '*/test/*' \
           '*/Applications/*' \
+          '*/schema/*' \
           --output-file coverage_filtered.info \
           --ignore-errors unused
         genhtml coverage_filtered.info \

@@ -4,7 +4,7 @@
  *
  * @file   adamw.h
  * @date   3 November 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @author Daniel Jang <minhyukjang@snu.ac.kr>

@@ -4,7 +4,7 @@
  *
  * @file   hgemm_kernel_1x4.cpp
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Debadri Samaddar <s.debadri@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is half-precision GEMM 1x4 kernel

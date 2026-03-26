@@ -5,7 +5,7 @@
  * @file   reshaped_rms_norm.h
  * @date   15 July 2025
  * @brief  Implementation of RMS normalization function with reshaping.
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This layer only supports inference mode.

@@ -5,7 +5,7 @@
  * @file unittest_databuffer.cpp
  * @date 13 July 2021
  * @brief databuffer unittest
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

@@ -5,7 +5,7 @@
  * @file   yolo_v3_loss.h
  * @date   16 June 2023
  * @brief  This file contains the yolo v3 loss layer
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items

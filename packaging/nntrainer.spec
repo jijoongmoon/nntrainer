@@ -722,9 +722,9 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/attention_kernel_strings.h
 %{_includedir}/nntrainer/blas_kernel_interface.h
 %{_includedir}/nntrainer/blas_kernel_strings.h
-%{_includedir}/nntrainer/cl_buffer_manager.h
 %{_includedir}/nntrainer/cl_context.h
 %{_includedir}/nntrainer/cl_platform.h
+%{_includedir}/nntrainer/opencl/opencl_buffer_manager.h
 %{_includedir}/nntrainer/opencl_command_queue_manager.h
 %{_includedir}/nntrainer/opencl_context_manager.h
 %{_includedir}/nntrainer/opencl_kernel.h

@@ -6,7 +6,7 @@ title: Android NNtrainer Applicaiton Sample
 This is a pratical demonstration of Android NNTrainer Resnet Application with [cifar100](https://www.cs.toronto.edu/~kriz/cifar.html) data.
 
 ## How to run
-Build nntrainer with `${NNTRAINER_HOME}/tools/package_android.sh` as in [Document](https://github.com/nnstreamer/nntrainer/blob/main/docs/how-to-run-example-android.md)
+Build nntrainer with `${NNTRAINER_HOME}/tools/package_android.sh` as in [Document](https://github.com/nntrainer/nntrainer/blob/main/docs/how-to-run-example-android.md)
 
 ```bash
 $ ls

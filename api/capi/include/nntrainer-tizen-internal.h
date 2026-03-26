@@ -6,7 +6,7 @@
  * @date   30 June 2021
  * @brief  NNTrainer CAPI header for tizen interanl api.
  * @note   This header is designed to be used only in Tizen
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug    No known bugs except for NYI items

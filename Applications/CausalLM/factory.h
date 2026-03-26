@@ -4,7 +4,7 @@
  *
  * @file   causal_lm.h
  * @date   22 July 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  CausalLM Factory to support registration and creation of various
@@ -14,7 +14,7 @@
 #ifndef __CAUSALLM_FACTORY_H__
 #define __CAUSALLM_FACTORY_H__
 
-#include <causal_lm.h>
+#include <transformer.h>
 #include <unordered_map>
 
 namespace causallm {
@@ -25,7 +25,7 @@ namespace causallm {
 class Factory {
 public:
   using Creator =
-    std::function<std::unique_ptr<CausalLM>(json &, json &, json &)>;
+    std::function<std::unique_ptr<Transformer>(json &, json &, json &)>;
 
   static Factory &Instance() {
     static Factory factory;
@@ -36,8 +36,9 @@ public:
     creators[key] = creator;
   }
 
-  std::unique_ptr<CausalLM> create(const std::string &key, json &cfg,
-                                   json &generation_cfg, json &nntr_cfg) const {
+  std::unique_ptr<Transformer> create(const std::string &key, json &cfg,
+                                      json &generation_cfg,
+                                      json &nntr_cfg) const {
     auto it = creators.find(key);
     if (it != creators.end()) {
       return (it->second)(cfg, generation_cfg, nntr_cfg);

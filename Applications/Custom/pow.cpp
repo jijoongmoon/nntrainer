@@ -6,7 +6,7 @@
  * @date   16 November 2020
  * @brief  This file contains the simple pow2 layer which squares input
  * elements.
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *

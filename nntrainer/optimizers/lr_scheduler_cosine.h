@@ -5,7 +5,7 @@
  * @file   lr_scheduler_cosine.h
  * @date   7 October 2024
  * @brief  This is CosineAnnealing Learning Rate Scheduler class
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Hyunwoo LEE <dlgusdn0414@snu.ac.kr>
  * @bug    No known bugs except for NYI items
  *

@@ -76,7 +76,7 @@ Refer to [PbuilderHowto](https://wiki.ubuntu.com/PbuilderHowto) for more about p
 #### Clone the needed repositories
 
 ```bash
-git clone https://github.com/nnstreamer/nntrainer
+git clone https://github.com/nntrainer/nntrainer
 ```
 
 Alternatively, you may simply download binary packages from PPA:
@@ -189,4 +189,4 @@ compilation terminated.
 sudo apt install libflatbuffers-dev
 ```
 
-## For Windows OS please follow: [Getting Started (Windows)](https://github.com/nnstreamer/nntrainer/blob/main/docs/getting-started-windows.md)
+## For Windows OS please follow: [Getting Started (Windows)](https://github.com/nntrainer/nntrainer/blob/main/docs/getting-started-windows.md)

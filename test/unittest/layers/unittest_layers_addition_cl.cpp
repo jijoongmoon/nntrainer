@@ -5,7 +5,7 @@
  * @file unittest_layers_addition_cl.cpp
  * @date 17 May 2024
  * @brief Addition Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Yash Singh <yash.singh@samsung.com>
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug No known bugs except for NYI items

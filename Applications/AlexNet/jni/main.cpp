@@ -4,7 +4,7 @@
  *
  * @file   main.cpp
  * @date   25 Jul 2022
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug	   No known bugs except for NYI items

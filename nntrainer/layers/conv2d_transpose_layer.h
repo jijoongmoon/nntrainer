@@ -4,7 +4,7 @@
  *
  * @file   conv2d_transpose_layer.h
  * @date   13 October 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author UGyeong Song <thddnrud@snu.ac.kr>
  * @bug    No known bugs except for NYI items
  * @brief  This is Transposed Convolution Layer Class for Neural Network

@@ -5,7 +5,7 @@
  * @file unittest_models_recurrent.cpp
  * @date 05 Oct 2021
  * @brief unittest models for recurrent ones
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug No known bugs except for NYI items
  */

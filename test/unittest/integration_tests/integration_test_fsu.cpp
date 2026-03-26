@@ -5,7 +5,7 @@
  * @file   integration_test_fsu.cpp
  * @date   20 Dec 2024
  * @brief  Unit Test for Asynch FSU
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug    No known bugs except for NYI items
  */

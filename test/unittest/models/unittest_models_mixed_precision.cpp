@@ -5,7 +5,7 @@
  * @file unittest_models_mixed_precision.cpp
  * @date 3 May 2024
  * @brief unittest models to cover mixed precision
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug No known bugs except for NYI items
  */

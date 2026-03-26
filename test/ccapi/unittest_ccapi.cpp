@@ -5,7 +5,7 @@
  * @file        unittest_ccapi.cc
  * @date        19 October 2020
  * @brief       cc API Unit tests.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug         No known bugs
  */
@@ -157,6 +157,7 @@ TEST(ccapi_optimizer, construct_02_p) {
   EXPECT_NO_THROW(ml::train::optimizer::Adam());
   EXPECT_NO_THROW(ml::train::optimizer::SGD());
   EXPECT_NO_THROW(ml::train::optimizer::AdamW());
+  EXPECT_NO_THROW(ml::train::optimizer::Lion());
 }
 
 /**

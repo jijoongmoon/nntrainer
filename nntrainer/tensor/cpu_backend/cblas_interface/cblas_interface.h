@@ -4,7 +4,7 @@
  *
  * @file cblas_interface.h
  * @date   23 April 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Function interface to use cblas lib from cpu_backend
@@ -16,6 +16,14 @@
 #ifdef __cplusplus
 
 namespace nntrainer {
+
+#ifdef USE_BLAS
+/**
+ * @brief     Wrapper for openblas_set_num_threads()
+ * @param[in] num_threads The number of threads for openblas op.
+ *                        Set -1 for default policy (BLAS_NUM_THREADS)
+ */
+void __openblas_set_num_threads(int num_threads);
 /**
  * @brief     saxpy computation : Y = alpha*X + Y
  * @param[in] N number of elements in Y
@@ -99,6 +107,9 @@ void __cblas_sgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
  */
 unsigned int __cblas_isamax(const unsigned int N, const float *X,
                             const unsigned int incX);
+#else  // USE_BLAS
+#error "cblas_interface.h is referred without enabling USE_BLAS (-Denable-blas=true with meson). Enable blas to use cblas_interface.h"
+#endif // USE_BLAS
 } // namespace nntrainer
 
 #endif

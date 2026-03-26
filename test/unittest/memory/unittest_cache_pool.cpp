@@ -5,7 +5,7 @@
  * @file unittest_cache_pool.cpp
  * @date 28 Sep 2022
  * @brief Cache Pool Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jiho Chu <jiho.chu@samsung.com>
  * @bug No known bugs except for NYI items
  */

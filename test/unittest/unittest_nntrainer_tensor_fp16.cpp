@@ -5,7 +5,7 @@
  * @file        unittest_nntrainer_tensor.cpp
  * @date        03 June 2020
  * @brief       Unit test utility for tensor.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Jijoong Moon <jijoong.moon@samsung.com>
  * @bug         No known bugs
  */

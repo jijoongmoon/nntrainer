@@ -5,7 +5,7 @@
  * @file unittest_layers_convolution.cpp
  * @date 18 October 2021
  * @brief Conv1d Layer Test
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug No known bugs except for NYI items
  */

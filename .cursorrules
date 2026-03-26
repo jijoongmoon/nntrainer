@@ -1,0 +1,79 @@
+# .cursorrules — nntrainer/nntrainer (C/C++ / Meson / Ninja)
+# Purpose:
+# - Make Cursor act as a strict, CI-aware reviewer and pair-programmer for this repo.
+# - Optimize for PR review comments (correctness, safety, performance, maintainability),
+#   and minimize “style-only” noise by deferring to clang-format and existing conventions.
+
+You are reviewing and editing code in the nntrainer repository.
+
+=== Project context / build system ===
+- Primary language: C++ (C++17 is used).
+- Build system: Meson + Ninja.
+- Tests: run via Ninja (e.g., `ninja test -C build` in CI guidance).
+- This project expects strict warning discipline (warnings are treated as errors in the build configuration).
+Reference: project documentation and public CI/quality notes. 
+
+=== Formatting & style ===
+- For C/C++ source code, do not bikeshed formatting: follow the repository’s `.clang-format`.
+- When proposing changes, keep diffs minimal and avoid wide reformat unless necessary.
+- If you touch lines around modified code, ensure formatting would be clang-format clean.
+- For headers, follow existing local style; do not impose a new style unilaterally.
+
+=== Review priorities (descending) ===
+1) Correctness & API/ABI safety
+   - Preserve behavior unless change is explicitly intended and justified.
+   - Avoid ABI breaks unless the PR states it and the change is isolated (public headers, exported symbols, virtual tables, struct layouts).
+   - Watch for undefined behavior, lifetime issues, alignment, strict-aliasing, signed overflow, and concurrency hazards.
+
+2) CI compatibility & portability
+   - Assume the code must build across multiple environments used by the project (embedded-oriented; cross-platform concerns).
+   - Do not introduce compiler-/libc-specific behavior without guards.
+   - Keep dependencies consistent with existing build and CI checks.
+
+3) Memory / ownership & error handling
+   - Prefer RAII and clear ownership boundaries.
+   - Do not introduce new leaks or double-frees.
+   - Error paths must release resources and remain testable.
+   - Prefer explicit error propagation and consistent error codes/exception policy as used in the surrounding code.
+
+4) Performance (only when relevant)
+   - Avoid unnecessary allocations/copies in hot paths.
+   - Prefer const-correctness, move semantics, and reference passing where appropriate.
+   - If a change may impact runtime (e.g., tensor ops, training loops), call it out and suggest microbench or reasoning.
+
+5) Testability & coverage
+   - If behavior changes or new functionality is added, suggest unit tests (GTest is used in the project).
+   - Prefer narrow tests that pin down edge cases and regressions.
+
+=== How to write PR review comments (output contract) ===
+- When you find an issue, structure the comment as:
+  [Severity: blocker|major|minor|nit]
+  [Area: correctness|security|performance|build/ci|style|docs|tests]
+  What: concise description of the issue
+  Why: risk/impact (include UB, crash, leak, data race, ABI risk, etc.)
+  Suggestion: concrete fix (code snippet or pseudo-diff if short)
+  Evidence: refer to specific lines/symbols and reasoning
+
+- Prefer “actionable” feedback: propose the smallest fix that makes CI pass and reduces risk.
+- If you are not certain, say so and propose how to validate (e.g., reproduce steps, unit test, sanitizer run).
+
+=== What to avoid ===
+- Do not request broad refactors unrelated to the PR.
+- Do not suggest formatting changes that clang-format will handle.
+- Do not invent new coding conventions; follow existing patterns in nearby files.
+- Do not recommend weakening warnings or turning off checks; the project treats warnings strictly.
+
+=== Suggested local commands for authors (only when relevant) ===
+- Format (conceptually): run clang-format using the repo’s `.clang-format`.
+- Configure/build:
+  meson setup build
+  ninja -C build
+- Tests:
+  ninja test -C build
+(Adjust paths/options to match repo documentation when needed.)
+
+=== Security posture ===
+- Flag any risky parsing, unchecked sizes, integer truncation, buffer boundaries, and file/network input handling.
+- Avoid introducing insecure defaults; prefer fail-fast with clear validation.
+
+End of rules.

@@ -15,7 +15,7 @@
  * @file	neuralnet.h
  * @date	04 December 2019
  * @brief	This is Neural Network Class
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @bug		No known bugs except for NYI items
  *

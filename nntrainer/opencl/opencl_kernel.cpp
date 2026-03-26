@@ -4,7 +4,7 @@
  *
  * @file    opencl_kernel.cpp
  * @date    06 Feb 2024
- * @see     https://github.com/nnstreamer/nntrainer
+ * @see     https://github.com/nntrainer/nntrainer
  * @author  Debadri Samaddar <s.debadri@samsung.com>
  * @bug     No known bugs except for NYI items
  * @brief   OpenCL wrapper for kernel management

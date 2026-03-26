@@ -38,12 +38,12 @@ This example has two options to train.
 
 ### Preparing NNTrainer
 
-<https://github.com/nnstreamer/nntrainer/blob/master/docs/getting-started.md>
+<https://github.com/nntrainer/nntrainer/blob/master/docs/getting-started.md>
 
 ### Write Configuration file
 
 you can find detail explanation about each keyword in
-<https://github.com/nnstreamer/nntrainer/blob/master/docs/configuration-ini.md>
+<https://github.com/nntrainer/nntrainer/blob/master/docs/configuration-ini.md>
 
 ```ini
 [Model]

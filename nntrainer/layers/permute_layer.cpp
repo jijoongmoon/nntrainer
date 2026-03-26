@@ -5,7 +5,7 @@
  * @file   permute_layer.cpp
  * @date   06 May 2021
  * @brief  Permute layer to support transpose
- * @see	   https://github.com/nnstreamer/nntrainer
+ * @see	   https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  */

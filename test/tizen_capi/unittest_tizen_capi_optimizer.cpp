@@ -15,7 +15,7 @@
  * @file        unittest_tizen_capi_optimizer.cpp
  * @date        12 May 2020
  * @brief       Unit test utility for optimizer.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Jijoong Moon <jijoong.moon@samsung.com>
  * @bug         No known bugs
  */

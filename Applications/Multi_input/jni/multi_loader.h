@@ -5,7 +5,7 @@
  * @file   multi_loader.h
  * @date   5 July 2023
  * @brief  multi data loader
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items

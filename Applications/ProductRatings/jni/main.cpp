@@ -4,7 +4,7 @@
  *
  * @file   main.cpp
  * @date   10 March 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Product ratings recommendation system using the ccapi Tensor API.

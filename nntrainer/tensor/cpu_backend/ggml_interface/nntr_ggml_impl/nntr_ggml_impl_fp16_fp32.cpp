@@ -10,7 +10,7 @@
  *
  * @file   nntr_ggml_impl_fp16_fp32.cpp
  * @date   20 August 2025
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author  Pawel Debski <p.debski2@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Implementations of GGML init & fp16-fp32 conversions

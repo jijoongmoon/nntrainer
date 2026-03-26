@@ -5,7 +5,7 @@
  * @file        unittest_tizen_capi_dataset.cpp
  * @date        14 July 2020
  * @brief       Unit test utility for dataset.
- * @see         https://github.com/nnstreamer/nntrainer
+ * @see         https://github.com/nntrainer/nntrainer
  * @author      Parichay Kapoor <pk.kapoor@samsung.com>
  * @bug         No known bugs
  */

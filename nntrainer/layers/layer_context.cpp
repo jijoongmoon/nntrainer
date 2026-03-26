@@ -4,7 +4,7 @@
  *
  * @file   layer_context.cpp
  * @date   26 July 2021
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Parichay Kapoor <pk.kapoor@samsung.com>
  * @author Debadri Samaddar <s.debadri@samsung.com>
  * @author Niket Agarwal <niket.a@samsung.com>

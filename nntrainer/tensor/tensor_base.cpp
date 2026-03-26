@@ -3,7 +3,7 @@
  * @file	tensor_base.cpp
  * @date	04 December 2023
  * @brief	This is Tensor base class
- * @see		https://github.com/nnstreamer/nntrainer
+ * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @author	Donghyeon Jeong <dhyeon.jeong@samsung.com>
  * @bug		No known bugs except for NYI items
@@ -518,6 +518,12 @@ Tensor &TensorBase::abs(Tensor &output) const {
 float TensorBase::l2norm() const {
   throw std::invalid_argument(
     "Tensor::l2norm() is currently not supported in tensor data type " +
+    getStringDataType());
+}
+
+void TensorBase::normalization_i(unsigned int dim, float p, float epsilon) {
+  throw std::runtime_error(
+    "Tensor::normalization_i() is not supported for this tensor type" +
     getStringDataType());
 }
 

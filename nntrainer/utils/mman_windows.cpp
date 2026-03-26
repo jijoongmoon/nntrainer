@@ -6,7 +6,7 @@
  * @file   mman_windows.h
  * @date   8 April 2025
  * @brief  Windows implementation of posix mman
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Grzegorz Kisala <g.kisala@samsung.com>
  * @bug    No known bugs except for NYI items
  *

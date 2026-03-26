@@ -3,7 +3,7 @@
 #
 # @file   main.cpp
 # @date   01 Feb 2023
-# @see    https://github.com/nnstreamer/nntrainer
+# @see    https://github.com/nntrainer/nntrainer
 # @author Donghak Park <donghak.park@samsung.com>
 # @bug	  No known bugs except for NYI items
 # @brief  This is Model_C_Linear Example for Tensorflow (with Dummy Dataset)

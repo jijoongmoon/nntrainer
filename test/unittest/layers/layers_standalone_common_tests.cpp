@@ -5,7 +5,7 @@
  * @file layer_common_tests.cpp
  * @date 15 June 2021
  * @brief Common test for nntrainer layers (Param Tests)
- * @see	https://github.com/nnstreamer/nntrainer
+ * @see	https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
  * @author Debadri Samaddar <s.debadri@samsung.com>
  * @bug No known bugs except for NYI items
@@ -82,7 +82,7 @@ TEST_P(LayerSemantics, setBatchValidate_p) {
   }
 }
 
-#ifdef ENABLE_OPENCL
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(LayerSemanticsGpu);
 
 TEST_P(LayerSemanticsGpu, setProperties_n) {

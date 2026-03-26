@@ -4,7 +4,7 @@
  *
  * @file   hgemm_kernel.h
  * @date   10 July 2024
- * @see    https://github.com/nnstreamer/nntrainer
+ * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is a collection of all the KERNELs function for hgemm
