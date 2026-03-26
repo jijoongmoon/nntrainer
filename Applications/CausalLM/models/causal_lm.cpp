@@ -164,11 +164,10 @@ void CausalLM::initialize() {
   model->setProperty(model_props);
 
   // construct and compile causalLM model via symbolic tensor graph
+  // constructModel builds the symbolic tensor graph and calls
+  // model->compile(inputs, outputs, mode) which internally does
+  // compile + initialize + allocate.
   constructModel();
-
-  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {
-    throw std::invalid_argument("Model initialization failed.");
-  }
 
   is_initialized = true;
 
@@ -198,33 +197,8 @@ void CausalLM::constructModel() {
      "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM)});
   Tensor x = embedding(input);
 
-  // allocate external KV cache buffers and create input tensors for them
-  size_t max_timestep = INIT_SEQ_LEN + NUM_TO_GENERATE;
-  size_t kv_heads = NUM_HEADS / GQA_SIZE;
-  size_t cache_size = BATCH_SIZE * kv_heads * max_timestep * HEAD_DIM;
-  kv_cache_buffers.allocate(NUM_LAYERS, cache_size);
-  key_cache_tensors.resize(NUM_LAYERS);
-  val_cache_tensors.resize(NUM_LAYERS);
-
   std::vector<Tensor> all_inputs;
   all_inputs.push_back(input);
-
-  for (int i = 0; i < NUM_LAYERS; ++i) {
-    std::string k_name = "ext_cache_key_" + std::to_string(i);
-    std::string v_name = "ext_cache_val_" + std::to_string(i);
-
-    std::string cache_shape = std::to_string(kv_heads) + ":" +
-                              std::to_string(max_timestep) + ":" +
-                              std::to_string(HEAD_DIM);
-    LayerHandle k_input = createLayer(
-      "input", {withKey("name", k_name), withKey("input_shape", cache_shape)});
-    LayerHandle v_input = createLayer(
-      "input", {withKey("name", v_name), withKey("input_shape", cache_shape)});
-    key_cache_tensors[i] = k_input(Tensor());
-    val_cache_tensors[i] = v_input(Tensor());
-    all_inputs.push_back(key_cache_tensors[i]);
-    all_inputs.push_back(val_cache_tensors[i]);
-  }
 
   // create transformer layers
   for (int i = 0; i < NUM_LAYERS; ++i) {
@@ -656,7 +630,7 @@ Tensor CausalLM::createAttention(const int layer_id, int seq_len, int n_heads,
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
   Tensor q = q_proj(query);
 
-  // Attention core layer (5-input: Q, K, V, ext_cache_key, ext_cache_val)
+  // Attention core layer (3-input: Q, K, V)
   LayerHandle attn = createLayer(
     "mha_core",
     {withKey("name", A_name), withKey("num_heads", n_heads),
@@ -667,8 +641,7 @@ Tensor CausalLM::createAttention(const int layer_id, int seq_len, int n_heads,
                                  : UINT_MAX),
      withKey("rope_theta", ROPE_THETA),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE))});
-  Tensor a = attn({q, k, v, key_cache_tensors[layer_id],
-                   val_cache_tensors[layer_id]});
+  Tensor a = attn({q, k, v});
 
   // O projection
   LayerHandle o_proj = createLayer(

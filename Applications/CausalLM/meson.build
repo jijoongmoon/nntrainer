@@ -71,3 +71,9 @@ e = executable('nntr_causallm',
     include_directories: causallm_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
 )
+
+test_causallm = executable('test_causallm',
+    meson.current_source_dir() / 'test_causallm.cpp',
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)

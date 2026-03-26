@@ -206,8 +206,7 @@ Tensor Gemma3Transformer::createAttention(const int layer_id, int seq_len,
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   LayerHandle attn = createLayer("mha_core", a_params);
-  Tensor a = attn({q_normed, k_normed, v, key_cache_tensors[layer_id],
-                   val_cache_tensors[layer_id]});
+  Tensor a = attn({q_normed, k_normed, v});
 
   // O projection (Gemma3: no bias)
   LayerHandle o_proj = createLayer(

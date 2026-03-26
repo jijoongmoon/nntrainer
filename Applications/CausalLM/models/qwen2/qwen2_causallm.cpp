@@ -60,8 +60,7 @@ Tensor Qwen2Transformer::createAttention(const int layer_id, int seq_len,
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")});
-  Tensor a = attn({q, k, v, key_cache_tensors[layer_id],
-                   val_cache_tensors[layer_id]});
+  Tensor a = attn({q, k, v});
 
   // O projection (Qwen2: no bias)
   LayerHandle o_proj = createLayer(
