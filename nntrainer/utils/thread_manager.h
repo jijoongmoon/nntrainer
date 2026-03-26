@@ -126,19 +126,21 @@ private:
    */
   void barrier() {
     int n_threads =
-      active_threads_.load(std::memory_order_relaxed);
+      active_threads_.load(std::memory_order_acquire);
     int n_passed =
-      n_barrier_passed_.load(std::memory_order_relaxed);
+      n_barrier_passed_.load(std::memory_order_acquire);
     int n = n_barrier_.fetch_add(1, std::memory_order_seq_cst);
     if (n == n_threads - 1) {
-      n_barrier_.store(0, std::memory_order_relaxed);
+      // Reset counter BEFORE signaling completion.
+      // Using release ensures this store is visible to other threads
+      // before they see the n_barrier_passed_ bump and exit the spin.
+      n_barrier_.store(0, std::memory_order_release);
       n_barrier_passed_.fetch_add(1, std::memory_order_seq_cst);
       return;
     }
-    while (n_barrier_passed_.load(std::memory_order_relaxed) == n_passed) {
+    while (n_barrier_passed_.load(std::memory_order_acquire) == n_passed) {
       cpuRelax();
     }
-    std::atomic_thread_fence(std::memory_order_seq_cst);
   }
 
   /**
@@ -153,7 +155,7 @@ private:
 
     // all workers participate in barrier (even inactive ones)
     active_threads_.store(static_cast<int>(total + 1),
-                          std::memory_order_relaxed);
+                          std::memory_order_release);
 
     current_task_ = [&fn](size_t i) { fn(i); };
     task_end_ = end;
