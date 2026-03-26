@@ -178,7 +178,8 @@ void Transformer::constructModel() {
   LayerHandle input_layer = createLayer(
     "input", {withKey("name", "input0"),
               withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))});
-  std::vector<Tensor> all_inputs = {Tensor(input_layer)};
+  Tensor input = input_layer(Tensor());
+  std::vector<Tensor> all_inputs = {input};
 
   // create embedding layer
   const std::string embedding_type =
@@ -189,7 +190,7 @@ void Transformer::constructModel() {
     {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
      "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
      "scale=" + std::to_string(EMBEDDING_SCALE)});
-  Tensor x = embedding(all_inputs[0]);
+  Tensor x = embedding(input);
 
   // create transformer layers
   for (int i = 0; i < NUM_LAYERS; ++i) {
