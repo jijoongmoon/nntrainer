@@ -197,7 +197,7 @@ int main(int argc, char *argv[]) {
                "epsilon=1e-7"});
     model->setOptimizer(std::move(optimizer));
 
-    auto status = model->compile(x, y);
+    auto status = model->compile(x, y, ml::train::ExecutionMode::TRAIN);
     if (status != 0) {
       std::cerr << "Error during compile" << std::endl;
       return 1;
