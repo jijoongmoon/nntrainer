@@ -30,9 +30,10 @@
 
 namespace causallm {
 
-Tensor Qwen3CausalLM::createAttention(const int layer_id, int seq_len,
-                                       int n_heads, int head_dim, Tensor query,
-                                       Tensor key, Tensor value) {
+Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
+                                          int n_heads, int head_dim,
+                                          Tensor query, Tensor key,
+                                          Tensor value) {
 
   using ml::train::createLayer;
 
@@ -103,9 +104,9 @@ Tensor Qwen3CausalLM::createAttention(const int layer_id, int seq_len,
   return o;
 }
 
-void Qwen3CausalLM::registerCustomLayers() {
+void Qwen3Transformer::registerCustomLayers() {
   CausalLM::registerCustomLayers();
-  ///
+
   auto &ct_engine = nntrainer::Engine::Global();
   auto app_context =
     static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
@@ -117,6 +118,10 @@ void Qwen3CausalLM::registerCustomLayers() {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
   }
+}
+
+void Qwen3CausalLM::registerCustomLayers() {
+  Qwen3Transformer::registerCustomLayers();
 }
 
 } // namespace causallm

@@ -40,14 +40,13 @@ public:
 /**
  * @brief Qwen3CausalLM class
  */
-class Qwen3CausalLM : public CausalLM, public Qwen3Transformer {
+class Qwen3CausalLM : public Qwen3Transformer {
 
 public:
   static constexpr const char *architectures = "Qwen3ForCausalLM";
 
   Qwen3CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
-    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
-    CausalLM(cfg, generation_cfg, nntr_cfg),
+    CausalLM(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
     Qwen3Transformer(cfg, generation_cfg, nntr_cfg) {}
 
   virtual ~Qwen3CausalLM() = default;

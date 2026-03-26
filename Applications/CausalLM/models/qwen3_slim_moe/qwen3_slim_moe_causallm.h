@@ -28,7 +28,7 @@ public:
   static constexpr const char *architectures = "Qwen3SlimMoeForCausalLM";
 
   Qwen3SlimMoECausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
-    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
+    CausalLM(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
     Qwen3CausalLM(cfg, generation_cfg, nntr_cfg) {
     setupParameters(cfg, generation_cfg, nntr_cfg);
   }

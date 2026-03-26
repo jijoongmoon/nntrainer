@@ -26,8 +26,7 @@ public:
   static constexpr const char *architectures = "GptOssForCausalLM";
 
   GptOssForCausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
-    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
-    CausalLM(cfg, generation_cfg, nntr_cfg) {
+    CausalLM(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
     setupParameters(cfg, generation_cfg, nntr_cfg);
   }
 

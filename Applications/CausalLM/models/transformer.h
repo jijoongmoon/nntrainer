@@ -86,6 +86,11 @@ struct KVCacheBuffers {
 };
 
 /**
+ * @brief Model type classification
+ */
+enum class ModelType { MODEL, CAUSALLM, EMBEDDING, UNKNOWN };
+
+/**
  * @brief CausalLM Class
  */
 WIN_EXPORT class CausalLM {
@@ -97,8 +102,10 @@ public:
    * @param generation_cfg Configuration for the generation
    * (generation_config.json)
    * @param nntr_cfg Configuration for nntrainer (nntrainer_config.json)
+   * @param model_type Type of the model (default: ModelType::MODEL)
    */
-  CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg);
+  CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg,
+           ModelType model_type = ModelType::MODEL);
 
   /**
    * @brief Destroy the CausalLM object
@@ -123,8 +130,9 @@ public:
   /**
    * @brief run the CausalLM model
    */
-  void run(const WSTR prompt, bool do_sample = false,
-           const WSTR system_prompt = "", const WSTR tail_prompt = "");
+  virtual void run(const WSTR prompt, bool do_sample = false,
+                   const WSTR system_prompt = "",
+                   const WSTR tail_prompt = "");
 
 protected:
   /**
@@ -240,6 +248,9 @@ protected:
   unsigned int ROPE_THETA = 10000; /**< RoPE theta value */
   float NORM_EPS = 1e-5;           /**< RMSNorm epsilon value */
   int GQA_SIZE;
+  bool IS_CAUSAL = true;                    /**< Causal attention mask */
+  float ATTN_LOGIT_SOFTCAPPING = 0.0f;     /**< Attention logit softcapping */
+  float EMBEDDING_SCALE = 1.0f;            /**< Embedding scaling factor */
 
   std::vector<unsigned int> BAD_WORD_IDS; /**< List of bad word IDs */
   unsigned int NUM_BADWORDS;              /**< Number of bad words */
@@ -284,6 +295,10 @@ inline json LoadJsonFile(const std::string &file_path) {
                              " | Details: " + e.what());
   }
 }
+/// Backward-compatibility alias: model variants inherit "virtual public
+/// Transformer" which now resolves to CausalLM.
+using Transformer = CausalLM;
+
 } // namespace causallm
 
 #endif

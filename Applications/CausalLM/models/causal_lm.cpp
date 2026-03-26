@@ -41,7 +41,8 @@ namespace causallm {
 
 std::string LoadBytesFromFile(const std::string &path);
 
-CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) {
+CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg,
+                    ModelType model_type) {
 
   // Initialize the model with the provided configurations
   // This is where you would set up the model layers, parameters, etc.
@@ -121,6 +122,12 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   TIE_WORD_EMBEDDINGS = cfg["tie_word_embeddings"].get<bool>();
   NORM_EPS = cfg["rms_norm_eps"];
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
+
+  if (cfg.contains("is_causal")) {
+    IS_CAUSAL = cfg["is_causal"].get<bool>();
+  } else if (cfg.contains("use_bidirectional_attention")) {
+    IS_CAUSAL = !cfg["use_bidirectional_attention"].get<bool>();
+  }
 
   EOS_TOKEN_ID =
     generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();

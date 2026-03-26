@@ -18,6 +18,14 @@ namespace causallm {
 
 /**
  * @brief Gemma3Transformer class
+ * @note  Gemma3 differences from base CausalLM:
+ *        - Post-attention norm (RMS norm after attention output, before residual)
+ *        - Post-FFN norm (RMS norm after FFN output, before residual)
+ *        - GeGLU FFN (GeLU activation instead of SiLU)
+ *        - Q/K reshaped_rms_norm
+ *        - Per-layer sliding window vs global attention
+ *        - Attention logit softcapping
+ *        - Embedding scaling by sqrt(hidden_size)
  */
 class Gemma3Transformer : virtual public Transformer {
 
@@ -42,21 +50,31 @@ protected:
   std::vector<std::string> layer_types;
 
 public:
-  std::vector<LayerHandle> createAttention(const int layer_id, int seq_len,
-                                           int n_heads, int head_dim,
-                                           std::string query_name,
-                                           std::string key_name,
-                                           std::string value_name) override;
+  /**
+   * @brief Create attention using Symbolic Tensor API.
+   * Gemma3 specifics: Q/K reshaped_rms_norm, per-layer sliding window,
+   * softcapping, no bias.
+   */
+  Tensor createAttention(const int layer_id, int seq_len, int n_heads,
+                          int head_dim, Tensor query, Tensor key,
+                          Tensor value) override;
 
-  std::vector<LayerHandle>
-  createTransformerDecoderBlock(const int layer_id, std::string input_name);
+  /**
+   * @brief Create decoder block using Symbolic Tensor API.
+   * Gemma3 specifics: post-attention norm and post-FFN norm (4 norms total).
+   */
+  Tensor createTransformerDecoderBlock(const int layer_id,
+                                        Tensor input) override;
 
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;
 
-  std::vector<LayerHandle> createMlp(const int layer_id, int dim,
-                                     int hidden_dim,
-                                     std::string input_name) override;
+  /**
+   * @brief Create MLP using Symbolic Tensor API.
+   * Gemma3 specifics: GeGLU (GeLU activation instead of SiLU/SwiGLU).
+   */
+  Tensor createMlp(const int layer_id, int dim, int hidden_dim,
+                    Tensor input) override;
 
   void registerCustomLayers() override;
 };
@@ -64,16 +82,14 @@ public:
 /**
  * @brief Gemma3CausalLM class
  */
-class Gemma3CausalLM : public CausalLM, public Gemma3Transformer {
+class Gemma3CausalLM : public Gemma3Transformer {
 
 public:
   static constexpr const char *architectures = "Gemma3ForCausalLM";
 
   Gemma3CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
-    Transformer(sanitizeConfig(cfg),
-                sanitizeGenerationConfig(generation_cfg, cfg), nntr_cfg),
     CausalLM(sanitizeConfig(cfg), sanitizeGenerationConfig(generation_cfg, cfg),
-             nntr_cfg),
+             nntr_cfg, ModelType::CAUSALLM),
     Gemma3Transformer(sanitizeConfig(cfg),
                       sanitizeGenerationConfig(generation_cfg, cfg), nntr_cfg) {
   }
