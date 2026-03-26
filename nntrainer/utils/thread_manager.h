@@ -159,8 +159,8 @@ private:
     if (n_workers == 0 || n_workers > total)
       n_workers = total;
 
-    // all workers participate in barrier (even inactive ones)
-    active_threads_.store(static_cast<int>(total + 1),
+    // only active workers + caller participate in barrier
+    active_threads_.store(static_cast<int>(n_workers + 1),
                           std::memory_order_release);
 
     // compute the sense for this round (alternates each dispatch)

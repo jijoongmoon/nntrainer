@@ -137,21 +137,23 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
   unsigned int my_gen = generation_.load(std::memory_order_acquire);
 
   while (true) {
-    // spin-wait for new generation (GGML-style)
+    // spin-wait for new generation with periodic yield for OS scheduling
+    unsigned int spin_count = 0;
     while (generation_.load(std::memory_order_acquire) == my_gen) {
       if (stop_.load(std::memory_order_acquire))
         return;
       cpuRelax();
+      if (++spin_count > 1024) {
+        std::this_thread::yield();
+        spin_count = 0;
+      }
     }
     my_gen = generation_.load(std::memory_order_acquire);
 
     if (stop_.load(std::memory_order_acquire))
       return;
 
-    // read the sense for this round
-    bool sense = current_sense_.load(std::memory_order_acquire);
-
-    // only active workers grab chunks
+    // only active workers do work + barrier; inactive workers skip both
     if (worker_id < active_workers_.load(std::memory_order_acquire)) {
       size_t end = task_end_;
       while (true) {
@@ -160,10 +162,11 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
           break;
         current_task_(idx);
       }
-    }
 
-    // barrier (all workers must arrive, including inactive ones)
-    barrier(sense);
+      bool sense = current_sense_.load(std::memory_order_acquire);
+      barrier(sense);
+    }
+    // inactive workers loop back to generation spin immediately
   }
 }
 
