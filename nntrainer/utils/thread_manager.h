@@ -124,21 +124,27 @@ private:
    * Last thread to arrive resets counter and bumps pass count.
    * Other threads spin on pass count with cpu_relax.
    */
-  void barrier() {
+  /**
+   * @brief Sense-reversing barrier.
+   *
+   * Each round uses the OPPOSITE sense (true/false). This prevents the
+   * race where a fast thread exits barrier, loops back, and re-enters
+   * the next barrier before slow threads have left the current one.
+   * With alternating sense, a thread spinning on sense=true won't be
+   * confused by a leftover sense=true from the previous round.
+   */
+  void barrier(bool sense) {
     int n_threads =
       active_threads_.load(std::memory_order_acquire);
-    int n_passed =
-      n_barrier_passed_.load(std::memory_order_acquire);
-    int n = n_barrier_.fetch_add(1, std::memory_order_seq_cst);
+    int n = n_barrier_.fetch_add(1, std::memory_order_acq_rel);
     if (n == n_threads - 1) {
-      // Reset counter BEFORE signaling completion.
-      // Using release ensures this store is visible to other threads
-      // before they see the n_barrier_passed_ bump and exit the spin.
-      n_barrier_.store(0, std::memory_order_release);
-      n_barrier_passed_.fetch_add(1, std::memory_order_seq_cst);
+      n_barrier_.store(0, std::memory_order_relaxed);
+      // flip the sense flag to signal completion
+      barrier_sense_.store(sense, std::memory_order_release);
       return;
     }
-    while (n_barrier_passed_.load(std::memory_order_acquire) == n_passed) {
+    // spin until the last thread flips the sense
+    while (barrier_sense_.load(std::memory_order_acquire) != sense) {
       cpuRelax();
     }
   }
@@ -157,10 +163,14 @@ private:
     active_threads_.store(static_cast<int>(total + 1),
                           std::memory_order_release);
 
+    // compute the sense for this round (alternates each dispatch)
+    bool sense = !barrier_sense_.load(std::memory_order_acquire);
+
     current_task_ = [&fn](size_t i) { fn(i); };
     task_end_ = end;
     current_chunk_.store(begin, std::memory_order_relaxed);
     active_workers_.store(n_workers, std::memory_order_release);
+    current_sense_.store(sense, std::memory_order_release);
 
     // wake workers
     generation_.fetch_add(1, std::memory_order_seq_cst);
@@ -174,7 +184,7 @@ private:
     }
 
     // barrier: wait for all threads
-    barrier();
+    barrier(sense);
     current_task_ = nullptr;
   }
 
@@ -188,7 +198,8 @@ private:
 
   alignas(64) std::atomic<unsigned int> generation_{0};
   alignas(64) std::atomic<int> n_barrier_{0};
-  alignas(64) std::atomic<int> n_barrier_passed_{0};
+  alignas(64) std::atomic<bool> barrier_sense_{false};
+  alignas(64) std::atomic<bool> current_sense_{false};
   alignas(64) std::atomic<size_t> current_chunk_{0};
   alignas(64) std::atomic<unsigned int> active_workers_{0};
   alignas(64) std::atomic<int> active_threads_{1};

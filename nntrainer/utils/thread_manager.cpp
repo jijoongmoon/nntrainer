@@ -148,6 +148,9 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
     if (stop_.load(std::memory_order_acquire))
       return;
 
+    // read the sense for this round
+    bool sense = current_sense_.load(std::memory_order_acquire);
+
     // only active workers grab chunks
     if (worker_id < active_workers_.load(std::memory_order_acquire)) {
       size_t end = task_end_;
@@ -160,7 +163,7 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
     }
 
     // barrier (all workers must arrive, including inactive ones)
-    barrier();
+    barrier(sense);
   }
 }
 
