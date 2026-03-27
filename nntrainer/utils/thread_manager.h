@@ -152,14 +152,24 @@ private:
       active_threads_.load(std::memory_order_acquire);
     int n = n_barrier_.fetch_add(1, std::memory_order_acq_rel);
     if (n == n_threads - 1) {
-      n_barrier_.store(0, std::memory_order_relaxed);
-      // flip the sense flag to signal completion
+      n_barrier_.store(0, std::memory_order_release);
       barrier_sense_.store(sense, std::memory_order_release);
       return;
     }
     // spin until the last thread flips the sense
+    unsigned int spin = 0;
     while (barrier_sense_.load(std::memory_order_acquire) != sense) {
       cpuRelax();
+      if (++spin > 100000000u) {
+        fprintf(stderr,
+                "[ThreadManager] BARRIER STALL: sense=%d barrier_sense=%d "
+                "n_barrier=%d active_threads=%d n_was=%d\n",
+                (int)sense,
+                (int)barrier_sense_.load(std::memory_order_relaxed),
+                n_barrier_.load(std::memory_order_relaxed),
+                active_threads_.load(std::memory_order_relaxed), n);
+        spin = 0;
+      }
     }
   }
 
