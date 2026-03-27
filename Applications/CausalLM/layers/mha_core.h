@@ -34,7 +34,6 @@
 #include <complex>
 
 #include <acti_func.h>
-#include <thread_manager.h>
 #include <common_properties.h>
 #include <cpu_backend.h>
 #include <layer_impl.h>
