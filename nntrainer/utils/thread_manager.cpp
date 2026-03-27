@@ -4,7 +4,7 @@
  *
  * @file   thread_manager.cpp
  * @date   20 March 2026
- * @brief  Unified thread manager implementation (GGML-style barrier)
+ * @brief  Unified thread manager implementation (condvar-based)
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -81,7 +81,7 @@ ThreadManager::ThreadManager() {}
 
 ThreadManager::~ThreadManager() {
   stop_.store(true, std::memory_order_release);
-  generation_.fetch_add(1, std::memory_order_seq_cst);
+  dispatch_cv_.notify_all();
 
   for (auto &t : compute_workers_)
     if (t.joinable())
@@ -134,27 +134,23 @@ void ThreadManager::initialize() noexcept {
 }
 
 void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
-  unsigned int my_gen = generation_.load(std::memory_order_acquire);
+  unsigned int my_gen = 0;
 
   while (true) {
-    // spin-wait for new generation with periodic yield for OS scheduling
-    unsigned int spin_count = 0;
-    while (generation_.load(std::memory_order_acquire) == my_gen) {
+    // wait for new dispatch via condvar
+    {
+      std::unique_lock<std::mutex> lock(dispatch_mutex_);
+      dispatch_cv_.wait(lock, [this, &my_gen] {
+        return dispatch_gen_ != my_gen ||
+               stop_.load(std::memory_order_acquire);
+      });
       if (stop_.load(std::memory_order_acquire))
         return;
-      cpuRelax();
-      if (++spin_count > 1024) {
-        std::this_thread::yield();
-        spin_count = 0;
-      }
+      my_gen = dispatch_gen_;
     }
-    my_gen = generation_.load(std::memory_order_acquire);
 
-    if (stop_.load(std::memory_order_acquire))
-      return;
-
-    // only active workers do work + barrier; inactive workers skip both
-    if (worker_id < active_workers_.load(std::memory_order_acquire)) {
+    // only active workers do work + barrier
+    if (worker_id < active_workers_) {
       size_t end = task_end_;
       while (true) {
         size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
@@ -163,10 +159,16 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
         current_task_(idx);
       }
 
-      bool sense = current_sense_.load(std::memory_order_acquire);
-      barrier(sense);
+      // arrive at barrier
+      {
+        std::unique_lock<std::mutex> lock(barrier_mutex_);
+        ++barrier_count_;
+        barrier_cv_.notify_all();
+        barrier_cv_.wait(lock,
+                         [this] { return barrier_count_ >= barrier_target_; });
+      }
     }
-    // inactive workers loop back to generation spin immediately
+    // inactive workers skip both work and barrier
   }
 }
 

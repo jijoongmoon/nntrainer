@@ -51,11 +51,10 @@ private:
 
 /**
  * @class ThreadManager
- * @brief Unified thread pool with GGML-style spin-wait barrier.
+ * @brief Unified thread pool for compute and I/O operations.
  *
- * Compute workers spin-wait for work and synchronize via atomic barrier.
- * No condition variables on the hot path — minimal dispatch latency.
- * I/O workers use condition variable (blocking I/O is fine).
+ * Compute: condvar-based dispatch + condvar barrier (reliable in release mode).
+ * I/O: condvar-based task queue for blocking I/O.
  */
 class ThreadManager : public Singleton<ThreadManager> {
   friend class Singleton<ThreadManager>;
@@ -125,56 +124,8 @@ protected:
   void initialize() noexcept override;
 
 private:
-  static inline void cpuRelax() {
-#if defined(__x86_64__) || defined(_M_X64)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__)
-    asm volatile("yield" ::: "memory");
-#endif
-  }
-
   /**
-   * @brief GGML-style spin-wait barrier.
-   * Last thread to arrive resets counter and bumps pass count.
-   * Other threads spin on pass count with cpu_relax.
-   */
-  /**
-   * @brief Sense-reversing barrier.
-   *
-   * Each round uses the OPPOSITE sense (true/false). This prevents the
-   * race where a fast thread exits barrier, loops back, and re-enters
-   * the next barrier before slow threads have left the current one.
-   * With alternating sense, a thread spinning on sense=true won't be
-   * confused by a leftover sense=true from the previous round.
-   */
-  void barrier(bool sense) {
-    int n_threads =
-      active_threads_.load(std::memory_order_acquire);
-    int n = n_barrier_.fetch_add(1, std::memory_order_acq_rel);
-    if (n == n_threads - 1) {
-      n_barrier_.store(0, std::memory_order_release);
-      barrier_sense_.store(sense, std::memory_order_release);
-      return;
-    }
-    // spin until the last thread flips the sense
-    unsigned int spin = 0;
-    while (barrier_sense_.load(std::memory_order_acquire) != sense) {
-      cpuRelax();
-      if (++spin > 100000000u) {
-        fprintf(stderr,
-                "[ThreadManager] BARRIER STALL: sense=%d barrier_sense=%d "
-                "n_barrier=%d active_threads=%d n_was=%d\n",
-                (int)sense,
-                (int)barrier_sense_.load(std::memory_order_relaxed),
-                n_barrier_.load(std::memory_order_relaxed),
-                active_threads_.load(std::memory_order_relaxed), n);
-        spin = 0;
-      }
-    }
-  }
-
-  /**
-   * @brief Dispatch work to workers and join via barrier.
+   * @brief Dispatch work to workers and join via condvar barrier.
    */
   template <typename F>
   void dispatchAndJoin(size_t begin, size_t end, F &&fn,
@@ -183,21 +134,18 @@ private:
     if (n_workers == 0 || n_workers > total)
       n_workers = total;
 
-    // only active workers + caller participate in barrier
-    active_threads_.store(static_cast<int>(n_workers + 1),
-                          std::memory_order_release);
-
-    // compute the sense for this round (alternates each dispatch)
-    bool sense = !barrier_sense_.load(std::memory_order_acquire);
-
-    current_task_ = [&fn](size_t i) { fn(i); };
-    task_end_ = end;
-    current_chunk_.store(begin, std::memory_order_relaxed);
-    active_workers_.store(n_workers, std::memory_order_release);
-    current_sense_.store(sense, std::memory_order_release);
-
-    // wake workers
-    generation_.fetch_add(1, std::memory_order_seq_cst);
+    // setup work
+    {
+      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+      current_task_ = [&fn](size_t i) { fn(i); };
+      task_end_ = end;
+      current_chunk_.store(begin, std::memory_order_relaxed);
+      active_workers_ = n_workers;
+      barrier_count_ = 0;
+      barrier_target_ = static_cast<int>(n_workers + 1); // workers + caller
+      ++dispatch_gen_;
+    }
+    dispatch_cv_.notify_all();
 
     // caller participates (work-stealing via atomic counter)
     while (true) {
@@ -207,26 +155,39 @@ private:
       fn(idx);
     }
 
-    // barrier: wait for all threads
-    barrier(sense);
+    // caller arrives at barrier
+    {
+      std::unique_lock<std::mutex> lock(barrier_mutex_);
+      ++barrier_count_;
+      barrier_cv_.wait(lock,
+                       [this] { return barrier_count_ >= barrier_target_; });
+    }
+    barrier_cv_.notify_all();
     current_task_ = nullptr;
   }
 
   void computeWorkerLoop(unsigned int worker_id);
   void ioWorkerLoop();
 
-  // ─── Compute (all cache-line isolated) ───────────────
+  // ─── Compute ────────────────────────────────────────
   std::vector<std::thread> compute_workers_;
   std::function<void(size_t)> current_task_;
   size_t task_end_{0};
+  unsigned int active_workers_{0};
 
-  alignas(64) std::atomic<unsigned int> generation_{0};
-  alignas(64) std::atomic<int> n_barrier_{0};
-  alignas(64) std::atomic<bool> barrier_sense_{false};
-  alignas(64) std::atomic<bool> current_sense_{false};
+  // dispatch signaling (condvar-based, reliable in release mode)
+  std::mutex dispatch_mutex_;
+  std::condition_variable dispatch_cv_;
+  unsigned int dispatch_gen_{0};
+
+  // barrier (condvar-based)
+  std::mutex barrier_mutex_;
+  std::condition_variable barrier_cv_;
+  int barrier_count_{0};
+  int barrier_target_{0};
+
+  // work-stealing counter
   alignas(64) std::atomic<size_t> current_chunk_{0};
-  alignas(64) std::atomic<unsigned int> active_workers_{0};
-  alignas(64) std::atomic<int> active_threads_{1};
   alignas(64) std::atomic<bool> stop_{false};
 
   // ─── I/O ─────────────────────────────────────────────
