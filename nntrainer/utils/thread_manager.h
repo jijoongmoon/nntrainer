@@ -27,12 +27,26 @@
 namespace nntrainer {
 
 struct ThreadManagerConfig {
-  unsigned int compute_threads =
-    std::thread::hardware_concurrency() > 2
-      ? std::thread::hardware_concurrency() - 2
-      : 1;
+  /**
+   * @brief Number of compute worker threads.
+   * Default uses NNTR_NUM_THREADS if set > 0, otherwise OMP_NUM_THREADS - 1.
+   * This avoids creating too many threads on machines with many cores.
+   */
+  unsigned int compute_threads = defaultComputeThreads();
   unsigned int io_threads = 1;
   bool enable_affinity = false;
+
+private:
+  static unsigned int defaultComputeThreads() {
+#if defined(NNTR_NUM_THREADS) && NNTR_NUM_THREADS > 0
+    return NNTR_NUM_THREADS;
+#elif defined(OMP_NUM_THREADS) && OMP_NUM_THREADS > 1
+    return OMP_NUM_THREADS - 1; // -1 because caller also participates
+#else
+    unsigned int hw = std::thread::hardware_concurrency();
+    return hw > 2 ? std::min(hw - 2, 6u) : 1;
+#endif
+  }
 };
 
 /**
