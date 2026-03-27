@@ -4,7 +4,7 @@
  *
  * @file   thread_manager.cpp
  * @date   20 March 2026
- * @brief  Unified thread manager implementation (condvar-based)
+ * @brief  Unified thread manager: spin-wait (affinity) or condvar (default)
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -81,7 +81,13 @@ ThreadManager::ThreadManager() {}
 
 ThreadManager::~ThreadManager() {
   stop_.store(true, std::memory_order_release);
-  dispatch_cv_.notify_all();
+
+  if (spin_mode_) {
+    // bump generation to wake spin-waiting workers
+    spin_generation_.fetch_add(1, std::memory_order_seq_cst);
+  } else {
+    dispatch_cv_.notify_all();
+  }
 
   for (auto &t : compute_workers_)
     if (t.joinable())
@@ -111,17 +117,27 @@ void ThreadManager::initialize() noexcept {
   if (config.io_threads > remaining)
     config.io_threads = remaining > 0 ? remaining : 1;
 
-  // start compute workers
+  // set mode based on affinity setting
+  spin_mode_ = config.enable_affinity;
+
+  // start compute workers with appropriate loop
   compute_workers_.reserve(config.compute_threads);
-  for (unsigned int i = 0; i < config.compute_threads; ++i)
-    compute_workers_.emplace_back([this, i] { computeWorkerLoop(i); });
+  for (unsigned int i = 0; i < config.compute_threads; ++i) {
+    if (spin_mode_) {
+      compute_workers_.emplace_back(
+        [this, i] { computeWorkerLoopSpin(i); });
+    } else {
+      compute_workers_.emplace_back(
+        [this, i] { computeWorkerLoopCondvar(i); });
+    }
+  }
 
   // start I/O workers
   io_workers_.reserve(config.io_threads);
   for (unsigned int i = 0; i < config.io_threads; ++i)
     io_workers_.emplace_back([this] { ioWorkerLoop(); });
 
-  // CPU affinity
+  // CPU affinity (only meaningful in spin mode, but apply if requested)
   if (config.enable_affinity) {
     auto sorted = getCoresByPerformance(hw_threads);
     for (unsigned int i = 0; i < compute_workers_.size(); ++i)
@@ -133,11 +149,47 @@ void ThreadManager::initialize() noexcept {
   }
 }
 
-void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
+// ─── SPIN-WAIT WORKER (GGML-style, used when affinity=true) ──────
+
+void ThreadManager::computeWorkerLoopSpin(unsigned int worker_id) {
+  unsigned int my_gen = spin_generation_.load(std::memory_order_acquire);
+
+  while (true) {
+    // spin-wait for new generation
+    while (spin_generation_.load(std::memory_order_acquire) == my_gen) {
+      if (stop_.load(std::memory_order_acquire))
+        return;
+      cpuRelax();
+    }
+    my_gen = spin_generation_.load(std::memory_order_acquire);
+
+    if (stop_.load(std::memory_order_acquire))
+      return;
+
+    // only active workers do work + barrier
+    if (worker_id < spin_active_workers_.load(std::memory_order_acquire)) {
+      size_t end = task_end_;
+      while (true) {
+        size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= end)
+          break;
+        current_task_(idx);
+      }
+
+      spinBarrier();
+    }
+    // inactive workers loop back to generation spin
+  }
+}
+
+// ─── CONDVAR WORKER (safe without affinity, default) ─────────────
+
+void ThreadManager::computeWorkerLoopCondvar(unsigned int worker_id) {
   unsigned int my_gen = 0;
 
   while (true) {
     // wait for new dispatch via condvar
+    unsigned int my_barrier_gen;
     {
       std::unique_lock<std::mutex> lock(dispatch_mutex_);
       dispatch_cv_.wait(lock, [this, &my_gen] {
@@ -147,10 +199,11 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
       if (stop_.load(std::memory_order_acquire))
         return;
       my_gen = dispatch_gen_;
+      my_barrier_gen = barrier_gen_;
     }
 
     // only active workers do work + barrier
-    if (worker_id < active_workers_) {
+    if (worker_id < cv_active_workers_) {
       size_t end = task_end_;
       while (true) {
         size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
@@ -159,18 +212,25 @@ void ThreadManager::computeWorkerLoop(unsigned int worker_id) {
         current_task_(idx);
       }
 
-      // arrive at barrier
+      // arrive at barrier (generation-based: no reset race)
       {
         std::unique_lock<std::mutex> lock(barrier_mutex_);
-        ++barrier_count_;
-        barrier_cv_.notify_all();
-        barrier_cv_.wait(lock,
-                         [this] { return barrier_count_ >= barrier_target_; });
+        ++barrier_arrived_;
+        if (barrier_arrived_ >= barrier_target_) {
+          barrier_done_gen_ = my_barrier_gen;
+          barrier_cv_.notify_all();
+        } else {
+          barrier_cv_.wait(lock, [this, my_barrier_gen] {
+            return barrier_done_gen_ >= my_barrier_gen;
+          });
+        }
       }
     }
     // inactive workers skip both work and barrier
   }
 }
+
+// ─── I/O WORKER ──────────────────────────────────────────────────
 
 void ThreadManager::ioWorkerLoop() {
   while (true) {

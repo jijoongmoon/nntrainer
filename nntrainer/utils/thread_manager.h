@@ -30,10 +30,16 @@ struct ThreadManagerConfig {
   /**
    * @brief Number of compute worker threads.
    * Default uses NNTR_NUM_THREADS if set > 0, otherwise OMP_NUM_THREADS - 1.
-   * This avoids creating too many threads on machines with many cores.
    */
   unsigned int compute_threads = defaultComputeThreads();
   unsigned int io_threads = 1;
+
+  /**
+   * @brief Enable CPU affinity pinning.
+   * When true, workers are pinned to cores and use GGML-style spin-wait
+   * barrier for minimal latency. When false (default), uses condvar-based
+   * barrier which is safe without dedicated cores.
+   */
   bool enable_affinity = false;
 
 private:
@@ -41,7 +47,7 @@ private:
 #if defined(NNTR_NUM_THREADS) && NNTR_NUM_THREADS > 0
     return NNTR_NUM_THREADS;
 #elif defined(OMP_NUM_THREADS) && OMP_NUM_THREADS > 1
-    return OMP_NUM_THREADS - 1; // -1 because caller also participates
+    return OMP_NUM_THREADS - 1;
 #else
     unsigned int hw = std::thread::hardware_concurrency();
     return hw > 2 ? std::min(hw - 2, 6u) : 1;
@@ -51,10 +57,15 @@ private:
 
 /**
  * @class ThreadManager
- * @brief Unified thread pool for compute and I/O operations.
+ * @brief Hybrid thread pool: spin-wait (with affinity) or condvar (without).
  *
- * Compute: condvar-based dispatch + condvar barrier (reliable in release mode).
- * I/O: condvar-based task queue for blocking I/O.
+ * With enable_affinity=true:
+ *   Workers are pinned to cores and use GGML-style spin-wait + atomic barrier.
+ *   Minimal dispatch latency (~0.1us), but requires dedicated cores.
+ *
+ * With enable_affinity=false (default):
+ *   Workers use condvar for dispatch and barrier.
+ *   Safe without dedicated cores, slightly higher latency (~1-2us).
  */
 class ThreadManager : public Singleton<ThreadManager> {
   friend class Singleton<ThreadManager>;
@@ -62,9 +73,6 @@ class ThreadManager : public Singleton<ThreadManager> {
 public:
   ~ThreadManager();
 
-  /**
-   * @brief Parallel for using all compute workers + caller.
-   */
   template <typename F> void parallel_for(size_t begin, size_t end, F &&fn) {
     if (begin >= end)
       return;
@@ -76,9 +84,6 @@ public:
     dispatchAndJoin(begin, end, std::forward<F>(fn));
   }
 
-  /**
-   * @brief Parallel for using at most n_workers compute workers + caller.
-   */
   template <typename F>
   void parallel_for(size_t begin, size_t end, unsigned int n_workers, F &&fn) {
     if (begin >= end)
@@ -94,9 +99,6 @@ public:
     dispatchAndJoin(begin, end, std::forward<F>(fn), n_workers);
   }
 
-  /**
-   * @brief Parallel for with thread-index based chunking.
-   */
   template <typename F> void parallel_for_chunked(size_t n_threads, F &&fn) {
     if (n_threads <= 1) {
       fn(0);
@@ -115,6 +117,8 @@ public:
     return static_cast<unsigned int>(io_workers_.size());
   }
 
+  bool isSpinMode() const { return spin_mode_; }
+
   static void setConfig(const ThreadManagerConfig &config) {
     pending_config_ = config;
   }
@@ -124,9 +128,30 @@ protected:
   void initialize() noexcept override;
 
 private:
-  /**
-   * @brief Dispatch work to workers and join via condvar barrier.
-   */
+  // ─── Spin-wait helpers (GGML-style, used when affinity=true) ────
+  static inline void cpuRelax() {
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#endif
+  }
+
+  void spinBarrier() {
+    int n_threads = spin_active_threads_.load(std::memory_order_acquire);
+    int n = spin_n_barrier_.fetch_add(1, std::memory_order_acq_rel);
+    if (n == n_threads - 1) {
+      spin_n_barrier_.store(0, std::memory_order_release);
+      spin_barrier_sense_.store(spin_current_sense_, std::memory_order_release);
+      return;
+    }
+    bool sense = spin_current_sense_;
+    while (spin_barrier_sense_.load(std::memory_order_acquire) != sense) {
+      cpuRelax();
+    }
+  }
+
+  // ─── Dispatch (branching on spin_mode_) ─────────────────────────
   template <typename F>
   void dispatchAndJoin(size_t begin, size_t end, F &&fn,
                        unsigned int n_workers = 0) {
@@ -134,63 +159,109 @@ private:
     if (n_workers == 0 || n_workers > total)
       n_workers = total;
 
-    // setup work
-    {
-      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+    if (spin_mode_) {
+      // ── SPIN-WAIT PATH (affinity=true) ──
+      spin_active_threads_.store(static_cast<int>(n_workers + 1),
+                                 std::memory_order_release);
+      spin_current_sense_ = !spin_barrier_sense_.load(std::memory_order_acquire);
+
       current_task_ = [&fn](size_t i) { fn(i); };
       task_end_ = end;
       current_chunk_.store(begin, std::memory_order_relaxed);
-      active_workers_ = n_workers;
-      barrier_count_ = 0;
-      barrier_target_ = static_cast<int>(n_workers + 1); // workers + caller
-      ++dispatch_gen_;
-    }
-    dispatch_cv_.notify_all();
+      spin_active_workers_.store(n_workers, std::memory_order_release);
 
-    // caller participates (work-stealing via atomic counter)
-    while (true) {
-      size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
-      if (idx >= end)
-        break;
-      fn(idx);
-    }
+      // wake workers via generation bump
+      spin_generation_.fetch_add(1, std::memory_order_seq_cst);
 
-    // caller arrives at barrier
-    {
-      std::unique_lock<std::mutex> lock(barrier_mutex_);
-      ++barrier_count_;
-      barrier_cv_.wait(lock,
-                       [this] { return barrier_count_ >= barrier_target_; });
+      // caller does work
+      while (true) {
+        size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= end)
+          break;
+        fn(idx);
+      }
+
+      spinBarrier();
+      current_task_ = nullptr;
+
+    } else {
+      // ── CONDVAR PATH (affinity=false, default) ──
+      unsigned int my_barrier_gen;
+      {
+        std::lock_guard<std::mutex> lock(dispatch_mutex_);
+        current_task_ = [&fn](size_t i) { fn(i); };
+        task_end_ = end;
+        current_chunk_.store(begin, std::memory_order_relaxed);
+        cv_active_workers_ = n_workers;
+        barrier_target_ = static_cast<int>(n_workers + 1);
+        ++dispatch_gen_;
+        ++barrier_gen_;
+        my_barrier_gen = barrier_gen_;
+        barrier_arrived_ = 0;
+      }
+      dispatch_cv_.notify_all();
+
+      // caller does work
+      while (true) {
+        size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= end)
+          break;
+        fn(idx);
+      }
+
+      // caller arrives at barrier
+      {
+        std::unique_lock<std::mutex> lock(barrier_mutex_);
+        ++barrier_arrived_;
+        if (barrier_arrived_ >= barrier_target_) {
+          barrier_done_gen_ = my_barrier_gen;
+          barrier_cv_.notify_all();
+        } else {
+          barrier_cv_.wait(lock, [this, my_barrier_gen] {
+            return barrier_done_gen_ >= my_barrier_gen;
+          });
+        }
+      }
+      current_task_ = nullptr;
     }
-    barrier_cv_.notify_all();
-    current_task_ = nullptr;
   }
 
-  void computeWorkerLoop(unsigned int worker_id);
+  void computeWorkerLoopSpin(unsigned int worker_id);
+  void computeWorkerLoopCondvar(unsigned int worker_id);
   void ioWorkerLoop();
 
-  // ─── Compute ────────────────────────────────────────
+  // ─── Mode ───────────────────────────────────────────
+  bool spin_mode_{false};
+
+  // ─── Shared ─────────────────────────────────────────
   std::vector<std::thread> compute_workers_;
   std::function<void(size_t)> current_task_;
   size_t task_end_{0};
-  unsigned int active_workers_{0};
-
-  // dispatch signaling (condvar-based, reliable in release mode)
-  std::mutex dispatch_mutex_;
-  std::condition_variable dispatch_cv_;
-  unsigned int dispatch_gen_{0};
-
-  // barrier (condvar-based)
-  std::mutex barrier_mutex_;
-  std::condition_variable barrier_cv_;
-  int barrier_count_{0};
-  int barrier_target_{0};
-
-  // work-stealing counter
   alignas(64) std::atomic<size_t> current_chunk_{0};
   alignas(64) std::atomic<bool> stop_{false};
 
-  // ─── I/O ─────────────────────────────────────────────
+  // ─── Spin-wait mode state ───────────────────────────
+  alignas(64) std::atomic<unsigned int> spin_generation_{0};
+  alignas(64) std::atomic<int> spin_n_barrier_{0};
+  alignas(64) std::atomic<bool> spin_barrier_sense_{false};
+  bool spin_current_sense_{false};
+  alignas(64) std::atomic<unsigned int> spin_active_workers_{0};
+  alignas(64) std::atomic<int> spin_active_threads_{1};
+
+  // ─── Condvar mode state ─────────────────────────────
+  std::mutex dispatch_mutex_;
+  std::condition_variable dispatch_cv_;
+  unsigned int dispatch_gen_{0};
+  unsigned int cv_active_workers_{0};
+
+  std::mutex barrier_mutex_;
+  std::condition_variable barrier_cv_;
+  int barrier_arrived_{0};
+  int barrier_target_{0};
+  unsigned int barrier_gen_{0};
+  unsigned int barrier_done_gen_{0};
+
+  // ─── I/O ────────────────────────────────────────────
   std::vector<std::thread> io_workers_;
   std::queue<std::pair<std::function<void()>,
                        std::shared_ptr<CompletionToken::SharedState>>>
@@ -198,7 +269,7 @@ private:
   std::mutex io_mutex_;
   std::condition_variable io_cv_;
 
-  // ─── Config ──────────────────────────────────────────
+  // ─── Config ─────────────────────────────────────────
   ThreadManagerConfig config_;
   static ThreadManagerConfig pending_config_;
 };
