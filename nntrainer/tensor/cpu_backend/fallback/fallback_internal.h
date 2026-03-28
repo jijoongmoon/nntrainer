@@ -1329,6 +1329,30 @@ void __fallback_transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
                                                   int q4_0x_block_size,
                                                   void *dst_q4_0x);
 
+/**
+ * @brief Fallback: Quantize FP32 KV values to TurboQuant 4-bit
+ */
+void __fallback_quantize_kv_turboquant(const float *input, size_t num_elements,
+                                       uint8_t *out_packed, float *out_scales);
+
+/**
+ * @brief Fallback: Compute Q*K^T with 4-bit packed key cache
+ */
+void __fallback_compute_kcaches_packed4(
+  const float *query, const uint8_t *kcache_packed, const float *kcache_scales,
+  float *output, int num_rows, int num_cache_head, int head_dim, int gqa_size,
+  int tile_size, size_t local_window_size = UINT_MAX, int head_start = 0,
+  int head_end = -1);
+
+/**
+ * @brief Fallback: Compute attention-weighted value with 4-bit packed vcache
+ */
+void __fallback_compute_vcache_packed4_transposed(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_scales, float *output, int num_cache_head, int gqa_size,
+  int head_dim, size_t local_window_size = UINT_MAX, int head_start = 0,
+  int head_end = -1);
+
 } // namespace nntrainer
 #endif
 #endif

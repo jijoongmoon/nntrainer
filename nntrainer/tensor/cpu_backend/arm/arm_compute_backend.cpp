@@ -579,4 +579,50 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
 #endif
 }
 
+void quantize_kv_turboquant(const float *input, size_t num_elements,
+                            uint8_t *out_packed, float *out_scales) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  neon::quantize_kv_turboquant(input, num_elements, out_packed, out_scales);
+#else
+  __fallback_quantize_kv_turboquant(input, num_elements, out_packed, out_scales);
+#endif
+}
+
+void compute_kcaches_packed4(const float *query, const uint8_t *kcache_packed,
+                             const float *kcache_scales, float *output,
+                             int num_rows, int num_cache_head, int head_dim,
+                             int gqa_size, int tile_size,
+                             size_t local_window_size, int head_start,
+                             int head_end) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  neon::compute_kcaches_packed4(query, kcache_packed, kcache_scales, output,
+                                num_rows, num_cache_head, head_dim, gqa_size,
+                                tile_size, local_window_size, head_start,
+                                head_end);
+#else
+  __fallback_compute_kcaches_packed4(query, kcache_packed, kcache_scales, output,
+                                     num_rows, num_cache_head, head_dim,
+                                     gqa_size, tile_size, local_window_size,
+                                     head_start, head_end);
+#endif
+}
+
+void compute_vcache_packed4_transposed(int row_num, const float *attn_weights,
+                                       const uint8_t *vcache_packed,
+                                       const float *vcache_scales,
+                                       float *output, int num_cache_head,
+                                       int gqa_size, int head_dim,
+                                       size_t local_window_size, int head_start,
+                                       int head_end) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  neon::compute_vcache_packed4_transposed(
+    row_num, attn_weights, vcache_packed, vcache_scales, output, num_cache_head,
+    gqa_size, head_dim, local_window_size, head_start, head_end);
+#else
+  __fallback_compute_vcache_packed4_transposed(
+    row_num, attn_weights, vcache_packed, vcache_scales, output, num_cache_head,
+    gqa_size, head_dim, local_window_size, head_start, head_end);
+#endif
+}
+
 } /* namespace nntrainer */

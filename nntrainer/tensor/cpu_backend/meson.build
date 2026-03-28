@@ -1,5 +1,6 @@
 cpu_backend_headers = [
   'cpu_backend.h',
+  'turboquant_utils.h',
 ]
 
 subdir('fallback')

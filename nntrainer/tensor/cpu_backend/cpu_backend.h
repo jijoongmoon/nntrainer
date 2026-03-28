@@ -1500,5 +1500,60 @@ extern void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
                                               size_t scale_group_size,
                                               void *dst_q4_0x);
 
+/**
+ * @brief Quantize FP32 KV values and pack into TurboQuant 4-bit format
+ *        (3-bit data + 1-bit QJL signature per element, 2 elements per byte).
+ * @param[in]  input        FP32 input values
+ * @param[in]  num_elements total number of elements (must be even)
+ * @param[out] out_packed   packed 4-bit output, size = num_elements / 2
+ * @param[out] out_scales   per-group scale factors
+ */
+extern void quantize_kv_turboquant(const float *input, size_t num_elements,
+                                   uint8_t *out_packed, float *out_scales);
+
+/**
+ * @brief Compute Q*K^T attention scores with TurboQuant 4-bit packed key cache.
+ * @param[in]  query          FP32 query vector
+ * @param[in]  kcache_packed  4-bit packed key cache
+ * @param[in]  kcache_scales  per-group scale factors for key cache
+ * @param[out] output         FP32 attention scores
+ * @param[in]  num_rows       number of cached key rows (context length)
+ * @param[in]  num_cache_head number of KV heads
+ * @param[in]  head_dim       dimension per head
+ * @param[in]  gqa_size       GQA group size (num_heads_Q / num_heads_KV)
+ * @param[in]  tile_size      tile size for loop blocking
+ * @param[in]  local_window_size sliding window size
+ * @param[in]  head_start     start index of KV heads to process
+ * @param[in]  head_end       end index of KV heads (exclusive, -1 = all)
+ */
+extern void compute_kcaches_packed4(const float *query,
+                                    const uint8_t *kcache_packed,
+                                    const float *kcache_scales, float *output,
+                                    int num_rows, int num_cache_head,
+                                    int head_dim, int gqa_size, int tile_size,
+                                    size_t local_window_size = UINT_MAX,
+                                    int head_start = 0, int head_end = -1);
+
+/**
+ * @brief Compute attention-weighted value aggregation with TurboQuant 4-bit
+ *        packed value cache.
+ * @param[in]  row_num          current row number (position in sequence)
+ * @param[in]  attn_weights     FP32 attention weights
+ * @param[in]  vcache_packed    4-bit packed value cache
+ * @param[in]  vcache_scales    per-group scale factors for value cache
+ * @param[out] output           FP32 output
+ * @param[in]  num_cache_head   number of KV heads
+ * @param[in]  gqa_size         GQA group size
+ * @param[in]  head_dim         dimension per head
+ * @param[in]  local_window_size sliding window size
+ * @param[in]  head_start       start index of KV heads to process
+ * @param[in]  head_end         end index of KV heads (exclusive, -1 = all)
+ */
+extern void compute_vcache_packed4_transposed(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_scales, float *output, int num_cache_head, int gqa_size,
+  int head_dim, size_t local_window_size = UINT_MAX, int head_start = 0,
+  int head_end = -1);
+
 #endif
 #endif

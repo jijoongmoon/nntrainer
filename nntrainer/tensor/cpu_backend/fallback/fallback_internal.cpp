@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <fallback_internal.h>
 #include <limits>
+#include <vector>
 #include <q4_0_utils.h>
 #include <stdexcept>
 #include <tensor_dim.h>
@@ -654,6 +655,141 @@ void __fallback_transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
   Q4_0Utils::transformQ4_0x_FromInt4(N, K, osv32_weights, osv32_scales,
                                      scale_group_size, q4_0x_block_size,
                                      dst_q4_0x);
+}
+
+void __fallback_quantize_kv_turboquant(const float *input, size_t num_elements,
+                                       uint8_t *out_packed, float *out_scales) {
+  constexpr int GROUP_SIZE = 32;
+  int num_groups = (num_elements + GROUP_SIZE - 1) / GROUP_SIZE;
+
+  for (int g = 0; g < num_groups; ++g) {
+    size_t start = g * GROUP_SIZE;
+    size_t end = start + GROUP_SIZE;
+    if (end > num_elements)
+      end = num_elements;
+
+    float absmax = 0.0f;
+    for (size_t i = start; i < end; ++i) {
+      float av = std::fabs(input[i]);
+      if (av > absmax)
+        absmax = av;
+    }
+
+    float scale = (absmax > 0.0f) ? (absmax / 3.0f) : 1.0f;
+    out_scales[g] = scale;
+    float inv_scale = 1.0f / scale;
+
+    for (size_t j = start; j < end; j += 2) {
+      float v0 = input[j];
+      int q0 = (int)std::round(v0 * inv_scale) + 4;
+      q0 = std::max(0, std::min(7, q0));
+      uint8_t s0 = (v0 >= 0.0f) ? 1 : 0;
+
+      uint8_t q1_val = 4, s1 = 1;
+      if (j + 1 < end) {
+        float v1 = input[j + 1];
+        int q1 = (int)std::round(v1 * inv_scale) + 4;
+        q1 = std::max(0, std::min(7, q1));
+        q1_val = (uint8_t)q1;
+        s1 = (v1 >= 0.0f) ? 1 : 0;
+      }
+
+      uint8_t elem0 = ((uint8_t)q0 & 0x07) | ((s0 & 0x01) << 3);
+      uint8_t elem1 = (q1_val & 0x07) | ((s1 & 0x01) << 3);
+      out_packed[j / 2] = (elem1 << 4) | elem0;
+    }
+  }
+}
+
+void __fallback_compute_kcaches_packed4(
+  const float *query, const uint8_t *kcache_packed, const float *kcache_scales,
+  float *output, int num_rows, int num_cache_head, int head_dim, int gqa_size,
+  int tile_size, size_t local_window_size, int head_start, int head_end) {
+  constexpr int GROUP_SIZE = 32;
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  int start_row =
+    (size_t)num_rows < local_window_size ? 0 : num_rows - local_window_size;
+  int row_cnt =
+    (size_t)num_rows < local_window_size ? num_rows : local_window_size;
+  int packed_row_bytes = num_cache_head * head_dim / 2;
+  int num_groups_per_head = (head_dim + GROUP_SIZE - 1) / GROUP_SIZE;
+  int scales_per_row = num_cache_head * num_groups_per_head;
+
+  std::vector<float> tmp_dequant(head_dim);
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int t_row = 0; t_row < row_cnt; ++t_row) {
+      int row = start_row + t_row;
+      const uint8_t *packed_ptr =
+        kcache_packed + row * packed_row_bytes + n * head_dim / 2;
+      const float *scale_ptr =
+        kcache_scales + row * scales_per_row + n * num_groups_per_head;
+
+      for (int d = 0; d < head_dim; d += 2) {
+        uint8_t packed = packed_ptr[d / 2];
+        uint8_t q0 = packed & 0x07;
+        uint8_t q1 = (packed >> 4) & 0x07;
+        int grp = d / GROUP_SIZE;
+        float s = scale_ptr[grp];
+        tmp_dequant[d] = s * ((float)q0 - 4.0f);
+        if (d + 1 < head_dim)
+          tmp_dequant[d + 1] = s * ((float)q1 - 4.0f);
+      }
+
+      for (int g = 0; g < gqa_size; ++g) {
+        const float *q_ptr = query + n * gqa_size * head_dim + g * head_dim;
+        float sum = 0.0f;
+        for (int d = 0; d < head_dim; ++d)
+          sum += q_ptr[d] * tmp_dequant[d];
+        output[t_row * num_cache_head * gqa_size + n * gqa_size + g] =
+          sum / std::sqrt((float)head_dim);
+      }
+    }
+  }
+}
+
+void __fallback_compute_vcache_packed4_transposed(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_scales, float *output, int num_cache_head, int gqa_size,
+  int head_dim, size_t local_window_size, int head_start, int head_end) {
+  constexpr int GROUP_SIZE = 32;
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  int packed_row_bytes = num_cache_head * head_dim / 2;
+  int num_groups_per_head = (head_dim + GROUP_SIZE - 1) / GROUP_SIZE;
+  int scales_per_row = num_cache_head * num_groups_per_head;
+  int j_start = (size_t)row_num < local_window_size
+                  ? 0
+                  : row_num + 1 - (int)local_window_size;
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int h = 0; h < gqa_size; ++h) {
+      std::vector<float> acc(head_dim, 0.0f);
+
+      for (int j = j_start; j <= row_num; ++j) {
+        float a_val =
+          attn_weights[((j - j_start) * num_cache_head + n) * gqa_size + h];
+        const uint8_t *packed_ptr =
+          vcache_packed + j * packed_row_bytes + n * head_dim / 2;
+        const float *scale_ptr =
+          vcache_scales + j * scales_per_row + n * num_groups_per_head;
+
+        for (int d = 0; d < head_dim; d += 2) {
+          uint8_t packed = packed_ptr[d / 2];
+          uint8_t q0 = packed & 0x07;
+          uint8_t q1 = (packed >> 4) & 0x07;
+          int grp = d / GROUP_SIZE;
+          float s = scale_ptr[grp];
+          acc[d] += a_val * s * ((float)q0 - 4.0f);
+          if (d + 1 < head_dim)
+            acc[d + 1] += a_val * s * ((float)q1 - 4.0f);
+        }
+      }
+
+      int out_base = (n * gqa_size + h) * head_dim;
+      for (int d = 0; d < head_dim; ++d)
+        output[out_base + d] = acc[d];
+    }
+  }
 }
 
 } // namespace nntrainer
