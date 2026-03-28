@@ -58,6 +58,7 @@ test_target = [
   ['unittest_nntrainer_activations', []],
   ['unittest_nntrainer_cpu_backend', []],
   ['unittest_nntrainer_fallback', []],
+  ['unittest_turboquant', []],
   ['unittest_nntrainer_tensor_types', []],
   ['unittest_nntrainer_tensor_advanced', []],
   ['unittest_nntrainer_exe_order', []],
