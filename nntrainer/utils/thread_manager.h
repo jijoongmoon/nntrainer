@@ -4,7 +4,7 @@
  *
  * @file   thread_manager.h
  * @date   20 March 2026
- * @brief  Unified thread manager for compute and I/O operations
+ * @brief  Unified thread manager with graph-level execution support
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -27,19 +27,8 @@
 namespace nntrainer {
 
 struct ThreadManagerConfig {
-  /**
-   * @brief Number of compute worker threads.
-   * Default uses NNTR_NUM_THREADS if set > 0, otherwise OMP_NUM_THREADS - 1.
-   */
   unsigned int compute_threads = defaultComputeThreads();
   unsigned int io_threads = 1;
-
-  /**
-   * @brief Enable CPU affinity pinning.
-   * When true, workers are pinned to cores and use GGML-style spin-wait
-   * barrier for minimal latency. When false (default), uses condvar-based
-   * barrier which is safe without dedicated cores.
-   */
   bool enable_affinity = false;
 
 private:
@@ -57,15 +46,24 @@ private:
 
 /**
  * @class ThreadManager
- * @brief Hybrid thread pool: spin-wait (with affinity) or condvar (without).
+ * @brief Hybrid thread pool with graph-level execution support.
  *
- * With enable_affinity=true:
- *   Workers are pinned to cores and use GGML-style spin-wait + atomic barrier.
- *   Minimal dispatch latency (~0.1us), but requires dedicated cores.
+ * Three execution modes:
  *
- * With enable_affinity=false (default):
- *   Workers use condvar for dispatch and barrier.
- *   Safe without dedicated cores, slightly higher latency (~1-2us).
+ * 1. Per-dispatch (default): each parallel_for = dispatch + barrier.
+ *    Condvar-based (safe) or spin-wait (fast, needs affinity).
+ *
+ * 2. Graph execution (beginGraphExec/endGraphExec):
+ *    Workers stay alive in a tight loop. Each parallel_for only does
+ *    a barrier — no generation spin, no condvar wake. Like llama.cpp's
+ *    ggml_graph_compute: ~0.2us per dispatch vs ~1-4us per-dispatch.
+ *
+ * Usage:
+ *   tm.beginGraphExec();          // wake workers once
+ *   for (each layer) {
+ *     tm.parallel_for(0, N, fn);  // barrier-only, no dispatch overhead
+ *   }
+ *   tm.endGraphExec();            // release workers
  */
 class ThreadManager : public Singleton<ThreadManager> {
   friend class Singleton<ThreadManager>;
@@ -73,6 +71,25 @@ class ThreadManager : public Singleton<ThreadManager> {
 public:
   ~ThreadManager();
 
+  // ─── Graph execution API ───────────────────────────────
+  /**
+   * @brief Begin graph-level execution. Workers enter a tight spin loop
+   * and stay alive until endGraphExec(). All parallel_for calls within
+   * a graph exec session use barrier-only synchronization (no dispatch
+   * overhead).
+   */
+  void beginGraphExec();
+
+  /**
+   * @brief End graph-level execution. Workers return to idle state.
+   */
+  void endGraphExec();
+
+  bool inGraphExec() const {
+    return in_graph_exec_.load(std::memory_order_acquire);
+  }
+
+  // ─── parallel_for API ──────────────────────────────────
   template <typename F> void parallel_for(size_t begin, size_t end, F &&fn) {
     if (begin >= end)
       return;
@@ -81,7 +98,11 @@ public:
         fn(i);
       return;
     }
-    dispatchAndJoin(begin, end, std::forward<F>(fn));
+    if (in_graph_exec_.load(std::memory_order_acquire)) {
+      graphDispatch(begin, end, std::forward<F>(fn));
+    } else {
+      standaloneDispatch(begin, end, std::forward<F>(fn));
+    }
   }
 
   template <typename F>
@@ -96,7 +117,11 @@ public:
         fn(i);
       return;
     }
-    dispatchAndJoin(begin, end, std::forward<F>(fn), n_workers);
+    if (in_graph_exec_.load(std::memory_order_acquire)) {
+      graphDispatch(begin, end, std::forward<F>(fn));
+    } else {
+      standaloneDispatch(begin, end, std::forward<F>(fn), n_workers);
+    }
   }
 
   template <typename F> void parallel_for_chunked(size_t n_threads, F &&fn) {
@@ -112,11 +137,9 @@ public:
   unsigned int getComputeThreadCount() const {
     return static_cast<unsigned int>(compute_workers_.size());
   }
-
   unsigned int getIOThreadCount() const {
     return static_cast<unsigned int>(io_workers_.size());
   }
-
   bool isSpinMode() const { return spin_mode_; }
 
   static void setConfig(const ThreadManagerConfig &config) {
@@ -128,7 +151,6 @@ protected:
   void initialize() noexcept override;
 
 private:
-  // ─── Spin-wait helpers (GGML-style, used when affinity=true) ────
   static inline void cpuRelax() {
 #if defined(__x86_64__) || defined(_M_X64)
     __builtin_ia32_pause();
@@ -137,8 +159,9 @@ private:
 #endif
   }
 
+  // ─── Spin barrier (used in graph exec and spin standalone) ──
   void spinBarrier(bool sense) {
-    int n_threads = spin_active_threads_.load(std::memory_order_acquire);
+    int n_threads = graph_n_threads_.load(std::memory_order_acquire);
     int n = spin_n_barrier_.fetch_add(1, std::memory_order_acq_rel);
     if (n == n_threads - 1) {
       spin_n_barrier_.store(0, std::memory_order_release);
@@ -150,18 +173,45 @@ private:
     }
   }
 
-  // ─── Dispatch (branching on spin_mode_) ─────────────────────────
+  // ─── Graph execution dispatch (barrier-only, no generation spin) ──
   template <typename F>
-  void dispatchAndJoin(size_t begin, size_t end, F &&fn,
-                       unsigned int n_workers = 0) {
+  void graphDispatch(size_t begin, size_t end, F &&fn) {
+    // setup work for workers (they're already spinning on barrier)
+    current_task_ = [&fn](size_t i) { fn(i); };
+    task_end_ = end;
+    current_chunk_.store(begin, std::memory_order_relaxed);
+    bool sense = !spin_barrier_sense_.load(std::memory_order_relaxed);
+
+    // signal workers: "work is ready" via barrier
+    // Workers are spinning on this barrier from previous round
+    spinBarrier(sense);
+
+    // caller does work
+    while (true) {
+      size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
+      if (idx >= end)
+        break;
+      fn(idx);
+    }
+
+    // completion barrier: wait for all workers to finish
+    bool sense2 = !spin_barrier_sense_.load(std::memory_order_relaxed);
+    spinBarrier(sense2);
+    current_task_ = nullptr;
+  }
+
+  // ─── Standalone dispatch (per-call, condvar or spin) ──────
+  template <typename F>
+  void standaloneDispatch(size_t begin, size_t end, F &&fn,
+                          unsigned int n_workers = 0) {
     unsigned int total = static_cast<unsigned int>(compute_workers_.size());
     if (n_workers == 0 || n_workers > total)
       n_workers = total;
 
     if (spin_mode_) {
-      // ── SPIN-WAIT PATH (affinity=true) ──
-      spin_active_threads_.store(static_cast<int>(n_workers + 1),
-                                 std::memory_order_release);
+      // spin-wait standalone (same as before)
+      graph_n_threads_.store(static_cast<int>(n_workers + 1),
+                             std::memory_order_release);
       bool sense = !spin_barrier_sense_.load(std::memory_order_acquire);
       spin_current_sense_.store(sense, std::memory_order_release);
 
@@ -169,23 +219,19 @@ private:
       task_end_ = end;
       current_chunk_.store(begin, std::memory_order_relaxed);
       spin_active_workers_.store(n_workers, std::memory_order_release);
-
-      // wake workers via generation bump
       spin_generation_.fetch_add(1, std::memory_order_seq_cst);
 
-      // caller does work
       while (true) {
         size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
         if (idx >= end)
           break;
         fn(idx);
       }
-
       spinBarrier(sense);
       current_task_ = nullptr;
 
     } else {
-      // ── CONDVAR PATH (affinity=false, default) ──
+      // condvar standalone (same as before)
       unsigned int my_barrier_gen;
       {
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
@@ -201,7 +247,6 @@ private:
       }
       dispatch_cv_.notify_all();
 
-      // caller does work
       while (true) {
         size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
         if (idx >= end)
@@ -209,7 +254,6 @@ private:
         fn(idx);
       }
 
-      // caller arrives at barrier
       {
         std::unique_lock<std::mutex> lock(barrier_mutex_);
         ++barrier_arrived_;
@@ -228,6 +272,7 @@ private:
 
   void computeWorkerLoopSpin(unsigned int worker_id);
   void computeWorkerLoopCondvar(unsigned int worker_id);
+  void graphWorkerLoop(unsigned int worker_id);
   void ioWorkerLoop();
 
   // ─── Mode ───────────────────────────────────────────
@@ -240,15 +285,23 @@ private:
   alignas(64) std::atomic<size_t> current_chunk_{0};
   alignas(64) std::atomic<bool> stop_{false};
 
-  // ─── Spin-wait mode state ───────────────────────────
+  // ─── Graph execution state ──────────────────────────
+  alignas(64) std::atomic<bool> in_graph_exec_{false};
+  alignas(64) std::atomic<bool> graph_exec_done_{false};
+  alignas(64) std::atomic<int> graph_n_threads_{1};
+  std::mutex graph_mutex_;
+  std::condition_variable graph_cv_;
+  unsigned int graph_gen_{0};
+  std::vector<std::thread> graph_workers_;
+
+  // ─── Spin-wait standalone state ─────────────────────
   alignas(64) std::atomic<unsigned int> spin_generation_{0};
   alignas(64) std::atomic<int> spin_n_barrier_{0};
   alignas(64) std::atomic<bool> spin_barrier_sense_{false};
   alignas(64) std::atomic<bool> spin_current_sense_{false};
   alignas(64) std::atomic<unsigned int> spin_active_workers_{0};
-  alignas(64) std::atomic<int> spin_active_threads_{1};
 
-  // ─── Condvar mode state ─────────────────────────────
+  // ─── Condvar standalone state ───────────────────────
   std::mutex dispatch_mutex_;
   std::condition_variable dispatch_cv_;
   unsigned int dispatch_gen_{0};
