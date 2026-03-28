@@ -137,6 +137,20 @@ public:
 };
 
 /**
+ * @brief Use4BitKVCache property
+ * When enabled, KV cache is stored as 4-bit packed format
+ * (3-bit quantized data + 1-bit QJL signature) instead of FP16.
+ * This reduces KV cache memory by 4x.
+ */
+class Use4BitKVCache : public nntrainer::Property<bool> {
+public:
+  Use4BitKVCache(bool value = false) { set(value); };
+  static constexpr const char *key =
+    "use_4bit_kv_cache";                         /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag;     /**< property type */
+};
+
+/**
  * @brief RopeScalingType
  * - default
  * - yarn
@@ -308,7 +322,7 @@ private:
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::AttnLogitSoftcapping, props::IsCausal>
+    props::AttnLogitSoftcapping, props::IsCausal, props::Use4BitKVCache>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -327,6 +341,7 @@ private:
   bool use_sink = false;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
+  bool use_4bit_kv_cache = false; /**< 4-bit quantized KV cache mode */
 
   enum INOUT_INDEX {
     /** input index */
@@ -351,8 +366,14 @@ private:
     attention_weight,
     dropout_mask,
     attention_output,
+    cache_key_scale,   /**< per-head quantization scale for 4-bit key cache */
+    cache_value_scale, /**< per-head quantization scale for 4-bit value cache */
+    cache_key_zp,      /**< per-head zero point for 4-bit key cache */
+    cache_value_zp,    /**< per-head zero point for 4-bit value cache */
+    cache_key_qjl_scale,   /**< per-head QJL correction scale for key */
+    cache_value_qjl_scale, /**< per-head QJL correction scale for value */
   };
-  std::array<unsigned int, 7> tensor_idx;
+  std::array<unsigned int, 13> tensor_idx;
   unsigned int sink_idx;
 
   /** attention parameters */

@@ -30,8 +30,10 @@ namespace nntrainer {
 
 void init_backend() {
   __ggml_init();
+#ifdef USE_BLAS
   // Do not repeatedly call set_num_threads. It's a global config.
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
+#endif
 }
 
 void scopy_int4_to_float32(const unsigned int N, const uint8_t *X,
@@ -453,6 +455,29 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
   nntrainer::avx2::compute_kcaches<uint16_t>(
     in, kcache, output, num_rows, num_cache_head, head_dim, gqa_size, tile_size,
     local_window_size, head_start, head_end);
+}
+
+void compute_kcaches_4bit(const float *in, const uint8_t *kcache_packed,
+                          float *output, int num_rows, int num_cache_head,
+                          int head_dim, int gqa_size, int tile_size,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales, size_t local_window_size,
+                          int head_start, int head_end) {
+  nntrainer::avx2::compute_kcaches_4bit(
+    in, kcache_packed, output, num_rows, num_cache_head, head_dim, gqa_size,
+    tile_size, scales, zero_points, qjl_scales, local_window_size, head_start,
+    head_end);
+}
+
+void compute_vcaches_4bit(int row_num, const float *in,
+                          const uint8_t *vcache_packed, float *output,
+                          int num_cache_head, int gqa_size, int head_dim,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales, size_t local_window_size,
+                          int head_start, int head_end) {
+  nntrainer::avx2::compute_vcaches_4bit(
+    row_num, in, vcache_packed, output, num_cache_head, gqa_size, head_dim,
+    scales, zero_points, qjl_scales, local_window_size, head_start, head_end);
 }
 
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,

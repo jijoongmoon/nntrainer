@@ -65,6 +65,7 @@ test_target = [
   ['unittest_nntrainer_lazy_tensor', []],
   ['unittest_nntrainer_tensor', []],
   ['unittest_nntrainer_quantizer', []],
+  ['unittest_turboquant_4bit', []],
   ['unittest_util_func', []],
   ['unittest_nntrainer_models', [
     'models' / 'models_test_utils.cpp', 'models' / 'models_golden_test.cpp'

@@ -23,6 +23,7 @@
 #include <matrix_transpose_neon.h>
 #include <neon_impl.h>
 #include <neon_setting.h>
+#include <turboquant_4bit.h>
 #include <nntrainer_error.h>
 #ifdef ARMV7
 #include <armv7_neon.h>
@@ -2205,6 +2206,143 @@ void compute_rotary_emb_value_uint16(unsigned int width, unsigned int dim,
           inout[i0] = out0;
           inout[i1] = out1;
         }
+      }
+    }
+  }
+}
+
+void compute_kcaches_4bit(const float *in, const uint8_t *kcache_packed,
+                          float *output, int num_rows, int num_cache_head,
+                          int head_dim, int gqa_size, int tile_size,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales, size_t local_window_size,
+                          int head_start, int head_end) {
+
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+
+  int start_row = (static_cast<size_t>(num_rows) < local_window_size)
+                    ? 0
+                    : num_rows - static_cast<int>(local_window_size);
+  int row_cnt = (static_cast<size_t>(num_rows) < local_window_size)
+                  ? num_rows
+                  : static_cast<int>(local_window_size);
+  int tile_count = (row_cnt + tile_size - 1) / tile_size;
+  int packed_head_dim = head_dim / 2;
+  float inv_sqrt_hd = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  std::vector<float> tmp_fp32(head_dim);
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int t = 0; t < tile_count; ++t) {
+      int row_tile_start = t * tile_size;
+      int tile_rows = std::min(tile_size, row_cnt - row_tile_start);
+
+      for (int g = 0; g < gqa_size; ++g) {
+        const float *in_ptr = in + n * gqa_size * head_dim + g * head_dim;
+
+        for (int t_row = 0; t_row < tile_rows; ++t_row) {
+          int row = start_row + row_tile_start + t_row;
+
+          const uint8_t *kptr =
+            kcache_packed + (row * num_cache_head + n) * packed_head_dim;
+          float s = scales[row * num_cache_head + n];
+          float zp = zero_points[row * num_cache_head + n];
+          float qs = qjl_scales[row * num_cache_head + n];
+
+          // Unpack + dequantize
+          nntrainer::unpack_and_dequantize_4bit(kptr, tmp_fp32.data(), s, zp,
+                                                qs, head_dim);
+          const float *k_row = tmp_fp32.data();
+
+          // NEON dot product
+          float sum = 0.0f;
+          int i = 0;
+          float32x4_t acc = vdupq_n_f32(0.0f);
+          for (; i + 4 <= head_dim; i += 4) {
+            float32x4_t va = vld1q_f32(in_ptr + i);
+            float32x4_t vb = vld1q_f32(k_row + i);
+            acc = vfmaq_f32(acc, va, vb);
+          }
+          acc = vpaddq_f32(acc, acc);
+          acc = vpaddq_f32(acc, acc);
+          sum += vgetq_lane_f32(acc, 0);
+
+          for (; i < head_dim; ++i)
+            sum += in_ptr[i] * k_row[i];
+
+          output[(row - start_row) * num_cache_head * gqa_size +
+                 n * gqa_size + g] = sum * inv_sqrt_hd;
+        }
+      }
+    }
+  }
+}
+
+void compute_vcaches_4bit(int row_num, const float *in,
+                          const uint8_t *vcache_packed, float *output,
+                          int num_cache_head, int gqa_size, int head_dim,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales, size_t local_window_size,
+                          int head_start, int head_end) {
+
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  int packed_head_dim = head_dim / 2;
+  int num_blocks = head_dim / 4;
+  int rem = head_dim % 4;
+
+  std::vector<float> tmp_fp32(head_dim);
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    std::vector<float32x4_t> sumVec(num_blocks * gqa_size, vdupq_n_f32(0.0f));
+    std::vector<float> sumRem(gqa_size * rem, 0.0f);
+
+    int j_start = (static_cast<size_t>(row_num) < local_window_size)
+                    ? 0
+                    : row_num + 1 - static_cast<int>(local_window_size);
+
+    for (int j = j_start; j <= row_num; ++j) {
+      const uint8_t *vptr =
+        vcache_packed + (j * num_cache_head + n) * packed_head_dim;
+      float s = scales[j * num_cache_head + n];
+      float zp = zero_points[j * num_cache_head + n];
+      float qs = qjl_scales[j * num_cache_head + n];
+
+      nntrainer::unpack_and_dequantize_4bit(vptr, tmp_fp32.data(), s, zp, qs,
+                                            head_dim);
+
+      for (int h = 0; h < gqa_size; ++h) {
+        int attn_idx =
+          (static_cast<size_t>(row_num) < local_window_size
+             ? j
+             : j - (row_num + 1 - static_cast<int>(local_window_size)));
+        float a_val =
+          in[attn_idx * gqa_size * num_cache_head + n * gqa_size + h];
+        float32x4_t inVec = vdupq_n_f32(a_val);
+
+        for (int b = 0; b < num_blocks; ++b) {
+          float32x4_t bVec = vld1q_f32(&tmp_fp32[b * 4]);
+          sumVec[h * num_blocks + b] =
+            vfmaq_f32(sumVec[h * num_blocks + b], inVec, bVec);
+        }
+
+        int base = num_blocks * 4;
+        float *remPtr = &sumRem[h * rem];
+        for (int r = 0; r < rem; ++r) {
+          remPtr[r] += a_val * tmp_fp32[base + r];
+        }
+      }
+    }
+
+    for (int h = 0; h < gqa_size; ++h) {
+      for (int b = 0; b < num_blocks; ++b) {
+        int out_base = (n * gqa_size + h) * head_dim + b * 4;
+        vst1q_f32(&output[out_base], sumVec[h * num_blocks + b]);
+      }
+
+      int base = num_blocks * 4;
+      float *remPtr = &sumRem[h * rem];
+      for (int r = 0; r < rem; ++r) {
+        output[(n * gqa_size + h) * head_dim + base + r] = remPtr[r];
       }
     }
   }

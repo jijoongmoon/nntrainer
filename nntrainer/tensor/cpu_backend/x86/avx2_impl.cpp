@@ -27,6 +27,7 @@
 #if __has_include(<numbers>)
 #include <numbers>
 #endif
+#include <turboquant_4bit.h>
 #include <type_traits>
 #if __has_include(<version>)
 #include <version>
@@ -2146,6 +2147,160 @@ void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
         row_out_block_id++;
         dst_offset +=
           (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) * column_blocks_cnt;
+      }
+    }
+  }
+}
+
+void compute_kcaches_4bit(const float *in, const uint8_t *kcache_packed,
+                          float *output, int num_rows, int num_cache_head,
+                          int head_dim, int gqa_size, int tile_size,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales, size_t local_window_size,
+                          int head_start, int head_end) {
+
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+
+  int start_row = (static_cast<size_t>(num_rows) < local_window_size)
+                    ? 0
+                    : num_rows - static_cast<int>(local_window_size);
+  int row_cnt = (static_cast<size_t>(num_rows) < local_window_size)
+                  ? num_rows
+                  : static_cast<int>(local_window_size);
+  int tile_count = (row_cnt + tile_size - 1) / tile_size;
+  int packed_head_dim = head_dim / 2;
+  float inv_sqrt_hd = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  std::vector<float> tmp_fp32(head_dim);
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int t = 0; t < tile_count; ++t) {
+      int row_tile_start = t * tile_size;
+      int tile_rows = std::min(tile_size, row_cnt - row_tile_start);
+
+      for (int g = 0; g < gqa_size; ++g) {
+        const float *in_ptr = in + n * gqa_size * head_dim + g * head_dim;
+
+        for (int t_row = 0; t_row < tile_rows; ++t_row) {
+          int row = start_row + row_tile_start + t_row;
+
+          // Prefetch next row
+          if (t_row + 1 < tile_rows) {
+            const uint8_t *next_kptr = kcache_packed +
+              ((row + 1) * num_cache_head + n) * packed_head_dim;
+            _mm_prefetch(reinterpret_cast<const char *>(next_kptr),
+                         _MM_HINT_T0);
+          }
+
+          const uint8_t *kptr =
+            kcache_packed + (row * num_cache_head + n) * packed_head_dim;
+          float s = scales[row * num_cache_head + n];
+          float zp = zero_points[row * num_cache_head + n];
+          float qs = qjl_scales[row * num_cache_head + n];
+
+          // Unpack + dequantize with QJL correction
+          nntrainer::unpack_and_dequantize_4bit(kptr, tmp_fp32.data(), s, zp,
+                                                qs, head_dim);
+
+          const float *k_row = tmp_fp32.data();
+
+          // AVX2 dot product
+          float sum = 0.0f;
+          int i = 0;
+          __m256 acc = _mm256_setzero_ps();
+          for (; i + 8 <= head_dim; i += 8) {
+            __m256 va = _mm256_loadu_ps(in_ptr + i);
+            __m256 vb = _mm256_loadu_ps(k_row + i);
+            acc = _mm256_fmadd_ps(va, vb, acc);
+          }
+
+          // Horizontal sum
+          __m128 low = _mm256_castps256_ps128(acc);
+          __m128 high = _mm256_extractf128_ps(acc, 1);
+          __m128 sum128 = _mm_add_ps(low, high);
+          sum128 = _mm_hadd_ps(sum128, sum128);
+          sum128 = _mm_hadd_ps(sum128, sum128);
+          sum += _mm_cvtss_f32(sum128);
+
+          // Tail
+          for (; i < head_dim; ++i)
+            sum += in_ptr[i] * k_row[i];
+
+          output[(row - start_row) * num_cache_head * gqa_size +
+                 n * gqa_size + g] = sum * inv_sqrt_hd;
+        }
+      }
+    }
+  }
+}
+
+void compute_vcaches_4bit(int row_num, const float *in,
+                          const uint8_t *vcache_packed, float *output,
+                          int num_cache_head, int gqa_size, int head_dim,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales, size_t local_window_size,
+                          int head_start, int head_end) {
+
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  int packed_head_dim = head_dim / 2;
+  int num_blocks = head_dim / 8;
+  int rem = head_dim % 8;
+
+  std::vector<float> tmp_fp32(head_dim);
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    // Initialize accumulators per GQA group using AVX2
+    std::vector<__m256> sumVec(num_blocks * gqa_size, _mm256_setzero_ps());
+    std::vector<float> sumRem(gqa_size * rem, 0.0f);
+
+    int j_start = (static_cast<size_t>(row_num) < local_window_size)
+                    ? 0
+                    : row_num + 1 - static_cast<int>(local_window_size);
+
+    for (int j = j_start; j <= row_num; ++j) {
+      const uint8_t *vptr =
+        vcache_packed + (j * num_cache_head + n) * packed_head_dim;
+      float s = scales[j * num_cache_head + n];
+      float zp = zero_points[j * num_cache_head + n];
+      float qs = qjl_scales[j * num_cache_head + n];
+
+      nntrainer::unpack_and_dequantize_4bit(vptr, tmp_fp32.data(), s, zp, qs,
+                                            head_dim);
+
+      for (int h = 0; h < gqa_size; ++h) {
+        int attn_idx =
+          (static_cast<size_t>(row_num) < local_window_size
+             ? j
+             : j - (row_num + 1 - static_cast<int>(local_window_size)));
+        float a_val =
+          in[attn_idx * gqa_size * num_cache_head + n * gqa_size + h];
+        __m256 inVec = _mm256_set1_ps(a_val);
+
+        for (int b = 0; b < num_blocks; ++b) {
+          __m256 bVec = _mm256_loadu_ps(&tmp_fp32[b * 8]);
+          sumVec[h * num_blocks + b] =
+            _mm256_fmadd_ps(inVec, bVec, sumVec[h * num_blocks + b]);
+        }
+
+        int base = num_blocks * 8;
+        float *remPtr = &sumRem[h * rem];
+        for (int r = 0; r < rem; ++r) {
+          remPtr[r] += a_val * tmp_fp32[base + r];
+        }
+      }
+    }
+
+    // Store results
+    for (int h = 0; h < gqa_size; ++h) {
+      for (int b = 0; b < num_blocks; ++b) {
+        int out_base = (n * gqa_size + h) * head_dim + b * 8;
+        _mm256_storeu_ps(&output[out_base], sumVec[h * num_blocks + b]);
+      }
+
+      int base = num_blocks * 8;
+      float *remPtr = &sumRem[h * rem];
+      for (int r = 0; r < rem; ++r) {
+        output[(n * gqa_size + h) * head_dim + base + r] = remPtr[r];
       }
     }
   }

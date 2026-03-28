@@ -1,4 +1,4 @@
-fallback_headers = ['fallback_internal.h', 'fallback_kleidiai.h']
+fallback_headers = ['fallback_internal.h', 'fallback_kleidiai.h', 'turboquant_4bit.h']
 fallback_sources = ['fallback_internal.cpp', 'fallback_kleidiai.cpp']
 
 arch = host_machine.cpu_family()

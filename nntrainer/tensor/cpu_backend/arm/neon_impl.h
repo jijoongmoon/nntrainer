@@ -953,6 +953,28 @@ void compute_rotary_emb_value_uint16(unsigned int width, unsigned int dim,
                                      void *output, const float *cos_,
                                      const float *sin_,
                                      bool only_convert_to_fp16);
+
+/**
+ * @brief NEON-optimized compute_kcaches for 4-bit packed KV cache.
+ */
+void compute_kcaches_4bit(const float *in, const uint8_t *kcache_packed,
+                          float *output, int num_rows, int num_cache_head,
+                          int head_dim, int gqa_size, int tile_size,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales,
+                          size_t local_window_size = UINT_MAX,
+                          int head_start = 0, int head_end = -1);
+
+/**
+ * @brief NEON-optimized compute_vcaches for 4-bit packed value cache.
+ */
+void compute_vcaches_4bit(int row_num, const float *in,
+                          const uint8_t *vcache_packed, float *output,
+                          int num_cache_head, int gqa_size, int head_dim,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales,
+                          size_t local_window_size = UINT_MAX,
+                          int head_start = 0, int head_end = -1);
 #endif
 } // namespace nntrainer::neon
 

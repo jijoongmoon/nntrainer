@@ -542,6 +542,30 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
 #endif
 }
 
+void compute_kcaches_4bit(const float *in, const uint8_t *kcache_packed,
+                          float *output, int num_rows, int num_cache_head,
+                          int head_dim, int gqa_size, int tile_size,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales, size_t local_window_size,
+                          int head_start, int head_end) {
+  neon::compute_kcaches_4bit(in, kcache_packed, output, num_rows,
+                             num_cache_head, head_dim, gqa_size, tile_size,
+                             scales, zero_points, qjl_scales,
+                             local_window_size, head_start, head_end);
+}
+
+void compute_vcaches_4bit(int row_num, const float *in,
+                          const uint8_t *vcache_packed, float *output,
+                          int num_cache_head, int gqa_size, int head_dim,
+                          const float *scales, const float *zero_points,
+                          const float *qjl_scales, size_t local_window_size,
+                          int head_start, int head_end) {
+  neon::compute_vcaches_4bit(row_num, in, vcache_packed, output,
+                             num_cache_head, gqa_size, head_dim, scales,
+                             zero_points, qjl_scales, local_window_size,
+                             head_start, head_end);
+}
+
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                               unsigned int half_, float *inout, void *output,
                               const float *cos_, const float *sin_,
