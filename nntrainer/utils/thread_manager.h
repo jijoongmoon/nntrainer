@@ -132,20 +132,19 @@ private:
   static inline void cpuRelax() {
 #if defined(__x86_64__) || defined(_M_X64)
     __builtin_ia32_pause();
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__arm__)
     asm volatile("yield" ::: "memory");
 #endif
   }
 
-  void spinBarrier() {
+  void spinBarrier(bool sense) {
     int n_threads = spin_active_threads_.load(std::memory_order_acquire);
     int n = spin_n_barrier_.fetch_add(1, std::memory_order_acq_rel);
     if (n == n_threads - 1) {
       spin_n_barrier_.store(0, std::memory_order_release);
-      spin_barrier_sense_.store(spin_current_sense_, std::memory_order_release);
+      spin_barrier_sense_.store(sense, std::memory_order_release);
       return;
     }
-    bool sense = spin_current_sense_;
     while (spin_barrier_sense_.load(std::memory_order_acquire) != sense) {
       cpuRelax();
     }
@@ -163,7 +162,8 @@ private:
       // ── SPIN-WAIT PATH (affinity=true) ──
       spin_active_threads_.store(static_cast<int>(n_workers + 1),
                                  std::memory_order_release);
-      spin_current_sense_ = !spin_barrier_sense_.load(std::memory_order_acquire);
+      bool sense = !spin_barrier_sense_.load(std::memory_order_acquire);
+      spin_current_sense_.store(sense, std::memory_order_release);
 
       current_task_ = [&fn](size_t i) { fn(i); };
       task_end_ = end;
@@ -181,7 +181,7 @@ private:
         fn(idx);
       }
 
-      spinBarrier();
+      spinBarrier(sense);
       current_task_ = nullptr;
 
     } else {
@@ -244,7 +244,7 @@ private:
   alignas(64) std::atomic<unsigned int> spin_generation_{0};
   alignas(64) std::atomic<int> spin_n_barrier_{0};
   alignas(64) std::atomic<bool> spin_barrier_sense_{false};
-  bool spin_current_sense_{false};
+  alignas(64) std::atomic<bool> spin_current_sense_{false};
   alignas(64) std::atomic<unsigned int> spin_active_workers_{0};
   alignas(64) std::atomic<int> spin_active_threads_{1};
 

@@ -197,6 +197,7 @@ void ThreadManager::computeWorkerLoopSpin(unsigned int worker_id) {
 
     // only active workers do work + barrier
     if (worker_id < spin_active_workers_.load(std::memory_order_acquire)) {
+      bool sense = spin_current_sense_.load(std::memory_order_acquire);
       size_t end = task_end_;
       while (true) {
         size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
@@ -205,7 +206,7 @@ void ThreadManager::computeWorkerLoopSpin(unsigned int worker_id) {
         current_task_(idx);
       }
 
-      spinBarrier();
+      spinBarrier(sense);
     }
     // inactive workers loop back to generation spin
   }
