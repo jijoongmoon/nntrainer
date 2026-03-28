@@ -12,23 +12,35 @@
 
 #include <thread_manager.h>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__ANDROID__)
 #include <fstream>
-#include <pthread.h>
 #include <sched.h>
+#if !defined(__ANDROID__)
+#include <pthread.h>
+#endif
+// Fallback for old Android NDK versions that lack cpu_set_t
+// (see: https://github.com/ggml-org/llama.cpp/issues/9324)
+#if defined(__ANDROID__) && !defined(CPU_SET)
+#define CPU_SETSIZE 1024
+typedef struct { unsigned long __bits[CPU_SETSIZE / (8 * sizeof(long))]; } cpu_set_t;
+#define CPU_ZERO(set) memset((set), 0, sizeof(cpu_set_t))
+#define CPU_SET(cpu, set) ((set)->__bits[(cpu) / (8 * sizeof(long))] |= (1UL << ((cpu) % (8 * sizeof(long)))))
+#endif
 #endif
 
 namespace nntrainer {
 
-static bool pinThreadToCore(std::thread &thread, unsigned int core_id) {
-#if defined(__linux__)
+/**
+ * @brief Pin the CALLING thread to a specific CPU core.
+ * Used on Android where affinity must be set from within the target thread.
+ */
+static bool pinSelfToCore(unsigned int core_id) {
+#if defined(__linux__) || defined(__ANDROID__)
   cpu_set_t cpuset;
   CPU_ZERO(&cpuset);
   CPU_SET(core_id, &cpuset);
-  return pthread_setaffinity_np(thread.native_handle(), sizeof(cpu_set_t),
-                                &cpuset) == 0;
+  return sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == 0;
 #else
-  (void)thread;
   (void)core_id;
   return true;
 #endif
@@ -39,7 +51,7 @@ getCoresByPerformance(unsigned int hw_threads) {
   std::vector<std::pair<unsigned long, unsigned int>> freq_core;
   freq_core.reserve(hw_threads);
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__ANDROID__)
   for (unsigned int i = 0; i < hw_threads; ++i) {
     std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(i) +
                        "/cpufreq/cpuinfo_max_freq";
@@ -120,32 +132,49 @@ void ThreadManager::initialize() noexcept {
   // set mode based on affinity setting
   spin_mode_ = config.enable_affinity;
 
+  // compute core assignment map (sorted by performance for big.LITTLE)
+  std::vector<unsigned int> core_map;
+  if (config.enable_affinity) {
+    core_map = getCoresByPerformance(hw_threads);
+  }
+
   // start compute workers with appropriate loop
   compute_workers_.reserve(config.compute_threads);
   for (unsigned int i = 0; i < config.compute_threads; ++i) {
+    // core_id: skip core 0 (reserved for caller/main thread)
+    int core_id = config.enable_affinity
+                    ? static_cast<int>(core_map[(i + 1) % core_map.size()])
+                    : -1;
     if (spin_mode_) {
       compute_workers_.emplace_back(
-        [this, i] { computeWorkerLoopSpin(i); });
+        [this, i, core_id] {
+          if (core_id >= 0)
+            pinSelfToCore(static_cast<unsigned int>(core_id));
+          computeWorkerLoopSpin(i);
+        });
     } else {
       compute_workers_.emplace_back(
-        [this, i] { computeWorkerLoopCondvar(i); });
+        [this, i, core_id] {
+          if (core_id >= 0)
+            pinSelfToCore(static_cast<unsigned int>(core_id));
+          computeWorkerLoopCondvar(i);
+        });
     }
   }
 
   // start I/O workers
+  unsigned int io_core_start = config.compute_threads + 1;
   io_workers_.reserve(config.io_threads);
-  for (unsigned int i = 0; i < config.io_threads; ++i)
-    io_workers_.emplace_back([this] { ioWorkerLoop(); });
-
-  // CPU affinity (only meaningful in spin mode, but apply if requested)
-  if (config.enable_affinity) {
-    auto sorted = getCoresByPerformance(hw_threads);
-    for (unsigned int i = 0; i < compute_workers_.size(); ++i)
-      pinThreadToCore(compute_workers_[i], sorted[(i + 1) % sorted.size()]);
-    unsigned int io_start =
-      static_cast<unsigned int>(compute_workers_.size()) + 1;
-    for (unsigned int i = 0; i < io_workers_.size(); ++i)
-      pinThreadToCore(io_workers_[i], sorted[(io_start + i) % sorted.size()]);
+  for (unsigned int i = 0; i < config.io_threads; ++i) {
+    int core_id = config.enable_affinity
+                    ? static_cast<int>(
+                        core_map[(io_core_start + i) % core_map.size()])
+                    : -1;
+    io_workers_.emplace_back([this, core_id] {
+      if (core_id >= 0)
+        pinSelfToCore(static_cast<unsigned int>(core_id));
+      ioWorkerLoop();
+    });
   }
 }
 
