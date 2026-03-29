@@ -862,6 +862,274 @@ TEST(turboquant_logit_compare, v1_vs_v2_llm_distribution) {
   }
 }
 
+/**
+ * @brief Simulate Qwen3-0.6B MHA: same random weights, compare
+ *        FP32 (no quantize) vs TurboQuant v2 token-by-token.
+ *
+ *        Qwen3-0.6B: hidden=896, heads_Q=14, heads_KV=2, head_dim=64,
+ *        but we use smaller dims to keep test fast while exercising the
+ *        full incremental decoding pipeline.
+ */
+TEST(turboquant_qwen3_sim, incremental_decode_fp32_vs_v2) {
+  // Qwen3-like config (scaled down)
+  constexpr int num_heads_Q = 8;
+  constexpr int num_heads_KV = 2;
+  constexpr int head_dim = 64;
+  constexpr int gqa_size = num_heads_Q / num_heads_KV;
+  constexpr int num_tokens = 32; // simulate 32-token generation
+
+  constexpr int kv_width = num_heads_KV * head_dim;
+  constexpr int q_width = num_heads_Q * head_dim;
+  constexpr int packed_row = kv_width / 2;
+
+  std::mt19937 gen(20260329); // deterministic seed
+  std::normal_distribution<float> normal(0.0f, 0.3f);
+  std::uniform_int_distribution<int> outlier_idx(0, head_dim - 1);
+  std::uniform_real_distribution<float> outlier_val(-4.0f, 4.0f);
+
+  // Generate random sign vector (shared between quantize and compute)
+  std::vector<float> rot_signs(head_dim);
+  nntrainer::generate_random_signs(rot_signs.data(), head_dim, 0xDEADBEEF);
+
+  // Accumulators for FP32 KV cache (ground truth)
+  std::vector<float> fp32_kcache(num_tokens * kv_width);
+  std::vector<float> fp32_vcache(num_tokens * kv_width);
+
+  // TurboQuant v2 packed cache
+  std::vector<uint8_t> tq_kcache(num_tokens * packed_row);
+  std::vector<float> tq_knorms(num_tokens * num_heads_KV);
+  std::vector<uint8_t> tq_vcache(num_tokens * packed_row);
+  std::vector<float> tq_vnorms(num_tokens * num_heads_KV);
+
+  float total_cosine_sim = 0.0f;
+  float max_diff_all = 0.0f;
+  float max_rel_all = 0.0f;
+
+  std::cout << "\n=== Qwen3-like Incremental Decode: FP32 vs TurboQuant v2 ===\n"
+            << "  Config: heads_Q=" << num_heads_Q << ", heads_KV=" << num_heads_KV
+            << ", dim=" << head_dim << ", tokens=" << num_tokens << "\n"
+            << "  token  max_diff  cosine_sim  rel_err%\n";
+
+  for (int t = 0; t < num_tokens; ++t) {
+    // Generate random K, V for this token (LLM-like: normal + outliers)
+    std::vector<float> new_k(kv_width), new_v(kv_width);
+    for (auto &v : new_k) v = normal(gen);
+    for (auto &v : new_v) v = normal(gen);
+    // 5% outliers
+    for (int i = 0; i < kv_width / 20; ++i) {
+      new_k[outlier_idx(gen) % kv_width] = outlier_val(gen);
+      new_v[outlier_idx(gen) % kv_width] = outlier_val(gen);
+    }
+
+    // Store in FP32 cache
+    std::copy(new_k.begin(), new_k.end(),
+              fp32_kcache.begin() + t * kv_width);
+    std::copy(new_v.begin(), new_v.end(),
+              fp32_vcache.begin() + t * kv_width);
+
+    // Quantize into TQ v2 cache
+    nntrainer::quantize_kv_turboquant_v2(
+      new_k.data(), tq_kcache.data() + t * packed_row,
+      tq_knorms.data() + t * num_heads_KV, rot_signs.data(), head_dim,
+      num_heads_KV);
+    nntrainer::quantize_kv_turboquant_v2(
+      new_v.data(), tq_vcache.data() + t * packed_row,
+      tq_vnorms.data() + t * num_heads_KV, rot_signs.data(), head_dim,
+      num_heads_KV);
+
+    // Generate random query for this token
+    std::vector<float> query(q_width);
+    for (auto &v : query) v = normal(gen);
+
+    int num_rows = t + 1;
+
+    // ===== FP32 attention =====
+    std::vector<float> fp32_out(q_width, 0.0f);
+    fp32_reference_attention(query.data(), fp32_kcache.data(),
+                             fp32_vcache.data(), fp32_out.data(), num_rows,
+                             num_heads_Q, num_heads_KV, head_dim);
+
+    // ===== TurboQuant v2 attention =====
+    // Q * K_tq^T
+    std::vector<float> tq_scores(num_rows * num_heads_Q, 0.0f);
+    nntrainer::compute_kcaches_packed4_v2(
+      query.data(), tq_kcache.data(), tq_knorms.data(), tq_scores.data(),
+      num_rows, num_heads_KV, head_dim, gqa_size, 4, rot_signs.data());
+
+    // Softmax
+    for (int h = 0; h < num_heads_Q; ++h) {
+      float mx = -1e30f;
+      for (int r = 0; r < num_rows; ++r)
+        mx = std::max(mx, tq_scores[r * num_heads_Q + h]);
+      float se = 0;
+      for (int r = 0; r < num_rows; ++r) {
+        tq_scores[r * num_heads_Q + h] =
+          std::exp(tq_scores[r * num_heads_Q + h] - mx);
+        se += tq_scores[r * num_heads_Q + h];
+      }
+      for (int r = 0; r < num_rows; ++r)
+        tq_scores[r * num_heads_Q + h] /= se;
+    }
+
+    // Attn * V_tq
+    std::vector<float> tq_out(q_width, 0.0f);
+    nntrainer::compute_vcache_packed4_v2(
+      t, tq_scores.data(), tq_vcache.data(), tq_vnorms.data(), tq_out.data(),
+      num_heads_KV, gqa_size, head_dim, rot_signs.data());
+
+    // ===== Compare =====
+    float max_diff = 0, dot_ab = 0, dot_aa = 0, dot_bb = 0;
+    for (int i = 0; i < q_width; ++i) {
+      float diff = std::fabs(fp32_out[i] - tq_out[i]);
+      max_diff = std::max(max_diff, diff);
+      dot_ab += fp32_out[i] * tq_out[i];
+      dot_aa += fp32_out[i] * fp32_out[i];
+      dot_bb += tq_out[i] * tq_out[i];
+    }
+    float cosine = (dot_aa > 0 && dot_bb > 0)
+                     ? dot_ab / (std::sqrt(dot_aa) * std::sqrt(dot_bb))
+                     : 0.0f;
+    float max_ref = 0;
+    for (int i = 0; i < q_width; ++i)
+      max_ref = std::max(max_ref, std::fabs(fp32_out[i]));
+    float rel_err = (max_ref > 0) ? max_diff / max_ref * 100 : 0;
+
+    total_cosine_sim += cosine;
+    max_diff_all = std::max(max_diff_all, max_diff);
+    max_rel_all = std::max(max_rel_all, rel_err);
+
+    if (t < 8 || t == num_tokens - 1) {
+      printf("  %5d  %.6f  %.6f    %.2f%%\n", t, max_diff, cosine, rel_err);
+    } else if (t == 8) {
+      printf("  ...    ...\n");
+    }
+
+    // Verify no NaN/Inf
+    for (int i = 0; i < q_width; ++i) {
+      ASSERT_TRUE(std::isfinite(tq_out[i]))
+        << "Token " << t << ": non-finite at " << i;
+    }
+  }
+
+  float avg_cosine = total_cosine_sim / num_tokens;
+  std::cout << "\n  Summary over " << num_tokens << " tokens:\n"
+            << "  avg_cosine_sim = " << avg_cosine << "\n"
+            << "  max_abs_diff   = " << max_diff_all << "\n"
+            << "  max_rel_err    = " << max_rel_all << "%\n";
+
+  EXPECT_GT(avg_cosine, 0.95f)
+    << "Average cosine similarity too low: " << avg_cosine;
+  EXPECT_LT(max_rel_all, 50.0f)
+    << "Max relative error too high: " << max_rel_all << "%";
+}
+
+/**
+ * @brief Same test but with Qwen3-1.7B-like dimensions.
+ *        heads_Q=16, heads_KV=4, head_dim=128
+ */
+TEST(turboquant_qwen3_sim, qwen3_1_7b_like) {
+  constexpr int num_heads_Q = 16;
+  constexpr int num_heads_KV = 4;
+  constexpr int head_dim = 128;
+  constexpr int gqa_size = num_heads_Q / num_heads_KV;
+  constexpr int num_tokens = 64;
+
+  constexpr int kv_width = num_heads_KV * head_dim;
+  constexpr int q_width = num_heads_Q * head_dim;
+  constexpr int packed_row = kv_width / 2;
+
+  std::mt19937 gen(42);
+  std::normal_distribution<float> normal(0.0f, 0.3f);
+  std::uniform_real_distribution<float> outlier_val(-5.0f, 5.0f);
+
+  std::vector<float> rot_signs(head_dim);
+  nntrainer::generate_random_signs(rot_signs.data(), head_dim, 0xDEADBEEF);
+
+  std::vector<float> fp32_kcache(num_tokens * kv_width);
+  std::vector<float> fp32_vcache(num_tokens * kv_width);
+  std::vector<uint8_t> tq_kcache(num_tokens * packed_row);
+  std::vector<float> tq_knorms(num_tokens * num_heads_KV);
+  std::vector<uint8_t> tq_vcache(num_tokens * packed_row);
+  std::vector<float> tq_vnorms(num_tokens * num_heads_KV);
+
+  float total_cosine = 0;
+
+  for (int t = 0; t < num_tokens; ++t) {
+    std::vector<float> new_k(kv_width), new_v(kv_width);
+    for (auto &v : new_k) v = normal(gen);
+    for (auto &v : new_v) v = normal(gen);
+    for (int i = 0; i < kv_width / 20; ++i) {
+      new_k[std::abs((int)gen()) % kv_width] = outlier_val(gen);
+      new_v[std::abs((int)gen()) % kv_width] = outlier_val(gen);
+    }
+
+    std::copy(new_k.begin(), new_k.end(), fp32_kcache.begin() + t * kv_width);
+    std::copy(new_v.begin(), new_v.end(), fp32_vcache.begin() + t * kv_width);
+
+    nntrainer::quantize_kv_turboquant_v2(
+      new_k.data(), tq_kcache.data() + t * packed_row,
+      tq_knorms.data() + t * num_heads_KV, rot_signs.data(), head_dim,
+      num_heads_KV);
+    nntrainer::quantize_kv_turboquant_v2(
+      new_v.data(), tq_vcache.data() + t * packed_row,
+      tq_vnorms.data() + t * num_heads_KV, rot_signs.data(), head_dim,
+      num_heads_KV);
+
+    std::vector<float> query(q_width);
+    for (auto &v : query) v = normal(gen);
+
+    int num_rows = t + 1;
+
+    std::vector<float> fp32_out(q_width, 0.0f);
+    fp32_reference_attention(query.data(), fp32_kcache.data(),
+                             fp32_vcache.data(), fp32_out.data(), num_rows,
+                             num_heads_Q, num_heads_KV, head_dim);
+
+    std::vector<float> tq_scores(num_rows * num_heads_Q, 0.0f);
+    nntrainer::compute_kcaches_packed4_v2(
+      query.data(), tq_kcache.data(), tq_knorms.data(), tq_scores.data(),
+      num_rows, num_heads_KV, head_dim, gqa_size, 4, rot_signs.data());
+
+    for (int h = 0; h < num_heads_Q; ++h) {
+      float mx = -1e30f;
+      for (int r = 0; r < num_rows; ++r)
+        mx = std::max(mx, tq_scores[r * num_heads_Q + h]);
+      float se = 0;
+      for (int r = 0; r < num_rows; ++r) {
+        tq_scores[r * num_heads_Q + h] =
+          std::exp(tq_scores[r * num_heads_Q + h] - mx);
+        se += tq_scores[r * num_heads_Q + h];
+      }
+      for (int r = 0; r < num_rows; ++r)
+        tq_scores[r * num_heads_Q + h] /= se;
+    }
+
+    std::vector<float> tq_out(q_width, 0.0f);
+    nntrainer::compute_vcache_packed4_v2(
+      t, tq_scores.data(), tq_vcache.data(), tq_vnorms.data(), tq_out.data(),
+      num_heads_KV, gqa_size, head_dim, rot_signs.data());
+
+    float dot_ab = 0, dot_aa = 0, dot_bb = 0;
+    for (int i = 0; i < q_width; ++i) {
+      ASSERT_TRUE(std::isfinite(tq_out[i])) << "t=" << t << " i=" << i;
+      dot_ab += fp32_out[i] * tq_out[i];
+      dot_aa += fp32_out[i] * fp32_out[i];
+      dot_bb += tq_out[i] * tq_out[i];
+    }
+    float cosine = (dot_aa > 0 && dot_bb > 0)
+                     ? dot_ab / (std::sqrt(dot_aa) * std::sqrt(dot_bb))
+                     : 0.0f;
+    total_cosine += cosine;
+  }
+
+  float avg_cosine = total_cosine / num_tokens;
+  std::cout << "\n=== Qwen3-1.7B-like: " << num_tokens << " tokens ===\n"
+            << "  avg_cosine_sim = " << avg_cosine << "\n";
+
+  EXPECT_GT(avg_cosine, 0.95f)
+    << "Qwen3-1.7B cosine sim too low: " << avg_cosine;
+}
+
 GTEST_API_ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
