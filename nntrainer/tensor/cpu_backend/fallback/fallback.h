@@ -1455,5 +1455,22 @@ void compute_vcache_packed4_transposed(int row_num, const float *attn_weights,
                                        size_t local_window_size = UINT_MAX,
                                        int head_start = 0, int head_end = -1);
 
+void quantize_kv_turboquant_rotated(const float *input, size_t num_elements,
+                                    uint8_t *out_packed, float *out_scales,
+                                    const float *signs, int head_dim,
+                                    int num_heads);
+
+void compute_kcaches_packed4_rotated(
+  const float *query, const uint8_t *kcache_packed, const float *kcache_scales,
+  float *output, int num_rows, int num_cache_head, int head_dim, int gqa_size,
+  int tile_size, const float *signs, size_t local_window_size = UINT_MAX,
+  int head_start = 0, int head_end = -1);
+
+void compute_vcache_packed4_transposed_rotated(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_scales, float *output, int num_cache_head, int gqa_size,
+  int head_dim, const float *signs, size_t local_window_size = UINT_MAX,
+  int head_start = 0, int head_end = -1);
+
 #endif /* __cplusplus */
 #endif /* __FALLBACK_H__ */

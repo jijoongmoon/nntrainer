@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace nntrainer {
 
@@ -141,6 +142,76 @@ inline void quantize_and_pack_turboquant(const float *input,
  */
 inline float dequantize_turboquant(uint8_t q_val, float scale) {
   return scale * ((float)q_val - 4.0f);
+}
+
+/**
+ * @brief In-place Walsh-Hadamard Transform (WHT).
+ *        Transforms x[] of length n (must be power of 2).
+ *        Normalizes by 1/sqrt(n) so the transform is orthogonal.
+ * @param[in,out] x  data array, length n
+ * @param[in]     n  length (must be power of 2)
+ */
+inline void hadamard_transform(float *x, int n) {
+  for (int len = 1; len < n; len <<= 1) {
+    for (int i = 0; i < n; i += len << 1) {
+      for (int j = 0; j < len; ++j) {
+        float u = x[i + j];
+        float v = x[i + j + len];
+        x[i + j] = u + v;
+        x[i + j + len] = u - v;
+      }
+    }
+  }
+  float inv_sqrt_n = 1.0f / std::sqrt((float)n);
+  for (int i = 0; i < n; ++i)
+    x[i] *= inv_sqrt_n;
+}
+
+/**
+ * @brief Generate deterministic random sign vector (±1) for rotation.
+ *        Uses a simple LCG seeded by seed value.
+ * @param[out] signs  output array of +1.0f / -1.0f, length n
+ * @param[in]  n      length
+ * @param[in]  seed   seed for deterministic generation
+ */
+inline void generate_random_signs(float *signs, int n,
+                                  uint32_t seed = 0x5EED1234) {
+  uint32_t state = seed;
+  for (int i = 0; i < n; ++i) {
+    // LCG: state = state * 1664525 + 1013904223
+    state = state * 1664525u + 1013904223u;
+    signs[i] = (state & 0x80000000u) ? -1.0f : 1.0f;
+  }
+}
+
+/**
+ * @brief Apply PolarQuant rotation: R = (1/sqrt(n)) * H * D
+ *        where H = Hadamard, D = diag(random_signs).
+ *        Equivalent to: element-wise multiply by signs, then Hadamard.
+ * @param[in]  input   input vector, length n
+ * @param[out] output  rotated output, length n
+ * @param[in]  signs   random sign vector (±1), length n
+ * @param[in]  n       length (must be power of 2)
+ */
+inline void apply_rotation(const float *input, float *output,
+                           const float *signs, int n) {
+  for (int i = 0; i < n; ++i)
+    output[i] = input[i] * signs[i];
+  hadamard_transform(output, n);
+}
+
+/**
+ * @brief Apply inverse rotation: R^T = D * (1/sqrt(n)) * H
+ *        Since H is self-inverse (up to scaling, already handled),
+ *        inverse = Hadamard then multiply by signs.
+ * @param[in,out] data   data to inverse-rotate in place, length n
+ * @param[in]     signs  same random sign vector used for forward rotation
+ * @param[in]     n      length (must be power of 2)
+ */
+inline void apply_inverse_rotation(float *data, const float *signs, int n) {
+  hadamard_transform(data, n);
+  for (int i = 0; i < n; ++i)
+    data[i] *= signs[i];
 }
 
 } // namespace nntrainer

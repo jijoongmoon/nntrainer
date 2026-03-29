@@ -431,6 +431,72 @@ static void turboquant_attention(
 }
 
 /**
+ * @brief TurboQuant with PolarQuant rotation pipeline.
+ *        Rotate K/V → quantize → packed attention with rotated Q → inverse rotate output.
+ */
+static void turboquant_rotated_attention(
+  const float *query, const float *keys, const float *values, float *output,
+  int num_rows, int num_heads_Q, int num_heads_KV, int head_dim) {
+
+  int gqa_size = num_heads_Q / num_heads_KV;
+  int kv_width = num_heads_KV * head_dim;
+  int packed_row_bytes = kv_width / 2;
+  constexpr int GROUP_SIZE = 32;
+  int num_groups_per_row =
+    num_heads_KV * ((head_dim + GROUP_SIZE - 1) / GROUP_SIZE);
+
+  // Generate deterministic random signs for rotation
+  std::vector<float> signs(head_dim);
+  nntrainer::generate_random_signs(signs.data(), head_dim, 0xDEADBEEF);
+
+  // Quantize K and V with rotation into packed cache
+  std::vector<uint8_t> pk(num_rows * packed_row_bytes);
+  std::vector<float> ks(num_rows * num_groups_per_row);
+  std::vector<uint8_t> pv(num_rows * packed_row_bytes);
+  std::vector<float> vs(num_rows * num_groups_per_row);
+
+  for (int r = 0; r < num_rows; ++r) {
+    nntrainer::quantize_kv_turboquant_rotated(
+      keys + r * kv_width, kv_width,
+      pk.data() + r * packed_row_bytes,
+      ks.data() + r * num_groups_per_row,
+      signs.data(), head_dim, num_heads_KV);
+    nntrainer::quantize_kv_turboquant_rotated(
+      values + r * kv_width, kv_width,
+      pv.data() + r * packed_row_bytes,
+      vs.data() + r * num_groups_per_row,
+      signs.data(), head_dim, num_heads_KV);
+  }
+
+  // Q*K^T with rotated query
+  std::vector<float> attn(num_rows * num_heads_Q, 0.0f);
+  nntrainer::compute_kcaches_packed4_rotated(
+    query, pk.data(), ks.data(), attn.data(), num_rows, num_heads_KV, head_dim,
+    gqa_size, 4, signs.data());
+
+  // Softmax
+  for (int h = 0; h < num_heads_Q; ++h) {
+    float max_val = -1e30f;
+    for (int r = 0; r < num_rows; ++r)
+      max_val = std::max(max_val, attn[r * num_heads_Q + h]);
+    float sum_exp = 0.0f;
+    for (int r = 0; r < num_rows; ++r) {
+      attn[r * num_heads_Q + h] =
+        std::exp(attn[r * num_heads_Q + h] - max_val);
+      sum_exp += attn[r * num_heads_Q + h];
+    }
+    for (int r = 0; r < num_rows; ++r)
+      attn[r * num_heads_Q + h] /= sum_exp;
+  }
+
+  // Attn * V_rotated → inverse rotate to get final output
+  std::fill(output, output + num_heads_Q * head_dim, 0.0f);
+  nntrainer::compute_vcache_packed4_transposed_rotated(
+    num_rows - 1, attn.data(), pv.data(), vs.data(), output, num_heads_KV,
+    gqa_size, head_dim, signs.data());
+}
+
+/**
  * @brief Compare FP32 reference attention output vs TurboQuant output.
  *        Small model config for detailed per-element analysis.
  */
@@ -607,6 +673,73 @@ TEST(turboquant_logit_compare, error_vs_context_length) {
     printf("  %5d    %.6f  %.6f  %.2f%%\n", ctx, max_diff, rmse, rel);
 
     EXPECT_LT(max_diff, 0.3f) << "ctx=" << ctx << " logit diff too large";
+  }
+}
+
+/**
+ * @brief Compare: FP32 ref vs no-rotation vs with-rotation.
+ *        This is the key test showing rotation's impact.
+ */
+TEST(turboquant_logit_compare, rotation_vs_no_rotation) {
+  constexpr int num_heads_Q = 16;
+  constexpr int num_heads_KV = 4;
+  constexpr int head_dim = 128;
+
+  int q_size = num_heads_Q * head_dim;
+  int kv_width = num_heads_KV * head_dim;
+
+  std::cout << "\n=== Rotation Impact: FP32 vs NoRotation vs WithRotation ===\n"
+            << "  Config: heads_Q=16, heads_KV=4, dim=128\n"
+            << "  ctx   norot_max  norot_rmse  rot_max    rot_rmse   improvement\n";
+
+  for (int ctx : {4, 16, 64, 128, 256}) {
+    std::mt19937 gen(ctx * 13 + 7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> query(q_size);
+    std::vector<float> keys(ctx * kv_width);
+    std::vector<float> values(ctx * kv_width);
+    for (auto &v : query) v = dist(gen);
+    for (auto &v : keys) v = dist(gen);
+    for (auto &v : values) v = dist(gen);
+
+    // Add outliers to make rotation more impactful
+    for (int r = 0; r < ctx; r += 4) {
+      keys[r * kv_width] = 5.0f * dist(gen); // outlier in first dim
+      values[r * kv_width + 1] = 5.0f * dist(gen);
+    }
+
+    std::vector<float> ref_out(q_size, 0.0f);
+    std::vector<float> norot_out(q_size, 0.0f);
+    std::vector<float> rot_out(q_size, 0.0f);
+
+    fp32_reference_attention(query.data(), keys.data(), values.data(),
+                             ref_out.data(), ctx, num_heads_Q, num_heads_KV,
+                             head_dim);
+    turboquant_attention(query.data(), keys.data(), values.data(),
+                         norot_out.data(), ctx, num_heads_Q, num_heads_KV,
+                         head_dim);
+    turboquant_rotated_attention(query.data(), keys.data(), values.data(),
+                                rot_out.data(), ctx, num_heads_Q, num_heads_KV,
+                                head_dim);
+
+    float norot_max = 0, norot_sq = 0, rot_max = 0, rot_sq = 0;
+    for (int i = 0; i < q_size; ++i) {
+      float d1 = std::fabs(ref_out[i] - norot_out[i]);
+      float d2 = std::fabs(ref_out[i] - rot_out[i]);
+      norot_max = std::max(norot_max, d1);
+      rot_max = std::max(rot_max, d2);
+      norot_sq += d1 * d1;
+      rot_sq += d2 * d2;
+    }
+    float norot_rmse = std::sqrt(norot_sq / q_size);
+    float rot_rmse = std::sqrt(rot_sq / q_size);
+    float improv = (1.0f - rot_rmse / norot_rmse) * 100;
+
+    printf("  %5d  %.6f  %.6f    %.6f  %.6f   %+.1f%%\n", ctx, norot_max,
+           norot_rmse, rot_max, rot_rmse, improv);
+
+    EXPECT_TRUE(std::isfinite(rot_max)) << "ctx=" << ctx << " rotation produced non-finite";
   }
 }
 

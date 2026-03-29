@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <fallback_internal.h>
 #include <limits>
+#include <turboquant_utils.h>
 #include <vector>
 #include <q4_0_utils.h>
 #include <stdexcept>
@@ -788,6 +789,65 @@ void __fallback_compute_vcache_packed4_transposed(
       int out_base = (n * gqa_size + h) * head_dim;
       for (int d = 0; d < head_dim; ++d)
         output[out_base + d] = acc[d];
+    }
+  }
+}
+
+void __fallback_quantize_kv_turboquant_rotated(
+  const float *input, size_t num_elements, uint8_t *out_packed,
+  float *out_scales, const float *signs, int head_dim, int num_heads) {
+  std::vector<float> rotated(num_elements);
+
+  // Apply per-head rotation: for each head, multiply by signs then Hadamard
+  for (int h = 0; h < num_heads; ++h) {
+    apply_rotation(input + h * head_dim, rotated.data() + h * head_dim, signs,
+                   head_dim);
+  }
+
+  // Quantize the rotated data
+  __fallback_quantize_kv_turboquant(rotated.data(), num_elements, out_packed,
+                                    out_scales);
+}
+
+void __fallback_compute_kcaches_packed4_rotated(
+  const float *query, const uint8_t *kcache_packed, const float *kcache_scales,
+  float *output, int num_rows, int num_cache_head, int head_dim, int gqa_size,
+  int tile_size, const float *signs, size_t local_window_size, int head_start,
+  int head_end) {
+  // Rotate query per-head before dot product
+  int num_heads_Q = num_cache_head * gqa_size;
+  std::vector<float> q_rotated(num_heads_Q * head_dim);
+
+  for (int h = 0; h < num_heads_Q; ++h) {
+    apply_rotation(query + h * head_dim, q_rotated.data() + h * head_dim, signs,
+                   head_dim);
+  }
+
+  // Use existing kcaches with rotated query
+  __fallback_compute_kcaches_packed4(q_rotated.data(), kcache_packed,
+                                     kcache_scales, output, num_rows,
+                                     num_cache_head, head_dim, gqa_size,
+                                     tile_size, local_window_size, head_start,
+                                     head_end);
+}
+
+void __fallback_compute_vcache_packed4_transposed_rotated(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_scales, float *output, int num_cache_head, int gqa_size,
+  int head_dim, const float *signs, size_t local_window_size, int head_start,
+  int head_end) {
+  // Compute attn * V_rotated (same as non-rotated)
+  __fallback_compute_vcache_packed4_transposed(
+    row_num, attn_weights, vcache_packed, vcache_scales, output, num_cache_head,
+    gqa_size, head_dim, local_window_size, head_start, head_end);
+
+  // Apply inverse rotation per query-head to output
+  int actual_start = head_start;
+  int actual_end = (head_end < 0) ? num_cache_head : head_end;
+  for (int n = actual_start; n < actual_end; ++n) {
+    for (int g = 0; g < gqa_size; ++g) {
+      int qh = n * gqa_size + g;
+      apply_inverse_rotation(output + qh * head_dim, signs, head_dim);
     }
   }
 }
