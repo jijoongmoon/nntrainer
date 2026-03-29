@@ -730,10 +730,10 @@ void __fallback_compute_kcaches_packed4(
         uint8_t q0 = packed & 0x07;
         uint8_t q1 = (packed >> 4) & 0x07;
         int grp = d / GROUP_SIZE;
-        float s = scale_ptr[grp];
-        tmp_dequant[d] = s * ((float)q0 - 4.0f);
+        float sc = scale_ptr[grp];
+        tmp_dequant[d] = sc * ((float)q0 - 4.0f);
         if (d + 1 < head_dim)
-          tmp_dequant[d + 1] = s * ((float)q1 - 4.0f);
+          tmp_dequant[d + 1] = sc * ((float)q1 - 4.0f);
       }
 
       for (int g = 0; g < gqa_size; ++g) {
@@ -778,10 +778,10 @@ void __fallback_compute_vcache_packed4_transposed(
           uint8_t q0 = packed & 0x07;
           uint8_t q1 = (packed >> 4) & 0x07;
           int grp = d / GROUP_SIZE;
-          float s = scale_ptr[grp];
-          acc[d] += a_val * s * ((float)q0 - 4.0f);
+          float sc = scale_ptr[grp];
+          acc[d] += a_val * sc * ((float)q0 - 4.0f);
           if (d + 1 < head_dim)
-            acc[d + 1] += a_val * s * ((float)q1 - 4.0f);
+            acc[d + 1] += a_val * sc * ((float)q1 - 4.0f);
         }
       }
 

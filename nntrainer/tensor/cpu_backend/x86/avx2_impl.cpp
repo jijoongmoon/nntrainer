@@ -2247,10 +2247,10 @@ void compute_kcaches_packed4(const float *query, const uint8_t *kcache_packed,
         uint8_t q0 = packed & 0x07;
         uint8_t q1 = (packed >> 4) & 0x07;
         int grp = d / GROUP_SIZE;
-        float s = scale_ptr[grp];
-        tmp_dequant[d] = s * ((float)q0 - 4.0f);
+        float sc = scale_ptr[grp];
+        tmp_dequant[d] = sc * ((float)q0 - 4.0f);
         if (d + 1 < head_dim)
-          tmp_dequant[d + 1] = s * ((float)q1 - 4.0f);
+          tmp_dequant[d + 1] = sc * ((float)q1 - 4.0f);
       }
 
       // AVX2 dot product for each GQA group
@@ -2312,7 +2312,6 @@ void compute_vcache_packed4_transposed(int row_num, const float *attn_weights,
 
         for (int b = 0; b < num_blocks; ++b) {
           int d = b * 8;
-          // Dequantize 8 elements
           alignas(32) float vals[8];
           for (int k = 0; k < 8; ++k) {
             int dd = d + k;
