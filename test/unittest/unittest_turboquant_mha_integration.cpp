@@ -318,6 +318,298 @@ TEST(turboquant_integration, incremental_generation) {
             << " tokens decoded" << std::endl;
 }
 
+/**
+ * @brief FP32 reference: full attention pipeline (scalar).
+ *        Q*K^T / sqrt(d) → softmax → attn*V
+ *        No quantization. This is the ground truth.
+ */
+static void fp32_reference_attention(
+  const float *query, // [num_heads_Q * head_dim]
+  const float *keys,  // [num_rows * num_heads_KV * head_dim]
+  const float *values, // [num_rows * num_heads_KV * head_dim]
+  float *output,      // [num_heads_Q * head_dim]
+  int num_rows, int num_heads_Q, int num_heads_KV, int head_dim) {
+
+  int gqa_size = num_heads_Q / num_heads_KV;
+  float scale = 1.0f / std::sqrt((float)head_dim);
+
+  for (int n = 0; n < num_heads_KV; ++n) {
+    for (int g = 0; g < gqa_size; ++g) {
+      int qh = n * gqa_size + g; // query head index
+      const float *q = query + qh * head_dim;
+
+      // Q*K^T
+      std::vector<float> scores(num_rows);
+      for (int r = 0; r < num_rows; ++r) {
+        const float *k = keys + (r * num_heads_KV + n) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d)
+          dot += q[d] * k[d];
+        scores[r] = dot * scale;
+      }
+
+      // Softmax
+      float max_s = *std::max_element(scores.begin(), scores.end());
+      float sum_exp = 0.0f;
+      for (int r = 0; r < num_rows; ++r) {
+        scores[r] = std::exp(scores[r] - max_s);
+        sum_exp += scores[r];
+      }
+      for (int r = 0; r < num_rows; ++r)
+        scores[r] /= sum_exp;
+
+      // Attn * V
+      float *out = output + qh * head_dim;
+      std::fill(out, out + head_dim, 0.0f);
+      for (int r = 0; r < num_rows; ++r) {
+        const float *v = values + (r * num_heads_KV + n) * head_dim;
+        for (int d = 0; d < head_dim; ++d)
+          out[d] += scores[r] * v[d];
+      }
+    }
+  }
+}
+
+/**
+ * @brief TurboQuant pipeline: quantize KV → packed attention.
+ *        Same Q, K, V as reference, but K/V go through 3-bit quantization.
+ */
+static void turboquant_attention(
+  const float *query, const float *keys, const float *values, float *output,
+  int num_rows, int num_heads_Q, int num_heads_KV, int head_dim) {
+
+  int gqa_size = num_heads_Q / num_heads_KV;
+  int kv_width = num_heads_KV * head_dim;
+  int packed_row_bytes = kv_width / 2;
+  constexpr int GROUP_SIZE = 32;
+  int num_groups_per_row =
+    num_heads_KV * ((head_dim + GROUP_SIZE - 1) / GROUP_SIZE);
+
+  // Quantize K and V into packed cache
+  std::vector<uint8_t> pk(num_rows * packed_row_bytes);
+  std::vector<float> ks(num_rows * num_groups_per_row);
+  std::vector<uint8_t> pv(num_rows * packed_row_bytes);
+  std::vector<float> vs(num_rows * num_groups_per_row);
+
+  for (int r = 0; r < num_rows; ++r) {
+    nntrainer::quantize_kv_turboquant(
+      keys + r * kv_width, kv_width,
+      pk.data() + r * packed_row_bytes,
+      ks.data() + r * num_groups_per_row);
+    nntrainer::quantize_kv_turboquant(
+      values + r * kv_width, kv_width,
+      pv.data() + r * packed_row_bytes,
+      vs.data() + r * num_groups_per_row);
+  }
+
+  // Q*K^T via packed kernel
+  std::vector<float> attn(num_rows * num_heads_Q, 0.0f);
+  nntrainer::compute_kcaches_packed4(
+    query, pk.data(), ks.data(), attn.data(), num_rows, num_heads_KV, head_dim,
+    gqa_size, 4);
+
+  // Softmax (per query head)
+  for (int h = 0; h < num_heads_Q; ++h) {
+    float max_val = -1e30f;
+    for (int r = 0; r < num_rows; ++r)
+      max_val = std::max(max_val, attn[r * num_heads_Q + h]);
+    float sum_exp = 0.0f;
+    for (int r = 0; r < num_rows; ++r) {
+      attn[r * num_heads_Q + h] =
+        std::exp(attn[r * num_heads_Q + h] - max_val);
+      sum_exp += attn[r * num_heads_Q + h];
+    }
+    for (int r = 0; r < num_rows; ++r)
+      attn[r * num_heads_Q + h] /= sum_exp;
+  }
+
+  // Attn * V via packed kernel
+  std::fill(output, output + num_heads_Q * head_dim, 0.0f);
+  nntrainer::compute_vcache_packed4_transposed(
+    num_rows - 1, attn.data(), pv.data(), vs.data(), output, num_heads_KV,
+    gqa_size, head_dim);
+}
+
+/**
+ * @brief Compare FP32 reference attention output vs TurboQuant output.
+ *        Small model config for detailed per-element analysis.
+ */
+TEST(turboquant_logit_compare, small_config) {
+  constexpr int num_heads_Q = 4;
+  constexpr int num_heads_KV = 2;
+  constexpr int head_dim = 64;
+  constexpr int context_len = 16;
+
+  std::mt19937 gen(42);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+  int kv_width = num_heads_KV * head_dim;
+  int q_size = num_heads_Q * head_dim;
+
+  std::vector<float> query(q_size);
+  std::vector<float> keys(context_len * kv_width);
+  std::vector<float> values(context_len * kv_width);
+  for (auto &v : query) v = dist(gen);
+  for (auto &v : keys) v = dist(gen);
+  for (auto &v : values) v = dist(gen);
+
+  std::vector<float> ref_out(q_size, 0.0f);
+  std::vector<float> tq_out(q_size, 0.0f);
+
+  fp32_reference_attention(query.data(), keys.data(), values.data(),
+                           ref_out.data(), context_len, num_heads_Q,
+                           num_heads_KV, head_dim);
+  turboquant_attention(query.data(), keys.data(), values.data(), tq_out.data(),
+                       context_len, num_heads_Q, num_heads_KV, head_dim);
+
+  // Per-element comparison
+  float max_diff = 0, sum_diff = 0, sum_sq_diff = 0;
+  float max_ref = 0;
+  int worst_idx = -1;
+
+  for (int i = 0; i < q_size; ++i) {
+    float diff = std::fabs(ref_out[i] - tq_out[i]);
+    sum_diff += diff;
+    sum_sq_diff += diff * diff;
+    max_ref = std::max(max_ref, std::fabs(ref_out[i]));
+    if (diff > max_diff) {
+      max_diff = diff;
+      worst_idx = i;
+    }
+  }
+  float avg_diff = sum_diff / q_size;
+  float rmse = std::sqrt(sum_sq_diff / q_size);
+  float rel_max = (max_ref > 0) ? max_diff / max_ref : 0;
+
+  std::cout << "\n=== Logit Comparison: small (heads_Q=4, heads_KV=2, dim=64, ctx=16) ===\n"
+            << "  max_abs_diff   = " << max_diff << " (at index " << worst_idx << ")\n"
+            << "  avg_abs_diff   = " << avg_diff << "\n"
+            << "  rmse           = " << rmse << "\n"
+            << "  max_rel_error  = " << (rel_max * 100) << "%\n"
+            << "  max |ref|      = " << max_ref << "\n"
+            << "  ref[worst]     = " << ref_out[worst_idx]
+            << "  tq[worst]      = " << tq_out[worst_idx] << "\n";
+
+  // Per-head breakdown
+  int gqa = num_heads_Q / num_heads_KV;
+  for (int h = 0; h < num_heads_Q; ++h) {
+    float h_max = 0, h_sum = 0;
+    for (int d = 0; d < head_dim; ++d) {
+      float diff = std::fabs(ref_out[h * head_dim + d] - tq_out[h * head_dim + d]);
+      h_max = std::max(h_max, diff);
+      h_sum += diff;
+    }
+    std::cout << "  head " << h << ": max_diff=" << h_max
+              << "  avg_diff=" << (h_sum / head_dim) << "\n";
+  }
+
+  EXPECT_LT(max_diff, 0.2f) << "Small config logit diff too large";
+  EXPECT_LT(rmse, 0.05f) << "Small config RMSE too large";
+}
+
+/**
+ * @brief Compare with Qwen3-1.7B-like dimensions.
+ */
+TEST(turboquant_logit_compare, qwen3_like) {
+  constexpr int num_heads_Q = 16;
+  constexpr int num_heads_KV = 4;
+  constexpr int head_dim = 128;
+  constexpr int context_len = 64;
+
+  std::mt19937 gen(2026);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+  int kv_width = num_heads_KV * head_dim;
+  int q_size = num_heads_Q * head_dim;
+
+  std::vector<float> query(q_size);
+  std::vector<float> keys(context_len * kv_width);
+  std::vector<float> values(context_len * kv_width);
+  for (auto &v : query) v = dist(gen);
+  for (auto &v : keys) v = dist(gen);
+  for (auto &v : values) v = dist(gen);
+
+  std::vector<float> ref_out(q_size, 0.0f);
+  std::vector<float> tq_out(q_size, 0.0f);
+
+  fp32_reference_attention(query.data(), keys.data(), values.data(),
+                           ref_out.data(), context_len, num_heads_Q,
+                           num_heads_KV, head_dim);
+  turboquant_attention(query.data(), keys.data(), values.data(), tq_out.data(),
+                       context_len, num_heads_Q, num_heads_KV, head_dim);
+
+  float max_diff = 0, sum_sq = 0, max_ref = 0;
+  for (int i = 0; i < q_size; ++i) {
+    float diff = std::fabs(ref_out[i] - tq_out[i]);
+    max_diff = std::max(max_diff, diff);
+    sum_sq += diff * diff;
+    max_ref = std::max(max_ref, std::fabs(ref_out[i]));
+  }
+  float rmse = std::sqrt(sum_sq / q_size);
+  float rel_max = (max_ref > 0) ? max_diff / max_ref : 0;
+
+  std::cout << "\n=== Logit Comparison: qwen3-like (heads_Q=16, heads_KV=4, dim=128, ctx=64) ===\n"
+            << "  max_abs_diff   = " << max_diff << "\n"
+            << "  rmse           = " << rmse << "\n"
+            << "  max_rel_error  = " << (rel_max * 100) << "%\n"
+            << "  max |ref|      = " << max_ref << "\n";
+
+  EXPECT_LT(max_diff, 0.2f) << "Qwen3-like logit diff too large";
+  EXPECT_LT(rmse, 0.05f) << "Qwen3-like RMSE too large";
+}
+
+/**
+ * @brief Compare across increasing context lengths.
+ *        Shows how error scales with sequence length.
+ */
+TEST(turboquant_logit_compare, error_vs_context_length) {
+  constexpr int num_heads_Q = 8;
+  constexpr int num_heads_KV = 2;
+  constexpr int head_dim = 128;
+
+  std::cout << "\n=== Error vs Context Length (heads_Q=8, heads_KV=2, dim=128) ===\n"
+            << "  ctx_len  max_diff    rmse      rel_max%\n";
+
+  int q_size = num_heads_Q * head_dim;
+  int kv_width = num_heads_KV * head_dim;
+
+  for (int ctx : {4, 16, 64, 128, 256, 512}) {
+    std::mt19937 gen(ctx * 7 + 1);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> query(q_size);
+    std::vector<float> keys(ctx * kv_width);
+    std::vector<float> values(ctx * kv_width);
+    for (auto &v : query) v = dist(gen);
+    for (auto &v : keys) v = dist(gen);
+    for (auto &v : values) v = dist(gen);
+
+    std::vector<float> ref_out(q_size, 0.0f);
+    std::vector<float> tq_out(q_size, 0.0f);
+
+    fp32_reference_attention(query.data(), keys.data(), values.data(),
+                             ref_out.data(), ctx, num_heads_Q, num_heads_KV,
+                             head_dim);
+    turboquant_attention(query.data(), keys.data(), values.data(),
+                         tq_out.data(), ctx, num_heads_Q, num_heads_KV,
+                         head_dim);
+
+    float max_diff = 0, sum_sq = 0, max_ref = 0;
+    for (int i = 0; i < q_size; ++i) {
+      float diff = std::fabs(ref_out[i] - tq_out[i]);
+      max_diff = std::max(max_diff, diff);
+      sum_sq += diff * diff;
+      max_ref = std::max(max_ref, std::fabs(ref_out[i]));
+    }
+    float rmse = std::sqrt(sum_sq / q_size);
+    float rel = (max_ref > 0) ? max_diff / max_ref * 100 : 0;
+
+    printf("  %5d    %.6f  %.6f  %.2f%%\n", ctx, max_diff, rmse, rel);
+
+    EXPECT_LT(max_diff, 0.3f) << "ctx=" << ctx << " logit diff too large";
+  }
+}
+
 GTEST_API_ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
