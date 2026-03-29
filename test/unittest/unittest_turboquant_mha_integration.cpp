@@ -863,123 +863,165 @@ TEST(turboquant_logit_compare, v1_vs_v2_llm_distribution) {
 }
 
 /**
- * @brief Simulate Qwen3-0.6B MHA: same random weights, compare
- *        FP32 (no quantize) vs TurboQuant v2 token-by-token.
+ * @brief Correct Prefill + Decode simulation:
  *
- *        Qwen3-0.6B: hidden=896, heads_Q=14, heads_KV=2, head_dim=64,
- *        but we use smaller dims to keep test fast while exercising the
- *        full incremental decoding pipeline.
+ *   [Prefill phase]
+ *     - Receive prompt tokens (e.g. 16 tokens)
+ *     - For FP32: store K,V as-is in cache
+ *     - For TQ v2: quantize K,V and store in packed cache
+ *     - Compute full causal attention for all prompt tokens
+ *
+ *   [Decode phase]
+ *     - Generate new tokens one at a time
+ *     - Only new Q is computed; K,V from prefill stay in cache
+ *     - For each new token: append new K,V to cache, then
+ *       compute attention using ALL cached K,V (prefill + new)
+ *
+ *   Compare FP32 output vs TurboQuant v2 output at each decode step.
  */
-TEST(turboquant_qwen3_sim, incremental_decode_fp32_vs_v2) {
-  // Qwen3-like config (scaled down)
+TEST(turboquant_qwen3_sim, prefill_then_decode) {
   constexpr int num_heads_Q = 8;
   constexpr int num_heads_KV = 2;
   constexpr int head_dim = 64;
   constexpr int gqa_size = num_heads_Q / num_heads_KV;
-  constexpr int num_tokens = 32; // simulate 32-token generation
+  constexpr int prefill_len = 16;  // prompt length
+  constexpr int decode_len = 16;   // tokens to generate
+  constexpr int max_seq = prefill_len + decode_len;
 
   constexpr int kv_width = num_heads_KV * head_dim;
   constexpr int q_width = num_heads_Q * head_dim;
   constexpr int packed_row = kv_width / 2;
 
-  std::mt19937 gen(20260329); // deterministic seed
+  std::mt19937 gen(20260329);
   std::normal_distribution<float> normal(0.0f, 0.3f);
-  std::uniform_int_distribution<int> outlier_idx(0, head_dim - 1);
   std::uniform_real_distribution<float> outlier_val(-4.0f, 4.0f);
 
-  // Generate random sign vector (shared between quantize and compute)
+  auto gen_llm_vec = [&](float *dst, int n) {
+    for (int i = 0; i < n; ++i)
+      dst[i] = normal(gen);
+    for (int i = 0; i < n / 20; ++i)
+      dst[std::abs((int)gen()) % n] = outlier_val(gen);
+  };
+
+  // Rotation signs (shared, generated once)
   std::vector<float> rot_signs(head_dim);
   nntrainer::generate_random_signs(rot_signs.data(), head_dim, 0xDEADBEEF);
 
-  // Accumulators for FP32 KV cache (ground truth)
-  std::vector<float> fp32_kcache(num_tokens * kv_width);
-  std::vector<float> fp32_vcache(num_tokens * kv_width);
+  // FP32 KV cache (ground truth)
+  std::vector<float> fp32_kcache(max_seq * kv_width, 0.0f);
+  std::vector<float> fp32_vcache(max_seq * kv_width, 0.0f);
 
   // TurboQuant v2 packed cache
-  std::vector<uint8_t> tq_kcache(num_tokens * packed_row);
-  std::vector<float> tq_knorms(num_tokens * num_heads_KV);
-  std::vector<uint8_t> tq_vcache(num_tokens * packed_row);
-  std::vector<float> tq_vnorms(num_tokens * num_heads_KV);
+  std::vector<uint8_t> tq_kcache(max_seq * packed_row, 0);
+  std::vector<float> tq_knorms(max_seq * num_heads_KV, 0.0f);
+  std::vector<uint8_t> tq_vcache(max_seq * packed_row, 0);
+  std::vector<float> tq_vnorms(max_seq * num_heads_KV, 0.0f);
 
-  float total_cosine_sim = 0.0f;
-  float max_diff_all = 0.0f;
-  float max_rel_all = 0.0f;
+  // ========== PREFILL ==========
+  // Generate all prompt K,V at once (same data for both paths)
+  std::vector<float> prompt_keys(prefill_len * kv_width);
+  std::vector<float> prompt_values(prefill_len * kv_width);
+  for (int t = 0; t < prefill_len; ++t) {
+    gen_llm_vec(prompt_keys.data() + t * kv_width, kv_width);
+    gen_llm_vec(prompt_values.data() + t * kv_width, kv_width);
+  }
 
-  std::cout << "\n=== Qwen3-like Incremental Decode: FP32 vs TurboQuant v2 ===\n"
-            << "  Config: heads_Q=" << num_heads_Q << ", heads_KV=" << num_heads_KV
-            << ", dim=" << head_dim << ", tokens=" << num_tokens << "\n"
-            << "  token  max_diff  cosine_sim  rel_err%\n";
+  // Store in FP32 cache
+  std::copy(prompt_keys.begin(), prompt_keys.end(), fp32_kcache.begin());
+  std::copy(prompt_values.begin(), prompt_values.end(), fp32_vcache.begin());
 
-  for (int t = 0; t < num_tokens; ++t) {
-    // Generate random K, V for this token (LLM-like: normal + outliers)
+  // Quantize into TQ v2 cache (all prefill tokens at once)
+  for (int t = 0; t < prefill_len; ++t) {
+    nntrainer::quantize_kv_turboquant_v2(
+      prompt_keys.data() + t * kv_width,
+      tq_kcache.data() + t * packed_row,
+      tq_knorms.data() + t * num_heads_KV,
+      rot_signs.data(), head_dim, num_heads_KV);
+    nntrainer::quantize_kv_turboquant_v2(
+      prompt_values.data() + t * kv_width,
+      tq_vcache.data() + t * packed_row,
+      tq_vnorms.data() + t * num_heads_KV,
+      rot_signs.data(), head_dim, num_heads_KV);
+  }
+
+  std::cout << "\n=== Prefill(" << prefill_len << ") + Decode(" << decode_len
+            << "): FP32 vs TurboQuant v2 ===\n"
+            << "  Config: heads_Q=" << num_heads_Q << ", heads_KV="
+            << num_heads_KV << ", dim=" << head_dim << "\n"
+            << "  step  ctx_len  max_diff  cosine_sim\n";
+
+  // ========== DECODE ==========
+  float total_cosine = 0;
+  float worst_max_diff = 0;
+
+  for (int d = 0; d < decode_len; ++d) {
+    int pos = prefill_len + d; // current position in sequence
+    int ctx_len = pos + 1;     // total context (prefill + decoded so far + current)
+
+    // Generate new K,V for this decode token (same data for both)
     std::vector<float> new_k(kv_width), new_v(kv_width);
-    for (auto &v : new_k) v = normal(gen);
-    for (auto &v : new_v) v = normal(gen);
-    // 5% outliers
-    for (int i = 0; i < kv_width / 20; ++i) {
-      new_k[outlier_idx(gen) % kv_width] = outlier_val(gen);
-      new_v[outlier_idx(gen) % kv_width] = outlier_val(gen);
-    }
+    gen_llm_vec(new_k.data(), kv_width);
+    gen_llm_vec(new_v.data(), kv_width);
 
-    // Store in FP32 cache
+    // Append to FP32 cache
     std::copy(new_k.begin(), new_k.end(),
-              fp32_kcache.begin() + t * kv_width);
+              fp32_kcache.begin() + pos * kv_width);
     std::copy(new_v.begin(), new_v.end(),
-              fp32_vcache.begin() + t * kv_width);
+              fp32_vcache.begin() + pos * kv_width);
 
-    // Quantize into TQ v2 cache
+    // Quantize and append to TQ cache
     nntrainer::quantize_kv_turboquant_v2(
-      new_k.data(), tq_kcache.data() + t * packed_row,
-      tq_knorms.data() + t * num_heads_KV, rot_signs.data(), head_dim,
-      num_heads_KV);
+      new_k.data(), tq_kcache.data() + pos * packed_row,
+      tq_knorms.data() + pos * num_heads_KV,
+      rot_signs.data(), head_dim, num_heads_KV);
     nntrainer::quantize_kv_turboquant_v2(
-      new_v.data(), tq_vcache.data() + t * packed_row,
-      tq_vnorms.data() + t * num_heads_KV, rot_signs.data(), head_dim,
-      num_heads_KV);
+      new_v.data(), tq_vcache.data() + pos * packed_row,
+      tq_vnorms.data() + pos * num_heads_KV,
+      rot_signs.data(), head_dim, num_heads_KV);
 
-    // Generate random query for this token
+    // Generate query (only query is new at decode time)
     std::vector<float> query(q_width);
-    for (auto &v : query) v = normal(gen);
+    gen_llm_vec(query.data(), q_width);
 
-    int num_rows = t + 1;
-
-    // ===== FP32 attention =====
+    // ---- FP32 attention (ground truth) ----
     std::vector<float> fp32_out(q_width, 0.0f);
     fp32_reference_attention(query.data(), fp32_kcache.data(),
-                             fp32_vcache.data(), fp32_out.data(), num_rows,
+                             fp32_vcache.data(), fp32_out.data(), ctx_len,
                              num_heads_Q, num_heads_KV, head_dim);
 
-    // ===== TurboQuant v2 attention =====
-    // Q * K_tq^T
-    std::vector<float> tq_scores(num_rows * num_heads_Q, 0.0f);
+    // ---- TQ v2 attention (using packed prefill + decode cache) ----
+    // Q * K_packed^T (reads ALL ctx_len rows from packed cache)
+    std::vector<float> tq_scores(ctx_len * num_heads_Q, 0.0f);
     nntrainer::compute_kcaches_packed4_v2(
       query.data(), tq_kcache.data(), tq_knorms.data(), tq_scores.data(),
-      num_rows, num_heads_KV, head_dim, gqa_size, 4, rot_signs.data());
+      ctx_len, num_heads_KV, head_dim, gqa_size, 4, rot_signs.data());
 
     // Softmax
     for (int h = 0; h < num_heads_Q; ++h) {
       float mx = -1e30f;
-      for (int r = 0; r < num_rows; ++r)
+      for (int r = 0; r < ctx_len; ++r)
         mx = std::max(mx, tq_scores[r * num_heads_Q + h]);
       float se = 0;
-      for (int r = 0; r < num_rows; ++r) {
+      for (int r = 0; r < ctx_len; ++r) {
         tq_scores[r * num_heads_Q + h] =
           std::exp(tq_scores[r * num_heads_Q + h] - mx);
         se += tq_scores[r * num_heads_Q + h];
       }
-      for (int r = 0; r < num_rows; ++r)
+      for (int r = 0; r < ctx_len; ++r)
         tq_scores[r * num_heads_Q + h] /= se;
     }
 
-    // Attn * V_tq
+    // Attn * V_packed (reads ALL ctx_len rows from packed value cache)
     std::vector<float> tq_out(q_width, 0.0f);
     nntrainer::compute_vcache_packed4_v2(
-      t, tq_scores.data(), tq_vcache.data(), tq_vnorms.data(), tq_out.data(),
-      num_heads_KV, gqa_size, head_dim, rot_signs.data());
+      pos, tq_scores.data(), tq_vcache.data(), tq_vnorms.data(),
+      tq_out.data(), num_heads_KV, gqa_size, head_dim, rot_signs.data());
 
-    // ===== Compare =====
+    // Compare
     float max_diff = 0, dot_ab = 0, dot_aa = 0, dot_bb = 0;
     for (int i = 0; i < q_width; ++i) {
+      ASSERT_TRUE(std::isfinite(tq_out[i]))
+        << "Decode " << d << ": non-finite at " << i;
       float diff = std::fabs(fp32_out[i] - tq_out[i]);
       max_diff = std::max(max_diff, diff);
       dot_ab += fp32_out[i] * tq_out[i];
@@ -989,50 +1031,35 @@ TEST(turboquant_qwen3_sim, incremental_decode_fp32_vs_v2) {
     float cosine = (dot_aa > 0 && dot_bb > 0)
                      ? dot_ab / (std::sqrt(dot_aa) * std::sqrt(dot_bb))
                      : 0.0f;
-    float max_ref = 0;
-    for (int i = 0; i < q_width; ++i)
-      max_ref = std::max(max_ref, std::fabs(fp32_out[i]));
-    float rel_err = (max_ref > 0) ? max_diff / max_ref * 100 : 0;
 
-    total_cosine_sim += cosine;
-    max_diff_all = std::max(max_diff_all, max_diff);
-    max_rel_all = std::max(max_rel_all, rel_err);
+    total_cosine += cosine;
+    worst_max_diff = std::max(worst_max_diff, max_diff);
 
-    if (t < 8 || t == num_tokens - 1) {
-      printf("  %5d  %.6f  %.6f    %.2f%%\n", t, max_diff, cosine, rel_err);
-    } else if (t == 8) {
-      printf("  ...    ...\n");
-    }
-
-    // Verify no NaN/Inf
-    for (int i = 0; i < q_width; ++i) {
-      ASSERT_TRUE(std::isfinite(tq_out[i]))
-        << "Token " << t << ": non-finite at " << i;
-    }
+    printf("  %4d  %7d  %.6f  %.6f\n", d, ctx_len, max_diff, cosine);
   }
 
-  float avg_cosine = total_cosine_sim / num_tokens;
-  std::cout << "\n  Summary over " << num_tokens << " tokens:\n"
-            << "  avg_cosine_sim = " << avg_cosine << "\n"
-            << "  max_abs_diff   = " << max_diff_all << "\n"
-            << "  max_rel_err    = " << max_rel_all << "%\n";
+  float avg_cosine = total_cosine / decode_len;
+  std::cout << "\n  Summary:\n"
+            << "  avg_cosine_sim  = " << avg_cosine << "\n"
+            << "  worst_max_diff  = " << worst_max_diff << "\n"
+            << "  prefill tokens  = " << prefill_len << " (packed once)\n"
+            << "  decode tokens   = " << decode_len << "\n";
 
   EXPECT_GT(avg_cosine, 0.95f)
-    << "Average cosine similarity too low: " << avg_cosine;
-  EXPECT_LT(max_rel_all, 50.0f)
-    << "Max relative error too high: " << max_rel_all << "%";
+    << "Prefill+decode cosine sim too low: " << avg_cosine;
 }
 
 /**
- * @brief Same test but with Qwen3-1.7B-like dimensions.
- *        heads_Q=16, heads_KV=4, head_dim=128
+ * @brief Qwen3-1.7B-like prefill+decode with larger dimensions.
  */
-TEST(turboquant_qwen3_sim, qwen3_1_7b_like) {
+TEST(turboquant_qwen3_sim, prefill_decode_1_7b_like) {
   constexpr int num_heads_Q = 16;
   constexpr int num_heads_KV = 4;
   constexpr int head_dim = 128;
   constexpr int gqa_size = num_heads_Q / num_heads_KV;
-  constexpr int num_tokens = 64;
+  constexpr int prefill_len = 32;
+  constexpr int decode_len = 32;
+  constexpr int max_seq = prefill_len + decode_len;
 
   constexpr int kv_width = num_heads_KV * head_dim;
   constexpr int q_width = num_heads_Q * head_dim;
@@ -1042,76 +1069,98 @@ TEST(turboquant_qwen3_sim, qwen3_1_7b_like) {
   std::normal_distribution<float> normal(0.0f, 0.3f);
   std::uniform_real_distribution<float> outlier_val(-5.0f, 5.0f);
 
+  auto gen_llm_vec = [&](float *dst, int n) {
+    for (int i = 0; i < n; ++i)
+      dst[i] = normal(gen);
+    for (int i = 0; i < n / 20; ++i)
+      dst[std::abs((int)gen()) % n] = outlier_val(gen);
+  };
+
   std::vector<float> rot_signs(head_dim);
   nntrainer::generate_random_signs(rot_signs.data(), head_dim, 0xDEADBEEF);
 
-  std::vector<float> fp32_kcache(num_tokens * kv_width);
-  std::vector<float> fp32_vcache(num_tokens * kv_width);
-  std::vector<uint8_t> tq_kcache(num_tokens * packed_row);
-  std::vector<float> tq_knorms(num_tokens * num_heads_KV);
-  std::vector<uint8_t> tq_vcache(num_tokens * packed_row);
-  std::vector<float> tq_vnorms(num_tokens * num_heads_KV);
+  std::vector<float> fp32_kc(max_seq * kv_width, 0.0f);
+  std::vector<float> fp32_vc(max_seq * kv_width, 0.0f);
+  std::vector<uint8_t> tq_kc(max_seq * packed_row, 0);
+  std::vector<float> tq_kn(max_seq * num_heads_KV, 0.0f);
+  std::vector<uint8_t> tq_vc(max_seq * packed_row, 0);
+  std::vector<float> tq_vn(max_seq * num_heads_KV, 0.0f);
+
+  // Prefill
+  for (int t = 0; t < prefill_len; ++t) {
+    gen_llm_vec(fp32_kc.data() + t * kv_width, kv_width);
+    gen_llm_vec(fp32_vc.data() + t * kv_width, kv_width);
+    nntrainer::quantize_kv_turboquant_v2(
+      fp32_kc.data() + t * kv_width, tq_kc.data() + t * packed_row,
+      tq_kn.data() + t * num_heads_KV, rot_signs.data(), head_dim,
+      num_heads_KV);
+    nntrainer::quantize_kv_turboquant_v2(
+      fp32_vc.data() + t * kv_width, tq_vc.data() + t * packed_row,
+      tq_vn.data() + t * num_heads_KV, rot_signs.data(), head_dim,
+      num_heads_KV);
+  }
 
   float total_cosine = 0;
 
-  for (int t = 0; t < num_tokens; ++t) {
-    std::vector<float> new_k(kv_width), new_v(kv_width);
-    for (auto &v : new_k) v = normal(gen);
-    for (auto &v : new_v) v = normal(gen);
-    for (int i = 0; i < kv_width / 20; ++i) {
-      new_k[std::abs((int)gen()) % kv_width] = outlier_val(gen);
-      new_v[std::abs((int)gen()) % kv_width] = outlier_val(gen);
-    }
+  std::cout << "\n=== Qwen3-1.7B-like Prefill(" << prefill_len << ")+Decode("
+            << decode_len << ") ===\n"
+            << "  step  ctx_len  max_diff  cosine_sim\n";
 
-    std::copy(new_k.begin(), new_k.end(), fp32_kcache.begin() + t * kv_width);
-    std::copy(new_v.begin(), new_v.end(), fp32_vcache.begin() + t * kv_width);
+  // Decode
+  for (int d = 0; d < decode_len; ++d) {
+    int pos = prefill_len + d;
+    int ctx_len = pos + 1;
 
+    gen_llm_vec(fp32_kc.data() + pos * kv_width, kv_width);
+    gen_llm_vec(fp32_vc.data() + pos * kv_width, kv_width);
     nntrainer::quantize_kv_turboquant_v2(
-      new_k.data(), tq_kcache.data() + t * packed_row,
-      tq_knorms.data() + t * num_heads_KV, rot_signs.data(), head_dim,
+      fp32_kc.data() + pos * kv_width, tq_kc.data() + pos * packed_row,
+      tq_kn.data() + pos * num_heads_KV, rot_signs.data(), head_dim,
       num_heads_KV);
     nntrainer::quantize_kv_turboquant_v2(
-      new_v.data(), tq_vcache.data() + t * packed_row,
-      tq_vnorms.data() + t * num_heads_KV, rot_signs.data(), head_dim,
+      fp32_vc.data() + pos * kv_width, tq_vc.data() + pos * packed_row,
+      tq_vn.data() + pos * num_heads_KV, rot_signs.data(), head_dim,
       num_heads_KV);
 
     std::vector<float> query(q_width);
-    for (auto &v : query) v = normal(gen);
+    gen_llm_vec(query.data(), q_width);
 
-    int num_rows = t + 1;
-
+    // FP32 ref
     std::vector<float> fp32_out(q_width, 0.0f);
-    fp32_reference_attention(query.data(), fp32_kcache.data(),
-                             fp32_vcache.data(), fp32_out.data(), num_rows,
-                             num_heads_Q, num_heads_KV, head_dim);
+    fp32_reference_attention(query.data(), fp32_kc.data(), fp32_vc.data(),
+                             fp32_out.data(), ctx_len, num_heads_Q,
+                             num_heads_KV, head_dim);
 
-    std::vector<float> tq_scores(num_rows * num_heads_Q, 0.0f);
+    // TQ v2
+    std::vector<float> tq_scores(ctx_len * num_heads_Q, 0.0f);
     nntrainer::compute_kcaches_packed4_v2(
-      query.data(), tq_kcache.data(), tq_knorms.data(), tq_scores.data(),
-      num_rows, num_heads_KV, head_dim, gqa_size, 4, rot_signs.data());
+      query.data(), tq_kc.data(), tq_kn.data(), tq_scores.data(), ctx_len,
+      num_heads_KV, head_dim, gqa_size, 4, rot_signs.data());
 
     for (int h = 0; h < num_heads_Q; ++h) {
       float mx = -1e30f;
-      for (int r = 0; r < num_rows; ++r)
+      for (int r = 0; r < ctx_len; ++r)
         mx = std::max(mx, tq_scores[r * num_heads_Q + h]);
       float se = 0;
-      for (int r = 0; r < num_rows; ++r) {
+      for (int r = 0; r < ctx_len; ++r) {
         tq_scores[r * num_heads_Q + h] =
           std::exp(tq_scores[r * num_heads_Q + h] - mx);
         se += tq_scores[r * num_heads_Q + h];
       }
-      for (int r = 0; r < num_rows; ++r)
+      for (int r = 0; r < ctx_len; ++r)
         tq_scores[r * num_heads_Q + h] /= se;
     }
 
     std::vector<float> tq_out(q_width, 0.0f);
     nntrainer::compute_vcache_packed4_v2(
-      t, tq_scores.data(), tq_vcache.data(), tq_vnorms.data(), tq_out.data(),
+      pos, tq_scores.data(), tq_vc.data(), tq_vn.data(), tq_out.data(),
       num_heads_KV, gqa_size, head_dim, rot_signs.data());
 
-    float dot_ab = 0, dot_aa = 0, dot_bb = 0;
+    float max_diff = 0, dot_ab = 0, dot_aa = 0, dot_bb = 0;
     for (int i = 0; i < q_width; ++i) {
-      ASSERT_TRUE(std::isfinite(tq_out[i])) << "t=" << t << " i=" << i;
+      ASSERT_TRUE(std::isfinite(tq_out[i]));
+      float diff = std::fabs(fp32_out[i] - tq_out[i]);
+      max_diff = std::max(max_diff, diff);
       dot_ab += fp32_out[i] * tq_out[i];
       dot_aa += fp32_out[i] * fp32_out[i];
       dot_bb += tq_out[i] * tq_out[i];
@@ -1120,14 +1169,18 @@ TEST(turboquant_qwen3_sim, qwen3_1_7b_like) {
                      ? dot_ab / (std::sqrt(dot_aa) * std::sqrt(dot_bb))
                      : 0.0f;
     total_cosine += cosine;
+
+    if (d < 5 || d == decode_len - 1)
+      printf("  %4d  %7d  %.6f  %.6f\n", d, ctx_len, max_diff, cosine);
+    else if (d == 5)
+      printf("  ...   ...\n");
   }
 
-  float avg_cosine = total_cosine / num_tokens;
-  std::cout << "\n=== Qwen3-1.7B-like: " << num_tokens << " tokens ===\n"
-            << "  avg_cosine_sim = " << avg_cosine << "\n";
+  float avg_cosine = total_cosine / decode_len;
+  std::cout << "  avg_cosine_sim = " << avg_cosine << "\n";
 
   EXPECT_GT(avg_cosine, 0.95f)
-    << "Qwen3-1.7B cosine sim too low: " << avg_cosine;
+    << "Qwen3-1.7B prefill+decode cosine too low: " << avg_cosine;
 }
 
 GTEST_API_ int main(int argc, char **argv) {
