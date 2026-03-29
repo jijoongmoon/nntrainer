@@ -2176,15 +2176,12 @@ void quantize_kv_turboquant(const float *input, size_t num_elements,
       __m256 av = _mm256_and_ps(v, sign_mask);
       vmax = _mm256_max_ps(vmax, av);
     }
-    float absmax = hsum_avx(_mm256_max_ps(vmax, _mm256_permute2f128_ps(
-                                                   vmax, vmax, 0x01)));
-    // hsum_avx gives sum not max; do it properly
-    alignas(32) float tmp[8];
-    _mm256_store_ps(tmp, vmax);
-    absmax = 0.0f;
-    for (int k = 0; k < 8; ++k)
-      if (tmp[k] > absmax)
-        absmax = tmp[k];
+    // Horizontal max: reduce 8-wide vmax to scalar
+    __m256 vmax_hi = _mm256_permute2f128_ps(vmax, vmax, 0x01);
+    vmax = _mm256_max_ps(vmax, vmax_hi);
+    vmax = _mm256_max_ps(vmax, _mm256_shuffle_ps(vmax, vmax, 0x4E));
+    vmax = _mm256_max_ps(vmax, _mm256_shuffle_ps(vmax, vmax, 0xB1));
+    float absmax = _mm_cvtss_f32(_mm256_castps256_ps128(vmax));
     for (; i < count; ++i) {
       float av = std::fabs(input[start + i]);
       if (av > absmax)

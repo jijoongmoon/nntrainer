@@ -431,13 +431,42 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(),
         true);
       nntrainer::Tensor cache_value_nth_step =
-        cache_key.getSharedDataTensor(cache_value_step_dim,
-                                      batch * cache_value_dim.getFeatureLen() +
-                                        from * cache_value_dim.width(),
-                                      true);
+        cache_value.getSharedDataTensor(cache_value_step_dim,
+                                        batch * cache_value_dim.getFeatureLen() +
+                                          from * cache_value_dim.width(),
+                                        true);
 
       cache_key_nth_step.copyData(cache_key_0_step);
-      cache_key_nth_step.copyData(cache_value_0_step);
+      cache_value_nth_step.copyData(cache_value_0_step);
+    }
+
+    // Replicate scale tensors across batches for turboquant path
+    if (use_turboquant) {
+      nntrainer::Tensor &cache_key_scales =
+        context.getTensor(tensor_idx[AttentionParams::cache_key_scales]);
+      nntrainer::Tensor &cache_value_scales =
+        context.getTensor(tensor_idx[AttentionParams::cache_value_scales]);
+
+      ml::train::TensorDim ks_dim = cache_key_scales.getDim();
+      ml::train::TensorDim vs_dim = cache_value_scales.getDim();
+      ml::train::TensorDim ks_step_dim = get_step_dim(ks_dim);
+      ml::train::TensorDim vs_step_dim = get_step_dim(vs_dim);
+
+      nntrainer::Tensor ks_0 =
+        cache_key_scales.getSharedDataTensor(ks_step_dim, 0, true);
+      nntrainer::Tensor vs_0 =
+        cache_value_scales.getSharedDataTensor(vs_step_dim, 0, true);
+
+      for (unsigned int batch = 1; batch < batch_size; ++batch) {
+        nntrainer::Tensor ks_nth = cache_key_scales.getSharedDataTensor(
+          ks_step_dim,
+          batch * ks_dim.getFeatureLen() + from * ks_dim.width(), true);
+        nntrainer::Tensor vs_nth = cache_value_scales.getSharedDataTensor(
+          vs_step_dim,
+          batch * vs_dim.getFeatureLen() + from * vs_dim.width(), true);
+        ks_nth.copyData(ks_0);
+        vs_nth.copyData(vs_0);
+      }
     }
   }
 }
@@ -788,6 +817,7 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
 
     nntrainer::Tensor out_(1, 1, row_to_compute, num_heads_Q,
                            query_step.getTensorType());
+    out_.setZero();
 
     const float *q_data = query_step.getData<float>();
     const uint8_t *kc_packed =
@@ -883,7 +913,7 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
           start_idx = i * to;
         }
         const float *input =
-          out_.getData<float>() + start_idx * num_heads_Q * gqa_size;
+          out_.getData<float>() + start_idx * num_heads_Q;
         float *out = attention_output_step.getData<float>() +
                      i * (num_heads_KV * gqa_size * head_dim);
 

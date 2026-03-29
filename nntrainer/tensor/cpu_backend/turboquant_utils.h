@@ -119,7 +119,7 @@ inline void quantize_and_pack_turboquant(const float *input,
       uint8_t q0 = quantize_one(input[i]);
       uint8_t s0 = (input[i] >= 0.0f) ? 1 : 0; // QJL sign: 1=positive
 
-      uint8_t q1 = 0, s1 = 0;
+      uint8_t q1 = 4, s1 = 1; // neutral defaults: zero_point=4, sign=positive
       if (i + 1 < end) {
         q1 = quantize_one(input[i + 1]);
         s1 = (input[i + 1] >= 0.0f) ? 1 : 0;
