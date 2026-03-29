@@ -90,6 +90,7 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
     withKey("rope_theta", ROPE_THETA),
     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+    withKey("use_turboquant", USE_TURBOQUANT ? "true" : "false"),
     withKey("input_layers", {Q_norm, K_norm, V})};
   layers.push_back(createLayer("mha_core", a_params));
 

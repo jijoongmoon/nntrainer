@@ -110,6 +110,10 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
     IS_CAUSAL = !cfg["use_bidirectional_attention"].get<bool>();
   }
 
+  if (nntr_cfg.contains("use_turboquant")) {
+    USE_TURBOQUANT = nntr_cfg["use_turboquant"].get<bool>();
+  }
+
   NUM_VOCAB = cfg["vocab_size"];
   DIM = cfg["hidden_size"];
   INTERMEDIATE_SIZE = cfg["intermediate_size"];
