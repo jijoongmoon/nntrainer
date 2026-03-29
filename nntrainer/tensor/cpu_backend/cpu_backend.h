@@ -1593,5 +1593,38 @@ extern void compute_vcache_packed4_transposed_rotated(
   int head_dim, const float *signs, size_t local_window_size = UINT_MAX,
   int head_start = 0, int head_end = -1);
 
+/**
+ * @brief TurboQuant v2: norm-normalized + rotated + Lloyd-Max quantize per head.
+ * @param[in]  input        FP32 input (num_heads * head_dim elements)
+ * @param[out] out_packed   4-bit packed output (num_heads * head_dim / 2 bytes)
+ * @param[out] out_norms    per-head L2 norms (num_heads floats)
+ * @param[in]  rot_signs    random sign vector for rotation (head_dim elements)
+ * @param[in]  head_dim     dimension per head (power of 2)
+ * @param[in]  num_heads    number of heads
+ */
+extern void quantize_kv_turboquant_v2(const float *input, uint8_t *out_packed,
+                                      float *out_norms, const float *rot_signs,
+                                      int head_dim, int num_heads);
+
+/**
+ * @brief Compute Q*K^T with TurboQuant v2 packed key cache.
+ *        Dequantizes via centroid lookup + inverse rotation + norm rescale,
+ *        then dot product with query.
+ */
+extern void compute_kcaches_packed4_v2(
+  const float *query, const uint8_t *kcache_packed, const float *kcache_norms,
+  float *output, int num_rows, int num_cache_head, int head_dim, int gqa_size,
+  int tile_size, const float *rot_signs, size_t local_window_size = UINT_MAX,
+  int head_start = 0, int head_end = -1);
+
+/**
+ * @brief Compute attention-weighted V aggregation with TurboQuant v2.
+ */
+extern void compute_vcache_packed4_v2(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_norms, float *output, int num_cache_head, int gqa_size,
+  int head_dim, const float *rot_signs, size_t local_window_size = UINT_MAX,
+  int head_start = 0, int head_end = -1);
+
 #endif
 #endif

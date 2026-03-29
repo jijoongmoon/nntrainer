@@ -431,10 +431,9 @@ static void turboquant_attention(
 }
 
 /**
- * @brief TurboQuant with PolarQuant rotation pipeline.
- *        Rotate K/V → quantize → packed attention with rotated Q → inverse rotate output.
+ * @brief TurboQuant with PolarQuant rotation pipeline (v1 rotation variant).
  */
-static void turboquant_rotated_attention(
+[[maybe_unused]] static void turboquant_rotated_attention(
   const float *query, const float *keys, const float *values, float *output,
   int num_rows, int num_heads_Q, int num_heads_KV, int head_dim) {
 
@@ -677,10 +676,70 @@ TEST(turboquant_logit_compare, error_vs_context_length) {
 }
 
 /**
- * @brief Compare: FP32 ref vs no-rotation vs with-rotation.
- *        This is the key test showing rotation's impact.
+ * @brief TurboQuant v2 pipeline: norm + rotation + Lloyd-Max codebook.
+ *        Paper Algorithm 1 (MSE-optimal).
  */
-TEST(turboquant_logit_compare, rotation_vs_no_rotation) {
+static void turboquant_v2_attention(
+  const float *query, const float *keys, const float *values, float *output,
+  int num_rows, int num_heads_Q, int num_heads_KV, int head_dim) {
+
+  int gqa_size = num_heads_Q / num_heads_KV;
+  int kv_width = num_heads_KV * head_dim;
+  int packed_row_bytes = kv_width / 2;
+
+  std::vector<float> rot_signs(head_dim);
+  nntrainer::generate_random_signs(rot_signs.data(), head_dim, 0xDEADBEEF);
+
+  // Quantize K and V with v2 (norm + rotation + Lloyd-Max)
+  std::vector<uint8_t> pk(num_rows * packed_row_bytes);
+  std::vector<float> k_norms(num_rows * num_heads_KV);
+  std::vector<uint8_t> pv(num_rows * packed_row_bytes);
+  std::vector<float> v_norms(num_rows * num_heads_KV);
+
+  for (int r = 0; r < num_rows; ++r) {
+    nntrainer::quantize_kv_turboquant_v2(
+      keys + r * kv_width, pk.data() + r * packed_row_bytes,
+      k_norms.data() + r * num_heads_KV, rot_signs.data(), head_dim,
+      num_heads_KV);
+    nntrainer::quantize_kv_turboquant_v2(
+      values + r * kv_width, pv.data() + r * packed_row_bytes,
+      v_norms.data() + r * num_heads_KV, rot_signs.data(), head_dim,
+      num_heads_KV);
+  }
+
+  // Q*K^T
+  std::vector<float> attn(num_rows * num_heads_Q, 0.0f);
+  nntrainer::compute_kcaches_packed4_v2(
+    query, pk.data(), k_norms.data(), attn.data(), num_rows, num_heads_KV,
+    head_dim, gqa_size, 4, rot_signs.data());
+
+  // Softmax
+  for (int h = 0; h < num_heads_Q; ++h) {
+    float max_val = -1e30f;
+    for (int r = 0; r < num_rows; ++r)
+      max_val = std::max(max_val, attn[r * num_heads_Q + h]);
+    float sum_exp = 0.0f;
+    for (int r = 0; r < num_rows; ++r) {
+      attn[r * num_heads_Q + h] =
+        std::exp(attn[r * num_heads_Q + h] - max_val);
+      sum_exp += attn[r * num_heads_Q + h];
+    }
+    for (int r = 0; r < num_rows; ++r)
+      attn[r * num_heads_Q + h] /= sum_exp;
+  }
+
+  // Attn * V
+  std::fill(output, output + num_heads_Q * head_dim, 0.0f);
+  nntrainer::compute_vcache_packed4_v2(
+    num_rows - 1, attn.data(), pv.data(), v_norms.data(), output, num_heads_KV,
+    gqa_size, head_dim, rot_signs.data());
+}
+
+/**
+ * @brief Compare all three: v1 (uniform quant) vs v2 (Lloyd-Max + norm + rot)
+ *        vs FP32 reference.
+ */
+TEST(turboquant_logit_compare, v1_vs_v2_vs_fp32) {
   constexpr int num_heads_Q = 16;
   constexpr int num_heads_KV = 4;
   constexpr int head_dim = 128;
@@ -688,58 +747,118 @@ TEST(turboquant_logit_compare, rotation_vs_no_rotation) {
   int q_size = num_heads_Q * head_dim;
   int kv_width = num_heads_KV * head_dim;
 
-  std::cout << "\n=== Rotation Impact: FP32 vs NoRotation vs WithRotation ===\n"
+  std::cout << "\n=== v1 (uniform) vs v2 (Lloyd-Max+norm+rot) vs FP32 ===\n"
             << "  Config: heads_Q=16, heads_KV=4, dim=128\n"
-            << "  ctx   norot_max  norot_rmse  rot_max    rot_rmse   improvement\n";
+            << "  ctx    v1_max     v1_rmse    v2_max     v2_rmse    improvement\n";
 
   for (int ctx : {4, 16, 64, 128, 256}) {
     std::mt19937 gen(ctx * 13 + 7);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
-    std::vector<float> query(q_size);
-    std::vector<float> keys(ctx * kv_width);
-    std::vector<float> values(ctx * kv_width);
+    std::vector<float> query(q_size), keys(ctx * kv_width),
+      values(ctx * kv_width);
     for (auto &v : query) v = dist(gen);
     for (auto &v : keys) v = dist(gen);
     for (auto &v : values) v = dist(gen);
 
-    // Add outliers to make rotation more impactful
-    for (int r = 0; r < ctx; r += 4) {
-      keys[r * kv_width] = 5.0f * dist(gen); // outlier in first dim
-      values[r * kv_width + 1] = 5.0f * dist(gen);
-    }
-
     std::vector<float> ref_out(q_size, 0.0f);
-    std::vector<float> norot_out(q_size, 0.0f);
-    std::vector<float> rot_out(q_size, 0.0f);
+    std::vector<float> v1_out(q_size, 0.0f);
+    std::vector<float> v2_out(q_size, 0.0f);
 
     fp32_reference_attention(query.data(), keys.data(), values.data(),
                              ref_out.data(), ctx, num_heads_Q, num_heads_KV,
                              head_dim);
     turboquant_attention(query.data(), keys.data(), values.data(),
-                         norot_out.data(), ctx, num_heads_Q, num_heads_KV,
+                         v1_out.data(), ctx, num_heads_Q, num_heads_KV,
                          head_dim);
-    turboquant_rotated_attention(query.data(), keys.data(), values.data(),
-                                rot_out.data(), ctx, num_heads_Q, num_heads_KV,
-                                head_dim);
+    turboquant_v2_attention(query.data(), keys.data(), values.data(),
+                            v2_out.data(), ctx, num_heads_Q, num_heads_KV,
+                            head_dim);
 
-    float norot_max = 0, norot_sq = 0, rot_max = 0, rot_sq = 0;
+    float v1_max = 0, v1_sq = 0, v2_max = 0, v2_sq = 0;
     for (int i = 0; i < q_size; ++i) {
-      float d1 = std::fabs(ref_out[i] - norot_out[i]);
-      float d2 = std::fabs(ref_out[i] - rot_out[i]);
-      norot_max = std::max(norot_max, d1);
-      rot_max = std::max(rot_max, d2);
-      norot_sq += d1 * d1;
-      rot_sq += d2 * d2;
+      float d1 = std::fabs(ref_out[i] - v1_out[i]);
+      float d2 = std::fabs(ref_out[i] - v2_out[i]);
+      v1_max = std::max(v1_max, d1);
+      v2_max = std::max(v2_max, d2);
+      v1_sq += d1 * d1;
+      v2_sq += d2 * d2;
     }
-    float norot_rmse = std::sqrt(norot_sq / q_size);
-    float rot_rmse = std::sqrt(rot_sq / q_size);
-    float improv = (1.0f - rot_rmse / norot_rmse) * 100;
+    float v1_rmse = std::sqrt(v1_sq / q_size);
+    float v2_rmse = std::sqrt(v2_sq / q_size);
+    float improv = (1.0f - v2_rmse / v1_rmse) * 100;
 
-    printf("  %5d  %.6f  %.6f    %.6f  %.6f   %+.1f%%\n", ctx, norot_max,
-           norot_rmse, rot_max, rot_rmse, improv);
+    printf("  %5d  %.6f  %.6f   %.6f  %.6f   %+.1f%%\n", ctx, v1_max,
+           v1_rmse, v2_max, v2_rmse, improv);
 
-    EXPECT_TRUE(std::isfinite(rot_max)) << "ctx=" << ctx << " rotation produced non-finite";
+    EXPECT_TRUE(std::isfinite(v2_max))
+      << "ctx=" << ctx << " v2 produced non-finite";
+  }
+}
+
+/**
+ * @brief Test with LLM-like activation distribution (normal + outliers).
+ *        This is where rotation + Lloyd-Max should shine.
+ */
+TEST(turboquant_logit_compare, v1_vs_v2_llm_distribution) {
+  constexpr int num_heads_Q = 16;
+  constexpr int num_heads_KV = 4;
+  constexpr int head_dim = 128;
+
+  int q_size = num_heads_Q * head_dim;
+  int kv_width = num_heads_KV * head_dim;
+
+  auto gen_llm_data = [](float *data, int n, std::mt19937 &gen) {
+    std::normal_distribution<float> normal(0.0f, 0.3f);
+    std::uniform_int_distribution<int> idx_dist(0, n - 1);
+    std::uniform_real_distribution<float> outlier(-5.0f, 5.0f);
+    for (int i = 0; i < n; ++i)
+      data[i] = normal(gen);
+    for (int i = 0; i < n / 20; ++i) // 5% outliers
+      data[idx_dist(gen)] = outlier(gen);
+  };
+
+  std::cout
+    << "\n=== LLM-like distribution: v1 vs v2 vs FP32 ===\n"
+    << "  (normal σ=0.3 + 5% outliers in [-5,5])\n"
+    << "  ctx    v1_max     v1_rmse    v2_max     v2_rmse    improvement\n";
+
+  for (int ctx : {16, 64, 128, 256}) {
+    std::mt19937 gen(ctx * 31 + 5);
+    std::vector<float> query(q_size), keys(ctx * kv_width),
+      values(ctx * kv_width);
+    gen_llm_data(query.data(), q_size, gen);
+    gen_llm_data(keys.data(), ctx * kv_width, gen);
+    gen_llm_data(values.data(), ctx * kv_width, gen);
+
+    std::vector<float> ref_out(q_size, 0.0f), v1_out(q_size, 0.0f),
+      v2_out(q_size, 0.0f);
+
+    fp32_reference_attention(query.data(), keys.data(), values.data(),
+                             ref_out.data(), ctx, num_heads_Q, num_heads_KV,
+                             head_dim);
+    turboquant_attention(query.data(), keys.data(), values.data(),
+                         v1_out.data(), ctx, num_heads_Q, num_heads_KV,
+                         head_dim);
+    turboquant_v2_attention(query.data(), keys.data(), values.data(),
+                            v2_out.data(), ctx, num_heads_Q, num_heads_KV,
+                            head_dim);
+
+    float v1_max = 0, v1_sq = 0, v2_max = 0, v2_sq = 0;
+    for (int i = 0; i < q_size; ++i) {
+      float d1 = std::fabs(ref_out[i] - v1_out[i]);
+      float d2 = std::fabs(ref_out[i] - v2_out[i]);
+      v1_max = std::max(v1_max, d1);
+      v2_max = std::max(v2_max, d2);
+      v1_sq += d1 * d1;
+      v2_sq += d2 * d2;
+    }
+    float v1_rmse = std::sqrt(v1_sq / q_size);
+    float v2_rmse = std::sqrt(v2_sq / q_size);
+    float improv = (1.0f - v2_rmse / v1_rmse) * 100;
+
+    printf("  %5d  %.6f  %.6f   %.6f  %.6f   %+.1f%%\n", ctx, v1_max,
+           v1_rmse, v2_max, v2_rmse, improv);
   }
 }
 
