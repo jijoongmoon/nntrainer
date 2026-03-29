@@ -147,10 +147,9 @@ TEST(turboquant_utils, quantize_roundtrip_error_bound) {
     max_err = std::max(max_err, std::max(err0, err1));
   }
 
-  // With 3-bit quantization (8 levels) and range [-3,3],
-  // max quantization step = absmax/3, so max error ~ absmax/6 ~ 0.5
-  // Allow some tolerance
-  EXPECT_LT(max_err, 1.0f) << "Quantization error too large: " << max_err;
+  // 3-bit quantization: scale = absmax/3, max per-element error = scale/2
+  // For input range [-3,3]: absmax~3, error bound = 3/6 = 0.5
+  EXPECT_LT(max_err, 0.55f) << "Quantization error too large: " << max_err;
 }
 
 /**
@@ -242,9 +241,10 @@ TEST(turboquant_compute, kcaches_packed4_vs_fp32_reference) {
     max_diff = std::max(max_diff, diff);
   }
 
-  // With 3-bit quantization, expect roughly ~10-20% relative error
-  // on dot products. Absolute tolerance depends on scale.
-  EXPECT_LT(max_diff, 0.5f)
+  // Dot product error: per-element errors cancel out over head_dim summation.
+  // Expected bound ~ absmax / (6 * sqrt(head_dim)) ≈ 0.03 for dim=32.
+  // Use 0.15 with margin for statistical variation.
+  EXPECT_LT(max_diff, 0.15f)
     << "compute_kcaches_packed4 error too large: " << max_diff;
 }
 
@@ -350,7 +350,9 @@ TEST(turboquant_compute, vcache_packed4_transposed_vs_fp32_reference) {
     max_diff = std::max(max_diff, diff);
   }
 
-  EXPECT_LT(max_diff, 0.5f)
+  // Weighted sum error: attn_weights sum to 1, so error bounded by
+  // max per-element quant error ≈ absmax/6 ≈ 0.167 for inputs in [-1,1].
+  EXPECT_LT(max_diff, 0.2f)
     << "compute_vcache_packed4_transposed error too large: " << max_diff;
 }
 
@@ -454,7 +456,9 @@ TEST(turboquant_compute, kcaches_packed4_large_head_dim) {
     max_diff = std::max(max_diff, diff);
   }
 
-  EXPECT_LT(max_diff, 0.5f)
+  // Larger head_dim → more cancellation → tighter bound.
+  // Expected ~ absmax / (6 * sqrt(128)) ≈ 0.015 for dim=128.
+  EXPECT_LT(max_diff, 0.05f)
     << "Large head_dim kcaches error too large: " << max_diff;
 }
 
