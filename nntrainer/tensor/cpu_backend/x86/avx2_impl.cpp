@@ -2151,4 +2151,204 @@ void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
   }
 }
 
+/***********************************************************************
+ * TurboQuant 4-bit packed KV cache operations (AVX2)
+ ***********************************************************************/
+
+void quantize_kv_turboquant(const float *input, size_t num_elements,
+                            uint8_t *out_packed, float *out_scales) {
+  constexpr int GROUP_SIZE = 32;
+  int num_groups = (num_elements + GROUP_SIZE - 1) / GROUP_SIZE;
+
+  for (int g = 0; g < num_groups; ++g) {
+    size_t start = g * GROUP_SIZE;
+    size_t end = start + GROUP_SIZE;
+    if (end > num_elements)
+      end = num_elements;
+    size_t count = end - start;
+
+    // Compute absmax using AVX2 (8-wide)
+    __m256 vmax = _mm256_setzero_ps();
+    const __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+      __m256 v = _mm256_loadu_ps(input + start + i);
+      __m256 av = _mm256_and_ps(v, sign_mask);
+      vmax = _mm256_max_ps(vmax, av);
+    }
+    float absmax = hsum_avx(_mm256_max_ps(vmax, _mm256_permute2f128_ps(
+                                                   vmax, vmax, 0x01)));
+    // hsum_avx gives sum not max; do it properly
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, vmax);
+    absmax = 0.0f;
+    for (int k = 0; k < 8; ++k)
+      if (tmp[k] > absmax)
+        absmax = tmp[k];
+    for (; i < count; ++i) {
+      float av = std::fabs(input[start + i]);
+      if (av > absmax)
+        absmax = av;
+    }
+
+    float scale = (absmax > 0.0f) ? (absmax / 3.0f) : 1.0f;
+    out_scales[g] = scale;
+    float inv_scale = 1.0f / scale;
+
+    for (size_t j = 0; j < count; j += 2) {
+      size_t idx = start + j;
+      float v0 = input[idx];
+      int q0 = (int)std::round(v0 * inv_scale) + 4;
+      q0 = std::max(0, std::min(7, q0));
+      uint8_t s0 = (v0 >= 0.0f) ? 1 : 0;
+
+      uint8_t q1_val = 4, s1 = 1;
+      if (j + 1 < count) {
+        float v1 = input[idx + 1];
+        int q1 = (int)std::round(v1 * inv_scale) + 4;
+        q1 = std::max(0, std::min(7, q1));
+        q1_val = (uint8_t)q1;
+        s1 = (v1 >= 0.0f) ? 1 : 0;
+      }
+
+      uint8_t elem0 = ((uint8_t)q0 & 0x07) | ((s0 & 0x01) << 3);
+      uint8_t elem1 = (q1_val & 0x07) | ((s1 & 0x01) << 3);
+      out_packed[idx / 2] = (elem1 << 4) | elem0;
+    }
+  }
+}
+
+void compute_kcaches_packed4(const float *query, const uint8_t *kcache_packed,
+                             const float *kcache_scales, float *output,
+                             int num_rows, int num_cache_head, int head_dim,
+                             int gqa_size, int tile_size,
+                             size_t local_window_size, int head_start,
+                             int head_end) {
+  constexpr int GROUP_SIZE = 32;
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  int start_row =
+    (size_t)num_rows < local_window_size ? 0 : num_rows - local_window_size;
+  int row_cnt =
+    (size_t)num_rows < local_window_size ? num_rows : local_window_size;
+  int packed_row_bytes = num_cache_head * head_dim / 2;
+  int num_groups_per_head = (head_dim + GROUP_SIZE - 1) / GROUP_SIZE;
+  int scales_per_row = num_cache_head * num_groups_per_head;
+
+  std::vector<float> tmp_dequant(head_dim);
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int t_row = 0; t_row < row_cnt; ++t_row) {
+      int row = start_row + t_row;
+      const uint8_t *packed_ptr =
+        kcache_packed + row * packed_row_bytes + n * head_dim / 2;
+      const float *scale_ptr =
+        kcache_scales + row * scales_per_row + n * num_groups_per_head;
+
+      // Dequantize
+      for (int d = 0; d < head_dim; d += 2) {
+        uint8_t packed = packed_ptr[d / 2];
+        uint8_t q0 = packed & 0x07;
+        uint8_t q1 = (packed >> 4) & 0x07;
+        int grp = d / GROUP_SIZE;
+        float s = scale_ptr[grp];
+        tmp_dequant[d] = s * ((float)q0 - 4.0f);
+        if (d + 1 < head_dim)
+          tmp_dequant[d + 1] = s * ((float)q1 - 4.0f);
+      }
+
+      // AVX2 dot product for each GQA group
+      for (int g = 0; g < gqa_size; ++g) {
+        const float *q_ptr = query + n * gqa_size * head_dim + g * head_dim;
+
+        int d = 0;
+        __m256 acc = _mm256_setzero_ps();
+        for (; d + 8 <= head_dim; d += 8) {
+          __m256 va = _mm256_loadu_ps(q_ptr + d);
+          __m256 vb = _mm256_loadu_ps(tmp_dequant.data() + d);
+          acc = _mm256_fmadd_ps(va, vb, acc);
+        }
+        float sum = hsum_avx(acc);
+        for (; d < head_dim; ++d)
+          sum += q_ptr[d] * tmp_dequant[d];
+
+        output[t_row * num_cache_head * gqa_size + n * gqa_size + g] =
+          sum / std::sqrt((float)head_dim);
+      }
+    }
+  }
+}
+
+void compute_vcache_packed4_transposed(int row_num, const float *attn_weights,
+                                       const uint8_t *vcache_packed,
+                                       const float *vcache_scales,
+                                       float *output, int num_cache_head,
+                                       int gqa_size, int head_dim,
+                                       size_t local_window_size, int head_start,
+                                       int head_end) {
+  constexpr int GROUP_SIZE = 32;
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  int packed_row_bytes = num_cache_head * head_dim / 2;
+  int num_groups_per_head = (head_dim + GROUP_SIZE - 1) / GROUP_SIZE;
+  int scales_per_row = num_cache_head * num_groups_per_head;
+  int j_start = (size_t)row_num < local_window_size
+                  ? 0
+                  : row_num + 1 - (int)local_window_size;
+
+  int num_blocks = head_dim / 8;
+  int rem = head_dim % 8;
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int h = 0; h < gqa_size; ++h) {
+      // AVX2 accumulators
+      std::vector<__m256> sumVec(num_blocks, _mm256_setzero_ps());
+      std::vector<float> sumRem(rem, 0.0f);
+
+      for (int j = j_start; j <= row_num; ++j) {
+        float a_val =
+          attn_weights[((j - j_start) * num_cache_head + n) * gqa_size + h];
+        __m256 a_vec = _mm256_set1_ps(a_val);
+
+        const uint8_t *packed_ptr =
+          vcache_packed + j * packed_row_bytes + n * head_dim / 2;
+        const float *scale_ptr =
+          vcache_scales + j * scales_per_row + n * num_groups_per_head;
+
+        for (int b = 0; b < num_blocks; ++b) {
+          int d = b * 8;
+          // Dequantize 8 elements
+          alignas(32) float vals[8];
+          for (int k = 0; k < 8; ++k) {
+            int dd = d + k;
+            uint8_t packed = packed_ptr[dd / 2];
+            uint8_t q =
+              (dd % 2 == 0) ? (packed & 0x07) : ((packed >> 4) & 0x07);
+            int grp = dd / GROUP_SIZE;
+            vals[k] = scale_ptr[grp] * ((float)q - 4.0f);
+          }
+          __m256 v = _mm256_load_ps(vals);
+          sumVec[b] = _mm256_fmadd_ps(a_vec, v, sumVec[b]);
+        }
+
+        for (int r = 0; r < rem; ++r) {
+          int dd = num_blocks * 8 + r;
+          uint8_t packed = packed_ptr[dd / 2];
+          uint8_t q =
+            (dd % 2 == 0) ? (packed & 0x07) : ((packed >> 4) & 0x07);
+          int grp = dd / GROUP_SIZE;
+          float val = scale_ptr[grp] * ((float)q - 4.0f);
+          sumRem[r] += a_val * val;
+        }
+      }
+
+      int out_base = (n * gqa_size + h) * head_dim;
+      for (int b = 0; b < num_blocks; ++b) {
+        _mm256_storeu_ps(&output[out_base + b * 8], sumVec[b]);
+      }
+      for (int r = 0; r < rem; ++r) {
+        output[out_base + num_blocks * 8 + r] = sumRem[r];
+      }
+    }
+  }
+}
+
 } // namespace nntrainer::avx2
