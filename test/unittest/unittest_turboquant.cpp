@@ -545,6 +545,372 @@ TEST(turboquant_utils, quantize_zeros) {
   }
 }
 
+/**
+ * @brief Stress test with realistic LLM dimensions.
+ *        Qwen3-1.7B: head_dim=128, num_heads_kv=4, gqa=8
+ */
+TEST(turboquant_stress, realistic_llm_dimensions) {
+  constexpr int num_rows = 256;   // context length
+  constexpr int num_cache_head = 4;
+  constexpr int head_dim = 128;
+  constexpr int gqa_size = 8;     // num_heads_Q / num_heads_KV = 32/4
+  constexpr int tile_size = 4;
+  constexpr int GROUP_SIZE = 32;
+
+  std::mt19937 gen(2024);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+  int q_size = num_cache_head * gqa_size * head_dim;
+  std::vector<float> query(q_size);
+  for (auto &v : query)
+    v = dist(gen);
+
+  int k_size = num_rows * num_cache_head * head_dim;
+  std::vector<float> keys_fp32(k_size);
+  for (auto &v : keys_fp32)
+    v = dist(gen);
+
+  // FP32 reference
+  int out_size = num_rows * num_cache_head * gqa_size;
+  std::vector<float> ref_output(out_size, 0.0f);
+  reference_qk_dot(query.data(), keys_fp32.data(), ref_output.data(), num_rows,
+                   num_cache_head, head_dim, gqa_size);
+
+  // Quantize full row at once (same as mha_core does)
+  int kv_width = num_cache_head * head_dim;
+  int packed_row_bytes = kv_width / 2;
+  int num_groups_per_row =
+    num_cache_head * ((head_dim + GROUP_SIZE - 1) / GROUP_SIZE);
+
+  std::vector<uint8_t> packed_keys(num_rows * packed_row_bytes);
+  std::vector<float> key_scales(num_rows * num_groups_per_row);
+
+  for (int row = 0; row < num_rows; ++row) {
+    const float *src = keys_fp32.data() + row * kv_width;
+    uint8_t *dst = packed_keys.data() + row * packed_row_bytes;
+    float *s_dst = key_scales.data() + row * num_groups_per_row;
+    // Quantize entire row at once, just like mha_core
+    nntrainer::quantize_kv_turboquant(src, kv_width, dst, s_dst);
+  }
+
+  // Packed computation
+  std::vector<float> packed_output(out_size, 0.0f);
+  nntrainer::compute_kcaches_packed4(
+    query.data(), packed_keys.data(), key_scales.data(), packed_output.data(),
+    num_rows, num_cache_head, head_dim, gqa_size, tile_size);
+
+  float max_diff = 0.0f;
+  double sum_sq_diff = 0.0;
+  for (int i = 0; i < out_size; ++i) {
+    float diff = std::fabs(ref_output[i] - packed_output[i]);
+    max_diff = std::max(max_diff, diff);
+    sum_sq_diff += (double)(diff * diff);
+  }
+  float rmse = std::sqrt(sum_sq_diff / out_size);
+
+  std::cout << "  [stress LLM] rows=" << num_rows << " heads=" << num_cache_head
+            << " dim=" << head_dim << " gqa=" << gqa_size
+            << " max_diff=" << max_diff << " rmse=" << rmse << std::endl;
+
+  // 3-bit quantization with 256 rows: per-element error ~ absmax/6 ~ 0.167,
+  // dot product error ~ error * sqrt(dim) / dim ~ 0.015 per output element.
+  // Max over 256*32 outputs can be ~0.2. RMSE should stay small.
+  EXPECT_LT(max_diff, 0.25f)
+    << "Realistic LLM kcaches max error too large: " << max_diff;
+  EXPECT_LT(rmse, 0.06f)
+    << "Realistic LLM kcaches RMSE too large: " << rmse;
+}
+
+/**
+ * @brief Stress test: value cache with realistic dimensions.
+ */
+TEST(turboquant_stress, realistic_vcache_dimensions) {
+  constexpr int num_rows = 128;
+  constexpr int num_cache_head = 4;
+  constexpr int head_dim = 128;
+  constexpr int gqa_size = 8;
+  constexpr int GROUP_SIZE = 32;
+  int row_num = num_rows - 1;
+
+  std::mt19937 gen(2025);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  std::uniform_real_distribution<float> attn_dist(0.0f, 1.0f);
+
+  int attn_size = num_rows * num_cache_head * gqa_size;
+  std::vector<float> attn_weights(attn_size);
+  for (auto &v : attn_weights)
+    v = attn_dist(gen);
+
+  // Normalize to softmax-like
+  for (int n = 0; n < num_cache_head; ++n) {
+    for (int h = 0; h < gqa_size; ++h) {
+      float sum = 0.0f;
+      for (int j = 0; j < num_rows; ++j)
+        sum += attn_weights[(j * num_cache_head + n) * gqa_size + h];
+      for (int j = 0; j < num_rows; ++j)
+        attn_weights[(j * num_cache_head + n) * gqa_size + h] /= sum;
+    }
+  }
+
+  int kv_width = num_cache_head * head_dim;
+  int v_size = num_rows * kv_width;
+  std::vector<float> values_fp32(v_size);
+  for (auto &v : values_fp32)
+    v = dist(gen);
+
+  // FP32 reference
+  int out_dim = num_cache_head * gqa_size * head_dim;
+  std::vector<float> ref_output(out_dim, 0.0f);
+  reference_attn_value(row_num, attn_weights.data(), values_fp32.data(),
+                       ref_output.data(), num_cache_head, gqa_size, head_dim);
+
+  // Quantize full row at once
+  int packed_row_bytes = kv_width / 2;
+  int num_groups_per_row =
+    num_cache_head * ((head_dim + GROUP_SIZE - 1) / GROUP_SIZE);
+
+  std::vector<uint8_t> packed_values(num_rows * packed_row_bytes);
+  std::vector<float> value_scales(num_rows * num_groups_per_row);
+
+  for (int row = 0; row < num_rows; ++row) {
+    const float *src = values_fp32.data() + row * kv_width;
+    uint8_t *dst = packed_values.data() + row * packed_row_bytes;
+    float *s_dst = value_scales.data() + row * num_groups_per_row;
+    nntrainer::quantize_kv_turboquant(src, kv_width, dst, s_dst);
+  }
+
+  // Packed computation
+  std::vector<float> packed_output(out_dim, 0.0f);
+  nntrainer::compute_vcache_packed4_transposed(
+    row_num, attn_weights.data(), packed_values.data(), value_scales.data(),
+    packed_output.data(), num_cache_head, gqa_size, head_dim);
+
+  float max_diff = 0.0f;
+  double sum_sq_diff = 0.0;
+  for (int i = 0; i < out_dim; ++i) {
+    float diff = std::fabs(ref_output[i] - packed_output[i]);
+    max_diff = std::max(max_diff, diff);
+    sum_sq_diff += (double)(diff * diff);
+  }
+  float rmse = std::sqrt(sum_sq_diff / out_dim);
+
+  std::cout << "  [stress vcache] rows=" << num_rows
+            << " heads=" << num_cache_head << " dim=" << head_dim
+            << " gqa=" << gqa_size << " max_diff=" << max_diff
+            << " rmse=" << rmse << std::endl;
+
+  EXPECT_LT(max_diff, 0.2f)
+    << "Realistic vcache max error too large: " << max_diff;
+  EXPECT_LT(rmse, 0.05f)
+    << "Realistic vcache RMSE too large: " << rmse;
+}
+
+/**
+ * @brief Verify per-head vs full-row quantization produce identical results.
+ *        mha_core quantizes full row, tests quantize per head.
+ *        They must match when head_dim is multiple of GROUP_SIZE.
+ */
+TEST(turboquant_compute, per_head_vs_full_row_quantize) {
+  constexpr int num_heads = 4;
+  constexpr int head_dim = 128;
+  constexpr int kv_width = num_heads * head_dim;
+  constexpr int GROUP_SIZE = 32;
+
+  std::mt19937 gen(999);
+  std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+
+  std::vector<float> input(kv_width);
+  for (auto &v : input)
+    v = dist(gen);
+
+  // Method 1: full-row quantize (mha_core style)
+  int packed_bytes = kv_width / 2;
+  int num_groups = (kv_width + GROUP_SIZE - 1) / GROUP_SIZE;
+  std::vector<uint8_t> packed_full(packed_bytes);
+  std::vector<float> scales_full(num_groups);
+  nntrainer::quantize_kv_turboquant(input.data(), kv_width, packed_full.data(),
+                                    scales_full.data());
+
+  // Method 2: per-head quantize (test style)
+  int num_groups_per_head = (head_dim + GROUP_SIZE - 1) / GROUP_SIZE;
+  std::vector<uint8_t> packed_perhead(packed_bytes);
+  std::vector<float> scales_perhead(num_groups);
+
+  for (int h = 0; h < num_heads; ++h) {
+    nntrainer::quantize_kv_turboquant(
+      input.data() + h * head_dim, head_dim,
+      packed_perhead.data() + h * head_dim / 2,
+      scales_perhead.data() + h * num_groups_per_head);
+  }
+
+  // Must be identical
+  for (int i = 0; i < num_groups; ++i) {
+    EXPECT_FLOAT_EQ(scales_full[i], scales_perhead[i])
+      << "Scale mismatch at group " << i;
+  }
+  for (int i = 0; i < packed_bytes; ++i) {
+    EXPECT_EQ(packed_full[i], packed_perhead[i])
+      << "Packed byte mismatch at index " << i;
+  }
+}
+
+/**
+ * @brief Verify head_start/head_end partial processing.
+ *        Process heads [1,3) should give same results as full process
+ *        for those heads.
+ */
+TEST(turboquant_compute, head_range_partial_processing) {
+  constexpr int num_rows = 4;
+  constexpr int num_cache_head = 4;
+  constexpr int head_dim = 32;
+  constexpr int gqa_size = 2;
+  constexpr int tile_size = 4;
+  constexpr int GROUP_SIZE = 32;
+
+  std::mt19937 gen(777);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+  int q_size = num_cache_head * gqa_size * head_dim;
+  std::vector<float> query(q_size);
+  for (auto &v : query)
+    v = dist(gen);
+
+  int kv_width = num_cache_head * head_dim;
+  int k_size = num_rows * kv_width;
+  std::vector<float> keys_fp32(k_size);
+  for (auto &v : keys_fp32)
+    v = dist(gen);
+
+  int packed_row_bytes = kv_width / 2;
+  int num_groups_per_row =
+    num_cache_head * ((head_dim + GROUP_SIZE - 1) / GROUP_SIZE);
+
+  std::vector<uint8_t> packed(num_rows * packed_row_bytes);
+  std::vector<float> scales(num_rows * num_groups_per_row);
+
+  for (int row = 0; row < num_rows; ++row) {
+    nntrainer::quantize_kv_turboquant(
+      keys_fp32.data() + row * kv_width, kv_width,
+      packed.data() + row * packed_row_bytes,
+      scales.data() + row * num_groups_per_row);
+  }
+
+  // Full computation
+  int out_size = num_rows * num_cache_head * gqa_size;
+  std::vector<float> output_full(out_size, 0.0f);
+  nntrainer::compute_kcaches_packed4(
+    query.data(), packed.data(), scales.data(), output_full.data(), num_rows,
+    num_cache_head, head_dim, gqa_size, tile_size);
+
+  // Partial: heads [1, 3)
+  std::vector<float> output_partial(out_size, 0.0f);
+  nntrainer::compute_kcaches_packed4(
+    query.data(), packed.data(), scales.data(), output_partial.data(), num_rows,
+    num_cache_head, head_dim, gqa_size, tile_size, UINT_MAX, 1, 3);
+
+  // Heads 1 and 2 should match
+  for (int row = 0; row < num_rows; ++row) {
+    for (int n = 1; n < 3; ++n) {
+      for (int g = 0; g < gqa_size; ++g) {
+        int idx = row * num_cache_head * gqa_size + n * gqa_size + g;
+        EXPECT_FLOAT_EQ(output_full[idx], output_partial[idx])
+          << "Head range mismatch at row=" << row << " head=" << n
+          << " g=" << g;
+      }
+    }
+  }
+
+  // Heads 0 and 3 should be zero (not processed)
+  for (int row = 0; row < num_rows; ++row) {
+    for (int n : {0, 3}) {
+      for (int g = 0; g < gqa_size; ++g) {
+        int idx = row * num_cache_head * gqa_size + n * gqa_size + g;
+        EXPECT_FLOAT_EQ(output_partial[idx], 0.0f)
+          << "Unprocessed head should be zero at row=" << row << " head=" << n;
+      }
+    }
+  }
+}
+
+/**
+ * @brief Test fallback and backend produce identical results.
+ *        Calls __fallback_* directly and compares with nntrainer::* dispatch.
+ */
+TEST(turboquant_compute, fallback_matches_dispatch) {
+  constexpr int num_rows = 8;
+  constexpr int num_cache_head = 2;
+  constexpr int head_dim = 64;
+  constexpr int gqa_size = 4;
+  constexpr int tile_size = 4;
+  constexpr int GROUP_SIZE = 32;
+
+  std::mt19937 gen(111);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+  int q_size = num_cache_head * gqa_size * head_dim;
+  std::vector<float> query(q_size);
+  for (auto &v : query)
+    v = dist(gen);
+
+  int kv_width = num_cache_head * head_dim;
+  std::vector<float> keys_fp32(num_rows * kv_width);
+  for (auto &v : keys_fp32)
+    v = dist(gen);
+
+  int packed_row_bytes = kv_width / 2;
+  int num_groups_per_row =
+    num_cache_head * ((head_dim + GROUP_SIZE - 1) / GROUP_SIZE);
+
+  // Quantize via dispatch
+  std::vector<uint8_t> packed_d(num_rows * packed_row_bytes);
+  std::vector<float> scales_d(num_rows * num_groups_per_row);
+  for (int r = 0; r < num_rows; ++r) {
+    nntrainer::quantize_kv_turboquant(
+      keys_fp32.data() + r * kv_width, kv_width,
+      packed_d.data() + r * packed_row_bytes,
+      scales_d.data() + r * num_groups_per_row);
+  }
+
+  // Quantize via fallback
+  std::vector<uint8_t> packed_f(num_rows * packed_row_bytes);
+  std::vector<float> scales_f(num_rows * num_groups_per_row);
+  for (int r = 0; r < num_rows; ++r) {
+    nntrainer::__fallback_quantize_kv_turboquant(
+      keys_fp32.data() + r * kv_width, kv_width,
+      packed_f.data() + r * packed_row_bytes,
+      scales_f.data() + r * num_groups_per_row);
+  }
+
+  // Byte-identical
+  for (size_t i = 0; i < packed_d.size(); ++i) {
+    EXPECT_EQ(packed_d[i], packed_f[i])
+      << "Dispatch vs fallback packed mismatch at " << i;
+  }
+  for (size_t i = 0; i < scales_d.size(); ++i) {
+    EXPECT_FLOAT_EQ(scales_d[i], scales_f[i])
+      << "Dispatch vs fallback scale mismatch at " << i;
+  }
+
+  // compute_kcaches_packed4 via dispatch
+  int out_size = num_rows * num_cache_head * gqa_size;
+  std::vector<float> out_d(out_size, 0.0f);
+  nntrainer::compute_kcaches_packed4(query.data(), packed_d.data(),
+                                     scales_d.data(), out_d.data(), num_rows,
+                                     num_cache_head, head_dim, gqa_size,
+                                     tile_size);
+
+  // compute_kcaches_packed4 via fallback
+  std::vector<float> out_f(out_size, 0.0f);
+  nntrainer::__fallback_compute_kcaches_packed4(
+    query.data(), packed_f.data(), scales_f.data(), out_f.data(), num_rows,
+    num_cache_head, head_dim, gqa_size, tile_size, UINT_MAX, 0, -1);
+
+  for (int i = 0; i < out_size; ++i) {
+    EXPECT_NEAR(out_d[i], out_f[i], 1e-5f)
+      << "kcaches dispatch vs fallback mismatch at " << i;
+  }
+}
+
 GTEST_API_ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
