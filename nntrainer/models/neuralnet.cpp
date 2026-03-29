@@ -28,6 +28,7 @@
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <unordered_map>
 #include <iomanip>
 #include <sstream>
 
@@ -630,6 +631,94 @@ void NeuralNetwork::save(const std::string &file_path,
     auto model_file = checkedOpenStream<std::ofstream>(
       file_path, std::ios::out | std::ios::binary | std::ios::trunc);
 
+    /**
+     * Binary format v1 (name-based):
+     *
+     *   [4B] Magic "NNTR"
+     *   [4B] Version (uint32_t, = 1)
+     *   [8B] Header size in bytes (uint64_t)
+     *   [Header] Per-weight entries:
+     *     [4B] name_len (uint32_t)
+     *     [name_len B] weight name (e.g. "layer0_qkv:qweight")
+     *     [8B] data_offset relative to data section start (uint64_t)
+     *     [8B] data_size in bytes (uint64_t)
+     *   [Padding to 8-byte alignment]
+     *   [Data section] Raw weight bytes
+     *
+     * The previous format (v0) has no magic header and stores weights
+     * sequentially in topological-sort order. The loader auto-detects
+     * the version by checking for the "NNTR" magic.
+     */
+
+    // -- 1. Collect weight metadata --
+    struct WeightEntry {
+      std::string name;
+      size_t data_size;
+    };
+    std::vector<WeightEntry> entries;
+    size_t total_data_size = 0;
+
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (unsigned int i = 0; i < weights.size(); ++i) {
+        if (!(*iter)->getRunContext().isGradientFirstAccess(i))
+          continue;
+        auto &w = *weights[i];
+        size_t sz = w.getVariable().getMemoryBytes();
+        auto dtype = w.getDim().getDataType();
+        if (dtype != TensorDim::DataType::FP32 &&
+            dtype != TensorDim::DataType::FP16 &&
+            dtype != TensorDim::DataType::Q6_K &&
+            dtype != TensorDim::DataType::Q4_0) {
+          sz += sizeof(uint16_t);
+        }
+        entries.push_back({w.getName(), sz});
+        total_data_size += sz;
+      }
+    }
+
+    // -- 2. Build header --
+    size_t header_size = 0;
+    for (auto &e : entries) {
+      header_size += sizeof(uint32_t);  // name_len
+      header_size += e.name.size();     // name bytes
+      header_size += sizeof(uint64_t);  // data_offset
+      header_size += sizeof(uint64_t);  // data_size
+    }
+    // Pad header to 8-byte alignment
+    size_t header_padded = (header_size + 7) & ~static_cast<size_t>(7);
+
+    // -- 3. Write magic + version + header_size --
+    const char magic[4] = {'N', 'N', 'T', 'R'};
+    model_file.write(magic, 4);
+    uint32_t version = 1;
+    model_file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    uint64_t hdr_size_val = static_cast<uint64_t>(header_padded);
+    model_file.write(reinterpret_cast<const char *>(&hdr_size_val),
+                     sizeof(hdr_size_val));
+
+    // -- 4. Write header entries --
+    size_t data_offset = 0;
+    for (auto &e : entries) {
+      uint32_t name_len = static_cast<uint32_t>(e.name.size());
+      model_file.write(reinterpret_cast<const char *>(&name_len),
+                       sizeof(name_len));
+      model_file.write(e.name.data(), name_len);
+      uint64_t off = static_cast<uint64_t>(data_offset);
+      model_file.write(reinterpret_cast<const char *>(&off), sizeof(off));
+      uint64_t sz = static_cast<uint64_t>(e.data_size);
+      model_file.write(reinterpret_cast<const char *>(&sz), sizeof(sz));
+      data_offset += e.data_size;
+    }
+
+    // Write padding bytes
+    size_t pad_bytes = header_padded - header_size;
+    if (pad_bytes > 0) {
+      char zeros[8] = {};
+      model_file.write(zeros, pad_bytes);
+    }
+
+    // -- 5. Write data section (weight bytes in graph order) --
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
       (*iter)->save(model_file, false, exec_mode);
     }
@@ -676,6 +765,21 @@ void NeuralNetwork::save(const std::string &file_path,
   }
 }
 
+void NeuralNetwork::convertBinV0ToV1(const std::string &v0_path,
+                                     const std::string &v1_path) {
+  NNTR_THROW_IF(!initialized, std::runtime_error)
+    << "Model must be initialized before converting weight format";
+
+  // Load v0 weights (position-based, sequential)
+  load(v0_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+
+  // Re-save as v1 (name-based header)
+  save(v1_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+
+  ml_logi("Converted weight file from v0 to v1: %s -> %s", v0_path.c_str(),
+          v1_path.c_str());
+}
+
 void NeuralNetwork::load(const std::string &file_path,
                          ml::train::ModelFormat format) {
   /// @todo this switch case should be delegating the function call only. It's
@@ -686,27 +790,95 @@ void NeuralNetwork::load(const std::string &file_path,
   const std::regex reg_("\\s*\\;\\s*");
   auto v = split(file_path, reg_);
 
+  auto f_path = (v.size() == 2) ? v[1] : v[0];
+
+  /**
+   * Detect binary format version by checking for "NNTR" magic.
+   *   v0 (legacy): no magic, weights stored sequentially in topological order.
+   *   v1: magic "NNTR" + header with name→offset mapping.
+   */
+  uint32_t bin_version = 0;
+  size_t data_section_start = 0;
+  std::unordered_map<std::string, std::pair<size_t, size_t>> name_offset_map;
+
+  if (format == ml::train::ModelFormat::MODEL_FORMAT_BIN) {
+    auto probe = checkedOpenStream<std::ifstream>(
+      f_path, std::ios::in | std::ios::binary);
+    char magic_buf[4] = {};
+    probe.read(magic_buf, 4);
+    if (probe.good() && magic_buf[0] == 'N' && magic_buf[1] == 'N' &&
+        magic_buf[2] == 'T' && magic_buf[3] == 'R') {
+      bin_version = 0;
+      probe.read(reinterpret_cast<char *>(&bin_version), sizeof(bin_version));
+      if (bin_version >= 1) {
+        uint64_t header_size = 0;
+        probe.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
+        size_t header_start = 4 + sizeof(uint32_t) + sizeof(uint64_t);
+        data_section_start = header_start + static_cast<size_t>(header_size);
+
+        // Parse header entries
+        size_t bytes_read = 0;
+        while (bytes_read < header_size) {
+          uint32_t name_len = 0;
+          probe.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
+          if (!probe.good())
+            break;
+          bytes_read += sizeof(name_len);
+          std::string wname(name_len, '\0');
+          probe.read(&wname[0], name_len);
+          bytes_read += name_len;
+          uint64_t d_offset = 0, d_size = 0;
+          probe.read(reinterpret_cast<char *>(&d_offset), sizeof(d_offset));
+          probe.read(reinterpret_cast<char *>(&d_size), sizeof(d_size));
+          bytes_read += sizeof(d_offset) + sizeof(d_size);
+          name_offset_map[wname] = {static_cast<size_t>(d_offset),
+                                    static_cast<size_t>(d_size)};
+        }
+        ml_logi("Loaded v%u weight file with %zu named entries", bin_version,
+                name_offset_map.size());
+      }
+    }
+    probe.close();
+  }
+
+  /**
+   * Assign file offsets to each weight tensor.
+   *   v1: look up by weight name in the header → order-independent.
+   *   v0: sequential accumulation in topological order (legacy behaviour).
+   */
   size_t start_from = 0;
   std::vector<std::pair<size_t, size_t>> file_offset;
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
     auto weights = (*iter)->getRunContext().getWeights();
-    for (auto weight : weights) {
+    for (unsigned int wi = 0; wi < weights.size(); ++wi) {
+      auto weight = weights[wi];
       size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
-      weight->getVariableRef().setFileOffset(start_from);
-      ///@todo instead of checking the data type,
-      /// we may need to create a common parent class for
-      /// quantized tensors, requiring qparam to be saved
-      /// and creating a common interface to check if qparam is needed
-      /// this kind of type checking should be avoided
       if (tensor_data_type != TensorDim::DataType::FP32 &&
           tensor_data_type != TensorDim::DataType::FP16 &&
           tensor_data_type != TensorDim::DataType::Q6_K &&
           tensor_data_type != TensorDim::DataType::Q4_0) {
-        // for tensor with qparam
         size += sizeof(uint16_t);
       }
-      file_offset.emplace_back(std::make_pair(start_from, size));
+
+      if (bin_version >= 1) {
+        // v1: name-based offset lookup
+        auto it = name_offset_map.find(weight->getName());
+        if (it != name_offset_map.end()) {
+          weight->getVariableRef().setFileOffset(data_section_start +
+                                                 it->second.first);
+        } else {
+          ml_logw("Weight '%s' not found in v1 header, using sequential offset",
+                  weight->getName().c_str());
+          weight->getVariableRef().setFileOffset(start_from);
+        }
+      } else {
+        // v0: sequential offset (legacy)
+        weight->getVariableRef().setFileOffset(start_from);
+      }
+
+      file_offset.emplace_back(
+        std::make_pair(weight->getVariable().getFileOffset(), size));
       start_from += size;
     }
   }
@@ -721,7 +893,6 @@ void NeuralNetwork::load(const std::string &file_path,
     NNTR_THROW_IF(!initialized, std::runtime_error)
       << "Cannot load if not initialized yet, path: " << file_path
       << " format: " << static_cast<unsigned>(format);
-    auto f_path = (v.size() == 2) ? v[1] : v[0];
 
     auto model_file =
       checkedOpenStream<std::ifstream>(f_path, std::ios::in | std::ios::binary);

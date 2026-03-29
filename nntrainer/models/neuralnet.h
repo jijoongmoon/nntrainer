@@ -284,6 +284,17 @@ public:
               ml::train::ModelFormat::MODEL_FORMAT_BIN) override;
 
   /**
+   * @brief     Convert a v0 (position-based) weight binary to v1
+   *            (name-based) format. The model must be initialized first.
+   *            This loads the v0 file into the current model and re-saves
+   *            it with the v1 header containing weight name → offset mapping.
+   * @param[in] v0_path path to the legacy v0 .bin file
+   * @param[in] v1_path path to write the new v1 .bin file
+   */
+  void convertBinV0ToV1(const std::string &v0_path,
+                        const std::string &v1_path);
+
+  /**
    * @brief     get Epochs
    * @retval    epochs
    */
