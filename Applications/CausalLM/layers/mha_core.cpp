@@ -155,16 +155,12 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   if (use_turboquant) {
     /**
-     * TurboQuant 4-bit packed KV cache:
-     * - Each element is 4 bits (3-bit data + 1-bit QJL sign)
-     * - 2 elements packed per byte → width = num_heads_KV * head_dim / 2
-     * - Stored as UINT8 tensor
-     * - Per-group scale factors stored separately (group_size = 32)
+     * TurboQuant v2: norm + rotation + Lloyd-Max codebook
+     * - Packed KV cache: UINT8, width = num_heads_KV * head_dim / 2
+     * - Per-head L2 norms: FP32, width = num_heads_KV
+     * - Rotation signs: generated once at finalize
      */
-    constexpr unsigned int TQ_GROUP_SIZE = 32;
     unsigned int packed_width = num_heads_KV * head_dim / 2;
-    unsigned int num_groups_per_row =
-      num_heads_KV * ((head_dim + TQ_GROUP_SIZE - 1) / TQ_GROUP_SIZE);
 
     ml::train::TensorDim cache_key_dim(
       {batch_size, 1, max_timestep, packed_width},
@@ -180,21 +176,26 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
       nntrainer::TensorLifespan::MAX_LIFESPAN);
 
-    // Scale factor tensors (FP32)
-    ml::train::TensorDim cache_key_scales_dim(
-      {batch_size, 1, max_timestep, num_groups_per_row},
+    // Per-head norm tensors (FP32)
+    ml::train::TensorDim cache_key_norms_dim(
+      {batch_size, 1, max_timestep, (unsigned int)num_heads_KV},
       {context.getFormat(), ml::train::TensorDim::DataType::FP32});
-    ml::train::TensorDim cache_value_scales_dim(
-      {batch_size, 1, max_timestep, num_groups_per_row},
+    ml::train::TensorDim cache_value_norms_dim(
+      {batch_size, 1, max_timestep, (unsigned int)num_heads_KV},
       {context.getFormat(), ml::train::TensorDim::DataType::FP32});
 
     tensor_idx[AttentionParams::cache_key_scales] = context.requestTensor(
-      cache_key_scales_dim, "cache_key_scales", nntrainer::Initializer::NONE,
+      cache_key_norms_dim, "cache_key_norms", nntrainer::Initializer::NONE,
       false, nntrainer::TensorLifespan::MAX_LIFESPAN);
     tensor_idx[AttentionParams::cache_value_scales] = context.requestTensor(
-      cache_value_scales_dim, "cache_value_scales",
+      cache_value_norms_dim, "cache_value_norms",
       nntrainer::Initializer::NONE, false,
       nntrainer::TensorLifespan::MAX_LIFESPAN);
+
+    // Generate rotation signs (deterministic, per head_dim)
+    tq_rot_signs.resize(head_dim);
+    nntrainer::generate_random_signs(tq_rot_signs.data(), head_dim,
+                                     0xDEADBEEF);
   } else {
     /** Tensor for KV-Cache */
 #ifdef ENABLE_FP16
@@ -757,14 +758,11 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
   ml::train::TensorDim &cache_value_dim,
   ml::train::TensorDim &cache_value_step_dim) {
 
-  constexpr unsigned int TQ_GROUP_SIZE = 32;
   auto &pool =
     nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
 
   unsigned int kv_width = num_heads_KV * head_dim;
   unsigned int packed_width = kv_width / 2;
-  unsigned int num_groups_per_row =
-    num_heads_KV * ((head_dim + TQ_GROUP_SIZE - 1) / TQ_GROUP_SIZE);
 
   // 1. Apply RoPE to query (in-place)
   apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
@@ -775,43 +773,44 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
                              query_step.getTensorType());
   apply_rotary_emb_tensor_v2(key_step, key_rope, head_dim, _from, false);
 
-  // 3. Quantize and pack key into cache
+  // 3. Quantize key with v2 (norm + rotation + Lloyd-Max) per head
   for (unsigned int s = 0; s < seq_len; ++s) {
     unsigned int cache_row = from + s;
     const float *key_data = key_rope.getData<float>() + s * kv_width;
     uint8_t *packed_dst =
       cache_key.getData<uint8_t>() +
       batch * cache_key_dim.getFeatureLen() + cache_row * packed_width;
-    float *scales_dst =
+    float *norms_dst =
       cache_key_scales.getData<float>() +
       batch * cache_key_scales.getDim().getFeatureLen() +
-      cache_row * num_groups_per_row;
+      cache_row * num_heads_KV;
 
-    nntrainer::quantize_kv_turboquant(key_data, kv_width, packed_dst,
-                                      scales_dst);
+    nntrainer::quantize_kv_turboquant_v2(key_data, packed_dst, norms_dst,
+                                         tq_rot_signs.data(), head_dim,
+                                         num_heads_KV);
   }
 
-  // 4. Quantize and pack value into cache (no RoPE for values, just convert)
+  // 4. Quantize value with v2 (no RoPE for values)
   for (unsigned int s = 0; s < seq_len; ++s) {
     unsigned int cache_row = from + s;
-    const float *val_data =
-      value_step.getData<float>() + s * kv_width;
+    const float *val_data = value_step.getData<float>() + s * kv_width;
     uint8_t *packed_dst =
       cache_value.getData<uint8_t>() +
       batch * cache_value_dim.getFeatureLen() + cache_row * packed_width;
-    float *scales_dst =
+    float *norms_dst =
       cache_value_scales.getData<float>() +
       batch * cache_value_scales.getDim().getFeatureLen() +
-      cache_row * num_groups_per_row;
+      cache_row * num_heads_KV;
 
-    nntrainer::quantize_kv_turboquant(val_data, kv_width, packed_dst,
-                                      scales_dst);
+    nntrainer::quantize_kv_turboquant_v2(val_data, packed_dst, norms_dst,
+                                         tq_rot_signs.data(), head_dim,
+                                         num_heads_KV);
   }
 
   // 5. Compute Q*K^T attention scores using packed key cache
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
-  // For single-token decoding (seq_len == 1)
+  // Single-token decoding (seq_len == 1)
   if (seq_len == 1) {
     int row_to_compute = is_causal ? from + 1 : from + seq_len;
 
@@ -822,7 +821,7 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
     const float *q_data = query_step.getData<float>();
     const uint8_t *kc_packed =
       cache_key.getData<uint8_t>() + batch * cache_key_dim.getFeatureLen();
-    const float *kc_scales =
+    const float *kc_norms =
       cache_key_scales.getData<float>() +
       batch * cache_key_scales.getDim().getFeatureLen();
     float *out_data = out_.getData<float>();
@@ -830,19 +829,19 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
 #pragma omp parallel for schedule(static)
     for (unsigned int head_kv = 0;
          head_kv < (unsigned int)(num_heads_Q / gqa_size); ++head_kv) {
-      nntrainer::compute_kcaches_packed4(
-        q_data, kc_packed, kc_scales, out_data, row_to_compute,
-        num_heads_KV, head_dim, gqa_size, tile_size, local_window_size,
-        head_kv, head_kv + 1);
+      nntrainer::compute_kcaches_packed4_v2(
+        q_data, kc_packed, kc_norms, out_data, row_to_compute, num_heads_KV,
+        head_dim, gqa_size, tile_size, tq_rot_signs.data(),
+        local_window_size, head_kv, head_kv + 1);
     }
 
     // 6. Softmax
     softmax_triangle(out_, seq_len, num_heads_Q, from, pool);
 
-    // 7. Compute attention-weighted values using packed value cache
+    // 7. Compute attention-weighted values
     const uint8_t *vc_packed =
       cache_value.getData<uint8_t>() + batch * cache_value_dim.getFeatureLen();
-    const float *vc_scales =
+    const float *vc_norms =
       cache_value_scales.getData<float>() +
       batch * cache_value_scales.getDim().getFeatureLen();
     float *attn_out = attention_output_step.getData<float>();
@@ -852,9 +851,10 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
 
 #pragma omp parallel for schedule(static)
     for (int head_kv = 0; head_kv < (int)num_heads_KV; ++head_kv) {
-      nntrainer::compute_vcache_packed4_transposed(
-        row_num, attn_data, vc_packed, vc_scales, attn_out, num_heads_KV,
-        gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
+      nntrainer::compute_vcache_packed4_v2(
+        row_num, attn_data, vc_packed, vc_norms, attn_out, num_heads_KV,
+        gqa_size, head_dim, tq_rot_signs.data(), local_window_size, head_kv,
+        head_kv + 1);
     }
   } else {
     // Multi-token (prefill) path
@@ -866,9 +866,10 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
 
     const uint8_t *kc_packed =
       cache_key.getData<uint8_t>() + batch * cache_key_dim.getFeatureLen();
-    const float *kc_scales =
+    const float *kc_norms =
       cache_key_scales.getData<float>() +
       batch * cache_key_scales.getDim().getFeatureLen();
+    const float *signs = tq_rot_signs.data();
 
     unsigned int seq =
       seq_len < local_window_size ? seq_len : local_window_size;
@@ -885,9 +886,10 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
         out_.getData<float>() + out_start_row * num_heads_Q;
 
       futures.emplace_back(pool.submit_task([=]() {
-        nntrainer::compute_kcaches_packed4(
-          input_addr, kc_packed, kc_scales, output_addr, row_to_compute,
-          num_heads_KV, head_dim, gqa_size, tile_size, local_window_size);
+        nntrainer::compute_kcaches_packed4_v2(
+          input_addr, kc_packed, kc_norms, output_addr, row_to_compute,
+          num_heads_KV, head_dim, gqa_size, tile_size, signs,
+          local_window_size);
       }));
     }
     for (auto &fut : futures)
@@ -898,7 +900,7 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
     // Value cache computation for prefill
     const uint8_t *vc_packed =
       cache_value.getData<uint8_t>() + batch * cache_value_dim.getFeatureLen();
-    const float *vc_scales =
+    const float *vc_norms =
       cache_value_scales.getData<float>() +
       batch * cache_value_scales.getDim().getFeatureLen();
 
@@ -918,9 +920,9 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
                      i * (num_heads_KV * gqa_size * head_dim);
 
         int row_num = is_causal ? (int)(to - seq + i) : (int)(to - 1);
-        nntrainer::compute_vcache_packed4_transposed(
-          row_num, input, vc_packed, vc_scales, out, num_heads_KV, gqa_size,
-          head_dim, local_window_size);
+        nntrainer::compute_vcache_packed4_v2(
+          row_num, input, vc_packed, vc_norms, out, num_heads_KV, gqa_size,
+          head_dim, signs, local_window_size);
       }));
     }
     for (auto &fut : v_futures)

@@ -340,6 +340,7 @@ private:
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
   bool use_turboquant = false;
+  std::vector<float> tq_rot_signs; /**< rotation signs for TurboQuant v2 */
 
   enum INOUT_INDEX {
     /** input index */
