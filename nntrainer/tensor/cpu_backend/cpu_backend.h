@@ -1626,5 +1626,27 @@ extern void compute_vcache_packed4_v2(
   int head_dim, const float *rot_signs, size_t local_window_size = UINT_MAX,
   int head_start = 0, int head_end = -1);
 
+/**
+ * @brief Quantize Value cache with per-group min-max 2-bit (paper method).
+ *        No rotation, no norm normalization — simple asymmetric quantization.
+ * @param[in]  input      FP32 values (num_heads * head_dim)
+ * @param[out] out_packed 2-bit packed (num_heads * head_dim / 4 bytes)
+ * @param[out] out_params per-group [scale, zero] pairs
+ * @param[in]  head_dim   dimension per head
+ * @param[in]  num_heads  number of heads
+ */
+extern void quantize_value_group2bit(const float *input, uint8_t *out_packed,
+                                     float *out_params, int head_dim,
+                                     int num_heads);
+
+/**
+ * @brief Compute attention-weighted V aggregation with 2-bit group min-max cache.
+ */
+extern void compute_vcache_group2bit(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_params, float *output, int num_cache_head, int gqa_size,
+  int head_dim, size_t local_window_size = UINT_MAX, int head_start = 0,
+  int head_end = -1);
+
 #endif
 #endif

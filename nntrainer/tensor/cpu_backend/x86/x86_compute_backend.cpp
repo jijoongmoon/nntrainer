@@ -601,4 +601,19 @@ void compute_vcache_packed4_v2(
     gqa_size, head_dim, rot_signs, local_window_size, head_start, head_end);
 }
 
+void quantize_value_group2bit(const float *input, uint8_t *out_packed,
+                              float *out_params, int head_dim, int num_heads) {
+  __fallback_quantize_value_group2bit(input, out_packed, out_params, head_dim,
+                                      num_heads);
+}
+void compute_vcache_group2bit(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_params, float *output, int num_cache_head, int gqa_size,
+  int head_dim, size_t local_window_size, int head_start, int head_end) {
+  __fallback_compute_vcache_group2bit(row_num, attn_weights, vcache_packed,
+                                      vcache_params, output, num_cache_head,
+                                      gqa_size, head_dim, local_window_size,
+                                      head_start, head_end);
+}
+
 } /* namespace nntrainer */

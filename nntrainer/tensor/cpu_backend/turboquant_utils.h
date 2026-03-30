@@ -256,6 +256,78 @@ inline float dequantize_turboquant(uint8_t q_val, float scale) {
   return scale * ((float)q_val - 4.0f);
 }
 
+/***********************************************************************
+ * Value cache: Group min-max 2-bit quantization (paper method)
+ *
+ * Per group of 32 elements:
+ *   scale = (max - min) / 3     (2-bit = 4 levels, range [0,3])
+ *   zero  = min
+ *   q     = clamp(round((v - zero) / scale), 0, 3)
+ *   dequant = q * scale + zero
+ *
+ * Packing: 4 values per byte (2 bits each)
+ *   byte = q3<<6 | q2<<4 | q1<<2 | q0
+ ***********************************************************************/
+
+constexpr int VALUE_GROUP_SIZE = 32;
+constexpr int VALUE_BITS = 2;
+constexpr int VALUE_LEVELS = 4; // 2^2
+
+/**
+ * @brief Quantize FP32 values with per-group asymmetric min-max, 2-bit.
+ * @param[in]  input   FP32 input (num_elements)
+ * @param[in]  num_elements total elements
+ * @param[out] out_packed  packed output (num_elements / 4 bytes)
+ * @param[out] out_params  per-group [scale, zero] pairs (2 * num_groups floats)
+ */
+inline void value_quantize_group2bit(const float *input, int num_elements,
+                                     uint8_t *out_packed, float *out_params) {
+  int num_groups = (num_elements + VALUE_GROUP_SIZE - 1) / VALUE_GROUP_SIZE;
+
+  for (int g = 0; g < num_groups; ++g) {
+    int start = g * VALUE_GROUP_SIZE;
+    int end = start + VALUE_GROUP_SIZE;
+    if (end > num_elements)
+      end = num_elements;
+
+    // Find min/max
+    float vmin = input[start], vmax = input[start];
+    for (int i = start + 1; i < end; ++i) {
+      if (input[i] < vmin) vmin = input[i];
+      if (input[i] > vmax) vmax = input[i];
+    }
+
+    float range = vmax - vmin;
+    float scale = (range > 1e-10f) ? (range / 3.0f) : 1.0f;
+    float zero = vmin;
+    out_params[g * 2] = scale;
+    out_params[g * 2 + 1] = zero;
+
+    float inv_scale = 1.0f / scale;
+
+    // Quantize 4 values per byte
+    for (int i = start; i < end; i += 4) {
+      uint8_t byte = 0;
+      for (int k = 0; k < 4 && (i + k) < end; ++k) {
+        int q = (int)std::round((input[i + k] - zero) * inv_scale);
+        if (q < 0) q = 0;
+        if (q > 3) q = 3;
+        byte |= ((uint8_t)q << (k * 2));
+      }
+      out_packed[(i - start) / 4 + start / 4] = byte;
+    }
+  }
+}
+
+/**
+ * @brief Dequantize 2-bit group min-max value at index d.
+ */
+inline float value_dequantize_2bit(uint8_t packed_byte, int pos_in_byte,
+                                   float scale, float zero) {
+  uint8_t q = (packed_byte >> (pos_in_byte * 2)) & 0x03;
+  return (float)q * scale + zero;
+}
+
 } // namespace nntrainer
 
 #endif /* __cplusplus */

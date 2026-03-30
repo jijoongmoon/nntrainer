@@ -961,4 +961,58 @@ void __fallback_compute_vcache_packed4_v2(
   }
 }
 
+void __fallback_quantize_value_group2bit(const float *input,
+                                         uint8_t *out_packed, float *out_params,
+                                         int head_dim, int num_heads) {
+  int total = num_heads * head_dim;
+  value_quantize_group2bit(input, total, out_packed, out_params);
+}
+
+void __fallback_compute_vcache_group2bit(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_params, float *output, int num_cache_head, int gqa_size,
+  int head_dim, size_t local_window_size, int head_start, int head_end) {
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  int kv_width = num_cache_head * head_dim;
+  int packed_row_bytes = kv_width / 4; // 2-bit: 4 values per byte
+  int num_groups_per_row = (kv_width + VALUE_GROUP_SIZE - 1) / VALUE_GROUP_SIZE;
+  int params_per_row = num_groups_per_row * 2; // [scale, zero] per group
+
+  int j_start = (size_t)row_num < local_window_size
+                  ? 0
+                  : row_num + 1 - (int)local_window_size;
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int h = 0; h < gqa_size; ++h) {
+      std::vector<float> acc(head_dim, 0.0f);
+
+      for (int j = j_start; j <= row_num; ++j) {
+        float a_val =
+          attn_weights[((j - j_start) * num_cache_head + n) * gqa_size + h];
+
+        const uint8_t *row_packed = vcache_packed + j * packed_row_bytes;
+        const float *row_params = vcache_params + j * params_per_row;
+
+        // Dequantize this head's values: head n starts at offset n*head_dim
+        int head_offset = n * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+          int abs_d = head_offset + d;
+          int byte_idx = abs_d / 4;
+          int pos = abs_d % 4;
+          int grp = abs_d / VALUE_GROUP_SIZE;
+          float scale = row_params[grp * 2];
+          float zero = row_params[grp * 2 + 1];
+          float val = value_dequantize_2bit(row_packed[byte_idx], pos, scale,
+                                            zero);
+          acc[d] += a_val * val;
+        }
+      }
+
+      int out_base = (n * gqa_size + h) * head_dim;
+      for (int d = 0; d < head_dim; ++d)
+        output[out_base + d] = acc[d];
+    }
+  }
+}
+
 } // namespace nntrainer

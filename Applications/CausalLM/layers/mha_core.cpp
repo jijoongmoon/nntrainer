@@ -155,18 +155,24 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   if (use_turboquant) {
     /**
-     * TurboQuant v2: norm + rotation + Lloyd-Max codebook
-     * - Packed KV cache: UINT8, width = num_heads_KV * head_dim / 2
-     * - Per-head L2 norms: FP32, width = num_heads_KV
-     * - Rotation signs: generated once at finalize
+     * TurboQuant v2 (paper Algorithm 1):
+     *   Key:   3-bit Lloyd-Max (norm+rotation), packed_width = kv_width / 2
+     *   Value: 2-bit group min-max, packed_width = kv_width / 4
      */
-    unsigned int packed_width = num_heads_KV * head_dim / 2;
+    unsigned int kv_width = num_heads_KV * head_dim;
+    unsigned int key_packed_width = kv_width / 2;   // 3-bit: 2 per byte
+    unsigned int val_packed_width = kv_width / 4;   // 2-bit: 4 per byte
+    unsigned int val_groups_per_row =
+      (kv_width + 32 - 1) / 32; // VALUE_GROUP_SIZE = 32
+    unsigned int val_params_per_row = val_groups_per_row * 2; // [scale,zero]
 
+    // Key cache: 3-bit packed (UINT8)
     ml::train::TensorDim cache_key_dim(
-      {batch_size, 1, max_timestep, packed_width},
+      {batch_size, 1, max_timestep, key_packed_width},
       {context.getFormat(), ml::train::TensorDim::DataType::UINT8});
+    // Value cache: 2-bit packed (UINT8)
     ml::train::TensorDim cache_value_dim(
-      {batch_size, 1, max_timestep, packed_width},
+      {batch_size, 1, max_timestep, val_packed_width},
       {context.getFormat(), ml::train::TensorDim::DataType::UINT8});
 
     tensor_idx[AttentionParams::cache_key] = context.requestTensor(
@@ -176,23 +182,24 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
       nntrainer::TensorLifespan::MAX_LIFESPAN);
 
-    // Per-head norm tensors (FP32)
+    // Key norms: per-head L2 norms (FP32)
     ml::train::TensorDim cache_key_norms_dim(
       {batch_size, 1, max_timestep, (unsigned int)num_heads_KV},
       {context.getFormat(), ml::train::TensorDim::DataType::FP32});
-    ml::train::TensorDim cache_value_norms_dim(
-      {batch_size, 1, max_timestep, (unsigned int)num_heads_KV},
+    // Value params: per-group [scale, zero] pairs (FP32)
+    ml::train::TensorDim cache_value_params_dim(
+      {batch_size, 1, max_timestep, val_params_per_row},
       {context.getFormat(), ml::train::TensorDim::DataType::FP32});
 
     tensor_idx[AttentionParams::cache_key_scales] = context.requestTensor(
       cache_key_norms_dim, "cache_key_norms", nntrainer::Initializer::NONE,
       false, nntrainer::TensorLifespan::MAX_LIFESPAN);
     tensor_idx[AttentionParams::cache_value_scales] = context.requestTensor(
-      cache_value_norms_dim, "cache_value_norms",
+      cache_value_params_dim, "cache_value_params",
       nntrainer::Initializer::NONE, false,
       nntrainer::TensorLifespan::MAX_LIFESPAN);
 
-    // Generate rotation signs (deterministic, per head_dim)
+    // Rotation signs for Key quantization
     tq_rot_signs.resize(head_dim);
     nntrainer::generate_random_signs(tq_rot_signs.data(), head_dim,
                                      0xDEADBEEF);
@@ -762,24 +769,27 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
     nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
 
   unsigned int kv_width = num_heads_KV * head_dim;
-  unsigned int packed_width = kv_width / 2;
+  unsigned int key_packed_width = kv_width / 2;   // 3-bit: 2 per byte
+  unsigned int val_packed_width = kv_width / 4;   // 2-bit: 4 per byte
+  unsigned int val_groups_per_row = (kv_width + 32 - 1) / 32;
+  unsigned int val_params_per_row = val_groups_per_row * 2;
 
   // 1. Apply RoPE to query (in-place)
   apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
 
-  // 2. Apply RoPE to key into a temporary FP32 buffer, then quantize+pack
+  // 2. Apply RoPE to key into a temporary FP32 buffer
   unsigned int seq_len = to - from;
   nntrainer::Tensor key_rope(1, 1, seq_len, kv_width,
                              query_step.getTensorType());
   apply_rotary_emb_tensor_v2(key_step, key_rope, head_dim, _from, false);
 
-  // 3. Quantize key with v2 (norm + rotation + Lloyd-Max) per head
+  // 3. Key: Lloyd-Max 3-bit (norm + rotation + codebook)
   for (unsigned int s = 0; s < seq_len; ++s) {
     unsigned int cache_row = from + s;
     const float *key_data = key_rope.getData<float>() + s * kv_width;
     uint8_t *packed_dst =
       cache_key.getData<uint8_t>() +
-      batch * cache_key_dim.getFeatureLen() + cache_row * packed_width;
+      batch * cache_key_dim.getFeatureLen() + cache_row * key_packed_width;
     float *norms_dst =
       cache_key_scales.getData<float>() +
       batch * cache_key_scales.getDim().getFeatureLen() +
@@ -790,28 +800,27 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
                                          num_heads_KV);
   }
 
-  // 4. Quantize value with v2 (no RoPE for values)
+  // 4. Value: Group min-max 2-bit (no rotation, simple asymmetric)
   for (unsigned int s = 0; s < seq_len; ++s) {
     unsigned int cache_row = from + s;
     const float *val_data = value_step.getData<float>() + s * kv_width;
     uint8_t *packed_dst =
       cache_value.getData<uint8_t>() +
-      batch * cache_value_dim.getFeatureLen() + cache_row * packed_width;
-    float *norms_dst =
+      batch * cache_value_dim.getFeatureLen() + cache_row * val_packed_width;
+    float *params_dst =
       cache_value_scales.getData<float>() +
       batch * cache_value_scales.getDim().getFeatureLen() +
-      cache_row * num_heads_KV;
+      cache_row * val_params_per_row;
 
-    nntrainer::quantize_kv_turboquant_v2(val_data, packed_dst, norms_dst,
-                                         tq_rot_signs.data(), head_dim,
-                                         num_heads_KV);
+    nntrainer::quantize_value_group2bit(val_data, packed_dst, params_dst,
+                                        head_dim, num_heads_KV);
   }
 
-  // 5. Compute Q*K^T attention scores using packed key cache
+  // 5. Compute Q*K^T with Key 3-bit Lloyd-Max cache
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
-  // Single-token decoding (seq_len == 1)
   if (seq_len == 1) {
+    // Single-token decoding
     int row_to_compute = is_causal ? from + 1 : from + seq_len;
 
     nntrainer::Tensor out_(1, 1, row_to_compute, num_heads_Q,
@@ -824,40 +833,37 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
     const float *kc_norms =
       cache_key_scales.getData<float>() +
       batch * cache_key_scales.getDim().getFeatureLen();
-    float *out_data = out_.getData<float>();
 
 #pragma omp parallel for schedule(static)
     for (unsigned int head_kv = 0;
-         head_kv < (unsigned int)(num_heads_Q / gqa_size); ++head_kv) {
+         head_kv < (unsigned int)num_heads_KV; ++head_kv) {
       nntrainer::compute_kcaches_packed4_v2(
-        q_data, kc_packed, kc_norms, out_data, row_to_compute, num_heads_KV,
-        head_dim, gqa_size, tile_size, tq_rot_signs.data(),
+        q_data, kc_packed, kc_norms, out_.getData<float>(), row_to_compute,
+        num_heads_KV, head_dim, gqa_size, tile_size, tq_rot_signs.data(),
         local_window_size, head_kv, head_kv + 1);
     }
 
     // 6. Softmax
     softmax_triangle(out_, seq_len, num_heads_Q, from, pool);
 
-    // 7. Compute attention-weighted values
+    // 7. Value aggregation with 2-bit group min-max cache
     const uint8_t *vc_packed =
       cache_value.getData<uint8_t>() + batch * cache_value_dim.getFeatureLen();
-    const float *vc_norms =
+    const float *vc_params =
       cache_value_scales.getData<float>() +
       batch * cache_value_scales.getDim().getFeatureLen();
-    float *attn_out = attention_output_step.getData<float>();
 
     int row_num = to - 1;
-    const float *attn_data = out_.getData<float>();
 
 #pragma omp parallel for schedule(static)
     for (int head_kv = 0; head_kv < (int)num_heads_KV; ++head_kv) {
-      nntrainer::compute_vcache_packed4_v2(
-        row_num, attn_data, vc_packed, vc_norms, attn_out, num_heads_KV,
-        gqa_size, head_dim, tq_rot_signs.data(), local_window_size, head_kv,
-        head_kv + 1);
+      nntrainer::compute_vcache_group2bit(
+        row_num, out_.getData<float>(), vc_packed, vc_params,
+        attention_output_step.getData<float>(), num_heads_KV, gqa_size,
+        head_dim, local_window_size, head_kv, head_kv + 1);
     }
   } else {
-    // Multi-token (prefill) path
+    // Multi-token (prefill)
     nntrainer::Tensor out_(
       1, 1,
       is_causal ? calc_attn_index(to) - calc_attn_index(from)
@@ -897,10 +903,9 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
 
     softmax_triangle(out_, seq_len, num_heads_Q, from, pool);
 
-    // Value cache computation for prefill
     const uint8_t *vc_packed =
       cache_value.getData<uint8_t>() + batch * cache_value_dim.getFeatureLen();
-    const float *vc_norms =
+    const float *vc_params =
       cache_value_scales.getData<float>() +
       batch * cache_value_scales.getDim().getFeatureLen();
 
@@ -920,9 +925,9 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
                      i * (num_heads_KV * gqa_size * head_dim);
 
         int row_num = is_causal ? (int)(to - seq + i) : (int)(to - 1);
-        nntrainer::compute_vcache_packed4_v2(
-          row_num, input, vc_packed, vc_norms, out, num_heads_KV, gqa_size,
-          head_dim, signs, local_window_size);
+        nntrainer::compute_vcache_group2bit(
+          row_num, input, vc_packed, vc_params, out, num_heads_KV, gqa_size,
+          head_dim, local_window_size);
       }));
     }
     for (auto &fut : v_futures)

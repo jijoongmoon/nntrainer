@@ -1384,6 +1384,15 @@ void __fallback_compute_vcache_packed4_v2(
   int head_dim, const float *rot_signs, size_t local_window_size = UINT_MAX,
   int head_start = 0, int head_end = -1);
 
+void __fallback_quantize_value_group2bit(const float *input,
+                                         uint8_t *out_packed, float *out_params,
+                                         int head_dim, int num_heads);
+void __fallback_compute_vcache_group2bit(
+  int row_num, const float *attn_weights, const uint8_t *vcache_packed,
+  const float *vcache_params, float *output, int num_cache_head, int gqa_size,
+  int head_dim, size_t local_window_size = UINT_MAX, int head_start = 0,
+  int head_end = -1);
+
 } // namespace nntrainer
 #endif
 #endif
