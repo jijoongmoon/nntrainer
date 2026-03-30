@@ -95,7 +95,11 @@ for inference and training without any configurations*/
     ML_TRAIN_MODEL_FORMAT_FLATBUFFER,             /**< flatbuffer file */
   MODEL_FORMAT_ONNX = ML_TRAIN_MODEL_FORMAT_ONNX, /**< ONNX file */
 
-  MODEL_FORMAT_QNN = ML_TRAIN_MODEL_FORMAT_QNN /**< qnn binary file */
+  MODEL_FORMAT_QNN = ML_TRAIN_MODEL_FORMAT_QNN, /**< qnn binary file */
+
+  MODEL_FORMAT_SAFETENSORS =
+    ML_TRAIN_MODEL_FORMAT_SAFETENSORS /**< safetensors format with JSON header
+                                        for name-based parallel loading */
 };
 
 /**

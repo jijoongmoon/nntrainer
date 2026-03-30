@@ -210,12 +210,23 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     if "weights" in formats:
         wc = WeightConverter(layers)
         state_dict = model.state_dict()
+
+        # Save in safetensors format (primary, name-based parallel loading)
+        st_path = os.path.join(output_dir, "model.safetensors")
+        wc.convert(state_dict, st_path, dtype=dtype,
+                   output_format="safetensors")
+        outputs["weights_safetensors"] = st_path
+        if verbose:
+            size_mb = os.path.getsize(st_path) / 1024 / 1024
+            print(f"  Weights (safetensors): {st_path} ({size_mb:.1f} MB)")
+
+        # Also save in legacy BIN format for backward compatibility
         bin_path = os.path.join(output_dir, "model.bin")
-        wc.convert(state_dict, bin_path, dtype=dtype)
+        wc.convert(state_dict, bin_path, dtype=dtype, output_format="bin")
         outputs["weights"] = bin_path
         if verbose:
             size_mb = os.path.getsize(bin_path) / 1024 / 1024
-            print(f"  Weights: {bin_path} ({size_mb:.1f} MB)")
+            print(f"  Weights (bin): {bin_path} ({size_mb:.1f} MB)")
 
         # Also save standalone weight conversion script
         script = wc.generate_script()

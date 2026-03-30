@@ -128,7 +128,11 @@ class JsonEmitter(BaseEmitter):
     # =========================================================================
 
     def _emit_weight_map(self):
-        """Emit HF state_dict key -> NNTrainer layer name mapping."""
+        """Emit HF state_dict key -> NNTrainer layer name mapping.
+
+        Includes safetensors-compatible tensor names (layer_name:weight,
+        layer_name:bias) for cross-format weight loading.
+        """
         weight_map = []
         for layer in self.layers:
             if not layer.has_weight and not layer.has_bias:
@@ -140,8 +144,10 @@ class JsonEmitter(BaseEmitter):
             if layer.has_weight:
                 entry["weight_key"] = layer.weight_hf_key
                 entry["transpose_weight"] = layer.transpose_weight
+                entry["safetensors_name"] = layer.name + ":weight"
             if layer.has_bias:
                 entry["bias_key"] = layer.bias_hf_key
+                entry["safetensors_bias_name"] = layer.name + ":bias"
             if layer.shared_from:
                 entry["shared_from"] = layer.shared_from
             weight_map.append(entry)
