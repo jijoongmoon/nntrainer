@@ -876,8 +876,17 @@ void __fallback_compute_kcaches_packed4_v2(
   int row_cnt =
     (size_t)num_rows < local_window_size ? num_rows : local_window_size;
   int packed_row_bytes = num_cache_head * head_dim / 2;
+  int num_heads_Q = num_cache_head * gqa_size;
 
-  std::vector<float> tmp_dequant(head_dim);
+  // Rotate ALL query heads ONCE: q_rot = R * q
+  // Then dot product in rotated space: <q, k> = norm_k * <q_rot, centroids[idx]>
+  std::vector<float> q_rotated(num_heads_Q * head_dim);
+  for (int h = 0; h < num_heads_Q; ++h)
+    apply_rotation(query + h * head_dim, q_rotated.data() + h * head_dim,
+                   rot_signs, head_dim);
+
+  // Centroid lookup (no Hadamard) for each cached row
+  std::vector<float> centroids_row(head_dim);
 
   for (int n = head_start; n < actual_head_end; ++n) {
     for (int t_row = 0; t_row < row_cnt; ++t_row) {
@@ -886,16 +895,23 @@ void __fallback_compute_kcaches_packed4_v2(
         kcache_packed + row * packed_row_bytes + n * head_dim / 2;
       float norm = kcache_norms[row * num_cache_head + n];
 
-      turboquant_dequantize_head(packed_ptr, norm, head_dim, tmp_dequant.data(),
-                                 rot_signs, cb);
+      // Unpack → centroid lookup only (already in rotated space)
+      for (int d = 0; d < head_dim; d += 2) {
+        uint8_t byte = packed_ptr[d / 2];
+        centroids_row[d] = cb.centroids[byte & 0x07];
+        if (d + 1 < head_dim)
+          centroids_row[d + 1] = cb.centroids[(byte >> 4) & 0x07];
+      }
 
+      // Dot product: norm * <q_rot, centroids>
       for (int g = 0; g < gqa_size; ++g) {
-        const float *q_ptr = query + n * gqa_size * head_dim + g * head_dim;
+        const float *q_ptr =
+          q_rotated.data() + (n * gqa_size + g) * head_dim;
         float sum = 0.0f;
         for (int d = 0; d < head_dim; ++d)
-          sum += q_ptr[d] * tmp_dequant[d];
+          sum += q_ptr[d] * centroids_row[d];
         output[t_row * num_cache_head * gqa_size + n * gqa_size + g] =
-          sum / std::sqrt((float)head_dim);
+          (sum * norm) / std::sqrt((float)head_dim);
       }
     }
   }
@@ -913,11 +929,11 @@ void __fallback_compute_vcache_packed4_v2(
                   ? 0
                   : row_num + 1 - (int)local_window_size;
 
-  std::vector<float> tmp_dequant(head_dim);
-
+  // Accumulate in ROTATED space (centroid space), then inverse rotate ONCE
   for (int n = head_start; n < actual_head_end; ++n) {
     for (int h = 0; h < gqa_size; ++h) {
-      std::vector<float> acc(head_dim, 0.0f);
+      // Accumulate weighted centroids in rotated space
+      std::vector<float> acc_rot(head_dim, 0.0f);
 
       for (int j = j_start; j <= row_num; ++j) {
         float a_val =
@@ -925,16 +941,22 @@ void __fallback_compute_vcache_packed4_v2(
         const uint8_t *packed_ptr =
           vcache_packed + j * packed_row_bytes + n * head_dim / 2;
         float norm = vcache_norms[j * num_cache_head + n];
+        float a_norm = a_val * norm;
 
-        turboquant_dequantize_head(packed_ptr, norm, head_dim,
-                                   tmp_dequant.data(), rot_signs, cb);
-        for (int d = 0; d < head_dim; ++d)
-          acc[d] += a_val * tmp_dequant[d];
+        for (int d = 0; d < head_dim; d += 2) {
+          uint8_t byte = packed_ptr[d / 2];
+          acc_rot[d] += a_norm * cb.centroids[byte & 0x07];
+          if (d + 1 < head_dim)
+            acc_rot[d + 1] += a_norm * cb.centroids[(byte >> 4) & 0x07];
+        }
       }
+
+      // Inverse rotate ONCE: Hadamard then sign multiply
+      apply_inverse_rotation(acc_rot.data(), rot_signs, head_dim);
 
       int out_base = (n * gqa_size + h) * head_dim;
       for (int d = 0; d < head_dim; ++d)
-        output[out_base + d] = acc[d];
+        output[out_base + d] = acc_rot[d];
     }
   }
 }
