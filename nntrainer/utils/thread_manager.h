@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -261,9 +262,22 @@ private:
           barrier_done_gen_ = my_barrier_gen;
           barrier_cv_.notify_all();
         } else {
-          barrier_cv_.wait(lock, [this, my_barrier_gen] {
-            return barrier_done_gen_ >= my_barrier_gen;
-          });
+          // wait with timeout to detect deadlocks
+          if (!barrier_cv_.wait_for(lock, std::chrono::seconds(5),
+                                    [this, my_barrier_gen] {
+                                      return barrier_done_gen_ >= my_barrier_gen;
+                                    })) {
+            fprintf(stderr,
+                    "[ThreadManager] CONDVAR BARRIER TIMEOUT: "
+                    "arrived=%d target=%d barrier_gen=%u done_gen=%u "
+                    "my_gen=%u\n",
+                    barrier_arrived_, barrier_target_, barrier_gen_,
+                    barrier_done_gen_, my_barrier_gen);
+            // retry wait (not a hard failure, just diagnostic)
+            barrier_cv_.wait(lock, [this, my_barrier_gen] {
+              return barrier_done_gen_ >= my_barrier_gen;
+            });
+          }
         }
       }
       current_task_ = nullptr;

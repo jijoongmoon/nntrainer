@@ -347,9 +347,20 @@ void ThreadManager::computeWorkerLoopCondvar(unsigned int worker_id) {
           barrier_done_gen_ = my_barrier_gen;
           barrier_cv_.notify_all();
         } else {
-          barrier_cv_.wait(lock, [this, my_barrier_gen] {
-            return barrier_done_gen_ >= my_barrier_gen;
-          });
+          if (!barrier_cv_.wait_for(lock, std::chrono::seconds(5),
+                                    [this, my_barrier_gen] {
+                                      return barrier_done_gen_ >= my_barrier_gen;
+                                    })) {
+            fprintf(stderr,
+                    "[ThreadManager] WORKER BARRIER TIMEOUT: "
+                    "arrived=%d target=%d barrier_gen=%u done_gen=%u "
+                    "my_gen=%u worker=%u\n",
+                    barrier_arrived_, barrier_target_, barrier_gen_,
+                    barrier_done_gen_, my_barrier_gen, worker_id);
+            barrier_cv_.wait(lock, [this, my_barrier_gen] {
+              return barrier_done_gen_ >= my_barrier_gen;
+            });
+          }
         }
       }
     }
