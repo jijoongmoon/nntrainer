@@ -162,6 +162,14 @@ void ThreadManager::initialize() noexcept {
     }
   }
 
+  // wait for all spin workers to be ready before allowing dispatches
+  if (spin_mode_) {
+    while (spin_workers_ready_.load(std::memory_order_acquire) <
+           config.compute_threads) {
+      std::this_thread::yield();
+    }
+  }
+
   // start I/O workers
   unsigned int io_core_start = config.compute_threads + 1;
   io_workers_.reserve(config.io_threads);
@@ -182,6 +190,9 @@ void ThreadManager::initialize() noexcept {
 
 void ThreadManager::computeWorkerLoopSpin(unsigned int worker_id) {
   unsigned int my_gen = spin_generation_.load(std::memory_order_acquire);
+
+  // signal that this worker is ready in the spin loop
+  spin_workers_ready_.fetch_add(1, std::memory_order_release);
 
   while (true) {
     // spin-wait for new generation

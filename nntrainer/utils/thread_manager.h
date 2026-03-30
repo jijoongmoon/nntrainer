@@ -261,6 +261,7 @@ private:
   alignas(64) std::atomic<bool> spin_current_sense_{false};
   alignas(64) std::atomic<unsigned int> spin_active_workers_{0};
   alignas(64) std::atomic<int> spin_active_threads_{1};
+  alignas(64) std::atomic<unsigned int> spin_workers_ready_{0};
 
   // ─── Condvar mode state ─────────────────────────────
   std::mutex dispatch_mutex_;
