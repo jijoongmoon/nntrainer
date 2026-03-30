@@ -161,7 +161,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
      */
     unsigned int kv_width = num_heads_KV * head_dim;
     unsigned int key_packed_width = kv_width / 2;   // 3-bit: 2 per byte
-    unsigned int val_packed_width = kv_width / 4;   // 2-bit: 4 per byte
+    unsigned int val_packed_width = kv_width / 2;   // 4-bit: 2 per byte
     unsigned int val_groups_per_row =
       (kv_width + 32 - 1) / 32; // VALUE_GROUP_SIZE = 32
     unsigned int val_params_per_row = val_groups_per_row * 2; // [scale,zero]
@@ -770,7 +770,7 @@ void MHACoreLayer::one_batch_incremental_forwarding_turboquant(
 
   unsigned int kv_width = num_heads_KV * head_dim;
   unsigned int key_packed_width = kv_width / 2;   // 3-bit: 2 per byte
-  unsigned int val_packed_width = kv_width / 4;   // 2-bit: 4 per byte
+  unsigned int val_packed_width = kv_width / 2;   // 4-bit: 2 per byte
   unsigned int val_groups_per_row = (kv_width + 32 - 1) / 32;
   unsigned int val_params_per_row = val_groups_per_row * 2;
 

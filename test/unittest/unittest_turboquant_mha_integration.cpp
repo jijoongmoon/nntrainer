@@ -1183,6 +1183,174 @@ TEST(turboquant_qwen3_sim, prefill_decode_1_7b_like) {
     << "Qwen3-1.7B prefill+decode cosine too low: " << avg_cosine;
 }
 
+/**
+ * @brief Qwen3-0.6B exact dimensions test.
+ *
+ *   Qwen3-0.6B: hidden=896, heads_Q=14, heads_KV=2, head_dim=64, layers=28
+ *
+ *   Simulates mha_core's exact calling pattern:
+ *   - RoPE-modulated K data (cos/sin frequency pattern)
+ *   - Prefill → packed cache → decode using packed cache
+ *   - Key: 3-bit Lloyd-Max (norm+rotation)
+ *   - Value: 2-bit group min-max
+ *   - Compare output vs FP32 reference for each decode step
+ */
+TEST(turboquant_qwen3_sim, qwen3_0_6b_exact_dims) {
+  // Qwen3-0.6B exact config
+  constexpr int NUM_HEADS_Q = 14;
+  constexpr int NUM_HEADS_KV = 2;
+  constexpr int HEAD_DIM = 64;
+  constexpr int GQA_SIZE = NUM_HEADS_Q / NUM_HEADS_KV; // 7
+  constexpr int PREFILL_LEN = 32;
+  constexpr int DECODE_LEN = 16;
+  constexpr int MAX_SEQ = PREFILL_LEN + DECODE_LEN;
+
+  constexpr int KV_WIDTH = NUM_HEADS_KV * HEAD_DIM;    // 128
+  constexpr int Q_WIDTH = NUM_HEADS_Q * HEAD_DIM;      // 896
+  constexpr int KEY_PACKED_ROW = KV_WIDTH / 2;          // 64 bytes (3-bit)
+  constexpr int VAL_PACKED_ROW = KV_WIDTH / 2;          // 32 bytes (4-bit)
+  constexpr int VAL_GROUPS = (KV_WIDTH + 32 - 1) / 32;  // 4
+  constexpr int VAL_PARAMS_ROW = VAL_GROUPS * 2;         // 8
+
+  std::mt19937 gen(42);
+  std::normal_distribution<float> normal(0.0f, 0.1f);
+
+  // Simulate RoPE-modulated data: each dim has different frequency
+  auto gen_rope_data = [&](float *dst, int width, int pos) {
+    for (int d = 0; d < width; ++d) {
+      // RoPE-like: base value * cos/sin modulation
+      float base = normal(gen);
+      float freq = 1.0f / std::pow(500000.0f, (float)(d % HEAD_DIM) / HEAD_DIM);
+      float angle = pos * freq;
+      if ((d % HEAD_DIM) < HEAD_DIM / 2)
+        dst[d] = base * std::cos(angle) + normal(gen) * std::sin(angle);
+      else
+        dst[d] = base * std::cos(angle) - normal(gen) * std::sin(angle);
+    }
+  };
+
+  std::vector<float> rot_signs(HEAD_DIM);
+  nntrainer::generate_random_signs(rot_signs.data(), HEAD_DIM, 0xDEADBEEF);
+
+  // FP32 caches
+  std::vector<float> fp32_kc(MAX_SEQ * KV_WIDTH, 0);
+  std::vector<float> fp32_vc(MAX_SEQ * KV_WIDTH, 0);
+  // TQ caches
+  std::vector<uint8_t> tq_kc(MAX_SEQ * KEY_PACKED_ROW, 0);
+  std::vector<float> tq_kn(MAX_SEQ * NUM_HEADS_KV, 0);
+  std::vector<uint8_t> tq_vc(MAX_SEQ * VAL_PACKED_ROW, 0);
+  std::vector<float> tq_vp(MAX_SEQ * VAL_PARAMS_ROW, 0);
+
+  // === PREFILL ===
+  for (int t = 0; t < PREFILL_LEN; ++t) {
+    gen_rope_data(fp32_kc.data() + t * KV_WIDTH, KV_WIDTH, t);
+    gen_rope_data(fp32_vc.data() + t * KV_WIDTH, KV_WIDTH, t);
+
+    nntrainer::quantize_kv_turboquant_v2(
+      fp32_kc.data() + t * KV_WIDTH,
+      tq_kc.data() + t * KEY_PACKED_ROW,
+      tq_kn.data() + t * NUM_HEADS_KV,
+      rot_signs.data(), HEAD_DIM, NUM_HEADS_KV);
+    nntrainer::quantize_value_group2bit(
+      fp32_vc.data() + t * KV_WIDTH,
+      tq_vc.data() + t * VAL_PACKED_ROW,
+      tq_vp.data() + t * VAL_PARAMS_ROW,
+      HEAD_DIM, NUM_HEADS_KV);
+  }
+
+  std::cout << "\n=== Qwen3-0.6B Exact Dims: Prefill(" << PREFILL_LEN
+            << ")+Decode(" << DECODE_LEN << ") ===\n"
+            << "  heads_Q=" << NUM_HEADS_Q << ", heads_KV=" << NUM_HEADS_KV
+            << ", dim=" << HEAD_DIM << ", GQA=" << GQA_SIZE << "\n"
+            << "  Key: 3-bit Lloyd-Max, Value: 2-bit group min-max\n"
+            << "  step  ctx_len  max_diff  cosine_sim\n";
+
+  float total_cosine = 0;
+  float worst_diff = 0;
+
+  // === DECODE ===
+  for (int d = 0; d < DECODE_LEN; ++d) {
+    int pos = PREFILL_LEN + d;
+    int ctx_len = pos + 1;
+
+    // New K,V for this decode token
+    gen_rope_data(fp32_kc.data() + pos * KV_WIDTH, KV_WIDTH, pos);
+    gen_rope_data(fp32_vc.data() + pos * KV_WIDTH, KV_WIDTH, pos);
+
+    nntrainer::quantize_kv_turboquant_v2(
+      fp32_kc.data() + pos * KV_WIDTH,
+      tq_kc.data() + pos * KEY_PACKED_ROW,
+      tq_kn.data() + pos * NUM_HEADS_KV,
+      rot_signs.data(), HEAD_DIM, NUM_HEADS_KV);
+    nntrainer::quantize_value_group2bit(
+      fp32_vc.data() + pos * KV_WIDTH,
+      tq_vc.data() + pos * VAL_PACKED_ROW,
+      tq_vp.data() + pos * VAL_PARAMS_ROW,
+      HEAD_DIM, NUM_HEADS_KV);
+
+    // Query
+    std::vector<float> query(Q_WIDTH);
+    gen_rope_data(query.data(), Q_WIDTH, pos);
+
+    // --- FP32 reference ---
+    std::vector<float> fp32_out(Q_WIDTH, 0);
+    fp32_reference_attention(query.data(), fp32_kc.data(), fp32_vc.data(),
+                             fp32_out.data(), ctx_len, NUM_HEADS_Q,
+                             NUM_HEADS_KV, HEAD_DIM);
+
+    // --- TQ: Key 3-bit Lloyd-Max ---
+    std::vector<float> tq_scores(ctx_len * NUM_HEADS_Q, 0);
+    nntrainer::compute_kcaches_packed4_v2(
+      query.data(), tq_kc.data(), tq_kn.data(), tq_scores.data(), ctx_len,
+      NUM_HEADS_KV, HEAD_DIM, GQA_SIZE, 4, rot_signs.data());
+
+    // Softmax
+    for (int h = 0; h < NUM_HEADS_Q; ++h) {
+      float mx = -1e30f;
+      for (int r = 0; r < ctx_len; ++r)
+        mx = std::max(mx, tq_scores[r * NUM_HEADS_Q + h]);
+      float se = 0;
+      for (int r = 0; r < ctx_len; ++r) {
+        tq_scores[r * NUM_HEADS_Q + h] =
+          std::exp(tq_scores[r * NUM_HEADS_Q + h] - mx);
+        se += tq_scores[r * NUM_HEADS_Q + h];
+      }
+      for (int r = 0; r < ctx_len; ++r)
+        tq_scores[r * NUM_HEADS_Q + h] /= se;
+    }
+
+    // --- TQ: Value 2-bit group min-max ---
+    std::vector<float> tq_out(Q_WIDTH, 0);
+    nntrainer::compute_vcache_group2bit(
+      pos, tq_scores.data(), tq_vc.data(), tq_vp.data(), tq_out.data(),
+      NUM_HEADS_KV, GQA_SIZE, HEAD_DIM);
+
+    // Compare
+    float max_diff = 0, dot_ab = 0, dot_aa = 0, dot_bb = 0;
+    for (int i = 0; i < Q_WIDTH; ++i) {
+      ASSERT_TRUE(std::isfinite(tq_out[i])) << "d=" << d << " i=" << i;
+      float diff = std::fabs(fp32_out[i] - tq_out[i]);
+      max_diff = std::max(max_diff, diff);
+      dot_ab += fp32_out[i] * tq_out[i];
+      dot_aa += fp32_out[i] * fp32_out[i];
+      dot_bb += tq_out[i] * tq_out[i];
+    }
+    float cosine = (dot_aa > 0 && dot_bb > 0)
+                     ? dot_ab / (std::sqrt(dot_aa) * std::sqrt(dot_bb))
+                     : 0;
+    total_cosine += cosine;
+    worst_diff = std::max(worst_diff, max_diff);
+
+    printf("  %4d  %7d  %.6f  %.6f\n", d, ctx_len, max_diff, cosine);
+  }
+
+  float avg_cos = total_cosine / DECODE_LEN;
+  std::cout << "\n  avg_cosine = " << avg_cos
+            << "\n  worst_diff = " << worst_diff << "\n";
+
+  EXPECT_GT(avg_cos, 0.95f) << "Qwen3-0.6B cosine too low";
+}
+
 GTEST_API_ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

@@ -965,7 +965,7 @@ void __fallback_quantize_value_group2bit(const float *input,
                                          uint8_t *out_packed, float *out_params,
                                          int head_dim, int num_heads) {
   int total = num_heads * head_dim;
-  value_quantize_group2bit(input, total, out_packed, out_params);
+  value_quantize_group4bit(input, total, out_packed, out_params);
 }
 
 void __fallback_compute_vcache_group2bit(
@@ -974,7 +974,7 @@ void __fallback_compute_vcache_group2bit(
   int head_dim, size_t local_window_size, int head_start, int head_end) {
   int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
   int kv_width = num_cache_head * head_dim;
-  int packed_row_bytes = kv_width / 4; // 2-bit: 4 values per byte
+  int packed_row_bytes = kv_width / 2; // 4-bit: 2 values per byte
   int num_groups_per_row = (kv_width + VALUE_GROUP_SIZE - 1) / VALUE_GROUP_SIZE;
   int params_per_row = num_groups_per_row * 2; // [scale, zero] per group
 
@@ -997,12 +997,12 @@ void __fallback_compute_vcache_group2bit(
         int head_offset = n * head_dim;
         for (int d = 0; d < head_dim; ++d) {
           int abs_d = head_offset + d;
-          int byte_idx = abs_d / 4;
-          int pos = abs_d % 4;
+          int byte_idx = abs_d / 2;   // 4-bit: 2 per byte
+          int pos = abs_d % 2;
           int grp = abs_d / VALUE_GROUP_SIZE;
           float scale = row_params[grp * 2];
           float zero = row_params[grp * 2 + 1];
-          float val = value_dequantize_2bit(row_packed[byte_idx], pos, scale,
+          float val = value_dequantize_4bit(row_packed[byte_idx], pos, scale,
                                             zero);
           acc[d] += a_val * val;
         }

@@ -320,11 +320,63 @@ inline void value_quantize_group2bit(const float *input, int num_elements,
 }
 
 /**
- * @brief Dequantize 2-bit group min-max value at index d.
+ * @brief Quantize FP32 values with per-group asymmetric min-max, 4-bit.
+ *        16 levels (0-15), 2 values per byte.
+ * @param[in]  input   FP32 input (num_elements)
+ * @param[in]  num_elements total elements
+ * @param[out] out_packed  packed output (num_elements / 2 bytes)
+ * @param[out] out_params  per-group [scale, zero] pairs (2 * num_groups floats)
  */
-inline float value_dequantize_2bit(uint8_t packed_byte, int pos_in_byte,
+inline void value_quantize_group4bit(const float *input, int num_elements,
+                                     uint8_t *out_packed, float *out_params) {
+  int num_groups = (num_elements + VALUE_GROUP_SIZE - 1) / VALUE_GROUP_SIZE;
+
+  for (int g = 0; g < num_groups; ++g) {
+    int start = g * VALUE_GROUP_SIZE;
+    int end = start + VALUE_GROUP_SIZE;
+    if (end > num_elements)
+      end = num_elements;
+
+    float vmin = input[start], vmax = input[start];
+    for (int i = start + 1; i < end; ++i) {
+      if (input[i] < vmin) vmin = input[i];
+      if (input[i] > vmax) vmax = input[i];
+    }
+
+    float range = vmax - vmin;
+    float scale = (range > 1e-10f) ? (range / 15.0f) : 1.0f;
+    float zero = vmin;
+    out_params[g * 2] = scale;
+    out_params[g * 2 + 1] = zero;
+
+    float inv_scale = 1.0f / scale;
+
+    // Pack 2 values per byte (4 bits each)
+    for (int i = start; i < end; i += 2) {
+      int q0 = (int)std::round((input[i] - zero) * inv_scale);
+      if (q0 < 0) q0 = 0;
+      if (q0 > 15) q0 = 15;
+
+      int q1 = 0;
+      if (i + 1 < end) {
+        q1 = (int)std::round((input[i + 1] - zero) * inv_scale);
+        if (q1 < 0) q1 = 0;
+        if (q1 > 15) q1 = 15;
+      }
+
+      out_packed[(i - start) / 2 + start / 2] =
+        ((uint8_t)q1 << 4) | (uint8_t)q0;
+    }
+  }
+}
+
+/**
+ * @brief Dequantize 4-bit group min-max value at index d.
+ */
+inline float value_dequantize_4bit(uint8_t packed_byte, int pos_in_byte,
                                    float scale, float zero) {
-  uint8_t q = (packed_byte >> (pos_in_byte * 2)) & 0x03;
+  uint8_t q = (pos_in_byte == 0) ? (packed_byte & 0x0F)
+                                 : ((packed_byte >> 4) & 0x0F);
   return (float)q * scale + zero;
 }
 
