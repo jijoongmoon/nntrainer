@@ -289,6 +289,7 @@ private:
   alignas(64) std::atomic<bool> in_graph_exec_{false};
   alignas(64) std::atomic<bool> graph_exec_done_{false};
   alignas(64) std::atomic<int> graph_n_threads_{1};
+  alignas(64) std::atomic<unsigned int> graph_sleeping_{0};
   std::mutex graph_mutex_;
   std::condition_variable graph_cv_;
   unsigned int graph_gen_{0};

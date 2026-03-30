@@ -21,7 +21,6 @@
 #include <cross_entropy_sigmoid_loss_layer.h>
 #include <cross_entropy_softmax_loss_layer.h>
 #include <engine.h>
-#include <thread_manager.h>
 #include <flatten_layer.h>
 #include <grucell.h>
 #include <identity_layer.h>
@@ -396,23 +395,17 @@ sharedConstTensors NetworkGraph::forwarding(
   bool training,
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
-  auto &tm = nntrainer::ThreadManager::Global();
-  tm.beginGraphExec();
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
     forwarding_op(*iter, training);
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
   }
-  tm.endGraphExec();
 
   sharedConstTensors out;
   for (unsigned int i = 0; i < graph.getNumOutputNodes(); ++i) {
     auto const &output_layer_node = LNODE(graph.getOutputNode(i));
     for (unsigned int j = 0; j < output_layer_node->getNumOutputs(); ++j) {
-      // @todo we should determine what type to return
-      // out.push_back(MAKE_SHARED_TENSOR(
-      //   output_layer_node->getOutput(j).clone(TensorDim::DataType::FP32)));
       out.push_back(MAKE_SHARED_TENSOR(output_layer_node->getOutput(j)));
     }
   }
@@ -424,15 +417,12 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
-  auto &tm = nntrainer::ThreadManager::Global();
-  tm.beginGraphExec();
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
     forwarding_op(*iter, training);
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
   }
-  tm.endGraphExec();
 
   sharedConstTensors out;
   for (unsigned int i = 0; i < graph.getNumOutputNodes(); ++i) {

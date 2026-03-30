@@ -98,16 +98,23 @@ ThreadManager::~ThreadManager() {
 
   stop_.store(true, std::memory_order_release);
 
+  // wake and join graph workers
+  graph_cv_.notify_all();
+  for (auto &t : graph_workers_)
+    if (t.joinable())
+      t.join();
+
+  // wake and join compute workers
   if (spin_mode_) {
     spin_generation_.fetch_add(1, std::memory_order_seq_cst);
   } else {
     dispatch_cv_.notify_all();
   }
-
   for (auto &t : compute_workers_)
     if (t.joinable())
       t.join();
 
+  // wake and join I/O workers
   io_cv_.notify_all();
   for (auto &t : io_workers_)
     if (t.joinable())
@@ -178,76 +185,100 @@ void ThreadManager::initialize() noexcept {
 
 // ─── GRAPH EXECUTION ─────────────────────────────────────────────
 //
-// beginGraphExec(): spawn temporary graph workers that spin-wait on
-// barriers. Between barriers they do work. The caller drives the loop:
-//
-//   beginGraphExec()
-//   for (each layer):
-//     tm.parallel_for(...)  → graphDispatch: barrier(ready) → work → barrier(done)
-//   endGraphExec()
-//
-// This eliminates generation spin between dispatches (~0.2us vs ~1-4us).
+// Graph workers are created ONCE (lazily on first beginGraphExec).
+// beginGraphExec/endGraphExec just toggle the mode flag and synchronize.
+// Workers spin between barriers during graph exec, sleep via condvar when idle.
 
 void ThreadManager::beginGraphExec() {
   if (in_graph_exec_.load(std::memory_order_acquire))
     return;
 
   unsigned int n = static_cast<unsigned int>(compute_workers_.size());
+  if (n == 0)
+    return;
+
   graph_n_threads_.store(static_cast<int>(n + 1), std::memory_order_release);
   spin_n_barrier_.store(0, std::memory_order_release);
   spin_barrier_sense_.store(false, std::memory_order_release);
-
   graph_exec_done_.store(false, std::memory_order_release);
-  in_graph_exec_.store(true, std::memory_order_release);
 
-  // spawn dedicated graph worker threads
-  graph_workers_.reserve(n);
-  for (unsigned int i = 0; i < n; ++i) {
-    graph_workers_.emplace_back([this, i] { graphWorkerLoop(i); });
+  // lazy-create graph workers (only once, reused across sessions)
+  if (graph_workers_.empty()) {
+    graph_workers_.reserve(n);
+    for (unsigned int i = 0; i < n; ++i)
+      graph_workers_.emplace_back([this, i] { graphWorkerLoop(i); });
   }
+
+  // wake graph workers from condvar sleep
+  {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    ++graph_gen_;
+    in_graph_exec_.store(true, std::memory_order_release);
+  }
+  graph_cv_.notify_all();
 }
 
 void ThreadManager::endGraphExec() {
   if (!in_graph_exec_.load(std::memory_order_acquire))
     return;
 
-  // signal graph workers to exit
+  // signal workers to exit spin loop after current work
   graph_exec_done_.store(true, std::memory_order_release);
 
-  // do a final barrier to release workers from their spin
+  // final barrier to release workers from their spin
   bool sense = !spin_barrier_sense_.load(std::memory_order_relaxed);
   spinBarrier(sense);
 
-  for (auto &t : graph_workers_)
-    if (t.joinable())
-      t.join();
-  graph_workers_.clear();
+  // wait until all graph workers have returned to condvar sleep
+  unsigned int n = static_cast<unsigned int>(graph_workers_.size());
+  while (graph_sleeping_.load(std::memory_order_acquire) < n) {
+    std::this_thread::yield();
+  }
 
   in_graph_exec_.store(false, std::memory_order_release);
 }
 
 void ThreadManager::graphWorkerLoop(unsigned int /*worker_id*/) {
+  unsigned int my_gen = 0;
+
   while (true) {
-    // ── Barrier 1: wait for work to be ready ──
-    bool sense1 = !spin_barrier_sense_.load(std::memory_order_acquire);
-    spinBarrier(sense1);
-
-    // check exit
-    if (graph_exec_done_.load(std::memory_order_acquire))
-      return;
-
-    // ── Do work (grab chunks via atomic counter) ──
-    size_t end = task_end_;
-    while (true) {
-      size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
-      if (idx >= end)
-        break;
-      current_task_(idx);
+    // ── Sleep until beginGraphExec wakes us ──
+    graph_sleeping_.fetch_add(1, std::memory_order_release);
+    {
+      std::unique_lock<std::mutex> lock(graph_mutex_);
+      graph_cv_.wait(lock, [this, &my_gen] {
+        return graph_gen_ != my_gen ||
+               stop_.load(std::memory_order_acquire);
+      });
+      if (stop_.load(std::memory_order_acquire))
+        return;
+      my_gen = graph_gen_;
     }
+    graph_sleeping_.fetch_sub(1, std::memory_order_release);
 
-    // ── Barrier 2: signal work completion ──
-    bool sense2 = !spin_barrier_sense_.load(std::memory_order_acquire);
-    spinBarrier(sense2);
+    // ── Graph execution spin loop ──
+    while (!graph_exec_done_.load(std::memory_order_acquire)) {
+      // Barrier 1: wait for work to be ready
+      bool sense1 = !spin_barrier_sense_.load(std::memory_order_acquire);
+      spinBarrier(sense1);
+
+      if (graph_exec_done_.load(std::memory_order_acquire))
+        break;
+
+      // Do work
+      size_t end = task_end_;
+      while (true) {
+        size_t idx = current_chunk_.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= end)
+          break;
+        current_task_(idx);
+      }
+
+      // Barrier 2: signal work completion
+      bool sense2 = !spin_barrier_sense_.load(std::memory_order_acquire);
+      spinBarrier(sense2);
+    }
+    // back to condvar sleep for next beginGraphExec
   }
 }
 
