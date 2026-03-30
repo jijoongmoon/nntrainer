@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -145,8 +146,21 @@ private:
       spin_barrier_sense_.store(sense, std::memory_order_release);
       return;
     }
+    unsigned int spin = 0;
     while (spin_barrier_sense_.load(std::memory_order_acquire) != sense) {
       cpuRelax();
+      if (++spin > 500000000u) {
+        fprintf(stderr,
+                "[ThreadManager] SPIN BARRIER STALL: sense=%d "
+                "barrier_sense=%d n_barrier=%d active_threads=%d "
+                "n_was=%d active_workers=%u\n",
+                (int)sense,
+                (int)spin_barrier_sense_.load(std::memory_order_relaxed),
+                spin_n_barrier_.load(std::memory_order_relaxed),
+                spin_active_threads_.load(std::memory_order_relaxed), n,
+                spin_active_workers_.load(std::memory_order_relaxed));
+        spin = 0;
+      }
     }
   }
 
