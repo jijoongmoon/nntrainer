@@ -76,6 +76,8 @@ test_target = [
   ['unittest_nntrainer_lr_scheduler', []],
   ['unittest_nntrainer_save_with_dtype', []]
   #['unittest_nntrainer_task', []],
+  ['unittest_thread_manager', []],
+  ['unittest_threading_benchmark', []],
 ]
 
 if host_machine.system() != 'windows'
@@ -121,7 +123,7 @@ endforeach
 
 unittest_inc = include_directories('.')
 
-# subdir('memory')
+subdir('memory')
 subdir('compiler')
 subdir('layers')
 subdir('datasets')
