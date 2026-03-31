@@ -11,6 +11,8 @@
 
 #include <numeric>
 
+#include <thread_manager.h>
+
 #include <char_tensor.h>
 #include <float_tensor.h>
 #include <int4_tensor.h>
@@ -876,7 +878,7 @@ Tensor &Tensor::sqrt(Tensor &output) const {
 };
 
 Tensor Tensor::neg() const {
-  Tensor output("", getFormat(), getDataType());
+  Tensor output(getDim());
   return neg(output);
 };
 
@@ -884,7 +886,7 @@ Tensor &Tensor::neg(Tensor &output) const {
   if (size() != output.size() || getDataType() != output.getDataType() ||
       getFormat() != output.getFormat())
     throw std::invalid_argument(
-      "Error: Tensor::sqrt requires output tensor to be same size, data type "
+      "Error: Tensor::neg requires output tensor to be same size, data type "
       "and format as input tensor.");
 
   itensor_->multiply(-1, output);
@@ -928,6 +930,51 @@ void Tensor::tan(Tensor &output, float alpha) const {
       "and format as input tensor.");
 
   itensor_->tan(output, alpha);
+}
+
+int Tensor::exp_i() {
+  exp(*this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::exp() const {
+  Tensor output("", getFormat(), getDataType());
+  return exp(output);
+}
+
+Tensor &Tensor::exp(Tensor &output) const {
+  itensor_->exp(output);
+  return output;
+}
+
+int Tensor::log_i() {
+  log(*this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::log() const {
+  Tensor output("", getFormat(), getDataType());
+  return log(output);
+}
+
+Tensor &Tensor::log(Tensor &output) const {
+  itensor_->log(output);
+  return output;
+}
+
+int Tensor::clamp_i(float min, float max) {
+  clamp(min, max, *this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::clamp(float min, float max) const {
+  Tensor output("", getFormat(), getDataType());
+  return clamp(min, max, output);
+}
+
+Tensor &Tensor::clamp(float min, float max, Tensor &output) const {
+  itensor_->clamp(min, max, output);
+  return output;
 }
 
 void Tensor::inv_sqrt_i() { itensor_->inv_sqrt(*this); }
@@ -1327,9 +1374,9 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
   unsigned char *dst_data =
     static_cast<unsigned char *>(output.getData<void>());
 
-// Parallel copy using OpenMP
-#pragma omp parallel for schedule(static)
-  for (int i = 0; i < static_cast<int>(indices.size()); ++i) {
+// Parallel copy using ThreadManager
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(indices.size()), [&](size_t i) {
     const unsigned batch_idx = indices[i];
 
     // Calculate memory offsets
@@ -1345,7 +1392,7 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
     // Perform memory copy
     std::memcpy(dst_data + dst_offset, src_data + src_offset,
                 single_batch_bytes);
-  }
+  });
 
   return output;
 }

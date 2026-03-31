@@ -36,7 +36,9 @@
 
 #include <layer.h>
 #include <model.h>
+#include <tensor_api.h>
 #include <random>
+#include <vector>
 
 #include <limits.h>
 
@@ -48,10 +50,29 @@
 namespace causallm {
 
 /*** ALIAS ****/
-using LayerHandle = std::shared_ptr<ml::train::Layer>;
+using LayerHandle = ml::train::LayerHandle;
+using Tensor = ml::train::Tensor;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 
 using json = nlohmann::json;
+
+/**
+ * @brief KV cache buffer storage for external cache mode.
+ *        Each layer has a pair of (key_cache, value_cache) raw buffers.
+ */
+struct KVCacheBuffers {
+  std::vector<std::vector<float>> key_buffers;   /**< per-layer key cache */
+  std::vector<std::vector<float>> value_buffers;  /**< per-layer value cache */
+
+  void allocate(unsigned int num_layers, size_t cache_size) {
+    key_buffers.resize(num_layers);
+    value_buffers.resize(num_layers);
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      key_buffers[i].resize(cache_size, 0.0f);
+      value_buffers[i].resize(cache_size, 0.0f);
+    }
+  }
+};
 
 /**
  * @brief Model Type Enum
@@ -107,30 +128,41 @@ protected:
   virtual void setupParameters(json &cfg, json &generation_cfg, json &nntr_cfg);
 
   /**
-   * @brief Construct Model
+   * @brief Construct Model using symbolic tensor graph
    */
   virtual void constructModel();
 
   /**
    * @brief create Attention Layer
    */
-  virtual std::vector<LayerHandle>
-  createTransformerDecoderBlock(const int layer_id, std::string input_name);
+  virtual Tensor createTransformerDecoderBlock(const int layer_id,
+                                               Tensor input);
 
   /**
    * @brief create Attention Layer
+   * @param layer_id Decoder block index
+   * @param seq_len Sequence length
+   * @param n_heads Number of attention heads
+   * @param head_dim Head dimension
+   * @param query Query tensor
+   * @param key Key tensor
+   * @param value Value tensor
+   * @return Output tensor of the attention
    */
-  virtual std::vector<LayerHandle>
-  createAttention(const int layer_id, int seq_len, int n_heads, int head_dim,
-                  std::string query_name, std::string key_name,
-                  std::string value_name);
+  virtual Tensor createAttention(const int layer_id, int seq_len, int n_heads,
+                                 int head_dim, Tensor query, Tensor key,
+                                 Tensor value);
 
   /**
    * @brief create Feed Forward Layer
+   * @param layer_id Decoder block index
+   * @param dim Model dimension
+   * @param hidden_dim FFN hidden dimension
+   * @param input Input tensor
+   * @return Output tensor of the MLP
    */
-  virtual std::vector<LayerHandle> createMlp(const int layer_id, int dim,
-                                             int hidden_dim,
-                                             std::string input_name);
+  virtual Tensor createMlp(const int layer_id, int dim, int hidden_dim,
+                            Tensor input);
 
   /**
    * @brief register CustomLayers
@@ -173,8 +205,20 @@ protected:
   unsigned int MAX_POSITION_EMBEDDINGS; /**< max_position embeddings */
   bool MEMORY_SWAP;                     /**< memory swap option */
   unsigned int FSU_LOOKAHEAD;
+  unsigned int SYS_PROMP_LEN;
+  std::string PRE_COMPUTED_CACHE_PATH;
+  std::string TAIL_PROMPT;
+  bool SAVE_KVCACHE;
+  bool USE_KVCACHE;
+  unsigned int global_token_len;
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
+
+  std::mt19937 rng; /**< Random Number Gen */
+
+  KVCacheBuffers kv_cache_buffers;    /**< External KV cache buffers */
+  std::vector<Tensor> key_cache_tensors; /**< per-layer key cache tensors */
+  std::vector<Tensor> val_cache_tensors; /**< per-layer value cache tensors */
 };
 /**
  * Loads JSON data from a file with detailed error handling

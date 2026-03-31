@@ -93,6 +93,10 @@ typedef enum {
   ML_TRAIN_LAYER_TYPE_RESHAPE = 52, /**< Reshape Layer type (Since 10.0) */
   ML_TRAIN_LAYER_TYPE_UPSAMPLE2D =
     53, /**< Upsample2D Layer type (Since 10.0) */
+  ML_TRAIN_LAYER_TYPE_GROUP_NORMALIZATION =
+    54, /**< Group Normalization Layer type */
+  ML_TRAIN_LAYER_TYPE_INSTANCE_NORMALIZATION =
+    55, /**< Instance Normalization Layer type */
   ML_TRAIN_LAYER_TYPE_PREPROCESS_FLIP =
     300, /**< Preprocess flip Layer (Since 6.5) */
   ML_TRAIN_LAYER_TYPE_PREPROCESS_TRANSLATE =
@@ -288,7 +292,10 @@ typedef enum {
   ML_TRAIN_MODEL_FORMAT_ONNX =
     4, /**< QNNX binary format file saves model configurations and weights. */
   ML_TRAIN_MODEL_FORMAT_QNN =
-    5 /**< QNN binary format file saves model configurations and weights. */
+    5, /**< QNN binary format file saves model configurations and weights. */
+  ML_TRAIN_MODEL_FORMAT_SAFETENSORS =
+    6 /**< Safetensors format file saves model weights with JSON header for
+          name-based, offset-based parallel loading. */
 } ml_train_model_format_e;
 
 /**
