@@ -388,6 +388,125 @@ def _remove_position_id_chains(layers):
 
 
 # =============================================================================
+# Rotary Embedding Chain Removal
+# =============================================================================
+
+# Tensor op types that can appear in RoPE computation/application chains.
+_ROPE_CHAIN_OPS = frozenset({
+    LAYER_MULTIPLY, LAYER_ADDITION, LAYER_SUBTRACT, LAYER_NEGATIVE,
+    LAYER_RESHAPE, LAYER_TRANSPOSE, LAYER_PERMUTE,
+    "concat", "slice", "cos", "sin", "matmul",
+})
+
+
+def _remove_rope_chains(layers):
+    """Remove rotary position embedding computation chains.
+
+    NNTrainer's mha_core layer handles RoPE internally via rope_theta config
+    (same approach as llama.cpp: discard inv_freq, compute at runtime).
+
+    The FX graph contains two parts:
+    1. rotary_emb module: inv_freq → matmul → cat → cos/sin
+    2. Per-attention rotate_half: Q/K → split → neg → cat → mul(sin)
+                                  Q/K → mul(cos)
+                                  → add(cos_part, sin_part) → SDPA
+
+    This function:
+    - Identifies rotary_emb scope layers (forward: mark by name)
+    - Traces forward to mark layers with rope inputs (mul, reshape, etc.)
+    - Traces backward to mark layers whose ALL consumers are removable
+      (captures rotate_half: split, neg, cat that only feed rope multiply)
+    - Rewires SDPA inputs from rotated Q/K (add) to pre-rotation Q/K
+
+    Returns the filtered layer list.
+    """
+    by_name = {l.name: l for l in layers}
+
+    # Build consumer graph: layer_name -> set of consumer layer names
+    consumers = {}
+    for l in layers:
+        for inp in (l.input_layers or []):
+            consumers.setdefault(inp, set()).add(l.name)
+
+    # Step 1: Seed with rotary_emb scope layers
+    removable = set()
+    for l in layers:
+        if "rotary_emb" in l.name:
+            removable.add(l.name)
+
+    if not removable:
+        return layers
+
+    # Step 2: Forward pass — mark tensor ops that have ANY input from
+    # the removable set (these consume rope cos/sin outputs)
+    changed = True
+    while changed:
+        changed = False
+        for l in layers:
+            if l.name in removable or l.layer_type not in _ROPE_CHAIN_OPS:
+                continue
+            if l.input_layers and any(inp in removable
+                                      for inp in l.input_layers):
+                removable.add(l.name)
+                changed = True
+
+    # Step 3: Backward pass — mark tensor ops whose ALL consumers are
+    # already removable (captures rotate_half: split→neg→cat chains
+    # that only feed into the rope multiply layers)
+    changed = True
+    while changed:
+        changed = False
+        for l in layers:
+            if l.name in removable or l.layer_type not in _ROPE_CHAIN_OPS:
+                continue
+            layer_consumers = consumers.get(l.name, set())
+            if layer_consumers and all(c in removable
+                                       for c in layer_consumers):
+                removable.add(l.name)
+                changed = True
+
+    # Step 4: Build rewire map for terminal addition layers.
+    # Each RoPE-application `add` feeds into SDPA with the rotated Q or K.
+    # We need to replace it with the pre-rotation Q/K tensor.
+    # Pattern: add ← [mul(Q*cos), mul(rotated*sin)]
+    #          mul(Q*cos) ← [Q_pre_rotation, cos_unsqueeze]
+    #          The non-rope input to mul is the pre-rotation tensor.
+    rewire_map = {}  # removable_layer_name -> replacement_name
+    for name in removable:
+        layer = by_name[name]
+        if layer.layer_type != LAYER_ADDITION:
+            continue
+        # Find the pre-rotation source via the cos-multiply branch
+        for inp_name in layer.input_layers:
+            inp_layer = by_name.get(inp_name)
+            if inp_layer and inp_layer.layer_type == LAYER_MULTIPLY:
+                for mul_inp in inp_layer.input_layers:
+                    if mul_inp not in removable:
+                        rewire_map[name] = mul_inp
+                        break
+            if name in rewire_map:
+                break
+
+    # Step 5: Rewire downstream layers (SDPA, etc.)
+    for l in layers:
+        if l.name in removable or not l.input_layers:
+            continue
+        new_inputs = []
+        for inp in l.input_layers:
+            if inp in rewire_map:
+                new_inputs.append(rewire_map[inp])
+            elif inp in removable:
+                continue  # drop dead reference
+            else:
+                new_inputs.append(inp)
+        l.input_layers = new_inputs
+
+    filtered = [l for l in layers if l.name not in removable]
+    print(f"  [CLEANUP] Removed {len(removable)} rotary embedding layers")
+    return filtered
+
+
+# =============================================================================
 # Adaptive Converter Pipeline
 # =============================================================================
 
@@ -499,6 +618,10 @@ class AdaptiveConverter:
         # Pass 3.7: Remove position ID computation chains
         # (arithmetic ops that exclusively feed position embeddings)
         layers = _remove_position_id_chains(layers)
+
+        # Pass 3.7.5: Remove rotary embedding chains
+        # (NNTrainer mha_core handles RoPE via rope_theta, like llama.cpp)
+        layers = _remove_rope_chains(layers)
 
         # Pass 3.8: Convert intermediate op types to final NNTrainer types
         _OP_TO_LAYER = {
