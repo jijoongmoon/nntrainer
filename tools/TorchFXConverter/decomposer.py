@@ -508,6 +508,79 @@ def _remove_rope_chains(layers):
 
 
 # =============================================================================
+# Orphan Layer Repair
+# =============================================================================
+
+def _repair_orphaned_layers(layers, graph):
+    """Reconnect non-input layers that lost all input_layers during cleanup.
+
+    After removal passes (noop, dropout, rope, position ID), some layers may
+    end up with empty input_layers if their inputs were removed but the layer
+    itself survived. This function tries to recover their inputs from the
+    original FX graph connectivity.
+
+    Layers that can't be recovered are left as-is (they'll get phantom input
+    layers from _add_input_layers_and_shape_info if they have dangling refs,
+    or remain inputless if truly orphaned).
+
+    Args:
+        layers: List of NNTrainerLayerDef (post-cleanup).
+        graph: FX graph from tracer (original node connectivity).
+
+    Returns:
+        Updated layers list (same length, some layers may have restored inputs).
+    """
+    defined = {l.name for l in layers}
+    fx_nodes = {node.name: node for node in graph.nodes}
+
+    # Build fx_node_name -> layer_name mapping for recovery
+    fx_to_layer = {}
+    for l in layers:
+        if l.fx_node_name and l.fx_node_name != l.name:
+            fx_to_layer[l.fx_node_name] = l.name
+        fx_to_layer[l.name] = l.name
+
+    repaired = 0
+    for l in layers:
+        if l.layer_type == LAYER_INPUT:
+            continue
+
+        # Check for truly orphaned (empty inputs) or all-dangling refs
+        is_orphaned = not l.input_layers
+        if not is_orphaned:
+            valid = [inp for inp in l.input_layers if inp in defined]
+            if not valid:
+                is_orphaned = True
+
+        if not is_orphaned:
+            continue
+
+        # Try to recover from FX graph.
+        fx_name = l.fx_node_name or l.name
+        fx_node = fx_nodes.get(fx_name)
+        if fx_node is None:
+            continue
+
+        # Walk FX node args to find a surviving layer
+        recovered = []
+        for arg in fx_node.args:
+            if not hasattr(arg, 'name'):
+                continue
+            candidate = fx_to_layer.get(arg.name)
+            if candidate and candidate in defined and candidate != l.name:
+                recovered.append(candidate)
+
+        if recovered:
+            l.input_layers = recovered
+            repaired += 1
+
+    if repaired:
+        print(f"  [CLEANUP] Orphan repair: {repaired} reconnected")
+
+    return layers
+
+
+# =============================================================================
 # Adaptive Converter Pipeline
 # =============================================================================
 
@@ -623,6 +696,10 @@ class AdaptiveConverter:
         # Pass 3.7.5: Remove rotary embedding chains
         # (NNTrainer mha_core handles RoPE via rope_theta, like llama.cpp)
         layers = _remove_rope_chains(layers)
+
+        # Pass 3.7.9: Repair orphaned layers (non-input layers that lost
+        # all input_layers during cleanup passes)
+        layers = _repair_orphaned_layers(layers, tracer.graph)
 
         # Pass 3.8: Convert intermediate op types to final NNTrainer types
         _OP_TO_LAYER = {
@@ -787,29 +864,73 @@ def _add_input_layers_and_shape_info(layers, graph, input_kwargs):
                 input_rank = len(in_shape)
 
         index_arg = node.args[1]
-        # Handle multi-dimensional indexing: tensor[..., idx]
+        # Handle multi-dimensional indexing: tensor[..., idx] or
+        # tensor[..., start:end]
         # e.g. span_idx[:, :, 0] → args[1] = (slice(None), slice(None), 0)
+        # e.g. conv_out[..., :seqlen] → args[1] = (Ellipsis, slice(None, 8))
         if isinstance(index_arg, (list, tuple)):
-            # Find the axis being indexed (first non-slice(None) element)
-            for ax, idx in enumerate(index_arg):
+            # Resolve Ellipsis to concrete axes
+            # Ellipsis fills remaining dims to match input_rank
+            expanded = []
+            for item in index_arg:
+                if item is Ellipsis:
+                    # Fill with slice(None) for the missing dims
+                    n_explicit = sum(1 for x in index_arg
+                                     if x is not Ellipsis)
+                    for _ in range(input_rank - n_explicit):
+                        expanded.append(slice(None))
+                else:
+                    expanded.append(item)
+
+            if not expanded:
+                expanded = list(index_arg)
+
+            # Find the axis being indexed (first non-trivial element)
+            for ax, idx in enumerate(expanded):
                 if isinstance(idx, int):
-                    # Convert PyTorch dim to NCHW axis (1-3).
-                    # For a tensor of rank R mapped to 4D NCHW:
-                    #   nchw_dim = pytorch_dim + (4 - R) for dims > 0
+                    # Integer indexing: extract single element
                     nn_axis = ax + (4 - input_rank)
-                    nn_axis = max(1, min(3, nn_axis))  # clamp to 1-3
+                    nn_axis = max(1, min(3, nn_axis))
                     if idx < 0:
-                        # Need input shape to resolve negative index
                         in_shape = input_node.meta.get('output_shape') \
                             if input_node else None
                         if in_shape and ax < len(in_shape):
-                            idx = in_shape[ax] + idx  # resolve negative
+                            idx = in_shape[ax] + idx
                         else:
                             break
                     # NNTrainer slice: 1-based, end is exclusive
                     layer.properties["axis"] = nn_axis
                     layer.properties["start_index"] = idx + 1
                     layer.properties["end_index"] = idx + 2
+                    break
+                elif isinstance(idx, slice) and idx != slice(None):
+                    # Slice object: extract range [start:stop]
+                    nn_axis = ax + (4 - input_rank)
+                    nn_axis = max(1, min(3, nn_axis))
+                    start = idx.start if idx.start is not None else 0
+                    stop = idx.stop
+                    if stop is None:
+                        # Open-ended slice — need input shape
+                        in_shape = input_node.meta.get('output_shape') \
+                            if input_node else None
+                        if in_shape and ax < len(in_shape):
+                            stop = in_shape[ax]
+                        else:
+                            break
+                    if start < 0 or stop < 0:
+                        in_shape = input_node.meta.get('output_shape') \
+                            if input_node else None
+                        if in_shape and ax < len(in_shape):
+                            if start < 0:
+                                start = in_shape[ax] + start
+                            if stop < 0:
+                                stop = in_shape[ax] + stop
+                        else:
+                            break
+                    # NNTrainer slice: 1-based, end is inclusive
+                    layer.properties["axis"] = nn_axis
+                    layer.properties["start_index"] = start + 1
+                    layer.properties["end_index"] = stop
                     break
         elif isinstance(index_arg, int):
             # Simple integer indexing on first non-batch dim
@@ -818,6 +939,29 @@ def _add_input_layers_and_shape_info(layers, graph, input_kwargs):
             layer.properties["axis"] = nn_axis
             layer.properties["start_index"] = index_arg + 1
             layer.properties["end_index"] = index_arg + 2
+        elif isinstance(index_arg, slice) and index_arg != slice(None):
+            # Simple slice on first non-batch dim
+            nn_axis = 1 + (4 - input_rank)
+            nn_axis = max(1, min(3, nn_axis))
+            start = index_arg.start if index_arg.start is not None else 0
+            stop = index_arg.stop
+            if stop is None:
+                in_shape = input_node.meta.get('output_shape') \
+                    if input_node else None
+                if in_shape and len(in_shape) > 1:
+                    stop = in_shape[1]
+            if stop is not None:
+                if start < 0 or stop < 0:
+                    in_shape = input_node.meta.get('output_shape') \
+                        if input_node else None
+                    if in_shape and len(in_shape) > 1:
+                        if start < 0:
+                            start = in_shape[1] + start
+                        if stop < 0:
+                            stop = in_shape[1] + stop
+                layer.properties["axis"] = nn_axis
+                layer.properties["start_index"] = start + 1
+                layer.properties["end_index"] = stop
 
     # Fix gather axis: convert PyTorch dim to NCHW axis (1-3)
     for layer in layers:
