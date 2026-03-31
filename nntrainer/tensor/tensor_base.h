@@ -430,6 +430,21 @@ public:
   virtual void tan(Tensor &output, float alpha = 1.0);
 
   /**
+   * @copydoc Tensor::exp(Tensor &output)
+   */
+  virtual Tensor &exp(Tensor &output) const;
+
+  /**
+   * @copydoc Tensor::log(Tensor &output)
+   */
+  virtual Tensor &log(Tensor &output) const;
+
+  /**
+   * @copydoc Tensor::clamp(float min, float max, Tensor &output)
+   */
+  virtual Tensor &clamp(float min, float max, Tensor &output) const;
+
+  /**
    * @brief      inverse squared root function
    * @param[out] out out to store the result
    */
