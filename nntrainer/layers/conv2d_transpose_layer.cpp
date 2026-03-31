@@ -19,7 +19,7 @@
 #include <cpu_backend.h>
 #include <layer_context.h>
 #include <lazy_tensor.h>
-#include <nntr_threads.h>
+#include <thread_manager.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -358,29 +358,19 @@ void Conv2DTransposeLayer::forwarding(RunLayerContext &context, bool training) {
    * Below sets the pad area values to zero
    * it is faster to do this way than seting selective area to zero
    */
-  auto forwarding_job = [&](unsigned int s, unsigned int e, unsigned int pid,
-                            void *user_data) {
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(in_dim.batch()), [&](size_t b) {
     Tensor result = Tensor(
       calcCol2ImOutputDim(out_dim, filter_dim)); // result is temporary data
     result.setZero();
-    for (unsigned int b = s; b < e; ++b) {
-      Tensor out = hidden_.getBatchSlice(b, 1);
-      out.reshape({filter_size, out_dim.width() * out_dim.height()});
-      Tensor in_sub = input_.getBatchSlice(b, 1);
+    Tensor out = hidden_.getBatchSlice(b, 1);
+    out.reshape({filter_size, out_dim.width() * out_dim.height()});
+    Tensor in_sub = input_.getBatchSlice(b, 1);
 
-      im2col_transpose(in_sub, filter_dim, padding, stride, dilation, result);
-      filter_kernel.dot(result, out, false, true);
-    }
+    im2col_transpose(in_sub, filter_dim, padding, stride, dilation, result);
+    filter_kernel.dot(result, out, false, true);
     result.deallocate();
-  };
-
-  auto workers = ParallelBatch(forwarding_job, in_dim.batch(), nullptr);
-
-  if (workers.getNumWorkers() > 1) {
-    workers.run();
-  } else {
-    forwarding_job(0, in_dim.batch(), 0, nullptr);
-  }
+  });
 
   filter_kernel.reshape(filter_dim);
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
@@ -414,30 +404,20 @@ void Conv2DTransposeLayer::calcDerivative(RunLayerContext &context) {
   /// filter_kernel^T X derivaitive  -> column matrix
   /// col2im(column matrix) to reconstruct the original image
 
-  auto compute_derivative = [&](unsigned int s, unsigned int e,
-                                unsigned int pid, void *user_data) {
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(derivative.batch()), [&](size_t b) {
     Tensor result =
       Tensor(calcCol2ImOutputDim(derivative.getDim(), filter_dim));
 
-    for (unsigned int b = s; b < e; ++b) {
-      Tensor deriv_sub = derivative.getBatchSlice(b, 1);
-      Tensor in_deriv_sub = input_derivative.getBatchSlice(b, 1);
-      deriv_sub.reshape(
-        {filter_size, derivative.width() * derivative.height()});
-      filter_kernel.dot(deriv_sub, result, true, false);
-      col2im_transpose(result, filter_dim, padding, stride, dilation,
-                       in_deriv_sub);
-    }
+    Tensor deriv_sub = derivative.getBatchSlice(b, 1);
+    Tensor in_deriv_sub = input_derivative.getBatchSlice(b, 1);
+    deriv_sub.reshape(
+      {filter_size, derivative.width() * derivative.height()});
+    filter_kernel.dot(deriv_sub, result, true, false);
+    col2im_transpose(result, filter_dim, padding, stride, dilation,
+                     in_deriv_sub);
     result.deallocate();
-  };
-
-  auto workers = ParallelBatch(compute_derivative, derivative.batch(), nullptr);
-
-  if (workers.getNumWorkers() > 1) {
-    workers.run();
-  } else {
-    compute_derivative(0, derivative.batch(), 0, nullptr);
-  }
+  });
 
   filter_kernel.reshape(filter_dim);
 }
@@ -467,10 +447,10 @@ void Conv2DTransposeLayer::calcGradient(RunLayerContext &context) {
 
   TensorDim out_dim_squeezed{filter_size,
                              derivative.width() * derivative.height()};
-  auto workers = ParallelBatch(input_.batch());
+  auto &tm = nntrainer::ThreadManager::Global();
   /// input -(im2col)-> column_matrix -> filter x (column_matrix) = output
   /// so delK = dy x column_matrix ^ T;
-  if (workers.getNumWorkers() > 1) {
+  if (input_.batch() > 1) {
 
     TensorDim delK_ext = filter_dim_squeezed;
     delK_ext.batch(input_.batch());
@@ -478,32 +458,25 @@ void Conv2DTransposeLayer::calcGradient(RunLayerContext &context) {
     Tensor delK_par = Tensor(delK_ext);
     delK_par.setZero();
 
-    auto calc_grad_job = [&](unsigned int s, unsigned int e, unsigned int pid,
-                             void *user_data) {
+    tm.parallel_for(0, static_cast<size_t>(input_.batch()), [&](size_t b) {
       Tensor result =
         Tensor(calcCol2ImOutputDim(derivative.getDim(), filter_dim));
       result.setZero();
-      for (unsigned int b = s; b < e; ++b) {
-        Tensor deriv_sub = derivative.getBatchSlice(b, 1);
-        Tensor delK_sub = delK_par.getBatchSlice(b, 1);
-        deriv_sub.reshape(out_dim_squeezed);
+      Tensor deriv_sub = derivative.getBatchSlice(b, 1);
+      Tensor delK_sub = delK_par.getBatchSlice(b, 1);
+      deriv_sub.reshape(out_dim_squeezed);
 
-        Tensor in_sub = input_.getBatchSlice(b, 1);
+      Tensor in_sub = input_.getBatchSlice(b, 1);
 
-        /**
-         * @todo this result can be cached from the forward iteration at the
-         * expense of memory. In this case, memory of im2col_result must be
-         * saved for the whole batch. try this while benchmarking.
-         */
-        im2col_transpose(in_sub, filter_dim, padding, stride, dilation, result);
-        deriv_sub.dot(result, delK_sub, false, false);
-      }
+      /**
+       * @todo this result can be cached from the forward iteration at the
+       * expense of memory. In this case, memory of im2col_result must be
+       * saved for the whole batch. try this while benchmarking.
+       */
+      im2col_transpose(in_sub, filter_dim, padding, stride, dilation, result);
+      deriv_sub.dot(result, delK_sub, false, false);
       result.deallocate();
-    };
-
-    workers.setCallback(calc_grad_job, nullptr);
-
-    workers.run();
+    });
 
     for (unsigned int b = 0; b < input_.batch(); ++b) {
       Tensor delK_sub = delK_par.getBatchSlice(b, 1);

@@ -55,10 +55,12 @@
 #include <fc_layer.h>
 #include <flatten_layer.h>
 #include <gather_layer.h>
+#include <group_normalization_layer.h>
 #include <gru.h>
 #include <grucell.h>
 #include <identity_layer.h>
 #include <input_layer.h>
+#include <instance_normalization_layer.h>
 #include <layer_normalization_layer.h>
 #include <lr_scheduler_constant.h>
 #include <lr_scheduler_cosine.h>
@@ -321,6 +323,12 @@ void AppContext::add_default_object() {
   registerFactory(nntrainer::createLayer<LayerNormalizationLayer>,
                   LayerNormalizationLayer::type,
                   LayerType::LAYER_LAYER_NORMALIZATION);
+  registerFactory(nntrainer::createLayer<GroupNormalizationLayer>,
+                  GroupNormalizationLayer::type,
+                  LayerType::LAYER_GROUP_NORMALIZATION);
+  registerFactory(nntrainer::createLayer<InstanceNormalizationLayer>,
+                  InstanceNormalizationLayer::type,
+                  LayerType::LAYER_INSTANCE_NORMALIZATION);
   registerFactory(nntrainer::createLayer<Conv2DLayer>, Conv2DLayer::type,
                   LayerType::LAYER_CONV2D);
   registerFactory(nntrainer::createLayer<Conv2DTransposeLayer>,
