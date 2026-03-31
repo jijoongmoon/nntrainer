@@ -122,10 +122,10 @@ void ThreadManager::checkin() {
     futex_wake(&has_active_threads_);
   }
 #elif defined(_WIN32)
-  std::lock_guard<std::mutex> lock(command_mutex_);
+  std::lock_guard<std::mutex> lock(completion_mutex_);
   size_t t = active_threads_.fetch_sub(1, std::memory_order_acq_rel) - 1;
   if (t == 0) {
-    command_cv_.notify_all();
+    completion_cv_.notify_all();
   }
 
 #endif
