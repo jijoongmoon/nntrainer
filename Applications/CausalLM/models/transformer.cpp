@@ -218,7 +218,13 @@ void Transformer::load_weight(const std::string &weight_path) {
   }
 
   try {
-    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    // Auto-detect format from file extension
+    ml::train::ModelFormat format = ml::train::ModelFormat::MODEL_FORMAT_BIN;
+    if (weight_path.size() >= 12 &&
+        weight_path.compare(weight_path.size() - 12, 12, ".safetensors") == 0) {
+      format = ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS;
+    }
+    model->load(weight_path, format);
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to load model weights: " +
                              std::string(e.what()));

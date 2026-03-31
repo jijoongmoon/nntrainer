@@ -475,8 +475,6 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
    * **/
-  auto &pool =
-    nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
 
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,
@@ -533,13 +531,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
-                  cache_to - cache_from, num_heads_Q, gqa_size, head_dim, pool);
+                  cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
 
-  softmax_triangle(out_, step_size, num_heads_Q, cache_from, pool);
+  softmax_triangle(out_, step_size, num_heads_Q, cache_from);
 
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
-                                cache_to, pool);
+                                cache_to);
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
