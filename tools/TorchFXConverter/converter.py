@@ -242,6 +242,53 @@ def convert_model(model_name_or_path, output_dir, formats=None,
         if verbose:
             print(f"  Weight script: {script_path}")
 
+    # Emit visualizer-ready JSON (conversion_result.json) with FX graph,
+    # node mapping, and generated C++/INI sources for the VS Code plugin
+    from vscode_bridge import (serialize_fx_graph, serialize_layer,
+                               serialize_structure, build_node_mapping)
+
+    viz_data = {
+        "nntrainerLayers": [serialize_layer(l) for l in layers],
+        "fxGraph": serialize_fx_graph(result.graph),
+        "modelStructure": serialize_structure(structure),
+        "nodeMapping": build_node_mapping(layers, result.graph),
+        "unsupportedOps": [l.name for l in result.unsupported_ops],
+        "unknownLayers": [l.name for l in result.unknown_layers],
+        "decomposedModules": list(result.decomposed_module_types),
+        "inheritTransformer": inherit_transformer,
+    }
+
+    # Include generated sources so visualizer can show them
+    if "cpp" in formats:
+        viz_data["cppHeader"] = emit_cpp_header(
+            layers, structure, model_name=effective_name,
+            inherit_transformer=inherit_transformer)
+        viz_data["cppSource"] = emit_cpp_source(
+            layers, structure, model_name=effective_name,
+            inherit_transformer=inherit_transformer)
+    if "ini" in formats:
+        viz_data["iniConfig"] = emit_ini(
+            layers, structure, batch_size=batch_size, mode="structured")
+
+    # Weight map for cross-referencing HF keys to NNTrainer layers
+    weight_map = []
+    for layer in layers:
+        if layer.has_weight and layer.weight_hf_key:
+            weight_map.append({
+                "layer_name": layer.name,
+                "layer_type": layer.layer_type,
+                "weight_key": layer.weight_hf_key,
+                "transpose_weight": layer.transpose_weight,
+            })
+    viz_data["weightMap"] = weight_map
+
+    viz_path = os.path.join(output_dir, "conversion_result.json")
+    with open(viz_path, "w") as f:
+        json.dump(viz_data, f, indent=2, default=str)
+    outputs["visualizer_json"] = viz_path
+    if verbose:
+        print(f"  Visualizer JSON: {viz_path}")
+
     if verbose:
         print(f"\nConversion complete! Output: {output_dir}")
 
