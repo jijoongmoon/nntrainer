@@ -34,6 +34,10 @@
 #include <cl_context.h>
 #endif
 
+#if defined(ENABLE_NPU) && ENABLE_NPU == 1
+#include <qnn_context.h>
+#endif
+
 #include "bs_thread_pool_manager.hpp"
 #include "singleton.h"
 

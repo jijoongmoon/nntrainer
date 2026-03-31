@@ -1,11 +1,12 @@
-# QNN context sources
+# Note: qnn_context.h and qnn_context.cpp have been moved to nntrainer/nntrainer/
+# and are now included in the main nntrainer build
+# Only qnn_rpc_manager files remain here
+
 qnn_context_sources = [
-  meson.current_source_dir() / 'qnn_context.cpp',
   meson.current_source_dir() / 'qnn_rpc_manager.cpp',
 ]
 
 qnn_context_headers = [
-  meson.current_source_dir() / 'qnn_context.h',
   meson.current_source_dir() / 'qnn_rpc_manager.h',
   meson.current_source_dir() / 'qnn_context_var.h',
 ]

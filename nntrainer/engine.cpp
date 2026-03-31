@@ -50,6 +50,12 @@ void Engine::add_default_object() {
 
   registerContext("gpu", &cl_context);
 #endif
+
+#if defined(ENABLE_NPU) && ENABLE_NPU == 1
+  auto &qnn_context = nntrainer::QNNContext::Global();
+
+  registerContext("qnn", &qnn_context);
+#endif
 }
 
 void Engine::initialize() noexcept {
