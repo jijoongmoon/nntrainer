@@ -577,6 +577,24 @@ def _repair_orphaned_layers(layers, graph):
     if repaired:
         print(f"  [CLEANUP] Orphan repair: {repaired} reconnected")
 
+    # Remove dead nodes: orphaned layers (no inputs) that have no consumers
+    consumer_inputs = set()
+    for l in layers:
+        for inp in (l.input_layers or []):
+            consumer_inputs.add(inp)
+
+    dead_names = set()
+    for l in layers:
+        if l.layer_type == LAYER_INPUT:
+            continue
+        if not l.input_layers and l.name not in consumer_inputs:
+            dead_names.add(l.name)
+
+    if dead_names:
+        layers = [l for l in layers if l.name not in dead_names]
+        print(f"  [CLEANUP] Dead node removal: {len(dead_names)} removed "
+              f"({', '.join(sorted(dead_names)[:5])}{'...' if len(dead_names) > 5 else ''})")
+
     return layers
 
 
