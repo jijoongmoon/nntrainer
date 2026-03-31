@@ -86,3 +86,7 @@ test_api = executable('test_api',
     build_by_default: true,
     install: false,
 )
+
+if get_option('enable-test')
+  subdir('test')
+endif

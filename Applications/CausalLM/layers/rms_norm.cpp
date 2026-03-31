@@ -29,12 +29,14 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
                                                context.getWeightDataType());
 
   nntrainer::TensorDim gamma_dim(1, 1, 1, input_dim.width(), tensor_type);
+  auto gamma_initializer =
+    std::get<props::RMS_NORM_GAMMA_INIT>(rms_props).get();
   wt_idx[RMSParams::gamma] = context.requestWeight(
-    gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
+    gamma_dim, gamma_initializer, nntrainer::WeightRegularizer::NONE, 1.0f,
+    0.0f, "gamma", true);
 
-  nntrainer::TensorDim reduced_dim(1, input_dim.channel(), input_dim.height(),
-                                   1, tensor_type);
+  nntrainer::TensorDim reduced_dim(input_dim.batch(), input_dim.channel(),
+                                   input_dim.height(), 1, tensor_type);
 
   /** caches variance = mean(x^2) + epsilon */
   wt_idx[RMSParams::variance] =
