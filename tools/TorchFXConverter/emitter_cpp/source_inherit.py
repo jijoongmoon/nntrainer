@@ -1,9 +1,15 @@
 """C++ source generation for Transformer-inheriting models.
 
-Generates only the overridden methods (createAttention, registerCustomLayers)
-and a test factory method. The base class (CausalLM/Transformer) provides
-constructModel(), createTransformerDecoderBlock(), createMlp(), initialize(),
-load_weight(), run(), etc.
+Generates overridden methods that differ from the base Transformer class.
+The base class (CausalLM/Transformer) provides default implementations for
+decoder-only models with pre-norm, RoPE, SwiGLU.
+
+For encoder-only models (BERT), the following differences must be overridden:
+- constructModel(): different embedding (token + position + token_type), post-norm
+- createTransformerDecoderBlock(): post-norm instead of pre-norm, LayerNorm
+- createAttention(): no RoPE, bias enabled, bidirectional
+- createMlp(): GELU instead of SwiGLU
+- setupParameters(): different config keys (layer_norm_eps vs rms_norm_eps)
 """
 
 from .helpers import _class_name, _cpp_tensor_layer, get_file_base, get_norm_type
@@ -15,22 +21,67 @@ from .source_custom import (
 )
 
 
+def _get_arch_diffs(structure, attn_block):
+    """Detect architectural differences from the Transformer base class.
+
+    Returns a dict describing what needs to be overridden.
+    """
+    s = structure
+    norm_type = get_norm_type(s.model_type)
+    block = s.blocks[0] if s.blocks else None
+
+    diffs = {
+        "is_encoder_only": s.arch_type == "encoder_only",
+        "is_post_norm": block and block.norm_type == "post_norm",
+        "uses_layer_norm": norm_type == "layer_normalization",
+        "no_rope": attn_block and not attn_block.attention.has_rope,
+        "has_bias": True if norm_type == "layer_normalization" else False,
+        "non_swiglu_ffn": (block and block.ffn and
+                           block.ffn.ffn_type not in ("swiglu",)),
+        "has_qk_norm": attn_block and attn_block.attention.has_qk_norm,
+        "has_position_embedding": s.arch_type == "encoder_only",
+        "has_token_type_embedding": s.arch_type == "encoder_only",
+    }
+
+    # Determine which methods need overriding
+    diffs["override_construct_model"] = (
+        diffs["has_position_embedding"] or
+        diffs["has_token_type_embedding"] or
+        diffs["is_post_norm"] or
+        diffs["uses_layer_norm"]
+    )
+    diffs["override_block"] = (
+        diffs["is_post_norm"] or
+        diffs["uses_layer_norm"]
+    )
+    diffs["override_attention"] = (
+        diffs["no_rope"] or
+        diffs["has_bias"] or
+        diffs["has_qk_norm"]
+    )
+    diffs["override_mlp"] = diffs["non_swiglu_ffn"]
+    diffs["override_setup_params"] = (
+        diffs["uses_layer_norm"] or
+        diffs["no_rope"]
+    )
+
+    return diffs
+
+
 def emit_inherit_source(structure, attn_block, custom_classes, model_name):
     """Generate source file for Transformer-inheriting model.
 
-    Only emits methods that differ from the base Transformer class:
-    - createAttention() if model has QK norms or other attention differences
-    - createMlp() if model has non-standard FFN (e.g., GELU instead of SwiGLU)
-    - registerCustomLayers() to register model-specific custom layers
-    - createTestModel() static factory for standalone testing
+    Analyzes architectural differences from the base Transformer class
+    and emits only the methods that need to be overridden.
     """
     s = structure
     cname = _class_name(s.model_type, s.arch_type)
     header_file = get_file_base(s, model_name) + ".h"
     norm_type = get_norm_type(s.model_type)
+    diffs = _get_arch_diffs(s, attn_block)
 
     has_lm_head = bool(s.lm_head)
-    has_qk_norm = attn_block and attn_block.attention.has_qk_norm
+    has_qk_norm = diffs["has_qk_norm"]
     need_variant = has_qk_norm
 
     if has_lm_head and s.arch_type == "decoder_only":
@@ -97,7 +148,6 @@ def emit_inherit_source(structure, attn_block, custom_classes, model_name):
 
         # registerCustomLayers for variant
         L.append(f"void {variant_name}::registerCustomLayers() {{")
-        # Register only variant-specific layers (e.g., ReshapedRMSNorm)
         variant_classes = set()
         if has_qk_norm:
             variant_classes.add("ReshapedRMSNormLayer")
@@ -106,6 +156,22 @@ def emit_inherit_source(structure, attn_block, custom_classes, model_name):
         L.append(f"")
 
     # --- Main class methods ---
+
+    # setupParameters override for encoder-only models
+    if diffs["override_setup_params"]:
+        _emit_setup_parameters_override(L, cname, s, diffs)
+
+    # constructModel override for encoder-only models
+    if diffs["override_construct_model"]:
+        _emit_construct_model_override(L, cname, s, diffs, norm_type)
+
+    # createTransformerDecoderBlock override for post-norm models
+    if diffs["override_block"]:
+        _emit_block_override(L, cname, s, diffs, norm_type)
+
+    # createAttention override for models without RoPE or with bias
+    if diffs["override_attention"] and not need_variant:
+        _emit_attention_override(L, cname, s, attn_block, diffs)
 
     # registerCustomLayers: combines base + variant registrations
     L.append(f"void {cname}::registerCustomLayers() {{")
@@ -121,13 +187,14 @@ def emit_inherit_source(structure, attn_block, custom_classes, model_name):
     L.append(f"}}")
     L.append(f"")
 
-    # If model has non-standard FFN and no variant handles it, emit createMlp
+    # createMlp override if non-SwiGLU FFN
     ffn_block = next((b for b in s.blocks if b.ffn), None)
-    if ffn_block and ffn_block.ffn.ffn_type not in ("swiglu",):
+    if diffs["override_mlp"] and ffn_block:
         L.append(emit_ffn_method(cname, ffn_block))
 
     # createTestModel: factory method for standalone testing
-    _emit_test_factory(L, cname, s, need_variant, base_class, variant_name)
+    _emit_test_factory(L, cname, s, need_variant, base_class, variant_name,
+                       diffs)
 
     L.append(f"}} // namespace causallm")
     L.append(f"")
@@ -152,9 +219,6 @@ def _emit_layer_registration(L, classes):
 
 def _get_extra_custom_classes(all_classes, base_class):
     """Return custom classes that aren't already registered by the base."""
-    # Base Transformer registers: SwiGLU, RMSNorm, MHACore,
-    # TieWordEmbedding, Embedding
-    # CausalLM also registers: LmHead
     base_registered = {
         "SwiGLULayer", "RMSNormLayer", "MHACoreLayer",
         "TieWordEmbedding", "EmbeddingLayer",
@@ -164,8 +228,363 @@ def _get_extra_custom_classes(all_classes, base_class):
     return sorted(set(all_classes) - base_registered)
 
 
-def _emit_test_factory(L, cname, s, need_variant, base_class, variant_name):
+# -------------------------------------------------------------------------
+# Override emitters for encoder-only (BERT-like) models
+# -------------------------------------------------------------------------
+
+def _emit_setup_parameters_override(L, cname, s, diffs):
+    """Emit setupParameters() override for models with different config keys.
+
+    BERT uses layer_norm_eps (not rms_norm_eps) and has no rope_theta.
+    """
+    norm_eps_key = "layer_norm_eps" if diffs["uses_layer_norm"] else "rms_norm_eps"
+
+    L.append(f"void {cname}::setupParameters(json &cfg, json &generation_cfg,")
+    L.append(f"                              json &nntr_cfg) {{")
+    L.append(f"")
+    L.append(f"  // nntrainer parameters")
+    L.append(f'  BATCH_SIZE = nntr_cfg["batch_size"].get<unsigned int>();')
+    L.append(f'  MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"]'
+             f'.get<std::string>();')
+    L.append(f'  INIT_SEQ_LEN = nntr_cfg["init_seq_len"];')
+    L.append(f'  MAX_SEQ_LEN = nntr_cfg.value("max_seq_len", INIT_SEQ_LEN);')
+    L.append(f'  NUM_TO_GENERATE = nntr_cfg.value("num_to_generate", 0);')
+    L.append(f'  MEMORY_SWAP = nntr_cfg.value("fsu", false);')
+    L.append(f'  FSU_LOOKAHEAD = nntr_cfg.value("fsu_lookahead", 1u);')
+    L.append(f'  EMBEDDING_DTYPE = nntr_cfg.value("embedding_dtype",'
+             f' MODEL_TENSOR_TYPE);')
+    L.append(f'  FC_LAYER_DTYPE = nntr_cfg.value("fc_layer_dtype",'
+             f' MODEL_TENSOR_TYPE);')
+    L.append(f"")
+
+    # is_causal
+    if diffs["is_encoder_only"]:
+        L.append(f"  // Encoder-only model: bidirectional attention")
+        L.append(f"  IS_CAUSAL = false;")
+    else:
+        L.append(f"  IS_CAUSAL = cfg.value(\"is_causal\", true);")
+    L.append(f"")
+
+    L.append(f"  // Model architecture parameters")
+    L.append(f'  NUM_VOCAB = cfg["vocab_size"];')
+    L.append(f'  DIM = cfg["hidden_size"];')
+    L.append(f'  INTERMEDIATE_SIZE = cfg["intermediate_size"];')
+    L.append(f'  NUM_LAYERS = cfg["num_hidden_layers"];')
+    L.append(f'  NUM_HEADS = cfg["num_attention_heads"];')
+    L.append(f'  HEAD_DIM = cfg.value("head_dim", DIM / NUM_HEADS);')
+    L.append(f'  NUM_KEY_VALUE_HEADS = cfg.value("num_key_value_heads",'
+             f' NUM_HEADS);')
+    L.append(f'  MAX_POSITION_EMBEDDINGS = cfg.value('
+             f'"max_position_embeddings", 512u);')
+    L.append(f'  TIE_WORD_EMBEDDINGS = cfg.value("tie_word_embeddings",'
+             f' false);')
+    L.append(f'  NORM_EPS = cfg.value("{norm_eps_key}", 1e-12f);')
+
+    if diffs["no_rope"]:
+        L.append(f"  ROPE_THETA = 0;  // No RoPE for this model")
+    else:
+        L.append(f'  ROPE_THETA = cfg.value("rope_theta", 10000u);')
+
+    L.append(f"  GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;")
+    L.append(f'  SLIDING_WINDOW = cfg.value("sliding_window", UINT_MAX);')
+    L.append(f"}}")
+    L.append(f"")
+
+
+def _emit_construct_model_override(L, cname, s, diffs, norm_type):
+    """Emit constructModel() override for encoder-only models.
+
+    Key differences from base Transformer:
+    - Multiple embeddings (token + position + token_type) with addition
+    - Post-embedding LayerNorm (BERT-style)
+    - No final output norm (each block ends with its own norm)
+    """
+    L.append(f"void {cname}::constructModel() {{")
+    L.append(f"")
+    L.append(f"  using ml::train::createLayer;")
+    L.append(f"")
+    L.append(f"  // Input layer")
+    L.append(f'  LayerHandle input_layer(createLayer("input", {{')
+    L.append(f'    withKey("name", "input0"),')
+    L.append(f'    withKey("input_shape", "1:1:" +'
+             f' std::to_string(INIT_SEQ_LEN))')
+    L.append(f"  }}));")
+    L.append(f"  Tensor input = input_layer(Tensor());")
+    L.append(f"  std::vector<Tensor> all_inputs = {{input}};")
+    L.append(f"")
+
+    if diffs["has_position_embedding"]:
+        L.append(f"  // Position IDs input")
+        L.append(f'  LayerHandle pos_input(createLayer("input", {{')
+        L.append(f'    withKey("name", "position_ids"),')
+        L.append(f'    withKey("input_shape", "1:1:" +'
+                 f' std::to_string(INIT_SEQ_LEN))')
+        L.append(f"  }}));")
+        L.append(f"  Tensor pos_ids = pos_input(Tensor());")
+        L.append(f"  all_inputs.push_back(pos_ids);")
+        L.append(f"")
+
+    if diffs["has_token_type_embedding"]:
+        L.append(f"  // Token type IDs input")
+        L.append(f'  LayerHandle tt_input(createLayer("input", {{')
+        L.append(f'    withKey("name", "token_type_ids"),')
+        L.append(f'    withKey("input_shape", "1:1:" +'
+                 f' std::to_string(INIT_SEQ_LEN))')
+        L.append(f"  }}));")
+        L.append(f"  Tensor tt_ids = tt_input(Tensor());")
+        L.append(f"  all_inputs.push_back(tt_ids);")
+        L.append(f"")
+
+    # Token embedding
+    L.append(f"  // Token embedding")
+    if s.tie_word_embeddings:
+        L.append(f'  const std::string embedding_type = '
+                 f'TIE_WORD_EMBEDDINGS ? '
+                 f'"tie_word_embeddings" : "embedding_layer";')
+    else:
+        L.append(f'  const std::string embedding_type = "embedding_layer";')
+    L.append(f'  LayerHandle word_emb(createLayer(embedding_type, {{')
+    L.append(f'    withKey("name", "embedding0"),')
+    L.append(f'    withKey("in_dim", NUM_VOCAB),')
+    L.append(f'    withKey("out_dim", DIM)')
+    L.append(f"  }}));")
+    L.append(f"  Tensor x = word_emb(input);")
+    L.append(f"")
+
+    if diffs["has_position_embedding"]:
+        L.append(f"  // Position embedding")
+        L.append(f'  LayerHandle pos_emb(createLayer("embedding_layer", {{')
+        L.append(f'    withKey("name", "position_embedding"),')
+        L.append(f'    withKey("in_dim", MAX_POSITION_EMBEDDINGS),')
+        L.append(f'    withKey("out_dim", DIM)')
+        L.append(f"  }}));")
+        L.append(f"  Tensor pos_out = pos_emb(pos_ids);")
+        L.append(f"  x = x.add(pos_out);")
+        L.append(f"")
+
+    if diffs["has_token_type_embedding"]:
+        type_vocab = getattr(s, 'type_vocab_size', 2) or 2
+        L.append(f"  // Token type embedding")
+        L.append(f'  LayerHandle tt_emb(createLayer("embedding_layer", {{')
+        L.append(f'    withKey("name", "token_type_embedding"),')
+        L.append(f'    withKey("in_dim", {type_vocab}),')
+        L.append(f'    withKey("out_dim", DIM)')
+        L.append(f"  }}));")
+        L.append(f"  Tensor tt_out = tt_emb(tt_ids);")
+        L.append(f"  x = x.add(tt_out);")
+        L.append(f"")
+
+    # Post-embedding LayerNorm (BERT-style)
+    L.append(f"  // Post-embedding normalization")
+    L.append(f'  LayerHandle emb_norm(createLayer("{norm_type}", {{')
+    L.append(f'    withKey("name", "embedding_norm"),')
+    L.append(f'    withKey("epsilon", std::to_string(NORM_EPS))')
+    if norm_type == "layer_normalization":
+        L.append(f'    , withKey("axis", 3)')
+    elif norm_type == "rms_norm":
+        L.append(f'    , withKey("packed", "false")')
+    L.append(f"  }}));")
+    L.append(f"  x = emb_norm(x);")
+    L.append(f"")
+
+    # Transformer blocks
+    L.append(f"  // Transformer encoder blocks")
+    L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
+    L.append(f"    x = createTransformerDecoderBlock(i, x);")
+    L.append(f"  }}")
+    L.append(f"")
+
+    # Compile
+    L.append(f"  // Compile model from symbolic tensor graph")
+    L.append(f"  std::vector<Tensor> outputs = {{x}};")
+    L.append(f"  model->compile(all_inputs, outputs, "
+             f"ml::train::ExecutionMode::INFERENCE);")
+    L.append(f"}}")
+    L.append(f"")
+
+
+def _emit_block_override(L, cname, s, diffs, norm_type):
+    """Emit createTransformerDecoderBlock() override for post-norm models.
+
+    Post-norm pattern: attn → residual add → LayerNorm → ffn → residual add → LayerNorm
+    vs base pre-norm:  LayerNorm → attn → residual add → LayerNorm → ffn → residual add
+    """
+    L.append(f"Tensor")
+    L.append(f"{cname}::createTransformerDecoderBlock(const int layer_id,")
+    L.append(f"                                      Tensor input) {{")
+    L.append(f"")
+    L.append(f"  using ml::train::createLayer;")
+    L.append(f"")
+
+    if diffs["is_post_norm"]:
+        # Post-norm: attention → residual → norm → ffn → residual → norm
+        L.append(f"  // Self attention")
+        L.append(f"  Tensor att_out =")
+        L.append(f"    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, "
+                 f"HEAD_DIM,")
+        L.append(f"                    input, input, input);")
+        L.append(f"")
+        L.append(f"  // Attention residual + post-norm")
+        L.append(f"  Tensor residual = input.add(att_out);")
+        L.append(f'  LayerHandle att_norm(createLayer("{norm_type}", {{')
+        L.append(f'    withKey("name", "layer" + std::to_string(layer_id) +'
+                 f' "_attention_norm"),')
+        L.append(f'    withKey("epsilon", std::to_string(NORM_EPS))')
+        if norm_type == "layer_normalization":
+            L.append(f'    , withKey("axis", 3)')
+        elif norm_type == "rms_norm":
+            L.append(f'    , withKey("packed", "false")')
+        L.append(f"  }}));")
+        L.append(f"  Tensor normed = att_norm(residual);")
+        L.append(f"")
+        L.append(f"  // Feed forward")
+        L.append(f"  Tensor ffn_out = createMlp(layer_id, DIM, "
+                 f"INTERMEDIATE_SIZE, normed);")
+        L.append(f"")
+        L.append(f"  // FFN residual + post-norm")
+        L.append(f"  Tensor ffn_residual = normed.add(ffn_out);")
+        L.append(f'  LayerHandle ffn_norm(createLayer("{norm_type}", {{')
+        L.append(f'    withKey("name", "layer" + std::to_string(layer_id) +'
+                 f' "_ffn_norm"),')
+        L.append(f'    withKey("epsilon", std::to_string(NORM_EPS))')
+        if norm_type == "layer_normalization":
+            L.append(f'    , withKey("axis", 3)')
+        elif norm_type == "rms_norm":
+            L.append(f'    , withKey("packed", "false")')
+        L.append(f"  }}));")
+        L.append(f"  Tensor block_out = ffn_norm(ffn_residual);")
+        L.append(f"")
+        L.append(f"  return block_out;")
+    else:
+        # Pre-norm with LayerNorm instead of RMSNorm
+        L.append(f"  // Pre-attention normalization")
+        L.append(f'  LayerHandle att_norm(createLayer("{norm_type}", {{')
+        L.append(f'    withKey("name", "layer" + std::to_string(layer_id) +'
+                 f' "_attention_norm"),')
+        L.append(f'    withKey("epsilon", std::to_string(NORM_EPS))')
+        if norm_type == "layer_normalization":
+            L.append(f'    , withKey("axis", 3)')
+        L.append(f"  }}));")
+        L.append(f"  Tensor normed = att_norm(input);")
+        L.append(f"")
+        L.append(f"  Tensor att_out =")
+        L.append(f"    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, "
+                 f"HEAD_DIM,")
+        L.append(f"                    normed, normed, normed);")
+        L.append(f"  Tensor residual = input.add(att_out);")
+        L.append(f"")
+        L.append(f'  LayerHandle ffn_norm(createLayer("{norm_type}", {{')
+        L.append(f'    withKey("name", "layer" + std::to_string(layer_id) +'
+                 f' "_ffn_norm"),')
+        L.append(f'    withKey("epsilon", std::to_string(NORM_EPS))')
+        if norm_type == "layer_normalization":
+            L.append(f'    , withKey("axis", 3)')
+        L.append(f"  }}));")
+        L.append(f"  Tensor ffn_normed = ffn_norm(residual);")
+        L.append(f"  Tensor ffn_out = createMlp(layer_id, DIM, "
+                 f"INTERMEDIATE_SIZE, ffn_normed);")
+        L.append(f"  Tensor block_out = residual.add(ffn_out);")
+        L.append(f"")
+        L.append(f"  return block_out;")
+
+    L.append(f"}}")
+    L.append(f"")
+
+
+def _emit_attention_override(L, cname, s, attn_block, diffs):
+    """Emit createAttention() override for models without RoPE or with bias."""
+    L.append(f"Tensor")
+    L.append(f"{cname}::createAttention(const int layer_id, int seq_len,")
+    L.append(f"                         int n_heads, int head_dim,")
+    L.append(f"                         Tensor query, Tensor key,")
+    L.append(f"                         Tensor value) {{")
+    L.append(f"")
+    L.append(f"  using ml::train::createLayer;")
+    L.append(f"")
+    L.append(f'  auto V_name = "layer" + std::to_string(layer_id) + "_wv";')
+    L.append(f'  auto K_name = "layer" + std::to_string(layer_id) + "_wk";')
+    L.append(f'  auto Q_name = "layer" + std::to_string(layer_id) + "_wq";')
+    L.append(f'  auto A_name = "layer" + std::to_string(layer_id) +'
+             f' "_attention";')
+    L.append(f'  auto O_name = "layer" + std::to_string(layer_id) +'
+             f' "_attention_out";')
+    L.append(f"")
+
+    bias_prop = ('"disable_bias", "false"' if diffs["has_bias"]
+                 else '"disable_bias", "true"')
+
+    # V projection
+    L.append(f"  // V projection")
+    L.append(f'  LayerHandle v_proj(createLayer("fully_connected", {{')
+    L.append(f'    withKey("name", V_name),')
+    L.append(f'    withKey("unit", head_dim * n_heads / GQA_SIZE),')
+    L.append(f'    withKey({bias_prop})')
+    L.append(f"  }}));")
+    L.append(f"  Tensor v = v_proj(value);")
+    L.append(f"")
+
+    # K projection
+    L.append(f"  // K projection")
+    L.append(f'  LayerHandle k_proj(createLayer("fully_connected", {{')
+    L.append(f'    withKey("name", K_name),')
+    L.append(f'    withKey("unit", head_dim * n_heads / GQA_SIZE),')
+    L.append(f'    withKey({bias_prop})')
+    L.append(f"  }}));")
+    L.append(f"  Tensor k = k_proj(key);")
+    L.append(f"")
+
+    # Q projection
+    L.append(f"  // Q projection")
+    L.append(f'  LayerHandle q_proj(createLayer("fully_connected", {{')
+    L.append(f'    withKey("name", Q_name),')
+    L.append(f'    withKey("unit", head_dim * n_heads),')
+    L.append(f'    withKey({bias_prop})')
+    L.append(f"  }}));")
+    L.append(f"  Tensor q = q_proj(query);")
+    L.append(f"")
+
+    # MHA core - with or without RoPE
+    L.append(f"  // Attention core layer")
+    L.append(f'  std::vector<std::string> attn_props = {{')
+    L.append(f'    withKey("name", A_name),')
+    L.append(f'    withKey("num_heads", n_heads),')
+    L.append(f'    withKey("num_heads_kv", n_heads / GQA_SIZE),')
+    L.append(f'    withKey("max_timestep", std::to_string(INIT_SEQ_LEN)),')
+    L.append(f'    withKey("is_causal", IS_CAUSAL ? "true" : "false")')
+    L.append(f"  }};")
+
+    if not diffs["no_rope"]:
+        L.append(f'  attn_props.push_back(withKey("rope_theta", ROPE_THETA));')
+        L.append(f'  attn_props.push_back(withKey("max_position_embeddings",'
+                 f' MAX_POSITION_EMBEDDINGS));')
+
+    L.append(f'  LayerHandle attn(createLayer("mha_core", attn_props));')
+    L.append(f"  Tensor a = attn({{q, k, v}});")
+    L.append(f"")
+
+    # O projection
+    L.append(f"  // O projection")
+    L.append(f'  LayerHandle o_proj(createLayer("fully_connected", {{')
+    L.append(f'    withKey("name", O_name),')
+    L.append(f'    withKey("unit", DIM),')
+    L.append(f'    withKey({bias_prop})')
+    L.append(f"  }}));")
+    L.append(f"  Tensor o = o_proj(a);")
+    L.append(f"")
+    L.append(f"  return o;")
+    L.append(f"}}")
+    L.append(f"")
+
+
+def _emit_test_factory(L, cname, s, need_variant, base_class, variant_name,
+                       diffs=None):
     """Emit createTestModel() static factory for standalone testing."""
+    if diffs is None:
+        diffs = {}
+    uses_layer_norm = diffs.get("uses_layer_norm", False)
+    no_rope = diffs.get("no_rope", False)
+    is_encoder_only = diffs.get("is_encoder_only", False)
+
     L.append(f"{cname} {cname}::createTestModel() {{")
     L.append(f"  // Minimal JSON config for testing")
     L.append(f"  json cfg;")
@@ -176,17 +595,25 @@ def _emit_test_factory(L, cname, s, need_variant, base_class, variant_name):
     L.append(f'  cfg["num_key_value_heads"] = {s.num_kv_heads};')
     L.append(f'  cfg["head_dim"] = {s.head_dim};')
     L.append(f'  cfg["intermediate_size"] = {s.intermediate_size};')
-    if s.rope_theta:
+
+    if not no_rope and s.rope_theta:
         L.append(f'  cfg["rope_theta"] = {int(s.rope_theta)};')
-    L.append(f'  cfg["rms_norm_eps"] = {s.norm_eps or 1e-6};')
+
+    norm_key = "layer_norm_eps" if uses_layer_norm else "rms_norm_eps"
+    L.append(f'  cfg["{norm_key}"] = {s.norm_eps or 1e-6};')
+
     L.append(f'  cfg["tie_word_embeddings"] = '
              f'{"true" if s.tie_word_embeddings else "false"};')
     if s.max_position_embeddings:
         L.append(f'  cfg["max_position_embeddings"] = '
                  f'{s.max_position_embeddings};')
+
+    if is_encoder_only:
+        L.append(f'  cfg["is_causal"] = false;')
+
     L.append(f"")
     L.append(f"  json gen_cfg;")
-    L.append(f'  gen_cfg["max_new_tokens"] = 1;')
+    L.append(f'  gen_cfg["max_new_tokens"] = {0 if is_encoder_only else 1};')
     L.append(f"")
     L.append(f"  json nntr_cfg;")
     L.append(f'  nntr_cfg["init_seq_len"] = 8;')

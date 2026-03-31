@@ -137,6 +137,21 @@ def _emit_inherit_header(structure, blocks_info, model_name):
         L.append(f"}};")
         L.append(f"")
 
+    # Detect architectural differences for override declarations
+    block = s.blocks[0] if s.blocks else None
+    from .helpers import get_norm_type as _get_norm_type
+    _norm_type = _get_norm_type(s.model_type)
+    is_post_norm = block and block.norm_type == "post_norm"
+    uses_layer_norm = _norm_type == "layer_normalization"
+    no_rope = attn_block and not attn_block.attention.has_rope
+    is_encoder_only = s.arch_type == "encoder_only"
+
+    need_override_construct = (is_encoder_only or is_post_norm or
+                               uses_layer_norm)
+    need_override_block = is_post_norm or uses_layer_norm
+    need_override_attention = (no_rope or uses_layer_norm) and not need_variant
+    need_override_setup = uses_layer_norm or no_rope
+
     # Main class
     L.append(f"/**")
     L.append(f" * @brief {cname} Class")
@@ -162,7 +177,6 @@ def _emit_inherit_header(structure, blocks_info, model_name):
         L.append(f"      {base_class}(cfg, generation_cfg, nntr_cfg),")
         L.append(f"      {variant_name}(cfg, generation_cfg, nntr_cfg) {{}}")
     elif base_class == "Transformer":
-        # Direct inheritance from Transformer (no CausalLM wrapper)
         mt = "ModelType::MODEL"
         L.append(f"  {cname}(json &cfg, json &generation_cfg, json &nntr_cfg)")
         L.append(f"    : Transformer(cfg, generation_cfg, nntr_cfg, {mt}) {{}}")
@@ -173,11 +187,34 @@ def _emit_inherit_header(structure, blocks_info, model_name):
         L.append(f"      {base_class}(cfg, generation_cfg, nntr_cfg) {{}}")
     L.append(f"")
 
-    # Register custom layers override (combines base + variant)
+    # Override declarations for methods that differ from base
+    if need_override_setup:
+        L.append(f"  void setupParameters(json &cfg, json &generation_cfg,")
+        L.append(f"                       json &nntr_cfg) override;")
+
+    if need_override_construct:
+        L.append(f"  void constructModel() override;")
+
+    if need_override_block:
+        L.append(f"  Tensor createTransformerDecoderBlock(const int layer_id,")
+        L.append(f"                                      Tensor input) override;")
+
+    if need_override_attention:
+        L.append(f"  Tensor createAttention(const int layer_id, int seq_len,")
+        L.append(f"                         int n_heads, int head_dim,")
+        L.append(f"                         Tensor query, Tensor key,")
+        L.append(f"                         Tensor value) override;")
+
+    # Non-SwiGLU FFN needs createMlp override
+    ffn_block = block.ffn if block else None
+    if ffn_block and ffn_block.ffn_type not in ("swiglu",):
+        L.append(f"  Tensor createMlp(const int layer_id, int dim,")
+        L.append(f"                   int hidden_dim, Tensor input) override;")
+
     L.append(f"  void registerCustomLayers() override;")
     L.append(f"")
 
-    # Test-only default constructor
+    # Test-only factory
     L.append(f"  /**")
     L.append(f"   * @brief Test constructor with minimal config")
     L.append(f"   * @note Creates model with small dimensions for testing")
