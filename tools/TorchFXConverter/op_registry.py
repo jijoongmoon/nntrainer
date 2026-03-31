@@ -75,7 +75,7 @@ FUNCTION_NAME_SIMPLE_OPS = {
 
 # Functions that map to OP_NOOP (internal torch/runtime functions)
 FUNCTION_NOOP_NAMES = frozenset({
-    "_set_grad_enabled", "tensor", "arange",
+    "_set_grad_enabled", "tensor", "arange", "device",
     "zeros", "zeros_like", "ones", "ones_like",
     "full_like", "empty_like",
     "custom_function_call",
@@ -267,7 +267,7 @@ METHOD_NOOP_NAMES = frozenset({
     "contiguous", "detach", "clone", "copy_", "to", "float",
     "half", "bfloat16", "int", "long", "short", "bool",
     "type_as", "expand",
-    "size", "dim", "numel",
+    "size", "dim", "numel", "is_floating_point",
     "new_ones", "new_zeros", "new_full", "new_empty",
     "fill_", "zero_", "masked_fill", "masked_fill_",
     "__bool__", "__or__", "__and__",
