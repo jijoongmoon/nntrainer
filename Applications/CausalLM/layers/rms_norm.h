@@ -8,7 +8,7 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items
- * @note   This layer only supports inference mode.
+ * @note   This layer supports both inference and training modes.
  */
 
 #ifndef __RMS_NORM_LAYER_H__
@@ -43,7 +43,7 @@ public:
    * @brief Construct a new custom RMS normalization layer object
    *
    */
-  WIN_EXPORT RMSNormLayer() : Layer(), wt_idx({0}) {}
+  WIN_EXPORT RMSNormLayer() : Layer(), wt_idx({0, 0, 0, 0, 0}) {}
 
   /**
    * @brief Destroy the custom RMS normalization layer object
@@ -76,9 +76,14 @@ public:
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::calcGradient(RunLayerContext &context)
+   */
+  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
+
+  /**
    * @copydoc bool supportBackwarding() const
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; };
+  WIN_EXPORT bool supportBackwarding() const override { return true; };
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ExportMethods method)
@@ -111,7 +116,7 @@ public:
   inline static const std::string type = "rms_norm";
 
 private:
-  std::array<unsigned int, 1> wt_idx;
+  std::array<unsigned int, 5> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon> rms_props;
 };
 
