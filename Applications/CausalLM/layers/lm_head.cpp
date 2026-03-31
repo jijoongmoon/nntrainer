@@ -112,8 +112,20 @@ void LmHeadLayer::setProperty(const std::vector<std::string> &values) {
 
 void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
                              bool training) {
-  throw nntrainer::exception::not_supported(
-    "Forwarding for LMHead layer is not supported");
+  nntrainer::Tensor &weight =
+    context.getWeight(weight_idx[LmHeadParams::weight]);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+
+  input_.dot(weight, hidden_);
+
+  if (auto &disable_bias =
+        std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+      disable_bias.empty() || disable_bias.get() == false) {
+    nntrainer::Tensor &bias =
+      context.getWeight(weight_idx[LmHeadParams::bias]);
+    hidden_.add_i(bias);
+  }
 }
 
 void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
@@ -158,13 +170,41 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 }
 
 void LmHeadLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcDerivative for LMHead layer is not supported");
+  nntrainer::Tensor &weight =
+    context.getWeight(weight_idx[LmHeadParams::weight]);
+
+  const nntrainer::Tensor &derivative_ =
+    context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &ret_ = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+
+  ret_.dot_deriv_wrt_1(weight, derivative_, false, false);
 }
 
 void LmHeadLayer::calcGradient(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcGradient for LMHead layer is not supported");
+  nntrainer::Tensor &djdw =
+    context.getWeightGrad(weight_idx[LmHeadParams::weight]);
+
+  const nntrainer::Tensor &derivative_ =
+    context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  if (auto &disable_bias =
+        std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+      disable_bias.empty() || disable_bias.get() == false) {
+    nntrainer::Tensor &djdb =
+      context.getWeightGrad(weight_idx[LmHeadParams::bias]);
+
+    if (context.isGradientFirstAccess(weight_idx[LmHeadParams::bias])) {
+      derivative_.sum({0, 1, 2}, djdb);
+    } else {
+      nntrainer::Tensor t = derivative_.sum({0, 1, 2});
+      djdb.add_i(t);
+    }
+  }
+
+  input_.dot_deriv_wrt_2(
+    djdw, derivative_, false, false,
+    !context.isGradientFirstAccess(weight_idx[LmHeadParams::weight]));
 }
 
 void LmHeadLayer::exportTo(nntrainer::Exporter &exporter,

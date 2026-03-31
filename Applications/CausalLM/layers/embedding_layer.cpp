@@ -84,7 +84,43 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
-                                bool training) {}
+                                bool training) {
+  unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
+  unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
+  float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
+                  ? 1.0f
+                  : std::get<nntrainer::props::Scale>(embedding_props).get();
+
+  nntrainer::Tensor &weight = context.getWeight(weight_idx);
+  nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  nntrainer::TensorDim out_tensor_dim =
+    nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
+
+  for (unsigned int b = 0; b < input_.batch(); ++b) {
+    float *in_data =
+      input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+
+    nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+    for (unsigned int i = 0; i < input_.width(); ++i) {
+      unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
+      if (embed_idx >= in_dim) {
+        throw std::invalid_argument("input word index is greater than in_dim");
+      }
+
+      nntrainer::Tensor cur_weight =
+        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
+      nntrainer::Tensor out_tensor =
+        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * i);
+      out_tensor.copyData(cur_weight);
+
+      if (scale != 1.0f) {
+        out_tensor.multiply_i(scale);
+      }
+    }
+  }
+}
 
 void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
@@ -158,11 +194,69 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 }
 
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcDerivative for Embedding layer is not supported");
+  /// Input is discrete indices, no meaningful gradient flows back.
+  nntrainer::Tensor &outgoing = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+  outgoing.setZero();
 }
 
-void EmbeddingLayer::calcGradient(nntrainer::RunLayerContext &context) {}
+void EmbeddingLayer::calcGradient(nntrainer::RunLayerContext &context) {
+  unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
+  float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
+                  ? 1.0f
+                  : std::get<nntrainer::props::Scale>(embedding_props).get();
+
+  nntrainer::Tensor &djdw = context.getWeightGrad(weight_idx);
+  const nntrainer::Tensor &derivative_ =
+    context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  djdw.setZero();
+
+  for (unsigned int b = 0; b < input_.batch(); ++b) {
+    float *in_data =
+      input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+
+    if (djdw.getDataType() == nntrainer::TensorDim::DataType::FP32) {
+      for (unsigned int i = 0; i < input_.width(); ++i) {
+        unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
+
+        float *djdw_data = djdw.getAddress<float>(embed_idx * out_dim);
+        const float *grad_data = derivative_.getAddress<float>(
+          b * derivative_.getDim().getFeatureLen() + i * out_dim);
+
+        if (scale == 1.0f) {
+          std::transform(djdw_data, djdw_data + out_dim, grad_data, djdw_data,
+                         std::plus<float>());
+        } else {
+          for (unsigned int j = 0; j < out_dim; ++j) {
+            djdw_data[j] += grad_data[j] * scale;
+          }
+        }
+      }
+    } else if (djdw.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+      for (unsigned int i = 0; i < input_.width(); ++i) {
+        unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
+
+        _FP16 *djdw_data = djdw.getAddress<_FP16>(embed_idx * out_dim);
+        const _FP16 *grad_data = derivative_.getAddress<_FP16>(
+          b * derivative_.getDim().getFeatureLen() + i * out_dim);
+
+        if (scale == 1.0f) {
+          std::transform(djdw_data, djdw_data + out_dim, grad_data, djdw_data,
+                         std::plus<_FP16>());
+        } else {
+          for (unsigned int j = 0; j < out_dim; ++j) {
+            djdw_data[j] += grad_data[j] * static_cast<_FP16>(scale);
+          }
+        }
+      }
+#else
+      throw std::invalid_argument("Error: enable-fp16 is not enabled");
+#endif
+    }
+  }
+}
 
 void EmbeddingLayer::exportTo(nntrainer::Exporter &exporter,
                               const ml::train::ExportMethods &method) const {

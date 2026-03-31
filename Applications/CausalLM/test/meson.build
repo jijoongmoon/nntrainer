@@ -39,4 +39,18 @@ if python3.found()
     workdir: meson.project_source_root(),
     is_parallel: false,
   )
+  test('test_mha_core_torch', python3,
+    args: ['-m', 'unittest', meson.current_source_dir() / 'test_mha_core_torch.py', '-v'],
+    timeout: test_timeout,
+    suite: 'unittests',
+    workdir: meson.project_source_root(),
+    is_parallel: false,
+  )
+  test('test_causallm_layers_torch', python3,
+    args: ['-m', 'unittest', meson.current_source_dir() / 'test_causallm_layers_torch.py', '-v'],
+    timeout: test_timeout,
+    suite: 'unittests',
+    workdir: meson.project_source_root(),
+    is_parallel: false,
+  )
 endif

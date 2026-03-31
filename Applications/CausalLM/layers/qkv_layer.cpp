@@ -128,7 +128,17 @@ void QKVLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void QKVLayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
-  return;
+  nntrainer::Tensor &Qweight = context.getWeight(weight_idx[QKVParams::Q]);
+  nntrainer::Tensor &Kweight = context.getWeight(weight_idx[QKVParams::K]);
+  nntrainer::Tensor &Vweight = context.getWeight(weight_idx[QKVParams::V]);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &Qhidden_ = context.getOutput(QKVParams::Q);
+  nntrainer::Tensor &Khidden_ = context.getOutput(QKVParams::K);
+  nntrainer::Tensor &Vhidden_ = context.getOutput(QKVParams::V);
+
+  input_.dot(Qweight, Qhidden_);
+  input_.dot(Kweight, Khidden_);
+  input_.dot(Vweight, Vhidden_);
 }
 
 void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
@@ -181,9 +191,49 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   input_step.dot(Weights, Outputs);
 }
 
-void QKVLayer::calcDerivative(nntrainer::RunLayerContext &context) { return; }
+void QKVLayer::calcDerivative(nntrainer::RunLayerContext &context) {
+  nntrainer::Tensor &Qweight = context.getWeight(weight_idx[QKVParams::Q]);
+  nntrainer::Tensor &Kweight = context.getWeight(weight_idx[QKVParams::K]);
+  nntrainer::Tensor &Vweight = context.getWeight(weight_idx[QKVParams::V]);
 
-void QKVLayer::calcGradient(nntrainer::RunLayerContext &context) { return; }
+  const nntrainer::Tensor &Qderiv =
+    context.getIncomingDerivative(QKVParams::Q);
+  const nntrainer::Tensor &Kderiv =
+    context.getIncomingDerivative(QKVParams::K);
+  const nntrainer::Tensor &Vderiv =
+    context.getIncomingDerivative(QKVParams::V);
+
+  nntrainer::Tensor &ret_ = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+
+  ret_.dot_deriv_wrt_1(Qweight, Qderiv, false, false);
+  ret_.dot_deriv_wrt_1(Kweight, Kderiv, false, false, 1.0f);
+  ret_.dot_deriv_wrt_1(Vweight, Vderiv, false, false, 1.0f);
+}
+
+void QKVLayer::calcGradient(nntrainer::RunLayerContext &context) {
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  const nntrainer::Tensor &Qderiv =
+    context.getIncomingDerivative(QKVParams::Q);
+  const nntrainer::Tensor &Kderiv =
+    context.getIncomingDerivative(QKVParams::K);
+  const nntrainer::Tensor &Vderiv =
+    context.getIncomingDerivative(QKVParams::V);
+
+  nntrainer::Tensor &djdQw = context.getWeightGrad(weight_idx[QKVParams::Q]);
+  nntrainer::Tensor &djdKw = context.getWeightGrad(weight_idx[QKVParams::K]);
+  nntrainer::Tensor &djdVw = context.getWeightGrad(weight_idx[QKVParams::V]);
+
+  input_.dot_deriv_wrt_2(
+    djdQw, Qderiv, false, false,
+    !context.isGradientFirstAccess(weight_idx[QKVParams::Q]));
+  input_.dot_deriv_wrt_2(
+    djdKw, Kderiv, false, false,
+    !context.isGradientFirstAccess(weight_idx[QKVParams::K]));
+  input_.dot_deriv_wrt_2(
+    djdVw, Vderiv, false, false,
+    !context.isGradientFirstAccess(weight_idx[QKVParams::V]));
+}
 
 void QKVLayer::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
