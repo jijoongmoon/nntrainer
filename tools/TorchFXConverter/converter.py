@@ -28,7 +28,8 @@ def convert_model(model_name_or_path, output_dir, formats=None,
                   batch_size=1, seq_len=8, dtype="float32",
                   convert_weights=False, verbose=True,
                   model_name=None, plugin_config=None,
-                  external_kv_cache=False):
+                  external_kv_cache=False,
+                  inherit_transformer=False):
     """Run the full conversion pipeline.
 
     Args:
@@ -174,8 +175,12 @@ def convert_model(model_name_or_path, output_dir, formats=None,
     )
 
     if "cpp" in formats:
-        header_code = emit_cpp_header(layers, structure, model_name=effective_name)
-        source_code = emit_cpp_source(layers, structure, model_name=effective_name)
+        header_code = emit_cpp_header(
+            layers, structure, model_name=effective_name,
+            inherit_transformer=inherit_transformer)
+        source_code = emit_cpp_source(
+            layers, structure, model_name=effective_name,
+            inherit_transformer=inherit_transformer)
         header_path = os.path.join(output_dir, filenames["header"])
         source_path = os.path.join(output_dir, filenames["source"])
         with open(header_path, "w") as f:
@@ -281,6 +286,10 @@ Examples:
                         help="Generate code with external KV cache buffers "
                              "(owned by the generated class instead of "
                              "internal MHA tensors)")
+    parser.add_argument("--inherit-transformer", action="store_true",
+                        help="Generate C++ class inheriting from "
+                             "CausalLM/Transformer base class "
+                             "(Applications/CausalLM)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress progress messages")
 
@@ -302,6 +311,7 @@ Examples:
         model_name=args.model_name,
         plugin_config=args.plugin_config,
         external_kv_cache=args.external_kv_cache,
+        inherit_transformer=args.inherit_transformer,
     )
 
 

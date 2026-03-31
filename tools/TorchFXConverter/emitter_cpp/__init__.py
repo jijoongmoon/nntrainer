@@ -45,8 +45,10 @@ class CppEmitter(BaseEmitter):
     Orchestrates the sub-modules to produce the complete C++ output.
     """
 
-    def __init__(self, layers, structure, model_name=None):
+    def __init__(self, layers, structure, model_name=None,
+                 inherit_transformer=False):
         super().__init__(layers, structure, model_name=model_name)
+        self._inherit_transformer = inherit_transformer
 
     def emit(self):
         """Generate combined C++ code (header + source)."""
@@ -59,7 +61,8 @@ class CppEmitter(BaseEmitter):
         if self._is_flat_model():
             return emit_flat_header(self.structure, self._model_name)
         return emit_structured_header(
-            self.structure, self._blocks_info(), self._model_name)
+            self.structure, self._blocks_info(), self._model_name,
+            inherit_transformer=self._inherit_transformer)
 
     # ----- Source -----
 
@@ -68,6 +71,8 @@ class CppEmitter(BaseEmitter):
         if self._is_flat_model():
             return emit_flat_source(
                 self.layers, self.structure, self._model_name)
+        if self._inherit_transformer:
+            return self._emit_inherit_source()
         return self._emit_structured_source()
 
     def _emit_structured_source(self):
@@ -195,6 +200,21 @@ class CppEmitter(BaseEmitter):
         if representative:
             L.append(emit_ffn_method(cname, representative))
 
+    def _emit_inherit_source(self):
+        """Generate source for Transformer-inheriting models.
+
+        Only emits overridden methods (createAttention, registerCustomLayers)
+        plus a test factory method.
+        """
+        from .source_inherit import emit_inherit_source
+        s = self.structure
+        attn_block = self._get_attn_block()
+        norm_type = get_norm_type(s.model_type)
+        custom_classes = collect_custom_layer_classes(
+            s, norm_type, attn_block)
+        return emit_inherit_source(
+            s, attn_block, custom_classes, self._model_name)
+
     # ----- Internal helpers -----
 
     def _is_flat_model(self):
@@ -249,16 +269,21 @@ class CppEmitter(BaseEmitter):
 # Convenience functions (backward compatible)
 # =============================================================================
 
-def emit_cpp(layers, structure, model_name=None):
+def emit_cpp(layers, structure, model_name=None, inherit_transformer=False):
     """Generate combined C++ code (header + source)."""
-    return CppEmitter(layers, structure, model_name=model_name).emit()
+    return CppEmitter(layers, structure, model_name=model_name,
+                      inherit_transformer=inherit_transformer).emit()
 
 
-def emit_cpp_header(layers, structure, model_name=None):
+def emit_cpp_header(layers, structure, model_name=None,
+                    inherit_transformer=False):
     """Generate C++ header file (.h) content."""
-    return CppEmitter(layers, structure, model_name=model_name).emit_header()
+    return CppEmitter(layers, structure, model_name=model_name,
+                      inherit_transformer=inherit_transformer).emit_header()
 
 
-def emit_cpp_source(layers, structure, model_name=None):
+def emit_cpp_source(layers, structure, model_name=None,
+                    inherit_transformer=False):
     """Generate C++ source file (.cpp) content."""
-    return CppEmitter(layers, structure, model_name=model_name).emit_source()
+    return CppEmitter(layers, structure, model_name=model_name,
+                      inherit_transformer=inherit_transformer).emit_source()
