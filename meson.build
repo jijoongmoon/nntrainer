@@ -783,6 +783,9 @@ if get_option('enable-app')
       endif
     endif
     subdir('Applications')
+    if get_option('enable-transformer')
+      subdir('tools')
+    endif
   endif
 endif
 

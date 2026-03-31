@@ -58,7 +58,7 @@ python converter.py --model Qwen/Qwen3-0.6B --output ./out/ --weights --dtype fl
 
 ### Running Tests
 
-All test commands should be run from the `Applications/TorchFXConverter/` directory.
+All test commands should be run from the `tools/TorchFXConverter/` directory.
 
 #### Full test suite (all unit tests)
 

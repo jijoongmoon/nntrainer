@@ -1123,7 +1123,7 @@ class TestConverterBuildAndRun(unittest.TestCase):
 
             # Step 6: Build the test executable
             target_name = MODEL_BUILD_TARGETS[config_name]
-            target = (f"Applications/TorchFXConverter/jni/"
+            target = (f"tools/TorchFXConverter/jni/"
                       f"{target_name}")
             ok, stdout, stderr = _build_test(BUILD_DIR, target)
             self.assertTrue(ok, f"Build failed for {config_name}:\n"
@@ -1145,7 +1145,7 @@ class TestConverterBuildAndRun(unittest.TestCase):
 
     def test_prebuilt_qwen3_executable(self):
         """Run the pre-built converter_qwen3_test executable."""
-        target = "Applications/TorchFXConverter/jni/converter_qwen3_test"
+        target = "tools/TorchFXConverter/jni/converter_qwen3_test"
         exe_path = os.path.join(BUILD_DIR, target)
 
         if not os.path.isfile(exe_path):

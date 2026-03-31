@@ -105,7 +105,7 @@ model->compile(input_tensor, output_tensor)
 ### Module Layout
 
 ```
-Applications/TorchFXConverter/
+tools/TorchFXConverter/
 ├── tracer.py              # FX graph tracer (callback-based)
 ├── node_mapper.py         # Maps FX nodes → NNTrainer layer definitions
 ├── decomposer.py          # Adaptive multi-pass conversion pipeline

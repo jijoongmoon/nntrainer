@@ -44,14 +44,14 @@ PyTorch models to NNTrainer format via TorchFXConverter.
   ```bash
   pip install torch transformers
   ```
-- **TorchFXConverter** (included in this repository at `Applications/TorchFXConverter/`)
+- **TorchFXConverter** (included in this repository at `tools/TorchFXConverter/`)
 
 ## Installation
 
 ### From Source
 
 ```bash
-cd Applications/GraphVisualizer
+cd tools/GraphVisualizer
 npm install
 npm run compile
 ```
@@ -62,7 +62,7 @@ Then press `F5` in VS Code to launch the Extension Development Host.
 
 ```bash
 npm install -g @vscode/vsce
-cd Applications/GraphVisualizer
+cd tools/GraphVisualizer
 vsce package
 # Install: code --install-extension nntrainer-graph-visualizer-0.0.1.vsix
 ```
@@ -165,11 +165,11 @@ Open VS Code Settings and search for `nntrainerGraph`:
 ```bash
 # 1. Quick test with included tiny model
 #    Command Palette → "NNTrainer: Convert Model"
-#    Enter: ./Applications/TorchFXConverter/test_model
+#    Enter: ./tools/TorchFXConverter/test_model
 
 # 2. Profile the same model
 #    Command Palette → "NNTrainer: Profile Model"
-#    Enter: ./Applications/TorchFXConverter/test_model
+#    Enter: ./tools/TorchFXConverter/test_model
 
 # 3. Export results
 #    Click "Export" button in toolbar
@@ -189,7 +189,7 @@ See [DESIGN.md](DESIGN.md) for detailed architecture documentation including:
 
 ```bash
 # Install dependencies
-cd Applications/GraphVisualizer
+cd tools/GraphVisualizer
 npm install
 
 # Compile TypeScript

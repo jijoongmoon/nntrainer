@@ -413,7 +413,7 @@ User          Webview              Extension             FileSystem
 ## 7. File Structure
 
 ```
-Applications/GraphVisualizer/
+tools/GraphVisualizer/
 ├── package.json                 # Extension manifest, commands, config
 ├── tsconfig.json                # TypeScript configuration
 ├── src/
@@ -429,7 +429,7 @@ Applications/GraphVisualizer/
 │   └── icon.svg                 # Activity bar icon
 └── out/                         # Compiled JS output
 
-Applications/TorchFXConverter/
+tools/TorchFXConverter/
 ├── vscode_bridge.py             # Conversion bridge for VS Code
 └── vscode_profile.py            # Profiling bridge for VS Code
 ```

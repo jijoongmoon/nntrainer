@@ -78,5 +78,5 @@ subprojects/googletest/
 subprojects/iniparser/
 
 # TorchFXConverter generated output
-Applications/TorchFXConverter/output/
-Applications/TorchFXConverter/test_model/*.safetensors
+tools/TorchFXConverter/output/
+tools/TorchFXConverter/test_model/*.safetensors

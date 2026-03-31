@@ -1307,11 +1307,11 @@ void Qwen3CausalLM::initialize() {
 ### TorchFXConverter (Phase 5)
 | 파일 | 변경 |
 |------|------|
-| `Applications/TorchFXConverter/converter.py` | `--external-kv-cache` CLI 옵션 |
-| `Applications/TorchFXConverter/emitter_cpp/header.py` | 외부 cache 멤버 선언 (조건부) |
-| `Applications/TorchFXConverter/emitter_cpp/source_construct.py` | `allocateKVCache()` 메서드 생성 (조건부) |
-| `Applications/TorchFXConverter/emitter_cpp/source_attention.py` | mha_core 5-input 생성 (조건부) |
-| `Applications/TorchFXConverter/emitter_cpp/source_custom.py` | `initialize()`에 cache 할당 호출 (조건부) |
+| `tools/TorchFXConverter/converter.py` | `--external-kv-cache` CLI 옵션 |
+| `tools/TorchFXConverter/emitter_cpp/header.py` | 외부 cache 멤버 선언 (조건부) |
+| `tools/TorchFXConverter/emitter_cpp/source_construct.py` | `allocateKVCache()` 메서드 생성 (조건부) |
+| `tools/TorchFXConverter/emitter_cpp/source_attention.py` | mha_core 5-input 생성 (조건부) |
+| `tools/TorchFXConverter/emitter_cpp/source_custom.py` | `initialize()`에 cache 할당 호출 (조건부) |
 | 기타 (ini, json, weight, patterns, mapper) | **변경 없음** |
 
 ### Tests
@@ -1961,7 +1961,7 @@ Applications/CausalLM/causal_lm.cpp
 
 **구현:**
 ```
-Applications/TorchFXConverter/converter.py
+tools/TorchFXConverter/converter.py
   - argparse에 --external-kv-cache 추가
   - config dict에 'external_kv_cache' 플래그 전달
 ```
