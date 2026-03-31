@@ -426,18 +426,35 @@ def _map_normalize(node, scope, input_names):
 
 
 def _map_getitem(node, scope, node_to_layer):
-    """Map operator.getitem for multi-output module tuple unpacking."""
+    """Map operator.getitem for multi-output module tuple unpacking.
+
+    For RNN-family layers (gru, lstm, etc.) only index 0 is the main output;
+    other indices (hidden state) are typically unused in inference.
+
+    For split/chunk layers, ALL indices are meaningful outputs that downstream
+    layers reference, so every index produces an identity layer connected to
+    the parent split.
+    """
     if len(node.args) >= 2 and hasattr(node.args[0], 'name'):
         parent_name = node.args[0].name
         parent_layer = node_to_layer.get(parent_name)
         idx = node.args[1]
-        if (parent_layer and
-                parent_layer.layer_type in MULTI_OUTPUT_LAYER_TYPES
-                and idx == 0):
-            return NNTrainerLayerDef(
-                layer_type=LAYER_IDENTITY,
-                name=node.name,
-                input_layers=[parent_name],
-                hf_module_name=scope,
-            )
+        if parent_layer and parent_layer.layer_type in _MULTI_OUTPUT_LAYER_TYPES:
+            # Split: every indexed output is used
+            if parent_layer.layer_type == "split":
+                return NNTrainerLayerDef(
+                    layer_type=LAYER_IDENTITY,
+                    name=node.name,
+                    input_layers=[parent_name],
+                    hf_module_name=scope,
+                    properties={"split_index": idx},
+                )
+            # RNN-family: only index 0 (main output)
+            if idx == 0:
+                return NNTrainerLayerDef(
+                    layer_type=LAYER_IDENTITY,
+                    name=node.name,
+                    input_layers=[parent_name],
+                    hf_module_name=scope,
+                )
     return None

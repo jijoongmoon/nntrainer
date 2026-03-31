@@ -178,7 +178,9 @@ FUNCTION_POOLING_NAMES = frozenset({
 })
 
 # Layer types that produce tuple outputs (for operator.getitem handling)
-MULTI_OUTPUT_LAYER_TYPES = frozenset({"gru", "lstm", "rnn", "lstmcell"})
+MULTI_OUTPUT_LAYER_TYPES = frozenset({
+    "gru", "lstm", "rnn", "lstmcell", "split",
+})
 
 # ---------------------------------------------------------------------------
 # Method-based ops: maps method_name (str) -> layer_type
