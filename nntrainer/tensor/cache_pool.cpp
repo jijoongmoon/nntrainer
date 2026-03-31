@@ -146,6 +146,8 @@ void CachePool::allocate() {
     << "Cache pool is already allocated";
 
   size_t pool_size = size();
+  // std::cout << "-------------------------- pool_size : " << pool_size <<
+  // std::endl;
 
   NNTR_THROW_IF(pool_size == 0, std::runtime_error)
     << "Allocating memory pool with size 0";
@@ -170,6 +172,9 @@ void CachePool::deallocate() {
 }
 
 void CachePool::validate(unsigned int id) {
+  // std::cout << "-----------------[ in validate ] "<< std::endl;
+  // std::cout << "---------------------------!elems[id]->isActive() == " <<
+  // (!elems[id]->isActive() ? "true" : "false") << std::endl;
   if (!elems[id]->isActive()) {
     elems[id]->swapIn();
     std::lock_guard<std::mutex> lock(mutex);
@@ -178,6 +183,9 @@ void CachePool::validate(unsigned int id) {
 }
 
 void CachePool::invalidate(unsigned int id) {
+  // std::cout << "----------------Imvalidate id : " << id << " ---- " <<
+  // std::endl; std::cout << "---------------------------elems[id]->isActive()
+  // == " << (elems[id]->isActive() ? "true" : "false") << std::endl;
   if (elems[id]->isActive()) {
     elems[id]->swapOut();
     std::lock_guard<std::mutex> lock(mutex);
@@ -235,9 +243,12 @@ std::shared_ptr<MemoryData> CachePool::getMemory(unsigned int id) {
       ords.append(std::to_string(o));
     }
   }
+
+  // printf("wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww[%d] exe_order(%s), offset:
+  // %llu, len: %zu \n", id, ords.c_str(), (long long unsigned int)offset, len);
+
   ml_logd("[%d] exe_order(%s), offset: %llu, len: %zu", id, ords.c_str(),
           (long long unsigned int)offset, len);
-
   return mem_data;
 }
 

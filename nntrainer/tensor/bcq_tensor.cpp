@@ -392,7 +392,7 @@ void BCQTensor::printScales(std::ostream &out) const {
   const float *q_scales = (float *)getScale();
   unsigned int len = scale_size();
 
-  if (len > 50) {
+  if (len > 5000) {
     out << "Scale factors: [" << (int)q_scales[0] << ' ' << (int)q_scales[1]
         << ' ' << (int)q_scales[2] << " ... " << (int)q_scales[len - 3] << ' '
         << (int)q_scales[len - 2] << ' ' << (int)q_scales[len - 1] << ']'

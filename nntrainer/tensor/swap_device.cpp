@@ -16,6 +16,8 @@
 #include <malloc.h>
 #include <profiler.h>
 #include <stdlib.h>
+#include <sys/resource.h>
+#include <sys/types.h>
 
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -43,6 +45,8 @@ void SwapDevice::start(size_t size, ml::train::ExecutionMode _execution_mode) {
 
   off_t off;
 
+  // std::cout << "path: "<<dev_path.c_str() << std::endl;
+
   /* make sparse file */
   off = lseek(fd, size - 1, SEEK_SET);
   NNTR_THROW_IF(off < 0, std::runtime_error)
@@ -61,6 +65,8 @@ void SwapDevice::start(size_t size, ml::train::ExecutionMode _execution_mode) {
 
 void *SwapDevice::getBuffer(off_t offset, size_t size, void *memory_ptr,
                             unsigned int id, bool alloc_only) {
+  std::cout << "swapdefice::getbuffer" << offset << " " << size << " "
+            << memory_ptr << " " << id << std::endl;
   NNTR_THROW_IF(fd <= 0, std::runtime_error)
     << "SwapDevice: Device is not started";
 
@@ -97,6 +103,8 @@ void *SwapDevice::getBuffer(off_t offset, size_t size, void *memory_ptr,
 
     void *buf = static_cast<void *>(ptr + diff);
 
+    std::cout << "memcpy(" << memory_ptr << ", " << buf << ", "
+              << len_offset.second << ")" << std::endl;
     memcpy(memory_ptr, buf, len_offset.second);
     const auto ret = munmap(ptr, len);
 
@@ -109,8 +117,10 @@ void *SwapDevice::getBuffer(off_t offset, size_t size, void *memory_ptr,
     size_t off = (offset / page_size) * page_size;
     size_t diff = offset - off;
     size_t len = size + diff;
+
     const size_t error_buflen = 100;
     char error_buf[error_buflen];
+
     char *ptr = static_cast<char *>(
       mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, off));
     NNTR_THROW_IF(ptr == MAP_FAILED, std::runtime_error)

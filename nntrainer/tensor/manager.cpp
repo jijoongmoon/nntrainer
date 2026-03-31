@@ -175,6 +175,7 @@ static Tensor *requestTensor_(const TensorSpecV2 &spec,
 
   std::vector<unsigned> order = spec.additional_exec_order;
   if (expose) {
+    std::cout << "expoed ------------" << std::endl;
     order.push_back(TensorPool::PERSIST_END_ORDER);
   }
 
@@ -456,6 +457,7 @@ std::vector<Weight *> Manager::requestWeights(
           TensorDim var32_dim(dim_v);
           var32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
           std::vector<unsigned int> var32_exec_order;
+          std::cout << " PERSIS_END_ORDER :VAR32 " << std::endl;
           var32_exec_order.push_back(TensorPool::PERSIST_END_ORDER);
 
           var32 = weight_pool.requestOrExtend(shared_name + ":var32", var32_dim,
@@ -606,7 +608,6 @@ Manager::requestInputs(const GraphNode &node,
   } else {
     var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
   }
-
   grad_common_spec.ls = TensorLifespan::CALC_DERIV_LIFESPAN;
   /// @todo handle this inside layer
   if (node.getType() == ActivationLayer::type or
@@ -734,6 +735,7 @@ std::vector<Tensor *> Manager::requestWeightOptimizerVariables(
   std::vector<unsigned int> exec;
   exec.reserve(1);
   if (is_grad_clip || is_mixed_precision) {
+    std::cout << "is_grad_clip || is_mixed" << std::endl;
     exec.emplace_back(TensorPool::PERSIST_END_ORDER);
   } else {
     exec.emplace_back(getMinMaxTensorExecutionOrder(name, true).second);
@@ -805,7 +807,6 @@ bool Manager::checkUnloadComplete(unsigned int order) {
 
 void Manager::LoadTensors(unsigned int order,
                           unsigned int remainder_lookahead) {
-
   auto loadTensorsAsync = [&](TensorPool &pool, unsigned int order) {
     return pool.loadCacheExecAsync(
       order, [&](int id, TaskExecutor::CompleteStatus status,
@@ -819,7 +820,6 @@ void Manager::LoadTensors(unsigned int order,
     auto load_weight = loadTensorsAsync(weight_pool, o);
     ml_logd("load weight is requested in LoadTensors with order - %d", o);
     int load_tensor = 0;
-
     if (exec_mode != ml::train::ExecutionMode::INFERENCE) {
       load_tensor = loadTensorsAsync(tensor_pool, o);
       ml_logd("load tensor is requested in LoadTensors with order - %d", o);

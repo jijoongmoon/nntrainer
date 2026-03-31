@@ -32,6 +32,7 @@
 #include <rotary_embedding.h>
 #include <swiglu.h>
 #include <transpose_layer.h>
+#include <optional>
 
 #if defined(ENABLE_TRANSFORMER)
 #include "json.hpp"

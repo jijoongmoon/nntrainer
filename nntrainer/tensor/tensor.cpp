@@ -15,6 +15,7 @@
 #include <float_tensor.h>
 #include <int4_tensor.h>
 #include <lazy_tensor.h>
+#include <nntr_threads.h>
 #include <q4_0_tensor.h>
 #include <q4_k_tensor.h>
 #include <q6_k_tensor.h>
@@ -1070,13 +1071,21 @@ Tensor &Tensor::dotBatched(Tensor const &m, Tensor &result, bool trans,
        "or the bigger one should be a multiple of the smaller one";
 
   for (unsigned int b = 0; b < lcm; b++) {
-    /** @todo try using transpose to speedup the operation */
     const Tensor this_b = this->getBatchSlice(b / group_size, 1);
     Tensor m_b = m.getBatchSlice(b / m_group_size, 1);
     Tensor result_b = result.getBatchSlice(b, 1);
 
     this_b.dot(m_b, result_b, trans, trans_m, beta);
   }
+
+  // for (unsigned int b = 0; b < batch(); b++) {
+  //   /** @todo try using transpose to speedup the operation */
+  //   const Tensor this_b = this->getBatchSlice(b, 1);
+  //   Tensor m_b = m.getBatchSlice(b, 1);
+  //   Tensor result_b = result.getBatchSlice(b, 1);
+
+  //   this_b.dot(m_b, result_b, trans, trans_m, beta);
+  // }
 
   return result;
 }
@@ -1391,6 +1400,20 @@ void Tensor::read(std::ifstream &file, size_t start_offset,
   }
 
   itensor_->read(file, start_offset, read_from_offset);
+}
+
+void Tensor::save_quantization_info(std::ostream &file) {
+  NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
+    << getName() << " is not contiguous, cannot save.";
+
+  itensor_->save_quantization_info(file);
+}
+
+void Tensor::read_quantization_info(std::ifstream &file) {
+  NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
+    << getName() << " is not contiguous, cannot read.";
+
+  itensor_->read_quantization_info(file);
 }
 
 void Tensor::read(ReadSource src, size_t start_offset, bool read_from_offset) {

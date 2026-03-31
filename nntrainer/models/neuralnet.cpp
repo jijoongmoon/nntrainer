@@ -24,21 +24,19 @@
 #include "layer_context.h"
 #include "model.h"
 #include "model_common_properties.h"
-#include <cmath>
-#include <cstring>
-#include <fstream>
-#include <future>
-#include <iomanip>
-#include <sstream>
-
 #include <activation_realizer.h>
 #include <adamw.h>
+#include <cmath>
 #include <common_properties.h>
+#include <cstring>
 #include <databuffer.h>
 #include <flatten_realizer.h>
+#include <fstream>
+#include <future>
 #include <ini_interpreter.h>
 #include <ini_wrapper.h>
 #include <input_realizer.h>
+#include <iomanip>
 #include <model_loader.h>
 #include <multiout_realizer.h>
 #include <neuralnet.h>
@@ -52,6 +50,9 @@
 #include <recurrent_realizer.h>
 #include <remap_realizer.h>
 #include <slice_realizer.h>
+#include <sstream>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <util_func.h>
 
 #ifdef ENABLE_TFLITE_INTERPRETER
@@ -399,6 +400,10 @@ sharedConstTensors NeuralNetwork::forwarding(
 
       **/
       model_graph.checkLoadComplete(f);
+
+      std::cout << ">>>>>>>>>>>>>>>>>>> Forwarding Start " << node->getName()
+                << std::endl;
+      // std::cout << "Layer : " << node->getName() << std::endl;
       node->forwarding(training);
       model_graph.inActive(f);
       model_graph.LoadTensors(f + lookahead);
@@ -431,6 +436,26 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   model_graph.setInputsLabels(input, label);
 
   return forwarding(training);
+}
+
+void NeuralNetwork::InvalidAllFSU() { model_graph.inActive(0); }
+
+size_t getMemoryUsage() {
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+
+    return usage.ru_maxrss;
+  }
+  return 0;
+}
+
+void print_rss() {
+  sleep(1);
+  std::cout << "Memory Usage : " << getMemoryUsage() << " KB   | ";
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+    std::cout << usage.ru_ixrss << " KB" << std::endl;
+  }
 }
 
 sharedConstTensors NeuralNetwork::incremental_forwarding(
@@ -617,6 +642,10 @@ void NeuralNetwork::backwarding(int iteration,
   }
 }
 
+long long alignToPageSize(long long size) {
+  return (((size + 4096 - 1) / 4096) * 4096) - size;
+}
+
 void NeuralNetwork::save(const std::string &file_path,
                          ml::train::ModelFormat format) {
   NNTR_THROW_IF(!initialized, std::runtime_error)
@@ -633,6 +662,11 @@ void NeuralNetwork::save(const std::string &file_path,
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
       (*iter)->save(model_file, false, exec_mode);
     }
+
+    // std::streampos after_info = model_file.tellp();
+    // auto calc_diff = alignToPageSize(after_info);
+    // std::vector<char> buffer2(calc_diff, '1');
+    // model_file.write(buffer2.data(), calc_diff);
 
     if (opt && istrequal(opt->getType(), "adam")) {
       std::string adam = "adam";
@@ -678,6 +712,7 @@ void NeuralNetwork::save(const std::string &file_path,
 
 void NeuralNetwork::load(const std::string &file_path,
                          ml::train::ModelFormat format) {
+  std::cout << "NeuralNetwork::load" << std::endl;
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
 
@@ -895,7 +930,6 @@ void NeuralNetwork::load(const std::string &file_path,
   case ml::train::ModelFormat::MODEL_FORMAT_QNN: {
     // for now, we only support to QNN binary format for Inference mode.
     // expect to have the file path for qnn bin and nntrainer bin seperated by
-    // ":" QNN bin ( graph ) : NNTrainer bin (weight)
     NNTR_THROW_IF(exec_mode != ExecutionMode::INFERENCE, std::invalid_argument)
       << "Only support QNN biarny for Infernece";
     NNTR_THROW_IF(!isFileExist(props::FilePath(v[0])), std::invalid_argument)
@@ -907,14 +941,18 @@ void NeuralNetwork::load(const std::string &file_path,
       throw_status(ret);
     });
 
+    int last_idx = v.size() - 1;
     if (!fsu_mode && v.size() > 1) {
-      NNTR_THROW_IF(!isFileExist(props::FilePath(v[1])), std::invalid_argument)
+      NNTR_THROW_IF(!isFileExist(props::FilePath(v[last_idx])),
+                    std::invalid_argument)
         << "Cannot open weight bin file";
-      load(props::FilePath(v[1]), ml::train::ModelFormat::MODEL_FORMAT_BIN);
+      load(props::FilePath(v[last_idx]),
+           ml::train::ModelFormat::MODEL_FORMAT_BIN);
     } else if (fsu_mode) {
       NNTR_THROW_IF(v.size() <= 1, std::invalid_argument)
         << "Swap mode should run with loading a weight-bin file";
-      NNTR_THROW_IF(!isFileExist(props::FilePath(v[1])), std::invalid_argument)
+      NNTR_THROW_IF(!isFileExist(props::FilePath(v[last_idx])),
+                    std::invalid_argument)
         << "Cannot open weight bin file";
       // model_graph.setFsuWeightPath(v[1]);
     }
@@ -1033,7 +1071,9 @@ sharedConstTensors NeuralNetwork::inference(sharedConstTensors X,
   if (!validateInput(X))
     throw std::invalid_argument("Input validation failed.");
 
+#ifndef ENABLE_NPU
   allocate(ExecutionMode::INFERENCE);
+#endif
 
   int nn_foward;
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
@@ -1053,6 +1093,90 @@ sharedConstTensors NeuralNetwork::inference(sharedConstTensors X,
   model_graph.setInputsLabels({}, {});
 
   return out;
+}
+
+std::vector<IO_TensorType>
+NeuralNetwork::inference(unsigned int batch_size,
+                         const std::vector<IO_TensorType> &input,
+                         const std::vector<IO_TensorType> &label) {
+  sharedConstTensors input_tensors, output_tensors;
+  auto in_dim = getInputDimension();
+
+  input_tensors.reserve(input.size());
+  for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
+    in_dim[idx].batch(batch_size);
+    std::visit(
+      [&input_tensors, &in_dim, idx](auto &&input_ptr) {
+        input_tensors.emplace_back(MAKE_SHARED_TENSOR(
+          Tensor::Map(input_ptr, in_dim[idx].getDataLen() * sizeof(*input_ptr),
+                      in_dim[idx], 0)));
+      },
+      input[idx]);
+  }
+
+  if (!label.empty()) {
+    sharedConstTensors label_tensors;
+    auto label_dim = getOutputDimension();
+    label_tensors.reserve(label.size());
+    for (unsigned int idx = 0; idx < label_dim.size(); idx++) {
+      label_dim[idx].batch(batch_size);
+      std::visit(
+        [&label_tensors, &label_dim, idx](auto &&label_ptr) {
+          label_tensors.emplace_back(MAKE_SHARED_TENSOR(Tensor::Map(
+            label_ptr, label_dim[idx].getDataLen() * sizeof(*label_ptr),
+            label_dim[idx], 0)));
+        },
+        input[idx]);
+    }
+    output_tensors = inference(input_tensors, label_tensors, false);
+  } else {
+    output_tensors = inference(input_tensors, false);
+  }
+
+  std::vector<IO_TensorType> output;
+  output.reserve(output_tensors.size());
+
+  for (auto &out : output_tensors) {
+    auto out_t = *out.get();
+    switch (out_t.getDataType()) {
+    case ml::train::TensorDim::DataType::QINT4:
+    case ml::train::TensorDim::DataType::QINT8:
+      output.push_back(out_t.getData<int8_t>());
+      break;
+    case ml::train::TensorDim::DataType::QINT16:
+      output.push_back(out_t.getData<int16_t>());
+      break;
+    case ml::train::TensorDim::DataType::BCQ:
+      output.push_back(out_t.getData<uint32_t>());
+      break;
+    case ml::train::TensorDim::DataType::UINT4:
+    case ml::train::TensorDim::DataType::UINT8:
+      // case ml::train::TensorDim::DataType::Q4_K:
+      // case ml::train::TensorDim::DataType::Q6_K:
+      // case ml::train::TensorDim::DataType::Q4_0:
+      output.push_back(out_t.getData<uint8_t>());
+      break;
+    case ml::train::TensorDim::DataType::UINT16:
+      output.push_back(out_t.getData<uint16_t>());
+      break;
+    case ml::train::TensorDim::DataType::UINT32:
+      output.push_back(out_t.getData<uint32_t>());
+      break;
+    case ml::train::TensorDim::DataType::FP32:
+      output.push_back(out_t.getData());
+      break;
+#ifdef ENABLE_FP16
+    case ml::train::TensorDim::DataType::FP16:
+      output.push_back(out_t.getData<_FP16>());
+      break;
+#endif
+    default:
+      output.push_back(out_t.getData());
+      break;
+    }
+  }
+
+  return output;
 }
 
 std::vector<float *>
