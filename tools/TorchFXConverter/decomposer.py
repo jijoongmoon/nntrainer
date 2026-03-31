@@ -394,7 +394,8 @@ def _remove_position_id_chains(layers):
 # Tensor op types that can appear in RoPE computation/application chains.
 _ROPE_CHAIN_OPS = frozenset({
     LAYER_MULTIPLY, LAYER_ADDITION, LAYER_SUBTRACT, LAYER_NEGATIVE,
-    LAYER_RESHAPE, LAYER_TRANSPOSE, LAYER_PERMUTE,
+    LAYER_RESHAPE, OP_RESHAPE, LAYER_TRANSPOSE, OP_TRANSPOSE,
+    LAYER_PERMUTE, OP_PERMUTE,
     "concat", "slice", "cos", "sin", "matmul",
 })
 
