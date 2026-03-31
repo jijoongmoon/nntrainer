@@ -182,6 +182,41 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});
   context.setOutputDimensions(output_dims);
+
+  /** Intermediate tensors for training backward pass */
+  const unsigned int seq_len = query_dim.height();
+
+  /** projected_key: K after RoPE (B, 1, S, H_KV * D) */
+  ml::train::TensorDim projected_key_dim(
+    {batch_size, 1, seq_len, (unsigned int)(num_heads_KV * head_dim)},
+    activation_type);
+  tensor_idx[AttentionParams::projected_key] = context.requestTensor(
+    projected_key_dim, "projected_key", nntrainer::Initializer::NONE, true,
+    nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+
+  /** projected_value: V reshaped (B, 1, S, H_KV * D) */
+  ml::train::TensorDim projected_value_dim(
+    {batch_size, 1, seq_len, (unsigned int)(num_heads_KV * head_dim)},
+    activation_type);
+  tensor_idx[AttentionParams::projected_value] = context.requestTensor(
+    projected_value_dim, "projected_value", nntrainer::Initializer::NONE, true,
+    nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+
+  /** attention_weight: softmax output (B * H_Q, 1, S, S) */
+  ml::train::TensorDim attention_weight_dim(
+    {batch_size * (unsigned int)num_heads_Q, 1, seq_len, seq_len},
+    activation_type);
+  tensor_idx[AttentionParams::attention_weight] = context.requestTensor(
+    attention_weight_dim, "attention_weight", nntrainer::Initializer::NONE, true,
+    nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+
+  /** attention_output: output before final reshape (B, 1, S, H_Q * D) */
+  ml::train::TensorDim attention_output_dim(
+    {batch_size, 1, seq_len, (unsigned int)(num_heads_Q * head_dim)},
+    activation_type);
+  tensor_idx[AttentionParams::attention_output] = context.requestTensor(
+    attention_output_dim, "attention_output", nntrainer::Initializer::NONE, true,
+    nntrainer::TensorLifespan::ITERATION_LIFESPAN);
 }
 
 /************************************************************** */
@@ -192,7 +227,107 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
  * @date 2024-09-02
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
-                              bool training) {}
+                              bool training) {
+  const unsigned int batch_size =
+    context.getInput(INOUT_INDEX::QUERY).getDim().batch();
+  const unsigned int seq_len =
+    context.getInput(INOUT_INDEX::QUERY).getDim().height();
+  const unsigned int gqa_size = num_heads_Q / num_heads_KV;
+
+  nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
+  nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
+  nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
+  nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
+
+  nntrainer::Tensor &projected_key =
+    context.getTensor(tensor_idx[AttentionParams::projected_key]);
+  nntrainer::Tensor &projected_value =
+    context.getTensor(tensor_idx[AttentionParams::projected_value]);
+  nntrainer::Tensor &attention_weight =
+    context.getTensor(tensor_idx[AttentionParams::attention_weight]);
+  nntrainer::Tensor &attention_output =
+    context.getTensor(tensor_idx[AttentionParams::attention_output]);
+
+  /** initialize RoPE frequencies if needed */
+  if (freqs_cos == nullptr) {
+    const std::lock_guard<std::mutex> lock(rope_init_mtx);
+    if (freqs_cos == nullptr) {
+      precompute_freqs(head_dim, max_position_embeddings, theta, false);
+    }
+  }
+
+  /**
+   * Step 1: Apply RoPE to Q and K.
+   *   Q_rotated → attention_output (cached for backward to compute d_K)
+   *   K_rotated → projected_key (cached for backward to compute d_Q)
+   *   V → projected_value (cached for backward to compute d_attention_weight)
+   */
+  apply_rotary_emb_tensor_v2(query, attention_output, head_dim, 0, false);
+  apply_rotary_emb_tensor_v2(key, projected_key, head_dim, 0, false);
+  projected_value.copyData(value);
+
+  /**
+   * Step 2: Reshape for batched multi-head dot product.
+   *   Q: (B, 1, S, H_Q*D) → (B*H_Q, 1, S, D)
+   *   K: (B, 1, S, H_KV*D) → (B*H_KV, 1, S, D)
+   *   V: (B, 1, S, H_KV*D) → (B*H_KV, 1, S, D)
+   */
+  nntrainer::TensorDim q_head_dim(
+    {batch_size * (unsigned int)num_heads_Q, 1, seq_len,
+     (unsigned int)head_dim},
+    query.getTensorType());
+  nntrainer::TensorDim kv_head_dim(
+    {batch_size * (unsigned int)num_heads_KV, 1, seq_len,
+     (unsigned int)head_dim},
+    key.getTensorType());
+
+  nntrainer::Tensor q_heads =
+    attention_output.getSharedDataTensor(q_head_dim, 0, true);
+  nntrainer::Tensor k_heads =
+    projected_key.getSharedDataTensor(kv_head_dim, 0, true);
+  nntrainer::Tensor v_heads =
+    projected_value.getSharedDataTensor(kv_head_dim, 0, true);
+
+  /**
+   * Step 3: Compute attention scores = Q_r @ K_r^T / sqrt(head_dim)
+   *   dotBatched handles GQA: bigger batch must be a multiple of smaller.
+   *   Result: (B*H_Q, 1, S, S)
+   */
+  float scale_factor = 1.0f / sqrt((float)head_dim);
+
+  q_heads.dotBatched(k_heads, attention_weight, false, true);
+  attention_weight.multiply_i(scale_factor);
+
+  /**
+   * Step 4: Apply causal mask (set upper triangle to -inf)
+   */
+  if (is_causal) {
+    float *aw_data = attention_weight.getData<float>();
+    unsigned int total_heads = batch_size * num_heads_Q;
+    for (unsigned int h = 0; h < total_heads; ++h) {
+      for (unsigned int i = 0; i < seq_len; ++i) {
+        for (unsigned int j = i + 1; j < seq_len; ++j) {
+          aw_data[h * seq_len * seq_len + i * seq_len + j] =
+            -std::numeric_limits<float>::infinity();
+        }
+      }
+    }
+  }
+
+  /**
+   * Step 5: Softmax (in-place, attention_weight cached for backward)
+   */
+  sm.run_fn(attention_weight, attention_weight);
+
+  /**
+   * Step 6: output = attention_weight @ V
+   *   (B*H_Q, 1, S, S) @ (B*H_KV, 1, S, D) → (B*H_Q, 1, S, D)
+   *   Output tensor is reshaped as (B*H_Q, 1, S, D), then the memory layout
+   *   matches (B, 1, S, H_Q*D) when viewed with original dims.
+   */
+  nntrainer::Tensor out_heads = output.getSharedDataTensor(q_head_dim, 0, true);
+  attention_weight.dotBatched(v_heads, out_heads);
+}
 
 /**
  * @note This incremental_forwarding method is invoked for inference mode.
@@ -1282,9 +1417,168 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
 }
 
-void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}
+void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
+  const unsigned int batch_size =
+    context.getInput(INOUT_INDEX::QUERY).getDim().batch();
+  const unsigned int seq_len =
+    context.getInput(INOUT_INDEX::QUERY).getDim().height();
 
-void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {}
+  const nntrainer::Tensor &incoming_derivative =
+    context.getIncomingDerivative(INOUT_INDEX::OUTPUT);
+  nntrainer::Tensor &d_query =
+    context.getOutgoingDerivative(INOUT_INDEX::QUERY);
+  nntrainer::Tensor &d_key = context.getOutgoingDerivative(INOUT_INDEX::KEY);
+  nntrainer::Tensor &d_value =
+    context.getOutgoingDerivative(INOUT_INDEX::VALUE);
+
+  /** Retrieve cached tensors from forward pass */
+  nntrainer::Tensor &q_rotated =
+    context.getTensor(tensor_idx[AttentionParams::attention_output]);
+  nntrainer::Tensor &k_rotated =
+    context.getTensor(tensor_idx[AttentionParams::projected_key]);
+  nntrainer::Tensor &v_cached =
+    context.getTensor(tensor_idx[AttentionParams::projected_value]);
+  nntrainer::Tensor &attention_weight =
+    context.getTensor(tensor_idx[AttentionParams::attention_weight]);
+
+  /** Gradient tensors (workspace) */
+  nntrainer::Tensor &d_attention_weight =
+    context.getTensorGrad(tensor_idx[AttentionParams::attention_weight]);
+  nntrainer::Tensor &d_q_rotated =
+    context.getTensorGrad(tensor_idx[AttentionParams::attention_output]);
+  nntrainer::Tensor &d_k_rotated =
+    context.getTensorGrad(tensor_idx[AttentionParams::projected_key]);
+  nntrainer::Tensor &d_v_cached =
+    context.getTensorGrad(tensor_idx[AttentionParams::projected_value]);
+
+  /** Multi-head reshape dims */
+  nntrainer::TensorDim q_head_dim(
+    {batch_size * (unsigned int)num_heads_Q, 1, seq_len,
+     (unsigned int)head_dim},
+    incoming_derivative.getTensorType());
+  nntrainer::TensorDim kv_head_dim(
+    {batch_size * (unsigned int)num_heads_KV, 1, seq_len,
+     (unsigned int)head_dim},
+    incoming_derivative.getTensorType());
+
+  /** Reshape incoming derivative to multi-head format */
+  nntrainer::Tensor d_out_heads =
+    incoming_derivative.getSharedDataTensor(q_head_dim, 0, true);
+
+  /** Reshape cached tensors to multi-head format */
+  nntrainer::Tensor v_heads =
+    v_cached.getSharedDataTensor(kv_head_dim, 0, true);
+  nntrainer::Tensor q_r_heads =
+    q_rotated.getSharedDataTensor(q_head_dim, 0, true);
+  nntrainer::Tensor k_r_heads =
+    k_rotated.getSharedDataTensor(kv_head_dim, 0, true);
+
+  /**
+   * Step 1: Backprop through attention_weight @ V
+   *   d_attention_weight = d_out_heads @ V^T  (B*H_Q, 1, S, S)
+   *   d_V = attention_weight^T @ d_out_heads  (B*H_KV, 1, S, D)
+   */
+  nntrainer::Tensor d_v_heads =
+    d_v_cached.getSharedDataTensor(kv_head_dim, 0, true);
+
+  d_attention_weight.dot_batched_deriv_wrt_1(v_heads, d_out_heads);
+  attention_weight.dot_batched_deriv_wrt_2(d_v_heads, d_out_heads);
+
+  /**
+   * Step 2: Softmax backward
+   *   d_scores = softmax_prime(attention_weight) ⊙ d_attention_weight
+   */
+  sm.run_prime_fn(attention_weight, d_attention_weight, d_attention_weight);
+
+  /**
+   * Step 3: Scale by 1/sqrt(head_dim)
+   */
+  float scale_factor = 1.0f / sqrt((float)head_dim);
+  d_attention_weight.multiply_i(scale_factor);
+
+  /**
+   * Step 4: Backprop through Q_r @ K_r^T
+   *   d_Q_r = d_scores @ K_r  (B*H_Q, 1, S, D)
+   *   d_K_r = d_scores^T @ Q_r  (B*H_KV, 1, S, D)
+   */
+  nntrainer::Tensor d_q_r_heads =
+    d_q_rotated.getSharedDataTensor(q_head_dim, 0, true);
+  nntrainer::Tensor d_k_r_heads =
+    d_k_rotated.getSharedDataTensor(kv_head_dim, 0, true);
+
+  d_q_r_heads.dot_batched_deriv_wrt_1(k_r_heads, d_attention_weight, false,
+                                       true);
+  q_r_heads.dot_batched_deriv_wrt_2(d_k_r_heads, d_attention_weight, false,
+                                     true);
+
+  /**
+   * Step 5: RoPE backward
+   *   RoPE inverse: apply rotation with negated sin values.
+   *   For each position p and dimension j:
+   *     dx[j]        = dy[j]*cos(θ_j*p) + dy[j+half]*sin(θ_j*p)
+   *     dx[j+half]   = -dy[j]*sin(θ_j*p) + dy[j+half]*cos(θ_j*p)
+   *   This is equivalent to applying RoPE with negated sin.
+   */
+  unsigned int half = head_dim / 2;
+  unsigned int q_width = d_query.getDim().width();
+  unsigned int k_width = d_key.getDim().width();
+
+  /** RoPE backward for d_Q */
+  float *dqr_data = d_q_rotated.getData<float>();
+  float *dq_data = d_query.getData<float>();
+  unsigned int total_q = batch_size * seq_len * d_query.getDim().channel();
+
+  for (unsigned int idx = 0; idx < total_q; ++idx) {
+    unsigned int h = idx % seq_len;
+    unsigned int pos = h;
+    if (pos < max_position_embeddings && freqs_cos != nullptr) {
+      const std::vector<float> &cos_ = (*freqs_cos)[pos];
+      const std::vector<float> &sin_ = (*freqs_sin)[pos];
+      float *src = dqr_data + idx * q_width;
+      float *dst = dq_data + idx * q_width;
+      for (unsigned int head = 0; head < num_heads_Q; ++head) {
+        float *s = src + head * head_dim;
+        float *d = dst + head * head_dim;
+        for (unsigned int j = 0; j < half; ++j) {
+          d[j] = s[j] * cos_[j] + s[j + half] * sin_[j];
+          d[j + half] = -s[j] * sin_[j] + s[j + half] * cos_[j];
+        }
+      }
+    }
+  }
+
+  /** RoPE backward for d_K */
+  float *dkr_data = d_k_rotated.getData<float>();
+  float *dk_data = d_key.getData<float>();
+  unsigned int total_k = batch_size * seq_len * d_key.getDim().channel();
+
+  for (unsigned int idx = 0; idx < total_k; ++idx) {
+    unsigned int h = idx % seq_len;
+    unsigned int pos = h;
+    if (pos < max_position_embeddings && freqs_cos != nullptr) {
+      const std::vector<float> &cos_ = (*freqs_cos)[pos];
+      const std::vector<float> &sin_ = (*freqs_sin)[pos];
+      float *src = dkr_data + idx * k_width;
+      float *dst = dk_data + idx * k_width;
+      for (unsigned int head = 0; head < num_heads_KV; ++head) {
+        float *s = src + head * head_dim;
+        float *d = dst + head * head_dim;
+        for (unsigned int j = 0; j < half; ++j) {
+          d[j] = s[j] * cos_[j] + s[j + half] * sin_[j];
+          d[j + half] = -s[j] * sin_[j] + s[j + half] * cos_[j];
+        }
+      }
+    }
+  }
+
+  /** d_V = d_v_cached (no RoPE applied to V) */
+  d_value.copyData(d_v_cached);
+}
+
+void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {
+  /** MHA core has no trainable weights (except optional sink).
+   *  All gradients flow through calcDerivative to input layers. */
+}
 
 void MHACoreLayer::exportTo(nntrainer::Exporter &exporter,
                             const ml::train::ExportMethods &method) const {

@@ -28,3 +28,15 @@ test('unittest_causallm_rms_norm', exe,
   timeout: test_timeout,
   suite: 'unittests'
 )
+
+# Python torch verification test (requires torch and numpy)
+python3 = find_program('python3', required: false)
+if python3.found()
+  test('test_rms_norm_torch', python3,
+    args: ['-m', 'unittest', meson.current_source_dir() / 'test_rms_norm_torch.py', '-v'],
+    timeout: test_timeout,
+    suite: 'unittests',
+    workdir: meson.project_source_root(),
+    is_parallel: false,
+  )
+endif
