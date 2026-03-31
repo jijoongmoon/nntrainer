@@ -146,8 +146,12 @@ def _emit_inherit_header(structure, blocks_info, model_name):
     no_rope = attn_block and not attn_block.attention.has_rope
     is_encoder_only = s.arch_type == "encoder_only"
 
+    op_types = set(b.operator_type for b in s.blocks) if s.blocks else set()
+    is_hybrid = len(op_types) > 1
+    has_conv = "conv" in op_types
+
     need_override_construct = (is_encoder_only or is_post_norm or
-                               uses_layer_norm)
+                               uses_layer_norm or is_hybrid)
     need_override_block = is_post_norm or uses_layer_norm
     need_override_attention = (no_rope or uses_layer_norm) and not need_variant
     need_override_setup = uses_layer_norm or no_rope
@@ -194,6 +198,10 @@ def _emit_inherit_header(structure, blocks_info, model_name):
 
     if need_override_construct:
         L.append(f"  void constructModel() override;")
+
+    if has_conv:
+        L.append(f"  Tensor createConvBlock(const int layer_id,")
+        L.append(f"                         Tensor input);")
 
     if need_override_block:
         L.append(f"  Tensor createTransformerDecoderBlock(const int layer_id,")

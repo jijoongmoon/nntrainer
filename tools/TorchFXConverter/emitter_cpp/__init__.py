@@ -213,7 +213,8 @@ class CppEmitter(BaseEmitter):
         custom_classes = collect_custom_layer_classes(
             s, norm_type, attn_block)
         return emit_inherit_source(
-            s, attn_block, custom_classes, self._model_name)
+            s, attn_block, custom_classes, self._model_name,
+            layers=self.layers)
 
     # ----- Internal helpers -----
 

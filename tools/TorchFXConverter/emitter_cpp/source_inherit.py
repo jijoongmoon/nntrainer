@@ -30,6 +30,11 @@ def _get_arch_diffs(structure, attn_block):
     norm_type = get_norm_type(s.model_type)
     block = s.blocks[0] if s.blocks else None
 
+    # Detect hybrid architecture (conv + attention blocks)
+    op_types = set(b.operator_type for b in s.blocks) if s.blocks else set()
+    is_hybrid = len(op_types) > 1
+    has_conv = "conv" in op_types
+
     diffs = {
         "is_encoder_only": s.arch_type == "encoder_only",
         "is_post_norm": block and block.norm_type == "post_norm",
@@ -41,6 +46,8 @@ def _get_arch_diffs(structure, attn_block):
         "has_qk_norm": attn_block and attn_block.attention.has_qk_norm,
         "has_position_embedding": s.arch_type == "encoder_only",
         "has_token_type_embedding": s.arch_type == "encoder_only",
+        "is_hybrid": is_hybrid,
+        "has_conv": has_conv,
     }
 
     # Determine which methods need overriding
@@ -48,7 +55,8 @@ def _get_arch_diffs(structure, attn_block):
         diffs["has_position_embedding"] or
         diffs["has_token_type_embedding"] or
         diffs["is_post_norm"] or
-        diffs["uses_layer_norm"]
+        diffs["uses_layer_norm"] or
+        diffs["is_hybrid"]  # Hybrid needs custom block dispatch
     )
     diffs["override_block"] = (
         diffs["is_post_norm"] or
@@ -68,11 +76,16 @@ def _get_arch_diffs(structure, attn_block):
     return diffs
 
 
-def emit_inherit_source(structure, attn_block, custom_classes, model_name):
+def emit_inherit_source(structure, attn_block, custom_classes, model_name,
+                        layers=None):
     """Generate source file for Transformer-inheriting model.
 
     Analyzes architectural differences from the base Transformer class
     and emits only the methods that need to be overridden.
+
+    Args:
+        layers: Full list of NNTrainerLayerDef from conversion result.
+                Needed for hybrid models to emit conv block tensor ops.
     """
     s = structure
     cname = _class_name(s.model_type, s.arch_type)
@@ -161,9 +174,13 @@ def emit_inherit_source(structure, attn_block, custom_classes, model_name):
     if diffs["override_setup_params"]:
         _emit_setup_parameters_override(L, cname, s, diffs)
 
-    # constructModel override for encoder-only models
+    # constructModel override for hybrid or encoder-only models
     if diffs["override_construct_model"]:
         _emit_construct_model_override(L, cname, s, diffs, norm_type)
+
+    # createConvBlock for hybrid models with conv layers
+    if diffs["has_conv"] and layers:
+        _emit_conv_block_method(L, cname, s, layers)
 
     # createTransformerDecoderBlock override for post-norm models
     if diffs["override_block"]:
@@ -292,113 +309,401 @@ def _emit_setup_parameters_override(L, cname, s, diffs):
 
 
 def _emit_construct_model_override(L, cname, s, diffs, norm_type):
-    """Emit constructModel() override for encoder-only models.
+    """Emit constructModel() override.
 
-    Key differences from base Transformer:
-    - Multiple embeddings (token + position + token_type) with addition
-    - Post-embedding LayerNorm (BERT-style)
-    - No final output norm (each block ends with its own norm)
+    Handles:
+    - Encoder-only: multiple embeddings, post-embedding norm
+    - Hybrid: per-layer type dispatch (conv vs attention blocks)
     """
+    is_hybrid = diffs.get("is_hybrid", False)
+    is_encoder_only = diffs.get("is_encoder_only", False)
+
     L.append(f"void {cname}::constructModel() {{")
     L.append(f"")
     L.append(f"  using ml::train::createLayer;")
     L.append(f"")
-    L.append(f"  // Input layer")
-    L.append(f'  LayerHandle input_layer(createLayer("input", {{')
-    L.append(f'    withKey("name", "input0"),')
-    L.append(f'    withKey("input_shape", "1:1:" +'
-             f' std::to_string(INIT_SEQ_LEN))')
-    L.append(f"  }}));")
-    L.append(f"  Tensor input = input_layer(Tensor());")
-    L.append(f"  std::vector<Tensor> all_inputs = {{input}};")
-    L.append(f"")
 
-    if diffs["has_position_embedding"]:
-        L.append(f"  // Position IDs input")
-        L.append(f'  LayerHandle pos_input(createLayer("input", {{')
-        L.append(f'    withKey("name", "position_ids"),')
+    if is_encoder_only:
+        # Encoder-only: custom input/embedding handling
+        L.append(f"  // Input layer")
+        L.append(f'  LayerHandle input_layer(createLayer("input", {{')
+        L.append(f'    withKey("name", "input0"),')
         L.append(f'    withKey("input_shape", "1:1:" +'
                  f' std::to_string(INIT_SEQ_LEN))')
         L.append(f"  }}));")
-        L.append(f"  Tensor pos_ids = pos_input(Tensor());")
-        L.append(f"  all_inputs.push_back(pos_ids);")
+        L.append(f"  Tensor input = input_layer(Tensor());")
+        L.append(f"  std::vector<Tensor> all_inputs = {{input}};")
         L.append(f"")
 
-    if diffs["has_token_type_embedding"]:
-        L.append(f"  // Token type IDs input")
-        L.append(f'  LayerHandle tt_input(createLayer("input", {{')
-        L.append(f'    withKey("name", "token_type_ids"),')
+        if diffs["has_position_embedding"]:
+            L.append(f"  // Position IDs input")
+            L.append(f'  LayerHandle pos_input(createLayer("input", {{')
+            L.append(f'    withKey("name", "position_ids"),')
+            L.append(f'    withKey("input_shape", "1:1:" +'
+                     f' std::to_string(INIT_SEQ_LEN))')
+            L.append(f"  }}));")
+            L.append(f"  Tensor pos_ids = pos_input(Tensor());")
+            L.append(f"  all_inputs.push_back(pos_ids);")
+            L.append(f"")
+
+        if diffs["has_token_type_embedding"]:
+            L.append(f"  // Token type IDs input")
+            L.append(f'  LayerHandle tt_input(createLayer("input", {{')
+            L.append(f'    withKey("name", "token_type_ids"),')
+            L.append(f'    withKey("input_shape", "1:1:" +'
+                     f' std::to_string(INIT_SEQ_LEN))')
+            L.append(f"  }}));")
+            L.append(f"  Tensor tt_ids = tt_input(Tensor());")
+            L.append(f"  all_inputs.push_back(tt_ids);")
+            L.append(f"")
+
+        # Token embedding
+        L.append(f"  // Token embedding")
+        if s.tie_word_embeddings:
+            L.append(f'  const std::string embedding_type = '
+                     f'TIE_WORD_EMBEDDINGS ? '
+                     f'"tie_word_embeddings" : "embedding_layer";')
+        else:
+            L.append(f'  const std::string embedding_type = '
+                     f'"embedding_layer";')
+        L.append(f'  LayerHandle word_emb(createLayer(embedding_type, {{')
+        L.append(f'    withKey("name", "embedding0"),')
+        L.append(f'    withKey("in_dim", NUM_VOCAB),')
+        L.append(f'    withKey("out_dim", DIM)')
+        L.append(f"  }}));")
+        L.append(f"  Tensor x = word_emb(input);")
+        L.append(f"")
+
+        if diffs["has_position_embedding"]:
+            L.append(f"  // Position embedding")
+            L.append(f'  LayerHandle pos_emb(createLayer("embedding_layer", '
+                     f'{{')
+            L.append(f'    withKey("name", "position_embedding"),')
+            L.append(f'    withKey("in_dim", MAX_POSITION_EMBEDDINGS),')
+            L.append(f'    withKey("out_dim", DIM)')
+            L.append(f"  }}));")
+            L.append(f"  Tensor pos_out = pos_emb(pos_ids);")
+            L.append(f"  x = x.add(pos_out);")
+            L.append(f"")
+
+        if diffs["has_token_type_embedding"]:
+            type_vocab = getattr(s, 'type_vocab_size', 2) or 2
+            L.append(f"  // Token type embedding")
+            L.append(f'  LayerHandle tt_emb(createLayer("embedding_layer", '
+                     f'{{')
+            L.append(f'    withKey("name", "token_type_embedding"),')
+            L.append(f'    withKey("in_dim", {type_vocab}),')
+            L.append(f'    withKey("out_dim", DIM)')
+            L.append(f"  }}));")
+            L.append(f"  Tensor tt_out = tt_emb(tt_ids);")
+            L.append(f"  x = x.add(tt_out);")
+            L.append(f"")
+
+        # Post-embedding LayerNorm (BERT-style)
+        L.append(f"  // Post-embedding normalization")
+        L.append(f'  LayerHandle emb_norm(createLayer("{norm_type}", {{')
+        L.append(f'    withKey("name", "embedding_norm"),')
+        L.append(f'    withKey("epsilon", std::to_string(NORM_EPS))')
+        if norm_type == "layer_normalization":
+            L.append(f'    , withKey("axis", 3)')
+        elif norm_type == "rms_norm":
+            L.append(f'    , withKey("packed", "false")')
+        L.append(f"  }}));")
+        L.append(f"  x = emb_norm(x);")
+        L.append(f"")
+
+        # Transformer blocks
+        L.append(f"  // Transformer encoder blocks")
+        L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
+        L.append(f"    x = createTransformerDecoderBlock(i, x);")
+        L.append(f"  }}")
+        L.append(f"")
+
+        # Compile
+        L.append(f"  // Compile model from symbolic tensor graph")
+        L.append(f"  std::vector<Tensor> outputs = {{x}};")
+        L.append(f"  model->compile(all_inputs, outputs, "
+                 f"ml::train::ExecutionMode::INFERENCE);")
+
+    elif is_hybrid:
+        # Hybrid: use base Transformer's input/embedding/norm,
+        # but override the block loop with per-layer type dispatch
+        op_type_list = [b.operator_type for b in s.blocks]
+        op_types_unique = sorted(set(op_type_list))
+
+        L.append(f"  // Create input tensor")
+        L.append(f'  LayerHandle input_layer = createLayer("input", {{')
+        L.append(f'    withKey("name", "input0"),')
         L.append(f'    withKey("input_shape", "1:1:" +'
                  f' std::to_string(INIT_SEQ_LEN))')
-        L.append(f"  }}));")
-        L.append(f"  Tensor tt_ids = tt_input(Tensor());")
-        L.append(f"  all_inputs.push_back(tt_ids);")
+        L.append(f"  }});")
+        L.append(f"  Tensor input = input_layer(Tensor());")
+        L.append(f"  std::vector<Tensor> all_inputs = {{input}};")
         L.append(f"")
 
-    # Token embedding
-    L.append(f"  // Token embedding")
-    if s.tie_word_embeddings:
-        L.append(f'  const std::string embedding_type = '
-                 f'TIE_WORD_EMBEDDINGS ? '
-                 f'"tie_word_embeddings" : "embedding_layer";')
-    else:
-        L.append(f'  const std::string embedding_type = "embedding_layer";')
-    L.append(f'  LayerHandle word_emb(createLayer(embedding_type, {{')
-    L.append(f'    withKey("name", "embedding0"),')
-    L.append(f'    withKey("in_dim", NUM_VOCAB),')
-    L.append(f'    withKey("out_dim", DIM)')
-    L.append(f"  }}));")
-    L.append(f"  Tensor x = word_emb(input);")
-    L.append(f"")
-
-    if diffs["has_position_embedding"]:
-        L.append(f"  // Position embedding")
-        L.append(f'  LayerHandle pos_emb(createLayer("embedding_layer", {{')
-        L.append(f'    withKey("name", "position_embedding"),')
-        L.append(f'    withKey("in_dim", MAX_POSITION_EMBEDDINGS),')
+        # Embedding (same as base Transformer)
+        L.append(f"  // Embedding layer")
+        if s.tie_word_embeddings:
+            L.append(f'  const std::string embedding_type = '
+                     f'TIE_WORD_EMBEDDINGS ? '
+                     f'"tie_word_embeddings" : "embedding_layer";')
+        else:
+            L.append(f'  const std::string embedding_type = '
+                     f'"embedding_layer";')
+        L.append(f'  LayerHandle embedding(createLayer(embedding_type, {{')
+        L.append(f'    withKey("name", "embedding0"),')
+        L.append(f'    withKey("in_dim", NUM_VOCAB),')
         L.append(f'    withKey("out_dim", DIM)')
         L.append(f"  }}));")
-        L.append(f"  Tensor pos_out = pos_emb(pos_ids);")
-        L.append(f"  x = x.add(pos_out);")
+        L.append(f"  Tensor x = embedding(input);")
         L.append(f"")
 
-    if diffs["has_token_type_embedding"]:
-        type_vocab = getattr(s, 'type_vocab_size', 2) or 2
-        L.append(f"  // Token type embedding")
-        L.append(f'  LayerHandle tt_emb(createLayer("embedding_layer", {{')
-        L.append(f'    withKey("name", "token_type_embedding"),')
-        L.append(f'    withKey("in_dim", {type_vocab}),')
-        L.append(f'    withKey("out_dim", DIM)')
+        # Layer types array
+        L.append(f"  // Per-layer operator types")
+        L.append(f"  const std::vector<std::string> LAYER_TYPES = {{")
+        for i, ot in enumerate(op_type_list):
+            comma = "," if i < len(op_type_list) - 1 else ""
+            L.append(f'    "{ot}"{comma}')
+        L.append(f"  }};")
+        L.append(f"")
+
+        # Hybrid block loop
+        L.append(f"  // Hybrid transformer blocks")
+        L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
+        for idx, op_type in enumerate(op_types_unique):
+            keyword = "if" if idx == 0 else "} else if"
+            if op_type == "attention":
+                L.append(f'    {keyword} (LAYER_TYPES[i] == "attention") {{')
+                L.append(f"      x = createTransformerDecoderBlock(i, x);")
+            else:
+                method = f"create{op_type.capitalize()}Block"
+                L.append(f'    {keyword} (LAYER_TYPES[i] == "{op_type}") {{')
+                L.append(f"      x = {method}(i, x);")
+        L.append(f"    }}")
+        L.append(f"  }}")
+        L.append(f"")
+
+        # Final norm
+        L.append(f"  // Final normalization")
+        L.append(f'  LayerHandle output_norm(createLayer("rms_norm", {{')
+        L.append(f'    withKey("name", "output_norm"),')
+        L.append(f'    withKey("epsilon", std::to_string(NORM_EPS)),')
+        L.append(f'    withKey("packed", "false")')
         L.append(f"  }}));")
-        L.append(f"  Tensor tt_out = tt_emb(tt_ids);")
-        L.append(f"  x = x.add(tt_out);")
+        L.append(f"  Tensor norm_out = output_norm(x);")
         L.append(f"")
 
-    # Post-embedding LayerNorm (BERT-style)
-    L.append(f"  // Post-embedding normalization")
-    L.append(f'  LayerHandle emb_norm(createLayer("{norm_type}", {{')
-    L.append(f'    withKey("name", "embedding_norm"),')
-    L.append(f'    withKey("epsilon", std::to_string(NORM_EPS))')
-    if norm_type == "layer_normalization":
-        L.append(f'    , withKey("axis", 3)')
-    elif norm_type == "rms_norm":
-        L.append(f'    , withKey("packed", "false")')
+        # LM head
+        if s.lm_head:
+            L.append(f"  // LM head")
+            if s.tie_word_embeddings:
+                L.append(f'  const std::string lmhead_type = '
+                         f'TIE_WORD_EMBEDDINGS ? '
+                         f'"tie_word_embeddings" : "fully_connected";')
+            else:
+                L.append(f'  const std::string lmhead_type = '
+                         f'"fully_connected";')
+            L.append(f'  std::vector<std::string> lmhead_props = {{')
+            L.append(f'    withKey("name", "output_of_causallm"),')
+            L.append(f'    withKey("unit", NUM_VOCAB),')
+            L.append(f'    withKey("disable_bias", "true")')
+            if s.tie_word_embeddings:
+                L.append(f'    , withKey("shared_from", "embedding0")')
+            L.append(f"  }};")
+            L.append(f"  LayerHandle lmhead(createLayer(lmhead_type, "
+                     f"lmhead_props));")
+            L.append(f"  Tensor output = lmhead(norm_out);")
+            L.append(f"")
+            output_var = "output"
+        else:
+            output_var = "norm_out"
+
+        # Compile
+        L.append(f"  // Compile model from symbolic tensor graph")
+        L.append(f"  model->compile(input, {output_var}, "
+                 f"ml::train::ExecutionMode::INFERENCE);")
+
+    L.append(f"}}")
+    L.append(f"")
+
+
+def _emit_conv_block_method(L, cname, s, layers):
+    """Emit createConvBlock() method for hybrid models.
+
+    Generates a complete conv block with all tensor operations from the
+    conversion result layers (transpose, split, multiply, conv1d, slice, etc).
+
+    Split/chunk operations produce multi-output tensors whose individual
+    outputs are accessed via operator.getitem in PyTorch.  In the converter
+    pipeline these getitem results become standalone ``input`` layers with
+    names like ``getitem``, ``getitem_1``, etc.  This method detects such
+    references, emits ``Tensor::output(N)`` calls after the split layer,
+    and wires the indexed outputs into downstream operations.
+    """
+    # Find the conv block pattern from structure
+    conv_block = None
+    for b in s.blocks:
+        if b.operator_type == "conv":
+            conv_block = b
+            break
+
+    if conv_block is None:
+        return
+
+    # Get the scope prefix to identify conv layers for block 0
+    scope = conv_block.operator_scope  # e.g. "model.layers.0.conv"
+    scope_san = scope.replace(".", "_")
+    # Find the block-level prefix: "model_layers_0"
+    # scope_san is like "model_layers_0_conv"
+    block_prefix = scope_san.rsplit("_", 1)[0] if "_conv" in scope_san \
+        else scope_san
+
+    # Collect all layers belonging to this conv block
+    conv_layers = []
+    for layer in layers:
+        if layer.name.startswith(scope_san):
+            conv_layers.append(layer)
+
+    # --- Resolve split → getitem mapping ---
+    # Find getitem references: input_layers names referenced by conv layers
+    # but not defined in the conv layer set themselves.
+    conv_layer_names = {la.name for la in conv_layers}
+    getitem_refs = set()
+    for la in conv_layers:
+        for inp in la.input_layers:
+            if inp not in conv_layer_names and inp.startswith("getitem"):
+                getitem_refs.add(inp)
+
+    # Build getitem → index mapping (getitem=0, getitem_1=1, getitem_2=2, …)
+    def _getitem_index(name):
+        if name == "getitem":
+            return 0
+        parts = name.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return int(parts[1])
+        return 0
+
+    getitem_sorted = sorted(getitem_refs, key=_getitem_index)
+
+    # Find which split layer in conv_layers these getitems belong to.
+    # There is typically exactly one split/chunk per conv block.
+    split_layer_name = None
+    for la in conv_layers:
+        if la.layer_type == "split":
+            split_layer_name = la.name
+            break
+
+    L.append(f"Tensor")
+    L.append(f"{cname}::createConvBlock(const int layer_id,")
+    L.append(f"  Tensor input) {{")
+    L.append(f"")
+    L.append(f"  using ml::train::createLayer;")
+    L.append(f'  auto prefix = "layer" + std::to_string(layer_id);')
+    L.append(f"")
+
+    # Pre-conv normalization (from base Transformer pattern)
+    L.append(f"  // Pre-conv normalization")
+    L.append(f'  LayerHandle conv_norm(createLayer("rms_norm", {{')
+    L.append(f'    withKey("name", prefix + "_conv_norm"),')
+    L.append(f'    withKey("epsilon", std::to_string(NORM_EPS)),')
+    L.append(f'    withKey("packed", "false")')
     L.append(f"  }}));")
-    L.append(f"  x = emb_norm(x);")
+    L.append(f"  Tensor normed = conv_norm(input);")
     L.append(f"")
 
-    # Transformer blocks
-    L.append(f"  // Transformer encoder blocks")
-    L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
-    L.append(f"    x = createTransformerDecoderBlock(i, x);")
-    L.append(f"  }}")
+    # Emit conv operator layers as tensor ops
+    L.append(f"  // Conv operator (tensor-level operations)")
+    tensor_vars = {"normed": "normed"}
+    prev_var = "normed"
+    var_idx = 0
+
+    for layer in conv_layers:
+        var_name = f"conv_op_{var_idx}"
+        var_idx += 1
+
+        # Determine the suffix for parameterized naming
+        if layer.name.startswith(scope_san + "_"):
+            suffix = layer.name[len(scope_san):]
+        elif layer.name.startswith(block_prefix + "_conv_"):
+            suffix = layer.name[len(block_prefix + "_conv"):]
+        else:
+            suffix = "_" + layer.name.split("_")[-1]
+
+        # Build properties
+        props = [f'withKey("name", prefix + "_conv{suffix}")']
+        for k, v in layer.properties.items():
+            if k == "name":
+                continue
+            if isinstance(v, bool):
+                props.append(f'withKey("{k}", '
+                             f'"{str(v).lower()}")')
+            elif isinstance(v, str):
+                props.append(f'withKey("{k}", "{v}")')
+            else:
+                props.append(f'withKey("{k}", {v})')
+
+        # Determine input
+        if len(layer.input_layers) == 1:
+            inp = layer.input_layers[0]
+            input_expr = tensor_vars.get(inp, prev_var)
+        elif len(layer.input_layers) > 1:
+            resolved = []
+            for inp in layer.input_layers:
+                resolved.append(tensor_vars.get(inp, inp))
+            input_expr = "{" + ", ".join(resolved) + "}"
+        else:
+            input_expr = prev_var
+
+        prop_str = ",\n    ".join(props)
+        L.append(f'  LayerHandle {var_name}(createLayer('
+                 f'"{layer.layer_type}", {{')
+        L.append(f"    {prop_str}")
+        L.append(f"  }}));")
+        L.append(f"  Tensor {var_name}_out = {var_name}({input_expr});")
+
+        tensor_vars[layer.name] = f"{var_name}_out"
+        prev_var = f"{var_name}_out"
+
+        # After a split layer, emit indexed output variables for each
+        # getitem reference so downstream layers can use them.
+        if layer.layer_type == "split" and layer.name == split_layer_name:
+            L.append(f"")
+            L.append(f"  // Indexed outputs from split/chunk")
+            for gi_name in getitem_sorted:
+                gi_idx = _getitem_index(gi_name)
+                gi_var = f"chunk_{gi_idx}"
+                L.append(f"  Tensor {gi_var} = "
+                         f"{var_name}_out.output({gi_idx});")
+                tensor_vars[gi_name] = gi_var
+
+        L.append(f"")
+
+    # Residual connection
+    L.append(f"  // Conv residual connection")
+    L.append(f"  Tensor residual = input.add({prev_var});")
     L.append(f"")
 
-    # Compile
-    L.append(f"  // Compile model from symbolic tensor graph")
-    L.append(f"  std::vector<Tensor> outputs = {{x}};")
-    L.append(f"  model->compile(all_inputs, outputs, "
-             f"ml::train::ExecutionMode::INFERENCE);")
+    # Pre-FFN norm
+    L.append(f"  // Pre-FFN normalization")
+    L.append(f'  LayerHandle ffn_norm(createLayer("rms_norm", {{')
+    L.append(f'    withKey("name", prefix + "_ffn_norm"),')
+    L.append(f'    withKey("epsilon", std::to_string(NORM_EPS)),')
+    L.append(f'    withKey("packed", "false")')
+    L.append(f"  }}));")
+    L.append(f"  Tensor ffn_normed = ffn_norm(residual);")
+    L.append(f"")
+
+    # FFN
+    L.append(f"  // Feed forward")
+    L.append(f"  Tensor ffn_out = createMlp(layer_id, DIM, "
+             f"INTERMEDIATE_SIZE, ffn_normed);")
+    L.append(f"")
+
+    # FFN residual
+    L.append(f"  // FFN residual connection")
+    L.append(f"  Tensor block_out = residual.add(ffn_out);")
+    L.append(f"")
+    L.append(f"  return block_out;")
     L.append(f"}}")
     L.append(f"")
 
