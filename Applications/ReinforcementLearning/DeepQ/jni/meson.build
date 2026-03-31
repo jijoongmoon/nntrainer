@@ -7,7 +7,10 @@ run_command(['cp', '-lr', res_path, nntr_deepq_resdir], check: true)
 env_dir='../../Environment'
 
 jsoncpp_dep = dependency('jsoncpp')
-libcurl_dep = dependency('libcurl')
+libcurl_dep = dependency('libcurl', required: false)
+if not libcurl_dep.found()
+  subdir_done()
+endif
 
 deepq_sources = [
   'main.cpp',

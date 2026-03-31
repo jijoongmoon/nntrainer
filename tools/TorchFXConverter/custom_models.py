@@ -790,7 +790,7 @@ def _load_resnet18(model_dir, config, seq_len, verbose):
         _sys.modules["torchconverter"] = _mock
 
     main_path = _os.path.abspath(
-        _os.path.join(_os.path.dirname(__file__), "..", "Resnet", "PyTorch", "main.py"))
+        _os.path.join(_os.path.dirname(__file__), "..", "..", "Applications", "Resnet", "PyTorch", "main.py"))
     spec = _ilu.spec_from_file_location("resnet_main", main_path)
     mod = _ilu.module_from_spec(spec)
     mod.__name__ = "resnet_main"          # avoid __main__ guard
