@@ -264,7 +264,7 @@ METHOD_CLAMP_NAMES = frozenset({
 
 # Method ops that are no-ops in inference
 METHOD_NOOP_NAMES = frozenset({
-    "contiguous", "detach", "clone", "to", "float",
+    "contiguous", "detach", "clone", "copy_", "to", "float",
     "half", "bfloat16", "int", "long", "short", "bool",
     "type_as", "expand",
     "size", "dim", "numel",
