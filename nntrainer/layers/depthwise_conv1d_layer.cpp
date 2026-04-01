@@ -253,17 +253,13 @@ void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
   }
 
   /**
-   * Depthwise 1D convolution using im2col + element-wise multiply + reduce.
+   * Depthwise 1D convolution using im2col + dot.
    *
    * For each batch:
    *   1. im2col: unroll input patches into col_buf [C*K, OW]
-   *   2. Element-wise multiply: col_buf *= weight_col  (both [C*K, OW])
-   *   3. Reduce-sum every K rows to get output [C, OW]:
-   *      output[c, ow] = sum_{k=0}^{K-1} col_buf[c*K+k, ow]
-   *
-   * This approach replaces per-channel dot products with bulk element-wise
-   * ops, which maps directly to quantized INT4×INT8 element-wise multiply
-   * followed by reduction.
+   *   2. Per-channel dot: weight_col[c] (1,K) . col_block[c] (K,OW) = (1,OW)
+   *      weight_col stores the pre-expanded weight so that for quantized
+   *      inference it can be INT4-quantized once and reused directly.
    */
   for (unsigned int b = 0; b < batch; ++b) {
     col_buf.setZero();
@@ -272,18 +268,16 @@ void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
     depthwise_im2col_1d(in_sub, col_buf, channels, in_width, out_width,
                         kernel_size, stride, dilation, pad_left);
 
-    // Element-wise multiply: col_buf[C*K, OW] *= weight_col[C*K, OW]
-    col_buf.multiply_i(weight_col);
-
-    // Reduce-sum every K rows → output[C, OW]
+    // Per-channel dot: weight[c] (1xK) . col_block (KxOW) = out (1xOW)
     for (unsigned int c = 0; c < channels; ++c) {
-      for (unsigned int ow = 0; ow < out_width; ++ow) {
-        float sum = 0.0f;
-        for (unsigned int k = 0; k < kernel_size; ++k) {
-          sum += col_buf.getValue(0, 0, c * kernel_size + k, ow);
-        }
-        hidden_.setValue(b, c, 0, ow, sum);
-      }
+      Tensor w_row = filter.getSharedDataTensor(
+        {1, 1, 1, kernel_size}, c * kernel_size);
+      Tensor col_block = col_buf.getSharedDataTensor(
+        {1, 1, kernel_size, out_width}, c * kernel_size * out_width);
+      Tensor out_row = hidden_.getSharedDataTensor(
+        {1, 1, 1, out_width}, (b * channels + c) * out_width);
+
+      w_row.dot(col_block, out_row, false, false);
     }
   }
 
