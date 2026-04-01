@@ -1466,17 +1466,43 @@
             // Index C++ LayerHandle declarations and Tensor::add() calls
             const cppHandles = []; // [{line, varName, layerType}]
             const cppAddLines = []; // [{line, varName}]
+            // Also track withKey("name", ...) to extract NNTrainer name
+            // suffixes for each LayerHandle (e.g. "_k_norm", "_conv_norm").
+            let lastHandle = null;
             cppLines.forEach((line, i) => {
                 let m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*"([^"]+)"/);
                 if (!m) m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*(\w+)/);
-                if (m) cppHandles.push({line: i+1, varName: m[1], layerType: m[2]});
+                if (m) {
+                    lastHandle = {line: i+1, varName: m[1], layerType: m[2], nameSuffixes: []};
+                    cppHandles.push(lastHandle);
+                }
                 let ma = line.match(/Tensor\s+(\w+)\s*=\s*\w+\.add\s*\(/);
                 if (ma) cppAddLines.push({line: i+1, varName: ma[1]});
+                // Extract name suffix from withKey("name", prefix + "_suffix")
+                // or withKey("name", VarName) where VarName = "layer" + id + "_suffix"
+                if (lastHandle) {
+                    let wk = line.match(/withKey\s*\(\s*"name"\s*,\s*(?:prefix\s*\+\s*)?"([^"]+)"/);
+                    if (wk) lastHandle.nameSuffixes.push(wk[1].replace(/^_/, ''));
+                    // Also handle variable references like K_norm_name
+                    let vr = line.match(/withKey\s*\(\s*"name"\s*,\s*(\w+_name)\s*\)/);
+                    if (vr) {
+                        // Find the variable definition: auto Foo = "layer" + ... + "_suffix";
+                        const varDef = cppLines.find(l => {
+                            const dm = l.match(new RegExp('auto\\s+' + vr[1] + '\\s*=.*"([^"]+)"\\s*;'));
+                            return dm;
+                        });
+                        if (varDef) {
+                            const dm = varDef.match(/"([^"]+)"\s*;/);
+                            if (dm) lastHandle.nameSuffixes.push(dm[1].replace(/^_/, ''));
+                        }
+                    }
+                }
             });
 
             // Build handle lookups
             const handleByVar = new Map();   // varName -> line
             const handlesByType = new Map();  // layerType -> [{line, varName}]
+            const nameSuffixMap = new Map();  // NNTrainer name suffix -> line
             cppHandles.forEach(h => {
                 if (!handleByVar.has(h.varName)) handleByVar.set(h.varName, h.line);
                 // Also index without _layer suffix (flat model emitter adds it)
@@ -1486,6 +1512,10 @@
                 }
                 if (!handlesByType.has(h.layerType)) handlesByType.set(h.layerType, []);
                 handlesByType.get(h.layerType).push(h);
+                // Index name suffixes (from withKey("name",...) parsing)
+                h.nameSuffixes.forEach(s => {
+                    if (!nameSuffixMap.has(s)) nameSuffixMap.set(s, h.line);
+                });
             });
 
             // Alias: NN layer name suffix -> C++ handle variable name
@@ -1597,7 +1627,20 @@
                     if (line) { cppLineMap.set(l.name, line); return; }
                 }
 
-                // 3. Fallback: match by layer type
+                // 3. Match via C++ withKey("name",...) name suffixes
+                // e.g. NN "model_layers_2_self_attn_q_proj" matches C++
+                // name suffix "wq" from withKey("name", "layer"+id+"_wq")
+                if (scoped) {
+                    for (const [suffix, sLine] of nameSuffixMap) {
+                        if (scoped === suffix || scoped.endsWith('_' + suffix)) {
+                            line = sLine;
+                            break;
+                        }
+                    }
+                    if (line) { cppLineMap.set(l.name, line); return; }
+                }
+
+                // 4. Fallback: match by layer type
                 const typeAlias = {'sdpa': 'mha_core'};
                 const lookupType = typeAlias[l.layer_type] || l.layer_type;
                 const typeHandles = handlesByType.get(lookupType) || handlesByType.get(l.layer_type);
