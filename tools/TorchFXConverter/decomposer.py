@@ -399,6 +399,19 @@ _ROPE_CHAIN_OPS = frozenset({
     "concat", "slice", "cos", "sin", "matmul",
 })
 
+# Subset for forward propagation only.  Excludes "concat" and "slice"
+# because these are ambiguous: they appear in rotate_half (RoPE) but
+# also in KV-cache concatenation.  rotate_half concat/slice are caught
+# by the backward pass (all their consumers are removable), whereas
+# KV-cache concats feed into SDPA and must survive.
+_ROPE_FORWARD_OPS = _ROPE_CHAIN_OPS - {"concat", "slice"}
+
+# Subset for backward propagation.  Excludes transpose because
+# transpose layers are the pre-rotation Q/K tensors — the boundary
+# between the main data path and the RoPE chain.  SDPA needs to be
+# rewired to these after RoPE removal.
+_ROPE_BACKWARD_OPS = _ROPE_CHAIN_OPS - {LAYER_TRANSPOSE, OP_TRANSPOSE}
+
 
 def _remove_rope_chains(layers):
     """Remove rotary position embedding computation chains.
@@ -439,12 +452,14 @@ def _remove_rope_chains(layers):
         return layers
 
     # Step 2: Forward pass — mark tensor ops that have ANY input from
-    # the removable set (these consume rope cos/sin outputs)
+    # the removable set (these consume rope cos/sin outputs).
+    # Uses _ROPE_FORWARD_OPS (excludes concat/slice) to avoid catching
+    # KV-cache concats that merely consume the RoPE output.
     changed = True
     while changed:
         changed = False
         for l in layers:
-            if l.name in removable or l.layer_type not in _ROPE_CHAIN_OPS:
+            if l.name in removable or l.layer_type not in _ROPE_FORWARD_OPS:
                 continue
             if l.input_layers and any(inp in removable
                                       for inp in l.input_layers):
@@ -453,12 +468,14 @@ def _remove_rope_chains(layers):
 
     # Step 3: Backward pass — mark tensor ops whose ALL consumers are
     # already removable (captures rotate_half: split→neg→cat chains
-    # that only feed into the rope multiply layers)
+    # that only feed into the rope multiply layers).
+    # Uses _ROPE_BACKWARD_OPS (excludes transpose) so that pre-rotation
+    # Q/K transpose layers are preserved as rewire targets for SDPA.
     changed = True
     while changed:
         changed = False
         for l in layers:
-            if l.name in removable or l.layer_type not in _ROPE_CHAIN_OPS:
+            if l.name in removable or l.layer_type not in _ROPE_BACKWARD_OPS:
                 continue
             layer_consumers = consumers.get(l.name, set())
             if layer_consumers and all(c in removable
