@@ -108,6 +108,7 @@ private:
 
   std::array<unsigned int, 2> padding; /**< computed padding [left, right] */
   std::array<unsigned int, 2> wt_idx;  /**< indices of the weights */
+  unsigned int col_buf_idx;            /**< index of the im2col buffer tensor */
 
   enum DepthwiseConvParams { weight, bias };
 };
