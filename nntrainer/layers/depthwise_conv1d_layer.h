@@ -110,6 +110,7 @@ private:
   std::array<unsigned int, 2> wt_idx;  /**< indices of the weights */
   unsigned int col_buf_idx;            /**< index of the im2col input buffer */
   unsigned int weight_col_idx;         /**< index of the im2col weight buffer */
+  bool weight_col_expanded;            /**< true after weight_col is filled */
 
   /**
    * @brief Expand weight [C,1,1,K] into im2col form [1,1,C*K,OW].

@@ -109,7 +109,8 @@ DepthwiseConv1DLayer::DepthwiseConv1DLayer() :
   LayerImpl(),
   conv_props(props::FilterSize(), props::KernelSize(), props::Stride(),
              props::Padding1D(), props::Dilation()),
-  padding({0, 0}) {
+  padding({0, 0}),
+  weight_col_expanded(false) {
   wt_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -244,9 +245,12 @@ void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
   unsigned int pad_left = padding[0];
 
   // Expand weight [C,1,1,K] → weight_col [1,1,C*K,OW] by tiling across OW.
-  // This is done once per forward call; for quantized inference the tiled
-  // weight_col can be pre-quantized to INT4 and reused across batches.
-  expandWeightCol(filter, weight_col, channels, kernel_size, out_width);
+  // Done only once; the tiled weight_col is reused across all forward calls.
+  // For quantized inference the stored weight_col can be INT4 quantized.
+  if (!weight_col_expanded) {
+    expandWeightCol(filter, weight_col, channels, kernel_size, out_width);
+    weight_col_expanded = true;
+  }
 
   /**
    * Depthwise 1D convolution using im2col + element-wise multiply + reduce.
