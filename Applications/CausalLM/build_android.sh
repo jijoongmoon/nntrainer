@@ -4,6 +4,24 @@
 # This script builds libcausallm_core.so and nntrainer_causallm executable
 set -e
 
+# Parse options
+USE_BUILD_CACHE=0
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --cache)
+            USE_BUILD_CACHE=1
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--cache]"
+            echo "  --cache  Reuse existing nntrainer builddir if available"
+            exit 1
+            ;;
+    esac
+done
+
+
 # Color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -82,21 +100,23 @@ export NNTRAINER_ROOT
 
 log_header "Build CausalLM Android Application"
 log_info "NNTRAINER_ROOT: $NNTRAINER_ROOT"
+log_info "Build cache: $([ "$USE_BUILD_CACHE" -eq 1 ] && echo 'enabled' || echo 'disabled (default)')"
 log_info "ANDROID_NDK: $ANDROID_NDK"
 log_info "Working directory: $(pwd)"
 
 # Step 1: Build nntrainer for Android if not already built
 log_step "1/4" "Build nntrainer for Android"
 
-if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
+if [ "$USE_BUILD_CACHE" -eq 1 ] && [ -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
+    log_info "Build cache enabled: reusing existing nntrainer builddir (skipping)"
+else
     log_info "Building nntrainer for Android..."
     cd "$NNTRAINER_ROOT"
     if [ -d "$NNTRAINER_ROOT/builddir" ]; then
+        log_info "Removing existing builddir..."
         rm -rf builddir
     fi
     ./tools/package_android.sh
-else
-    log_info "nntrainer for Android already built (skipping)"
 fi
 
 # Check if build was successful
