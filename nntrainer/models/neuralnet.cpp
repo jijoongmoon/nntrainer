@@ -1043,7 +1043,9 @@ sharedConstTensors NeuralNetwork::inference(sharedConstTensors X,
   if (!validateInput(X))
     throw std::invalid_argument("Input validation failed.");
 
+#ifndef ENABLE_NPU
   allocate(ExecutionMode::INFERENCE);
+#endif
 
   int nn_foward;
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");

@@ -340,7 +340,8 @@ template <typename T> void UIntTensor<T>::copyData(const Tensor &from) {
   /// @todo support copy from other data types
   switch (from.getDataType()) {
   case ml::train::TensorDim::DataType::FP32: {
-    copy_fp32(from.size(), from.getData<float>(), (T *)getData());
+    // copy_fp32(from.size(), from.getData<float>(), (T *)getData());
+    memcpy((T *)getData(), from.getData<float>(), from.size() * 2);
     break;
   }
   default:
@@ -384,7 +385,12 @@ void UIntTensor<T>::read(std::ifstream &file, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
+#ifdef ENABLE_NPU
+  start_offset = 0;
+  read_from_offset = false;
+#else
   read_quantization_info(file, start_offset, read_from_offset);
+#endif
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -408,7 +414,12 @@ void UIntTensor<T>::read(ReadSource src, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
+#ifdef ENABLE_NPU
+  start_offset = 0;
+  read_from_offset = false;
+#else
   read_quantization_info(src, start_offset, read_from_offset);
+#endif
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -478,9 +489,14 @@ template <typename T> void UIntTensor<T>::print(std::ostream &out) const {
   out << dim;
 
   if (len > 512) {
-    out << '[' << (int)data[0] << ' ' << (int)data[1] << ' ' << (int)data[2]
-        << " ... " << (int)data[len - 3] << ' ' << (int)data[len - 2] << ' '
-        << (int)data[len - 1] << ']' << std::endl;
+    out << '[' << (int)data[0];
+    for (int i = 1; i < 128; i++)
+      out << ' ' << (int)data[i];
+
+    out << " ... ";
+    for (int i = 128; i > 1; i--)
+      out << (int)data[len - i] << ' ';
+    out << (int)data[len - 1] << ']' << std::endl;
     return;
   }
 
@@ -545,8 +561,12 @@ template <typename T> void UIntTensor<T>::print(std::ostream &out) const {
 }
 
 template <typename T> size_t UIntTensor<T>::getMemoryBytes() const {
+#ifdef ENABLE_NPU
+  return bytes();
+#else
   return bytes() + scale_size() * sizeof(float) +
          scale_size() * sizeof(unsigned int);
+#endif
 }
 
 template <typename T>
@@ -600,6 +620,9 @@ template <typename T> void UIntTensor<T>::copy(const void *buf) {
     const uint16_t *data = (const uint16_t *)buf;
     uint16_t *rdata = (uint16_t *)getData();
     copy_u16((const unsigned int)size(), data, rdata);
+#ifdef ENABLE_NPU
+    return;
+#endif
   } else {
     /// @todo need to optimize
     memcpy(getData(), buf, size() * (sizeof(T)));
