@@ -192,6 +192,35 @@ void DepthwiseConv1DLayer::finalize(InitLayerContext &context) {
   col_buf_idx = context.requestTensor(col_dim, "im2col_buf",
                                       Initializer::NONE, false,
                                       TensorLifespan::ITERATION_LIFESPAN);
+
+  // Pre-allocate weight im2col buffer: [1, 1, C*K, OW]
+  // Weight[C,1,1,K] is expanded (tiled) into [C*K, OW] once and stored.
+  // For quantized inference: weight is 4-bit quantized, then tiled into this
+  // buffer. During forward, only input needs im2col, then element-wise
+  // INT4×INT8 multiply + reduce-sum replaces per-channel dot products.
+  TensorDim weight_col_dim(1, 1, channels * kernel_size, out_width,
+                           in_dim.getTensorType());
+  weight_col_idx = context.requestTensor(weight_col_dim, "weight_col",
+                                         Initializer::NONE, false,
+                                         TensorLifespan::MAX_LIFESPAN);
+}
+
+void DepthwiseConv1DLayer::expandWeightCol(const Tensor &filter,
+                                           Tensor &weight_col,
+                                           unsigned int channels,
+                                           unsigned int kernel_size,
+                                           unsigned int out_width) {
+  // Tile weight[c, 0, 0, k] across all OW positions:
+  //   weight_col[0, 0, c*K+k, ow] = filter[c, 0, 0, k]  for all ow
+  for (unsigned int c = 0; c < channels; ++c) {
+    for (unsigned int k = 0; k < kernel_size; ++k) {
+      unsigned int row = c * kernel_size + k;
+      float val = filter.getValue(c, 0, 0, k);
+      for (unsigned int ow = 0; ow < out_width; ++ow) {
+        weight_col.setValue(0, 0, row, ow, val);
+      }
+    }
+  }
 }
 
 void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
@@ -203,6 +232,7 @@ void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &filter = context.getWeight(wt_idx[DepthwiseConvParams::weight]);
   Tensor &col_buf = context.getTensor(col_buf_idx);
+  Tensor &weight_col = context.getTensor(weight_col_idx);
 
   const TensorDim &in_dim = input_.getDim();
   const TensorDim &out_dim = hidden_.getDim();
@@ -213,14 +243,23 @@ void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
   unsigned int out_width = out_dim.width();
   unsigned int pad_left = padding[0];
 
+  // Expand weight [C,1,1,K] → weight_col [1,1,C*K,OW] by tiling across OW.
+  // This is done once per forward call; for quantized inference the tiled
+  // weight_col can be pre-quantized to INT4 and reused across batches.
+  expandWeightCol(filter, weight_col, channels, kernel_size, out_width);
+
   /**
-   * Depthwise 1D convolution using im2col + per-channel dot product.
+   * Depthwise 1D convolution using im2col + element-wise multiply + reduce.
    *
    * For each batch:
    *   1. im2col: unroll input patches into col_buf [C*K, OW]
-   *   2. For each channel c:
-   *      weight[c] is [1, K], col_block[c*K:(c+1)*K, :] is [K, OW]
-   *      output[c,:] = weight[c,:] . col_block = [1, OW]
+   *   2. Element-wise multiply: col_buf *= weight_col  (both [C*K, OW])
+   *   3. Reduce-sum every K rows to get output [C, OW]:
+   *      output[c, ow] = sum_{k=0}^{K-1} col_buf[c*K+k, ow]
+   *
+   * This approach replaces per-channel dot products with bulk element-wise
+   * ops, which maps directly to quantized INT4×INT8 element-wise multiply
+   * followed by reduction.
    */
   for (unsigned int b = 0; b < batch; ++b) {
     col_buf.setZero();
@@ -229,19 +268,18 @@ void DepthwiseConv1DLayer::forwarding(RunLayerContext &context, bool training) {
     depthwise_im2col_1d(in_sub, col_buf, channels, in_width, out_width,
                         kernel_size, stride, dilation, pad_left);
 
-    // Per-channel dot: weight[c] (1xK) . col_block (KxOW) = out (1xOW)
-    for (unsigned int c = 0; c < channels; ++c) {
-      // weight row for channel c: [1, K]
-      Tensor w_row = filter.getSharedDataTensor(
-        {1, 1, 1, kernel_size}, c * kernel_size);
-      // col block for channel c: [K, OW]
-      Tensor col_block = col_buf.getSharedDataTensor(
-        {1, 1, kernel_size, out_width}, c * kernel_size * out_width);
-      // output row for channel c in this batch: [1, OW]
-      Tensor out_row = hidden_.getSharedDataTensor(
-        {1, 1, 1, out_width}, (b * channels + c) * out_width);
+    // Element-wise multiply: col_buf[C*K, OW] *= weight_col[C*K, OW]
+    col_buf.multiply_i(weight_col);
 
-      w_row.dot(col_block, out_row, false, false);
+    // Reduce-sum every K rows → output[C, OW]
+    for (unsigned int c = 0; c < channels; ++c) {
+      for (unsigned int ow = 0; ow < out_width; ++ow) {
+        float sum = 0.0f;
+        for (unsigned int k = 0; k < kernel_size; ++k) {
+          sum += col_buf.getValue(0, 0, c * kernel_size + k, ow);
+        }
+        hidden_.setValue(b, c, 0, ow, sum);
+      }
     }
   }
 

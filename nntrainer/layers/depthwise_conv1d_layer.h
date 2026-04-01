@@ -108,7 +108,20 @@ private:
 
   std::array<unsigned int, 2> padding; /**< computed padding [left, right] */
   std::array<unsigned int, 2> wt_idx;  /**< indices of the weights */
-  unsigned int col_buf_idx;            /**< index of the im2col buffer tensor */
+  unsigned int col_buf_idx;            /**< index of the im2col input buffer */
+  unsigned int weight_col_idx;         /**< index of the im2col weight buffer */
+
+  /**
+   * @brief Expand weight [C,1,1,K] into im2col form [1,1,C*K,OW].
+   *
+   * Each weight[c,k] is tiled across all OW output positions.
+   * Called once after weight loading; the result is stored and reused
+   * across forward passes (weight is static during inference, and for
+   * quantized inference INT4 weight_col enables bulk element-wise ops).
+   */
+  void expandWeightCol(const Tensor &filter, Tensor &weight_col,
+                       unsigned int channels, unsigned int kernel_size,
+                       unsigned int out_width);
 
   enum DepthwiseConvParams { weight, bias };
 };
