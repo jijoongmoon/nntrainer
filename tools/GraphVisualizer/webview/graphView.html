@@ -1464,16 +1464,41 @@
             const cppLines = D.cppSource.split('\n');
 
             // Index C++ LayerHandle declarations and Tensor::add() calls
-            const cppHandles = []; // [{line, varName, layerType}]
+            const cppHandles = []; // [{line, varName, layerType, method}]
             const cppAddLines = []; // [{line, varName}]
             // Also track withKey("name", ...) to extract NNTrainer name
             // suffixes for each LayerHandle (e.g. "_k_norm", "_conv_norm").
+            // Track C++ method boundaries for method-aware type matching
             let lastHandle = null;
+            let currentMethod = null;
+            let braceDepth = 0;
+            let inMethod = false;
             cppLines.forEach((line, i) => {
+                // Detect method signatures: ClassName::methodName(
+                // Exclude std::, nntrainer::, ml::, etc. by requiring
+                // the class name to start with uppercase
+                const methodMatch = line.match(/[A-Z]\w*::(\w+)\s*\(/);
+                if (methodMatch && !line.match(/^\s*\/\//) && !line.match(/static_cast/)) {
+                    currentMethod = methodMatch[1];
+                    braceDepth = 0;
+                    inMethod = false;
+                }
+                // Track brace depth to detect method end
+                for (const ch of line) {
+                    if (ch === '{') { braceDepth++; inMethod = true; }
+                    else if (ch === '}') {
+                        braceDepth--;
+                        if (inMethod && braceDepth <= 0) {
+                            currentMethod = null;
+                            inMethod = false;
+                        }
+                    }
+                }
+
                 let m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*"([^"]+)"/);
                 if (!m) m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*(\w+)/);
                 if (m) {
-                    lastHandle = {line: i+1, varName: m[1], layerType: m[2], nameSuffixes: []};
+                    lastHandle = {line: i+1, varName: m[1], layerType: m[2], nameSuffixes: [], method: currentMethod};
                     cppHandles.push(lastHandle);
                 }
                 let ma = line.match(/Tensor\s+(\w+)\s*=\s*\w+\.add\s*\(/);
@@ -1517,6 +1542,24 @@
                     if (!nameSuffixMap.has(s)) nameSuffixMap.set(s, h.line);
                 });
             });
+
+            // Method-aware type index: method -> layerType -> [handles]
+            const handlesByTypeInMethod = new Map();
+            cppHandles.forEach(h => {
+                if (!h.method) return;
+                if (!handlesByTypeInMethod.has(h.method)) handlesByTypeInMethod.set(h.method, new Map());
+                const methodTypes = handlesByTypeInMethod.get(h.method);
+                if (!methodTypes.has(h.layerType)) methodTypes.set(h.layerType, []);
+                methodTypes.get(h.layerType).push(h);
+            });
+
+            // Map NN layer scope to preferred C++ method name
+            function scopeToMethod(name) {
+                if (/_self_attn_/.test(name)) return 'createAttention';
+                if (/_conv_|_feed_forward_|_short_conv/.test(name)) return 'createConvBlock';
+                if (/_mlp_/.test(name)) return 'createMlp';
+                return null;
+            }
 
             // Alias: NN layer name suffix -> C++ handle variable name
             // Covers naming differences between HF module paths and C++ emitter
@@ -1640,14 +1683,28 @@
                     if (line) { cppLineMap.set(l.name, line); return; }
                 }
 
-                // 4. Fallback: match by layer type
+                // 4. Fallback: match by layer type (method-aware)
                 const typeAlias = {'sdpa': 'mha_core'};
                 const lookupType = typeAlias[l.layer_type] || l.layer_type;
-                const typeHandles = handlesByType.get(lookupType) || handlesByType.get(l.layer_type);
+                // Prefer handles from the method matching the NN layer scope
+                const preferredMethod = scopeToMethod(l.name);
+                let typeHandles = null;
+                if (preferredMethod) {
+                    const methodTypes = handlesByTypeInMethod.get(preferredMethod);
+                    if (methodTypes) {
+                        typeHandles = methodTypes.get(lookupType) || methodTypes.get(l.layer_type);
+                    }
+                }
+                // Fall back to global type index if no method-specific match
+                if (!typeHandles) {
+                    typeHandles = handlesByType.get(lookupType) || handlesByType.get(l.layer_type);
+                }
                 if (typeHandles && typeHandles.length > 0) {
-                    const idx = typeMatchIdx.get(l.layer_type) || 0;
+                    // Use method-specific counters for sequential matching
+                    const typeKey = (preferredMethod || '') + ':' + l.layer_type;
+                    const idx = typeMatchIdx.get(typeKey) || 0;
                     cppLineMap.set(l.name, typeHandles[idx % typeHandles.length].line);
-                    typeMatchIdx.set(l.layer_type, idx + 1);
+                    typeMatchIdx.set(typeKey, idx + 1);
                     return;
                 }
             });
