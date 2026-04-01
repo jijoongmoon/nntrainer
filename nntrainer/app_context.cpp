@@ -44,6 +44,7 @@
 #include <constant_derivative_loss_layer.h>
 #include <conv1d_layer.h>
 #include <conv2d_layer.h>
+#include <depthwise_conv1d_layer.h>
 #include <conv2d_transpose_layer.h>
 #include <cosine_layer.h>
 #include <cross_entropy_sigmoid_loss_layer.h>
@@ -336,6 +337,9 @@ void AppContext::add_default_object() {
                   LayerType::LAYER_CONV2D_TRANSPOSE);
   registerFactory(nntrainer::createLayer<Conv1DLayer>, Conv1DLayer::type,
                   LayerType::LAYER_CONV1D);
+  registerFactory(nntrainer::createLayer<DepthwiseConv1DLayer>,
+                  DepthwiseConv1DLayer::type,
+                  LayerType::LAYER_DEPTHWISE_CONV1D);
   registerFactory(nntrainer::createLayer<Pooling2DLayer>, Pooling2DLayer::type,
                   LayerType::LAYER_POOLING2D);
   registerFactory(nntrainer::createLayer<FlattenLayer>, FlattenLayer::type,

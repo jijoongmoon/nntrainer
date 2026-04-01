@@ -30,6 +30,7 @@ layer_sources = [
   'conv2d_transpose_layer.cpp',
   'conv2d_layer.cpp',
   'conv1d_layer.cpp',
+  'depthwise_conv1d_layer.cpp',
   'fc_layer.cpp',
   'flatten_layer.cpp',
   'input_layer.cpp',

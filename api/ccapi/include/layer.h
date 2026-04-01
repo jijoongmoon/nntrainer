@@ -129,6 +129,8 @@ enum LayerType {
     ML_TRAIN_LAYER_TYPE_GROUP_NORMALIZATION, /**< Group Normalization type */
   LAYER_INSTANCE_NORMALIZATION =
     ML_TRAIN_LAYER_TYPE_INSTANCE_NORMALIZATION, /**< Instance Normalization */
+  LAYER_DEPTHWISE_CONV1D =
+    ML_TRAIN_LAYER_TYPE_DEPTHWISE_CONV1D, /**< Depthwise Conv 1D Layer type */
 
   LAYER_UNKNOWN = ML_TRAIN_LAYER_TYPE_UNKNOWN, /**< Unknown */
 

@@ -10,7 +10,8 @@ from nntrainer_layers import (
     NNTrainerLayerDef,
     LAYER_FC, LAYER_EMBEDDING, LAYER_RMS_NORM, LAYER_LAYER_NORM,
     LAYER_ACTIVATION, LAYER_DROPOUT, LAYER_IDENTITY,
-    LAYER_CONV1D, LAYER_CONV2D, LAYER_CONV2D_TRANSPOSE, LAYER_DEPTHWISE_CONV2D,
+    LAYER_CONV1D, LAYER_CONV2D, LAYER_CONV2D_TRANSPOSE,
+    LAYER_DEPTHWISE_CONV1D, LAYER_DEPTHWISE_CONV2D,
     LAYER_POOLING2D, LAYER_UPSAMPLE2D, LAYER_BATCH_NORM,
     LAYER_GROUP_NORM, LAYER_INSTANCE_NORM,
     LAYER_CHANNEL_SHUFFLE, LAYER_L2NORM, LAYER_MHA,
@@ -161,6 +162,9 @@ def map_module_node(node, modules, node_to_layer):
 
     # Conv layers
     if isinstance(module, nn.Conv1d):
+        # Depthwise conv1d: groups == in_channels and out_channels == in_channels
+        if module.groups == module.in_channels and module.out_channels == module.in_channels:
+            return _map_depthwise_conv1d(module, module_name, module_type, input_names)
         return _map_conv1d(module, module_name, module_type, input_names)
 
     if isinstance(module, nn.ConvTranspose2d):
@@ -379,6 +383,28 @@ def _map_conv1d(module, module_name, module_type, input_names):
             "kernel_size": module.kernel_size[0],
             "stride": module.stride[0],
             "padding": module.padding[0],
+        },
+        input_layers=input_names,
+        hf_module_name=module_name,
+        hf_module_type=module_type,
+        has_weight=True,
+        has_bias=module.bias is not None,
+        weight_hf_key=f"{module_name}.weight",
+        bias_hf_key=f"{module_name}.bias" if module.bias is not None else "",
+    )
+
+
+def _map_depthwise_conv1d(module, module_name, module_type, input_names):
+    """Map nn.Conv1d with groups==in_channels to NNTrainer depthwiseconv1d layer."""
+    return NNTrainerLayerDef(
+        layer_type=LAYER_DEPTHWISE_CONV1D,
+        name=_sanitize_name(module_name),
+        properties={
+            "filters": module.out_channels,
+            "kernel_size": module.kernel_size[0],
+            "stride": module.stride[0],
+            "padding": module.padding[0],
+            "dilation": module.dilation[0],
         },
         input_layers=input_names,
         hf_module_name=module_name,

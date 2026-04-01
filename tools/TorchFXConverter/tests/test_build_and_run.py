@@ -782,10 +782,8 @@ class TestConverterBuildAndRun(unittest.TestCase):
         """Granite 4.0: GraniteMoeHybrid in dense mode (no MoE/Mamba)."""
         self._run_model_test("granite_40")
 
-    @unittest.expectedFailure
     def test_lfm_700m(self):
-        """LFM-700M: Liquid Foundation Model (lfm2) with hybrid conv+attention.
-        Expected failure: NNTrainer Conv1D requires height=1 input."""
+        """LFM-700M: Liquid Foundation Model (lfm2) with hybrid conv+attention."""
         self._run_model_test("lfm_700m")
 
     # ---- Embedding models ----
