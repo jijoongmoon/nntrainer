@@ -1501,6 +1501,19 @@
                     lastHandle = {line: i+1, varName: m[1], layerType: m[2], nameSuffixes: [], method: currentMethod};
                     cppHandles.push(lastHandle);
                 }
+                // Handle multi-line: LayerHandle var(createLayer(\n"type", {
+                if (!m) {
+                    const partial = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*$/);
+                    if (partial) {
+                        // Type string is on the next line
+                        const nextLine = cppLines[i+1] || '';
+                        const tm = nextLine.match(/^\s*"([^"]+)"/);
+                        if (tm) {
+                            lastHandle = {line: i+1, varName: partial[1], layerType: tm[1], nameSuffixes: [], method: currentMethod};
+                            cppHandles.push(lastHandle);
+                        }
+                    }
+                }
                 let ma = line.match(/Tensor\s+(\w+)\s*=\s*\w+\.add\s*\(/);
                 if (ma) cppAddLines.push({line: i+1, varName: ma[1]});
                 // Extract name suffix from withKey("name", prefix + "_suffix")
