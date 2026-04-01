@@ -1495,6 +1495,7 @@
                 'input_layernorm': 'att_norm',
                 'pre_attn_norm': 'att_norm',
                 'attention_norm': 'att_norm',
+                'operator_norm': 'att_norm',
                 'ln_1': 'att_norm',
                 // MHA core (SDPA in NN model → attn handle in C++)
                 'sdpa': 'attn',
@@ -1502,6 +1503,9 @@
                 'attention': 'attn',
                 'self_attention': 'attn',
                 'self_attn': 'attn',
+                // Q/K norms (Qwen3 and LFM2 naming conventions)
+                'q_layernorm': 'q_norm',
+                'k_layernorm': 'k_norm',
                 // Post-attention / pre-FFN norm
                 'post_attention_layernorm': 'ffn_norm',
                 'pre_ffn_norm': 'ffn_norm',
@@ -1526,10 +1530,45 @@
                 'wte': 'embedding',
                 'lm_head': 'lmhead',
                 // Encoder/decoder output norm
+                'norm': 'output_norm',
+                'model_norm': 'output_norm',
                 'final_layer_norm': 'output_norm',
                 'final_layernorm': 'output_norm',
                 'ln_f': 'output_norm',
             };
+
+            // Try suffix matching against handleByVar and suffixAlias.
+            // Returns the C++ line number or null.
+            function matchSuffix(name) {
+                const parts = name.split('_');
+                const maxLen = Math.min(6, parts.length);
+                for (let len = 1; len <= maxLen; len++) {
+                    const suffix = parts.slice(-len).join('_');
+                    if (handleByVar.has(suffix)) return handleByVar.get(suffix);
+                    const alias = suffixAlias[suffix];
+                    if (alias && handleByVar.has(alias)) return handleByVar.get(alias);
+                }
+                return null;
+            }
+
+            // Extract functional suffix after scope markers
+            // e.g. "model_layers_2_self_attn_k_layernorm" -> "k_layernorm"
+            //      "model_layers_0_mlp_down_proj" -> "down_proj"
+            //      "model_layers_0_input_layernorm" -> "input_layernorm"
+            function extractScopedSuffix(name) {
+                // Try stripping after self_attn/mlp scope
+                const scopePatterns = [
+                    /_self_attn_(?!.*_self_attn_)(.+)$/,
+                    /_mlp_(?!.*_mlp_)(.+)$/,
+                    /_layers_\d+_(.+)$/,
+                    /^model_(.+)$/,
+                ];
+                for (const re of scopePatterns) {
+                    const m = name.match(re);
+                    if (m) return m[1];
+                }
+                return null;
+            }
 
             // Track type-based match index per type for sequential matching
             const typeMatchIdx = new Map();
@@ -1537,37 +1576,29 @@
             let addIdx = 0;
             D.nntrainerLayers.forEach(l => {
                 // Addition layers map to .add() calls in block methods
-                if (l.layer_type === 'addition' && addIdx < cppAddLines.length) {
-                    cppLineMap.set(l.name, cppAddLines[addIdx].line);
+                // Wrap around for multiple blocks sharing the same method
+                if (l.layer_type === 'addition' && cppAddLines.length > 0) {
+                    cppLineMap.set(l.name, cppAddLines[addIdx % cppAddLines.length].line);
                     addIdx++;
                     return;
                 }
-                const parts = l.name.split('_');
-                // Try progressively longer suffixes (up to 4 for post_attention_layernorm)
-                const maxSuffix = Math.min(4, parts.length);
-                for (let len = 1; len <= maxSuffix; len++) {
-                    const suffix = parts.slice(-len).join('_');
-                    // Direct match (handles both exact and _layer-stripped names)
-                    if (handleByVar.has(suffix)) {
-                        cppLineMap.set(l.name, handleByVar.get(suffix));
-                        return;
-                    }
-                    // Alias match
-                    const alias = suffixAlias[suffix];
-                    if (alias && handleByVar.has(alias)) {
-                        cppLineMap.set(l.name, handleByVar.get(alias));
-                        return;
-                    }
+
+                // 1. Direct suffix matching on the full name
+                let line = matchSuffix(l.name);
+                if (line) { cppLineMap.set(l.name, line); return; }
+
+                // 2. Extract suffix after scope markers, then match
+                const scoped = extractScopedSuffix(l.name);
+                if (scoped) {
+                    line = matchSuffix(scoped);
+                    if (line) { cppLineMap.set(l.name, line); return; }
                 }
-                // Fallback: match by layer type (handles flat models and
-                // any layers not covered by suffix/alias matching)
-                // NN model uses different type names than C++ emitter in some cases
+
+                // 3. Fallback: match by layer type
                 const typeAlias = {'sdpa': 'mha_core'};
                 const lookupType = typeAlias[l.layer_type] || l.layer_type;
                 const typeHandles = handlesByType.get(lookupType) || handlesByType.get(l.layer_type);
                 if (typeHandles && typeHandles.length > 0) {
-                    // Use sequential index so each layer of the same type
-                    // maps to a different C++ handle (wraps around)
                     const idx = typeMatchIdx.get(l.layer_type) || 0;
                     cppLineMap.set(l.name, typeHandles[idx % typeHandles.length].line);
                     typeMatchIdx.set(l.layer_type, idx + 1);
