@@ -1538,11 +1538,14 @@
             };
 
             // Try suffix matching against handleByVar and suffixAlias.
+            // Tries longest suffix first for specificity (e.g. "operator_norm"
+            // should match before the shorter "norm").
             // Returns the C++ line number or null.
             function matchSuffix(name) {
                 const parts = name.split('_');
                 const maxLen = Math.min(6, parts.length);
-                for (let len = 1; len <= maxLen; len++) {
+                // Longest suffix first: more specific matches win
+                for (let len = maxLen; len >= 1; len--) {
                     const suffix = parts.slice(-len).join('_');
                     if (handleByVar.has(suffix)) return handleByVar.get(suffix);
                     const alias = suffixAlias[suffix];
