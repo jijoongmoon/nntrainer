@@ -41,8 +41,9 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     std::vector<char> QA = std::vector<char>(qa_size);
     nntr_quantize_row_q8_0(A, QA.data(), K);
 
-    unsigned int chunk_size = 4;
-    unsigned int loop = (N + chunk_size - 1) / chunk_size;
+    tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
+      unsigned int M_step_start = (thread_idx * N) / thread_num;
+      unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
 
     tm.parallel_for(0, loop, [=](size_t idx) {
       unsigned int M_step_start = chunk_size * idx;
@@ -72,12 +73,16 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
         (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
     }
     // Compute 4-divisible-M row portion with multithreaded GEMM
-    unsigned int chunk_size = 4;
-    unsigned int loop = (N + chunk_size - 1) / chunk_size;
+    tm.parallel_for_chunked(thread_num, [=](size_t i) {
+      unsigned int src0_start = (i * N) / thread_num;
+      unsigned int src0_end = ((i + 1) * N) / thread_num;
 
-    tm.parallel_for(0, loop, [=](size_t i) {
-      unsigned int src0_start = i * chunk_size;
-      unsigned int src0_end = std::min(chunk_size * (i + 1), (size_t)N);
+      src0_start = (src0_start % NB_COLS)
+                     ? src0_start + NB_COLS - (src0_start % NB_COLS)
+                     : src0_start;
+      src0_end = (src0_end % NB_COLS)
+                   ? src0_end + NB_COLS - (src0_end % NB_COLS)
+                   : src0_end;
 
       nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + src0_start), ldc,
                               (void *)((char *)B + src0_start * B_step),
@@ -118,8 +123,9 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     }
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
-    unsigned int chunk_size = 4;
-    unsigned int loop = (N + chunk_size - 1) / chunk_size;
+    tm.parallel_for_chunked(thread_num, [=](size_t i) {
+      unsigned int src0_start = (i * N) / thread_num;
+      unsigned int src0_end = ((i + 1) * N) / thread_num;
 
     tm.parallel_for(0, loop, [=](size_t i) {
       unsigned int src0_start = i * chunk_size;

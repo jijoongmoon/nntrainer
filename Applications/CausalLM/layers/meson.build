@@ -13,7 +13,6 @@ causallm_rms_reverse_norm_src_abs = [meson.current_source_dir() / 'rms_reverse_n
 causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_pooling_layer.cpp']
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
 
-openmp_dep = dependency('openmp')
 causallm_rms_norm = shared_library(
     'rms_norm_layer', 
     causallm_rms_norm_src_abs, 
@@ -44,7 +43,7 @@ causallm_tie_word_embedding = shared_library(
     'tie_word_embedding_layer',
     causallm_tie_word_embedding_src_abs,
     include_directories: causallm_layer_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, openmp_dep],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
     install_dir: application_install_dir
 )
@@ -70,7 +69,7 @@ causallm_mha_core = shared_library(
     'mha_core_layer',
     causallm_mha_core_abs,
     include_directories: causallm_layer_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, openmp_dep],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
     install_dir: application_install_dir
 )
@@ -83,7 +82,7 @@ causallm_embedding_layer = shared_library(
     'embedding_layer',
     causallm_embedding_src_abs,
     include_directories: causallm_layer_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, openmp_dep],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
     install_dir: application_install_dir
 )
@@ -96,7 +95,7 @@ causallm_embedding_pooling_layer = shared_library(
     'embedding_pooling_layer',
     causallm_embedding_pooling_src_abs,
     include_directories: causallm_layer_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, openmp_dep],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
     install_dir: application_install_dir
 )
