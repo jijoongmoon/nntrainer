@@ -52,9 +52,9 @@ static void register_qwen3_0_6b() {
   rc.num_to_generate = 512;
   rc.fsu = false;
   rc.fsu_lookahead = 2;
-  strncpy(rc.embedding_dtype, "Q6_K", sizeof(rc.embedding_dtype) - 1);
+  strncpy(rc.embedding_dtype, "Q4_0", sizeof(rc.embedding_dtype) - 1);
   strncpy(rc.fc_layer_dtype, "Q4_0", sizeof(rc.fc_layer_dtype) - 1);
-  strncpy(rc.model_file_name, "qwen3-0.6b-q6k-q40-q40-fp32-arm.bin",
+  strncpy(rc.model_file_name, "qwen3-0.6b-q40-fp32-arm.bin",
           sizeof(rc.model_file_name) - 1);
   strncpy(rc.tokenizer_file, "tokenizer.json", sizeof(rc.tokenizer_file) - 1);
   strncpy(rc.lmhead_dtype, "Q4_0", sizeof(rc.lmhead_dtype) - 1);
