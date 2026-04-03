@@ -1322,6 +1322,11 @@ void dequantize_row_q4_K(const void *x, float *y, int64_t k);
  */
 void dequantize_row_q4_0(const void *x, float *y, int64_t k);
 
+size_t quantize_q1_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights);
+
+void dequantize_row_q1_0(const void *x, float *y, int64_t k);
+
 /**
  * @brief dequantize row of q6_K data to float
  *
