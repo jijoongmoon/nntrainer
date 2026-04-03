@@ -28,10 +28,25 @@ auto semantic_multi_head_attention_with_mask = LayerSemanticsParamType(
   {"num_heads=1", "projected_key_dim=1"},
   LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 4);
 
+auto semantic_multi_head_attention_ext_cache = LayerSemanticsParamType(
+  nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>,
+  nntrainer::MultiHeadAttentionLayer::type,
+  {"num_heads=1", "projected_key_dim=1"},
+  LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 5);
+
+auto semantic_multi_head_attention_ext_cache_with_mask =
+  LayerSemanticsParamType(
+    nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>,
+    nntrainer::MultiHeadAttentionLayer::type,
+    {"num_heads=1", "projected_key_dim=1"},
+    LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 6);
+
 GTEST_PARAMETER_TEST(
   MultiHeadAttention, LayerSemantics,
   ::testing::Values(semantic_multi_head_attention,
-                    semantic_multi_head_attention_with_mask));
+                    semantic_multi_head_attention_with_mask,
+                    semantic_multi_head_attention_ext_cache,
+                    semantic_multi_head_attention_ext_cache_with_mask));
 
 auto no_cos_sim_option = LayerGoldenTestParamOptions::SKIP_COSINE_SIMILARITY;
 auto inference_only_option =
