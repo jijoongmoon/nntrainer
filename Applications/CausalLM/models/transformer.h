@@ -116,9 +116,9 @@ public:
                    bool log_output = true);
 
   /**
-   * @brief Get PerformanceMetrics
+   * @brief Get TransformerPerformanceMetrics
    */
-  PerformanceMetrics getPerformanceMetrics() const {
+  TransformerPerformanceMetrics getPerformanceMetrics() const {
     return performance_metrics;
   }
 
@@ -199,7 +199,7 @@ protected:
   bool IS_CAUSAL = true;
 
   // Performance metrics
-  PerformanceMetrics performance_metrics;
+  TransformerPerformanceMetrics performance_metrics;
 };
 /**
  * Loads JSON data from a file with detailed error handling
