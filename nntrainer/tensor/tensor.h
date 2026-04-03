@@ -1293,6 +1293,69 @@ public:
   void tan(Tensor &output, float alpha = 1.0) const;
 
   /**
+   * @brief     Compute exponential element-wise (in-place)
+   * @retval    #ML_ERROR_NONE  Successful
+   */
+  int exp_i();
+
+  /**
+   * @brief     Compute exponential element-wise
+   * @retval    Calculated Tensor
+   */
+  Tensor exp() const;
+
+  /**
+   * @brief      Compute exponential element-wise
+   * @param[out] output out to store the result
+   * @retval     Calculated Tensor
+   */
+  Tensor &exp(Tensor &output) const;
+
+  /**
+   * @brief     Compute natural logarithm element-wise (in-place)
+   * @retval    #ML_ERROR_NONE  Successful
+   */
+  int log_i();
+
+  /**
+   * @brief     Compute natural logarithm element-wise
+   * @retval    Calculated Tensor
+   */
+  Tensor log() const;
+
+  /**
+   * @brief      Compute natural logarithm element-wise
+   * @param[out] output out to store the result
+   * @retval     Calculated Tensor
+   */
+  Tensor &log(Tensor &output) const;
+
+  /**
+   * @brief     Clamp tensor values to [min, max] (in-place)
+   * @param[in] min minimum value
+   * @param[in] max maximum value
+   * @retval    #ML_ERROR_NONE  Successful
+   */
+  int clamp_i(float min, float max);
+
+  /**
+   * @brief     Clamp tensor values to [min, max]
+   * @param[in] min minimum value
+   * @param[in] max maximum value
+   * @retval    Calculated Tensor
+   */
+  Tensor clamp(float min, float max) const;
+
+  /**
+   * @brief      Clamp tensor values to [min, max]
+   * @param[in]  min minimum value
+   * @param[in]  max maximum value
+   * @param[out] output out to store the result
+   * @retval     Calculated Tensor
+   */
+  Tensor &clamp(float min, float max, Tensor &output) const;
+
+  /**
    * @brief inverse squared root function (in-place)
    */
   void inv_sqrt_i();
