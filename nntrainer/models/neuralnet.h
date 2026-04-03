@@ -288,6 +288,17 @@ public:
               ml::train::ModelFormat::MODEL_FORMAT_BIN) override;
 
   /**
+   * @brief     Convert a BIN weight file (v0 or v1) to safetensors format.
+   *            The model must be initialized first. Loads the BIN file and
+   *            re-saves as safetensors with JSON header for name-based,
+   *            offset-based parallel loading.
+   * @param[in] bin_path path to the .bin file
+   * @param[in] st_path  path to write the .safetensors file
+   */
+  void convertBinToSafetensors(const std::string &bin_path,
+                               const std::string &st_path);
+
+  /**
    * @brief     get Epochs
    * @retval    epochs
    */

@@ -22,7 +22,28 @@
 namespace nntrainer {
 
 void MultiplyLayer::finalize(InitLayerContext &context) {
-  context.setOutputDimensions({context.getInputDimensions()[0]});
+  auto const &input_dims = context.getInputDimensions();
+  TensorDim out_dim = input_dims[0];
+
+  if (input_dims.size() > 1) {
+    TensorDim dim1 = input_dims[1];
+    // Compute broadcast output shape: for each dimension, take the max
+    // when one of the inputs has size 1 (standard broadcasting rules).
+    for (unsigned int i = 0; i < 4; ++i) {
+      if (out_dim[i] != dim1[i]) {
+        if (out_dim[i] == 1) {
+          out_dim.setTensorDim(i, dim1[i]);
+        } else if (dim1[i] != 1) {
+          throw std::invalid_argument(
+            "MultiplyLayer: incompatible shapes for broadcasting at dim " +
+            std::to_string(i) + " (" + std::to_string(out_dim[i]) + " vs " +
+            std::to_string(dim1[i]) + ")");
+        }
+      }
+    }
+  }
+
+  context.setOutputDimensions({out_dim});
 }
 
 void MultiplyLayer::forwarding_operation(const Tensor &input0,
