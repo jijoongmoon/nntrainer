@@ -26,7 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <node_exporter.h>
-#include <omp.h>
+#include <thread_manager.h>
 #include <qwen_moe_layer_fsu.h>
 #include <stdexcept>
 
@@ -187,11 +187,13 @@ void SlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
   auto topk_indices = std::get<1>(topk_result);
 
   const uint32_t *indices_data = topk_indices.getData<uint32_t>();
-#pragma omp parallel for collapse(2)
-  for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-    for (int k = 0; k < static_cast<int>(topk); ++k) {
-      expert_mask.setValue(indices_data[i * topk + k], 0, k, i, 1.0f);
-    }
+  {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(total_tokens), [&](size_t i) {
+      for (int k = 0; k < static_cast<int>(topk); ++k) {
+        expert_mask.setValue(indices_data[i * topk + k], 0, k, i, 1.0f);
+      }
+    });
   }
 
   // Pre-compute expert token assignments for better cache locality
@@ -450,34 +452,35 @@ void SlimMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
 
-#pragma omp parallel for schedule(dynamic)
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      const auto &assignments = expert_assignments[expert_idx];
-      if (assignments.empty())
-        continue;
+    {
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(0, static_cast<size_t>(num_experts), [&](size_t expert_idx) {
+        const auto &assignments = expert_assignments[expert_idx];
+        if (assignments.empty())
+          return;
 
-      ///@note Please note that expert_gate_proj is virtual tensor,
-      ///      which is not allocated so far. It will be allocated when it is
-      ///      used. `activate(read=true)` will allocate its memory and will
-      ///      read from the original weight. activate is true by default. i.e.,
-      ///      mmap
-      context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
-      context.getWeight(expert_up_proj_indices[expert_idx]).activate();
-      context.getWeight(expert_down_proj_indices[expert_idx]).activate();
+        ///@note Please note that expert_gate_proj is virtual tensor,
+        ///      which is not allocated so far. It will be allocated when it is
+        ///      used. `activate(read=true)` will allocate its memory and will
+        ///      read from the original weight. activate is true by default. i.e.,
+        ///      mmap
+        context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
+        context.getWeight(expert_up_proj_indices[expert_idx]).activate();
+        context.getWeight(expert_down_proj_indices[expert_idx]).activate();
 
-      compute_expert_forward_no_critical(
-        input, expert_outputs[expert_idx], assignments,
-        context.getWeight(expert_gate_proj_indices[expert_idx]),
-        context.getWeight(expert_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+        compute_expert_forward_no_critical(
+          input, expert_outputs[expert_idx], assignments,
+          context.getWeight(expert_gate_proj_indices[expert_idx]),
+          context.getWeight(expert_up_proj_indices[expert_idx]),
+          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
 
-      ////@note Please note that the virtual tensor is deactivated after usage
-      ////      This will allocate and load data from the storage on-the-fly
-      ////      i.e., unmap
-      context.getWeight(expert_gate_proj_indices[expert_idx]).deactivate();
-      context.getWeight(expert_up_proj_indices[expert_idx]).deactivate();
-      context.getWeight(expert_down_proj_indices[expert_idx]).deactivate();
+        ////@note Please note that the virtual tensor is deactivated after usage
+        ////      This will allocate and load data from the storage on-the-fly
+        ////      i.e., unmap
+        context.getWeight(expert_gate_proj_indices[expert_idx]).deactivate();
+        context.getWeight(expert_up_proj_indices[expert_idx]).deactivate();
+        context.getWeight(expert_down_proj_indices[expert_idx]).deactivate();
+      });
     }
 
     // Combine expert outputs
