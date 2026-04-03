@@ -1219,6 +1219,28 @@ extern void dequantize_row_q4_0(const void *x, float *y, int64_t k);
 extern void dequantize_row_q6_K(const void *x, float *y, int64_t k);
 
 /**
+ * @brief quantize_q1_0 function (1-bit, group size 128)
+ *
+ * @param src float* to quantize
+ * @param dst void* to store quantized data
+ * @param nrow number of rows
+ * @param n_per_row number of elements per row
+ * @param quant_weights unused
+ * @return size_t size of total quantized data in bytes
+ */
+extern size_t quantize_q1_0(const float *src, void *dst, int64_t nrow,
+                            int64_t n_per_row, const float *quant_weights);
+
+/**
+ * @brief dequantize row of Q1_0 data to float
+ *
+ * @param x input to be dequantized from Q1_0 to float
+ * @param y dequantized data output
+ * @param k number of elements in x
+ */
+extern void dequantize_row_q1_0(const void *x, float *y, int64_t k);
+
+/**
  * @brief dequantize row of q8_K data to float
  *
  * @param x input to be dequantized from q8_K to float
