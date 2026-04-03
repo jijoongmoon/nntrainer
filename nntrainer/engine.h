@@ -61,7 +61,9 @@ protected:
 
   void add_default_object();
 
-  void registerContext(std::string name, nntrainer::Context *context) {
+  void registerContext(std::string name, nntrainer::Context *context,
+                       void *library_handle = nullptr,
+                       DestroyContextFunc destroy_func = nullptr) {
     const std::lock_guard<std::mutex> lock(engine_mutex);
     static int registerCount = 0;
 
@@ -83,6 +85,14 @@ protected:
     auto alloc = context->getMemAllocator();
 
     allocator.insert(std::make_pair(name, alloc));
+
+    // Store library handle and destroy function for plugin contexts
+    if (library_handle) {
+      library_handles[name] = library_handle;
+    }
+    if (destroy_func) {
+      destroy_funcs[name] = destroy_func;
+    }
   }
 
 public:
@@ -92,9 +102,9 @@ public:
   Engine() = default;
 
   /**
-   * @brief   Default Destructor
+   * @brief   Destructor - releases all contexts
    */
-  ~Engine() = default;
+  ~Engine() { release(); }
 
   /**
    * @brief   Release resources allocated by Engine
@@ -280,6 +290,18 @@ private:
    *
    */
   std::unordered_map<std::string, nntrainer::Context *> engines;
+
+  /**
+   * @brief map for library handles (context name -> library handle)
+   * These handles must be kept alive until contexts are destroyed
+   */
+  std::unordered_map<std::string, void *> library_handles;
+
+  /**
+   * @brief map for destroy functions (context name -> destroy function)
+   * Used to properly destroy contexts created by plugins
+   */
+  std::unordered_map<std::string, DestroyContextFunc> destroy_funcs;
 
   std::unordered_map<std::string, std::shared_ptr<nntrainer::MemAllocator>>
     allocator;
