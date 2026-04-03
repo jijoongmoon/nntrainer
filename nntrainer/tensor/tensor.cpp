@@ -11,10 +11,13 @@
 
 #include <numeric>
 
+#include <thread_manager.h>
+
 #include <char_tensor.h>
 #include <float_tensor.h>
 #include <int4_tensor.h>
 #include <lazy_tensor.h>
+#include <q1_0_tensor.h>
 #include <q4_0_tensor.h>
 #include <q4_k_tensor.h>
 #include <q6_k_tensor.h>
@@ -131,6 +134,8 @@ Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
     itensor_ = std::make_unique<Q6_K_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(name_, fm);
+  } else if (d_type == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(name_, fm);
   } else if (d_type == Tdatatype::UINT8) {
@@ -179,6 +184,8 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
     itensor_ = std::make_unique<Q6_K_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, alloc_now, init, name);
+  } else if (d.getDataType() == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::UINT4) {
     if (qscheme != QScheme::Q4_Kx8) {
       itensor_ =
@@ -231,6 +238,8 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
     itensor_ = std::make_unique<Q6_K_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, buf);
+  } else if (d.getDataType() == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::UINT4) {
     if (qscheme != QScheme::Q4_Kx8)
       itensor_ = std::make_unique<Uint4QTensor>(d, buf, qscheme);
@@ -278,6 +287,8 @@ Tensor::Tensor(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -359,6 +370,8 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -410,6 +423,8 @@ bool Tensor::operator==(const Tensor &rhs) const {
       return itensorCompare<Q6_K_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::Q4_0) {
       return itensorCompare<Q4_0_Tensor>(itensor_.get(), rhs.itensor_.get());
+    } else if (getDataType() == Tdatatype::Q1_0) {
+      return itensorCompare<Q1_0_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT4) {
       return itensorCompare<Uint4QTensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT8) {
@@ -876,7 +891,7 @@ Tensor &Tensor::sqrt(Tensor &output) const {
 };
 
 Tensor Tensor::neg() const {
-  Tensor output("", getFormat(), getDataType());
+  Tensor output(getDim());
   return neg(output);
 };
 
@@ -884,7 +899,7 @@ Tensor &Tensor::neg(Tensor &output) const {
   if (size() != output.size() || getDataType() != output.getDataType() ||
       getFormat() != output.getFormat())
     throw std::invalid_argument(
-      "Error: Tensor::sqrt requires output tensor to be same size, data type "
+      "Error: Tensor::neg requires output tensor to be same size, data type "
       "and format as input tensor.");
 
   itensor_->multiply(-1, output);
@@ -928,6 +943,51 @@ void Tensor::tan(Tensor &output, float alpha) const {
       "and format as input tensor.");
 
   itensor_->tan(output, alpha);
+}
+
+int Tensor::exp_i() {
+  exp(*this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::exp() const {
+  Tensor output("", getFormat(), getDataType());
+  return exp(output);
+}
+
+Tensor &Tensor::exp(Tensor &output) const {
+  itensor_->exp(output);
+  return output;
+}
+
+int Tensor::log_i() {
+  log(*this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::log() const {
+  Tensor output("", getFormat(), getDataType());
+  return log(output);
+}
+
+Tensor &Tensor::log(Tensor &output) const {
+  itensor_->log(output);
+  return output;
+}
+
+int Tensor::clamp_i(float min, float max) {
+  clamp(min, max, *this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::clamp(float min, float max) const {
+  Tensor output("", getFormat(), getDataType());
+  return clamp(min, max, output);
+}
+
+Tensor &Tensor::clamp(float min, float max, Tensor &output) const {
+  itensor_->clamp(min, max, output);
+  return output;
 }
 
 void Tensor::inv_sqrt_i() { itensor_->inv_sqrt(*this); }
@@ -1327,9 +1387,9 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
   unsigned char *dst_data =
     static_cast<unsigned char *>(output.getData<void>());
 
-// Parallel copy using OpenMP
-#pragma omp parallel for schedule(static)
-  for (int i = 0; i < static_cast<int>(indices.size()); ++i) {
+// Parallel copy using ThreadManager
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(indices.size()), [&](size_t i) {
     const unsigned batch_idx = indices[i];
 
     // Calculate memory offsets
@@ -1345,7 +1405,7 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
     // Perform memory copy
     std::memcpy(dst_data + dst_offset, src_data + src_offset,
                 single_batch_bytes);
-  }
+  });
 
   return output;
 }
