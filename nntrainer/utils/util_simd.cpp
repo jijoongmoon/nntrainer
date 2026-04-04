@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <util_simd.h>
 
@@ -25,13 +26,15 @@ void calc_trigonometric_vals_dup_util(unsigned int N_half, float *angle,
 }
 
 void swiglu_util(const unsigned int N, float *X, float *Y, float *Z) {
-  swiglu(N, X, Y, Z);
+  getComputeOps()->swiglu_fp32(N, X, Y, Z);
 }
 
-float max_util(const unsigned int N, float *X) { return max_val(N, X); }
+float max_util(const unsigned int N, float *X) {
+  return getComputeOps()->max_val_fp32(N, X);
+}
 
 void softmax_util(const unsigned int N, float *X, float *Y) {
-  softmax(N, X, Y);
+  getComputeOps()->softmax_fp32(N, X, Y);
 }
 
 } // namespace nntrainer
