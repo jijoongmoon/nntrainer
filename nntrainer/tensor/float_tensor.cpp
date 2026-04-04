@@ -24,6 +24,15 @@
 
 #include <compute_ops.h>
 
+/// @brief Get the compute ops table, with lazy initialization.
+/// This ensures g_compute_ops is set even if init_backend() wasn't called
+/// explicitly (e.g., standalone tensor tests).
+static inline nntrainer::ComputeOps *ops() {
+  if (__builtin_expect(nntrainer::g_compute_ops == nullptr, 0))
+    nntrainer::ensureComputeOps();
+  return nntrainer::g_compute_ops;
+}
+
 namespace nntrainer {
 
 FloatTensor::FloatTensor(std::string name_, Tformat fm) :
@@ -341,7 +350,7 @@ int FloatTensor::multiply_i(float const &value) {
   float *data = (float *)getData();
   unsigned int len = size();
 
-  sscal(len, value, data, 1);
+  ops()->sscal_fp32(len, value, data, 1);
 
   return ML_ERROR_NONE;
 }
@@ -356,8 +365,8 @@ Tensor &FloatTensor::multiply(Tensor const &m, Tensor &output,
                               const float beta) const {
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    ele_mul(e.buffer_size, buf, m_buf, out_buf, 1, beta, e.strides[3],
-            strides[3]);
+    ops()->ele_mul_fp32(e.buffer_size, buf, m_buf, out_buf, 1, beta,
+                               e.strides[3], strides[3]);
   };
 
   NNTR_THROW_IF(m.getFormat() != this->getFormat(), std::invalid_argument)
@@ -386,7 +395,8 @@ Tensor &FloatTensor::divide(float const &value, Tensor &output) const {
 Tensor &FloatTensor::divide(Tensor const &m, Tensor &output) const {
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    ele_div(e.buffer_size, buf, m_buf, out_buf, 1, 0, e.strides[3], strides[3]);
+    ops()->ele_div_fp32(e.buffer_size, buf, m_buf, out_buf, 1, 0,
+                               e.strides[3], strides[3]);
   };
 
   apply_broadcast(m, f, output);
@@ -450,8 +460,9 @@ Tensor &FloatTensor::add_strided(Tensor const &input, Tensor &output,
 int FloatTensor::add_i_partial(unsigned int len, unsigned int addr_idx,
                                Tensor &m, unsigned int incX, unsigned int incY,
                                const Tensor alphas, unsigned int alpha_idx) {
-  saxpy(len, alphas.getValue<float>(alpha_idx), m.getData<float>(), incX,
-        (float *)getAddress(addr_idx), incY);
+  ops()->saxpy_fp32(len, alphas.getValue<float>(alpha_idx),
+                           m.getData<float>(), incX,
+                           (float *)getAddress(addr_idx), incY);
 
   return ML_ERROR_NONE;
 }
@@ -466,7 +477,8 @@ Tensor &FloatTensor::add(Tensor const &m, Tensor &output,
                          float const alpha) const {
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    ele_add(e.buffer_size, buf, m_buf, out_buf, alpha, 0, e.strides[3],
+    ops()->ele_add_fp32(e.buffer_size, buf, m_buf, out_buf, alpha, 0,
+                               e.strides[3],
             strides[3]);
   };
   apply_broadcast(m, f, output);
@@ -661,9 +673,9 @@ void FloatTensor::normalization_i(unsigned int dim, float p, float epsilon) {
 #pragma omp parallel for
     for (int i = 0; i < num_vectors; ++i) {
       float *vec_ptr = data + i * dim_size;
-      float norm = snrm2(dim_size, vec_ptr, 1);
+      float norm = ops()->snrm2_fp32(dim_size, vec_ptr, 1);
       float scale = 1.0f / std::max(norm, epsilon);
-      sscal(dim_size, scale, vec_ptr, 1);
+      ops()->sscal_fp32(dim_size, scale, vec_ptr, 1);
     }
   } else {
     throw nntrainer::exception::not_supported(
@@ -773,34 +785,34 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
     rdatas.push_back(output[i]->getData<float>());
   }
 
-  auto ops = g_compute_ops;
+  auto *o = ops();
   if (input_dtype == Tdatatype::Q4_0) {
-    if (ops->gemm_q4_0_batch_fp32 && M > 1) {
-      ops->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
+    if (o->gemm_q4_0_batch_fp32 && M > 1) {
+      o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
     } else {
       for (unsigned int i = 0; i < input.size(); ++i) {
-        ops->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
+        o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
                             Ns[i]);
       }
     }
   } else { // QINT4
-    if (ops->gemv_int4_batch_fp32 && input[0]->getMemoryData()->isSVM() &&
+    if (o->gemv_int4_batch_fp32 && input[0]->getMemoryData()->isSVM() &&
         output[0]->getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
       std::vector<uint16_t *> scales;
       for (unsigned int i = 0; i < input.size(); ++i) {
         scales.push_back(input[i]->getScale<uint16_t>());
       }
       if (M == 1) {
-        ops->gemv_int4_batch_fp32(mdatas, scales, data, rdatas, K, Ns,
+        o->gemv_int4_batch_fp32(mdatas, scales, data, rdatas, K, Ns,
                                   Int4QTensor::getGroupSize());
       } else {
-        ops->gemm_int4_batch_fp32(data, mdatas, scales, rdatas, M, Ns, K,
+        o->gemm_int4_batch_fp32(data, mdatas, scales, rdatas, M, Ns, K,
                                   Int4QTensor::getGroupSize());
       }
     } else {
       /// @todo Replace with standard CPU INT4 computation
       for (unsigned int i = 0; i < input.size(); ++i) {
-        ops->gemm_q4_0_fp32(M, Ns[i], K, data, K,
+        o->gemm_q4_0_fp32(M, Ns[i], K, data, K,
                             (void *)input[i]->getData(), Ns[i], rdatas[i],
                             Ns[i]);
       }
@@ -840,28 +852,30 @@ Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
   /// transpose.
   /// For example, there is no case like (1 * K) X (1 * K) while
   /// (1 * K) X (1 * M) can be a case
+  auto *o = ops();
   /// case1: (1 * K) X (K * 1)
   if (M == 1 && N == 1) {
-    *rdata =
-      sdot(K, data, 1, mdata, 1) + ((0.0f == beta) ? 0.0f : beta * *rdata);
+    *rdata = o->sdot_fp32(K, data, 1, mdata, 1) +
+             ((0.0f == beta) ? 0.0f : beta * *rdata);
   }
   /// case2: (M * K) X (K * 1)
   else if (N == 1) {
-    sgemv((unsigned int)dim.getStorageOrder(), trans, first_three_flat,
-          last_axis, alpha, data, lda, mdata, 1, beta, rdata, 1);
+    o->sgemv_fp32((unsigned int)dim.getStorageOrder(), trans,
+                    first_three_flat, last_axis, alpha, data, lda, mdata, 1,
+                    beta, rdata, 1);
   }
   /// case3: (1 * K) X (K * N) = 1 * N = R
   /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
   /// Effectively a translation of sgemv
   else if (M == 1) {
-    sgemv((unsigned int)dim.getStorageOrder(), !trans_in,
-          input_first_three_flat, input_last_axis, alpha, mdata, ldb, data, 1,
-          beta, rdata, 1);
+    o->sgemv_fp32((unsigned int)dim.getStorageOrder(), !trans_in,
+                    input_first_three_flat, input_last_axis, alpha, mdata, ldb,
+                    data, 1, beta, rdata, 1);
   }
   /// case others: use gemm
   else {
-    sgemm((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K, alpha,
-          data, lda, mdata, ldb, beta, rdata, ldc);
+    o->sgemm_fp32((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N,
+                    K, alpha, data, lda, mdata, ldb, beta, rdata, ldc);
   }
 
   return output;
@@ -906,23 +920,24 @@ Tensor &FloatTensor::dotFloat32Float16(Tensor const &input, Tensor &output,
   /// case1: (1 * K) X (K * 1)
   NNTR_THROW_IF((M == 1 && N == 1), std::invalid_argument)
     << "dotQnK does not support trans / trans_in";
+  auto *o = ops();
   /// case2: (M * K) X (K * 1)
   if (N == 1) {
-    shgemv((unsigned int)dim.getStorageOrder(), trans, first_three_flat,
-           last_axis, alpha, data, lda, mdata, 1, beta, rdata, 1);
+    o->shgemv((unsigned int)dim.getStorageOrder(), trans, first_three_flat,
+                last_axis, alpha, data, lda, mdata, 1, beta, rdata, 1);
   }
   /// case3: (1 * K) X (K * N) = 1 * N = R
   /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
   /// Effectively a translation of sgemv
   else if (M == 1) {
-    hsgemv((unsigned int)dim.getStorageOrder(), !trans_in,
-           input_first_three_flat, input_last_axis, alpha, mdata, ldb, data, 1,
-           beta, rdata, 1);
+    o->hsgemv((unsigned int)dim.getStorageOrder(), !trans_in,
+                input_first_three_flat, input_last_axis, alpha, mdata, ldb,
+                data, 1, beta, rdata, 1);
   }
   /// case others: use gemm
   else {
-    shgemm((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K, alpha,
-           data, lda, mdata, ldb, beta, rdata, ldc);
+    o->shgemm((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K,
+                alpha, data, lda, mdata, ldb, beta, rdata, ldc);
   }
 
   return output;
@@ -950,22 +965,23 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   K = getDim().width();
   N = trans_in ? input.getDim().height() : input.getDim().width();
 
+  auto *o = ops();
   switch (dtype) {
   case Tdatatype::Q4_K:
-    gemm_q4_K(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    o->gemm_q4_K_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
   case Tdatatype::Q6_K:
-    gemm_q6_K(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    o->gemm_q6_K_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
   case Tdatatype::Q4_0: {
     M = getDim().height();
     K = getDim().width();
     N = input.getDim().width();
-    auto ops = g_compute_ops;
-    if (ops->gemm_q4_0_accel_fp32 && M > 1) {
-      ops->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
+    auto *o = ops();
+    if (o->gemm_q4_0_accel_fp32 && M > 1) {
+      o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
     } else {
-      ops->gemm_q4_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
+      o->gemm_q4_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     }
     break;
   }
@@ -989,14 +1005,14 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
 
-  auto ops = g_compute_ops;
-  if (ops->gemv_int4_accel_fp32 && input.getMemoryData()->isSVM() &&
+  auto *o = ops();
+  if (o->gemv_int4_accel_fp32 && input.getMemoryData()->isSVM() &&
       output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
     if (M == 1) {
-      ops->gemv_int4_accel_fp32(mdata, input.getScale<uint16_t>(), data, rdata,
+      o->gemv_int4_accel_fp32(mdata, input.getScale<uint16_t>(), data, rdata,
                                 K, N, Int4QTensor::getGroupSize());
     } else {
-      ops->sgemm_int4_accel_fp32(data, mdata, input.getScale<uint16_t>(),
+      o->sgemm_int4_accel_fp32(data, mdata, input.getScale<uint16_t>(),
                                  rdata, M, N, K,
                                  Int4QTensor::getGroupSize());
     }
@@ -1013,7 +1029,7 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
     }
 #else
     /// @todo Replace with standard CPU INT4 computation
-    ops->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata,
+    o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata,
                         N);
 #endif
   }
@@ -1227,7 +1243,7 @@ Tensor &FloatTensor::transpose(const std::string &direction,
       if (is_format_nchw) {
         for (unsigned int b = 0; b < batch(); ++b) {
           for (unsigned int c = 0; c < channel(); ++c) {
-            transpose_matrix(
+            ops()->transpose_matrix_fp32(
               height(), width(), (float *)getData() + getIndex(b, c, 0, 0),
               width(), (float *)output.getData() + output.getIndex(b, c, 0, 0),
               output.width());

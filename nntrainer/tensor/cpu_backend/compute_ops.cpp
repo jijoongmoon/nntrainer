@@ -10,9 +10,16 @@
  */
 
 #include <compute_ops.h>
+#include <cpu_backend.h>
 
 namespace nntrainer {
 
 ComputeOps *g_compute_ops = nullptr;
+
+void ensureComputeOps() {
+  if (g_compute_ops == nullptr) {
+    init_backend();
+  }
+}
 
 } // namespace nntrainer
