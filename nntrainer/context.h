@@ -52,8 +52,21 @@ public:
 
   void setMemAllocator(std::shared_ptr<MemAllocator> m) { mem_allocator = m; }
 
+  /**
+   * @brief Get the compute ops table for this context
+   * @return ComputeOps* pointer to the ops table, or nullptr if not set
+   */
+  struct ComputeOps *getComputeOps() { return compute_ops; }
+
+  /**
+   * @brief Set the compute ops table for this context
+   * @param ops pointer to the ops table
+   */
+  void setComputeOps(struct ComputeOps *ops) { compute_ops = ops; }
+
 private:
   std::shared_ptr<MemAllocator> mem_allocator = nullptr;
+  struct ComputeOps *compute_ops = nullptr;
 };
 
 /**
