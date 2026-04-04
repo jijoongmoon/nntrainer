@@ -367,6 +367,15 @@ struct ComputeOps {
 extern ComputeOps *g_compute_ops;
 
 /**
+ * @brief Ensure the global compute ops table is initialized.
+ *
+ * If g_compute_ops is nullptr (e.g., init_backend() not yet called),
+ * calls init_backend() to set it up. This provides safe lazy init
+ * for standalone tensor usage outside of Engine/Context.
+ */
+void ensureComputeOps();
+
+/**
  * @brief Get the active compute ops table.
  *
  * Returns the global compute ops pointer. In the future, this may
