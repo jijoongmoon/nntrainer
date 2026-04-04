@@ -639,6 +639,13 @@ static ComputeOps arm_ops = {
   // Quantized weight packing
   .unpack_q4_0 = nntrainer::unpack_q4_0,
   .unpack_q4_0x8_transpose16 = nntrainer::unpack_q4_0x8_transpose16,
+  // GPU-accelerated quantized ops (not available on CPU)
+  .gemm_q4_0_batch_fp32 = nullptr,
+  .gemm_q4_0_accel_fp32 = nullptr,
+  .gemv_int4_batch_fp32 = nullptr,
+  .gemm_int4_batch_fp32 = nullptr,
+  .gemv_int4_accel_fp32 = nullptr,
+  .sgemm_int4_accel_fp32 = nullptr,
 #ifdef ENABLE_FP16
   // FP16 BLAS
   .sgemm_fp16 = nntrainer::sgemm,
