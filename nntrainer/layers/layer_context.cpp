@@ -13,7 +13,6 @@
  */
 
 #include "nntrainer_error.h"
-#include <context.h>
 #include <functional>
 #include <memory>
 #include <tensor_wrap_specs.h>

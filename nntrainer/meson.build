@@ -18,6 +18,7 @@ nntrainer_headers = [
    meson.current_source_dir() / 'nntrainer_error.h',
    meson.current_source_dir() / 'app_context.h',
    meson.current_source_dir() / 'context.h',
+   meson.current_source_dir() / 'context_data.h',
    meson.current_source_dir() / 'engine.h',
    meson.current_source_dir() / 'mem_allocator.h',
 ]

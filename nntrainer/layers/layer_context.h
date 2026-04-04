@@ -25,10 +25,11 @@
 #include <tensor_wrap_specs.h>
 #include <weight.h>
 
+#include <context_data.h>
+
 namespace nntrainer {
 
 class Var_Grad;
-class ContextData;
 
 /**
  * @class   Layer Context class for all layers
