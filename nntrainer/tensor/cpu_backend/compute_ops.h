@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #ifdef ENABLE_FP16
 #include <tensor_dim.h>
@@ -166,6 +167,46 @@ struct ComputeOps {
 
   void (*unpack_q4_0x8_transpose16)(const void *src, uint16_t *d_out,
                                     uint16_t *qs_out, int N, int K);
+
+  // =========================================================================
+  // GPU-accelerated quantized ops (nullable — nullptr on CPU)
+  // These function pointers have GPU-specific signatures.
+  // When non-null, they provide batch/async acceleration for quantized GEMM.
+  // =========================================================================
+
+  /** @brief Batch async Q4_0 GEMM (e.g., OpenCL gemm_q4_0_async_cl) */
+  void (*gemm_q4_0_batch_fp32)(std::vector<void *> matAdata, float *matBdata,
+                               std::vector<float *> matCdata, unsigned int M,
+                               std::vector<unsigned int> N, unsigned int K);
+
+  /** @brief Single Q4_0 GEMM on accelerator (e.g., OpenCL gemm_q4_0_cl) */
+  void (*gemm_q4_0_accel_fp32)(void *matAdata, float *matBdata,
+                               float *matCdata, unsigned int M, unsigned int N,
+                               unsigned int K);
+
+  /** @brief Batch async INT4 GEMV (e.g., OpenCL gemv_int4_async_cl) */
+  void (*gemv_int4_batch_fp32)(std::vector<void *> weights,
+                               std::vector<uint16_t *> scales, float *input,
+                               std::vector<float *> outputs, unsigned int K,
+                               std::vector<unsigned int> Ns,
+                               unsigned int group_size);
+
+  /** @brief Batch async INT4 GEMM (e.g., OpenCL gemm_int4_async_cl) */
+  void (*gemm_int4_batch_fp32)(float *input, std::vector<void *> weights,
+                               std::vector<uint16_t *> scales,
+                               std::vector<float *> matCdata, unsigned int M,
+                               std::vector<unsigned int> Ns, unsigned int K,
+                               unsigned int group_size);
+
+  /** @brief Single INT4 GEMV on accelerator */
+  void (*gemv_int4_accel_fp32)(char *weight, uint16_t *scale, float *input,
+                               float *output, unsigned int K, unsigned int N,
+                               unsigned int group_size);
+
+  /** @brief Single INT4 SGEMM on accelerator */
+  void (*sgemm_int4_accel_fp32)(float *input, char *weight, uint16_t *scale,
+                                float *output, unsigned int M, unsigned int N,
+                                unsigned int K, unsigned int group_size);
 
 #ifdef ENABLE_FP16
   // =========================================================================
