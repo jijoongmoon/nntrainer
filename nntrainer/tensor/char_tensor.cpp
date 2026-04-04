@@ -12,6 +12,7 @@
 #include <iostream>
 
 #include <char_tensor.h>
+#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <tensor.h>
 
@@ -91,7 +92,7 @@ CharTensor::CharTensor(
   }
 
   // copy scale factors
-  scopy(scale_size(), scales.data(), 1, (float *)getScale(), 1);
+  getComputeOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 }
 
 bool CharTensor::operator==(const CharTensor &rhs) const {
@@ -272,7 +273,7 @@ int CharTensor::multiply_i(float const &value) {
   // multiply value to scale factors
   float *g_scale = (float *)getScale();
 
-  sscal(scale_size(), value, g_scale, 1);
+  getComputeOps()->sscal_fp32(scale_size(), value, g_scale, 1);
   return ML_ERROR_NONE;
 }
 
@@ -386,7 +387,7 @@ void CharTensor::copyData(const Tensor &from) {
     copy(from.getData());
     break;
   case ml::train::TensorDim::DataType::FP32:
-    copy_fp32(from.size(), from.getData<float>(), (int8_t *)getData());
+    getComputeOps()->copy_fp32_s8(from.size(), from.getData<float>(), (int8_t *)getData());
     break;
   default:
     throw std::invalid_argument("Error: Unsupported data type");
@@ -590,10 +591,10 @@ void CharTensor::copy(const void *buf) {
     return;
   }
 
-  scopy(size(), (int8_t *)buf, 1, (int8_t *)getData(), 1);
+  getComputeOps()->scopy_s8(size(), (int8_t *)buf, 1, (int8_t *)getData(), 1);
 
   float *scales = (float *)(((int8_t *)buf) + size());
-  scopy(scale_size(), scales, 1, (float *)getScale(), 1);
+  getComputeOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
 }
 
 void CharTensor::save_quantization_info(std::ostream &file) {
