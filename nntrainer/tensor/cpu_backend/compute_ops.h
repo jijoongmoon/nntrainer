@@ -384,11 +384,12 @@ void ensureComputeOps();
 inline ComputeOps *getComputeOps() { return g_compute_ops; }
 
 /**
- * @brief Get the CPU ops table (shared across ARM/x86/fallback).
- * The actual implementation differs based on which architecture-specific
- * .cpp is compiled and linked.
+ * @brief Backend-specific ops table getters.
+ * Each backend defines its own getter in its .cpp file.
  */
-ComputeOps *get_cpu_ops();
+ComputeOps *get_arm_ops();
+ComputeOps *get_x86_ops();
+ComputeOps *get_fallback_ops();
 
 } // namespace nntrainer
 
