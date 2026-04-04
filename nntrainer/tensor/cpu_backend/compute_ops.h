@@ -368,20 +368,20 @@ extern ComputeOps *g_compute_ops;
 
 /**
  * @brief Ensure the global compute ops table is initialized.
- *
- * If g_compute_ops is nullptr (e.g., init_backend() not yet called),
- * calls init_backend() to set it up. This provides safe lazy init
- * for standalone tensor usage outside of Engine/Context.
  */
 void ensureComputeOps();
 
 /**
- * @brief Get the active compute ops table.
+ * @brief Get the active compute ops table with lazy initialization.
  *
- * Returns the global compute ops pointer. In the future, this may
- * be extended to check thread-local or context-specific overrides.
+ * If g_compute_ops is nullptr (init_backend() not yet called),
+ * automatically initializes it. Safe to call from any context.
  */
-inline ComputeOps *getComputeOps() { return g_compute_ops; }
+inline ComputeOps *getComputeOps() {
+  if (__builtin_expect(g_compute_ops == nullptr, 0))
+    ensureComputeOps();
+  return g_compute_ops;
+}
 
 /**
  * @brief Backend-specific ops table getters.

@@ -24,15 +24,6 @@
 
 #include <compute_ops.h>
 
-/// @brief Get the compute ops table, with lazy initialization.
-/// This ensures g_compute_ops is set even if init_backend() wasn't called
-/// explicitly (e.g., standalone tensor tests).
-static inline nntrainer::ComputeOps *ops() {
-  if (__builtin_expect(nntrainer::g_compute_ops == nullptr, 0))
-    nntrainer::ensureComputeOps();
-  return nntrainer::g_compute_ops;
-}
-
 namespace nntrainer {
 
 FloatTensor::FloatTensor(std::string name_, Tformat fm) :
@@ -350,7 +341,7 @@ int FloatTensor::multiply_i(float const &value) {
   float *data = (float *)getData();
   unsigned int len = size();
 
-  ops()->sscal_fp32(len, value, data, 1);
+  getComputeOps()->sscal_fp32(len, value, data, 1);
 
   return ML_ERROR_NONE;
 }
@@ -365,7 +356,7 @@ Tensor &FloatTensor::multiply(Tensor const &m, Tensor &output,
                               const float beta) const {
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    ops()->ele_mul_fp32(e.buffer_size, buf, m_buf, out_buf, 1, beta,
+    getComputeOps()->ele_mul_fp32(e.buffer_size, buf, m_buf, out_buf, 1, beta,
                                e.strides[3], strides[3]);
   };
 
@@ -395,7 +386,7 @@ Tensor &FloatTensor::divide(float const &value, Tensor &output) const {
 Tensor &FloatTensor::divide(Tensor const &m, Tensor &output) const {
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    ops()->ele_div_fp32(e.buffer_size, buf, m_buf, out_buf, 1, 0,
+    getComputeOps()->ele_div_fp32(e.buffer_size, buf, m_buf, out_buf, 1, 0,
                                e.strides[3], strides[3]);
   };
 
@@ -460,7 +451,7 @@ Tensor &FloatTensor::add_strided(Tensor const &input, Tensor &output,
 int FloatTensor::add_i_partial(unsigned int len, unsigned int addr_idx,
                                Tensor &m, unsigned int incX, unsigned int incY,
                                const Tensor alphas, unsigned int alpha_idx) {
-  ops()->saxpy_fp32(len, alphas.getValue<float>(alpha_idx),
+  getComputeOps()->saxpy_fp32(len, alphas.getValue<float>(alpha_idx),
                            m.getData<float>(), incX,
                            (float *)getAddress(addr_idx), incY);
 
@@ -477,7 +468,7 @@ Tensor &FloatTensor::add(Tensor const &m, Tensor &output,
                          float const alpha) const {
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    ops()->ele_add_fp32(e.buffer_size, buf, m_buf, out_buf, alpha, 0,
+    getComputeOps()->ele_add_fp32(e.buffer_size, buf, m_buf, out_buf, alpha, 0,
                                e.strides[3],
             strides[3]);
   };
@@ -500,7 +491,7 @@ void FloatTensor::sum_by_batch(Tensor &output) const {
 
   Tensor ones(1, 1, 1, feat_len, this->getFormat());
   ones.setValue(1.0);
-  sgemv((unsigned int)dim.getStorageOrder(), false, (int)batch, (int)feat_len,
+  getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), false, (int)batch, (int)feat_len,
         1, data, (int)feat_len, ones.getData<float>(), 1, 0.0, out_data, 1);
 }
 
@@ -516,7 +507,7 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
 
   if (dim.getDim()[axis] == 1 and alpha == 1.0 and !beta) {
     CREATE_IF_EMPTY_DIMS(output, dim);
-    scopy(size(), (float *)getData(), 1, output.getData<float>(), 1);
+    getComputeOps()->scopy_fp32(size(), (float *)getData(), 1, output.getData<float>(), 1);
     return output;
   }
 
@@ -528,7 +519,7 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
     size_t batch = dim.batch();
     Tensor ones(1, 1, 1, batch, getTensorType());
     ones.setValue(alpha);
-    sgemv((unsigned int)dim.getStorageOrder(), true, (int)batch, (int)feat_len,
+    getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), true, (int)batch, (int)feat_len,
           1, data, (int)feat_len, ones.getData<float>(), 1, beta,
           output.getData<float>(), 1);
   } break;
@@ -539,7 +530,7 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       unsigned int t_axis = dim[1];
       Tensor ones(1, 1, 1, t_axis, getTensorType());
       ones.setValue(alpha);
-      sgemv((unsigned int)dim.getStorageOrder(), false, (int)feat_len,
+      getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), false, (int)feat_len,
             (int)t_axis, 1, data, (int)t_axis, ones.getData<float>(), 1, beta,
             output.getData<float>(), 1);
     } else {
@@ -549,7 +540,7 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       ones.setValue(alpha);
       float *rdata = output.getData<float>();
       for (unsigned int k = 0; k < dim[0]; ++k) {
-        sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+        getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
               (int)feat_len, 1, &data[k * dim.getFeatureLen()], (int)feat_len,
               ones.getData<float>(), 1, beta, &rdata[k * feat_len], 1);
       }
@@ -564,7 +555,7 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       ones.setValue(alpha);
       float *rdata = output.getData<float>();
       for (unsigned int k = 0; k < dim[0]; ++k) {
-        sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+        getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
               (int)feat_len, 1, &data[k * dim.getFeatureLen()], (int)feat_len,
               ones.getData<float>(), 1, beta, &rdata[k * feat_len], 1);
       }
@@ -582,13 +573,13 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
             unsigned int ridx =
               k * output.getDim().getFeatureLen() + c * dim[3];
 
-            sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+            getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
                   (int)t_3, 1, &data[idx], (int)t_3, ones.getData<float>(), 1,
                   beta, &rdata[ridx], 1);
           }
         }
       } else {
-        sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+        getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
               (int)output.getDim().getDataLen(), 1, data, (int)t_axis,
               ones.getData<float>(), 1, beta, output.getData<float>(), 1);
       }
@@ -607,7 +598,7 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
         for (unsigned int c = 0; c < dim[2]; ++c) {
           unsigned int idx = k * dim.getFeatureLen() + c * dim[3] * dim[1];
           unsigned int ridx = k * output.getDim().getFeatureLen() + c * dim[1];
-          sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+          getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
                 (int)t_3, 1, &data[idx], (int)t_3, ones.getData<float>(), 1,
                 beta, &rdata[ridx], 1);
         }
@@ -619,7 +610,7 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       ones.setValue(alpha);
 
       if (dim.getStorageOrder() == TStorageOrder::ROW_MAJOR) {
-        sgemv((unsigned int)dim.getStorageOrder(), false, (int)m, (int)n, 1,
+        getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), false, (int)m, (int)n, 1,
               data, (int)n, ones.getData<float>(), 1, beta,
               output.getData<float>(), 1);
       } else {
@@ -630,7 +621,7 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
             unsigned int idx = k * dim.getFeatureLen() + c * dim[3] * dim[2];
             unsigned int ridx = k * dim[1] * dim[2] + c * dim[2];
 
-            sgemv((unsigned int)dim.getStorageOrder(), false, (int)dim[2],
+            getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), false, (int)dim[2],
                   (int)n, 1, &data[idx], (int)dim[2], ones.getData<float>(), 1,
                   beta, &rdata[ridx], 1);
           }
@@ -673,9 +664,9 @@ void FloatTensor::normalization_i(unsigned int dim, float p, float epsilon) {
 #pragma omp parallel for
     for (int i = 0; i < num_vectors; ++i) {
       float *vec_ptr = data + i * dim_size;
-      float norm = ops()->snrm2_fp32(dim_size, vec_ptr, 1);
+      float norm = getComputeOps()->snrm2_fp32(dim_size, vec_ptr, 1);
       float scale = 1.0f / std::max(norm, epsilon);
-      ops()->sscal_fp32(dim_size, scale, vec_ptr, 1);
+      getComputeOps()->sscal_fp32(dim_size, scale, vec_ptr, 1);
     }
   } else {
     throw nntrainer::exception::not_supported(
@@ -785,7 +776,7 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
     rdatas.push_back(output[i]->getData<float>());
   }
 
-  auto *o = ops();
+  auto *o = getComputeOps();
   if (input_dtype == Tdatatype::Q4_0) {
     if (o->gemm_q4_0_batch_fp32 && M > 1) {
       o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
@@ -852,7 +843,7 @@ Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
   /// transpose.
   /// For example, there is no case like (1 * K) X (1 * K) while
   /// (1 * K) X (1 * M) can be a case
-  auto *o = ops();
+  auto *o = getComputeOps();
   /// case1: (1 * K) X (K * 1)
   if (M == 1 && N == 1) {
     *rdata = o->sdot_fp32(K, data, 1, mdata, 1) +
@@ -920,7 +911,7 @@ Tensor &FloatTensor::dotFloat32Float16(Tensor const &input, Tensor &output,
   /// case1: (1 * K) X (K * 1)
   NNTR_THROW_IF((M == 1 && N == 1), std::invalid_argument)
     << "dotQnK does not support trans / trans_in";
-  auto *o = ops();
+  auto *o = getComputeOps();
   /// case2: (M * K) X (K * 1)
   if (N == 1) {
     o->shgemv((unsigned int)dim.getStorageOrder(), trans, first_three_flat,
@@ -965,7 +956,7 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   K = getDim().width();
   N = trans_in ? input.getDim().height() : input.getDim().width();
 
-  auto *o = ops();
+  auto *o = getComputeOps();
   switch (dtype) {
   case Tdatatype::Q4_K:
     o->gemm_q4_K_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
@@ -977,7 +968,7 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     M = getDim().height();
     K = getDim().width();
     N = input.getDim().width();
-    auto *o = ops();
+    auto *o = getComputeOps();
     if (o->gemm_q4_0_accel_fp32 && M > 1) {
       o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
     } else {
@@ -1005,7 +996,7 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
 
-  auto *o = ops();
+  auto *o = getComputeOps();
   if (o->gemv_int4_accel_fp32 && input.getMemoryData()->isSVM() &&
       output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
     if (M == 1) {
@@ -1056,20 +1047,20 @@ void FloatTensor::copyData(const Tensor &from) {
   case ml::train::TensorDim::DataType::FP16:
 /// @todo remove #ifdef ENABLE_FP16
 #ifdef ENABLE_FP16
-    scopy(size(), from.getData<_FP16>(), 1, (float *)getData(), 1);
+    getComputeOps()->scopy_fp16_to_fp32(size(), from.getData<_FP16>(), 1, (float *)getData(), 1);
 #else
     throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif
     break;
   case ml::train::TensorDim::DataType::QINT16:
-    copy_s16_fp32(from.size(), from.getData<int16_t>(), (float *)getData());
+    getComputeOps()->copy_s16_fp32(from.size(), from.getData<int16_t>(), (float *)getData());
     break;
   case ml::train::TensorDim::DataType::QINT8:
     scopy_int8_to_float32(from.size(), from.getData<int8_t>(), 1,
                           (float *)getData(), 1);
     break;
   case ml::train::TensorDim::DataType::UINT16:
-    copy_u16_fp32(from.size(), from.getData<uint16_t>(), (float *)getData());
+    getComputeOps()->copy_u16_fp32(from.size(), from.getData<uint16_t>(), (float *)getData());
     break;
   case ml::train::TensorDim::DataType::UINT8:
     scopy_int8_to_float32(from.size(), from.getData<uint8_t>(), 1,
@@ -1243,7 +1234,7 @@ Tensor &FloatTensor::transpose(const std::string &direction,
       if (is_format_nchw) {
         for (unsigned int b = 0; b < batch(); ++b) {
           for (unsigned int c = 0; c < channel(); ++c) {
-            ops()->transpose_matrix_fp32(
+            getComputeOps()->transpose_matrix_fp32(
               height(), width(), (float *)getData() + getIndex(b, c, 0, 0),
               width(), (float *)output.getData() + output.getIndex(b, c, 0, 0),
               output.width());
@@ -1549,7 +1540,7 @@ void FloatTensor::copy(const void *buf) {
     return;
   }
 
-  scopy(size(), (float *)buf, 1, (float *)getData(), 1);
+  getComputeOps()->scopy_fp32(size(), (float *)buf, 1, (float *)getData(), 1);
 }
 
 void FloatTensor::apply_broadcast_util(

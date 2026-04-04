@@ -8,6 +8,7 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <q4_k_tensor.h>
 #include <tensor.h>
@@ -90,7 +91,7 @@ void Q4_K_Tensor::copy_q4k(const void *buf) {
     return;
   }
   // copy tensor data
-  scopy(size(), (uint8_t *)buf, 1, (uint8_t *)getData(), 1);
+  getComputeOps()->scopy_u8(size(), (uint8_t *)buf, 1, (uint8_t *)getData(), 1);
 }
 
 } // namespace nntrainer
