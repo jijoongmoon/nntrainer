@@ -337,11 +337,11 @@ Tensor FloatTensor::multiply_strided(Tensor const &m, Tensor &output,
   return output;
 }
 
-int FloatTensor::multiply_i(float const &value) {
+int FloatTensor::multiply_i(float const &value, ComputeOps *ops) {
   float *data = (float *)getData();
   unsigned int len = size();
-
-  getComputeOps()->sscal_fp32(len, value, data, 1);
+  auto *o = ops ? ops : getComputeOps();
+  o->sscal_fp32(len, value, data, 1);
 
   return ML_ERROR_NONE;
 }
@@ -353,11 +353,12 @@ Tensor &FloatTensor::multiply(float const &value, Tensor &out) const {
 }
 
 Tensor &FloatTensor::multiply(Tensor const &m, Tensor &output,
-                              const float beta) const {
+                              const float beta, ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    getComputeOps()->ele_mul_fp32(e.buffer_size, buf, m_buf, out_buf, 1, beta,
-                               e.strides[3], strides[3]);
+    o->ele_mul_fp32(e.buffer_size, buf, m_buf, out_buf, 1, beta,
+                    e.strides[3], strides[3]);
   };
 
   NNTR_THROW_IF(m.getFormat() != this->getFormat(), std::invalid_argument)
@@ -383,11 +384,13 @@ Tensor &FloatTensor::divide(float const &value, Tensor &output) const {
   return output;
 }
 
-Tensor &FloatTensor::divide(Tensor const &m, Tensor &output) const {
+Tensor &FloatTensor::divide(Tensor const &m, Tensor &output,
+                            ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    getComputeOps()->ele_div_fp32(e.buffer_size, buf, m_buf, out_buf, 1, 0,
-                               e.strides[3], strides[3]);
+    o->ele_div_fp32(e.buffer_size, buf, m_buf, out_buf, 1, 0,
+                    e.strides[3], strides[3]);
   };
 
   apply_broadcast(m, f, output);
@@ -450,8 +453,10 @@ Tensor &FloatTensor::add_strided(Tensor const &input, Tensor &output,
 
 int FloatTensor::add_i_partial(unsigned int len, unsigned int addr_idx,
                                Tensor &m, unsigned int incX, unsigned int incY,
-                               const Tensor alphas, unsigned int alpha_idx) {
-  getComputeOps()->saxpy_fp32(len, alphas.getValue<float>(alpha_idx),
+                               const Tensor alphas, unsigned int alpha_idx,
+                               ComputeOps *ops) {
+  auto *o = ops ? ops : getComputeOps();
+  o->saxpy_fp32(len, alphas.getValue<float>(alpha_idx),
                            m.getData<float>(), incX,
                            (float *)getAddress(addr_idx), incY);
 
@@ -465,10 +470,11 @@ Tensor &FloatTensor::add(float const &value, Tensor &output) const {
 }
 
 Tensor &FloatTensor::add(Tensor const &m, Tensor &output,
-                         float const alpha) const {
+                         float const alpha, ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    getComputeOps()->ele_add_fp32(e.buffer_size, buf, m_buf, out_buf, alpha, 0,
+    o->ele_add_fp32(e.buffer_size, buf, m_buf, out_buf, alpha, 0,
                                e.strides[3],
             strides[3]);
   };

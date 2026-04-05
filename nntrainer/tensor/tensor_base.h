@@ -314,7 +314,7 @@ public:
   /**
    * @copydoc Tensor::multiply_i(float const &value)
    */
-  virtual int multiply_i(float const &value);
+  virtual int multiply_i(float const &value, ComputeOps *ops = nullptr);
 
   /**
    * @copydoc Tensor::multiply(float const &value, Tensor &output)
@@ -326,7 +326,7 @@ public:
    * float beta = 0.0)
    */
   virtual Tensor &multiply(Tensor const &m, Tensor &output,
-                           const float beta = 0.0) const;
+                           const float beta = 0.0, ComputeOps *ops = nullptr) const;
 
   /**
    * @copydoc Tensor::divide(float const &value, Tensor &output)
@@ -336,7 +336,7 @@ public:
   /**
    * @copydoc Tensor::divide(Tensor const &m, Tensor &output)
    */
-  virtual Tensor &divide(Tensor const &m, Tensor &output) const;
+  virtual Tensor &divide(Tensor const &m, Tensor &output, ComputeOps *ops = nullptr) const;
 
   /**
    * @copydoc Tensor::add_strided(Tensor const &input, Tensor &output,
@@ -350,7 +350,8 @@ public:
    */
   virtual int add_i_partial(unsigned int len, unsigned int addr_idx, Tensor &m,
                             unsigned int incX, unsigned int incY,
-                            const Tensor alphas, unsigned int alpha_idx);
+                            const Tensor alphas, unsigned int alpha_idx,
+                               ComputeOps *ops = nullptr);
 
   /**
    * @copydoc Tensor::add(float const &value, Tensor &output)
@@ -361,7 +362,8 @@ public:
    * @copydoc Tensor::add(Tensor const &m, Tensor &output, float const
    * alpha)
    */
-  virtual Tensor &add(Tensor const &m, Tensor &output, float const alpha) const;
+  virtual Tensor &add(Tensor const &m, Tensor &output, float const alpha,
+                      ComputeOps *ops = nullptr) const;
 
   /**
    * @copydoc Tensor::subtract(float const &value, Tensor &output)

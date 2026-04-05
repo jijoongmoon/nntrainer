@@ -268,7 +268,7 @@ void CharTensor::initialize(Initializer init) {
   initialize();
 }
 
-int CharTensor::multiply_i(float const &value) {
+int CharTensor::multiply_i(float const &value, ComputeOps *ops) {
   // multiply value to scale factors
   float *g_scale = (float *)getScale();
 
@@ -277,7 +277,7 @@ int CharTensor::multiply_i(float const &value) {
 }
 
 Tensor &CharTensor::multiply(Tensor const &input, Tensor &output,
-                             const float scale) const {
+                             const float scale, ComputeOps *ops) const {
   CREATE_IF_EMPTY_DIMS(output, dim, nullptr, q_scheme());
 
   NNTR_THROW_IF(q_scheme() != input.q_scheme(), std::invalid_argument)
@@ -319,7 +319,7 @@ Tensor &CharTensor::multiply(Tensor const &input, Tensor &output,
 }
 
 Tensor &CharTensor::add(Tensor const &input, Tensor &output,
-                        float const scale) const {
+                        float const scale, ComputeOps *ops) const {
   CREATE_IF_EMPTY_DIMS(output, dim, nullptr, qscheme);
 
   NNTR_THROW_IF(q_scheme() != input.q_scheme(), std::invalid_argument)
