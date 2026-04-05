@@ -307,3 +307,107 @@ void QNNGraph::forwarding(RunLayerContext &context) {
 | `app_context.h/cpp` | CPU backend context (AppContext) |
 | `cl_context.h/cpp` | GPU backend context (ClContext) |
 | `qnn_context.h/cpp` | QNN backend context (QNNContext) |
+
+---
+
+## Plugin .so Loading (Dynamic Backend Registration)
+
+Backends like QNN are built as separate `.so` shared libraries and loaded
+at runtime. This avoids compile-time dependency on vendor SDKs.
+
+### Loading Flow
+
+```
+App or Framework:
+  Engine::Global().registerContext("path/to/qnn_context.so");
+    │
+    ▼
+  Engine::registerContext(library_path):
+    ├── dlopen("qnn_context.so", RTLD_LAZY | RTLD_LOCAL)
+    ├── dlsym("ml_train_context_pluggable")
+    │     → ContextPluggable { createfunc, destroyfunc }
+    ├── pluggable->createfunc()
+    │     → QNNContext::Global()
+    │       → QNNContext::initialize()
+    │         ├── init_backend()           ← from libnntrainer.so
+    │         ├── setComputeOps(g_compute_ops)  ← CPU fallback
+    │         ├── QNN SDK init (vendor-specific)
+    │         └── register QNN layers (QNNGraph, QNNLinear)
+    └── registerContext("qnn", context)
+```
+
+### Symbol Resolution Across .so Boundary
+
+| Symbol | Location | Plugin Access |
+|--------|----------|---------------|
+| `g_compute_ops` | libnntrainer.so (BSS) | ✅ via dynamic linking |
+| `init_backend()` | libnntrainer.so (TEXT) | ✅ via dynamic linking |
+| `ensureComputeOps()` | libnntrainer.so (TEXT) | ✅ via dynamic linking |
+| `getComputeOps()` | compute_ops.h (inline) | ✅ compiled into plugin |
+| `ContextData` vtable | libnntrainer.so | ✅ RTTI works across .so |
+| `as<T>()` (dynamic_cast) | compile-time | ✅ RTTI resolves correctly |
+
+### Plugin .so Entry Point
+
+```cpp
+// In qnn_context.so:
+extern "C" nntrainer::ContextPluggable ml_train_context_pluggable = {
+  // Create function — called once by Engine
+  []() -> nntrainer::Context * {
+    return &QNNContext::Global();  // Singleton
+  },
+  // Destroy function — Engine holds .so handle, no unload
+  [](nntrainer::Context *) { /* Singleton, no delete */ }
+};
+```
+
+### Safety Considerations
+
+1. **ComputeOps pointer lifetime**: The plugin can safely use
+   `g_compute_ops` (CPU fallback) because it lives in libnntrainer.so
+   which outlives any plugin.
+
+2. **Plugin-defined ops table**: If the plugin defines its own
+   `static ComputeOps qnn_ops`, it's safe because Engine retains the
+   .so handle and never calls `dlclose()`.
+
+3. **ContextData via shared_ptr**: `shared_ptr<ContextData>` ensures
+   the vendor data (QNNBackendVar) stays alive as long as any
+   RunLayerContext references it, regardless of .so boundaries.
+
+4. **RTTI across .so**: `dynamic_cast` (used by `as<T>()`) works
+   correctly across .so boundaries on Linux (ELF), as long as both
+   the main binary and plugin link against the same libnntrainer.so.
+
+### ComputeOps Override Strategy for Plugins
+
+A plugin can choose how much of the CPU ops to override:
+
+**Strategy 1: Full vendor ops table**
+```cpp
+static ComputeOps qnn_ops = {
+  .sgemm_fp32 = qnn_backend::sgemm,     // all ops defined by vendor
+  .ele_add_fp32 = qnn_backend::ele_add,
+  // ...
+};
+cd->setComputeOps(&qnn_ops);
+```
+
+**Strategy 2: Copy CPU ops, override only accelerated ones** (recommended)
+```cpp
+void QNNContext::initialize() {
+  init_backend();  // g_compute_ops = CPU ops (ARM NEON / x86 AVX)
+  
+  static ComputeOps qnn_ops = *g_compute_ops;  // start with CPU base
+  qnn_ops.sgemm_fp32 = qnn_htp_sgemm;   // GEMM → QNN HTP
+  qnn_ops.sgemv_fp32 = qnn_htp_sgemv;   // GEMV → QNN HTP
+  // ele_add, softmax, etc. stay as CPU NEON/AVX fallback
+  
+  cd->setComputeOps(&qnn_ops);
+}
+```
+
+Strategy 2 is recommended because:
+- You only need to implement ops your hardware accelerates
+- New ops added to ComputeOps automatically fall back to CPU
+- No risk of nullptr function pointers for unimplemented ops
