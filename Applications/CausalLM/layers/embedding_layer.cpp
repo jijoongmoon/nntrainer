@@ -11,6 +11,7 @@
  * @note   This embedding layer supports FP32/FP16/Q6_K data type only.
  */
 
+#include <cpu_backend.h>
 #include <embedding_layer.h>
 #include <layer_context.h>
 #include <thread_manager.h>

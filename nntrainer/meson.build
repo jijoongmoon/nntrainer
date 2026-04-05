@@ -61,6 +61,10 @@ if get_option('enable-opencl')
   nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
 endif
 
+if get_option('enable-npu')
+  nntrainer_elements += 'qnn'
+endif
+
 foreach elem : nntrainer_elements
   subdir(elem)
   nntrainer_inc += include_directories(elem)
@@ -73,6 +77,13 @@ nntrainer_common_sources = [
   'engine.cpp',
   'mem_allocator.cpp'
 ]
+
+# QNN context is built as a separate plugin .so (libqnn_context.so)
+# and loaded dynamically by Engine. See qnn/jni/meson.build for the
+# shared_library target. The header is still needed for type definitions.
+if get_option('enable-npu')
+  nntrainer_headers += meson.current_source_dir() / 'qnn_context.h'
+endif
 
 nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'ruy'
 

@@ -19,6 +19,7 @@
 
 #include <app_context.h>
 #include <base_properties.h>
+#include <compute_ops.h>
 #include <context.h>
 #include <dynamic_library_loader.h>
 #include <engine.h>
@@ -40,15 +41,25 @@ void Engine::add_default_object() {
   /// @note all layers should be added to the app_context to guarantee that
   /// createLayer/createOptimizer class is created
 
+  // AppContext::Global() triggers initialize() which calls init_backend()
+  // and sets compute ops on ContextData — same pattern as ClContext
   auto &app_context = nntrainer::AppContext::Global();
-
-  init_backend(); // initialize cpu backend
   registerContext("cpu", &app_context);
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
   auto &cl_context = nntrainer::ClContext::Global();
 
   registerContext("gpu", &cl_context);
+#endif
+
+#if defined(ENABLE_NPU) && ENABLE_NPU == 1
+  // QNN context is loaded as a plugin .so for decoupling from QNN SDK.
+  // libqnn_context.so exports ml_train_context_pluggable symbol.
+  try {
+    registerContext("libqnn_context.so", "");
+  } catch (std::exception &e) {
+    ml_logw("QNN context plugin not available: %s", e.what());
+  }
 #endif
 }
 

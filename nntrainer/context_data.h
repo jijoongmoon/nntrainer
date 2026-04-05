@@ -34,6 +34,35 @@ public:
   ContextData() = default;
   virtual ~ContextData() = default;
 
+  /**
+   * @brief Get the backend type name for this context data.
+   *
+   * Override in subclasses to identify the backend type.
+   * Used for type checking and debugging.
+   *
+   * @return const char* backend type name (e.g., "cpu", "gpu", "qnn")
+   */
+  virtual const char *getType() const { return "cpu"; }
+
+  /**
+   * @brief Type-safe downcast to a specific ContextData subclass.
+   *
+   * Use this instead of static_pointer_cast to safely access
+   * vendor-specific data. Returns nullptr if the type doesn't match.
+   *
+   * Example:
+   *   auto *qnn = context.getContextData()->as<QNNBackendVar>();
+   *   if (!qnn) throw std::runtime_error("not a QNN context");
+   *
+   * @tparam T target ContextData subclass type
+   * @return T* pointer to the subclass, or nullptr if wrong type
+   */
+  template <typename T> T *as() { return dynamic_cast<T *>(this); }
+
+  template <typename T> const T *as() const {
+    return dynamic_cast<const T *>(this);
+  }
+
   std::shared_ptr<MemAllocator> getMemAllocator() { return mem_allocator; }
 
   void setMemAllocator(std::shared_ptr<MemAllocator> m) { mem_allocator = m; }

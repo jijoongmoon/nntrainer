@@ -102,6 +102,7 @@ struct ComputeOps {
   void (*swiglu_alpha_fp32)(const unsigned int N, float *X, float *Y, float *Z,
                             float alpha);
   void (*tanh_gelu_fp32)(const unsigned int N, const float *X, float *Y);
+  void (*gelu_v2_fp32)(const unsigned int N, const float *X, float *Y);
   void (*tanh_gelu_v2_fp32)(const unsigned int N, const float *X, float *Y);
   void (*tanh_gelu_mul_fp32)(const unsigned int N, float *X, float *Y,
                              float *Z);
@@ -160,13 +161,37 @@ struct ComputeOps {
                          const unsigned int ldc);
 
   // =========================================================================
-  // Quantized weight packing
+  // Quantized weight packing / quantization
   // =========================================================================
   void (*unpack_q4_0)(const void *in_q4_0x, void *out_q4_0, size_t data_size,
                       const unsigned int M, const unsigned int N);
 
   void (*unpack_q4_0x8_transpose16)(const void *src, uint16_t *d_out,
                                     uint16_t *qs_out, int N, int K);
+
+  size_t (*quantize_q4_0)(const float *src, void *dst, int64_t nrow,
+                          int64_t n_per_row, const float *quant_weights);
+
+  void (*dequantize_row_q4_0)(const void *x, float *y, int64_t k);
+
+  void (*repack_q4_0)(void *dst, void *src, size_t data_size,
+                      const unsigned int M, const unsigned int N);
+
+  // =========================================================================
+  // Clamp
+  // =========================================================================
+  void (*clamp_fp32)(const float *input, float *output, size_t length,
+                     float lower_bound, float upper_bound);
+
+  // =========================================================================
+  // Data conversion (int8 → FP32)
+  // =========================================================================
+  void (*scopy_int8_to_fp32_u)(const unsigned int N, const uint8_t *X,
+                               const unsigned int incX, float *Y,
+                               const unsigned int incY);
+  void (*scopy_int8_to_fp32_s)(const unsigned int N, const int8_t *X,
+                               const unsigned int incX, float *Y,
+                               const unsigned int incY);
 
   // =========================================================================
   // GPU-accelerated quantized ops (nullable — nullptr on CPU)
@@ -384,8 +409,17 @@ inline ComputeOps *getComputeOps() {
 }
 
 /**
+ * @brief Initialize the CPU compute backend.
+ *
+ * Sets up architecture-specific resources (e.g., GGML, OpenBLAS threads)
+ * and sets g_compute_ops to the appropriate ops table for the current
+ * CPU architecture. Called once by Engine::add_default_object().
+ */
+void init_backend();
+
+/**
  * @brief Backend-specific ops table getters.
- * Each backend defines its own getter in its .cpp file.
+ * Each backend defines its own getter in its ops_table.cpp file.
  */
 ComputeOps *get_arm_ops();
 ComputeOps *get_x86_ops();
