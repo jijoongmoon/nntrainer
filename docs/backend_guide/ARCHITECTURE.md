@@ -411,3 +411,74 @@ Strategy 2 is recommended because:
 - You only need to implement ops your hardware accelerates
 - New ops added to ComputeOps automatically fall back to CPU
 - No risk of nullptr function pointers for unimplemented ops
+
+---
+
+## Tensor Ops Dispatch (Planned: B-2 Pattern)
+
+### Current Limitation
+
+Currently, tensor operations (`tensor.dot()`, `tensor.add()`, etc.) use the
+**global** `getComputeOps()` which always returns CPU ops. This means that
+even when a GPU layer calls `tensor.dot()`, the CPU implementation runs.
+
+```
+Layer (GPU context) → tensor.dot() → getComputeOps() → g_compute_ops (CPU!)
+```
+
+### Planned Solution: Explicit Ops Parameter (B-2)
+
+Tensor operations will accept an optional `ComputeOps*` parameter with
+`nullptr` default for backward compatibility:
+
+```cpp
+// Current
+Tensor &Tensor::dot(Tensor const &input, Tensor &output,
+                    bool trans = false, bool trans_in = false,
+                    float beta = 0.0f) const;
+
+// Planned
+Tensor &Tensor::dot(Tensor const &input, Tensor &output,
+                    bool trans = false, bool trans_in = false,
+                    float beta = 0.0f,
+                    ComputeOps *ops = nullptr) const;
+// ops == nullptr → getComputeOps() (global CPU fallback)
+// ops != nullptr → use provided ops (GPU, NPU, etc.)
+```
+
+### Why This Approach
+
+| Alternative | Issue |
+|-------------|-------|
+| Tensor stores ops | Shared tensors between CPU/GPU layers — whose ops? |
+| Thread-local | Worker threads in parallel_for don't inherit TLS — silent bugs when code changes |
+| RAII scope | Not thread-safe for parallel layer execution |
+| **Explicit parameter** | **Safe in all cases: sequential, parallel, parallel_for** |
+
+### Usage in Layers
+
+```cpp
+// CPU layer — no change needed (ops=nullptr → CPU fallback)
+void FullyConnectedLayer::forwarding(RunLayerContext &ctx) {
+  input.dot(weight, output);  // uses global CPU ops
+}
+
+// GPU/NPU layer — pass context ops explicitly
+void FullyConnectedLayerGpu::forwarding(RunLayerContext &ctx) {
+  auto *ops = ctx.getComputeOps();  // GPU/NPU ops
+  input.dot(weight, output, false, false, 0.0f, ops);  // uses GPU ops
+}
+```
+
+### Thread Safety with parallel_for
+
+```cpp
+ComputeOps *ops = ctx.getComputeOps();
+ThreadManager::Global().parallel_for(0, N, [=](size_t i) {
+  // ops captured by lambda — correct in ANY thread
+  partial_result.dot(partial_input, partial_weight, false, false, 0.0f, ops);
+});
+```
+
+This is the safest approach because ops flows through the call chain as
+a value, not through global/thread-local state.
