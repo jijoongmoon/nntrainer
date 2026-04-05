@@ -1016,11 +1016,11 @@ Tensor Tensor::dot(Tensor const &input, bool trans, bool trans_in) const {
  * in case of trans is false.
  */
 Tensor &Tensor::dot(Tensor const &input, Tensor &output, bool trans,
-                    bool trans_in, float beta) const {
+                    bool trans_in, float beta, ComputeOps *ops) const {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous. Cannot dot product.";
 
-  itensor_->dot(input, output, trans, trans_in, beta);
+  itensor_->dot(input, output, trans, trans_in, beta, ops);
   return output;
 }
 
