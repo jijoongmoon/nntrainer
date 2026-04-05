@@ -52,6 +52,7 @@
 
 namespace nntrainer {
 
+struct ComputeOps;
 using TensorDim = ml::train::TensorDim;
 using Tformat = ml::train::TensorDim::Format;
 using Tdatatype = ml::train::TensorDim::DataType;
@@ -447,7 +448,8 @@ public:
    * @retval    Calculated Tensor
    */
   virtual Tensor &dot(Tensor const &input, Tensor &output, bool trans,
-                      bool trans_in, float beta) const;
+                      bool trans_in, float beta,
+                      ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Dot Product of Tensors ( equal MxMs )

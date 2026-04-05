@@ -401,7 +401,7 @@ public:
    * trans, bool trans_in, float beta)
    */
   Tensor &dot(Tensor const &input, Tensor &output, bool trans, bool trans_in,
-              float beta) const override;
+              float beta, ComputeOps *ops = nullptr) const override;
 
   void dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
            bool trans, bool trans_in, float beta) const override;
@@ -548,14 +548,14 @@ private:
    * @return Tensor& reference to the output tensor
    */
   Tensor &dotFloat(Tensor const &input, Tensor &output, bool trans,
-                   bool trans_in, float beta) const;
+                   bool trans_in, float beta, ComputeOps *ops) const;
 
   /**
    * @brief Float32.dot(Float16)
    * @return Tensor& reference to the output tensor
    */
   Tensor &dotFloat32Float16(Tensor const &input, Tensor &output, bool trans,
-                            bool trans_in, float beta) const;
+                            bool trans_in, float beta, ComputeOps *ops) const;
 
   /**
    * @brief Float.dot(Q4K/Q6K)

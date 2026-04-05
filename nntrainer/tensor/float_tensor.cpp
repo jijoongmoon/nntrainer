@@ -721,7 +721,7 @@ void FloatTensor::inv_sqrt(Tensor &out) {
 }
 
 Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
-                         bool trans_in, float beta) const {
+                         bool trans_in, float beta, ComputeOps *ops) const {
   /**
    * @note FP32.dot(input);
    * according to the input type, invoked kernels can be varied.
@@ -729,10 +729,10 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   switch (input.getDataType()) {
   /** applying sgemm/sgemv after type casting to FP32 */
   case Tdatatype::FP32:
-    dotFloat(input, output, trans, trans_in, beta);
+    dotFloat(input, output, trans, trans_in, beta, ops);
     break;
   case Tdatatype::FP16:
-    dotFloat32Float16(input, output, trans, trans_in, beta);
+    dotFloat32Float16(input, output, trans, trans_in, beta, ops);
     break;
   /** applying gemm_q4_k / gemm_q6_k / gemm_q4_0 */
   case Tdatatype::Q4_K:
@@ -812,7 +812,7 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
 }
 
 Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
-                              bool trans_in, float beta) const {
+                              bool trans_in, float beta, ComputeOps *ops) const {
   // Comment out with intension to support the calculation wrt. batch and
   // height direction. It supposes to have this->dim as [ BxCxH,W ] and
   // input.dim is [BxCxH,W] as well if (input.dim.rank() > 2) {
@@ -843,7 +843,7 @@ Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
   /// transpose.
   /// For example, there is no case like (1 * K) X (1 * K) while
   /// (1 * K) X (1 * M) can be a case
-  auto *o = getComputeOps();
+  auto *o = ops ? ops : getComputeOps();
   /// case1: (1 * K) X (K * 1)
   if (M == 1 && N == 1) {
     *rdata = o->sdot_fp32(K, data, 1, mdata, 1) +
@@ -874,7 +874,7 @@ Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
 
 Tensor &FloatTensor::dotFloat32Float16(Tensor const &input, Tensor &output,
                                        bool trans, bool trans_in,
-                                       float beta) const {
+                                       float beta, ComputeOps *ops) const {
 /// @todo remove #ifdef ENABLE_FP16
 #ifdef ENABLE_FP16
 
@@ -911,7 +911,7 @@ Tensor &FloatTensor::dotFloat32Float16(Tensor const &input, Tensor &output,
   /// case1: (1 * K) X (K * 1)
   NNTR_THROW_IF((M == 1 && N == 1), std::invalid_argument)
     << "dotQnK does not support trans / trans_in";
-  auto *o = getComputeOps();
+  auto *o = ops ? ops : getComputeOps();
   /// case2: (M * K) X (K * 1)
   if (N == 1) {
     o->shgemv((unsigned int)dim.getStorageOrder(), trans, first_three_flat,

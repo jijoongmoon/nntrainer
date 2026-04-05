@@ -570,7 +570,7 @@ void TensorBase::inv_sqrt(Tensor &out) {
 }
 
 Tensor &TensorBase::dot(Tensor const &input, Tensor &output, bool trans,
-                        bool trans_in, float beta) const {
+                        bool trans_in, float beta, ComputeOps *ops) const {
   throw std::invalid_argument(
     "Tensor::dot() is currently not supported in tensor data type " +
     getStringDataType());
