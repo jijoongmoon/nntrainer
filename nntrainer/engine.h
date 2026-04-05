@@ -34,9 +34,8 @@
 #include <cl_context.h>
 #endif
 
-#if defined(ENABLE_NPU) && ENABLE_NPU == 1
-#include <qnn_context.h>
-#endif
+// QNN context is loaded as a plugin .so (libqnn_context.so)
+// No header dependency needed here.
 
 #include "bs_thread_pool_manager.hpp"
 #include "singleton.h"

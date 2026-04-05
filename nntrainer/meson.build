@@ -78,10 +78,11 @@ nntrainer_common_sources = [
   'mem_allocator.cpp'
 ]
 
-# Add QNN context files if NPU is enabled
+# QNN context is built as a separate plugin .so (libqnn_context.so)
+# and loaded dynamically by Engine. See qnn/jni/meson.build for the
+# shared_library target. The header is still needed for type definitions.
 if get_option('enable-npu')
   nntrainer_headers += meson.current_source_dir() / 'qnn_context.h'
-  nntrainer_common_sources += 'qnn_context.cpp'
 endif
 
 nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'ruy'
