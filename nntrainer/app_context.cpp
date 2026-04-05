@@ -252,10 +252,9 @@ void AppContext::initialize() noexcept {
     ml_loge("registering layer failed due to unknown reason");
   }
 
-  // Set compute ops from the global ops table (set by init_backend())
-  if (auto cd = getContextData(); cd && g_compute_ops) {
-    cd->setComputeOps(g_compute_ops);
-  }
+  // Note: compute ops are set by Engine::add_default_object() after
+  // init_backend(), since AppContext::initialize() runs before init_backend()
+  // due to Singleton lazy init ordering.
 };
 
 void AppContext::add_default_object() {

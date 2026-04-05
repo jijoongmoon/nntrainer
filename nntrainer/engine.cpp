@@ -19,6 +19,7 @@
 
 #include <app_context.h>
 #include <base_properties.h>
+#include <compute_ops.h>
 #include <context.h>
 #include <dynamic_library_loader.h>
 #include <engine.h>
@@ -42,7 +43,15 @@ void Engine::add_default_object() {
 
   auto &app_context = nntrainer::AppContext::Global();
 
-  init_backend(); // initialize cpu backend
+  init_backend(); // initialize cpu backend — sets g_compute_ops
+
+  // Set compute ops on AppContext's ContextData
+  // (AppContext::initialize() runs before init_backend() due to Singleton,
+  //  so g_compute_ops was nullptr at that point)
+  if (auto cd = app_context.getContextData(); cd && g_compute_ops) {
+    cd->setComputeOps(g_compute_ops);
+  }
+
   registerContext("cpu", &app_context);
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
