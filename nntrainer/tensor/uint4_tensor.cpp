@@ -332,12 +332,12 @@ void Uint4QTensor::initialize(Initializer init) {
   initialize();
 }
 
-void Uint4QTensor::copy(const Tensor &from) {
+void Uint4QTensor::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-void Uint4QTensor::copyData(const Tensor &from) {
+void Uint4QTensor::copyData(const Tensor &from, ComputeOps *ops) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -474,7 +474,7 @@ std::vector<unsigned int> Uint4QTensor::argmin() const {
   return result;
 }
 
-float Uint4QTensor::max_abs() const {
+float Uint4QTensor::max_abs(ComputeOps *ops) const {
   uint8_t abs_max_val = 0;
   uint8_t curr_val;
   for (unsigned int idx = 0; idx < size(); ++idx) {

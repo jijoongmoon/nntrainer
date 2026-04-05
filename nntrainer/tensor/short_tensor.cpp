@@ -269,12 +269,12 @@ void ShortTensor::initialize(Initializer init) {
   initialize();
 }
 
-void ShortTensor::copy(const Tensor &from) {
+void ShortTensor::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-void ShortTensor::copyData(const Tensor &from) {
+void ShortTensor::copyData(const Tensor &from, ComputeOps *ops) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -377,7 +377,7 @@ std::vector<unsigned int> ShortTensor::argmin() const {
   return result;
 }
 
-float ShortTensor::max_abs() const {
+float ShortTensor::max_abs(ComputeOps *ops) const {
   const int16_t *data = (int16_t *)getData();
   unsigned int idx;
 

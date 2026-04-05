@@ -521,13 +521,13 @@ public:
    *
    * @note copy can reshape the tensor to match the shape
    */
-  virtual void copy(const Tensor &from) = 0;
+  virtual void copy(const Tensor &from, ComputeOps *ops = nullptr) = 0;
 
   /**
    * @brief     Copy the Tensor
    * @param[in] from Tensor to be copied
    */
-  virtual void copyData(const Tensor &from) = 0;
+  virtual void copyData(const Tensor &from, ComputeOps *ops = nullptr) = 0;
 
   /**
    * @brief      Copy the Tensor
@@ -596,7 +596,7 @@ public:
   /**
    * @copydoc Tensor::max_abs()
    */
-  virtual float max_abs() const = 0;
+  virtual float max_abs(ComputeOps *ops = nullptr) const = 0;
 
   /**
    * @copydoc Tensor::maxValue()
@@ -611,7 +611,8 @@ public:
   /**
    * @copydoc Tensor::transpose(const std::string &direction, Tensor &out)
    */
-  virtual Tensor &transpose(const std::string &direction, Tensor &out) const;
+  virtual Tensor &transpose(const std::string &direction, Tensor &out,
+                            ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     put data of Tensor
@@ -863,7 +864,7 @@ public:
   /**
    * @copydoc Tensor::isValid()
    */
-  virtual bool isValid() const = 0;
+  virtual bool isValid(ComputeOps *ops = nullptr) const = 0;
 
   static constexpr float epsilon = 1e-5f;
 

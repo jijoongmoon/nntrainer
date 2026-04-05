@@ -336,7 +336,8 @@ int HalfTensor::multiply_i(float const &value, ComputeOps *ops) {
   return ML_ERROR_NONE;
 }
 
-Tensor &HalfTensor::multiply(float const &value, Tensor &out) const {
+Tensor &HalfTensor::multiply(float const &value, Tensor &out,
+                             ComputeOps *ops) const {
   auto f = std::bind(std::multiplies<_FP16>(), std::placeholders::_1,
                      static_cast<_FP16>(value));
   apply(f, out);
@@ -425,14 +426,16 @@ Tensor &HalfTensor::add_strided(Tensor const &input, Tensor &output,
 int HalfTensor::add_i_partial(unsigned int len, unsigned int addr_idx,
                               Tensor &m, unsigned int incX, unsigned int incY,
                               const Tensor alphas, unsigned int alpha_idx,
-                               ComputeOps *ops) {
-  getComputeOps()->saxpy_fp16(len, alphas.getValue<_FP16>(alpha_idx), m.getData<_FP16>(), incX,
+                              ComputeOps *ops) {
+  auto *o = ops ? ops : getComputeOps();
+  o->saxpy_fp16(len, alphas.getValue<_FP16>(alpha_idx), m.getData<_FP16>(), incX,
         (_FP16 *)getAddress(addr_idx), incY);
 
   return ML_ERROR_NONE;
 }
 
-Tensor &HalfTensor::add(float const &value, Tensor &output) const {
+Tensor &HalfTensor::add(float const &value, Tensor &output,
+                        ComputeOps *ops) const {
   auto f = std::bind(std::plus<_FP16>(), std::placeholders::_1,
                      static_cast<_FP16>(value));
   apply(f, output);
@@ -457,7 +460,8 @@ Tensor &HalfTensor::subtract(float const &value, Tensor &output) const {
   return output;
 }
 
-void HalfTensor::sum_by_batch(Tensor &output) const {
+void HalfTensor::sum_by_batch(Tensor &output, ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   size_t feat_len = dim.getFeatureLen();
   size_t batch = dim.batch();
 
@@ -466,7 +470,7 @@ void HalfTensor::sum_by_batch(Tensor &output) const {
 
   Tensor ones(1, 1, 1, feat_len, this->getTensorType());
   ones.setValue((_FP16)1.0);
-  getComputeOps()->sgemv_fp16((unsigned int)dim.getStorageOrder(), false, batch, feat_len, 1, data,
+  o->sgemv_fp16((unsigned int)dim.getStorageOrder(), false, batch, feat_len, 1, data,
         feat_len, ones.getData<_FP16>(), 1, 0.0, out_data, 1);
 }
 
@@ -585,11 +589,12 @@ Tensor &HalfTensor::sum(unsigned int axis, Tensor &output, float alpha,
   return output;
 }
 
-float HalfTensor::l2norm() const {
-  return getComputeOps()->snrm2_fp16(size(), (_FP16 *)getData(), 1);
+float HalfTensor::l2norm(ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
+  return o->snrm2_fp16(size(), (_FP16 *)getData(), 1);
 }
 
-Tensor &HalfTensor::abs(Tensor &output) const {
+Tensor &HalfTensor::abs(Tensor &output, ComputeOps *ops) const {
   auto f = [](_FP16 in) {
     return static_cast<_FP16>(std::abs(static_cast<float>(in)));
   };
@@ -628,7 +633,7 @@ void HalfTensor::tan(Tensor &output, float alpha) {
   apply(f, output);
 }
 
-void HalfTensor::inv_sqrt(Tensor &out) {
+void HalfTensor::inv_sqrt(Tensor &out, ComputeOps *ops) {
   if (!contiguous) {
     apply(
       [](_FP16 val) -> _FP16 {
@@ -715,7 +720,9 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
 }
 
 Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
-                           bool trans_in, float beta, Tdatatype dtype) const {
+                           bool trans_in, float beta, Tdatatype dtype,
+                           ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   _FP16 *data = (_FP16 *)getData();
   uint8_t *mdata = input.getData<uint8_t>();
   _FP16 *rdata = output.getData<_FP16>();
@@ -726,7 +733,7 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   N = trans_in ? input.getDim().height() : input.getDim().width();
   switch (dtype) {
   case Tdatatype::Q4_0:
-    getComputeOps()->gemm_q4_0_fp16(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    o->gemm_q4_0_fp16(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
   default:
     throw std::invalid_argument("Error: unsupported datatype");
@@ -986,7 +993,8 @@ void HalfTensor::print(std::ostream &out) const {
   out.copyfmt(init);
 }
 
-Tensor &HalfTensor::divide(float const &value, Tensor &output) const {
+Tensor &HalfTensor::divide(float const &value, Tensor &output,
+                           ComputeOps *ops) const {
   auto f = std::bind(std::divides<_FP16>(), std::placeholders::_1,
                      static_cast<_FP16>(value));
   apply(f, output);
@@ -1003,12 +1011,13 @@ Tensor &HalfTensor::divide(Tensor const &m, Tensor &output, ComputeOps *ops) con
   return output;
 }
 
-void HalfTensor::copy(const Tensor &from) {
+void HalfTensor::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
-  copy(from.getData<_FP16>());
+  copy(from.getData<_FP16>(), ops);
 }
 
-void HalfTensor::copyData(const Tensor &from) {
+void HalfTensor::copyData(const Tensor &from, ComputeOps *ops) {
+  auto *o = ops ? ops : getComputeOps();
   if (!contiguous) {
     throw std::runtime_error("Cannot copy non-contiguous tensor");
   }
@@ -1018,13 +1027,13 @@ void HalfTensor::copyData(const Tensor &from) {
 
   switch (from.getDataType()) {
   case ml::train::TensorDim::DataType::FP32:
-    getComputeOps()->scopy_fp32_to_fp16(size(), from.getData<float>(), 1, (_FP16 *)getData(), 1);
+    o->scopy_fp32_to_fp16(size(), from.getData<float>(), 1, (_FP16 *)getData(), 1);
     break;
   case ml::train::TensorDim::DataType::FP16:
-    copy(from.getData<_FP16>());
+    copy(from.getData<_FP16>(), ops);
     break;
   case ml::train::TensorDim::DataType::QINT8:
-    getComputeOps()->scopy_int8_to_float16_s(from.size(), from.getData<int8_t>(), 1,
+    o->scopy_int8_to_float16_s(from.size(), from.getData<int8_t>(), 1,
                           (_FP16 *)getData(), 1);
     break;
   default:
@@ -1078,9 +1087,10 @@ std::vector<unsigned int> HalfTensor::argmin() const {
   return result;
 }
 
-float HalfTensor::max_abs() const {
+float HalfTensor::max_abs(ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   const _FP16 *data = (_FP16 *)getData();
-  unsigned int idx = getComputeOps()->isamax_fp16(size(), data, 1);
+  unsigned int idx = o->isamax_fp16(size(), data, 1);
   return (float)(*(data + idx));
 }
 
@@ -1095,7 +1105,7 @@ float HalfTensor::minValue() const {
 }
 
 Tensor &HalfTensor::transpose(const std::string &direction,
-                              Tensor &output) const {
+                              Tensor &output, ComputeOps *ops) const {
   unsigned int SL, SI, SJ, SK;
 
   output.reshape(dim.transpose(direction));
@@ -1167,7 +1177,8 @@ Tensor &HalfTensor::transpose(const std::string &direction,
   return output;
 }
 
-void HalfTensor::copy(const void *buf) {
+void HalfTensor::copy(const void *buf, ComputeOps *ops) {
+  auto *o = ops ? ops : getComputeOps();
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -1175,7 +1186,7 @@ void HalfTensor::copy(const void *buf) {
     return;
   }
 
-  getComputeOps()->scopy_fp16(size(), (_FP16 *)buf, 1, (_FP16 *)getData(), 1);
+  o->scopy_fp16(size(), (_FP16 *)buf, 1, (_FP16 *)getData(), 1);
 }
 
 void HalfTensor::apply_broadcast(
@@ -1233,8 +1244,9 @@ void HalfTensor::apply_broadcast_util(
   }
 }
 
-bool HalfTensor::isValid() const {
-  return getComputeOps()->is_valid_fp16(dim.getDataLen(), (_FP16 *)getData());
+bool HalfTensor::isValid(ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
+  return o->is_valid_fp16(dim.getDataLen(), (_FP16 *)getData());
 }
 
 } // namespace nntrainer
