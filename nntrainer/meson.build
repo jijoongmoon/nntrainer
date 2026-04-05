@@ -61,6 +61,10 @@ if get_option('enable-opencl')
   nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
 endif
 
+if get_option('enable-npu')
+  nntrainer_elements += 'qnn'
+endif
+
 foreach elem : nntrainer_elements
   subdir(elem)
   nntrainer_inc += include_directories(elem)
