@@ -135,7 +135,6 @@ RunLayerContext::RunLayerContext(const std::string &name, bool trainable,
                                  const std::vector<Var_Grad *> &out,
                                  const std::vector<Var_Grad *> &t) :
   ct_data(ct_data_),
-  compute_ops(ct_data_ ? ct_data_->getComputeOps() : nullptr),
   loss(l),
   is_inplace(is_inplace_),
   loss_scale(loss_scale_),

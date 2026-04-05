@@ -914,16 +914,13 @@ public:
    *
    * Returns the ComputeOps function pointer table associated with the
    * compute engine (CPU/GPU/NPU) that this layer belongs to.
+   * Accessed through ContextData which is shared from the Context.
    *
    * @return ComputeOps* pointer to the ops table, or nullptr
    */
-  struct ComputeOps *getComputeOps() const { return compute_ops; }
-
-  /**
-   * @brief Set the compute ops table
-   * @param ops pointer to the ops table
-   */
-  void setComputeOps(struct ComputeOps *ops) { compute_ops = ops; }
+  struct ComputeOps *getComputeOps() const {
+    return ct_data ? ct_data->getComputeOps() : nullptr;
+  }
 
   /**
    * @brief   get name by the layer
@@ -1002,9 +999,9 @@ public:
 
 private:
   std::tuple<props::Name, props::Trainable> props; /**< props of the layer */
-  std::shared_ptr<ContextData> ct_data;
-  struct ComputeOps *compute_ops =
-    nullptr;          /**< compute ops table for this context */
+  std::shared_ptr<ContextData> ct_data; /**< context data from Context (holds
+                                             ComputeOps, MemAllocator, and
+                                             vendor-specific data via subclass) */
   float loss;         /**< loss of the layer */
   bool is_inplace;    /**< if the layer is expected to run in-place */
   float loss_scale;   /**< loss_scale of the layer */
