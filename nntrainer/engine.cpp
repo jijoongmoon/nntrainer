@@ -41,17 +41,9 @@ void Engine::add_default_object() {
   /// @note all layers should be added to the app_context to guarantee that
   /// createLayer/createOptimizer class is created
 
+  // AppContext::Global() triggers initialize() which calls init_backend()
+  // and sets compute ops on ContextData — same pattern as ClContext
   auto &app_context = nntrainer::AppContext::Global();
-
-  init_backend(); // initialize cpu backend — sets g_compute_ops
-
-  // Set compute ops on AppContext's ContextData
-  // (AppContext::initialize() runs before init_backend() due to Singleton,
-  //  so g_compute_ops was nullptr at that point)
-  if (auto cd = app_context.getContextData(); cd && g_compute_ops) {
-    cd->setComputeOps(g_compute_ops);
-  }
-
   registerContext("cpu", &app_context);
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1

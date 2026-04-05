@@ -12,7 +12,6 @@
 #include <iostream>
 
 #include <compute_ops.h>
-#include <cpu_backend.h>
 #include <int4_tensor.h>
 #include <tensor.h>
 

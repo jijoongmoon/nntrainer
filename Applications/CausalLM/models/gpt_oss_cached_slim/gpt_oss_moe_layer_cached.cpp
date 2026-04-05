@@ -21,6 +21,7 @@
  *
  */
 
+#include <cpu_backend.h>
 #include <acti_func.h>
 #include <algorithm>
 #include <cmath>

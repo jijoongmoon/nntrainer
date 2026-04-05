@@ -102,6 +102,7 @@ struct ComputeOps {
   void (*swiglu_alpha_fp32)(const unsigned int N, float *X, float *Y, float *Z,
                             float alpha);
   void (*tanh_gelu_fp32)(const unsigned int N, const float *X, float *Y);
+  void (*gelu_v2_fp32)(const unsigned int N, const float *X, float *Y);
   void (*tanh_gelu_v2_fp32)(const unsigned int N, const float *X, float *Y);
   void (*tanh_gelu_mul_fp32)(const unsigned int N, float *X, float *Y,
                              float *Z);
@@ -408,8 +409,17 @@ inline ComputeOps *getComputeOps() {
 }
 
 /**
+ * @brief Initialize the CPU compute backend.
+ *
+ * Sets up architecture-specific resources (e.g., GGML, OpenBLAS threads)
+ * and sets g_compute_ops to the appropriate ops table for the current
+ * CPU architecture. Called once by Engine::add_default_object().
+ */
+void init_backend();
+
+/**
  * @brief Backend-specific ops table getters.
- * Each backend defines its own getter in its .cpp file.
+ * Each backend defines its own getter in its ops_table.cpp file.
  */
 ComputeOps *get_arm_ops();
 ComputeOps *get_x86_ops();

@@ -242,7 +242,15 @@ std::once_flag global_app_context_init_flag;
 
 void AppContext::initialize() noexcept {
   try {
+    // Initialize CPU backend first — sets g_compute_ops
+    init_backend();
+
     setMemAllocator(std::make_shared<MemAllocator>());
+
+    // Set compute ops on our ContextData
+    if (auto cd = getContextData(); cd && g_compute_ops) {
+      cd->setComputeOps(g_compute_ops);
+    }
 
     add_default_object();
     add_extension_object();
@@ -251,10 +259,6 @@ void AppContext::initialize() noexcept {
   } catch (...) {
     ml_loge("registering layer failed due to unknown reason");
   }
-
-  // Note: compute ops are set by Engine::add_default_object() after
-  // init_backend(), since AppContext::initialize() runs before init_backend()
-  // due to Singleton lazy init ordering.
 };
 
 void AppContext::add_default_object() {

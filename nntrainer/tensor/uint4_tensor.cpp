@@ -13,7 +13,6 @@
 #include <iostream>
 
 #include <compute_ops.h>
-#include <cpu_backend.h>
 #include <tensor.h>
 #include <uint4_tensor.h>
 

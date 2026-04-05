@@ -93,6 +93,9 @@ static void swiglu_alpha_fp32(const unsigned int N, float *X, float *Y,
 static void tanh_gelu_fp32(const unsigned int N, const float *X, float *Y) {
   nntrainer::tanh_gelu(N, X, Y);
 }
+static void gelu_v2_fp32(const unsigned int N, const float *X, float *Y) {
+  nntrainer::gelu_v2(N, X, Y);
+}
 static void tanh_gelu_v2_fp32(const unsigned int N, const float *X, float *Y) {
   nntrainer::tanh_gelu_v2(N, X, Y);
 }
@@ -192,6 +195,7 @@ static ComputeOps x86_ops = {
   .swiglu_fp32 = x86_backend::swiglu_fp32,
   .swiglu_alpha_fp32 = x86_backend::swiglu_alpha_fp32,
   .tanh_gelu_fp32 = x86_backend::tanh_gelu_fp32,
+  .gelu_v2_fp32 = x86_backend::gelu_v2_fp32,
   .tanh_gelu_v2_fp32 = x86_backend::tanh_gelu_v2_fp32,
   .tanh_gelu_mul_fp32 = x86_backend::tanh_gelu_mul_fp32,
   .tanh_gelu_v2_mul_fp32 = x86_backend::tanh_gelu_v2_mul_fp32,

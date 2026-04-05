@@ -23,7 +23,7 @@
 
 #include <cstddef>
 
-#include <cpu_backend.h>
+#include <compute_ops.h>
 #include <nntrainer_log.h>
 #include <tensor_base.h>
 

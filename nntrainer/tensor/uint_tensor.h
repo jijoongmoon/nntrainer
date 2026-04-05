@@ -13,9 +13,9 @@
 #define __UINT_TENSOR_H__
 #ifdef __cplusplus
 
-#include <cpu_backend.h>
 #include <iomanip>
 #include <iostream>
+#include <cpu_backend.h>
 #include <tensor.h>
 #include <tensor_base.h>
 

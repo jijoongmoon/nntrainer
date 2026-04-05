@@ -481,7 +481,6 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(
 /**
  * @brief Initialization of ggml backend
  */
-void init_backend();
 
 /**
  * @copydoc unpack_q4_0x8_transpose16 in cpu_backend.h
