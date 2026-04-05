@@ -586,7 +586,7 @@ Tensor &HalfTensor::sum(unsigned int axis, Tensor &output, float alpha,
 }
 
 float HalfTensor::l2norm() const {
-  return snrm2(size(), (_FP16 *)getData(), 1);
+  return getComputeOps()->snrm2_fp16(size(), (_FP16 *)getData(), 1);
 }
 
 Tensor &HalfTensor::abs(Tensor &output) const {
@@ -674,7 +674,7 @@ Tensor &HalfTensor::dotHalf(Tensor const &input, Tensor &output, bool trans,
   /// (1 * K) X (1 * M) can be a case
   /// case1: (1 * K) X (K * 1)
   if (M == 1 && N == 1) {
-    *rdata = sdot(K, data, 1, mdata, 1) +
+    *rdata = getComputeOps()->sdot_fp16(K, data, 1, mdata, 1) +
              ((0.0f == beta) ? static_cast<_FP16>(0.0f)
                              : static_cast<_FP16>(beta) * *rdata);
   }
@@ -1080,7 +1080,7 @@ std::vector<unsigned int> HalfTensor::argmin() const {
 
 float HalfTensor::max_abs() const {
   const _FP16 *data = (_FP16 *)getData();
-  unsigned int idx = isamax(size(), data, 1);
+  unsigned int idx = getComputeOps()->isamax_fp16(size(), data, 1);
   return (float)(*(data + idx));
 }
 
@@ -1234,7 +1234,7 @@ void HalfTensor::apply_broadcast_util(
 }
 
 bool HalfTensor::isValid() const {
-  return is_valid(dim.getDataLen(), (_FP16 *)getData());
+  return getComputeOps()->is_valid_fp16(dim.getDataLen(), (_FP16 *)getData());
 }
 
 } // namespace nntrainer
