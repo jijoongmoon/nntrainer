@@ -21,6 +21,7 @@
 #include <iniparser.h>
 
 #include <app_context.h>
+#include <compute_ops.h>
 #include <layer.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -252,6 +253,11 @@ void AppContext::initialize() noexcept {
     ml_loge("registering layers failed!!, reason: %s", e.what());
   } catch (...) {
     ml_loge("registering layer failed due to unknown reason");
+  }
+
+  // Set compute ops from the global ops table (set by init_backend())
+  if (auto cd = getContextData(); cd && g_compute_ops) {
+    cd->setComputeOps(g_compute_ops);
   }
 };
 
