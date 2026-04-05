@@ -78,6 +78,12 @@ nntrainer_common_sources = [
   'mem_allocator.cpp'
 ]
 
+# Add QNN context files if NPU is enabled
+if get_option('enable-npu')
+  nntrainer_headers += meson.current_source_dir() / 'qnn_context.h'
+  nntrainer_common_sources += 'qnn_context.cpp'
+endif
+
 nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'ruy'
 
 if get_option('enable-opencl')

@@ -38,6 +38,8 @@
 #include <nntrainer_log.h>
 #include <qnn_context_var.h>
 
+#include "singleton.h"
+
 using namespace qnn;
 using namespace qnn::tools;
 
@@ -50,7 +52,7 @@ extern std::mutex qnn_factory_mutex;
  * @brief QNN support for app context
  */
 
-class QNNContext : public Context {
+class QNNContext : public Context, public Singleton<QNNContext> {
 
 public:
   /**
@@ -73,14 +75,6 @@ public:
       pal::dynamicloading::dlClose(qnn_data->m_backendLibraryHandle);
     }
   }
-
-  /**
-   *
-   * @brief Get Global qnn context.
-   *
-   * @return QNNContext&
-   */
-  QNNContext &Global();
 
   int init() override;
 
@@ -213,6 +207,8 @@ public:
   }
 
 private:
+  void initialize() noexcept override;
+
   // flag to check predefined qnn context is resistered
   bool qnn_initialized = false;
 
