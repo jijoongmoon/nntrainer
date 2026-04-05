@@ -524,7 +524,7 @@ private:
    * @brief dotHalf
    */
   Tensor &dotHalf(Tensor const &input, Tensor &output, bool trans,
-                  bool trans_in, float beta) const;
+                  bool trans_in, float beta, ComputeOps *ops = nullptr) const;
 
   /**
    * @brief dotQnK
