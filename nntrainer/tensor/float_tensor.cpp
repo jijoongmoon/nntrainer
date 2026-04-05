@@ -643,7 +643,7 @@ Tensor &FloatTensor::abs(Tensor &output) const {
 }
 
 float FloatTensor::l2norm() const {
-  return snrm2(size(), (float *)getData(), 1);
+  return getComputeOps()->snrm2_fp32(size(), (float *)getData(), 1);
 }
 
 void FloatTensor::normalization_i(unsigned int dim, float p, float epsilon) {
@@ -1193,7 +1193,7 @@ void FloatTensor::topK(unsigned int k, void *output_data,
 
 float FloatTensor::max_abs() const {
   const float *data = (float *)getData();
-  unsigned int idx = isamax(size(), data, 1);
+  unsigned int idx = getComputeOps()->isamax_fp32(size(), data, 1);
   return *(data + idx);
 }
 
@@ -1606,7 +1606,7 @@ void FloatTensor::apply_broadcast(
 }
 
 bool FloatTensor::isValid() const {
-  return is_valid(dim.getDataLen(), (float *)getData());
+  return getComputeOps()->is_valid_fp32(dim.getDataLen(), (float *)getData());
 }
 
 } // namespace nntrainer
