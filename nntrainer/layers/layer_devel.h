@@ -29,6 +29,7 @@
 
 #include <base_properties.h>
 #include <common.h>
+#include <compute_ops.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 
@@ -402,10 +403,11 @@ public:
                                     {Tformat::NCHW, dtype});
                 std::vector<char> tmp(quant_weight.size());
 
-                quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
-                              nullptr);
-                repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
-                            quant_weight.size(), N, K);
+                getComputeOps()->quantize_q4_0(weight_t.getData<float>(),
+                                               tmp.data(), N, K, nullptr);
+                getComputeOps()->repack_q4_0(quant_weight.getData<uint8_t>(),
+                                             tmp.data(),
+                                             quant_weight.size(), N, K);
                 quant_weight.save(file);
               }
             } else {

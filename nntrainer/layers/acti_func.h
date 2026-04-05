@@ -18,7 +18,6 @@
 
 #include <common_properties.h>
 #include <compute_ops.h>
-#include <cpu_backend.h>
 
 #if defined(_WIN32)
 #define _USE_MATH_DEFINES
@@ -455,8 +454,8 @@ public:
    */
   template <typename T = float>
   static Tensor &gelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
-                       t_out.getData<float>());
+    getComputeOps()->gelu_v2_fp32(t_in.size(), t_in.getData<float>(),
+                                  t_out.getData<float>());
     return t_out;
   }
 
@@ -496,8 +495,8 @@ public:
    */
   template <typename T = float>
   static Tensor &tanhGelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
-                         t_out.getData<float>());
+    getComputeOps()->tanh_gelu_fp32(t_in.size(), t_in.getData<float>(),
+                                    t_out.getData<float>());
     return t_out;
   }
 

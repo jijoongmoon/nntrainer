@@ -17,7 +17,6 @@
 #include <string>
 
 #include <channel_shuffle.h>
-#include <cpu_backend.h>
 #include <layer_context.h>
 #include <lazy_tensor.h>
 #include <thread_manager.h>

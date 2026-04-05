@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * @file   example_npu_context.cpp
- * @brief  Example: NPU backend implementation for nntrainer.
+ * @brief  Example NPU backend — complete implementation.
  *
- * This file shows the 3 essential parts of a new backend:
- *   Part 1: ComputeOps table — your accelerated function implementations
- *   Part 2: Context class — lifecycle and registration
- *   Part 3: Plugin entry point — for .so dynamic loading
+ * This shows the 4 essential parts of a new backend:
+ *   Part 1: ComputeOps wrappers (vendor_backend:: namespace)
+ *   Part 2: ComputeOps table (maps wrappers to ops table)
+ *   Part 3: Context initialization (set ops + vendor data)
+ *   Part 4: Plugin entry point (for .so dynamic loading)
  */
 
 #include "example_npu_context.h"
 
 #include <compute_ops.h>
 #include <context_data.h>
-#include <cpu_backend.h> // for CPU fallback functions
+#include <cpu_backend.h>
 #include <mem_allocator.h>
 
 #include <cstdio>
@@ -21,99 +22,209 @@
 namespace example_npu {
 
 // =========================================================================
-// Part 1: ComputeOps Table
+// Part 1: ComputeOps wrappers
 // =========================================================================
 //
-// Define function pointers for every operation your NPU accelerates.
-// For operations your NPU doesn't support, set the pointer to:
-//   a) nullptr  — causes runtime error if called (strict)
-//   b) CPU fallback function — seamless fallback (recommended)
+// Each wrapper adapts the vendor's implementation to the ComputeOps
+// function pointer signature. For ops your NPU accelerates, call your
+// vendor SDK. For others, fall back to CPU.
 //
-// The ops table uses BLAS-standard signatures. If your hardware has
-// different calling conventions, write thin wrapper functions.
+// This follows the SAME pattern as:
+//   - arm_backend::  in arm_ops_table.cpp
+//   - x86_backend::  in x86_ops_table.cpp
+//   - cl_sgemm_fp32  in cl_compute_ops.cpp
 //
 
-/// Example: NPU-accelerated SGEMM (replace with real implementation)
-static void npu_sgemm_fp32(const unsigned int TStorageOrder, bool TransA,
-                            bool TransB, const unsigned int M,
-                            const unsigned int N, const unsigned int K,
-                            const float alpha, const float *A,
-                            const unsigned int lda, const float *B,
-                            const unsigned int ldb, const float beta, float *C,
-                            const unsigned int ldc) {
-  // In a real backend, this would call your NPU's GEMM API.
-  // Example: npu_driver_sgemm(handle, TransA, TransB, M, N, K, ...);
+namespace npu_backend {
 
-  // For this example, fall back to CPU implementation:
+/// NPU-accelerated SGEMM (replace with real NPU SDK call)
+static void sgemm_fp32(const unsigned int TStorageOrder, bool TransA,
+                        bool TransB, const unsigned int M, const unsigned int N,
+                        const unsigned int K, const float alpha, const float *A,
+                        const unsigned int lda, const float *B,
+                        const unsigned int ldb, const float beta, float *C,
+                        const unsigned int ldc) {
+  // In production: npu_driver_sgemm(handle, TransA, TransB, M, N, K, ...);
+  // For this example: fall back to CPU
   nntrainer::sgemm(TStorageOrder, TransA, TransB, M, N, K, alpha, A, lda, B,
                    ldb, beta, C, ldc);
-
-  // Optionally log that NPU path was taken:
-  // printf("[NPU] sgemm %ux%ux%u dispatched\n", M, N, K);
 }
 
-/// Example: NPU-accelerated SGEMV
-static void npu_sgemv_fp32(const unsigned int TStorageOrder, bool TransA,
-                            const unsigned int M, const unsigned int N,
-                            const float alpha, const float *A,
-                            const unsigned int lda, const float *X,
-                            const unsigned int incX, const float beta,
-                            float *Y, const unsigned int incY) {
-  // Real backend: call NPU GEMV API
+/// NPU-accelerated SGEMV
+static void sgemv_fp32(const unsigned int TStorageOrder, bool TransA,
+                        const unsigned int M, const unsigned int N,
+                        const float alpha, const float *A,
+                        const unsigned int lda, const float *X,
+                        const unsigned int incX, const float beta, float *Y,
+                        const unsigned int incY) {
   nntrainer::sgemv(TStorageOrder, TransA, M, N, alpha, A, lda, X, incX, beta,
                    Y, incY);
 }
 
-// For ops not accelerated by the NPU, use CPU functions directly.
-// The `using namespace nntrainer;` below makes this convenient.
+// For ops NOT accelerated by NPU, use CPU functions directly
+static float sdot_fp32(const unsigned int N, const float *X,
+                        const unsigned int iX, const float *Y,
+                        const unsigned int iY) {
+  return nntrainer::sdot(N, X, iX, Y, iY);
+}
+static void saxpy_fp32(const unsigned int N, const float a, const float *X,
+                        const unsigned int iX, float *Y,
+                        const unsigned int iY) {
+  nntrainer::saxpy(N, a, X, iX, Y, iY);
+}
+static void scopy_fp32(const unsigned int N, const float *X,
+                        const unsigned int iX, float *Y,
+                        const unsigned int iY) {
+  nntrainer::scopy(N, X, iX, Y, iY);
+}
+static void sscal_fp32(const unsigned int N, const float a, float *X,
+                        const unsigned int iX) {
+  nntrainer::sscal(N, a, X, iX);
+}
+static float snrm2_fp32(const unsigned int N, const float *X,
+                         const unsigned int iX) {
+  return nntrainer::snrm2(N, X, iX);
+}
+static unsigned int isamax_fp32(const unsigned int N, const float *X,
+                                 const unsigned int iX) {
+  return nntrainer::isamax(N, X, iX);
+}
+static void ele_mul_fp32(const unsigned int N, const float *X, const float *Y,
+                          float *Z, float a, float b, unsigned int is,
+                          unsigned int os) {
+  nntrainer::ele_mul(N, X, Y, Z, a, b, is, os);
+}
+static void ele_add_fp32(const unsigned int N, const float *X, const float *Y,
+                          float *Z, float a, float b, unsigned int is,
+                          unsigned int os) {
+  nntrainer::ele_add(N, X, Y, Z, a, b, is, os);
+}
+static void ele_sub_fp32(const unsigned int N, const float *X, const float *Y,
+                          float *Z, float a, float b, unsigned int is,
+                          unsigned int os) {
+  nntrainer::ele_sub(N, X, Y, Z, a, b, is, os);
+}
+static void ele_div_fp32(const unsigned int N, const float *X, const float *Y,
+                          float *Z, float a, float b, unsigned int is,
+                          unsigned int os) {
+  nntrainer::ele_div(N, X, Y, Z, a, b, is, os);
+}
+static void swiglu_fp32(const unsigned int N, float *X, float *Y, float *Z) {
+  nntrainer::swiglu(N, X, Y, Z);
+}
+static void swiglu_alpha_fp32(const unsigned int N, float *X, float *Y,
+                               float *Z, float alpha) {
+  nntrainer::swiglu(N, X, Y, Z, alpha);
+}
+static void tanh_gelu_fp32(const unsigned int N, const float *X, float *Y) {
+  nntrainer::tanh_gelu(N, X, Y);
+}
+static void gelu_v2_fp32(const unsigned int N, const float *X, float *Y) {
+  nntrainer::gelu_v2(N, X, Y);
+}
+static void tanh_gelu_v2_fp32(const unsigned int N, const float *X, float *Y) {
+  nntrainer::tanh_gelu_v2(N, X, Y);
+}
+static void tanh_gelu_mul_fp32(const unsigned int N, float *X, float *Y,
+                                float *Z) {
+  nntrainer::tanh_gelu_mul(N, X, Y, Z);
+}
+static void tanh_gelu_v2_mul_fp32(const unsigned int N, float *X, float *Y,
+                                   float *Z) {
+  nntrainer::tanh_gelu_v2_mul(N, X, Y, Z);
+}
+static float max_val_fp32(const unsigned int N, float *X) {
+  return nntrainer::max_val(N, X);
+}
+static void softmax_fp32(const unsigned int N, float *X, float *Y) {
+  nntrainer::softmax(N, X, Y);
+}
+static bool is_valid_fp32(const unsigned int N, const float *X) {
+  return nntrainer::is_valid(N, X);
+}
+static void transpose_matrix_fp32(const unsigned int M, const unsigned int N,
+                                   const float *s, unsigned int lds, float *d,
+                                   unsigned int ldd) {
+  nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
+}
+static void gemm_q4_0_fp32(const unsigned int M, const unsigned int N,
+                             const unsigned int K, const float *A,
+                             const unsigned int lda, const void *B,
+                             const unsigned int ldb, float *C,
+                             const unsigned int ldc) {
+  nntrainer::gemm_q4_0(M, N, K, A, lda, B, ldb, C, ldc);
+}
+static void gemm_q4_K_fp32(const unsigned int M, const unsigned int N,
+                             const unsigned int K, const float *A,
+                             const unsigned int lda, const void *B,
+                             const unsigned int ldb, float *C,
+                             const unsigned int ldc) {
+  nntrainer::gemm_q4_K(M, N, K, A, lda, B, ldb, C, ldc);
+}
+static void gemm_q6_K_fp32(const unsigned int M, const unsigned int N,
+                             const unsigned int K, const float *A,
+                             const unsigned int lda, const void *B,
+                             const unsigned int ldb, float *C,
+                             const unsigned int ldc) {
+  nntrainer::gemm_q6_K(M, N, K, A, lda, B, ldb, C, ldc);
+}
+static size_t quantize_q4_0_impl(const float *src, void *dst, int64_t nrow,
+                                  int64_t n_per_row, const float *qw) {
+  return nntrainer::quantize_q4_0(src, dst, nrow, n_per_row, qw);
+}
+static void dequantize_row_q4_0_impl(const void *x, float *y, int64_t k) {
+  nntrainer::dequantize_row_q4_0(x, y, k);
+}
+static void repack_q4_0_impl(void *dst, void *src, size_t ds,
+                              const unsigned int M, const unsigned int N) {
+  nntrainer::repack_q4_0(dst, src, ds, M, N);
+}
+static void clamp_fp32(const float *in, float *out, size_t len, float lb,
+                        float ub) {
+  nntrainer::clamp(in, out, len, lb, ub);
+}
+static void scopy_int8_to_fp32_u(const unsigned int N, const uint8_t *X,
+                                  const unsigned int iX, float *Y,
+                                  const unsigned int iY) {
+  nntrainer::scopy_int8_to_float32(N, X, iX, Y, iY);
+}
+static void scopy_int8_to_fp32_s(const unsigned int N, const int8_t *X,
+                                  const unsigned int iX, float *Y,
+                                  const unsigned int iY) {
+  nntrainer::scopy_int8_to_float32(N, X, iX, Y, iY);
+}
 
-/**
- * @brief The NPU ops table.
- *
- * Strategy: accelerate GEMM/GEMV on NPU, fall back to CPU for everything else.
- * This is the most common pattern — NPUs typically accelerate matrix math
- * but not element-wise or activation functions.
- */
+} // namespace npu_backend
+
+// =========================================================================
+// Part 2: ComputeOps table
+// =========================================================================
+
 static nntrainer::ComputeOps npu_ops = {
-  // ── NPU-accelerated operations ────────────────────────────────────
-  .sgemm_fp32 = npu_sgemm_fp32,
-  .sgemv_fp32 = npu_sgemv_fp32,
-
-  // ── CPU fallback for everything else ──────────────────────────────
-  .sdot_fp32 = nntrainer::sdot,
-  .saxpy_fp32 = nntrainer::saxpy,
-  .scopy_fp32 =
-    static_cast<void (*)(const unsigned int, const float *, const unsigned int,
-                         float *, const unsigned int)>(nntrainer::scopy),
-  .sscal_fp32 = nntrainer::sscal,
-  .snrm2_fp32 = nntrainer::snrm2,
-  .isamax_fp32 = nntrainer::isamax,
-
-  // FP32 element-wise — CPU fallback
-  .ele_mul_fp32 = nntrainer::ele_mul,
-  .ele_add_fp32 = nntrainer::ele_add,
-  .ele_sub_fp32 = nntrainer::ele_sub,
-  .ele_div_fp32 = nntrainer::ele_div,
-
-  // FP32 activation / special — CPU fallback
-  .swiglu_fp32 =
-    static_cast<void (*)(const unsigned int, float *, float *, float *)>(
-      nntrainer::swiglu),
-  .swiglu_alpha_fp32 =
-    static_cast<void (*)(const unsigned int, float *, float *, float *, float)>(
-      nntrainer::swiglu),
-  .tanh_gelu_fp32 = nntrainer::tanh_gelu,
-  .tanh_gelu_v2_fp32 = nntrainer::tanh_gelu_v2,
-  .tanh_gelu_mul_fp32 = nntrainer::tanh_gelu_mul,
-  .tanh_gelu_v2_mul_fp32 = nntrainer::tanh_gelu_v2_mul,
-  .max_val_fp32 = nntrainer::max_val,
-  .softmax_fp32 = nntrainer::softmax,
-  .is_valid_fp32 = nntrainer::is_valid,
-
-  // FP32 matrix ops — CPU fallback
-  .transpose_matrix_fp32 = nntrainer::transpose_matrix,
-
-  // FP32 data conversion — CPU fallback
+  // ── NPU-accelerated (or CPU fallback) ──
+  .sgemm_fp32 = npu_backend::sgemm_fp32,
+  .sgemv_fp32 = npu_backend::sgemv_fp32,
+  .sdot_fp32 = npu_backend::sdot_fp32,
+  .saxpy_fp32 = npu_backend::saxpy_fp32,
+  .scopy_fp32 = npu_backend::scopy_fp32,
+  .sscal_fp32 = npu_backend::sscal_fp32,
+  .snrm2_fp32 = npu_backend::snrm2_fp32,
+  .isamax_fp32 = npu_backend::isamax_fp32,
+  .ele_mul_fp32 = npu_backend::ele_mul_fp32,
+  .ele_add_fp32 = npu_backend::ele_add_fp32,
+  .ele_sub_fp32 = npu_backend::ele_sub_fp32,
+  .ele_div_fp32 = npu_backend::ele_div_fp32,
+  .swiglu_fp32 = npu_backend::swiglu_fp32,
+  .swiglu_alpha_fp32 = npu_backend::swiglu_alpha_fp32,
+  .tanh_gelu_fp32 = npu_backend::tanh_gelu_fp32,
+  .gelu_v2_fp32 = npu_backend::gelu_v2_fp32,
+  .tanh_gelu_v2_fp32 = npu_backend::tanh_gelu_v2_fp32,
+  .tanh_gelu_mul_fp32 = npu_backend::tanh_gelu_mul_fp32,
+  .tanh_gelu_v2_mul_fp32 = npu_backend::tanh_gelu_v2_mul_fp32,
+  .max_val_fp32 = npu_backend::max_val_fp32,
+  .softmax_fp32 = npu_backend::softmax_fp32,
+  .is_valid_fp32 = npu_backend::is_valid_fp32,
+  .transpose_matrix_fp32 = npu_backend::transpose_matrix_fp32,
   .scopy_u8 = nntrainer::scopy,
   .scopy_s8 = nntrainer::scopy,
   .scopy_int4_to_float32 = nntrainer::scopy_int4_to_float32,
@@ -124,128 +235,126 @@ static nntrainer::ComputeOps npu_ops = {
   .copy_fp32_u8 = nntrainer::copy_fp32_u8,
   .copy_fp32_s16 = nntrainer::copy_fp32_s16,
   .copy_fp32_s8 = nntrainer::copy_fp32_s8,
-
-  // Quantized GEMM — CPU fallback
-  .gemm_q4_0_fp32 = nntrainer::gemm_q4_0<float>,
-  .gemm_q4_K_fp32 = nntrainer::gemm_q4_K,
-  .gemm_q6_K_fp32 = nntrainer::gemm_q6_K<float>,
-
-  // Quantized weight packing — CPU fallback
+  .gemm_q4_0_fp32 = npu_backend::gemm_q4_0_fp32,
+  .gemm_q4_K_fp32 = npu_backend::gemm_q4_K_fp32,
+  .gemm_q6_K_fp32 = npu_backend::gemm_q6_K_fp32,
   .unpack_q4_0 = nntrainer::unpack_q4_0,
   .unpack_q4_0x8_transpose16 = nntrainer::unpack_q4_0x8_transpose16,
-
-  // GPU-accelerated batch ops — not available on NPU example
+  .quantize_q4_0 = npu_backend::quantize_q4_0_impl,
+  .dequantize_row_q4_0 = npu_backend::dequantize_row_q4_0_impl,
+  .repack_q4_0 = npu_backend::repack_q4_0_impl,
+  .clamp_fp32 = npu_backend::clamp_fp32,
+  .scopy_int8_to_fp32_u = npu_backend::scopy_int8_to_fp32_u,
+  .scopy_int8_to_fp32_s = npu_backend::scopy_int8_to_fp32_s,
+  // GPU-accelerated batch ops — not available on this NPU
   .gemm_q4_0_batch_fp32 = nullptr,
   .gemm_q4_0_accel_fp32 = nullptr,
   .gemv_int4_batch_fp32 = nullptr,
   .gemm_int4_batch_fp32 = nullptr,
   .gemv_int4_accel_fp32 = nullptr,
   .sgemm_int4_accel_fp32 = nullptr,
-
-  // FP16 — omitted for brevity (set all to nullptr or CPU fallback)
-  // In a real backend, fill these in if your NPU supports FP16.
 #ifdef ENABLE_FP16
-  .sgemm_fp16 = nullptr,
-  .sgemv_fp16 = nullptr,
-  .sdot_fp16 = nullptr,
-  .saxpy_fp16 = nullptr,
-  .scopy_fp16 = nullptr,
-  .scopy_fp32_to_fp16 = nullptr,
-  .scopy_fp16_to_fp32 = nullptr,
-  .sscal_fp16 = nullptr,
-  .snrm2_fp16 = nullptr,
-  .isamax_fp16 = nullptr,
-  .ele_mul_fp16 = nullptr,
-  .ele_add_fp16 = nullptr,
-  .ele_sub_fp16 = nullptr,
-  .ele_div_fp16 = nullptr,
-  .swiglu_fp16 = nullptr,
-  .max_val_fp16 = nullptr,
-  .softmax_fp16 = nullptr,
-  .is_valid_fp16 = nullptr,
-  .inv_sqrt_inplace_fp16 = nullptr,
-  .transpose_matrix_fp16 = nullptr,
+  // FP16 — set to nullptr (fill in if your NPU supports FP16)
+  .sgemm_fp16 = nullptr, .sgemv_fp16 = nullptr, .sdot_fp16 = nullptr,
+  .saxpy_fp16 = nullptr, .scopy_fp16 = nullptr,
+  .scopy_fp32_to_fp16 = nullptr, .scopy_fp16_to_fp32 = nullptr,
+  .sscal_fp16 = nullptr, .snrm2_fp16 = nullptr, .isamax_fp16 = nullptr,
+  .ele_mul_fp16 = nullptr, .ele_add_fp16 = nullptr,
+  .ele_sub_fp16 = nullptr, .ele_div_fp16 = nullptr,
+  .swiglu_fp16 = nullptr, .max_val_fp16 = nullptr,
+  .softmax_fp16 = nullptr, .is_valid_fp16 = nullptr,
+  .inv_sqrt_inplace_fp16 = nullptr, .transpose_matrix_fp16 = nullptr,
   .scopy_int4_to_float16 = nullptr,
-  .scopy_int8_to_float16_u = nullptr,
-  .scopy_int8_to_float16_s = nullptr,
-  .shgemm = nullptr,
-  .shgemv = nullptr,
-  .hsgemm = nullptr,
-  .hsgemv = nullptr,
-  .gemm_q4_0_fp16 = nullptr,
-  .gemm_q6_K_fp16 = nullptr,
+  .scopy_int8_to_float16_u = nullptr, .scopy_int8_to_float16_s = nullptr,
+  .shgemm = nullptr, .shgemv = nullptr,
+  .hsgemm = nullptr, .hsgemv = nullptr,
+  .gemm_q4_0_fp16 = nullptr, .gemm_q6_K_fp16 = nullptr,
   .compute_rotary_embedding_value = nullptr,
 #endif
 };
 
-nntrainer::ComputeOps *get_npu_ops() { return &npu_ops; }
-
 // =========================================================================
-// Part 2: Context Class Implementation
+// Part 3: Context initialization
 // =========================================================================
-
-ExampleNpuContext::ExampleNpuContext()
-  : Context(std::make_shared<nntrainer::ContextData>()) {}
 
 void ExampleNpuContext::initialize() noexcept {
   try {
-    // Step 1: Initialize your hardware
-    // npu_driver_init();
+    // 1. Initialize CPU backend (for fallback ops)
+    nntrainer::init_backend();
 
-    // Step 2: Set memory allocator and compute ops table
-    if (auto cd = getContextData()) {
+    // 2. Set ComputeOps on our ContextData
+    //    ALL contexts must set this — even NPU.
+    //
+    //    Option A: Use fully vendor-defined ops table (npu_ops)
+    //      cd->setComputeOps(&npu_ops);
+    //
+    //    Option B: Copy CPU ops and override only accelerated ones:
+    //      static ComputeOps mixed_ops = *g_compute_ops;  // CPU base
+    //      mixed_ops.sgemm_fp32 = npu_backend::sgemm_fp32;  // NPU override
+    //      cd->setComputeOps(&mixed_ops);
+    //
+    //    Option B is useful when your NPU accelerates only a few ops.
+    //
+    if (auto cd = getContextData())
+      cd->setComputeOps(&npu_ops);
+
+    // 3. Set memory allocator
+    if (auto cd = getContextData())
       cd->setMemAllocator(std::make_shared<nntrainer::MemAllocator>());
-      // THIS IS THE KEY STEP — sets which ops tensor.dot() will call
-      cd->setComputeOps(get_npu_ops());
+
+    // 4. Initialize NPU hardware
+    auto *npu_data = getContextData()->as<NpuBackendData>();
+    if (npu_data) {
+      npu_data->getNpuData()->initialize("default");
     }
 
-    // Step 4: Register NPU-specific layers (optional)
-    add_default_object();
+    // 5. Register NPU-specific layers (optional)
+    // registerFactory(createLayer<NpuGraphLayer>, "npu_graph", ...);
 
   } catch (std::exception &e) {
     fprintf(stderr, "ExampleNpuContext init failed: %s\n", e.what());
   }
 }
 
-void ExampleNpuContext::add_default_object() {
-  // Register NPU-specific layer implementations here.
-  // If your NPU reuses CPU layers (just accelerates tensor ops),
-  // you can leave this empty.
-  //
-  // Example:
-  // registerFactory(nntrainer::createLayer<NpuFullyConnectedLayer>,
-  //                 "fully_connected", LayerType::LAYER_FC);
-}
-
 nntrainer::Context::PtrType<nntrainer::Layer>
 ExampleNpuContext::createLayerObject(const std::string &type,
                                      const std::vector<std::string> &props) {
-  // For this example, return nullptr to fall back to CPU layer creation.
-  // In a real backend, create NPU-optimized layers here.
-  return nullptr;
+  return nullptr; // Fall back to CPU layer creation
 }
-
-// =========================================================================
-// Part 3: Plugin Entry Point (for .so dynamic loading)
-// =========================================================================
-//
-// If your backend is built as a shared library plugin (.so), export these
-// symbols so Engine can discover and load it at runtime:
-//
-//   engine.registerPluggableContext("path/to/libyour_backend.so");
-//
-// For static linking, register directly in engine.cpp instead.
-//
 
 } // namespace example_npu
 
-// Uncomment these for .so plugin builds:
+// =========================================================================
+// Part 4: Plugin .so entry point
+// =========================================================================
 //
+// This is how the backend is discovered when loaded as a plugin .so:
+//
+//   1. Build this file as a shared library:
+//      g++ -shared -o libexample_npu_context.so example_npu_context.cpp \
+//          -lnntrainer $(pkg-config --cflags nntrainer)
+//
+//   2. Load at runtime:
+//      Engine::Global().registerContext("path/to/libexample_npu_context.so");
+//
+//   3. Engine calls dlopen() → finds ml_train_context_pluggable →
+//      calls createfunc() → ExampleNpuContext::Global() →
+//      initialize() runs → ComputeOps + vendor data set up →
+//      registerContext("example_npu", context)
+//
+//   4. Model layers with compute_engine=example_npu will use this backend.
+//
+// Symbol resolution:
+//   - g_compute_ops, init_backend() → resolved from libnntrainer.so
+//   - npu_ops (static in this .so) → safe because Engine holds .so handle
+//   - ContextData (shared_ptr) → reference counted across .so boundary
+//   - as<T>() (dynamic_cast) → RTTI works across .so on Linux/Android
+//
+
+// Uncomment to enable plugin loading:
 // extern "C" nntrainer::ContextPluggable ml_train_context_pluggable = {
 //   []() -> nntrainer::Context * {
 //     return &example_npu::ExampleNpuContext::Global();
 //   },
-//   [](nntrainer::Context *) {
-//     // Singleton — no delete needed
-//   }
+//   [](nntrainer::Context *) { /* Singleton, no delete needed */ }
 // };
