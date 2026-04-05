@@ -231,6 +231,20 @@ Layer::forwarding(RunLayerContext &context)
           → QNN runtime (HTP hardware)
 ```
 
+### 5. Non-layer Code (Model, Preprocessing)
+
+Code outside layers (e.g., `neuralnet.cpp`) that needs backend ops
+uses `getComputeOps()` directly — the global fallback (CPU ops):
+
+```cpp
+// neuralnet.cpp — output data conversion
+getComputeOps()->scopy_fp16_to_fp32(buf_size, fp16_data, 1, fp32_data, 1);
+```
+
+This always uses CPU ops, which is correct because model-level data
+handling (output copying, loss computation) happens on CPU regardless
+of which backend individual layers use.
+
 ---
 
 ## Two Dispatch Models
@@ -410,22 +424,59 @@ ThreadManager::Global().parallel_for(0, N, [=](size_t i) {
 
 ## Plugin .so Loading (Dynamic Backend Registration)
 
-Backends like QNN are built as separate `.so` and loaded at runtime.
+Backends like QNN are built as separate `.so` shared libraries and
+loaded at runtime. This decouples vendor SDK dependencies from the
+main nntrainer library.
+
+### Build Structure
+
+```
+libnntrainer.so          ← Core library (no QNN/CUDA dependency)
+  ├── Engine, Context, ComputeOps, Tensor
+  └── CPU backends (ARM/x86/fallback)
+
+libqnn_context.so        ← QNN plugin (separate build, links QNN SDK)
+  ├── qnn_context.cpp    ← built with -DPLUGGABLE
+  ├── qnn_rpc_manager.cpp
+  └── QNN SDK libraries
+  Exports: ml_train_context_pluggable
+
+libcuda_context.so       ← CUDA plugin (future, links cuBLAS)
+  └── ...
+```
 
 ### Loading Flow
 
 ```
-Engine::registerContext("path/to/qnn_context.so")
+Engine::add_default_object()
   │
-  ├── dlopen("qnn_context.so", RTLD_LAZY | RTLD_LOCAL)
-  ├── dlsym("ml_train_context_pluggable")
-  ├── pluggable->createfunc() → QNNContext::Global()
-  │     └── QNNContext::initialize()
-  │           ├── init_backend()              ← from libnntrainer.so
-  │           ├── cd->setComputeOps(...)      ← CPU fallback or custom
-  │           ├── QNN SDK init
-  │           └── register QNN layers
-  └── registerContext("qnn", context)
+  ├── registerContext("cpu", &AppContext::Global())   ← built-in
+  ├── registerContext("gpu", &ClContext::Global())    ← built-in (if OpenCL)
+  │
+  └── registerContext("libqnn_context.so", "")        ← plugin .so
+        │
+        ├── dlopen("libqnn_context.so", RTLD_LAZY | RTLD_LOCAL)
+        ├── dlsym("ml_train_context_pluggable")
+        ├── pluggable->createfunc() → QNNContext::Global()
+        │     └── QNNContext::initialize()
+        │           ├── init_backend()              ← from libnntrainer.so
+        │           ├── cd->setComputeOps(...)      ← CPU fallback or custom
+        │           ├── QNN SDK init (vendor-specific)
+        │           └── register QNN layers (QNNGraph, QNNLinear)
+        └── registerContext("qnn", context)
+```
+
+### Plugin Entry Point
+
+```cpp
+// In qnn_context.cpp (built with -DPLUGGABLE):
+#ifdef PLUGGABLE
+extern "C" {
+  nntrainer::ContextPluggable ml_train_context_pluggable{
+    create_qnn_context, destroy_qnn_context
+  };
+}
+#endif
 ```
 
 ### ComputeOps Override Strategy
@@ -473,8 +524,9 @@ cd->setComputeOps(&qnn_ops);
 | `network_graph.cpp` | Graph finalization (Context → ContextData → LayerNode) |
 | `app_context.h/cpp` | CPU backend context |
 | `cl_context.h/cpp` | GPU backend context |
-| `qnn_context.h/cpp` | QNN backend context |
-| `tensor.h/cpp` | Tensor public API (ops parameter) |
+| `qnn_context.h/cpp` | QNN backend context (built as libqnn_context.so plugin) |
+| `neuralnet.cpp` | Model execution (uses getComputeOps() for data conversion) |
+| `tensor.h/cpp` | Tensor public API (ops parameter on all operations) |
 | `tensor_base.h/cpp` | TensorBase virtual interface (ops parameter) |
 | `float_tensor.h/cpp` | FP32 tensor implementation |
 | `half_tensor.h/cpp` | FP16 tensor implementation |
