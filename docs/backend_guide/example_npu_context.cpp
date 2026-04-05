@@ -283,8 +283,18 @@ void ExampleNpuContext::initialize() noexcept {
     nntrainer::init_backend();
 
     // 2. Set ComputeOps on our ContextData
-    //    ALL contexts must set this — even NPU (for tensor ops outside
-    //    the NPU graph, like preprocessing and postprocessing)
+    //    ALL contexts must set this — even NPU.
+    //
+    //    Option A: Use fully vendor-defined ops table (npu_ops)
+    //      cd->setComputeOps(&npu_ops);
+    //
+    //    Option B: Copy CPU ops and override only accelerated ones:
+    //      static ComputeOps mixed_ops = *g_compute_ops;  // CPU base
+    //      mixed_ops.sgemm_fp32 = npu_backend::sgemm_fp32;  // NPU override
+    //      cd->setComputeOps(&mixed_ops);
+    //
+    //    Option B is useful when your NPU accelerates only a few ops.
+    //
     if (auto cd = getContextData())
       cd->setComputeOps(&npu_ops);
 
@@ -312,23 +322,39 @@ ExampleNpuContext::createLayerObject(const std::string &type,
   return nullptr; // Fall back to CPU layer creation
 }
 
-// =========================================================================
-// Part 4: Plugin entry point (for .so dynamic loading)
-// =========================================================================
-//
-// Build as shared library and load via:
-//   engine.registerContext("path/to/libexample_npu.so");
-//
-// Or register statically in engine.cpp:
-//   auto &npu = example_npu::ExampleNpuContext::Global();
-//   registerContext("example_npu", &npu);
-
 } // namespace example_npu
 
-// Uncomment for .so plugin:
+// =========================================================================
+// Part 4: Plugin .so entry point
+// =========================================================================
+//
+// This is how the backend is discovered when loaded as a plugin .so:
+//
+//   1. Build this file as a shared library:
+//      g++ -shared -o libexample_npu_context.so example_npu_context.cpp \
+//          -lnntrainer $(pkg-config --cflags nntrainer)
+//
+//   2. Load at runtime:
+//      Engine::Global().registerContext("path/to/libexample_npu_context.so");
+//
+//   3. Engine calls dlopen() → finds ml_train_context_pluggable →
+//      calls createfunc() → ExampleNpuContext::Global() →
+//      initialize() runs → ComputeOps + vendor data set up →
+//      registerContext("example_npu", context)
+//
+//   4. Model layers with compute_engine=example_npu will use this backend.
+//
+// Symbol resolution:
+//   - g_compute_ops, init_backend() → resolved from libnntrainer.so
+//   - npu_ops (static in this .so) → safe because Engine holds .so handle
+//   - ContextData (shared_ptr) → reference counted across .so boundary
+//   - as<T>() (dynamic_cast) → RTTI works across .so on Linux/Android
+//
+
+// Uncomment to enable plugin loading:
 // extern "C" nntrainer::ContextPluggable ml_train_context_pluggable = {
 //   []() -> nntrainer::Context * {
 //     return &example_npu::ExampleNpuContext::Global();
 //   },
-//   [](nntrainer::Context *) { /* Singleton, no delete */ }
+//   [](nntrainer::Context *) { /* Singleton, no delete needed */ }
 // };

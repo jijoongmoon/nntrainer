@@ -354,6 +354,9 @@ struct QNNVar {
 class QNNBackendVar : public ContextData {
 public:
   QNNBackendVar() : data(std::make_shared<QNNVar>()) {}
+
+  const char *getType() const override { return "qnn"; }
+
   std::shared_ptr<QNNVar> &getVar() { return data; }
 
 private:

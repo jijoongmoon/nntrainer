@@ -23,6 +23,7 @@
 #include "BackendExtensions.hpp"
 
 #include "qnn_context.h"
+#include <compute_ops.h>
 #include <QNNGraph.h>
 #include <QNNLinear.h>
 #include <iostream>
@@ -39,13 +40,24 @@ std::mutex qnn_factory_mutex;
 
 void QNNContext::initialize() noexcept {
   try {
+    // Initialize CPU backend for fallback ops
+    init_backend();
+
+    // Set CPU fallback ComputeOps (for tensor ops outside QNN graph)
+    if (auto cd = getContextData(); cd && g_compute_ops) {
+      cd->setComputeOps(g_compute_ops);
+    }
+
     init();
     ml_logi("qnn init done");
     setMemAllocator(std::make_shared<QNNRpcManager>());
 
-    std::static_pointer_cast<QNNBackendVar>(getContextData())
-      ->getVar()
-      ->RpcMem = std::static_pointer_cast<QNNRpcManager>(getMemAllocator());
+    // Use type-safe as<T>() instead of static_pointer_cast
+    auto *qnn_data = getContextData()->as<QNNBackendVar>();
+    if (qnn_data) {
+      qnn_data->getVar()->RpcMem =
+        std::static_pointer_cast<QNNRpcManager>(getMemAllocator());
+    }
 
     // Register QNN layers
     registerFactory(nntrainer::createLayer<QNNLinear>, QNNLinear::type,

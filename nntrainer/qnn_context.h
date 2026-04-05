@@ -196,8 +196,9 @@ public:
   }
 
   std::shared_ptr<QNNVar> getQnnData() {
-    std::shared_ptr<QNNBackendVar> d =
-      std::static_pointer_cast<QNNBackendVar>(this->getContextData());
+    auto *d = this->getContextData()->as<QNNBackendVar>();
+    NNTR_THROW_IF(!d, std::runtime_error)
+      << "QNNContext requires QNNBackendVar ContextData";
     return d->getVar();
   }
 
