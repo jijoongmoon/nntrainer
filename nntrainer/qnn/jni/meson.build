@@ -1,9 +1,10 @@
-# Note: qnn_context.h and qnn_context.cpp have been moved to nntrainer/nntrainer/
-# and are now included in the main nntrainer build
-# Only qnn_rpc_manager files remain here
+# QNN context is built as a plugin shared library (libqnn_context.so).
+# It is loaded dynamically by Engine::registerContext("libqnn_context.so").
+# This decouples the QNN SDK dependency from the main nntrainer library.
 
 qnn_context_sources = [
   meson.current_source_dir() / 'qnn_rpc_manager.cpp',
+  meson.current_source_dir() / '..' / '..' / 'qnn_context.cpp',
 ]
 
 qnn_context_headers = [
@@ -11,15 +12,15 @@ qnn_context_headers = [
   meson.current_source_dir() / 'qnn_context_var.h',
 ]
 
-# Add sources to nntrainer
-foreach src : qnn_context_sources
-  nntrainer_sources += src
-endforeach
-
-# Add headers to nntrainer
-foreach hdr : qnn_context_headers
-  nntrainer_headers += hdr
-endforeach
+# Build as shared library plugin
+shared_library('qnn_context',
+  qnn_context_sources,
+  dependencies: nntrainer_dep,
+  include_directories: nntrainer_inc,
+  cpp_args: ['-DPLUGGABLE'],
+  install: true,
+  install_dir: nntrainer_libdir,
+)
 
 # Include directories for QNN
 nntrainer_inc += include_directories('.')
