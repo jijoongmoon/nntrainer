@@ -28,6 +28,14 @@
 #include <cstdint>
 #include <tensor_dim.h>
 
+// The architecture-specific headers (arm_compute_backend.h, x86_compute_backend.h,
+// fallback.h) already declare all backend functions inside namespace nntrainer.
+// The declarations below are only needed when none of those headers were included.
+#if !defined(__ARM_COMPUTE_BACKEND_H__) && !defined(__x86_COMPUTE_BACKEND_H__) && \
+  !defined(__FALLBACK_H__)
+
+namespace nntrainer {
+
 #ifdef ENABLE_FP16
 /**
  * @brief F32 * F16 = F32 GEMM
@@ -1530,6 +1538,10 @@ extern void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
                                               const uint16_t *osv32_scales,
                                               size_t scale_group_size,
                                               void *dst_q4_0x);
+
+} /* namespace nntrainer */
+
+#endif /* !defined backend headers guard */
 
 #endif
 #endif
