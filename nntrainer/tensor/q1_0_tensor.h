@@ -162,13 +162,13 @@ public:
   /**
    * @copydoc Tensor::copy()
    */
-  void copy(const Tensor &from) override {
+  void copy(const Tensor &from, ComputeOps *ops = nullptr) override {
     throw std::invalid_argument("Q1_0_Tensor::copy() is not supported.");
   }
   /**
    * @copydoc Tensor::copyData()
    */
-  void copyData(const Tensor &from) override {
+  void copyData(const Tensor &from, ComputeOps *ops = nullptr) override {
     throw std::invalid_argument("Q1_0_Tensor::copyData() is not supported.");
   }
 
@@ -183,7 +183,7 @@ public:
   /**
    * @copydoc Tensor::max_abs()
    */
-  float max_abs() const override {
+  float max_abs(ComputeOps *ops = nullptr) const override {
     throw std::invalid_argument("Q1_0_Tensor::max_abs() is not supported.");
   }
 
@@ -234,7 +234,7 @@ private:
   /**
    * @copydoc Tensor::isValid()
    */
-  bool isValid() const override { return true; }
+  bool isValid(ComputeOps *ops = nullptr) const override { return true; }
 };
 
 } // namespace nntrainer
