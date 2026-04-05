@@ -144,6 +144,33 @@ static void gemm_q6_K_fp32(const unsigned int M, const unsigned int N,
   nntrainer::gemm_q6_K(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
+// ── Quantization / Utility ──────────────────────────────────
+static size_t quantize_q4_0_impl(const float *src, void *dst, int64_t nrow,
+                                  int64_t n_per_row, const float *qw) {
+  return nntrainer::quantize_q4_0(src, dst, nrow, n_per_row, qw);
+}
+static void dequantize_row_q4_0_impl(const void *x, float *y, int64_t k) {
+  nntrainer::dequantize_row_q4_0(x, y, k);
+}
+static void repack_q4_0_impl(void *dst, void *src, size_t ds,
+                              const unsigned int M, const unsigned int N) {
+  nntrainer::repack_q4_0(dst, src, ds, M, N);
+}
+static void clamp_fp32(const float *in, float *out, size_t len, float lb,
+                        float ub) {
+  nntrainer::clamp(in, out, len, lb, ub);
+}
+static void scopy_int8_to_fp32_u(const unsigned int N, const uint8_t *X,
+                                  const unsigned int iX, float *Y,
+                                  const unsigned int iY) {
+  nntrainer::scopy_int8_to_float32(N, X, iX, Y, iY);
+}
+static void scopy_int8_to_fp32_s(const unsigned int N, const int8_t *X,
+                                  const unsigned int iX, float *Y,
+                                  const unsigned int iY) {
+  nntrainer::scopy_int8_to_float32(N, X, iX, Y, iY);
+}
+
 } // namespace arm_backend
 
 // ═══════════════════════════════════════════════════════════════
@@ -187,6 +214,12 @@ static ComputeOps arm_ops = {
   .gemm_q6_K_fp32 = arm_backend::gemm_q6_K_fp32,
   .unpack_q4_0 = nntrainer::unpack_q4_0,
   .unpack_q4_0x8_transpose16 = nntrainer::unpack_q4_0x8_transpose16,
+  .quantize_q4_0 = arm_backend::quantize_q4_0_impl,
+  .dequantize_row_q4_0 = arm_backend::dequantize_row_q4_0_impl,
+  .repack_q4_0 = arm_backend::repack_q4_0_impl,
+  .clamp_fp32 = arm_backend::clamp_fp32,
+  .scopy_int8_to_fp32_u = arm_backend::scopy_int8_to_fp32_u,
+  .scopy_int8_to_fp32_s = arm_backend::scopy_int8_to_fp32_s,
   .gemm_q4_0_batch_fp32 = nullptr,
   .gemm_q4_0_accel_fp32 = nullptr,
   .gemv_int4_batch_fp32 = nullptr,
