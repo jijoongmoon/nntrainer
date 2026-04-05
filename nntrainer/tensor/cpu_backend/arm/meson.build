@@ -7,6 +7,7 @@ arm_compute_backend_headers = [
 ]
 arm_compute_backend_sources = [
     'arm_compute_backend.cpp',
+    'arm_ops_table.cpp',
     'neon_impl.cpp',
 ]
 

@@ -13,6 +13,8 @@
 
 #include <assert.h>
 #include <cmath>
+#include <compute_ops.h>
+#include <cpu_backend.h>
 #include <fallback_internal.h>
 #include <ggml_interface.h>
 #include <nntrainer_error.h>
@@ -384,5 +386,6 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
   __fallback_transform_int4_osv32_isv2_to_q4_0(
     N, K, osv32_weights, osv32_scales, scale_group_size, 8, dst_q4_0x);
 }
+
 
 } /* namespace nntrainer */

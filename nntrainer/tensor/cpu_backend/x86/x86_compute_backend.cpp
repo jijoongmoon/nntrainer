@@ -17,6 +17,8 @@
 #ifdef USE_BLAS
 #include <cblas_interface.h>
 #endif
+#include <compute_ops.h>
+#include <cpu_backend.h>
 #include <fallback_internal.h>
 #include <ggml_interface.h>
 #include <nntrainer_error.h>
@@ -34,6 +36,7 @@ void init_backend() {
   // Do not repeatedly call set_num_threads. It's a global config.
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
 #endif
+  g_compute_ops = get_x86_ops();
 }
 
 void scopy_int4_to_float32(const unsigned int N, const uint8_t *X,
@@ -514,4 +517,5 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
     N, K, osv32_weights, osv32_scales, scale_group_size, 8, dst_q4_0x);
 #endif
 }
+
 } /* namespace nntrainer */
