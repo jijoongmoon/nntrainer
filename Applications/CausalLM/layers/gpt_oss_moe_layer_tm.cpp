@@ -28,11 +28,13 @@
  *   - No OpenMP dependency
  */
 
+#include <cpu_backend.h>
 #include <acti_func.h>
 #include <algorithm>
 #include <cmath>
 #include <gpt_oss_moe_layer_tm.h>
 #include <node_exporter.h>
+#include <thread_manager.h>
 #include <stdexcept>
 
 namespace causallm {
