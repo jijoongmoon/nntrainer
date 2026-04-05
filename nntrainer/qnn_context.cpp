@@ -37,50 +37,34 @@ namespace nntrainer {
 
 std::mutex qnn_factory_mutex;
 
-std::once_flag global_qnn_context_init_flag;
-
-static void add_default_object(QNNContext &qc) {
-
-  qc.registerFactory(nntrainer::createLayer<QNNLinear>, QNNLinear::type,
-                     ml::train::LayerType::LAYER_FC);
-  qc.registerFactory(nntrainer::createLayer<WeightLayer>, WeightLayer::type,
-                     ml::train::LayerType::LAYER_WEIGHT);
-  qc.registerFactory(nntrainer::createLayer<TensorLayer>, TensorLayer::type,
-                     ml::train::LayerType::LAYER_TENSOR);
-  qc.registerFactory(nntrainer::createLayer<QNNGraph>, QNNGraph::type, -1);
-  ml_logi("qnn registerFactory done");
-}
-
-static void registerer(QNNContext &qc) noexcept {
-  qc.init();
-  ml_logi("qnn init done");
-  qc.setMemAllocator(std::make_shared<QNNRpcManager>());
-
-  std::static_pointer_cast<QNNBackendVar>(qc.getContextData())
-    ->getVar()
-    ->RpcMem = std::static_pointer_cast<QNNRpcManager>(qc.getMemAllocator());
-
+void QNNContext::initialize() noexcept {
   try {
-    add_default_object(qc);
+    init();
+    ml_logi("qnn init done");
+    setMemAllocator(std::make_shared<QNNRpcManager>());
+
+    std::static_pointer_cast<QNNBackendVar>(getContextData())
+      ->getVar()
+      ->RpcMem = std::static_pointer_cast<QNNRpcManager>(getMemAllocator());
+
+    // Register QNN layers
+    registerFactory(nntrainer::createLayer<QNNLinear>, QNNLinear::type,
+                    ml::train::LayerType::LAYER_FC);
+    registerFactory(nntrainer::createLayer<WeightLayer>, WeightLayer::type,
+                    ml::train::LayerType::LAYER_WEIGHT);
+    registerFactory(nntrainer::createLayer<TensorLayer>, TensorLayer::type,
+                    ml::train::LayerType::LAYER_TENSOR);
+    registerFactory(nntrainer::createLayer<QNNGraph>, QNNGraph::type, -1);
+    ml_logi("qnn registerFactory done");
   } catch (std::exception &e) {
-    ml_loge("qnn_context: registering layers failed!!, reason: %s", e.what());
+    ml_loge("registering qnn layers failed!!, reason: %s", e.what());
   } catch (...) {
-    ml_loge("qnn_context: registering layer failed due to unknown reason");
+    ml_loge("registering qnn layer failed due to unknown reason");
   }
-};
-
-QNNContext &QNNContext::Global() {
-
-  /// in g++ there is a bug that hangs up if caller throws,
-  /// so registerer is noexcept although it'd better not
-  /// https://gcc.gnu.org/bugzilla/show_bug.cgi?id=70298
-  // std::call_once(global_qnn_context_init_flag, registerer,
-  // std::ref(instance));
-  registerer(*this);
-  return *this;
 }
 
 int QNNContext::init() {
+  std::cout << "qnncontext::init called" << std::endl;
   if (!log::initializeLogging()) {
     ml_loge("ERROR: Unable to initialize logging!");
     return -1;
@@ -109,10 +93,12 @@ int QNNContext::init() {
     ml_loge("ERROR: Cannot fine backend Path : libQnnHtp.so");
     return -1;
   }
+  std::cout << "before dynamicloadutil::getQnnFunctionPointers" << std::endl;
 
   auto statusCode = dynamicloadutil::getQnnFunctionPointers(
     backEndPath, "", &qnn_data->m_qnnFunctionPointers,
     &qnn_data->m_backendLibraryHandle, false, nullptr);
+  std::cout << "after dynamicloadutil::getQnnFunctionPointers" << std::endl;
   if (dynamicloadutil::StatusCode::SUCCESS != statusCode) {
     if (dynamicloadutil::StatusCode::FAIL_LOAD_BACKEND == statusCode) {
       ml_loge(
