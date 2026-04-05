@@ -319,12 +319,12 @@ template <typename T> void UIntTensor<T>::initialize(Initializer init) {
   initialize();
 }
 
-template <typename T> void UIntTensor<T>::copy(const Tensor &from) {
+template <typename T> void UIntTensor<T>::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-template <typename T> void UIntTensor<T>::copyData(const Tensor &from) {
+template <typename T> void UIntTensor<T>::copyData(const Tensor &from, ComputeOps *ops) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -462,7 +462,7 @@ template <typename T> std::vector<unsigned int> UIntTensor<T>::argmin() const {
   return result;
 }
 
-template <typename T> float UIntTensor<T>::max_abs() const {
+template <typename T> float UIntTensor<T>::max_abs(ComputeOps *ops) const {
   return maxValue();
 }
 

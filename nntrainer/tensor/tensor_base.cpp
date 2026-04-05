@@ -437,7 +437,8 @@ int TensorBase::multiply_i(float const &value, ComputeOps *) {
     getStringDataType());
 }
 
-Tensor &TensorBase::multiply(float const &value, Tensor &output) const {
+Tensor &TensorBase::multiply(float const &value, Tensor &output,
+                             ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::multiply() is currently not supported in tensor data type " +
     getStringDataType());
@@ -450,7 +451,8 @@ Tensor &TensorBase::multiply(Tensor const &m, Tensor &output,
     getStringDataType());
 }
 
-Tensor &TensorBase::divide(float const &value, Tensor &output) const {
+Tensor &TensorBase::divide(float const &value, Tensor &output,
+                           ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::divide() is currently not supported in tensor data type " +
     getStringDataType());
@@ -478,7 +480,8 @@ int TensorBase::add_i_partial(unsigned int len, unsigned int addr_idx,
     getStringDataType());
 }
 
-Tensor &TensorBase::add(float const &value, Tensor &output) const {
+Tensor &TensorBase::add(float const &value, Tensor &output,
+                        ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::add() is currently not supported in tensor data type " +
     getStringDataType());
@@ -497,7 +500,7 @@ Tensor &TensorBase::subtract(float const &value, Tensor &output) const {
     getStringDataType());
 }
 
-void TensorBase::sum_by_batch(Tensor &output) const {
+void TensorBase::sum_by_batch(Tensor &output, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::sum_by_batch() is currently not supported in tensor data type " +
     getStringDataType());
@@ -510,13 +513,13 @@ Tensor &TensorBase::sum(unsigned int axis, Tensor &output, float alpha,
     getStringDataType());
 }
 
-Tensor &TensorBase::abs(Tensor &output) const {
+Tensor &TensorBase::abs(Tensor &output, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::abs() is currently not supported in tensor data type " +
     getStringDataType());
 }
 
-float TensorBase::l2norm() const {
+float TensorBase::l2norm(ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::l2norm() is currently not supported in tensor data type " +
     getStringDataType());
@@ -564,7 +567,7 @@ void TensorBase::tan(Tensor &output, float alpha) {
     getStringDataType());
 }
 
-void TensorBase::inv_sqrt(Tensor &out) {
+void TensorBase::inv_sqrt(Tensor &out, ComputeOps *) {
   throw std::invalid_argument(
     "Tensor::inv_sqrt() is currently not supported in tensor data type " +
     getStringDataType());
@@ -649,7 +652,8 @@ void TensorBase::topK(unsigned int k, void *output_data, uint32_t *indices) {
     getStringDataType());
 }
 
-Tensor &TensorBase::transpose(const std::string &direction, Tensor &out) const {
+Tensor &TensorBase::transpose(const std::string &direction, Tensor &out,
+                              ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::transpose() is currently not supported in tensor data type " +
     getStringDataType());

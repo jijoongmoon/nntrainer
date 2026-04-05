@@ -283,7 +283,8 @@ public:
   /**
    * @copydoc Tensor::multiply(float const &value, Tensor &out)
    */
-  Tensor &multiply(float const &value, Tensor &out) const override;
+  Tensor &multiply(float const &value, Tensor &out,
+                   ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::multiply(Tensor const &m, Tensor &output, const
@@ -296,7 +297,8 @@ public:
   /**
    * @copydoc Tensor::divide(float const &value, Tensor &output)
    */
-  Tensor &divide(float const &value, Tensor &output) const override;
+  Tensor &divide(float const &value, Tensor &output,
+                 ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::divide(Tensor const &m, Tensor &output)
@@ -321,7 +323,8 @@ public:
   /**
    * @copydoc Tensor::add(float const &value, Tensor &output)
    */
-  Tensor &add(float const &value, Tensor &output) const override;
+  Tensor &add(float const &value, Tensor &output,
+              ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::add(Tensor const &m, Tensor &output, float const
@@ -338,7 +341,7 @@ public:
   /**
    *  @copydoc TensorBase::sum_by_batch(Tensor &output)
    */
-  void sum_by_batch(Tensor &output) const override;
+  void sum_by_batch(Tensor &output, ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::sum(unsigned int axis, Tensor &output, float alpha,
@@ -350,12 +353,12 @@ public:
   /**
    * @copydoc Tensor::abs()
    */
-  Tensor &abs(Tensor &output) const override;
+  Tensor &abs(Tensor &output, ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::l2norm
    */
-  float l2norm() const override;
+  float l2norm(ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::normalization_i
@@ -396,7 +399,7 @@ public:
   /**
    * @copydoc TensorBase::inv_sqrt(Tensor &out)
    */
-  void inv_sqrt(Tensor &out) override;
+  void inv_sqrt(Tensor &out, ComputeOps *ops = nullptr) override;
 
   /**
    *  @copydoc Tensor::dot(Tensor const &input, Tensor &output, bool
@@ -437,12 +440,12 @@ public:
   /**
    * @copydoc Tensor::copy(const Tensor &from)
    */
-  void copy(const Tensor &from) override;
+  void copy(const Tensor &from, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::copyData(const Tensor &from)
    */
-  void copyData(const Tensor &from) override;
+  void copyData(const Tensor &from, ComputeOps *ops = nullptr) override;
 
   /**
    * @brief      Copy the Tensor
@@ -469,7 +472,7 @@ public:
   /**
    * @copydoc Tensor::max_abs()
    */
-  float max_abs() const override;
+  float max_abs(ComputeOps *ops = nullptr) const override;
   /**
    * @copydoc Tensor::maxValue()
    */
@@ -483,8 +486,8 @@ public:
   /**
    * @copydoc Tensor::transpose(const std::string &direction, Tensor &out)
    */
-  Tensor &transpose(const std::string &direction,
-                    Tensor &output) const override;
+  Tensor &transpose(const std::string &direction, Tensor &output,
+                    ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::print(std::ostream &out)
@@ -498,7 +501,7 @@ private:
    *
    * @param buf buffer to copy from
    */
-  void copy(const void *buf);
+  void copy(const void *buf, ComputeOps *ops = nullptr);
 
   /**
    * @brief Applies the given operator to the tensor with the passed argument
@@ -543,7 +546,7 @@ private:
   /**
    * @copydoc Tensor::isValid()
    */
-  bool isValid() const override;
+  bool isValid(ComputeOps *ops = nullptr) const override;
 
   /**
    * @brief Float.dot(Float)
@@ -564,14 +567,16 @@ private:
    * @return Tensor& reference to the output tensor
    */
   Tensor &dotQnK(Tensor const &input, Tensor &output, bool trans, bool trans_in,
-                 float beta, Tdatatype dtype) const;
+                 float beta, Tdatatype dtype,
+                 ComputeOps *ops = nullptr) const;
 
   /**
    * @brief Float.dot(QINT4/QINT8/QINT16)
    * @return Tensor& reference to the output tensor
    */
   Tensor &dotQInteger(Tensor const &input, Tensor &output, bool trans,
-                      bool trans_in, float beta, Tdatatype dtype) const;
+                      bool trans_in, float beta, Tdatatype dtype,
+                      ComputeOps *ops = nullptr) const;
 };
 
 } // namespace nntrainer
