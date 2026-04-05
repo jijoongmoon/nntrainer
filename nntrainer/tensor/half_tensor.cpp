@@ -641,7 +641,7 @@ void HalfTensor::inv_sqrt(Tensor &out) {
 }
 
 Tensor &HalfTensor::dotHalf(Tensor const &input, Tensor &output, bool trans,
-                            bool trans_in, float beta) const {
+                            bool trans_in, float beta, ComputeOps *ops) const {
   // Comment out with intension to support the calculation wrt. batch and height
   // direction. It supposes to have this->dim as [ BxCxH,W ] and input.dim is
   // [BxCxH,W] as well if (input.dim.rank() > 2) {
@@ -701,7 +701,7 @@ Tensor &HalfTensor::dotHalf(Tensor const &input, Tensor &output, bool trans,
 }
 
 Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
-                        bool trans_in, float beta) const {
+                        bool trans_in, float beta, ComputeOps *ops) const {
   switch (input.getDataType()) {
   case Tdatatype::FP16:
     dotHalf(input, output, trans, trans_in, beta);

@@ -384,8 +384,8 @@ public:
    *  @copydoc Tensor::dot(Tensor const &input, Tensor &output, bool
    * trans, bool trans_in, float beta)
    */
-  Tensor &dot(Tensor const &input, Tensor &output, bool trans, bool trans_in,
-              float beta) const override;
+    Tensor &dot(Tensor const &input, Tensor &output, bool trans, bool trans_in,
+              float beta, ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::dropout_mask(float dropout)

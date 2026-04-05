@@ -319,7 +319,8 @@ public:
   /**
    * @copydoc Tensor::multiply(float const &value, Tensor &output)
    */
-  virtual Tensor &multiply(float const &value, Tensor &output) const;
+  virtual Tensor &multiply(float const &value, Tensor &output,
+                           ComputeOps *ops = nullptr) const;
 
   /**
    * @copydoc Tensor::multiply(Tensor const &m, Tensor &output, const
@@ -331,7 +332,8 @@ public:
   /**
    * @copydoc Tensor::divide(float const &value, Tensor &output)
    */
-  virtual Tensor &divide(float const &value, Tensor &output) const;
+  virtual Tensor &divide(float const &value, Tensor &output,
+                         ComputeOps *ops = nullptr) const;
 
   /**
    * @copydoc Tensor::divide(Tensor const &m, Tensor &output)
@@ -356,7 +358,8 @@ public:
   /**
    * @copydoc Tensor::add(float const &value, Tensor &output)
    */
-  virtual Tensor &add(float const &value, Tensor &output) const;
+  virtual Tensor &add(float const &value, Tensor &output,
+                      ComputeOps *ops = nullptr) const;
 
   /**
    * @copydoc Tensor::add(Tensor const &m, Tensor &output, float const
@@ -374,7 +377,7 @@ public:
    * @brief      Sum all the Tensor elements according to the batch
    * @param[out] output Tensor(batch, 1, 1, 1)
    */
-  virtual void sum_by_batch(Tensor &output) const;
+  virtual void sum_by_batch(Tensor &output, ComputeOps *ops = nullptr) const;
 
   /**
    * @copydoc Tensor::sum(unsigned int axis, Tensor &output, float alpha,
@@ -386,12 +389,12 @@ public:
   /**
    * @copydoc Tensor::abs()
    */
-  virtual Tensor &abs(Tensor &output) const;
+  virtual Tensor &abs(Tensor &output, ComputeOps *ops = nullptr) const;
 
   /**
    * @copydoc Tensor::l2norm
    */
-  virtual float l2norm() const;
+  virtual float l2norm(ComputeOps *ops = nullptr) const;
 
   /**
    * @copydoc Tensor::normalization_i(unsigned int dim, float p, float epsilon)
@@ -436,7 +439,7 @@ public:
    * @brief      inverse squared root function
    * @param[out] out out to store the result
    */
-  virtual void inv_sqrt(Tensor &out);
+  virtual void inv_sqrt(Tensor &out, ComputeOps *ops = nullptr);
 
   /**
    * @brief     Dot Product of Tensor ( equal MxM )
