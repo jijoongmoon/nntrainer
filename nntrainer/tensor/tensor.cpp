@@ -502,7 +502,7 @@ Tensor &Tensor::multiply_strided(Tensor const &m, Tensor &output,
   return output;
 }
 
-int Tensor::multiply_i(float const &value) {
+int Tensor::multiply_i(float const &value, ComputeOps *ops) {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot multiply";
 
@@ -536,7 +536,7 @@ Tensor Tensor::multiply(Tensor const &m, const float beta) const {
 }
 
 Tensor &Tensor::multiply(Tensor const &m, Tensor &output,
-                         const float beta) const {
+                         const float beta, ComputeOps *ops) const {
   NNTR_THROW_IF(m.getFormat() != this->getFormat(), std::invalid_argument)
     << "Tensor Format of " << getName() << ":"
     << ((bool)(this->getFormat()) ? "NHWC" : "NCHW") << " is not match. ("
@@ -547,7 +547,7 @@ Tensor &Tensor::multiply(Tensor const &m, Tensor &output,
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot multiply";
 
-  itensor_->multiply(m, output, beta);
+  itensor_->multiply(m, output, beta, ops);
   return output;
 }
 
@@ -591,12 +591,12 @@ Tensor Tensor::divide(Tensor const &m) const {
   return this->divide(m, output);
 }
 
-Tensor &Tensor::divide(Tensor const &m, Tensor &output) const {
+Tensor &Tensor::divide(Tensor const &m, Tensor &output, ComputeOps *ops) const {
   NNTR_THROW_IF(!getContiguous() || !m.getContiguous() ||
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot divide";
-  itensor_->divide(m, output);
+  itensor_->divide(m, output, ops);
   return output;
 }
 
@@ -656,9 +656,10 @@ int Tensor::add_i(Tensor const &m, float const alpha) {
 
 int Tensor::add_i_partial(unsigned int len, unsigned int addr_idx, Tensor &m,
                           unsigned int incX, unsigned int incY,
-                          const Tensor alphas, unsigned int alpha_idx) {
+                          const Tensor alphas, unsigned int alpha_idx,
+                               ComputeOps *ops) {
   return itensor_->add_i_partial(len, addr_idx, m, incX, incY, alphas,
-                                 alpha_idx);
+                                 alpha_idx, ops);
 }
 
 Tensor Tensor::add(Tensor const &m, float const alpha) const {
@@ -666,7 +667,7 @@ Tensor Tensor::add(Tensor const &m, float const alpha) const {
   return this->add(m, t, alpha);
 }
 
-Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
+Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha, ComputeOps *ops) const {
   NNTR_THROW_IF(m.getFormat() != this->getFormat(), std::invalid_argument)
     << "Tensor Format of " << getName() << ":"
     << ((bool)(this->getFormat()) ? "NHWC" : "NCHW") << " is not match. ("
@@ -676,7 +677,7 @@ Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot add";
-  itensor_->add(m, output, alpha);
+  itensor_->add(m, output, alpha, ops);
   return output;
 }
 

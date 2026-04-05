@@ -431,7 +431,7 @@ Tensor TensorBase::multiply_strided(Tensor const &m, Tensor &output,
                               getStringDataType());
 }
 
-int TensorBase::multiply_i(float const &value) {
+int TensorBase::multiply_i(float const &value, ComputeOps *) {
   throw std::invalid_argument(
     "Tensor::multiply_i() is currently not supported in tensor data type " +
     getStringDataType());
@@ -444,7 +444,7 @@ Tensor &TensorBase::multiply(float const &value, Tensor &output) const {
 }
 
 Tensor &TensorBase::multiply(Tensor const &m, Tensor &output,
-                             const float beta) const {
+                             const float beta, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::multiply() is currently not supported in tensor data type " +
     getStringDataType());
@@ -456,7 +456,7 @@ Tensor &TensorBase::divide(float const &value, Tensor &output) const {
     getStringDataType());
 }
 
-Tensor &TensorBase::divide(Tensor const &m, Tensor &output) const {
+Tensor &TensorBase::divide(Tensor const &m, Tensor &output, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::divide() is currently not supported in tensor data type " +
     getStringDataType());
@@ -471,7 +471,8 @@ Tensor &TensorBase::add_strided(Tensor const &input, Tensor &output,
 
 int TensorBase::add_i_partial(unsigned int len, unsigned int addr_idx,
                               Tensor &m, unsigned int incX, unsigned int incY,
-                              const Tensor alphas, unsigned int alpha_idx) {
+                              const Tensor alphas, unsigned int alpha_idx,
+                               ComputeOps *) {
   throw std::invalid_argument(
     "Tensor::add_i_partial() is currently not supported in tensor data type " +
     getStringDataType());
@@ -484,7 +485,7 @@ Tensor &TensorBase::add(float const &value, Tensor &output) const {
 }
 
 Tensor &TensorBase::add(Tensor const &m, Tensor &output,
-                        float const alpha) const {
+                        float const alpha, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::add() is currently not supported in tensor data type " +
     getStringDataType());

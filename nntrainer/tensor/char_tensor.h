@@ -199,7 +199,7 @@ public:
   /**
    * @copydoc Tensor::multiply_i(float const &value)
    */
-  int multiply_i(float const &value) override;
+  int multiply_i(float const &value, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::multiply(Tensor const &m, Tensor &output, const
@@ -213,13 +213,14 @@ public:
    * 4. only per-tensor quantization qscheme is supported
    */
   Tensor &multiply(Tensor const &m, Tensor &output,
-                   const float scale = 0.0) const override;
+                   const float scale = 0.0,
+                   ComputeOps *ops = nullptr) const override;
   /**
    * @copydoc Tensor::add(Tensor const &m, Tensor &output, float const
    * alpha)
    */
   Tensor &add(Tensor const &m, Tensor &output,
-              float const scale) const override;
+              float const scale, ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::copy(const Tensor &from)

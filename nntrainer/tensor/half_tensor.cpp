@@ -328,7 +328,7 @@ Tensor HalfTensor::multiply_strided(Tensor const &m, Tensor &output,
   return output;
 }
 
-int HalfTensor::multiply_i(float const &value) {
+int HalfTensor::multiply_i(float const &value, ComputeOps *ops) {
   _FP16 *data = (_FP16 *)getData();
   unsigned int len = size();
   getComputeOps()->sscal_fp16(len, value, data, 1);
@@ -344,7 +344,7 @@ Tensor &HalfTensor::multiply(float const &value, Tensor &out) const {
 }
 
 Tensor &HalfTensor::multiply(Tensor const &m, Tensor &output,
-                             const float beta) const {
+                             const float beta, ComputeOps *ops) const {
   auto f = [&](const BroadcastInfo &e, const _FP16 *buf, const _FP16 *m_buf,
                _FP16 *out_buf) {
     getComputeOps()->ele_mul_fp16(e.buffer_size, buf, m_buf, out_buf, 1, beta, e.strides[3],
@@ -424,7 +424,8 @@ Tensor &HalfTensor::add_strided(Tensor const &input, Tensor &output,
 
 int HalfTensor::add_i_partial(unsigned int len, unsigned int addr_idx,
                               Tensor &m, unsigned int incX, unsigned int incY,
-                              const Tensor alphas, unsigned int alpha_idx) {
+                              const Tensor alphas, unsigned int alpha_idx,
+                               ComputeOps *ops) {
   getComputeOps()->saxpy_fp16(len, alphas.getValue<_FP16>(alpha_idx), m.getData<_FP16>(), incX,
         (_FP16 *)getAddress(addr_idx), incY);
 
@@ -439,7 +440,7 @@ Tensor &HalfTensor::add(float const &value, Tensor &output) const {
 }
 
 Tensor &HalfTensor::add(Tensor const &m, Tensor &output,
-                        float const alpha) const {
+                        float const alpha, ComputeOps *ops) const {
   auto f = [&](const BroadcastInfo &e, const _FP16 *buf, const _FP16 *m_buf,
                _FP16 *out_buf) {
     getComputeOps()->ele_add_fp16(e.buffer_size, buf, m_buf, out_buf, alpha, 0, e.strides[3],
@@ -992,7 +993,7 @@ Tensor &HalfTensor::divide(float const &value, Tensor &output) const {
   return output;
 }
 
-Tensor &HalfTensor::divide(Tensor const &m, Tensor &output) const {
+Tensor &HalfTensor::divide(Tensor const &m, Tensor &output, ComputeOps *ops) const {
   auto f = [&](const BroadcastInfo &e, const _FP16 *buf, const _FP16 *m_buf,
                _FP16 *out_buf) {
     getComputeOps()->ele_div_fp16(e.buffer_size, buf, m_buf, out_buf, 1, 0, e.strides[3], strides[3]);

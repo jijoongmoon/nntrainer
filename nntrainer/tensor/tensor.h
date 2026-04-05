@@ -860,7 +860,7 @@ public:
    * @retval    #ML_ERROR_INVALID_PARAMETER Tensor dimension is not right
    * @retval    #ML_ERROR_NONE Successful
    */
-  int multiply_i(float const &value);
+  int multiply_i(float const &value, ComputeOps *ops = nullptr);
 
   /**
    * @brief     Multiply value element by element
@@ -901,7 +901,7 @@ public:
    * @retval     Calculated Tensor
    */
   Tensor &multiply(Tensor const &m, Tensor &output,
-                   const float beta = 0.0) const;
+                   const float beta = 0.0, ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Divide value element by element immediately
@@ -946,7 +946,7 @@ public:
    * @param[out] output Tensor to store the result
    * @retval    Calculated Tensor
    */
-  Tensor &divide(Tensor const &m, Tensor &output) const;
+  Tensor &divide(Tensor const &m, Tensor &output, ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Add Tensor Elementwise
@@ -1036,7 +1036,7 @@ public:
    */
   int add_i_partial(unsigned int len, unsigned int addr_idx, Tensor &m,
                     unsigned int incX, unsigned int incY, const Tensor alphas,
-                    unsigned int alpha_idx);
+                    unsigned int alpha_idx, ComputeOps *ops = nullptr);
 
   /**
    * @brief     Add Tensor Element by Element
@@ -1053,7 +1053,7 @@ public:
    * @param[in]  alpha Values to be scaled
    * @retval     Calculated Tensor
    */
-  Tensor &add(Tensor const &m, Tensor &output, float const alpha = 1) const;
+  Tensor &add(Tensor const &m, Tensor &output, float const alpha = 1, ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     memcpyless version of subtract

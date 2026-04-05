@@ -278,7 +278,7 @@ public:
   /**
    * @copydoc Tensor::multiply_i(float const &value)
    */
-  int multiply_i(float const &value) override;
+  int multiply_i(float const &value, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::multiply(float const &value, Tensor &out)
@@ -290,7 +290,8 @@ public:
    * float beta = 0.0)
    */
   Tensor &multiply(Tensor const &m, Tensor &output,
-                   const float beta = 0.0) const override;
+                   const float beta = 0.0,
+                   ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::divide(float const &value, Tensor &output)
@@ -300,7 +301,7 @@ public:
   /**
    * @copydoc Tensor::divide(Tensor const &m, Tensor &output)
    */
-  Tensor &divide(Tensor const &m, Tensor &output) const override;
+  Tensor &divide(Tensor const &m, Tensor &output, ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::add_strided(Tensor const &input, Tensor &output,
@@ -314,7 +315,8 @@ public:
    */
   int add_i_partial(unsigned int len, unsigned int addr_idx, Tensor &m,
                     unsigned int incX, unsigned int incY, const Tensor alphas,
-                    unsigned int alpha_idx) override;
+                    unsigned int alpha_idx,
+                    ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::add(float const &value, Tensor &output)
@@ -326,7 +328,7 @@ public:
    * alpha)
    */
   Tensor &add(Tensor const &m, Tensor &output,
-              float const alpha) const override;
+              float const alpha, ComputeOps *ops = nullptr) const override;
 
   /**
    *  @copydoc Tensor::subtract(float const &value, Tensor &output)
