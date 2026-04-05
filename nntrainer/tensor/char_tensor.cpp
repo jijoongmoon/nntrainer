@@ -13,7 +13,6 @@
 
 #include <char_tensor.h>
 #include <compute_ops.h>
-#include <cpu_backend.h>
 #include <tensor.h>
 
 namespace nntrainer {

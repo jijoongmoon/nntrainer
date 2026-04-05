@@ -746,7 +746,6 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
 /**
  * @brief Initialization of ggml backend
  */
-void init_backend();
 
 /**
  * @copydoc unpack_q4_0x8_transpose16 in cpu_backend.h

@@ -10,7 +10,6 @@
  */
 
 #include <compute_ops.h>
-#include <cpu_backend.h>
 
 namespace nntrainer {
 

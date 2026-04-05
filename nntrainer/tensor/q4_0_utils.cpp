@@ -11,8 +11,8 @@
 #include <cassert>
 #include <cmath>
 
-#include "compute_ops.h"
-#include "cpu_backend.h"
+#include <compute_ops.h>
+#include <cpu_backend.h>
 #include "fp16.h"
 #include "int4_utils.h"
 #include "nntrainer_error.h"

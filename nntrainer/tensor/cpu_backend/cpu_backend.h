@@ -627,7 +627,6 @@ extern void nntr_gemm_qsi8d32p_qsi4c32p_packed(
 /**
  * @brief Initialization of ggml backend
  */
-extern void init_backend();
 
 /**
  * @brief Unpack Q4_0x8 data

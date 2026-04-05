@@ -9,7 +9,6 @@
  */
 
 #include <compute_ops.h>
-#include <cpu_backend.h>
 #include <q4_0_tensor.h>
 #include <tensor.h>
 

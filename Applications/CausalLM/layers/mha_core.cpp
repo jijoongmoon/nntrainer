@@ -11,6 +11,7 @@
  * @brief  This code is based on custom_multi_head_attention_layer.cpp.
  *         This code is a part of the break down version of the mha layer.
  */
+#include <cpu_backend.h>
 #include <algorithm>
 #include <cmath>
 #include <mutex>
