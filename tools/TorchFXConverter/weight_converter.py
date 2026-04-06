@@ -107,11 +107,26 @@ class WeightConverter:
         converter.convert(hf_state_dict, "model.safetensors", output_format="safetensors")
         # or
         converter.convert_from_pretrained("Qwen/Qwen3-0.6B", "model.bin")
+
+    For CausalLM-compatible output:
+        name_remap, weight_order = build_causallm_mapping(28, True, "qwen3")
+        converter = WeightConverter(layers, name_remap=name_remap,
+                                    weight_order=weight_order)
     """
 
-    def __init__(self, layers):
+    def __init__(self, layers, name_remap=None, weight_order=None):
+        """
+        Args:
+            layers: List of NNTrainerLayerDef from converter pipeline.
+            name_remap: Optional dict mapping sanitized HF layer name to
+                        target layer name (e.g. CausalLM names).
+            weight_order: Optional list of target layer names specifying
+                          the output order for binary format.
+        """
         self.layers = layers
         self.weight_map = build_weight_map(layers)
+        self.name_remap = name_remap or {}
+        self.weight_order = weight_order or []
 
     def _dtype_to_safetensors(self, dtype_str):
         """Map dtype string to safetensors dtype name."""
@@ -153,12 +168,53 @@ class WeightConverter:
         else:
             return self._convert_bin(state_dict, output_path, target_dtype)
 
+    def _remap_layer_name(self, nntr_layer):
+        """Remap a layer name using name_remap if available."""
+        return self.name_remap.get(nntr_layer, nntr_layer)
+
+    def _ordered_entries(self):
+        """Return weight map entries in the correct output order.
+
+        If weight_order is set, reorders entries to match the specified order.
+        Otherwise returns entries in their original order.
+        """
+        if not self.weight_order:
+            return list(self.weight_map)
+
+        # Build lookup: remapped_name -> entry
+        by_name = {}
+        for entry in self.weight_map:
+            remapped = self._remap_layer_name(entry["nntr_layer"])
+            suffix = ":bias" if entry.get("is_bias") else ":weight"
+            by_name[remapped + suffix] = entry
+
+        ordered = []
+        for layer_name in self.weight_order:
+            # Each layer may have weight and/or bias
+            wkey = layer_name + ":weight"
+            bkey = layer_name + ":bias"
+            if wkey in by_name:
+                ordered.append(by_name.pop(wkey))
+            if bkey in by_name:
+                ordered.append(by_name.pop(bkey))
+
+        # Append any remaining entries not in weight_order
+        for entry in self.weight_map:
+            remapped = self._remap_layer_name(entry["nntr_layer"])
+            suffix = ":bias" if entry.get("is_bias") else ":weight"
+            key = remapped + suffix
+            if key in by_name:
+                ordered.append(by_name.pop(key))
+
+        return ordered
+
     def _convert_bin(self, state_dict, output_path, target_dtype):
         """Convert to raw binary format (legacy)."""
         import torch
 
+        entries = self._ordered_entries()
         with open(output_path, "wb") as f:
-            for entry in self.weight_map:
+            for entry in entries:
                 hf_key = entry["hf_key"]
                 if hf_key not in state_dict:
                     raise KeyError(
@@ -185,17 +241,23 @@ class WeightConverter:
           [8B]  header_size (little-endian uint64)
           [header_size B] JSON header
           [data section]  raw tensor bytes
+
+        When name_remap is set, tensor names use the remapped CausalLM-style
+        layer names (e.g. "layer0_wq:weight") instead of sanitized HF names.
         """
         import torch
 
         sf_dtype = self._dtype_to_safetensors(dtype_str)
+
+        # Use ordered entries (respects weight_order if set)
+        entries = self._ordered_entries()
 
         # First pass: collect all tensor data and metadata
         tensor_data = []
         header_entries = OrderedDict()
         data_offset = 0
 
-        for entry in self.weight_map:
+        for entry in entries:
             hf_key = entry["hf_key"]
             if hf_key not in state_dict:
                 raise KeyError(
@@ -210,8 +272,8 @@ class WeightConverter:
             data = tensor.cpu().numpy().tobytes()
             data_size = len(data)
 
-            # Use NNTrainer layer name + weight suffix as the tensor name
-            nntr_name = entry["nntr_layer"]
+            # Use remapped name if available, otherwise sanitized HF name
+            nntr_name = self._remap_layer_name(entry["nntr_layer"])
             if entry.get("is_bias"):
                 nntr_name += ":bias"
             else:
@@ -271,13 +333,26 @@ class WeightConverter:
 
     def summary(self):
         """Print weight mapping summary."""
-        print(f"Weight map: {len(self.weight_map)} entries")
-        print(f"{'HF Key':<60} {'NNTrainer Layer':<30} {'Transform'}")
-        print("-" * 100)
-        for entry in self.weight_map:
-            print(f"{entry['hf_key']:<60} "
-                  f"{entry['nntr_layer']:<30} "
-                  f"{entry['transform']}")
+        entries = self._ordered_entries()
+        has_remap = bool(self.name_remap)
+        print(f"Weight map: {len(entries)} entries"
+              f"{' (CausalLM remapped)' if has_remap else ''}")
+        if has_remap:
+            print(f"{'HF Key':<55} {'Original':<30} {'Remapped':<25} {'Xform'}")
+            print("-" * 115)
+            for entry in entries:
+                remapped = self._remap_layer_name(entry['nntr_layer'])
+                print(f"{entry['hf_key']:<55} "
+                      f"{entry['nntr_layer']:<30} "
+                      f"{remapped:<25} "
+                      f"{entry['transform']}")
+        else:
+            print(f"{'HF Key':<60} {'NNTrainer Layer':<30} {'Transform'}")
+            print("-" * 100)
+            for entry in entries:
+                print(f"{entry['hf_key']:<60} "
+                      f"{entry['nntr_layer']:<30} "
+                      f"{entry['transform']}")
 
     def generate_script(self):
         """Generate a standalone Python weight conversion script.
@@ -330,6 +405,92 @@ class WeightConverter:
 
 
 # =============================================================================
+# CausalLM Name Mapping
+# =============================================================================
+
+def build_causallm_mapping(num_layers, tie_word_embeddings=True,
+                           model_type="qwen3"):
+    """Build name remapping and weight ordering for CausalLM C++ app.
+
+    The CausalLM C++ app (Applications/CausalLM) uses hardcoded layer names
+    that differ from TorchFXConverter's sanitized HuggingFace module names.
+    This function generates the mapping between them.
+
+    Args:
+        num_layers: Number of transformer decoder layers.
+        tie_word_embeddings: Whether lm_head shares weights with embedding.
+        model_type: Model architecture ("qwen3", "llama", "qwen2").
+
+    Returns:
+        tuple: (name_remap, weight_order)
+          - name_remap: dict mapping sanitized HF name -> CausalLM layer name
+          - weight_order: list of CausalLM layer names in C++ creation order
+    """
+    name_remap = {}
+    weight_order = []
+
+    # Embedding
+    name_remap["model_embed_tokens"] = "embedding0"
+    weight_order.append("embedding0")
+
+    for i in range(num_layers):
+        hf_prefix = f"model_layers_{i}_"
+        cl_prefix = f"layer{i}_"
+
+        # Attention norm
+        name_remap[f"{hf_prefix}input_layernorm"] = f"{cl_prefix}attention_norm"
+        weight_order.append(f"{cl_prefix}attention_norm")
+
+        if model_type == "qwen3":
+            # Qwen3 createAttention order: V, K, K_norm, Q, Q_norm, O
+            name_remap[f"{hf_prefix}self_attn_v_proj"] = f"{cl_prefix}wv"
+            name_remap[f"{hf_prefix}self_attn_k_proj"] = f"{cl_prefix}wk"
+            name_remap[f"{hf_prefix}self_attn_k_norm"] = f"{cl_prefix}k_norm"
+            name_remap[f"{hf_prefix}self_attn_q_proj"] = f"{cl_prefix}wq"
+            name_remap[f"{hf_prefix}self_attn_q_norm"] = f"{cl_prefix}q_norm"
+            name_remap[f"{hf_prefix}self_attn_o_proj"] = f"{cl_prefix}attention_out"
+            weight_order.extend([
+                f"{cl_prefix}wv", f"{cl_prefix}wk", f"{cl_prefix}k_norm",
+                f"{cl_prefix}wq", f"{cl_prefix}q_norm",
+                f"{cl_prefix}attention_out",
+            ])
+        else:
+            # Default (llama, qwen2): V, K, Q, O
+            name_remap[f"{hf_prefix}self_attn_v_proj"] = f"{cl_prefix}wv"
+            name_remap[f"{hf_prefix}self_attn_k_proj"] = f"{cl_prefix}wk"
+            name_remap[f"{hf_prefix}self_attn_q_proj"] = f"{cl_prefix}wq"
+            name_remap[f"{hf_prefix}self_attn_o_proj"] = f"{cl_prefix}attention_out"
+            weight_order.extend([
+                f"{cl_prefix}wv", f"{cl_prefix}wk", f"{cl_prefix}wq",
+                f"{cl_prefix}attention_out",
+            ])
+
+        # FFN norm
+        name_remap[f"{hf_prefix}post_attention_layernorm"] = f"{cl_prefix}ffn_norm"
+        weight_order.append(f"{cl_prefix}ffn_norm")
+
+        # FFN: up, gate, down
+        name_remap[f"{hf_prefix}mlp_up_proj"] = f"{cl_prefix}ffn_up"
+        name_remap[f"{hf_prefix}mlp_gate_proj"] = f"{cl_prefix}ffn_gate"
+        name_remap[f"{hf_prefix}mlp_down_proj"] = f"{cl_prefix}ffn_down"
+        weight_order.extend([
+            f"{cl_prefix}ffn_up", f"{cl_prefix}ffn_gate",
+            f"{cl_prefix}ffn_down",
+        ])
+
+    # Output norm
+    name_remap["model_norm"] = "output_norm"
+    weight_order.append("output_norm")
+
+    # LM head (only if not tied)
+    if not tie_word_embeddings:
+        name_remap["lm_head"] = "output_of_causallm"
+        weight_order.append("output_of_causallm")
+
+    return name_remap, weight_order
+
+
+# =============================================================================
 # Convenience functions
 # =============================================================================
 
@@ -348,4 +509,33 @@ def convert_weights(layers, state_dict, output_path, dtype="float32",
         str: Output file path.
     """
     converter = WeightConverter(layers)
+    return converter.convert(state_dict, output_path, dtype, output_format)
+
+
+def convert_weights_causallm(layers, state_dict, output_path, num_layers,
+                             tie_word_embeddings=True, model_type="qwen3",
+                             dtype="float32", output_format="auto"):
+    """Convert HuggingFace weights to NNTrainer CausalLM-compatible format.
+
+    Remaps weight names and reorders to match the CausalLM C++ app's
+    layer creation order, ensuring correct loading for both .bin and
+    .safetensors formats.
+
+    Args:
+        layers: List of NNTrainerLayerDef from converter pipeline.
+        state_dict: HuggingFace model state_dict.
+        output_path: Output file path (.bin or .safetensors).
+        num_layers: Number of transformer decoder layers.
+        tie_word_embeddings: Whether lm_head shares weights with embedding.
+        model_type: Model architecture ("qwen3", "llama", "qwen2").
+        dtype: Target dtype.
+        output_format: "bin", "safetensors", or "auto" (detect from extension).
+
+    Returns:
+        str: Output file path.
+    """
+    name_remap, weight_order = build_causallm_mapping(
+        num_layers, tie_word_embeddings, model_type)
+    converter = WeightConverter(layers, name_remap=name_remap,
+                                weight_order=weight_order)
     return converter.convert(state_dict, output_path, dtype, output_format)
