@@ -725,6 +725,15 @@ void compute_kcaches(const float *in, const BType *kcache, float *output,
                      size_t local_window_size = UINT_MAX, int head_start = 0,
                      int head_end = -1);
 
+/// Explicit specialization declaration for uint16_t (defined in
+/// arm_compute_backend.cpp).
+template <>
+void compute_kcaches<uint16_t>(const float *in, const uint16_t *kcache,
+                               float *output, int num_rows, int num_cache_head,
+                               int head_dim, int gqa_size, int tile_size,
+                               size_t local_window_size, int head_start,
+                               int head_end);
+
 /**
  * @brief Compute rotary embedding value
  * @param[in] width current w value from b, c, h, w
