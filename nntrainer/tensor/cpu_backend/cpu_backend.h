@@ -1551,5 +1551,57 @@ extern void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
 
 #endif /* !defined architecture headers */
 
+// Ensure key declarations are always visible in namespace nntrainer,
+// even when an architecture-specific header was already included.
+// On Android ndk-build, the guard above may skip the entire block while
+// arm_compute_backend.h declarations are sometimes not resolved correctly.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wredundant-decls"
+namespace nntrainer {
+
+extern void gelu_v2(const unsigned int N, const float *X, float *Y);
+extern void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
+extern void tanh_gelu(const unsigned int N, const float *X, float *Y);
+extern void swiglu(const unsigned int N, float *X, float *Y, float *Z);
+extern void swiglu(const unsigned int N, float *X, float *Y, float *Z,
+                   float alpha);
+extern void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z);
+extern void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y,
+                             float *Z);
+
+extern void compute_fp16vcache_fp32_transposed(
+  int row_num, const float *in, const uint16_t *vcache, float *output,
+  int num_cache_head, int gqa_size, int head_dim, size_t local_window_size,
+  int head_start, int head_end);
+
+template <typename BType>
+void compute_kcaches(const float *in, const BType *kcache, float *output,
+                     int num_rows, int num_cache_head, int head_dim,
+                     int gqa_size, int tile_size, size_t local_window_size,
+                     int head_start, int head_end);
+
+template <>
+void compute_kcaches<uint16_t>(const float *in, const uint16_t *kcache,
+                               float *output, int num_rows, int num_cache_head,
+                               int head_dim, int gqa_size, int tile_size,
+                               size_t local_window_size, int head_start,
+                               int head_end);
+
+#ifdef ENABLE_FP16
+extern void compute_fp16vcache_transposed(
+  int row_num, const _FP16 *in, const _FP16 *vcache, _FP16 *output,
+  int num_cache_head, int gqa_size, int head_dim, size_t local_window_size,
+  int head_start, int head_end);
+
+extern void compute_kcaches(const _FP16 *in, const _FP16 *kcache,
+                            _FP16 *output, int num_rows, int num_cache_head,
+                            int head_dim, int gqa_size, int tile_size,
+                            size_t local_window_size, int head_start,
+                            int head_end);
+#endif
+
+} /* namespace nntrainer */
+#pragma GCC diagnostic pop
+
 #endif /* __cplusplus */
 #endif /* __CPU_BACKEND_H__ */
