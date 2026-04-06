@@ -120,7 +120,7 @@ Tensor::Tensor(
 Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
   itensor_ = nullptr;
 
-  if (d_type == Tdatatype::FP32) {
+  if (d_type == Tdatatype::FP32 || d_type == Tdatatype::NONE) {
     itensor_ = std::make_unique<FloatTensor>(name_, fm);
   } else if (d_type == Tdatatype::FP16) {
 #ifdef ENABLE_FP16
@@ -159,7 +159,9 @@ Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
 #endif
   } else {
     throw std::invalid_argument(
-      "Error: Tensor cannot be constructed because the given d_type is not "
+      "Error: Tensor cannot be constructed because the given d_type (" +
+      std::to_string(static_cast<int>(d_type)) +
+      ") is not "
       "compatible with itensor. The supported d_types are: FP32, FP16 "
       "(if built with ENABLE_FP16).");
   }
@@ -170,7 +172,8 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
   itensor_ = nullptr;
   this->is_virtual = is_virtual;
 
-  if (d.getDataType() == Tdatatype::FP32) {
+  if (d.getDataType() == Tdatatype::FP32 ||
+      d.getDataType() == Tdatatype::NONE) {
     itensor_ = std::make_unique<FloatTensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::FP16) {
 #ifdef ENABLE_FP16
@@ -215,7 +218,9 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
 #endif
   } else {
     throw std::invalid_argument(
-      "Error: Tensor cannot be constructed because the given d_type is not "
+      "Error: Tensor cannot be constructed because the given d_type (" +
+      std::to_string(static_cast<int>(d.getDataType())) +
+      ") is not "
       "compatible with itensor. The supported d_types are: FP32, FP16 "
       "(if built with ENABLE_FP16).");
   }
@@ -224,7 +229,8 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
 Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
   itensor_ = nullptr;
 
-  if (d.getDataType() == Tdatatype::FP32) {
+  if (d.getDataType() == Tdatatype::FP32 ||
+      d.getDataType() == Tdatatype::NONE) {
     itensor_ = std::make_unique<FloatTensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::FP16) {
 #ifdef ENABLE_FP16
@@ -266,7 +272,9 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
 #endif
   } else {
     throw std::invalid_argument(
-      "Error: Tensor cannot be constructed because the given d_type is not "
+      "Error: Tensor cannot be constructed because the given d_type (" +
+      std::to_string(static_cast<int>(d.getDataType())) +
+      ") is not "
       "compatible with itensor. The supported d_types are: FP32, FP16 "
       "(if built with ENABLE_FP16).");
   }
