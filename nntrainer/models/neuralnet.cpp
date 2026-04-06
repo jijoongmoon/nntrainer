@@ -1006,6 +1006,14 @@ void NeuralNetwork::load(const std::string &file_path,
     parse_safetensors_header(header_json, name_offset_map);
     ml_logi("Loaded safetensors file with %zu tensor entries",
             name_offset_map.size());
+
+    // Debug: print all tensor names in safetensors header
+    ml_logi("=== Safetensors tensor names ===");
+    for (auto &kv : name_offset_map) {
+      ml_logi("  [safetensors] '%s' offset=%zu size=%zu", kv.first.c_str(),
+              kv.second.first, kv.second.second);
+    }
+    ml_logi("================================");
   }
 
   /**
@@ -1016,6 +1024,8 @@ void NeuralNetwork::load(const std::string &file_path,
   size_t start_from = 0;
   std::vector<std::pair<size_t, size_t>> file_offset;
   std::unordered_set<const Tensor *> visited_weights;
+  unsigned int weight_match_count = 0;
+  unsigned int weight_miss_count = 0;
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
     auto weights = (*iter)->getRunContext().getWeights();
     for (auto weight : weights) {
@@ -1036,11 +1046,15 @@ void NeuralNetwork::load(const std::string &file_path,
         if (it != name_offset_map.end()) {
           weight->getVariableRef().setFileOffset(data_section_start +
                                                  it->second.first);
+          ml_logi("  [MATCH] nntr='%s' -> offset=%zu",
+                  weight->getName().c_str(),
+                  data_section_start + it->second.first);
+          weight_match_count++;
         } else {
-          ml_logw("Weight '%s' not found in safetensors header, "
-                  "using sequential offset",
+          ml_logw("  [MISS]  nntr='%s' NOT FOUND in safetensors",
                   weight->getName().c_str());
           weight->getVariableRef().setFileOffset(start_from);
+          weight_miss_count++;
         }
       } else {
         weight->getVariableRef().setFileOffset(start_from);
@@ -1056,6 +1070,11 @@ void NeuralNetwork::load(const std::string &file_path,
         std::make_pair(weight->getVariable().getFileOffset(), size));
       start_from += size;
     }
+  }
+
+  if (is_safetensors) {
+    ml_logi("=== Safetensors load summary: %u matched, %u missed ===",
+            weight_match_count, weight_miss_count);
   }
 
   if (exec_mode == ExecutionMode::INFERENCE && fsu_mode) {
