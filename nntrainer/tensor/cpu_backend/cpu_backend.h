@@ -28,9 +28,9 @@
 #include <cstdint>
 #include <tensor_dim.h>
 
-// The architecture-specific headers above already declare all backend functions
-// inside namespace nntrainer. The block below provides the same declarations
-// as a fallback for any edge case where no architecture header was included.
+// Architecture-specific headers above declare all backend functions inside
+// namespace nntrainer. Skip the duplicate declarations below when present.
+// When no architecture header matches, these provide the declarations.
 #if !defined(__ARM_COMPUTE_BACKEND_H__) && !defined(__x86_COMPUTE_BACKEND_H__) && \
   !defined(__FALLBACK_H__)
 
@@ -1541,7 +1541,7 @@ extern void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
 
 } /* namespace nntrainer */
 
-#endif /* architecture header guard */
+#endif /* !defined architecture headers */
 
-#endif
-#endif
+#endif /* __cplusplus */
+#endif /* __CPU_BACKEND_H__ */
