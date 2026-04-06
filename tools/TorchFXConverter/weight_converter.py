@@ -539,3 +539,170 @@ def convert_weights_causallm(layers, state_dict, output_path, num_layers,
     converter = WeightConverter(layers, name_remap=name_remap,
                                 weight_order=weight_order)
     return converter.convert(state_dict, output_path, dtype, output_format)
+
+
+def convert_causallm_from_pretrained(model_path, output_path, model_type="qwen3",
+                                     dtype="float32", output_format="auto"):
+    """Convert a local HuggingFace model directly to CausalLM-compatible format.
+
+    This is a standalone function that does NOT require the TorchFXConverter
+    tracing pipeline. It reads the HF model config, builds the correct weight
+    mapping for CausalLM, and converts weights.
+
+    Args:
+        model_path: Local path to HuggingFace model directory.
+        output_path: Output file path (.bin or .safetensors).
+        model_type: Model architecture ("qwen3", "llama", "qwen2").
+        dtype: Target dtype ("float32" or "float16").
+        output_format: "bin", "safetensors", or "auto".
+
+    Returns:
+        str: Output file path.
+    """
+    import torch
+    import numpy as np
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    if output_format == "auto":
+        output_format = "safetensors" if output_path.endswith(".safetensors") else "bin"
+
+    # Load model config and weights
+    config = AutoConfig.from_pretrained(model_path)
+    print(f"Loading model from {model_path}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.float32, trust_remote_code=True)
+    model.eval()
+    state_dict = model.state_dict()
+
+    num_layers = config.num_hidden_layers
+    tie_word = getattr(config, "tie_word_embeddings", True)
+
+    # Auto-detect model_type from config if not specified
+    if model_type == "auto":
+        arch = getattr(config, "model_type", "").lower()
+        if "qwen3" in arch or (hasattr(config, "architectures") and
+                any("Qwen3" in a for a in config.architectures)):
+            model_type = "qwen3"
+        else:
+            model_type = "llama"  # default fallback
+
+    name_remap, weight_order = build_causallm_mapping(
+        num_layers, tie_word, model_type)
+
+    print(f"Model: {model_path}")
+    print(f"  type={model_type}, layers={num_layers}, "
+          f"tie_word_embeddings={tie_word}")
+    print(f"  Output: {output_path} ({output_format}, {dtype})")
+
+    # Build weight entries in CausalLM order
+    # Map: causallm_name -> (hf_key, transform)
+    _ATTN_PROJS = {"wv": "v_proj", "wk": "k_proj", "wq": "q_proj",
+                   "attention_out": "o_proj"}
+    _FFN_PROJS = {"ffn_up": "up_proj", "ffn_gate": "gate_proj",
+                  "ffn_down": "down_proj"}
+
+    target_dtype = torch.float32 if dtype == "float32" else torch.float16
+    sf_dtype = "F32" if dtype == "float32" else "F16"
+
+    # Collect tensors in CausalLM order
+    ordered_tensors = []  # list of (causallm_name, tensor_bytes, shape)
+
+    for cl_name in weight_order:
+        if cl_name == "embedding0":
+            hf_key = "model.embed_tokens.weight"
+            t = state_dict[hf_key].to(target_dtype)
+        elif cl_name == "output_norm":
+            hf_key = "model.norm.weight"
+            t = state_dict[hf_key].to(target_dtype)
+        elif cl_name == "output_of_causallm":
+            hf_key = "lm_head.weight"
+            t = state_dict[hf_key].to(target_dtype).t().contiguous()
+        else:
+            # Parse layer index: "layer{i}_{suffix}"
+            parts = cl_name.split("_", 1)
+            layer_idx = int(parts[0].replace("layer", ""))
+            suffix = parts[1]
+            lp = f"model.layers.{layer_idx}."
+
+            if suffix == "attention_norm":
+                hf_key = f"{lp}input_layernorm.weight"
+                t = state_dict[hf_key].to(target_dtype)
+            elif suffix == "ffn_norm":
+                hf_key = f"{lp}post_attention_layernorm.weight"
+                t = state_dict[hf_key].to(target_dtype)
+            elif suffix == "q_norm":
+                hf_key = f"{lp}self_attn.q_norm.weight"
+                t = state_dict[hf_key].to(target_dtype)
+            elif suffix == "k_norm":
+                hf_key = f"{lp}self_attn.k_norm.weight"
+                t = state_dict[hf_key].to(target_dtype)
+            elif suffix in _ATTN_PROJS:
+                hf_key = f"{lp}self_attn.{_ATTN_PROJS[suffix]}.weight"
+                t = state_dict[hf_key].to(target_dtype).t().contiguous()
+            elif suffix in _FFN_PROJS:
+                hf_key = f"{lp}mlp.{_FFN_PROJS[suffix]}.weight"
+                t = state_dict[hf_key].to(target_dtype).t().contiguous()
+            else:
+                raise ValueError(f"Unknown CausalLM layer suffix: {suffix}")
+
+        data = t.cpu().numpy().tobytes()
+        ordered_tensors.append((cl_name + ":weight", data, list(t.shape)))
+
+    # Write output
+    if output_format == "bin":
+        with open(output_path, "wb") as f:
+            for _, data, _ in ordered_tensors:
+                f.write(data)
+    else:
+        # Safetensors
+        header_entries = OrderedDict()
+        data_offset = 0
+        for name, data, shape in ordered_tensors:
+            header_entries[name] = {
+                "dtype": sf_dtype, "shape": shape,
+                "data_offsets": [data_offset, data_offset + len(data)],
+            }
+            data_offset += len(data)
+
+        header_dict = {"__metadata__": {"format": "nntrainer"}}
+        header_dict.update(header_entries)
+        header_json = json.dumps(header_dict, separators=(",", ":"),
+                                 ensure_ascii=True)
+        header_bytes = header_json.encode("utf-8")
+        pad_len = (8 - len(header_bytes) % 8) % 8
+        header_bytes += b" " * pad_len
+
+        with open(output_path, "wb") as f:
+            f.write(struct.pack("<Q", len(header_bytes)))
+            f.write(header_bytes)
+            for _, data, _ in ordered_tensors:
+                f.write(data)
+
+    print(f"Saved {len(ordered_tensors)} weights to {output_path}")
+    return output_path
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Convert HuggingFace model weights to NNTrainer format")
+    parser.add_argument("--model_path", type=str, required=True,
+                        help="Local path to HuggingFace model")
+    parser.add_argument("--output", type=str, required=True,
+                        help="Output file path (.bin or .safetensors)")
+    parser.add_argument("--model_type", type=str, default="auto",
+                        choices=["auto", "qwen3", "llama", "qwen2"],
+                        help="Model architecture (default: auto-detect)")
+    parser.add_argument("--dtype", type=str, default="float32",
+                        choices=["float32", "float16"],
+                        help="Target data type")
+    args = parser.parse_args()
+
+    convert_causallm_from_pretrained(
+        args.model_path, args.output,
+        model_type=args.model_type, dtype=args.dtype)
