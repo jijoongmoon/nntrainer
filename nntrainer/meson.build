@@ -63,10 +63,15 @@ endif
 
 if get_option('enable-npu')
   nntrainer_elements += 'qnn'
+  # Note: qnn subdir is NOT processed here with the other elements.
+  # libqnn_context.so depends on nntrainer_dep, which is declared later.
+  # The qnn subdir is processed after nntrainer_dep is available (see below).
 endif
 
 foreach elem : nntrainer_elements
-  subdir(elem)
+  if elem != 'qnn'
+    subdir(elem)
+  endif
   nntrainer_inc += include_directories(elem)
   nntrainer_inc_abs += meson.current_source_dir() / elem
 endforeach
@@ -143,6 +148,12 @@ else
     dependencies: nntrainer_base_deps,
     include_directories: nntrainer_inc
   )
+endif
+
+# Build QNN context plugin after nntrainer_dep is available.
+# libqnn_context.so links against libnntrainer, so it must be built after it.
+if get_option('enable-npu')
+  subdir('qnn')
 endif
 
 # Install headers
