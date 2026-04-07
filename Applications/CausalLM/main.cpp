@@ -42,6 +42,7 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include <models/gemma3/function.h>
+#include "chat_template.h"
 #include <sys/resource.h>
 
 #include <atomic>
@@ -248,14 +249,28 @@ int main(int argc, char *argv[]) {
       input_text = argv[2];
     } else {
       if (nntr_cfg.contains("chat_input")) {
-        if (architecture == "Gemma3ForCausalLM") {
+        // Try dynamic chat template from tokenizer_config.json first
+        causallm::ChatTemplate chat_tmpl;
+        std::string tokenizer_config_path =
+          model_path + "/tokenizer_config.json";
+        bool has_dynamic_template =
+          chat_tmpl.load_from_tokenizer_config(tokenizer_config_path);
+
+        if (has_dynamic_template) {
+          input_text =
+            chat_tmpl.apply_chat_input(nntr_cfg["chat_input"], true);
+          std::cout << "[ChatTemplate] Applied dynamic template from "
+                       "tokenizer_config.json"
+                    << std::endl;
+        } else if (architecture == "Gemma3ForCausalLM") {
+          // Fallback to Gemma3-specific function template
           input_text = causallm::gemma3::apply_function_gemma_template(
             nntr_cfg["chat_input"]);
         } else {
-          std::cerr << "[Warning] 'chat_input' is set but support for model "
-                       "architecture '"
-                    << architecture
-                    << "' is not implemented. Falling back to 'sample_input'."
+          std::cerr << "[Warning] 'chat_input' is set but no chat_template "
+                       "found in tokenizer_config.json and no built-in "
+                       "template for '"
+                    << architecture << "'. Falling back to 'sample_input'."
                     << std::endl;
           input_text = nntr_cfg["sample_input"].get<std::string>();
         }
