@@ -86,7 +86,62 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
-                                bool training) {}
+                                bool training) {
+  unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
+  unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
+  float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
+                  ? 1.0f
+                  : std::get<nntrainer::props::Scale>(embedding_props).get();
+
+  nntrainer::Tensor &weight = context.getWeight(weight_idx);
+  nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  nntrainer::TensorDim out_tensor_dim =
+    nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
+
+  unsigned int b_size = input_.batch();
+  unsigned int iter = input_.height();
+
+  for (unsigned int b = 0; b < b_size; ++b) {
+    float *in_data =
+      input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+    nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
+      size_t embed_idx = static_cast<size_t>(in_data[i]);
+      if (embed_idx >= in_dim) {
+        throw std::invalid_argument("input word index is greater than in_dim");
+      }
+
+      nntrainer::Tensor cur_weight =
+        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
+      nntrainer::Tensor out_tensor =
+        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
+
+      if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
+        int num_blocks_per_row = (weight.width() + 256 - 1) / 256;
+        nntrainer::dequantize_row_q6_K(
+          (void *)((char *)weight.getData<uint8_t>() +
+                   (210 * num_blocks_per_row) * embed_idx),
+          out_tensor.getData(), out_dim);
+      } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
+        int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
+        nntrainer::dequantize_row_q4_0(
+          (void *)((char *)weight.getData<uint8_t>() +
+                   (18 * num_blocks_per_row) * embed_idx),
+          out_tensor.getData(), out_dim);
+      } else {
+        out_tensor.copyData(cur_weight);
+      }
+
+      if (scale != 1.0f) {
+        out_tensor.multiply_i(scale);
+      }
+    });
+  }
+}
 
 void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
