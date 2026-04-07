@@ -818,23 +818,12 @@ void LayerNode::forwarding(bool training) {
  */
 void LayerNode::incremental_forwarding(unsigned int from, unsigned int to,
                                        bool training) {
-  loss->set(run_context->getRegularizationLoss());
-  PROFILE_TIME_START(forward_event_key);
-  // std::cerr << getType() << "\n";
-  layer->incremental_forwarding(*run_context, from, to, training);
-  PROFILE_TIME_END(forward_event_key);
-  TRACE_MEMORY() << getName() + ": F";
-  TRACE_TIME() << getName() + ": F";
-
-#ifdef DEBUG
-  if (!run_context->validate(getNumInputConnections() == 0, !requireLabel()))
-    throw std::runtime_error("Running forwarding() layer " + getName() +
-                             " invalidated the context.");
-#endif
-
-  /** add loss only for loss layers */
-  if (requireLabel())
-    loss->set(*loss + run_context->getLoss());
+  /** @note incremental_forwarding now delegates to forwarding().
+   *  All layers use forwarding() directly. The from/to parameters are
+   *  kept in the signature for backward compatibility with the framework
+   *  call chain (neuralnet → network_graph → layer_node).
+   */
+  forwarding(training);
 }
 
 /**
