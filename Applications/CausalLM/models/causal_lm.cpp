@@ -256,6 +256,46 @@ void CausalLM::initKVCacheManager() {
                               ml::train::TensorDim::DataType::FP32);
 }
 
+std::vector<float *>
+CausalLM::prefill(unsigned int batch, const std::vector<float *> &input,
+                  const std::vector<float *> &label, unsigned int seq_len) {
+  // Resize model tensors for prefill sequence length
+  ml::train::TensorDim input_dim(batch, 1, seq_len, 1);
+  model->resetInputDimension({input_dim});
+
+  // Set cache_index on all mha_core layers via forEachLayer
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+            void *) {
+      if (l.getType() == causallm::MHACoreLayer::type) {
+        auto &mha = dynamic_cast<causallm::MHACoreLayer &>(l);
+        mha.setCacheIndex(0);
+      }
+    };
+  model->forEachLayer(fn, nullptr);
+
+  // Run inference using forwarding()
+  auto output = model->inference(batch, input, label);
+  return output;
+}
+
+std::vector<float *>
+CausalLM::generate_step(unsigned int batch, const std::vector<float *> &input,
+                         const std::vector<float *> &label) {
+  static bool dim_set_for_generation = false;
+
+  if (!dim_set_for_generation) {
+    // Resize model tensors for single token generation (height=1)
+    ml::train::TensorDim input_dim(batch, 1, 1, 1);
+    model->resetInputDimension({input_dim});
+    dim_set_for_generation = true;
+  }
+
+  // Run inference using forwarding()
+  auto output = model->inference(batch, input, label);
+  return output;
+}
+
 std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
                                              float repetition_penalty,
                                              unsigned int *input_ids,
