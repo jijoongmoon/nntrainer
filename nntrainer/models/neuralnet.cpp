@@ -851,6 +851,7 @@ void NeuralNetwork::load(const std::string &file_path,
    */
   size_t data_section_start = 0;
   std::unordered_map<std::string, std::pair<size_t, size_t>> name_offset_map;
+  std::unordered_map<std::string, std::pair<size_t, size_t>> prefix_offset_map;
   bool is_safetensors = (format == ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS);
 
   if (is_safetensors) {
@@ -1007,13 +1008,19 @@ void NeuralNetwork::load(const std::string &file_path,
     ml_logi("Loaded safetensors file with %zu tensor entries",
             name_offset_map.size());
 
-    // Debug: print all tensor names in safetensors header
-    ml_logi("=== Safetensors tensor names ===");
+    // Build prefix-based fallback map: "layer_name" -> (offset, size)
+    // This allows matching when the weight suffix differs between
+    // the safetensors file and the C++ model (e.g., ":weight" vs ":gamma").
     for (auto &kv : name_offset_map) {
-      ml_logi("  [safetensors] '%s' offset=%zu size=%zu", kv.first.c_str(),
-              kv.second.first, kv.second.second);
+      auto colon_pos = kv.first.find(':');
+      if (colon_pos != std::string::npos) {
+        std::string prefix = kv.first.substr(0, colon_pos);
+        // Only store first occurrence per prefix (weight before bias)
+        if (prefix_offset_map.find(prefix) == prefix_offset_map.end()) {
+          prefix_offset_map[prefix] = kv.second;
+        }
+      }
     }
-    ml_logi("================================");
   }
 
   /**
@@ -1042,19 +1049,35 @@ void NeuralNetwork::load(const std::string &file_path,
       auto tensor_data_type = weight->getDim().getDataType();
 
       if (is_safetensors) {
-        auto it = name_offset_map.find(weight->getName());
+        const std::string &wname = weight->getName();
+        auto it = name_offset_map.find(wname);
         if (it != name_offset_map.end()) {
+          // Exact match: safetensors name == C++ weight name
           weight->getVariableRef().setFileOffset(data_section_start +
                                                  it->second.first);
-          ml_logi("  [MATCH] nntr='%s' -> offset=%zu",
-                  weight->getName().c_str(),
+          ml_logi("  [MATCH] '%s' -> offset=%zu", wname.c_str(),
                   data_section_start + it->second.first);
           weight_match_count++;
         } else {
-          ml_logw("  [MISS]  nntr='%s' NOT FOUND in safetensors",
-                  weight->getName().c_str());
-          weight->getVariableRef().setFileOffset(start_from);
-          weight_miss_count++;
+          // Prefix fallback: match by layer name prefix (before ':')
+          // This handles suffix mismatches like ":weight" vs ":gamma"
+          auto colon_pos = wname.find(':');
+          std::string prefix =
+            (colon_pos != std::string::npos) ? wname.substr(0, colon_pos) : wname;
+          auto pit = prefix_offset_map.find(prefix);
+          if (pit != prefix_offset_map.end()) {
+            weight->getVariableRef().setFileOffset(data_section_start +
+                                                   pit->second.first);
+            ml_logi("  [PREFIX] '%s' matched by prefix '%s' -> offset=%zu",
+                    wname.c_str(), prefix.c_str(),
+                    data_section_start + pit->second.first);
+            weight_match_count++;
+          } else {
+            ml_logw("  [MISS] '%s' NOT FOUND in safetensors",
+                    wname.c_str());
+            weight->getVariableRef().setFileOffset(start_from);
+            weight_miss_count++;
+          }
         }
       } else {
         weight->getVariableRef().setFileOffset(start_from);
