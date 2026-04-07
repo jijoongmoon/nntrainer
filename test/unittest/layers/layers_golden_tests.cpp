@@ -446,20 +446,10 @@ TEST_P(LayerGoldenTest, run) {
 
   for (int i = 0; i < 4; ++i) {
     /// warm layer multiple times
-    if (use_inc_forward) {
-      layer->incremental_forwarding(rc, 0, inputHeight,
-                                    !shouldForwardWithInferenceMode());
-    } else {
-      layer->forwarding(rc, !shouldForwardWithInferenceMode());
-    }
-  }
-
-  if (use_inc_forward) {
-    layer->incremental_forwarding(rc, 0, inputHeight,
-                                  !shouldForwardWithInferenceMode());
-  } else {
     layer->forwarding(rc, !shouldForwardWithInferenceMode());
   }
+
+  layer->forwarding(rc, !shouldForwardWithInferenceMode());
 
   if (!skip_calc_grad) {
     layer->calcGradient(rc);

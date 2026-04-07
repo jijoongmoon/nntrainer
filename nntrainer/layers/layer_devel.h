@@ -220,11 +220,6 @@ public:
    * outputs, and tensors (if any) for the layer. Input and output dimensions
    * can be access from the inputs/outputs tensors themselves.
    */
-  virtual void incremental_forwarding(RunLayerContext &context,
-                                      unsigned int from, unsigned int to,
-                                      bool training) {
-    forwarding(context, training);
-  };
 
   /**
    * @brief     calc the derivative to be passed to the previous layer
