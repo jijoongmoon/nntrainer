@@ -204,6 +204,30 @@ void FullyConnectedLayer::setBatch(nntrainer::RunLayerContext &context,
   }
 }
 
+void FullyConnectedLayer::updateTensorsByInputDimensions(
+  nntrainer::RunLayerContext &context,
+  std::vector<ml::train::TensorDim> input_dimensions) {
+  ml::train::TensorDim in_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
+  ml::train::TensorDim out_dim = context.getOutput(SINGLE_INOUT_IDX).getDim();
+
+  in_dim.height(input_dimensions[0].height());
+  out_dim.height(input_dimensions[0].height());
+
+  context.updateInput(SINGLE_INOUT_IDX, in_dim);
+  context.updateOutput(SINGLE_INOUT_IDX, out_dim);
+
+  if (!std::get<props::LoraRank>(fc_props).empty()) {
+    ml::train::TensorDim lora_tmp_dim =
+      context.getTensor(lora_idx[LORAParams::loraTmp]).getDim();
+    ml::train::TensorDim lora_out_dim =
+      context.getTensor(lora_idx[LORAParams::loraOut]).getDim();
+    lora_tmp_dim.height(input_dimensions[0].height());
+    lora_out_dim.height(input_dimensions[0].height());
+    context.updateTensor(lora_idx[LORAParams::loraTmp], lora_tmp_dim);
+    context.updateTensor(lora_idx[LORAParams::loraOut], lora_out_dim);
+  }
+}
+
 void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
