@@ -76,23 +76,6 @@ void SwiGLULayerCl::forwarding(RunLayerContext &context, bool training) {
   swigluProcess(in1, in2, out);
 }
 
-void SwiGLULayerCl::incremental_forwarding(RunLayerContext &context,
-                                           unsigned int from, unsigned int to,
-                                           bool training) {
-  Tensor &in1 = context.getInput(INPUT_IDX_1);
-  Tensor &in2 = context.getInput(INPUT_IDX_2);
-  Tensor &out = context.getOutput(OUT_IDX);
-
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-    from = 0;
-    to = 1;
-  }
-
-  swigluProcess(in1, in2, out);
-}
-
 void SwiGLULayerCl::swigluProcess(Tensor const &in1, Tensor const &in2,
                                   Tensor &result) {
 

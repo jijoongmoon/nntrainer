@@ -153,12 +153,6 @@ void InstanceNormalizationLayer::forwarding(RunLayerContext &context,
   }
 }
 
-void InstanceNormalizationLayer::incremental_forwarding(
-  RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
-  forwarding(context, training);
-}
-
 void InstanceNormalizationLayer::calcDerivative(RunLayerContext &context) {
   Tensor &outgoing_derivative = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
   const Tensor &incoming_derivative =
