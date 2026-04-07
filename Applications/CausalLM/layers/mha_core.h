@@ -295,6 +295,18 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
+  /**
+   * @brief Set the cache index for external cache mode.
+   *        Must be called before forwarding() when use_external_cache is true.
+   * @param[in] idx current write position in the KV cache
+   */
+  WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
+
+  /**
+   * @brief Get the current cache index
+   */
+  WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
+
   inline static const std::string type = "mha_core";
 
 private:
