@@ -55,24 +55,29 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
 
         if is_full_attention_layer(layer_idx, interval):
             # Full attention layer
-            # Q projection is 2x size: [hidden_size, num_heads*head_dim*2]
-            # Split into query half and gate half for separate FC layers
+            # Weight order must match model's addLayer order:
+            #   wq, wq_gate, q_norm, wk, k_norm, wv, (mha_core=no weight),
+            #   (attn_gate=no weight), attention_out
+
+            # Q projection is 2x size: split into query and gate
             q_weight = params[f"{prefix}self_attn.q_proj.weight"]  # [out, in]
             q_out_dim = q_weight.shape[0]
             q_half = q_out_dim // 2
-            # wq (query): first half, transposed to [in, out/2]
+            # wq (query): first half
             save_weight(q_weight[:q_half, :].permute(1, 0))
-            # wq_gate (gate): second half, transposed to [in, out/2]
+            # wq_gate (gate): second half
             save_weight(q_weight[q_half:, :].permute(1, 0))
+            # Q norm (reshaped_rms_norm)
+            save_weight(params[f"{prefix}self_attn.q_norm.weight"])
             # K projection
             save_weight(params[f"{prefix}self_attn.k_proj.weight"].permute(1, 0))
+            # K norm (reshaped_rms_norm)
+            save_weight(params[f"{prefix}self_attn.k_norm.weight"])
             # V projection
             save_weight(params[f"{prefix}self_attn.v_proj.weight"].permute(1, 0))
-            # Q norm
-            save_weight(params[f"{prefix}self_attn.q_norm.weight"])
-            # K norm
-            save_weight(params[f"{prefix}self_attn.k_norm.weight"])
-            # O projection (attn_gate in GGUF)
+            # mha_core: no weight (sink only if enabled)
+            # attn_gate: no weight
+            # O projection (attention_out)
             save_weight(params[f"{prefix}self_attn.o_proj.weight"].permute(1, 0))
         else:
             # Linear attention layer (GatedDeltaNet)
