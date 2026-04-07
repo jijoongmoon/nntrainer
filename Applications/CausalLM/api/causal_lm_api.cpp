@@ -516,7 +516,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     // Try to load dynamic chat template from tokenizer_config.json
     g_chat_template = std::make_unique<causallm::ChatTemplate>();
     std::string tokenizer_config_path =
-      model_path + "/tokenizer_config.json";
+      model_dir_path + "/tokenizer_config.json";
     if (g_chat_template->load_from_tokenizer_config(tokenizer_config_path)) {
       std::cout << "[ChatTemplate] Loaded dynamic template from "
                 << tokenizer_config_path << std::endl;
