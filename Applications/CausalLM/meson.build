@@ -29,6 +29,9 @@ causallm_layer_dependencies += [
     causallm_qkv_layer_dep,
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
+    causallm_gated_delta_net_dep,
+    causallm_rms_norm_gated_dep,
+    causallm_attention_gate_dep,
 ]
 
 subdir('models')
