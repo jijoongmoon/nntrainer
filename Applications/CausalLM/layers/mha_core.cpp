@@ -208,17 +208,25 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
-  if (!use_external_cache) {
-    return;
-  }
-
   nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
   nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
   nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
   nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
 
-  nntrainer::Tensor &ext_cache_key = context.getInput(3);
-  nntrainer::Tensor &ext_cache_value = context.getInput(4);
+  nntrainer::Tensor *cache_key_ptr;
+  nntrainer::Tensor *cache_value_ptr;
+
+  if (use_external_cache) {
+    cache_key_ptr = &context.getInput(3);
+    cache_value_ptr = &context.getInput(4);
+  } else {
+    cache_key_ptr = &context.getTensor(tensor_idx[AttentionParams::cache_key]);
+    cache_value_ptr =
+      &context.getTensor(tensor_idx[AttentionParams::cache_value]);
+  }
+
+  nntrainer::Tensor &cache_key = *cache_key_ptr;
+  nntrainer::Tensor &cache_value = *cache_value_ptr;
 
   unsigned int step_size = query.height();
 
@@ -233,8 +241,8 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   ml::train::TensorDim key_dim = key.getDim();
   ml::train::TensorDim value_dim = value.getDim();
   ml::train::TensorDim output_dim = output.getDim();
-  ml::train::TensorDim cache_key_dim = ext_cache_key.getDim();
-  ml::train::TensorDim cache_value_dim = ext_cache_value.getDim();
+  ml::train::TensorDim cache_key_dim = cache_key.getDim();
+  ml::train::TensorDim cache_value_dim = cache_value.getDim();
 
   ml::train::TensorDim query_step_dim = get_step_dim(query_dim);
   ml::train::TensorDim key_step_dim = get_step_dim(key_dim);
@@ -277,20 +285,20 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 
       one_batch_incremental_forwarding(
         batch, 0, 0, step_size, Q_step, K_step, V_step, O_step,
-        ext_cache_key, ext_cache_value, cache_key_dim, cache_key_step_dim,
+        cache_key, cache_value, cache_key_dim, cache_key_step_dim,
         cache_value_dim, cache_value_step_dim);
 
       output_step.copyData(O_step);
 #else
       one_batch_incremental_forwarding(
         batch, 0, 0, step_size, query_step, key_step, value_step, output_step,
-        ext_cache_key, ext_cache_value, cache_key_dim, cache_key_step_dim,
+        cache_key, cache_value, cache_key_dim, cache_key_step_dim,
         cache_value_dim, cache_value_step_dim);
 #endif
     } else {
       one_batch_incremental_forwarding(
         batch, 0, 0, step_size, query_step, key_step, value_step, output_step,
-        ext_cache_key, ext_cache_value, cache_key_dim, cache_key_step_dim,
+        cache_key, cache_value, cache_key_dim, cache_key_step_dim,
         cache_value_dim, cache_value_step_dim);
     }
   }
@@ -1164,7 +1172,8 @@ void MHACoreLayer::updateTensorsByInputDimensions(
     std::get<props::MaxNewTokens>(mha_core_props).get();
   max_position_embeddings =
     std::get<props::MaxPositionEmbeddings>(mha_core_props).get();
-  max_timestep = height + max_new_tokens;
+
+  unsigned int new_max_timestep = height + max_new_tokens;
 
   ml::train::TensorDim kv_dim = input_dimensions[0];
   kv_dim.width(kv_dim.width() / (num_heads_Q / num_heads_KV));
@@ -1175,6 +1184,12 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   context.updateOutput(0, input_dimensions[0]);
 
   if (!use_external_cache) {
+    // Only grow cache, never shrink (generation mode with height=1 must not
+    // reduce cache that was sized during prefill)
+    if (new_max_timestep > max_timestep) {
+      max_timestep = new_max_timestep;
+    }
+
     ml::train::TensorDim kv_cache_dim = kv_dim;
 #ifdef ENABLE_FP16
     kv_cache_dim.setDataType(ml::train::TensorDim::DataType::FP16);
@@ -1185,6 +1200,8 @@ void MHACoreLayer::updateTensorsByInputDimensions(
 
     context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
     context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
+  } else {
+    max_timestep = new_max_timestep;
   }
 }
 
