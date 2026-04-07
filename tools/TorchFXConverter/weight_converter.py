@@ -487,7 +487,7 @@ def build_causallm_mapping(num_layers, tie_word_embeddings=True,
         name_remap["lm_head"] = "output_of_causallm"
         weight_order.append("output_of_causallm")
 
-    return name_remap, weight_order, weight_suffix_map
+    return name_remap, weight_order
 
 
 # =============================================================================
