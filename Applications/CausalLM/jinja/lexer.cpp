@@ -60,6 +60,7 @@ std::vector<Token> Lexer::tokenize() {
       // Handle whitespace trimming: {{-
       pos_ += 2;
       bool ltrim = false;
+      (void)ltrim;
       if (!at_end() && peek() == '-') {
         ltrim = true;
         pos_++;
@@ -78,6 +79,7 @@ std::vector<Token> Lexer::tokenize() {
     } else if (match("{%")) {
       pos_ += 2;
       bool ltrim = false;
+      (void)ltrim;
       if (!at_end() && peek() == '-') {
         ltrim = true;
         pos_++;
