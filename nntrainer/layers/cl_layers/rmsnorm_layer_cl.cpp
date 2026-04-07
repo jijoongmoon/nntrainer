@@ -206,44 +206,6 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
 }
 #endif
 
-void RMSNormLayerCl::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                            unsigned int from, unsigned int to,
-                                            bool training) {
-  Tensor &in = context.getInput(SINGLE_INOUT_IDX);
-  Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
-  Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
-  ml::train::TensorDim in_dim = in.getDim();
-  ml::train::TensorDim out_dim = out.getDim();
-
-  ml::train::TensorDim in_step_dim = in_dim;
-  ml::train::TensorDim out_step_dim = out_dim;
-
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-    from = 0;
-    to = 1;
-  }
-
-  in_step_dim.height(to - from);
-  out_step_dim.height(to - from);
-
-  Tensor in_step = in.getSharedDataTensor(in_step_dim, 0, true);
-  Tensor out_step = out.getSharedDataTensor(out_step_dim, 0, true);
-
-  auto &epsilon = std::get<props::Epsilon>(rmsnorm_props).get();
-
-  if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    rmsnormProcess(in, out, gamma, epsilon);
-  } else {
-#ifdef ENABLE_FP16
-    rmsnormProcess_fp16(in, out, gamma, epsilon);
-#else
-    throw std::runtime_error("enable-fp16 is not enabled");
-#endif
-  }
-}
-
 void RMSNormLayerCl::calcDerivative(RunLayerContext &context) {
   ml_logi("Training not supported");
 }

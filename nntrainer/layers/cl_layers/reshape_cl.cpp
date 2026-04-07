@@ -99,22 +99,6 @@ void ReshapeLayerCl::forwarding(RunLayerContext &context, bool training) {
   }
 }
 
-void ReshapeLayerCl::incremental_forwarding(RunLayerContext &context,
-                                            unsigned int from, unsigned int to,
-                                            bool training) {
-  if (!context.getInPlace()) {
-    Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
-    const Tensor &input = context.getInput(SINGLE_INOUT_IDX);
-    if (from) {
-      NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-        << "incremental step size is not 1";
-      from = 0;
-      to = 1;
-    }
-    ReshapeProcess(input, output);
-  }
-}
-
 void ReshapeLayerCl::ReshapeProcess(Tensor const &input, Tensor &output) {
   if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
     const float *data = input.getData();

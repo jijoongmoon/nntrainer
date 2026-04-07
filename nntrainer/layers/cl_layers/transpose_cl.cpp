@@ -42,21 +42,6 @@ void TransposeLayerCl::forwarding(RunLayerContext &context, bool training) {
   transposeCl("1:0:2", in, out);
 }
 
-void TransposeLayerCl::incremental_forwarding(RunLayerContext &context,
-                                              unsigned int from,
-                                              unsigned int to, bool training) {
-  Tensor &in = context.getInput(SINGLE_INOUT_IDX);
-  Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-    from = 0;
-    to = 1;
-  }
-  // "1:0:2" is arbitrary
-  transposeCl("1:0:2", in, out);
-}
-
 void TransposeLayerCl::calcDerivative(RunLayerContext &context) {
   std::throw_with_nested(std::runtime_error("Training is not supported yet."));
 }

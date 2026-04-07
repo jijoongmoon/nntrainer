@@ -179,13 +179,6 @@ void GroupNormalizationLayer::forwarding(RunLayerContext &context,
   }
 }
 
-void GroupNormalizationLayer::incremental_forwarding(RunLayerContext &context,
-                                                     unsigned int from,
-                                                     unsigned int to,
-                                                     bool training) {
-  forwarding(context, training);
-}
-
 void GroupNormalizationLayer::calcDerivative(RunLayerContext &context) {
   const float epsilon = std::get<props::Epsilon>(gn_props).get();
 

@@ -39,8 +39,6 @@ public:
 
   void finalize(InitLayerContext &context) override;
   void forwarding(RunLayerContext &context, bool training) override;
-  void incremental_forwarding(RunLayerContext &context, unsigned int from,
-                              unsigned int to, bool training) override;
   void calcDerivative(RunLayerContext &context) override;
   void calcGradient(RunLayerContext &context) override;
 

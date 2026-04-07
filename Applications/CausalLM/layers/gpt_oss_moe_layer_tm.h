@@ -51,9 +51,6 @@ public:
 
   void finalize(nntrainer::InitLayerContext &context) override;
   void forwarding(nntrainer::RunLayerContext &context, bool training) override;
-  void incremental_forwarding(nntrainer::RunLayerContext &context,
-                              unsigned int from, unsigned int to,
-                              bool training) override;
   void calcDerivative(nntrainer::RunLayerContext &context) override;
   void calcGradient(nntrainer::RunLayerContext &context) override;
   void setProperty(const std::vector<std::string> &values) override;
