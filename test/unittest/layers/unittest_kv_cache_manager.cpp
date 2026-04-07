@@ -305,6 +305,139 @@ TEST_F(KVCacheManagerTest, typical_inference_flow) {
   EXPECT_FLOAT_EQ(kd[1], 1.0f);      // l=0, b=0, i=1
 }
 
+/**
+ * @brief Integration test: Simulates real CausalLM inference pattern with
+ *        KVCacheManager - prefill, token-by-token generation, save, reload,
+ *        and continued generation.
+ */
+TEST_F(KVCacheManagerTest, integration_prefill_generate_save_reload_resume) {
+  // Simulate a 4-layer transformer with batch=2
+
+  // === Phase 1: Prefill with 10 tokens ===
+  unsigned int prefill_len = 10;
+  for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+    for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+      auto k_write = manager.getKeyCacheWriteView(l, b, prefill_len);
+      auto v_write = manager.getValueCacheWriteView(l, b, prefill_len);
+      float *kd = k_write.getData<float>();
+      float *vd = v_write.getData<float>();
+      for (unsigned int i = 0; i < prefill_len * KV_WIDTH; ++i) {
+        kd[i] = static_cast<float>(l * 10000 + b * 1000 + i);
+        vd[i] = static_cast<float>(l * 10000 + b * 1000 + i + 500000);
+      }
+    }
+  }
+  manager.advance(prefill_len);
+  EXPECT_EQ(manager.getPosition(), prefill_len);
+
+  // === Phase 2: Generate 5 tokens one by one ===
+  for (unsigned int step = 0; step < 5; ++step) {
+    unsigned int pos = manager.getPosition();
+    for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+        // Write new K/V at current position
+        auto k_write = manager.getKeyCacheWriteView(l, b, 1);
+        auto v_write = manager.getValueCacheWriteView(l, b, 1);
+        k_write.getData<float>()[0] = static_cast<float>(pos * 100 + l);
+        v_write.getData<float>()[0] = static_cast<float>(pos * 100 + l + 50);
+
+        // Read all cached K/V for attention computation
+        auto k_read = manager.getKeyCacheReadView(l, b, pos + 1);
+        auto v_read = manager.getValueCacheReadView(l, b, pos + 1);
+        EXPECT_EQ(k_read.height(), pos + 1);
+        EXPECT_EQ(v_read.height(), pos + 1);
+      }
+    }
+    manager.advance(1);
+  }
+  EXPECT_EQ(manager.getPosition(), 15u);
+
+  // === Phase 3: Save cache ===
+  std::string save_path = "/tmp/test_kv_integration.bin";
+  manager.save(save_path, 15);
+
+  // Verify specific values before save
+  auto k_check = manager.getKeyCacheReadView(0, 0, 15);
+  float prefill_val_0 = k_check.getData<float>()[0]; // First prefill value
+  float gen_val_10 =
+    k_check.getData<float>()[10 * KV_WIDTH]; // First generated value at pos 10
+  EXPECT_FLOAT_EQ(prefill_val_0, 0.0f);     // l=0, b=0, i=0
+  EXPECT_FLOAT_EQ(gen_val_10,
+                  static_cast<float>(10 * 100 + 0)); // pos=10, l=0
+
+  // === Phase 4: Create new manager and load ===
+  causallm::KVCacheManager loaded;
+  loaded.allocate(NUM_LAYERS, BATCH_SIZE, MAX_SEQ_LEN, NUM_HEADS_KV, HEAD_DIM,
+                  ml::train::TensorDim::DataType::FP32);
+  loaded.load(save_path, 15);
+  EXPECT_EQ(loaded.getPosition(), 15u);
+
+  // Verify loaded data matches
+  auto k_loaded = loaded.getKeyCacheReadView(0, 0, 15);
+  EXPECT_FLOAT_EQ(k_loaded.getData<float>()[0], prefill_val_0);
+  EXPECT_FLOAT_EQ(k_loaded.getData<float>()[10 * KV_WIDTH], gen_val_10);
+
+  // Verify all layers and batches
+  for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+    for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+      auto orig = manager.getKeyCacheReadView(l, b, 15);
+      auto copy = loaded.getKeyCacheReadView(l, b, 15);
+      for (unsigned int i = 0; i < 15 * KV_WIDTH; ++i) {
+        EXPECT_FLOAT_EQ(orig.getData<float>()[i], copy.getData<float>()[i])
+          << "Mismatch at layer=" << l << " batch=" << b << " i=" << i;
+      }
+    }
+  }
+
+  // === Phase 5: Continue generation from loaded cache ===
+  for (unsigned int step = 0; step < 3; ++step) {
+    unsigned int pos = loaded.getPosition();
+    for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+        auto k_write = loaded.getKeyCacheWriteView(l, b, 1);
+        k_write.getData<float>()[0] = static_cast<float>(pos * 200 + l);
+
+        auto k_read = loaded.getKeyCacheReadView(l, b, pos + 1);
+        EXPECT_EQ(k_read.height(), pos + 1);
+
+        // Verify old data is still intact
+        EXPECT_FLOAT_EQ(k_read.getData<float>()[0],
+                        static_cast<float>(l * 10000 + b * 1000));
+      }
+    }
+    loaded.advance(1);
+  }
+  EXPECT_EQ(loaded.getPosition(), 18u);
+
+  std::remove(save_path.c_str());
+}
+
+/**
+ * @brief Test that KVCacheManager position tracking matches what
+ *        mha_core.setCacheIndex() would need.
+ */
+TEST_F(KVCacheManagerTest, cache_index_sync_pattern) {
+  // Simulate the pattern: Manager.getPosition() → mha_core.setCacheIndex()
+  unsigned int prefill_len = 20;
+
+  // After prefill
+  EXPECT_EQ(manager.getPosition(), 0u);
+  // mha_core.setCacheIndex(0) before prefill
+  // After prefill writes 20 tokens:
+  manager.advance(prefill_len);
+  EXPECT_EQ(manager.getPosition(), 20u);
+  // mha_core.setCacheIndex(20) would be called next
+
+  // Generate tokens
+  for (unsigned int i = 0; i < 10; ++i) {
+    unsigned int cache_idx = manager.getPosition();
+    EXPECT_EQ(cache_idx, 20u + i);
+    // mha_core.setCacheIndex(cache_idx) would be called here
+    manager.advance(1);
+  }
+  EXPECT_EQ(manager.getPosition(), 30u);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

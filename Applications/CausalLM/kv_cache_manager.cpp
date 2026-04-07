@@ -186,19 +186,23 @@ void KVCacheManager::save(const std::string &path,
                              path);
   }
 
+  ml::train::TensorDim batch_dim({1, 1, seq_len, kv_width_}, {format_, dtype_});
+
   for (const auto &lc : layer_caches_) {
-    ml::train::TensorDim save_dim = lc.key_cache.getDim();
-    save_dim.height(seq_len);
+    ml::train::TensorDim cache_dim = lc.key_cache.getDim();
+    size_t feature_len = cache_dim.getFeatureLen();
 
-    nntrainer::Tensor k_slice =
-      const_cast<nntrainer::Tensor &>(lc.key_cache)
-        .getSharedDataTensor(save_dim, 0, true);
-    nntrainer::Tensor v_slice =
-      const_cast<nntrainer::Tensor &>(lc.value_cache)
-        .getSharedDataTensor(save_dim, 0, true);
+    for (unsigned int b = 0; b < batch_size_; ++b) {
+      nntrainer::Tensor k_slice =
+        const_cast<nntrainer::Tensor &>(lc.key_cache)
+          .getSharedDataTensor(batch_dim, b * feature_len, true);
+      nntrainer::Tensor v_slice =
+        const_cast<nntrainer::Tensor &>(lc.value_cache)
+          .getSharedDataTensor(batch_dim, b * feature_len, true);
 
-    k_slice.save(f);
-    v_slice.save(f);
+      k_slice.save(f);
+      v_slice.save(f);
+    }
   }
 }
 
@@ -217,17 +221,21 @@ void KVCacheManager::load(const std::string &path, unsigned int seq_len) {
                              path);
   }
 
+  ml::train::TensorDim batch_dim({1, 1, seq_len, kv_width_}, {format_, dtype_});
+
   for (auto &lc : layer_caches_) {
-    ml::train::TensorDim load_dim = lc.key_cache.getDim();
-    load_dim.height(seq_len);
+    ml::train::TensorDim cache_dim = lc.key_cache.getDim();
+    size_t feature_len = cache_dim.getFeatureLen();
 
-    nntrainer::Tensor k_slice =
-      lc.key_cache.getSharedDataTensor(load_dim, 0, true);
-    nntrainer::Tensor v_slice =
-      lc.value_cache.getSharedDataTensor(load_dim, 0, true);
+    for (unsigned int b = 0; b < batch_size_; ++b) {
+      nntrainer::Tensor k_slice =
+        lc.key_cache.getSharedDataTensor(batch_dim, b * feature_len, true);
+      nntrainer::Tensor v_slice =
+        lc.value_cache.getSharedDataTensor(batch_dim, b * feature_len, true);
 
-    k_slice.read(f);
-    v_slice.read(f);
+      k_slice.read(f);
+      v_slice.read(f);
+    }
   }
 
   cache_pos_ = seq_len;
