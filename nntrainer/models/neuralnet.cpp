@@ -1330,11 +1330,13 @@ void NeuralNetwork::load(const std::string &file_path,
       }
     } else {
       // Training mode: sequential loading (no optimizer state in safetensors)
+      // Use read_from_offset=true so each weight seeks to its file_offset
       auto model_file = checkedOpenStream<std::ifstream>(
         f_path, std::ios::in | std::ios::binary);
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
            ++iter) {
-        (*iter)->read(model_file, false, exec_mode, fsu_mode);
+        (*iter)->read(model_file, false, exec_mode, fsu_mode,
+                      std::numeric_limits<size_t>::max(), true);
       }
     }
 
