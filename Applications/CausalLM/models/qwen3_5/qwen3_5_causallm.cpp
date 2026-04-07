@@ -222,12 +222,14 @@ Qwen3_5Transformer::createGatedDeltaNet(const int layer_id,
 
   auto GDN = "layer" + std::to_string(layer_id) + "_attention_out";
 
-  // GatedDeltaNet as a single composite layer
-  // All internal projections and computations are handled within the layer
   std::vector<std::string> gdn_params = {
     withKey("name", GDN),
     withKey("input_layers", input_name),
     withKey("num_heads", LINEAR_NUM_VALUE_HEADS),
+    withKey("num_key_heads", LINEAR_NUM_KEY_HEADS),
+    withKey("key_head_dim", LINEAR_KEY_HEAD_DIM),
+    withKey("value_head_dim", LINEAR_VALUE_HEAD_DIM),
+    withKey("conv_kernel_size", LINEAR_CONV_KERNEL_DIM),
     withKey("epsilon", std::to_string(NORM_EPS))};
   layers.push_back(createLayer("gated_delta_net", gdn_params));
 

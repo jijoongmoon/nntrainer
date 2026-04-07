@@ -78,6 +78,42 @@ public:
 };
 
 /**
+ * @brief KeyHeadDim, key head dimension for GatedDeltaNet
+ */
+class KeyHeadDim : public nntrainer::PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "key_head_dim";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+/**
+ * @brief ValueHeadDim, value head dimension for GatedDeltaNet
+ */
+class ValueHeadDim : public nntrainer::PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "value_head_dim";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+/**
+ * @brief NumKeyHeads, number of key heads for GatedDeltaNet
+ */
+class NumKeyHeads : public nntrainer::PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "num_key_heads";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+/**
+ * @brief ConvKernelSize, conv1d kernel size for GatedDeltaNet
+ */
+class ConvKernelSize : public nntrainer::PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "conv_kernel_size";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+/**
  * @brief RMS_NORM_GAMMA_INIT Initialization Enumeration Information
  *
  */

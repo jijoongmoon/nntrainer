@@ -61,18 +61,25 @@ void GatedDeltaNetLayer::finalize(nntrainer::InitLayerContext &context) {
 
   auto &num_heads_prop = std::get<props::NumHeads>(gdn_props);
   auto &epsilon_prop = std::get<nntrainer::props::Epsilon>(gdn_props);
+  auto &key_head_dim_prop = std::get<props::KeyHeadDim>(gdn_props);
+  auto &value_head_dim_prop = std::get<props::ValueHeadDim>(gdn_props);
+  auto &num_key_heads_prop = std::get<props::NumKeyHeads>(gdn_props);
+  auto &conv_kernel_prop = std::get<props::ConvKernelSize>(gdn_props);
 
   const auto &input_dims = context.getInputDimensions();
   hidden_size = input_dims[0].width();
 
   num_v_heads = num_heads_prop.get();
-  head_v_dim = hidden_size / num_v_heads;
-  num_k_heads = num_v_heads;
-  head_k_dim = head_v_dim;
+  num_k_heads = num_key_heads_prop.empty() ? num_v_heads
+                                           : num_key_heads_prop.get();
+  head_v_dim = value_head_dim_prop.empty() ? (hidden_size / num_v_heads)
+                                           : value_head_dim_prop.get();
+  head_k_dim = key_head_dim_prop.empty() ? head_v_dim
+                                         : key_head_dim_prop.get();
   key_dim = head_k_dim * num_k_heads;
   value_dim = head_v_dim * num_v_heads;
   conv_dim = key_dim * 2 + value_dim;
-  conv_kernel_size = 4;
+  conv_kernel_size = conv_kernel_prop.empty() ? 4 : conv_kernel_prop.get();
   norm_eps = epsilon_prop.get();
 
   ml::train::TensorDim::TensorType weight_type = {

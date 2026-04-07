@@ -159,7 +159,9 @@ private:
   unsigned int conv_kernel_size;
   float norm_eps;
 
-  std::tuple<props::NumHeads, nntrainer::props::Epsilon> gdn_props;
+  std::tuple<props::NumHeads, nntrainer::props::Epsilon, props::KeyHeadDim,
+             props::ValueHeadDim, props::NumKeyHeads, props::ConvKernelSize>
+    gdn_props;
 };
 
 } // namespace causallm
