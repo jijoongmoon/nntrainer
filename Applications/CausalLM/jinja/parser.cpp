@@ -152,12 +152,12 @@ ASTNodePtr Parser::parse_for() {
     throw std::runtime_error("Expected 'in' in for loop");
   consume(); // 'in'
 
-  node->left = parse_expr();
+  node->left = parse_or(); // Use parse_or to avoid consuming 'if' as ternary
 
   // Optional 'if' filter
   if (check_value("if")) {
     consume(); // 'if'
-    node->condition = parse_expr();
+    node->condition = parse_or();
   }
 
   // Optional 'recursive'
@@ -197,6 +197,13 @@ ASTNodePtr Parser::parse_set() {
   auto node = std::make_shared<ASTNode>();
   node->type = NodeType::Set;
   node->str_val = expect(TokenType::Identifier).value;
+
+  // Support dotted names: {% set ns.attr = value %}
+  while (check(TokenType::Dot)) {
+    consume(); // '.'
+    node->str_val += "." + expect(TokenType::Identifier).value;
+  }
+
   expect(TokenType::Assign);
   node->left = parse_expr();
   expect(TokenType::StmtEnd);
