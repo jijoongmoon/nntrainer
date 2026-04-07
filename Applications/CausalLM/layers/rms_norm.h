@@ -63,14 +63,6 @@ public:
                              bool training) override;
 
   /**
-   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
-   * int from, unsigned int to, bool training)
-   */
-  WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
-                                         unsigned int from, unsigned int to,
-                                         bool training) override;
-
-  /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;

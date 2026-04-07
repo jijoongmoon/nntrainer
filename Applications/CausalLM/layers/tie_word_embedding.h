@@ -69,14 +69,6 @@ public:
                              bool training) override;
 
   /**
-￼   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
-￼   * int from, unsigned int to, bool training)
-￼   */
-  WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
-                                         unsigned int from, unsigned int to,
-                                         bool training) override;
-
-  /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
@@ -160,14 +152,6 @@ private:
 
   WIN_EXPORT void finalize_embedding(nntrainer::InitLayerContext &context);
   WIN_EXPORT void finalize_lmhead(nntrainer::InitLayerContext &context);
-  WIN_EXPORT void
-  incremental_forwarding_embedding(nntrainer::RunLayerContext &context,
-                                   unsigned int from, unsigned int to,
-                                   bool training);
-  WIN_EXPORT void
-  incremental_forwarding_lmhead(nntrainer::RunLayerContext &context,
-                                unsigned int from, unsigned int to,
-                                bool training);
 };
 } // namespace causallm
 
