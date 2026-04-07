@@ -31,6 +31,7 @@
 
 #include "causal_lm.h"
 #include "embedding_gemma.h"
+#include "speculative_decoding.h"
 #include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
@@ -264,37 +265,80 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    auto model = causallm::Factory::Instance().create(architecture, cfg,
-                                                      generation_cfg, nntr_cfg);
-    if (!model) {
-      std::cerr << "Unknown architecture: " << architecture << std::endl;
-      std::cerr << "Registered architectures:";
-      causallm::Factory::Instance().printRegistered(std::cerr);
-      std::cerr << std::endl;
-      return EXIT_FAILURE;
-    }
-    model->initialize();
-    model->load_weight(weight_file);
-
     bool do_sample = generation_cfg.value("do_sample", false);
 
+    // ──── Speculative Decoding Mode ────
+    // Activated when nntr_config.json contains "speculative_decoding" section
+    // Example config:
+    //   "speculative_decoding": {
+    //     "num_speculative_tokens": 32,
+    //     "draft_num_layers": 8
+    //   }
+    if (nntr_cfg.contains("speculative_decoding")) {
+      json spec_cfg = nntr_cfg["speculative_decoding"];
+      unsigned int draft_layers =
+        spec_cfg.value("draft_num_layers",
+                       cfg["num_hidden_layers"].get<unsigned int>() / 3);
+
+      // Create draft config with reduced layers
+      json draft_cfg = cfg;
+      draft_cfg["num_hidden_layers"] = draft_layers;
+
+      std::cout << "[SSD] Speculative decoding enabled.\n";
+
+      auto ssd_model = std::make_unique<causallm::SpeculativeDecodingCausalLM>(
+        cfg, draft_cfg, generation_cfg, nntr_cfg, spec_cfg);
+
+      ssd_model->initialize();
+      ssd_model->load_weight(weight_file);
+
 #ifdef PROFILE
-    start_peak_tracker();
+      start_peak_tracker();
+#endif
+      ssd_model->run(input_text, do_sample, system_head_prompt,
+                     system_tail_prompt);
+#ifdef PROFILE
+      stop_and_print_peak();
+#endif
+      auto finish_time = std::chrono::high_resolution_clock::now();
+      auto e2e_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        finish_time - start_time);
+      std::cout << "[e2e time]: " << e2e_duration.count() << " ms \n";
+      printMemoryUsage();
+
+    } else {
+      // ──── Standard CausalLM Mode ────
+      auto model = causallm::Factory::Instance().create(
+        architecture, cfg, generation_cfg, nntr_cfg);
+      if (!model) {
+        std::cerr << "Unknown architecture: " << architecture << std::endl;
+        std::cerr << "Registered architectures:";
+        causallm::Factory::Instance().printRegistered(std::cerr);
+        std::cerr << std::endl;
+        return EXIT_FAILURE;
+      }
+      model->initialize();
+      model->load_weight(weight_file);
+
+#ifdef PROFILE
+      start_peak_tracker();
 #endif
 #if defined(_WIN32)
-    model->run(input_text.c_str(), do_sample, system_head_prompt.c_str(),
-               system_tail_prompt.c_str());
+      model->run(input_text.c_str(), do_sample, system_head_prompt.c_str(),
+                 system_tail_prompt.c_str());
 #else
-    model->run(input_text, do_sample, system_head_prompt, system_tail_prompt);
+      model->run(input_text, do_sample, system_head_prompt,
+                 system_tail_prompt);
 #endif
 #ifdef PROFILE
-    stop_and_print_peak();
+      stop_and_print_peak();
 #endif
-    auto finish_time = std::chrono::high_resolution_clock::now();
-    auto e2e_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-      finish_time - start_time);
-    std::cout << "[e2e time]: " << e2e_duration.count() << " ms \n";
-    printMemoryUsage();
+      auto finish_time = std::chrono::high_resolution_clock::now();
+      auto e2e_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        finish_time - start_time);
+      std::cout << "[e2e time]: " << e2e_duration.count() << " ms \n";
+      printMemoryUsage();
+    }
 
   } catch (const std::exception &e) {
     std::cerr << "\n[!] FATAL ERROR: " << e.what() << "\n";
