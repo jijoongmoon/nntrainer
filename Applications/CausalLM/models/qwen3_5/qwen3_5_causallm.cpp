@@ -23,6 +23,7 @@
 #include <qwen3_5_causallm.h>
 
 #include <app_context.h>
+#include <attention_gate.h>
 #include <engine.h>
 #include <gated_delta_net.h>
 #include <reshaped_rms_norm.h>
@@ -128,22 +129,32 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
 
   std::vector<LayerHandle> layers;
   auto Q = "layer" + std::to_string(layer_id) + "_wq";
+  auto Q_gate = "layer" + std::to_string(layer_id) + "_wq_gate";
   auto Q_norm = "layer" + std::to_string(layer_id) + "_q_norm";
   auto K = "layer" + std::to_string(layer_id) + "_wk";
   auto K_norm = "layer" + std::to_string(layer_id) + "_k_norm";
   auto V = "layer" + std::to_string(layer_id) + "_wv";
   auto A = "layer" + std::to_string(layer_id) + "_attention";
+  auto AG = "layer" + std::to_string(layer_id) + "_attn_gate";
   auto O = "layer" + std::to_string(layer_id) + "_attention_out";
 
-  // Q layer: outputs 2x size (half is sigmoid gate)
-  // q_proj: hidden_size -> num_heads * head_dim * 2
+  // Q layer: query projection (first half of original 2x Q)
+  // q_proj: hidden_size -> num_heads * head_dim
   std::vector<std::string> q_params = {
-    withKey("name", Q), withKey("unit", head_dim * n_heads * 2),
+    withKey("name", Q), withKey("unit", head_dim * n_heads),
     withKey("disable_bias", "true"), withKey("input_layers", query_name),
     withKey("weight_initializer", "ones")};
   layers.push_back(createLayer("fully_connected", q_params));
 
-  // Q-reshaped-norm layer (applied to the query half, not the gate half)
+  // Q gate layer: sigmoid gate (second half of original 2x Q)
+  // gate_proj: hidden_size -> num_heads * head_dim
+  std::vector<std::string> qg_params = {
+    withKey("name", Q_gate), withKey("unit", head_dim * n_heads),
+    withKey("disable_bias", "true"), withKey("input_layers", query_name),
+    withKey("weight_initializer", "ones")};
+  layers.push_back(createLayer("fully_connected", qg_params));
+
+  // Q-reshaped-norm layer
   std::vector<std::string> q_norm_params = {
     withKey("name", Q_norm), withKey("input_layers", Q),
     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
@@ -185,10 +196,16 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
     withKey("input_layers", {Q_norm, K_norm, V})};
   layers.push_back(createLayer("mha_core", a_params));
 
-  // O layer (output projection, also serves as attn_gate in GGUF)
+  // Attention gate: output = attn_output * sigmoid(gate)
+  std::vector<std::string> ag_params = {
+    withKey("name", AG),
+    withKey("input_layers", A + "," + Q_gate)};
+  layers.push_back(createLayer("attention_gate", ag_params));
+
+  // O layer (output projection)
   std::vector<std::string> o_params = {
     withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "true"),
-    withKey("input_layers", A), withKey("weight_initializer", "ones")};
+    withKey("input_layers", AG), withKey("weight_initializer", "ones")};
   layers.push_back(createLayer("fully_connected", o_params));
 
   return layers;
@@ -229,6 +246,8 @@ void Qwen3_5Transformer::registerCustomLayers() {
       nntrainer::createLayer<causallm::GatedDeltaNetLayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::RMSNormGatedLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::AttentionGateLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;

@@ -13,6 +13,7 @@ causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_po
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
 causallm_gated_delta_net_src_abs = [meson.current_source_dir() / 'gated_delta_net.cpp']
 causallm_rms_norm_gated_src_abs = [meson.current_source_dir() / 'rms_norm_gated.cpp']
+causallm_attention_gate_src_abs = [meson.current_source_dir() / 'attention_gate.cpp']
 
 openmp_dep = dependency('openmp')
 causallm_rms_norm = shared_library(
@@ -170,5 +171,18 @@ causallm_rms_norm_gated = shared_library(
 )
 causallm_rms_norm_gated_dep = declare_dependency(
     link_with: causallm_rms_norm_gated,
+    include_directories: causallm_layer_inc
+)
+
+causallm_attention_gate = shared_library(
+    'attention_gate_layer',
+    causallm_attention_gate_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_attention_gate_dep = declare_dependency(
+    link_with: causallm_attention_gate,
     include_directories: causallm_layer_inc
 )

@@ -55,8 +55,15 @@ def save_qwen3_5_for_nntrainer(params, config, dtype, file):
 
         if is_full_attention_layer(layer_idx, interval):
             # Full attention layer
-            # Q projection (outputs 2x: half query, half gate)
-            save_weight(params[f"{prefix}self_attn.q_proj.weight"].permute(1, 0))
+            # Q projection is 2x size: [hidden_size, num_heads*head_dim*2]
+            # Split into query half and gate half for separate FC layers
+            q_weight = params[f"{prefix}self_attn.q_proj.weight"]  # [out, in]
+            q_out_dim = q_weight.shape[0]
+            q_half = q_out_dim // 2
+            # wq (query): first half, transposed to [in, out/2]
+            save_weight(q_weight[:q_half, :].permute(1, 0))
+            # wq_gate (gate): second half, transposed to [in, out/2]
+            save_weight(q_weight[q_half:, :].permute(1, 0))
             # K projection
             save_weight(params[f"{prefix}self_attn.k_proj.weight"].permute(1, 0))
             # V projection
