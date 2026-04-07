@@ -338,7 +338,9 @@ void printUsage(const char *prog) {
  */
 std::map<std::string, DataType>
 buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
-                   DataType lmhead_dtype, bool tie_word_embeddings) {
+                   DataType lmhead_dtype, bool tie_word_embeddings,
+                   const std::string &architecture = "",
+                   unsigned int full_attention_interval = 0) {
 
   std::map<std::string, DataType> dtype_map;
 
@@ -347,18 +349,35 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
     dtype_map["embedding0"] = embd_dtype;
   }
 
+  bool is_qwen3_5 = (architecture == "Qwen3_5ForCausalLM");
+
   // Transformer decoder layers
   for (int i = 0; i < num_layers; ++i) {
     std::string prefix = "layer" + std::to_string(i);
 
-    // Attention FC layers
     if (fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE) {
-      dtype_map[prefix + "_wq"] = fc_dtype;
-      dtype_map[prefix + "_wk"] = fc_dtype;
-      dtype_map[prefix + "_wv"] = fc_dtype;
-      dtype_map[prefix + "_attention_out"] = fc_dtype;
 
-      // FFN FC layers
+      bool is_full_attn = !is_qwen3_5 ||
+                          (full_attention_interval > 0 &&
+                           ((i + 1) % full_attention_interval) == 0);
+
+      if (is_full_attn) {
+        // Full attention layers: quantize Q, K, V, O projections
+        dtype_map[prefix + "_wq"] = fc_dtype;
+        dtype_map[prefix + "_wk"] = fc_dtype;
+        dtype_map[prefix + "_wv"] = fc_dtype;
+        dtype_map[prefix + "_attention_out"] = fc_dtype;
+
+        // Qwen3.5 full attention also has wq_gate
+        if (is_qwen3_5) {
+          dtype_map[prefix + "_wq_gate"] = fc_dtype;
+        }
+      }
+      // Linear attention (GatedDeltaNet) layers: skip attention_out
+      // GatedDeltaNet is a composite layer with mixed-precision weights
+      // that should stay FP32 when quantized via this tool
+
+      // FFN FC layers (common to all layer types)
       dtype_map[prefix + "_ffn_up"] = fc_dtype;
       dtype_map[prefix + "_ffn_gate"] = fc_dtype;
       dtype_map[prefix + "_ffn_down"] = fc_dtype;
@@ -533,8 +552,15 @@ int main(int argc, char *argv[]) {
     std::cout << "[4/5] Quantizing and saving weights to: " << dst_weight_path
               << "\n";
 
+    // Detect Qwen3.5 and full_attention_interval for quantization map
+    unsigned int full_attention_interval = 0;
+    if (cfg.contains("full_attention_interval"))
+      full_attention_interval =
+        cfg["full_attention_interval"].get<unsigned int>();
+
     auto layer_dtype_map = buildLayerDtypeMap(
-      num_layers, fc_dtype, embd_dtype, lmhead_dtype, tie_word_embeddings);
+      num_layers, fc_dtype, embd_dtype, lmhead_dtype, tie_word_embeddings,
+      architecture, full_attention_interval);
 
     std::cout << "  Layer dtype mapping (" << layer_dtype_map.size()
               << " layers targeted):\n";
