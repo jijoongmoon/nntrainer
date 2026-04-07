@@ -36,6 +36,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "chat_template.h"
+
 using json = nlohmann::json;
 
 static std::unique_ptr<causallm::Transformer> g_model;
@@ -46,6 +48,7 @@ static bool g_use_chat_template = false;
 static bool g_verbose = false;
 static std::string g_last_output = "";
 static double g_initialization_duration_ms = 0.0;
+static std::unique_ptr<causallm::ChatTemplate> g_chat_template;
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
@@ -134,22 +137,28 @@ static const char *get_model_name_from_type(ModelType type) {
 
 static std::string apply_chat_template(const std::string &architecture,
                                        const std::string &input) {
+  // Try dynamic template first (loaded from tokenizer_config.json)
+  if (g_chat_template && g_chat_template->has_template()) {
+    try {
+      json messages = json::array();
+      messages.push_back({{"role", "user"}, {"content", input}});
+      return g_chat_template->apply(messages, true);
+    } catch (const std::exception &e) {
+      std::cerr << "[ChatTemplate] Dynamic template failed: " << e.what()
+                << ", falling back to built-in template" << std::endl;
+    }
+  }
+
+  // Fallback to built-in templates
   if (architecture == "LlamaForCausalLM") {
-    // Llama 2/3 chat format: [INST] {prompt} [/INST]
     return "[INST] " + input + " [/INST]";
   } else if (architecture == "Qwen2ForCausalLM" ||
              architecture == "Qwen3ForCausalLM" ||
              architecture == "Qwen3MoeForCausalLM" ||
              architecture == "Qwen3SlimMoeForCausalLM" ||
              architecture == "Qwen3CachedSlimMoeForCausalLM") {
-    // Qwen chat format
-    // <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
-    // Note: assuming model handles tokenizer specific special tokens or we
-    // might need to handle them raw if tokenizer enabled
     return "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
   } else if (architecture == "Gemma3ForCausalLM") {
-    // Gemma chat format:
-    // <start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
     return "<start_of_turn>user\n" + input +
            "<end_of_turn>\n<start_of_turn>model\n";
   }
@@ -503,6 +512,15 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
 
     g_initialized = true;
     g_architecture = architecture;
+
+    // Try to load dynamic chat template from tokenizer_config.json
+    g_chat_template = std::make_unique<causallm::ChatTemplate>();
+    std::string tokenizer_config_path =
+      model_path + "/tokenizer_config.json";
+    if (g_chat_template->load_from_tokenizer_config(tokenizer_config_path)) {
+      std::cout << "[ChatTemplate] Loaded dynamic template from "
+                << tokenizer_config_path << std::endl;
+    }
 
     auto finish_init = std::chrono::high_resolution_clock::now();
     auto init_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
