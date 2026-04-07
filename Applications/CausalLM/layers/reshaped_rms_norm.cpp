@@ -37,7 +37,63 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
 }
 
 void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
-                                      bool training) {}
+                                      bool training) {
+  auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
+
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
+
+  ml::train::TensorDim in_dim = in.getDim();
+  ml::train::TensorDim out_dim = out.getDim();
+
+  ml::train::TensorDim in_step_dim = in_dim;
+  ml::train::TensorDim out_step_dim = out_dim;
+
+  unsigned int step_size = in_dim.height();
+
+  in_step_dim.batch(1);
+  in_step_dim.height(step_size);
+  out_step_dim.batch(1);
+  out_step_dim.height(step_size);
+
+  // set reshaped dim to (1, 1, -1, feature_size)
+  ml::train::TensorDim step_reshaped_dim = in_step_dim;
+
+  step_reshaped_dim.width(feature_size);
+  step_reshaped_dim.height(in_step_dim.height() *
+                           (in_dim.width() / feature_size));
+
+  unsigned int b_size = in_dim.batch();
+
+  for (unsigned int b = 0; b < b_size; ++b) {
+    nntrainer::Tensor in_step =
+      in.getSharedDataTensor(in_step_dim, b * in_dim.getFeatureLen(), true);
+    nntrainer::Tensor out_step =
+      out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
+
+    in_step.reshape(step_reshaped_dim);
+    out_step.reshape(step_reshaped_dim);
+
+    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+#ifdef ENABLE_FP16
+      nntrainer::rms_norm_wrt_width_fp16_intrinsic(
+        in_step.getData<float>(), out_step.getData<float>(),
+        in_step.getDim().height(), in_step.getDim().width(), epsilon);
+#else
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+        in_step.getData<float>(), out_step.getData<float>(),
+        in_step.getDim().height(), in_step.getDim().width(), epsilon);
+#endif
+    } else {
+      throw std::invalid_argument(
+        "Error: not yet implemented for this data type");
+    }
+    out_step.multiply_i(gamma);
+
+    out_step.reshape(out_step_dim);
+  }
+}
 
 void ReshapedRMSNormLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,

@@ -128,7 +128,47 @@ void QKVLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void QKVLayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
-  return;
+  nntrainer::Tensor &Qweight = context.getWeight(weight_idx[QKVParams::Q]);
+  nntrainer::Tensor &Kweight = context.getWeight(weight_idx[QKVParams::K]);
+  nntrainer::Tensor &Vweight = context.getWeight(weight_idx[QKVParams::V]);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &Qhidden_ = context.getOutput(QKVParams::Q);
+  nntrainer::Tensor &Khidden_ = context.getOutput(QKVParams::K);
+  nntrainer::Tensor &Vhidden_ = context.getOutput(QKVParams::V);
+
+  nntrainer::TensorDim input_dim = input_.getDim();
+  unsigned int step_size = input_dim.height();
+
+  nntrainer::TensorDim input_step_dim = input_dim;
+  input_step_dim.batch(1);
+  input_step_dim.height(step_size);
+
+  nntrainer::Tensor input_step =
+    input_.getSharedDataTensor(input_step_dim, 0, true);
+
+  nntrainer::TensorDim Qhidden_step_dim = Qhidden_.getDim();
+  Qhidden_step_dim.batch(1);
+  Qhidden_step_dim.height(step_size);
+  nntrainer::Tensor Qhidden_step =
+    Qhidden_.getSharedDataTensor(Qhidden_step_dim, 0, true);
+
+  nntrainer::TensorDim Khidden_step_dim = Khidden_.getDim();
+  Khidden_step_dim.batch(1);
+  Khidden_step_dim.height(step_size);
+  nntrainer::Tensor Khidden_step =
+    Khidden_.getSharedDataTensor(Khidden_step_dim, 0, true);
+
+  nntrainer::TensorDim Vhidden_step_dim = Vhidden_.getDim();
+  Vhidden_step_dim.batch(1);
+  Vhidden_step_dim.height(step_size);
+  nntrainer::Tensor Vhidden_step =
+    Vhidden_.getSharedDataTensor(Vhidden_step_dim, 0, true);
+
+  std::vector<nntrainer::Tensor *> Weights({&Qweight, &Kweight, &Vweight});
+  std::vector<nntrainer::Tensor *> Outputs(
+    {&Qhidden_step, &Khidden_step, &Vhidden_step});
+
+  input_step.dot(Weights, Outputs);
 }
 
 void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
