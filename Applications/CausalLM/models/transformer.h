@@ -122,6 +122,17 @@ public:
     return performance_metrics;
   }
 
+  /**
+   * @brief Get the underlying model handle for advanced use cases
+   * (e.g., speculative decoding)
+   */
+  ml::train::Model *getModel() const { return model.get(); }
+
+  /**
+   * @brief Get vocabulary size
+   */
+  unsigned int getNumVocab() const { return NUM_VOCAB; }
+
 protected:
   /**
    * @brief Setup the parameters for the Transformer model
