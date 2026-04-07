@@ -1005,8 +1005,8 @@ void NeuralNetwork::load(const std::string &file_path,
       };
 
     parse_safetensors_header(header_json, name_offset_map);
-    ml_logi("Loaded safetensors file with %zu tensor entries",
-            name_offset_map.size());
+    std::cout << "[safetensors] Loaded " << name_offset_map.size()
+              << " tensor entries" << std::endl;
 
     // Build prefix-based fallback map: "layer_name" -> (offset, size)
     // This allows matching when the weight suffix differs between
@@ -1055,8 +1055,8 @@ void NeuralNetwork::load(const std::string &file_path,
           // Exact match: safetensors name == C++ weight name
           weight->getVariableRef().setFileOffset(data_section_start +
                                                  it->second.first);
-          ml_logi("  [MATCH] '%s' -> offset=%zu", wname.c_str(),
-                  data_section_start + it->second.first);
+          std::cout << "  [MATCH]  '" << wname << "' -> offset="
+                    << (data_section_start + it->second.first) << std::endl;
           weight_match_count++;
         } else {
           // Prefix fallback: match by layer name prefix (before ':')
@@ -1068,13 +1068,13 @@ void NeuralNetwork::load(const std::string &file_path,
           if (pit != prefix_offset_map.end()) {
             weight->getVariableRef().setFileOffset(data_section_start +
                                                    pit->second.first);
-            ml_logi("  [PREFIX] '%s' matched by prefix '%s' -> offset=%zu",
-                    wname.c_str(), prefix.c_str(),
-                    data_section_start + pit->second.first);
+            std::cout << "  [PREFIX] '" << wname << "' matched by prefix '"
+                      << prefix << "' -> offset="
+                      << (data_section_start + pit->second.first) << std::endl;
             weight_match_count++;
           } else {
-            ml_logw("  [MISS] '%s' NOT FOUND in safetensors",
-                    wname.c_str());
+            std::cout << "  [MISS]   '" << wname
+                      << "' NOT FOUND in safetensors" << std::endl;
             weight->getVariableRef().setFileOffset(start_from);
             weight_miss_count++;
           }
@@ -1096,8 +1096,8 @@ void NeuralNetwork::load(const std::string &file_path,
   }
 
   if (is_safetensors) {
-    ml_logi("=== Safetensors load summary: %u matched, %u missed ===",
-            weight_match_count, weight_miss_count);
+    std::cout << "=== Safetensors load summary: " << weight_match_count
+              << " matched, " << weight_miss_count << " missed ===" << std::endl;
   }
 
   if (exec_mode == ExecutionMode::INFERENCE && fsu_mode) {
