@@ -127,6 +127,18 @@ public:
 };
 
 /**
+ * @brief PartialRotaryFactor - fraction of head_dim to apply RoPE
+ * Default 1.0 means full RoPE. Qwen3.5 uses 0.25.
+ */
+class PartialRotaryFactor : public nntrainer::Property<float> {
+public:
+  PartialRotaryFactor(float value = 1.0f) { set(value); };
+  static constexpr const char *key =
+    "partial_rotary_factor";                  /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
  * @brief IsCausal property
  */
 class IsCausal : public nntrainer::Property<bool> {
@@ -308,7 +320,7 @@ private:
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::AttnLogitSoftcapping, props::IsCausal>
+    props::AttnLogitSoftcapping, props::IsCausal, props::PartialRotaryFactor>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -327,6 +339,7 @@ private:
   bool use_sink = false;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
+  unsigned int rope_dim; /**< dim for RoPE = head_dim * partial_rotary_factor */
 
   enum INOUT_INDEX {
     /** input index */

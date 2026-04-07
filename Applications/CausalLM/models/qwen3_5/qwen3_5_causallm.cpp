@@ -182,8 +182,7 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
     withKey("weight_initializer", "ones")};
   layers.push_back(createLayer("fully_connected", v_params));
 
-  // Attention core layer
-  // @todo: partial_rotary_factor support needs to be added to mha_core
+  // Attention core layer with partial RoPE
   std::vector<std::string> a_params = {
     withKey("name", A),
     withKey("num_heads", n_heads),
@@ -193,6 +192,7 @@ std::vector<LayerHandle> Qwen3_5Transformer::createAttention(
     withKey("rope_theta", ROPE_THETA),
     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+    withKey("partial_rotary_factor", std::to_string(PARTIAL_ROTARY_FACTOR)),
     withKey("input_layers", {Q_norm, K_norm, V})};
   layers.push_back(createLayer("mha_core", a_params));
 

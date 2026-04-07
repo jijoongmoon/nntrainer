@@ -52,14 +52,16 @@ MHACoreLayer::MHACoreLayer() :
     props::SlidingWindow(), props::MaxNewTokens(), props::RopeTheta(),
     props::MaxPositionEmbeddings(), props::UseSink(), props::RopeScalingType(),
     props::RopeScalingFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal()),
+    props::AttnLogitSoftcapping(), props::IsCausal(),
+    props::PartialRotaryFactor()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
   num_heads_Q(0),
   num_heads_KV(0),
   head_dim(0),
-  cache_shift(false) {
+  cache_shift(false),
+  rope_dim(0) {
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -148,6 +150,15 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
+
+  /** Partial Rotary Factor (default 1.0 = full RoPE) */
+  float partial_rotary_factor =
+    std::get<props::PartialRotaryFactor>(mha_core_props).get();
+  rope_dim = static_cast<unsigned int>(head_dim * partial_rotary_factor);
+  // Ensure rope_dim is even
+  rope_dim = (rope_dim / 2) * 2;
+  if (rope_dim == 0)
+    rope_dim = head_dim;
 
   /** Tensor for KV-Cache */
 #ifdef ENABLE_FP16
@@ -496,16 +507,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                     true);
 
   // apply rotary embedding for query
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
+  apply_rotary_emb_tensor_v2(query_step, query_step, rope_dim, cache_index,
                              false);
 
   // append kcache with rotary embedding
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
+  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, rope_dim, cache_index,
                              false);
 
   // append vcache without rotary embedding
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, rope_dim,
                                cache_index, true);
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -586,13 +597,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
     true);
 
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
+  apply_rotary_emb_tensor_v2(query_step, query_step, rope_dim, _from, false);
 
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from,
+  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, rope_dim, _from,
                              false);
 
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
+    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, rope_dim, _from,
                                true);
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -746,12 +757,7 @@ void MHACoreLayer::_compute_default_parameters(int head_dim, float theta) {
 void MHACoreLayer::_compute_yarn_parameters(int head_dim, float theta) {
 
   // Config parameters
-  ///@todo partial_rotary_factor should be generalized to fully support
-  /// transformers's implementation
-  // const float partial_rotary_factor = has_partial_rotary_factor ?
-  // config_partial_rotary_factor : 1.0f;
-  const float partial_rotary_factor = 1.0f;
-  const int dim = static_cast<int>(head_dim * partial_rotary_factor);
+  const int dim = static_cast<int>(rope_dim);
   const float base = theta;
 
   // Handle max position embeddings
@@ -850,7 +856,7 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     if (freqs_cos == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
       if (freqs_cos == nullptr) {
-        precompute_freqs(head_dim, max_position_embeddings, theta, false);
+        precompute_freqs(rope_dim, max_position_embeddings, theta, false);
       }
     }
     std::vector<float> *cos_ = nullptr;
@@ -893,7 +899,7 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     if (freqs_cos_fp16 == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
       if (freqs_cos_fp16 == nullptr) {
-        precompute_freqs(head_dim, max_position_embeddings, theta, true);
+        precompute_freqs(rope_dim, max_position_embeddings, theta, true);
       }
     }
     std::vector<_FP16> *cos_ = nullptr;
