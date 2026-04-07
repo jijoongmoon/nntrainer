@@ -28,6 +28,7 @@
 #include "model_config_internal.h"
 #include "qwen2_causallm.h"
 #include "qwen3_cached_slim_moe_causallm.h"
+#include "qwen3_5_causallm.h"
 #include "qwen3_causallm.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
@@ -83,6 +84,11 @@ static void register_models() {
       "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::Qwen3CausalLM>(cfg, generation_cfg,
                                                          nntr_cfg);
+      });
+    causallm::Factory::Instance().registerModel(
+      "Qwen3_5ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::Qwen3_5CausalLM>(
+          cfg, generation_cfg, nntr_cfg);
       });
     causallm::Factory::Instance().registerModel(
       "Qwen3MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {

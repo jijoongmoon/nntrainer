@@ -11,6 +11,8 @@ causallm_reshaped_rms_norm_src_abs = [meson.current_source_dir() / 'reshaped_rms
 causallm_qkv_layer_src_abs = [meson.current_source_dir() / 'qkv_layer.cpp']
 causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_pooling_layer.cpp']
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
+causallm_gated_delta_net_src_abs = [meson.current_source_dir() / 'gated_delta_net.cpp']
+causallm_rms_norm_gated_src_abs = [meson.current_source_dir() / 'rms_norm_gated.cpp']
 
 openmp_dep = dependency('openmp')
 causallm_rms_norm = shared_library(
@@ -142,5 +144,31 @@ causallm_qkv_layer = shared_library(
 
 causallm_qkv_layer_dep = declare_dependency(
     link_with: causallm_qkv_layer,
+    include_directories: causallm_layer_inc
+)
+
+causallm_gated_delta_net = shared_library(
+    'gated_delta_net_layer',
+    causallm_gated_delta_net_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_gated_delta_net_dep = declare_dependency(
+    link_with: causallm_gated_delta_net,
+    include_directories: causallm_layer_inc
+)
+
+causallm_rms_norm_gated = shared_library(
+    'rms_norm_gated_layer',
+    causallm_rms_norm_gated_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_rms_norm_gated_dep = declare_dependency(
+    link_with: causallm_rms_norm_gated,
     include_directories: causallm_layer_inc
 )
