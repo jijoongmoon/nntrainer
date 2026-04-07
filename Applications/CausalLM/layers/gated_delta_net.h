@@ -145,7 +145,7 @@ private:
   void l2Normalize(nntrainer::Tensor &tensor, float eps = 1e-6f);
 
   std::array<unsigned int, 9> wt_idx;  /**< weight indices */
-  std::array<unsigned int, 5> tensor_idx; /**< tensor indices for state/temps */
+  std::array<unsigned int, 8> tensor_idx; /**< tensor indices for state/temps */
 
   /** Layer properties */
   unsigned int hidden_size;
