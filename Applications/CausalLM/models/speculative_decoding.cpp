@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <layer_context.h>
+#include <mha_core.h>
 #include <tensor.h>
 
 #include <llm_util.hpp>
@@ -187,6 +188,33 @@ std::string SpeculativeDecodingCausalLM::getOutput(int batch_idx) const {
   if (batch_idx < 0 || batch_idx >= static_cast<int>(output_list_.size()))
     return "";
   return output_list_[batch_idx];
+}
+
+// ─────────────────── KV Cache Management ───────────────────
+
+/**
+ * @brief Rollback KV cache index for all MHA layers in a model.
+ *
+ * After speculative decoding, if some draft tokens are rejected, the KV cache
+ * indices in all MHA layers must be rolled back to the accepted position.
+ * Otherwise, subsequent forward passes would write to incorrect cache positions.
+ *
+ * @param model_ptr Pointer to the model
+ * @param new_cache_index The cache index to set (= accepted position)
+ */
+static void rollbackKVCache(ml::train::Model *model_ptr,
+                            unsigned int new_cache_index) {
+  model_ptr->forEachLayer(
+    [](ml::train::Layer &layer, nntrainer::RunLayerContext &ctx,
+       void *user_data) {
+      if (layer.getType() == causallm::MHACoreLayer::type) {
+        unsigned int target_idx =
+          *static_cast<unsigned int *>(user_data);
+        auto &mha_layer = dynamic_cast<causallm::MHACoreLayer &>(layer);
+        mha_layer.setCacheIndex(target_idx);
+      }
+    },
+    &new_cache_index);
 }
 
 // ─────────────────── Main Run Loop ───────────────────
@@ -469,6 +497,38 @@ void SpeculativeDecodingCausalLM::run(const WSTR prompt, bool do_sample,
       has_bonus = true;
     }
 
+    // ──── KV CACHE ROLLBACK ────
+    // Draft model generated K tokens → cache_index advanced by K
+    // Target model verified K+1 tokens → cache_index advanced by K+1
+    // We only accepted `num_accepted` (+ 1 resampled/bonus) tokens.
+    // Must rollback both models' KV caches to the correct position.
+    //
+    // Before draft phase:
+    //   both models' cache_index = current_pos (prompt_len + previously generated)
+    // After draft phase:
+    //   draft cache_index = current_pos + K
+    // After verify phase:
+    //   target cache_index = current_pos + K + 1
+    // Correct cache_index after this step:
+    //   = current_pos + num_accepted + 1 (accepted + resampled/bonus)
+    //   (if all accepted with bonus: current_pos + K + 1, no rollback needed for target)
+
+    unsigned int tokens_actually_kept =
+      num_accepted + (has_resampled || has_bonus ? 1 : 0);
+    unsigned int correct_cache_pos = current_pos + tokens_actually_kept;
+
+    // Rollback draft model KV cache
+    // Draft had advanced to current_pos + K
+    if (tokens_actually_kept < K) {
+      rollbackKVCache(draft_model_->getModel(), correct_cache_pos);
+    }
+
+    // Rollback target model KV cache
+    // Target had advanced to current_pos + K + 1
+    if (tokens_actually_kept < K + 1) {
+      rollbackKVCache(target_model_->getModel(), correct_cache_pos);
+    }
+
     // ──── REGISTER accepted tokens ────
     std::vector<unsigned int> accepted_ids;
 
@@ -507,6 +567,15 @@ void SpeculativeDecodingCausalLM::run(const WSTR prompt, bool do_sample,
 
       // Advance position
       current_pos += tokens_to_register;
+
+      // If EOS caused fewer tokens to register, rollback caches again
+      if (eos_reached && tokens_to_register < tokens_actually_kept) {
+        rollbackKVCache(draft_model_->getModel(),
+                        current_pos);
+        rollbackKVCache(target_model_->getModel(),
+                        current_pos);
+      }
+
       if (tokens_to_register > 0)
         current_token = accepted_ids[tokens_to_register - 1];
     }

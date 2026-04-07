@@ -268,6 +268,18 @@ public:
   WIN_EXPORT bool supportBackwarding() const override { return true; };
 
   /**
+   * @brief Get the current KV cache index
+   * @return Current cache index position
+   */
+  unsigned int getCacheIndex() const { return cache_index; }
+
+  /**
+   * @brief Set the KV cache index (for speculative decoding rollback)
+   * @param idx New cache index position
+   */
+  void setCacheIndex(unsigned int idx) { cache_index = idx; }
+
+  /**
    * @copydoc Layer::setBatch(RunLayerContext &context, unsigned int batch)
    */
   WIN_EXPORT void
