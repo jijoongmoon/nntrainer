@@ -123,6 +123,14 @@ public:
                        nntrainer::TensorDim::DataType dtype =
                          nntrainer::TensorDim::DataType::NONE) const override;
 
+  /**
+   * @copydoc Layer::updateTensorsByInputDimensions(RunLayerContext &context,
+   * std::vector<TensorDim> input_dimensions)
+   */
+  WIN_EXPORT void updateTensorsByInputDimensions(
+    nntrainer::RunLayerContext &context,
+    std::vector<nntrainer::TensorDim> input_dimensions) override;
+
   inline static const std::string type = "embedding_layer";
 
 private:

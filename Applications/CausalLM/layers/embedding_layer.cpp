@@ -214,6 +214,20 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
+void EmbeddingLayer::updateTensorsByInputDimensions(
+  nntrainer::RunLayerContext &context,
+  std::vector<nntrainer::TensorDim> input_dimensions) {
+  unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
+
+  // Input: (batch, 1, seq_len, 1) - token IDs
+  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
+
+  // Output: (batch, 1, seq_len, out_dim)
+  ml::train::TensorDim output_dim = context.getOutput(SINGLE_INOUT_IDX).getDim();
+  output_dim.height(input_dimensions[0].height());
+  context.updateOutput(SINGLE_INOUT_IDX, output_dim);
+}
+
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   throw nntrainer::exception::not_supported(
     "calcDerivative for Embedding layer is not supported");
