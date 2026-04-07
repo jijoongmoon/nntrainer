@@ -106,14 +106,27 @@ protected:
                   const std::vector<bool> &eos_list, bool log_output = true);
 
   /**
-   * @brief save kv cache
+   * @brief save kv cache (legacy - uses internal mha_core tensors)
    */
   WIN_EXPORT virtual void save_kvcache(std::string path, int to);
 
   /**
-   * @brief load kv cache
+   * @brief load kv cache (legacy - uses internal mha_core tensors)
    */
   WIN_EXPORT virtual void load_kvcache(std::string path, int to);
+
+  /**
+   * @brief Initialize the KVCacheManager for externalized cache management.
+   *        Should be called after model initialization.
+   */
+  WIN_EXPORT void initKVCacheManager();
+
+  /**
+   * @brief Get the KVCacheManager instance
+   */
+  WIN_EXPORT causallm::KVCacheManager *getKVCacheManager() {
+    return kv_cache_manager_.get();
+  }
 
   /**
    * @brief generate

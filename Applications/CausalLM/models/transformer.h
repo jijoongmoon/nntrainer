@@ -44,6 +44,7 @@
 #include <limits.h>
 
 #include "json.hpp"
+#include "kv_cache_manager.h"
 #include "performance_metrics.h"
 #include <fstream>
 #include <tokenizers_c.h>
@@ -241,9 +242,15 @@ protected:
 
   std::mt19937 rng; /**< Random Number Gen */
 
-  KVCacheBuffers kv_cache_buffers;    /**< External KV cache buffers */
-  std::vector<Tensor> key_cache_tensors; /**< per-layer key cache tensors */
-  std::vector<Tensor> val_cache_tensors; /**< per-layer value cache tensors */
+  KVCacheBuffers kv_cache_buffers;    /**< External KV cache buffers (legacy) */
+  std::vector<Tensor> key_cache_tensors; /**< per-layer key cache tensors (legacy) */
+  std::vector<Tensor> val_cache_tensors; /**< per-layer value cache tensors (legacy) */
+
+  /**
+   * @brief KV Cache Manager for externalized cache management.
+   *        Manages cache allocation, position tracking, and save/load.
+   */
+  std::unique_ptr<causallm::KVCacheManager> kv_cache_manager_;
 };
 /**
  * Loads JSON data from a file with detailed error handling

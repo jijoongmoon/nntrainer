@@ -217,6 +217,45 @@ void CausalLM::load_kvcache(std::string path, int to_) {
   f.close();
 }
 
+void CausalLM::initKVCacheManager() {
+  if (kv_cache_manager_) {
+    return; // already initialized
+  }
+
+  unsigned int num_attn_layers = 0;
+  unsigned int kv_heads = 0;
+  unsigned int h_dim = 0;
+
+  // Count attention layers and get KV cache dimensions from mha_core layers
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+             void *) {
+      if (l.getType() == causallm::MHACoreLayer::type) {
+        num_attn_layers++;
+        if (kv_heads == 0) {
+          // Get dimensions from the first mha_core layer's internal cache
+          auto k_cache = context.getTensor(0);
+          auto dim = k_cache.getDim();
+          kv_heads = 1; // Will be refined from actual head info
+          h_dim = dim.width();
+        }
+      }
+    };
+  model->forEachLayer(fn, nullptr);
+
+  if (num_attn_layers == 0) {
+    return;
+  }
+
+  unsigned int max_seq = INIT_SEQ_LEN + NUM_TO_GENERATE;
+
+  kv_cache_manager_ = std::make_unique<causallm::KVCacheManager>();
+  // Use kv_width directly (num_heads_kv * head_dim is already in h_dim)
+  // We set num_heads_kv=1, head_dim=h_dim to get kv_width = h_dim
+  kv_cache_manager_->allocate(num_attn_layers, BATCH_SIZE, max_seq, 1, h_dim,
+                              ml::train::TensorDim::DataType::FP32);
+}
+
 std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
                                              float repetition_penalty,
                                              unsigned int *input_ids,
