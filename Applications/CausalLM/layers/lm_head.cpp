@@ -151,47 +151,6 @@ void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
-void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                         unsigned int from, unsigned int to,
-                                         bool training) {
-
-  nntrainer::Tensor weight =
-    context.getWeight(weight_idx[LmHeadParams::weight]);
-
-  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
-
-  ml::train::TensorDim input_dim = input_.getDim();
-  ml::train::TensorDim hidden_dim = hidden_.getDim();
-
-  ml::train::TensorDim input_step_dim = input_dim;
-  ml::train::TensorDim hidden_step_dim = hidden_dim;
-
-  input_step_dim.batch(1);
-  input_step_dim.height(1);
-  hidden_step_dim.batch(1);
-
-  unsigned int b_size = input_dim.batch();
-
-  for (unsigned int b = 0; b < b_size; ++b) {
-    nntrainer::Tensor input_step = input_.getSharedDataTensor(
-      input_step_dim,
-      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
-    nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
-      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
-
-    input_step.dot(weight, hidden_step, false, false);
-
-    if (auto &disable_bias =
-          std::get<nntrainer::props::DisableBias>(*layer_impl_props);
-        disable_bias.empty() || disable_bias.get() == false) {
-      nntrainer::Tensor &bias =
-        context.getWeight(weight_idx[LmHeadParams::bias]);
-      hidden_step.add_i(bias);
-    }
-  }
-}
-
 void LmHeadLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   throw nntrainer::exception::not_supported(
     "calcDerivative for LMHead layer is not supported");

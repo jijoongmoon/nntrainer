@@ -72,46 +72,6 @@ void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
-void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                         unsigned int from, unsigned int to,
-                                         bool training) {
-  nntrainer::Tensor &in1 = context.getInput(INPUT_IDX_1);
-  nntrainer::Tensor &in2 = context.getInput(INPUT_IDX_2);
-  nntrainer::Tensor &out = context.getOutput(OUT_IDX);
-
-  unsigned int _from = from;
-
-  int iter = to - from;
-
-  if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    for (unsigned int b = 0; b < in1.batch(); b++) {
-      for (unsigned int c = 0; c < in1.channel(); c++) {
-        for (unsigned int h = 0; h < iter; h++) {
-          nntrainer::swiglu(in1.width(),
-                            out.getData<float>() + out.getIndex(b, c, h, 0),
-                            in1.getData<float>() + in1.getIndex(b, c, h, 0),
-                            in2.getData<float>() + in2.getIndex(b, c, h, 0));
-        }
-      }
-    }
-  } else if (in1.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    for (unsigned int b = 0; b < in1.batch(); b++) {
-      for (unsigned int c = 0; c < in1.channel(); c++) {
-        for (unsigned int h = 0; h < iter; h++) {
-          nntrainer::swiglu(in1.width(),
-                            out.getData<_FP16>() + out.getIndex(b, c, h, 0),
-                            in1.getData<_FP16>() + in1.getIndex(b, c, h, 0),
-                            in2.getData<_FP16>() + in2.getIndex(b, c, h, 0));
-        }
-      }
-    }
-#else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
-#endif
-  }
-}
-
 void SwiGLULayer::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
   std::vector<nntrainer::TensorDim> input_dimensions) {
