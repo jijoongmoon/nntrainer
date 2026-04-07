@@ -31,6 +31,20 @@ void Context::set(const std::string &name, const Value &val) {
   scopes_.back()[name] = val;
 }
 
+void Context::set_in_defining_scope(const std::string &name,
+                                    const Value &val) {
+  // Find the scope where this variable is defined and update it there
+  for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+    auto found = it->find(name);
+    if (found != it->end()) {
+      found->second = val;
+      return;
+    }
+  }
+  // Not found anywhere, set in current scope
+  scopes_.back()[name] = val;
+}
+
 Value Context::get(const std::string &name) const {
   // Search from innermost scope outward
   for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
@@ -173,7 +187,14 @@ void Evaluator::render_for(const ASTNodePtr &node, std::ostringstream &out) {
     }
 
     for (size_t i = 0; i < arr.size(); i++) {
-      ctx_.set(node->loop_var, arr[i]);
+      // Support tuple unpacking: {% for k, v in items %}
+      if (!node->loop_var2.empty() && arr[i].is_array() &&
+          arr[i].size() >= 2) {
+        ctx_.set(node->loop_var, arr[i].get(size_t(0)));
+        ctx_.set(node->loop_var2, arr[i].get(size_t(1)));
+      } else {
+        ctx_.set(node->loop_var, arr[i]);
+      }
 
       // Set loop variable
       Value::Object loop;
@@ -264,7 +285,8 @@ void Evaluator::render_set(const ASTNodePtr &node) {
     if (ns.is_object()) {
       auto obj = ns.as_object();
       obj[attr] = val;
-      ctx_.set(ns_name, Value(obj));
+      // Update in all scopes where ns exists (namespace spans scopes)
+      ctx_.set_in_defining_scope(ns_name, Value(obj));
     }
   } else {
     ctx_.set(node->str_val, val);

@@ -29,6 +29,7 @@ public:
   explicit Context(const std::map<std::string, Value> &vars);
 
   void set(const std::string &name, const Value &val);
+  void set_in_defining_scope(const std::string &name, const Value &val);
   Value get(const std::string &name) const;
   bool has(const std::string &name) const;
 
