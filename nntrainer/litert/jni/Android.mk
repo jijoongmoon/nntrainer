@@ -21,6 +21,11 @@ ifndef ABSEIL_ROOT
 $(error ABSEIL_ROOT is not defined! Set to abseil-cpp source root.)
 endif
 
+# Protobuf headers (Bazel: bazel-LiteRT-LM/external/com_google_protobuf/src)
+ifndef PROTOBUF_INCLUDES
+PROTOBUF_INCLUDES := $(LITERT_LM_ROOT)/bazel-LiteRT-LM/external/com_google_protobuf/src
+endif
+
 ML_API_COMMON_INCLUDES := $(NNTRAINER_ROOT)/ml_api_common/include
 NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/nntrainer \
 	$(NNTRAINER_ROOT)/nntrainer/dataset \
@@ -66,7 +71,7 @@ LITERT_LM_LIB_PATH := $(LITERT_LM_ROOT)/bazel-bin/runtime/engine
 endif
 
 LOCAL_SRC_FILES := $(LITERT_LM_LIB_PATH)/liblitert_lm_lib.a
-LOCAL_EXPORT_C_INCLUDES := $(LITERT_LM_ROOT) $(LITERT_SDK_ROOT) $(ABSEIL_ROOT)
+LOCAL_EXPORT_C_INCLUDES := $(LITERT_LM_ROOT) $(LITERT_SDK_ROOT) $(ABSEIL_ROOT) $(PROTOBUF_INCLUDES)
 include $(PREBUILT_STATIC_LIBRARY)
 
 ####################################################################
@@ -91,7 +96,8 @@ LOCAL_C_INCLUDES    := \
 	$(NNTRAINER_ROOT)/nntrainer/litert \
 	$(LITERT_LM_ROOT) \
 	$(LITERT_SDK_ROOT) \
-	$(ABSEIL_ROOT)
+	$(ABSEIL_ROOT) \
+	$(PROTOBUF_INCLUDES)
 
 LOCAL_CFLAGS        += -pthread -fexceptions -Wno-deprecated-declarations
 LOCAL_CXXFLAGS      += -std=c++20 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITERT_LM
