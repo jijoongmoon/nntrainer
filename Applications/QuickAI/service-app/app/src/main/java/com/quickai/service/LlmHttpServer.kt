@@ -237,10 +237,20 @@ class LlmHttpServer(
     }
 
     private fun readBody(session: IHTTPSession): String {
+        // NanoHTTPD normalizes headers to lowercase
         val contentLength = session.headers["content-length"]?.toIntOrNull() ?: 0
+        if (contentLength <= 0) return ""
+
         val buffer = ByteArray(contentLength)
-        session.inputStream.read(buffer, 0, contentLength)
-        return String(buffer)
+        var totalRead = 0
+        while (totalRead < contentLength) {
+            val bytesRead = session.inputStream.read(
+                buffer, totalRead, contentLength - totalRead
+            )
+            if (bytesRead < 0) break
+            totalRead += bytesRead
+        }
+        return String(buffer, 0, totalRead, Charsets.UTF_8)
     }
 
     private fun jsonResponse(data: Any): Response {

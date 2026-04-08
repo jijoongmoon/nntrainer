@@ -66,7 +66,7 @@ Java_com_quickai_service_NativeEngine_nativeGetLoadedBackend(JNIEnv *env,
   return (jint)getLoadedBackend();
 }
 
-JNIEXPORT jfloatArray JNICALL
+JNIEXPORT jdoubleArray JNICALL
 Java_com_quickai_service_NativeEngine_nativeGetPerformanceMetrics(JNIEnv *env,
                                                                    jobject) {
   PerformanceMetrics metrics;
@@ -76,16 +76,16 @@ Java_com_quickai_service_NativeEngine_nativeGetPerformanceMetrics(JNIEnv *env,
     return nullptr;
   }
 
-  jfloatArray result = env->NewFloatArray(7);
-  float values[7] = {
-      (float)metrics.prefill_tokens,
-      (float)metrics.prefill_duration_ms,
-      (float)metrics.generation_tokens,
-      (float)metrics.generation_duration_ms,
-      (float)metrics.total_duration_ms,
-      (float)metrics.initialization_duration_ms,
-      (float)metrics.peak_memory_kb};
-  env->SetFloatArrayRegion(result, 0, 7, values);
+  jdoubleArray result = env->NewDoubleArray(7);
+  double values[7] = {
+      (double)metrics.prefill_tokens,
+      metrics.prefill_duration_ms,
+      (double)metrics.generation_tokens,
+      metrics.generation_duration_ms,
+      metrics.total_duration_ms,
+      metrics.initialization_duration_ms,
+      (double)metrics.peak_memory_kb};
+  env->SetDoubleArrayRegion(result, 0, 7, values);
   return result;
 }
 

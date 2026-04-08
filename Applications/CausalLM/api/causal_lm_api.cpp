@@ -413,11 +413,19 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       }
 
       // Find QNN binary in model directory
-      std::string qnn_bin_path = model_dir_path + "/model.bin";
+      std::string qnn_bin_path;
       struct stat st;
-      if (stat(qnn_bin_path.c_str(), &st) != 0) {
-        std::cerr << "[quick.ai] NPU: QNN binary not found: " << qnn_bin_path
-                  << std::endl;
+      for (const auto &name :
+           {"model.bin", "qnn_model.bin", "context.bin"}) {
+        std::string candidate = model_dir_path + "/" + name;
+        if (stat(candidate.c_str(), &st) == 0) {
+          qnn_bin_path = candidate;
+          break;
+        }
+      }
+      if (qnn_bin_path.empty()) {
+        std::cerr << "[quick.ai] NPU: no QNN binary found in "
+                  << model_dir_path << std::endl;
         return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
       }
 

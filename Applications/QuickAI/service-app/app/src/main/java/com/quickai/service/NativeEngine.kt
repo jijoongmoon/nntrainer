@@ -6,7 +6,7 @@ package com.quickai.service
 object NativeEngine {
 
     init {
-        System.loadLibrary("causallm_api")
+        System.loadLibrary("quickai_jni")
     }
 
     // Backend types (matches causal_lm_api.h)
@@ -39,7 +39,7 @@ object NativeEngine {
     external fun nativeUnloadModel(): Int
     external fun nativeSetModelBasePath(basePath: String): Int
     external fun nativeGetLoadedBackend(): Int
-    external fun nativeGetPerformanceMetrics(): FloatArray?
+    external fun nativeGetPerformanceMetrics(): DoubleArray?
 
     data class PerformanceMetrics(
         val prefillTokens: Int,
@@ -56,11 +56,11 @@ object NativeEngine {
         if (raw.size < 7) return null
         return PerformanceMetrics(
             prefillTokens = raw[0].toInt(),
-            prefillDurationMs = raw[1].toDouble(),
+            prefillDurationMs = raw[1],
             generationTokens = raw[2].toInt(),
-            generationDurationMs = raw[3].toDouble(),
-            totalDurationMs = raw[4].toDouble(),
-            initDurationMs = raw[5].toDouble(),
+            generationDurationMs = raw[3],
+            totalDurationMs = raw[4],
+            initDurationMs = raw[5],
             peakMemoryKb = raw[6].toLong()
         )
     }

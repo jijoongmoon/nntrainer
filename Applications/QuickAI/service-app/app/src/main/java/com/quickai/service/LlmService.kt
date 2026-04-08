@@ -38,8 +38,9 @@ class LlmService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         port = intent?.getIntExtra(EXTRA_PORT, DEFAULT_PORT) ?: DEFAULT_PORT
 
-        // Set model base path to app's files directory
-        val modelsDir = "${filesDir.absolutePath}/models/"
+        // Set model base path to app's files directory (without trailing slash,
+        // setModelBasePath() in C++ adds one if needed)
+        val modelsDir = "${filesDir.absolutePath}/models"
         NativeEngine.nativeSetModelBasePath(modelsDir)
         Log.i(TAG, "Model base path: $modelsDir")
 
