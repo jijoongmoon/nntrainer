@@ -70,17 +70,16 @@ LOCAL_EXPORT_C_INCLUDES := $(LITERT_LM_ROOT) $(LITERT_SDK_ROOT) $(ABSEIL_ROOT)
 include $(PREBUILT_SHARED_LIBRARY)
 
 ####################################################################
-# Prebuilt: protobuf
+# Prebuilt: protobuf (optional - only needed if litert_lm_lib
+# does not statically link protobuf)
 ####################################################################
+ifdef PROTOBUF_LIB_PATH
 include $(CLEAR_VARS)
 LOCAL_MODULE := protobuf
-
-ifndef PROTOBUF_LIB_PATH
-$(error PROTOBUF_LIB_PATH is not defined! Set to directory containing libprotobuf.so for $(TARGET_ARCH_ABI).)
-endif
-
 LOCAL_SRC_FILES := $(PROTOBUF_LIB_PATH)/libprotobuf.so
 include $(PREBUILT_SHARED_LIBRARY)
+LITERT_USE_EXTERNAL_PROTOBUF := 1
+endif
 
 ####################################################################
 # liblitert_context.so - LiteRT-LM context plugin for nntrainer
@@ -108,6 +107,10 @@ LOCAL_CXXFLAGS      += -std=c++20 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITER
 LOCAL_LDLIBS        := -llog -landroid
 LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer litert_lm_lib protobuf
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer litert_lm_lib
+
+ifeq ($(LITERT_USE_EXTERNAL_PROTOBUF),1)
+LOCAL_SHARED_LIBRARIES += protobuf
+endif
 
 include $(BUILD_SHARED_LIBRARY)
