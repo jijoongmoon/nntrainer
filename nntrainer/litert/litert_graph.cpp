@@ -90,8 +90,13 @@ void LiteRTGraph::forwarding(RunLayerContext &context, bool training) {
   // Execute inference
   if (!input_prompt_.empty()) {
     // Synchronous generation
-    auto responses = session_->GenerateContent(
-        {litert::lm::InputText(std::string(input_prompt_))});
+    using LiteRTInput =
+        std::variant<litert::lm::InputText, litert::lm::InputImage,
+                     litert::lm::InputAudio, litert::lm::InputImageEnd,
+                     litert::lm::InputAudioEnd>;
+    std::vector<LiteRTInput> inputs;
+    inputs.emplace_back(litert::lm::InputText(std::string(input_prompt_)));
+    auto responses = session_->GenerateContent(std::move(inputs));
 
     if (responses.ok()) {
       const auto &texts = responses->GetTexts();
