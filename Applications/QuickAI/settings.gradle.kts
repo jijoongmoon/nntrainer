@@ -23,4 +23,5 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "QuickAI"
-include(":app")
+include(":LauncherApp")
+include(":clientapp")
