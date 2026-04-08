@@ -209,6 +209,106 @@ libcausallm_api.so
             └─ litert_lm_ext.so 내부에서 전체 추론 실행
 ```
 
+## Current Implementation Status
+
+### GPU2 코드 경로 (causal_lm_api.cpp)
+
+```
+loadModel(GPU2, GEMMA4_E2B, ...)
+  │
+  ├─ [1] Transformer 생성 안 함 (g_model = nullptr)
+  │      GPU2/NPU는 CPU/GPU와 달리 nntrainer Transformer 모델을 사용하지 않음.
+  │      loadModel() 함수 초반에서 GPU2/NPU를 먼저 분기하여
+  │      Transformer Factory 호출 이전에 처리함.
+  │
+  ├─ [2] Engine::Global().registerContext("liblitert_context.so")
+  │      dlopen으로 liblitert_context.so 로딩
+  │      → ml_train_context_pluggable 심볼에서 createfunc 호출
+  │      → LiteRTContext 인스턴스 생성
+  │      → LiteRTContext::initialize() → LiteRTGraph 레이어 팩토리 등록
+  │      → Engine에 "gpu2" 이름으로 context 등록
+  │      ※ 이미 등록된 경우 예외 catch하여 무시 (재등록 방지)
+  │
+  ├─ [3] engine.getRegisteredContext("gpu2")->load(model.litertlm)
+  │      LiteRTContext::load() 호출:
+  │      #ifdef ENABLE_LITERT_LM:
+  │        → ModelAssets::Create(file_path)
+  │        → EngineSettings::CreateDefault(assets, Backend::GPU)
+  │           GPU 실패 시 Backend::CPU로 fallback
+  │        → EngineFactory::CreateAny(settings) → engine_ 생성
+  │      #else:
+  │        → 에러 리턴 (-1)
+  │
+  ├─ [4] g_initialized = true, g_loaded_backend = GPU2
+  │
+  └─ return CAUSAL_LM_ERROR_NONE
+
+
+runModel("prompt")
+  │
+  ├─ g_loaded_backend == GPU2 확인
+  │
+  └─ [현재] placeholder 텍스트 반환
+     [TODO] 실제 LiteRT-LM 추론 연결:
+        auto &engine = nntrainer::Engine::Global();
+        auto *ctx = dynamic_cast<LiteRTContext*>(
+            engine.getRegisteredContext("gpu2"));
+        auto session = ctx->createSession();
+        auto responses = session->GenerateContent(
+            {litert::lm::InputText(std::string(prompt))});
+        output = responses->GetTexts()[0];
+
+
+unloadModel()
+  │
+  └─ g_initialized = false, g_model.reset()
+     GPU2/NPU에서는 g_model이 이미 nullptr이므로 정상 동작
+     Context 자원은 Engine::release()에서 관리
+
+
+getPerformanceMetrics()
+  │
+  ├─ GPU2/NPU → placeholder 메트릭 반환 (init duration만 유효)
+  │  [TODO] LiteRT-LM BenchmarkInfo에서 메트릭 추출:
+  │    session->GetBenchmarkInfo() → prefill_tok/s, decode_tok/s 등
+  │
+  └─ CPU/GPU → g_model->getPerformanceMetrics() (기존 동작)
+```
+
+### 핵심 빌드 플래그
+
+| 플래그 | 설명 | 적용 대상 |
+|--------|------|-----------|
+| `-DPLUGGABLE` | `extern "C" ml_train_context_pluggable` 심볼 export | liblitert_context.so |
+| `-DENABLE_LITERT_LM` | LiteRT-LM C++ API 호출 코드 활성화 | liblitert_context.so |
+
+**`-DENABLE_LITERT_LM` 없이 빌드하면:**
+- `LiteRTContext::load()` → 에러 리턴 (-1)
+- `LiteRTContext::init()` → 경고 로그만 출력, 성공(0) 리턴
+- `LiteRTGraph::forwarding()` → input을 output으로 복사만 함 (pass-through)
+
+### 남은 TODO (실제 동작을 위해)
+
+1. **runModel() GPU2 실제 추론 연결**
+   - 현재: placeholder 텍스트 반환
+   - 필요: `LiteRTContext::createSession()` → `session->GenerateContent()` 호출
+   - `#ifdef ENABLE_LITERT_LM`으로 감싸야 함
+   - `causal_lm_api.cpp`에 `#include "litert_context.h"` 추가 필요
+
+2. **getPerformanceMetrics() GPU2 메트릭**
+   - 현재: 0으로 채운 placeholder
+   - 필요: `session->GetBenchmarkInfo()` → prefill/decode tok/s 추출
+   - `BenchmarkInfo::GetPrefillTurn()`, `GetDecodeTurn()` 사용
+
+3. **liblitert_context.so 실제 빌드**
+   - LiteRT-LM 라이브러리 (.a/.so) 빌드 필요 (Bazel/CMake)
+   - 헤더: LiteRT-LM + LiteRT SDK + Abseil
+   - 프록시 없는 환경에서 빌드해야 함
+
+4. **.litertlm 모델 파일 확보**
+   - HuggingFace: `litert-community/gemma-4-E2B-it-litert-lm`
+   - `huggingface-cli download` 명령으로 다운로드
+
 ## Verified Items
 
 - [x] LiteRT-LM C++ API 헤더 확인 (Engine, EngineFactory, Session, InputText, Responses)
@@ -217,6 +317,11 @@ libcausallm_api.so
 - [x] litert_context.h/cpp - LiteRT-LM API 연동 코드 작성 완료
 - [x] litert_graph.h/cpp - GenerateContent/BenchmarkInfo 연동 코드 작성 완료
 - [x] ContextPluggable export (#ifdef PLUGGABLE)
+- [x] causal_lm_api.cpp - GPU2 loadModel() Engine::registerContext() 경로 구현
+- [x] causal_lm_api.cpp - GPU2 runModel() 분기 구현 (placeholder)
+- [x] causal_lm_api.cpp - GPU2 unloadModel() / getPerformanceMetrics() 처리
+- [ ] runModel() GPU2 실제 LiteRT-LM 추론 연결 (ENABLE_LITERT_LM 빌드 후)
+- [ ] getPerformanceMetrics() GPU2 BenchmarkInfo 연동
 - [ ] 실제 컴파일 및 링크 (LiteRT-LM 라이브러리 빌드 필요)
 - [ ] .litertlm 모델 로딩 테스트
 - [ ] 추론 동작 검증
