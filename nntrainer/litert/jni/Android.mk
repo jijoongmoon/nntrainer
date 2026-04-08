@@ -100,8 +100,7 @@ LOCAL_C_INCLUDES    := \
 	$(LITERT_SDK_ROOT) \
 	$(ABSEIL_ROOT) \
 	$(PROTOBUF_INCLUDES) \
-	$(LITERT_LM_ROOT)/LiteRT \
-	$(LITERT_LM_ROOT)/protobuf
+	$(LITERT_LM_ROOT)/LiteRT
 
 LOCAL_CFLAGS        += -pthread -fexceptions -Wno-deprecated-declarations
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITERT_LM
