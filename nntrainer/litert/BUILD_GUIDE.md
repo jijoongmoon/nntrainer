@@ -72,9 +72,17 @@ make -j$(nproc)
 
 ## Step 3: Proto 파일 생성
 
-> **Note:** Bazel 빌드(Step 2-2 Option A)를 사용한 경우 이 단계는 **불필요**합니다.
-> Bazel이 proto 파일 생성을 자동으로 처리합니다.
-> CMake 빌드 또는 Step 5에서 NDK 직접 컴파일 시에만 필요합니다.
+> **중요: Bazel 빌드(Step 2 Option A)를 사용한 경우 이 단계를 실행하지 마세요.**
+> Bazel이 자체 protobuf 버전으로 `.pb.h`를 생성하고 `liblitert_lm_lib.so`에 포함시킵니다.
+> 시스템 `protoc`으로 수동 생성하면 protobuf 버전 불일치 에러가 발생합니다.
+>
+> 이미 수동 생성한 경우 삭제하세요:
+> ```bash
+> rm LiteRT-LM/runtime/proto/*.pb.h LiteRT-LM/runtime/proto/*.pb.cc
+> rm LiteRT-LM/runtime/executor/proto/*.pb.h LiteRT-LM/runtime/executor/proto/*.pb.cc
+> ```
+
+CMake 빌드 시에만 필요:
 
 ```bash
 cd LiteRT-LM
