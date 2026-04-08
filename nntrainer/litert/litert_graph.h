@@ -12,7 +12,7 @@
  * This layer wraps the entire LiteRT-LM inference engine as a single
  * nntrainer layer, following the same pattern as QNNGraph layer.
  * When forwarding() is called, it executes the complete LiteRT-LM
- * model (tokenization → prefill → decode → detokenization).
+ * model (tokenization -> prefill -> decode -> detokenization).
  */
 
 #ifndef __LITERT_GRAPH_H__
@@ -24,6 +24,11 @@
 
 #include <common_properties.h>
 #include <layer_impl.h>
+
+#ifdef ENABLE_LITERT_LM
+#include "runtime/engine/engine.h"
+#include "runtime/engine/io_types.h"
+#endif
 
 namespace nntrainer {
 
@@ -90,20 +95,42 @@ public:
             size_t start_offset = 0, bool read_from_offset = false,
             int file_fd = -1) override;
 
+  /**
+   * @brief Get the last generated text output
+   * @return generated text string
+   */
+  const std::string &getLastOutput() const { return last_output_; }
+
+  /**
+   * @brief Set the input prompt for next forwarding
+   * @param prompt input text
+   */
+  void setInputPrompt(const std::string &prompt) { input_prompt_ = prompt; }
+
 private:
   std::tuple<std::vector<props::TensorDimension>,
              std::vector<props::TensorDataType>, props::FilePath>
       graph_props;
 
   std::string model_path;
-  bool is_engine_initialized;
+  bool is_session_created;
 
   std::vector<TensorDim> t_dims;
   std::vector<unsigned int> tensor_idx;
 
-  /// @todo Add LiteRT-LM engine and session handles when C++ API is integrated
-  /// std::unique_ptr<litert::lm::Engine> engine_;
-  /// std::unique_ptr<litert::lm::Engine::Session> session_;
+  // Input/output for text-level interface
+  std::string input_prompt_;
+  std::string last_output_;
+
+  // Performance tracking
+  double last_prefill_ms_ = 0.0;
+  double last_decode_ms_ = 0.0;
+  unsigned int last_prefill_tokens_ = 0;
+  unsigned int last_decode_tokens_ = 0;
+
+#ifdef ENABLE_LITERT_LM
+  std::unique_ptr<litert::lm::Engine::Session> session_;
+#endif
 };
 
 } // namespace nntrainer

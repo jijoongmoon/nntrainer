@@ -40,11 +40,14 @@ void LiteRTContext::initialize() noexcept {
 int LiteRTContext::init() {
   ml_logi("LiteRTContext::init - initializing LiteRT-LM backend");
 
-  /// @todo Initialize LiteRT-LM runtime here
-  /// This will be populated when LiteRT-LM C++ API is integrated:
-  /// - Verify LiteRT-LM shared libraries are available
-  /// - Initialize GPU accelerator if available
-  /// - Set up logging
+#ifdef ENABLE_LITERT_LM
+  // LiteRT-LM runtime will be fully initialized when load() is called
+  // with a model path. At this point we just verify the runtime is available.
+  ml_logi("LiteRT-LM support enabled at compile time");
+#else
+  ml_logw("LiteRT-LM support not enabled (ENABLE_LITERT_LM not defined). "
+          "GPU2 backend will be non-functional.");
+#endif
 
   return 0;
 }
@@ -52,18 +55,89 @@ int LiteRTContext::init() {
 int LiteRTContext::load(const std::string &file_path) {
   ml_logi("LiteRTContext::load - loading model: %s", file_path.c_str());
 
-  /// @todo Load .litertlm model file via LiteRT-LM API:
-  /// auto model_assets = ModelAssets::Create(file_path);
-  /// auto settings = EngineSettings::CreateDefault(model_assets, Backend::GPU);
-  /// engine_ = EngineFactory::CreateAny(settings);
+#ifdef ENABLE_LITERT_LM
+  try {
+    // Step 1: Create model assets from the .litertlm file
+    auto model_assets = litert::lm::ModelAssets::Create(file_path);
+    if (!model_assets.ok()) {
+      ml_loge("Failed to create model assets: %s",
+              model_assets.status().message().data());
+      return -1;
+    }
+
+    // Step 2: Create engine settings with GPU backend
+    // Falls back to CPU if GPU is not available
+    auto engine_settings = litert::lm::EngineSettings::CreateDefault(
+        std::move(*model_assets), litert::lm::Backend::GPU);
+    if (!engine_settings.ok()) {
+      ml_logw("GPU backend failed, falling back to CPU: %s",
+              engine_settings.status().message().data());
+      // Retry with CPU backend
+      auto model_assets_retry = litert::lm::ModelAssets::Create(file_path);
+      engine_settings = litert::lm::EngineSettings::CreateDefault(
+          std::move(*model_assets_retry), litert::lm::Backend::CPU);
+      if (!engine_settings.ok()) {
+        ml_loge("Failed to create engine settings: %s",
+                engine_settings.status().message().data());
+        return -1;
+      }
+    }
+
+    // Step 3: Enable benchmarking for performance metrics
+    engine_settings->GetMutableBenchmarkParams();
+
+    // Step 4: Create the engine
+    auto engine =
+        litert::lm::EngineFactory::CreateAny(std::move(*engine_settings));
+    if (!engine.ok()) {
+      ml_loge("Failed to create LiteRT-LM engine: %s",
+              engine.status().message().data());
+      return -1;
+    }
+
+    engine_ = std::move(*engine);
+    loaded_model_path_ = file_path;
+    ml_logi("LiteRT-LM engine created successfully for: %s",
+            file_path.c_str());
+
+  } catch (const std::exception &e) {
+    ml_loge("Exception in LiteRTContext::load: %s", e.what());
+    return -1;
+  }
 
   return 0;
+#else
+  ml_loge("LiteRT-LM not enabled. Cannot load model.");
+  return -1;
+#endif
 }
+
+#ifdef ENABLE_LITERT_LM
+std::unique_ptr<litert::lm::Engine::Session> LiteRTContext::createSession() {
+  if (!engine_) {
+    ml_loge("Engine not initialized. Call load() first.");
+    return nullptr;
+  }
+
+  auto session_config = litert::lm::SessionConfig::CreateDefault();
+  auto session = engine_->CreateSession(session_config);
+  if (!session.ok()) {
+    ml_loge("Failed to create session: %s",
+            session.status().message().data());
+    return nullptr;
+  }
+
+  return std::move(*session);
+}
+#endif
 
 void LiteRTContext::release() {
   ml_logi("LiteRTContext::release - cleaning up LiteRT-LM resources");
 
-  /// @todo Release LiteRT-LM engine and session resources
+#ifdef ENABLE_LITERT_LM
+  engine_.reset();
+  loaded_model_path_.clear();
+#endif
 }
 
 template <typename T>

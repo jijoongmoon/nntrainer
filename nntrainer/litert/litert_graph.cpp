@@ -19,15 +19,21 @@
 #include <node_exporter.h>
 #include <util_func.h>
 
+#ifdef ENABLE_LITERT_LM
+#include "litert_context.h"
+#endif
+
 namespace nntrainer {
 
 LiteRTGraph::LiteRTGraph() :
   LayerImpl(),
   graph_props({}, {}, props::FilePath()),
-  is_engine_initialized(false) {}
+  is_session_created(false) {}
 
 LiteRTGraph::~LiteRTGraph() {
-  /// @todo Release LiteRT-LM engine/session handles
+#ifdef ENABLE_LITERT_LM
+  session_.reset();
+#endif
 }
 
 void LiteRTGraph::setProperty(const std::vector<std::string> &values) {
@@ -64,35 +70,63 @@ void LiteRTGraph::finalize(InitLayerContext &context) {
 }
 
 void LiteRTGraph::forwarding(RunLayerContext &context, bool training) {
-  auto start = std::chrono::system_clock::now();
+  auto start = std::chrono::high_resolution_clock::now();
 
-  /// @todo Implement LiteRT-LM inference execution
-  /// Following the QNNGraph pattern:
-  ///
-  /// 1. Initialize engine if not done:
-  ///    if (!is_engine_initialized) {
-  ///      auto model_assets = ModelAssets::Create(model_path);
-  ///      auto settings = EngineSettings::CreateDefault(
-  ///          model_assets, litert::lm::Backend::GPU);
-  ///      engine_ = EngineFactory::CreateAny(settings);
-  ///      session_ = engine_->CreateSession(SessionConfig::CreateDefault());
-  ///      is_engine_initialized = true;
-  ///    }
-  ///
-  /// 2. Set up input tensors from context:
-  ///    Tensor &input = context.getInput(0);
-  ///    // Convert input tensor to LiteRT-LM input format
-  ///
-  /// 3. Execute inference:
-  ///    auto responses = session_->GenerateContent({InputText(prompt)});
-  ///    // OR for tensor-level:
-  ///    session_->RunPrefill({input_data});
-  ///    auto output = session_->RunDecode();
-  ///
-  /// 4. Copy results to output tensors:
-  ///    Tensor &output = context.getOutput(0);
-  ///    // Copy LiteRT-LM output to nntrainer tensor
+#ifdef ENABLE_LITERT_LM
+  // Get or create session from LiteRTContext
+  if (!is_session_created || !session_) {
+    // Access the LiteRT context to create a session
+    auto &litert_ctx = LiteRTContext::Global();
+    session_ = litert_ctx.createSession();
+    if (!session_) {
+      ml_loge("Failed to create LiteRT-LM session");
+      return;
+    }
+    is_session_created = true;
+    ml_logi("LiteRT-LM session created successfully");
+  }
 
+  // Execute inference
+  if (!input_prompt_.empty()) {
+    // Synchronous generation
+    auto responses = session_->GenerateContent(
+        {litert::lm::InputText(std::string(input_prompt_))});
+
+    if (responses.ok()) {
+      const auto &texts = responses->GetTexts();
+      if (!texts.empty()) {
+        last_output_ = texts[0];
+        ml_logi("LiteRT-LM generated %zu chars", last_output_.size());
+      }
+
+      // Extract benchmark info if available
+      auto bench = session_->GetBenchmarkInfo();
+      if (bench.ok()) {
+        if (bench->GetTotalPrefillTurns() > 0) {
+          auto prefill_turn = bench->GetPrefillTurn(0);
+          if (prefill_turn.ok()) {
+            last_prefill_tokens_ = prefill_turn->num_tokens;
+            last_prefill_ms_ =
+                absl::ToDoubleMilliseconds(prefill_turn->duration);
+          }
+        }
+        if (bench->GetTotalDecodeTurns() > 0) {
+          auto decode_turn = bench->GetDecodeTurn(0);
+          if (decode_turn.ok()) {
+            last_decode_tokens_ = decode_turn->num_tokens;
+            last_decode_ms_ =
+                absl::ToDoubleMilliseconds(decode_turn->duration);
+          }
+        }
+      }
+    } else {
+      ml_loge("LiteRT-LM GenerateContent failed: %s",
+              responses.status().message().data());
+    }
+  }
+
+#else
+  // Fallback when ENABLE_LITERT_LM is not defined: pass-through
   for (unsigned int i = 0; i < context.getNumOutputs(); ++i) {
     Tensor &input_ = context.getInput(i);
     Tensor &hidden_ = context.getOutput(i);
@@ -100,10 +134,12 @@ void LiteRTGraph::forwarding(RunLayerContext &context, bool training) {
       hidden_.copyData(input_);
     }
   }
+  ml_logw("LiteRT-LM not enabled, forwarding is pass-through only");
+#endif
 
-  auto end = std::chrono::system_clock::now();
-  std::chrono::duration<double> elapsed_seconds = end - start;
-  ml_logd("LiteRTGraph::forwarding elapsed: %f sec", elapsed_seconds.count());
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> elapsed = end - start;
+  ml_logd("LiteRTGraph::forwarding elapsed: %.2f ms", elapsed.count());
 }
 
 void LiteRTGraph::read(std::ifstream &file, RunLayerContext &run_context,
@@ -112,6 +148,7 @@ void LiteRTGraph::read(std::ifstream &file, RunLayerContext &run_context,
                        bool fsu, size_t start_offset, bool read_from_offset,
                        int file_fd) {
   // No-op: LiteRT-LM model is self-contained in .litertlm file
+  // All weights and configurations are loaded via LiteRTContext::load()
 }
 
 void LiteRTGraph::exportTo(Exporter &exporter,

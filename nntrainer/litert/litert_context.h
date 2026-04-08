@@ -29,6 +29,13 @@
 #include <nntrainer_log.h>
 #include <singleton.h>
 
+#ifdef ENABLE_LITERT_LM
+#include "runtime/engine/engine.h"
+#include "runtime/engine/engine_factory.h"
+#include "runtime/engine/engine_settings.h"
+#include "runtime/engine/io_types.h"
+#endif
+
 namespace nntrainer {
 
 extern std::mutex litert_factory_mutex;
@@ -158,12 +165,31 @@ public:
    */
   int load(const std::string &file_path) override;
 
+#ifdef ENABLE_LITERT_LM
+  /**
+   * @brief Get LiteRT-LM engine instance
+   * @return pointer to engine (nullptr if not initialized)
+   */
+  litert::lm::Engine *getEngine() { return engine_.get(); }
+
+  /**
+   * @brief Create a new session for inference
+   * @return unique_ptr to session
+   */
+  std::unique_ptr<litert::lm::Engine::Session> createSession();
+#endif
+
 private:
   void initialize() noexcept override;
 
   void release();
 
   FactoryMap<nntrainer::Layer> factory_map;
+
+#ifdef ENABLE_LITERT_LM
+  std::unique_ptr<litert::lm::Engine> engine_;
+  std::string loaded_model_path_;
+#endif
 
   template <typename Args, typename T> struct isSupportedHelper;
 
