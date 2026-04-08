@@ -76,9 +76,20 @@ void InputLayer::finalize(InitLayerContext &context) {
 
   std::vector<TensorDim> output_dims = context.getInputDimensions();
 
-  // Use explicit tensor_dtype property if set, otherwise use model default
+  // Use explicit tensor_dtype if set, otherwise use model's activation type
   auto &dtype_prop = std::get<props::TensorDataType>(input_props);
-  ml::train::TensorDim::DataType dtype = dtype_prop.get();
+  ml::train::TensorDim::DataType dtype;
+
+  // Check if tensor_dtype was explicitly set (not default FP32 from constructor)
+  // by comparing with the activation data type
+  if (dtype_prop.get() != context.getActivationDataType() &&
+      dtype_prop.get() != ml::train::TensorDim::DataType::FP32) {
+    // Explicitly set to a non-default type (e.g., UINT16 for KV cache)
+    dtype = dtype_prop.get();
+  } else {
+    // Use model's activation data type (original behavior)
+    dtype = context.getActivationDataType();
+  }
 
   for (auto &d : output_dims) {
     d.setDataType(dtype);
@@ -93,14 +104,6 @@ void InputLayer::finalize(InitLayerContext &context) {
 void InputLayer::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
   std::vector<nntrainer::TensorDim> input_dimensions) {
-  // Skip update if this input layer's data type differs from the provided
-  // dimensions. This preserves external tensors (e.g., KV cache with UINT16)
-  // when resetInputDimension is called with FP32 token dimensions.
-  auto current_dtype = context.getOutput(SINGLE_INOUT_IDX).getDataType();
-  auto new_dtype = input_dimensions[0].getDataType();
-  if (current_dtype != new_dtype) {
-    return;
-  }
   context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
   context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
 }

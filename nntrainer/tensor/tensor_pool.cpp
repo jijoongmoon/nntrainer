@@ -257,13 +257,8 @@ void TensorPool::allocate(bool init) {
 void TensorPool::deallocate() {
   mem_pool->deallocate();
 
-  /** nullify the data pointers for internally managed tensors only.
-   *  External tensors (token == 0, e.g., fromData) retain their pointers. */
+  /** nullify the data pointers for the tensors */
   for (auto &spec : pool) {
-    auto details = std::get_if<SourceDetails>(&spec.details);
-    if (details && details->token == 0) {
-      continue; // external tensor — don't nullify
-    }
     spec.tensor->setData(nullptr);
   }
 }
