@@ -69,13 +69,10 @@ MHACoreLayer::~MHACoreLayer() {}
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
-                std::invalid_argument)
-    << "Multi head Attention layer needs 3, 4, or 5 inputs. (query, key, value"
-       ", mask is optional, and external cache_key + cache_value for external "
-       "cache mode)";
+  NNTR_THROW_IF(context.getNumInputs() != 5, std::invalid_argument)
+    << "MHA Core layer needs exactly 5 inputs: query, key, value, "
+       "cache_key, cache_value";
 
-  use_external_cache = (context.getNumInputs() >= 5);
   ml::train::TensorDim::TensorType activation_type = {
     context.getFormat(), context.getActivationDataType()};
   ml::train::TensorDim empty_dim(activation_type);
@@ -152,32 +149,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
 
-  /** Tensor for KV-Cache (only allocate internally when not using external
-   * cache) */
-  if (!use_external_cache) {
-#ifdef ENABLE_FP16
-    ml::train::TensorDim cache_key_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::FP16});
-    ml::train::TensorDim cache_value_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::FP16});
-#else
-    ml::train::TensorDim cache_key_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
-    ml::train::TensorDim cache_value_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
-#endif
-
-    tensor_idx[AttentionParams::cache_key] = context.requestTensor(
-      cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
-      nntrainer::TensorLifespan::MAX_LIFESPAN);
-    tensor_idx[AttentionParams::cache_value] = context.requestTensor(
-      cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
-      nntrainer::TensorLifespan::MAX_LIFESPAN);
-  }
+  /** KV Cache tensors are provided as inputs[3] and inputs[4].
+   * No internal cache allocation — cache is managed externally
+   * (e.g., by KVCacheManager via graph input layers). */
 
   theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
 
@@ -193,18 +167,18 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 /************************************************************** */
 
 /**
- * @note forwarding() supports external KV cache mode.
- *       When use_external_cache is true (num_inputs >= 5), cache tensors are
- *       provided as inputs 3 and 4 (cache_key, cache_value) instead of being
- *       allocated internally. cache_index must be set externally via
- *       setCacheIndex() before calling this method.
+ * @note MHA Core forwarding with externally managed KV cache.
  *
- *       Input layout for external cache mode:
+ *       Input layout (5 inputs):
  *         input[0] = Q  (batch, 1, step_size, num_heads_Q * head_dim)
  *         input[1] = K  (batch, 1, step_size, num_heads_KV * head_dim)
  *         input[2] = V  (batch, 1, step_size, num_heads_KV * head_dim)
  *         input[3] = cache_key   (batch, 1, max_seq_len, num_heads_KV * head_dim)
  *         input[4] = cache_value (batch, 1, max_seq_len, num_heads_KV * head_dim)
+ *
+ *       Cache tensors are provided via graph input layers and managed by
+ *       KVCacheManager. cache_index must be set via setCacheIndex() before
+ *       each forwarding call.
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
@@ -213,20 +187,8 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
   nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
 
-  nntrainer::Tensor *cache_key_ptr;
-  nntrainer::Tensor *cache_value_ptr;
-
-  if (use_external_cache) {
-    cache_key_ptr = &context.getInput(3);
-    cache_value_ptr = &context.getInput(4);
-  } else {
-    cache_key_ptr = &context.getTensor(tensor_idx[AttentionParams::cache_key]);
-    cache_value_ptr =
-      &context.getTensor(tensor_idx[AttentionParams::cache_value]);
-  }
-
-  nntrainer::Tensor &cache_key = *cache_key_ptr;
-  nntrainer::Tensor &cache_value = *cache_value_ptr;
+  nntrainer::Tensor &cache_key = context.getInput(INOUT_INDEX::CACHE_KEY);
+  nntrainer::Tensor &cache_value = context.getInput(INOUT_INDEX::CACHE_VALUE);
 
   unsigned int step_size = query.height();
 
@@ -1154,8 +1116,7 @@ void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
 
   const float dropout_rate =
     std::get<nntrainer::props::DropOutRate>(mha_core_props).get();
-  context.updateTensor(tensor_idx[AttentionParams::cache_key], batch);
-  context.updateTensor(tensor_idx[AttentionParams::cache_value], batch);
+  // Cache tensors are external inputs — no batch update needed here
   // context.updateTensor(tensor_idx[AttentionParams::attention_weight], batch);
   if (dropout_rate > epsilon) {
     context.updateTensor(tensor_idx[AttentionParams::dropout_mask], batch);
@@ -1178,31 +1139,13 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   ml::train::TensorDim kv_dim = input_dimensions[0];
   kv_dim.width(kv_dim.width() / (num_heads_Q / num_heads_KV));
 
+  max_timestep = new_max_timestep;
+
   context.updateInput(INOUT_INDEX::QUERY, input_dimensions[0]);
   context.updateInput(INOUT_INDEX::KEY, kv_dim);
   context.updateInput(INOUT_INDEX::VALUE, kv_dim);
   context.updateOutput(0, input_dimensions[0]);
-
-  if (!use_external_cache) {
-    // Only grow cache, never shrink (generation mode with height=1 must not
-    // reduce cache that was sized during prefill)
-    if (new_max_timestep > max_timestep) {
-      max_timestep = new_max_timestep;
-    }
-
-    ml::train::TensorDim kv_cache_dim = kv_dim;
-#ifdef ENABLE_FP16
-    kv_cache_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-#else
-    kv_cache_dim.setDataType(ml::train::TensorDim::DataType::UINT16);
-#endif
-    kv_cache_dim.height(max_timestep);
-
-    context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
-    context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
-  } else {
-    max_timestep = new_max_timestep;
-  }
+  // Cache inputs (3, 4) are managed externally — not updated here
 }
 
 void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}
