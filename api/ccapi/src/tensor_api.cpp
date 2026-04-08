@@ -1018,20 +1018,33 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
   }
 
   // 1b. Create input layers for additional leaf tensors.
-  //     Skip external (fromData) tensors — they provide their own memory.
+  //     For external (fromData) tensors, preserve their data type so the
+  //     input layer does not convert/copy — it acts as a typed passthrough.
   for (auto &[leaf_name, leaf_info] : additional_leaves) {
-    if (leaf_info.is_external) {
-      // External tensor: no input layer needed. The tensor data is managed
-      // externally (e.g., by KVCacheManager). The layer that consumes this
-      // leaf will receive the external buffer directly.
-      continue;
-    }
-
     std::string leaf_shape = std::to_string(leaf_info.dim.channel()) + ":" +
                               std::to_string(leaf_info.dim.height()) + ":" +
                               std::to_string(leaf_info.dim.width());
     std::vector<std::string> leaf_props = {
       "name=" + leaf_name, "input_shape=" + leaf_shape};
+
+    // Preserve data type for external tensors (e.g., UINT16 KV cache)
+    if (leaf_info.is_external) {
+      auto dt = leaf_info.dim.getDataType();
+      if (dt != TensorDim::DataType::FP32) {
+        const char *dtype_str = nullptr;
+        switch (dt) {
+        case TensorDim::DataType::FP16: dtype_str = "FP16"; break;
+        case TensorDim::DataType::UINT16: dtype_str = "UINT16"; break;
+        case TensorDim::DataType::UINT8: dtype_str = "UINT8"; break;
+        case TensorDim::DataType::QINT4: dtype_str = "QINT4"; break;
+        case TensorDim::DataType::QINT8: dtype_str = "QINT8"; break;
+        default: break;
+        }
+        if (dtype_str) {
+          leaf_props.push_back(std::string("tensor_dtype=") + dtype_str);
+        }
+      }
+    }
 
     auto leaf_layer = createLayer("input", leaf_props);
     status = addLayer(std::move(leaf_layer));
