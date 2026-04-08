@@ -42,6 +42,8 @@ struct SymbolicGraphNode {
   TensorDim dim;
   std::string name;
   int output_index = -1; ///< >=0 means indexed output, e.g. split(0)
+  bool is_external = false;       ///< true if from Tensor::fromData
+  void *external_ptr = nullptr;   ///< external data pointer if any
 };
 
 /**
@@ -828,6 +830,8 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
       if (inp.isValid()) {
         leaf->dim = inp.shape();
         leaf->name = inp.name();
+        leaf->is_external = inp.impl_->external;
+        leaf->external_ptr = inp.impl_->external_ptr;
       }
       edge->inputs.push_back(leaf);
     }
@@ -880,6 +884,8 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
   // Track additional leaf tensors (e.g., fromData external caches)
   struct LeafInfo {
     TensorDim dim;
+    bool is_external = false;       /**< true if from Tensor::fromData */
+    void *external_ptr = nullptr;   /**< external data pointer if any */
   };
   std::map<std::string, LeafInfo> additional_leaves;
   int unnamed_leaf_counter = 0;
@@ -930,7 +936,10 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
             input_names.push_back(leaf_name);
           } else {
             if (additional_leaves.find(leaf_name) == additional_leaves.end()) {
-              additional_leaves[leaf_name] = {inp ? inp->dim : TensorDim()};
+              bool ext = inp && inp->is_external;
+              void *ext_ptr = ext ? inp->external_ptr : nullptr;
+              additional_leaves[leaf_name] = {
+                inp ? inp->dim : TensorDim(), ext, ext_ptr};
             }
             input_names.push_back(leaf_name);
           }
@@ -1008,30 +1017,21 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
     }
   }
 
-  // 1b. Create input layers for additional leaf tensors
+  // 1b. Create input layers for additional leaf tensors.
+  //     Skip external (fromData) tensors — they provide their own memory.
   for (auto &[leaf_name, leaf_info] : additional_leaves) {
+    if (leaf_info.is_external) {
+      // External tensor: no input layer needed. The tensor data is managed
+      // externally (e.g., by KVCacheManager). The layer that consumes this
+      // leaf will receive the external buffer directly.
+      continue;
+    }
+
     std::string leaf_shape = std::to_string(leaf_info.dim.channel()) + ":" +
                               std::to_string(leaf_info.dim.height()) + ":" +
                               std::to_string(leaf_info.dim.width());
     std::vector<std::string> leaf_props = {
       "name=" + leaf_name, "input_shape=" + leaf_shape};
-
-    // Preserve data type from the leaf tensor dimension if non-default
-    auto dt = leaf_info.dim.getDataType();
-    if (dt != TensorDim::DataType::FP32) {
-      const char *dtype_str = nullptr;
-      switch (dt) {
-      case TensorDim::DataType::FP16: dtype_str = "FP16"; break;
-      case TensorDim::DataType::UINT16: dtype_str = "UINT16"; break;
-      case TensorDim::DataType::UINT8: dtype_str = "UINT8"; break;
-      case TensorDim::DataType::QINT4: dtype_str = "QINT4"; break;
-      case TensorDim::DataType::QINT8: dtype_str = "QINT8"; break;
-      default: break;
-      }
-      if (dtype_str) {
-        leaf_props.push_back(std::string("tensor_dtype=") + dtype_str);
-      }
-    }
 
     auto leaf_layer = createLayer("input", leaf_props);
     status = addLayer(std::move(leaf_layer));
