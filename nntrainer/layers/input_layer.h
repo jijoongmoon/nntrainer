@@ -107,7 +107,7 @@ public:
 
   void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions);
+    std::vector<nntrainer::TensorDim> input_dimensions) override;
 
   /**
    * @brief Get input tensor data type
