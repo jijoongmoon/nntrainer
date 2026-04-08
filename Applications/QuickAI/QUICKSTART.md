@@ -108,10 +108,14 @@ LITERT_LM_DIR=/path/to/LiteRT-LM
 LITERT_SDK_DIR=/path/to/LiteRT
 ABSEIL_DIR=/path/to/abseil-cpp
 
-# Android arm64 크로스 컴파일
-$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++ \
-  -std=c++20 -shared -fPIC -DPLUGGABLE -DENABLE_LITERT_LM \
+# NDK 크로스 컴파일러로 Android arm64 빌드
+NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+NDK_CC=$NDK_TOOLCHAIN/bin/aarch64-linux-android29-clang++
+NDK_SYSROOT=$NDK_TOOLCHAIN/sysroot
+
+$NDK_CC -std=c++20 -shared -fPIC -DPLUGGABLE -DENABLE_LITERT_LM \
   -Wno-deprecated-declarations \
+  --sysroot=$NDK_SYSROOT \
   -I${NNTRAINER_DIR} \
   -I${NNTRAINER_DIR}/nntrainer \
   -I${NNTRAINER_DIR}/api/ccapi/include \
@@ -123,6 +127,7 @@ $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-androi
   -L/path/to/litert_lm_lib_android_arm64 \
   -llitert_lm_lib \
   -lprotobuf \
+  -llog \
   -o liblitert_context.so
 ```
 
