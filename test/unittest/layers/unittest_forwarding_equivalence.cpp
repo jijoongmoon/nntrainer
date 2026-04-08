@@ -65,6 +65,17 @@ static void registerCustomLayers() {
   }
 }
 
+// Shared cache buffers (defined before buildTinyTransformer which uses them)
+static const unsigned int TEST_MAX_SEQ = 8; // SEQ_LEN(4) + NUM_TO_GENERATE(4)
+static const size_t CACHE_ELEMENTS = TEST_MAX_SEQ * DIM;
+static std::vector<uint16_t> g_cache_k(CACHE_ELEMENTS, 0);
+static std::vector<uint16_t> g_cache_v(CACHE_ELEMENTS, 0);
+
+static void resetCache() {
+  std::fill(g_cache_k.begin(), g_cache_k.end(), static_cast<uint16_t>(0));
+  std::fill(g_cache_v.begin(), g_cache_v.end(), static_cast<uint16_t>(0));
+}
+
 static std::unique_ptr<ml::train::Model>
 buildTinyTransformer(unsigned int seq_len) {
   registerCustomLayers();
@@ -115,22 +126,17 @@ buildTinyTransformer(unsigned int seq_len) {
      withKey("weight_initializer", "xavier_uniform")});
   Tensor v = v_proj(x);
 
-  // Cache input layers (managed externally by KVCacheManager)
+  // Cache tensors via fromData (external memory, typed as UINT16)
   unsigned int max_seq = seq_len + NUM_TO_GENERATE;
-  std::string cache_shape = "1:" + std::to_string(max_seq) + ":" +
-                            std::to_string(DIM);
+  ml::train::TensorDim cache_dim(
+    {1, 1, max_seq, DIM},
+    {ml::train::TensorDim::Format::NCHW,
+     ml::train::TensorDim::DataType::UINT16});
 
-  LayerHandle ck_layer = createLayer(
-    "input", {withKey("name", "cache_key_0"),
-              withKey("input_shape", cache_shape),
-              withKey("tensor_dtype", "UINT16")});
-  Tensor ck = ck_layer(Tensor());
-
-  LayerHandle cv_layer = createLayer(
-    "input", {withKey("name", "cache_value_0"),
-              withKey("input_shape", cache_shape),
-              withKey("tensor_dtype", "UINT16")});
-  Tensor cv = cv_layer(Tensor());
+  Tensor ck = Tensor::fromData(cache_dim,
+                               g_cache_k.data(), "cache_key_0");
+  Tensor cv = Tensor::fromData(cache_dim,
+                               g_cache_v.data(), "cache_value_0");
 
   LayerHandle attn = createLayer(
     "mha_core",
@@ -156,26 +162,13 @@ buildTinyTransformer(unsigned int seq_len) {
      withKey("weight_initializer", "xavier_uniform")});
   Tensor output = lm_head(o);
 
-  std::vector<Tensor> all_inputs = {input, ck, cv};
+  std::vector<Tensor> all_inputs = {input};
   std::vector<Tensor> outputs = {output};
   model->compile(all_inputs, outputs, ml::train::ExecutionMode::INFERENCE);
 
   return model;
 }
 
-// Shared cache buffers for test models (1 layer, max_seq=8, width=DIM=8)
-// UINT16: 2 bytes per element, buffer in bytes = max_seq * DIM * 2
-static const unsigned int TEST_MAX_SEQ = 8; // SEQ_LEN(4) + NUM_TO_GENERATE(4)
-static const size_t CACHE_ELEMENTS = TEST_MAX_SEQ * DIM;
-static const size_t CACHE_BYTES = CACHE_ELEMENTS * sizeof(uint16_t);
-// Allocate as uint16_t but cast to float* for inference API
-static std::vector<uint16_t> g_cache_k(CACHE_ELEMENTS, 0);
-static std::vector<uint16_t> g_cache_v(CACHE_ELEMENTS, 0);
-
-static void resetCache() {
-  std::fill(g_cache_k.begin(), g_cache_k.end(), static_cast<uint16_t>(0));
-  std::fill(g_cache_v.begin(), g_cache_v.end(), static_cast<uint16_t>(0));
-}
 
 /**
  * @brief Helper: run prefill via resetInputDimension + inference
@@ -183,15 +176,19 @@ static void resetCache() {
 static std::vector<float> runPrefill(ml::train::Model &model, unsigned int batch,
                                      std::vector<float> &input_data,
                                      unsigned int seq_len) {
-  // Note: resetInputDimension only changes token input dim,
-  // cache inputs keep their fixed size (max_seq * DIM)
   ml::train::TensorDim token_dim(batch, 1, seq_len, 1);
-  ml::train::TensorDim cache_dim(batch, 1, TEST_MAX_SEQ, DIM);
+  ml::train::TensorDim cache_dim(
+    batch, 1, TEST_MAX_SEQ, DIM,
+    {ml::train::TensorDim::Format::NCHW,
+     ml::train::TensorDim::DataType::UINT16});
   model.resetInputDimension({token_dim, cache_dim, cache_dim});
 
-  std::vector<float *> input = {input_data.data(),
-                                reinterpret_cast<float *>(g_cache_k.data()),
-                                reinterpret_cast<float *>(g_cache_v.data())};
+  // Model has 3 inputs: tokens, cache_k, cache_v
+  // Cache inputs are fromData tensors — pass their buffers
+  std::vector<float *> input = {
+    input_data.data(),
+    reinterpret_cast<float *>(g_cache_k.data()),
+    reinterpret_cast<float *>(g_cache_v.data())};
   std::vector<float *> label;
   auto output = model.inference(batch, input, label);
 
@@ -207,13 +204,17 @@ static std::vector<float> runGenStep(ml::train::Model &model, unsigned int batch
                                      bool need_resize = false) {
   if (need_resize) {
     ml::train::TensorDim token_dim(batch, 1, 1, 1);
-    ml::train::TensorDim cache_dim(batch, 1, TEST_MAX_SEQ, DIM);
+    ml::train::TensorDim cache_dim(
+      batch, 1, TEST_MAX_SEQ, DIM,
+      {ml::train::TensorDim::Format::NCHW,
+       ml::train::TensorDim::DataType::UINT16});
     model.resetInputDimension({token_dim, cache_dim, cache_dim});
   }
 
-  std::vector<float *> input = {token_data.data(),
-                                reinterpret_cast<float *>(g_cache_k.data()),
-                                reinterpret_cast<float *>(g_cache_v.data())};
+  std::vector<float *> input = {
+    token_data.data(),
+    reinterpret_cast<float *>(g_cache_k.data()),
+    reinterpret_cast<float *>(g_cache_v.data())};
   std::vector<float *> label;
   auto output = model.inference(batch, input, label);
 
