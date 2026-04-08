@@ -73,6 +73,10 @@ make -j$(nproc)
 
 ## Step 3: Proto 파일 생성
 
+> **Note:** Bazel 빌드(Step 2-2 Option A)를 사용한 경우 이 단계는 **불필요**합니다.
+> Bazel이 proto 파일 생성을 자동으로 처리합니다.
+> CMake 빌드 또는 Step 5에서 NDK 직접 컴파일 시에만 필요합니다.
+
 ```bash
 cd LiteRT-LM
 protoc --cpp_out=. --proto_path=. \
