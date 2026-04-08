@@ -46,9 +46,12 @@ static bool g_use_chat_template = false;
 static bool g_verbose = false;
 static std::string g_last_output = "";
 static double g_initialization_duration_ms = 0.0;
+static int g_loaded_backend = -1;
+static std::string g_model_base_path = "./models/";
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
+  {"GEMMA4-E2B", "gemma4-e2b"},
 };
 
 /**
@@ -127,6 +130,8 @@ static const char *get_model_name_from_type(ModelType type) {
   switch (type) {
   case CAUSAL_LM_MODEL_QWEN3_0_6B:
     return "QWEN3-0.6B";
+  case CAUSAL_LM_MODEL_GEMMA4_E2B:
+    return "GEMMA4-E2B";
   default:
     return nullptr;
   }
@@ -192,7 +197,7 @@ static std::string resolve_model_path(const std::string &model_key,
   }
 
   std::string model_path =
-    "./models/" + base_dir_name + get_quantization_suffix(quant_type);
+    g_model_base_path + base_dir_name + get_quantization_suffix(quant_type);
 
   return model_path;
 }
@@ -498,11 +503,47 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
     }
 
-    g_model->initialize();
-    g_model->load_weight(weight_file);
+    // Backend-specific model loading
+    switch (compute) {
+    case CAUSAL_LM_BACKEND_CPU:
+    case CAUSAL_LM_BACKEND_GPU:
+      // CPU/GPU(OpenCL): use existing nntrainer native inference
+      g_model->initialize();
+      g_model->load_weight(weight_file);
+      break;
+
+    case CAUSAL_LM_BACKEND_NPU: {
+      // NPU: register QNN context plugin and load QNN binary
+      /// @todo Load libqnn_context.so via Engine::registerContext()
+      /// Engine::Global().registerContext("libqnn_context.so");
+      /// Then load model with MODEL_FORMAT_QNN
+      g_model->initialize();
+      g_model->load_weight(weight_file);
+      std::cerr << "[quick.ai] NPU backend: QNN context integration pending"
+                << std::endl;
+      break;
+    }
+
+    case CAUSAL_LM_BACKEND_GPU2: {
+      // GPU2: register LiteRT-LM context plugin and load .litertlm model
+      /// @todo Load liblitert_context.so via Engine::registerContext()
+      /// Engine::Global().registerContext("liblitert_context.so");
+      /// Then load model with MODEL_FORMAT_LITERT
+      g_model->initialize();
+      g_model->load_weight(weight_file);
+      std::cerr << "[quick.ai] GPU2 backend: LiteRT-LM context integration "
+                   "pending"
+                << std::endl;
+      break;
+    }
+
+    default:
+      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+    }
 
     g_initialized = true;
     g_architecture = architecture;
+    g_loaded_backend = (int)compute;
 
     auto finish_init = std::chrono::high_resolution_clock::now();
     auto init_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -591,3 +632,38 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
 
   return CAUSAL_LM_ERROR_NONE;
 }
+
+ErrorCode unloadModel(void) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+
+  if (!g_initialized || !g_model) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+
+  g_model.reset();
+  g_initialized = false;
+  g_architecture = "";
+  g_last_output = "";
+  g_initialization_duration_ms = 0.0;
+  g_loaded_backend = -1;
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode setModelBasePath(const char *basePath) {
+  if (basePath == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_model_base_path = std::string(basePath);
+
+  // Ensure trailing slash
+  if (!g_model_base_path.empty() && g_model_base_path.back() != '/') {
+    g_model_base_path += '/';
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+int getLoadedBackend(void) { return g_loaded_backend; }

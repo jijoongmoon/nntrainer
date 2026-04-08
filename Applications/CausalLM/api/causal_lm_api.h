@@ -54,9 +54,10 @@ typedef enum {
  * @brief Backend compute type
  */
 typedef enum {
-  CAUSAL_LM_BACKEND_CPU = 0,
-  CAUSAL_LM_BACKEND_GPU = 1, /// < @todo: support gpu
-  CAUSAL_LM_BACKEND_NPU = 2, /// < @todo: support npu
+  CAUSAL_LM_BACKEND_CPU = 0,  ///< nntrainer CPU (AppContext)
+  CAUSAL_LM_BACKEND_GPU = 1,  ///< nntrainer GPU (ClContext/OpenCL)
+  CAUSAL_LM_BACKEND_NPU = 2,  ///< QNN NPU (libqnn_context.so)
+  CAUSAL_LM_BACKEND_GPU2 = 3, ///< LiteRT-LM (liblitert_context.so)
 } BackendType;
 
 /**
@@ -64,7 +65,8 @@ typedef enum {
  * @note  Enable only when your library supports the model
  */
 typedef enum {
-  CAUSAL_LM_MODEL_QWEN3_0_6B = 0,
+  CAUSAL_LM_MODEL_QWEN3_0_6B = 0,  ///< Qwen3 0.6B (CPU/NPU)
+  CAUSAL_LM_MODEL_GEMMA4_E2B = 1,  ///< Gemma4 E2B (GPU2/LiteRT-LM)
 } ModelType;
 
 /**
@@ -120,6 +122,26 @@ WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
  */
 WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
                               const char **outputText);
+
+/**
+ * @brief Unload current model and free resources
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode unloadModel(void);
+
+/**
+ * @brief Set base path for model files
+ * @param basePath directory containing model subdirectories
+ * @return ErrorCode
+ * @note Default is "./models/" if not set
+ */
+WIN_EXPORT ErrorCode setModelBasePath(const char *basePath);
+
+/**
+ * @brief Get currently loaded backend type
+ * @return BackendType (-1 if no model loaded)
+ */
+WIN_EXPORT int getLoadedBackend(void);
 
 #ifdef __cplusplus
 }
