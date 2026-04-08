@@ -21,9 +21,10 @@ ifndef ABSEIL_ROOT
 $(error ABSEIL_ROOT is not defined! Set to abseil-cpp source root.)
 endif
 
-# Protobuf headers - 헤더는 아키텍처 무관이므로 호스트 경로 사용 가능
+# Protobuf headers - /usr/include 직접 사용하면 호스트 glibc 헤더 충돌
+# google/protobuf 헤더만 별도 디렉토리에 복사하여 사용
 ifndef PROTOBUF_INCLUDES
-PROTOBUF_INCLUDES := /usr/include
+PROTOBUF_INCLUDES := $(LOCAL_PATH)/protobuf_headers
 endif
 
 ML_API_COMMON_INCLUDES := $(NNTRAINER_ROOT)/ml_api_common/include
