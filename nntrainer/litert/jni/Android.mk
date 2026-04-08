@@ -48,7 +48,7 @@ NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/nntrainer \
 ####################################################################
 include $(CLEAR_VARS)
 LOCAL_MODULE := nntrainer
-LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/libs/$(TARGET_ARCH_ABI)/libnntrainer.so
+LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/android_build_result/lib/$(TARGET_ARCH_ABI)/libnntrainer.so
 include $(PREBUILT_SHARED_LIBRARY)
 
 ####################################################################
@@ -56,7 +56,7 @@ include $(PREBUILT_SHARED_LIBRARY)
 ####################################################################
 include $(CLEAR_VARS)
 LOCAL_MODULE := ccapi-nntrainer
-LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/libs/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so
+LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/android_build_result/lib/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so
 include $(PREBUILT_SHARED_LIBRARY)
 
 ####################################################################
@@ -99,7 +99,9 @@ LOCAL_C_INCLUDES    := \
 	$(LITERT_LM_ROOT) \
 	$(LITERT_SDK_ROOT) \
 	$(ABSEIL_ROOT) \
-	$(PROTOBUF_INCLUDES)
+	$(PROTOBUF_INCLUDES) \
+	$(LITERT_LM_ROOT)/LiteRT \
+	$(LITERT_LM_ROOT)/protobuf
 
 LOCAL_CFLAGS        += -pthread -fexceptions -Wno-deprecated-declarations
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITERT_LM
