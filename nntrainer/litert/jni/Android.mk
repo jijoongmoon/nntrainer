@@ -100,7 +100,7 @@ LOCAL_C_INCLUDES    := \
 	$(PROTOBUF_INCLUDES)
 
 LOCAL_CFLAGS        += -pthread -fexceptions -Wno-deprecated-declarations
-LOCAL_CXXFLAGS      += -std=c++20 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITERT_LM
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITERT_LM
 LOCAL_LDLIBS        := -llog -landroid
 LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
 
