@@ -131,6 +131,36 @@ def emit_allocate_kv_cache(cname):
     return "\n".join(L)
 
 
+def emit_bind_external_cache(cname, attn_layer_prefix="layer{}_attention"):
+    """Generate bindExternalCache() method that wires KVCacheManager
+    tensors to each attention layer via setLayerExternalTensor.
+
+    This enables runtime zero-copy cache injection. After calling this,
+    inference only needs the token input — cache is pinned.
+
+    Args:
+        cname: C++ class name
+        attn_layer_prefix: format string for attention layer names
+    """
+    L = []
+    L.append(f"void {cname}::bindExternalCache() {{")
+    L.append(f"  // Bind KVCacheManager tensors to attention layers")
+    L.append(f"  // After this, inference() only needs token input")
+    L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
+    L.append(f'    std::string attn_name = "layer" + std::to_string(i) + '
+             f'"_attention";')
+    L.append(f"    // slot 0 = cache_key, slot 1 = cache_value")
+    L.append(f"    // (matches AttentionParams enum in mha_core)")
+    L.append(f"    model->setLayerExternalTensor(attn_name, 0, "
+             f"&key_cache_tensors[i]);")
+    L.append(f"    model->setLayerExternalTensor(attn_name, 1, "
+             f"&val_cache_tensors[i]);")
+    L.append(f"  }}")
+    L.append(f"}}")
+    L.append(f"")
+    return "\n".join(L)
+
+
 def emit_initialize(cname, external_kv_cache=False):
     """Generate initialize() method that wires up the full model pipeline.
 
@@ -156,6 +186,7 @@ def emit_initialize(cname, external_kv_cache=False):
     L.append(f"  constructModel();")
     if external_kv_cache:
         L.append(f"  allocateKVCache();")
+        L.append(f"  bindExternalCache();")
     L.append(f"}}")
     L.append(f"")
     return "\n".join(L)

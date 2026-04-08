@@ -29,7 +29,7 @@ from .source_ffn import emit_ffn_method
 from .source_custom import (
     collect_custom_layer_classes, emit_register_custom_layers,
     emit_custom_layer_includes, emit_initialize,
-    emit_allocate_kv_cache, CUSTOM_LAYER_CLASS,
+    emit_allocate_kv_cache, emit_bind_external_cache, CUSTOM_LAYER_CLASS,
 )
 
 # Re-export for backward compatibility
@@ -151,9 +151,10 @@ class CppEmitter(BaseEmitter):
         # registerCustomLayers (custom_classes already collected above)
         L.append(emit_register_custom_layers(cname, custom_classes))
 
-        # allocateKVCache (external mode)
+        # allocateKVCache + bindExternalCache (external mode)
         if s.external_kv_cache:
             L.append(emit_allocate_kv_cache(cname))
+            L.append(emit_bind_external_cache(cname))
 
         # initialize()
         L.append(emit_initialize(cname,

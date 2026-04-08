@@ -361,12 +361,18 @@ def _emit_standalone_header(structure, blocks_info, model_name):
     L.append(f"            Tensor input);")
     L.append(f"")
 
-    # allocateKVCache (external mode)
+    # allocateKVCache + bindExternalCache (external mode)
     if s.external_kv_cache:
         L.append(f"  /**")
         L.append(f"   * @brief Allocate external KV cache buffers")
         L.append(f"   */")
         L.append(f"  void allocateKVCache();")
+        L.append(f"")
+        L.append(f"  /**")
+        L.append(f"   * @brief Bind KV cache tensors to attention layers")
+        L.append(f"   *        via setLayerExternalTensor (zero-copy runtime pin)")
+        L.append(f"   */")
+        L.append(f"  void bindExternalCache();")
         L.append(f"")
 
     # registerCustomLayers

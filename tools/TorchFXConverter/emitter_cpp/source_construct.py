@@ -237,7 +237,7 @@ def emit_construct_model(structure, block_type, is_hybrid, blocks_info):
 
 
 def _emit_external_kv_cache_inputs(L, s):
-    """Emit external KV cache tensor creation."""
+    """Emit external KV cache tensor creation with proper dtype."""
     L.append(f"  // External KV cache tensors")
     L.append(f"  size_t max_timestep = INIT_SEQ_LEN + NUM_TO_GENERATE;")
     L.append(f"  size_t kv_heads = NUM_KV_HEADS;")
@@ -245,6 +245,13 @@ def _emit_external_kv_cache_inputs(L, s):
     L.append(f"  kv_cache_buffers.allocate(NUM_LAYERS, cache_size);")
     L.append(f"  key_cache_tensors.resize(NUM_LAYERS);")
     L.append(f"  val_cache_tensors.resize(NUM_LAYERS);")
+    L.append(f"")
+    L.append(f"  // Cache dtype must match what mha_core expects")
+    L.append(f"#ifdef ENABLE_FP16")
+    L.append(f'  std::string cache_dtype = "FP16";')
+    L.append(f"#else")
+    L.append(f'  std::string cache_dtype = "UINT16";')
+    L.append(f"#endif")
     L.append(f"")
     L.append(f"  for (int i = 0; i < NUM_LAYERS; ++i) {{")
     L.append(f'    std::string k_name = "ext_cache_key_" + std::to_string(i);')
@@ -255,10 +262,12 @@ def _emit_external_kv_cache_inputs(L, s):
     L.append(f'      std::to_string(HEAD_DIM);')
     L.append(f'    LayerHandle k_input(')
     L.append(f'      createLayer("input", {{withKey("name", k_name),')
-    L.append(f'                             withKey("input_shape", cache_shape)}}));')
+    L.append(f'                             withKey("input_shape", cache_shape),')
+    L.append(f'                             withKey("tensor_dtype", cache_dtype)}}));')
     L.append(f'    LayerHandle v_input(')
     L.append(f'      createLayer("input", {{withKey("name", v_name),')
-    L.append(f'                             withKey("input_shape", cache_shape)}}));')
+    L.append(f'                             withKey("input_shape", cache_shape),')
+    L.append(f'                             withKey("tensor_dtype", cache_dtype)}}));')
     L.append(f"    key_cache_tensors[i] = k_input(Tensor());")
     L.append(f"    val_cache_tensors[i] = v_input(Tensor());")
     L.append(f"    all_inputs.push_back(key_cache_tensors[i]);")
