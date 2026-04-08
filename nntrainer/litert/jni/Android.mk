@@ -70,22 +70,9 @@ LOCAL_EXPORT_C_INCLUDES := $(LITERT_LM_ROOT) $(LITERT_SDK_ROOT) $(ABSEIL_ROOT)
 include $(PREBUILT_STATIC_LIBRARY)
 
 ####################################################################
-# Prebuilt static: protobuf
-####################################################################
-include $(CLEAR_VARS)
-LOCAL_MODULE := protobuf
-
-ifndef PROTOBUF_LIB_PATH
-PROTOBUF_LIB_PATH := $(LITERT_LM_LIB_PATH)
-endif
-
-LOCAL_SRC_FILES := $(PROTOBUF_LIB_PATH)/libprotobuf.a
-include $(PREBUILT_STATIC_LIBRARY)
-
-####################################################################
 # liblitert_context.so - LiteRT-LM context plugin for nntrainer
 #
-# litert_lm_lib.a + protobuf.a → liblitert_context.so
+# litert_lm_lib.a (protobuf 포함) → liblitert_context.so
 # 배포 시 .a 파일 불필요, .so 하나에 모두 포함됨
 ####################################################################
 include $(CLEAR_VARS)
@@ -112,7 +99,6 @@ LOCAL_LDLIBS        := -llog -landroid
 LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := litert_lm_lib protobuf
 LOCAL_WHOLE_STATIC_LIBRARIES := litert_lm_lib
 
 include $(BUILD_SHARED_LIBRARY)
