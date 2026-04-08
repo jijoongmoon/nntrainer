@@ -321,12 +321,6 @@ private:
   float epsilon;            /** to avoid overflow */
   unsigned int cache_index; /** idx of kv cache */
 
-  /**
-   * @brief Whether to use externally provided cache tensors
-   *        (true when num_inputs >= 4, i.e., Q, K, V + ext caches)
-   */
-  bool use_external_cache = false;
-
   /** intermal info */
   size_t num_heads_Q;
   size_t num_heads_KV;
@@ -343,26 +337,23 @@ private:
     QUERY = 0,
     KEY = 1,
     VALUE = 2,
-    MASK = 3,
+    CACHE_KEY = 3,
+    CACHE_VALUE = 4,
 
     /** output index */
     OUTPUT = 0,
     RETURN_ATTENTION_WEIGHT = 1,
   };
 
-  /**< indices of the weights and tensors */
+  /**< indices of the internal tensors (cache_key/cache_value are now inputs) */
   enum AttentionParams {
-    cache_key,
-    cache_value,
     projected_key,
     projected_value,
-    /** intended comment for later use of attention_mask */
-    // attention_mask,
     attention_weight,
     dropout_mask,
     attention_output,
   };
-  std::array<unsigned int, 7> tensor_idx;
+  std::array<unsigned int, 5> tensor_idx;
   unsigned int sink_idx;
 
   /** attention parameters */

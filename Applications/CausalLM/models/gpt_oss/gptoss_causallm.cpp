@@ -34,7 +34,8 @@ namespace causallm {
 Tensor GptOssForCausalLM::createAttention(const int layer_id, int seq_len,
                                            int n_heads, int head_dim,
                                            Tensor query, Tensor key,
-                                           Tensor value) {
+                                           Tensor value, Tensor cache_key,
+                                           Tensor cache_value) {
 
   using ml::train::createLayer;
 
@@ -82,7 +83,7 @@ Tensor GptOssForCausalLM::createAttention(const int layer_id, int seq_len,
      withKey("rope_scaling_factor", ATTENTION_ROPE_SCALING_FACTOR),
      withKey("rope_scaling_type", "yarn"),
      withKey("rope_scaling_max_position_embeddings", 4096)});
-  Tensor a = attn({q, k, v});
+  Tensor a = attn({q, k, v, cache_key, cache_value});
 
   // O projection (with bias)
   LayerHandle o_proj = createLayer(

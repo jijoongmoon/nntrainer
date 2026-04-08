@@ -63,7 +63,9 @@ void Gemma3Transformer::setupParameters(json &cfg, json &generation_cfg,
 
 Tensor
 Gemma3Transformer::createTransformerDecoderBlock(const int layer_id,
-                                                 Tensor input) {
+                                                 Tensor input,
+                                                 Tensor cache_key,
+                                                 Tensor cache_value) {
 
   using ml::train::createLayer;
 
@@ -78,7 +80,7 @@ Gemma3Transformer::createTransformerDecoderBlock(const int layer_id,
   // Attention
   Tensor att_out =
     createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
-                    normed, normed, normed);
+                    normed, normed, normed, cache_key, cache_value);
 
   // Post attention norm
   LayerHandle post_attention_norm = createLayer(
@@ -119,7 +121,8 @@ Gemma3Transformer::createTransformerDecoderBlock(const int layer_id,
 
 Tensor Gemma3Transformer::createAttention(
   const int layer_id, int seq_len, int n_heads, int head_dim,
-  Tensor query, Tensor key, Tensor value) {
+  Tensor query, Tensor key, Tensor value,
+  Tensor cache_key, Tensor cache_value) {
 
   using ml::train::createLayer;
 
@@ -200,7 +203,7 @@ Tensor Gemma3Transformer::createAttention(
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")});
-  Tensor a = attn({q_normed, k_normed, v});
+  Tensor a = attn({q_normed, k_normed, v, cache_key, cache_value});
 
   // O projection
   LayerHandle o_proj = createLayer(
