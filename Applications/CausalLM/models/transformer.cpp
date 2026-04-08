@@ -190,50 +190,9 @@ void Transformer::constructModel() {
      "scale=" + std::to_string(EMBEDDING_SCALE)});
   Tensor x = embedding(input);
 
-  // create cache tensors for each attention layer (external memory via fromData)
-  unsigned int kv_width = DIM / (NUM_HEADS / NUM_KEY_VALUE_HEADS);
-  unsigned int max_seq = INIT_SEQ_LEN + NUM_TO_GENERATE;
-
-#ifdef ENABLE_FP16
-  auto cache_dtype = ml::train::TensorDim::DataType::FP16;
-#else
-  auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
-#endif
-
-  ml::train::TensorDim cache_dim(
-    {BATCH_SIZE, 1, max_seq, kv_width},
-    {ml::train::TensorDim::Format::NCHW, cache_dtype});
-
-  // Allocate cache buffers (will be managed by KVCacheManager in production)
-  size_t cache_bytes = cache_dim.getDataLen() * cache_dim.getDataTypeSize();
-  kv_cache_buffers.key_buffers.resize(NUM_LAYERS);
-  kv_cache_buffers.value_buffers.resize(NUM_LAYERS);
-
-  std::vector<Tensor> cache_key_inputs;
-  std::vector<Tensor> cache_value_inputs;
-
-  for (int i = 0; i < NUM_LAYERS; ++i) {
-    kv_cache_buffers.key_buffers[i].resize(cache_bytes / sizeof(float), 0.0f);
-    kv_cache_buffers.value_buffers[i].resize(cache_bytes / sizeof(float), 0.0f);
-
-    auto ck_name = "cache_key_" + std::to_string(i);
-    auto cv_name = "cache_value_" + std::to_string(i);
-
-    Tensor ck = Tensor::fromData(cache_dim,
-                                 kv_cache_buffers.key_buffers[i].data(),
-                                 ck_name);
-    Tensor cv = Tensor::fromData(cache_dim,
-                                 kv_cache_buffers.value_buffers[i].data(),
-                                 cv_name);
-
-    cache_key_inputs.push_back(ck);
-    cache_value_inputs.push_back(cv);
-  }
-
   // create transformer layers
   for (int i = 0; i < NUM_LAYERS; ++i) {
-    x = createTransformerDecoderBlock(i, x, cache_key_inputs[i],
-                                      cache_value_inputs[i]);
+    x = createTransformerDecoderBlock(i, x);
   }
 
   // create rms_norm
@@ -319,9 +278,7 @@ void Transformer::run(const WSTR prompt, bool do_sample,
 }
 
 Tensor
-Transformer::createTransformerDecoderBlock(const int layer_id, Tensor input,
-                                            Tensor cache_key,
-                                            Tensor cache_value) {
+Transformer::createTransformerDecoderBlock(const int layer_id, Tensor input) {
 
   using ml::train::createLayer;
 
@@ -336,7 +293,7 @@ Transformer::createTransformerDecoderBlock(const int layer_id, Tensor input,
   // self attention
   Tensor att_out =
     createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM, normed,
-                    normed, normed, cache_key, cache_value);
+                    normed, normed);
 
   // residual add
   Tensor residual = input.add(att_out);
@@ -360,8 +317,7 @@ Transformer::createTransformerDecoderBlock(const int layer_id, Tensor input,
 
 Tensor Transformer::createAttention(const int layer_id, int seq_len,
                                     int n_heads, int head_dim, Tensor query,
-                                    Tensor key, Tensor value,
-                                    Tensor cache_key, Tensor cache_value) {
+                                    Tensor key, Tensor value) {
 
   using ml::train::createLayer;
 
@@ -404,7 +360,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
      withKey("rope_theta", ROPE_THETA),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")});
-  Tensor a = attn({q, k, v, cache_key, cache_value});
+  Tensor a = attn({q, k, v});
 
   // O projection
   LayerHandle o_proj = createLayer(

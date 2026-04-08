@@ -702,6 +702,25 @@ public:
   const Tensor &getTensor(unsigned int idx) const;
 
   /**
+   * @brief Bind an external tensor to a slot by index.
+   *        The external tensor is NOT owned by the context — the caller
+   *        must ensure it outlives the context. This pointer is not affected
+   *        by allocate/deallocate cycles.
+   *
+   * @param idx Slot index
+   * @param tensor Pointer to external tensor (nullptr to unbind)
+   */
+  void setExternalTensor(unsigned int idx, Tensor *tensor);
+
+  /**
+   * @brief Get an external tensor bound to a slot.
+   *
+   * @param idx Slot index
+   * @return Tensor* Pointer to external tensor, or nullptr if not bound
+   */
+  Tensor *getExternalTensor(unsigned int idx) const;
+
+  /**
    * @brief Get the Tensor Grad object
    *
    * @param idx Identifier of the tensor
@@ -1011,6 +1030,11 @@ private:
   std::vector<Var_Grad *> inputs;  /**< inputs of the layer */
   std::vector<Var_Grad *> outputs; /**< outputs of the layer */
   std::vector<Var_Grad *> tensors; /**< tensors of the layer */
+
+  /** External tensor slots — pointers NOT owned by this context.
+   *  Used by layers that need externally managed buffers (e.g., KV cache).
+   *  Not affected by framework allocate/deallocate cycles. */
+  std::map<unsigned int, Tensor *> external_tensors_;
 
 #ifdef DEBUG
   std::map<std::string, const void *>

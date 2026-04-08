@@ -32,6 +32,7 @@
 
 namespace nntrainer {
 class RunLayerContext;
+class Tensor;
 }
 /** Define more aliases for the model in the API */
 namespace ml {
@@ -344,6 +345,26 @@ public:
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
   virtual int getLayer(const char *name, std::shared_ptr<Layer> *layer) = 0;
+
+  /**
+   * @brief     Bind an external tensor to a layer's tensor slot.
+   *            The tensor is NOT copied — the pointer must remain valid.
+   *            This is used for zero-copy external buffer injection
+   *            (e.g., KV cache managed by an external cache manager).
+   *
+   * @param[in] layer_name Name of the target layer
+   * @param[in] tensor_idx Index of the tensor slot in the layer
+   * @param[in] tensor Pointer to external tensor (not owned by model)
+   *
+   * @note Example:
+   * @code
+   *   nntrainer::Tensor cache_key(cache_dim, true);
+   *   model->setLayerExternalTensor("layer0_attention", 0, &cache_key);
+   * @endcode
+   */
+  virtual void setLayerExternalTensor(const std::string &layer_name,
+                                      unsigned int tensor_idx,
+                                      nntrainer::Tensor *tensor) = 0;
 
   /**
    * @brief     get input dimension of a model

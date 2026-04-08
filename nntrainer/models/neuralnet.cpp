@@ -1627,6 +1627,27 @@ void NeuralNetwork::resetInputDimension(std::vector<TensorDim> dims) {
   model_graph.resetInputDimension(dims);
 }
 
+void NeuralNetwork::setLayerExternalTensor(const std::string &layer_name,
+                                           unsigned int tensor_idx,
+                                           Tensor *tensor) {
+  bool found = false;
+  std::function<void(ml::train::Layer &, RunLayerContext &, void *)> fn =
+    [&](ml::train::Layer &l, RunLayerContext &context, void *) {
+      if (found)
+        return;
+      if (context.getName() == layer_name) {
+        context.setExternalTensor(tensor_idx, tensor);
+        found = true;
+      }
+    };
+  forEachLayer(fn, nullptr);
+
+  if (!found) {
+    throw std::invalid_argument("setLayerExternalTensor: layer '" +
+                                layer_name + "' not found");
+  }
+}
+
 int NeuralNetwork::setDataset(const DatasetModeType &mode,
                               std::shared_ptr<ml::train::Dataset> dataset) {
   return setDataBuffer(mode, std::static_pointer_cast<DataBuffer>(dataset));
