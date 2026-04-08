@@ -52,8 +52,7 @@ bazel build --config=android_arm64 \
 ```
 
 빌드 결과물:
-- `bazel-bin/runtime/engine/liblitert_lm_lib.a` (정적 라이브러리)
-- 또는 `bazel-bin/runtime/engine/liblitert_lm_lib.so` (동적 라이브러리)
+- `bazel-bin/runtime/engine/liblitert_lm_lib.a` (정적 라이브러리, ndk-build에서 사용)
 
 ### Option B: CMake
 
@@ -109,12 +108,10 @@ export NNTRAINER_ROOT=/path/to/nntrainer
 export LITERT_LM_ROOT=/path/to/LiteRT-LM
 export LITERT_SDK_ROOT=/path/to/LiteRT
 export ABSEIL_ROOT=/path/to/abseil-cpp
-# (선택) LiteRT-LM 라이브러리 경로가 기본값과 다를 경우
-export LITERT_LM_LIB_PATH=/path/to/litert_lm_lib_android_arm64
-
-# (선택) protobuf가 litert_lm_lib에 정적 링크되지 않은 경우만 필요
-# Bazel 빌드는 보통 protobuf를 정적으로 포함하므로 이 변수는 생략 가능
-# export PROTOBUF_LIB_PATH=/path/to/protobuf/lib/arm64-v8a
+# (선택) .a 파일 경로가 기본값과 다를 경우
+# 기본값: ${LITERT_LM_ROOT}/bazel-bin/runtime/engine
+# export LITERT_LM_LIB_PATH=/path/to/litert_lm_lib_android_arm64
+# export PROTOBUF_LIB_PATH=/path/to/protobuf_android_arm64
 ```
 
 ### ndk-build 실행
@@ -131,8 +128,6 @@ ${ANDROID_NDK}/ndk-build \
   LITERT_SDK_ROOT=${LITERT_SDK_ROOT} \
   ABSEIL_ROOT=${ABSEIL_ROOT} \
   -j$(nproc)
-  # PROTOBUF_LIB_PATH는 필요한 경우에만 추가:
-  # PROTOBUF_LIB_PATH=${PROTOBUF_LIB_PATH}
 ```
 
 빌드 결과물:
@@ -151,8 +146,9 @@ ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm \
   -D libs/arm64-v8a/liblitert_context.so | grep ml_train_context_pluggable
 ```
 
-> **참고:** LiteRT-LM 라이브러리(`liblitert_lm_lib.so`)도
-> `--config=android_arm64`로 빌드된 arm64 버전을 사용해야 합니다.
+> **참고:** `liblitert_lm_lib.a`와 `libprotobuf.a`가 `.so`안에 정적으로 포함되므로,
+> 배포 시 `liblitert_context.so` 하나만 있으면 됩니다.
+> 단, `.a` 파일도 반드시 `--config=android_arm64`로 빌드된 arm64 버전이어야 합니다.
 
 ### 핵심 컴파일 플래그
 
