@@ -60,8 +60,10 @@ LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/libs/$(TARGET_ARCH_ABI)/libccapi-nntrainer.
 include $(PREBUILT_SHARED_LIBRARY)
 
 ####################################################################
-# Prebuilt static: litert_lm_lib (LiteRT-LM engine)
-# Bazel: bazel-bin/runtime/engine/liblitert_lm_lib.a
+# Prebuilt shared: litert_lm_lib (LiteRT-LM engine)
+# Bazel: bazel-bin/runtime/engine/liblitert_lm_lib.so
+# .so를 사용해야 Bazel 의존성(SessionConfig 등)이 모두 포함됨
+# .a는 thin archive라 직접 소스만 포함, deps 심볼 누락
 ####################################################################
 include $(CLEAR_VARS)
 LOCAL_MODULE := litert_lm_lib
@@ -70,9 +72,9 @@ ifndef LITERT_LM_LIB_PATH
 LITERT_LM_LIB_PATH := $(LITERT_LM_ROOT)/bazel-bin/runtime/engine
 endif
 
-LOCAL_SRC_FILES := $(LITERT_LM_LIB_PATH)/liblitert_lm_lib.a
+LOCAL_SRC_FILES := $(LITERT_LM_LIB_PATH)/liblitert_lm_lib.so
 LOCAL_EXPORT_C_INCLUDES := $(LITERT_LM_ROOT) $(LITERT_SDK_ROOT) $(ABSEIL_ROOT) $(PROTOBUF_INCLUDES)
-include $(PREBUILT_STATIC_LIBRARY)
+include $(PREBUILT_SHARED_LIBRARY)
 
 ####################################################################
 # liblitert_context.so - LiteRT-LM context plugin for nntrainer
@@ -104,7 +106,6 @@ LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITER
 LOCAL_LDLIBS        := -llog -landroid
 LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_WHOLE_STATIC_LIBRARIES := litert_lm_lib
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer litert_lm_lib
 
 include $(BUILD_SHARED_LIBRARY)
