@@ -27,7 +27,6 @@
 
 #ifdef ENABLE_LITERT_LM
 #include "runtime/engine/engine.h"
-#include "runtime/engine/io_types.h"
 #endif
 
 namespace nntrainer {
