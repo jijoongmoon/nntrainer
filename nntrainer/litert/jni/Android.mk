@@ -90,7 +90,8 @@ LOCAL_C_INCLUDES    := \
 	$(LITERT_LM_BAZEL_BIN) \
 	$(LITERT_LM_ROOT)/../LiteRT \
 	$(LITERT_LM_ROOT)/LiteRT \
-	$(ABSEIL_ROOT)
+	$(ABSEIL_ROOT) \
+	$(LITERT_LM_ROOT)/bazel-LiteRT-LM/external/com_google_protobuf/src
 
 LOCAL_CFLAGS        += -pthread -fexceptions -Wno-deprecated-declarations
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITERT_LM
