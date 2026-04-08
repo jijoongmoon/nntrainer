@@ -89,6 +89,7 @@ LOCAL_C_INCLUDES    := \
 	$(LITERT_LM_ROOT) \
 	$(LITERT_LM_BAZEL_BIN) \
 	$(LITERT_LM_ROOT)/../LiteRT \
+	$(LITERT_LM_ROOT)/LiteRT \
 	$(ABSEIL_ROOT)
 
 LOCAL_CFLAGS        += -pthread -fexceptions -Wno-deprecated-declarations
