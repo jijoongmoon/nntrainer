@@ -21,11 +21,10 @@ ifndef ABSEIL_ROOT
 $(error ABSEIL_ROOT is not defined! Set to abseil-cpp source root.)
 endif
 
-# Protobuf headers - Bazel 빌드 시 Bazel이 protobuf를 자체 관리하므로
-# .pb.h 수동 생성 불필요. liblitert_lm_lib.so에 이미 포함됨.
-# 필요한 경우만 PROTOBUF_INCLUDES 지정
-ifdef PROTOBUF_INCLUDES
-PROTOBUF_EXTRA_INCLUDES := $(PROTOBUF_INCLUDES)
+# Protobuf headers - Bazel external에서 가져와야 함
+# find $LITERT_LM_ROOT -path "*/external/*protobuf*/src/google/protobuf/port_def.inc"
+ifndef PROTOBUF_INCLUDES
+$(error PROTOBUF_INCLUDES is not defined! Set to Bazel protobuf src path, e.g. $(LITERT_LM_ROOT)/bazel-LiteRT-LM/external/com_google_protobuf/src)
 endif
 
 ML_API_COMMON_INCLUDES := $(NNTRAINER_ROOT)/ml_api_common/include
@@ -75,7 +74,7 @@ LITERT_LM_LIB_PATH := $(LITERT_LM_ROOT)/bazel-bin/runtime/engine
 endif
 
 LOCAL_SRC_FILES := $(LITERT_LM_LIB_PATH)/liblitert_lm_lib.so
-LOCAL_EXPORT_C_INCLUDES := $(LITERT_LM_ROOT) $(LITERT_SDK_ROOT) $(ABSEIL_ROOT) $(PROTOBUF_EXTRA_INCLUDES)
+LOCAL_EXPORT_C_INCLUDES := $(LITERT_LM_ROOT) $(LITERT_SDK_ROOT) $(ABSEIL_ROOT) $(PROTOBUF_INCLUDES)
 include $(PREBUILT_SHARED_LIBRARY)
 
 ####################################################################
@@ -101,7 +100,7 @@ LOCAL_C_INCLUDES    := \
 	$(LITERT_LM_ROOT) \
 	$(LITERT_SDK_ROOT) \
 	$(ABSEIL_ROOT) \
-	$(PROTOBUF_EXTRA_INCLUDES) \
+	$(PROTOBUF_INCLUDES) \
 	$(LITERT_LM_ROOT)/LiteRT
 
 LOCAL_CFLAGS        += -pthread -fexceptions -Wno-deprecated-declarations
