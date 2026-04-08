@@ -9,24 +9,6 @@ ifndef NNTRAINER_ROOT
 NNTRAINER_ROOT := $(LOCAL_PATH)/../../..
 endif
 
-ifndef LITERT_LM_ROOT
-$(error LITERT_LM_ROOT is not defined! Set to LiteRT-LM source root.)
-endif
-
-ifndef LITERT_SDK_ROOT
-$(error LITERT_SDK_ROOT is not defined! Set to LiteRT SDK source root.)
-endif
-
-ifndef ABSEIL_ROOT
-$(error ABSEIL_ROOT is not defined! Set to abseil-cpp source root.)
-endif
-
-# Protobuf headers - Bazel external에서 가져와야 함
-# find $LITERT_LM_ROOT -path "*/external/*protobuf*/src/google/protobuf/port_def.inc"
-ifndef PROTOBUF_INCLUDES
-$(error PROTOBUF_INCLUDES is not defined! Set to Bazel protobuf src path, e.g. $(LITERT_LM_ROOT)/bazel-LiteRT-LM/external/com_google_protobuf/src)
-endif
-
 ML_API_COMMON_INCLUDES := $(NNTRAINER_ROOT)/ml_api_common/include
 NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/nntrainer \
 	$(NNTRAINER_ROOT)/nntrainer/dataset \
@@ -61,27 +43,14 @@ LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/android_build_result/lib/$(TARGET_
 include $(PREBUILT_SHARED_LIBRARY)
 
 ####################################################################
-# Prebuilt shared: litert_lm_lib (LiteRT-LM engine)
-# Bazel: bazel-bin/runtime/engine/liblitert_lm_lib.so
-# .so를 사용해야 Bazel 의존성(SessionConfig 등)이 모두 포함됨
-# .a는 thin archive라 직접 소스만 포함, deps 심볼 누락
-####################################################################
-include $(CLEAR_VARS)
-LOCAL_MODULE := litert_lm_lib
-
-ifndef LITERT_LM_LIB_PATH
-LITERT_LM_LIB_PATH := $(LITERT_LM_ROOT)/bazel-bin/runtime/engine
-endif
-
-LOCAL_SRC_FILES := $(LITERT_LM_LIB_PATH)/liblitert_lm_lib.so
-LOCAL_EXPORT_C_INCLUDES := $(LITERT_LM_ROOT) $(LITERT_SDK_ROOT) $(ABSEIL_ROOT) $(PROTOBUF_INCLUDES)
-include $(PREBUILT_SHARED_LIBRARY)
-
-####################################################################
 # liblitert_context.so - LiteRT-LM context plugin for nntrainer
 #
-# litert_lm_lib.a (protobuf 포함) → liblitert_context.so
-# 배포 시 .a 파일 불필요, .so 하나에 모두 포함됨
+# ENABLE_LITERT_LM 없이 빌드:
+#   - 플러그인 로딩/레이어 등록 정상 동작
+#   - LiteRT-LM 실제 추론은 pass-through (stub)
+#   - liblitert_lm_lib.so 링크 불필요
+#
+# ENABLE_LITERT_LM=1로 빌드하려면 LITERT_LM_ROOT 등 추가 설정 필요
 ####################################################################
 include $(CLEAR_VARS)
 
@@ -96,18 +65,13 @@ LOCAL_SRC_FILES     := \
 
 LOCAL_C_INCLUDES    := \
 	$(NNTRAINER_INCLUDES) \
-	$(NNTRAINER_ROOT)/nntrainer/litert \
-	$(LITERT_LM_ROOT) \
-	$(LITERT_SDK_ROOT) \
-	$(ABSEIL_ROOT) \
-	$(PROTOBUF_INCLUDES) \
-	$(LITERT_LM_ROOT)/LiteRT
+	$(NNTRAINER_ROOT)/nntrainer/litert
 
 LOCAL_CFLAGS        += -pthread -fexceptions -Wno-deprecated-declarations
-LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITERT_LM
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions -DPLUGGABLE
 LOCAL_LDLIBS        := -llog -landroid
 LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer litert_lm_lib
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 
 include $(BUILD_SHARED_LIBRARY)
