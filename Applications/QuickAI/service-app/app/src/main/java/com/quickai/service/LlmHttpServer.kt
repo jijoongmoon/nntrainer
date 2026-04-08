@@ -8,7 +8,10 @@ import fi.iki.elonen.NanoHTTPD
  * REST API server for LLM inference
  * Default port: 8080
  */
-class LlmHttpServer(port: Int = 8080) : NanoHTTPD(port) {
+class LlmHttpServer(
+    port: Int = 8080,
+    val modelManager: ModelManager? = null
+) : NanoHTTPD(port) {
 
     private val gson = Gson()
 
@@ -22,9 +25,25 @@ class LlmHttpServer(port: Int = 8080) : NanoHTTPD(port) {
                 uri == "/v1/health" && method == Method.GET ->
                     jsonResponse(mapOf("status" to "ok", "backend" to NativeEngine.nativeGetLoadedBackend()))
 
-                // List models
+                // List models (with download status)
                 uri == "/v1/models" && method == Method.GET ->
                     handleGetModels()
+
+                // Download model
+                uri.matches(Regex("/v1/models/[^/]+/download")) && method == Method.POST ->
+                    handleDownloadModel(session, uri.split("/")[3])
+
+                // Model status (download progress)
+                uri.matches(Regex("/v1/models/[^/]+/status")) && method == Method.GET ->
+                    handleModelStatus(uri.split("/")[3])
+
+                // Delete model
+                uri.matches(Regex("/v1/models/[^/]+")) && method == Method.DELETE ->
+                    handleDeleteModel(uri.split("/")[3])
+
+                // Storage info
+                uri == "/v1/storage" && method == Method.GET ->
+                    handleStorageInfo()
 
                 // Load model
                 uri == "/v1/engine/load" && method == Method.POST ->
@@ -51,21 +70,84 @@ class LlmHttpServer(port: Int = 8080) : NanoHTTPD(port) {
     }
 
     private fun handleGetModels(): Response {
+        if (modelManager != null) {
+            return jsonResponse(mapOf("models" to modelManager.getModels()))
+        }
+        // Fallback when no ModelManager
         val models = listOf(
-            mapOf(
-                "id" to "qwen3-0.6b",
-                "name" to "Qwen3 0.6B",
-                "backends" to listOf("cpu", "npu"),
-                "model_type" to NativeEngine.MODEL_QWEN3_0_6B
-            ),
-            mapOf(
-                "id" to "gemma4-e2b",
-                "name" to "Gemma4 E2B",
-                "backends" to listOf("gpu2"),
-                "model_type" to NativeEngine.MODEL_GEMMA4_E2B
-            )
+            mapOf("id" to "qwen3-0.6b", "name" to "Qwen3 0.6B", "backend" to "cpu",
+                  "model_type" to NativeEngine.MODEL_QWEN3_0_6B, "status" to "UNKNOWN"),
+            mapOf("id" to "gemma4-e2b", "name" to "Gemma4 E2B", "backend" to "gpu2",
+                  "model_type" to NativeEngine.MODEL_GEMMA4_E2B, "status" to "UNKNOWN")
         )
         return jsonResponse(mapOf("models" to models))
+    }
+
+    private fun handleDownloadModel(session: IHTTPSession, modelId: String): Response {
+        if (modelManager == null) {
+            return errorResponse(Response.Status.INTERNAL_ERROR, "ModelManager not initialized")
+        }
+
+        val body = readBody(session)
+        val json = if (body.isNotEmpty()) JsonParser.parseString(body).asJsonObject else null
+
+        // Parse file URLs from request body
+        // Example: {"files": {"qwen3-0.6b-q40-fp32-arm.bin": "https://...", "tokenizer.json": "https://..."}}
+        val fileUrls = mutableMapOf<String, String>()
+        json?.getAsJsonObject("files")?.entrySet()?.forEach { (key, value) ->
+            fileUrls[key] = value.asString
+        }
+
+        val started = modelManager.startDownload(modelId, fileUrls)
+        return if (started) {
+            jsonResponse(mapOf("status" to "download_started", "model_id" to modelId))
+        } else {
+            errorResponse(Response.Status.BAD_REQUEST, "Cannot start download for $modelId")
+        }
+    }
+
+    private fun handleModelStatus(modelId: String): Response {
+        if (modelManager == null) {
+            return errorResponse(Response.Status.INTERNAL_ERROR, "ModelManager not initialized")
+        }
+
+        val status = modelManager.getModelStatus(modelId)
+        val progress = modelManager.getDownloadProgress(modelId)
+
+        val result = mutableMapOf<String, Any>(
+            "model_id" to modelId,
+            "status" to status.name
+        )
+        if (progress != null) {
+            result["download"] = mapOf(
+                "state" to progress.state.name,
+                "progress" to progress.progress,
+                "downloaded_bytes" to progress.downloadedBytes,
+                "total_bytes" to progress.totalBytes,
+                "error" to (progress.error ?: "")
+            )
+        }
+        return jsonResponse(result)
+    }
+
+    private fun handleDeleteModel(modelId: String): Response {
+        if (modelManager == null) {
+            return errorResponse(Response.Status.INTERNAL_ERROR, "ModelManager not initialized")
+        }
+
+        val deleted = modelManager.deleteModel(modelId)
+        return if (deleted) {
+            jsonResponse(mapOf("status" to "deleted", "model_id" to modelId))
+        } else {
+            errorResponse(Response.Status.NOT_FOUND, "Model not found: $modelId")
+        }
+    }
+
+    private fun handleStorageInfo(): Response {
+        if (modelManager == null) {
+            return errorResponse(Response.Status.INTERNAL_ERROR, "ModelManager not initialized")
+        }
+        return jsonResponse(modelManager.getStorageInfo())
     }
 
     private fun handleLoadModel(session: IHTTPSession): Response {

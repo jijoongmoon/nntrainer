@@ -61,6 +61,40 @@ class ServiceClient(
     suspend fun unloadModel(): Result<StatusResponse> =
         post("/v1/engine/unload", "")
 
+    // --- Model Download ---
+
+    data class DownloadRequest(val files: Map<String, String> = emptyMap())
+
+    suspend fun downloadModel(modelId: String, fileUrls: Map<String, String> = emptyMap()): Result<StatusResponse> =
+        post("/v1/models/$modelId/download", DownloadRequest(fileUrls))
+
+    data class ModelStatusResponse(
+        val model_id: String = "",
+        val status: String = "",
+        val download: DownloadInfo? = null
+    )
+    data class DownloadInfo(
+        val state: String = "",
+        val progress: Float = 0f,
+        val downloaded_bytes: Long = 0,
+        val total_bytes: Long = 0,
+        val error: String = ""
+    )
+
+    suspend fun getModelStatus(modelId: String): Result<ModelStatusResponse> =
+        get("/v1/models/$modelId/status")
+
+    suspend fun deleteModel(modelId: String): Result<StatusResponse> =
+        delete("/v1/models/$modelId")
+
+    data class StorageInfo(
+        val models_dir: String = "",
+        val used_mb: Long = 0,
+        val free_mb: Long = 0
+    )
+
+    suspend fun getStorageInfo(): Result<StorageInfo> = get("/v1/storage")
+
     // --- Generate ---
 
     data class GenerateRequest(
@@ -127,6 +161,21 @@ class ServiceClient(
                 Result.success(gson.fromJson(respBody, T::class.java))
             } else {
                 Result.failure(ServiceException(response.code, respBody))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private suspend inline fun <reified T> delete(path: String): Result<T> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder().url("$baseUrl$path").delete().build()
+            val response = client.newCall(request).execute()
+            val body = response.body?.string() ?: ""
+            if (response.isSuccessful) {
+                Result.success(gson.fromJson(body, T::class.java))
+            } else {
+                Result.failure(ServiceException(response.code, body))
             }
         } catch (e: Exception) {
             Result.failure(e)

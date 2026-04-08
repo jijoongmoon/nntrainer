@@ -24,6 +24,7 @@ class LlmService : Service() {
     }
 
     private var httpServer: LlmHttpServer? = null
+    private var modelManager: ModelManager? = null
     private var port: Int = DEFAULT_PORT
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -44,8 +45,13 @@ class LlmService : Service() {
 
         startForeground(NOTIFICATION_ID, buildNotification())
 
+        if (modelManager == null) {
+            modelManager = ModelManager(this)
+            Log.i(TAG, "ModelManager initialized")
+        }
+
         if (httpServer == null) {
-            httpServer = LlmHttpServer(port).also {
+            httpServer = LlmHttpServer(port, modelManager).also {
                 it.start()
                 Log.i(TAG, "HTTP server started on port $port")
             }
