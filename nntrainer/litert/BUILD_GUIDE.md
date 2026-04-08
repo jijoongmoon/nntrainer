@@ -97,71 +97,59 @@ mkdir -p LiteRT/litert/build_common
 echo "// Generated stub" > LiteRT/litert/build_common/build_config.h
 ```
 
-## Step 5: liblitert_context.so 빌드
+## Step 5: liblitert_context.so 빌드 (ndk-build)
 
-### Include paths 설정
+`nntrainer/litert/jni/` 디렉토리에 `Android.mk`와 `Application.mk`가 준비되어 있습니다.
 
-```
-LITERT_LM_DIR   = /path/to/LiteRT-LM
-LITERT_SDK_DIR  = /path/to/LiteRT
-ABSEIL_DIR      = /path/to/abseil-cpp
-NNTRAINER_DIR   = /path/to/nntrainer
-```
-
-### 컴파일 명령
-
-#### Host (Linux x86_64) - 개발/테스트용
+### 환경 변수 설정
 
 ```bash
-clang++ -std=c++20 -shared -fPIC -DPLUGGABLE -DENABLE_LITERT_LM \
-  -Wno-deprecated-declarations \
-  -I${NNTRAINER_DIR} \
-  -I${NNTRAINER_DIR}/nntrainer \
-  -I${NNTRAINER_DIR}/api/ccapi/include \
-  -I${LITERT_LM_DIR} \
-  -I${LITERT_SDK_DIR} \
-  -I${ABSEIL_DIR} \
-  ${NNTRAINER_DIR}/nntrainer/litert/litert_context.cpp \
-  ${NNTRAINER_DIR}/nntrainer/litert/litert_graph.cpp \
-  -L/path/to/litert_lm_lib \
-  -llitert_lm_lib \
-  -lprotobuf \
-  -o liblitert_context.so
+export ANDROID_NDK=/path/to/android-ndk-r28b
+export NNTRAINER_ROOT=/path/to/nntrainer
+export LITERT_LM_ROOT=/path/to/LiteRT-LM
+export LITERT_SDK_ROOT=/path/to/LiteRT
+export ABSEIL_ROOT=/path/to/abseil-cpp
+export PROTOBUF_LIB_PATH=/path/to/protobuf/lib/arm64-v8a
+
+# (선택) LiteRT-LM 라이브러리 경로가 기본값과 다를 경우
+export LITERT_LM_LIB_PATH=/path/to/litert_lm_lib_android_arm64
 ```
 
-#### Android arm64 - 실제 배포용
+### ndk-build 실행
 
 ```bash
-# NDK 크로스 컴파일러 경로
-NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
-NDK_CC=$NDK_TOOLCHAIN/bin/aarch64-linux-android29-clang++
-NDK_SYSROOT=$NDK_TOOLCHAIN/sysroot
+cd ${NNTRAINER_ROOT}/nntrainer/litert
 
-$NDK_CC -std=c++20 -shared -fPIC -DPLUGGABLE -DENABLE_LITERT_LM \
-  -Wno-deprecated-declarations \
-  --sysroot=$NDK_SYSROOT \
-  -I${NNTRAINER_DIR} \
-  -I${NNTRAINER_DIR}/nntrainer \
-  -I${NNTRAINER_DIR}/api/ccapi/include \
-  -I${LITERT_LM_DIR} \
-  -I${LITERT_SDK_DIR} \
-  -I${ABSEIL_DIR} \
-  ${NNTRAINER_DIR}/nntrainer/litert/litert_context.cpp \
-  ${NNTRAINER_DIR}/nntrainer/litert/litert_graph.cpp \
-  -L/path/to/litert_lm_lib_android_arm64 \
-  -llitert_lm_lib \
-  -lprotobuf \
-  -llog \
-  -o liblitert_context.so
+${ANDROID_NDK}/ndk-build \
+  NDK_PROJECT_PATH=. \
+  NDK_APPLICATION_MK=jni/Application.mk \
+  APP_BUILD_SCRIPT=jni/Android.mk \
+  NNTRAINER_ROOT=${NNTRAINER_ROOT} \
+  LITERT_LM_ROOT=${LITERT_LM_ROOT} \
+  LITERT_SDK_ROOT=${LITERT_SDK_ROOT} \
+  ABSEIL_ROOT=${ABSEIL_ROOT} \
+  PROTOBUF_LIB_PATH=${PROTOBUF_LIB_PATH} \
+  -j$(nproc)
+```
 
-# 빌드 결과 확인
-file liblitert_context.so
+빌드 결과물:
+```
+libs/arm64-v8a/liblitert_context.so
+```
+
+### 빌드 결과 확인
+
+```bash
+file libs/arm64-v8a/liblitert_context.so
 # ELF 64-bit LSB shared object, ARM aarch64, ...
+
+# PLUGGABLE 심볼 확인
+${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm \
+  -D libs/arm64-v8a/liblitert_context.so | grep ml_train_context_pluggable
 ```
 
-> **주의:** Host 빌드는 x86_64 바이너리를 생성하므로 Android 디바이스에서 실행할 수 없습니다.
-> APK에 포함하려면 반드시 NDK 크로스 컴파일러(`aarch64-linux-android29-clang++`)를 사용하세요.
-> LiteRT-LM 라이브러리도 동일하게 `--config=android_arm64`로 빌드된 것을 사용해야 합니다.
+> **참고:** LiteRT-LM 라이브러리(`liblitert_lm_lib.so`)도
+> `--config=android_arm64`로 빌드된 arm64 버전을 사용해야 합니다.
 
 ### 핵심 컴파일 플래그
 
