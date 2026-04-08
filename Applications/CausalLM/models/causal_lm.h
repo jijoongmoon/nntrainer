@@ -80,11 +80,6 @@ public:
    */
   std::string getOutput(int batch_idx = 0) const;
 
-  /**
-   * @brief get the status of run
-   */
-  bool hasRun() const { return has_run_; }
-
 protected:
   /**
    * @brief Setup the parameters for the CausalLM model
@@ -151,8 +146,6 @@ protected:
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
   unsigned int global_token_len;
-
-  bool has_run_ = false;
 
   std::mt19937 rng; /**< Random Number Gen */
 };

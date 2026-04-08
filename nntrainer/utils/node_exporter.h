@@ -249,11 +249,12 @@ class LayerNode;
  */
 template <>
 void Exporter::saveTflResult(
-  const std::tuple<
-    props::Name, props::Distribute, props::Trainable,
-    std::vector<props::InputConnection>, std::vector<props::InputShape>,
-    props::SharedFrom, props::ClipGradByGlobalNorm, props::Packed,
-    props::WeightDtype, props::LossScaleForMixed, props::ComputeEngine> &props,
+  const std::tuple<props::Name, props::Distribute, props::Trainable,
+                   std::vector<props::InputConnection>,
+                   std::vector<props::InputShape>, props::SharedFrom,
+                   props::ClipGradByGlobalNorm, props::Packed,
+                   props::WeightDtype, props::LossScaleForMixed,
+                   props::ComputeEngine, props::InputTensorDataType> &props,
   const LayerNode *self);
 
 class BatchNormalizationLayer;
@@ -321,7 +322,8 @@ class InputLayer;
  */
 template <>
 void Exporter::saveTflResult(
-  const std::tuple<props::Normalization, props::Standardization> &props,
+  const std::tuple<props::Normalization, props::Standardization,
+                   props::InputTensorDataType, props::TensorDataType> &props,
   const InputLayer *self);
 
 class Pooling2DLayer;

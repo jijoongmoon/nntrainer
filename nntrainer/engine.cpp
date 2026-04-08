@@ -62,7 +62,52 @@ void Engine::initialize() noexcept {
   }
 };
 
-void Engine::release() { thread_pool_manager_.reset(); }
+void Engine::release() {
+  // Guard against double-release (could be called from both atexit and
+  // destructor)
+  if (engines.empty()) {
+    return;
+  }
+
+  // Clean up dynamically allocated contexts (those loaded from plugins)
+  // Note: Static contexts like AppContext::Global() are not deleted here
+  // as they are managed elsewhere
+
+  // Delete all dynamic contexts using their destroy functions
+  // Using destroyfunc ensures proper cleanup as defined by the plugin
+  for (auto &pair : engines) {
+    // Check if this is a dynamically allocated context
+    // by checking if it was loaded from a plugin library
+    bool is_dynamic = true;
+    if (pair.first == "cpu") {
+      is_dynamic = false; // AppContext is a static singleton
+    }
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+    if (pair.first == "gpu") {
+      is_dynamic = false; // ClContext is a static singleton
+    }
+#endif
+    if (is_dynamic && pair.second) {
+      // Use destroyfunc if available, otherwise fall back to delete
+      auto it = destroy_funcs.find(pair.first);
+      if (it != destroy_funcs.end() && it->second) {
+        it->second(pair.second);
+      } else {
+        delete pair.second;
+      }
+    }
+  }
+  engines.clear();
+  allocator.clear();
+  destroy_funcs.clear();
+
+  // Do NOT close library handles - QNNContext destructor already handles
+  // its own library cleanup (dlClose on m_backendLibraryHandle)
+  // Closing library handles here would cause a double-free segfault
+  library_handles.clear();
+
+  thread_pool_manager_.reset();
+}
 
 std::string
 Engine::parseComputeEngine(const std::vector<std::string> &props) const {
@@ -84,7 +129,6 @@ Engine::parseComputeEngine(const std::vector<std::string> &props) const {
 
   return "cpu";
 }
-
 /**
  * @brief Get the Full Path from given string
  * @details path is resolved in the following order
@@ -167,7 +211,15 @@ int Engine::registerContext(const std::string &library_path,
   NNTR_THROW_IF_CLEANUP(type == "", std::invalid_argument, close_dl)
     << func_tag << "custom layer must specify type name, but it is empty";
 
-  registerContext(type, context);
+  // Pass library handle and destroy function for proper cleanup
+  registerContext(type, context, handle, pluggable->destroyfunc);
+
+  // Register cleanup with atexit to ensure it runs before static destruction
+  // This ensures QNN contexts are cleaned up before the driver state becomes
+  // invalid. Using std::call_once for thread safety.
+  static std::once_flag atexit_flag;
+  std::call_once(atexit_flag,
+                 []() { std::atexit([]() { Engine::Global().release(); }); });
 
   return 0;
 }

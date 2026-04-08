@@ -1400,6 +1400,20 @@ void Tensor::read(ReadSource src, size_t start_offset, bool read_from_offset) {
   itensor_->read(src, start_offset, read_from_offset);
 }
 
+void Tensor::save_quantization_info(std::ostream &file) {
+  NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
+    << getName() << " is not contiguous, cannot save.";
+
+  itensor_->save_quantization_info(file);
+}
+
+void Tensor::read_quantization_info(std::ifstream &file) {
+  NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
+    << getName() << " is not contiguous, cannot read.";
+
+  itensor_->read_quantization_info(file);
+}
+
 std::vector<unsigned int> Tensor::argmax() const {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot get argmax.";

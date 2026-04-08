@@ -571,18 +571,17 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
 
   try {
     std::lock_guard<std::mutex> lock(g_mutex);
-    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
 
-    if (causal_lm_model) {
-      if (!causal_lm_model->hasRun()) {
-        return CAUSAL_LM_ERROR_INFERENCE_NOT_RUN;
-      }
-      *metrics = causal_lm_model->getPerformanceMetrics();
-      // Overwrite init duration with the one measured in loadModel API
-      metrics->initialization_duration_ms = g_initialization_duration_ms;
-    } else {
-      return CAUSAL_LM_ERROR_UNKNOWN;
-    }
+    auto internal_metrics = g_model->getPerformanceMetrics();
+    metrics->prefill_tokens = internal_metrics.prefill_tokens;
+    metrics->prefill_duration_ms = internal_metrics.prefill_duration_ms;
+    metrics->generation_tokens = internal_metrics.generation_tokens;
+    metrics->generation_duration_ms = internal_metrics.generation_duration_ms;
+    metrics->total_duration_ms = internal_metrics.total_duration_ms;
+    metrics->peak_memory_kb = internal_metrics.peak_memory_kb;
+
+    // Overwrite init duration with the one measured in loadModel API
+    metrics->initialization_duration_ms = g_initialization_duration_ms;
 
   } catch (const std::exception &e) {
     std::cerr << "Exception in getPerformanceMetrics: " << e.what()
