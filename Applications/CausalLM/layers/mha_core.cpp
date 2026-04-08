@@ -69,9 +69,9 @@ MHACoreLayer::~MHACoreLayer() {}
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  NNTR_THROW_IF(context.getNumInputs() != 5, std::invalid_argument)
-    << "MHA Core layer needs exactly 5 inputs: query, key, value, "
-       "cache_key, cache_value";
+  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 4,
+                std::invalid_argument)
+    << "MHA Core layer needs 3 or 4 inputs (Q, K, V, optional mask)";
 
   ml::train::TensorDim::TensorType activation_type = {
     context.getFormat(), context.getActivationDataType()};
@@ -149,9 +149,30 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
 
-  /** KV Cache tensors are provided as inputs[3] and inputs[4].
-   * No internal cache allocation — cache is managed externally
-   * (e.g., by KVCacheManager via graph input layers). */
+  /** KV Cache tensors — allocated internally, but can be replaced at runtime
+   * via context.setTensor() by an external KVCacheManager. */
+#ifdef ENABLE_FP16
+  ml::train::TensorDim cache_key_dim(
+    {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+  ml::train::TensorDim cache_value_dim(
+    {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+#else
+  ml::train::TensorDim cache_key_dim(
+    {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+    {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+  ml::train::TensorDim cache_value_dim(
+    {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+    {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+#endif
+
+  tensor_idx[AttentionParams::cache_key] = context.requestTensor(
+    cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::MAX_LIFESPAN);
+  tensor_idx[AttentionParams::cache_value] = context.requestTensor(
+    cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::MAX_LIFESPAN);
 
   theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
 
