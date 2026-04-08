@@ -21,9 +21,9 @@ ifndef ABSEIL_ROOT
 $(error ABSEIL_ROOT is not defined! Set to abseil-cpp source root.)
 endif
 
-# Protobuf headers (Bazel: bazel-LiteRT-LM/external/com_google_protobuf/src)
+# Protobuf headers - 헤더는 아키텍처 무관이므로 호스트 경로 사용 가능
 ifndef PROTOBUF_INCLUDES
-PROTOBUF_INCLUDES := $(LITERT_LM_ROOT)/bazel-LiteRT-LM/external/com_google_protobuf/src
+PROTOBUF_INCLUDES := /usr/include
 endif
 
 ML_API_COMMON_INCLUDES := $(NNTRAINER_ROOT)/ml_api_common/include
