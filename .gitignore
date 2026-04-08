@@ -23,6 +23,14 @@ Applications/**/*.bin
 Applications/**/res/*
 Applications/**/tokenizers-cpp-build/*
 
+# QuickAI ships tiny source-level Android resource files (strings, themes,
+# network_security_config) that must be tracked in git, so negate the
+# blanket Applications/**/res/* rule just for that project.
+!Applications/QuickAI/LauncherApp/src/main/res
+!Applications/QuickAI/LauncherApp/src/main/res/**
+!Applications/QuickAI/clientapp/src/main/res
+!Applications/QuickAI/clientapp/src/main/res/**
+
 # CTag
 /tags
 /TAGS

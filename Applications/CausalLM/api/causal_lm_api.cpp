@@ -12,11 +12,13 @@
 
 #include "causal_lm_api.h"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -38,14 +40,38 @@
 
 using json = nlohmann::json;
 
-static std::unique_ptr<causallm::Transformer> g_model;
-static std::mutex g_mutex;
-static bool g_initialized = false;
-static std::string g_architecture = "";
+/**
+ * @brief Per-handle state for a loaded CausalLM model instance.
+ *
+ * The handle-based API (loadModelHandle / runModelHandle / ...) allocates
+ * one of these per loaded model, which allows multiple models to live
+ * simultaneously and multiple threads to drive different handles in
+ * parallel without blocking each other.
+ *
+ * Note: the legacy non-handle API (loadModel / runModel / ...) is
+ * implemented on top of a single static "default" instance of this struct
+ * so that existing callers (e.g. test_api) keep working unchanged.
+ */
+struct CausalLmModel {
+  std::mutex mtx;
+  std::unique_ptr<causallm::Transformer> model;
+  std::string architecture;
+  std::string last_output;
+  double initialization_duration_ms = 0.0;
+  bool initialized = false;
+};
+
+// Globals shared across all handles — options set via setOptions() apply
+// process-wide regardless of which handle is active.
+static std::mutex g_registry_mutex;
 static bool g_use_chat_template = false;
 static bool g_verbose = false;
-static std::string g_last_output = "";
-static double g_initialization_duration_ms = 0.0;
+
+// Default handle backing the legacy non-handle API.
+static CausalLmModel &get_default_handle() {
+  static CausalLmModel instance;
+  return instance;
+}
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
@@ -318,8 +344,18 @@ ErrorCode registerModel(const char *model_name, const char *arch_name,
   return CAUSAL_LM_ERROR_NONE;
 }
 
-ErrorCode loadModel(BackendType compute, ModelType modeltype,
-                    ModelQuantizationType quant_type) {
+/**
+ * @brief Core loader shared by loadModel and loadModelHandle.
+ *
+ * Populates the given handle's model / architecture / init-duration fields
+ * on success. Takes the handle's own mutex so two concurrent loads on the
+ * same handle are serialized, while loads on different handles run in
+ * parallel. A separate registry mutex protects g_model_registry /
+ * g_arch_config_map during lookup.
+ */
+static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
+                                  ModelType modeltype,
+                                  ModelQuantizationType quant_type) {
 
   auto start_init = std::chrono::high_resolution_clock::now();
 
@@ -331,7 +367,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
   // Ensure models/configs are registered (thread-safe via call_once)
   register_models();
 
-  std::lock_guard<std::mutex> lock(g_mutex);
+  std::lock_guard<std::mutex> lock(h.mtx);
   try {
 
     // Check if it's a registered in-memory config
@@ -363,6 +399,11 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     json generation_cfg;
     json nntr_cfg;
     std::string model_dir_path;
+
+    // Snapshot registry entries under the registry mutex so concurrent
+    // loads on different handles don't race with each other (or with
+    // registerModel / registerModelArchitecture).
+    std::lock_guard<std::mutex> reg_lock(g_registry_mutex);
 
     // Check in-memory map first
     if (g_model_registry.find(lookup_name) != g_model_registry.end()) {
@@ -492,22 +533,22 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       return CAUSAL_LM_ERROR_INVALID_PARAMETER;
     }
 
-    g_model = causallm::Factory::Instance().create(architecture, cfg,
+    h.model = causallm::Factory::Instance().create(architecture, cfg,
                                                    generation_cfg, nntr_cfg);
-    if (!g_model) {
+    if (!h.model) {
       return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
     }
 
-    g_model->initialize();
-    g_model->load_weight(weight_file);
+    h.model->initialize();
+    h.model->load_weight(weight_file);
 
-    g_initialized = true;
-    g_architecture = architecture;
+    h.initialized = true;
+    h.architecture = architecture;
 
     auto finish_init = std::chrono::high_resolution_clock::now();
     auto init_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       finish_init - start_init);
-    g_initialization_duration_ms = init_duration.count();
+    h.initialization_duration_ms = init_duration.count();
 
   } catch (const std::exception &e) {
     std::cerr << "Exception in loadModel: " << e.what() << std::endl;
@@ -520,38 +561,42 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
   return CAUSAL_LM_ERROR_NONE;
 }
 
-ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
-  if (!g_initialized || !g_model) {
-    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
-  }
+/**
+ * @brief Core runner shared by runModel and runModelHandle.
+ */
+static ErrorCode run_on_handle(CausalLmModel &h, const char *inputTextPrompt,
+                               const char **outputText) {
   if (inputTextPrompt == nullptr || outputText == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
-  try {
-    std::lock_guard<std::mutex> lock(g_mutex);
+  std::lock_guard<std::mutex> lock(h.mtx);
+  if (!h.initialized || !h.model) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
 
+  try {
     std::string input(inputTextPrompt);
 
     if (g_use_chat_template) {
-      input = apply_chat_template(g_architecture, input);
+      input = apply_chat_template(h.architecture, input);
     }
 
 // We assume single batch request for this API
 #if defined(_WIN32)
-    g_model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
+    h.model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
                  g_verbose);
 #else
-    g_model->run(input, false, "", "", g_verbose);
+    h.model->run(input, false, "", "", g_verbose);
 #endif
 
-    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
-    g_last_output = ""; // Reset last output
+    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(h.model.get());
+    h.last_output = "";
     if (causal_lm_model) {
-      g_last_output = causal_lm_model->getOutput(0);
+      h.last_output = causal_lm_model->getOutput(0);
     }
 
-    *outputText = g_last_output.c_str();
+    *outputText = h.last_output.c_str();
 
   } catch (const std::exception &e) {
     std::cerr << "Exception in runModel: " << e.what() << std::endl;
@@ -561,36 +606,37 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
   return CAUSAL_LM_ERROR_NONE;
 }
 
-ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
-  if (!g_initialized || !g_model) {
-    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
-  }
+/**
+ * @brief Core metrics fetcher shared by getPerformanceMetrics and its
+ *        handle-based counterpart.
+ */
+static ErrorCode metrics_on_handle(CausalLmModel &h,
+                                   PerformanceMetrics *metrics) {
   if (metrics == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
+  std::lock_guard<std::mutex> lock(h.mtx);
+  if (!h.initialized || !h.model) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+
   try {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
-
-    if (causal_lm_model) {
-      if (!causal_lm_model->hasRun()) {
-        return CAUSAL_LM_ERROR_INFERENCE_NOT_RUN;
-      }
-      auto internal_metrics = causal_lm_model->getPerformanceMetrics();
-      metrics->prefill_tokens = internal_metrics.prefill_tokens;
-      metrics->prefill_duration_ms = internal_metrics.prefill_duration_ms;
-      metrics->generation_tokens = internal_metrics.generation_tokens;
-      metrics->generation_duration_ms = internal_metrics.generation_duration_ms;
-      metrics->total_duration_ms = internal_metrics.total_duration_ms;
-      metrics->peak_memory_kb = internal_metrics.peak_memory_kb;
-
-      // Overwrite init duration with the one measured in loadModel API
-      metrics->initialization_duration_ms = g_initialization_duration_ms;
-    } else {
+    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(h.model.get());
+    if (!causal_lm_model) {
       return CAUSAL_LM_ERROR_UNKNOWN;
     }
-
+    if (!causal_lm_model->hasRun()) {
+      return CAUSAL_LM_ERROR_INFERENCE_NOT_RUN;
+    }
+    auto internal_metrics = causal_lm_model->getPerformanceMetrics();
+    metrics->prefill_tokens = internal_metrics.prefill_tokens;
+    metrics->prefill_duration_ms = internal_metrics.prefill_duration_ms;
+    metrics->generation_tokens = internal_metrics.generation_tokens;
+    metrics->generation_duration_ms = internal_metrics.generation_duration_ms;
+    metrics->total_duration_ms = internal_metrics.total_duration_ms;
+    metrics->peak_memory_kb = internal_metrics.peak_memory_kb;
+    metrics->initialization_duration_ms = h.initialization_duration_ms;
   } catch (const std::exception &e) {
     std::cerr << "Exception in getPerformanceMetrics: " << e.what()
               << std::endl;
@@ -599,3 +645,74 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
 
   return CAUSAL_LM_ERROR_NONE;
 }
+
+ErrorCode loadModel(BackendType compute, ModelType modeltype,
+                    ModelQuantizationType quant_type) {
+  return load_into_handle(get_default_handle(), compute, modeltype, quant_type);
+}
+
+ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
+  return run_on_handle(get_default_handle(), inputTextPrompt, outputText);
+}
+
+ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
+  return metrics_on_handle(get_default_handle(), metrics);
+}
+
+/*============================================================================
+ * Handle-based API implementation
+ *============================================================================*/
+
+ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
+                          ModelQuantizationType quant_type,
+                          CausalLmHandle *out_handle) {
+  if (out_handle == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+  auto *h = new (std::nothrow) CausalLmModel();
+  if (h == nullptr) {
+    return CAUSAL_LM_ERROR_UNKNOWN;
+  }
+  ErrorCode ec = load_into_handle(*h, compute, modeltype, quant_type);
+  if (ec != CAUSAL_LM_ERROR_NONE) {
+    delete h;
+    *out_handle = nullptr;
+    return ec;
+  }
+  *out_handle = h;
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode runModelHandle(CausalLmHandle handle, const char *inputTextPrompt,
+                         const char **outputText) {
+  if (handle == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+  return run_on_handle(*handle, inputTextPrompt, outputText);
+}
+
+ErrorCode getPerformanceMetricsHandle(CausalLmHandle handle,
+                                      PerformanceMetrics *metrics) {
+  if (handle == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+  return metrics_on_handle(*handle, metrics);
+}
+
+ErrorCode destroyModelHandle(CausalLmHandle handle) {
+  if (handle == nullptr) {
+    return CAUSAL_LM_ERROR_NONE;
+  }
+  // Take the mutex to make sure no in-flight call on this handle is still
+  // running, then release and delete. Any caller that still holds a pointer
+  // to the output buffer returned by runModelHandle is reading freed memory
+  // after this point — documented as "valid until destroy".
+  {
+    std::lock_guard<std::mutex> lock(handle->mtx);
+    handle->model.reset();
+    handle->initialized = false;
+  }
+  delete handle;
+  return CAUSAL_LM_ERROR_NONE;
+}
+

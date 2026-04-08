@@ -121,6 +121,86 @@ WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
 WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
                               const char **outputText);
 
+/*============================================================================
+ * Handle-based API (for parallel multi-model execution)
+ *
+ * The non-handle API above operates on a single process-wide model instance
+ * protected by one global mutex, which serializes every call and prevents
+ * loading more than one model at a time. The handle-based API below lets a
+ * caller load several models simultaneously and run them in parallel from
+ * different threads, with per-handle state so that different handles never
+ * block each other. Each handle owns its own model, its own last-output
+ * buffer, and its own mutex.
+ *
+ * Typical usage:
+ *   CausalLmHandle h = NULL;
+ *   loadModelHandle(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_QWEN3_0_6B,
+ *                   CAUSAL_LM_QUANTIZATION_W4A32, &h);
+ *   const char *out = NULL;
+ *   runModelHandle(h, "Hello", &out);
+ *   // ... use out (owned by h, valid until the next run or destroy) ...
+ *   destroyModelHandle(h);
+ *============================================================================*/
+
+/**
+ * @brief Opaque handle to a loaded CausalLM model instance.
+ */
+typedef struct CausalLmModel *CausalLmHandle;
+
+/**
+ * @brief Load a model and return a newly-allocated handle.
+ *
+ * Calling this multiple times with different parameters returns independent
+ * handles, each with its own model state. The caller must eventually call
+ * destroyModelHandle on the returned handle to release resources.
+ *
+ * @param compute    Backend compute type
+ * @param modeltype  Model type enum
+ * @param quant_type Quantization type
+ * @param out_handle Out-parameter that receives the new handle on success
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
+                                     ModelQuantizationType quant_type,
+                                     CausalLmHandle *out_handle);
+
+/**
+ * @brief Run inference on a specific handle.
+ *
+ * The returned outputText pointer is owned by the handle and remains valid
+ * until the next runModelHandle call on the same handle or until the handle
+ * is destroyed. Different handles are safe to call concurrently from
+ * different threads; the same handle is serialized by its own internal
+ * mutex.
+ *
+ * @param handle          Handle returned by loadModelHandle
+ * @param inputTextPrompt Input prompt
+ * @param outputText      Out-parameter that receives a pointer to the output
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode runModelHandle(CausalLmHandle handle,
+                                    const char *inputTextPrompt,
+                                    const char **outputText);
+
+/**
+ * @brief Retrieve performance metrics of the last run for a given handle.
+ * @param handle  Handle returned by loadModelHandle
+ * @param metrics Pointer to a PerformanceMetrics struct to be filled
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode
+getPerformanceMetricsHandle(CausalLmHandle handle, PerformanceMetrics *metrics);
+
+/**
+ * @brief Release all resources owned by a handle.
+ *
+ * Passing a NULL handle is a no-op and returns CAUSAL_LM_ERROR_NONE.
+ *
+ * @param handle Handle returned by loadModelHandle
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode destroyModelHandle(CausalLmHandle handle);
+
 #ifdef __cplusplus
 }
 #endif
