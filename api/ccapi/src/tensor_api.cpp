@@ -1013,8 +1013,27 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
     std::string leaf_shape = std::to_string(leaf_info.dim.channel()) + ":" +
                               std::to_string(leaf_info.dim.height()) + ":" +
                               std::to_string(leaf_info.dim.width());
-    auto leaf_layer = createLayer(
-      "input", {"name=" + leaf_name, "input_shape=" + leaf_shape});
+    std::vector<std::string> leaf_props = {
+      "name=" + leaf_name, "input_shape=" + leaf_shape};
+
+    // Preserve data type from the leaf tensor dimension if non-default
+    auto dt = leaf_info.dim.getDataType();
+    if (dt != TensorDim::DataType::FP32) {
+      const char *dtype_str = nullptr;
+      switch (dt) {
+      case TensorDim::DataType::FP16: dtype_str = "FP16"; break;
+      case TensorDim::DataType::UINT16: dtype_str = "UINT16"; break;
+      case TensorDim::DataType::UINT8: dtype_str = "UINT8"; break;
+      case TensorDim::DataType::QINT4: dtype_str = "QINT4"; break;
+      case TensorDim::DataType::QINT8: dtype_str = "QINT8"; break;
+      default: break;
+      }
+      if (dtype_str) {
+        leaf_props.push_back(std::string("tensor_dtype=") + dtype_str);
+      }
+    }
+
+    auto leaf_layer = createLayer("input", leaf_props);
     status = addLayer(std::move(leaf_layer));
     if (status != ML_ERROR_NONE) {
       return status;

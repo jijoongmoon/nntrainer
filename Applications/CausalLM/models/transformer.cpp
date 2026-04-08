@@ -190,40 +190,44 @@ void Transformer::constructModel() {
      "scale=" + std::to_string(EMBEDDING_SCALE)});
   Tensor x = embedding(input);
 
-  // create cache input layers for each attention layer
+  // create cache tensors for each attention layer (external memory via fromData)
   unsigned int kv_width = DIM / (NUM_HEADS / NUM_KEY_VALUE_HEADS);
   unsigned int max_seq = INIT_SEQ_LEN + NUM_TO_GENERATE;
-  std::string cache_shape = "1:" + std::to_string(max_seq) + ":" +
-                            std::to_string(kv_width);
 
-  // Cache data type matches what mha_core expects
 #ifdef ENABLE_FP16
-  std::string cache_dtype = "FP16";
+  auto cache_dtype = ml::train::TensorDim::DataType::FP16;
 #else
-  std::string cache_dtype = "UINT16";
+  auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
 #endif
+
+  ml::train::TensorDim cache_dim(
+    {BATCH_SIZE, 1, max_seq, kv_width},
+    {ml::train::TensorDim::Format::NCHW, cache_dtype});
+
+  // Allocate cache buffers (will be managed by KVCacheManager in production)
+  size_t cache_bytes = cache_dim.getDataLen() * cache_dim.getDataTypeSize();
+  kv_cache_buffers.key_buffers.resize(NUM_LAYERS);
+  kv_cache_buffers.value_buffers.resize(NUM_LAYERS);
 
   std::vector<Tensor> cache_key_inputs;
   std::vector<Tensor> cache_value_inputs;
 
   for (int i = 0; i < NUM_LAYERS; ++i) {
+    kv_cache_buffers.key_buffers[i].resize(cache_bytes / sizeof(float), 0.0f);
+    kv_cache_buffers.value_buffers[i].resize(cache_bytes / sizeof(float), 0.0f);
+
     auto ck_name = "cache_key_" + std::to_string(i);
     auto cv_name = "cache_value_" + std::to_string(i);
 
-    LayerHandle ck_layer = createLayer(
-      "input", {withKey("name", ck_name), withKey("input_shape", cache_shape),
-                withKey("tensor_dtype", cache_dtype)});
-    Tensor ck = ck_layer(Tensor());
-
-    LayerHandle cv_layer = createLayer(
-      "input", {withKey("name", cv_name), withKey("input_shape", cache_shape),
-                withKey("tensor_dtype", cache_dtype)});
-    Tensor cv = cv_layer(Tensor());
+    Tensor ck = Tensor::fromData(cache_dim,
+                                 kv_cache_buffers.key_buffers[i].data(),
+                                 ck_name);
+    Tensor cv = Tensor::fromData(cache_dim,
+                                 kv_cache_buffers.value_buffers[i].data(),
+                                 cv_name);
 
     cache_key_inputs.push_back(ck);
     cache_value_inputs.push_back(cv);
-    all_inputs.push_back(ck);
-    all_inputs.push_back(cv);
   }
 
   // create transformer layers
