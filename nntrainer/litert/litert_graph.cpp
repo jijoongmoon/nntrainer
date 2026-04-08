@@ -105,26 +105,8 @@ void LiteRTGraph::forwarding(RunLayerContext &context, bool training) {
         ml_logi("LiteRT-LM generated %zu chars", last_output_.size());
       }
 
-      // Extract benchmark info if available
-      auto bench = session_->GetBenchmarkInfo();
-      if (bench.ok()) {
-        if (bench->GetTotalPrefillTurns() > 0) {
-          auto prefill_turn = bench->GetPrefillTurn(0);
-          if (prefill_turn.ok()) {
-            last_prefill_tokens_ = prefill_turn->num_tokens;
-            last_prefill_ms_ =
-                absl::ToDoubleMilliseconds(prefill_turn->duration);
-          }
-        }
-        if (bench->GetTotalDecodeTurns() > 0) {
-          auto decode_turn = bench->GetDecodeTurn(0);
-          if (decode_turn.ok()) {
-            last_decode_tokens_ = decode_turn->num_tokens;
-            last_decode_ms_ =
-                absl::ToDoubleMilliseconds(decode_turn->duration);
-          }
-        }
-      }
+      // TODO: Extract benchmark info when Abseil is available
+      // session_->GetBenchmarkInfo() → prefill/decode tok/s
     } else {
       ml_loge("LiteRT-LM GenerateContent failed: %s",
               responses.status().message().data());
