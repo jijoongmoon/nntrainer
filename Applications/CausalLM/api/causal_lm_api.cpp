@@ -31,7 +31,7 @@
 #include "qwen3_causallm.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
-// TODO: #include <engine.h> needed when NPU/GPU2 backends are implemented
+#include <engine.h>
 #include <factory.h>
 #include <fstream>
 #include <sys/stat.h>
@@ -334,13 +334,120 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
-  // Ensure models/configs are registered (thread-safe via call_once)
-  register_models();
-
   std::lock_guard<std::mutex> lock(g_mutex);
   try {
 
-    // Check if it's a registered in-memory config
+    std::string model_dir_path =
+        resolve_model_path(target_model_name, quant_type);
+
+    // =====================================================================
+    // GPU2 / NPU: Context-based loading (no Transformer model needed)
+    // These backends handle everything internally via their context plugins.
+    // Branch BEFORE Transformer creation since g_model is not used.
+    // =====================================================================
+    if (compute == CAUSAL_LM_BACKEND_GPU2) {
+      // Register LiteRT-LM context plugin
+      std::string litert_lib_path =
+          g_model_base_path + "liblitert_context.so";
+      auto &engine = nntrainer::Engine::Global();
+
+      try {
+        engine.registerContext(litert_lib_path);
+      } catch (const std::invalid_argument &e) {
+        // Context may already be registered - this is OK
+        std::cerr << "[quick.ai] GPU2 registerContext: " << e.what()
+                  << " (may already be registered)" << std::endl;
+      }
+
+      // Find the model file in the model directory
+      // For LiteRT-LM, look for .task or .litertlm files
+      std::string model_file;
+      struct stat st;
+      for (const auto &name :
+           {"gemma-4-E2B-it-litert-lm.task", "model.litertlm"}) {
+        std::string candidate = model_dir_path + "/" + name;
+        if (stat(candidate.c_str(), &st) == 0) {
+          model_file = candidate;
+          break;
+        }
+      }
+      if (model_file.empty()) {
+        std::cerr << "[quick.ai] GPU2: no .task/.litertlm model found in "
+                  << model_dir_path << std::endl;
+        return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+      }
+
+      // Load via context
+      int ret =
+          engine.getRegisteredContext("gpu2")->load(model_file);
+      if (ret != 0) {
+        std::cerr << "[quick.ai] GPU2: context load failed for "
+                  << model_file << std::endl;
+        return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+      }
+
+      g_model.reset(); // GPU2 doesn't use g_model
+      g_initialized = true;
+      g_architecture = "LiteRTLM";
+      g_loaded_backend = (int)compute;
+
+      auto finish_init = std::chrono::high_resolution_clock::now();
+      g_initialization_duration_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              finish_init - start_init)
+              .count();
+
+      return CAUSAL_LM_ERROR_NONE;
+    }
+
+    if (compute == CAUSAL_LM_BACKEND_NPU) {
+      // Register QNN context plugin
+      std::string qnn_lib_path = g_model_base_path + "libqnn_context.so";
+      auto &engine = nntrainer::Engine::Global();
+
+      try {
+        engine.registerContext(qnn_lib_path);
+      } catch (const std::invalid_argument &e) {
+        std::cerr << "[quick.ai] NPU registerContext: " << e.what()
+                  << " (may already be registered)" << std::endl;
+      }
+
+      // Find QNN binary in model directory
+      std::string qnn_bin_path = model_dir_path + "/model.bin";
+      struct stat st;
+      if (stat(qnn_bin_path.c_str(), &st) != 0) {
+        std::cerr << "[quick.ai] NPU: QNN binary not found: " << qnn_bin_path
+                  << std::endl;
+        return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+      }
+
+      int ret = engine.getRegisteredContext("qnn")->load(qnn_bin_path);
+      if (ret != 0) {
+        std::cerr << "[quick.ai] NPU: context load failed" << std::endl;
+        return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+      }
+
+      g_model.reset(); // NPU doesn't use g_model
+      g_initialized = true;
+      g_architecture = "QNN";
+      g_loaded_backend = (int)compute;
+
+      auto finish_init = std::chrono::high_resolution_clock::now();
+      g_initialization_duration_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              finish_init - start_init)
+              .count();
+
+      return CAUSAL_LM_ERROR_NONE;
+    }
+
+    // =====================================================================
+    // CPU / GPU (OpenCL): Transformer-based loading (existing flow)
+    // =====================================================================
+
+    // Ensure models/configs are registered (thread-safe via call_once)
+    register_models();
+
     std::string input_name = std::string(target_model_name);
     std::string input_name_upper = input_name;
     std::transform(input_name_upper.begin(), input_name_upper.end(),
@@ -368,7 +475,6 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     json cfg;
     json generation_cfg;
     json nntr_cfg;
-    std::string model_dir_path;
 
     // Check in-memory map first
     if (g_model_registry.find(lookup_name) != g_model_registry.end()) {
@@ -504,34 +610,9 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
     }
 
-    // Backend-specific model loading
-    switch (compute) {
-    case CAUSAL_LM_BACKEND_CPU:
-    case CAUSAL_LM_BACKEND_GPU:
-      // CPU/GPU(OpenCL): use existing nntrainer native inference
-      g_model->initialize();
-      g_model->load_weight(weight_file);
-      break;
-
-    case CAUSAL_LM_BACKEND_NPU:
-      // TODO: NPU backend - load via Engine::registerContext("libqnn_context.so")
-      //   then context("qnn")->load(qnn_binary_path)
-      //   Refactor needed: branch before Transformer creation since NPU
-      //   doesn't use g_model at all
-      std::cerr << "[quick.ai] NPU backend not yet supported" << std::endl;
-      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-
-    case CAUSAL_LM_BACKEND_GPU2:
-      // TODO: GPU2 backend - load via Engine::registerContext("liblitert_context.so")
-      //   then context("gpu2")->load(model.litertlm)
-      //   Refactor needed: branch before Transformer creation since GPU2
-      //   doesn't use g_model at all (LiteRT-LM is end-to-end)
-      std::cerr << "[quick.ai] GPU2 backend not yet supported" << std::endl;
-      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-
-    default:
-      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-    }
+    // CPU/GPU: Transformer-based model loading
+    g_model->initialize();
+    g_model->load_weight(weight_file);
 
     g_initialized = true;
     g_architecture = architecture;
@@ -566,38 +647,52 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
 
     std::string input(inputTextPrompt);
 
-    // Currently only CPU/GPU backends are functional
-    if (g_loaded_backend != CAUSAL_LM_BACKEND_CPU &&
-        g_loaded_backend != CAUSAL_LM_BACKEND_GPU) {
-      // TODO: NPU runs via QNN context, GPU2 runs via LiteRT-LM context
-      std::cerr << "[quick.ai] Backend " << g_loaded_backend
-                << " inference not yet supported" << std::endl;
-      return CAUSAL_LM_ERROR_INFERENCE_FAILED;
-    }
+    if (g_loaded_backend == CAUSAL_LM_BACKEND_GPU2) {
+      // GPU2: inference through LiteRT-LM context
+      auto &engine = nntrainer::Engine::Global();
+      auto *ctx = engine.getRegisteredContext("gpu2");
 
-    if (!g_model) {
-      return CAUSAL_LM_ERROR_NOT_INITIALIZED;
-    }
+      // LiteRT-LM context handles the entire pipeline:
+      // tokenize -> prefill -> decode -> detokenize
+      // We use the context's load() which already created the engine,
+      // now we need to create a session and run inference.
+      // The LiteRTGraph layer's forwarding() handles this.
+      /// @todo For now, use a simplified path that directly calls
+      /// the context. Full integration will go through LiteRTGraph layer.
+      g_last_output = "[GPU2] LiteRT-LM inference placeholder for: " + input;
+      *outputText = g_last_output.c_str();
 
-    if (g_use_chat_template) {
-      input = apply_chat_template(g_architecture, input);
-    }
+    } else if (g_loaded_backend == CAUSAL_LM_BACKEND_NPU) {
+      // NPU: inference through QNN context
+      g_last_output = "[NPU] QNN inference placeholder for: " + input;
+      *outputText = g_last_output.c_str();
+
+    } else {
+      // CPU/GPU: use nntrainer Transformer model
+      if (!g_model) {
+        return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+      }
+
+      if (g_use_chat_template) {
+        input = apply_chat_template(g_architecture, input);
+      }
 
 #if defined(_WIN32)
-    g_model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
-                 g_verbose);
+      g_model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
+                   g_verbose);
 #else
-    g_model->run(input, false, "", "", g_verbose);
+      g_model->run(input, false, "", "", g_verbose);
 #endif
 
-    auto causal_lm_model =
-        dynamic_cast<causallm::CausalLM *>(g_model.get());
-    g_last_output = "";
-    if (causal_lm_model) {
-      g_last_output = causal_lm_model->getOutput(0);
-    }
+      auto causal_lm_model =
+          dynamic_cast<causallm::CausalLM *>(g_model.get());
+      g_last_output = "";
+      if (causal_lm_model) {
+        g_last_output = causal_lm_model->getOutput(0);
+      }
 
-    *outputText = g_last_output.c_str();
+      *outputText = g_last_output.c_str();
+    }
 
   } catch (const std::exception &e) {
     std::cerr << "Exception in runModel: " << e.what() << std::endl;
@@ -618,10 +713,22 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
   try {
     std::lock_guard<std::mutex> lock(g_mutex);
 
+    if (g_loaded_backend == CAUSAL_LM_BACKEND_GPU2 ||
+        g_loaded_backend == CAUSAL_LM_BACKEND_NPU) {
+      // GPU2/NPU: metrics from context (placeholder for now)
+      metrics->prefill_tokens = 0;
+      metrics->prefill_duration_ms = 0;
+      metrics->generation_tokens = 0;
+      metrics->generation_duration_ms = 0;
+      metrics->total_duration_ms = 0;
+      metrics->peak_memory_kb = 0;
+      metrics->initialization_duration_ms = g_initialization_duration_ms;
+      return CAUSAL_LM_ERROR_NONE;
+    }
+
     if (!g_model) {
       return CAUSAL_LM_ERROR_NOT_INITIALIZED;
     }
-    // TODO: NPU/GPU2 backends will need metrics from their context
     auto internal_metrics = g_model->getPerformanceMetrics();
     metrics->prefill_tokens = internal_metrics.prefill_tokens;
     metrics->prefill_duration_ms = internal_metrics.prefill_duration_ms;
@@ -645,10 +752,12 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
 ErrorCode unloadModel(void) {
   std::lock_guard<std::mutex> lock(g_mutex);
 
-  if (!g_initialized || !g_model) {
+  if (!g_initialized) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
 
+  // GPU2/NPU: g_model is nullptr, but context needs cleanup
+  // Context resources are managed by Engine::release()
   g_model.reset();
   g_initialized = false;
   g_architecture = "";
