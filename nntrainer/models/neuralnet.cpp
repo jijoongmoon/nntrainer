@@ -1340,6 +1340,30 @@ void NeuralNetwork::load(const std::string &file_path,
       }
     }
 
+    // Print first 4 values of each weight for verification
+    std::cout << "\n=== Loaded weight values (first 4) ===" << std::endl;
+    std::unordered_set<const Tensor *> printed_weights;
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (auto weight : weights) {
+        if (!printed_weights.insert(&weight->getVariableRef()).second)
+          continue;
+        const float *data = weight->getVariable().getData<float>();
+        if (!data)
+          continue;
+        size_t total = weight->getVariable().size();
+        size_t show = std::min<size_t>(4, total);
+        std::cout << "  " << weight->getName() << " first4=[";
+        for (size_t j = 0; j < show; ++j) {
+          if (j)
+            std::cout << ", ";
+          printf("%.8f", data[j]);
+        }
+        std::cout << "]" << std::endl;
+      }
+    }
+    std::cout << "=======================================" << std::endl;
+
     ml_logi("read safetensors modelfile: %s", f_path.c_str());
     break;
   }
