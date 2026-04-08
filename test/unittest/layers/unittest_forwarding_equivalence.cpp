@@ -122,12 +122,14 @@ buildTinyTransformer(unsigned int seq_len) {
 
   LayerHandle ck_layer = createLayer(
     "input", {withKey("name", "cache_key_0"),
-              withKey("input_shape", cache_shape)});
+              withKey("input_shape", cache_shape),
+              withKey("tensor_dtype", "UINT16")});
   Tensor ck = ck_layer(Tensor());
 
   LayerHandle cv_layer = createLayer(
     "input", {withKey("name", "cache_value_0"),
-              withKey("input_shape", cache_shape)});
+              withKey("input_shape", cache_shape),
+              withKey("tensor_dtype", "UINT16")});
   Tensor cv = cv_layer(Tensor());
 
   LayerHandle attn = createLayer(
@@ -162,13 +164,17 @@ buildTinyTransformer(unsigned int seq_len) {
 }
 
 // Shared cache buffers for test models (1 layer, max_seq=8, width=DIM=8)
+// UINT16: 2 bytes per element, buffer in bytes = max_seq * DIM * 2
 static const unsigned int TEST_MAX_SEQ = 8; // SEQ_LEN(4) + NUM_TO_GENERATE(4)
-static std::vector<float> g_cache_k(TEST_MAX_SEQ * DIM, 0.0f);
-static std::vector<float> g_cache_v(TEST_MAX_SEQ * DIM, 0.0f);
+static const size_t CACHE_ELEMENTS = TEST_MAX_SEQ * DIM;
+static const size_t CACHE_BYTES = CACHE_ELEMENTS * sizeof(uint16_t);
+// Allocate as uint16_t but cast to float* for inference API
+static std::vector<uint16_t> g_cache_k(CACHE_ELEMENTS, 0);
+static std::vector<uint16_t> g_cache_v(CACHE_ELEMENTS, 0);
 
 static void resetCache() {
-  std::fill(g_cache_k.begin(), g_cache_k.end(), 0.0f);
-  std::fill(g_cache_v.begin(), g_cache_v.end(), 0.0f);
+  std::fill(g_cache_k.begin(), g_cache_k.end(), static_cast<uint16_t>(0));
+  std::fill(g_cache_v.begin(), g_cache_v.end(), static_cast<uint16_t>(0));
 }
 
 /**
@@ -183,8 +189,9 @@ static std::vector<float> runPrefill(ml::train::Model &model, unsigned int batch
   ml::train::TensorDim cache_dim(batch, 1, TEST_MAX_SEQ, DIM);
   model.resetInputDimension({token_dim, cache_dim, cache_dim});
 
-  std::vector<float *> input = {input_data.data(), g_cache_k.data(),
-                                g_cache_v.data()};
+  std::vector<float *> input = {input_data.data(),
+                                reinterpret_cast<float *>(g_cache_k.data()),
+                                reinterpret_cast<float *>(g_cache_v.data())};
   std::vector<float *> label;
   auto output = model.inference(batch, input, label);
 
@@ -204,8 +211,9 @@ static std::vector<float> runGenStep(ml::train::Model &model, unsigned int batch
     model.resetInputDimension({token_dim, cache_dim, cache_dim});
   }
 
-  std::vector<float *> input = {token_data.data(), g_cache_k.data(),
-                                g_cache_v.data()};
+  std::vector<float *> input = {token_data.data(),
+                                reinterpret_cast<float *>(g_cache_k.data()),
+                                reinterpret_cast<float *>(g_cache_v.data())};
   std::vector<float *> label;
   auto output = model.inference(batch, input, label);
 
@@ -313,9 +321,9 @@ TEST(ForwardingTest, kvcache_save_load_continue) {
   std::vector<float> gen1 = {5.0f};
   runGenStep(*modelA, 1, gen1, true);
 
-  // Save cache (external buffer) to file after prefill+gen1
-  std::vector<float> saved_cache_k = g_cache_k;
-  std::vector<float> saved_cache_v = g_cache_v;
+  // Save cache (external buffer) after prefill+gen1
+  std::vector<uint16_t> saved_cache_k = g_cache_k;
+  std::vector<uint16_t> saved_cache_v = g_cache_v;
 
   // Model A: gen2
   std::vector<float> gen2 = {6.0f};

@@ -1474,7 +1474,8 @@ NeuralNetwork::inference(unsigned int batch_size,
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
     input_tensors.emplace_back(MAKE_SHARED_TENSOR(Tensor::Map(
-      input[idx], in_dim[idx].getDataLen() * sizeof(float), in_dim[idx], 0)));
+      input[idx], in_dim[idx].getDataLen() * in_dim[idx].getDataTypeSize(),
+      in_dim[idx], 0)));
   }
 
   if (!label.empty()) {
@@ -1554,7 +1555,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
     input_tensors.emplace_back(MAKE_SHARED_TENSOR(Tensor::Map(
-      input[idx], in_dim[idx].getDataLen() * sizeof(float), in_dim[idx], 0)));
+      input[idx], in_dim[idx].getDataLen() * in_dim[idx].getDataTypeSize(),
+      in_dim[idx], 0)));
   }
 
   // auto start_increment = std::chrono::high_resolution_clock::now();

@@ -196,6 +196,13 @@ void Transformer::constructModel() {
   std::string cache_shape = "1:" + std::to_string(max_seq) + ":" +
                             std::to_string(kv_width);
 
+  // Cache data type matches what mha_core expects
+#ifdef ENABLE_FP16
+  std::string cache_dtype = "FP16";
+#else
+  std::string cache_dtype = "UINT16";
+#endif
+
   std::vector<Tensor> cache_key_inputs;
   std::vector<Tensor> cache_value_inputs;
 
@@ -204,11 +211,13 @@ void Transformer::constructModel() {
     auto cv_name = "cache_value_" + std::to_string(i);
 
     LayerHandle ck_layer = createLayer(
-      "input", {withKey("name", ck_name), withKey("input_shape", cache_shape)});
+      "input", {withKey("name", ck_name), withKey("input_shape", cache_shape),
+                withKey("tensor_dtype", cache_dtype)});
     Tensor ck = ck_layer(Tensor());
 
     LayerHandle cv_layer = createLayer(
-      "input", {withKey("name", cv_name), withKey("input_shape", cache_shape)});
+      "input", {withKey("name", cv_name), withKey("input_shape", cache_shape),
+                withKey("tensor_dtype", cache_dtype)});
     Tensor cv = cv_layer(Tensor());
 
     cache_key_inputs.push_back(ck);
