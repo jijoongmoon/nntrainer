@@ -93,6 +93,14 @@ void InputLayer::finalize(InitLayerContext &context) {
 void InputLayer::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
   std::vector<nntrainer::TensorDim> input_dimensions) {
+  // Skip update if this input layer's data type differs from the provided
+  // dimensions. This preserves external tensors (e.g., KV cache with UINT16)
+  // when resetInputDimension is called with FP32 token dimensions.
+  auto current_dtype = context.getOutput(SINGLE_INOUT_IDX).getDataType();
+  auto new_dtype = input_dimensions[0].getDataType();
+  if (current_dtype != new_dtype) {
+    return;
+  }
   context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
   context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
 }
