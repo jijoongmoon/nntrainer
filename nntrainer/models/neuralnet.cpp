@@ -932,6 +932,24 @@ void NeuralNetwork::load(const std::string &file_path,
     qnn_load.join();
     break;
   }
+
+  case ml::train::ModelFormat::MODEL_FORMAT_LITERT: {
+    // LiteRT-LM format: the model file (.litertlm) is self-contained.
+    // LiteRT-LM handles tokenization, KV-cache, decode loop internally.
+    // Only inference mode is supported.
+    NNTR_THROW_IF(exec_mode != ExecutionMode::INFERENCE, std::invalid_argument)
+      << "Only support LiteRT-LM format for Inference";
+    NNTR_THROW_IF(!isFileExist(props::FilePath(v[0])), std::invalid_argument)
+      << "Cannot open LiteRT-LM model file: " << v[0];
+
+    // Load through gpu2 context - LiteRTContext::load() creates
+    // the LiteRT-LM Engine and loads the .litertlm model
+    int ret =
+      ct_engine->getRegisteredContext("gpu2")->load(props::FilePath(v[0]));
+    throw_status(ret);
+    break;
+  }
+
   default:
     throw nntrainer::exception::not_supported(
       "loading with given format is not supported yet");
