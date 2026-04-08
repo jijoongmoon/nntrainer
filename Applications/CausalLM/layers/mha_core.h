@@ -337,8 +337,7 @@ private:
     QUERY = 0,
     KEY = 1,
     VALUE = 2,
-    CACHE_KEY = 3,
-    CACHE_VALUE = 4,
+    MASK = 3,
 
     /** output index */
     OUTPUT = 0,
@@ -347,13 +346,15 @@ private:
 
   /**< indices of the internal tensors (cache_key/cache_value are now inputs) */
   enum AttentionParams {
+    cache_key,
+    cache_value,
     projected_key,
     projected_value,
     attention_weight,
     dropout_mask,
     attention_output,
   };
-  std::array<unsigned int, 5> tensor_idx;
+  std::array<unsigned int, 7> tensor_idx;
   unsigned int sink_idx;
 
   /** attention parameters */

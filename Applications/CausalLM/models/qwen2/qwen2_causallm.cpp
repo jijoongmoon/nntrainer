@@ -22,8 +22,7 @@ namespace causallm {
 Tensor Qwen2Transformer::createAttention(const int layer_id, int seq_len,
                                           int n_heads, int head_dim,
                                           Tensor query, Tensor key,
-                                          Tensor value, Tensor cache_key,
-                                          Tensor cache_value) {
+                                          Tensor value) {
 
   using ml::train::createLayer;
 
@@ -65,7 +64,7 @@ Tensor Qwen2Transformer::createAttention(const int layer_id, int seq_len,
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")});
-  Tensor a = attn({q, k, v, cache_key, cache_value});
+  Tensor a = attn({q, k, v});
 
   // O projection
   LayerHandle o_proj = createLayer(

@@ -366,6 +366,18 @@ const Tensor &RunLayerContext::getTensor(unsigned int idx) const {
   return tensors[idx]->getVariableRef();
 }
 
+void RunLayerContext::setExternalTensor(unsigned int idx, Tensor *tensor) {
+  if (tensor)
+    external_tensors_[idx] = tensor;
+  else
+    external_tensors_.erase(idx);
+}
+
+Tensor *RunLayerContext::getExternalTensor(unsigned int idx) const {
+  auto it = external_tensors_.find(idx);
+  return (it != external_tensors_.end()) ? it->second : nullptr;
+}
+
 /**
  * @brief Get the Tensor Grad object
  *

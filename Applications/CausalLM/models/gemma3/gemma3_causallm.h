@@ -44,12 +44,10 @@ protected:
 public:
   Tensor createAttention(const int layer_id, int seq_len, int n_heads,
                           int head_dim, Tensor query, Tensor key,
-                          Tensor value, Tensor cache_key,
-                          Tensor cache_value) override;
+                          Tensor value) override;
 
-  Tensor createTransformerDecoderBlock(const int layer_id, Tensor input,
-                                       Tensor cache_key,
-                                       Tensor cache_value) override;
+  Tensor createTransformerDecoderBlock(const int layer_id,
+                                       Tensor input) override;
 
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;

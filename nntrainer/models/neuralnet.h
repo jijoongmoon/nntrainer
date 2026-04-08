@@ -534,6 +534,13 @@ public:
   }
 
   /**
+   * @copydoc Model::setLayerExternalTensor
+   */
+  void setLayerExternalTensor(const std::string &layer_name,
+                              unsigned int tensor_idx,
+                              Tensor *tensor) override;
+
+  /**
    * @brief     get output dimension of neural network
    * @retval std::vector<TensorDim> output dimension
    */
