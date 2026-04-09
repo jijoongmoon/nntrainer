@@ -107,6 +107,6 @@ LOCAL_LDLIBS        := -llog -landroid
 LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384" "-Wl,--allow-multiple-definition"
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer litert_lm_all
-LOCAL_WHOLE_STATIC_LIBRARIES := absl_all
+LOCAL_STATIC_LIBRARIES := absl_all
 
 include $(BUILD_SHARED_LIBRARY)
