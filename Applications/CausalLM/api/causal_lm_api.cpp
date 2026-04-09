@@ -351,12 +351,18 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
           g_model_base_path + "liblitert_context.so";
       auto &engine = nntrainer::Engine::Global();
 
+      std::cerr << "[DEBUG-GPU2] litert_lib_path: " << litert_lib_path
+                << std::endl;
+
       try {
         engine.registerContext(litert_lib_path);
+        std::cerr << "[DEBUG-GPU2] registerContext succeeded" << std::endl;
       } catch (const std::invalid_argument &e) {
-        // Context may already be registered - this is OK
-        std::cerr << "[quick.ai] GPU2 registerContext: " << e.what()
-                  << " (may already be registered)" << std::endl;
+        std::cerr << "[DEBUG-GPU2] registerContext invalid_argument: "
+                  << e.what() << std::endl;
+      } catch (const std::exception &e) {
+        std::cerr << "[DEBUG-GPU2] registerContext exception: " << e.what()
+                  << std::endl;
       }
 
       // Find the model file in the model directory
