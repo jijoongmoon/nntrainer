@@ -82,7 +82,7 @@ static void register_qwen3_0_6b() {
 }
 
 int register_builtin_model_configs() {
-  register_qwen3_0_6b();
+  // register_qwen3_0_6b();
   // Add more models here...
   return 0;
 }
