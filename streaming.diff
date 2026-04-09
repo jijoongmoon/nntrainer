@@ -1,0 +1,1358 @@
+commit 4ad54fd2de2ce6f8f4d541834b2bab728bccc5f2
+Author: junbong.yu <junbong.yu@samsung.com>
+Date:   Thu Apr 9 15:03:30 2026 +0900
+
+    fix for streaming
+
+diff --git a/Applications/CausalLM/api/buffered_streamer.cpp b/Applications/CausalLM/api/buffered_streamer.cpp
+new file mode 100644
+index 000000000..4d94a7e33
+--- /dev/null
++++ b/Applications/CausalLM/api/buffered_streamer.cpp
+@@ -0,0 +1,251 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
++ *
++ * @file   buffered_streamer.cpp
++ * @date   30 Mar 2026
++ * @brief  Thread-safe buffered streamer implementation
++ *         Producer-Consumer pattern for LLM streaming
++ */
++
++#include "buffered_streamer.h"
++#include <stdlib.h>
++#include <string.h>
++
++static void buffered_put(void* self,
++                         const unsigned int* token_ids,
++                         int count,
++                         const char* text) {
++    (void)token_ids;
++    (void)count;
++    
++    BufferedStreamer* streamer = (BufferedStreamer*)self;
++    if (streamer == NULL || text == NULL) {
++        return;
++    }
++
++    // Create new node
++    BufferNode* node = (BufferNode*)malloc(sizeof(BufferNode));
++    if (node == NULL) {
++        return;
++    }
++
++    node->text = strdup(text);
++    if (node->text == NULL) {
++        free(node);
++        return;
++    }
++    node->next = NULL;
++
++    // Lock and add to queue
++    pthread_mutex_lock(&streamer->mutex);
++    
++    if (streamer->tail == NULL) {
++        // Empty queue
++        streamer->head = node;
++        streamer->tail = node;
++    } else {
++        // Append to tail
++        streamer->tail->next = node;
++        streamer->tail = node;
++    }
++    
++    // Signal waiting consumer
++    pthread_cond_signal(&streamer->cond);
++    pthread_mutex_unlock(&streamer->mutex);
++}
++
++static void buffered_end(void* self) {
++    BufferedStreamer* streamer = (BufferedStreamer*)self;
++    if (streamer == NULL) {
++        return;
++    }
++
++    pthread_mutex_lock(&streamer->mutex);
++    streamer->is_done = true;
++    // Signal all waiting consumers
++    pthread_cond_broadcast(&streamer->cond);
++    pthread_mutex_unlock(&streamer->mutex);
++}
++
++static StreamerVtbl buffered_vtbl = {
++    .put = buffered_put,
++    .end = buffered_end
++};
++
++int buffered_streamer_init(BufferedStreamer* streamer) {
++    if (streamer == NULL) {
++        return -1;
++    }
++
++    // Initialize base streamer
++    base_streamer_init(&streamer->base, &buffered_vtbl, NULL);
++    
++    // Initialize queue
++    streamer->head = NULL;
++    streamer->tail = NULL;
++    
++    // Initialize state
++    streamer->is_done = false;
++    streamer->is_initialized = true;
++
++    // Initialize synchronization primitives
++    if (pthread_mutex_init(&streamer->mutex, NULL) != 0) {
++        return -1;
++    }
++    
++    if (pthread_cond_init(&streamer->cond, NULL) != 0) {
++        pthread_mutex_destroy(&streamer->mutex);
++        return -1;
++    }
++
++    return 0;
++}
++
++void buffered_streamer_cleanup(BufferedStreamer* streamer) {
++    if (streamer == NULL || !streamer->is_initialized) {
++        return;
++    }
++
++    // Free all remaining nodes in queue
++    pthread_mutex_lock(&streamer->mutex);
++    BufferNode* node = streamer->head;
++    while (node != NULL) {
++        BufferNode* next = node->next;
++        free(node->text);
++        free(node);
++        node = next;
++    }
++    streamer->head = NULL;
++    streamer->tail = NULL;
++    pthread_mutex_unlock(&streamer->mutex);
++
++    // Destroy synchronization primitives
++    pthread_cond_destroy(&streamer->cond);
++    pthread_mutex_destroy(&streamer->mutex);
++
++    streamer->is_initialized = false;
++}
++
++BufferedStreamer* buffered_streamer_create(void) {
++    BufferedStreamer* streamer = (BufferedStreamer*)malloc(sizeof(BufferedStreamer));
++    if (streamer == NULL) {
++        return NULL;
++    }
++
++    if (buffered_streamer_init(streamer) != 0) {
++        free(streamer);
++        return NULL;
++    }
++
++    return streamer;
++}
++
++void buffered_streamer_destroy(BufferedStreamer* streamer) {
++    if (streamer == NULL) {
++        return;
++    }
++
++    buffered_streamer_cleanup(streamer);
++    free(streamer);
++}
++
++int buffered_streamer_get(BufferedStreamer* streamer, char** text_out) {
++    if (streamer == NULL || text_out == NULL || !streamer->is_initialized) {
++        return -1;
++    }
++
++    pthread_mutex_lock(&streamer->mutex);
++
++    // Wait until data available or stream ends
++    while (streamer->head == NULL && !streamer->is_done) {
++        pthread_cond_wait(&streamer->cond, &streamer->mutex);
++    }
++
++    // Check if we have data
++    if (streamer->head == NULL) {
++        // No data and stream is done
++        pthread_mutex_unlock(&streamer->mutex);
++        return 0;
++    }
++
++    // Dequeue node
++    BufferNode* node = streamer->head;
++    streamer->head = node->next;
++    if (streamer->head == NULL) {
++        streamer->tail = NULL;
++    }
++
++    pthread_mutex_unlock(&streamer->mutex);
++
++    // Return text (caller must free)
++    *text_out = node->text;
++    free(node);
++
++    return 1;
++}
++
++int buffered_streamer_has_data(BufferedStreamer* streamer) {
++    if (streamer == NULL || !streamer->is_initialized) {
++        return -1;
++    }
++
++    pthread_mutex_lock(&streamer->mutex);
++    int has_data = (streamer->head != NULL) ? 1 : 0;
++    int is_done = streamer->is_done;
++    pthread_mutex_unlock(&streamer->mutex);
++
++    if (is_done && !has_data) {
++        return -1;  // Stream ended
++    }
++    return has_data;
++}
++
++bool buffered_streamer_is_done(BufferedStreamer* streamer) {
++    if (streamer == NULL || !streamer->is_initialized) {
++        return true;
++    }
++
++    pthread_mutex_lock(&streamer->mutex);
++    bool done = streamer->is_done;
++    pthread_mutex_unlock(&streamer->mutex);
++
++    return done;
++}
++
++int buffered_streamer_wait_done(BufferedStreamer* streamer, int timeout_ms) {
++    if (streamer == NULL || !streamer->is_initialized) {
++        return -1;
++    }
++
++    pthread_mutex_lock(&streamer->mutex);
++
++    if (streamer->is_done) {
++        pthread_mutex_unlock(&streamer->mutex);
++        return 0;
++    }
++
++    int result = 0;
++    if (timeout_ms > 0) {
++        struct timespec ts;
++        clock_gettime(CLOCK_REALTIME, &ts);
++        ts.tv_sec += timeout_ms / 1000;
++        ts.tv_nsec += (timeout_ms % 1000) * 1000000;
++        if (ts.tv_nsec >= 1000000000) {
++            ts.tv_sec++;
++            ts.tv_nsec -= 1000000000;
++        }
++        
++        while (!streamer->is_done && result == 0) {
++            result = pthread_cond_timedwait(&streamer->cond, &streamer->mutex, &ts);
++        }
++    } else {
++        while (!streamer->is_done) {
++            pthread_cond_wait(&streamer->cond, &streamer->mutex);
++        }
++    }
++
++    pthread_mutex_unlock(&streamer->mutex);
++    
++    return (result == 0) ? 0 : -1;
++}
+diff --git a/Applications/CausalLM/api/buffered_streamer.h b/Applications/CausalLM/api/buffered_streamer.h
+new file mode 100644
+index 000000000..7863daf7d
+--- /dev/null
++++ b/Applications/CausalLM/api/buffered_streamer.h
+@@ -0,0 +1,111 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
++ *
++ * @file   buffered_streamer.h
++ * @date   30 Mar 2026
++ * @brief  Thread-safe buffered streamer with get() interface
++ *         Producer-Consumer pattern for LLM streaming
++ */
++
++#ifndef __BUFFERED_STREAMER_H__
++#define __BUFFERED_STREAMER_H__
++
++#include "streamer.h"
++#include <pthread.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @brief Buffer node for linked list queue
++ */
++typedef struct BufferNode {
++    char* text;
++    struct BufferNode* next;
++} BufferNode;
++
++/**
++ * @brief Thread-safe buffered streamer
++ *        Producer (LLM thread) puts tokens via vtbl->put()
++ *        Consumer (user thread) gets tokens via buffered_streamer_get()
++ */
++typedef struct {
++    BaseStreamer base;           /**< Must be first member */
++    
++    // Thread-safe queue
++    BufferNode* head;            /**< Queue head (for get) */
++    BufferNode* tail;            /**< Queue tail (for put) */
++    pthread_mutex_t mutex;       /**< Queue mutex */
++    pthread_cond_t cond;         /**< Condition variable */
++    
++    // State
++    bool is_done;                /**< Generation complete flag */
++    bool is_initialized;         /**< Initialization flag */
++} BufferedStreamer;
++
++/**
++ * @brief Initialize buffered streamer
++ * @param streamer Streamer instance to initialize
++ * @return 0 on success, -1 on failure
++ */
++CAUSALLM_API int buffered_streamer_init(BufferedStreamer* streamer);
++
++/**
++ * @brief Cleanup buffered streamer resources
++ * @param streamer Streamer instance to cleanup
++ */
++CAUSALLM_API void buffered_streamer_cleanup(BufferedStreamer* streamer);
++
++/**
++ * @brief Create buffered streamer with dynamic allocation
++ * @return Allocated streamer instance, NULL on failure
++ */
++CAUSALLM_API BufferedStreamer* buffered_streamer_create(void);
++
++/**
++ * @brief Destroy dynamically allocated buffered streamer
++ * @param streamer Streamer instance to destroy
++ */
++CAUSALLM_API void buffered_streamer_destroy(BufferedStreamer* streamer);
++
++/**
++ * @brief Get text from buffer (blocking)
++ *        Consumer thread calls this to get tokens
++ * @param streamer Streamer instance
++ * @param text_out Output buffer to store text (must be freed by caller)
++ * @return 1 if got data, 0 if stream ended and no more data, -1 on error
++ * @note Blocks until data available or stream ends
++ */
++CAUSALLM_API int buffered_streamer_get(BufferedStreamer* streamer, char** text_out);
++
++/**
++ * @brief Non-blocking check if data is available
++ * @param streamer Streamer instance
++ * @return 1 if data available, 0 if not, -1 if stream ended
++ */
++CAUSALLM_API int buffered_streamer_has_data(BufferedStreamer* streamer);
++
++/**
++ * @brief Check if stream has ended
++ * @param streamer Streamer instance
++ * @return true if stream ended, false otherwise
++ */
++CAUSALLM_API bool buffered_streamer_is_done(BufferedStreamer* streamer);
++
++/**
++ * @brief Wait for stream to complete
++ * @param streamer Streamer instance
++ * @param timeout_ms Timeout in milliseconds (0 for no timeout)
++ * @return 0 on success, -1 on timeout
++ */
++CAUSALLM_API int buffered_streamer_wait_done(BufferedStreamer* streamer, int timeout_ms);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __BUFFERED_STREAMER_H__ */
+diff --git a/Applications/CausalLM/api/callback_streamer.c b/Applications/CausalLM/api/callback_streamer.c
+new file mode 100644
+index 000000000..3756596b9
+--- /dev/null
++++ b/Applications/CausalLM/api/callback_streamer.c
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
++ *
++ * @file    callback_streamer.c
++ * @date    28 Mar 2026
++ * @brief   Callback streamer implementation
++ */
++
++#include "callback_streamer.h"
++#include <string.h>
++
++#define INITIAL_BUFFER_CAPACITY 256
++
++static void callback_put(void* self,
++                         const unsigned int* token_ids,
++                         int count,
++                         const char* text) {
++    CallbackStreamer* streamer = (CallbackStreamer*)self;
++    if (streamer == NULL || streamer->callback == NULL || text == NULL) {
++        return;
++    }
++
++    streamer->callback(text, 0, streamer->base.user_data);
++}
++
++static void callback_end(void* self) {
++    CallbackStreamer* streamer = (CallbackStreamer*)self;
++    if (streamer == NULL || streamer->callback == NULL) {
++        return;
++    }
++
++    streamer->callback("", 1, streamer->base.user_data);
++}
++
++static StreamerVtbl callback_vtbl = {
++    .put = callback_put,
++    .end = callback_end
++};
++
++int callback_streamer_init(CallbackStreamer* streamer,
++                           TokenCallback callback,
++                           void* user_data) {
++    if (streamer == NULL || callback == NULL) {
++        return -1;
++    }
++
++    base_streamer_init(&streamer->base, &callback_vtbl, user_data);
++    streamer->callback = callback;
++    streamer->buffer = NULL;
++    streamer->buffer_size = 0;
++    streamer->buffer_capacity = 0;
++
++    return 0;
++}
++
++void callback_streamer_cleanup(CallbackStreamer* streamer) {
++    if (streamer == NULL) {
++        return;
++    }
++
++    if (streamer->buffer != NULL) {
++        free(streamer->buffer);
++        streamer->buffer = NULL;
++    }
++    streamer->buffer_size = 0;
++    streamer->buffer_capacity = 0;
++    streamer->callback = NULL;
++}
++
++CallbackStreamer* callback_streamer_create(TokenCallback callback,
++                                           void* user_data) {
++    if (callback == NULL) {
++        return NULL;
++    }
++
++    CallbackStreamer* streamer = (CallbackStreamer*)malloc(sizeof(CallbackStreamer));
++    if (streamer == NULL) {
++        return NULL;
++    }
++
++    if (callback_streamer_init(streamer, callback, user_data) != 0) {
++        free(streamer);
++        return NULL;
++    }
++
++    return streamer;
++}
++
++void callback_streamer_destroy(CallbackStreamer* streamer) {
++    if (streamer == NULL) {
++        return;
++    }
++
++    callback_streamer_cleanup(streamer);
++    free(streamer);
++}
+diff --git a/Applications/CausalLM/api/callback_streamer.cpp b/Applications/CausalLM/api/callback_streamer.cpp
+new file mode 100644
+index 000000000..3756596b9
+--- /dev/null
++++ b/Applications/CausalLM/api/callback_streamer.cpp
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
++ *
++ * @file    callback_streamer.c
++ * @date    28 Mar 2026
++ * @brief   Callback streamer implementation
++ */
++
++#include "callback_streamer.h"
++#include <string.h>
++
++#define INITIAL_BUFFER_CAPACITY 256
++
++static void callback_put(void* self,
++                         const unsigned int* token_ids,
++                         int count,
++                         const char* text) {
++    CallbackStreamer* streamer = (CallbackStreamer*)self;
++    if (streamer == NULL || streamer->callback == NULL || text == NULL) {
++        return;
++    }
++
++    streamer->callback(text, 0, streamer->base.user_data);
++}
++
++static void callback_end(void* self) {
++    CallbackStreamer* streamer = (CallbackStreamer*)self;
++    if (streamer == NULL || streamer->callback == NULL) {
++        return;
++    }
++
++    streamer->callback("", 1, streamer->base.user_data);
++}
++
++static StreamerVtbl callback_vtbl = {
++    .put = callback_put,
++    .end = callback_end
++};
++
++int callback_streamer_init(CallbackStreamer* streamer,
++                           TokenCallback callback,
++                           void* user_data) {
++    if (streamer == NULL || callback == NULL) {
++        return -1;
++    }
++
++    base_streamer_init(&streamer->base, &callback_vtbl, user_data);
++    streamer->callback = callback;
++    streamer->buffer = NULL;
++    streamer->buffer_size = 0;
++    streamer->buffer_capacity = 0;
++
++    return 0;
++}
++
++void callback_streamer_cleanup(CallbackStreamer* streamer) {
++    if (streamer == NULL) {
++        return;
++    }
++
++    if (streamer->buffer != NULL) {
++        free(streamer->buffer);
++        streamer->buffer = NULL;
++    }
++    streamer->buffer_size = 0;
++    streamer->buffer_capacity = 0;
++    streamer->callback = NULL;
++}
++
++CallbackStreamer* callback_streamer_create(TokenCallback callback,
++                                           void* user_data) {
++    if (callback == NULL) {
++        return NULL;
++    }
++
++    CallbackStreamer* streamer = (CallbackStreamer*)malloc(sizeof(CallbackStreamer));
++    if (streamer == NULL) {
++        return NULL;
++    }
++
++    if (callback_streamer_init(streamer, callback, user_data) != 0) {
++        free(streamer);
++        return NULL;
++    }
++
++    return streamer;
++}
++
++void callback_streamer_destroy(CallbackStreamer* streamer) {
++    if (streamer == NULL) {
++        return;
++    }
++
++    callback_streamer_cleanup(streamer);
++    free(streamer);
++}
+diff --git a/Applications/CausalLM/api/callback_streamer.h b/Applications/CausalLM/api/callback_streamer.h
+new file mode 100644
+index 000000000..798358a9a
+--- /dev/null
++++ b/Applications/CausalLM/api/callback_streamer.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
++ *
++ * @file    callback_streamer.h
++ * @date    28 Mar 2026
++ * @brief   Callback-based streamer for JNI integration
++ *          Bridges C++ generation to Java/Kotlin callbacks
++ */
++
++#ifndef __CALLBACK_STREAMER_H__
++#define __CALLBACK_STREAMER_H__
++
++#include "streamer.h"
++#include <stdlib.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @brief Callback function type for token streaming
++ * @param text Generated text chunk
++ * @param is_end 1 if generation is complete, 0 if ongoing
++ * @param user_data User-defined context (e.g., JNI environment)
++ */
++typedef void (*TokenCallback)(const char* text, int is_end, void* user_data);
++
++/**
++ * @brief Callback streamer structure
++ *        Extends BaseStreamer for JNI callback integration
++ */
++typedef struct {
++    BaseStreamer base;           /**< Must be first member for inheritance */
++    TokenCallback callback;      /**< User-provided callback function */
++    char* buffer;                /**< Internal buffer for partial tokens */
++    size_t buffer_size;          /**< Current buffer size */
++    size_t buffer_capacity;      /**< Buffer capacity */
++} CallbackStreamer;
++
++/**
++ * @brief Initialize callback streamer
++ * @param streamer Streamer instance to initialize
++ * @param callback Token callback function
++ * @param user_data User context data (passed to callback)
++ * @return 0 on success, -1 on failure
++ */
++int callback_streamer_init(CallbackStreamer* streamer,
++                           TokenCallback callback,
++                           void* user_data);
++
++/**
++ * @brief Cleanup callback streamer resources
++ * @param streamer Streamer instance to cleanup
++ */
++void callback_streamer_cleanup(CallbackStreamer* streamer);
++
++/**
++ * @brief Create callback streamer with dynamic allocation
++ * @param callback Token callback function
++ * @param user_data User context data
++ * @return Allocated streamer instance, NULL on failure
++ */
++CallbackStreamer* callback_streamer_create(TokenCallback callback,
++                                           void* user_data);
++
++/**
++ * @brief Destroy dynamically allocated callback streamer
++ * @param streamer Streamer instance to destroy
++ */
++void callback_streamer_destroy(CallbackStreamer* streamer);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __CALLBACK_STREAMER_H__ */
+diff --git a/Applications/CausalLM/api/causal_lm_api.cpp b/Applications/CausalLM/api/causal_lm_api.cpp
+index f4069b0b1..8ee034a08 100644
+--- a/Applications/CausalLM/api/causal_lm_api.cpp
++++ b/Applications/CausalLM/api/causal_lm_api.cpp
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include "causal_lm_api.h"
++#include "callback_streamer.h"
+ #include <algorithm>
+ #include <cstring>
+ #include <iostream>
+@@ -592,3 +593,96 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
+ 
+   return CAUSAL_LM_ERROR_NONE;
+ }
++
++ErrorCode runModelStreaming(const char *inputTextPrompt,
++                            StreamCallback callback,
++                            void *user_data) {
++  if (!g_initialized || !g_model) {
++    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
++  }
++  if (inputTextPrompt == nullptr) {
++    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
++  }
++
++  try {
++    std::lock_guard<std::mutex> lock(g_mutex);
++
++    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
++    if (!causal_lm_model) {
++      return CAUSAL_LM_ERROR_UNKNOWN;
++    }
++
++    CallbackStreamer *streamer = nullptr;
++    if (callback != nullptr) {
++      streamer = callback_streamer_create(callback, user_data);
++      if (streamer == nullptr) {
++        return CAUSAL_LM_ERROR_UNKNOWN;
++      }
++      causal_lm_model->setStreamer(&streamer->base);
++    }
++
++    std::string input(inputTextPrompt);
++    if (g_use_chat_template) {
++      input = apply_chat_template(g_architecture, input);
++    }
++
++    causal_lm_model->run(input, false, "", "", g_verbose);
++
++    if (streamer != nullptr) {
++      causal_lm_model->setStreamer(nullptr);
++      callback_streamer_destroy(streamer);
++    }
++
++  } catch (const std::exception &e) {
++    std::cerr << "Exception in runModelStreaming: " << e.what() << std::endl;
++    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
++  } catch (...) {
++    std::cerr << "Unknown exception in runModelStreaming" << std::endl;
++    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
++  }
++
++  return CAUSAL_LM_ERROR_NONE;
++}
++
++ErrorCode runModelWithStreamer(const char *inputTextPrompt,
++                                BaseStreamer *streamer) {
++  if (!g_initialized || !g_model) {
++    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
++  }
++  if (inputTextPrompt == nullptr) {
++    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
++  }
++
++  try {
++    std::lock_guard<std::mutex> lock(g_mutex);
++
++    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
++    if (!causal_lm_model) {
++      return CAUSAL_LM_ERROR_UNKNOWN;
++    }
++
++    // Set the streamer directly
++    if (streamer != nullptr) {
++      causal_lm_model->setStreamer(streamer);
++    }
++
++    std::string input(inputTextPrompt);
++    if (g_use_chat_template) {
++      input = apply_chat_template(g_architecture, input);
++    }
++
++    causal_lm_model->run(input, false, "", "", g_verbose);
++
++    // Reset streamer after run
++    causal_lm_model->setStreamer(nullptr);
++
++  } catch (const std::exception &e) {
++    std::cerr << "Exception in runModelWithStreamer: " << e.what() << std::endl;
++    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
++  } catch (...) {
++    std::cerr << "Unknown exception in runModelWithStreamer" << std::endl;
++    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
++  }
++
++  return CAUSAL_LM_ERROR_NONE;
++}
+diff --git a/Applications/CausalLM/api/causal_lm_api.h b/Applications/CausalLM/api/causal_lm_api.h
+index 3af22f0f7..0ecf40ccf 100644
+--- a/Applications/CausalLM/api/causal_lm_api.h
++++ b/Applications/CausalLM/api/causal_lm_api.h
+@@ -109,6 +109,40 @@ WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
+ WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
+                               const char **outputText);
+ 
++/**
++ * @brief Callback function type for streaming generation
++ * @param text Generated text chunk
++ * @param is_end 1 if generation is complete, 0 if ongoing
++ * @param user_data User-defined context (e.g., JNI environment)
++ */
++typedef void (*StreamCallback)(const char *text, int is_end, void *user_data);
++
++/**
++ * @brief Run inference with streaming output
++ * @param inputTextPrompt Input prompt
++ * @param callback Callback function for streaming (can be NULL)
++ * @param user_data User context data passed to callback
++ * @return ErrorCode
++ */
++WIN_EXPORT ErrorCode runModelStreaming(const char *inputTextPrompt,
++                                        StreamCallback callback,
++                                        void *user_data);
++
++/* Forward declaration for BaseStreamer */
++struct BaseStreamer;
++
++/**
++ * @brief Run inference with custom streamer (advanced usage)
++ *        Allows direct control via put/get pattern with buffered streamer
++ * @param inputTextPrompt Input prompt
++ * @param streamer BaseStreamer instance (e.g., BufferedStreamer)
++ * @return ErrorCode
++ * @note The streamer must be properly initialized before calling
++ *       Consumer thread should call get() to retrieve tokens
++ */
++WIN_EXPORT ErrorCode runModelWithStreamer(const char *inputTextPrompt,
++                                           struct BaseStreamer *streamer);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/Applications/CausalLM/api/streamer.cpp b/Applications/CausalLM/api/streamer.cpp
+new file mode 100644
+index 000000000..011599591
+--- /dev/null
++++ b/Applications/CausalLM/api/streamer.cpp
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
++ *
++ * @file    streamer.c
++ * @date    28 Mar 2026
++ * @brief   Streamer interface implementation
++ */
++
++#include "streamer.h"
++
++void base_streamer_init(BaseStreamer* streamer,
++                        const StreamerVtbl* vtbl,
++                        void* user_data) {
++    if (streamer == NULL) {
++        return;
++    }
++    streamer->vtbl = vtbl;
++    streamer->user_data = user_data;
++}
++
++void streamer_put(BaseStreamer* streamer,
++                  const unsigned int* token_ids,
++                  int count,
++                  const char* text) {
++    if (streamer == NULL || streamer->vtbl == NULL || streamer->vtbl->put == NULL) {
++        return;
++    }
++    streamer->vtbl->put(streamer, token_ids, count, text);
++}
++
++void streamer_end(BaseStreamer* streamer) {
++    if (streamer == NULL || streamer->vtbl == NULL || streamer->vtbl->end == NULL) {
++        return;
++    }
++    streamer->vtbl->end(streamer);
++}
++
++bool streamer_is_valid(BaseStreamer* streamer) {
++    return streamer != NULL &&
++           streamer->vtbl != NULL &&
++           streamer->vtbl->put != NULL &&
++           streamer->vtbl->end != NULL;
++}
+diff --git a/Applications/CausalLM/api/streamer.h b/Applications/CausalLM/api/streamer.h
+new file mode 100644
+index 000000000..9e9450e5a
+--- /dev/null
++++ b/Applications/CausalLM/api/streamer.h
+@@ -0,0 +1,105 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
++ *
++ * @file    streamer.h
++ * @date    28 Mar 2026
++ * @brief   Streamer interface for real-time token generation
++ *          Similar to HuggingFace Transformers' BaseStreamer
++ * @see     https://github.com/huggingface/transformers
++ */
++
++#ifndef __STREAMER_H__
++#define __STREAMER_H__
++
++#include <stddef.h>
++#include <stdbool.h>
++
++/* API export macros */
++#ifdef _WIN32
++  #ifdef CAUSALLM_BUILDING_DLL
++    #define CAUSALLM_API __declspec(dllexport)
++  #else
++    #define CAUSALLM_API __declspec(dllimport)
++  #endif
++#else
++  #define CAUSALLM_API __attribute__((visibility("default")))
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @brief Streamer virtual function table (vtable)
++ *        C++ virtual function emulation in C
++ *        Similar to HuggingFace's BaseStreamer interface
++ */
++typedef struct StreamerVtbl {
++    /**
++     * @brief Called when new tokens are generated
++     * @param self Streamer instance
++     * @param token_ids Array of generated token IDs
++     * @param count Number of tokens
++     * @param text Decoded text representation
++     */
++    void (*put)(void* self,
++                const unsigned int* token_ids,
++                int count,
++                const char* text);
++
++    /**
++     * @brief Called when generation is complete
++     * @param self Streamer instance
++     */
++    void (*end)(void* self);
++} StreamerVtbl;
++
++/**
++ * @brief Base streamer structure
++ *        Must be first member of any concrete streamer implementation
++ */
++typedef struct BaseStreamer {
++    const StreamerVtbl* vtbl;  /**< Virtual function table */
++    void* user_data;           /**< User-defined context data */
++} BaseStreamer;
++
++/**
++ * @brief Initialize base streamer
++ * @param streamer Streamer instance to initialize
++ * @param vtbl Virtual function table for concrete implementation
++ * @param user_data User context data
++ */
++CAUSALLM_API void base_streamer_init(BaseStreamer* streamer,
++                         const StreamerVtbl* vtbl,
++                         void* user_data);
++
++/**
++ * @brief Put tokens to streamer
++ * @param streamer Streamer instance
++ * @param token_ids Token IDs array
++ * @param count Number of tokens
++ * @param text Decoded text
++ */
++CAUSALLM_API void streamer_put(BaseStreamer* streamer,
++                  const unsigned int* token_ids,
++                  int count,
++                  const char* text);
++
++/**
++ * @brief Signal end of generation
++ * @param streamer Streamer instance
++ */
++CAUSALLM_API void streamer_end(BaseStreamer* streamer);
++
++/**
++ * @brief Check if streamer is valid (non-null with valid vtbl)
++ * @param streamer Streamer instance
++ * @return true if valid, false otherwise
++ */
++CAUSALLM_API bool streamer_is_valid(BaseStreamer* streamer);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __STREAMER_H__ */
+diff --git a/Applications/CausalLM/api/test_api.cpp b/Applications/CausalLM/api/test_api.cpp
+index 8477cfad8..f04c58d85 100644
+--- a/Applications/CausalLM/api/test_api.cpp
++++ b/Applications/CausalLM/api/test_api.cpp
+@@ -6,20 +6,79 @@
+  * @date   21 Jan 2026
+  * @see    https://github.com/nntrainer/nntrainer
+  * @author Eunju Yang <ej.yang@samsung.com>
+- * @brief  Simple application to test CausalLM API
++ * @brief  Simple application to test CausalLM API with buffered streaming
+  * @bug    No known bugs except for NYI items
+  *
+  */
+ 
+ #include "causal_lm_api.h"
++#include "buffered_streamer.h"
+ #include <cmath>
+ #include <cstring>
+ #include <iomanip>
+ #include <iostream>
++#include <pthread.h>
+ #include <sstream>
+ #include <string>
++#include <unistd.h>
+ #include <vector>
+ 
++// Volatile flag for thread termination
++volatile bool stop_consumer = false;
++
++// Structure for consumer thread
++typedef struct {
++    BufferedStreamer* streamer;
++    bool verbose;
++} ConsumerArgs;
++
++// Consumer thread function - reads from buffer and prints
++void* consumer_thread(void* arg) {
++    ConsumerArgs* args = (ConsumerArgs*)arg;
++    BufferedStreamer* streamer = args->streamer;
++    bool verbose = args->verbose;
++
++    if (verbose) {
++        std::cout << "[Consumer] Thread started, waiting for data...\n";
++    }
++
++    int chunk_count = 0;
++    while (!stop_consumer) {
++        char* text = NULL;
++        int result = buffered_streamer_get(streamer, &text);
++
++        if (result < 0) {
++            // Error
++            if (verbose) {
++                std::cerr << "[Consumer] Error getting data\n";
++            }
++            break;
++        } else if (result == 0) {
++            // Stream ended, no more data
++            if (verbose) {
++                std::cout << "\n[Consumer] Stream ended, received " << chunk_count << " chunks\n";
++            }
++            break;
++        } else {
++            // Got data
++            chunk_count++;
++            if (verbose) {
++                std::cout << "[Consumer] Chunk " << chunk_count << ": \"";
++            }
++            std::cout << text << std::flush;
++            if (verbose) {
++                std::cout << "\"\n";
++            }
++            free(text);
++        }
++    }
++
++    if (verbose) {
++        std::cout << "[Consumer] Thread exiting\n";
++    }
++    return NULL;
++}
++
+ namespace {
+ constexpr const char *COLOR_RESET = "\033[0m";
+ constexpr const char *COLOR_BOLD = "\033[1m";
+@@ -196,56 +255,65 @@ int main(int argc, char *argv[]) {
+   }
+   printSuccess("Model loaded successfully");
+ 
+-  printSection("Inference");
++  printSection("Inference (Buffered Streaming with Producer-Consumer)");
+   std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Input Prompt:\n";
+   std::cout << COLOR_BOLD << COLOR_YELLOW << "  " << prompt << COLOR_RESET
+             << "\n\n";
+ 
+-  std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET << "Running inference...\n\n";
++  std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET << "Running inference with buffered streamer...\n";
++  std::cout << "         (Producer: LLM thread puts tokens via streamer_put)\n";
++  std::cout << "         (Consumer: Separate thread gets tokens via streamer_get)\n\n";
++
++  // Create buffered streamer
++  BufferedStreamer* streamer = buffered_streamer_create();
++  if (streamer == nullptr) {
++    printError("Failed to create buffered streamer");
++    return 1;
++  }
+ 
+-  const char *outputText = nullptr;
++  // Setup consumer thread arguments
++  ConsumerArgs consumer_args;
++  consumer_args.streamer = streamer;
++  consumer_args.verbose = verbose;
++
++  // Create consumer thread
++  pthread_t consumer_tid;
++  if (pthread_create(&consumer_tid, nullptr, consumer_thread, &consumer_args) != 0) {
++    printError("Failed to create consumer thread");
++    buffered_streamer_destroy(streamer);
++    return 1;
++  }
+ 
+   if (verbose) {
+     std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+     std::cout << COLOR_BOLD << COLOR_GRAY;
+   }
+ 
+-  err = runModel(prompt, &outputText);
+-
+-  if (verbose) {
+-    std::cout << COLOR_RESET << "\n\n";
+-  }
++  // Run inference with buffered streamer
++  // Producer (LLM thread) will call streamer_put() for each token
++  err = runModelWithStreamer(prompt, &streamer->base);
+ 
+   if (err != CAUSAL_LM_ERROR_NONE) {
+     printError("Failed to run model");
+     std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
++    stop_consumer = true;
++    pthread_join(consumer_tid, nullptr);
++    buffered_streamer_destroy(streamer);
+     return 1;
+   }
+ 
+-  if (outputText) {
+-    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Output:\n";
+-    std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
+-    std::string out(outputText);
+-    size_t pos = 0;
+-    while (pos < out.length()) {
+-      size_t newlinePos = out.find('\n', pos);
+-      if (newlinePos == std::string::npos) {
+-        newlinePos = out.length();
+-      }
+-      std::string line = out.substr(pos, newlinePos - pos);
+-      std::cout << line;
+-      if (newlinePos < out.length()) {
+-        std::cout << "\n  ";
+-        pos = newlinePos + 1;
+-      } else {
+-        pos = out.length();
+-      }
+-    }
+-    std::cout << COLOR_RESET << "\n\n";
+-  } else {
+-    printWarning("No output generated");
++  // Wait for consumer thread to finish
++  pthread_join(consumer_tid, nullptr);
++
++  if (verbose) {
++    std::cout << COLOR_RESET << "\n";
+   }
+ 
++  // Cleanup
++  buffered_streamer_destroy(streamer);
++
++  printSuccess("Buffered streaming inference completed");
++
+   printSection("Performance Metrics");
+   PerformanceMetrics metrics;
+   err = getPerformanceMetrics(&metrics);
+diff --git a/Applications/CausalLM/jni/Android.mk b/Applications/CausalLM/jni/Android.mk
+index d49072e06..6c521d17f 100644
+--- a/Applications/CausalLM/jni/Android.mk
++++ b/Applications/CausalLM/jni/Android.mk
+@@ -25,7 +25,7 @@ CAUSALLM_COMMON_INCLUDES := \
+     $(LOCAL_PATH)/../models/qwen3_moe \
+     $(LOCAL_PATH)/../models/qwen3_slim_moe \
+     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+-    $(LOCAL_PATH)/../models/gemma3 
++    $(LOCAL_PATH)/../models/gemma3
+ 
+ # Prebuilt nntrainer libraries
+ include $(CLEAR_VARS)
+@@ -58,6 +58,7 @@ LOCAL_MODULE := causallm_core
+ LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
+ 
+ LOCAL_SRC_FILES := \
++    ../api/streamer.cpp \
+     ../models/causal_lm.cpp \
+     ../models/transformer.cpp \
+     ../models/sentence_transformer.cpp \
+@@ -94,7 +95,8 @@ LOCAL_SRC_FILES := \
+ LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+ LOCAL_STATIC_LIBRARIES := tokenizers_c
+ 
+-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES)
++LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES) \
++    $(LOCAL_PATH)/../api
+ 
+ include $(BUILD_SHARED_LIBRARY)
+ 
+@@ -112,7 +114,8 @@ LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__F
+ 
+ LOCAL_SRC_FILES := \
+     ../api/causal_lm_api.cpp \
+-    ../api/model_config.cpp
++    ../api/model_config.cpp \
++    ../api/callback_streamer.cpp
+ 
+ LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
+ LOCAL_STATIC_LIBRARIES := tokenizers_c
+@@ -157,7 +160,7 @@ LOCAL_ARM_MODE := arm
+ LOCAL_MODULE := test_api
+ LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
+ 
+-LOCAL_SRC_FILES := ../api/test_api.cpp
++LOCAL_SRC_FILES := ../api/test_api.cpp ../api/buffered_streamer.cpp
+ 
+ LOCAL_SHARED_LIBRARIES := causallm_api causallm_core nntrainer ccapi-nntrainer
+ LOCAL_STATIC_LIBRARIES := tokenizers_c
+diff --git a/Applications/CausalLM/meson.build b/Applications/CausalLM/meson.build
+index 79c1dca07..e4dbb7c89 100644
+--- a/Applications/CausalLM/meson.build
++++ b/Applications/CausalLM/meson.build
+@@ -3,6 +3,9 @@ causallm_src = [
+     meson.current_source_dir() / 'llm_util.cpp',
+     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
+     meson.current_source_dir() / 'api' / 'model_config.cpp',
++    meson.current_source_dir() / 'api' / 'streamer.cpp',
++    meson.current_source_dir() / 'api' / 'buffered_streamer.cpp',
++    meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
+ ]
+ 
+ executable_src = [
+@@ -69,6 +72,17 @@ causallm_dep = declare_dependency(
+     include_directories: causallm_inc
+ )
+ 
++# Public headers for API users
++causallm_headers = [
++    'api/causal_lm_api.h',
++    'api/streamer.h',
++    'api/buffered_streamer.h',
++    'api/callback_streamer.h',
++    'api/model_config_internal.h',
++]
++
++install_headers(causallm_headers, subdir: 'causallm')
++
+ e = executable('nntr_causallm',
+     executable_src,
+     include_directories: causallm_inc,
+diff --git a/Applications/CausalLM/models/causal_lm.cpp b/Applications/CausalLM/models/causal_lm.cpp
+index a7a941566..c00b38984 100644
+--- a/Applications/CausalLM/models/causal_lm.cpp
++++ b/Applications/CausalLM/models/causal_lm.cpp
+@@ -35,16 +35,20 @@
+ #include <mha_core.h>
+ #include <tensor.h>
+ 
++#include "../api/streamer.h"
+ #include <causal_lm.h>
+ #include <llm_util.hpp>
+ 
+ namespace causallm {
+ 
+ CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
+-  Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
++  Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
++  streamer_(nullptr) {
+   setupParameters(cfg, generation_cfg, nntr_cfg);
+ }
+ 
++void CausalLM::setStreamer(BaseStreamer *streamer) { streamer_ = streamer; }
++
+ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
+                                json &nntr_cfg) {
+   // Initialize output list
+@@ -143,7 +147,9 @@ void CausalLM::registerOutputs(
+                  decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
+         // ends with an incomplete token, hold on
+       } else {
+-        if (log_output) {
++        if (streamer_ != nullptr) {
++          streamer_put(streamer_, nullptr, 0, decoded_str.c_str());
++        } else if (log_output) {
+ #if defined(_WIN32)
+           std::wcout << L"" << utf8_to_wstring(decoded_str);
+           std::wcout.flush();
+@@ -459,10 +465,6 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
+   if (init_len < INIT_SEQ_LEN)
+     registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
+ 
+-  // output should be deallocated after use
+-  for (auto &out : output) {
+-    delete[] out;
+-  }
+ 
+   auto finish_prefill = std::chrono::high_resolution_clock::now();
+   auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+@@ -505,6 +507,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
+       registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
+                       log_output);
+     }
++
+     ++generation_cnt;
+ 
+     // output should be deallocated after use
+@@ -570,6 +573,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
+   performance_metrics.total_duration_ms = total_duration.count();
+   performance_metrics.peak_memory_kb = peak_memory;
+ 
++  // Signal streamer that generation is complete
++  if (streamer_ != nullptr) {
++    streamer_end(streamer_);
++  }
++
+   has_run_ = true;
+ }
+ 
+diff --git a/Applications/CausalLM/models/causal_lm.h b/Applications/CausalLM/models/causal_lm.h
+index 43302ecf0..e1e02ecb5 100644
+--- a/Applications/CausalLM/models/causal_lm.h
++++ b/Applications/CausalLM/models/causal_lm.h
+@@ -39,8 +39,13 @@
+ #define WCHAR_P std::string &
+ #endif
+ 
++#include "../api/causal_lm_api.h"
++#include "../api/streamer.h"
+ #include <transformer.h>
+ 
++/* Forward declaration for C compatibility */
++typedef struct BaseStreamer BaseStreamer;
++
+ namespace causallm {
+ 
+ /**
+@@ -85,6 +90,18 @@ public:
+    */
+   bool hasRun() const { return has_run_; }
+ 
++  /**
++   * @brief Set streamer for real-time token streaming
++   * @param streamer Streamer instance (can be NULL to disable)
++   */
++  void setStreamer(BaseStreamer* streamer);
++
++  /**
++   * @brief Get current streamer
++   * @return Current streamer or NULL if not set
++   */
++  BaseStreamer* getStreamer() const { return streamer_; }
++
+ protected:
+   /**
+    * @brief Setup the parameters for the CausalLM model
+@@ -155,6 +172,9 @@ protected:
+   bool has_run_ = false;
+ 
+   std::mt19937 rng; /**< Random Number Gen */
++
++  // Streaming support
++  BaseStreamer* streamer_; /**< Streamer for real-time output (nullable) */
+ };
+ 
+ } // namespace causallm
