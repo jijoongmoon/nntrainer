@@ -63,7 +63,7 @@ android {
             // in src/main/jniLibs/.
             jniLibs.srcDirs(
                 "src/main/jniLibs",
-                layout.buildDirectory.dir("generated/jniLibs")
+                file("${buildDir}/generated/jniLibs")
             )
         }
     }
@@ -102,6 +102,10 @@ dependencies {
     implementation(libs.androidx.activity)
     implementation(libs.material)
 
+    // Navigation Component
+    implementation("androidx.navigation:navigation-fragment-ktx:2.7.7")
+    implementation("androidx.navigation:navigation-ui-ktx:2.7.7")
+
     // REST server embedded inside QuickAIService.
     implementation(libs.nanohttpd)
 
@@ -113,7 +117,7 @@ dependencies {
 
     // LiteRT-LM for Gemma-family models (Architecture.md §4).
     // See how-to-use-litert-lm-guide.md at the repo root for the Kotlin API.
-    implementation(libs.litertlm.android)
+    implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
