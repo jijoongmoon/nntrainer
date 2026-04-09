@@ -13,6 +13,8 @@
  */
 package com.example.clientapp
 
+import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Bundle
 import android.view.Gravity
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -24,19 +26,23 @@ import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.example.clientapp.api.ApiResult
 import com.example.clientapp.api.LoadModelRequest
 import com.example.clientapp.api.ModelId
 import com.example.clientapp.api.QuantizationType
 import com.example.clientapp.api.QuickAiClient
 import com.example.clientapp.api.RunModelRequest
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
 
     private val client = QuickAiClient()
 
+    private lateinit var connectionView: TextView
     private lateinit var modelSpinner: Spinner
     private lateinit var quantSpinner: Spinner
     private lateinit var modelPathField: EditText
@@ -54,6 +60,20 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.TOP
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
         }
+
+        // --- Connection indicator bar (always at the very top) ---------
+        // This view is driven by the periodic /v1/health poll started in
+        // onCreate() below. It reports the live reachability of the
+        // QuickAIService REST endpoint on 127.0.0.1:3453 independently of
+        // whatever operation the user most recently issued.
+        connectionView = TextView(this).apply {
+            text = "● Connecting…"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(COLOR_UNKNOWN)
+            setPadding(0, 0, 0, pad / 2)
+        }
+        root.addView(connectionView)
 
         val title = TextView(this).apply {
             text = "QuickAI Client"
@@ -123,12 +143,32 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(root)
 
-        // Health probe on startup.
+        // Periodic health poll. Runs only while the activity is at least
+        // STARTED, so it automatically pauses in the background and
+        // resumes on foreground — no manual start/stop bookkeeping.
         lifecycleScope.launch {
-            when (val r = client.health()) {
-                is ApiResult.Ok -> statusView.text = "Service OK on port ${r.value.port}"
-                is ApiResult.Err -> statusView.text =
-                    "Service not reachable: ${r.message} (is LauncherApp running?)"
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (true) {
+                    updateConnectionStatus()
+                    delay(HEALTH_POLL_INTERVAL_MS)
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief Fire one /v1/health request and paint [connectionView] with
+     * the result. Called from the polling loop in onCreate().
+     */
+    private suspend fun updateConnectionStatus() {
+        when (val r = client.health()) {
+            is ApiResult.Ok -> {
+                connectionView.text = "● Connected (port ${r.value.port})"
+                connectionView.setTextColor(COLOR_CONNECTED)
+            }
+            is ApiResult.Err -> {
+                connectionView.text = "● Disconnected — ${r.message}"
+                connectionView.setTextColor(COLOR_DISCONNECTED)
             }
         }
     }
@@ -204,5 +244,16 @@ class MainActivity : AppCompatActivity() {
                     statusView.text = "Metrics failed: [${r.errorCode}] ${r.message}"
             }
         }
+    }
+
+    private companion object {
+        /** How often the connection indicator re-probes /v1/health. */
+        const val HEALTH_POLL_INTERVAL_MS: Long = 3_000L
+
+        // Material-ish greens / reds. Deliberately inline so we don't need
+        // a colors.xml just for two swatches.
+        val COLOR_CONNECTED = Color.parseColor("#2E7D32")
+        val COLOR_DISCONNECTED = Color.parseColor("#C62828")
+        val COLOR_UNKNOWN = Color.parseColor("#757575")
     }
 }
