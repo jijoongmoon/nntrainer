@@ -27,6 +27,7 @@ typealias ModelId = com.example.quickdotai.ModelId
 typealias QuantizationType = com.example.quickdotai.QuantizationType
 typealias QuickAiError = com.example.quickdotai.QuickAiError
 typealias LoadModelRequest = com.example.quickdotai.LoadModelRequest
+typealias PerformanceMetrics = com.example.quickdotai.PerformanceMetrics
 
 /* -------------------------------------------------------------------- */
 /* setOptions                                                           */

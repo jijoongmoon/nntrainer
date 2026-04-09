@@ -10,7 +10,6 @@
 
 plugins {
     alias(libs.plugins.android.library)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.serialization)
 }
 
@@ -73,7 +72,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            consumerProguardFiles(
+            proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "consumer-rules.pro"
             )
@@ -107,5 +106,5 @@ dependencies {
 
     // LiteRT-LM is the engine used by LiteRTLm.kt for Gemma-family models.
     // Exposed as `api` so consumers don't have to redeclare it.
-    api(libs.litertlm.android)
+    api("com.google.ai.edge.litertlm:litertlm-android:latest.release")
 }
