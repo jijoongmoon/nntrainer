@@ -34,9 +34,18 @@ class NativeCausalLmBackend : Backend {
     private var loaded: Boolean = false
 
     override fun load(req: LoadModelRequest): BackendResult<Unit> {
-        if (loaded) return BackendResult.Ok(Unit)
+        Log.i(
+            TAG,
+            "load() entered: model=${req.model} backend=${req.backend} " +
+                "quant=${req.quantization}"
+        )
+        if (loaded) {
+            Log.i(TAG, "load(): already loaded, returning Ok")
+            return BackendResult.Ok(Unit)
+        }
 
         if (!NativeCausalLm.ensureLoaded()) {
+            Log.e(TAG, "load(): native libs unavailable on this device")
             return BackendResult.Err(
                 QuickAiError.MODEL_LOAD_FAILED,
                 "libquickai_jni.so / libcausallm_api.so not available on this device"
@@ -44,21 +53,40 @@ class NativeCausalLmBackend : Backend {
         }
 
         val nativeModelOrdinal = mapModelId(req.model)
-            ?: return BackendResult.Err(
-                QuickAiError.UNSUPPORTED,
-                "Model ${req.model} is not supported by the native backend"
-            )
+            ?: run {
+                Log.e(TAG, "load(): model ${req.model} has no native ordinal")
+                return BackendResult.Err(
+                    QuickAiError.UNSUPPORTED,
+                    "Model ${req.model} is not supported by the native backend"
+                )
+            }
 
         return try {
+            Log.i(
+                TAG,
+                "load(): calling loadModelHandleNative(backend=${req.backend.ordinal}, " +
+                    "model=$nativeModelOrdinal, quant=${req.quantization.ordinal})"
+            )
             val result = NativeCausalLm.loadModelHandleNative(
                 backendOrdinal = mapBackend(req.backend),
                 modelOrdinal = nativeModelOrdinal,
                 quantOrdinal = mapQuant(req.quantization)
             )
+            Log.i(
+                TAG,
+                "load(): loadModelHandleNative returned " +
+                    "errorCode=${result.errorCode} handle=0x${result.handle.toString(16)}"
+            )
             if (result.errorCode != 0 || result.handle == 0L) {
+                Log.e(
+                    TAG,
+                    "load(): loadModelHandle FAILED — errorCode=${result.errorCode} " +
+                        "(this is the NATIVE backend; for Gemma4 you want " +
+                        "LiteRtLmBackend — check that ModelId.GEMMA4 was requested)"
+                )
                 BackendResult.Err(
                     QuickAiError.fromNativeCode(result.errorCode),
-                    "loadModelHandle failed"
+                    "loadModelHandle failed (errorCode=${result.errorCode})"
                 )
             } else {
                 handle = result.handle
@@ -66,10 +94,11 @@ class NativeCausalLmBackend : Backend {
                 // Architecture is resolved native-side; we report the model
                 // key until we add a dedicated native getter.
                 architecture = req.model.name
+                Log.i(TAG, "load(): SUCCESS, handle=0x${handle.toString(16)}")
                 BackendResult.Ok(Unit)
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "loadModelHandleNative threw", t)
+            Log.e(TAG, "load(): loadModelHandleNative threw", t)
             BackendResult.Err(QuickAiError.MODEL_LOAD_FAILED, t.message)
         }
     }

@@ -61,6 +61,12 @@ class LiteRtLmBackend(
     private var lastRunDurationMs: Double = 0.0
 
     override fun load(req: LoadModelRequest): BackendResult<Unit> {
+        Log.i(
+            TAG,
+            "load() entered: model=${req.model} backend=${req.backend} " +
+                "quant=${req.quantization} modelPath=${req.modelPath}"
+        )
+
         // TEST HARDCODING (see gemma-model-path.md): during bring-up we
         // want `POST /v1/models` with model=GEMMA4 to Just Work even if
         // the client forgets to pass model_path. Fall back to the known
@@ -77,21 +83,29 @@ class LiteRtLmBackend(
                 val fallback = testModelFile().absolutePath
                 Log.w(
                     TAG,
-                    "loadModel: model_path not provided, falling back to " +
+                    "load(): model_path not provided, falling back to " +
                         "test path: $fallback"
                 )
                 fallback
             }
 
-        if (!File(modelPath).exists()) {
+        Log.i(TAG, "load(): resolved modelPath=$modelPath")
+
+        val modelFile = File(modelPath)
+        if (!modelFile.exists()) {
             val parentDir = testModelFile().parentFile?.absolutePath ?: "<unknown>"
             val hint = "push it with: adb push $TEST_GEMMA4_FILE_NAME $parentDir/"
-            Log.e(TAG, "model file not found at $modelPath — $hint")
+            Log.e(TAG, "load(): model file not found at $modelPath — $hint")
             return BackendResult.Err(
                 QuickAiError.MODEL_LOAD_FAILED,
                 "model file not found at $modelPath. $hint"
             )
         }
+        Log.i(
+            TAG,
+            "load(): model file exists, size=${modelFile.length()} bytes, " +
+                "canRead=${modelFile.canRead()}"
+        )
 
         val llmBackend: LlmBackend = when (req.backend) {
             QuickAiBackendType.CPU -> LlmBackend.CPU()
@@ -102,23 +116,42 @@ class LiteRtLmBackend(
             // here — fall back to CPU until the caller wires one in.
             QuickAiBackendType.NPU -> LlmBackend.CPU()
         }
+        Log.i(
+            TAG,
+            "load(): mapped compute backend ${req.backend} -> " +
+                llmBackend::class.java.simpleName
+        )
 
         val engineConfig = EngineConfig(
             modelPath = modelPath,
             backend = llmBackend
         )
+        Log.i(TAG, "load(): EngineConfig built, constructing Engine…")
 
         return try {
             val startNs = System.nanoTime()
             val e = Engine(engineConfig)
+            Log.i(TAG, "load(): Engine() constructed, calling initialize()…")
             e.initialize()
+            Log.i(
+                TAG,
+                "load(): Engine.initialize() returned after " +
+                    "${(System.nanoTime() - startNs) / 1_000_000} ms"
+            )
+
             val c = e.createConversation()
+            Log.i(TAG, "load(): Engine.createConversation() returned")
+
             initializationDurationMs = (System.nanoTime() - startNs) / 1_000_000.0
             engine = e
             conversation = c
+            Log.i(
+                TAG,
+                "load(): SUCCESS, total init duration=${initializationDurationMs} ms"
+            )
             BackendResult.Ok(Unit)
         } catch (t: Throwable) {
-            Log.w(TAG, "LiteRT-LM engine load failed", t)
+            Log.e(TAG, "load(): LiteRT-LM engine load failed", t)
             // On partial success, make sure we don't leak a half-initialised
             // engine into the registry.
             closeQuietly()
@@ -131,11 +164,15 @@ class LiteRtLmBackend(
 
     override fun run(prompt: String): BackendResult<String> {
         val c = conversation
-            ?: return BackendResult.Err(
-                QuickAiError.NOT_INITIALIZED,
-                "LiteRT-LM backend has not been loaded yet"
-            )
+            ?: run {
+                Log.e(TAG, "run(): called before load() — conversation is null")
+                return BackendResult.Err(
+                    QuickAiError.NOT_INITIALIZED,
+                    "LiteRT-LM backend has not been loaded yet"
+                )
+            }
 
+        Log.i(TAG, "run(): sending prompt of length ${prompt.length}")
         return try {
             val startNs = System.nanoTime()
             // Blocking synchronous send; the ModelWorker thread that calls
@@ -145,9 +182,15 @@ class LiteRtLmBackend(
             // endpoints, which are blocking request/response).
             val message = c.sendMessage(prompt)
             lastRunDurationMs = (System.nanoTime() - startNs) / 1_000_000.0
-            BackendResult.Ok(message.toString())
+            val output = message.toString()
+            Log.i(
+                TAG,
+                "run(): sendMessage returned in ${lastRunDurationMs.toLong()} ms, " +
+                    "output length=${output.length}"
+            )
+            BackendResult.Ok(output)
         } catch (t: Throwable) {
-            Log.w(TAG, "LiteRT-LM sendMessage failed", t)
+            Log.e(TAG, "run(): LiteRT-LM sendMessage failed", t)
             BackendResult.Err(
                 QuickAiError.INFERENCE_FAILED,
                 t.message ?: "LiteRT-LM inference failed"
@@ -175,6 +218,7 @@ class LiteRtLmBackend(
     }
 
     override fun close() {
+        Log.i(TAG, "close() invoked")
         closeQuietly()
     }
 

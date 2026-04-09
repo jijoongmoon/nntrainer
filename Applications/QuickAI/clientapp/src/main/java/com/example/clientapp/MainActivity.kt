@@ -104,6 +104,10 @@ class MainActivity : AppCompatActivity() {
                 android.R.layout.simple_spinner_dropdown_item,
                 ModelId.values().map { it.name }
             )
+            // Default to GEMMA4 so the LiteRT-LM bring-up flow is a
+            // one-click Load. Choose QWEN3_0_6B explicitly for the
+            // native backend.
+            setSelection(ModelId.values().indexOf(ModelId.GEMMA4))
         }
         root.addView(modelSpinner)
 

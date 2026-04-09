@@ -49,27 +49,45 @@ class ModelRegistry(
      * started, and the load result is returned.
      */
     fun getOrLoad(req: LoadModelRequest): BackendResult<ModelWorker> {
-        workers[req.modelKey]?.let { return BackendResult.Ok(it) }
+        Log.i(TAG, "getOrLoad(${req.modelKey}) entered")
+        workers[req.modelKey]?.let {
+            Log.i(TAG, "getOrLoad(${req.modelKey}): cache hit, returning existing worker")
+            return BackendResult.Ok(it)
+        }
 
         synchronized(transitionLock) {
             // Double-check after acquiring the lock to avoid creating two
             // workers in a load/load race.
-            workers[req.modelKey]?.let { return BackendResult.Ok(it) }
+            workers[req.modelKey]?.let {
+                Log.i(TAG, "getOrLoad(${req.modelKey}): cache hit after lock")
+                return BackendResult.Ok(it)
+            }
 
             val backend = createBackendFor(req)
+            Log.i(
+                TAG,
+                "getOrLoad(${req.modelKey}): created backend " +
+                    "${backend::class.java.simpleName} (kind=${backend.kind})"
+            )
             val worker = ModelWorker(
                 modelId = req.modelKey,
                 loadRequest = req,
                 backend = backend
             )
+            Log.i(TAG, "getOrLoad(${req.modelKey}): starting worker and loading model…")
             val loadOutcome = worker.start()
             return when (loadOutcome) {
                 is BackendResult.Ok -> {
                     workers[req.modelKey] = worker
+                    Log.i(TAG, "getOrLoad(${req.modelKey}): LOAD SUCCESS")
                     BackendResult.Ok(worker)
                 }
                 is BackendResult.Err -> {
-                    Log.w(TAG, "Failed to load ${req.modelKey}: ${loadOutcome.error} ${loadOutcome.message}")
+                    Log.e(
+                        TAG,
+                        "getOrLoad(${req.modelKey}): LOAD FAILED — " +
+                            "error=${loadOutcome.error} message=${loadOutcome.message}"
+                    )
                     worker.shutdown()
                     loadOutcome
                 }
