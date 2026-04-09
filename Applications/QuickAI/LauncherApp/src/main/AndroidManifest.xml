@@ -24,6 +24,19 @@
         android:theme="@style/Theme.QuickAI">
 
         <!--
+          LiteRT-LM GPU backend needs access to these Android system native
+          libraries. Marked required="false" so the app still installs on
+          devices that do not expose them — the LiteRtLmBackend falls back
+          to CPU in that case. See how-to-use-litert-lm-guide.md §2.
+        -->
+        <uses-native-library
+            android:name="libvndksupport.so"
+            android:required="false"/>
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false"/>
+
+        <!--
           QuickAIService runs in a dedicated ":remote" process and is
           exported=true so the single service instance can be started /
           hosted by LauncherApp and then contacted by arbitrary ClientApps

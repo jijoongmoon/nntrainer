@@ -42,7 +42,12 @@ data class SetOptionsResponse(
 data class LoadModelRequest(
     val backend: BackendType = BackendType.CPU,
     val model: ModelId,
-    val quantization: QuantizationType = QuantizationType.W4A32
+    val quantization: QuantizationType = QuantizationType.W4A32,
+    /**
+     * Absolute path to the on-device model asset. Required for Gemma4
+     * (LiteRT-LM); ignored for native causal_lm_api models.
+     */
+    @SerialName("model_path") val modelPath: String? = null
 )
 
 @Serializable

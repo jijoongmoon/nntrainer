@@ -100,7 +100,14 @@ data class SetOptionsResponse(
 data class LoadModelRequest(
     val backend: BackendType = BackendType.CPU,
     val model: ModelId,
-    val quantization: QuantizationType = QuantizationType.W4A32
+    val quantization: QuantizationType = QuantizationType.W4A32,
+    /**
+     * Absolute path to the on-device model asset. Required for the
+     * LiteRT-LM backend (Gemma4) which takes an explicit `.litertlm` file
+     * path. Optional (ignored) for the native causal_lm_api backend, which
+     * performs its own model-directory discovery.
+     */
+    @SerialName("model_path") val modelPath: String? = null
 ) {
     /** Canonical key used by ModelRegistry — one worker per key. */
     val modelKey: String get() = "${model.name}:${quantization.name}"

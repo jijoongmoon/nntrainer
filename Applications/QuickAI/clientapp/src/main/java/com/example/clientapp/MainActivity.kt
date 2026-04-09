@@ -39,6 +39,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var modelSpinner: Spinner
     private lateinit var quantSpinner: Spinner
+    private lateinit var modelPathField: EditText
     private lateinit var promptField: EditText
     private lateinit var outputView: TextView
     private lateinit var statusView: TextView
@@ -80,6 +81,12 @@ class MainActivity : AppCompatActivity() {
             )
         }
         root.addView(quantSpinner)
+
+        modelPathField = EditText(this).apply {
+            hint = "Model path (required for GEMMA4 / LiteRT-LM)"
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+        }
+        root.addView(modelPathField)
 
         val loadBtn = Button(this).apply {
             text = "Load model"
@@ -129,10 +136,15 @@ class MainActivity : AppCompatActivity() {
     private fun onLoadClicked() {
         val model = ModelId.valueOf(modelSpinner.selectedItem as String)
         val quant = QuantizationType.valueOf(quantSpinner.selectedItem as String)
+        val modelPath = modelPathField.text.toString().trim().ifEmpty { null }
         statusView.text = "Loading $model [$quant]…"
         lifecycleScope.launch {
             val result = client.loadModel(
-                LoadModelRequest(model = model, quantization = quant)
+                LoadModelRequest(
+                    model = model,
+                    quantization = quant,
+                    modelPath = modelPath
+                )
             )
             statusView.text = when (result) {
                 is ApiResult.Ok ->

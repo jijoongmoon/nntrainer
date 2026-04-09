@@ -186,11 +186,15 @@ Two implementations:
 - **`LiteRtLmBackend`** (`service/backend/LiteRtLmBackend.kt`)
   Used only when `model == GEMMA4`. Routing happens at the Kotlin level in
   `ModelRegistry`, before a `ModelWorker` is created — so we never touch JNI
-  for Gemma4. Internally delegates to the official LiteRT-LM Kotlin API
-  (https://github.com/google-ai-edge/LiteRT-LM). First iteration is a **stub**
-  that returns `ErrorCode.UNSUPPORTED` until the LiteRT-LM artifact is
-  integrated, but the control flow is wired end-to-end so only the backend
-  class body changes later.
+  for Gemma4. Delegates to the official LiteRT-LM Kotlin API via the Maven
+  artifact `com.google.ai.edge.litertlm:litertlm-android`. On `load` it
+  creates an `Engine` + `Conversation`, keeps them open for the ModelWorker's
+  lifetime, and closes them in `close()`. Since LiteRT-LM requires an
+  explicit `.litertlm` file path, Gemma4 `loadModel` requests **must**
+  include a non-empty `model_path` field in the JSON body — otherwise the
+  backend returns `INVALID_PARAMETER`. See
+  [how-to-use-litert-lm-guide.md](../../how-to-use-litert-lm-guide.md) at
+  the repo root for the Kotlin API surface we target.
 
 ### 2.8 `JNIBridge`
 - **Files:**
@@ -200,9 +204,15 @@ Two implementations:
 - A thin C++ shim that forwards JNI calls directly to the new handle-based
   `causal_lm_api` functions. No business logic — purely data marshalling
   (`jstring ↔ const char*`, struct → Kotlin data class).
-- Loads `libcausallm_api.so` at startup via `System.loadLibrary("causallm_api")`.
-  The `.so` is shipped under `LauncherApp/src/main/jniLibs/arm64-v8a/` and
-  produced by the existing `Applications/CausalLM/build_api_lib.sh`.
+- Loads `libcausallm_api.so` at startup via
+  `System.loadLibrary("causallm_api")` (plus its transitive dependencies
+  `libnntrainer.so`, `libccapi-nntrainer.so`, `libcausallm_core.so`,
+  `libc++_shared.so`). These prebuilt `.so` files are checked into git at
+  `Applications/QuickAI/prebuilt_libs/` and a Gradle copy task in
+  `LauncherApp/build.gradle.kts` stages them into `build/generated/jniLibs/
+  arm64-v8a/` so Android Gradle's standard `jniLibs` pipeline picks them up
+  at packaging time. Regenerate them with
+  `Applications/CausalLM/build_api_lib.sh`.
 
 ### 2.9 `ClientApp`
 - **Files:**
@@ -325,18 +335,22 @@ Cleartext localhost is enabled via `res/xml/network_security_config.xml`
 
 ## 7. Build & Packaging
 
-- **Native library:** `libcausallm_api.so` is produced out-of-tree by
-  `Applications/CausalLM/build_api_lib.sh` (existing). We copy the artifacts
-  into `LauncherApp/src/main/jniLibs/arm64-v8a/`:
-  - `libcausallm_api.so`
-  - `libcausallm_core.so`
-  - `libnntrainer.so`
-  - `libccapi-nntrainer.so`
+- **Native library:** `libcausallm_api.so` (plus transitive deps
+  `libcausallm_core.so`, `libnntrainer.so`, `libccapi-nntrainer.so`,
+  `libc++_shared.so`) is produced out-of-tree by
+  `Applications/CausalLM/build_api_lib.sh` and the resulting artifacts are
+  committed to `Applications/QuickAI/prebuilt_libs/` so consumers do not
+  have to rebuild the engine themselves. A Gradle `Copy` task
+  (`copyPrebuiltNativeLibs` in `LauncherApp/build.gradle.kts`) stages them
+  into `build/generated/jniLibs/arm64-v8a/` which is wired into
+  `android.sourceSets.main.jniLibs.srcDirs`, so Android Gradle packages
+  them into the APK through the standard `jniLibs` pipeline.
 - **JNI shim:** built via Android Gradle's CMake integration from
   `LauncherApp/src/main/cpp/CMakeLists.txt`. Produces `libquickai_jni.so`
-  which dlopens `libcausallm_api.so`.
+  which links against `libcausallm_api.so` from the prebuilt_libs folder
+  above.
 - **Kotlin deps (LauncherApp):** NanoHTTPD, kotlinx-serialization-json,
-  kotlinx-coroutines-core, androidx-lifecycle-service.
+  kotlinx-coroutines-android, `com.google.ai.edge.litertlm:litertlm-android`.
 - **Kotlin deps (clientapp):** OkHttp, kotlinx-serialization-json,
   kotlinx-coroutines-android.
 
@@ -345,14 +359,18 @@ Cleartext localhost is enabled via `res/xml/network_security_config.xml`
 ```
 Applications/QuickAI/
 ├── Architecture.md                        (this file)
+├── prebuilt_libs/                         (checked-in .so artifacts)
+│   ├── libcausallm_api.so
+│   ├── libcausallm_core.so
+│   ├── libnntrainer.so
+│   ├── libccapi-nntrainer.so
+│   └── libc++_shared.so
 ├── LauncherApp/
 │   └── src/main/
 │       ├── AndroidManifest.xml            (permissions + :remote service)
 │       ├── cpp/
 │       │   ├── CMakeLists.txt
 │       │   └── quickai_jni.cpp
-│       ├── jniLibs/arm64-v8a/
-│       │   └── libcausallm_api.so         (copied post-build)
 │       ├── res/xml/network_security_config.xml
 │       └── java/com/example/QuickAI/
 │           ├── LauncherApp.kt             (boots service)
@@ -393,16 +411,20 @@ Applications/CausalLM/api/
 9. **Manifests + permissions + network_security_config**.
 10. **Gradle wiring** (NanoHTTPD, serialization, externalNativeBuild).
 11. **ClientApp REST client + test UI**.
-12. (Later) LiteRT-LM artifact integration for Gemma4.
+12. **LiteRT-LM artifact integration** via
+    `com.google.ai.edge.litertlm:litertlm-android` (done).
 
 ## 10. Open items
 
-- **LiteRT-LM artifact coordinates** are not yet public as a Maven artifact;
-  we leave the backend as a clearly marked stub until we decide between
-  vendoring the AAR locally or pulling from a private repo.
-- **Model assets** (`./models/qwen3-0.6b-w4a32/...`) must be present on the
-  device. The service resolves paths relative to its working directory; we
-  will expose `GET /v1/models/available` later to advertise which models are
-  actually installed.
-- **Streaming output** (token-by-token SSE) is out of scope for iteration 1.
+- **Model assets** (`./models/qwen3-0.6b-w4a32/...`,
+  `/sdcard/Download/gemma4.litertlm`, …) must be present on the device. The
+  native backend resolves paths relative to its working directory, and the
+  LiteRT-LM backend takes the path verbatim from `LoadModelRequest.model_path`.
+  A future `GET /v1/models/available` endpoint can advertise which assets
+  are installed.
+- **LiteRT-LM NPU backend** currently falls back to CPU because it needs a
+  `Context` to locate `applicationInfo.nativeLibraryDir`. Plumbing a
+  `Context` into `LiteRtLmBackend` via `ModelRegistry` is a small follow-up.
+- **Streaming output** (token-by-token SSE / LiteRT-LM
+  `sendMessageAsync(...).collect { ... }`) is out of scope for iteration 1.
   The REST endpoints are blocking request/response.
