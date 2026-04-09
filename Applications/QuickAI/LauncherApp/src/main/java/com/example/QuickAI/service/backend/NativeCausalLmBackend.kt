@@ -120,6 +120,69 @@ class NativeCausalLmBackend : Backend {
         }
     }
 
+    /**
+     * @brief Streaming override that forwards deltas from the native
+     * `runModelHandleStreaming` entry point into [sink].
+     *
+     * Replaces the default single-delta implementation inherited from
+     * [Backend] so Qwen3-family models get the same token-by-token UX
+     * as Gemma4 over LiteRT-LM. See AsyncAndStreaming.md §5.1 at the
+     * repo root.
+     *
+     * Threading: this method runs on the ModelWorker thread; the
+     * native callback is invoked synchronously on the same thread for
+     * every delta, so no JNI AttachCurrentThread is needed. Terminal
+     * events (onDone / onError) are synthesized from the native
+     * return value because the C API reports completion through its
+     * return code rather than through the streamer vtable.
+     */
+    override fun runStreaming(
+        prompt: String,
+        sink: StreamSink
+    ): BackendResult<Unit> {
+        if (!loaded || handle == 0L) {
+            Log.e(TAG, "runStreaming(): called before load()")
+            val err = BackendResult.Err(
+                QuickAiError.NOT_INITIALIZED,
+                "native backend has not been loaded yet"
+            )
+            sink.onError(err.error, err.message)
+            return err
+        }
+
+        Log.i(TAG, "runStreaming(): prompt length=${prompt.length}")
+        return try {
+            val errorCode = NativeCausalLm.runModelHandleStreamingNative(
+                handle,
+                prompt
+            ) { delta ->
+                // Called on the ModelWorker thread (this one).
+                // Forward straight to the sink; ChunkedStreamSink
+                // hands off to its internal queue, so this is a
+                // bounded-time operation.
+                sink.onDelta(delta)
+            }
+            if (errorCode != 0) {
+                val err = QuickAiError.fromNativeCode(errorCode)
+                Log.e(
+                    TAG,
+                    "runStreaming(): runModelHandleStreaming failed " +
+                        "errorCode=$errorCode (${err.name})"
+                )
+                sink.onError(err, "runModelHandleStreaming failed (errorCode=$errorCode)")
+                BackendResult.Err(err, "runModelHandleStreaming failed (errorCode=$errorCode)")
+            } else {
+                Log.i(TAG, "runStreaming(): native runner returned NONE, signalling onDone")
+                sink.onDone()
+                BackendResult.Ok(Unit)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "runStreaming(): runModelHandleStreamingNative threw", t)
+            sink.onError(QuickAiError.INFERENCE_FAILED, t.message)
+            BackendResult.Err(QuickAiError.INFERENCE_FAILED, t.message)
+        }
+    }
+
     override fun metrics(): BackendResult<PerformanceMetrics> {
         if (!loaded || handle == 0L) {
             return BackendResult.Err(QuickAiError.NOT_INITIALIZED)

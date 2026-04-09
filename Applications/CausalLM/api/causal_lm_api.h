@@ -18,6 +18,9 @@
 #define WIN_EXPORT
 #endif
 
+#include "callback_streamer.h"
+#include "streamer.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -200,6 +203,43 @@ getPerformanceMetricsHandle(CausalLmHandle handle, PerformanceMetrics *metrics);
  * @return ErrorCode
  */
 WIN_EXPORT ErrorCode destroyModelHandle(CausalLmHandle handle);
+
+/**
+ * @brief Streaming counterpart of runModelHandle.
+ *
+ * Synchronously drives inference on @p handle and invokes @p callback
+ * once per decoded-token boundary with a UTF-8 delta string. The call
+ * blocks on the invoking thread until generation finishes, hits an EOS
+ * token, reaches NUM_TO_GENERATE, the callback returns non-zero (which
+ * requests cancellation at the next token boundary), or an error
+ * occurs.
+ *
+ * The @p delta pointer passed into the callback is owned by the
+ * streaming runtime and is only valid for the duration of the callback
+ * invocation. Callers that need to retain the text must copy it.
+ *
+ * After a successful return the handle's "last output" buffer holds
+ * the full concatenated generation (or the partial output on a
+ * cancelled run), so a subsequent getPerformanceMetricsHandle() call
+ * returns valid metrics and the same handle can be reused for another
+ * run — identical semantics to runModelHandle.
+ *
+ * Streaming is currently only supported on models whose underlying
+ * C++ implementation derives from causallm::CausalLM (all the Qwen
+ * variants and Llama do; non-CausalLM models return
+ * CAUSAL_LM_ERROR_UNKNOWN). See AsyncAndStreaming.md §3.4 at the repo
+ * root for the full design.
+ *
+ * @param handle          Handle returned by loadModelHandle.
+ * @param inputTextPrompt Input prompt (UTF-8, NUL-terminated).
+ * @param callback        Token delta callback. Must be non-NULL.
+ * @param user_data       Opaque pointer forwarded verbatim to the
+ *                        callback on every invocation. May be NULL.
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode
+runModelHandleStreaming(CausalLmHandle handle, const char *inputTextPrompt,
+                        CausalLmTokenCallback callback, void *user_data);
 
 #ifdef __cplusplus
 }

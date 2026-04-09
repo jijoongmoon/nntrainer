@@ -112,7 +112,9 @@ LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__F
 
 LOCAL_SRC_FILES := \
     ../api/causal_lm_api.cpp \
-    ../api/model_config.cpp
+    ../api/model_config.cpp \
+    ../api/streamer.cpp \
+    ../api/callback_streamer.cpp
 
 LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c

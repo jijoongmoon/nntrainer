@@ -697,6 +697,70 @@ ErrorCode getPerformanceMetricsHandle(CausalLmHandle handle,
   return metrics_on_handle(*handle, metrics);
 }
 
+ErrorCode runModelHandleStreaming(CausalLmHandle handle,
+                                  const char *inputTextPrompt,
+                                  CausalLmTokenCallback callback,
+                                  void *user_data) {
+  if (handle == nullptr || inputTextPrompt == nullptr || callback == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  auto &h = *handle;
+  std::lock_guard<std::mutex> lock(h.mtx);
+  if (!h.initialized || !h.model) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+
+  // Streaming is only wired up for causallm::CausalLM subclasses (the
+  // setStreamer / registerOutputs hook lives on that class). If the
+  // loaded model is something else (e.g. a future sentence-transformer
+  // style model) the caller should fall back to runModelHandle().
+  auto *causal = dynamic_cast<causallm::CausalLM *>(h.model.get());
+  if (causal == nullptr) {
+    return CAUSAL_LM_ERROR_UNKNOWN;
+  }
+
+  CallbackStreamer streamer;
+  callback_streamer_init(&streamer, callback, user_data);
+  // Safe upcast: CallbackStreamer embeds BaseStreamer as its first
+  // field (C-style inheritance), so &streamer.base yields a valid
+  // BaseStreamer pointer without reinterpret_cast.
+  causal->setStreamer(&streamer.base);
+
+  // RAII detach: make sure the dangling stack pointer never survives
+  // the return of this function, no matter which exception path we
+  // exit through.
+  struct Detach {
+    causallm::CausalLM *c;
+    ~Detach() { c->setStreamer(nullptr); }
+  } detach_guard{causal};
+
+  try {
+    std::string input(inputTextPrompt);
+    if (g_use_chat_template) {
+      input = apply_chat_template(h.architecture, input);
+    }
+
+#if defined(_WIN32)
+    h.model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
+                 g_verbose);
+#else
+    h.model->run(input, false, "", "", g_verbose);
+#endif
+
+    h.last_output = causal->getOutput(0);
+  } catch (const std::exception &e) {
+    std::cerr << "Exception in runModelHandleStreaming: " << e.what()
+              << std::endl;
+    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+  } catch (...) {
+    std::cerr << "Unknown exception in runModelHandleStreaming" << std::endl;
+    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
 ErrorCode destroyModelHandle(CausalLmHandle handle) {
   if (handle == nullptr) {
     return CAUSAL_LM_ERROR_NONE;

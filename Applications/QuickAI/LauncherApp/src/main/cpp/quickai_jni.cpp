@@ -188,3 +188,87 @@ Java_com_example_QuickAI_service_NativeCausalLm_destroyModelHandleNative(
   auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
   return static_cast<jint>(destroyModelHandle(handle));
 }
+
+// ---------------------------------------------------------------------------
+// runModelHandleStreaming
+//
+// Forwards deltas from the native causal_lm_api streaming callback to a
+// Kotlin NativeStreamListener.onDelta(String). See AsyncAndStreaming.md §4
+// at the repo root for the design rationale — in particular, the
+// callback fires on the SAME thread that invoked this JNI entry point
+// (the ModelWorker thread), which means we do NOT need AttachCurrentThread:
+// the JNIEnv* captured here is still valid throughout every callback.
+// ---------------------------------------------------------------------------
+namespace {
+struct StreamCtx {
+  JNIEnv *env;
+  jobject listener;   // local ref owned by the JNI entry frame
+  jmethodID onDelta;  // Ljava/lang/String;)V
+};
+
+int stream_trampoline(const char *delta, void *user_data) {
+  auto *ctx = static_cast<StreamCtx *>(user_data);
+  if (ctx == nullptr || ctx->env == nullptr || ctx->listener == nullptr ||
+      ctx->onDelta == nullptr) {
+    return 1; // cancel
+  }
+  jstring js = ctx->env->NewStringUTF(delta != nullptr ? delta : "");
+  if (js == nullptr) {
+    // OOM or pending exception; clear and ask the native runner to stop.
+    if (ctx->env->ExceptionCheck()) {
+      ctx->env->ExceptionClear();
+    }
+    return 1;
+  }
+  ctx->env->CallVoidMethod(ctx->listener, ctx->onDelta, js);
+  ctx->env->DeleteLocalRef(js);
+  if (ctx->env->ExceptionCheck()) {
+    // Surface Kotlin-side errors as cancellation; the Kotlin override
+    // in NativeCausalLmBackend.runStreaming will catch the exception
+    // on the JNI call's return and report it through StreamSink.onError.
+    ctx->env->ExceptionDescribe();
+    ctx->env->ExceptionClear();
+    return 1;
+  }
+  return 0;
+}
+} // namespace
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_QuickAI_service_NativeCausalLm_runModelHandleStreamingNative(
+  JNIEnv *env, jobject /*thiz*/, jlong handleJlong, jstring promptJ,
+  jobject listenerObj) {
+  if (promptJ == nullptr || listenerObj == nullptr) {
+    return static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER);
+  }
+
+  // Resolve the onDelta(String)V method id per-call. We can't cache
+  // this globally because NativeStreamListener is a `fun interface`
+  // and the concrete class of `listenerObj` varies call-to-call.
+  jclass listenerCls = env->GetObjectClass(listenerObj);
+  if (listenerCls == nullptr) {
+    return static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER);
+  }
+  jmethodID onDelta =
+    env->GetMethodID(listenerCls, "onDelta", "(Ljava/lang/String;)V");
+  env->DeleteLocalRef(listenerCls);
+  if (onDelta == nullptr) {
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+    }
+    return static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER);
+  }
+
+  const char *prompt = env->GetStringUTFChars(promptJ, nullptr);
+  if (prompt == nullptr) {
+    return static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER);
+  }
+
+  auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
+  StreamCtx ctx{env, listenerObj, onDelta};
+  ErrorCode ec =
+    runModelHandleStreaming(handle, prompt, &stream_trampoline, &ctx);
+
+  env->ReleaseStringUTFChars(promptJ, prompt);
+  return static_cast<jint>(ec);
+}

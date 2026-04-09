@@ -38,6 +38,14 @@
 #include <causal_lm.h>
 #include <llm_util.hpp>
 
+// Streamer vtable lives in the api/ directory; pulled in here so
+// registerOutputs() can push per-token deltas through streamer_put()
+// without the rest of the model headers having to know about the C API.
+// The include path is rooted at Applications/CausalLM (see the
+// CAUSALLM_COMMON_INCLUDES list in jni/Android.mk and the
+// include_directories('.') in meson.build).
+#include "api/streamer.h"
+
 namespace causallm {
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
@@ -153,6 +161,17 @@ void CausalLM::registerOutputs(
 #endif
         }
         output_list[b].append(decoded_str);
+
+        // If a streamer is attached, hand the just-completed delta to
+        // it. A non-zero return is interpreted as "please cancel",
+        // and the outer run() loop will honor it at the next token
+        // boundary. See AsyncAndStreaming.md §3.3.
+        if (streamer_ != nullptr) {
+          if (streamer_put(streamer_, decoded_str.c_str()) != 0) {
+            stop_requested_ = true;
+          }
+        }
+
         pending_ids_.clear();
       }
     }
@@ -295,6 +314,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
 
   has_run_ = false;
+
+  // Always start with a clean cancellation state — the streamer (if
+  // any) may have flipped this flag on a previous run that was
+  // cancelled, and we don't want stale state to break an unrelated
+  // subsequent run().
+  stop_requested_ = false;
 
   output_list.clear();
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
@@ -532,6 +557,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       free(input_sample);
       break;
     }
+
+    // Cooperative cancellation: a streamer may have asked us to stop
+    // via its put() return value. We check once per generated token so
+    // worst-case latency is a single decode step. When cancelled we
+    // still free the input buffer (the normal EOS path above does the
+    // same), exit the loop, and let the rest of run() record metrics
+    // for however many tokens we actually produced.
+    if (stop_requested_) {
+      free(input_sample);
+      break;
+    }
   }
 
   global_token_len += (generation_cnt + init_len);
@@ -569,6 +605,15 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   performance_metrics.generation_duration_ms = generation_duration.count();
   performance_metrics.total_duration_ms = total_duration.count();
   performance_metrics.peak_memory_kb = peak_memory;
+
+  // Notify any attached streamer that the run is fully terminated.
+  // Callers in causal_lm_api.cpp still detach the streamer after
+  // run() returns (via an RAII guard), but we fire end() first so
+  // concrete streamers can release per-run state from inside the
+  // vtable if they ever need to.
+  if (streamer_ != nullptr) {
+    streamer_end(streamer_);
+  }
 
   has_run_ = true;
 }

@@ -97,6 +97,41 @@ object NativeCausalLm {
         prompt: String
     ): RunResult
 
+    /**
+     * @brief Listener invoked by the JNI trampoline once per decoded
+     * delta during [runModelHandleStreamingNative].
+     *
+     * The method is called **on the same thread that invoked
+     * runModelHandleStreamingNative** — for QuickAI that is the
+     * ModelWorker thread — so implementations must be non-blocking
+     * (deltas arrive back-to-back at decode speed). See
+     * AsyncAndStreaming.md §4.1 at the repo root.
+     */
+    fun interface NativeStreamListener {
+        fun onDelta(text: String)
+    }
+
+    /**
+     * @brief Forwards to `runModelHandleStreaming` in causal_lm_api.h.
+     *
+     * Blocking: returns only when generation finishes, EOS is emitted,
+     * NUM_TO_GENERATE is reached, the listener throws, or an error
+     * occurs. [listener] is invoked synchronously from the same
+     * thread for every decoded delta; if it throws, the JNI bridge
+     * catches the exception, asks the native runner to cancel at the
+     * next token boundary, and propagates a non-zero ErrorCode back
+     * here. Terminal events (onDone / onError) are synthesized on the
+     * Kotlin side from the return value — see
+     * [com.example.QuickAI.service.backend.NativeCausalLmBackend.runStreaming].
+     *
+     * @return An `ErrorCode` int; 0 on clean completion.
+     */
+    external fun runModelHandleStreamingNative(
+        handle: Long,
+        prompt: String,
+        listener: NativeStreamListener
+    ): Int
+
     /** Forwards to `getPerformanceMetricsHandle` in causal_lm_api.h. */
     external fun getPerformanceMetricsHandleNative(handle: Long): MetricsResult
 

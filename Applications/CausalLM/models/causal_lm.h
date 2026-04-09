@@ -41,6 +41,15 @@
 
 #include <transformer.h>
 
+// Forward-declare the C streamer type from api/streamer.h. We keep this
+// a bare forward declaration so causal_lm.h does not pull the API
+// header into the rest of the CausalLM models tree — the full
+// definition is only needed in causal_lm.cpp where the vtable is
+// actually invoked.
+extern "C" {
+struct BaseStreamer;
+}
+
 namespace causallm {
 
 /**
@@ -84,6 +93,24 @@ public:
    * @brief get the status of run
    */
   bool hasRun() const { return has_run_; }
+
+  /**
+   * @brief Attach (or detach) a BaseStreamer to intercept per-token
+   *        output during the next call to run().
+   *
+   * Passing @c nullptr detaches any currently-attached streamer.
+   *
+   * The streamer pointer is NOT owned by this class — the caller is
+   * responsible for keeping the storage alive for the full duration of
+   * the run() call and for detaching before the storage is destroyed.
+   *
+   * The high-level C API `runModelHandleStreaming` in
+   * causal_lm_api.{h,cpp} uses a stack-allocated CallbackStreamer and
+   * an RAII detach guard, which keeps this contract trivially safe.
+   * See AsyncAndStreaming.md §3.3 at the repo root for the full
+   * design.
+   */
+  void setStreamer(::BaseStreamer *streamer) { streamer_ = streamer; }
 
 protected:
   /**
@@ -153,6 +180,22 @@ protected:
   unsigned int global_token_len;
 
   bool has_run_ = false;
+
+  /**
+   * @brief Optional streamer that receives each decoded token as it is
+   *        produced during run(). Set via setStreamer(); nullptr means
+   *        "no streaming, behave exactly like the pre-streaming code
+   *        path". See AsyncAndStreaming.md §3.3.
+   */
+  ::BaseStreamer *streamer_ = nullptr;
+
+  /**
+   * @brief Cooperative cancellation flag set by registerOutputs() when
+   *        the attached streamer's put() returns non-zero. The token
+   *        generation loop in run() checks this once per iteration and
+   *        breaks out at the next safe boundary.
+   */
+  bool stop_requested_ = false;
 
   std::mt19937 rng; /**< Random Number Gen */
 };
