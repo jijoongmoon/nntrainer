@@ -98,7 +98,7 @@ data class SetOptionsResponse(
 
 @Serializable
 data class LoadModelRequest(
-    val backend: BackendType = BackendType.CPU,
+    val backend: BackendType = BackendType.GPU,
     val model: ModelId,
     val quantization: QuantizationType = QuantizationType.W4A32,
     /**
