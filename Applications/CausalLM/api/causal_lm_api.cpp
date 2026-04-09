@@ -322,7 +322,6 @@ ErrorCode registerModelArchitecture(const char *arch_name,
                                     ModelArchConfig config) {
   if (arch_name == nullptr)
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-  std::lock_guard<std::mutex> lock(g_mutex);
   std::string name(arch_name);
   std::transform(name.begin(), name.end(), name.begin(), ::toupper);
   g_arch_config_map[name] = config;
@@ -333,7 +332,6 @@ ErrorCode registerModel(const char *model_name, const char *arch_name,
                         ModelRuntimeConfig config) {
   if (model_name == nullptr || arch_name == nullptr)
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-  std::lock_guard<std::mutex> lock(g_mutex);
   std::string name(model_name);
   std::transform(name.begin(), name.end(), name.begin(), ::toupper);
 
