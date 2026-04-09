@@ -3,8 +3,9 @@
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
  * @file    quickai_jni.cpp
- * @brief   JNI shim that forwards calls from Kotlin's NativeCausalLm to
- *          the handle-based C entry points declared in
+ * @brief   JNI shim that forwards calls from Kotlin's
+ *          com.example.quickdotai.NativeCausalLm object to the
+ *          handle-based C entry points declared in
  *          Applications/CausalLM/api/causal_lm_api.h.
  *
  * This file contains no business logic — only JNI marshalling:
@@ -13,7 +14,10 @@
  *   ErrorCode +  struct PerformanceMetrics -> Kotlin data classes.
  *
  * Higher-level concerns (per-model threading, FIFO queue, Gemma4
- * routing) live in Kotlin (ModelWorker / ModelRegistry).
+ * routing) live one level up in NativeQuickDotAI.kt and in the host
+ * app's worker (for QuickAIService that is ModelWorker / ModelRegistry;
+ * SampleTestAPP drives NativeQuickDotAI directly from its own
+ * background dispatcher).
  */
 
 #include <android/log.h>
@@ -67,21 +71,21 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
   }
 
   g_cache.loadResultCls =
-    find_global(env, "com/example/QuickAI/service/NativeCausalLm$LoadResult");
+    find_global(env, "com/example/quickdotai/NativeCausalLm$LoadResult");
   if (g_cache.loadResultCls != nullptr) {
     g_cache.loadResultCtor =
       env->GetMethodID(g_cache.loadResultCls, "<init>", "(IJ)V");
   }
 
   g_cache.runResultCls =
-    find_global(env, "com/example/QuickAI/service/NativeCausalLm$RunResult");
+    find_global(env, "com/example/quickdotai/NativeCausalLm$RunResult");
   if (g_cache.runResultCls != nullptr) {
     g_cache.runResultCtor = env->GetMethodID(
       g_cache.runResultCls, "<init>", "(ILjava/lang/String;)V");
   }
 
   g_cache.metricsResultCls = find_global(
-    env, "com/example/QuickAI/service/NativeCausalLm$MetricsResult");
+    env, "com/example/quickdotai/NativeCausalLm$MetricsResult");
   if (g_cache.metricsResultCls != nullptr) {
     g_cache.metricsResultCtor = env->GetMethodID(
       g_cache.metricsResultCls, "<init>", "(IIDIDDDJ)V");
@@ -94,7 +98,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
 // setOptions
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jint JNICALL
-Java_com_example_QuickAI_service_NativeCausalLm_setOptionsNative(
+Java_com_example_quickdotai_NativeCausalLm_setOptionsNative(
   JNIEnv * /*env*/, jobject /*thiz*/, jboolean useChatTemplate,
   jboolean debugMode, jboolean verbose) {
   Config cfg;
@@ -108,7 +112,7 @@ Java_com_example_QuickAI_service_NativeCausalLm_setOptionsNative(
 // loadModelHandle
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jobject JNICALL
-Java_com_example_QuickAI_service_NativeCausalLm_loadModelHandleNative(
+Java_com_example_quickdotai_NativeCausalLm_loadModelHandleNative(
   JNIEnv *env, jobject /*thiz*/, jint backendOrdinal, jint modelOrdinal,
   jint quantOrdinal) {
   CausalLmHandle handle = nullptr;
@@ -129,7 +133,7 @@ Java_com_example_QuickAI_service_NativeCausalLm_loadModelHandleNative(
 // runModelHandle
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jobject JNICALL
-Java_com_example_QuickAI_service_NativeCausalLm_runModelHandleNative(
+Java_com_example_quickdotai_NativeCausalLm_runModelHandleNative(
   JNIEnv *env, jobject /*thiz*/, jlong handleJlong, jstring promptJ) {
   auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
 
@@ -158,7 +162,7 @@ Java_com_example_QuickAI_service_NativeCausalLm_runModelHandleNative(
 // getPerformanceMetricsHandle
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jobject JNICALL
-Java_com_example_QuickAI_service_NativeCausalLm_getPerformanceMetricsHandleNative(
+Java_com_example_quickdotai_NativeCausalLm_getPerformanceMetricsHandleNative(
   JNIEnv *env, jobject /*thiz*/, jlong handleJlong) {
   auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
 
@@ -183,7 +187,7 @@ Java_com_example_QuickAI_service_NativeCausalLm_getPerformanceMetricsHandleNativ
 // destroyModelHandle
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jint JNICALL
-Java_com_example_QuickAI_service_NativeCausalLm_destroyModelHandleNative(
+Java_com_example_quickdotai_NativeCausalLm_destroyModelHandleNative(
   JNIEnv * /*env*/, jobject /*thiz*/, jlong handleJlong) {
   auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
   return static_cast<jint>(destroyModelHandle(handle));
@@ -224,8 +228,8 @@ int stream_trampoline(const char *delta, void *user_data) {
   ctx->env->DeleteLocalRef(js);
   if (ctx->env->ExceptionCheck()) {
     // Surface Kotlin-side errors as cancellation; the Kotlin override
-    // in NativeCausalLmBackend.runStreaming will catch the exception
-    // on the JNI call's return and report it through StreamSink.onError.
+    // in NativeQuickDotAI.runStreaming will catch the exception on the
+    // JNI call's return and report it through StreamSink.onError.
     ctx->env->ExceptionDescribe();
     ctx->env->ExceptionClear();
     return 1;
@@ -235,7 +239,7 @@ int stream_trampoline(const char *delta, void *user_data) {
 } // namespace
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_example_QuickAI_service_NativeCausalLm_runModelHandleStreamingNative(
+Java_com_example_quickdotai_NativeCausalLm_runModelHandleStreamingNative(
   JNIEnv *env, jobject /*thiz*/, jlong handleJlong, jstring promptJ,
   jobject listenerObj) {
   if (promptJ == nullptr || listenerObj == nullptr) {

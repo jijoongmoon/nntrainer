@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
 #
-# QuickAI JNI shim build
+# QuickDotAI JNI shim build
 #
 # Produces libquickai_jni.so, which forwards JNI calls from Kotlin
-# (NativeCausalLm.kt) to the C entry points in Applications/CausalLM/api/
-# causal_lm_api.h. The causal_lm_api.so itself (plus its transitive
-# dependencies libnntrainer.so, libccapi-nntrainer.so, libcausallm_core.so,
-# libc++_shared.so) is shipped as a set of prebuilt shared libraries in
-# Applications/QuickAI/prebuilt_libs/ — see build_api_lib.sh in
-# Applications/CausalLM to regenerate them. A Gradle copy task in
-# LauncherApp/build.gradle.kts copies those files into the APK's jniLibs
-# at build time, so they are discoverable at runtime via System.loadLibrary.
+# (com.example.quickdotai.NativeCausalLm) to the C entry points in
+# Applications/CausalLM/api/causal_lm_api.h. The causal_lm_api.so itself
+# (plus its transitive dependencies libnntrainer.so, libccapi-nntrainer.so,
+# libcausallm_core.so, libc++_shared.so) is shipped as a set of prebuilt
+# shared libraries in Applications/QuickAI/prebuilt_libs/ — see
+# build_api_lib.sh in Applications/CausalLM to regenerate them. A Gradle
+# copy task in QuickDotAI/build.gradle.kts copies those files into the
+# AAR's jniLibs/arm64-v8a at build time, so they are discoverable at
+# runtime via System.loadLibrary from whichever app hosts the AAR.
 cmake_minimum_required(VERSION 3.22.1)
 project(quickai_jni LANGUAGES CXX)
 
@@ -19,7 +20,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Path to the CausalLM headers so we can #include "causal_lm_api.h".
-# CMAKE_CURRENT_SOURCE_DIR == LauncherApp/src/main/cpp, so five levels up
+# CMAKE_CURRENT_SOURCE_DIR == QuickDotAI/src/main/cpp, so five levels up
 # lands at Applications/, and then /CausalLM/api points at the headers.
 set(CAUSALLM_API_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../CausalLM/api")

@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.QuickAI"
+    namespace = "com.example.sampletestapp"
     compileSdk {
         version = release(36) {
             minorApiLevel = 1
@@ -12,7 +12,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.QuickAI"
+        applicationId = "com.example.sampletestapp"
         minSdk = 33
         targetSdk = 36
         versionCode = 1
@@ -21,9 +21,10 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            // The QuickDotAI AAR dependency bundles arm64-v8a prebuilt
-            // .so files; restrict the host APK to the matching ABI so we
-            // don't generate empty ABI slices for armv7 / x86_64.
+            // SampleTestAPP hosts the QuickDotAI AAR directly (no remote
+            // :remote process) so it packages the AAR's arm64-v8a
+            // jniLibs. Restrict to the matching ABI to avoid empty
+            // armv7/x86_64 slices.
             abiFilters += listOf("arm64-v8a")
         }
     }
@@ -44,24 +45,18 @@ android {
 }
 
 dependencies {
-    // The QuickDotAI interface + both implementations (LiteRTLm and
-    // NativeQuickDotAI) + libquickai_jni.so + the CausalLM prebuilt
-    // shared libraries all come from this module. LauncherApp contains
-    // only service / REST plumbing on top.
+    // The whole point of SampleTestAPP: depend on the :QuickDotAI AAR
+    // directly and drive LiteRTLm / NativeQuickDotAI in-process, without
+    // QuickAIService. The AAR re-exports kotlinx-serialization-json and
+    // the LiteRT-LM Kotlin runtime as `api` dependencies so we get them
+    // transitively.
     implementation(project(":QuickDotAI"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.activity)
     implementation(libs.material)
-
-    // REST server embedded inside QuickAIService.
-    implementation(libs.nanohttpd)
-
-    // JSON (wire format for the REST API).
-    implementation(libs.kotlinx.serialization.json)
-
-    // Coroutines for future async work (foreground service helpers).
+    implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.kotlinx.coroutines.android)
 
     testImplementation(libs.junit)

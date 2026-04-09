@@ -14,11 +14,11 @@
  * The two sides are decoupled by a LinkedBlockingQueue<ByteArray>, with an
  * empty ByteArray serving as the EOF sentinel. See Architecture.md §5.1.
  */
-package com.example.QuickAI.service.backend
+package com.example.QuickAI.service
 
 import android.util.Log
-import com.example.QuickAI.service.QuickAiError
-import com.example.QuickAI.service.StreamFrame
+import com.example.quickdotai.QuickAiError
+import com.example.quickdotai.StreamSink
 import java.io.InputStream
 import java.util.concurrent.LinkedBlockingQueue
 import kotlinx.serialization.encodeToString

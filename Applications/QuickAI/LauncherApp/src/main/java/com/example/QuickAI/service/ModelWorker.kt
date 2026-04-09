@@ -16,9 +16,9 @@
 package com.example.QuickAI.service
 
 import android.util.Log
-import com.example.QuickAI.service.backend.Backend
-import com.example.QuickAI.service.backend.BackendResult
-import com.example.QuickAI.service.backend.StreamSink
+import com.example.quickdotai.BackendResult
+import com.example.quickdotai.QuickDotAI
+import com.example.quickdotai.StreamSink
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -69,7 +69,7 @@ internal sealed class Job {
  * @brief Worker for a single loaded model.
  *
  * Lifecycle:
- *  1. Constructed with a pre-created (but not yet loaded) [Backend].
+ *  1. Constructed with a pre-created (but not yet loaded) [QuickDotAI].
  *  2. [start] kicks off the background thread and synchronously loads the
  *     model. Returns the load result.
  *  3. Clients call [submitRun] / [submitMetrics] which enqueue a job.
@@ -82,7 +82,7 @@ internal sealed class Job {
 class ModelWorker(
     val modelId: String,
     private val loadRequest: LoadModelRequest,
-    private val backend: Backend,
+    private val backend: QuickDotAI,
     private val capacity: Int = DEFAULT_CAPACITY
 ) {
     private val queue = LinkedBlockingQueue<Job>(capacity)

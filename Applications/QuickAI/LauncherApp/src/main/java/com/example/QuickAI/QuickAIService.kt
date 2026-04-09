@@ -31,7 +31,7 @@ import android.util.Log
 import com.example.QuickAI.service.DEFAULT_QUICKAI_PORT
 import com.example.QuickAI.service.HttpServer
 import com.example.QuickAI.service.ModelRegistry
-import com.example.QuickAI.service.NativeCausalLm
+import com.example.quickdotai.NativeCausalLm
 
 class QuickAIService : Service() {
 

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      QuickDotAI AAR manifest.
+
+      The library does not need any permissions of its own — consumers
+      grant whatever they need at the app level. The only Android system
+      libraries we hint at are the ones LiteRT-LM's GPU backend needs;
+      they are declared here with required="false" so they are merged
+      into every consumer manifest without breaking installs on devices
+      that do not expose them.
+    -->
+    <application>
+        <uses-native-library
+            android:name="libvndksupport.so"
+            android:required="false"/>
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false"/>
+    </application>
+
+</manifest>

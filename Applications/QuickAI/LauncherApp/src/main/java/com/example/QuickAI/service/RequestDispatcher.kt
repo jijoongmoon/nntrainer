@@ -11,8 +11,8 @@
 package com.example.QuickAI.service
 
 import android.util.Log
-import com.example.QuickAI.service.backend.BackendResult
-import com.example.QuickAI.service.backend.ChunkedStreamSink
+import com.example.quickdotai.BackendResult
+import com.example.quickdotai.NativeCausalLm
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit

@@ -18,10 +18,10 @@ package com.example.QuickAI.service
 
 import android.content.Context
 import android.util.Log
-import com.example.QuickAI.service.backend.Backend
-import com.example.QuickAI.service.backend.BackendResult
-import com.example.QuickAI.service.backend.LiteRtLmBackend
-import com.example.QuickAI.service.backend.NativeCausalLmBackend
+import com.example.quickdotai.BackendResult
+import com.example.quickdotai.LiteRTLm
+import com.example.quickdotai.NativeQuickDotAI
+import com.example.quickdotai.QuickDotAI
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -147,9 +147,9 @@ class ModelRegistry(
      * Architecture.md §4 — Gemma4 goes to LiteRT-LM, everything else to
      * the native engine.
      */
-    private fun createBackendFor(req: LoadModelRequest): Backend = when (req.model) {
-        ModelId.GEMMA4 -> LiteRtLmBackend(appContext)
-        else -> NativeCausalLmBackend()
+    private fun createBackendFor(req: LoadModelRequest): QuickDotAI = when (req.model) {
+        ModelId.GEMMA4 -> LiteRTLm(appContext)
+        else -> NativeQuickDotAI()
     }
 
     companion object {

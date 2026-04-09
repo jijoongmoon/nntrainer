@@ -2,28 +2,22 @@
 /*
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
- * @file    NativeCausalLmBackend.kt
- * @brief   Backend implementation that forwards to the handle-based
- *          causal_lm_api.h via JNI.
+ * @file    NativeQuickDotAI.kt
+ * @brief   QuickDotAI implementation backed by the handle-based
+ *          causal_lm_api.h (routed through libquickai_jni.so → JNI →
+ *          libcausallm_api.so).
  */
-package com.example.QuickAI.service.backend
+package com.example.quickdotai
 
 import android.util.Log
-import com.example.QuickAI.service.BackendType
-import com.example.QuickAI.service.LoadModelRequest
-import com.example.QuickAI.service.ModelId
-import com.example.QuickAI.service.NativeCausalLm
-import com.example.QuickAI.service.PerformanceMetrics
-import com.example.QuickAI.service.QuantizationType
-import com.example.QuickAI.service.QuickAiError
 
 /**
  * @brief Kotlin wrapper around a single `CausalLmHandle` in native code.
  *
- * Non-thread-safe by design — one ModelWorker owns one backend instance and
- * calls into it from one thread.
+ * Non-thread-safe by design — the host app must drive a single instance
+ * from a single worker thread.
  */
-class NativeCausalLmBackend : Backend {
+class NativeQuickDotAI : QuickDotAI {
 
     override val kind: String = "native"
 
@@ -57,7 +51,7 @@ class NativeCausalLmBackend : Backend {
                 Log.e(TAG, "load(): model ${req.model} has no native ordinal")
                 return BackendResult.Err(
                     QuickAiError.UNSUPPORTED,
-                    "Model ${req.model} is not supported by the native backend"
+                    "Model ${req.model} is not supported by NativeQuickDotAI"
                 )
             }
 
@@ -81,8 +75,8 @@ class NativeCausalLmBackend : Backend {
                 Log.e(
                     TAG,
                     "load(): loadModelHandle FAILED — errorCode=${result.errorCode} " +
-                        "(this is the NATIVE backend; for Gemma4 you want " +
-                        "LiteRtLmBackend — check that ModelId.GEMMA4 was requested)"
+                        "(this is the NATIVE engine; for Gemma4 you want LiteRTLm " +
+                        "— check that ModelId.GEMMA4 was NOT requested)"
                 )
                 BackendResult.Err(
                     QuickAiError.fromNativeCode(result.errorCode),
@@ -91,8 +85,8 @@ class NativeCausalLmBackend : Backend {
             } else {
                 handle = result.handle
                 loaded = true
-                // Architecture is resolved native-side; we report the model
-                // key until we add a dedicated native getter.
+                // Architecture is resolved native-side; we report the
+                // model key until we add a dedicated native getter.
                 architecture = req.model.name
                 Log.i(TAG, "load(): SUCCESS, handle=0x${handle.toString(16)}")
                 BackendResult.Ok(Unit)
@@ -124,17 +118,12 @@ class NativeCausalLmBackend : Backend {
      * @brief Streaming override that forwards deltas from the native
      * `runModelHandleStreaming` entry point into [sink].
      *
-     * Replaces the default single-delta implementation inherited from
-     * [Backend] so Qwen3-family models get the same token-by-token UX
-     * as Gemma4 over LiteRT-LM. See AsyncAndStreaming.md §5.1 at the
-     * repo root.
-     *
-     * Threading: this method runs on the ModelWorker thread; the
-     * native callback is invoked synchronously on the same thread for
-     * every delta, so no JNI AttachCurrentThread is needed. Terminal
-     * events (onDone / onError) are synthesized from the native
-     * return value because the C API reports completion through its
-     * return code rather than through the streamer vtable.
+     * Threading: this method runs on the caller thread; the native
+     * callback is invoked synchronously on the same thread for every
+     * delta, so no JNI AttachCurrentThread is needed. Terminal events
+     * (onDone / onError) are synthesized from the native return value
+     * because the C API reports completion through its return code
+     * rather than through the streamer vtable.
      */
     override fun runStreaming(
         prompt: String,
@@ -144,7 +133,7 @@ class NativeCausalLmBackend : Backend {
             Log.e(TAG, "runStreaming(): called before load()")
             val err = BackendResult.Err(
                 QuickAiError.NOT_INITIALIZED,
-                "native backend has not been loaded yet"
+                "NativeQuickDotAI has not been loaded yet"
             )
             sink.onError(err.error, err.message)
             return err
@@ -156,10 +145,9 @@ class NativeCausalLmBackend : Backend {
                 handle,
                 prompt
             ) { delta ->
-                // Called on the ModelWorker thread (this one).
-                // Forward straight to the sink; ChunkedStreamSink
-                // hands off to its internal queue, so this is a
-                // bounded-time operation.
+                // Called on the caller thread (this one). Forward
+                // straight to the sink — the contract is that sink
+                // implementations are non-blocking.
                 sink.onDelta(delta)
             }
             if (errorCode != 0) {
@@ -226,8 +214,9 @@ class NativeCausalLmBackend : Backend {
 
     /**
      * @brief Maps a ModelId to the C enum ordinal in causal_lm_api.h.
-     * Returns null for values that are Kotlin-only (e.g. GEMMA4) — those
-     * are never routed to this backend.
+     * Returns null for values that are Kotlin-only (e.g. GEMMA4) —
+     * those are routed to [LiteRTLm] instead and never reach this
+     * engine.
      */
     private fun mapModelId(m: ModelId): Int? = when (m) {
         ModelId.QWEN3_0_6B -> 0 // CAUSAL_LM_MODEL_QWEN3_0_6B
@@ -249,6 +238,6 @@ class NativeCausalLmBackend : Backend {
     }
 
     companion object {
-        private const val TAG = "NativeCausalLmBackend"
+        private const val TAG = "NativeQuickDotAI"
     }
 }

@@ -3,78 +3,30 @@
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
  * @file    Protocol.kt
- * @brief   Wire-level DTOs, enums and helpers shared between the HTTP
- *          server (inside QuickAIService) and any client.
+ * @brief   REST wire-level DTOs and helpers for QuickAIService.
  *
- * The enums mirror the C enums in causal_lm_api.h. Kotlin-only values like
- * GEMMA4 are additionally defined so the service can route those requests
- * to LiteRT-LM without ever crossing the JNI boundary.
+ * The fundamental value types (BackendType, ModelId, QuantizationType,
+ * QuickAiError, LoadModelRequest, PerformanceMetrics) live in the
+ * :QuickDotAI AAR so both the service and third-party apps can share
+ * them. This file only defines the REST-specific request/response DTOs
+ * and JSON-level helpers that are private to the HTTP layer.
  */
 package com.example.QuickAI.service
 
+import com.example.quickdotai.PerformanceMetrics
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
-/**
- * @brief Compute backend. Mirrors BackendType in causal_lm_api.h.
- */
-@Serializable
-enum class BackendType {
-    CPU,
-    GPU,
-    NPU
-}
-
-/**
- * @brief Model identifier.
- *
- * The first entries mirror the C enum `ModelType` in causal_lm_api.h.
- * GEMMA4 is a Kotlin-only value that triggers the LiteRT-LM code path
- * inside the service; it is never sent over JNI.
- */
-@Serializable
-enum class ModelId {
-    QWEN3_0_6B,
-    GEMMA4
-}
-
-/**
- * @brief Quantization type. Mirrors ModelQuantizationType in causal_lm_api.h.
- */
-@Serializable
-enum class QuantizationType {
-    UNKNOWN,
-    W4A32,
-    W16A16,
-    W8A16,
-    W32A32
-}
-
-/**
- * @brief Error code. Mirrors ErrorCode in causal_lm_api.h plus a few
- * Kotlin-level additions for transport errors.
- */
-@Serializable
-enum class QuickAiError(val code: Int) {
-    NONE(0),
-    INVALID_PARAMETER(1),
-    MODEL_LOAD_FAILED(2),
-    INFERENCE_FAILED(3),
-    NOT_INITIALIZED(4),
-    INFERENCE_NOT_RUN(5),
-    UNKNOWN(99),
-
-    // Kotlin-only
-    QUEUE_FULL(100),
-    MODEL_NOT_FOUND(101),
-    UNSUPPORTED(102),
-    BAD_REQUEST(103);
-
-    companion object {
-        fun fromNativeCode(code: Int): QuickAiError =
-            values().firstOrNull { it.code == code } ?: UNKNOWN
-    }
-}
+/* -------------------------------------------------------------------- */
+/* Re-export shared types from the QuickDotAI AAR so existing unqualified
+ * references inside com.example.QuickAI.service keep compiling without
+ * a pile of churn in every file.                                       */
+/* -------------------------------------------------------------------- */
+typealias BackendType = com.example.quickdotai.BackendType
+typealias ModelId = com.example.quickdotai.ModelId
+typealias QuantizationType = com.example.quickdotai.QuantizationType
+typealias QuickAiError = com.example.quickdotai.QuickAiError
+typealias LoadModelRequest = com.example.quickdotai.LoadModelRequest
 
 /* -------------------------------------------------------------------- */
 /* setOptions                                                           */
@@ -95,23 +47,6 @@ data class SetOptionsResponse(
 /* -------------------------------------------------------------------- */
 /* loadModel                                                            */
 /* -------------------------------------------------------------------- */
-
-@Serializable
-data class LoadModelRequest(
-    val backend: BackendType = BackendType.GPU,
-    val model: ModelId,
-    val quantization: QuantizationType = QuantizationType.W4A32,
-    /**
-     * Absolute path to the on-device model asset. Required for the
-     * LiteRT-LM backend (Gemma4) which takes an explicit `.litertlm` file
-     * path. Optional (ignored) for the native causal_lm_api backend, which
-     * performs its own model-directory discovery.
-     */
-    @SerialName("model_path") val modelPath: String? = null
-) {
-    /** Canonical key used by ModelRegistry — one worker per key. */
-    val modelKey: String get() = "${model.name}:${quantization.name}"
-}
 
 @Serializable
 data class LoadModelResponse(
@@ -166,17 +101,6 @@ data class StreamFrame(
 /* -------------------------------------------------------------------- */
 /* getPerformanceMetrics                                                */
 /* -------------------------------------------------------------------- */
-
-@Serializable
-data class PerformanceMetrics(
-    @SerialName("prefill_tokens") val prefillTokens: Int = 0,
-    @SerialName("prefill_duration_ms") val prefillDurationMs: Double = 0.0,
-    @SerialName("generation_tokens") val generationTokens: Int = 0,
-    @SerialName("generation_duration_ms") val generationDurationMs: Double = 0.0,
-    @SerialName("total_duration_ms") val totalDurationMs: Double = 0.0,
-    @SerialName("initialization_duration_ms") val initializationDurationMs: Double = 0.0,
-    @SerialName("peak_memory_kb") val peakMemoryKb: Long = 0
-)
 
 @Serializable
 data class PerformanceMetricsResponse(
