@@ -13,6 +13,30 @@ endif
 
 NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/builddir/android_build_result/include/nntrainer
 
+####################################################################
+# LiteRT-LM support (optional, enabled when LITERT_LM_ROOT is set)
+####################################################################
+ifdef LITERT_LM_ROOT
+ENABLE_LITERT_LM := 1
+
+ifndef LITERT_LM_BAZEL_BIN
+LITERT_LM_BAZEL_BIN := $(LITERT_LM_ROOT)/bazel-bin
+endif
+
+ifndef LITERT_LM_LIB_PATH
+LITERT_LM_LIB_PATH := $(LITERT_LM_BAZEL_BIN)/runtime/engine
+endif
+
+LITERT_LM_INCLUDES := \
+    $(NNTRAINER_ROOT)/nntrainer/litert \
+    $(LITERT_LM_ROOT) \
+    $(LITERT_LM_BAZEL_BIN) \
+    $(LITERT_LM_ROOT)/../LiteRT \
+    $(LITERT_LM_ROOT)/LiteRT \
+    $(LITERT_LM_ROOT)/bazel-LiteRT-LM/external/com_google_absl \
+    $(LITERT_LM_ROOT)/bazel-LiteRT-LM/external/com_google_protobuf/src
+endif
+
 # Common Includes Definition
 CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/.. \
@@ -25,7 +49,22 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
-    $(LOCAL_PATH)/../models/gemma3 
+    $(LOCAL_PATH)/../models/gemma3
+
+####################################################################
+# LiteRT-LM prebuilt libraries (when LITERT_LM_ROOT is set)
+####################################################################
+ifeq ($(ENABLE_LITERT_LM),1)
+include $(CLEAR_VARS)
+LOCAL_MODULE := litert_lm_all
+LOCAL_SRC_FILES := $(LITERT_LM_LIB_PATH)/liblitert_lm_all.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := absl_all
+LOCAL_SRC_FILES := $(LITERT_LM_LIB_PATH)/libabsl_all.a
+include $(PREBUILT_STATIC_LIBRARY)
+endif
 
 # Prebuilt nntrainer libraries
 include $(CLEAR_VARS)
@@ -119,6 +158,15 @@ LOCAL_STATIC_LIBRARIES := tokenizers_c
 
 LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES) \
     $(LOCAL_PATH)/../api
+
+# LiteRT-LM support
+ifeq ($(ENABLE_LITERT_LM),1)
+LOCAL_CXXFLAGS += -DENABLE_LITERT_LM
+LOCAL_C_INCLUDES += $(LITERT_LM_INCLUDES)
+LOCAL_SHARED_LIBRARIES += litert_lm_all
+LOCAL_STATIC_LIBRARIES += absl_all
+LOCAL_LDFLAGS += "-Wl,--allow-multiple-definition"
+endif
 
 include $(BUILD_SHARED_LIBRARY)
 
