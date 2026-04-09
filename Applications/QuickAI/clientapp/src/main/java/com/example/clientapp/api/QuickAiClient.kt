@@ -53,6 +53,9 @@ class QuickAiClient(
     suspend fun health(): ApiResult<HealthResponse> =
         get("/v1/health", HealthResponse.serializer())
 
+    suspend fun connect(): ApiResult<ConnectResponse> =
+        postEmpty("/v1/connect", ConnectResponse.serializer())
+
     suspend fun listModels(): ApiResult<ListModelsResponse> =
         get("/v1/models", ListModelsResponse.serializer())
 
@@ -95,6 +98,17 @@ class QuickAiClient(
         serializer: kotlinx.serialization.KSerializer<T>
     ): ApiResult<T> = withContext(Dispatchers.IO) {
         execute(Request.Builder().url(base + path).delete().build(), serializer)
+    }
+
+    private suspend fun <T> postEmpty(
+        path: String,
+        serializer: kotlinx.serialization.KSerializer<T>
+    ): ApiResult<T> = withContext(Dispatchers.IO) {
+        val body = "".toRequestBody("application/json".toMediaType())
+        execute(
+            Request.Builder().url(base + path).post(body).build(),
+            serializer
+        )
     }
 
     private suspend fun <Req, Res> postJson(

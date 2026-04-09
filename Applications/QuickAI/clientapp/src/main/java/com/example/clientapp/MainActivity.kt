@@ -81,6 +81,16 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(title)
 
+        // Explicit, user-initiated handshake. Distinct from the periodic
+        // health poll above: this hits POST /v1/connect and reports the
+        // result in statusView so the user can see exactly what happened
+        // without fighting the background polling loop.
+        val connectBtn = Button(this).apply {
+            text = "Connect"
+            setOnClickListener { onConnectClicked() }
+        }
+        root.addView(connectBtn)
+
         modelSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(
                 this@MainActivity,
@@ -169,6 +179,19 @@ class MainActivity : AppCompatActivity() {
             is ApiResult.Err -> {
                 connectionView.text = "● Disconnected — ${r.message}"
                 connectionView.setTextColor(COLOR_DISCONNECTED)
+            }
+        }
+    }
+
+    private fun onConnectClicked() {
+        statusView.text = "Connecting…"
+        lifecycleScope.launch {
+            when (val r = client.connect()) {
+                is ApiResult.Ok ->
+                    statusView.text =
+                        "Connected: ${r.value.message} (port ${r.value.port})"
+                is ApiResult.Err ->
+                    statusView.text = "Connect failed: [${r.errorCode}] ${r.message}"
             }
         }
     }

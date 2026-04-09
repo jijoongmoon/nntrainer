@@ -116,6 +116,11 @@ class HttpServer(
         if (method == NanoHTTPD.Method.GET && uri == "/v1/health") {
             return Request.Health
         }
+        // POST /v1/connect — explicit, client-initiated handshake. Body
+        // is ignored; semantics are "confirm you can reach me".
+        if (method == NanoHTTPD.Method.POST && uri == "/v1/connect") {
+            return Request.Connect
+        }
         // GET /v1/models
         if (method == NanoHTTPD.Method.GET && uri == "/v1/models") {
             return Request.ListModels

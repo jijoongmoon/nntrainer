@@ -22,6 +22,7 @@ import kotlinx.serialization.json.Json
  */
 sealed class Request {
     object Health : Request()
+    object Connect : Request()
     object ListModels : Request()
     data class SetOptions(val body: SetOptionsRequest) : Request()
     data class LoadModel(val body: LoadModelRequest) : Request()
@@ -62,6 +63,10 @@ class RequestDispatcher(
     fun dispatch(request: Request): Response = try {
         when (request) {
             Request.Health -> okJson(HealthResponse(status = "ok", port = port))
+
+            Request.Connect -> okJson(
+                ConnectResponse(connected = true, port = port, message = "connected")
+            )
 
             Request.ListModels -> okJson(ListModelsResponse(registry.list()))
 

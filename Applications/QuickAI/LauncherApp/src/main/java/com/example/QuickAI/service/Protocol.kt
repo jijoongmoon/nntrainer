@@ -181,6 +181,21 @@ data class HealthResponse(
     val port: Int
 )
 
+/**
+ * @brief Response to POST /v1/connect.
+ *
+ * The connect endpoint is intentionally minimal: it performs no model
+ * work and only confirms that the REST surface is reachable and ready
+ * to accept further requests. Clients use this as an explicit
+ * "handshake" separate from the periodic /v1/health liveness probe.
+ */
+@Serializable
+data class ConnectResponse(
+    val connected: Boolean = true,
+    val port: Int,
+    val message: String = "connected"
+)
+
 @Serializable
 data class ErrorResponse(
     @SerialName("error_code") val errorCode: Int,

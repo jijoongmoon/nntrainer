@@ -100,6 +100,13 @@ data class ListModelsResponse(val models: List<LoadedModelInfo>)
 data class HealthResponse(val status: String, val port: Int)
 
 @Serializable
+data class ConnectResponse(
+    val connected: Boolean = true,
+    val port: Int,
+    val message: String = "connected"
+)
+
+@Serializable
 data class ErrorResponse(
     @SerialName("error_code") val errorCode: Int,
     val message: String
