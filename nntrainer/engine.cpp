@@ -188,7 +188,7 @@ int Engine::registerContext(const std::string &library_path,
   const std::string full_path = getFullPath(library_path, base_path);
 
   void *handle = DynamicLibraryLoader::loadLibrary(full_path.c_str(),
-                                                   RTLD_LAZY | RTLD_LOCAL);
+                                                   RTLD_LAZY | RTLD_GLOBAL);
   const char *error_msg = DynamicLibraryLoader::getLastError();
 
   NNTR_THROW_IF(handle == nullptr, std::invalid_argument)
