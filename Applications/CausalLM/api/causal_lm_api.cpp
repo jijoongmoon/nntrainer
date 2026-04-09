@@ -14,6 +14,10 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+
+#ifdef ENABLE_LITERT_LM
+#include "litert_context.h"
+#endif
 #include <map>
 #include <memory>
 #include <mutex>
@@ -674,7 +678,39 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
       // The LiteRTGraph layer's forwarding() handles this.
       /// @todo For now, use a simplified path that directly calls
       /// the context. Full integration will go through LiteRTGraph layer.
+#ifdef ENABLE_LITERT_LM
+      {
+        auto *litert_ctx =
+            dynamic_cast<nntrainer::LiteRTContext *>(ctx);
+        if (!litert_ctx) {
+          std::cerr << "[GPU2] Failed to cast context to LiteRTContext"
+                    << std::endl;
+          return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+        }
+        auto session = litert_ctx->createSession();
+        if (!session) {
+          std::cerr << "[GPU2] Failed to create LiteRT-LM session"
+                    << std::endl;
+          return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+        }
+        auto responses = session->GenerateContent(
+            litert::lm::InputText(std::string(input)));
+        if (responses.ok()) {
+          const auto &texts = responses->GetTexts();
+          if (!texts.empty()) {
+            g_last_output = texts[0];
+          } else {
+            g_last_output = "";
+          }
+        } else {
+          std::cerr << "[GPU2] GenerateContent failed: "
+                    << responses.status().message() << std::endl;
+          return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+        }
+      }
+#else
       g_last_output = "[GPU2] LiteRT-LM inference placeholder for: " + input;
+#endif
       *outputText = g_last_output.c_str();
 
     } else if (g_loaded_backend == CAUSAL_LM_BACKEND_NPU) {
