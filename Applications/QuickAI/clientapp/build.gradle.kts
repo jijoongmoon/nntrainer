@@ -41,6 +41,7 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.activity)
     implementation(libs.material)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
 
     // REST client
     implementation(libs.okhttp)
