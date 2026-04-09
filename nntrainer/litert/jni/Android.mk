@@ -104,7 +104,7 @@ LOCAL_C_INCLUDES    := \
 LOCAL_CFLAGS        += -pthread -fexceptions -Wno-deprecated-declarations
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions -DPLUGGABLE -DENABLE_LITERT_LM
 LOCAL_LDLIBS        := -llog -landroid
-LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
+LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384" "-Wl,--allow-multiple-definition"
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer litert_lm_all
 LOCAL_WHOLE_STATIC_LIBRARIES := absl_all
