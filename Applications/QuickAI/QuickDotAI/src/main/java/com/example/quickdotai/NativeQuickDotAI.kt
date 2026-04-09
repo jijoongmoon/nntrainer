@@ -10,6 +10,7 @@
 package com.example.quickdotai
 
 import android.util.Log
+import java.io.File
 
 /**
  * @brief Kotlin wrapper around a single `CausalLmHandle` in native code.
@@ -54,6 +55,46 @@ class NativeQuickDotAI : QuickDotAI {
                     "Model ${req.model} is not supported by NativeQuickDotAI"
                 )
             }
+
+        // Point the native loader at the right directory. The C API
+        // builds its model paths as "./models/<name>-<quant>" relative
+        // to the process's cwd, so when a caller (e.g. SampleTestAPP)
+        // passes an absolute [modelPath] we chdir the process to its
+        // grandparent — for `.../files/models/qwen3-0.6b-w4a32` that is
+        // `.../files/`, which makes `./models/qwen3-0.6b-w4a32` resolve
+        // to the caller's intended directory. See NativeCausalLm.chdirNative.
+        req.modelPath?.takeIf { it.isNotBlank() }?.let { modelPathStr ->
+            val nativeCwd = File(modelPathStr).parentFile?.parentFile
+            if (nativeCwd == null) {
+                Log.e(
+                    TAG,
+                    "load(): modelPath=$modelPathStr has no grandparent; " +
+                        "cannot derive native cwd"
+                )
+                return BackendResult.Err(
+                    QuickAiError.INVALID_PARAMETER,
+                    "modelPath must be an absolute path with at least two " +
+                        "parent directories (e.g. .../files/models/qwen3-0.6b-w4a32)"
+                )
+            }
+            if (!nativeCwd.exists()) {
+                Log.e(TAG, "load(): native cwd does not exist: $nativeCwd")
+                return BackendResult.Err(
+                    QuickAiError.MODEL_LOAD_FAILED,
+                    "Native working directory $nativeCwd does not exist. " +
+                        "Push the model to $modelPathStr first."
+                )
+            }
+            Log.i(TAG, "load(): chdir -> ${nativeCwd.absolutePath}")
+            val chdirErr = NativeCausalLm.chdirNative(nativeCwd.absolutePath)
+            if (chdirErr != 0) {
+                Log.e(TAG, "load(): chdir failed, errno=$chdirErr")
+                return BackendResult.Err(
+                    QuickAiError.MODEL_LOAD_FAILED,
+                    "chdir to ${nativeCwd.absolutePath} failed (errno=$chdirErr)"
+                )
+            }
+        }
 
         return try {
             Log.i(

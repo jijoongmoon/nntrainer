@@ -26,8 +26,10 @@ package com.example.sampletestapp
 
 import android.os.Bundle
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -149,15 +151,31 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(quantSpinner)
 
-        root.addView(labelView("Model path (LiteRT-LM / GEMMA4 only)"))
+        root.addView(labelView("Model path"))
         modelPathField = EditText(this).apply {
-            hint = "e.g. /sdcard/Android/data/.../gemma-4-E2B-it.litertlm"
+            hint = "Absolute path to the model file/dir"
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-            // Mirror the default hardcoded path from the clientapp so a
-            // single Load click works on a freshly-pushed device.
-            setText(TEST_GEMMA4_MODEL_PATH)
         }
         root.addView(modelPathField)
+
+        // Keep the model-path field in sync with the current (model,
+        // quantization) selection so a single Load click works without
+        // the user having to type a path manually. The user can still
+        // edit the field after the fact — a subsequent spinner change
+        // will just overwrite it with the new default.
+        val pathSyncListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?, view: View?, position: Int, id: Long
+            ) {
+                modelPathField.setText(defaultModelPathFor(selectedModelId(), selectedQuant()))
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) { /* no-op */ }
+        }
+        modelSpinner.onItemSelectedListener = pathSyncListener
+        quantSpinner.onItemSelectedListener = pathSyncListener
+        // Seed the field synchronously for the initial selection (the
+        // spinner listeners fire asynchronously after setContentView).
+        modelPathField.setText(defaultModelPathFor(selectedModelId(), selectedQuant()))
 
         val loadBtn = Button(this).apply {
             text = "Load model"
@@ -375,17 +393,60 @@ class MainActivity : AppCompatActivity() {
         mainHandler.post { statusView.text = text }
     }
 
-    private companion object {
-        /**
-         * TEST ONLY — mirrors LiteRTLm.TEST_GEMMA4_* so a Load click
-         * works on a device that has the Gemma model pushed to this
-         * app's external files dir. The path intentionally uses the
-         * SampleTestAPP applicationId, not QuickAI's, because the AAR's
-         * testModelFile() helper resolves the dir from whichever host
-         * app is driving it.
-         */
-        const val TEST_GEMMA4_MODEL_PATH: String =
-            "/sdcard/Android/data/com.example.sampletestapp/files/" +
-                "models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
+    /**
+     * @brief Reads the current value of the model spinner.
+     *
+     * Guarded with a try/catch because AdapterView listeners can fire
+     * once before the adapter is fully wired up on some API levels.
+     */
+    private fun selectedModelId(): ModelId = try {
+        ModelId.valueOf(modelSpinner.selectedItem as String)
+    } catch (_: Throwable) {
+        ModelId.GEMMA4
+    }
+
+    private fun selectedQuant(): QuantizationType = try {
+        QuantizationType.valueOf(quantSpinner.selectedItem as String)
+    } catch (_: Throwable) {
+        QuantizationType.W4A32
+    }
+
+    /**
+     * @brief Builds the default on-device model path for the given
+     * (model, quantization) pair rooted in this app's external files
+     * dir, so the path lines up with the native C API's hardcoded
+     * `./models/<name>-<quant>` prefix (resolve_model_path() in
+     * causal_lm_api.cpp).
+     *
+     * Layout — e.g. for QWEN3_0_6B + W4A32:
+     *   /sdcard/Android/data/com.example.sampletestapp/files/
+     *       models/qwen3-0.6b-w4a32
+     *
+     * For GEMMA4 the path is the `.litertlm` model file (LiteRT-LM
+     * takes an explicit file path), not a directory.
+     */
+    private fun defaultModelPathFor(model: ModelId, quant: QuantizationType): String {
+        val externalFiles = applicationContext.getExternalFilesDir(null)
+        val base = externalFiles?.absolutePath
+            ?: "/sdcard/Android/data/$packageName/files"
+        return when (model) {
+            ModelId.GEMMA4 ->
+                "$base/models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
+            ModelId.QWEN3_0_6B ->
+                "$base/models/qwen3-0.6b${quantizationSuffix(quant)}"
+        }
+    }
+
+    /**
+     * @brief Mirror of `get_quantization_suffix` in
+     * Applications/CausalLM/api/causal_lm_api.cpp — kept in sync so the
+     * default path stays valid for whichever quant the user picks.
+     */
+    private fun quantizationSuffix(quant: QuantizationType): String = when (quant) {
+        QuantizationType.W4A32 -> "-w4a32"
+        QuantizationType.W16A16 -> "-w16a16"
+        QuantizationType.W8A16 -> "-w8a16"
+        QuantizationType.W32A32 -> "-w32a32"
+        QuantizationType.UNKNOWN -> "-w4a32"
     }
 }

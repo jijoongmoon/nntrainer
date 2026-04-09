@@ -21,9 +21,11 @@
  */
 
 #include <android/log.h>
+#include <cerrno>
 #include <cstddef>
 #include <jni.h>
 #include <string>
+#include <unistd.h>
 
 #include "causal_lm_api.h"
 
@@ -106,6 +108,34 @@ Java_com_example_quickdotai_NativeCausalLm_setOptionsNative(
   cfg.debug_mode = (debugMode == JNI_TRUE);
   cfg.verbose = (verbose == JNI_TRUE);
   return static_cast<jint>(setOptions(cfg));
+}
+
+// ---------------------------------------------------------------------------
+// chdir
+//
+// The C API in causal_lm_api.cpp hardcodes the model discovery prefix to
+// the relative path "./models/<model>-<quant>" (see resolve_model_path()),
+// which ties model lookup to the process's current working directory.
+// Android apps start with cwd="/" so the only way to point the loader at
+// an app-owned directory is to chdir(2) the process before calling
+// loadModelHandle. This helper exposes that chdir to Kotlin as a thin
+// wrapper — returning 0 on success or the POSIX errno on failure, which
+// NativeQuickDotAI surfaces as CAUSAL_LM_ERROR_MODEL_LOAD_FAILED.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_quickdotai_NativeCausalLm_chdirNative(
+  JNIEnv *env, jobject /*thiz*/, jstring pathJ) {
+  if (pathJ == nullptr) {
+    return EINVAL;
+  }
+  const char *path = env->GetStringUTFChars(pathJ, nullptr);
+  if (path == nullptr) {
+    return ENOMEM;
+  }
+  int rc = chdir(path);
+  int err = (rc == 0) ? 0 : errno;
+  env->ReleaseStringUTFChars(pathJ, path);
+  return static_cast<jint>(err);
 }
 
 // ---------------------------------------------------------------------------

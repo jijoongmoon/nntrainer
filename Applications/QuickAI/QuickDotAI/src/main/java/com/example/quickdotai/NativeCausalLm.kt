@@ -95,6 +95,22 @@ object NativeCausalLm {
         verbose: Boolean
     ): Int
 
+    /**
+     * @brief Thin wrapper around POSIX `chdir(2)`.
+     *
+     * The native C API in causal_lm_api.cpp builds its model paths as
+     * `./models/<name>-<quant>` (see `resolve_model_path`), so the
+     * loader's behaviour depends on the process's current working
+     * directory. Android apps launch with cwd="/" which is not writable,
+     * so the host code must chdir the process to an app-owned directory
+     * (typically `Context.getExternalFilesDir(null)`) before calling
+     * [loadModelHandleNative]. [NativeQuickDotAI] does this
+     * automatically when the caller supplies a [LoadModelRequest.modelPath].
+     *
+     * @return 0 on success, or the POSIX errno value on failure.
+     */
+    external fun chdirNative(path: String): Int
+
     /** Forwards to `loadModelHandle` in causal_lm_api.h. */
     external fun loadModelHandleNative(
         backendOrdinal: Int,
