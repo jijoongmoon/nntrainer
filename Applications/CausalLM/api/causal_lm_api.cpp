@@ -364,7 +364,8 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       std::string model_file;
       struct stat st;
       for (const auto &name :
-           {"gemma-4-E2B-it-litert-lm.task", "model.litertlm"}) {
+           {"gemma-4-E2B-it-litert-lm.task", "model.litertlm",
+            "gemma-4-E2B-it.litertlm"}) {
         std::string candidate = model_dir_path + "/" + name;
         if (stat(candidate.c_str(), &st) == 0) {
           model_file = candidate;
