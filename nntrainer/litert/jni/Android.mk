@@ -110,3 +110,47 @@ LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer litert_lm_all
 LOCAL_STATIC_LIBRARIES := absl_all
 
 include $(BUILD_SHARED_LIBRARY)
+
+####################################################################
+# Prebuilt: causallm_api (from CausalLM build)
+####################################################################
+include $(CLEAR_VARS)
+LOCAL_MODULE := causallm_api
+
+ifndef CAUSALLM_LIB_PATH
+CAUSALLM_LIB_PATH := $(NNTRAINER_ROOT)/Applications/CausalLM/libs/$(TARGET_ARCH_ABI)
+endif
+
+LOCAL_SRC_FILES := $(CAUSALLM_LIB_PATH)/libcausallm_api.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+####################################################################
+# Prebuilt: causallm_core
+####################################################################
+include $(CLEAR_VARS)
+LOCAL_MODULE := causallm_core
+LOCAL_SRC_FILES := $(CAUSALLM_LIB_PATH)/libcausallm_core.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+####################################################################
+# test_litert_gpu2 - CLI test executable
+####################################################################
+include $(CLEAR_VARS)
+
+LOCAL_MODULE        := test_litert_gpu2
+LOCAL_MODULE_TAGS   := optional
+LOCAL_ARM_NEON      := true
+LOCAL_ARM_MODE      := arm
+
+LOCAL_SRC_FILES     := $(NNTRAINER_ROOT)/nntrainer/litert/test_litert_gpu2.cpp
+
+LOCAL_C_INCLUDES    := $(NNTRAINER_ROOT)/Applications/CausalLM/api
+
+LOCAL_CFLAGS        += -pthread -fexceptions
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS        := -llog -landroid
+LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
+
+LOCAL_SHARED_LIBRARIES := causallm_api causallm_core nntrainer ccapi-nntrainer
+
+include $(BUILD_EXECUTABLE)
