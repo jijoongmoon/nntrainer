@@ -149,7 +149,7 @@ LOCAL_C_INCLUDES    := $(NNTRAINER_ROOT)/Applications/CausalLM/api
 LOCAL_CFLAGS        += -pthread -fexceptions
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
-LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
+LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384" "-Wl,--allow-shlib-undefined"
 
 LOCAL_SHARED_LIBRARIES := causallm_api causallm_core nntrainer ccapi-nntrainer
 
