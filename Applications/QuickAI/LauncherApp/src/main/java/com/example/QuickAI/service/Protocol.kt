@@ -138,6 +138,32 @@ data class RunModelResponse(
 )
 
 /* -------------------------------------------------------------------- */
+/* runModel streaming (NDJSON frames — see Architecture.md §5.1)         */
+/* -------------------------------------------------------------------- */
+
+/**
+ * @brief One frame of the NDJSON response emitted by
+ * `POST /v1/models/{id}/run_stream`.
+ *
+ * Each frame is serialised onto its own line, terminated by `\n`. The
+ * recognised [type] values are:
+ *  - `"delta"` — a chunk of newly-generated text; [text] is non-null.
+ *  - `"done"`  — the stream completed successfully; [durationMs] may be set.
+ *  - `"error"` — the stream terminated with an error; [errorCode] and
+ *                [message] are set.
+ *
+ * A stream MUST end with exactly one `done` or `error` frame.
+ */
+@Serializable
+data class StreamFrame(
+    val type: String,
+    val text: String? = null,
+    @SerialName("duration_ms") val durationMs: Long? = null,
+    @SerialName("error_code") val errorCode: Int? = null,
+    val message: String? = null
+)
+
+/* -------------------------------------------------------------------- */
 /* getPerformanceMetrics                                                */
 /* -------------------------------------------------------------------- */
 

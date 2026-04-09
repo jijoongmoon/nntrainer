@@ -68,6 +68,31 @@ data class RunModelResponse(
     val message: String? = null
 )
 
+/**
+ * @brief One line (frame) of the NDJSON stream emitted by
+ * `POST /v1/models/{id}/run_stream`. Keep in sync with the service-side
+ * [com.example.QuickAI.service.StreamFrame].
+ */
+@Serializable
+data class StreamFrame(
+    val type: String,
+    val text: String? = null,
+    @SerialName("duration_ms") val durationMs: Long? = null,
+    @SerialName("error_code") val errorCode: Int? = null,
+    val message: String? = null
+)
+
+/**
+ * @brief Higher-level sealed class that [QuickAiClient.runModelStreaming]
+ * hands to its caller for each decoded frame. UI code pattern-matches on
+ * this instead of poking at the raw [StreamFrame] fields.
+ */
+sealed class StreamChunk {
+    data class Delta(val text: String) : StreamChunk()
+    data class Done(val durationMs: Long?) : StreamChunk()
+    data class Error(val errorCode: Int, val message: String) : StreamChunk()
+}
+
 @Serializable
 data class PerformanceMetrics(
     @SerialName("prefill_tokens") val prefillTokens: Int = 0,

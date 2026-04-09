@@ -18,6 +18,7 @@ package com.example.QuickAI.service
 import android.util.Log
 import com.example.QuickAI.service.backend.Backend
 import com.example.QuickAI.service.backend.BackendResult
+import com.example.QuickAI.service.backend.StreamSink
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -40,6 +41,19 @@ internal sealed class Job {
     class Run(
         val prompt: String,
         val onResult: (BackendResult<String>) -> Unit
+    ) : Job()
+
+    /**
+     * @brief Streaming inference. Deltas + terminal events are delivered
+     * through [sink] on the worker thread (or on the backend's own
+     * streaming thread for LiteRT-LM, which is thread-safe against the
+     * sink's backing queue). ModelWorker guarantees that exactly one of
+     * [StreamSink.onDone] or [StreamSink.onError] is delivered, even on
+     * exceptional paths (backend throw / shutdown).
+     */
+    class RunStream(
+        val prompt: String,
+        val sink: StreamSink
     ) : Job()
 
     /** Metrics fetch. */
@@ -121,6 +135,20 @@ class ModelWorker(
     }
 
     /**
+     * @brief Enqueue a streaming run request. Returns false if the queue
+     * is full — in that case the caller should return 503 WITHOUT calling
+     * any method on [sink], because the sink has not been handed off to
+     * the worker yet.
+     *
+     * On successful enqueue, ModelWorker owns [sink] and will deliver
+     * exactly one terminal event (done or error) before returning to the
+     * queue loop.
+     */
+    fun submitRunStream(prompt: String, sink: StreamSink): Boolean {
+        return queue.offer(Job.RunStream(prompt, sink))
+    }
+
+    /**
      * @brief Enqueue a metrics fetch. Returns false if the queue is full.
      */
     fun submitMetrics(onResult: (BackendResult<PerformanceMetrics>) -> Unit): Boolean {
@@ -182,6 +210,51 @@ class ModelWorker(
                         }
                         job.onResult(r)
                     }
+                    is Job.RunStream -> {
+                        // Guarantee exactly one terminal event on the
+                        // sink, even if the backend throws or forgets to
+                        // close the stream. We wrap the sink in a thin
+                        // filter that remembers whether onDone/onError
+                        // has been seen and fills in a final onError in
+                        // the finally block if not.
+                        val sink = job.sink
+                        var closed = false
+                        val guard = object : StreamSink {
+                            override fun onDelta(text: String) = sink.onDelta(text)
+                            override fun onDone() {
+                                closed = true
+                                sink.onDone()
+                            }
+                            override fun onError(
+                                error: QuickAiError,
+                                message: String?
+                            ) {
+                                closed = true
+                                sink.onError(error, message)
+                            }
+                        }
+                        try {
+                            backend.runStreaming(job.prompt, guard)
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "runStreaming threw for $modelId", t)
+                            if (!closed) {
+                                guard.onError(
+                                    QuickAiError.INFERENCE_FAILED,
+                                    t.message
+                                )
+                            }
+                        } finally {
+                            // Ensure the downstream HTTP chunked writer
+                            // always gets a terminal frame so it can
+                            // close the socket.
+                            if (!closed) {
+                                guard.onError(
+                                    QuickAiError.UNKNOWN,
+                                    "stream terminated without completion"
+                                )
+                            }
+                        }
+                    }
                     is Job.Metrics -> {
                         val r = try {
                             backend.metrics()
@@ -218,6 +291,10 @@ class ModelWorker(
                 )
                 is Job.Run -> job.onResult(
                     BackendResult.Err(QuickAiError.NOT_INITIALIZED, "worker shutting down")
+                )
+                is Job.RunStream -> job.sink.onError(
+                    QuickAiError.NOT_INITIALIZED,
+                    "worker shutting down"
                 )
                 is Job.Metrics -> job.onResult(
                     BackendResult.Err(QuickAiError.NOT_INITIALIZED, "worker shutting down")

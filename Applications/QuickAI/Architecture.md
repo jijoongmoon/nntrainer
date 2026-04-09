@@ -108,9 +108,11 @@ state (see §3 on parallelism).
 | POST   | `/v1/options`                     | `setOptions`                | global, affects all future loads |
 | POST   | `/v1/models`                      | `loadModelHandle`           | returns `{model_id}` |
 | POST   | `/v1/models/{id}/run`             | `runModelHandle`            | returns `{output}` |
+| POST   | `/v1/models/{id}/run_stream`      | `runModelHandle` (streaming)| NDJSON chunked stream — see §5.1 |
 | GET    | `/v1/models/{id}/metrics`         | `getPerformanceMetricsHandle` | returns `PerformanceMetrics` JSON |
 | DELETE | `/v1/models/{id}`                 | `destroyModelHandle`        | unloads / frees |
 | GET    | `/v1/models`                      | (service-only)              | lists loaded models |
+| POST   | `/v1/connect`                     | (service-only)              | explicit handshake (test) |
 | GET    | `/v1/health`                      | (service-only)              | liveness probe |
 
 Request / response bodies are JSON (kotlinx.serialization).
@@ -172,8 +174,23 @@ Content-Type: application/json
 interface Backend {
     fun load(req: LoadModelRequest): LoadModelResponse
     fun run(prompt: String): RunModelResponse
+    /**
+     * Streaming variant of [run]. The default implementation just calls
+     * run() and delivers the whole result as a single delta, so non-
+     * streaming backends automatically work through /v1/models/{id}/run_stream.
+     * Streaming-capable backends (LiteRtLmBackend) override this to emit
+     * progressive deltas via MessageCallback → sink.onDelta(...).
+     */
+    fun runStreaming(prompt: String, sink: StreamSink): BackendResult<Unit>
     fun metrics(): PerformanceMetrics
     fun close()
+}
+
+/** Where backends push streamed output. Single-threaded from the worker. */
+interface StreamSink {
+    fun onDelta(text: String)
+    fun onDone()
+    fun onError(error: QuickAiError, message: String?)
 }
 ```
 
@@ -314,6 +331,127 @@ values to the C enum inside `NativeCausalLmBackend`.
 | ClientA issues overlapping requests on one model    | Serialized in that model's FIFO. |
 | Service receives a request for an unloaded model    | 404 — client must `POST /v1/models` first. |
 
+### 5.1 Streaming responses
+
+The vanilla `POST /v1/models/{id}/run` endpoint buffers the entire generation
+on the service side and returns it in one JSON response. That is simple but
+wastes the interactivity that LiteRT-LM (and future nntrainer incremental
+decoding) already provides — the first token is available in hundreds of
+milliseconds, but the client only sees anything after the full generation
+finishes.
+
+To fix that we add a second, streaming endpoint:
+
+```
+POST /v1/models/{id}/run_stream
+Content-Type: application/json
+
+{ "prompt": "Tell me a joke" }
+```
+
+The response is **chunked HTTP** with an **NDJSON** body (one JSON object per
+line, each terminated by `\n`). Frame shape:
+
+```jsonl
+{"type":"delta","text":"Why did"}
+{"type":"delta","text":" the chicken"}
+{"type":"delta","text":" cross the road?"}
+{"type":"done","duration_ms":612}
+```
+
+or, on failure:
+
+```jsonl
+{"type":"delta","text":"Why did the"}
+{"type":"error","error_code":3,"message":"kernel OOM at layer 12"}
+```
+
+**Why NDJSON over SSE?** SSE (`text/event-stream`) would work too, but it
+wraps every payload in `data: ...\n\n` framing and complicates the server
+implementation (NanoHTTPD has no native SSE helper). NDJSON is transport-
+neutral, trivially parseable on the client with
+`BufferedSource.readUtf8LineStrict()`, and keeps every chunk a self-contained
+JSON object — perfect for future metrics / partial-metrics frames.
+
+**Transport path through the existing pipeline**
+
+```
+ ChunkedStreamSink.inputStream  (producer/consumer queue)
+              ▲
+              │ onDelta(text) → encodeFrame → queue.put(bytes)
+              │
+ LiteRtLmBackend.runStreaming(prompt, sink)
+              │
+              │  Conversation.sendMessageAsync(prompt, MessageCallback)
+              │     onMessage(m)  → defensive delta extraction → sink.onDelta(...)
+              │     onDone()     → sink.onDone() + latch.countDown()
+              │     onError(t)   → sink.onError(...) + latch.countDown()
+              │  latch.await()  ← blocks the worker thread until callback done
+              │
+              ▼
+ ModelWorker.runLoop() — single thread, FIFO discipline preserved
+              │
+              ▼
+ RequestDispatcher.handleRunStream()
+              │  Response.Chunked(200, "application/x-ndjson", sink.inputStream)
+              │
+              ▼
+ HttpServer     NanoHTTPD.newChunkedResponse(OK, "application/x-ndjson",
+                                             sink.inputStream)
+              │
+              ▼
+ Client        OkHttp BufferedSource.readUtf8LineStrict() loop →
+               decode each line as StreamFrame → dispatch to onChunk(chunk)
+```
+
+The `ChunkedStreamSink` lives on the backend side. It exposes:
+
+- a `StreamSink` implementation that backends push deltas into, and
+- an `InputStream` that NanoHTTPD drains to write the chunked body.
+
+The two are connected by a `LinkedBlockingQueue<ByteArray>` so the backend
+worker thread and the NanoHTTPD writer thread never block each other beyond
+normal queue backpressure. An empty ByteArray serves as the EOF sentinel that
+wakes the reader and closes the response.
+
+**Why NanoHTTPD's `newChunkedResponse` is safe here.** That helper simply
+copies from the `InputStream` to the socket in a background thread; it does
+not assume `available()` or a finite length, so our queue-backed stream works
+as long as `read()` blocks until data or EOF arrives. Once the backend calls
+`sink.onDone()` we push the EOF sentinel and the NanoHTTPD writer naturally
+terminates the chunked encoding.
+
+**Concurrency discipline is preserved.** The ModelWorker thread is still the
+only thread calling into the backend. Inside `runStreaming`, LiteRT-LM may
+invoke `MessageCallback` on its own internal thread, but that callback only
+touches the `ChunkedStreamSink` (which is itself thread-safe via the blocking
+queue) — the worker thread holds a `CountDownLatch` until the callback signals
+`onDone`/`onError`, so the worker does not return to the job loop while the
+model is still emitting tokens. FIFO ordering across streaming and non-
+streaming requests is therefore unchanged.
+
+**Defensive delta extraction.** The LiteRT-LM Kotlin API documents
+`sendMessageAsync(...).collect { print(it) }` as already emitting per-token
+deltas, but the callback variant's `onMessage(Message)` contract is not
+explicit about whether each `Message` is a delta or an accumulated snapshot.
+The backend therefore keeps a running `StringBuilder` and emits
+`full.substring(accumulated.length)` when the new message starts with the
+accumulated buffer, falling back to the raw text otherwise. This copes with
+both behaviours without double-printing tokens.
+
+**Client consumption.** `QuickAiClient.runModelStreaming(modelId, req,
+onChunk)` opens the response, reads its `BufferedSource` line-by-line with
+`readUtf8LineStrict()`, decodes each line into a `StreamFrame`, and dispatches
+a sealed `StreamChunk` (`Delta`, `Done`, `Error`) to the caller. In the
+sample app the handler just calls `outputView.append(delta)` on the main
+thread so tokens appear as they arrive.
+
+**Non-streaming backends get streaming for free.** Because `Backend.runStreaming`
+has a default implementation that calls `run(prompt)` and pushes the whole
+string as a single `onDelta` followed by `onDone`, the native backend works
+with `/run_stream` unchanged — it just emits one big chunk instead of many
+small ones.
+
 ## 6. Permissions & Manifests
 
 ### LauncherApp `AndroidManifest.xml`
@@ -425,6 +563,8 @@ Applications/CausalLM/api/
 - **LiteRT-LM NPU backend** currently falls back to CPU because it needs a
   `Context` to locate `applicationInfo.nativeLibraryDir`. Plumbing a
   `Context` into `LiteRtLmBackend` via `ModelRegistry` is a small follow-up.
-- **Streaming output** (token-by-token SSE / LiteRT-LM
-  `sendMessageAsync(...).collect { ... }`) is out of scope for iteration 1.
-  The REST endpoints are blocking request/response.
+- **Streaming output** — done. `POST /v1/models/{id}/run_stream` now emits
+  NDJSON chunks over HTTP chunked transfer encoding, driven by LiteRT-LM's
+  `Conversation.sendMessageAsync(prompt, MessageCallback)` on the service
+  side. See §5.1 for the full design. Non-streaming backends fall back to a
+  single-chunk default implementation in `Backend.runStreaming`.

@@ -27,7 +27,11 @@ import com.google.ai.edge.litertlm.Backend as LlmBackend
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.Message
+import com.google.ai.edge.litertlm.MessageCallback
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * @brief LiteRT-LM-backed implementation for Gemma4.
@@ -177,9 +181,7 @@ class LiteRtLmBackend(
             val startNs = System.nanoTime()
             // Blocking synchronous send; the ModelWorker thread that calls
             // us is already a background thread, so this is safe. Streaming
-            // via sendMessageAsync().collect { ... } is a later iteration
-            // (Architecture.md §10 — out of scope for the current REST
-            // endpoints, which are blocking request/response).
+            // is handled in runStreaming() via sendMessageAsync().
             val message = c.sendMessage(prompt)
             lastRunDurationMs = (System.nanoTime() - startNs) / 1_000_000.0
             val output = message.toString()
@@ -195,6 +197,129 @@ class LiteRtLmBackend(
                 QuickAiError.INFERENCE_FAILED,
                 t.message ?: "LiteRT-LM inference failed"
             )
+        }
+    }
+
+    /**
+     * @brief Streaming override that drives LiteRT-LM's asynchronous
+     * `sendMessageAsync(prompt, MessageCallback)` and forwards each
+     * incremental `onMessage` to [sink] as an NDJSON delta.
+     *
+     * The ModelWorker thread (our caller) blocks on a [CountDownLatch]
+     * until LiteRT-LM invokes either `onDone` or `onError`, so FIFO
+     * ordering across streaming and non-streaming jobs is preserved:
+     * the worker does NOT return to its queue loop while the model is
+     * still decoding tokens.
+     *
+     * LiteRT-LM's `onMessage(Message)` contract is not explicit about
+     * whether each Message is a delta or a running accumulation. We
+     * therefore keep a private StringBuilder of everything we've emitted
+     * so far and only forward the new suffix when the incoming message
+     * starts with it — otherwise (defensive fallback) we forward the raw
+     * text. This handles both shapes without double-emitting tokens.
+     *
+     * See Architecture.md §5.1.
+     */
+    override fun runStreaming(
+        prompt: String,
+        sink: StreamSink
+    ): BackendResult<Unit> {
+        val c = conversation
+            ?: run {
+                Log.e(TAG, "runStreaming(): called before load()")
+                val err = BackendResult.Err(
+                    QuickAiError.NOT_INITIALIZED,
+                    "LiteRT-LM backend has not been loaded yet"
+                )
+                sink.onError(err.error, err.message)
+                return err
+            }
+
+        Log.i(TAG, "runStreaming(): prompt length=${prompt.length}")
+
+        val latch = CountDownLatch(1)
+        val accumulated = StringBuilder()
+        // Outcome is published from the callback thread and read on the
+        // worker thread after latch.await() returns.
+        @Volatile var terminalError: BackendResult.Err? = null
+        val startNs = System.nanoTime()
+
+        val callback = object : MessageCallback {
+            override fun onMessage(message: Message) {
+                try {
+                    val full = message.toString()
+                    // Defensive delta extraction — if the callback emits
+                    // accumulated snapshots we forward only the suffix;
+                    // if it already emits per-token deltas, `full` will
+                    // not start with `accumulated` and we forward the raw
+                    // text and accumulate it.
+                    val delta = if (full.startsWith(accumulated.toString())) {
+                        full.substring(accumulated.length)
+                    } else {
+                        full
+                    }
+                    if (delta.isNotEmpty()) {
+                        accumulated.append(delta)
+                        sink.onDelta(delta)
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "runStreaming(): onMessage threw", t)
+                }
+            }
+
+            override fun onDone() {
+                lastRunDurationMs = (System.nanoTime() - startNs) / 1_000_000.0
+                Log.i(
+                    TAG,
+                    "runStreaming(): onDone after ${lastRunDurationMs.toLong()} ms, " +
+                        "total chars=${accumulated.length}"
+                )
+                try {
+                    sink.onDone()
+                } finally {
+                    latch.countDown()
+                }
+            }
+
+            override fun onError(throwable: Throwable) {
+                Log.e(TAG, "runStreaming(): onError from LiteRT-LM", throwable)
+                val err = BackendResult.Err(
+                    QuickAiError.INFERENCE_FAILED,
+                    throwable.message ?: "LiteRT-LM streaming inference failed"
+                )
+                terminalError = err
+                try {
+                    sink.onError(err.error, err.message)
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+
+        return try {
+            c.sendMessageAsync(prompt, callback)
+            // Wait up to the same 5-minute envelope we use for blocking
+            // runs. If the callback never fires we surface a timeout so
+            // the worker thread isn't parked forever.
+            val finished = latch.await(5, TimeUnit.MINUTES)
+            if (!finished) {
+                Log.e(TAG, "runStreaming(): timed out waiting for onDone/onError")
+                val err = BackendResult.Err(
+                    QuickAiError.INFERENCE_FAILED,
+                    "LiteRT-LM streaming timeout"
+                )
+                sink.onError(err.error, err.message)
+                return err
+            }
+            terminalError ?: BackendResult.Ok(Unit)
+        } catch (t: Throwable) {
+            Log.e(TAG, "runStreaming(): sendMessageAsync threw", t)
+            val err = BackendResult.Err(
+                QuickAiError.INFERENCE_FAILED,
+                t.message ?: "LiteRT-LM streaming inference failed"
+            )
+            sink.onError(err.error, err.message)
+            err
         }
     }
 

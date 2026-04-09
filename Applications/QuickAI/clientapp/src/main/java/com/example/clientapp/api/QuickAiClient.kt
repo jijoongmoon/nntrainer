@@ -78,6 +78,100 @@ class QuickAiClient(
             RunModelResponse.serializer()
         )
 
+    /**
+     * @brief Streaming counterpart of [runModel].
+     *
+     * Opens `POST /v1/models/{id}/run_stream`, reads the NDJSON body
+     * line-by-line via OkHttp's BufferedSource, decodes each line into a
+     * [StreamFrame], and dispatches a higher-level [StreamChunk] to
+     * [onChunk]. The coroutine returns [ApiResult.Ok] on a clean `done`
+     * frame or [ApiResult.Err] if the transport itself fails (network
+     * error, HTTP != 2xx, malformed frame).
+     *
+     * A server-side error frame IS reported through [onChunk] as
+     * [StreamChunk.Error] and ALSO returned as [ApiResult.Err] so the
+     * caller doesn't have to remember to check both places.
+     *
+     * The call is blocking for the duration of the stream — wrap it in a
+     * coroutine scope that can be cancelled if the user navigates away.
+     * The suspend [onChunk] is invoked on Dispatchers.IO; switch to the
+     * main thread inside it if you need to touch UI state.
+     */
+    suspend fun runModelStreaming(
+        modelId: String,
+        req: RunModelRequest,
+        onChunk: suspend (StreamChunk) -> Unit
+    ): ApiResult<Unit> = withContext(Dispatchers.IO) {
+        val body = json.encodeToString(RunModelRequest.serializer(), req)
+            .toRequestBody("application/json".toMediaType())
+        val request = Request.Builder()
+            .url("$base/v1/models/$modelId/run_stream")
+            .post(body)
+            .build()
+        try {
+            http.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    val bodyString = response.body?.string().orEmpty()
+                    val err = runCatching {
+                        json.decodeFromString(ErrorResponse.serializer(), bodyString)
+                    }.getOrNull()
+                    return@withContext ApiResult.Err(
+                        errorCode = err?.errorCode ?: response.code,
+                        message = err?.message ?: "HTTP ${response.code}"
+                    )
+                }
+                val source = response.body?.source()
+                    ?: return@withContext ApiResult.Err(-1, "empty response body")
+
+                var terminalError: ApiResult.Err? = null
+                // Read until EOF. readUtf8LineStrict() throws on EOF so
+                // we break explicitly when exhausted() becomes true.
+                while (!source.exhausted()) {
+                    val line = try {
+                        source.readUtf8LineStrict()
+                    } catch (io: IOException) {
+                        return@withContext ApiResult.Err(
+                            -1,
+                            "stream read error: ${io.message}"
+                        )
+                    }
+                    if (line.isEmpty()) continue
+                    val frame = try {
+                        json.decodeFromString(StreamFrame.serializer(), line)
+                    } catch (t: Throwable) {
+                        return@withContext ApiResult.Err(-1, "bad frame: ${t.message}")
+                    }
+                    when (frame.type) {
+                        "delta" -> {
+                            val text = frame.text ?: continue
+                            onChunk(StreamChunk.Delta(text))
+                        }
+                        "done" -> {
+                            onChunk(StreamChunk.Done(frame.durationMs))
+                            return@withContext ApiResult.Ok(Unit)
+                        }
+                        "error" -> {
+                            val code = frame.errorCode ?: -1
+                            val msg = frame.message ?: "stream error"
+                            onChunk(StreamChunk.Error(code, msg))
+                            terminalError = ApiResult.Err(code, msg)
+                            // Keep draining in case there's a trailing
+                            // newline before EOF, but record the error.
+                        }
+                        else -> {
+                            // Unknown frame type — ignore forward-
+                            // compatibly.
+                        }
+                    }
+                }
+                // Stream ended without an explicit done/error frame.
+                terminalError ?: ApiResult.Err(-1, "stream ended without done frame")
+            }
+        } catch (io: IOException) {
+            ApiResult.Err(-1, "network error: ${io.message}")
+        }
+    }
+
     suspend fun getMetrics(modelId: String): ApiResult<PerformanceMetricsResponse> =
         get("/v1/models/$modelId/metrics", PerformanceMetricsResponse.serializer())
 

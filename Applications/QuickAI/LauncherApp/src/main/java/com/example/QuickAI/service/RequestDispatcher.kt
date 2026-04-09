@@ -12,6 +12,8 @@ package com.example.QuickAI.service
 
 import android.util.Log
 import com.example.QuickAI.service.backend.BackendResult
+import com.example.QuickAI.service.backend.ChunkedStreamSink
+import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.serialization.encodeToString
@@ -27,17 +29,35 @@ sealed class Request {
     data class SetOptions(val body: SetOptionsRequest) : Request()
     data class LoadModel(val body: LoadModelRequest) : Request()
     data class RunModel(val modelId: String, val body: RunModelRequest) : Request()
+    data class RunModelStream(val modelId: String, val body: RunModelRequest) : Request()
     data class GetMetrics(val modelId: String) : Request()
     data class UnloadModel(val modelId: String) : Request()
 }
 
 /**
- * @brief Result of dispatching a request — a JSON body plus HTTP status.
+ * @brief Result of dispatching a request.
+ *
+ * Two shapes:
+ *  - [Json] — a fully buffered JSON response, written with a Content-Length.
+ *  - [Chunked] — an open-ended stream the server should write with HTTP
+ *    chunked transfer encoding. Used by `POST /v1/models/{id}/run_stream`
+ *    (Architecture.md §5.1). The [body] InputStream blocks on its backing
+ *    queue until the backend emits bytes or closes the stream with EOF.
  */
-data class Response(
-    val status: Int,
-    val jsonBody: String
-)
+sealed class Response {
+    abstract val status: Int
+
+    data class Json(
+        override val status: Int,
+        val jsonBody: String
+    ) : Response()
+
+    data class Chunked(
+        override val status: Int,
+        val contentType: String,
+        val body: InputStream
+    ) : Response()
+}
 
 /**
  * @brief The routing engine. Holds a reference to the one ModelRegistry
@@ -75,6 +95,8 @@ class RequestDispatcher(
             is Request.LoadModel -> handleLoadModel(request.body)
 
             is Request.RunModel -> handleRunModel(request.modelId, request.body)
+
+            is Request.RunModelStream -> handleRunStream(request.modelId, request.body)
 
             is Request.GetMetrics -> handleGetMetrics(request.modelId)
 
@@ -156,6 +178,41 @@ class RequestDispatcher(
         }
     }
 
+    /* ---------------- runModel (streaming) ---------------- */
+
+    /**
+     * @brief Entry point for `POST /v1/models/{id}/run_stream`.
+     *
+     * Unlike the blocking [handleRunModel] path, this handler does NOT
+     * wait for inference to finish. Instead it:
+     *  1. Creates a [ChunkedStreamSink] whose [InputStream] end is wired
+     *     into the HTTP chunked response, and
+     *  2. Enqueues a [Job.RunStream] on the target worker that drives the
+     *     backend and writes deltas into the sink.
+     *
+     * The HTTP server thread returns the [Response.Chunked] immediately
+     * and NanoHTTPD streams bytes from the sink's InputStream on its own
+     * writer thread. Backpressure is provided by the sink's bounded
+     * LinkedBlockingQueue. See Architecture.md §5.1.
+     */
+    private fun handleRunStream(modelId: String, body: RunModelRequest): Response {
+        val worker = registry.get(modelId)
+            ?: return errorJson(404, QuickAiError.MODEL_NOT_FOUND, "no such model: $modelId")
+
+        val sink = ChunkedStreamSink()
+        val accepted = worker.submitRunStream(body.prompt, sink)
+        if (!accepted) {
+            // Queue full — the sink was never handed to the worker so we
+            // can fall back to a normal JSON 503.
+            return errorJson(503, QuickAiError.QUEUE_FULL, "worker queue full")
+        }
+        return Response.Chunked(
+            status = 200,
+            contentType = "application/x-ndjson",
+            body = sink.inputStream
+        )
+    }
+
     /* ---------------- metrics ---------------- */
 
     private fun handleGetMetrics(modelId: String): Response {
@@ -203,10 +260,10 @@ class RequestDispatcher(
     /* ---------------- helpers ---------------- */
 
     private inline fun <reified T> okJson(body: T): Response =
-        Response(200, json.encodeToString(body))
+        Response.Json(200, json.encodeToString(body))
 
     private fun errorJson(status: Int, error: QuickAiError, message: String): Response =
-        Response(
+        Response.Json(
             status,
             json.encodeToString(
                 ErrorResponse(errorCode = error.code, message = message)

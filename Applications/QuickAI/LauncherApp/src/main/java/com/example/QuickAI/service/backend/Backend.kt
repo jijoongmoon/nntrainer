@@ -29,6 +29,26 @@ sealed class BackendResult<out T> {
 }
 
 /**
+ * @brief Where a backend pushes streamed output during [Backend.runStreaming].
+ *
+ * The contract is:
+ *  - zero or more [onDelta] calls carrying newly-generated text, followed by
+ *  - exactly one terminal call — either [onDone] on success or [onError] on
+ *    failure.
+ *
+ * Implementations (see ChunkedStreamSink) are expected to be thread-safe
+ * because LiteRT-LM may invoke the backend's MessageCallback from its own
+ * internal thread, not the ModelWorker thread.
+ *
+ * See Architecture.md §5.1.
+ */
+interface StreamSink {
+    fun onDelta(text: String)
+    fun onDone()
+    fun onError(error: QuickAiError, message: String?)
+}
+
+/**
  * @brief Common interface implemented by every backend.
  */
 interface Backend {
@@ -48,6 +68,35 @@ interface Backend {
      * @brief Run inference on a prompt.
      */
     fun run(prompt: String): BackendResult<String>
+
+    /**
+     * @brief Streaming variant of [run]. The default implementation simply
+     * calls [run] and emits the whole string as a single delta, so backends
+     * without a native streaming path (the current native causal_lm_api
+     * backend) automatically work through /v1/models/{id}/run_stream —
+     * they just emit one big chunk instead of many small ones.
+     *
+     * Streaming-capable backends (LiteRtLmBackend) override this to push
+     * progressive deltas through [sink] as tokens arrive.
+     *
+     * Contract: on return, exactly one of [StreamSink.onDone] or
+     * [StreamSink.onError] MUST have been delivered. The returned
+     * BackendResult mirrors the terminal state for the caller's
+     * convenience.
+     */
+    fun runStreaming(prompt: String, sink: StreamSink): BackendResult<Unit> {
+        return when (val r = run(prompt)) {
+            is BackendResult.Ok -> {
+                if (r.value.isNotEmpty()) sink.onDelta(r.value)
+                sink.onDone()
+                BackendResult.Ok(Unit)
+            }
+            is BackendResult.Err -> {
+                sink.onError(r.error, r.message)
+                r
+            }
+        }
+    }
 
     /**
      * @brief Fetch metrics from the last run.

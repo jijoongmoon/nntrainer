@@ -36,8 +36,11 @@ import com.example.clientapp.api.ModelId
 import com.example.clientapp.api.QuantizationType
 import com.example.clientapp.api.QuickAiClient
 import com.example.clientapp.api.RunModelRequest
+import com.example.clientapp.api.StreamChunk
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
@@ -237,6 +240,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * @brief Streaming run — opens POST /v1/models/{id}/run_stream and
+     * appends each delta to [outputView] as it arrives, giving the user
+     * token-by-token feedback instead of waiting for the whole generation
+     * to finish. See Architecture.md §5.1.
+     */
     private fun onRunClicked() {
         val model = ModelId.valueOf(modelSpinner.selectedItem as String)
         val quant = QuantizationType.valueOf(quantSpinner.selectedItem as String)
@@ -246,18 +255,32 @@ class MainActivity : AppCompatActivity() {
             statusView.text = "Prompt is empty."
             return
         }
-        statusView.text = "Running on $modelId…"
+        statusView.text = "Streaming on $modelId…"
         outputView.text = ""
         lifecycleScope.launch {
-            val result = client.runModel(modelId, RunModelRequest(prompt))
-            when (result) {
-                is ApiResult.Ok -> {
-                    statusView.text = "Done."
-                    outputView.text = result.value.output.orEmpty()
+            val result = client.runModelStreaming(
+                modelId,
+                RunModelRequest(prompt)
+            ) { chunk ->
+                // The client dispatches chunks on Dispatchers.IO — hop
+                // to the main thread for every UI touch.
+                withContext(Dispatchers.Main) {
+                    when (chunk) {
+                        is StreamChunk.Delta -> outputView.append(chunk.text)
+                        is StreamChunk.Done -> {
+                            statusView.text = chunk.durationMs?.let {
+                                "Done in ${it} ms."
+                            } ?: "Done."
+                        }
+                        is StreamChunk.Error -> {
+                            statusView.text =
+                                "Run failed: [${chunk.errorCode}] ${chunk.message}"
+                        }
+                    }
                 }
-                is ApiResult.Err -> {
-                    statusView.text = "Run failed: [${result.errorCode}] ${result.message}"
-                }
+            }
+            if (result is ApiResult.Err) {
+                statusView.text = "Run failed: [${result.errorCode}] ${result.message}"
             }
         }
     }

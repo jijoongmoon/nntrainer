@@ -92,12 +92,18 @@ class HttpServer(
         return try {
             val req = parseRequest(session)
                 ?: return badRequest("unsupported path: ${session.method} ${session.uri}")
-            val resp = dispatcher.dispatch(req)
-            NanoHTTPD.newFixedLengthResponse(
-                statusOf(resp.status),
-                "application/json",
-                resp.jsonBody
-            )
+            when (val resp = dispatcher.dispatch(req)) {
+                is Response.Json -> NanoHTTPD.newFixedLengthResponse(
+                    statusOf(resp.status),
+                    "application/json",
+                    resp.jsonBody
+                )
+                is Response.Chunked -> NanoHTTPD.newChunkedResponse(
+                    statusOf(resp.status),
+                    resp.contentType,
+                    resp.body
+                )
+            }
         } catch (t: Throwable) {
             Log.e(TAG, "session handling threw", t)
             NanoHTTPD.newFixedLengthResponse(
@@ -140,6 +146,16 @@ class HttpServer(
             if (method == NanoHTTPD.Method.POST) {
                 val body = readBody(session)
                 return Request.RunModel(
+                    modelId = m.groupValues[1],
+                    body = json.decodeFromString<RunModelRequest>(body)
+                )
+            }
+        }
+        // POST /v1/models/{id}/run_stream — NDJSON chunked stream
+        Regex("""^/v1/models/([^/]+)/run_stream$""").matchEntire(uri)?.let { m ->
+            if (method == NanoHTTPD.Method.POST) {
+                val body = readBody(session)
+                return Request.RunModelStream(
                     modelId = m.groupValues[1],
                     body = json.decodeFromString<RunModelRequest>(body)
                 )
