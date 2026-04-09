@@ -16,6 +16,7 @@
  */
 package com.example.QuickAI.service
 
+import android.content.Context
 import android.util.Log
 import com.example.QuickAI.service.backend.Backend
 import com.example.QuickAI.service.backend.BackendResult
@@ -23,7 +24,15 @@ import com.example.QuickAI.service.backend.LiteRtLmBackend
 import com.example.QuickAI.service.backend.NativeCausalLmBackend
 import java.util.concurrent.ConcurrentHashMap
 
-class ModelRegistry {
+/**
+ * @param appContext application context used by backends that need to
+ *        resolve on-device paths (LiteRT-LM fallback model path in
+ *        particular). Stored as the application context so it outlives
+ *        any single activity.
+ */
+class ModelRegistry(
+    private val appContext: Context
+) {
 
     private val workers = ConcurrentHashMap<String, ModelWorker>()
 
@@ -121,7 +130,7 @@ class ModelRegistry {
      * the native engine.
      */
     private fun createBackendFor(req: LoadModelRequest): Backend = when (req.model) {
-        ModelId.GEMMA4 -> LiteRtLmBackend()
+        ModelId.GEMMA4 -> LiteRtLmBackend(appContext)
         else -> NativeCausalLmBackend()
     }
 

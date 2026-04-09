@@ -56,7 +56,7 @@ class QuickAIService : Service() {
         // that need the native library get a clean MODEL_LOAD_FAILED.
         NativeCausalLm.ensureLoaded()
 
-        registry = ModelRegistry()
+        registry = ModelRegistry(applicationContext)
         httpServer = HttpServer(
             hostname = "127.0.0.1",
             preferredPort = DEFAULT_QUICKAI_PORT,

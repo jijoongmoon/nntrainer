@@ -17,6 +17,7 @@
  */
 package com.example.QuickAI.service.backend
 
+import android.content.Context
 import android.util.Log
 import com.example.QuickAI.service.BackendType as QuickAiBackendType
 import com.example.QuickAI.service.LoadModelRequest
@@ -26,14 +27,20 @@ import com.google.ai.edge.litertlm.Backend as LlmBackend
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import java.io.File
 
 /**
  * @brief LiteRT-LM-backed implementation for Gemma4.
  *
  * Non-thread-safe by design — one ModelWorker owns one backend instance
  * and drives it from its dedicated worker thread (Architecture.md §2.6).
+ *
+ * @param appContext application context, used only to resolve the
+ *        test-mode fallback model path via getExternalFilesDir().
  */
-class LiteRtLmBackend : Backend {
+class LiteRtLmBackend(
+    private val appContext: Context
+) : Backend {
 
     override val kind: String = "litert-lm"
 
@@ -57,16 +64,34 @@ class LiteRtLmBackend : Backend {
         // TEST HARDCODING (see gemma-model-path.md): during bring-up we
         // want `POST /v1/models` with model=GEMMA4 to Just Work even if
         // the client forgets to pass model_path. Fall back to the known
-        // good on-device path so we can end-to-end-verify the LiteRT-LM
-        // pipeline. Remove once the client UI reliably supplies a path.
+        // good on-device path inside our external files dir so we can
+        // end-to-end-verify the LiteRT-LM pipeline.
+        //
+        // /data/local/tmp is NOT app-readable on user builds: it carries
+        // the shell_data_file SELinux context and the untrusted_app
+        // domain is denied read access. Use getExternalFilesDir() which
+        // (a) requires no runtime permissions, (b) is always writable by
+        // adb, and (c) is already created by the framework for us.
         val modelPath = req.modelPath?.takeIf { it.isNotBlank() }
-            ?: TEST_GEMMA4_MODEL_PATH.also {
+            ?: run {
+                val fallback = testModelFile().absolutePath
                 Log.w(
                     TAG,
-                    "loadModel: model_path not provided, falling back to test " +
-                        "hardcoded path: $it"
+                    "loadModel: model_path not provided, falling back to " +
+                        "test path: $fallback"
                 )
+                fallback
             }
+
+        if (!File(modelPath).exists()) {
+            val parentDir = testModelFile().parentFile?.absolutePath ?: "<unknown>"
+            val hint = "push it with: adb push $TEST_GEMMA4_FILE_NAME $parentDir/"
+            Log.e(TAG, "model file not found at $modelPath — $hint")
+            return BackendResult.Err(
+                QuickAiError.MODEL_LOAD_FAILED,
+                "model file not found at $modelPath. $hint"
+            )
+        }
 
         val llmBackend: LlmBackend = when (req.backend) {
             QuickAiBackendType.CPU -> LlmBackend.CPU()
@@ -168,19 +193,35 @@ class LiteRtLmBackend : Backend {
         engine = null
     }
 
+    /**
+     * @brief Build the test-mode fallback model file handle, rooted in
+     * the service's external files dir (app-private, no permissions).
+     * Creates the parent directory so `adb push` can write directly
+     * without a separate `mkdir -p`.
+     */
+    private fun testModelFile(): File {
+        val externalFiles = appContext.getExternalFilesDir(null)
+            ?: appContext.filesDir
+        val dir = File(externalFiles, TEST_GEMMA4_REL_DIR)
+        if (!dir.exists()) dir.mkdirs()
+        return File(dir, TEST_GEMMA4_FILE_NAME)
+    }
+
     companion object {
         private const val TAG = "LiteRtLmBackend"
 
         /**
-         * @brief TEST ONLY — absolute on-device path to the Gemma-4 E2B-IT
-         * `.litertlm` model used for LiteRT-LM bring-up.
+         * @brief TEST ONLY — path components of the Gemma-4 E2B-IT
+         * `.litertlm` model, relative to the service's external files
+         * dir. The absolute path is resolved at runtime via
+         * [testModelFile] so it always reflects the actual app package.
          *
-         * Kept in sync with gemma-model-path.md at the repo root. Push the
-         * file with adb before installing the app:
+         * Kept in sync with gemma-model-path.md at the repo root. Push
+         * the file with adb before installing the app:
          *   adb push gemma-4-E2B-it.litertlm \
-         *       /data/local/tmp/Quick.AI/models/gemma-4-E2B-it/
+         *       /sdcard/Android/data/com.example.QuickAI/files/models/gemma-4-E2B-it/
          */
-        const val TEST_GEMMA4_MODEL_PATH: String =
-            "/data/local/tmp/Quick.AI/models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
+        const val TEST_GEMMA4_REL_DIR: String = "models/gemma-4-E2B-it"
+        const val TEST_GEMMA4_FILE_NAME: String = "gemma-4-E2B-it.litertlm"
     }
 }

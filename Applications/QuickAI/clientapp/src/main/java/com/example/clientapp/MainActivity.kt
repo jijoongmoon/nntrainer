@@ -296,12 +296,21 @@ class MainActivity : AppCompatActivity() {
 
         /**
          * TEST ONLY — absolute on-device path to the Gemma-4 E2B-IT
-         * `.litertlm` model, kept in sync with gemma-model-path.md at the
-         * repo root and the server-side constant in LiteRtLmBackend.kt.
-         * Prefilled into the model-path field so the LiteRT-LM flow works
-         * with a single Load click during bring-up.
+         * `.litertlm` model, kept in sync with gemma-model-path.md at
+         * the repo root and with the fallback resolved server-side in
+         * LiteRtLmBackend.testModelFile(). Prefilled into the model-path
+         * field so the LiteRT-LM flow works with a single Load click
+         * during bring-up.
+         *
+         * Located in the LauncherApp service's external files dir
+         * (/sdcard/Android/data/com.example.QuickAI/files/…) rather than
+         * /data/local/tmp — the latter is blocked for regular apps by
+         * SELinux (shell_data_file context). Push with:
+         *   adb push gemma-4-E2B-it.litertlm \
+         *     /sdcard/Android/data/com.example.QuickAI/files/models/gemma-4-E2B-it/
          */
         const val TEST_GEMMA4_MODEL_PATH: String =
-            "/data/local/tmp/Quick.AI/models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
+            "/sdcard/Android/data/com.example.QuickAI/files/" +
+                "models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
     }
 }
