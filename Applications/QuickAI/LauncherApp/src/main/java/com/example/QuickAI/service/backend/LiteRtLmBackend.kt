@@ -241,7 +241,7 @@ class LiteRtLmBackend(
         val accumulated = StringBuilder()
         // Outcome is published from the callback thread and read on the
         // worker thread after latch.await() returns.
-        @Volatile var terminalError: BackendResult.Err? = null
+        var terminalError: BackendResult.Err? = null
         val startNs = System.nanoTime()
 
         val callback = object : MessageCallback {
