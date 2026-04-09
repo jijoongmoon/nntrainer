@@ -54,14 +54,19 @@ class LiteRtLmBackend : Backend {
     private var lastRunDurationMs: Double = 0.0
 
     override fun load(req: LoadModelRequest): BackendResult<Unit> {
-        val modelPath = req.modelPath
-        if (modelPath.isNullOrBlank()) {
-            return BackendResult.Err(
-                QuickAiError.INVALID_PARAMETER,
-                "LiteRT-LM (Gemma4) requires an explicit model_path to a " +
-                    ".litertlm file in the loadModel request"
-            )
-        }
+        // TEST HARDCODING (see gemma-model-path.md): during bring-up we
+        // want `POST /v1/models` with model=GEMMA4 to Just Work even if
+        // the client forgets to pass model_path. Fall back to the known
+        // good on-device path so we can end-to-end-verify the LiteRT-LM
+        // pipeline. Remove once the client UI reliably supplies a path.
+        val modelPath = req.modelPath?.takeIf { it.isNotBlank() }
+            ?: TEST_GEMMA4_MODEL_PATH.also {
+                Log.w(
+                    TAG,
+                    "loadModel: model_path not provided, falling back to test " +
+                        "hardcoded path: $it"
+                )
+            }
 
         val llmBackend: LlmBackend = when (req.backend) {
             QuickAiBackendType.CPU -> LlmBackend.CPU()
@@ -165,5 +170,17 @@ class LiteRtLmBackend : Backend {
 
     companion object {
         private const val TAG = "LiteRtLmBackend"
+
+        /**
+         * @brief TEST ONLY — absolute on-device path to the Gemma-4 E2B-IT
+         * `.litertlm` model used for LiteRT-LM bring-up.
+         *
+         * Kept in sync with gemma-model-path.md at the repo root. Push the
+         * file with adb before installing the app:
+         *   adb push gemma-4-E2B-it.litertlm \
+         *       /data/local/tmp/Quick.AI/models/gemma-4-E2B-it/
+         */
+        const val TEST_GEMMA4_MODEL_PATH: String =
+            "/data/local/tmp/Quick.AI/models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
     }
 }

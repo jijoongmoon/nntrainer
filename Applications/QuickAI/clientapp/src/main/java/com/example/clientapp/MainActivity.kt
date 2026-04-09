@@ -23,6 +23,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -54,11 +55,17 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         val pad = (resources.displayMetrics.density * 16).toInt()
+        // A vertical ScrollView wraps everything so long Gemma4 outputs
+        // (which can easily exceed the visible area) remain readable.
+        val scrollRoot = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+            isFillViewport = true
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
             gravity = Gravity.TOP
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
         }
 
         // --- Connection indicator bar (always at the very top) ---------
@@ -115,6 +122,10 @@ class MainActivity : AppCompatActivity() {
         modelPathField = EditText(this).apply {
             hint = "Model path (required for GEMMA4 / LiteRT-LM)"
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+            // TEST HARDCODING: prefill with the known-good Gemma4 path
+            // from gemma-model-path.md so the LiteRT-LM flow works with a
+            // single Load click. The user can still edit/clear it.
+            setText(TEST_GEMMA4_MODEL_PATH)
         }
         root.addView(modelPathField)
 
@@ -148,10 +159,14 @@ class MainActivity : AppCompatActivity() {
         outputView = TextView(this).apply {
             text = ""
             setPadding(0, pad, 0, 0)
+            // Allow the user to long-press to copy the generated output
+            // — handy for inspecting Gemma4 responses.
+            setTextIsSelectable(true)
         }
         root.addView(outputView)
 
-        setContentView(root)
+        scrollRoot.addView(root)
+        setContentView(scrollRoot)
 
         // Periodic health poll. Runs only while the activity is at least
         // STARTED, so it automatically pauses in the background and
@@ -278,5 +293,15 @@ class MainActivity : AppCompatActivity() {
         val COLOR_CONNECTED = Color.parseColor("#2E7D32")
         val COLOR_DISCONNECTED = Color.parseColor("#C62828")
         val COLOR_UNKNOWN = Color.parseColor("#757575")
+
+        /**
+         * TEST ONLY — absolute on-device path to the Gemma-4 E2B-IT
+         * `.litertlm` model, kept in sync with gemma-model-path.md at the
+         * repo root and the server-side constant in LiteRtLmBackend.kt.
+         * Prefilled into the model-path field so the LiteRT-LM flow works
+         * with a single Load click during bring-up.
+         */
+        const val TEST_GEMMA4_MODEL_PATH: String =
+            "/data/local/tmp/Quick.AI/models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
     }
 }
