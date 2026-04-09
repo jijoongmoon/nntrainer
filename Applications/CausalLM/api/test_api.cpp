@@ -69,6 +69,36 @@ void printInfo(const std::string &label, const std::string &value) {
             << "\n";
 }
 
+/**
+ * @brief User-data passed to onStreamDelta() for accumulating the
+ *        streamed generation.
+ */
+struct StreamCollector {
+  std::string accumulated;
+  size_t delta_count = 0;
+};
+
+/**
+ * @brief CausalLmTokenCallback implementation: prints each decoded
+ *        delta immediately and stashes a copy in @p user_data.
+ *
+ * Returning 0 continues generation; returning non-zero would ask the
+ * native runner to cancel at the next token boundary.
+ */
+int onStreamDelta(const char *delta, void *user_data) {
+  auto *col = static_cast<StreamCollector *>(user_data);
+  if (delta != nullptr) {
+    // Print and flush so the user actually sees tokens appear one by
+    // one rather than all at once at the end of the run.
+    std::cout << delta << std::flush;
+    if (col != nullptr) {
+      col->accumulated.append(delta);
+      col->delta_count += 1;
+    }
+  }
+  return 0;
+}
+
 void printLogo() {
   std::cout << "\n";
   std::cout << COLOR_BOLD << COLOR_MAGENTA;
@@ -187,68 +217,54 @@ int main(int argc, char *argv[]) {
               << "\n";
   }
 
-  err = loadModel(CAUSAL_LM_BACKEND_CPU, model_type, quant_type);
+  CausalLmHandle handle = nullptr;
+  err = loadModelHandle(CAUSAL_LM_BACKEND_CPU, model_type, quant_type, &handle);
 
-  if (err != CAUSAL_LM_ERROR_NONE) {
+  if (err != CAUSAL_LM_ERROR_NONE || handle == nullptr) {
     printError("Failed to load model");
     std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
     return 1;
   }
   printSuccess("Model loaded successfully");
 
-  printSection("Inference");
+  printSection("Inference (Streaming)");
   std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Input Prompt:\n";
   std::cout << COLOR_BOLD << COLOR_YELLOW << "  " << prompt << COLOR_RESET
             << "\n\n";
 
-  std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET << "Running inference...\n\n";
+  std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
+            << "Running inference via runModelHandleStreaming()...\n\n";
 
-  const char *outputText = nullptr;
+  std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+  std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
 
-  if (verbose) {
-    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
-    std::cout << COLOR_BOLD << COLOR_GRAY;
-  }
+  StreamCollector collector;
+  err =
+    runModelHandleStreaming(handle, prompt, &onStreamDelta, &collector);
 
-  err = runModel(prompt, &outputText);
-
-  if (verbose) {
-    std::cout << COLOR_RESET << "\n\n";
-  }
+  // Reset colors after the streamed region — every delta was emitted
+  // from inside onStreamDelta() above.
+  std::cout << COLOR_RESET << "\n\n";
 
   if (err != CAUSAL_LM_ERROR_NONE) {
     printError("Failed to run model");
     std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+    destroyModelHandle(handle);
     return 1;
   }
 
-  if (outputText) {
-    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Output:\n";
-    std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
-    std::string out(outputText);
-    size_t pos = 0;
-    while (pos < out.length()) {
-      size_t newlinePos = out.find('\n', pos);
-      if (newlinePos == std::string::npos) {
-        newlinePos = out.length();
-      }
-      std::string line = out.substr(pos, newlinePos - pos);
-      std::cout << line;
-      if (newlinePos < out.length()) {
-        std::cout << "\n  ";
-        pos = newlinePos + 1;
-      } else {
-        pos = out.length();
-      }
-    }
-    std::cout << COLOR_RESET << "\n\n";
-  } else {
+  if (collector.accumulated.empty()) {
     printWarning("No output generated");
+  } else {
+    printInfo("Streamed deltas", std::to_string(collector.delta_count));
+    printInfo("Total bytes",
+              std::to_string(collector.accumulated.size()) + " bytes");
+    std::cout << "\n";
   }
 
   printSection("Performance Metrics");
   PerformanceMetrics metrics;
-  err = getPerformanceMetrics(&metrics);
+  err = getPerformanceMetricsHandle(handle, &metrics);
   if (err != CAUSAL_LM_ERROR_NONE) {
     printWarning("Failed to get metrics");
     std::cout << "  Error code: " << static_cast<int>(err) << "\n";
@@ -295,6 +311,8 @@ int main(int argc, char *argv[]) {
     std::cout << COLOR_CYAN << "    Peak Mem:" << COLOR_RESET << "     "
               << metrics.peak_memory_kb / 1024 << " MB\n\n";
   }
+
+  destroyModelHandle(handle);
 
   printLine("═", 63);
   std::cout << COLOR_BOLD << COLOR_GREEN << "  ✓ Test completed successfully!"
