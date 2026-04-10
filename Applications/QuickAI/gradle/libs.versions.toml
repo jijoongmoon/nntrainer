@@ -1,5 +1,12 @@
 [versions]
-agp = "9.1.0"
+# AGP 9.0.1 (January 2026) instead of 9.1.0 (March 2026) because the
+# plugin marker for 9.1.0 is not reliably resolvable from every
+# environment yet. 9.0.1 has been in Google Maven / the Gradle Plugin
+# Portal longer and is widely mirrored. If you want to move back to
+# 9.1.x later, also restore the `compileSdk { version = release(36)
+# { minorApiLevel = 1 } }` blocks in each module — that minorApiLevel
+# DSL was added in 9.1.0 and is not understood by 9.0.x.
+agp = "9.0.1"
 kotlin = "2.2.21"
 kotlinxSerialization = "1.7.3"
 kotlinxCoroutines = "1.9.0"

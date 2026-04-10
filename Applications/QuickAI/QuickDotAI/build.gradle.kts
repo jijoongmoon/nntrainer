@@ -27,11 +27,7 @@ val copyPrebuiltNativeLibs = tasks.register<Copy>("copyPrebuiltNativeLibs") {
 
 android {
     namespace = "com.example.quickdotai"
-    compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
-    }
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 33
