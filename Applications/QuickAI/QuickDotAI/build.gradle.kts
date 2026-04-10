@@ -86,6 +86,12 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+        // LiteRT-LM 0.10.0 (the version our mirror serves) was compiled
+        // with Kotlin 2.3.0 but our compiler is 2.2.21; the flag tells
+        // kotlinc to accept the newer metadata stamp on the LiteRT-LM
+        // AAR this module directly links against. See
+        // libs.versions.toml for the full story.
+        freeCompilerArgs += "-Xskip-metadata-version-check"
     }
 }
 
@@ -111,5 +117,14 @@ dependencies {
 
     // LiteRT-LM is the engine used by LiteRTLm.kt for Gemma-family models.
     // Exposed as `api` so consumers don't have to redeclare it.
-    api("com.google.ai.edge.litertlm:litertlm-android:latest.release")
+    //
+    // Pinned to an explicit version via the version catalog instead of
+    // `latest.release`: dynamic versions are non-deterministic (they
+    // resolve differently depending on what each environment's Maven
+    // mirror happens to cache) and they caused a hard failure earlier
+    // when one mirror served 0.10.0 as "latest" while our Kotlin
+    // compiler was pinned to a version that could not read 0.10.0's
+    // metadata stamp. See gradle/libs.versions.toml for the rationale
+    // behind the exact pin.
+    api(libs.litertlm.android)
 }

@@ -41,6 +41,11 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+        // LiteRT-LM 0.10.0 (the version our mirror serves) was compiled
+        // with Kotlin 2.3.0 but our compiler is 2.2.21; the flag tells
+        // kotlinc to accept the newer metadata stamp on transitive
+        // artifacts. See libs.versions.toml for the full story.
+        freeCompilerArgs += "-Xskip-metadata-version-check"
     }
 }
 
