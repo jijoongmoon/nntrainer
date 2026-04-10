@@ -19,8 +19,13 @@
 #define __QUICK_DOT_AI_API_H__
 
 /* ── Extended model types (src additions) ────────────────────── */
+
 #ifdef __CAUSAL_LM_API_H__
-/* Model types already defined from causal_lm_api.h */
+
+#ifndef CAUSAL_LM_MODEL_GAUSS2_5
+#define CAUSAL_LM_MODEL_GAUSS2_5 ((ModelType)1)
+#endif
+
 #else /* causal_lm_api.h not included — provide full definitions */
 
 #define __CAUSAL_LM_API_H__
@@ -58,6 +63,7 @@ typedef enum {
 
 typedef enum {
   CAUSAL_LM_MODEL_QWEN3_0_6B = 0,
+  CAUSAL_LM_MODEL_GAUSS2_5 = 1,
 } ModelType;
 
 typedef struct {

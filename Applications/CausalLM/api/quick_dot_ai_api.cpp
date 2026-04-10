@@ -785,6 +785,16 @@ ErrorCode runModelHandleStreaming(CausalLmHandle handle,
   return CAUSAL_LM_ERROR_NONE;
 }
 
+ErrorCode unloadModelHandle(CausalLmHandle handle) {
+  if (handle == nullptr) {
+    return CAUSAL_LM_ERROR_NONE;
+  }
+  std::lock_guard<std::mutex> lock(handle->mtx);
+  handle->model.reset();
+  handle->initialized = false;
+  return CAUSAL_LM_ERROR_NONE;
+}
+
 ErrorCode destroyModelHandle(CausalLmHandle handle) {
   if (handle == nullptr) {
     return CAUSAL_LM_ERROR_NONE;

@@ -214,6 +214,16 @@ Java_com_example_quickdotai_NativeCausalLm_getPerformanceMetricsHandleNative(
 }
 
 // ---------------------------------------------------------------------------
+// unloadModelHandle
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_quickdotai_NativeCausalLm_unloadModelHandleNative(
+  JNIEnv * /*env*/, jobject /*thiz*/, jlong handleJlong) {
+  auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
+  return static_cast<jint>(unloadModelHandle(handle));
+}
+
+// ---------------------------------------------------------------------------
 // destroyModelHandle
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jint JNICALL

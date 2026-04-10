@@ -125,6 +125,19 @@ interface QuickDotAI {
     }
 
     /**
+     * @brief Unload the model weights without destroying the engine.
+     *
+     * After a successful unload the engine is in a "not initialized" state
+     * — subsequent [run] / [runStreaming] / [metrics] calls will return
+     * [QuickAiError.NOT_INITIALIZED]. The instance can still be [close]d
+     * normally (and must be, to release any remaining resources).
+     *
+     * Implementations that do not support partial unload may treat this as
+     * a full [close] or return [BackendResult.Ok] as a no-op.
+     */
+    fun unload(): BackendResult<Unit>
+
+    /**
      * @brief Fetch performance metrics for the most recent run.
      */
     fun metrics(): BackendResult<PerformanceMetrics>

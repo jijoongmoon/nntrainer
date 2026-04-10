@@ -239,6 +239,24 @@ class NativeQuickDotAI : QuickDotAI {
         }
     }
 
+    override fun unload(): BackendResult<Unit> {
+        if (!loaded || handle == 0L) {
+            return BackendResult.Ok(Unit)
+        }
+        return try {
+            val ec = NativeCausalLm.unloadModelHandleNative(handle)
+            loaded = false
+            if (ec != 0) {
+                BackendResult.Err(QuickAiError.fromNativeCode(ec))
+            } else {
+                BackendResult.Ok(Unit)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "unloadModelHandleNative threw", t)
+            BackendResult.Err(QuickAiError.UNKNOWN, t.message)
+        }
+    }
+
     override fun close() {
         if (handle != 0L) {
             try {

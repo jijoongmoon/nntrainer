@@ -320,6 +320,12 @@ class LiteRTLm(
         }
     }
 
+    override fun unload(): BackendResult<Unit> {
+        Log.i(TAG, "unload() invoked")
+        closeQuietly()
+        return BackendResult.Ok(Unit)
+    }
+
     override fun metrics(): BackendResult<PerformanceMetrics> {
         if (conversation == null) {
             return BackendResult.Err(

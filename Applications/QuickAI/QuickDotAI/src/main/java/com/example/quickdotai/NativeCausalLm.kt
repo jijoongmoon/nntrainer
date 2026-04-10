@@ -160,6 +160,9 @@ object NativeCausalLm {
     /** Forwards to `getPerformanceMetricsHandle` in quick_dot_ai_api.h. */
     external fun getPerformanceMetricsHandleNative(handle: Long): MetricsResult
 
+    /** Forwards to `unloadModelHandle` in quick_dot_ai_api.h. */
+    external fun unloadModelHandleNative(handle: Long): Int
+
     /** Forwards to `destroyModelHandle` in quick_dot_ai_api.h. */
     external fun destroyModelHandleNative(handle: Long): Int
 

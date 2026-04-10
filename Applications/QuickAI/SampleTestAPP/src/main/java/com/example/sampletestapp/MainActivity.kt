@@ -363,17 +363,20 @@ class MainActivity : AppCompatActivity() {
     private fun onUnloadClicked() {
         engineExecutor.execute {
             val e = engine
-            engine = null
-            loadedKey = null
             if (e == null) {
                 setStatus("Nothing to unload.")
                 return@execute
             }
-            try {
-                e.close()
-                setStatus("Unloaded.")
-            } catch (t: Throwable) {
-                setStatus("Unload threw: ${t.message}")
+            when (val r = e.unload()) {
+                is BackendResult.Ok -> {
+                    // Keep the engine instance alive so onDestroy can still
+                    // call close(), but clear loadedKey so a subsequent Load
+                    // tap creates a fresh engine.
+                    loadedKey = null
+                    setStatus("Unloaded.")
+                }
+                is BackendResult.Err ->
+                    setStatus("Unload failed: [${r.error.name}] ${r.message ?: ""}")
             }
         }
     }
