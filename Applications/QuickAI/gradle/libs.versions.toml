@@ -10,7 +10,12 @@
 #
 # Compatibility notes:
 #  - Gradle 8.11.1 (January 2025) is the paired Gradle for AGP 8.9.x.
-#  - AGP 8.9.0 (March 2025) is the first AGP with full API 36 support.
+#  - AGP 8.9.1 (April 2025) is the minimum that satisfies the
+#    `[minCompileSdk AGP metadata]` pinned by androidx.core 1.18.0,
+#    androidx.activity 1.13.0 and androidx.navigationevent 1.0.0.
+#    AGP 8.9.0 hits AAR metadata check with "requires Android Gradle
+#    plugin 8.9.1 or higher" for those deps. The bump is a pure patch
+#    version, released a month after 8.9.0, and has full API 36 support.
 #  - Kotlin 2.0.21 (December 2024) is the last Kotlin-2.0 patch, works
 #    out of the box with AGP 8.9.x and Gradle 8.11.1.
 #  - kotlinx.serialization 1.7.3 remains compatible with Kotlin 2.0.x.
@@ -19,7 +24,7 @@
 # step once the target environment has those newer artifacts in its
 # mirror. Bump agp -> 9.0.1+, kotlin -> 2.2.x, and the Gradle wrapper
 # to 9.3.1+ in gradle/wrapper/gradle-wrapper.properties together.
-agp = "8.9.0"
+agp = "8.9.1"
 kotlin = "2.0.21"
 kotlinxSerialization = "1.7.3"
 kotlinxCoroutines = "1.9.0"
