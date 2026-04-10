@@ -1027,6 +1027,38 @@ endif
 
 include $(CLEAR_VARS)
 
+  LOCAL_MODULE : = unittest_neon_gelu LOCAL_CFLAGS
+  : = -Igoogletest / include - I../ include - I../ unittest / layers
+      - I../../ nntrainer / layers / loss - pthread - fexceptions - fopenmp -
+      static - openmp - DMIN_CPP_VERSION =
+        201703L - DNNTR_NUM_THREADS =
+          1 - D__LOGGING__ = 1 - DENABLE_TEST = 1 - DREDUCE_TOLERANCE =
+                                                  1 $(ARM_MARCH_FLAGS) - O3
+                                                  - frtti - DNDK_BUILD =
+                                                    1 LOCAL_CXXFLAGS +=
+    -std = c++ 17 - frtti - fexceptions LOCAL_LDLIBS : = -llog - landroid
+                                                         - fopenmp - static -
+                                                         openmp
+
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_neon_gelu.cpp
+
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
+
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
+
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl LOCAL_STATIC_LIBRARIES
+    += clblast endif
+
+    include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+
   LOCAL_MODULE : = unittest_nntrainer_cpu_backend_fp16 LOCAL_CFLAGS
   : = -Igoogletest / include - I../ include - I../ unittest / layers
       - I../../ nntrainer / layers / loss - pthread - fexceptions - fopenmp -
@@ -1053,7 +1085,8 @@ include $(CLEAR_VARS)
   : = googletest_main test_util
 
     ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
-    += opencl endif
+    += opencl LOCAL_STATIC_LIBRARIES
+    += clblast endif
 
     include $(BUILD_EXECUTABLE)
 
