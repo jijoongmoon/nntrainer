@@ -30,6 +30,8 @@ Applications/**/tokenizers-cpp-build/*
 !Applications/QuickAI/LauncherApp/src/main/res/**
 !Applications/QuickAI/clientapp/src/main/res
 !Applications/QuickAI/clientapp/src/main/res/**
+!Applications/QuickAI/SampleTestAPP/src/main/res
+!Applications/QuickAI/SampleTestAPP/src/main/res/**
 
 # CTag
 /tags

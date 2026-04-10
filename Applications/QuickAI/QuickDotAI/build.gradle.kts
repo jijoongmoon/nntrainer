@@ -58,9 +58,14 @@ android {
             // Pick up the generated/jniLibs/<abi>/*.so tree produced by
             // copyPrebuiltNativeLibs above, alongside any hand-placed files
             // in src/main/jniLibs/.
+            //
+            // `buildDir` getter was deprecated in Gradle 8 and removed in
+            // Gradle 9; use the Provider-based layout.buildDirectory API
+            // so this file is forward-compatible with Gradle 9 if we
+            // ever roll the wrapper back up.
             jniLibs.srcDirs(
                 "src/main/jniLibs",
-                file("${buildDir}/generated/jniLibs")
+                layout.buildDirectory.dir("generated/jniLibs").get().asFile
             )
         }
     }
