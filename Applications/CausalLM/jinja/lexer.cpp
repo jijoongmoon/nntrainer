@@ -59,9 +59,7 @@ std::vector<Token> Lexer::tokenize() {
     } else if (match("{{")) {
       // Handle whitespace trimming: {{-
       pos_ += 2;
-      bool ltrim = false;
       if (!at_end() && peek() == '-') {
-        ltrim = true;
         pos_++;
         // Trim trailing whitespace from previous text token
         if (!tokens.empty() && tokens.back().type == TokenType::Text) {
@@ -77,9 +75,7 @@ std::vector<Token> Lexer::tokenize() {
       scan_inner_tokens(tokens, "}}");
     } else if (match("{%")) {
       pos_ += 2;
-      bool ltrim = false;
       if (!at_end() && peek() == '-') {
-        ltrim = true;
         pos_++;
         if (!tokens.empty() && tokens.back().type == TokenType::Text) {
           auto &txt = tokens.back().value;
