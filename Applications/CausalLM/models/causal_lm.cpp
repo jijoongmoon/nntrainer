@@ -151,7 +151,8 @@ void CausalLM::registerOutputs(
                  decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
         // ends with an incomplete token, hold on
       } else {
-        if (log_output) {
+        // Only print to stdout if we're not streaming (streamer handles output)
+        if (log_output && streamer_ == nullptr) {
 #if defined(_WIN32)
           std::wcout << L"" << utf8_to_wstring(decoded_str);
           std::wcout.flush();
