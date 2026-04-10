@@ -7,15 +7,20 @@
  *          no QuickAIService, no REST, no remote process.
  *
  * The user picks a (ModelId, BackendType, QuantizationType) triple, types
- * a prompt, and taps "Run (streaming)". MainActivity:
+ * a prompt, optionally picks an image via the system photo picker, and
+ * taps "Run (streaming)". MainActivity:
  *
  *  1. Instantiates [LiteRTLm] for GEMMA4 and [NativeQuickDotAI] for
  *     every other model, both against a single-thread Executor so all
  *     calls touching a given engine are serialised on the same worker
  *     thread (the interface is not internally thread-safe).
  *  2. Calls [QuickDotAI.load] once per chosen (model, quant) pair.
- *  3. Drives [QuickDotAI.runStreaming] with an in-memory StreamSink that
- *     appends each delta to the output TextView on the main thread.
+ *     For GEMMA4 it auto-populates [LoadModelRequest.visionBackend] so
+ *     the multimodal path is armed from load time.
+ *  3. Drives [QuickDotAI.runStreaming] (text-only) or
+ *     [QuickDotAI.runMultimodalStreaming] (when an image is selected)
+ *     with an in-memory StreamSink that appends each delta to the
+ *     output TextView on the main thread.
  *
  * This exists as the end-to-end proof that the AAR is genuinely reusable
  * from a third-party app — LauncherApp keeps the HTTP plumbing, but
@@ -24,6 +29,7 @@
  */
 package com.example.sampletestapp
 
+import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
@@ -37,6 +43,8 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.example.quickdotai.BackendResult
 import com.example.quickdotai.BackendType
@@ -44,6 +52,7 @@ import com.example.quickdotai.LiteRTLm
 import com.example.quickdotai.LoadModelRequest
 import com.example.quickdotai.ModelId
 import com.example.quickdotai.NativeQuickDotAI
+import com.example.quickdotai.PromptPart
 import com.example.quickdotai.QuantizationType
 import com.example.quickdotai.QuickAiError
 import com.example.quickdotai.QuickDotAI
@@ -84,8 +93,46 @@ class MainActivity : AppCompatActivity() {
     private lateinit var quantSpinner: Spinner
     private lateinit var modelPathField: EditText
     private lateinit var promptField: EditText
+    private lateinit var imageStatusView: TextView
     private lateinit var statusView: TextView
     private lateinit var outputView: TextView
+
+    /**
+     * @brief Raw bytes of the most recently picked image, or null if
+     * no image is currently selected.
+     *
+     * Written by the image-reader thread spawned in
+     * [readImageBytesAsync] and by [onClearImageClicked]; read by the
+     * engine thread inside [onRunClicked]. `@Volatile` is enough —
+     * we never need a read-modify-write cycle on this field.
+     */
+    @Volatile
+    private var selectedImageBytes: ByteArray? = null
+
+    /**
+     * @brief ActivityResult launcher for the Android system photo picker.
+     *
+     * `PickVisualMedia` does NOT require any runtime permissions — the
+     * system photo picker runs in a separate process and grants the
+     * caller a one-shot, URI-level read grant that stays valid for as
+     * long as we hold the returned [Uri]. We immediately drain the
+     * bytes on a background thread so we do not depend on that grant
+     * beyond the call to [readImageBytesAsync].
+     *
+     * Registered as a property so the contract is wired up BEFORE the
+     * activity reaches STARTED; calling [ActivityResultContracts] in
+     * onCreate after super.onCreate would also work, but the property
+     * form is the idiomatic one-liner.
+     */
+    private val imagePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        if (uri == null) {
+            setStatus("Image pick cancelled.")
+            return@registerForActivityResult
+        }
+        readImageBytesAsync(uri)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -190,6 +237,30 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(promptField)
 
+        // --- Image picker (multimodal, GEMMA4 only) -------------------
+        // Not hidden for non-GEMMA4 models on purpose — tapping Run
+        // with a selected image against a text-only engine exercises
+        // the UNSUPPORTED default in QuickDotAI.runMultimodal, which
+        // is a useful smoke test of that error path too.
+        root.addView(labelView("Image input (for GEMMA4 multimodal)"))
+        imageStatusView = TextView(this).apply {
+            text = "Image: none"
+            textSize = 13f
+        }
+        root.addView(imageStatusView)
+
+        val pickImageBtn = Button(this).apply {
+            text = "Pick image"
+            setOnClickListener { onPickImageClicked() }
+        }
+        root.addView(pickImageBtn)
+
+        val clearImageBtn = Button(this).apply {
+            text = "Clear image"
+            setOnClickListener { onClearImageClicked() }
+        }
+        root.addView(clearImageBtn)
+
         val runBtn = Button(this).apply {
             text = "Run (streaming)"
             setOnClickListener { onRunClicked() }
@@ -248,13 +319,27 @@ class MainActivity : AppCompatActivity() {
         val backend = BackendType.valueOf(backendSpinner.selectedItem as String)
         val quant = QuantizationType.valueOf(quantSpinner.selectedItem as String)
         val modelPath = modelPathField.text.toString().trim().ifEmpty { null }
+
+        // Auto-enable the vision encoder when loading a multimodal-
+        // capable model (currently only GEMMA4 → LiteRTLm). We reuse
+        // the user-selected compute backend so the vision encoder
+        // lands on the same device (CPU/GPU/NPU). For every other
+        // model the field stays null and LiteRTLm loads in text-only
+        // mode — runMultimodal then returns UNSUPPORTED, which the
+        // Run handler surfaces verbatim to the status bar.
+        val visionBackend = if (model == ModelId.GEMMA4) backend else null
+
         val req = LoadModelRequest(
             backend = backend,
             model = model,
             quantization = quant,
-            modelPath = modelPath
+            modelPath = modelPath,
+            visionBackend = visionBackend,
         )
-        setStatus("Loading ${req.modelKey}…")
+        setStatus(
+            "Loading ${req.modelKey}… " +
+                "(vision=${visionBackend?.name ?: "off"})"
+        )
         outputView.text = ""
 
         engineExecutor.execute {
@@ -301,9 +386,17 @@ class MainActivity : AppCompatActivity() {
             setStatus("Prompt is empty.")
             return
         }
+        // Snapshot the image bytes on the main thread so the engine
+        // thread sees a stable reference even if the user taps "Clear
+        // image" mid-run.
+        val imgBytes = selectedImageBytes
+
         // Clear any previous output before we start streaming.
         mainHandler.post { outputView.text = "" }
-        setStatus("Running…")
+        setStatus(
+            if (imgBytes != null) "Running multimodal (${imgBytes.size}B image)…"
+            else "Running…"
+        )
 
         engineExecutor.execute {
             val e = engine
@@ -322,10 +415,21 @@ class MainActivity : AppCompatActivity() {
                     setStatus("Run failed: [${error.name}] ${message ?: ""}")
                 }
             }
-            // runStreaming blocks until the backend finishes; that's
-            // fine because we're already off the main thread.
+            // Both streaming variants block until the backend finishes
+            // or errors out; that's fine because we're already off the
+            // main thread.
             try {
-                e.runStreaming(prompt, sink)
+                if (imgBytes != null) {
+                    // Canonical Gemma-4 / Gemma3n convention: image
+                    // part(s) first, then a trailing text instruction.
+                    val parts = listOf(
+                        PromptPart.ImageBytes(imgBytes),
+                        PromptPart.Text(prompt),
+                    )
+                    e.runMultimodalStreaming(parts, sink)
+                } else {
+                    e.runStreaming(prompt, sink)
+                }
             } catch (t: Throwable) {
                 setStatus("Run threw: ${t.message}")
             }
@@ -379,6 +483,68 @@ class MainActivity : AppCompatActivity() {
                     setStatus("Unload failed: [${r.error.name}] ${r.message ?: ""}")
             }
         }
+    }
+
+    // --- image picker handlers ----------------------------------------
+
+    /**
+     * @brief Launches the system photo picker (no runtime permissions
+     * required).
+     *
+     * Uses `PickVisualMedia.ImageOnly` to filter out videos. The
+     * result is dispatched to [imagePickerLauncher]'s callback, which
+     * drains the URI on a background thread via [readImageBytesAsync].
+     */
+    private fun onPickImageClicked() {
+        imagePickerLauncher.launch(
+            PickVisualMediaRequest(
+                ActivityResultContracts.PickVisualMedia.ImageOnly
+            )
+        )
+        setStatus("Opening photo picker…")
+    }
+
+    /**
+     * @brief Forgets the currently-selected image so the next Run tap
+     * falls back to the text-only [QuickDotAI.runStreaming] path.
+     */
+    private fun onClearImageClicked() {
+        selectedImageBytes = null
+        mainHandler.post { imageStatusView.text = "Image: none" }
+        setStatus("Image cleared.")
+    }
+
+    /**
+     * @brief Reads the picked image URI into a byte array on a
+     * throwaway background thread.
+     *
+     * We deliberately do NOT reuse [engineExecutor] here so a long-
+     * running inference does not block the image read and leave the
+     * user staring at a stale "Image: none" label. The thread is a
+     * one-shot daemon — it terminates as soon as the read completes.
+     *
+     * The bytes are the raw file contents (JPEG / PNG / …) — exactly
+     * what LiteRT-LM's `Content.ImageBytes` expects on the far side
+     * of [PromptPart.ImageBytes].
+     */
+    private fun readImageBytesAsync(uri: Uri) {
+        setStatus("Reading image…")
+        Thread({
+            try {
+                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                if (bytes == null || bytes.isEmpty()) {
+                    setStatus("Image read failed or empty.")
+                    return@Thread
+                }
+                selectedImageBytes = bytes
+                mainHandler.post {
+                    imageStatusView.text = "Image: ${bytes.size} bytes selected"
+                }
+                setStatus("Image loaded (${bytes.size} bytes). Tap Run to send.")
+            } catch (t: Throwable) {
+                setStatus("Failed to read image: ${t.message}")
+            }
+        }, "SampleTestAPP-ImageRead").apply { isDaemon = true }.start()
     }
 
     // --- helpers -------------------------------------------------------
