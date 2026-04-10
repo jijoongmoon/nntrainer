@@ -19,6 +19,8 @@ package com.example.quickdotai
 import android.content.Context
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend as LlmBackend
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
@@ -55,6 +57,12 @@ class LiteRTLm(
     // LiteRTLm instance. Closed in [close].
     private var engine: Engine? = null
     private var conversation: Conversation? = null
+
+    // True if the engine was loaded with a non-null visionBackend. We
+    // gate runMultimodal / runMultimodalStreaming on this so callers
+    // that loaded in text-only mode get a clear UNSUPPORTED error
+    // instead of a cryptic native failure deep inside LiteRT-LM.
+    private var visionEnabled: Boolean = false
 
     // Simple wall-clock metrics. LiteRT-LM's Kotlin API does not expose
     // token-level prefill/generation timings in the release we target,
@@ -109,26 +117,31 @@ class LiteRTLm(
                 "canRead=${modelFile.canRead()}"
         )
 
-        val llmBackend: LlmBackend = when (req.backend) {
-            BackendType.CPU -> LlmBackend.CPU()
-            BackendType.GPU -> LlmBackend.GPU()
-            // LiteRT-LM's NPU backend wants the dir holding the vendor
-            // native .so files. For an app-bundled setup that is simply
-            // the APK's nativeLibraryDir, but we don't have a Context
-            // here — fall back to CPU until the caller wires one in.
-            BackendType.NPU -> LlmBackend.CPU()
-        }
+        val llmBackend: LlmBackend = mapBackend(req.backend)
+        // Null visionBackend leaves the engine in text-only mode. A
+        // non-null value enables the multimodal code path and unblocks
+        // [runMultimodal] / [runMultimodalStreaming] at call time.
+        val visionLlmBackend: LlmBackend? = req.visionBackend?.let(::mapBackend)
+
         Log.i(
             TAG,
             "load(): mapped compute backend ${req.backend} -> " +
-                llmBackend::class.java.simpleName
+                "${llmBackend::class.java.simpleName}, vision=${req.visionBackend} -> " +
+                (visionLlmBackend?.let { it::class.java.simpleName } ?: "<none>")
         )
 
         val engineConfig = EngineConfig(
             modelPath = modelPath,
-            backend = llmBackend
+            backend = llmBackend,
+            visionBackend = visionLlmBackend,
+            maxNumImages = req.maxNumImages,
+            cacheDir = req.cacheDir,
         )
-        Log.i(TAG, "load(): EngineConfig built, constructing Engine…")
+        Log.i(
+            TAG,
+            "load(): EngineConfig built (maxNumImages=${req.maxNumImages}, " +
+                "cacheDir=${req.cacheDir}), constructing Engine…"
+        )
 
         return try {
             val startNs = System.nanoTime()
@@ -147,9 +160,11 @@ class LiteRTLm(
             initializationDurationMs = (System.nanoTime() - startNs) / 1_000_000.0
             engine = e
             conversation = c
+            visionEnabled = (visionLlmBackend != null)
             Log.i(
                 TAG,
-                "load(): SUCCESS, total init duration=${initializationDurationMs} ms"
+                "load(): SUCCESS, total init duration=${initializationDurationMs} ms, " +
+                    "visionEnabled=$visionEnabled"
             )
             BackendResult.Ok(Unit)
         } catch (t: Throwable) {
@@ -320,6 +335,209 @@ class LiteRTLm(
         }
     }
 
+    /**
+     * @brief Multimodal inference — blocking.
+     *
+     * Builds a LiteRT-LM [Contents] from [parts] and hands it to
+     * `conversation.sendMessage(contents)`. Returns the decoded text
+     * of the model's reply on success, or a [BackendResult.Err] on
+     * failure. Gated on [visionEnabled] so callers that forgot to set
+     * [LoadModelRequest.visionBackend] get a clear UNSUPPORTED error
+     * rather than a cryptic native crash.
+     */
+    override fun runMultimodal(parts: List<PromptPart>): BackendResult<String> {
+        val c = conversation
+            ?: run {
+                Log.e(TAG, "runMultimodal(): called before load() — conversation is null")
+                return BackendResult.Err(
+                    QuickAiError.NOT_INITIALIZED,
+                    "LiteRTLm has not been loaded yet"
+                )
+            }
+        if (!visionEnabled) {
+            Log.e(
+                TAG,
+                "runMultimodal(): engine loaded in text-only mode — " +
+                    "reload with LoadModelRequest.visionBackend set"
+            )
+            return BackendResult.Err(
+                QuickAiError.UNSUPPORTED,
+                "LiteRTLm was loaded without a visionBackend — reload with " +
+                    "LoadModelRequest.visionBackend set to a non-null value."
+            )
+        }
+        if (parts.isEmpty()) {
+            return BackendResult.Err(
+                QuickAiError.INVALID_PARAMETER,
+                "runMultimodal(): parts list is empty"
+            )
+        }
+
+        val contents = try {
+            toLiteRtContents(parts)
+        } catch (t: Throwable) {
+            Log.e(TAG, "runMultimodal(): failed to build Contents", t)
+            return BackendResult.Err(
+                QuickAiError.INVALID_PARAMETER,
+                t.message ?: "failed to build LiteRT-LM Contents from parts"
+            )
+        }
+
+        Log.i(TAG, "runMultimodal(): sending ${parts.size} parts")
+        return try {
+            val startNs = System.nanoTime()
+            val message = c.sendMessage(contents)
+            lastRunDurationMs = (System.nanoTime() - startNs) / 1_000_000.0
+            val output = message.toString()
+            Log.i(
+                TAG,
+                "runMultimodal(): sendMessage returned in ${lastRunDurationMs.toLong()} ms, " +
+                    "output length=${output.length}"
+            )
+            BackendResult.Ok(output)
+        } catch (t: Throwable) {
+            Log.e(TAG, "runMultimodal(): LiteRT-LM sendMessage failed", t)
+            BackendResult.Err(
+                QuickAiError.INFERENCE_FAILED,
+                t.message ?: "LiteRT-LM multimodal inference failed"
+            )
+        }
+    }
+
+    /**
+     * @brief Multimodal inference — streaming.
+     *
+     * Same shape as [runStreaming]: drives LiteRT-LM's
+     * `sendMessageAsync(contents, callback)` and forwards incremental
+     * deltas to [sink], blocking the caller thread on a
+     * [CountDownLatch] until the callback signals `onDone` or
+     * `onError`. The delta-extraction logic is shared with the
+     * text-only path (see [runStreaming] for the rationale behind
+     * the `accumulated` StringBuilder defensive handling).
+     */
+    override fun runMultimodalStreaming(
+        parts: List<PromptPart>,
+        sink: StreamSink
+    ): BackendResult<Unit> {
+        val c = conversation
+            ?: run {
+                Log.e(TAG, "runMultimodalStreaming(): called before load()")
+                val err = BackendResult.Err(
+                    QuickAiError.NOT_INITIALIZED,
+                    "LiteRTLm has not been loaded yet"
+                )
+                sink.onError(err.error, err.message)
+                return err
+            }
+        if (!visionEnabled) {
+            Log.e(TAG, "runMultimodalStreaming(): engine loaded in text-only mode")
+            val err = BackendResult.Err(
+                QuickAiError.UNSUPPORTED,
+                "LiteRTLm was loaded without a visionBackend — reload with " +
+                    "LoadModelRequest.visionBackend set to a non-null value."
+            )
+            sink.onError(err.error, err.message)
+            return err
+        }
+        if (parts.isEmpty()) {
+            val err = BackendResult.Err(
+                QuickAiError.INVALID_PARAMETER,
+                "runMultimodalStreaming(): parts list is empty"
+            )
+            sink.onError(err.error, err.message)
+            return err
+        }
+
+        val contents = try {
+            toLiteRtContents(parts)
+        } catch (t: Throwable) {
+            Log.e(TAG, "runMultimodalStreaming(): failed to build Contents", t)
+            val err = BackendResult.Err(
+                QuickAiError.INVALID_PARAMETER,
+                t.message ?: "failed to build LiteRT-LM Contents from parts"
+            )
+            sink.onError(err.error, err.message)
+            return err
+        }
+
+        Log.i(TAG, "runMultimodalStreaming(): ${parts.size} parts")
+
+        val latch = CountDownLatch(1)
+        val accumulated = StringBuilder()
+        var terminalError: BackendResult.Err? = null
+        val startNs = System.nanoTime()
+
+        val callback = object : MessageCallback {
+            override fun onMessage(message: Message) {
+                try {
+                    val full = message.toString()
+                    val delta = if (full.startsWith(accumulated.toString())) {
+                        full.substring(accumulated.length)
+                    } else {
+                        full
+                    }
+                    if (delta.isNotEmpty()) {
+                        accumulated.append(delta)
+                        sink.onDelta(delta)
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "runMultimodalStreaming(): onMessage threw", t)
+                }
+            }
+
+            override fun onDone() {
+                lastRunDurationMs = (System.nanoTime() - startNs) / 1_000_000.0
+                Log.i(
+                    TAG,
+                    "runMultimodalStreaming(): onDone after ${lastRunDurationMs.toLong()} ms, " +
+                        "total chars=${accumulated.length}"
+                )
+                try {
+                    sink.onDone()
+                } finally {
+                    latch.countDown()
+                }
+            }
+
+            override fun onError(throwable: Throwable) {
+                Log.e(TAG, "runMultimodalStreaming(): onError from LiteRT-LM", throwable)
+                val err = BackendResult.Err(
+                    QuickAiError.INFERENCE_FAILED,
+                    throwable.message ?: "LiteRT-LM multimodal streaming inference failed"
+                )
+                terminalError = err
+                try {
+                    sink.onError(err.error, err.message)
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+
+        return try {
+            c.sendMessageAsync(contents, callback)
+            val finished = latch.await(5, TimeUnit.MINUTES)
+            if (!finished) {
+                Log.e(TAG, "runMultimodalStreaming(): timed out waiting for onDone/onError")
+                val err = BackendResult.Err(
+                    QuickAiError.INFERENCE_FAILED,
+                    "LiteRT-LM multimodal streaming timeout"
+                )
+                sink.onError(err.error, err.message)
+                return err
+            }
+            terminalError ?: BackendResult.Ok(Unit)
+        } catch (t: Throwable) {
+            Log.e(TAG, "runMultimodalStreaming(): sendMessageAsync threw", t)
+            val err = BackendResult.Err(
+                QuickAiError.INFERENCE_FAILED,
+                t.message ?: "LiteRT-LM multimodal streaming inference failed"
+            )
+            sink.onError(err.error, err.message)
+            err
+        }
+    }
+
     override fun unload(): BackendResult<Unit> {
         Log.i(TAG, "unload() invoked")
         closeQuietly()
@@ -363,6 +581,60 @@ class LiteRTLm(
             Log.w(TAG, "engine.close() threw", t)
         }
         engine = null
+        visionEnabled = false
+    }
+
+    /**
+     * @brief Map a QuickDotAI [BackendType] to a LiteRT-LM [LlmBackend].
+     *
+     * Extracted as a helper so both the compute and vision backends
+     * use exactly the same mapping (including the NPU → CPU fallback)
+     * and we never drift between the two.
+     */
+    private fun mapBackend(b: BackendType): LlmBackend = when (b) {
+        BackendType.CPU -> LlmBackend.CPU()
+        BackendType.GPU -> LlmBackend.GPU()
+        // LiteRT-LM's NPU backend wants the dir holding the vendor
+        // native .so files. For an app-bundled setup that is simply
+        // the APK's nativeLibraryDir, but we don't have a Context
+        // here — fall back to CPU until the caller wires one in.
+        BackendType.NPU -> LlmBackend.CPU()
+    }
+
+    /**
+     * @brief Convert a list of [PromptPart]s into a LiteRT-LM [Contents]
+     * object ready to hand to `sendMessage` / `sendMessageAsync`.
+     *
+     * This is where the AAR-level public types cross the boundary into
+     * the LiteRT-LM package. We also validate each part eagerly so the
+     * caller gets a crisp error BEFORE we reach the native layer:
+     *  - ImageFile: file must exist and be readable
+     *  - ImageBytes: bytes must be non-empty
+     *
+     * Throws [IllegalArgumentException] on validation failure; the
+     * calling runMultimodal* wrappers translate that into a
+     * [QuickAiError.INVALID_PARAMETER] BackendResult.
+     */
+    private fun toLiteRtContents(parts: List<PromptPart>): Contents {
+        val mapped: List<Content> = parts.map { p ->
+            when (p) {
+                is PromptPart.Text -> Content.Text(p.text)
+                is PromptPart.ImageFile -> {
+                    val f = File(p.absolutePath)
+                    require(f.exists() && f.canRead()) {
+                        "PromptPart.ImageFile not readable: ${p.absolutePath}"
+                    }
+                    Content.ImageFile(p.absolutePath)
+                }
+                is PromptPart.ImageBytes -> {
+                    require(p.bytes.isNotEmpty()) {
+                        "PromptPart.ImageBytes has empty byte array"
+                    }
+                    Content.ImageBytes(p.bytes)
+                }
+            }
+        }
+        return Contents.of(mapped)
     }
 
     /**

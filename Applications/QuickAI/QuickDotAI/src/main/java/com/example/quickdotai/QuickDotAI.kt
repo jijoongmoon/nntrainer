@@ -125,6 +125,66 @@ interface QuickDotAI {
     }
 
     /**
+     * @brief Multimodal variant of [run] — accepts a sequence of
+     * [PromptPart]s that may interleave text and image inputs.
+     *
+     * The default implementation returns [QuickAiError.UNSUPPORTED]
+     * because not every engine can handle non-text inputs. Concrete
+     * implementations backed by multimodal-capable models (currently
+     * [LiteRTLm] with a multimodal Gemma loaded through a non-null
+     * [LoadModelRequest.visionBackend]) override this to do the real
+     * work. [NativeQuickDotAI] inherits the UNSUPPORTED default, so
+     * consumers get a clear error message instead of a silent failure
+     * when they aim an image prompt at the text-only native engine.
+     *
+     * Contract:
+     *  - [parts] must be non-empty; an empty list returns
+     *    [QuickAiError.INVALID_PARAMETER].
+     *  - Parts may appear in any order. The canonical Gemma-4 /
+     *    Gemma3n convention is one or more image parts followed by a
+     *    single trailing text instruction.
+     *  - Must be called only after a successful [load]; calling it
+     *    before [load] returns [QuickAiError.NOT_INITIALIZED].
+     *
+     * Example:
+     * ```
+     * val reply = engine.runMultimodal(listOf(
+     *     PromptPart.ImageFile("/sdcard/photo.jpg"),
+     *     PromptPart.Text("What is happening in this picture?"),
+     * ))
+     * ```
+     */
+    fun runMultimodal(parts: List<PromptPart>): BackendResult<String> =
+        BackendResult.Err(
+            QuickAiError.UNSUPPORTED,
+            "runMultimodal is not supported by engine '$kind'. " +
+                "Load a multimodal-capable model (e.g. GEMMA4) with " +
+                "LoadModelRequest.visionBackend set to a non-null value."
+        )
+
+    /**
+     * @brief Streaming variant of [runMultimodal].
+     *
+     * The default implementation returns [QuickAiError.UNSUPPORTED]
+     * and delivers a single terminal [StreamSink.onError] before
+     * returning, so callers can rely on the same StreamSink contract
+     * as text-only streaming regardless of which engine they targeted.
+     */
+    fun runMultimodalStreaming(
+        parts: List<PromptPart>,
+        sink: StreamSink
+    ): BackendResult<Unit> {
+        val err = BackendResult.Err(
+            QuickAiError.UNSUPPORTED,
+            "runMultimodalStreaming is not supported by engine '$kind'. " +
+                "Load a multimodal-capable model (e.g. GEMMA4) with " +
+                "LoadModelRequest.visionBackend set to a non-null value."
+        )
+        sink.onError(err.error, err.message)
+        return err
+    }
+
+    /**
      * @brief Unload the model weights without destroying the engine.
      *
      * After a successful unload the engine is in a "not initialized" state

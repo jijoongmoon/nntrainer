@@ -92,19 +92,110 @@ enum class QuickAiError(val code: Int) {
  * to a `.litertlm` file) and ignored by [NativeQuickDotAI] (which
  * discovers its model assets through the native C API's internal
  * model-directory resolution).
+ *
+ * [visionBackend], [maxNumImages] and [cacheDir] are optional knobs
+ * used only by multimodal-capable engines ([LiteRTLm] today). They
+ * are ignored by [NativeQuickDotAI].
  */
 @Serializable
 data class LoadModelRequest(
     val backend: BackendType = BackendType.GPU,
     val model: ModelId,
     val quantization: QuantizationType = QuantizationType.W4A32,
-    @SerialName("model_path") val modelPath: String? = null
+    @SerialName("model_path") val modelPath: String? = null,
+
+    /**
+     * Compute backend for the model's vision encoder when loading a
+     * multimodal-capable model (e.g. Gemma-4 / Gemma3n). Null means
+     * the engine is loaded in text-only mode — in that case
+     * [QuickDotAI.runMultimodal] returns [QuickAiError.UNSUPPORTED]
+     * even on backends that would otherwise support images.
+     *
+     * Only honored by [LiteRTLm]; [NativeQuickDotAI] ignores it.
+     */
+    @SerialName("vision_backend") val visionBackend: BackendType? = null,
+
+    /**
+     * Cap on the number of images a single multimodal prompt can
+     * contain. Maps directly to LiteRT-LM's EngineConfig.maxNumImages.
+     * Null = engine default (currently 1 for Gemma3n).
+     *
+     * Only honored by [LiteRTLm]; [NativeQuickDotAI] ignores it.
+     */
+    @SerialName("max_num_images") val maxNumImages: Int? = null,
+
+    /**
+     * Writable directory for engine on-disk caches. Populating this
+     * field materially speeds up the second and subsequent loads of
+     * the same model. Maps to LiteRT-LM's EngineConfig.cacheDir.
+     * Null = engine default.
+     *
+     * Only honored by [LiteRTLm]; [NativeQuickDotAI] ignores it.
+     */
+    @SerialName("cache_dir") val cacheDir: String? = null,
 ) {
     /**
      * Canonical key shared across the stack: one worker/handle per
      * (model, quantization) pair.
      */
     val modelKey: String get() = "${model.name}:${quantization.name}"
+}
+
+/**
+ * @brief One part of a multimodal prompt passed to
+ *        [QuickDotAI.runMultimodal] / [QuickDotAI.runMultimodalStreaming].
+ *
+ * The concrete backend (currently [LiteRTLm] for Gemma-family models
+ * loaded with a non-null [LoadModelRequest.visionBackend]) translates
+ * each part to its native content representation. The ordering in the
+ * list is preserved — the canonical Gemma-4 / Gemma3n convention is
+ * one or more image parts followed by a single trailing text
+ * instruction, e.g.
+ * ```
+ * runMultimodal(listOf(
+ *     PromptPart.ImageFile("/sdcard/.../photo.jpg"),
+ *     PromptPart.Text("Describe this picture in one sentence."),
+ * ))
+ * ```
+ *
+ * PromptPart is intentionally NOT @Serializable: `ImageBytes.bytes`
+ * would serialize as a JSON array of ints, which is the wrong wire
+ * format for a REST layer. Consumers that need to carry multimodal
+ * prompts over the wire (e.g. LauncherApp's HTTP server) should
+ * define their own Base64-flavored DTO and convert at the boundary.
+ */
+sealed class PromptPart {
+    /** A chunk of text — typically the user's question or instruction. */
+    data class Text(val text: String) : PromptPart()
+
+    /**
+     * A local image file. [absolutePath] must point to a readable file
+     * on the device — the engine opens it directly from the native
+     * layer, so relative paths are NOT supported. Mirrors LiteRT-LM's
+     * parameter naming for clarity.
+     *
+     * Supported formats depend on the underlying engine but generally
+     * include JPEG and PNG.
+     */
+    data class ImageFile(val absolutePath: String) : PromptPart()
+
+    /**
+     * Image bytes already held in memory. Useful when the image comes
+     * from an in-process source (camera buffer, bundled asset, HTTP
+     * download) and the caller does not want to materialize it to a
+     * temporary file first.
+     *
+     * The byte layout must be the raw file contents of an encoded
+     * image (JPEG / PNG / …), NOT a decoded pixel array.
+     */
+    data class ImageBytes(val bytes: ByteArray) : PromptPart() {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is ImageBytes) return false
+            return bytes.contentEquals(other.bytes)
+        }
+        override fun hashCode(): Int = bytes.contentHashCode()
+    }
 }
 
 /**

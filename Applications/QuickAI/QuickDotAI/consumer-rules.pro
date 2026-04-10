@@ -23,6 +23,8 @@
 -keep class com.example.quickdotai.BackendResult** { *; }
 -keep class com.example.quickdotai.LoadModelRequest { *; }
 -keep class com.example.quickdotai.PerformanceMetrics { *; }
+-keep class com.example.quickdotai.PromptPart { *; }
+-keep class com.example.quickdotai.PromptPart$* { *; }
 -keepclassmembers class com.example.quickdotai.ModelId { *; }
 -keepclassmembers class com.example.quickdotai.BackendType { *; }
 -keepclassmembers class com.example.quickdotai.QuantizationType { *; }
