@@ -1,13 +1,26 @@
 [versions]
-# AGP 9.0.1 (January 2026) instead of 9.1.0 (March 2026) because the
-# plugin marker for 9.1.0 is not reliably resolvable from every
-# environment yet. 9.0.1 has been in Google Maven / the Gradle Plugin
-# Portal longer and is widely mirrored. If you want to move back to
-# 9.1.x later, also restore the `compileSdk { version = release(36)
-# { minorApiLevel = 1 } }` blocks in each module — that minorApiLevel
-# DSL was added in 9.1.0 and is not understood by 9.0.x.
-agp = "9.0.1"
-kotlin = "2.2.21"
+# Toolchain is intentionally pinned to the versions that Android
+# Studio Meerkat (2025.1) shipped with — they have been out for
+# 13+ months and are cached in every Google Maven / Maven Central
+# mirror in the wild, including the more conservative corporate
+# mirrors. Newer AGP 9.x / Kotlin 2.2.x combos were blowing up on
+# fresh checkouts with "could not resolve plugin artifact
+# com.android.tools.build:gradle:9.0.1" because the artifact has
+# not yet propagated to every mirror the user's environment reaches.
+#
+# Compatibility notes:
+#  - Gradle 8.11.1 (January 2025) is the paired Gradle for AGP 8.9.x.
+#  - AGP 8.9.0 (March 2025) is the first AGP with full API 36 support.
+#  - Kotlin 2.0.21 (December 2024) is the last Kotlin-2.0 patch, works
+#    out of the box with AGP 8.9.x and Gradle 8.11.1.
+#  - kotlinx.serialization 1.7.3 remains compatible with Kotlin 2.0.x.
+#
+# Rolling forward: AGP 9.x + Kotlin 2.2.x + Gradle 9.x is the next
+# step once the target environment has those newer artifacts in its
+# mirror. Bump agp -> 9.0.1+, kotlin -> 2.2.x, and the Gradle wrapper
+# to 9.3.1+ in gradle/wrapper/gradle-wrapper.properties together.
+agp = "8.9.0"
+kotlin = "2.0.21"
 kotlinxSerialization = "1.7.3"
 kotlinxCoroutines = "1.9.0"
 okhttp = "4.12.0"
