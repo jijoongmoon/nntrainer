@@ -93,9 +93,9 @@ enum class QuickAiError(val code: Int) {
  * discovers its model assets through the native C API's internal
  * model-directory resolution).
  *
- * [visionBackend], [maxNumImages] and [cacheDir] are optional knobs
- * used only by multimodal-capable engines ([LiteRTLm] today). They
- * are ignored by [NativeQuickDotAI].
+ * [visionBackend] and [cacheDir] are optional knobs used only by
+ * multimodal-capable engines ([LiteRTLm] today). They are ignored
+ * by [NativeQuickDotAI].
  */
 @Serializable
 data class LoadModelRequest(
@@ -116,21 +116,17 @@ data class LoadModelRequest(
     @SerialName("vision_backend") val visionBackend: BackendType? = null,
 
     /**
-     * Cap on the number of images a single multimodal prompt can
-     * contain. Maps directly to LiteRT-LM's EngineConfig.maxNumImages.
-     * Null = engine default (currently 1 for Gemma3n).
-     *
-     * Only honored by [LiteRTLm]; [NativeQuickDotAI] ignores it.
-     */
-    @SerialName("max_num_images") val maxNumImages: Int? = null,
-
-    /**
      * Writable directory for engine on-disk caches. Populating this
      * field materially speeds up the second and subsequent loads of
      * the same model. Maps to LiteRT-LM's EngineConfig.cacheDir.
      * Null = engine default.
      *
      * Only honored by [LiteRTLm]; [NativeQuickDotAI] ignores it.
+     *
+     * (Note: the LiteRT-LM 0.10.x EngineConfig surface we compile
+     * against does not yet expose a per-prompt `maxNumImages` cap —
+     * that is a 1.0+ feature. Once we roll forward past 1.0 we can
+     * add the corresponding field back to this request.)
      */
     @SerialName("cache_dir") val cacheDir: String? = null,
 ) {

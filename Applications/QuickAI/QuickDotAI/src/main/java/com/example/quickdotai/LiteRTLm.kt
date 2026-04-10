@@ -134,13 +134,12 @@ class LiteRTLm(
             modelPath = modelPath,
             backend = llmBackend,
             visionBackend = visionLlmBackend,
-            maxNumImages = req.maxNumImages,
             cacheDir = req.cacheDir,
         )
         Log.i(
             TAG,
-            "load(): EngineConfig built (maxNumImages=${req.maxNumImages}, " +
-                "cacheDir=${req.cacheDir}), constructing Engine…"
+            "load(): EngineConfig built (cacheDir=${req.cacheDir}), " +
+                "constructing Engine…"
         )
 
         return try {
