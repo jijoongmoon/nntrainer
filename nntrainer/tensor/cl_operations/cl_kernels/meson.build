@@ -1,40 +1,41 @@
 fs = import('fs')
 
-cl_op_kernels = [
-  'addition.cl',
-  'concat_axis_1.cl',
-  'concat_axis_2.cl',
-  'concat_axis_3.cl',
-  'convert_block_q4_0.cl',
-  'copy.cl',
-  'dot.cl',
-  'int4_gemv.cl',
-  'int4_quantize_input.cl',
-  'int4_gemm.cl',
-  'int4_gemm_adreno.cl',
-  'input_transpose.cl',
-  'q4_0_ab_bi_8x4.cl',
-  'q6_k_sgemv.cl',
-  'restore_block_q4_0.cl',
-  'rmsnorm.cl',
-  'rotary_emb.cl',
-  'sgemm_no_trans.cl',
-  'sgemm_trans_a.cl',
-  'sgemm_trans_ab.cl',
-  'sgemm_trans_b.cl',
-  'sgemv_no_trans.cl',
-  'sgemv.cl',
-  'sscal.cl',
-  'swiglu.cl',
-  'transpose_16bit.cl',
-  'transpose_32bit_16bit.cl',
-  'transpose_axis_0.cl',
-  'transpose_axis_1.cl',
-  'transpose_axis_2.cl',
-]
+  cl_op_kernels =
+    [
+      'addition.cl',
+      'concat_axis_1.cl',
+      'concat_axis_2.cl',
+      'concat_axis_3.cl',
+      'convert_block_q4_0.cl',
+      'copy.cl',
+      'dot.cl',
+      'int4_gemv.cl',
+      'int4_quantize_input.cl',
+      'int4_gemm.cl',
+      'int4_gemm_adreno.cl',
+      'input_transpose.cl',
+      'q4_0_ab_bi_8x4.cl',
+      'q6_k_sgemv.cl',
+      'restore_block_q4_0.cl',
+      'rmsnorm.cl',
+      'rotary_emb.cl',
+      'sgemm_no_trans.cl',
+      'sgemm_trans_a.cl',
+      'sgemm_trans_ab.cl',
+      'sgemm_trans_b.cl',
+      'sgemv_no_trans.cl',
+      'sgemv.cl',
+      'sscal.cl',
+      'swiglu.cl',
+      'transpose_16bit.cl',
+      'transpose_32bit_16bit.cl',
+      'transpose_axis_0.cl',
+      'transpose_axis_1.cl',
+      'transpose_axis_2.cl',
+    ]
 
-if get_option('enable-fp16')
-  cl_op_kernels += [
+  if get_option ('enable-fp16') cl_op_kernels +=
+  [
     'addition_fp16.cl',
     'concat_axis_1_fp16.cl',
     'concat_axis_2_fp16.cl',
@@ -54,50 +55,44 @@ if get_option('enable-fp16')
     'transpose_axis_0_fp16.cl',
     'transpose_axis_1_fp16.cl',
     'transpose_axis_2_fp16.cl',
-  ]
-endif
+  ] endif
 
-all_includes = ''
-foreach k : cl_op_kernels
-  basename = fs.stem(k)
-  kernel_code = fs.read(k).split('\n')
-  modified_code = []
-  foreach line : kernel_code
-    modified_code += ('R"(' + line + ')"' + ' "\\n"')
-  endforeach
-  variable_name = basename + '_kernel'
-  if basename == 'int4_gemm'
-    variable_name = 'gemm_int4_kernel'
-  endif
-  conf_data = configuration_data(
-    {
-      'namespace': 'nntrainer',
-      'variable_name': variable_name,
-      'header_path': basename + '.h',
-      'kernel_code': '\n'.join(modified_code),
-    },
-  )
+    all_includes = '' foreach k
+  : cl_op_kernels basename = fs.stem(k) kernel_code =
+      fs.read(k).split('\n') modified_code = [] foreach line
+  : kernel_code modified_code +=
+    ('R"(' + line + ')"' + ' "\\n"') endforeach variable_name =
+      basename + '_kernel' if basename == 'int4_gemm' variable_name =
+        'gemm_int4_kernel' endif conf_data = configuration_data({
+          'namespace' : 'nntrainer',
+          'variable_name' : variable_name,
+          'header_path' : basename + '.h',
+          'kernel_code' : '\n'.join(modified_code),
+        }, )
 
-  configure_file(
-    input: 'kernel.cpp.in',
-    output: basename + '.cpp',
-    configuration: conf_data,
-  )
-  configure_file(input: 'kernel.h.in', output: basename + '.h', configuration: conf_data)
+          configure_file(input
+                         : 'kernel.cpp.in', output
+                         : basename + '.cpp', configuration
+                         : conf_data, )
+            configure_file(input
+                           : 'kernel.h.in', output
+                           : basename + '.h', configuration
+                           : conf_data)
 
-  # source.full_path() does not work: https://github.com/mesonbuild/meson/issues/5273#issuecomment-1851811417
-  # can be used when meson is upgraded to 1.4.0
-  nntrainer_headers += meson.current_build_dir() / basename + '.h'
-  nntrainer_sources += meson.current_build_dir() / basename + '.cpp'
+#source.full_path()                                                            \
+  does not work : https: // github.com/mesonbuild/meson/issues/5273#issuecomment-1851811417
+#can be used when meson is upgraded to 1.4.0
+              nntrainer_headers +=
+    meson.current_build_dir() / basename + '.h' nntrainer_sources +=
+    meson.current_build_dir() / basename + '.cpp'
 
-  all_includes += f'#include "@basename@.h"\n'
-endforeach
-configure_file(
-  input: 'kernels.h.in',
-  output: 'cl_kernels.h',
-  configuration: {'includes': all_includes},
-)
-nntrainer_headers += meson.current_build_dir() / 'cl_kernels.h'
+    all_includes +=
+    f '#include "@basename@.h"\n' endforeach configure_file(
+      input
+      : 'kernels.h.in', output
+      : 'cl_kernels.h', configuration
+      : {'includes' : all_includes}, ) nntrainer_headers +=
+    meson.current_build_dir() / 'cl_kernels.h'
 
-nntrainer_inc += include_directories('..')
-nntrainer_inc_abs += meson.current_build_dir() / '..'
+    nntrainer_inc += include_directories('..') nntrainer_inc_abs +=
+    meson.current_build_dir() / '..'

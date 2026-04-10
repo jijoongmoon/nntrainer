@@ -1,27 +1,24 @@
 ##
-# @brief .gitignore list
+#@brief.gitignore list
 
-# ignore build directory
-/build
-/builddir
-.cache/
-.idea/
+#ignore build directory
+    / build / builddir.cache /.idea /
 
-# jni build files
-libs/
-obj/
-ml_api_common/
+#jni build files
+    libs / obj / ml_api_common /
 
-# tflite for applications
-tensorflow-1.13.1
-tensorflow-2.3.0
+#tflite for applications
+    tensorflow -
+  1.13.1 tensorflow -
+  2.3.0
 
-# data files for applications
-Applications/**/data
-cifar-100-binary*
-Applications/**/*.bin
-Applications/**/res/*
-Applications/**/tokenizers-cpp-build/*
+#data files for applications
+  Applications /**/ data cifar -
+  100 -
+  binary *Applications /**/ *.bin Applications /**/ res /*
+                                     Applications/**/
+    tokenizers -
+  cpp - build/*
 
 # CTag
 /tags
