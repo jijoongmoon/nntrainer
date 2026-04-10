@@ -4,15 +4,16 @@
  *
  * @file    model_config.cpp
  * @date    22 Jan 2026
- * @brief   This is a sample code for internal regitration of model_config.
+ * @brief   Built-in model configuration registration for api.
+ *          All calls use extern "C" functions for compatibility.
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Eunju Yang <ej.yang@samsung.com>
  * @bug     No known bugs except for NYI items
  */
-#include "causal_lm_api.h"
 #include "model_config_internal.h"
 #include <climits>
 #include <cstring>
+#include <iostream>
 
 static void register_qwen3_0_6b() {
   // 1. Architecture Config

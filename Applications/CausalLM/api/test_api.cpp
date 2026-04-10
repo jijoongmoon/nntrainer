@@ -11,7 +11,7 @@
  *
  */
 
-#include "causal_lm_api.h"
+#include "quick_dot_ai_api.h"
 #include <cmath>
 #include <cstring>
 #include <iomanip>

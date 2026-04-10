@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
- * @file    causal_lm_api.cpp
+ * @file    quick_dot_ai_api.cpp
  * @date    21 Jan 2026
  * @brief   This is a C API for CausalLM application
  * @see     https://github.com/nntrainer/nntrainer
@@ -10,7 +10,7 @@
  * @bug     No known bugs except for NYI items
  */
 
-#include "causal_lm_api.h"
+#include "quick_dot_ai_api.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -87,6 +87,27 @@ struct RegisteredModel {
 static std::map<std::string, RegisteredModel> g_model_registry;
 static std::map<std::string, ModelArchConfig> g_arch_config_map;
 
+// Internal C++ registration functions — called from model_config.cpp
+// These bypass extern "C" PLT and write directly to our static maps.
+namespace quick_dot_ai {
+
+void register_arch(const char *arch_name, ModelArchConfig config) {
+  std::string name(arch_name);
+  std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+  g_arch_config_map[name] = config;
+}
+
+void register_model(const char *model_name, const char *arch_name,
+                    ModelRuntimeConfig config) {
+  std::string name(model_name);
+  std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+  std::string aname(arch_name);
+  std::transform(aname.begin(), aname.end(), aname.begin(), ::toupper);
+  g_model_registry[name] = {aname, config};
+}
+
+} // namespace quick_dot_ai
+
 // Helper to register models (similar to main.cpp)
 // ensuring factory is populated.
 // @note: Factory registration is singleton and persistent, but we do it once
@@ -143,7 +164,6 @@ static void register_models() {
         return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
                                                           nntr_cfg);
       });
-
     // Register built-in configurations
     register_builtin_model_configs();
   });
@@ -644,6 +664,10 @@ static ErrorCode metrics_on_handle(CausalLmModel &h,
   return CAUSAL_LM_ERROR_NONE;
 }
 
+/*============================================================================
+ * Legacy non-handle API implementation
+ *============================================================================*/
+
 ErrorCode loadModel(BackendType compute, ModelType modeltype,
                     ModelQuantizationType quant_type) {
   return load_into_handle(get_default_handle(), compute, modeltype, quant_type);
@@ -777,4 +801,3 @@ ErrorCode destroyModelHandle(CausalLmHandle handle) {
   delete handle;
   return CAUSAL_LM_ERROR_NONE;
 }
-

@@ -113,7 +113,7 @@ LOCAL_MODULE := causallm_api
 LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1
 
 LOCAL_SRC_FILES := \
-    ../api/causal_lm_api.cpp \
+    ../api/quick_dot_ai_api.cpp \
     ../api/model_config.cpp \
     ../api/streamer.cpp \
     ../api/callback_streamer.cpp

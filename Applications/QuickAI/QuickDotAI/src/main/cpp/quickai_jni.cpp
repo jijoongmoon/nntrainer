@@ -6,7 +6,7 @@
  * @brief   JNI shim that forwards calls from Kotlin's
  *          com.example.quickdotai.NativeCausalLm object to the
  *          handle-based C entry points declared in
- *          Applications/CausalLM/api/causal_lm_api.h.
+ *          Applications/CausalLM/api/quick_dot_ai_api.h.
  *
  * This file contains no business logic — only JNI marshalling:
  *   jstring   <-> const char*
@@ -27,7 +27,7 @@
 #include <string>
 #include <unistd.h>
 
-#include "causal_lm_api.h"
+#include "quick_dot_ai_api.h"
 
 #define LOG_TAG "quickai_jni"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -113,7 +113,7 @@ Java_com_example_quickdotai_NativeCausalLm_setOptionsNative(
 // ---------------------------------------------------------------------------
 // chdir
 //
-// The C API in causal_lm_api.cpp hardcodes the model discovery prefix to
+// The C API in quick_dot_ai_api.cpp hardcodes the model discovery prefix to
 // the relative path "./models/<model>-<quant>" (see resolve_model_path()),
 // which ties model lookup to the process's current working directory.
 // Android apps start with cwd="/" so the only way to point the loader at
@@ -226,7 +226,7 @@ Java_com_example_quickdotai_NativeCausalLm_destroyModelHandleNative(
 // ---------------------------------------------------------------------------
 // runModelHandleStreaming
 //
-// Forwards deltas from the native causal_lm_api streaming callback to a
+// Forwards deltas from the native quick_dot_ai_api streaming callback to a
 // Kotlin NativeStreamListener.onDelta(String). See AsyncAndStreaming.md §4
 // at the repo root for the design rationale — in particular, the
 // callback fires on the SAME thread that invoked this JNI entry point

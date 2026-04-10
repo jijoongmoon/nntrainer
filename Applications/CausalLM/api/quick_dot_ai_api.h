@@ -2,14 +2,27 @@
 /**
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
- * @file    causal_lm_api.h
- * @date    21 Jan 2026
- * @brief   This is a C API for CausalLM application
+ * @file    quick_dot_ai_api.h
+ * @date    20 Mar 2026
+ * @brief   C API for src (extension of CausalLM)
+ *
+ *          This header is self-contained: if causal_lm_api.h has already
+ *          been included its types are reused; otherwise fallback
+ *          definitions are provided so that this single header is
+ *          sufficient for application code.
+ *
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Eunju Yang <ej.yang@samsung.com>
  * @bug     No known bugs except for NYI items
  */
-#ifndef __CAUSAL_LM_API_H__
+#ifndef __QUICK_DOT_AI_API_H__
+#define __QUICK_DOT_AI_API_H__
+
+/* ── Extended model types (src additions) ────────────────────── */
+#ifdef __CAUSAL_LM_API_H__
+/* Model types already defined from causal_lm_api.h */
+#else /* causal_lm_api.h not included — provide full definitions */
+
 #define __CAUSAL_LM_API_H__
 
 #ifdef _WIN32
@@ -27,22 +40,6 @@ extern "C" {
 
 #include <stddef.h>
 
-/**
- * @brief Performance Metrics
- */
-typedef struct {
-  unsigned int prefill_tokens;
-  double prefill_duration_ms;
-  unsigned int generation_tokens;
-  double generation_duration_ms;
-  double total_duration_ms;
-  double initialization_duration_ms;
-  size_t peak_memory_kb;
-} PerformanceMetrics;
-
-/**
- * @brief Error codes
- */
 typedef enum {
   CAUSAL_LM_ERROR_NONE = 0,
   CAUSAL_LM_ERROR_INVALID_PARAMETER = 1,
@@ -53,74 +50,47 @@ typedef enum {
   CAUSAL_LM_ERROR_UNKNOWN = 99
 } ErrorCode;
 
-/**
- * @brief Backend compute type
- */
 typedef enum {
   CAUSAL_LM_BACKEND_CPU = 0,
-  CAUSAL_LM_BACKEND_GPU = 1, /// < @todo: support gpu
-  CAUSAL_LM_BACKEND_NPU = 2, /// < @todo: support npu
+  CAUSAL_LM_BACKEND_GPU = 1,
+  CAUSAL_LM_BACKEND_NPU = 2,
 } BackendType;
 
-/**
- * @brief Model type
- * @note  Enable only when your library supports the model
- */
 typedef enum {
   CAUSAL_LM_MODEL_QWEN3_0_6B = 0,
 } ModelType;
 
-/**
- * @brief Configuration structure
- */
 typedef struct {
-  // Add configuration options here as needed
-  bool use_chat_template; /// < @brief Whether to apply chat template to input
-  bool debug_mode; /// < @brief Check model file validity during initialization
-  bool verbose;    /// < @brief Whether to print output during generation
+  bool use_chat_template;
+  bool debug_mode;
+  bool verbose;
 } Config;
 
-/**
- * @brief Set global options
- * @param config Configuration object
- * @return ErrorCode
- */
 WIN_EXPORT ErrorCode setOptions(Config config);
 
-/**
- * @brief Model Quantization type
- */
 typedef enum {
   CAUSAL_LM_QUANTIZATION_UNKNOWN = 0,
-  CAUSAL_LM_QUANTIZATION_W4A32 = 1,  ///< 4-bit weights, 32-bit activations
-  CAUSAL_LM_QUANTIZATION_W16A16 = 2, ///< 16-bit weights, 16-bit activations
-  CAUSAL_LM_QUANTIZATION_W8A16 = 3,  ///< 8-bit weights, 16-bit activations
-  CAUSAL_LM_QUANTIZATION_W32A32 = 4, ///< 32-bit weights, 32-bit activations
+  CAUSAL_LM_QUANTIZATION_W4A32 = 1,
+  CAUSAL_LM_QUANTIZATION_W16A16 = 2,
+  CAUSAL_LM_QUANTIZATION_W8A16 = 3,
+  CAUSAL_LM_QUANTIZATION_W32A32 = 4,
 } ModelQuantizationType;
 
-/**
- * @brief Load a model
- * @param compute Backend compute type
- * @param modeltype Model type
- * @param quant_type Model quantization type
- * @return ErrorCode
- */
 WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
                                ModelQuantizationType quant_type);
 
-/**
- * @brief Get performance metrics of the last run
- * @param metrics Pointer to PerformanceMetrics struct to be filled
- * @return ErrorCode
- */
+typedef struct {
+  unsigned int prefill_tokens;
+  double prefill_duration_ms;
+  unsigned int generation_tokens;
+  double generation_duration_ms;
+  double total_duration_ms;
+  double initialization_duration_ms;
+  size_t peak_memory_kb;
+} PerformanceMetrics;
+
 WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
 
-/**
- * @brief Run inference
- * @param inputTextPrompt Input prompt
- * @param outputText Buffer to store output text
- * @return ErrorCode
- */
 WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
                               const char **outputText);
 
@@ -245,4 +215,6 @@ runModelHandleStreaming(CausalLmHandle handle, const char *inputTextPrompt,
 }
 #endif
 
-#endif // __CAUSAL_LM_API_H__
+#endif /* __CAUSAL_LM_API_H__ */
+
+#endif /* __QUICK_DOT_AI_API_H__ */

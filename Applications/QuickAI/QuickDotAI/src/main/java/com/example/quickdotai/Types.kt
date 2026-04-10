@@ -6,7 +6,7 @@
  * @brief   Value types shared by the QuickDotAI interface and its
  *          implementations.
  *
- * The enums mirror the C enums in Applications/CausalLM/api/causal_lm_api.h.
+ * The enums mirror the C enums in Applications/CausalLM/api/quick_dot_ai_api.h.
  * Kotlin-only values (ModelId.GEMMA4) are additionally defined so the host
  * app can route to LiteRT-LM without crossing the JNI boundary.
  *
@@ -21,7 +21,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 /**
- * @brief Compute backend. Mirrors BackendType in causal_lm_api.h.
+ * @brief Compute backend. Mirrors BackendType in quick_dot_ai_api.h.
  */
 @Serializable
 enum class BackendType {
@@ -33,7 +33,7 @@ enum class BackendType {
 /**
  * @brief Model identifier.
  *
- * The first entries mirror the C enum `ModelType` in causal_lm_api.h.
+ * The first entries mirror the C enum `ModelType` in quick_dot_ai_api.h.
  * [GEMMA4] is a Kotlin-only value that triggers the [LiteRTLm] code
  * path; it never crosses the JNI boundary.
  */
@@ -45,7 +45,7 @@ enum class ModelId {
 
 /**
  * @brief Quantization type. Mirrors ModelQuantizationType in
- *        causal_lm_api.h.
+ *        quick_dot_ai_api.h.
  */
 @Serializable
 enum class QuantizationType {
@@ -57,7 +57,7 @@ enum class QuantizationType {
 }
 
 /**
- * @brief Error code. Mirrors ErrorCode in causal_lm_api.h plus a few
+ * @brief Error code. Mirrors ErrorCode in quick_dot_ai_api.h plus a few
  *        Kotlin-level additions for out-of-band conditions.
  */
 @Serializable

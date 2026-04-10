@@ -1,7 +1,7 @@
 causallm_src = [
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
-    meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
+    meson.current_source_dir() / 'api' / 'quick_dot_ai_api.cpp',
     meson.current_source_dir() / 'api' / 'model_config.cpp',
     meson.current_source_dir() / 'api' / 'streamer.cpp',
     meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
@@ -12,7 +12,7 @@ executable_src = [
 ]
 
 causallm_inc_abs = [meson.current_source_dir()]
-causallm_inc = [include_directories('.')]
+causallm_inc = [include_directories('.'), include_directories('api')]
 
 # Build layer dependency
 causallm_layer_dependencies = []

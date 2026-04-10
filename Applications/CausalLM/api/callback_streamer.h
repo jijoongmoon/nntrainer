@@ -14,8 +14,8 @@
  *
  * See AsyncAndStreaming.md §3.2 at the repo root.
  */
-#ifndef __CAUSAL_LM_CALLBACK_STREAMER_H__
-#define __CAUSAL_LM_CALLBACK_STREAMER_H__
+#ifndef __QUICK_DOT_AI_CALLBACK_STREAMER_H__
+#define __QUICK_DOT_AI_CALLBACK_STREAMER_H__
 
 #ifndef WIN_EXPORT
 #ifdef _WIN32
@@ -72,4 +72,4 @@ WIN_EXPORT void callback_streamer_init(CallbackStreamer *self,
 } // extern "C"
 #endif
 
-#endif // __CAUSAL_LM_CALLBACK_STREAMER_H__
+#endif // __QUICK_DOT_AI_CALLBACK_STREAMER_H__

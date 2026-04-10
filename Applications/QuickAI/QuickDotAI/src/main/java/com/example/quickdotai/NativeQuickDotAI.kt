@@ -4,7 +4,7 @@
  *
  * @file    NativeQuickDotAI.kt
  * @brief   QuickDotAI implementation backed by the handle-based
- *          causal_lm_api.h (routed through libquickai_jni.so → JNI →
+ *          quick_dot_ai_api.h (routed through libquickai_jni.so → JNI →
  *          libcausallm_api.so).
  */
 package com.example.quickdotai
@@ -254,7 +254,7 @@ class NativeQuickDotAI : QuickDotAI {
     // --- enum → native-ordinal mapping ---------------------------------
 
     /**
-     * @brief Maps a ModelId to the C enum ordinal in causal_lm_api.h.
+     * @brief Maps a ModelId to the C enum ordinal in quick_dot_ai_api.h.
      * Returns null for values that are Kotlin-only (e.g. GEMMA4) —
      * those are routed to [LiteRTLm] instead and never reach this
      * engine.

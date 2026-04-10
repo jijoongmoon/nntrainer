@@ -4,7 +4,7 @@
  *
  * @file    streamer.h
  * @brief   Minimal C-callable base streamer used by the handle-based
- *          `runModelHandleStreaming` entry point in causal_lm_api.h.
+ *          `runModelHandleStreaming` entry point in quick_dot_ai_api.h.
  *
  * This is intentionally a very thin vtable-based polymorphism layer so
  * that:
@@ -20,8 +20,8 @@
  * See AsyncAndStreaming.md §3.1 at the repo root for the full design
  * rationale.
  */
-#ifndef __CAUSAL_LM_STREAMER_H__
-#define __CAUSAL_LM_STREAMER_H__
+#ifndef __QUICK_DOT_AI_STREAMER_H__
+#define __QUICK_DOT_AI_STREAMER_H__
 
 #ifndef WIN_EXPORT
 #ifdef _WIN32
@@ -91,4 +91,4 @@ WIN_EXPORT void streamer_end(BaseStreamer *self);
 } // extern "C"
 #endif
 
-#endif // __CAUSAL_LM_STREAMER_H__
+#endif // __QUICK_DOT_AI_STREAMER_H__

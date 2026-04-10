@@ -6,7 +6,7 @@
  * @brief   JNI bindings for libcausallm_api.so (handle-based API only).
  *
  * All methods here are 1:1 with the handle-based entry points added to
- * causal_lm_api.h. Higher-level lifecycle (serialization, registry,
+ * quick_dot_ai_api.h. Higher-level lifecycle (serialization, registry,
  * threading) lives in [NativeQuickDotAI] and in the host app — this
  * file is only the JNI glue.
  */
@@ -24,7 +24,7 @@ package com.example.quickdotai
  *   - libccapi-nntrainer.so (transitive)
  *
  * Any non-zero `errorCode` value corresponds to `ErrorCode` in
- * causal_lm_api.h — see [QuickAiError.fromNativeCode] for the Kotlin
+ * quick_dot_ai_api.h — see [QuickAiError.fromNativeCode] for the Kotlin
  * mapping.
  *
  * @hide
@@ -88,7 +88,7 @@ object NativeCausalLm {
         val peakMemoryKb: Long
     )
 
-    /** Forwards to `setOptions` in causal_lm_api.h. */
+    /** Forwards to `setOptions` in quick_dot_ai_api.h. */
     external fun setOptionsNative(
         useChatTemplate: Boolean,
         debugMode: Boolean,
@@ -98,7 +98,7 @@ object NativeCausalLm {
     /**
      * @brief Thin wrapper around POSIX `chdir(2)`.
      *
-     * The native C API in causal_lm_api.cpp builds its model paths as
+     * The native C API in quick_dot_ai_api.cpp builds its model paths as
      * `./models/<name>-<quant>` (see `resolve_model_path`), so the
      * loader's behaviour depends on the process's current working
      * directory. Android apps launch with cwd="/" which is not writable,
@@ -111,14 +111,14 @@ object NativeCausalLm {
      */
     external fun chdirNative(path: String): Int
 
-    /** Forwards to `loadModelHandle` in causal_lm_api.h. */
+    /** Forwards to `loadModelHandle` in quick_dot_ai_api.h. */
     external fun loadModelHandleNative(
         backendOrdinal: Int,
         modelOrdinal: Int,
         quantOrdinal: Int
     ): LoadResult
 
-    /** Forwards to `runModelHandle` in causal_lm_api.h. */
+    /** Forwards to `runModelHandle` in quick_dot_ai_api.h. */
     external fun runModelHandleNative(
         handle: Long,
         prompt: String
@@ -138,7 +138,7 @@ object NativeCausalLm {
     }
 
     /**
-     * @brief Forwards to `runModelHandleStreaming` in causal_lm_api.h.
+     * @brief Forwards to `runModelHandleStreaming` in quick_dot_ai_api.h.
      *
      * Blocking: returns only when generation finishes, EOS is emitted,
      * NUM_TO_GENERATE is reached, the listener throws, or an error
@@ -157,10 +157,10 @@ object NativeCausalLm {
         listener: NativeStreamListener
     ): Int
 
-    /** Forwards to `getPerformanceMetricsHandle` in causal_lm_api.h. */
+    /** Forwards to `getPerformanceMetricsHandle` in quick_dot_ai_api.h. */
     external fun getPerformanceMetricsHandleNative(handle: Long): MetricsResult
 
-    /** Forwards to `destroyModelHandle` in causal_lm_api.h. */
+    /** Forwards to `destroyModelHandle` in quick_dot_ai_api.h. */
     external fun destroyModelHandleNative(handle: Long): Int
 
     private const val TAG = "NativeCausalLm"
