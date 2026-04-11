@@ -800,12 +800,26 @@ void NeuralNetwork::save(
         qi.axis = 0;
         qi.group_size = 32; // GGML Q4_0 block size
         break;
+      case TensorDim::DataType::Q4_K:
+        qi.present = true;
+        qi.encoding = "q4_k";
+        qi.bitwidth = 4;
+        qi.axis = 0;
+        qi.group_size = 256; // GGML Q4_K super-block
+        break;
       case TensorDim::DataType::Q6_K:
         qi.present = true;
         qi.encoding = "q6_k";
         qi.bitwidth = 6;
         qi.axis = 0;
         qi.group_size = 256; // GGML super-block
+        break;
+      case TensorDim::DataType::Q1_0:
+        qi.present = true;
+        qi.encoding = "q1_0";
+        qi.bitwidth = 1;
+        qi.axis = 0;
+        qi.group_size = 128; // nntr_ggml_impl Q1_0 group size (QK1_0_TENSOR)
         break;
       default:
         // FP32/FP16/UINT32/etc. — not a quantized weight
@@ -851,6 +865,21 @@ void NeuralNetwork::save(
           break;
         case TensorDim::DataType::UINT32:
           dtype_str = "U32";
+          break;
+        // Lane B: block-quantized tensors (GGML-style layout). The dtype
+        // string labels the block format; the actual block size and
+        // scale layout are implicit in the tensor class.
+        case TensorDim::DataType::Q4_0:
+          dtype_str = "Q4_0";
+          break;
+        case TensorDim::DataType::Q4_K:
+          dtype_str = "Q4_K";
+          break;
+        case TensorDim::DataType::Q6_K:
+          dtype_str = "Q6_K";
+          break;
+        case TensorDim::DataType::Q1_0:
+          dtype_str = "Q1_0";
           break;
         default:
           dtype_str = "F32";
@@ -1399,6 +1428,14 @@ void NeuralNetwork::load(const std::string &file_path,
               return "U16";
             case TensorDim::DataType::UINT32:
               return "U32";
+            case TensorDim::DataType::Q4_0:
+              return "Q4_0";
+            case TensorDim::DataType::Q4_K:
+              return "Q4_K";
+            case TensorDim::DataType::Q6_K:
+              return "Q6_K";
+            case TensorDim::DataType::Q1_0:
+              return "Q1_0";
             default:
               return "";
             }
@@ -1430,7 +1467,9 @@ void NeuralNetwork::load(const std::string &file_path,
                              tensor_data_type == TensorDim::DataType::UINT8 ||
                              tensor_data_type == TensorDim::DataType::UINT16 ||
                              tensor_data_type == TensorDim::DataType::Q4_0 ||
-                             tensor_data_type == TensorDim::DataType::Q6_K);
+                             tensor_data_type == TensorDim::DataType::Q4_K ||
+                             tensor_data_type == TensorDim::DataType::Q6_K ||
+                             tensor_data_type == TensorDim::DataType::Q1_0);
           if (entry.quant_present && !c_is_quant) {
             std::ostringstream oss;
             oss << "[safetensors] weight '" << wname
