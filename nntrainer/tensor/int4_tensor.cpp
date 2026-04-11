@@ -560,6 +560,13 @@ size_t Int4QTensor::scale_size() const {
     return 1;
     break;
   case QScheme::PER_CHANNEL_AFFINE:
+    // group_size_ == 0 is the canonical signal for "pure per-channel":
+    // exactly one scale per output row (matches qsi4cxp and QNN's
+    // AXIS_SCALE_OFFSET with numScaleOffsets == height).
+    // group_size_ == row_width gives the same result mathematically;
+    // users may pass either form.
+    if (group_size_ == 0 || group_size_ == width())
+      return height();
     return height() * width() / group_size_;
     break;
   default:

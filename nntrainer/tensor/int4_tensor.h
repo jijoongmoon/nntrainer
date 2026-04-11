@@ -68,7 +68,7 @@ public:
    */
   Int4QTensor(std::string name_ = "", Tformat fm = Tformat::NCHW,
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
-              size_t g_size = 32);
+              size_t g_size = 0);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -82,7 +82,7 @@ public:
   Int4QTensor(const TensorDim &d, bool alloc_now,
               Initializer init = Initializer::NONE, std::string name = "",
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
-              size_t g_size = 32);
+              size_t g_size = 0);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -93,7 +93,7 @@ public:
    */
   Int4QTensor(const TensorDim &d, const void *buf = nullptr,
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
-              size_t g_size = 32);
+              size_t g_size = 0);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -106,7 +106,7 @@ public:
   Int4QTensor(
     std::vector<std::vector<std::vector<std::vector<int8_t>>>> const &d,
     std::vector<float> const &scales, Tformat fm, QScheme qscheme_,
-    size_t g_size = 32);
+    size_t g_size = 0);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -350,12 +350,17 @@ private:
 
   /**
    * @brief per-instance quantization group size (elements per scale).
-   *        Default 32. Set via constructor argument g_size; no longer
-   *        static so multiple Int4QTensors with different group sizes
-   *        can coexist in one process (required for per-layer mixed
-   *        quant and for safetensors schema_version 2 round-tripping).
+   *        Default 0, which is the canonical signal for "pure per-channel"
+   *        (= one scale per output row, a.k.a. qsi4cxp / QNN
+   *        AXIS_SCALE_OFFSET with numScaleOffsets == height). A non-zero
+   *        value means "group_size_ elements share one scale" within
+   *        each output row (e.g. 32 -> qsi4c32p / GGML Q4_0 block layout).
+   *        Set via constructor argument g_size; no longer static so
+   *        multiple Int4QTensors with different group sizes can coexist
+   *        in one process (required for per-layer mixed quant and for
+   *        safetensors schema_version 2 round-tripping).
    */
-  size_t group_size_ = 32;
+  size_t group_size_ = 0;
 
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is
