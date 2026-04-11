@@ -25,6 +25,7 @@
 #include <compute_ops.h>
 #include "model.h"
 #include "model_common_properties.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -852,6 +853,7 @@ void NeuralNetwork::load(const std::string &file_path,
   size_t data_section_start = 0;
   std::unordered_map<std::string, std::pair<size_t, size_t>> name_offset_map;
   std::unordered_map<std::string, std::pair<size_t, size_t>> prefix_offset_map;
+  std::unordered_map<std::string, int> prefix_count;
   bool is_safetensors = (format == ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS);
 
   if (is_safetensors) {
@@ -1011,14 +1013,65 @@ void NeuralNetwork::load(const std::string &file_path,
     // Build prefix-based fallback map: "layer_name" -> (offset, size)
     // This allows matching when the weight suffix differs between
     // the safetensors file and the C++ model (e.g., ":weight" vs ":gamma").
+    //
+    // Safety: only add to prefix_offset_map when the prefix is UNAMBIGUOUS
+    // (exactly one safetensors entry shares that prefix). When multiple
+    // entries share a prefix (e.g. both :weight and :bias), prefix fallback
+    // is refused — otherwise unordered_map iteration order would make the
+    // result non-deterministic and the wrong tensor could be loaded
+    // silently.
     for (auto &kv : name_offset_map) {
       auto colon_pos = kv.first.find(':');
       if (colon_pos != std::string::npos) {
         std::string prefix = kv.first.substr(0, colon_pos);
-        // Only store first occurrence per prefix (weight before bias)
-        if (prefix_offset_map.find(prefix) == prefix_offset_map.end()) {
+        prefix_count[prefix]++;
+      }
+    }
+    for (auto &kv : name_offset_map) {
+      auto colon_pos = kv.first.find(':');
+      if (colon_pos != std::string::npos) {
+        std::string prefix = kv.first.substr(0, colon_pos);
+        if (prefix_count[prefix] == 1) {
           prefix_offset_map[prefix] = kv.second;
         }
+      }
+    }
+
+    // Diagnostic dump: list all safetensors entries in sorted order so the
+    // user can visually diff against the C++ model weight list (printed
+    // below, right before the matching loop).
+    {
+      std::vector<std::string> sorted_names;
+      sorted_names.reserve(name_offset_map.size());
+      for (auto &kv : name_offset_map)
+        sorted_names.push_back(kv.first);
+      std::sort(sorted_names.begin(), sorted_names.end());
+      std::cout << "[safetensors] File tensor list (sorted):" << std::endl;
+      for (auto &n : sorted_names) {
+        auto &off = name_offset_map[n];
+        std::cout << "  " << n << "  (offset=" << off.first
+                  << ", size=" << off.second << ")" << std::endl;
+      }
+    }
+  }
+
+  // Diagnostic dump: list all C++ model weight names in graph order so the
+  // user can visually diff against the safetensors file list (printed
+  // above). This is the authoritative "what C++ expects" reference.
+  if (is_safetensors) {
+    std::cout << "[nntrainer] C++ model weight list (graph order):"
+              << std::endl;
+    std::unordered_set<const Tensor *> dumped;
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (auto weight : weights) {
+        if (!dumped.insert(&weight->getVariableRef()).second)
+          continue;
+        std::cout << "  " << weight->getName()
+                  << "  (bytes=" << weight->getVariable().getMemoryBytes()
+                  << ", dtype="
+                  << static_cast<int>(weight->getDim().getDataType()) << ")"
+                  << std::endl;
       }
     }
   }
@@ -1073,10 +1126,30 @@ void NeuralNetwork::load(const std::string &file_path,
                       << (data_section_start + pit->second.first) << std::endl;
             weight_match_count++;
           } else {
+            // Strict: a MISS used to set file_offset=0, which silently read
+            // garbage from the start of the file (the safetensors header).
+            // Fail loudly with a diagnostic message so name-mismatch bugs
+            // surface immediately instead of producing wrong outputs.
+            weight_miss_count++;
             std::cout << "  [MISS]   '" << wname
                       << "' NOT FOUND in safetensors" << std::endl;
-            weight->getVariableRef().setFileOffset(start_from);
-            weight_miss_count++;
+            std::ostringstream oss;
+            oss << "[safetensors] weight '" << wname
+                << "' NOT FOUND: no exact match, ";
+            auto pc_it = prefix_count.find(prefix);
+            if (pc_it != prefix_count.end() && pc_it->second > 1) {
+              oss << "prefix '" << prefix << "' is ambiguous ("
+                  << pc_it->second
+                  << " safetensors entries share it; prefix fallback refused)";
+            } else if (pc_it == prefix_count.end()) {
+              oss << "prefix '" << prefix
+                  << "' not present in safetensors either";
+            } else {
+              oss << "prefix '" << prefix << "' present but lookup failed";
+            }
+            oss << ". See the '[safetensors] File tensor list' and "
+                   "'[nntrainer] C++ model weight list' above to diff names.";
+            throw std::runtime_error(oss.str());
           }
         }
       } else {
