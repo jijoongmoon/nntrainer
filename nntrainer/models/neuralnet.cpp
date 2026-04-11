@@ -969,9 +969,34 @@ void NeuralNetwork::load(const std::string &file_path,
    * For BIN format, use sequential offset assignment (legacy).
    */
   size_t data_section_start = 0;
-  std::unordered_map<std::string, std::pair<size_t, size_t>> name_offset_map;
+
+  /**
+   * @brief Parsed per-tensor metadata from the safetensors JSON header.
+   *
+   * Schema version 1 (legacy) populates only {offset,size,shape?}; schema
+   * version 2 additionally fills {dtype, quant_*} when the writer emits
+   * them. quant_present indicates whether the "quant" object was found on
+   * this entry; absent + a quantized model-side dtype is accepted with a
+   * warning (legacy files) while a mismatching "quant" object triggers a
+   * strict error.
+   */
+  struct SafetensorEntry {
+    size_t offset = 0;
+    size_t size = 0;
+    std::string dtype; ///< empty if not present in the header
+    bool quant_present = false;
+    std::string quant_encoding;
+    int quant_axis = 0;
+    int quant_bitwidth = 0;
+    int quant_group_size = 0;
+    bool quant_has_zero_point = false;
+  };
+
+  std::unordered_map<std::string, SafetensorEntry> name_offset_map;
   std::unordered_map<std::string, std::pair<size_t, size_t>> prefix_offset_map;
   std::unordered_map<std::string, int> prefix_count;
+  std::string safetensors_schema_version = "1";
+  std::string safetensors_format;
   bool is_safetensors = (format == ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS);
 
   if (is_safetensors) {
@@ -990,10 +1015,13 @@ void NeuralNetwork::load(const std::string &file_path,
       << "Failed to read safetensors JSON header from: " << f_path;
     probe.close();
 
-    // Minimal JSON parser for safetensors header: extract data_offsets
+    // Minimal JSON parser for safetensors header. Extracts:
+    //   - __metadata__.schema_version, __metadata__.format
+    //   - per-entry: data_offsets, dtype, quant object
     auto parse_safetensors_header =
       [](const std::string &json,
-         std::unordered_map<std::string, std::pair<size_t, size_t>> &out_map) {
+         std::unordered_map<std::string, SafetensorEntry> &out_map,
+         std::string &out_schema_version, std::string &out_format) {
         size_t pos = 0;
         auto skip_ws = [&]() {
           while (pos < json.size() &&
@@ -1024,6 +1052,18 @@ void NeuralNetwork::load(const std::string &file_path,
             ++pos;
           }
           return val;
+        };
+        auto parse_bool = [&]() -> bool {
+          skip_ws();
+          if (pos + 4 <= json.size() && json.compare(pos, 4, "true") == 0) {
+            pos += 4;
+            return true;
+          }
+          if (pos + 5 <= json.size() && json.compare(pos, 5, "false") == 0) {
+            pos += 5;
+            return false;
+          }
+          return false;
         };
         auto skip_value = [&]() {
           skip_ws();
@@ -1058,6 +1098,72 @@ void NeuralNetwork::load(const std::string &file_path,
           }
         };
 
+        // Parse the __metadata__ nested object and extract recognized
+        // fields. Unknown fields are skipped for forward compatibility.
+        auto parse_metadata_object = [&]() {
+          skip_ws();
+          if (pos >= json.size() || json[pos] != '{') {
+            skip_value();
+            return;
+          }
+          ++pos;
+          while (pos < json.size() && json[pos] != '}') {
+            skip_ws();
+            if (pos < json.size() && json[pos] == ',')
+              ++pos;
+            std::string mk = parse_string();
+            skip_ws();
+            if (pos < json.size() && json[pos] == ':')
+              ++pos;
+            skip_ws();
+            if (mk == "schema_version") {
+              out_schema_version = parse_string();
+            } else if (mk == "format") {
+              out_format = parse_string();
+            } else {
+              skip_value();
+            }
+          }
+          if (pos < json.size() && json[pos] == '}')
+            ++pos;
+        };
+
+        // Parse the "quant" nested object inside a per-tensor entry.
+        auto parse_quant_object = [&](SafetensorEntry &entry) {
+          skip_ws();
+          if (pos >= json.size() || json[pos] != '{') {
+            skip_value();
+            return;
+          }
+          ++pos;
+          entry.quant_present = true;
+          while (pos < json.size() && json[pos] != '}') {
+            skip_ws();
+            if (pos < json.size() && json[pos] == ',')
+              ++pos;
+            std::string qf = parse_string();
+            skip_ws();
+            if (pos < json.size() && json[pos] == ':')
+              ++pos;
+            skip_ws();
+            if (qf == "encoding") {
+              entry.quant_encoding = parse_string();
+            } else if (qf == "axis") {
+              entry.quant_axis = static_cast<int>(parse_number());
+            } else if (qf == "bitwidth") {
+              entry.quant_bitwidth = static_cast<int>(parse_number());
+            } else if (qf == "group_size") {
+              entry.quant_group_size = static_cast<int>(parse_number());
+            } else if (qf == "has_zero_point") {
+              entry.quant_has_zero_point = parse_bool();
+            } else {
+              skip_value();
+            }
+          }
+          if (pos < json.size() && json[pos] == '}')
+            ++pos;
+        };
+
         skip_ws();
         if (pos >= json.size() || json[pos] != '{')
           return;
@@ -1077,12 +1183,13 @@ void NeuralNetwork::load(const std::string &file_path,
           skip_ws();
 
           if (key == "__metadata__") {
-            skip_value();
+            parse_metadata_object();
             continue;
           }
 
           if (pos < json.size() && json[pos] == '{') {
             ++pos;
+            SafetensorEntry entry;
             size_t offset_start = 0, offset_end = 0;
             bool found_offsets = false;
             while (pos < json.size() && json[pos] != '}') {
@@ -1108,6 +1215,10 @@ void NeuralNetwork::load(const std::string &file_path,
                     ++pos;
                   found_offsets = true;
                 }
+              } else if (field == "dtype") {
+                entry.dtype = parse_string();
+              } else if (field == "quant") {
+                parse_quant_object(entry);
               } else {
                 skip_value();
               }
@@ -1116,7 +1227,9 @@ void NeuralNetwork::load(const std::string &file_path,
               ++pos;
 
             if (found_offsets) {
-              out_map[key] = {offset_start, offset_end - offset_start};
+              entry.offset = offset_start;
+              entry.size = offset_end - offset_start;
+              out_map[key] = entry;
             }
           } else {
             skip_value();
@@ -1124,9 +1237,31 @@ void NeuralNetwork::load(const std::string &file_path,
         }
       };
 
-    parse_safetensors_header(header_json, name_offset_map);
+    parse_safetensors_header(header_json, name_offset_map,
+                             safetensors_schema_version, safetensors_format);
+
+    // Version management: reject unknown schemas. schema_version "1"
+    // is the legacy untagged format (files that predate P2 and have
+    // no schema_version field at all); "2" is the current format
+    // with optional per-entry "quant" metadata.
+    if (safetensors_schema_version != "1" && safetensors_schema_version != "2") {
+      std::ostringstream oss;
+      oss << "[safetensors] Unsupported schema_version '"
+          << safetensors_schema_version
+          << "' in file " << f_path
+          << ". This nntrainer build understands schema_version 1 and 2. "
+          << "Please regenerate the file with a compatible converter or "
+          << "update nntrainer.";
+      throw std::runtime_error(oss.str());
+    }
+
     std::cout << "[safetensors] Loaded " << name_offset_map.size()
-              << " tensor entries" << std::endl;
+              << " tensor entries (schema_version="
+              << safetensors_schema_version
+              << (safetensors_format.empty()
+                    ? ""
+                    : ", format=" + safetensors_format)
+              << ")" << std::endl;
 
     // Build prefix-based fallback map: "layer_name" -> (offset, size)
     // This allows matching when the weight suffix differs between
@@ -1150,7 +1285,7 @@ void NeuralNetwork::load(const std::string &file_path,
       if (colon_pos != std::string::npos) {
         std::string prefix = kv.first.substr(0, colon_pos);
         if (prefix_count[prefix] == 1) {
-          prefix_offset_map[prefix] = kv.second;
+          prefix_offset_map[prefix] = {kv.second.offset, kv.second.size};
         }
       }
     }
@@ -1166,9 +1301,19 @@ void NeuralNetwork::load(const std::string &file_path,
       std::sort(sorted_names.begin(), sorted_names.end());
       std::cout << "[safetensors] File tensor list (sorted):" << std::endl;
       for (auto &n : sorted_names) {
-        auto &off = name_offset_map[n];
-        std::cout << "  " << n << "  (offset=" << off.first
-                  << ", size=" << off.second << ")" << std::endl;
+        auto &e = name_offset_map[n];
+        std::cout << "  " << n << "  (offset=" << e.offset
+                  << ", size=" << e.size;
+        if (!e.dtype.empty())
+          std::cout << ", dtype=" << e.dtype;
+        if (e.quant_present) {
+          std::cout << ", quant={enc=" << e.quant_encoding
+                    << ",axis=" << e.quant_axis
+                    << ",bw=" << e.quant_bitwidth
+                    << ",gs=" << e.quant_group_size
+                    << (e.quant_has_zero_point ? ",zp" : "") << "}";
+        }
+        std::cout << ")" << std::endl;
       }
     }
   }
@@ -1224,11 +1369,86 @@ void NeuralNetwork::load(const std::string &file_path,
         auto it = name_offset_map.find(wname);
         if (it != name_offset_map.end()) {
           // Exact match: safetensors name == C++ weight name
+          const SafetensorEntry &entry = it->second;
           weight->getVariableRef().setFileOffset(data_section_start +
-                                                 it->second.first);
+                                                 entry.offset);
           std::cout << "  [MATCH]  '" << wname << "' -> offset="
-                    << (data_section_start + it->second.first) << std::endl;
+                    << (data_section_start + entry.offset) << std::endl;
           weight_match_count++;
+
+          // ---- Validation (schema_version 2+) ----
+          // Map C++ model dtype to the short string the writer emits.
+          auto dtype_to_str =
+            [](TensorDim::DataType t) -> const char * {
+            switch (t) {
+            case TensorDim::DataType::FP32:
+              return "F32";
+            case TensorDim::DataType::FP16:
+              return "F16";
+            case TensorDim::DataType::QINT4:
+              return "I4";
+            case TensorDim::DataType::QINT8:
+              return "I8";
+            case TensorDim::DataType::QINT16:
+              return "I16";
+            case TensorDim::DataType::UINT4:
+              return "U4";
+            case TensorDim::DataType::UINT8:
+              return "U8";
+            case TensorDim::DataType::UINT16:
+              return "U16";
+            case TensorDim::DataType::UINT32:
+              return "U32";
+            default:
+              return "";
+            }
+          };
+          const char *c_dtype = dtype_to_str(tensor_data_type);
+
+          // dtype mismatch is a hard error if the file declared a dtype.
+          // Legacy schema_version 1 files have no dtype so we skip.
+          if (!entry.dtype.empty() && *c_dtype != '\0' &&
+              entry.dtype != std::string(c_dtype)) {
+            std::ostringstream oss;
+            oss << "[safetensors] dtype mismatch for weight '" << wname
+                << "': file has '" << entry.dtype
+                << "' but C++ model expects '" << c_dtype
+                << "'. The safetensors file was likely generated for a "
+                   "different quantization config.";
+            throw std::runtime_error(oss.str());
+          }
+
+          // Quant metadata validation. We only validate in one direction
+          // for now: if BOTH sides declare quant info, they must agree.
+          // If the file has no quant info (v1 or omitted), we accept it
+          // and trust the C++ model's dtype — this preserves backward
+          // compatibility with existing files.
+          bool c_is_quant = (tensor_data_type == TensorDim::DataType::QINT4 ||
+                             tensor_data_type == TensorDim::DataType::QINT8 ||
+                             tensor_data_type == TensorDim::DataType::QINT16 ||
+                             tensor_data_type == TensorDim::DataType::UINT4 ||
+                             tensor_data_type == TensorDim::DataType::UINT8 ||
+                             tensor_data_type == TensorDim::DataType::UINT16 ||
+                             tensor_data_type == TensorDim::DataType::Q4_0 ||
+                             tensor_data_type == TensorDim::DataType::Q6_K);
+          if (entry.quant_present && !c_is_quant) {
+            std::ostringstream oss;
+            oss << "[safetensors] weight '" << wname
+                << "' has a quant object in the file (encoding="
+                << entry.quant_encoding
+                << ") but the C++ model's dtype (" << c_dtype
+                << ") is not a quantized type.";
+            throw std::runtime_error(oss.str());
+          }
+          if (c_is_quant && !entry.quant_present &&
+              safetensors_schema_version == "2") {
+            // Schema v2 should include quant info for quantized
+            // weights; absence is suspicious but not fatal.
+            std::cout << "  [WARN]   '" << wname
+                      << "' C++ expects a quantized dtype but the "
+                         "schema_version 2 file has no quant object"
+                      << std::endl;
+          }
         } else {
           // Prefix fallback: match by layer name prefix (before ':')
           // This handles suffix mismatches like ":weight" vs ":gamma"
