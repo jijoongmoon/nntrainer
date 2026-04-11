@@ -19,10 +19,12 @@
 #include <memory_data.h>
 #include <tensor.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <functional>
-#include <stdexcept>
 #include <set>
+#include <stdexcept>
 #include <unordered_set>
 
 namespace ml {
@@ -42,6 +44,17 @@ struct SymbolicGraphNode {
   TensorDim dim;
   std::string name;
   int output_index = -1; ///< >=0 means indexed output, e.g. split(0)
+  /**
+   * @brief Monotonic creation index assigned by LayerHandle::operator().
+   *        Used by Model::compile() to sort independent sibling layers
+   *        into their source-code creation order, so that addLayer order
+   *        and therefore sequential .bin file layout matches the string-
+   *        based API. Without this, DFS recursion order (which follows
+   *        consumer input_layers order) would swap the order of sibling
+   *        layers like ffn_up / ffn_gate and produce weight slot
+   *        mismatches when loading legacy .bin files.
+   */
+  long creation_index = 0;
 };
 
 /**
@@ -819,6 +832,14 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
   edge->producing_layer = ptr_;
   edge->dim = out_dim;
   edge->name = out_name;
+  // Assign a monotonic creation index so Model::compile() can preserve
+  // source-code creation order for independent sibling layers. Without
+  // this, sibling layers fed into a common consumer would be reordered
+  // by the consumer's input_layers list during the DFS in compile().
+  {
+    static std::atomic<long> creation_counter{0};
+    edge->creation_index = creation_counter.fetch_add(1);
+  }
   for (auto &inp : inputs) {
     if (inp.impl_ && inp.impl_->graph_edge) {
       edge->inputs.push_back(inp.impl_->graph_edge);
@@ -861,6 +882,7 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
   struct LayerInfo {
     std::shared_ptr<Layer> layer;
     std::vector<std::string> input_layer_names;
+    long creation_index = 0;
   };
 
   std::vector<LayerInfo> layers_in_order;
@@ -937,7 +959,8 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
         }
       }
 
-      layers_in_order.push_back({edge->producing_layer, input_names});
+      layers_in_order.push_back(
+        {edge->producing_layer, input_names, edge->creation_index});
     };
 
   // Walk backwards from each output
@@ -946,6 +969,22 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
       dfs(output.impl_->graph_edge);
     }
   }
+
+  // Restore source-code creation order for independent sibling layers.
+  // The DFS above produces a topologically valid order, but its
+  // sibling order follows consumer->inputs ordering (e.g. the order
+  // passed to swiglu({gate, up})), which for legacy .bin files causes
+  // weight slot swaps when it differs from the order in which the
+  // layers were actually constructed in source code (ffn_up created
+  // before ffn_gate). stable_sort by creation_index preserves DFS
+  // dependency ordering — a layer's creation_index is always greater
+  // than its inputs' because you cannot call op(tensor) before its
+  // producing layer exists — while reordering independent siblings
+  // into creation order, which matches the string-based API / main.
+  std::stable_sort(layers_in_order.begin(), layers_in_order.end(),
+                   [](const LayerInfo &a, const LayerInfo &b) {
+                     return a.creation_index < b.creation_index;
+                   });
 
   // 1. Create and add input layers (skip if already in DFS-discovered graph)
   //    When constructModel() already creates input layers via
