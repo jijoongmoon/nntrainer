@@ -1037,17 +1037,29 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   unsigned int N = output.getDim().width();
 
   auto *o = ops ? ops : getComputeOps();
-  if (o->gemv_int4_accel_fp32 && input.getMemoryData()->isSVM() &&
-      output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
+
+  // Try the SVM / accelerator path first. Previously this was gated
+  // on `o->gemv_int4_accel_fp32` being non-null, which meant that
+  // when a CL backend wired only `sgemm_int4_accel_fp32` but left
+  // `gemv_int4_accel_fp32 = nullptr` (as cl_compute_ops.cpp does
+  // today), even the M>1 sgemm path was unreachable and the whole
+  // call fell back to KleidiAI on CPU. Check each path's own slot.
+  bool handled_on_accel = false;
+  if (input.getMemoryData()->isSVM() && output.getMemoryData()->isSVM() &&
+      getMemoryData()->isSVM()) {
     const size_t gs = input.group_size();
-    if (M == 1) {
+    if (M == 1 && o->gemv_int4_accel_fp32) {
       o->gemv_int4_accel_fp32(mdata, input.getScale<uint16_t>(), data, rdata,
-                                K, N, gs);
-    } else {
-      o->sgemm_int4_accel_fp32(data, mdata, input.getScale<uint16_t>(),
-                                 rdata, M, N, K, gs);
+                              K, N, gs);
+      handled_on_accel = true;
+    } else if (M > 1 && o->sgemm_int4_accel_fp32) {
+      o->sgemm_int4_accel_fp32(data, mdata, input.getScale<uint16_t>(), rdata,
+                               M, N, K, gs);
+      handled_on_accel = true;
     }
-  } else {
+  }
+
+  if (!handled_on_accel) {
 #ifdef ENABLE_FP16
     if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
       uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
