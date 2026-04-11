@@ -550,8 +550,19 @@ void Int4QTensor::print(std::ostream &out) const {
 }
 
 size_t Int4QTensor::getMemoryBytes() const {
+  // Scales are stored as fp32 (sizeof(float)) per the canonical layout
+  // documented on the class header. allocate() already reserves
+  // `sizeof(float) * scale_size()` bytes for the scale section, and the
+  // KleidiAI qai8dxp_qsi4cxp_unpacked kernel consumes fp32 scales. Before
+  // P6b this function reported `sizeof(uint16_t) * scale_size()` which
+  // caused save() and read() to transfer only the low 2 bytes of each
+  // fp32 scale (= garbage), while the in-memory buffer actually held
+  // correct fp32 values. That silent data corruption on round-trip
+  // never surfaced because the FC layer's old dequantize path worked
+  // entirely in memory and the test coverage for saved-then-reloaded
+  // QINT4 weights was effectively zero. Align with the allocator here.
   return ((size() + 1) / 2) * dim.getDataTypeSize() +
-         scale_size() * sizeof(uint16_t);
+         scale_size() * sizeof(float);
 }
 
 size_t Int4QTensor::scale_size() const {

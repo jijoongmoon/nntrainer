@@ -216,6 +216,118 @@ TEST(SafetensorsInt4, SaveThenLoadQINT4Fc_roundtrip) {
   std::remove(path.c_str());
 }
 
+// =============================================================================
+// Q4_0 regression tests: FC layer must keep working for Q4_0 weights, which
+// live on Lane B (GGML-style block-quantized) and go through
+// FloatTensor::dotQnK / gemm_q4_0_fp32 rather than the int4 dispatch path
+// touched by P5/P6b. These tests guard against accidental breakage of the
+// Q4_0 code path when the QINT4 branches are refactored.
+// =============================================================================
+
+namespace {
+
+/**
+ * @brief Build an initialized Input + FC NeuralNetwork whose FC weight
+ *        is Q4_0. Q4_0_Tensor requires batch=1, channel=1 and
+ *        `width() % 32 == 0`, so `N` must be a multiple of 32.
+ *        The Q4_0 block format carries its fp16 scale embedded in
+ *        each 18-byte block, so the layer-side quantizer on FC stays
+ *        null (old `default:` branch, unchanged by P5).
+ */
+std::unique_ptr<nntrainer::NeuralNetwork>
+buildQ4_0FcNN(unsigned int K, unsigned int N) {
+  auto nn = std::make_unique<nntrainer::NeuralNetwork>();
+  nn->addLayer(ml::train::layer::Input(
+    {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+  nn->addLayer(ml::train::layer::FullyConnected({
+    "name=dense",
+    "unit=" + std::to_string(N),
+    "weight_dtype=Q4_0",
+    "disable_bias=true",
+    "weight_initializer=ones",
+  }));
+  nn->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
+  nn->setProperty({"loss=mse", "batch_size=1"});
+  nn->compile();
+  nn->initialize();
+  return nn;
+}
+
+} // namespace
+
+/**
+ * @brief Building and initializing an FC layer with Q4_0 weight dtype
+ *        must succeed. Validates that P5's QINT4-specific branch in
+ *        FullyConnectedLayer::finalize did not accidentally null out
+ *        Q4_0 allocation or selection.
+ */
+TEST(SafetensorsQ4_0, BuildFcWithQ4_0Weight_smoke) {
+  const unsigned int K = 16;
+  const unsigned int N = 32; // must be divisible by 32 for Q4_0_Tensor
+  ASSERT_NO_THROW({ auto nn = buildQ4_0FcNN(K, N); });
+}
+
+/**
+ * @brief Save an FC layer whose weight is Q4_0 and verify that
+ *        neuralnet.cpp's safetensors writer emits the Q4_0 quant
+ *        encoding (schema_version 2). This covers the Lane B
+ *        dtype_str + deriveQuantInfo additions from commit 807f18d.
+ */
+TEST(SafetensorsQ4_0, SaveQ4_0Fc_header_contains_q4_0_quant) {
+  const std::string path = "test_q4_0_header.safetensors";
+  const unsigned int K = 16;
+  const unsigned int N = 32;
+
+  auto nn = buildQ4_0FcNN(K, N);
+  ASSERT_NO_THROW(
+    nn->save(path, ModelFormat::MODEL_FORMAT_SAFETENSORS));
+
+  std::string blob = readFile(path);
+  ASSERT_GE(blob.size(), static_cast<size_t>(8));
+
+  uint64_t hdr_size = 0;
+  std::memcpy(&hdr_size, blob.data(), sizeof(hdr_size));
+  ASSERT_LE(static_cast<size_t>(8 + hdr_size), blob.size());
+  std::string header_json = blob.substr(8, hdr_size);
+
+  EXPECT_NE(header_json.find("\"schema_version\":\"2\""), std::string::npos);
+  EXPECT_NE(header_json.find("\"dtype\":\"Q4_0\""), std::string::npos)
+    << "Q4_0 dtype string missing from header";
+  EXPECT_NE(header_json.find("\"quant\""), std::string::npos)
+    << "per-entry quant object missing for Q4_0 weight";
+  EXPECT_NE(header_json.find("\"encoding\":\"q4_0\""), std::string::npos)
+    << "q4_0 encoding missing in quant object";
+  EXPECT_NE(header_json.find("\"bitwidth\":4"), std::string::npos)
+    << "bitwidth=4 missing in quant object for Q4_0";
+  // group_size for Q4_0 is the GGML block size, 32.
+  EXPECT_NE(header_json.find("\"group_size\":32"), std::string::npos)
+    << "group_size=32 missing in quant object for Q4_0";
+
+  std::remove(path.c_str());
+}
+
+/**
+ * @brief Full Q4_0 save/load round-trip. Identical topology on both
+ *        sides; P3a strict dtype validation must accept "Q4_0" ==
+ *        Q4_0 and the quant object must not be flagged as a mismatch
+ *        against a quantized C++ dtype.
+ */
+TEST(SafetensorsQ4_0, SaveThenLoadQ4_0Fc_roundtrip) {
+  const std::string path = "test_q4_0_roundtrip.safetensors";
+  const unsigned int K = 16;
+  const unsigned int N = 32;
+
+  auto nn1 = buildQ4_0FcNN(K, N);
+  ASSERT_NO_THROW(
+    nn1->save(path, ModelFormat::MODEL_FORMAT_SAFETENSORS));
+
+  auto nn2 = buildQ4_0FcNN(K, N);
+  ASSERT_NO_THROW(
+    nn2->load(path, ModelFormat::MODEL_FORMAT_SAFETENSORS));
+
+  std::remove(path.c_str());
+}
+
 /**
  * @brief Loading a safetensors file whose dtype contradicts the C++
  *        model must fail loudly (strict P3a dtype validation). We

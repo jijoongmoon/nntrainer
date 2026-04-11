@@ -39,9 +39,17 @@ namespace nntrainer {
  *                                        | (output-channel first). Two
  *                                        | nibbles per byte, high nibble
  *                                        | = even index.
- *   ceil(N/2) .. ceil(N/2) + 2*S - 1     | per-scale fp16 (uint16_t) array
- *                                        | of length S = scale_size(),
+ *   ceil(N/2) .. ceil(N/2) + 4*S - 1     | per-scale fp32 array of
+ *                                        | length S = scale_size(),
  *                                        | contiguous, row-major.
+ *
+ * NOTE on scale dtype: scales are fp32, not fp16. This matches (a) the
+ * memory that Int4QTensor::allocate() actually reserves via
+ * `sizeof(float) * scale_size()`, (b) KleidiAI's qai8dxp_qsi4cxp_unpacked
+ * variant which takes `rhs_scales_f32`, and (c) the existing
+ * char_tensor/quantizer code that accesses scales via getScale<float>().
+ * Using 2 bytes/scale (fp16) would save memory but would conflict with
+ * all three existing consumers and break the round-trip test suite.
  *
  * Where N = dim.getDataLen() and S is determined by the QScheme:
  *   PER_TENSOR_AFFINE  -> S = 1
