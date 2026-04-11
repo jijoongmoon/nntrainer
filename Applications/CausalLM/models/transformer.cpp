@@ -394,7 +394,12 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   LayerHandle swiglu = createLayer(
     "swiglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")});
-  Tensor activated = swiglu({up, gate});
+  // SwiGLU kernel convention: output = silu(input[0]) * input[1]
+  // i.e. input[0] is the gated path (silu applied), input[1] is the
+  // passthrough (up). Standard Llama/Qwen SwiGLU:
+  //   silu(gate_proj(x)) * up_proj(x)
+  // so the first operand MUST be `gate`, not `up`.
+  Tensor activated = swiglu({gate, up});
 
   LayerHandle ffn_down = createLayer(
     "fully_connected",
