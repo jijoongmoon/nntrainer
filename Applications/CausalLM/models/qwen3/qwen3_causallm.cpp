@@ -45,12 +45,28 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
   auto A_name = "layer" + std::to_string(layer_id) + "_attention";
   auto O_name = "layer" + std::to_string(layer_id) + "_attention_out";
 
-  // V projection
-  LayerHandle v_proj = createLayer(
+  // Layer creation order MUST match the main/legacy string-based API
+  // (Q -> Q_norm -> K -> K_norm -> V -> attention -> O) so that .bin
+  // files generated for the main branch load with the correct sequential
+  // offsets on the symbolic API path. Changing this order will shift
+  // weight slots within the attention sub-block and produce numerically
+  // wrong outputs without any visible error.
+
+  // Q projection
+  LayerHandle q_proj = createLayer(
     "fully_connected",
-    {withKey("name", V_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
+    {withKey("name", Q_name), withKey("unit", head_dim * n_heads),
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
-  Tensor v = v_proj(value);
+  Tensor q = q_proj(query);
+
+  // Q-reshaped-norm layer
+  // q_norm(q_proj.view(hidden_shape))
+  LayerHandle q_norm = createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", Q_norm_name), withKey("packed", "false"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(head_dim))});
+  Tensor q_normed = q_norm(q);
 
   // K projection
   LayerHandle k_proj = createLayer(
@@ -68,21 +84,12 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("feature_size", std::to_string(head_dim))});
   Tensor k_normed = k_norm(k);
 
-  // Q projection
-  LayerHandle q_proj = createLayer(
+  // V projection
+  LayerHandle v_proj = createLayer(
     "fully_connected",
-    {withKey("name", Q_name), withKey("unit", head_dim * n_heads),
+    {withKey("name", V_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones")});
-  Tensor q = q_proj(query);
-
-  // Q-reshaped-norm layer
-  // q_norm(q_proj.view(hidden_shape))
-  LayerHandle q_norm = createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", Q_norm_name), withKey("packed", "false"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))});
-  Tensor q_normed = q_norm(q);
+  Tensor v = v_proj(value);
 
   // Attention core layer
   LayerHandle attn = createLayer(
