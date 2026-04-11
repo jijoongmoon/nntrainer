@@ -1995,6 +1995,17 @@ public:
   QScheme q_scheme() const;
 
   /**
+   * @brief     return the quantization group size for grouped per-channel
+   *            quantized tensors (e.g. Int4QTensor PER_CHANNEL_AFFINE).
+   *            Returns 0 for non-quantized tensors. For Int4QTensor, a
+   *            value of 0 also signals pure per-channel (qsi4cxp: one
+   *            scale per output channel); any non-zero value means
+   *            "group_size elements share one scale" within each channel.
+   * @retval    group size in elements, 0 if not applicable
+   */
+  size_t group_size() const;
+
+  /**
    * @brief Merge the given two axis for tensor at second axis inplace
    *
    * @param axis1 first axis to merge

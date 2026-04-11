@@ -820,6 +820,21 @@ public:
   virtual size_t scale_size() const { return 0; }
 
   /**
+   * @brief     return the quantization group size (elements per scale) for
+   *            tensors that use grouped per-channel quantization. Returns 0
+   *            for non-quantized tensors or for schemes where the concept
+   *            does not apply (e.g. pure per-tensor). For Int4QTensor with
+   *            PER_CHANNEL_AFFINE this is the number of elements that share
+   *            one fp16 scale factor; set group_size == row_width (= 0 by
+   *            convention here) to signal "one scale per output channel"
+   *            (pure channel-wise / qsi4cxp semantics).
+   * @retval    group size in elements, 0 if not applicable
+   * @note      Override for quantized tensors that carry a per-instance
+   *            group size.
+   */
+  virtual size_t group_size() const { return 0; }
+
+  /**
    * @brief     return Tensor quantization scheme
    * @retval    Qscheme qscheme
    * @note      Override for quantize tensor

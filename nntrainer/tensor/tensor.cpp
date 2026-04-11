@@ -1657,6 +1657,8 @@ size_t Tensor::scale_size() const { return itensor_->scale_size(); }
 
 QScheme Tensor::q_scheme() const { return itensor_->q_scheme(); }
 
+size_t Tensor::group_size() const { return itensor_->group_size(); }
+
 void Tensor::mergeAxis(unsigned int axis1, unsigned int axis2) {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot merge axis";

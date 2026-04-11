@@ -823,12 +823,22 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
       for (unsigned int i = 0; i < input.size(); ++i) {
         scales.push_back(input[i]->getScale<uint16_t>());
       }
+      // All inputs in a batch int4 dispatch must share the same group
+      // size since the kernel takes a single scalar parameter. Enforce
+      // this so mixed-group-size batches fail loudly instead of
+      // silently using input[0]'s value for everything.
+      const size_t gs = input[0]->group_size();
+      for (size_t i = 1; i < input.size(); ++i) {
+        NNTR_THROW_IF(input[i]->group_size() != gs, std::invalid_argument)
+          << "Int4 batch GEMM/GEMV requires all weight tensors to share "
+             "the same quantization group_size, but input[" << i
+          << "].group_size()=" << input[i]->group_size()
+          << " differs from input[0].group_size()=" << gs;
+      }
       if (M == 1) {
-        o->gemv_int4_batch_fp32(mdatas, scales, data, rdatas, K, Ns,
-                                  Int4QTensor::getGroupSize());
+        o->gemv_int4_batch_fp32(mdatas, scales, data, rdatas, K, Ns, gs);
       } else {
-        o->gemm_int4_batch_fp32(data, mdatas, scales, rdatas, M, Ns, K,
-                                  Int4QTensor::getGroupSize());
+        o->gemm_int4_batch_fp32(data, mdatas, scales, rdatas, M, Ns, K, gs);
       }
     } else {
       /// @todo Replace with standard CPU INT4 computation
@@ -1029,13 +1039,13 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   auto *o = ops ? ops : getComputeOps();
   if (o->gemv_int4_accel_fp32 && input.getMemoryData()->isSVM() &&
       output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
+    const size_t gs = input.group_size();
     if (M == 1) {
       o->gemv_int4_accel_fp32(mdata, input.getScale<uint16_t>(), data, rdata,
-                                K, N, Int4QTensor::getGroupSize());
+                                K, N, gs);
     } else {
       o->sgemm_int4_accel_fp32(data, mdata, input.getScale<uint16_t>(),
-                                 rdata, M, N, K,
-                                 Int4QTensor::getGroupSize());
+                                 rdata, M, N, K, gs);
     }
   } else {
 #ifdef ENABLE_FP16

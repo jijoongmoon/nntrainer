@@ -21,13 +21,45 @@ namespace nntrainer {
  * @class Int4QTensor class
  * @brief Int4QTensor class for quantized 4-bit integer calculation
  *
- * @note Int4QTensor store int4 data within the int8 memory space.
- * Specifically, each int8 value contains two int4 values packed together.
- * The first four bits represent the first int4 value, while the last four bits
- * represent the second int4 value.
- * E.g., 01011001 (89) represents 0101 (+5) and 1001 (-1)
+ * @note Int4QTensor stores symmetric signed int4 data inside int8 memory
+ * space. Each int8 byte carries two int4 values packed together; the high
+ * nibble is the element at even index, the low nibble is the element at
+ * odd index. E.g. the byte 01011001 (0x59) represents 0101 (+5) at index
+ * 2*i and 1001 (-1, two's complement) at index 2*i+1. The class supports
+ * both PER_TENSOR_AFFINE (one scale for the entire tensor) and
+ * PER_CHANNEL_AFFINE (grouped per-channel) via QScheme.
  *
- * @todo Remove variable `group_size` and add PER_GROUP_AFFINE_32,64,128
+ * @note CANONICAL IN-MEMORY / ON-DISK LAYOUT (must match all three
+ * backends: KleidiAI CPU, LiteRT-LM/Adreno GPU repackers, QNN HTP):
+ *
+ *   Offset                               | Content
+ *   -------------------------------------+-------------------------------
+ *   0 .. ceil(N/2) - 1                   | packed int4 values, row-major
+ *                                        | in the tensor's natural order
+ *                                        | (output-channel first). Two
+ *                                        | nibbles per byte, high nibble
+ *                                        | = even index.
+ *   ceil(N/2) .. ceil(N/2) + 2*S - 1     | per-scale fp16 (uint16_t) array
+ *                                        | of length S = scale_size(),
+ *                                        | contiguous, row-major.
+ *
+ * Where N = dim.getDataLen() and S is determined by the QScheme:
+ *   PER_TENSOR_AFFINE  -> S = 1
+ *   PER_CHANNEL_AFFINE -> S = height * width / group_size_
+ *                         (if group_size_ == row_width, this collapses
+ *                          to S = height, i.e. one scale per output
+ *                          channel = pure per-channel / qsi4cxp)
+ *
+ * group_size_ is a PER-INSTANCE member so one process can hold tensors
+ * with different group sizes (e.g. 0 / pure, 32, 64, 128) simultaneously.
+ * The previous implementation used a static class member, which forced
+ * all Int4QTensors in a process to share a single group size and made
+ * mixed-quantization models impossible.
+ *
+ * This canonical layout is also what safetensors schema_version 2 writes
+ * for dtype "I4" + quant.encoding == "axis_scale_offset". See
+ * neuralnet.cpp::NeuralNetwork::save for the writer and the
+ * documentation note in P4 for details.
  */
 class Int4QTensor : public TensorBase {
 public:
@@ -301,9 +333,14 @@ public:
   QScheme q_scheme() const override;
 
   /**
-   * @brief Returns quantization group size
+   * @brief     return the quantization group size stored on this instance.
+   * @retval    group size in elements
+   * @note      This is the number of elements that share one fp16 scale
+   *            factor within a channel (or across the whole tensor when
+   *            scheme == PER_TENSOR_AFFINE). See the CANONICAL LAYOUT
+   *            note on the class for full semantics.
    */
-  static size_t getGroupSize();
+  size_t group_size() const override { return group_size_; }
 
 private:
   /**
@@ -312,11 +349,13 @@ private:
   QScheme qscheme;
 
   /**
-   * @brief Quantization group size
-   *
-   * @note need to properly define this
+   * @brief per-instance quantization group size (elements per scale).
+   *        Default 32. Set via constructor argument g_size; no longer
+   *        static so multiple Int4QTensors with different group sizes
+   *        can coexist in one process (required for per-layer mixed
+   *        quant and for safetensors schema_version 2 round-tripping).
    */
-  static size_t group_size;
+  size_t group_size_ = 32;
 
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is
