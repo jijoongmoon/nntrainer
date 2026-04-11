@@ -1076,10 +1076,19 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
       // without a pre-pack step. A follow-up can add per-instance
       // caching of a KleidiAI-packed buffer for better throughput
       // (the current unpacked variant does runtime packing internally).
+      //
+      // transB=false (= kxn format) is correct for nntrainer's weight
+      // storage convention. nntrainer's FC weight_dim is
+      //   [1, 1, in_width=K, unit=N]
+      // and Int4QTensor stores the packed bytes in standard NCHW
+      // row-major, so the first N/2 bytes hold row 0 (all output
+      // columns for input-channel 0), and so on. KleidiAI's transB=true
+      // variant would interpret the same buffer as [N, K/2] and produce
+      // a transposed (wrong) result.
       nntr_gemm_qai8dxp_qsi4cxp_unpacked<float>(
         M, N, K, (void *)data, (void *)mdata,
         (void *)input.getScale<float>(), rdata,
-        /*transB=*/true);
+        /*transB=*/false);
     } else {
       throw std::runtime_error(
         "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
