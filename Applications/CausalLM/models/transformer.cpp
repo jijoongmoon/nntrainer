@@ -164,8 +164,10 @@ void Transformer::initialize() {
 
   // Compile the full graph now that all layers have been added.
   // Note: model->compile(vector<Tensor>, vector<Tensor>, mode) internally
-  // runs compile(), initialize(), and allocate().
-  model->compile(symbolic_inputs_, {symbolic_output_},
+  // runs compile(), initialize(), and allocate(). It takes non-const
+  // lvalue references, so the outputs vector must be a named local.
+  std::vector<Tensor> symbolic_outputs = {symbolic_output_};
+  model->compile(symbolic_inputs_, symbolic_outputs,
                  ml::train::ExecutionMode::INFERENCE);
 
   is_initialized = true;
