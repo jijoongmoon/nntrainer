@@ -244,6 +244,21 @@ protected:
   KVCacheBuffers kv_cache_buffers;    /**< External KV cache buffers */
   std::vector<Tensor> key_cache_tensors; /**< per-layer key cache tensors */
   std::vector<Tensor> val_cache_tensors; /**< per-layer value cache tensors */
+
+  /**
+   * @brief Symbolic graph inputs populated by constructModel().
+   *        Used by initialize() to compile the model AFTER subclasses have
+   *        had a chance to extend the graph (e.g. CausalLM adds an lm_head).
+   */
+  std::vector<Tensor> symbolic_inputs_;
+
+  /**
+   * @brief Current "end" of the symbolic graph populated by constructModel().
+   *        Subclasses (CausalLM, SentenceTransformer, ...) update this to
+   *        the tensor produced by the layers they add after the base
+   *        Transformer graph.
+   */
+  Tensor symbolic_output_;
 };
 /**
  * Loads JSON data from a file with detailed error handling

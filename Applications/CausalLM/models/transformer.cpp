@@ -143,7 +143,7 @@ void Transformer::initialize() {
   // RegisterCustomLayers
   registerCustomLayers();
 
-  // setup model property (must be set before constructModel which calls compile)
+  // setup model property (must be set before compile)
   model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
 
   std::vector<std::string> model_props = {
@@ -156,10 +156,17 @@ void Transformer::initialize() {
 
   model->setProperty(model_props);
 
-  // construct and compile model via symbolic tensor graph
-  // Note: model->compile(Tensor, Tensor) internally calls compile(),
-  // initialize(), and allocate() — no separate initialize() needed.
+  // Build the symbolic graph. constructModel() is virtual and dispatches
+  // to the most derived subclass (e.g. CausalLM), which extends the base
+  // Transformer graph with additional layers (e.g. lm_head). Subclasses
+  // must update symbolic_output_ to the final output tensor they produce.
   constructModel();
+
+  // Compile the full graph now that all layers have been added.
+  // Note: model->compile(vector<Tensor>, vector<Tensor>, mode) internally
+  // runs compile(), initialize(), and allocate().
+  model->compile(symbolic_inputs_, {symbolic_output_},
+                 ml::train::ExecutionMode::INFERENCE);
 
   is_initialized = true;
 
@@ -177,7 +184,6 @@ void Transformer::constructModel() {
     "input", {withKey("name", "input0"),
               withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))});
   Tensor input = input_layer(Tensor());
-  std::vector<Tensor> all_inputs = {input};
 
   // create embedding layer
   const std::string embedding_type =
@@ -202,9 +208,12 @@ void Transformer::constructModel() {
                  withKey("packed", "false")});
   x = output_norm(x);
 
-  // compile model from symbolic tensor graph
-  std::vector<Tensor> outputs = {x};
-  model->compile(all_inputs, outputs, ml::train::ExecutionMode::INFERENCE);
+  // Publish the symbolic graph endpoints so subclasses (CausalLM, etc.)
+  // can extend the graph by consuming `symbolic_output_` and updating it
+  // to their own final tensor. Transformer::initialize() then compiles
+  // the complete graph after constructModel() returns.
+  symbolic_inputs_ = {input};
+  symbolic_output_ = x;
 }
 
 void Transformer::load_weight(const std::string &weight_path) {
