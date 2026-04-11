@@ -680,34 +680,139 @@ void NeuralNetwork::save(
   }
   case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
     /**
-     * Safetensors format:
+     * Safetensors format (schema_version 2):
      *   [8B]  header_size (little-endian uint64)
      *   [header_size B] JSON header with tensor metadata
      *   [data section]  raw tensor bytes
      *
      * JSON header format:
      *   {
-     *     "__metadata__": { "format": "nntrainer" },
+     *     "__metadata__": {
+     *       "format": "nntrainer",
+     *       "schema_version": "2"
+     *     },
      *     "weight_name": {
-     *       "dtype": "F32"|"F16"|...,
+     *       "dtype": "F32"|"F16"|"I4"|...,
      *       "shape": [d1, d2, ...],
-     *       "data_offsets": [start, end]
+     *       "data_offsets": [start, end],
+     *       "quant": {                       // optional, only for quantized weights
+     *         "encoding": "axis_scale_offset" | "per_tensor_affine" |
+     *                     "q4_0" | "q6_k" | ...,
+     *         "axis": 0,                     // per-axis scale/offset axis
+     *         "bitwidth": 4,                 // effective bit width
+     *         "group_size": 0,               // 0 = pure per-channel, >0 = grouped
+     *         "has_zero_point": false        // true for asymmetric (UINT*)
+     *       }
      *     },
      *     ...
      *   }
+     *
+     * Notes on the embedded-scales layout (Int4QTensor / Uint4QTensor):
+     *   `data_offsets` covers the full packed region, i.e.
+     *     [packed_4bit_values | scales | (zero_points)?]
+     *   exactly as Tensor::save writes it. Readers that want raw weight
+     *   bytes only should use `shape` + `bitwidth` to compute the weight
+     *   sub-region; the remainder is the scale/zp section.
      */
     auto model_file = checkedOpenStream<std::ofstream>(
       file_path, std::ios::out | std::ios::binary | std::ios::trunc);
 
     // -- 1. Collect weight metadata --
+    struct QuantInfo {
+      bool present = false;
+      std::string encoding;
+      int axis = 0;
+      int bitwidth = 0;
+      int group_size = 0;
+      bool has_zero_point = false;
+    };
+
     struct SafetensorEntry {
       std::string name;
       size_t data_size;
       std::string dtype_str;
       std::vector<size_t> shape;
+      QuantInfo quant;
     };
     std::vector<SafetensorEntry> entries;
     size_t total_data_size = 0;
+
+    // Helper: derive quant metadata from a weight tensor. Returns
+    // {present=false} for non-quantized (FP32/FP16) tensors; otherwise
+    // fills encoding/bitwidth/axis/group_size from the tensor's dtype
+    // and QScheme, plus scale_size() when available.
+    auto deriveQuantInfo = [](Weight &w) -> QuantInfo {
+      QuantInfo qi;
+      auto dtype = w.getDim().getDataType();
+      auto &var = w.getVariable();
+
+      // Map dtype to bitwidth + signed/unsigned
+      auto affineBits = [&](int bits, bool unsigned_) {
+        qi.present = true;
+        qi.bitwidth = bits;
+        qi.has_zero_point = unsigned_;
+        try {
+          auto scheme = var.q_scheme();
+          if (scheme == QScheme::PER_CHANNEL_AFFINE) {
+            qi.encoding = "axis_scale_offset";
+            qi.axis = 0;
+            size_t ss = var.scale_size();
+            size_t total = w.getDim().getDataLen();
+            if (ss > 0 && ss <= total) {
+              // group_size = total_elements / scale_count.
+              // If it equals one output channel's width (one scale
+              // per output row), normalize to 0 == "pure per-channel".
+              size_t gs = total / ss;
+              size_t row_width = w.getDim().width();
+              qi.group_size = (gs == row_width) ? 0 : static_cast<int>(gs);
+            }
+          } else {
+            qi.encoding = "per_tensor_affine";
+          }
+        } catch (...) {
+          qi.encoding = "per_tensor_affine";
+        }
+      };
+
+      switch (dtype) {
+      case TensorDim::DataType::QINT4:
+        affineBits(4, false);
+        break;
+      case TensorDim::DataType::QINT8:
+        affineBits(8, false);
+        break;
+      case TensorDim::DataType::QINT16:
+        affineBits(16, false);
+        break;
+      case TensorDim::DataType::UINT4:
+        affineBits(4, true);
+        break;
+      case TensorDim::DataType::UINT8:
+        affineBits(8, true);
+        break;
+      case TensorDim::DataType::UINT16:
+        affineBits(16, true);
+        break;
+      case TensorDim::DataType::Q4_0:
+        qi.present = true;
+        qi.encoding = "q4_0";
+        qi.bitwidth = 4;
+        qi.axis = 0;
+        qi.group_size = 32; // GGML Q4_0 block size
+        break;
+      case TensorDim::DataType::Q6_K:
+        qi.present = true;
+        qi.encoding = "q6_k";
+        qi.bitwidth = 6;
+        qi.axis = 0;
+        qi.group_size = 256; // GGML super-block
+        break;
+      default:
+        // FP32/FP16/UINT32/etc. — not a quantized weight
+        break;
+      }
+      return qi;
+    };
 
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
       auto weights = (*iter)->getRunContext().getWeights();
@@ -765,14 +870,16 @@ void NeuralNetwork::save(
         if (shape.empty())
           shape.push_back(1);
 
-        entries.push_back({w.getName(), sz, dtype_str, shape});
+        QuantInfo qi = deriveQuantInfo(w);
+        entries.push_back({w.getName(), sz, dtype_str, shape, qi});
         total_data_size += sz;
       }
     }
 
     // -- 2. Build JSON header string --
     std::ostringstream json_ss;
-    json_ss << "{\"__metadata__\":{\"format\":\"nntrainer\"}";
+    json_ss << "{\"__metadata__\":{\"format\":\"nntrainer\","
+            << "\"schema_version\":\"2\"}";
 
     size_t data_offset = 0;
     for (auto &e : entries) {
@@ -784,7 +891,18 @@ void NeuralNetwork::save(
         json_ss << e.shape[si];
       }
       json_ss << "],\"data_offsets\":[" << data_offset << ","
-              << (data_offset + e.data_size) << "]}";
+              << (data_offset + e.data_size) << "]";
+
+      if (e.quant.present) {
+        json_ss << ",\"quant\":{\"encoding\":\"" << e.quant.encoding
+                << "\",\"axis\":" << e.quant.axis
+                << ",\"bitwidth\":" << e.quant.bitwidth
+                << ",\"group_size\":" << e.quant.group_size
+                << ",\"has_zero_point\":"
+                << (e.quant.has_zero_point ? "true" : "false") << "}";
+      }
+
+      json_ss << "}";
       data_offset += e.data_size;
     }
     json_ss << "}";
