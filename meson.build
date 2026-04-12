@@ -185,13 +185,12 @@ if get_option('enable-fp16')
      arm_arch_opt = get_option('arm-arch')
      if arm_arch_opt == 'armv9.2-a'
        arm_base_arch = 'armv9.2-a'
-       # Legacy backward-compat baseline: armv9.2-a has always
-       # auto-included sve2+sme in nntrainer. Keep it so existing
-       # build configs do not silently drop those features.
-       arm_features = ['fp16', 'sve2', 'sme']
+       # armv9.2-a baseline: fp16 + sve2. SME/SME2 require explicit
+       # opt-in via enable-sme/enable-sme2 because GCC < 14 does not
+       # accept +sme in -march. NDK r27+ (Clang 18) supports it.
+       arm_features = ['fp16', 'sve2']
        extra_defines += '-DARM_ARCH_ARMV9_2A=1'
        extra_defines += '-DENABLE_SVE2=1'
-       extra_defines += '-DENABLE_SME=1'
      elif arm_arch_opt == 'armv8.2-a'
        arm_base_arch = 'armv8.2-a'
        arm_features = ['fp16', 'dotprod', 'i8mm']

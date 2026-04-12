@@ -1,13 +1,12 @@
-# KleidiAI qsi4cxp matmul kernels — synced from upstream
-# https://github.com/ARM-software/kleidiai (2026-04)
+# KleidiAI qsi4cxp matmul kernels
+# NEON dotprod/i8mm: local versions (pre-upstream C99 restrict migration)
+# SME/SME2: from upstream ARM-software/kleidiai (2026-04), require C99
 
 matmul_clamp_f32_qai8dxp_qsi4cxp_headers = [
     'kai_matmul_clamp_f32_qai8dxp_qsi4cxp_interface.h',
     # NEON dotprod
-    'kai_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4x4_1x4_neon_dotprod.h',
     'kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod.h',
     'kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.h',
-    'kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.h',
     'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod.h',
     'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod.h',
     # NEON i8mm
@@ -19,10 +18,8 @@ matmul_clamp_f32_qai8dxp_qsi4cxp_headers = [
 
 matmul_clamp_f32_qai8dxp_qsi4cxp_sources = [
     # NEON dotprod
-    'kai_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4x4_1x4_neon_dotprod.c',
     'kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod.c',
     'kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.c',
-    'kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.c',
     'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod.c',
     'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod.c',
     # NEON i8mm
@@ -32,8 +29,9 @@ matmul_clamp_f32_qai8dxp_qsi4cxp_sources = [
     'kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm.c',
 ]
 
-# SME/SME2 kernels — only compiled when the corresponding meson
-# options are enabled (enable-sme, enable-sme2 from C5).
+# SME/SME2 kernels from upstream KleidiAI. These use C99 restrict
+# and mixed declarations, so they need GCC 14+ or Clang 16+ (NDK r27).
+# GCC 13 (Ubuntu 24.04 cross-compiler) does NOT support them.
 if get_option('enable-sme')
   matmul_clamp_f32_qai8dxp_qsi4cxp_headers += [
     'kai_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa.h',
