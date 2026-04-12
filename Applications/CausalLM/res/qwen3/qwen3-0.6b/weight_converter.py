@@ -29,7 +29,7 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 # Import channel-wise int4 quantizer from TorchFXConverter
 import importlib.util
 _qsi4_path = os.path.join(os.path.dirname(__file__),
-                          "../../../../tools/TorchFXConverter/weight_converter.py")
+                          "../../../../../tools/TorchFXConverter/weight_converter.py")
 _qsi4_spec = importlib.util.spec_from_file_location("tfx_weight_converter",
                                                       _qsi4_path)
 _qsi4_mod = importlib.util.module_from_spec(_qsi4_spec)
