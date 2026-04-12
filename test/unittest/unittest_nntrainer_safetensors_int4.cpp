@@ -42,6 +42,8 @@
 #include <model.h>
 #include <neuralnet.h>
 #include <optimizer.h>
+#include <quantizer.h>
+#include <tensor.h>
 #include <tensor_dim.h>
 
 using TensorDim = ml::train::TensorDim;
@@ -384,4 +386,223 @@ TEST(SafetensorsInt4, DtypeMismatch_throws) {
       << "loading QINT4 file into a FP32 model should throw";
     std::remove(path.c_str());
   }
+}
+
+// =============================================================================
+// P6b Part B: numerical end-to-end dispatch test for FloatTensor::dotQInteger
+// -----------------------------------------------------------------------------
+// These tests exercise the CPU KleidiAI qsi4cxp_unpacked path that P5/P6b
+// wired into FloatTensor::dotQInteger. They sit at the Tensor API level (no
+// NeuralNetwork / FC layer) so the validation is scoped to:
+//
+//   1. Tensor::dot on FP32 activation x QINT4 weight reaches
+//      FloatTensor::dotQInteger (dispatch switch case).
+//   2. dotQInteger picks the PER_CHANNEL_AFFINE branch and forwards the
+//      raw packed nibble buffer + fp32 scale buffer to
+//      nntr_gemm_qai8dxp_qsi4cxp_unpacked without layout translation.
+//   3. The P6b transB=false direction matches nntrainer's [K, N] (kxn)
+//      weight storage convention.
+//
+// They do NOT test Int4QTensor::setValue / getValue semantic compatibility
+// with KleidiAI. Int4QTensor's setValue packs values as two's-complement
+// signed nibbles with the even flat-index in the HIGH nibble, whereas
+// KleidiAI's qsi4cxp kxn kernel reads bytes as offset-binary unsigned with
+// zero_point=8 and the even n_idx in the LOW nibble. These are genuinely
+// incompatible conventions — a separate follow-up ([P6b-2]) must either
+// translate at save/load time or rewrite Int4QTensor to natively use
+// KleidiAI's convention. To sidestep that unresolved question, these tests
+// write the raw packed bytes directly via getData<uint8_t>() in
+// KleidiAI-native format (offset-binary, low nibble for even n_idx) and
+// set scales directly via getScale<float>().
+//
+// Gated on ENABLE_FP16 because the CPU KleidiAI dispatch in
+// FloatTensor::dotQInteger is currently itself inside `#ifdef ENABLE_FP16`
+// (tracked as [C4]).
+// =============================================================================
+
+#ifdef ENABLE_FP16
+
+namespace {
+
+/**
+ * @brief Allocate a QINT4 nntrainer::Tensor with canonical [1, 1, K, N]
+ *        shape, then overwrite its packed-nibble data and fp32 scale
+ *        buffer with KleidiAI-native kxn bytes so the KleidiAI kernel
+ *        sees uniform real weight `real_value` with uniform scale 1.0
+ *        for every output column.
+ *
+ * Byte layout written:
+ *   - K rows x ((N+1)/2) bytes per row, row-major
+ *   - For each (k, n): offset = k * ((N+1)/2) + n/2
+ *   - Even n_idx -> LOW nibble, odd n_idx -> HIGH nibble
+ *   - Stored nibble = (real_value + 8) & 0xf   (offset-binary, zp=8)
+ *
+ * The scale buffer is a contiguous fp32 array of length
+ * Int4QTensor::scale_size(), filled with 1.0f. For a [1,1,K,N] tensor
+ * with group_size==0 (pure per-channel) scale_size() returns height() =
+ * K, which over-allocates vs KleidiAI's per-N-output expectation for
+ * K != N but is harmless with uniform scales. The tests use K == N to
+ * keep the count consistent on both sides; mixed-size cases need the
+ * [P6b-2] convention fix first.
+ */
+nntrainer::Tensor makeKleidiAiInt4Weight(unsigned int K, unsigned int N,
+                                         int real_value) {
+  // Construct a QINT4 tensor on the Tensor API (this is the same path
+  // FC layer / safetensors loader exercise internally).
+  nntrainer::TensorDim dim(1, 1, K, N,
+                            {nntrainer::Tformat::NCHW,
+                             nntrainer::Tdatatype::QINT4});
+  nntrainer::Tensor weight(dim, true, nntrainer::Initializer::ZEROS, "w",
+                           nntrainer::QScheme::PER_CHANNEL_AFFINE);
+
+  // Overwrite the raw packed-nibble buffer with KleidiAI kxn bytes.
+  uint8_t *data = weight.getData<uint8_t>();
+  const size_t row_stride = (N + 1) / 2;
+  const uint8_t stored_nibble =
+    static_cast<uint8_t>((real_value + 8) & 0xf); // offset-binary, zp=8
+  // Pack both nibbles of each byte to the same stored value.
+  const uint8_t packed_byte =
+    static_cast<uint8_t>((stored_nibble << 4) | stored_nibble);
+  std::memset(data, packed_byte, K * row_stride);
+
+  // Overwrite the fp32 scale buffer with uniform 1.0. getScale<float>()
+  // returns the same pointer allocate() uses, so this is a direct
+  // in-place write (no re-allocation needed).
+  float *scales = weight.getScale<float>();
+  const size_t n_scales = weight.scale_size();
+  for (size_t i = 0; i < n_scales; ++i)
+    scales[i] = 1.0f;
+
+  return weight;
+}
+
+} // namespace
+
+/**
+ * @brief Weight = all zeros (real value 0), input = [1, 2, 3, 4],
+ *        scale = 1.0. Expected output = [0, 0, 0, 0] exactly, since
+ *        any input times zero is zero and no scale is ever applied to
+ *        a non-zero accumulator. This is the strongest invariant in
+ *        KleidiAI's kxn kernel and trips any gross dispatch or layout
+ *        error.
+ */
+TEST(SafetensorsInt4, DotQInt4_zeroWeight_producesZero) {
+  const unsigned int K = 4;
+  const unsigned int N = 4;
+
+  // FP32 activation [1, 1, 1, 4]
+  nntrainer::Tensor act(1, 1, 1, K, nntrainer::Tformat::NCHW,
+                        nntrainer::Tdatatype::FP32);
+  act.setValue(0, 0, 0, 0, 1.0f);
+  act.setValue(0, 0, 0, 1, 2.0f);
+  act.setValue(0, 0, 0, 2, 3.0f);
+  act.setValue(0, 0, 0, 3, 4.0f);
+
+  nntrainer::Tensor weight = makeKleidiAiInt4Weight(K, N, /*real_value=*/0);
+
+  // Pre-allocate output with [1,1,1,N]. FloatTensor::dotQInteger reads
+  // M from this->height() (=1), K from this->width() (=4), and
+  // N from output.width() (=4).
+  nntrainer::Tensor output(1, 1, 1, N, nntrainer::Tformat::NCHW,
+                           nntrainer::Tdatatype::FP32);
+  output.setZero();
+
+  ASSERT_NO_THROW(act.dot(weight, output, false, false));
+
+  for (unsigned int n = 0; n < N; ++n) {
+    EXPECT_NEAR(output.getValue(0, 0, 0, n), 0.0f, 1e-5f)
+      << "all-zero weight must produce zero output at n=" << n;
+  }
+}
+
+/**
+ * @brief Weight = all +1 (real value 1), input = [1, 2, 3, 4],
+ *        scale = 1.0. Expected output per column = sum(input) = 10.
+ *        Activation quantization introduces a small rounding error
+ *        (~0.04 for this range), so we assert with a generous
+ *        tolerance of 0.1.
+ */
+TEST(SafetensorsInt4, DotQInt4_onesWeight_sumsInputs) {
+  const unsigned int K = 4;
+  const unsigned int N = 4;
+
+  nntrainer::Tensor act(1, 1, 1, K, nntrainer::Tformat::NCHW,
+                        nntrainer::Tdatatype::FP32);
+  act.setValue(0, 0, 0, 0, 1.0f);
+  act.setValue(0, 0, 0, 1, 2.0f);
+  act.setValue(0, 0, 0, 2, 3.0f);
+  act.setValue(0, 0, 0, 3, 4.0f);
+  const float expected = 1.0f + 2.0f + 3.0f + 4.0f; // = 10
+
+  nntrainer::Tensor weight = makeKleidiAiInt4Weight(K, N, /*real_value=*/1);
+
+  nntrainer::Tensor output(1, 1, 1, N, nntrainer::Tformat::NCHW,
+                           nntrainer::Tdatatype::FP32);
+  output.setZero();
+
+  ASSERT_NO_THROW(act.dot(weight, output, false, false));
+
+  for (unsigned int n = 0; n < N; ++n) {
+    EXPECT_NEAR(output.getValue(0, 0, 0, n), expected, 0.1f)
+      << "ones weight should sum the inputs at n=" << n
+      << " (got " << output.getValue(0, 0, 0, n) << ")";
+  }
+}
+
+/**
+ * @brief Weight = all -1 (real value -1), input = [1, 2, 3, 4],
+ *        scale = 1.0. Expected output per column = -sum(input) = -10.
+ *        The negative branch catches sign-extension errors that the
+ *        positive-only ones-weight test would miss (since the
+ *        offset-binary encoding for -1 is stored nibble 7, and KleidiAI
+ *        subtracts 8 internally to recover -1).
+ */
+TEST(SafetensorsInt4, DotQInt4_negativeOnesWeight_negSumsInputs) {
+  const unsigned int K = 4;
+  const unsigned int N = 4;
+
+  nntrainer::Tensor act(1, 1, 1, K, nntrainer::Tformat::NCHW,
+                        nntrainer::Tdatatype::FP32);
+  act.setValue(0, 0, 0, 0, 1.0f);
+  act.setValue(0, 0, 0, 1, 2.0f);
+  act.setValue(0, 0, 0, 2, 3.0f);
+  act.setValue(0, 0, 0, 3, 4.0f);
+  const float expected = -(1.0f + 2.0f + 3.0f + 4.0f); // = -10
+
+  nntrainer::Tensor weight = makeKleidiAiInt4Weight(K, N, /*real_value=*/-1);
+
+  nntrainer::Tensor output(1, 1, 1, N, nntrainer::Tformat::NCHW,
+                           nntrainer::Tdatatype::FP32);
+  output.setZero();
+
+  ASSERT_NO_THROW(act.dot(weight, output, false, false));
+
+  for (unsigned int n = 0; n < N; ++n) {
+    EXPECT_NEAR(output.getValue(0, 0, 0, n), expected, 0.1f)
+      << "-1 weight should negate-and-sum the inputs at n=" << n
+      << " (got " << output.getValue(0, 0, 0, n) << ")";
+  }
+}
+
+#endif // ENABLE_FP16
+
+// =============================================================================
+// Main function
+// =============================================================================
+
+int main(int argc, char **argv) {
+  int result = -1;
+  try {
+    testing::InitGoogleTest(&argc, argv);
+  } catch (...) {
+    std::cerr << "Failed to initialize google test" << std::endl;
+  }
+
+  try {
+    result = RUN_ALL_TESTS();
+  } catch (...) {
+    std::cerr << "Failed to run all tests" << std::endl;
+  }
+
+  return result;
 }

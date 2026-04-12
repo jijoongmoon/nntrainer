@@ -744,7 +744,9 @@ void NeuralNetwork::save(
     auto deriveQuantInfo = [](Weight &w) -> QuantInfo {
       QuantInfo qi;
       auto dtype = w.getDim().getDataType();
-      auto &var = w.getVariable();
+      // getVariable() returns by value; we need a non-const reference
+      // to call q_scheme()/scale_size() on the Tensor's itensor_ view.
+      auto &var = w.getVariableRef();
 
       // Map dtype to bitwidth + signed/unsigned
       auto affineBits = [&](int bits, bool unsigned_) {

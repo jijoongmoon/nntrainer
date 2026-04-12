@@ -460,8 +460,25 @@ public:
           if (run_context.isGradientFirstAccess(i)) {
             run_context.getWeight(i).read(file, start_offset, read_from_offset,
                                           file_fd);
+            // FP32 shadow copy is the "master copy" used by mixed-precision
+            // FP16 training. For quantized weights (QINT4/QINT8/QINT16,
+            // Q4_0/Q4_K/Q6_K/Q1_0) FloatTensor::copyData has no dequant
+            // path and would throw (or size-mismatch, since some
+            // quantized Tensors report size() in bytes). Skip the shadow
+            // sync for those types; they never participate in FP32 master
+            // updates anyway.
+            const auto src_dtype = run_context.getWeight(i).getDataType();
+            const bool src_is_quant =
+              (src_dtype == TensorDim::DataType::QINT4 ||
+               src_dtype == TensorDim::DataType::QINT8 ||
+               src_dtype == TensorDim::DataType::QINT16 ||
+               src_dtype == TensorDim::DataType::UINT4 ||
+               src_dtype == TensorDim::DataType::Q4_0 ||
+               src_dtype == TensorDim::DataType::Q4_K ||
+               src_dtype == TensorDim::DataType::Q6_K ||
+               src_dtype == TensorDim::DataType::Q1_0);
             if (run_context.isMixedPrecision(i) && trainable &&
-                !run_context.getWeightFP32(i).empty()) {
+                !run_context.getWeightFP32(i).empty() && !src_is_quant) {
               run_context.getWeightFP32(i).copyData(run_context.getWeight(i));
             }
           }
@@ -508,8 +525,24 @@ public:
           /// @note shared weights are only be read at the first acecss
           if (run_context.isGradientFirstAccess(i)) {
             run_context.getWeight(i).read(src, start_offset, read_from_offset);
+            // See the std::ifstream overload above: skip the FP32 shadow
+            // sync for quantized source weights (Int4/Int8/Int16/Q4_0/
+            // Q4_K/Q6_K/Q1_0) since FloatTensor::copyData has no dequant
+            // path and would either throw "Unsupported data type" or
+            // trip the size-mismatch check (Q4_0_Tensor::size() reports
+            // bytes, not elements).
+            const auto src_dtype = run_context.getWeight(i).getDataType();
+            const bool src_is_quant =
+              (src_dtype == TensorDim::DataType::QINT4 ||
+               src_dtype == TensorDim::DataType::QINT8 ||
+               src_dtype == TensorDim::DataType::QINT16 ||
+               src_dtype == TensorDim::DataType::UINT4 ||
+               src_dtype == TensorDim::DataType::Q4_0 ||
+               src_dtype == TensorDim::DataType::Q4_K ||
+               src_dtype == TensorDim::DataType::Q6_K ||
+               src_dtype == TensorDim::DataType::Q1_0);
             if (run_context.isMixedPrecision(i) && trainable &&
-                !run_context.getWeightFP32(i).empty()) {
+                !run_context.getWeightFP32(i).empty() && !src_is_quant) {
               run_context.getWeightFP32(i).copyData(run_context.getWeight(i));
             }
           }
