@@ -233,6 +233,26 @@ struct ComputeOps {
                                 float *output, unsigned int M, unsigned int N,
                                 unsigned int K, unsigned int group_size);
 
+  // =========================================================================
+  // Channel-wise INT4 GEMM (qsi4cxp kxn format, per-column fp32 scales)
+  // =========================================================================
+  // This slot consumes Int4QTensor's canonical layout directly:
+  //   packed_data = K rows × ceil(N/2) bytes (kxn nibble order)
+  //   scales      = N fp32 per-output-column scales
+  // No transpose or repack needed.
+  //
+  // Filled by:
+  //   ARM  → KleidiAI qsi4cxp_unpacked wrapper (or fallback C ref)
+  //   x86  → AVX2 gemm_qsi4cxp_kxn_fp32 (x86_qsi4cxp.cpp)
+  //   GPU  → nullptr (int4 CL kernel uses the SVM/accel path above)
+  //
+  // Nullable: when nullptr, FloatTensor::dotQInteger throws for QINT4
+  // on non-SVM CPU path.
+  void (*gemm_qsi4cxp_fp32)(unsigned int M, unsigned int N, unsigned int K,
+                             const float *activation,
+                             const void *packed_data,
+                             const void *scales, float *output);
+
 #ifdef ENABLE_FP16
   // =========================================================================
   // FP16 BLAS

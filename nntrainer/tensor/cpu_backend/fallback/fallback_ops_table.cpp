@@ -230,6 +230,7 @@ static ComputeOps fallback_ops = {
   .gemm_int4_batch_fp32 = nullptr,
   .gemv_int4_accel_fp32 = nullptr,
   .sgemm_int4_accel_fp32 = nullptr,
+  .gemm_qsi4cxp_fp32 = nullptr, // fallback: no optimized qsi4cxp kernel
 #ifdef ENABLE_FP16
   // FP16 ops use nntrainer:: directly (same pattern applies when
   // FP16-specific wrappers are needed)

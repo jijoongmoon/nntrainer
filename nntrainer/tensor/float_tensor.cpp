@@ -1060,44 +1060,25 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   }
 
   if (!handled_on_accel) {
-#ifdef ENABLE_FP16
-    if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
-      // Use the UNPACKED qsi4cxp kernel, which consumes Int4QTensor's
-      // canonical layout directly:
-      //   rhs_native_mtx_qs4cx = raw packed nibbles (getData<char>)
-      //   rhs_scales_f32       = fp32 scale array  (getScale<float>)
-      //
-      // The previously-used `_packed` variant expects a KleidiAI
-      // pre-packed buffer (tile-interleaved with integrated scales),
-      // which does NOT match Int4QTensor's layout. Calling it with
-      // `mdata` (raw canonical bytes) silently produced garbage on ARM
-      // and threw NYI on x86 via the fallback stub. P6b switches to
-      // `_unpacked` so the Tensor dispatch path is finally usable
-      // without a pre-pack step. A follow-up can add per-instance
-      // caching of a KleidiAI-packed buffer for better throughput
-      // (the current unpacked variant does runtime packing internally).
-      //
-      // transB=false (= kxn format) is correct for nntrainer's weight
-      // storage convention. nntrainer's FC weight_dim is
-      //   [1, 1, in_width=K, unit=N]
-      // and Int4QTensor stores the packed bytes in standard NCHW
-      // row-major, so the first N/2 bytes hold row 0 (all output
-      // columns for input-channel 0), and so on. KleidiAI's transB=true
-      // variant would interpret the same buffer as [N, K/2] and produce
-      // a transposed (wrong) result.
-      nntr_gemm_qai8dxp_qsi4cxp_unpacked<float>(
-        M, N, K, (void *)data, (void *)mdata,
-        (void *)input.getScale<float>(), rdata,
-        /*transB=*/false);
-    } else {
+    if (input.q_scheme() != QScheme::PER_CHANNEL_AFFINE) {
       throw std::runtime_error(
         "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
     }
-#else
-    /// @todo Replace with standard CPU INT4 computation
-    o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata,
-                        N);
-#endif
+
+    // Dispatch through the ops table gemm_qsi4cxp_fp32 slot, which
+    // reads the qsi4cxp kxn canonical layout directly — no transpose,
+    // no repack. Platform-specific implementations:
+    //   ARM:     KleidiAI qsi4cxp_unpacked (NEON/SVE)
+    //   x86:     AVX2 gemm_qsi4cxp_kxn_fp32 (x86_qsi4cxp.cpp)
+    //   fallback: nullptr → error
+    if (o->gemm_qsi4cxp_fp32) {
+      o->gemm_qsi4cxp_fp32(M, N, K, data, (const void *)mdata,
+                            (const void *)input.getScale<float>(), rdata);
+    } else {
+      throw std::runtime_error(
+        "Error: QINT4 channel-wise int4 GEMM not available on this "
+        "platform. No gemm_qsi4cxp_fp32 registered in ComputeOps.");
+    }
   }
 
   return output;

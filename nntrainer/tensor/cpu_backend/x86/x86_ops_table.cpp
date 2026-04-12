@@ -11,6 +11,7 @@
  *   .op_field = VENDOR_OPNAME,
  */
 #include <x86_compute_backend.h>
+#include <x86_qsi4cxp.h>
 #include <compute_ops.h>
 
 namespace nntrainer {
@@ -230,6 +231,13 @@ static ComputeOps x86_ops = {
   .gemm_int4_batch_fp32 = nullptr,
   .gemv_int4_accel_fp32 = nullptr,
   .sgemm_int4_accel_fp32 = nullptr,
+  .gemm_qsi4cxp_fp32 = [](unsigned int M, unsigned int N, unsigned int K,
+                           const float *A, const void *B, const void *S,
+                           float *C) {
+    nntrainer::gemm_qsi4cxp_kxn_fp32(M, N, K, A,
+                                      static_cast<const uint8_t *>(B),
+                                      static_cast<const float *>(S), C);
+  },
 #ifdef ENABLE_FP16
   // FP16 ops use nntrainer:: directly (same pattern applies when
   // FP16-specific wrappers are needed)

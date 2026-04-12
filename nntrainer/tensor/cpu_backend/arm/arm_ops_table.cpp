@@ -231,6 +231,16 @@ static ComputeOps arm_ops = {
   .gemv_int4_accel_fp32 = nullptr,
   .sgemm_int4_accel_fp32 = nullptr,
 #ifdef ENABLE_FP16
+  .gemm_qsi4cxp_fp32 = [](unsigned int M, unsigned int N, unsigned int K,
+                           const float *A, const void *B, const void *S,
+                           float *C) {
+    nntrainer::nntr_gemm_qai8dxp_qsi4cxp_unpacked<float>(
+      M, N, K, (void *)A, (void *)B, (void *)S, C, /*transB=*/false);
+  },
+#else
+  .gemm_qsi4cxp_fp32 = nullptr,
+#endif
+#ifdef ENABLE_FP16
   // FP16 ops use nntrainer:: directly (same pattern applies when
   // FP16-specific wrappers are needed)
   .sgemm_fp16 = nntrainer::sgemm,
