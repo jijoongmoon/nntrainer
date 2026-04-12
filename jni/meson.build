@@ -48,6 +48,14 @@ and_conf.set('MESON_CCAPI_NNTRAINER_SRCS', ' '.join(ccapi_src))
 and_conf.set('MESON_CCAPI_NNTRAINER_INCS', ' '.join(ccapi_inc_abs))
 and_conf.set('MESON_ARM_MARCH', arm_march_flag)
 
+# APP_ABI for Application.mk: derived from arm-arch
+arm_arch_opt_jni = get_option('arm-arch')
+if arm_arch_opt_jni == 'armv7l'
+  and_conf.set('MESON_APP_ABI', 'armeabi-v7a')
+else
+  and_conf.set('MESON_APP_ABI', 'arm64-v8a')
+endif
+
 and_conf.set('VERSION_MAJOR', nntrainer_version_split[0])
 and_conf.set('VERSION_MINOR', nntrainer_version_split[1])
 and_conf.set('VERSION_MICRO', nntrainer_version_split[2])
@@ -113,8 +121,8 @@ configure_file(input: 'Android.mk.in', output: 'Android.mk',
 
 install_data(sources: 'Android-prebuilt.mk', rename: 'Android.mk', install_dir: nntrainer_prefix)
 
-configure_file(input: 'Application.mk', output: 'Application.mk',
-  copy: true
+configure_file(input: 'Application.mk.in', output: 'Application.mk',
+  configuration: and_conf
 )
 
 # below is list of file that meson acknowledges this is the output of custom target so that
