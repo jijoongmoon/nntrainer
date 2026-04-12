@@ -1,6 +1,8 @@
 {
     "arm_arch": "armv9.2-a",
-    "arm_march": "armv9.2-a+fp16+sve2+sme",
+    "arm_march": "armv9.2-a+fp16+sve2+sme+sme2",
     "enable_fp16": true,
+    "enable_sme": true,
+    "enable_sme2": true,
     "app_abi": "arm64-v8a"
 }

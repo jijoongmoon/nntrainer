@@ -13,7 +13,16 @@ if get_option('platform') == 'android'
     # Fallback: derive from arm-arch (for builds without --arm-arch argument)
     arm_arch_opt = get_option('arm-arch')
     if arm_arch_opt == 'armv9.2-a'
-      arm_march_flag = '-march=armv9.2-a+fp16+sve2+sme'
+      # Base: fp16+sve2. SME/SME2 added only when explicitly enabled
+      # (GCC 13 rejects +sme; NDK Clang 18 accepts it).
+      jni_arm_features = 'armv9.2-a+fp16+sve2'
+      if get_option('enable-sme')
+        jni_arm_features += '+sme'
+      endif
+      if get_option('enable-sme2')
+        jni_arm_features += '+sme2'
+      endif
+      arm_march_flag = '-march=' + jni_arm_features
     elif arm_arch_opt == 'armv8.2-a' or arm_arch_opt == 'auto'
       arm_march_flag = '-march=armv8.2-a+fp16+dotprod+i8mm'
     elif arm_arch_opt == 'armv7l'
