@@ -8,6 +8,7 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 
@@ -643,6 +644,86 @@ void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
   // See note above in the std::ifstream overload.
+}
+
+void Int4QTensor::buildQ4_0RepackCache() {
+  const size_t K = height(); // reduction axis (input features)
+  const size_t N = width();  // output axis (output features)
+
+  NNTR_THROW_IF(K % 32 != 0, std::invalid_argument)
+    << "Int4QTensor::buildQ4_0RepackCache requires height (K=" << K
+    << ") divisible by 32 for Q4_0 block alignment";
+
+  // Q4_0 layout: N rows of (K/32) blocks. Each block = 18 bytes:
+  //   [2B fp16 scale] [16B packed nibbles: 32 int4 values]
+  const size_t blocks_per_row = K / 32;
+  const size_t block_size = 18; // sizeof(block_q4_0)
+  const size_t total_bytes = N * blocks_per_row * block_size;
+  q4_0_repack_cache_.resize(total_bytes);
+
+  const uint8_t *src = (const uint8_t *)getData();
+  const float *scales_fp32 = (const float *)getScale();
+  const size_t src_row_stride = (N + 1) / 2; // bytes per K-row in qsi4cxp
+
+  uint8_t *dst = q4_0_repack_cache_.data();
+
+  for (size_t n = 0; n < N; ++n) {
+    // fp16 scale for this output channel (same for all blocks in row)
+    // Use the _Float16 / __fp16 if available, else simple conversion.
+    const float s = scales_fp32[n];
+    uint16_t fp16_scale;
+    {
+      // IEEE 754 fp32 -> fp16 conversion (round-to-nearest-even).
+      // Handles the common range; overflow clamps to inf, underflow to 0.
+      uint32_t f32;
+      std::memcpy(&f32, &s, 4);
+      uint32_t sign = (f32 >> 16) & 0x8000;
+      int32_t exp = ((f32 >> 23) & 0xFF) - 127 + 15;
+      uint32_t mant = (f32 >> 13) & 0x03FF;
+      if (exp <= 0) {
+        fp16_scale = static_cast<uint16_t>(sign); // underflow → ±0
+      } else if (exp >= 31) {
+        fp16_scale = static_cast<uint16_t>(sign | 0x7C00); // overflow → ±inf
+      } else {
+        fp16_scale = static_cast<uint16_t>(sign | (exp << 10) | mant);
+      }
+    }
+
+    for (size_t b = 0; b < blocks_per_row; ++b) {
+      size_t dst_offset = (n * blocks_per_row + b) * block_size;
+
+      // Write fp16 scale (little-endian)
+      dst[dst_offset + 0] = static_cast<uint8_t>(fp16_scale & 0xFF);
+      dst[dst_offset + 1] = static_cast<uint8_t>(fp16_scale >> 8);
+
+      // Pack 32 nibbles from qsi4cxp kxn into Q4_0 block layout.
+      // Source: for k = 32*b .. 32*b+31, column n.
+      //   qsi4cxp kxn: byte at (k * src_row_stride + n/2)
+      //     even n → low nibble,  odd n → high nibble
+      // Dest: Q4_0 block qs[j/2] where j = k - 32*b
+      //     even j → low nibble,  odd j → high nibble
+      uint8_t *qs = &dst[dst_offset + 2];
+      const size_t k_start = 32 * b;
+
+      for (size_t j = 0; j < 32; j += 2) {
+        const size_t k0 = k_start + j;
+        const size_t k1 = k_start + j + 1;
+
+        // Extract nibble for (k0, n) from source
+        uint8_t src_byte0 = src[k0 * src_row_stride + n / 2];
+        uint8_t nib0 = (n % 2 == 0) ? (src_byte0 & 0x0F)
+                                     : ((src_byte0 >> 4) & 0x0F);
+
+        // Extract nibble for (k1, n) from source
+        uint8_t src_byte1 = src[k1 * src_row_stride + n / 2];
+        uint8_t nib1 = (n % 2 == 0) ? (src_byte1 & 0x0F)
+                                     : ((src_byte1 >> 4) & 0x0F);
+
+        // Pack into Q4_0: even j → low nibble, odd j → high nibble
+        qs[j / 2] = nib0 | (nib1 << 4);
+      }
+    }
+  }
 }
 
 } // namespace nntrainer

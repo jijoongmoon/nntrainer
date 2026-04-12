@@ -350,6 +350,38 @@ public:
    */
   size_t group_size() const override { return group_size_; }
 
+  /**
+   * @brief Build a Q4_0 interleaved repack cache from the canonical
+   *        qsi4cxp kxn data. This enables fast GEMM on x86 (via the
+   *        GGML AVX2 kernel) without KleidiAI. The cache is persistent
+   *        — call once at load time and reuse across all forward() calls.
+   *
+   * Layout produced (matches GGML gemm_q4_0):
+   *   N rows of (K/32) block_q4_0 each. Each block = 2B fp16 scale +
+   *   16B packed nibbles (32 int4 values). Total = N * (K/32) * 18 bytes.
+   *
+   * The per-output-column fp32 scale is TRUNCATED to fp16 and duplicated
+   * into every block within that column (since the original data is
+   * pure per-channel = same scale for all K elements in one column).
+   *
+   * @pre width() must be divisible by 32 (K%32==0 for Q4_0 blocks).
+   *      Throws std::invalid_argument otherwise.
+   * @note Thread-safe for concurrent reads after build (const accessor).
+   */
+  void buildQ4_0RepackCache();
+
+  /**
+   * @brief Return the Q4_0 repack buffer (nullptr if not built).
+   */
+  const void *getQ4_0RepackData() const {
+    return q4_0_repack_cache_.empty() ? nullptr : q4_0_repack_cache_.data();
+  }
+
+  /**
+   * @brief Check whether the Q4_0 repack cache has been built.
+   */
+  bool hasQ4_0RepackCache() const { return !q4_0_repack_cache_.empty(); }
+
 private:
   /**
    * @brief quantization scheme
@@ -369,6 +401,13 @@ private:
    *        safetensors schema_version 2 round-tripping).
    */
   size_t group_size_ = 0;
+
+  /**
+   * @brief Cached Q4_0 interleaved repack for x86 GGML GEMM. Built
+   *        once at load time via buildQ4_0RepackCache(), then used by
+   *        FloatTensor::dotQInteger on non-KleidiAI platforms.
+   */
+  std::vector<uint8_t> q4_0_repack_cache_;
 
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is
