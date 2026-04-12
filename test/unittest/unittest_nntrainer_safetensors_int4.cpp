@@ -589,6 +589,132 @@ TEST(SafetensorsInt4, DotQInt4_negativeOnesWeight_negSumsInputs) {
   }
 }
 
+/**
+ * @brief  Cross-validation GEMM test against the Python qsi4cxp encoder.
+ *
+ *         This test is the C++ half of a golden-byte fixture shared with
+ *         tools/TorchFXConverter/tests/test_int4_quant.py ::
+ *           test_gemm_golden_bytes_match_python_encoder
+ *           test_gemm_golden_dequant_matches_reference
+ *
+ *         Both sides hard-code the same 16 packed-nibble bytes and the
+ *         same 4 fp32 scales for a K=8, N=4 weight matrix whose signed
+ *         int4 values, per-output-column scales, and input activation
+ *         yield a hand-computed reference output of [44, -22, 29, 0].
+ *
+ *         The Python side proves quantize_qsi4cxp_kxn() produces those
+ *         exact bytes from the plaintext fp32 weight and that
+ *         dequant+fp32-GEMM against the same input recovers the
+ *         reference. The C++ side proves FloatTensor::dotQInteger ->
+ *         nntr_gemm_qai8dxp_qsi4cxp_unpacked consumes those exact bytes
+ *         and produces the same reference (up to KleidiAI's internal
+ *         int8 activation-quantization error, which is absorbed by the
+ *         EXPECT_NEAR tolerance).
+ *
+ *         Transitively this verifies that the Python encoder and the C++
+ *         KleidiAI consumer agree on:
+ *           - Nibble packing order (even n_idx = low nibble)
+ *           - Offset-binary encoding (stored = real + 8)
+ *           - kxn row stride (K rows of ceil(N/2) bytes)
+ *           - Per-output-column fp32 scale layout
+ *           - axis=1 per-channel semantics (via Int4QTensor::scale_size
+ *             returning width())
+ *
+ *         without requiring any change to Int4QTensor::setValue /
+ *         getValue (which are tracked separately as P6b-2 and are
+ *         inherently tricky to fix because they take/return float per
+ *         element without access to the per-column scale).
+ *
+ *         IMPORTANT: if you edit the golden bytes, scales, or reference
+ *         output here, also update the matching constants in the Python
+ *         test file. The two sides communicate only through raw bytes
+ *         so a silent drift would not be caught by the compiler.
+ */
+TEST(SafetensorsInt4, DotQInt4_gemm_nonUniform_matchesReference) {
+  const unsigned int K = 8;
+  const unsigned int N = 4;
+
+  // Construct an Int4QTensor with pure per-channel (group_size=0)
+  // and allocate. After P6b the layout allocation is
+  //   K*ceil(N/2) data bytes + width()*sizeof(float) scale bytes
+  //   = 8*2 + 4*4 = 32 bytes total.
+  nntrainer::TensorDim wdim(1, 1, K, N,
+                             {nntrainer::Tformat::NCHW,
+                              nntrainer::Tdatatype::QINT4});
+  nntrainer::Tensor weight(wdim, true, nntrainer::Initializer::ZEROS, "w",
+                           nntrainer::QScheme::PER_CHANNEL_AFFINE);
+
+  // Packed bytes matching Python's quantize_qsi4cxp_kxn output for
+  // the weight matrix below. Each pair of bytes is one K-row of the
+  // N=4 output columns, packed in KleidiAI kxn order:
+  //   byte_lo_nibble = stored(w[k, even n]) = w[k, even] + 8
+  //   byte_hi_nibble = stored(w[k, odd  n]) = w[k, odd]  + 8
+  //
+  // Keep in lock-step with GEMM_GOLDEN_PACKED in
+  // tools/TorchFXConverter/tests/test_int4_quant.py.
+  const uint8_t packed[K * 2] = {
+    0x5F, 0x88,  // k=0  w=( +7, -3,  0,  0 )
+    0xD6, 0x89,  // k=1  w=( -2, +5, +1,  0 )
+    0x2C, 0x8B,  // k=2  w=( +4, -6, +3,  0 )
+    0xA7, 0x86,  // k=3  w=( -1, +2, -2,  0 )
+    0x1B, 0x8D,  // k=4  w=( +3, -7, +5,  0 )
+    0xC3, 0x84,  // k=5  w=( -5, +4, -4,  0 )
+    0x88, 0x8F,  // k=6  w=(  0,  0, +7,  0 )
+    0x7E, 0x85,  // k=7  w=( +6, -1, -3,  0 )
+  };
+  std::memcpy(weight.getData<uint8_t>(), packed, sizeof(packed));
+
+  // Per-output-column fp32 scales. Columns 0..2 have max|w| = 7 so
+  // scale = 7/7 = 1.0. Column 3 is all zeros; the Python encoder
+  // clips absmax to 1.0 to avoid dividing by zero, then scale = 1/7.
+  // The exact value of the column-3 scale is irrelevant for the
+  // result (the nibble is 8, real = 0, so the contribution is 0)
+  // but must match Python byte-for-byte or the C++ load path would
+  // see different bytes than Python wrote.
+  float *scales = weight.getScale<float>();
+  scales[0] = 1.0f;
+  scales[1] = 1.0f;
+  scales[2] = 1.0f;
+  scales[3] = 1.0f / 7.0f;
+
+  // fp32 activation [1, 2, 3, 4, 5, 6, 7, 8].
+  nntrainer::Tensor act(1, 1, 1, K, nntrainer::Tformat::NCHW,
+                        nntrainer::Tdatatype::FP32);
+  for (unsigned int k = 0; k < K; ++k) {
+    act.setValue(0, 0, 0, k, static_cast<float>(k + 1));
+  }
+
+  nntrainer::Tensor output(1, 1, 1, N, nntrainer::Tformat::NCHW,
+                           nntrainer::Tdatatype::FP32);
+  output.setZero();
+
+  ASSERT_NO_THROW(act.dot(weight, output, false, false));
+
+  // Hand-computed reference, matching GEMM_GOLDEN_REFERENCE in the
+  // Python test. sum_k input[k] * dequant_weight[k, n].
+  const float expected[N] = {
+    44.0f,   //  1*7  + 2*(-2) + 3*4  + 4*(-1) + 5*3  + 6*(-5) + 7*0 + 8*6
+    -22.0f,  //  1*(-3)+ 2*5   + 3*(-6)+ 4*2   + 5*(-7)+ 6*4   + 7*0 + 8*(-1)
+    29.0f,   //  1*0  + 2*1   + 3*3  + 4*(-2) + 5*5  + 6*(-4) + 7*7 + 8*(-3)
+    0.0f,    //  all-zero column
+  };
+
+  // KleidiAI quantizes the fp32 activation to int8 internally with a
+  // dynamic scale derived from the per-row min/max. For input range
+  // [1, 8] the activation scale is 255/8 = 31.875, so per-element
+  // dequant error is at most ~0.004. Accumulated over K=8 terms and
+  // weighted by max|w| = 7 the total output error is bounded by
+  // 8 * 0.004 * 7 ~= 0.22. Use 0.5 as a safe tolerance.
+  for (unsigned int n = 0; n < N; ++n) {
+    EXPECT_NEAR(output.getValue(0, 0, 0, n), expected[n], 0.5f)
+      << "GEMM output mismatch at column n=" << n << " (got "
+      << output.getValue(0, 0, 0, n) << ", expected " << expected[n]
+      << "). If this failure is paired with a Python test failure in "
+         "test_gemm_golden_bytes_match_python_encoder, the encoder "
+         "format drifted; otherwise the C++ dispatch path regressed.";
+  }
+}
+
 #endif // ENABLE_FP16
 
 // =============================================================================

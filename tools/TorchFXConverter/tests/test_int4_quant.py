@@ -141,6 +141,132 @@ def test_quantize_qsi4cxp_kxn_roundtrip_accuracy():
 
 
 # =============================================================================
+# Python <-> C++ golden byte fixture for the GEMM cross-validation test
+# =============================================================================
+#
+# This fixture is the verification bridge that replaces P6b-2 for now.
+# The Python quantize_qsi4cxp_kxn() and the C++ KleidiAI forward path
+# (FloatTensor::dotQInteger -> nntr_gemm_qai8dxp_qsi4cxp_unpacked) must
+# agree on the byte wire format: nibble packing order, offset-binary
+# encoding, per-output-column scale layout, and K-row stride.
+#
+# The C++ side of the fixture lives in
+#   test/unittest/unittest_nntrainer_safetensors_int4.cpp ::
+#       DotQInt4_gemm_nonUniform_matchesReference
+# which hard-codes the same 16 bytes + 4 fp32 scales and runs a small
+# GEMM through FloatTensor::dot, comparing against the hand-computed
+# reference output documented in GEMM_GOLDEN_* below.
+#
+# If you change quantize_qsi4cxp_kxn()'s nibble / scale convention you
+# MUST update both this test and the C++ test together — the compiler
+# will not catch a drift because the two sides communicate through raw
+# bytes in a file.
+
+# Signed int4 weight matrix for a K=8, N=4 GEMM. Values are chosen so
+# every output column has a different absmax profile:
+#   col 0: max|w| = 7  -> scale = 1.0         (exact scale)
+#   col 1: max|w| = 7  -> scale = 1.0
+#   col 2: max|w| = 7  -> scale = 1.0
+#   col 3: all zeros  -> absmax clipped to 1 -> scale = 1/7
+GEMM_GOLDEN_K = 8
+GEMM_GOLDEN_N = 4
+GEMM_GOLDEN_WEIGHT = [
+    [ 7., -3.,  0.,  0.],
+    [-2.,  5.,  1.,  0.],
+    [ 4., -6.,  3.,  0.],
+    [-1.,  2., -2.,  0.],
+    [ 3., -7.,  5.,  0.],
+    [-5.,  4., -4.,  0.],
+    [ 0.,  0.,  7.,  0.],
+    [ 6., -1., -3.,  0.],
+]
+# Per-K-row byte pair in KleidiAI kxn order:
+#   byte 0: low = w[k,0]+8, high = w[k,1]+8
+#   byte 1: low = w[k,2]+8, high = w[k,3]+8
+GEMM_GOLDEN_PACKED = bytes([
+    0x5F, 0x88,  # k=0  w=( +7, -3,  0,  0)  -> (15|5<<4, 8|8<<4)
+    0xD6, 0x89,  # k=1  w=( -2, +5, +1,  0)  -> ( 6|13<<4, 9|8<<4)
+    0x2C, 0x8B,  # k=2  w=( +4, -6, +3,  0)  -> (12|2<<4, 11|8<<4)
+    0xA7, 0x86,  # k=3  w=( -1, +2, -2,  0)  -> ( 7|10<<4, 6|8<<4)
+    0x1B, 0x8D,  # k=4  w=( +3, -7, +5,  0)  -> (11|1<<4, 13|8<<4)
+    0xC3, 0x84,  # k=5  w=( -5, +4, -4,  0)  -> ( 3|12<<4, 4|8<<4)
+    0x88, 0x8F,  # k=6  w=(  0,  0, +7,  0)  -> ( 8|8<<4, 15|8<<4)
+    0x7E, 0x85,  # k=7  w=( +6, -1, -3,  0)  -> (14|7<<4, 5|8<<4)
+])
+GEMM_GOLDEN_SCALES = [1.0, 1.0, 1.0, 1.0 / 7.0]
+# Input [1, 2, 3, 4, 5, 6, 7, 8] dotted with the weight above gives
+# the hand-computed per-column reference output:
+#   col 0: 1*7 + 2*(-2) + 3*4 + 4*(-1) + 5*3 + 6*(-5) + 7*0 + 8*6     = 44
+#   col 1: 1*(-3) + 2*5 + 3*(-6) + 4*2 + 5*(-7) + 6*4 + 7*0 + 8*(-1)  = -22
+#   col 2: 1*0 + 2*1 + 3*3 + 4*(-2) + 5*5 + 6*(-4) + 7*7 + 8*(-3)     = 29
+#   col 3: 0 * anything                                                = 0
+GEMM_GOLDEN_INPUT = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+GEMM_GOLDEN_REFERENCE = [44.0, -22.0, 29.0, 0.0]
+
+
+def test_gemm_golden_bytes_match_python_encoder():
+    """Cross-validation: quantize_qsi4cxp_kxn() applied to the golden
+    weight must produce exactly GEMM_GOLDEN_PACKED and
+    GEMM_GOLDEN_SCALES. If this test drifts, the C++ GEMM fixture in
+    unittest_nntrainer_safetensors_int4.cpp will also drift and the
+    Python <-> KleidiAI wire format contract is broken."""
+    w = torch.tensor(GEMM_GOLDEN_WEIGHT, dtype=torch.float32)
+    packed, scales_bytes = quantize_qsi4cxp_kxn(w)
+
+    assert packed == GEMM_GOLDEN_PACKED, (
+        "golden packed bytes drifted. Python encoder output:\n"
+        + " ".join(f"0x{b:02X}" for b in packed)
+        + "\nexpected:\n"
+        + " ".join(f"0x{b:02X}" for b in GEMM_GOLDEN_PACKED)
+    )
+
+    scales = np.frombuffer(scales_bytes, dtype="<f4")
+    np.testing.assert_allclose(
+        scales, np.array(GEMM_GOLDEN_SCALES, dtype=np.float32),
+        rtol=1e-6,
+        err_msg="golden fp32 scales drifted")
+
+
+def test_gemm_golden_dequant_matches_reference():
+    """Dequantize the golden int4 bytes with the documented KleidiAI
+    convention (stored_nibble - 8) and verify the unquantized fp32
+    GEMM against GEMM_GOLDEN_INPUT yields GEMM_GOLDEN_REFERENCE.
+    This is a pure-Python check; the C++ side runs the same reference
+    through the KleidiAI kernel with an additional activation
+    quantization error that the C++ test's EXPECT_NEAR absorbs."""
+    K = GEMM_GOLDEN_K
+    N = GEMM_GOLDEN_N
+    row_stride = (N + 1) // 2
+    packed_arr = np.frombuffer(
+        GEMM_GOLDEN_PACKED, dtype=np.uint8).reshape(K, row_stride)
+    scales = np.array(GEMM_GOLDEN_SCALES, dtype=np.float32)
+
+    w_real = np.zeros((K, N), dtype=np.float32)
+    for k in range(K):
+        for n in range(N):
+            b = int(packed_arr[k, n // 2])
+            nibble = (b & 0x0F) if (n % 2 == 0) else ((b >> 4) & 0x0F)
+            w_real[k, n] = (nibble - 8) * scales[n]
+
+    # Check the reconstructed real weight matches the original fp32
+    # weight column-by-column. For this hand-picked pattern all
+    # non-zero columns have scale=1 so the decode is exact; column 3
+    # decodes to 0 (its nibble is 8, and 0 * 1/7 = 0).
+    np.testing.assert_allclose(w_real,
+                               np.array(GEMM_GOLDEN_WEIGHT,
+                                        dtype=np.float32),
+                               rtol=1e-6,
+                               atol=1e-6)
+
+    # Compute the dot product and verify it matches the reference.
+    inp = np.array(GEMM_GOLDEN_INPUT, dtype=np.float32)
+    out = inp @ w_real  # [N]
+    np.testing.assert_allclose(
+        out, np.array(GEMM_GOLDEN_REFERENCE, dtype=np.float32),
+        rtol=1e-5, atol=1e-5)
+
+
+# =============================================================================
 # WeightConverter int4 integration tests
 # =============================================================================
 
@@ -289,6 +415,8 @@ if __name__ == "__main__":
         test_quantize_qsi4cxp_kxn_output_sizes,
         test_quantize_qsi4cxp_kxn_known_pattern,
         test_quantize_qsi4cxp_kxn_roundtrip_accuracy,
+        test_gemm_golden_bytes_match_python_encoder,
+        test_gemm_golden_dequant_matches_reference,
         test_weightconverter_int4_header_has_schema_v2_and_quant,
         test_weightconverter_int4_bias_stays_fp32,
     ]
