@@ -208,7 +208,14 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
   } else if (d.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, alloc_now, init, name, qscheme);
   } else if (d.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(d, alloc_now, init, name, qscheme);
+    // QINT4 defaults to PER_CHANNEL_AFFINE (one scale per output column,
+    // matching KleidiAI qsi4cxp and QNN AXIS_SCALE_OFFSET). The Tensor
+    // wrapper default is PER_TENSOR_AFFINE which would be overridden here
+    // since callers (fc_layer requestWeight) don't pass QScheme explicitly.
+    QScheme qs = (qscheme == QScheme::PER_TENSOR_AFFINE)
+                   ? QScheme::PER_CHANNEL_AFFINE
+                   : qscheme;
+    itensor_ = std::make_unique<Int4QTensor>(d, alloc_now, init, name, qs);
   } else if (d.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(d, alloc_now, init, name);
