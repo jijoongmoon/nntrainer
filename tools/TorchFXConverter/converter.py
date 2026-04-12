@@ -10,6 +10,7 @@ Converts HuggingFace models to NNTrainer format:
 
 Usage:
   python converter.py --model Qwen/Qwen3-0.6B --output ./output/
+  python converter.py --model Qwen/Qwen3-0.6B --output ./output/ --int4
   python converter.py --model bert-base-uncased --output ./output/ --format ini
   python converter.py --model google/mt5-small --output ./output/ --format all
 
@@ -29,7 +30,8 @@ def convert_model(model_name_or_path, output_dir, formats=None,
                   convert_weights=False, verbose=True,
                   model_name=None, plugin_config=None,
                   external_kv_cache=False,
-                  inherit_transformer=False):
+                  inherit_transformer=False,
+                  int4_linear=False):
     """Run the full conversion pipeline.
 
     Args:
@@ -213,25 +215,31 @@ def convert_model(model_name_or_path, output_dir, formats=None,
             print(f"  JSON config: {json_path} ({len(json_str)} bytes)")
 
     if "weights" in formats:
-        wc = WeightConverter(layers)
+        wc = WeightConverter(layers, int4_linear=int4_linear)
         state_dict = model.state_dict()
 
         # Save in safetensors format (primary, name-based parallel loading)
-        st_path = os.path.join(output_dir, "model.safetensors")
+        suffix = "-int4" if int4_linear else ""
+        st_path = os.path.join(output_dir, f"model{suffix}.safetensors")
         wc.convert(state_dict, st_path, dtype=dtype,
                    output_format="safetensors")
         outputs["weights_safetensors"] = st_path
         if verbose:
             size_mb = os.path.getsize(st_path) / 1024 / 1024
             print(f"  Weights (safetensors): {st_path} ({size_mb:.1f} MB)")
+            if int4_linear:
+                print(f"    ↳ Linear weights quantized to channel-wise int4 "
+                      f"(qsi4cxp / KleidiAI kxn format)")
 
         # Also save in legacy BIN format for backward compatibility
-        bin_path = os.path.join(output_dir, "model.bin")
-        wc.convert(state_dict, bin_path, dtype=dtype, output_format="bin")
-        outputs["weights"] = bin_path
-        if verbose:
-            size_mb = os.path.getsize(bin_path) / 1024 / 1024
-            print(f"  Weights (bin): {bin_path} ({size_mb:.1f} MB)")
+        # (int4 BIN is not supported — skip when int4_linear is set)
+        if not int4_linear:
+            bin_path = os.path.join(output_dir, "model.bin")
+            wc.convert(state_dict, bin_path, dtype=dtype, output_format="bin")
+            outputs["weights"] = bin_path
+            if verbose:
+                size_mb = os.path.getsize(bin_path) / 1024 / 1024
+                print(f"  Weights (bin): {bin_path} ({size_mb:.1f} MB)")
 
         # Also save standalone weight conversion script
         script = wc.generate_script()
@@ -302,6 +310,7 @@ def main():
         epilog="""
 Examples:
   %(prog)s --model Qwen/Qwen3-0.6B --output ./qwen3/
+  %(prog)s --model Qwen/Qwen3-0.6B --output ./qwen3/ --int4
   %(prog)s --model bert-base-uncased --output ./bert/ --format ini json
   %(prog)s --model google/mt5-small --output ./mt5/ --format all
   %(prog)s --model ./local_model/ --output ./out/ --weights --dtype float16
@@ -337,6 +346,11 @@ Examples:
                         help="Generate C++ class inheriting from "
                              "CausalLM/Transformer base class "
                              "(Applications/CausalLM)")
+    parser.add_argument("--int4", action="store_true",
+                        help="Quantize Linear weights to channel-wise int4 "
+                             "(qsi4cxp / KleidiAI). Implies --weights. "
+                             "Embedding, norm, and bias stay at --dtype. "
+                             "Output is safetensors only (no .bin).")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress progress messages")
 
@@ -346,6 +360,9 @@ Examples:
     if "all" in formats:
         formats = ["cpp", "ini", "json"]
 
+    # --int4 implies --weights
+    do_weights = args.weights or args.int4
+
     convert_model(
         model_name_or_path=args.model,
         output_dir=args.output,
@@ -353,12 +370,13 @@ Examples:
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         dtype=args.dtype,
-        convert_weights=args.weights,
+        convert_weights=do_weights,
         verbose=not args.quiet,
         model_name=args.model_name,
         plugin_config=args.plugin_config,
         external_kv_cache=args.external_kv_cache,
         inherit_transformer=args.inherit_transformer,
+        int4_linear=args.int4,
     )
 
 
