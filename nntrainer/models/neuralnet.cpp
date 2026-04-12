@@ -845,6 +845,15 @@ void NeuralNetwork::save(
         auto &w = *weights[i];
         size_t sz = w.getVariable().getMemoryBytes();
         auto dtype = w.getDim().getDataType();
+        // Quantized tensors (Int4QTensor, CharTensor, ShortTensor) write
+        // a 2-byte QScheme header before the data via save_quantization_info.
+        // Include that in the safetensors data_offsets so read() can
+        // consume the same header.
+        if (dtype == TensorDim::DataType::QINT4 ||
+            dtype == TensorDim::DataType::QINT8 ||
+            dtype == TensorDim::DataType::QINT16) {
+          sz += sizeof(uint16_t);
+        }
 
         std::string dtype_str;
         switch (dtype) {

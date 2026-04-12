@@ -76,4 +76,12 @@ def quantize_qsi4cxp_kxn(weight_kxn):
     if n_odd > 0:
         packed[:, :n_odd] |= (q_u8[:, 1:N:2] & 0x0F) << 4
 
-    return packed.tobytes(order="C"), scales.astype("<f4").tobytes(order="C")
+    packed_bytes = packed.tobytes(order="C")
+    scales_bytes = scales.astype("<f4").tobytes(order="C")
+
+    # Prepend 2-byte QScheme header for C++ Int4QTensor::read()
+    # compatibility. Int4QTensor::read() always calls
+    # read_quantization_info() first, which reads 2 bytes as a
+    # uint16_t QScheme enum. PER_CHANNEL_AFFINE = 0x0001.
+    QSCHEME_PER_CHANNEL_AFFINE = b'\x01\x00'  # uint16_t LE
+    return QSCHEME_PER_CHANNEL_AFFINE + packed_bytes, scales_bytes
