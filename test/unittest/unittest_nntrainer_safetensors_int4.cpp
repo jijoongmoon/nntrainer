@@ -183,6 +183,11 @@ TEST(SafetensorsInt4, SaveQINT4Fc_header_contains_quant) {
     << "axis_scale_offset encoding missing";
   EXPECT_NE(header_json.find("\"bitwidth\":4"), std::string::npos)
     << "bitwidth=4 missing in quant object";
+  // axis=1: for nntrainer's [K, N] FC weight layout, per-channel means
+  // per-output-column (width), not per-input-row (height). Int4QTensor::
+  // scale_size() returns width() and the save path emits axis=1.
+  EXPECT_NE(header_json.find("\"axis\":1"), std::string::npos)
+    << "axis=1 (per-output-column) missing in quant object";
 
   std::remove(path.c_str());
 }

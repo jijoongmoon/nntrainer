@@ -28,6 +28,135 @@ from nntrainer_layers import NNTrainerLayerDef
 
 
 # =============================================================================
+# Channel-wise int4 (qsi4cxp) quantization
+# =============================================================================
+#
+# This is the Python counterpart to nntrainer::Int4QTensor's canonical
+# on-disk layout (P2 + P4 + P6b, schema_version 2). It produces bytes
+# that FloatTensor::dotQInteger can hand directly to KleidiAI's
+# qai8dxp_qsi4cxp_unpacked kernel without any translation.
+#
+# Why this exists: the existing Q4_0 quantizer in quantize.cpp is a C++
+# utility that re-quantizes an already-nntrainer-loaded .bin file. It
+# cannot be used in a pure-Python HF -> nntrainer pipeline. For
+# TorchFXConverter we want a Python quantizer that runs BEFORE load,
+# directly on HF torch.Tensor objects.
+#
+# Layout (matches Int4QTensor::allocate + KleidiAI kxn expectation):
+#
+#   offset                              | contents
+#   ------------------------------------+-------------------------------
+#   0 .. K * ceil(N/2) - 1              | packed int4 nibbles, kxn
+#                                       | (one K-row of ceil(N/2) bytes,
+#                                       |  N outer dim packed 2-per-byte)
+#   K*ceil(N/2) .. K*ceil(N/2)+4*N - 1  | fp32 scales, one per output
+#                                       | column (length N)
+#
+# Conventions (KleidiAI-native, NOT Int4QTensor::setValue):
+#   - Weight is interpreted as [K, N] with K = input features (reduction
+#     axis, = nntrainer weight_dim.height) and N = output features
+#     (= width). HF / PyTorch weights are stored as [N, K] so the
+#     caller must transpose once before handing the tensor here; this
+#     mirrors what WeightConverter already does for FP32 linear layers
+#     in `_convert_safetensors`.
+#   - Per-output-channel (per-N) symmetric scale: one fp32 scale per N.
+#     Within each column, all K reduction elements share that scale.
+#     This matches nntrainer::Int4QTensor::scale_size() returning
+#     width() and the safetensors schema_version 2 metadata
+#     emitting `"encoding":"axis_scale_offset","axis":1`.
+#   - Int4 value in range [-8, +7] (symmetric, no zero point), encoded
+#     on disk as OFFSET-BINARY with `stored_nibble = real + 8` so the
+#     4-bit encoding uses 0..15 unsigned. KleidiAI's qsi4cxp kernel
+#     reads this same offset-binary convention internally.
+#   - Nibble packing within a K-row: byte `b = k*ceil(N/2) + n/2` holds
+#       low nibble (bits 0..3) -> n % 2 == 0 (even n_idx)
+#       high nibble (bits 4..7) -> n % 2 == 1 (odd  n_idx)
+#     This is KleidiAI's `kxn` ordering. Note: this is the OPPOSITE
+#     of Int4QTensor::getValue()'s convention (which places even flat
+#     indices in the HIGH nibble as two's-complement signed int4).
+#     That discrepancy only matters if downstream C++ code reads the
+#     data via getValue() — the KleidiAI forward path uses raw bytes
+#     via getData<char>() so it is unaffected.
+#
+# Follow-up [P6b-2]: align Int4QTensor::setValue/getValue with this
+# convention so C++ getValue() prints the semantically correct int4
+# values instead of a byte-flipped / sign-flipped view.
+def quantize_qsi4cxp_kxn(weight_kxn):
+    """Quantize a [K, N] FP32 weight matrix to KleidiAI qsi4cxp format.
+
+    Args:
+        weight_kxn: 2-D torch.Tensor in [K, N] layout (K = in_features,
+                    N = out_features). Callers convert from HuggingFace
+                    [N, K] via `.t().contiguous()` before calling.
+
+    Returns:
+        (packed_bytes, scales_fp32) where
+          packed_bytes: Python `bytes`, length K * ceil(N/2),
+                        packed int4 nibbles in KleidiAI kxn order.
+          scales_fp32:  Python `bytes`, length 4*N, per-output-column
+                        fp32 scales in little-endian native order.
+    """
+    import numpy as np
+
+    if weight_kxn.dim() != 2:
+        raise ValueError(
+            f"quantize_qsi4cxp_kxn expects a 2-D tensor, got shape "
+            f"{tuple(weight_kxn.shape)}")
+
+    # Work entirely in numpy so we don't depend on torch quant kernels.
+    w = weight_kxn.detach().to("cpu").float().numpy()  # [K, N]
+    K, N = w.shape
+
+    # Per-output-column absolute max. Symmetric range -> scale covers
+    # -max .. +max in 16 levels (-8 .. +7). Clip the min scale so we
+    # never divide by zero for an all-zero column.
+    col_absmax = np.abs(w).max(axis=0)                 # [N]
+    col_absmax = np.where(col_absmax > 0.0, col_absmax,
+                          np.float32(1.0))
+    # scale = max_abs / 7 so that the largest value maps to +7. Using
+    # 7 (not 8) avoids saturating at the negative extreme -8 when the
+    # positive side hits its max; for symmetric signed int4 the
+    # reachable positive max is +7.
+    scales = (col_absmax / np.float32(7.0)).astype(np.float32)  # [N]
+
+    # Quantize: for each element q[k, n] = round(w[k, n] / scales[n]).
+    # Broadcasting scales across K rows.
+    q = np.round(w / scales).astype(np.int32)           # [K, N]
+    # Clip to the symmetric signed int4 range.
+    q = np.clip(q, -8, 7)
+
+    # Convert to offset-binary uint8 nibbles (stored = real + 8).
+    q_u8 = (q + 8).astype(np.uint8)                     # [K, N], 0..15
+
+    # Pack two N-values per byte in KleidiAI kxn order:
+    #   byte[k, n//2] LOW  nibble  = q_u8[k, n]         (even n_idx)
+    #   byte[k, n//2] HIGH nibble  = q_u8[k, n+1]       (odd  n_idx)
+    # For odd N the last byte has a valid LOW nibble (last even index)
+    # but its HIGH nibble is padding; leave it as 0, which decodes
+    # to real -8 but is never read since n_idx never exceeds N - 1.
+    row_stride = (N + 1) // 2                           # bytes per K row
+    packed = np.zeros((K, row_stride), dtype=np.uint8)
+
+    # Even-index columns occupy the LOW nibble of every byte that
+    # has one. For N elements the even indices are 0,2,...,2*m where
+    # m = (N+1)//2 - 1, giving (N+1)//2 slots — exactly row_stride.
+    n_even = (N + 1) // 2
+    packed[:, :n_even] = q_u8[:, 0:N:2] & 0x0F
+
+    # Odd-index columns occupy the HIGH nibble of the first N//2 bytes.
+    # For odd N there is no odd index paired with the last even one,
+    # so we only touch the first (N//2) bytes, not the full row.
+    n_odd = N // 2
+    if n_odd > 0:
+        packed[:, :n_odd] |= (q_u8[:, 1:N:2] & 0x0F) << 4
+
+    packed_bytes = packed.tobytes(order="C")
+    scales_bytes = scales.astype("<f4").tobytes(order="C")
+
+    return packed_bytes, scales_bytes
+
+
+# =============================================================================
 # Weight Mapping
 # =============================================================================
 
@@ -114,7 +243,8 @@ class WeightConverter:
                                     weight_order=weight_order)
     """
 
-    def __init__(self, layers, name_remap=None, weight_order=None):
+    def __init__(self, layers, name_remap=None, weight_order=None,
+                 int4_linear=False, int4_predicate=None):
         """
         Args:
             layers: List of NNTrainerLayerDef from converter pipeline.
@@ -122,11 +252,22 @@ class WeightConverter:
                         target layer name (e.g. CausalLM names).
             weight_order: Optional list of target layer names specifying
                           the output order for binary format.
+            int4_linear: If True, quantize all Linear layer weights to
+                         qsi4cxp channel-wise int4. Embedding and norm
+                         weights are left at the converter's base dtype
+                         (fp32 / fp16). Biases always stay at base dtype.
+            int4_predicate: Optional callable(entry) -> bool. Overrides
+                         int4_linear for fine-grained selection: return
+                         True for the entries that should be quantized
+                         to int4. The entry is a dict from build_weight_map
+                         with keys {hf_key, nntr_layer, transform, is_bias}.
         """
         self.layers = layers
         self.weight_map = build_weight_map(layers)
         self.name_remap = name_remap or {}
         self.weight_order = weight_order or []
+        self.int4_linear = int4_linear
+        self.int4_predicate = int4_predicate
 
     def _dtype_to_safetensors(self, dtype_str):
         """Map dtype string to safetensors dtype name."""
@@ -138,8 +279,32 @@ class WeightConverter:
             "int16": "I16",
             "int32": "I32",
             "uint8": "U8",
+            "qint4": "I4",
         }
         return mapping.get(dtype_str, "F32")
+
+    def _should_quantize_int4(self, entry):
+        """Return True if the given weight entry should be emitted as
+        qsi4cxp channel-wise int4.
+
+        Policy:
+          - Biases stay at base dtype (I4 would lose accuracy with no
+            upside, and Int4QTensor layout is weight-only).
+          - If a user-supplied predicate is set, it fully controls
+            selection. This lets callers exclude specific layers (e.g.
+            gate_proj/up_proj) or opt individual layers in.
+          - Otherwise `int4_linear=True` turns on int4 for any entry
+            that had transform=="transpose" (the TorchFXConverter
+            pipeline marks Linear weights as transpose-needed; other
+            weight kinds like embedding/norm use transform=="none").
+        """
+        if entry.get("is_bias"):
+            return False
+        if self.int4_predicate is not None:
+            return bool(self.int4_predicate(entry))
+        if self.int4_linear and entry.get("transform") == "transpose":
+            return True
+        return False
 
     def convert(self, state_dict, output_path, dtype="float32",
                 output_format="auto"):
@@ -244,6 +409,15 @@ class WeightConverter:
 
         When name_remap is set, tensor names use the remapped CausalLM-style
         layer names (e.g. "layer0_wq:weight") instead of sanitized HF names.
+
+        When `int4_linear=True` (or `int4_predicate` selects an entry),
+        the selected Linear weights are quantized to channel-wise int4
+        via `quantize_qsi4cxp_kxn` and written with schema_version="2"
+        + per-entry "quant" metadata object, matching the nntrainer
+        Int4QTensor canonical layout. Embeddings, norms, and biases
+        stay at the converter's base dtype. The presence of any int4
+        entry promotes the whole file to schema_version 2; otherwise
+        schema_version stays at 1 (= default, not emitted).
         """
         import torch
 
@@ -256,6 +430,7 @@ class WeightConverter:
         tensor_data = []
         header_entries = OrderedDict()
         data_offset = 0
+        any_quant = False  # triggers schema_version=2 on the metadata block
 
         for entry in entries:
             hf_key = entry["hf_key"]
@@ -269,9 +444,6 @@ class WeightConverter:
             if entry["transform"] == "transpose" and tensor.dim() == 2:
                 tensor = tensor.t().contiguous()
 
-            data = tensor.cpu().numpy().tobytes()
-            data_size = len(data)
-
             # Use remapped name if available, otherwise sanitized HF name
             nntr_name = self._remap_layer_name(entry["nntr_layer"])
             if entry.get("is_bias"):
@@ -279,19 +451,64 @@ class WeightConverter:
             else:
                 nntr_name += ":weight"
 
-            shape = list(tensor.shape)
+            if self._should_quantize_int4(entry):
+                # Quantize to qsi4cxp channel-wise int4. The transpose
+                # above has already put the tensor in [K, N] order
+                # (K = reduction / input features, N = output features),
+                # which is exactly what quantize_qsi4cxp_kxn expects.
+                if tensor.dim() != 2:
+                    raise ValueError(
+                        f"int4 quantization requires a 2-D weight, "
+                        f"but '{hf_key}' has shape "
+                        f"{tuple(tensor.shape)}")
 
-            header_entries[nntr_name] = {
-                "dtype": sf_dtype,
-                "shape": shape,
-                "data_offsets": [data_offset, data_offset + data_size],
-            }
+                packed_bytes, scales_bytes = quantize_qsi4cxp_kxn(tensor)
+                data = packed_bytes + scales_bytes
+                data_size = len(data)
+                K, N = int(tensor.shape[0]), int(tensor.shape[1])
+
+                header_entries[nntr_name] = {
+                    "dtype": "I4",
+                    "shape": [K, N],
+                    "data_offsets": [data_offset, data_offset + data_size],
+                    # schema_version 2 quant object. Must agree with the
+                    # C++ save path in neuralnet.cpp::deriveQuantInfo:
+                    #   encoding   = "axis_scale_offset"
+                    #   axis       = 1  (per-output-column for [K,N] layout)
+                    #   bitwidth   = 4
+                    #   group_size = 0  (pure per-channel, == height)
+                    #   has_zero_point = false (signed int4, offset-binary
+                    #                            is an encoding detail,
+                    #                            not an asymmetric zp).
+                    "quant": {
+                        "encoding": "axis_scale_offset",
+                        "axis": 1,
+                        "bitwidth": 4,
+                        "group_size": 0,
+                        "has_zero_point": False,
+                    },
+                }
+                any_quant = True
+            else:
+                data = tensor.cpu().numpy().tobytes()
+                data_size = len(data)
+                shape = list(tensor.shape)
+                header_entries[nntr_name] = {
+                    "dtype": sf_dtype,
+                    "shape": shape,
+                    "data_offsets": [data_offset, data_offset + data_size],
+                }
 
             tensor_data.append(data)
             data_offset += data_size
 
         # Build JSON header
-        header_dict = {"__metadata__": {"format": "nntrainer"}}
+        metadata = {"format": "nntrainer"}
+        if any_quant:
+            # Promote to schema_version 2 so the C++ loader's strict
+            # validation accepts the per-entry quant objects.
+            metadata["schema_version"] = "2"
+        header_dict = {"__metadata__": metadata}
         header_dict.update(header_entries)
         header_json = json.dumps(header_dict, separators=(",", ":"),
                                  ensure_ascii=True)

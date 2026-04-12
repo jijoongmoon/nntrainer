@@ -757,16 +757,23 @@ void NeuralNetwork::save(
           auto scheme = var.q_scheme();
           if (scheme == QScheme::PER_CHANNEL_AFFINE) {
             qi.encoding = "axis_scale_offset";
-            qi.axis = 0;
+            // axis=1 for nntrainer's FC weight layout [K, N]: the
+            // quantization axis is the OUTPUT dimension (width, N).
+            // Each output column shares one scale across all K
+            // reduction elements. This matches Int4QTensor::scale_size()
+            // returning width() for pure per-channel.
+            qi.axis = 1;
             size_t ss = var.scale_size();
             size_t total = w.getDim().getDataLen();
             if (ss > 0 && ss <= total) {
-              // group_size = total_elements / scale_count.
-              // If it equals one output channel's width (one scale
-              // per output row), normalize to 0 == "pure per-channel".
+              // group_size = total_elements / scale_count. When it
+              // equals the reduction-axis length (height = K), all
+              // reduction elements in one output column share one
+              // scale, which is pure per-channel — normalize to 0.
               size_t gs = total / ss;
-              size_t row_width = w.getDim().width();
-              qi.group_size = (gs == row_width) ? 0 : static_cast<int>(gs);
+              size_t reduction_len = w.getDim().height();
+              qi.group_size =
+                (gs == reduction_len) ? 0 : static_cast<int>(gs);
             }
           } else {
             qi.encoding = "per_tensor_affine";

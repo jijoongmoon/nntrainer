@@ -572,12 +572,23 @@ size_t Int4QTensor::scale_size() const {
     break;
   case QScheme::PER_CHANNEL_AFFINE:
     // group_size_ == 0 is the canonical signal for "pure per-channel":
-    // exactly one scale per output row (matches qsi4cxp and QNN's
-    // AXIS_SCALE_OFFSET with numScaleOffsets == height).
-    // group_size_ == row_width gives the same result mathematically;
-    // users may pass either form.
-    if (group_size_ == 0 || group_size_ == width())
-      return height();
+    // exactly one scale per output column. For nntrainer's FC weight
+    // layout TensorDim(1, 1, K=in_features, N=out_features) where
+    // height() is K (input features) and width() is N (output
+    // features), the natural per-output-channel quantization produces
+    // N scales = width(). This matches:
+    //   - KleidiAI qsi4cxp kxn: rhs_scales_f32[n_idx], indexed by
+    //     output column, length N.
+    //   - HuggingFace / PyTorch per-channel quant: one scale per
+    //     output feature.
+    //   - QNN AXIS_SCALE_OFFSET with axis=1 (output dim) and
+    //     numScaleOffsets=N.
+    //
+    // group_size_ == height() (= K, the row length along the
+    // reduction axis) is semantically identical to pure per-channel:
+    // "all K elements in one output column share one scale".
+    if (group_size_ == 0 || group_size_ == height())
+      return width();
     return height() * width() / group_size_;
     break;
   default:
