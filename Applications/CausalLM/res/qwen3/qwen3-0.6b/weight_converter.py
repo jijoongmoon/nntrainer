@@ -27,9 +27,14 @@ from collections import OrderedDict
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 # Import channel-wise int4 quantizer from TorchFXConverter
-sys.path.insert(0, os.path.join(os.path.dirname(__file__),
-                                "../../../../tools/TorchFXConverter"))
-from weight_converter import quantize_qsi4cxp_kxn
+import importlib.util
+_qsi4_path = os.path.join(os.path.dirname(__file__),
+                          "../../../../tools/TorchFXConverter/weight_converter.py")
+_qsi4_spec = importlib.util.spec_from_file_location("tfx_weight_converter",
+                                                      _qsi4_path)
+_qsi4_mod = importlib.util.module_from_spec(_qsi4_spec)
+_qsi4_spec.loader.exec_module(_qsi4_mod)
+quantize_qsi4cxp_kxn = _qsi4_mod.quantize_qsi4cxp_kxn
 
 
 # =============================================================================
