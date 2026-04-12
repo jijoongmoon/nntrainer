@@ -25,6 +25,7 @@ import struct
 from collections import OrderedDict
 
 from nntrainer_layers import NNTrainerLayerDef
+from int4_quant import quantize_qsi4cxp_kxn
 
 
 # =============================================================================

@@ -28,10 +28,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from weight_converter import (
-    WeightConverter,
-    quantize_qsi4cxp_kxn,
-)
+from int4_quant import quantize_qsi4cxp_kxn
+from weight_converter import WeightConverter
 from nntrainer_layers import NNTrainerLayerDef
 
 
