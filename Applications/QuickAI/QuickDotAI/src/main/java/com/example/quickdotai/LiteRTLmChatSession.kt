@@ -33,11 +33,17 @@ import java.util.concurrent.atomic.AtomicBoolean
  * @param engine      the parent LiteRT-LM engine (kept for rebuild)
  * @param config      session-level sampling + template config
  * @param visionEnabled whether the engine was loaded with a vision backend
+ * @param onSessionClosed callback fired once when [close] is invoked.
+ *        Used by [LiteRTLm] to clear its `activeSession` and restore
+ *        the flat-API Conversation. Skipped when the parent engine is
+ *        tearing down (it nulls out `activeSession` before calling
+ *        close so the callback sees nothing to do).
  */
 class LiteRTLmChatSession(
     private val engine: Engine,
     private val config: QuickAiChatSessionConfig?,
     private val visionEnabled: Boolean,
+    private val onSessionClosed: (() -> Unit)? = null,
     override val sessionId: String = UUID.randomUUID().toString()
 ) : QuickAiChatSession {
 
@@ -329,6 +335,11 @@ class LiteRTLmChatSession(
         conversation = null
         imageStore.clear()
         history.clear()
+        try {
+            onSessionClosed?.invoke()
+        } catch (t: Throwable) {
+            Log.w(TAG, "close($sessionId): onSessionClosed threw", t)
+        }
     }
 
     // ----- helpers -------------------------------------------------------

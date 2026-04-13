@@ -427,67 +427,73 @@ class MainActivity : AppCompatActivity() {
     // --- button handlers ----------------------------------------------
 
     private fun onLoadClicked() {
-        val model = ModelId.valueOf(modelSpinner.selectedItem as String)
+        val req = buildLoadRequest()
+        setStatus(
+            "Loading ${req.modelKey}… " +
+                "(vision=${req.visionBackend?.name ?: "off"})"
+        )
+        outputView.text = ""
+        engineExecutor.execute { loadModelInternal(req) }
+    }
+
+    /**
+     * @brief Build a [LoadModelRequest] from the current spinner / text
+     * field values. Must be called on the main thread.
+     */
+    private fun buildLoadRequest(): LoadModelRequest {
+        val model = selectedModelId()
         val backend = BackendType.valueOf(backendSpinner.selectedItem as String)
-        val quant = QuantizationType.valueOf(quantSpinner.selectedItem as String)
+        val quant = selectedQuant()
         val modelPath = modelPathField.text.toString().trim().ifEmpty { null }
-
-        // Auto-enable the vision encoder when loading a multimodal-
-        // capable model (currently only GEMMA4 → LiteRTLm). We reuse
-        // the user-selected compute backend so the vision encoder
-        // lands on the same device (CPU/GPU/NPU). For every other
-        // model the field stays null and LiteRTLm loads in text-only
-        // mode — runMultimodal then returns UNSUPPORTED, which the
-        // Run handler surfaces verbatim to the status bar.
         val visionBackend = if (model == ModelId.GEMMA4) backend else null
-
-        val req = LoadModelRequest(
+        return LoadModelRequest(
             backend = backend,
             model = model,
             quantization = quant,
             modelPath = modelPath,
             visionBackend = visionBackend,
         )
-        setStatus(
-            "Loading ${req.modelKey}… " +
-                "(vision=${visionBackend?.name ?: "off"})"
-        )
-        outputView.text = ""
+    }
 
-        engineExecutor.execute {
-            // If a different model is already loaded, swap it out so the
-            // sample stays simple (one engine at a time).
-            if (loadedKey != null && loadedKey != req.modelKey) {
+    /**
+     * @brief Core model loading logic. Must be called from [engineExecutor].
+     * Returns the loaded [QuickDotAI] engine, or null on failure.
+     */
+    private fun loadModelInternal(req: LoadModelRequest): QuickDotAI? {
+        // If a different model is already loaded, swap it out so the
+        // sample stays simple (one engine at a time).
+        if (loadedKey != null && loadedKey != req.modelKey) {
+            try {
+                engine?.close()
+            } catch (_: Throwable) { /* best effort */ }
+            engine = null
+            loadedKey = null
+        }
+        if (engine != null && loadedKey == req.modelKey) {
+            setStatus("Already loaded: ${req.modelKey}")
+            return engine
+        }
+
+        val newEngine: QuickDotAI = when (req.model) {
+            ModelId.GEMMA4 -> LiteRTLm(applicationContext)
+            else -> NativeQuickDotAI()
+        }
+        return when (val r = newEngine.load(req)) {
+            is BackendResult.Ok -> {
+                engine = newEngine
+                loadedKey = req.modelKey
+                setStatus(
+                    "Loaded ${req.modelKey} " +
+                        "(${newEngine.kind}, arch=${newEngine.architecture ?: "?"})"
+                )
+                newEngine
+            }
+            is BackendResult.Err -> {
                 try {
-                    engine?.close()
+                    newEngine.close()
                 } catch (_: Throwable) { /* best effort */ }
-                engine = null
-                loadedKey = null
-            }
-            if (engine != null && loadedKey == req.modelKey) {
-                setStatus("Already loaded: ${req.modelKey}")
-                return@execute
-            }
-
-            val newEngine: QuickDotAI = when (req.model) {
-                ModelId.GEMMA4 -> LiteRTLm(applicationContext)
-                else -> NativeQuickDotAI()
-            }
-            when (val r = newEngine.load(req)) {
-                is BackendResult.Ok -> {
-                    engine = newEngine
-                    loadedKey = req.modelKey
-                    setStatus(
-                        "Loaded ${req.modelKey} " +
-                            "(${newEngine.kind}, arch=${newEngine.architecture ?: "?"})"
-                    )
-                }
-                is BackendResult.Err -> {
-                    try {
-                        newEngine.close()
-                    } catch (_: Throwable) { /* best effort */ }
-                    setStatus("Load failed: [${r.error.name}] ${r.message ?: ""}")
-                }
+                setStatus("Load failed: [${r.error.name}] ${r.message ?: ""}")
+                null
             }
         }
     }
@@ -600,41 +606,27 @@ class MainActivity : AppCompatActivity() {
     // --- chat session handlers -------------------------------------------
 
     private fun onChatOpenClicked() {
+        // Capture all UI values on the main thread — no latches needed.
+        val req = buildLoadRequest()
+        val tempStr = chatTemperatureField.text.toString().trim()
+        val thinkingIdx = chatEnableThinkingSpinner.selectedItemPosition
+
         setStatus("Opening chat session…")
         engineExecutor.execute {
-            val e = engine
+            // Auto-load the model if not loaded yet.
+            val e = loadModelInternal(req)
             if (e == null) {
-                setStatus("No model loaded — tap Load first.")
+                setStatus("Cannot open chat session — model load failed.")
                 return@execute
             }
-            // Close existing session if any
+
+            // Close existing session if any (callback handles engine cleanup).
             chatSession?.let {
                 try { it.close() } catch (_: Throwable) {}
                 chatSession = null
             }
 
-            // Build config from UI fields
-            val tempStr = mainHandler.let {
-                var result = ""
-                val latch = java.util.concurrent.CountDownLatch(1)
-                it.post {
-                    result = chatTemperatureField.text.toString().trim()
-                    latch.countDown()
-                }
-                latch.await()
-                result
-            }
-            val thinkingIdx = mainHandler.let {
-                var result = 0
-                val latch = java.util.concurrent.CountDownLatch(1)
-                it.post {
-                    result = chatEnableThinkingSpinner.selectedItemPosition
-                    latch.countDown()
-                }
-                latch.await()
-                result
-            }
-
+            // Build config from captured UI values
             val sampling = if (tempStr.isNotEmpty()) {
                 QuickAiChatSamplingConfig(
                     temperature = tempStr.toDoubleOrNull()
@@ -672,23 +664,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onChatRunStreamingClicked() {
-        val prompt = mainHandler.let {
-            var result = ""
-            val latch = java.util.concurrent.CountDownLatch(1)
-            it.post {
-                result = chatPromptField.text.toString()
-                latch.countDown()
-            }
-            latch.await()
-            result
-        }
+        val prompt = chatPromptField.text.toString()
         if (prompt.isBlank()) {
             setStatus("Chat message is empty.")
             return
         }
 
         val imgBytes = selectedImageBytes
-        mainHandler.post { outputView.text = "" }
+        outputView.text = ""
         setStatus("Chat streaming…")
 
         engineExecutor.execute {
@@ -730,23 +713,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onChatRunBlockingClicked() {
-        val prompt = mainHandler.let {
-            var result = ""
-            val latch = java.util.concurrent.CountDownLatch(1)
-            it.post {
-                result = chatPromptField.text.toString()
-                latch.countDown()
-            }
-            latch.await()
-            result
-        }
+        val prompt = chatPromptField.text.toString()
         if (prompt.isBlank()) {
             setStatus("Chat message is empty.")
             return
         }
 
         val imgBytes = selectedImageBytes
-        mainHandler.post { outputView.text = "" }
+        outputView.text = ""
         setStatus("Chat running (blocking)…")
 
         engineExecutor.execute {

@@ -584,7 +584,16 @@ class LiteRTLm(
             val session = LiteRTLmChatSession(
                 engine = e,
                 config = config,
-                visionEnabled = visionEnabled
+                visionEnabled = visionEnabled,
+                onSessionClosed = {
+                    // Called when session.close() fires (from any caller).
+                    // Only act if we still own this session — closeActiveSession()
+                    // nulls activeSession first so teardown skips restoration.
+                    if (activeSession != null) {
+                        activeSession = null
+                        restoreConversation()
+                    }
+                }
             )
             activeSession = session
             Log.i(TAG, "openChatSession(): created session ${session.sessionId}")
@@ -605,11 +614,10 @@ class LiteRTLm(
     fun closeChatSession(sessionId: String): Boolean {
         val session = activeSession ?: return false
         if (session.sessionId != sessionId) return false
+        // session.close() fires the onSessionClosed callback which
+        // nulls activeSession and calls restoreConversation().
         session.close()
-        activeSession = null
         Log.i(TAG, "closeChatSession($sessionId): closed")
-        // Restore the flat-API Conversation so run()/runStreaming() work again.
-        restoreConversation()
         return true
     }
 
@@ -620,18 +628,16 @@ class LiteRTLm(
     }
 
     /**
-     * Close the active chat session if any. Does NOT restore the flat-API
-     * Conversation — callers that want to keep using the engine (e.g.
-     * [closeChatSession]) must call [restoreConversation] separately.
-     * [unload] / [close] skip restoration because [closeQuietly] tears
-     * everything down immediately afterward.
+     * Close the active chat session if any. Nulls [activeSession] first
+     * so the session's onSessionClosed callback sees nothing to restore
+     * — [unload] / [close] call [closeQuietly] right after, which tears
+     * down the entire Engine.
      */
     private fun closeActiveSession() {
-        activeSession?.let {
-            Log.i(TAG, "closeActiveSession(): closing ${it.sessionId}")
-            it.close()
-            activeSession = null
-        }
+        val session = activeSession ?: return
+        Log.i(TAG, "closeActiveSession(): closing ${session.sessionId}")
+        activeSession = null   // detach first → callback skips restore
+        session.close()
     }
 
     /**
