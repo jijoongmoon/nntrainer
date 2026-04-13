@@ -446,9 +446,9 @@ internal class LiteRTLmChatSession(
 
             val samplerConfig = sampling?.let { s ->
                 SamplerConfig(
-                    temperature = s.temperature?.toFloat() ?: 1.0f,
+                    temperature = s.temperature ?: 1.0,
                     topK = s.topK ?: 40,
-                    topP = s.topP?.toFloat() ?: 0.95f,
+                    topP = s.topP ?: 0.95,
                 )
             }
 
