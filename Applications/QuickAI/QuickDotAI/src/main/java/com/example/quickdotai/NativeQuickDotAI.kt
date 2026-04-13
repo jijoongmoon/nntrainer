@@ -261,9 +261,12 @@ class NativeQuickDotAI : QuickDotAI {
 
     private var activeSession: NativeChatSession? = null
 
+    override val chatSessionId: String?
+        get() = activeSession?.sessionId
+
     override fun openChatSession(
         config: QuickAiChatSessionConfig?
-    ): BackendResult<QuickAiChatSession> {
+    ): BackendResult<String> {
         if (!loaded || handle == 0L) {
             return BackendResult.Err(
                 QuickAiError.NOT_INITIALIZED,
@@ -280,7 +283,63 @@ class NativeQuickDotAI : QuickDotAI {
         val session = NativeChatSession()
         activeSession = session
         Log.i(TAG, "openChatSession(): created dummy session ${session.sessionId}")
-        return BackendResult.Ok(session)
+        return BackendResult.Ok(session.sessionId)
+    }
+
+    override fun closeChatSession(): BackendResult<Unit> {
+        val session = activeSession
+        if (session == null) {
+            return BackendResult.Err(
+                QuickAiError.BAD_REQUEST,
+                "No active chat session to close"
+            )
+        }
+        session.close()
+        activeSession = null
+        Log.i(TAG, "closeChatSession(${session.sessionId}): closed")
+        return BackendResult.Ok(Unit)
+    }
+
+    override fun chatRun(
+        messages: List<QuickAiChatMessage>
+    ): BackendResult<QuickAiChatResult> {
+        val session = activeSession
+            ?: return BackendResult.Err(
+                QuickAiError.BAD_REQUEST,
+                "No active chat session — call openChatSession() first"
+            )
+        return session.run(messages)
+    }
+
+    override fun chatRunStreaming(
+        messages: List<QuickAiChatMessage>,
+        sink: StreamSink
+    ): BackendResult<QuickAiChatResult> {
+        val session = activeSession
+        if (session == null) {
+            val err = BackendResult.Err(
+                QuickAiError.BAD_REQUEST,
+                "No active chat session — call openChatSession() first"
+            )
+            sink.onError(err.error, err.message)
+            return err
+        }
+        return session.runStreaming(messages, sink)
+    }
+
+    override fun chatCancel() {
+        activeSession?.cancel()
+    }
+
+    override fun chatRebuild(
+        messages: List<QuickAiChatMessage>
+    ): BackendResult<Unit> {
+        val session = activeSession
+            ?: return BackendResult.Err(
+                QuickAiError.BAD_REQUEST,
+                "No active chat session — call openChatSession() first"
+            )
+        return session.rebuild(messages)
     }
 
     override fun close() {

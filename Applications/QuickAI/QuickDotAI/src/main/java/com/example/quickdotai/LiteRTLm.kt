@@ -75,6 +75,9 @@ class LiteRTLm(
     // A new session cannot be opened until the active one is closed.
     private var activeSession: LiteRTLmChatSession? = null
 
+    override val chatSessionId: String?
+        get() = activeSession?.sessionId
+
     override fun load(req: LoadModelRequest): BackendResult<Unit> {
         Log.i(
             TAG,
@@ -546,7 +549,7 @@ class LiteRTLm(
 
     override fun openChatSession(
         config: QuickAiChatSessionConfig?
-    ): BackendResult<QuickAiChatSession> {
+    ): BackendResult<String> {
         val e = engine
             ?: return BackendResult.Err(
                 QuickAiError.NOT_INITIALIZED,
@@ -597,7 +600,7 @@ class LiteRTLm(
             )
             activeSession = session
             Log.i(TAG, "openChatSession(): created session ${session.sessionId}")
-            BackendResult.Ok(session)
+            BackendResult.Ok(session.sessionId)
         } catch (t: Throwable) {
             Log.e(TAG, "openChatSession(): failed", t)
             // Session creation failed — restore the flat-API Conversation
@@ -610,21 +613,83 @@ class LiteRTLm(
         }
     }
 
-    /** Close the active chat session. Returns false if no session or id mismatch. */
-    fun closeChatSession(sessionId: String): Boolean {
-        val session = activeSession ?: return false
-        if (session.sessionId != sessionId) return false
+    override fun closeChatSession(): BackendResult<Unit> {
+        val session = activeSession
+        if (session == null) {
+            Log.w(TAG, "closeChatSession(): no active session")
+            return BackendResult.Err(
+                QuickAiError.BAD_REQUEST,
+                "No active chat session to close"
+            )
+        }
         // session.close() fires the onSessionClosed callback which
         // nulls activeSession and calls restoreConversation().
         session.close()
-        Log.i(TAG, "closeChatSession($sessionId): closed")
-        return true
+        Log.i(TAG, "closeChatSession(${session.sessionId}): closed")
+        return BackendResult.Ok(Unit)
     }
 
-    /** Retrieve the active chat session (only if its id matches). */
-    fun getChatSession(sessionId: String): LiteRTLmChatSession? {
-        val session = activeSession ?: return null
-        return if (session.sessionId == sessionId) session else null
+    override fun chatRun(
+        messages: List<QuickAiChatMessage>
+    ): BackendResult<QuickAiChatResult> {
+        val session = activeSession
+            ?: return BackendResult.Err(
+                QuickAiError.BAD_REQUEST,
+                "No active chat session — call openChatSession() first"
+            )
+        return try {
+            session.run(messages)
+        } catch (t: Throwable) {
+            Log.e(TAG, "chatRun(): threw", t)
+            BackendResult.Err(QuickAiError.INFERENCE_FAILED, t.message)
+        }
+    }
+
+    override fun chatRunStreaming(
+        messages: List<QuickAiChatMessage>,
+        sink: StreamSink
+    ): BackendResult<QuickAiChatResult> {
+        val session = activeSession
+        if (session == null) {
+            val err = BackendResult.Err(
+                QuickAiError.BAD_REQUEST,
+                "No active chat session — call openChatSession() first"
+            )
+            sink.onError(err.error, err.message)
+            return err
+        }
+        return try {
+            session.runStreaming(messages, sink)
+        } catch (t: Throwable) {
+            Log.e(TAG, "chatRunStreaming(): threw", t)
+            val err = BackendResult.Err(
+                QuickAiError.INFERENCE_FAILED,
+                t.message ?: "chat streaming failed"
+            )
+            sink.onError(err.error, err.message)
+            err
+        }
+    }
+
+    override fun chatCancel() {
+        activeSession?.cancel()
+            ?: Log.w(TAG, "chatCancel(): no active session")
+    }
+
+    override fun chatRebuild(
+        messages: List<QuickAiChatMessage>
+    ): BackendResult<Unit> {
+        val session = activeSession
+            ?: return BackendResult.Err(
+                QuickAiError.BAD_REQUEST,
+                "No active chat session — call openChatSession() first"
+            )
+        return try {
+            session.rebuild(messages)
+        } catch (t: Throwable) {
+            Log.e(TAG, "chatRebuild(): threw", t)
+            BackendResult.Err(QuickAiError.UNKNOWN, t.message)
+        }
     }
 
     /**

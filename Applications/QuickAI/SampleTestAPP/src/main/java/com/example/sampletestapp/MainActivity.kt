@@ -56,7 +56,6 @@ import com.example.quickdotai.PromptPart
 import com.example.quickdotai.QuickAiChatMessage
 import com.example.quickdotai.QuickAiChatRole
 import com.example.quickdotai.QuickAiChatSamplingConfig
-import com.example.quickdotai.QuickAiChatSession
 import com.example.quickdotai.QuickAiChatSessionConfig
 import com.example.quickdotai.QuickAiChatTemplateKwargs
 import com.example.quickdotai.QuantizationType
@@ -91,11 +90,6 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile
     private var loadedKey: String? = null
-
-    // --- Chat session state ----------------------------------------------
-
-    @Volatile
-    private var chatSession: QuickAiChatSession? = null
 
     // --- UI state -----------------------------------------------------
 
@@ -406,18 +400,14 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         // Fire-and-forget close on the engine thread so we don't leak the
         // native model handle / LiteRT-LM Engine on config changes.
-        val cs = chatSession
-        chatSession = null
+        // engine.close() internally closes any active chat session.
         val e = engine
         engine = null
         loadedKey = null
-        if (cs != null || e != null) {
+        if (e != null) {
             engineExecutor.execute {
                 try {
-                    cs?.close()
-                } catch (_: Throwable) { /* best effort */ }
-                try {
-                    e?.close()
+                    e.close()
                 } catch (_: Throwable) { /* best effort */ }
             }
         }
@@ -620,10 +610,9 @@ class MainActivity : AppCompatActivity() {
                 return@execute
             }
 
-            // Close existing session if any (callback handles engine cleanup).
-            chatSession?.let {
-                try { it.close() } catch (_: Throwable) {}
-                chatSession = null
+            // Close existing session if any.
+            if (e.chatSessionId != null) {
+                try { e.closeChatSession() } catch (_: Throwable) {}
             }
 
             // Build config from captured UI values
@@ -648,8 +637,7 @@ class MainActivity : AppCompatActivity() {
 
             when (val r = e.openChatSession(config)) {
                 is BackendResult.Ok -> {
-                    chatSession = r.value
-                    val sid = r.value.sessionId
+                    val sid = r.value
                     mainHandler.post {
                         chatSessionStatusView.text =
                             "Session: ${sid.take(8)}… (active)"
@@ -675,8 +663,8 @@ class MainActivity : AppCompatActivity() {
         setStatus("Chat streaming…")
 
         engineExecutor.execute {
-            val cs = chatSession
-            if (cs == null) {
+            val e = engine
+            if (e == null || e.chatSessionId == null) {
                 setStatus("No chat session — tap Open Chat Session first.")
                 return@execute
             }
@@ -696,7 +684,7 @@ class MainActivity : AppCompatActivity() {
                 QuickAiChatMessage(role = QuickAiChatRole.USER, parts = parts)
             )
             try {
-                when (val r = cs.runStreaming(messages, sink)) {
+                when (val r = e.chatRunStreaming(messages, sink)) {
                     is BackendResult.Ok -> {
                         setStatus(
                             "Chat done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)"
@@ -724,8 +712,8 @@ class MainActivity : AppCompatActivity() {
         setStatus("Chat running (blocking)…")
 
         engineExecutor.execute {
-            val cs = chatSession
-            if (cs == null) {
+            val e = engine
+            if (e == null || e.chatSessionId == null) {
                 setStatus("No chat session — tap Open Chat Session first.")
                 return@execute
             }
@@ -734,7 +722,7 @@ class MainActivity : AppCompatActivity() {
                 QuickAiChatMessage(role = QuickAiChatRole.USER, parts = parts)
             )
             try {
-                when (val r = cs.run(messages)) {
+                when (val r = e.chatRun(messages)) {
                     is BackendResult.Ok -> {
                         mainHandler.post { outputView.text = r.value.content }
                         setStatus(
@@ -752,25 +740,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onChatCancelClicked() {
-        val cs = chatSession
-        if (cs == null) {
+        val e = engine
+        if (e == null || e.chatSessionId == null) {
             setStatus("No active chat session.")
             return
         }
-        // cancel() is thread-safe — can be called from main thread
-        cs.cancel()
+        // chatCancel() is thread-safe — can be called from main thread
+        e.chatCancel()
         setStatus("Chat cancel requested.")
     }
 
     private fun onChatRebuildClicked() {
         setStatus("Rebuilding chat (clear history)…")
         engineExecutor.execute {
-            val cs = chatSession
-            if (cs == null) {
+            val e = engine
+            if (e == null || e.chatSessionId == null) {
                 setStatus("No active chat session.")
                 return@execute
             }
-            when (val r = cs.rebuild(emptyList())) {
+            when (val r = e.chatRebuild(emptyList())) {
                 is BackendResult.Ok -> {
                     setStatus("Chat history cleared. Session still active.")
                 }
@@ -784,19 +772,22 @@ class MainActivity : AppCompatActivity() {
     private fun onChatCloseClicked() {
         setStatus("Closing chat session…")
         engineExecutor.execute {
-            val cs = chatSession
-            if (cs == null) {
+            val e = engine
+            if (e == null || e.chatSessionId == null) {
                 setStatus("No active chat session.")
                 return@execute
             }
-            try {
-                cs.close()
-            } catch (_: Throwable) { /* best effort */ }
-            chatSession = null
-            mainHandler.post {
-                chatSessionStatusView.text = "Session: none"
+            when (val r = e.closeChatSession()) {
+                is BackendResult.Ok -> {
+                    mainHandler.post {
+                        chatSessionStatusView.text = "Session: none"
+                    }
+                    setStatus("Chat session closed.")
+                }
+                is BackendResult.Err -> {
+                    setStatus("Chat close failed: [${r.error.name}] ${r.message ?: ""}")
+                }
             }
-            setStatus("Chat session closed.")
         }
     }
 

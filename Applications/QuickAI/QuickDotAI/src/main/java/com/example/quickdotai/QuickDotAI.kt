@@ -129,6 +129,12 @@ interface QuickAiChatSession : AutoCloseable {
  * [runStreaming] / [metrics] calls, then [close] exactly once. Calling
  * [run] before [load] returns a [BackendResult.Err] with
  * [QuickAiError.NOT_INITIALIZED].
+ *
+ * **Chat session lifecycle:** [openChatSession] → [chatRun] /
+ * [chatRunStreaming] / [chatCancel] / [chatRebuild] → [closeChatSession].
+ * Only one session may be active at a time. While a chat session is
+ * active, the flat [run] / [runStreaming] / [runMultimodal] APIs are
+ * unavailable (their internal Conversation is released to the session).
  */
 interface QuickDotAI {
     /** @return a short identifier like "native" or "litert-lm". */
@@ -136,6 +142,13 @@ interface QuickDotAI {
 
     /** @return the architecture string reported by the engine, if any. */
     val architecture: String?
+
+    /**
+     * @return the sessionId of the currently active chat session, or
+     * null if no session is open.
+     */
+    val chatSessionId: String?
+        get() = null
 
     /**
      * @brief Load the model described by [req]. Must be called exactly
@@ -260,23 +273,85 @@ interface QuickDotAI {
      */
     fun metrics(): BackendResult<PerformanceMetrics>
 
+    // ----- Chat session API ------------------------------------------------
+    // All chat operations go through this interface so the app never needs
+    // to interact with QuickAiChatSession directly.
+
     /**
      * @brief Open a new structured chat session on this engine.
      *
      * Only **one** session may be active at a time (LiteRT-LM allows a
      * single Conversation per Engine). If a session is already open,
-     * this method returns [QuickAiError.BAD_REQUEST] — the caller must
-     * [QuickAiChatSession.close] the existing session first. The
-     * session maintains its own conversation history and image cache.
-     * The default implementation returns [QuickAiError.UNSUPPORTED];
-     * concrete engines override this to provide session management.
+     * this method returns [QuickAiError.BAD_REQUEST]. Returns the
+     * session ID on success.
      */
     fun openChatSession(
         config: QuickAiChatSessionConfig? = null
-    ): BackendResult<QuickAiChatSession> =
+    ): BackendResult<String> =
         BackendResult.Err(
             QuickAiError.UNSUPPORTED,
             "openChatSession is not supported by engine '$kind'."
+        )
+
+    /**
+     * @brief Close the active chat session, releasing its resources
+     * (conversation handle, cached images, etc.). After closing, the
+     * flat [run] / [runStreaming] APIs become usable again.
+     */
+    fun closeChatSession(): BackendResult<Unit> =
+        BackendResult.Err(
+            QuickAiError.UNSUPPORTED,
+            "closeChatSession is not supported by engine '$kind'."
+        )
+
+    /**
+     * @brief Send structured chat [messages] and return the assistant
+     * reply. Messages and the reply are accumulated in the session's
+     * internal history. Requires an active session opened via
+     * [openChatSession].
+     */
+    fun chatRun(
+        messages: List<QuickAiChatMessage>
+    ): BackendResult<QuickAiChatResult> =
+        BackendResult.Err(
+            QuickAiError.UNSUPPORTED,
+            "chatRun is not supported by engine '$kind'."
+        )
+
+    /**
+     * @brief Streaming variant of [chatRun]. Deltas are pushed through
+     * [sink]; the full assistant reply is returned on completion and
+     * also appended to the internal history.
+     */
+    fun chatRunStreaming(
+        messages: List<QuickAiChatMessage>,
+        sink: StreamSink
+    ): BackendResult<QuickAiChatResult> {
+        val err = BackendResult.Err(
+            QuickAiError.UNSUPPORTED,
+            "chatRunStreaming is not supported by engine '$kind'."
+        )
+        sink.onError(err.error, err.message)
+        return err
+    }
+
+    /**
+     * @brief Cancel an in-flight [chatRun] or [chatRunStreaming].
+     * Safe to call from any thread. No-op if no generation is running.
+     */
+    fun chatCancel() { /* no-op by default */ }
+
+    /**
+     * @brief Replace the active session's entire conversation history
+     * and rebuild internal engine state. Use this after history edits,
+     * sampling changes, or to recover from a failed/cancelled turn.
+     */
+    fun chatRebuild(
+        messages: List<QuickAiChatMessage>
+    ): BackendResult<Unit> =
+        BackendResult.Err(
+            QuickAiError.UNSUPPORTED,
+            "chatRebuild is not supported by engine '$kind'."
         )
 
     /**

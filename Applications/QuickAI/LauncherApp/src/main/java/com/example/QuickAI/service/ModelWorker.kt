@@ -19,11 +19,9 @@ import android.util.Log
 import com.example.quickdotai.BackendResult
 import com.example.quickdotai.QuickAiChatMessage
 import com.example.quickdotai.QuickAiChatResult
-import com.example.quickdotai.QuickAiChatSession
 import com.example.quickdotai.QuickAiChatSessionConfig
 import com.example.quickdotai.QuickDotAI
 import com.example.quickdotai.StreamSink
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -126,7 +124,6 @@ class ModelWorker(
     private val capacity: Int = DEFAULT_CAPACITY
 ) {
     private val queue = LinkedBlockingQueue<Job>(capacity)
-    private val chatSessions = ConcurrentHashMap<String, QuickAiChatSession>()
 
     @Volatile
     private var running: Boolean = false
@@ -344,14 +341,7 @@ class ModelWorker(
 
                     is Job.ChatOpen -> {
                         val r = try {
-                            when (val res = backend.openChatSession(job.config)) {
-                                is BackendResult.Ok -> {
-                                    val session = res.value
-                                    chatSessions[session.sessionId] = session
-                                    BackendResult.Ok(session.sessionId)
-                                }
-                                is BackendResult.Err -> res
-                            }
+                            backend.openChatSession(job.config)
                         } catch (t: Throwable) {
                             BackendResult.Err(QuickAiError.UNKNOWN, t.message)
                         }
@@ -359,15 +349,15 @@ class ModelWorker(
                     }
 
                     is Job.ChatRun -> {
-                        val session = chatSessions[job.sessionId]
-                        if (session == null) {
+                        val currentSid = backend.chatSessionId
+                        if (currentSid == null || currentSid != job.sessionId) {
                             job.onResult(BackendResult.Err(
                                 QuickAiError.BAD_REQUEST,
-                                "unknown session: ${job.sessionId}"
+                                "unknown or mismatched session: ${job.sessionId}"
                             ))
                         } else {
                             val r = try {
-                                session.run(job.messages)
+                                backend.chatRun(job.messages)
                             } catch (t: Throwable) {
                                 BackendResult.Err(QuickAiError.INFERENCE_FAILED, t.message)
                             }
@@ -376,11 +366,11 @@ class ModelWorker(
                     }
 
                     is Job.ChatRunStream -> {
-                        val session = chatSessions[job.sessionId]
-                        if (session == null) {
+                        val currentSid = backend.chatSessionId
+                        if (currentSid == null || currentSid != job.sessionId) {
                             job.sink.onError(
                                 QuickAiError.BAD_REQUEST,
-                                "unknown session: ${job.sessionId}"
+                                "unknown or mismatched session: ${job.sessionId}"
                             )
                         } else {
                             val sink = job.sink
@@ -395,7 +385,7 @@ class ModelWorker(
                                 }
                             }
                             try {
-                                session.runStreaming(job.messages, guard)
+                                backend.chatRunStreaming(job.messages, guard)
                             } catch (t: Throwable) {
                                 Log.e(TAG, "chatRunStream threw for ${job.sessionId}", t)
                                 if (!closed) {
@@ -413,28 +403,28 @@ class ModelWorker(
                     }
 
                     is Job.ChatCancel -> {
-                        val session = chatSessions[job.sessionId]
-                        if (session == null) {
+                        val currentSid = backend.chatSessionId
+                        if (currentSid == null || currentSid != job.sessionId) {
                             job.onResult(BackendResult.Err(
                                 QuickAiError.BAD_REQUEST,
-                                "unknown session: ${job.sessionId}"
+                                "unknown or mismatched session: ${job.sessionId}"
                             ))
                         } else {
-                            session.cancel()
+                            backend.chatCancel()
                             job.onResult(BackendResult.Ok(Unit))
                         }
                     }
 
                     is Job.ChatRebuild -> {
-                        val session = chatSessions[job.sessionId]
-                        if (session == null) {
+                        val currentSid = backend.chatSessionId
+                        if (currentSid == null || currentSid != job.sessionId) {
                             job.onResult(BackendResult.Err(
                                 QuickAiError.BAD_REQUEST,
-                                "unknown session: ${job.sessionId}"
+                                "unknown or mismatched session: ${job.sessionId}"
                             ))
                         } else {
                             val r = try {
-                                session.rebuild(job.messages)
+                                backend.chatRebuild(job.messages)
                             } catch (t: Throwable) {
                                 BackendResult.Err(QuickAiError.UNKNOWN, t.message)
                             }
@@ -443,19 +433,20 @@ class ModelWorker(
                     }
 
                     is Job.ChatClose -> {
-                        val session = chatSessions.remove(job.sessionId)
-                        if (session == null) {
+                        val currentSid = backend.chatSessionId
+                        if (currentSid == null || currentSid != job.sessionId) {
                             job.onResult(BackendResult.Err(
                                 QuickAiError.BAD_REQUEST,
-                                "unknown session: ${job.sessionId}"
+                                "unknown or mismatched session: ${job.sessionId}"
                             ))
                         } else {
-                            try {
-                                session.close()
+                            val r = try {
+                                backend.closeChatSession()
                             } catch (t: Throwable) {
-                                Log.w(TAG, "session.close() threw for ${job.sessionId}", t)
+                                Log.w(TAG, "closeChatSession threw for ${job.sessionId}", t)
+                                BackendResult.Err(QuickAiError.UNKNOWN, t.message)
                             }
-                            job.onResult(BackendResult.Ok(Unit))
+                            job.onResult(r)
                         }
                     }
 
@@ -479,11 +470,11 @@ class ModelWorker(
      * on their latches see a clear error instead of blocking forever.
      */
     private fun drainAndFail() {
-        // Close all chat sessions on shutdown
-        chatSessions.values.forEach {
-            try { it.close() } catch (_: Throwable) {}
+        // Close active chat session on shutdown (backend.close() handles
+        // the rest, but closing the session first is cleaner).
+        if (backend.chatSessionId != null) {
+            try { backend.closeChatSession() } catch (_: Throwable) {}
         }
-        chatSessions.clear()
 
         while (true) {
             val job = queue.poll() ?: break
