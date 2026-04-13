@@ -161,6 +161,22 @@ if get_option('enable-fp16')
      endif
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
+     # Android: apply SVE/SVE2/SME/SME2 defines based on enable-* options.
+     # The actual -march flag is set by jni/meson.build from JSON config.
+     # We still need the ENABLE_* defines for the interface C++ files
+     # (kleidiai_interface_qai8dxp_qsi4cxp.cpp uses #ifdef ENABLE_SME).
+     if get_option('enable-sve')
+       extra_defines += '-DENABLE_SVE=1'
+     endif
+     if get_option('enable-sve2')
+       extra_defines += '-DENABLE_SVE2=1'
+     endif
+     if get_option('enable-sme')
+       extra_defines += '-DENABLE_SME=1'
+     endif
+     if get_option('enable-sme2')
+       extra_defines += '-DENABLE_SME2=1'
+     endif
    elif arch == 'aarch64'
      ## About FP16 in GCC (from GCC-9.1 manual)
      # https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html
