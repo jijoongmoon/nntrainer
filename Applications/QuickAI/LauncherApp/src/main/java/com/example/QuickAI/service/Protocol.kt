@@ -28,6 +28,9 @@ typealias QuantizationType = com.example.quickdotai.QuantizationType
 typealias QuickAiError = com.example.quickdotai.QuickAiError
 typealias LoadModelRequest = com.example.quickdotai.LoadModelRequest
 typealias PerformanceMetrics = com.example.quickdotai.PerformanceMetrics
+typealias QuickAiChatSamplingConfig = com.example.quickdotai.QuickAiChatSamplingConfig
+typealias QuickAiChatTemplateKwargs = com.example.quickdotai.QuickAiChatTemplateKwargs
+typealias QuickAiChatSessionConfig = com.example.quickdotai.QuickAiChatSessionConfig
 
 /* -------------------------------------------------------------------- */
 /* setOptions                                                           */
@@ -151,6 +154,74 @@ data class ConnectResponse(
 data class ErrorResponse(
     @SerialName("error_code") val errorCode: Int,
     val message: String
+)
+
+/* -------------------------------------------------------------------- */
+/* Chat session DTOs                                                    */
+/* -------------------------------------------------------------------- */
+
+/**
+ * @brief One content part in a chat message, as carried over the wire.
+ *
+ * Image bytes are Base64-encoded so they survive JSON serialization.
+ * The dispatcher converts these to [com.example.quickdotai.PromptPart]
+ * at the boundary.
+ */
+@Serializable
+data class ChatContentPartDto(
+    val type: String, // "text", "image_file", "image_bytes"
+    val text: String? = null,
+    @SerialName("absolute_path") val absolutePath: String? = null,
+    @SerialName("image_base64") val imageBase64: String? = null
+)
+
+@Serializable
+data class ChatMessageDto(
+    val role: String, // "system", "user", "assistant"
+    val parts: List<ChatContentPartDto>
+)
+
+@Serializable
+data class ChatOpenRequest(
+    val config: QuickAiChatSessionConfig? = null
+)
+
+@Serializable
+data class ChatOpenResponse(
+    @SerialName("session_id") val sessionId: String,
+    @SerialName("error_code") val errorCode: Int = 0,
+    val message: String? = null
+)
+
+@Serializable
+data class ChatRunRequest(
+    @SerialName("session_id") val sessionId: String,
+    val messages: List<ChatMessageDto>
+)
+
+@Serializable
+data class ChatRunResponse(
+    val content: String? = null,
+    val metrics: PerformanceMetrics? = null,
+    @SerialName("error_code") val errorCode: Int = 0,
+    val message: String? = null
+)
+
+@Serializable
+data class ChatSessionIdRequest(
+    @SerialName("session_id") val sessionId: String
+)
+
+@Serializable
+data class ChatRebuildRequest(
+    @SerialName("session_id") val sessionId: String,
+    val messages: List<ChatMessageDto>
+)
+
+@Serializable
+data class ChatGenericResponse(
+    @SerialName("error_code") val errorCode: Int = 0,
+    val message: String? = null
 )
 
 /**

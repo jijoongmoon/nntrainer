@@ -17,8 +17,13 @@ package com.example.QuickAI.service
 
 import android.util.Log
 import com.example.quickdotai.BackendResult
+import com.example.quickdotai.QuickAiChatMessage
+import com.example.quickdotai.QuickAiChatResult
+import com.example.quickdotai.QuickAiChatSession
+import com.example.quickdotai.QuickAiChatSessionConfig
 import com.example.quickdotai.QuickDotAI
 import com.example.quickdotai.StreamSink
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -61,6 +66,41 @@ internal sealed class Job {
         val onResult: (BackendResult<PerformanceMetrics>) -> Unit
     ) : Job()
 
+    // --- Chat session jobs ---
+
+    class ChatOpen(
+        val config: QuickAiChatSessionConfig?,
+        val onResult: (BackendResult<String>) -> Unit // returns sessionId
+    ) : Job()
+
+    class ChatRun(
+        val sessionId: String,
+        val messages: List<QuickAiChatMessage>,
+        val onResult: (BackendResult<QuickAiChatResult>) -> Unit
+    ) : Job()
+
+    class ChatRunStream(
+        val sessionId: String,
+        val messages: List<QuickAiChatMessage>,
+        val sink: StreamSink
+    ) : Job()
+
+    class ChatCancel(
+        val sessionId: String,
+        val onResult: (BackendResult<Unit>) -> Unit
+    ) : Job()
+
+    class ChatRebuild(
+        val sessionId: String,
+        val messages: List<QuickAiChatMessage>,
+        val onResult: (BackendResult<Unit>) -> Unit
+    ) : Job()
+
+    class ChatClose(
+        val sessionId: String,
+        val onResult: (BackendResult<Unit>) -> Unit
+    ) : Job()
+
     /** Sentinel used to shut the worker down cleanly. */
     object Shutdown : Job()
 }
@@ -86,6 +126,7 @@ class ModelWorker(
     private val capacity: Int = DEFAULT_CAPACITY
 ) {
     private val queue = LinkedBlockingQueue<Job>(capacity)
+    private val chatSessions = ConcurrentHashMap<String, QuickAiChatSession>()
 
     @Volatile
     private var running: Boolean = false
@@ -154,6 +195,41 @@ class ModelWorker(
     fun submitMetrics(onResult: (BackendResult<PerformanceMetrics>) -> Unit): Boolean {
         return queue.offer(Job.Metrics(onResult))
     }
+
+    // --- Chat session submit methods ---
+
+    fun submitChatOpen(
+        config: QuickAiChatSessionConfig?,
+        onResult: (BackendResult<String>) -> Unit
+    ): Boolean = queue.offer(Job.ChatOpen(config, onResult))
+
+    fun submitChatRun(
+        sessionId: String,
+        messages: List<QuickAiChatMessage>,
+        onResult: (BackendResult<QuickAiChatResult>) -> Unit
+    ): Boolean = queue.offer(Job.ChatRun(sessionId, messages, onResult))
+
+    fun submitChatRunStream(
+        sessionId: String,
+        messages: List<QuickAiChatMessage>,
+        sink: StreamSink
+    ): Boolean = queue.offer(Job.ChatRunStream(sessionId, messages, sink))
+
+    fun submitChatCancel(
+        sessionId: String,
+        onResult: (BackendResult<Unit>) -> Unit
+    ): Boolean = queue.offer(Job.ChatCancel(sessionId, onResult))
+
+    fun submitChatRebuild(
+        sessionId: String,
+        messages: List<QuickAiChatMessage>,
+        onResult: (BackendResult<Unit>) -> Unit
+    ): Boolean = queue.offer(Job.ChatRebuild(sessionId, messages, onResult))
+
+    fun submitChatClose(
+        sessionId: String,
+        onResult: (BackendResult<Unit>) -> Unit
+    ): Boolean = queue.offer(Job.ChatClose(sessionId, onResult))
 
     /**
      * @brief Post the shutdown sentinel and join the worker thread. Any
@@ -263,6 +339,126 @@ class ModelWorker(
                         }
                         job.onResult(r)
                     }
+
+                    // --- Chat session jobs ---
+
+                    is Job.ChatOpen -> {
+                        val r = try {
+                            when (val res = backend.openChatSession(job.config)) {
+                                is BackendResult.Ok -> {
+                                    val session = res.value
+                                    chatSessions[session.sessionId] = session
+                                    BackendResult.Ok(session.sessionId)
+                                }
+                                is BackendResult.Err -> res
+                            }
+                        } catch (t: Throwable) {
+                            BackendResult.Err(QuickAiError.UNKNOWN, t.message)
+                        }
+                        job.onResult(r)
+                    }
+
+                    is Job.ChatRun -> {
+                        val session = chatSessions[job.sessionId]
+                        if (session == null) {
+                            job.onResult(BackendResult.Err(
+                                QuickAiError.BAD_REQUEST,
+                                "unknown session: ${job.sessionId}"
+                            ))
+                        } else {
+                            val r = try {
+                                session.run(job.messages)
+                            } catch (t: Throwable) {
+                                BackendResult.Err(QuickAiError.INFERENCE_FAILED, t.message)
+                            }
+                            job.onResult(r)
+                        }
+                    }
+
+                    is Job.ChatRunStream -> {
+                        val session = chatSessions[job.sessionId]
+                        if (session == null) {
+                            job.sink.onError(
+                                QuickAiError.BAD_REQUEST,
+                                "unknown session: ${job.sessionId}"
+                            )
+                        } else {
+                            val sink = job.sink
+                            var closed = false
+                            val guard = object : StreamSink {
+                                override fun onDelta(text: String) = sink.onDelta(text)
+                                override fun onDone() {
+                                    closed = true; sink.onDone()
+                                }
+                                override fun onError(error: QuickAiError, message: String?) {
+                                    closed = true; sink.onError(error, message)
+                                }
+                            }
+                            try {
+                                session.runStreaming(job.messages, guard)
+                            } catch (t: Throwable) {
+                                Log.e(TAG, "chatRunStream threw for ${job.sessionId}", t)
+                                if (!closed) {
+                                    guard.onError(QuickAiError.INFERENCE_FAILED, t.message)
+                                }
+                            } finally {
+                                if (!closed) {
+                                    guard.onError(
+                                        QuickAiError.UNKNOWN,
+                                        "chat stream terminated without completion"
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    is Job.ChatCancel -> {
+                        val session = chatSessions[job.sessionId]
+                        if (session == null) {
+                            job.onResult(BackendResult.Err(
+                                QuickAiError.BAD_REQUEST,
+                                "unknown session: ${job.sessionId}"
+                            ))
+                        } else {
+                            session.cancel()
+                            job.onResult(BackendResult.Ok(Unit))
+                        }
+                    }
+
+                    is Job.ChatRebuild -> {
+                        val session = chatSessions[job.sessionId]
+                        if (session == null) {
+                            job.onResult(BackendResult.Err(
+                                QuickAiError.BAD_REQUEST,
+                                "unknown session: ${job.sessionId}"
+                            ))
+                        } else {
+                            val r = try {
+                                session.rebuild(job.messages)
+                            } catch (t: Throwable) {
+                                BackendResult.Err(QuickAiError.UNKNOWN, t.message)
+                            }
+                            job.onResult(r)
+                        }
+                    }
+
+                    is Job.ChatClose -> {
+                        val session = chatSessions.remove(job.sessionId)
+                        if (session == null) {
+                            job.onResult(BackendResult.Err(
+                                QuickAiError.BAD_REQUEST,
+                                "unknown session: ${job.sessionId}"
+                            ))
+                        } else {
+                            try {
+                                session.close()
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "session.close() threw for ${job.sessionId}", t)
+                            }
+                            job.onResult(BackendResult.Ok(Unit))
+                        }
+                    }
+
                     is Job.Shutdown -> {
                         break
                     }
@@ -283,22 +479,32 @@ class ModelWorker(
      * on their latches see a clear error instead of blocking forever.
      */
     private fun drainAndFail() {
+        // Close all chat sessions on shutdown
+        chatSessions.values.forEach {
+            try { it.close() } catch (_: Throwable) {}
+        }
+        chatSessions.clear()
+
         while (true) {
             val job = queue.poll() ?: break
+            val shutdownErr = BackendResult.Err(
+                QuickAiError.NOT_INITIALIZED, "worker shutting down"
+            )
             when (job) {
-                is Job.Load -> job.onResult(
-                    BackendResult.Err(QuickAiError.NOT_INITIALIZED, "worker shutting down")
-                )
-                is Job.Run -> job.onResult(
-                    BackendResult.Err(QuickAiError.NOT_INITIALIZED, "worker shutting down")
-                )
+                is Job.Load -> job.onResult(shutdownErr)
+                is Job.Run -> job.onResult(shutdownErr)
                 is Job.RunStream -> job.sink.onError(
-                    QuickAiError.NOT_INITIALIZED,
-                    "worker shutting down"
+                    QuickAiError.NOT_INITIALIZED, "worker shutting down"
                 )
-                is Job.Metrics -> job.onResult(
-                    BackendResult.Err(QuickAiError.NOT_INITIALIZED, "worker shutting down")
+                is Job.Metrics -> job.onResult(shutdownErr)
+                is Job.ChatOpen -> job.onResult(shutdownErr)
+                is Job.ChatRun -> job.onResult(shutdownErr)
+                is Job.ChatRunStream -> job.sink.onError(
+                    QuickAiError.NOT_INITIALIZED, "worker shutting down"
                 )
+                is Job.ChatCancel -> job.onResult(shutdownErr)
+                is Job.ChatRebuild -> job.onResult(shutdownErr)
+                is Job.ChatClose -> job.onResult(shutdownErr)
                 Job.Shutdown -> { /* ignore */ }
             }
         }

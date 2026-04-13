@@ -65,6 +65,60 @@ interface StreamSink {
 }
 
 /**
+ * @brief A live chat session created by [QuickDotAI.openChatSession].
+ *
+ * The session accumulates conversation history internally. Callers
+ * send new [QuickAiChatMessage]s and the backend appends them plus
+ * the assistant reply to the running history. Multiple sessions may
+ * coexist on the same loaded model.
+ *
+ * Threading: a session is NOT internally thread-safe. The host must
+ * drive it from a single worker thread — the same contract as the
+ * owning [QuickDotAI] instance. [cancel] is the only method safe to
+ * call from an external thread.
+ */
+interface QuickAiChatSession : AutoCloseable {
+    /** Unique identifier for this session. */
+    val sessionId: String
+
+    /**
+     * @brief Append [messages] to the conversation, run inference, and
+     * return the assistant's reply. The new user messages AND the
+     * assistant reply are persisted in the session's internal history.
+     */
+    fun run(messages: List<QuickAiChatMessage>): BackendResult<QuickAiChatResult>
+
+    /**
+     * @brief Streaming variant of [run]. Deltas are pushed through
+     * [sink]; the full assistant reply is returned on completion and
+     * also appended to the internal history.
+     */
+    fun runStreaming(
+        messages: List<QuickAiChatMessage>,
+        sink: StreamSink
+    ): BackendResult<QuickAiChatResult>
+
+    /**
+     * @brief Cancel an in-flight [run] or [runStreaming]. Safe to call
+     * from any thread.
+     */
+    fun cancel()
+
+    /**
+     * @brief Replace the entire conversation history and rebuild
+     * internal engine state. Use this after history edits, sampling
+     * changes, or to recover from a failed/cancelled turn.
+     */
+    fun rebuild(messages: List<QuickAiChatMessage>): BackendResult<Unit>
+
+    /**
+     * @brief Close the session, releasing its resources (conversation
+     * handle, cached images, etc.). Idempotent.
+     */
+    override fun close()
+}
+
+/**
  * @brief Common interface implemented by every QuickDotAI engine.
  *
  * Lifecycle: [load] exactly once, then any number of [run] /
@@ -201,6 +255,22 @@ interface QuickDotAI {
      * @brief Fetch performance metrics for the most recent run.
      */
     fun metrics(): BackendResult<PerformanceMetrics>
+
+    /**
+     * @brief Open a new structured chat session on this engine.
+     *
+     * Multiple sessions may coexist on the same loaded model. Each
+     * session maintains its own conversation history and image cache.
+     * The default implementation returns [QuickAiError.UNSUPPORTED];
+     * concrete engines override this to provide session management.
+     */
+    fun openChatSession(
+        config: QuickAiChatSessionConfig? = null
+    ): BackendResult<QuickAiChatSession> =
+        BackendResult.Err(
+            QuickAiError.UNSUPPORTED,
+            "openChatSession is not supported by engine '$kind'."
+        )
 
     /**
      * @brief Release all resources. Idempotent — safe to call more

@@ -32,6 +32,14 @@ sealed class Request {
     data class RunModelStream(val modelId: String, val body: RunModelRequest) : Request()
     data class GetMetrics(val modelId: String) : Request()
     data class UnloadModel(val modelId: String) : Request()
+
+    // Chat session requests
+    data class ChatOpen(val modelId: String, val body: ChatOpenRequest) : Request()
+    data class ChatRun(val modelId: String, val body: ChatRunRequest) : Request()
+    data class ChatRunStream(val modelId: String, val body: ChatRunRequest) : Request()
+    data class ChatCancel(val modelId: String, val body: ChatSessionIdRequest) : Request()
+    data class ChatRebuild(val modelId: String, val body: ChatRebuildRequest) : Request()
+    data class ChatClose(val modelId: String, val body: ChatSessionIdRequest) : Request()
 }
 
 /**
@@ -101,6 +109,13 @@ class RequestDispatcher(
             is Request.GetMetrics -> handleGetMetrics(request.modelId)
 
             is Request.UnloadModel -> handleUnload(request.modelId)
+
+            is Request.ChatOpen -> handleChatOpen(request.modelId, request.body)
+            is Request.ChatRun -> handleChatRun(request.modelId, request.body)
+            is Request.ChatRunStream -> handleChatRunStream(request.modelId, request.body)
+            is Request.ChatCancel -> handleChatCancel(request.modelId, request.body)
+            is Request.ChatRebuild -> handleChatRebuild(request.modelId, request.body)
+            is Request.ChatClose -> handleChatClose(request.modelId, request.body)
         }
     } catch (t: Throwable) {
         Log.e(TAG, "dispatch threw", t)
@@ -257,7 +272,211 @@ class RequestDispatcher(
         }
     }
 
+    /* ---------------- chat: open ---------------- */
+
+    private fun handleChatOpen(modelId: String, body: ChatOpenRequest): Response {
+        val worker = registry.get(modelId)
+            ?: return errorJson(404, QuickAiError.MODEL_NOT_FOUND, "no such model: $modelId")
+
+        val latch = CountDownLatch(1)
+        var outcome: BackendResult<String> = BackendResult.Err(QuickAiError.UNKNOWN)
+
+        val accepted = worker.submitChatOpen(body.config) { res ->
+            outcome = res
+            latch.countDown()
+        }
+        if (!accepted) return errorJson(503, QuickAiError.QUEUE_FULL, "worker queue full")
+        if (!latch.await(requestTimeoutMs, TimeUnit.MILLISECONDS)) {
+            return errorJson(504, QuickAiError.UNKNOWN, "worker timeout")
+        }
+        return when (val r = outcome) {
+            is BackendResult.Ok -> okJson(
+                ChatOpenResponse(sessionId = r.value, errorCode = 0)
+            )
+            is BackendResult.Err -> errorJson(
+                httpStatusFor(r.error), r.error, r.message ?: "chat open failed"
+            )
+        }
+    }
+
+    /* ---------------- chat: run ---------------- */
+
+    private fun handleChatRun(modelId: String, body: ChatRunRequest): Response {
+        val worker = registry.get(modelId)
+            ?: return errorJson(404, QuickAiError.MODEL_NOT_FOUND, "no such model: $modelId")
+
+        val messages = try {
+            body.messages.map { it.toDomain() }
+        } catch (t: Throwable) {
+            return errorJson(400, QuickAiError.BAD_REQUEST, "bad message: ${t.message}")
+        }
+
+        val latch = CountDownLatch(1)
+        var outcome: BackendResult<com.example.quickdotai.QuickAiChatResult> =
+            BackendResult.Err(QuickAiError.UNKNOWN)
+
+        val accepted = worker.submitChatRun(body.sessionId, messages) { res ->
+            outcome = res
+            latch.countDown()
+        }
+        if (!accepted) return errorJson(503, QuickAiError.QUEUE_FULL, "worker queue full")
+        if (!latch.await(requestTimeoutMs, TimeUnit.MILLISECONDS)) {
+            return errorJson(504, QuickAiError.UNKNOWN, "worker timeout")
+        }
+        return when (val r = outcome) {
+            is BackendResult.Ok -> okJson(
+                ChatRunResponse(
+                    content = r.value.content,
+                    metrics = r.value.metrics,
+                    errorCode = 0
+                )
+            )
+            is BackendResult.Err -> errorJson(
+                httpStatusFor(r.error), r.error, r.message ?: "chat run failed"
+            )
+        }
+    }
+
+    /* ---------------- chat: run_stream ---------------- */
+
+    private fun handleChatRunStream(modelId: String, body: ChatRunRequest): Response {
+        val worker = registry.get(modelId)
+            ?: return errorJson(404, QuickAiError.MODEL_NOT_FOUND, "no such model: $modelId")
+
+        val messages = try {
+            body.messages.map { it.toDomain() }
+        } catch (t: Throwable) {
+            return errorJson(400, QuickAiError.BAD_REQUEST, "bad message: ${t.message}")
+        }
+
+        val sink = ChunkedStreamSink()
+        val accepted = worker.submitChatRunStream(body.sessionId, messages, sink)
+        if (!accepted) return errorJson(503, QuickAiError.QUEUE_FULL, "worker queue full")
+        return Response.Chunked(
+            status = 200,
+            contentType = "application/x-ndjson",
+            body = sink.inputStream
+        )
+    }
+
+    /* ---------------- chat: cancel ---------------- */
+
+    private fun handleChatCancel(modelId: String, body: ChatSessionIdRequest): Response {
+        val worker = registry.get(modelId)
+            ?: return errorJson(404, QuickAiError.MODEL_NOT_FOUND, "no such model: $modelId")
+
+        val latch = CountDownLatch(1)
+        var outcome: BackendResult<Unit> = BackendResult.Err(QuickAiError.UNKNOWN)
+
+        val accepted = worker.submitChatCancel(body.sessionId) { res ->
+            outcome = res
+            latch.countDown()
+        }
+        if (!accepted) return errorJson(503, QuickAiError.QUEUE_FULL, "worker queue full")
+        if (!latch.await(requestTimeoutMs, TimeUnit.MILLISECONDS)) {
+            return errorJson(504, QuickAiError.UNKNOWN, "worker timeout")
+        }
+        return when (val r = outcome) {
+            is BackendResult.Ok -> okJson(ChatGenericResponse(errorCode = 0))
+            is BackendResult.Err -> errorJson(
+                httpStatusFor(r.error), r.error, r.message ?: "chat cancel failed"
+            )
+        }
+    }
+
+    /* ---------------- chat: rebuild ---------------- */
+
+    private fun handleChatRebuild(modelId: String, body: ChatRebuildRequest): Response {
+        val worker = registry.get(modelId)
+            ?: return errorJson(404, QuickAiError.MODEL_NOT_FOUND, "no such model: $modelId")
+
+        val messages = try {
+            body.messages.map { it.toDomain() }
+        } catch (t: Throwable) {
+            return errorJson(400, QuickAiError.BAD_REQUEST, "bad message: ${t.message}")
+        }
+
+        val latch = CountDownLatch(1)
+        var outcome: BackendResult<Unit> = BackendResult.Err(QuickAiError.UNKNOWN)
+
+        val accepted = worker.submitChatRebuild(body.sessionId, messages) { res ->
+            outcome = res
+            latch.countDown()
+        }
+        if (!accepted) return errorJson(503, QuickAiError.QUEUE_FULL, "worker queue full")
+        if (!latch.await(requestTimeoutMs, TimeUnit.MILLISECONDS)) {
+            return errorJson(504, QuickAiError.UNKNOWN, "worker timeout")
+        }
+        return when (val r = outcome) {
+            is BackendResult.Ok -> okJson(ChatGenericResponse(errorCode = 0))
+            is BackendResult.Err -> errorJson(
+                httpStatusFor(r.error), r.error, r.message ?: "chat rebuild failed"
+            )
+        }
+    }
+
+    /* ---------------- chat: close ---------------- */
+
+    private fun handleChatClose(modelId: String, body: ChatSessionIdRequest): Response {
+        val worker = registry.get(modelId)
+            ?: return errorJson(404, QuickAiError.MODEL_NOT_FOUND, "no such model: $modelId")
+
+        val latch = CountDownLatch(1)
+        var outcome: BackendResult<Unit> = BackendResult.Err(QuickAiError.UNKNOWN)
+
+        val accepted = worker.submitChatClose(body.sessionId) { res ->
+            outcome = res
+            latch.countDown()
+        }
+        if (!accepted) return errorJson(503, QuickAiError.QUEUE_FULL, "worker queue full")
+        if (!latch.await(requestTimeoutMs, TimeUnit.MILLISECONDS)) {
+            return errorJson(504, QuickAiError.UNKNOWN, "worker timeout")
+        }
+        return when (val r = outcome) {
+            is BackendResult.Ok -> okJson(ChatGenericResponse(errorCode = 0))
+            is BackendResult.Err -> errorJson(
+                httpStatusFor(r.error), r.error, r.message ?: "chat close failed"
+            )
+        }
+    }
+
     /* ---------------- helpers ---------------- */
+
+    /**
+     * @brief Convert a wire-format [ChatMessageDto] to the domain
+     * [com.example.quickdotai.QuickAiChatMessage].
+     */
+    private fun ChatMessageDto.toDomain(): com.example.quickdotai.QuickAiChatMessage {
+        val chatRole = when (role.lowercase()) {
+            "system" -> com.example.quickdotai.QuickAiChatRole.SYSTEM
+            "user" -> com.example.quickdotai.QuickAiChatRole.USER
+            "assistant" -> com.example.quickdotai.QuickAiChatRole.ASSISTANT
+            else -> throw IllegalArgumentException("unknown role: $role")
+        }
+        val domainParts = parts.map { p ->
+            when (p.type) {
+                "text" -> com.example.quickdotai.PromptPart.Text(
+                    p.text ?: throw IllegalArgumentException("text part missing 'text'")
+                )
+                "image_file" -> com.example.quickdotai.PromptPart.ImageFile(
+                    p.absolutePath
+                        ?: throw IllegalArgumentException("image_file part missing 'absolute_path'")
+                )
+                "image_bytes" -> {
+                    val b64 = p.imageBase64
+                        ?: throw IllegalArgumentException("image_bytes part missing 'image_base64'")
+                    com.example.quickdotai.PromptPart.ImageBytes(
+                        android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                    )
+                }
+                else -> throw IllegalArgumentException("unknown part type: ${p.type}")
+            }
+        }
+        return com.example.quickdotai.QuickAiChatMessage(
+            role = chatRole,
+            parts = domainParts
+        )
+    }
 
     private inline fun <reified T> okJson(body: T): Response =
         Response.Json(200, json.encodeToString(body))

@@ -257,7 +257,29 @@ class NativeQuickDotAI : QuickDotAI {
         }
     }
 
+    // --- chat session (dummy) --------------------------------------------
+
+    private val sessions = java.util.concurrent.ConcurrentHashMap<String, NativeChatSession>()
+
+    override fun openChatSession(
+        config: QuickAiChatSessionConfig?
+    ): BackendResult<QuickAiChatSession> {
+        if (!loaded || handle == 0L) {
+            return BackendResult.Err(
+                QuickAiError.NOT_INITIALIZED,
+                "NativeQuickDotAI has not been loaded yet"
+            )
+        }
+        val session = NativeChatSession()
+        sessions[session.sessionId] = session
+        Log.i(TAG, "openChatSession(): created dummy session ${session.sessionId}")
+        return BackendResult.Ok(session)
+    }
+
     override fun close() {
+        // Close all chat sessions first
+        sessions.values.forEach { it.close() }
+        sessions.clear()
         if (handle != 0L) {
             try {
                 NativeCausalLm.destroyModelHandleNative(handle)

@@ -172,6 +172,130 @@ class QuickAiClient(
         }
     }
 
+    // --- Chat session methods ---
+
+    suspend fun chatOpen(
+        modelId: String,
+        config: ChatSessionConfig? = null
+    ): ApiResult<ChatOpenResponse> =
+        postJson(
+            "/v1/models/$modelId/chat/open",
+            ChatOpenRequest(config),
+            ChatOpenRequest.serializer(),
+            ChatOpenResponse.serializer()
+        )
+
+    suspend fun chatRun(
+        modelId: String,
+        sessionId: String,
+        messages: List<ChatMessageDto>
+    ): ApiResult<ChatRunResponse> =
+        postJson(
+            "/v1/models/$modelId/chat/run",
+            ChatRunRequest(sessionId, messages),
+            ChatRunRequest.serializer(),
+            ChatRunResponse.serializer()
+        )
+
+    suspend fun chatRunStreaming(
+        modelId: String,
+        sessionId: String,
+        messages: List<ChatMessageDto>,
+        onChunk: suspend (StreamChunk) -> Unit
+    ): ApiResult<Unit> = withContext(Dispatchers.IO) {
+        val reqBody = json.encodeToString(
+            ChatRunRequest.serializer(),
+            ChatRunRequest(sessionId, messages)
+        ).toRequestBody("application/json".toMediaType())
+        val request = Request.Builder()
+            .url("$base/v1/models/$modelId/chat/run_stream")
+            .post(reqBody)
+            .build()
+        try {
+            http.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    val bodyStr = response.body?.string().orEmpty()
+                    val err = runCatching {
+                        json.decodeFromString(ErrorResponse.serializer(), bodyStr)
+                    }.getOrNull()
+                    return@withContext ApiResult.Err(
+                        errorCode = err?.errorCode ?: response.code,
+                        message = err?.message ?: "HTTP ${response.code}"
+                    )
+                }
+                val source = response.body?.source()
+                    ?: return@withContext ApiResult.Err(-1, "empty response body")
+
+                var terminalError: ApiResult.Err? = null
+                while (!source.exhausted()) {
+                    val line = try {
+                        source.readUtf8LineStrict()
+                    } catch (io: IOException) {
+                        return@withContext ApiResult.Err(-1, "stream read error: ${io.message}")
+                    }
+                    if (line.isEmpty()) continue
+                    val frame = try {
+                        json.decodeFromString(StreamFrame.serializer(), line)
+                    } catch (t: Throwable) {
+                        return@withContext ApiResult.Err(-1, "bad frame: ${t.message}")
+                    }
+                    when (frame.type) {
+                        "delta" -> onChunk(StreamChunk.Delta(frame.text ?: continue))
+                        "done" -> {
+                            onChunk(StreamChunk.Done(frame.durationMs))
+                            return@withContext ApiResult.Ok(Unit)
+                        }
+                        "error" -> {
+                            val code = frame.errorCode ?: -1
+                            val msg = frame.message ?: "stream error"
+                            onChunk(StreamChunk.Error(code, msg))
+                            terminalError = ApiResult.Err(code, msg)
+                        }
+                    }
+                }
+                terminalError ?: ApiResult.Err(-1, "stream ended without done frame")
+            }
+        } catch (io: IOException) {
+            ApiResult.Err(-1, "network error: ${io.message}")
+        }
+    }
+
+    suspend fun chatCancel(
+        modelId: String,
+        sessionId: String
+    ): ApiResult<ChatGenericResponse> =
+        postJson(
+            "/v1/models/$modelId/chat/cancel",
+            ChatSessionIdRequest(sessionId),
+            ChatSessionIdRequest.serializer(),
+            ChatGenericResponse.serializer()
+        )
+
+    suspend fun chatRebuild(
+        modelId: String,
+        sessionId: String,
+        messages: List<ChatMessageDto>
+    ): ApiResult<ChatGenericResponse> =
+        postJson(
+            "/v1/models/$modelId/chat/rebuild",
+            ChatRebuildRequest(sessionId, messages),
+            ChatRebuildRequest.serializer(),
+            ChatGenericResponse.serializer()
+        )
+
+    suspend fun chatClose(
+        modelId: String,
+        sessionId: String
+    ): ApiResult<ChatGenericResponse> =
+        postJson(
+            "/v1/models/$modelId/chat/close",
+            ChatSessionIdRequest(sessionId),
+            ChatSessionIdRequest.serializer(),
+            ChatGenericResponse.serializer()
+        )
+
+    // --- existing methods ---
+
     suspend fun getMetrics(modelId: String): ApiResult<PerformanceMetricsResponse> =
         get("/v1/models/$modelId/metrics", PerformanceMetricsResponse.serializer())
 

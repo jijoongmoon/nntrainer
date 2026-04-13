@@ -71,6 +71,10 @@ class LiteRTLm(
     private var initializationDurationMs: Double = 0.0
     private var lastRunDurationMs: Double = 0.0
 
+    // Active chat sessions keyed by sessionId. Cleaned up on
+    // unload/close.
+    private val chatSessions = java.util.concurrent.ConcurrentHashMap<String, LiteRTLmChatSession>()
+
     override fun load(req: LoadModelRequest): BackendResult<Unit> {
         Log.i(
             TAG,
@@ -135,11 +139,12 @@ class LiteRTLm(
             backend = llmBackend,
             visionBackend = visionLlmBackend,
             cacheDir = req.cacheDir,
+            maxNumTokens = req.maxNumTokens,
         )
         Log.i(
             TAG,
-            "load(): EngineConfig built (cacheDir=${req.cacheDir}), " +
-                "constructing Engine…"
+            "load(): EngineConfig built (cacheDir=${req.cacheDir}, " +
+                "maxNumTokens=${req.maxNumTokens}), constructing Engine…"
         )
 
         return try {
@@ -537,8 +542,62 @@ class LiteRTLm(
         }
     }
 
+    // --- chat session management -----------------------------------------
+
+    override fun openChatSession(
+        config: QuickAiChatSessionConfig?
+    ): BackendResult<QuickAiChatSession> {
+        val e = engine
+            ?: return BackendResult.Err(
+                QuickAiError.NOT_INITIALIZED,
+                "LiteRTLm has not been loaded yet"
+            )
+
+        return try {
+            val session = LiteRTLmChatSession(
+                engine = e,
+                config = config,
+                visionEnabled = visionEnabled
+            )
+            chatSessions[session.sessionId] = session
+            Log.i(
+                TAG,
+                "openChatSession(): created session ${session.sessionId} " +
+                    "(total active=${chatSessions.size})"
+            )
+            BackendResult.Ok(session)
+        } catch (t: Throwable) {
+            Log.e(TAG, "openChatSession(): failed", t)
+            BackendResult.Err(
+                QuickAiError.INFERENCE_FAILED,
+                t.message ?: "failed to create chat session"
+            )
+        }
+    }
+
+    /** Close a specific chat session by id. */
+    fun closeChatSession(sessionId: String): Boolean {
+        val session = chatSessions.remove(sessionId) ?: return false
+        session.close()
+        Log.i(TAG, "closeChatSession($sessionId): closed, remaining=${chatSessions.size}")
+        return true
+    }
+
+    /** Retrieve a chat session by id. */
+    fun getChatSession(sessionId: String): LiteRTLmChatSession? = chatSessions[sessionId]
+
+    /** Close all active chat sessions. */
+    private fun closeAllChatSessions() {
+        if (chatSessions.isNotEmpty()) {
+            Log.i(TAG, "closeAllChatSessions(): closing ${chatSessions.size} session(s)")
+            chatSessions.values.forEach { it.close() }
+            chatSessions.clear()
+        }
+    }
+
     override fun unload(): BackendResult<Unit> {
         Log.i(TAG, "unload() invoked")
+        closeAllChatSessions()
         closeQuietly()
         return BackendResult.Ok(Unit)
     }
@@ -564,6 +623,7 @@ class LiteRTLm(
 
     override fun close() {
         Log.i(TAG, "close() invoked")
+        closeAllChatSessions()
         closeQuietly()
     }
 

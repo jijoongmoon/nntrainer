@@ -129,6 +129,17 @@ data class LoadModelRequest(
      * add the corresponding field back to this request.)
      */
     @SerialName("cache_dir") val cacheDir: String? = null,
+
+    /**
+     * Maximum number of tokens the engine should allocate for the KV
+     * cache / context window. This is a load-sensitive setting — it must
+     * be known at engine-construction time and cannot be changed per
+     * request. Null = engine default.
+     *
+     * Honored by [LiteRTLm] (maps to EngineConfig.maxNumTokens) and
+     * ignored by [NativeQuickDotAI].
+     */
+    @SerialName("max_num_tokens") val maxNumTokens: Int? = null,
 ) {
     /**
      * Canonical key shared across the stack: one worker/handle per
@@ -204,6 +215,82 @@ sealed class PromptPart {
  *    [totalDurationMs] because the LiteRT-LM Kotlin API does not expose
  *    token-level counters in the release we target.
  */
+/* -------------------------------------------------------------------- */
+/* Structured Chat / Session types (request-mail1 §1–§5, mail2 §6)      */
+/* -------------------------------------------------------------------- */
+
+/**
+ * @brief Role within a structured chat conversation.
+ */
+enum class QuickAiChatRole {
+    SYSTEM,
+    USER,
+    ASSISTANT
+}
+
+/**
+ * @brief Sampling configuration applied to a chat session.
+ *
+ * LiteRT-LM may not honor every field in the current release. The
+ * wrapper accepts them unconditionally so callers can express intent
+ * without version-checking the underlying engine.
+ */
+@Serializable
+data class QuickAiChatSamplingConfig(
+    val temperature: Double? = null,
+    @SerialName("top_k") val topK: Int? = null,
+    @SerialName("top_p") val topP: Double? = null,
+    @SerialName("min_p") val minP: Double? = null,
+    @SerialName("max_tokens") val maxTokens: Int? = null,
+    val seed: Int? = null
+)
+
+/**
+ * @brief Template keyword arguments forwarded to the chat template
+ * renderer. [enableThinking] controls whether the model's "thinking"
+ * prompt preamble is activated. The response schema is unchanged —
+ * no separate reasoning field is introduced.
+ */
+@Serializable
+data class QuickAiChatTemplateKwargs(
+    @SerialName("enable_thinking") val enableThinking: Boolean? = null
+)
+
+/**
+ * @brief Configuration for a new chat session, passed to
+ * [QuickDotAI.openChatSession].
+ */
+@Serializable
+data class QuickAiChatSessionConfig(
+    val sampling: QuickAiChatSamplingConfig? = null,
+    @SerialName("chat_template_kwargs") val chatTemplateKwargs: QuickAiChatTemplateKwargs? = null
+)
+
+/**
+ * @brief One message in a structured chat conversation.
+ *
+ * The [parts] list may contain text, image files, or raw image bytes
+ * in any order — the backend preserves insertion order. For text-only
+ * turns, a single [PromptPart.Text] suffices.
+ */
+data class QuickAiChatMessage(
+    val role: QuickAiChatRole,
+    val parts: List<PromptPart>
+)
+
+/**
+ * @brief Result returned by [QuickAiChatSession.run] /
+ * [QuickAiChatSession.runStreaming].
+ */
+data class QuickAiChatResult(
+    val content: String,
+    val metrics: PerformanceMetrics? = null
+)
+
+/* -------------------------------------------------------------------- */
+/* Performance metrics                                                  */
+/* -------------------------------------------------------------------- */
+
 @Serializable
 data class PerformanceMetrics(
     @SerialName("prefill_tokens") val prefillTokens: Int = 0,

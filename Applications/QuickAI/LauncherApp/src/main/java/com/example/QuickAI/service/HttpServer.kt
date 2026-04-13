@@ -173,6 +173,69 @@ class HttpServer(
                 return Request.UnloadModel(m.groupValues[1])
             }
         }
+
+        // --- Chat session endpoints ---
+
+        // POST /v1/models/{id}/chat/open
+        Regex("""^/v1/models/([^/]+)/chat/open$""").matchEntire(uri)?.let { m ->
+            if (method == NanoHTTPD.Method.POST) {
+                val body = readBody(session)
+                val req = if (body.isBlank()) ChatOpenRequest()
+                    else json.decodeFromString<ChatOpenRequest>(body)
+                return Request.ChatOpen(m.groupValues[1], req)
+            }
+        }
+        // POST /v1/models/{id}/chat/run
+        Regex("""^/v1/models/([^/]+)/chat/run$""").matchEntire(uri)?.let { m ->
+            if (method == NanoHTTPD.Method.POST) {
+                val body = readBody(session)
+                return Request.ChatRun(
+                    m.groupValues[1],
+                    json.decodeFromString<ChatRunRequest>(body)
+                )
+            }
+        }
+        // POST /v1/models/{id}/chat/run_stream
+        Regex("""^/v1/models/([^/]+)/chat/run_stream$""").matchEntire(uri)?.let { m ->
+            if (method == NanoHTTPD.Method.POST) {
+                val body = readBody(session)
+                return Request.ChatRunStream(
+                    m.groupValues[1],
+                    json.decodeFromString<ChatRunRequest>(body)
+                )
+            }
+        }
+        // POST /v1/models/{id}/chat/cancel
+        Regex("""^/v1/models/([^/]+)/chat/cancel$""").matchEntire(uri)?.let { m ->
+            if (method == NanoHTTPD.Method.POST) {
+                val body = readBody(session)
+                return Request.ChatCancel(
+                    m.groupValues[1],
+                    json.decodeFromString<ChatSessionIdRequest>(body)
+                )
+            }
+        }
+        // POST /v1/models/{id}/chat/rebuild
+        Regex("""^/v1/models/([^/]+)/chat/rebuild$""").matchEntire(uri)?.let { m ->
+            if (method == NanoHTTPD.Method.POST) {
+                val body = readBody(session)
+                return Request.ChatRebuild(
+                    m.groupValues[1],
+                    json.decodeFromString<ChatRebuildRequest>(body)
+                )
+            }
+        }
+        // POST /v1/models/{id}/chat/close
+        Regex("""^/v1/models/([^/]+)/chat/close$""").matchEntire(uri)?.let { m ->
+            if (method == NanoHTTPD.Method.POST) {
+                val body = readBody(session)
+                return Request.ChatClose(
+                    m.groupValues[1],
+                    json.decodeFromString<ChatSessionIdRequest>(body)
+                )
+            }
+        }
+
         return null
     }
 

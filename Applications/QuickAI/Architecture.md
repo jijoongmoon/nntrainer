@@ -114,6 +114,12 @@ state (see §3 on parallelism).
 | GET    | `/v1/models`                      | (service-only)              | lists loaded models |
 | POST   | `/v1/connect`                     | (service-only)              | explicit handshake (test) |
 | GET    | `/v1/health`                      | (service-only)              | liveness probe |
+| POST   | `/v1/models/{id}/chat/open`       | `openChatSession`           | returns `{session_id}` |
+| POST   | `/v1/models/{id}/chat/run`        | `chatSession.run`           | structured chat inference |
+| POST   | `/v1/models/{id}/chat/run_stream` | `chatSession.runStreaming`  | structured chat NDJSON stream |
+| POST   | `/v1/models/{id}/chat/cancel`     | `chatSession.cancel`        | cancel in-flight generation |
+| POST   | `/v1/models/{id}/chat/rebuild`    | `chatSession.rebuild`       | replace conversation history |
+| POST   | `/v1/models/{id}/chat/close`      | `chatSession.close`         | close session, free resources |
 
 Request / response bodies are JSON (kotlinx.serialization).
 
@@ -568,3 +574,98 @@ Applications/CausalLM/api/
   `Conversation.sendMessageAsync(prompt, MessageCallback)` on the service
   side. See §5.1 for the full design. Non-streaming backends fall back to a
   single-chunk default implementation in `Backend.runStreaming`.
+
+## 11. Structured Chat Session API
+
+Added in response to aistudio-mobile requirements (request-mail1 + request-mail2).
+
+### 11.1 Overview
+
+The chat session API extends Quick.AI with structured multi-turn conversation
+support. Instead of the flat `run(prompt)` API, clients open a **chat session**
+on a loaded model, send structured messages with `system`/`user`/`assistant`
+roles, and receive structured responses.
+
+Key design decisions:
+- **Multiple sessions per model**: `openChatSession()` returns independent
+  sessions, each with its own conversation state and image cache.
+- **Backend-managed history**: The session accumulates messages internally.
+  Clients send only the new messages for each turn.
+- **Rebuild support**: `rebuild(messages)` replaces the entire history —
+  used after edits, sampling changes, or failed turns.
+- **Stable image handling**: An `ImageStore` per session caches images by
+  SHA-256 hash. The same image arriving via different temp file paths is
+  recognized as identical.
+- **Explicit cancellation**: `cancel()` is thread-safe and stops in-flight
+  generation.
+
+### 11.2 Session lifecycle
+
+```
+loadModel(GEMMA4) → openChatSession(config?) → run/runStreaming(messages)
+                                              → cancel()
+                                              → rebuild(messages)
+                                              → close()
+```
+
+### 11.3 REST endpoints
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| POST | `/v1/models/{id}/chat/open` | `ChatOpenRequest` | `ChatOpenResponse{session_id}` |
+| POST | `/v1/models/{id}/chat/run` | `ChatRunRequest{session_id, messages}` | `ChatRunResponse{content}` |
+| POST | `/v1/models/{id}/chat/run_stream` | `ChatRunRequest{session_id, messages}` | NDJSON stream |
+| POST | `/v1/models/{id}/chat/cancel` | `ChatSessionIdRequest{session_id}` | `ChatGenericResponse` |
+| POST | `/v1/models/{id}/chat/rebuild` | `ChatRebuildRequest{session_id, messages}` | `ChatGenericResponse` |
+| POST | `/v1/models/{id}/chat/close` | `ChatSessionIdRequest{session_id}` | `ChatGenericResponse` |
+
+### 11.4 Message wire format
+
+```json
+{
+  "session_id": "uuid",
+  "messages": [
+    {
+      "role": "user",
+      "parts": [
+        { "type": "text", "text": "Describe this image" },
+        { "type": "image_file", "absolute_path": "/sdcard/photo.jpg" },
+        { "type": "image_bytes", "image_base64": "..." }
+      ]
+    }
+  ]
+}
+```
+
+### 11.5 Configuration
+
+`ChatOpenRequest.config` accepts:
+- `sampling`: `{temperature, top_k, top_p, min_p, max_tokens, seed}`
+- `chat_template_kwargs`: `{enable_thinking}` — controls thinking-mode prompt
+
+### 11.6 Backend support
+
+| Feature | LiteRTLm (Gemma4) | NativeQuickDotAI (Qwen3) |
+|---------|--------------------|--------------------------|
+| Chat session | Full implementation | Dummy (UNSUPPORTED) |
+| Multimodal turns | With visionBackend | UNSUPPORTED |
+| Cancellation | AtomicBoolean flag | No-op |
+| Rebuild | New Conversation | UNSUPPORTED |
+| enable_thinking | Passed to template | Dummy |
+| maxNumTokens | EngineConfig | Ignored |
+
+### 11.7 Files added/modified
+
+- `QuickDotAI/Types.kt` — new chat data classes + `maxNumTokens`
+- `QuickDotAI/QuickDotAI.kt` — `QuickAiChatSession` interface + `openChatSession()`
+- `QuickDotAI/ImageStore.kt` — SHA-256 image cache (NEW)
+- `QuickDotAI/LiteRTLmChatSession.kt` — LiteRT-LM session impl (NEW)
+- `QuickDotAI/LiteRTLm.kt` — session management + maxNumTokens
+- `QuickDotAI/NativeChatSession.kt` — dummy session (NEW)
+- `QuickDotAI/NativeQuickDotAI.kt` — dummy openChatSession
+- `LauncherApp/service/Protocol.kt` — chat DTOs
+- `LauncherApp/service/HttpServer.kt` — chat route parsing
+- `LauncherApp/service/RequestDispatcher.kt` — chat handlers
+- `LauncherApp/service/ModelWorker.kt` — chat job types + processing
+- `clientapp/api/Models.kt` — client chat DTOs
+- `clientapp/api/QuickAiClient.kt` — client chat methods

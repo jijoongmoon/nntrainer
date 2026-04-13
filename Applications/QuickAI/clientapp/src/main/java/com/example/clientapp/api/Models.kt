@@ -47,7 +47,8 @@ data class LoadModelRequest(
      * Absolute path to the on-device model asset. Required for Gemma4
      * (LiteRT-LM); ignored for native causal_lm_api models.
      */
-    @SerialName("model_path") val modelPath: String? = null
+    @SerialName("model_path") val modelPath: String? = null,
+    @SerialName("max_num_tokens") val maxNumTokens: Int? = null
 )
 
 @Serializable
@@ -135,4 +136,86 @@ data class ConnectResponse(
 data class ErrorResponse(
     @SerialName("error_code") val errorCode: Int,
     val message: String
+)
+
+/* -------------------------------------------------------------------- */
+/* Chat session DTOs                                                    */
+/* -------------------------------------------------------------------- */
+
+@Serializable
+data class ChatSamplingConfig(
+    val temperature: Double? = null,
+    @SerialName("top_k") val topK: Int? = null,
+    @SerialName("top_p") val topP: Double? = null,
+    @SerialName("min_p") val minP: Double? = null,
+    @SerialName("max_tokens") val maxTokens: Int? = null,
+    val seed: Int? = null
+)
+
+@Serializable
+data class ChatTemplateKwargs(
+    @SerialName("enable_thinking") val enableThinking: Boolean? = null
+)
+
+@Serializable
+data class ChatSessionConfig(
+    val sampling: ChatSamplingConfig? = null,
+    @SerialName("chat_template_kwargs") val chatTemplateKwargs: ChatTemplateKwargs? = null
+)
+
+@Serializable
+data class ChatContentPartDto(
+    val type: String, // "text", "image_file", "image_bytes"
+    val text: String? = null,
+    @SerialName("absolute_path") val absolutePath: String? = null,
+    @SerialName("image_base64") val imageBase64: String? = null
+)
+
+@Serializable
+data class ChatMessageDto(
+    val role: String, // "system", "user", "assistant"
+    val parts: List<ChatContentPartDto>
+)
+
+@Serializable
+data class ChatOpenRequest(
+    val config: ChatSessionConfig? = null
+)
+
+@Serializable
+data class ChatOpenResponse(
+    @SerialName("session_id") val sessionId: String? = null,
+    @SerialName("error_code") val errorCode: Int = 0,
+    val message: String? = null
+)
+
+@Serializable
+data class ChatRunRequest(
+    @SerialName("session_id") val sessionId: String,
+    val messages: List<ChatMessageDto>
+)
+
+@Serializable
+data class ChatRunResponse(
+    val content: String? = null,
+    val metrics: PerformanceMetrics? = null,
+    @SerialName("error_code") val errorCode: Int = 0,
+    val message: String? = null
+)
+
+@Serializable
+data class ChatSessionIdRequest(
+    @SerialName("session_id") val sessionId: String
+)
+
+@Serializable
+data class ChatRebuildRequest(
+    @SerialName("session_id") val sessionId: String,
+    val messages: List<ChatMessageDto>
+)
+
+@Serializable
+data class ChatGenericResponse(
+    @SerialName("error_code") val errorCode: Int = 0,
+    val message: String? = null
 )
