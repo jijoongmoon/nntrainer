@@ -27,7 +27,7 @@ import java.util.concurrent.ConcurrentHashMap
  * the store from a single worker thread, but defensive safety costs
  * almost nothing here.
  */
-class ImageStore {
+internal class ImageStore {
 
     private val cache = ConcurrentHashMap<String, ByteArray>()
 

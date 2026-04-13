@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *        tearing down (it nulls out `activeSession` before calling
  *        close so the callback sees nothing to do).
  */
-class LiteRTLmChatSession(
+internal class LiteRTLmChatSession(
     private val engine: Engine,
     private val config: QuickAiChatSessionConfig?,
     private val visionEnabled: Boolean,
@@ -50,7 +50,7 @@ class LiteRTLmChatSession(
 ) : QuickAiChatSession {
 
     private var conversation: Conversation? = createConversationFromConfig(engine, config)
-    val imageStore = ImageStore()
+    internal val imageStore = ImageStore()
 
     /** Accumulated conversation history. */
     private val history = mutableListOf<QuickAiChatMessage>()

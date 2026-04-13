@@ -15,7 +15,7 @@ package com.example.quickdotai
 
 import java.util.UUID
 
-class NativeChatSession(
+internal class NativeChatSession(
     override val sessionId: String = UUID.randomUUID().toString()
 ) : QuickAiChatSession {
 

@@ -67,6 +67,11 @@ interface StreamSink {
 /**
  * @brief A live chat session created by [QuickDotAI.openChatSession].
  *
+ * Internal to the AAR — apps interact with chat sessions exclusively
+ * through [QuickDotAI.chatRun], [QuickDotAI.chatRunStreaming],
+ * [QuickDotAI.chatCancel], [QuickDotAI.chatRebuild], and
+ * [QuickDotAI.closeChatSession].
+ *
  * The session accumulates conversation history internally. Callers
  * send new [QuickAiChatMessage]s and the backend appends them plus
  * the assistant reply to the running history.
@@ -81,7 +86,7 @@ interface StreamSink {
  * owning [QuickDotAI] instance. [cancel] is the only method safe to
  * call from an external thread.
  */
-interface QuickAiChatSession : AutoCloseable {
+internal interface QuickAiChatSession : AutoCloseable {
     /** Unique identifier for this session. */
     val sessionId: String
 
