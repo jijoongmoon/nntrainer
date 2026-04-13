@@ -183,9 +183,33 @@ my_sgemm() → your NPU hardware
 | **BLAS** | sgemm, sgemv, sdot, saxpy, scopy, sscal | sgemm/sgemv usually accelerated |
 | **Element-wise** | ele_add, ele_mul, ele_sub, ele_div | Sometimes accelerated |
 | **Activation** | swiglu, tanh_gelu, softmax, max_val | Rarely accelerated (use CPU) |
-| **Quantized GEMM** | gemm_q4_0, gemm_q4_K, gemm_q6_K | Often accelerated |
+| **Quantized GEMM (block)** | gemm_q4_0, gemm_q4_K, gemm_q6_K | GGML block-quantized (Q4_0=32-block, Q4_K/Q6_K=256-super-block) |
+| **Quantized GEMM (channel)** | gemm_qsi4cxp_fp32 | Channel-wise int4 (Int4QTensor / KleidiAI qsi4cxp). Per-output-column fp32 scale. Set for ARM (KleidiAI NEON/SME), x86 (AVX2), nullptr for NPU (graph-level dispatch instead) |
 | **Data conversion** | copy_fp32_u16, scopy, etc. | Usually CPU fallback |
 | **FP16** | All *_fp16 variants | If hardware supports FP16 |
+
+## Quantized Weight Types
+
+nntrainer supports two families of int4/int8 quantized weights. A single
+backend may accelerate either or both:
+
+**Lane A: Channel-wise int4** (`Int4QTensor`, dtype=`QINT4`, safetensors
+dtype=`I4`, schema_version=2)
+- One fp32 scale per output column, packed-nibbles blob
+- ARM backend: `ComputeOps::gemm_qsi4cxp_fp32 = KleidiAI wrapper`
+- x86 backend: `ComputeOps::gemm_qsi4cxp_fp32 = AVX2 kernel`
+- NPU backend: leave `gemm_qsi4cxp_fp32 = nullptr`, consume via QNN
+  graph (AXIS_SCALE_OFFSET encoding, axis=1, N scales)
+
+**Lane B: Block-quantized** (`Q4_0_Tensor`, `Q4_K_Tensor`, `Q6_K_Tensor`)
+- GGML super-block layout with embedded fp16 scales
+- Dispatch via `ComputeOps::gemm_q4_0_fp32` etc.
+
+If your backend accelerates int4, decide which lane matches your
+accelerator's native int4 format:
+- QNN HTP, Hexagon NPU, Adreno GPU OpenCL → Lane A (channel-wise)
+- x86 CPU with GGML heritage → Lane B (block)
+- Android ARM CPU with recent KleidiAI → Lane A (KleidiAI is upstream)
 
 ## Fallback Strategy
 

@@ -68,10 +68,15 @@ backend at runtime based on the layer's `compute_engine` property.
 │    // Activation                                            │
 │    void (*swiglu_fp32)(...);                                │
 │    ...                                                      │
-│    // Quantized GEMM + utilities                            │
+│    // Quantized GEMM — GGML block-quantized (Q4_0/K, Q6_K)  │
 │    void (*gemm_q4_0_fp32)(...);                             │
+│    void (*gemm_q4_K_fp32)(...);                             │
+│    void (*gemm_q6_K_fp32)(...);                             │
 │    size_t (*quantize_q4_0)(...);                            │
 │    void (*dequantize_row_q4_0)(...);                        │
+│    // Quantized GEMM — channel-wise int4 (qsi4cxp/QINT4)    │
+│    //   ARM: KleidiAI NEON/SME, x86: AVX2, fallback: C ref  │
+│    void (*gemm_qsi4cxp_fp32)(M, N, K, act, data, scales, out);│
 │    ...                                                      │
 │  };                                                         │
 └──────────────┬──────────────────────────────────────────────┘
@@ -326,6 +331,125 @@ All vendors follow the same pattern:
 
 ---
 
+## Quantization Paths
+
+nntrainer supports two distinct families of int4/int8 quantized weights.
+They coexist — choose per-tensor based on target platform and deployment.
+
+### Lane A: Channel-wise int4 (QINT4 / Int4QTensor)
+
+**Format**: one fp32 scale per output channel, symmetric signed int4.
+
+**On-disk layout** (matches `Int4QTensor::allocate()` + KleidiAI
+`qai8dxp_qsi4cxp_unpacked` expectation):
+```
+[2B QScheme header] [K × ceil(N/2) packed nibbles, kxn] [N × fp32 scales]
+```
+
+**Nibble packing** (KleidiAI kxn convention):
+- Even `n_idx` → LOW nibble (bits 0–3)
+- Odd `n_idx` → HIGH nibble (bits 4–7)
+- Stored as offset-binary: `stored = real_int4 + 8` (range 0..15)
+
+**Runtime dispatch** (via `ComputeOps::gemm_qsi4cxp_fp32`):
+
+| Platform | Implementation | Source file |
+|----------|----------------|-------------|
+| ARM | KleidiAI `qai8dxp_qsi4cxp` (NEON / SME / SME2) | `arm/kleidiai_interface_qai8dxp_qsi4cxp.cpp` |
+| x86 | AVX2 direct kxn GEMM | `x86/x86_qsi4cxp.cpp` |
+| fallback | pure C reference | `fallback/fallback_kleidiai.cpp` |
+| NPU (QNN) | `AXIS_SCALE_OFFSET` encoding, axis=1, N scales | QNN runtime (HTP) |
+| GPU (Adreno) | OpenCL custom kernel (planned) | `cl_operations/` |
+
+**Key invariant**: the safetensors on-disk bytes can be consumed by all
+4 backends without any layout translation. One weight file → every
+target.
+
+**Variant selection** (inside `nntr_kai_gemm_qai8dxp_qsi4cxp_rtp`):
+```c
+compile-time: ENABLE_SME2 / ENABLE_SME / neither
+ ×
+runtime:      getauxval(AT_HWCAP2) & HWCAP2_SME[2]
+ ↓
+select:  SME2 mopa/sdot  →  SME mopa/dot  →  NEON i8mm/dotprod
+         (idx 10/11)        (idx 8/9)       (idx 0/5)
+```
+Runtime check is essential: a binary compiled with `ENABLE_SME2=1`
+will SIGILL on SME instructions if the OS kernel hasn't enabled
+userspace SME access (requires Linux 6.3+). The selection cascade
+falls back gracefully.
+
+**RHS pack caching** (critical for LLM decode perf):
+The KleidiAI `_rtp` interface packs the weight into its native tile
+layout on every call. Since FC weights are static in inference,
+`nntr_kai_gemm_qai8dxp_qsi4cxp_rtp` caches the packed RHS by
+`(rhs_ptr, variant_idx, transB)` key. First call packs; subsequent
+calls reuse the cached buffer. This cuts per-call CPU time roughly
+in half on LLM decode.
+
+### Lane B: Block-quantized (Q4_0 / Q4_K / Q6_K / Q1_0)
+
+**Format**: GGML-style super-blocks with embedded scales.
+
+| Type | Block size | Scale storage | Consumer |
+|------|-----------|---------------|----------|
+| Q4_0 | 32 elements | fp16 per block | GGML gemm_q4_0 |
+| Q4_K | 256 (8×32 sub) | fp16 super + uint8 sub | GGML gemm_q4_K |
+| Q6_K | 256 | fp16 super | GGML gemm_q6_K |
+| Q1_0 | 128 | nntr_ggml_impl custom | ggml_interface |
+
+**Dispatch**: `ComputeOps::gemm_q4_0_fp32`, `gemm_q4_K_fp32`,
+`gemm_q6_K_fp32`. The underlying kernels come from the vendored
+`nntr_ggml_impl/` (AVX2 for x86, NEON/SVE for ARM).
+
+**When to use which lane**:
+- Deploying to Galaxy S26 / ARM with KleidiAI SME → Lane A (QINT4)
+- NPU (QNN HTP) deployment → Lane A (AXIS_SCALE_OFFSET)
+- CPU-only x86 server with existing GGML pipeline → Lane B (Q4_0)
+- Mixed CPU+GPU with shared weight format → Lane A (wire-format
+  compatible across all backends)
+
+---
+
+## Android Build Pipeline (ARM Feature Flags)
+
+```
+./tools/package_android.sh . --arm-arch=armv9.2-a
+  │
+  ├── Load tools/cross/android_armv9-2-a.json:
+  │     arm_march  = "armv9.2-a+fp16+sve2+sme"
+  │     enable_sme = true,  enable_sve2 = true
+  │     enable_sme2 = false  (Oryon cores in S26 Ultra don't have SME2)
+  │
+  ├── meson configure with:
+  │     -Darm-arch=armv9.2-a
+  │     -Darm-march=-march=armv9.2-a+fp16+sve2+sme
+  │     -Denable-fp16=true -Denable-sme=true -Denable-sve2=true
+  │
+  ├── meson.build (android branch): sets compile defines
+  │     extra_defines += -DENABLE_FP16=1
+  │                   += -DENABLE_SME=1        ← conditional
+  │                   += -DENABLE_SVE2=1       ← conditional
+  │
+  ├── jni/meson.build: substitutes into Android.mk.in
+  │     MESON_CFLAGS = flags + extra_defines
+  │     MESON_APP_ABI = arm64-v8a  (from arm-arch)
+  │
+  └── ndk-build (NDK Clang 18):
+        compiles kai/ SME/SME2 kernel sources (needs Clang 16+)
+        kleidiai_interface_qai8dxp_qsi4cxp.cpp picks up
+          #ifdef ENABLE_SME → registers SME kernel variants
+```
+
+The `subdir('kai')` and `kleidiai_interface_qai8dxp_qsi4cxp.cpp` are
+compiled UNCONDITIONALLY on ARM (outside the `enable-fp16` guard)
+because the KleidiAI int4 kernel is pure FP32→int8→int4→FP32 and has
+no FP16 dependency. SME/SME2 kernel *files* are still gated on
+`enable-sme`/`enable-sme2` because they use C99 `restrict` (needs
+Clang 16+ or GCC 14+).
+
+---
+
 ## ContextData Extension (Vendor Data)
 
 ContextData is the extensible container for backend-specific data.
@@ -519,6 +643,16 @@ cd->setComputeOps(&qnn_ops);
 | `x86/x86_ops_table.cpp` | x86 ops table (x86_backend:: wrappers) |
 | `fallback/fallback_ops_table.cpp` | Fallback ops table |
 | `cl_operations/cl_compute_ops.cpp` | OpenCL ops table |
+| `arm/kleidiai_interface_qai8dxp_qsi4cxp.cpp` | KleidiAI channel-wise int4 driver (variant selection, RHS pack cache, NEON/SME/SME2 dispatch) |
+| `arm/kai/` | KleidiAI upstream kernels (NEON dotprod/i8mm, SME, SME2) |
+| `x86/x86_qsi4cxp.cpp` | x86 AVX2 channel-wise int4 GEMV/GEMM (reads kxn layout directly) |
+| `fallback/fallback_kleidiai.cpp` | Pure C reference for qsi4cxp (always compiled) |
+| `fallback/fallback_kleidiai_dispatch.cpp` | qsi4cxp wrapper when ENABLE_FP16 is off |
+| `tensor/int4_tensor.h/cpp` | Int4QTensor — canonical QINT4 layout, scale_size=width(), PER_CHANNEL_AFFINE default |
+| `jni/meson.build` | Android.mk.in template filler (MESON_CFLAGS, MESON_APP_ABI from arm-arch) |
+| `jni/Android.mk.in` | NDK build template, `@MESON_*@` variables filled by configure_file |
+| `tools/cross/android_*.json` | Per-arch cross-build config (arm_march, SME/SVE flags) |
+| `tools/package_android.sh` | Android wrapper: loads JSON, invokes meson + ndk-build |
 | `layer_context.h` | RunLayerContext (getComputeOps, getContextData) |
 | `layer_node.cpp` | configureRunContext (ContextData → RunLayerContext) |
 | `network_graph.cpp` | Graph finalization (Context → ContextData → LayerNode) |
