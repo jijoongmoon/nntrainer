@@ -253,6 +253,15 @@ static nntrainer::ComputeOps npu_ops = {
   .gemm_int4_batch_fp32 = nullptr,
   .gemv_int4_accel_fp32 = nullptr,
   .sgemm_int4_accel_fp32 = nullptr,
+
+  // Channel-wise int4 (qsi4cxp / Int4QTensor) — op-level dispatch.
+  // If your NPU consumes int4 at the graph level (like QNN HTP does
+  // via QNN_QUANTIZATION_ENCODING_AXIS_SCALE_OFFSET), leave this as
+  // nullptr so QINT4 GEMM can't accidentally fall through to an
+  // op-level path on your context. Set to a wrapper if your NPU
+  // exposes op-level int4 matmul.
+  .gemm_qsi4cxp_fp32 = nullptr,
+
 #ifdef ENABLE_FP16
   // FP16 — set to nullptr (fill in if your NPU supports FP16)
   .sgemm_fp16 = nullptr, .sgemv_fp16 = nullptr, .sdot_fp16 = nullptr,

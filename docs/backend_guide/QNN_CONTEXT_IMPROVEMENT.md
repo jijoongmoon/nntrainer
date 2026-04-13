@@ -1,164 +1,180 @@
-# QNN Context 개선 제안
+# QNN Backend Integration
 
-## 현재 문제점
+This document describes how the QNN (Qualcomm Neural Network) backend
+integrates with the nntrainer compute dispatch architecture, including
+channel-wise int4 weight support.
 
-### 1. 안전하지 않은 `static_pointer_cast`
+## Status (current)
 
-```cpp
-// 현재: crash 위험
-std::shared_ptr<QNNVar> getQNNVar(RunLayerContext &context) {
-  return static_pointer_cast<QNNBackendVar>(context.getContextData())
-    ->getVar();  // CPU context가 전달되면 undefined behavior!
-}
-```
+The improvements originally proposed in this document have been
+implemented. This file now documents the resulting architecture rather
+than proposed changes. See `ARCHITECTURE.md` for the broader dispatch
+model; this file zooms in on QNN specifics.
 
-### 2. QNN이 ComputeOps를 설정하지 않음
-
-```cpp
-// 현재: ComputeOps가 nullptr
-void QNNContext::initialize() {
-  init();
-  setMemAllocator(...);
-  // ComputeOps 설정 없음! → 일반 텐서 연산 불가
-}
-```
-
-### 3. QNNVar가 monolithic struct
-
-QNNVar에 backend handle, function pointers, RPC memory, IO tensor,
-context-graph map이 모두 하나의 struct에 있음.
-
----
-
-## 개선 방향
-
-### 개선 1: ContextData에 type-safe 접근 메서드 추가
+## QNN Context Structure
 
 ```cpp
-// context_data.h
-class ContextData {
-public:
-  // Type-safe downcast (returns nullptr if wrong type)
-  template<typename T>
-  T* as() { return dynamic_cast<T*>(this); }
+class QNNContext : public Context, public Singleton<QNNContext> {
+  QNNContext()
+    : Context(std::make_shared<QNNBackendVar>()) {}
 
-  template<typename T>
-  const T* as() const { return dynamic_cast<const T*>(this); }
+  void initialize() noexcept override {
+    // 1. Ensure CPU fallback ComputeOps exist.
+    init_backend();
 
-  // ... existing members ...
-};
-```
-
-QNN 레이어에서의 사용:
-```cpp
-// 개선: 안전한 타입 체크
-std::shared_ptr<QNNVar> getQNNVar(RunLayerContext &context) {
-  auto *qnn_data = context.getContextData()->as<QNNBackendVar>();
-  NNTR_THROW_IF(!qnn_data, std::runtime_error)
-    << "QNNGraph requires QNN context, got: " << context.getContextData()->getType();
-  return qnn_data->getVar();
-}
-```
-
-### 개선 2: 모든 Context가 ComputeOps를 설정하도록 강제
-
-```cpp
-// QNNContext::initialize()
-void QNNContext::initialize() noexcept {
-  // 1. CPU backend 초기화 (fallback ops)
-  init_backend();
-
-  // 2. ComputeOps 설정 — QNN에서도 필수
-  //    QNN 전용 ops가 있으면 교체, 없으면 CPU fallback
-  getContextData()->setComputeOps(g_compute_ops);
-
-  // 3. QNN-specific 초기화
-  init();
-  setMemAllocator(std::make_shared<QNNRpcManager>());
-
-  // 4. QNN 레이어 등록
-  registerFactory(...);
-}
-```
-
-이렇게 하면:
-- QNN 모델에서 일반 텐서 연산 (전처리, 후처리)이 정상 동작
-- QNN이 특정 ops를 가속하고 싶으면 ops table 교체 가능
-
-### 개선 3: ContextData에 type 식별자 추가
-
-```cpp
-class ContextData {
-public:
-  virtual ~ContextData() = default;
-
-  // Backend type identification
-  virtual const char* getType() const { return "cpu"; }
-
-  // ... existing members ...
-};
-
-class QNNBackendVar : public ContextData {
-public:
-  const char* getType() const override { return "qnn"; }
-  // ...
-};
-```
-
-### 개선 4: Context::initialize()에서 ComputeOps 설정을 기본 동작으로
-
-```cpp
-// context.h — Context base class
-class Context {
-protected:
-  // 서브클래스가 override하지 않으면 CPU fallback ops 사용
-  virtual void setupComputeOps() {
-    if (auto cd = getContextData(); cd && !cd->getComputeOps()) {
-      ensureComputeOps();  // init_backend() if needed
+    // 2. Set CPU ComputeOps on the QNN ContextData — this lets
+    //    non-QNN tensor ops (pre/post-processing, tokenizer,
+    //    sampling) continue to work when running a QNN model.
+    if (auto cd = getContextData(); cd && g_compute_ops) {
       cd->setComputeOps(g_compute_ops);
     }
+
+    // 3. Initialize QNN runtime (HTP backend, RPC memory, graph
+    //    compile + load).
+    auto *qnn_data = getContextData()->as<QNNBackendVar>();
+    qnn_data->getVar()->initialize(...);
+
+    // 4. Register QNN-specific layers (QNNGraph, etc.)
+    add_default_object();
   }
 };
 ```
 
----
+## Type-safe Context Access
 
-## 전체 아키텍처 (개선 후)
+Layers access vendor data through the `as<T>()` downcast, which returns
+nullptr when the context is of a different type:
+
+```cpp
+// In a QNN-specific layer:
+void QNNGraph::forwarding(RunLayerContext &ctx) {
+  auto *qnn_data = ctx.getContextData()->as<QNNBackendVar>();
+  NNTR_THROW_IF(!qnn_data, std::runtime_error)
+    << "QNNGraph requires QNN context, got: "
+    << ctx.getContextData()->getType();
+
+  qnn_data->getVar()->executeGraph(input_tensors, output_tensors);
+}
+```
+
+`getType()` is a virtual on `ContextData`; `QNNBackendVar` overrides
+it to return `"qnn"`, which is used in error messages and diagnostics.
+
+## Dispatch Model Coexistence in a QNN Model
+
+A single inference run typically mixes op-level and graph-level
+dispatch:
 
 ```
-Context (base)
+Embedding layer    → op-level, CPU ComputeOps (token_id → vector)
+Transformer block  → graph-level, QNN runtime on HTP
+  (the whole block compiles to a single QNN graph)
+LM head + softmax  → op-level, CPU ComputeOps (logits → sample)
+Tokenizer, loss    → op-level, CPU ComputeOps
+```
+
+The QNN `ComputeOps` table is simply the CPU fallback — QNN doesn't
+accelerate individual BLAS ops. The acceleration happens at the graph
+level, by delegating an entire subgraph to the HTP.
+
+## Channel-wise int4 (QINT4) Weight Integration
+
+QNN's HTP supports int4 weights via the
+`QNN_QUANTIZATION_ENCODING_AXIS_SCALE_OFFSET` encoding. This matches
+nntrainer's `Int4QTensor` canonical layout exactly, so the same
+safetensors file can be loaded into either the ARM CPU (KleidiAI) or
+the QNN HTP without any format conversion.
+
+### Wire Format Agreement
+
+| Property | Int4QTensor | QNN AXIS_SCALE_OFFSET |
+|----------|-------------|----------------------|
+| Nibble packing | even index = low nibble, offset-binary | same |
+| Scale dtype | fp32 | fp32 |
+| Scale axis | width (output columns, axis=1 in [K,N]) | axis = output dim, `numScaleOffsets == N` |
+| Zero point | 0 (symmetric) | 0 (`offset = 0` for all scales) |
+| group_size | 0 (pure per-channel) | 1 (per-channel) |
+
+Same bytes, same semantic — the safetensors data section is binary
+identical between the two consumers.
+
+### Loader Flow
+
+```
+nn->load("qwen3-0.6b-int4.safetensors", SAFETENSORS)
   │
-  ├── AppContext ("cpu")
-  │     └── ContextData { ComputeOps = arm_ops/x86_ops }
+  ├── Parse JSON header:
+  │     __metadata__.schema_version = "2"
+  │     dense:weight.dtype = "I4"
+  │     dense:weight.quant = {
+  │         encoding: "axis_scale_offset",
+  │         axis: 1, bitwidth: 4,
+  │         group_size: 0, has_zero_point: false
+  │     }
   │
-  ├── ClContext ("gpu")
-  │     └── ContextData { ComputeOps = opencl_ops }
+  ├── For ARM CPU (AppContext):
+  │     allocate Int4QTensor in memory pool
+  │     memcpy raw bytes (qscheme header + nibbles + scales)
+  │     → forward: KleidiAI qsi4cxp_unpacked + RHS pack cache
   │
-  └── QNNContext ("qnn")
-        └── QNNBackendVar : ContextData {
-              ComputeOps = cpu_fallback_ops (일반 텐서 연산용)
-              QNNVar = { backend handle, graphs, sessions }
+  └── For QNN HTP (QNNContext):
+        hand raw bytes to QNN's updateGraphTensors()
+        QNN interprets with AXIS_SCALE_OFFSET encoding
+        → forward: HTP int4 matmul (accelerated)
+```
+
+## ComputeOps Slots for QNN
+
+QNN's ops table should set most entries to CPU fallback and leave
+channel-wise int4 slots as nullptr (because QNN consumes int4 at the
+graph level, not via op-level dispatch):
+
+```cpp
+// In QNNContext::initialize():
+static ComputeOps qnn_ops = *g_compute_ops;   // CPU base
+// No override — QNN doesn't replace op-level ops for a CausalLM.
+// gemm_qsi4cxp_fp32 stays as CPU (KleidiAI on ARM, AVX2 on x86),
+// but QNN-scheduled layers never reach this path — they go through
+// QNNGraph which calls QNN runtime directly.
+qnn_ops.gemm_qsi4cxp_fp32 = nullptr;  // optional: make op-level
+                                        // channel-wise int4 unsupported
+                                        // on QNN context (graph-level only)
+
+cd->setComputeOps(&qnn_ops);
+```
+
+The `nullptr` choice signals intent clearly: QNN layers must use the
+graph-level path. If a non-QNN layer (accidentally) tries int4 GEMM
+through the QNN context, `FloatTensor::dotQInteger` throws with a
+clear error rather than silently running CPU math.
+
+## Build Integration
+
+QNN is loaded as a plugin `.so` to keep QNN SDK dependencies out of
+the core `libnntrainer.so`:
+
+```
+Engine::add_default_object()
+  │
+  ├── registerContext("cpu", &AppContext::Global())   ← always on
+  ├── registerContext("gpu", &ClContext::Global())    ← if enable-opencl
+  │
+  └── registerPluggableContext("libqnn_context.so")   ← runtime dlopen
+        └── exports: ml_train_context_pluggable = {
+              create_qnn_context,
+              destroy_qnn_context
             }
-
-레이어 실행:
-  일반 레이어 → context.getComputeOps()->sgemm_fp32(...)
-  QNN 레이어 → context.getContextData()->as<QNNBackendVar>()->getVar()
-                → QNN 그래프 실행
 ```
 
-## Dispatch 모델 정리
+QNN layers register their factories inside `QNNContext::add_default_object`,
+and the plugin pulls in QNN SDK symbols via its own link dependency.
 
-| Level | 메커니즘 | 사용자 | 예시 |
-|-------|----------|--------|------|
-| **Op-level** | ComputeOps table | 모든 레이어 | sgemm, ele_add, quantize |
-| **Graph-level** | ContextData subclass | NPU 레이어만 | QNN graph execution |
+## References
 
-Op-level은 **모든 Context가 제공**해야 합니다 (최소 CPU fallback).
-Graph-level은 **NPU 전용 레이어만** 사용합니다.
-
-## 구현 우선순위
-
-1. ContextData에 `as<T>()` 메서드 추가 (type-safe cast)
-2. ContextData에 `getType()` 가상 메서드 추가 (디버깅용)
-3. QNNContext::initialize()에서 ComputeOps 설정
-4. Context base에서 ComputeOps 기본 설정 로직 추가
+- `nntrainer/qnn_context.cpp` — QNNContext implementation
+- `nntrainer/qnn/jni/qnn_context_var.h` — QNNBackendVar / QNNVar
+- `nntrainer/tensor/int4_tensor.h` — canonical layout doc
+- `docs/backend_guide/ARCHITECTURE.md` — broader dispatch model
+- `docs/backend_guide/BACKEND_GUIDE.md` — guide for adding a new backend
+- Qualcomm QNN SDK `QnnTensor.h` — `Qnn_QuantizeParams_t`,
+  `QNN_QUANTIZATION_ENCODING_AXIS_SCALE_OFFSET`
