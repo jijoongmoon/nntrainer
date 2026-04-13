@@ -587,8 +587,10 @@ on a loaded model, send structured messages with `system`/`user`/`assistant`
 roles, and receive structured responses.
 
 Key design decisions:
-- **Multiple sessions per model**: `openChatSession()` returns independent
-  sessions, each with its own conversation state and image cache.
+- **Single session per engine**: LiteRT-LM allows only one `Conversation`
+  per `Engine` at a time. `openChatSession()` therefore permits at most
+  **one** active session — attempting to open a second returns
+  `BAD_REQUEST`. The caller must close the existing session first.
 - **Backend-managed history**: The session accumulates messages internally.
   Clients send only the new messages for each turn.
 - **Rebuild support**: `rebuild(messages)` replaces the entire history —
@@ -648,6 +650,7 @@ loadModel(GEMMA4) → openChatSession(config?) → run/runStreaming(messages)
 | Feature | LiteRTLm (Gemma4) | NativeQuickDotAI (Qwen3) |
 |---------|--------------------|--------------------------|
 | Chat session | Full implementation | Dummy (UNSUPPORTED) |
+| Session concurrency | Single session per engine | Single session per engine |
 | Multimodal turns | With visionBackend | UNSUPPORTED |
 | Cancellation | AtomicBoolean flag | No-op |
 | Rebuild | New Conversation | UNSUPPORTED |

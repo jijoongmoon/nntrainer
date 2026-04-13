@@ -69,8 +69,12 @@ interface StreamSink {
  *
  * The session accumulates conversation history internally. Callers
  * send new [QuickAiChatMessage]s and the backend appends them plus
- * the assistant reply to the running history. Multiple sessions may
- * coexist on the same loaded model.
+ * the assistant reply to the running history.
+ *
+ * **Single-session constraint:** LiteRT-LM allows only one
+ * [Conversation] per [Engine] at a time, so each [QuickDotAI]
+ * instance supports at most **one** active chat session. A new
+ * session cannot be opened until the current one is closed.
  *
  * Threading: a session is NOT internally thread-safe. The host must
  * drive it from a single worker thread — the same contract as the
@@ -259,7 +263,10 @@ interface QuickDotAI {
     /**
      * @brief Open a new structured chat session on this engine.
      *
-     * Multiple sessions may coexist on the same loaded model. Each
+     * Only **one** session may be active at a time (LiteRT-LM allows a
+     * single Conversation per Engine). If a session is already open,
+     * this method returns [QuickAiError.BAD_REQUEST] — the caller must
+     * [QuickAiChatSession.close] the existing session first. The
      * session maintains its own conversation history and image cache.
      * The default implementation returns [QuickAiError.UNSUPPORTED];
      * concrete engines override this to provide session management.

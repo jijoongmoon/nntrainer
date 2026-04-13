@@ -21,7 +21,7 @@
 
 | 항목 | 결정 |
 |------|------|
-| 세션 다중성 | 동일 모델에 다중 chat session 허용 |
+| 세션 다중성 | 엔진당 단일 chat session (LiteRT-LM Conversation 제약). 기존 세션을 닫아야 새 세션 생성 가능 |
 | 히스토리 관리 | 백엔드가 히스토리를 누적 관리 |
 | Conversation Rebuild | 별도 `rebuild()` API 제공 |
 | 이미지 안정성 | SHA-256 해시 기반 컨텐츠 비교, unload/close 시 저장 이미지 삭제 |
@@ -102,7 +102,7 @@ interface QuickAiChatSession : AutoCloseable {
 interface QuickDotAI {
     // ... 기존 API 유지 ...
 
-    /** 새 chat session을 연다 (모델당 다중 세션 가능) */
+    /** 새 chat session을 연다 (엔진당 단일 세션, 기존 세션 있으면 BAD_REQUEST) */
     fun openChatSession(
         config: QuickAiChatSessionConfig? = null
     ): BackendResult<QuickAiChatSession>
@@ -253,8 +253,8 @@ ImageStore
 #### 3i. LiteRTLm에 openChatSession 구현
 - [ ] `LiteRTLm.openChatSession(config)` 구현
   - 새 `LiteRTLmChatSession` 생성
-  - `ConcurrentHashMap<String, LiteRTLmChatSession>`으로 다중 세션 관리
-  - unload 시 모든 세션 close
+  - 단일 `activeSession` 변수로 관리 (기존 세션 있으면 BAD_REQUEST)
+  - unload/close 시 활성 세션 close
 
 **의존성**: Phase 1, Phase 2
 
@@ -404,9 +404,9 @@ ImageStore
 
 ## 4. 리스크 & 고려사항
 
-### 4.1 LiteRT-LM Conversation 다중 인스턴스
-- LiteRT-LM `Engine` 하나에서 `Conversation`을 여러 개 생성할 수 있는지 확인 필요
-- 불가능할 경우: 세션 레벨에서 Engine을 추가 생성하거나, 세션 간 직렬화 필요
+### 4.1 LiteRT-LM Conversation 단일 인스턴스 제약
+- LiteRT-LM `Engine` 하나에서 `Conversation`은 하나만 허용됨 (확인 완료)
+- 해결: 엔진당 단일 세션만 허용, `openChatSession()` 시 기존 세션이 있으면 `BAD_REQUEST` 반환
 
 ### 4.2 Sampling Config 반영 범위
 - LiteRT-LM이 `temperature`, `topK` 등을 실제로 honor하는지는 런타임 확인 필요
@@ -445,7 +445,7 @@ Phase 2와 Phase 4는 독립적이므로 병렬 진행 가능.
 ## 6. 완료 기준
 
 - [ ] `openChatSession()` → 세션 열기 → `run(messages)` → assistant 응답 수신 (LiteRTLm)
-- [ ] 동일 모델에 2개 이상 세션 동시 운용 확인
+- [ ] 엔진당 단일 세션 제약 확인 (두 번째 open 시 BAD_REQUEST 반환)
 - [ ] 스트리밍 chat 동작 확인 (NDJSON delta 수신)
 - [ ] `cancel()` 호출 시 진행 중 생성 중단 확인
 - [ ] `rebuild(messages)` 호출 시 히스토리 교체 후 정상 동작 확인

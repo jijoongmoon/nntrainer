@@ -71,9 +71,9 @@ class LiteRTLm(
     private var initializationDurationMs: Double = 0.0
     private var lastRunDurationMs: Double = 0.0
 
-    // Active chat sessions keyed by sessionId. Cleaned up on
-    // unload/close.
-    private val chatSessions = java.util.concurrent.ConcurrentHashMap<String, LiteRTLmChatSession>()
+    // LiteRT-LM allows only one Conversation per Engine at a time.
+    // A new session cannot be opened until the active one is closed.
+    private var activeSession: LiteRTLmChatSession? = null
 
     override fun load(req: LoadModelRequest): BackendResult<Unit> {
         Log.i(
@@ -553,18 +553,29 @@ class LiteRTLm(
                 "LiteRTLm has not been loaded yet"
             )
 
+        // LiteRT-LM supports only one Conversation per Engine. Reject
+        // if a session is already active.
+        if (activeSession != null) {
+            Log.w(
+                TAG,
+                "openChatSession(): rejected — session ${activeSession!!.sessionId} " +
+                    "is still active. Close it first."
+            )
+            return BackendResult.Err(
+                QuickAiError.BAD_REQUEST,
+                "A chat session is already active (${activeSession!!.sessionId}). " +
+                    "Close it before opening a new one."
+            )
+        }
+
         return try {
             val session = LiteRTLmChatSession(
                 engine = e,
                 config = config,
                 visionEnabled = visionEnabled
             )
-            chatSessions[session.sessionId] = session
-            Log.i(
-                TAG,
-                "openChatSession(): created session ${session.sessionId} " +
-                    "(total active=${chatSessions.size})"
-            )
+            activeSession = session
+            Log.i(TAG, "openChatSession(): created session ${session.sessionId}")
             BackendResult.Ok(session)
         } catch (t: Throwable) {
             Log.e(TAG, "openChatSession(): failed", t)
@@ -575,29 +586,34 @@ class LiteRTLm(
         }
     }
 
-    /** Close a specific chat session by id. */
+    /** Close the active chat session. Returns false if no session or id mismatch. */
     fun closeChatSession(sessionId: String): Boolean {
-        val session = chatSessions.remove(sessionId) ?: return false
+        val session = activeSession ?: return false
+        if (session.sessionId != sessionId) return false
         session.close()
-        Log.i(TAG, "closeChatSession($sessionId): closed, remaining=${chatSessions.size}")
+        activeSession = null
+        Log.i(TAG, "closeChatSession($sessionId): closed")
         return true
     }
 
-    /** Retrieve a chat session by id. */
-    fun getChatSession(sessionId: String): LiteRTLmChatSession? = chatSessions[sessionId]
+    /** Retrieve the active chat session (only if its id matches). */
+    fun getChatSession(sessionId: String): LiteRTLmChatSession? {
+        val session = activeSession ?: return null
+        return if (session.sessionId == sessionId) session else null
+    }
 
-    /** Close all active chat sessions. */
-    private fun closeAllChatSessions() {
-        if (chatSessions.isNotEmpty()) {
-            Log.i(TAG, "closeAllChatSessions(): closing ${chatSessions.size} session(s)")
-            chatSessions.values.forEach { it.close() }
-            chatSessions.clear()
+    /** Close the active chat session if any. */
+    private fun closeActiveSession() {
+        activeSession?.let {
+            Log.i(TAG, "closeActiveSession(): closing ${it.sessionId}")
+            it.close()
+            activeSession = null
         }
     }
 
     override fun unload(): BackendResult<Unit> {
         Log.i(TAG, "unload() invoked")
-        closeAllChatSessions()
+        closeActiveSession()
         closeQuietly()
         return BackendResult.Ok(Unit)
     }
@@ -623,7 +639,7 @@ class LiteRTLm(
 
     override fun close() {
         Log.i(TAG, "close() invoked")
-        closeAllChatSessions()
+        closeActiveSession()
         closeQuietly()
     }
 
