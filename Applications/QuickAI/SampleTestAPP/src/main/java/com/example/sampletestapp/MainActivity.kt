@@ -104,6 +104,7 @@ class MainActivity : AppCompatActivity() {
 
     // Chat session UI
     private lateinit var chatSessionStatusView: TextView
+    private lateinit var chatSystemPromptField: EditText
     private lateinit var chatTemperatureField: EditText
     private lateinit var chatEnableThinkingSpinner: Spinner
     private lateinit var chatPromptField: EditText
@@ -316,6 +317,14 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, pad / 4)
         }
         root.addView(chatSessionStatusView)
+
+        // System prompt (maps to ConversationConfig.systemInstruction)
+        root.addView(labelView("System prompt (optional)"))
+        chatSystemPromptField = EditText(this).apply {
+            hint = "e.g. You are a helpful assistant."
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+        }
+        root.addView(chatSystemPromptField)
 
         // Sampling config
         root.addView(labelView("Temperature (optional)"))
@@ -598,6 +607,7 @@ class MainActivity : AppCompatActivity() {
     private fun onChatOpenClicked() {
         // Capture all UI values on the main thread — no latches needed.
         val req = buildLoadRequest()
+        val systemPrompt = chatSystemPromptField.text.toString().trim().ifEmpty { null }
         val tempStr = chatTemperatureField.text.toString().trim()
         val thinkingIdx = chatEnableThinkingSpinner.selectedItemPosition
 
@@ -628,8 +638,9 @@ class MainActivity : AppCompatActivity() {
                 else -> null
             }
 
-            val config = if (sampling != null || templateKwargs != null) {
+            val config = if (systemPrompt != null || sampling != null || templateKwargs != null) {
                 QuickAiChatSessionConfig(
+                    systemInstruction = systemPrompt,
                     sampling = sampling,
                     chatTemplateKwargs = templateKwargs
                 )

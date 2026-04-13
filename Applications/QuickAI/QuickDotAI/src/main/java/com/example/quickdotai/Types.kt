@@ -259,9 +259,15 @@ data class QuickAiChatTemplateKwargs(
 /**
  * @brief Configuration for a new chat session, passed to
  * [QuickDotAI.openChatSession].
+ *
+ * [systemInstruction] maps to LiteRT-LM's
+ * `ConversationConfig.systemInstruction` and is applied once when the
+ * conversation is created — equivalent to the `"system"` role in
+ * OpenAI-style message lists.
  */
 @Serializable
 data class QuickAiChatSessionConfig(
+    @SerialName("system_instruction") val systemInstruction: String? = null,
     val sampling: QuickAiChatSamplingConfig? = null,
     @SerialName("chat_template_kwargs") val chatTemplateKwargs: QuickAiChatTemplateKwargs? = null
 )

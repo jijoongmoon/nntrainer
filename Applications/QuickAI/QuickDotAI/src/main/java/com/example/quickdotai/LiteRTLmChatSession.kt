@@ -20,9 +20,11 @@ import android.util.Log
 import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
+import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
+import com.google.ai.edge.litertlm.SamplerConfig
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -47,7 +49,7 @@ class LiteRTLmChatSession(
     override val sessionId: String = UUID.randomUUID().toString()
 ) : QuickAiChatSession {
 
-    private var conversation: Conversation? = engine.createConversation()
+    private var conversation: Conversation? = createConversationFromConfig(engine, config)
     val imageStore = ImageStore()
 
     /** Accumulated conversation history. */
@@ -298,9 +300,9 @@ class LiteRTLmChatSession(
             Log.w(TAG, "rebuild($sessionId): conversation.close() threw", t)
         }
 
-        // Create a fresh conversation
+        // Create a fresh conversation (preserving the session config)
         conversation = try {
-            engine.createConversation()
+            createConversationFromConfig(engine, config)
         } catch (t: Throwable) {
             Log.e(TAG, "rebuild($sessionId): createConversation failed", t)
             return BackendResult.Err(
@@ -413,5 +415,51 @@ class LiteRTLmChatSession(
 
     companion object {
         private const val TAG = "LiteRTLmChatSession"
+
+        /**
+         * Build a LiteRT-LM [Conversation] from a [QuickAiChatSessionConfig].
+         *
+         * Maps:
+         *  - [QuickAiChatSessionConfig.systemInstruction] →
+         *    [ConversationConfig.systemInstruction]
+         *  - [QuickAiChatSamplingConfig] → [SamplerConfig]
+         *
+         * Falls back to the bare `engine.createConversation()` overload
+         * when no config fields are set, so existing callers are
+         * unaffected.
+         */
+        private fun createConversationFromConfig(
+            engine: Engine,
+            config: QuickAiChatSessionConfig?
+        ): Conversation {
+            val sysInstruction = config?.systemInstruction?.takeIf { it.isNotBlank() }
+            val sampling = config?.sampling
+            // Skip ConversationConfig entirely when nothing is configured
+            // so we don't hit any default-value surprises.
+            if (sysInstruction == null && sampling == null) {
+                return engine.createConversation()
+            }
+
+            val samplerConfig = sampling?.let { s ->
+                SamplerConfig(
+                    temperature = s.temperature?.toFloat() ?: 1.0f,
+                    topK = s.topK ?: 40,
+                    topP = s.topP?.toFloat() ?: 0.95f,
+                )
+            }
+
+            val convConfig = ConversationConfig(
+                systemInstruction =
+                    sysInstruction?.let { Contents.of(it) },
+                samplerConfig = samplerConfig,
+            )
+            Log.i(
+                TAG,
+                "createConversationFromConfig: " +
+                    "sysInstruction=${sysInstruction?.take(60)}, " +
+                    "sampling=$sampling"
+            )
+            return engine.createConversation(convConfig)
+        }
     }
 }
