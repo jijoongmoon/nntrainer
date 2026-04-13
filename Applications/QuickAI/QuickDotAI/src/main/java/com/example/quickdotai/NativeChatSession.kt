@@ -3,7 +3,7 @@
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
  * @file    NativeChatSession.kt
- * @brief   Dummy QuickAiChatSession for the native causal_lm backend.
+ * @brief   Internal chat session helper for the native causal_lm backend.
  *
  * The native engine does not yet support structured chat / multi-turn
  * conversation. This stub returns [QuickAiError.UNSUPPORTED] for all
@@ -16,13 +16,13 @@ package com.example.quickdotai
 import java.util.UUID
 
 internal class NativeChatSession(
-    override val sessionId: String = UUID.randomUUID().toString()
-) : QuickAiChatSession {
+    val sessionId: String = UUID.randomUUID().toString()
+) {
 
     @Volatile
     private var closed = false
 
-    override fun run(
+    fun run(
         messages: List<QuickAiChatMessage>
     ): BackendResult<QuickAiChatResult> {
         if (closed) return errClosed()
@@ -32,7 +32,7 @@ internal class NativeChatSession(
         )
     }
 
-    override fun runStreaming(
+    fun runStreaming(
         messages: List<QuickAiChatMessage>,
         sink: StreamSink
     ): BackendResult<QuickAiChatResult> {
@@ -49,11 +49,11 @@ internal class NativeChatSession(
         return err
     }
 
-    override fun cancel() {
+    fun cancel() {
         // no-op — nothing to cancel
     }
 
-    override fun rebuild(
+    fun rebuild(
         messages: List<QuickAiChatMessage>
     ): BackendResult<Unit> {
         if (closed) return errClosed()
@@ -63,7 +63,7 @@ internal class NativeChatSession(
         )
     }
 
-    override fun close() {
+    fun close() {
         closed = true
     }
 

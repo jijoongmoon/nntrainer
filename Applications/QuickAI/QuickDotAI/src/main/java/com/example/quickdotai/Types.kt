@@ -285,8 +285,8 @@ data class QuickAiChatMessage(
 )
 
 /**
- * @brief Result returned by [QuickAiChatSession.run] /
- * [QuickAiChatSession.runStreaming].
+ * @brief Result returned by [QuickDotAI.chatRun] /
+ * [QuickDotAI.chatRunStreaming].
  */
 data class QuickAiChatResult(
     val content: String,

@@ -9,7 +9,7 @@
  * identified by content hash, so the conversation history can reference
  * them stably across turns without depending on filesystem paths.
  *
- * Each [QuickAiChatSession] owns its own [ImageStore]. The store is
+ * Each chat session owns its own [ImageStore]. The store is
  * cleared when the session is closed or the owning engine is unloaded.
  */
 package com.example.quickdotai
@@ -79,7 +79,7 @@ internal class ImageStore {
 
     /**
      * Remove images whose hashes are NOT in [retainHashes]. Used by
-     * [QuickAiChatSession.rebuild] to prune images that are no longer
+     * [LiteRTLmChatSession.rebuild] to prune images that are no longer
      * referenced by the new history.
      */
     fun retainOnly(retainHashes: Set<String>) {

@@ -65,69 +65,6 @@ interface StreamSink {
 }
 
 /**
- * @brief A live chat session created by [QuickDotAI.openChatSession].
- *
- * Internal to the AAR — apps interact with chat sessions exclusively
- * through [QuickDotAI.chatRun], [QuickDotAI.chatRunStreaming],
- * [QuickDotAI.chatCancel], [QuickDotAI.chatRebuild], and
- * [QuickDotAI.closeChatSession].
- *
- * The session accumulates conversation history internally. Callers
- * send new [QuickAiChatMessage]s and the backend appends them plus
- * the assistant reply to the running history.
- *
- * **Single-session constraint:** LiteRT-LM allows only one
- * [Conversation] per [Engine] at a time, so each [QuickDotAI]
- * instance supports at most **one** active chat session. A new
- * session cannot be opened until the current one is closed.
- *
- * Threading: a session is NOT internally thread-safe. The host must
- * drive it from a single worker thread — the same contract as the
- * owning [QuickDotAI] instance. [cancel] is the only method safe to
- * call from an external thread.
- */
-internal interface QuickAiChatSession : AutoCloseable {
-    /** Unique identifier for this session. */
-    val sessionId: String
-
-    /**
-     * @brief Append [messages] to the conversation, run inference, and
-     * return the assistant's reply. The new user messages AND the
-     * assistant reply are persisted in the session's internal history.
-     */
-    fun run(messages: List<QuickAiChatMessage>): BackendResult<QuickAiChatResult>
-
-    /**
-     * @brief Streaming variant of [run]. Deltas are pushed through
-     * [sink]; the full assistant reply is returned on completion and
-     * also appended to the internal history.
-     */
-    fun runStreaming(
-        messages: List<QuickAiChatMessage>,
-        sink: StreamSink
-    ): BackendResult<QuickAiChatResult>
-
-    /**
-     * @brief Cancel an in-flight [run] or [runStreaming]. Safe to call
-     * from any thread.
-     */
-    fun cancel()
-
-    /**
-     * @brief Replace the entire conversation history and rebuild
-     * internal engine state. Use this after history edits, sampling
-     * changes, or to recover from a failed/cancelled turn.
-     */
-    fun rebuild(messages: List<QuickAiChatMessage>): BackendResult<Unit>
-
-    /**
-     * @brief Close the session, releasing its resources (conversation
-     * handle, cached images, etc.). Idempotent.
-     */
-    override fun close()
-}
-
-/**
  * @brief Common interface implemented by every QuickDotAI engine.
  *
  * Lifecycle: [load] exactly once, then any number of [run] /
@@ -280,7 +217,7 @@ interface QuickDotAI {
 
     // ----- Chat session API ------------------------------------------------
     // All chat operations go through this interface so the app never needs
-    // to interact with QuickAiChatSession directly.
+    // to interact with chat session classes directly.
 
     /**
      * @brief Open a new structured chat session on this engine.

@@ -3,7 +3,7 @@
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
  * @file    LiteRTLmChatSession.kt
- * @brief   QuickAiChatSession backed by a LiteRT-LM Conversation.
+ * @brief   Chat session helper backed by a LiteRT-LM Conversation.
  *
  * Each session owns its own LiteRT-LM [Conversation] and an [ImageStore]
  * that caches image bytes keyed by SHA-256 hash. When the same image
@@ -32,6 +32,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
+ * @brief Internal helper that holds the state of a single LiteRT-LM
+ *        chat session. Not an interface implementation — all public
+ *        chat API goes through [QuickDotAI] / [LiteRTLm].
+ *
  * @param engine      the parent LiteRT-LM engine (kept for rebuild)
  * @param config      session-level sampling + template config
  * @param visionEnabled whether the engine was loaded with a vision backend
@@ -46,8 +50,8 @@ internal class LiteRTLmChatSession(
     private val config: QuickAiChatSessionConfig?,
     private val visionEnabled: Boolean,
     private val onSessionClosed: (() -> Unit)? = null,
-    override val sessionId: String = UUID.randomUUID().toString()
-) : QuickAiChatSession {
+    val sessionId: String = UUID.randomUUID().toString()
+) {
 
     private var conversation: Conversation? = createConversationFromConfig(engine, config)
     internal val imageStore = ImageStore()
@@ -65,7 +69,7 @@ internal class LiteRTLmChatSession(
 
     // ----- run (blocking) ------------------------------------------------
 
-    override fun run(
+    fun run(
         messages: List<QuickAiChatMessage>
     ): BackendResult<QuickAiChatResult> {
         val c = conversation ?: return errClosed()
@@ -135,7 +139,7 @@ internal class LiteRTLmChatSession(
 
     // ----- runStreaming ---------------------------------------------------
 
-    override fun runStreaming(
+    fun runStreaming(
         messages: List<QuickAiChatMessage>,
         sink: StreamSink
     ): BackendResult<QuickAiChatResult> {
@@ -275,14 +279,14 @@ internal class LiteRTLmChatSession(
 
     // ----- cancel --------------------------------------------------------
 
-    override fun cancel() {
+    fun cancel() {
         cancelRequested.set(true)
         Log.i(TAG, "cancel($sessionId): cancel requested")
     }
 
     // ----- rebuild -------------------------------------------------------
 
-    override fun rebuild(
+    fun rebuild(
         messages: List<QuickAiChatMessage>
     ): BackendResult<Unit> {
         if (closed) return errClosed()
@@ -325,7 +329,7 @@ internal class LiteRTLmChatSession(
 
     // ----- close ---------------------------------------------------------
 
-    override fun close() {
+    fun close() {
         if (closed) return
         closed = true
         Log.i(TAG, "close($sessionId)")
