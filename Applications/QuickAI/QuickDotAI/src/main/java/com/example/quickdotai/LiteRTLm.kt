@@ -568,6 +568,18 @@ class LiteRTLm(
             )
         }
 
+        // LiteRT-LM allows only one Conversation per Engine. The flat
+        // run()/runStreaming() API keeps its own Conversation in
+        // `this.conversation` — close it first so the chat session can
+        // create a fresh one. It will be recreated when the session is
+        // closed (see closeActiveSession / closeChatSession).
+        try {
+            conversation?.close()
+        } catch (t: Throwable) {
+            Log.w(TAG, "openChatSession(): conversation.close() threw", t)
+        }
+        conversation = null
+
         return try {
             val session = LiteRTLmChatSession(
                 engine = e,
@@ -579,6 +591,9 @@ class LiteRTLm(
             BackendResult.Ok(session)
         } catch (t: Throwable) {
             Log.e(TAG, "openChatSession(): failed", t)
+            // Session creation failed — restore the flat-API Conversation
+            // so run()/runStreaming() remain usable.
+            restoreConversation()
             BackendResult.Err(
                 QuickAiError.INFERENCE_FAILED,
                 t.message ?: "failed to create chat session"
@@ -593,6 +608,8 @@ class LiteRTLm(
         session.close()
         activeSession = null
         Log.i(TAG, "closeChatSession($sessionId): closed")
+        // Restore the flat-API Conversation so run()/runStreaming() work again.
+        restoreConversation()
         return true
     }
 
@@ -602,12 +619,32 @@ class LiteRTLm(
         return if (session.sessionId == sessionId) session else null
     }
 
-    /** Close the active chat session if any. */
+    /**
+     * Close the active chat session if any. Does NOT restore the flat-API
+     * Conversation — callers that want to keep using the engine (e.g.
+     * [closeChatSession]) must call [restoreConversation] separately.
+     * [unload] / [close] skip restoration because [closeQuietly] tears
+     * everything down immediately afterward.
+     */
     private fun closeActiveSession() {
         activeSession?.let {
             Log.i(TAG, "closeActiveSession(): closing ${it.sessionId}")
             it.close()
             activeSession = null
+        }
+    }
+
+    /**
+     * Recreate `this.conversation` from the engine so the flat run()/
+     * runStreaming() API is usable again after a chat session closes.
+     */
+    private fun restoreConversation() {
+        if (conversation != null || engine == null) return
+        try {
+            conversation = engine!!.createConversation()
+            Log.i(TAG, "restoreConversation(): flat-API Conversation recreated")
+        } catch (t: Throwable) {
+            Log.e(TAG, "restoreConversation(): failed to recreate Conversation", t)
         }
     }
 
@@ -619,7 +656,7 @@ class LiteRTLm(
     }
 
     override fun metrics(): BackendResult<PerformanceMetrics> {
-        if (conversation == null) {
+        if (engine == null) {
             return BackendResult.Err(
                 QuickAiError.NOT_INITIALIZED,
                 "LiteRTLm has not been loaded yet"
