@@ -43,6 +43,15 @@
 #include <string>
 #include <thread_manager.h>
 
+// Runtime ARM feature detection via auxv HWCAP bits. SME/SME2 require
+// both CPU support AND OS kernel enablement (kernel 6.3+ for SME),
+// so compile-time flags alone are not sufficient — fall back to NEON
+// if the running kernel doesn't expose SME.
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+
 #include <chrono>
 #include <iostream>
 using std::chrono::duration_cast;
@@ -256,31 +265,50 @@ uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
   void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
   bool transB, float lower_bound, float upper_bound) {
-  // Select a SINGLE variant at compile time. The original code
-  // benchmarked ALL 8 NEON variants on EVERY call (for-loop + per-
-  // iteration LHS+RHS packing + timing), which made every FC forward
-  // 8x slower than necessary and completely missed SME/SME2 variants
-  // (hardcoded upper bound was `< 8`).
+  // Variant selection: compile-time feature availability + RUNTIME
+  // CPU feature check. An SME2-compiled binary can run on CPUs that
+  // only have SME, or pure NEON, or where the OS kernel hasn't
+  // enabled SME userspace access yet (common on current Android
+  // devices — Linux kernel SME support shipped in 6.3 but many
+  // phones still run older kernels). Without runtime fallback the
+  // kernel SIGILLs on SMSTART / SME2 instructions.
   //
   // Variant layout after C6 upstream sync:
-  //   [0..7]   NEON dotprod + i8mm (always compiled)
-  //   [8..9]   SME  mopa, SME  dot    (only with ENABLE_SME)
-  //   [10..11] SME2 mopa, SME2 sdot   (only with ENABLE_SME + SME2)
-  //
-  // For M=1 (GEMV, LLM decode critical path): pick the "dot"/"sdot"
-  // 1-row tile variant. For M>1 (GEMM, prefill): pick the "mopa"
-  // outer-product-accumulate variant.
+  //   [0..7]   NEON dotprod + i8mm (always compiled, always safe)
+  //   [8..9]   SME  mopa, SME  dot    (needs runtime SME)
+  //   [10..11] SME2 mopa, SME2 sdot   (needs runtime SME2)
   uint32_t ret_idx;
-#if defined(ENABLE_SME2)
-  ret_idx = (m == 1) ? 11 : 10;  // SME2 sdot (M=1) or SME2 mopa (M>1)
-#elif defined(ENABLE_SME)
-  ret_idx = (m == 1) ? 9 : 8;    // SME dot or SME mopa
-#else
-  // NEON-only: index 0 (qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod) is
-  // GEMV-tuned; index 4 (qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm) is
-  // a small-GEMM i8mm kernel.
-  ret_idx = (m == 1) ? 0 : 4;
+
+  // Runtime feature detection (aarch64 Linux/Android)
+  bool has_sme  = false;
+  bool has_sme2 = false;
+#if defined(__aarch64__) && defined(__linux__)
+  unsigned long hwcap2 = getauxval(AT_HWCAP2);
+# ifdef HWCAP2_SME
+  has_sme  = (hwcap2 & HWCAP2_SME)  != 0;
+# endif
+# ifdef HWCAP2_SME2
+  has_sme2 = (hwcap2 & HWCAP2_SME2) != 0;
+# endif
 #endif
+
+#if defined(ENABLE_SME2)
+  if (has_sme2) {
+    ret_idx = (m == 1) ? 11 : 10;  // SME2 sdot / mopa
+  } else
+#endif
+#if defined(ENABLE_SME)
+  if (has_sme) {
+    ret_idx = (m == 1) ? 9 : 8;    // SME dot / mopa
+  } else
+#endif
+  {
+    // NEON fallback. Index 0 (1x8_qsi4cxp4x8_1x4x32_neon_dotprod) is
+    // GEMV-tuned; index 5 (qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm)
+    // has the largest GEMM tile and is fastest on armv8.6-a+ cores
+    // that support i8mm (Cortex-X series, all recent Snapdragon 8).
+    ret_idx = (m == 1) ? 0 : 5;
+  }
   // Run ONCE at this selected variant, no benchmarking loop.
   for (int idx_variant = ret_idx; idx_variant == (int)ret_idx; idx_variant++) {
     rhs_format format = rhs_format::nxk;
