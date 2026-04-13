@@ -256,11 +256,33 @@ uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
   void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
   bool transB, float lower_bound, float upper_bound) {
-  uint32_t ret_idx = 0;
-  uint64_t min_latency = INT64_MAX;
-  ///@todo check for optimal variant, or check for optimal variant config for
-  /// specific M-N-K combination
-  for (int idx_variant = 0; idx_variant < 8; idx_variant++) {
+  // Select a SINGLE variant at compile time. The original code
+  // benchmarked ALL 8 NEON variants on EVERY call (for-loop + per-
+  // iteration LHS+RHS packing + timing), which made every FC forward
+  // 8x slower than necessary and completely missed SME/SME2 variants
+  // (hardcoded upper bound was `< 8`).
+  //
+  // Variant layout after C6 upstream sync:
+  //   [0..7]   NEON dotprod + i8mm (always compiled)
+  //   [8..9]   SME  mopa, SME  dot    (only with ENABLE_SME)
+  //   [10..11] SME2 mopa, SME2 sdot   (only with ENABLE_SME + SME2)
+  //
+  // For M=1 (GEMV, LLM decode critical path): pick the "dot"/"sdot"
+  // 1-row tile variant. For M>1 (GEMM, prefill): pick the "mopa"
+  // outer-product-accumulate variant.
+  uint32_t ret_idx;
+#if defined(ENABLE_SME2)
+  ret_idx = (m == 1) ? 11 : 10;  // SME2 sdot (M=1) or SME2 mopa (M>1)
+#elif defined(ENABLE_SME)
+  ret_idx = (m == 1) ? 9 : 8;    // SME dot or SME mopa
+#else
+  // NEON-only: index 0 (qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod) is
+  // GEMV-tuned; index 4 (qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm) is
+  // a small-GEMM i8mm kernel.
+  ret_idx = (m == 1) ? 0 : 4;
+#endif
+  // Run ONCE at this selected variant, no benchmarking loop.
+  for (int idx_variant = ret_idx; idx_variant == (int)ret_idx; idx_variant++) {
     rhs_format format = rhs_format::nxk;
     if (!transB) {
       format = rhs_format::kxn;
@@ -352,15 +374,8 @@ uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
       );
     }
 
-    auto t3 = high_resolution_clock::now();
-    auto dt2 = duration_cast<nanoseconds>(t3 - t2);
-    // std::cout << "  ukernel duration for kernel# " << idx_variant << " | "
-    //           << dt2.count() << " ns " << dt2.count() / 1'000 << " us "
-    //           << dt2.count() / 1'000'000 << " ms " << std::endl;
-
-    uint64_t casted_time = static_cast<uint64_t>(dt2.count());
-    ret_idx = (min_latency > casted_time) ? idx_variant : ret_idx;
-    min_latency = (min_latency > casted_time) ? casted_time : min_latency;
+    // Variant is pre-selected at compile time (see top of function);
+    // no per-call benchmarking or ret_idx update needed.
 
     delete[] lhs_packed_mtx_qa8dx;
     delete[] rhs_packed_mtx_qs4cx;
