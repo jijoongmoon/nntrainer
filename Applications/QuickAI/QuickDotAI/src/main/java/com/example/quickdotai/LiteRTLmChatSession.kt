@@ -395,7 +395,7 @@ class LiteRTLmChatSession(
         return hashes
     }
 
-    private fun <T> errClosed(): BackendResult.Err = BackendResult.Err(
+    private fun errClosed(): BackendResult.Err = BackendResult.Err(
         QuickAiError.NOT_INITIALIZED,
         "Chat session $sessionId is closed"
     )
