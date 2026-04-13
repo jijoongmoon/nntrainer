@@ -45,9 +45,18 @@ log_step() {
     echo -e "${YELLOW}----------------------------------------${NC}"
 }
 
+# Check if NDK path is set
+if [ -z "$ANDROID_NDK" ]; then
+    log_error "ANDROID_NDK is not set. Please set it to your Android NDK path."
+    log_info "Example: export ANDROID_NDK=/path/to/android-ndk-r21d"
+    log_info "Or: export ANDROID_NDK=~/Android/Sdk/ndk/26.1.10909125"
+    exit 1
+fi
+
 log_header "Install CausalLM to Android Device"
 log_info "INSTALL_DIR: $INSTALL_DIR"
 log_info "SCRIPT_DIR: $SCRIPT_DIR"
+log_info "ANDROID_NDK: $ANDROID_NDK"
 
 # Check if device is connected
 log_step "1/3" "Check device connection"
