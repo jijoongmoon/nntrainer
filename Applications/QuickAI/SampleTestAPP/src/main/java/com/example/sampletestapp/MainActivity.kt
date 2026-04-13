@@ -141,6 +141,7 @@ class MainActivity : AppCompatActivity() {
         val scrollRoot = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
             isFillViewport = true
+            fitsSystemWindows = true
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
