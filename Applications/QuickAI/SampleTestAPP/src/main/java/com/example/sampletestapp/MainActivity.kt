@@ -110,6 +110,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var chatSessionStatusView: TextView
     private lateinit var chatSystemPromptField: EditText
     private lateinit var chatTemperatureField: EditText
+    private lateinit var chatTopKField: EditText
+    private lateinit var chatTopPField: EditText
+    private lateinit var chatSeedField: EditText
     private lateinit var chatEnableThinkingSpinner: Spinner
     private lateinit var chatPromptField: EditText
 
@@ -333,8 +336,11 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(chatSystemPromptField)
 
-        // Sampling config
-        root.addView(labelView("Temperature (optional)"))
+        // Sampling config (all optional; specifying any of
+        // temperature/topK/topP forces the wrapper to supply all three,
+        // falling back to temperature=1.0 / topK=40 / topP=0.95 for
+        // unspecified fields — see LiteRTLmChatSession.buildSamplerConfig).
+        root.addView(labelView("Temperature (optional, ≥ 0)"))
         chatTemperatureField = EditText(this).apply {
             hint = "e.g. 0.7"
             inputType = android.text.InputType.TYPE_CLASS_NUMBER or
@@ -342,6 +348,32 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
         }
         root.addView(chatTemperatureField)
+
+        root.addView(labelView("topK (optional, > 0)"))
+        chatTopKField = EditText(this).apply {
+            hint = "e.g. 40"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+        }
+        root.addView(chatTopKField)
+
+        root.addView(labelView("topP (optional, 0..1)"))
+        chatTopPField = EditText(this).apply {
+            hint = "e.g. 0.95"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+        }
+        root.addView(chatTopPField)
+
+        root.addView(labelView("seed (optional, 0 = nondeterministic)"))
+        chatSeedField = EditText(this).apply {
+            hint = "e.g. 42"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+        }
+        root.addView(chatSeedField)
 
         root.addView(labelView("enable_thinking"))
         chatEnableThinkingSpinner = Spinner(this).apply {
@@ -662,7 +694,14 @@ class MainActivity : AppCompatActivity() {
         // Capture all UI values on the main thread — no latches needed.
         val req = buildLoadRequest()
         val systemPrompt = chatSystemPromptField.text.toString().trim().ifEmpty { null }
-        val tempStr = chatTemperatureField.text.toString().trim()
+        val temperature = chatTemperatureField.text.toString().trim()
+            .ifEmpty { null }?.toDoubleOrNull()
+        val topK = chatTopKField.text.toString().trim()
+            .ifEmpty { null }?.toIntOrNull()
+        val topP = chatTopPField.text.toString().trim()
+            .ifEmpty { null }?.toDoubleOrNull()
+        val seed = chatSeedField.text.toString().trim()
+            .ifEmpty { null }?.toIntOrNull()
         val thinkingIdx = chatEnableThinkingSpinner.selectedItemPosition
 
         setStatus("Opening chat session…")
@@ -679,10 +718,16 @@ class MainActivity : AppCompatActivity() {
                 try { e.closeChatSession() } catch (_: Throwable) {}
             }
 
-            // Build config from captured UI values
-            val sampling = if (tempStr.isNotEmpty()) {
+            // Build config from captured UI values. Leave sampling null
+            // when every sampling field is empty so LiteRT-LM uses its
+            // own engine/model default.
+            val sampling = if (temperature != null || topK != null ||
+                topP != null || seed != null) {
                 QuickAiChatSamplingConfig(
-                    temperature = tempStr.toDoubleOrNull()
+                    temperature = temperature,
+                    topK = topK,
+                    topP = topP,
+                    seed = seed
                 )
             } else null
 
