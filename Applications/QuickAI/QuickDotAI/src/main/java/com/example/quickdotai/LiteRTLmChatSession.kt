@@ -79,6 +79,24 @@ internal class LiteRTLmChatSession(
     /** Signals an in-flight cancel request. */
     private val cancelRequested = AtomicBoolean(false)
 
+    /**
+     * Session-level `extraContext` map forwarded to every
+     * [Conversation.sendMessage] / [Conversation.sendMessageAsync] call.
+     *
+     * LiteRT-LM's [ConversationConfig] does not expose template kwargs,
+     * so we materialize them per-call instead. Built once from
+     * [QuickAiChatSessionConfig.chatTemplateKwargs]:
+     *  - `enableThinking` → `"enable_thinking" → Boolean`
+     *
+     * Empty when no template kwargs are configured.
+     */
+    private val extraContext: Map<String, Any> =
+        buildExtraContext(config?.chatTemplateKwargs).also {
+            if (it.isNotEmpty()) {
+                Log.i(TAG, "LiteRTLmChatSession($sessionId): extraContext=$it")
+            }
+        }
+
     @Volatile
     private var closed = false
 
@@ -105,10 +123,10 @@ internal class LiteRTLmChatSession(
             val startNs = System.nanoTime()
             val response = if (hasImages(prep.lastUser)) {
                 val contents = toChatContents(prep.lastUser)
-                c.sendMessage(contents)
+                c.sendMessage(contents, extraContext)
             } else {
                 val text = extractText(prep.lastUser)
-                c.sendMessage(text)
+                c.sendMessage(text, extraContext)
             }
             lastRunDurationMs = (System.nanoTime() - startNs) / 1_000_000.0
 
@@ -211,10 +229,10 @@ internal class LiteRTLmChatSession(
         return try {
             if (hasImages(prep.lastUser)) {
                 val contents = toChatContents(prep.lastUser)
-                c.sendMessageAsync(contents, callback)
+                c.sendMessageAsync(contents, callback, extraContext)
             } else {
                 val text = extractText(prep.lastUser)
-                c.sendMessageAsync(text, callback)
+                c.sendMessageAsync(text, callback, extraContext)
             }
 
             val finished = latch.await(5, TimeUnit.MINUTES)
@@ -559,6 +577,30 @@ internal class LiteRTLmChatSession(
 
     companion object {
         private const val TAG = "LiteRTLmChatSession"
+
+        /**
+         * Translate a [QuickAiChatTemplateKwargs] into the
+         * `extraContext: Map<String, Any>` that LiteRT-LM's
+         * [Conversation.sendMessage] / `sendMessageAsync` accepts.
+         *
+         * The native chat template reads these keys directly
+         * (e.g. Jinja `{% if enable_thinking %}`), so the JSON-style
+         * snake_case names must be preserved exactly:
+         *  - [QuickAiChatTemplateKwargs.enableThinking] →
+         *    `"enable_thinking" → Boolean`
+         *
+         * Null fields are omitted from the map so the chat template's
+         * own default kicks in. Returns an empty map when [kwargs] is
+         * null.
+         */
+        private fun buildExtraContext(
+            kwargs: QuickAiChatTemplateKwargs?
+        ): Map<String, Any> {
+            if (kwargs == null) return emptyMap()
+            val out = mutableMapOf<String, Any>()
+            kwargs.enableThinking?.let { out["enable_thinking"] = it }
+            return out
+        }
 
         // Neutral fallback values used only when the caller specifies
         // *some* sampling fields but not all three required ones.
