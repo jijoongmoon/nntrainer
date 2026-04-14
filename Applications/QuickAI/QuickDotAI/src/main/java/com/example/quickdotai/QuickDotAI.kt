@@ -248,9 +248,13 @@ interface QuickDotAI {
 
     /**
      * @brief Send structured chat [messages] and return the assistant
-     * reply. Messages and the reply are accumulated in the session's
-     * internal history. Requires an active session opened via
-     * [openChatSession].
+     * reply. Requires an active session opened via [openChatSession].
+     *
+     * History is owned by the backend's KV cache, not by this wrapper.
+     * Callers should pass only the *new* messages that haven't been
+     * seen yet on this session — prior turns are implicitly retained
+     * across calls. To reset or re-seed the conversation, use
+     * [chatRebuild].
      */
     fun chatRun(
         messages: List<QuickAiChatMessage>
@@ -262,8 +266,8 @@ interface QuickDotAI {
 
     /**
      * @brief Streaming variant of [chatRun]. Deltas are pushed through
-     * [sink]; the full assistant reply is returned on completion and
-     * also appended to the internal history.
+     * [sink]; the full assistant reply is returned on completion.
+     * History is retained in the backend's KV cache across turns.
      */
     fun chatRunStreaming(
         messages: List<QuickAiChatMessage>,
@@ -284,9 +288,11 @@ interface QuickDotAI {
     fun chatCancel() { /* no-op by default */ }
 
     /**
-     * @brief Replace the active session's entire conversation history
-     * and rebuild internal engine state. Use this after history edits,
-     * sampling changes, or to recover from a failed/cancelled turn.
+     * @brief Reset the active session: drop the backend's KV cache and
+     * optionally pre-seed a fresh conversation with [messages] as
+     * initial turns. Pass `emptyList()` to simply clear the session.
+     * Use this after history edits, sampling changes, or to recover
+     * from a failed/cancelled turn.
      */
     fun chatRebuild(
         messages: List<QuickAiChatMessage>

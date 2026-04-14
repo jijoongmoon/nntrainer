@@ -10,6 +10,13 @@
  * via a different temporary file path, the hash matches and the
  * conversation history stays consistent.
  *
+ * History ownership:
+ * This wrapper does NOT track conversation history itself. The
+ * underlying LiteRT-LM [Conversation] owns the full KV cache, so prior
+ * turns are implicitly retained across calls as long as the same
+ * [Conversation] is reused. Callers are expected to pass only *new*
+ * messages on each turn — not the whole transcript.
+ *
  * Role handling:
  * OpenAI-style role-interleaved inputs (including multiple SYSTEM turns,
  * e.g. `[SYSTEM, USER, ASSISTANT, SYSTEM, USER]`) are forwarded to
@@ -21,11 +28,11 @@
  * natively.
  *
  * Fast path:
- * When the caller just passes a single trailing USER turn (the common
+ * When the caller passes a single trailing USER turn (the common
  * "continue the dialogue" case), the session reuses the existing
  * [Conversation] and simply calls `sendMessage(user)` — no close / no
- * re-prefill. LiteRT-LM keeps the prior history internally, so this
- * stays O(new tokens) instead of O(all tokens) per turn.
+ * re-prefill. LiteRT-LM keeps the prior history in its KV cache, so
+ * this stays O(new tokens) instead of O(all tokens) per turn.
  */
 package com.example.quickdotai
 
@@ -69,16 +76,6 @@ internal class LiteRTLmChatSession(
     private var conversation: Conversation? = null
     internal val imageStore = ImageStore()
 
-    /**
-     * Accumulated conversation history across turns. Populated after
-     * each successful [run] / [runStreaming]. On every new turn the
-     * session rebuilds the underlying LiteRT-LM [Conversation] with
-     * [history] + the new messages (minus the trailing USER turn) as
-     * `ConversationConfig.initialMessages`, so the model's chat
-     * template sees the full role-annotated array natively.
-     */
-    private val history = mutableListOf<QuickAiChatMessage>()
-
     /** Signals an in-flight cancel request. */
     private val cancelRequested = AtomicBoolean(false)
 
@@ -117,8 +114,6 @@ internal class LiteRTLmChatSession(
 
             val output = response.toString()
             Log.i(TAG, "run($sessionId): completed in ${lastRunDurationMs.toLong()} ms")
-
-            commitTurn(prep.effective, output)
 
             BackendResult.Ok(
                 QuickAiChatResult(
@@ -238,7 +233,6 @@ internal class LiteRTLmChatSession(
             }
 
             val output = accumulated.toString()
-            commitTurn(prep.effective, output)
             BackendResult.Ok(
                 QuickAiChatResult(
                     content = output,
@@ -272,13 +266,12 @@ internal class LiteRTLmChatSession(
 
         Log.i(
             TAG,
-            "rebuild($sessionId): replacing history " +
-                "(${history.size} → ${messages.size} messages)"
+            "rebuild($sessionId): reset Conversation and pre-seed with " +
+                "${messages.size} message(s)"
         )
 
-        // Close old conversation — the next chatRun / chatRunStreaming
-        // will lazily build a fresh one with initialMessages set from
-        // the new history.
+        // Drop the KV cache carried by the current Conversation so the
+        // rebuild is a true reset.
         try {
             conversation?.close()
         } catch (t: Throwable) {
@@ -286,15 +279,35 @@ internal class LiteRTLmChatSession(
         }
         conversation = null
 
-        // Update history
-        history.clear()
-        history.addAll(messages)
-
-        // Prune images not referenced by the new history
+        // Prune images not referenced by the new seed.
         val referencedHashes = collectImageHashes(messages)
         imageStore.retainOnly(referencedHashes)
 
-        Log.i(TAG, "rebuild($sessionId): done, new history size=${history.size}")
+        // When the caller provides seed messages, eagerly create a new
+        // Conversation with them as initialMessages so LiteRT-LM can
+        // pre-fill its KV cache. If no seed is given, we leave the
+        // Conversation null and the next run() will lazily create it.
+        if (messages.isNotEmpty()) {
+            val initial = try {
+                messages.map { toLiteRtMessage(it) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "rebuild($sessionId): mapping seed failed", t)
+                return BackendResult.Err(
+                    QuickAiError.INFERENCE_FAILED,
+                    t.message ?: "failed to map seed messages"
+                )
+            }
+            try {
+                conversation = createConversationFromConfig(engine, config, initial)
+            } catch (t: Throwable) {
+                Log.e(TAG, "rebuild($sessionId): createConversation threw", t)
+                return BackendResult.Err(
+                    QuickAiError.INFERENCE_FAILED,
+                    t.message ?: "failed to create seeded Conversation"
+                )
+            }
+        }
+
         return BackendResult.Ok(Unit)
     }
 
@@ -311,7 +324,6 @@ internal class LiteRTLmChatSession(
         }
         conversation = null
         imageStore.clear()
-        history.clear()
         try {
             onSessionClosed?.invoke()
         } catch (t: Throwable) {
@@ -321,9 +333,8 @@ internal class LiteRTLmChatSession(
 
     // ----- helpers -------------------------------------------------------
 
-    /** Per-turn data: full effective history, trailing USER, and prior turns. */
+    /** Per-turn data: trailing USER and any prior turns in this call. */
     private data class TurnPrep(
-        val effective: List<QuickAiChatMessage>,
         val priorTurns: List<QuickAiChatMessage>,
         val lastUser: QuickAiChatMessage,
     )
@@ -337,8 +348,9 @@ internal class LiteRTLmChatSession(
     private var lastPrepError: BackendResult.Err? = null
 
     /**
-     * Merge new [messages] into [history], locate the trailing USER
-     * turn that will drive inference, and validate vision requirements.
+     * Validate [messages] (non-empty, trailing USER, vision gating) and
+     * split off the trailing USER turn that will drive inference from
+     * any leading turns that need to feed the chat template.
      *
      * Returns null on validation failure; the concrete error is stashed
      * in [lastPrepError] for the caller to surface (and optionally
@@ -362,11 +374,10 @@ internal class LiteRTLmChatSession(
             return null
         }
 
-        val effective = history + messages
-        val lastUser = effective.last()
-        val priorTurns = effective.subList(0, effective.size - 1)
+        val lastUser = messages.last()
+        val priorTurns = messages.subList(0, messages.size - 1)
 
-        if (!visionEnabled && effective.any { hasImages(it) }) {
+        if (!visionEnabled && messages.any { hasImages(it) }) {
             lastPrepError = BackendResult.Err(
                 QuickAiError.UNSUPPORTED,
                 "Engine loaded in text-only mode — cannot process images"
@@ -374,7 +385,7 @@ internal class LiteRTLmChatSession(
             return null
         }
 
-        return TurnPrep(effective = effective, priorTurns = priorTurns, lastUser = lastUser)
+        return TurnPrep(priorTurns = priorTurns, lastUser = lastUser)
     }
 
     /**
@@ -425,22 +436,21 @@ internal class LiteRTLmChatSession(
     /**
      * Fast path wrapper around [rebuildConversationForTurn].
      *
-     * Invariant maintained by [commitTurn]: after every successful turn,
-     * LiteRT-LM's internal [Conversation] state mirrors this session's
-     * [history] (prior turns + the just-appended assistant reply).
+     * Source of truth: LiteRT-LM's [Conversation] owns the KV cache and
+     * therefore the full conversation history. As long as we keep
+     * handing the same [Conversation] out, `sendMessage(user)` extends
+     * the dialogue correctly — no replay needed on our side.
      *
-     * When the next call adds only a single trailing USER turn — the
-     * common "continue the dialogue" case — we can therefore skip the
-     * close+rebuild+re-prefill cycle and simply let LiteRT-LM extend the
-     * existing conversation via `sendMessage(user)`. This keeps each
-     * follow-up turn O(new user tokens) instead of O(all history tokens).
+     * When the caller passes only a single trailing USER turn we just
+     * reuse the existing [Conversation]. This keeps each follow-up turn
+     * O(new user tokens) instead of O(all history tokens).
      *
      * Falls back to [rebuildConversationForTurn] whenever:
-     *  - no existing Conversation is held yet (first turn), or
+     *  - no existing Conversation is held yet (first turn, or post-rebuild), or
      *  - the caller injects anything other than exactly one USER turn
      *    (e.g. SYSTEM/ASSISTANT turns, role-interleaved bundles, or
      *    multi-USER batches) — those require the full role-annotated
-     *    initialMessages replay to render correctly.
+     *    initialMessages replay, which drops the KV cache.
      */
     private fun acquireConversationForTurn(
         prep: TurnPrep,
@@ -454,33 +464,11 @@ internal class LiteRTLmChatSession(
             Log.i(
                 TAG,
                 "acquireConversationForTurn($sessionId): fast path — " +
-                    "reusing existing Conversation (history=${history.size})"
+                    "reusing existing Conversation (KV cache retained)"
             )
             return existing
         }
         return rebuildConversationForTurn(prep.priorTurns)
-    }
-
-    /**
-     * Atomically replace [history] with [effective] + the assistant
-     * reply produced this turn.
-     *
-     * This also preserves the fast-path invariant: after this call,
-     * the tracked [history] matches what LiteRT-LM has seen internally
-     * (either via the full `initialMessages` replay on a rebuild, or
-     * via the single `sendMessage(user)` append on the fast path),
-     * so the *next* turn is free to reuse the same [Conversation]
-     * when it only adds a new USER message.
-     */
-    private fun commitTurn(effective: List<QuickAiChatMessage>, reply: String) {
-        history.clear()
-        history.addAll(effective)
-        history.add(
-            QuickAiChatMessage(
-                role = QuickAiChatRole.ASSISTANT,
-                parts = listOf(PromptPart.Text(reply))
-            )
-        )
     }
 
     /**
