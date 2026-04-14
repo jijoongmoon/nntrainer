@@ -5,14 +5,20 @@
  * @file    LiteRTLmChatSession.kt
  * @brief   Chat session helper backed by a LiteRT-LM Conversation.
  *
- * Each session owns its own LiteRT-LM [Conversation] and an [ImageStore]
- * that caches image bytes keyed by SHA-256 hash. When the same image
- * arrives via a different temporary file path, the hash matches and
- * the conversation history stays consistent.
+ * Each session owns a LiteRT-LM [Conversation] and an [ImageStore] that
+ * caches image bytes keyed by SHA-256 hash. When the same image arrives
+ * via a different temporary file path, the hash matches and the
+ * conversation history stays consistent.
  *
- * History is accumulated internally — callers send only the new
- * messages for each turn, and the session appends them plus the
- * assistant reply.
+ * Role handling:
+ * OpenAI-style role-interleaved inputs (including multiple SYSTEM turns,
+ * e.g. `[SYSTEM, USER, ASSISTANT, SYSTEM, USER]`) are forwarded to
+ * LiteRT-LM with roles preserved. Each call rebuilds the underlying
+ * [Conversation] with prior turns passed through
+ * [ConversationConfig.initialMessages] as a mix of [Message.system],
+ * [Message.user], and [Message.model] — the model's embedded chat
+ * template then renders the full role-annotated array natively. Only
+ * the trailing USER turn is sent via `sendMessage*` to drive inference.
  */
 package com.example.quickdotai
 
@@ -53,10 +59,17 @@ internal class LiteRTLmChatSession(
     val sessionId: String = UUID.randomUUID().toString()
 ) {
 
-    private var conversation: Conversation? = createConversationFromConfig(engine, config)
+    private var conversation: Conversation? = null
     internal val imageStore = ImageStore()
 
-    /** Accumulated conversation history. */
+    /**
+     * Accumulated conversation history across turns. Populated after
+     * each successful [run] / [runStreaming]. On every new turn the
+     * session rebuilds the underlying LiteRT-LM [Conversation] with
+     * [history] + the new messages (minus the trailing USER turn) as
+     * `ConversationConfig.initialMessages`, so the model's chat
+     * template sees the full role-annotated array natively.
+     */
     private val history = mutableListOf<QuickAiChatMessage>()
 
     /** Signals an in-flight cancel request. */
@@ -72,42 +85,25 @@ internal class LiteRTLmChatSession(
     fun run(
         messages: List<QuickAiChatMessage>
     ): BackendResult<QuickAiChatResult> {
-        val c = conversation ?: return errClosed()
         if (closed) return errClosed()
         cancelRequested.set(false)
 
-        if (messages.isEmpty()) {
-            return BackendResult.Err(
-                QuickAiError.INVALID_PARAMETER,
-                "messages list is empty"
-            )
-        }
-
-        // Build the LiteRT-LM contents from the last user message.
-        // The conversation object already holds prior context.
-        val lastUserMsg = messages.lastOrNull { it.role == QuickAiChatRole.USER }
-            ?: return BackendResult.Err(
-                QuickAiError.INVALID_PARAMETER,
-                "no USER message found in the provided messages"
-            )
-
-        // Append all new messages to history (they become part of the
-        // session state regardless of inference outcome).
-        history.addAll(messages)
+        val prep = prepareTurn(messages) ?: return lastPrepError
+            ?: BackendResult.Err(QuickAiError.INVALID_PARAMETER, "invalid chat input")
 
         return try {
+            val c = rebuildConversationForTurn(prep.priorTurns)
+                ?: return BackendResult.Err(
+                    QuickAiError.INFERENCE_FAILED,
+                    "Failed to build Conversation for this turn"
+                )
+
             val startNs = System.nanoTime()
-            val response = if (hasImages(lastUserMsg)) {
-                if (!visionEnabled) {
-                    return BackendResult.Err(
-                        QuickAiError.UNSUPPORTED,
-                        "Engine loaded in text-only mode — cannot process images"
-                    )
-                }
-                val contents = toChatContents(lastUserMsg)
+            val response = if (hasImages(prep.lastUser)) {
+                val contents = toChatContents(prep.lastUser)
                 c.sendMessage(contents)
             } else {
-                val text = extractText(lastUserMsg)
+                val text = extractText(prep.lastUser)
                 c.sendMessage(text)
             }
             lastRunDurationMs = (System.nanoTime() - startNs) / 1_000_000.0
@@ -115,12 +111,7 @@ internal class LiteRTLmChatSession(
             val output = response.toString()
             Log.i(TAG, "run($sessionId): completed in ${lastRunDurationMs.toLong()} ms")
 
-            // Append assistant reply to history
-            val assistantMsg = QuickAiChatMessage(
-                role = QuickAiChatRole.ASSISTANT,
-                parts = listOf(PromptPart.Text(output))
-            )
-            history.add(assistantMsg)
+            commitTurn(prep.effective, output)
 
             BackendResult.Ok(
                 QuickAiChatResult(
@@ -143,11 +134,6 @@ internal class LiteRTLmChatSession(
         messages: List<QuickAiChatMessage>,
         sink: StreamSink
     ): BackendResult<QuickAiChatResult> {
-        val c = conversation ?: run {
-            val err = errClosed()
-            sink.onError(err.error, err.message)
-            return err
-        }
         if (closed) {
             val err = errClosed()
             sink.onError(err.error, err.message)
@@ -155,26 +141,25 @@ internal class LiteRTLmChatSession(
         }
         cancelRequested.set(false)
 
-        if (messages.isEmpty()) {
-            val err = BackendResult.Err(
+        val prep = prepareTurn(messages)
+        if (prep == null) {
+            val err = lastPrepError ?: BackendResult.Err(
                 QuickAiError.INVALID_PARAMETER,
-                "messages list is empty"
+                "invalid chat input"
             )
             sink.onError(err.error, err.message)
             return err
         }
 
-        val lastUserMsg = messages.lastOrNull { it.role == QuickAiChatRole.USER }
-        if (lastUserMsg == null) {
+        val c = rebuildConversationForTurn(prep.priorTurns)
+        if (c == null) {
             val err = BackendResult.Err(
-                QuickAiError.INVALID_PARAMETER,
-                "no USER message found"
+                QuickAiError.INFERENCE_FAILED,
+                "Failed to build Conversation for this turn"
             )
             sink.onError(err.error, err.message)
             return err
         }
-
-        history.addAll(messages)
 
         val latch = CountDownLatch(1)
         val accumulated = StringBuilder()
@@ -222,19 +207,11 @@ internal class LiteRTLmChatSession(
         }
 
         return try {
-            if (hasImages(lastUserMsg)) {
-                if (!visionEnabled) {
-                    val err = BackendResult.Err(
-                        QuickAiError.UNSUPPORTED,
-                        "Engine loaded in text-only mode"
-                    )
-                    sink.onError(err.error, err.message)
-                    return err
-                }
-                val contents = toChatContents(lastUserMsg)
+            if (hasImages(prep.lastUser)) {
+                val contents = toChatContents(prep.lastUser)
                 c.sendMessageAsync(contents, callback)
             } else {
-                val text = extractText(lastUserMsg)
+                val text = extractText(prep.lastUser)
                 c.sendMessageAsync(text, callback)
             }
 
@@ -254,12 +231,7 @@ internal class LiteRTLmChatSession(
             }
 
             val output = accumulated.toString()
-            history.add(
-                QuickAiChatMessage(
-                    role = QuickAiChatRole.ASSISTANT,
-                    parts = listOf(PromptPart.Text(output))
-                )
-            )
+            commitTurn(prep.effective, output)
             BackendResult.Ok(
                 QuickAiChatResult(
                     content = output,
@@ -297,23 +269,15 @@ internal class LiteRTLmChatSession(
                 "(${history.size} → ${messages.size} messages)"
         )
 
-        // Close old conversation
+        // Close old conversation — the next chatRun / chatRunStreaming
+        // will lazily build a fresh one with initialMessages set from
+        // the new history.
         try {
             conversation?.close()
         } catch (t: Throwable) {
             Log.w(TAG, "rebuild($sessionId): conversation.close() threw", t)
         }
-
-        // Create a fresh conversation (preserving the session config)
-        conversation = try {
-            createConversationFromConfig(engine, config)
-        } catch (t: Throwable) {
-            Log.e(TAG, "rebuild($sessionId): createConversation failed", t)
-            return BackendResult.Err(
-                QuickAiError.INFERENCE_FAILED,
-                "Failed to create new conversation: ${t.message}"
-            )
-        }
+        conversation = null
 
         // Update history
         history.clear()
@@ -349,6 +313,141 @@ internal class LiteRTLmChatSession(
     }
 
     // ----- helpers -------------------------------------------------------
+
+    /** Per-turn data: full effective history, trailing USER, and prior turns. */
+    private data class TurnPrep(
+        val effective: List<QuickAiChatMessage>,
+        val priorTurns: List<QuickAiChatMessage>,
+        val lastUser: QuickAiChatMessage,
+    )
+
+    /**
+     * Surface for [run] / [runStreaming] to learn WHY [prepareTurn]
+     * returned null without resorting to exceptions. Mutated only from
+     * the caller thread right before prepareTurn is invoked.
+     */
+    @Volatile
+    private var lastPrepError: BackendResult.Err? = null
+
+    /**
+     * Merge new [messages] into [history], locate the trailing USER
+     * turn that will drive inference, and validate vision requirements.
+     *
+     * Returns null on validation failure; the concrete error is stashed
+     * in [lastPrepError] for the caller to surface (and optionally
+     * forward to a StreamSink).
+     */
+    private fun prepareTurn(messages: List<QuickAiChatMessage>): TurnPrep? {
+        lastPrepError = null
+        if (messages.isEmpty()) {
+            lastPrepError = BackendResult.Err(
+                QuickAiError.INVALID_PARAMETER,
+                "messages list is empty"
+            )
+            return null
+        }
+        if (messages.last().role != QuickAiChatRole.USER) {
+            lastPrepError = BackendResult.Err(
+                QuickAiError.INVALID_PARAMETER,
+                "last message must have role USER to trigger inference " +
+                    "(got ${messages.last().role})"
+            )
+            return null
+        }
+
+        val effective = history + messages
+        val lastUser = effective.last()
+        val priorTurns = effective.subList(0, effective.size - 1)
+
+        if (!visionEnabled && effective.any { hasImages(it) }) {
+            lastPrepError = BackendResult.Err(
+                QuickAiError.UNSUPPORTED,
+                "Engine loaded in text-only mode — cannot process images"
+            )
+            return null
+        }
+
+        return TurnPrep(effective = effective, priorTurns = priorTurns, lastUser = lastUser)
+    }
+
+    /**
+     * Close any previously-held Conversation and build a fresh one for
+     * this turn, passing [priorTurns] through
+     * [ConversationConfig.initialMessages] so LiteRT-LM's native chat
+     * template renders the full role-annotated array.
+     *
+     * Returns null on construction failure.
+     */
+    private fun rebuildConversationForTurn(
+        priorTurns: List<QuickAiChatMessage>
+    ): Conversation? {
+        try {
+            conversation?.close()
+        } catch (t: Throwable) {
+            Log.w(TAG, "rebuildConversationForTurn($sessionId): close() threw", t)
+        }
+        conversation = null
+
+        val initial = try {
+            priorTurns.map { toLiteRtMessage(it) }
+        } catch (t: Throwable) {
+            Log.e(TAG, "rebuildConversationForTurn($sessionId): mapping failed", t)
+            return null
+        }
+
+        return try {
+            createConversationFromConfig(engine, config, initial).also {
+                conversation = it
+                if (initial.isNotEmpty()) {
+                    Log.i(
+                        TAG,
+                        "rebuildConversationForTurn($sessionId): seeded with " +
+                            "${initial.size} initialMessage(s) " +
+                            priorTurns.joinToString(prefix = "[", postfix = "]") {
+                                it.role.name
+                            }
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "rebuildConversationForTurn($sessionId): createConversation threw", t)
+            null
+        }
+    }
+
+    /**
+     * Atomically replace [history] with [effective] + the assistant
+     * reply produced this turn.
+     */
+    private fun commitTurn(effective: List<QuickAiChatMessage>, reply: String) {
+        history.clear()
+        history.addAll(effective)
+        history.add(
+            QuickAiChatMessage(
+                role = QuickAiChatRole.ASSISTANT,
+                parts = listOf(PromptPart.Text(reply))
+            )
+        )
+    }
+
+    /**
+     * Map a [QuickAiChatMessage] to a LiteRT-LM [Message], preserving
+     * the original role:
+     *  - [QuickAiChatRole.SYSTEM]    → [Message.system]
+     *  - [QuickAiChatRole.USER]      → [Message.user]
+     *  - [QuickAiChatRole.ASSISTANT] → [Message.model]
+     *
+     * Image parts are also stored in the session's [imageStore] so the
+     * hash-based identity stays stable across rebuilds.
+     */
+    private fun toLiteRtMessage(msg: QuickAiChatMessage): Message {
+        val contents = toChatContents(msg)
+        return when (msg.role) {
+            QuickAiChatRole.SYSTEM -> Message.system(contents)
+            QuickAiChatRole.USER -> Message.user(contents)
+            QuickAiChatRole.ASSISTANT -> Message.model(contents = contents)
+        }
+    }
 
     private fun hasImages(msg: QuickAiChatMessage): Boolean =
         msg.parts.any { it is PromptPart.ImageFile || it is PromptPart.ImageBytes }
@@ -430,41 +529,51 @@ internal class LiteRTLmChatSession(
         private const val FALLBACK_TOP_P = 0.95
 
         /**
-         * Build a LiteRT-LM [Conversation] from a [QuickAiChatSessionConfig].
+         * Build a LiteRT-LM [Conversation] from a [QuickAiChatSessionConfig]
+         * and a list of prior turns that will be forwarded to the native
+         * chat template via [ConversationConfig.initialMessages].
          *
          * Maps:
          *  - [QuickAiChatSessionConfig.systemInstruction] →
          *    [ConversationConfig.systemInstruction]
          *  - [QuickAiChatSamplingConfig] → [SamplerConfig]
          *    (see [buildSamplerConfig] for per-field behavior)
+         *  - [initialMessages] → [ConversationConfig.initialMessages]
+         *    (role-preserving: SYSTEM/USER/ASSISTANT → system/user/model)
          *
          * Falls back to the bare `engine.createConversation()` overload
-         * when nothing is configured, so LiteRT-LM uses its own
-         * engine-level default sampling.
+         * only when nothing is configured AND there are no prior turns,
+         * so LiteRT-LM uses its own engine-level defaults.
          */
         private fun createConversationFromConfig(
             engine: Engine,
-            config: QuickAiChatSessionConfig?
+            config: QuickAiChatSessionConfig?,
+            initialMessages: List<Message> = emptyList(),
         ): Conversation {
             val sysInstruction = config?.systemInstruction?.takeIf { it.isNotBlank() }
             val samplerConfig = buildSamplerConfig(config?.sampling)
 
             // Skip ConversationConfig entirely when nothing is configured
             // so LiteRT-LM uses its own engine/model defaults.
-            if (sysInstruction == null && samplerConfig == null) {
+            if (sysInstruction == null &&
+                samplerConfig == null &&
+                initialMessages.isEmpty()
+            ) {
                 return engine.createConversation()
             }
 
             val convConfig = ConversationConfig(
                 systemInstruction =
                     sysInstruction?.let { Contents.of(it) },
+                initialMessages = initialMessages,
                 samplerConfig = samplerConfig,
             )
             Log.i(
                 TAG,
                 "createConversationFromConfig: " +
                     "sysInstruction=${sysInstruction?.take(60)}, " +
-                    "samplerConfig=$samplerConfig"
+                    "samplerConfig=$samplerConfig, " +
+                    "initialMessages=${initialMessages.size}"
             )
             return engine.createConversation(convConfig)
         }
