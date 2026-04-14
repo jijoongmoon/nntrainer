@@ -64,6 +64,10 @@ import com.example.quickdotai.QuickDotAI
 import com.example.quickdotai.StreamSink
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 class MainActivity : AppCompatActivity() {
 
@@ -108,6 +112,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var chatTemperatureField: EditText
     private lateinit var chatEnableThinkingSpinner: Spinner
     private lateinit var chatPromptField: EditText
+
+    // OpenAI-style messages input UI
+    private lateinit var openAIMessagesField: EditText
 
     /**
      * @brief Raw bytes of the most recently picked image, or null if
@@ -388,6 +395,53 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { onChatCloseClicked() }
         }
         root.addView(chatCloseBtn)
+
+        // ============================================================
+        // OpenAI-Style Messages Input Section
+        // ============================================================
+        root.addView(dividerView())
+
+        val openAITitle = TextView(this).apply {
+            text = "OpenAI-Style Messages Input"
+            textSize = 18f
+            setPadding(0, pad / 2, 0, 0)
+        }
+        root.addView(openAITitle)
+
+        val openAISubtitle = TextView(this).apply {
+            text = "Parse OpenAI-style JSON messages array and run chat"
+            textSize = 12f
+            setPadding(0, 0, 0, pad / 4)
+        }
+        root.addView(openAISubtitle)
+
+        root.addView(labelView("Messages JSON (OpenAI format)"))
+        openAIMessagesField = EditText(this).apply {
+            hint = """[{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]"""
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+            minLines = 4
+            maxLines = 10
+            setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
+            textSize = 12f
+            // Pre-fill with example
+            setText("""[
+  {"role": "system", "content": "You are a helpful assistant."},
+  {"role": "user", "content": "Write a short joke about saving RAM."}
+]""")
+        }
+        root.addView(openAIMessagesField)
+
+        val openAIRunBtn = Button(this).apply {
+            text = "Run OpenAI Messages (streaming)"
+            setOnClickListener { onOpenAIMessagesRunClicked() }
+        }
+        root.addView(openAIRunBtn)
+
+        val openAIRunBlockingBtn = Button(this).apply {
+            text = "Run OpenAI Messages (blocking)"
+            setOnClickListener { onOpenAIMessagesRunBlockingClicked() }
+        }
+        root.addView(openAIRunBlockingBtn)
 
         statusView = TextView(this).apply {
             text = "Idle."
@@ -811,6 +865,229 @@ class MainActivity : AppCompatActivity() {
             listOf(PromptPart.ImageBytes(imgBytes), PromptPart.Text(prompt))
         } else {
             listOf(PromptPart.Text(prompt))
+        }
+    }
+
+    // --- OpenAI-style messages handlers -----------------------------------
+
+    /**
+     * @brief Parse result for OpenAI-style messages.
+     * @property systemPrompt The system instruction (from role="system").
+     * @property messages The chat messages (user/assistant roles only).
+     */
+    private data class ParsedOpenAIMessages(
+        val systemPrompt: String?,
+        val messages: List<QuickAiChatMessage>
+    )
+
+    /**
+     * @brief Parse OpenAI-style JSON messages array into QuickDotAI types.
+     *
+     * Input format:
+     * ```json
+     * [
+     *   {"role": "system", "content": "You are a helpful assistant."},
+     *   {"role": "user", "content": "Hello!"},
+     *   {"role": "assistant", "content": "Hi there!"},
+     *   {"role": "user", "content": "How are you?"}
+     * ]
+     * ```
+     *
+     * @param jsonString JSON array of message objects
+     * @return ParsedOpenAIMessages or null on parse error
+     */
+    private fun parseOpenAIMessages(jsonString: String): ParsedOpenAIMessages? {
+        return try {
+            val json = Json { ignoreUnknownKeys = true; isLenient = true }
+            val jsonArray = json.parseToJsonElement(jsonString).jsonArray
+
+            var systemPrompt: String? = null
+            val messages = mutableListOf<QuickAiChatMessage>()
+
+            for (element in jsonArray) {
+                val obj = element.jsonObject
+                val role = obj["role"]?.jsonPrimitive?.content?.lowercase() ?: continue
+                val content = obj["content"]?.jsonPrimitive?.content ?: ""
+
+                when (role) {
+                    "system" -> systemPrompt = content
+                    "user" -> messages.add(
+                        QuickAiChatMessage(
+                            role = QuickAiChatRole.USER,
+                            parts = listOf(PromptPart.Text(content))
+                        )
+                    )
+                    "assistant" -> messages.add(
+                        QuickAiChatMessage(
+                            role = QuickAiChatRole.ASSISTANT,
+                            parts = listOf(PromptPart.Text(content))
+                        )
+                    )
+                }
+            }
+
+            ParsedOpenAIMessages(systemPrompt, messages)
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * @brief Run OpenAI-style messages with streaming output.
+     * Parses the JSON, opens a session with system prompt, and runs chat.
+     */
+    private fun onOpenAIMessagesRunClicked() {
+        val jsonText = openAIMessagesField.text.toString().trim()
+        if (jsonText.isBlank()) {
+            setStatus("Messages JSON is empty.")
+            return
+        }
+
+        val parsed = parseOpenAIMessages(jsonText)
+        if (parsed == null) {
+            setStatus("Failed to parse messages JSON. Check format.")
+            return
+        }
+
+        if (parsed.messages.isEmpty()) {
+            setStatus("No user/assistant messages found in JSON.")
+            return
+        }
+
+        outputView.text = ""
+        setStatus("Opening session and running OpenAI messages…")
+
+        val req = buildLoadRequest()
+        engineExecutor.execute {
+            // Load model if needed
+            val e = loadModelInternal(req)
+            if (e == null) {
+                setStatus("Model load failed.")
+                return@execute
+            }
+
+            // Close existing session if any
+            if (e.chatSessionId != null) {
+                try { e.closeChatSession() } catch (_: Throwable) {}
+            }
+
+            // Build config with system prompt
+            val config = parsed.systemPrompt?.let { sysPrompt ->
+                QuickAiChatSessionConfig(systemInstruction = sysPrompt)
+            }
+
+            // Open new session
+            when (val openResult = e.openChatSession(config)) {
+                is BackendResult.Err -> {
+                    setStatus("Failed to open session: ${openResult.message}")
+                    return@execute
+                }
+                is BackendResult.Ok -> {
+                    mainHandler.post {
+                        chatSessionStatusView.text = "Session: ${openResult.value.take(8)}… (active)"
+                    }
+                }
+            }
+
+            // Run streaming
+            val sink = object : StreamSink {
+                override fun onDelta(text: String) {
+                    mainHandler.post { outputView.append(text) }
+                }
+                override fun onDone() {
+                    setStatus("OpenAI messages chat done.")
+                }
+                override fun onError(error: QuickAiError, message: String?) {
+                    setStatus("Chat error: [${error.name}] ${message ?: ""}")
+                }
+            }
+
+            try {
+                when (val r = e.chatRunStreaming(parsed.messages, sink)) {
+                    is BackendResult.Ok -> {
+                        setStatus("Done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)")
+                    }
+                    is BackendResult.Err -> {
+                        // Error already surfaced via sink.onError
+                    }
+                }
+            } catch (t: Throwable) {
+                setStatus("Chat threw: ${t.message}")
+            }
+        }
+    }
+
+    /**
+     * @brief Run OpenAI-style messages with blocking output.
+     * Parses the JSON, opens a session with system prompt, and runs chat.
+     */
+    private fun onOpenAIMessagesRunBlockingClicked() {
+        val jsonText = openAIMessagesField.text.toString().trim()
+        if (jsonText.isBlank()) {
+            setStatus("Messages JSON is empty.")
+            return
+        }
+
+        val parsed = parseOpenAIMessages(jsonText)
+        if (parsed == null) {
+            setStatus("Failed to parse messages JSON. Check format.")
+            return
+        }
+
+        if (parsed.messages.isEmpty()) {
+            setStatus("No user/assistant messages found in JSON.")
+            return
+        }
+
+        outputView.text = ""
+        setStatus("Opening session and running OpenAI messages (blocking)…")
+
+        val req = buildLoadRequest()
+        engineExecutor.execute {
+            // Load model if needed
+            val e = loadModelInternal(req)
+            if (e == null) {
+                setStatus("Model load failed.")
+                return@execute
+            }
+
+            // Close existing session if any
+            if (e.chatSessionId != null) {
+                try { e.closeChatSession() } catch (_: Throwable) {}
+            }
+
+            // Build config with system prompt
+            val config = parsed.systemPrompt?.let { sysPrompt ->
+                QuickAiChatSessionConfig(systemInstruction = sysPrompt)
+            }
+
+            // Open new session
+            when (val openResult = e.openChatSession(config)) {
+                is BackendResult.Err -> {
+                    setStatus("Failed to open session: ${openResult.message}")
+                    return@execute
+                }
+                is BackendResult.Ok -> {
+                    mainHandler.post {
+                        chatSessionStatusView.text = "Session: ${openResult.value.take(8)}… (active)"
+                    }
+                }
+            }
+
+            // Run blocking
+            try {
+                when (val r = e.chatRun(parsed.messages)) {
+                    is BackendResult.Ok -> {
+                        mainHandler.post { outputView.text = r.value.content }
+                        setStatus("Done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)")
+                    }
+                    is BackendResult.Err -> {
+                        setStatus("Chat failed: [${r.error.name}] ${r.message ?: ""}")
+                    }
+                }
+            } catch (t: Throwable) {
+                setStatus("Chat threw: ${t.message}")
+            }
         }
     }
 
