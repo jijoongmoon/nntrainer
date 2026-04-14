@@ -33,10 +33,10 @@ set(PREBUILT_LIBS_DIR
 
 # Register the prebuilt causal_lm_api shared library so the linker can
 # resolve its symbols when linking libquickai_jni.so.
-add_library(causallm_api SHARED IMPORTED)
-set_target_properties(causallm_api PROPERTIES
+add_library(quick_dot_ai_api SHARED IMPORTED)
+set_target_properties(quick_dot_ai_api PROPERTIES
     IMPORTED_LOCATION
-        "${PREBUILT_LIBS_DIR}/libcausallm_api.so")
+        "${PREBUILT_LIBS_DIR}/libquick_dot_ai_api.so")
 
 add_library(quickai_jni SHARED
     quickai_jni.cpp)
@@ -47,5 +47,5 @@ target_include_directories(quickai_jni PRIVATE
 find_library(log-lib log)
 
 target_link_libraries(quickai_jni
-    causallm_api
+    quick_dot_ai_api
     ${log-lib})
