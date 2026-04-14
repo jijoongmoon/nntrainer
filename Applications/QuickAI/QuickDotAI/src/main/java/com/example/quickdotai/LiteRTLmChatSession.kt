@@ -13,12 +13,19 @@
  * Role handling:
  * OpenAI-style role-interleaved inputs (including multiple SYSTEM turns,
  * e.g. `[SYSTEM, USER, ASSISTANT, SYSTEM, USER]`) are forwarded to
- * LiteRT-LM with roles preserved. Each call rebuilds the underlying
- * [Conversation] with prior turns passed through
- * [ConversationConfig.initialMessages] as a mix of [Message.system],
- * [Message.user], and [Message.model] — the model's embedded chat
- * template then renders the full role-annotated array natively. Only
- * the trailing USER turn is sent via `sendMessage*` to drive inference.
+ * LiteRT-LM with roles preserved. When such input arrives, the session
+ * rebuilds the underlying [Conversation] with prior turns passed
+ * through [ConversationConfig.initialMessages] as a mix of
+ * [Message.system], [Message.user], and [Message.model] — the model's
+ * embedded chat template then renders the full role-annotated array
+ * natively.
+ *
+ * Fast path:
+ * When the caller just passes a single trailing USER turn (the common
+ * "continue the dialogue" case), the session reuses the existing
+ * [Conversation] and simply calls `sendMessage(user)` — no close / no
+ * re-prefill. LiteRT-LM keeps the prior history internally, so this
+ * stays O(new tokens) instead of O(all tokens) per turn.
  */
 package com.example.quickdotai
 
@@ -92,7 +99,7 @@ internal class LiteRTLmChatSession(
             ?: BackendResult.Err(QuickAiError.INVALID_PARAMETER, "invalid chat input")
 
         return try {
-            val c = rebuildConversationForTurn(prep.priorTurns)
+            val c = acquireConversationForTurn(prep, messages)
                 ?: return BackendResult.Err(
                     QuickAiError.INFERENCE_FAILED,
                     "Failed to build Conversation for this turn"
@@ -151,7 +158,7 @@ internal class LiteRTLmChatSession(
             return err
         }
 
-        val c = rebuildConversationForTurn(prep.priorTurns)
+        val c = acquireConversationForTurn(prep, messages)
         if (c == null) {
             val err = BackendResult.Err(
                 QuickAiError.INFERENCE_FAILED,
@@ -416,8 +423,54 @@ internal class LiteRTLmChatSession(
     }
 
     /**
+     * Fast path wrapper around [rebuildConversationForTurn].
+     *
+     * Invariant maintained by [commitTurn]: after every successful turn,
+     * LiteRT-LM's internal [Conversation] state mirrors this session's
+     * [history] (prior turns + the just-appended assistant reply).
+     *
+     * When the next call adds only a single trailing USER turn — the
+     * common "continue the dialogue" case — we can therefore skip the
+     * close+rebuild+re-prefill cycle and simply let LiteRT-LM extend the
+     * existing conversation via `sendMessage(user)`. This keeps each
+     * follow-up turn O(new user tokens) instead of O(all history tokens).
+     *
+     * Falls back to [rebuildConversationForTurn] whenever:
+     *  - no existing Conversation is held yet (first turn), or
+     *  - the caller injects anything other than exactly one USER turn
+     *    (e.g. SYSTEM/ASSISTANT turns, role-interleaved bundles, or
+     *    multi-USER batches) — those require the full role-annotated
+     *    initialMessages replay to render correctly.
+     */
+    private fun acquireConversationForTurn(
+        prep: TurnPrep,
+        newMessages: List<QuickAiChatMessage>
+    ): Conversation? {
+        val existing = conversation
+        if (existing != null &&
+            newMessages.size == 1 &&
+            newMessages[0].role == QuickAiChatRole.USER
+        ) {
+            Log.i(
+                TAG,
+                "acquireConversationForTurn($sessionId): fast path — " +
+                    "reusing existing Conversation (history=${history.size})"
+            )
+            return existing
+        }
+        return rebuildConversationForTurn(prep.priorTurns)
+    }
+
+    /**
      * Atomically replace [history] with [effective] + the assistant
      * reply produced this turn.
+     *
+     * This also preserves the fast-path invariant: after this call,
+     * the tracked [history] matches what LiteRT-LM has seen internally
+     * (either via the full `initialMessages` replay on a rebuild, or
+     * via the single `sendMessage(user)` append on the fast path),
+     * so the *next* turn is free to reuse the same [Conversation]
+     * when it only adds a new USER message.
      */
     private fun commitTurn(effective: List<QuickAiChatMessage>, reply: String) {
         history.clear()
