@@ -1017,17 +1017,25 @@ class MainActivity : AppCompatActivity() {
             // JSON (including SYSTEM turns) is forwarded in-order via
             // chatRunStreaming so LiteRT-LM's native chat template
             // renders the full role-annotated array.
+            //
+            // If a chat session is already active (e.g. the user pressed
+            // "Open Chat Session" first to configure enableThinking /
+            // sampling), reuse it — chatRunStreaming will rebuild the
+            // Conversation for the multi-role bundle internally while
+            // preserving the session's original config. Opening a fresh
+            // config=null session here would discard those settings.
             val config: QuickAiChatSessionConfig? = null
 
-            // Open new session
-            when (val openResult = e.openChatSession(config)) {
-                is BackendResult.Err -> {
-                    setStatus("Failed to open session: ${openResult.message}")
-                    return@execute
-                }
-                is BackendResult.Ok -> {
-                    mainHandler.post {
-                        chatSessionStatusView.text = "Session: ${openResult.value.take(8)}… (active)"
+            if (e.chatSessionId == null) {
+                when (val openResult = e.openChatSession(config)) {
+                    is BackendResult.Err -> {
+                        setStatus("Failed to open session: ${openResult.message}")
+                        return@execute
+                    }
+                    is BackendResult.Ok -> {
+                        mainHandler.post {
+                            chatSessionStatusView.text = "Session: ${openResult.value.take(8)}… (active)"
+                        }
                     }
                 }
             }
@@ -1102,17 +1110,25 @@ class MainActivity : AppCompatActivity() {
             // JSON (including SYSTEM turns) is forwarded in-order via
             // chatRun so LiteRT-LM's native chat template renders the
             // full role-annotated array.
+            //
+            // If a chat session is already active (e.g. the user pressed
+            // "Open Chat Session" first to configure enableThinking /
+            // sampling), reuse it — chatRun will rebuild the Conversation
+            // for the multi-role bundle internally while preserving the
+            // session's original config. Opening a fresh config=null
+            // session here would discard those settings.
             val config: QuickAiChatSessionConfig? = null
 
-            // Open new session
-            when (val openResult = e.openChatSession(config)) {
-                is BackendResult.Err -> {
-                    setStatus("Failed to open session: ${openResult.message}")
-                    return@execute
-                }
-                is BackendResult.Ok -> {
-                    mainHandler.post {
-                        chatSessionStatusView.text = "Session: ${openResult.value.take(8)}… (active)"
+            if (e.chatSessionId == null) {
+                when (val openResult = e.openChatSession(config)) {
+                    is BackendResult.Err -> {
+                        setStatus("Failed to open session: ${openResult.message}")
+                        return@execute
+                    }
+                    is BackendResult.Ok -> {
+                        mainHandler.post {
+                            chatSessionStatusView.text = "Session: ${openResult.value.take(8)}… (active)"
+                        }
                     }
                 }
             }
