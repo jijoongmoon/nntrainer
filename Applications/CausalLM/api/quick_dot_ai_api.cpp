@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "causal_lm.h"
+#include "chat_template.h"
 #include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
@@ -66,6 +67,11 @@ struct CausalLmModel {
 static std::mutex g_registry_mutex;
 static bool g_use_chat_template = false;
 static bool g_verbose = false;
+static std::string g_last_output = "";
+static double g_initialization_duration_ms = 0.0;
+static causallm::ChatTemplate g_chat_template;
+static std::string g_formatted_template;
+static std::string g_chat_template_name = "default";
 
 // Default handle backing the legacy non-handle API.
 static CausalLmModel &get_default_handle() {
@@ -180,6 +186,12 @@ static const char *get_model_name_from_type(ModelType type) {
 
 static std::string apply_chat_template(const std::string &architecture,
                                        const std::string &input) {
+  // Use dynamic chat template from tokenizer_config.json if available
+  if (g_chat_template.isAvailable()) {
+    return g_chat_template.apply(input);
+  }
+
+  // Fallback: hardcoded per-architecture templates
   if (architecture == "LlamaForCausalLM") {
     // Llama 2/3 chat format: [INST] {prompt} [/INST]
     return "[INST] " + input + " [/INST]";
@@ -190,8 +202,6 @@ static std::string apply_chat_template(const std::string &architecture,
              architecture == "Qwen3CachedSlimMoeForCausalLM") {
     // Qwen chat format
     // <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
-    // Note: assuming model handles tokenizer specific special tokens or we
-    // might need to handle them raw if tokenizer enabled
     return "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
   } else if (architecture == "Gemma3ForCausalLM") {
     // Gemma chat format:
@@ -330,6 +340,9 @@ ErrorCode setOptions(Config config) {
   // Currently no options are being handled
   g_use_chat_template = config.use_chat_template;
   g_verbose = config.verbose;
+  g_chat_template_name = (config.chat_template_name != nullptr)
+                           ? config.chat_template_name
+                           : "default";
   if (config.debug_mode) {
     // Ensure models are registered so we can validate them
     register_models();
@@ -527,6 +540,27 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
       }
     }
 
+    // Load chat template from tokenizer_config.json if available
+    std::string tc_path = model_dir_path + "/tokenizer_config.json";
+    if (check_file_exists(tc_path)) {
+      g_chat_template =
+        causallm::ChatTemplate::fromFile(tc_path, g_chat_template_name);
+      if (g_chat_template.isAvailable()) {
+        std::cout << "[Info] Chat template loaded from tokenizer_config.json"
+                  << std::endl;
+      } else {
+        std::cerr
+          << "[Warning] tokenizer_config.json found but chat template could "
+             "not be loaded. Falling back to hardcoded templates."
+          << std::endl;
+      }
+    } else {
+      g_chat_template = causallm::ChatTemplate();
+      std::cerr << "[Warning] tokenizer_config.json not found in "
+                << model_dir_path << ". Using hardcoded chat templates."
+                << std::endl;
+    }
+
     // Construct weight file path
     std::string weight_file_name;
     if (nntr_cfg.contains("model_file_name")) {
@@ -664,6 +698,121 @@ static ErrorCode metrics_on_handle(CausalLmModel &h,
   return CAUSAL_LM_ERROR_NONE;
 }
 
+/*****************************************************************************
+ * Chat Template API - role + content message support
+ *****************************************************************************/
+
+/**
+ * @brief Convert C message array to C++ ChatMessage vector
+ */
+static std::vector<causallm::ChatMessage>
+convertMessages(const CausalLMChatMessage *messages, size_t num_messages) {
+  std::vector<causallm::ChatMessage> result;
+  result.reserve(num_messages);
+  for (size_t i = 0; i < num_messages; ++i) {
+    causallm::ChatMessage msg;
+    msg.role = messages[i].role ? messages[i].role : "";
+    msg.content = messages[i].content ? messages[i].content : "";
+    result.push_back(std::move(msg));
+  }
+  return result;
+}
+
+/**
+ * @brief Apply chat template to messages with hardcoded fallback
+ */
+static std::string
+apply_chat_template_messages(const std::string &architecture,
+                             const std::vector<causallm::ChatMessage> &messages,
+                             bool add_generation_prompt) {
+  if (g_chat_template.isAvailable()) {
+    return g_chat_template.apply(messages, add_generation_prompt);
+  }
+
+  std::string result;
+
+  if (architecture == "LlamaForCausalLM") {
+    for (const auto &msg : messages) {
+      if (msg.role == "system") {
+        result += "<<SYS>>\n" + msg.content + "\n<</SYS>>\n\n";
+      } else if (msg.role == "user") {
+        result += "[INST] " + msg.content + " [/INST]";
+      } else if (msg.role == "assistant") {
+        result += msg.content + "\n";
+      }
+    }
+  } else if (architecture == "Qwen2ForCausalLM" ||
+             architecture == "Qwen3ForCausalLM" ||
+             architecture == "Qwen3MoeForCausalLM" ||
+             architecture == "Qwen3SlimMoeForCausalLM" ||
+             architecture == "Qwen3CachedSlimMoeForCausalLM") {
+    for (const auto &msg : messages) {
+      result += "<|im_start|>" + msg.role + "\n" + msg.content + "<|im_end|>\n";
+    }
+    if (add_generation_prompt) {
+      result += "<|im_start|>assistant\n";
+    }
+  } else if (architecture == "Gemma3ForCausalLM") {
+    for (const auto &msg : messages) {
+      if (msg.role == "user") {
+        result += "<start_of_turn>user\n" + msg.content + "<end_of_turn>\n";
+      } else if (msg.role == "assistant") {
+        result += "<start_of_turn>model\n" + msg.content + "<end_of_turn>\n";
+      }
+    }
+    if (add_generation_prompt) {
+      result += "<start_of_turn>model\n";
+    }
+  } else {
+    for (const auto &msg : messages) {
+      result += msg.content + "\n";
+    }
+  }
+
+  return result;
+}
+
+ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
+                            size_t num_messages, bool add_generation_prompt,
+                            const char **formattedText) {
+  if (messages == nullptr || num_messages == 0 || formattedText == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  try {
+    auto &h = get_default_handle();
+    std::lock_guard<std::mutex> lock(h.mtx);
+
+    auto chat_messages = convertMessages(messages, num_messages);
+    g_formatted_template = apply_chat_template_messages(
+      h.architecture, chat_messages, add_generation_prompt);
+
+    *formattedText = g_formatted_template.c_str();
+
+  } catch (const std::exception &e) {
+    std::cerr << "Exception in applyChatTemplate: " << e.what() << std::endl;
+    return CAUSAL_LM_ERROR_UNKNOWN;
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
+                               size_t num_messages, bool add_generation_prompt,
+                               const char **outputText) {
+  if (outputText == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  const char *formattedInput = nullptr;
+  ErrorCode err = applyChatTemplate(messages, num_messages,
+                                    add_generation_prompt, &formattedInput);
+  if (err != CAUSAL_LM_ERROR_NONE) {
+    return err;
+  }
+
+  return runModel(formattedInput, outputText);
+}
 /*============================================================================
  * Legacy non-handle API implementation
  *============================================================================*/

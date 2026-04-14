@@ -72,7 +72,8 @@ extern "C" {
  * @param config Architecture configuration
  * @return ErrorCode (CAUSAL_LM_ERROR_NONE on success)
  */
-ErrorCode registerModelArchitecture(const char *arch_name, ModelArchConfig config);
+ErrorCode registerModelArchitecture(const char *arch_name,
+                                    ModelArchConfig config);
 
 /**
  * @brief Register a full model configuration linking runtime config to an

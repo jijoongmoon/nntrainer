@@ -30,6 +30,7 @@
 #include <factory.h>
 
 #include "causal_lm.h"
+#include "chat_template.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
@@ -46,6 +47,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <thread>
 
 using json = nlohmann::json;
@@ -243,9 +245,34 @@ int main(int argc, char *argv[]) {
       architecture = resolve_architecture(model_type, architecture);
     }
 
+    // Load chat template from tokenizer_config.json (if available)
+    causallm::ChatTemplate chat_tmpl;
+    std::string tokenizer_config_path = model_path + "/tokenizer_config.json";
+    if (std::filesystem::exists(tokenizer_config_path)) {
+      chat_tmpl = causallm::ChatTemplate::fromFile(tokenizer_config_path);
+      if (chat_tmpl.isAvailable()) {
+        std::cout << "[Info] Chat template loaded from tokenizer_config.json"
+                  << std::endl;
+      } else {
+        std::cerr
+          << "[Warning] tokenizer_config.json found but chat template could "
+             "not be loaded. Chat formatting will not be applied to raw input."
+          << std::endl;
+      }
+    } else {
+      std::cerr
+        << "[Warning] tokenizer_config.json not found in " << model_path
+        << ". Chat template will not be available for raw input formatting."
+        << std::endl;
+    }
+
     // Determine input text
     if (argc >= 3) {
       input_text = argv[2];
+      // Apply chat template to raw user input if available
+      if (chat_tmpl.isAvailable()) {
+        input_text = chat_tmpl.apply(input_text);
+      }
     } else {
       if (nntr_cfg.contains("chat_input")) {
         if (architecture == "Gemma3ForCausalLM") {

@@ -28,6 +28,76 @@ The API allows loading models, running inference, and retrieving performance met
 
 For detailed documentation, please refer to [API Documentation](api/README.md).
 
+## Chat Template
+
+CausalLM supports automatic chat template formatting by reading the `chat_template` field from HuggingFace's `tokenizer_config.json`. This eliminates the need for hardcoded per-model chat formatting.
+
+### How It Works
+
+Most HuggingFace models include a `tokenizer_config.json` with a `chat_template` field (Jinja2 format) that defines how to format conversations. CausalLM includes a built-in mini Jinja2 renderer that processes these templates at runtime.
+
+When a `tokenizer_config.json` is present in the model directory:
+- **CLI (`nntr_causallm`)**: Raw user input provided as a command-line argument is automatically wrapped with the chat template.
+- **C API**: The `apply_chat_template()` function uses the dynamic template instead of hardcoded formats.
+
+If `tokenizer_config.json` is absent or does not contain a `chat_template` field, a warning is printed and the system falls back to hardcoded per-architecture templates (Llama, Qwen, Gemma3).
+
+### Supported Template Features
+
+The built-in Jinja2 renderer supports the following constructs commonly used in HuggingFace chat templates:
+
+| Feature | Example |
+|---------|---------|
+| For loops | `{% for message in messages %}...{% endfor %}` |
+| Conditionals | `{% if %}...{% elif %}...{% else %}...{% endif %}` |
+| Output expressions | `{{ bos_token }}` |
+| Variable assignment | `{% set offset = 1 %}` |
+| Dict/array access | `message['role']`, `messages[0]` |
+| String concatenation | `'<\|im_start\|>' + message['role']` |
+| Comparison operators | `==`, `!=`, `>`, `<`, `>=`, `<=` |
+| Boolean operators | `and`, `or`, `not` |
+| Loop variables | `loop.first`, `loop.last`, `loop.index`, `loop.index0` |
+| Filters | `\| trim`, `\| length`, `\| tojson` |
+| String methods | `.strip()`, `.startswith()`, `.upper()`, `.split()` |
+| Containment test | `'keyword' in message['content']` |
+| Namespace | `namespace()` for cross-scope variable mutation |
+| Whitespace control | `{%- -%}`, `{{- -}}` |
+
+### Required Files
+
+To use chat templates, ensure `tokenizer_config.json` is in your model directory alongside the other config files. This file is included by default when downloading models from HuggingFace.
+
+### Example
+
+```bash
+# With tokenizer_config.json present, raw input is auto-formatted:
+./nntr_causallm /path/to/model "What is machine learning?"
+
+# The input will be automatically wrapped, e.g. for Qwen3:
+# <|im_start|>user
+# What is machine learning?<|im_end|>
+# <|im_start|>assistant
+```
+
+### Multi-turn Conversations (API)
+
+The C API supports multi-turn conversations through `ChatMessage`:
+
+```cpp
+#include "chat_template.h"
+
+causallm::ChatTemplate tmpl = causallm::ChatTemplate::fromFile("tokenizer_config.json");
+
+std::vector<causallm::ChatMessage> messages = {
+  {"system", "You are a helpful assistant."},
+  {"user", "Hello!"},
+  {"assistant", "Hi there!"},
+  {"user", "How are you?"}
+};
+
+std::string formatted = tmpl.apply(messages);
+```
+
 ## How to run
 
 ### 1. Prepare Model Files

@@ -12,8 +12,7 @@
 
 extern "C" {
 
-static int callback_streamer_put(BaseStreamer *self,
-                                 const char *decoded_utf8) {
+static int callback_streamer_put(BaseStreamer *self, const char *decoded_utf8) {
   CallbackStreamer *cs = reinterpret_cast<CallbackStreamer *>(self);
   if (cs == nullptr || cs->callback == nullptr) {
     return 0;

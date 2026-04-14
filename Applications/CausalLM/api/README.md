@@ -96,7 +96,10 @@ Supported quantization formats.
 
 #### `ErrorCode setOptions(Config config)`
 Sets global configuration options.
-- **config**: Structure containing options like `use_chat_template` and `debug_mode`.
+- **config.use_chat_template**: Whether to apply chat template in `runModel()`.
+- **config.debug_mode**: Validate model files during initialization.
+- **config.verbose**: Print output during generation.
+- **config.chat_template_name**: Template name to select when `chat_template` is an array (e.g., `"default"`, `"tool_use"`). `NULL` defaults to `"default"`.
 
 #### `ErrorCode loadModel(BackendType compute, ModelType modeltype, ModelQuantizationType quant_type)`
 Loads a registered model.
@@ -117,7 +120,23 @@ Retrieves performance metrics of the last run.
 - `total_duration_ms`: Total execution time from start to finish.
 - `peak_memory_kb`: Peak resident set size (memory usage) in KB.
 
-## Usage Example
+#### `ErrorCode applyChatTemplate(const CausalLMChatMessage *messages, size_t num_messages, bool add_generation_prompt, const char **formattedText)`
+Applies chat template to messages without running inference. Useful for debugging or verifying prompt formatting.
+- **messages**: Array of `CausalLMChatMessage` structs (role + content).
+- **num_messages**: Number of messages in the array.
+- **add_generation_prompt**: Whether to append generation prompt (e.g., `<|im_start|>assistant\n`).
+- **formattedText**: Pointer to store the formatted prompt string.
+
+#### `ErrorCode runModelWithMessages(const CausalLMChatMessage *messages, size_t num_messages, bool add_generation_prompt, const char **outputText)`
+Applies chat template to messages and runs inference. Internally calls `applyChatTemplate()` then `runModel()`.
+- **messages**: Array of `CausalLMChatMessage` structs (role + content).
+- **num_messages**: Number of messages in the array.
+- **add_generation_prompt**: Whether to append generation prompt.
+- **outputText**: Pointer to store the generated output string.
+
+## Usage Examples
+
+### 1. Single Prompt
 
 ```c
 #include "causal_lm_api.h"
@@ -159,3 +178,94 @@ int main() {
     return 0;
 }
 ```
+
+### 2. Chat Template with Messages
+
+```c
+#include "causal_lm_api.h"
+#include <stdio.h>
+
+int main() {
+    Config config = {.use_chat_template = true, .debug_mode = false, .verbose = true};
+    setOptions(config);
+
+    loadModel(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_QWEN3_0_6B,
+              CAUSAL_LM_QUANTIZATION_W16A16);
+
+    // System prompt + user message
+    CausalLMChatMessage msgs[] = {
+        {"system", "You are a helpful AI assistant."},
+        {"user",   "What is machine learning?"}
+    };
+
+    const char *output;
+    runModelWithMessages(msgs, 2, true, &output);
+    printf("Response: %s\n", output);
+
+    return 0;
+}
+```
+
+### 3. Conversation History
+
+```c
+    // Multiple user/assistant turns
+    CausalLMChatMessage msgs[] = {
+        {"user",      "Hello, how are you?"},
+        {"assistant", "I'm doing great. How can I help you today?"},
+        {"user",      "What is deep learning?"},
+        {"assistant", "Deep learning uses neural networks with many layers."},
+        {"user",      "How is it different from traditional ML?"}
+    };
+
+    const char *output;
+    runModelWithMessages(msgs, 5, true, &output);
+    printf("Response: %s\n", output);
+```
+
+### 4. Preview Formatted Prompt (No Inference)
+```c
+    CausalLMChatMessage msgs[] = {
+        {"system", "You are a helpful assistant."},
+        {"user",   "Hello!"}
+    };
+    const char *formatted;
+    applyChatTemplate(msgs, 2, true, &formatted);
+    printf("Formatted prompt:\n%s\n", formatted);
+    // Output (Qwen3):
+    // <|im_start|>system
+    // You are a helpful assistant.<|im_end|>
+    // <|im_start|>user
+    // Hello!<|im_end|>
+    // <|im_start|>assistant
+```
+
+### 5. Named Template Selection (default / tool_use)
+
+When `tokenizer_config.json` contains an array of named templates, select by name:
+
+```c
+    // Use "default" template (normal conversation)
+    Config config;
+    config.use_chat_template = true;
+    config.chat_template_name = "default";
+    setOptions(config);
+    loadModel(...);
+
+    // Use "tool_use" template (function calling)
+    Config config;
+    config.use_chat_template = true;
+    config.chat_template_name = "tool_use";
+    setOptions(config);
+    loadModel(...);
+```
+
+Supported by models like Gemma3 that provide multiple templates:
+```json
+"chat_template": [
+    {"name": "default",  "template": "..."},
+    {"name": "tool_use", "template": "..."}
+]
+```
+
+If the requested name is not found, falls back to the first template with a warning.

@@ -11,9 +11,11 @@
  *
  */
 
+#include "../json.hpp"
 #include "quick_dot_ai_api.h"
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -88,8 +90,6 @@ struct StreamCollector {
 int onStreamDelta(const char *delta, void *user_data) {
   auto *col = static_cast<StreamCollector *>(user_data);
   if (delta != nullptr) {
-    // Print and flush so the user actually sees tokens appear one by
-    // one rather than all at once at the end of the run.
     std::cout << delta << std::flush;
     if (col != nullptr) {
       col->accumulated.append(delta);
@@ -119,28 +119,51 @@ void printLogo() {
 void printUsage(const char *program_name) {
   std::cout << COLOR_YELLOW << "Usage:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " <model_name> [prompt] [use_chat_template] [quantization] "
-               "[verbose] \n\n";
+            << " <model_name> [use_chat_template] [quantization] [verbose] "
+               "[prompt...]\n";
+  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
+            << " <model_name> --chat-file <path.json> [--template name] "
+               "[quantization] [verbose] \n\n";
 
   std::cout << COLOR_CYAN << "Arguments:" << COLOR_RESET << "\n";
   std::cout << "  model_name        " << COLOR_BOLD << "REQUIRED" << COLOR_RESET
             << "  - Model name (e.g., QWEN3-0.6B)\n";
-  std::cout << "  prompt            " << COLOR_GREEN << "OPTIONAL"
-            << COLOR_RESET
-            << "  - Input prompt (default: 'Hello, how are you?')\n";
   std::cout << "  use_chat_template " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET << "  - 0/1 or true/false (default: 1)\n";
   std::cout << "  quantization      " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET
             << "  - W4A32/W16A16/W8A16/W32A32/UNKNOWN (default: UNKNOWN)\n";
   std::cout << "  verbose           " << COLOR_GREEN << "OPTIONAL"
-            << COLOR_RESET << "  - 0/1 or true/false (default: 0)\n\n";
+            << COLOR_RESET << "  - 0/1 or true/false (default: 0)\n";
+  std::cout << "  prompt...         " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET
+            << "  - Input prompt (all remaining args joined with spaces)\n";
+  std::cout << "  --chat-file       " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET
+            << "  - JSON file with chat messages [{role, content}, ...]\n";
+  std::cout << "  --template        " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET << "  - Template name (e.g., default, tool_use)\n\n";
 
   std::cout << COLOR_YELLOW << "Examples:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B \"Tell me a joke\" 1 W4A32\n";
+            << " QWEN3-0.6B 1 W32A32 1 What is machine learning?\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B \"Write a poem\" 1 W32A32 1\n\n";
+            << " QWEN3-0.6B 1 W4A32 1 Hello\n";
+  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
+            << " QWEN3-0.6B --chat-file chat.json W32A32 1\n";
+  std::cout
+    << "  " << COLOR_BOLD << program_name << COLOR_RESET
+    << " QWEN3-0.6B --chat-file chat.json --template tool_use W32A32 1\n\n";
+
+  std::cout << COLOR_YELLOW << "Chat file format (JSON):" << COLOR_RESET
+            << "\n";
+  std::cout << "  [\n";
+  std::cout << "    {\"role\": \"system\",    \"content\": \"You are a helpful "
+               "assistant.\"},\n";
+  std::cout << "    {\"role\": \"user\",      \"content\": \"Hello!\"},\n";
+  std::cout << "    {\"role\": \"assistant\", \"content\": \"Hi there!\"},\n";
+  std::cout << "    {\"role\": \"user\",      \"content\": \"How are you?\"}\n";
+  std::cout << "  ]\n\n";
 }
 } // namespace
 
@@ -154,30 +177,72 @@ int main(int argc, char *argv[]) {
   }
 
   const char *model_name = argv[1];
-  const char *prompt = (argc >= 3) ? argv[2] : "Hello, how are you?";
+  const char *prompt = "Hello, how are you?";
   bool use_chat_template = true;
-  if (argc >= 4) {
-    use_chat_template =
-      (std::string(argv[3]) == "1" || std::string(argv[3]) == "true");
-  }
-
+  std::string chat_file_path = "";
   std::string quant_str = "UNKNOWN";
   ModelQuantizationType quant_type = CAUSAL_LM_QUANTIZATION_UNKNOWN;
-  if (argc >= 5) {
-    quant_str = std::string(argv[4]);
-    if (quant_str == "W4A32")
-      quant_type = CAUSAL_LM_QUANTIZATION_W4A32;
-    else if (quant_str == "W16A16")
-      quant_type = CAUSAL_LM_QUANTIZATION_W16A16;
-    else if (quant_str == "W8A16")
-      quant_type = CAUSAL_LM_QUANTIZATION_W8A16;
-    else if (quant_str == "W32A32")
-      quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
-  }
-
   bool verbose = true;
-  if (argc >= 6) {
-    verbose = (std::string(argv[5]) == "1" || std::string(argv[5]) == "true");
+  std::string template_name = "default";
+
+  // Parse --chat-file mode: <model> --chat-file <path> [--template name]
+  // [quant] [verbose]
+  if (argc >= 4 && std::string(argv[2]) == "--chat-file") {
+    chat_file_path = argv[3];
+    use_chat_template = true;
+    int next_arg = 4;
+    // Check for --template option
+    if (next_arg < argc && std::string(argv[next_arg]) == "--template") {
+      next_arg++;
+      if (next_arg < argc) {
+        template_name = argv[next_arg];
+        next_arg++;
+      }
+    }
+    if (next_arg < argc) {
+      quant_str = std::string(argv[next_arg]);
+      if (quant_str == "W4A32")
+        quant_type = CAUSAL_LM_QUANTIZATION_W4A32;
+      else if (quant_str == "W16A16")
+        quant_type = CAUSAL_LM_QUANTIZATION_W16A16;
+      else if (quant_str == "W8A16")
+        quant_type = CAUSAL_LM_QUANTIZATION_W8A16;
+      else if (quant_str == "W32A32")
+        quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
+    }
+    next_arg++;
+    if (next_arg < argc) {
+      verbose = (std::string(argv[next_arg]) == "1" ||
+                 std::string(argv[next_arg]) == "true");
+    }
+  } else {
+    // Normal mode: <model> [chat_template] [quant] [verbose] [prompt...]
+    if (argc >= 3)
+      use_chat_template =
+        (std::string(argv[2]) == "1" || std::string(argv[2]) == "true");
+    if (argc >= 4) {
+      quant_str = std::string(argv[3]);
+      if (quant_str == "W4A32")
+        quant_type = CAUSAL_LM_QUANTIZATION_W4A32;
+      else if (quant_str == "W16A16")
+        quant_type = CAUSAL_LM_QUANTIZATION_W16A16;
+      else if (quant_str == "W8A16")
+        quant_type = CAUSAL_LM_QUANTIZATION_W8A16;
+      else if (quant_str == "W32A32")
+        quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
+    }
+    if (argc >= 5)
+      verbose = (std::string(argv[4]) == "1" || std::string(argv[4]) == "true");
+    // Join all remaining args as prompt (handles adb shell word splitting)
+    if (argc >= 6) {
+      std::string joined_prompt = argv[5];
+      for (int i = 6; i < argc; ++i) {
+        joined_prompt += " ";
+        joined_prompt += argv[i];
+      }
+      static std::string prompt_storage = joined_prompt;
+      prompt = prompt_storage.c_str();
+    }
   }
 
   printSection("Configuration");
@@ -185,6 +250,10 @@ int main(int argc, char *argv[]) {
   printInfo("Use Chat Template", use_chat_template ? "true" : "false");
   printInfo("Quantization", quant_str);
   printInfo("Verbose", verbose ? "true" : "false");
+  printInfo("Template Name", template_name);
+  if (!chat_file_path.empty()) {
+    printInfo("Chat File", chat_file_path);
+  }
   std::cout << "\n";
 
   printSection("Initialization");
@@ -193,6 +262,7 @@ int main(int argc, char *argv[]) {
   config.use_chat_template = use_chat_template;
   config.debug_mode = true;
   config.verbose = verbose;
+  config.chat_template_name = template_name.c_str();
   ErrorCode err = setOptions(config);
   if (err != CAUSAL_LM_ERROR_NONE) {
     printError("Failed to set options");
@@ -227,41 +297,139 @@ int main(int argc, char *argv[]) {
   }
   printSuccess("Model loaded successfully");
 
-  printSection("Inference (Streaming)");
-  std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Input Prompt:\n";
-  std::cout << COLOR_BOLD << COLOR_YELLOW << "  " << prompt << COLOR_RESET
-            << "\n\n";
+  // ── --chat-file mode: load messages from JSON file ──
+  using json = nlohmann::json;
+  std::vector<CausalLMChatMessage> file_msgs;
+  std::vector<std::string> role_strs, content_strs;
 
-  std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
-            << "Running inference via runModelHandleStreaming()...\n\n";
+  if (!chat_file_path.empty()) {
+    printSection("Test: Chat Template from File");
+    std::ifstream chat_file(chat_file_path);
+    if (!chat_file.is_open()) {
+      printError("Cannot open chat file: " + chat_file_path);
+      destroyModelHandle(handle);
+      return 1;
+    }
 
-  std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
-  std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
+    json chat_json;
+    try {
+      chat_file >> chat_json;
+    } catch (const json::parse_error &e) {
+      printError("JSON parse error: " + std::string(e.what()));
+      destroyModelHandle(handle);
+      return 1;
+    }
 
-  StreamCollector collector;
-  err =
-    runModelHandleStreaming(handle, prompt, &onStreamDelta, &collector);
+    // Support both formats:
+    //   Array:  [{"role":"user","content":"Hi"}]
+    //   Object: {"chat": [{"role":"user","content":"Hi"}]}
+    json messages_json;
+    if (chat_json.is_array()) {
+      messages_json = chat_json;
+    } else if (chat_json.is_object() && chat_json.contains("chat") &&
+               chat_json["chat"].is_array()) {
+      messages_json = chat_json["chat"];
+    } else {
+      printError("Chat file must contain a JSON array or {\"chat\": [...]}");
+      destroyModelHandle(handle);
+      return 1;
+    }
 
-  // Reset colors after the streamed region — every delta was emitted
-  // from inside onStreamDelta() above.
-  std::cout << COLOR_RESET << "\n\n";
+    // Store strings to keep pointers valid
+    for (const auto &msg : messages_json) {
+      if (msg.contains("role") && msg.contains("content")) {
+        role_strs.push_back(msg["role"].get<std::string>());
+        content_strs.push_back(msg["content"].get<std::string>());
+      }
+    }
+    for (size_t i = 0; i < role_strs.size(); ++i) {
+      file_msgs.push_back({role_strs[i].c_str(), content_strs[i].c_str()});
+    }
 
-  if (err != CAUSAL_LM_ERROR_NONE) {
-    printError("Failed to run model");
-    std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
-    destroyModelHandle(handle);
-    return 1;
-  }
-
-  if (collector.accumulated.empty()) {
-    printWarning("No output generated");
-  } else {
-    printInfo("Streamed deltas", std::to_string(collector.delta_count));
-    printInfo("Total bytes",
-              std::to_string(collector.accumulated.size()) + " bytes");
+    std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Messages from "
+              << chat_file_path << ":\n";
+    for (size_t i = 0; i < file_msgs.size(); ++i) {
+      std::cout << COLOR_YELLOW << "  [" << file_msgs[i].role << "] "
+                << COLOR_RESET << file_msgs[i].content << "\n";
+    }
     std::cout << "\n";
+
+    // Test applyChatTemplate with file messages (format only, no inference)
+    const char *formattedText = nullptr;
+    err = applyChatTemplate(file_msgs.data(), file_msgs.size(), true,
+                            &formattedText);
+    if (err == CAUSAL_LM_ERROR_NONE && formattedText) {
+      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Formatted prompt:\n";
+      std::cout << COLOR_BOLD << COLOR_YELLOW << formattedText << COLOR_RESET
+                << "\n\n";
+      printSuccess("applyChatTemplate works");
+    } else {
+      printError("applyChatTemplate failed");
+      std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+    }
+
+    // Test inference with formatted prompt via streaming API
+    if (formattedText != nullptr) {
+      printSection("Test: Streaming Inference with Chat Template");
+      std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
+                << "Running inference with formatted prompt...\n\n";
+
+      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+      std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
+
+      StreamCollector collector;
+      err = runModelHandleStreaming(handle, formattedText, &onStreamDelta,
+                                    &collector);
+
+      std::cout << COLOR_RESET << "\n\n";
+
+      if (err == CAUSAL_LM_ERROR_NONE && !collector.accumulated.empty()) {
+        printInfo("Streamed deltas", std::to_string(collector.delta_count));
+        printInfo("Total bytes",
+                  std::to_string(collector.accumulated.size()) + " bytes");
+        printSuccess("Chat template streaming inference works");
+      } else {
+        printError("Streaming inference failed");
+        std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+      }
+    }
+
+  } else {
+    // ── Normal mode: streaming inference with single prompt ──
+    printSection("Inference (Streaming)");
+    std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Input Prompt:\n";
+    std::cout << COLOR_BOLD << COLOR_YELLOW << "  " << prompt << COLOR_RESET
+              << "\n\n";
+
+    std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
+              << "Running inference via runModelHandleStreaming()...\n\n";
+
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+    std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
+
+    StreamCollector collector;
+    err = runModelHandleStreaming(handle, prompt, &onStreamDelta, &collector);
+
+    std::cout << COLOR_RESET << "\n\n";
+
+    if (err != CAUSAL_LM_ERROR_NONE) {
+      printError("Failed to run model");
+      std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+      destroyModelHandle(handle);
+      return 1;
+    }
+
+    if (collector.accumulated.empty()) {
+      printWarning("No output generated");
+    } else {
+      printInfo("Streamed deltas", std::to_string(collector.delta_count));
+      printInfo("Total bytes",
+                std::to_string(collector.accumulated.size()) + " bytes");
+      std::cout << "\n";
+    }
   }
 
+  // ── Performance Metrics ──
   printSection("Performance Metrics");
   PerformanceMetrics metrics;
   err = getPerformanceMetricsHandle(handle, &metrics);
