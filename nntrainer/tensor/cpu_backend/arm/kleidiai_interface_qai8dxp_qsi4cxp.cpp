@@ -403,9 +403,24 @@ uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
     lhs_packed_mtx_qa8dx);
 
   // ==========================================================
-  // MATMUL
+  // MATMUL — parallelized over N output columns
   // ==========================================================
-  {
+  // Split N across ThreadManager worker threads. Each thread runs
+  // the same ukernel on its slice of output columns, reading from
+  // the same cached packed RHS (different slice offset per thread).
+  // This matches Q4_0's parallel_for_chunked pattern — without it,
+  // KleidiAI is single-threaded and runs 4-8x slower than Q4_0 on
+  // multi-core devices.
+  //
+  // Constraint: each thread's N-slice must be a multiple of the
+  // kernel's nr (output-column tile). For unaligned N we let the
+  // last thread handle the remainder.
+  const size_t nr_tile = nr;
+  auto &tm = nntrainer::ThreadManager::Global();
+  unsigned int thread_num = tm.getComputeThreadCount() + 1;
+
+  // Don't bother spawning threads for tiny GEMMs.
+  if (n < nr_tile * 2 || thread_num <= 1) {
     const size_t dst_stride = n * sizeof(float);
     const size_t lhs_offset =
       ukernel_variants[idx_variant].ukernel.get_lhs_packed_offset(0, k);
@@ -420,6 +435,39 @@ uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
       (const char *)rhs_packed_cached + rhs_offset,
       (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset),
       dst_stride, sizeof(float), lower_bound, upper_bound);
+  } else {
+    // Chunk N into thread_num parts, aligned to nr_tile.
+    const size_t dst_stride = n * sizeof(float);
+    const size_t lhs_offset =
+      ukernel_variants[idx_variant].ukernel.get_lhs_packed_offset(0, k);
+    const size_t n_tiles = n / nr_tile;
+    const size_t tiles_per_thread = (n_tiles + thread_num - 1) / thread_num;
+
+    tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
+      const size_t tile_start = thread_idx * tiles_per_thread;
+      if (tile_start >= n_tiles) return;
+      const size_t tile_end =
+        std::min(tile_start + tiles_per_thread, n_tiles);
+      const size_t n_start = tile_start * nr_tile;
+      size_t n_end = tile_end * nr_tile;
+      // Last thread picks up any N-remainder past the tile boundary.
+      if (thread_idx == thread_num - 1 && n_end < n) {
+        n_end = n;
+      }
+      const size_t n_this = n_end - n_start;
+
+      const size_t rhs_offset =
+        ukernel_variants[idx_variant].ukernel.get_rhs_packed_offset(n_start, k);
+      const size_t dst_offset =
+        ukernel_variants[idx_variant].ukernel.get_dst_offset(0, n_start,
+                                                              dst_stride);
+      ukernel_variants[idx_variant].ukernel.run_matmul(
+        m, n_this, k,
+        (const char *)lhs_packed_mtx_qa8dx + lhs_offset,
+        (const char *)rhs_packed_cached + rhs_offset,
+        (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset),
+        dst_stride, sizeof(float), lower_bound, upper_bound);
+    });
   }
 
   delete[] lhs_packed_mtx_qa8dx;
