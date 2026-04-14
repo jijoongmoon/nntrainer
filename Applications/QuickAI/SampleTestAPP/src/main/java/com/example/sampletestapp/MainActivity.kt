@@ -455,9 +455,13 @@ class MainActivity : AppCompatActivity() {
             maxLines = 10
             setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
             textSize = 12f
-            // Pre-fill with example
+            // Pre-fill with a role-interleaved example that exercises
+            // LiteRT-LM's native chat template (multiple SYSTEM turns).
             setText("""[
   {"role": "system", "content": "You are a helpful assistant."},
+  {"role": "user", "content": "Hello!"},
+  {"role": "assistant", "content": "Hi! How can I help?"},
+  {"role": "system", "content": "Answer in one short sentence."},
   {"role": "user", "content": "Write a short joke about saving RAM."}
 ]""")
         }
@@ -916,16 +920,6 @@ class MainActivity : AppCompatActivity() {
     // --- OpenAI-style messages handlers -----------------------------------
 
     /**
-     * @brief Parse result for OpenAI-style messages.
-     * @property systemPrompt The system instruction (from role="system").
-     * @property messages The chat messages (user/assistant roles only).
-     */
-    private data class ParsedOpenAIMessages(
-        val systemPrompt: String?,
-        val messages: List<QuickAiChatMessage>
-    )
-
-    /**
      * @brief Parse OpenAI-style JSON messages array into QuickDotAI types.
      *
      * Input format:
@@ -934,19 +928,26 @@ class MainActivity : AppCompatActivity() {
      *   {"role": "system", "content": "You are a helpful assistant."},
      *   {"role": "user", "content": "Hello!"},
      *   {"role": "assistant", "content": "Hi there!"},
+     *   {"role": "system", "content": "Now answer briefly."},
      *   {"role": "user", "content": "How are you?"}
      * ]
      * ```
      *
+     * Every entry — including multiple [QuickAiChatRole.SYSTEM] turns —
+     * is preserved in order. Role-interleaved input is forwarded to
+     * LiteRT-LM's native chat template through
+     * [com.example.quickdotai.QuickDotAI.chatRun] /
+     * [com.example.quickdotai.QuickDotAI.chatRunStreaming] ; the
+     * wrapper does no role folding or merging.
+     *
      * @param jsonString JSON array of message objects
-     * @return ParsedOpenAIMessages or null on parse error
+     * @return parsed messages in input order, or null on parse error
      */
-    private fun parseOpenAIMessages(jsonString: String): ParsedOpenAIMessages? {
+    private fun parseOpenAIMessages(jsonString: String): List<QuickAiChatMessage>? {
         return try {
             val json = Json { ignoreUnknownKeys = true; isLenient = true }
             val jsonArray = json.parseToJsonElement(jsonString).jsonArray
 
-            var systemPrompt: String? = null
             val messages = mutableListOf<QuickAiChatMessage>()
 
             for (element in jsonArray) {
@@ -954,24 +955,21 @@ class MainActivity : AppCompatActivity() {
                 val role = obj["role"]?.jsonPrimitive?.content?.lowercase() ?: continue
                 val content = obj["content"]?.jsonPrimitive?.content ?: ""
 
-                when (role) {
-                    "system" -> systemPrompt = content
-                    "user" -> messages.add(
-                        QuickAiChatMessage(
-                            role = QuickAiChatRole.USER,
-                            parts = listOf(PromptPart.Text(content))
-                        )
-                    )
-                    "assistant" -> messages.add(
-                        QuickAiChatMessage(
-                            role = QuickAiChatRole.ASSISTANT,
-                            parts = listOf(PromptPart.Text(content))
-                        )
-                    )
+                val quickRole = when (role) {
+                    "system" -> QuickAiChatRole.SYSTEM
+                    "user" -> QuickAiChatRole.USER
+                    "assistant" -> QuickAiChatRole.ASSISTANT
+                    else -> continue
                 }
+                messages.add(
+                    QuickAiChatMessage(
+                        role = quickRole,
+                        parts = listOf(PromptPart.Text(content))
+                    )
+                )
             }
 
-            ParsedOpenAIMessages(systemPrompt, messages)
+            messages
         } catch (t: Throwable) {
             null
         }
@@ -988,14 +986,18 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val parsed = parseOpenAIMessages(jsonText)
-        if (parsed == null) {
+        val messages = parseOpenAIMessages(jsonText)
+        if (messages == null) {
             setStatus("Failed to parse messages JSON. Check format.")
             return
         }
 
-        if (parsed.messages.isEmpty()) {
-            setStatus("No user/assistant messages found in JSON.")
+        if (messages.isEmpty()) {
+            setStatus("No messages found in JSON.")
+            return
+        }
+        if (messages.last().role != QuickAiChatRole.USER) {
+            setStatus("Last message must be role=\"user\" to trigger inference.")
             return
         }
 
@@ -1016,10 +1018,11 @@ class MainActivity : AppCompatActivity() {
                 try { e.closeChatSession() } catch (_: Throwable) {}
             }
 
-            // Build config with system prompt
-            val config = parsed.systemPrompt?.let { sysPrompt ->
-                QuickAiChatSessionConfig(systemInstruction = sysPrompt)
-            }
+            // No session-level systemInstruction — every role from the
+            // JSON (including SYSTEM turns) is forwarded in-order via
+            // chatRunStreaming so LiteRT-LM's native chat template
+            // renders the full role-annotated array.
+            val config: QuickAiChatSessionConfig? = null
 
             // Open new session
             when (val openResult = e.openChatSession(config)) {
@@ -1048,7 +1051,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             try {
-                when (val r = e.chatRunStreaming(parsed.messages, sink)) {
+                when (val r = e.chatRunStreaming(messages, sink)) {
                     is BackendResult.Ok -> {
                         setStatus("Done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)")
                     }
@@ -1073,14 +1076,18 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val parsed = parseOpenAIMessages(jsonText)
-        if (parsed == null) {
+        val messages = parseOpenAIMessages(jsonText)
+        if (messages == null) {
             setStatus("Failed to parse messages JSON. Check format.")
             return
         }
 
-        if (parsed.messages.isEmpty()) {
-            setStatus("No user/assistant messages found in JSON.")
+        if (messages.isEmpty()) {
+            setStatus("No messages found in JSON.")
+            return
+        }
+        if (messages.last().role != QuickAiChatRole.USER) {
+            setStatus("Last message must be role=\"user\" to trigger inference.")
             return
         }
 
@@ -1101,10 +1108,11 @@ class MainActivity : AppCompatActivity() {
                 try { e.closeChatSession() } catch (_: Throwable) {}
             }
 
-            // Build config with system prompt
-            val config = parsed.systemPrompt?.let { sysPrompt ->
-                QuickAiChatSessionConfig(systemInstruction = sysPrompt)
-            }
+            // No session-level systemInstruction — every role from the
+            // JSON (including SYSTEM turns) is forwarded in-order via
+            // chatRun so LiteRT-LM's native chat template renders the
+            // full role-annotated array.
+            val config: QuickAiChatSessionConfig? = null
 
             // Open new session
             when (val openResult = e.openChatSession(config)) {
@@ -1121,7 +1129,7 @@ class MainActivity : AppCompatActivity() {
 
             // Run blocking
             try {
-                when (val r = e.chatRun(parsed.messages)) {
+                when (val r = e.chatRun(messages)) {
                     is BackendResult.Ok -> {
                         mainHandler.post { outputView.text = r.value.content }
                         setStatus("Done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)")
