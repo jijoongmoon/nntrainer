@@ -1013,11 +1013,6 @@ class MainActivity : AppCompatActivity() {
                 return@execute
             }
 
-            // Close existing session if any
-            if (e.chatSessionId != null) {
-                try { e.closeChatSession() } catch (_: Throwable) {}
-            }
-
             // No session-level systemInstruction — every role from the
             // JSON (including SYSTEM turns) is forwarded in-order via
             // chatRunStreaming so LiteRT-LM's native chat template
@@ -1101,11 +1096,6 @@ class MainActivity : AppCompatActivity() {
             if (e == null) {
                 setStatus("Model load failed.")
                 return@execute
-            }
-
-            // Close existing session if any
-            if (e.chatSessionId != null) {
-                try { e.closeChatSession() } catch (_: Throwable) {}
             }
 
             // No session-level systemInstruction — every role from the
