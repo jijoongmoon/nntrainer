@@ -231,9 +231,25 @@ enum class QuickAiChatRole {
 /**
  * @brief Sampling configuration applied to a chat session.
  *
- * LiteRT-LM may not honor every field in the current release. The
- * wrapper accepts them unconditionally so callers can express intent
- * without version-checking the underlying engine.
+ * Field support by backend:
+ *  - [LiteRTLm] maps [temperature], [topK], [topP], and [seed] to
+ *    LiteRT-LM's `SamplerConfig`. [minP] and [maxTokens] are NOT
+ *    supported by LiteRT-LM's SamplerConfig and are silently ignored
+ *    (a warning is logged).
+ *
+ * Partial specification:
+ *  - Leaving every field null is equivalent to passing no sampling
+ *    config at all — LiteRT-LM uses its engine/model default.
+ *  - Specifying any of [temperature] / [topK] / [topP] requires the
+ *    wrapper to build a full `SamplerConfig`, which in LiteRT-LM has
+ *    non-nullable core fields. Unspecified core fields fall back to
+ *    temperature=1.0, topK=40, topP=0.95, and a warning is logged.
+ *    To avoid surprises, specify all three together.
+ *
+ * Validation:
+ *  - LiteRT-LM requires topK > 0, topP in [0, 1], temperature >= 0.
+ *    Violations throw from the underlying engine and surface as a
+ *    [BackendResult.Err].
  */
 @Serializable
 data class QuickAiChatSamplingConfig(

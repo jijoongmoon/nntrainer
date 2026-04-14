@@ -420,6 +420,15 @@ internal class LiteRTLmChatSession(
     companion object {
         private const val TAG = "LiteRTLmChatSession"
 
+        // Neutral fallback values used only when the caller specifies
+        // *some* sampling fields but not all three required ones.
+        // LiteRT-LM's SamplerConfig(topK, topP, temperature) are all
+        // non-nullable with no defaults, so we must supply something
+        // whenever we construct a SamplerConfig at all.
+        private const val FALLBACK_TEMPERATURE = 1.0
+        private const val FALLBACK_TOP_K = 40
+        private const val FALLBACK_TOP_P = 0.95
+
         /**
          * Build a LiteRT-LM [Conversation] from a [QuickAiChatSessionConfig].
          *
@@ -427,29 +436,23 @@ internal class LiteRTLmChatSession(
          *  - [QuickAiChatSessionConfig.systemInstruction] →
          *    [ConversationConfig.systemInstruction]
          *  - [QuickAiChatSamplingConfig] → [SamplerConfig]
+         *    (see [buildSamplerConfig] for per-field behavior)
          *
          * Falls back to the bare `engine.createConversation()` overload
-         * when no config fields are set, so existing callers are
-         * unaffected.
+         * when nothing is configured, so LiteRT-LM uses its own
+         * engine-level default sampling.
          */
         private fun createConversationFromConfig(
             engine: Engine,
             config: QuickAiChatSessionConfig?
         ): Conversation {
             val sysInstruction = config?.systemInstruction?.takeIf { it.isNotBlank() }
-            val sampling = config?.sampling
-            // Skip ConversationConfig entirely when nothing is configured
-            // so we don't hit any default-value surprises.
-            if (sysInstruction == null && sampling == null) {
-                return engine.createConversation()
-            }
+            val samplerConfig = buildSamplerConfig(config?.sampling)
 
-            val samplerConfig = sampling?.let { s ->
-                SamplerConfig(
-                    temperature = s.temperature ?: 1.0,
-                    topK = s.topK ?: 40,
-                    topP = s.topP ?: 0.95,
-                )
+            // Skip ConversationConfig entirely when nothing is configured
+            // so LiteRT-LM uses its own engine/model defaults.
+            if (sysInstruction == null && samplerConfig == null) {
+                return engine.createConversation()
             }
 
             val convConfig = ConversationConfig(
@@ -461,9 +464,97 @@ internal class LiteRTLmChatSession(
                 TAG,
                 "createConversationFromConfig: " +
                     "sysInstruction=${sysInstruction?.take(60)}, " +
-                    "sampling=$sampling"
+                    "samplerConfig=$samplerConfig"
             )
             return engine.createConversation(convConfig)
+        }
+
+        /**
+         * Map [QuickAiChatSamplingConfig] to LiteRT-LM [SamplerConfig].
+         *
+         * LiteRT-LM's `SamplerConfig(topK: Int, topP: Double,
+         * temperature: Double, seed: Int = 0)` has three non-nullable
+         * core fields. That means we cannot express "set only
+         * temperature, leave topK/topP to the engine default" through
+         * a partially-populated SamplerConfig — any SamplerConfig we
+         * construct MUST carry all three.
+         *
+         * Behavior:
+         *  - Returns `null` when [sampling] is null or all relevant
+         *    fields are null. The caller then passes no samplerConfig
+         *    to ConversationConfig, and LiteRT-LM uses its own
+         *    engine-level defaults (preferred path for best quality).
+         *  - When any of temperature/topK/topP/seed is specified,
+         *    constructs a full SamplerConfig, filling the remaining
+         *    core fields from [FALLBACK_TEMPERATURE]/[FALLBACK_TOP_K]/
+         *    [FALLBACK_TOP_P]. A warning is logged so partial
+         *    specification is visible in logcat.
+         *  - [QuickAiChatSamplingConfig.minP] and
+         *    [QuickAiChatSamplingConfig.maxTokens] are not supported by
+         *    LiteRT-LM's SamplerConfig; values are ignored and a
+         *    warning is logged.
+         *
+         * LiteRT-LM validates ranges in `SamplerConfig.init`
+         * (topK > 0, topP in [0,1], temperature >= 0) and throws
+         * [IllegalArgumentException] on violation. That throw
+         * propagates up through [createConversationFromConfig] and is
+         * caught in [LiteRTLm.openChatSession], where it is converted
+         * to a BackendResult.Err.
+         */
+        private fun buildSamplerConfig(
+            sampling: QuickAiChatSamplingConfig?
+        ): SamplerConfig? {
+            if (sampling == null) return null
+
+            val anyCoreSet = sampling.temperature != null ||
+                sampling.topK != null ||
+                sampling.topP != null ||
+                sampling.seed != null
+
+            // Warn about QuickAi fields that LiteRT-LM's SamplerConfig
+            // does not expose. Doing it up front means the warning
+            // fires even if no core field is set (i.e. even if we end
+            // up returning null below).
+            if (sampling.minP != null) {
+                Log.w(
+                    TAG,
+                    "buildSamplerConfig: minP=${sampling.minP} is not " +
+                        "supported by LiteRT-LM SamplerConfig — ignored"
+                )
+            }
+            if (sampling.maxTokens != null) {
+                Log.w(
+                    TAG,
+                    "buildSamplerConfig: maxTokens=${sampling.maxTokens} " +
+                        "is not supported by LiteRT-LM SamplerConfig — ignored"
+                )
+            }
+
+            if (!anyCoreSet) return null
+
+            val missing = buildList {
+                if (sampling.temperature == null) add("temperature")
+                if (sampling.topK == null) add("topK")
+                if (sampling.topP == null) add("topP")
+            }
+            if (missing.isNotEmpty()) {
+                Log.w(
+                    TAG,
+                    "buildSamplerConfig: partial sampling config — " +
+                        "LiteRT-LM SamplerConfig requires all core fields; " +
+                        "filling ${missing.joinToString()} with fallback " +
+                        "defaults (temperature=$FALLBACK_TEMPERATURE, " +
+                        "topK=$FALLBACK_TOP_K, topP=$FALLBACK_TOP_P). " +
+                        "Specify all three together to avoid this."
+                )
+            }
+
+            return SamplerConfig(
+                topK = sampling.topK ?: FALLBACK_TOP_K,
+                topP = sampling.topP ?: FALLBACK_TOP_P,
+                temperature = sampling.temperature ?: FALLBACK_TEMPERATURE,
+                seed = sampling.seed ?: 0,
+            )
         }
     }
 }
