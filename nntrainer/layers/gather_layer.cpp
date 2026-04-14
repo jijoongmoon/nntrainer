@@ -6,8 +6,14 @@
  * @date   02 April 2025
  * @see    https://github.com/nntrainer/nntrainer
  * @author SeungBaek Hong <sb92.hong@samsung.com>
- * @bug    It's not implemented operation yet. Just a draft for compilation.
+ * @bug    No known bugs except for NYI items
  * @brief  This is gather layer class (operation layer)
+ *
+ * Implements torch.gather semantics:
+ *   output[b][c][h][w] = input[b][idx][h][w]  (axis=1)
+ *   output[b][c][h][w] = input[b][c][idx][w]  (axis=2)
+ *   output[b][c][h][w] = input[b][c][h][idx]  (axis=3)
+ * where idx = (unsigned int)index[b][c][h][w]
  */
 
 #include "common_properties.h"
@@ -44,13 +50,87 @@ void GatherLayer::finalize(InitLayerContext &context) {
 
 void GatherLayer::forwarding_operation(const Tensor &input, const Tensor &index,
                                        Tensor &output) {
-  // TODO: implement forwarding operation
-  throw std::runtime_error("forwarding operation is not implemented yet");
+  unsigned int out_b = output.batch();
+  unsigned int out_c = output.channel();
+  unsigned int out_h = output.height();
+  unsigned int out_w = output.width();
+
+  // Support index broadcasting: if index is smaller than output along
+  // non-gather dimensions, use modulo to broadcast (repeat) the index.
+  unsigned int idx_c = index.channel();
+  unsigned int idx_h = index.height();
+  unsigned int idx_w = index.width();
+
+  for (unsigned int b = 0; b < out_b; ++b) {
+    for (unsigned int c = 0; c < out_c; ++c) {
+      for (unsigned int h = 0; h < out_h; ++h) {
+        for (unsigned int w = 0; w < out_w; ++w) {
+          unsigned int idx =
+            static_cast<unsigned int>(index.getValue<float>(
+              b, c % idx_c, h % idx_h, w % idx_w));
+
+          unsigned int src_c = c, src_h = h, src_w = w;
+          switch (axis) {
+          case 1:
+            src_c = idx;
+            break;
+          case 2:
+            src_h = idx;
+            break;
+          case 3:
+            src_w = idx;
+            break;
+          }
+
+          output.setValue(b, c, h, w,
+                         input.getValue<float>(b, src_c, src_h, src_w));
+        }
+      }
+    }
+  }
 }
 
 void GatherLayer::calcDerivative(RunLayerContext &context) {
-  // TODO: implement derivative calculation
-  throw std::runtime_error("derivative calculation is not implemented yet");
+  Tensor &input_deriv = context.getOutgoingDerivative(0);
+  const Tensor &output_deriv =
+    context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  const Tensor &index = context.getInput(1);
+
+  input_deriv.setValue(0.0f);
+
+  unsigned int out_b = output_deriv.batch();
+  unsigned int out_c = output_deriv.channel();
+  unsigned int out_h = output_deriv.height();
+  unsigned int out_w = output_deriv.width();
+
+  for (unsigned int b = 0; b < out_b; ++b) {
+    for (unsigned int c = 0; c < out_c; ++c) {
+      for (unsigned int h = 0; h < out_h; ++h) {
+        for (unsigned int w = 0; w < out_w; ++w) {
+          unsigned int idx =
+            static_cast<unsigned int>(index.getValue<float>(b, c, h, w));
+
+          unsigned int src_c = c, src_h = h, src_w = w;
+          switch (axis) {
+          case 1:
+            src_c = idx;
+            break;
+          case 2:
+            src_h = idx;
+            break;
+          case 3:
+            src_w = idx;
+            break;
+          }
+
+          float grad = output_deriv.getValue<float>(b, c, h, w);
+          float current =
+            input_deriv.getValue<float>(b, src_c, src_h, src_w);
+          input_deriv.setValue(b, src_c, src_h, src_w, current + grad);
+        }
+      }
+    }
+  }
 }
 
 void GatherLayer::setProperty(const std::vector<std::string> &values) {

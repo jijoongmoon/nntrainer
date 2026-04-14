@@ -60,6 +60,7 @@ NNTrainer supports Large Language Model (LLM) inference! Please refer to `Applic
 | GPT-OSS 20B | Qwen3 MoE 30B-A3B |
 |:-----------:|:-----------------:|
 | <img src="docs/videos/GPT_OSS_20B_Demo.gif" width="360"> | <img src="docs/videos/Qwen_30B_Demo.gif" width="360"> |
+| Running GPT-OSS 20B model on device | Running Qwen3 MoE 30B-A3B model on device |
 
 #### 💻 Running MoE on your PC
 
@@ -69,7 +70,6 @@ NNTrainer supports Large Language Model (LLM) inference! Please refer to `Applic
   |:-------:|:------:|
   |![](./docs/videos/moe-full.gif)| ![](./docs/videos/moe-on-the-fly.gif) |
   | Memory: 16.5 GB | Memory: 1.3 GB |
-
 
 ## Official Releases
 

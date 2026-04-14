@@ -876,6 +876,92 @@ TEST(TensorPool, createOrExtend_unmanaged_n) {
     pool.requestOrExtend("t", {10}, {0}, nntrainer::TensorLifespan::UNMANAGED));
 }
 
+// ===== requestOrPlaceholder tests =====
+
+/**
+ * @brief requestOrPlaceholder with is_external=true creates placeholder
+ */
+TEST(TensorPool, requestOrPlaceholder_external_p) {
+  nntrainer::TensorPool pool;
+  nntrainer::TensorDim dim({1, 1, 3, 4});
+
+  nntrainer::Tensor *t = pool.requestOrPlaceholder(
+    "ext_tensor", dim, {0}, max_ls, true);
+  EXPECT_NE(t, nullptr);
+  EXPECT_EQ(t->getDim(), dim);
+}
+
+/**
+ * @brief requestOrPlaceholder with is_external=false creates normal tensor
+ */
+TEST(TensorPool, requestOrPlaceholder_internal_p) {
+  nntrainer::TensorPool pool;
+  nntrainer::TensorDim dim({1, 1, 3, 4});
+
+  nntrainer::Tensor *t = pool.requestOrPlaceholder(
+    "int_tensor", dim, {0}, max_ls, false);
+  EXPECT_NE(t, nullptr);
+  EXPECT_EQ(t->getDim(), dim);
+}
+
+/**
+ * @brief placeholder tensor is not allocated by MemoryPool
+ */
+TEST(TensorPool, placeholder_no_alloc_p) {
+  nntrainer::TensorPool pool;
+  nntrainer::TensorDim dim({1, 1, 3, 4});
+
+  // Request a placeholder (external) tensor
+  pool.requestOrPlaceholder("ext", dim, {0}, max_ls, true);
+
+  // Also request a normal tensor so finalize has something to plan
+  pool.requestOrPlaceholder("normal", dim, {0}, max_ls, false);
+
+  nntrainer::BasicPlanner planner;
+  pool.finalize(planner, 0, 0);
+
+  // Allocate — only internal tensors get memory
+  pool.allocate();
+
+  // Normal tensor should have data
+  nntrainer::Tensor *normal_t = pool.getTensor("normal");
+  EXPECT_NE(normal_t->getData(), nullptr);
+
+  // Placeholder tensor should NOT have data yet (needs fillPlaceholder)
+  nntrainer::Tensor *ext_t = pool.getTensor("ext");
+  EXPECT_EQ(ext_t->getData(), nullptr);
+
+  pool.deallocate();
+}
+
+/**
+ * @brief fillPlaceholder sets external data on placeholder tensor
+ */
+TEST(TensorPool, fillPlaceholder_p) {
+  nntrainer::TensorPool pool;
+  nntrainer::TensorDim dim({1, 1, 3, 4});
+
+  pool.requestOrPlaceholder("ext", dim, {0}, max_ls, true);
+
+  nntrainer::BasicPlanner planner;
+  pool.finalize(planner, 0, 0);
+  pool.allocate();
+
+  // Create an external tensor with real data
+  nntrainer::Tensor ext_data(dim, true);
+  ext_data.initialize(nntrainer::Initializer::ONES);
+
+  // Fill the placeholder
+  pool.fillPlaceholder("ext", ext_data);
+
+  // Now the pool tensor should point to the external data
+  nntrainer::Tensor *t = pool.getTensor("ext");
+  EXPECT_NE(t->getData(), nullptr);
+  EXPECT_FLOAT_EQ(t->getValue<float>(0, 0, 0, 0), 1.0f);
+
+  pool.deallocate();
+}
+
 /**
  * @brief Main gtest
  */

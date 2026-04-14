@@ -22,8 +22,10 @@
  */
 
 #include "layer_context.h"
+#include <compute_ops.h>
 #include "model.h"
 #include "model_common_properties.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -676,6 +678,304 @@ void NeuralNetwork::save(
     std::get<props::SavePath>(model_flex_props) = old_save_path;
     break;
   }
+  case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
+    /**
+     * Safetensors format (schema_version 2):
+     *   [8B]  header_size (little-endian uint64)
+     *   [header_size B] JSON header with tensor metadata
+     *   [data section]  raw tensor bytes
+     *
+     * JSON header format:
+     *   {
+     *     "__metadata__": {
+     *       "format": "nntrainer",
+     *       "schema_version": "2"
+     *     },
+     *     "weight_name": {
+     *       "dtype": "F32"|"F16"|"I4"|...,
+     *       "shape": [d1, d2, ...],
+     *       "data_offsets": [start, end],
+     *       "quant": {                       // optional, only for quantized weights
+     *         "encoding": "axis_scale_offset" | "per_tensor_affine" |
+     *                     "q4_0" | "q6_k" | ...,
+     *         "axis": 0,                     // per-axis scale/offset axis
+     *         "bitwidth": 4,                 // effective bit width
+     *         "group_size": 0,               // 0 = pure per-channel, >0 = grouped
+     *         "has_zero_point": false        // true for asymmetric (UINT*)
+     *       }
+     *     },
+     *     ...
+     *   }
+     *
+     * Notes on the embedded-scales layout (Int4QTensor / Uint4QTensor):
+     *   `data_offsets` covers the full packed region, i.e.
+     *     [packed_4bit_values | scales | (zero_points)?]
+     *   exactly as Tensor::save writes it. Readers that want raw weight
+     *   bytes only should use `shape` + `bitwidth` to compute the weight
+     *   sub-region; the remainder is the scale/zp section.
+     */
+    auto model_file = checkedOpenStream<std::ofstream>(
+      file_path, std::ios::out | std::ios::binary | std::ios::trunc);
+
+    // -- 1. Collect weight metadata --
+    struct QuantInfo {
+      bool present = false;
+      std::string encoding;
+      int axis = 0;
+      int bitwidth = 0;
+      int group_size = 0;
+      bool has_zero_point = false;
+    };
+
+    struct SafetensorEntry {
+      std::string name;
+      size_t data_size;
+      std::string dtype_str;
+      std::vector<size_t> shape;
+      QuantInfo quant;
+    };
+    std::vector<SafetensorEntry> entries;
+    size_t total_data_size = 0;
+
+    // Helper: derive quant metadata from a weight tensor. Returns
+    // {present=false} for non-quantized (FP32/FP16) tensors; otherwise
+    // fills encoding/bitwidth/axis/group_size from the tensor's dtype
+    // and QScheme, plus scale_size() when available.
+    auto deriveQuantInfo = [](Weight &w) -> QuantInfo {
+      QuantInfo qi;
+      auto dtype = w.getDim().getDataType();
+      // getVariable() returns by value; we need a non-const reference
+      // to call q_scheme()/scale_size() on the Tensor's itensor_ view.
+      auto &var = w.getVariableRef();
+
+      // Map dtype to bitwidth + signed/unsigned
+      auto affineBits = [&](int bits, bool unsigned_) {
+        qi.present = true;
+        qi.bitwidth = bits;
+        qi.has_zero_point = unsigned_;
+        try {
+          auto scheme = var.q_scheme();
+          if (scheme == QScheme::PER_CHANNEL_AFFINE) {
+            qi.encoding = "axis_scale_offset";
+            // axis=1 for nntrainer's FC weight layout [K, N]: the
+            // quantization axis is the OUTPUT dimension (width, N).
+            // Each output column shares one scale across all K
+            // reduction elements. This matches Int4QTensor::scale_size()
+            // returning width() for pure per-channel.
+            qi.axis = 1;
+            size_t ss = var.scale_size();
+            size_t total = w.getDim().getDataLen();
+            if (ss > 0 && ss <= total) {
+              // group_size = total_elements / scale_count. When it
+              // equals the reduction-axis length (height = K), all
+              // reduction elements in one output column share one
+              // scale, which is pure per-channel — normalize to 0.
+              size_t gs = total / ss;
+              size_t reduction_len = w.getDim().height();
+              qi.group_size =
+                (gs == reduction_len) ? 0 : static_cast<int>(gs);
+            }
+          } else {
+            qi.encoding = "per_tensor_affine";
+          }
+        } catch (...) {
+          qi.encoding = "per_tensor_affine";
+        }
+      };
+
+      switch (dtype) {
+      case TensorDim::DataType::QINT4:
+        affineBits(4, false);
+        break;
+      case TensorDim::DataType::QINT8:
+        affineBits(8, false);
+        break;
+      case TensorDim::DataType::QINT16:
+        affineBits(16, false);
+        break;
+      case TensorDim::DataType::UINT4:
+        affineBits(4, true);
+        break;
+      case TensorDim::DataType::UINT8:
+        affineBits(8, true);
+        break;
+      case TensorDim::DataType::UINT16:
+        affineBits(16, true);
+        break;
+      case TensorDim::DataType::Q4_0:
+        qi.present = true;
+        qi.encoding = "q4_0";
+        qi.bitwidth = 4;
+        qi.axis = 0;
+        qi.group_size = 32; // GGML Q4_0 block size
+        break;
+      case TensorDim::DataType::Q4_K:
+        qi.present = true;
+        qi.encoding = "q4_k";
+        qi.bitwidth = 4;
+        qi.axis = 0;
+        qi.group_size = 256; // GGML Q4_K super-block
+        break;
+      case TensorDim::DataType::Q6_K:
+        qi.present = true;
+        qi.encoding = "q6_k";
+        qi.bitwidth = 6;
+        qi.axis = 0;
+        qi.group_size = 256; // GGML super-block
+        break;
+      case TensorDim::DataType::Q1_0:
+        qi.present = true;
+        qi.encoding = "q1_0";
+        qi.bitwidth = 1;
+        qi.axis = 0;
+        qi.group_size = 128; // nntr_ggml_impl Q1_0 group size (QK1_0_TENSOR)
+        break;
+      default:
+        // FP32/FP16/UINT32/etc. — not a quantized weight
+        break;
+      }
+      return qi;
+    };
+
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (unsigned int i = 0; i < weights.size(); ++i) {
+        if (!(*iter)->getRunContext().isGradientFirstAccess(i))
+          continue;
+        auto &w = *weights[i];
+        size_t sz = w.getVariable().getMemoryBytes();
+        auto dtype = w.getDim().getDataType();
+        // Quantized tensors (Int4QTensor, CharTensor, ShortTensor) write
+        // a 2-byte QScheme header before the data via save_quantization_info.
+        // Include that in the safetensors data_offsets so read() can
+        // consume the same header.
+        if (dtype == TensorDim::DataType::QINT4 ||
+            dtype == TensorDim::DataType::QINT8 ||
+            dtype == TensorDim::DataType::QINT16) {
+          sz += sizeof(uint16_t);
+        }
+
+        std::string dtype_str;
+        switch (dtype) {
+        case TensorDim::DataType::FP32:
+          dtype_str = "F32";
+          break;
+        case TensorDim::DataType::FP16:
+          dtype_str = "F16";
+          break;
+        case TensorDim::DataType::QINT4:
+          dtype_str = "I4";
+          break;
+        case TensorDim::DataType::QINT8:
+          dtype_str = "I8";
+          break;
+        case TensorDim::DataType::QINT16:
+          dtype_str = "I16";
+          break;
+        case TensorDim::DataType::UINT4:
+          dtype_str = "U4";
+          break;
+        case TensorDim::DataType::UINT8:
+          dtype_str = "U8";
+          break;
+        case TensorDim::DataType::UINT16:
+          dtype_str = "U16";
+          break;
+        case TensorDim::DataType::UINT32:
+          dtype_str = "U32";
+          break;
+        // Lane B: block-quantized tensors (GGML-style layout). The dtype
+        // string labels the block format; the actual block size and
+        // scale layout are implicit in the tensor class.
+        case TensorDim::DataType::Q4_0:
+          dtype_str = "Q4_0";
+          break;
+        case TensorDim::DataType::Q4_K:
+          dtype_str = "Q4_K";
+          break;
+        case TensorDim::DataType::Q6_K:
+          dtype_str = "Q6_K";
+          break;
+        case TensorDim::DataType::Q1_0:
+          dtype_str = "Q1_0";
+          break;
+        default:
+          dtype_str = "F32";
+          break;
+        }
+
+        auto dim = w.getDim();
+        std::vector<size_t> shape;
+        const size_t *dims = dim.getDim();
+        bool found_nonone = false;
+        for (size_t d = 0; d < TensorDim::MAXDIM; ++d) {
+          if (dims[d] != 1)
+            found_nonone = true;
+          if (found_nonone)
+            shape.push_back(dims[d]);
+        }
+        if (shape.empty())
+          shape.push_back(1);
+
+        QuantInfo qi = deriveQuantInfo(w);
+        entries.push_back({w.getName(), sz, dtype_str, shape, qi});
+        total_data_size += sz;
+      }
+    }
+
+    // -- 2. Build JSON header string --
+    std::ostringstream json_ss;
+    json_ss << "{\"__metadata__\":{\"format\":\"nntrainer\","
+            << "\"schema_version\":\"2\"}";
+
+    size_t data_offset = 0;
+    for (auto &e : entries) {
+      json_ss << ",\"" << e.name << "\":{\"dtype\":\"" << e.dtype_str
+              << "\",\"shape\":[";
+      for (size_t si = 0; si < e.shape.size(); ++si) {
+        if (si > 0)
+          json_ss << ",";
+        json_ss << e.shape[si];
+      }
+      json_ss << "],\"data_offsets\":[" << data_offset << ","
+              << (data_offset + e.data_size) << "]";
+
+      if (e.quant.present) {
+        json_ss << ",\"quant\":{\"encoding\":\"" << e.quant.encoding
+                << "\",\"axis\":" << e.quant.axis
+                << ",\"bitwidth\":" << e.quant.bitwidth
+                << ",\"group_size\":" << e.quant.group_size
+                << ",\"has_zero_point\":"
+                << (e.quant.has_zero_point ? "true" : "false") << "}";
+      }
+
+      json_ss << "}";
+      data_offset += e.data_size;
+    }
+    json_ss << "}";
+    std::string header_json = json_ss.str();
+
+    // Pad header to 8-byte alignment
+    size_t header_len = header_json.size();
+    size_t header_padded = (header_len + 7) & ~static_cast<size_t>(7);
+    header_json.resize(header_padded, ' ');
+
+    // -- 3. Write header_size + header + data --
+    uint64_t hdr_size_val = static_cast<uint64_t>(header_padded);
+    model_file.write(reinterpret_cast<const char *>(&hdr_size_val),
+                     sizeof(hdr_size_val));
+    model_file.write(header_json.data(), header_padded);
+
+    // Write data section (weight bytes in graph order)
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      (*iter)->save(model_file, false, exec_mode);
+    }
+
+    model_file.close();
+    ml_logi("Saved model in safetensors format: %s (%zu weights, %zu bytes)",
+            file_path.c_str(), entries.size(), total_data_size);
+    break;
+  }
   case ml::train::ModelFormat::MODEL_FORMAT_ONNX: {
     throw nntrainer::exception::not_supported(
       "saving with ONNX format is not supported yet.");
@@ -685,6 +985,18 @@ void NeuralNetwork::save(
     throw nntrainer::exception::not_supported(
       "saving with given format is not supported yet");
   }
+}
+
+void NeuralNetwork::convertBinToSafetensors(const std::string &bin_path,
+                                            const std::string &st_path) {
+  NNTR_THROW_IF(!initialized, std::runtime_error)
+    << "Model must be initialized before converting weight format";
+
+  load(bin_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+  save(st_path, ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS);
+
+  ml_logi("Converted weight file from BIN to safetensors: %s -> %s",
+          bin_path.c_str(), st_path.c_str());
 }
 
 void NeuralNetwork::load(const std::string &file_path,
@@ -697,9 +1009,393 @@ void NeuralNetwork::load(const std::string &file_path,
   const std::regex reg_("\\s*\\;\\s*");
   auto v = split(file_path, reg_);
 
+  auto f_path = (v.size() == 2) ? v[1] : v[0];
+
+  /**
+   * For safetensors format, parse JSON header to get name-based offsets.
+   * For BIN format, use sequential offset assignment (legacy).
+   */
+  size_t data_section_start = 0;
+
+  /**
+   * @brief Parsed per-tensor metadata from the safetensors JSON header.
+   *
+   * Schema version 1 (legacy) populates only {offset,size,shape?}; schema
+   * version 2 additionally fills {dtype, quant_*} when the writer emits
+   * them. quant_present indicates whether the "quant" object was found on
+   * this entry; absent + a quantized model-side dtype is accepted with a
+   * warning (legacy files) while a mismatching "quant" object triggers a
+   * strict error.
+   */
+  struct SafetensorEntry {
+    size_t offset = 0;
+    size_t size = 0;
+    std::string dtype; ///< empty if not present in the header
+    bool quant_present = false;
+    std::string quant_encoding;
+    int quant_axis = 0;
+    int quant_bitwidth = 0;
+    int quant_group_size = 0;
+    bool quant_has_zero_point = false;
+  };
+
+  std::unordered_map<std::string, SafetensorEntry> name_offset_map;
+  std::unordered_map<std::string, std::pair<size_t, size_t>> prefix_offset_map;
+  std::unordered_map<std::string, int> prefix_count;
+  std::string safetensors_schema_version = "1";
+  std::string safetensors_format;
+  bool is_safetensors = (format == ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS);
+
+  if (is_safetensors) {
+    auto probe = checkedOpenStream<std::ifstream>(
+      f_path, std::ios::in | std::ios::binary);
+    uint64_t header_size = 0;
+    probe.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
+    NNTR_THROW_IF(!probe.good(), std::runtime_error)
+      << "Failed to read safetensors header size from: " << f_path;
+
+    data_section_start = sizeof(uint64_t) + static_cast<size_t>(header_size);
+
+    std::string header_json(static_cast<size_t>(header_size), '\0');
+    probe.read(&header_json[0], header_size);
+    NNTR_THROW_IF(!probe.good(), std::runtime_error)
+      << "Failed to read safetensors JSON header from: " << f_path;
+    probe.close();
+
+    // Minimal JSON parser for safetensors header. Extracts:
+    //   - __metadata__.schema_version, __metadata__.format
+    //   - per-entry: data_offsets, dtype, quant object
+    auto parse_safetensors_header =
+      [](const std::string &json,
+         std::unordered_map<std::string, SafetensorEntry> &out_map,
+         std::string &out_schema_version, std::string &out_format) {
+        size_t pos = 0;
+        auto skip_ws = [&]() {
+          while (pos < json.size() &&
+                 (json[pos] == ' ' || json[pos] == '\n' || json[pos] == '\r' ||
+                  json[pos] == '\t'))
+            ++pos;
+        };
+        auto parse_string = [&]() -> std::string {
+          skip_ws();
+          if (pos >= json.size() || json[pos] != '"')
+            return "";
+          ++pos;
+          std::string result;
+          while (pos < json.size() && json[pos] != '"') {
+            if (json[pos] == '\\' && pos + 1 < json.size())
+              ++pos;
+            result += json[pos++];
+          }
+          if (pos < json.size())
+            ++pos;
+          return result;
+        };
+        auto parse_number = [&]() -> size_t {
+          skip_ws();
+          size_t val = 0;
+          while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+            val = val * 10 + (json[pos] - '0');
+            ++pos;
+          }
+          return val;
+        };
+        auto parse_bool = [&]() -> bool {
+          skip_ws();
+          if (pos + 4 <= json.size() && json.compare(pos, 4, "true") == 0) {
+            pos += 4;
+            return true;
+          }
+          if (pos + 5 <= json.size() && json.compare(pos, 5, "false") == 0) {
+            pos += 5;
+            return false;
+          }
+          return false;
+        };
+        auto skip_value = [&]() {
+          skip_ws();
+          if (pos >= json.size())
+            return;
+          if (json[pos] == '"') {
+            parse_string();
+          } else if (json[pos] == '{') {
+            int depth = 1;
+            ++pos;
+            while (pos < json.size() && depth > 0) {
+              if (json[pos] == '{')
+                ++depth;
+              else if (json[pos] == '}')
+                --depth;
+              ++pos;
+            }
+          } else if (json[pos] == '[') {
+            int depth = 1;
+            ++pos;
+            while (pos < json.size() && depth > 0) {
+              if (json[pos] == '[')
+                ++depth;
+              else if (json[pos] == ']')
+                --depth;
+              ++pos;
+            }
+          } else {
+            while (pos < json.size() && json[pos] != ',' && json[pos] != '}' &&
+                   json[pos] != ']')
+              ++pos;
+          }
+        };
+
+        // Parse the __metadata__ nested object and extract recognized
+        // fields. Unknown fields are skipped for forward compatibility.
+        auto parse_metadata_object = [&]() {
+          skip_ws();
+          if (pos >= json.size() || json[pos] != '{') {
+            skip_value();
+            return;
+          }
+          ++pos;
+          while (pos < json.size() && json[pos] != '}') {
+            skip_ws();
+            if (pos < json.size() && json[pos] == ',')
+              ++pos;
+            std::string mk = parse_string();
+            skip_ws();
+            if (pos < json.size() && json[pos] == ':')
+              ++pos;
+            skip_ws();
+            if (mk == "schema_version") {
+              out_schema_version = parse_string();
+            } else if (mk == "format") {
+              out_format = parse_string();
+            } else {
+              skip_value();
+            }
+          }
+          if (pos < json.size() && json[pos] == '}')
+            ++pos;
+        };
+
+        // Parse the "quant" nested object inside a per-tensor entry.
+        auto parse_quant_object = [&](SafetensorEntry &entry) {
+          skip_ws();
+          if (pos >= json.size() || json[pos] != '{') {
+            skip_value();
+            return;
+          }
+          ++pos;
+          entry.quant_present = true;
+          while (pos < json.size() && json[pos] != '}') {
+            skip_ws();
+            if (pos < json.size() && json[pos] == ',')
+              ++pos;
+            std::string qf = parse_string();
+            skip_ws();
+            if (pos < json.size() && json[pos] == ':')
+              ++pos;
+            skip_ws();
+            if (qf == "encoding") {
+              entry.quant_encoding = parse_string();
+            } else if (qf == "axis") {
+              entry.quant_axis = static_cast<int>(parse_number());
+            } else if (qf == "bitwidth") {
+              entry.quant_bitwidth = static_cast<int>(parse_number());
+            } else if (qf == "group_size") {
+              entry.quant_group_size = static_cast<int>(parse_number());
+            } else if (qf == "has_zero_point") {
+              entry.quant_has_zero_point = parse_bool();
+            } else {
+              skip_value();
+            }
+          }
+          if (pos < json.size() && json[pos] == '}')
+            ++pos;
+        };
+
+        skip_ws();
+        if (pos >= json.size() || json[pos] != '{')
+          return;
+        ++pos;
+
+        while (pos < json.size()) {
+          skip_ws();
+          if (json[pos] == '}')
+            break;
+          if (json[pos] == ',')
+            ++pos;
+
+          std::string key = parse_string();
+          skip_ws();
+          if (pos < json.size() && json[pos] == ':')
+            ++pos;
+          skip_ws();
+
+          if (key == "__metadata__") {
+            parse_metadata_object();
+            continue;
+          }
+
+          if (pos < json.size() && json[pos] == '{') {
+            ++pos;
+            SafetensorEntry entry;
+            size_t offset_start = 0, offset_end = 0;
+            bool found_offsets = false;
+            while (pos < json.size() && json[pos] != '}') {
+              skip_ws();
+              if (json[pos] == ',')
+                ++pos;
+              std::string field = parse_string();
+              skip_ws();
+              if (pos < json.size() && json[pos] == ':')
+                ++pos;
+
+              if (field == "data_offsets") {
+                skip_ws();
+                if (pos < json.size() && json[pos] == '[') {
+                  ++pos;
+                  offset_start = parse_number();
+                  skip_ws();
+                  if (pos < json.size() && json[pos] == ',')
+                    ++pos;
+                  offset_end = parse_number();
+                  skip_ws();
+                  if (pos < json.size() && json[pos] == ']')
+                    ++pos;
+                  found_offsets = true;
+                }
+              } else if (field == "dtype") {
+                entry.dtype = parse_string();
+              } else if (field == "quant") {
+                parse_quant_object(entry);
+              } else {
+                skip_value();
+              }
+            }
+            if (pos < json.size() && json[pos] == '}')
+              ++pos;
+
+            if (found_offsets) {
+              entry.offset = offset_start;
+              entry.size = offset_end - offset_start;
+              out_map[key] = entry;
+            }
+          } else {
+            skip_value();
+          }
+        }
+      };
+
+    parse_safetensors_header(header_json, name_offset_map,
+                             safetensors_schema_version, safetensors_format);
+
+    // Version management: reject unknown schemas. schema_version "1"
+    // is the legacy untagged format (files that predate P2 and have
+    // no schema_version field at all); "2" is the current format
+    // with optional per-entry "quant" metadata.
+    if (safetensors_schema_version != "1" && safetensors_schema_version != "2") {
+      std::ostringstream oss;
+      oss << "[safetensors] Unsupported schema_version '"
+          << safetensors_schema_version
+          << "' in file " << f_path
+          << ". This nntrainer build understands schema_version 1 and 2. "
+          << "Please regenerate the file with a compatible converter or "
+          << "update nntrainer.";
+      throw std::runtime_error(oss.str());
+    }
+
+    std::cout << "[safetensors] Loaded " << name_offset_map.size()
+              << " tensor entries (schema_version="
+              << safetensors_schema_version
+              << (safetensors_format.empty()
+                    ? ""
+                    : ", format=" + safetensors_format)
+              << ")" << std::endl;
+
+    // Build prefix-based fallback map: "layer_name" -> (offset, size)
+    // This allows matching when the weight suffix differs between
+    // the safetensors file and the C++ model (e.g., ":weight" vs ":gamma").
+    //
+    // Safety: only add to prefix_offset_map when the prefix is UNAMBIGUOUS
+    // (exactly one safetensors entry shares that prefix). When multiple
+    // entries share a prefix (e.g. both :weight and :bias), prefix fallback
+    // is refused — otherwise unordered_map iteration order would make the
+    // result non-deterministic and the wrong tensor could be loaded
+    // silently.
+    for (auto &kv : name_offset_map) {
+      auto colon_pos = kv.first.find(':');
+      if (colon_pos != std::string::npos) {
+        std::string prefix = kv.first.substr(0, colon_pos);
+        prefix_count[prefix]++;
+      }
+    }
+    for (auto &kv : name_offset_map) {
+      auto colon_pos = kv.first.find(':');
+      if (colon_pos != std::string::npos) {
+        std::string prefix = kv.first.substr(0, colon_pos);
+        if (prefix_count[prefix] == 1) {
+          prefix_offset_map[prefix] = {kv.second.offset, kv.second.size};
+        }
+      }
+    }
+
+    // Diagnostic dump: list all safetensors entries in sorted order so the
+    // user can visually diff against the C++ model weight list (printed
+    // below, right before the matching loop).
+    {
+      std::vector<std::string> sorted_names;
+      sorted_names.reserve(name_offset_map.size());
+      for (auto &kv : name_offset_map)
+        sorted_names.push_back(kv.first);
+      std::sort(sorted_names.begin(), sorted_names.end());
+      std::cout << "[safetensors] File tensor list (sorted):" << std::endl;
+      for (auto &n : sorted_names) {
+        auto &e = name_offset_map[n];
+        std::cout << "  " << n << "  (offset=" << e.offset
+                  << ", size=" << e.size;
+        if (!e.dtype.empty())
+          std::cout << ", dtype=" << e.dtype;
+        if (e.quant_present) {
+          std::cout << ", quant={enc=" << e.quant_encoding
+                    << ",axis=" << e.quant_axis
+                    << ",bw=" << e.quant_bitwidth
+                    << ",gs=" << e.quant_group_size
+                    << (e.quant_has_zero_point ? ",zp" : "") << "}";
+        }
+        std::cout << ")" << std::endl;
+      }
+    }
+  }
+
+  // Diagnostic dump: list all C++ model weight names in graph order so the
+  // user can visually diff against the safetensors file list (printed
+  // above). This is the authoritative "what C++ expects" reference.
+  if (is_safetensors) {
+    std::cout << "[nntrainer] C++ model weight list (graph order):"
+              << std::endl;
+    std::unordered_set<const Tensor *> dumped;
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (auto weight : weights) {
+        if (!dumped.insert(&weight->getVariableRef()).second)
+          continue;
+        std::cout << "  " << weight->getName()
+                  << "  (bytes=" << weight->getVariable().getMemoryBytes()
+                  << ", dtype="
+                  << static_cast<int>(weight->getDim().getDataType()) << ")"
+                  << std::endl;
+      }
+    }
+  }
+
+  /**
+   * Assign file offsets to each weight tensor.
+   *   Safetensors: look up by weight name in the JSON header (order-independent).
+   *   BIN: sequential accumulation in topological order (legacy).
+   */
   size_t start_from = 0;
   std::vector<std::pair<size_t, size_t>> file_offset;
   std::unordered_set<const Tensor *> visited_weights;
+  unsigned int weight_match_count = 0;
+  unsigned int weight_miss_count = 0;
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
     auto weights = (*iter)->getRunContext().getWeights();
     for (auto weight : weights) {
@@ -714,22 +1410,162 @@ void NeuralNetwork::load(const std::string &file_path,
       }
       size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
-      weight->getVariableRef().setFileOffset(start_from);
-      ///@todo instead of checking the data type,
-      /// we may need to create a common parent class for
-      /// quantized tensors, requiring qparam to be saved
-      /// and creating a common interface to check if qparam is needed
-      /// this kind of type checking should be avoided
+
+      if (is_safetensors) {
+        const std::string &wname = weight->getName();
+        auto it = name_offset_map.find(wname);
+        if (it != name_offset_map.end()) {
+          // Exact match: safetensors name == C++ weight name
+          const SafetensorEntry &entry = it->second;
+          weight->getVariableRef().setFileOffset(data_section_start +
+                                                 entry.offset);
+          std::cout << "  [MATCH]  '" << wname << "' -> offset="
+                    << (data_section_start + entry.offset) << std::endl;
+          weight_match_count++;
+
+          // ---- Validation (schema_version 2+) ----
+          // Map C++ model dtype to the short string the writer emits.
+          auto dtype_to_str =
+            [](TensorDim::DataType t) -> const char * {
+            switch (t) {
+            case TensorDim::DataType::FP32:
+              return "F32";
+            case TensorDim::DataType::FP16:
+              return "F16";
+            case TensorDim::DataType::QINT4:
+              return "I4";
+            case TensorDim::DataType::QINT8:
+              return "I8";
+            case TensorDim::DataType::QINT16:
+              return "I16";
+            case TensorDim::DataType::UINT4:
+              return "U4";
+            case TensorDim::DataType::UINT8:
+              return "U8";
+            case TensorDim::DataType::UINT16:
+              return "U16";
+            case TensorDim::DataType::UINT32:
+              return "U32";
+            case TensorDim::DataType::Q4_0:
+              return "Q4_0";
+            case TensorDim::DataType::Q4_K:
+              return "Q4_K";
+            case TensorDim::DataType::Q6_K:
+              return "Q6_K";
+            case TensorDim::DataType::Q1_0:
+              return "Q1_0";
+            default:
+              return "";
+            }
+          };
+          const char *c_dtype = dtype_to_str(tensor_data_type);
+
+          // dtype mismatch is a hard error if the file declared a dtype.
+          // Legacy schema_version 1 files have no dtype so we skip.
+          if (!entry.dtype.empty() && *c_dtype != '\0' &&
+              entry.dtype != std::string(c_dtype)) {
+            std::ostringstream oss;
+            oss << "[safetensors] dtype mismatch for weight '" << wname
+                << "': file has '" << entry.dtype
+                << "' but C++ model expects '" << c_dtype
+                << "'. The safetensors file was likely generated for a "
+                   "different quantization config.";
+            throw std::runtime_error(oss.str());
+          }
+
+          // Quant metadata validation. We only validate in one direction
+          // for now: if BOTH sides declare quant info, they must agree.
+          // If the file has no quant info (v1 or omitted), we accept it
+          // and trust the C++ model's dtype — this preserves backward
+          // compatibility with existing files.
+          bool c_is_quant = (tensor_data_type == TensorDim::DataType::QINT4 ||
+                             tensor_data_type == TensorDim::DataType::QINT8 ||
+                             tensor_data_type == TensorDim::DataType::QINT16 ||
+                             tensor_data_type == TensorDim::DataType::UINT4 ||
+                             tensor_data_type == TensorDim::DataType::UINT8 ||
+                             tensor_data_type == TensorDim::DataType::UINT16 ||
+                             tensor_data_type == TensorDim::DataType::Q4_0 ||
+                             tensor_data_type == TensorDim::DataType::Q4_K ||
+                             tensor_data_type == TensorDim::DataType::Q6_K ||
+                             tensor_data_type == TensorDim::DataType::Q1_0);
+          if (entry.quant_present && !c_is_quant) {
+            std::ostringstream oss;
+            oss << "[safetensors] weight '" << wname
+                << "' has a quant object in the file (encoding="
+                << entry.quant_encoding
+                << ") but the C++ model's dtype (" << c_dtype
+                << ") is not a quantized type.";
+            throw std::runtime_error(oss.str());
+          }
+          if (c_is_quant && !entry.quant_present &&
+              safetensors_schema_version == "2") {
+            // Schema v2 should include quant info for quantized
+            // weights; absence is suspicious but not fatal.
+            std::cout << "  [WARN]   '" << wname
+                      << "' C++ expects a quantized dtype but the "
+                         "schema_version 2 file has no quant object"
+                      << std::endl;
+          }
+        } else {
+          // Prefix fallback: match by layer name prefix (before ':')
+          // This handles suffix mismatches like ":weight" vs ":gamma"
+          auto colon_pos = wname.find(':');
+          std::string prefix =
+            (colon_pos != std::string::npos) ? wname.substr(0, colon_pos) : wname;
+          auto pit = prefix_offset_map.find(prefix);
+          if (pit != prefix_offset_map.end()) {
+            weight->getVariableRef().setFileOffset(data_section_start +
+                                                   pit->second.first);
+            std::cout << "  [PREFIX] '" << wname << "' matched by prefix '"
+                      << prefix << "' -> offset="
+                      << (data_section_start + pit->second.first) << std::endl;
+            weight_match_count++;
+          } else {
+            // Strict: a MISS used to set file_offset=0, which silently read
+            // garbage from the start of the file (the safetensors header).
+            // Fail loudly with a diagnostic message so name-mismatch bugs
+            // surface immediately instead of producing wrong outputs.
+            weight_miss_count++;
+            std::cout << "  [MISS]   '" << wname
+                      << "' NOT FOUND in safetensors" << std::endl;
+            std::ostringstream oss;
+            oss << "[safetensors] weight '" << wname
+                << "' NOT FOUND: no exact match, ";
+            auto pc_it = prefix_count.find(prefix);
+            if (pc_it != prefix_count.end() && pc_it->second > 1) {
+              oss << "prefix '" << prefix << "' is ambiguous ("
+                  << pc_it->second
+                  << " safetensors entries share it; prefix fallback refused)";
+            } else if (pc_it == prefix_count.end()) {
+              oss << "prefix '" << prefix
+                  << "' not present in safetensors either";
+            } else {
+              oss << "prefix '" << prefix << "' present but lookup failed";
+            }
+            oss << ". See the '[safetensors] File tensor list' and "
+                   "'[nntrainer] C++ model weight list' above to diff names.";
+            throw std::runtime_error(oss.str());
+          }
+        }
+      } else {
+        weight->getVariableRef().setFileOffset(start_from);
+      }
+
       if (tensor_data_type != TensorDim::DataType::FP32 &&
           tensor_data_type != TensorDim::DataType::FP16 &&
           tensor_data_type != TensorDim::DataType::Q6_K &&
           tensor_data_type != TensorDim::DataType::Q4_0) {
-        // for tensor with qparam
         size += sizeof(uint16_t);
       }
-      file_offset.emplace_back(std::make_pair(start_from, size));
+      file_offset.emplace_back(
+        std::make_pair(weight->getVariable().getFileOffset(), size));
       start_from += size;
     }
+  }
+
+  if (is_safetensors) {
+    std::cout << "=== Safetensors load summary: " << weight_match_count
+              << " matched, " << weight_miss_count << " missed ===" << std::endl;
   }
 
   if (exec_mode == ExecutionMode::INFERENCE && fsu_mode) {
@@ -742,7 +1578,6 @@ void NeuralNetwork::load(const std::string &file_path,
     NNTR_THROW_IF(!initialized, std::runtime_error)
       << "Cannot load if not initialized yet, path: " << file_path
       << " format: " << static_cast<unsigned>(format);
-    auto f_path = (v.size() == 2) ? v[1] : v[0];
 
     auto model_file =
       checkedOpenStream<std::ifstream>(f_path, std::ios::in | std::ios::binary);
@@ -900,6 +1735,104 @@ void NeuralNetwork::load(const std::string &file_path,
   case ml::train::ModelFormat::MODEL_FORMAT_ONNX: {
     int ret = loadFromConfig((v.size() == 2) ? v[1] : v[0]);
     throw_status(ret);
+    break;
+  }
+
+  case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
+    NNTR_THROW_IF(!initialized, std::runtime_error)
+      << "Cannot load if not initialized yet, path: " << file_path
+      << " format: safetensors";
+
+    // Safetensors: parallel mmap loading using name-based offsets
+    if (exec_mode == ml::train::ExecutionMode::INFERENCE) {
+      std::vector<std::thread> threads;
+      threads.reserve(model_graph.size());
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           ++iter) {
+        auto node = *iter;
+        threads.emplace_back([&, node]() {
+#if defined(_WIN32)
+          HANDLE hFile =
+            CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+          NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
+            << "CreateFileA failed";
+          HANDLE hMap =
+            CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+          NNTR_THROW_IF((hMap == NULL), std::runtime_error)
+            << "CreateFileMapping failed";
+          char *view =
+            static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+          NNTR_THROW_IF((view == nullptr), std::runtime_error)
+            << "MapViewOfFile failed";
+          node->read(view, false, exec_mode, fsu_mode,
+                     std::numeric_limits<size_t>::max(), true);
+          UnmapViewOfFile(view);
+          CloseHandle(hMap);
+          CloseHandle(hFile);
+#else
+          int fd = ::open(f_path.c_str(), O_RDONLY);
+          NNTR_THROW_IF((fd == -1), std::invalid_argument)
+            << "Cannot open file : " << f_path;
+          struct stat st {};
+          NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+            << "Cannot get file info (fstat): " << f_path;
+          size_t f_size = static_cast<size_t>(st.st_size);
+          void *mmap_ptr =
+            ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+          ::close(fd);
+          NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+            << "mmap failed";
+          (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+          char *view = static_cast<char *>(mmap_ptr);
+          node->read(view, false, exec_mode, fsu_mode,
+                     std::numeric_limits<size_t>::max(), true);
+          (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+          ::munmap(mmap_ptr, f_size);
+#endif
+        });
+      }
+      for (auto &t : threads) {
+        if (t.joinable())
+          t.join();
+      }
+    } else {
+      // Training mode: sequential loading (no optimizer state in safetensors)
+      // Use read_from_offset=true so each weight seeks to its file_offset
+      auto model_file = checkedOpenStream<std::ifstream>(
+        f_path, std::ios::in | std::ios::binary);
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           ++iter) {
+        (*iter)->read(model_file, false, exec_mode, fsu_mode,
+                      std::numeric_limits<size_t>::max(), true);
+      }
+    }
+
+    // Print first 4 values of each weight for verification
+    std::cout << "\n=== Loaded weight values (first 4) ===" << std::endl;
+    std::unordered_set<const Tensor *> printed_weights;
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (auto weight : weights) {
+        if (!printed_weights.insert(&weight->getVariableRef()).second)
+          continue;
+        const float *data = weight->getVariable().getData<float>();
+        if (!data)
+          continue;
+        size_t total = weight->getVariable().size();
+        size_t show = std::min<size_t>(4, total);
+        std::cout << "  " << weight->getName() << " first4=[";
+        for (size_t j = 0; j < show; ++j) {
+          if (j)
+            std::cout << ", ";
+          printf("%.8f", data[j]);
+        }
+        std::cout << "]" << std::endl;
+      }
+    }
+    std::cout << "=======================================" << std::endl;
+
+    ml_logi("read safetensors modelfile: %s", f_path.c_str());
     break;
   }
 
@@ -1195,8 +2128,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
 
-      nntrainer::scopy(buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data,
-                       1);
+      nntrainer::getComputeOps()->scopy_fp16_to_fp32(
+        buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data, 1);
 #else
       throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif

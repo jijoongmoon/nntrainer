@@ -103,25 +103,34 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
 
 void CausalLM::constructModel() {
 
-  // It adds all transformer model's block to model
+  using ml::train::createLayer;
+
+  // Build the base transformer graph. This populates symbolic_output_
+  // with the post-norm hidden state tensor and does NOT compile the
+  // model (Transformer::initialize() compiles after constructModel()).
   Transformer::constructModel();
 
   const std::string lmhead_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
 
-  // add lmhead
+  // lm head props: input connection is supplied by the symbolic call
+  // below (lmhead(symbolic_output_)), so we do NOT set "input_layers"
+  // here. Setting it would conflict with the Tensor-based connection.
   std::vector<std::string> lmhead_prop = {
     withKey("name", "output_of_causallm"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
-    withKey("input_layers", "output_norm"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
 
   if (TIE_WORD_EMBEDDINGS)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
 
-  model->addLayer(createLayer(lmhead_type, lmhead_prop));
+  // Extend the symbolic graph: feed the post-norm hidden state through
+  // the lm head. symbolic_output_ is updated to the logits tensor so
+  // Transformer::initialize() compiles with the correct final output.
+  LayerHandle lmhead = createLayer(lmhead_type, lmhead_prop);
+  symbolic_output_ = lmhead(symbolic_output_);
 }
 
 void CausalLM::registerOutputs(

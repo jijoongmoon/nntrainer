@@ -16,6 +16,7 @@
 
 #include <addition_layer_cl.h>
 #include <cl_context.h>
+#include <compute_ops.h>
 #include <cl_kernels/cl_kernels.h>
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
@@ -81,6 +82,11 @@ void ClContext::initialize() noexcept {
     initAttentionClKernels();
     add_default_object();
     setMemAllocator(std::make_shared<MemAllocator>());
+
+    // Set OpenCL compute ops table so tensor operations dispatch to GPU
+    extern ComputeOps *get_opencl_ops();
+    if (auto cd = getContextData())
+      cd->setComputeOps(get_opencl_ops());
 
   } catch (std::exception &e) {
     ml_loge("cl_context: registering layers failed!!, reason: %s", e.what());

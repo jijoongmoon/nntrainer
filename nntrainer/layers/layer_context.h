@@ -25,10 +25,11 @@
 #include <tensor_wrap_specs.h>
 #include <weight.h>
 
+#include <context_data.h>
+
 namespace nntrainer {
 
 class Var_Grad;
-class ContextData;
 
 /**
  * @class   Layer Context class for all layers
@@ -909,6 +910,19 @@ public:
   std::shared_ptr<ContextData> getContextData() { return ct_data; }
 
   /**
+   * @brief Get the compute ops table for this layer's context.
+   *
+   * Returns the ComputeOps function pointer table associated with the
+   * compute engine (CPU/GPU/NPU) that this layer belongs to.
+   * Accessed through ContextData which is shared from the Context.
+   *
+   * @return ComputeOps* pointer to the ops table, or nullptr
+   */
+  struct ComputeOps *getComputeOps() const {
+    return ct_data ? ct_data->getComputeOps() : nullptr;
+  }
+
+  /**
    * @brief   get name by the layer
    *
    * @return name of the layer
@@ -985,11 +999,13 @@ public:
 
 private:
   std::tuple<props::Name, props::Trainable> props; /**< props of the layer */
-  std::shared_ptr<ContextData> ct_data;
-  float loss;       /**< loss of the layer */
-  bool is_inplace;  /**< if the layer is expected to run in-place */
-  float loss_scale; /**< loss_scale of the layer */
-  bool restoreData; /**< reset output for mixed precsion */
+  std::shared_ptr<ContextData> ct_data; /**< context data from Context (holds
+                                             ComputeOps, MemAllocator, and
+                                             vendor-specific data via subclass) */
+  float loss;         /**< loss of the layer */
+  bool is_inplace;    /**< if the layer is expected to run in-place */
+  float loss_scale;   /**< loss_scale of the layer */
+  bool restoreData;   /**< reset output for mixed precsion */
 
   std::vector<Weight *> weights;   /**< weights of the layer */
   std::vector<Var_Grad *> inputs;  /**< inputs of the layer */

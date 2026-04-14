@@ -73,3 +73,30 @@ option('arm-arch', type: 'combo',
 option('arm-march', type: 'string',
        value: '',
        description: 'ARM march flag (e.g., "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch.')
+
+# ARM vector / matrix extension options (opt-in feature flags layered
+# on top of arm-arch). These compose into the final -march string.
+#
+#   enable-sve   : Scalable Vector Extension (armv8.2-a optional,
+#                  armv9.0-a+ standard). Safe to enable on armv8.2-a
+#                  hardware that declares SVE support.
+#   enable-sve2  : SVE2. Requires armv9.0-a or later. REJECTED when
+#                  arm-arch is armv8.2-a or lower.
+#   enable-sme   : Scalable Matrix Extension. Requires armv9.2-a.
+#                  REJECTED on armv8.2-a / armv7l.
+#   enable-sme2  : SME2 (streaming matmul, outer product accumulate,
+#                  etc.). Typically armv9.3-a+ but many armv9.2-a
+#                  implementations ship with it. REJECTED on
+#                  armv8.2-a / armv7l.
+#
+# Setting arm-arch=armv9.2-a as before still auto-enables sve2+sme to
+# preserve the legacy default. The opt-in flags above let you add
+# plain SVE on an armv8.2-a build without jumping to armv9.
+option('enable-sve',  type: 'boolean', value: false,
+       description: 'Enable ARM SVE (scalable vector) feature in -march.')
+option('enable-sve2', type: 'boolean', value: false,
+       description: 'Enable ARM SVE2 feature in -march. Requires arm-arch=armv9.2-a.')
+option('enable-sme',  type: 'boolean', value: false,
+       description: 'Enable ARM SME (scalable matrix) feature in -march. Requires arm-arch=armv9.2-a.')
+option('enable-sme2', type: 'boolean', value: false,
+       description: 'Enable ARM SME2 feature in -march. Requires arm-arch=armv9.2-a (normally armv9.3-a).')

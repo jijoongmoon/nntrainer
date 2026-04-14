@@ -1,0 +1,24 @@
+{
+    "model_type": "CausalLM",
+    "model_tensor_type": "QINT4-FP32",
+    "model_file_name": "nntr_qwen3_0.6b_int4.safetensors",
+
+    "fc_layer_dtype" : "QINT4",
+    "embedding_dtype" : "Q6_K",
+    "lmhead_dtype" : "QINT4",
+
+    "lora_rank" : 0,
+    "lora_alpha" : 0,
+    "lora_target": [],
+
+    "bad_word_ids": [],
+    "fsu": false,
+    "fsu_lookahead": 2,
+    "num_to_generate": 512,
+    "init_seq_len": 1024,
+    "max_seq_len": 2048,
+    "batch_size": 1,
+
+    "tokenizer_file": "tokenizer.json",
+    "sample_input": "<|im_start|>user\nGive me a short introduction to large language model.<|im_end|>\n<|im_start|>assistant\n"
+}

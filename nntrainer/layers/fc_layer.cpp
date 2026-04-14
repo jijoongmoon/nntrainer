@@ -170,11 +170,23 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
                             TensorLifespan::FORWARD_FUNC_LIFESPAN);
   }
 
-  ///@todo this quantizaer should be moved to tensor, not layer!
+  ///@todo this quantizer should be moved to tensor, not layer!
   switch (context.getWeightDataType()) {
   case ml::train::TensorDim::DataType::QINT4:
+    // QINT4 weights are forwarded through the native int4 dot path
+    // (KleidiAI qsi4cxp on CPU, int4 OpenCL kernel on GPU, QNN on
+    // NPU) which consumes the packed nibbles + per-channel fp16 scale
+    // layout directly. No layer-side dequantizer is used, so we skip
+    // creating one to avoid dead state. Per P5: the Int4QTensor is
+    // allocated PER_CHANNEL_AFFINE with group_size_=0 (pure per-channel,
+    // qsi4cxp semantics) by default in TensorPool::request.
+    quantizer = nullptr;
+    break;
   case ml::train::TensorDim::DataType::QINT8:
   case ml::train::TensorDim::DataType::QINT16:
+    // QINT8/QINT16 still go through the dequantize-then-matmul
+    // fallback until their native dot paths are wired through
+    // ComputeOps. This mirrors the pre-P5 behavior for these dtypes.
     quantizer =
       Quantization::createQuantizer(nntrainer::QScheme::PER_TENSOR_AFFINE);
     break;
@@ -210,7 +222,16 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
   ///@todo This dequantization action should be moved to tensor.dot()
-  if (quantizer != nullptr) {
+  // QINT4: route through the native int4 dot dispatch in
+  // FloatTensor::dotFloat -> dotQInteger, which calls KleidiAI
+  // qsi4cxp (CPU) or the int4 OpenCL kernel (GPU SVM path).
+  // Int4QTensor already holds the canonical packed layout so no
+  // repack happens here; the per-channel fp16 scales live right
+  // after the packed bytes and are read by the kernel directly.
+  if (weight.getDataType() == ml::train::TensorDim::DataType::QINT4) {
+    input_.dot(weight, hidden_, false, false);
+  } else if (quantizer != nullptr) {
+    // QINT8 / QINT16: dequantize-then-matmul fallback.
     Tensor weight_ = quantizer->dequantize(weight, input_.getDataType());
     input_.dot(weight_, hidden_, false, false);
   } else {

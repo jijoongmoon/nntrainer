@@ -11,6 +11,7 @@
  *
  */
 
+#include <cpu_backend.h>
 #include <util_simd.h>
 
 #include "swiglu.h"

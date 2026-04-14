@@ -156,9 +156,27 @@ endif
 
 if get_option('enable-fp16')
    if get_option('platform') == 'android'
-     add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+     if cxx.has_argument('-mfp16-format=ieee')
+       add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+     endif
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
+     # Android: apply SVE/SVE2/SME/SME2 defines based on enable-* options.
+     # The actual -march flag is set by jni/meson.build from JSON config.
+     # We still need the ENABLE_* defines for the interface C++ files
+     # (kleidiai_interface_qai8dxp_qsi4cxp.cpp uses #ifdef ENABLE_SME).
+     if get_option('enable-sve')
+       extra_defines += '-DENABLE_SVE=1'
+     endif
+     if get_option('enable-sve2')
+       extra_defines += '-DENABLE_SVE2=1'
+     endif
+     if get_option('enable-sme')
+       extra_defines += '-DENABLE_SME=1'
+     endif
+     if get_option('enable-sme2')
+       extra_defines += '-DENABLE_SME2=1'
+     endif
    elif arch == 'aarch64'
      ## About FP16 in GCC (from GCC-9.1 manual)
      # https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html
@@ -174,21 +192,84 @@ if get_option('enable-fp16')
      else
        message ('The compiler does not support -mfp16-format=ieee. However, according to https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html, gcc may use IEEE fp16 anyway. Thus, we will proceed without the option for FP16 support.')
      endif
-     # Use arm-arch option for architecture-specific flags
+     # Use arm-arch option for architecture-specific flags. The final
+     # -march string is composed from the baseline features of the
+     # selected arm-arch plus any opt-in enable-sve/sve2/sme/sme2
+     # feature flags. Guards reject SVE2/SME/SME2 on armv8.2-a so a
+     # wrong combination fails loudly at configure time instead of
+     # silently producing code that will SIGILL on the target CPU.
      arm_arch_opt = get_option('arm-arch')
      if arm_arch_opt == 'armv9.2-a'
-       add_project_arguments('-march=armv9.2-a+fp16+sve2+sme', language: ['c', 'cpp'])
+       arm_base_arch = 'armv9.2-a'
+       # armv9.2-a baseline: fp16 + sve2. SME/SME2 require explicit
+       # opt-in via enable-sme/enable-sme2 because GCC < 14 does not
+       # accept +sme in -march. NDK r27+ (Clang 18) supports it.
+       arm_features = ['fp16', 'sve2']
        extra_defines += '-DARM_ARCH_ARMV9_2A=1'
        extra_defines += '-DENABLE_SVE2=1'
      elif arm_arch_opt == 'armv8.2-a'
-       add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
+       arm_base_arch = 'armv8.2-a'
+       arm_features = ['fp16', 'dotprod', 'i8mm']
        extra_defines += '-DARM_ARCH_ARMV8_2A=1'
      else
-       # auto: default to armv8.2-a+fp16+dotprod+i8mm for native aarch64 builds
-       add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
+       # auto / unknown: default to armv8.2-a+fp16+dotprod+i8mm for
+       # native aarch64 builds.
+       arm_base_arch = 'armv8.2-a'
+       arm_features = ['fp16', 'dotprod', 'i8mm']
        extra_defines += '-DARM_ARCH_ARMV8_2A=1'
        message('Unknown arm-arch option. Using default armv8.2-a+fp16+dotprod+i8mm')
      endif
+
+     # Opt-in SVE (plain). Valid on armv8.2-a+ hardware as an
+     # optional extension, so we allow it regardless of base_arch.
+     if get_option('enable-sve')
+       if not ('sve' in arm_features) and not ('sve2' in arm_features)
+         arm_features += 'sve'
+       endif
+       extra_defines += '-DENABLE_SVE=1'
+     endif
+
+     # SVE2 / SME / SME2 require armv9.2-a baseline (within the
+     # arm-arch choices that nntrainer exposes). Reject on armv8.2-a
+     # so a mis-configured build cannot sneak these into armv8.2-a
+     # binaries.
+     if get_option('enable-sve2')
+       if arm_base_arch != 'armv9.2-a'
+         error('enable-sve2 requires arm-arch=armv9.2-a (SVE2 is an armv9.0-a+ feature). Current arm-arch: ' + arm_base_arch)
+       endif
+       if not ('sve2' in arm_features)
+         arm_features += 'sve2'
+       endif
+       extra_defines += '-DENABLE_SVE2=1'
+     endif
+
+     if get_option('enable-sme')
+       if arm_base_arch != 'armv9.2-a'
+         error('enable-sme requires arm-arch=armv9.2-a (SME is an armv9.2-a feature). Current arm-arch: ' + arm_base_arch)
+       endif
+       if not ('sme' in arm_features)
+         arm_features += 'sme'
+       endif
+       extra_defines += '-DENABLE_SME=1'
+     endif
+
+     if get_option('enable-sme2')
+       if arm_base_arch != 'armv9.2-a'
+         error('enable-sme2 requires arm-arch=armv9.2-a (SME2 is normally an armv9.3-a feature but armv9.2-a implementations may support it). Current arm-arch: ' + arm_base_arch)
+       endif
+       if not ('sme2' in arm_features)
+         arm_features += 'sme2'
+       endif
+       extra_defines += '-DENABLE_SME2=1'
+     endif
+
+     # Compose the final -march string.
+     arm_march_str = '-march=' + arm_base_arch
+     foreach feat : arm_features
+       arm_march_str += '+' + feat
+     endforeach
+     add_project_arguments(arm_march_str, language: ['c', 'cpp'])
+     message('ARM march: ' + arm_march_str)
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
    elif arch == 'arm'
@@ -778,6 +859,9 @@ if get_option('enable-app')
       endif
     endif
     subdir('Applications')
+    if get_option('enable-transformer')
+      subdir('tools')
+    endif
   endif
 endif
 

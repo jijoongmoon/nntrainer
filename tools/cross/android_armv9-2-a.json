@@ -2,5 +2,10 @@
     "arm_arch": "armv9.2-a",
     "arm_march": "armv9.2-a+fp16+sve2+sme",
     "enable_fp16": true,
-    "app_abi": "arm64-v8a"
+    "enable_sve": true,
+    "enable_sve2": true,
+    "enable_sme": true,
+    "enable_sme2": false,
+    "app_abi": "arm64-v8a",
+    "__note__": "Galaxy S26 Ultra / Snapdragon 8 Elite Gen 5 (Oryon cores) supports SME1 but NOT SME2. Exynos 2600 (non-Ultra variants) supports SME2 — if targeting Exynos, override enable_sme2 to true and add +sme2 to arm_march."
 }

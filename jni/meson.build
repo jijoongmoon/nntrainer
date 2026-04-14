@@ -13,7 +13,16 @@ if get_option('platform') == 'android'
     # Fallback: derive from arm-arch (for builds without --arm-arch argument)
     arm_arch_opt = get_option('arm-arch')
     if arm_arch_opt == 'armv9.2-a'
-      arm_march_flag = '-march=armv9.2-a+fp16+sve2+sme'
+      # Base: fp16+sve2. SME/SME2 added only when explicitly enabled
+      # (GCC 13 rejects +sme; NDK Clang 18 accepts it).
+      jni_arm_features = 'armv9.2-a+fp16+sve2'
+      if get_option('enable-sme')
+        jni_arm_features += '+sme'
+      endif
+      if get_option('enable-sme2')
+        jni_arm_features += '+sme2'
+      endif
+      arm_march_flag = '-march=' + jni_arm_features
     elif arm_arch_opt == 'armv8.2-a' or arm_arch_opt == 'auto'
       arm_march_flag = '-march=armv8.2-a+fp16+dotprod+i8mm'
     elif arm_arch_opt == 'armv7l'
@@ -38,6 +47,14 @@ and_conf.set('MESON_NNTRAINER_INCS', ' '.join(nntrainer_inc_abs))
 and_conf.set('MESON_CCAPI_NNTRAINER_SRCS', ' '.join(ccapi_src))
 and_conf.set('MESON_CCAPI_NNTRAINER_INCS', ' '.join(ccapi_inc_abs))
 and_conf.set('MESON_ARM_MARCH', arm_march_flag)
+
+# APP_ABI for Application.mk: derived from arm-arch
+arm_arch_opt_jni = get_option('arm-arch')
+if arm_arch_opt_jni == 'armv7l'
+  and_conf.set('MESON_APP_ABI', 'armeabi-v7a')
+else
+  and_conf.set('MESON_APP_ABI', 'arm64-v8a')
+endif
 
 and_conf.set('VERSION_MAJOR', nntrainer_version_split[0])
 and_conf.set('VERSION_MINOR', nntrainer_version_split[1])
@@ -104,8 +121,8 @@ configure_file(input: 'Android.mk.in', output: 'Android.mk',
 
 install_data(sources: 'Android-prebuilt.mk', rename: 'Android.mk', install_dir: nntrainer_prefix)
 
-configure_file(input: 'Application.mk', output: 'Application.mk',
-  copy: true
+configure_file(input: 'Application.mk.in', output: 'Application.mk',
+  configuration: and_conf
 )
 
 # below is list of file that meson acknowledges this is the output of custom target so that

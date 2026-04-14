@@ -49,8 +49,8 @@ public:
 
   /**
    * @brief Tensor Data Type.
-   * Currently support QINT4, QINT8, QINT16, BCQ, Q4_K, UINT8, UINT16, UINT32,
-   * FP16 & FP32
+   * Currently support QINT4, QINT8, QINT16, BCQ, Q4_K, Q1_0, UINT8, UINT16,
+   * UINT32, FP16 & FP32
    */
   enum class DataType {
     QINT4,  /** quantized int 4*/
@@ -60,6 +60,7 @@ public:
     Q4_K,   /** Q4_K quantized*/
     Q6_K,   /** q6 k quantized */
     Q4_0,   /** Q4_0 k quantized */
+    Q1_0,   /** Q1_0 1-bit quantized with group size 128 */
     UINT4,  /** quantized unsigned int 4*/
     UINT8,  /** unsigned int 8 bit */
     UINT16, /** unsigned int 16 bit */

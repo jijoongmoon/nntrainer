@@ -17,10 +17,9 @@
 #include <string>
 
 #include <channel_shuffle.h>
-#include <cpu_backend.h>
 #include <layer_context.h>
 #include <lazy_tensor.h>
-#include <nntr_threads.h>
+#include <thread_manager.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -205,37 +204,27 @@ void ChannelShuffle::forwarding(RunLayerContext &context, bool training) {
       << "Channel Shuffle layer only supports NHWC and NCHW format";
   }
 
-  auto forwarding_job = [&](unsigned int s, unsigned int e, unsigned int pid,
-                            void *user_data) {
-    for (unsigned int b = s; b < e; ++b) {
-      Tensor out = hidden_.getBatchSlice(b, 1);
-      Tensor in_sub = input_.getBatchSlice(b, 1);
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(input_.batch()), [&](size_t b) {
+    Tensor out = hidden_.getBatchSlice(b, 1);
+    Tensor in_sub = input_.getBatchSlice(b, 1);
 
-      // Step 1: Reshape into groups
-      // [1, C, H, W] -> [1, G, C/G, H*W]
-      // [1, H, W, C] -> [1, HW, G, C/G] in NHWC format
-      in_sub.reshape(group_dim);
+    // Step 1: Reshape into groups
+    // [1, C, H, W] -> [1, G, C/G, H*W]
+    // [1, H, W, C] -> [1, HW, G, C/G] in NHWC format
+    in_sub.reshape(group_dim);
 
-      // Step 2: Transpose groups
-      // [1, G, C/G, H*W] -> [1, C/G, G, H*W]
-      // [1, HW, G, C/G] -> [1, HW, C/G, G] in NHWC format
-      out.reshape(transposed_dim);
-      channel_shuffle_transpose(in_sub, out);
+    // Step 2: Transpose groups
+    // [1, G, C/G, H*W] -> [1, C/G, G, H*W]
+    // [1, HW, G, C/G] -> [1, HW, C/G, G] in NHWC format
+    out.reshape(transposed_dim);
+    channel_shuffle_transpose(in_sub, out);
 
-      // Step 3: Reshape back to original dimensions
-      // [1, C/G, G, H*W] -> [1, C, H, W]
-      // [1, HW, C/G, G] -> [1, H, W, C] in NHWC format
-      out.reshape(original_dim);
-    }
-  };
-
-  auto workers = ParallelBatch(forwarding_job, input_.batch(), nullptr);
-
-  if (workers.getNumWorkers() > 1) {
-    workers.run();
-  } else {
-    forwarding_job(0, input_.batch(), 0, nullptr);
-  }
+    // Step 3: Reshape back to original dimensions
+    // [1, C/G, G, H*W] -> [1, C, H, W]
+    // [1, HW, C/G, G] -> [1, H, W, C] in NHWC format
+    out.reshape(original_dim);
+  });
 }
 
 void ChannelShuffle::calcDerivative(RunLayerContext &context) {
@@ -279,37 +268,27 @@ void ChannelShuffle::calcDerivative(RunLayerContext &context) {
     original_dim.batch(1);                    // For batch slice
   }
 
-  auto compute_derivative = [&](unsigned int s, unsigned int e,
-                                unsigned int pid, void *user_data) {
-    for (unsigned int b = s; b < e; ++b) {
-      Tensor deriv_sub = derivative.getBatchSlice(b, 1);
-      Tensor in_deriv_sub = input_derivative.getBatchSlice(b, 1);
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(derivative.batch()), [&](size_t b) {
+    Tensor deriv_sub = derivative.getBatchSlice(b, 1);
+    Tensor in_deriv_sub = input_derivative.getBatchSlice(b, 1);
 
-      // Step 1: Reshape into groups
-      // [1, C, H, W] -> [1, C/G, G, H*W]
-      // [1, H, W, C] -> [1, HW, C/G, G] in NHWC format
-      deriv_sub.reshape(group_dim);
+    // Step 1: Reshape into groups
+    // [1, C, H, W] -> [1, C/G, G, H*W]
+    // [1, H, W, C] -> [1, HW, C/G, G] in NHWC format
+    deriv_sub.reshape(group_dim);
 
-      // Step 2: Transpose groups (inverse of forward operation)
-      // [1, C/G, G, H*W] -> [1, G, C/G, H*W]
-      // [1, HW, C/G, G] -> [1, HW, G, C/G] in NHWC format
-      in_deriv_sub.reshape(transposed_dim);
-      channel_shuffle_transpose(deriv_sub, in_deriv_sub);
+    // Step 2: Transpose groups (inverse of forward operation)
+    // [1, C/G, G, H*W] -> [1, G, C/G, H*W]
+    // [1, HW, C/G, G] -> [1, HW, G, C/G] in NHWC format
+    in_deriv_sub.reshape(transposed_dim);
+    channel_shuffle_transpose(deriv_sub, in_deriv_sub);
 
-      // Step 3: Reshape back to original dimensions
-      // [1, G, C/G, H*W] -> [1, C, H, W]
-      // [1, HW, G, C/G] -> [1, H, W, C] in NHWC format
-      in_deriv_sub.reshape(original_dim);
-    }
-  };
-
-  auto workers = ParallelBatch(compute_derivative, derivative.batch(), nullptr);
-
-  if (workers.getNumWorkers() > 1) {
-    workers.run();
-  } else {
-    compute_derivative(0, derivative.batch(), 0, nullptr);
-  }
+    // Step 3: Reshape back to original dimensions
+    // [1, G, C/G, H*W] -> [1, C, H, W]
+    // [1, HW, G, C/G] -> [1, H, W, C] in NHWC format
+    in_deriv_sub.reshape(original_dim);
+  });
 }
 
 void ChannelShuffle::calcGradient(RunLayerContext &context) {

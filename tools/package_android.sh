@@ -50,6 +50,10 @@ try:
     data = json.load(open('$json_file'))
     print(f'enable_fp16={data.get(\"enable_fp16\", \"True\")}')
     print(f'arm_march=\"{data.get(\"arm_march\", \"\")}\"')
+    print(f'enable_sve={data.get(\"enable_sve\", \"False\")}')
+    print(f'enable_sve2={data.get(\"enable_sve2\", \"False\")}')
+    print(f'enable_sme={data.get(\"enable_sme\", \"False\")}')
+    print(f'enable_sme2={data.get(\"enable_sme2\", \"False\")}')
 except Exception as e:
     print(f'echo \"Error reading JSON: {e}\" >&2', file=sys.stderr)
     sys.exit(1)
@@ -60,6 +64,19 @@ except Exception as e:
         # Handle enable_fp16 based on JSON boolean
         if [[ "$enable_fp16" == "False" ]]; then
             filtered_args+=("-Denable-fp16=false")
+        fi
+        # Handle SVE/SVE2/SME/SME2 based on JSON boolean
+        if [[ "$enable_sve" == "True" ]]; then
+            filtered_args+=("-Denable-sve=true")
+        fi
+        if [[ "$enable_sve2" == "True" ]]; then
+            filtered_args+=("-Denable-sve2=true")
+        fi
+        if [[ "$enable_sme" == "True" ]]; then
+            filtered_args+=("-Denable-sme=true")
+        fi
+        if [[ "$enable_sme2" == "True" ]]; then
+            filtered_args+=("-Denable-sme2=true")
         fi
     else
         echo "Warning: JSON config file not found: $json_file"
