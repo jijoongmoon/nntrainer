@@ -19,13 +19,8 @@
 #define __QUICK_DOT_AI_API_H__
 
 /* ── Extended model types (src additions) ────────────────────── */
-
 #ifdef __CAUSAL_LM_API_H__
-
-#ifndef CAUSAL_LM_MODEL_GAUSS2_5
-#define CAUSAL_LM_MODEL_GAUSS2_5 ((ModelType)1)
-#endif
-
+/* Model types already defined from causal_lm_api.h */
 #else /* causal_lm_api.h not included — provide full definitions */
 
 #define __CAUSAL_LM_API_H__
@@ -64,12 +59,18 @@ typedef enum {
 typedef enum {
   CAUSAL_LM_MODEL_QWEN3_0_6B = 0,
   CAUSAL_LM_MODEL_GAUSS2_5 = 1,
+  CAUSAL_LM_MODEL_GAUSS3_6_QNN = 2,
+  CAUSAL_LM_MODEL_GAUSS3_8_QNN = 3,
 } ModelType;
 
 typedef struct {
-  bool use_chat_template;
-  bool debug_mode;
-  bool verbose;
+  // Add configuration options here as needed
+  bool use_chat_template; /// < @brief Whether to apply chat template to input
+  bool debug_mode; /// < @brief Check model file validity during initialization
+  bool verbose;    /// < @brief Whether to print output during generation
+  const char
+    *chat_template_name; /// < @brief Template name to select from array
+                         ///  (e.g., "default", "tool_use"). NULL for "default".
 } Config;
 
 WIN_EXPORT ErrorCode setOptions(Config config);
@@ -82,6 +83,22 @@ typedef enum {
   CAUSAL_LM_QUANTIZATION_W32A32 = 4,
 } ModelQuantizationType;
 
+/**
+ * @brief Chat message structure for chat template formatting
+ * @note  Compatible with HuggingFace apply_chat_template() format
+ */
+typedef struct {
+  const char *role;    /**< Message role: "system", "user", or "assistant" */
+  const char *content; /**< Message content text */
+} CausalLMChatMessage;
+
+/**
+ * @brief Load a model
+ * @param compute Backend compute type
+ * @param modeltype Model type
+ * @param quant_type Model quantization type
+ * @return ErrorCode
+ */
 WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
                                ModelQuantizationType quant_type);
 
@@ -100,6 +117,31 @@ WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
 WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
                               const char **outputText);
 
+/**
+ * @brief Run inference with chat template formatted messages
+ * @param messages Array of chat messages with role and content
+ * @param num_messages Number of messages in the array
+ * @param add_generation_prompt Whether to append generation prompt at end
+ * @param outputText Buffer to store output text (owned by the library)
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
+                                          size_t num_messages,
+                                          bool add_generation_prompt,
+                                          const char **outputText);
+
+/**
+ * @brief Apply chat template to messages without running inference
+ * @param messages Array of chat messages with role and content
+ * @param num_messages Number of messages in the array
+ * @param add_generation_prompt Whether to append generation prompt at end
+ * @param formattedText Buffer to store formatted text (owned by the library)
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
+                                       size_t num_messages,
+                                       bool add_generation_prompt,
+                                       const char **formattedText);
 /*============================================================================
  * Handle-based API (for parallel multi-model execution)
  *
@@ -133,14 +175,17 @@ typedef struct CausalLmModel *CausalLmHandle;
  * handles, each with its own model state. The caller must eventually call
  * destroyModelHandle on the returned handle to release resources.
  *
- * @param compute    Backend compute type
- * @param modeltype  Model type enum
- * @param quant_type Quantization type
- * @param out_handle Out-parameter that receives the new handle on success
+ * @param compute         Backend compute type
+ * @param modeltype       Model type enum
+ * @param quant_type      Quantization type
+ * @param native_lib_dir  Native library directory path (from Android
+ *                        ApplicationInfo.nativeLibraryDir). May be NULL.
+ * @param out_handle      Out-parameter that receives the new handle on success
  * @return ErrorCode
  */
 WIN_EXPORT ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
                                      ModelQuantizationType quant_type,
+                                     const char *native_lib_dir,
                                      CausalLmHandle *out_handle);
 
 /**
@@ -167,8 +212,8 @@ WIN_EXPORT ErrorCode runModelHandle(CausalLmHandle handle,
  * @param metrics Pointer to a PerformanceMetrics struct to be filled
  * @return ErrorCode
  */
-WIN_EXPORT ErrorCode
-getPerformanceMetricsHandle(CausalLmHandle handle, PerformanceMetrics *metrics);
+WIN_EXPORT ErrorCode getPerformanceMetricsHandle(CausalLmHandle handle,
+                                                 PerformanceMetrics *metrics);
 
 /**
  * @brief Release all resources owned by a handle.
@@ -229,9 +274,10 @@ WIN_EXPORT ErrorCode unloadModelHandle(CausalLmHandle handle);
  *                        callback on every invocation. May be NULL.
  * @return ErrorCode
  */
-WIN_EXPORT ErrorCode
-runModelHandleStreaming(CausalLmHandle handle, const char *inputTextPrompt,
-                        CausalLmTokenCallback callback, void *user_data);
+WIN_EXPORT ErrorCode runModelHandleStreaming(CausalLmHandle handle,
+                                             const char *inputTextPrompt,
+                                             CausalLmTokenCallback callback,
+                                             void *user_data);
 
 #ifdef __cplusplus
 }

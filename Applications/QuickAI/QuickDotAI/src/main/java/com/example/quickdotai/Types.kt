@@ -40,7 +40,8 @@ enum class BackendType {
 @Serializable
 enum class ModelId {
     QWEN3_0_6B,
-    GEMMA4
+    GEMMA4,
+    GAUSS3_8_QNN
 }
 
 /**
@@ -140,6 +141,14 @@ data class LoadModelRequest(
      * ignored by [NativeQuickDotAI].
      */
     @SerialName("max_num_tokens") val maxNumTokens: Int? = null,
+
+    /**
+     * Native library directory path from ApplicationInfo.nativeLibraryDir.
+     * Used by the native engine to locate shared libraries for loading.
+     *
+     * Only honored by [NativeQuickDotAI]; [LiteRTLm] ignores it.
+     */
+    @SerialName("native_lib_dir") val nativeLibDir: String? = null,
 ) {
     /**
      * Canonical key shared across the stack: one worker/handle per

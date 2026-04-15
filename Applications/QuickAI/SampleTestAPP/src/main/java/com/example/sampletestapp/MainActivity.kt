@@ -535,12 +535,14 @@ class MainActivity : AppCompatActivity() {
         val quant = selectedQuant()
         val modelPath = modelPathField.text.toString().trim().ifEmpty { null }
         val visionBackend = if (model == ModelId.GEMMA4) backend else null
+        val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
         return LoadModelRequest(
             backend = backend,
             model = model,
             quantization = quant,
             modelPath = modelPath,
             visionBackend = visionBackend,
+            nativeLibDir = nativeLibDir,
         )
     }
 
@@ -1279,6 +1281,8 @@ class MainActivity : AppCompatActivity() {
                 "$base/models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
             ModelId.QWEN3_0_6B ->
                 "$base/models/qwen3-0.6b${quantizationSuffix(quant)}"
+            ModelId.GAUSS3_8_QNN ->
+                "$base/models/gauss-3.8b-qnn"
         }
     }
 

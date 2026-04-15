@@ -22,6 +22,13 @@
 #include <context.h>
 #include <dynamic_library_loader.h>
 #include <engine.h>
+#include <android/log.h>
+
+#define LOG_TAG "nntrainer_engine"
+
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
@@ -185,18 +192,32 @@ void Engine::setWorkingDirectory(const std::string &base) {
 
 int Engine::registerContext(const std::string &library_path,
                             const std::string &base_path) {
+
+  LOGD("%s:%d", __FILE__, __LINE__);
+
   const std::string full_path = getFullPath(library_path, base_path);
 
+  LOGD("%s", full_path.c_str());
+
   void *handle = DynamicLibraryLoader::loadLibrary(full_path.c_str(),
-                                                   RTLD_LAZY | RTLD_LOCAL);
+                                                   RTLD_LAZY | RTLD_GLOBAL);
+
+  LOGD("%s:%d", __FILE__, __LINE__);
+
   const char *error_msg = DynamicLibraryLoader::getLastError();
 
   NNTR_THROW_IF(handle == nullptr, std::invalid_argument)
     << func_tag << "open plugin failed, reason: " << error_msg;
 
+            LOGD("%s:%d", __FILE__, __LINE__);
+
+
   nntrainer::ContextPluggable *pluggable =
     reinterpret_cast<nntrainer::ContextPluggable *>(
       DynamicLibraryLoader::loadSymbol(handle, "ml_train_context_pluggable"));
+
+              LOGD("%s:%d", __FILE__, __LINE__);
+
 
   error_msg = DynamicLibraryLoader::getLastError();
   auto close_dl = [handle] { DynamicLibraryLoader::freeLibrary(handle); };
@@ -204,10 +225,19 @@ int Engine::registerContext(const std::string &library_path,
                         std::invalid_argument, close_dl)
     << func_tag << "loading symbol failed, reason: " << error_msg;
 
+            LOGD("%s:%d", __FILE__, __LINE__);
+
+
   auto context = pluggable->createfunc();
+
+          LOGD("%s:%d", __FILE__, __LINE__);
+
   NNTR_THROW_IF_CLEANUP(context == nullptr, std::invalid_argument, close_dl)
     << func_tag << "created pluggable context is null";
   auto type = context->getName();
+
+          LOGD("%s:%d", __FILE__, __LINE__);
+
   NNTR_THROW_IF_CLEANUP(type == "", std::invalid_argument, close_dl)
     << func_tag << "custom layer must specify type name, but it is empty";
 

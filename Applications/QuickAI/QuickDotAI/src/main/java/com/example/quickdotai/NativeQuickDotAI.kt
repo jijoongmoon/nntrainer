@@ -100,12 +100,14 @@ class NativeQuickDotAI : QuickDotAI {
             Log.i(
                 TAG,
                 "load(): calling loadModelHandleNative(backend=${req.backend.ordinal}, " +
-                    "model=$nativeModelOrdinal, quant=${req.quantization.ordinal})"
+                    "model=$nativeModelOrdinal, quant=${req.quantization.ordinal}, " +
+                    "nativeLibDir=${req.nativeLibDir})"
             )
             val result = NativeCausalLm.loadModelHandleNative(
                 backendOrdinal = mapBackend(req.backend),
                 modelOrdinal = nativeModelOrdinal,
-                quantOrdinal = mapQuant(req.quantization)
+                quantOrdinal = mapQuant(req.quantization),
+                nativeLibDir = req.nativeLibDir
             )
             Log.i(
                 TAG,
@@ -367,6 +369,7 @@ class NativeQuickDotAI : QuickDotAI {
     private fun mapModelId(m: ModelId): Int? = when (m) {
         ModelId.QWEN3_0_6B -> 0 // CAUSAL_LM_MODEL_QWEN3_0_6B
         ModelId.GEMMA4 -> null
+        ModelId.GAUSS3_8_QNN -> 3 // CAUSAL_LM_MODEL_GAUSS3_8_QNN
     }
 
     private fun mapBackend(b: BackendType): Int = when (b) {

@@ -111,11 +111,17 @@ object NativeCausalLm {
      */
     external fun chdirNative(path: String): Int
 
-    /** Forwards to `loadModelHandle` in quick_dot_ai_api.h. */
+    /**
+     * @brief Forwards to `loadModelHandle` in quick_dot_ai_api.h.
+     *
+     * @param nativeLibDir Native library directory path from
+     *        ApplicationInfo.nativeLibraryDir. May be null.
+     */
     external fun loadModelHandleNative(
         backendOrdinal: Int,
         modelOrdinal: Int,
-        quantOrdinal: Int
+        quantOrdinal: Int,
+        nativeLibDir: String?
     ): LoadResult
 
     /** Forwards to `runModelHandle` in quick_dot_ai_api.h. */

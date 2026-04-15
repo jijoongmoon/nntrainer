@@ -144,12 +144,22 @@ Java_com_example_quickdotai_NativeCausalLm_chdirNative(
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_example_quickdotai_NativeCausalLm_loadModelHandleNative(
   JNIEnv *env, jobject /*thiz*/, jint backendOrdinal, jint modelOrdinal,
-  jint quantOrdinal) {
+  jint quantOrdinal, jstring nativeLibDirJ) {
+  const char *native_lib_dir = nullptr;
+  if (nativeLibDirJ != nullptr) {
+    native_lib_dir = env->GetStringUTFChars(nativeLibDirJ, nullptr);
+  }
+
   CausalLmHandle handle = nullptr;
   ErrorCode ec =
     loadModelHandle(static_cast<BackendType>(backendOrdinal),
                     static_cast<ModelType>(modelOrdinal),
-                    static_cast<ModelQuantizationType>(quantOrdinal), &handle);
+                    static_cast<ModelQuantizationType>(quantOrdinal),
+                    native_lib_dir, &handle);
+
+  if (native_lib_dir != nullptr && nativeLibDirJ != nullptr) {
+    env->ReleaseStringUTFChars(nativeLibDirJ, native_lib_dir);
+  }
 
   if (g_cache.loadResultCls == nullptr || g_cache.loadResultCtor == nullptr) {
     return nullptr;

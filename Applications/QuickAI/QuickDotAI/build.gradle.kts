@@ -23,12 +23,17 @@ val prebuiltNativeLibsDir =
 val copyPrebuiltNativeLibs = tasks.register<Copy>("copyPrebuiltNativeLibs") {
     from(project.file("prebuilt_libs"))
     include("*.so")
+    include("htp_backend_ext_config.json")
     into(prebuiltNativeLibsDir)
 }
 
 android {
     namespace = "com.example.quickdotai"
     compileSdk = 36
+
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
 
     defaultConfig {
         minSdk = 33
