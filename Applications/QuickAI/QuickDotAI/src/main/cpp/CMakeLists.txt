@@ -41,6 +41,7 @@ set_target_properties(quick_dot_ai_api PROPERTIES
 add_library(quickai_jni SHARED
     quickai_jni.cpp)
 
+
 target_include_directories(quickai_jni PRIVATE
     ${CAUSALLM_API_DIR})
 

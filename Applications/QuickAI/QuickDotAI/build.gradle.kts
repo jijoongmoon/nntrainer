@@ -35,6 +35,8 @@ android {
         jniLibs.useLegacyPackaging = true
     }
 
+    ndkVersion = "26.3.11579264"
+
     defaultConfig {
         minSdk = 33
 
@@ -45,7 +47,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                cppFlags += "-std=c++17"
+                cppFlags += "-std=c++17 -frtti -fexceptions"
             }
         }
 

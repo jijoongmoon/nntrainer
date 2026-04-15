@@ -171,6 +171,11 @@ void Transformer::initialize() {
 #endif
 }
 
+void Transformer::initialize(const std::string &native_lib_dir) {
+  native_lib_dir_ = native_lib_dir;
+  initialize();
+}
+
 void Transformer::constructModel() {
 
   // layers used in the model

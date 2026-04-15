@@ -193,31 +193,44 @@ void Engine::setWorkingDirectory(const std::string &base) {
 int Engine::registerContext(const std::string &library_path,
                             const std::string &base_path) {
 
-  LOGD("%s:%d", __FILE__, __LINE__);
+  LOGD("(JBD: test) %s:%d", __FILE__, __LINE__);
 
   const std::string full_path = getFullPath(library_path, base_path);
 
+  void *handle;
   LOGD("%s", full_path.c_str());
+  try
+  {
+      handle = DynamicLibraryLoader::loadLibrary(full_path.c_str(),
+                                                 RTLD_LAZY | RTLD_LOCAL);
+  }
+  catch (const std::exception &e)
+  {
+      LOGE("[JBD] load_into_handle: Exception: %s", e.what());
+  }
 
-  void *handle = DynamicLibraryLoader::loadLibrary(full_path.c_str(),
-                                                   RTLD_LAZY | RTLD_GLOBAL);
-
-  LOGD("%s:%d", __FILE__, __LINE__);
+  LOGD("(JBD: test) %s:%d", __FILE__, __LINE__);
 
   const char *error_msg = DynamicLibraryLoader::getLastError();
+
+  LOGD("error msg: %s", error_msg);
 
   NNTR_THROW_IF(handle == nullptr, std::invalid_argument)
     << func_tag << "open plugin failed, reason: " << error_msg;
 
-            LOGD("%s:%d", __FILE__, __LINE__);
+  LOGD("%p", handle);
 
+  LOGD("%s:%d", __FILE__, __LINE__);
+
+  void *struct__ = dlsym(handle, "_ZTv0_n56_N9nntrainer8QNNGraph10forwardingERNS_15RunLayerContextEb");
+
+  LOGD("struct: %p", struct__);
 
   nntrainer::ContextPluggable *pluggable =
     reinterpret_cast<nntrainer::ContextPluggable *>(
       DynamicLibraryLoader::loadSymbol(handle, "ml_train_context_pluggable"));
 
-              LOGD("%s:%d", __FILE__, __LINE__);
-
+  LOGD("%s:%d", __FILE__, __LINE__);
 
   error_msg = DynamicLibraryLoader::getLastError();
   auto close_dl = [handle] { DynamicLibraryLoader::freeLibrary(handle); };

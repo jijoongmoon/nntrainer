@@ -17,7 +17,9 @@
             android:required="false"/>
         <uses-native-library
             android:name="libOpenCL.so"
-            android:required="false"/>
+            android:required="false"
+            />
+        <uses-native-library android:name="libcdsprpc.so" android:required="false"/>
     </application>
 
 </manifest>

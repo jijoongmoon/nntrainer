@@ -8,6 +8,9 @@ android {
     namespace = "com.example.sampletestapp"
     compileSdk = 36
 
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
     defaultConfig {
         applicationId = "com.example.sampletestapp"
         minSdk = 33

@@ -87,6 +87,12 @@ public:
   virtual void initialize();
 
   /**
+   * @brief Initialize and Construct the Transformer model with native library directory
+   * @param native_lib_dir Native library directory path (from Android ApplicationInfo.nativeLibraryDir)
+   */
+  virtual void initialize(const std::string &native_lib_dir);
+
+  /**
    * @brief Load the model weights from a file
    */
   virtual void load_weight(const std::string &weight_path);
@@ -200,6 +206,9 @@ protected:
 
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;
+
+  /** Native library directory for loading shared libraries (e.g., QNN context) */
+  std::string native_lib_dir_;
 };
 /**
  * Loads JSON data from a file with detailed error handling
