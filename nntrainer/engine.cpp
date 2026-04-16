@@ -69,7 +69,14 @@ void Engine::initialize() noexcept {
   }
 };
 
+Engine &Engine::Global() {
+  static Engine instance;
+  instance.initializeOnce();
+  return instance;
+}
+
 void Engine::release() {
+  LOGD("(JBD: test) %s:%s:%d", __FILE__, __func__, __LINE__);
   // Guard against double-release (could be called from both atexit and
   // destructor)
   if (engines.empty()) {

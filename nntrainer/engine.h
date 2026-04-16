@@ -30,6 +30,24 @@
 #include <mem_allocator.h>
 #include <nntrainer_error.h>
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#ifndef LOG_TAG
+#define LOG_TAG "nntrainer_engine"
+#endif
+#ifndef LOGD
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#endif
+#else
+#include <cstdio>
+#ifndef LOG_TAG
+#define LOG_TAG "nntrainer_engine"
+#endif
+#ifndef LOGD
+#define LOGD(...) fprintf(stderr, "[DEBUG][%s] ", LOG_TAG); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n")
+#endif
+#endif
+
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
 #include <cl_context.h>
 #endif
@@ -64,6 +82,9 @@ protected:
   void registerContext(std::string name, nntrainer::Context *context,
                        void *library_handle = nullptr,
                        DestroyContextFunc destroy_func = nullptr) {
+
+    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
+
     const std::lock_guard<std::mutex> lock(engine_mutex);
     static int registerCount = 0;
 
@@ -76,6 +97,12 @@ protected:
       throw std::invalid_argument(ss.str().c_str());
     }
     engines.insert(std::make_pair(name, context));
+
+    if (engines.find(name) != engines.end()) {
+        LOGD("%s:%d, engine insert success :this %p, name: %s:%p", __FILE__, __LINE__, this, name.c_str(), &engines);
+    } else {
+        LOGD("%s:%d, engine insert faied: name: %s", __FILE__, __LINE__, name.c_str());
+    }
 
     if (registerCount < RegisterContextMax) {
       nntrainerRegisteredContext[registerCount] = context;
@@ -96,10 +123,11 @@ protected:
   }
 
 public:
-  /**
-   * @brief   Default constructor
-   */
-  Engine() = default;
+    static Engine &Global();
+/**
+/->   * @brief   Default constructor
+ */
+Engine() = default;
 
   /**
    * @brief   Destructor - releases all contexts
@@ -135,13 +163,21 @@ public:
    */
   nntrainer::Context *getRegisteredContext(std::string name) const {
 
+    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
+
     std::transform(name.begin(), name.end(), name.begin(),
                    [](unsigned char c) { return std::tolower(c); });
+    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
 
     if (engines.find(name) == engines.end()) {
+      LOGD("%s:%d, engine search failed: size:%d, this %p, name: %s:%p", __FILE__, __LINE__, engines.size(), this, name.c_str(), &engines);
+
       throw std::invalid_argument("[Engine] " + name +
                                   " Context is not registered");
     }
+
+    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
+
     return engines.at(name);
   }
 
@@ -175,7 +211,11 @@ public:
   std::unique_ptr<nntrainer::Layer>
   createLayerObject(const std::string &type,
                     const std::vector<std::string> &properties = {}) const {
+    // LOGD("%s", ct->getName().c_str());
+    LOGD("%s", type.c_str());
+
     auto ct = getRegisteredContext(parseComputeEngine(properties));
+
     return ct->createLayerObject(type);
   }
 

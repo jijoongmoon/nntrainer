@@ -39,6 +39,25 @@
 #include <cl_context.h>
 #endif
 
+/* LOGD macro for QNN context if not defined */
+#if defined(__ANDROID__)
+#include <android/log.h>
+#ifndef LOG_TAG
+#define LOG_TAG "qnn_context"
+#endif
+#ifndef LOGD
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#endif
+#else
+#ifndef LOG_TAG
+#define LOG_TAG "qnn_context"
+#endif
+#ifndef LOGD
+#include <cstdio>
+#define LOGD(...) do { fprintf(stderr, "[DEBUG][%s] ", LOG_TAG); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#endif
+#endif
+
 namespace nntrainer {
 
 #ifdef PROFILE
@@ -166,6 +185,7 @@ std::unique_ptr<LayerNode>
 createLayerNode(const ml::train::LayerType &type,
                 const std::vector<std::string> &properties) {
   auto &eg = nntrainer::Engine::Global();
+  LOGD("%s:%d, eg: %p type: %d", __FILE__, __LINE__, &eg, type);
   return createLayerNode(eg.createLayerObject(type, properties), properties);
 }
 
@@ -176,6 +196,7 @@ std::unique_ptr<LayerNode>
 createLayerNode(const std::string &type,
                 const std::vector<std::string> &properties) {
   auto &eg = nntrainer::Engine::Global();
+  LOGD("%s:%d, eg: %p type: %s", __FILE__, __LINE__, &eg, type.c_str());
   return createLayerNode(eg.createLayerObject(type, properties), properties);
 }
 

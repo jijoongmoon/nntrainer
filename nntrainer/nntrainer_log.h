@@ -81,4 +81,48 @@
 
 #endif
 
+/* LOGD, LOGI, LOGE macros for convenience */
+#if defined(__ANDROID__)
+#include <android/log.h>
+#ifndef LOG_TAG
+#define LOG_TAG "nntrainer"
+#endif
+#ifndef LOGD
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#endif
+#ifndef LOGI
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#endif
+#ifndef LOGE
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#endif
+#elif defined(__TIZEN__)
+#ifndef LOG_TAG
+#define LOG_TAG "nntrainer"
+#endif
+#ifndef LOGD
+#define LOGD(...) dlog_print(DLOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#endif
+#ifndef LOGI
+#define LOGI(...) dlog_print(DLOG_INFO, LOG_TAG, __VA_ARGS__)
+#endif
+#ifndef LOGE
+#define LOGE(...) dlog_print(DLOG_ERROR, LOG_TAG, __VA_ARGS__)
+#endif
+#else /* Linux distro */
+#include <cstdio>
+#ifndef LOG_TAG
+#define LOG_TAG "nntrainer"
+#endif
+#ifndef LOGD
+#define LOGD(...) do { fprintf(stderr, "[DEBUG][%s] ", LOG_TAG); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#endif
+#ifndef LOGI
+#define LOGI(...) do { fprintf(stderr, "[INFO][%s] ", LOG_TAG); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#endif
+#ifndef LOGE
+#define LOGE(...) do { fprintf(stderr, "[ERROR][%s] ", LOG_TAG); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#endif
+#endif
+
 #endif /* __NNTRAINER_LOG_H__ */
