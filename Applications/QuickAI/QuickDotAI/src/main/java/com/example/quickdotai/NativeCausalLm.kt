@@ -52,6 +52,8 @@ object NativeCausalLm {
     fun ensureLoaded(): Boolean {
         if (loaded) return true
         return try {
+            // qnn_context must be loaded before quickai_jni
+            System.loadLibrary("qnn_context")
             // quickai_jni dlopens libcausallm_api.so as part of its JNI_OnLoad.
             System.loadLibrary("quickai_jni")
             loaded = true
