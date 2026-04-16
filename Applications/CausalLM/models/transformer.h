@@ -47,6 +47,11 @@
 #include <tokenizers_c.h>
 #include <tokenizers_cpp.h>
 
+// Forward declaration for BaseStreamer (used by setStreamer)
+extern "C" {
+struct BaseStreamer;
+}
+
 namespace causallm {
 
 /*** ALIAS ****/
@@ -128,6 +133,21 @@ public:
     return performance_metrics;
   }
 
+  bool hasRun() const { return has_run_; }
+
+  /**
+   * @brief Attach (or detach) a BaseStreamer to intercept per-token
+   *        output during the next call to run().
+   *        Default implementation does nothing - subclasses can override.
+   */
+  virtual void setStreamer(::BaseStreamer *streamer) { (void)streamer; }
+
+  /**
+   * @brief Get the generated output text.
+   *        Default implementation returns empty string - subclasses can override.
+   */
+  virtual std::string getOutput(int batch_idx = 0) const { (void)batch_idx; return ""; }
+
 protected:
   /**
    * @brief Setup the parameters for the Transformer model
@@ -206,6 +226,8 @@ protected:
 
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;
+
+  bool has_run_ = false;
 
   /** Native library directory for loading shared libraries (e.g., QNN context) */
   std::string native_lib_dir_;

@@ -90,11 +90,6 @@ public:
   std::string getOutput(int batch_idx = 0) const;
 
   /**
-   * @brief get the status of run
-   */
-  bool hasRun() const { return has_run_; }
-
-  /**
    * @brief Attach (or detach) a BaseStreamer to intercept per-token
    *        output during the next call to run().
    *
@@ -178,8 +173,6 @@ protected:
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
   unsigned int global_token_len;
-
-  bool has_run_ = false;
 
   /**
    * @brief Optional streamer that receives each decoded token as it is
