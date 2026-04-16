@@ -257,6 +257,7 @@ class MainActivity : AppCompatActivity() {
         promptField = EditText(this).apply {
             hint = "Type a prompt…"
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+            setText("<|begin_of_text|><|turn_start|>System\n<|turn_end|>\n<|turn_start|>user\nWhat is rainbow?<|turn_end|>\n<|turn_start|>Assistant")
         }
         root.addView(promptField)
 
