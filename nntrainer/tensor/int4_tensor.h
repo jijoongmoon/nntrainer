@@ -29,14 +29,17 @@ namespace nntrainer {
  *
  * @todo Remove variable `group_size` and add PER_GROUP_AFFINE_32,64,128
  */
-class Int4QTensor : public TensorBase {
-public:
   /**
    * @brief     Basic Constructor of Tensor
    */
   Int4QTensor(std::string name_ = "", Tformat fm = Tformat::NCHW,
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
               size_t g_size = 32);
+  
+
+   
+ 
+
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -300,10 +303,20 @@ public:
    */
   QScheme q_scheme() const override;
 
+
   /**
-   * @brief Returns quantization group size
-   */
-  static size_t getGroupSize();
++   * @brief Get the fixed KleidiAI kernel index based on compile‑time
++   *        environment detection.
++   *
++   * If SME (Scalable Matrix Extension) is enabled, the function returns
++   * index 8 (SME‑optimized kernel). Otherwise, if NEON is available, it
++   * returns index 3 (NEON‑optimized kernel). If neither macro is defined,
++   * it defaults to the NEON index 3.
++   *
++   * The used by the KleidiAI interface to select a
++   * specific micro‑kernel variant without runtime latency probing.
++   */
+  static uint32_t get_kleidiai_kernel_idx();
 
 private:
   /**

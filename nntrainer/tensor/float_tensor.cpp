@@ -1011,22 +1011,24 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   unsigned int N = output.getDim().width();
 
 #ifndef ENABLE_OPENCL
-#ifdef ENABLE_FP16
-  if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
-    uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
-    nntr_gemm_qai8dxp_qsi4cxp_packed(
-      M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx,
-      true); /// @todo kernel supports both trans / noTrans situation
-  } else {
-    throw std::runtime_error(
-      "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
-  }
+
+if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
+#if defined(ENABLE_SME)
+  uint32_t kernel_idx = 8;
+#elif defined(ENABLE_SVE2)
+  uint32_t kernel_idx = 3;
 #else
-  /// @note It is essential to understand that this section of the code requires
-  /// the `input` data to be converted to Q4_0 type, not QINT4 type. This should
-  /// be replaced with standard CPU INT4 computation instead of using Q4_0.
-  gemm_q4_0(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
+  uint32_t kernel_idx = -1;
 #endif
+  nntr_gemm_qai8dxp_qsi4cxp_packed(
+    M, N, K, (void *)data, (void *)mdata, rdata, kernel_idx,
+    true); /// @todo kernel supports both trans / noTrans situation
+} 
+else {
+  throw std::runtime_error(
+    "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
+}
+
 #else
   if (input.getMemoryData()->isSVM() && output.getMemoryData()->isSVM() &&
       getMemoryData()->isSVM()) {

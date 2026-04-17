@@ -8,27 +8,26 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 
-#include <cpu_backend.h>
+#include <compute_ops.h>
 #include <int4_tensor.h>
 #include <tensor.h>
+#include "cpu_backend/arm/kleidiai_interface.h"
 
 namespace nntrainer {
 
-size_t Int4QTensor::group_size = 32;
-
 Int4QTensor::Int4QTensor(std::string name_, Tformat fm, QScheme qscheme_,
                          size_t g_size) :
-  TensorBase(name_, fm, Tdatatype::QINT4), qscheme(qscheme_) {
-  group_size = g_size;
-}
+  TensorBase(name_, fm, Tdatatype::QINT4), qscheme(qscheme_),
+  group_size_(g_size) {}
 
 Int4QTensor::Int4QTensor(const TensorDim &d, bool alloc_now, Initializer init,
                          std::string name, QScheme qscheme_, size_t g_size) :
-  TensorBase(d, alloc_now, init, name), qscheme(qscheme_) {
-  group_size = g_size;
+  TensorBase(d, alloc_now, init, name), qscheme(qscheme_),
+  group_size_(g_size) {
   if (alloc_now)
     allocate();
 }
@@ -46,8 +45,7 @@ Int4QTensor::Int4QTensor(
   std::vector<std::vector<std::vector<std::vector<int8_t>>>> const &d,
   std::vector<float> const &scales, Tformat fm, QScheme qscheme_,
   size_t g_size) :
-  qscheme(qscheme_) {
-  group_size = g_size;
+  qscheme(qscheme_), group_size_(g_size) {
   if (d.empty() || d[0].empty() || d[0][0].empty() || d[0][0][0].empty()) {
     throw std::out_of_range(
       "[Tensor] trying to initialize Int4QTensor from empty vector");
@@ -101,7 +99,7 @@ Int4QTensor::Int4QTensor(
   }
 
   // copy scale factors
-  scopy(scale_size(), scales.data(), 1, (float *)getScale(), 1);
+  getComputeOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 }
 
 bool Int4QTensor::operator==(const Int4QTensor &rhs) const {
@@ -270,6 +268,21 @@ void Int4QTensor::setValue(unsigned int b, unsigned int c, unsigned int h,
                    : (((int8_t *)getData())[idx / 2] & 0xf0) | (val & 0x0f);
 }
 
+
+
+uint32_t Int4QTensor::get_kleidiai_kernel_idx(){
+#if defined(ENABLE_SME)
+  // SME가 활성화된 경우 idx_variant=8 사용
+  return 8;
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+  // SME가 없고 NEON만 있는 경우 idx_variant=3 사용
+  return 3;
+#else
+  // Fallback
+  return -1;
+#endif
+}
+
 void Int4QTensor::setZero() {
   /// @todo accelerate with SIMD
   setValue(0);
@@ -304,12 +317,12 @@ void Int4QTensor::initialize(Initializer init) {
   initialize();
 }
 
-void Int4QTensor::copy(const Tensor &from) {
+void Int4QTensor::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-void Int4QTensor::copyData(const Tensor &from) {
+void Int4QTensor::copyData(const Tensor &from, ComputeOps *ops) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -446,7 +459,7 @@ std::vector<unsigned int> Int4QTensor::argmin() const {
   return result;
 }
 
-float Int4QTensor::max_abs() const {
+float Int4QTensor::max_abs(ComputeOps *ops) const {
   int8_t abs_max_val = 0;
   int8_t curr_val;
   for (unsigned int idx = 0; idx < size(); ++idx) {
@@ -554,8 +567,25 @@ void Int4QTensor::print(std::ostream &out) const {
 }
 
 size_t Int4QTensor::getMemoryBytes() const {
-  return ((size() + 1) / 2) * dim.getDataTypeSize() +
-         scale_size() * sizeof(uint16_t);
+  // Scales are stored as fp32 (sizeof(float)) per the canonical layout
+  // documented on the class header. allocate() already reserves
+  // `sizeof(float) * scale_size()` bytes for the scale section, and the
+  // KleidiAI qai8dxp_qsi4cxp_unpacked kernel consumes fp32 scales. Before
+  // P6b this function reported `sizeof(uint16_t) * scale_size()` which
+  // caused save() and read() to transfer only the low 2 bytes of each
+  // fp32 scale (= garbage), while the in-memory buffer actually held
+  // correct fp32 values. That silent data corruption on round-trip
+  // never surfaced because the FC layer's old dequantize path worked
+  // entirely in memory and the test coverage for saved-then-reloaded
+  // QINT4 weights was effectively zero. Align with the allocator here.
+  uint32_t idx = get_kleidiai_kernel_idx();
+  if (idx >= 0){
+      return nntr_kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(width(), height(), idx, true);
+  }
+  else{
+      return ((size() + 1) / 2) * dim.getDataTypeSize() +
+         scale_size() * sizeof(float);
+  }
 }
 
 size_t Int4QTensor::scale_size() const {
@@ -564,7 +594,27 @@ size_t Int4QTensor::scale_size() const {
     return 1;
     break;
   case QScheme::PER_CHANNEL_AFFINE:
-    return height() * width() / group_size;
+    // group_size_ == 0 is the canonical signal for "pure per-channel":
+    // exactly one scale per output column. For nntrainer's FC weight
+    // layout TensorDim(1, 1, K=in_features, N=out_features) where
+    // height() is K (input features) and width() is N (output
+    // features), the natural per-output-channel quantization produces
+    // N scales = width(). This matches:
+    //   - KleidiAI qsi4cxp kxn: rhs_scales_f32[n_idx], indexed by
+    //     output column, length N.
+    //   - HuggingFace / PyTorch per-channel quant: one scale per
+    //     output feature.
+    //   - QNN AXIS_SCALE_OFFSET with axis=1 (output dim) and
+    //     numScaleOffsets=N.
+    //
+    // group_size_ == height() (= K, the row length along the
+    // reduction axis) is semantically identical to pure per-channel:
+    // "all K elements in one output column share one scale".
+
+    
+    if (group_size_ == 0 || group_size_ == height())
+      return width();
+    return height() * width() / group_size_;
     break;
   default:
     break;
@@ -582,11 +632,11 @@ void Int4QTensor::copy(const void *buf) {
     return;
   }
   // copy tensor data
-  scopy((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(), 1);
+  getComputeOps()->scopy_s8((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(), 1);
 
   // copy scale factor data
   float *scales = (float *)(((int8_t *)buf) + (size() + 1) / 2);
-  scopy(scale_size(), scales, 1, (float *)getScale(), 1);
+  getComputeOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
 }
 
 void Int4QTensor::save_quantization_info(std::ostream &file) {
@@ -600,7 +650,16 @@ void Int4QTensor::read_quantization_info(std::ifstream &file,
   checkedRead(file, (char *)&qscheme, sizeof(uint16_t),
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
-  group_size = 32; /// Remove me
+  // NOTE: group_size_ is NOT reset here. The previous implementation did
+  // `group_size = 32;` because the static class member was shared across
+  // all instances and needed to be restored to the "default" after each
+  // read. Now that group_size_ is a per-instance member, we keep whatever
+  // value the constructor established (typically via a TensorDim hint
+  // from the model config, or the default 32). The on-disk header still
+  // only contains the 2-byte QScheme enum for backward compatibility
+  // with schema_version 1 .bin files; schema_version 2 safetensors
+  // carries group_size via the quant object and the loader is expected
+  // to pass it to the Int4QTensor constructor at allocation time.
 }
 
 void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
@@ -608,9 +667,9 @@ void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
   checkedRead(src, (char *)&qscheme, sizeof(uint16_t),
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
-  group_size = 32; /// Remove me
+  // See note above in the std::ifstream overload.
 }
 
-size_t Int4QTensor::getGroupSize() { return group_size; }
+
 
 } // namespace nntrainer

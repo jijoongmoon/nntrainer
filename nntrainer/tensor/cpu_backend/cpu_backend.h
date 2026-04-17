@@ -452,6 +452,9 @@ extern void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                                      unsigned int half_, _FP16 *inout,
                                      _FP16 *output, const _FP16 *cos_,
                                      const _FP16 *sin_);
+
+#endif
+
 /**
  * @brief qs4cx quantization of (n*k) matrix. Typically a weight quantization,
  * and generally regard the weight is already transposed, and quantize it as it
@@ -623,7 +626,6 @@ extern void nntr_gemm_qsi8d32p_qsi4c32p_packed(
   void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
   T upper_bound = std::numeric_limits<T>::max());
-#endif
 /**
  * @brief Initialization of ggml backend
  */
