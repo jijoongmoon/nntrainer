@@ -1019,20 +1019,28 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
                                M, N, K, Int4QTensor::getGroupSize());
     }
   } else {
-#ifdef ENABLE_FP16
     if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
-      uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
+#if defined(ENABLE_SME)
+      uint32_t kernel_idx = 8;
+#elif defined(ENABLE_SVE2)
+      uint32_t kernel_idx = 3;
+#elif defined(ENABLE_FP16)
+      uint32_t kernel_idx = (M == 1) ? 1 : 5;
+#else
+      uint32_t kernel_idx = 0;
+#endif
       nntr_gemm_qai8dxp_qsi4cxp_packed(
-        M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx,
+        M, N, K, (void *)data, (void *)mdata, rdata, kernel_idx,
         true); /// @todo kernel supports both trans / noTrans situation
     } else {
+#ifdef ENABLE_FP16
       throw std::runtime_error(
         "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
-    }
 #else
-    /// @todo Replace with standard CPU INT4 computation
-    o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
+      /// @todo Replace with standard CPU INT4 computation
+      o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
 #endif
+    }
   }
 
   return output;

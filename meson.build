@@ -159,6 +159,14 @@ if get_option('enable-fp16')
      add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
+     # Use arm-arch option for architecture-specific flags
+     arm_arch_opt = get_option('arm-arch')
+     if arm_arch_opt == 'armv9.2-a'
+       add_project_arguments('-march=armv9.2-a+fp16+sve2+sme', language: ['c', 'cpp'])
+       if get_option('enable-sve2')
+         extra_defines += '-DENABLE_SVE2=1'
+       if get_option('enable-sme')
+         extra_defines += '-DENABLE_SME=1'
    elif arch == 'aarch64'
      ## About FP16 in GCC (from GCC-9.1 manual)
      # https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html
