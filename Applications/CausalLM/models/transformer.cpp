@@ -289,6 +289,15 @@ void Transformer::run(const WSTR prompt, bool do_sample,
   /// The run action can be defined by the precedent classes.
 }
 
+multimodal_pointer
+Transformer::run_image(const WSTR prompt, multimodal_pointer image,
+                       int image_height, int image_width, bool do_sample,
+                       const WSTR system_prompt, const WSTR tail_prompt,
+                       bool log_output) {
+  ///@note Override this if your model supports image input
+  return std::make_pair(nullptr, 0);
+}
+
 std::vector<LayerHandle>
 Transformer::createTransformerDecoderBlock(const int layer_id,
                                            std::string input_name) {

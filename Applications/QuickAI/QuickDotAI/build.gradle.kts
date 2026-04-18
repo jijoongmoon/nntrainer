@@ -35,7 +35,6 @@ android {
         jniLibs.useLegacyPackaging = true
     }
 
-    ndkVersion = "26.3.11579264"
 
     defaultConfig {
         minSdk = 33

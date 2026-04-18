@@ -10,6 +10,7 @@
  * @author  Eunju Yang <ej.yang@samsung.com>
  * @bug     No known bugs except for NYI items
  */
+#include "causal_lm_api.h"
 #include "model_config_internal.h"
 #include <climits>
 #include <cstring>

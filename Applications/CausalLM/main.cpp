@@ -312,7 +312,21 @@ int main(int argc, char *argv[]) {
     model->run(input_text.c_str(), do_sample, system_head_prompt.c_str(),
                system_tail_prompt.c_str());
 #else
+    if (architecture.find("Visual") != std::string::npos) {
+      // Temp code for testing multimodal input
+      int my_image_height = 1024;
+      int my_image_width = 1024;
+      int my_image_size = 5 * 512 * 512 * 3 * sizeof(uint16_t);
+      void *my_image = malloc(my_image_size);
+      causallm::multimodal_pointer image =
+        std::make_pair(my_image, my_image_size);
+      auto output =
+        model->run_image(input_text, image, my_image_height, my_image_width,
+                         do_sample, system_head_prompt, system_tail_prompt);
+      free(my_image);
+    } else {
     model->run(input_text, do_sample, system_head_prompt, system_tail_prompt);
+    }
 #endif
 #ifdef PROFILE
     stop_and_print_peak();
