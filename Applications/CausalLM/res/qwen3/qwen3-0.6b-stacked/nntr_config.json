@@ -1,0 +1,29 @@
+{
+    "model_type": "CausalLM",
+    "model_tensor_type": "FP32-FP32",
+
+    "architectures": ["Qwen3ForCausalLM", "Qwen3ForCausalLM"],
+    "model_dirs": ["../qwen3-0.6b", "../qwen3-0.6b"],
+    "model_file_names": [
+        "nntr_qwen3_0.6b_fp32.bin",
+        "nntr_qwen3_0.6b_fp32.bin"
+    ],
+
+    "fc_layer_dtype": "FP32",
+    "embedding_dtype": "FP32",
+
+    "lora_rank": 0,
+    "lora_alpha": 0,
+    "lora_target": [],
+
+    "bad_word_ids": [],
+    "fsu": false,
+    "fsu_lookahead": 2,
+    "num_to_generate": 128,
+    "init_seq_len": 1024,
+    "max_seq_len": 2048,
+    "batch_size": 1,
+
+    "tokenizer_file": "/tmp/nntrainer/Applications/CausalLM/res/qwen3/qwen3-0.6b/tokenizer.json",
+    "sample_input": "<|im_start|>user\nGive me a short introduction to large language model.<|im_end|>\n<|im_start|>assistant\n"
+}
