@@ -644,15 +644,22 @@ const int AppContext::registerFactory(const FactoryType<T> factory,
 
   const std::lock_guard<std::mutex> lock(factory_mutex);
   if (str_map.find(assigned_key) != str_map.end()) {
-    std::stringstream ss;
-    ss << "cannot register factory with already taken key: " << key;
-    throw std::invalid_argument(ss.str().c_str());
+    // std::stringstream ss;
+    // ss << "cannot register factory with already taken int key: " << int_key;
+    //    return str_map[assigned_key].second;
+    for (const auto &[ik, sk] : int_map) {
+      if (sk == assigned_key)
+        return ik;
+    }
+    return -1;
   }
 
   if (int_key != -1 && int_map.find(int_key) != int_map.end()) {
-    std::stringstream ss;
-    ss << "cannot register factory with already taken int key: " << int_key;
-    throw std::invalid_argument(ss.str().c_str());
+    //    std::stringstream ss;
+    // ss << "cannot register factory with already taken int key: " << int_key;
+    // throw std::invalid_argument(ss.str().c_str());
+    //    return str_map[assigned_key].second;
+    return int_key;
   }
 
   int assigned_int_key = int_key == -1 ? str_map.size() + 1 : int_key;

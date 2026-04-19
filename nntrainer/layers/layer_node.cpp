@@ -185,7 +185,7 @@ std::unique_ptr<LayerNode>
 createLayerNode(const ml::train::LayerType &type,
                 const std::vector<std::string> &properties) {
   auto &eg = nntrainer::Engine::Global();
-  LOGD("%s:%d, eg: %p type: %d", __FILE__, __LINE__, &eg, type);
+  //  LOGD("%s:%d, eg: %p type: %d", __FILE__, __LINE__, &eg, type);
   return createLayerNode(eg.createLayerObject(type, properties), properties);
 }
 
@@ -196,7 +196,7 @@ std::unique_ptr<LayerNode>
 createLayerNode(const std::string &type,
                 const std::vector<std::string> &properties) {
   auto &eg = nntrainer::Engine::Global();
-  LOGD("%s:%d, eg: %p type: %s", __FILE__, __LINE__, &eg, type.c_str());
+  //  LOGD("%s:%d, eg: %p type: %s", __FILE__, __LINE__, &eg, type.c_str());
   return createLayerNode(eg.createLayerObject(type, properties), properties);
 }
 

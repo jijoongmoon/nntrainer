@@ -257,7 +257,7 @@ class MainActivity : AppCompatActivity() {
         promptField = EditText(this).apply {
             hint = "Type a prompt…"
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-            setText("<|begin_of_text|><|turn_start|>System\n<|turn_end|>\n<|turn_start|>user\nWhat is rainbow?<|turn_end|>\n<|turn_start|>Assistant")
+            setText("What is rainbow")
         }
         root.addView(promptField)
 
@@ -535,7 +535,10 @@ class MainActivity : AppCompatActivity() {
         val backend = BackendType.valueOf(backendSpinner.selectedItem as String)
         val quant = selectedQuant()
         val modelPath = modelPathField.text.toString().trim().ifEmpty { null }
-        val visionBackend = if (model == ModelId.GEMMA4) backend else null
+        
+        // Call vsionBackend for all cases (Change to Gauss3.8/Gemma4 later)
+        val visionBackend = backend
+        // val visionBackend = if (model == ModelId.GEMMA4) backend else null
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
         return LoadModelRequest(
             backend = backend,
@@ -568,7 +571,7 @@ class MainActivity : AppCompatActivity() {
 
         val newEngine: QuickDotAI = when (req.model) {
             ModelId.GEMMA4 -> LiteRTLm(applicationContext)
-            else -> NativeQuickDotAI()
+            else -> NativeQuickDotAI(applicationContext)
         }
         return when (val r = newEngine.load(req)) {
             is BackendResult.Ok -> {
@@ -1282,8 +1285,12 @@ class MainActivity : AppCompatActivity() {
                 "$base/models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
             ModelId.QWEN3_0_6B ->
                 "$base/models/qwen3-0.6b${quantizationSuffix(quant)}"
+            ModelId.GAUSS3_6_QNN ->
+                "$base/models/gauss-3.6-qnn"
             ModelId.GAUSS3_8_QNN ->
-                "$base/models/gauss-3.8b-qnn"
+                "$base/models/gauss-3.8-qnn"
+            ModelId.QWEN3_1_7B_Q40 ->
+                "$base/models/qwen3-1.7b-q40-arm"
         }
     }
 

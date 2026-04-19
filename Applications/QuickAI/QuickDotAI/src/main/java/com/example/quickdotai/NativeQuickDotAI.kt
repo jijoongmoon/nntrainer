@@ -9,6 +9,8 @@
  */
 package com.example.quickdotai
 
+import android.content.Context
+import android.graphics.BitmapFactory
 import android.util.Log
 import java.io.File
 
@@ -17,8 +19,13 @@ import java.io.File
  *
  * Non-thread-safe by design — the host app must drive a single instance
  * from a single worker thread.
+ *
+ * @param appContext Application context required for multimodal image processing.
+ *                   Must be non-null to enable runMultimodal/runMultimodalStreaming.
  */
-class NativeQuickDotAI : QuickDotAI {
+class NativeQuickDotAI(
+    private val appContext: Context
+) : QuickDotAI {
 
     override val kind: String = "native"
 
@@ -27,6 +34,12 @@ class NativeQuickDotAI : QuickDotAI {
 
     private var handle: Long = 0L
     private var loaded: Boolean = false
+
+    // Image processor for multimodal inference
+    private var imageProcessor: LlavaNextImageProcessor? = null
+
+    // Vision backend type (null = text-only mode)
+    private var visionBackend: BackendType? = null
 
     override fun load(req: LoadModelRequest): BackendResult<Unit> {
         Log.i(
@@ -131,6 +144,14 @@ class NativeQuickDotAI : QuickDotAI {
                 // Architecture is resolved native-side; we report the
                 // model key until we add a dedicated native getter.
                 architecture = req.model.name
+                
+                // Initialize image processor if visionBackend is set
+                visionBackend = req.visionBackend
+                if (req.visionBackend != null) {
+                    imageProcessor = LlavaNextImageProcessor(appContext)
+                    Log.i(TAG, "load(): visionBackend=${req.visionBackend}, image processor initialized")
+                }
+                
                 Log.i(TAG, "load(): SUCCESS, handle=0x${handle.toString(16)}")
                 BackendResult.Ok(Unit)
             }
@@ -358,6 +379,223 @@ class NativeQuickDotAI : QuickDotAI {
         loaded = false
     }
 
+    // --- multimodal -------------------------------------------------------
+
+    /**
+     * @brief Blocking multimodal inference.
+     *
+     * Preprocesses images from [parts], combines with text prompt, and
+     * runs inference through the native engine.
+     *
+     * @param parts List of PromptPart containing text and/or images
+     * @return BackendResult with generated text on success
+     */
+    override fun runMultimodal(parts: List<PromptPart>): BackendResult<String> {
+        if (!loaded || handle == 0L) {
+            return BackendResult.Err(
+                QuickAiError.NOT_INITIALIZED,
+                "NativeQuickDotAI has not been loaded yet"
+            )
+        }
+
+        val processor = imageProcessor
+        if (processor == null) {
+            return BackendResult.Err(
+                QuickAiError.UNSUPPORTED,
+                "Multimodal not enabled — reload with LoadModelRequest.visionBackend set"
+            )
+        }
+
+        // Extract image and text from parts
+        val multimodalInput = prepareMultimodalInput(parts, processor)
+            ?: return BackendResult.Err(
+                QuickAiError.INVALID_PARAMETER,
+                "No valid image found in parts"
+            )
+
+        val textPrompt = extractTextPrompt(parts)
+
+        Log.i(
+            TAG,
+            "runMultimodal(): numPatches=${multimodalInput.numPatches}, " +
+                "originalSize=${multimodalInput.originalHeight}x${multimodalInput.originalWidth}, " +
+                "prompt length=${textPrompt.length}"
+        )
+
+        return try {
+            val result = NativeCausalLm.runMultimodalHandleNative(
+                handle,
+                textPrompt,
+                multimodalInput.pixelValues,
+                multimodalInput.numPatches,
+                multimodalInput.originalHeight,
+                multimodalInput.originalWidth
+            )
+            if (result.errorCode != 0) {
+                val err = QuickAiError.fromNativeCode(result.errorCode)
+                Log.e(TAG, "runMultimodal(): failed with errorCode=${result.errorCode}")
+                BackendResult.Err(err, "runMultimodalHandle failed (errorCode=${result.errorCode})")
+            } else {
+                Log.i(TAG, "runMultimodal(): success, output length=${result.output?.length ?: 0}")
+                BackendResult.Ok(result.output.orEmpty())
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "runMultimodal(): threw exception", t)
+            BackendResult.Err(QuickAiError.INFERENCE_FAILED, t.message)
+        }
+    }
+
+    /**
+     * @brief Streaming multimodal inference.
+     *
+     * Preprocesses images from [parts], combines with text prompt, and
+     * runs streaming inference through the native engine. Deltas are
+     * forwarded to [sink] as they are generated.
+     *
+     * @param parts List of PromptPart containing text and/or images
+     * @param sink StreamSink to receive streaming output
+     * @return BackendResult<Unit> on completion
+     */
+    override fun runMultimodalStreaming(
+        parts: List<PromptPart>,
+        sink: StreamSink
+    ): BackendResult<Unit> {
+        if (!loaded || handle == 0L) {
+            val err = BackendResult.Err(
+                QuickAiError.NOT_INITIALIZED,
+                "NativeQuickDotAI has not been loaded yet"
+            )
+            sink.onError(err.error, err.message)
+            return err
+        }
+
+        val processor = imageProcessor
+        if (processor == null) {
+            val err = BackendResult.Err(
+                QuickAiError.UNSUPPORTED,
+                "MultimodalStreaming not enabled — reload with LoadModelRequest.visionBackend set"
+            )
+            sink.onError(err.error, err.message)
+            return err
+        }
+
+        // Extract image and text from parts
+        val multimodalInput = prepareMultimodalInput(parts, processor)
+        if (multimodalInput == null) {
+            val err = BackendResult.Err(
+                QuickAiError.INVALID_PARAMETER,
+                "No valid image found in parts"
+            )
+            sink.onError(err.error, err.message)
+            return err
+        }
+
+        val textPrompt = extractTextPrompt(parts)
+
+        Log.i(
+            TAG,
+            "runMultimodalStreaming(): numPatches=${multimodalInput.numPatches}, " +
+                "originalSize=${multimodalInput.originalHeight}x${multimodalInput.originalWidth}, " +
+                "prompt length=${textPrompt.length}"
+        )
+
+        return try {
+            val errorCode = NativeCausalLm.runMultimodalHandleStreamingNative(
+                handle,
+                textPrompt,
+                multimodalInput.pixelValues,
+                multimodalInput.numPatches,
+                multimodalInput.originalHeight,
+                multimodalInput.originalWidth
+            ) { delta ->
+                sink.onDelta(delta)
+            }
+
+            if (errorCode != 0) {
+                val err = QuickAiError.fromNativeCode(errorCode)
+                Log.e(TAG, "runMultimodalStreaming(): failed with errorCode=$errorCode")
+                sink.onError(err, "runMultimodalHandleStreaming failed (errorCode=$errorCode)")
+                BackendResult.Err(err, "runMultimodalHandleStreaming failed (errorCode=$errorCode)")
+            } else {
+                Log.i(TAG, "runMultimodalStreaming(): success")
+                sink.onDone()
+                BackendResult.Ok(Unit)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "runMultimodalStreaming(): threw exception", t)
+            sink.onError(QuickAiError.INFERENCE_FAILED, t.message)
+            BackendResult.Err(QuickAiError.INFERENCE_FAILED, t.message)
+        }
+    }
+
+    /**
+     * @brief Prepare multimodal input from PromptPart list.
+     *
+     * Extracts the first image from parts and preprocesses it using
+     * LlavaNextImageProcessor.
+     *
+     * @return MultimodalInput with preprocessed pixel values, or null if no image found
+     */
+    private fun prepareMultimodalInput(
+        parts: List<PromptPart>,
+        processor: LlavaNextImageProcessor
+    ): NativeCausalLm.MultimodalInput? {
+        for (part in parts) {
+            when (part) {
+                is PromptPart.ImageFile -> {
+                    val file = File(part.absolutePath)
+                    if (!file.exists() || !file.canRead()) {
+                        Log.w(TAG, "Image file not readable: ${part.absolutePath}")
+                        continue
+                    }
+                    val bitmap = BitmapFactory.decodeFile(part.absolutePath)
+                    if (bitmap == null) {
+                        Log.w(TAG, "Failed to decode image: ${part.absolutePath}")
+                        continue
+                    }
+                    val modelInput = processor.preprocess(bitmap)
+                    return NativeCausalLm.MultimodalInput(
+                        pixelValues = modelInput.pixelValues,
+                        numPatches = modelInput.pixelValues.size / (processor.getCropSize() * processor.getCropSize() * 3),
+                        originalHeight = modelInput.originalSize.first,
+                        originalWidth = modelInput.originalSize.second
+                    )
+                }
+                is PromptPart.ImageBytes -> {
+                    if (part.bytes.isEmpty()) {
+                        Log.w(TAG, "Image bytes are empty")
+                        continue
+                    }
+                    val bitmap = BitmapFactory.decodeByteArray(part.bytes, 0, part.bytes.size)
+                    if (bitmap == null) {
+                        Log.w(TAG, "Failed to decode image from bytes")
+                        continue
+                    }
+                    val modelInput = processor.preprocess(bitmap)
+                    return NativeCausalLm.MultimodalInput(
+                        pixelValues = modelInput.pixelValues,
+                        numPatches = modelInput.pixelValues.size / (processor.getCropSize() * processor.getCropSize() * 3),
+                        originalHeight = modelInput.originalSize.first,
+                        originalWidth = modelInput.originalSize.second
+                    )
+                }
+                is PromptPart.Text -> { /* skip text parts */ }
+            }
+        }
+        return null
+    }
+
+    /**
+     * @brief Extract text prompt from PromptPart list.
+     *
+     * Concatenates all Text parts into a single prompt string.
+     */
+    private fun extractTextPrompt(parts: List<PromptPart>): String {
+        return parts.filterIsInstance<PromptPart.Text>()
+            .joinToString(" ") { it.text }
+            .ifEmpty { "Describe this image." }
+    }
+
     // --- enum → native-ordinal mapping ---------------------------------
 
     /**
@@ -369,7 +607,9 @@ class NativeQuickDotAI : QuickDotAI {
     private fun mapModelId(m: ModelId): Int? = when (m) {
         ModelId.QWEN3_0_6B -> 0 // CAUSAL_LM_MODEL_QWEN3_0_6B
         ModelId.GEMMA4 -> null
+        ModelId.GAUSS3_6_QNN -> 2 // CAUSAL_LM_MODEL_GAUSS3_6_QNN
         ModelId.GAUSS3_8_QNN -> 3 // CAUSAL_LM_MODEL_GAUSS3_8_QNN
+        ModelId.QWEN3_1_7B_Q40 -> 4 // CAUSAL_LM_MODEL_QWEN3_1_7B_Q40
     }
 
     private fun mapBackend(b: BackendType): Int = when (b) {

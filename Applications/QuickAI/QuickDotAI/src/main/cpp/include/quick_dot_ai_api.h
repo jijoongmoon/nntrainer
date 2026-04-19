@@ -47,6 +47,7 @@ typedef enum {
   CAUSAL_LM_ERROR_INFERENCE_FAILED = 3,
   CAUSAL_LM_ERROR_NOT_INITIALIZED = 4,
   CAUSAL_LM_ERROR_INFERENCE_NOT_RUN = 5,
+    CAUSAL_LM_ERROR_UNSUPPORTED = 6,
   CAUSAL_LM_ERROR_UNKNOWN = 99
 } ErrorCode;
 
@@ -61,6 +62,7 @@ typedef enum {
   CAUSAL_LM_MODEL_GAUSS2_5 = 1,
   CAUSAL_LM_MODEL_GAUSS3_6_QNN = 2,
   CAUSAL_LM_MODEL_GAUSS3_8_QNN = 3,
+  CAUSAL_LM_MODEL_QWEN3_1_7B_Q40 = 4,
 } ModelType;
 
 typedef struct {
@@ -278,6 +280,54 @@ WIN_EXPORT ErrorCode runModelHandleStreaming(CausalLmHandle handle,
                                              const char *inputTextPrompt,
                                              CausalLmTokenCallback callback,
                                              void *user_data);
+
+  /*============================================================================
+   * Multimodal API
+   *
+   * These functions extend the handle-based API to support image+text inputs.
+   * The pixel values are passed as preprocessed FloatArray (CHW format) from
+   * the Kotlin image processor (LlavaNextImageProcessor).
+   *
+   * Vision Encoder integration is planned for future implementation.
+   * Currently these functions return CAUSAL_LM_ERROR_UNSUPPORTED as stubs.
+   *============================================================================*/
+
+  /**
+   * @brief Streaming multimodal inference on a specific handle.
+   *
+   * @param handle         Handle returned by loadModelHandle
+   * @param prompt         Text prompt (UTF-8, NUL-terminated)
+   * @param pixelValues    Preprocessed image patches in CHW format
+   * @param numPatches     Number of image patches
+   * @param originalHeight Original image height before preprocessing
+   * @param originalWidth  Original image width before preprocessing
+   * @param callback       Token delta callback. Must be non-NULL.
+   * @param user_data      Opaque pointer forwarded to callback
+   * @return ErrorCode (CAUSAL_LM_ERROR_UNSUPPORTED until Vision Encoder implemented)
+   */
+  WIN_EXPORT ErrorCode
+  runMultimodalHandleStreaming(CausalLmHandle handle, const char *prompt,
+                               const float *pixelValues, int numPatches,
+                               int originalHeight, int originalWidth,
+                               CausalLmTokenCallback callback, void *user_data);
+
+  /**
+   * @brief Blocking multimodal inference on a specific handle.
+   *
+   * @param handle         Handle returned by loadModelHandle
+   * @param prompt         Text prompt (UTF-8, NUL-terminated)
+   * @param pixelValues    Preprocessed image patches in CHW format
+   * @param numPatches     Number of image patches
+   * @param originalHeight Original image height before preprocessing
+   * @param originalWidth  Original image width before preprocessing
+   * @param outputText     Out-parameter that receives a pointer to the output
+   * @return ErrorCode (CAUSAL_LM_ERROR_UNSUPPORTED until Vision Encoder implemented)
+   */
+  WIN_EXPORT ErrorCode
+  runMultimodalHandle(CausalLmHandle handle, const char *prompt,
+                      const float *pixelValues, int numPatches,
+                      int originalHeight, int originalWidth,
+                      const char **outputText);
 
 #ifdef __cplusplus
 }

@@ -326,3 +326,110 @@ Java_com_example_quickdotai_NativeCausalLm_runModelHandleStreamingNative(
   env->ReleaseStringUTFChars(promptJ, prompt);
   return static_cast<jint>(ec);
 }
+
+// ---------------------------------------------------------------------------
+// runMultimodalHandleStreaming
+//
+// Multimodal streaming inference that accepts preprocessed image patches
+// (as FloatArray) and a text prompt. The pixel values are converted from
+// jfloatArray to native float* and passed to the C API.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_quickdotai_NativeCausalLm_runMultimodalHandleStreamingNative(
+  JNIEnv *env, jobject /*thiz*/, jlong handleJlong, jstring promptJ,
+  jfloatArray pixelValuesJ, jint numPatches, jint originalHeight, jint originalWidth,
+  jobject listenerObj) {
+  if (promptJ == nullptr || pixelValuesJ == nullptr || listenerObj == nullptr) {
+    return static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER);
+  }
+
+  // Resolve the onDelta(String)V method id
+  jclass listenerCls = env->GetObjectClass(listenerObj);
+  if (listenerCls == nullptr) {
+    return static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER);
+  }
+  jmethodID onDelta =
+    env->GetMethodID(listenerCls, "onDelta", "(Ljava/lang/String;)V");
+  env->DeleteLocalRef(listenerCls);
+  if (onDelta == nullptr) {
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+    }
+    return static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER);
+  }
+
+  const char *prompt = env->GetStringUTFChars(promptJ, nullptr);
+  if (prompt == nullptr) {
+    return static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER);
+  }
+
+  // Get float* from FloatArray
+  float *pixels = env->GetFloatArrayElements(pixelValuesJ, nullptr);
+  if (pixels == nullptr) {
+    env->ReleaseStringUTFChars(promptJ, prompt);
+    return static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER);
+  }
+
+  auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
+  StreamCtx ctx{env, listenerObj, onDelta};
+  
+  ErrorCode ec = runMultimodalHandleStreaming(
+    handle, prompt, pixels, numPatches, originalHeight, originalWidth,
+    &stream_trampoline, &ctx);
+
+  // Release resources
+  env->ReleaseFloatArrayElements(pixelValuesJ, pixels, JNI_ABORT);
+  env->ReleaseStringUTFChars(promptJ, prompt);
+  
+  return static_cast<jint>(ec);
+}
+
+// ---------------------------------------------------------------------------
+// runMultimodalHandle
+//
+// Blocking multimodal inference that returns the complete output.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_example_quickdotai_NativeCausalLm_runMultimodalHandleNative(
+  JNIEnv *env, jobject /*thiz*/, jlong handleJlong, jstring promptJ,
+  jfloatArray pixelValuesJ, jint numPatches, jint originalHeight, jint originalWidth) {
+  if (promptJ == nullptr || pixelValuesJ == nullptr) {
+    return env->NewObject(g_cache.runResultCls, g_cache.runResultCtor,
+                          static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER),
+                          nullptr);
+  }
+
+  const char *prompt = env->GetStringUTFChars(promptJ, nullptr);
+  if (prompt == nullptr) {
+    return env->NewObject(g_cache.runResultCls, g_cache.runResultCtor,
+                          static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER),
+                          nullptr);
+  }
+
+  // Get float* from FloatArray
+  float *pixels = env->GetFloatArrayElements(pixelValuesJ, nullptr);
+  if (pixels == nullptr) {
+    env->ReleaseStringUTFChars(promptJ, prompt);
+    return env->NewObject(g_cache.runResultCls, g_cache.runResultCtor,
+                          static_cast<jint>(CAUSAL_LM_ERROR_INVALID_PARAMETER),
+                          nullptr);
+  }
+
+  auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
+  const char *output = nullptr;
+  
+  ErrorCode ec = runMultimodalHandle(
+    handle, prompt, pixels, numPatches, originalHeight, originalWidth, &output);
+
+  // Release resources
+  env->ReleaseFloatArrayElements(pixelValuesJ, pixels, JNI_ABORT);
+  env->ReleaseStringUTFChars(promptJ, prompt);
+
+  jstring outJ = nullptr;
+  if (ec == CAUSAL_LM_ERROR_NONE && output != nullptr) {
+    outJ = env->NewStringUTF(output);
+  }
+
+  return env->NewObject(g_cache.runResultCls, g_cache.runResultCtor,
+                        static_cast<jint>(ec), outJ);
+}
