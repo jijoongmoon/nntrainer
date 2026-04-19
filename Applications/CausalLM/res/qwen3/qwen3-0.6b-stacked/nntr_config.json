@@ -1,0 +1,4 @@
+{
+    "architectures": ["Qwen3ForCausalLM", "Qwen3ForCausalLM"],
+    "model_dirs": ["../qwen3-0.6b", "../qwen3-0.6b"]
+}
