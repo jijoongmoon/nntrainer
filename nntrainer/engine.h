@@ -83,7 +83,7 @@ protected:
                        void *library_handle = nullptr,
                        DestroyContextFunc destroy_func = nullptr) {
 
-    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
+    // LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
 
     const std::lock_guard<std::mutex> lock(engine_mutex);
     static int registerCount = 0;
@@ -92,17 +92,18 @@ protected:
                    [](unsigned char c) { return std::tolower(c); });
 
     if (engines.find(name) != engines.end()) {
-      std::stringstream ss;
-      ss << "Cannot register Context with name : " << name;
-      throw std::invalid_argument(ss.str().c_str());
+      // std::stringstream ss;
+      // ss << "Cannot register Context with name : " << name;
+      // throw std::invalid_argument(ss.str().c_str());
+      return;
     }
     engines.insert(std::make_pair(name, context));
 
-    if (engines.find(name) != engines.end()) {
-        LOGD("%s:%d, engine insert success :this %p, name: %s:%p", __FILE__, __LINE__, this, name.c_str(), &engines);
-    } else {
-        LOGD("%s:%d, engine insert faied: name: %s", __FILE__, __LINE__, name.c_str());
-    }
+    // if (engines.find(name) != engines.end()) {
+    //     LOGD("%s:%d, engine insert success :this %p, name: %s:%p", __FILE__, __LINE__, this, name.c_str(), &engines);
+    // } else {
+    //     LOGD("%s:%d, engine insert faied: name: %s", __FILE__, __LINE__, name.c_str());
+    // }
 
     if (registerCount < RegisterContextMax) {
       nntrainerRegisteredContext[registerCount] = context;
@@ -163,20 +164,20 @@ Engine() = default;
    */
   nntrainer::Context *getRegisteredContext(std::string name) const {
 
-    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
+    //    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
 
     std::transform(name.begin(), name.end(), name.begin(),
                    [](unsigned char c) { return std::tolower(c); });
-    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
+    //    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
 
     if (engines.find(name) == engines.end()) {
-      LOGD("%s:%d, engine search failed: size:%d, this %p, name: %s:%p", __FILE__, __LINE__, engines.size(), this, name.c_str(), &engines);
+      //      LOGD("%s:%d, engine search failed: size:%d, this %p, name: %s:%p", __FILE__, __LINE__, engines.size(), this, name.c_str(), &engines);
 
       throw std::invalid_argument("[Engine] " + name +
                                   " Context is not registered");
     }
 
-    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
+    //    LOGD("%s:%d, name: %s", __FILE__, __LINE__, name.c_str());
 
     return engines.at(name);
   }
@@ -212,7 +213,7 @@ Engine() = default;
   createLayerObject(const std::string &type,
                     const std::vector<std::string> &properties = {}) const {
     // LOGD("%s", ct->getName().c_str());
-    LOGD("%s", type.c_str());
+    //    LOGD("%s", type.c_str());
 
     auto ct = getRegisteredContext(parseComputeEngine(properties));
 

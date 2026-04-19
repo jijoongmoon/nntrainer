@@ -41,7 +41,9 @@ enum class BackendType {
 enum class ModelId {
     QWEN3_0_6B,
     GEMMA4,
-    GAUSS3_8_QNN
+    GAUSS3_6_QNN,
+    GAUSS3_8_QNN,
+    QWEN3_1_7B_Q40
 }
 
 /**

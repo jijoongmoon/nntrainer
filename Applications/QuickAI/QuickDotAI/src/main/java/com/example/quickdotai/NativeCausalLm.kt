@@ -90,6 +90,29 @@ object NativeCausalLm {
         val peakMemoryKb: Long
     )
 
+
+    /**
+     * @brief Result of a multimodal run call.
+     */
+    data class MultimodalRunResult(val errorCode: Int, val output: String?)
+
+    /**
+     * @brief Multimodal input data for vision encoder.
+     *
+     * @param pixelValues    Preprocessed image patches in CHW format.
+     *                       Shape: [numPatches * 3 * 512 * 512] (patch size is fixed at 512)
+     * @param numPatches     Number of image patches
+     * @param originalHeight Original image height before preprocessing
+     * @param originalWidth  Original image width before preprocessing
+     */
+    data class MultimodalInput(
+        val pixelValues: FloatArray,
+        val numPatches: Int,
+        val originalHeight: Int,
+        val originalWidth: Int
+    )
+
+
     /** Forwards to `setOptions` in quick_dot_ai_api.h. */
     external fun setOptionsNative(
         useChatTemplate: Boolean,
@@ -173,6 +196,55 @@ object NativeCausalLm {
 
     /** Forwards to `destroyModelHandle` in quick_dot_ai_api.h. */
     external fun destroyModelHandleNative(handle: Long): Int
+
+    /**
+     * @brief Forwards to `runMultimodalHandleStreaming` in quick_dot_ai_api.h.
+     *
+     * Multimodal streaming inference that accepts preprocessed image patches
+     * and a text prompt. The pixel values are passed as a FloatArray and
+     * converted to native float* in JNI layer.
+     *
+     * @param handle         Handle returned by loadModelHandleNative
+     * @param prompt         Text prompt
+     * @param pixelValues    Preprocessed image patches (CHW format)
+     * @param numPatches     Number of image patches
+     * @param originalHeight Original image height before preprocessing
+     * @param originalWidth  Original image width before preprocessing
+     * @param listener       Callback for streaming output
+     * @return An `ErrorCode` int; 0 on clean completion.
+     */
+    external fun runMultimodalHandleStreamingNative(
+        handle: Long,
+        prompt: String,
+        pixelValues: FloatArray,
+        numPatches: Int,
+        originalHeight: Int,
+        originalWidth: Int,
+        listener: NativeStreamListener
+    ): Int
+
+    /**
+     * @brief Blocking multimodal inference.
+     *
+     * Same as [runMultimodalHandleStreamingNative] but returns the complete
+     * output instead of streaming.
+     *
+     * @param handle         Handle returned by loadModelHandleNative
+     * @param prompt         Text prompt
+     * @param pixelValues    Preprocessed image patches (CHW format)
+     * @param numPatches     Number of image patches
+     * @param originalHeight Original image height before preprocessing
+     * @param originalWidth  Original image width before preprocessing
+     * @return MultimodalRunResult with error code and output string
+     */
+    external fun runMultimodalHandleNative(
+        handle: Long,
+        prompt: String,
+        pixelValues: FloatArray,
+        numPatches: Int,
+        originalHeight: Int,
+        originalWidth: Int
+    ): MultimodalRunResult
 
     private const val TAG = "NativeCausalLm"
 }

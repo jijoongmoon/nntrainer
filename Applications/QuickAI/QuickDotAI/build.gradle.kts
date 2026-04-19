@@ -133,4 +133,7 @@ dependencies {
     // metadata stamp. See gradle/libs.versions.toml for the rationale
     // behind the exact pin.
     api(libs.litertlm.android)
+    
+    // AndroidX Core for createBitmap and other utility functions
+    implementation("androidx.core:core-ktx:1.12.0")
 }
