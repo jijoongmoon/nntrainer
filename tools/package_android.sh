@@ -81,7 +81,7 @@ else
     #enable-tflite-interpreter=false is just temporally until ci system is stabel  
     #enable-opencl=true will compile OpenCL related changes or remove this option to exclude OpenCL compilations.
     meson configure -Dplatform=android -Dopenblas-num-threads=1 -Denable-tflite-interpreter=false -Denable-tflite-backbone=false -Denable-fp16=true -Domp-num-threads=1 -Dhgemm-experimental-kernel=false ${filtered_args[@]}
-    meson --wipe
+    # meson --wipe
   popd
 fi
 

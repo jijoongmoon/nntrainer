@@ -862,3 +862,35 @@ LOCAL_STATIC_LIBRARIES += clblast
 endif
 
 include $(BUILD_EXECUTABLE)
+
+# unittest_nntrainer_qint4_vs_q40
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := unittest_nntrainer_qint4_vs_q40
+
+# SME 지원이 필요한 경우: 환경변수 ENABLE_SME=1로 빌드
+ifdef ENABLE_SME
+LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/layers -I../../nntrainer/layers/loss -pthread -fexceptions -fopenmp -static-openmp -DMIN_CPP_VERSION=201703L -DNNTR_NUM_THREADS=1 -D__LOGGING__=1 -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 -march=armv9.2-a+fp16+sve2+sme -O3 -frtti -DNDK_BUILD=1 -DENABLE_FP16=1 -DUSE__FP16=1 -DENABLE_SVE2=1 -DENABLE_SME=1
+else
+LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/layers -I../../nntrainer/layers/loss -pthread -fexceptions -fopenmp -static-openmp -DMIN_CPP_VERSION=201703L -DNNTR_NUM_THREADS=1 -D__LOGGING__=1 -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 $(ARM_MARCH_FLAGS) -O3 -frtti -DNDK_BUILD=1 -DENABLE_FP16=1 -DUSE__FP16=1
+endif
+
+LOCAL_CXXFLAGS += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp
+
+LOCAL_SRC_FILES := \
+     ../unittest/unittest_nntrainer_qint4_vs_q40.cpp \
+
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := googletest_main test_util
+
+ifeq ($(MESON_ENABLE_OPENCL), 1)
+LOCAL_SHARED_LIBRARIES += opencl
+LOCAL_STATIC_LIBRARIES += clblast
+endif
+
+include $(BUILD_EXECUTABLE)
+
+

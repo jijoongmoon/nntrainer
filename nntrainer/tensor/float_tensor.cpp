@@ -1013,16 +1013,17 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
 #ifndef ENABLE_OPENCL
 
 if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
-#if defined(ENABLE_SME)
-  uint32_t kernel_idx = 8;
-#elif defined(ENABLE_SVE2)
-  uint32_t kernel_idx = 3;
-#else
-  uint32_t kernel_idx = -1;
-#endif
+  int32_t kernel_idx = Int4QTensor::get_kleidiai_kernel_idx();
   nntr_gemm_qai8dxp_qsi4cxp_packed(
-    M, N, K, (void *)data, (void *)mdata, rdata, kernel_idx,
-    true); /// @todo kernel supports both trans / noTrans situation
+      M, N, K,
+      (void *)data,        // LHS (activations) - will be packed internally
+      (void *)mdata,       // RHS (weights) - assumed already packed in block-32 format
+      rdata,               // Output
+      kernel_idx,
+      true,                // transB
+      -std::numeric_limits<float>::infinity(),  // lower_bound
+      std::numeric_limits<float>::infinity()    // upper_bound
+  );
 } 
 else {
   throw std::runtime_error(

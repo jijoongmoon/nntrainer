@@ -88,16 +88,17 @@ log_info "Working directory: $(pwd)"
 # Step 1: Build nntrainer for Android if not already built
 log_step "1/4" "Build nntrainer for Android"
 
-if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
-    log_info "Building nntrainer for Android..."
+# if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
+#     log_info "Building nntrainer for Android..."
     cd "$NNTRAINER_ROOT"
-    if [ -d "$NNTRAINER_ROOT/builddir" ]; then
-        rm -rf builddir
-    fi
+
+    # if [ -d "$NNTRAINER_ROOT/builddir" ]; then
+    #     rm -rf builddir
+    # fi
     ./tools/package_android.sh
-else
-    log_info "nntrainer for Android already built (skipping)"
-fi
+# else
+#     log_info "nntrainer for Android already built (skipping)"
+# fi
 
 # Check if build was successful
 if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
