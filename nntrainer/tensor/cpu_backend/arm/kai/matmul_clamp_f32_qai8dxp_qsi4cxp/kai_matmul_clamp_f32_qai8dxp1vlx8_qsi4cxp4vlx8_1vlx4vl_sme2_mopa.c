@@ -7,7 +7,7 @@
 // Do not flag up inline assembly blocks
 #pragma GCC diagnostic ignored "-Woverlength-strings"
 
-#if !defined(__aarch64__) || !defined(__ARM_FEATURE_SVE2)
+#if !defined(__aarch64__) || !defined(ENABLE_SVE2)
 #error This file must be compiled for AArch64, FEAT_SVE2.
 #else  // Architectural feature check
 

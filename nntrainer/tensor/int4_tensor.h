@@ -17,6 +17,10 @@
 
 namespace nntrainer {
 
+
+class Int4QTensor : public TensorBase {
+
+public:
 /**
  * @class Int4QTensor class
  * @brief Int4QTensor class for quantized 4-bit integer calculation
@@ -305,18 +309,18 @@ namespace nntrainer {
 
 
   /**
-+   * @brief Get the fixed KleidiAI kernel index based on compile‑time
-+   *        environment detection.
-+   *
-+   * If SME (Scalable Matrix Extension) is enabled, the function returns
-+   * index 8 (SME‑optimized kernel). Otherwise, if NEON is available, it
-+   * returns index 3 (NEON‑optimized kernel). If neither macro is defined,
-+   * it defaults to the NEON index 3.
-+   *
-+   * The used by the KleidiAI interface to select a
-+   * specific micro‑kernel variant without runtime latency probing.
-+   */
-  static uint32_t get_kleidiai_kernel_idx();
+   * @brief Get the fixed KleidiAI kernel index based on compile‑time
+   *        environment detection.
+   *
+   * If SME (Scalable Matrix Extension) is enabled, the function returns
+   * index 8 (SME‑optimized kernel). Otherwise, if NEON is available, it
+   * returns index 3 (NEON‑optimized kernel). If neither macro is defined,
+   * it returns -1 (no ARM extension available).
+   *
+   * The used by the KleidiAI interface to select a
+   * specific micro‑kernel variant without runtime latency probing.
+   */
+  static int32_t get_kleidiai_kernel_idx();
 
 private:
   /**
@@ -329,7 +333,7 @@ private:
    *
    * @note need to properly define this
    */
-  static size_t group_size;
+  size_t group_size;
 
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is

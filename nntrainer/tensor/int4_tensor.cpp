@@ -12,22 +12,23 @@
 #include <iomanip>
 #include <iostream>
 
-#include <compute_ops.h>
 #include <int4_tensor.h>
 #include <tensor.h>
 #include "cpu_backend/arm/kleidiai_interface.h"
 
 namespace nntrainer {
 
+  
+
 Int4QTensor::Int4QTensor(std::string name_, Tformat fm, QScheme qscheme_,
                          size_t g_size) :
   TensorBase(name_, fm, Tdatatype::QINT4), qscheme(qscheme_),
-  group_size_(g_size) {}
+  group_size(g_size) {}
 
 Int4QTensor::Int4QTensor(const TensorDim &d, bool alloc_now, Initializer init,
                          std::string name, QScheme qscheme_, size_t g_size) :
   TensorBase(d, alloc_now, init, name), qscheme(qscheme_),
-  group_size_(g_size) {
+  group_size(g_size) {
   if (alloc_now)
     allocate();
 }
@@ -45,7 +46,12 @@ Int4QTensor::Int4QTensor(
   std::vector<std::vector<std::vector<std::vector<int8_t>>>> const &d,
   std::vector<float> const &scales, Tformat fm, QScheme qscheme_,
   size_t g_size) :
-  qscheme(qscheme_), group_size_(g_size) {
+  
+  qscheme(qscheme_), group_size(g_size) {
+
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of constructor does not support for Android";
+ 
   if (d.empty() || d[0].empty() || d[0][0].empty() || d[0][0][0].empty()) {
     throw std::out_of_range(
       "[Tensor] trying to initialize Int4QTensor from empty vector");
@@ -53,7 +59,7 @@ Int4QTensor::Int4QTensor(
 
   NNTR_THROW_IF(scales.size() != scale_size(), std::invalid_argument)
     << "invalid scale factor size " << scales.size();
-
+ 
   dim.setTensorDim(0, d.size());
   if (fm == Tformat::NCHW) {
     dim.setTensorDim(1, d[0].size());
@@ -103,6 +109,8 @@ Int4QTensor::Int4QTensor(
 }
 
 bool Int4QTensor::operator==(const Int4QTensor &rhs) const {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+  << "This type of function does not support for Android";
   if (qscheme != rhs.qscheme)
     return false;
 
@@ -138,9 +146,16 @@ void Int4QTensor::allocate() {
     MemoryData *mem_data;
 
     /// quantized 4-bit is stored as a 8-bit signed integer (int4x2)
-    mem_data =
-      new MemoryData((void *)(new int8_t[(dim.getDataLen() + 1) / 2 +
-                                         sizeof(float) * scale_size()]{}));
+    if (get_kleidiai_kernel_idx() < 0){
+      // negative idx implies non-android platform
+      mem_data =
+        new MemoryData((void *)(new int8_t[(dim.getDataLen() + 1) / 2 +
+                                           sizeof(float) * scale_size()]{}));
+    }
+    else{
+      mem_data = new MemoryData((void *)(new int8_t[getMemoryBytes()]{}));
+    }
+      
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<int8_t>();
       delete mem_data;
@@ -160,11 +175,13 @@ void *Int4QTensor::getData() const {
   if (!data)
     return nullptr;
 
-  data->validate();
+  data->validate(); 
   return data->getAddr<int8_t>() + offset;
 }
 
 void *Int4QTensor::getData(size_t idx) const {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";
   if (!data)
     return nullptr;
 
@@ -173,6 +190,9 @@ void *Int4QTensor::getData(size_t idx) const {
 }
 
 void *Int4QTensor::getScale() const {
+
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";
   if (!data)
     return nullptr;
 
@@ -181,6 +201,10 @@ void *Int4QTensor::getScale() const {
 }
 
 void *Int4QTensor::getScale(size_t idx) const {
+
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";
+
   NNTR_THROW_IF(idx > scale_size(), std::invalid_argument)
     << "Tensor::getScale() index is not valid";
 
@@ -192,6 +216,9 @@ void *Int4QTensor::getScale(size_t idx) const {
 }
 
 void *Int4QTensor::getAddress(unsigned int i) {
+
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";
   size_t index = getIndex(batch(), channel(), height(), width());
   if (i > index) {
     return nullptr;
@@ -200,6 +227,9 @@ void *Int4QTensor::getAddress(unsigned int i) {
 }
 
 const void *Int4QTensor::getAddress(unsigned int i) const {
+
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";
   size_t index = getIndex(batch(), channel(), height(), width());
   if (i > index) {
     return nullptr;
@@ -208,27 +238,42 @@ const void *Int4QTensor::getAddress(unsigned int i) const {
 }
 
 const int8_t Int4QTensor::getValue(unsigned int i) const {
+
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";
   int8_t value = ((int8_t *)getData())[i / 2];
   return (i % 2 == 0) ? value >> 4 : ((int8_t)(value << 4) >> 4);
 }
 
 int8_t Int4QTensor::getValue(unsigned int i) {
+
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";
   int8_t value = ((int8_t *)getData())[i / 2];
   return (i % 2 == 0) ? value >> 4 : ((int8_t)(value << 4) >> 4);
 }
 
 const int8_t Int4QTensor::getValue(unsigned int b, unsigned int c,
                                    unsigned int h, unsigned int w) const {
+  
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";                                  
   return getValue(getIndex(b, c, h, w));
 }
 
 int8_t Int4QTensor::getValue(unsigned int b, unsigned int c, unsigned int h,
                              unsigned int w) {
+
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";                              
   return getValue(getIndex(b, c, h, w));
 }
 
 /// @todo this func should be template function
 void Int4QTensor::setValue(float value) {
+
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";
   NNTR_THROW_IF(value < -8 || value > 7, std::out_of_range)
     << "Value must be in range [-8, 7]. Input value: " << value;
 
@@ -240,6 +285,9 @@ void Int4QTensor::setValue(float value) {
 /// @todo this func should be template function
 void Int4QTensor::addValue(unsigned int b, unsigned int c, unsigned int h,
                            unsigned int w, float value, float beta) {
+  
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";                            
   auto const &idx = getIndex(b, c, h, w);
   float output = getValue(idx);
   output *= beta;
@@ -257,6 +305,9 @@ void Int4QTensor::addValue(unsigned int b, unsigned int c, unsigned int h,
 /// @todo this func should be template function
 void Int4QTensor::setValue(unsigned int b, unsigned int c, unsigned int h,
                            unsigned int w, float value) {
+  
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";
   NNTR_THROW_IF(value < -8 || value > 7, std::out_of_range)
     << "Value must be in range [-8, 7]. Input value: " << value;
 
@@ -270,7 +321,7 @@ void Int4QTensor::setValue(unsigned int b, unsigned int c, unsigned int h,
 
 
 
-uint32_t Int4QTensor::get_kleidiai_kernel_idx(){
+int32_t Int4QTensor::get_kleidiai_kernel_idx(){
 #if defined(ENABLE_SME)
   // SME가 활성화된 경우 idx_variant=8 사용
   return 8;
@@ -278,7 +329,7 @@ uint32_t Int4QTensor::get_kleidiai_kernel_idx(){
   // SME가 없고 NEON만 있는 경우 idx_variant=3 사용
   return 3;
 #else
-  // Fallback
+  // Fallback - no ARM extension available
   return -1;
 #endif
 }
@@ -291,6 +342,11 @@ void Int4QTensor::setZero() {
 void Int4QTensor::initialize() {
   if (empty() || !isAllocated())
     return;
+
+  
+  if (get_kleidiai_kernel_idx() >= 0) {
+    return;  // offline packed data, skip initialization
+  }
 
   /// @note Sampling from the normal/uniform distribution is invalid
   switch (initializer) {
@@ -317,12 +373,16 @@ void Int4QTensor::initialize(Initializer init) {
   initialize();
 }
 
-void Int4QTensor::copy(const Tensor &from, ComputeOps *ops) {
+void Int4QTensor::copy(const Tensor &from) {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";   
   reshape(from.getDim());
   copy(from.getData());
 }
 
-void Int4QTensor::copyData(const Tensor &from, ComputeOps *ops) {
+void Int4QTensor::copyData(const Tensor &from) {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";   
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -341,6 +401,8 @@ void Int4QTensor::copyData(const Tensor &from, ComputeOps *ops) {
 }
 
 void Int4QTensor::copy_with_stride(const Tensor &input, Tensor &output) {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";   
   for (unsigned int b = 0; b < output.batch(); ++b) {
     for (unsigned int c = 0; c < output.channel(); ++c) {
       for (unsigned int h = 0; h < output.height(); ++h) {
@@ -354,7 +416,9 @@ void Int4QTensor::copy_with_stride(const Tensor &input, Tensor &output) {
 
 void Int4QTensor::save(std::ostream &file) {
   /// @note Save quantization information
-  save_quantization_info(file);
+
+  if(get_kleidiai_kernel_idx() < 0)
+    save_quantization_info(file);
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -372,17 +436,21 @@ void Int4QTensor::read(std::ifstream &file, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
-  read_quantization_info(file, start_offset, read_from_offset);
+
+  if(get_kleidiai_kernel_idx() < 0)
+    read_quantization_info(file, start_offset, read_from_offset); //only for non-android
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
   NNTR_THROW_IF(sz < 0, std::invalid_argument)
     << "read size: " << getMemoryBytes()
     << " is too big. It cannot be represented by std::streamsize";
-
-  if (read_from_offset) {
-    start_offset += sizeof(uint16_t);
-  }
+  
+  if(get_kleidiai_kernel_idx() < 0){  
+    if (read_from_offset) {
+      start_offset += sizeof(uint16_t);
+    }
+  } 
 
   checkedRead(file, (char *)getData(), sz,
               "[Int4QTensor::read] operation failed", start_offset,
@@ -395,7 +463,9 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
-  read_quantization_info(src, start_offset, read_from_offset);
+
+  if(get_kleidiai_kernel_idx() < 0)
+    read_quantization_info(src, start_offset, read_from_offset); //only for non-android
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -403,8 +473,10 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
     << "read size: " << getMemoryBytes()
     << " is too big. It cannot be represented by std::streamsize";
 
-  if (read_from_offset) {
-    start_offset += sizeof(uint16_t);
+  if(get_kleidiai_kernel_idx() < 0){  
+    if (read_from_offset) {
+      start_offset += sizeof(uint16_t);
+    } 
   }
 
   checkedRead(src, (char *)getData(), sz,
@@ -414,6 +486,8 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
 }
 
 std::vector<unsigned int> Int4QTensor::argmax() const {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";       
   std::vector<unsigned int> result;
   const int8_t *data = (int8_t *)getData();
   size_t batch_size = batch();
@@ -437,6 +511,8 @@ std::vector<unsigned int> Int4QTensor::argmax() const {
 }
 
 std::vector<unsigned int> Int4QTensor::argmin() const {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";       
   std::vector<unsigned int> result;
   const int8_t *data = (int8_t *)getData();
   size_t batch_size = batch();
@@ -459,7 +535,9 @@ std::vector<unsigned int> Int4QTensor::argmin() const {
   return result;
 }
 
-float Int4QTensor::max_abs(ComputeOps *ops) const {
+float Int4QTensor::max_abs() const {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";       
   int8_t abs_max_val = 0;
   int8_t curr_val;
   for (unsigned int idx = 0; idx < size(); ++idx) {
@@ -475,6 +553,8 @@ float Int4QTensor::max_abs(ComputeOps *ops) const {
 }
 
 float Int4QTensor::maxValue() const {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";       
   int8_t max_val = -8;
   int8_t curr_val;
   for (unsigned int idx = 0; idx < size(); ++idx) {
@@ -490,6 +570,8 @@ float Int4QTensor::maxValue() const {
 }
 
 float Int4QTensor::minValue() const {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";       
   int8_t min_val = 7;
   int8_t curr_val;
   for (unsigned int idx = 0; idx < size(); ++idx) {
@@ -505,6 +587,8 @@ float Int4QTensor::minValue() const {
 }
 
 void Int4QTensor::print(std::ostream &out) const {
+  NNTR_THROW_IF(get_kleidiai_kernel_idx() >= 0, std::runtime_error)
+    << "This type of function does not support for Android";       
   const int8_t *data = (int8_t *)getData();
   unsigned int len = size();
   out << "data addr: " << reinterpret_cast<const float *>(data) << '\n';
@@ -578,9 +662,9 @@ size_t Int4QTensor::getMemoryBytes() const {
   // never surfaced because the FC layer's old dequantize path worked
   // entirely in memory and the test coverage for saved-then-reloaded
   // QINT4 weights was effectively zero. Align with the allocator here.
-  uint32_t idx = get_kleidiai_kernel_idx();
+  int32_t idx = static_cast<int32_t>(get_kleidiai_kernel_idx());
   if (idx >= 0){
-      return nntr_kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(width(), height(), idx, true);
+      return nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(width(), height(), idx, true);
   }
   else{
       return ((size() + 1) / 2) * dim.getDataTypeSize() +
@@ -612,9 +696,9 @@ size_t Int4QTensor::scale_size() const {
     // "all K elements in one output column share one scale".
 
     
-    if (group_size_ == 0 || group_size_ == height())
+    if (group_size == 0 || group_size == height())
       return width();
-    return height() * width() / group_size_;
+    return height() * width() / group_size;
     break;
   default:
     break;
@@ -631,13 +715,19 @@ void Int4QTensor::copy(const void *buf) {
   if (buf == getData()) {
     return;
   }
-  // copy tensor data
-  getOps()->scopy_s8((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(),
-                     1);
+  if (get_kleidiai_kernel_idx() < 0) {
+    // copy tensor data
+    getOps()->scopy_s8((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(),
+                       1);
 
-  // copy scale factor data
-  float *scales = (float *)(((int8_t *)buf) + (size() + 1) / 2);
-  getOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
+    // copy scale factor data
+    float *scales = (float *)(((int8_t *)buf) + (size() + 1) / 2);
+    getOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
+  } else {
+    // KleidiAI-packed layout: single contiguous buffer
+    getOps()->scopy_u8(getMemoryBytes(), (uint8_t *)buf, 1,
+                       (uint8_t *)getData(), 1);
+  }
 }
 
 void Int4QTensor::save_quantization_info(std::ostream &file) {
