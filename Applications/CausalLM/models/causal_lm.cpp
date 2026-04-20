@@ -169,7 +169,7 @@ void CausalLM::registerOutputs(
         // boundary. See AsyncAndStreaming.md §3.3.
         if (streamer_ != nullptr) {
           if (streamer_put(streamer_, decoded_str.c_str()) != 0) {
-            stop_requested_ = true;
+            stop_requested_.store(true, std::memory_order_release);
           }
         }
 
@@ -320,7 +320,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // any) may have flipped this flag on a previous run that was
   // cancelled, and we don't want stale state to break an unrelated
   // subsequent run().
-  stop_requested_ = false;
+  stop_requested_.store(false, std::memory_order_release);
 
   output_list.clear();
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
@@ -560,12 +560,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     }
 
     // Cooperative cancellation: a streamer may have asked us to stop
-    // via its put() return value. We check once per generated token so
-    // worst-case latency is a single decode step. When cancelled we
-    // still free the input buffer (the normal EOS path above does the
-    // same), exit the loop, and let the rest of run() record metrics
-    // for however many tokens we actually produced.
-    if (stop_requested_) {
+    // via its put() return value, or requestStop() was called from
+    // another thread. We check once per generated token so worst-case
+    // latency is a single decode step. When cancelled we still free
+    // the input buffer (the normal EOS path above does the same), exit
+    // the loop, and let the rest of run() record metrics for however
+    // many tokens we actually produced.
+    if (stop_requested_.load(std::memory_order_acquire)) {
       free(input_sample);
       break;
     }

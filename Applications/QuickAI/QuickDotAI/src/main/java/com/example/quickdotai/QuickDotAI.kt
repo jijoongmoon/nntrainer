@@ -282,6 +282,12 @@ interface QuickDotAI {
     }
 
     /**
+     * @brief Cancel an in-flight [runStreaming] or [runMultimodalStreaming].
+     * Safe to call from any thread. No-op if no generation is running.
+     */
+    fun cancel() { /* no-op by default */ }
+
+    /**
      * @brief Cancel an in-flight [chatRun] or [chatRunStreaming].
      * Safe to call from any thread. No-op if no generation is running.
      */

@@ -198,6 +198,17 @@ object NativeCausalLm {
     external fun destroyModelHandleNative(handle: Long): Int
 
     /**
+     * @brief Forwards to `cancelModelHandle` in quick_dot_ai_api.h.
+     *
+     * Requests cancellation of an in-progress streaming run. Thread-safe:
+     * can be called from any thread (e.g., UI cancel button handler).
+     *
+     * @param handle Handle returned by loadModelHandleNative
+     * @return An `ErrorCode` int; 0 on success.
+     */
+    external fun cancelModelHandleNative(handle: Long): Int
+
+    /**
      * @brief Forwards to `runMultimodalHandleStreaming` in quick_dot_ai_api.h.
      *
      * Multimodal streaming inference that accepts preprocessed image patches

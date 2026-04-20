@@ -144,14 +144,14 @@ class NativeQuickDotAI(
                 // Architecture is resolved native-side; we report the
                 // model key until we add a dedicated native getter.
                 architecture = req.model.name
-                
+
                 // Initialize image processor if visionBackend is set
                 visionBackend = req.visionBackend
                 if (req.visionBackend != null) {
                     imageProcessor = LlavaNextImageProcessor(appContext)
                     Log.i(TAG, "load(): visionBackend=${req.visionBackend}, image processor initialized")
                 }
-                
+
                 Log.i(TAG, "load(): SUCCESS, handle=0x${handle.toString(16)}")
                 BackendResult.Ok(Unit)
             }
@@ -303,9 +303,10 @@ class NativeQuickDotAI(
                     "Close it before opening a new one."
             )
         }
-        val session = NativeChatSession()
+        // Pass handle provider so cancel() can access the native handle
+        val session = NativeChatSession(handleProvider = { handle })
         activeSession = session
-        Log.i(TAG, "openChatSession(): created dummy session ${session.sessionId}")
+        Log.i(TAG, "openChatSession(): created session ${session.sessionId} with handle=0x${handle.toString(16)}")
         return BackendResult.Ok(session.sessionId)
     }
 
@@ -348,6 +349,17 @@ class NativeQuickDotAI(
             return err
         }
         return session.runStreaming(messages, sink)
+    }
+
+    override fun cancel() {
+        Log.d(TAG, "cancel(): START, handle=0x${handle.toString(16)}")
+        if (handle != 0L) {
+            Log.d(TAG, "cancel(): calling NativeCausalLm.cancelModelHandleNative(handle=0x${handle.toString(16)})")
+            val result = NativeCausalLm.cancelModelHandleNative(handle)
+            Log.d(TAG, "cancel(): cancelModelHandleNative returned $result")
+        } else {
+            Log.w(TAG, "cancel(): no valid handle to cancel")
+        }
     }
 
     override fun chatCancel() {

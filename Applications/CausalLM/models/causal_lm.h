@@ -39,7 +39,12 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <atomic>
 #include <transformer.h>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 // Forward-declare the C streamer type from api/streamer.h. We keep this
 // a bare forward declaration so causal_lm.h does not pull the API
@@ -106,6 +111,35 @@ public:
    * design.
    */
   void setStreamer(::BaseStreamer *streamer) { streamer_ = streamer; }
+
+  /**
+   * @brief Request cancellation of the current run().
+   *
+   * Thread-safe: sets the stop flag atomically, causing the token
+   * generation loop to exit at the next token boundary. Safe to call
+   * from any thread (e.g., from a UI cancel button handler).
+   */
+  void requestStop() override {
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_DEBUG, "CausalLM",
+                        "requestStop: setting stop_requested_ to true");
+#else
+    std::cout << "[DEBUG] requestStop: setting stop_requested_ to true" << std::endl;
+#endif
+    stop_requested_.store(true, std::memory_order_release);
+  }
+
+  /**
+   * @brief Check if stop has been requested.
+   * Thread-safe: can be called from any thread.
+   */
+  bool isStopRequested() const { return stop_requested_.load(std::memory_order_acquire); }
+
+  /**
+   * @brief Clear the stop request flag.
+   * Thread-safe: can be called from any thread.
+   */
+  void clearStopRequest() { stop_requested_.store(false, std::memory_order_release); }
 
 protected:
   /**
@@ -184,11 +218,15 @@ protected:
 
   /**
    * @brief Cooperative cancellation flag set by registerOutputs() when
-   *        the attached streamer's put() returns non-zero. The token
-   *        generation loop in run() checks this once per iteration and
-   *        breaks out at the next safe boundary.
+   *        the attached streamer's put() returns non-zero, or by
+   *        requestStop() from any thread. The token generation loop in
+   *        run() checks this once per iteration and breaks out at the
+   *        next safe boundary.
+   *
+   * Uses std::atomic for thread-safe access from any thread (e.g.,
+   * cancel button handler in UI thread).
    */
-  bool stop_requested_ = false;
+  std::atomic<bool> stop_requested_{false};
 
   std::mt19937 rng; /**< Random Number Gen */
 };

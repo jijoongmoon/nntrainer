@@ -13,10 +13,12 @@
  */
 package com.example.quickdotai
 
+import android.util.Log
 import java.util.UUID
 
 internal class NativeChatSession(
-    val sessionId: String = UUID.randomUUID().toString()
+    val sessionId: String = UUID.randomUUID().toString(),
+    private val handleProvider: () -> Long = { 0L }
 ) {
 
     @Volatile
@@ -49,8 +51,22 @@ internal class NativeChatSession(
         return err
     }
 
+    /**
+     * @brief Request cancellation of an in-progress streaming run.
+     *
+     * Thread-safe: can be called from any thread (e.g., UI cancel button handler).
+     * Sets the stop flag on the native model, causing the token generation loop
+     * to exit at the next token boundary.
+     */
     fun cancel() {
-        // no-op — nothing to cancel
+        if (closed) return
+        val handle = handleProvider()
+        if (handle != 0L) {
+            Log.i(TAG, "cancel(): requesting stop for handle=0x${handle.toString(16)}")
+            NativeCausalLm.cancelModelHandleNative(handle)
+        } else {
+            Log.w(TAG, "cancel(): no valid handle to cancel")
+        }
     }
 
     fun rebuild(
@@ -71,4 +87,8 @@ internal class NativeChatSession(
         QuickAiError.NOT_INITIALIZED,
         "Chat session $sessionId is closed"
     )
+
+    companion object {
+        private const val TAG = "NativeChatSession"
+    }
 }

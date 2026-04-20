@@ -244,6 +244,24 @@ Java_com_example_quickdotai_NativeCausalLm_destroyModelHandleNative(
 }
 
 // ---------------------------------------------------------------------------
+// cancelModelHandle
+//
+// Requests cancellation of an in-progress streaming run. Thread-safe:
+// can be called from any thread (e.g., UI cancel button handler).
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_quickdotai_NativeCausalLm_cancelModelHandleNative(
+  JNIEnv * /*env*/, jobject /*thiz*/, jlong handleJlong) {
+  auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
+  __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
+                      "cancelModelHandleNative: handle=%p", (void *)handle);
+  auto result = cancelModelHandle(handle);
+  __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
+                      "cancelModelHandleNative: returned %d", result);
+  return static_cast<jint>(result);
+}
+
+// ---------------------------------------------------------------------------
 // runModelHandleStreaming
 //
 // Forwards deltas from the native quick_dot_ai_api streaming callback to a
@@ -372,7 +390,7 @@ Java_com_example_quickdotai_NativeCausalLm_runMultimodalHandleStreamingNative(
 
   auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
   StreamCtx ctx{env, listenerObj, onDelta};
-  
+
   ErrorCode ec = runMultimodalHandleStreaming(
     handle, prompt, pixels, numPatches, originalHeight, originalWidth,
     &stream_trampoline, &ctx);
@@ -380,7 +398,7 @@ Java_com_example_quickdotai_NativeCausalLm_runMultimodalHandleStreamingNative(
   // Release resources
   env->ReleaseFloatArrayElements(pixelValuesJ, pixels, JNI_ABORT);
   env->ReleaseStringUTFChars(promptJ, prompt);
-  
+
   return static_cast<jint>(ec);
 }
 
@@ -417,7 +435,7 @@ Java_com_example_quickdotai_NativeCausalLm_runMultimodalHandleNative(
 
   auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
   const char *output = nullptr;
-  
+
   ErrorCode ec = runMultimodalHandle(
     handle, prompt, pixels, numPatches, originalHeight, originalWidth, &output);
 
