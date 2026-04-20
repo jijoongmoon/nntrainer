@@ -183,9 +183,7 @@ class MainActivity : AppCompatActivity() {
     private var selectedQuant: QuantizationType = QuantizationType.W4A32
 
     private var modelPathText: String = ""
-    private var promptText: String =
-        "<|begin_of_text|><|turn_start|>System\n<|turn_end|>\n" +
-        "<|turn_start|>user\nWhat is rainbow?<|turn_end|>\n<|turn_start|>Assistant"
+    private var promptText: String = "What is rainbow?"
 
     private var systemPromptText: String = ""
     private var temperatureText: String = ""
