@@ -47,7 +47,7 @@ typedef enum {
   CAUSAL_LM_ERROR_INFERENCE_FAILED = 3,
   CAUSAL_LM_ERROR_NOT_INITIALIZED = 4,
   CAUSAL_LM_ERROR_INFERENCE_NOT_RUN = 5,
-    CAUSAL_LM_ERROR_UNSUPPORTED = 6,
+  CAUSAL_LM_ERROR_UNSUPPORTED = 6,
   CAUSAL_LM_ERROR_UNKNOWN = 99
 } ErrorCode;
 
@@ -63,6 +63,8 @@ typedef enum {
   CAUSAL_LM_MODEL_GAUSS3_6_QNN = 2,
   CAUSAL_LM_MODEL_GAUSS3_8_QNN = 3,
   CAUSAL_LM_MODEL_QWEN3_1_7B_Q40 = 4,
+  CAUSAL_LM_MODEL_GAUSS3_8_VE_QNN = 5,
+  CAUSAL_LM_MODEL_GAUSS3_8_VIT_QNN = 6,
 } ModelType;
 
 typedef struct {
@@ -226,6 +228,21 @@ WIN_EXPORT ErrorCode getPerformanceMetricsHandle(CausalLmHandle handle,
  * @return ErrorCode
  */
 WIN_EXPORT ErrorCode destroyModelHandle(CausalLmHandle handle);
+
+
+/**
+ * @brief Request cancellation of an in-progress run on a handle.
+ *
+ * Sets the stop flag on the model, causing the token generation loop
+ * to exit at the next token boundary. Thread-safe: can be called from
+ * any thread (e.g., from a UI cancel button handler).
+ *
+ * If no run is in progress, this function is a no-op.
+ *
+ * @param handle Handle returned by loadModelHandle
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode cancelModelHandle(CausalLmHandle handle);
 
 /**
  * @brief Unload the model from a handle without destroying the handle.

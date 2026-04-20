@@ -291,6 +291,12 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(runBtn)
 
+        val cancelBtn = Button(this).apply {
+            text = "Cancel"
+            setOnClickListener { onCancelClicked() }
+        }
+        root.addView(cancelBtn)
+
         val metricsBtn = Button(this).apply {
             text = "Fetch metrics"
             setOnClickListener { onMetricsClicked() }
@@ -535,7 +541,7 @@ class MainActivity : AppCompatActivity() {
         val backend = BackendType.valueOf(backendSpinner.selectedItem as String)
         val quant = selectedQuant()
         val modelPath = modelPathField.text.toString().trim().ifEmpty { null }
-        
+
         // Call vsionBackend for all cases (Change to Gauss3.8/Gemma4 later)
         val visionBackend = backend
         // val visionBackend = if (model == ModelId.GEMMA4) backend else null
@@ -696,6 +702,21 @@ class MainActivity : AppCompatActivity() {
                     setStatus("Unload failed: [${r.error.name}] ${r.message ?: ""}")
             }
         }
+    }
+
+    private fun onCancelClicked() {
+        android.util.Log.d("SampleTestApp", "onCancelClicked: START")
+        val e = engine
+        if (e == null) {
+            android.util.Log.w("SampleTestApp", "onCancelClicked: No model loaded")
+            setStatus("No model loaded.")
+            return
+        }
+        android.util.Log.d("SampleTestApp", "onCancelClicked: engine kind=${e.kind}, calling cancel()")
+        // cancel() is thread-safe — can be called from main thread
+        e.cancel()
+        android.util.Log.d("SampleTestApp", "onCancelClicked: cancel() returned")
+        setStatus("Cancel requested.")
     }
 
     // --- chat session handlers -------------------------------------------

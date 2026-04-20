@@ -671,6 +671,14 @@ class LiteRTLm(
         }
     }
 
+    override fun cancel() {
+        // LiteRT-LM's Kotlin API does not currently expose a direct cancel
+        // method for in-flight streaming operations. The streaming callback
+        // will continue until onDone/onError is received.
+        // TODO: Implement cancel when LiteRT-LM adds cancel support.
+        Log.w(TAG, "cancel(): LiteRT-LM does not support mid-stream cancellation yet")
+    }
+
     override fun chatCancel() {
         activeSession?.cancel()
             ?: Log.w(TAG, "chatCancel(): no active session")

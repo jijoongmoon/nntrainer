@@ -164,6 +164,13 @@ public:
    */
   virtual std::string getOutput(int batch_idx = 0) const { (void)batch_idx; return ""; }
 
+  /**
+   * @brief Request cancellation of the current run().
+   *        Thread-safe: can be called from any thread.
+   *        Default implementation does nothing - subclasses can override.
+   */
+  virtual void requestStop() { /* no-op by default */ }
+
 protected:
   /**
    * @brief Setup the parameters for the Transformer model
