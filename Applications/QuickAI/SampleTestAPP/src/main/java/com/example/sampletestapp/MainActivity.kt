@@ -57,6 +57,10 @@ import android.widget.TextView
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.widget.NestedScrollView
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import com.example.quickdotai.BackendResult
 import com.example.quickdotai.BackendType
 import com.example.quickdotai.LiteRTLm
@@ -286,7 +290,7 @@ class MainActivity : AppCompatActivity() {
         // Main scrolling content area — wraps the model section, the
         // active tab body, and (for non-metrics tabs) the shared output
         // panel.
-        val scroll = ScrollView(this).apply {
+        val scroll = NestedScrollView(this).apply {
             isFillViewport = false
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f)
             overScrollMode = View.OVER_SCROLL_NEVER
@@ -1088,6 +1092,22 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
         })
+        val copy = TextView(this).apply {
+            text = "📋"
+            setTextColor(0x80FFFFFF.toInt())
+            gravity = Gravity.CENTER
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(dp(24), dp(24))
+            setOnClickListener {
+                if (outputText.isNotEmpty()) {
+                    val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    val clip = ClipData.newPlainText("output", outputText)
+                    clipboard.setPrimaryClip(clip)
+                }
+            }
+        }
+        titleBar.addView(copy)
+        spacerH(titleBar, 8)
         val clear = TextView(this).apply {
             text = "🗑"
             setTextColor(0x80FFFFFF.toInt())
@@ -1106,7 +1126,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 1)
         })
 
-        val outScroll = ScrollView(this).apply {
+        val outScroll = NestedScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(220))
         }
         outputView = TextView(this).apply {
@@ -1116,7 +1136,7 @@ class MainActivity : AppCompatActivity() {
             textSize = 13f
             typeface = Typeface.MONOSPACE
             setPadding(dp(16), dp(12), dp(16), dp(12))
-            setTextIsSelectable(true)
+            layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
         }
         outScroll.addView(outputView)
         wrap.addView(outScroll)
