@@ -43,7 +43,8 @@ enum class ModelId {
     GEMMA4,
     GAUSS3_6_QNN,
     GAUSS3_8_QNN,
-    QWEN3_1_7B_Q40
+    QWEN3_1_7B_Q40,
+    GAUSS3_8_VISION_QNN,
 }
 
 /**

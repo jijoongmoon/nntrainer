@@ -1291,6 +1291,8 @@ class MainActivity : AppCompatActivity() {
                 "$base/models/gauss-3.8-qnn"
             ModelId.QWEN3_1_7B_Q40 ->
                 "$base/models/qwen3-1.7b-q40-arm"
+            ModelId.GAUSS3_8_VISION_QNN ->
+                "$base/models/gauss-3.8-vsion-qnn"
         }
     }
 

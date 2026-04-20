@@ -83,8 +83,11 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
   setupParameters(cfg, generation_cfg, nntr_cfg);
 
   // prep tokenizer
-  tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-    LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+  if (nntr_cfg.contains("tokenizer_file") &&
+      !nntr_cfg["tokenizer_file"].is_null()) {
+    tokenizer = tokenizers::Tokenizer::FromBlobJSON(
+      LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+  }
 };
 
 void Transformer::setupParameters(json &cfg, json &generation_cfg,
