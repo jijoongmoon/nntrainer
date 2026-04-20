@@ -182,6 +182,10 @@ class MainActivity : AppCompatActivity() {
     private var selectedBackend: BackendType = BackendType.GPU
     private var selectedQuant: QuantizationType = QuantizationType.W4A32
 
+    private var chatSelectedModel: ModelId = ModelId.GEMMA4
+    private var chatSelectedBackend: BackendType = BackendType.GPU
+    private var chatSelectedQuant: QuantizationType = QuantizationType.W4A32
+
     private var modelPathText: String = ""
     private var promptText: String = "What is rainbow?"
 
@@ -310,8 +314,10 @@ class MainActivity : AppCompatActivity() {
         mainScrollView.addView(scrollColumn)
         column.addView(mainScrollView)
 
-        scrollColumn.addView(buildModelSection(tokens))
-        spacer(scrollColumn, 10)
+        if (selectedTab != "chat") {
+            scrollColumn.addView(buildModelSection(tokens))
+            spacer(scrollColumn, 10)
+        }
 
         scrollColumn.addView(when (selectedTab) {
             "run"     -> buildRunTab(tokens)
@@ -704,53 +710,64 @@ class MainActivity : AppCompatActivity() {
     private fun buildChatTab(t: M3Tokens): View {
         val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // ── Session status card ──
-        val sessionCard = LinearLayout(this).apply {
+        // ── Model Selection Card ──
+        val modelCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = solid(t.surfaceContainer, 20)
             setPadding(dp(14), dp(14), dp(14), dp(14))
         }
         val active = sessionIdText != null
-        val sessionIcon = TextView(this).apply {
-            text = "⌬"
+        val modelIcon = TextView(this).apply {
+            text = "▦"
             gravity = Gravity.CENTER
             textSize = 18f
             setTextColor(if (active) t.success else t.onSurfaceVar)
             background = solid(if (active) t.successContainer else t.surfaceContainerHigh, 10)
             layoutParams = LinearLayout.LayoutParams(dp(38), dp(38))
         }
-        sessionCard.addView(sessionIcon)
-        spacerH(sessionCard, 12)
-        val sessionTextCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
-        }
-        sessionTextCol.addView(TextView(this).apply {
-            text = "SESSION"
-            setTextColor(t.onSurfaceVar)
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-        })
-        chatSessionStatusView = TextView(this).apply {
-            text = if (active) "${sessionIdText!!.take(8)}… active" else "none"
+        modelCard.addView(modelIcon)
+        spacerH(modelCard, 12)
+
+        val modelDropdown = TextView(this).apply {
+            text = badgePlusLabel(chatSelectedModel)
             setTextColor(t.onSurface)
             textSize = 14f
             typeface = Typeface.MONOSPACE
+            background = solid(t.surfaceContainerHigh, 12)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+            setOnClickListener {
+                val popup = PopupMenu(this@MainActivity, this)
+                ModelId.values().forEachIndexed { i, m ->
+                    popup.menu.add(0, i, i, badgePlusLabel(m))
+                }
+                popup.setOnMenuItemClickListener { item ->
+                    chatSelectedModel = ModelId.values()[item.itemId]
+                    rebuildUi()
+                    true
+                }
+                popup.show()
+            }
         }
-        sessionTextCol.addView(chatSessionStatusView)
-        sessionCard.addView(sessionTextCol)
+        modelCard.addView(modelDropdown)
 
         if (active) {
-            sessionCard.addView(tonalButton(t, "↺ Rebuild") { onChatRebuildClicked() })
-            spacerH(sessionCard, 6)
-            sessionCard.addView(tonalButton(t, "✕ Close", danger = true) {
-                onChatCloseClicked()
-            })
+            chatSessionStatusView = TextView(this).apply {
+                text = "${sessionIdText!!.take(8)}…"
+                setTextColor(t.success)
+                textSize = 12f
+                typeface = Typeface.MONOSPACE
+            }
+            spacerH(modelCard, 8)
+            modelCard.addView(chatSessionStatusView)
+            spacerH(modelCard, 6)
+            modelCard.addView(tonalButton(t, "✕ Close", danger = true) { onChatCloseClicked() })
         } else {
-            sessionCard.addView(filledButton(t, "+ Open") { onChatOpenClicked() })
+            spacerH(modelCard, 8)
+            modelCard.addView(filledButton(t, "+ Open") { onChatOpenClicked() })
         }
-        container.addView(sessionCard)
+        container.addView(modelCard)
         spacer(container, 10)
 
         // ── Collapsible session config ──
@@ -854,11 +871,6 @@ class MainActivity : AppCompatActivity() {
         }
         composerRow.addView(sendFab)
         composer.addView(composerRow)
-        spacer(composer, 6)
-        val blockingBtn = outlinedButton(t, "Send (blocking)") {
-            onChatRunBlockingClicked()
-        }.apply { isEnabled = sessionIdText != null }
-        composer.addView(blockingBtn)
         container.addView(composer)
         return container
     }
@@ -1566,14 +1578,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onCancelClicked() {
-        // Best-effort: chat sessions support cancel; one-shot run is
-        // bounded by the streaming sink and will end naturally when the
-        // engine returns.
         val e = engine
         if (e != null && e.chatSessionId != null) {
             e.chatCancel()
             setStatus("Cancel requested.")
         } else {
+            e?.cancel()
             streaming = false
             setStatus("Cancelled.")
             mainHandler.post { rebuildUi() }
@@ -1590,6 +1600,23 @@ class MainActivity : AppCompatActivity() {
         val quant = selectedQuant
         val modelPath = (if (::modelPathField.isInitialized) modelPathField.text.toString()
                           else modelPathText).trim().ifEmpty { null }
+        val visionBackend = if (model == ModelId.GEMMA4) backend else null
+        val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
+        return LoadModelRequest(
+            backend = backend,
+            model = model,
+            quantization = quant,
+            modelPath = modelPath,
+            visionBackend = visionBackend,
+            nativeLibDir = nativeLibDir,
+        )
+    }
+
+    private fun buildChatLoadRequest(): LoadModelRequest {
+        val model = chatSelectedModel
+        val backend = chatSelectedBackend
+        val quant = chatSelectedQuant
+        val modelPath = defaultModelPathFor(model, quant)
         val visionBackend = if (model == ModelId.GEMMA4) backend else null
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
         return LoadModelRequest(
@@ -1743,7 +1770,7 @@ class MainActivity : AppCompatActivity() {
     /* ───── Chat session handlers ───── */
 
     private fun onChatOpenClicked() {
-        val req = buildLoadRequest()
+        val req = buildChatLoadRequest()
         val systemPrompt = systemPromptText.trim().ifEmpty { null }
         val temperature = temperatureText.trim().ifEmpty { null }?.toDoubleOrNull()
         val topK = topKText.trim().ifEmpty { null }?.toIntOrNull()
