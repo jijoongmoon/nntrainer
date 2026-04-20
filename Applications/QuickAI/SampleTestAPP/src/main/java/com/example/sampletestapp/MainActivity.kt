@@ -210,9 +210,14 @@ class MainActivity : AppCompatActivity() {
     private var sessionIdText: String? = null
     private var lastMetrics: PerformanceMetrics? = null
 
+    private var mainScrollY = 0
+    private var outputScrollY = 0
+
     /* ───── UI refs (re-wired on every rebuildUi() call) ───── */
 
     private lateinit var rootHost: FrameLayout
+    private lateinit var mainScrollView: NestedScrollView
+    private lateinit var outputScrollView: NestedScrollView
     private lateinit var statusView: TextView
     private lateinit var outputView: TextView
     private lateinit var modelPathField: EditText
@@ -272,6 +277,10 @@ class MainActivity : AppCompatActivity() {
         if (::chatPromptField.isInitialized) chatPromptText = chatPromptField.text.toString()
         if (::openAIMessagesField.isInitialized) openAiJsonText = openAIMessagesField.text.toString()
 
+        // Save scroll positions before rebuilding
+        if (::mainScrollView.isInitialized) mainScrollY = mainScrollView.scrollY
+        if (::outputScrollView.isInitialized) outputScrollY = outputScrollView.scrollY
+
         rootHost = FrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT)
             setBackgroundColor(tokens.bg)
@@ -290,7 +299,7 @@ class MainActivity : AppCompatActivity() {
         // Main scrolling content area — wraps the model section, the
         // active tab body, and (for non-metrics tabs) the shared output
         // panel.
-        val scroll = NestedScrollView(this).apply {
+        mainScrollView = NestedScrollView(this).apply {
             isFillViewport = false
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f)
             overScrollMode = View.OVER_SCROLL_NEVER
@@ -300,8 +309,8 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(12), 0, dp(12), dp(120))
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
         }
-        scroll.addView(scrollColumn)
-        column.addView(scroll)
+        mainScrollView.addView(scrollColumn)
+        column.addView(mainScrollView)
 
         scrollColumn.addView(buildModelSection(tokens))
         spacer(scrollColumn, 10)
@@ -320,6 +329,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         setContentView(rootHost)
+
+        // Restore scroll positions after UI is built
+        mainScrollView.post { mainScrollView.scrollTo(0, mainScrollY) }
+        if (::outputScrollView.isInitialized) {
+            outputScrollView.post { outputScrollView.scrollTo(0, outputScrollY) }
+        }
     }
 
     /* ════════════════════════════════════════════════════════════════
@@ -1126,7 +1141,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 1)
         })
 
-        val outScroll = NestedScrollView(this).apply {
+        outputScrollView = NestedScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(220))
         }
         outputView = TextView(this).apply {
@@ -1138,8 +1153,8 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(12), dp(16), dp(12))
             layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
         }
-        outScroll.addView(outputView)
-        wrap.addView(outScroll)
+        outputScrollView.addView(outputView)
+        wrap.addView(outputScrollView)
         return wrap
     }
 
