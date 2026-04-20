@@ -557,7 +557,7 @@ class MainActivity : AppCompatActivity() {
             // Load / Unload action row.
             val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             val loadLabel = if (loadStatus == "loaded") "↻  Reload model" else "↓  Load model"
-            actions.addView(filledButton(t, loadLabel, full = true) { onLoadClicked() })
+            actions.addView(filledButton(t, loadLabel, fill = "horizontal") { onLoadClicked() })
             if (loadStatus == "loaded") {
                 spacerH(actions, 8)
                 actions.addView(tonalButton(t, "✕  Unload", danger = true) { onUnloadClicked() })
@@ -676,7 +676,7 @@ class MainActivity : AppCompatActivity() {
             selectedImageBytes != null -> "▶  Run multimodal (streaming)"
             else -> "▶  Run (streaming)"
         }
-        val runBtn = filledButton(t, runLabel, full = true,
+        val runBtn = filledButton(t, runLabel, fill = "vertical",
             danger = streaming) {
             if (streaming) onCancelClicked() else onRunClicked()
         }
@@ -926,7 +926,7 @@ class MainActivity : AppCompatActivity() {
         spacer(card, 12)
 
         val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val runBtn = filledButton(t, "▶  Run (streaming)", full = true) {
+        val runBtn = filledButton(t, "▶  Run (streaming)", fill = "horizontal") {
             onOpenAIMessagesRunClicked()
         }.apply { isEnabled = !streaming && parseErr == null }
         actions.addView(runBtn)
@@ -973,7 +973,7 @@ class MainActivity : AppCompatActivity() {
                 setPadding(0, dp(4), 0, 0)
             })
             spacer(empty, 12)
-            empty.addView(filledButton(t, "Fetch metrics", full = true) { onMetricsClicked() })
+            empty.addView(filledButton(t, "Fetch metrics", fill = "vertical") { onMetricsClicked() })
             column.addView(empty)
             return column
         }
@@ -1331,7 +1331,7 @@ class MainActivity : AppCompatActivity() {
         return scroll
     }
 
-    private fun filledButton(t: M3Tokens, label: String, full: Boolean = false,
+    private fun filledButton(t: M3Tokens, label: String, fill: String? = null,
                              danger: Boolean = false, onClick: () -> Unit): Button {
         return Button(this).apply {
             text = label
@@ -1342,9 +1342,11 @@ class MainActivity : AppCompatActivity() {
             stateListAnimator = null
             background = solid(if (danger) t.error else t.primary, 100)
             setPadding(dp(20), dp(12), dp(20), dp(12))
-            layoutParams = LinearLayout.LayoutParams(
-                if (full) 0 else WRAP_CONTENT, WRAP_CONTENT, if (full) 1f else 0f
-            )
+            layoutParams = when (fill) {
+                "vertical"   -> LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+                "horizontal" -> LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+                else         -> LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+            }
             setOnClickListener { onClick() }
         }
     }
