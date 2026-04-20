@@ -1495,9 +1495,11 @@ class MainActivity : AppCompatActivity() {
 
     /** Pretty label including the design's "MULTIMODAL/TEXT/QNN" tag. */
     private fun badgePlusLabel(m: ModelId): String = when (m) {
-        ModelId.GEMMA4       -> "[MULTIMODAL]  ${m.name}"
-        ModelId.QWEN3_0_6B   -> "[TEXT]        ${m.name}"
-        ModelId.GAUSS3_8_QNN -> "[QNN]         ${m.name}"
+        ModelId.GEMMA4         -> "[MULTIMODAL]  ${m.name}"
+        ModelId.QWEN3_0_6B     -> "[TEXT]        ${m.name}"
+        ModelId.GAUSS3_8_QNN   -> "[QNN]         ${m.name}"
+        ModelId.GAUSS3_6_QNN   -> "[QNN]         ${m.name}"
+        ModelId.QWEN3_1_7B_Q40 -> "[TEXT]        ${m.name}"
     }
 
     /* ════════════════════════════════════════════════════════════════
@@ -1585,7 +1587,7 @@ class MainActivity : AppCompatActivity() {
 
         val newEngine: QuickDotAI = when (req.model) {
             ModelId.GEMMA4 -> LiteRTLm(applicationContext)
-            else -> NativeQuickDotAI()
+            else -> NativeQuickDotAI(applicationContext)
         }
         return when (val r = newEngine.load(req)) {
             is BackendResult.Ok -> {
@@ -2093,6 +2095,10 @@ class MainActivity : AppCompatActivity() {
                 "$base/models/qwen3-0.6b${quantizationSuffix(quant)}"
             ModelId.GAUSS3_8_QNN ->
                 "$base/models/gauss-3.8b-qnn"
+            ModelId.GAUSS3_6_QNN ->
+                "$base/models/gauss-3.6b-qnn"
+            ModelId.QWEN3_1_7B_Q40 ->
+                "$base/models/qwen3-1.7b-q40"
         }
     }
 
