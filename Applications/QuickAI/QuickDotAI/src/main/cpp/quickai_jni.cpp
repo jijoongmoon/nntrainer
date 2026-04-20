@@ -371,17 +371,19 @@ Java_com_example_quickdotai_NativeCausalLm_runMultimodalHandleStreamingNative(
   }
 
   auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
-  StreamCtx ctx{env, listenerObj, onDelta};
+  (void)handle;
   
-  ErrorCode ec = runMultimodalHandleStreaming(
-    handle, prompt, pixels, numPatches, originalHeight, originalWidth,
-    &stream_trampoline, &ctx);
+  // TODO: runMultimodalHandleStreaming not yet implemented in libquick_dot_ai_api.so
+  // StreamCtx ctx{env, listenerObj, onDelta};
+  // ErrorCode ec = runMultimodalHandleStreaming(
+  //   handle, prompt, pixels, numPatches, originalHeight, originalWidth,
+  //   &stream_trampoline, &ctx);
 
   // Release resources
   env->ReleaseFloatArrayElements(pixelValuesJ, pixels, JNI_ABORT);
   env->ReleaseStringUTFChars(promptJ, prompt);
   
-  return static_cast<jint>(ec);
+  return static_cast<jint>(CAUSAL_LM_ERROR_UNSUPPORTED);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,20 +418,18 @@ Java_com_example_quickdotai_NativeCausalLm_runMultimodalHandleNative(
   }
 
   auto handle = reinterpret_cast<CausalLmHandle>(handleJlong);
+  (void)handle;
   const char *output = nullptr;
+  (void)output;
   
-  ErrorCode ec = runMultimodalHandle(
-    handle, prompt, pixels, numPatches, originalHeight, originalWidth, &output);
+  // TODO: runMultimodalHandle not yet implemented in libquick_dot_ai_api.so
+  // ErrorCode ec = runMultimodalHandle(
+  //   handle, prompt, pixels, numPatches, originalHeight, originalWidth, &output);
 
   // Release resources
   env->ReleaseFloatArrayElements(pixelValuesJ, pixels, JNI_ABORT);
   env->ReleaseStringUTFChars(promptJ, prompt);
 
-  jstring outJ = nullptr;
-  if (ec == CAUSAL_LM_ERROR_NONE && output != nullptr) {
-    outJ = env->NewStringUTF(output);
-  }
-
   return env->NewObject(g_cache.runResultCls, g_cache.runResultCtor,
-                        static_cast<jint>(ec), outJ);
+                        static_cast<jint>(CAUSAL_LM_ERROR_UNSUPPORTED), nullptr);
 }
