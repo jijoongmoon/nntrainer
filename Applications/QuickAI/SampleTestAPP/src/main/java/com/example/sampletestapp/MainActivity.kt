@@ -195,7 +195,7 @@ class MainActivity : AppCompatActivity() {
     private var topPText: String = ""
     private var seedText: String = ""
     private var thinkingChoice: String = "default"      // default | true | false
-    private var chatPromptText: String = ""
+    private var chatPromptText: String = "I bought a red car"
     private var openAiJsonText: String = """[
   {"role": "system", "content": "You are a helpful assistant."},
   {"role": "user", "content": "Hello!"},
@@ -836,7 +836,7 @@ class MainActivity : AppCompatActivity() {
         spacer(composer, 6)
         val composerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.BOTTOM
+            gravity = Gravity.CENTER_VERTICAL
             background = solid(t.surfaceContainerHigh, 24)
             setPadding(dp(6), dp(6), dp(6), dp(6))
         }
