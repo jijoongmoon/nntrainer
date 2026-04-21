@@ -6,52 +6,68 @@
  * @brief   Standalone sample that drives the :QuickDotAI AAR directly —
  *          no QuickAIService, no REST, no remote process.
  *
- * The user picks a (ModelId, BackendType, QuantizationType) triple, types
- * a prompt, optionally picks an image via the system photo picker, and
- * taps "Run (streaming)". MainActivity:
+ * Engine wiring (unchanged from the original sample):
  *
- *  1. Instantiates [LiteRTLm] for GEMMA4 and [NativeQuickDotAI] for
- *     every other model, both against a single-thread Executor so all
- *     calls touching a given engine are serialised on the same worker
- *     thread (the interface is not internally thread-safe).
- *  2. Calls [QuickDotAI.load] once per chosen (model, quant) pair.
- *     For GEMMA4 it auto-populates [LoadModelRequest.visionBackend] so
- *     the multimodal path is armed from load time.
+ *  1. Instantiates [LiteRTLm] for GEMMA4 and [NativeQuickDotAI] for every
+ *     other model, both against a single-thread Executor so all calls
+ *     touching a given engine are serialised on the same worker thread
+ *     (the [QuickDotAI] interface is not internally thread-safe).
+ *  2. Calls [QuickDotAI.load] once per chosen (model, quant) pair. For
+ *     GEMMA4 it auto-populates [LoadModelRequest.visionBackend] so the
+ *     multimodal path is armed from load time.
  *  3. Drives [QuickDotAI.runStreaming] (text-only) or
  *     [QuickDotAI.runMultimodalStreaming] (when an image is selected)
- *     with an in-memory StreamSink that appends each delta to the
- *     output TextView on the main thread.
+ *     with an in-memory StreamSink that appends each delta to the output
+ *     view on the main thread.
  *
- * This exists as the end-to-end proof that the AAR is genuinely reusable
- * from a third-party app — LauncherApp keeps the HTTP plumbing, but
- * SampleTestAPP shows a client that needs none of it. See Architecture.md
- * §2.9 for the big-picture view.
+ * UI (M3 Expressive redesign — see Applications/QuickAI/QuickDotAI/QuickDotAI.html
+ * design bundle): the screen is rebuilt as a tabbed Material 3 interface
+ * with a custom top bar, hero status pill, collapsible Model section
+ * with chip-group backend / quantization pickers, and a terminal-styled
+ * output panel shared across the Run / Chat / OpenAI tabs. A light/dark
+ * toggle in the top bar swaps the full M3 token set at runtime.
  */
 package com.example.sampletestapp
 
+import android.content.res.ColorStateList
+import android.graphics.Color
+import android.graphics.PorterDuff
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.widget.NestedScrollView
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import com.example.quickdotai.BackendResult
 import com.example.quickdotai.BackendType
 import com.example.quickdotai.LiteRTLm
 import com.example.quickdotai.LoadModelRequest
 import com.example.quickdotai.ModelId
 import com.example.quickdotai.NativeQuickDotAI
+import com.example.quickdotai.PerformanceMetrics
 import com.example.quickdotai.PromptPart
 import com.example.quickdotai.QuickAiChatMessage
 import com.example.quickdotai.QuickAiChatRole
@@ -69,82 +85,162 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
+/* ────────────────────────────────────────────────────────────────────────
+ * M3 Expressive token set — mirrors the LIGHT / DARK objects defined in
+ * the QuickDotAI.html design bundle. Holding both palettes in a single
+ * data class lets us swap them atomically when the user taps the dark-
+ * mode toggle in the top bar.
+ * ──────────────────────────────────────────────────────────────────────── */
+private data class M3Tokens(
+    val bg: Int, val surface: Int, val surfaceDim: Int,
+    val surfaceContainer: Int, val surfaceContainerHigh: Int,
+    val outline: Int, val outlineVariant: Int,
+    val onSurface: Int, val onSurfaceVar: Int,
+    val primary: Int, val onPrimary: Int,
+    val primaryContainer: Int, val onPrimaryContainer: Int,
+    val secondary: Int, val secondaryContainer: Int,
+    val tertiary: Int, val tertiaryContainer: Int,
+    val error: Int, val errorContainer: Int,
+    val success: Int, val successContainer: Int,
+    val codeBg: Int, val codeFg: Int,
+)
+
+private val LIGHT = M3Tokens(
+    bg = 0xFFFBF8FF.toInt(),
+    surface = 0xFFFFFFFF.toInt(),
+    surfaceDim = 0xFFF2EEF8.toInt(),
+    surfaceContainer = 0xFFF4EFFA.toInt(),
+    surfaceContainerHigh = 0xFFEDE7F6.toInt(),
+    outline = 0xFFCAC4D0.toInt(),
+    outlineVariant = 0xFFE7E0EC.toInt(),
+    onSurface = 0xFF1C1B1F.toInt(),
+    onSurfaceVar = 0xFF49454F.toInt(),
+    primary = 0xFF5B3EBE.toInt(),
+    onPrimary = 0xFFFFFFFF.toInt(),
+    primaryContainer = 0xFFE9DDFF.toInt(),
+    onPrimaryContainer = 0xFF21005D.toInt(),
+    secondary = 0xFF625B71.toInt(),
+    secondaryContainer = 0xFFE8DEF8.toInt(),
+    tertiary = 0xFF7D5260.toInt(),
+    tertiaryContainer = 0xFFFFD8E4.toInt(),
+    error = 0xFFB3261E.toInt(),
+    errorContainer = 0xFFF9DEDC.toInt(),
+    success = 0xFF146C2E.toInt(),
+    successContainer = 0xFFD5F5DF.toInt(),
+    codeBg = 0xFF0F0B1E.toInt(),
+    codeFg = 0xFFEDE7F6.toInt(),
+)
+
+private val DARK = M3Tokens(
+    bg = 0xFF121019.toInt(),
+    surface = 0xFF1B1823.toInt(),
+    surfaceDim = 0xFF100E17.toInt(),
+    surfaceContainer = 0xFF211E2B.toInt(),
+    surfaceContainerHigh = 0xFF2B2834.toInt(),
+    outline = 0xFF4A4458.toInt(),
+    outlineVariant = 0xFF2D2A37.toInt(),
+    onSurface = 0xFFE6E0E9.toInt(),
+    onSurfaceVar = 0xFFCAC4D0.toInt(),
+    primary = 0xFFCFBCFF.toInt(),
+    onPrimary = 0xFF371E73.toInt(),
+    primaryContainer = 0xFF4A3A8C.toInt(),
+    onPrimaryContainer = 0xFFE9DDFF.toInt(),
+    secondary = 0xFFCCC2DC.toInt(),
+    secondaryContainer = 0xFF4A4458.toInt(),
+    tertiary = 0xFFEFB8C8.toInt(),
+    tertiaryContainer = 0xFF633B48.toInt(),
+    error = 0xFFF2B8B5.toInt(),
+    errorContainer = 0xFF601410.toInt(),
+    success = 0xFF6EDB88.toInt(),
+    successContainer = 0xFF124F24.toInt(),
+    codeBg = 0xFF06040F.toInt(),
+    codeFg = 0xFFCFBCFF.toInt(),
+)
+
 class MainActivity : AppCompatActivity() {
 
-    /**
-     * @brief Single-thread executor that every [QuickDotAI] call is
-     * dispatched on. [QuickDotAI] implementations are NOT thread-safe —
-     * pinning every load / run / metrics / close to one thread mirrors
-     * what QuickAIService's ModelWorker does internally.
-     */
+    /* ───── Engine plumbing (unchanged from the original sample) ───── */
+
     private val engineExecutor: Executor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "SampleTestAPP-Engine").apply { isDaemon = true }
     }
 
-    /** Posts Runnables back to the Looper thread for UI updates. */
     private val mainHandler by lazy { android.os.Handler(mainLooper) }
 
-    /**
-     * The currently-loaded engine, if any. Guarded by only being touched
-     * from [engineExecutor]. [loadedKey] is only read/written from the
-     * same executor.
-     */
-    @Volatile
-    private var engine: QuickDotAI? = null
+    @Volatile private var engine: QuickDotAI? = null
+    @Volatile private var loadedKey: String? = null
+    @Volatile private var selectedImageBytes: ByteArray? = null
 
-    @Volatile
-    private var loadedKey: String? = null
+    /* ───── UI state (preserved across light/dark theme rebuilds) ───── */
 
-    // --- UI state -----------------------------------------------------
+    private var darkMode = false
+    private var selectedTab: String = "run"             // run | chat | openai | metrics
+    private var modelExpanded = true
+    private var samplingExpanded = false
 
-    private lateinit var modelSpinner: Spinner
-    private lateinit var backendSpinner: Spinner
-    private lateinit var quantSpinner: Spinner
+    private var selectedModel: ModelId = ModelId.GEMMA4
+    private var selectedBackend: BackendType = BackendType.GPU
+    private var selectedQuant: QuantizationType = QuantizationType.W4A32
+
+    private var chatSelectedModel: ModelId = ModelId.GEMMA4
+    private var chatSelectedBackend: BackendType = BackendType.GPU
+    private var chatSelectedQuant: QuantizationType = QuantizationType.W4A32
+
+    private var modelPathText: String = ""
+    private var promptText: String = "What is rainbow?"
+
+    private var systemPromptText: String = ""
+    private var temperatureText: String = ""
+    private var topKText: String = ""
+    private var topPText: String = ""
+    private var seedText: String = ""
+    private var thinkingChoice: String = "default"      // default | true | false
+    private var chatPromptText: String = "I bought a red car"
+    private var openAiJsonText: String = """[
+  {"role": "system", "content": "You are a helpful assistant."},
+  {"role": "user", "content": "Hello!"},
+  {"role": "assistant", "content": "Hi! How can I help?"},
+  {"role": "system", "content": "Answer in one short sentence."},
+  {"role": "user", "content": "Write a short joke about saving RAM."}
+]"""
+
+    private var statusText: String = "Idle."
+    private var outputText: String = ""
+    private var streaming: Boolean = false
+    private var loadStatus: String = "idle"             // idle | loading | loaded
+    private var loadedLabel: String = ""
+    private var sessionIdText: String? = null
+    private var lastMetrics: PerformanceMetrics? = null
+
+    private var mainScrollY = 0
+    private var outputScrollY = 0
+
+    /* ───── UI refs (re-wired on every rebuildUi() call) ───── */
+
+    private lateinit var rootHost: FrameLayout
+    private lateinit var mainScrollView: NestedScrollView
+    private lateinit var outputScrollView: NestedScrollView
+    private lateinit var statusView: TextView
+    private lateinit var outputView: TextView
     private lateinit var modelPathField: EditText
     private lateinit var promptField: EditText
     private lateinit var imageStatusView: TextView
-    private lateinit var statusView: TextView
-    private lateinit var outputView: TextView
-
-    // Chat session UI
-    private lateinit var chatSessionStatusView: TextView
     private lateinit var chatSystemPromptField: EditText
     private lateinit var chatTemperatureField: EditText
     private lateinit var chatTopKField: EditText
     private lateinit var chatTopPField: EditText
     private lateinit var chatSeedField: EditText
-    private lateinit var chatEnableThinkingSpinner: Spinner
     private lateinit var chatPromptField: EditText
-
-    // OpenAI-style messages input UI
     private lateinit var openAIMessagesField: EditText
-
-    /**
-     * @brief Raw bytes of the most recently picked image, or null if
-     * no image is currently selected.
-     *
-     * Written by the image-reader thread spawned in
-     * [readImageBytesAsync] and by [onClearImageClicked]; read by the
-     * engine thread inside [onRunClicked]. `@Volatile` is enough —
-     * we never need a read-modify-write cycle on this field.
-     */
-    @Volatile
-    private var selectedImageBytes: ByteArray? = null
+    private lateinit var chatSessionStatusView: TextView
 
     /**
      * @brief ActivityResult launcher for the Android system photo picker.
-     *
-     * `PickVisualMedia` does NOT require any runtime permissions — the
-     * system photo picker runs in a separate process and grants the
-     * caller a one-shot, URI-level read grant that stays valid for as
-     * long as we hold the returned [Uri]. We immediately drain the
-     * bytes on a background thread so we do not depend on that grant
-     * beyond the call to [readImageBytesAsync].
-     *
-     * Registered as a property so the contract is wired up BEFORE the
-     * activity reaches STARTED; calling [ActivityResultContracts] in
-     * onCreate after super.onCreate would also work, but the property
-     * form is the idiomatic one-liner.
+     * Uses [ActivityResultContracts.PickVisualMedia] which does NOT
+     * require any runtime permissions — the system photo picker grants a
+     * one-shot URI read grant. We immediately drain the bytes on a
+     * background thread so we do not depend on that grant beyond
+     * [readImageBytesAsync].
      */
     private val imagePickerLauncher = registerForActivityResult(
         ActivityResultContracts.PickVisualMedia()
@@ -158,350 +254,1304 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Seed the path field so a single Load tap works without typing.
+        modelPathText = defaultModelPathFor(selectedModel, selectedQuant)
+        rebuildUi()
+    }
 
-        val pad = (resources.displayMetrics.density * 16).toInt()
-        val scrollRoot = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
-            isFillViewport = true
+    /**
+     * @brief Tear down and re-inflate the entire view tree using the
+     * current [darkMode] palette. EditText contents are preserved by
+     * round-tripping through the `*Text` state vars, which are kept in
+     * sync via [TextWatcher]s installed in the field builders below.
+     */
+    private fun rebuildUi() {
+        val tokens = if (darkMode) DARK else LIGHT
+        // Snapshot any in-flight EditText contents into state vars so the
+        // theme rebuild does not lose typed input.
+        if (::promptField.isInitialized) promptText = promptField.text.toString()
+        if (::modelPathField.isInitialized) modelPathText = modelPathField.text.toString()
+        if (::chatSystemPromptField.isInitialized) systemPromptText = chatSystemPromptField.text.toString()
+        if (::chatTemperatureField.isInitialized) temperatureText = chatTemperatureField.text.toString()
+        if (::chatTopKField.isInitialized) topKText = chatTopKField.text.toString()
+        if (::chatTopPField.isInitialized) topPText = chatTopPField.text.toString()
+        if (::chatSeedField.isInitialized) seedText = chatSeedField.text.toString()
+        if (::chatPromptField.isInitialized) chatPromptText = chatPromptField.text.toString()
+        if (::openAIMessagesField.isInitialized) openAiJsonText = openAIMessagesField.text.toString()
+
+        // Save scroll positions before rebuilding
+        if (::mainScrollView.isInitialized) mainScrollY = mainScrollView.scrollY
+        if (::outputScrollView.isInitialized) outputScrollY = outputScrollView.scrollY
+
+        rootHost = FrameLayout(this).apply {
+            layoutParams = ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+            setBackgroundColor(tokens.bg)
             fitsSystemWindows = true
         }
-        val root = LinearLayout(this).apply {
+        val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-            gravity = Gravity.TOP
+            layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+        }
+        rootHost.addView(column)
+
+        column.addView(buildTopBar(tokens))
+        column.addView(buildHeroCard(tokens))
+        column.addView(buildTabBar(tokens))
+
+        // Main scrolling content area — wraps the model section, the
+        // active tab body, and (for non-metrics tabs) the shared output
+        // panel.
+        mainScrollView = NestedScrollView(this).apply {
+            isFillViewport = false
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f)
+            overScrollMode = View.OVER_SCROLL_NEVER
+        }
+        val scrollColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), 0, dp(12), dp(120))
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
         }
+        mainScrollView.addView(scrollColumn)
+        column.addView(mainScrollView)
 
+        if (selectedTab != "chat") {
+            scrollColumn.addView(buildModelSection(tokens))
+            spacer(scrollColumn, 10)
+        }
+
+        scrollColumn.addView(when (selectedTab) {
+            "run"     -> buildRunTab(tokens)
+            "chat"    -> buildChatTab(tokens)
+            "openai"  -> buildOpenAiTab(tokens)
+            "metrics" -> buildMetricsTab(tokens)
+            else      -> buildRunTab(tokens)
+        })
+
+        if (selectedTab != "metrics") {
+            spacer(scrollColumn, 10)
+            scrollColumn.addView(buildOutputPanel(tokens))
+        }
+
+        setContentView(rootHost)
+
+        // Restore scroll positions after UI is built
+        mainScrollView.post { mainScrollView.scrollTo(0, mainScrollY) }
+        if (::outputScrollView.isInitialized) {
+            outputScrollView.post { outputScrollView.scrollTo(0, outputScrollY) }
+        }
+    }
+
+    /* ════════════════════════════════════════════════════════════════
+     * Component builders
+     * ════════════════════════════════════════════════════════════════ */
+
+    private fun buildTopBar(t: M3Tokens): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(10))
+        }
+        // Brand mark — gradient-filled rounded square with a "✦" glyph,
+        // approximating the hero icon in the design.
+        val brand = TextView(this).apply {
+            text = "✦"
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            background = gradient(t.primary, t.tertiary, 12)
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+        }
+        row.addView(brand)
+
+        spacerH(row, 12)
+
+        val titleColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+        }
         val title = TextView(this).apply {
-            text = "QuickDotAI AAR sample (in-process)"
-            textSize = 20f
+            text = "QuickDotAI"
+            setTextColor(t.onSurface)
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
         }
-        root.addView(title)
-
-        val subtitle = TextView(this).apply {
-            text = "No service, no REST — runs the AAR directly."
-            textSize = 13f
-            setPadding(0, 0, 0, pad / 2)
+        val sub = TextView(this).apply {
+            val tail = if (loadStatus == "loaded") loadedLabel else "no model"
+            val tailColor = if (loadStatus == "loaded") t.success else t.onSurfaceVar
+            val full = "In-process AAR  ·  $tail"
+            text = full
+            textSize = 11f
+            // Approximate the React design's two-tone subtitle by using
+            // the success color when a model is loaded, otherwise neutral.
+            setTextColor(tailColor)
         }
-        root.addView(subtitle)
+        titleColumn.addView(title)
+        titleColumn.addView(sub)
+        row.addView(titleColumn)
 
-        // --- Model / backend / quantization selectors ----------------
-        root.addView(labelView("Model"))
-        modelSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                ModelId.values().map { it.name }
-            )
-            // Default to GEMMA4 so the LiteRTLm path is exercised with a
-            // single Load click — the more interesting bring-up case.
-            setSelection(ModelId.values().indexOf(ModelId.GEMMA4))
-        }
-        root.addView(modelSpinner)
-
-        root.addView(labelView("Compute backend"))
-        backendSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                BackendType.values().map { it.name }
-            )
-            setSelection(BackendType.values().indexOf(BackendType.GPU))
-        }
-        root.addView(backendSpinner)
-
-        root.addView(labelView("Quantization"))
-        quantSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                QuantizationType.values().map { it.name }
-            )
-            setSelection(QuantizationType.values().indexOf(QuantizationType.W4A32))
-        }
-        root.addView(quantSpinner)
-
-        root.addView(labelView("Model path"))
-        modelPathField = EditText(this).apply {
-            hint = "Absolute path to the model file/dir"
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-        }
-        root.addView(modelPathField)
-
-        // Keep the model-path field in sync with the current (model,
-        // quantization) selection so a single Load click works without
-        // the user having to type a path manually. The user can still
-        // edit the field after the fact — a subsequent spinner change
-        // will just overwrite it with the new default.
-        val pathSyncListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(
-                parent: AdapterView<*>?, view: View?, position: Int, id: Long
-            ) {
-                modelPathField.setText(defaultModelPathFor(selectedModelId(), selectedQuant()))
+        // Light/dark toggle button.
+        val toggle = TextView(this).apply {
+            text = if (darkMode) "☀" else "☾"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(t.onSurfaceVar)
+            background = solid(t.surfaceContainer, 20)
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+            setOnClickListener {
+                darkMode = !darkMode
+                rebuildUi()
             }
-            override fun onNothingSelected(parent: AdapterView<*>?) { /* no-op */ }
         }
-        modelSpinner.onItemSelectedListener = pathSyncListener
-        quantSpinner.onItemSelectedListener = pathSyncListener
-        // Seed the field synchronously for the initial selection (the
-        // spinner listeners fire asynchronously after setContentView).
-        modelPathField.setText(defaultModelPathFor(selectedModelId(), selectedQuant()))
+        row.addView(toggle)
+        return row
+    }
 
-        val loadBtn = Button(this).apply {
-            text = "Load model"
-            setOnClickListener { onLoadClicked() }
+    private fun buildHeroCard(t: M3Tokens): View {
+        val tone = statusTone()
+        val (bgColor, dotColor, fgColor) = when (tone) {
+            "error"    -> Triple(t.errorContainer,   t.error,   t.error)
+            "success"  -> Triple(t.successContainer, t.success, t.success)
+            "progress" -> Triple(t.primaryContainer, t.primary, t.onPrimaryContainer)
+            else       -> Triple(t.surfaceContainer, t.outline, t.onSurfaceVar)
         }
-        root.addView(loadBtn)
-
-        root.addView(labelView("Prompt"))
-        promptField = EditText(this).apply {
-            hint = "Type a prompt…"
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-            setText("What is rainbow")
+        val outer = FrameLayout(this).apply {
+            setPadding(dp(12), 0, dp(12), dp(12))
         }
-        root.addView(promptField)
-
-        // --- Image picker (multimodal, GEMMA4 only) -------------------
-        // Not hidden for non-GEMMA4 models on purpose — tapping Run
-        // with a selected image against a text-only engine exercises
-        // the UNSUPPORTED default in QuickDotAI.runMultimodal, which
-        // is a useful smoke test of that error path too.
-        root.addView(labelView("Image input (for GEMMA4 multimodal)"))
-        imageStatusView = TextView(this).apply {
-            text = "Image: none"
-            textSize = 13f
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = solid(bgColor, 20)
+            layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
         }
-        root.addView(imageStatusView)
-
-        val pickImageBtn = Button(this).apply {
-            text = "Pick image"
-            setOnClickListener { onPickImageClicked() }
+        // Status indicator dot.
+        val dot = View(this).apply {
+            background = circle(dotColor)
+            layoutParams = LinearLayout.LayoutParams(dp(10), dp(10))
         }
-        root.addView(pickImageBtn)
-
-        val clearImageBtn = Button(this).apply {
-            text = "Clear image"
-            setOnClickListener { onClearImageClicked() }
-        }
-        root.addView(clearImageBtn)
-
-        val runBtn = Button(this).apply {
-            text = "Run (streaming)"
-            setOnClickListener { onRunClicked() }
-        }
-        root.addView(runBtn)
-
-        val cancelBtn = Button(this).apply {
-            text = "Cancel"
-            setOnClickListener { onCancelClicked() }
-        }
-        root.addView(cancelBtn)
-
-        val metricsBtn = Button(this).apply {
-            text = "Fetch metrics"
-            setOnClickListener { onMetricsClicked() }
-        }
-        root.addView(metricsBtn)
-
-        val unloadBtn = Button(this).apply {
-            text = "Unload"
-            setOnClickListener { onUnloadClicked() }
-        }
-        root.addView(unloadBtn)
-
-        // ============================================================
-        // Chat Session Test Section
-        // ============================================================
-        root.addView(dividerView())
-
-        val chatTitle = TextView(this).apply {
-            text = "Chat Session Test"
-            textSize = 18f
-            setPadding(0, pad / 2, 0, 0)
-        }
-        root.addView(chatTitle)
-
-        val chatSubtitle = TextView(this).apply {
-            text = "Tests openChatSession / run / cancel / rebuild / close"
-            textSize = 12f
-            setPadding(0, 0, 0, pad / 4)
-        }
-        root.addView(chatSubtitle)
-
-        chatSessionStatusView = TextView(this).apply {
-            text = "Session: none"
-            textSize = 13f
-            setPadding(0, 0, 0, pad / 4)
-        }
-        root.addView(chatSessionStatusView)
-
-        // System prompt (maps to ConversationConfig.systemInstruction)
-        root.addView(labelView("System prompt (optional)"))
-        chatSystemPromptField = EditText(this).apply {
-            hint = "e.g. You are a helpful assistant."
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-        }
-        root.addView(chatSystemPromptField)
-
-        // Sampling config (all optional; specifying any of
-        // temperature/topK/topP forces the wrapper to supply all three,
-        // falling back to temperature=1.0 / topK=40 / topP=0.95 for
-        // unspecified fields — see LiteRTLmChatSession.buildSamplerConfig).
-        root.addView(labelView("Temperature (optional, ≥ 0)"))
-        chatTemperatureField = EditText(this).apply {
-            hint = "e.g. 0.7"
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
-                android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-        }
-        root.addView(chatTemperatureField)
-
-        root.addView(labelView("topK (optional, > 0)"))
-        chatTopKField = EditText(this).apply {
-            hint = "e.g. 40"
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-        }
-        root.addView(chatTopKField)
-
-        root.addView(labelView("topP (optional, 0..1)"))
-        chatTopPField = EditText(this).apply {
-            hint = "e.g. 0.95"
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
-                android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-        }
-        root.addView(chatTopPField)
-
-        root.addView(labelView("seed (optional, 0 = nondeterministic)"))
-        chatSeedField = EditText(this).apply {
-            hint = "e.g. 42"
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
-                android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-        }
-        root.addView(chatSeedField)
-
-        root.addView(labelView("enable_thinking"))
-        chatEnableThinkingSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                listOf("default (null)", "true", "false")
-            )
-        }
-        root.addView(chatEnableThinkingSpinner)
-
-        val chatOpenBtn = Button(this).apply {
-            text = "Open Chat Session"
-            setOnClickListener { onChatOpenClicked() }
-        }
-        root.addView(chatOpenBtn)
-
-        root.addView(labelView("Chat message"))
-        chatPromptField = EditText(this).apply {
-            hint = "Type a chat message…"
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-        }
-        root.addView(chatPromptField)
-
-        val chatRunBtn = Button(this).apply {
-            text = "Chat Send (streaming)"
-            setOnClickListener { onChatRunStreamingClicked() }
-        }
-        root.addView(chatRunBtn)
-
-        val chatRunBlockingBtn = Button(this).apply {
-            text = "Chat Send (blocking)"
-            setOnClickListener { onChatRunBlockingClicked() }
-        }
-        root.addView(chatRunBlockingBtn)
-
-        val chatCancelBtn = Button(this).apply {
-            text = "Chat Cancel"
-            setOnClickListener { onChatCancelClicked() }
-        }
-        root.addView(chatCancelBtn)
-
-        val chatRebuildBtn = Button(this).apply {
-            text = "Chat Rebuild (clear history)"
-            setOnClickListener { onChatRebuildClicked() }
-        }
-        root.addView(chatRebuildBtn)
-
-        val chatCloseBtn = Button(this).apply {
-            text = "Chat Close Session"
-            setOnClickListener { onChatCloseClicked() }
-        }
-        root.addView(chatCloseBtn)
-
-        // ============================================================
-        // OpenAI-Style Messages Input Section
-        // ============================================================
-        root.addView(dividerView())
-
-        val openAITitle = TextView(this).apply {
-            text = "OpenAI-Style Messages Input"
-            textSize = 18f
-            setPadding(0, pad / 2, 0, 0)
-        }
-        root.addView(openAITitle)
-
-        val openAISubtitle = TextView(this).apply {
-            text = "Parse OpenAI-style JSON messages array and run chat"
-            textSize = 12f
-            setPadding(0, 0, 0, pad / 4)
-        }
-        root.addView(openAISubtitle)
-
-        root.addView(labelView("Messages JSON (OpenAI format)"))
-        openAIMessagesField = EditText(this).apply {
-            hint = """[{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]"""
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-            minLines = 4
-            maxLines = 10
-            setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
-            textSize = 12f
-            // Pre-fill with a role-interleaved example that exercises
-            // LiteRT-LM's native chat template (multiple SYSTEM turns).
-            setText("""[
-  {"role": "system", "content": "You are a helpful assistant."},
-  {"role": "user", "content": "Hello!"},
-  {"role": "assistant", "content": "Hi! How can I help?"},
-  {"role": "system", "content": "Answer in one short sentence."},
-  {"role": "user", "content": "Write a short joke about saving RAM."}
-]""")
-        }
-        root.addView(openAIMessagesField)
-
-        val openAIRunBtn = Button(this).apply {
-            text = "Run OpenAI Messages (streaming)"
-            setOnClickListener { onOpenAIMessagesRunClicked() }
-        }
-        root.addView(openAIRunBtn)
-
-        val openAIRunBlockingBtn = Button(this).apply {
-            text = "Run OpenAI Messages (blocking)"
-            setOnClickListener { onOpenAIMessagesRunBlockingClicked() }
-        }
-        root.addView(openAIRunBlockingBtn)
+        card.addView(dot)
+        spacerH(card, 10)
 
         statusView = TextView(this).apply {
-            text = "Idle."
-            setPadding(0, pad / 2, 0, 0)
+            text = statusText
+            setTextColor(fgColor)
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            maxLines = 1
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
         }
-        root.addView(statusView)
+        card.addView(statusView)
 
-        outputView = TextView(this).apply {
-            text = ""
-            setPadding(0, pad / 2, 0, 0)
-            setTextIsSelectable(true)
+        if (streaming) {
+            val stop = TextView(this).apply {
+                text = "■  Stop"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                background = solid(t.error, 100)
+                setPadding(dp(12), dp(6), dp(12), dp(6))
+                setOnClickListener { onCancelClicked() }
+            }
+            card.addView(stop)
         }
-        root.addView(outputView)
-
-        scrollRoot.addView(root)
-        setContentView(scrollRoot)
+        outer.addView(card)
+        return outer
     }
+
+    private fun buildTabBar(t: M3Tokens): View {
+        val outer = FrameLayout(this).apply {
+            setPadding(dp(12), 0, dp(12), dp(10))
+        }
+        val pill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = solid(t.surfaceContainer, 100)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+            layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+        }
+        val tabs = listOf("run" to "▶ Run", "chat" to "⌬ Chat",
+                          "openai" to "{ } OpenAI", "metrics" to "▤ Metrics")
+        for ((idx, entry) in tabs.withIndex()) {
+            val (key, label) = entry
+            val active = key == selectedTab
+            val tab = TextView(this).apply {
+                text = label
+                gravity = Gravity.CENTER
+                textSize = 13f
+                typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                setTextColor(if (active) t.onPrimary else t.onSurfaceVar)
+                background = if (active) solid(t.primary, 100) else null
+                setPadding(dp(6), dp(10), dp(6), dp(10))
+                layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).also {
+                    if (idx > 0) it.leftMargin = dp(4)
+                }
+                setOnClickListener {
+                    selectedTab = key
+                    rebuildUi()
+                }
+            }
+            pill.addView(tab)
+        }
+        outer.addView(pill)
+        return outer
+    }
+
+    private fun buildModelSection(t: M3Tokens): View {
+        val subtitle = if (loadStatus == "loaded")
+            "$loadedLabel  ·  ${selectedBackend.name}"
+        else
+            "${selectedModel.name}  ·  ${selectedBackend.name}  ·  ${selectedQuant.name}"
+        val statusDotColor = when (loadStatus) {
+            "loaded"  -> t.success
+            "loading" -> t.primary
+            else      -> t.outline
+        }
+        val card = collapsibleCard(
+            t = t,
+            iconGlyph = "▦",
+            iconBg = t.primaryContainer,
+            iconFg = t.onPrimaryContainer,
+            title = "Model",
+            subtitle = subtitle,
+            rightAdornment = View(this).apply {
+                background = circle(statusDotColor)
+                layoutParams = LinearLayout.LayoutParams(dp(10), dp(10)).also {
+                    it.rightMargin = dp(4)
+                }
+            },
+            expanded = modelExpanded,
+            onToggle = {
+                modelExpanded = !modelExpanded
+                rebuildUi()
+            }
+        ) { body ->
+            // MODEL select.
+            body.addView(labelView(t, "MODEL"))
+            val modelRow = TextView(this).apply {
+                text = badgePlusLabel(selectedModel)
+                setTextColor(t.onSurface)
+                textSize = 14f
+                typeface = Typeface.MONOSPACE
+                background = solid(t.surfaceContainer, 12)
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                gravity = Gravity.CENTER_VERTICAL
+                setCompoundDrawablesWithIntrinsicBounds(null, null, null, null)
+                setOnClickListener {
+                    val popup = PopupMenu(this@MainActivity, this)
+                    ModelId.values().forEachIndexed { i, m -> popup.menu.add(0, i, i, badgePlusLabel(m)) }
+                    popup.setOnMenuItemClickListener { item ->
+                        selectedModel = ModelId.values()[item.itemId]
+                        modelPathText = defaultModelPathFor(selectedModel, selectedQuant)
+                        rebuildUi(); true
+                    }
+                    popup.show()
+                }
+            }
+            body.addView(modelRow)
+            spacer(body, 12)
+
+            // BACKEND chip group.
+            body.addView(labelView(t, "COMPUTE BACKEND"))
+            body.addView(chipRow(t, BackendType.values().map { it.name },
+                selectedBackend.name) { picked ->
+                selectedBackend = BackendType.valueOf(picked)
+                rebuildUi()
+            })
+            spacer(body, 12)
+
+            // QUANT chip group.
+            body.addView(labelView(t, "QUANTIZATION"))
+            body.addView(chipRow(t, QuantizationType.values().map { it.name },
+                selectedQuant.name) { picked ->
+                selectedQuant = QuantizationType.valueOf(picked)
+                modelPathText = defaultModelPathFor(selectedModel, selectedQuant)
+                rebuildUi()
+            })
+            spacer(body, 12)
+
+            // MODEL PATH.
+            body.addView(labelView(t, "MODEL PATH"))
+            modelPathField = roundedEditText(t, modelPathText, mono = true,
+                onTextChange = { modelPathText = it })
+            body.addView(modelPathField)
+            spacer(body, 12)
+
+            // Load / Unload action row.
+            val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val loadLabel = if (loadStatus == "loaded") "↻  Reload model" else "↓  Load model"
+            actions.addView(filledButton(t, loadLabel, fill = "horizontal") { onLoadClicked() })
+            if (loadStatus == "loaded") {
+                spacerH(actions, 8)
+                actions.addView(tonalButton(t, "✕  Unload", danger = true) { onUnloadClicked() })
+            }
+            body.addView(actions)
+        }
+        return card
+    }
+
+    private fun buildRunTab(t: M3Tokens): View {
+        val card = roundedCard(t, t.surfaceContainer)
+        val header = sectionHeader(t, "⚡", t.secondaryContainer, t.onSurface,
+            "One-shot run", "Raw prompt · streaming output")
+        card.addView(header)
+        spacer(card, 14)
+
+        // PROMPT.
+        card.addView(labelView(t, "PROMPT"))
+        promptField = roundedEditText(t, promptText, multiline = true, mono = true, rows = 5,
+            onTextChange = { promptText = it })
+        card.addView(promptField)
+        spacer(card, 14)
+
+        // IMAGE INPUT.
+        val imgLabelRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        imgLabelRow.addView(labelView(t, "IMAGE INPUT").also {
+            it.layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+        })
+        if (selectedModel != ModelId.GEMMA4) {
+            spacerH(imgLabelRow, 6)
+            val badge = TextView(this).apply {
+                text = "GEMMA4 only"
+                setTextColor(t.tertiary)
+                textSize = 10f
+                typeface = Typeface.DEFAULT_BOLD
+                background = solid(t.tertiaryContainer, 4)
+                setPadding(dp(6), dp(1), dp(6), dp(1))
+            }
+            imgLabelRow.addView(badge)
+        }
+        card.addView(imgLabelRow)
+        spacer(card, 6)
+
+        if (selectedImageBytes != null) {
+            val attached = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = solid(t.surfaceContainerHigh, 12)
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+            }
+            val thumb = TextView(this).apply {
+                text = "🖼"
+                setTextColor(t.onSurface)
+                textSize = 22f
+                gravity = Gravity.CENTER
+                background = gradient(
+                    blendAlpha(t.primary, 0x55),
+                    blendAlpha(t.tertiary, 0x55), 8
+                )
+                layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
+            }
+            attached.addView(thumb)
+            spacerH(attached, 10)
+            val info = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+            }
+            info.addView(TextView(this).apply {
+                text = "Selected image"
+                setTextColor(t.onSurface)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+            })
+            info.addView(TextView(this).apply {
+                text = "${selectedImageBytes!!.size} bytes  ·  raw bytes ready"
+                setTextColor(t.onSurfaceVar)
+                textSize = 11f
+                typeface = Typeface.MONOSPACE
+            })
+            attached.addView(info)
+            val close = TextView(this).apply {
+                text = "✕"
+                setTextColor(t.onSurfaceVar)
+                gravity = Gravity.CENTER
+                textSize = 14f
+                layoutParams = LinearLayout.LayoutParams(dp(32), dp(32))
+                setOnClickListener { onClearImageClicked(); rebuildUi() }
+            }
+            attached.addView(close)
+            card.addView(attached)
+            // Keep the legacy imageStatusView reference happy — it is
+            // touched by onClearImageClicked / readImageBytesAsync.
+            imageStatusView = TextView(this).apply { visibility = View.GONE }
+        } else {
+            val dropzone = TextView(this).apply {
+                text = "+  Pick image for multimodal run"
+                setTextColor(t.onSurfaceVar)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                background = dashedBg(t)
+                setPadding(dp(14), dp(14), dp(14), dp(14))
+                setOnClickListener { onPickImageClicked() }
+            }
+            card.addView(dropzone)
+            imageStatusView = TextView(this).apply { visibility = View.GONE }
+        }
+        spacer(card, 14)
+
+        // RUN button.
+        val runLabel = when {
+            streaming -> "■  Stop streaming"
+            selectedImageBytes != null -> "▶  Run multimodal (streaming)"
+            else -> "▶  Run (streaming)"
+        }
+        val runBtn = filledButton(t, runLabel, fill = "vertical",
+            danger = streaming) {
+            if (streaming) onCancelClicked() else onRunClicked()
+        }
+        card.addView(runBtn)
+        return card
+    }
+
+    private fun buildChatTab(t: M3Tokens): View {
+        val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        // ── Model Selection Card ──
+        val modelCard = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = solid(t.surfaceContainer, 20)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+        }
+        val active = sessionIdText != null
+        val modelIcon = TextView(this).apply {
+            text = "▦"
+            gravity = Gravity.CENTER
+            textSize = 18f
+            setTextColor(if (active) t.success else t.onSurfaceVar)
+            background = solid(if (active) t.successContainer else t.surfaceContainerHigh, 10)
+            layoutParams = LinearLayout.LayoutParams(dp(38), dp(38))
+        }
+        modelCard.addView(modelIcon)
+        spacerH(modelCard, 12)
+
+        val modelDropdown = TextView(this).apply {
+            text = badgePlusLabel(chatSelectedModel)
+            setTextColor(t.onSurface)
+            textSize = 14f
+            typeface = Typeface.MONOSPACE
+            background = solid(t.surfaceContainerHigh, 12)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+            setOnClickListener {
+                val popup = PopupMenu(this@MainActivity, this)
+                ModelId.values().forEachIndexed { i, m ->
+                    popup.menu.add(0, i, i, badgePlusLabel(m))
+                }
+                popup.setOnMenuItemClickListener { item ->
+                    chatSelectedModel = ModelId.values()[item.itemId]
+                    rebuildUi()
+                    true
+                }
+                popup.show()
+            }
+        }
+        modelCard.addView(modelDropdown)
+
+        if (active) {
+            chatSessionStatusView = TextView(this).apply {
+                text = "${sessionIdText!!.take(8)}…"
+                setTextColor(t.success)
+                textSize = 12f
+                typeface = Typeface.MONOSPACE
+            }
+            spacerH(modelCard, 8)
+            modelCard.addView(chatSessionStatusView)
+            spacerH(modelCard, 6)
+            modelCard.addView(tonalButton(t, "✕ Close", danger = true) { onChatCloseClicked() })
+        } else {
+            spacerH(modelCard, 8)
+            modelCard.addView(filledButton(t, "+ Open") { onChatOpenClicked() })
+        }
+        container.addView(modelCard)
+        spacer(container, 10)
+
+        // ── Collapsible session config ──
+        val configCard = collapsibleCard(
+            t = t,
+            iconGlyph = "⚙",
+            iconBg = t.tertiaryContainer,
+            iconFg = t.tertiary,
+            title = "Session config",
+            subtitle = "System prompt · sampling · thinking mode",
+            rightAdornment = null,
+            expanded = samplingExpanded,
+            onToggle = {
+                samplingExpanded = !samplingExpanded
+                rebuildUi()
+            }
+        ) { body ->
+            body.addView(labelView(t, "SYSTEM PROMPT"))
+            chatSystemPromptField = roundedEditText(t, systemPromptText,
+                multiline = true, rows = 2,
+                placeholder = "You are a helpful assistant.",
+                onTextChange = { systemPromptText = it })
+            body.addView(chatSystemPromptField)
+            spacer(body, 10)
+
+            // 2x2 grid of numeric fields.
+            val grid1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            chatTemperatureField = roundedEditText(t, temperatureText, mono = true, numeric = true,
+                placeholder = "0.7", onTextChange = { temperatureText = it })
+            chatTopKField = roundedEditText(t, topKText, mono = true, numeric = true,
+                placeholder = "40", onTextChange = { topKText = it })
+            grid1.addView(labeledColumn(t, "TEMPERATURE", chatTemperatureField, weight = 1f))
+            spacerH(grid1, 10)
+            grid1.addView(labeledColumn(t, "TOP_K", chatTopKField, weight = 1f))
+            body.addView(grid1)
+            spacer(body, 10)
+
+            val grid2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            chatTopPField = roundedEditText(t, topPText, mono = true, numeric = true,
+                placeholder = "0.95", onTextChange = { topPText = it })
+            chatSeedField = roundedEditText(t, seedText, mono = true, numeric = true,
+                placeholder = "random", onTextChange = { seedText = it })
+            grid2.addView(labeledColumn(t, "TOP_P", chatTopPField, weight = 1f))
+            spacerH(grid2, 10)
+            grid2.addView(labeledColumn(t, "SEED", chatSeedField, weight = 1f))
+            body.addView(grid2)
+            spacer(body, 12)
+
+            body.addView(labelView(t, "ENABLE_THINKING"))
+            body.addView(chipRow(t, listOf("default", "true", "false"),
+                thinkingChoice) { picked ->
+                thinkingChoice = picked
+                rebuildUi()
+            })
+        }
+        container.addView(configCard)
+        spacer(container, 10)
+
+        // ── Composer ──
+        val composer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = solid(t.surfaceContainer, 20)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+        }
+        composer.addView(labelView(t, "CHAT MESSAGE"))
+        spacer(composer, 6)
+        val composerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = solid(t.surfaceContainerHigh, 24)
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+        }
+        chatPromptField = EditText(this).apply {
+            setText(chatPromptText)
+            hint = "Type a chat message…"
+            setHintTextColor(t.onSurfaceVar)
+            setTextColor(t.onSurface)
+            textSize = 14f
+            background = null
+            minLines = 2
+            maxLines = 6
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+            addTextChangedListener(simpleWatcher { chatPromptText = it })
+        }
+        composerRow.addView(chatPromptField)
+
+        val canSend = sessionIdText != null && !streaming
+        val sendFab = TextView(this).apply {
+            text = "▶"
+            gravity = Gravity.CENTER
+            textSize = 18f
+            setTextColor(if (canSend) t.onPrimary else t.onSurfaceVar)
+            background = solid(if (canSend) t.primary else t.outlineVariant, 22)
+            layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).also {
+                it.bottomMargin = dp(2); it.rightMargin = dp(2)
+            }
+            isEnabled = canSend
+            setOnClickListener { onChatRunStreamingClicked() }
+        }
+        composerRow.addView(sendFab)
+        composer.addView(composerRow)
+        container.addView(composer)
+        return container
+    }
+
+    private fun buildOpenAiTab(t: M3Tokens): View {
+        val card = roundedCard(t, t.surfaceContainer)
+        card.addView(sectionHeader(t, "{ }", t.secondaryContainer, t.onSurface,
+            "OpenAI messages",
+            "Role-interleaved array · forwarded to chat template"))
+        spacer(card, 12)
+
+        // Parsed preview.
+        var parseErr: String? = null
+        val parsed: List<QuickAiChatMessage>? = try {
+            parseOpenAIMessages(openAiJsonText)
+        } catch (e: Throwable) { parseErr = e.message; null }
+
+        if (parsed != null) {
+            val previewWrap = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = solid(t.surfaceContainerHigh, 16)
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+            }
+            for (msg in parsed) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.TOP
+                    setPadding(0, dp(3), 0, dp(3))
+                }
+                val (badgeBg, badgeFg, badgeLabel) = when (msg.role) {
+                    QuickAiChatRole.SYSTEM    -> Triple(t.tertiaryContainer, t.tertiary, "SYSTEM")
+                    QuickAiChatRole.USER      -> Triple(t.primaryContainer,  t.onPrimaryContainer, "USER")
+                    QuickAiChatRole.ASSISTANT -> Triple(t.secondaryContainer, t.onSurface, "ASSISTANT")
+                }
+                val badge = TextView(this).apply {
+                    text = badgeLabel
+                    setTextColor(badgeFg)
+                    textSize = 10f
+                    typeface = Typeface.MONOSPACE
+                    gravity = Gravity.CENTER
+                    background = solid(badgeBg, 100)
+                    setPadding(dp(8), dp(2), dp(8), dp(2))
+                    layoutParams = LinearLayout.LayoutParams(dp(80), WRAP_CONTENT)
+                }
+                row.addView(badge)
+                spacerH(row, 8)
+                val content = TextView(this).apply {
+                    val txtPart = msg.parts.firstOrNull() as? PromptPart.Text
+                    text = txtPart?.text ?: ""
+                    setTextColor(t.onSurface)
+                    textSize = 13f
+                    layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+                }
+                row.addView(content)
+                previewWrap.addView(row)
+            }
+            card.addView(previewWrap)
+            spacer(card, 12)
+        }
+        if (parseErr != null) {
+            val errBox = TextView(this).apply {
+                text = "ⓘ  $parseErr"
+                setTextColor(t.error)
+                textSize = 12f
+                typeface = Typeface.MONOSPACE
+                background = solid(t.errorContainer, 10)
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+            }
+            card.addView(errBox)
+            spacer(card, 12)
+        }
+
+        card.addView(labelView(t, "MESSAGES JSON"))
+        openAIMessagesField = roundedEditText(t, openAiJsonText, multiline = true, mono = true, rows = 8,
+            onTextChange = {
+                val same = it == openAiJsonText
+                openAiJsonText = it
+                // Re-render the preview so role pills track edits live.
+                if (!same) rebuildUi()
+            })
+        card.addView(openAIMessagesField)
+        spacer(card, 12)
+
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val runBtn = filledButton(t, "▶  Run (streaming)", fill = "horizontal") {
+            onOpenAIMessagesRunClicked()
+        }.apply { isEnabled = !streaming && parseErr == null }
+        actions.addView(runBtn)
+        spacerH(actions, 8)
+        val blockingBtn = tonalButton(t, "Blocking") {
+            onOpenAIMessagesRunBlockingClicked()
+        }.apply { isEnabled = !streaming && parseErr == null }
+        actions.addView(blockingBtn)
+        card.addView(actions)
+        return card
+    }
+
+    private fun buildMetricsTab(t: M3Tokens): View {
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val m = lastMetrics
+        if (m == null) {
+            val empty = roundedCard(t, t.surfaceContainer).apply {
+                gravity = Gravity.CENTER
+                setPadding(dp(20), dp(32), dp(20), dp(32))
+            }
+            val icon = TextView(this).apply {
+                text = "▤"
+                gravity = Gravity.CENTER
+                textSize = 28f
+                setTextColor(t.onSurfaceVar)
+                background = solid(t.surfaceContainerHigh, 28)
+                layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).also {
+                    it.bottomMargin = dp(12); it.gravity = Gravity.CENTER_HORIZONTAL
+                }
+            }
+            empty.addView(icon)
+            empty.addView(TextView(this).apply {
+                text = "No metrics yet"
+                setTextColor(t.onSurface)
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            })
+            empty.addView(TextView(this).apply {
+                text = "Run a prompt and tap Fetch metrics in the Run tab to populate counters."
+                setTextColor(t.onSurfaceVar)
+                textSize = 13f
+                gravity = Gravity.CENTER
+                setPadding(0, dp(4), 0, 0)
+            })
+            spacer(empty, 12)
+            empty.addView(filledButton(t, "Fetch metrics", fill = "vertical") { onMetricsClicked() })
+            column.addView(empty)
+            return column
+        }
+
+        val tps = if (m.generationDurationMs > 0)
+            String.format("%.1f", m.generationTokens / (m.generationDurationMs / 1000.0))
+        else "—"
+        val ttft = String.format("%.0f", m.prefillDurationMs)
+
+        // Big stat tile: tokens/sec.
+        column.addView(metricTile(t, "TOKENS PER SECOND", tps, "tok/s", big = true))
+        spacer(column, 10)
+
+        val grid = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        grid.addView(metricTile(t, "TTFT", ttft, "ms", weight = 1f))
+        spacerH(grid, 10)
+        grid.addView(metricTile(t, "TOTAL", String.format("%.2f", m.totalDurationMs / 1000.0), "s", weight = 1f))
+        column.addView(grid)
+        spacer(column, 10)
+
+        val grid2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        grid2.addView(metricTile(t, "PREFILL TOKENS", m.prefillTokens.toString(), "tok", weight = 1f))
+        spacerH(grid2, 10)
+        grid2.addView(metricTile(t, "GEN TOKENS", m.generationTokens.toString(), "tok", weight = 1f))
+        column.addView(grid2)
+        spacer(column, 10)
+
+        val grid3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        grid3.addView(metricTile(t, "INIT", String.format("%.0f", m.initializationDurationMs), "ms", weight = 1f))
+        spacerH(grid3, 10)
+        grid3.addView(metricTile(t, "PEAK MEMORY",
+            String.format("%.1f", m.peakMemoryKb / 1024.0), "MB", weight = 1f))
+        column.addView(grid3)
+        spacer(column, 10)
+
+        // Prefill ▸ Gen bar.
+        val barCard = roundedCard(t, t.surfaceContainer)
+        barCard.addView(TextView(this).apply {
+            text = "PREFILL ▸ GENERATION"
+            setTextColor(t.onSurfaceVar)
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(10))
+        })
+        val total = (m.totalDurationMs).coerceAtLeast(1.0)
+        val prefillFrac = (m.prefillDurationMs / total).coerceIn(0.0, 1.0).toFloat()
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = solid(t.surfaceContainerHigh, 4)
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(8))
+        }
+        bar.addView(View(this).apply {
+            background = solid(t.tertiary, 0)
+            layoutParams = LinearLayout.LayoutParams(0, MATCH_PARENT, prefillFrac)
+        })
+        bar.addView(View(this).apply {
+            background = solid(t.primary, 0)
+            layoutParams = LinearLayout.LayoutParams(0, MATCH_PARENT, 1f - prefillFrac)
+        })
+        barCard.addView(bar)
+        spacer(barCard, 8)
+        val barLegend = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        barLegend.addView(TextView(this).apply {
+            text = "● prefill ${ttft}ms"
+            setTextColor(t.tertiary)
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+        })
+        barLegend.addView(TextView(this).apply {
+            text = "● gen ${String.format("%.0f", m.generationDurationMs)}ms"
+            setTextColor(t.primary)
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            gravity = Gravity.RIGHT
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+        })
+        barCard.addView(barLegend)
+        column.addView(barCard)
+        spacer(column, 10)
+        column.addView(tonalButton(t, "↻  Refresh metrics") { onMetricsClicked() })
+        return column
+    }
+
+    private fun buildOutputPanel(t: M3Tokens): View {
+        val wrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = solid(t.codeBg, 20)
+        }
+        // Title bar with macOS-style traffic-light dots.
+        val titleBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+        val dotRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for (color in intArrayOf(0xFFFF5F57.toInt(), 0xFFFEBC2E.toInt(), 0xFF28C840.toInt())) {
+            val d = View(this).apply {
+                background = circle(color)
+                layoutParams = LinearLayout.LayoutParams(dp(10), dp(10)).also {
+                    it.rightMargin = dp(4)
+                }
+            }
+            dotRow.addView(d)
+        }
+        titleBar.addView(dotRow)
+        titleBar.addView(TextView(this).apply {
+            text = "output  ·  stream.kt"
+            setTextColor(0x80FFFFFF.toInt())
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+        })
+        val copy = TextView(this).apply {
+            text = "📋"
+            setTextColor(0x80FFFFFF.toInt())
+            gravity = Gravity.CENTER
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(dp(24), dp(24))
+            setOnClickListener {
+                if (outputText.isNotEmpty()) {
+                    val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    val clip = ClipData.newPlainText("output", outputText)
+                    clipboard.setPrimaryClip(clip)
+                }
+            }
+        }
+        titleBar.addView(copy)
+        spacerH(titleBar, 8)
+        val clear = TextView(this).apply {
+            text = "🗑"
+            setTextColor(0x80FFFFFF.toInt())
+            gravity = Gravity.CENTER
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(dp(24), dp(24))
+            setOnClickListener {
+                outputText = ""
+                outputView.text = ""
+            }
+        }
+        titleBar.addView(clear)
+        wrap.addView(titleBar)
+        wrap.addView(View(this).apply {
+            setBackgroundColor(0x10FFFFFF)
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 1)
+        })
+
+        outputScrollView = NestedScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(220))
+        }
+        outputView = TextView(this).apply {
+            text = if (outputText.isEmpty())
+                "// streaming output appears here…" else outputText
+            setTextColor(if (outputText.isEmpty()) 0x4DFFFFFF else 0xFFEDE7F6.toInt())
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+        }
+        outputScrollView.addView(outputView)
+        wrap.addView(outputScrollView)
+        return wrap
+    }
+
+    /* ════════════════════════════════════════════════════════════════
+     * Reusable UI primitives (drawables, buttons, fields, chips, …)
+     * ════════════════════════════════════════════════════════════════ */
+
+    private fun roundedCard(t: M3Tokens, color: Int): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = solid(color, 20)
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+        }
+    }
+
+    private fun collapsibleCard(
+        t: M3Tokens,
+        iconGlyph: String, iconBg: Int, iconFg: Int,
+        title: String, subtitle: String,
+        rightAdornment: View?,
+        expanded: Boolean,
+        onToggle: () -> Unit,
+        body: (LinearLayout) -> Unit,
+    ): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = strokedSolid(t.surface, 24, t.outlineVariant, 1)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+        // Header row.
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+            isClickable = true
+            setOnClickListener { onToggle() }
+        }
+        val iconBox = TextView(this).apply {
+            text = iconGlyph
+            gravity = Gravity.CENTER
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(iconFg)
+            background = solid(iconBg, 10)
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36))
+        }
+        header.addView(iconBox)
+        spacerH(header, 12)
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+        }
+        titleCol.addView(TextView(this).apply {
+            text = title
+            setTextColor(t.onSurface)
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        titleCol.addView(TextView(this).apply {
+            text = subtitle
+            setTextColor(t.onSurfaceVar)
+            textSize = 12f
+        })
+        header.addView(titleCol)
+        if (rightAdornment != null) header.addView(rightAdornment)
+        header.addView(TextView(this).apply {
+            text = if (expanded) "▲" else "▼"
+            setTextColor(t.onSurfaceVar)
+            textSize = 12f
+            setPadding(dp(6), 0, 0, 0)
+        })
+        card.addView(header)
+        if (expanded) {
+            val bodyContainer = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(4), dp(12), dp(4), dp(4))
+            }
+            body(bodyContainer)
+            card.addView(bodyContainer)
+        }
+        return card
+    }
+
+    private fun sectionHeader(
+        t: M3Tokens, glyph: String, iconBg: Int, iconFg: Int,
+        title: String, subtitle: String
+    ): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val icon = TextView(this).apply {
+            text = glyph
+            gravity = Gravity.CENTER
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(iconFg)
+            background = solid(iconBg, 10)
+            layoutParams = LinearLayout.LayoutParams(dp(32), dp(32))
+        }
+        row.addView(icon)
+        spacerH(row, 8)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(TextView(this).apply {
+            text = title
+            setTextColor(t.onSurface)
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        col.addView(TextView(this).apply {
+            text = subtitle
+            setTextColor(t.onSurfaceVar)
+            textSize = 12f
+        })
+        row.addView(col)
+        return row
+    }
+
+    private fun labelView(t: M3Tokens, text: String): TextView = TextView(this).apply {
+        this.text = text
+        setTextColor(t.onSurfaceVar)
+        textSize = 12f
+        typeface = Typeface.DEFAULT_BOLD
+        setPadding(dp(4), 0, 0, dp(6))
+    }
+
+    private fun roundedEditText(
+        t: M3Tokens, value: String,
+        multiline: Boolean = false,
+        mono: Boolean = false,
+        numeric: Boolean = false,
+        rows: Int = 1,
+        placeholder: String? = null,
+        onTextChange: (String) -> Unit,
+    ): EditText {
+        val baseBg = strokedSolid(t.surfaceContainer, 12, Color.TRANSPARENT, 0)
+        val focusBg = strokedSolid(t.surfaceContainer, 12, t.primary, 2)
+        val field = EditText(this).apply {
+            setText(value)
+            if (placeholder != null) {
+                hint = placeholder
+                setHintTextColor(t.onSurfaceVar)
+            }
+            setTextColor(t.onSurface)
+            textSize = 14f
+            background = baseBg
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            if (mono) typeface = Typeface.MONOSPACE
+            if (multiline) {
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                minLines = rows
+                maxLines = rows + 4
+                setHorizontallyScrolling(false)
+                gravity = Gravity.TOP
+            }
+            if (numeric) {
+                inputType = InputType.TYPE_CLASS_NUMBER or
+                    InputType.TYPE_NUMBER_FLAG_DECIMAL or
+                    InputType.TYPE_NUMBER_FLAG_SIGNED
+            }
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+            setOnFocusChangeListener { _, hasFocus ->
+                background = if (hasFocus) focusBg else baseBg
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+            }
+            addTextChangedListener(simpleWatcher(onTextChange))
+        }
+        return field
+    }
+
+    private fun labeledColumn(t: M3Tokens, label: String, field: View, weight: Float): View {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, weight)
+        }
+        col.addView(labelView(t, label))
+        col.addView(field)
+        return col
+    }
+
+    private fun chipRow(t: M3Tokens, options: List<String>, selected: String,
+                        onPick: (String) -> Unit): View {
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+        }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for ((i, opt) in options.withIndex()) {
+            val active = opt == selected
+            val chip = TextView(this).apply {
+                text = if (active) "✓ $opt" else opt
+                setTextColor(if (active) t.onSurface else t.onSurfaceVar)
+                textSize = 13f
+                typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                background = if (active)
+                    solid(t.secondaryContainer, 8)
+                else
+                    strokedSolid(Color.TRANSPARENT, 8, t.outline, 1)
+                setPadding(dp(12), dp(6), dp(12), dp(6))
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).also {
+                    if (i > 0) it.leftMargin = dp(6)
+                }
+                setOnClickListener { onPick(opt) }
+            }
+            row.addView(chip)
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    private fun filledButton(t: M3Tokens, label: String, fill: String? = null,
+                             danger: Boolean = false, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(if (danger) Color.WHITE else t.onPrimary)
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            stateListAnimator = null
+            background = solid(if (danger) t.error else t.primary, 100)
+            setPadding(dp(20), dp(12), dp(20), dp(12))
+            layoutParams = when (fill) {
+                "vertical"   -> LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+                "horizontal" -> LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+                else         -> LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+            }
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun tonalButton(t: M3Tokens, label: String, danger: Boolean = false,
+                            onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(if (danger) t.error else t.onSurface)
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            stateListAnimator = null
+            background = solid(if (danger) t.errorContainer else t.secondaryContainer, 100)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun outlinedButton(t: M3Tokens, label: String,
+                               onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(t.primary)
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            stateListAnimator = null
+            background = strokedSolid(Color.TRANSPARENT, 100, t.outline, 1)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun metricTile(t: M3Tokens, label: String, value: String, unit: String,
+                           big: Boolean = false, weight: Float = 0f): View {
+        val tile = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = solid(if (big) t.primaryContainer else t.surfaceContainer, 20)
+            setPadding(dp(if (big) 20 else 14),
+                       dp(if (big) 20 else 14),
+                       dp(if (big) 20 else 14),
+                       dp(if (big) 20 else 14))
+            layoutParams = if (weight > 0)
+                LinearLayout.LayoutParams(0, WRAP_CONTENT, weight)
+            else
+                LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+        }
+        val fg = if (big) t.onPrimaryContainer else t.onSurface
+        tile.addView(TextView(this).apply {
+            text = label
+            setTextColor(fg and 0x00FFFFFF or (0xB3 shl 24))
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        val valueRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+            setPadding(0, dp(4), 0, 0)
+        }
+        valueRow.addView(TextView(this).apply {
+            text = value
+            setTextColor(fg)
+            textSize = if (big) 38f else 24f
+            typeface = Typeface.MONOSPACE
+        })
+        valueRow.addView(TextView(this).apply {
+            text = " $unit"
+            setTextColor(fg and 0x00FFFFFF or (0x99 shl 24))
+            textSize = if (big) 14f else 11f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(4), 0, 0, dp(if (big) 6 else 3))
+        })
+        tile.addView(valueRow)
+        return tile
+    }
+
+    /* ───── Drawable / dimension helpers ───── */
+
+    private fun solid(color: Int, radiusDp: Int): GradientDrawable = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dpf(radiusDp)
+    }
+
+    private fun strokedSolid(fill: Int, radiusDp: Int, strokeColor: Int, strokeDp: Int): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(fill)
+            cornerRadius = dpf(radiusDp)
+            if (strokeDp > 0) setStroke(dp(strokeDp), strokeColor)
+        }
+
+    private fun circle(color: Int): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color)
+    }
+
+    private fun gradient(c1: Int, c2: Int, radiusDp: Int): GradientDrawable =
+        GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(c1, c2)).apply {
+            cornerRadius = dpf(radiusDp)
+        }
+
+    private fun dashedBg(t: M3Tokens): GradientDrawable = GradientDrawable().apply {
+        setColor(Color.TRANSPARENT)
+        cornerRadius = dpf(12)
+        setStroke(dp(1), t.outline, dpf(6), dpf(4))
+    }
+
+    private fun blendAlpha(color: Int, alpha: Int): Int =
+        (color and 0x00FFFFFF) or (alpha shl 24)
+
+    private fun dp(v: Int): Int = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
+    ).toInt()
+
+    private fun dpf(v: Int): Float = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
+    )
+
+    private fun spacer(parent: LinearLayout, h: Int) {
+        parent.addView(View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(h))
+        })
+    }
+
+    private fun spacerH(parent: LinearLayout, w: Int) {
+        parent.addView(View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(w), MATCH_PARENT)
+        })
+    }
+
+    private fun simpleWatcher(onChange: (String) -> Unit): TextWatcher = object : TextWatcher {
+        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+        override fun afterTextChanged(s: Editable?) { onChange(s?.toString() ?: "") }
+    }
+
+    private fun statusTone(): String {
+        val s = statusText.lowercase()
+        return when {
+            "fail" in s || "error" in s || "empty" in s || "cancel" in s -> "error"
+            "done" in s || "loaded" in s || "opened" in s || "ready" in s -> "success"
+            "load" in s || "running" in s || "open" in s || "stream" in s -> "progress"
+            else -> "neutral"
+        }
+    }
+
+    /** Pretty label including the design's "MULTIMODAL/TEXT/QNN" tag. */
+    private fun badgePlusLabel(m: ModelId): String = when (m) {
+        ModelId.GEMMA4         -> "[MULTIMODAL]  ${m.name}"
+        ModelId.QWEN3_0_6B     -> "[TEXT]        ${m.name}"
+        ModelId.GAUSS3_8_QNN   -> "[QNN]         ${m.name}"
+        ModelId.GAUSS3_6_QNN   -> "[QNN]         ${m.name}"
+        ModelId.QWEN3_1_7B_Q40 -> "[TEXT]        ${m.name}"
+    }
+
+    /* ════════════════════════════════════════════════════════════════
+     * Engine handlers (logic preserved from the original sample)
+     * ════════════════════════════════════════════════════════════════ */
 
     override fun onDestroy() {
         // Fire-and-forget close on the engine thread so we don't leak the
@@ -512,39 +1562,62 @@ class MainActivity : AppCompatActivity() {
         loadedKey = null
         if (e != null) {
             engineExecutor.execute {
-                try {
-                    e.close()
-                } catch (_: Throwable) { /* best effort */ }
+                try { e.close() } catch (_: Throwable) { /* best effort */ }
             }
         }
         super.onDestroy()
     }
 
-    // --- button handlers ----------------------------------------------
-
     private fun onLoadClicked() {
         val req = buildLoadRequest()
-        setStatus(
-            "Loading ${req.modelKey}… " +
-                "(vision=${req.visionBackend?.name ?: "off"})"
-        )
-        outputView.text = ""
+        loadStatus = "loading"
+        setStatus("Loading ${req.modelKey}…  (vision=${req.visionBackend?.name ?: "off"})")
+        outputText = ""
+        mainHandler.post { rebuildUi() }
         engineExecutor.execute { loadModelInternal(req) }
     }
 
+    private fun onCancelClicked() {
+        val e = engine
+        if (e != null && e.chatSessionId != null) {
+            e.chatCancel()
+            setStatus("Cancel requested.")
+        } else {
+            e?.cancel()
+            streaming = false
+            setStatus("Cancelled.")
+            mainHandler.post { rebuildUi() }
+        }
+    }
+
     /**
-     * @brief Build a [LoadModelRequest] from the current spinner / text
-     * field values. Must be called on the main thread.
+     * @brief Build a [LoadModelRequest] from the current UI state. Must
+     * be called on the main thread.
      */
     private fun buildLoadRequest(): LoadModelRequest {
-        val model = selectedModelId()
-        val backend = BackendType.valueOf(backendSpinner.selectedItem as String)
-        val quant = selectedQuant()
-        val modelPath = modelPathField.text.toString().trim().ifEmpty { null }
+        val model = selectedModel
+        val backend = selectedBackend
+        val quant = selectedQuant
+        val modelPath = (if (::modelPathField.isInitialized) modelPathField.text.toString()
+                          else modelPathText).trim().ifEmpty { null }
+        val visionBackend = if (model == ModelId.GEMMA4) backend else null
+        val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
+        return LoadModelRequest(
+            backend = backend,
+            model = model,
+            quantization = quant,
+            modelPath = modelPath,
+            visionBackend = visionBackend,
+            nativeLibDir = nativeLibDir,
+        )
+    }
 
-        // Call vsionBackend for all cases (Change to Gauss3.8/Gemma4 later)
-        val visionBackend = backend
-        // val visionBackend = if (model == ModelId.GEMMA4) backend else null
+    private fun buildChatLoadRequest(): LoadModelRequest {
+        val model = chatSelectedModel
+        val backend = chatSelectedBackend
+        val quant = chatSelectedQuant
+        val modelPath = defaultModelPathFor(model, quant)
+        val visionBackend = if (model == ModelId.GEMMA4) backend else null
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
         return LoadModelRequest(
             backend = backend,
@@ -561,17 +1634,16 @@ class MainActivity : AppCompatActivity() {
      * Returns the loaded [QuickDotAI] engine, or null on failure.
      */
     private fun loadModelInternal(req: LoadModelRequest): QuickDotAI? {
-        // If a different model is already loaded, swap it out so the
-        // sample stays simple (one engine at a time).
         if (loadedKey != null && loadedKey != req.modelKey) {
-            try {
-                engine?.close()
-            } catch (_: Throwable) { /* best effort */ }
+            try { engine?.close() } catch (_: Throwable) { /* best effort */ }
             engine = null
             loadedKey = null
         }
         if (engine != null && loadedKey == req.modelKey) {
+            loadStatus = "loaded"
+            loadedLabel = req.modelKey
             setStatus("Already loaded: ${req.modelKey}")
+            mainHandler.post { rebuildUi() }
             return engine
         }
 
@@ -583,17 +1655,17 @@ class MainActivity : AppCompatActivity() {
             is BackendResult.Ok -> {
                 engine = newEngine
                 loadedKey = req.modelKey
-                setStatus(
-                    "Loaded ${req.modelKey} " +
-                        "(${newEngine.kind}, arch=${newEngine.architecture ?: "?"})"
-                )
+                loadStatus = "loaded"
+                loadedLabel = req.modelKey
+                setStatus("Loaded ${req.modelKey} (${newEngine.kind}, arch=${newEngine.architecture ?: "?"})")
+                mainHandler.post { rebuildUi() }
                 newEngine
             }
             is BackendResult.Err -> {
-                try {
-                    newEngine.close()
-                } catch (_: Throwable) { /* best effort */ }
+                try { newEngine.close() } catch (_: Throwable) { /* best effort */ }
+                loadStatus = "idle"
                 setStatus("Load failed: [${r.error.name}] ${r.message ?: ""}")
+                mainHandler.post { rebuildUi() }
                 null
             }
         }
@@ -605,42 +1677,40 @@ class MainActivity : AppCompatActivity() {
             setStatus("Prompt is empty.")
             return
         }
-        // Snapshot the image bytes on the main thread so the engine
-        // thread sees a stable reference even if the user taps "Clear
-        // image" mid-run.
         val imgBytes = selectedImageBytes
-
-        // Clear any previous output before we start streaming.
+        outputText = ""
         mainHandler.post { outputView.text = "" }
-        setStatus(
-            if (imgBytes != null) "Running multimodal (${imgBytes.size}B image)…"
-            else "Running…"
-        )
+        streaming = true
+        setStatus(if (imgBytes != null) "Running multimodal (${imgBytes.size}B image)…"
+                  else "Running…")
+        mainHandler.post { rebuildUi() }
 
         engineExecutor.execute {
             val e = engine
             if (e == null) {
+                streaming = false
                 setStatus("No model loaded — tap Load first.")
+                mainHandler.post { rebuildUi() }
                 return@execute
             }
             val sink = object : StreamSink {
                 override fun onDelta(text: String) {
+                    outputText += text
                     mainHandler.post { outputView.append(text) }
                 }
                 override fun onDone() {
+                    streaming = false
                     setStatus("Done.")
+                    mainHandler.post { rebuildUi() }
                 }
                 override fun onError(error: QuickAiError, message: String?) {
+                    streaming = false
                     setStatus("Run failed: [${error.name}] ${message ?: ""}")
+                    mainHandler.post { rebuildUi() }
                 }
             }
-            // Both streaming variants block until the backend finishes
-            // or errors out; that's fine because we're already off the
-            // main thread.
             try {
                 if (imgBytes != null) {
-                    // Canonical Gemma-4 / Gemma3n convention: image
-                    // part(s) first, then a trailing text instruction.
                     val parts = listOf(
                         PromptPart.ImageBytes(imgBytes),
                         PromptPart.Text(prompt),
@@ -650,7 +1720,9 @@ class MainActivity : AppCompatActivity() {
                     e.runStreaming(prompt, sink)
                 }
             } catch (t: Throwable) {
+                streaming = false
                 setStatus("Run threw: ${t.message}")
+                mainHandler.post { rebuildUi() }
             }
         }
     }
@@ -664,18 +1736,9 @@ class MainActivity : AppCompatActivity() {
             }
             when (val r = e.metrics()) {
                 is BackendResult.Ok -> {
-                    val m = r.value
-                    val text = buildString {
-                        append("prefill: ").append(m.prefillTokens).append(" toks / ")
-                            .append(m.prefillDurationMs).append(" ms\n")
-                        append("gen:     ").append(m.generationTokens).append(" toks / ")
-                            .append(m.generationDurationMs).append(" ms\n")
-                        append("total:   ").append(m.totalDurationMs).append(" ms\n")
-                        append("init:    ").append(m.initializationDurationMs).append(" ms\n")
-                        append("peak:    ").append(m.peakMemoryKb).append(" KB")
-                    }
-                    mainHandler.post { outputView.text = text }
+                    lastMetrics = r.value
                     setStatus("Metrics fetched.")
+                    mainHandler.post { rebuildUi() }
                 }
                 is BackendResult.Err ->
                     setStatus("Metrics failed: [${r.error.name}] ${r.message ?: ""}")
@@ -684,6 +1747,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onUnloadClicked() {
+        val e = engine
+        e?.cancel()  // Immediately cancel any in-flight inference (thread-safe)
+
         engineExecutor.execute {
             val e = engine
             if (e == null) {
@@ -692,11 +1758,11 @@ class MainActivity : AppCompatActivity() {
             }
             when (val r = e.unload()) {
                 is BackendResult.Ok -> {
-                    // Keep the engine instance alive so onDestroy can still
-                    // call close(), but clear loadedKey so a subsequent Load
-                    // tap creates a fresh engine.
                     loadedKey = null
+                    loadStatus = "idle"
+                    loadedLabel = ""
                     setStatus("Unloaded.")
+                    mainHandler.post { rebuildUi() }
                 }
                 is BackendResult.Err ->
                     setStatus("Unload failed: [${r.error.name}] ${r.message ?: ""}")
@@ -704,68 +1770,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun onCancelClicked() {
-        android.util.Log.d("SampleTestApp", "onCancelClicked: START")
-        val e = engine
-        if (e == null) {
-            android.util.Log.w("SampleTestApp", "onCancelClicked: No model loaded")
-            setStatus("No model loaded.")
-            return
-        }
-        android.util.Log.d("SampleTestApp", "onCancelClicked: engine kind=${e.kind}, calling cancel()")
-        // cancel() is thread-safe — can be called from main thread
-        e.cancel()
-        android.util.Log.d("SampleTestApp", "onCancelClicked: cancel() returned")
-        setStatus("Cancel requested.")
-    }
-
-    // --- chat session handlers -------------------------------------------
+    /* ───── Chat session handlers ───── */
 
     private fun onChatOpenClicked() {
-        // Capture all UI values on the main thread — no latches needed.
-        val req = buildLoadRequest()
-        val systemPrompt = chatSystemPromptField.text.toString().trim().ifEmpty { null }
-        val temperature = chatTemperatureField.text.toString().trim()
-            .ifEmpty { null }?.toDoubleOrNull()
-        val topK = chatTopKField.text.toString().trim()
-            .ifEmpty { null }?.toIntOrNull()
-        val topP = chatTopPField.text.toString().trim()
-            .ifEmpty { null }?.toDoubleOrNull()
-        val seed = chatSeedField.text.toString().trim()
-            .ifEmpty { null }?.toIntOrNull()
-        val thinkingIdx = chatEnableThinkingSpinner.selectedItemPosition
+        val req = buildChatLoadRequest()
+        val systemPrompt = systemPromptText.trim().ifEmpty { null }
+        val temperature = temperatureText.trim().ifEmpty { null }?.toDoubleOrNull()
+        val topK = topKText.trim().ifEmpty { null }?.toIntOrNull()
+        val topP = topPText.trim().ifEmpty { null }?.toDoubleOrNull()
+        val seed = seedText.trim().ifEmpty { null }?.toIntOrNull()
 
         setStatus("Opening chat session…")
         engineExecutor.execute {
-            // Auto-load the model if not loaded yet.
             val e = loadModelInternal(req)
             if (e == null) {
                 setStatus("Cannot open chat session — model load failed.")
                 return@execute
             }
-
-            // Close existing session if any.
             if (e.chatSessionId != null) {
                 try { e.closeChatSession() } catch (_: Throwable) {}
             }
 
-            // Build config from captured UI values. Leave sampling null
-            // when every sampling field is empty so LiteRT-LM uses its
-            // own engine/model default.
-            val sampling = if (temperature != null || topK != null ||
-                topP != null || seed != null) {
+            val sampling = if (temperature != null || topK != null || topP != null || seed != null) {
                 QuickAiChatSamplingConfig(
-                    temperature = temperature,
-                    topK = topK,
-                    topP = topP,
-                    seed = seed
+                    temperature = temperature, topK = topK, topP = topP, seed = seed
                 )
             } else null
 
-            val templateKwargs = when (thinkingIdx) {
-                1 -> QuickAiChatTemplateKwargs(enableThinking = true)
-                2 -> QuickAiChatTemplateKwargs(enableThinking = false)
-                else -> null
+            val templateKwargs = when (thinkingChoice) {
+                "true"  -> QuickAiChatTemplateKwargs(enableThinking = true)
+                "false" -> QuickAiChatTemplateKwargs(enableThinking = false)
+                else    -> null
             }
 
             val config = if (systemPrompt != null || sampling != null || templateKwargs != null) {
@@ -778,12 +1813,9 @@ class MainActivity : AppCompatActivity() {
 
             when (val r = e.openChatSession(config)) {
                 is BackendResult.Ok -> {
-                    val sid = r.value
-                    mainHandler.post {
-                        chatSessionStatusView.text =
-                            "Session: ${sid.take(8)}… (active)"
-                    }
-                    setStatus("Chat session opened: ${sid.take(8)}…")
+                    sessionIdText = r.value
+                    setStatus("Chat session opened: ${r.value.take(8)}…")
+                    mainHandler.post { rebuildUi() }
                 }
                 is BackendResult.Err -> {
                     setStatus("Chat open failed: [${r.error.name}] ${r.message ?: ""}")
@@ -794,101 +1826,92 @@ class MainActivity : AppCompatActivity() {
 
     private fun onChatRunStreamingClicked() {
         val prompt = chatPromptField.text.toString()
-        if (prompt.isBlank()) {
-            setStatus("Chat message is empty.")
-            return
-        }
-
+        if (prompt.isBlank()) { setStatus("Chat message is empty."); return }
         val imgBytes = selectedImageBytes
+        outputText = ""
         outputView.text = ""
+        streaming = true
         setStatus("Chat streaming…")
+        mainHandler.post { rebuildUi() }
 
         engineExecutor.execute {
             val e = engine
             if (e == null || e.chatSessionId == null) {
-                setStatus("No chat session — tap Open Chat Session first.")
+                streaming = false
+                setStatus("No chat session — tap Open first.")
+                mainHandler.post { rebuildUi() }
                 return@execute
             }
             val sink = object : StreamSink {
                 override fun onDelta(text: String) {
+                    outputText += text
                     mainHandler.post { outputView.append(text) }
                 }
                 override fun onDone() {
+                    streaming = false
                     setStatus("Chat done.")
+                    mainHandler.post { rebuildUi() }
                 }
                 override fun onError(error: QuickAiError, message: String?) {
+                    streaming = false
                     setStatus("Chat error: [${error.name}] ${message ?: ""}")
+                    mainHandler.post { rebuildUi() }
                 }
             }
             val parts = buildChatParts(prompt, imgBytes)
-            val messages = listOf(
-                QuickAiChatMessage(role = QuickAiChatRole.USER, parts = parts)
-            )
+            val messages = listOf(QuickAiChatMessage(role = QuickAiChatRole.USER, parts = parts))
             try {
                 when (val r = e.chatRunStreaming(messages, sink)) {
                     is BackendResult.Ok -> {
-                        setStatus(
-                            "Chat done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)"
-                        )
+                        streaming = false
+                        lastMetrics = r.value.metrics ?: lastMetrics
+                        setStatus("Chat done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)")
+                        mainHandler.post { rebuildUi() }
                     }
                     is BackendResult.Err -> {
-                        // Error already surfaced via sink.onError
+                        streaming = false
+                        mainHandler.post { rebuildUi() }
                     }
                 }
             } catch (t: Throwable) {
+                streaming = false
                 setStatus("Chat threw: ${t.message}")
+                mainHandler.post { rebuildUi() }
             }
         }
     }
 
     private fun onChatRunBlockingClicked() {
         val prompt = chatPromptField.text.toString()
-        if (prompt.isBlank()) {
-            setStatus("Chat message is empty.")
-            return
-        }
-
+        if (prompt.isBlank()) { setStatus("Chat message is empty."); return }
         val imgBytes = selectedImageBytes
+        outputText = ""
         outputView.text = ""
         setStatus("Chat running (blocking)…")
 
         engineExecutor.execute {
             val e = engine
             if (e == null || e.chatSessionId == null) {
-                setStatus("No chat session — tap Open Chat Session first.")
+                setStatus("No chat session — tap Open first.")
                 return@execute
             }
             val parts = buildChatParts(prompt, imgBytes)
-            val messages = listOf(
-                QuickAiChatMessage(role = QuickAiChatRole.USER, parts = parts)
-            )
+            val messages = listOf(QuickAiChatMessage(role = QuickAiChatRole.USER, parts = parts))
             try {
                 when (val r = e.chatRun(messages)) {
                     is BackendResult.Ok -> {
+                        outputText = r.value.content
+                        lastMetrics = r.value.metrics ?: lastMetrics
                         mainHandler.post { outputView.text = r.value.content }
-                        setStatus(
-                            "Chat done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)"
-                        )
+                        setStatus("Chat done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)")
                     }
-                    is BackendResult.Err -> {
+                    is BackendResult.Err ->
                         setStatus("Chat failed: [${r.error.name}] ${r.message ?: ""}")
-                    }
                 }
             } catch (t: Throwable) {
                 setStatus("Chat threw: ${t.message}")
             }
         }
-    }
-
-    private fun onChatCancelClicked() {
-        val e = engine
-        if (e == null || e.chatSessionId == null) {
-            setStatus("No active chat session.")
-            return
-        }
-        // chatCancel() is thread-safe — can be called from main thread
-        e.chatCancel()
-        setStatus("Chat cancel requested.")
     }
 
     private fun onChatRebuildClicked() {
@@ -900,12 +1923,10 @@ class MainActivity : AppCompatActivity() {
                 return@execute
             }
             when (val r = e.chatRebuild(emptyList())) {
-                is BackendResult.Ok -> {
+                is BackendResult.Ok ->
                     setStatus("Chat history cleared. Session still active.")
-                }
-                is BackendResult.Err -> {
+                is BackendResult.Err ->
                     setStatus("Chat rebuild failed: [${r.error.name}] ${r.message ?: ""}")
-                }
             }
         }
     }
@@ -920,22 +1941,16 @@ class MainActivity : AppCompatActivity() {
             }
             when (val r = e.closeChatSession()) {
                 is BackendResult.Ok -> {
-                    mainHandler.post {
-                        chatSessionStatusView.text = "Session: none"
-                    }
+                    sessionIdText = null
                     setStatus("Chat session closed.")
+                    mainHandler.post { rebuildUi() }
                 }
-                is BackendResult.Err -> {
+                is BackendResult.Err ->
                     setStatus("Chat close failed: [${r.error.name}] ${r.message ?: ""}")
-                }
             }
         }
     }
 
-    /**
-     * @brief Build [PromptPart] list for a chat message. If image bytes
-     * are available, include them (image first, then text — Gemma convention).
-     */
     private fun buildChatParts(prompt: String, imgBytes: ByteArray?): List<PromptPart> {
         return if (imgBytes != null) {
             listOf(PromptPart.ImageBytes(imgBytes), PromptPart.Text(prompt))
@@ -944,343 +1959,187 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // --- OpenAI-style messages handlers -----------------------------------
+    /* ───── OpenAI-style messages handlers ───── */
 
-    /**
-     * @brief Parse OpenAI-style JSON messages array into QuickDotAI types.
-     *
-     * Input format:
-     * ```json
-     * [
-     *   {"role": "system", "content": "You are a helpful assistant."},
-     *   {"role": "user", "content": "Hello!"},
-     *   {"role": "assistant", "content": "Hi there!"},
-     *   {"role": "system", "content": "Now answer briefly."},
-     *   {"role": "user", "content": "How are you?"}
-     * ]
-     * ```
-     *
-     * Every entry — including multiple [QuickAiChatRole.SYSTEM] turns —
-     * is preserved in order. Role-interleaved input is forwarded to
-     * LiteRT-LM's native chat template through
-     * [com.example.quickdotai.QuickDotAI.chatRun] /
-     * [com.example.quickdotai.QuickDotAI.chatRunStreaming] ; the
-     * wrapper does no role folding or merging.
-     *
-     * @param jsonString JSON array of message objects
-     * @return parsed messages in input order, or null on parse error
-     */
     private fun parseOpenAIMessages(jsonString: String): List<QuickAiChatMessage>? {
         return try {
             val json = Json { ignoreUnknownKeys = true; isLenient = true }
             val jsonArray = json.parseToJsonElement(jsonString).jsonArray
-
             val messages = mutableListOf<QuickAiChatMessage>()
-
             for (element in jsonArray) {
                 val obj = element.jsonObject
                 val role = obj["role"]?.jsonPrimitive?.content?.lowercase() ?: continue
                 val content = obj["content"]?.jsonPrimitive?.content ?: ""
-
                 val quickRole = when (role) {
-                    "system" -> QuickAiChatRole.SYSTEM
-                    "user" -> QuickAiChatRole.USER
+                    "system"    -> QuickAiChatRole.SYSTEM
+                    "user"      -> QuickAiChatRole.USER
                     "assistant" -> QuickAiChatRole.ASSISTANT
-                    else -> continue
+                    else        -> continue
                 }
-                messages.add(
-                    QuickAiChatMessage(
-                        role = quickRole,
-                        parts = listOf(PromptPart.Text(content))
-                    )
-                )
+                messages.add(QuickAiChatMessage(
+                    role = quickRole,
+                    parts = listOf(PromptPart.Text(content))
+                ))
             }
-
             messages
-        } catch (t: Throwable) {
-            null
-        }
+        } catch (t: Throwable) { null }
     }
 
-    /**
-     * @brief Run OpenAI-style messages with streaming output.
-     * Parses the JSON, opens a session with system prompt, and runs chat.
-     */
     private fun onOpenAIMessagesRunClicked() {
         val jsonText = openAIMessagesField.text.toString().trim()
-        if (jsonText.isBlank()) {
-            setStatus("Messages JSON is empty.")
-            return
-        }
-
+        if (jsonText.isBlank()) { setStatus("Messages JSON is empty."); return }
         val messages = parseOpenAIMessages(jsonText)
-        if (messages == null) {
-            setStatus("Failed to parse messages JSON. Check format.")
-            return
-        }
-
-        if (messages.isEmpty()) {
-            setStatus("No messages found in JSON.")
-            return
-        }
+        if (messages == null) { setStatus("Failed to parse messages JSON. Check format."); return }
+        if (messages.isEmpty()) { setStatus("No messages found in JSON."); return }
         if (messages.last().role != QuickAiChatRole.USER) {
             setStatus("Last message must be role=\"user\" to trigger inference.")
             return
         }
-
+        outputText = ""
         outputView.text = ""
+        streaming = true
         setStatus("Opening session and running OpenAI messages…")
+        mainHandler.post { rebuildUi() }
 
         val req = buildLoadRequest()
         engineExecutor.execute {
-            // Load model if needed
             val e = loadModelInternal(req)
             if (e == null) {
-                setStatus("Model load failed.")
-                return@execute
+                streaming = false; setStatus("Model load failed.")
+                mainHandler.post { rebuildUi() }; return@execute
             }
-
-            // No session-level systemInstruction — every role from the
-            // JSON (including SYSTEM turns) is forwarded in-order via
-            // chatRunStreaming so LiteRT-LM's native chat template
-            // renders the full role-annotated array.
-            //
-            // If a chat session is already active (e.g. the user pressed
-            // "Open Chat Session" first to configure enableThinking /
-            // sampling), reuse it — chatRunStreaming will rebuild the
-            // Conversation for the multi-role bundle internally while
-            // preserving the session's original config. Opening a fresh
-            // config=null session here would discard those settings.
             val config: QuickAiChatSessionConfig? = null
-
             if (e.chatSessionId == null) {
                 when (val openResult = e.openChatSession(config)) {
                     is BackendResult.Err -> {
+                        streaming = false
                         setStatus("Failed to open session: ${openResult.message}")
-                        return@execute
+                        mainHandler.post { rebuildUi() }; return@execute
                     }
                     is BackendResult.Ok -> {
-                        mainHandler.post {
-                            chatSessionStatusView.text = "Session: ${openResult.value.take(8)}… (active)"
-                        }
+                        sessionIdText = openResult.value
+                        mainHandler.post { rebuildUi() }
                     }
                 }
             }
-
-            // Run streaming
             val sink = object : StreamSink {
                 override fun onDelta(text: String) {
+                    outputText += text
                     mainHandler.post { outputView.append(text) }
                 }
                 override fun onDone() {
-                    setStatus("OpenAI messages chat done.")
+                    streaming = false; setStatus("OpenAI messages chat done.")
+                    mainHandler.post { rebuildUi() }
                 }
                 override fun onError(error: QuickAiError, message: String?) {
-                    setStatus("Chat error: [${error.name}] ${message ?: ""}")
+                    streaming = false; setStatus("Chat error: [${error.name}] ${message ?: ""}")
+                    mainHandler.post { rebuildUi() }
                 }
             }
-
             try {
                 when (val r = e.chatRunStreaming(messages, sink)) {
                     is BackendResult.Ok -> {
+                        streaming = false
+                        lastMetrics = r.value.metrics ?: lastMetrics
                         setStatus("Done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)")
+                        mainHandler.post { rebuildUi() }
                     }
                     is BackendResult.Err -> {
-                        // Error already surfaced via sink.onError
+                        streaming = false; mainHandler.post { rebuildUi() }
                     }
                 }
             } catch (t: Throwable) {
-                setStatus("Chat threw: ${t.message}")
+                streaming = false; setStatus("Chat threw: ${t.message}")
+                mainHandler.post { rebuildUi() }
             }
         }
     }
 
-    /**
-     * @brief Run OpenAI-style messages with blocking output.
-     * Parses the JSON, opens a session with system prompt, and runs chat.
-     */
     private fun onOpenAIMessagesRunBlockingClicked() {
         val jsonText = openAIMessagesField.text.toString().trim()
-        if (jsonText.isBlank()) {
-            setStatus("Messages JSON is empty.")
-            return
-        }
-
+        if (jsonText.isBlank()) { setStatus("Messages JSON is empty."); return }
         val messages = parseOpenAIMessages(jsonText)
-        if (messages == null) {
-            setStatus("Failed to parse messages JSON. Check format.")
-            return
-        }
-
-        if (messages.isEmpty()) {
-            setStatus("No messages found in JSON.")
-            return
-        }
+        if (messages == null) { setStatus("Failed to parse messages JSON. Check format."); return }
+        if (messages.isEmpty()) { setStatus("No messages found in JSON."); return }
         if (messages.last().role != QuickAiChatRole.USER) {
             setStatus("Last message must be role=\"user\" to trigger inference.")
             return
         }
-
-        outputView.text = ""
+        outputText = ""; outputView.text = ""
         setStatus("Opening session and running OpenAI messages (blocking)…")
 
         val req = buildLoadRequest()
         engineExecutor.execute {
-            // Load model if needed
             val e = loadModelInternal(req)
-            if (e == null) {
-                setStatus("Model load failed.")
-                return@execute
-            }
-
-            // No session-level systemInstruction — every role from the
-            // JSON (including SYSTEM turns) is forwarded in-order via
-            // chatRun so LiteRT-LM's native chat template renders the
-            // full role-annotated array.
-            //
-            // If a chat session is already active (e.g. the user pressed
-            // "Open Chat Session" first to configure enableThinking /
-            // sampling), reuse it — chatRun will rebuild the Conversation
-            // for the multi-role bundle internally while preserving the
-            // session's original config. Opening a fresh config=null
-            // session here would discard those settings.
+            if (e == null) { setStatus("Model load failed."); return@execute }
             val config: QuickAiChatSessionConfig? = null
-
             if (e.chatSessionId == null) {
                 when (val openResult = e.openChatSession(config)) {
                     is BackendResult.Err -> {
-                        setStatus("Failed to open session: ${openResult.message}")
-                        return@execute
+                        setStatus("Failed to open session: ${openResult.message}"); return@execute
                     }
                     is BackendResult.Ok -> {
-                        mainHandler.post {
-                            chatSessionStatusView.text = "Session: ${openResult.value.take(8)}… (active)"
-                        }
+                        sessionIdText = openResult.value
+                        mainHandler.post { rebuildUi() }
                     }
                 }
             }
-
-            // Run blocking
             try {
                 when (val r = e.chatRun(messages)) {
                     is BackendResult.Ok -> {
+                        outputText = r.value.content
+                        lastMetrics = r.value.metrics ?: lastMetrics
                         mainHandler.post { outputView.text = r.value.content }
                         setStatus("Done. (${r.value.metrics?.totalDurationMs?.toLong() ?: "?"} ms)")
                     }
-                    is BackendResult.Err -> {
+                    is BackendResult.Err ->
                         setStatus("Chat failed: [${r.error.name}] ${r.message ?: ""}")
-                    }
                 }
-            } catch (t: Throwable) {
-                setStatus("Chat threw: ${t.message}")
-            }
+            } catch (t: Throwable) { setStatus("Chat threw: ${t.message}") }
         }
     }
 
-    // --- image picker handlers ----------------------------------------
+    /* ───── Image picker handlers ───── */
 
-    /**
-     * @brief Launches the system photo picker (no runtime permissions
-     * required).
-     *
-     * Uses `PickVisualMedia.ImageOnly` to filter out videos. The
-     * result is dispatched to [imagePickerLauncher]'s callback, which
-     * drains the URI on a background thread via [readImageBytesAsync].
-     */
     private fun onPickImageClicked() {
         imagePickerLauncher.launch(
-            PickVisualMediaRequest(
-                ActivityResultContracts.PickVisualMedia.ImageOnly
-            )
+            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
         )
         setStatus("Opening photo picker…")
     }
 
-    /**
-     * @brief Forgets the currently-selected image so the next Run tap
-     * falls back to the text-only [QuickDotAI.runStreaming] path.
-     */
     private fun onClearImageClicked() {
         selectedImageBytes = null
-        mainHandler.post { imageStatusView.text = "Image: none" }
+        if (::imageStatusView.isInitialized) {
+            mainHandler.post { imageStatusView.text = "Image: none" }
+        }
         setStatus("Image cleared.")
     }
 
-    /**
-     * @brief Reads the picked image URI into a byte array on a
-     * throwaway background thread.
-     *
-     * We deliberately do NOT reuse [engineExecutor] here so a long-
-     * running inference does not block the image read and leave the
-     * user staring at a stale "Image: none" label. The thread is a
-     * one-shot daemon — it terminates as soon as the read completes.
-     *
-     * The bytes are the raw file contents (JPEG / PNG / …) — exactly
-     * what LiteRT-LM's `Content.ImageBytes` expects on the far side
-     * of [PromptPart.ImageBytes].
-     */
     private fun readImageBytesAsync(uri: Uri) {
         setStatus("Reading image…")
         Thread({
             try {
                 val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
                 if (bytes == null || bytes.isEmpty()) {
-                    setStatus("Image read failed or empty.")
-                    return@Thread
+                    setStatus("Image read failed or empty."); return@Thread
                 }
                 selectedImageBytes = bytes
-                mainHandler.post {
-                    imageStatusView.text = "Image: ${bytes.size} bytes selected"
-                }
                 setStatus("Image loaded (${bytes.size} bytes). Tap Run to send.")
+                mainHandler.post { rebuildUi() }
             } catch (t: Throwable) {
                 setStatus("Failed to read image: ${t.message}")
             }
         }, "SampleTestAPP-ImageRead").apply { isDaemon = true }.start()
     }
 
-    // --- helpers -------------------------------------------------------
-
-    private fun dividerView(): View {
-        val pad = (resources.displayMetrics.density * 12).toInt()
-        return View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 2).also {
-                it.topMargin = pad
-                it.bottomMargin = pad / 2
-            }
-            setBackgroundColor(0xFF888888.toInt())
-        }
-    }
-
-    private fun labelView(text: String): TextView {
-        val pad = (resources.displayMetrics.density * 6).toInt()
-        return TextView(this).apply {
-            this.text = text
-            textSize = 13f
-            setPadding(0, pad, 0, 0)
-        }
-    }
+    /* ───── Misc helpers ───── */
 
     private fun setStatus(text: String) {
-        mainHandler.post { statusView.text = text }
-    }
-
-    /**
-     * @brief Reads the current value of the model spinner.
-     *
-     * Guarded with a try/catch because AdapterView listeners can fire
-     * once before the adapter is fully wired up on some API levels.
-     */
-    private fun selectedModelId(): ModelId = try {
-        ModelId.valueOf(modelSpinner.selectedItem as String)
-    } catch (_: Throwable) {
-        ModelId.GEMMA4
-    }
-
-    private fun selectedQuant(): QuantizationType = try {
-        QuantizationType.valueOf(quantSpinner.selectedItem as String)
-    } catch (_: Throwable) {
-        QuantizationType.W4A32
+        statusText = text
+        mainHandler.post {
+            if (::statusView.isInitialized) statusView.text = text
+        }
     }
 
     /**
@@ -1289,13 +2148,6 @@ class MainActivity : AppCompatActivity() {
      * dir, so the path lines up with the native C API's hardcoded
      * `./models/<name>-<quant>` prefix (resolve_model_path() in
      * quick_dot_ai_api.cpp).
-     *
-     * Layout — e.g. for QWEN3_0_6B + W4A32:
-     *   /sdcard/Android/data/com.example.sampletestapp/files/
-     *       models/qwen3-0.6b-w4a32
-     *
-     * For GEMMA4 the path is the `.litertlm` model file (LiteRT-LM
-     * takes an explicit file path), not a directory.
      */
     private fun defaultModelPathFor(model: ModelId, quant: QuantizationType): String {
         val externalFiles = applicationContext.getExternalFilesDir(null)
@@ -1306,10 +2158,10 @@ class MainActivity : AppCompatActivity() {
                 "$base/models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
             ModelId.QWEN3_0_6B ->
                 "$base/models/qwen3-0.6b${quantizationSuffix(quant)}"
-            ModelId.GAUSS3_6_QNN ->
-                "$base/models/gauss-3.6-qnn"
             ModelId.GAUSS3_8_QNN ->
                 "$base/models/gauss-3.8-qnn"
+            ModelId.GAUSS3_6_QNN ->
+                "$base/models/gauss-3.6-qnn"
             ModelId.QWEN3_1_7B_Q40 ->
                 "$base/models/qwen3-1.7b-q40-arm"
             ModelId.GAUSS3_8_VISION_QNN ->
@@ -1317,11 +2169,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * @brief Mirror of `get_quantization_suffix` in
-     * Applications/CausalLM/api/quick_dot_ai_api.cpp — kept in sync so the
-     * default path stays valid for whichever quant the user picks.
-     */
     private fun quantizationSuffix(quant: QuantizationType): String = when (quant) {
         QuantizationType.W4A32 -> "-w4a32"
         QuantizationType.W16A16 -> "-w16a16"

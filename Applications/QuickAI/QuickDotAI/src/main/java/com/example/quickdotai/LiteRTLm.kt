@@ -29,6 +29,7 @@ import com.google.ai.edge.litertlm.MessageCallback
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * @brief LiteRT-LM-backed QuickDotAI implementation for Gemma-family
@@ -63,6 +64,9 @@ class LiteRTLm(
     // that loaded in text-only mode get a clear UNSUPPORTED error
     // instead of a cryptic native failure deep inside LiteRT-LM.
     private var visionEnabled: Boolean = false
+
+    /** Signals an in-flight cancel request for one-shot run(). */
+    private val cancelRequested = AtomicBoolean(false)
 
     // Simple wall-clock metrics. LiteRT-LM's Kotlin API does not expose
     // token-level prefill/generation timings in the release we target,
@@ -255,6 +259,8 @@ class LiteRTLm(
 
         Log.i(TAG, "runStreaming(): prompt length=${prompt.length}")
 
+        cancelRequested.set(false)
+
         val latch = CountDownLatch(1)
         val accumulated = StringBuilder()
         // Outcome is published from the callback thread and read on the
@@ -264,6 +270,7 @@ class LiteRTLm(
 
         val callback = object : MessageCallback {
             override fun onMessage(message: Message) {
+                if (cancelRequested.get()) return
                 try {
                     val full = message.toString()
                     // Defensive delta extraction — if the callback emits
@@ -672,11 +679,8 @@ class LiteRTLm(
     }
 
     override fun cancel() {
-        // LiteRT-LM's Kotlin API does not currently expose a direct cancel
-        // method for in-flight streaming operations. The streaming callback
-        // will continue until onDone/onError is received.
-        // TODO: Implement cancel when LiteRT-LM adds cancel support.
-        Log.w(TAG, "cancel(): LiteRT-LM does not support mid-stream cancellation yet")
+        cancelRequested.set(true)
+        Log.i(TAG, "cancel(): one-shot run cancel requested")
     }
 
     override fun chatCancel() {
@@ -729,6 +733,9 @@ class LiteRTLm(
 
     override fun unload(): BackendResult<Unit> {
         Log.i(TAG, "unload() invoked")
+        // Cancel any in-flight inference before unloading
+        cancel()
+
         closeActiveSession()
         closeQuietly()
         return BackendResult.Ok(Unit)
