@@ -117,26 +117,29 @@ static void pack_and_set_int4_weights(nntrainer::Tensor &weight_tensor,
   // Quantize weights to INT4
   size_t quantized_size = N * ((K + 1)/2);
   std::vector<uint8_t> quantized_weights(quantized_size);
-  std::vector<uint8_t> scales(N * sizeof(float));
+  std::vector<float> scales(N);
   nntr_quant_qs4cx_f32(N, K, (void *)weights_fp32, 
                        (void *)quantized_weights.data(), (void *)scales.data(), true);
   
   if (kernel_idx >= 0) {
     // Android: Pack weights for KleidiAI and copy to tensor
-    size_t packed_size = nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+    size_t packed_size = nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
       N, K, kernel_idx, true);
     std::vector<uint8_t> packed_weights(packed_size);
     
-    nntr_kai_qsi4cxp_qs4cxs1s0_rhs_pack(N, K, packed_weights.data(),
+    nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K, packed_weights.data(),
                                     quantized_weights.data(), scales.data(),
                                     kernel_idx, true);
 
     auto qw = quantized_weights.data();
     auto sc = scales.data();
     
+    auto w = weight_tensor.getData();
+    auto p = (float *)(packed_weights.data());
     // Copy packed data directly to tensor
     memcpy(weight_tensor.getData<uint8_t>(), packed_weights.data(), packed_size);
-  } else {
+
+    } else {
     // Non-Android: Copy unpacked data and scales separately
     memcpy(weight_tensor.getData<uint8_t>(), quantized_weights.data(), quantized_size);
     memcpy(weight_tensor.getScale<float>(), scales.data(), N * sizeof(float));
@@ -172,7 +175,7 @@ static float test_dot_int4_kleidiai(const uint32_t M, const uint32_t K,
   
   // Pack and set weights (handles both Android and non-Android)
   pack_and_set_int4_weights(weight_tensor, weights_fp32, K, N);
-
+  
   // Step 3: Create output tensor (M x N)
   nntrainer::TensorDim out_dim(1, 1, M, N, nntrainer::Tformat::NCHW,
                                 nntrainer::Tdatatype::FP32);
@@ -197,6 +200,7 @@ static float test_dot_int4_kleidiai(const uint32_t M, const uint32_t K,
   std::vector<float> dst(M * N);
   memcpy(dst.data(), out_tensor.getData<float>(), M * N * sizeof(float));
 
+  std::cout << "ref vs kai" << std::endl;
   std::cout << ref_dst[0] << ref_dst[1] << ref_dst[2] << std::endl;
   std::cout << dst[0] << dst[1] << dst[2] << std::endl;
 
@@ -302,7 +306,7 @@ static void run_int4_kleidiai_test(const uint32_t M, const uint32_t K,
               << dt_sgemm.count() / 1'000 << " us "
               << dt_sgemm.count() / 1'000'000 << " ms " << std::endl;
   }
-
+  
   // Test INT4 KleidiAI accuracy using Tensor::dot()
   int4_mse = test_dot_int4_kleidiai(M, K, N, weight.data(), activation.data(),
                                     ref_dst, print);

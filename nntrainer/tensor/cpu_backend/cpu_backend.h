@@ -16,7 +16,7 @@
 #ifdef __cplusplus
 #if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
   defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
-  defined(_M_ARM64)
+  defined(_M_ARM64) || defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_compute_backend.h>
 #elif defined(__x86_64__) || defined(__i586__) || defined(_M_X64) ||           \
   defined(_M_IX86)
@@ -544,7 +544,7 @@ extern void nntr_gemm_qai8dxp_qsi4cxp_packed(
   void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
   T upper_bound = std::numeric_limits<T>::max());
-
+  
 /**
  * @brief get size of memory to allocate for rhs weight packing of qsi8d32p to
  * qsi4c32p

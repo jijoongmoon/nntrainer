@@ -366,7 +366,6 @@ void nntr_kai_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
   const size_t nr = ukernel_variants[idx_variant].ukernel.get_nr();
   const size_t kr = ukernel_variants[idx_variant].ukernel.get_kr();
   const size_t sr = ukernel_variants[idx_variant].ukernel.get_sr();
-
   if (format == rhs_format::nxk) {
     struct kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_params nxk_params;
 
