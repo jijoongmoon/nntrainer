@@ -118,7 +118,7 @@ static void quant_nxk_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
 
   // Make sure the output is filled with zeros
   std::memset(rhs_qs4cx, 0, n * rhs_qs4cx_stride);
-
+  
   for (size_t n_idx = 0; n_idx < n; ++n_idx) {
     const float *src_ptr = rhs_f32 + n_idx * k;
 
@@ -453,6 +453,7 @@ template void nntr_gemm_qai8dxp_qsi4cxp_unpacked<float>(
 size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
                                                    uint32_t idx_variant,
                                                    bool transB) {
+  std::cout << "I hope this not one" << std::endl;                                                    
   // Fallback: return size for unpacked format
   // For int4: (k * n + 1) / 2 bytes for packed int4 + n * sizeof(float) for scales
   return ((k * n + 1) / 2) + n * sizeof(float);
@@ -463,6 +464,7 @@ void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
                                      void *rhs_native_mtx_qs4cx,
                                      void *rhs_scales_f32,
                                      uint32_t idx_variant, bool transB) {
+  std::cout << "fallback?" << std::endl;
   // Fallback: just copy the unpacked data
   size_t data_size = (k * n + 1) / 2;
   std::memcpy(rhs_packed_mtx_qs4cx, rhs_native_mtx_qs4cx, data_size);

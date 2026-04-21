@@ -133,6 +133,11 @@ bool Int4QTensor::operator==(const Int4QTensor &rhs) const {
   return true;
 }
 
+size_t Int4QTensor::size() const {
+
+  return getMemoryBytes();
+}
+
 void Int4QTensor::allocate() {
   if (empty() || data)
     return;
@@ -664,7 +669,7 @@ size_t Int4QTensor::getMemoryBytes() const {
   // QINT4 weights was effectively zero. Align with the allocator here.
   int32_t idx = static_cast<int32_t>(get_kleidiai_kernel_idx());
   if (idx >= 0){
-      return nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(width(), height(), idx, true);
+      return nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(width(), height(), idx, true);
   }
   else{
       return ((size() + 1) / 2) * dim.getDataTypeSize() +

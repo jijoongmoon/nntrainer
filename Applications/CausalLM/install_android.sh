@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# If you want to build it with sme/sve2 option on armv9-2a
+# Please use the command like:
+# ./tools/install_android.sh -Denable-sve2=true -Denable-sme=true --arm-arch=armv9.2-a
+
 # Installation script for CausalLM Android application
 set -e
 

@@ -113,6 +113,11 @@ public:
   void allocate() override;
 
   /**
+   * @copydoc TensorBase::size()
+   */
+  size_t size() const override;
+
+  /**
    * @copydoc Tensor::deallocate()
    */
   void deallocate() override;

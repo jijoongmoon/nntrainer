@@ -205,7 +205,7 @@ inline static float kai_cast_f32_bf16(uint16_t bf16) {
 /// @return the bf16 value
 inline static uint16_t kai_cast_bf16_f32(float f32) {
   uint16_t bf16 = 0;
-#ifdef __ARM_FEATURE_BF16
+#ifdef ENABLE_FP16
   __asm__ __volatile__("bfcvt %h[output], %s[input]"
                        : [output] "=w"(bf16)
                        : [input] "w"(f32));
@@ -233,7 +233,7 @@ inline static size_t kai_roundup(size_t a, size_t b) {
   return ((a + b - 1) / b) * b;
 }
 
-#if defined(__ARM_FEATURE_SVE2) || defined(_M_ARM64)
+#if defined(ENABLE_SVE2) || defined(_M_ARM64)
 /// Gets the SME vector length for 8-bit elements.
 uint64_t kai_get_sme_vector_length_u8(void);
 
