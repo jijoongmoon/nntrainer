@@ -486,7 +486,6 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
   // Fallback implementation for non-ARM platforms
   // When idx_variant == (uint32_t)-1, data is in unpacked format with scales appended
   // When idx_variant is a valid kernel index, data is in packed format (not supported in fallback)
-  std::cout << "fallbakc" << std::endl;
   size_t data_size = (k * n + 1) / 2;
   uint8_t *rhs_qs4cx = (uint8_t *)rhs_packed_mtx_qs4cx;
   float *rhs_scales = (float *)((char *)rhs_packed_mtx_qs4cx + data_size);
