@@ -1547,6 +1547,7 @@ class MainActivity : AppCompatActivity() {
         ModelId.GAUSS3_8_QNN   -> "[QNN]         ${m.name}"
         ModelId.GAUSS3_6_QNN   -> "[QNN]         ${m.name}"
         ModelId.QWEN3_1_7B_Q40 -> "[TEXT]        ${m.name}"
+        ModelId.GAUSS3_8_VISION_QNN -> "[VISION-QNN]  ${m.name}"
     }
 
     /* ════════════════════════════════════════════════════════════════
