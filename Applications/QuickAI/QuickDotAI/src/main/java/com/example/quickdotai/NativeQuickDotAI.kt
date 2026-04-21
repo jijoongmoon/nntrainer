@@ -263,6 +263,9 @@ class NativeQuickDotAI(
     }
 
     override fun unload(): BackendResult<Unit> {
+        // Cancel any in-flight inference before unloading
+        cancel()
+
         if (!loaded || handle == 0L) {
             return BackendResult.Ok(Unit)
         }

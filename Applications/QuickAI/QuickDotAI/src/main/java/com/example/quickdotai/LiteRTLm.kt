@@ -733,6 +733,9 @@ class LiteRTLm(
 
     override fun unload(): BackendResult<Unit> {
         Log.i(TAG, "unload() invoked")
+        // Cancel any in-flight inference before unloading
+        cancel()
+
         closeActiveSession()
         closeQuietly()
         return BackendResult.Ok(Unit)

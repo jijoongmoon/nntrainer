@@ -1747,6 +1747,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onUnloadClicked() {
+        val e = engine
+        e?.cancel()  // Immediately cancel any in-flight inference (thread-safe)
+
         engineExecutor.execute {
             val e = engine
             if (e == null) {
