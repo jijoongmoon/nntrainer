@@ -36,22 +36,24 @@ def save_gemma3_for_nntrainer(params, config, dtype, file):
         """Save attention layer weights"""  
         save_weight(params[f"{layer_name}input_layernorm.weight"], is_rms=True)  
           
-        # Save Q/K/V/O projections with layer norms
-        save_projection(layer_name, "self_attn.v_proj")
-        save_projection(layer_name, "self_attn.k_proj")
-        if f"{layer_name}self_attn.k_norm.weight" in params:
-            save_weight(params[f"{layer_name}self_attn.k_norm.weight"], is_rms=True)
+        # Save in NNTrainer graph order:
+        # attention_norm -> Q -> K -> V -> q_norm -> k_norm -> O
         save_projection(layer_name, "self_attn.q_proj")
+        save_projection(layer_name, "self_attn.k_proj")
+        save_projection(layer_name, "self_attn.v_proj")
         if f"{layer_name}self_attn.q_norm.weight" in params:
             save_weight(params[f"{layer_name}self_attn.q_norm.weight"], is_rms=True)
+        if f"{layer_name}self_attn.k_norm.weight" in params:
+            save_weight(params[f"{layer_name}self_attn.k_norm.weight"], is_rms=True)
         save_projection(layer_name, "self_attn.o_proj")
 
     def save_feed_forward(layer_name):  
         """Save feed forward layer weights"""  
         save_weight(params[f"{layer_name}post_attention_layernorm.weight"], is_rms=True)
         save_weight(params[f"{layer_name}pre_feedforward_layernorm.weight"], is_rms=True)
-        # Save FFN projections using helper 
-        for proj in ["up_proj", "gate_proj", "down_proj"]:  
+        # Save in NNTrainer graph order:
+        # post_attention_norm -> pre_ffn_norm -> gate -> up -> down -> post_ffn_norm
+        for proj in ["gate_proj", "up_proj", "down_proj"]:  
             save_projection(layer_name, f"mlp.{proj}")
         save_weight(params[f"{layer_name}post_feedforward_layernorm.weight"], is_rms=True)
 
