@@ -306,8 +306,11 @@ class NativeQuickDotAI(
                     "Close it before opening a new one."
             )
         }
-        // Pass handle provider so cancel() can access the native handle
-        val session = NativeChatSession(handleProvider = { handle })
+        val session = NativeChatSession(
+            handleProvider = { handle },
+            architectureProvider = { architecture },
+            config = config
+        )
         activeSession = session
         Log.i(TAG, "openChatSession(): created session ${session.sessionId} with handle=0x${handle.toString(16)}")
         return BackendResult.Ok(session.sessionId)
