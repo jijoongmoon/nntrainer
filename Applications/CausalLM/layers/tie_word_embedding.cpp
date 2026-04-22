@@ -18,6 +18,7 @@
 #include <node_exporter.h>
 #include <tensor.h>
 #include <tensor_dim.h>
+#include <thread_manager.h>
 #include <tie_word_embedding.h>
 #include <util_func.h>
 
@@ -217,8 +218,8 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
     int iter = to - from;
 
-#pragma omp parallel for
-    for (int i = 0; i < iter; ++i) {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
       unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
@@ -243,7 +244,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
       if (scale != 1.0f) {
         out_tensor.multiply_i(scale);
       }
-    }
+    });
 
 #ifdef DEBUG
     std::cout << context.getName() << " : "
@@ -378,7 +379,8 @@ void TieWordEmbedding::save(std::ofstream &file,
                             nntrainer::RunLayerContext &run_context,
                             bool opt_var, ml::train::ExecutionMode mode,
                             bool trainable,
-                            nntrainer::TensorDim::DataType dtype) const {
+                            nntrainer::TensorDim::DataType dtype,
+                            ml::train::ISA target_isa) const {
   // Only read when mode is embedding
   if (mode_ == mode::embedding) {
     // @note shared weights are only be saved at the first access
@@ -406,7 +408,6 @@ void TieWordEmbedding::save(std::ofstream &file,
             //////////////////////////////////////////////////////////////////
             nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                            {nntrainer::Tformat::NCHW, dtype});
-
             nntrainer::quantize_q6_K(weight.getData<float>(),
                                      quant_weight.getData<uint8_t>(), K, N,
                                      nullptr);

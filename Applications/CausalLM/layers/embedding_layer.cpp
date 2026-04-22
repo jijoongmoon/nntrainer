@@ -16,6 +16,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <thread_manager.h>
 #include <util_func.h>
 
 namespace causallm {
@@ -110,8 +111,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     int iter = to - from;
 
-#pragma omp parallel for
-    for (int i = 0; i < iter; ++i) {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
       size_t embed_idx = static_cast<size_t>(in_data[i]);
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
@@ -143,7 +144,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       if (scale != 1.0f) {
         out_tensor.multiply_i(scale);
       }
-    }
+    });
 
 #ifdef DEBUG
     std::cout << context.getName() << " : "
@@ -169,7 +170,8 @@ void EmbeddingLayer::exportTo(nntrainer::Exporter &exporter,
 void EmbeddingLayer::save(std::ofstream &file,
                           nntrainer::RunLayerContext &run_context, bool opt_var,
                           ml::train::ExecutionMode mode, bool trainable,
-                          nntrainer::TensorDim::DataType dtype) const {
+                          nntrainer::TensorDim::DataType dtype,
+                          ml::train::ISA target_isa) const {
   // @note shared weights are only be saved at the first access
   for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
     if (run_context.isGradientFirstAccess(i)) {

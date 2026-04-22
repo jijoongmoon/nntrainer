@@ -15,7 +15,6 @@ executable_src = [
 
 causallm_inc_abs = [meson.current_source_dir()]
 causallm_inc = [include_directories('.'), include_directories('api')]
-
 # Build layer dependency
 causallm_layer_dependencies = []
 subdir('layers')

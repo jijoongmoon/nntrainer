@@ -168,16 +168,20 @@ public:
    * @param[in] layer_dtype_map a map of layer name to data type. If a layer
    * name is found in this map, its weights are saved with the specific data
    *            type instead of @a dtype.
+   * @param[in] target_isa target ISA (Instruction Set Architecture) format for
+   * quantization (AUTO/X86/ARM). Enables cross-platform quantization, e.g.,
+   * quantizing on x86 but saving in ARM format.
    * @note When @a dtype equals the current weight type of a layer and the layer
    *       is not in @a layer_dtype_map , the weights are saved as-is without
-   * any conversion.
+   *       any conversion.
    * @note save-with-dtype only supports the `MODEL_FORMAT_BIN` model format
    */
-  virtual void save(
-    const std::string &file_path,
-    ModelFormat format = ModelFormat::MODEL_FORMAT_BIN,
-    TensorDim::DataType dtype = TensorDim::DataType::NONE,
-    const std::map<std::string, TensorDim::DataType> &layer_dtype_map = {}) = 0;
+  virtual void
+  save(const std::string &file_path,
+       ModelFormat format = ModelFormat::MODEL_FORMAT_BIN,
+       TensorDim::DataType dtype = TensorDim::DataType::NONE,
+       const std::map<std::string, TensorDim::DataType> &layer_dtype_map = {},
+       ISA target_isa = ISA::AUTO) = 0;
 
   /**
    * @brief  load model with regard to the format

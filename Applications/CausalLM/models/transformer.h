@@ -95,8 +95,10 @@ public:
   virtual void initialize();
 
   /**
-   * @brief Initialize and Construct the Transformer model with native library directory
-   * @param native_lib_dir Native library directory path (from Android ApplicationInfo.nativeLibraryDir)
+   * @brief Initialize and Construct the Transformer model with native library
+   * directory
+   * @param native_lib_dir Native library directory path (from Android
+   * ApplicationInfo.nativeLibraryDir)
    */
   virtual void initialize(const std::string &native_lib_dir);
 
@@ -109,18 +111,33 @@ public:
    * @brief Save the weight to a file
    */
   virtual void save_weight(const std::string &weight_path);
-
   /**
    * @brief Save the weight to a file with type conversion
    * @param weight_path Path to save the weight file
    * @param dtype Global target data type for all layers (NONE = keep original)
    * @param layer_dtype_map Per-layer data type overrides (layer_name -> dtype)
+   * @param target_isa Target ISA for quantization (default: AUTO)
    */
   virtual void
   save_weight(const std::string &weight_path,
               ml::train::TensorDim::DataType dtype,
               const std::map<std::string, ml::train::TensorDim::DataType>
-                &layer_dtype_map = {});
+                &layer_dtype_map = {},
+              ml::train::ISA target_isa = ml::train::ISA::AUTO);
+
+   /**
+     * @brief Access the tokenizer owned by this Transformer.
+     * @return Pointer to the tokenizer, or nullptr if the model was
+     *         constructed without one (e.g. vision-only sub-models that
+     *         skipped the text tokenizer load path).
+     * @note   The Transformer retains ownership; callers must not delete
+     *         the returned pointer. The multimodal API path uses this to
+     *         tokenize prompts externally and compose pre-computed
+     *         embeddings before driving the LLM.
+     */
+  tokenizers::Tokenizer *getTokenizer() {
+    return tokenizer.get();
+  }
 
   /**
    * @brief run the Transformer model
@@ -136,8 +153,8 @@ public:
   virtual multimodal_pointer
   run_image(const WSTR prompt, multimodal_pointer image, int image_height,
             int image_width, bool do_sample = false,
-                   const WSTR system_prompt = "", const WSTR tail_prompt = "",
-                   bool log_output = true);
+            const WSTR system_prompt = "", const WSTR tail_prompt = "",
+            bool log_output = true);
 
   /**
    * @brief Get TransformerPerformanceMetrics
@@ -160,9 +177,13 @@ public:
 
   /**
    * @brief Get the generated output text.
-   *        Default implementation returns empty string - subclasses can override.
+   *        Default implementation returns empty string - subclasses can
+   * override.
    */
-  virtual std::string getOutput(int batch_idx = 0) const { (void)batch_idx; return ""; }
+  virtual std::string getOutput(int batch_idx = 0) const {
+    (void)batch_idx;
+    return "";
+  }
 
   /**
    * @brief Request cancellation of the current run().
@@ -252,7 +273,8 @@ protected:
 
   bool has_run_ = false;
 
-  /** Native library directory for loading shared libraries (e.g., QNN context) */
+  /** Native library directory for loading shared libraries (e.g., QNN context)
+   */
   std::string native_lib_dir_;
 };
 /**

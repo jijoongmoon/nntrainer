@@ -54,7 +54,12 @@
 #endif
 #ifndef LOGD
 #include <cstdio>
-#define LOGD(...) do { fprintf(stderr, "[DEBUG][%s] ", LOG_TAG); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#define LOGD(...)                                                              \
+  do {                                                                         \
+    fprintf(stderr, "[DEBUG][%s] ", LOG_TAG);                                  \
+    fprintf(stderr, __VA_ARGS__);                                              \
+    fprintf(stderr, "\n");                                                     \
+  } while (0)
 #endif
 #endif
 
@@ -553,12 +558,13 @@ void LayerNode::read_quantization_info(std::ifstream &file, bool opt_var,
 
 void LayerNode::save(std::ofstream &file, bool opt_var,
                      ml::train::ExecutionMode mode,
-                     TensorDim::DataType target_dtype) const {
+                     TensorDim::DataType target_dtype,
+                     ml::train::ISA target_isa) const {
   NNTR_THROW_IF(!run_context, std::runtime_error)
     << __func__ << " layer needs to be finalized first!";
   getLayer()->save(file, *run_context, opt_var, mode,
                    (getTrainable() && mode == ml::train::ExecutionMode::TRAIN),
-                   target_dtype);
+                   target_dtype, target_isa);
 }
 
 void LayerNode::save_quantization_info(std::ofstream &file, bool opt_var,
@@ -880,7 +886,16 @@ void LayerNode::incremental_forwarding(unsigned int from, unsigned int to,
   loss->set(run_context->getRegularizationLoss());
   PROFILE_TIME_START(forward_event_key);
   // std::cerr << getType() << "\n";
+
+  auto start_prefill = std::chrono::high_resolution_clock::now();
   layer->incremental_forwarding(*run_context, from, to, training);
+
+  auto finish_prefill = std::chrono::high_resolution_clock::now();
+  auto prefill_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+    finish_prefill - start_prefill);
+
+  // LOGD("layer name: %s, time: %lld us", getName().c_str(), prefill_duration.count());
+
   PROFILE_TIME_END(forward_event_key);
   TRACE_MEMORY() << getName() + ": F";
   TRACE_TIME() << getName() + ": F";

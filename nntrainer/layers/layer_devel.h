@@ -29,6 +29,7 @@
 
 #include <base_properties.h>
 #include <common.h>
+#include <cpu_backend.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 
@@ -350,11 +351,13 @@ public:
    * @param mode Execution mode
    * @param trainable is there trainable weight
    * @param dtype data type to save this layer
+   * @param target_isa target ISA (Instruction Set Architecture) format for
+   * quantization (AUTO/X86/ARM)
    */
-  virtual void
-  save(std::ofstream &file, RunLayerContext &run_context, bool opt_var,
-       ml::train::ExecutionMode mode, bool trainable,
-       TensorDim::DataType dtype = TensorDim::DataType::NONE) const {
+  virtual void save(std::ofstream &file, RunLayerContext &run_context,
+                    bool opt_var, ml::train::ExecutionMode mode, bool trainable,
+                    TensorDim::DataType dtype = TensorDim::DataType::NONE,
+                    ml::train::ISA target_isa = ml::train::ISA::AUTO) const {
 
     if (opt_var) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
@@ -405,7 +408,7 @@ public:
                 quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
                               nullptr);
                 repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
-                            quant_weight.size(), N, K);
+                            quant_weight.size(), N, K, target_isa);
                 quant_weight.save(file);
               }
             } else {

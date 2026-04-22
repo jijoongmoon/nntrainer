@@ -626,6 +626,8 @@ class NativeQuickDotAI(
         ModelId.GAUSS3_8_QNN -> 3 // CAUSAL_LM_MODEL_GAUSS3_8_QNN
         ModelId.QWEN3_1_7B_Q40 -> 4 // CAUSAL_LM_MODEL_QWEN3_1_7B_Q40
         ModelId.GAUSS3_8_VISION_QNN -> 6 // CAUSAL_LM_MODEL_GAUSS3_8_VIT_QNN
+        ModelId.GAUSS3_6 -> 7 // CAUSAL_LM_MODEL_GAUSS3_6
+        ModelId.TINY_BERT ->8 // CAUSAL_LM_MODEL_TINY_BERT
     }
 
     private fun mapBackend(b: BackendType): Int = when (b) {

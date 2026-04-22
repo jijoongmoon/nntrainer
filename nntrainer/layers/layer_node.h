@@ -790,13 +790,18 @@ public:
     bool swap = false);
 
   /**
-   * @brief     save layer Weight & Bias data from file
-   * @param file output file stream
-   * @param bool save optimizer variables
+   * @brief         save layer Weight & Bias data from file
+   * @param file    output file stream
+   * @param opt_var save optimizer variables
+   * @param mode    execution mode
+   * @param target_dtype target data type to convert weights before saving
+   * @param target_isa target ISA (Instruction Set Architecture) format for
+   * quantization (AUTO/X86/ARM)
    */
   void save(std::ofstream &file, bool opt_var = false,
             ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN,
-            TensorDim::DataType target_dtype = TensorDim::DataType::NONE) const;
+            TensorDim::DataType target_dtype = TensorDim::DataType::NONE,
+            ml::train::ISA target_isa = ml::train::ISA::AUTO) const;
 
   /**
    * @brief     save layer quantization_info

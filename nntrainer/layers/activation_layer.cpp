@@ -73,6 +73,37 @@ void ActivationLayer::forwarding(RunLayerContext &context, bool training) {
   acti_func.run_fn(input_, hidden_);
 }
 
+void ActivationLayer::incremental_forwarding(RunLayerContext &context,
+                                             unsigned int from,
+                                             unsigned int to, bool training) {
+  (void)training;
+  Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  TensorDim input_dim = input_.getDim();
+  TensorDim hidden_dim = hidden_.getDim();
+
+  TensorDim input_step_dim = input_dim;
+  TensorDim hidden_step_dim = hidden_dim;
+
+  input_step_dim.batch(1);
+  hidden_step_dim.batch(1);
+
+  if (input_dim.height() > 1)
+    input_step_dim.height(to - from);
+  if (hidden_dim.height() > 1)
+    hidden_step_dim.height(to - from);
+
+  for (unsigned int b = 0; b < hidden_.batch(); ++b) {
+    Tensor input_step = input_.getSharedDataTensor(
+      input_step_dim, b * input_dim.getFeatureLen(), true);
+    Tensor hidden_step = hidden_.getSharedDataTensor(
+      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+
+    acti_func.run_fn(input_step, hidden_step);
+  }
+}
+
 void ActivationLayer::calcDerivative(RunLayerContext &context) {
   const Tensor &deriv = context.getIncomingDerivative(SINGLE_INOUT_IDX);
   Tensor &ret = context.getOutgoingDerivative(SINGLE_INOUT_IDX);

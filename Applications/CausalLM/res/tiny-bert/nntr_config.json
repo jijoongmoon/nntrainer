@@ -1,0 +1,22 @@
+{
+    "model_type": "embedding",
+    "model_tensor_type": "FP32-FP32",
+    "model_file_name": "tinybert_fp32.bin",
+    "fc_layer_dtype" : "FP32",
+    "embedding_dtype" : "FP32",
+
+    "lora_rank" : 0,
+    "lora_alpha" : 0,
+    "lora_target": [],
+
+    "bad_word_ids": [],
+    "fsu": false,
+    "fsu_lookahead": 2,
+    "num_to_generate": 512,
+    "init_seq_len": 512,
+    "max_seq_len": 512,
+    "batch_size": 1,
+
+    "tokenizer_file": "/tmp/nntrainer/Applications/CausalLM/res/tiny-bert/tokenizer.json",
+    "sample_input": "This is a sentence"
+}

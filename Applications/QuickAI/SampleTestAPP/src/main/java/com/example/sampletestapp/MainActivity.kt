@@ -1548,6 +1548,8 @@ class MainActivity : AppCompatActivity() {
         ModelId.GAUSS3_6_QNN   -> "[QNN]         ${m.name}"
         ModelId.QWEN3_1_7B_Q40 -> "[TEXT]        ${m.name}"
         ModelId.GAUSS3_8_VISION_QNN -> "[VISION-QNN]  ${m.name}"
+        ModelId.GAUSS3_6 -> "[TEXT]  ${m.name}"
+        ModelId.TINY_BERT -> "[EMBEDDING]   ${m.name}"
     }
 
     /* ════════════════════════════════════════════════════════════════
@@ -2158,15 +2160,19 @@ class MainActivity : AppCompatActivity() {
             ModelId.GEMMA4 ->
                 "$base/models/gemma-4-E2B-it/gemma-4-E2B-it.litertlm"
             ModelId.QWEN3_0_6B ->
-                "$base/models/qwen3-0.6b${quantizationSuffix(quant)}"
-            ModelId.GAUSS3_8_QNN ->
-                "$base/models/gauss-3.8-qnn"
+                "$base/models/qwen3-0.6b"
             ModelId.GAUSS3_6_QNN ->
                 "$base/models/gauss-3.6-qnn"
+            ModelId.GAUSS3_8_QNN ->
+                "$base/models/gauss-3.8-qnn"
             ModelId.QWEN3_1_7B_Q40 ->
                 "$base/models/qwen3-1.7b-q40-arm"
             ModelId.GAUSS3_8_VISION_QNN ->
                 "$base/models/gauss-3.8-vsion-qnn"
+            ModelId.GAUSS3_6 ->
+                "$base/models/gauss-3.6"
+            ModelId.TINY_BERT ->
+                "$base/models/tiny-bert"
         }
     }
 

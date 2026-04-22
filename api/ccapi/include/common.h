@@ -53,6 +53,19 @@ enum LayerComputeEngine {
 };
 
 /**
+ * @brief     Enumeration of ISA (Instruction Set Architecture) for quantization
+ *
+ * @details This enum allows specifying the target ISA format when saving
+ * quantized models, enabling cross-platform quantization (e.g., quantizing on
+ * x86 but saving in ARM format).
+ */
+enum ISA {
+  AUTO, /**< Use the current compiled backend format */
+  X86,  /**< Force x86 format (q4_0x8 for Q4_0) */
+  ARM   /**< Force ARM format (q4_0x4 for Q4_0) */
+};
+
+/**
  * @brief Get the version of NNTrainer
  */
 extern std::string getVersion();

@@ -44,7 +44,7 @@
 // The include path is rooted at Applications/CausalLM (see the
 // CAUSALLM_COMMON_INCLUDES list in jni/Android.mk and the
 // include_directories('.') in meson.build).
-#include "api/streamer.h"
+#include <streamer.h>
 
 namespace causallm {
 
@@ -69,6 +69,10 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   LMHEAD_DTYPE = nntr_cfg.contains("lmhead_dtype")
                    ? nntr_cfg["lmhead_dtype"]
                    : nntr_cfg["embedding_dtype"];
+
+  SKIP_PREFILL = nntr_cfg.contains("skip_prefill")
+                   ? nntr_cfg["skip_prefill"].get<bool>()
+                   : false;
 
   USE_KVCACHE = false;
   PRE_COMPUTED_CACHE_PATH = "";
@@ -474,17 +478,37 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   } else {
     SYS_PROMP_LEN = 0;
   }
-  output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
-                                        SYS_PROMP_LEN,
-                                        SYS_PROMP_LEN + input_len, false);
+  std::vector<unsigned int> id_list;
 
-  // post process of model output
-  std::vector<unsigned int> id_list(generate_multi_tokens(
-    output[0], NUM_VOCAB, BATCH_SIZE, 1, ids_history, _len));
+  if (SKIP_PREFILL && init_len > 1) {
+    // Prefill only N-1 tokens; the last input token will be used as the first
+    // token in the generation phase (assigned directly, not sampled).
+    unsigned int skipped_token =
+      static_cast<unsigned int>(init_input[init_len - 1]);
 
-  if (init_len < INIT_SEQ_LEN)
-    registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
+    output = model->incremental_inference(BATCH_SIZE, input, label,
+                                          init_len - 1, SYS_PROMP_LEN,
+                                          SYS_PROMP_LEN + input_len - 1, false);
 
+    for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+      id_list.push_back(skipped_token);
+
+    // Adjust lengths so the generation loop processes the skipped token
+    // at the correct KV cache position.
+    input_len -= 1;
+    init_len -= 1;
+  } else {
+    output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
+                                          SYS_PROMP_LEN,
+                                          SYS_PROMP_LEN + input_len, false);
+
+    // post process of model output
+    id_list = generate_multi_tokens(output[0], NUM_VOCAB, BATCH_SIZE, 1,
+                                    ids_history, _len);
+
+    if (init_len < INIT_SEQ_LEN)
+      registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
+  }
   // output should be deallocated after use
   for (auto &out : output) {
     delete[] out;

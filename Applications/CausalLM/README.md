@@ -261,15 +261,18 @@ nntr_quantize <model_path> [options]
 | `--lmhead_dtype <type>` | Target dtype for LM head layer | Same as `embd_dtype` |
 | `--output_bin <name>` | Output `.bin` filename | Auto-generated |
 | `--config <path>` | Use a target `nntr_config.json` for dtype settings | – |
+| `--isa <x86|ARM|AUTO>` | Target ISA for quantization | `AUTO` |
 
 ### Examples
-
 ```bash
 # Quantize FC layers to Q4_0 (default), embedding stays FP32:
 nntr_quantize /path/to/qwen3-4b
 
 # Quantize FC layers to Q4_0 and embedding to Q6_K:
 nntr_quantize /path/to/qwen3-4b --fc_dtype Q4_0 --embd_dtype Q6_K
+
+# Quantize FC layers to Q4_0 and embedding to Q6_K in ARM format:
+nntr_quantize /path/to/qwen3-4b --fc_dtype Q4_0 --embd_dtype Q6_K --isa ARM
 
 # Quantize to a different output directory:
 nntr_quantize /path/to/qwen3-4b -o /output/qwen3-4b-q4

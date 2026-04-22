@@ -211,16 +211,62 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
   variance.add_i(epsilon);
   variance.pow(-0.5f, inv_std_dev);
 #else
-  unsigned int axis_dim = deviation.getDim()[normalize_axes[0]];
-  for (unsigned int i = 0; i < deviation.getDim()[normalize_axes[0] - 1]; ++i) {
-    float sum = 0.0;
+  NNTR_THROW_IF(normalize_axes.size() != 1 || normalize_axes[0] != 3,
+                std::invalid_argument)
+    << "FP16 incremental LN path currently supports axis=3 only";
 
-    _FP16 *data = deviation.getAddress<_FP16>(0, 0, i, 0);
+  const unsigned int step_h = to - from;
+  const unsigned int axis_dim = deviation.getDim().width();
 
-    for (unsigned int j = 0; j < axis_dim; ++j) {
-      sum += powf(static_cast<float>(data[j]), 2.0f);
+  nntrainer::TensorDim dev_step_dim = deviation.getDim();
+  dev_step_dim.height(step_h);
+  const size_t dev_offset = from * axis_dim;
+
+  nntrainer::Tensor deviation_step =
+    deviation.getSharedDataTensor(dev_step_dim, dev_offset, true);
+
+  TensorDim inv_step_dim = inv_std_dev.getDim();
+  inv_step_dim.height(step_h);
+  Tensor inv_std_step = inv_std_dev.getSharedDataTensor(
+    inv_step_dim, from * inv_std_dev.getDim().width(), true);
+
+  if (deviation.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    for (unsigned int i = 0; i < (to - from); ++i) {
+      float sum = 0.0f;
+      const _FP16 *row = deviation_step.getData<_FP16>() + i * axis_dim;
+      for (unsigned int j = 0; j < axis_dim; ++j) {
+        float v = (float)row[j];
+        sum += v * v;
+      }
+      float inv = 1.0f / std::sqrt(sum / axis_dim + epsilon);
+
+      if (inv_std_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+        inv_std_step.getData<_FP16>()[i] = (_FP16)inv;
+      } else {
+        inv_std_step.getData<float>()[i] = inv;
+      }
     }
-    inv_std_dev.setValue(0, 0, i, 0, 1.0 / sqrt(sum / axis_dim - epsilon));
+  } else {
+    TensorDim dev_fp16_dim = deviation_step.getDim();
+    dev_fp16_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+    Tensor dev_fp16(dev_fp16_dim, true);
+    dev_fp16.copyData(deviation_step);
+
+    for (unsigned int i = 0; i < (to - from); ++i) {
+      float sum = 0.0f;
+      const _FP16 *row = dev_fp16.getData<_FP16>() + i * axis_dim;
+      for (unsigned int j = 0; j < axis_dim; ++j) {
+        float v = (float)row[j];
+        sum += v * v;
+      }
+      float inv = 1.0f / std::sqrt(sum / axis_dim + epsilon);
+
+      if (inv_std_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+        inv_std_step.getData<_FP16>()[i] = (_FP16)inv;
+      } else {
+        inv_std_step.getData<float>()[i] = inv;
+      }
+    }
   }
 #endif
 

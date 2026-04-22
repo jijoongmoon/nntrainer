@@ -168,7 +168,7 @@ void Transformer::initialize() {
   }
 
   is_initialized = true;
-
+  model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 #ifdef DEBUG
   model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 #endif
@@ -263,7 +263,8 @@ void Transformer::save_weight(const std::string &weight_path) {
 void Transformer::save_weight(
   const std::string &weight_path, ml::train::TensorDim::DataType dtype,
   const std::map<std::string, ml::train::TensorDim::DataType>
-    &layer_dtype_map) {
+    &layer_dtype_map, ml::train::ISA target_isa) {
+
 
   if (!is_initialized) {
     throw std::runtime_error(
@@ -272,8 +273,8 @@ void Transformer::save_weight(
   }
 
   try {
-    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN, dtype,
-                layer_dtype_map);
+    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN, dtype,layer_dtype_map, target_isa);
+
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to save model weights with dtype: " +
                              std::string(e.what()));

@@ -45,7 +45,10 @@ enum class ModelId {
     GAUSS3_8_QNN,
     QWEN3_1_7B_Q40,
     GAUSS3_8_VISION_QNN,
+    GAUSS3_6,
+    TINY_BERT
 }
+
 
 /**
  * @brief Quantization type. Mirrors ModelQuantizationType in

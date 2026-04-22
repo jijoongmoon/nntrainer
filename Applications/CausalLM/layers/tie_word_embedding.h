@@ -131,14 +131,15 @@ public:
                        bool fsu, size_t start_offset = 0,
                        bool read_from_offset = false) override;
 
+
   /**
-   * @copydic Layer::save()
+   * @copydoc Layer::save()
    */
-  WIN_EXPORT void save(std::ofstream &file,
-                       nntrainer::RunLayerContext &run_context, bool opt_var,
-                       ml::train::ExecutionMode mode, bool trainable,
-                       nntrainer::TensorDim::DataType dtype =
-                         nntrainer::TensorDim::DataType::NONE) const override;
+  WIN_EXPORT void save(
+    std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
+    ml::train::ExecutionMode mode, bool trainable,
+    nntrainer::TensorDim::DataType dtype = nntrainer::TensorDim::DataType::NONE,
+    ml::train::ISA target_isa = ml::train::ISA::AUTO) const override;
 
   using Layer::setProperty;
 

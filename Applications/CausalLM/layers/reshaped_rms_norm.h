@@ -47,7 +47,7 @@ public:
   WIN_EXPORT ReshapedRMSNormLayer() :
     Layer(),
     rms_props(props::RMS_NORM_GAMMA_INIT(), nntrainer::props::Epsilon(),
-              props::FeatureSize()),
+              props::FeatureSize(), nntrainer::props::SkipPrefill()),
     feature_size(0) {
     wt_idx.fill(std::numeric_limits<unsigned int>::max());
   }
@@ -120,10 +120,11 @@ public:
 private:
   std::array<unsigned int, 1> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
-             props::FeatureSize>
+             props::FeatureSize, nntrainer::props::SkipPrefill>
     rms_props;
 
   unsigned int feature_size;
+  bool skip_prefill = false;
 };
 
 } // namespace causallm

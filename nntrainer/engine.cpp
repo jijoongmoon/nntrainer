@@ -119,8 +119,6 @@ void Engine::release() {
   // its own library cleanup (dlClose on m_backendLibraryHandle)
   // Closing library handles here would cause a double-free segfault
   library_handles.clear();
-
-  thread_pool_manager_.reset();
 }
 
 std::string
@@ -272,16 +270,6 @@ int Engine::registerContext(const std::string &library_path,
                  []() { std::atexit([]() { Engine::Global().release(); }); });
 
   return 0;
-}
-
-ThreadPoolManager *Engine::getThreadPoolManager() {
-  std::lock_guard<std::mutex> lock(thread_pool_manager_mutex_);
-
-  if (!thread_pool_manager_) {
-    thread_pool_manager_ = std::make_unique<ThreadPoolManager>();
-  }
-
-  return thread_pool_manager_.get();
 }
 
 } // namespace nntrainer
