@@ -1603,7 +1603,7 @@ class MainActivity : AppCompatActivity() {
         val quant = selectedQuant
         val modelPath = (if (::modelPathField.isInitialized) modelPathField.text.toString()
                           else modelPathText).trim().ifEmpty { null }
-        val visionBackend = if (model == ModelId.GEMMA4) backend else null
+        val visionBackend = if (model == ModelId.GEMMA4 || model == ModelId.GAUSS3_8_VISION_QNN) backend else null
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
         return LoadModelRequest(
             backend = backend,
