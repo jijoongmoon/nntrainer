@@ -144,10 +144,15 @@ Java_com_example_quickdotai_NativeCausalLm_chdirNative(
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_example_quickdotai_NativeCausalLm_loadModelHandleNative(
   JNIEnv *env, jobject /*thiz*/, jint backendOrdinal, jint modelOrdinal,
-  jint quantOrdinal, jstring nativeLibDirJ) {
+  jint quantOrdinal, jstring nativeLibDirJ, jstring modelBasePathJ) {
   const char *native_lib_dir = nullptr;
   if (nativeLibDirJ != nullptr) {
     native_lib_dir = env->GetStringUTFChars(nativeLibDirJ, nullptr);
+  }
+
+  const char *model_base_path = nullptr;
+  if (modelBasePathJ != nullptr) {
+    model_base_path = env->GetStringUTFChars(modelBasePathJ, nullptr);
   }
 
   CausalLmHandle handle = nullptr;
@@ -155,10 +160,13 @@ Java_com_example_quickdotai_NativeCausalLm_loadModelHandleNative(
     loadModelHandle(static_cast<BackendType>(backendOrdinal),
                     static_cast<ModelType>(modelOrdinal),
                     static_cast<ModelQuantizationType>(quantOrdinal),
-                    native_lib_dir, &handle);
+                    native_lib_dir, model_base_path, &handle);
 
   if (native_lib_dir != nullptr && nativeLibDirJ != nullptr) {
     env->ReleaseStringUTFChars(nativeLibDirJ, native_lib_dir);
+  }
+  if (model_base_path != nullptr && modelBasePathJ != nullptr) {
+    env->ReleaseStringUTFChars(modelBasePathJ, model_base_path);
   }
 
   if (g_cache.loadResultCls == nullptr || g_cache.loadResultCtor == nullptr) {

@@ -1605,6 +1605,7 @@ class MainActivity : AppCompatActivity() {
                           else modelPathText).trim().ifEmpty { null }
         val visionBackend = if (model == ModelId.GEMMA4 || model == ModelId.GAUSS3_8_VISION_QNN) backend else null
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
+        val modelBasePath = "${applicationContext.getExternalFilesDir(null)?.absolutePath}/models"
         return LoadModelRequest(
             backend = backend,
             model = model,
@@ -1612,6 +1613,7 @@ class MainActivity : AppCompatActivity() {
             modelPath = modelPath,
             visionBackend = visionBackend,
             nativeLibDir = nativeLibDir,
+            modelBasePath = modelBasePath,
         )
     }
 
@@ -1622,6 +1624,7 @@ class MainActivity : AppCompatActivity() {
         val modelPath = defaultModelPathFor(model, quant)
         val visionBackend = if (model == ModelId.GEMMA4) backend else null
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
+        val modelBasePath = "${applicationContext.getExternalFilesDir(null)?.absolutePath}/models"
         return LoadModelRequest(
             backend = backend,
             model = model,
@@ -1629,6 +1632,7 @@ class MainActivity : AppCompatActivity() {
             modelPath = modelPath,
             visionBackend = visionBackend,
             nativeLibDir = nativeLibDir,
+            modelBasePath = modelBasePath,
         )
     }
 

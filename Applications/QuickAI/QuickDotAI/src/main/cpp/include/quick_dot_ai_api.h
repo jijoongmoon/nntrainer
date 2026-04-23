@@ -75,8 +75,9 @@ typedef struct {
   bool debug_mode; /// < @brief Check model file validity during initialization
   bool verbose;    /// < @brief Whether to print output during generation
   const char
-    *chat_template_name; /// < @brief Template name to select from array
-                         ///  (e.g., "default", "tool_use"). NULL for "default".
+      *chat_template_name; /// < @brief Template name to select from array
+                           ///  (e.g., "default", "tool_use"). NULL for
+                           ///  "default".
 } Config;
 
 WIN_EXPORT ErrorCode setOptions(Config config);
@@ -106,7 +107,8 @@ typedef struct {
  * @return ErrorCode
  */
 WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
-                               ModelQuantizationType quant_type);
+                               ModelQuantizationType quant_type,
+                               const char *model_base_path);
 
 typedef struct {
   unsigned int prefill_tokens;
@@ -159,10 +161,16 @@ WIN_EXPORT ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
  * block each other. Each handle owns its own model, its own last-output
  * buffer, and its own mutex.
  *
+ * A single handle may internally carry multiple sub-models (e.g. vision
+ * encoder + LLM) when loaded from a top-level nntr_config.json that
+ * specifies "architectures" and "model_dirs" arrays. The single-model
+ * run API (runModelHandle / runModelHandleStreaming) drives models[0]
+ * only; the multimodal API (runMultimodalHandle*) drives the full set.
+ *
  * Typical usage:
  *   CausalLmHandle h = NULL;
  *   loadModelHandle(CAUSAL_LM_BACKEND_CPU, CAUSAL_LM_MODEL_QWEN3_0_6B,
- *                   CAUSAL_LM_QUANTIZATION_W4A32, &h);
+ *                   CAUSAL_LM_QUANTIZATION_W4A32, NULL, &h);
  *   const char *out = NULL;
  *   runModelHandle(h, "Hello", &out);
  *   // ... use out (owned by h, valid until the next run or destroy) ...
@@ -192,6 +200,7 @@ typedef struct CausalLmModel *CausalLmHandle;
 WIN_EXPORT ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
                                      ModelQuantizationType quant_type,
                                      const char *native_lib_dir,
+                                     const char *model_base_path,
                                      CausalLmHandle *out_handle);
 
 /**
@@ -202,6 +211,10 @@ WIN_EXPORT ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
  * is destroyed. Different handles are safe to call concurrently from
  * different threads; the same handle is serialized by its own internal
  * mutex.
+ *
+ * Single-model API: drives models[0] only even when the handle was
+ * populated with multiple sub-models. Use runMultimodalHandle for
+ * compositions such as vision-encoder + LLM.
  *
  * @param handle          Handle returned by loadModelHandle
  * @param inputTextPrompt Input prompt
@@ -300,53 +313,60 @@ WIN_EXPORT ErrorCode runModelHandleStreaming(CausalLmHandle handle,
                                              CausalLmTokenCallback callback,
                                              void *user_data);
 
-  /*============================================================================
-   * Multimodal API
-   *
-   * These functions extend the handle-based API to support image+text inputs.
-   * The pixel values are passed as preprocessed FloatArray (CHW format) from
-   * the Kotlin image processor (LlavaNextImageProcessor).
-   *
-   * Vision Encoder integration is planned for future implementation.
-   * Currently these functions return CAUSAL_LM_ERROR_UNSUPPORTED as stubs.
-   *============================================================================*/
+/*============================================================================
+ * Multimodal API
+ *
+ * These functions extend the handle-based API to support image+text inputs.
+ * The pixel values are passed as preprocessed FloatArray (CHW format) from
+ * the Kotlin image processor (LlavaNextImageProcessor).
+ *
+ * The handle must have been loaded from a multi-model nntr_config.json
+ * (architectures[] + model_dirs[]) with at least [vision_encoder, llm];
+ * a single-model handle returns CAUSAL_LM_ERROR_UNSUPPORTED.
+ *
+ * Vision Encoder integration is planned for future implementation.
+ * Currently these functions return CAUSAL_LM_ERROR_UNSUPPORTED as stubs
+ * once the multi-model precondition is satisfied.
+ *============================================================================*/
 
-  /**
-   * @brief Streaming multimodal inference on a specific handle.
-   *
-   * @param handle         Handle returned by loadModelHandle
-   * @param prompt         Text prompt (UTF-8, NUL-terminated)
-   * @param pixelValues    Preprocessed image patches in CHW format
-   * @param numPatches     Number of image patches
-   * @param originalHeight Original image height before preprocessing
-   * @param originalWidth  Original image width before preprocessing
-   * @param callback       Token delta callback. Must be non-NULL.
-   * @param user_data      Opaque pointer forwarded to callback
-   * @return ErrorCode (CAUSAL_LM_ERROR_UNSUPPORTED until Vision Encoder implemented)
-   */
-  WIN_EXPORT ErrorCode
-  runMultimodalHandleStreaming(CausalLmHandle handle, const char *prompt,
-                               const float *pixelValues, int numPatches,
-                               int originalHeight, int originalWidth,
-                               CausalLmTokenCallback callback, void *user_data);
+/**
+ * @brief Streaming multimodal inference on a specific handle.
+ *
+ * @param handle         Handle returned by loadModelHandle
+ * @param prompt         Text prompt (UTF-8, NUL-terminated)
+ * @param pixelValues    Preprocessed image patches in CHW format
+ * @param numPatches     Number of image patches
+ * @param originalHeight Original image height before preprocessing
+ * @param originalWidth  Original image width before preprocessing
+ * @param callback       Token delta callback. Must be non-NULL.
+ * @param user_data      Opaque pointer forwarded to callback
+ * @return ErrorCode (CAUSAL_LM_ERROR_UNSUPPORTED until Vision Encoder
+ * implemented)
+ */
+WIN_EXPORT ErrorCode runMultimodalHandleStreaming(
+    CausalLmHandle handle, const char *prompt, const float *pixelValues,
+    int numPatches, int originalHeight, int originalWidth,
+    CausalLmTokenCallback callback, void *user_data);
 
-  /**
-   * @brief Blocking multimodal inference on a specific handle.
-   *
-   * @param handle         Handle returned by loadModelHandle
-   * @param prompt         Text prompt (UTF-8, NUL-terminated)
-   * @param pixelValues    Preprocessed image patches in CHW format
-   * @param numPatches     Number of image patches
-   * @param originalHeight Original image height before preprocessing
-   * @param originalWidth  Original image width before preprocessing
-   * @param outputText     Out-parameter that receives a pointer to the output
-   * @return ErrorCode (CAUSAL_LM_ERROR_UNSUPPORTED until Vision Encoder implemented)
-   */
-  WIN_EXPORT ErrorCode
-  runMultimodalHandle(CausalLmHandle handle, const char *prompt,
-                      const float *pixelValues, int numPatches,
-                      int originalHeight, int originalWidth,
-                      const char **outputText);
+/**
+ * @brief Blocking multimodal inference on a specific handle.
+ *
+ * @param handle         Handle returned by loadModelHandle
+ * @param prompt         Text prompt (UTF-8, NUL-terminated)
+ * @param pixelValues    Preprocessed image patches in CHW format
+ * @param numPatches     Number of image patches
+ * @param originalHeight Original image height before preprocessing
+ * @param originalWidth  Original image width before preprocessing
+ * @param outputText     Out-parameter that receives a pointer to the output
+ * @return ErrorCode (CAUSAL_LM_ERROR_UNSUPPORTED until Vision Encoder
+ * implemented)
+ */
+WIN_EXPORT ErrorCode runMultimodalHandle(CausalLmHandle handle,
+                                         const char *prompt,
+                                         const float *pixelValues,
+                                         int numPatches, int originalHeight,
+                                         int originalWidth,
+                                         const char **outputText);
 
 #ifdef __cplusplus
 }

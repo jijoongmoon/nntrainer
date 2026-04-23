@@ -141,12 +141,16 @@ object NativeCausalLm {
      *
      * @param nativeLibDir Native library directory path from
      *        ApplicationInfo.nativeLibraryDir. May be null.
+     * @param modelBasePath Base directory for model files
+     *        (e.g. "/storage/emulated/0/Android/data/com.example.sampletestapp/files/models").
+     *        May be null (uses C API default).
      */
     external fun loadModelHandleNative(
         backendOrdinal: Int,
         modelOrdinal: Int,
         quantOrdinal: Int,
-        nativeLibDir: String?
+        nativeLibDir: String?,
+        modelBasePath: String?
     ): LoadResult
 
     /** Forwards to `runModelHandle` in quick_dot_ai_api.h. */

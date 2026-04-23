@@ -369,7 +369,7 @@ static std::string resolve_model_path(const std::string &model_key,
   }
 
   std::string model_path =
-      "/models/" + base_dir_name + get_quantization_suffix(quant_type);
+      "/" + base_dir_name + get_quantization_suffix(quant_type);
 
   return model_path;
 }
@@ -436,7 +436,7 @@ static void validate_models()
       }
 
       // Resolve path for this combination
-      std::string resolved_path = "." + resolve_model_path(key, qt);
+      std::string resolved_path = "./models" + resolve_model_path(key, qt);
 
       if (g_model_registry.find(lookup_key) != g_model_registry.end())
       {
@@ -564,7 +564,8 @@ ErrorCode registerModel(const char *model_name, const char *arch_name,
 static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
                                   ModelType modeltype,
                                   ModelQuantizationType quant_type,
-                                  const char *native_lib_dir)
+                                  const char *native_lib_dir,
+                                  const char *model_base_path)
 {
   LOGD("[DEBUG] load_into_handle: START");
   LOGD("[DEBUG]   compute: %d", compute);
@@ -625,7 +626,9 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
     std::string model_dir_path;
     std::string abs_model_dir;
     std::string base_dir =
-        "/sdcard/Android/data/com.example.sampletestapp/files";
+        (model_base_path != nullptr && strlen(model_base_path) > 0)
+            ? model_base_path
+            : "/sdcard/Android/data/com.example.sampletestapp/files/models";
 
     // Snapshot registry entries under the registry mutex so concurrent
     // loads on different handles don't race with each other (or with
@@ -659,7 +662,7 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
       ModelRuntimeConfig &rc = rm.config;
 
       // Strategy: Resolve path to find the weight file
-      model_dir_path = "." + resolve_model_path(target_model_name, quant_type);
+      model_dir_path = "./models" + resolve_model_path(target_model_name, quant_type);
       LOGD("[DEBUG] load_into_handle: model_dir_path = %s", model_dir_path.c_str());
 
       // Populate JSONs from Arch Struct
@@ -1356,9 +1359,10 @@ ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
  *============================================================================*/
 
 ErrorCode loadModel(BackendType compute, ModelType modeltype,
-                    ModelQuantizationType quant_type)
+                    ModelQuantizationType quant_type,
+                    const char *model_base_path)
 {
-  return load_into_handle(get_default_handle(), compute, modeltype, quant_type, nullptr);
+  return load_into_handle(get_default_handle(), compute, modeltype, quant_type, nullptr, model_base_path);
 }
 
 ErrorCode runModel(const char *inputTextPrompt, const char **outputText)
@@ -1378,6 +1382,7 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics)
 ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
                           ModelQuantizationType quant_type,
                           const char *native_lib_dir,
+                          const char *model_base_path,
                           CausalLmHandle *out_handle)
 {
   LOGD("[DEBUG] loadModelHandle:%d START", __LINE__);
@@ -1406,7 +1411,7 @@ ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
 
   LOGD("[DEBUG] loadModelHandle:%d Calling load_into_handle...", __LINE__);
   ErrorCode ec =
-      load_into_handle(*h, compute, modeltype, quant_type, native_lib_dir);
+      load_into_handle(*h, compute, modeltype, quant_type, native_lib_dir, model_base_path);
   LOGD("[DEBUG] loadModelHandle:%d load_into_handle returned: %d", __LINE__,
        ec);
 

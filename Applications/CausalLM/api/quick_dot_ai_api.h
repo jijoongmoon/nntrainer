@@ -107,7 +107,8 @@ typedef struct {
  * @return ErrorCode
  */
 WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
-                               ModelQuantizationType quant_type);
+                               ModelQuantizationType quant_type,
+                               const char *model_base_path);
 
 typedef struct {
   unsigned int prefill_tokens;
@@ -199,6 +200,7 @@ typedef struct CausalLmModel *CausalLmHandle;
 WIN_EXPORT ErrorCode loadModelHandle(BackendType compute, ModelType modeltype,
                                      ModelQuantizationType quant_type,
                                      const char *native_lib_dir,
+                                     const char *model_base_path,
                                      CausalLmHandle *out_handle);
 
 /**

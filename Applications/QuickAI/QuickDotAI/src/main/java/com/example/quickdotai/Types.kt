@@ -155,6 +155,16 @@ data class LoadModelRequest(
      * Only honored by [NativeQuickDotAI]; [LiteRTLm] ignores it.
      */
     @SerialName("native_lib_dir") val nativeLibDir: String? = null,
+
+    /**
+     * Base directory path for model files. The native C API uses this
+     * as the prefix when resolving model directories (e.g.
+     * "$modelBasePath/qwen3-0.6b"). When null, the C API falls back
+     * to its built-in default path.
+     *
+     * Only honored by [NativeQuickDotAI]; [LiteRTLm] ignores it.
+     */
+    @SerialName("model_base_path") val modelBasePath: String? = null,
 ) {
     /**
      * Canonical key shared across the stack: one worker/handle per
