@@ -8,7 +8,6 @@
 #ifndef __QUICK_DOT_AI_MODEL_CONFIG_INTERNAL_H__
 #define __QUICK_DOT_AI_MODEL_CONFIG_INTERNAL_H__
 
-#include "quick_dot_ai_api.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -62,38 +61,24 @@ typedef struct {
   float temperature;
 } ModelRuntimeConfig;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+namespace quick_dot_ai {
 
 /**
- * @brief Register a model architecture configuration
- * @param arch_name Name of the architecture (e.g., "Qwen3-0.6B-Arch")
- * @param config Architecture configuration
- * @return ErrorCode (CAUSAL_LM_ERROR_NONE on success)
+ * @brief Register a model architecture config (writes to g_arch_config_map)
  */
-ErrorCode registerModelArchitecture(const char *arch_name,
-                                    ModelArchConfig config);
+void register_arch(const char *arch_name, ModelArchConfig config);
 
 /**
- * @brief Register a full model configuration linking runtime config to an
- * architecture
- * @param model_name Name of the model to register (e.g., "Qwen3-0.6B")
- * @param arch_name Name of the registered architecture to use
- * @param config Runtime configuration
- * @return ErrorCode (CAUSAL_LM_ERROR_NONE on success)
+ * @brief Register a model runtime config (writes to g_model_registry)
  */
-ErrorCode registerModel(const char *model_name, const char *arch_name,
-                        ModelRuntimeConfig config);
+void register_model(const char *model_name, const char *arch_name,
+                    ModelRuntimeConfig config);
 
 /**
- * @brief Register built-in model configurations (e.g., Qwen3-0.6B)
- * @return 0 on success
+ * @brief Called from register_models() to register all built-in configs
  */
-int register_builtin_model_configs();
+void register_builtin_configs();
 
-#ifdef __cplusplus
-}
-#endif
+} // namespace quick_dot_ai
 
 #endif // __QUICK_DOT_AI_MODEL_CONFIG_INTERNAL_H__
