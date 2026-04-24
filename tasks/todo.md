@@ -64,9 +64,14 @@
   - **남은 작업**: GitHub에서 PR 생성 (사용자 판단)
 
 - `[PR]` **B2. Safetensors 포맷 지원 + weight loading 구현**
-  - 브랜치: `feature/safetensors` tip `b1069ea` (main 기반, 단독 PR 가능)
-  - 포함 파일: `api/ccapi/include/model.h` (`MODEL_FORMAT_SAFETENSORS`), `api/nntrainer-api-common.h` (`ML_TRAIN_MODEL_FORMAT_SAFETENSORS = 6`), `nntrainer/models/neuralnet.cpp` (save/load with JSON header + `std::thread` parallel mmap in INFERENCE), `nntrainer/models/neuralnet.h` (`convertBinToSafetensors` 선언), `Applications/CausalLM/models/transformer.cpp` (load_weight/save_weight 확장자 자동 감지), `test/unittest/unittest_nntrainer_safetensors.cpp` (4개 라운드트립 테스트), `docs/weight-format-specification.md`
-  - **후속(별도 PR)**: D2 머지 후 `std::thread` → `ThreadManager` 전환
+  - 브랜치: `feature/safetensors` tip `bb4b778` (main 기반, 단독 PR 가능)
+  - 포함 파일: `api/ccapi/include/model.h` (`MODEL_FORMAT_SAFETENSORS`), `api/nntrainer-api-common.h` (`ML_TRAIN_MODEL_FORMAT_SAFETENSORS = 6`), `nntrainer/models/neuralnet.cpp` (save/load with JSON header + `std::thread` parallel mmap in INFERENCE), `nntrainer/models/neuralnet.h` (`convertBinToSafetensors` 선언), `nntrainer/utils/safetensors_util.{h,cpp}` (dtype mapping + header build/parse), `Applications/CausalLM/models/transformer.cpp` (load_weight/save_weight 확장자 자동 감지), `test/unittest/unittest_nntrainer_safetensors.cpp` (4개 라운드트립 테스트), `docs/weight-format-specification.md`
+  - **후속(별도 PR)**:
+    - D2 머지 후 `std::thread` → `ThreadManager` 전환
+    - B2-f1. `bin_to_safetensors` CLI (name-aware 변환 유틸) — 후속 I2(TorchFXConverter)보다 선행 가능
+    - B2-f2. `Applications/CausalLM/res/*/weight_converter.py` (6개 — gemma3, qwen2, qwen3(4b·30b-a3b), gpt-oss-20b, kalm-embedding) 에 safetensors 출력 모드 추가. 각 모델별 `hf_key → nntrainer weight name (<layer>:<role>)` 매핑 테이블 필요
+    - B2-f3. `Applications/CausalLM/quantize.cpp` 가 `.safetensors` 출력 지원 (양자화된 config 로 재빌드 → load tmp BIN → save safetensors). dtype 변환 + safetensors 동시 지원 전제
+  - **TorchFXConverter (I2) 연계 필수 노트**: TorchFXConverter 가 safetensors 를 생성할 때 nntrainer canonical weight name 규칙 `<layer_name>:<param_role>` 을 따라야 함 (예: `fc1:weight`, `embedding0:weight`). `layer_context.h::requestWeight` 에서 `prefix + ":" + name` 로 조립되며, `prefix` 는 layer property `name=...`, `name` 은 각 layer 구현의 고정 역할 문자열. I2 PR 에서 `WeightMap` 을 이 규칙에 맞춰 확장해야 B2-f1/f2 와 호환 가능.
   - PR URL: https://github.com/jijoongmoon/nntrainer/pull/new/feature/safetensors
 
 - `[ ]` **B3. LazyTensor infrastructure**
@@ -214,6 +219,7 @@
 - `[ ]` I2c. emitter_ini/ (INI config generation)
 - `[ ]` I2d. patterns/ (attention, ffn, block, ssm 패턴 감지)
 - `[ ]` I2e. tests/ + plugin_system + weight_converter
+- **safetensors 연계 (B2 cross-ref)**: `tools/TorchFXConverter/weight_converter.py::WeightMap` 가 safetensors 출력 모드를 지원할 때 nntrainer canonical weight name (`<layer_name>:<param_role>`, layer_context.h::requestWeight 참조) 규칙을 따라야 함. B2 PR 의 `docs/weight-format-specification.md` 에 해당 규칙이 문서화됨 (B2 관련 후속 작업: B2-f1 `bin_to_safetensors` CLI / B2-f2 `res/*/weight_converter.py` 확장).
 
 ### I3. Build + docs + sample apps + tests 업데이트 (원 커밋 `6d2c6af`, 27 files / 7516 lines)
 "Update build system, documentation, sample apps, and tests" — **4개로 분해 권장**:
