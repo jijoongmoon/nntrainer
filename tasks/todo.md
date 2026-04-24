@@ -112,6 +112,37 @@
   - 의존: 없음
   - 브랜치: `feature/thread-manager`
   - **주의**: 단일 커밋이라 크기 큼. 필요 시 sub-PR로 분해
+  - **현재 상태 (main)**: `thread_manager.{h,cpp}` + `completion_token.h` + `barrier.h` 가 이미 main 에 들어있고 `parallel_for` 경로가 좋은 성능을 내고 있음 (유지해야 함). 그러나 **IO thread 가 없어** FSU swap in/out 이 동기 경로로 실행됨.
+
+- `[ ]` **D3. ThreadManager IO thread + FSU swap / look-ahead 통합 (큰 작업, 주의 필요)**
+  - 목표: `CachePool` / `TensorPool` / `MemoryPool` / `CacheLoader` 의 swap-in/out 경로를 ThreadManager 기반 비동기 IO 로 옮기고, `fsu_lookahead` 지정 시 다음 실행 순서의 weight 를 선행 로드하도록 연결.
+  - **제약**:
+    - main 의 `ThreadManager::parallel_for` 경로는 **건드리지 않는다** (성능 검증됨).
+    - IO thread 는 **별도 thread (single-producer / few-consumer 큐)** 로 모델 실행 thread 와 격리.
+    - FSU-on 상태에서 기존 동작(정확성)이 회귀 없어야 함 → `unittest_cache_pool_fsu`, `integration_test_fsu` 로 방어.
+  - **조사(PR 작성 전 필수)**:
+    - main `CacheLoader` 의 현재 swap-in/out 경로 — blocking read, task queue, promise/future 사용 여부
+    - main `Manager::LoadTensors` / `UnloadTensors` / `checkLoadComplete` / `checkUnloadComplete` 의 완료 추적
+    - main `CachePool::loadCacheExecAsync` / `flushCacheExecAsync` 시그니처 — `TaskExecutor::CompleteCallback` 의존 vs `std::function<void(int)>` 직접
+    - `CacheElem::CompletionToken`(혹은 등가물) 존재 여부 / main 에서 사용 중인지
+    - source branch (`claude/add-claude-documentation-P6NvS`) 의 B3 커밋(`bc4b2cb`)이 이 영역에서 **CacheLoader 제거 + ThreadManager 기반 CompletionToken** 으로 리팩터한 부분을 참고 — 단 그 커밋은 다른 infra 변경과 섞여있어 관련 부분만 추출 필요.
+    - `fsu_lookahead` 가 현재 어떻게 주입되는지 (`Fsu` / `FsuLookahead` model property → `Manager` → `TensorPool`).
+  - **구현 축 (예상)**:
+    1. `ThreadManager::submit_io(std::function<void()>)` — IO 전용 thread(pool? single? few?) 추가. `parallel_for` 와 동일한 ThreadManager 인스턴스에 IO 슬롯만 추가하여 단일 지점 관리.
+    2. `CompletionToken` + `Barrier` 를 CacheElem 당 하나씩 두고, Manager 의 promise/future maps 를 제거.
+    3. `CacheLoader` 의 blocking 경로를 ThreadManager IO submit 로 교체. 기존 `CacheLoader` 클래스를 얇게 유지하거나, 역할을 `CachePool::loadCacheExecAsync` 로 흡수.
+    4. `Manager::LoadTensors(order, remainder_lookahead)` 의 look-ahead 계산은 그대로 유지, 실제 submit 만 ThreadManager 로 위임.
+    5. 각 layer_node 실행 직전에 `checkLoadComplete(order)` 로 기다림 — `CompletionToken::wait()` 한 줄로 교체.
+  - **테스트**:
+    - 기존: `unittest_cache_pool_fsu` (정확성), `integration_test_fsu` (end-to-end)
+    - 추가: `unittest_thread_manager_io` (IO submit + completion 단위), FSU on/off 비교 벤치 (lookahead=1,2,3 에서 throughput 측정)
+  - **롤아웃**:
+    - Phase 1: IO thread 추가 + CacheElem CompletionToken 도입 — 기존 CacheLoader 경로와 병존 (feature flag)
+    - Phase 2: CacheLoader 를 ThreadManager 기반으로 교체, FSU 경로 전환
+    - Phase 3: FSU off 경로 회귀 검증 + 벤치 공개 + feature flag 제거
+  - **의존**: D2 선행 (ThreadManager refactor 자체가 먼저 main-ized) 불필요 — 이미 main 에 ThreadManager 존재. 단 `CacheElem::CompletionToken` / `Barrier` 는 main 에 있는지 재확인 후 결정.
+  - **주의**: 이 작업은 **cache pool + tensor pool + memory pool + cache loader** 네 컴포넌트를 가로지르므로 잘못 건드리면 FSU 기반 LLM 추론 전체가 깨질 수 있음. 설계 리뷰(사용자 / myungjoo/lhs8928) 후 착수.
+  - 브랜치 (예정): `feature/thread-manager-io-fsu`
 
 ---
 
