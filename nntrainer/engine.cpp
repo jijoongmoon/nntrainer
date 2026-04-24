@@ -19,6 +19,7 @@
 
 #include <app_context.h>
 #include <base_properties.h>
+#include <compute_ops.h>
 #include <context.h>
 #include <dynamic_library_loader.h>
 #include <engine.h>
