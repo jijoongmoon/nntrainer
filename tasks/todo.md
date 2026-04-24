@@ -48,15 +48,20 @@
 ## Group B — Tensor / Public API 재설계
 
 - `[WIP]` **B1. Tensor API 재설계 (Pimpl, symbolic/eager, graph-based compile)**
-  - 원본 커밋: `466abfc` ("Add safetensors format support and weight loading API" — 제목은 misleading, 실제 내용은 Tensor API 재설계 + safetensors enum 1줄)
-  - 브랜치: `feature/tensor-api` (생성 완료, cherry-pick 성공 @ `3011fb3`)
+  - 원본 커밋: `466abfc` (제목 misleading — 실제 내용은 Tensor API 재설계 + safetensors enum 1줄 + safetensors doc) + `6d2c6af`의 일부 (sample apps + tests + design.md)
+  - 브랜치: `feature/tensor-api` (생성 완료, `466abfc` cherry-pick @ `3011fb3`)
+  - **B3 (LazyTensor)와의 관계**: **독립**. `tensor_api.cpp`의 chain/lazy API는 `std::function` 람다 큐로 자체 구현되며 `LazyTensor` 클래스를 전혀 참조하지 않음. 람다가 호출하는 내부 연산(`add_i`/`subtract_i`/`multiply_i`/`divide_i`/`pow_i`/`inv_sqrt_i`)은 모두 main의 `nntrainer::Tensor`에 이미 존재. B3 머지 후 chain 구현을 LazyTensor 기반으로 리팩터하는 것은 별도 후속 작업.
   - **TODO**:
-    - [ ] 커밋 메시지 정정 (예: `"Redesign ml::train::Tensor API with Pimpl pattern + symbolic graph compile"`)
-    - [ ] `model.h`의 `MODEL_FORMAT_SAFETENSORS` enum 1줄 제거 (차후 B2 PR로 이동)
-    - [ ] 빌드 테스트
-    - [ ] `ccapi` 테스트 실행
+    - [ ] cherry-pick 잔재 제거: `MODEL_FORMAT_SAFETENSORS` enum 1줄 (`api/ccapi/include/model.h`) + `docs/weight-format-specification.md` (B2로 이동)
+    - [ ] `6d2c6af`에서 consumer 파일 선별 가져오기:
+      - 13개 Apps main.cpp (MNIST, Resnet, SimpleFC, LLaMA, PicoGPT, MixedPrecision, Multi_input, YOLOv2, YOLOv3, ProductRatings, Android/PicoGPTJNI) + MNIST/Resnet/ProductRatings `meson.build`
+      - `test/ccapi/unittest_ccapi_tensor.cpp` (새 테스트, +1480 lines)
+      - `design.md` (새 파일 "Unified Tensor API Design" 2054 lines — B1 설계 문서)
+    - [ ] 커밋 메시지 정정 (예: `"Redesign ml::train::Tensor API (Pimpl, symbolic/eager, graph compile) + migrate apps and tests"`)
+    - [ ] 빌드
+    - [ ] `unittest_ccapi_tensor` 실행 및 응용 예제 빌드 확인
     - [ ] 푸시 + PR
-  - 규모: 5 files / ~2188 lines
+  - 규모: 원본 5 files + sample apps/tests 17 files ≈ **22 files / ~8,000 lines**
   - 의존: 없음
 
 - `[ ]` **B2. Safetensors 포맷 지원 + weight loading 구현**
