@@ -82,6 +82,7 @@ if host_machine.system() != 'windows'
   test_target += [['unittest_nntrainer_appcontext', []]]
   test_target += [['unittest_nntrainer_modelfile', []]]
   test_target += [['unittest_nntrainer_tensor_utils', []]]
+  test_target += [['unittest_nntrainer_safetensors', []]]
 endif
 
 if get_option('enable-opencl')

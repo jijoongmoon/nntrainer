@@ -229,7 +229,16 @@ void Transformer::load_weight(const std::string &weight_path) {
   }
 
   try {
-    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    // Auto-detect format from file extension: *.safetensors -> safetensors,
+    // anything else -> legacy BIN.
+    ml::train::ModelFormat format = ml::train::ModelFormat::MODEL_FORMAT_BIN;
+    const std::string ext = ".safetensors";
+    if (weight_path.size() >= ext.size() &&
+        weight_path.compare(weight_path.size() - ext.size(), ext.size(), ext) ==
+          0) {
+      format = ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS;
+    }
+    model->load(weight_path, format);
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to load model weights: " +
                              std::string(e.what()));
@@ -245,7 +254,15 @@ void Transformer::save_weight(const std::string &weight_path) {
   }
 
   try {
-    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    // Auto-detect format from file extension; mirrors load_weight().
+    ml::train::ModelFormat format = ml::train::ModelFormat::MODEL_FORMAT_BIN;
+    const std::string ext = ".safetensors";
+    if (weight_path.size() >= ext.size() &&
+        weight_path.compare(weight_path.size() - ext.size(), ext.size(), ext) ==
+          0) {
+      format = ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS;
+    }
+    model->save(weight_path, format);
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to save model weights: " +
                              std::string(e.what()));

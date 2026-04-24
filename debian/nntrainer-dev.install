@@ -65,6 +65,7 @@
 /usr/include/nntrainer/bs_thread_pool_manager.hpp
 /usr/include/nntrainer/fp16.h
 /usr/include/nntrainer/util_simd.h
+/usr/include/nntrainer/safetensors_util.h
 /usr/include/nntrainer/dynamic_library_loader.h
 /usr/include/nntrainer/mman_windows.h
 # model

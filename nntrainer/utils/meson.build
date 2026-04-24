@@ -8,7 +8,8 @@ util_sources = [
   'fp16.cpp',
   'util_simd.cpp',
   'mman_windows.cpp',
-  'bs_thread_pool_manager.cpp'
+  'bs_thread_pool_manager.cpp',
+  'safetensors_util.cpp'
 ]
 
 util_headers = [
@@ -26,6 +27,7 @@ util_headers = [
   'singleton.h',
   'nonmovable.h',
   'noncopyable.h',
+  'safetensors_util.h',
 ]
 
 if get_option('enable-trace')
