@@ -63,10 +63,11 @@
     - `external_cache_mha_compile_p` 테스트 (5-input MHA 사용) → H2
   - **남은 작업**: GitHub에서 PR 생성 (사용자 판단)
 
-- `[ ]` **B2. Safetensors 포맷 지원 + weight loading 구현**
-  - 포함: `MODEL_FORMAT_SAFETENSORS` enum (B1에서 제외한 1줄) + 실제 로딩 구현
-  - 실제 로딩 구현 위치: **조사 필요** — 가능성: `1b67c7d` (layers/model/graph/API 업데이트) 또는 `0f22588` (CausalLM) 내부에 분산
-  - 의존: B1 머지 후
+- `[PR]` **B2. Safetensors 포맷 지원 + weight loading 구현**
+  - 브랜치: `feature/safetensors` tip `b1069ea` (main 기반, 단독 PR 가능)
+  - 포함 파일: `api/ccapi/include/model.h` (`MODEL_FORMAT_SAFETENSORS`), `api/nntrainer-api-common.h` (`ML_TRAIN_MODEL_FORMAT_SAFETENSORS = 6`), `nntrainer/models/neuralnet.cpp` (save/load with JSON header + `std::thread` parallel mmap in INFERENCE), `nntrainer/models/neuralnet.h` (`convertBinToSafetensors` 선언), `Applications/CausalLM/models/transformer.cpp` (load_weight/save_weight 확장자 자동 감지), `test/unittest/unittest_nntrainer_safetensors.cpp` (4개 라운드트립 테스트), `docs/weight-format-specification.md`
+  - **후속(별도 PR)**: D2 머지 후 `std::thread` → `ThreadManager` 전환
+  - PR URL: https://github.com/jijoongmoon/nntrainer/pull/new/feature/safetensors
 
 - `[ ]` **B3. LazyTensor infrastructure**
   - 커밋: `bc4b2cb`
