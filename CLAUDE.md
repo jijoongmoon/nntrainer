@@ -190,6 +190,7 @@ From `.cursorrules` and project norms — apply these when editing:
 - **Minimal diffs.** Don't reformat unrelated code. Don't invent new conventions; follow the nearby file.
 - **Strict warnings.** `werror=true` is intentional. Fix warnings at the root; don't add `-Wno-*` to silence them.
 - **Commit messages.** Describe the what-and-why (bug + fix, or feature summary). Include a sign-off (`Signed-off-by:`). See `CONTRIBUTING.md`.
+- **Commit author.** Always author commits as `Jijoong Moon <jijoong.moon@samsung.com>`. Never commit as `Claude <noreply@anthropic.com>` or any other identity. When running `git commit`, pass `--author="Jijoong Moon <jijoong.moon@samsung.com>"` (or ensure `user.name` / `user.email` are set to these values) and keep the `Signed-off-by` trailer matching. This applies to amends and cherry-picks as well.
 
 ## Key Files for Common Tasks
 
