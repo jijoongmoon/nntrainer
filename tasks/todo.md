@@ -47,22 +47,21 @@
 
 ## Group B — Tensor / Public API 재설계
 
-- `[WIP]` **B1. Tensor API 재설계 (Pimpl, symbolic/eager, graph-based compile)**
-  - 원본 커밋: `466abfc` (제목 misleading — 실제 내용은 Tensor API 재설계 + safetensors enum 1줄 + safetensors doc) + `6d2c6af`의 일부 (sample apps + tests + design.md)
-  - 브랜치: `feature/tensor-api` (생성 완료, `466abfc` cherry-pick @ `3011fb3`)
-  - **B3 (LazyTensor)와의 관계**: **독립**. `tensor_api.cpp`의 chain/lazy API는 `std::function` 람다 큐로 자체 구현되며 `LazyTensor` 클래스를 전혀 참조하지 않음. 람다가 호출하는 내부 연산(`add_i`/`subtract_i`/`multiply_i`/`divide_i`/`pow_i`/`inv_sqrt_i`)은 모두 main의 `nntrainer::Tensor`에 이미 존재. B3 머지 후 chain 구현을 LazyTensor 기반으로 리팩터하는 것은 별도 후속 작업.
-  - **TODO**:
-    - [ ] cherry-pick 잔재 제거: `MODEL_FORMAT_SAFETENSORS` enum 1줄 (`api/ccapi/include/model.h`) + `docs/weight-format-specification.md` (B2로 이동)
-    - [ ] `6d2c6af`에서 consumer 파일 선별 가져오기:
-      - 13개 Apps main.cpp (MNIST, Resnet, SimpleFC, LLaMA, PicoGPT, MixedPrecision, Multi_input, YOLOv2, YOLOv3, ProductRatings, Android/PicoGPTJNI) + MNIST/Resnet/ProductRatings `meson.build`
-      - `test/ccapi/unittest_ccapi_tensor.cpp` (새 테스트, +1480 lines)
-      - `design.md` (새 파일 "Unified Tensor API Design" 2054 lines — B1 설계 문서)
-    - [ ] 커밋 메시지 정정 (예: `"Redesign ml::train::Tensor API (Pimpl, symbolic/eager, graph compile) + migrate apps and tests"`)
-    - [ ] 빌드
-    - [ ] `unittest_ccapi_tensor` 실행 및 응용 예제 빌드 확인
-    - [ ] 푸시 + PR
-  - 규모: 원본 5 files + sample apps/tests 17 files ≈ **22 files / ~8,000 lines**
-  - 의존: 없음
+- `[PUSHED]` **B1. Tensor API 재설계 (Pimpl, symbolic/eager, graph-based compile)**
+  - 브랜치: `feature/tensor-api` (pushed)
+  - 커밋:
+    - `0b51dc1` Redesign ml::train::Tensor API with Pimpl + symbolic graph compile (5 files / +3750 / −64)
+    - `d6ed9df` Migrate sample apps and ccapi tests to symbolic tensor graph API (15 files / +2442 / −1546)
+  - author/committer: `Jijoong Moon <jijoong.moon@samsung.com>` ✓
+  - 검증:
+    - 본체 + 13 migrated Apps 빌드 **561/561 타겟 ✓**
+    - `unittest_ccapi` **117/117 ✓** (tensor API 새 그룹 86개 + lazy chain 테스트 포함)
+    - `unittest_models` 156/156, `unittest_nntrainer_modelfile` 267/267, `unittest_nntrainer_graph` 12/12 모두 회귀 없음
+  - **B3 (LazyTensor)와의 관계**: 독립. chain/lazy API는 `std::function` 람다 큐로 자체 구현.
+  - 제외하여 타 PR로 이동:
+    - `MODEL_FORMAT_SAFETENSORS` enum + `docs/weight-format-specification.md` → B2
+    - `external_cache_mha_compile_p` 테스트 (5-input MHA 사용) → H2
+  - **남은 작업**: GitHub에서 PR 생성 (사용자 판단)
 
 - `[ ]` **B2. Safetensors 포맷 지원 + weight loading 구현**
   - 포함: `MODEL_FORMAT_SAFETENSORS` enum (B1에서 제외한 1줄) + 실제 로딩 구현
