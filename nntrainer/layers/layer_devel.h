@@ -29,6 +29,7 @@
 
 #include <base_properties.h>
 #include <common.h>
+#include <compute_ops.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 
@@ -219,11 +220,6 @@ public:
    * outputs, and tensors (if any) for the layer. Input and output dimensions
    * can be access from the inputs/outputs tensors themselves.
    */
-  virtual void incremental_forwarding(RunLayerContext &context,
-                                      unsigned int from, unsigned int to,
-                                      bool training) {
-    forwarding(context, training);
-  };
 
   /**
    * @brief     calc the derivative to be passed to the previous layer
@@ -402,10 +398,11 @@ public:
                                     {Tformat::NCHW, dtype});
                 std::vector<char> tmp(quant_weight.size());
 
-                quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
-                              nullptr);
-                repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
-                            quant_weight.size(), N, K);
+                getComputeOps()->quantize_q4_0(weight_t.getData<float>(),
+                                               tmp.data(), N, K, nullptr);
+                getComputeOps()->repack_q4_0(quant_weight.getData<uint8_t>(),
+                                             tmp.data(),
+                                             quant_weight.size(), N, K);
                 quant_weight.save(file);
               }
             } else {

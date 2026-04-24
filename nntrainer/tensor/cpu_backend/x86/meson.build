@@ -4,6 +4,7 @@ simd_interface_x86_headers = [
 ]
 simd_interface_x86_sources = [
   'x86_compute_backend.cpp',
+  'x86_ops_table.cpp',
   'avx2_impl.cpp',
 ]
 

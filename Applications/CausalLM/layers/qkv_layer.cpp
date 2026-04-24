@@ -23,7 +23,7 @@
 
 #include <qkv_layer.h>
 
-#include <bs_thread_pool_manager.hpp>
+#include <thread_manager.h>
 #include <engine.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
@@ -128,12 +128,6 @@ void QKVLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void QKVLayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
-  return;
-}
-
-void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                      unsigned int from, unsigned int to,
-                                      bool training) {
   nntrainer::Tensor &Qweight = context.getWeight(weight_idx[QKVParams::Q]);
   nntrainer::Tensor &Kweight = context.getWeight(weight_idx[QKVParams::K]);
   nntrainer::Tensor &Vweight = context.getWeight(weight_idx[QKVParams::V]);
@@ -143,34 +137,30 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &Vhidden_ = context.getOutput(QKVParams::V);
 
   nntrainer::TensorDim input_dim = input_.getDim();
+  unsigned int step_size = input_dim.height();
+
   nntrainer::TensorDim input_step_dim = input_dim;
   input_step_dim.batch(1);
-  input_step_dim.height(to - from);
-
-  auto &pool =
-    nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
+  input_step_dim.height(step_size);
 
   nntrainer::Tensor input_step =
     input_.getSharedDataTensor(input_step_dim, 0, true);
 
-  nntrainer::TensorDim Qhidden_dim = Qhidden_.getDim();
   nntrainer::TensorDim Qhidden_step_dim = Qhidden_.getDim();
   Qhidden_step_dim.batch(1);
-  Qhidden_step_dim.height(to - from);
+  Qhidden_step_dim.height(step_size);
   nntrainer::Tensor Qhidden_step =
     Qhidden_.getSharedDataTensor(Qhidden_step_dim, 0, true);
 
-  nntrainer::TensorDim Khidden_dim = Khidden_.getDim();
   nntrainer::TensorDim Khidden_step_dim = Khidden_.getDim();
   Khidden_step_dim.batch(1);
-  Khidden_step_dim.height(to - from);
+  Khidden_step_dim.height(step_size);
   nntrainer::Tensor Khidden_step =
     Khidden_.getSharedDataTensor(Khidden_step_dim, 0, true);
 
-  nntrainer::TensorDim Vhidden_dim = Vhidden_.getDim();
   nntrainer::TensorDim Vhidden_step_dim = Vhidden_.getDim();
   Vhidden_step_dim.batch(1);
-  Vhidden_step_dim.height(to - from);
+  Vhidden_step_dim.height(step_size);
   nntrainer::Tensor Vhidden_step =
     Vhidden_.getSharedDataTensor(Vhidden_step_dim, 0, true);
 

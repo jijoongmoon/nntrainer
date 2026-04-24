@@ -26,7 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <node_exporter.h>
-#include <omp.h>
+#include <thread_manager.h>
 #include <qwen_moe_layer.h>
 #include <stdexcept>
 
@@ -186,11 +186,13 @@ void MoELayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
   auto topk_indices = std::get<1>(topk_result);
 
   const uint32_t *indices_data = topk_indices.getData<uint32_t>();
-#pragma omp parallel for collapse(2)
-  for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-    for (int k = 0; k < static_cast<int>(topk); ++k) {
-      expert_mask.setValue(indices_data[i * topk + k], 0, k, i, 1.0f);
-    }
+  {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(total_tokens), [&](size_t i) {
+      for (int k = 0; k < static_cast<int>(topk); ++k) {
+        expert_mask.setValue(indices_data[i * topk + k], 0, k, i, 1.0f);
+      }
+    });
   }
 
   // Pre-compute expert token assignments for better cache locality
@@ -220,23 +222,19 @@ void MoELayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
 
   if (use_parallel) {
     // Parallel processing for larger workloads
-#pragma omp parallel
-    {
-#pragma omp for schedule(dynamic)
-      for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-           ++expert_idx) {
-        const auto &assignments = expert_assignments[expert_idx];
-        if (assignments.empty())
-          continue;
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(num_experts), [&](size_t expert_idx) {
+      const auto &assignments = expert_assignments[expert_idx];
+      if (assignments.empty())
+        return;
 
-        // Use optimized expert forward computation without memory copies
-        compute_expert_forward(
-          input, output, assignments,
-          context.getWeight(expert_gate_proj_indices[expert_idx]),
-          context.getWeight(expert_up_proj_indices[expert_idx]),
-          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-      }
-    }
+      // Use optimized expert forward computation without memory copies
+      compute_expert_forward(
+        input, output, assignments,
+        context.getWeight(expert_gate_proj_indices[expert_idx]),
+        context.getWeight(expert_up_proj_indices[expert_idx]),
+        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+    });
   } else {
     // Sequential processing for smaller workloads
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
@@ -388,117 +386,6 @@ inline void MoELayer::compute_expert_forward_no_critical(
       expert_output.getSharedDataTensor(token_output_dim, output_offset, true);
 
     token_output.add_i(token_expert_output);
-  }
-}
-
-void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                      unsigned int from, unsigned int to,
-                                      bool training) {
-
-  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
-
-  nntrainer::Tensor &router_logits_ = context.getTensor(router_logits_idx);
-  nntrainer::Tensor &expert_mask = context.getTensor(expert_mask_idx);
-
-  nntrainer::TensorDim input_step_dim = input_.getDim();
-  nntrainer::TensorDim output_step_dim = output_.getDim();
-  nntrainer::TensorDim router_logits_step_dim = router_logits_.getDim();
-
-  input_step_dim.batch(1);
-  output_step_dim.batch(1);
-  router_logits_step_dim.batch(to - from);
-
-  input_step_dim.height(to - from);
-  output_step_dim.height(to - from);
-
-  for (unsigned int b = 0; b < input_.batch(); ++b) {
-
-    auto input = input_.getSharedDataTensor(
-      input_step_dim, b * input_step_dim.getFeatureLen(), true);
-    auto output = output_.getSharedDataTensor(
-      output_step_dim, b * output_step_dim.getFeatureLen(), true);
-    auto router_logits =
-      router_logits_.getSharedDataTensor(router_logits_step_dim, 0, true);
-
-    const unsigned batch_size = input.batch();
-    const unsigned seq_len = input.height();
-    const unsigned hidden_size = input.width();
-    const unsigned total_tokens = batch_size * seq_len;
-
-    // reshape input: [B,1,S,H] -> [B*S,1,1,H]
-    input.reshape({total_tokens, 1, 1, hidden_size});
-
-    // reshape output: [B,1,S,H] -> [B*S,1,1,H]
-    output.reshape({total_tokens, 1, 1, hidden_size});
-    output.setZero();
-    expert_mask.setZero();
-
-    // routing
-    nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
-    input.dot(gate_weights, router_logits);
-    router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
-    auto topk_result = router_logits.topK(topk);
-    auto topk_values = std::get<0>(topk_result);
-    auto topk_indices = std::get<1>(topk_result);
-
-    // norm_topk_prob
-    topk_values.divide_i(topk_values.sum(3));
-
-    const uint32_t *indices_data = topk_indices.getData<uint32_t>();
-    // Set expert mask
-    for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-      for (int k = 0; k < static_cast<int>(topk); ++k) {
-        expert_mask.setValue(indices_data[i * topk + k], 0, k, i, 1.0f);
-      }
-    }
-
-    // Pre-compute expert token assignments for better performance
-    std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
-      num_experts);
-    for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-      for (int k = 0; k < static_cast<int>(topk); ++k) {
-        unsigned expert_idx = indices_data[i * topk + k];
-        float weight = topk_values.getValue<float>(i, 0, 0, k);
-        expert_assignments[expert_idx].emplace_back(i, weight);
-      }
-    }
-
-    // Parallel processing for multiple tokens with many active experts
-    std::vector<nntrainer::Tensor> expert_outputs(num_experts);
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      if (!expert_assignments[expert_idx].empty()) {
-        expert_outputs[expert_idx] = nntrainer::Tensor(
-          total_tokens, 1, 1, hidden_size, output.getTensorType());
-        expert_outputs[expert_idx].setZero();
-      }
-    }
-
-#pragma omp parallel for schedule(dynamic)
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      const auto &assignments = expert_assignments[expert_idx];
-      if (assignments.empty())
-        continue;
-
-      compute_expert_forward_no_critical(
-        input, expert_outputs[expert_idx], assignments,
-        context.getWeight(expert_gate_proj_indices[expert_idx]),
-        context.getWeight(expert_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-    }
-
-    // Combine expert outputs
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      if (!expert_assignments[expert_idx].empty()) {
-        output.add_i(expert_outputs[expert_idx]);
-      }
-    }
-
-    // reshape output: [B*S,1,1,H] -> [B,1,S,H]
-    output.reshape({batch_size, 1, seq_len, hidden_size});
   }
 }
 

@@ -59,13 +59,6 @@ public:
   void forwarding(RunLayerContext &context, bool training) override;
 
   /**
-￼   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
-￼   * int from, unsigned int to, bool training)
-￼   */
-  void incremental_forwarding(RunLayerContext &context, unsigned int from,
-                              unsigned int to, bool training) override;
-
-  /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
   void calcDerivative(RunLayerContext &context) override;
@@ -108,6 +101,14 @@ public:
    */
   void setBatch(nntrainer::RunLayerContext &context,
                 unsigned int batch) override;
+
+  /**
+   * @copydoc Layer::updateTensorsByInputDimensions(RunLayerContext &context,
+   * std::vector<TensorDim> input_dimensions)
+   */
+  void updateTensorsByInputDimensions(
+    nntrainer::RunLayerContext &context,
+    std::vector<ml::train::TensorDim> input_dimensions) override;
 
   static constexpr const char *type = "fully_connected";
 

@@ -12,7 +12,6 @@
  *
  */
 
-#include <blas_kernel_interface.h>
 #include <common_properties.h>
 #include <fc_layer_cl.h>
 #include <layer_context.h>
@@ -115,53 +114,12 @@ void FullyConnectedLayerCl::forwarding(RunLayerContext &context,
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
   hidden_.setZero();
-  dotCl(input_, weight, hidden_);
+  input_.dot(weight, hidden_);
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
     hidden_.add_i(bias);
-  }
-}
-
-void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
-                                                   unsigned int from,
-                                                   unsigned int to,
-                                                   bool training) {
-  Tensor w;
-  Tensor &weight = w;
-  context.getWeight(weight, weight_idx[FCParams::weight]);
-
-  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
-
-  TensorDim input_dim = input_.getDim();
-  TensorDim hidden_dim = hidden_.getDim();
-
-  TensorDim input_step_dim = input_dim;
-  TensorDim hidden_step_dim = hidden_dim;
-
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-    from = 0;
-    to = 1;
-  }
-
-  input_step_dim.height(to - from);
-  hidden_step_dim.height(to - from);
-
-  // @todo: set reset stride as false. This implementation only works when
-  // batch size is 1
-  Tensor input_step = input_.getSharedDataTensor(input_step_dim, 0, true);
-  Tensor hidden_step = hidden_.getSharedDataTensor(hidden_step_dim, 0, true);
-
-  dotCl(input_step, weight, hidden_step);
-
-  if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
-      disable_bias.empty() || disable_bias.get() == false) {
-    Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
-    hidden_step.add_i(bias);
   }
 }
 

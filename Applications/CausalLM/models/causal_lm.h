@@ -106,14 +106,52 @@ protected:
                   const std::vector<bool> &eos_list, bool log_output = true);
 
   /**
-   * @brief save kv cache
+   * @brief save kv cache (legacy - uses internal mha_core tensors)
    */
   WIN_EXPORT virtual void save_kvcache(std::string path, int to);
 
   /**
-   * @brief load kv cache
+   * @brief load kv cache (legacy - uses internal mha_core tensors)
    */
   WIN_EXPORT virtual void load_kvcache(std::string path, int to);
+
+  /**
+   * @brief Initialize the KVCacheManager for externalized cache management.
+   *        Should be called after model initialization.
+   */
+  WIN_EXPORT void initKVCacheManager();
+
+  /**
+   * @brief Get the KVCacheManager instance
+   */
+  WIN_EXPORT causallm::KVCacheManager *getKVCacheManager() {
+    return kv_cache_manager_.get();
+  }
+
+  /**
+   * @brief Run prefill using forwarding() with resetInputDimension.
+   *        Uses KVCacheManager for cache management.
+   * @param[in] batch batch size
+   * @param[in] input input data (token ids)
+   * @param[in] label label data (unused, for API compatibility)
+   * @param[in] seq_len sequence length for prefill
+   * @return output logits
+   */
+  WIN_EXPORT std::vector<float *>
+  prefill(unsigned int batch, const std::vector<float *> &input,
+          const std::vector<float *> &label, unsigned int seq_len);
+
+  /**
+   * @brief Run single token generation using forwarding() with height=1.
+   *        Uses KVCacheManager for cache management.
+   * @param[in] batch batch size
+   * @param[in] input input data (single token)
+   * @param[in] label label data (unused)
+   * @return output logits
+   */
+  WIN_EXPORT std::vector<float *>
+  generate_step(unsigned int batch, const std::vector<float *> &input,
+                const std::vector<float *> &label);
 
   /**
    * @brief generate

@@ -112,7 +112,8 @@ public:
   static constexpr const char *type = "input";
 
 private:
-  std::tuple<props::Normalization, props::Standardization> input_props;
+  std::tuple<props::Normalization, props::Standardization, props::TensorDataType>
+    input_props;
 };
 } // namespace nntrainer
 

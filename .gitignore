@@ -71,3 +71,14 @@ test/jni/googletest/
 ctre-unicode.hpp
 encoder.hpp
 json.hpp
+subprojects/.wraplock
+
+
+# meson subprojects (fetched during build)
+subprojects/googletest/
+subprojects/iniparser/
+
+# TorchFXConverter generated output
+tools/TorchFXConverter/output/
+tools/TorchFXConverter/test_model/*.safetensors
+libjsoncpp-dev_1.9.5-6build1_amd64.deb

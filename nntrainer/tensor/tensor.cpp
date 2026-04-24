@@ -11,10 +11,13 @@
 
 #include <numeric>
 
+#include <thread_manager.h>
+
 #include <char_tensor.h>
 #include <float_tensor.h>
 #include <int4_tensor.h>
 #include <lazy_tensor.h>
+#include <q1_0_tensor.h>
 #include <q4_0_tensor.h>
 #include <q4_k_tensor.h>
 #include <q6_k_tensor.h>
@@ -117,7 +120,7 @@ Tensor::Tensor(
 Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
   itensor_ = nullptr;
 
-  if (d_type == Tdatatype::FP32) {
+  if (d_type == Tdatatype::FP32 || d_type == Tdatatype::NONE) {
     itensor_ = std::make_unique<FloatTensor>(name_, fm);
   } else if (d_type == Tdatatype::FP16) {
 #ifdef ENABLE_FP16
@@ -131,6 +134,8 @@ Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
     itensor_ = std::make_unique<Q6_K_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(name_, fm);
+  } else if (d_type == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(name_, fm);
   } else if (d_type == Tdatatype::UINT8) {
@@ -154,7 +159,9 @@ Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
 #endif
   } else {
     throw std::invalid_argument(
-      "Error: Tensor cannot be constructed because the given d_type is not "
+      "Error: Tensor cannot be constructed because the given d_type (" +
+      std::to_string(static_cast<int>(d_type)) +
+      ") is not "
       "compatible with itensor. The supported d_types are: FP32, FP16 "
       "(if built with ENABLE_FP16).");
   }
@@ -165,7 +172,8 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
   itensor_ = nullptr;
   this->is_virtual = is_virtual;
 
-  if (d.getDataType() == Tdatatype::FP32) {
+  if (d.getDataType() == Tdatatype::FP32 ||
+      d.getDataType() == Tdatatype::NONE) {
     itensor_ = std::make_unique<FloatTensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::FP16) {
 #ifdef ENABLE_FP16
@@ -179,6 +187,8 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
     itensor_ = std::make_unique<Q6_K_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, alloc_now, init, name);
+  } else if (d.getDataType() == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::UINT4) {
     if (qscheme != QScheme::Q4_Kx8) {
       itensor_ =
@@ -208,7 +218,9 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
 #endif
   } else {
     throw std::invalid_argument(
-      "Error: Tensor cannot be constructed because the given d_type is not "
+      "Error: Tensor cannot be constructed because the given d_type (" +
+      std::to_string(static_cast<int>(d.getDataType())) +
+      ") is not "
       "compatible with itensor. The supported d_types are: FP32, FP16 "
       "(if built with ENABLE_FP16).");
   }
@@ -217,7 +229,8 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
 Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
   itensor_ = nullptr;
 
-  if (d.getDataType() == Tdatatype::FP32) {
+  if (d.getDataType() == Tdatatype::FP32 ||
+      d.getDataType() == Tdatatype::NONE) {
     itensor_ = std::make_unique<FloatTensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::FP16) {
 #ifdef ENABLE_FP16
@@ -231,6 +244,8 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
     itensor_ = std::make_unique<Q6_K_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, buf);
+  } else if (d.getDataType() == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::UINT4) {
     if (qscheme != QScheme::Q4_Kx8)
       itensor_ = std::make_unique<Uint4QTensor>(d, buf, qscheme);
@@ -257,7 +272,9 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
 #endif
   } else {
     throw std::invalid_argument(
-      "Error: Tensor cannot be constructed because the given d_type is not "
+      "Error: Tensor cannot be constructed because the given d_type (" +
+      std::to_string(static_cast<int>(d.getDataType())) +
+      ") is not "
       "compatible with itensor. The supported d_types are: FP32, FP16 "
       "(if built with ENABLE_FP16).");
   }
@@ -278,6 +295,8 @@ Tensor::Tensor(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -359,6 +378,8 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::Q1_0) {
+    itensor_ = std::make_unique<Q1_0_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -410,6 +431,8 @@ bool Tensor::operator==(const Tensor &rhs) const {
       return itensorCompare<Q6_K_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::Q4_0) {
       return itensorCompare<Q4_0_Tensor>(itensor_.get(), rhs.itensor_.get());
+    } else if (getDataType() == Tdatatype::Q1_0) {
+      return itensorCompare<Q1_0_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT4) {
       return itensorCompare<Uint4QTensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT8) {
@@ -502,11 +525,11 @@ Tensor &Tensor::multiply_strided(Tensor const &m, Tensor &output,
   return output;
 }
 
-int Tensor::multiply_i(float const &value) {
+int Tensor::multiply_i(float const &value, ComputeOps *ops) {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot multiply";
 
-  return itensor_->multiply_i(value);
+  return itensor_->multiply_i(value, ops);
 }
 
 Tensor Tensor::multiply(float const &value) const {
@@ -514,8 +537,9 @@ Tensor Tensor::multiply(float const &value) const {
   return multiply(value, t);
 }
 
-Tensor &Tensor::multiply(float const &value, Tensor &out) const {
-  itensor_->multiply(value, out);
+Tensor &Tensor::multiply(float const &value, Tensor &out,
+                         ComputeOps *ops) const {
+  itensor_->multiply(value, out, ops);
   return out;
 }
 
@@ -536,7 +560,7 @@ Tensor Tensor::multiply(Tensor const &m, const float beta) const {
 }
 
 Tensor &Tensor::multiply(Tensor const &m, Tensor &output,
-                         const float beta) const {
+                         const float beta, ComputeOps *ops) const {
   NNTR_THROW_IF(m.getFormat() != this->getFormat(), std::invalid_argument)
     << "Tensor Format of " << getName() << ":"
     << ((bool)(this->getFormat()) ? "NHWC" : "NCHW") << " is not match. ("
@@ -547,7 +571,7 @@ Tensor &Tensor::multiply(Tensor const &m, Tensor &output,
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot multiply";
 
-  itensor_->multiply(m, output, beta);
+  itensor_->multiply(m, output, beta, ops);
   return output;
 }
 
@@ -564,14 +588,15 @@ Tensor Tensor::divide(float const &value) const {
   return divide(value, output);
 }
 
-Tensor &Tensor::divide(float const &value, Tensor &output) const {
+Tensor &Tensor::divide(float const &value, Tensor &output,
+                       ComputeOps *ops) const {
   /// @todo add unittest, ZeroDivisionError
   if (value == 0.0f) {
     std::stringstream ss;
     ss << "[Tensor] divide by value failed, value: " << value;
     throw std::invalid_argument(ss.str().c_str());
   }
-  itensor_->divide(value, output);
+  itensor_->divide(value, output, ops);
   return output;
 }
 
@@ -591,12 +616,12 @@ Tensor Tensor::divide(Tensor const &m) const {
   return this->divide(m, output);
 }
 
-Tensor &Tensor::divide(Tensor const &m, Tensor &output) const {
+Tensor &Tensor::divide(Tensor const &m, Tensor &output, ComputeOps *ops) const {
   NNTR_THROW_IF(!getContiguous() || !m.getContiguous() ||
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot divide";
-  itensor_->divide(m, output);
+  itensor_->divide(m, output, ops);
   return output;
 }
 
@@ -639,8 +664,9 @@ Tensor Tensor::add(float const &value) const {
   return add(value, t);
 }
 
-Tensor &Tensor::add(float const &value, Tensor &output) const {
-  itensor_->add(value, output);
+Tensor &Tensor::add(float const &value, Tensor &output,
+                    ComputeOps *ops) const {
+  itensor_->add(value, output, ops);
   return output;
 }
 
@@ -656,9 +682,10 @@ int Tensor::add_i(Tensor const &m, float const alpha) {
 
 int Tensor::add_i_partial(unsigned int len, unsigned int addr_idx, Tensor &m,
                           unsigned int incX, unsigned int incY,
-                          const Tensor alphas, unsigned int alpha_idx) {
+                          const Tensor alphas, unsigned int alpha_idx,
+                               ComputeOps *ops) {
   return itensor_->add_i_partial(len, addr_idx, m, incX, incY, alphas,
-                                 alpha_idx);
+                                 alpha_idx, ops);
 }
 
 Tensor Tensor::add(Tensor const &m, float const alpha) const {
@@ -666,7 +693,7 @@ Tensor Tensor::add(Tensor const &m, float const alpha) const {
   return this->add(m, t, alpha);
 }
 
-Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
+Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha, ComputeOps *ops) const {
   NNTR_THROW_IF(m.getFormat() != this->getFormat(), std::invalid_argument)
     << "Tensor Format of " << getName() << ":"
     << ((bool)(this->getFormat()) ? "NHWC" : "NCHW") << " is not match. ("
@@ -676,7 +703,7 @@ Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot add";
-  itensor_->add(m, output, alpha);
+  itensor_->add(m, output, alpha, ops);
   return output;
 }
 
@@ -710,12 +737,12 @@ Tensor &Tensor::subtract(Tensor const &m, Tensor &output) const {
  * This is to sum the Tensor data according to the dim.batch().
  * Therefore the result has M(dim.batch(), 1, 1, 1) dimension.
  */
-Tensor Tensor::sum_by_batch() const {
+Tensor Tensor::sum_by_batch(ComputeOps *ops) const {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot sum";
 
   Tensor output(batch(), 1, 1, 1, this->getFormat(), getDataType());
-  itensor_->sum_by_batch(output);
+  itensor_->sum_by_batch(output, ops);
   return output;
 }
 
@@ -770,13 +797,13 @@ Tensor &Tensor::sum(const std::vector<unsigned int> &axes, Tensor &output,
   return output;
 }
 
-Tensor &Tensor::abs(Tensor &output) const {
+Tensor &Tensor::abs(Tensor &output, ComputeOps *ops) const {
   if (size() != output.size() || getDataType() != output.getDataType() ||
       getFormat() != output.getFormat())
     throw std::invalid_argument(
       "Error: Tensor::abs requires output tensor to be same size, data type "
       "and format as input tensor.");
-  return itensor_->abs(output);
+  return itensor_->abs(output, ops);
 }
 
 Tensor Tensor::average(unsigned int axis) const {
@@ -876,7 +903,7 @@ Tensor &Tensor::sqrt(Tensor &output) const {
 };
 
 Tensor Tensor::neg() const {
-  Tensor output("", getFormat(), getDataType());
+  Tensor output(getDim());
   return neg(output);
 };
 
@@ -884,7 +911,7 @@ Tensor &Tensor::neg(Tensor &output) const {
   if (size() != output.size() || getDataType() != output.getDataType() ||
       getFormat() != output.getFormat())
     throw std::invalid_argument(
-      "Error: Tensor::sqrt requires output tensor to be same size, data type "
+      "Error: Tensor::neg requires output tensor to be same size, data type "
       "and format as input tensor.");
 
   itensor_->multiply(-1, output);
@@ -930,16 +957,61 @@ void Tensor::tan(Tensor &output, float alpha) const {
   itensor_->tan(output, alpha);
 }
 
+int Tensor::exp_i() {
+  exp(*this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::exp() const {
+  Tensor output("", getFormat(), getDataType());
+  return exp(output);
+}
+
+Tensor &Tensor::exp(Tensor &output) const {
+  itensor_->exp(output);
+  return output;
+}
+
+int Tensor::log_i() {
+  log(*this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::log() const {
+  Tensor output("", getFormat(), getDataType());
+  return log(output);
+}
+
+Tensor &Tensor::log(Tensor &output) const {
+  itensor_->log(output);
+  return output;
+}
+
+int Tensor::clamp_i(float min, float max) {
+  clamp(min, max, *this);
+  return ML_ERROR_NONE;
+}
+
+Tensor Tensor::clamp(float min, float max) const {
+  Tensor output("", getFormat(), getDataType());
+  return clamp(min, max, output);
+}
+
+Tensor &Tensor::clamp(float min, float max, Tensor &output) const {
+  itensor_->clamp(min, max, output);
+  return output;
+}
+
 void Tensor::inv_sqrt_i() { itensor_->inv_sqrt(*this); }
 
-Tensor Tensor::inv_sqrt(Tensor &out) const {
-  itensor_->inv_sqrt(out);
+Tensor Tensor::inv_sqrt(Tensor &out, ComputeOps *ops) const {
+  itensor_->inv_sqrt(out, ops);
   return out;
 }
 
 LazyTensor Tensor::chain() const { return LazyTensor(*this); }
 
-float Tensor::l2norm() const { return itensor_->l2norm(); }
+float Tensor::l2norm(ComputeOps *ops) const { return itensor_->l2norm(ops); }
 
 void Tensor::normalization_i() {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
@@ -1016,11 +1088,11 @@ Tensor Tensor::dot(Tensor const &input, bool trans, bool trans_in) const {
  * in case of trans is false.
  */
 Tensor &Tensor::dot(Tensor const &input, Tensor &output, bool trans,
-                    bool trans_in, float beta) const {
+                    bool trans_in, float beta, ComputeOps *ops) const {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous. Cannot dot product.";
 
-  itensor_->dot(input, output, trans, trans_in, beta);
+  itensor_->dot(input, output, trans, trans_in, beta, ops);
   return output;
 }
 
@@ -1248,7 +1320,7 @@ const std::shared_ptr<MemoryData> Tensor::getMemoryData() const {
 
 size_t Tensor::getOffset() const { return itensor_->getOffset(); }
 
-void Tensor::copy(const Tensor &from) {
+void Tensor::copy(const Tensor &from, ComputeOps *ops) {
   /// @todo enable copy to non-contiguous tensor
   if (!itensor_->getContiguous() || !from.getContiguous()) {
     throw std::runtime_error("Cannot copy non-contiguous tensor");
@@ -1258,14 +1330,14 @@ void Tensor::copy(const Tensor &from) {
       scale_size() == from.scale_size() &&
       getDataType() == from.getDataType()) {
     // if tensor size and data type match, copy data
-    itensor_->copy(from);
+    itensor_->copy(from, ops);
   } else {
     Tensor t = Tensor(from.getDim(), from.getData<char>());
     swap(t, *this);
   }
 }
 
-void Tensor::copyData(const Tensor &from) { itensor_->copyData(from); }
+void Tensor::copyData(const Tensor &from, ComputeOps *ops) { itensor_->copyData(from, ops); }
 
 void Tensor::copy_with_stride(const Tensor &from) {
   if (itensor_->getDim() == from.getDim()) {
@@ -1327,9 +1399,9 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
   unsigned char *dst_data =
     static_cast<unsigned char *>(output.getData<void>());
 
-// Parallel copy using OpenMP
-#pragma omp parallel for schedule(static)
-  for (int i = 0; i < static_cast<int>(indices.size()); ++i) {
+// Parallel copy using ThreadManager
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(indices.size()), [&](size_t i) {
     const unsigned batch_idx = indices[i];
 
     // Calculate memory offsets
@@ -1345,7 +1417,7 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
     // Perform memory copy
     std::memcpy(dst_data + dst_offset, src_data + src_offset,
                 single_batch_bytes);
-  }
+  });
 
   return output;
 }
@@ -1445,10 +1517,10 @@ std::pair<Tensor, Tensor> Tensor::topK(unsigned int k) const {
   return {output, indices};
 }
 
-float Tensor::max_abs() const {
+float Tensor::max_abs(ComputeOps *ops) const {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot get max_abs.";
-  return itensor_->max_abs();
+  return itensor_->max_abs(ops);
 }
 
 float Tensor::maxValue() const { return itensor_->maxValue(); }
@@ -1461,16 +1533,17 @@ Tensor Tensor::transpose(const std::string &direction) const {
   return output;
 }
 
-Tensor &Tensor::transpose(const std::string &direction, Tensor &output) const {
+Tensor &Tensor::transpose(const std::string &direction, Tensor &output,
+                          ComputeOps *ops) const {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous. Cannot transpose.";
 
   if (output.getData<char>() == getData<char>()) {
     Tensor result = clone();
-    return result.transpose(direction, output);
+    return result.transpose(direction, output, ops);
   }
 
-  itensor_->transpose(direction, output);
+  itensor_->transpose(direction, output, ops);
 
   return output;
 }

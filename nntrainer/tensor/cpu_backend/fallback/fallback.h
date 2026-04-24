@@ -1190,6 +1190,11 @@ void dequantize_row_q4_K(const void *x, float *y, int64_t k);
  */
 void dequantize_row_q4_0(const void *x, float *y, int64_t k);
 
+size_t quantize_q1_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights);
+
+void dequantize_row_q1_0(const void *x, float *y, int64_t k);
+
 /**
  * @brief dequantize row of q6_K data to float
  *
@@ -1330,6 +1335,13 @@ void compute_kcaches(const float *in, const BType *kcache, float *output,
                      int gqa_size, int tile_size,
                      size_t local_window_size = UINT_MAX, int head_start = 0,
                      int head_end = -1);
+
+template <>
+void compute_kcaches<uint16_t>(const float *in, const uint16_t *kcache,
+                               float *output, int num_rows, int num_cache_head,
+                               int head_dim, int gqa_size, int tile_size,
+                               size_t local_window_size, int head_start,
+                               int head_end);
 
 /**
  * @brief Compute rotary embedding value

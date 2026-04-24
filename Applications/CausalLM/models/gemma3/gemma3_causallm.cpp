@@ -61,129 +61,120 @@ void Gemma3Transformer::setupParameters(json &cfg, json &generation_cfg,
   }
 }
 
-std::vector<LayerHandle>
+Tensor
 Gemma3Transformer::createTransformerDecoderBlock(const int layer_id,
-                                                 std::string input_name) {
+                                                 Tensor input) {
 
-  std::vector<LayerHandle> layers;
+  using ml::train::createLayer;
 
-  layers.push_back(createLayer(
+  // Attention norm
+  LayerHandle attention_norm = createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-     withKey("input_layers", input_name),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("packed", "false")});
+  Tensor normed = attention_norm(input);
 
-  auto att_layer =
+  // Attention
+  Tensor att_out =
     createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
-                    "layer" + std::to_string(layer_id) + "_attention_norm",
-                    "layer" + std::to_string(layer_id) + "_attention_norm",
-                    "layer" + std::to_string(layer_id) + "_attention_norm");
-  layers.insert(layers.end(), att_layer.begin(), att_layer.end());
+                    normed, normed, normed);
 
-  layers.push_back(createLayer(
-    "rms_norm", {withKey("name", "layer" + std::to_string(layer_id) +
-                                   "_post_attention_norm"),
-                 withKey("input_layers",
-                         "layer" + std::to_string(layer_id) + "_attention_out"),
-                 withKey("epsilon", std::to_string(NORM_EPS)),
-                 withKey("packed", "false")}));
+  // Post attention norm
+  LayerHandle post_attention_norm = createLayer(
+    "rms_norm",
+    {withKey("name", "layer" + std::to_string(layer_id) +
+                       "_post_attention_norm"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("packed", "false")});
+  Tensor post_att_normed = post_attention_norm(att_out);
 
-  layers.push_back(createLayer(
-    "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_post_attention"),
-     withKey("input_layers", input_name + ",layer" + std::to_string(layer_id) +
-                               "_post_attention_norm")}));
+  // Residual addition (input + post_attention_norm)
+  Tensor post_attention = input.add(post_att_normed);
 
-  layers.push_back(createLayer(
+  // Pre FFN norm
+  LayerHandle pre_ffn_norm = createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "pre_ffn_norm"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_post_attention"),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("packed", "false")});
+  Tensor pre_ffn = pre_ffn_norm(post_attention);
 
-  auto ffn_layer =
-    createMlp(layer_id, DIM, INTERMEDIATE_SIZE,
-              "layer" + std::to_string(layer_id) + "pre_ffn_norm");
-  layers.insert(layers.end(), ffn_layer.begin(), ffn_layer.end());
+  // MLP
+  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
 
-  layers.push_back(createLayer(
+  // Post FFN norm
+  LayerHandle post_ffn_norm = createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "post_ffn_norm"),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("packed", "false")});
+  Tensor post_ffn = post_ffn_norm(ffn_out);
 
-  layers.push_back(createLayer(
-    "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) +
-                               "_post_attention,layer" +
-                               std::to_string(layer_id) + "post_ffn_norm")}));
+  // Residual addition (post_attention + post_ffn_norm)
+  Tensor decoder_output = post_attention.add(post_ffn);
 
-  return layers;
+  return decoder_output;
 }
 
-std::vector<LayerHandle> Gemma3Transformer::createAttention(
+Tensor Gemma3Transformer::createAttention(
   const int layer_id, int seq_len, int n_heads, int head_dim,
-  std::string query_name, std::string key_name, std::string value_name) {
-  std::vector<LayerHandle> layers;
+  Tensor query, Tensor key, Tensor value) {
 
-  auto Q = "layer" + std::to_string(layer_id) + "_wq";
-  auto Q_norm = "layer" + std::to_string(layer_id) + "_q_norm";
-  auto K = "layer" + std::to_string(layer_id) + "_wk";
-  auto K_norm = "layer" + std::to_string(layer_id) + "_k_norm";
-  auto V = "layer" + std::to_string(layer_id) + "_wv";
-  auto A = "layer" + std::to_string(layer_id) + "_attention";
-  auto O = "layer" + std::to_string(layer_id) + "_attention_out";
+  using ml::train::createLayer;
 
-  // Q layer
-  std::vector<std::string> q_params = {withKey("name", Q),
-                                       withKey("unit", head_dim * n_heads),
-                                       withKey("disable_bias", "true"),
-                                       withKey("input_layers", query_name),
-                                       withKey("weight_initializer", "ones"),
-                                       withKey("weight_dtype", FC_LAYER_DTYPE)};
-  layers.push_back(createLayer("fully_connected", q_params));
+  auto Q_name = "layer" + std::to_string(layer_id) + "_wq";
+  auto Q_norm_name = "layer" + std::to_string(layer_id) + "_q_norm";
+  auto K_name = "layer" + std::to_string(layer_id) + "_wk";
+  auto K_norm_name = "layer" + std::to_string(layer_id) + "_k_norm";
+  auto V_name = "layer" + std::to_string(layer_id) + "_wv";
+  auto A_name = "layer" + std::to_string(layer_id) + "_attention";
+  auto O_name = "layer" + std::to_string(layer_id) + "_attention_out";
 
-  // K layer
-  std::vector<std::string> k_params = {
-    withKey("name", K),
-    withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true"),
-    withKey("input_layers", key_name),
-    withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
-  layers.push_back(createLayer("fully_connected", k_params));
+  // Q projection
+  LayerHandle q_proj = createLayer(
+    "fully_connected",
+    {withKey("name", Q_name), withKey("unit", head_dim * n_heads),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)});
+  Tensor q = q_proj(query);
 
-  // V layer
-  std::vector<std::string> v_params = {
-    withKey("name", V),
-    withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true"),
-    withKey("input_layers", value_name),
-    withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
-  layers.push_back(createLayer("fully_connected", v_params));
+  // K projection
+  LayerHandle k_proj = createLayer(
+    "fully_connected",
+    {withKey("name", K_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)});
+  Tensor k = k_proj(key);
 
-  // q_norm
-  std::vector<std::string> q_norm_params = {
-    withKey("name", Q_norm), withKey("input_layers", Q),
-    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(head_dim))};
-  layers.push_back(createLayer("reshaped_rms_norm", q_norm_params));
+  // V projection
+  LayerHandle v_proj = createLayer(
+    "fully_connected",
+    {withKey("name", V_name), withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)});
+  Tensor v = v_proj(value);
 
-  // k_norm
-  std::vector<std::string> k_norm_params = {
-    withKey("name", K_norm), withKey("input_layers", K),
-    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(head_dim))};
-  layers.push_back(createLayer("reshaped_rms_norm", k_norm_params));
+  // Q norm
+  LayerHandle q_norm = createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", Q_norm_name), withKey("packed", "false"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(head_dim))});
+  Tensor q_normed = q_norm(q);
+
+  // K norm
+  LayerHandle k_norm = createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", K_norm_name), withKey("packed", "false"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(head_dim))});
+  Tensor k_normed = k_norm(k);
 
   // Attention core layer
   unsigned int window_size = UINT_MAX;
   if (!layer_types.empty()) {
-    if (layer_id < layer_types.size()) {
+    if (layer_id < static_cast<int>(layer_types.size())) {
       if (layer_types[layer_id] == "sliding_attention") {
         window_size = SLIDING_WINDOW;
       }
@@ -193,84 +184,81 @@ std::vector<LayerHandle> Gemma3Transformer::createAttention(
   }
 
   float rope_theta = ROPE_THETA; // Default global
-  if (!layer_types.empty() && layer_id < layer_types.size()) {
+  if (!layer_types.empty() && layer_id < static_cast<int>(layer_types.size())) {
     if (layer_types[layer_id] == "sliding_attention") {
       rope_theta = 10000.0f;
     }
   }
 
-  std::vector<std::string> a_params = {
-    withKey("name", A),
-    withKey("num_heads", n_heads),
-    withKey("num_heads_kv", n_heads / GQA_SIZE),
-    withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
-    withKey("sliding_window", window_size),
-    withKey("rope_theta", std::to_string(rope_theta)),
-    withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-    withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
-    withKey("is_causal", IS_CAUSAL ? "true" : "false"),
-    withKey("input_layers", {Q_norm, K_norm, V})};
-  layers.push_back(createLayer("mha_core", a_params));
+  LayerHandle attn = createLayer(
+    "mha_core",
+    {withKey("name", A_name), withKey("num_heads", n_heads),
+     withKey("num_heads_kv", n_heads / GQA_SIZE),
+     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+     withKey("sliding_window", window_size),
+     withKey("rope_theta", std::to_string(rope_theta)),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
+     withKey("is_causal", IS_CAUSAL ? "true" : "false")});
+  Tensor a = attn({q_normed, k_normed, v});
 
-  // O layer
-  std::vector<std::string> o_params = {withKey("name", O),
-                                       withKey("unit", DIM),
-                                       withKey("disable_bias", "true"),
-                                       withKey("input_layers", A),
-                                       withKey("weight_initializer", "ones"),
-                                       withKey("weight_dtype", FC_LAYER_DTYPE)};
-  layers.push_back(createLayer("fully_connected", o_params));
+  // O projection
+  LayerHandle o_proj = createLayer(
+    "fully_connected",
+    {withKey("name", O_name), withKey("unit", DIM),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)});
+  Tensor o = o_proj(a);
 
-  return layers;
+  return o;
 }
 
-std::vector<LayerHandle> Gemma3Transformer::createMlp(const int layer_id,
-                                                      int dim, int hidden_dim,
-                                                      std::string input_name) {
-  std::vector<LayerHandle> layers;
+Tensor Gemma3Transformer::createMlp(const int layer_id, int dim,
+                                     int hidden_dim, Tensor input) {
+
+  using ml::train::createLayer;
 
   // Gate projection
-  layers.push_back(createLayer(
+  LayerHandle gate_proj = createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("input_layers", input_name), withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE)}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)});
+  Tensor gate = gate_proj(input);
 
   // GeLU
-  layers.push_back(createLayer(
+  LayerHandle gelu = createLayer(
     "activation",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate_gelu"),
-     withKey("activation", "tanh_gelu"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_ffn_gate")}));
+     withKey("activation", "tanh_gelu")});
+  Tensor gate_activated = gelu(gate);
 
   // Up projection
-  layers.push_back(createLayer(
+  LayerHandle up_proj = createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("input_layers", input_name), withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE)}));
+     withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE)});
+  Tensor up = up_proj(input);
 
-  // Multiply
-  layers.push_back(createLayer(
+  // Multiply (geglu)
+  LayerHandle multiply = createLayer(
     "multiply",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) +
-                               "_ffn_gate_gelu,layer" +
-                               std::to_string(layer_id) + "_ffn_up")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu")});
+  Tensor geglu = multiply({gate_activated, up});
 
   // Down projection
-  layers.push_back(createLayer(
+  LayerHandle down_proj = createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_geglu"),
      withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE)}));
+     withKey("weight_dtype", FC_LAYER_DTYPE)});
+  Tensor down = down_proj(geglu);
 
-  return layers;
+  return down;
 }
 
 void Gemma3Transformer::registerCustomLayers() {

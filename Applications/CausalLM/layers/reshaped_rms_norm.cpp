@@ -37,11 +37,7 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
 }
 
 void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
-                                      bool training) {}
-
-void ReshapedRMSNormLayer::incremental_forwarding(
-  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
+                                      bool training) {
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
@@ -54,12 +50,12 @@ void ReshapedRMSNormLayer::incremental_forwarding(
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
 
-  unsigned int _from = from;
+  unsigned int step_size = in_dim.height();
 
   in_step_dim.batch(1);
-  in_step_dim.height(to - from);
+  in_step_dim.height(step_size);
   out_step_dim.batch(1);
-  out_step_dim.height(to - from);
+  out_step_dim.height(step_size);
 
   // set reshaped dim to (1, 1, -1, feature_size)
   ml::train::TensorDim step_reshaped_dim = in_step_dim;
@@ -76,14 +72,10 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     nntrainer::Tensor out_step =
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
-    // reshape in_step
-    // reshape out_step
     in_step.reshape(step_reshaped_dim);
     out_step.reshape(step_reshaped_dim);
 
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      ///@todo rms_norm_wrt_width_something() should be refactored to
-      /// nntrainer::Tensor operation.
 #ifdef ENABLE_FP16
       nntrainer::rms_norm_wrt_width_fp16_intrinsic(
         in_step.getData<float>(), out_step.getData<float>(),
@@ -99,13 +91,7 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     }
     out_step.multiply_i(gamma);
 
-    // reshape again out_step
     out_step.reshape(out_step_dim);
-
-#ifdef DEBUG
-    std::cout << context.getName() << " \n input:" << in_step
-              << "output:" << out_step << "gamma:" << gamma << std::endl;
-#endif
   }
 }
 

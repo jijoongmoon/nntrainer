@@ -17,7 +17,7 @@
 #ifdef __cplusplus
 
 #include <common_properties.h>
-#include <cpu_backend.h>
+#include <compute_ops.h>
 
 #if defined(_WIN32)
 #define _USE_MATH_DEFINES
@@ -193,7 +193,14 @@ public:
       T max_value = *std::max_element(ptr, ptr + width);
 
       tmp.setValue(max_value);
-      saxpy(width, -1, tmp.getData<T>(), 1, ptr, 1);
+      if constexpr (std::is_same_v<T, float>)
+        getComputeOps()->saxpy_fp32(width, -1, tmp.getData<T>(), 1, ptr, 1);
+#ifdef ENABLE_FP16
+      else if constexpr (std::is_same_v<T, _FP16>)
+        getComputeOps()->saxpy_fp16(width, -1, tmp.getData<T>(), 1, ptr, 1);
+#endif
+      else
+        saxpy(width, -1, tmp.getData<T>(), 1, ptr, 1);
     }
 
     // take exp
@@ -270,8 +277,19 @@ public:
             }
             tmp.setValue(0, 0, 0, w1, sum);
           }
-          scopy(width, tmp_data, 1, outgoing_derivative_data + bch_offset,
-                output_width_stride);
+          if constexpr (std::is_same_v<T, float>)
+            getComputeOps()->scopy_fp32(width, tmp_data, 1,
+                                       outgoing_derivative_data + bch_offset,
+                                       output_width_stride);
+#ifdef ENABLE_FP16
+          else if constexpr (std::is_same_v<T, _FP16>)
+            getComputeOps()->scopy_fp16(width, tmp_data, 1,
+                                       outgoing_derivative_data + bch_offset,
+                                       output_width_stride);
+#endif
+          else
+            scopy(width, tmp_data, 1, outgoing_derivative_data + bch_offset,
+                  output_width_stride);
         }
       }
     }
@@ -436,8 +454,8 @@ public:
    */
   template <typename T = float>
   static Tensor &gelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
-                       t_out.getData<float>());
+    getComputeOps()->gelu_v2_fp32(t_in.size(), t_in.getData<float>(),
+                                  t_out.getData<float>());
     return t_out;
   }
 
@@ -477,8 +495,8 @@ public:
    */
   template <typename T = float>
   static Tensor &tanhGelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
-                         t_out.getData<float>());
+    getComputeOps()->tanh_gelu_fp32(t_in.size(), t_in.getData<float>(),
+                                    t_out.getData<float>());
     return t_out;
   }
 

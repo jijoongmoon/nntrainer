@@ -33,7 +33,9 @@ namespace nntrainer {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 InputLayer::InputLayer() :
-  Layer(), input_props(props::Normalization(), props::Standardization()) {}
+  Layer(),
+  input_props(props::Normalization(), props::Standardization(),
+              props::TensorDataType()) {}
 
 void InputLayer::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, input_props);
@@ -73,13 +75,29 @@ void InputLayer::exportTo(Exporter &exporter,
 void InputLayer::finalize(InitLayerContext &context) {
 
   std::vector<TensorDim> output_dims = context.getInputDimensions();
+
+  // Use explicit tensor_dtype if set, otherwise use model's activation type
+  auto &dtype_prop = std::get<props::TensorDataType>(input_props);
+  ml::train::TensorDim::DataType dtype;
+
+  // Check if tensor_dtype was explicitly set (not default FP32 from constructor)
+  // by comparing with the activation data type
+  if (dtype_prop.get() != context.getActivationDataType() &&
+      dtype_prop.get() != ml::train::TensorDim::DataType::FP32) {
+    // Explicitly set to a non-default type (e.g., UINT16 for KV cache)
+    dtype = dtype_prop.get();
+  } else {
+    // Use model's activation data type (original behavior)
+    dtype = context.getActivationDataType();
+  }
+
   for (auto &d : output_dims) {
-    d.setDataType(context.getActivationDataType());
+    d.setDataType(dtype);
   }
 
   context.setOutputDimensions(output_dims);
   is_inplace = true;
-  if (context.getActivationDataType() != ml::train::TensorDim::DataType::FP32)
+  if (dtype != ml::train::TensorDim::DataType::FP32)
     is_inplace = false;
 }
 

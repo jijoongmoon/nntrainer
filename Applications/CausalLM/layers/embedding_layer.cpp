@@ -11,8 +11,10 @@
  * @note   This embedding layer supports FP32/FP16/Q6_K data type only.
  */
 
+#include <cpu_backend.h>
 #include <embedding_layer.h>
 #include <layer_context.h>
+#include <thread_manager.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -84,19 +86,12 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
-                                bool training) {}
-
-void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                            unsigned int from, unsigned int to,
-                                            bool training) {
-
-  /// @todo get input and output dimension from input_ and hidden itself
+                                bool training) {
   unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
   unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
   float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
                   ? 1.0f
                   : std::get<nntrainer::props::Scale>(embedding_props).get();
-  unsigned int _from = from;
 
   nntrainer::Tensor &weight = context.getWeight(weight_idx);
   nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -106,16 +101,15 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
 
   unsigned int b_size = input_.batch();
+  unsigned int iter = input_.height();
 
   for (unsigned int b = 0; b < b_size; ++b) {
     float *in_data =
       input_.getAddress<float>(b * input_.getDim().getFeatureLen());
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
 
-    int iter = to - from;
-
-#pragma omp parallel for
-    for (int i = 0; i < iter; ++i) {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
       size_t embed_idx = static_cast<size_t>(in_data[i]);
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
@@ -127,14 +121,12 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
       if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
-        ///@note this should be replaced with quantizer operation
         int num_blocks_per_row = (weight.width() + 256 - 1) / 256;
         nntrainer::dequantize_row_q6_K(
           (void *)((char *)weight.getData<uint8_t>() +
                    (210 * num_blocks_per_row) * embed_idx),
           out_tensor.getData(), out_dim);
       } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
-        ///@note this should be replaced with quantizer operation
         int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
         nntrainer::dequantize_row_q4_0(
           (void *)((char *)weight.getData<uint8_t>() +
@@ -147,14 +139,22 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       if (scale != 1.0f) {
         out_tensor.multiply_i(scale);
       }
-    }
-
-#ifdef DEBUG
-    std::cout << context.getName() << " : "
-              << "\n input:" << input_ << "\n weight: " << weight
-              << "\n hidden: " << hidden_ << std::endl;
-#endif
+    });
   }
+}
+
+void EmbeddingLayer::updateTensorsByInputDimensions(
+  nntrainer::RunLayerContext &context,
+  std::vector<nntrainer::TensorDim> input_dimensions) {
+  unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
+
+  // Input: (batch, 1, seq_len, 1) - token IDs
+  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
+
+  // Output: (batch, 1, seq_len, out_dim)
+  ml::train::TensorDim output_dim = context.getOutput(SINGLE_INOUT_IDX).getDim();
+  output_dim.height(input_dimensions[0].height());
+  context.updateOutput(SINGLE_INOUT_IDX, output_dim);
 }
 
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {

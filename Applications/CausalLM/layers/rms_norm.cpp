@@ -33,11 +33,7 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
 }
 
 void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
-                              bool training) {}
-
-void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                          unsigned int from, unsigned int to,
-                                          bool training) {
+                              bool training) {
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
@@ -50,12 +46,12 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
 
-  unsigned int _from = from;
+  unsigned int step_size = in_dim.height();
 
   in_step_dim.batch(1);
-  in_step_dim.height(to - from);
+  in_step_dim.height(step_size);
   out_step_dim.batch(1);
-  out_step_dim.height(to - from);
+  out_step_dim.height(step_size);
 
   unsigned int b_size = in_dim.batch();
 
@@ -74,11 +70,6 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         "Error: not yet implemented for this data type");
     }
     out_step.multiply_i(gamma);
-
-#ifdef DEBUG
-    std::cout << context.getName() << " \n input:" << in_step
-              << "output:" << out_step << "gamma:" << gamma << std::endl;
-#endif
   }
 }
 

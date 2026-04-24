@@ -3,6 +3,13 @@ causallm_src = [
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
     meson.current_source_dir() / 'api' / 'model_config.cpp',
+    meson.current_source_dir() / 'jinja' / 'value.cpp',
+    meson.current_source_dir() / 'jinja' / 'lexer.cpp',
+    meson.current_source_dir() / 'jinja' / 'parser.cpp',
+    meson.current_source_dir() / 'jinja' / 'evaluator.cpp',
+    meson.current_source_dir() / 'chat_template_engine.cpp',
+    meson.current_source_dir() / 'chat_template.cpp',
+    meson.current_source_dir() / 'kv_cache_manager.cpp',
 ]
 
 executable_src = [
@@ -10,7 +17,7 @@ executable_src = [
 ]
 
 causallm_inc_abs = [meson.current_source_dir()]
-causallm_inc = [include_directories('.')]
+causallm_inc = [include_directories('.'), include_directories('jinja')]
 
 # Build layer dependency
 causallm_layer_dependencies = []
@@ -98,3 +105,37 @@ test_api = executable('test_api',
     build_by_default: true,
     install: false,
 )
+
+# KVCacheManager unit tests
+if get_option('enable-test')
+  unittest_kv_cache_manager = executable(
+    'unittest_kv_cache_manager',
+    meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_dep, causallm_dep],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_kv_cache_manager', unittest_kv_cache_manager,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_kv_cache_manager'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  unittest_forwarding_equiv = executable(
+    'unittest_forwarding_equivalence',
+    meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_forwarding_equivalence.cpp',
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_dep, causallm_dep,
+                   causallm_layer_dependencies],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_forwarding_equivalence', unittest_forwarding_equiv,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_forwarding_equivalence'),
+    timeout: 120,
+    suite: 'unittests'
+  )
+endif

@@ -11,8 +11,8 @@
  * @note   This layer only supports inference mode.
  */
 
-#ifndef __RMS_NORM_LAYER_H__
-#define __RMS_NORM_LAYER_H__
+#ifndef __RESHAPED_RMS_NORM_LAYER_H__
+#define __RESHAPED_RMS_NORM_LAYER_H__
 
 #pragma once
 #ifdef _WIN32
@@ -68,14 +68,6 @@ public:
    */
   WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
                              bool training) override;
-
-  /**
-   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
-   * int from, unsigned int to, bool training)
-   */
-  WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
-                                         unsigned int from, unsigned int to,
-                                         bool training) override;
 
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)

@@ -337,9 +337,23 @@ void NetworkGraph::resetInputDimension(std::vector<TensorDim> dims) {
   if (allocated)
     deallocateTensors();
 
+  // When multiple input dims are provided, assign each to its corresponding
+  // input layer by index. Non-input layers receive dims[0] for compatibility.
+  unsigned int input_layer_idx = 0;
   for (auto iter = cbegin(); iter != cend(); iter++) {
     if ((*iter)->isFinalized()) {
-      (*iter)->updateTensorsByInputDimensions(dims);
+      bool is_input = false;
+      try {
+        is_input = ((*iter)->getType() == "input");
+      } catch (...) {}
+
+      if (is_input && dims.size() > 1 && input_layer_idx < dims.size()) {
+        // Give each input layer its own dimension
+        (*iter)->updateTensorsByInputDimensions({dims[input_layer_idx]});
+        input_layer_idx++;
+      } else {
+        (*iter)->updateTensorsByInputDimensions(dims);
+      }
     }
   }
 

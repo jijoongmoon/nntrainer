@@ -30,6 +30,7 @@ layer_sources = [
   'conv2d_transpose_layer.cpp',
   'conv2d_layer.cpp',
   'conv1d_layer.cpp',
+  'depthwise_conv1d_layer.cpp',
   'fc_layer.cpp',
   'flatten_layer.cpp',
   'input_layer.cpp',
@@ -62,7 +63,9 @@ layer_sources = [
   'positional_encoding_layer.cpp',
   'identity_layer.cpp',
   'upsample2d_layer.cpp',
-  'channel_shuffle.cpp'
+  'channel_shuffle.cpp',
+  'group_normalization_layer.cpp',
+  'instance_normalization_layer.cpp'
 ]
 
 layer_headers = [

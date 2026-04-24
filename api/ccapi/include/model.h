@@ -32,10 +32,13 @@
 
 namespace nntrainer {
 class RunLayerContext;
+class Tensor;
 }
 /** Define more aliases for the model in the API */
 namespace ml {
 namespace train {
+
+class Tensor; // Forward declaration for graph-based compile
 
 /**
  * @brief     Statistics from running or training a model
@@ -94,7 +97,11 @@ for inference and training without any configurations*/
     ML_TRAIN_MODEL_FORMAT_FLATBUFFER,             /**< flatbuffer file */
   MODEL_FORMAT_ONNX = ML_TRAIN_MODEL_FORMAT_ONNX, /**< ONNX file */
 
-  MODEL_FORMAT_QNN = ML_TRAIN_MODEL_FORMAT_QNN /**< qnn binary file */
+  MODEL_FORMAT_QNN = ML_TRAIN_MODEL_FORMAT_QNN, /**< qnn binary file */
+
+  MODEL_FORMAT_SAFETENSORS =
+    ML_TRAIN_MODEL_FORMAT_SAFETENSORS /**< safetensors format with JSON header
+                                        for name-based parallel loading */
 };
 
 /**
@@ -141,6 +148,52 @@ public:
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
   virtual int compile(ExecutionMode exec_mode_ = ExecutionMode::TRAIN) = 0;
+
+  /**
+   * @brief     Compile from symbolic tensor graph.
+   *
+   * Extracts the computation graph by walking backwards from output to input,
+   * then adds all discovered layers (with input_layers connections) and
+   * compiles. This replaces manual addLayer() + input_layers strings.
+   *
+   * @param input  Leaf symbolic tensor (model input)
+   * @param output Output symbolic tensor (model output)
+   * @param mode   Execution mode (default: TRAIN)
+   * @retval #ML_ERROR_NONE Successful.
+   */
+  int compile(Tensor &input, Tensor &output,
+              ExecutionMode mode = ExecutionMode::INFERENCE);
+
+  /**
+   * @brief     Compile from symbolic tensor graph with multiple outputs.
+   *
+   * Extracts the computation graph by walking backwards from each output to
+   * the input, then adds all discovered layers and compiles. This supports
+   * models with multiple output heads (e.g., YOLOv3 with 3 loss layers).
+   *
+   * @param input   Leaf symbolic tensor (model input)
+   * @param outputs Vector of output symbolic tensors
+   * @param mode    Execution mode (default: TRAIN)
+   * @retval #ML_ERROR_NONE Successful.
+   */
+  int compile(Tensor &input, std::vector<Tensor> &outputs,
+              ExecutionMode mode = ExecutionMode::INFERENCE);
+
+  /**
+   * @brief     Compile from symbolic tensor graph with multiple inputs and
+   *            multiple outputs.
+   *
+   * Extracts the computation graph by walking backwards from each output to
+   * discover all layers. Supports models with multiple input heads and
+   * multiple output heads.
+   *
+   * @param inputs  Vector of leaf symbolic tensors (model inputs)
+   * @param outputs Vector of output symbolic tensors
+   * @param mode    Execution mode (default: TRAIN)
+   * @retval #ML_ERROR_NONE Successful.
+   */
+  int compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
+              ExecutionMode mode = ExecutionMode::INFERENCE);
 
   /**
    * @brief     Initialize Network. This should be called after setting the
@@ -292,6 +345,26 @@ public:
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
   virtual int getLayer(const char *name, std::shared_ptr<Layer> *layer) = 0;
+
+  /**
+   * @brief     Bind an external tensor to a layer's tensor slot.
+   *            The tensor is NOT copied — the pointer must remain valid.
+   *            This is used for zero-copy external buffer injection
+   *            (e.g., KV cache managed by an external cache manager).
+   *
+   * @param[in] layer_name Name of the target layer
+   * @param[in] tensor_idx Index of the tensor slot in the layer
+   * @param[in] tensor Pointer to external tensor (not owned by model)
+   *
+   * @note Example:
+   * @code
+   *   nntrainer::Tensor cache_key(cache_dim, true);
+   *   model->setLayerExternalTensor("layer0_attention", 0, &cache_key);
+   * @endcode
+   */
+  virtual void setLayerExternalTensor(const std::string &layer_name,
+                                      unsigned int tensor_idx,
+                                      nntrainer::Tensor *tensor) = 0;
 
   /**
    * @brief     get input dimension of a model

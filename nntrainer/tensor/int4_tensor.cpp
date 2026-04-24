@@ -11,7 +11,7 @@
 #include <iomanip>
 #include <iostream>
 
-#include <cpu_backend.h>
+#include <compute_ops.h>
 #include <int4_tensor.h>
 #include <tensor.h>
 
@@ -101,7 +101,7 @@ Int4QTensor::Int4QTensor(
   }
 
   // copy scale factors
-  scopy(scale_size(), scales.data(), 1, (float *)getScale(), 1);
+  getComputeOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 }
 
 bool Int4QTensor::operator==(const Int4QTensor &rhs) const {
@@ -304,12 +304,12 @@ void Int4QTensor::initialize(Initializer init) {
   initialize();
 }
 
-void Int4QTensor::copy(const Tensor &from) {
+void Int4QTensor::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-void Int4QTensor::copyData(const Tensor &from) {
+void Int4QTensor::copyData(const Tensor &from, ComputeOps *ops) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -446,7 +446,7 @@ std::vector<unsigned int> Int4QTensor::argmin() const {
   return result;
 }
 
-float Int4QTensor::max_abs() const {
+float Int4QTensor::max_abs(ComputeOps *ops) const {
   int8_t abs_max_val = 0;
   int8_t curr_val;
   for (unsigned int idx = 0; idx < size(); ++idx) {
@@ -582,11 +582,11 @@ void Int4QTensor::copy(const void *buf) {
     return;
   }
   // copy tensor data
-  scopy((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(), 1);
+  getComputeOps()->scopy_s8((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(), 1);
 
   // copy scale factor data
   float *scales = (float *)(((int8_t *)buf) + (size() + 1) / 2);
-  scopy(scale_size(), scales, 1, (float *)getScale(), 1);
+  getComputeOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
 }
 
 void Int4QTensor::save_quantization_info(std::ostream &file) {

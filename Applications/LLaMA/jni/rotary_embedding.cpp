@@ -95,53 +95,6 @@ void RotaryEmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
-void RotaryEmbeddingLayer::incremental_forwarding(
-  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
-
-  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
-
-  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    for (int b = 0; b < (int)in.batch(); b++) {
-      for (int c = 0; c < (int)in.channel(); c++) {
-        for (int h = 0; h < (int)in.height(); h++) {
-          for (int w = 0; w < (int)in.width(); w = w + 2) {
-            float *data = in.getAddress(b, c, h, w);
-            float real = data[0];
-            float imag = data[1];
-            std::tie(real, imag) =
-              apply_rotary_emb(real, imag, freqs_cis, h, w);
-            out.setValue(b, c, h, w, real);
-            out.setValue(b, c, h, w + 1, imag);
-          }
-        }
-      }
-    }
-  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
-    for (int b = 0; b < (int)in.batch(); b++) {
-      for (int c = 0; c < (int)in.channel(); c++) {
-        for (int h = 0; h < (int)in.height(); h++) {
-          for (int w = 0; w < (int)in.width(); w = w + 2) {
-#ifdef ENABLE_FP16
-            _FP16 *data = in.getAddress<_FP16>(b, c, h, w);
-            float real = static_cast<float>(data[0]);
-            float imag = static_cast<float>(data[1]);
-            std::tie(real, imag) =
-              apply_rotary_emb(real, imag, freqs_cis, h, w);
-            out.setValue(b, c, h, w, static_cast<_FP16>(real));
-            out.setValue(b, c, h, w + 1, static_cast<_FP16>(imag));
-#else
-            throw std::invalid_argument("enable-fp16 is not set");
-
-#endif
-          }
-        }
-      }
-    }
-  }
-}
-
 void RotaryEmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   // std::throw_with_nested(std::runtime_error("Training is not supported
   // yet."));
