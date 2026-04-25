@@ -40,10 +40,10 @@ struct CallCounters {
 
 CallCounters *g_counters = nullptr;
 
-void mock_sgemm(unsigned int o, bool tA, bool tB, unsigned int M, unsigned int N,
-                unsigned int K, float a, const float *A, unsigned int lda,
-                const float *B, unsigned int ldb, float b, float *C,
-                unsigned int ldc) {
+void mock_sgemm(unsigned int o, bool tA, bool tB, unsigned int M,
+                unsigned int N, unsigned int K, float a, const float *A,
+                unsigned int lda, const float *B, unsigned int ldb, float b,
+                float *C, unsigned int ldc) {
   if (g_counters)
     g_counters->sgemm++;
   nntrainer::getComputeOps()->sgemm_fp32(o, tA, tB, M, N, K, a, A, lda, B, ldb,
@@ -215,44 +215,34 @@ TEST_F(ComputeOpsDispatchTest, ResultInheritsContextDataFromOperand) {
 }
 
 /**
- * @brief When the caller passes an explicit ComputeOps* override, it
- *        wins over both the attached ContextData and the global table.
- *        Validates priority order in Tensor::resolveOps.
+ * @brief Replacing the attached ContextData with a different mock
+ *        rebinds dispatch on subsequent calls. This is the "swap
+ *        backend at runtime" property — important for hot-swapping
+ *        between vendor contexts on the same Tensor.
  */
-TEST_F(ComputeOpsDispatchTest, ExplicitOpsParamWinsOverContextData) {
-  // Build a SECOND mock with separate counters that only the explicit
-  // override should hit.
-  CallCounters override_counters;
-  CallCounters *prev = g_counters;
-
-  nntrainer::ComputeOps override_ops = *nntrainer::getComputeOps();
-  override_ops.ele_mul_fp32 = [](unsigned int N, const float *X,
-                                 const float *Y, float *Z, float a, float b,
-                                 unsigned int is, unsigned int os) {
-    nntrainer::getComputeOps()->ele_mul_fp32(N, X, Y, Z, a, b, is, os);
-    // tag: write to a static counter via &override_counters captured by
-    // file-static (lambda cannot capture) - use g_counters swap instead.
-  };
-  // Simpler: temporarily redirect g_counters to override_counters during
-  // the explicit-ops call and check mock_ele_mul was hit.
+TEST_F(ComputeOpsDispatchTest, SwappingContextDataRebindsDispatch) {
   nntrainer::Tensor a(1, 1, 1, 8);
   nntrainer::Tensor b(1, 1, 1, 8);
   a.setValue(2.0f);
   b.setValue(3.0f);
-  nntrainer::Tensor out(1, 1, 1, 8);
+  nntrainer::Tensor out1(1, 1, 1, 8);
+  nntrainer::Tensor out2(1, 1, 1, 8);
 
   a.setContextData(ct_data);
-  int before_attached = counters->ele_mul.load();
+  a.multiply(b, out1);
+  int after_first = counters->ele_mul.load();
+  EXPECT_GT(after_first, 0);
 
-  // Pass override_ops explicitly; since override_ops uses the GLOBAL
-  // ele_mul (not mock_ele_mul), the attached ct_data's mock counter
-  // must NOT increment.
-  a.multiply(b, out, /*beta=*/0.0f, &override_ops);
+  // Swap to a fresh ContextData carrying its OWN ComputeOps that does
+  // NOT touch the original counters.
+  nntrainer::ComputeOps fresh_ops = *nntrainer::getComputeOps();
+  auto fresh_ct = std::make_shared<nntrainer::ContextData>();
+  fresh_ct->setComputeOps(&fresh_ops);
+  a.setContextData(fresh_ct);
 
-  EXPECT_EQ(counters->ele_mul.load(), before_attached)
-    << "explicit ops parameter must override attached ContextData";
-  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, 0), 6.0f);
-  g_counters = prev;
+  a.multiply(b, out2);
+  // The original mock counter must not have advanced.
+  EXPECT_EQ(counters->ele_mul.load(), after_first);
 }
 
 int main(int argc, char **argv) {
