@@ -22,9 +22,7 @@
 #include <tensor.h>
 #include <util_func.h>
 
-#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-#include "blas_kernels.h"
-#endif
+#include <compute_ops.h>
 
 namespace nntrainer {
 
@@ -339,27 +337,29 @@ Tensor FloatTensor::multiply_strided(Tensor const &m, Tensor &output,
   return output;
 }
 
-int FloatTensor::multiply_i(float const &value) {
+int FloatTensor::multiply_i(float const &value, ComputeOps *ops) {
   float *data = (float *)getData();
   unsigned int len = size();
-
-  sscal(len, value, data, 1);
+  auto *o = ops ? ops : getComputeOps();
+  o->sscal_fp32(len, value, data, 1);
 
   return ML_ERROR_NONE;
 }
 
-Tensor &FloatTensor::multiply(float const &value, Tensor &out) const {
+Tensor &FloatTensor::multiply(float const &value, Tensor &out,
+                              ComputeOps *ops) const {
   auto f = std::bind(std::multiplies<float>(), std::placeholders::_1, value);
   apply(f, out);
   return out;
 }
 
-Tensor &FloatTensor::multiply(Tensor const &m, Tensor &output,
-                              const float beta) const {
+Tensor &FloatTensor::multiply(Tensor const &m, Tensor &output, const float beta,
+                              ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    ele_mul(e.buffer_size, buf, m_buf, out_buf, 1, beta, e.strides[3],
-            strides[3]);
+    o->ele_mul_fp32(e.buffer_size, buf, m_buf, out_buf, 1, beta, e.strides[3],
+                    strides[3]);
   };
 
   NNTR_THROW_IF(m.getFormat() != this->getFormat(), std::invalid_argument)
@@ -379,16 +379,20 @@ Tensor &FloatTensor::multiply(Tensor const &m, Tensor &output,
   return output;
 }
 
-Tensor &FloatTensor::divide(float const &value, Tensor &output) const {
+Tensor &FloatTensor::divide(float const &value, Tensor &output,
+                            ComputeOps *ops) const {
   auto f = std::bind(std::divides<float>(), std::placeholders::_1, value);
   apply(f, output);
   return output;
 }
 
-Tensor &FloatTensor::divide(Tensor const &m, Tensor &output) const {
+Tensor &FloatTensor::divide(Tensor const &m, Tensor &output,
+                            ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    ele_div(e.buffer_size, buf, m_buf, out_buf, 1, 0, e.strides[3], strides[3]);
+    o->ele_div_fp32(e.buffer_size, buf, m_buf, out_buf, 1, 0, e.strides[3],
+                    strides[3]);
   };
 
   apply_broadcast(m, f, output);
@@ -451,25 +455,29 @@ Tensor &FloatTensor::add_strided(Tensor const &input, Tensor &output,
 
 int FloatTensor::add_i_partial(unsigned int len, unsigned int addr_idx,
                                Tensor &m, unsigned int incX, unsigned int incY,
-                               const Tensor alphas, unsigned int alpha_idx) {
-  saxpy(len, alphas.getValue<float>(alpha_idx), m.getData<float>(), incX,
-        (float *)getAddress(addr_idx), incY);
+                               const Tensor alphas, unsigned int alpha_idx,
+                               ComputeOps *ops) {
+  auto *o = ops ? ops : getComputeOps();
+  o->saxpy_fp32(len, alphas.getValue<float>(alpha_idx), m.getData<float>(),
+                incX, (float *)getAddress(addr_idx), incY);
 
   return ML_ERROR_NONE;
 }
 
-Tensor &FloatTensor::add(float const &value, Tensor &output) const {
+Tensor &FloatTensor::add(float const &value, Tensor &output,
+                         ComputeOps *ops) const {
   auto f = std::bind(std::plus<float>(), std::placeholders::_1, value);
   apply(f, output);
   return output;
 }
 
-Tensor &FloatTensor::add(Tensor const &m, Tensor &output,
-                         float const alpha) const {
+Tensor &FloatTensor::add(Tensor const &m, Tensor &output, float const alpha,
+                         ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   auto f = [&](const BroadcastInfo &e, const float *buf, const float *m_buf,
                float *out_buf) {
-    ele_add(e.buffer_size, buf, m_buf, out_buf, alpha, 0, e.strides[3],
-            strides[3]);
+    o->ele_add_fp32(e.buffer_size, buf, m_buf, out_buf, alpha, 0, e.strides[3],
+                    strides[3]);
   };
   apply_broadcast(m, f, output);
   return output;
@@ -481,7 +489,8 @@ Tensor &FloatTensor::subtract(float const &value, Tensor &output) const {
   return output;
 }
 
-void FloatTensor::sum_by_batch(Tensor &output) const {
+void FloatTensor::sum_by_batch(Tensor &output, ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   size_t feat_len = dim.getFeatureLen();
   size_t batch = dim.batch();
 
@@ -490,8 +499,9 @@ void FloatTensor::sum_by_batch(Tensor &output) const {
 
   Tensor ones(1, 1, 1, feat_len, this->getFormat());
   ones.setValue(1.0);
-  sgemv((unsigned int)dim.getStorageOrder(), false, (int)batch, (int)feat_len,
-        1, data, (int)feat_len, ones.getData<float>(), 1, 0.0, out_data, 1);
+  o->sgemv_fp32((unsigned int)dim.getStorageOrder(), false, (int)batch,
+                (int)feat_len, 1, data, (int)feat_len, ones.getData<float>(), 1,
+                0.0, out_data, 1);
 }
 
 Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
@@ -506,7 +516,8 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
 
   if (dim.getDim()[axis] == 1 and alpha == 1.0 and !beta) {
     CREATE_IF_EMPTY_DIMS(output, dim);
-    scopy(size(), (float *)getData(), 1, output.getData<float>(), 1);
+    getComputeOps()->scopy_fp32(size(), (float *)getData(), 1,
+                                output.getData<float>(), 1);
     return output;
   }
 
@@ -518,9 +529,10 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
     size_t batch = dim.batch();
     Tensor ones(1, 1, 1, batch, getTensorType());
     ones.setValue(alpha);
-    sgemv((unsigned int)dim.getStorageOrder(), true, (int)batch, (int)feat_len,
-          1, data, (int)feat_len, ones.getData<float>(), 1, beta,
-          output.getData<float>(), 1);
+    getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), true,
+                                (int)batch, (int)feat_len, 1, data,
+                                (int)feat_len, ones.getData<float>(), 1, beta,
+                                output.getData<float>(), 1);
   } break;
   case 1: {
     CREATE_IF_EMPTY_DIMS(output, dim[0], 1, dim[2], dim[3], getTensorType());
@@ -529,9 +541,10 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       unsigned int t_axis = dim[1];
       Tensor ones(1, 1, 1, t_axis, getTensorType());
       ones.setValue(alpha);
-      sgemv((unsigned int)dim.getStorageOrder(), false, (int)feat_len,
-            (int)t_axis, 1, data, (int)t_axis, ones.getData<float>(), 1, beta,
-            output.getData<float>(), 1);
+      getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), false,
+                                  (int)feat_len, (int)t_axis, 1, data,
+                                  (int)t_axis, ones.getData<float>(), 1, beta,
+                                  output.getData<float>(), 1);
     } else {
       unsigned int feat_len = dim[2] * dim[3];
       unsigned int t_axis = dim[1];
@@ -539,9 +552,10 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       ones.setValue(alpha);
       float *rdata = output.getData<float>();
       for (unsigned int k = 0; k < dim[0]; ++k) {
-        sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
-              (int)feat_len, 1, &data[k * dim.getFeatureLen()], (int)feat_len,
-              ones.getData<float>(), 1, beta, &rdata[k * feat_len], 1);
+        getComputeOps()->sgemv_fp32(
+          (unsigned int)dim.getStorageOrder(), true, (int)t_axis, (int)feat_len,
+          1, &data[k * dim.getFeatureLen()], (int)feat_len,
+          ones.getData<float>(), 1, beta, &rdata[k * feat_len], 1);
       }
     }
   } break;
@@ -554,9 +568,10 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       ones.setValue(alpha);
       float *rdata = output.getData<float>();
       for (unsigned int k = 0; k < dim[0]; ++k) {
-        sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
-              (int)feat_len, 1, &data[k * dim.getFeatureLen()], (int)feat_len,
-              ones.getData<float>(), 1, beta, &rdata[k * feat_len], 1);
+        getComputeOps()->sgemv_fp32(
+          (unsigned int)dim.getStorageOrder(), true, (int)t_axis, (int)feat_len,
+          1, &data[k * dim.getFeatureLen()], (int)feat_len,
+          ones.getData<float>(), 1, beta, &rdata[k * feat_len], 1);
       }
     } else {
       unsigned int t_3 = dim[3];
@@ -572,15 +587,17 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
             unsigned int ridx =
               k * output.getDim().getFeatureLen() + c * dim[3];
 
-            sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
-                  (int)t_3, 1, &data[idx], (int)t_3, ones.getData<float>(), 1,
-                  beta, &rdata[ridx], 1);
+            getComputeOps()->sgemv_fp32(
+              (unsigned int)dim.getStorageOrder(), true, (int)t_axis, (int)t_3,
+              1, &data[idx], (int)t_3, ones.getData<float>(), 1, beta,
+              &rdata[ridx], 1);
           }
         }
       } else {
-        sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
-              (int)output.getDim().getDataLen(), 1, data, (int)t_axis,
-              ones.getData<float>(), 1, beta, output.getData<float>(), 1);
+        getComputeOps()->sgemv_fp32(
+          (unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+          (int)output.getDim().getDataLen(), 1, data, (int)t_axis,
+          ones.getData<float>(), 1, beta, output.getData<float>(), 1);
       }
     }
   } break;
@@ -597,9 +614,10 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
         for (unsigned int c = 0; c < dim[2]; ++c) {
           unsigned int idx = k * dim.getFeatureLen() + c * dim[3] * dim[1];
           unsigned int ridx = k * output.getDim().getFeatureLen() + c * dim[1];
-          sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
-                (int)t_3, 1, &data[idx], (int)t_3, ones.getData<float>(), 1,
-                beta, &rdata[ridx], 1);
+          getComputeOps()->sgemv_fp32((unsigned int)dim.getStorageOrder(), true,
+                                      (int)t_axis, (int)t_3, 1, &data[idx],
+                                      (int)t_3, ones.getData<float>(), 1, beta,
+                                      &rdata[ridx], 1);
         }
       }
     } else {
@@ -609,9 +627,9 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       ones.setValue(alpha);
 
       if (dim.getStorageOrder() == TStorageOrder::ROW_MAJOR) {
-        sgemv((unsigned int)dim.getStorageOrder(), false, (int)m, (int)n, 1,
-              data, (int)n, ones.getData<float>(), 1, beta,
-              output.getData<float>(), 1);
+        getComputeOps()->sgemv_fp32(
+          (unsigned int)dim.getStorageOrder(), false, (int)m, (int)n, 1, data,
+          (int)n, ones.getData<float>(), 1, beta, output.getData<float>(), 1);
       } else {
         float *rdata = output.getData<float>();
 
@@ -620,9 +638,10 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
             unsigned int idx = k * dim.getFeatureLen() + c * dim[3] * dim[2];
             unsigned int ridx = k * dim[1] * dim[2] + c * dim[2];
 
-            sgemv((unsigned int)dim.getStorageOrder(), false, (int)dim[2],
-                  (int)n, 1, &data[idx], (int)dim[2], ones.getData<float>(), 1,
-                  beta, &rdata[ridx], 1);
+            getComputeOps()->sgemv_fp32(
+              (unsigned int)dim.getStorageOrder(), false, (int)dim[2], (int)n,
+              1, &data[idx], (int)dim[2], ones.getData<float>(), 1, beta,
+              &rdata[ridx], 1);
           }
         }
       }
@@ -635,14 +654,15 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
   return output;
 }
 
-Tensor &FloatTensor::abs(Tensor &output) const {
+Tensor &FloatTensor::abs(Tensor &output, ComputeOps *ops) const {
   auto f = [](float in) { return std::abs(in); };
   apply(f, output);
   return output;
 }
 
-float FloatTensor::l2norm() const {
-  return snrm2(size(), (float *)getData(), 1);
+float FloatTensor::l2norm(ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
+  return o->snrm2_fp32(size(), (float *)getData(), 1);
 }
 
 void FloatTensor::normalization_i(unsigned int dim, float p, float epsilon) {
@@ -663,9 +683,9 @@ void FloatTensor::normalization_i(unsigned int dim, float p, float epsilon) {
 #pragma omp parallel for
     for (int i = 0; i < num_vectors; ++i) {
       float *vec_ptr = data + i * dim_size;
-      float norm = snrm2(dim_size, vec_ptr, 1);
+      float norm = getComputeOps()->snrm2_fp32(dim_size, vec_ptr, 1);
       float scale = 1.0f / std::max(norm, epsilon);
-      sscal(dim_size, scale, vec_ptr, 1);
+      getComputeOps()->sscal_fp32(dim_size, scale, vec_ptr, 1);
     }
   } else {
     throw nntrainer::exception::not_supported(
@@ -715,12 +735,12 @@ void FloatTensor::tan(Tensor &output, float alpha) {
   apply(f, output);
 }
 
-void FloatTensor::inv_sqrt(Tensor &out) {
+void FloatTensor::inv_sqrt(Tensor &out, ComputeOps *ops) {
   apply([](float val) -> float { return 1 / std::sqrt(val); }, out);
 }
 
 Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
-                         bool trans_in, float beta) const {
+                         bool trans_in, float beta, ComputeOps *ops) const {
   /**
    * @note FP32.dot(input);
    * according to the input type, invoked kernels can be varied.
@@ -728,21 +748,21 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   switch (input.getDataType()) {
   /** applying sgemm/sgemv after type casting to FP32 */
   case Tdatatype::FP32:
-    dotFloat(input, output, trans, trans_in, beta);
+    dotFloat(input, output, trans, trans_in, beta, ops);
     break;
   case Tdatatype::FP16:
-    dotFloat32Float16(input, output, trans, trans_in, beta);
+    dotFloat32Float16(input, output, trans, trans_in, beta, ops);
     break;
   /** applying gemm_q4_k / gemm_q6_k / gemm_q4_0 */
   case Tdatatype::Q4_K:
   case Tdatatype::Q6_K:
   case Tdatatype::Q4_0:
-    dotQnK(input, output, trans, trans_in, beta, input.getDataType());
+    dotQnK(input, output, trans, trans_in, beta, input.getDataType(), ops);
     break;
   case Tdatatype::QINT16:
   case Tdatatype::QINT8:
   case Tdatatype::QINT4:
-    dotQInteger(input, output, trans, trans_in, beta, input.getDataType());
+    dotQInteger(input, output, trans, trans_in, beta, input.getDataType(), ops);
     break;
   default:
     throw std::invalid_argument("Error: unsupported datatype");
@@ -775,59 +795,43 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
     rdatas.push_back(output[i]->getData<float>());
   }
 
-#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+  auto *o = getComputeOps();
   if (input_dtype == Tdatatype::Q4_0) {
-    if (M == 1) {
-      for (unsigned int i = 0; i < input.size(); ++i) {
-        gemm_q4_0(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i], Ns[i]);
-      }
+    if (o->gemm_q4_0_batch_fp32 && M > 1) {
+      o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
     } else {
-      gemm_q4_0_async_cl(mdatas, data, rdatas, M, Ns, K);
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
+                          Ns[i]);
+      }
     }
   } else { // QINT4
-    /// Run on GPU only when memory is a Shared Virual Memory
-    if (input[0]->getMemoryData()->isSVM() &&
+    if (o->gemv_int4_batch_fp32 && input[0]->getMemoryData()->isSVM() &&
         output[0]->getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
       std::vector<uint16_t *> scales;
       for (unsigned int i = 0; i < input.size(); ++i) {
         scales.push_back(input[i]->getScale<uint16_t>());
       }
       if (M == 1) {
-        gemv_int4_async_cl(mdatas, scales, data, rdatas, K, Ns,
-                           Int4QTensor::getGroupSize());
+        o->gemv_int4_batch_fp32(mdatas, scales, data, rdatas, K, Ns,
+                                Int4QTensor::getGroupSize());
       } else {
-        gemm_int4_async_cl(data, mdatas, scales, rdatas, M, Ns, K,
-                           Int4QTensor::getGroupSize());
+        o->gemm_int4_batch_fp32(data, mdatas, scales, rdatas, M, Ns, K,
+                                Int4QTensor::getGroupSize());
       }
     } else {
-      /// @todo This should be replaced with standard CPU INT4 computation
+      /// @todo Replace with standard CPU INT4 computation
       for (unsigned int i = 0; i < input.size(); ++i) {
-        gemm_q4_0(M, Ns[i], K, data, K, (void *)input[i]->getData(), Ns[i],
-                  rdatas[i], Ns[i]);
+        o->gemm_q4_0_fp32(M, Ns[i], K, data, K, (void *)input[i]->getData(),
+                          Ns[i], rdatas[i], Ns[i]);
       }
     }
   }
-#else
-  if (input_dtype == Tdatatype::Q4_0) {
-    /// @todo Support multi-weight q4_0 for x64
-    for (unsigned int i = 0; i < input.size(); ++i) {
-      gemm_q4_0(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i], Ns[i]);
-    }
-  } else { // QINT4
-    /// @note It is essential to understand that this section of the code
-    /// requires the `input` data to be converted to Q4_0 type, not QINT4 type.
-    /// This should be replaced with standard CPU INT4 computation instead of
-    /// using Q4_0.
-    for (unsigned int i = 0; i < input.size(); ++i) {
-      gemm_q4_0(M, Ns[i], K, data, K, (void *)input[i]->getData(), Ns[i],
-                rdatas[i], Ns[i]);
-    }
-  }
-#endif
 }
 
 Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
-                              bool trans_in, float beta) const {
+                              bool trans_in, float beta,
+                              ComputeOps *ops) const {
   // Comment out with intension to support the calculation wrt. batch and
   // height direction. It supposes to have this->dim as [ BxCxH,W ] and
   // input.dim is [BxCxH,W] as well if (input.dim.rank() > 2) {
@@ -858,36 +862,37 @@ Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
   /// transpose.
   /// For example, there is no case like (1 * K) X (1 * K) while
   /// (1 * K) X (1 * M) can be a case
+  auto *o = ops ? ops : getComputeOps();
   /// case1: (1 * K) X (K * 1)
   if (M == 1 && N == 1) {
-    *rdata =
-      sdot(K, data, 1, mdata, 1) + ((0.0f == beta) ? 0.0f : beta * *rdata);
+    *rdata = o->sdot_fp32(K, data, 1, mdata, 1) +
+             ((0.0f == beta) ? 0.0f : beta * *rdata);
   }
   /// case2: (M * K) X (K * 1)
   else if (N == 1) {
-    sgemv((unsigned int)dim.getStorageOrder(), trans, first_three_flat,
-          last_axis, alpha, data, lda, mdata, 1, beta, rdata, 1);
+    o->sgemv_fp32((unsigned int)dim.getStorageOrder(), trans, first_three_flat,
+                  last_axis, alpha, data, lda, mdata, 1, beta, rdata, 1);
   }
   /// case3: (1 * K) X (K * N) = 1 * N = R
   /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
   /// Effectively a translation of sgemv
   else if (M == 1) {
-    sgemv((unsigned int)dim.getStorageOrder(), !trans_in,
-          input_first_three_flat, input_last_axis, alpha, mdata, ldb, data, 1,
-          beta, rdata, 1);
+    o->sgemv_fp32((unsigned int)dim.getStorageOrder(), !trans_in,
+                  input_first_three_flat, input_last_axis, alpha, mdata, ldb,
+                  data, 1, beta, rdata, 1);
   }
   /// case others: use gemm
   else {
-    sgemm((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K, alpha,
-          data, lda, mdata, ldb, beta, rdata, ldc);
+    o->sgemm_fp32((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K,
+                  alpha, data, lda, mdata, ldb, beta, rdata, ldc);
   }
 
   return output;
 }
 
 Tensor &FloatTensor::dotFloat32Float16(Tensor const &input, Tensor &output,
-                                       bool trans, bool trans_in,
-                                       float beta) const {
+                                       bool trans, bool trans_in, float beta,
+                                       ComputeOps *ops) const {
 /// @todo remove #ifdef ENABLE_FP16
 #ifdef ENABLE_FP16
 
@@ -924,23 +929,24 @@ Tensor &FloatTensor::dotFloat32Float16(Tensor const &input, Tensor &output,
   /// case1: (1 * K) X (K * 1)
   NNTR_THROW_IF((M == 1 && N == 1), std::invalid_argument)
     << "dotQnK does not support trans / trans_in";
+  auto *o = ops ? ops : getComputeOps();
   /// case2: (M * K) X (K * 1)
   if (N == 1) {
-    shgemv((unsigned int)dim.getStorageOrder(), trans, first_three_flat,
-           last_axis, alpha, data, lda, mdata, 1, beta, rdata, 1);
+    o->shgemv((unsigned int)dim.getStorageOrder(), trans, first_three_flat,
+              last_axis, alpha, data, lda, mdata, 1, beta, rdata, 1);
   }
   /// case3: (1 * K) X (K * N) = 1 * N = R
   /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
   /// Effectively a translation of sgemv
   else if (M == 1) {
-    hsgemv((unsigned int)dim.getStorageOrder(), !trans_in,
-           input_first_three_flat, input_last_axis, alpha, mdata, ldb, data, 1,
-           beta, rdata, 1);
+    o->hsgemv((unsigned int)dim.getStorageOrder(), !trans_in,
+              input_first_three_flat, input_last_axis, alpha, mdata, ldb, data,
+              1, beta, rdata, 1);
   }
   /// case others: use gemm
   else {
-    shgemm((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K, alpha,
-           data, lda, mdata, ldb, beta, rdata, ldc);
+    o->shgemm((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K,
+              alpha, data, lda, mdata, ldb, beta, rdata, ldc);
   }
 
   return output;
@@ -950,7 +956,8 @@ Tensor &FloatTensor::dotFloat32Float16(Tensor const &input, Tensor &output,
 }
 
 Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
-                            bool trans_in, float beta, Tdatatype dtype) const {
+                            bool trans_in, float beta, Tdatatype dtype,
+                            ComputeOps *ops) const {
   ///@note Be cautious.
   /// Qn_K does not support transpose in principle.
   /// This trans option only aims to support Tensor Dimension only,
@@ -968,27 +975,25 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   K = getDim().width();
   N = trans_in ? input.getDim().height() : input.getDim().width();
 
+  auto *o = ops ? ops : getComputeOps();
   switch (dtype) {
   case Tdatatype::Q4_K:
-    gemm_q4_K(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    o->gemm_q4_K_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
   case Tdatatype::Q6_K:
-    gemm_q6_K(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    o->gemm_q6_K_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
-  case Tdatatype::Q4_0:
+  case Tdatatype::Q4_0: {
     M = getDim().height();
     K = getDim().width();
     N = input.getDim().width();
-#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-    if (M == 1) {
-      gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    if (o->gemm_q4_0_accel_fp32 && M > 1) {
+      o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
     } else {
-      gemm_q4_0_cl((void *)mdata, data, rdata, M, N, K);
+      o->gemm_q4_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     }
-#else
-    gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
-#endif
     break;
+  }
 
   default:
     throw std::invalid_argument("Error: unsupported datatype");
@@ -999,7 +1004,7 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
 
 Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
                                  bool trans, bool trans_in, float beta,
-                                 Tdatatype dtype) const {
+                                 Tdatatype dtype, ComputeOps *ops) const {
 
   float *data = (float *)getData();
   char *mdata = input.getData<char>();
@@ -1009,48 +1014,43 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
 
-#ifndef ENABLE_OPENCL
-#ifdef ENABLE_FP16
-  if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
-    uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
-    nntr_gemm_qai8dxp_qsi4cxp_packed(
-      M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx,
-      true); /// @todo kernel supports both trans / noTrans situation
-  } else {
-    throw std::runtime_error(
-      "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
-  }
-#else
-  /// @note It is essential to understand that this section of the code requires
-  /// the `input` data to be converted to Q4_0 type, not QINT4 type. This should
-  /// be replaced with standard CPU INT4 computation instead of using Q4_0.
-  gemm_q4_0(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
-#endif
-#else
-  if (input.getMemoryData()->isSVM() && output.getMemoryData()->isSVM() &&
-      getMemoryData()->isSVM()) {
+  auto *o = ops ? ops : getComputeOps();
+  if (o->gemv_int4_accel_fp32 && input.getMemoryData()->isSVM() &&
+      output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
     if (M == 1) {
-      gemv_int4_cl(mdata, input.getScale<uint16_t>(), data, rdata, K, N,
-                   Int4QTensor::getGroupSize());
+      o->gemv_int4_accel_fp32(mdata, input.getScale<uint16_t>(), data, rdata, K,
+                              N, Int4QTensor::getGroupSize());
     } else {
-      sgemm_int4_cl(data, mdata, input.getScale<uint16_t>(), rdata, M, N, K,
-                    Int4QTensor::getGroupSize());
+      o->sgemm_int4_accel_fp32(data, mdata, input.getScale<uint16_t>(), rdata,
+                               M, N, K, Int4QTensor::getGroupSize());
     }
   } else {
-    /// @todo This should be replaced with standard CPU INT4 computation
-    gemm_q4_0(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
-  }
+#ifdef ENABLE_FP16
+    if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
+      uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
+      nntr_gemm_qai8dxp_qsi4cxp_packed(
+        M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx,
+        true); /// @todo kernel supports both trans / noTrans situation
+    } else {
+      throw std::runtime_error(
+        "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
+    }
+#else
+    /// @todo Replace with standard CPU INT4 computation
+    o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
 #endif
+  }
 
   return output;
 }
 
-void FloatTensor::copy(const Tensor &from) {
+void FloatTensor::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
-  copy(from.getData<float>());
+  copy(from.getData<float>(), ops);
 }
 
-void FloatTensor::copyData(const Tensor &from) {
+void FloatTensor::copyData(const Tensor &from, ComputeOps *ops) {
+  auto *o = ops ? ops : getComputeOps();
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -1059,29 +1059,30 @@ void FloatTensor::copyData(const Tensor &from) {
 
   switch (from.getDataType()) {
   case ml::train::TensorDim::DataType::FP32:
-    copy(from.getData<float>());
+    copy(from.getData<float>(), ops);
     break;
   case ml::train::TensorDim::DataType::FP16:
 /// @todo remove #ifdef ENABLE_FP16
 #ifdef ENABLE_FP16
-    scopy(size(), from.getData<_FP16>(), 1, (float *)getData(), 1);
+    o->scopy_fp16_to_fp32(size(), from.getData<_FP16>(), 1, (float *)getData(),
+                          1);
 #else
     throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif
     break;
   case ml::train::TensorDim::DataType::QINT16:
-    copy_s16_fp32(from.size(), from.getData<int16_t>(), (float *)getData());
+    o->copy_s16_fp32(from.size(), from.getData<int16_t>(), (float *)getData());
     break;
   case ml::train::TensorDim::DataType::QINT8:
-    scopy_int8_to_float32(from.size(), from.getData<int8_t>(), 1,
-                          (float *)getData(), 1);
+    o->scopy_int8_to_fp32_s(from.size(), from.getData<int8_t>(), 1,
+                            (float *)getData(), 1);
     break;
   case ml::train::TensorDim::DataType::UINT16:
-    copy_u16_fp32(from.size(), from.getData<uint16_t>(), (float *)getData());
+    o->copy_u16_fp32(from.size(), from.getData<uint16_t>(), (float *)getData());
     break;
   case ml::train::TensorDim::DataType::UINT8:
-    scopy_int8_to_float32(from.size(), from.getData<uint8_t>(), 1,
-                          (float *)getData(), 1);
+    o->scopy_int8_to_fp32_u(from.size(), from.getData<uint8_t>(), 1,
+                            (float *)getData(), 1);
     break;
   default:
     throw std::invalid_argument(
@@ -1208,9 +1209,10 @@ void FloatTensor::topK(unsigned int k, void *output_data,
   }
 }
 
-float FloatTensor::max_abs() const {
+float FloatTensor::max_abs(ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
   const float *data = (float *)getData();
-  unsigned int idx = isamax(size(), data, 1);
+  unsigned int idx = o->isamax_fp32(size(), data, 1);
   return *(data + idx);
 }
 
@@ -1224,8 +1226,8 @@ float FloatTensor::minValue() const {
   return *std::min_element(data, data + size());
 }
 
-Tensor &FloatTensor::transpose(const std::string &direction,
-                               Tensor &output) const {
+Tensor &FloatTensor::transpose(const std::string &direction, Tensor &output,
+                               ComputeOps *ops) const {
   unsigned int SL, SI, SJ, SK;
 
   output.reshape(dim.transpose(direction));
@@ -1251,7 +1253,7 @@ Tensor &FloatTensor::transpose(const std::string &direction,
       if (is_format_nchw) {
         for (unsigned int b = 0; b < batch(); ++b) {
           for (unsigned int c = 0; c < channel(); ++c) {
-            transpose_matrix(
+            getComputeOps()->transpose_matrix_fp32(
               height(), width(), (float *)getData() + getIndex(b, c, 0, 0),
               width(), (float *)output.getData() + output.getIndex(b, c, 0, 0),
               output.width());
@@ -1549,7 +1551,8 @@ void FloatTensor::print(std::ostream &out) const {
   out.copyfmt(init);
 }
 
-void FloatTensor::copy(const void *buf) {
+void FloatTensor::copy(const void *buf, ComputeOps *ops) {
+  auto *o = ops ? ops : getComputeOps();
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -1557,7 +1560,7 @@ void FloatTensor::copy(const void *buf) {
     return;
   }
 
-  scopy(size(), (float *)buf, 1, (float *)getData(), 1);
+  o->scopy_fp32(size(), (float *)buf, 1, (float *)getData(), 1);
 }
 
 void FloatTensor::apply_broadcast_util(
@@ -1622,8 +1625,9 @@ void FloatTensor::apply_broadcast(
   return apply_broadcast_util(m, v_func, output, this->computeBroadcastInfo(m));
 }
 
-bool FloatTensor::isValid() const {
-  return is_valid(dim.getDataLen(), (float *)getData());
+bool FloatTensor::isValid(ComputeOps *ops) const {
+  auto *o = ops ? ops : getComputeOps();
+  return o->is_valid_fp32(dim.getDataLen(), (float *)getData());
 }
 
 } // namespace nntrainer
