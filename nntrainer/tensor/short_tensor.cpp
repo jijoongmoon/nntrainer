@@ -91,8 +91,7 @@ ShortTensor::ShortTensor(
   }
 
   // copy scale factors
-  getComputeOps()->scopy_fp32(scale_size(), scales.data(), 1,
-                              (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 }
 
 bool ShortTensor::operator==(const ShortTensor &rhs) const {
@@ -270,12 +269,12 @@ void ShortTensor::initialize(Initializer init) {
   initialize();
 }
 
-void ShortTensor::copy(const Tensor &from, ComputeOps *ops) {
+void ShortTensor::copy(const Tensor &from) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-void ShortTensor::copyData(const Tensor &from, ComputeOps *ops) {
+void ShortTensor::copyData(const Tensor &from) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -288,8 +287,8 @@ void ShortTensor::copyData(const Tensor &from, ComputeOps *ops) {
     copy(from.getData());
     break;
   case ml::train::TensorDim::DataType::FP32:
-    getComputeOps()->copy_fp32_s16(from.size(), from.getData<float>(),
-                                   (int16_t *)getData());
+    getOps()->copy_fp32_s16(from.size(), from.getData<float>(),
+                            (int16_t *)getData());
     break;
   default:
     throw std::invalid_argument("Error: Unsupported data type");
@@ -379,7 +378,7 @@ std::vector<unsigned int> ShortTensor::argmin() const {
   return result;
 }
 
-float ShortTensor::max_abs(ComputeOps *ops) const {
+float ShortTensor::max_abs() const {
   const int16_t *data = (int16_t *)getData();
   unsigned int idx;
 
@@ -496,7 +495,7 @@ void ShortTensor::copy(const void *buf) {
   copy_s16(size(), (int16_t *)buf, (int16_t *)getData());
 
   float *scales = (float *)(((int16_t *)buf) + size());
-  getComputeOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
 }
 
 void ShortTensor::save_quantization_info(std::ostream &file) {

@@ -186,17 +186,17 @@ public:
    * @note BCQTensor::dot ignores trans, trans_in, and beta currently
    */
   Tensor &dot(Tensor const &input, Tensor &output, bool trans, bool trans_in,
-              float beta, ComputeOps *ops = nullptr) const override;
+              float beta) const override;
 
   /**
    * @copydoc Tensor::copy(const Tensor &from)
    */
-  void copy(const Tensor &from, ComputeOps *ops = nullptr) override;
+  void copy(const Tensor &from) override;
 
   /**
    * @copydoc Tensor::copyData(const Tensor &from)
    */
-  void copyData(const Tensor &from, ComputeOps *ops = nullptr) override;
+  void copyData(const Tensor &from) override;
 
   /**
    * @copydoc Tensor::copy_with_stride()
@@ -243,7 +243,7 @@ public:
   /**
    * @copydoc Tensor::max_abs()
    */
-  float max_abs(ComputeOps *ops = nullptr) const override;
+  float max_abs() const override;
 
   /**
    * @copydoc Tensor::maxValue()
@@ -297,7 +297,7 @@ private:
   /**
    * @copydoc Tensor::isValid()
    */
-  bool isValid(ComputeOps *ops = nullptr) const override { return true; };
+  bool isValid() const override { return true; };
 
   /**
    * @brief print quantization scale factors

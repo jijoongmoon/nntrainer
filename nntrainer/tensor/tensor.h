@@ -17,12 +17,8 @@
 
 #define CREATE_IF_EMPTY_DIMS(tensor, ...)                                      \
   do {                                                                         \
-    if (tensor.empty()) {                                                      \
-      auto __ct_keep = tensor.getContextData();                                \
+    if (tensor.empty())                                                        \
       tensor = Tensor(__VA_ARGS__);                                            \
-      if (__ct_keep)                                                           \
-        tensor.setContextData(__ct_keep);                                      \
-    }                                                                          \
   } while (0);
 
 #include <cstddef>
@@ -1982,7 +1978,7 @@ public:
    * @brief      check if there is NaN or Inf element
    * @param[out] bool false if there is NaN or Inf else false
    */
-  bool isValid() const { return itensor_->isValid(resolveOps()); };
+  bool isValid() const { return itensor_->isValid(); };
 
   /**
    * @brief check if tensor is virtual
@@ -2011,44 +2007,36 @@ public:
   /**
    * @brief Attach ContextData carrying the per-vendor ComputeOps table.
    *
-   * Once set, this tensor's ops calls (dot/multiply/...) will dispatch to
-   * `ct_data->getComputeOps()` instead of the global `getComputeOps()`.
-   * Result tensors of binary/unary ops inherit ct_data from the receiver.
+   * The state lives on the underlying TensorBase impl; Tensor is a
+   * thin Pimpl handle that just forwards. After this call, every op
+   * invoked on the tensor (dot/multiply/...) dispatches via
+   * ct_data->getComputeOps() instead of the global table. Binary-op
+   * result tensors inherit the ContextData via TensorBase helpers.
    */
   void setContextData(std::shared_ptr<ContextData> ct_data) {
-    ct_data_ = std::move(ct_data);
+    itensor_->setContextData(std::move(ct_data));
   }
 
   /**
    * @brief Get the ContextData attached to this tensor (may be null).
    */
   const std::shared_ptr<ContextData> &getContextData() const {
-    return ct_data_;
-  }
-
-  /**
-   * @brief Resolve the effective ComputeOps for a tensor op call.
-   *
-   * Returns the ComputeOps from the attached ContextData if any, else
-   * nullptr. The TensorBase impl falls back to the global table when
-   * given nullptr, so callers never need to thread anything through.
-   */
-  ComputeOps *resolveOps() const {
-    if (ct_data_)
-      return ct_data_->getComputeOps();
-    return nullptr;
+    return itensor_->getContextData();
   }
 
   /**
    * @brief Propagate this tensor's ContextData to a result tensor.
    *
    * Used by binary/unary ops so that subsequent calls on the result
-   * dispatch to the same vendor backend as the operand. If `out`
-   * already has a ContextData, it is preserved (caller-supplied wins).
+   * dispatch to the same vendor backend as the receiver. Caller-supplied
+   * ContextData on `out` is preserved. Must be called AFTER the kernel
+   * runs because CREATE_IF_EMPTY_DIMS may reallocate `out` mid-kernel
+   * and discard whatever ContextData was set before.
    */
-  void inheritContextDataTo(Tensor &out) const {
-    if (!out.ct_data_)
-      out.ct_data_ = ct_data_;
+  void inheritContextTo(Tensor &out) const {
+    const auto &ct = itensor_->getContextData();
+    if (ct && !out.getContextData())
+      out.setContextData(ct);
   }
 
   /**
@@ -2068,8 +2056,8 @@ public:
    */
   void checkContextCompatibility(const Tensor &other,
                                  const char *op_name) const {
-    const auto &lhs = ct_data_;
-    const auto &rhs = other.ct_data_;
+    const auto &lhs = itensor_->getContextData();
+    const auto &rhs = other.itensor_->getContextData();
     if (lhs && rhs && lhs.get() != rhs.get()) {
       throw std::invalid_argument(
         std::string("Tensor::") + op_name +
@@ -2100,7 +2088,6 @@ public:
 
 private:
   std::unique_ptr<TensorBase> itensor_;
-  std::shared_ptr<ContextData> ct_data_;
 
   /**
    * @brief properties for virtual tensor

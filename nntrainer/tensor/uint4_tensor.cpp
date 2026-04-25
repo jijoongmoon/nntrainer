@@ -96,8 +96,7 @@ Uint4QTensor::Uint4QTensor(
   }
 
   // copy scale factors
-  getComputeOps()->scopy_fp32(scale_size(), scales.data(), 1,
-                              (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 
   unsigned int *zps = getZeroPoint();
 
@@ -333,12 +332,12 @@ void Uint4QTensor::initialize(Initializer init) {
   initialize();
 }
 
-void Uint4QTensor::copy(const Tensor &from, ComputeOps *ops) {
+void Uint4QTensor::copy(const Tensor &from) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-void Uint4QTensor::copyData(const Tensor &from, ComputeOps *ops) {
+void Uint4QTensor::copyData(const Tensor &from) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -475,7 +474,7 @@ std::vector<unsigned int> Uint4QTensor::argmin() const {
   return result;
 }
 
-float Uint4QTensor::max_abs(ComputeOps *ops) const {
+float Uint4QTensor::max_abs() const {
   uint8_t abs_max_val = 0;
   uint8_t curr_val;
   for (unsigned int idx = 0; idx < size(); ++idx) {
@@ -623,12 +622,12 @@ void Uint4QTensor::copy(const void *buf) {
     return;
   }
   // copy tensor data
-  getComputeOps()->scopy_u8((size() + 1) / 2, (uint8_t *)buf, 1,
-                            (uint8_t *)getData(), 1);
+  getOps()->scopy_u8((size() + 1) / 2, (uint8_t *)buf, 1, (uint8_t *)getData(),
+                     1);
 
   // copy scale factor data
   float *scales = (float *)(((uint8_t *)buf) + (size() + 1) / 2);
-  getComputeOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
 
   // copy zero points
   unsigned int *zps =

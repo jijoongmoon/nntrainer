@@ -91,8 +91,7 @@ CharTensor::CharTensor(
   }
 
   // copy scale factors
-  getComputeOps()->scopy_fp32(scale_size(), scales.data(), 1,
-                              (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 }
 
 bool CharTensor::operator==(const CharTensor &rhs) const {
@@ -269,16 +268,16 @@ void CharTensor::initialize(Initializer init) {
   initialize();
 }
 
-int CharTensor::multiply_i(float const &value, ComputeOps *ops) {
+int CharTensor::multiply_i(float const &value) {
   // multiply value to scale factors
   float *g_scale = (float *)getScale();
 
-  getComputeOps()->sscal_fp32(scale_size(), value, g_scale, 1);
+  getOps()->sscal_fp32(scale_size(), value, g_scale, 1);
   return ML_ERROR_NONE;
 }
 
 Tensor &CharTensor::multiply(Tensor const &input, Tensor &output,
-                             const float scale, ComputeOps *ops) const {
+                             const float scale) const {
   CREATE_IF_EMPTY_DIMS(output, dim, nullptr, q_scheme());
 
   NNTR_THROW_IF(q_scheme() != input.q_scheme(), std::invalid_argument)
@@ -319,8 +318,8 @@ Tensor &CharTensor::multiply(Tensor const &input, Tensor &output,
   return output;
 }
 
-Tensor &CharTensor::add(Tensor const &input, Tensor &output, float const scale,
-                        ComputeOps *ops) const {
+Tensor &CharTensor::add(Tensor const &input, Tensor &output,
+                        float const scale) const {
   CREATE_IF_EMPTY_DIMS(output, dim, nullptr, qscheme);
 
   NNTR_THROW_IF(q_scheme() != input.q_scheme(), std::invalid_argument)
@@ -368,13 +367,13 @@ Tensor &CharTensor::add(Tensor const &input, Tensor &output, float const scale,
   return output;
 }
 
-void CharTensor::copy(const Tensor &from, ComputeOps *ops) {
+void CharTensor::copy(const Tensor &from) {
   reshape(from.getDim());
-  copy(from.getData(), ops);
+  copy(from.getData());
 }
 
-void CharTensor::copyData(const Tensor &from, ComputeOps *ops) {
-  auto *o = ops ? ops : getComputeOps();
+void CharTensor::copyData(const Tensor &from) {
+  auto *o = getOps();
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -385,7 +384,7 @@ void CharTensor::copyData(const Tensor &from, ComputeOps *ops) {
   /// @note this could require scale factor
   switch (from.getDataType()) {
   case ml::train::TensorDim::DataType::QINT8:
-    copy(from.getData(), ops);
+    copy(from.getData());
     break;
   case ml::train::TensorDim::DataType::FP32:
     o->copy_fp32_s8(from.size(), from.getData<float>(), (int8_t *)getData());
@@ -478,7 +477,7 @@ std::vector<unsigned int> CharTensor::argmin() const {
   return result;
 }
 
-float CharTensor::max_abs(ComputeOps *ops) const {
+float CharTensor::max_abs() const {
   const int8_t *data = (int8_t *)getData();
   unsigned int idx;
 
@@ -584,8 +583,8 @@ size_t CharTensor::scale_size() const {
 
 QScheme CharTensor::q_scheme() const { return qscheme; }
 
-void CharTensor::copy(const void *buf, ComputeOps *ops) {
-  auto *o = ops ? ops : getComputeOps();
+void CharTensor::copy(const void *buf) {
+  auto *o = getOps();
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 

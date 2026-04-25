@@ -278,32 +278,29 @@ public:
   /**
    * @copydoc Tensor::multiply_i(float const &value)
    */
-  int multiply_i(float const &value, ComputeOps *ops = nullptr) override;
+  int multiply_i(float const &value) override;
 
   /**
    * @copydoc Tensor::multiply(float const &value, Tensor &out)
    */
-  Tensor &multiply(float const &value, Tensor &out,
-                   ComputeOps *ops = nullptr) const override;
+  Tensor &multiply(float const &value, Tensor &out) const override;
 
   /**
    * @copydoc Tensor::multiply(Tensor const &m, Tensor &output, const
    * float beta = 0.0)
    */
-  Tensor &multiply(Tensor const &m, Tensor &output, const float beta = 0.0,
-                   ComputeOps *ops = nullptr) const override;
+  Tensor &multiply(Tensor const &m, Tensor &output,
+                   const float beta = 0.0) const override;
 
   /**
    * @copydoc Tensor::divide(float const &value, Tensor &output)
    */
-  Tensor &divide(float const &value, Tensor &output,
-                 ComputeOps *ops = nullptr) const override;
+  Tensor &divide(float const &value, Tensor &output) const override;
 
   /**
    * @copydoc Tensor::divide(Tensor const &m, Tensor &output)
    */
-  Tensor &divide(Tensor const &m, Tensor &output,
-                 ComputeOps *ops = nullptr) const override;
+  Tensor &divide(Tensor const &m, Tensor &output) const override;
 
   /**
    * @copydoc Tensor::add_strided(Tensor const &input, Tensor &output,
@@ -317,20 +314,19 @@ public:
    */
   int add_i_partial(unsigned int len, unsigned int addr_idx, Tensor &m,
                     unsigned int incX, unsigned int incY, const Tensor alphas,
-                    unsigned int alpha_idx, ComputeOps *ops = nullptr) override;
+                    unsigned int alpha_idx) override;
 
   /**
    * @copydoc Tensor::add(float const &value, Tensor &output)
    */
-  Tensor &add(float const &value, Tensor &output,
-              ComputeOps *ops = nullptr) const override;
+  Tensor &add(float const &value, Tensor &output) const override;
 
   /**
    * @copydoc Tensor::add(Tensor const &m, Tensor &output, float const
    * alpha)
    */
-  Tensor &add(Tensor const &m, Tensor &output, float const alpha,
-              ComputeOps *ops = nullptr) const override;
+  Tensor &add(Tensor const &m, Tensor &output,
+              float const alpha) const override;
 
   /**
    * @copydoc Tensor::subtract(float const &value, Tensor &output)
@@ -340,7 +336,7 @@ public:
   /**
    *  @copydoc TensorBase::sum_by_batch(Tensor &output)
    */
-  void sum_by_batch(Tensor &output, ComputeOps *ops = nullptr) const override;
+  void sum_by_batch(Tensor &output) const override;
 
   /**
    * @copydoc Tensor::sum(unsigned int axis, Tensor &output, float alpha,
@@ -352,12 +348,12 @@ public:
   /**
    * @copydoc Tensor::abs()
    */
-  Tensor &abs(Tensor &output, ComputeOps *ops = nullptr) const override;
+  Tensor &abs(Tensor &output) const override;
 
   /**
    * @copydoc Tensor::l2norm
    */
-  float l2norm(ComputeOps *ops = nullptr) const override;
+  float l2norm() const override;
 
   /**
    * @copydoc Tensor::pow(float exponent, Tensor &output)
@@ -382,14 +378,14 @@ public:
   /**
    * @copydoc TensorBase::inv_sqrt(Tensor &out)
    */
-  void inv_sqrt(Tensor &out, ComputeOps *ops = nullptr) override;
+  void inv_sqrt(Tensor &out) override;
 
   /**
    *  @copydoc Tensor::dot(Tensor const &input, Tensor &output, bool
    * trans, bool trans_in, float beta)
    */
   Tensor &dot(Tensor const &input, Tensor &output, bool trans, bool trans_in,
-              float beta, ComputeOps *ops = nullptr) const override;
+              float beta) const override;
 
   /**
    * @copydoc Tensor::dropout_mask(float dropout)
@@ -420,12 +416,12 @@ public:
   /**
    * @copydoc Tensor::copy(const Tensor &from)
    */
-  void copy(const Tensor &from, ComputeOps *ops = nullptr) override;
+  void copy(const Tensor &from) override;
 
   /**
    * @copydoc Tensor::copyData(const Tensor &from)
    */
-  void copyData(const Tensor &from, ComputeOps *ops = nullptr) override;
+  void copyData(const Tensor &from) override;
 
   /**
    * @brief      Copy the Tensor
@@ -447,7 +443,7 @@ public:
   /**
    * @copydoc Tensor::max_abs()
    */
-  float max_abs(ComputeOps *ops = nullptr) const override;
+  float max_abs() const override;
 
   /**
    * @copydoc Tensor::maxValue()
@@ -462,8 +458,8 @@ public:
   /**
    * @copydoc Tensor::transpose(const std::string &direction, Tensor &out)
    */
-  Tensor &transpose(const std::string &direction, Tensor &output,
-                    ComputeOps *ops = nullptr) const override;
+  Tensor &transpose(const std::string &direction,
+                    Tensor &output) const override;
 
   /**
    * @copydoc Tensor::print(std::ostream &out)
@@ -477,7 +473,7 @@ private:
    *
    * @param buf buffer to copy from
    */
-  void copy(const void *buf, ComputeOps *ops = nullptr);
+  void copy(const void *buf);
 
   /**
    * @brief Applies the given operator to the tensor with the passed argument
@@ -523,18 +519,18 @@ private:
    * @brief dotHalf
    */
   Tensor &dotHalf(Tensor const &input, Tensor &output, bool trans,
-                  bool trans_in, float beta, ComputeOps *ops = nullptr) const;
+                  bool trans_in, float beta) const;
 
   /**
    * @brief dotQnK
    */
   Tensor &dotQnK(Tensor const &input, Tensor &output, bool trans, bool trans_in,
-                 float beta, Tdatatype dtype, ComputeOps *ops = nullptr) const;
+                 float beta, Tdatatype dtype) const;
 
   /**
    * @copydoc Tensor::isValid()
    */
-  bool isValid(ComputeOps *ops = nullptr) const override;
+  bool isValid() const override;
 };
 
 } // namespace nntrainer

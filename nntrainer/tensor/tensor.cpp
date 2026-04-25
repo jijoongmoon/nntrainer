@@ -306,7 +306,6 @@ Tensor::Tensor(const Tensor &rhs) {
   this->fd = rhs.fd;
   this->read_offset = rhs.read_offset;
   this->mapped_ptr = rhs.mapped_ptr;
-  this->ct_data_ = rhs.ct_data_;
 }
 
 Tensor::Tensor(const std::unique_ptr<TensorBase> &rhs) {
@@ -388,7 +387,6 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
   this->fd = rhs.fd;
   this->read_offset = rhs.read_offset;
   this->mapped_ptr = rhs.mapped_ptr;
-  this->ct_data_ = rhs.ct_data_;
   return *this;
 }
 
@@ -508,7 +506,7 @@ int Tensor::multiply_i(float const &value) {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot multiply";
 
-  return itensor_->multiply_i(value, resolveOps());
+  return itensor_->multiply_i(value);
 }
 
 Tensor Tensor::multiply(float const &value) const {
@@ -517,8 +515,8 @@ Tensor Tensor::multiply(float const &value) const {
 }
 
 Tensor &Tensor::multiply(float const &value, Tensor &out) const {
-  inheritContextDataTo(out);
-  itensor_->multiply(value, out, resolveOps());
+  itensor_->multiply(value, out);
+  inheritContextTo(out);
   return out;
 }
 
@@ -551,8 +549,8 @@ Tensor &Tensor::multiply(Tensor const &m, Tensor &output,
     << getName() << " is not contiguous, cannot multiply";
 
   checkContextCompatibility(m, "multiply");
-  inheritContextDataTo(output);
-  itensor_->multiply(m, output, beta, resolveOps());
+  itensor_->multiply(m, output, beta);
+  inheritContextTo(output);
   return output;
 }
 
@@ -576,8 +574,8 @@ Tensor &Tensor::divide(float const &value, Tensor &output) const {
     ss << "[Tensor] divide by value failed, value: " << value;
     throw std::invalid_argument(ss.str().c_str());
   }
-  inheritContextDataTo(output);
-  itensor_->divide(value, output, resolveOps());
+  itensor_->divide(value, output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -603,8 +601,8 @@ Tensor &Tensor::divide(Tensor const &m, Tensor &output) const {
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot divide";
   checkContextCompatibility(m, "divide");
-  inheritContextDataTo(output);
-  itensor_->divide(m, output, resolveOps());
+  itensor_->divide(m, output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -648,8 +646,8 @@ Tensor Tensor::add(float const &value) const {
 }
 
 Tensor &Tensor::add(float const &value, Tensor &output) const {
-  inheritContextDataTo(output);
-  itensor_->add(value, output, resolveOps());
+  itensor_->add(value, output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -667,7 +665,7 @@ int Tensor::add_i_partial(unsigned int len, unsigned int addr_idx, Tensor &m,
                           unsigned int incX, unsigned int incY,
                           const Tensor alphas, unsigned int alpha_idx) {
   return itensor_->add_i_partial(len, addr_idx, m, incX, incY, alphas,
-                                 alpha_idx, resolveOps());
+                                 alpha_idx);
 }
 
 Tensor Tensor::add(Tensor const &m, float const alpha) const {
@@ -686,8 +684,8 @@ Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot add";
   checkContextCompatibility(m, "add");
-  inheritContextDataTo(output);
-  itensor_->add(m, output, alpha, resolveOps());
+  itensor_->add(m, output, alpha);
+  inheritContextTo(output);
   return output;
 }
 
@@ -726,8 +724,8 @@ Tensor Tensor::sum_by_batch() const {
     << getName() << " is not contiguous, cannot sum";
 
   Tensor output(batch(), 1, 1, 1, this->getFormat(), getDataType());
-  inheritContextDataTo(output);
-  itensor_->sum_by_batch(output, resolveOps());
+  itensor_->sum_by_batch(output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -788,8 +786,9 @@ Tensor &Tensor::abs(Tensor &output) const {
     throw std::invalid_argument(
       "Error: Tensor::abs requires output tensor to be same size, data type "
       "and format as input tensor.");
-  inheritContextDataTo(output);
-  return itensor_->abs(output, resolveOps());
+  itensor_->abs(output);
+  inheritContextTo(output);
+  return output;
 }
 
 Tensor Tensor::average(unsigned int axis) const {
@@ -946,14 +945,14 @@ void Tensor::tan(Tensor &output, float alpha) const {
 void Tensor::inv_sqrt_i() { itensor_->inv_sqrt(*this); }
 
 Tensor Tensor::inv_sqrt(Tensor &out) const {
-  inheritContextDataTo(out);
-  itensor_->inv_sqrt(out, resolveOps());
+  itensor_->inv_sqrt(out);
+  inheritContextTo(out);
   return out;
 }
 
 LazyTensor Tensor::chain() const { return LazyTensor(*this); }
 
-float Tensor::l2norm() const { return itensor_->l2norm(resolveOps()); }
+float Tensor::l2norm() const { return itensor_->l2norm(); }
 
 void Tensor::normalization_i() {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
@@ -1035,8 +1034,8 @@ Tensor &Tensor::dot(Tensor const &input, Tensor &output, bool trans,
     << getName() << " is not contiguous. Cannot dot product.";
 
   checkContextCompatibility(input, "dot");
-  inheritContextDataTo(output);
-  itensor_->dot(input, output, trans, trans_in, beta, resolveOps());
+  itensor_->dot(input, output, trans, trans_in, beta);
+  inheritContextTo(output);
   return output;
 }
 
@@ -1274,16 +1273,14 @@ void Tensor::copy(const Tensor &from) {
       scale_size() == from.scale_size() &&
       getDataType() == from.getDataType()) {
     // if tensor size and data type match, copy data
-    itensor_->copy(from, resolveOps());
+    itensor_->copy(from);
   } else {
     Tensor t = Tensor(from.getDim(), from.getData<char>());
     swap(t, *this);
   }
 }
 
-void Tensor::copyData(const Tensor &from) {
-  itensor_->copyData(from, resolveOps());
-}
+void Tensor::copyData(const Tensor &from) { itensor_->copyData(from); }
 
 void Tensor::copy_with_stride(const Tensor &from) {
   if (itensor_->getDim() == from.getDim()) {
@@ -1466,7 +1463,7 @@ std::pair<Tensor, Tensor> Tensor::topK(unsigned int k) const {
 float Tensor::max_abs() const {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot get max_abs.";
-  return itensor_->max_abs(resolveOps());
+  return itensor_->max_abs();
 }
 
 float Tensor::maxValue() const { return itensor_->maxValue(); }
@@ -1488,8 +1485,8 @@ Tensor &Tensor::transpose(const std::string &direction, Tensor &output) const {
     return result.transpose(direction, output);
   }
 
-  inheritContextDataTo(output);
-  itensor_->transpose(direction, output, resolveOps());
+  itensor_->transpose(direction, output);
+  inheritContextTo(output);
 
   return output;
 }

@@ -53,6 +53,7 @@
 namespace nntrainer {
 
 struct ComputeOps;
+class ContextData;
 using TensorDim = ml::train::TensorDim;
 using Tformat = ml::train::TensorDim::Format;
 using Tdatatype = ml::train::TensorDim::DataType;
@@ -141,6 +142,7 @@ public:
     offset = rhs.offset;
     file_offset = rhs.file_offset;
     src_tensor = rhs.src_tensor;
+    ct_data_ = rhs.ct_data_;
   }
 
   /**
@@ -305,6 +307,33 @@ public:
   virtual void initialize(Initializer init) = 0;
 
   /**
+   * @brief Attach a per-Context ComputeOps dispatch table to this tensor.
+   *
+   * After this call, every op invoked on this tensor (dot/multiply/...)
+   * uses ct_data->getComputeOps() rather than the global table. Result
+   * tensors from binary ops inherit the ContextData via the same path.
+   */
+  void setContextData(std::shared_ptr<ContextData> ct_data) {
+    ct_data_ = std::move(ct_data);
+  }
+
+  /**
+   * @brief Get the attached ContextData (nullable).
+   */
+  const std::shared_ptr<ContextData> &getContextData() const {
+    return ct_data_;
+  }
+
+  /**
+   * @brief Resolve the ComputeOps to dispatch on for this tensor.
+   *
+   * Priority: attached ContextData > global g_compute_ops fallback.
+   * Defined out-of-line in tensor_base.cpp so the header does not need
+   * to pull in <context_data.h> + <compute_ops.h>.
+   */
+  ComputeOps *getOps() const;
+
+  /**
    * @copydoc Tensor::multiply_strided(Tensor const &m, Tensor &output,
    * const float beta)
    */
@@ -314,33 +343,29 @@ public:
   /**
    * @copydoc Tensor::multiply_i(float const &value)
    */
-  virtual int multiply_i(float const &value, ComputeOps *ops = nullptr);
+  virtual int multiply_i(float const &value);
 
   /**
    * @copydoc Tensor::multiply(float const &value, Tensor &output)
    */
-  virtual Tensor &multiply(float const &value, Tensor &output,
-                           ComputeOps *ops = nullptr) const;
+  virtual Tensor &multiply(float const &value, Tensor &output) const;
 
   /**
    * @copydoc Tensor::multiply(Tensor const &m, Tensor &output, const
    * float beta = 0.0)
    */
   virtual Tensor &multiply(Tensor const &m, Tensor &output,
-                           const float beta = 0.0,
-                           ComputeOps *ops = nullptr) const;
+                           const float beta = 0.0) const;
 
   /**
    * @copydoc Tensor::divide(float const &value, Tensor &output)
    */
-  virtual Tensor &divide(float const &value, Tensor &output,
-                         ComputeOps *ops = nullptr) const;
+  virtual Tensor &divide(float const &value, Tensor &output) const;
 
   /**
    * @copydoc Tensor::divide(Tensor const &m, Tensor &output)
    */
-  virtual Tensor &divide(Tensor const &m, Tensor &output,
-                         ComputeOps *ops = nullptr) const;
+  virtual Tensor &divide(Tensor const &m, Tensor &output) const;
 
   /**
    * @copydoc Tensor::add_strided(Tensor const &input, Tensor &output,
@@ -354,21 +379,18 @@ public:
    */
   virtual int add_i_partial(unsigned int len, unsigned int addr_idx, Tensor &m,
                             unsigned int incX, unsigned int incY,
-                            const Tensor alphas, unsigned int alpha_idx,
-                            ComputeOps *ops = nullptr);
+                            const Tensor alphas, unsigned int alpha_idx);
 
   /**
    * @copydoc Tensor::add(float const &value, Tensor &output)
    */
-  virtual Tensor &add(float const &value, Tensor &output,
-                      ComputeOps *ops = nullptr) const;
+  virtual Tensor &add(float const &value, Tensor &output) const;
 
   /**
    * @copydoc Tensor::add(Tensor const &m, Tensor &output, float const
    * alpha)
    */
-  virtual Tensor &add(Tensor const &m, Tensor &output, float const alpha,
-                      ComputeOps *ops = nullptr) const;
+  virtual Tensor &add(Tensor const &m, Tensor &output, float const alpha) const;
 
   /**
    * @copydoc Tensor::subtract(float const &value, Tensor &output)
@@ -379,7 +401,7 @@ public:
    * @brief      Sum all the Tensor elements according to the batch
    * @param[out] output Tensor(batch, 1, 1, 1)
    */
-  virtual void sum_by_batch(Tensor &output, ComputeOps *ops = nullptr) const;
+  virtual void sum_by_batch(Tensor &output) const;
 
   /**
    * @copydoc Tensor::sum(unsigned int axis, Tensor &output, float alpha,
@@ -391,12 +413,12 @@ public:
   /**
    * @copydoc Tensor::abs()
    */
-  virtual Tensor &abs(Tensor &output, ComputeOps *ops = nullptr) const;
+  virtual Tensor &abs(Tensor &output) const;
 
   /**
    * @copydoc Tensor::l2norm
    */
-  virtual float l2norm(ComputeOps *ops = nullptr) const;
+  virtual float l2norm() const;
 
   /**
    * @copydoc Tensor::normalization_i(unsigned int dim, float p, float epsilon)
@@ -441,7 +463,7 @@ public:
    * @brief      inverse squared root function
    * @param[out] out out to store the result
    */
-  virtual void inv_sqrt(Tensor &out, ComputeOps *ops = nullptr);
+  virtual void inv_sqrt(Tensor &out);
 
   /**
    * @brief     Dot Product of Tensor ( equal MxM )
@@ -455,8 +477,7 @@ public:
    * @retval    Calculated Tensor
    */
   virtual Tensor &dot(Tensor const &input, Tensor &output, bool trans,
-                      bool trans_in, float beta,
-                      ComputeOps *ops = nullptr) const;
+                      bool trans_in, float beta) const;
 
   /**
    * @brief     Dot Product of Tensors ( equal MxMs )
@@ -523,13 +544,13 @@ public:
    *
    * @note copy can reshape the tensor to match the shape
    */
-  virtual void copy(const Tensor &from, ComputeOps *ops = nullptr) = 0;
+  virtual void copy(const Tensor &from) = 0;
 
   /**
    * @brief     Copy the Tensor
    * @param[in] from Tensor to be copied
    */
-  virtual void copyData(const Tensor &from, ComputeOps *ops = nullptr) = 0;
+  virtual void copyData(const Tensor &from) = 0;
 
   /**
    * @brief      Copy the Tensor
@@ -598,7 +619,7 @@ public:
   /**
    * @copydoc Tensor::max_abs()
    */
-  virtual float max_abs(ComputeOps *ops = nullptr) const = 0;
+  virtual float max_abs() const = 0;
 
   /**
    * @copydoc Tensor::maxValue()
@@ -613,8 +634,7 @@ public:
   /**
    * @copydoc Tensor::transpose(const std::string &direction, Tensor &out)
    */
-  virtual Tensor &transpose(const std::string &direction, Tensor &out,
-                            ComputeOps *ops = nullptr) const;
+  virtual Tensor &transpose(const std::string &direction, Tensor &out) const;
 
   /**
    * @brief     put data of Tensor
@@ -866,7 +886,7 @@ public:
   /**
    * @copydoc Tensor::isValid()
    */
-  virtual bool isValid(ComputeOps *ops = nullptr) const = 0;
+  virtual bool isValid() const = 0;
 
   static constexpr float epsilon = 1e-5f;
 
@@ -877,6 +897,7 @@ protected:
   Initializer initializer;
   std::string name; /**< name of the tensor */
   std::shared_ptr<MemoryData> data;
+  std::shared_ptr<ContextData> ct_data_; /**< per-Context dispatch table */
   size_t offset;
   size_t file_offset; /**< offset of the tensor in the file */
 
