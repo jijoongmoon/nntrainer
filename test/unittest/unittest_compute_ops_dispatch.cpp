@@ -7,11 +7,11 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  Verify that a per-Context ComputeOps table installed into
- *         ContextData actually reaches Tensor::dot / multiply / add
- *         through the Tensor's attached ContextData. This is the
- *         end-to-end check that vendor backend dispatch works without
- *         any preprocessor branches at the call site.
+ * @brief  Verify that a per-Context ComputeOps installed via ContextData
+ *         actually reaches Tensor::dot / multiply / add through the
+ *         tensor's attached ContextData. End-to-end check that
+ *         vendor backend dispatch works with virtual dispatch (no
+ *         preprocessor branches at the call site).
  */
 
 #include <compute_ops.h>
@@ -25,10 +25,11 @@
 namespace {
 
 /**
- * @brief Per-test counters incremented by mock ComputeOps wrappers.
+ * @brief Per-test counters incremented by the mock subclass.
  *
- * The mock wrappers forward to the global ops so result correctness is
- * preserved; the counters confirm dispatch reached the mock.
+ * The mock forwards each op to the real (CPU) backend so that result
+ * correctness is preserved; the counters confirm dispatch reached the
+ * mock and not the global singleton directly.
  */
 struct CallCounters {
   std::atomic<int> sgemm{0};
@@ -38,80 +39,70 @@ struct CallCounters {
   std::atomic<int> scopy{0};
 };
 
-CallCounters *g_counters = nullptr;
-
-void mock_sgemm(unsigned int o, bool tA, bool tB, unsigned int M,
-                unsigned int N, unsigned int K, float a, const float *A,
-                unsigned int lda, const float *B, unsigned int ldb, float b,
-                float *C, unsigned int ldc) {
-  if (g_counters)
-    g_counters->sgemm++;
-  nntrainer::getComputeOps()->sgemm_fp32(o, tA, tB, M, N, K, a, A, lda, B, ldb,
-                                         b, C, ldc);
-}
-
-void mock_sgemv(unsigned int o, bool tA, unsigned int M, unsigned int N,
-                float a, const float *A, unsigned int lda, const float *X,
-                unsigned int iX, float b, float *Y, unsigned int iY) {
-  if (g_counters)
-    g_counters->sgemv++;
-  nntrainer::getComputeOps()->sgemv_fp32(o, tA, M, N, a, A, lda, X, iX, b, Y,
-                                         iY);
-}
-
-void mock_ele_mul(unsigned int N, const float *X, const float *Y, float *Z,
-                  float a, float b, unsigned int is, unsigned int os) {
-  if (g_counters)
-    g_counters->ele_mul++;
-  nntrainer::getComputeOps()->ele_mul_fp32(N, X, Y, Z, a, b, is, os);
-}
-
-void mock_ele_add(unsigned int N, const float *X, const float *Y, float *Z,
-                  float a, float b, unsigned int is, unsigned int os) {
-  if (g_counters)
-    g_counters->ele_add++;
-  nntrainer::getComputeOps()->ele_add_fp32(N, X, Y, Z, a, b, is, os);
-}
-
-void mock_scopy(unsigned int N, const float *X, unsigned int iX, float *Y,
-                unsigned int iY) {
-  if (g_counters)
-    g_counters->scopy++;
-  nntrainer::getComputeOps()->scopy_fp32(N, X, iX, Y, iY);
-}
-
 /**
- * @brief Build a ComputeOps table that starts as a copy of the active
- *        backend, then overrides a few function pointers with the mocks.
+ * @brief Mock ComputeOps subclass: forwards to a "real" backend
+ *        (the global one) for correctness while bumping per-op counters.
  *
- * Copying the global table guarantees every other op still works (so
- * tensor allocate/copy paths used by the test setup don't crash).
+ * Because every base-class default just throws, this only overrides
+ * the ops the tests exercise. Anything the test setup happens to
+ * trigger that's not overridden here would throw — the tests stay
+ * inside the overridden subset (sgemm/sgemv/ele_mul/ele_add/scopy).
  */
-nntrainer::ComputeOps make_mock_ops() {
-  nntrainer::ensureComputeOps();
-  nntrainer::ComputeOps ops = *nntrainer::getComputeOps();
-  ops.sgemm_fp32 = mock_sgemm;
-  ops.sgemv_fp32 = mock_sgemv;
-  ops.ele_mul_fp32 = mock_ele_mul;
-  ops.ele_add_fp32 = mock_ele_add;
-  ops.scopy_fp32 = mock_scopy;
-  return ops;
-}
+class MockComputeOps : public nntrainer::ComputeOps {
+public:
+  MockComputeOps(nntrainer::ComputeOps *real, CallCounters *c) :
+    real_(real), counters_(c) {}
+
+  void sgemm_fp32(unsigned int o, bool tA, bool tB, unsigned int M,
+                  unsigned int N, unsigned int K, float a, const float *A,
+                  unsigned int lda, const float *B, unsigned int ldb, float b,
+                  float *C, unsigned int ldc) override {
+    counters_->sgemm++;
+    real_->sgemm_fp32(o, tA, tB, M, N, K, a, A, lda, B, ldb, b, C, ldc);
+  }
+  void sgemv_fp32(unsigned int o, bool tA, unsigned int M, unsigned int N,
+                  float a, const float *A, unsigned int lda, const float *X,
+                  unsigned int iX, float b, float *Y,
+                  unsigned int iY) override {
+    counters_->sgemv++;
+    real_->sgemv_fp32(o, tA, M, N, a, A, lda, X, iX, b, Y, iY);
+  }
+  void ele_mul_fp32(unsigned int N, const float *X, const float *Y, float *Z,
+                    float a, float b, unsigned int is,
+                    unsigned int os) override {
+    counters_->ele_mul++;
+    real_->ele_mul_fp32(N, X, Y, Z, a, b, is, os);
+  }
+  void ele_add_fp32(unsigned int N, const float *X, const float *Y, float *Z,
+                    float a, float b, unsigned int is,
+                    unsigned int os) override {
+    counters_->ele_add++;
+    real_->ele_add_fp32(N, X, Y, Z, a, b, is, os);
+  }
+  void scopy_fp32(unsigned int N, const float *X, unsigned int iX, float *Y,
+                  unsigned int iY) override {
+    counters_->scopy++;
+    real_->scopy_fp32(N, X, iX, Y, iY);
+  }
+
+private:
+  nntrainer::ComputeOps *real_;
+  CallCounters *counters_;
+};
 
 class ComputeOpsDispatchTest : public ::testing::Test {
 protected:
   void SetUp() override {
     counters = std::make_unique<CallCounters>();
-    g_counters = counters.get();
-    mock_ops = make_mock_ops();
+    nntrainer::ensureComputeOps();
+    mock_ops = std::make_unique<MockComputeOps>(nntrainer::getComputeOps(),
+                                                counters.get());
     ct_data = std::make_shared<nntrainer::ContextData>();
-    ct_data->setComputeOps(&mock_ops);
+    ct_data->setComputeOps(mock_ops.get());
   }
 
-  void TearDown() override { g_counters = nullptr; }
-
   std::unique_ptr<CallCounters> counters;
-  nntrainer::ComputeOps mock_ops{};
+  std::unique_ptr<MockComputeOps> mock_ops;
   std::shared_ptr<nntrainer::ContextData> ct_data;
 };
 
@@ -119,10 +110,10 @@ protected:
 
 /**
  * @brief A Tensor with no attached ContextData should fall back to the
- *        global ops table; no mock counter increments.
+ *        global ops; no mock counter increments.
  */
 TEST_F(ComputeOpsDispatchTest, FallbackToGlobalWhenNoContextData) {
-  nntrainer::Tensor a(1, 1, 4, 4); // 4x4
+  nntrainer::Tensor a(1, 1, 4, 4);
   nntrainer::Tensor b(1, 1, 4, 4);
   a.setValue(1.0f);
   b.setValue(1.0f);
@@ -134,7 +125,7 @@ TEST_F(ComputeOpsDispatchTest, FallbackToGlobalWhenNoContextData) {
 }
 
 /**
- * @brief When a ContextData with a mock ComputeOps is attached to a
+ * @brief When a ContextData with the mock subclass is attached to a
  *        Tensor, calling .dot dispatches through the mock.
  */
 TEST_F(ComputeOpsDispatchTest, DotDispatchesThroughAttachedContextOps) {
@@ -144,12 +135,9 @@ TEST_F(ComputeOpsDispatchTest, DotDispatchesThroughAttachedContextOps) {
   b.setValue(1.0f);
 
   a.setContextData(ct_data);
-
   auto out = a.dot(b);
 
-  // Either sgemm or sgemv must have been invoked (4x4 dot uses sgemm).
   EXPECT_GT(counters->sgemm.load() + counters->sgemv.load(), 0);
-  // Result correctness preserved (mock forwards to global).
   EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, 0), 4.0f);
 }
 
@@ -165,7 +153,6 @@ TEST_F(ComputeOpsDispatchTest, MultiplyDispatchesThroughAttachedContextOps) {
   nntrainer::Tensor out(1, 1, 1, 8);
 
   a.setContextData(ct_data);
-
   a.multiply(b, out);
 
   EXPECT_GT(counters->ele_mul.load(), 0);
@@ -184,7 +171,6 @@ TEST_F(ComputeOpsDispatchTest, AddDispatchesThroughAttachedContextOps) {
   nntrainer::Tensor out(1, 1, 1, 8);
 
   a.setContextData(ct_data);
-
   a.add(b, out);
 
   EXPECT_GT(counters->ele_add.load(), 0);
@@ -194,7 +180,7 @@ TEST_F(ComputeOpsDispatchTest, AddDispatchesThroughAttachedContextOps) {
 /**
  * @brief Result tensor of a binary op inherits ContextData from `this`,
  *        so a chained op on the result keeps dispatching through the
- *        same backend. Verifies the inheritance contract.
+ *        same backend.
  */
 TEST_F(ComputeOpsDispatchTest, ResultInheritsContextDataFromOperand) {
   nntrainer::Tensor a(1, 1, 4, 4);
@@ -205,7 +191,6 @@ TEST_F(ComputeOpsDispatchTest, ResultInheritsContextDataFromOperand) {
   a.setContextData(ct_data);
 
   auto first = a.dot(b);
-  // first should now own ct_data via inheritContextDataTo.
   EXPECT_EQ(first.getContextData().get(), ct_data.get());
 
   int before = counters->sgemm.load() + counters->sgemv.load();
@@ -215,10 +200,9 @@ TEST_F(ComputeOpsDispatchTest, ResultInheritsContextDataFromOperand) {
 }
 
 /**
- * @brief Replacing the attached ContextData with a different mock
- *        rebinds dispatch on subsequent calls. This is the "swap
- *        backend at runtime" property — important for hot-swapping
- *        between vendor contexts on the same Tensor.
+ * @brief Replacing the attached ContextData with a different subclass
+ *        rebinds dispatch on subsequent calls — the runtime swap
+ *        property required for hot-swapping vendor contexts.
  */
 TEST_F(ComputeOpsDispatchTest, SwappingContextDataRebindsDispatch) {
   nntrainer::Tensor a(1, 1, 1, 8);
@@ -233,16 +217,18 @@ TEST_F(ComputeOpsDispatchTest, SwappingContextDataRebindsDispatch) {
   int after_first = counters->ele_mul.load();
   EXPECT_GT(after_first, 0);
 
-  // Swap to a fresh ContextData carrying its OWN ComputeOps that does
-  // NOT touch the original counters.
-  nntrainer::ComputeOps fresh_ops = *nntrainer::getComputeOps();
+  // Swap to a fresh ContextData carrying its own MockComputeOps with
+  // independent counters. Subsequent ops bump fresh counters only.
+  auto fresh_counters = std::make_unique<CallCounters>();
+  auto fresh_mock = std::make_unique<MockComputeOps>(nntrainer::getComputeOps(),
+                                                     fresh_counters.get());
   auto fresh_ct = std::make_shared<nntrainer::ContextData>();
-  fresh_ct->setComputeOps(&fresh_ops);
+  fresh_ct->setComputeOps(fresh_mock.get());
   a.setContextData(fresh_ct);
 
   a.multiply(b, out2);
-  // The original mock counter must not have advanced.
   EXPECT_EQ(counters->ele_mul.load(), after_first);
+  EXPECT_GT(fresh_counters->ele_mul.load(), 0);
 }
 
 /**
@@ -264,7 +250,7 @@ TEST_F(ComputeOpsDispatchTest, BinaryOpThrowsOnContextMismatch) {
   // contexts (e.g. CPU + OpenCL) — same kind of mock here, but the
   // identity of the ContextData pointers differs.
   auto ct_other = std::make_shared<nntrainer::ContextData>();
-  ct_other->setComputeOps(&mock_ops);
+  ct_other->setComputeOps(mock_ops.get());
 
   a.setContextData(ct_data);
   b.setContextData(ct_other);
@@ -326,7 +312,7 @@ TEST_F(ComputeOpsDispatchTest, ToMigratesContextDataAndUnblocksOp) {
   nntrainer::Tensor out(1, 1, 1, 8);
 
   auto ct_other = std::make_shared<nntrainer::ContextData>();
-  ct_other->setComputeOps(&mock_ops);
+  ct_other->setComputeOps(mock_ops.get());
 
   a.setContextData(ct_data);
   b.setContextData(ct_other);

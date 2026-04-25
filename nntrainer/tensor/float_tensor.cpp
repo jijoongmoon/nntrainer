@@ -791,7 +791,7 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
 
   auto *o = getOps();
   if (input_dtype == Tdatatype::Q4_0) {
-    if (o->gemm_q4_0_batch_fp32 && M > 1) {
+    if (o->supports_gemm_q4_0_batch_fp32() && M > 1) {
       o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
     } else {
       for (unsigned int i = 0; i < input.size(); ++i) {
@@ -800,7 +800,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
       }
     }
   } else { // QINT4
-    if (o->gemv_int4_batch_fp32 && input[0]->getMemoryData()->isSVM() &&
+    if (o->supports_gemv_int4_batch_fp32() &&
+        input[0]->getMemoryData()->isSVM() &&
         output[0]->getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
       std::vector<uint16_t *> scales;
       for (unsigned int i = 0; i < input.size(); ++i) {
@@ -979,7 +980,7 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     M = getDim().height();
     K = getDim().width();
     N = input.getDim().width();
-    if (o->gemm_q4_0_accel_fp32 && M > 1) {
+    if (o->supports_gemm_q4_0_accel_fp32() && M > 1) {
       o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
     } else {
       o->gemm_q4_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
@@ -1007,7 +1008,7 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   unsigned int N = output.getDim().width();
 
   auto *o = getOps();
-  if (o->gemv_int4_accel_fp32 && input.getMemoryData()->isSVM() &&
+  if (o->supports_gemv_int4_accel_fp32() && input.getMemoryData()->isSVM() &&
       output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
     if (M == 1) {
       o->gemv_int4_accel_fp32(mdata, input.getScale<uint16_t>(), data, rdata, K,
