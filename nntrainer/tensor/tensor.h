@@ -17,13 +17,18 @@
 
 #define CREATE_IF_EMPTY_DIMS(tensor, ...)                                      \
   do {                                                                         \
-    if (tensor.empty())                                                        \
+    if (tensor.empty()) {                                                      \
+      auto __ct_keep = tensor.getContextData();                                \
       tensor = Tensor(__VA_ARGS__);                                            \
+      if (__ct_keep)                                                           \
+        tensor.setContextData(__ct_keep);                                      \
+    }                                                                          \
   } while (0);
 
 #include <cstddef>
 
 #include <compute_ops.h>
+#include <context_data.h>
 #include <cpu_backend.h>
 #include <nntrainer_log.h>
 #include <tensor_base.h>
@@ -1985,7 +1990,7 @@ public:
    * @param[out] bool false if there is NaN or Inf else false
    */
   bool isValid(ComputeOps *ops = nullptr) const {
-    return itensor_->isValid(ops);
+    return itensor_->isValid(resolveOps(ops));
   };
 
   /**
@@ -2012,8 +2017,54 @@ public:
 
   static constexpr float epsilon = 1e-5f;
 
+  /**
+   * @brief Attach ContextData carrying the per-vendor ComputeOps table.
+   *
+   * Once set, this tensor's ops calls (dot/multiply/...) will dispatch to
+   * `ct_data->getComputeOps()` instead of the global `getComputeOps()`.
+   * Result tensors of binary/unary ops inherit ct_data from the receiver.
+   */
+  void setContextData(std::shared_ptr<ContextData> ct_data) {
+    ct_data_ = std::move(ct_data);
+  }
+
+  /**
+   * @brief Get the ContextData attached to this tensor (may be null).
+   */
+  const std::shared_ptr<ContextData> &getContextData() const {
+    return ct_data_;
+  }
+
+  /**
+   * @brief Resolve the effective ComputeOps for a tensor op call.
+   *
+   * Priority: explicit `ops` param > attached `ct_data_` > global table.
+   * Returning nullptr lets the underlying TensorBase keep its current
+   * "default to global getComputeOps()" behaviour.
+   */
+  ComputeOps *resolveOps(ComputeOps *ops) const {
+    if (ops)
+      return ops;
+    if (ct_data_)
+      return ct_data_->getComputeOps();
+    return nullptr;
+  }
+
+  /**
+   * @brief Propagate this tensor's ContextData to a result tensor.
+   *
+   * Used by binary/unary ops so that subsequent calls on the result
+   * dispatch to the same vendor backend as the operand. If `out`
+   * already has a ContextData, it is preserved (caller-supplied wins).
+   */
+  void inheritContextDataTo(Tensor &out) const {
+    if (!out.ct_data_)
+      out.ct_data_ = ct_data_;
+  }
+
 private:
   std::unique_ptr<TensorBase> itensor_;
+  std::shared_ptr<ContextData> ct_data_;
 
   /**
    * @brief properties for virtual tensor
