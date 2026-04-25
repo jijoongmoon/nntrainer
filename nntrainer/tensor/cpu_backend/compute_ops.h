@@ -420,11 +420,16 @@ void init_backend();
 
 /**
  * @brief Backend-specific compute ops getters. Each returns a pointer
- * to a process-wide singleton instance of the concrete CPU subclass.
+ * to a process-wide singleton instance of the concrete subclass.
  */
 ComputeOps *get_arm_ops();
 ComputeOps *get_x86_ops();
 ComputeOps *get_fallback_ops();
+#ifdef ENABLE_OPENCL
+/** @brief OpenCL accelerator ComputeOps singleton. Defined when
+ *  enable-opencl is on, in cl_operations/cl_compute_ops.cpp. */
+ComputeOps *get_cl_ops();
+#endif
 
 } // namespace nntrainer
 
