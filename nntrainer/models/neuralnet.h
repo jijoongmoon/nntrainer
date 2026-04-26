@@ -458,6 +458,15 @@ public:
     void *user_data = nullptr) override;
 
   /**
+   * @copydoc void setExternalTensors(const std::vector<Tensor> &,
+   *                                  const std::vector<std::string> &);
+   */
+  void setExternalTensors(const std::vector<Tensor> &data,
+                          const std::vector<std::string> &names) override {
+    model_graph.setExternalTensors(data, names);
+  }
+
+  /**
    * @brief     Run NeuralNetwork train with callback function by user
    * @param[in] dt datatype (mode) where it should be
    * @param[in] databuffer set the databuffer

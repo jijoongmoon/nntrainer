@@ -32,7 +32,8 @@
 
 namespace nntrainer {
 class RunLayerContext;
-}
+class Tensor;
+} // namespace nntrainer
 /** Define more aliases for the model in the API */
 namespace ml {
 namespace train {
@@ -324,6 +325,24 @@ public:
                                   void * /**< user_data */)>
                  fn,
                void *user_data = nullptr) = 0;
+
+  /**
+   * @brief Bind externally-owned tensors into the graph by input layer name.
+   *
+   * Each name in @p names must match an input layer in the compiled graph
+   * (e.g., a Tensor placeholder created via the symbolic graph API). The
+   * matching tensor in @p data is wired into that input layer's output
+   * placeholder zero-copy — the caller retains ownership.
+   *
+   * Used e.g. by Applications/CausalLM to bind a host-side KV cache buffer
+   * to mha_core's external cache input slots.
+   *
+   * @param data  external tensors to bind; must contain a value for each
+   *              entry of @p names (or be a single-element broadcast).
+   * @param names input-layer names to bind to.
+   */
+  virtual void setExternalTensors(const std::vector<nntrainer::Tensor> &data,
+                                  const std::vector<std::string> &names) = 0;
 
   /**
    * @brief     set optimizer for the neural network model
