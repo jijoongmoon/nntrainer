@@ -29,6 +29,39 @@
 
 namespace nntrainer {
 
+namespace props {
+
+/**
+ * @brief Per-input-layer override of the output tensor data type.
+ *
+ * Without this, InputLayer::finalize() coerces the output dtype to the
+ * model's global activation dtype (set via "model_tensor_type"), which makes
+ * it impossible for, e.g., an FP16 KV-cache or INT-coded tokens placeholder
+ * to coexist with FP32 activations.
+ *
+ * Accepted values: "FP32", "FP16", "UINT8", "UINT16", "UINT32", "QINT8" ...
+ *                  (anything ml::train::TensorDim::DataType supports as a
+ *                  string token via str_converter).
+ *
+ * Mainly used by the symbolic Tensor → input layer auto-creation path in
+ * tensor_api so a Tensor declared with FP16 dim wires up a matching FP16
+ * input layer at compile time.
+ */
+class TensorDtype final : public nntrainer::Property<std::string> {
+public:
+  /**
+   * @brief Default-constructed TensorDtype is an UNSET property
+   *        (`empty() == true`). Use the explicit-value constructor — or set
+   *        via `setProperty({"tensor_dtype=FP16"})` — to pin the dtype.
+   */
+  TensorDtype() = default;
+  explicit TensorDtype(const std::string &value) { set(value); }
+  static constexpr const char *key = "tensor_dtype";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+} // namespace props
+
 /**
  * @class   Input Layer
  * @note    input layers requires to be only single input, consider making the
@@ -112,7 +145,8 @@ public:
   static constexpr const char *type = "input";
 
 private:
-  std::tuple<props::Normalization, props::Standardization> input_props;
+  std::tuple<props::Normalization, props::Standardization, props::TensorDtype>
+    input_props;
 };
 } // namespace nntrainer
 

@@ -1484,3 +1484,58 @@ TEST(nntrainer_ccapi_graph, causallm_style_multi_input_p) {
   EXPECT_FALSE(output_bufs.empty());
   EXPECT_NE(output_bufs[0], nullptr);
 }
+
+// ===== PR-B4: Typed input layer (tensor_dtype) =====
+
+/**
+ * @brief A symbolic input Tensor declared with a non-FP32 dim must compile
+ *        into an InputLayer that preserves that dtype (via the new
+ *        tensor_dtype property), instead of being silently coerced to the
+ *        model's activation dtype. This is what lets typed KV caches —
+ *        FP16/UINT16 — coexist with FP32 activations in the same graph.
+ */
+#ifdef ENABLE_FP16
+TEST(nntrainer_ccapi_graph, typed_input_fp16_compile_p) {
+  using namespace ml::train;
+  TensorDim fp16_dim(
+    {1, 1, 1, 4},
+    TensorDim::TensorType(TensorDim::Format::NCHW, TensorDim::DataType::FP16));
+  auto x = Tensor(fp16_dim, "fp16_input");
+  LayerHandle id = createLayer("identity", {"name=id_layer"});
+  Tensor y = id(x);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y, ExecutionMode::INFERENCE), ML_ERROR_NONE);
+}
+#endif
+
+/**
+ * @brief Same shape check, but UINT16 — exercises the "InputLayer dtype !=
+ *        activation dtype" fallback path (is_inplace becomes false, etc.).
+ */
+TEST(nntrainer_ccapi_graph, typed_input_uint16_compile_p) {
+  using namespace ml::train;
+  TensorDim u16_dim({1, 1, 1, 4},
+                    TensorDim::TensorType(TensorDim::Format::NCHW,
+                                          TensorDim::DataType::UINT16));
+  auto x = Tensor(u16_dim, "uint16_input");
+  LayerHandle id = createLayer("identity", {"name=id_layer"});
+  Tensor y = id(x);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y, ExecutionMode::INFERENCE), ML_ERROR_NONE);
+}
+
+/**
+ * @brief FP32 dim — control test. Compile must succeed without emitting
+ *        tensor_dtype (default behaviour unchanged).
+ */
+TEST(nntrainer_ccapi_graph, typed_input_fp32_default_p) {
+  using namespace ml::train;
+  auto x = Tensor({1, 1, 1, 4}, "fp32_input"); // default = FP32
+  LayerHandle fc = createLayer("fully_connected", {"unit=4", "name=fc"});
+  Tensor y = fc(x);
+
+  auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
+  EXPECT_EQ(model->compile(x, y, ExecutionMode::INFERENCE), ML_ERROR_NONE);
+}
