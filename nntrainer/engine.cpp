@@ -43,7 +43,10 @@ void Engine::add_default_object() {
 
   auto &app_context = nntrainer::AppContext::Global();
 
-  init_backend(); // initialize cpu backend
+  // Ensure CPU backend compute-ops table is bound. ensureComputeOps() is
+  // std::call_once-guarded, so this call is safe even if AppContext or
+  // another Context already initialized it.
+  ensureComputeOps();
   registerContext("cpu", &app_context);
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1

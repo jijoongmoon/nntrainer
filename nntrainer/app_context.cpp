@@ -243,10 +243,11 @@ std::once_flag global_app_context_init_flag;
 void AppContext::initialize() noexcept {
   try {
     // Ensure the CPU compute-ops table is bound before anything else. Engine
-    // also calls init_backend() at startup, but calling it here is idempotent
-    // and guarantees g_compute_ops is available when AppContext runs ahead of
-    // Engine in some tests.
-    init_backend();
+    // also routes through ensureComputeOps() at startup, but calling it here
+    // guarantees g_compute_ops is available when AppContext runs ahead of
+    // Engine in some tests. ensureComputeOps() is std::call_once-guarded so
+    // multi-threaded init paths cannot race init_backend().
+    ensureComputeOps();
 
     setMemAllocator(std::make_shared<MemAllocator>());
 
