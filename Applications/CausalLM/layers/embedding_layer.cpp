@@ -84,11 +84,7 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
-                                bool training) {}
-
-void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                            unsigned int from, unsigned int to,
-                                            bool training) {
+                                bool training) {
 
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
@@ -96,7 +92,6 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
                   ? 1.0f
                   : std::get<nntrainer::props::Scale>(embedding_props).get();
-  unsigned int _from = from;
 
   nntrainer::Tensor &weight = context.getWeight(weight_idx);
   nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -106,13 +101,12 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
 
   unsigned int b_size = input_.batch();
+  const int iter = static_cast<int>(input_.width());
 
   for (unsigned int b = 0; b < b_size; ++b) {
     float *in_data =
       input_.getAddress<float>(b * input_.getDim().getFeatureLen());
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
-
-    int iter = to - from;
 
 #pragma omp parallel for
     for (int i = 0; i < iter; ++i) {
@@ -150,9 +144,9 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
 
 #ifdef DEBUG
-    std::cout << context.getName() << " : "
-              << "\n input:" << input_ << "\n weight: " << weight
-              << "\n hidden: " << hidden_ << std::endl;
+    std::cout << context.getName() << " : " << "\n input:" << input_
+              << "\n weight: " << weight << "\n hidden: " << hidden_
+              << std::endl;
 #endif
   }
 }

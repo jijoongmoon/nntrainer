@@ -171,23 +171,18 @@ void TieWordEmbedding::setProperty(const std::vector<std::string> &values) {
 }
 
 void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
-                                  bool training) {}
-
-void TieWordEmbedding::incremental_forwarding(
-  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
+                                  bool training) {
 
   if (mode_ == mode::embedding)
-    incremental_forwarding_embedding(context, from, to, training);
+    forwarding_embedding(context, training);
   else if (mode_ == mode::lm_head)
-    incremental_forwarding_lmhead(context, from, to, training);
+    forwarding_lmhead(context, training);
   else
     throw std::invalid_argument("lm_head is not supported yet");
 }
 
-void TieWordEmbedding::incremental_forwarding_embedding(
-  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
+void TieWordEmbedding::forwarding_embedding(nntrainer::RunLayerContext &context,
+                                            bool training) {
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim =
     std::get<nntrainer::props::InDim>(tieword_embedding_props);
@@ -197,7 +192,6 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     std::get<nntrainer::props::Scale>(tieword_embedding_props).empty()
       ? 1.0f
       : std::get<nntrainer::props::Scale>(tieword_embedding_props).get();
-  unsigned int _from = from;
 
   nntrainer::Tensor &weight =
     context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
@@ -213,13 +207,13 @@ void TieWordEmbedding::incremental_forwarding_embedding(
       "Tieword embedding is not supported yet for the data type");
 
   size_t b_size = input_.batch();
+  const int iter = static_cast<int>(input_.width());
 
   for (size_t b = 0; b < b_size; ++b) {
     float *in_data =
       input_.getAddress<float>(b * input_.getDim().getFeatureLen());
 
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
-    int iter = to - from;
 
 #pragma omp parallel for
     for (int i = 0; i < iter; ++i) {
@@ -250,16 +244,15 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     }
 
 #ifdef DEBUG
-    std::cout << context.getName() << " : "
-              << "\n input:" << input_ << "\n weight: " << weight
-              << "\n hidden: " << hidden_ << std::endl;
+    std::cout << context.getName() << " : " << "\n input:" << input_
+              << "\n weight: " << weight << "\n hidden: " << hidden_
+              << std::endl;
 #endif
   }
 }
 
-void TieWordEmbedding::incremental_forwarding_lmhead(
-  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
+void TieWordEmbedding::forwarding_lmhead(nntrainer::RunLayerContext &context,
+                                         bool training) {
   nntrainer::Tensor weight =
     context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
 
@@ -277,11 +270,13 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
   hidden_step_dim.batch(1);
 
   unsigned int b_size = input_dim.batch();
+  // Tied LM-head emits logits only for the last position of the input chunk.
+  const unsigned int last_row = input_.height() - 1;
 
   for (unsigned int b = 0; b < b_size; ++b) {
     nntrainer::Tensor input_step = input_.getSharedDataTensor(
-      input_step_dim,
-      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
+      input_step_dim, b * input_dim.getFeatureLen() + last_row * input_.width(),
+      true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 

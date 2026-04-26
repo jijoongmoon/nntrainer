@@ -167,9 +167,6 @@ void CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
                           nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
 }
 
-void CachedSlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
-                                    bool training) {}
-
 inline void CachedSlimMoELayer::compute_expert_forward(
   const nntrainer::Tensor &input, nntrainer::Tensor &output,
   const std::vector<std::pair<unsigned, float>> &token_assignments,
@@ -261,9 +258,8 @@ inline void CachedSlimMoELayer::compute_expert_forward(
   }
 }
 
-void CachedSlimMoELayer::incremental_forwarding(
-  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
+void CachedSlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
+                                    bool training) {
 
 #ifdef DEBUG
   auto t1 = high_resolution_clock::now();
@@ -278,12 +274,14 @@ void CachedSlimMoELayer::incremental_forwarding(
   nntrainer::TensorDim output_step_dim = output_.getDim();
   nntrainer::TensorDim router_logits_step_dim = router_logits_.getDim();
 
+  const unsigned int step = input_.height();
+
   input_step_dim.batch(1);
   output_step_dim.batch(1);
-  router_logits_step_dim.batch(to - from);
+  router_logits_step_dim.batch(step);
 
-  input_step_dim.height(to - from);
-  output_step_dim.height(to - from);
+  input_step_dim.height(step);
+  output_step_dim.height(step);
 
   for (unsigned int b = 0; b < input_.batch(); ++b) {
 
@@ -481,16 +479,14 @@ void CachedSlimMoELayer::incremental_forwarding(
     auto dt_miss = duration_cast<nanoseconds>(t2_miss - t1_miss);
     auto dt_hit = duration_cast<nanoseconds>(t2_hit - t1_hit);
     auto dt_evict = duration_cast<nanoseconds>(t2_evict - t1_evict);
-    std::cout << context.getName() << " \t| " << dt.count() << " ns "
-              << "\t| " << dt.count() / 1'000 << " us "
-              << "\t| " << dt.count() / 1'000'000 << " ms "
-              << "\t| "
+    std::cout << context.getName() << " \t| " << dt.count() << " ns " << "\t| "
+              << dt.count() / 1'000 << " us " << "\t| "
+              << dt.count() / 1'000'000 << " ms " << "\t| "
               << "hit ratio: " << hit_count / 8.0 << "\t | "
               << " miss ratio: " << miss_count / 8.0 << "\t | "
               << "hit_compute: " << dt_hit.count() / 1'000'000 << " ms "
-              << "\t| "
-              << "miss_compute: " << dt_miss.count() / 1'000'000 << " ms "
-              << "\t| "
+              << "\t| " << "miss_compute: " << dt_miss.count() / 1'000'000
+              << " ms " << "\t| "
               << "evict_time: " << dt_evict.count() / 1'000'000 << " ms "
               << "\t| " << std::endl;
 #endif
