@@ -28,6 +28,45 @@
 namespace ml {
 namespace train {
 
+namespace {
+
+/**
+ * @brief Map a TensorDim::DataType to the string token InputLayer's
+ *        `tensor_dtype` property accepts. Returns "" for FP32 (the default,
+ *        in which case the property need not be set) and for types that
+ *        cannot be expressed as a typed input (NONE / quantized variants
+ *        without a string token).
+ */
+std::string dtypeToString(TensorDim::DataType d) {
+  using DT = TensorDim::DataType;
+  switch (d) {
+  case DT::FP32:
+    return ""; // default, no need to override
+  case DT::FP16:
+    return "FP16";
+  case DT::UINT8:
+    return "UINT8";
+  case DT::UINT16:
+    return "UINT16";
+  case DT::UINT32:
+    return "UINT32";
+  case DT::QINT8:
+    return "QINT8";
+  case DT::QINT16:
+    return "QINT16";
+  case DT::Q4_K:
+    return "Q4_K";
+  case DT::Q6_K:
+    return "Q6_K";
+  case DT::Q4_0:
+    return "Q4_0";
+  default:
+    return ""; // BCQ, QINT4, UINT4, NONE — fall back to default
+  }
+}
+
+} // namespace
+
 std::shared_ptr<Layer> Tensor::getProducingLayer() const {
   return (impl_ && impl_->graph_edge) ? impl_->graph_edge->producing_layer
                                       : nullptr;
@@ -393,8 +432,18 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
     std::string shape_str = std::to_string(dim.channel()) + ":" +
                             std::to_string(dim.height()) + ":" +
                             std::to_string(dim.width());
-    auto input_layer =
-      createLayer("input", {"name=" + inp_name, "input_shape=" + shape_str});
+    std::vector<std::string> input_props = {"name=" + inp_name,
+                                            "input_shape=" + shape_str};
+    // Honour the symbolic Tensor's dtype: if the placeholder was declared
+    // with a non-default DataType (e.g. FP16 for KV cache, UINT16 for
+    // quantized inputs), forward it as `tensor_dtype=...` so InputLayer's
+    // finalize() doesn't coerce it to the model's activation dtype.
+    {
+      std::string s = dtypeToString(dim.getDataType());
+      if (!s.empty())
+        input_props.push_back("tensor_dtype=" + s);
+    }
+    auto input_layer = createLayer("input", input_props);
     status = addLayer(std::move(input_layer));
     if (status != ML_ERROR_NONE) {
       return status;
@@ -406,8 +455,14 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
     std::string leaf_shape = std::to_string(leaf_info.dim.channel()) + ":" +
                              std::to_string(leaf_info.dim.height()) + ":" +
                              std::to_string(leaf_info.dim.width());
-    auto leaf_layer =
-      createLayer("input", {"name=" + leaf_name, "input_shape=" + leaf_shape});
+    std::vector<std::string> leaf_props = {"name=" + leaf_name,
+                                           "input_shape=" + leaf_shape};
+    {
+      std::string s = dtypeToString(leaf_info.dim.getDataType());
+      if (!s.empty())
+        leaf_props.push_back("tensor_dtype=" + s);
+    }
+    auto leaf_layer = createLayer("input", leaf_props);
     status = addLayer(std::move(leaf_layer));
     if (status != ML_ERROR_NONE) {
       return status;
