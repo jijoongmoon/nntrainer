@@ -419,12 +419,15 @@ inline ComputeOps *getComputeOps() {
 void init_backend();
 
 /**
- * @brief Backend-specific compute ops getters. Each returns a pointer
- * to a process-wide singleton instance of the concrete subclass.
+ * @brief Backend-specific compute ops getters.
+ *
+ * `get_cpu_ops()` returns a process-wide singleton of the unified
+ * `CpuComputeOps` subclass. The same singleton works for ARM / x86 /
+ * fallback because each arch's compute_backend.cpp provides its own
+ * specialised body for `nntrainer::sgemm` etc.; the wrapper class is
+ * arch-agnostic and only needs to be defined once.
  */
-ComputeOps *get_arm_ops();
-ComputeOps *get_x86_ops();
-ComputeOps *get_fallback_ops();
+ComputeOps *get_cpu_ops();
 #ifdef ENABLE_OPENCL
 /** @brief OpenCL accelerator ComputeOps singleton. Defined when
  *  enable-opencl is on, in cl_operations/cl_compute_ops.cpp. */

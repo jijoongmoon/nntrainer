@@ -6,7 +6,6 @@ arch = host_machine.cpu_family()
 if arch != 'arm' and arch != 'aarch64' and arch != 'x86_64' and arch != 'x86'
   fallback_headers += 'fallback.h'
   fallback_sources += 'fallback.cpp'
-  fallback_sources += 'fallback_ops_table.cpp'
   if get_option('enable-fp16')
     fallback_sources += 'fallback_fp16.cpp'
   endif

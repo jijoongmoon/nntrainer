@@ -2,26 +2,26 @@
 /**
  * Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
  *
- * @file   arm_ops_table.cpp
+ * @file   cpu_ops_table.cpp
  * @date   04 April 2026
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  ARM CPU backend ComputeOps subclass.
+ * @brief  Unified CPU backend ComputeOps subclass.
  *
- * Concrete ComputeOps subclass for ARM (NEON/SVE/SME) targets. Each
- * override forwards to the existing nntrainer::* implementation in
- * arm_compute_backend.cpp. CPU backends are stateless so this class
- * has no member variables — but the same pattern lets a future
- * GPU/NPU subclass keep its cl_command_queue / npu_session inside.
+ * Single concrete ComputeOps subclass for ALL CPU targets (ARM /
+ * x86 / fallback). The nntrainer::sgemm etc. functions are arch-
+ * specialized — each arch_compute_backend.cpp defines its own body
+ * — so a single forwarding wrapper is enough; build-time arch
+ * dispatch picks the right symbol at link time.
  */
 
-#include <arm_compute_backend.h>
+#include <cpu_backend.h>
 #include <compute_ops.h>
 
 namespace nntrainer {
 
-class ArmComputeOps : public ComputeOps {
+class CpuComputeOps : public ComputeOps {
 public:
   // FP32 BLAS
   void sgemm_fp32(unsigned int o, bool tA, bool tB, unsigned int M,
@@ -210,7 +210,7 @@ public:
     nntrainer::scopy_int8_to_float32(N, X, iX, Y, iY);
   }
 
-  // Accelerator-only ops: ARM CPU does not implement these — base
+  // Accelerator-only ops: CPU backends do not implement these — base
   // class defaults (throw + supports_*() = false) are correct.
 
 #ifdef ENABLE_FP16
@@ -357,8 +357,8 @@ public:
 #endif // ENABLE_FP16
 };
 
-ComputeOps *get_arm_ops() {
-  static ArmComputeOps instance;
+ComputeOps *get_cpu_ops() {
+  static CpuComputeOps instance;
   return &instance;
 }
 

@@ -35,7 +35,7 @@ void init_backend() {
   // Do not repeatedly call set_num_threads. It's a global config.
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
 #endif
-  g_compute_ops = get_x86_ops();
+  g_compute_ops = get_cpu_ops();
 }
 
 void scopy_int4_to_float32(const unsigned int N, const uint8_t *X,
