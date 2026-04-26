@@ -20,7 +20,19 @@ namespace causallm {
 
 /**
  * @brief BertTransformer class
- * @note  Base class for BERT-style encoder-only models.
+ * @note  Base class for BERT-style encoder-only models. Built on the same
+ *        symbolic ml::train::Tensor graph API as the other causallm
+ *        Transformer derivatives (qwen2/qwen3/gemma3) — every create*()
+ *        method takes and returns symbolic Tensors and constructModel()
+ *        returns the (input, output) pair so derived classes can fold an
+ *        embedder head on top if needed.
+ *
+ *        Bert takes 3 inputs (token IDs, position IDs, token-type IDs).
+ *        The base API exposes only the primary input/output via the
+ *        std::pair return; the other two leaves stay reachable through
+ *        position_ids_input and token_type_ids_input member Tensors so
+ *        the host (encode()) can bind their data per call.
+ *
  *        The structure is :
  *
  *          [Input] [PositionIds] [TokenTypeIds]
@@ -54,21 +66,22 @@ public:
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;
 
-  void constructModel() override;
+  /**
+   * @brief Build the encoder graph and return (token_ids, encoder_output).
+   *        position_ids and token_type_ids are stashed on the instance so
+   *        the host can bind them before encode().
+   */
+  std::pair<Tensor, Tensor> constructModel() override;
 
-  std::vector<LayerHandle>
-  createTransformerDecoderBlock(const int layer_id,
-                                std::string input_name) override;
+  Tensor createTransformerDecoderBlock(const int layer_id,
+                                       Tensor input) override;
 
-  std::vector<LayerHandle> createAttention(const int layer_id, int seq_len,
-                                           int n_heads, int head_dim,
-                                           std::string query_name,
-                                           std::string key_name,
-                                           std::string value_name) override;
+  Tensor createAttention(const int layer_id, int seq_len, int n_heads,
+                         int head_dim, Tensor query, Tensor key,
+                         Tensor value) override;
 
-  std::vector<LayerHandle> createMlp(const int layer_id, int dim,
-                                     int hidden_dim,
-                                     std::string input_name) override;
+  Tensor createMlp(const int layer_id, int dim, int hidden_dim,
+                   Tensor input) override;
 
   void registerCustomLayers() override;
 
@@ -83,6 +96,17 @@ protected:
    * @brief Type-vocab size for token_type_ids (BERT default: 2)
    */
   unsigned int TYPE_VOCAB_SIZE = 2;
+
+  /**
+   * @brief Auxiliary input Tensors created in constructModel(). Bert takes
+   *        three input streams; only the primary one (token IDs) flows
+   *        through the std::pair return. These two are kept on the
+   *        instance so derived classes (and the host's encode() loop)
+   *        can hand them off to model->incremental_inference as the
+   *        2nd / 3rd entries of the input vector.
+   */
+  Tensor position_ids_input;
+  Tensor token_type_ids_input;
 
 public:
   /**
