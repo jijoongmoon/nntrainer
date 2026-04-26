@@ -2051,6 +2051,53 @@ public:
       out.ct_data_ = ct_data_;
   }
 
+  /**
+   * @brief Verify two operands of a binary op live on the same vendor.
+   *
+   * If both tensors have a ContextData attached AND they point to
+   * different ones, that means a CPU-resident tensor is about to be
+   * combined with a GPU/NPU-resident tensor (or two different GPU
+   * contexts) — the underlying memory is incompatible and the op
+   * would silently produce garbage. Throw early with a clear message
+   * so the caller knows to migrate one of them via `Tensor::to()`.
+   *
+   * If either side has no ContextData (default state), the check
+   * is permissive — fall through to the global g_compute_ops path
+   * as before. That preserves backward compatibility for code that
+   * never touches ContextData.
+   */
+  void checkContextCompatibility(const Tensor &other,
+                                 const char *op_name) const {
+    const auto &lhs = ct_data_;
+    const auto &rhs = other.ct_data_;
+    if (lhs && rhs && lhs.get() != rhs.get()) {
+      throw std::invalid_argument(
+        std::string("Tensor::") + op_name +
+        ": operands belong to different vendor contexts. "
+        "Migrate one operand with Tensor::to(target_ctx) before the op.");
+    }
+  }
+
+  /**
+   * @brief Migrate this tensor to a different ContextData (vendor).
+   *
+   * Skeleton: in the current host-shared-memory regime (CPU ↔ CPU,
+   * or CPU ↔ OpenCL where both can map the same buffer), this
+   * just deep-copies the tensor and re-tags the copy with
+   * `target_ct`. When real device-only memory backends land
+   * (CUDA, NPU with DMA-only buffers), this is the single place
+   * that grows the host↔device or device↔device transfer logic.
+   *
+   * @param target_ct the destination ContextData (may be null to
+   *                  detach back to the global ops fallback).
+   * @return a new Tensor with identical data and the new context.
+   */
+  Tensor to(std::shared_ptr<ContextData> target_ct) const {
+    Tensor migrated = *this; // deep copy via Tensor copy ctor
+    migrated.setContextData(std::move(target_ct));
+    return migrated;
+  }
+
 private:
   std::unique_ptr<TensorBase> itensor_;
   std::shared_ptr<ContextData> ct_data_;

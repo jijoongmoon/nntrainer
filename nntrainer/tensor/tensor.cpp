@@ -550,6 +550,7 @@ Tensor &Tensor::multiply(Tensor const &m, Tensor &output,
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot multiply";
 
+  checkContextCompatibility(m, "multiply");
   inheritContextDataTo(output);
   itensor_->multiply(m, output, beta, resolveOps());
   return output;
@@ -601,6 +602,7 @@ Tensor &Tensor::divide(Tensor const &m, Tensor &output) const {
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot divide";
+  checkContextCompatibility(m, "divide");
   inheritContextDataTo(output);
   itensor_->divide(m, output, resolveOps());
   return output;
@@ -683,6 +685,7 @@ Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot add";
+  checkContextCompatibility(m, "add");
   inheritContextDataTo(output);
   itensor_->add(m, output, alpha, resolveOps());
   return output;
@@ -1031,6 +1034,7 @@ Tensor &Tensor::dot(Tensor const &input, Tensor &output, bool trans,
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous. Cannot dot product.";
 
+  checkContextCompatibility(input, "dot");
   inheritContextDataTo(output);
   itensor_->dot(input, output, trans, trans_in, beta, resolveOps());
   return output;

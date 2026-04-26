@@ -245,6 +245,101 @@ TEST_F(ComputeOpsDispatchTest, SwappingContextDataRebindsDispatch) {
   EXPECT_EQ(counters->ele_mul.load(), after_first);
 }
 
+/**
+ * @brief Cross-vendor mismatch — when two operands of a binary op
+ *        carry DIFFERENT ContextData (e.g. one CPU-resident tensor,
+ *        one OpenCL-resident tensor), the op must throw rather than
+ *        silently dispatch through one side's ops onto the other
+ *        side's incompatible memory. This is the assertion that
+ *        protects against the most insidious mixed-backend bug.
+ */
+TEST_F(ComputeOpsDispatchTest, BinaryOpThrowsOnContextMismatch) {
+  nntrainer::Tensor a(1, 1, 1, 8);
+  nntrainer::Tensor b(1, 1, 1, 8);
+  a.setValue(2.0f);
+  b.setValue(3.0f);
+  nntrainer::Tensor out(1, 1, 1, 8);
+
+  // Two distinct ContextData instances simulate two different vendor
+  // contexts (e.g. CPU + OpenCL) — same kind of mock here, but the
+  // identity of the ContextData pointers differs.
+  auto ct_other = std::make_shared<nntrainer::ContextData>();
+  ct_other->setComputeOps(&mock_ops);
+
+  a.setContextData(ct_data);
+  b.setContextData(ct_other);
+
+  EXPECT_THROW(a.multiply(b, out), std::invalid_argument);
+  EXPECT_THROW(a.add(b, out), std::invalid_argument);
+  EXPECT_THROW(a.divide(b, out), std::invalid_argument);
+}
+
+/**
+ * @brief Same ContextData identity on both operands → no throw.
+ *        Confirms the mismatch check is keyed on identity, not on
+ *        nullness alone (which would be backward-compatibility break).
+ */
+TEST_F(ComputeOpsDispatchTest, BinaryOpAcceptsSameContext) {
+  nntrainer::Tensor a(1, 1, 1, 8);
+  nntrainer::Tensor b(1, 1, 1, 8);
+  a.setValue(2.0f);
+  b.setValue(3.0f);
+  nntrainer::Tensor out(1, 1, 1, 8);
+
+  a.setContextData(ct_data);
+  b.setContextData(ct_data); // same instance, not a copy
+
+  EXPECT_NO_THROW(a.multiply(b, out));
+}
+
+/**
+ * @brief One operand has no ContextData → permissive (legacy code
+ *        path). A tensor created without ever touching ContextData
+ *        falls back to the global ops table; binary-op'ing it with
+ *        a context-attached tensor must NOT throw — that would break
+ *        every existing test and call site.
+ */
+TEST_F(ComputeOpsDispatchTest, BinaryOpAcceptsOneSideUnattached) {
+  nntrainer::Tensor a(1, 1, 1, 8);
+  nntrainer::Tensor b(1, 1, 1, 8);
+  a.setValue(2.0f);
+  b.setValue(3.0f);
+  nntrainer::Tensor out(1, 1, 1, 8);
+
+  a.setContextData(ct_data);
+  // b has no ContextData — legacy code path
+
+  EXPECT_NO_THROW(a.multiply(b, out));
+}
+
+/**
+ * @brief Tensor::to(target_ct) deep-copies and re-tags. Result owns
+ *        the new ContextData; original is unchanged. After to(), a
+ *        previously-mismatched binary op on the migrated tensor
+ *        succeeds.
+ */
+TEST_F(ComputeOpsDispatchTest, ToMigratesContextDataAndUnblocksOp) {
+  nntrainer::Tensor a(1, 1, 1, 8);
+  nntrainer::Tensor b(1, 1, 1, 8);
+  a.setValue(2.0f);
+  b.setValue(3.0f);
+  nntrainer::Tensor out(1, 1, 1, 8);
+
+  auto ct_other = std::make_shared<nntrainer::ContextData>();
+  ct_other->setComputeOps(&mock_ops);
+
+  a.setContextData(ct_data);
+  b.setContextData(ct_other);
+
+  // Migrate b onto a's context. Original b stays on ct_other.
+  nntrainer::Tensor b_migrated = b.to(ct_data);
+  EXPECT_EQ(b_migrated.getContextData().get(), ct_data.get());
+  EXPECT_EQ(b.getContextData().get(), ct_other.get()); // unchanged
+
+  // Now a.multiply(b_migrated) is on the same context — no throw.
+  EXPECT_NO_THROW(a.multiply(b_migrated, out));
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
