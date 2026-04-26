@@ -307,6 +307,167 @@ TEST_F(KVCacheManagerTest, typical_inference_flow) {
   EXPECT_FLOAT_EQ(kd[1], 1.0f); // l=0, b=0, i=1
 }
 
+// Multi-session independence: two KVCacheManagers serve independent sessions
+// in the same process — writes to one must not be visible from the other.
+// This is the host-side property that makes mha_core's stateless / position-
+// as-input design safe for concurrent / branching inference.
+TEST_F(KVCacheManagerTest, multi_session_independence) {
+  causallm::KVCacheManager session_b;
+  session_b.allocate(NUM_LAYERS, BATCH_SIZE, MAX_SEQ_LEN, NUM_HEADS_KV,
+                     HEAD_DIM, ml::train::TensorDim::DataType::FP32);
+
+  // Session A writes 'A' marker at position 0
+  for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+    auto kw = manager.getKeyCacheWriteView(l, 0, 1);
+    auto vw = manager.getValueCacheWriteView(l, 0, 1);
+    for (unsigned int i = 0; i < KV_WIDTH; ++i) {
+      kw.getData<float>()[i] = 100.0f + l;
+      vw.getData<float>()[i] = 200.0f + l;
+    }
+  }
+  manager.advance(1);
+
+  // Session B writes 'B' marker at the same logical position 0
+  for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+    auto kw = session_b.getKeyCacheWriteView(l, 0, 1);
+    auto vw = session_b.getValueCacheWriteView(l, 0, 1);
+    for (unsigned int i = 0; i < KV_WIDTH; ++i) {
+      kw.getData<float>()[i] = 500.0f + l;
+      vw.getData<float>()[i] = 600.0f + l;
+    }
+  }
+  session_b.advance(1);
+
+  // Each session sees only its own data
+  for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+    auto a_k = manager.getKeyCacheReadView(l, 0, 1);
+    auto a_v = manager.getValueCacheReadView(l, 0, 1);
+    auto b_k = session_b.getKeyCacheReadView(l, 0, 1);
+    auto b_v = session_b.getValueCacheReadView(l, 0, 1);
+    for (unsigned int i = 0; i < KV_WIDTH; ++i) {
+      EXPECT_FLOAT_EQ(a_k.getData<float>()[i], 100.0f + l);
+      EXPECT_FLOAT_EQ(a_v.getData<float>()[i], 200.0f + l);
+      EXPECT_FLOAT_EQ(b_k.getData<float>()[i], 500.0f + l);
+      EXPECT_FLOAT_EQ(b_v.getData<float>()[i], 600.0f + l);
+    }
+  }
+
+  EXPECT_EQ(manager.getPosition(), 1u);
+  EXPECT_EQ(session_b.getPosition(), 1u);
+}
+
+// Multi-turn continuation: a single session's KV cache must accumulate across
+// "turns" — turn 2 prefill must see turn 1's tokens at the start of cache and
+// write its own at the position turn 1 left off at. This is the protocol
+// CausalLM::bindPositionForCall + advanceKVCachePosition implements.
+TEST_F(KVCacheManagerTest, multi_turn_continuation) {
+  // Turn 1: write 4 tokens starting at position 0
+  for (unsigned int t = 0; t < 4; ++t) {
+    for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+      auto kw = manager.getKeyCacheWriteView(l, 0, 1);
+      for (unsigned int i = 0; i < KV_WIDTH; ++i) {
+        kw.getData<float>()[i] = static_cast<float>(t * 10 + l);
+      }
+    }
+    manager.advance(1);
+  }
+  EXPECT_EQ(manager.getPosition(), 4u);
+
+  // Turn 2: write 3 tokens, must continue at position 4 (no reset)
+  const unsigned int turn2_start = manager.getPosition();
+  for (unsigned int t = 0; t < 3; ++t) {
+    for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+      auto kw = manager.getKeyCacheWriteView(l, 0, 1);
+      for (unsigned int i = 0; i < KV_WIDTH; ++i) {
+        kw.getData<float>()[i] = static_cast<float>(turn2_start + t + l * 100);
+      }
+    }
+    manager.advance(1);
+  }
+  EXPECT_EQ(manager.getPosition(), 7u);
+
+  // Read back: turn 1 marker survives at slots [0..4), turn 2 lives at [4..7)
+  for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+    auto k = manager.getKeyCacheReadView(l, 0, 7);
+    const float *kd = k.getData<float>();
+    for (unsigned int t = 0; t < 4; ++t) {
+      EXPECT_FLOAT_EQ(kd[t * KV_WIDTH], static_cast<float>(t * 10 + l))
+        << "turn1 token " << t << " layer " << l << " was clobbered";
+    }
+    for (unsigned int t = 0; t < 3; ++t) {
+      EXPECT_FLOAT_EQ(kd[(4 + t) * KV_WIDTH],
+                      static_cast<float>(4 + t + l * 100))
+        << "turn2 token " << t << " layer " << l << " mis-written";
+    }
+  }
+}
+
+// Branching: two managers branch off the same shared prefix, then diverge.
+// Demonstrates how a host can "fork" a generation safely with two KV caches.
+TEST_F(KVCacheManagerTest, branching_from_shared_prefix) {
+  const unsigned int prefix_len = 5;
+
+  // Build a shared prefix in 'manager'
+  for (unsigned int t = 0; t < prefix_len; ++t) {
+    for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+      auto kw = manager.getKeyCacheWriteView(l, 0, 1);
+      for (unsigned int i = 0; i < KV_WIDTH; ++i)
+        kw.getData<float>()[i] = static_cast<float>(t + l * 1000);
+    }
+    manager.advance(1);
+  }
+  manager.save("/tmp/test_kv_branch.bin", prefix_len);
+
+  // Branch B: load prefix, then continue with branch-B specific tokens
+  causallm::KVCacheManager branch_b;
+  branch_b.allocate(NUM_LAYERS, BATCH_SIZE, MAX_SEQ_LEN, NUM_HEADS_KV, HEAD_DIM,
+                    ml::train::TensorDim::DataType::FP32);
+  branch_b.load("/tmp/test_kv_branch.bin", prefix_len);
+  EXPECT_EQ(branch_b.getPosition(), prefix_len);
+
+  // Continue 'manager' (branch A) with A-specific tokens
+  for (unsigned int t = 0; t < 2; ++t) {
+    for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+      auto kw = manager.getKeyCacheWriteView(l, 0, 1);
+      for (unsigned int i = 0; i < KV_WIDTH; ++i)
+        kw.getData<float>()[i] = -1000.0f - t; // branch A marker
+    }
+    manager.advance(1);
+  }
+
+  // Continue branch B with B-specific tokens
+  for (unsigned int t = 0; t < 2; ++t) {
+    for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+      auto kw = branch_b.getKeyCacheWriteView(l, 0, 1);
+      for (unsigned int i = 0; i < KV_WIDTH; ++i)
+        kw.getData<float>()[i] = +9000.0f + t; // branch B marker
+    }
+    branch_b.advance(1);
+  }
+
+  // Prefix is identical in both
+  for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+    auto a = manager.getKeyCacheReadView(l, 0, prefix_len);
+    auto b = branch_b.getKeyCacheReadView(l, 0, prefix_len);
+    for (unsigned int t = 0; t < prefix_len; ++t) {
+      const float expected = static_cast<float>(t + l * 1000);
+      EXPECT_FLOAT_EQ(a.getData<float>()[t * KV_WIDTH], expected);
+      EXPECT_FLOAT_EQ(b.getData<float>()[t * KV_WIDTH], expected);
+    }
+  }
+  // ...but the suffixes diverge
+  for (unsigned int l = 0; l < NUM_LAYERS; ++l) {
+    auto a = manager.getKeyCacheReadView(l, 0, prefix_len + 2);
+    auto b = branch_b.getKeyCacheReadView(l, 0, prefix_len + 2);
+    EXPECT_FLOAT_EQ(a.getData<float>()[prefix_len * KV_WIDTH], -1000.0f);
+    EXPECT_FLOAT_EQ(a.getData<float>()[(prefix_len + 1) * KV_WIDTH], -1001.0f);
+    EXPECT_FLOAT_EQ(b.getData<float>()[prefix_len * KV_WIDTH], 9000.0f);
+    EXPECT_FLOAT_EQ(b.getData<float>()[(prefix_len + 1) * KV_WIDTH], 9001.0f);
+  }
+
+  std::remove("/tmp/test_kv_branch.bin");
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

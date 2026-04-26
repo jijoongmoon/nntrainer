@@ -180,6 +180,19 @@ protected:
                                                       int n_heads);
 
   /**
+   * @brief Get (lazily-create) the symbolic POSITION input that feeds every
+   *        mha_core's slot 5. One placeholder per Transformer instance
+   *        (named "position", shape (B,1,1,1) FP32) — its memory is owned
+   *        by the host (CausalLM) and bound via Model::setExternalTensors
+   *        before each forwarding call.
+   *
+   *        position[b] is the cache-write start index (and RoPE base
+   *        position) for batch b, so multi-turn / multi-session / branching
+   *        can all use the same model instance without any layer-side state.
+   */
+  Tensor getOrCreatePositionPlaceholder();
+
+  /**
    * @brief register CustomLayers
    */
   virtual void registerCustomLayers();
@@ -189,6 +202,13 @@ protected:
    */
   bool is_initialized = false; /**< Flag to check if the model is initialized */
   ModelHandle model;
+
+  /**
+   * @brief Lazily-built symbolic POSITION input, shared across all mha_core
+   *        layers in this Transformer's graph. Created on the first
+   *        getOrCreatePositionPlaceholder() call inside constructModel().
+   */
+  Tensor position_input;
 
   /** tokenizer */
   std::unique_ptr<tokenizers::Tokenizer> tokenizer;

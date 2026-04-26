@@ -297,6 +297,16 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   return decoder_output({residual, ffn_out});
 }
 
+Tensor Transformer::getOrCreatePositionPlaceholder() {
+  if (!position_input.isValid()) {
+    // FP32 (B,1,1,1) — single value per batch, host fills before each
+    // forwarding call. FP32 keeps wide compatibility today; the value is
+    // truncated to unsigned int inside mha_core.
+    position_input = Tensor({BATCH_SIZE, 1, 1, 1}, "position");
+  }
+  return position_input;
+}
+
 std::pair<Tensor, Tensor>
 Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   const unsigned int max_timestep =
@@ -347,9 +357,11 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
   Tensor v = wv(value);
 
-  // External KV cache placeholders (per-layer). Their actual storage is owned
-  // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
+  // External KV cache placeholders (per-layer) + shared POSITION input.
+  // Storage is owned by the host (KVCacheManager + a per-batch position
+  // buffer) and bound at runtime via setExternalTensors.
   auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+  Tensor position = getOrCreatePositionPlaceholder();
 
   // Attention core layer
   LayerHandle mha(createLayer(
@@ -363,7 +375,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
      withKey("rope_theta", ROPE_THETA),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
-  Tensor a = mha({q, k, v, cache_k, cache_v});
+  Tensor a = mha({q, k, v, cache_k, cache_v, position});
 
   // O layer
   LayerHandle wo(createLayer(

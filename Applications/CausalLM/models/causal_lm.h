@@ -159,29 +159,39 @@ protected:
   std::mt19937 rng; /**< Random Number Gen */
 
   /**
-   * @brief Externalized KV cache (host-owned). Allocated by allocateKVCache()
-   *        once the model has been compiled (so we have the layer count,
-   *        head count, etc.) and bound to mha_core's input slots
-   *        cache_k_l<i> / cache_v_l<i> via Model::setExternalTensors.
+   * @brief Externalized KV cache (host-owned). Allocated by
+   *        allocateAndBindKVCache() once the model has been compiled and
+   *        bound to mha_core's input slots cache_k_l<i> / cache_v_l<i> via
+   *        Model::setExternalTensors. Together with @ref position_buffer,
+   *        this is the only state that survives across inference calls —
+   *        mha_core itself is stateless.
    */
   KVCacheManager kv_cache;
 
   /**
-   * @brief Allocate kv_cache and bind it to all mha_core layers via
-   *        Model::setExternalTensors. Idempotent — safe to call once after
-   *        initialize().
+   * @brief Per-batch position values, shape (BATCH_SIZE, 1, 1, 1) FP32.
+   *        Wired into the shared "position" input layer once via
+   *        allocateAndBindKVCache(); the host updates the in-place float[]
+   *        before each forwarding call (see bindPositionForCall).
+   */
+  nntrainer::Tensor position_buffer;
+
+  /**
+   * @brief Allocate kv_cache + position_buffer and bind both to the model
+   *        via Model::setExternalTensors. Idempotent.
    */
   void allocateAndBindKVCache();
 
   /**
-   * @brief Reset all mha_core layers' cache_index to @p pos and the
-   *        KVCacheManager's tracked write position.
+   * @brief Write @p pos into every batch slot of position_buffer. Call this
+   *        before each model->inference() in the prefill / generate loop.
    */
-  void setKVCachePosition(unsigned int pos);
+  void bindPositionForCall(unsigned int pos);
 
   /**
-   * @brief Advance all mha_core layers' cache_index by @p step_size and
-   *        update the KVCacheManager's tracked write position.
+   * @brief Advance the KVCacheManager's tracked write position by
+   *        @p step_size. mha_core itself is stateless and does not need
+   *        notification.
    */
   void advanceKVCachePosition(unsigned int step_size);
 };
