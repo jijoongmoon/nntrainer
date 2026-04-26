@@ -34,6 +34,9 @@
 #include <cl_context.h>
 #endif
 
+// QNN context is loaded as a plugin .so (libqnn_context.so)
+// No header dependency needed here.
+
 #include "singleton.h"
 
 namespace nntrainer {
