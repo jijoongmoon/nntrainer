@@ -516,6 +516,7 @@ Tensor Tensor::multiply(float const &value) const {
 
 Tensor &Tensor::multiply(float const &value, Tensor &out) const {
   itensor_->multiply(value, out);
+  inheritContextTo(out);
   return out;
 }
 
@@ -547,7 +548,9 @@ Tensor &Tensor::multiply(Tensor const &m, Tensor &output,
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot multiply";
 
+  checkContextCompatibility(m, "multiply");
   itensor_->multiply(m, output, beta);
+  inheritContextTo(output);
   return output;
 }
 
@@ -572,6 +575,7 @@ Tensor &Tensor::divide(float const &value, Tensor &output) const {
     throw std::invalid_argument(ss.str().c_str());
   }
   itensor_->divide(value, output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -596,7 +600,9 @@ Tensor &Tensor::divide(Tensor const &m, Tensor &output) const {
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot divide";
+  checkContextCompatibility(m, "divide");
   itensor_->divide(m, output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -641,6 +647,7 @@ Tensor Tensor::add(float const &value) const {
 
 Tensor &Tensor::add(float const &value, Tensor &output) const {
   itensor_->add(value, output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -676,7 +683,9 @@ Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot add";
+  checkContextCompatibility(m, "add");
   itensor_->add(m, output, alpha);
+  inheritContextTo(output);
   return output;
 }
 
@@ -716,6 +725,7 @@ Tensor Tensor::sum_by_batch() const {
 
   Tensor output(batch(), 1, 1, 1, this->getFormat(), getDataType());
   itensor_->sum_by_batch(output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -776,7 +786,9 @@ Tensor &Tensor::abs(Tensor &output) const {
     throw std::invalid_argument(
       "Error: Tensor::abs requires output tensor to be same size, data type "
       "and format as input tensor.");
-  return itensor_->abs(output);
+  itensor_->abs(output);
+  inheritContextTo(output);
+  return output;
 }
 
 Tensor Tensor::average(unsigned int axis) const {
@@ -934,6 +946,7 @@ void Tensor::inv_sqrt_i() { itensor_->inv_sqrt(*this); }
 
 Tensor Tensor::inv_sqrt(Tensor &out) const {
   itensor_->inv_sqrt(out);
+  inheritContextTo(out);
   return out;
 }
 
@@ -1020,7 +1033,9 @@ Tensor &Tensor::dot(Tensor const &input, Tensor &output, bool trans,
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous. Cannot dot product.";
 
+  checkContextCompatibility(input, "dot");
   itensor_->dot(input, output, trans, trans_in, beta);
+  inheritContextTo(output);
   return output;
 }
 
@@ -1471,6 +1486,7 @@ Tensor &Tensor::transpose(const std::string &direction, Tensor &output) const {
   }
 
   itensor_->transpose(direction, output);
+  inheritContextTo(output);
 
   return output;
 }
