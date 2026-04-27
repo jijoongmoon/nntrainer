@@ -715,6 +715,16 @@ void NeuralNetwork::load(const std::string &file_path,
       }
       size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
+
+      if (tensor_data_type == TensorDim::DataType::QINT4){
+        //QINT4 but read as Q4_0
+        uint32_t K = weight->getVariable().height();
+        uint32_t N = weight->getVariable().width();
+        nntrainer::Tensor W_q40(1, 1, K, N, {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::Q4_0});
+        //size = N * K;
+        size = W_q40.getMemoryBytes();
+        W_q40.deallocate();
+      }
       weight->getVariableRef().setFileOffset(start_from);
       ///@todo instead of checking the data type,
       /// we may need to create a common parent class for
@@ -724,7 +734,8 @@ void NeuralNetwork::load(const std::string &file_path,
       if (tensor_data_type != TensorDim::DataType::FP32 &&
           tensor_data_type != TensorDim::DataType::FP16 &&
           tensor_data_type != TensorDim::DataType::Q6_K &&
-          tensor_data_type != TensorDim::DataType::Q4_0) {
+          tensor_data_type != TensorDim::DataType::Q4_0 &&
+          tensor_data_type != TensorDim::DataType::QINT4) {
         // for tensor with qparam
         size += sizeof(uint16_t);
       }
