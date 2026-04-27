@@ -183,7 +183,11 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
     {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
      "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
      "scale=" + std::to_string(EMBEDDING_SCALE)}));
-  Tensor h = embedding(x);
+  // 2-input wiring: token IDs + shared active_len placeholder. embedding's
+  // forwarding() reads active_len[0] to bound iter; mirrors the same
+  // (data, active_len) pattern used by the four MoE layers.
+  Tensor active_len = getOrCreateActiveLenPlaceholder();
+  Tensor h = embedding({x, active_len});
 
   // transformer decoder blocks
   for (int i = 0; i < NUM_LAYERS; ++i) {
@@ -297,6 +301,28 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   return decoder_output({residual, ffn_out});
 }
 
+Tensor Transformer::getOrCreatePositionPlaceholder() {
+  if (!position_input.isValid()) {
+    // FP32 (B,1,1,1) — single value per batch, host fills before each
+    // forwarding call. FP32 keeps wide compatibility today; the value is
+    // truncated to unsigned int inside mha_core.
+    position_input = Tensor({BATCH_SIZE, 1, 1, 1}, "position");
+  }
+  return position_input;
+}
+
+Tensor Transformer::getOrCreateActiveLenPlaceholder() {
+  if (!active_len_input.isValid()) {
+    // FP32 (B,1,1,1). Same value per batch (uniform call). Host writes
+    // input_len before the initial prompt and 1 before each incremental
+    // decode call. embedding_layer and the four MoE layers read it to
+    // bound their per-call work — same place mha_core would read
+    // "position" but for active-range length, not the cache slot.
+    active_len_input = Tensor({BATCH_SIZE, 1, 1, 1}, "active_len");
+  }
+  return active_len_input;
+}
+
 std::pair<Tensor, Tensor>
 Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   const unsigned int max_timestep =
@@ -347,9 +373,11 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
   Tensor v = wv(value);
 
-  // External KV cache placeholders (per-layer). Their actual storage is owned
-  // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
+  // External KV cache placeholders (per-layer) + shared POSITION input.
+  // Storage is owned by the host (KVCacheManager + a per-batch position
+  // buffer) and bound at runtime via setExternalTensors.
   auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+  Tensor position = getOrCreatePositionPlaceholder();
 
   // Attention core layer
   LayerHandle mha(createLayer(
@@ -363,7 +391,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
      withKey("rope_theta", ROPE_THETA),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
-  Tensor a = mha({q, k, v, cache_k, cache_v});
+  Tensor a = mha({q, k, v, cache_k, cache_v, position});
 
   // O layer
   LayerHandle wo(createLayer(

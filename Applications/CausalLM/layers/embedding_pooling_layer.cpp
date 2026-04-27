@@ -110,48 +110,6 @@ void EmbeddingPoolingLayer::forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
-void EmbeddingPoolingLayer::incremental_forwarding(
-  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
-  nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
-
-  unsigned int batch = input.batch();
-  unsigned int dim = input.width();
-  size_t feature_len = input.getDim().getFeatureLen(); // height * width
-
-  bool mode_lasttoken = std::get<props::PoolingModeLastToken>(pooling_props);
-
-  if (mode_lasttoken) {
-    for (unsigned int b = 0; b < batch; ++b) {
-      // Use feature_len for batch stride
-      // The last token processed is at index `to-1` in the absolute sequence.
-      size_t offset = static_cast<size_t>(b) * feature_len + (to - 1) * dim;
-
-      nntrainer::Tensor source =
-        input.getSharedDataTensor({1, 1, 1, dim}, offset);
-      nntrainer::Tensor dest =
-        output.getSharedDataTensor({1, 1, 1, dim}, b * dim);
-
-      dest.copyData(source);
-    }
-  } else if (std::get<props::PoolingModeMeanTokens>(pooling_props)) {
-    for (unsigned int b = 0; b < batch; ++b) {
-      unsigned int len = to - from;
-      size_t offset = static_cast<size_t>(b) * feature_len + from * dim;
-
-      nntrainer::Tensor source =
-        input.getSharedDataTensor({1, 1, len, dim}, offset);
-      nntrainer::Tensor dest =
-        output.getSharedDataTensor({1, 1, 1, dim}, b * dim);
-
-      dest.copyData(source.average(2));
-    }
-  } else {
-    output.setZero();
-  }
-}
-
 void EmbeddingPoolingLayer::calcDerivative(
   nntrainer::RunLayerContext &context) {
   throw nntrainer::exception::not_supported(

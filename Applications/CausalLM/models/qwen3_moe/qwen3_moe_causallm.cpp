@@ -54,7 +54,10 @@ Tensor Qwen3MoECausalLM::createMlp(const int layer_id, int dim, int hidden_dim,
      withKey("unit", hidden_dim), withKey("num_experts", NUM_EXPERTS),
      withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
      withKey("moe_activation", "swish")}));
-  return moe(input);
+  // Wire active_len placeholder so the MoE delegates per-call work to
+  // [0, active_len) instead of always processing the full input height.
+  Tensor active_len = getOrCreateActiveLenPlaceholder();
+  return moe({input, active_len});
 }
 
 void Qwen3MoECausalLM::registerCustomLayers() {

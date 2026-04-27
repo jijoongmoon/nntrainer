@@ -112,13 +112,6 @@ void LmHeadLayer::setProperty(const std::vector<std::string> &values) {
 
 void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
                              bool training) {
-  throw nntrainer::exception::not_supported(
-    "Forwarding for LMHead layer is not supported");
-}
-
-void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                         unsigned int from, unsigned int to,
-                                         bool training) {
 
   nntrainer::Tensor weight =
     context.getWeight(weight_idx[LmHeadParams::weight]);
@@ -137,11 +130,14 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   hidden_step_dim.batch(1);
 
   unsigned int b_size = input_dim.batch();
+  // LM head only emits logits for the LAST position of the input chunk —
+  // (input_.height() - 1) replaces the legacy (to - from - 1) offset.
+  const unsigned int last_row = input_.height() - 1;
 
   for (unsigned int b = 0; b < b_size; ++b) {
     nntrainer::Tensor input_step = input_.getSharedDataTensor(
-      input_step_dim,
-      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
+      input_step_dim, b * input_dim.getFeatureLen() + last_row * input_.width(),
+      true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
