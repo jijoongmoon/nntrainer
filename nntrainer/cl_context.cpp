@@ -17,6 +17,7 @@
 #include <addition_layer_cl.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
+#include <compute_ops.h>
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
 #include <reshape_cl.h>
@@ -81,6 +82,14 @@ void ClContext::initialize() noexcept {
     initAttentionClKernels();
     add_default_object();
     setMemAllocator(std::make_shared<MemAllocator>());
+
+    // Install the OpenCL ComputeOps subclass so tensors created from
+    // this Context dispatch their accelerator-only ops (Q4_0/INT4
+    // batch & accel GEMM/GEMV) to the existing OpenCL kernels in
+    // cl_operations/blas_kernels.cpp instead of throwing or silently
+    // taking the CPU path. CPU-only ops on a CL-attached tensor still
+    // throw via base default — by design, those stay on a CPU context.
+    getContextData()->setComputeOps(get_cl_ops());
 
   } catch (std::exception &e) {
     ml_loge("cl_context: registering layers failed!!, reason: %s", e.what());
