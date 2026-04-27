@@ -69,13 +69,15 @@ MHACoreLayer::~MHACoreLayer() {}
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
+  const unsigned int num_inputs = context.getNumInputs();
+  NNTR_THROW_IF(num_inputs != 3 && num_inputs != 4 && num_inputs != 6,
                 std::invalid_argument)
-    << "Multi head Attention layer needs 3, 4, or 5 inputs. "
-       "(query, key, value; mask is optional; external cache_key + cache_value "
-       "for external cache mode)";
+    << "Multi head Attention layer needs 3, 4, or 6 inputs. "
+       "(Q, K, V; optional mask at slot 3; OR external-cache mode: "
+       "Q, K, V, cache_key, cache_value, position) — got "
+    << num_inputs;
 
-  use_external_cache = (context.getNumInputs() >= 5);
+  use_external_cache = (num_inputs == 6);
   ml::train::TensorDim::TensorType activation_type = {
     context.getFormat(), context.getActivationDataType()};
   ml::train::TensorDim empty_dim(activation_type);
@@ -193,23 +195,23 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 /************************************************************** */
 
 /**
- * @note In external KV cache mode (use_external_cache == true), this
- *       implements the inference forward pass using cache tensors supplied
- *       as input[3] (cache_key) and input[4] (cache_value). The host (e.g.
- *       KVCacheManager via setExternalTensors) is responsible for owning
- *       these buffers and for calling setCacheIndex() before each step to
- *       set the write position. After this call cache_index is advanced by
- *       input.height().
+ * @note In external KV cache mode (num_inputs == 6) the layer is fully
+ *       stateless: cache buffers come from input slots 3/4 and the per-batch
+ *       starting position arrives via input slot 5 (POSITION). Nothing is
+ *       remembered between calls, so the same MHACoreLayer instance can
+ *       service multi-turn, multi-session and branching inference safely as
+ *       long as the host binds the right (cache, position) before each call.
+ *
+ *       Input layout for external cache mode:
+ *         input[0] = Q       (B, 1, step_size, num_heads_Q  * head_dim)
+ *         input[1] = K       (B, 1, step_size, num_heads_KV * head_dim)
+ *         input[2] = V       (B, 1, step_size, num_heads_KV * head_dim)
+ *         input[3] = cache_key   (B, 1, max_seq_len, num_heads_KV*head_dim)
+ *         input[4] = cache_value (B, 1, max_seq_len, num_heads_KV*head_dim)
+ *         input[5] = position    (B, 1, 1, 1) FP32 — read as integer
  *
  *       In legacy 3/4-input mode (use_external_cache == false) training is
  *       NYI and incremental_forwarding() is the inference path.
- *
- *       Input layout for external cache mode:
- *         input[0] = Q   (B, 1, step_size, num_heads_Q  * head_dim)
- *         input[1] = K   (B, 1, step_size, num_heads_KV * head_dim)
- *         input[2] = V   (B, 1, step_size, num_heads_KV * head_dim)
- *         input[3] = cache_key   (B, 1, max_seq_len, num_heads_KV * head_dim)
- *         input[4] = cache_value (B, 1, max_seq_len, num_heads_KV * head_dim)
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
@@ -222,8 +224,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
   nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
 
-  nntrainer::Tensor &cache_key = context.getInput(3);
-  nntrainer::Tensor &cache_value = context.getInput(4);
+  nntrainer::Tensor &cache_key = context.getInput(INOUT_INDEX::EXT_CACHE_KEY);
+  nntrainer::Tensor &cache_value =
+    context.getInput(INOUT_INDEX::EXT_CACHE_VALUE);
+  nntrainer::Tensor &position = context.getInput(INOUT_INDEX::POSITION);
+  const float *position_data = position.getData<float>();
 
   nntrainer::Tensor sink;
   if (use_sink) {
@@ -231,8 +236,6 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   }
 
   unsigned int step_size = query.height();
-  unsigned int from = cache_index;
-  unsigned int to = cache_index + step_size;
 
   auto get_step_dim = [step_size](const ml::train::TensorDim &dim) {
     auto step_dim = dim;
@@ -257,6 +260,12 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 
   unsigned int batch_size = query_dim.batch();
   for (unsigned int batch = 0; batch < batch_size; ++batch) {
+    // Per-batch position lets independent sessions share the same model
+    // instance + same batch dimension while sitting at different cache
+    // offsets.
+    const unsigned int from = static_cast<unsigned int>(position_data[batch]);
+    const unsigned int to = from + step_size;
+
     nntrainer::Tensor query_step = query.getSharedDataTensor(
       query_step_dim, batch * query_dim.getFeatureLen(), true);
     nntrainer::Tensor key_step = key.getSharedDataTensor(
@@ -318,8 +327,6 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
         cache_value_dim, cache_value_step_dim);
     }
   }
-
-  cache_index += step_size;
 }
 
 /**
@@ -330,11 +337,12 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
-  // External KV cache path: from/to are interpreted as the absolute write
-  // position; route through forwarding() which reads cache_key/cache_value
-  // from input slots 3/4. forwarding() advances cache_index internally.
+  // External-cache (6-input) mode is fully stateless: the host has already
+  // written @p _from into the bound POSITION input via
+  // CausalLM::bindPositionForCall() before NeuralNetwork::incremental_inference
+  // routed here, so all the information forwarding() needs is on the inputs
+  // already. Just delegate.
   if (use_external_cache) {
-    cache_index = _from;
     forwarding(context, training);
     return;
   }

@@ -64,17 +64,14 @@ public:
 
   /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
+   *
+   * @note Two-input mode: input[0] = token id sequence (B,1,1,seq_len),
+   *       input[1] = active_len placeholder (B,1,1,1) read per call to
+   *       bound the iteration to the active range. Single-input mode
+   *       (no active_len) iterates the full input width as before.
    */
   WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
                              bool training) override;
-
-  /**
-￼   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
-￼   * int from, unsigned int to, bool training)
-￼   */
-  WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
-                                         unsigned int from, unsigned int to,
-                                         bool training) override;
 
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)

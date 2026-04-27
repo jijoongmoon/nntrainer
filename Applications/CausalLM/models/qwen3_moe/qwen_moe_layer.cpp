@@ -50,8 +50,15 @@ MoELayer::MoELayer() :
 void MoELayer::finalize(nntrainer::InitLayerContext &context) {
 
   // 1. Validate input/output dimensions
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "MoE layer only supports single input";
+  // Two-input mode: [hidden_states, active_len] — active_len is a (B,1,1,1)
+  // FP32 placeholder the host updates per call, used to bound the
+  // routing/expert work to the leading [0, active_len) positions.
+  // Single-input mode (no active_len) processes the full input height.
+  const unsigned int num_inputs = context.getNumInputs();
+  NNTR_THROW_IF(num_inputs != 1 && num_inputs != 2, std::invalid_argument)
+    << "MoELayer takes 1 input (hidden_states) or 2 inputs (hidden_states + "
+       "active_len), got "
+    << num_inputs;
 
   auto &weight_regularizer =
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
@@ -159,6 +166,21 @@ void MoELayer::finalize(nntrainer::InitLayerContext &context) {
 }
 
 void MoELayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
+  // active_len delegation: when wired with 2 inputs, read active_len[0] and
+  // delegate to incremental_forwarding(0, active_len) so we run the
+  // per-batch sliced path that processes only [0, active_len) positions.
+  // Without active_len, fall through to the legacy bulk-reshape path that
+  // processes the full input height.
+  if (context.getNumInputs() >= 2) {
+    nntrainer::Tensor &active_len_t = context.getInput(1);
+    int al = static_cast<int>(active_len_t.getValue<float>(0, 0, 0, 0));
+    if (al > 0) {
+      incremental_forwarding(context, 0, static_cast<unsigned int>(al),
+                             training);
+      return;
+    }
+  }
+
   nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
 

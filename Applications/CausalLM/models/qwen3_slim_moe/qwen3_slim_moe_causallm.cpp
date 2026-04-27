@@ -54,7 +54,8 @@ Tensor Qwen3SlimMoECausalLM::createMlp(const int layer_id, int dim,
      withKey("unit", hidden_dim), withKey("num_experts", NUM_EXPERTS),
      withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
      withKey("moe_activation", "swish")}));
-  return moe(input);
+  Tensor active_len = getOrCreateActiveLenPlaceholder();
+  return moe({input, active_len});
 }
 
 void Qwen3SlimMoECausalLM::registerCustomLayers() {
