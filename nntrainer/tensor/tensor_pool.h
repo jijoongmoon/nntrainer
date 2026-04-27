@@ -77,6 +77,20 @@ public:
   }
 
   /**
+   * @brief Select the backing allocator for the underlying MemoryPool by name.
+   *
+   * @param name allocator name. "cpu" maps to CpuMemAllocator. "npu"
+   *             tries to construct an RpcMemAllocator (Android+NPU
+   *             builds only); throws on other platforms or if rpcmem
+   *             cannot be loaded. Other names are looked up in the
+   *             Engine allocator registry.
+   *
+   * Must be called before allocate(); throws otherwise. Has no effect
+   * on a CachePool — FSU pools always use the CPU allocator today.
+   */
+  void setAllocator(const std::string &name);
+
+  /**
    * @brief finalize the requested tensors
    * @param planner planner to layout the tensor memories
    * @param start_order start value for the order_exec (inclusive)

@@ -311,6 +311,27 @@ public:
   bool isAllocated() const { return tensor_pool.isAllocated(); }
 
   /**
+   * @brief Choose the backend allocator used by the weight and tensor pools.
+   *
+   * @param weight_backend allocator name for the weight pool (e.g. "cpu",
+   *                       "npu"). Empty string keeps the current default.
+   * @param tensor_backend allocator name for the activation/scratch pool.
+   *                       Empty string keeps the current default.
+   *
+   * Must be called before allocateTensors()/allocateWeights(). With this
+   * hook the same Manager instance can route weights and activations to
+   * different backends (e.g. weights on NPU shared memory, activations
+   * on CPU page-aligned memory).
+   */
+  void setComputeBackend(const std::string &weight_backend,
+                         const std::string &tensor_backend) {
+    if (!weight_backend.empty())
+      weight_pool.setAllocator(weight_backend);
+    if (!tensor_backend.empty())
+      tensor_pool.setAllocator(tensor_backend);
+  }
+
+  /**
    * @brief Set the batch size for the inputs/outputs of the layers
    */
   void setBatchSize(unsigned int batch) {

@@ -14,6 +14,7 @@
 #include <limits>
 
 #include <numeric>
+#include <unordered_set>
 #include <vector>
 
 #include <map>
@@ -25,30 +26,19 @@
 #include <profiler.h>
 #include <vector>
 
-#if defined(_WIN32)
-#define GET_SYSTEM_ALIGMENT()                                                  \
-  ([]() -> size_t {                                                            \
-    SYSTEM_INFO sysInfo;                                                       \
-    GetSystemInfo(&sysInfo);                                                   \
-    return sysInfo.dwPageSize;                                                 \
-  })()
-
-#define ALIGNED_ALLOC(size) _aligned_malloc(size, GET_SYSTEM_ALIGMENT())
-#define ALIGNED_FREE(ptr) _aligned_free(ptr)
-#elif defined(__ANDROID__) && ENABLE_NPU
-#define RPCMEM_HEAP_ID_SYSTEM 25
-#define RPCMEM_DEFAULT_FLAGS 1
-#define ALIGNED_ALLOC(size)                                                    \
-  rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size)
-#define ALIGNED_FREE(ptr) rpcmem_free(ptr)
-#else
-#define GET_SYSTEM_ALIGMENT()                                                  \
-  ([]() -> size_t { return sysconf(_SC_PAGE_SIZE); })()
-#define ALIGNED_ALLOC(size) std::aligned_alloc(GET_SYSTEM_ALIGMENT(), size)
-#define ALIGNED_FREE(ptr) free(ptr)
-#endif
-
 namespace nntrainer {
+
+namespace {
+
+/// Allocate via the pool's MemAllocator. Returns nullptr if the allocator
+/// fails. alignment=0 lets the allocator pick its default (page size).
+void *allocBlock(MemAllocator &alloc, size_t bytes) {
+  void *p = nullptr;
+  alloc.alloc(&p, bytes, 0);
+  return p;
+}
+
+} // namespace
 
 /**
  * @brief Request Memory from memory pool
@@ -126,70 +116,68 @@ void MemoryPool::allocate() {
 
   ml_logi("MemoryPool::allocate size: %zu", pool_size);
 
-#if defined(__ANDROID__) && ENABLE_NPU
-  int i = 0;
-#define RPCMEM_HEAP_ID_SYSTEM 25
-#define RPCMEM_DEFAULT_FLAGS 1
-  std::map<size_t, void *> offset_ptr;     // offset : ptr
-  std::map<size_t, size_t> allocated_size; // offset : memory size
-  std::map<size_t, std::vector<int>>
-    offset_indices; // offset : list of index which has same offset
+  // The "npu" allocator (rpcmem) hands out individually allocated blocks
+  // because rpcmem regions cannot be subdivided into a single backing
+  // pool. Other allocators ("cpu", OpenCL SVM) use a single contiguous
+  // pool and slice it via offsets — same layout the planner produced.
+  if (allocator->getName() == "npu") {
+    int i = 0;
+    std::map<size_t, void *> offset_ptr;     // offset : ptr
+    std::map<size_t, size_t> allocated_size; // offset : memory size
+    std::map<size_t, std::vector<int>>
+      offset_indices; // offset : list of indices that share offset
 
-  for (auto &s : memory_offset) {
-    size_t current_size = memory_size.at(i);
-    auto it = offset_ptr.find(s);
-    if (it == offset_ptr.end()) {
-      void *ptr =
-        rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, current_size);
-      memory_ptrs.push_back(ptr);
-      offset_ptr[s] = ptr;
-      allocated_size[s] = current_size;
-      offset_indices[s].push_back(i);
-    } else {
-      void *existing_ptr = it->second;
-      size_t max_size = allocated_size[s];
-      if (max_size < current_size) {
-        void *new_ptr = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
-                                     RPCMEM_DEFAULT_FLAGS, current_size);
-
-        for (int idx : offset_indices[s]) {
-          memory_ptrs[idx] = new_ptr;
-        }
-        rpcmem_free(existing_ptr);
-        offset_ptr[s] = new_ptr;
+    for (auto &s : memory_offset) {
+      size_t current_size = memory_size.at(i);
+      auto it = offset_ptr.find(s);
+      if (it == offset_ptr.end()) {
+        void *ptr = allocBlock(*allocator, current_size);
+        memory_ptrs.push_back(ptr);
+        offset_ptr[s] = ptr;
         allocated_size[s] = current_size;
+        offset_indices[s].push_back(i);
+      } else {
+        void *existing_ptr = it->second;
+        size_t max_size = allocated_size[s];
+        if (max_size < current_size) {
+          void *new_ptr = allocBlock(*allocator, current_size);
+          for (int idx : offset_indices[s]) {
+            memory_ptrs[idx] = new_ptr;
+          }
+          allocator->free(existing_ptr);
+          offset_ptr[s] = new_ptr;
+          allocated_size[s] = current_size;
+        }
+        memory_ptrs.push_back(offset_ptr[s]);
+        offset_indices[s].push_back(i);
       }
-      memory_ptrs.push_back(offset_ptr[s]);
-      offset_indices[s].push_back(i);
+      i++;
     }
-    i++;
-  }
 
-  mem_pool = calloc(1, 1);
-
-#else
-
+    mem_pool = calloc(1, 1);
+    owns_individual_blocks = true;
+  } else {
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-  auto *cl_context =
-    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  mem_pool = cl_context->context_inst_.createSVMRegion(pool_size);
+    auto *cl_context =
+      static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+    mem_pool = cl_context->context_inst_.createSVMRegion(pool_size);
 
-  // If SVM allocation fails, use calloc()
-  if (mem_pool != nullptr) {
-    svm_allocation = true;
-  }
+    // If SVM allocation fails, fall back to calloc.
+    if (mem_pool != nullptr) {
+      svm_allocation = true;
+    }
 #endif
 
-  if (mem_pool == nullptr)
-    mem_pool = calloc(pool_size, 1);
+    if (mem_pool == nullptr)
+      mem_pool = calloc(pool_size, 1);
 
-  unsigned int idx = 1;
-  for (auto &s : memory_offset) {
-    char *ptr = static_cast<char *>(mem_pool) + memory_offset.at(idx - 1);
-    memory_ptrs.push_back(ptr);
-    idx++;
+    unsigned int idx = 1;
+    for (auto &s : memory_offset) {
+      char *ptr = static_cast<char *>(mem_pool) + memory_offset.at(idx - 1);
+      memory_ptrs.push_back(ptr);
+      idx++;
+    }
   }
-#endif
 
 #ifdef PROFILE
   static long long seq = 0;
@@ -219,7 +207,7 @@ void MemoryPool::allocateFSU() {
     size_t current_size = memory_size.at(i);
     auto it = offset_ptr.find(s);
     if (it == offset_ptr.end()) {
-      void *ptr = ALIGNED_ALLOC(current_size);
+      void *ptr = allocBlock(*allocator, current_size);
       memory_ptrs.push_back(ptr);
       offset_ptr[s] = ptr;
       allocated_size[s] = current_size;
@@ -229,12 +217,12 @@ void MemoryPool::allocateFSU() {
       void *existing_ptr = it->second;
       size_t max_size = allocated_size[s];
       if (max_size < current_size) {
-        void *new_ptr = ALIGNED_ALLOC(current_size);
+        void *new_ptr = allocBlock(*allocator, current_size);
 
         for (int idx : offset_indices[s]) {
           memory_ptrs[idx] = new_ptr;
         }
-        ALIGNED_FREE(existing_ptr);
+        allocator->free(existing_ptr);
         offset_ptr[s] = new_ptr;
         allocated_size[s] = current_size;
       }
@@ -249,6 +237,10 @@ void MemoryPool::allocateFSU() {
   if (mem_pool == nullptr)
     throw std::runtime_error(
       "Failed to allocate memory: " + std::to_string(pool_size) + "bytes");
+
+  // Each entry of memory_ptrs is an independently allocated block; the
+  // owning allocator must free each unique pointer in deallocate().
+  owns_individual_blocks = true;
 }
 
 /**
@@ -270,6 +262,20 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
  */
 void MemoryPool::deallocate() {
   if (mem_pool != nullptr) {
+    // When memory_ptrs entries are independently allocated blocks (FSU
+    // inference path or Android+NPU rpcmem path), free each unique pointer
+    // before releasing the sentinel mem_pool. Duplicate entries can exist
+    // because the allocation paths reuse a pointer across multiple logical
+    // indices via the offset_ptr map; dedup to avoid double free.
+    if (owns_individual_blocks) {
+      std::unordered_set<void *> freed;
+      for (void *p : memory_ptrs) {
+        if (p != nullptr && freed.insert(p).second) {
+          allocator->free(p);
+        }
+      }
+    }
+
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
     if (svm_allocation) {
       auto *cl_context =
@@ -293,6 +299,8 @@ void MemoryPool::deallocate() {
     memory_ptrs.clear();
   }
   mem_pool = nullptr;
+  owns_individual_blocks = false;
+  svm_allocation = false;
 }
 
 /**

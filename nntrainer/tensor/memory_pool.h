@@ -19,24 +19,13 @@
 #ifndef __MEMORY_POOL_H__
 #define __MEMORY_POOL_H__
 
-#include <functional>
-#include <memory>
-#include <vector>
-
-#include <engine.h>
-#include <memory_data.h>
-#include <memory_planner.h>
-#include <tensor_wrap_specs.h>
-
-#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-#include <cl_context.h>
-#endif
-
 #include <cstdlib>
-#include <dynamic_library_loader.h>
 #include <functional>
+#include <iostream>
 #include <memory>
+#include <set>
 #include <vector>
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #ifdef max
@@ -54,21 +43,17 @@
 #include <unistd.h>
 #endif
 
-#include <dynamic_library_loader.h>
 #include <engine.h>
-#include <iostream>
 #include <mem_allocator.h>
-#include <set>
+#include <memory_data.h>
+#include <memory_planner.h>
+#include <tensor_wrap_specs.h>
+
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+#include <cl_context.h>
+#endif
 
 static const std::string func_tag = "[MemoryPool] ";
-typedef void *(*RpcMemAllocFn_t)(int, uint32_t, int);
-typedef void (*RpcMemFreeFn_t)(void *);
-
-enum {
-  DL_NOW = 0x0001,
-  DL_LOCAL = 0x0002,
-  DL_GLOBAL = 0x0004,
-};
 
 namespace nntrainer {
 
@@ -79,36 +64,47 @@ namespace nntrainer {
 class MemoryPool {
 public:
   /**
-   * @brief MemoryPool default constructor
+   * @brief MemoryPool default constructor — selects allocator based on platform.
    *
+   * On Android+NPU builds, attempts to use RpcMemAllocator for NPU-compatible
+   * memory. Falls back to CpuMemAllocator if rpcmem is unavailable or on
+   * other platforms. For explicit control, use the constructor that takes an
+   * allocator or call setAllocator() before planLayout()/allocate().
    */
   explicit MemoryPool() :
     mem_pool(nullptr),
     pool_size(0),
     min_pool_size(0),
     n_wgrad(0),
-    svm_allocation(false) {
-
+    svm_allocation(false),
+    owns_individual_blocks(false),
 #if defined(__ANDROID__) && ENABLE_NPU
-    void *handle =
-      DynamicLibraryLoader::loadLibrary("libcdsprpc.so", DL_NOW | DL_LOCAL);
-    const char *error_msg = DynamicLibraryLoader::getLastError();
-
-    rpcmem_alloc =
-      (RpcMemAllocFn_t)DynamicLibraryLoader::loadSymbol(handle, "rpcmem_alloc");
-    rpcmem_free =
-      (RpcMemFreeFn_t)DynamicLibraryLoader::loadSymbol(handle, "rpcmem_free");
-
-    auto close_dl = [handle] { DynamicLibraryLoader::freeLibrary(handle); };
-
-    if (rpcmem_alloc == nullptr || rpcmem_free == nullptr) {
-      NNTR_THROW_IF_CLEANUP(rpcmem_alloc == nullptr || rpcmem_free == nullptr,
-                            std::invalid_argument, close_dl)
-        << func_tag << "open rpc mem failed";
-    }
+    allocator(tryCreateRpcMemAllocator())
 #else
-    allocators = Engine::Global().getAllocators();
+    allocator(std::make_shared<CpuMemAllocator>())
 #endif
+  {
+    if (allocator == nullptr)
+      allocator = std::make_shared<CpuMemAllocator>();
+  }
+
+  /**
+   * @brief MemoryPool constructor with an explicit backing allocator.
+   *
+   * @param alloc allocator that owns alloc/free for individually allocated
+   *              blocks (FSU and NPU paths). The same allocator is used for
+   *              the matching free in deallocate().
+   */
+  explicit MemoryPool(std::shared_ptr<MemAllocator> alloc) :
+    mem_pool(nullptr),
+    pool_size(0),
+    min_pool_size(0),
+    n_wgrad(0),
+    svm_allocation(false),
+    owns_individual_blocks(false),
+    allocator(std::move(alloc)) {
+    if (allocator == nullptr)
+      allocator = std::make_shared<CpuMemAllocator>();
   }
 
   /**
@@ -225,6 +221,25 @@ public:
   void *getMemoryPoolAddress() { return mem_pool; }
 
   /**
+   * @brief Replace the backing allocator. Only valid before allocate().
+   *
+   * @param alloc allocator to use; must be non-null. Throws if the pool
+   *              is already allocated.
+   */
+  void setAllocator(std::shared_ptr<MemAllocator> alloc) {
+    if (mem_pool != nullptr)
+      throw std::runtime_error("Cannot change allocator after allocation");
+    if (alloc == nullptr)
+      throw std::invalid_argument("Allocator must not be null");
+    allocator = std::move(alloc);
+  }
+
+  /**
+   * @brief Get the current backing allocator.
+   */
+  std::shared_ptr<MemAllocator> getAllocator() const { return allocator; }
+
+  /**
    * @brief set FSU weight path
    *
    * @param path FSU weight file path
@@ -328,12 +343,15 @@ private:
 
   bool svm_allocation; /**< flag if memory is a shared virtual memory */
 
-  std::unordered_map<std::string, std::shared_ptr<nntrainer::MemAllocator>>
-    allocators;
-#if defined(__ANDROID__) && ENABLE_NPU
-  RpcMemAllocFn_t rpcmem_alloc;
-  RpcMemFreeFn_t rpcmem_free;
-#endif
+  bool owns_individual_blocks; /**< true when memory_ptrs entries are
+                                    independently allocated blocks that must be
+                                    freed individually on deallocate(). false
+                                    when memory_ptrs entries are offsets into
+                                    a single mem_pool buffer. */
+
+  std::shared_ptr<MemAllocator>
+    allocator; /**< backend that allocates the individual blocks for the
+                    FSU and NPU paths; never null after construction. */
 };
 
 } // namespace nntrainer
