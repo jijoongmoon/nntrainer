@@ -14,14 +14,39 @@
  * @todo   check before allocate that finalize is done
  */
 
+#include <engine.h>
+#include <mem_allocator.h>
 #include <memory_pool.h>
 #include <nntrainer_log.h>
+#include <stdexcept>
 #include <tensor.h>
 #include <tensor_pool.h>
 #include <tensor_wrap_specs.h>
 #include <util_func.h>
 
 namespace nntrainer {
+
+void TensorPool::setAllocator(const std::string &name) {
+  std::shared_ptr<MemAllocator> alloc;
+
+  if (name == "npu") {
+    alloc = tryCreateRpcMemAllocator();
+    if (alloc == nullptr)
+      throw std::runtime_error(
+        "[TensorPool] npu allocator is unavailable on this build");
+  } else if (name == "cpu") {
+    alloc = std::make_shared<CpuMemAllocator>();
+  } else {
+    auto registry = Engine::Global().getAllocators();
+    auto it = registry.find(name);
+    if (it == registry.end())
+      throw std::invalid_argument(
+        "[TensorPool] unknown allocator name: " + name);
+    alloc = it->second;
+  }
+
+  mem_pool->setAllocator(std::move(alloc));
+}
 
 /**
  * @brief     Request tensor with the given spec
