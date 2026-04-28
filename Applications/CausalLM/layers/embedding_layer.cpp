@@ -31,8 +31,14 @@ EmbeddingLayer::EmbeddingLayer() :
   weight_idx(std::numeric_limits<unsigned>::max()) {}
 
 void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "Embedding layer takes only one input";
+  // Accept either:
+  //  - 1 input  (legacy: token IDs only; iter falls back to input.width())
+  //  - 2 inputs (token IDs + active_len placeholder; iter = active_len[0])
+  const unsigned int num_inputs = context.getNumInputs();
+  NNTR_THROW_IF(num_inputs != 1 && num_inputs != 2, std::invalid_argument)
+    << "EmbeddingLayer takes 1 input (token IDs) or 2 inputs (token IDs + "
+       "active_len), got "
+    << num_inputs;
 
   const nntrainer::TensorDim &input_dim =
     context.getInputDimensions()[SINGLE_INOUT_IDX];
@@ -84,11 +90,7 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
-                                bool training) {}
-
-void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                            unsigned int from, unsigned int to,
-                                            bool training) {
+                                bool training) {
 
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
@@ -96,7 +98,6 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
                   ? 1.0f
                   : std::get<nntrainer::props::Scale>(embedding_props).get();
-  unsigned int _from = from;
 
   nntrainer::Tensor &weight = context.getWeight(weight_idx);
   nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -107,12 +108,21 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
   unsigned int b_size = input_.batch();
 
+  // iter = active_len when wired with the (token_ids, active_len) two-input
+  // pattern, otherwise the full input width (legacy single-input mode).
+  // active_len is the same scheme mha_core uses for its position input.
+  int iter = static_cast<int>(input_.width());
+  if (context.getNumInputs() >= 2) {
+    nntrainer::Tensor &active_len_t = context.getInput(1);
+    int al = static_cast<int>(active_len_t.getValue<float>(0, 0, 0, 0));
+    if (al > 0 && al <= static_cast<int>(input_.width()))
+      iter = al;
+  }
+
   for (unsigned int b = 0; b < b_size; ++b) {
     float *in_data =
       input_.getAddress<float>(b * input_.getDim().getFeatureLen());
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
-
-    int iter = to - from;
 
 #pragma omp parallel for
     for (int i = 0; i < iter; ++i) {

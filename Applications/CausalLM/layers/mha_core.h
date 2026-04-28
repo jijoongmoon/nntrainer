@@ -296,18 +296,6 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
-  /**
-   * @brief Set the cache index for external cache mode.
-   *        Must be called before forwarding() when use_external_cache is true.
-   * @param[in] idx current write position in the KV cache
-   */
-  WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
-
-  /**
-   * @brief Get the current cache index
-   */
-  WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
-
   inline static const std::string type = "mha_core";
 
 private:
@@ -326,15 +314,23 @@ private:
   /** softmax activation operation */
   nntrainer::ActiFunc sm;
 
-  float epsilon;            /** to avoid overflow */
-  unsigned int cache_index; /** idx of kv cache */
+  float epsilon; /** to avoid overflow */
 
   /**
-   * @brief Whether to use externally provided cache tensors
-   *        (true when num_inputs >= 5, i.e., Q, K, V + cache_key + cache_value)
-   *        In external mode mha_core does not allocate its own cache tensors,
-   *        and reads cache slots from input[3] (cache_key) and input[4]
-   *        (cache_value) which are bound by the host via setExternalTensors.
+   * @brief Per-layer write position used by the legacy 3-input internal-cache
+   *        path (driven by incremental_forwarding(from, to, ...)). The
+   *        external-cache path is stateless: position arrives as input[5]
+   *        per call.
+   */
+  unsigned int cache_index;
+
+  /**
+   * @brief Whether to use externally provided cache tensors + position input
+   *        (true when num_inputs == 6, i.e., Q, K, V, cache_key, cache_value,
+   *        position). In external mode mha_core does not allocate its own
+   *        cache tensors and does not own a write position — both arrive on
+   *        every forwarding() call. This makes the layer fully stateless and
+   *        safe for multi-turn / multi-session / branching use.
    */
   bool use_external_cache = false;
 
@@ -354,6 +350,15 @@ private:
     QUERY = 0,
     KEY = 1,
     VALUE = 2,
+    /** External-cache mode (num_inputs == 6) input slots */
+    EXT_CACHE_KEY = 3,
+    EXT_CACHE_VALUE = 4,
+    POSITION = 5, /**< (B,1,1,1) FP32; per-batch starting cache index. The
+                       layer reads pos[b] for each batch and uses it as the
+                       cache write offset and RoPE base position. */
+
+    /** Legacy 3/4-input attention mask slot (mutually exclusive with the
+        external-cache mode above). */
     MASK = 3,
 
     /** output index */

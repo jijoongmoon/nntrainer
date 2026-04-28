@@ -107,7 +107,7 @@ void CausalLM::allocateAndBindKVCache() {
     return;
 
     // dtype matches mha_core's internal cache choice (kept consistent so
-    // saved caches stay binary-compatible across the 3-input/5-input modes).
+    // saved caches stay binary-compatible across the 3-input/6-input modes).
 #ifdef ENABLE_FP16
   const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
 #else
@@ -122,12 +122,22 @@ void CausalLM::allocateAndBindKVCache() {
                     static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
                     static_cast<unsigned int>(HEAD_DIM), cache_dtype);
 
-  // Bind each (layer, K|V) buffer into the corresponding input layer
-  // declared by Transformer::createKVCachePlaceholders(). The names here
-  // must match what createKVCachePlaceholders() registers with the model.
-  // We look up each placeholder by name and point it at our cache slab —
-  // this is the same wiring Model::setExternalTensors used to do, just
-  // without going through that API.
+  // Allocate the per-batch POSITION buffer (FP32). The host updates this
+  // in-place before each inference call via bindPositionForCall().
+  ml::train::TensorDim pos_dim(
+    BATCH_SIZE, 1, 1, 1,
+    ml::train::TensorDim::TensorType(ml::train::TensorDim::Format::NCHW,
+                                     ml::train::TensorDim::DataType::FP32));
+  position_buffer = nntrainer::Tensor(pos_dim, true);
+  position_buffer.setZero();
+
+  // Bind each (layer, K|V) buffer + the shared "position" input into their
+  // respective input layer placeholders (declared by
+  // Transformer::createKVCachePlaceholders() and
+  // Transformer::getOrCreatePositionPlaceholder()). Looking up by name and
+  // setting MemoryData directly on the placeholder is the same wiring the
+  // old Model::setExternalTensors used to do, but no longer routes through
+  // a public API.
   for (int i = 0; i < NUM_LAYERS; ++i) {
     auto &kc = kv_cache.getKeyCache(i);
     auto &vc = kv_cache.getValueCache(i);
@@ -141,21 +151,49 @@ void CausalLM::allocateAndBindKVCache() {
     kp->setData(kc.getMemoryData(), kc.getOffset(), false);
     vp->setData(vc.getMemoryData(), vc.getOffset(), false);
   }
+
+  auto *pp = model->getTensor("position");
+  NNTR_THROW_IF(pp == nullptr, std::runtime_error)
+    << "allocateAndBindKVCache: position input placeholder not found in "
+       "compiled graph";
+  pp->setData(position_buffer.getMemoryData(), position_buffer.getOffset(),
+              false);
+
+  // active_len placeholder — same shape/dtype as position, but carries the
+  // per-call iteration count (input_len for prefill, 1 for incremental).
+  active_len_buffer = nntrainer::Tensor(pos_dim, true);
+  active_len_buffer.setZero();
+  auto *al = model->getTensor("active_len");
+  NNTR_THROW_IF(al == nullptr, std::runtime_error)
+    << "allocateAndBindKVCache: active_len input placeholder not found in "
+       "compiled graph";
+  al->setData(active_len_buffer.getMemoryData(), active_len_buffer.getOffset(),
+              false);
 }
 
-void CausalLM::setKVCachePosition(unsigned int pos) {
+void CausalLM::bindPositionForCall(unsigned int pos) {
+  // KVCacheManager bookkeeping (used for save/load + bounds checks). mha_core
+  // itself is stateless — it reads pos from the bound input each call.
   kv_cache.setPosition(pos);
-  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [pos](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
-      if (l.getType() == causallm::MHACoreLayer::type)
-        dynamic_cast<causallm::MHACoreLayer &>(l).setCacheIndex(pos);
-    };
-  model->forEachLayer(fn, nullptr);
+
+  // Update the FP32 buffer in-place; the model already holds a zero-copy view
+  // of this memory through setExternalTensors() in allocateAndBindKVCache().
+  float *p = position_buffer.getData<float>();
+  for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+    p[b] = static_cast<float>(pos);
+  }
+}
+
+void CausalLM::bindActiveLenForCall(unsigned int len) {
+  // Same in-place pattern as bindPositionForCall: the model holds a zero-copy
+  // view of active_len_buffer's memory; we just overwrite the floats.
+  float *p = active_len_buffer.getData<float>();
+  for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+    p[b] = static_cast<float>(len);
+  }
 }
 
 void CausalLM::advanceKVCachePosition(unsigned int step_size) {
-  // mha_core advances its own cache_index inside forwarding(), so the host
-  // only has to keep KVCacheManager's tracked position in sync.
   kv_cache.advance(step_size);
 }
 
@@ -231,9 +269,9 @@ void CausalLM::load_kvcache(std::string path, int to_) {
     allocateAndBindKVCache();
   }
   kv_cache.load(path, static_cast<unsigned int>(to_));
-  // mha_core layers each track their own cache_index; sync them all to the
-  // newly-loaded position so the next forwarding() writes at the right slot.
-  setKVCachePosition(static_cast<unsigned int>(to_));
+  // The next inference() call will start writing at this offset.
+  // mha_core is stateless — only the host-side position_buffer needs syncing.
+  bindPositionForCall(static_cast<unsigned int>(to_));
 }
 
 std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
@@ -313,12 +351,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                              "initialize() before run().");
   }
 
-  // Allocate the host-owned KV cache and bind it to mha_core's external cache
-  // input slots. Idempotent — only the first call does work; subsequent runs
-  // reuse the same buffers and reset write position from the load_kvcache /
-  // setKVCachePosition call below.
+  // Allocate the host-owned KV cache + position buffer and bind both to the
+  // model's external input slots. Idempotent — only the first call does
+  // work; subsequent runs reuse the same buffers. mha_core is stateless, so
+  // session reset is just zeroing the host-side position.
   allocateAndBindKVCache();
-  setKVCachePosition(0);
+  bindPositionForCall(0);
 
   has_run_ = false;
 
@@ -450,6 +488,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     if (log_output)
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
+    bindPositionForCall(0 + global_token_len);
+    bindActiveLenForCall(input_len);
     output = model->incremental_inference(BATCH_SIZE, input, label, input_len,
                                           0 + global_token_len,
                                           input_len + global_token_len, false);
@@ -474,6 +514,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   } else {
     SYS_PROMP_LEN = 0;
   }
+  bindPositionForCall(SYS_PROMP_LEN);
+  bindActiveLenForCall(input_len);
   output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
                                         SYS_PROMP_LEN,
                                         SYS_PROMP_LEN + input_len, false);
@@ -511,6 +553,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
        ++token_generation_idx) {
 
+    bindPositionForCall(token_generation_idx - 1 + global_token_len);
+    bindActiveLenForCall(1);
     auto output_interval =
       model->incremental_inference(BATCH_SIZE, input, label, input_len,
                                    token_generation_idx - 1 + global_token_len,

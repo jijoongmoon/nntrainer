@@ -62,9 +62,9 @@ Tensor GptOssCachedSlimCausalLM::createAttention(const int layer_id,
      withKey("weight_initializer", "ones")}));
   Tensor q = wq(query);
 
-  // External KV cache placeholders (per-layer). Storage is owned by the host
-  // (KVCacheManager) and bound at runtime via setExternalTensors.
+  // External KV cache placeholders + shared POSITION input.
   auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+  Tensor position = getOrCreatePositionPlaceholder();
 
   // Attention core layer
   unsigned sliding_window =
@@ -83,7 +83,7 @@ Tensor GptOssCachedSlimCausalLM::createAttention(const int layer_id,
      withKey("rope_scaling_factor", ATTENTION_ROPE_SCALING_FACTOR),
      withKey("rope_scaling_type", "yarn"),
      withKey("rope_scaling_max_position_embeddings", 4096)}));
-  Tensor a = mha({q, k, v, cache_k, cache_v});
+  Tensor a = mha({q, k, v, cache_k, cache_v, position});
 
   // O layer
   LayerHandle wo(createLayer(
@@ -105,7 +105,8 @@ Tensor GptOssCachedSlimCausalLM::createMlp(const int layer_id, int dim,
       withKey("num_experts", NUM_EXPERTS),
       withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
     }));
-  return moe(input);
+  Tensor active_len = getOrCreateActiveLenPlaceholder();
+  return moe({input, active_len});
 }
 
 void GptOssCachedSlimCausalLM::setupParameters(json &cfg, json &generation_cfg,
