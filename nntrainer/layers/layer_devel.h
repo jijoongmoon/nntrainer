@@ -33,6 +33,14 @@
 #include <layer_context.h>
 #include <tensor_dim.h>
 
+
+#define QK4_0 32
+/**
+ * @brief Q4_0 Block
+ * @note This is a structure for Q4_0 quantization.
+ * This struct is not for use, only for reference.
+ */
+
 namespace ml::train {
 class Layer;
 }
@@ -436,7 +444,7 @@ public:
                     size_t start_offset = 0, bool read_from_offset = false,
                     int file_fd = -1) {
 
-    std::cout << "Hello World!" << std::endl;
+    // std::cout << "Hello World!" << std::endl;
     if (fsu) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.getWeight(i).getDataType() ==
@@ -533,6 +541,7 @@ public:
               std::vector<uint8_t> kai_quant_scale(rhs_scales_size_f32);
 
               nntrainer::unpack_q4_0((void *)W_q40.getData(), (void *)unpacked_weight.data(), W_q40.getMemoryBytes(), N, K);
+
               W_q40.deallocate();
               nntrainer::dequantize_row_q4_0 ((void *)unpacked_weight.data() , weight_fp32.data(), N*K);
 

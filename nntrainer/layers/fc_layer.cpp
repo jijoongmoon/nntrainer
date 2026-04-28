@@ -208,7 +208,7 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-
+  
   ///@todo This dequantization action should be moved to tensor.dot()
   if (quantizer != nullptr) {
     Tensor weight_ = quantizer->dequantize(weight, input_.getDataType());
@@ -265,6 +265,56 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   if (hidden_dim.height() > 1)
     hidden_step_dim.height(to - from);
 
+  uint32_t K = weight.height();
+  uint32_t N = weight.width();
+
+  nntrainer::TensorDim dim_qint4(1, 1, K, N, TensorDim::Format::NCHW, nntrainer::Tdatatype::QINT4);
+  nntrainer::Tensor W_qint4(dim_qint4);
+  
+  
+  std::vector<float> weight_fp32 (N * K);
+  
+  
+
+
+
+  std::vector<uint8_t> unpacked_weight (weight.getMemoryBytes());
+  
+  //std::vector<uint8_t> kai_quant_data(rhs_native_size_qs4cx);
+  //std::vector<uint8_t> kai_quant_scale(rhs_scales_size_f32);
+
+  //std::cout <<"here?" << std::endl;
+  
+  nntrainer::unpack_q4_0((void *)weight.getData(), (void *)unpacked_weight.data(), weight.getMemoryBytes(), N, K);
+
+  for (size_t row = 0; row < N; row++) {
+    dequantize_row_q4_0(
+        (void *)(unpacked_weight.data() + row * (K/32) * 18),
+        weight_fp32.data() + row * K,
+        K);
+  }
+
+  size_t rhs_native_size_qs4cx = static_cast<size_t>(N) * (((K + 2 - 1) / 2) * 2 / 2) * sizeof(uint8_t); //nxk
+  size_t rhs_scales_size_f32 = N * sizeof(float);
+  
+
+  std::vector<float> kai_quant_scale(N);
+  std::vector <uint8_t> kai_quant_data (N * K / 2);
+  size_t packed_size = nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+      N, K, 3, true);
+
+  std::vector<uint8_t> packed_weights(packed_size);
+
+  nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data(), true);
+           
+            
+  nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
+                                  packed_weights.data(),
+                                  kai_quant_data.data(),
+                                  kai_quant_scale.data(),
+                                  3, true);
+  
+  memcpy(W_qint4.getData<uint8_t>(), packed_weights.data(), packed_size);
   // @todo make it parallelized with batch axis
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
     Tensor input_step = input_.getSharedDataTensor(
@@ -272,7 +322,18 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
-    input_step.dot(weight, hidden_step, false, false);
+    //input_step.dot(W_qint4, hidden_step, false, true);
+    auto M = hidden_step.height();
+    nntrainer::nntr_gemm_qai8dxp_qsi4cxp_packed<float>(
+      M, N, K,
+      (void *)input_step.getData(),        // LHS (activations) - will be packed internally
+      (void *)packed_weights.data(),       // RHS (weights) - assumed already packed in block-32 format
+      hidden_step.getData(),               // Output
+      3,
+      true,                // transB
+      -std::numeric_limits<float>::infinity(),  // lower_bound
+      std::numeric_limits<float>::infinity()    // upper_bound
+    );
 
     if (!std::get<props::LoraRank>(fc_props).empty()) {
       nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora.getDim();
