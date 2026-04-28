@@ -33,6 +33,14 @@
 #include <layer_context.h>
 #include <tensor_dim.h>
 
+
+#define QK4_0 32
+/**
+ * @brief Q4_0 Block
+ * @note This is a structure for Q4_0 quantization.
+ * This struct is not for use, only for reference.
+ */
+
 namespace ml::train {
 class Layer;
 }
@@ -436,7 +444,7 @@ public:
                     size_t start_offset = 0, bool read_from_offset = false,
                     int file_fd = -1) {
 
-    std::cout << "Hello World!" << std::endl;
+    // std::cout << "Hello World!" << std::endl;
     if (fsu) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.getWeight(i).getDataType() ==
@@ -486,7 +494,7 @@ public:
                     ml::train::ExecutionMode mode, bool trainable,
                     TensorDim::DataType defineWeightDataType, bool fsu,
                     size_t start_offset = 0, bool read_from_offset = false) {
-    std::cout << "Hello World2!" << std::endl;
+    // std::cout << "Hello World2!" << std::endl;
     if (fsu) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.getWeight(i).getDataType() ==
@@ -513,9 +521,9 @@ public:
         for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
           /// @note shared weights are only be read at the first acecss
           if (run_context.isGradientFirstAccess(i)) {
-
-            if (run_context.getWeight(i).getDataType() == nntrainer::Tdatatype::QINT4){
-              nntrainer::Tensor &W_qint4 = run_context.getWeight(i);
+            
+            if (run_context.getWeight(i).getDataType() == nntrainer::Tdatatype::Q4_0 && false){
+              nntrainer::Tensor W_qint4 = run_context.getWeight(i);
               uint32_t K = W_qint4.height();
               uint32_t N = W_qint4.width();
 
@@ -579,27 +587,36 @@ public:
               std::vector<uint8_t> kai_quant_scale(rhs_scales_size_f32);
 
               //std::cout <<"here?" << std::endl;
-
+              
               nntrainer::unpack_q4_0((void *)W_q40.getData(), (void *)unpacked_weight.data(), W_q40.getMemoryBytes(), N, K);
+
               W_q40.deallocate();
-              nntrainer::dequantize_row_q4_0 ((void *)unpacked_weight.data() , weight_fp32.data(), N*K);
+              for (size_t row = 0; row < N; row++) {
+                dequantize_row_q4_0(
+                    (void *)(unpacked_weight.data() + row * (K/32) * 18),
+                    weight_fp32.data() + row * K,
+                    K);
+              }
+              //nntrainer::dequantize_row_q4_0 ((void *)unpacked_weight.data() , weight_fp32.data(), N*K);
+              
+              std::cout << weight_fp32.data()[0] << weight_fp32.data()[1] << weight_fp32.data()[2] << std::endl;
               //std::cout <<"here2?" << std::endl;
               //nntrainer::quantize_q4_0(weight_fp32.data(), (void *)unpacked_weight.data(), N, K, nullptr);
               //nntrainer::repack_q4_0((void *)unpacked_weight.data(), (void *)W_qint4.getData(), W_qint4.getMemoryBytes(), N, K);
               //std::memcpy(W_qint4.getData(), W_q40.getData(), W_qint4.getMemoryBytes());
               //std::cout << W_qint4.getMemoryBytes() << std::endl;
               
-              
+              std::memcpy(W_qint4.getData(), weight_fp32.data(), N*K*sizeof(float));
+              std::vector <uint8_t> kai_quant_data (N * K / 2);
 
-
-              nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)unpacked_weight.data(), (void *)kai_quant_scale.data());
+              nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data());
            
               //std::cout << "Here?" << std::endl;
-              nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
-                                        W_qint4.getData(),
-                                        unpacked_weight.data(),
-                                        kai_quant_scale.data(),
-                                        3, true);
+              //nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
+               //                         W_qint4.getData(),
+                //                        kai_quant_data.data(),
+                 //                       kai_quant_scale.data(),
+                  //                      3, true);
                   
               //std::cout << W_qint4.getFileOffset() << std::endl;
               //std::cout <<"here3?" << std::endl;                                           

@@ -1014,6 +1014,7 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
 
 if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
   int32_t kernel_idx = Int4QTensor::get_kleidiai_kernel_idx();
+ 
   nntrainer::nntr_gemm_qai8dxp_qsi4cxp_packed(
       M, N, K,
       (void *)data,        // LHS (activations) - will be packed internally
