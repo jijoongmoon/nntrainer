@@ -1393,9 +1393,25 @@ void Tensor::read(std::ifstream &file, size_t start_offset,
   itensor_->read(file, start_offset, read_from_offset);
 }
 
-void Tensor::read(ReadSource src, size_t start_offset, bool read_from_offset) {
+void Tensor::read(ReadSource src, size_t start_offset, bool read_from_offset,
+                  int file_fd) {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot read.";
+
+  // save the start_offset_info
+  read_offset = start_offset;
+
+  // Virtual tensors are not backed by allocated memory; they are lazily
+  // mapped from the model file via activate(). Mirror the std::ifstream
+  // overload: do not actually read here, but remember the backing fd so
+  // a subsequent activate() can mmap(this->fd, ...) successfully. Without
+  // this, fd stays at -1 and activate() returns MAP_FAILED, leading to a
+  // segfault when the layer dereferences the mapped pointer.
+  if (is_virtual) {
+    if (file_fd != -1)
+      fd = file_fd;
+    return;
+  }
 
   itensor_->read(src, start_offset, read_from_offset);
 }
@@ -1624,13 +1640,22 @@ void Tensor::activate() {
   size_t diff = file_offset - off;
   size_t len = getMemoryBytes() + diff;
 
+  // A virtual tensor must have captured a backing fd during read (see
+  // Tensor::read overloads). Without it, mmap() below returns MAP_FAILED
+  // and dereferencing the resulting pointer segfaults the process.
+  NNTR_THROW_IF(this->fd == -1, std::runtime_error)
+    << "[activate] virtual tensor '" << getName()
+    << "' has no backing fd; the model file fd was not propagated at "
+       "read-time";
+
   mapped_ptr = mmap(NULL, len, PROT_READ, MAP_PRIVATE, this->fd, off);
 #ifdef __ANDROID__
-  madvise(mapped_ptr, len, MADV_WILLNEED);
+  if (mapped_ptr != MAP_FAILED)
+    madvise(mapped_ptr, len, MADV_WILLNEED);
 #endif
-  if (mapped_ptr == MAP_FAILED) {
-    std::cerr << "[activate] mmap failed: " << strerror(errno) << std::endl;
-  }
+  NNTR_THROW_IF(mapped_ptr == MAP_FAILED, std::runtime_error)
+    << "[activate] mmap failed for virtual tensor '" << getName()
+    << "': " << strerror(errno);
   itensor_->activate((void *)&((uint8_t *)mapped_ptr)[diff]);
 #endif
 }

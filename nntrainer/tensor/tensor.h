@@ -1657,9 +1657,15 @@ public:
   /**
    * @brief     ReadSource
    * @param[in] ReadSource input file source
+   * @param[in] start_offset offset within source to read from
+   * @param[in] read_from_offset whether to honor start_offset
+   * @param[in] file_fd backing file descriptor to remember for virtual
+   *            tensors (used by activate()/deactivate() to mmap on-the-fly).
+   *            Pass -1 if the source has no associated long-lived fd; in that
+   *            case virtual tensors will keep whatever fd they already hold.
    */
   void read(ReadSource src, size_t start_offset = 0,
-            bool read_from_offset = false);
+            bool read_from_offset = false, int file_fd = -1);
 
   /**
    * @brief     return argument index which value is max by batch
