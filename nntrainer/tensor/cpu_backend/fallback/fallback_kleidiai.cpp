@@ -141,7 +141,8 @@ static void quant_nxk_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
     const float rmax0 = std::max(0.0f, max0);
 
     const float scale0 = rmin0 == rmax0 ? 1.f : (qmax - qmin) / (rmax0 - rmin0);
-
+    
+    std::cout << scale0 << std::endl;
     // Reciprocal to quantize
     const float recip_scale0 = scale0 ? 1.0f / scale0 : 0.0f;
 
@@ -202,7 +203,7 @@ static void quant_kxn_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
     const float rmax0 = std::max(0.0f, max0);
 
     const float scale0 = rmin0 == rmax0 ? 1.f : (qmax - qmin) / (rmax0 - rmin0);
-
+    std::cout << scale0 << std::endl;
     // Reciprocal to quantize
     const float recip_scale0 = scale0 ? 1.0f / scale0 : 0.0f;
 
@@ -237,6 +238,7 @@ static void quant_kxn_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
 void quant_qs4cx_f32(size_t n, size_t k, rhs_format format,
                      const float *rhs_f32, uint8_t *rhs_qs4cx,
                      float *rhs_scales_f32) {
+
   if (rhs_format::nxk == format) {
     quant_nxk_qs4cx_f32(n, k, rhs_f32, rhs_qs4cx, rhs_scales_f32);
   } else {
@@ -472,12 +474,14 @@ void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
               n * sizeof(float));
 }
 
+/*
 void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_f32,
                           void *rhs_qs4cx, void *rhs_scales_f32, bool transB) {
   rhs_format format = transB ? rhs_format::nxk : rhs_format::kxn;
   quant_qs4cx_f32(n, k, format, (const float *)rhs_f32, (uint8_t *)rhs_qs4cx,
                   (float *)rhs_scales_f32);
 }
+*/
 
 template <typename T>
 void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,

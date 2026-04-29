@@ -470,7 +470,7 @@ extern void compute_rotary_emb_value(unsigned int width, unsigned int dim,
  */
 extern void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
                                  void *rhs_native_mtx_qs4cx,
-                                 void *rhs_scales_f32, bool transB = true);
+                                 void *rhs_scales_f32, bool transB);
 /**
  * @brief get size of memory to allocate for rhs weight packing of qsi4cxp to
  * qs4cxs1s0
