@@ -219,6 +219,54 @@ kai_matmul_ukernel_f32_qa8dxp_qs4cxp ukernel_variants[] = {
 
 static size_t roundup(size_t a, size_t b) { return ((a + b - 1) / b) * b; }
 
+
+void nntr_kai_quant_qsi4cx_f32(size_t n, size_t k, const float *rhs_f32,
+                               uint8_t *rhs_qsi4cx, float *scale) {
+  const size_t rhs_stride = roundup(k, 2) / 2;
+
+  for (size_t row_idx = 0; row_idx < n; ++row_idx) {
+    const float *src_ptr = rhs_f32 + row_idx * k;
+    uint8_t *dst_ptr = rhs_qsi4cx + row_idx * rhs_stride;
+
+    float amax = 0.0f;
+    float max = 0.0f;
+
+    for (size_t kk = 0; kk < k; ++kk) {
+      const float src0_0 = src_ptr[kk];
+      const float asrc0_0 = fabsf(src0_0);
+
+      if (amax < asrc0_0) {
+        amax = asrc0_0;
+        max = src0_0;
+      }
+    }
+
+    const float row_scale = max / -8.0f;
+    const float recip_scale = row_scale ? 1.0f / row_scale : 0.0f;
+
+    scale[row_idx] = row_scale;
+
+    for (size_t kk = 0; kk < k; kk += 2) {
+      float v0_f32 = src_ptr[kk];
+      float v1_f32 = 0.0f;
+
+      if ((kk + 1) < k) {
+        v1_f32 = src_ptr[kk + 1];
+      }
+
+      v0_f32 *= recip_scale;
+      v1_f32 *= recip_scale;
+
+      const uint8_t v0_u8 =
+        (uint8_t)std::min((int8_t)15, (int8_t)(v0_f32 + 8.5f));
+      const uint8_t v1_u8 =
+        (uint8_t)std::min((int8_t)15, (int8_t)(v1_f32 + 8.5f));
+
+      dst_ptr[kk / 2] = (v1_u8 << 4) | v0_u8;
+    }
+  }
+}
+
 uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
   void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,

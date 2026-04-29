@@ -545,7 +545,7 @@ public:
               W_q40.deallocate();
               nntrainer::dequantize_row_q4_0 ((void *)unpacked_weight.data() , weight_fp32.data(), N*K);
 
-              nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)unpacked_weight.data(), (void *)kai_quant_scale.data());
+              nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)unpacked_weight.data(), (void *)kai_quant_scale.data(), true);
 
               nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
                                         W_qint4.getData(),

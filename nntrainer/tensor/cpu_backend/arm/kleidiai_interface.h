@@ -150,8 +150,23 @@ uint32_t nntr_kai_gemm_qsi8d32p_qsi4c32p_rtp(
  * @param rhs_f32 matrix data before quantization to load
  * @param rhs_qs4c32 matrix data after quantization to store
  */
+
+ 
 void nntr_kai_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
                                const float *rhs_f32, uint8_t *rhs_qs4c32);
+
+
+                               /**
+ * @brief qs4cx quantization of (n*k) matrix channel-wise.
+ * qsi4cx refers to quantized symmetric 4-bit quantization along channel.
+ *
+ * @param n N length of the matrix
+ * @param k K length of the matrix (must be divisible by bl)
+ * @param rhs_f32 matrix data before quantization to load
+ * @param rhs_qs4c32 matrix data after quantization to store
+ */
+void nntr_kai_quant_qsi4cx_f32(size_t n, size_t k,
+                               const float *rhs_f32, uint8_t *rhs_qsi4cx, float *scale);
 
 /**
  * @brief run qsi8d32p_qsi4c32p GEMM with offline weight packing

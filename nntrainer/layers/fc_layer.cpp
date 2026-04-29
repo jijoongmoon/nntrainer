@@ -29,6 +29,7 @@
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <util_func.h>
+#include <cpu_backend.h>
 
 #include <iostream>
 
@@ -304,10 +305,10 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
       N, K, 3, true);
 
   std::vector<uint8_t> packed_weights(packed_size);
-
-  nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data(), true);
+  //std::cout << weight_fp32.data()[0] << " " << weight_fp32.data()[1] << " " << weight_fp32.data()[2] << std::endl;  
+  nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data(), true);
            
-            
+  //std::cout << kai_quant_scale.data()[0] << kai_quant_scale.data()[1] << kai_quant_scale.data()[2] << std::endl;          
   nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
                                   packed_weights.data(),
                                   kai_quant_data.data(),
