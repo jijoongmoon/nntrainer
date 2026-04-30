@@ -233,7 +233,7 @@ inline static size_t kai_roundup(size_t a, size_t b) {
   return ((a + b - 1) / b) * b;
 }
 
-#if defined(ENABLE_SVE2) || defined(_M_ARM64)
+#if defined(ENABLE_SME) || defined(_M_ARM64)
 /// Gets the SME vector length for 8-bit elements.
 uint64_t kai_get_sme_vector_length_u8(void);
 

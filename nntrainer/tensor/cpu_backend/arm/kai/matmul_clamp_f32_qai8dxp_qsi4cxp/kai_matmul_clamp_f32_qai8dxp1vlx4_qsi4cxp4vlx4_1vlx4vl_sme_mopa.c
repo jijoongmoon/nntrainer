@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#if (!defined(__aarch64__) || !defined(ENABLE_SVE2)) && !defined(_M_ARM64)
-#error This file must be compiled for AArch64, FEAT_SVE2
+#if (!defined(__aarch64__) || !defined(ENABLE_SME)) && !defined(_M_ARM64)
+#error This file must be compiled for AArch64, ENABLE_SME
 #else  // Architectural feature check
 
 #include "kai_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa.h"

@@ -98,6 +98,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NNTRAINER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export NNTRAINER_ROOT
 
+all_args=("$@")
+
 log_header "Build CausalLM Android Application"
 log_info "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 log_info "Build cache: $([ "$USE_BUILD_CACHE" -eq 1 ] && echo 'enabled' || echo 'disabled (default)')"
@@ -116,7 +118,7 @@ else
         log_info "Removing existing builddir..."
         rm -rf builddir
     fi
-    ./tools/package_android.sh
+    ./tools/package_android.sh "${all_args[@]}"
 fi
 
 # Check if build was successful
