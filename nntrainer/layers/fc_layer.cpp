@@ -306,7 +306,7 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
 
   std::vector<uint8_t> packed_weights(packed_size);
   //std::cout << weight_fp32.data()[0] << " " << weight_fp32.data()[1] << " " << weight_fp32.data()[2] << std::endl;  
-  nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data(), true);
+  nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data());
            
   //std::cout << kai_quant_scale.data()[0] << kai_quant_scale.data()[1] << kai_quant_scale.data()[2] << std::endl;          
   nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
@@ -325,7 +325,7 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
 
     //input_step.dot(W_qint4, hidden_step, false, true);
     auto M = hidden_step.height();
-    nntrainer::nntr_gemm_qai8dxp_qsi4cxp_packed<float>(
+    nntrainer::nntr_gemm_qai8dxp_qsi4cxp_packed(
       M, N, K,
       (void *)input_step.getData(),        // LHS (activations) - will be packed internally
       (void *)packed_weights.data(),       // RHS (weights) - assumed already packed in block-32 format

@@ -142,7 +142,7 @@ static void quant_nxk_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
 
     const float scale0 = rmin0 == rmax0 ? 1.f : (qmax - qmin) / (rmax0 - rmin0);
     
-    std::cout << scale0 << std::endl;
+    //std::cout << scale0 << std::endl;
     // Reciprocal to quantize
     const float recip_scale0 = scale0 ? 1.0f / scale0 : 0.0f;
 
@@ -454,8 +454,7 @@ template void nntr_gemm_qai8dxp_qsi4cxp_unpacked<float>(
 
 size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
                                                    uint32_t idx_variant,
-                                                   bool transB) {
-  std::cout << "I hope this not one" << std::endl;                                                    
+                                                   bool transB) {                                                   
   // Fallback: return size for unpacked format
   // For int4: (k * n + 1) / 2 bytes for packed int4 + n * sizeof(float) for scales
   return ((k * n + 1) / 2) + n * sizeof(float);
@@ -466,7 +465,6 @@ void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
                                      void *rhs_native_mtx_qs4cx,
                                      void *rhs_scales_f32,
                                      uint32_t idx_variant, bool transB) {
-  std::cout << "fallback?" << std::endl;
   // Fallback: just copy the unpacked data
   size_t data_size = (k * n + 1) / 2;
   std::memcpy(rhs_packed_mtx_qs4cx, rhs_native_mtx_qs4cx, data_size);
@@ -474,14 +472,14 @@ void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
               n * sizeof(float));
 }
 
-/*
-void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_f32,
+
+void nntr_kai_quant_qs4cx_f32(size_t n, size_t k, void *rhs_f32,
                           void *rhs_qs4cx, void *rhs_scales_f32, bool transB) {
   rhs_format format = transB ? rhs_format::nxk : rhs_format::kxn;
   quant_qs4cx_f32(n, k, format, (const float *)rhs_f32, (uint8_t *)rhs_qs4cx,
                   (float *)rhs_scales_f32);
 }
-*/
+
 
 template <typename T>
 void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,

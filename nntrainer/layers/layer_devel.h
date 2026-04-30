@@ -609,7 +609,7 @@ public:
               std::memcpy(W_qint4.getData(), weight_fp32.data(), N*K*sizeof(float));
               std::vector <uint8_t> kai_quant_data (N * K / 2);
 
-              nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data(), true);
+              nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data());
            
               //std::cout << "Here?" << std::endl;
               //nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,

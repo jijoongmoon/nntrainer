@@ -11,7 +11,6 @@
  *
  */
 
-#include <cpu_backend.h>
 #include <layer_context.h>
 #include <lm_head.h>
 #include <nntrainer_error.h>
@@ -19,7 +18,7 @@
 #include <node_exporter.h>
 #include <tensor.h>
 #include <tensor_dim.h>
-#include <util_func.h>
+#include "cpu_backend.h"
 
 namespace causallm {
 
@@ -138,6 +137,59 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
   unsigned int b_size = input_dim.batch();
 
+  uint32_t K = weight.height();
+  uint32_t N = weight.width();
+  std::cout << "Height : " << K << std::endl;
+  std::cout << "Width : " << N << std::endl;
+
+  nntrainer::TensorDim dim_qint4(1, 1, K, N, nntrainer::TensorDim::Format::NCHW, nntrainer::Tdatatype::QINT4);
+  nntrainer::Tensor W_qint4(dim_qint4);
+  
+  std::vector<float> weight_fp32 (N * K);
+
+  std::vector<uint8_t> unpacked_weight (weight.getMemoryBytes());
+  
+  //std::vector<uint8_t> kai_quant_data(rhs_native_size_qs4cx);
+  //std::vector<uint8_t> kai_quant_scale(rhs_scales_size_f32);
+
+  
+  nntrainer::unpack_q4_0((void *)weight.getData(), (void *)unpacked_weight.data(), weight.getMemoryBytes(), N, K);
+
+  for (size_t row = 0; row < N; row++) {
+    nntrainer::dequantize_row_q4_0(
+        (void *)(unpacked_weight.data() + row * (K/32) * 18),
+        weight_fp32.data() + row * K,
+        K);
+  }
+
+  std::cout << weight_fp32.data()[0] << weight_fp32.data()[1] << weight_fp32.data()[2] << std::endl;
+  
+  size_t rhs_native_size_qs4cx = static_cast<size_t>(N) * (((K + 2 - 1) / 2) * 2 / 2) * sizeof(uint8_t); //nxk
+  size_t rhs_scales_size_f32 = N * sizeof(float);
+  
+
+  std::vector<float> kai_quant_scale(N);
+  std::vector <uint8_t> kai_quant_data (N * K / 2);
+  size_t packed_size = nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+      N, K, 3, true);
+
+  std::vector<uint8_t> packed_weights(packed_size);
+  //std::cout << weight_fp32.data()[0] << " " << weight_fp32.data()[1] << " " << weight_fp32.data()[2] << std::endl;  
+  nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data());
+           
+  //std::cout << kai_quant_scale.data()[0] << kai_quant_scale.data()[1] << kai_quant_scale.data()[2] << std::endl;          
+  nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
+                                  packed_weights.data(),
+                                  kai_quant_data.data(),
+                                  kai_quant_scale.data(),
+                                  3, true);
+
+  //std::cout << kai_quant_scale.data()[0] << kai_quant_scale.data()[1] << kai_quant_scale.data()[2] << std::endl;
+  
+  memcpy(W_qint4.getData<uint8_t>(), packed_weights.data(), packed_size);
+
+
+
   for (unsigned int b = 0; b < b_size; ++b) {
     nntrainer::Tensor input_step = input_.getSharedDataTensor(
       input_step_dim,
@@ -145,7 +197,23 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
-    input_step.dot(weight, hidden_step, false, false);
+   
+    //input_step.dot(W_qint4, hidden_step, false, true);
+    auto M = hidden_step.height();
+    std::cout << M << std::endl;
+    nntrainer::nntr_gemm_qai8dxp_qsi4cxp_packed(
+      M, N, K,
+      (void *)input_step.getData(),        // LHS (activations) - will be packed internally
+      (void *)packed_weights.data(),       // RHS (weights) - assumed already packed in block-32 format
+      hidden_step.getData(),               // Output
+      3,
+      true,                // transB
+      -std::numeric_limits<float>::infinity(),  // lower_bound
+      std::numeric_limits<float>::infinity()    // upper_bound
+    );
+    
+    
+    //input_step.dot(weight, hidden_step, false, false);
 
     if (auto &disable_bias =
           std::get<nntrainer::props::DisableBias>(*layer_impl_props);

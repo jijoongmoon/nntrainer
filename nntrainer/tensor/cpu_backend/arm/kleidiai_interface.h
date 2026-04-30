@@ -165,8 +165,8 @@ void nntr_kai_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
  * @param rhs_f32 matrix data before quantization to load
  * @param rhs_qs4c32 matrix data after quantization to store
  */
-void nntr_kai_quant_qsi4cx_f32(size_t n, size_t k,
-                               const float *rhs_f32, uint8_t *rhs_qsi4cx, float *scale);
+void nntr_kai_quant_qs4cx_f32(size_t n, size_t k,
+                               void *rhs_f32, void *rhs_qsi4cx, void *scale, bool transB);
 
 /**
  * @brief run qsi8d32p_qsi4c32p GEMM with offline weight packing

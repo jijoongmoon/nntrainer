@@ -435,10 +435,10 @@ void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
 }
 
 void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
-                          void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, bool transB) {
+                          void *rhs_native_mtx_qs4cx, void *rhs_scales_f32) {
   
-  nntr_kai_quant_qsi4cx_f32(n, k, (const float *)rhs_native_mtx_f32,
-                                  (uint8_t *)rhs_native_mtx_qs4cx, (float *)rhs_scales_f32);
+  nntr_kai_quant_qs4cx_f32(n, k, rhs_native_mtx_f32,
+                                  rhs_native_mtx_qs4cx, rhs_scales_f32, true);
 }
 
 void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,

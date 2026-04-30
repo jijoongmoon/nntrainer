@@ -44,7 +44,7 @@ foreach h : matmul_clamp_f32_qai8dxp_qsi4cxp_headers
   nntrainer_headers += meson.current_source_dir() / h
 endforeach
 
-if get_option('platform') == 'android' and get_option('enable-sme') and get_option('enable-sve2')
+if get_option('platform') == 'android' and get_option('enable-sme')
     foreach s : matmul_clamp_f32_qai8dxp_qsi4cxp_sme_sources
       nntrainer_sources += meson.current_source_dir() / s
     endforeach

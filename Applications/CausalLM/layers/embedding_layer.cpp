@@ -99,6 +99,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                   : std::get<nntrainer::props::Scale>(embedding_props).get();
   unsigned int _from = from;
 
+  
+
   nntrainer::Tensor &weight = context.getWeight(weight_idx);
   nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
@@ -107,7 +109,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
 
   unsigned int b_size = input_.batch();
-
+  
   for (unsigned int b = 0; b < b_size; ++b) {
     float *in_data =
       input_.getAddress<float>(b * input_.getDim().getFeatureLen());
