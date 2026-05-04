@@ -134,16 +134,11 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
     << "Embedding layer takes only one for channel size";
 
-  // Accept FP32 by default (legacy path) and additionally UINT16/UINT32
-  // for QNN-style pipelines where the activation dtype (and thus the
-  // input layer feeding token IDs) is integer. Token IDs are read in
-  // forwarding using the actual input dtype.
-  const auto in_dtype = input_dim.getDataType();
-  NNTR_THROW_IF(in_dtype != nntrainer::TensorDim::DataType::FP32 &&
-                  in_dtype != nntrainer::TensorDim::DataType::UINT16 &&
-                  in_dtype != nntrainer::TensorDim::DataType::UINT32,
-                std::invalid_argument)
-    << "Embedding layer input dtype must be FP32, UINT16, or UINT32";
+  // The embedding layer may be the model entry point (no separate Input
+  // layer in front), in which case the input dim's dtype follows
+  // model_tensor_type's activation dtype. We don't fight that — token
+  // IDs are read in forwarding using whatever dtype is actually set
+  // (FP32 / UINT16 / UINT32).
 
   auto &weight_regularizer =
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
