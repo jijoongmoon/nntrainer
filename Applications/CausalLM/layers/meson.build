@@ -81,8 +81,10 @@ causallm_mha_core_dep = declare_dependency(
 causallm_embedding_layer = shared_library(
     'embedding_layer',
     causallm_embedding_src_abs,
-    include_directories: causallm_layer_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    # parent dir is added so the layer can include "json.hpp" that the
+    # CausalLM build pulls in for shared use across components.
+    include_directories: [causallm_layer_inc, include_directories('..')],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, openmp_dep],
     install: true,
     install_dir: application_install_dir
 )
