@@ -159,6 +159,7 @@ public:
   WIN_EXPORT bool supportBackwarding() const override { return false; }
 
   using Layer::setProperty;
+  using Layer::save;
 
   /**
    * @copydoc Layer::setProperty(const PropertyType type, const std::string
