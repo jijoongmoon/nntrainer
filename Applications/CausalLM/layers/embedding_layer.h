@@ -59,33 +59,6 @@ public:
   using prop_tag = nntrainer::str_prop_tag;
 };
 
-/**
- * @brief Output requantization scale.
- *
- * When the layer dequantizes a 4-bit LUT value, it produces a float in
- * the LUT's quantization space. The downstream consumer (e.g. a QNN
- * graph) expects UINT16 codes that, when dequantized with its own
- * scale/offset, recover the same float. These two properties carry the
- * consumer's scale/offset so the layer can do the requant. If unset,
- * the layer falls back to a naive clamp which is only valid when the
- * LUT and consumer share the same quant space.
- */
-class OutputQuantScale final : public nntrainer::Property<float> {
-public:
-  OutputQuantScale() = default;
-  OutputQuantScale(float v) { set(v); }
-  static constexpr const char *key = "output_quant_scale";
-  using prop_tag = nntrainer::float_prop_tag;
-};
-
-class OutputQuantOffset final : public nntrainer::Property<int> {
-public:
-  OutputQuantOffset() = default;
-  OutputQuantOffset(int v) { set(v); }
-  static constexpr const char *key = "output_quant_offset";
-  using prop_tag = nntrainer::int_prop_tag;
-};
-
 } // namespace props
 
 /**
@@ -197,8 +170,7 @@ public:
 
 private:
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
-             nntrainer::props::Scale, props::QuantizedLutPath,
-             props::OutputQuantScale, props::OutputQuantOffset>
+             nntrainer::props::Scale, props::QuantizedLutPath>
     embedding_props;
   unsigned int weight_idx;
 
