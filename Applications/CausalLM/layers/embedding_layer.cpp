@@ -129,16 +129,21 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "Embedding layer takes only one input";
 
+  // Force the input dim dtype to FP32. The embedding layer is often the
+  // model entry point (no separate Input layer in front), so its input
+  // dim would otherwise inherit the model's activation dtype (e.g.
+  // UINT16 in QNN-style pipelines). Token IDs, however, are integer
+  // indices into a vocab that can exceed UINT16's range (e.g. Gemma
+  // vocab ~256K), so we represent them as 32-bit floats by convention.
+  // The embedding layer reads FP32 token IDs and writes the configured
+  // activation dtype (UINT16 here) into its output for downstream
+  // (e.g. QNN graph) consumption.
+  context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
+
   const nntrainer::TensorDim &input_dim =
     context.getInputDimensions()[SINGLE_INOUT_IDX];
   NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
     << "Embedding layer takes only one for channel size";
-
-  // The embedding layer may be the model entry point (no separate Input
-  // layer in front), in which case the input dim's dtype follows
-  // model_tensor_type's activation dtype. We don't fight that — token
-  // IDs are read in forwarding using whatever dtype is actually set
-  // (FP32 / UINT16 / UINT32).
 
   auto &weight_regularizer =
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
@@ -235,50 +240,22 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       << out_dim;
 
     const auto out_dtype = hidden_.getDataType();
-    const auto in_dtype = input_.getDataType();
     const uint8_t *packed = quant_lut_->packed.data();
     const float lut_scale = quant_lut_->scale * scale;
     const int lut_offset = quant_lut_->offset;
     const size_t bytes_per_row = out_dim / 2;
 
-    // Read a token id at position `i` of the current batch row,
-    // honoring the actual input dtype (FP32 / UINT16 / UINT32).
-    auto read_token = [&](const void *base, int i) -> size_t {
-      switch (in_dtype) {
-      case nntrainer::TensorDim::DataType::FP32:
-        return static_cast<size_t>(static_cast<const float *>(base)[i]);
-      case nntrainer::TensorDim::DataType::UINT16:
-        return static_cast<size_t>(static_cast<const uint16_t *>(base)[i]);
-      case nntrainer::TensorDim::DataType::UINT32:
-        return static_cast<size_t>(static_cast<const uint32_t *>(base)[i]);
-      default:
-        throw std::runtime_error("Embedding: unsupported input dtype");
-      }
-    };
-
+    // Token IDs are FP32 (forced by setInputDataType in finalize).
     for (unsigned int b = 0; b < b_size; ++b) {
-      const size_t batch_off = b * input_.getDim().getFeatureLen();
-      const void *in_base = nullptr;
-      switch (in_dtype) {
-      case nntrainer::TensorDim::DataType::FP32:
-        in_base = input_.getAddress<float>(batch_off);
-        break;
-      case nntrainer::TensorDim::DataType::UINT16:
-        in_base = input_.getAddress<uint16_t>(batch_off);
-        break;
-      case nntrainer::TensorDim::DataType::UINT32:
-        in_base = input_.getAddress<uint32_t>(batch_off);
-        break;
-      default:
-        throw std::runtime_error("Embedding: unsupported input dtype");
-      }
+      const float *in_data =
+        input_.getAddress<float>(b * input_.getDim().getFeatureLen());
       nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
 
       const int iter = static_cast<int>(to - from);
 
 #pragma omp parallel for
       for (int i = 0; i < iter; ++i) {
-        const size_t embed_idx = read_token(in_base, i);
+        const size_t embed_idx = static_cast<size_t>(in_data[i]);
         if (embed_idx >= in_dim) {
           throw std::invalid_argument(
             "input word index is greater than in_dim");
