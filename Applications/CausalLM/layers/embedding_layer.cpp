@@ -19,6 +19,7 @@
 #include <util_func.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -122,7 +123,8 @@ get_or_load_quant_lut(const std::string &manifest_path) {
 EmbeddingLayer::EmbeddingLayer() :
   LayerImpl(),
   embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
-                  nntrainer::props::Scale(), props::QuantizedLutPath()),
+                  nntrainer::props::Scale(), props::QuantizedLutPath(),
+                  props::OutputQuantScale(), props::OutputQuantOffset()),
   weight_idx(std::numeric_limits<unsigned>::max()) {}
 
 void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
@@ -245,6 +247,19 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     const int lut_offset = quant_lut_->offset;
     const size_t bytes_per_row = out_dim / 2;
 
+    // Two-step requant for UINT16 output:
+    //   f      = (q4bit + lut_offset) * lut_scale
+    //   q16bit = round(f / out_scale - out_offset)  ← QNN convention
+    // When the consumer's quant params are missing we fall back to a
+    // naive clamp (only valid if LUT and consumer share quant space).
+    auto &out_scale_prop  = std::get<props::OutputQuantScale>(embedding_props);
+    auto &out_offset_prop = std::get<props::OutputQuantOffset>(embedding_props);
+    const bool   has_out_quant = !out_scale_prop.empty();
+    const float  out_scale     = has_out_quant ? out_scale_prop.get() : 1.0f;
+    const int    out_offset    =
+      (!out_offset_prop.empty()) ? out_offset_prop.get() : 0;
+    const float  inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
+
     // Token IDs are FP32 (forced by setInputDataType in finalize).
     for (unsigned int b = 0; b < b_size; ++b) {
       const float *in_data =
@@ -267,13 +282,33 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
           uint16_t *dst =
             batchsliced_hidden.getData<uint16_t>() + out_off;
-          for (size_t k = 0; k < bytes_per_row; ++k) {
-            const uint8_t byte = row[k];
-            dst[2 * k] = clamp_u16(
-              (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale);
-            dst[2 * k + 1] = clamp_u16(
-              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
-              lut_scale);
+          if (has_out_quant) {
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              const float f_lo =
+                (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale;
+              const float f_hi =
+                (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
+                lut_scale;
+              const int q_lo = static_cast<int>(
+                std::lrintf(f_lo * inv_out_scale)) - out_offset;
+              const int q_hi = static_cast<int>(
+                std::lrintf(f_hi * inv_out_scale)) - out_offset;
+              dst[2 * k]     = static_cast<uint16_t>(
+                std::max(0, std::min(65535, q_lo)));
+              dst[2 * k + 1] = static_cast<uint16_t>(
+                std::max(0, std::min(65535, q_hi)));
+            }
+          } else {
+            // Naive clamp (legacy / same-quant-space).
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              dst[2 * k] = clamp_u16(
+                (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale);
+              dst[2 * k + 1] = clamp_u16(
+                (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
+                lut_scale);
+            }
           }
         } else if (out_dtype == nntrainer::TensorDim::DataType::FP32) {
           float *dst = batchsliced_hidden.getData<float>() + out_off;
