@@ -30,6 +30,7 @@
 #include <future>
 #include <iomanip>
 #include <sstream>
+#include <iostream>
 
 #include <activation_realizer.h>
 #include <adamw.h>
@@ -642,6 +643,7 @@ void NeuralNetwork::save(
       const auto &layer_node = *iter;
       auto it = layer_dtype_map.find(layer_node->getName());
       auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
+      std::cout << layer_node->getName() << std::endl;
       layer_node->save(model_file, false, exec_mode, target_dtype);
     }
 
