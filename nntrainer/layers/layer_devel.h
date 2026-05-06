@@ -366,6 +366,7 @@ public:
        TensorDim::DataType dtype = TensorDim::DataType::NONE) const {
 
     if (opt_var) {
+      std::cout << "HERE3!" << std::endl;
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.isGradientFirstAccess(i) && trainable) {
           // @note save optimizer variables
@@ -378,23 +379,29 @@ public:
         }
       }
     } else {
+      std::cout << "HERE4!" << std::endl;
+      std::cout << "Num of weights" << run_context.getNumWeights() << std::endl;
       // @note shared weights are only be saved at the first access
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.isGradientFirstAccess(i)) {
           auto &weight = run_context.getWeight(i);
-          if (dtype == TensorDim::DataType::NONE ||
-              weight.getDataType() == dtype)
+          
+          if (weight.getDim().getDataType() != TensorDim::DataType::Q4_0){
+            if (weight.getDim().getDataType() == TensorDim::DataType::FP32){
+              std::cout << "FP32" << std::endl;
+            } else{
+              std::cout << "Other" << std::endl;
+            }
             weight.save(file);
+          }
           else {
-            if (dtype == TensorDim::DataType::Q4_0) {
-              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
-                            std::runtime_error)
-                << "Save with quantization only supports for FP32 weight.";
-              ///@note The codelines below can be replaced with quantizer's
-              /// quantize()
+            std::cout << "HERE5!" << std::endl;
+            if (weight.getDim().getDataType() == TensorDim::DataType::Q4_0) {
+              
               TensorDim dim = weight.getDim();
               unsigned int K = dim.height();
               unsigned int N = dim.width();
+              std::cout << "K : " << K << "N : " << N << std::endl;
 
               // Skip quantization for bias-like tensors (1D with height == 1)
               // as they are not suitable for Q4_0 block quantization
@@ -405,17 +412,81 @@ public:
                   << "Q4_0 quantization requires both width and height to be "
                      "divisible by 32, but got height="
                   << K << ", width=" << N;
+                
+                if (K > 50000 || N > 50000) {
+                   //if lm_head or embedding, just save as q40
+                  std::cout << "HERE!" << std::endl;
+                  weight.save(file);
+                } else{
+                  std::cout << "HERE2!" << std::endl;
+                  uint32_t K = weight.height();
+                  uint32_t N = weight.width();
 
+                  nntrainer::TensorDim dim_qint4(1, 1, K, N, TensorDim::Format::NCHW, nntrainer::Tdatatype::QINT4);
+                  nntrainer::Tensor W_qint4(dim_qint4);
+                  
+                  
+                  std::vector<float> weight_fp32 (N * K);
+                  
+                  
+
+
+
+                  std::vector<uint8_t> unpacked_weight (weight.getMemoryBytes());
+                  
+                  //std::vector<uint8_t> kai_quant_data(rhs_native_size_qs4cx);
+                  //std::vector<uint8_t> kai_quant_scale(rhs_scales_size_f32);
+
+                  //std::cout <<"here?" << std::endl;
+                  
+                  nntrainer::unpack_q4_0((void *)weight.getData(), (void *)unpacked_weight.data(), weight.getMemoryBytes(), N, K);
+
+                  for (size_t row = 0; row < N; row++) {
+                    dequantize_row_q4_0(
+                        (void *)(unpacked_weight.data() + row * (K/32) * 18),
+                        weight_fp32.data() + row * K,
+                        K);
+                  }
+
+                  size_t rhs_native_size_qs4cx = static_cast<size_t>(N) * (((K + 2 - 1) / 2) * 2 / 2) * sizeof(uint8_t); //nxk
+                  size_t rhs_scales_size_f32 = N * sizeof(float);
+                  
+                  uint8_t k_idx = 3;
+                  std::vector<float> kai_quant_scale(N);
+                  std::vector <uint8_t> kai_quant_data (N * K / 2);
+                  size_t packed_size = nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+                      N, K, k_idx, true);
+
+                  std::vector<uint8_t> packed_weights(packed_size);
+                  //std::cout << weight_fp32.data()[0] << " " << weight_fp32.data()[1] << " " << weight_fp32.data()[2] << std::endl;  
+                  nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data());
+                          
+                  //std::cout << kai_quant_scale.data()[0] << kai_quant_scale.data()[1] << kai_quant_scale.data()[2] << std::endl;          
+                  nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
+                                                  packed_weights.data(),
+                                                  kai_quant_data.data(),
+                                                  kai_quant_scale.data(),
+                                                  k_idx, true);
+
+                  std::cout << packed_size << std::endl;
+                  std::cout << W_qint4.getMemoryBytes() << std::endl;
+                  
+                  memcpy(W_qint4.getData<uint8_t>(), packed_weights.data(), packed_size);
+                  W_qint4.save(file);                  
+                }
+              
+                /*
                 Tensor weight_t = weight.transpose("0:2:1");
                 Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                     {Tformat::NCHW, dtype});
                 std::vector<char> tmp(quant_weight.size());
-
+                
                 quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
                               nullptr);
                 repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
                             quant_weight.size(), N, K);
                 quant_weight.save(file);
+                */
               }
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
