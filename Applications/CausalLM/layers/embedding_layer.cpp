@@ -16,8 +16,17 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
-#include <thread_manager.h>
 #include <util_func.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
+
+#include "json.hpp"
 
 namespace causallm {
 
@@ -25,15 +34,112 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 enum EmbeddingParams { weight };
 
+namespace {
+
+// Path-keyed cache so two graphs (or two layers) that reference the same
+// manifest share a single in-memory copy of the 4-bit LUT.
+std::mutex g_lut_cache_mtx;
+std::unordered_map<std::string, std::weak_ptr<QuantLut>> g_lut_cache;
+
+std::string dirname(const std::string &p) {
+  auto pos = p.find_last_of('/');
+  return (pos == std::string::npos) ? std::string() : p.substr(0, pos);
+}
+
+std::string resolve_relative(const std::string &path,
+                             const std::string &base_dir) {
+  if (path.empty() || path[0] == '/' || base_dir.empty())
+    return path;
+  return base_dir + "/" + path;
+}
+
+inline uint16_t clamp_u16(float v) {
+  return static_cast<uint16_t>(std::max(0.0f, std::min(65535.0f, v)));
+}
+
+} // namespace
+
+std::shared_ptr<QuantLut>
+get_or_load_quant_lut(const std::string &manifest_path) {
+  std::lock_guard<std::mutex> lk(g_lut_cache_mtx);
+
+  auto it = g_lut_cache.find(manifest_path);
+  if (it != g_lut_cache.end()) {
+    if (auto sp = it->second.lock())
+      return sp;
+    g_lut_cache.erase(it);
+  }
+
+  std::ifstream f(manifest_path);
+  NNTR_THROW_IF(!f.is_open(), std::runtime_error)
+    << "Failed to open LUT manifest: " << manifest_path;
+
+  nlohmann::json j;
+  f >> j;
+
+  const std::string lut_rel = j.at("lut-path").get<std::string>();
+  const int per_row = j.at("size").get<int>();
+  const std::string datatype = j.value("datatype", std::string("ufixed8"));
+  const auto &qp = j.at("quant-param");
+
+  // Per the manifest convention used in this project, "ufixed8" means
+  // two 4-bit values packed into one byte (NOT a single 8-bit code).
+  NNTR_THROW_IF(datatype != "ufixed8", std::runtime_error)
+    << "Only 'ufixed8' (4-bit packed in 8-bit) is supported, got: " << datatype;
+
+  auto lut = std::make_shared<QuantLut>();
+  lut->scale = qp.at("scale").get<float>();
+  lut->offset = qp.at("offset").get<int>();
+  lut->out_dim = static_cast<size_t>(per_row);
+
+  const std::string lut_abs = resolve_relative(lut_rel, dirname(manifest_path));
+
+  std::ifstream bin(lut_abs, std::ios::binary | std::ios::ate);
+  NNTR_THROW_IF(!bin.is_open(), std::runtime_error)
+    << "Failed to open LUT binary: " << lut_abs;
+  const std::streamsize sz = bin.tellg();
+  bin.seekg(0, std::ios::beg);
+  lut->packed.resize(static_cast<size_t>(sz));
+  bin.read(reinterpret_cast<char *>(lut->packed.data()), sz);
+
+  // 4-bit packed: 2 elements per byte. Total nibbles = 2 * file_bytes.
+  // in_dim = total_nibbles / out_dim.
+  NNTR_THROW_IF(lut->out_dim == 0 || (2 * lut->packed.size()) % lut->out_dim,
+                std::runtime_error)
+    << "LUT binary size " << lut->packed.size()
+    << " is not consistent with out_dim=" << lut->out_dim;
+  lut->in_dim = (2 * lut->packed.size()) / lut->out_dim;
+
+  ml_logi("Loaded shared 4-bit LUT '%s' (in_dim=%zu, out_dim=%zu, scale=%f, "
+          "offset=%d, bytes=%zu)",
+          manifest_path.c_str(), lut->in_dim, lut->out_dim, lut->scale,
+          lut->offset, lut->packed.size());
+
+  g_lut_cache[manifest_path] = lut;
+  return lut;
+}
+
 EmbeddingLayer::EmbeddingLayer() :
   LayerImpl(),
   embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
-                  nntrainer::props::Scale()),
+                  nntrainer::props::Scale(), props::QuantizedLutPath(),
+                  props::OutputQuantScale(), props::OutputQuantOffset()),
   weight_idx(std::numeric_limits<unsigned>::max()) {}
 
 void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "Embedding layer takes only one input";
+
+  // Force the input dim dtype to FP32. The embedding layer is often the
+  // model entry point (no separate Input layer in front), so its input
+  // dim would otherwise inherit the model's activation dtype (e.g.
+  // UINT16 in QNN-style pipelines). Token IDs, however, are integer
+  // indices into a vocab that can exceed UINT16's range (e.g. Gemma
+  // vocab ~256K), so we represent them as 32-bit floats by convention.
+  // The embedding layer reads FP32 token IDs and writes the configured
+  // activation dtype (UINT16 here) into its output for downstream
+  // (e.g. QNN graph) consumption.
+  context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
 
   const nntrainer::TensorDim &input_dim =
     context.getInputDimensions()[SINGLE_INOUT_IDX];
@@ -53,6 +159,22 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   size_t out_dim =
     static_cast<size_t>(std::get<nntrainer::props::OutDim>(embedding_props));
 
+  // Tensorwise 4-bit LUT mode: load (or look up cached) shared LUT and
+  // skip the standard managed weight allocation. The LUT is owned by
+  // this layer via shared_ptr, and shared with any other layer that
+  // references the same manifest path.
+  auto &quant_path_prop = std::get<props::QuantizedLutPath>(embedding_props);
+  if (!quant_path_prop.empty()) {
+    quant_lut_ = get_or_load_quant_lut(quant_path_prop.get());
+
+    NNTR_THROW_IF(quant_lut_->in_dim != in_dim, std::invalid_argument)
+      << "in_dim mismatch: layer=" << in_dim
+      << " manifest=" << quant_lut_->in_dim;
+    NNTR_THROW_IF(quant_lut_->out_dim != out_dim, std::invalid_argument)
+      << "out_dim mismatch: layer=" << out_dim
+      << " manifest=" << quant_lut_->out_dim;
+  }
+
   nntrainer::TensorDim output_dim = input_dim;
 
   // output_dim expected as hidden x num input (batch size)
@@ -61,6 +183,11 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   output_dim.setTensorType(
     {context.getFormat(), context.getActivationDataType()});
   context.setOutputDimensions({output_dim});
+
+  if (quant_lut_) {
+    // No managed weight in LUT mode — embedding rows live in quant_lut_.
+    return;
+  }
 
   nntrainer::TensorDim dim = output_dim;
 
@@ -81,7 +208,188 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
-                                bool training) {}
+                                bool training) {
+
+  /// Mirror incremental_forwarding for the full input width (no from/to).
+  unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
+  unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
+  float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
+                  ? 1.0f
+                  : std::get<nntrainer::props::Scale>(embedding_props).get();
+
+  nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  unsigned int b_size = input_.batch();
+  const unsigned int seq_len = input_.width();
+
+  // -------------------------------------------------------------------
+  // Tensorwise 4-bit LUT path: dequant 4-bit → float (LUT space) →
+  // uint16 (consumer space) per token, mirroring incremental_forwarding.
+  // -------------------------------------------------------------------
+  if (quant_lut_) {
+    NNTR_THROW_IF(out_dim != quant_lut_->out_dim, std::runtime_error)
+      << "LUT out_dim drift";
+    NNTR_THROW_IF(out_dim % 2 != 0, std::runtime_error)
+      << "4-bit packed embedding requires out_dim to be even, got " << out_dim;
+
+    const auto out_dtype = hidden_.getDataType();
+    const uint8_t *packed = quant_lut_->packed.data();
+    const float lut_scale = quant_lut_->scale * scale;
+    const int lut_offset = quant_lut_->offset;
+    const size_t bytes_per_row = out_dim / 2;
+
+    auto &out_scale_prop = std::get<props::OutputQuantScale>(embedding_props);
+    auto &out_offset_prop = std::get<props::OutputQuantOffset>(embedding_props);
+    const bool has_out_quant = !out_scale_prop.empty();
+    const float out_scale = has_out_quant ? out_scale_prop.get() : 1.0f;
+    const int out_offset =
+      (!out_offset_prop.empty()) ? out_offset_prop.get() : 0;
+    const float inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
+
+    static bool dbg_done = false;
+    if (!dbg_done) {
+      dbg_done = true;
+      std::cout << "[ EMB-DBG] has_out_quant = " << has_out_quant
+                << " out_scale=" << out_scale << " out_offset=" << out_offset
+                << " lut_scale=" << lut_scale << " lut_offset=" << lut_offset
+                << std::endl;
+    }
+
+    for (unsigned int b = 0; b < b_size; ++b) {
+      const float *in_data =
+        input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+      nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+
+#pragma omp parallel for
+      for (int i = 0; i < (int)seq_len; ++i) {
+        const size_t embed_idx = static_cast<size_t>(in_data[i]);
+        if (embed_idx >= in_dim) {
+          throw std::invalid_argument(
+            "input word index is greater than in_dim");
+        }
+
+        const uint8_t *row = packed + bytes_per_row * embed_idx;
+        const size_t out_off = static_cast<size_t>(out_dim) * i;
+
+        if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
+          uint16_t *dst = batchsliced_hidden.getData<uint16_t>() + out_off;
+          if (has_out_quant) {
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              const float f_lo =
+                (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale;
+              const float f_hi =
+                (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
+                lut_scale;
+              const int q_lo =
+                static_cast<int>(std::lrintf(f_lo * inv_out_scale)) -
+                out_offset;
+              const int q_hi =
+                static_cast<int>(std::lrintf(f_hi * inv_out_scale)) -
+                out_offset;
+              dst[2 * k] =
+                static_cast<uint16_t>(std::max(0, std::min(65535, q_lo)));
+              dst[2 * k + 1] =
+                static_cast<uint16_t>(std::max(0, std::min(65535, q_hi)));
+            }
+          } else {
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              dst[2 * k] = clamp_u16(
+                (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale);
+              dst[2 * k + 1] = clamp_u16(
+                (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
+                lut_scale);
+            }
+          }
+        } else if (out_dtype == nntrainer::TensorDim::DataType::FP32) {
+          float *dst = batchsliced_hidden.getData<float>() + out_off;
+          for (size_t k = 0; k < bytes_per_row; ++k) {
+            const uint8_t byte = row[k];
+            dst[2 * k] =
+              (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale;
+            dst[2 * k + 1] =
+              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) * lut_scale;
+          }
+#ifdef ENABLE_FP16
+        } else if (out_dtype == nntrainer::TensorDim::DataType::FP16) {
+          _FP16 *dst = batchsliced_hidden.getData<_FP16>() + out_off;
+          for (size_t k = 0; k < bytes_per_row; ++k) {
+            const uint8_t byte = row[k];
+            dst[2 * k] = static_cast<_FP16>(
+              (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale);
+            dst[2 * k + 1] = static_cast<_FP16>(
+              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
+              lut_scale);
+          }
+#endif
+        } else {
+          throw std::runtime_error(
+            "EmbeddingLayer LUT mode: unsupported output dtype");
+        }
+      }
+      static bool dbg_first = false;
+      if (!dbg_first && b == 0) {
+        dbg_first = true;
+        uint16_t *p = batchsliced_hidden.getData<uint16_t>();
+        std::cout << "[EMB-DBG] token 0 first 8 elems: ";
+        for (int j = 0; j < 8; ++j)
+          std::cout << p[j] << " ";
+        std::cout << std::endl;
+      }
+    }
+    return;
+  }
+
+  // -------------------------------------------------------------------
+  // Non-LUT path (FP32/FP16 + Q4_0/Q6_K block dequant) mirroring
+  // incremental_forwarding's loop body but over the full sequence.
+  // -------------------------------------------------------------------
+  nntrainer::Tensor &weight = context.getWeight(weight_idx);
+
+  nntrainer::TensorDim out_tensor_dim =
+    nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
+
+  for (unsigned int b = 0; b < b_size; ++b) {
+    float *in_data =
+      input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+    nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+
+#pragma omp parallel for
+    for (int i = 0; i < (int)seq_len; ++i) {
+      size_t embed_idx = static_cast<size_t>(in_data[i]);
+      if (embed_idx >= in_dim) {
+        throw std::invalid_argument("input word index is greater than in_dim");
+      }
+
+      nntrainer::Tensor cur_weight =
+        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
+      nntrainer::Tensor out_tensor =
+        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * i);
+
+      if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
+        int num_blocks_per_row = (weight.width() + 256 - 1) / 256;
+        nntrainer::dequantize_row_q6_K(
+          (void *)((char *)weight.getData<uint8_t>() +
+                   (210 * num_blocks_per_row) * embed_idx),
+          out_tensor.getData(), out_dim);
+      } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
+        int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
+        nntrainer::dequantize_row_q4_0(
+          (void *)((char *)weight.getData<uint8_t>() +
+                   (18 * num_blocks_per_row) * embed_idx),
+          out_tensor.getData(), out_dim);
+      } else {
+        out_tensor.copyData(cur_weight);
+      }
+
+      if (scale != 1.0f) {
+        out_tensor.multiply_i(scale);
+      }
+    }
+  }
+}
 
 void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
@@ -93,16 +401,148 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
                   ? 1.0f
                   : std::get<nntrainer::props::Scale>(embedding_props).get();
-  unsigned int _from = from;
 
-  nntrainer::Tensor &weight = context.getWeight(weight_idx);
   nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
+  unsigned int b_size = input_.batch();
+
+  // -------------------------------------------------------------------
+  // Tensorwise 4-bit LUT path: dequantize the embedding row directly into
+  // the output (UINT16 or float). Bypasses the managed-weight tensor
+  // entirely; the packed table is shared with peer graphs via the
+  // QuantLut shared_ptr.
+  // -------------------------------------------------------------------
+  if (quant_lut_) {
+    NNTR_THROW_IF(out_dim != quant_lut_->out_dim, std::runtime_error)
+      << "LUT out_dim drift";
+    NNTR_THROW_IF(out_dim % 2 != 0, std::runtime_error)
+      << "4-bit packed embedding requires out_dim to be even, got " << out_dim;
+
+    const auto out_dtype = hidden_.getDataType();
+    const uint8_t *packed = quant_lut_->packed.data();
+    const float lut_scale = quant_lut_->scale * scale;
+    const int lut_offset = quant_lut_->offset;
+    const size_t bytes_per_row = out_dim / 2;
+
+    // Two-step requant for UINT16 output:
+    //   f      = (q4bit + lut_offset) * lut_scale
+    //   q16bit = round(f / out_scale - out_offset)  ← QNN convention
+    // When the consumer's quant params are missing we fall back to a
+    // naive clamp (only valid if LUT and consumer share quant space).
+    auto &out_scale_prop = std::get<props::OutputQuantScale>(embedding_props);
+    auto &out_offset_prop = std::get<props::OutputQuantOffset>(embedding_props);
+    const bool has_out_quant = !out_scale_prop.empty();
+    const float out_scale = has_out_quant ? out_scale_prop.get() : 1.0f;
+    const int out_offset =
+      (!out_offset_prop.empty()) ? out_offset_prop.get() : 0;
+    const float inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
+
+    static bool dbg_done = false;
+    if (!dbg_done) {
+      dbg_done = true;
+      std::cout << "[ EMB-DBG] has_out_quant = " << has_out_quant
+                << " out_scale=" << out_scale << " out_offset=" << out_offset
+                << " lut_scale=" << lut_scale << " lut_offset=" << lut_offset
+                << std::endl;
+    }
+
+    // Token IDs are FP32 (forced by setInputDataType in finalize).
+    for (unsigned int b = 0; b < b_size; ++b) {
+      const float *in_data =
+        input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+      nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+
+      const int iter = static_cast<int>(to - from);
+
+#pragma omp parallel for
+      for (int i = 0; i < iter; ++i) {
+        const size_t embed_idx = static_cast<size_t>(in_data[i]);
+        if (embed_idx >= in_dim) {
+          throw std::invalid_argument(
+            "input word index is greater than in_dim");
+        }
+
+        const uint8_t *row = packed + bytes_per_row * embed_idx;
+        const size_t out_off = static_cast<size_t>(out_dim) * i;
+
+        if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
+          uint16_t *dst = batchsliced_hidden.getData<uint16_t>() + out_off;
+          if (has_out_quant) {
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              const float f_lo =
+                (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale;
+              const float f_hi =
+                (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
+                lut_scale;
+              const int q_lo =
+                static_cast<int>(std::lrintf(f_lo * inv_out_scale)) -
+                out_offset;
+              const int q_hi =
+                static_cast<int>(std::lrintf(f_hi * inv_out_scale)) -
+                out_offset;
+              dst[2 * k] =
+                static_cast<uint16_t>(std::max(0, std::min(65535, q_lo)));
+              dst[2 * k + 1] =
+                static_cast<uint16_t>(std::max(0, std::min(65535, q_hi)));
+            }
+          } else {
+            // Naive clamp (legacy / same-quant-space).
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              dst[2 * k] = clamp_u16(
+                (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale);
+              dst[2 * k + 1] = clamp_u16(
+                (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
+                lut_scale);
+            }
+          }
+        } else if (out_dtype == nntrainer::TensorDim::DataType::FP32) {
+          float *dst = batchsliced_hidden.getData<float>() + out_off;
+          for (size_t k = 0; k < bytes_per_row; ++k) {
+            const uint8_t byte = row[k];
+            dst[2 * k] =
+              (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale;
+            dst[2 * k + 1] =
+              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) * lut_scale;
+          }
+#ifdef ENABLE_FP16
+        } else if (out_dtype == nntrainer::TensorDim::DataType::FP16) {
+          _FP16 *dst = batchsliced_hidden.getData<_FP16>() + out_off;
+          for (size_t k = 0; k < bytes_per_row; ++k) {
+            const uint8_t byte = row[k];
+            dst[2 * k] = static_cast<_FP16>(
+              (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale);
+            dst[2 * k + 1] = static_cast<_FP16>(
+              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
+              lut_scale);
+          }
+#endif
+        } else {
+          throw std::runtime_error(
+            "EmbeddingLayer LUT mode: unsupported output dtype");
+        }
+        if (i == 0 && b == 0) {
+          uint16_t *p = batchsliced_hidden.getData<uint16_t>();
+          std::cout << "[EMB dbg] token=" << embed_idx << " e[0..3]: ";
+          for (int j = 0; j < 4; ++j)
+            std::cout << p[j] << " ";
+          std::cout << " (out_scale/offset=" << out_scale << "/" << out_offset
+                    << ")" << std::endl;
+        }
+      }
+    }
+    return;
+  }
+
+  // -------------------------------------------------------------------
+  // Original non-LUT path (FP32/FP16 + Q4_0 / Q6_K block dequant).
+  // -------------------------------------------------------------------
+  nntrainer::Tensor &weight = context.getWeight(weight_idx);
+
   nntrainer::TensorDim out_tensor_dim =
     nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
-
-  unsigned int b_size = input_.batch();
 
   for (unsigned int b = 0; b < b_size; ++b) {
     float *in_data =
@@ -111,8 +551,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     int iter = to - from;
 
-    auto &tm = nntrainer::ThreadManager::Global();
-    tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
+#pragma omp parallel for
+    for (int i = 0; i < iter; ++i) {
       size_t embed_idx = static_cast<size_t>(in_data[i]);
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
@@ -144,7 +584,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       if (scale != 1.0f) {
         out_tensor.multiply_i(scale);
       }
-    });
+    }
 
 #ifdef DEBUG
     std::cout << context.getName() << " : "
@@ -165,71 +605,6 @@ void EmbeddingLayer::exportTo(nntrainer::Exporter &exporter,
                               const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);
   exporter.saveResult(embedding_props, method, this);
-}
-
-void EmbeddingLayer::save(std::ofstream &file,
-                          nntrainer::RunLayerContext &run_context, bool opt_var,
-                          ml::train::ExecutionMode mode, bool trainable,
-                          nntrainer::TensorDim::DataType dtype,
-                          ml::train::ISA target_isa) const {
-  // @note shared weights are only be saved at the first access
-  for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
-    if (run_context.isGradientFirstAccess(i)) {
-      auto &weight = run_context.getWeight(i);
-      if (dtype == nntrainer::TensorDim::DataType::NONE ||
-          weight.getDataType() == dtype)
-        weight.save(file);
-      else {
-        NNTR_THROW_IF(weight.getDataType() !=
-                        nntrainer::TensorDim::DataType::FP32,
-                      std::runtime_error)
-          << "Save with quantization only supports for FP32 weight.";
-        ///@note The codelines below can be replaced with quantizer's
-        /// quantize()
-        nntrainer::TensorDim dim = weight.getDim();
-        unsigned int K = dim.height();
-        unsigned int N = dim.width();
-
-        if (dtype == nntrainer::TensorDim::DataType::Q4_0) {
-
-          // Skip quantization for bias-like tensors (1D with height == 1)
-          // as they are not suitable for Q4_0 block quantization
-          if (K == 1) {
-            weight.save(file);
-          } else {
-            NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
-              << "Q4_0 quantization requires both width and height to be "
-                 "divisible by 32, but got height="
-              << K << ", width=" << N;
-            //////////////////////////////////////////////////////////////////
-            ///@note Please note that Embedding layer doesn't need to be
-            /// transposed!
-            //////////////////////////////////////////////////////////////////
-            nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
-                                           {nntrainer::Tformat::NCHW, dtype});
-            nntrainer::quantize_q4_0(weight.getData<float>(),
-                                     quant_weight.getData<uint8_t>(), K, N,
-                                     nullptr);
-            quant_weight.save(file);
-          }
-        } else if (dtype == nntrainer::TensorDim::DataType::Q6_K) {
-          //////////////////////////////////////////////////////////////////
-          ///@note Please note that Embedding layer doesn't need to be
-          /// transposed!
-          //////////////////////////////////////////////////////////////////
-          nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
-                                         {nntrainer::Tformat::NCHW, dtype});
-          nntrainer::quantize_q6_K(weight.getData<float>(),
-                                   quant_weight.getData<uint8_t>(), K, N,
-                                   nullptr);
-          quant_weight.save(file);
-        } else {
-          NNTR_THROW_IF(true, std::runtime_error)
-            << "This dtype is not supported in save with quantization";
-        }
-      }
-    }
-  }
 }
 
 #ifdef PLUGGABLE

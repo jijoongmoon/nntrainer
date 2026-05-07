@@ -26,7 +26,85 @@
 #include <common_properties.h>
 #include <layer_impl.h>
 
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
 namespace causallm {
+
+namespace props {
+
+/**
+ * @brief Path to a JSON manifest describing a tensorwise 4-bit quantized
+ *        embedding LUT. When set, the embedding layer skips the standard
+ *        FP weight allocation and instead loads the packed nibble table
+ *        described by the manifest, dequantizing per-token at forward time.
+ *
+ * Manifest schema:
+ *   {
+ *     "version":   1,
+ *     "type":      "lut",
+ *     "lut-path":  "<binary path, relative to manifest dir>",
+ *     "size":      <out_dim>,
+ *     "datatype":  "ufixed8",   // 4-bit values, 2 packed per uint8 byte
+ *     "quant-param": { "scale": <float>, "offset": <int> }
+ *   }
+ */
+class QuantizedLutPath final : public nntrainer::Property<std::string> {
+public:
+  QuantizedLutPath() = default;
+  QuantizedLutPath(const std::string &v) { set(v); }
+  static constexpr const char *key = "quantized_lut_path";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+/**
+ * @brief Output requantization scale.
+ *
+ * When the layer dequantizes a 4-bit LUT value, it produces a float in
+ * the LUT's quantization space. The downstream consumer (e.g. a QNN
+ * graph) expects UINT16 codes that, when dequantized with its own
+ * scale/offset, recover the same float. These two properties carry the
+ * consumer's scale/offset so the layer can do the requant. If unset,
+ * the layer falls back to a naive clamp which is only valid when the
+ * LUT and consumer share the same quant space.
+ */
+class OutputQuantScale final : public nntrainer::Property<float> {
+public:
+  OutputQuantScale() = default;
+  OutputQuantScale(float v) { set(v); }
+  static constexpr const char *key = "output_quant_scale";
+  using prop_tag = nntrainer::float_prop_tag;
+};
+
+class OutputQuantOffset final : public nntrainer::Property<int> {
+public:
+  OutputQuantOffset() = default;
+  OutputQuantOffset(int v) { set(v); }
+  static constexpr const char *key = "output_quant_offset";
+  using prop_tag = nntrainer::int_prop_tag;
+};
+
+} // namespace props
+
+/**
+ * @brief Tensorwise 4-bit quantized embedding LUT shared across networks.
+ *        `packed` holds nibble-packed bytes (low nibble first) of length
+ *        ceil(in_dim * out_dim / 2). Lives in a path-keyed weak cache so
+ *        two graphs that load the same manifest see the same in-memory
+ *        table.
+ */
+struct QuantLut {
+  std::vector<uint8_t> packed;
+  float scale = 1.0f;
+  int offset = 0;
+  size_t in_dim = 0;  ///< vocab size (rows)
+  size_t out_dim = 0; ///< per-token feature dim (cols)
+};
+
+std::shared_ptr<QuantLut>
+get_or_load_quant_lut(const std::string &manifest_path);
 
 /**
  * @class   EmbeddingLayer
@@ -114,22 +192,20 @@ public:
    */
   WIN_EXPORT void setProperty(const std::vector<std::string> &values) override;
 
-  /**
-   * @copydoc Layer::save()
-   */
-  WIN_EXPORT void save(
-    std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
-    ml::train::ExecutionMode mode, bool trainable,
-    nntrainer::TensorDim::DataType dtype = nntrainer::TensorDim::DataType::NONE,
-    ml::train::ISA target_isa = ml::train::ISA::AUTO) const override;
-
   inline static const std::string type = "embedding_layer";
 
 private:
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
-             nntrainer::props::Scale>
+             nntrainer::props::Scale, props::QuantizedLutPath,
+             props::OutputQuantScale, props::OutputQuantOffset>
     embedding_props;
   unsigned int weight_idx;
+
+  // Tensorwise 4-bit LUT mode. Populated in finalize() when
+  // QuantizedLutPath property is set; kept alive for the layer's lifetime
+  // so the data stays valid across forward calls. The shared_ptr also
+  // ensures cross-graph sharing via the path-keyed cache.
+  std::shared_ptr<QuantLut> quant_lut_;
 };
 } // namespace causallm
 
