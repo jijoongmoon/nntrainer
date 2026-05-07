@@ -130,7 +130,8 @@ void GraphCore::ensureName(GraphNode &node, const std::string &prefix_,
     return ret;
   };
 
-  std::string orig_name = to_lower(node.getName());
+  // std::string orig_name = to_lower(node.getName());
+  std::string orig_name = node.getName();
   std::string prefix = to_lower(prefix_);
   std::string postfix = to_lower(postfix_);
 

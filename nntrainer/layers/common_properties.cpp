@@ -38,7 +38,8 @@ void Name::set(const std::string &value) {
                    [](unsigned char c) { return std::tolower(c); });
     return ret;
   };
-  nntrainer::Property<std::string>::set(to_lower(value));
+  // nntrainer::Property<std::string>::set(to_lower(value));
+  nntrainer::Property<std::string>::set((value));
 }
 
 bool Name::isValid(const std::string &v) const {
