@@ -211,7 +211,6 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
                                 bool training) {
-
   /// Mirror incremental_forwarding for the full input width (no from/to).
   unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
   unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
@@ -233,7 +232,8 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
     NNTR_THROW_IF(out_dim != quant_lut_->out_dim, std::runtime_error)
       << "LUT out_dim drift";
     NNTR_THROW_IF(out_dim % 2 != 0, std::runtime_error)
-      << "4-bit packed embedding requires out_dim to be even, got " << out_dim;
+      << "4-bit packed embedding requires out_dim to be even, got "
+      << out_dim;
 
     const auto out_dtype = hidden_.getDataType();
     const uint8_t *packed = quant_lut_->packed.data();
@@ -241,22 +241,13 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
     const int lut_offset = quant_lut_->offset;
     const size_t bytes_per_row = out_dim / 2;
 
-    auto &out_scale_prop = std::get<props::OutputQuantScale>(embedding_props);
+    auto &out_scale_prop  = std::get<props::OutputQuantScale>(embedding_props);
     auto &out_offset_prop = std::get<props::OutputQuantOffset>(embedding_props);
-    const bool has_out_quant = !out_scale_prop.empty();
-    const float out_scale = has_out_quant ? out_scale_prop.get() : 1.0f;
-    const int out_offset =
+    const bool   has_out_quant = !out_scale_prop.empty();
+    const float  out_scale     = has_out_quant ? out_scale_prop.get() : 1.0f;
+    const int    out_offset    =
       (!out_offset_prop.empty()) ? out_offset_prop.get() : 0;
-    const float inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
-
-    static bool dbg_done = false;
-    if (!dbg_done) {
-      dbg_done = true;
-      std::cout << "[ EMB-DBG] has_out_quant = " << has_out_quant
-                << " out_scale=" << out_scale << " out_offset=" << out_offset
-                << " lut_scale=" << lut_scale << " lut_offset=" << lut_offset
-                << std::endl;
-    }
+    const float  inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
 
     for (unsigned int b = 0; b < b_size; ++b) {
       const float *in_data =
@@ -275,7 +266,8 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
         const size_t out_off = static_cast<size_t>(out_dim) * i;
 
         if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
-          uint16_t *dst = batchsliced_hidden.getData<uint16_t>() + out_off;
+          uint16_t *dst =
+            batchsliced_hidden.getData<uint16_t>() + out_off;
           if (has_out_quant) {
             for (size_t k = 0; k < bytes_per_row; ++k) {
               const uint8_t byte = row[k];
@@ -284,16 +276,14 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
               const float f_hi =
                 (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
                 lut_scale;
-              const int q_lo =
-                static_cast<int>(std::lrintf(f_lo * inv_out_scale)) -
-                out_offset;
-              const int q_hi =
-                static_cast<int>(std::lrintf(f_hi * inv_out_scale)) -
-                out_offset;
-              dst[2 * k] =
-                static_cast<uint16_t>(std::max(0, std::min(65535, q_lo)));
-              dst[2 * k + 1] =
-                static_cast<uint16_t>(std::max(0, std::min(65535, q_hi)));
+              const int q_lo = static_cast<int>(
+                std::lrintf(f_lo * inv_out_scale)) - out_offset;
+              const int q_hi = static_cast<int>(
+                std::lrintf(f_hi * inv_out_scale)) - out_offset;
+              dst[2 * k]     = static_cast<uint16_t>(
+                std::max(0, std::min(65535, q_lo)));
+              dst[2 * k + 1] = static_cast<uint16_t>(
+                std::max(0, std::min(65535, q_hi)));
             }
           } else {
             for (size_t k = 0; k < bytes_per_row; ++k) {
@@ -312,7 +302,8 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
             dst[2 * k] =
               (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale;
             dst[2 * k + 1] =
-              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) * lut_scale;
+              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
+              lut_scale;
           }
 #ifdef ENABLE_FP16
         } else if (out_dtype == nntrainer::TensorDim::DataType::FP16) {
