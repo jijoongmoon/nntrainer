@@ -30,6 +30,9 @@ causallm_layer_dependencies += [
     causallm_qkv_layer_dep,
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
+    causallm_per_layer_slice_dep,
+    causallm_scalar_multiply_dep,
+    causallm_logit_softcapping_dep,
 ]
 
 subdir('models')
@@ -91,10 +94,3 @@ test_api_src = [
     meson.current_source_dir() / 'api' / 'test_api.cpp',
 ]
 
-test_api = executable('test_api',
-    test_api_src,
-    include_directories: causallm_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
-    build_by_default: true,
-    install: false,
-)

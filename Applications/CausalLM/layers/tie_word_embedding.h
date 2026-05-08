@@ -133,13 +133,13 @@ public:
                        int file_fd = -1) override;
 
   /**
-   * @copydic Layer::save()
+   * @copydoc Layer::save()
    */
-  WIN_EXPORT void save(std::ofstream &file,
-                       nntrainer::RunLayerContext &run_context, bool opt_var,
-                       ml::train::ExecutionMode mode, bool trainable,
-                       nntrainer::TensorDim::DataType dtype =
-                         nntrainer::TensorDim::DataType::NONE) const override;
+  WIN_EXPORT void save(
+    std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
+    ml::train::ExecutionMode mode, bool trainable,
+    nntrainer::TensorDim::DataType dtype = nntrainer::TensorDim::DataType::NONE,
+    ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
 
   using Layer::setProperty;
 
@@ -158,6 +158,7 @@ private:
   enum mode { embedding, lm_head };
   enum mode mode_;
   std::array<unsigned int, 4> weight_idx; /**< indices of the weights */
+  bool skip_prefill = false;
 
   WIN_EXPORT void finalize_embedding(nntrainer::InitLayerContext &context);
   WIN_EXPORT void finalize_lmhead(nntrainer::InitLayerContext &context);

@@ -150,6 +150,7 @@ protected:
   std::string TAIL_PROMPT;
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
+  bool SKIP_PREFILL;
   unsigned int global_token_len;
 
   bool has_run_ = false;

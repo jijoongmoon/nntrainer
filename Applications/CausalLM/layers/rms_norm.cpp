@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2023 Seungbaek Hong <sb92.hong@samsung.com>
  *
- * @file   custom_rms_norm.cpp
+ * @file   rms_norm.cpp
  * @date   19 July 2023
  * @brief  Implementation of custom RMS normalization function
  * @see    https://github.com/nntrainer/nntrainer
@@ -23,6 +23,10 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
   context.setOutputDimensions(dim);
+
+  if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
+    skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
+
   nntrainer::TensorDim gamma_dim(
     1, 1, 1, dim[0].width(),
     nntrainer::TensorDim::TensorType(context.getFormat(),
@@ -50,7 +54,9 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
 
-  unsigned int _from = from;
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
 
   in_step_dim.batch(1);
   in_step_dim.height(to - from);

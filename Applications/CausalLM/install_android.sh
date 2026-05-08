@@ -171,6 +171,12 @@ adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" "$INSTALL_DIR/" 2>&1 | t
 adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
 log_success "nntr_quantize pushed"
 
+if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" ]; then
+    adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" $INSTALL_DIR/
+    adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
+    echo "nntr_quantize installed."
+fi
+
 # Push shared libraries
 log_info "Pushing shared libraries..."
 log_info "  [1/5] libcausallm_core.so (CausalLM Core library)..."

@@ -793,10 +793,13 @@ public:
    * @param opt_var save optimizer variables
    * @param mode    execution mode
    * @param target_dtype target data type to convert weights before saving
+   * @param target_isa target ISA (Instruction Set Architecture) format for
+   * quantization (DEFAULT/X86/ARM)
    */
   void save(std::ofstream &file, bool opt_var = false,
             ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN,
-            TensorDim::DataType target_dtype = TensorDim::DataType::NONE) const;
+            TensorDim::DataType target_dtype = TensorDim::DataType::NONE,
+            ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const;
 
   /**
    * @brief clear optimizer variable to initial state

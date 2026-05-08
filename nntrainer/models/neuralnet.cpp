@@ -620,7 +620,8 @@ void NeuralNetwork::backwarding(int iteration,
 void NeuralNetwork::save(
   const std::string &file_path, ml::train::ModelFormat format,
   TensorDim::DataType dtype,
-  const std::map<std::string, TensorDim::DataType> &layer_dtype_map) {
+  const std::map<std::string, TensorDim::DataType> &layer_dtype_map,
+  ml::train::ISA target_isa) {
   NNTR_THROW_IF(!initialized, std::runtime_error)
     << "Cannot save model if not initialized yet, path: " << file_path
     << " format: " << static_cast<unsigned>(format);
@@ -642,7 +643,7 @@ void NeuralNetwork::save(
       const auto &layer_node = *iter;
       auto it = layer_dtype_map.find(layer_node->getName());
       auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
-      layer_node->save(model_file, false, exec_mode, target_dtype);
+      layer_node->save(model_file, false, exec_mode, target_dtype, target_isa);
     }
 
     if (opt && istrequal(opt->getType(), "adam")) {

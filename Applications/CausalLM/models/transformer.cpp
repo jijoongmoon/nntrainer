@@ -129,7 +129,16 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                              ? cfg["sliding_window_pattern"].get<unsigned int>()
                              : 1;
   MAX_POSITION_EMBEDDINGS = cfg["max_position_embeddings"].get<unsigned int>();
-  ROPE_THETA = cfg["rope_theta"].get<unsigned int>();
+
+  // RoPE parameters (use sliding attention defaults)
+  if (cfg.contains("rope_parameters") &&
+      cfg["rope_parameters"].contains("sliding_attention")) {
+    json &rope_cfg = cfg["rope_parameters"]["sliding_attention"];
+    ROPE_THETA = rope_cfg.value("rope_theta", 10000);
+  } else {
+    ROPE_THETA = cfg.value("rope_theta", 10000);
+  }
+
   TIE_WORD_EMBEDDINGS = cfg["tie_word_embeddings"].get<bool>();
   NORM_EPS = cfg["rms_norm_eps"];
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
@@ -165,7 +174,6 @@ void Transformer::initialize() {
   }
 
   is_initialized = true;
-
 #ifdef DEBUG
   model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 #endif
@@ -221,7 +229,6 @@ void Transformer::constructModel() {
 };
 
 void Transformer::load_weight(const std::string &weight_path) {
-
   if (!is_initialized) {
     throw std::runtime_error(
       "Transformer model is not initialized. Please call "
@@ -254,8 +261,8 @@ void Transformer::save_weight(const std::string &weight_path) {
 
 void Transformer::save_weight(
   const std::string &weight_path, ml::train::TensorDim::DataType dtype,
-  const std::map<std::string, ml::train::TensorDim::DataType>
-    &layer_dtype_map) {
+  const std::map<std::string, ml::train::TensorDim::DataType> &layer_dtype_map,
+  ml::train::ISA target_isa) {
 
   if (!is_initialized) {
     throw std::runtime_error(
@@ -265,7 +272,8 @@ void Transformer::save_weight(
 
   try {
     model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN, dtype,
-                layer_dtype_map);
+                layer_dtype_map, target_isa);
+
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to save model weights with dtype: " +
                              std::string(e.what()));
