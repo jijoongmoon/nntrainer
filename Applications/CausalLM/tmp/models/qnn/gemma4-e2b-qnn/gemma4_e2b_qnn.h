@@ -39,13 +39,23 @@ public:
 
 private:
   // -------------------------------------------------------------------
-  // PLE: tensorwise 4-bit packed LUT, mmap-backed.
+  // PLE: dual-mode (auto-detected from `ple_file_name` extension).
+  //   *.json  → 4-bit packed LUT manifest. Per-token rows hold
+  //             `ple_row_elems` 4-bit values (2 packed per byte). The
+  //             host dequantizes (lut scale/offset) and requantizes
+  //             into each layer's UINT16 consumer space at fill time.
+  //   else    → raw UINT16 binary. Each per-token row holds
+  //             `ple_row_elems` uint16 values already in the
+  //             consumer's quant space. Per-layer fill is a straight
+  //             memcpy with no dequant/requant.
   // -------------------------------------------------------------------
+  bool           ple_is_4bit_    = false;
   int            ple_fd_         = -1;
-  const uint8_t *ple_mmap_       = nullptr;
+  const uint8_t *ple_mmap_       = nullptr;  // 4-bit byte view
+  const uint16_t *ple_u16_mmap_  = nullptr;  // raw uint16 view
   size_t         ple_file_size_  = 0;
-  float          ple_scale_      = 1.0f;
-  int            ple_offset_     = 0;
+  float          ple_scale_      = 1.0f;     // 4-bit only
+  int            ple_offset_     = 0;        // 4-bit only
   size_t         ple_row_elems_  = 0;
   size_t         ple_row_bytes_  = 0;
   size_t         ple_layers_     = 0;

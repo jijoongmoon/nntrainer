@@ -139,65 +139,129 @@ __attribute__((constructor)) static void register_custom_models() {
 }
 
 // =====================================================================
-// PLE methods
+// PLE methods (dual-mode: 4-bit manifest OR raw uint16 bin)
 // =====================================================================
+namespace {
+inline bool ends_with(const std::string &s, const std::string &suf) {
+  return s.size() >= suf.size() &&
+         0 == s.compare(s.size() - suf.size(), suf.size(), suf);
+}
+} // namespace
+
 void Gemma4_E2B_QNN::open_ple_file_() {
   if (ple_file_name.empty()) return;
 
-  std::ifstream mf(ple_file_name);
-  if (!mf.is_open())
-    throw std::runtime_error("Failed to open PLE manifest: " + ple_file_name);
-  json j; mf >> j;
-
-  const std::string lut_rel  = j.at("lut-path").get<std::string>();
-  const int row_elems        = j.at("size").get<int>();
-  const std::string datatype = j.value("datatype", std::string("ufixed8"));
-  const auto &qp             = j.at("quant-param");
-
-  if (datatype != "ufixed8")
-    throw std::runtime_error("PLE: only ufixed8 supported, got " + datatype);
-
-  ple_scale_     = qp.at("scale").get<float>();
-  ple_offset_    = qp.at("offset").get<int>();
-  ple_row_elems_ = static_cast<size_t>(row_elems);
-  ple_row_bytes_ = (ple_row_elems_ + 1) / 2;
+  ple_is_4bit_ = ends_with(ple_file_name, ".json");
   ple_per_layer_ = 256;
-  ple_layers_    = ple_row_elems_ / ple_per_layer_;
 
-  if (ple_layers_ * ple_per_layer_ != ple_row_elems_)
-    throw std::runtime_error("PLE 'size' not divisible by 256");
-  if (generation_per_layer_dst_.size() > ple_layers_)
-    throw std::runtime_error("PLE layer count too small");
+  if (ple_is_4bit_) {
+    // ── 4-bit packed: read manifest, then mmap the referenced .bin ──
+    std::ifstream mf(ple_file_name);
+    if (!mf.is_open())
+      throw std::runtime_error("Failed to open PLE manifest: " + ple_file_name);
+    json j; mf >> j;
 
-  std::string lut_abs = rebase_relative_to_model_file(lut_rel, ple_file_name);
+    const std::string lut_rel  = j.at("lut-path").get<std::string>();
+    const int row_elems        = j.at("size").get<int>();
+    const std::string datatype = j.value("datatype", std::string("ufixed8"));
+    const auto &qp             = j.at("quant-param");
 
-  ple_fd_ = open(lut_abs.c_str(), O_RDONLY);
+    if (datatype != "ufixed8")
+      throw std::runtime_error("PLE: only ufixed8 supported, got " + datatype);
+
+    ple_scale_     = qp.at("scale").get<float>();
+    ple_offset_    = qp.at("offset").get<int>();
+    ple_row_elems_ = static_cast<size_t>(row_elems);
+    ple_row_bytes_ = (ple_row_elems_ + 1) / 2;
+    ple_layers_    = ple_row_elems_ / ple_per_layer_;
+
+    if (ple_layers_ * ple_per_layer_ != ple_row_elems_)
+      throw std::runtime_error("PLE 'size' not divisible by 256");
+    if (generation_per_layer_dst_.size() > ple_layers_)
+      throw std::runtime_error("PLE layer count too small");
+
+    std::string lut_abs =
+        rebase_relative_to_model_file(lut_rel, ple_file_name);
+
+    ple_fd_ = open(lut_abs.c_str(), O_RDONLY);
+    if (ple_fd_ < 0)
+      throw std::runtime_error("open PLE bin: " + lut_abs);
+    struct stat st;
+    if (fstat(ple_fd_, &st) < 0) {
+      ::close(ple_fd_); ple_fd_ = -1;
+      throw std::runtime_error("stat PLE bin: " + lut_abs);
+    }
+    ple_file_size_ = static_cast<size_t>(st.st_size);
+    if (ple_file_size_ % ple_row_bytes_ != 0) {
+      ::close(ple_fd_); ple_fd_ = -1;
+      throw std::runtime_error("PLE bin size not multiple of row bytes");
+    }
+
+    void *m = mmap(nullptr, ple_file_size_, PROT_READ, MAP_PRIVATE, ple_fd_, 0);
+    if (m == MAP_FAILED) {
+      ::close(ple_fd_); ple_fd_ = -1;
+      throw std::runtime_error("mmap PLE bin: " + lut_abs);
+    }
+    ple_mmap_ = static_cast<const uint8_t *>(m);
+#ifdef POSIX_MADV_RANDOM
+    posix_madvise((void *)ple_mmap_, ple_file_size_, POSIX_MADV_RANDOM);
+#endif
+    std::cout << "[PLE] 4-bit mmaped " << lut_abs
+              << " rows=" << (ple_file_size_ / ple_row_bytes_)
+              << " layers=" << ple_layers_ << " per_layer=" << ple_per_layer_
+              << " scale=" << ple_scale_ << " offset=" << ple_offset_
+              << std::endl;
+    return;
+  }
+
+  // ── raw UINT16: row = ple_layers * 256 uint16, no manifest ──
+  // Derive layer count from the generation graph's per_layer_inputs_*
+  // count (collected before open_ple_file_() is called).
+  ple_layers_    = generation_per_layer_dst_.size();
+  if (ple_layers_ == 0)
+    throw std::runtime_error(
+      "PLE raw uint16: no per_layer slots collected from generation graph");
+  ple_row_elems_ = ple_layers_ * ple_per_layer_;
+  ple_row_bytes_ = ple_row_elems_ * sizeof(uint16_t);
+
+  ple_fd_ = open(ple_file_name.c_str(), O_RDONLY);
   if (ple_fd_ < 0)
-    throw std::runtime_error("open PLE bin: " + lut_abs);
+    throw std::runtime_error("open PLE bin: " + ple_file_name);
   struct stat st;
   if (fstat(ple_fd_, &st) < 0) {
     ::close(ple_fd_); ple_fd_ = -1;
-    throw std::runtime_error("stat PLE bin: " + lut_abs);
+    throw std::runtime_error("stat PLE bin: " + ple_file_name);
   }
   ple_file_size_ = static_cast<size_t>(st.st_size);
   if (ple_file_size_ % ple_row_bytes_ != 0) {
     ::close(ple_fd_); ple_fd_ = -1;
-    throw std::runtime_error("PLE bin size not multiple of row bytes");
+    throw std::runtime_error(
+      "PLE raw uint16: file size not multiple of row bytes (expected "
+      + std::to_string(ple_row_bytes_) + ")");
   }
 
   void *m = mmap(nullptr, ple_file_size_, PROT_READ, MAP_PRIVATE, ple_fd_, 0);
   if (m == MAP_FAILED) {
     ::close(ple_fd_); ple_fd_ = -1;
-    throw std::runtime_error("mmap PLE bin: " + lut_abs);
+    throw std::runtime_error("mmap PLE bin: " + ple_file_name);
   }
-  ple_mmap_ = static_cast<const uint8_t *>(m);
+  ple_u16_mmap_ = static_cast<const uint16_t *>(m);
+  ple_mmap_     = static_cast<const uint8_t *>(m); // alias for cleanup
 #ifdef POSIX_MADV_RANDOM
-  posix_madvise((void *)ple_mmap_, ple_file_size_, POSIX_MADV_RANDOM);
+  posix_madvise(m, ple_file_size_, POSIX_MADV_RANDOM);
 #endif
+  std::cout << "[PLE] raw u16 mmaped " << ple_file_name
+            << " rows=" << (ple_file_size_ / ple_row_bytes_)
+            << " layers=" << ple_layers_ << " per_layer=" << ple_per_layer_
+            << " (no requant)" << std::endl;
 }
 
 void Gemma4_E2B_QNN::close_ple_file_() {
-  if (ple_mmap_) { munmap((void *)ple_mmap_, ple_file_size_); ple_mmap_ = nullptr; }
+  if (ple_mmap_) {
+    munmap((void *)ple_mmap_, ple_file_size_);
+    ple_mmap_     = nullptr;
+    ple_u16_mmap_ = nullptr;
+  }
   if (ple_fd_ >= 0) { ::close(ple_fd_); ple_fd_ = -1; }
 }
 
@@ -206,19 +270,33 @@ void Gemma4_E2B_QNN::fill_prefill_ple_chunk_(const std::vector<int> &tokens,
   if (!ple_mmap_) return;
   const size_t L_pre = prefill_per_layer_dst_.size();
   const size_t per_layer_elems = ple_per_layer_;
-  const size_t per_layer_bytes = per_layer_elems / 2;
   const int    chunk_size_tokens = context_size;
 
-  for (int t = 0; t < chunk_size_tokens; ++t) {
-    const int abs_idx  = chunk_idx * chunk_size_tokens + t;
-    const int token_id = (t < chunk_len) ? tokens[abs_idx] : padding_token;
-    const uint8_t *row = ple_mmap_ + (size_t)token_id * ple_row_bytes_;
-    for (size_t l = 0; l < L_pre; ++l) {
-      uint16_t *dst = prefill_per_layer_dst_[l] + (size_t)t * per_layer_elems;
-      dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
-                                  ple_scale_, ple_offset_,
-                                  prefill_per_layer_scale_[l],
-                                  prefill_per_layer_offset_[l], dst);
+  if (ple_is_4bit_) {
+    const size_t per_layer_bytes = per_layer_elems / 2;
+    for (int t = 0; t < chunk_size_tokens; ++t) {
+      const int abs_idx  = chunk_idx * chunk_size_tokens + t;
+      const int token_id = (t < chunk_len) ? tokens[abs_idx] : padding_token;
+      const uint8_t *row = ple_mmap_ + (size_t)token_id * ple_row_bytes_;
+      for (size_t l = 0; l < L_pre; ++l) {
+        uint16_t *dst = prefill_per_layer_dst_[l] + (size_t)t * per_layer_elems;
+        dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
+                                    ple_scale_, ple_offset_,
+                                    prefill_per_layer_scale_[l],
+                                    prefill_per_layer_offset_[l], dst);
+      }
+    }
+  } else {
+    // raw uint16: per-layer slice memcpy. Source already in consumer space.
+    for (int t = 0; t < chunk_size_tokens; ++t) {
+      const int abs_idx  = chunk_idx * chunk_size_tokens + t;
+      const int token_id = (t < chunk_len) ? tokens[abs_idx] : padding_token;
+      const uint16_t *row = ple_u16_mmap_ + (size_t)token_id * ple_row_elems_;
+      for (size_t l = 0; l < L_pre; ++l) {
+        uint16_t *dst = prefill_per_layer_dst_[l] + (size_t)t * per_layer_elems;
+        std::memcpy(dst, row + l * per_layer_elems,
+                    per_layer_elems * sizeof(uint16_t));
+      }
     }
   }
 }
@@ -227,15 +305,24 @@ void Gemma4_E2B_QNN::fill_generation_ple_(int token_id) {
   if (!ple_mmap_) return;
   const size_t L_gen = generation_per_layer_dst_.size();
   const size_t per_layer_elems = ple_per_layer_;
-  const size_t per_layer_bytes = per_layer_elems / 2;
-  const uint8_t *row = ple_mmap_ + (size_t)token_id * ple_row_bytes_;
 
-  for (size_t l = 0; l < L_gen; ++l) {
-    dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
-                                ple_scale_, ple_offset_,
-                                generation_per_layer_scale_[l],
-                                generation_per_layer_offset_[l],
-                                generation_per_layer_dst_[l]);
+  if (ple_is_4bit_) {
+    const size_t per_layer_bytes = per_layer_elems / 2;
+    const uint8_t *row = ple_mmap_ + (size_t)token_id * ple_row_bytes_;
+    for (size_t l = 0; l < L_gen; ++l) {
+      dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
+                                  ple_scale_, ple_offset_,
+                                  generation_per_layer_scale_[l],
+                                  generation_per_layer_offset_[l],
+                                  generation_per_layer_dst_[l]);
+    }
+  } else {
+    const uint16_t *row = ple_u16_mmap_ + (size_t)token_id * ple_row_elems_;
+    for (size_t l = 0; l < L_gen; ++l) {
+      std::memcpy(generation_per_layer_dst_[l],
+                  row + l * per_layer_elems,
+                  per_layer_elems * sizeof(uint16_t));
+    }
   }
 }
 
