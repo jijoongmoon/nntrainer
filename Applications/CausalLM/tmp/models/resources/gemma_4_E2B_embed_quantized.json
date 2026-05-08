@@ -1,0 +1,11 @@
+{
+    "version": 1,
+    "type": "lut",
+    "lut-path": "gemma_4_E2B_embed_quantized.bin",
+    "size": 1536,
+    "datatype": "ufixed8",
+    "quant-param": {
+        "scale": 1.9136640377317755,
+        "offset": -7
+    }
+}

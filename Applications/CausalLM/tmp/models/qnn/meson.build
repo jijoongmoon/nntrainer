@@ -1,0 +1,17 @@
+qnn_src = [
+    meson.current_source_dir() / 'android_memory_allocator.cpp',
+    meson.current_source_dir() / 'quick_dot_ai_qnn.cpp',
+    meson.current_source_dir() / 'graph_parser.cpp',
+    meson.current_source_dir() / 'quick_dot_ai_qnn_old.cpp',
+    meson.current_source_dir() / 'generate_qnn_utils.cpp',
+]
+
+qnn_inc = include_directories('.')
+
+quick_dot_ai_src += qnn_src
+quick_dot_ai_inc += qnn_inc
+
+subdir('gauss-3.6-qnn')
+subdir('gauss-3.8-qnn')
+subdir('gauss-3.8-vit-qnn')
+subdir('gemma4-e2b-qnn')
