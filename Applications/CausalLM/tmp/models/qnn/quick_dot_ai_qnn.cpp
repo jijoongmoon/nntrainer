@@ -12,6 +12,8 @@
 #include "graph_parser.h"
 
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <sstream>
 
 using namespace ml::train;
@@ -49,6 +51,22 @@ rebase_relative_to_model_file (const std::string &path, const std::string &model
     return path;
   }
   return base_dir + "/" + path;
+}
+
+// Format a scale value with enough precision for the float that QNN
+// will eventually use (`Qnn_QuantizeParams_t::scaleOffsetEncoding::scale`
+// is float, parsed with std::stof on the property side). TensorInfo
+// stores scale as double, so we round-trip via float — std::to_string
+// silently caps at 6 fractional digits and mangles tiny QNN scales
+// (e.g. 0.0004169851... → "0.000417"). Across 70+ tensors × 35 layers
+// × every token the dequant drift compounds into representation
+// collapse after a few dozen tokens.
+inline std::string format_float_precise (double v)
+{
+  std::ostringstream os;
+  os << std::setprecision (std::numeric_limits<float>::max_digits10)
+     << static_cast<float> (v);
+  return os.str ();
 }
 
 } // namespace
@@ -288,8 +306,10 @@ causallm::Quick_Dot_AI_QNN::initialize ()
         };
         if (uses_embedding && !embedding_file_name.empty ()) {
           emb_props.push_back (withKey ("quantized_lut_path", embedding_file_name));
-          emb_props.push_back (
-              withKey ("output_quant_scale", std::to_string (tensor_object.scale)));
+          // Round-trip-precise float string so the layer's requant uses
+          // the exact same scale QNN sees on the input_embeds tensor.
+          emb_props.push_back (withKey (
+              "output_quant_scale", format_float_precise (tensor_object.scale)));
           emb_props.push_back (
               withKey ("output_quant_offset", std::to_string (tensor_object.offset)));
         }
@@ -323,7 +343,7 @@ causallm::Quick_Dot_AI_QNN::initialize ()
       }
       in_quant += tensor_name;
       in_quant += ":";
-      in_quant += std::to_string (tensor_object.scale);
+      in_quant += format_float_precise (tensor_object.scale);
       in_quant += ":";
       in_quant += std::to_string (tensor_object.offset);
     }
@@ -353,7 +373,7 @@ causallm::Quick_Dot_AI_QNN::initialize ()
       }
       out_quant += tensor_name;
       out_quant += ":";
-      out_quant += std::to_string (tensor_object.scale);
+      out_quant += format_float_precise (tensor_object.scale);
       out_quant += ":";
       out_quant += std::to_string (tensor_object.offset);
     }
