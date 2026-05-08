@@ -89,22 +89,43 @@ public:
 } // namespace props
 
 /**
- * @brief Tensorwise 4-bit quantized embedding LUT shared across networks.
- *        `packed` holds nibble-packed bytes (low nibble first) of length
- *        ceil(in_dim * out_dim / 2). Lives in a path-keyed weak cache so
- *        two graphs that load the same manifest see the same in-memory
- *        table.
+ * @brief Embedding LUT shared across networks. Two on-disk formats are
+ *        supported, auto-detected from the path passed in:
+ *
+ *        - `*.json` manifest → 4-bit packed mode. `bytes` holds nibble-
+ *          packed bytes (low nibble first) of length
+ *          ceil(in_dim * out_dim / 2). Per-token forward dequantizes
+ *          (and optionally requantizes) into the consumer's space.
+ *
+ *        - any other extension → raw UINT16 mode. `bytes` holds
+ *          in_dim * out_dim * 2 bytes that are already in the consumer's
+ *          quant space. Per-token forward is a straight memcpy.
+ *
+ *        In raw mode `scale`/`offset` are unused; in 4-bit mode they are
+ *        the LUT-space quant params from the manifest.
+ *
+ *        Lives in a path-keyed weak cache so two graphs that load the
+ *        same file see the same in-memory table.
  */
 struct QuantLut {
-  std::vector<uint8_t> packed;
+  std::vector<uint8_t> bytes;
   float scale = 1.0f;
   int offset = 0;
   size_t in_dim = 0;  ///< vocab size (rows)
   size_t out_dim = 0; ///< per-token feature dim (cols)
+  bool is_raw_u16 = false;
 };
 
+/**
+ * @brief Resolve a path to a shared LUT. `path` may be either a JSON
+ *        manifest (4-bit) or a raw UINT16 bin; the format is
+ *        auto-detected from the extension. `in_dim` / `out_dim` are
+ *        only used to validate / size the raw-uint16 case.
+ */
 std::shared_ptr<QuantLut>
-get_or_load_quant_lut(const std::string &manifest_path);
+get_or_load_quant_lut(const std::string &path,
+                      size_t in_dim_hint = 0,
+                      size_t out_dim_hint = 0);
 
 
 /**
