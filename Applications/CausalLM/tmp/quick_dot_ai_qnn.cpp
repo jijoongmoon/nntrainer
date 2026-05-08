@@ -11,7 +11,10 @@
 #include "engine.h"
 #include "graph_parser.h"
 
+#include <app_context.h>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <sstream>
 
 using namespace ml::train;
@@ -126,16 +129,18 @@ void causallm::Quick_Dot_AI_QNN::initialize() {
           input_size *= input_shape[i];
         }
 
-        // Embedding layer properties. When `embedding_file_name` is set
-        // we hand the path to the layer via `quantized_lut_path`. The
-        // CausalLM EmbeddingLayer auto-detects the format from the
-        // extension:
-        //   *.json  → 4-bit packed manifest (dequant + requant)
+        // CausalLM `embedding_layer` (registered via Transformer::
+        // registerCustomLayers) auto-detects the embedding-source
+        // format from `quantized_lut_path`:
+        //   *.json  → 4-bit packed manifest (dequant + per-token requant)
         //   else    → raw UINT16 bin (memcpy, no requant)
-        // For the 4-bit path we also pass the consumer's quant params
-        // (this graph's input `scale`/`offset` for input_embeds) so the
-        // layer can requant into QNN's UINT16 codes; the raw-uint16 path
-        // ignores them.
+        // The consumer-space quant params come from this graph's
+        // `input_embeds` tensor info; the raw-uint16 path ignores them.
+        //
+        // Pass the float scale via ostringstream + max_digits10 so the
+        // property parser sees the same value the QNN graph reports —
+        // std::to_string(float) silently caps at 6 fractional digits and
+        // mangles tiny scales (e.g. 1.23e-5).
         std::vector<std::string> emb_props = {
             withKey("name", tensor_name),
             withKey("in_dim", vocab_size),
@@ -145,16 +150,15 @@ void causallm::Quick_Dot_AI_QNN::initialize() {
         if (!embedding_file_name.empty()) {
           emb_props.push_back(
               withKey("quantized_lut_path", embedding_file_name));
-          // Pass consumer (graph input) quant params; the layer ignores
-          // them in raw-uint16 mode and uses them in 4-bit mode.
-          emb_props.push_back(
-              withKey("output_quant_scale",
-                      std::to_string(tensor_object.scale)));
+          std::ostringstream sc;
+          sc << std::setprecision(std::numeric_limits<float>::max_digits10)
+             << tensor_object.scale;
+          emb_props.push_back(withKey("output_quant_scale", sc.str()));
           emb_props.push_back(
               withKey("output_quant_offset",
                       std::to_string(tensor_object.offset)));
         }
-        current_model->addLayer(createLayer("embedding", emb_props));
+        current_model->addLayer(createLayer("embedding_layer", emb_props));
 
         model_inputs.push_back(
             (float *)tracked_allocate(sizeof(float) * input_size));
@@ -291,7 +295,12 @@ causallm::Quick_Dot_AI_QNN::createMlp(const int, int, int, std::string) {
   return {};
 }
 
-void causallm::Quick_Dot_AI_QNN::registerCustomLayers() {}
+void causallm::Quick_Dot_AI_QNN::registerCustomLayers() {
+  // Register CausalLM custom layers (SwiGLU, RMSNorm, MHACore,
+  // TieWordEmbedding, EmbeddingLayer, ...) with the global app
+  // context so `createLayer("embedding_layer", ...)` etc. resolves.
+  Transformer::registerCustomLayers();
+}
 
 void causallm::Quick_Dot_AI_QNN::quantize_uint16_memcpy(float *src,
                                                         uint16_t *dest,
