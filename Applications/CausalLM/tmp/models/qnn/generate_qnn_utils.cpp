@@ -115,7 +115,8 @@ uint16_t *get_zero_memory(int size, int zero_point) {
 
 int sample(uint16_t *pointer, int length, int *tokens, int number_of_tokens,
            float logit_scale, int logit_offset, float repetition_penalty,
-           float temperature, float top_p, int top_k) {
+           float temperature, float top_p, int top_k,
+           float final_logit_softcapping) {
   // Priority queue!
   std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>,
                       std::greater<std::pair<int, int>>>
@@ -131,12 +132,21 @@ int sample(uint16_t *pointer, int length, int *tokens, int number_of_tokens,
   }
   length = top_k_elements.size();
 
-  // Convert to float
+  // Convert to float, dequant, then apply Gemma final-logit soft-cap.
+  // Soft-cap: l = soft_cap * tanh(l / soft_cap). Without it, a few raw
+  // logits dominate softmax and the model collapses into repetition.
   std::vector<int> indices(length);
   std::vector<float> logits(length);
+  const bool use_softcap = final_logit_softcapping > 0.0f;
+  const float inv_softcap =
+      use_softcap ? 1.0f / final_logit_softcapping : 0.0f;
   for (int i = 0; i < length; i++) {
     auto element = top_k_elements.top();
-    logits[i] = (1.0 * element.first + logit_offset) * logit_scale;
+    float l = (1.0f * element.first + logit_offset) * logit_scale;
+    if (use_softcap) {
+      l = final_logit_softcapping * std::tanh(l * inv_softcap);
+    }
+    logits[i] = l;
     indices[i] = element.second;
     top_k_elements.pop();
   }

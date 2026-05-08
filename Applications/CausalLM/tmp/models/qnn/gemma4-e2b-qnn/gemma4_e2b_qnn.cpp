@@ -638,6 +638,11 @@ void Gemma4_E2B_QNN::setupParameters(json &cfg, json &generation_cfg,
   logit_scale        = generation_cfg.value("logit_scale", 1.0f);
   logit_offset       = generation_cfg.value("logit_offset", 0);
 
+  // Gemma final-logit soft-cap (0 disables). Without it the model
+  // collapses into repetition since a few raw logits dominate softmax.
+  final_logit_softcapping = cfg.value("final_logit_softcapping", 0.0f);
+  LOGD("final_logit_softcapping = %f", final_logit_softcapping);
+
   lora_path     = nntr_cfg.value("lora_path", "");
   lora_path     = rebase_relative_to_model_file(lora_path, model_file_name);
   ple_file_name = nntr_cfg.value("ple_file_name", "");
@@ -833,7 +838,8 @@ void Gemma4_E2B_QNN::run(const WSTR prompt, bool /*do_sample*/,
     kv_len += 1;
     token = sample(std::get<uint16_t *>(outputs.back()), vocab_size,
                    _input.data(), _input.size(), logit_scale, logit_offset,
-                   repetition_penalty, temperature, top_p, top_k);
+                   repetition_penalty, temperature, top_p, top_k,
+                   final_logit_softcapping);
     output.push_back(token);
 
     bool reached_eos = false;

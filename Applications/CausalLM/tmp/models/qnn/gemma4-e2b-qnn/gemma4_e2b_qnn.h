@@ -166,6 +166,9 @@ private:
   float              repetition_penalty;
   float              logit_scale;
   int                logit_offset;
+  // Gemma soft-cap on final logits. config.json key:
+  // "final_logit_softcapping": 30.0. 0 disables the cap.
+  float              final_logit_softcapping = 0.0f;
 
   std::string lora_path;
   std::string ple_file_name;

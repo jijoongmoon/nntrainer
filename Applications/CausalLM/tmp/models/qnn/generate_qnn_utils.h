@@ -40,6 +40,7 @@ uint16_t *get_zero_memory (int size, int zero_point);
 
 int sample (uint16_t *pointer, int length, int *tokens, int number_of_tokens,
     float logit_scale, int logit_offset, float repetition_penalty,
-    float temperature, float top_p, int top_k);
+    float temperature, float top_p, int top_k,
+    float final_logit_softcapping = 0.0f);
 
 #endif // __GENERATE_QNN_UTILS_HPP__
