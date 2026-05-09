@@ -405,6 +405,34 @@ void Gemma4_E2B_QNN::fill_generation_ple_(int token_id) {
             generation_per_layer_offset_[l],
             generation_per_layer_dst_[l]);
       }
+      // ── Debug: dump token's first decoded nibbles + scales (once) ──
+      static bool dbg_done = false;
+      if (!dbg_done) {
+        dbg_done = true;
+        std::cout << "[PLE-S4-DBG] token=" << token_id
+                  << " row_offset=" << (size_t)token_id * ple_row_bytes_
+                  << "\n[PLE-S4-DBG] L0 row_scale=" << row_scales[0]
+                  << " L1=" << row_scales[1]
+                  << " L17=" << row_scales[17]
+                  << " L34=" << row_scales[34] << "\n";
+        std::cout << "[PLE-S4-DBG] L0 raw bytes [0..7]: ";
+        for (int i = 0; i < 8; ++i)
+          std::cout << std::hex << (int)row[i] << " ";
+        std::cout << std::dec
+                  << "\n[PLE-S4-DBG] L0 nibbles s4 [0..15]: ";
+        for (int i = 0; i < 8; ++i) {
+          int lo = s4(row[i] & 0x0F);
+          int hi = s4((row[i] >> 4) & 0x0F);
+          std::cout << lo << " " << hi << " ";
+        }
+        std::cout << "\n[PLE-S4-DBG] L0 dst u16 [0..7]: ";
+        for (int i = 0; i < 8; ++i)
+          std::cout << generation_per_layer_dst_[0][i] << " ";
+        std::cout << "\n[PLE-S4-DBG] L0 consumer scale="
+                  << generation_per_layer_scale_[0]
+                  << " offset=" << generation_per_layer_offset_[0]
+                  << "\n";
+      }
     } else {
       for (size_t l = 0; l < L_gen; ++l) {
         dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,

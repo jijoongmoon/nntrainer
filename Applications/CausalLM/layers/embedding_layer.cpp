@@ -461,6 +461,33 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
               "EmbeddingLayer sfixed4 mode: unsupported output dtype");
           }
         }
+        // ── Debug: dump first dequant for token 0 (forwarding once) ──
+        static bool dbg_s4 = false;
+        if (!dbg_s4 && b == 0 && seq_len > 0) {
+          dbg_s4 = true;
+          const size_t t0 = static_cast<size_t>(in_data[0]);
+          if (t0 < in_dim) {
+            const uint8_t *r = packed + bytes_per_row * t0;
+            std::cout << "[EMB-S4-DBG] token=" << t0
+                      << " row_scale=" << row_scales[t0]
+                      << " has_out_quant=" << has_out_quant
+                      << " out_scale=" << out_scale
+                      << " out_offset=" << out_offset << "\n";
+            std::cout << "[EMB-S4-DBG] raw bytes [0..7]: ";
+            for (int k = 0; k < 8; ++k)
+              std::cout << std::hex << (int)r[k] << " ";
+            std::cout << std::dec
+                      << "\n[EMB-S4-DBG] nibbles s4 [0..15]: ";
+            for (int k = 0; k < 8; ++k) {
+              std::cout << s4(r[k] & 0x0F) << " "
+                        << s4((r[k] >> 4) & 0x0F) << " ";
+            }
+            std::cout << "\n[EMB-S4-DBG] dst u16 [0..7]: ";
+            uint16_t *p = batchsliced_hidden.getData<uint16_t>();
+            for (int k = 0; k < 8; ++k) std::cout << p[k] << " ";
+            std::cout << "\n";
+          }
+        }
       }
       return;
     }
