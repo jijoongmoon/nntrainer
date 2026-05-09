@@ -758,6 +758,10 @@ void Gemma4_E2B_QNN::initialize() {
         }
         std::cout << "] → row_len=" << gen_key_info.dimensions.back()
                   << " columns(dim[2])=" << gen_key_info.dimensions[2]
+                  << " dtype=" << gen_key_info.data_type
+                  << " scale=" << gen_key_info.scale
+                  << " offset=" << gen_key_info.offset
+                  << " size_bytes=" << GraphParser::get_tensor_size(gen_key_info)
                   << "\n";
         const auto &gen_val_info = GraphParser::get_tensor_info_or_throw(
             generation_graph_info.raw_inputs, kv_names[1]);
@@ -766,7 +770,11 @@ void Gemma4_E2B_QNN::initialize() {
           if (i) std::cout << ",";
           std::cout << gen_val_info.dimensions[i];
         }
-        std::cout << "]\n";
+        std::cout << "] dtype=" << gen_val_info.data_type
+                  << " scale=" << gen_val_info.scale
+                  << " offset=" << gen_val_info.offset
+                  << " size_bytes=" << GraphParser::get_tensor_size(gen_val_info)
+                  << "\n";
       }
     }
 
