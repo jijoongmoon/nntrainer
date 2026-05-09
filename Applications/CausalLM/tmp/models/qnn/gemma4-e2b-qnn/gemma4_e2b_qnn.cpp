@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -858,6 +859,21 @@ void Gemma4_E2B_QNN::initialize() {
       generation_graph_info.raw_outputs, "logits");
   logit_scale  = logits_info.scale;
   logit_offset = logits_info.offset;
+  std::cout << "[LOGIT-DBG] dtype=" << logits_info.data_type
+            << " scale=" << logit_scale
+            << " offset=" << logit_offset
+            << " | final_logit_softcapping=" << final_logit_softcapping
+            << std::endl;
+  // Diagnostic experiment: disable our externally-applied softcap if the
+  // QNN graph already applies it internally (double-softcap would flatten
+  // the distribution and produce structured-but-mixed-language gibberish).
+  // Toggle by env var GEMMA4_DISABLE_SOFTCAP=1 to test.
+  if (const char *env = std::getenv("GEMMA4_DISABLE_SOFTCAP");
+      env && env[0] == '1') {
+    std::cout << "[LOGIT-DBG] GEMMA4_DISABLE_SOFTCAP=1 → forcing softcap=0"
+              << std::endl;
+    final_logit_softcapping = 0.0f;
+  }
 
   initialize_kv_cache();
 
