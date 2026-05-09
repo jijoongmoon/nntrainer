@@ -854,6 +854,17 @@ void Gemma4_E2B_QNN::initialize() {
        this->prefill_output_kv_bindings.size(),
        this->generation_output_kv_bindings.size());
 
+  // ── Debug: dump prefill/gen output KV bindings (layer indices) ──
+  std::cout << "[KV-OUT-DBG] prefill output KV layers (key only): ";
+  for (const auto &b : prefill_output_kv_bindings)
+    if (b.is_key) std::cout << b.layer_index << " ";
+  std::cout << "\n[KV-OUT-DBG] generation output KV layers (key only): ";
+  for (const auto &b : generation_output_kv_bindings)
+    if (b.is_key) std::cout << b.layer_index << " ";
+  std::cout << "\n[KV-OUT-DBG] prefill bindings count=" << prefill_output_kv_bindings.size()
+            << " generation bindings count=" << generation_output_kv_bindings.size()
+            << std::endl;
+
   // ── Logit dequant params (overrides setupParameters defaults) ──
   const auto &logits_info = GraphParser::get_tensor_info_or_throw(
       generation_graph_info.raw_outputs, "logits");
