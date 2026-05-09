@@ -374,6 +374,21 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
           std::memcpy(dst, table + embed_idx * out_dim,
                       out_dim * sizeof(uint16_t));
         }
+        // ── Debug: dump first 4 elems for first 32 tokens (raw u16) ──
+        static bool dbg_u16_done = false;
+        if (!dbg_u16_done && b == 0) {
+          dbg_u16_done = true;
+          uint16_t *p = batchsliced_hidden.getData<uint16_t>();
+          const int n_dump = std::min<int>(32, (int)seq_len);
+          for (int i = 0; i < n_dump; ++i) {
+            const size_t tid = static_cast<size_t>(in_data[i]);
+            std::cout << "[EMB-U16-DBG] pos=" << i << " tok=" << tid
+                      << " emb[0..3]=";
+            for (int k = 0; k < 4; ++k)
+              std::cout << p[i * out_dim + k] << " ";
+            std::cout << "\n";
+          }
+        }
       }
       return;
     }
@@ -461,30 +476,18 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
               "EmbeddingLayer sfixed4 mode: unsupported output dtype");
           }
         }
-        // ── Debug: dump first dequant for token 0 (forwarding once) ──
+        // ── Debug: dump first 32 tokens' embedding (sfixed4) ──
         static bool dbg_s4 = false;
-        if (!dbg_s4 && b == 0 && seq_len > 0) {
+        if (!dbg_s4 && b == 0) {
           dbg_s4 = true;
-          const size_t t0 = static_cast<size_t>(in_data[0]);
-          if (t0 < in_dim) {
-            const uint8_t *r = packed + bytes_per_row * t0;
-            std::cout << "[EMB-S4-DBG] token=" << t0
-                      << " row_scale=" << row_scales[t0]
-                      << " has_out_quant=" << has_out_quant
-                      << " out_scale=" << out_scale
-                      << " out_offset=" << out_offset << "\n";
-            std::cout << "[EMB-S4-DBG] raw bytes [0..7]: ";
-            for (int k = 0; k < 8; ++k)
-              std::cout << std::hex << (int)r[k] << " ";
-            std::cout << std::dec
-                      << "\n[EMB-S4-DBG] nibbles s4 [0..15]: ";
-            for (int k = 0; k < 8; ++k) {
-              std::cout << s4(r[k] & 0x0F) << " "
-                        << s4((r[k] >> 4) & 0x0F) << " ";
-            }
-            std::cout << "\n[EMB-S4-DBG] dst u16 [0..7]: ";
-            uint16_t *p = batchsliced_hidden.getData<uint16_t>();
-            for (int k = 0; k < 8; ++k) std::cout << p[k] << " ";
+          uint16_t *p = batchsliced_hidden.getData<uint16_t>();
+          const int n_dump = std::min<int>(32, (int)seq_len);
+          for (int i = 0; i < n_dump; ++i) {
+            const size_t tid = static_cast<size_t>(in_data[i]);
+            std::cout << "[EMB-S4-DBG] pos=" << i << " tok=" << tid
+                      << " emb[0..3]=";
+            for (int k = 0; k < 4; ++k)
+              std::cout << p[i * out_dim + k] << " ";
             std::cout << "\n";
           }
         }
@@ -573,10 +576,18 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
       if (!dbg_first && b == 0) {
         dbg_first = true;
         uint16_t *p = batchsliced_hidden.getData<uint16_t>();
-        std::cout << "[EMB-DBG] token 0 first 8 elems: ";
-        for (int j = 0; j < 8; ++j)
-          std::cout << p[j] << " ";
-        std::cout << std::endl;
+        // Dump first 32 tokens' embedding so user can compare per-token
+        // values across ufixed8 vs uint16 modes (look for divergence on
+        // specific token IDs like the ones for "/4" digits).
+        const int n_dump = std::min<int>(32, (int)seq_len);
+        for (int i = 0; i < n_dump; ++i) {
+          const size_t tid = static_cast<size_t>(in_data[i]);
+          std::cout << "[EMB-U8-DBG] pos=" << i << " tok=" << tid
+                    << " emb[0..3]=";
+          for (int k = 0; k < 4; ++k)
+            std::cout << p[i * out_dim + k] << " ";
+          std::cout << "\n";
+        }
       }
     }
     return;
