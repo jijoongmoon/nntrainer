@@ -655,15 +655,9 @@ void Gemma4_E2B_QNN::initialize() {
   allocated_ptrs_.insert (position_ids_sin);
 
   // ── Sliding window RoPE (default = no scaling) ──
-  // HF Gemma 3/4 share a single RotaryEmbedding instance between full and
-  // sliding attention, so the partial_rotary_factor read from
-  // rope_parameters.full_attention applies to BOTH paths. Setting it to
-  // 1.0 here would over-rotate the non-rotary lanes of the sliding head
-  // and accumulate noise across layers, producing structured-but-garbled
-  // output as the SWA path dominates short-range attention.
   std::tuple<uint16_t *, uint16_t *> swa_cos_sin_tuple
       = get_cos_sin (rope_cache_seq_len, swa_pos_dim, rope_theta_sliding,
-          rope_type_sliding, rope_partial_factor, /*scaling=*/1.0);
+          rope_type_sliding, /*partial=*/1.0, /*scaling=*/1.0);
   swa_position_ids_cos = std::get<0> (swa_cos_sin_tuple);
   swa_position_ids_sin = std::get<1> (swa_cos_sin_tuple);
   allocated_ptrs_.insert (swa_position_ids_cos);
