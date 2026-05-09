@@ -294,6 +294,16 @@ causallm::Quick_Dot_AI_QNN::initialize ()
           input_size *= input_shape[i];
         }
 
+        // ── Debug: dump inputs_embeds tensor quant params ──
+        std::cout << "[EMB-IN-DBG] graph=" << graph_name
+                  << " name=" << tensor_name
+                  << " dtype=" << tensor_object.data_type
+                  << " scale=" << format_float_precise(tensor_object.scale)
+                  << " offset=" << tensor_object.offset
+                  << " shape=" << input_shape_string
+                  << ":" << input_shape.back()
+                  << std::endl;
+
         // Use the CausalLM tensorwise-4bit-aware embedding layer.
         // When `embedding_file_name` points at a JSON manifest with a
         // 4-bit packed LUT, the layer loads the table once via a
