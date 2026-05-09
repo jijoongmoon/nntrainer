@@ -71,6 +71,13 @@ private:
   std::vector<int>        prefill_per_layer_offset_;
   std::vector<float>      generation_per_layer_scale_;
   std::vector<int>        generation_per_layer_offset_;
+  // Model layer index that each prefill/generation `per_layer_inputs_N` slot
+  // corresponds to. Built from the integer `N` parsed from the tensor name
+  // (sorted ascending). The PLE binary file is laid out per model-layer 0..L-1
+  // per row, so source rows must be indexed by these model indices, NOT by
+  // the dense slot index.
+  std::vector<int>        prefill_per_layer_model_index_;
+  std::vector<int>        generation_per_layer_model_index_;
   std::vector<uint8_t> prefill_kv_zero_byte_;
 
   void open_ple_file_();

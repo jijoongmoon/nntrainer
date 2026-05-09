@@ -337,6 +337,12 @@ void Gemma4_E2B_QNN::fill_prefill_ple_chunk_(const std::vector<int> &tokens,
   const size_t per_layer_elems = ple_per_layer_;
   const int    chunk_size_tokens = context_size;
 
+  // The PLE binary is laid out per model-layer (`ple_layers_` chunks of
+  // `per_layer_elems` per row). The prefill graph may expose a SUBSET of
+  // model layers via `per_layer_inputs_N`, so source rows MUST be indexed
+  // by the parsed N (model layer index), not by the dense slot index `l`.
+  const int *pre_layer_idx = prefill_per_layer_model_index_.data();
+
   if (ple_is_4bit_) {
     const size_t per_layer_bytes = per_layer_elems / 2;
     if (ple_is_signed4_) {
@@ -349,10 +355,11 @@ void Gemma4_E2B_QNN::fill_prefill_ple_chunk_(const std::vector<int> &tokens,
         const float *row_scales =
             scales + (size_t)token_id * ple_layers_;
         for (size_t l = 0; l < L_pre; ++l) {
+          const size_t ml = (size_t)pre_layer_idx[l];
           uint16_t *dst =
               prefill_per_layer_dst_[l] + (size_t)t * per_layer_elems;
           dequant_sfixed4_requant_u16(
-              row + l * per_layer_bytes, per_layer_elems, row_scales[l],
+              row + ml * per_layer_bytes, per_layer_elems, row_scales[ml],
               prefill_per_layer_scale_[l],
               prefill_per_layer_offset_[l], dst);
         }
@@ -363,9 +370,10 @@ void Gemma4_E2B_QNN::fill_prefill_ple_chunk_(const std::vector<int> &tokens,
         const int token_id = (t < chunk_len) ? tokens[abs_idx] : padding_token;
         const uint8_t *row = ple_mmap_ + (size_t)token_id * ple_row_bytes_;
         for (size_t l = 0; l < L_pre; ++l) {
+          const size_t ml = (size_t)pre_layer_idx[l];
           uint16_t *dst =
               prefill_per_layer_dst_[l] + (size_t)t * per_layer_elems;
-          dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
+          dequant_nibbles_requant_u16(row + ml * per_layer_bytes, per_layer_elems,
                                       ple_scale_, ple_offset_,
                                       prefill_per_layer_scale_[l],
                                       prefill_per_layer_offset_[l], dst);
@@ -379,8 +387,9 @@ void Gemma4_E2B_QNN::fill_prefill_ple_chunk_(const std::vector<int> &tokens,
       const int token_id = (t < chunk_len) ? tokens[abs_idx] : padding_token;
       const uint16_t *row = ple_u16_mmap_ + (size_t)token_id * ple_row_elems_;
       for (size_t l = 0; l < L_pre; ++l) {
+        const size_t ml = (size_t)pre_layer_idx[l];
         uint16_t *dst = prefill_per_layer_dst_[l] + (size_t)t * per_layer_elems;
-        std::memcpy(dst, row + l * per_layer_elems,
+        std::memcpy(dst, row + ml * per_layer_elems,
                     per_layer_elems * sizeof(uint16_t));
       }
     }
@@ -391,6 +400,7 @@ void Gemma4_E2B_QNN::fill_generation_ple_(int token_id) {
   if (!ple_mmap_) return;
   const size_t L_gen = generation_per_layer_dst_.size();
   const size_t per_layer_elems = ple_per_layer_;
+  const int *gen_layer_idx = generation_per_layer_model_index_.data();
 
   if (ple_is_4bit_) {
     const size_t per_layer_bytes = per_layer_elems / 2;
@@ -399,8 +409,9 @@ void Gemma4_E2B_QNN::fill_generation_ple_(int token_id) {
       const float *row_scales =
           ple_row_layer_scales_.data() + (size_t)token_id * ple_layers_;
       for (size_t l = 0; l < L_gen; ++l) {
+        const size_t ml = (size_t)gen_layer_idx[l];
         dequant_sfixed4_requant_u16(
-            row + l * per_layer_bytes, per_layer_elems, row_scales[l],
+            row + ml * per_layer_bytes, per_layer_elems, row_scales[ml],
             generation_per_layer_scale_[l],
             generation_per_layer_offset_[l],
             generation_per_layer_dst_[l]);
@@ -435,7 +446,8 @@ void Gemma4_E2B_QNN::fill_generation_ple_(int token_id) {
       }
     } else {
       for (size_t l = 0; l < L_gen; ++l) {
-        dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
+        const size_t ml = (size_t)gen_layer_idx[l];
+        dequant_nibbles_requant_u16(row + ml * per_layer_bytes, per_layer_elems,
                                     ple_scale_, ple_offset_,
                                     generation_per_layer_scale_[l],
                                     generation_per_layer_offset_[l],
@@ -445,8 +457,9 @@ void Gemma4_E2B_QNN::fill_generation_ple_(int token_id) {
   } else {
     const uint16_t *row = ple_u16_mmap_ + (size_t)token_id * ple_row_elems_;
     for (size_t l = 0; l < L_gen; ++l) {
+      const size_t ml = (size_t)gen_layer_idx[l];
       std::memcpy(generation_per_layer_dst_[l],
-                  row + l * per_layer_elems,
+                  row + ml * per_layer_elems,
                   per_layer_elems * sizeof(uint16_t));
     }
   }
@@ -637,7 +650,8 @@ void Gemma4_E2B_QNN::initialize() {
   auto collect_per_layer = [] (const GraphInfo &gi,
                                std::vector<ml::train::TensorDim::IO_TensorType> &inputs,
                                std::vector<uint16_t *> &dsts,
-                               std::vector<float> &scales, std::vector<int> &offsets) {
+                               std::vector<float> &scales, std::vector<int> &offsets,
+                               std::vector<int> &model_indices) {
     std::map<int, std::tuple<uint16_t *, float, int>> by_index;
     for (size_t idx = 0; idx < gi.raw_inputs.size(); ++idx) {
       const auto &[name, info] = gi.raw_inputs[idx];
@@ -651,7 +665,9 @@ void Gemma4_E2B_QNN::initialize() {
     dsts.clear();
     scales.clear ();
     offsets.clear ();
+    model_indices.clear();
     for (auto &kv : by_index) {
+      model_indices.push_back(kv.first);
       dsts.push_back(std::get<0>(kv.second));
       scales.push_back(std::get<1>(kv.second));
       offsets.push_back(std::get<2>(kv.second));
@@ -659,14 +675,21 @@ void Gemma4_E2B_QNN::initialize() {
   };
   collect_per_layer(prefill_graph_info, prefill_inputs,
                     prefill_per_layer_dst_, prefill_per_layer_scale_,
-                    prefill_per_layer_offset_);
+                    prefill_per_layer_offset_,
+                    prefill_per_layer_model_index_);
   collect_per_layer(generation_graph_info, generation_inputs,
                     generation_per_layer_dst_, generation_per_layer_scale_,
-                    generation_per_layer_offset_);
+                    generation_per_layer_offset_,
+                    generation_per_layer_model_index_);
 
   std::cout << "[PLE] prefill slots=" << prefill_per_layer_dst_.size()
             << " generation slots=" << generation_per_layer_dst_.size()
             << std::endl;
+  std::cout << "[PLE] prefill model indices: ";
+  for (int n : prefill_per_layer_model_index_) std::cout << n << " ";
+  std::cout << "\n[PLE] generation model indices: ";
+  for (int n : generation_per_layer_model_index_) std::cout << n << " ";
+  std::cout << std::endl;
 
   open_ple_file_();
 
