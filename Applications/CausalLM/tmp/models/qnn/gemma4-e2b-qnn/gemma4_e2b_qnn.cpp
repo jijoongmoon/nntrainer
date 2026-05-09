@@ -865,6 +865,36 @@ void Gemma4_E2B_QNN::initialize() {
             << " generation bindings count=" << generation_output_kv_bindings.size()
             << std::endl;
 
+  // ── Debug: dump prefill OUTPUT past_key shapes (sliding & full layers) ──
+  // Confirms whether the output is per-chunk [head_dim, 256] or full
+  // updated cache [head_dim, 7936+] or something else. The append code
+  // assumes per-chunk with src_row_length=context_size=256.
+  std::cout << "[KV-OUT-SHAPE-DBG] prefill output K shapes: ";
+  for (const auto &b : prefill_output_kv_bindings) {
+    if (!b.is_key) continue;
+    if (b.layer_index > 5 && b.layer_index != 14) continue;
+    const auto &info = prefill_graph_info.raw_outputs[b.output_index].second;
+    std::cout << "L" << b.layer_index << "=[";
+    for (size_t i = 0; i < info.dimensions.size(); ++i) {
+      if (i) std::cout << ",";
+      std::cout << info.dimensions[i];
+    }
+    std::cout << "] ";
+  }
+  std::cout << "\n[KV-OUT-SHAPE-DBG] generation output K shapes: ";
+  for (const auto &b : generation_output_kv_bindings) {
+    if (!b.is_key) continue;
+    if (b.layer_index > 5 && b.layer_index != 14) continue;
+    const auto &info = generation_graph_info.raw_outputs[b.output_index].second;
+    std::cout << "L" << b.layer_index << "=[";
+    for (size_t i = 0; i < info.dimensions.size(); ++i) {
+      if (i) std::cout << ",";
+      std::cout << info.dimensions[i];
+    }
+    std::cout << "] ";
+  }
+  std::cout << std::endl;
+
   // ── Logit dequant params (overrides setupParameters defaults) ──
   const auto &logits_info = GraphParser::get_tensor_info_or_throw(
       generation_graph_info.raw_outputs, "logits");
