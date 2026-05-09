@@ -562,6 +562,23 @@ void Gemma4_E2B_QNN::initialize() {
   swa_pos_dim = GraphParser::get_tensor_info_or_throw(
       prefill_graph_info.raw_inputs, "swa_position_ids_cos").dimensions.back();
 
+  // ── Debug: confirm prefill and generation share the same pos/swa dims ──
+  {
+    const int gen_pos = GraphParser::get_tensor_info_or_throw(
+        generation_graph_info.raw_inputs, "position_ids_cos")
+        .dimensions.back();
+    const int gen_swa = GraphParser::get_tensor_info_or_throw(
+        generation_graph_info.raw_inputs, "swa_position_ids_cos")
+        .dimensions.back();
+    std::cout << "[ROPE-DBG] prefill pos_dim=" << pos_dim
+              << " gen pos_dim=" << gen_pos
+              << " | prefill swa_pos_dim=" << swa_pos_dim
+              << " gen swa_pos_dim=" << gen_swa << std::endl;
+    if (gen_pos != pos_dim || gen_swa != swa_pos_dim)
+      std::cout << "[ROPE-DBG] !!! prefill/gen position dims DIFFER !!!"
+                << std::endl;
+  }
+
   rope_cache_seq_len = std::max(max_seq_len, generation_attention_mask_elements);
 
   // ── Bind input tensor pointers ──
@@ -729,6 +746,26 @@ void Gemma4_E2B_QNN::initialize() {
           generation_graph_info.raw_inputs, kv_names[0]);
       this->kv_row_lengths.push_back(gen_key_info.dimensions.back());
       this->kv_columns.push_back(gen_key_info.dimensions[2]);
+
+      // ── Debug: dump KV tensor shape for first 3 + last layer ──
+      if (layer < 3 || layer == 34) {
+        std::cout << "[KV-DBG] layer " << layer << " key dims=[";
+        for (size_t i = 0; i < gen_key_info.dimensions.size(); ++i) {
+          if (i) std::cout << ",";
+          std::cout << gen_key_info.dimensions[i];
+        }
+        std::cout << "] → row_len=" << gen_key_info.dimensions.back()
+                  << " columns(dim[2])=" << gen_key_info.dimensions[2]
+                  << "\n";
+        const auto &gen_val_info = GraphParser::get_tensor_info_or_throw(
+            generation_graph_info.raw_inputs, kv_names[1]);
+        std::cout << "[KV-DBG] layer " << layer << " val dims=[";
+        for (size_t i = 0; i < gen_val_info.dimensions.size(); ++i) {
+          if (i) std::cout << ",";
+          std::cout << gen_val_info.dimensions[i];
+        }
+        std::cout << "]\n";
+      }
     }
 
     for (const auto &name : kv_names) {
