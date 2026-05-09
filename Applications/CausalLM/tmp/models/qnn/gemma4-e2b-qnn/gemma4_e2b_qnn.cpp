@@ -734,6 +734,8 @@ void Gemma4_E2B_QNN::initialize() {
     kv_layer_count++;
   }
 
+  std::cout << "[KV-DBG] kv_layer_count=" << kv_layer_count
+            << " (num_hidden_layers=" << num_hidden_layers << ")" << std::endl;
   LOGD("KV layer count = %d (num_hidden_layers config = %d)", kv_layer_count, num_hidden_layers);
   for(int layer=0; layer<kv_layer_count;++layer){
     const std::vector<std::string> kv_names = {
@@ -747,8 +749,8 @@ void Gemma4_E2B_QNN::initialize() {
       this->kv_row_lengths.push_back(gen_key_info.dimensions.back());
       this->kv_columns.push_back(gen_key_info.dimensions[2]);
 
-      // ── Debug: dump KV tensor shape for first 3 + last layer ──
-      if (layer < 3 || layer == 34) {
+      // ── Debug: dump KV tensor shape for first 6 + last layer ──
+      if (layer < 6 || layer + 1 == kv_layer_count) {
         std::cout << "[KV-DBG] layer " << layer << " key dims=[";
         for (size_t i = 0; i < gen_key_info.dimensions.size(); ++i) {
           if (i) std::cout << ",";
