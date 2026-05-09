@@ -997,19 +997,31 @@ void Gemma4_E2B_QNN::run(const WSTR prompt, bool /*do_sample*/,
 
     fill_attention_mask_with_length(context_size, prefill_attention_mask_columns,
                                     chunk_len, attention_mask);
-    fill_attention_mask_with_prev_length(context_size,
-                                         prefill_attention_mask_columns,
-                                         std::min(kv_len,
-                                                  generation_full_kv_past_length),
-                                         attention_mask);
+    // Past KV cap MUST reserve the trailing `context_size` cols for the
+    // current chunk's causal triangle (those cols are written by
+    // fill_attention_mask_with_length above). Using
+    // generation_full_kv_past_length here would overlap chunk cols when
+    // kv_len > prefill_attention_mask_columns - context_size, corrupting
+    // the mask on multi-chunk prefill. Match Gauss 3.6 convention:
+    //   past_max = mask_columns - context_size
+    {
+      const int prefill_full_past_max =
+          prefill_attention_mask_columns - context_size;
+      fill_attention_mask_with_prev_length(
+          context_size, prefill_attention_mask_columns,
+          std::min(kv_len, prefill_full_past_max), attention_mask);
+    }
     fill_attention_mask_with_length(context_size,
                                     prefill_sliding_attention_mask_columns,
                                     chunk_len, sliding_attention_mask);
-    fill_attention_mask_with_prev_length(context_size,
-                                         prefill_sliding_attention_mask_columns,
-                                         std::min(kv_len,
-                                                  generation_sliding_kv_past_length),
-                                         sliding_attention_mask);
+    {
+      const int prefill_sliding_past_max =
+          prefill_sliding_attention_mask_columns - context_size;
+      fill_attention_mask_with_prev_length(
+          context_size, prefill_sliding_attention_mask_columns,
+          std::min(kv_len, prefill_sliding_past_max),
+          sliding_attention_mask);
+    }
 
     std::fill_n(prefill_position_ids_cos, context_size * pos_dim, 65535);
     std::fill_n(prefill_position_ids_sin, context_size * pos_dim, 32768);
