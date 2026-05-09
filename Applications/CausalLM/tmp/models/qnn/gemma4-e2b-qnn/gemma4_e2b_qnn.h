@@ -39,27 +39,31 @@ public:
 
 private:
   // -------------------------------------------------------------------
-  // PLE: dual-mode (auto-detected from `ple_file_name` extension).
-  //   *.json  → 4-bit packed LUT manifest. Per-token rows hold
-  //             `ple_row_elems` 4-bit values (2 packed per byte). The
-  //             host dequantizes (lut scale/offset) and requantizes
-  //             into each layer's UINT16 consumer space at fill time.
-  //   else    → raw UINT16 binary. Each per-token row holds
-  //             `ple_row_elems` uint16 values already in the
-  //             consumer's quant space. Per-layer fill is a straight
-  //             memcpy with no dequant/requant.
+  // PLE: tri-mode (auto-detected from `ple_file_name` + manifest
+  // datatype).
+  //   *.json + datatype="ufixed8" → tensorwise 4-bit (legacy):
+  //       single (ple_scale_, ple_offset_) for the whole table.
+  //   *.json + datatype="sfixed4" → per-row-per-layer signed 4-bit:
+  //       ple_row_layer_scales_[token_id*num_layers + layer] is the
+  //       float scale, no offset, sign-extend the 4-bit nibble.
+  //   any other extension → raw UINT16 binary (already in each
+  //       layer's consumer quant space; per-layer fill is a memcpy).
   // -------------------------------------------------------------------
-  bool           ple_is_4bit_    = false;
-  int            ple_fd_         = -1;
-  const uint8_t *ple_mmap_       = nullptr;  // 4-bit byte view
-  const uint16_t *ple_u16_mmap_  = nullptr;  // raw uint16 view
-  size_t         ple_file_size_  = 0;
-  float          ple_scale_      = 1.0f;     // 4-bit only
-  int            ple_offset_     = 0;        // 4-bit only
-  size_t         ple_row_elems_  = 0;
-  size_t         ple_row_bytes_  = 0;
-  size_t         ple_layers_     = 0;
-  size_t         ple_per_layer_  = 0;
+  bool           ple_is_4bit_     = false;
+  bool           ple_is_signed4_  = false;   // sfixed4 (per-row-per-layer)
+  int            ple_fd_          = -1;
+  const uint8_t *ple_mmap_        = nullptr; // 4-bit byte view
+  const uint16_t *ple_u16_mmap_   = nullptr; // raw uint16 view
+  size_t         ple_file_size_   = 0;
+  float          ple_scale_       = 1.0f;    // ufixed8 only
+  int            ple_offset_      = 0;       // ufixed8 only
+  // sfixed4: per-token per-layer scales. Layout is row-major
+  // [vocab][num_layers]; index with token_id * ple_layers_ + layer.
+  std::vector<float> ple_row_layer_scales_;
+  size_t         ple_row_elems_   = 0;
+  size_t         ple_row_bytes_   = 0;
+  size_t         ple_layers_      = 0;
+  size_t         ple_per_layer_   = 0;
 
   std::vector<uint16_t *> prefill_per_layer_dst_;     // 14
   std::vector<uint16_t *> generation_per_layer_dst_;  // 35

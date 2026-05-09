@@ -89,28 +89,40 @@ public:
 } // namespace props
 
 /**
- * @brief Embedding LUT shared across networks. Two on-disk formats are
- *        supported, auto-detected from the path passed in:
+ * @brief Embedding LUT shared across networks. Three on-disk formats are
+ *        supported, auto-detected from the path / manifest contents:
  *
- *        - `*.json` manifest → 4-bit packed mode. `bytes` holds nibble-
- *          packed bytes (low nibble first) of length
- *          ceil(in_dim * out_dim / 2). Per-token forward dequantizes
- *          (and optionally requantizes) into the consumer's space.
+ *        - `*.json` manifest with `datatype: "ufixed8"` → tensorwise
+ *          4-bit packed mode (legacy). `bytes` holds nibble-packed
+ *          uint4 values; one (scale, offset) for the whole table.
+ *
+ *        - `*.json` manifest with `datatype: "sfixed4"` → rowwise
+ *          signed-4-bit mode (per-row symmetric, no offset). `bytes`
+ *          holds nibble-packed int4 values; `row_scales[token_id]`
+ *          carries one float per vocab row.
  *
  *        - any other extension → raw UINT16 mode. `bytes` holds
- *          in_dim * out_dim * 2 bytes that are already in the consumer's
- *          quant space. Per-token forward is a straight memcpy.
+ *          in_dim * out_dim * 2 bytes already in the consumer's
+ *          quant space; per-token forward is a straight memcpy.
  *
- *        In raw mode `scale`/`offset` are unused; in 4-bit mode they are
- *        the LUT-space quant params from the manifest.
- *
- *        Lives in a path-keyed weak cache so two graphs that load the
- *        same file see the same in-memory table.
+ *        Lives in a path-keyed weak cache so two graphs that load
+ *        the same file see the same in-memory table.
  */
 struct QuantLut {
   std::vector<uint8_t> bytes;
+
+  // Tensorwise quant params (ufixed8). Used when `row_scales` is empty.
   float scale = 1.0f;
   int offset = 0;
+
+  // Per-row quant params (sfixed4 rowwise). When non-empty, takes
+  // precedence; size == in_dim.
+  std::vector<float> row_scales;
+
+  // Signed 4-bit (-8..7, sign-extended from the low/high nibble) vs
+  // unsigned 4-bit (0..15). Independent of tensorwise vs rowwise.
+  bool is_signed4 = false;
+
   size_t in_dim = 0;  ///< vocab size (rows)
   size_t out_dim = 0; ///< per-token feature dim (cols)
   bool is_raw_u16 = false;

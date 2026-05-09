@@ -104,6 +104,7 @@ void copy_kv_cache_window(uint8_t *dest, int dest_row_length,
 }
 
 // PLE 4-bit packed → uint16 (QNN consumer space) two-step requant.
+// ufixed8 path: f = (q4bit + lut_offset) * lut_scale.
 inline void dequant_nibbles_requant_u16(const uint8_t *packed, size_t elems,
                                         float lut_scale, int lut_offset,
                                         float out_scale, int out_offset,
@@ -111,6 +112,31 @@ inline void dequant_nibbles_requant_u16(const uint8_t *packed, size_t elems,
   const float inv_out = 1.0f / out_scale;
   auto requant = [&](uint8_t nib) -> uint16_t {
     const float f = (static_cast<float>(nib) + lut_offset) * lut_scale;
+    int q = static_cast<int>(std::lrintf(f * inv_out)) - out_offset;
+    return static_cast<uint16_t>(std::max(0, std::min(65535, q)));
+  };
+  const size_t whole = elems / 2;
+  for (size_t i = 0; i < whole; ++i) {
+    const uint8_t b = packed[i];
+    dst[2 * i]     = requant(b & 0x0F);
+    dst[2 * i + 1] = requant((b >> 4) & 0x0F);
+  }
+  if (elems & 1) dst[2 * whole] = requant(packed[whole] & 0x0F);
+}
+
+// Sign-extend a 4-bit value (0..15 → -8..7).
+inline int s4(unsigned nib) {
+  return (nib & 0x8u) ? static_cast<int>(nib) - 16 : static_cast<int>(nib);
+}
+
+// PLE sfixed4 (per-row-per-layer) → uint16 requant. f = s4(nib) * row_scale.
+inline void dequant_sfixed4_requant_u16(const uint8_t *packed, size_t elems,
+                                         float row_scale,
+                                         float out_scale, int out_offset,
+                                         uint16_t *dst) {
+  const float inv_out = 1.0f / out_scale;
+  auto requant = [&](unsigned nib) -> uint16_t {
+    const float f = static_cast<float>(s4(nib)) * row_scale;
     int q = static_cast<int>(std::lrintf(f * inv_out)) - out_offset;
     return static_cast<uint16_t>(std::max(0, std::min(65535, q)));
   };
@@ -155,7 +181,7 @@ void Gemma4_E2B_QNN::open_ple_file_() {
   ple_per_layer_ = 256;
 
   if (ple_is_4bit_) {
-    // ── 4-bit packed: read manifest, then mmap the referenced .bin ──
+    // ── 4-bit manifest: dispatch by `datatype` (ufixed8 / sfixed4) ──
     std::ifstream mf(ple_file_name);
     if (!mf.is_open())
       throw std::runtime_error("Failed to open PLE manifest: " + ple_file_name);
@@ -166,11 +192,10 @@ void Gemma4_E2B_QNN::open_ple_file_() {
     const std::string datatype = j.value("datatype", std::string("ufixed8"));
     const auto &qp             = j.at("quant-param");
 
-    if (datatype != "ufixed8")
-      throw std::runtime_error("PLE: only ufixed8 supported, got " + datatype);
+    ple_is_signed4_ = (datatype == "sfixed4");
+    if (!ple_is_signed4_ && datatype != "ufixed8")
+      throw std::runtime_error("PLE: unsupported datatype: " + datatype);
 
-    ple_scale_     = qp.at("scale").get<float>();
-    ple_offset_    = qp.at("offset").get<int>();
     ple_row_elems_ = static_cast<size_t>(row_elems);
     ple_row_bytes_ = (ple_row_elems_ + 1) / 2;
     ple_layers_    = ple_row_elems_ / ple_per_layer_;
@@ -179,6 +204,28 @@ void Gemma4_E2B_QNN::open_ple_file_() {
       throw std::runtime_error("PLE 'size' not divisible by 256");
     if (generation_per_layer_dst_.size() > ple_layers_)
       throw std::runtime_error("PLE layer count too small");
+
+    if (ple_is_signed4_) {
+      // Per-row-per-layer scale array; shape [vocab][layers] flat in
+      // row-major. No offset (symmetric).
+      const auto &scale_arr = qp.at("scale");
+      if (!scale_arr.is_array())
+        throw std::runtime_error(
+          "PLE sfixed4: quant-param.scale must be an array");
+      ple_row_layer_scales_.clear();
+      ple_row_layer_scales_.reserve(scale_arr.size());
+      for (const auto &v : scale_arr)
+        ple_row_layer_scales_.push_back(v.get<float>());
+      // Validate shape: must be a multiple of ple_layers_; vocab inferred.
+      if (ple_row_layer_scales_.size() % ple_layers_ != 0)
+        throw std::runtime_error(
+          "PLE sfixed4: scale array length not divisible by num_layers");
+      ple_scale_  = 1.0f; // unused
+      ple_offset_ = 0;    // unused
+    } else {
+      ple_scale_  = qp.at("scale").get<float>();
+      ple_offset_ = qp.at("offset").get<int>();
+    }
 
     std::string lut_abs =
         rebase_relative_to_model_file(lut_rel, ple_file_name);
@@ -197,6 +244,17 @@ void Gemma4_E2B_QNN::open_ple_file_() {
       throw std::runtime_error("PLE bin size not multiple of row bytes");
     }
 
+    // For sfixed4 the scale array's vocab dim must match the bin's row
+    // count; for ufixed8 there is no per-row scale to validate.
+    if (ple_is_signed4_) {
+      const size_t expected_vocab = ple_file_size_ / ple_row_bytes_;
+      const size_t scale_vocab    = ple_row_layer_scales_.size() / ple_layers_;
+      if (scale_vocab != expected_vocab)
+        throw std::runtime_error(
+          "PLE sfixed4 scale vocab=" + std::to_string(scale_vocab) +
+          " != bin vocab=" + std::to_string(expected_vocab));
+    }
+
     void *m = mmap(nullptr, ple_file_size_, PROT_READ, MAP_PRIVATE, ple_fd_, 0);
     if (m == MAP_FAILED) {
       ::close(ple_fd_); ple_fd_ = -1;
@@ -206,11 +264,18 @@ void Gemma4_E2B_QNN::open_ple_file_() {
 #ifdef POSIX_MADV_RANDOM
     posix_madvise((void *)ple_mmap_, ple_file_size_, POSIX_MADV_RANDOM);
 #endif
-    std::cout << "[PLE] 4-bit mmaped " << lut_abs
-              << " rows=" << (ple_file_size_ / ple_row_bytes_)
-              << " layers=" << ple_layers_ << " per_layer=" << ple_per_layer_
-              << " scale=" << ple_scale_ << " offset=" << ple_offset_
-              << std::endl;
+    if (ple_is_signed4_) {
+      std::cout << "[PLE] sfixed4 (rowwise+layerwise) mmaped " << lut_abs
+                << " rows=" << (ple_file_size_ / ple_row_bytes_)
+                << " layers=" << ple_layers_ << " per_layer=" << ple_per_layer_
+                << " scales=" << ple_row_layer_scales_.size() << std::endl;
+    } else {
+      std::cout << "[PLE] ufixed8 (tensorwise) mmaped " << lut_abs
+                << " rows=" << (ple_file_size_ / ple_row_bytes_)
+                << " layers=" << ple_layers_ << " per_layer=" << ple_per_layer_
+                << " scale=" << ple_scale_ << " offset=" << ple_offset_
+                << std::endl;
+    }
     return;
   }
 
@@ -274,16 +339,37 @@ void Gemma4_E2B_QNN::fill_prefill_ple_chunk_(const std::vector<int> &tokens,
 
   if (ple_is_4bit_) {
     const size_t per_layer_bytes = per_layer_elems / 2;
-    for (int t = 0; t < chunk_size_tokens; ++t) {
-      const int abs_idx  = chunk_idx * chunk_size_tokens + t;
-      const int token_id = (t < chunk_len) ? tokens[abs_idx] : padding_token;
-      const uint8_t *row = ple_mmap_ + (size_t)token_id * ple_row_bytes_;
-      for (size_t l = 0; l < L_pre; ++l) {
-        uint16_t *dst = prefill_per_layer_dst_[l] + (size_t)t * per_layer_elems;
-        dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
-                                    ple_scale_, ple_offset_,
-                                    prefill_per_layer_scale_[l],
-                                    prefill_per_layer_offset_[l], dst);
+    if (ple_is_signed4_) {
+      // sfixed4: per-row-per-layer scale lookup, signed nibble decode.
+      const float *scales = ple_row_layer_scales_.data();
+      for (int t = 0; t < chunk_size_tokens; ++t) {
+        const int abs_idx  = chunk_idx * chunk_size_tokens + t;
+        const int token_id = (t < chunk_len) ? tokens[abs_idx] : padding_token;
+        const uint8_t *row = ple_mmap_ + (size_t)token_id * ple_row_bytes_;
+        const float *row_scales =
+            scales + (size_t)token_id * ple_layers_;
+        for (size_t l = 0; l < L_pre; ++l) {
+          uint16_t *dst =
+              prefill_per_layer_dst_[l] + (size_t)t * per_layer_elems;
+          dequant_sfixed4_requant_u16(
+              row + l * per_layer_bytes, per_layer_elems, row_scales[l],
+              prefill_per_layer_scale_[l],
+              prefill_per_layer_offset_[l], dst);
+        }
+      }
+    } else {
+      for (int t = 0; t < chunk_size_tokens; ++t) {
+        const int abs_idx  = chunk_idx * chunk_size_tokens + t;
+        const int token_id = (t < chunk_len) ? tokens[abs_idx] : padding_token;
+        const uint8_t *row = ple_mmap_ + (size_t)token_id * ple_row_bytes_;
+        for (size_t l = 0; l < L_pre; ++l) {
+          uint16_t *dst =
+              prefill_per_layer_dst_[l] + (size_t)t * per_layer_elems;
+          dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
+                                      ple_scale_, ple_offset_,
+                                      prefill_per_layer_scale_[l],
+                                      prefill_per_layer_offset_[l], dst);
+        }
       }
     }
   } else {
@@ -309,12 +395,24 @@ void Gemma4_E2B_QNN::fill_generation_ple_(int token_id) {
   if (ple_is_4bit_) {
     const size_t per_layer_bytes = per_layer_elems / 2;
     const uint8_t *row = ple_mmap_ + (size_t)token_id * ple_row_bytes_;
-    for (size_t l = 0; l < L_gen; ++l) {
-      dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
-                                  ple_scale_, ple_offset_,
-                                  generation_per_layer_scale_[l],
-                                  generation_per_layer_offset_[l],
-                                  generation_per_layer_dst_[l]);
+    if (ple_is_signed4_) {
+      const float *row_scales =
+          ple_row_layer_scales_.data() + (size_t)token_id * ple_layers_;
+      for (size_t l = 0; l < L_gen; ++l) {
+        dequant_sfixed4_requant_u16(
+            row + l * per_layer_bytes, per_layer_elems, row_scales[l],
+            generation_per_layer_scale_[l],
+            generation_per_layer_offset_[l],
+            generation_per_layer_dst_[l]);
+      }
+    } else {
+      for (size_t l = 0; l < L_gen; ++l) {
+        dequant_nibbles_requant_u16(row + l * per_layer_bytes, per_layer_elems,
+                                    ple_scale_, ple_offset_,
+                                    generation_per_layer_scale_[l],
+                                    generation_per_layer_offset_[l],
+                                    generation_per_layer_dst_[l]);
+      }
     }
   } else {
     const uint16_t *row = ple_u16_mmap_ + (size_t)token_id * ple_row_elems_;

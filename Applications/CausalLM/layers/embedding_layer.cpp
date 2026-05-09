@@ -57,31 +57,30 @@ inline uint16_t clamp_u16(float v) {
   return static_cast<uint16_t>(std::max(0.0f, std::min(65535.0f, v)));
 }
 
+// Sign-extend a 4-bit value (low or high nibble) to int.
+//   nib in [0,7]   → 0..7
+//   nib in [8,15]  → -8..-1
+inline int s4(unsigned nib) {
+  return (nib & 0x8u) ? static_cast<int>(nib) - 16 : static_cast<int>(nib);
+}
+
 bool ends_with(const std::string &s, const std::string &suf) {
   return s.size() >= suf.size() &&
          0 == s.compare(s.size() - suf.size(), suf.size(), suf);
 }
 
 std::shared_ptr<QuantLut>
-load_4bit_manifest_(const std::string &manifest_path) {
-  std::ifstream f(manifest_path);
-  NNTR_THROW_IF(!f.is_open(), std::runtime_error)
-      << "Failed to open LUT manifest: " << manifest_path;
-
-  nlohmann::json j;
-  f >> j;
-
-  const std::string lut_rel  = j.at("lut-path").get<std::string>();
-  const int per_row          = j.at("size").get<int>();
-  const std::string datatype = j.value("datatype", std::string("ufixed8"));
-  const auto &qp             = j.at("quant-param");
-
-  NNTR_THROW_IF(datatype != "ufixed8", std::runtime_error)
-      << "Only 'ufixed8' (4-bit packed in 8-bit) is supported, got: "
-      << datatype;
+load_ufixed8_manifest_(const std::string &manifest_path,
+                       const nlohmann::json &j) {
+  // Tensorwise unsigned 4-bit (legacy). One (scale, offset) for the
+  // whole table.
+  const std::string lut_rel = j.at("lut-path").get<std::string>();
+  const int per_row         = j.at("size").get<int>();
+  const auto &qp            = j.at("quant-param");
 
   auto lut         = std::make_shared<QuantLut>();
   lut->is_raw_u16  = false;
+  lut->is_signed4  = false;
   lut->scale       = qp.at("scale").get<float>();
   lut->offset      = qp.at("offset").get<int>();
   lut->out_dim     = static_cast<size_t>(per_row);
@@ -102,11 +101,82 @@ load_4bit_manifest_(const std::string &manifest_path) {
       << " is not consistent with out_dim=" << lut->out_dim;
   lut->in_dim = (2 * lut->bytes.size()) / lut->out_dim;
 
-  ml_logi("Loaded shared 4-bit LUT '%s' (in_dim=%zu, out_dim=%zu, scale=%f, "
-          "offset=%d, bytes=%zu)",
+  ml_logi("Loaded ufixed8 (tensorwise) LUT '%s' (in_dim=%zu, out_dim=%zu, "
+          "scale=%f, offset=%d, bytes=%zu)",
           manifest_path.c_str(), lut->in_dim, lut->out_dim, lut->scale,
           lut->offset, lut->bytes.size());
   return lut;
+}
+
+std::shared_ptr<QuantLut>
+load_sfixed4_manifest_(const std::string &manifest_path,
+                       const nlohmann::json &j) {
+  // Per-row signed 4-bit (-8..7), 2 packed per byte, no offset.
+  // quant-param.scale is an array of length == in_dim (vocab size).
+  const std::string lut_rel = j.at("lut-path").get<std::string>();
+  const int per_row         = j.at("size").get<int>();
+  const auto &qp            = j.at("quant-param");
+
+  auto lut         = std::make_shared<QuantLut>();
+  lut->is_raw_u16  = false;
+  lut->is_signed4  = true;
+  lut->offset      = 0;
+  lut->out_dim     = static_cast<size_t>(per_row);
+
+  // scale array, one entry per vocab row.
+  const auto &scale_arr = qp.at("scale");
+  NNTR_THROW_IF(!scale_arr.is_array(), std::runtime_error)
+      << "sfixed4 manifest expects quant-param.scale as an array";
+  lut->row_scales.reserve(scale_arr.size());
+  for (const auto &v : scale_arr) lut->row_scales.push_back(v.get<float>());
+
+  const std::string lut_abs = resolve_relative(lut_rel, dirname(manifest_path));
+
+  std::ifstream bin(lut_abs, std::ios::binary | std::ios::ate);
+  NNTR_THROW_IF(!bin.is_open(), std::runtime_error)
+      << "Failed to open LUT binary: " << lut_abs;
+  const std::streamsize sz = bin.tellg();
+  bin.seekg(0, std::ios::beg);
+  lut->bytes.resize(static_cast<size_t>(sz));
+  bin.read(reinterpret_cast<char *>(lut->bytes.data()), sz);
+
+  NNTR_THROW_IF(lut->out_dim == 0 || (2 * lut->bytes.size()) % lut->out_dim,
+                std::runtime_error)
+      << "LUT binary size " << lut->bytes.size()
+      << " is not consistent with out_dim=" << lut->out_dim;
+  lut->in_dim = (2 * lut->bytes.size()) / lut->out_dim;
+
+  NNTR_THROW_IF(lut->row_scales.size() != lut->in_dim, std::invalid_argument)
+      << "sfixed4 row_scales.size=" << lut->row_scales.size()
+      << " != in_dim=" << lut->in_dim;
+
+  ml_logi("Loaded sfixed4 (rowwise) LUT '%s' (in_dim=%zu, out_dim=%zu, "
+          "row_scales=%zu, bytes=%zu)",
+          manifest_path.c_str(), lut->in_dim, lut->out_dim,
+          lut->row_scales.size(), lut->bytes.size());
+  return lut;
+}
+
+std::shared_ptr<QuantLut>
+load_4bit_manifest_(const std::string &manifest_path) {
+  // Dispatch by `datatype`: "ufixed8" = legacy tensorwise unsigned,
+  // "sfixed4" = rowwise signed (per-row scale, no offset).
+  std::ifstream f(manifest_path);
+  NNTR_THROW_IF(!f.is_open(), std::runtime_error)
+      << "Failed to open LUT manifest: " << manifest_path;
+
+  nlohmann::json j;
+  f >> j;
+
+  const std::string datatype = j.value("datatype", std::string("ufixed8"));
+
+  if (datatype == "sfixed4") return load_sfixed4_manifest_(manifest_path, j);
+  if (datatype == "ufixed8") return load_ufixed8_manifest_(manifest_path, j);
+
+  NNTR_THROW_IF(true, std::runtime_error)
+      << "Unsupported LUT datatype: " << datatype
+      << " (expected 'ufixed8' or 'sfixed4')";
+  return nullptr; // unreachable
 }
 
 std::shared_ptr<QuantLut>
@@ -313,8 +383,6 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
       << out_dim;
 
     const uint8_t *packed = quant_lut_->bytes.data();
-    const float lut_scale = quant_lut_->scale * scale;
-    const int lut_offset = quant_lut_->offset;
     const size_t bytes_per_row = out_dim / 2;
 
     auto &out_scale_prop  = std::get<props::OutputQuantScale>(embedding_props);
@@ -324,6 +392,82 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
     const int    out_offset    =
       (!out_offset_prop.empty()) ? out_offset_prop.get() : 0;
     const float  inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
+
+    // ─── Per-row signed-4-bit (sfixed4) path ──────────────────────────
+    // f = s4(nib) * row_scales[token_id] * scale (props::Scale modifier);
+    // q16 = round(f / out_scale) - out_offset.
+    if (quant_lut_->is_signed4 && !quant_lut_->row_scales.empty()) {
+      const float *row_scales = quant_lut_->row_scales.data();
+
+      for (unsigned int b = 0; b < b_size; ++b) {
+        const float *in_data =
+          input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+        nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+
+#pragma omp parallel for
+        for (int i = 0; i < (int)seq_len; ++i) {
+          const size_t embed_idx = static_cast<size_t>(in_data[i]);
+          if (embed_idx >= in_dim) {
+            throw std::invalid_argument(
+              "input word index is greater than in_dim");
+          }
+          const uint8_t *row = packed + bytes_per_row * embed_idx;
+          const float  row_scale = row_scales[embed_idx] * scale;
+          const size_t out_off = static_cast<size_t>(out_dim) * i;
+
+          if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
+            uint16_t *dst = batchsliced_hidden.getData<uint16_t>() + out_off;
+            if (has_out_quant) {
+              for (size_t k = 0; k < bytes_per_row; ++k) {
+                const uint8_t byte = row[k];
+                const float f_lo = s4(byte & 0x0F)        * row_scale;
+                const float f_hi = s4((byte >> 4) & 0x0F) * row_scale;
+                const int q_lo = static_cast<int>(
+                  std::lrintf(f_lo * inv_out_scale)) - out_offset;
+                const int q_hi = static_cast<int>(
+                  std::lrintf(f_hi * inv_out_scale)) - out_offset;
+                dst[2 * k]     = static_cast<uint16_t>(
+                  std::max(0, std::min(65535, q_lo)));
+                dst[2 * k + 1] = static_cast<uint16_t>(
+                  std::max(0, std::min(65535, q_hi)));
+              }
+            } else {
+              for (size_t k = 0; k < bytes_per_row; ++k) {
+                const uint8_t byte = row[k];
+                dst[2 * k]     = clamp_u16(s4(byte & 0x0F)        * row_scale);
+                dst[2 * k + 1] = clamp_u16(s4((byte >> 4) & 0x0F) * row_scale);
+              }
+            }
+          } else if (out_dtype == nntrainer::TensorDim::DataType::FP32) {
+            float *dst = batchsliced_hidden.getData<float>() + out_off;
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              dst[2 * k]     = s4(byte & 0x0F)        * row_scale;
+              dst[2 * k + 1] = s4((byte >> 4) & 0x0F) * row_scale;
+            }
+#ifdef ENABLE_FP16
+          } else if (out_dtype == nntrainer::TensorDim::DataType::FP16) {
+            _FP16 *dst = batchsliced_hidden.getData<_FP16>() + out_off;
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              dst[2 * k]     = static_cast<_FP16>(
+                s4(byte & 0x0F) * row_scale);
+              dst[2 * k + 1] = static_cast<_FP16>(
+                s4((byte >> 4) & 0x0F) * row_scale);
+            }
+#endif
+          } else {
+            throw std::runtime_error(
+              "EmbeddingLayer sfixed4 mode: unsupported output dtype");
+          }
+        }
+      }
+      return;
+    }
+
+    // ─── Tensorwise unsigned-4-bit (ufixed8 legacy) path ──────────────
+    const float lut_scale = quant_lut_->scale * scale;
+    const int lut_offset = quant_lut_->offset;
 
     for (unsigned int b = 0; b < b_size; ++b) {
       const float *in_data =
@@ -524,12 +668,10 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       << out_dim;
 
     const uint8_t *packed = quant_lut_->bytes.data();
-    const float lut_scale = quant_lut_->scale * scale;
-    const int lut_offset = quant_lut_->offset;
     const size_t bytes_per_row = out_dim / 2;
 
     // Two-step requant for UINT16 output:
-    //   f      = (q4bit + lut_offset) * lut_scale
+    //   f      = <decode>(q4bit) * <scale>
     //   q16bit = round(f / out_scale - out_offset)  ← QNN convention
     // When the consumer's quant params are missing we fall back to a
     // naive clamp (only valid if LUT and consumer share quant space).
@@ -540,6 +682,81 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     const int    out_offset    =
       (!out_offset_prop.empty()) ? out_offset_prop.get() : 0;
     const float  inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
+
+    // ─── Per-row signed-4-bit (sfixed4) path ──────────────────────────
+    if (quant_lut_->is_signed4 && !quant_lut_->row_scales.empty()) {
+      const float *row_scales = quant_lut_->row_scales.data();
+
+      for (unsigned int b = 0; b < b_size; ++b) {
+        const float *in_data =
+          input_.getAddress<float>(b * input_.getDim().getFeatureLen());
+        nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+        const int iter = static_cast<int>(to - from);
+
+#pragma omp parallel for
+        for (int i = 0; i < iter; ++i) {
+          const size_t embed_idx = static_cast<size_t>(in_data[i]);
+          if (embed_idx >= in_dim) {
+            throw std::invalid_argument(
+              "input word index is greater than in_dim");
+          }
+          const uint8_t *row = packed + bytes_per_row * embed_idx;
+          const float  row_scale = row_scales[embed_idx] * scale;
+          const size_t out_off = static_cast<size_t>(out_dim) * i;
+
+          if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
+            uint16_t *dst = batchsliced_hidden.getData<uint16_t>() + out_off;
+            if (has_out_quant) {
+              for (size_t k = 0; k < bytes_per_row; ++k) {
+                const uint8_t byte = row[k];
+                const float f_lo = s4(byte & 0x0F)        * row_scale;
+                const float f_hi = s4((byte >> 4) & 0x0F) * row_scale;
+                const int q_lo = static_cast<int>(
+                  std::lrintf(f_lo * inv_out_scale)) - out_offset;
+                const int q_hi = static_cast<int>(
+                  std::lrintf(f_hi * inv_out_scale)) - out_offset;
+                dst[2 * k]     = static_cast<uint16_t>(
+                  std::max(0, std::min(65535, q_lo)));
+                dst[2 * k + 1] = static_cast<uint16_t>(
+                  std::max(0, std::min(65535, q_hi)));
+              }
+            } else {
+              for (size_t k = 0; k < bytes_per_row; ++k) {
+                const uint8_t byte = row[k];
+                dst[2 * k]     = clamp_u16(s4(byte & 0x0F)        * row_scale);
+                dst[2 * k + 1] = clamp_u16(s4((byte >> 4) & 0x0F) * row_scale);
+              }
+            }
+          } else if (out_dtype == nntrainer::TensorDim::DataType::FP32) {
+            float *dst = batchsliced_hidden.getData<float>() + out_off;
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              dst[2 * k]     = s4(byte & 0x0F)        * row_scale;
+              dst[2 * k + 1] = s4((byte >> 4) & 0x0F) * row_scale;
+            }
+#ifdef ENABLE_FP16
+          } else if (out_dtype == nntrainer::TensorDim::DataType::FP16) {
+            _FP16 *dst = batchsliced_hidden.getData<_FP16>() + out_off;
+            for (size_t k = 0; k < bytes_per_row; ++k) {
+              const uint8_t byte = row[k];
+              dst[2 * k]     = static_cast<_FP16>(
+                s4(byte & 0x0F) * row_scale);
+              dst[2 * k + 1] = static_cast<_FP16>(
+                s4((byte >> 4) & 0x0F) * row_scale);
+            }
+#endif
+          } else {
+            throw std::runtime_error(
+              "EmbeddingLayer sfixed4 mode: unsupported output dtype");
+          }
+        }
+      }
+      return;
+    }
+
+    // ─── Tensorwise unsigned-4-bit (ufixed8 legacy) path ──────────────
+    const float lut_scale = quant_lut_->scale * scale;
+    const int lut_offset = quant_lut_->offset;
 
     // Token IDs are FP32 (forced by setInputDataType in finalize).
     for (unsigned int b = 0; b < b_size; ++b) {
