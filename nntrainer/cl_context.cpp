@@ -26,6 +26,11 @@
 
 #include <filesystem>
 
+#ifdef PROFILE
+#include <iostream>
+#include <opencl_profiler.h>
+#endif
+
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -65,6 +70,21 @@ bool writeBinaryFile(const std::string &path,
 
   fs.write(reinterpret_cast<const char *>(data.data()), data.size());
   return true;
+}
+
+ClContext::~ClContext() {
+  if (cl_initialized) {
+#ifdef PROFILE
+    // Dump per-kernel GPU timing summary collected during this run.
+    auto &prof = opencl::OpenCLProfiler::Global();
+    if (!prof.empty()) {
+      prof.report(std::cerr);
+    }
+#endif
+    command_queue_inst_.ReleaseCommandQueue();
+    // getContext() is called by clCreateKernel
+    context_inst_.ReleaseContext();
+  }
 }
 
 void ClContext::initialize() noexcept {

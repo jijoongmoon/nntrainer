@@ -6,6 +6,7 @@ opencl_sources = [
     'opencl_device_info.cpp',
     'opencl_kernel.cpp',
     'opencl_loader.cpp',
+    'opencl_profiler.cpp',
     'opencl_program.cpp'
 ]
 
@@ -15,6 +16,7 @@ opencl_headers = [
   'opencl_command_queue_manager.h',
   'opencl_context_manager.h',
   'opencl_kernel.h',
+  'opencl_profiler.h',
   'opencl_program.h'
 ]
 

@@ -71,13 +71,7 @@ public:
   /**
    * @brief destructor to release opencl commandQueue
    */
-  ~ClContext() override {
-    if (cl_initialized) {
-      command_queue_inst_.ReleaseCommandQueue();
-      // getContext() is called by clCreateKernel
-      context_inst_.ReleaseContext();
-    }
-  };
+  ~ClContext() override;
 
   /**
    * @brief Factory register function, use this function to register custom

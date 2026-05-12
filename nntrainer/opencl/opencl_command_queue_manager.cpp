@@ -19,6 +19,11 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
+#ifdef PROFILE
+#include "opencl_profiler.h"
+#include <string>
+#endif
+
 namespace nntrainer::opencl {
 
 /**
@@ -48,9 +53,15 @@ bool CommandQueueManager::CreateCommandQueue() {
   // getting GPU device ID
   cl_device_id device_id = context_instance.GetDeviceId();
 
+  cl_command_queue_properties queue_props =
+    CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
+#ifdef PROFILE
+  queue_props |= CL_QUEUE_PROFILING_ENABLE;
+#endif
+
   // returns NULL with error code if fails
-  command_queue_ = clCreateCommandQueue(
-    context, device_id, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &error_code);
+  command_queue_ =
+    clCreateCommandQueue(context, device_id, queue_props, &error_code);
   if (!command_queue_) {
     ml_loge("Failed to create a command queue. OpenCL error code: %d : ",
             error_code, OpenCLErrorCodeToString(error_code));
@@ -332,38 +343,80 @@ bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event) {
  * or wait for this command to complete
  * @return true if command queue execution is successful or false otherwise
  */
-bool CommandQueueManager::DispatchCommand(
-  Kernel kernel, const int (&work_groups_count)[3],
-  const int (&work_group_size)[3], cl_event *event,
-  std::vector<cl_event> events_to_wait) {
+namespace {
 
-  // work_dim of 2 has been hardcoded, might be modified later based on
-  // requirements
+#ifdef PROFILE
+std::string queryKernelName(cl_kernel kernel) {
+  size_t name_size = 0;
+  if (clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, 0, nullptr,
+                      &name_size) != CL_SUCCESS ||
+      name_size == 0) {
+    return "<unknown>";
+  }
+  std::string name(name_size, '\0');
+  if (clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, name_size, name.data(),
+                      nullptr) != CL_SUCCESS) {
+    return "<unknown>";
+  }
+  // CL_KERNEL_FUNCTION_NAME includes the trailing NUL.
+  if (!name.empty() && name.back() == '\0')
+    name.pop_back();
+  return name;
+}
+#endif
 
-  // setting the local_work_size referred to as the size of the
-  // work-group
-  const size_t local[3] = {static_cast<size_t>(work_group_size[0]),
-                           static_cast<size_t>(work_group_size[1]),
-                           static_cast<size_t>(work_group_size[2])};
+bool enqueueND(cl_command_queue queue, cl_kernel kernel,
+               const size_t (&global)[3], const size_t (&local)[3],
+               const std::vector<cl_event> &waits, cl_event *user_event) {
+#ifdef PROFILE
+  // Always allocate an internal event when profiling so we can collect timings,
+  // regardless of whether the caller asked for one.
+  cl_event prof_event = nullptr;
+  cl_event *evt_out = user_event ? user_event : &prof_event;
+#else
+  cl_event *evt_out = user_event;
+#endif
 
-  // setting the global_work_size that describe the number of global work-items
-  const size_t global[3] = {static_cast<size_t>(work_groups_count[0]),
-                            static_cast<size_t>(work_groups_count[1]),
-                            static_cast<size_t>(work_groups_count[2])};
-
-  cl_kernel kernel_ = kernel.GetKernel();
-
-  // returns NULL with error code if fails
-  const int error_code =
-    clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
-                           events_to_wait.size(), events_to_wait.data(), event);
+  const cl_int error_code = clEnqueueNDRangeKernel(
+    queue, kernel, 3, nullptr, global, local,
+    static_cast<cl_uint>(waits.size()), waits.empty() ? nullptr : waits.data(),
+    evt_out);
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
     return false;
   }
 
+#ifdef PROFILE
+  if (evt_out && *evt_out) {
+    // Retain so user_event lifetime is unchanged; profiler releases its ref.
+    cl_event evt_for_profile = *evt_out;
+    if (user_event) {
+      clRetainEvent(evt_for_profile);
+    }
+    OpenCLProfiler::Global().record(queryKernelName(kernel), evt_for_profile);
+  }
+#endif
+
   return true;
+}
+
+} // namespace
+
+bool CommandQueueManager::DispatchCommand(
+  Kernel kernel, const int (&work_groups_count)[3],
+  const int (&work_group_size)[3], cl_event *event,
+  std::vector<cl_event> events_to_wait) {
+
+  const size_t local[3] = {static_cast<size_t>(work_group_size[0]),
+                           static_cast<size_t>(work_group_size[1]),
+                           static_cast<size_t>(work_group_size[2])};
+  const size_t global[3] = {static_cast<size_t>(work_groups_count[0]),
+                            static_cast<size_t>(work_groups_count[1]),
+                            static_cast<size_t>(work_groups_count[2])};
+
+  return enqueueND(command_queue_, kernel.GetKernel(), global, local,
+                   events_to_wait, event);
 }
 
 bool CommandQueueManager::DispatchCommand(
@@ -371,33 +424,15 @@ bool CommandQueueManager::DispatchCommand(
   const int (&work_group_size)[3], cl_event *event,
   std::vector<cl_event> events_to_wait) {
 
-  // work_dim of 2 has been hardcoded, might be modified later based on
-  // requirements
-
-  // setting the local_work_size referred to as the size of the
-  // work-group
   const size_t local[3] = {static_cast<size_t>(work_group_size[0]),
                            static_cast<size_t>(work_group_size[1]),
                            static_cast<size_t>(work_group_size[2])};
-
-  // setting the global_work_size that describe the number of global work-items
   const size_t global[3] = {static_cast<size_t>(work_groups_count[0]),
                             static_cast<size_t>(work_groups_count[1]),
                             static_cast<size_t>(work_groups_count[2])};
 
-  cl_kernel kernel_ = kernel_ptr->GetKernel();
-
-  // returns NULL with error code if fails
-  const int error_code =
-    clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
-                           events_to_wait.size(), events_to_wait.data(), event);
-  if (error_code != CL_SUCCESS) {
-    ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
-            error_code, OpenCLErrorCodeToString(error_code));
-    return false;
-  }
-
-  return true;
+  return enqueueND(command_queue_, kernel_ptr->GetKernel(), global, local,
+                   events_to_wait, event);
 }
 
 void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
@@ -408,13 +443,30 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
                                         const cl_event *event_wait_list,
                                         cl_event *event) {
 
+#ifdef PROFILE
+  cl_event prof_event = nullptr;
+  cl_event *evt_out = event ? event : &prof_event;
+#else
+  cl_event *evt_out = event;
+#endif
+
   const auto error_code = clEnqueueNDRangeKernel(
     command_queue_, kernel, work_dim, nullptr, global_work_size,
-    local_work_size, num_events_in_wait_list, event_wait_list, event);
+    local_work_size, num_events_in_wait_list, event_wait_list, evt_out);
 
   NNTR_THROW_IF(error_code != CL_SUCCESS, std::runtime_error)
     << "clEnqueueNDRangeKernel failed. OpenCL error code: " << error_code
     << ", error: " << OpenCLErrorCodeToString(error_code);
+
+#ifdef PROFILE
+  if (evt_out && *evt_out) {
+    cl_event evt_for_profile = *evt_out;
+    if (event) {
+      clRetainEvent(evt_for_profile);
+    }
+    OpenCLProfiler::Global().record(queryKernelName(kernel), evt_for_profile);
+  }
+#endif
 }
 
 } // namespace nntrainer::opencl
