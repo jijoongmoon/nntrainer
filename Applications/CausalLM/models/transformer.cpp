@@ -299,8 +299,7 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
 
 std::pair<Tensor, Tensor>
 Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
-  const unsigned int max_timestep =
-    static_cast<unsigned int>(INIT_SEQ_LEN + NUM_TO_GENERATE);
+  const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
   const unsigned int kv_width =
     static_cast<unsigned int>(HEAD_DIM * n_heads / GQA_SIZE);
 
@@ -356,7 +355,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "mha_core",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
      withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
-     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
      withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
                                  ? SLIDING_WINDOW
                                  : UINT_MAX),
