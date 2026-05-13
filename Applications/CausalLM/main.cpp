@@ -31,6 +31,7 @@
 
 #include "causal_lm.h"
 #include "chat_template.h"
+#include "clip_vit_transformer.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
@@ -206,6 +207,11 @@ int main(int argc, char *argv[]) {
     "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::MultilingualTinyBert>(
         cfg, generation_cfg, nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "ClipVitTransformer", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::ClipVitTransformer>(cfg, generation_cfg,
+                                                            nntr_cfg);
     });
 
   // Validate arguments
