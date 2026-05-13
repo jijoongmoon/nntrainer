@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nntrainer/nntrainer/docs/gpu/baseline_schema.json",
+  "title": "nntrainer GPU baseline measurement v1",
+  "description": "Schema for the JSON emitted by tools/gpu_bench/run_baseline.sh after running the OpenCL unittests with the M0-1 per-kernel profiler enabled (-Denable-profile=true). One record per (binary, kernel) pair aggregating all enqueue calls of that kernel within the run. Comparisons against ML Drift (arXiv:2505.00232) parity targets use exec_total_us / avg_us as the primary metrics.",
+  "type": "object",
+  "required": ["schema_version", "records"],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Bump on any change to required fields or semantics."
+    },
+    "records": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/kernel_record"}
+    }
+  },
+  "$defs": {
+    "kernel_record": {
+      "type": "object",
+      "required": [
+        "binary",
+        "kernel",
+        "calls",
+        "exec_total_us",
+        "avg_us",
+        "min_us",
+        "max_us",
+        "queued_us",
+        "submit_us",
+        "pct_exec"
+      ],
+      "properties": {
+        "binary": {
+          "type": "string",
+          "description": "Originating unittest binary (e.g. unittest_opencl_kernels_int4).",
+          "examples": [
+            "unittest_opencl_kernels_blas",
+            "unittest_opencl_kernels_int4",
+            "unittest_opencl_kernels_qk_k"
+          ]
+        },
+        "kernel": {
+          "type": "string",
+          "description": "OpenCL kernel name as passed to clCreateKernel. May contain spaces if the build appends a variant suffix.",
+          "examples": ["sgemv_cl", "int4_gemv_cl", "qk_k_dequant_cl"]
+        },
+        "calls": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of clEnqueueNDRangeKernel invocations aggregated into this record."
+        },
+        "exec_total_us": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Sum of (END - START) timestamps in microseconds. Primary metric for ROI comparison."
+        },
+        "avg_us": {
+          "type": "number",
+          "minimum": 0.0,
+          "description": "exec_total_us / calls, microseconds. Two decimal digits as emitted by the profiler."
+        },
+        "min_us": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Minimum single-call execution time."
+        },
+        "max_us": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum single-call execution time. A wide max/min spread can flag warmup / dispatch-stall issues."
+        },
+        "queued_us": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Sum of (SUBMIT - QUEUED) — time spent waiting in host queue before driver submit. High values indicate host-side scheduling overhead."
+        },
+        "submit_us": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Sum of (START - SUBMIT) — driver-side submission latency. High values can indicate driver compile / param-setup overhead."
+        },
+        "pct_exec": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 100.0,
+          "description": "Share of this kernel's exec_total_us within the run's grand total. Drives prioritization of optimization targets."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
