@@ -1019,20 +1019,26 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
                                M, N, K, Int4QTensor::getGroupSize());
     }
   } else {
-#ifdef ENABLE_FP16
     if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
-      uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
+#if NNTR_HAS_KAI_INT4
+      int32_t kernel_idx = Int4QTensor::get_kleidiai_kernel_idx();
       nntr_gemm_qai8dxp_qsi4cxp_packed(
-        M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx,
-        true); /// @todo kernel supports both trans / noTrans situation
+        M, N, K, (void *)data, (void *)mdata, rdata, kernel_idx,
+        true, -std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity());
+#else
+      throw std::runtime_error(
+        "QINT4 PER_CHANNEL_AFFINE Dot requires the ARM KleidiAI backend.");
+#endif
     } else {
+#ifdef ENABLE_FP16
       throw std::runtime_error(
         "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
-    }
 #else
-    /// @todo Replace with standard CPU INT4 computation
-    o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
+      /// @todo Replace with standard CPU INT4 computation
+      o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
 #endif
+    }
   }
 
   return output;

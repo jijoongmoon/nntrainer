@@ -61,6 +61,10 @@ using std::chrono::seconds;      // or microseconds
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_4x8x32_neon_i8mm.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm.h"
+#if defined(ENABLE_SME)
+#include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa.h"
+#include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot.h"
+#endif
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp_qsi4cxp_interface.h"
 #include "kai/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
 #include "kai/pack/kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.h"
@@ -184,10 +188,35 @@ kai_matmul_ukernel_f32_qa8dxp_qs4cxp ukernel_variants[] = {
    kai_get_dst_size_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
    kai_run_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
    "matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod"},
+#if defined(ENABLE_SME)
+   {kai_get_m_step_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_get_n_step_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_get_nr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_get_kr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_get_sr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_get_dst_offset_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_get_dst_size_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa,
+   "matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"},
+   {kai_get_m_step_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_get_n_step_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_get_mr_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_get_nr_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_get_kr_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_get_sr_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_get_dst_offset_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_get_dst_size_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   kai_run_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot,
+   "matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot"},
+#endif
 
 };
 
-static size_t roundup(size_t a, size_t b) { return ((a + b - 1) / b) * b; }
 
 uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
@@ -298,7 +327,7 @@ uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
     uint64_t casted_time = static_cast<uint64_t>(dt2.count());
     ret_idx = (min_latency > casted_time) ? idx_variant : ret_idx;
     min_latency = (min_latency > casted_time) ? casted_time : min_latency;
-
+    
     delete[] lhs_packed_mtx_qa8dx;
     delete[] rhs_packed_mtx_qs4cx;
   }
@@ -336,7 +365,6 @@ void nntr_kai_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
   const size_t nr = ukernel_variants[idx_variant].ukernel.get_nr();
   const size_t kr = ukernel_variants[idx_variant].ukernel.get_kr();
   const size_t sr = ukernel_variants[idx_variant].ukernel.get_sr();
-
   if (format == rhs_format::nxk) {
     struct kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_params nxk_params;
 
@@ -483,9 +511,9 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp(size_t m, size_t n, size_t k,
                                        uint32_t idx_variant, bool transB,
                                        float lower_bound, float upper_bound) {
   if (m == 1) {
-    return nntr_kai_gemm_qai8dxp_qsi4cxp_olp_single_thread(
+    return nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
       m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
-      idx_variant, transB, lower_bound, upper_bound);
+      idx_variant, transB, lower_bound, upper_bound); //single_thread(prev.)
   } else {
     return nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
       m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx, dst_act_mtx_f32,

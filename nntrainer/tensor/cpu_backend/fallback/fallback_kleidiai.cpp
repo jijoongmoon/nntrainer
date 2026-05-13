@@ -29,6 +29,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <fallback_kleidiai.h>
 
@@ -117,7 +118,7 @@ static void quant_nxk_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
 
   // Make sure the output is filled with zeros
   std::memset(rhs_qs4cx, 0, n * rhs_qs4cx_stride);
-
+  
   for (size_t n_idx = 0; n_idx < n; ++n_idx) {
     const float *src_ptr = rhs_f32 + n_idx * k;
 
@@ -140,7 +141,8 @@ static void quant_nxk_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
     const float rmax0 = std::max(0.0f, max0);
 
     const float scale0 = rmin0 == rmax0 ? 1.f : (qmax - qmin) / (rmax0 - rmin0);
-
+    
+    //std::cout << scale0 << std::endl;
     // Reciprocal to quantize
     const float recip_scale0 = scale0 ? 1.0f / scale0 : 0.0f;
 
@@ -201,7 +203,7 @@ static void quant_kxn_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
     const float rmax0 = std::max(0.0f, max0);
 
     const float scale0 = rmin0 == rmax0 ? 1.f : (qmax - qmin) / (rmax0 - rmin0);
-
+    std::cout << scale0 << std::endl;
     // Reciprocal to quantize
     const float recip_scale0 = scale0 ? 1.0f / scale0 : 0.0f;
 
@@ -236,6 +238,7 @@ static void quant_kxn_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
 void quant_qs4cx_f32(size_t n, size_t k, rhs_format format,
                      const float *rhs_f32, uint8_t *rhs_qs4cx,
                      float *rhs_scales_f32) {
+
   if (rhs_format::nxk == format) {
     quant_nxk_qs4cx_f32(n, k, rhs_f32, rhs_qs4cx, rhs_scales_f32);
   } else {
@@ -414,3 +417,91 @@ void ref_matmul_f32_qs8d32_qs4c32(size_t m, size_t n, size_t k, size_t bl,
                                   float scalar_min, float scalar_max) {
   throw std::runtime_error("NYI : ref_matmul_f32_qs8d32_qs4c32 (fallback)");
 }
+
+// ============================================================================
+// KleidiAI Interface Stubs for non-ARM platforms (x86, etc.)
+// These functions provide fallback implementations when KleidiAI is not available
+// ============================================================================
+
+template <typename T>
+void nntr_gemm_qai8dxp_qsi4cxp_unpacked(size_t m, size_t n, size_t k,
+                                        void *lhs_native_mtx_f32,
+                                        void *rhs_qs4cx, void *rhs_scales_f32,
+                                        T *dst_f32, bool transB,
+                                        float lower_bound, float upper_bound) {
+  // Fallback reference implementation
+  rhs_format format = transB ? rhs_format::nxk : rhs_format::kxn;
+  
+  // Allocate and quantize LHS
+  size_t lhs_packed_size =
+    k * sizeof(int8_t) + sizeof(float) + sizeof(int32_t);
+  std::vector<int8_t> lhs_qa8dx(m * lhs_packed_size);
+  
+  ref_quant_qa8dx_f32(m, k, (const float *)lhs_native_mtx_f32, lhs_qa8dx.data());
+  
+  // Run reference matmul
+  ref_matmul_f32_qa8dx_qs4cx(m, n, k, format, lhs_qa8dx.data(),
+                             (const uint8_t *)rhs_qs4cx,
+                             (const float *)rhs_scales_f32, dst_f32,
+                             lower_bound, upper_bound);
+}
+
+// Explicit template instantiation
+template void nntr_gemm_qai8dxp_qsi4cxp_unpacked<float>(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32, void *rhs_qs4cx,
+  void *rhs_scales_f32, float *dst_f32, bool transB, float lower_bound,
+  float upper_bound);
+
+size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                                   uint32_t idx_variant,
+                                                   bool transB) {                                                   
+  // Fallback: return size for unpacked format
+  // For int4: (k * n + 1) / 2 bytes for packed int4 + n * sizeof(float) for scales
+  return ((k * n + 1) / 2) + n * sizeof(float);
+}
+
+void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
+                                     void *rhs_packed_mtx_qs4cx,
+                                     void *rhs_native_mtx_qs4cx,
+                                     void *rhs_scales_f32,
+                                     uint32_t idx_variant, bool transB) {
+  // Fallback: just copy the unpacked data
+  size_t data_size = (k * n + 1) / 2;
+  std::memcpy(rhs_packed_mtx_qs4cx, rhs_native_mtx_qs4cx, data_size);
+  std::memcpy((char *)rhs_packed_mtx_qs4cx + data_size, rhs_scales_f32,
+              n * sizeof(float));
+}
+
+
+void nntr_kai_quant_qs4cx_f32(size_t n, size_t k, void *rhs_f32,
+                          void *rhs_qs4cx, void *rhs_scales_f32, bool transB) {
+  rhs_format format = transB ? rhs_format::nxk : rhs_format::kxn;
+  quant_qs4cx_f32(n, k, format, (const float *)rhs_f32, (uint8_t *)rhs_qs4cx,
+                  (float *)rhs_scales_f32);
+}
+
+
+template <typename T>
+void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
+                                      void *lhs_native_mtx_f32,
+                                      void *rhs_packed_mtx_qs4cx, T *dst_f32,
+                                      uint32_t idx_variant, bool transB,
+                                      float lower_bound, float upper_bound) {
+  // Fallback implementation for non-ARM platforms
+  // When idx_variant == (uint32_t)-1, data is in unpacked format with scales appended
+  // When idx_variant is a valid kernel index, data is in packed format (not supported in fallback)
+  size_t data_size = (k * n + 1) / 2;
+  uint8_t *rhs_qs4cx = (uint8_t *)rhs_packed_mtx_qs4cx;
+  float *rhs_scales = (float *)((char *)rhs_packed_mtx_qs4cx + data_size);
+  
+  nntr_gemm_qai8dxp_qsi4cxp_unpacked<T>(m, n, k, lhs_native_mtx_f32, rhs_qs4cx,
+                                        rhs_scales, dst_f32, transB, lower_bound,
+                                        upper_bound);
+}
+
+// Explicit template instantiation
+template void nntr_gemm_qai8dxp_qsi4cxp_packed<float>(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_packed_mtx_qs4cx, float *dst_f32, uint32_t idx_variant, bool transB,
+  float lower_bound, float upper_bound);
+

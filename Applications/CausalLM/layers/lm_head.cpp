@@ -11,7 +11,6 @@
  *
  */
 
-#include <cpu_backend.h>
 #include <layer_context.h>
 #include <lm_head.h>
 #include <nntrainer_error.h>
@@ -19,7 +18,7 @@
 #include <node_exporter.h>
 #include <tensor.h>
 #include <tensor_dim.h>
-#include <util_func.h>
+#include "cpu_backend.h"
 
 namespace causallm {
 
@@ -138,6 +137,11 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
   unsigned int b_size = input_dim.batch();
 
+  uint32_t K = weight.height();
+  uint32_t N = weight.width();
+ 
+
+
   for (unsigned int b = 0; b < b_size; ++b) {
     nntrainer::Tensor input_step = input_.getSharedDataTensor(
       input_step_dim,
@@ -145,6 +149,9 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
+   
+    
+    
     input_step.dot(weight, hidden_step, false, false);
 
     if (auto &disable_bias =

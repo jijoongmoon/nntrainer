@@ -31,6 +31,7 @@
 #include <future>
 #include <iomanip>
 #include <sstream>
+#include <iostream>
 
 #include <activation_realizer.h>
 #include <adamw.h>
@@ -643,6 +644,7 @@ void NeuralNetwork::save(
       const auto &layer_node = *iter;
       auto it = layer_dtype_map.find(layer_node->getName());
       auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
+      std::cout << layer_node->getName() << std::endl;
       layer_node->save(model_file, false, exec_mode, target_dtype);
     }
 
@@ -702,6 +704,7 @@ void NeuralNetwork::load(const std::string &file_path,
   std::vector<std::pair<size_t, size_t>> file_offset;
   std::unordered_set<const Tensor *> visited_weights;
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+    auto &ln = *iter;
     auto weights = (*iter)->getRunContext().getWeights();
     for (auto weight : weights) {
       // Shared weights (e.g., TieWordEmbedding) reference the same Tensor
@@ -715,6 +718,22 @@ void NeuralNetwork::load(const std::string &file_path,
       }
       size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
+
+      if (ln->getType() != "rms_norm" && ln->getType() != "reshaped_rms_norm") {
+        if (tensor_data_type == TensorDim::DataType::FP32) {
+          std::cout << ln->getName() << std::endl;
+          std::cout << "Yabal!" << std::endl;
+          // QINT4 but read as Q4_0
+          uint32_t K = weight->getVariable().height();
+          uint32_t N = weight->getVariable().width();
+          nntrainer::Tensor W_q40(1, 1, K, N,
+                                  {ml::train::TensorDim::Format::NCHW,
+                                   ml::train::TensorDim::DataType::Q4_0});
+          // size = N * K;
+          size = W_q40.getMemoryBytes();
+          W_q40.deallocate();
+        }
+      }
       weight->getVariableRef().setFileOffset(start_from);
       ///@todo instead of checking the data type,
       /// we may need to create a common parent class for
@@ -724,7 +743,8 @@ void NeuralNetwork::load(const std::string &file_path,
       if (tensor_data_type != TensorDim::DataType::FP32 &&
           tensor_data_type != TensorDim::DataType::FP16 &&
           tensor_data_type != TensorDim::DataType::Q6_K &&
-          tensor_data_type != TensorDim::DataType::Q4_0) {
+          tensor_data_type != TensorDim::DataType::Q4_0 &&
+          tensor_data_type != TensorDim::DataType::QINT4) {
         // for tensor with qparam
         size += sizeof(uint16_t);
       }

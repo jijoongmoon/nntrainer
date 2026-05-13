@@ -17,6 +17,10 @@
 
 namespace nntrainer {
 
+
+class Int4QTensor : public TensorBase {
+
+public:
 /**
  * @class Int4QTensor class
  * @brief Int4QTensor class for quantized 4-bit integer calculation
@@ -29,14 +33,17 @@ namespace nntrainer {
  *
  * @todo Remove variable `group_size` and add PER_GROUP_AFFINE_32,64,128
  */
-class Int4QTensor : public TensorBase {
-public:
   /**
    * @brief     Basic Constructor of Tensor
    */
   Int4QTensor(std::string name_ = "", Tformat fm = Tformat::NCHW,
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
               size_t g_size = 32);
+  
+
+   
+ 
+
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -104,6 +111,11 @@ public:
    * @copydoc Tensor::allocate()
    */
   void allocate() override;
+
+  /**
+   * @copydoc TensorBase::size()
+   */
+  size_t size() const override;
 
   /**
    * @copydoc Tensor::deallocate()
@@ -301,9 +313,25 @@ public:
   QScheme q_scheme() const override;
 
   /**
-   * @brief Returns quantization group size
+   * @brief Returns the default quantization group size used by Int4QTensor.
+   * @note Static helper retained for ComputeOps adapter call sites that need a
+   * compile-time-known group size when no Int4QTensor instance is in scope.
    */
-  static size_t getGroupSize();
+  static size_t getGroupSize() { return 32; }
+
+  /**
+   * @brief Get the fixed KleidiAI kernel index based on compile‑time
+   *        environment detection.
+   *
+   * If SME (Scalable Matrix Extension) is enabled, the function returns
+   * index 8 (SME‑optimized kernel). Otherwise, if NEON is available, it
+   * returns index 3 (NEON‑optimized kernel). If neither macro is defined,
+   * it returns -1 (no ARM extension available).
+   *
+   * The used by the KleidiAI interface to select a
+   * specific micro‑kernel variant without runtime latency probing.
+   */
+  static int32_t get_kleidiai_kernel_idx();
 
 private:
   /**
@@ -316,7 +344,7 @@ private:
    *
    * @note need to properly define this
    */
-  static size_t group_size;
+  size_t group_size;
 
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is

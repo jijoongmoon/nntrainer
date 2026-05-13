@@ -16,6 +16,7 @@ TARGET=$1
 FILE_PREFIX=nnstreamer-lite-native
 ZIP_NAME=${FILE_PREFIX}.zip
 URL="https://nnstreamer-release.s3-ap-northeast-2.amazonaws.com/nnstreamer/latest/android/"
+#URL="https://release.nnstreamer.com/#nnstreamer/latest/android"
 
 echo "PREPARING ml_api at ${TARGET}"
 

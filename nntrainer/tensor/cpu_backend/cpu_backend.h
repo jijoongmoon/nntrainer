@@ -16,7 +16,7 @@
 #ifdef __cplusplus
 #if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
   defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
-  defined(_M_ARM64)
+  defined(_M_ARM64) || defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_compute_backend.h>
 #elif defined(__x86_64__) || defined(__i586__) || defined(_M_X64) ||           \
   defined(_M_IX86)
@@ -31,6 +31,17 @@
 
 #include <cstdint>
 #include <tensor_dim.h>
+
+// KleidiAI INT4 (qai8dxp_qsi4cxp) kernels and their fallbacks live in the ARM
+// compute backend and the FP16-enabled fallback paths. On x86/non-FP16 builds
+// the symbols are not linked, so callers must avoid the KAI code path.
+#if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
+  defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
+  defined(_M_ARM64) || defined(__ARM_NEON) || defined(__ARM_NEON__)
+#define NNTR_HAS_KAI_INT4 1
+#else
+#define NNTR_HAS_KAI_INT4 0
+#endif
 
 #ifdef ENABLE_FP16
 /**
@@ -456,6 +467,9 @@ extern void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                                      unsigned int half_, _FP16 *inout,
                                      _FP16 *output, const _FP16 *cos_,
                                      const _FP16 *sin_);
+
+#endif
+
 /**
  * @brief qs4cx quantization of (n*k) matrix. Typically a weight quantization,
  * and generally regard the weight is already transposed, and quantize it as it
@@ -471,7 +485,7 @@ extern void compute_rotary_emb_value(unsigned int width, unsigned int dim,
  */
 extern void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
                                  void *rhs_native_mtx_qs4cx,
-                                 void *rhs_scales_f32, bool transB = true);
+                                 void *rhs_scales_f32, bool transB);
 /**
  * @brief get size of memory to allocate for rhs weight packing of qsi4cxp to
  * qs4cxs1s0
@@ -541,7 +555,7 @@ extern void nntr_gemm_qai8dxp_qsi4cxp_packed(
   void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
   T upper_bound = std::numeric_limits<T>::max());
-
+  
 /**
  * @brief get size of memory to allocate for rhs weight packing of qsi8d32p to
  * qsi4c32p
@@ -627,7 +641,6 @@ extern void nntr_gemm_qsi8d32p_qsi4c32p_packed(
   void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
   T upper_bound = std::numeric_limits<T>::max());
-#endif
 // init_backend() is declared in compute_ops.h (canonical location).
 
 /**
