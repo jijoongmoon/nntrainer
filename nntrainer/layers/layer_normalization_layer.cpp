@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <numeric>
 
+#include <base_properties.h>
+#include <cpu_backend.h>
 #include <layer_context.h>
 #include <layer_normalization_layer.h>
 #include <nntrainer_error.h>
@@ -210,21 +212,52 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
 
   variance.add_i(epsilon);
   variance.pow(-0.5f, inv_std_dev);
+  deviation.multiply(inv_std_dev, output);
 #else
-  unsigned int axis_dim = deviation.getDim()[normalize_axes[0]];
-  for (unsigned int i = 0; i < deviation.getDim()[normalize_axes[0] - 1]; ++i) {
-    float sum = 0.0;
+  // Optimized path for FP32 tensors with width-axis-only normalization.
+  // Uses NEON intrinsic (rms_norm_wrt_width_fp16_intrinsic) which:
+  // - Accumulates in FP16 for better performance
+  // - Computes: output = deviation / sqrt(mean(deviation^2) + epsilon)
+  // - Supports incremental decoding with [from, to) row range
+  // - Processes all batches and channels
+  const bool width_axis_only =
+    normalize_axes.size() == 1 &&
+    normalize_axes[0] == ml::train::TensorDim::getNumDim() - 1;
 
-    _FP16 *data = deviation.getAddress<_FP16>(0, 0, i, 0);
+  if (deviation.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      width_axis_only) {
+    const unsigned int W = input_dim.width();
+    const unsigned int row_dim_v = input_dim.height();
+    const unsigned int row_begin = (to > from && to <= row_dim_v) ? from : 0u;
+    const unsigned int row_end =
+      (to > from && to <= row_dim_v) ? to : row_dim_v;
+    const size_t row_count = row_end - row_begin;
 
-    for (unsigned int j = 0; j < axis_dim; ++j) {
-      sum += powf(static_cast<float>(data[j]), 2.0f);
+    for (unsigned int b = 0; b < input_dim.batch(); ++b) {
+      for (unsigned int c = 0; c < input_dim.channel(); ++c) {
+        const float *src = deviation.getAddress<float>(b, c, row_begin, 0);
+        float *dst = output.getAddress<float>(b, c, row_begin, 0);
+        // NOTE: rms_norm_wrt_width_fp16_intrinsic is reused here for Layer
+        // Normalization. Since 'deviation' is already centered (X - mean),
+        // computing:
+        //   output = deviation / sqrt(mean(deviation^2) + epsilon)
+        // is equivalent to Layer Norm's formula:
+        //   output = (X - mean_X) / sqrt(variance + epsilon)
+        nntrainer::rms_norm_wrt_width_fp16_intrinsic(src, dst, row_count, W,
+                                                     epsilon);
+      }
     }
-    inv_std_dev.setValue(0, 0, i, 0, 1.0 / sqrt(sum / axis_dim - epsilon));
+  } else {
+    // Fallback: generic tensor operations for all data types.
+    // Used when: FP16 not enabled, non-FP32 tensor, or multi-axis
+    // normalization.
+    deviation.pow(2.0f, temp_full_size);
+    temp_full_size.average(normalize_axes, variance);
+    variance.add_i(epsilon);
+    variance.pow(-0.5f, inv_std_dev);
+    deviation.multiply(inv_std_dev, output);
   }
 #endif
-
-  deviation.multiply(inv_std_dev, output);
   output.multiply_i(gamma);
   output.add_i(beta);
 }

@@ -129,7 +129,8 @@ public:
                        ml::train::ExecutionMode mode, bool trainable,
                        nntrainer::TensorDim::DataType definedWeightDataType,
                        bool fsu, size_t start_offset = 0,
-                       bool read_from_offset = false) override;
+                       bool read_from_offset = false,
+                       int file_fd = -1) override;
 
   /**
    * @copydic Layer::save()

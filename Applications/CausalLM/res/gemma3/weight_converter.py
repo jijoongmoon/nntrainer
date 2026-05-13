@@ -49,14 +49,14 @@ def save_gemma3_for_nntrainer(
         save_weight(params[f"{layer_name}input_layernorm.weight"], is_rms=True)  
           
         # Save in NNTrainer graph order:
-        # attention_norm -> Q -> q_norm -> K -> k_norm -> V -> O
+        # attention_norm -> Q -> K -> V -> q_norm -> k_norm -> O
         save_projection(layer_name, "self_attn.q_proj")
+        save_projection(layer_name, "self_attn.k_proj")
+        save_projection(layer_name, "self_attn.v_proj")
         if f"{layer_name}self_attn.q_norm.weight" in params:
             save_weight(params[f"{layer_name}self_attn.q_norm.weight"], is_rms=True)
-        save_projection(layer_name, "self_attn.k_proj")
         if f"{layer_name}self_attn.k_norm.weight" in params:
             save_weight(params[f"{layer_name}self_attn.k_norm.weight"], is_rms=True)
-        save_projection(layer_name, "self_attn.v_proj")
         save_projection(layer_name, "self_attn.o_proj")
 
     def save_feed_forward(layer_name):  

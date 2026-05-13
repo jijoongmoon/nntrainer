@@ -1,4 +1,5 @@
 causallm_src = [
+    meson.current_source_dir() / 'chat_template.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
@@ -55,8 +56,7 @@ causallm = shared_library('causallm',
         nntrainer_dep,
         nntrainer_ccapi_dep,
         causallm_layer_dependencies, 
-        tokenizer_dependencies,
-        openmp_dep
+        tokenizer_dependencies
     ],
     include_directories: causallm_inc,
     install: true,

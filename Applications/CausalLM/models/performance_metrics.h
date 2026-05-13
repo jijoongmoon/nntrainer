@@ -30,7 +30,7 @@ typedef struct {
   double total_duration_ms;
   double initialization_duration_ms;
   size_t peak_memory_kb;
-} PerformanceMetrics;
+} TransformerPerformanceMetrics;
 
 #ifdef __cplusplus
 }

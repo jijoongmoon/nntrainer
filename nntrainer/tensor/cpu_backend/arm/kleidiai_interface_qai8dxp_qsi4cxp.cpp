@@ -41,6 +41,7 @@
 #include <kleidiai_interface.h>
 #include <limits>
 #include <string>
+#include <thread_manager.h>
 
 #include <chrono>
 #include <iostream>
@@ -438,20 +439,22 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
                                      (const float *)lhs_native_mtx_f32, // LHS
                                      k * sizeof(float),     // LHS stride
                                      lhs_packed_mtx_qa8dx); // LHS packed
-  int n_threads = 4;
-  assert(n % n_threads == 0);
-  size_t n_ukernel = n / n_threads;
-#pragma omp parallel for num_thread(n_threads)
-  for (int current_thread = 0; current_thread < n_threads; ++current_thread) {
+
+  // TODO find optimal chunk size
+  size_t chunk_size = 4;
+  assert(n % chunk_size == 0);
+  size_t loop = n / chunk_size;
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, loop, [&](size_t i) {
     const size_t dst_stride = n * sizeof(float);
     const size_t lhs_offset =
       ukernel_variants[idx_variant].ukernel.get_lhs_packed_offset(0, k);
     const size_t rhs_offset =
       ukernel_variants[idx_variant].ukernel.get_rhs_packed_offset(
-        n_ukernel * current_thread, k);
+        chunk_size * i, k);
     const size_t dst_offset =
-      ukernel_variants[idx_variant].ukernel.get_dst_offset(
-        0, n_ukernel * current_thread, dst_stride);
+      ukernel_variants[idx_variant].ukernel.get_dst_offset(0, chunk_size * i,
+                                                           dst_stride);
 
     const void *lhs_ptr =
       (const void *)((const char *)lhs_packed_mtx_qa8dx + lhs_offset);
@@ -460,7 +463,7 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
     float *dst_ptr = (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset);
 
     ukernel_variants[idx_variant].ukernel.run_matmul(
-      m, n / n_threads, k,     // Dimensions
+      m, chunk_size, k,        // Dimensions
       lhs_ptr,                 // LHS packed
       rhs_ptr,                 // RHS packed
       dst_ptr,                 // DST
@@ -468,7 +471,7 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
       sizeof(float),           // DST stride (col)
       lower_bound, upper_bound // Min and max for the clamp operation
     );
-  }
+  });
 
   delete[] lhs_packed_mtx_qa8dx;
 }
