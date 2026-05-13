@@ -5,7 +5,7 @@
 #define ALIGN(a, b) (CEIL_DIV(a, b) * (b))
 
 __attribute__((qcom_reqd_sub_group_size("full"))) kernel void
-fully_connected_gpu_int4_gemm_adreno(
+gpu_int4_gemm_adreno(
                             __read_only image1d_buffer_t input, 
                             __global const half *scales,
                             __global half *output,
