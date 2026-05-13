@@ -9,7 +9,7 @@ if get_option('platform') == 'tizen'
   unittest_nntrainer_deps += [ nntrainer_capi_dep ] # so that feature_state can be overridden
 endif
 
-# test material need to be unzipped from "(project_home)/packaging/"
+#test material need to be unzipped from "(project_home)/packaging/"
 unzip_target = [
   ['trainset.tar.gz', ''],
   ['valset.tar.gz', ''],
@@ -90,6 +90,7 @@ endif
 if get_option('enable-opencl')
   test_target += [['unittest_opencl_kernels_blas', []]]
   test_target += [['unittest_opencl_kernels_int4', []]]
+  test_target += [['unittest_opencl_kernels_int4_adreno', []]]
   test_target += [['unittest_opencl_kernels_qk_k', []]]
   test_target += [['unittest_attention_kernels_cl', []]]
 endif
@@ -109,7 +110,7 @@ foreach target: test_target
   exe = executable(
     target[0],
     [target[0] + '.cpp'] + [target[1]],
-    # below is temporary measure, we will eventually remove unittest_nntrainer_models
+#below is temporary measure, we will eventually remove unittest_nntrainer_models
     include_directories: include_directories('models'),
     dependencies: unittest_nntrainer_deps,
     install: get_option('enable-test'),
@@ -124,7 +125,7 @@ endforeach
 
 unittest_inc = include_directories('.')
 
-# subdir('memory')
+#subdir('memory')
 subdir('compiler')
 subdir('layers')
 subdir('datasets')

@@ -67,7 +67,8 @@ public:
   static uint8_t pack(const float *weights, const float *scales,
                       const size_t row_id, const size_t column_id,
                       const size_t groups_per_row, const size_t group_size,
-                      const size_t rows_count, const size_t columns_count);
+                      const size_t rows_count, const size_t columns_count,
+                      const bool convert_with_add8 = false);
 
   /**
    * @brief Quantize weights float* matrix to OpenVINO layout:
@@ -89,13 +90,21 @@ public:
                                 std::vector<uint8_t> &out_weights,
                                 std::vector<uint16_t> &out_scales);
 
+  static void quantizeAndRepackSimpleLayout(const float *weights,
+                                            const size_t rows_count,
+                                            const size_t columns_count,
+                                            const size_t group_size,
+                                            std::vector<uint16_t> &out_weights,
+                                            std::vector<uint16_t> &out_scales);
+
   /**
    * @brief     Quantize one float value to 4-bits integer
    * @param[in] weight input weight
    * @param[in] scale input scale
    * @return 4-bit integer
    */
-  static uint8_t quantizeToInt4(const float weight, const float scale);
+  static uint8_t quantizeToInt4(const float weight, const float scale,
+                                bool convert_with_add8 = false);
 
   /**
    * @brief     Convert 4-bit integer value to 32-bit integer

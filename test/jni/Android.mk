@@ -1,91 +1,89 @@
-LOCAL_PATH := $(call my-dir)
+LOCAL_PATH : = $(call my - dir)
+
+               include
+               $(CLEAR_VARS)
+
+#ndk path
+ifndef ANDROID_NDK $(error ANDROID_NDK is not defined !) endif
+
+  ifndef NNTRAINER_ROOT NNTRAINER_ROOT
+  : = $(LOCAL_PATH) /../
+                       ..endif
+
+#ARM architecture flags -                                                      \
+  can be overridden via MESON_ARM_MARCH environment variable
+#Default : armv8 .2 - a + fp16 + dotprod +                                     \
+  i8mm(for compatibility with existing builds)
+                       ifdef MESON_ARM_MARCH ARM_MARCH_FLAGS
+  : = $(MESON_ARM_MARCH) else ARM_MARCH_FLAGS : = $(ARM_MARCH_FLAGS) endif
+
+                                                ML_API_COMMON_INCLUDES
+  : = ${NNTRAINER_ROOT} / ml_api_common /
+      include NNTRAINER_INCLUDES
+  : = $(NNTRAINER_ROOT) / nntrainer $(NNTRAINER_ROOT) / nntrainer
+      / dataset $(NNTRAINER_ROOT) / nntrainer
+      / models $(NNTRAINER_ROOT) / nntrainer
+      / layers $(NNTRAINER_ROOT) / nntrainer
+      / compiler $(NNTRAINER_ROOT) / nntrainer
+      / graph $(NNTRAINER_ROOT) / nntrainer
+      / optimizers $(NNTRAINER_ROOT) / nntrainer
+      / tensor $(NNTRAINER_ROOT) / nntrainer / tensor
+      / cpu_backend $(NNTRAINER_ROOT) / nntrainer / tensor / cpu_backend
+      / fallback $(NNTRAINER_ROOT) / nntrainer / tensor / cpu_backend
+      / arm $(NNTRAINER_ROOT) / nntrainer / tensor / cpu_backend
+      / ggml_interface $(NNTRAINER_ROOT) / nntrainer / tensor / cpu_backend
+      / ggml_interface / nntr_ggml_impl $(NNTRAINER_ROOT) / nntrainer
+      / utils $(NNTRAINER_ROOT) / api $(NNTRAINER_ROOT) / api / ccapi /
+      include ${ML_API_COMMON_INCLUDES}
+
+      ifeq($(MESON_ENABLE_OPENCL), 1) NNTRAINER_INCLUDES
+    += $(NNTRAINER_ROOT) / nntrainer / opencl $(NNTRAINER_ROOT) / nntrainer
+       / tensor / cl_operations $(NNTRAINER_ROOT) / nntrainer / layers /
+       cl_layers endif
+
+       LOCAL_MODULE : = nntrainer LOCAL_SRC_FILES
+  : = $(NNTRAINER_ROOT) / builddir / jni / $(TARGET_ARCH_ABI) /
+      libnntrainer.so
+
+      include $(PREBUILT_SHARED_LIBRARY)
 
 include $(CLEAR_VARS)
 
-# ndk path
-ifndef ANDROID_NDK
-$(error ANDROID_NDK is not defined!)
-endif
+  LOCAL_MODULE : = ccapi - nntrainer LOCAL_SRC_FILES
+  : = $(NNTRAINER_ROOT) / builddir / jni / $(TARGET_ARCH_ABI) / libccapi
+      - nntrainer.so
 
-ifndef NNTRAINER_ROOT
-NNTRAINER_ROOT := $(LOCAL_PATH)/../..
-endif
+        include $(PREBUILT_SHARED_LIBRARY)
 
-# ARM architecture flags - can be overridden via MESON_ARM_MARCH environment variable
-# Default: armv8.2-a+fp16+dotprod+i8mm (for compatibility with existing builds)
-ifdef MESON_ARM_MARCH
-ARM_MARCH_FLAGS := $(MESON_ARM_MARCH)
-else
-ARM_MARCH_FLAGS := $(ARM_MARCH_FLAGS)
-endif
+          ifeq($(MESON_ENABLE_OPENCL), 1) include $(CLEAR_VARS)
 
+            LOCAL_MODULE : = opencl LOCAL_SRC_FILES
+  : = $(NNTRAINER_ROOT) / builddir / jni / $(TARGET_ARCH_ABI) /
+      libOpenCL.so
 
-ML_API_COMMON_INCLUDES := ${NNTRAINER_ROOT}/ml_api_common/include
-NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/nntrainer \
-	$(NNTRAINER_ROOT)/nntrainer/dataset \
-	$(NNTRAINER_ROOT)/nntrainer/models \
-	$(NNTRAINER_ROOT)/nntrainer/layers \
-	$(NNTRAINER_ROOT)/nntrainer/compiler \
-	$(NNTRAINER_ROOT)/nntrainer/graph \
-	$(NNTRAINER_ROOT)/nntrainer/optimizers \
-	$(NNTRAINER_ROOT)/nntrainer/tensor \
-	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend \
-	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/fallback \
-	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/arm \
-	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/ggml_interface \
-	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/ggml_interface/nntr_ggml_impl \
-	$(NNTRAINER_ROOT)/nntrainer/utils \
-	$(NNTRAINER_ROOT)/api \
-	$(NNTRAINER_ROOT)/api/ccapi/include \
-	${ML_API_COMMON_INCLUDES}
-
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-NNTRAINER_INCLUDES += $(NNTRAINER_ROOT)/nntrainer/opencl \
-	$(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
-	$(NNTRAINER_ROOT)/nntrainer/layers/cl_layers 
-endif
-
-
-LOCAL_MODULE := nntrainer
-LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/jni/$(TARGET_ARCH_ABI)/libnntrainer.so
-
-include $(PREBUILT_SHARED_LIBRARY)
+      include $(PREBUILT_SHARED_LIBRARY)
 
 include $(CLEAR_VARS)
 
-LOCAL_MODULE := ccapi-nntrainer
-LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/jni/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so
+  LOCAL_MODULE : = clblast LOCAL_SRC_FILES
+  : = $(NNTRAINER_ROOT) / builddir / obj / local / $(TARGET_ARCH_ABI) /
+      libclblast.a
 
-include $(PREBUILT_SHARED_LIBRARY)
-
-
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-include $(CLEAR_VARS)
-
-LOCAL_MODULE := opencl
-LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/jni/$(TARGET_ARCH_ABI)/libOpenCL.so
-
-include $(PREBUILT_SHARED_LIBRARY)
-
-include $(CLEAR_VARS)
-
-LOCAL_MODULE := clblast
-LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/obj/local/$(TARGET_ARCH_ABI)/libclblast.a
-
-include $(PREBUILT_STATIC_LIBRARY)
+      include $(PREBUILT_STATIC_LIBRARY)
 endif
 
-include $(CLEAR_VARS)
-GTEST_PATH := googletest
+  include
+  $(CLEAR_VARS) GTEST_PATH : = googletest
 
-LOCAL_MODULE := googletest_main
-LOCAL_CFLAGS := -Igoogletest/include -Igoogletest/
-LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
+                             LOCAL_MODULE : = googletest_main LOCAL_CFLAGS
+  : = -Igoogletest / include - Igoogletest / LOCAL_CXXFLAGS
+    += -std = c++ 17 - frtti -
+              fexceptions
 
-LOCAL_SRC_FILES := \
-    $(GTEST_PATH)/src/gtest-all.cc
+              LOCAL_SRC_FILES
+  : = $(GTEST_PATH) / src / gtest - all.cc
 
-include $(BUILD_STATIC_LIBRARY)
+                                    include $(BUILD_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
 
@@ -114,16 +112,13 @@ LOCAL_SRC_FILES := \
 LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
 
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+                                          LOCAL_C_INCLUDES
+                                        += $(NNTRAINER_INCLUDES)../ include
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+                                           LOCAL_SRC_FILES
+  : =../ nntrainer_test_util.cpp
 
-include $(BUILD_EXECUTABLE)
-
+         include $(BUILD_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
 
@@ -132,21 +127,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_nntrainer_exe_order.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_activations.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
-
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -155,21 +150,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_nntrainer_internal.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_exe_order.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
-
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -181,19 +176,21 @@ LOCAL_LDLIBS        := -llog -landroid
 LOCAL_SRC_FILES := \
     ../unittest/unittest_nntrainer_lazy_tensor.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_internal.cpp
 
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
-
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -202,22 +199,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_nntrainer_tensor.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_lazy_tensor.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
-
-include $(BUILD_EXECUTABLE)
-
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -229,19 +225,21 @@ LOCAL_LDLIBS        := -llog -landroid
 LOCAL_SRC_FILES := \
     ../unittest/unittest_nntrainer_tensor_nhwc.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_tensor.cpp
 
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
-
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -253,19 +251,21 @@ LOCAL_LDLIBS        := -llog -landroid
 LOCAL_SRC_FILES := \
     ../unittest/unittest_nntrainer_tensor_fp16.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_tensor_nhwc.cpp
 
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
-
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -274,21 +274,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_util_func.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_tensor_fp16.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
-
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -297,21 +297,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_nntrainer_modelfile.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_util_func.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
-
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -323,18 +323,21 @@ LOCAL_LDLIBS        := -llog -landroid
 LOCAL_SRC_FILES := \
     ../unittest/unittest_nntrainer_graph.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_modelfile.cpp
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-include $(BUILD_EXECUTABLE)
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
+    include $(BUILD_EXECUTABLE)
 
 
 
@@ -345,20 +348,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_nntrainer_appcontext.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_graph.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -367,20 +371,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_base_properties.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_appcontext.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -389,20 +394,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_common_properties.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_base_properties.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -411,20 +417,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_nntrainer_tensor_neon_fp16.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_common_properties.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -433,20 +440,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_nntrainer_tensor_pool.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_tensor_neon_fp16.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -455,20 +463,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_nntrainer_tensor_pool_fp16.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_tensor_pool.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -477,20 +486,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../unittest/unittest_nntrainer_lr_scheduler.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_tensor_pool_fp16.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -499,22 +509,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/compiler -pthrea
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-     ../unittest/compiler/compiler_test_util.cpp \
-     ../unittest/compiler/unittest_compiler.cpp \
-     ../unittest/compiler/unittest_realizer.cpp \
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_lr_scheduler.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -523,22 +532,22 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/models -pthread 
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-	../unittest/unittest_nntrainer_models.cpp \
-	../unittest/models/models_test_utils.cpp \
-	../unittest/models/models_golden_test.cpp 
+                                                         LOCAL_SRC_FILES
+  : =../ unittest / compiler / compiler_test_util.cpp../ unittest / compiler
+     / unittest_compiler.cpp../ unittest / compiler /
+     unittest_realizer.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -547,24 +556,22 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/models -pthread 
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-	 ../unittest/models/models_test_utils.cpp \
-	 ../unittest/models/models_golden_test.cpp \
-	 ../unittest/models/unittest_models_recurrent.cpp \
-	 ../unittest/models/unittest_models_multiout.cpp \
-	 ../unittest/models/unittest_models.cpp \
+                                                         LOCAL_SRC_FILES
+  : =../ unittest / unittest_nntrainer_models.cpp../ unittest / models
+     / models_test_utils.cpp../ unittest / models /
+     models_golden_test.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -591,7 +598,6 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -661,12 +667,8 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
 endif
 
-include $(BUILD_EXECUTABLE)
-
-ifeq ($(MESON_ENABLE_OPENCL), 1)
 include $(CLEAR_VARS)
 
 LOCAL_MODULE := unittest_opencl_kernels_blas
@@ -684,7 +686,6 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -696,20 +697,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/layers -I../../n
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-	 ../unittest/unittest_opencl_kernels_int4.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_opencl_kernels_int4.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -718,20 +720,21 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/layers -I../../n
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-	 ../unittest/unittest_opencl_kernels_qk_k.cpp
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_opencl_kernels_qk_k.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -751,33 +754,78 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
 endif
 
 include $(BUILD_EXECUTABLE)
-endif
 
 include $(CLEAR_VARS)
+
+  LOCAL_MODULE : = unittest_opencl_kernels_int4_adreno LOCAL_CFLAGS
+  : = -Igoogletest / include - I../ include - I../ unittest / layers
+      - I../../ nntrainer / layers / loss - pthread - fexceptions - fopenmp -
+      static - openmp - DMIN_CPP_VERSION =
+        201703L - DNNTR_NUM_THREADS =
+          1 - D__LOGGING__ =
+            1 - DENABLE_TEST =
+              1 - DREDUCE_TOLERANCE =
+                1 $(ARM_MARCH_FLAGS) - O3 - frtti - DNDK_BUILD =
+                  1 - DENABLE_FP16 = 1 - DENABLE_OPENCL = 1 ifeq($(NDK_DEBUG),
+                                                                 1) LOCAL_CFLAGS
+    += -DDEBUG endif LOCAL_CXXFLAGS
+    += -std = c++ 17 - frtti LOCAL_LDLIBS
+  : = -llog - landroid - fopenmp - static -
+      openmp
+
+      LOCAL_SRC_FILES : =../ unittest /
+                         unittest_opencl_kernels_int4_adreno.cpp
+
+                         LOCAL_C_INCLUDES
+                        += $(NNTRAINER_INCLUDES)
+
+                          LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
+
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
+
+    include $(BUILD_EXECUTABLE)
+endif
+
+  include
+  $(CLEAR_VARS)
+
+    LOCAL_MODULE : = unittest_nntrainer_cpu_backend LOCAL_CFLAGS
+  : = -Igoogletest / include - I../ include - I../ unittest / layers
+      - I../../ nntrainer / layers / loss - pthread - fexceptions - fopenmp -
+      static - openmp - DMIN_CPP_VERSION =
+        201703L - DNNTR_NUM_THREADS =
+          1 - D__LOGGING__ =
+            1 - DENABLE_TEST =
+              1 - DREDUCE_TOLERANCE =
+                1 $(ARM_MARCH_FLAGS) - O3 - frtti - DNDK_BUILD =
+                  1 - DENABLE_FP16 = 1 - DUSE__FP16 = 1 LOCAL_CXXFLAGS +=
+    -std = c++ 17 - frtti - fexceptions LOCAL_LDLIBS : = -llog - landroid
+                                                         - fopenmp - static -
+                                                         openmp
+
+                                                         LOCAL_SRC_FILES
+  : =../ unittest /
+     unittest_nntrainer_cpu_backend.cpp
+
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
+
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
 LOCAL_MODULE := unittest_nntrainer_cpu_backend
 LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/layers -I../../nntrainer/layers/loss -pthread -fexceptions -DMIN_CPP_VERSION=201703L -DNNTR_NUM_THREADS=1 -D__LOGGING__=1 -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 $(ARM_MARCH_FLAGS) -O3 -frtti -DNDK_BUILD=1 -DENABLE_FP16=1 -DUSE__FP16=1
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-	 ../unittest/unittest_nntrainer_cpu_backend.cpp
-
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
-
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
-
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
-
-include $(BUILD_EXECUTABLE)
+    include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
@@ -818,7 +866,6 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -848,18 +895,19 @@ LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CP
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
-LOCAL_SRC_FILES := \
-    ../ccapi/unittest_ccapi.cpp
+                                                            LOCAL_SRC_FILES
+  : =../ ccapi /
+     unittest_ccapi.cpp
 
-LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+     LOCAL_C_INCLUDES
+    += $(NNTRAINER_INCLUDES)
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := googletest_main test_util
+      LOCAL_SHARED_LIBRARIES
+  : = nntrainer ccapi - nntrainer LOCAL_STATIC_LIBRARIES
+  : = googletest_main test_util
 
-ifeq ($(MESON_ENABLE_OPENCL), 1)
-LOCAL_SHARED_LIBRARIES += opencl
-LOCAL_STATIC_LIBRARIES += clblast
-endif
+    ifeq($(MESON_ENABLE_OPENCL), 1) LOCAL_SHARED_LIBRARIES
+    += opencl endif
 
 include $(BUILD_EXECUTABLE)
 

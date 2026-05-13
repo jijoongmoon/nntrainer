@@ -83,13 +83,14 @@ void Int4Utils::computeScales(const float *weights, const size_t rows_count,
 uint8_t Int4Utils::pack(const float *weights, const float *scales,
                         const size_t row_id, const size_t column_id,
                         const size_t groups_per_row, const size_t group_size,
-                        const size_t rows_count, const size_t columns_count) {
+                        const size_t rows_count, const size_t columns_count,
+                        const bool convert_with_add8) {
   {
     const auto rows_count_pad = align(rows_count, ROW_BLOCK_SIZE);
     const float scale =
       scales[row_id + ((column_id / group_size) * rows_count_pad)];
     const float weight = weights[(row_id * columns_count) + column_id];
-    return quantizeToInt4(weight, scale);
+    return quantizeToInt4(weight, scale, convert_with_add8);
   }
 }
 
@@ -163,7 +164,70 @@ void Int4Utils::quantizeAndRepack(const float *weights, const size_t rows_count,
   }
 }
 
-uint8_t Int4Utils::quantizeToInt4(const float weight, const float scale) {
+void Int4Utils::quantizeAndRepackSimpleLayout(
+  const float *weights, const size_t N, const size_t K, const size_t group_size,
+  std::vector<uint16_t> &out_weights, std::vector<uint16_t> &out_scales) {
+  int COLUMN_BLOCK_SIZE_ADRENO = 4;
+  NNTR_THROW_IF(!weights, std::invalid_argument) << "Weight cannot be null";
+
+  NNTR_THROW_IF((N <= 0), std::invalid_argument)
+    << "Rows count needs to be greater than 0";
+
+  NNTR_THROW_IF((K <= 0), std::invalid_argument)
+    << "Columns count needs to be greater than 0";
+
+  NNTR_THROW_IF((!(group_size == 32 || group_size == 64 || group_size == 128)),
+                std::invalid_argument)
+    << "Group size must be 32/64/128";
+
+  std::vector<float> scales_fp32;
+  computeScales(weights, N, K, group_size, scales_fp32);
+
+  out_scales.resize(scales_fp32.size());
+  for (size_t scale_id = 0; scale_id < scales_fp32.size(); ++scale_id) {
+    out_scales[scale_id] = compute_fp32_to_fp16(scales_fp32[scale_id]);
+  }
+
+  const auto K_pad = align(K, group_size);
+  const auto K_pack_count = ceilDiv(K_pad, COLUMN_BLOCK_SIZE_ADRENO);
+
+  out_weights.resize(N * K_pack_count, 0);
+
+  for (size_t k = 0; k < K_pack_count; ++k) {
+    for (size_t n = 0; n < N; ++n) {
+      uint16_t bits0 = 0, bits1 = 0, bits2 = 0, bits3 = 0;
+      const auto n_id = n;
+      if (n < N) {
+        const auto k_id = k * COLUMN_BLOCK_SIZE_ADRENO;
+        if (k_id < K) {
+          bits0 = pack(weights, scales_fp32.data(), n_id, k_id, 0, group_size,
+                       N, K, true);
+        }
+        if (k_id + 1 < K) {
+          bits1 = pack(weights, scales_fp32.data(), n_id, k_id + 1, 0,
+                       group_size, N, K, true);
+        }
+        if (k_id + 2 < K) {
+          bits2 = pack(weights, scales_fp32.data(), n_id, k_id + 2, 0,
+                       group_size, N, K, true);
+        }
+        if (k_id + 3 < K) {
+          bits3 = pack(weights, scales_fp32.data(), n_id, k_id + 3, 0,
+                       group_size, N, K, true);
+        }
+      }
+
+      out_weights[k * N + n] =
+        uint16_t((bits3 << 12) | (bits2 << 8) | (bits1 << 4) | bits0);
+    }
+  }
+}
+
+uint8_t Int4Utils::quantizeToInt4(const float weight, const float scale,
+                                  bool convert_with_add8) {
+  // convert_with_add8=true : [-8,-7,...,7] -> [0,1,2,...15]
+  // convert_with_add8=false : [-8,-7,..,-1,0,1,...,7] -> [8,9,...,15,0,1,...,7]
+
   auto div = std::nearbyintf(weight / scale);
 
   if (std::isnan(div)) {
@@ -172,7 +236,12 @@ uint8_t Int4Utils::quantizeToInt4(const float weight, const float scale) {
 
   div = std::clamp(div, -8.0f, 7.0f);
   int quantized = (int)div;
-  return uint8_t(quantized & 0xF);
+
+  if (convert_with_add8) {
+    return uint8_t(quantized + 8);
+  } else {
+    return uint8_t(quantized & 0xF);
+  }
 }
 
 int Int4Utils::convertInt4ToInt(const uint8_t int4_value) {
