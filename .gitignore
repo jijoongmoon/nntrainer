@@ -71,3 +71,5 @@ test/jni/googletest/
 ctre-unicode.hpp
 encoder.hpp
 json.hpp
+
+tools/test_android.sh

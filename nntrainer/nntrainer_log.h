@@ -39,18 +39,20 @@
 
 #elif defined(__ANDROID__)
 #include <android/log.h>
+#include <nntrainer_logger.h>
+#define ml_logi(format, ...) \
+  __nntrainer_log_print(NNTRAINER_LOG_INFO, "(%s:%s:%d) " format, __FILE__, \
+                        __func__, __LINE__, ##__VA_ARGS__)
+#define ml_logw(format, ...) \
+  __nntrainer_log_print(NNTRAINER_LOG_WARN, "(%s:%s:%d) " format, __FILE__, \
+                        __func__, __LINE__, ##__VA_ARGS__)
+#define ml_loge(format, ...) \
+  __nntrainer_log_print(NNTRAINER_LOG_ERROR, "(%s:%s:%d) " format, __FILE__, \
+                        __func__, __LINE__, ##__VA_ARGS__)
+#define ml_logd(format, ...) \
+  __nntrainer_log_print(NNTRAINER_LOG_DEBUG, "(%s:%s:%d) " format, __FILE__, \
+                        __func__, __LINE__, ##__VA_ARGS__)
 
-#define ml_logi(...) \
-  __android_log_print(ANDROID_LOG_INFO, TAG_NAME, __VA_ARGS__)
-
-#define ml_logw(...) \
-  __android_log_print(ANDROID_LOG_WARN, TAG_NAME, __VA_ARGS__)
-
-#define ml_loge(...) \
-  __android_log_print(ANDROID_LOG_ERROR, TAG_NAME, __VA_ARGS__)
-
-#define ml_logd(...) \
-  __android_log_print(ANDROID_LOG_DEBUG, TAG_NAME, __VA_ARGS__)
 
 #else /* Linux distro */
 #include <nntrainer_logger.h>

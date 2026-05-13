@@ -31,6 +31,8 @@
 
 using namespace nntrainer;
 
+#define Q4_0 32
+
 static void run_q_6_K_test(const uint32_t M, const uint32_t K,
                            const uint32_t N) {
   nntrainer::init_backend();

@@ -118,6 +118,10 @@ void gemm_int4_cl(void *input, void *weights, void *scales, void *output,
                   unsigned int M, unsigned int N, unsigned int K,
                   unsigned int quantization_group_size);
 
+void gemm_int4_cl_adreno(void *input, void *weights, void *scales, void *output,
+                  unsigned int M, unsigned int N, unsigned int K,
+                  unsigned int quantization_group_size);
+
 /**
  * @brief INT4 GEMM async computation
  */
