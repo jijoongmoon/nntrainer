@@ -1,0 +1,12 @@
+option('platform', type: 'combo', choices: ['auto', 'x86', 'android'], value: 'auto',
+       description: 'Target platform (auto detects from cross file)')
+option('nntrainer_builddir', type: 'string', value: 'builddir_x86',
+       description: 'nntrainer build directory name (x86 only)')
+option('enable-qnn', type: 'boolean', value: false,
+       description: 'Build QNN integration - android only (qnn_context lib + qnn-transformer model)')
+option('enable-fp16', type: 'boolean', value: true,
+       description: 'Enable FP16 support')
+option('enable-api', type: 'boolean', value: false,
+       description: 'Build libquick_dot_ai_api.so')
+option('enable-api-test', type: 'boolean', value: false,
+       description: 'Build quick_dot_ai_test executable')

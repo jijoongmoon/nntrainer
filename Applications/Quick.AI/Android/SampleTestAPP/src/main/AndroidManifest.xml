@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      SampleTestAPP runs the QuickDotAI AAR in-process: no remote service,
+      no REST server, no sockets. We therefore do not need INTERNET or
+      FOREGROUND_SERVICE permissions.
+
+      The <uses-native-library> entries required by LiteRT-LM's GPU backend
+      (libvndksupport.so, libOpenCL.so) are declared in the :QuickDotAI AAR
+      manifest and merged in automatically.
+    -->
+
+    <application
+        android:allowBackup="false"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="@string/app_name"
+        android:roundIcon="@android:drawable/sym_def_app_icon"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.SampleTestAPP">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
