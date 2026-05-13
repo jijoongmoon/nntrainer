@@ -312,6 +312,12 @@ public:
    */
   QScheme q_scheme() const override;
 
+  /**
+   * @brief Returns the default quantization group size used by Int4QTensor.
+   * @note Static helper retained for ComputeOps adapter call sites that need a
+   * compile-time-known group size when no Int4QTensor instance is in scope.
+   */
+  static size_t getGroupSize() { return 32; }
 
   /**
    * @brief Get the fixed KleidiAI kernel index based on compile‑time

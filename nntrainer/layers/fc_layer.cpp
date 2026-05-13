@@ -297,27 +297,27 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
         K);
   }
 
+#if NNTR_HAS_KAI_INT4
   size_t rhs_native_size_qs4cx = static_cast<size_t>(N) * (((K + 2 - 1) / 2) * 2 / 2) * sizeof(uint8_t); //nxk
   size_t rhs_scales_size_f32 = N * sizeof(float);
-  
+
   uint8_t k_idx = 3;
   std::vector<float> kai_quant_scale(N);
   std::vector <uint8_t> kai_quant_data (N * K / 2);
-  size_t packed_size = nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+  size_t packed_size = nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
       N, K, k_idx, true);
 
   std::vector<uint8_t> packed_weights(packed_size);
-  //std::cout << weight_fp32.data()[0] << " " << weight_fp32.data()[1] << " " << weight_fp32.data()[2] << std::endl;  
-  nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data());
-           
-  //std::cout << kai_quant_scale.data()[0] << kai_quant_scale.data()[1] << kai_quant_scale.data()[2] << std::endl;          
-  nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
+  nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data(), true);
+
+  nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
                                   packed_weights.data(),
                                   kai_quant_data.data(),
                                   kai_quant_scale.data(),
                                   k_idx, true);
-  
+
   memcpy(W_qint4.getData<uint8_t>(), packed_weights.data(), packed_size);
+#endif
   // @todo make it parallelized with batch axis
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
     Tensor input_step = input_.getSharedDataTensor(
@@ -327,8 +327,9 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
 
     //input_step.dot(W_qint4, hidden_step, false, true);
     if(weight.getDataType() == nntrainer::Tdatatype::Q4_0){
+#if NNTR_HAS_KAI_INT4
       auto M = hidden_step.height();
-      nntrainer::nntr_gemm_qai8dxp_qsi4cxp_packed(
+      nntr_gemm_qai8dxp_qsi4cxp_packed(
         M, N, K,
         (void *)input_step.getData(),        // LHS (activations) - will be packed internally
         (void *)packed_weights.data(),       // RHS (weights) - assumed already packed in block-32 format
@@ -338,10 +339,13 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
         -std::numeric_limits<float>::infinity(),  // lower_bound
         std::numeric_limits<float>::infinity()    // upper_bound
       );
+#else
+      input_step.dot(weight, hidden_step, false, true);
+#endif
     } else{
       input_step.dot(weight, hidden_step, false, true);
     }
-    
+
     if (!std::get<props::LoraRank>(fc_props).empty()) {
       nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora.getDim();
       hidden_tmp_lora_step_dim.batch(1);

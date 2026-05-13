@@ -448,25 +448,28 @@ public:
                         K);
                   }
 
+#if NNTR_HAS_KAI_INT4
                   size_t rhs_native_size_qs4cx = static_cast<size_t>(N) * (((K + 2 - 1) / 2) * 2 / 2) * sizeof(uint8_t); //nxk
                   size_t rhs_scales_size_f32 = N * sizeof(float);
-                  
+
                   uint8_t k_idx = 3;
                   std::vector<float> kai_quant_scale(N);
                   std::vector <uint8_t> kai_quant_data (N * K / 2);
-                  size_t packed_size = nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+                  size_t packed_size = nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
                       N, K, k_idx, true);
 
                   std::vector<uint8_t> packed_weights(packed_size);
-                  //std::cout << weight_fp32.data()[0] << " " << weight_fp32.data()[1] << " " << weight_fp32.data()[2] << std::endl;  
-                  nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data());
-                          
-                  //std::cout << kai_quant_scale.data()[0] << kai_quant_scale.data()[1] << kai_quant_scale.data()[2] << std::endl;          
-                  nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
+                  nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)kai_quant_data.data(), (void *)kai_quant_scale.data(), true);
+
+                  nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
                                                   packed_weights.data(),
                                                   kai_quant_data.data(),
                                                   kai_quant_scale.data(),
                                                   k_idx, true);
+#else
+                  size_t packed_size = 0;
+                  std::vector<uint8_t> packed_weights;
+#endif
 
                   std::cout << packed_size << std::endl;
                   std::cout << W_qint4.getMemoryBytes() << std::endl;
@@ -616,13 +619,15 @@ public:
               W_q40.deallocate();
               nntrainer::dequantize_row_q4_0 ((void *)unpacked_weight.data() , weight_fp32.data(), N*K);
 
-              nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)unpacked_weight.data(), (void *)kai_quant_scale.data(), true);
+#if NNTR_HAS_KAI_INT4
+              nntr_quant_qs4cx_f32(N, K, (void *)weight_fp32.data(), (void *)unpacked_weight.data(), (void *)kai_quant_scale.data(), true);
 
               nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
                                         W_qint4.getData(),
                                         unpacked_weight.data(),
                                         kai_quant_scale.data(),
                                         3, true);
+#endif
             }
             else{
               // file_fd is forwarded so virtual weights (e.g. SlimMoE expert

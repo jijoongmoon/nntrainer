@@ -670,7 +670,7 @@ size_t Int4QTensor::getMemoryBytes() const {
   int32_t idx = static_cast<int32_t>(get_kleidiai_kernel_idx());
   if (idx >= 0){
       
-      return nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(width(), height(), idx, true);
+      return nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(width(), height(), idx, true);
   }
   else{
       return ((size() + 1) / 2) * dim.getDataTypeSize() +

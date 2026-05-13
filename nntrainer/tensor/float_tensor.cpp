@@ -1020,11 +1020,16 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
     }
   } else {
     if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
+#if NNTR_HAS_KAI_INT4
       int32_t kernel_idx = Int4QTensor::get_kleidiai_kernel_idx();
       nntr_gemm_qai8dxp_qsi4cxp_packed(
         M, N, K, (void *)data, (void *)mdata, rdata, kernel_idx,
         true, -std::numeric_limits<float>::infinity(),
         std::numeric_limits<float>::infinity());
+#else
+      throw std::runtime_error(
+        "QINT4 PER_CHANNEL_AFFINE Dot requires the ARM KleidiAI backend.");
+#endif
     } else {
 #ifdef ENABLE_FP16
       throw std::runtime_error(

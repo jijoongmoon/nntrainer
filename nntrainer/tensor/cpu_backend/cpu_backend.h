@@ -32,6 +32,17 @@
 #include <cstdint>
 #include <tensor_dim.h>
 
+// KleidiAI INT4 (qai8dxp_qsi4cxp) kernels and their fallbacks live in the ARM
+// compute backend and the FP16-enabled fallback paths. On x86/non-FP16 builds
+// the symbols are not linked, so callers must avoid the KAI code path.
+#if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
+  defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
+  defined(_M_ARM64) || defined(__ARM_NEON) || defined(__ARM_NEON__)
+#define NNTR_HAS_KAI_INT4 1
+#else
+#define NNTR_HAS_KAI_INT4 0
+#endif
+
 #ifdef ENABLE_FP16
 /**
  * @brief F32 * F16 = F32 GEMM
@@ -630,7 +641,6 @@ extern void nntr_gemm_qsi8d32p_qsi4c32p_packed(
   void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
   T upper_bound = std::numeric_limits<T>::max());
-#endif
 // init_backend() is declared in compute_ops.h (canonical location).
 
 /**
