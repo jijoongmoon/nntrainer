@@ -18,3 +18,4 @@ if get_option('platform') != 'windows'
     subdir('gpt_oss_cached_slim')
     subdir('qwen3_cached_slim_moe')
 endif
+subdir('clip_vit')
