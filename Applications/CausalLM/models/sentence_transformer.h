@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <kv_cache_manager.h>
 #include <map>
 #include <transformer.h>
 
@@ -67,7 +68,7 @@ protected:
   /**
    * @brief Construct Model
    */
-  void constructModel() override;
+  std::pair<Tensor, Tensor> constructModel() override;
 
   /**
    * @brief Map of module type suffix to layer type name
@@ -82,10 +83,16 @@ protected:
   static std::map<std::string, std::string> layer_map;
 
   /**
-   * @brief Add Module Layer
-   * @param config Configuration for the layer
+   * @brief Add Module Layer onto the symbolic graph
+   * @param type module type string (e.g.,
+   *             "sentence_transformers.models.Pooling")
+   * @param idx  module index used to look up its config
+   * @param input tensor that feeds the new module
+   * @return the module's output tensor (or @p input unchanged if the type
+   *         cannot be mapped, so the chain continues)
    */
-  void addModule(const std::string &type, int idx);
+  Tensor addModule(const std::string &type, int idx,
+                   const std::string &module_name, Tensor input);
 
   /**
    * @brief register CustomLayers
@@ -93,6 +100,14 @@ protected:
   void registerCustomLayers() override;
 
 private:
+  /**
+   * @brief Allocate and bind external KV cache placeholders for attention
+   * layers.
+   */
+  void allocateAndBindKVCache();
+
+  KVCacheManager kv_cache;
+
   /**
    * @brief Module metadata list (from modules.json)
    */

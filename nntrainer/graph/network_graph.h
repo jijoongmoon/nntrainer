@@ -21,6 +21,7 @@
 #include <stack>
 #include <vector>
 
+#include <engine.h>
 #include <graph_core.h>
 #include <layer_node.h>
 #include <manager.h>
@@ -64,13 +65,19 @@ public:
    * (default NCHW)
    * @param[in] tensor_type It says weight type and activation type (default
    * FP32-FP32)
+   * @param[in] engine_name name of the registered Context whose
+   *            MemAllocator the graph's Manager should use for tensor
+   *            buffer allocation (default "cpu"). Resolves once at
+   *            construction; a missing engine throws.
    */
   NetworkGraph(bool enable_fsu, ExecutionMode mode = ExecutionMode::TRAIN,
                const std::string &fsu_path = "", unsigned int lookahead = 0,
                const std::string &tensor_format_ = "NCHW",
-               const std::string &tensor_dtype_ = "FP32-FP32") :
+               const std::string &tensor_dtype_ = "FP32-FP32",
+               const std::string &engine_name = "cpu") :
     tensor_manager(std::make_shared<Manager>(
-      enable_fsu, fsu_path, lookahead, tensor_format_, tensor_dtype_, mode)),
+      enable_fsu, fsu_path, lookahead, tensor_format_, tensor_dtype_, mode,
+      Engine::Global().getRegisteredContext(engine_name)->getMemAllocator())),
     graph(),
     compiled(false),
     batch_size(0),
@@ -542,6 +549,33 @@ public:
     tensor_manager->setWeightOffset(offsets);
   }
 
+  /**
+   * @brief Look up a graph tensor by name.
+   *
+   * Used by the ml::train::Tensor symbolic API to wire each input Tensor
+   * handle to its corresponding graph placeholder right after
+   * compile/initialize/allocate, so post-compile updates can flow through
+   * `tensor.setData(host_buf)` instead of an external by-name binding.
+   *
+   * Returns nullptr (rather than throwing) when the name is missing. Manager
+   * itself throws std::out_of_range from the underlying unordered_map::at;
+   * the binding loop in tensor_api_graph wants a yes/no answer to decide
+   * between bound_tensor and a fallback eager_data tensor, so the throw
+   * gets absorbed here.
+   *
+   * @param name tensor or input-layer name
+   * @return Tensor* pointer to the graph-owned tensor; nullptr if not found.
+   */
+  Tensor *getTensor(const std::string &name) {
+    if (!tensor_manager)
+      return nullptr;
+    try {
+      return tensor_manager->getTensor(name);
+    } catch (...) {
+      return nullptr;
+    }
+  }
+
 private:
   std::map<std::string, std::string> sub_in_out; /** This is map to identify
                  input and output layer name of subgraph */
@@ -661,15 +695,23 @@ private:
    */
   void setExecutionOrder();
 
+public:
   /**
    * @brief Set external data to the given tensors with name
    *
-   * @param data External data
-   * @param names Names of the tensor to set the data to
+   * Bind externally-owned tensors into the graph by input layer name (or
+   * label name). Each name must match an input layer that was declared in
+   * the symbolic graph; the matching tensor is wired into the layer's
+   * placeholder zero-copy. The caller retains ownership of the data.
+   *
+   * @param data  External data; size must match @p names (or be 1 for
+   *              broadcast).
+   * @param names Input-layer names to bind to.
    */
   void setExternalTensors(const std::vector<Tensor> &data,
                           const std::vector<std::string> names);
 
+private:
   /**
    * @brief     Optimize the graph memory utilization for in-place operations
    */
