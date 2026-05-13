@@ -385,13 +385,13 @@ void quantize_row_q4_0_ref(const float *__restrict x, block_q4_0 *__restrict y,
 
   assert(k % qk == 0);
 
-  const int nb = k / qk;
+  const int64_t nb = k / qk;
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     float amax = 0.0f; // absolute max
     float max = 0.0f;
 
-    for (int j = 0; j < qk; j++) {
+    for (int64_t j = 0; j < qk; j++) {
       const float v = x[i * qk + j];
       if (amax < fabsf(v)) {
         amax = fabsf(v);
@@ -472,9 +472,9 @@ void dequantize_row_q4_0_impl(const block_q4_0 *__restrict x,
 
   assert(k % qk == 0);
 
-  const int nb = k / qk;
+  const int64_t nb = k / qk;
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     const float d = nntr_fp16_to_fp32(x[i].d);
 
     for (int j = 0; j < qk / 2; ++j) {
@@ -497,9 +497,9 @@ void nntr_dequantize_row_q4_0(const void *__restrict x, float *__restrict y,
 void quantize_row_q8_0_ref(const float *__restrict x, block_q8_0 *__restrict y,
                            int64_t k) {
   assert(k % QK8_0 == 0);
-  const int nb = k / QK8_0;
+  const int64_t nb = k / QK8_0;
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     float amax = 0.0f; // absolute max
 
     for (int j = 0; j < QK8_0; j++) {
@@ -533,12 +533,12 @@ void nntr_quantize_row_q8_0(const float *__restrict x, void *__restrict vy,
                             int64_t k) {
   assert(QK8_0 == 32);
   assert(k % QK8_0 == 0);
-  const int nb = k / QK8_0;
+  const int64_t nb = k / QK8_0;
 
   block_q8_0 *__restrict y = (block_q8_0 *)vy;
 
 #if defined(__ARM_NEON)
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     float32x4_t srcv[8];
     float32x4_t asrcv[8];
     float32x4_t amaxv[8];
@@ -573,7 +573,7 @@ void nntr_quantize_row_q8_0(const float *__restrict x, void *__restrict vy,
     }
   }
 #elif defined __wasm_simd128__
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     v128_t srcv[8];
     v128_t asrcv[8];
     v128_t amaxv[8];
@@ -611,7 +611,7 @@ void nntr_quantize_row_q8_0(const float *__restrict x, void *__restrict vy,
     }
   }
 #elif defined(__AVX2__) || defined(__AVX__)
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     // Load elements into 4 AVX vectors
     __m256 v0 = _mm256_loadu_ps(x);
     __m256 v1 = _mm256_loadu_ps(x + 8);
@@ -703,7 +703,7 @@ void nntr_quantize_row_q8_0(const float *__restrict x, void *__restrict vy,
 
   size_t vl = QK8_0;
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     // load elements
     vfloat32m8_t v_x = __riscv_vle32_v_f32m8(x + i * QK8_0, vl);
 
@@ -728,7 +728,7 @@ void nntr_quantize_row_q8_0(const float *__restrict x, void *__restrict vy,
   }
 
 #elif defined(__POWER9_VECTOR__)
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     vector float srcv[8];
     vector float asrcv[8];
     vector float amaxv[8];
@@ -767,7 +767,7 @@ void nntr_quantize_row_q8_0(const float *__restrict x, void *__restrict vy,
   }
 
 #elif defined(__loongarch_asx)
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     __m256 v0 = (__m256)__lasx_xvld(x, 0);
     __m256 v1 = (__m256)__lasx_xvld(x, 32);
     __m256 v2 = (__m256)__lasx_xvld(x, 64);
@@ -833,7 +833,7 @@ void nntr_quantize_row_q8_0(const float *__restrict x, void *__restrict vy,
     __lsx_vst(ni4, (__m128i *)(y[i].qs + 16), 0);
   }
 #elif defined(__VXE__) || defined(__VXE2__)
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     __vector float srcv[8];
     __vector float asrcv[8];
     __vector float amaxv[8];
@@ -880,9 +880,9 @@ void dequantize_row_q8_0_impl(const block_q8_0 *__restrict x,
 
   assert(k % qk == 0);
 
-  const int nb = k / qk;
+  const int64_t nb = k / qk;
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     const float d = nntr_fp16_to_fp32(x[i].d);
 
     for (int j = 0; j < qk; ++j) {
@@ -901,7 +901,7 @@ void nntr_dequantize_row_q8_0(const void *__restrict x, float *__restrict y,
 void quantize_row_q4_K_ref(const float *__restrict x, block_q4_K *__restrict y,
                            int64_t k) {
   assert(k % QK_K == 0);
-  const int nb = k / QK_K;
+  const int64_t nb = k / QK_K;
 
   uint8_t L[QK_K];
   uint8_t Laux[32];
@@ -909,7 +909,7 @@ void quantize_row_q4_K_ref(const float *__restrict x, block_q4_K *__restrict y,
   float mins[QK_K / 32];
   float scales[QK_K / 32];
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     float max_scale =
       0; // as we are deducting the min, scales are always positive
     float max_min = 0;
@@ -993,7 +993,7 @@ static void quantize_row_q4_K_impl(const float *__restrict x,
   float mins[QK_K / 32];
   float scales[QK_K / 32];
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
 
     float sum_x2 = 0;
     for (int l = 0; l < QK_K; ++l)
@@ -1079,9 +1079,9 @@ size_t nntr_quantize_q4_K(const float *__restrict src, void *__restrict dst,
 void dequantize_row_q4_K_impl(const block_q4_K *__restrict x,
                               float *__restrict y, int64_t k) {
   assert(k % QK_K == 0);
-  const int nb = k / QK_K;
+  const int64_t nb = k / QK_K;
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     const uint8_t *q = x[i].qs;
 
     const float d = nntr_fp16_to_fp32(x[i].data.data.d);
@@ -1121,7 +1121,7 @@ void quantize_row_q6_K_ref(const float *__restrict x, block_q6_K *__restrict y,
   int8_t L[QK_K];
   float scales[QK_K / 16];
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
 
     float max_scale = 0;
     float max_abs_scale = 0;
@@ -1195,7 +1195,7 @@ static void quantize_row_q6_K_impl(const float *__restrict x,
   float scales[QK_K / 16];
   // float   weights[16];
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
 
     // float sum_x2 = 0;
     // for (int j = 0; j < QK_K; ++j) sum_x2 += x[j]*x[j];
@@ -1293,7 +1293,7 @@ void dequantize_row_q6_K_impl(const block_q6_K *__restrict x,
   assert(k % QK_K == 0);
   const int64_t nb = k / QK_K;
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     const float d = nntr_compute_fp16_to_fp32(x[i].d);
 
     const uint8_t *__restrict ql = x[i].ql;
@@ -1336,7 +1336,7 @@ void quantize_row_q8_K_ref(const float *__restrict x, block_q8_K *__restrict y,
   assert(k % QK_K == 0);
   const int64_t nb = k / QK_K;
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
 
     float max = 0;
     float amax = 0;
@@ -1380,7 +1380,7 @@ void nntr_quantize_row_q8_K(const float *__restrict x, void *__restrict y,
   const int64_t nb = k / QK_K;
   block_q8_K *__restrict yc = y; // Cast to proper type
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     const float *x_block = x + i * QK_K;
 
     v128_t min_vec = wasm_v128_load(x_block);
@@ -1463,7 +1463,7 @@ void dequantize_row_q8_K_impl(const block_q8_K *__restrict x,
   assert(k % QK_K == 0);
   const int64_t nb = k / QK_K;
 
-  for (int i = 0; i < nb; i++) {
+  for (int64_t i = 0; i < nb; i++) {
     for (int j = 0; j < QK_K; ++j) {
       *y++ = x[i].d * x[i].qs[j];
     }

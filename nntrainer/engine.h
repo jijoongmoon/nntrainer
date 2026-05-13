@@ -34,7 +34,9 @@
 #include <cl_context.h>
 #endif
 
-#include "bs_thread_pool_manager.hpp"
+// QNN context is loaded as a plugin .so (libqnn_context.so)
+// No header dependency needed here.
+
 #include "singleton.h"
 
 namespace nntrainer {
@@ -139,13 +141,6 @@ public:
   getAllocators() {
     return allocator;
   }
-
-  /**
-   *
-   * @brief   Get pointer to thread pool manager, contruct it if needed
-   * @return  Pointer to thread pool manager
-   */
-  ThreadPoolManager *getThreadPoolManager();
 
   /**
    *
@@ -285,9 +280,6 @@ private:
     allocator;
 
   std::string working_path_base;
-
-  std::mutex thread_pool_manager_mutex_ = {};
-  std::unique_ptr<ThreadPoolManager> thread_pool_manager_ = {};
 };
 
 namespace plugin {}

@@ -57,6 +57,7 @@ endif
 test_target = [
   ['unittest_nntrainer_activations', []],
   ['unittest_nntrainer_cpu_backend', []],
+  ['unittest_compute_ops_dispatch', []],
   ['unittest_nntrainer_fallback', []],
   ['unittest_nntrainer_tensor_types', []],
   ['unittest_nntrainer_tensor_advanced', []],
@@ -74,7 +75,8 @@ test_target = [
   ['unittest_common_properties', []],
   ['unittest_nntrainer_tensor_pool', []],
   ['unittest_nntrainer_lr_scheduler', []],
-  ['unittest_nntrainer_save_with_dtype', []]
+  ['unittest_nntrainer_save_with_dtype', []],
+  ['unittest_thread_manager', []],
   #['unittest_nntrainer_task', []],
 ]
 

@@ -597,6 +597,8 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %endif
 %{_includedir}/nntrainer/tensor_wrap_specs.h
 %{_includedir}/nntrainer/cpu_backend.h
+%{_includedir}/nntrainer/compute_ops.h
+%{_includedir}/nntrainer/context_data.h
 %{_includedir}/nntrainer/fallback_internal.h
 %{_includedir}/nntrainer/fallback_kleidiai.h
 %if 0%{?use_cblas}
@@ -606,8 +608,8 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/nntr_ggml_impl.h
 %{_includedir}/nntrainer/nntr_ggml_impl_common.h
 %{_includedir}/nntrainer/nntr_ggml_impl_utils.h
-%{_includedir}/nntrainer/bs_thread_pool.h
-%{_includedir}/nntrainer/bs_thread_pool_manager.hpp
+%{_includedir}/nntrainer/thread_manager.h
+%{_includedir}/nntrainer/thread_manager_util.h
 %ifarch %{ix86} x86_64
 %{_includedir}/nntrainer/x86_compute_backend.h
 %{_includedir}/nntrainer/avx2_impl.h
@@ -615,7 +617,6 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %ifarch aarch64
 %{_includedir}/nntrainer/arm_compute_backend.h
 %{_includedir}/nntrainer/neon_impl.h
-%{_includedir}/nntrainer/neon_setting.h
 %{_includedir}/nntrainer/neon_mathfun.h
 %{_includedir}/nntrainer/neon_mathfun.hxx
 %{_includedir}/nntrainer/matrix_transpose_neon.h
@@ -646,7 +647,6 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
     %{_includedir}/nntrainer/arm_compute_backend.h
     %{_includedir}/nntrainer/armv7_neon.h
     %{_includedir}/nntrainer/neon_impl.h
-    %{_includedir}/nntrainer/neon_setting.h
     %{_includedir}/nntrainer/neon_mathfun.h
     %{_includedir}/nntrainer/neon_mathfun.hxx
     %{_includedir}/nntrainer/matrix_transpose_neon.h

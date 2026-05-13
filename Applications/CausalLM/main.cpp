@@ -30,10 +30,12 @@
 #include <factory.h>
 
 #include "causal_lm.h"
+#include "chat_template.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
+#include "multilingual_tinybert_16mb.h"
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
 #include "qwen3_cached_slim_moe_causallm.h"
@@ -46,6 +48,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <thread>
 
 using json = nlohmann::json;
@@ -120,6 +123,8 @@ std::string resolve_architecture(std::string model_type,
       return "EmbeddingGemma";
     } else if (architecture == "Qwen2Model") {
       return "Qwen2Embedding";
+    } else if (architecture == "BertForMaskedLM") {
+      return "MultilingualTinyBert";
     } else {
       throw std::invalid_argument(
         "Unsupported architecture for embedding model: " + architecture);
@@ -197,6 +202,11 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::EmbeddingGemma>(cfg, generation_cfg,
                                                         nntr_cfg);
     });
+  causallm::Factory::Instance().registerModel(
+    "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::MultilingualTinyBert>(
+        cfg, generation_cfg, nntr_cfg);
+    });
 
   // Validate arguments
   if (argc < 2) {
@@ -243,9 +253,34 @@ int main(int argc, char *argv[]) {
       architecture = resolve_architecture(model_type, architecture);
     }
 
+    // Load chat template from tokenizer_config.json (if available)
+    causallm::ChatTemplate chat_tmpl;
+    std::string tokenizer_config_path = model_path + "/tokenizer_config.json";
+    if (std::filesystem::exists(tokenizer_config_path)) {
+      chat_tmpl = causallm::ChatTemplate::fromFile(tokenizer_config_path);
+      if (chat_tmpl.isAvailable()) {
+        std::cout << "[Info] Chat template loaded from tokenizer_config.json"
+                  << std::endl;
+      } else {
+        std::cerr
+          << "[Warning] tokenizer_config.json found but chat template could "
+             "not be loaded. Chat formatting will not be applied to raw input."
+          << std::endl;
+      }
+    } else {
+      std::cerr
+        << "[Warning] tokenizer_config.json not found in " << model_path
+        << ". Chat template will not be available for raw input formatting."
+        << std::endl;
+    }
+
     // Determine input text
     if (argc >= 3) {
       input_text = argv[2];
+      // Apply chat template to raw user input if available
+      if (chat_tmpl.isAvailable()) {
+        input_text = chat_tmpl.apply(input_text);
+      }
     } else {
       if (nntr_cfg.contains("chat_input")) {
         if (architecture == "Gemma3ForCausalLM") {

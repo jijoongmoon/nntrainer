@@ -1,8 +1,10 @@
 causallm_src = [
+    meson.current_source_dir() / 'chat_template.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
     meson.current_source_dir() / 'api' / 'model_config.cpp',
+    meson.current_source_dir() / 'kv_cache_manager.cpp',
 ]
 
 executable_src = [
@@ -54,8 +56,7 @@ causallm = shared_library('causallm',
         nntrainer_dep,
         nntrainer_ccapi_dep,
         causallm_layer_dependencies, 
-        tokenizer_dependencies,
-        openmp_dep
+        tokenizer_dependencies
     ],
     include_directories: causallm_inc,
     install: true,
@@ -98,3 +99,21 @@ test_api = executable('test_api',
     build_by_default: true,
     install: false,
 )
+
+# KVCacheManager unit tests
+if get_option('enable-test')
+  unittest_kv_cache_manager = executable(
+    'unittest_kv_cache_manager',
+    meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_dep, causallm_dep],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_kv_cache_manager', unittest_kv_cache_manager,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_kv_cache_manager'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+endif

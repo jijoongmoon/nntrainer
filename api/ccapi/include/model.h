@@ -32,10 +32,13 @@
 
 namespace nntrainer {
 class RunLayerContext;
-}
+class Tensor;
+} // namespace nntrainer
 /** Define more aliases for the model in the API */
 namespace ml {
 namespace train {
+
+class Tensor; // Forward declaration for graph-based compile
 
 /**
  * @brief     Statistics from running or training a model
@@ -141,6 +144,52 @@ public:
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
   virtual int compile(ExecutionMode exec_mode_ = ExecutionMode::TRAIN) = 0;
+
+  /**
+   * @brief     Compile from symbolic tensor graph.
+   *
+   * Extracts the computation graph by walking backwards from output to input,
+   * then adds all discovered layers (with input_layers connections) and
+   * compiles. This replaces manual addLayer() + input_layers strings.
+   *
+   * @param input  Leaf symbolic tensor (model input)
+   * @param output Output symbolic tensor (model output)
+   * @param mode   Execution mode (default: TRAIN)
+   * @retval #ML_ERROR_NONE Successful.
+   */
+  int compile(Tensor &input, Tensor &output,
+              ExecutionMode mode = ExecutionMode::TRAIN);
+
+  /**
+   * @brief     Compile from symbolic tensor graph with multiple outputs.
+   *
+   * Extracts the computation graph by walking backwards from each output to
+   * the input, then adds all discovered layers and compiles. This supports
+   * models with multiple output heads (e.g., YOLOv3 with 3 loss layers).
+   *
+   * @param input   Leaf symbolic tensor (model input)
+   * @param outputs Vector of output symbolic tensors
+   * @param mode    Execution mode (default: TRAIN)
+   * @retval #ML_ERROR_NONE Successful.
+   */
+  int compile(Tensor &input, std::vector<Tensor> &outputs,
+              ExecutionMode mode = ExecutionMode::TRAIN);
+
+  /**
+   * @brief     Compile from symbolic tensor graph with multiple inputs and
+   *            multiple outputs.
+   *
+   * Extracts the computation graph by walking backwards from each output to
+   * discover all layers. Supports models with multiple input heads and
+   * multiple output heads.
+   *
+   * @param inputs  Vector of leaf symbolic tensors (model inputs)
+   * @param outputs Vector of output symbolic tensors
+   * @param mode    Execution mode (default: TRAIN)
+   * @retval #ML_ERROR_NONE Successful.
+   */
+  int compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
+              ExecutionMode mode = ExecutionMode::TRAIN);
 
   /**
    * @brief     Initialize Network. This should be called after setting the
@@ -276,6 +325,20 @@ public:
                                   void * /**< user_data */)>
                  fn,
                void *user_data = nullptr) = 0;
+
+  /**
+   * @brief Look up a graph-managed tensor by name.
+   *
+   * Used by the symbolic ml::train::Tensor API to wire a user-facing
+   * Tensor handle to its corresponding graph placeholder after compile.
+   * Once wired, host-side updates flow through `tensor.setData(buf)` instead
+   * of going through a separate setExternalTensors call by name.
+   *
+   * @param name tensor or input-layer name
+   * @return Tensor* pointer to the graph-owned tensor, or nullptr if no
+   *         such tensor exists in the compiled graph.
+   */
+  virtual nntrainer::Tensor *getTensor(const std::string &name) = 0;
 
   /**
    * @brief     set optimizer for the neural network model

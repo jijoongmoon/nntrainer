@@ -27,6 +27,8 @@
 /usr/include/nntrainer/cblas_interface.h
 /usr/include/nntrainer/x86_compute_backend.h
 /usr/include/nntrainer/cpu_backend.h
+/usr/include/nntrainer/compute_ops.h
+/usr/include/nntrainer/context_data.h
 /usr/include/nntrainer/var_grad.h
 /usr/include/nntrainer/weight.h
 /usr/include/nntrainer/quantizer.h
@@ -61,8 +63,8 @@
 /usr/include/nntrainer/noncopyable.h
 /usr/include/nntrainer/nonmovable.h
 /usr/include/nntrainer/singleton.h
-/usr/include/nntrainer/bs_thread_pool.h
-/usr/include/nntrainer/bs_thread_pool_manager.hpp
+/usr/include/nntrainer/thread_manager.h
+/usr/include/nntrainer/thread_manager_util.h
 /usr/include/nntrainer/fp16.h
 /usr/include/nntrainer/util_simd.h
 /usr/include/nntrainer/dynamic_library_loader.h

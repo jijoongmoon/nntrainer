@@ -25,6 +25,7 @@
 #include "model.h"
 #include "model_common_properties.h"
 #include <cmath>
+#include <compute_ops.h>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -752,12 +753,14 @@ void NeuralNetwork::load(const std::string &file_path,
 #endif
 
     if (exec_mode == ml::train::ExecutionMode::INFERENCE) {
-      if (!MMAP_READ) {
-        ///@note for slim-tensor. This should be removed.
-        model_file_fd = open(f_path.c_str(), O_RDONLY);
-        NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
-          << "Cannot open file : " << f_path;
-      }
+      // Always keep a long-lived fd open during inference. Virtual (slim)
+      // tensors capture this fd at read-time and use it later in activate()
+      // to mmap their backing region on demand. Without it, virtual tensors
+      // end up with fd=-1 and activate() returns MAP_FAILED, segfaulting on
+      // first use (e.g. SlimMoE expert weights when MMAP_READ=true).
+      model_file_fd = open(f_path.c_str(), O_RDONLY);
+      NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
+        << "Cannot open file : " << f_path;
       // std::vector<std::future<void>> futures;
       std::vector<std::thread> threads;
       threads.reserve(model_graph.size());
@@ -793,7 +796,7 @@ void NeuralNetwork::load(const std::string &file_path,
               << "MapViewOfFile failed";
 
             node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true);
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
 
             // Early unmap: let the OS reclaim the working set ASAP
             UnmapViewOfFile(view);
@@ -822,7 +825,7 @@ void NeuralNetwork::load(const std::string &file_path,
 
             char *view = static_cast<char *>(mmap_ptr);
             node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true);
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
 
             // Early drop: pages no longer needed; helps lower peak RSS during
             // overlap
@@ -1195,8 +1198,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
 
-      nntrainer::scopy(buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data,
-                       1);
+      nntrainer::getComputeOps()->scopy_fp16_to_fp32(
+        buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data, 1);
 #else
       throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif

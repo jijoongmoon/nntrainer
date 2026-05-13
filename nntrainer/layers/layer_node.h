@@ -778,11 +778,14 @@ public:
    * @param fsu fsu type
    * @param mode Execution mode
    * @param opt_var read optimizer variables
+   * @param file_fd long-lived backing file descriptor; required for virtual
+   *        tensors (e.g. SlimMoE expert weights) so they can mmap themselves
+   *        in activate() after the per-thread mmap source is unmapped.
    */
   void read(ReadSource src, bool opt_var = false,
             ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN,
             bool fsu = false, size_t start_offset = 0,
-            bool read_from_offset = false);
+            bool read_from_offset = false, int file_fd = -1);
 
   /**
    * @brief         save layer Weight & Bias data from file
