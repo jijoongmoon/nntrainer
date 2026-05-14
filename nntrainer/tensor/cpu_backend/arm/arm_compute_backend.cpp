@@ -387,8 +387,10 @@ template <>
 void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
                const unsigned int ldb, float *C, const unsigned int ldc) {
-  // No NEON micro-kernel yet; route through the scalar fallback.
-  return __fallback_gemm_q8_0<float>(M, N, K, A, lda, B, ldb, C, ldc);
+  // NEON path. Routes to __ggml_q8_0_q8_0_GEMM which dispatches to the
+  // NEON nntr_gemm_q8_0_q8_0 in nntr_ggml_impl_neon.cpp -- shares the
+  // ggml_vdotq_s32 int8 dot helper with the Q4_0 NEON kernel.
+  return __ggml_q8_0_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
