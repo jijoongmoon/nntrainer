@@ -13,10 +13,13 @@
  */
 
 #include "nntrainer_error.h"
+#include <base_properties.h>
 #include <functional>
 #include <memory>
 #include <tensor_wrap_specs.h>
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <iterator>
 #include <layer_context.h>
@@ -633,6 +636,60 @@ bool RunLayerContext::validate(bool skip_input, bool skip_label) {
 #endif
 
   return ret;
+}
+
+// ----------------------------------------------------------------------------
+// Per-role weight dtype lookup (weight_dtype_map property)
+// ----------------------------------------------------------------------------
+TensorDim::DataType
+InitLayerContext::getDataTypeForRole(const std::string &role,
+                                     TensorDim::DataType fallback) const {
+  if (weight_dtype_map_str.empty())
+    return fallback;
+
+  // Lazy parse "role:dtype,role:dtype,..." into the cache on first access.
+  // Whitespace is tolerated; unknown dtype tokens raise std::invalid_argument
+  // via the TensorDataTypeInfo enum converter, same as any other property.
+  if (!weight_dtype_map_parsed) {
+    auto trim = [](std::string s) {
+      auto issp = [](unsigned char c) { return std::isspace(c); };
+      while (!s.empty() && issp(static_cast<unsigned char>(s.front())))
+        s.erase(s.begin());
+      while (!s.empty() && issp(static_cast<unsigned char>(s.back())))
+        s.pop_back();
+      return s;
+    };
+
+    size_t pos = 0;
+    const std::string &raw = weight_dtype_map_str;
+    while (pos < raw.size()) {
+      size_t comma = raw.find(',', pos);
+      std::string pair = trim(
+        raw.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+      if (!pair.empty()) {
+        size_t colon = pair.find(':');
+        if (colon == std::string::npos) {
+          throw std::invalid_argument(
+            "weight_dtype_map entry missing ':' (got: '" + pair + "')");
+        }
+        std::string key = trim(pair.substr(0, colon));
+        std::string val = trim(pair.substr(colon + 1));
+        auto dt =
+          str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
+            from_string(val);
+        weight_dtype_map_cache[key] = dt;
+      }
+      if (comma == std::string::npos)
+        break;
+      pos = comma + 1;
+    }
+    weight_dtype_map_parsed = true;
+  }
+
+  auto it = weight_dtype_map_cache.find(role);
+  if (it != weight_dtype_map_cache.end())
+    return it->second;
+  return fallback;
 }
 
 } // namespace nntrainer
