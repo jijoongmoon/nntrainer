@@ -748,10 +748,11 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::FP16:
     dotFloat32Float16(input, output, trans, trans_in, beta);
     break;
-  /** applying gemm_q4_k / gemm_q6_k / gemm_q4_0 */
+  /** applying gemm_q4_k / gemm_q6_k / gemm_q4_0 / gemm_q8_0 */
   case Tdatatype::Q4_K:
   case Tdatatype::Q6_K:
   case Tdatatype::Q4_0:
+  case Tdatatype::Q8_0:
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
   case Tdatatype::QINT16:
@@ -773,7 +774,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   Tdatatype input_dtype = input[0]->getDataType();
 
   // Handle standard inputs
-  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::QINT4) {
+  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::Q8_0 &&
+      input_dtype != Tdatatype::QINT4) {
     for (unsigned int i = 0; i < input.size(); ++i) {
       dot(*input[i], *output[i], trans, trans_in, beta);
     }
@@ -799,6 +801,12 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
         o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
                           Ns[i]);
       }
+    }
+  } else if (input_dtype == Tdatatype::Q8_0) {
+    // No batched Q8_0 kernel yet; loop over the inputs.
+    for (unsigned int i = 0; i < input.size(); ++i) {
+      o->gemm_q8_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
+                        Ns[i]);
     }
   } else { // QINT4
     if (o->supports_gemv_int4_batch_fp32() &&

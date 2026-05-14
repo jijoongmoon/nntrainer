@@ -1096,6 +1096,32 @@ extern void gemm_q4_0(const unsigned int M, const unsigned int N,
                       const unsigned int ldc);
 
 /**
+ * @brief q8_0 GEMM : A (M,K) * W.T (N,K) = O (M,N)
+ *
+ * Activations are FP32 and get online-quantised to Q8_0 internally.
+ * Weights are pre-quantised Q8_0 blocks (block_q8_0[N * K/32]) stored
+ * row-major over the N output dimension. Per-block dot product is an
+ * int8 x int8 -> int32 accumulate, scaled by both block-level fp16
+ * deltas. Output is FP32.
+ *
+ * @param M Original row size of output
+ * @param N Original col size of output
+ * @param K Hidden size (must be a multiple of 32)
+ * @param A Input activation, FP32, row-major [M x lda]
+ * @param lda Leading dimension of A (>= K)
+ * @param B (void*) (block_q8_0*) for offline-quantised transposed weight
+ *          [N x K/32]
+ * @param ldb Leading dimension of B (>= K, in element units)
+ * @param C T* output, row-major [M x ldc]
+ * @param ldc Leading dimension of C (>= N)
+ */
+template <typename T = float>
+extern void gemm_q8_0(const unsigned int M, const unsigned int N,
+                      const unsigned int K, const T *A, const unsigned int lda,
+                      const void *B, const unsigned int ldb, T *C,
+                      const unsigned int ldc);
+
+/**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
  * @param M Original row size of output
