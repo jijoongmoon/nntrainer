@@ -81,6 +81,7 @@ GPU_BENCH_ARGS=(
     -Denable-tflite-backbone=false
     -Denable-opencl=true
     -Denable-profile=true
+    -Denable-fp16=true
     -Dnntr-num-threads=4
     -Dhgemm-experimental-kernel=false
 )

@@ -48,6 +48,14 @@ bool Program::BuildProgram(cl_device_id device_id,
       "Failed to build program executable. OpenCL error code: %d : %s. %s",
       error_code, OpenCLErrorCodeToString(error_code),
       (GetProgramBuildInfo(device_id, CL_PROGRAM_BUILD_LOG)).c_str());
+    // Release the half-baked program so the driver can reclaim its resources.
+    // On Adreno, leaving a failed-build program alive subsequently corrupts the
+    // SVM heap — every later clSVMAlloc returns null, breaking unit tests that
+    // would otherwise be unaffected by this kernel.
+    if (program_) {
+      clReleaseProgram(program_);
+      program_ = nullptr;
+    }
     return false;
   }
 

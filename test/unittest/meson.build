@@ -77,9 +77,13 @@ test_target = [
   ['unittest_nntrainer_lr_scheduler', []],
   ['unittest_nntrainer_save_with_dtype', []],
   ['unittest_thread_manager', []],
-  ['unittest_nntrainer_qint4_vs_q40', []],
   #['unittest_nntrainer_task', []],
 ]
+
+arch = host_machine.cpu_family()
+if arch == 'arm' or arch == 'aarch64'
+  test_target += [['unittest_nntrainer_qint4_vs_q40', []]]
+endif
 
 if host_machine.system() != 'windows'
   test_target += [['unittest_nntrainer_appcontext', []]]
@@ -93,6 +97,7 @@ if get_option('enable-opencl')
   test_target += [['unittest_opencl_kernels_int4_adreno', []]]
   test_target += [['unittest_opencl_kernels_qk_k', []]]
   test_target += [['unittest_attention_kernels_cl', []]]
+  test_target += [['unittest_opencl_phwc4_layout', []]]
 endif
 
 if get_option('enable-fp16')

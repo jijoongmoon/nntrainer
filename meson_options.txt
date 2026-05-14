@@ -69,7 +69,7 @@ option('enable-nnstreamer-tensor-trainer', type: 'feature', value: 'auto')
 option('nnstreamer-subplugin-install-path', type: 'string', value: 'lib/nnstreamer') # where nnstreamer subplugin should be installed (after prefix)
 
 # application related options
-option('enable-transformer', type: 'boolean', value: false)
+option('enable-transformer', type: 'boolean', value: true)
 
 # ARM architecture options
 option('arm-arch', type: 'combo',

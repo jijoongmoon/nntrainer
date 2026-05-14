@@ -102,6 +102,51 @@
 #define DT_FILTER_BLOCK_READ8(ptr, offset) BLOCK_READN(char, 8, ptr, offset)
 #define DT_FILTER_BLOCK_READ16(ptr, offset) BLOCK_READN(char, 16, ptr, offset)
 
+#define BLOCK_READ_IMPL_1 ret = ptr[idx];
+
+#define BLOCK_READ_IMPL_2                                                      \
+  ret.s0 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.s1 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();
+
+#define BLOCK_READ_IMPL_4                                                      \
+  BLOCK_READ_IMPL_2                                                            \
+  ret.s2 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.s3 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();
+
+#define BLOCK_READ_IMPL_8                                                      \
+  BLOCK_READ_IMPL_4                                                            \
+  ret.s4 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.s5 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.s6 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.s7 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();
+
+#define BLOCK_READ_IMPL_16                                                     \
+  BLOCK_READ_IMPL_8                                                            \
+  ret.s8 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.s9 = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.sa = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.sb = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.sc = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.sd = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.se = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();                                             \
+  ret.sf = ptr[idx];                                                           \
+  idx += get_max_sub_group_size();
+
 #define BLOCK_READ_IMPL(vec_size) CAT(BLOCK_READ_IMPL_, vec_size)
 #define BLOCK_READ_FUNC_NAME(type_size, vec_size)                              \
   MAKE_VECTOR_TYPE(BLOCK_READ_FUNC(type_size), vec_size)
@@ -245,10 +290,10 @@ fully_connected_gpu_int4_gemv(__global half *input, const __global half *scales,
       GEMV_FILTER_VEC_TYPE i4x16_even =
         TO_GEMV_FILTER_VEC_TYPE(bx16 & (char16)0xF);
       GEMV_FILTER_VEC_TYPE i4x16_odd =
-        TO_GEMV_FILTER_VEC_TYPE(as_char16(as_uchar16(bx16) >> 4));
+        TO_GEMV_FILTER_VEC_TYPE(as_char16(as_uchar16(bx16) >> (uchar16)4));
 #else
       char16 i4x16_even_c16 = (bx16 & (char16)0xF);
-      char16 i4x16_odd_c16 = (as_char16(as_uchar16(bx16) >> 4));
+      char16 i4x16_odd_c16 = (as_char16(as_uchar16(bx16) >> (uchar16)4));
       i4x16_even_c16 = select(i4x16_even_c16, i4x16_even_c16 - (char16)16,
                               i4x16_even_c16 > (char16)7);
       i4x16_odd_c16 = select(i4x16_odd_c16, i4x16_odd_c16 - (char16)16,
@@ -257,53 +302,53 @@ fully_connected_gpu_int4_gemv(__global half *input, const __global half *scales,
       GEMV_FILTER_VEC_TYPE i4x16_odd = TO_GEMV_FILTER_VEC_TYPE(i4x16_odd_c16);
 #endif
 
-      sum[0] += as_half(sub_group_broadcast(input_value, 0)) * i4x16_even.s0 +
+      sum.s0 += as_half(sub_group_broadcast(input_value, 0)) * i4x16_even.s0 +
                 as_half(sub_group_broadcast(input_value, 4)) * i4x16_even.s4 +
                 as_half(sub_group_broadcast(input_value, 8)) * i4x16_even.s8 +
                 as_half(sub_group_broadcast(input_value, 12)) * i4x16_even.sc;
 
-      sum[1] += as_half(sub_group_broadcast(input_value, 0)) * i4x16_even.s1 +
+      sum.s1 += as_half(sub_group_broadcast(input_value, 0)) * i4x16_even.s1 +
                 as_half(sub_group_broadcast(input_value, 4)) * i4x16_even.s5 +
                 as_half(sub_group_broadcast(input_value, 8)) * i4x16_even.s9 +
                 as_half(sub_group_broadcast(input_value, 12)) * i4x16_even.sd;
 
-      sum[2] += as_half(sub_group_broadcast(input_value, 1)) * i4x16_odd.s0 +
+      sum.s2 += as_half(sub_group_broadcast(input_value, 1)) * i4x16_odd.s0 +
                 as_half(sub_group_broadcast(input_value, 5)) * i4x16_odd.s4 +
                 as_half(sub_group_broadcast(input_value, 9)) * i4x16_odd.s8 +
                 as_half(sub_group_broadcast(input_value, 13)) * i4x16_odd.sc;
 
-      sum[3] += as_half(sub_group_broadcast(input_value, 1)) * i4x16_odd.s1 +
+      sum.s3 += as_half(sub_group_broadcast(input_value, 1)) * i4x16_odd.s1 +
                 as_half(sub_group_broadcast(input_value, 5)) * i4x16_odd.s5 +
                 as_half(sub_group_broadcast(input_value, 9)) * i4x16_odd.s9 +
                 as_half(sub_group_broadcast(input_value, 13)) * i4x16_odd.sd;
 
-      sum[4] += as_half(sub_group_broadcast(input_value, 2)) * i4x16_even.s2 +
+      sum.s4 += as_half(sub_group_broadcast(input_value, 2)) * i4x16_even.s2 +
                 as_half(sub_group_broadcast(input_value, 6)) * i4x16_even.s6 +
                 as_half(sub_group_broadcast(input_value, 10)) * i4x16_even.sa +
                 as_half(sub_group_broadcast(input_value, 14)) * i4x16_even.se;
 
-      sum[5] += as_half(sub_group_broadcast(input_value, 2)) * i4x16_even.s3 +
+      sum.s5 += as_half(sub_group_broadcast(input_value, 2)) * i4x16_even.s3 +
                 as_half(sub_group_broadcast(input_value, 6)) * i4x16_even.s7 +
                 as_half(sub_group_broadcast(input_value, 10)) * i4x16_even.sb +
                 as_half(sub_group_broadcast(input_value, 14)) * i4x16_even.sf;
 
-      sum[6] += as_half(sub_group_broadcast(input_value, 3)) * i4x16_odd.s2 +
+      sum.s6 += as_half(sub_group_broadcast(input_value, 3)) * i4x16_odd.s2 +
                 as_half(sub_group_broadcast(input_value, 7)) * i4x16_odd.s6 +
                 as_half(sub_group_broadcast(input_value, 11)) * i4x16_odd.sa +
                 as_half(sub_group_broadcast(input_value, 15)) * i4x16_odd.se;
 
-      sum[7] += as_half(sub_group_broadcast(input_value, 3)) * i4x16_odd.s3 +
+      sum.s7 += as_half(sub_group_broadcast(input_value, 3)) * i4x16_odd.s3 +
                 as_half(sub_group_broadcast(input_value, 7)) * i4x16_odd.s7 +
                 as_half(sub_group_broadcast(input_value, 11)) * i4x16_odd.sb +
                 as_half(sub_group_broadcast(input_value, 15)) * i4x16_odd.sf;
     }
 
-    sum_all[0] += (sum[0] + sum[2] + sum[4] + sum[6]) * scale_0;
-    sum_all[1] += (sum[1] + sum[3] + sum[5] + sum[7]) * scale_1;
+    sum_all.s0 += (sum.s0 + sum.s2 + sum.s4 + sum.s6) * scale_0;
+    sum_all.s1 += (sum.s1 + sum.s3 + sum.s5 + sum.s7) * scale_1;
   }
 
-  all_sum_even[wi_id][thr_id] = sum_all[0];
-  all_sum_odd[wi_id][thr_id] = sum_all[1];
+  all_sum_even[wi_id][thr_id] = sum_all.s0;
+  all_sum_odd[wi_id][thr_id] = sum_all.s1;
   barrier(CLK_LOCAL_MEM_FENCE);
 
   float2 sum_value;

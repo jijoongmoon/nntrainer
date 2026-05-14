@@ -22,8 +22,8 @@ kernel void quantize_input_int4(const __global half *restrict input,
 
   for(uint i = 0; i < quantize_block; ++i) {
     input_0 = vload4(0, &input[input_offset + (i * 4)]);
-    max_vals[i] = fmax(fmax(fabs(input_0[0]), fabs(input_0[1])),
-                  fmax(fabs(input_0[2]), fabs(input_0[3])));
+    max_vals[i] = fmax(fmax(fabs(input_0.s0), fabs(input_0.s1)),
+                  fmax(fabs(input_0.s2), fabs(input_0.s3)));
   }
 
   half max_value = 0.001h;
@@ -74,8 +74,8 @@ kernel void quantize_input_int4_pad(const __global half *restrict input,
 
   for(uint i = 0; i < quantize_block; ++i) {
     input_0 = vload4(0, &input[input_offset + (i * 4)]);
-    max_vals[i] = fmax(fmax(fabs(input_0[0]), fabs(input_0[1])),
-                  fmax(fabs(input_0[2]), fabs(input_0[3])));
+    max_vals[i] = fmax(fmax(fabs(input_0.s0), fabs(input_0.s1)),
+                  fmax(fabs(input_0.s2), fabs(input_0.s3)));
   }
 
   half max_value = 0.001h;

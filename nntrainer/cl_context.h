@@ -35,6 +35,9 @@
 #include <opencl_command_queue_manager.h>
 #include <opencl_context_manager.h>
 #include <opencl_kernel.h>
+#ifdef PROFILE
+#include <opencl_profiler.h>
+#endif
 #include <opencl_program.h>
 
 #include "singleton.h"
@@ -56,6 +59,15 @@ public:
   using OclKernelMap = std::unordered_map<std::string, SharedPtrClKernel>;
 
   // getting static instance of commandqueue, opencl context and buffermanager
+#ifdef PROFILE
+  // Construct the profiler singleton *before* ClContext's other singletons so
+  // its static-storage lifetime strictly contains ClContext's. The destructor
+  // reads from OpenCLProfiler::Global(); without this priming the profiler is
+  // lazily constructed later and gets destroyed first, leaving ~ClContext to
+  // touch a destroyed mutex and FORTIFY-abort the process.
+  opencl::OpenCLProfiler &profiler_inst_ = opencl::OpenCLProfiler::Global();
+#endif
+
   opencl::CommandQueueManager &command_queue_inst_ =
     opencl::CommandQueueManager::Global();
 

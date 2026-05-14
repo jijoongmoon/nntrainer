@@ -13,6 +13,7 @@ cl_op_kernels = [
   'int4_gemm.cl',
   'int4_gemm_adreno.cl',
   'input_transpose.cl',
+  'phwc4_identity.cl',
   'q4_0_ab_bi_8x4.cl',
   'q6_k_sgemv.cl',
   'restore_block_q4_0.cl',

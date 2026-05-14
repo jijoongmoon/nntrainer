@@ -118,18 +118,19 @@ static void pack_and_set_int4_weights(nntrainer::Tensor &weight_tensor,
   size_t quantized_size = N * ((K + 1)/2);
   std::vector<uint8_t> quantized_weights(quantized_size);
   std::vector<float> scales(N);
-  nntr_quant_qs4cx_f32(N, K, (void *)weights_fp32, 
-                       (void *)quantized_weights.data(), (void *)scales.data(), true);
-  
+  nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weights_fp32,
+                                  (void *)quantized_weights.data(),
+                                  (void *)scales.data(), true);
+
   if (kernel_idx >= 0) {
     // Android: Pack weights for KleidiAI and copy to tensor
     size_t packed_size = nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
       N, K, kernel_idx, true);
     std::vector<uint8_t> packed_weights(packed_size);
-    
-    nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K, packed_weights.data(),
-                                    quantized_weights.data(), scales.data(),
-                                    kernel_idx, true);
+
+    nntrainer::nntr_qsi4cxp_qs4cxs1s0_rhs_pack(
+      N, K, packed_weights.data(), quantized_weights.data(), scales.data(),
+      kernel_idx, true);
 
     auto qw = quantized_weights.data();
     auto sc = scales.data();

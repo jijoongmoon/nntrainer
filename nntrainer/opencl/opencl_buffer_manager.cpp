@@ -19,12 +19,15 @@
 namespace nntrainer {
 
 void ClBufferManager::initBuffers() {
-  data_input = context_inst_.createSVMRegion(buffer_size_bytes);
-  for (unsigned int i = 0; i < max_qs; ++i) {
-    scale_vec.push_back(context_inst_.createSVMRegion(scale_q4_0_size));
-    quant_vec.push_back(context_inst_.createSVMRegion(quant_q4_0_size));
-    output_vec.push_back(context_inst_.createSVMRegion(buffer_size_bytes));
-  }
+  // Lazy: allocate SVM only when the corresponding getSVM* accessor is first
+  // called. Eagerly reserving ~205 MiB here (4×32 MiB + 3×1.5 MiB + 3×24 MiB)
+  // exhausts the Adreno SVM heap before any test even starts, so subsequent
+  // small allocateSVM calls from individual tests return null and the test
+  // fixture throws. Sizing each slot on first use keeps tests that never
+  // touch the int4/q4_0 paths within the device's SVM budget.
+  scale_vec.assign(max_qs, nullptr);
+  quant_vec.assign(max_qs, nullptr);
+  output_vec.assign(max_qs, nullptr);
 }
 
 opencl::Buffer *ClBufferManager::getInBufferA() {
@@ -62,26 +65,37 @@ opencl::Buffer *ClBufferManager::getOutBufferB() {
   return outBufferB;
 }
 
-void *ClBufferManager::getSVMInput() { return data_input; }
+void *ClBufferManager::getSVMInput() {
+  if (data_input == nullptr) {
+    data_input = context_inst_.createSVMRegion(buffer_size_bytes);
+  }
+  return data_input;
+}
 
 void *ClBufferManager::getSVMScale(unsigned int idx) {
   if (idx >= scale_vec.size())
     return nullptr;
-
+  if (scale_vec[idx] == nullptr) {
+    scale_vec[idx] = context_inst_.createSVMRegion(scale_q4_0_size);
+  }
   return scale_vec[idx];
 }
 
 void *ClBufferManager::getSVMQuant(unsigned int idx) {
   if (idx >= quant_vec.size())
     return nullptr;
-
+  if (quant_vec[idx] == nullptr) {
+    quant_vec[idx] = context_inst_.createSVMRegion(quant_q4_0_size);
+  }
   return quant_vec[idx];
 }
 
 void *ClBufferManager::getSVMOutput(unsigned int idx) {
   if (idx >= output_vec.size())
     return nullptr;
-
+  if (output_vec[idx] == nullptr) {
+    output_vec[idx] = context_inst_.createSVMRegion(buffer_size_bytes);
+  }
   return output_vec[idx];
 }
 
