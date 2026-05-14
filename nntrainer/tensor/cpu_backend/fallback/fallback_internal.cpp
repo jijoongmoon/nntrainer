@@ -16,12 +16,16 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fallback_internal.h>
 #include <limits>
+#include <nntr_ggml_impl.h> // nntr_quantize_row_q8_0
 #include <q4_0_utils.h>
+#include <q8_0_tensor.h> // nntrainer::block_q8_0, QK8_0 (matches GGML block_q8_0 layout)
 #include <stdexcept>
 #include <tensor_dim.h>
 #include <util_func.h>
+#include <vector>
 
 #define sgemv_loop(ci, cj, cM, cN)                                             \
   do {                                                                         \
@@ -484,6 +488,91 @@ void __fallback_gemm_q4_0(const unsigned int M, const unsigned int N,
                           const unsigned int ldb, float *C,
                           const unsigned int ldc) {
   throw std::runtime_error("NYI : __fallback_gemm_q4_0");
+}
+
+namespace {
+// IEEE 754 half-precision (fp16) -> single-precision (fp32) bit cast.
+// Self-contained to avoid pulling in nntr_ggml_impl_common.h, which clashes
+// with q4_0_utils.h definitions of QK_0 / block / block_q4_0.
+static inline float fp16_bits_to_fp32(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t exp = (h & 0x7C00u) >> 10;
+  uint32_t mant = h & 0x03FFu;
+  uint32_t f;
+  if (exp == 0u) {
+    if (mant == 0u) {
+      f = sign;
+    } else {
+      while ((mant & 0x0400u) == 0u) {
+        mant <<= 1;
+        exp -= 1u;
+      }
+      exp += 1u;
+      mant &= ~0x0400u;
+      f = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1Fu) {
+    f = sign | 0x7F800000u | (mant << 13);
+  } else {
+    f = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
+  }
+  float out;
+  std::memcpy(&out, &f, sizeof(out));
+  return out;
+}
+} // namespace
+
+template <>
+void __fallback_gemm_q8_0(const unsigned int M, const unsigned int N,
+                          const unsigned int K, const float *A,
+                          const unsigned int lda, const void *B,
+                          const unsigned int ldb, float *C,
+                          const unsigned int ldc) {
+  // Scalar reference Q8_0 x Q8_0 GEMM. Correctness-first; the SIMD path is
+  // a follow-up that should share __ggml_q4_0_8x8_q8_0_GEMM's int8 dot core
+  // and only swap the weight-unpack step.
+  if (K % QK8_0 != 0) {
+    throw std::runtime_error(
+      "gemm_q8_0: K must be a multiple of 32 (got K=" + std::to_string(K) +
+      ")");
+  }
+  const unsigned int n_blocks_k = K / QK8_0;
+
+  // Online-quantise A row-by-row into Q8_0 blocks. nntr_quantize_row_q8_0
+  // produces the exact same bit layout as nntrainer::block_q8_0.
+  std::vector<nntrainer::block_q8_0> A_q8(static_cast<size_t>(M) * n_blocks_k);
+  for (unsigned int m = 0; m < M; ++m) {
+    nntr_quantize_row_q8_0(A + static_cast<size_t>(m) * lda,
+                           A_q8.data() + static_cast<size_t>(m) * n_blocks_k,
+                           static_cast<int64_t>(K));
+  }
+
+  // B is row-major over the N output dimension: each row holds K/32 Q8_0
+  // blocks (length K elements when expanded). ldb is in element units.
+  const auto *B_blocks = reinterpret_cast<const nntrainer::block_q8_0 *>(B);
+  const unsigned int b_row_blocks = ldb / QK8_0;
+
+  for (unsigned int m = 0; m < M; ++m) {
+    const nntrainer::block_q8_0 *a_row =
+      A_q8.data() + static_cast<size_t>(m) * n_blocks_k;
+    for (unsigned int n = 0; n < N; ++n) {
+      const nntrainer::block_q8_0 *b_row =
+        B_blocks + static_cast<size_t>(n) * b_row_blocks;
+      float acc = 0.0f;
+      for (unsigned int blk = 0; blk < n_blocks_k; ++blk) {
+        const nntrainer::block_q8_0 &a = a_row[blk];
+        const nntrainer::block_q8_0 &b = b_row[blk];
+        int32_t sumi = 0;
+        for (int l = 0; l < QK8_0; ++l) {
+          sumi += static_cast<int32_t>(a.qs[l]) * static_cast<int32_t>(b.qs[l]);
+        }
+        const float a_d = fp16_bits_to_fp32(a.d);
+        const float b_d = fp16_bits_to_fp32(b.d);
+        acc += a_d * b_d * static_cast<float>(sumi);
+      }
+      C[static_cast<size_t>(m) * ldc + n] = acc;
+    }
+  }
 }
 
 void __fallback_gemm_q4_K(const unsigned int M, const unsigned int N,
