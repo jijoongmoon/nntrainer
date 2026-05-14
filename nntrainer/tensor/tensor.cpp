@@ -18,6 +18,7 @@
 #include <int4_tensor.h>
 #include <lazy_tensor.h>
 #include <q4_0_tensor.h>
+#include <q8_0_tensor.h>
 #include <q4_k_tensor.h>
 #include <q6_k_tensor.h>
 #include <short_tensor.h>
@@ -133,6 +134,8 @@ Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
     itensor_ = std::make_unique<Q6_K_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(name_, fm);
+  } else if (d_type == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(name_, fm);
   } else if (d_type == Tdatatype::UINT8) {
@@ -181,6 +184,8 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
     itensor_ = std::make_unique<Q6_K_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, alloc_now, init, name);
+  } else if (d.getDataType() == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::UINT4) {
     if (qscheme != QScheme::Q4_Kx8) {
       itensor_ =
@@ -233,6 +238,8 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
     itensor_ = std::make_unique<Q6_K_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, buf);
+  } else if (d.getDataType() == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::UINT4) {
     if (qscheme != QScheme::Q4_Kx8)
       itensor_ = std::make_unique<Uint4QTensor>(d, buf, qscheme);
@@ -280,6 +287,8 @@ Tensor::Tensor(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -361,6 +370,8 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -412,6 +423,8 @@ bool Tensor::operator==(const Tensor &rhs) const {
       return itensorCompare<Q6_K_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::Q4_0) {
       return itensorCompare<Q4_0_Tensor>(itensor_.get(), rhs.itensor_.get());
+    } else if (getDataType() == Tdatatype::Q8_0) {
+      return itensorCompare<Q8_0_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT4) {
       return itensorCompare<Uint4QTensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT8) {
