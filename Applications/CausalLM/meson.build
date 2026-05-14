@@ -117,18 +117,18 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
-  # ClipVitTransformer structural unit tests
-  unittest_clip_vit_transformer = executable(
-    'unittest_clip_vit_transformer',
-    meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_clip_vit_transformer.cpp',
+  # Lfm2VlVisionTransformer structural unit tests
+  unittest_lfm2_vl_vision_transformer = executable(
+    'unittest_lfm2_vl_vision_transformer',
+    meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_lfm2_vl_vision_transformer.cpp',
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_dep, causallm_layer_dependencies, causallm_dep],
-    include_directories: [causallm_inc, include_directories('models', 'models/clip_vit')],
+    include_directories: [causallm_inc, include_directories('models', 'models/lfm2/lfm2-vl/vision')],
     build_by_default: true,
     install: false,
   )
 
-  test('unittest_clip_vit_transformer', unittest_clip_vit_transformer,
-    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_clip_vit_transformer'),
+  test('unittest_lfm2_vl_vision_transformer', unittest_lfm2_vl_vision_transformer,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_lfm2_vl_vision_transformer'),
     timeout: 60,
     suite: 'unittests'
   )

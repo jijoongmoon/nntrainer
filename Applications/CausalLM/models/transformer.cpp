@@ -83,7 +83,7 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
   setupParameters(cfg, generation_cfg, nntr_cfg);
 
   // prep tokenizer — optional, since image-only models (e.g.
-  // ClipVitTransformer) and unit tests have no tokenizer.json to point at.
+  // Lfm2VlVisionTransformer) and unit tests have no tokenizer.json to point at.
   if (nntr_cfg.contains("tokenizer_file") &&
       !nntr_cfg["tokenizer_file"].is_null() &&
       !nntr_cfg["tokenizer_file"].get<std::string>().empty()) {

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file   clip_vit_transformer.cpp
+ * @file   lfm2_vl_vision_transformer.cpp
  * @date   13 May 2026
  * @brief  CLIP/SigLIP-style Vision Transformer encoder.
  */
 
-#include <clip_vit_transformer.h>
+#include <lfm2_vl_vision_transformer.h>
 #include <llm_util.hpp>
 #include <model.h>
 
@@ -34,10 +34,10 @@ std::string blkName(int i, const char *suffix) {
 
 } // namespace
 
-json &ClipVitTransformer::sanitizeConfig(json &cfg) {
+json &Lfm2VlVisionTransformer::sanitizeConfig(json &cfg) {
   // base Transformer::setupParameters() calls .get<T>() on these without a
   // default, so missing keys would throw. Values written here are overwritten
-  // by ClipVitTransformer::setupParameters() immediately afterwards.
+  // by Lfm2VlVisionTransformer::setupParameters() immediately afterwards.
   if (!cfg.contains("vocab_size"))
     cfg["vocab_size"] = 0u;
   if (!cfg.contains("max_position_embeddings")) {
@@ -62,7 +62,7 @@ json &ClipVitTransformer::sanitizeConfig(json &cfg) {
   return cfg;
 }
 
-void ClipVitTransformer::setupParameters(json &cfg, json &generation_cfg,
+void Lfm2VlVisionTransformer::setupParameters(json &cfg, json &generation_cfg,
                                          json &nntr_cfg) {
   // Vision Transformer parameters. Defaults follow LFM2.5-VL's vision tower
   // (SigLIP2-style, 86M).
@@ -110,7 +110,7 @@ void ClipVitTransformer::setupParameters(json &cfg, json &generation_cfg,
   ATTN_LOGIT_SOFTCAPPING = 0.0f;
 }
 
-std::pair<Tensor, Tensor> ClipVitTransformer::constructModel() {
+std::pair<Tensor, Tensor> Lfm2VlVisionTransformer::constructModel() {
 
   // [B, C, H, W] image input.
   Tensor x =
@@ -164,7 +164,7 @@ std::pair<Tensor, Tensor> ClipVitTransformer::constructModel() {
   return {x, h};
 }
 
-Tensor ClipVitTransformer::createEncoderBlock(int layer_id, Tensor input) {
+Tensor Lfm2VlVisionTransformer::createEncoderBlock(int layer_id, Tensor input) {
 
   // Pre-LN.
   LayerHandle ln1(createLayer(
@@ -199,7 +199,7 @@ Tensor ClipVitTransformer::createEncoderBlock(int layer_id, Tensor input) {
   return ffn_res({h, m});
 }
 
-Tensor ClipVitTransformer::createSelfAttention(int layer_id, Tensor x) {
+Tensor Lfm2VlVisionTransformer::createSelfAttention(int layer_id, Tensor x) {
 
   // Q / K / V projections (CLIP/SigLIP-style: bias enabled).
   LayerHandle wq(createLayer(
@@ -244,7 +244,7 @@ Tensor ClipVitTransformer::createSelfAttention(int layer_id, Tensor x) {
   return wo(a);
 }
 
-Tensor ClipVitTransformer::createVitMlp(int layer_id, Tensor x) {
+Tensor Lfm2VlVisionTransformer::createVitMlp(int layer_id, Tensor x) {
 
   LayerHandle up(createLayer(
     "fully_connected",
@@ -266,13 +266,13 @@ Tensor ClipVitTransformer::createVitMlp(int layer_id, Tensor x) {
   return down(h);
 }
 
-void ClipVitTransformer::run(const WSTR image_tensor_path, bool /*do_sample*/,
+void Lfm2VlVisionTransformer::run(const WSTR image_tensor_path, bool /*do_sample*/,
                              const WSTR /*system_prompt*/,
                              const WSTR /*tail_prompt*/, bool log_output) {
 
   if (!is_initialized) {
     throw std::runtime_error(
-      "ClipVitTransformer is not initialized. Call initialize() first.");
+      "Lfm2VlVisionTransformer is not initialized. Call initialize() first.");
   }
 
   // Load preprocessed image tensor (raw fp32, NCHW, BATCH_SIZE x C x H x W).
@@ -300,7 +300,7 @@ void ClipVitTransformer::run(const WSTR image_tensor_path, bool /*do_sample*/,
   std::vector<float *> out_ptrs = model->inference(BATCH_SIZE, in_ptrs, {});
 
   if (log_output && !out_ptrs.empty() && out_ptrs[0] != nullptr) {
-    std::cout << "ClipVitTransformer features [" << NUM_PATCHES << "x" << DIM
+    std::cout << "Lfm2VlVisionTransformer features [" << NUM_PATCHES << "x" << DIM
               << "], first 10 values: ";
     for (int i = 0; i < 10 && i < DIM; ++i) {
       std::cout << out_ptrs[0][i] << (i == 9 ? "" : ", ");

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file   clip_vit_transformer.h
+ * @file   lfm2_vl_vision_transformer.h
  * @date   13 May 2026
  * @brief  CLIP/SigLIP-style Vision Transformer encoder for nntrainer CausalLM.
  *         Targets the LFM2.5-VL vision tower (GGUF tensor naming v.*).
@@ -26,18 +26,18 @@
  *           [Image features B,N,DIM]
  */
 
-#ifndef __CLIP_VIT_TRANSFORMER_H__
-#define __CLIP_VIT_TRANSFORMER_H__
+#ifndef __LFM2_VL_VISION_TRANSFORMER_H__
+#define __LFM2_VL_VISION_TRANSFORMER_H__
 
 #include <transformer.h>
 
 namespace causallm {
 
-class ClipVitTransformer : public Transformer {
+class Lfm2VlVisionTransformer : public Transformer {
 public:
-  static constexpr const char *architectures = "ClipVitTransformer";
+  static constexpr const char *architectures = "Lfm2VlVisionTransformer";
 
-  ClipVitTransformer(json &cfg, json &generation_cfg, json &nntr_cfg) :
+  Lfm2VlVisionTransformer(json &cfg, json &generation_cfg, json &nntr_cfg) :
     Transformer(sanitizeConfig(cfg), generation_cfg, nntr_cfg,
                 ModelType::EMBEDDING) {
     setupParameters(cfg, generation_cfg, nntr_cfg);
@@ -49,11 +49,11 @@ public:
    *        (vocab_size, max_position_embeddings, rope_theta,
    *        tie_word_embeddings, rms_norm_eps, num_attention_heads). The values
    *        written here are immediately overwritten by
-   *        ClipVitTransformer::setupParameters() with the real ViT values.
+   *        Lfm2VlVisionTransformer::setupParameters() with the real ViT values.
    */
   static json &sanitizeConfig(json &cfg);
 
-  ~ClipVitTransformer() override = default;
+  ~Lfm2VlVisionTransformer() override = default;
 
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;
@@ -100,4 +100,4 @@ protected:
 
 } // namespace causallm
 
-#endif /* __CLIP_VIT_TRANSFORMER_H__ */
+#endif /* __LFM2_VL_VISION_TRANSFORMER_H__ */
