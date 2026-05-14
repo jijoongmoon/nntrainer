@@ -10,7 +10,7 @@
  *         symbolic graph without throwing on a tiny toy configuration.
  *         No GGUF / pretrained weights are required.
  * @see    https://github.com/nntrainer/nntrainer
- * @author Jijoong Moon <jijoong.moon@samsung.com> <noreply@anthropic.com>
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  */
 
