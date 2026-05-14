@@ -41,6 +41,22 @@ TensorDim::DataType safetensorsDtypeToNntrainer(const std::string &raw) {
   return TensorDim::DataType::NONE;
 }
 
+std::string safetensorsDtypeToNntrainerString(const std::string &raw) {
+  if (raw == "F32")
+    return "FP32";
+  if (raw == "F16")
+    return "FP16";
+  if (raw == "I8")
+    return "QINT8";
+  if (raw == "U8")
+    return "UINT8";
+  if (raw == "U16")
+    return "UINT16";
+  if (raw == "U32")
+    return "UINT32";
+  return "";
+}
+
 namespace {
 
 // Single-pass JSON walker over the safetensors header. State is just an

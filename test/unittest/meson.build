@@ -80,6 +80,7 @@ test_target = [
   ['unittest_nntrainer_gemm_q8_0', []],
   ['unittest_nntrainer_weight_dtype_map', []],
   ['unittest_nntrainer_safetensors_header', []],
+  ['unittest_nntrainer_weight_source', []],
   ['unittest_thread_manager', []],
   #['unittest_nntrainer_task', []],
 ]

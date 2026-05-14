@@ -161,6 +161,31 @@ public:
 };
 
 /**
+ * @brief Path to a .safetensors file whose header drives per-tensor dtype.
+ *
+ *        When non-empty, NeuralNetwork::compile() reads the safetensors
+ *        header (no full weight load) once, and for every layer node it
+ *        synthesises a `weight_dtype_map` property like
+ *
+ *           "weight:F32,bias:F16"
+ *
+ *        by looking up `<layer_name>.<role>` keys in the header. The
+ *        injected per-layer maps then drive
+ *        InitLayerContext::getDataTypeForRole() at finalize, so the
+ *        TensorDim built for each weight already knows its true storage
+ *        dtype before the tensor manager allocates it.
+ *
+ *        Empty string (default) disables the feature — the model falls
+ *        back to its model_tensor_type / per-layer weight_dtype settings.
+ */
+class WeightSource : public Property<std::string> {
+public:
+  static constexpr const char *key = "weight_source";
+  using prop_tag = str_prop_tag;
+  WeightSource(const std::string &value = "") : Property<std::string>(value) {}
+};
+
+/**
  * @brief cache file path property
  *
  */
