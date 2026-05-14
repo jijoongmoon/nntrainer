@@ -38,9 +38,20 @@ public:
   static constexpr const char *architectures = "ClipVitTransformer";
 
   ClipVitTransformer(json &cfg, json &generation_cfg, json &nntr_cfg) :
-    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::EMBEDDING) {
+    Transformer(sanitizeConfig(cfg), generation_cfg, nntr_cfg,
+                ModelType::EMBEDDING) {
     setupParameters(cfg, generation_cfg, nntr_cfg);
   }
+
+  /**
+   * @brief Fill in the LLM-shaped fields that base Transformer::setupParameters
+   *        requires but a vision-tower config does not naturally carry
+   *        (vocab_size, max_position_embeddings, rope_theta,
+   *        tie_word_embeddings, rms_norm_eps, num_attention_heads). The values
+   *        written here are immediately overwritten by
+   *        ClipVitTransformer::setupParameters() with the real ViT values.
+   */
+  static json &sanitizeConfig(json &cfg);
 
   ~ClipVitTransformer() override = default;
 
