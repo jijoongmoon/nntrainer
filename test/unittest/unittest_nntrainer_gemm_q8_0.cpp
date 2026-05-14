@@ -19,6 +19,7 @@
 
 #include <cpu_backend.h>
 #include <fallback_internal.h>
+#include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
 #include <q8_0_tensor.h>
 
@@ -192,7 +193,58 @@ INSTANTIATE_TEST_SUITE_P(
   ::testing::Values(Shape{1, 32, 32}, Shape{1, 64, 64}, Shape{4, 32, 64},
                     Shape{8, 128, 128}, Shape{2, 96, 96}));
 
+// SIMD path: __ggml_q8_0_q8_0_GEMM uses the AVX2 nntr_gemm_q8_0_q8_0 kernel,
+// which shares mul_sum_i8_pairs_acc_int32x8 with the Q4_0 kernel — identical
+// int8 dot product instruction mix.
+TEST_P(GemmQ8_0Param, simd_kernel_matches_scalar_oracle) {
+  const Shape sh = GetParam();
+  ASSERT_EQ(sh.K % QK, 0u);
+
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  std::vector<float> A(static_cast<size_t>(sh.M) * sh.K);
+  std::vector<float> B_fp32(static_cast<size_t>(sh.N) * sh.K);
+  for (auto &v : A)
+    v = dist(rng);
+  for (auto &v : B_fp32)
+    v = dist(rng);
+
+  const unsigned int nb_per_row = sh.K / QK;
+  std::vector<nntrainer::block_q8_0> B_q8(static_cast<size_t>(sh.N) *
+                                          nb_per_row);
+  for (unsigned int n = 0; n < sh.N; ++n) {
+    quantize_row_q8_0_ref(B_fp32.data() + static_cast<size_t>(n) * sh.K,
+                          B_q8.data() + static_cast<size_t>(n) * nb_per_row,
+                          sh.K);
+  }
+
+  std::vector<float> C_scalar(static_cast<size_t>(sh.M) * sh.N, 0.0f);
+  std::vector<float> C_simd(static_cast<size_t>(sh.M) * sh.N, 0.0f);
+
+  nntrainer::__fallback_gemm_q8_0<float>(sh.M, sh.N, sh.K, A.data(), sh.K,
+                                         B_q8.data(), sh.K, C_scalar.data(),
+                                         sh.N);
+
+  nntrainer::__ggml_q8_0_q8_0_GEMM(sh.M, sh.N, sh.K, A.data(), sh.K,
+                                   B_q8.data(), sh.K, C_simd.data(), sh.N);
+
+  // Both kernels do the same arithmetic on the same Q8_0 blocks; the only
+  // possible discrepancy is fp32 accumulation order. A tight epsilon catches
+  // any structural bug while tolerating that.
+  const float abs_tol = 1e-3f;
+  for (size_t i = 0; i < C_scalar.size(); ++i) {
+    ASSERT_LE(std::fabs(C_simd[i] - C_scalar[i]), abs_tol)
+      << "idx=" << i << "  simd=" << C_simd[i] << "  scalar=" << C_scalar[i];
+  }
+}
+
 int main(int argc, char **argv) {
+  // Initialise the fp16 <-> fp32 lookup table that the GGML quantised path
+  // depends on. In production this is invoked by init_backend() during model
+  // setup, but unit tests reach the GEMM kernels directly so we have to do it
+  // here. Without this nntr_fp16_to_fp32() returns 0 for every input.
+  nntrainer::__ggml_init();
+
   int result = -1;
   try {
     ::testing::InitGoogleTest(&argc, argv);
