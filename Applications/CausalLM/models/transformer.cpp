@@ -82,9 +82,14 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
   // This is where you would set up the model layers, parameters, etc.
   setupParameters(cfg, generation_cfg, nntr_cfg);
 
-  // prep tokenizer
-  tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-    LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+  // prep tokenizer — optional, since image-only models (e.g.
+  // ClipVitTransformer) and unit tests have no tokenizer.json to point at.
+  if (nntr_cfg.contains("tokenizer_file") &&
+      !nntr_cfg["tokenizer_file"].is_null() &&
+      !nntr_cfg["tokenizer_file"].get<std::string>().empty()) {
+    tokenizer = tokenizers::Tokenizer::FromBlobJSON(
+      LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+  }
 };
 
 void Transformer::setupParameters(json &cfg, json &generation_cfg,

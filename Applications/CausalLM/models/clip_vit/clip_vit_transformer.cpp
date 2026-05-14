@@ -34,6 +34,34 @@ std::string blkName(int i, const char *suffix) {
 
 } // namespace
 
+json &ClipVitTransformer::sanitizeConfig(json &cfg) {
+  // base Transformer::setupParameters() calls .get<T>() on these without a
+  // default, so missing keys would throw. Values written here are overwritten
+  // by ClipVitTransformer::setupParameters() immediately afterwards.
+  if (!cfg.contains("vocab_size"))
+    cfg["vocab_size"] = 0u;
+  if (!cfg.contains("max_position_embeddings")) {
+    unsigned int img = cfg.value("image_size", 256u);
+    unsigned int patch = cfg.value("patch_size", 16u);
+    cfg["max_position_embeddings"] = (img / patch) * (img / patch);
+  }
+  if (!cfg.contains("rope_theta"))
+    cfg["rope_theta"] = 0u;
+  if (!cfg.contains("tie_word_embeddings"))
+    cfg["tie_word_embeddings"] = false;
+  if (!cfg.contains("rms_norm_eps"))
+    cfg["rms_norm_eps"] = cfg.value("layer_norm_eps", 1e-6f);
+  if (!cfg.contains("num_attention_heads"))
+    cfg["num_attention_heads"] = 12;
+  if (!cfg.contains("hidden_size"))
+    cfg["hidden_size"] = 768;
+  if (!cfg.contains("num_hidden_layers"))
+    cfg["num_hidden_layers"] = 12;
+  if (!cfg.contains("intermediate_size"))
+    cfg["intermediate_size"] = 3072;
+  return cfg;
+}
+
 void ClipVitTransformer::setupParameters(json &cfg, json &generation_cfg,
                                          json &nntr_cfg) {
   // Vision Transformer parameters. Defaults follow LFM2.5-VL's vision tower

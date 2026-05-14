@@ -116,4 +116,20 @@ if get_option('enable-test')
     timeout: 60,
     suite: 'unittests'
   )
+
+  # ClipVitTransformer structural unit tests
+  unittest_clip_vit_transformer = executable(
+    'unittest_clip_vit_transformer',
+    meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_clip_vit_transformer.cpp',
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_dep, causallm_layer_dependencies, causallm_dep],
+    include_directories: [causallm_inc, include_directories('models', 'models/clip_vit')],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_clip_vit_transformer', unittest_clip_vit_transformer,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_clip_vit_transformer'),
+    timeout: 60,
+    suite: 'unittests'
+  )
 endif
