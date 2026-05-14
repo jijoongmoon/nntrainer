@@ -12,6 +12,7 @@ subdir('qwen3')
 subdir('qwen3_moe')
 subdir('qwen3_slim_moe')
 subdir('gemma3')
+
 subdir('timm_vit')
 if get_option('platform') != 'windows'
     subdir('bert')
@@ -19,3 +20,6 @@ if get_option('platform') != 'windows'
     subdir('qwen3_cached_slim_moe')
 endif
 subdir('clip_vit')
+
+subdir('lfm2')
+

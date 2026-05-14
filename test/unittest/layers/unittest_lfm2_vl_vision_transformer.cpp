@@ -2,9 +2,9 @@
 /**
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
- * @file   unittest_clip_vit_transformer.cpp
+ * @file   unittest_lfm2_vl_vision_transformer.cpp
  * @date   13 May 2026
- * @brief  Unit tests for ClipVitTransformer (CLIP/SigLIP-style ViT encoder).
+ * @brief  Unit tests for Lfm2VlVisionTransformer (CLIP/SigLIP-style ViT encoder).
  *         These tests exercise structure-only behavior: config parsing,
  *         parameter defaults, and that initialize() builds + compiles the
  *         symbolic graph without throwing on a tiny toy configuration.
@@ -16,7 +16,7 @@
 
 #include <gtest/gtest.h>
 
-#include <clip_vit_transformer.h>
+#include <lfm2_vl_vision_transformer.h>
 
 namespace {
 
@@ -25,9 +25,9 @@ namespace {
  *        protected fields. We only need read access — the test does not
  *        mutate any internal state.
  */
-class TestableClipVit : public causallm::ClipVitTransformer {
+class TestableLfm2Vl : public causallm::Lfm2VlVisionTransformer {
 public:
-  using causallm::ClipVitTransformer::ClipVitTransformer;
+  using causallm::Lfm2VlVisionTransformer::Lfm2VlVisionTransformer;
 
   unsigned int imageSize() const { return IMAGE_SIZE; }
   unsigned int patchSize() const { return PATCH_SIZE; }
@@ -45,7 +45,7 @@ public:
 };
 
 /**
- * @brief Helper: build the three JSON blobs ClipVitTransformer expects.
+ * @brief Helper: build the three JSON blobs Lfm2VlVisionTransformer expects.
  *        Sized small enough for the graph to compile in a few hundred ms.
  */
 struct ToyConfig {
@@ -91,9 +91,9 @@ causallm::json makeFullNntrCfg() {
 
 } // namespace
 
-TEST(ClipVitTransformer, setup_parameters_picks_up_overrides) {
+TEST(Lfm2VlVisionTransformer, setup_parameters_picks_up_overrides) {
   auto toy = makeToyConfig();
-  TestableClipVit vit(toy.cfg, toy.generation_cfg, toy.nntr_cfg);
+  TestableLfm2Vl vit(toy.cfg, toy.generation_cfg, toy.nntr_cfg);
 
   EXPECT_EQ(vit.imageSize(), 32u);
   EXPECT_EQ(vit.patchSize(), 16u);
@@ -115,13 +115,13 @@ TEST(ClipVitTransformer, setup_parameters_picks_up_overrides) {
   EXPECT_EQ(vit.initSeqLen(), 4u);
 }
 
-TEST(ClipVitTransformer, setup_parameters_uses_defaults_when_fields_missing) {
+TEST(Lfm2VlVisionTransformer, setup_parameters_uses_defaults_when_fields_missing) {
   // Empty cfg: every field must fall back to the LFM2.5-VL / SigLIP2 defaults
   // baked into setupParameters().
   causallm::json cfg = causallm::json::object();
   causallm::json generation_cfg = causallm::json::object();
   causallm::json nntr_cfg = makeFullNntrCfg();
-  TestableClipVit vit(cfg, generation_cfg, nntr_cfg);
+  TestableLfm2Vl vit(cfg, generation_cfg, nntr_cfg);
 
   EXPECT_EQ(vit.imageSize(), 256u);
   EXPECT_EQ(vit.patchSize(), 16u);
@@ -138,19 +138,19 @@ TEST(ClipVitTransformer, setup_parameters_uses_defaults_when_fields_missing) {
   EXPECT_EQ(vit.initSeqLen(), 256u);
 }
 
-TEST(ClipVitTransformer, initialize_builds_graph_without_exception) {
+TEST(Lfm2VlVisionTransformer, initialize_builds_graph_without_exception) {
   // This is the structural smoke test: any mismatch between layer-name
   // uniqueness, shape inference (Conv2D -> Reshape -> mha_core ->
   // residual addition) or property parsing will surface here as a thrown
   // exception inside compile().
   auto toy = makeToyConfig();
-  TestableClipVit vit(toy.cfg, toy.generation_cfg, toy.nntr_cfg);
+  TestableLfm2Vl vit(toy.cfg, toy.generation_cfg, toy.nntr_cfg);
 
   ASSERT_NO_THROW(vit.initialize());
   EXPECT_TRUE(vit.initialized());
 }
 
-TEST(ClipVitTransformer, initialize_supports_larger_grid) {
+TEST(Lfm2VlVisionTransformer, initialize_supports_larger_grid) {
   // A slightly larger grid (4x4 patches, 4 heads, 3 layers) to catch
   // regressions that only manifest at non-trivial NUM_HEADS / NUM_LAYERS.
   causallm::json cfg = {{"hidden_size", 32},
@@ -166,7 +166,7 @@ TEST(ClipVitTransformer, initialize_supports_larger_grid) {
   nntr_cfg["init_seq_len"] = 16;
   nntr_cfg["max_seq_len"] = 16;
 
-  TestableClipVit vit(cfg, generation_cfg, nntr_cfg);
+  TestableLfm2Vl vit(cfg, generation_cfg, nntr_cfg);
   EXPECT_EQ(vit.numPatches(), 16u); // (64/16)^2
 
   ASSERT_NO_THROW(vit.initialize());

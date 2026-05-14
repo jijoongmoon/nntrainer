@@ -32,7 +32,7 @@
 
 #include "causal_lm.h"
 #include "chat_template.h"
-#include "clip_vit_transformer.h"
+#include "lfm2_vl_vision_transformer.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
 #if !defined(_WIN32)
@@ -272,8 +272,8 @@ int main(int argc, char *argv[]) {
     });							    
 
   causallm::Factory::Instance().registerModel(
-    "ClipVitTransformer", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::ClipVitTransformer>(cfg, generation_cfg,
+    "Lfm2VlVisionTransformer", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Lfm2VlVisionTransformer>(cfg, generation_cfg,
                                                             nntr_cfg);
     });
 
