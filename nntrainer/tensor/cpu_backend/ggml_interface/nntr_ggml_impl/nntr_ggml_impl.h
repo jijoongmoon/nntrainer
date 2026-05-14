@@ -39,6 +39,18 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);
 
+// Q8_0 weight x Q8_0 activation GEMM/GEMV. AVX2-vectorised, uses the same
+// mul_sum_i8_pairs_acc_int32x8 helper as the Q4_0 path so the int8 dot
+// product instruction mix is identical. Weights are consumed in their raw
+// block_q8_0 row-major layout (no interleave/repack required).
+void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc);
+
+void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc);
+
 void nntr_gemv_q4_K_8x8_q8_K(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);

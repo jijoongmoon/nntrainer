@@ -121,6 +121,25 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int ldc);
 
 /**
+ * @brief Q8_0 weight x Q8_0 activation GEMM dispatcher (AVX2 path).
+ *        Online-quantises FP32 activation A to Q8_0, then performs the
+ *        int8 dot product against pre-quantised Q8_0 weight B (raw
+ *        block_q8_0 row-major layout, no repack/interleave).
+ *
+ * @param M Rows of activation / output.
+ * @param N Cols of output / rows of weight.
+ * @param K Hidden dim (must be a multiple of 32).
+ * @param A FP32 activation [M, lda].
+ * @param B (block_q8_0*) weight, [N, K/32] blocks.
+ * @param C FP32 output [M, ldc].
+ */
+void __ggml_q8_0_q8_0_GEMM(const unsigned int M, const unsigned int N,
+                           const unsigned int K, const float *A,
+                           const unsigned int lda, const void *B,
+                           const unsigned int ldb, float *C,
+                           const unsigned int ldc);
+
+/**
  * @brief A(M, K) * W.T(N, K) = (M, N)
  *
  * @param M as descripted above

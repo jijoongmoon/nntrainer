@@ -337,9 +337,10 @@ template <>
 void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
                const unsigned int ldb, float *C, const unsigned int ldc) {
-  // No dedicated SIMD kernel yet; route through the scalar fallback. A
-  // ggml-style q8_0 x q8_0 8x8 micro-kernel is the planned follow-up.
-  return __fallback_gemm_q8_0<float>(M, N, K, A, lda, B, ldb, C, ldc);
+  // AVX2 path. Routes to __ggml_q8_0_q8_0_GEMM (online-quantises A to Q8_0
+  // and runs nntr_gemm_q8_0_q8_0, which uses the same
+  // mul_sum_i8_pairs_acc_int32x8 int8 dot helper as the Q4_0 kernel).
+  return __ggml_q8_0_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
