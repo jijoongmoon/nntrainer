@@ -333,6 +333,15 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
   return __ggml_q4_0_8x8_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
+template <>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const float *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, float *C, const unsigned int ldc) {
+  // No dedicated SIMD kernel yet; route through the scalar fallback. A
+  // ggml-style q8_0 x q8_0 8x8 micro-kernel is the planned follow-up.
+  return __fallback_gemm_q8_0<float>(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
