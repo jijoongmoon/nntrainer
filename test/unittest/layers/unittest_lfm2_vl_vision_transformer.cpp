@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
+ * Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
  *
  * @file   unittest_lfm2_vl_vision_transformer.cpp
  * @date   13 May 2026
@@ -10,7 +10,7 @@
  *         symbolic graph without throwing on a tiny toy configuration.
  *         No GGUF / pretrained weights are required.
  * @see    https://github.com/nntrainer/nntrainer
- * @author Claude <noreply@anthropic.com>
+ * @author Jijoong Moon <jijoong.moon@samsung.com> <noreply@anthropic.com>
  * @bug    No known bugs except for NYI items
  */
 

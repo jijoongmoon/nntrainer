@@ -24,7 +24,7 @@
  *         up.
  *
  * @see    https://github.com/nntrainer/nntrainer
- * @author Claude
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  */
 

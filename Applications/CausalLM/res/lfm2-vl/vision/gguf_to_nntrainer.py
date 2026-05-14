@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 ##
-# Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
+# Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
 #
 # @file  gguf_to_nntrainer.py
 # @brief Convert a GGUF vision-tower (LFM2.5-VL / SigLIP2-86M style) into

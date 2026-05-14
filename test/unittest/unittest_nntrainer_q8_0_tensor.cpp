@@ -7,7 +7,7 @@
  *         ModelTensorDataTypeInfo::WQ80A32). Mirrors what Q4_0_Tensor
  *         already provides for the 4-bit path.
  * @see    https://github.com/nntrainer/nntrainer
- * @author Claude (mirror of q4_0 plumbing by Donghyeon Jeong)
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  */
 

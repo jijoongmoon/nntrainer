@@ -2,6 +2,9 @@
 /**
  * @file   lfm2_vl_vision_transformer.cpp
  * @date   13 May 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug    No known bugs except for NYI items
  * @brief  CLIP/SigLIP-style Vision Transformer encoder.
  */
 

@@ -4,7 +4,7 @@
  * @date        14 May 2026
  * @brief       Q8_0_Tensor class for Q8_0 quantised weights.
  * @see         https://github.com/nntrainer/nntrainer
- * @author      Claude (mirror of q4_0_tensor by Donghyeon Jeong)
+ * @author      Jijoong Moon <jijoong.moon@samsung.com>
  * @bug         No known bugs except for NYI items
  *
  * Q8_0 layout (matches llama.cpp / GGML):

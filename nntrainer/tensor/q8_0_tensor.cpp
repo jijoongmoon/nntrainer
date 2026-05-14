@@ -4,7 +4,7 @@
  * @date        14 May 2026
  * @brief       Q8_0_Tensor implementation (mirror of q4_0_tensor.cpp).
  * @see         https://github.com/nntrainer/nntrainer
- * @author      Claude
+ * @author      Jijoong Moon <jijoong.moon@samsung.com>
  * @bug         No known bugs except for NYI items
  */
 
