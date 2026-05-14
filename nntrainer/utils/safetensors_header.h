@@ -120,6 +120,16 @@ SafetensorsHeader parseSafetensorsHeader(const void *data, size_t size);
  */
 TensorDim::DataType safetensorsDtypeToNntrainer(const std::string &raw);
 
+/**
+ * @brief Same mapping as @c safetensorsDtypeToNntrainer but returns the
+ *        nntrainer property-format string ("FP32", "FP16", "QINT8", ...)
+ *        ready to be plugged into the `weight_dtype_map` property string
+ *        ("weight:FP32,bias:FP16").
+ *
+ *        Returns the empty string for unrecognised safetensors tokens.
+ */
+std::string safetensorsDtypeToNntrainerString(const std::string &raw);
+
 } // namespace nntrainer
 
 #endif /* __cplusplus */
