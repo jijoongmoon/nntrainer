@@ -98,6 +98,7 @@ if get_option('enable-opencl')
   test_target += [['unittest_opencl_kernels_qk_k', []]]
   test_target += [['unittest_attention_kernels_cl', []]]
   test_target += [['unittest_opencl_phwc4_layout', []]]
+  test_target += [['unittest_opencl_weight_pack_layout', []]]
 endif
 
 if get_option('enable-fp16')
