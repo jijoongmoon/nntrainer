@@ -440,9 +440,38 @@ private:
   std::string name;   /**< name of the layer */
   std::string prefix; /**< prefix of the layer */
   std::array<std::string, 3> tensor_type;
+  /**< Raw "role:dtype,role:dtype" string from the WeightDtypeMap property.
+       Parsed lazily on first lookup; empty string disables per-role
+       overrides and the layer falls back to model-level tensor_type. */
+  std::string weight_dtype_map_str;
+  mutable std::map<std::string, TensorDim::DataType> weight_dtype_map_cache;
+  mutable bool weight_dtype_map_parsed = false;
   float loss_scale; /**< loss_scale value */
   ml::train::ExecutionMode mode;
   ml::train::LayerComputeEngine engine;
+
+public:
+  /**
+   * @brief Set the raw weight_dtype_map string (typically from
+   *        LayerNode::finalize after props are realised). Format:
+   *        "role:dtype,role:dtype" (e.g. "weight:Q8_0,bias:FP32"). Empty
+   *        string disables the map. Resets the parsed cache.
+   */
+  void setWeightDtypeMap(const std::string &s) {
+    weight_dtype_map_str = s;
+    weight_dtype_map_parsed = false;
+    weight_dtype_map_cache.clear();
+  }
+
+  /**
+   * @brief Look up the dtype for a per-weight role (e.g. "weight", "bias",
+   *        "gamma", "beta", "filter"). If the role is present in the map
+   *        the override is returned; otherwise @p fallback is returned.
+   *        Whitespace in the map string is tolerated. Unknown dtype
+   *        strings throw the same exception EnumProperty would.
+   */
+  TensorDim::DataType getDataTypeForRole(const std::string &role,
+                                         TensorDim::DataType fallback) const;
 };
 
 /**

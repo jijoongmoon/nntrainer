@@ -325,13 +325,23 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   auto &dilation =
     std::get<std::array<props::Dilation, CONV2D_DIM>>(conv_props);
 
-  auto in_t_type = in_dim.getTensorType();
-  in_t_type.data_type = context.getWeightDataType();
+  // filter is multiplicative -> weight dtype channel by default.
+  // bias is additive -> activation dtype channel by default (mirrors FC bias).
+  // Both can be overridden per-role via the weight_dtype_map property
+  // (e.g. weight_dtype_map = "filter:Q4_0,bias:FP32").
+  auto filter_t_type = in_dim.getTensorType();
+  filter_t_type.data_type =
+    context.getDataTypeForRole("filter", context.getWeightDataType());
 
-  TensorDim kernel_dim = TensorDim(filter_size, in_dim.channel(),
-                                   kernel_size[0], kernel_size[1], in_t_type);
+  auto bias_t_type = in_dim.getTensorType();
+  bias_t_type.data_type =
+    context.getDataTypeForRole("bias", context.getActivationDataType());
 
-  TensorDim bias_dim = TensorDim(1, filter_size, 1, 1, in_t_type);
+  TensorDim kernel_dim =
+    TensorDim(filter_size, in_dim.channel(), kernel_size[0], kernel_size[1],
+              filter_t_type);
+
+  TensorDim bias_dim = TensorDim(1, filter_size, 1, 1, bias_t_type);
 
   padding = std::get<props::Padding2D>(conv_props)
               .compute(in_dim, kernel_dim, {stride[0], stride[1]},

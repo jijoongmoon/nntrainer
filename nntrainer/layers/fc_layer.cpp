@@ -96,18 +96,23 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   /** Bias Dimension : (1, 1, 1, unit) */
   /// @note bias is directly added to activation
   /// since we have no dequantizer for add operation,
-  /// we have to set its data type as same as activation.
-  /// This should be updated when the dequantizer is supported.
+  /// we have to set its data type as same as activation by default.
+  /// The weight_dtype_map property ("bias:...") can override this per-role.
   TensorDim bias_dim(
     1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    TensorDim::TensorType(context.getFormat(), context.getActivationDataType()),
+    TensorDim::TensorType(
+      context.getFormat(),
+      context.getDataTypeForRole("bias", context.getActivationDataType())),
     is_nchw ? 0b0001 : 0b0100);
 
   /** Weight Dimension : (1, 1, in_dim.width(), unit)*/
+  /// weight_dtype_map ("weight:...") overrides the model-level weight dtype.
   TensorDim weight_dim(
     1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
     is_nchw ? unit : in_dim.channel(),
-    TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+    TensorDim::TensorType(
+      context.getFormat(),
+      context.getDataTypeForRole("weight", context.getWeightDataType())),
     is_nchw ? 0b0011 : 0b0101);
 
   weight_idx[FCParams::weight] = context.requestWeight(
