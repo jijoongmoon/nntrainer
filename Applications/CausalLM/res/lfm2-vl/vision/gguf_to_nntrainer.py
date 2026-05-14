@@ -4,9 +4,13 @@
 # Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
 #
 # @file  gguf_to_nntrainer.py
-# @brief Convert a GGUF vision-tower (LFM2.5-VL / SigLIP2-86M style) into the
-#        layer-ordered raw .bin format the nntrainer ClipVitTransformer
-#        consumes via Model::load(MODEL_FORMAT_BIN).
+# @brief Convert a GGUF vision-tower (LFM2.5-VL / SigLIP2-86M style) into
+#        either:
+#          (a) the layer-ordered raw .bin format the nntrainer
+#              ClipVitTransformer consumes via Model::load(MODEL_FORMAT_BIN),
+#          (b) a HuggingFace .safetensors file with nntrainer-style names, or
+#          (c) both, side-by-side.
+#        Selected via `--format {bin,safetensors,both}`.
 #
 # The nntrainer .bin format is not self-describing: it is a sequence of raw
 # tensor bytes laid out in the exact order the layers are constructed (and
@@ -14,6 +18,15 @@
 # the order ClipVitTransformer wires up — see
 # Applications/CausalLM/models/clip_vit/clip_vit_transformer.cpp — and writes
 # tensors out in that exact sequence.
+#
+# The .safetensors output stores the same tensors as named entries:
+#   "v_patch_embd.filter", "v_patch_embd.bias",
+#   "v_blk_{i}_ln1.gamma", "v_blk_{i}_ln1.beta",
+#   "v_blk_{i}_attn_q.weight", "v_blk_{i}_attn_q.bias",
+#   ... and so on, mirroring the C++ layer names assigned in
+#   clip_vit_transformer.cpp. All tensors are stored as FP32. Useful as an
+#   interchange format and for diffing converters; nntrainer's runtime does
+#   not yet have a safetensors loader.
 #
 # Expected GGUF tensor names (HuggingFace convert_clip.py / mmproj convention):
 #
@@ -368,54 +381,114 @@ def top_level_names(reader: GGUFReader):
 
 
 # ---------------------------------------------------------------------------
-# Writers
+# Tensor collection helpers
 # ---------------------------------------------------------------------------
-def _write_fp32(out, arr: np.ndarray):
-    """Write a numpy array as little-endian fp32, contiguous."""
-    np.ascontiguousarray(arr.astype(np.float32, copy=False)).tofile(out)
+# Each helper appends one or more (name, fp32_array) entries to `tensors`.
+# `name` is the nntrainer-style fully-qualified weight key:
+#   "<layer_name>.<weight_role>"
+# (matches the names ClipVitTransformer assigns in clip_vit_transformer.cpp).
+# Writing the array contents in `tensors` order reproduces the byte stream
+# nntrainer's Model::load(MODEL_FORMAT_BIN) expects; the same array list is
+# also what we hand to write_safetensors().
 
 
-def write_conv2d(out, reader: GGUFReader, name_w: str, name_b: str,
-                 expected_shape):
+def _check_shape(name: str, arr: np.ndarray, expected):
+    if tuple(arr.shape) != tuple(expected):
+        raise ValueError(
+            f"{name} shape {tuple(arr.shape)} != expected {tuple(expected)}")
+
+
+def _check_len(name: str, arr: np.ndarray, expected: int):
+    if arr.size != expected:
+        raise ValueError(f"{name} length {arr.size} != expected {expected}")
+
+
+def collect_conv2d(tensors, reader: GGUFReader,
+                   nntr_layer: str, name_w: str, name_b: str,
+                   expected_shape):
     w = reader.read_tensor_fp32(name_w)
-    if tuple(w.shape) != tuple(expected_shape):
-        raise ValueError(
-            f"{name_w} shape {tuple(w.shape)} != expected {expected_shape}")
-    _write_fp32(out, w)
+    _check_shape(name_w, w, expected_shape)
+    tensors.append((f"{nntr_layer}.filter", w.astype(np.float32, copy=False)))
+
     b = reader.read_tensor_fp32(name_b)
-    if b.size != expected_shape[0]:
-        raise ValueError(
-            f"{name_b} length {b.size} != expected {expected_shape[0]}")
-    _write_fp32(out, b)
+    _check_len(name_b, b, expected_shape[0])
+    tensors.append((f"{nntr_layer}.bias", b.astype(np.float32, copy=False)))
 
 
-def write_fc(out, reader: GGUFReader, name_w: str, name_b: str,
-             N_out: int, N_in: int):
-    """GGUF stores nn.Linear weight as [out, in]; nntrainer expects [in, out].
-    Transpose on the way out."""
+def collect_fc(tensors, reader: GGUFReader,
+               nntr_layer: str, name_w: str, name_b: str,
+               N_out: int, N_in: int):
+    """GGUF stores nn.Linear weight as [out, in]; nntrainer FC expects
+    [in, out]. Transpose on the way out."""
     w = reader.read_tensor_fp32(name_w)
-    if tuple(w.shape) != (N_out, N_in):
-        raise ValueError(
-            f"{name_w} shape {tuple(w.shape)} != expected ({N_out}, {N_in})")
-    _write_fp32(out, w.T)
+    _check_shape(name_w, w, (N_out, N_in))
+    w_t = np.ascontiguousarray(w.T).astype(np.float32, copy=False)
+    tensors.append((f"{nntr_layer}.weight", w_t))
+
     b = reader.read_tensor_fp32(name_b)
-    if b.size != N_out:
-        raise ValueError(f"{name_b} length {b.size} != {N_out}")
-    _write_fp32(out, b)
+    _check_len(name_b, b, N_out)
+    tensors.append((f"{nntr_layer}.bias", b.astype(np.float32, copy=False)))
 
 
-def write_norm(out, reader: GGUFReader, name_w: str, name_b: str,
-               expected_len: int):
+def collect_norm(tensors, reader: GGUFReader,
+                 nntr_layer: str, name_w: str, name_b: str,
+                 expected_len: int):
     g = reader.read_tensor_fp32(name_w)
-    if g.size != expected_len:
-        raise ValueError(
-            f"{name_w} length {g.size} != expected {expected_len}")
-    _write_fp32(out, g)
+    _check_len(name_w, g, expected_len)
+    tensors.append((f"{nntr_layer}.gamma", g.astype(np.float32, copy=False)))
+
     b = reader.read_tensor_fp32(name_b)
-    if b.size != expected_len:
-        raise ValueError(
-            f"{name_b} length {b.size} != expected {expected_len}")
-    _write_fp32(out, b)
+    _check_len(name_b, b, expected_len)
+    tensors.append((f"{nntr_layer}.beta", b.astype(np.float32, copy=False)))
+
+
+# ---------------------------------------------------------------------------
+# Serialisers
+# ---------------------------------------------------------------------------
+def write_bin(out_path: str, tensors):
+    """nntrainer .bin: raw FP32 bytes concatenated in layer order, no header,
+    no names. Consumed by Model::load(MODEL_FORMAT_BIN)."""
+    with open(out_path, "wb") as out:
+        for _name, arr in tensors:
+            np.ascontiguousarray(arr).astype(np.float32, copy=False).tofile(out)
+
+
+def write_safetensors(out_path: str, tensors):
+    """HuggingFace safetensors v0.4 format:
+       <u64 LE header_size> <UTF-8 JSON header> <raw bytes ...>
+    The JSON header maps each tensor name to its dtype, shape and
+    (start, end) byte offsets inside the data block. All tensors are
+    written contiguous, FP32 little-endian."""
+    # First pass: compute offsets.
+    header = {}
+    offset = 0
+    payloads = []
+    for name, arr in tensors:
+        arr_f32 = np.ascontiguousarray(arr).astype(np.float32, copy=False)
+        nbytes = arr_f32.nbytes
+        header[name] = {
+            "dtype": "F32",
+            "shape": list(arr_f32.shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+        offset += nbytes
+        payloads.append(arr_f32.tobytes())
+
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    # Pad the header to 8-byte alignment so the data section is aligned too.
+    pad = (8 - (len(header_bytes) % 8)) % 8
+    header_bytes += b" " * pad
+
+    with open(out_path, "wb") as out:
+        out.write(struct.pack("<Q", len(header_bytes)))
+        out.write(header_bytes)
+        for payload in payloads:
+            out.write(payload)
+
+
+def _layer_name_for_block(i: int, suffix: str) -> str:
+    """Mirror the C++ blkName(i, suffix) helper in clip_vit_transformer.cpp."""
+    return f"v_blk_{i}_{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +524,72 @@ def _infer_config(md: dict, reader: GGUFReader):
     )
 
 
+def gather_tensors(reader: GGUFReader, cfg: dict):
+    """Walk the ClipVitTransformer layer order and collect (name, fp32_array)
+    tuples. Order matches clip_vit_transformer.cpp exactly: writing these out
+    sequentially as raw FP32 reproduces the byte layout
+    Model::load(MODEL_FORMAT_BIN) expects."""
+    tensors = []
+    top = top_level_names(reader)
+    expected_patch_shape = (cfg["hidden"], cfg["channels"],
+                            cfg["patch_size"], cfg["patch_size"])
+
+    # 1. patch embedding (Conv2D).
+    collect_conv2d(tensors, reader, "v_patch_embd",
+                   _pick(reader, *top["patch_embd.weight"]),
+                   _pick(reader, *top["patch_embd.bias"]),
+                   expected_patch_shape)
+
+    # 2. encoder blocks (Pre-LN order matches clip_vit_transformer.cpp:
+    #    ln1, attn_q, attn_k, attn_v, attn_out, ln2, ffn_up, ffn_down).
+    for i in range(cfg["n_layers"]):
+        blk = vision_tensor_names(i)
+        layer = lambda s: _layer_name_for_block(i, s)
+
+        collect_norm(tensors, reader, layer("ln1"),
+                     _pick(reader, *blk["ln1.weight"]),
+                     _pick(reader, *blk["ln1.bias"]),
+                     cfg["hidden"])
+        collect_fc(tensors, reader, layer("attn_q"),
+                   _pick(reader, *blk["attn_q.weight"]),
+                   _pick(reader, *blk["attn_q.bias"]),
+                   cfg["hidden"], cfg["hidden"])
+        collect_fc(tensors, reader, layer("attn_k"),
+                   _pick(reader, *blk["attn_k.weight"]),
+                   _pick(reader, *blk["attn_k.bias"]),
+                   cfg["hidden"], cfg["hidden"])
+        collect_fc(tensors, reader, layer("attn_v"),
+                   _pick(reader, *blk["attn_v.weight"]),
+                   _pick(reader, *blk["attn_v.bias"]),
+                   cfg["hidden"], cfg["hidden"])
+        collect_fc(tensors, reader, layer("attn_out"),
+                   _pick(reader, *blk["attn_out.weight"]),
+                   _pick(reader, *blk["attn_out.bias"]),
+                   cfg["hidden"], cfg["hidden"])
+        collect_norm(tensors, reader, layer("ln2"),
+                     _pick(reader, *blk["ln2.weight"]),
+                     _pick(reader, *blk["ln2.bias"]),
+                     cfg["hidden"])
+        collect_fc(tensors, reader, layer("ffn_up"),
+                   _pick(reader, *blk["ffn_up.weight"]),
+                   _pick(reader, *blk["ffn_up.bias"]),
+                   cfg["ff_dim"], cfg["hidden"])
+        collect_fc(tensors, reader, layer("ffn_down"),
+                   _pick(reader, *blk["ffn_down.weight"]),
+                   _pick(reader, *blk["ffn_down.bias"]),
+                   cfg["hidden"], cfg["ff_dim"])
+
+        print(f"  block {i:2d}/{cfg['n_layers']} collected")
+
+    # 3. final post_ln.
+    collect_norm(tensors, reader, "v_post_ln",
+                 _pick(reader, *top["post_ln.weight"]),
+                 _pick(reader, *top["post_ln.bias"]),
+                 cfg["hidden"])
+
+    return tensors
+
+
 def convert(args):
     reader = GGUFReader(args.gguf)
     cfg = _infer_config(reader.metadata, reader)
@@ -460,77 +599,41 @@ def convert(args):
         print(f"  {k:14s} : {v}")
     print()
 
-    head_dim = cfg["hidden"] // cfg["n_heads"]
-    expected_patch_shape = (cfg["hidden"], cfg["channels"],
-                            cfg["patch_size"], cfg["patch_size"])
-
-    top = top_level_names(reader)
-
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".",
                 exist_ok=True)
 
-    with open(args.output, "wb") as out:
-        # 1. patch_embd (Conv2D weight + bias)
-        write_conv2d(out, reader,
-                     _pick(reader, *top["patch_embd.weight"]),
-                     _pick(reader, *top["patch_embd.bias"]),
-                     expected_patch_shape)
+    # Gather the full tensor list once; reuse for both serializers.
+    tensors = gather_tensors(reader, cfg)
+    total_params = sum(t[1].size for t in tensors)
+    print(f"\n  total params : {total_params:,} "
+          f"({total_params * 4 / (1024 * 1024):.2f} MiB raw FP32)")
 
-        # 2. encoder blocks (Pre-LN order matches clip_vit_transformer.cpp:
-        #    ln1, attn_q, attn_k, attn_v, attn_out, ln2, ffn_up, ffn_down)
-        for i in range(cfg["n_layers"]):
-            blk = vision_tensor_names(i)
+    fmt = args.format
+    base, _ext = os.path.splitext(args.output)
 
-            write_norm(out, reader,
-                       _pick(reader, *blk["ln1.weight"]),
-                       _pick(reader, *blk["ln1.bias"]),
-                       cfg["hidden"])
-            write_fc(out, reader,
-                     _pick(reader, *blk["attn_q.weight"]),
-                     _pick(reader, *blk["attn_q.bias"]),
-                     cfg["hidden"], cfg["hidden"])
-            write_fc(out, reader,
-                     _pick(reader, *blk["attn_k.weight"]),
-                     _pick(reader, *blk["attn_k.bias"]),
-                     cfg["hidden"], cfg["hidden"])
-            write_fc(out, reader,
-                     _pick(reader, *blk["attn_v.weight"]),
-                     _pick(reader, *blk["attn_v.bias"]),
-                     cfg["hidden"], cfg["hidden"])
-            write_fc(out, reader,
-                     _pick(reader, *blk["attn_out.weight"]),
-                     _pick(reader, *blk["attn_out.bias"]),
-                     cfg["hidden"], cfg["hidden"])
-            write_norm(out, reader,
-                       _pick(reader, *blk["ln2.weight"]),
-                       _pick(reader, *blk["ln2.bias"]),
-                       cfg["hidden"])
-            write_fc(out, reader,
-                     _pick(reader, *blk["ffn_up.weight"]),
-                     _pick(reader, *blk["ffn_up.bias"]),
-                     cfg["ff_dim"], cfg["hidden"])
-            write_fc(out, reader,
-                     _pick(reader, *blk["ffn_down.weight"]),
-                     _pick(reader, *blk["ffn_down.bias"]),
-                     cfg["hidden"], cfg["ff_dim"])
+    if fmt in ("bin", "both"):
+        bin_path = args.output if fmt == "bin" else (base + ".bin")
+        write_bin(bin_path, tensors)
+        size_mb = os.path.getsize(bin_path) / (1024 * 1024)
+        print(f"Wrote {bin_path} ({size_mb:.2f} MiB)  [nntrainer .bin]")
 
-            print(f"  block {i:2d}/{cfg['n_layers']} written")
-
-        # 3. final post_ln
-        write_norm(out, reader,
-                   _pick(reader, *top["post_ln.weight"]),
-                   _pick(reader, *top["post_ln.bias"]),
-                   cfg["hidden"])
-
-    size_mb = os.path.getsize(args.output) / (1024 * 1024)
-    print(f"\nWrote {args.output} ({size_mb:.2f} MiB)")
+    if fmt in ("safetensors", "both"):
+        st_path = args.output if fmt == "safetensors" else (base + ".safetensors")
+        write_safetensors(st_path, tensors)
+        size_mb = os.path.getsize(st_path) / (1024 * 1024)
+        print(f"Wrote {st_path} ({size_mb:.2f} MiB)  [safetensors]")
 
     if args.emit_nntr_config:
+        # nntrainer's CausalLM runtime loads MODEL_FORMAT_BIN, so point
+        # model_file_name at the .bin variant when both are written.
+        bin_name = base + ".bin" if fmt == "both" else (
+            os.path.basename(args.output) if fmt == "bin" else
+            os.path.basename(base + ".bin"))
         out_cfg = {
             "model_type": "embedding",
             "architectures": "ClipVitTransformer",
             "model_tensor_type": "FP32-FP32",
-            "model_file_name": os.path.basename(args.output),
+            "model_file_name": os.path.basename(bin_name),
             "fc_layer_dtype": "FP32",
             "embedding_dtype": "FP32",
             "batch_size": 1,
@@ -559,15 +662,33 @@ def convert(args):
 def parse_args():
     ap = argparse.ArgumentParser(
         description="Convert a GGUF vision tower (LFM2.5-VL / SigLIP2 86M) "
-                    "into the nntrainer .bin layout ClipVitTransformer "
-                    "consumes.")
+                    "into either the nntrainer .bin layout that "
+                    "ClipVitTransformer consumes (Model::load(MODEL_FORMAT_BIN)) "
+                    "or a HuggingFace .safetensors file with nntrainer-style "
+                    "tensor names, or both.")
     ap.add_argument("gguf", help="input GGUF file")
-    ap.add_argument("-o", "--output", default="vision.bin",
-                    help="output nntrainer .bin path (default: vision.bin)")
+    ap.add_argument("-o", "--output", default=None,
+                    help="output path. Default: vision.bin (for --format bin), "
+                         "vision.safetensors (for --format safetensors), or "
+                         "vision.{bin,safetensors} when --format both")
+    ap.add_argument("--format", default="bin",
+                    choices=["bin", "safetensors", "both"],
+                    help="output format. bin = raw layer-ordered nntrainer "
+                         ".bin (loadable today); safetensors = named-tensor "
+                         "HuggingFace .safetensors (FP32); both = write both "
+                         "alongside one another. Default: bin")
     ap.add_argument("--emit-nntr-config", action="store_true",
                     help="also write a matching nntr_config.json next to "
-                         "the output .bin")
-    return ap.parse_args()
+                         "the output (always points at the .bin variant)")
+    args = ap.parse_args()
+
+    # Resolve the default output path based on --format.
+    if args.output is None:
+        if args.format == "safetensors":
+            args.output = "vision.safetensors"
+        else:
+            args.output = "vision.bin"
+    return args
 
 
 def main():
