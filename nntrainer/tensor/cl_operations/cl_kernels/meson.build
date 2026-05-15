@@ -21,6 +21,7 @@ cl_op_kernels = [
   'activation_quant_int8_per_token.cl',
   'conv_1x1_int4cxp_qai8.cl',
   'conv_1x1_int4cxp_qai8_img2d_w.cl',
+  'conv_1x1_int4cxp_qai8_img2d_w_tile_w4.cl',
   'q4_0_ab_bi_8x4.cl',
   'q6_k_sgemv.cl',
   'restore_block_q4_0.cl',

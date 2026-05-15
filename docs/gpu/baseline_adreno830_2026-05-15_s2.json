@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-05-15T09:20:00Z",
+  "device": {
+    "model": "SM-S938N (Galaxy S25 Ultra)",
+    "gpu": "QUALCOMM Adreno(TM) 830",
+    "driver": "OpenCL 3.0 QUALCOMM build: 0800.40.1"
+  },
+  "kernel_variant": "Tier S2 — 4-token tile on top of B2 image2d. 1 work-item = 4 outputs x 4 W positions = 16 outputs. Each weight image2d texel is reused across 4 tokens within one work-item.",
+  "harness": {
+    "binary": "unittest_opencl_perf_conv_1x1_int4cxp_qai8_img2d_tile_w4",
+    "timing": "cl_event + clGetEventProfilingInfo",
+    "warmup_iters": 3,
+    "measured_iters": "10 (5 for FFN shapes)",
+    "build_options": "-cl-std=CL3.0",
+    "work_group_size": 64,
+    "constraint": "W must be divisible by 4 — decode (W=1) handled by the B2 non-tiled kernel"
+  },
+  "records": [
+    {
+      "kernel": "conv_1x1_int4cxp_qai8_img2d_w_tile_w4",
+      "B": 1, "C_in": 1024, "C_out": 1024, "H": 1, "W": 64,
+      "median_us": 218.88, "throughput_GOps_per_s": 613.20,
+      "speedup_vs_b2": 1.05, "speedup_vs_buffer_baseline": 1.78,
+      "label": "baseline_small"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8_img2d_w_tile_w4",
+      "B": 1, "C_in": 4096, "C_out": 4096, "H": 1, "W": 128,
+      "median_us": 5693.95, "throughput_GOps_per_s": 754.30,
+      "speedup_vs_b2": 1.15, "speedup_vs_buffer_baseline": 1.83,
+      "label": "prefill_hidden4096_seq128"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8_img2d_w_tile_w4",
+      "B": 1, "C_in": 4096, "C_out": 11008, "H": 1, "W": 128,
+      "median_us": 14598.14, "throughput_GOps_per_s": 790.70,
+      "speedup_vs_b2": 1.19, "speedup_vs_buffer_baseline": 1.91,
+      "label": "llama_ffn_up_proj_seq128"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8_img2d_w_tile_w4",
+      "B": 1, "C_in": 11008, "C_out": 4096, "H": 1, "W": 128,
+      "median_us": 15266.05, "throughput_GOps_per_s": 756.10,
+      "speedup_vs_b2": 1.16, "speedup_vs_buffer_baseline": 1.85,
+      "label": "llama_ffn_down_proj_seq128"
+    }
+  ],
+  "notes": [
+    "Throughput plateau on Adreno 830 climbed from ~655 to ~790 GOps/s (22% of peak int8). Speedup vs B2 (1.15-1.19x) is modest — the headline win remains B2 image2d (decode 14.8x).",
+    "Work-group size tested: 64 and 128, no observed difference. Bottleneck is therefore NOT WG geometry. Next likely causes: register pressure (16 accumulators per WI) forcing spill, or dot() instruction issue rate.",
+    "Further headroom paths (deferred):",
+    "  - sub-group cooperative reduction (cl_khr_subgroups) to split slice_I across lanes",
+    "  - Larger output tile (8 or 16 outputs per WI) — needs careful register budgeting",
+    "  - cl_qcom_dot_product8 / cl_arm_matrix_multiply vendor variants (plan §C1)",
+    "  - fp16 / half-tile output to halve memory bandwidth on write",
+    "Compared to ML Drift target ~1000+ prefill_tok/s on a 7B LLaMA-class model: we are at ~125 prefill_tok/s (32 layers x ~14.6 ms FFN at seq=128 with tile_w4) — still ~8x off in compute alone, but each subsequent perf pass narrows this systematically."
+  ]
+}
