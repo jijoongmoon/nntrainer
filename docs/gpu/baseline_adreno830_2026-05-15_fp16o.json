@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-05-15T09:45:00Z",
+  "device": {
+    "model": "SM-S938N (Galaxy S25 Ultra)",
+    "gpu": "QUALCOMM Adreno(TM) 830",
+    "driver": "OpenCL 3.0 QUALCOMM build: 0800.40.1"
+  },
+  "kernel_variant": "Tier S2 tile_w4 + fp16 output. Same kernel body; final vstore4 down-casts to half and the output buffer is half-sized.",
+  "harness": {
+    "binary": "unittest_opencl_perf_conv_1x1_int4cxp_qai8_img2d_tile_w4_fp16o",
+    "build_options": "-cl-std=CL3.0",
+    "extensions": "cl_khr_integer_dot_product, cl_khr_fp16"
+  },
+  "records": [
+    {
+      "shape": "B=1,Ci=1024,Co=1024,H=1,W=64",
+      "median_us": 218.11, "throughput_GOps_per_s": 615.36,
+      "speedup_vs_tile_w4": 1.005
+    },
+    {
+      "shape": "B=1,Ci=4096,Co=4096,H=1,W=128",
+      "median_us": 5680.90, "throughput_GOps_per_s": 756.04,
+      "speedup_vs_tile_w4": 1.002
+    },
+    {
+      "shape": "B=1,Ci=4096,Co=11008,H=1,W=128",
+      "median_us": 14543.87, "throughput_GOps_per_s": 793.65,
+      "speedup_vs_tile_w4": 1.004
+    },
+    {
+      "shape": "B=1,Ci=11008,Co=4096,H=1,W=128",
+      "median_us": 15237.89, "throughput_GOps_per_s": 757.50,
+      "speedup_vs_tile_w4": 1.002
+    }
+  ],
+  "conclusion": "fp16 output gave essentially zero speedup on the single-kernel benchmark (1.002 - 1.005x).",
+  "diagnosis": [
+    "Output write of a 4K x 4K x 128 fp32 result is 8 MiB; at Adreno ~50 GB/s that's <200 us, less than 4% of the 5.7 ms kernel time. Halving the output to 4 MiB saves at most ~20 us per shape.",
+    "The actual bottleneck remains the inner-loop dot() / weight-read pipeline — output bandwidth was never on the critical path.",
+    "Value of fp16 output is therefore SYSTEM-LEVEL: it halves the downstream layer's input bandwidth, and is a prerequisite for fp32-buffer-less op fusion. It is not a perf win when measured in isolation.",
+    "Conclusion: keep the kernel as a building block for op-fused decode/prefill pipelines (§3.6), but stop expecting single-kernel speedup from this change alone."
+  ]
+}
