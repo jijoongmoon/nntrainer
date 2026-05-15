@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-05-15T08:35:00Z",
+  "device": {
+    "model": "SM-S938N (Galaxy S25 Ultra)",
+    "gpu": "QUALCOMM Adreno(TM) 830",
+    "vendor_id": "0x5143",
+    "driver": "OpenCL 3.0 QUALCOMM build: 0800.40.1 Compiler E031.47.18.36",
+    "compute_units": 12,
+    "max_work_group_size": 1024,
+    "max_mem_alloc_size_bytes": 1073741824,
+    "svm_capabilities": [
+      "CL_DEVICE_SVM_COARSE_GRAIN_BUFFER",
+      "CL_DEVICE_SVM_FINE_GRAIN_BUFFER",
+      "CL_DEVICE_SVM_ATOMICS"
+    ],
+    "khr_integer_dot_product": true,
+    "android_release": "16"
+  },
+  "harness": {
+    "binary": "unittest_opencl_perf_conv_1x1_int4cxp_qai8",
+    "timing": "cl_event + clGetEventProfilingInfo",
+    "queue_properties": "CL_QUEUE_PROFILING_ENABLE",
+    "warmup_iters": 3,
+    "measured_iters": "10 (5 for FFN shapes due to size)",
+    "build_options": "-cl-std=CL3.0",
+    "work_group_size": 64,
+    "host_cwd": "/data/local/tmp/gpu_bench",
+    "commit": "db6d993b"
+  },
+  "records": [
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 1024, "C_out": 1024, "H": 1, "W": 64,
+      "median_us": 388.86, "min_us": 377.86, "p95_us": 390.14,
+      "ops": 1.342e8, "throughput_GOps_per_s": 345.15,
+      "label": "baseline_small"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 4096, "C_out": 4096, "H": 1, "W": 1,
+      "median_us": 5505.02, "min_us": 5265.92, "p95_us": 5923.84,
+      "ops": 3.356e7, "throughput_GOps_per_s": 6.10,
+      "label": "decode_hidden4096_seq1"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 4096, "C_out": 4096, "H": 1, "W": 128,
+      "median_us": 10445.82, "min_us": 10438.91, "p95_us": 10482.94,
+      "ops": 4.295e9, "throughput_GOps_per_s": 411.17,
+      "label": "prefill_hidden4096_seq128"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 4096, "C_out": 11008, "H": 1, "W": 128,
+      "median_us": 27783.94, "min_us": 27776.00, "p95_us": 27789.82,
+      "ops": 1.154e10, "throughput_GOps_per_s": 415.45,
+      "label": "llama_ffn_up_proj_seq128"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 11008, "C_out": 4096, "H": 1, "W": 128,
+      "median_us": 28148.99, "min_us": 28085.25, "p95_us": 28356.10,
+      "ops": 1.154e10, "throughput_GOps_per_s": 410.06,
+      "label": "llama_ffn_down_proj_seq128"
+    }
+  ],
+  "notes": [
+    "Decode (W=1) is heavily memory-bound: only 6 GOps/s — reading the 4K x 4K int4 weight (8 MiB) once dominates latency. Adreno texture cache + image2d backing (plan §B2) should close most of this gap.",
+    "Prefill (W=128) reaches ~410 GOps/s steadily — ~2-4% of the device's peak int8 throughput. Big headroom for work-group / tile / sub-group tuning (Tier S2, A3).",
+    "Intel Arc (Meteor Lake-P) on the same kernel runs 3-10x faster than Adreno 830 — strongly suggests the buffer-based access pattern is leaving Adreno's texture cache idle. Adreno is the prime target for the B2 image2d transition next.",
+    "Throughput of 1309 GOps/s on Intel Arc at prefill_hidden4096_seq128 vs 411 GOps/s on Adreno: ratio 3.2x. Despite Adreno 830 having higher nominal compute, our kernel isn't reaching its envelope.",
+    "For an LLM at seq=128 prefill, FFN up+down at one transformer block = 56 ms on Adreno. 32 blocks => ~1.8 s/128 tokens = ~70 prefill_tok/s before attention/norm overhead. ML Drift target is 1000+ tok/s — current gap > 14x in compute alone."
+  ]
+}

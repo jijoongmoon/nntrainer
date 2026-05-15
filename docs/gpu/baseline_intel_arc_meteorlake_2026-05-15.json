@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-05-15T08:30:00Z",
+  "device": {
+    "model": "Intel(R) Graphics [0x7d55]",
+    "gpu": "Intel Arc (Meteor Lake-P, Xe-LPG)",
+    "vendor": "Intel Corporation",
+    "driver": "Intel(R) OpenCL Graphics, OpenCL 3.0",
+    "khr_integer_dot_product": "2.0.0",
+    "host_os": "Ubuntu 24.04",
+    "icd_isolation": "OCL_ICD_VENDORS=/etc/OpenCL/vendors/intel.icd"
+  },
+  "harness": {
+    "binary": "unittest_opencl_perf_conv_1x1_int4cxp_qai8",
+    "timing": "cl_event + clGetEventProfilingInfo",
+    "queue_properties": "CL_QUEUE_PROFILING_ENABLE",
+    "warmup_iters": 3,
+    "measured_iters": "10 (5 for FFN shapes)",
+    "build_options": "-cl-std=CL3.0",
+    "work_group_size": 64,
+    "commit": "db6d993b"
+  },
+  "records": [
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 1024, "C_out": 1024, "H": 1, "W": 64,
+      "median_us": 201.15, "min_us": 199.79, "p95_us": 212.92,
+      "ops": 1.342e8, "throughput_GOps_per_s": 667.27,
+      "label": "baseline_small"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 4096, "C_out": 4096, "H": 1, "W": 1,
+      "median_us": 564.58, "min_us": 466.98, "p95_us": 684.69,
+      "ops": 3.356e7, "throughput_GOps_per_s": 59.43,
+      "label": "decode_hidden4096_seq1"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 4096, "C_out": 4096, "H": 1, "W": 128,
+      "median_us": 3281.56, "min_us": 3210.00, "p95_us": 9189.79,
+      "ops": 4.295e9, "throughput_GOps_per_s": 1308.82,
+      "label": "prefill_hidden4096_seq128"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 4096, "C_out": 11008, "H": 1, "W": 128,
+      "median_us": 8327.50, "min_us": 8321.04, "p95_us": 8809.58,
+      "ops": 1.154e10, "throughput_GOps_per_s": 1386.10,
+      "label": "llama_ffn_up_proj_seq128"
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8",
+      "B": 1, "C_in": 11008, "C_out": 4096, "H": 1, "W": 128,
+      "median_us": 9101.98, "min_us": 8591.35, "p95_us": 9799.27,
+      "ops": 1.154e10, "throughput_GOps_per_s": 1268.16,
+      "label": "llama_ffn_down_proj_seq128"
+    }
+  ]
+}
