@@ -12,7 +12,8 @@ cl_op_headers = [
   'attention_kernel_interface.h',
   'clblast_interface.h',
   'phwc4_layout.h',
-  'weight_pack_layout.h'
+  'weight_pack_layout.h',
+  'weight_pack_int4cxp_layout.h'
 ]
 
 if get_option('enable-fp16')
