@@ -18,6 +18,7 @@ cl_op_kernels = [
   'conv_1x1_fp32.cl',
   'weight_pack_int4cxp_dequant.cl',
   'conv_1x1_int4cxp_fp32.cl',
+  'activation_quant_int8_per_token.cl',
   'q4_0_ab_bi_8x4.cl',
   'q6_k_sgemv.cl',
   'restore_block_q4_0.cl',

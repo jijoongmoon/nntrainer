@@ -102,6 +102,7 @@ if get_option('enable-opencl')
   test_target += [['unittest_opencl_conv_1x1_fp32', []]]
   test_target += [['unittest_opencl_weight_pack_int4cxp_layout', []]]
   test_target += [['unittest_opencl_conv_1x1_int4cxp_fp32', []]]
+  test_target += [['unittest_opencl_phwc4_int8_quant', []]]
 endif
 
 if get_option('enable-fp16')
