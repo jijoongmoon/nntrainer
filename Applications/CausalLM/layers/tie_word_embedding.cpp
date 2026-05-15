@@ -210,9 +210,11 @@ void TieWordEmbedding::incremental_forwarding_embedding(
   nntrainer::TensorDim out_tensor_dim =
     nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
 
-  if (!(weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0 ||
-        weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K ||
-        weight.getDataType() == nntrainer::TensorDim::DataType::FP32))
+  const auto wdt = weight.getDataType();
+  if (!(wdt == nntrainer::TensorDim::DataType::Q6_K ||
+        wdt == nntrainer::TensorDim::DataType::Q4_0 ||
+        wdt == nntrainer::TensorDim::DataType::Q8_0 ||
+        wdt == nntrainer::TensorDim::DataType::FP32))
     throw std::invalid_argument(
       "Tieword embedding is not supported yet for the data type");
 
@@ -251,6 +253,19 @@ void TieWordEmbedding::incremental_forwarding_embedding(
           (void *)((char *)weight.getData<uint8_t>() +
                    (18 * num_blocks_per_row) * embed_idx),
           out_tensor.getData(), out_dim);
+      } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q8_0) {
+        // Q8_0: fp16 scale (2B) + 32 int8 quants (32B) = 34 bytes per
+        // 32-element block.
+        ///@note this should be replaced with quantizer operation
+        constexpr int Q8_0_BLOCK_SIZE = 32;
+        constexpr int Q8_0_BYTES_PER_BLOCK = 34;
+        int num_blocks_per_row =
+          (weight.width() + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+        nntrainer::dequantize_row_q8_0(
+          (const void *)((char *)weight.getData<uint8_t>() +
+                         (Q8_0_BYTES_PER_BLOCK * num_blocks_per_row) *
+                           embed_idx),
+          out_tensor.getData<float>(), out_dim);
       } else {
         out_tensor.copyData(cur_weight);
       }
@@ -477,6 +492,37 @@ void TieWordEmbedding::save(std::ofstream &file,
                                      quant_weight.getData<uint8_t>(), K, N,
                                      nullptr);
             quant_weight.save(file);
+          } else if (dtype == nntrainer::TensorDim::DataType::Q4_0) {
+            // Embedding-style: rows are vocab entries, no transpose.
+            // Skip 1-D rows; require width % 32.
+            if (K == 1) {
+              weight.save(file);
+            } else {
+              NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
+                << "Q4_0 quantization requires width to be divisible by 32, "
+                   "but got width=" << N;
+              nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                             {nntrainer::Tformat::NCHW, dtype});
+              nntrainer::quantize_q4_0(weight.getData<float>(),
+                                       quant_weight.getData<uint8_t>(), K, N,
+                                       nullptr);
+              quant_weight.save(file);
+            }
+          } else if (dtype == nntrainer::TensorDim::DataType::Q8_0) {
+            // Same shape constraints as Q4_0; 34 bytes/block instead of 18.
+            if (K == 1) {
+              weight.save(file);
+            } else {
+              NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
+                << "Q8_0 quantization requires width to be divisible by 32, "
+                   "but got width=" << N;
+              nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                             {nntrainer::Tformat::NCHW, dtype});
+              nntrainer::quantize_q8_0(weight.getData<float>(),
+                                              quant_weight.getData<uint8_t>(),
+                                              K, N, nullptr);
+              quant_weight.save(file);
+            }
           } else {
             NNTR_THROW_IF(true, std::runtime_error)
               << "This dtype is not supported in save with quantization";

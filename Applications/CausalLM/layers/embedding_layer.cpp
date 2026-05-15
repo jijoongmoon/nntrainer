@@ -8,9 +8,11 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
- * @note   This embedding layer supports FP32/FP16/Q6_K data type only.
+ * @note   This embedding layer supports FP32/FP16/Q4_0/Q6_K/Q8_0 weight
+ *         dtypes. Q* paths dequantise per-row at lookup time.
  */
 
+#include <cpu_backend.h>
 #include <embedding_layer.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
@@ -141,6 +143,20 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           (void *)((char *)weight.getData<uint8_t>() +
                    (18 * num_blocks_per_row) * embed_idx),
           out_tensor.getData(), out_dim);
+      } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q8_0) {
+        // Q8_0 block layout (matches llama.cpp / GGML):
+        //   fp16 scale (2 bytes) + 32 int8 quants (32 bytes) = 34 bytes
+        //   per 32-element block.
+        ///@note this should be replaced with quantizer operation
+        constexpr int Q8_0_BLOCK_SIZE = 32;
+        constexpr int Q8_0_BYTES_PER_BLOCK = 34;
+        int num_blocks_per_row =
+          (weight.width() + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+        nntrainer::dequantize_row_q8_0(
+          (const void *)((char *)weight.getData<uint8_t>() +
+                         (Q8_0_BYTES_PER_BLOCK * num_blocks_per_row) *
+                           embed_idx),
+          out_tensor.getData<float>(), out_dim);
       } else {
         out_tensor.copyData(cur_weight);
       }
@@ -227,6 +243,24 @@ void EmbeddingLayer::save(std::ofstream &file,
                                    quant_weight.getData<uint8_t>(), K, N,
                                    nullptr);
           quant_weight.save(file);
+        } else if (dtype == nntrainer::TensorDim::DataType::Q8_0) {
+          // Q8_0 quantises along the inner (width) axis in 32-element
+          // blocks, same as Q4_0. Skip the 1-D bias-like tensors and
+          // require width divisible by 32. Embedding tables are row-major
+          // (one row per vocab id), so no transpose needed.
+          if (K == 1) {
+            weight.save(file);
+          } else {
+            NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
+              << "Q8_0 quantization requires width to be divisible by 32, "
+                 "but got width=" << N;
+            nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                           {nntrainer::Tformat::NCHW, dtype});
+            nntrainer::quantize_q8_0(weight.getData<float>(),
+                                            quant_weight.getData<uint8_t>(),
+                                            K, N, nullptr);
+            quant_weight.save(file);
+          }
         } else {
           NNTR_THROW_IF(true, std::runtime_error)
             << "This dtype is not supported in save with quantization";

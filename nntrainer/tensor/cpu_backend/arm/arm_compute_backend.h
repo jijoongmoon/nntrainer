@@ -1255,6 +1255,19 @@ void gemm_q6_K(const unsigned int M, const unsigned int N, const unsigned int K,
  */
 size_t quantize_q4_0(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights);
+
+/**
+ * @brief quantize_q8_0 function (FP32 source). Non-template float overload.
+ *
+ * @param src float* to quantize
+ * @param dst q8_0* destination (34 bytes / 32 elements)
+ * @param nrow number of rows
+ * @param n_per_row number of elements per row (must be multiple of 32)
+ * @param quant_weights unused
+ * @return size_t size of total quantized data in bytes
+ */
+size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights);
 /**
  * @brief quantize_q4_K function
  *
@@ -1327,6 +1340,15 @@ void dequantize_row_q4_K(const void *x, float *y, int64_t k);
  * @param k number of elements in x
  */
 void dequantize_row_q4_0(const void *x, float *y, int64_t k);
+
+/**
+ * @brief dequantize row of q8_0 data to float
+ *
+ * @param x_raw input to be dequantized from q8_0 to float
+ * @param y dequantized data output
+ * @param k number of elements in x_raw (multiple of 32)
+ */
+void dequantize_row_q8_0(const void *x_raw, float *y, int64_t k);
 
 /**
  * @brief dequantize row of q6_K data to float
