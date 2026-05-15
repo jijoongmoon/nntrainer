@@ -33,12 +33,20 @@
 
 namespace nntrainer::weight_pack_int4cxp {
 
+// Sizes are padded up to slice_O * 4 output channels so that GPU kernels which
+// iterate by slice_O group (4 outputs at a time) can read the last slice
+// without out-of-range accesses. The padded outputs hold zero bytes and zero
+// scale, so their contribution to any dequant or MAC is exactly 0.
 inline std::size_t num_bytes(int O, int I, int H, int W) {
+  const std::size_t slice_O = (O + 3) / 4;
   const std::size_t slice_I = (I + 3) / 4;
-  return static_cast<std::size_t>(O) * H * W * slice_I * 2;
+  return slice_O * 4 * static_cast<std::size_t>(H) * W * slice_I * 2;
 }
 
-inline std::size_t num_scales(int O) { return static_cast<std::size_t>(O); }
+inline std::size_t num_scales(int O) {
+  const std::size_t slice_O = (O + 3) / 4;
+  return slice_O * 4;
+}
 
 inline std::size_t byte_offset(int o, int i, int h, int w, int O, int I, int H,
                                int W) {
@@ -71,6 +79,9 @@ inline void pack_fp32_to_int4cxp(const float *src, std::uint8_t *dst_bytes,
                                  float *dst_scale, int O, int I, int H,
                                  int W) {
   std::fill_n(dst_bytes, num_bytes(O, I, H, W), std::uint8_t{0});
+  // Zero the padded scale slots too — a kernel that reads beyond logical O
+  // multiplies by zero and contributes nothing to its accumulator.
+  std::fill_n(dst_scale, num_scales(O), 0.0f);
   const std::size_t ihw = static_cast<std::size_t>(I) * H * W;
   for (int o = 0; o < O; ++o) {
     float amax = 0.0f;

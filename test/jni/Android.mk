@@ -719,6 +719,24 @@ include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
+# B4-int4 1x1 conv-as-matmul correctness test (int4 weight + fp32 activation).
+LOCAL_MODULE := unittest_opencl_conv_1x1_int4cxp_fp32
+LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/layers -I../../nntrainer/layers/loss -pthread -fexceptions -DMIN_CPP_VERSION=201703L -DNNTR_NUM_THREADS=1 -D__LOGGING__=1 -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 $(ARM_MARCH_FLAGS) -O3 -frtti -DNDK_BUILD=1 -DENABLE_FP16=1 -DENABLE_OPENCL=1
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS        := -llog -landroid
+
+LOCAL_SRC_FILES := \
+	 ../unittest/unittest_opencl_conv_1x1_int4cxp_fp32.cpp
+
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES)
+
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer opencl
+LOCAL_STATIC_LIBRARIES := googletest_main test_util
+
+include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+
 LOCAL_MODULE := unittest_opencl_kernels_blas
 LOCAL_CFLAGS := -Igoogletest/include -I../include -I../unittest/layers -I../../nntrainer/layers/loss -pthread -fexceptions -DMIN_CPP_VERSION=201703L -DNNTR_NUM_THREADS=1 -D__LOGGING__=1 -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 $(ARM_MARCH_FLAGS) -O3 -frtti -DNDK_BUILD=1 -DENABLE_FP16=1 -DENABLE_OPENCL=1 
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
