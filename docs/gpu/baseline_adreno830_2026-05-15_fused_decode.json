@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-05-15T10:00:00Z",
+  "device": {
+    "model": "SM-S938N (Galaxy S25 Ultra)",
+    "gpu": "QUALCOMM Adreno(TM) 830",
+    "driver": "OpenCL 3.0 QUALCOMM build: 0800.40.1"
+  },
+  "kernel_variant": "§3.6 op fusion attempt: fp32 X -> inline INT8 quant -> int4 weight matmul -> fp16 output, in a single kernel. Each work-item independently rescans X to recover the per-token scale (no work-group cooperation).",
+  "harness": {
+    "binary": "unittest_opencl_perf_conv_1x1_int4cxp_decode_fused",
+    "build_options": "-cl-std=CL3.0",
+    "extensions": "cl_khr_integer_dot_product, cl_khr_fp16"
+  },
+  "records": [
+    {
+      "shape": "B=1,Ci=1024,Co=1024,H=1,W=1",
+      "median_us": 124.93,
+      "throughput_GOps_per_s": 16.79
+    },
+    {
+      "shape": "B=1,Ci=4096,Co=4096,H=1,W=1",
+      "median_us": 544.26,
+      "throughput_GOps_per_s": 61.65,
+      "comparison": {
+        "b2_image2d_alone_us": 371.0,
+        "fused_vs_b2_speedup": 0.68,
+        "regression_observed_us": 173.3
+      }
+    },
+    {
+      "shape": "B=1,Ci=4096,Co=11008,H=1,W=1",
+      "median_us": 7417.09,
+      "throughput_GOps_per_s": 12.16
+    },
+    {
+      "shape": "B=1,Ci=11008,Co=4096,H=1,W=1",
+      "median_us": 1509.89,
+      "throughput_GOps_per_s": 59.72
+    }
+  ],
+  "conclusion": "Naive fusion (single-kernel quant + matmul) regresses 1.47x at decode 4K hidden vs the 2-kernel B5 + B2-image2d pipeline.",
+  "diagnosis": [
+    "Every work-item independently scans X to compute amax. For decode 4K (slice_O = 1024 work-items, each scanning slice_I_total = 1024 vload4), that's 1024^2 = ~1M redundant scan ops. The B5 + B2 pipeline only scans X once in B5 (one work-item per token).",
+    "Eliminated cost: ~50-100 us B5 dispatch + INT8 buffer trip.",
+    "Added cost: 1024-way redundant scan = ~150 us measured.",
+    "Net: regression of ~170 us — matches the measured delta closely.",
+    "Paper §3.7's 'decode integrates input quantization' implicitly assumes work-group cooperation for the amax reduction. Naive per-WI fusion doesn't deliver."
+  ],
+  "next_steps": {
+    "alpha_cooperative": "Use local memory + barrier (or cl_khr_subgroups) for WG-cooperative amax reduction. One WI scans, all share. True §3.7 form. Moderate complexity.",
+    "beta_split_scale_only": "Keep the matmul kernel close to current form but replace B5 with a tiny scale-only kernel that just emits scale_x (no INT8 buffer). Matmul kernel reads fp32 X + scale, quantizes inline per element. Same total work, but scan happens once. Low complexity."
+  }
+}
