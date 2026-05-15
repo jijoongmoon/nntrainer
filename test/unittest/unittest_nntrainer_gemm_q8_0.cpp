@@ -6,7 +6,7 @@
  *         Compares the scalar Q8_0 GEMM against a plain FP32 reference
  *         GEMM, expecting agreement to within Q8_0 quantisation tolerance.
  * @see    https://github.com/nntrainer/nntrainer
- * @author Claude (mirror of q4_0 unittest scaffolding)
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  */
 
