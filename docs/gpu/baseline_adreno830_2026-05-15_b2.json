@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-05-15T09:00:00Z",
+  "device": {
+    "model": "SM-S938N (Galaxy S25 Ultra)",
+    "gpu": "QUALCOMM Adreno(TM) 830",
+    "driver": "OpenCL 3.0 QUALCOMM build: 0800.40.1 Compiler E031.47.18.36"
+  },
+  "harness": {
+    "binary": "unittest_opencl_perf_conv_1x1_int4cxp_qai8_img2d",
+    "timing": "cl_event + clGetEventProfilingInfo",
+    "warmup_iters": 3,
+    "measured_iters": "10 (5 for FFN shapes)",
+    "build_options": "-cl-std=CL3.0",
+    "work_group_size": 64,
+    "commit": "post-08685cba"
+  },
+  "kernel_variant": "B2 — int4 weight via image2d (CL_RGBA + UNSIGNED_INT8), activation still char* buffer",
+  "image_layout": {
+    "format": "CL_RGBA + CL_UNSIGNED_INT8",
+    "width": "(slice_I + 1) / 2",
+    "height": "slice_O * 4",
+    "texel_packs": "2 i4 groups per texel (.x/.y for slice_i=2*pair, .z/.w for slice_i=2*pair+1)",
+    "sampler": "sampler-less read_imageui"
+  },
+  "records": [
+    {
+      "kernel": "conv_1x1_int4cxp_qai8_img2d_w",
+      "B": 1, "C_in": 1024, "C_out": 1024, "H": 1, "W": 64,
+      "median_us": 229.89, "min_us": 229.89, "p95_us": 232.96,
+      "ops": 1.342e8, "throughput_GOps_per_s": 583.84,
+      "label": "baseline_small",
+      "speedup_vs_buffer": 1.69
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8_img2d_w",
+      "B": 1, "C_in": 4096, "C_out": 4096, "H": 1, "W": 1,
+      "median_us": 370.94, "min_us": 364.03, "p95_us": 377.09,
+      "ops": 3.356e7, "throughput_GOps_per_s": 90.46,
+      "label": "decode_hidden4096_seq1",
+      "speedup_vs_buffer": 14.84
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8_img2d_w",
+      "B": 1, "C_in": 4096, "C_out": 4096, "H": 1, "W": 128,
+      "median_us": 6553.86, "min_us": 6552.06, "p95_us": 6557.95,
+      "ops": 4.295e9, "throughput_GOps_per_s": 655.33,
+      "label": "prefill_hidden4096_seq128",
+      "speedup_vs_buffer": 1.59
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8_img2d_w",
+      "B": 1, "C_in": 4096, "C_out": 11008, "H": 1, "W": 128,
+      "median_us": 17368.83, "min_us": 17368.06, "p95_us": 17370.11,
+      "ops": 1.154e10, "throughput_GOps_per_s": 664.57,
+      "label": "llama_ffn_up_proj_seq128",
+      "speedup_vs_buffer": 1.60
+    },
+    {
+      "kernel": "conv_1x1_int4cxp_qai8_img2d_w",
+      "B": 1, "C_in": 11008, "C_out": 4096, "H": 1, "W": 128,
+      "median_us": 17753.09, "min_us": 17750.02, "p95_us": 17757.95,
+      "ops": 1.154e10, "throughput_GOps_per_s": 650.18,
+      "label": "llama_ffn_down_proj_seq128",
+      "speedup_vs_buffer": 1.59
+    }
+  ],
+  "notes": [
+    "Decode (W=1) saw the headline win: 14.8x speedup. Texture cache eliminates the weight-read latency that previously dominated the memory-bound single-token path. 90 GOps/s now, up from 6.",
+    "Prefill / FFN shapes are all ~1.6x faster. The compute side is the same; only the weight access pattern changed. Throughput plateaus near 655 GOps/s — next bottleneck is likely the dot-product issue rate, addressable by sub-group / tile widening (Tier S2).",
+    "Intel Arc Meteor Lake-P refuses both CL_R+UINT16 and CL_R+UINT32 image2d reads at SPIR-V level (undefined ImageRead opcode) even with the sampler-less form, and refuses CL_RGBA+UINT8 too. The kernel is therefore Adreno-only for now. Intel debugging is deferred — Adreno is the production target.",
+    "Setup overhead (clCreateImage + clEnqueueWriteImage) is not measured here — only the kernel itself. For an inference graph the image2d is allocated once at model load."
+  ]
+}
