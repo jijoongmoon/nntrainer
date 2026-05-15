@@ -25,6 +25,7 @@ cl_op_kernels = [
   'conv_1x1_int4cxp_qai8_img2d_w_tile_w4_fp16o.cl',
   'conv_1x1_int4cxp_decode_fused_fp16o.cl',
   'conv_1x1_int4cxp_decode_fused_coop_fp16o.cl',
+  'rmsnorm_residual_fused_fp16.cl',
   'q4_0_ab_bi_8x4.cl',
   'q6_k_sgemv.cl',
   'restore_block_q4_0.cl',
