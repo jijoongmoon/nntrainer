@@ -15,6 +15,7 @@ cl_op_kernels = [
   'input_transpose.cl',
   'phwc4_identity.cl',
   'weight_pack_identity.cl',
+  'conv_1x1_fp32.cl',
   'q4_0_ab_bi_8x4.cl',
   'q6_k_sgemv.cl',
   'restore_block_q4_0.cl',
