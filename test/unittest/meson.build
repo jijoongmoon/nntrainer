@@ -109,6 +109,7 @@ if get_option('enable-opencl')
   test_target += [['unittest_opencl_perf_conv_1x1_int4cxp_qai8_img2d_tile_w4', []]]
   test_target += [['unittest_opencl_perf_conv_1x1_int4cxp_qai8_img2d_tile_w4_fp16o', []]]
   test_target += [['unittest_opencl_perf_conv_1x1_int4cxp_decode_fused', []]]
+  test_target += [['unittest_opencl_perf_conv_1x1_int4cxp_decode_fused_coop', []]]
 endif
 
 if get_option('enable-fp16')

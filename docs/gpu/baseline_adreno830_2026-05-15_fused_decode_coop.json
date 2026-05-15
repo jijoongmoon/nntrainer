@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-05-15T10:25:00Z",
+  "device": {
+    "model": "SM-S938N (Galaxy S25 Ultra)",
+    "gpu": "QUALCOMM Adreno(TM) 830"
+  },
+  "kernel_variant": "§3.6 cooperative-amax fused decode kernel. Work-group of 64 lanes cooperatively scans X via sub_group_reduce_max; 64x reduction in redundant scan work vs the naive variant.",
+  "extensions_used": ["cl_khr_integer_dot_product", "cl_khr_fp16", "cl_khr_subgroups"],
+  "records": [
+    {
+      "shape": "B=1,Ci=1024,Co=1024,H=1,W=1",
+      "median_us": 93.18,
+      "throughput_GOps_per_s": 22.51,
+      "naive_fused_us": 124.93,
+      "speedup_vs_naive_fused": 1.34
+    },
+    {
+      "shape": "B=1,Ci=4096,Co=4096,H=1,W=1",
+      "median_us": 409.86,
+      "throughput_GOps_per_s": 81.87,
+      "naive_fused_us": 544.26,
+      "speedup_vs_naive_fused": 1.33,
+      "b2_image2d_alone_us": 371.0,
+      "b2_plus_b5_est_us": 435.0,
+      "win_vs_b2_plus_b5_us": 25.1,
+      "win_vs_b2_plus_b5_pct": 5.7
+    },
+    {
+      "shape": "B=1,Ci=4096,Co=11008,H=1,W=1",
+      "median_us": 7384.06,
+      "throughput_GOps_per_s": 12.21,
+      "naive_fused_us": 7417.09,
+      "speedup_vs_naive_fused": 1.00
+    },
+    {
+      "shape": "B=1,Ci=11008,Co=4096,H=1,W=1",
+      "median_us": 1170.94,
+      "throughput_GOps_per_s": 77.01,
+      "naive_fused_us": 1509.89,
+      "speedup_vs_naive_fused": 1.29
+    }
+  ],
+  "diagnosis": [
+    "Cooperative amax via sub_group_reduce_max delivers a real but shape-dependent win. The naive fused kernel had every WI rescan X (1024-way redundancy at decode 4K). The coop kernel reduces that to one scan per work-group (16-way redundancy at 64-lane WG), saving ~134 us at decode 4K hidden.",
+    "Net vs B2 + B5 baseline at decode 4K: 410 us vs ~435 us = 6% faster. Smaller than initial estimate but on the right side of zero.",
+    "Win is biggest where slice_I is large relative to slice_O (decode 4K, FFN down). When slice_O dominates (FFN up: 11008 / 64 = 173 work-groups, each rescanning X), the matmul work dwarfs the scan and fusion doesn't help.",
+    "Confirms the paper §3.7 pattern works — input quantization integrated with the operational kernel via work-group cooperation. The pattern is now in place for future fusion candidates (RMSNorm + residual, RoPE + QKV + layout transform from §3.6 manual fusion)."
+  ],
+  "lessons": [
+    "fusion is shape-dependent — its value scales with the ratio of pre/post-matmul work to matmul work itself.",
+    "sub_group_reduce_max is the right primitive on Adreno (verified cl_khr_subgroups extension available).",
+    "reqd_work_group_size(64,1,1) attribute pins the WG = sub-group invariant so sub_group_reduce_max is unambiguous.",
+    "future fusion-style improvements should focus on the cases where the fused op contributes meaningful pre/post-matmul cost — RoPE, LayerNorm/RMSNorm, residual add — and on the decode-path matmuls specifically."
+  ]
+}
