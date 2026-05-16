@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -208,10 +210,120 @@ load_sfixed4_manifest_(const std::string &manifest_path,
   return lut;
 }
 
+// ── sfixed4 binary sidecar cache ────────────────────────────────────
+// Parsing the multi-MB scale array out of the JSON manifest with
+// nlohmann on every cold start dominates load time. After the first
+// parse we dump a compact binary next to the manifest; subsequent
+// loads read it and skip JSON parsing entirely. Invalidated when the
+// manifest's mtime changes.
+constexpr char     kSf4Magic[4] = {'S', 'F', '4', 'C'};
+constexpr uint32_t kSf4Version  = 1;
+
+#pragma pack(push, 1)
+struct Sf4CacheHeader {
+  char     magic[4];
+  uint32_t version;
+  int64_t  manifest_mtime;
+  uint64_t in_dim;
+  uint64_t out_dim;
+  uint64_t group_size;
+  uint64_t scale_count;
+  uint32_t lut_path_len;
+};
+#pragma pack(pop)
+
+int64_t file_mtime_(const std::string &p) {
+  struct stat st {};
+  return (::stat(p.c_str(), &st) == 0) ? static_cast<int64_t>(st.st_mtime)
+                                       : -1;
+}
+
+std::string sf4_cache_path_(const std::string &manifest_path) {
+  return manifest_path + ".sf4cache";
+}
+
+std::shared_ptr<QuantLut>
+try_load_sf4_cache_(const std::string &manifest_path) {
+  const std::string cpath = sf4_cache_path_(manifest_path);
+  std::ifstream cf(cpath, std::ios::binary);
+  if (!cf.is_open())
+    return nullptr;
+
+  Sf4CacheHeader h{};
+  cf.read(reinterpret_cast<char *>(&h), sizeof(h));
+  if (!cf || std::memcmp(h.magic, kSf4Magic, 4) != 0 ||
+      h.version != kSf4Version)
+    return nullptr;
+  if (h.manifest_mtime != file_mtime_(manifest_path))
+    return nullptr; // stale: manifest changed
+
+  std::string lut_path(h.lut_path_len, '\0');
+  cf.read(&lut_path[0], h.lut_path_len);
+  if (!cf)
+    return nullptr;
+
+  auto lut        = std::make_shared<QuantLut>();
+  lut->is_signed4 = true;
+  lut->is_raw_u16 = false;
+  lut->offset     = 0;
+  lut->in_dim     = h.in_dim;
+  lut->out_dim    = h.out_dim;
+  lut->group_size = h.group_size;
+  lut->row_scales.resize(h.scale_count);
+  cf.read(reinterpret_cast<char *>(lut->row_scales.data()),
+          static_cast<std::streamsize>(h.scale_count * sizeof(float)));
+  if (!cf)
+    return nullptr;
+
+  mmap_into_lut_(*lut, lut_path);
+  ml_logi("sfixed4 LUT loaded from binary cache '%s' (JSON parse skipped, "
+          "in_dim=%zu out_dim=%zu group_size=%zu scales=%zu)",
+          cpath.c_str(), lut->in_dim, lut->out_dim, lut->group_size,
+          lut->row_scales.size());
+  return lut;
+}
+
+void write_sf4_cache_(const std::string &manifest_path,
+                      const std::string &lut_abs, const QuantLut &lut) {
+  const std::string cpath = sf4_cache_path_(manifest_path);
+  const std::string tmp   = cpath + ".tmp";
+  std::ofstream cf(tmp, std::ios::binary | std::ios::trunc);
+  if (!cf.is_open())
+    return; // best-effort: read-only fs is acceptable
+
+  Sf4CacheHeader h{};
+  std::memcpy(h.magic, kSf4Magic, 4);
+  h.version        = kSf4Version;
+  h.manifest_mtime = file_mtime_(manifest_path);
+  h.in_dim         = lut.in_dim;
+  h.out_dim        = lut.out_dim;
+  h.group_size     = lut.group_size;
+  h.scale_count    = lut.row_scales.size();
+  h.lut_path_len   = static_cast<uint32_t>(lut_abs.size());
+
+  cf.write(reinterpret_cast<const char *>(&h), sizeof(h));
+  cf.write(lut_abs.data(), static_cast<std::streamsize>(lut_abs.size()));
+  cf.write(
+    reinterpret_cast<const char *>(lut.row_scales.data()),
+    static_cast<std::streamsize>(lut.row_scales.size() * sizeof(float)));
+  const bool ok = static_cast<bool>(cf);
+  cf.close();
+  if (ok && cf)
+    std::rename(tmp.c_str(), cpath.c_str());
+  else
+    std::remove(tmp.c_str());
+}
+
 std::shared_ptr<QuantLut>
 load_4bit_manifest_(const std::string &manifest_path) {
+  // Fast path: sfixed4 binary sidecar cache (skips the giant JSON
+  // scale-array parse). Misses harmlessly for ufixed8 (no cache file
+  // was ever written) and falls through to the JSON path below.
+  if (auto cached = try_load_sf4_cache_(manifest_path))
+    return cached;
+
   // Dispatch by `datatype`: "ufixed8" = legacy tensorwise unsigned,
-  // "sfixed4" = rowwise signed (per-row scale, no offset).
+  // "sfixed4" = signed group-quant.
   std::ifstream f(manifest_path);
   NNTR_THROW_IF(!f.is_open(), std::runtime_error)
       << "Failed to open LUT manifest: " << manifest_path;
@@ -221,7 +333,13 @@ load_4bit_manifest_(const std::string &manifest_path) {
 
   const std::string datatype = j.value("datatype", std::string("ufixed8"));
 
-  if (datatype == "sfixed4") return load_sfixed4_manifest_(manifest_path, j);
+  if (datatype == "sfixed4") {
+    auto lut = load_sfixed4_manifest_(manifest_path, j);
+    const std::string lut_abs = resolve_relative(
+      j.at("lut-path").get<std::string>(), dirname(manifest_path));
+    write_sf4_cache_(manifest_path, lut_abs, *lut);
+    return lut;
+  }
   if (datatype == "ufixed8") return load_ufixed8_manifest_(manifest_path, j);
 
   NNTR_THROW_IF(true, std::runtime_error)
