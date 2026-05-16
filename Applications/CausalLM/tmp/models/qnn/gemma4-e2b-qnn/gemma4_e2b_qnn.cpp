@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -288,6 +289,8 @@ void Gemma4_E2B_QNN::open_ple_file_() {
     const std::string datatype = j.value("datatype", std::string("ufixed8"));
     const auto &qp             = j.at("quant-param");
 
+    std::cout << "[PLE-CACHE-DBG] JSON path: ple_file_name=" << ple_file_name
+              << " datatype='" << datatype << "'" << std::endl;
     ple_is_signed4_ = (datatype == "sfixed4");
     if (!ple_is_signed4_ && datatype != "ufixed8")
       throw std::runtime_error("PLE: unsupported datatype: " + datatype);
@@ -379,8 +382,17 @@ void Gemma4_E2B_QNN::open_ple_file_() {
       // rename; a read-only model dir simply keeps using JSON.
       const std::string cpath = ple_sf4_cache_path_(ple_file_name);
       const std::string tmp   = cpath + ".tmp";
+      std::cout << "[PLE-CACHE-DBG] writing sidecar: " << cpath
+                << " scales=" << ple_row_layer_scales_.size()
+                << " (" << (ple_row_layer_scales_.size() * sizeof(float))
+                << " bytes)" << std::endl;
       std::ofstream wf(tmp, std::ios::binary | std::ios::trunc);
-      if (wf.is_open()) {
+      if (!wf.is_open()) {
+        std::cout << "[PLE-CACHE-DBG] FAILED to open temp for write: "
+                  << tmp << " (errno=" << errno << " "
+                  << std::strerror(errno) << ") — keeping JSON path"
+                  << std::endl;
+      } else {
         PleSf4CacheHeader h{};
         std::memcpy(h.magic, kPleSf4Magic, 4);
         h.version        = kPleSf4Version;
@@ -398,10 +410,23 @@ void Gemma4_E2B_QNN::open_ple_file_() {
             ple_row_layer_scales_.size() * sizeof(float)));
         const bool ok = static_cast<bool>(wf);
         wf.close();
-        if (ok && wf)
-          std::rename(tmp.c_str(), cpath.c_str());
-        else
+        if (ok && wf) {
+          if (std::rename(tmp.c_str(), cpath.c_str()) == 0) {
+            std::cout << "[PLE-CACHE-DBG] sidecar written OK: " << cpath
+                      << std::endl;
+          } else {
+            std::cout << "[PLE-CACHE-DBG] rename failed (errno=" << errno
+                      << " " << std::strerror(errno) << "): " << tmp
+                      << " -> " << cpath << std::endl;
+            std::remove(tmp.c_str());
+          }
+        } else {
+          std::cout << "[PLE-CACHE-DBG] write stream bad after "
+                    << (ok ? "close" : "write")
+                    << " (errno=" << errno << " " << std::strerror(errno)
+                    << ") — removing temp" << std::endl;
           std::remove(tmp.c_str());
+        }
       }
     }
     return;
