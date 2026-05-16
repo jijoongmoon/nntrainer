@@ -109,15 +109,37 @@ public:
  *        the same file see the same in-memory table.
  */
 struct QuantLut {
+  // ── Binary payload, memory-mapped (lazily paged, never fully read
+  // into RAM). `bytes` is kept only as a fallback for tiny in-memory
+  // tables; mmap is preferred for the multi-hundred-MB LUTs. Use
+  // data()/size() instead of touching either member directly.
   std::vector<uint8_t> bytes;
+  const uint8_t       *mmap_ptr = nullptr;
+  size_t               mmap_size = 0;
+  int                  mmap_fd = -1;
+
+  const uint8_t *data() const {
+    return mmap_ptr ? mmap_ptr : bytes.data();
+  }
+  size_t size() const { return mmap_ptr ? mmap_size : bytes.size(); }
 
   // Tensorwise quant params (ufixed8). Used when `row_scales` is empty.
   float scale = 1.0f;
   int offset = 0;
 
-  // Per-row quant params (sfixed4 rowwise). When non-empty, takes
-  // precedence; size == in_dim.
+  // Signed-4-bit group scales. Flat, row-major:
+  //   row_scales[row * num_groups + (col / group_size)]
+  // `group_size` partitions each out_dim row into out_dim/group_size
+  // groups, each with its own scale (matches dequantize.py's
+  // `scale-shape = [N, D // group_size]`). For the legacy per-row
+  // case group_size == out_dim → num_groups == 1 → one scale/row.
   std::vector<float> row_scales;
+  size_t group_size = 0; ///< elements per scale group (0 ⇒ out_dim)
+
+  size_t num_groups() const {
+    const size_t gs = group_size ? group_size : out_dim;
+    return (gs == 0) ? 1 : (out_dim / gs);
+  }
 
   // Signed 4-bit (-8..7, sign-extended from the low/high nibble) vs
   // unsigned 4-bit (0..15). Independent of tensorwise vs rowwise.
@@ -126,6 +148,8 @@ struct QuantLut {
   size_t in_dim = 0;  ///< vocab size (rows)
   size_t out_dim = 0; ///< per-token feature dim (cols)
   bool is_raw_u16 = false;
+
+  ~QuantLut();
 };
 
 /**
