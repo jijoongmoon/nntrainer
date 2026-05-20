@@ -435,9 +435,13 @@ private:
   inline static std::vector<std::vector<float>> *freqs_cos = {};
   inline static std::vector<std::vector<float>> *freqs_sin = {};
   inline static std::vector<float> thetas;
+  std::vector<std::vector<float>> *cached_freqs_cos = {};
+  std::vector<std::vector<float>> *cached_freqs_sin = {};
 #ifdef ENABLE_FP16
   inline static std::vector<std::vector<_FP16>> *freqs_cos_fp16 = {};
   inline static std::vector<std::vector<_FP16>> *freqs_sin_fp16 = {};
+  std::vector<std::vector<_FP16>> *cached_freqs_cos_fp16 = {};
+  std::vector<std::vector<_FP16>> *cached_freqs_sin_fp16 = {};
 #endif
 
   /**
