@@ -1278,14 +1278,14 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
 
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    std::vector<std::vector<float>> *freqs_cos_local = nullptr;
-    std::vector<std::vector<float>> *freqs_sin_local = nullptr;
-    {
+    if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
       precompute_freqs(head_dim, max_position_embeddings, theta, false);
-      freqs_cos_local = freqs_cos;
-      freqs_sin_local = freqs_sin;
+      cached_freqs_cos = freqs_cos;
+      cached_freqs_sin = freqs_sin;
     }
+    std::vector<std::vector<float>> *freqs_cos_local = cached_freqs_cos;
+    std::vector<std::vector<float>> *freqs_sin_local = cached_freqs_sin;
     std::vector<float> *cos_ = nullptr;
     std::vector<float> *sin_ = nullptr;
 
@@ -1331,14 +1331,16 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     }
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    std::vector<std::vector<_FP16>> *freqs_cos_fp16_local = nullptr;
-    std::vector<std::vector<_FP16>> *freqs_sin_fp16_local = nullptr;
-    {
+    if (cached_freqs_cos_fp16 == nullptr || cached_freqs_sin_fp16 == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
       precompute_freqs(head_dim, max_position_embeddings, theta, true);
-      freqs_cos_fp16_local = freqs_cos_fp16;
-      freqs_sin_fp16_local = freqs_sin_fp16;
+      cached_freqs_cos_fp16 = freqs_cos_fp16;
+      cached_freqs_sin_fp16 = freqs_sin_fp16;
     }
+    std::vector<std::vector<_FP16>> *freqs_cos_fp16_local =
+      cached_freqs_cos_fp16;
+    std::vector<std::vector<_FP16>> *freqs_sin_fp16_local =
+      cached_freqs_sin_fp16;
     std::vector<_FP16> *cos_ = nullptr;
     std::vector<_FP16> *sin_ = nullptr;
 
@@ -1732,6 +1734,12 @@ void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
 
   auto remain_props = loadProperties(props, mha_core_props);
   LayerImpl::setProperty(remain_props);
+  cached_freqs_cos = nullptr;
+  cached_freqs_sin = nullptr;
+#ifdef ENABLE_FP16
+  cached_freqs_cos_fp16 = nullptr;
+  cached_freqs_sin_fp16 = nullptr;
+#endif
 }
 
 size_t MHACoreLayer::calc_attn_index(size_t i) { return (i * (i + 1)) / 2; };
