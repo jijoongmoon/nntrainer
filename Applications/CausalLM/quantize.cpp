@@ -556,6 +556,16 @@ int main(int argc, char *argv[]) {
     json generation_cfg =
       causallm::LoadJsonFile(model_path + "/generation_config.json");
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+    json runtime_nntr_cfg = nntr_cfg;
+
+    if (runtime_nntr_cfg.contains("tokenizer_file")) {
+      std::filesystem::path tokenizer_file =
+        runtime_nntr_cfg["tokenizer_file"].get<std::string>();
+      if (tokenizer_file.is_relative()) {
+        runtime_nntr_cfg["tokenizer_file"] =
+          (std::filesystem::path(model_path) / tokenizer_file).string();
+      }
+    }
 
     // If a target config is specified, read dtypes from it
     if (!target_config_path.empty()) {
@@ -634,8 +644,8 @@ int main(int argc, char *argv[]) {
       architecture = resolve_architecture(model_type, architecture);
     }
 
-    auto model = causallm::Factory::Instance().create(architecture, cfg,
-                                                      generation_cfg, nntr_cfg);
+    auto model = causallm::Factory::Instance().create(
+      architecture, cfg, generation_cfg, runtime_nntr_cfg);
     if (!model) {
       throw std::runtime_error("Failed to create model for architecture: " +
                                architecture);
