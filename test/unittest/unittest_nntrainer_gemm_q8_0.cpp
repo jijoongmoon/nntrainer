@@ -51,8 +51,8 @@ static void quantize_row_q8_0_ref(const float *x, nntrainer::block_q8_0 *y,
     } else if (exp >= 31) {
       y[b].d = static_cast<uint16_t>(sign | (0x1Fu << 10) | mant);
     } else {
-      y[b].d = static_cast<uint16_t>(
-        sign | (static_cast<uint32_t>(exp) << 10) | mant);
+      y[b].d =
+        static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | mant);
     }
     for (unsigned int l = 0; l < QK; ++l) {
       int32_t q = static_cast<int32_t>(std::round(x[b * QK + l] * id));
@@ -114,8 +114,7 @@ TEST_P(GemmQ8_0Param, scalar_kernel_matches_fp32_reference_within_q8_0_tol) {
 
   // GEMM under test: A FP32 (auto-quantised inside) * B Q8_0 -> C FP32.
   nntrainer::__fallback_gemm_q8_0<float>(sh.M, sh.N, sh.K, A.data(), sh.K,
-                                         B_q8.data(), sh.K, C_q8.data(),
-                                         sh.N);
+                                         B_q8.data(), sh.K, C_q8.data(), sh.N);
 
   // Reference: FP32 x FP32, no quantisation.
   gemm_fp32_ref(sh.M, sh.N, sh.K, A.data(), B_fp32.data(), C_ref.data());
@@ -123,10 +122,10 @@ TEST_P(GemmQ8_0Param, scalar_kernel_matches_fp32_reference_within_q8_0_tol) {
   // Tolerance: Q8_0 (8-bit) on both operands -> per-element relative error
   // bounded by ~2 / 127 ~= 1.6%, scaled by sqrt(K) for the accumulated dot.
   // We use an absolute tolerance proportional to K and the input scale.
-  const float input_amax = 1.0f; // dist range is [-1, 1]
+  const float input_amax = 1.0f;               // dist range is [-1, 1]
   const float rel_err_per_dim = 2.0f / 127.0f; // Q8_0 quantisation step
-  const float abs_tol = rel_err_per_dim * input_amax * input_amax *
-                        static_cast<float>(sh.K);
+  const float abs_tol =
+    rel_err_per_dim * input_amax * input_amax * static_cast<float>(sh.K);
 
   size_t max_abs_off_idx = 0;
   float max_abs_off = 0.0f;
@@ -188,10 +187,10 @@ TEST_P(GemmQ8_0Param, identity_weight_reproduces_input_row_sums) {
   }
 }
 
-INSTANTIATE_TEST_SUITE_P(
-  GemmQ8_0Shapes, GemmQ8_0Param,
-  ::testing::Values(Shape{1, 32, 32}, Shape{1, 64, 64}, Shape{4, 32, 64},
-                    Shape{8, 128, 128}, Shape{2, 96, 96}));
+INSTANTIATE_TEST_SUITE_P(GemmQ8_0Shapes, GemmQ8_0Param,
+                         ::testing::Values(Shape{1, 32, 32}, Shape{1, 64, 64},
+                                           Shape{4, 32, 64}, Shape{8, 128, 128},
+                                           Shape{2, 96, 96}));
 
 // SIMD path: __ggml_q8_0_q8_0_GEMM uses the AVX2 nntr_gemm_q8_0_q8_0 kernel,
 // which shares mul_sum_i8_pairs_acc_int32x8 with the Q4_0 kernel — identical
@@ -221,9 +220,8 @@ TEST_P(GemmQ8_0Param, simd_kernel_matches_scalar_oracle) {
   std::vector<float> C_scalar(static_cast<size_t>(sh.M) * sh.N, 0.0f);
   std::vector<float> C_simd(static_cast<size_t>(sh.M) * sh.N, 0.0f);
 
-  nntrainer::__fallback_gemm_q8_0<float>(sh.M, sh.N, sh.K, A.data(), sh.K,
-                                         B_q8.data(), sh.K, C_scalar.data(),
-                                         sh.N);
+  nntrainer::__fallback_gemm_q8_0<float>(
+    sh.M, sh.N, sh.K, A.data(), sh.K, B_q8.data(), sh.K, C_scalar.data(), sh.N);
 
   nntrainer::__ggml_q8_0_q8_0_GEMM(sh.M, sh.N, sh.K, A.data(), sh.K,
                                    B_q8.data(), sh.K, C_simd.data(), sh.N);

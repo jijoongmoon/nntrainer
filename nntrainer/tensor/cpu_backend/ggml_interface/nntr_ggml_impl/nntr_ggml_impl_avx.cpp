@@ -3718,8 +3718,8 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
 //   nc : N (number of weight rows)
 // ============================================================================
 void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
-                         const void *__restrict vx,
-                         const void *__restrict vy, int nr, int nc) {
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
   const int qk = QK8_0;
   const int nb = n / qk;
   assert(n % qk == 0);
@@ -3733,13 +3733,11 @@ void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
       const block_q8_0 *b_row = b_base + (size_t)j * nb;
       float acc = 0.0f;
       for (int b = 0; b < nb; ++b) {
-        const __m256i ax =
-          _mm256_loadu_si256((const __m256i *)(a_row[b].qs));
-        const __m256i bx =
-          _mm256_loadu_si256((const __m256i *)(b_row[b].qs));
+        const __m256i ax = _mm256_loadu_si256((const __m256i *)(a_row[b].qs));
+        const __m256i bx = _mm256_loadu_si256((const __m256i *)(b_row[b].qs));
         // SAME helper as the Q4_0 path -> same int8 dot instruction mix.
-        const __m256i sumi32 = mul_sum_i8_pairs_acc_int32x8(
-          _mm256_setzero_si256(), ax, bx);
+        const __m256i sumi32 =
+          mul_sum_i8_pairs_acc_int32x8(_mm256_setzero_si256(), ax, bx);
         const int32_t isum = hsum_i32_8(sumi32);
         const float da = nntr_fp16_to_fp32(a_row[b].d);
         const float db = nntr_fp16_to_fp32(b_row[b].d);
@@ -3751,8 +3749,8 @@ void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
 }
 
 void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
-                         const void *__restrict vx,
-                         const void *__restrict vy, int nr, int nc) {
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
   // GEMV is just GEMM with nr (== M for vy-layout) == 1. Keep the names
   // separate to match the existing Q4_0 API surface so __ggml_q8_0_q8_0_GEMM
   // can dispatch them.

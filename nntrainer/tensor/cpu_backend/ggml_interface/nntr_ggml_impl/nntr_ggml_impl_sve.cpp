@@ -1787,8 +1787,7 @@ void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
   (void)vy;
   (void)nr;
   (void)nc;
-  throw std::runtime_error(
-    "NYI: nntr_gemm_q8_0_q8_0 SVE path");
+  throw std::runtime_error("NYI: nntr_gemm_q8_0_q8_0 SVE path");
 }
 
 void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
@@ -1801,6 +1800,5 @@ void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
   (void)vy;
   (void)nr;
   (void)nc;
-  throw std::runtime_error(
-    "NYI: nntr_gemv_q8_0_q8_0 SVE path");
+  throw std::runtime_error("NYI: nntr_gemv_q8_0_q8_0 SVE path");
 }

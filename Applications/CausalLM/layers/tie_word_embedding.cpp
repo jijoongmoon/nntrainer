@@ -24,6 +24,9 @@
 
 #include <vector>
 
+/**
+ * @brief Namespace for CausalLM application components
+ */
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -492,22 +495,6 @@ void TieWordEmbedding::save(std::ofstream &file,
                                      quant_weight.getData<uint8_t>(), K, N,
                                      nullptr);
             quant_weight.save(file);
-          } else if (dtype == nntrainer::TensorDim::DataType::Q4_0) {
-            // Embedding-style: rows are vocab entries, no transpose.
-            // Skip 1-D rows; require width % 32.
-            if (K == 1) {
-              weight.save(file);
-            } else {
-              NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
-                << "Q4_0 quantization requires width to be divisible by 32, "
-                   "but got width=" << N;
-              nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
-                                             {nntrainer::Tformat::NCHW, dtype});
-              nntrainer::quantize_q4_0(weight.getData<float>(),
-                                       quant_weight.getData<uint8_t>(), K, N,
-                                       nullptr);
-              quant_weight.save(file);
-            }
           } else if (dtype == nntrainer::TensorDim::DataType::Q8_0) {
             // Same shape constraints as Q4_0; 34 bytes/block instead of 18.
             if (K == 1) {
@@ -515,12 +502,13 @@ void TieWordEmbedding::save(std::ofstream &file,
             } else {
               NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
                 << "Q8_0 quantization requires width to be divisible by 32, "
-                   "but got width=" << N;
+                   "but got width="
+                << N;
               nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                              {nntrainer::Tformat::NCHW, dtype});
               nntrainer::quantize_q8_0(weight.getData<float>(),
-                                              quant_weight.getData<uint8_t>(),
-                                              K, N, nullptr);
+                                       quant_weight.getData<uint8_t>(), K, N,
+                                       nullptr);
               quant_weight.save(file);
             }
           } else {

@@ -18,9 +18,9 @@
 #include <int4_tensor.h>
 #include <lazy_tensor.h>
 #include <q4_0_tensor.h>
-#include <q8_0_tensor.h>
 #include <q4_k_tensor.h>
 #include <q6_k_tensor.h>
+#include <q8_0_tensor.h>
 #include <short_tensor.h>
 #include <tensor.h>
 #include <uint4_tensor.h>
@@ -42,6 +42,9 @@
 #include <unistd.h>
 #endif
 
+/**
+ * @brief Namespace for nntrainer core components
+ */
 namespace nntrainer {
 
 Tensor::Tensor(

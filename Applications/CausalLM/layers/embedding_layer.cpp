@@ -21,6 +21,9 @@
 #include <thread_manager.h>
 #include <util_func.h>
 
+/**
+ * @brief Namespace for CausalLM application components
+ */
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -253,12 +256,13 @@ void EmbeddingLayer::save(std::ofstream &file,
           } else {
             NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
               << "Q8_0 quantization requires width to be divisible by 32, "
-                 "but got width=" << N;
+                 "but got width="
+              << N;
             nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                            {nntrainer::Tformat::NCHW, dtype});
             nntrainer::quantize_q8_0(weight.getData<float>(),
-                                            quant_weight.getData<uint8_t>(),
-                                            K, N, nullptr);
+                                     quant_weight.getData<uint8_t>(), K, N,
+                                     nullptr);
             quant_weight.save(file);
           }
         } else {

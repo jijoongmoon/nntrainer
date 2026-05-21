@@ -813,7 +813,7 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((fd == -1), std::invalid_argument)
               << "Cannot open file : " << f_path;
 
-            struct stat st{};
+            struct stat st {};
             NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
               << "Cannot get file info (fstat): " << f_path;
 

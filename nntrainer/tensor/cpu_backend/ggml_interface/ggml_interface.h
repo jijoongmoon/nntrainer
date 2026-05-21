@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <tensor_dim.h>
 
+/**
+ * @brief Namespace for nntrainer core components
+ */
 namespace nntrainer {
 
 /**
@@ -121,7 +124,7 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int ldc);
 
 /**
- * @brief Q8_0 weight x Q8_0 activation GEMM dispatcher (AVX2 path).
+ * @brief Q8_0 weight x Q8_0 activation GEMM dispatcher.
  *        Online-quantises FP32 activation A to Q8_0, then performs the
  *        int8 dot product against pre-quantised Q8_0 weight B (raw
  *        block_q8_0 row-major layout, no repack/interleave).

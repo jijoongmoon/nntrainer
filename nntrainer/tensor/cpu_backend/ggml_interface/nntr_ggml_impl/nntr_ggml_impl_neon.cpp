@@ -1396,8 +1396,8 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
 //   nr : M (activation rows), nc : N (weight rows / output cols)
 // ============================================================================
 void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
-                         const void *__restrict vx,
-                         const void *__restrict vy, int nr, int nc) {
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
   const int qk = QK8_0;
   const int nb = n / qk;
   assert(n % qk == 0);
@@ -1433,8 +1433,8 @@ void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
 }
 
 void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
-                         const void *__restrict vx,
-                         const void *__restrict vy, int nr, int nc) {
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
   (void)nr;
   nntr_gemm_q8_0_q8_0(n, s, bs, vx, vy, 1, nc);
 }

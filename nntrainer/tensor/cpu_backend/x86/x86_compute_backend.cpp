@@ -27,6 +27,9 @@
 #define ROW_MAJOR 0
 #define COL_MAJOR 1
 
+/**
+ * @brief Namespace for nntrainer core components
+ */
 namespace nntrainer {
 
 void init_backend() {

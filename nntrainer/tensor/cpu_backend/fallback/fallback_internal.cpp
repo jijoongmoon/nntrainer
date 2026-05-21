@@ -41,6 +41,9 @@
       Y[ci * incY] = y0;                                                       \
     }                                                                          \
   } while (0);
+/**
+ * @brief Namespace for nntrainer core components
+ */
 namespace nntrainer {
 
 /**
@@ -532,9 +535,8 @@ void __fallback_gemm_q8_0(const unsigned int M, const unsigned int N,
   // a follow-up that should share __ggml_q4_0_8x8_q8_0_GEMM's int8 dot core
   // and only swap the weight-unpack step.
   if (K % QK8_0 != 0) {
-    throw std::runtime_error(
-      "gemm_q8_0: K must be a multiple of 32 (got K=" + std::to_string(K) +
-      ")");
+    throw std::runtime_error("gemm_q8_0: K must be a multiple of 32 (got K=" +
+                             std::to_string(K) + ")");
   }
   const unsigned int n_blocks_k = K / QK8_0;
 

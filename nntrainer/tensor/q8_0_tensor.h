@@ -35,8 +35,8 @@ namespace nntrainer {
  * @note  This struct is reference-only; the tensor buffer is a flat byte array.
  */
 struct block_q8_0 {
-  uint16_t d;           // fp16 scale
-  int8_t qs[QK8_0];     // 32 signed int8 quants
+  uint16_t d;       // fp16 scale
+  int8_t qs[QK8_0]; // 32 signed int8 quants
 };
 
 #define Q8_0_SIZE sizeof(struct block_q8_0)
@@ -97,7 +97,8 @@ public:
   void setZero() override;
 
   void initialize(Initializer init) override {
-    throw std::invalid_argument("Q8_0_Tensor::initialize(init) is not supported.");
+    throw std::invalid_argument(
+      "Q8_0_Tensor::initialize(init) is not supported.");
   }
 
   void initialize() override;

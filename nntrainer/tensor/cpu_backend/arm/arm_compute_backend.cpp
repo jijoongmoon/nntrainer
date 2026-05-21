@@ -22,6 +22,9 @@
 #include <nntrainer_error.h>
 #include <q4_0_utils.h>
 
+/**
+ * @brief Namespace for nntrainer core components
+ */
 namespace nntrainer {
 
 void init_backend() {
