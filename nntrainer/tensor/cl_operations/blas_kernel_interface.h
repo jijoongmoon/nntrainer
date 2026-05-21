@@ -120,5 +120,17 @@ int amaxCl(const Tensor &input);
  */
 int aminCl(const Tensor &input);
 
+/**
+ * @brief v8c GPU path entry point — paper 8/4/4: int8 activation × channel-wise
+ *        QINT4 weight, 87% of Adreno 830 dp4a peak (4499 GFLOP/s validated).
+ *        Env-gated via NNTR_FC_INT8_GPU=1. Caller falls back to dotCl on false.
+ * @param[in] input fp32 or fp16 activation tensor [M, K]
+ * @param[in] weight Int4QTensor (channel-wise QINT4, osv32) [K, N]
+ * @param[out] output fp32 or fp16 tensor [M, N] (preallocated)
+ * @return true if v8c path executed; false if not applicable
+ *         (env disabled, weight not QINT4, shape misaligned).
+ */
+bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNEL_INTERFACE_H__ */

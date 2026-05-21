@@ -19,6 +19,43 @@
 
 #include <blas_kernels.h>
 
+#include <cstdlib>
+#include <memory>
+#include <unordered_map>
+
+#include <opencl_buffer.h>
+#include <opencl_context_manager.h>
+
+namespace nntrainer {
+/**
+ * @brief M-G2 paper method: GPU weight residency (upload-once). ML Drift
+ *  §3 / our M-R1 (84x on the transfer-bound microbench). Weights are
+ *  immutable across decode/prefill steps; keep each weight's device
+ *  buffer resident keyed by its stable host pointer instead of
+ *  re-uploading every FC forward. Numerically identical (same bytes,
+ *  uploaded once). Env-gated NNTR_FC_RESIDENT (default off = original).
+ */
+inline opencl::Buffer *
+residentWeightBuffer(const void *host_ptr, size_t bytes,
+                     opencl::CommandQueueManager &q) {
+  static const bool on = std::getenv("NNTR_FC_RESIDENT") != nullptr;
+  if (!on || host_ptr == nullptr)
+    return nullptr;
+  static std::unordered_map<const void *,
+                            std::pair<std::shared_ptr<opencl::Buffer>, size_t>>
+    cache;
+  auto it = cache.find(host_ptr);
+  if (it != cache.end() && it->second.second == bytes)
+    return it->second.first.get();
+  auto buf = std::make_shared<opencl::Buffer>(
+    opencl::ContextManager::Global(), bytes, /*read_only=*/true, nullptr);
+  if (!buf->WriteData(q, host_ptr))
+    return nullptr;
+  cache[host_ptr] = {buf, bytes};
+  return buf.get();
+}
+} // namespace nntrainer
+
 namespace nntrainer {
 template <typename T = float>
 inline static void sgemv_cl_internal(ClContext::SharedPtrClKernel kernel,
@@ -189,10 +226,18 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
     return;
   }
 
-  result = clbuffInstance.getInBufferB()->WriteDataRegion(
-    blas_cc->command_queue_inst_, k_n_size, B);
-  if (!result) {
-    return;
+  // M-G2 paper method: weight (B) residency — upload once, reuse the
+  // resident device buffer; fall back to per-call upload if disabled.
+  opencl::Buffer *bbuf =
+    residentWeightBuffer((const void *)B, k_n_size,
+                         blas_cc->command_queue_inst_);
+  if (bbuf == nullptr) {
+    result = clbuffInstance.getInBufferB()->WriteDataRegion(
+      blas_cc->command_queue_inst_, k_n_size, B);
+    if (!result) {
+      return;
+    }
+    bbuf = clbuffInstance.getInBufferB();
   }
 
   result = clbuffInstance.getOutBufferA()->WriteDataRegion(
@@ -207,8 +252,7 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
     return;
   }
 
-  result = kernel->SetKernelArguments(1, clbuffInstance.getInBufferB(),
-                                      sizeof(cl_mem));
+  result = kernel->SetKernelArguments(1, bbuf, sizeof(cl_mem));
   if (!result) {
     return;
   }

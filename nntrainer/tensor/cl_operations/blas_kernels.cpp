@@ -15,6 +15,7 @@
 #include <cl_kernels/cl_kernels.h>
 
 #include "util_func.h"
+#include <array>
 #include <fp16.h>
 
 namespace nntrainer {
@@ -1347,4 +1348,225 @@ void transpose_16(void *input, void *output, int width, int height,
   }
 }
 */
+
+// =============================================================================
+// v8c (paper 8/4/4) host wrappers — channel-wise QINT4 weight + int8 activation
+// dot_4x8packed_su_int with bias-subtraction trick. Validated 87% of Adreno 830
+// dp4a peak (4499 GFLOP/s ffn_down, 4344 GFLOP/s ffn_gate at t4×8 LWS 4×16).
+// All inputs are plain cl_mem (image2d_from_buffer or buffer), no SVM.
+// =============================================================================
+
+void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
+                      cl_mem scale_wgt, cl_mem row_sum_act, cl_mem output_fp16,
+                      unsigned int M, unsigned int N, unsigned int K) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(int8_int4_gemm_v8c_kernel, "v8c_gemm_int8_int4");
+  if (!kp)
+    throw std::runtime_error("v8c_gemm_int8_int4: registerClKernel failed");
+
+  int arg = 0;
+  if (!kp->SetKernelArguments(arg++, &act_image, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 0 (act_image)");
+  if (!kp->SetKernelArguments(arg++, &weight_image, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 1 (weight_image)");
+  if (!kp->SetKernelArguments(arg++, &scale_act, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 2 (scale_act)");
+  if (!kp->SetKernelArguments(arg++, &scale_wgt, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 3 (scale_wgt)");
+  if (!kp->SetKernelArguments(arg++, &row_sum_act, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 4 (row_sum_act)");
+  if (!kp->SetKernelArguments(arg++, &output_fp16, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 5 (output_fp16)");
+  int Mi = (int)M, Ni = (int)N, Ki = (int)K;
+  if (!kp->SetKernelArguments(arg++, &Mi, sizeof(int)))
+    throw std::runtime_error("v8c gemm arg 6 (M)");
+  if (!kp->SetKernelArguments(arg++, &Ni, sizeof(int)))
+    throw std::runtime_error("v8c gemm arg 7 (N)");
+  if (!kp->SetKernelArguments(arg++, &Ki, sizeof(int)))
+    throw std::runtime_error("v8c gemm arg 8 (K)");
+
+  // Canonical config: V8C_TM=4, V8C_TN=8 (defaults in the .cl), LWS 4×16.
+  // global = (N/TN, M/TM); requires M%4=0, N%8=0, K%32=0.
+  const size_t TM = 4, TN = 8;
+  std::array<size_t, 3> gws = {(size_t)N / TN, (size_t)M / TM, 1};
+  std::array<size_t, 3> lws = {4, 16, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(
+    kp->GetKernel(), 2, gws.data(), lws.data(), 0, nullptr, nullptr);
+}
+
+static void quantize_act_v8c_cl_impl(cl_mem act_in, cl_mem out_int8,
+                                     cl_mem out_scale, cl_mem out_row_sum,
+                                     unsigned int M, unsigned int K,
+                                     const char *kernel_name) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(int8_int4_gemm_v8c_kernel, kernel_name);
+  if (!kp)
+    throw std::runtime_error(std::string("v8c quant: registerClKernel failed: ") +
+                             kernel_name);
+  int arg = 0;
+  if (!kp->SetKernelArguments(arg++, &act_in, sizeof(cl_mem)))
+    throw std::runtime_error("v8c quant arg 0");
+  if (!kp->SetKernelArguments(arg++, &out_int8, sizeof(cl_mem)))
+    throw std::runtime_error("v8c quant arg 1");
+  if (!kp->SetKernelArguments(arg++, &out_scale, sizeof(cl_mem)))
+    throw std::runtime_error("v8c quant arg 2");
+  if (!kp->SetKernelArguments(arg++, &out_row_sum, sizeof(cl_mem)))
+    throw std::runtime_error("v8c quant arg 3");
+  int Mi = (int)M, Ki = (int)K;
+  if (!kp->SetKernelArguments(arg++, &Mi, sizeof(int)))
+    throw std::runtime_error("v8c quant arg 4");
+  if (!kp->SetKernelArguments(arg++, &Ki, sizeof(int)))
+    throw std::runtime_error("v8c quant arg 5");
+
+  std::array<size_t, 3> gws = {(size_t)M, 1, 1};
+  // local size NULL → driver picks
+  blas_cc->command_queue_inst_.enqueueKernel(
+    kp->GetKernel(), 1, gws.data(), nullptr, 0, nullptr, nullptr);
+}
+
+void quantize_act_v8c_fp16_cl(cl_mem act_fp16, cl_mem out_int8, cl_mem out_scale,
+                              cl_mem out_row_sum, unsigned int M,
+                              unsigned int K) {
+  quantize_act_v8c_cl_impl(act_fp16, out_int8, out_scale, out_row_sum, M, K,
+                           "v8c_act_quant_f16");
+}
+
+void quantize_act_v8c_fp32_cl(cl_mem act_fp32, cl_mem out_int8, cl_mem out_scale,
+                              cl_mem out_row_sum, unsigned int M,
+                              unsigned int K) {
+  quantize_act_v8c_cl_impl(act_fp32, out_int8, out_scale, out_row_sum, M, K,
+                           "v8c_act_quant_f32");
+}
+
+// fp16 (uint16 bit pattern) → fp32 host helper. Standard IEEE 754 half decode.
+static inline float h2f_host(uint16_t h) {
+  uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t e = (h >> 10) & 0x1fu;
+  uint32_t m = h & 0x3ffu;
+  uint32_t o;
+  if (e == 0) {
+    if (m == 0)
+      o = s;
+    else {
+      e = 1;
+      while ((m & 0x400u) == 0) {
+        m <<= 1;
+        e--;
+      }
+      m &= 0x3ffu;
+      o = s | ((e + 112) << 23) | (m << 13);
+    }
+  } else if (e == 0x1f) {
+    o = s | 0x7f800000u | (m << 13);
+  } else {
+    o = s | ((e + 112) << 23) | (m << 13);
+  }
+  float f;
+  std::memcpy(&f, &o, 4);
+  return f;
+}
+
+} // namespace nntrainer
+
+// Use Int4Utils for osv32 row dequant; keep include inside the helper file
+// (TU-local) to avoid leaking the dependency through the public header.
+#include "../int4_utils.h"
+#include <cmath>
+#include <cstring>
+#include <vector>
+
+namespace nntrainer {
+
+std::unique_ptr<tv::TensorBacking>
+make_v8c_weight_backing(const uint8_t *osv32_packed,
+                        const uint16_t *fp16_scales, unsigned int group_size,
+                        unsigned int N, unsigned int K,
+                        cl_mem *out_scale_buf) {
+  if (K % 32 != 0)
+    throw std::invalid_argument(
+      "make_v8c_weight_backing: K must be a multiple of 32");
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_context ctx =
+    blas_cc->context_inst_.GetContext(); // OpenCL context handle
+
+  // 1) Walk osv32 row by row, dequantize → re-quantize per-channel (paper §4.2)
+  //    Pack into row-major v8c layout: per row N, K/2 bytes; per K-block of 32
+  //    one 16-byte texel; byte offset = (k_outer/32)*16 + c*4 + b within row.
+  //    Byte content: low_nib = (q[k_outer+c*8+b] + 8) & 0xF,
+  //                  high_nib = (q[k_outer+c*8+b+4] + 8) & 0xF.
+  const size_t row_bytes = (size_t)K / 2;
+  std::vector<uint8_t> packed((size_t)N * row_bytes);
+  std::vector<float> per_channel_scale(N);
+  std::vector<float> deq_row((size_t)K);
+
+  // dequantizePackedRow takes non-const pointers; cast safely (it reads only).
+  uint8_t *osv_nonconst = const_cast<uint8_t *>(osv32_packed);
+  uint16_t *scales_nonconst = const_cast<uint16_t *>(fp16_scales);
+
+  for (unsigned int n = 0; n < N; ++n) {
+    // (a) Dequantize this row from osv32 + per-group scales → fp32 [K].
+    Int4Utils::dequantizePackedRow(osv_nonconst, scales_nonconst,
+                                   /*rows_count*/ N, /*cols_count*/ K,
+                                   /*group_size*/ group_size,
+                                   /*row_index*/ n, deq_row.data());
+    // (b) Compute per-channel scale = max|.| / 7
+    float amax = 0.0f;
+    for (unsigned int k = 0; k < K; ++k) {
+      float a = std::fabs(deq_row[k]);
+      if (a > amax)
+        amax = a;
+    }
+    float s = (amax > 0.0f) ? (amax / 7.0f) : 1.0f;
+    per_channel_scale[n] = s;
+    float inv_s = 1.0f / s;
+    // (c) Re-quantize to int4 in [-7,7], offset-encode, pack to v8c layout
+    uint8_t *out_row = packed.data() + (size_t)n * row_bytes;
+    for (unsigned int k_outer = 0; k_outer < K; k_outer += 32) {
+      for (int c = 0; c < 4; ++c) {
+        for (int b = 0; b < 4; ++b) {
+          unsigned int kLo = k_outer + (unsigned int)(c * 8 + b);
+          unsigned int kHi = kLo + 4;
+          int qL = (int)std::lrint(deq_row[kLo] * inv_s);
+          int qH = (int)std::lrint(deq_row[kHi] * inv_s);
+          qL = qL < -7 ? -7 : (qL > 7 ? 7 : qL);
+          qH = qH < -7 ? -7 : (qH > 7 ? 7 : qH);
+          uint8_t lo = (uint8_t)((qL + 8) & 0xF);
+          uint8_t hi = (uint8_t)((qH + 8) & 0xF);
+          size_t off = (size_t)(k_outer / 32) * 16 + (size_t)(c * 4 + b);
+          out_row[off] = (uint8_t)((hi << 4) | lo);
+        }
+      }
+    }
+  }
+
+  // 2) Upload packed weight to a new cl_mem buffer, wrap in TensorBacking.
+  cl_int err = CL_SUCCESS;
+  cl_mem w_buf =
+    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                   packed.size(), packed.data(), &err);
+  if (err != CL_SUCCESS || !w_buf)
+    throw std::runtime_error("make_v8c_weight_backing: clCreateBuffer (weight) "
+                             "failed: " +
+                             std::to_string(err));
+  auto backing = std::make_unique<tv::TensorBacking>(
+    ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, packed.size(),
+    /*owned=*/true);
+
+  // 3) Upload per-channel scale buffer.
+  cl_mem sb = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                             sizeof(float) * N, per_channel_scale.data(), &err);
+  if (err != CL_SUCCESS || !sb)
+    throw std::runtime_error("make_v8c_weight_backing: clCreateBuffer (scale) "
+                             "failed: " +
+                             std::to_string(err));
+  *out_scale_buf = sb;
+  return backing;
+}
+
 } // namespace nntrainer

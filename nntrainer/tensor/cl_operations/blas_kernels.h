@@ -365,5 +365,63 @@ void transpose_cl_axis(const _FP16 *in, _FP16 *res,
                        unsigned int input_width, unsigned int axis);
 #endif
 
+/**
+ * @brief v8c int8 act × int4(channel-wise QINT4, offset-encoded) GEMM
+ *        (paper-aligned 8/4/4 prefill, validated 87% of Adreno 830 dp4a peak).
+ * @param[in] act_image image2d_from_buffer view over int8 act buffer
+ *            (CL_RGBA UINT32, width=K/16, height=M)
+ * @param[in] weight_image image2d_from_buffer view over int4-offset weight buf
+ *            (CL_RGBA UINT32, width=K/32, height=N)
+ * @param[in] scale_act per-row fp32 act scale buffer [M]
+ * @param[in] scale_wgt per-channel fp32 weight scale buffer [N]
+ * @param[in] row_sum_act per-row int32 sum of int8 acts [M] (paper §3.7 quant-kernel output)
+ * @param[out] output_fp16 fp16 output buffer [M*N]
+ * @param[in] M,N,K shape; K must be multiple of 32
+ */
+void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
+                      cl_mem scale_wgt, cl_mem row_sum_act, cl_mem output_fp16,
+                      unsigned int M, unsigned int N, unsigned int K);
+
+/**
+ * @brief paper §3.7 activation quant kernel for v8c: fp16/fp32 → int8
+ *        + per-row scale + per-row int32 sum.
+ * @param[in] act_fp16 or act_fp32 input buffer [M*K]
+ * @param[out] out_int8 [M*K] int8 (row-major; later wrapped in image2d view)
+ * @param[out] out_scale [M] fp32 per-row scale
+ * @param[out] out_row_sum [M] int32 sum_k(int8_value), for v8c bias correction
+ * @param[in] M,K shape; K must be multiple of 4 (no other constraint here)
+ */
+void quantize_act_v8c_fp16_cl(cl_mem act_fp16, cl_mem out_int8, cl_mem out_scale,
+                              cl_mem out_row_sum, unsigned int M, unsigned int K);
+void quantize_act_v8c_fp32_cl(cl_mem act_fp32, cl_mem out_int8, cl_mem out_scale,
+                              cl_mem out_row_sum, unsigned int M, unsigned int K);
+
+} // namespace nntrainer
+
+#include "cl_tensor_view.h"
+#include <memory>
+namespace nntrainer {
+/**
+ * @brief Convert a channel-wise QINT4 weight (Int4QTensor osv32_isv2 + fp16
+ *        per-group scales) into a v8c-ready backing: row-major + offset-encoded
+ *        int4 in a single cl_mem buffer (image2d view created on demand via
+ *        TensorBacking::imageView), plus a fp32 per-channel scale cl_mem.
+ *        Paper §4.2 alignment: re-quantize from per-group (32) → per-channel
+ *        (one scale per output row) during the conversion. ONE-TIME at FC init.
+ * @param[in] osv32_packed   pointer to osv32 packed int4 bytes (N*K/2 bytes)
+ * @param[in] fp16_scales    pointer to fp16 scales (N*K/group_size values)
+ * @param[in] group_size     32 (Int4QTensor default)
+ * @param[in] N              output channels
+ * @param[in] K              input dim
+ * @param[out] out_scale_buf cl_mem (fp32, [N], CL_MEM_READ_ONLY) — caller owns
+ * @return TensorBacking holding the v8c row-major+offset weight buffer
+ *         (Encoding::INT4_OFFSET, Layout::ROW_MAJOR, bytes = N*K/2)
+ */
+std::unique_ptr<tv::TensorBacking>
+make_v8c_weight_backing(const uint8_t *osv32_packed,
+                        const uint16_t *fp16_scales, unsigned int group_size,
+                        unsigned int N, unsigned int K,
+                        cl_mem *out_scale_buf);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNELS_H__ */

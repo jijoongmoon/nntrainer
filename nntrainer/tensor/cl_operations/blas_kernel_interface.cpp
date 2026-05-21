@@ -383,3 +383,271 @@ int aminCl(const Tensor &input) {
 }
 
 } // namespace nntrainer
+
+// =============================================================================
+// v8c (paper 8/4/4) dispatch entry — env-gated, dotCl fallback.
+// =============================================================================
+#include "blas_kernels.h"
+#include "cl_tensor_view.h"
+#include <cl_context.h>
+#include <cstdlib>
+#include <cstring>
+#include <engine.h>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
+namespace nntrainer {
+namespace {
+struct V8cWeightEntry {
+  std::unique_ptr<tv::TensorBacking> backing;
+  cl_mem scale_buf = nullptr; // owned
+  unsigned int N = 0, K = 0;
+  cl_mem weight_image = nullptr; // cached image2d view (also released via TensorBacking)
+};
+
+static bool v8c_env_enabled() {
+  static int cached = -1;
+  if (cached < 0)
+    cached = std::getenv("NNTR_FC_INT8_GPU") != nullptr ? 1 : 0;
+  return cached != 0;
+}
+
+static std::mutex &v8c_cache_mtx() {
+  static std::mutex m;
+  return m;
+}
+static std::unordered_map<const void *, V8cWeightEntry> &v8c_weight_cache() {
+  static std::unordered_map<const void *, V8cWeightEntry> c;
+  return c;
+}
+
+// Grow-only scratch buffer pool, reused across all dotCl_v8c forward calls
+// to avoid per-call clCreateBuffer/clReleaseMemObject churn (the dominant
+// integration overhead, especially in M=1 decode where the same FC shapes
+// recur thousands of times).
+struct V8cScratch {
+  cl_mem act_in = nullptr;
+  size_t act_in_bytes = 0;
+  cl_mem act_i8 = nullptr;
+  size_t act_i8_bytes = 0;
+  cl_mem act_scale = nullptr;
+  size_t act_scale_bytes = 0;
+  cl_mem act_rs = nullptr;
+  size_t act_rs_bytes = 0;
+  cl_mem y_fp16 = nullptr;
+  size_t y_fp16_bytes = 0;
+};
+static V8cScratch &v8c_scratch() {
+  static V8cScratch s;
+  return s;
+}
+// Ensure *buf has at least `bytes` capacity with the given flags; (re)alloc
+// only when too small. Returns false on alloc failure.
+static bool v8c_ensure_buf(cl_context ctx, cl_mem *buf, size_t *cap,
+                           size_t bytes, cl_mem_flags flags) {
+  if (*buf && *cap >= bytes)
+    return true;
+  if (*buf) {
+    clReleaseMemObject(*buf);
+    *buf = nullptr;
+    *cap = 0;
+  }
+  cl_int err = CL_SUCCESS;
+  *buf = clCreateBuffer(ctx, flags, bytes, nullptr, &err);
+  if (err != CL_SUCCESS || !*buf) {
+    *buf = nullptr;
+    *cap = 0;
+    return false;
+  }
+  *cap = bytes;
+  return true;
+}
+
+// Get or build the cached v8c weight backing for a given Int4QTensor weight.
+// Returns nullptr if shape unsupported (caller falls back).
+static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
+                                               unsigned int K, unsigned int N) {
+  if (K % 32 != 0 || N % 8 != 0)
+    return nullptr;
+  const void *key = weight.getData<uint8_t>();
+  if (!key)
+    return nullptr;
+  std::lock_guard<std::mutex> lock(v8c_cache_mtx());
+  auto &cache = v8c_weight_cache();
+  auto it = cache.find(key);
+  if (it != cache.end())
+    return &it->second;
+  const uint8_t *osv = weight.getData<uint8_t>();
+  const uint16_t *fp16_scales = weight.getScale<uint16_t>();
+  if (!osv || !fp16_scales)
+    return nullptr;
+  V8cWeightEntry e;
+  cl_mem sb = nullptr;
+  try {
+    e.backing = make_v8c_weight_backing(osv, fp16_scales, /*group_size*/ 32, N,
+                                        K, &sb);
+  } catch (...) {
+    return nullptr;
+  }
+  e.scale_buf = sb;
+  e.N = N;
+  e.K = K;
+  tv::ViewSpec ws;
+  ws.as_image = true;
+  ws.image_channel_order = CL_RGBA;
+  ws.image_channel_type = CL_UNSIGNED_INT32;
+  ws.width = K / 32;
+  ws.height = N;
+  ws.row_pitch_bytes = K / 2;
+  try {
+    e.weight_image = e.backing->imageView(ws);
+  } catch (...) {
+    if (sb)
+      clReleaseMemObject(sb);
+    return nullptr;
+  }
+  auto inserted = cache.emplace(key, std::move(e));
+  return &inserted.first->second;
+}
+
+// fp16 → fp32 (host-side decode used to convert kernel fp16 output)
+static inline float v8c_h2f(uint16_t h) {
+  uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t e = (h >> 10) & 0x1fu;
+  uint32_t m = h & 0x3ffu;
+  uint32_t o;
+  if (e == 0) {
+    if (m == 0)
+      o = s;
+    else {
+      e = 1;
+      while ((m & 0x400u) == 0) {
+        m <<= 1;
+        e--;
+      }
+      m &= 0x3ffu;
+      o = s | ((e + 112) << 23) | (m << 13);
+    }
+  } else if (e == 0x1f) {
+    o = s | 0x7f800000u | (m << 13);
+  } else {
+    o = s | ((e + 112) << 23) | (m << 13);
+  }
+  float f;
+  std::memcpy(&f, &o, 4);
+  return f;
+}
+} // anonymous namespace
+
+bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
+  if (!v8c_env_enabled())
+    return false;
+  if (weight.getDataType() != ml::train::TensorDim::DataType::QINT4)
+    return false;
+  // Derive M, K, N from tensor dims (no-transpose case only).
+  unsigned int M, K, N;
+  if (input.getFormat() == Tformat::NHWC) {
+    M = input.batch() * input.height() * input.width();
+    K = input.channel();
+  } else {
+    M = input.batch() * input.channel() * input.height();
+    K = input.width();
+  }
+  N = weight.width();
+  if (K != weight.height())
+    return false;
+  if (M % 4 != 0 || N % 8 != 0 || K % 32 != 0)
+    return false;
+  if (input.getDataType() != ml::train::TensorDim::DataType::FP32 &&
+      input.getDataType() != ml::train::TensorDim::DataType::FP16)
+    return false;
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+
+  V8cWeightEntry *w = v8c_get_or_build_weight(weight, K, N);
+  if (!w)
+    return false;
+
+  // Reused scratch buffers (grow-only pool). The weight backing + scale are
+  // already cached per-weight; only the activation/output scratch scales with
+  // (M, K, N), so we grow these lazily and reuse them across forwards.
+  cl_int err = CL_SUCCESS;
+  const size_t act_elem =
+    (input.getDataType() == ml::train::TensorDim::DataType::FP16)
+      ? sizeof(uint16_t)
+      : sizeof(float);
+  std::lock_guard<std::mutex> slock(v8c_cache_mtx());
+  V8cScratch &sc = v8c_scratch();
+  if (!v8c_ensure_buf(ctx, &sc.act_in, &sc.act_in_bytes, (size_t)M * K * act_elem,
+                      CL_MEM_READ_ONLY) ||
+      !v8c_ensure_buf(ctx, &sc.act_i8, &sc.act_i8_bytes, (size_t)M * K,
+                      CL_MEM_READ_WRITE) ||
+      !v8c_ensure_buf(ctx, &sc.act_scale, &sc.act_scale_bytes, sizeof(float) * M,
+                      CL_MEM_READ_WRITE) ||
+      !v8c_ensure_buf(ctx, &sc.act_rs, &sc.act_rs_bytes, sizeof(int) * M,
+                      CL_MEM_READ_WRITE) ||
+      !v8c_ensure_buf(ctx, &sc.y_fp16, &sc.y_fp16_bytes,
+                      sizeof(uint16_t) * (size_t)M * N, CL_MEM_READ_WRITE))
+    return false;
+
+  // Upload activation into the (reused) act_in buffer.
+  if (clEnqueueWriteBuffer(q, sc.act_in, CL_FALSE, 0, (size_t)M * K * act_elem,
+                           input.getData<uint8_t>(), 0, nullptr,
+                           nullptr) != CL_SUCCESS)
+    return false;
+
+  try {
+    // (c) fp→int8 act quant + row_sum
+    if (input.getDataType() == ml::train::TensorDim::DataType::FP16)
+      quantize_act_v8c_fp16_cl(sc.act_in, sc.act_i8, sc.act_scale, sc.act_rs, M,
+                               K);
+    else
+      quantize_act_v8c_fp32_cl(sc.act_in, sc.act_i8, sc.act_scale, sc.act_rs, M,
+                               K);
+
+    // Build image2d view over act_i8 buffer (zero-copy, tensor virtualization).
+    // This view is cheap; it must be recreated when M/K change, so keep it
+    // local. (clCreateImage over an existing buffer is far cheaper than a
+    // fresh device allocation.)
+    cl_image_format afmt{CL_RGBA, CL_UNSIGNED_INT32};
+    cl_image_desc adesc{};
+    adesc.image_type = CL_MEM_OBJECT_IMAGE2D;
+    adesc.image_width = K / 16;
+    adesc.image_height = M;
+    adesc.image_row_pitch = K;
+    adesc.buffer = sc.act_i8;
+    cl_mem act_image =
+      clCreateImage(ctx, CL_MEM_READ_ONLY, &afmt, &adesc, nullptr, &err);
+    if (err != CL_SUCCESS) throw std::runtime_error("act image view fail");
+
+    // (b) v8c GEMM
+    gemm_int8_v8c_cl(act_image, w->weight_image, sc.act_scale, w->scale_buf,
+                     sc.act_rs, sc.y_fp16, M, N, K);
+
+    // Read output fp16, convert to output dtype
+    std::vector<uint16_t> y_host((size_t)M * N);
+    clEnqueueReadBuffer(q, sc.y_fp16, CL_TRUE, 0,
+                        sizeof(uint16_t) * y_host.size(), y_host.data(), 0,
+                        nullptr, nullptr);
+    if (output.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      float *out = output.getData<float>();
+      for (size_t i = 0; i < y_host.size(); ++i) out[i] = v8c_h2f(y_host[i]);
+    } else if (output.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      std::memcpy(output.getData<uint8_t>(), y_host.data(),
+                  sizeof(uint16_t) * y_host.size());
+    } else {
+      clReleaseMemObject(act_image);
+      throw std::runtime_error("unsupported output dtype");
+    }
+    clReleaseMemObject(act_image);
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
+} // namespace nntrainer
