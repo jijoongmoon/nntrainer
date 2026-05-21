@@ -33,10 +33,16 @@
 #include <layer_context.h>
 #include <tensor_dim.h>
 
+/**
+ * @brief Namespace for training APIs
+ */
 namespace ml::train {
 class Layer;
 }
 
+/**
+ * @brief Namespace for nntrainer core components
+ */
 namespace nntrainer {
 
 class InitLayerContext;
@@ -194,7 +200,7 @@ public:
   /**
    * @brief    Initialize the layer
    */
-  virtual void initialize(RunLayerContext &context){};
+  virtual void initialize(RunLayerContext &context) {};
 
   /**
    * @brief     Forward Propagation of a layer
@@ -409,6 +415,30 @@ public:
                               nullptr);
                 repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
                             quant_weight.size(), N, K, target_isa);
+                quant_weight.save(file);
+              }
+            } else if (dtype == TensorDim::DataType::Q8_0) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
+                  << "Q8_0 quantization requires both width and height to be "
+                     "divisible by 32, but got height="
+                  << K << ", width=" << N;
+
+                Tensor weight_t = weight.transpose("0:2:1");
+                Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                    {Tformat::NCHW, dtype});
+
+                quantize_q8_0(weight_t.getData<float>(),
+                              quant_weight.getData<uint8_t>(), N, K, nullptr);
                 quant_weight.save(file);
               }
             } else {

@@ -25,6 +25,9 @@
 
 #include <compute_ops.h>
 
+/**
+ * @brief Namespace for nntrainer core components
+ */
 namespace nntrainer {
 
 FloatTensor::FloatTensor(std::string name_, Tformat fm) :
@@ -805,8 +808,7 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   } else if (input_dtype == Tdatatype::Q8_0) {
     // No batched Q8_0 kernel yet; loop over the inputs.
     for (unsigned int i = 0; i < input.size(); ++i) {
-      o->gemm_q8_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
-                        Ns[i]);
+      o->gemm_q8_0_fp32(M, Ns[i], K, data, K, mdatas[i], K, rdatas[i], Ns[i]);
     }
   } else { // QINT4
     if (o->supports_gemv_int4_batch_fp32() &&
@@ -996,6 +998,9 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     }
     break;
   }
+  case Tdatatype::Q8_0:
+    o->gemm_q8_0_fp32(M, N, K, data, K, (void *)mdata, K, rdata, N);
+    break;
 
   default:
     throw std::invalid_argument("Error: unsupported datatype");
