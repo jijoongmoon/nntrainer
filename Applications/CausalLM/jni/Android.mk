@@ -27,6 +27,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/bert \
     $(LOCAL_PATH)/../models/timm_vit \
+    $(LOCAL_PATH)/../models/vjepa2_vit \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/xlm_roberta \
@@ -105,6 +106,10 @@ LOCAL_SRC_FILES := \
     ../models/lfm2/lfm2_causallm.cpp \
     ../models/gemma3/function.cpp \
     ../models/timm_vit/timm_vit_transformer.cpp \
+    ../models/vjepa2_vit/vjepa2_vit.cpp \
+    ../layers/vjepa_rope_layer.cpp \
+    ../layers/vjepa_gelu_layer.cpp \
+    ../layers/vjepa_layernorm_layer.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../models/bert/bert_transformer.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
@@ -221,6 +226,10 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
     ../models/lfm2/lfm2_causallm.cpp \
     ../models/gemma3/function.cpp \
+    ../models/vjepa2_vit/vjepa2_vit.cpp \
+    ../layers/vjepa_rope_layer.cpp \
+    ../layers/vjepa_gelu_layer.cpp \
+    ../layers/vjepa_layernorm_layer.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../models/bert/bert_transformer.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
