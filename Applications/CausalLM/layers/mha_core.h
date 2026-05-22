@@ -138,6 +138,19 @@ public:
 };
 
 /**
+ * @brief UseGemmAttention property
+ * @note  Optional GEMM-based attention path for the non-causal (encoder) case.
+ *        QK and AV are computed with (s)gemm per head instead of the per-row
+ *        dot kernels, improving cache reuse for large sequence lengths.
+ */
+class UseGemmAttention : public nntrainer::Property<bool> {
+public:
+  UseGemmAttention(bool value = false) { set(value); };
+  static constexpr const char *key = "use_gemm_attention";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
  * @brief RopeScalingType
  * - default
  * - yarn
@@ -321,7 +334,7 @@ private:
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::AttnLogitSoftcapping, props::IsCausal>
+    props::AttnLogitSoftcapping, props::IsCausal, props::UseGemmAttention>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -349,6 +362,21 @@ private:
   bool use_sink = false;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
+  bool use_gemm_attention = false;
+
+  /**
+   * @brief GEMM-based non-causal attention for one batch (encoder path).
+   *        Computes, per head, scores = (Q Kᵀ)/sqrt(d) via (s)gemm, a row
+   *        softmax, then out = scores V via (s)gemm. Q is FP32; the K/V cache
+   *        may be FP16 (-> shgemm) or FP32 (-> sgemm). Uses one reusable
+   *        [seq x seq] FP32 score buffer (per head) instead of the full
+   *        [seq x seq x num_heads] buffer.
+   */
+  void gemm_attention_noncausal(nntrainer::Tensor &query_step,
+                                nntrainer::Tensor &b_cached_key,
+                                nntrainer::Tensor &b_cached_value,
+                                nntrainer::Tensor &attention_output_step,
+                                unsigned int seq_len);
 
   enum INOUT_INDEX {
     /** input index */

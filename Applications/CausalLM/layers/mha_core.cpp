@@ -13,6 +13,7 @@
  */
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -115,7 +116,8 @@ MHACoreLayer::MHACoreLayer() :
     props::SlidingWindow(), props::MaxNewTokens(), props::RopeTheta(),
     props::MaxPositionEmbeddings(), props::UseSink(), props::RopeScalingType(),
     props::RopeScalingFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal()),
+    props::AttnLogitSoftcapping(), props::IsCausal(),
+    props::UseGemmAttention()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -214,6 +216,14 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
+  use_gemm_attention =
+    std::get<props::UseGemmAttention>(mha_core_props).get() && !is_causal;
+#if !defined(ENABLE_FP16)
+  // The GEMM attention path is tuned/validated for the ARM FP16-cache build
+  // (shgemm QK + FP16 hgemm AV). The plain-FP32 (x86) variant is unverified, so
+  // fall back to the reference attention there.
+  use_gemm_attention = false;
+#endif
 
   /** Tensor for KV-Cache (only allocate internally when not using external
    * cache) */
@@ -753,14 +763,22 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
 
+  unsigned int gqa_size = num_heads_Q / num_heads_KV;
+
+  // Optional GEMM attention path (non-causal encoder). Avoids the full
+  // [seq x seq x num_heads] score buffer and the per-row dot kernels.
+  if (use_gemm_attention && gqa_size == 1) {
+    gemm_attention_noncausal(query_step, b_cached_key, b_cached_value,
+                             attention_output_step, cache_to);
+    return;
+  }
+
   // out_ stores the output of Q * K
   nntrainer::Tensor out_(
     1, 1,
     is_causal ? (calc_attn_index(cache_to) - calc_attn_index(cache_from))
               : (step_size * cache_to),
     num_heads_Q, query_step.getTensorType());
-
-  unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
                   cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
@@ -770,6 +788,194 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
                                 cache_to);
+}
+
+#if defined(ENABLE_FP16) && defined(__ARM_NEON)
+#include <arm_neon.h>
+// Cephes exp() for 4 floats at once (matches neon_mathfun.hxx exp_ps).
+static inline float32x4_t vjepa_expq_f32(float32x4_t x) {
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  x = vminq_f32(x, vdupq_n_f32(88.3762626647949f));
+  x = vmaxq_f32(x, vdupq_n_f32(-88.3762626647949f));
+  float32x4_t fx =
+    vmlaq_f32(vdupq_n_f32(0.5f), x, vdupq_n_f32(1.44269504088896341f));
+  float32x4_t tmp = vcvtq_f32_s32(vcvtq_s32_f32(fx));
+  uint32x4_t mask = vandq_u32(vcgtq_f32(tmp, fx), vreinterpretq_u32_f32(one));
+  fx = vsubq_f32(tmp, vreinterpretq_f32_u32(mask));
+  x = vsubq_f32(x, vmulq_f32(fx, vdupq_n_f32(0.693359375f)));
+  x = vsubq_f32(x, vmulq_f32(fx, vdupq_n_f32(-2.12194440e-4f)));
+  float32x4_t z = vmulq_f32(x, x);
+  float32x4_t y = vdupq_n_f32(1.9875691500E-4f);
+  y = vmulq_f32(y, x);
+  y = vaddq_f32(y, vdupq_n_f32(1.3981999507E-3f));
+  y = vmulq_f32(y, x);
+  y = vaddq_f32(y, vdupq_n_f32(8.3334519073E-3f));
+  y = vmulq_f32(y, x);
+  y = vaddq_f32(y, vdupq_n_f32(4.1665795894E-2f));
+  y = vmulq_f32(y, x);
+  y = vaddq_f32(y, vdupq_n_f32(1.6666665459E-1f));
+  y = vmulq_f32(y, x);
+  y = vaddq_f32(y, vdupq_n_f32(5.0000001201E-1f));
+  y = vmulq_f32(y, z);
+  y = vaddq_f32(y, x);
+  y = vaddq_f32(y, one);
+  int32x4_t mm = vshlq_n_s32(
+    vaddq_s32(vcvtq_s32_f32(fx), vdupq_n_s32(0x7f)), 23);
+  return vmulq_f32(y, vreinterpretq_f32_s32(mm));
+}
+#endif
+
+void MHACoreLayer::gemm_attention_noncausal(
+  nntrainer::Tensor &query_step, nntrainer::Tensor &b_cached_key,
+  nntrainer::Tensor &b_cached_value,
+  nntrainer::Tensor &attention_output_step, unsigned int seq_len) {
+  const unsigned int N = seq_len;
+  const unsigned int d = head_dim;
+  const unsigned int HD = num_heads_Q * d; // row stride (interleaved heads)
+  const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(d));
+  const unsigned int order =
+    static_cast<unsigned int>(query_step.getDim().getStorageOrder());
+
+  const float *Q = query_step.getData<float>();
+  float *O = attention_output_step.getData<float>();
+
+  // Flash attention, parallelized over heads (one head per worker; shgemm is
+  // single-threaded so this uses all cores). 2D tiling (query block x key
+  // block) with an online (running max/sum) softmax: only [Bq x Bk] scores
+  // exist at a time, so the O(N^2) score buffer and its RAM round-trip are
+  // avoided. QK uses shgemm (FP32 Q x FP16 K -> FP32; block0 logits ~457k
+  // overflow FP16) and AV uses shgemm (FP32 probs x FP16 V).
+
+  // tile sizes (cache-resident S); overridable via env for tuning
+  unsigned int Bq = 256, Bk = 512;
+  if (const char *e = std::getenv("VJEPA_BQ"))
+    Bq = static_cast<unsigned int>(std::stoul(e));
+  if (const char *e = std::getenv("VJEPA_BK"))
+    Bk = static_cast<unsigned int>(std::stoul(e));
+
+  const unsigned int num_qb = (N + Bq - 1) / Bq;
+  auto &tm = nntrainer::ThreadManager::Global();
+
+#ifdef ENABLE_FP16
+  // Phase 1: de-interleave heads once into shared contiguous [H, N, d] buffers
+  // (Q FP32, K/V FP16). Parallel over heads.
+  std::vector<float> Qa((size_t)num_heads_Q * N * d);
+  std::vector<_FP16> Ka((size_t)num_heads_Q * N * d);
+  std::vector<_FP16> Va((size_t)num_heads_Q * N * d);
+  {
+    const _FP16 *Kbase = b_cached_key.getData<_FP16>();
+    const _FP16 *Vbase = b_cached_value.getData<_FP16>();
+    tm.parallel_for(0, static_cast<size_t>(num_heads_Q), [&](size_t h) {
+      float *qa = Qa.data() + (size_t)h * N * d;
+      _FP16 *ka = Ka.data() + (size_t)h * N * d;
+      _FP16 *va = Va.data() + (size_t)h * N * d;
+      const float *qh = Q + h * d;
+      const _FP16 *kh = Kbase + h * d;
+      const _FP16 *vh = Vbase + h * d;
+      for (unsigned int n = 0; n < N; ++n) {
+        std::memcpy(qa + (size_t)n * d, qh + (size_t)n * HD, d * sizeof(float));
+        std::memcpy(ka + (size_t)n * d, kh + (size_t)n * HD, d * sizeof(_FP16));
+        std::memcpy(va + (size_t)n * d, vh + (size_t)n * HD, d * sizeof(_FP16));
+      }
+    });
+  }
+
+  // Phase 2: flash attention over balanced (head x query-block) work units so
+  // all workers stay busy (num_heads is not a multiple of the worker count).
+  tm.parallel_for(
+    0, static_cast<size_t>(num_heads_Q) * num_qb, [&](size_t u) {
+      const unsigned int h = static_cast<unsigned int>(u / num_qb);
+      const unsigned int qb = static_cast<unsigned int>(u % num_qb) * Bq;
+      const unsigned int bq = std::min(Bq, N - qb);
+      const float *Qp = Qa.data() + (size_t)h * N * d;
+      const _FP16 *Kp = Ka.data() + (size_t)h * N * d;
+      const _FP16 *Vp = Va.data() + (size_t)h * N * d;
+      float *Oh = O + h * d;
+
+      // per-thread scratch, reused across work units (no per-unit alloc)
+      thread_local std::vector<float> S, Pacc, Ol, mrow, lrow;
+      S.resize((size_t)Bq * Bk);
+      Pacc.resize((size_t)Bq * d);
+      Ol.resize((size_t)Bq * d);
+      mrow.resize(Bq);
+      lrow.resize(Bq);
+
+      std::fill(Ol.begin(), Ol.begin() + (size_t)bq * d, 0.0f);
+      for (unsigned int i = 0; i < bq; ++i) {
+        mrow[i] = -3.0e38f;
+        lrow[i] = 0.0f;
+      }
+
+      for (unsigned int kb = 0; kb < N; kb += Bk) {
+        const unsigned int bk = std::min(Bk, N - kb);
+        nntrainer::shgemm(order, false, true, bq, bk, d, inv_sqrt,
+                          Qp + (size_t)qb * d, d, Kp + (size_t)kb * d, d, 0.0f,
+                          S.data(), bk);
+
+        for (unsigned int i = 0; i < bq; ++i) {
+          float *s = S.data() + (size_t)i * bk;
+          float bm = -3.0e38f;
+          {
+            float32x4_t vmx = vdupq_n_f32(-3.0e38f);
+            unsigned int k = 0;
+            for (; k + 4 <= bk; k += 4)
+              vmx = vmaxq_f32(vmx, vld1q_f32(s + k));
+            bm = vmaxvq_f32(vmx);
+            for (; k < bk; ++k)
+              bm = std::max(bm, s[k]);
+          }
+          const float nm = std::max(mrow[i], bm);
+          const float c = std::exp(mrow[i] - nm);
+          float bs = 0.0f;
+          {
+            float32x4_t vsum = vdupq_n_f32(0.0f), vnm = vdupq_n_f32(nm);
+            unsigned int k = 0;
+            for (; k + 4 <= bk; k += 4) {
+              float32x4_t e = vjepa_expq_f32(vsubq_f32(vld1q_f32(s + k), vnm));
+              vst1q_f32(s + k, e);
+              vsum = vaddq_f32(vsum, e);
+            }
+            bs = vaddvq_f32(vsum);
+            for (; k < bk; ++k) {
+              float e = std::exp(s[k] - nm);
+              s[k] = e;
+              bs += e;
+            }
+          }
+          lrow[i] = lrow[i] * c + bs;
+          mrow[i] = nm;
+          float *ol = Ol.data() + (size_t)i * d;
+          for (unsigned int x = 0; x < d; ++x)
+            ol[x] *= c;
+        }
+
+        nntrainer::shgemm(order, false, false, bq, d, bk, 1.0f, S.data(), bk,
+                          Vp + (size_t)kb * d, d, 0.0f, Pacc.data(), d);
+        for (unsigned int i = 0; i < bq; ++i) {
+          float *ol = Ol.data() + (size_t)i * d;
+          const float *pa = Pacc.data() + (size_t)i * d;
+          for (unsigned int x = 0; x < d; ++x)
+            ol[x] += pa[x];
+        }
+      }
+      for (unsigned int i = 0; i < bq; ++i) {
+        const float inv = 1.0f / lrow[i];
+        const float *ol = Ol.data() + (size_t)i * d;
+        float *oh = Oh + (size_t)(qb + i) * HD;
+        for (unsigned int x = 0; x < d; ++x)
+          oh[x] = ol[x] * inv;
+      }
+    });
+#else
+  (void)Q;
+  (void)O;
+  (void)HD;
+  (void)inv_sqrt;
+  (void)order;
+  (void)num_qb;
+  (void)tm;
+  (void)Bk;
+#endif
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
