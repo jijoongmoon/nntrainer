@@ -1084,21 +1084,27 @@ void MHACoreLayer::gemm_attention(
 #endif
 
   // Phase 1: de-interleave heads once into shared contiguous buffers.
-  // K/V always kept as raw FP16 bits (uint16). Q always materialized as
-  // FP32 so Phase 2 can use shgemm (FP32 Q × FP16 K -> FP32, V-JEPA
-  // precision). If the model arrives with FP16 Q (ENABLE_FP16+Android
-  // build), de-interleave + FP16->FP32 cvt happens in one pass here.
-  std::vector<float> Qa_fp32((size_t)num_heads_Q * N_q * d);
+  // K/V always kept as raw FP16 bits (uint16). Q either FP32 (V-JEPA
+  // path) or FP16 (when forwarding() pre-converts to FP16; ENABLE_FP16+
+  // Android). The FP16 Q path keeps the entire attention in FP16
+  // (custom_hgemm for QK and AV, FP16 softmax) without ever materializing
+  // an FP32 score buffer.
+  std::vector<float> Qa_fp32;
+  std::vector<uint16_t> Qa_fp16;
+  if (q_fp16)
+    Qa_fp16.resize((size_t)num_heads_Q * N_q * d);
+  else
+    Qa_fp32.resize((size_t)num_heads_Q * N_q * d);
   std::vector<uint16_t> Ka((size_t)num_heads_KV * N_kv * d);
   std::vector<uint16_t> Va((size_t)num_heads_KV * N_kv * d);
   {
     if (q_fp16) {
       tm.parallel_for(0, static_cast<size_t>(num_heads_Q), [&](size_t h) {
-        float *qa = Qa_fp32.data() + (size_t)h * N_q * d;
+        uint16_t *qa = Qa_fp16.data() + (size_t)h * N_q * d;
         const uint16_t *qh = Q_fp16_src + h * d;
         for (unsigned int n = 0; n < N_q; ++n)
-          mha_convert_fp16bits_to_fp32(d, qh + (size_t)n * HD_Q,
-                                       qa + (size_t)n * d);
+          std::memcpy(qa + (size_t)n * d, qh + (size_t)n * HD_Q,
+                      d * sizeof(uint16_t));
       });
     } else {
       tm.parallel_for(0, static_cast<size_t>(num_heads_Q), [&](size_t h) {
@@ -1130,7 +1136,10 @@ void MHACoreLayer::gemm_attention(
       const unsigned int h_kv = h_q / gqa;
       const unsigned int qb = static_cast<unsigned int>(u % num_qb) * Bq;
       const unsigned int bq = std::min(Bq, N_q - qb);
-      const float *Qp = Qa_fp32.data() + (size_t)h_q * N_q * d;
+      const float *Qp_fp32 =
+        q_fp16 ? nullptr : (Qa_fp32.data() + (size_t)h_q * N_q * d);
+      const uint16_t *Qp_fp16 =
+        q_fp16 ? (Qa_fp16.data() + (size_t)h_q * N_q * d) : nullptr;
       const uint16_t *Kp = Ka.data() + (size_t)h_kv * N_kv * d;
       const uint16_t *Vp = Va.data() + (size_t)h_kv * N_kv * d;
       float *Oh = o_fp16 ? nullptr : (O + h_q * d);
@@ -1147,6 +1156,9 @@ void MHACoreLayer::gemm_attention(
       Sp16.resize((size_t)Bq * Bk);
       Pacc16.resize((size_t)Bq * d);
 #endif
+      // FP16-throughout path uses Sp16 for both QK output (custom_hgemm,
+      // FP16-stored) and AV input (softmax in-place updates the same
+      // buffer). The FP32 S buffer is unused in that path.
 
       std::fill(Ol.begin(), Ol.begin() + (size_t)bq * d, 0.0f);
       for (unsigned int i = 0; i < bq; ++i) {
@@ -1173,22 +1185,6 @@ void MHACoreLayer::gemm_attention(
         if (windowed && (size_t)kb + bk + W <= q_abs_lo + 1)
           continue;
 
-#if defined(__x86_64__) || defined(__i386__)
-        // Fused AVX2+F16C QK: FP32 Q x FP16-bits K -> FP32 S (TransB=true).
-        mha_hsgemm_avx2(bq, bk, d, inv_sqrt, Qp + (size_t)qb * d, d,
-                        Kp + (size_t)kb * d, d, /*TransB=*/true, S.data(), bk);
-#elif defined(__ARM_NEON)
-        // V-JEPA precision: shgemm reads K as FP16 directly.
-        nntrainer::shgemm(
-          order, false, true, bq, bk, d, inv_sqrt, Qp + (size_t)qb * d, d,
-          reinterpret_cast<const __fp16 *>(Kp + (size_t)kb * d), d, 0.0f,
-          S.data(), bk);
-#else
-        nntrainer::sgemm(order, false, true, bq, bk, d, inv_sqrt,
-                         Qp + (size_t)qb * d, d, Kp + (size_t)kb * d, d, 0.0f,
-                         S.data(), bk);
-#endif
-
         // Does this block straddle the causal diagonal for any row?
         const bool causal_boundary =
           causal && ((size_t)kb + bk > q_abs_lo + 1);
@@ -1196,151 +1192,268 @@ void MHACoreLayer::gemm_attention(
         const bool window_boundary =
           windowed && ((size_t)kb + W < q_abs_hi + 1);
 
-        for (unsigned int i = 0; i < bq; ++i) {
-          float *s = S.data() + (size_t)i * bk;
-          const long long q_abs = (long long)cache_from + qb + i;
-
-          if (causal_boundary) {
-            // valid k: kb + k <= q_abs -> k <= q_abs - kb
-            long long valid_count_ll = q_abs + 1 - (long long)kb;
-            unsigned int valid_count =
-              (valid_count_ll <= 0)
-                ? 0u
-                : (valid_count_ll >= (long long)bk
-                     ? bk
-                     : (unsigned int)valid_count_ll);
-            for (unsigned int k = valid_count; k < bk; ++k)
-              s[k] = -INFINITY;
-          }
-          if (window_boundary) {
-            // valid k: kb + k > q_abs - W -> k > q_abs - W - kb
-            long long first_valid_ll =
-              q_abs - (long long)W - (long long)kb + 1;
-            unsigned int first_valid =
-              (first_valid_ll <= 0)
-                ? 0u
-                : (first_valid_ll >= (long long)bk
-                     ? bk
-                     : (unsigned int)first_valid_ll);
-            for (unsigned int k = 0; k < first_valid; ++k)
-              s[k] = -INFINITY;
-          }
-
-          // Block max (row-wise)
-          float bm = -3.0e38f;
-#if defined(__ARM_NEON)
-          {
-            float32x4_t vmx = vdupq_n_f32(-3.0e38f);
-            unsigned int k = 0;
-            for (; k + 4 <= bk; k += 4)
-              vmx = vmaxq_f32(vmx, vld1q_f32(s + k));
-            bm = vmaxvq_f32(vmx);
-            for (; k < bk; ++k)
-              bm = std::max(bm, s[k]);
-          }
-#else
-          for (unsigned int k = 0; k < bk; ++k)
-            bm = std::max(bm, s[k]);
-#endif
-          const float nm = std::max(mrow[i], bm);
-          const float c = std::exp(mrow[i] - nm);
-          float bs = 0.0f;
 #if !defined(__x86_64__) && !defined(__i386__) && defined(__ARM_NEON)
-          // V-JEPA precision: fused softmax — compute exp in FP32 register,
-          // store the probability directly as FP16 into Sp16. Avoids a
-          // separate FP32->FP16 conversion pass before AV custom_hgemm.
-          {
+        if (q_fp16) {
+          // ALL-FP16 PATH (matches pre-V-JEPA mha_core precision: FP16
+          // storage with FP32 partial accumulation inside NEON kernels,
+          // no upgrade to FP32 in the score buffer).
+          // QK: FP16 × FP16 -> FP16 (custom_hgemm with FP32 partial acc).
+          nntrainer::neon::custom_hgemm(
+            reinterpret_cast<const __fp16 *>(Qp_fp16 + (size_t)qb * d),
+            reinterpret_cast<const __fp16 *>(Kp + (size_t)kb * d),
+            reinterpret_cast<__fp16 *>(Sp16.data()), bq, bk, d, inv_sqrt, 0.0f,
+            /*TransA=*/false, /*TransB=*/true);
+
+          // Boundary masking in FP16: write -INFINITY as bit pattern 0xFC00.
+          for (unsigned int i = 0; i < bq; ++i) {
             uint16_t *sp16 = Sp16.data() + (size_t)i * bk;
-            float32x4_t vsum = vdupq_n_f32(0.0f), vnm = vdupq_n_f32(nm);
-            unsigned int k = 0;
-            for (; k + 4 <= bk; k += 4) {
-              float32x4_t e =
-                vjepa_expq_f32(vsubq_f32(vld1q_f32(s + k), vnm));
-              float16x4_t e_h = vcvt_f16_f32(e);
-              vst1_u16(sp16 + k, vreinterpret_u16_f16(e_h));
-              vsum = vaddq_f32(vsum, e);
+            const long long q_abs = (long long)cache_from + qb + i;
+            if (causal_boundary) {
+              long long valid_count_ll = q_abs + 1 - (long long)kb;
+              unsigned int valid_count =
+                (valid_count_ll <= 0)
+                  ? 0u
+                  : (valid_count_ll >= (long long)bk
+                       ? bk
+                       : (unsigned int)valid_count_ll);
+              for (unsigned int k = valid_count; k < bk; ++k)
+                sp16[k] = 0xFC00; // FP16 -infinity
             }
-            bs = vaddvq_f32(vsum);
-            for (; k < bk; ++k) {
-              float e = std::exp(s[k] - nm);
-              sp16[k] = nntrainer::compute_fp32_to_fp16(e);
-              bs += e;
+            if (window_boundary) {
+              long long first_valid_ll =
+                q_abs - (long long)W - (long long)kb + 1;
+              unsigned int first_valid =
+                (first_valid_ll <= 0)
+                  ? 0u
+                  : (first_valid_ll >= (long long)bk
+                       ? bk
+                       : (unsigned int)first_valid_ll);
+              for (unsigned int k = 0; k < first_valid; ++k)
+                sp16[k] = 0xFC00;
             }
+
+            // Block max (read FP16, compute FP32 register for stability).
+            float bm = -3.0e38f;
+            {
+              float32x4_t vmx = vdupq_n_f32(-3.0e38f);
+              unsigned int k = 0;
+              for (; k + 4 <= bk; k += 4) {
+                float16x4_t h =
+                  vreinterpret_f16_u16(vld1_u16(sp16 + k));
+                vmx = vmaxq_f32(vmx, vcvt_f32_f16(h));
+              }
+              bm = vmaxvq_f32(vmx);
+              for (; k < bk; ++k)
+                bm = std::max(bm, nntrainer::compute_fp16_to_fp32(sp16[k]));
+            }
+            const float nm = std::max(mrow[i], bm);
+            const float c = std::exp(mrow[i] - nm);
+            float bs = 0.0f;
+            {
+              // Softmax: read FP16 -> FP32 register, exp, store FP16.
+              float32x4_t vsum = vdupq_n_f32(0.0f), vnm = vdupq_n_f32(nm);
+              unsigned int k = 0;
+              for (; k + 4 <= bk; k += 4) {
+                float16x4_t h =
+                  vreinterpret_f16_u16(vld1_u16(sp16 + k));
+                float32x4_t v = vcvt_f32_f16(h);
+                float32x4_t e = vjepa_expq_f32(vsubq_f32(v, vnm));
+                float16x4_t e_h = vcvt_f16_f32(e);
+                vst1_u16(sp16 + k, vreinterpret_u16_f16(e_h));
+                vsum = vaddq_f32(vsum, e);
+              }
+              bs = vaddvq_f32(vsum);
+              for (; k < bk; ++k) {
+                float v = nntrainer::compute_fp16_to_fp32(sp16[k]);
+                float e = std::exp(v - nm);
+                sp16[k] = nntrainer::compute_fp32_to_fp16(e);
+                bs += e;
+              }
+            }
+            lrow[i] = lrow[i] * c + bs;
+            mrow[i] = nm;
+            float *ol = Ol.data() + (size_t)i * d;
+            for (unsigned int x = 0; x < d; ++x)
+              ol[x] *= c;
           }
-#elif defined(__ARM_NEON)
-          {
-            float32x4_t vsum = vdupq_n_f32(0.0f), vnm = vdupq_n_f32(nm);
-            unsigned int k = 0;
-            for (; k + 4 <= bk; k += 4) {
-              float32x4_t e =
-                vjepa_expq_f32(vsubq_f32(vld1q_f32(s + k), vnm));
-              vst1q_f32(s + k, e);
-              vsum = vaddq_f32(vsum, e);
+
+          // AV: FP16 × FP16 -> FP16 (custom_hgemm).
+          nntrainer::neon::custom_hgemm(
+            reinterpret_cast<const __fp16 *>(Sp16.data()),
+            reinterpret_cast<const __fp16 *>(Vp + (size_t)kb * d),
+            reinterpret_cast<__fp16 *>(Pacc16.data()), bq, d, bk, 1.0f, 0.0f,
+            /*TransA=*/false, /*TransB=*/false);
+          // Accumulate Pacc16 -> Ol FP32 (FP32 accumulator across kb).
+          for (unsigned int i = 0; i < bq; ++i) {
+            float *ol = Ol.data() + (size_t)i * d;
+            const uint16_t *pa = Pacc16.data() + (size_t)i * d;
+            unsigned int x = 0;
+            for (; x + 8 <= d; x += 8) {
+              float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(pa + x));
+              float32x4_t lo = vcvt_f32_f16(vget_low_f16(h));
+              float32x4_t hi = vcvt_f32_f16(vget_high_f16(h));
+              vst1q_f32(ol + x, vaddq_f32(vld1q_f32(ol + x), lo));
+              vst1q_f32(ol + x + 4, vaddq_f32(vld1q_f32(ol + x + 4), hi));
             }
-            bs = vaddvq_f32(vsum);
-            for (; k < bk; ++k) {
+            for (; x < d; ++x)
+              ol[x] += nntrainer::compute_fp16_to_fp32(pa[x]);
+          }
+        } else
+#endif // ARM NEON q_fp16 branch
+        {
+          // FP32 Q path: QK -> FP32 S, fused FP16 softmax store to Sp16, AV.
+#if defined(__x86_64__) || defined(__i386__)
+          mha_hsgemm_avx2(bq, bk, d, inv_sqrt, Qp_fp32 + (size_t)qb * d, d,
+                          Kp + (size_t)kb * d, d, /*TransB=*/true, S.data(),
+                          bk);
+#elif defined(__ARM_NEON)
+          nntrainer::shgemm(
+            order, false, true, bq, bk, d, inv_sqrt,
+            Qp_fp32 + (size_t)qb * d, d,
+            reinterpret_cast<const __fp16 *>(Kp + (size_t)kb * d), d, 0.0f,
+            S.data(), bk);
+#else
+          nntrainer::sgemm(order, false, true, bq, bk, d, inv_sqrt,
+                           Qp_fp32 + (size_t)qb * d, d,
+                           Kp + (size_t)kb * d, d, 0.0f, S.data(), bk);
+#endif
+
+          for (unsigned int i = 0; i < bq; ++i) {
+            float *s = S.data() + (size_t)i * bk;
+            const long long q_abs = (long long)cache_from + qb + i;
+            if (causal_boundary) {
+              long long valid_count_ll = q_abs + 1 - (long long)kb;
+              unsigned int valid_count =
+                (valid_count_ll <= 0)
+                  ? 0u
+                  : (valid_count_ll >= (long long)bk
+                       ? bk
+                       : (unsigned int)valid_count_ll);
+              for (unsigned int k = valid_count; k < bk; ++k)
+                s[k] = -INFINITY;
+            }
+            if (window_boundary) {
+              long long first_valid_ll =
+                q_abs - (long long)W - (long long)kb + 1;
+              unsigned int first_valid =
+                (first_valid_ll <= 0)
+                  ? 0u
+                  : (first_valid_ll >= (long long)bk
+                       ? bk
+                       : (unsigned int)first_valid_ll);
+              for (unsigned int k = 0; k < first_valid; ++k)
+                s[k] = -INFINITY;
+            }
+
+            float bm = -3.0e38f;
+#if defined(__ARM_NEON)
+            {
+              float32x4_t vmx = vdupq_n_f32(-3.0e38f);
+              unsigned int k = 0;
+              for (; k + 4 <= bk; k += 4)
+                vmx = vmaxq_f32(vmx, vld1q_f32(s + k));
+              bm = vmaxvq_f32(vmx);
+              for (; k < bk; ++k)
+                bm = std::max(bm, s[k]);
+            }
+#else
+            for (unsigned int k = 0; k < bk; ++k)
+              bm = std::max(bm, s[k]);
+#endif
+            const float nm = std::max(mrow[i], bm);
+            const float c = std::exp(mrow[i] - nm);
+            float bs = 0.0f;
+#if !defined(__x86_64__) && !defined(__i386__) && defined(__ARM_NEON)
+            {
+              uint16_t *sp16 = Sp16.data() + (size_t)i * bk;
+              float32x4_t vsum = vdupq_n_f32(0.0f), vnm = vdupq_n_f32(nm);
+              unsigned int k = 0;
+              for (; k + 4 <= bk; k += 4) {
+                float32x4_t e =
+                  vjepa_expq_f32(vsubq_f32(vld1q_f32(s + k), vnm));
+                float16x4_t e_h = vcvt_f16_f32(e);
+                vst1_u16(sp16 + k, vreinterpret_u16_f16(e_h));
+                vsum = vaddq_f32(vsum, e);
+              }
+              bs = vaddvq_f32(vsum);
+              for (; k < bk; ++k) {
+                float e = std::exp(s[k] - nm);
+                sp16[k] = nntrainer::compute_fp32_to_fp16(e);
+                bs += e;
+              }
+            }
+#elif defined(__ARM_NEON)
+            {
+              float32x4_t vsum = vdupq_n_f32(0.0f), vnm = vdupq_n_f32(nm);
+              unsigned int k = 0;
+              for (; k + 4 <= bk; k += 4) {
+                float32x4_t e =
+                  vjepa_expq_f32(vsubq_f32(vld1q_f32(s + k), vnm));
+                vst1q_f32(s + k, e);
+                vsum = vaddq_f32(vsum, e);
+              }
+              bs = vaddvq_f32(vsum);
+              for (; k < bk; ++k) {
+                float e = std::exp(s[k] - nm);
+                s[k] = e;
+                bs += e;
+              }
+            }
+#else
+            for (unsigned int k = 0; k < bk; ++k) {
               float e = std::exp(s[k] - nm);
               s[k] = e;
               bs += e;
             }
-          }
-#else
-          for (unsigned int k = 0; k < bk; ++k) {
-            float e = std::exp(s[k] - nm);
-            s[k] = e;
-            bs += e;
-          }
 #endif
-          lrow[i] = lrow[i] * c + bs;
-          mrow[i] = nm;
-          float *ol = Ol.data() + (size_t)i * d;
-          for (unsigned int x = 0; x < d; ++x)
-            ol[x] *= c;
-        }
+            lrow[i] = lrow[i] * c + bs;
+            mrow[i] = nm;
+            float *ol = Ol.data() + (size_t)i * d;
+            for (unsigned int x = 0; x < d; ++x)
+              ol[x] *= c;
+          }
 
 #if defined(__x86_64__) || defined(__i386__)
-        // Fused AVX2+F16C AV: FP32 S x FP16-bits V -> FP32 Pacc (TransB=false).
-        mha_hsgemm_avx2(bq, d, bk, 1.0f, S.data(), bk, Vp + (size_t)kb * d, d,
-                        /*TransB=*/false, Pacc.data(), d);
-        for (unsigned int i = 0; i < bq; ++i) {
-          float *ol = Ol.data() + (size_t)i * d;
-          const float *pa = Pacc.data() + (size_t)i * d;
-          for (unsigned int x = 0; x < d; ++x)
-            ol[x] += pa[x];
-        }
-#elif defined(__ARM_NEON)
-        // V-JEPA precision: custom_hgemm reads FP16 Sp16 + FP16 V (cvt-on-
-        // the-fly inside the NEON kernel) -> FP16 Pacc16 with FP32 partial
-        // accumulation. Convert Pacc16 to FP32 when accumulating into Ol.
-        nntrainer::neon::custom_hgemm(
-          reinterpret_cast<const __fp16 *>(Sp16.data()),
-          reinterpret_cast<const __fp16 *>(Vp + (size_t)kb * d),
-          reinterpret_cast<__fp16 *>(Pacc16.data()), bq, d, bk, 1.0f, 0.0f,
-          /*TransA=*/false, /*TransB=*/false);
-        for (unsigned int i = 0; i < bq; ++i) {
-          float *ol = Ol.data() + (size_t)i * d;
-          const uint16_t *pa = Pacc16.data() + (size_t)i * d;
-          unsigned int x = 0;
-          for (; x + 8 <= d; x += 8) {
-            float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(pa + x));
-            float32x4_t lo = vcvt_f32_f16(vget_low_f16(h));
-            float32x4_t hi = vcvt_f32_f16(vget_high_f16(h));
-            vst1q_f32(ol + x, vaddq_f32(vld1q_f32(ol + x), lo));
-            vst1q_f32(ol + x + 4, vaddq_f32(vld1q_f32(ol + x + 4), hi));
+          mha_hsgemm_avx2(bq, d, bk, 1.0f, S.data(), bk,
+                          Vp + (size_t)kb * d, d, /*TransB=*/false,
+                          Pacc.data(), d);
+          for (unsigned int i = 0; i < bq; ++i) {
+            float *ol = Ol.data() + (size_t)i * d;
+            const float *pa = Pacc.data() + (size_t)i * d;
+            for (unsigned int x = 0; x < d; ++x)
+              ol[x] += pa[x];
           }
-          for (; x < d; ++x)
-            ol[x] += nntrainer::compute_fp16_to_fp32(pa[x]);
-        }
+#elif defined(__ARM_NEON)
+          nntrainer::neon::custom_hgemm(
+            reinterpret_cast<const __fp16 *>(Sp16.data()),
+            reinterpret_cast<const __fp16 *>(Vp + (size_t)kb * d),
+            reinterpret_cast<__fp16 *>(Pacc16.data()), bq, d, bk, 1.0f, 0.0f,
+            /*TransA=*/false, /*TransB=*/false);
+          for (unsigned int i = 0; i < bq; ++i) {
+            float *ol = Ol.data() + (size_t)i * d;
+            const uint16_t *pa = Pacc16.data() + (size_t)i * d;
+            unsigned int x = 0;
+            for (; x + 8 <= d; x += 8) {
+              float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(pa + x));
+              float32x4_t lo = vcvt_f32_f16(vget_low_f16(h));
+              float32x4_t hi = vcvt_f32_f16(vget_high_f16(h));
+              vst1q_f32(ol + x, vaddq_f32(vld1q_f32(ol + x), lo));
+              vst1q_f32(ol + x + 4, vaddq_f32(vld1q_f32(ol + x + 4), hi));
+            }
+            for (; x < d; ++x)
+              ol[x] += nntrainer::compute_fp16_to_fp32(pa[x]);
+          }
 #else
-        nntrainer::sgemm(order, false, false, bq, d, bk, 1.0f, S.data(), bk,
-                         Vp + (size_t)kb * d, d, 0.0f, Pacc.data(), d);
-        for (unsigned int i = 0; i < bq; ++i) {
-          float *ol = Ol.data() + (size_t)i * d;
-          const float *pa = Pacc.data() + (size_t)i * d;
-          for (unsigned int x = 0; x < d; ++x)
-            ol[x] += pa[x];
-        }
+          nntrainer::sgemm(order, false, false, bq, d, bk, 1.0f, S.data(), bk,
+                           Vp + (size_t)kb * d, d, 0.0f, Pacc.data(), d);
+          for (unsigned int i = 0; i < bq; ++i) {
+            float *ol = Ol.data() + (size_t)i * d;
+            const float *pa = Pacc.data() + (size_t)i * d;
+            for (unsigned int x = 0; x < d; ++x)
+              ol[x] += pa[x];
+          }
 #endif
+        } // FP32 Q path
       }
       for (unsigned int i = 0; i < bq; ++i) {
         const float inv = (lrow[i] > 0.0f) ? (1.0f / lrow[i]) : 0.0f;
