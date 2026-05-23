@@ -716,6 +716,7 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     dotHalf(input, output, trans, trans_in, beta);
     break;
   case Tdatatype::Q4_0:
+    dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
   default:
     throw std::invalid_argument("Error: unsupported datatype");
