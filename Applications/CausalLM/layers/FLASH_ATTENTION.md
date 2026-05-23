@@ -308,16 +308,26 @@ should not be the case (FP16 is half the bytes), so there is headroom in
 `custom_hgemm` if someone tunes its register/cache blocking — that would
 flip the ranking and make the all-FP16 path strictly faster.
 
-## Qwen3-0.6B benchmarks — final, ENABLE_FP16=1, S25 Ultra
+## Qwen3-0.6B benchmarks — S25 Ultra
 
 (1003-token prefill + 32-token greedy decode, `NNTR_NUM_THREADS=8`,
 `Q4_0-FP32` activation; outputs match the reference path token-for-token.)
 
-| Path                                | Prefill (TPS)   | Decode (TPS)    | e2e      |
-|---|---|---|---|
-| reference (no flash)                | 1 752 ms (572)  | 484 ms (66.1)   | 2 259 ms |
-| flash, Phase-1 Q FP16→FP32 + `shgemm` | 1 535 ms (653) | 586 ms (54.6)\* | 2 149 ms |
-| flash, all-FP16 path (`custom_hgemm`) | 1 656 ms (606) | 486 ms (65.8)   | 2 166 ms |
+| Build      | Path                                  | Prefill (TPS)   | Decode (TPS)    | e2e      |
+|---|---|---|---|---|
+| `ENABLE_FP16=0` | reference (no flash)              | 2 967 ms (338)  | 586 ms (54.6)   | 3 580 ms |
+| `ENABLE_FP16=0` | flash, V-JEPA `shgemm` path       | **1 458 ms (688)** | 583 ms (54.9) | **2 070 ms** |
+| `ENABLE_FP16=1` | reference (no flash)              | 1 752 ms (572)  | 484 ms (66.1)   | 2 259 ms |
+| `ENABLE_FP16=1` | flash, Phase-1 Q FP16→FP32 + `shgemm` | 1 535 ms (653) | 586 ms (54.6)\* | 2 149 ms |
+| `ENABLE_FP16=1` | flash, all-FP16 (`custom_hgemm`)  | 1 656 ms (606)  | 486 ms (65.8)   | 2 166 ms |
+
+The fastest configuration overall is **`ENABLE_FP16=0` + flash**
+(2 070 ms e2e, 688 TPS prefill): `shgemm` keeps QK in FP32 scores,
+and the FP32 reference decode path on this build still beats the
+forwarding() wrap-conversion overhead the `ENABLE_FP16=1` build pays
+per layer. That setting is preserved for benchmarking but the
+production target is `ENABLE_FP16=1` because it matches the FP16
+storage + FP32 partial-accumulation precision the NPU runs at.
 
 \* The Q FP16→FP32 cvt variant happens to take a non-fused decode path
 that runs slower than the all-FP16 decode; per-call decode kernel choice
