@@ -991,9 +991,10 @@ mha_hsgemm_avx2(unsigned int M, unsigned int N, unsigned int K, float alpha,
 // libnntrainer.so is built with ENABLE_FP16=1 and exports these symbols. The
 // CausalLM app may be built with ENABLE_FP16=0, in which case cpu_backend.h
 // hides them behind #ifdef. Re-declare here at global / ::nntrainer scope.
-// - shgemm:       FP32 A × FP16 B -> FP32 C   (FP32 partial accumulation)
-// - custom_hgemm: FP16 A × FP16 B -> FP16 C   (FP32 partial accumulation,
-//                                              FP16-stored result).
+// - shgemm:         FP32 A × FP16 B -> FP32 C   (FP32 partial accumulation)
+// - hgemm_classify: FP16 A × FP16 B -> FP32 C   (FP32 partial accumulation)
+// - custom_hgemm:   FP16 A × FP16 B -> FP16 C   (FP32 partial accumulation,
+//                                                FP16-stored result).
 namespace nntrainer {
 void shgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
             const unsigned int M, const unsigned int N, const unsigned int K,
@@ -1006,6 +1007,9 @@ void custom_hgemm(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
                   bool TransB);
 } // namespace neon
 } // namespace nntrainer
+void hgemm_classify(const __fp16 *A, const __fp16 *B, float *C32,
+                    unsigned int M, unsigned int N, unsigned int K,
+                    float alpha, float beta, bool TransA, bool TransB);
 
 namespace causallm {
 #endif
@@ -1029,8 +1033,33 @@ void MHACoreLayer::gemm_attention(
   const bool windowed = (local_window_size < N_kv);
   const size_t W = static_cast<size_t>(local_window_size);
 
-  const float *Q = query_step.getData<float>();
-  float *O = attention_output_step.getData<float>();
+  // Runtime dtype dispatch: forwarding() may convert Q/V/output to FP16 when
+  // ENABLE_FP16 && __ANDROID__ build. K/V are always FP16 storage.
+  const bool q_fp16 = (query_step.getDataType() ==
+                       ml::train::TensorDim::DataType::FP16);
+  const bool o_fp16 = (attention_output_step.getDataType() ==
+                       ml::train::TensorDim::DataType::FP16);
+
+  const float *Q = nullptr;
+  const uint16_t *Q_fp16_src = nullptr;
+  float *O = nullptr;
+  uint16_t *O_fp16 = nullptr;
+  if (q_fp16) {
+#ifdef ENABLE_FP16
+    Q_fp16_src = reinterpret_cast<const uint16_t *>(
+      query_step.getData<_FP16>());
+#endif
+  } else {
+    Q = query_step.getData<float>();
+  }
+  if (o_fp16) {
+#ifdef ENABLE_FP16
+    O_fp16 = reinterpret_cast<uint16_t *>(
+      attention_output_step.getData<_FP16>());
+#endif
+  } else {
+    O = attention_output_step.getData<float>();
+  }
 
   // tile sizes (cache-resident S); overridable via env for tuning
   unsigned int Bq = 256, Bk = 512;
@@ -1055,20 +1084,31 @@ void MHACoreLayer::gemm_attention(
 #endif
 
   // Phase 1: de-interleave heads once into shared contiguous buffers.
-  // K/V always kept as raw FP16 bits (uint16). Q stays FP32 (V-JEPA precision).
-  // x86 reads K/V via fused AVX2+F16C hsgemm; ARM passes them to native NEON
-  // shgemm (FP32 Q × FP16 K -> FP32) and custom_hgemm.
-  std::vector<float> Qa((size_t)num_heads_Q * N_q * d);
+  // K/V always kept as raw FP16 bits (uint16). Q always materialized as
+  // FP32 so Phase 2 can use shgemm (FP32 Q × FP16 K -> FP32, V-JEPA
+  // precision). If the model arrives with FP16 Q (ENABLE_FP16+Android
+  // build), de-interleave + FP16->FP32 cvt happens in one pass here.
+  std::vector<float> Qa_fp32((size_t)num_heads_Q * N_q * d);
   std::vector<uint16_t> Ka((size_t)num_heads_KV * N_kv * d);
   std::vector<uint16_t> Va((size_t)num_heads_KV * N_kv * d);
   {
-    tm.parallel_for(0, static_cast<size_t>(num_heads_Q), [&](size_t h) {
-      float *qa = Qa.data() + (size_t)h * N_q * d;
-      const float *qh = Q + h * d;
-      for (unsigned int n = 0; n < N_q; ++n)
-        std::memcpy(qa + (size_t)n * d, qh + (size_t)n * HD_Q,
-                    d * sizeof(float));
-    });
+    if (q_fp16) {
+      tm.parallel_for(0, static_cast<size_t>(num_heads_Q), [&](size_t h) {
+        float *qa = Qa_fp32.data() + (size_t)h * N_q * d;
+        const uint16_t *qh = Q_fp16_src + h * d;
+        for (unsigned int n = 0; n < N_q; ++n)
+          mha_convert_fp16bits_to_fp32(d, qh + (size_t)n * HD_Q,
+                                       qa + (size_t)n * d);
+      });
+    } else {
+      tm.parallel_for(0, static_cast<size_t>(num_heads_Q), [&](size_t h) {
+        float *qa = Qa_fp32.data() + (size_t)h * N_q * d;
+        const float *qh = Q + h * d;
+        for (unsigned int n = 0; n < N_q; ++n)
+          std::memcpy(qa + (size_t)n * d, qh + (size_t)n * HD_Q,
+                      d * sizeof(float));
+      });
+    }
     tm.parallel_for(0, static_cast<size_t>(num_heads_KV), [&](size_t hkv) {
       uint16_t *ka = Ka.data() + (size_t)hkv * N_kv * d;
       uint16_t *va = Va.data() + (size_t)hkv * N_kv * d;
@@ -1090,10 +1130,11 @@ void MHACoreLayer::gemm_attention(
       const unsigned int h_kv = h_q / gqa;
       const unsigned int qb = static_cast<unsigned int>(u % num_qb) * Bq;
       const unsigned int bq = std::min(Bq, N_q - qb);
-      const float *Qp = Qa.data() + (size_t)h_q * N_q * d;
+      const float *Qp = Qa_fp32.data() + (size_t)h_q * N_q * d;
       const uint16_t *Kp = Ka.data() + (size_t)h_kv * N_kv * d;
       const uint16_t *Vp = Va.data() + (size_t)h_kv * N_kv * d;
-      float *Oh = O + h_q * d;
+      float *Oh = o_fp16 ? nullptr : (O + h_q * d);
+      uint16_t *Oh_fp16 = o_fp16 ? (O_fp16 + h_q * d) : nullptr;
 
       thread_local std::vector<float> S, Pacc, Ol, mrow, lrow;
       thread_local std::vector<uint16_t> Sp16, Pacc16;
@@ -1137,7 +1178,7 @@ void MHACoreLayer::gemm_attention(
         mha_hsgemm_avx2(bq, bk, d, inv_sqrt, Qp + (size_t)qb * d, d,
                         Kp + (size_t)kb * d, d, /*TransB=*/true, S.data(), bk);
 #elif defined(__ARM_NEON)
-        // V-JEPA precision: shgemm reads K as FP16 directly (no FP32 staging).
+        // V-JEPA precision: shgemm reads K as FP16 directly.
         nntrainer::shgemm(
           order, false, true, bq, bk, d, inv_sqrt, Qp + (size_t)qb * d, d,
           reinterpret_cast<const __fp16 *>(Kp + (size_t)kb * d), d, 0.0f,
@@ -1304,9 +1345,15 @@ void MHACoreLayer::gemm_attention(
       for (unsigned int i = 0; i < bq; ++i) {
         const float inv = (lrow[i] > 0.0f) ? (1.0f / lrow[i]) : 0.0f;
         const float *ol = Ol.data() + (size_t)i * d;
-        float *oh = Oh + (size_t)(qb + i) * HD_Q;
-        for (unsigned int x = 0; x < d; ++x)
-          oh[x] = ol[x] * inv;
+        if (o_fp16) {
+          uint16_t *oh = Oh_fp16 + (size_t)(qb + i) * HD_Q;
+          for (unsigned int x = 0; x < d; ++x)
+            oh[x] = nntrainer::compute_fp32_to_fp16(ol[x] * inv);
+        } else {
+          float *oh = Oh + (size_t)(qb + i) * HD_Q;
+          for (unsigned int x = 0; x < d; ++x)
+            oh[x] = ol[x] * inv;
+        }
       }
     });
 }
