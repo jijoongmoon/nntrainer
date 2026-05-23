@@ -270,3 +270,82 @@ token on some runs (expected behavior).
    per-row dot kernels. The flash path is structurally a poor fit for
    decode (one query row vs. tile size 256), and the reference path is
    already efficient there.
+
+---
+
+## Precision matrix (ARM device)
+
+Three precision configurations are supported, controlled by the
+`ENABLE_FP16` build flag (Android.mk) and (implicitly) the model's
+`model_tensor_type`:
+
+| Build / model                       | Q at gemm_attention | QK kernel        | Score buffer | Softmax            | AV kernel       | Notes |
+|---|---|---|---|---|---|---|
+| `ENABLE_FP16=0`, `Q4_0-FP32`        | FP32                | `shgemm`         | FP32         | NEON exp, FP16 store | `custom_hgemm` | V-JEPA precision. FP16 K/V storage, FP32 partial accum. |
+| `ENABLE_FP16=1`, `Q4_0-FP32`        | FP16 (forwarding cvt) | Phase-1 FP16→FP32 cvt + `shgemm` (current behavior) | FP32 | NEON exp, FP16 store | `custom_hgemm` | mha_core's `forwarding()` wrap-converts Q/K/V/O to FP16; we cvt Q back to FP32 in Phase 1 for the shgemm path. Adds ~100 ms forwarding overhead on 1 K prefill. |
+| `ENABLE_FP16=1`, `Q4_0-FP32`, all-FP16 q_fp16 branch | FP16 | `custom_hgemm` (FP16 × FP16 → FP16) | FP16 | NEON exp in FP32 register, FP16 read+store | `custom_hgemm` | **Reference precision** (matches `compute_kcaches` FP16 path). No FP32 score buffer. |
+
+The default ARM build is now `ENABLE_FP16=1` so the in-CausalLM attention
+runs at the same FP16 storage + FP32 partial accumulation precision the
+NPU target uses.
+
+## Kernel profile (S25 Ultra, Qwen3-0.6B Q4_0, 1003-token prefill)
+
+Wall-clock time aggregated across all 2 688 QK GEMM calls per inference
+(`std::chrono::steady_clock`, summed across 8 worker threads):
+
+| QK kernel                  | Aggregate QK time | Per call | Prefill total |
+|---|---|---|---|
+| `nntrainer::shgemm`        | 1 649 ms          | 613 µs   | 1 535 ms      |
+| `nntrainer::neon::custom_hgemm` | 2 295 ms          | 854 µs   | 1 656 ms      |
+
+`shgemm` (which internally does `scopy(FP16→FP32) + __cblas_sgemm`) is
+**~28 % faster per call** than `custom_hgemm` on these shapes
+(M=256, K=128, N=512 for QK; M=256, K=512, N=128 for AV). The OpenBLAS
+sgemm micro-kernel out-tunes the in-tree custom NEON FP16 GEMM despite
+having to widen K to FP32 before the multiply. Per memory bandwidth this
+should not be the case (FP16 is half the bytes), so there is headroom in
+`custom_hgemm` if someone tunes its register/cache blocking — that would
+flip the ranking and make the all-FP16 path strictly faster.
+
+## Qwen3-0.6B benchmarks — final, ENABLE_FP16=1, S25 Ultra
+
+(1003-token prefill + 32-token greedy decode, `NNTR_NUM_THREADS=8`,
+`Q4_0-FP32` activation; outputs match the reference path token-for-token.)
+
+| Path                                | Prefill (TPS)   | Decode (TPS)    | e2e      |
+|---|---|---|---|
+| reference (no flash)                | 1 752 ms (572)  | 484 ms (66.1)   | 2 259 ms |
+| flash, Phase-1 Q FP16→FP32 + `shgemm` | 1 535 ms (653) | 586 ms (54.6)\* | 2 149 ms |
+| flash, all-FP16 path (`custom_hgemm`) | 1 656 ms (606) | 486 ms (65.8)   | 2 166 ms |
+
+\* The Q FP16→FP32 cvt variant happens to take a non-fused decode path
+that runs slower than the all-FP16 decode; per-call decode kernel choice
+matters more than prefill kernel choice for total e2e.
+
+The all-FP16 path is currently slower than the FP16→FP32+shgemm variant
+purely because of the `custom_hgemm` vs `shgemm` kernel gap measured
+above; matching the reference precision (FP16 storage throughout) costs
+~120 ms / 1 K prefill but is what NPU deployment wants.
+
+## Failed experiment — model-wide FP16 activation (`Q4_0-FP16`)
+
+We tried switching `model_tensor_type` from `Q4_0-FP32` to `Q4_0-FP16`
+to eliminate the per-layer FP32↔FP16 wrap-conversion inside
+`mha_core::forwarding()`. This requires:
+
+1. Lifting the embedding layer's hard FP32 input check (done in
+   commit `0ff355c2`).
+2. Keeping the token-ID input itself FP32 — vocab ≈ 150 k cannot fit in
+   FP16's effective integer range (2048), so any ID > 2048 rounds into
+   garbage and trips the embedding bounds check.
+3. Every downstream layer's FP16 codepath being correct end-to-end.
+
+We made (1) and (2) work locally, but the model still segfaulted at
+runtime in some FP16 codepath we could not pinpoint without root-level
+symbol resolution on the device. Searching the repository, **no
+CausalLM model in `res/` declares a `-FP16` activation
+`model_tensor_type`**, so this path appears to be unmaintained for
+the CausalLM stack. Tracked as future work; the embedding-side check
+removal is preserved upstream-friendly even though the rest of the
+chain still needs work.
