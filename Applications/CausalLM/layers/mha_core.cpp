@@ -217,13 +217,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
   use_gemm_attention =
-    std::get<props::UseGemmAttention>(mha_core_props).get() && !is_causal;
-#if !defined(ENABLE_FP16)
-  // The GEMM attention path is tuned/validated for the ARM FP16-cache build
-  // (shgemm QK + FP16 hgemm AV). The plain-FP32 (x86) variant is unverified, so
-  // fall back to the reference attention there.
-  use_gemm_attention = false;
-#endif
+    std::get<props::UseGemmAttention>(mha_core_props).get();
 
   /** Tensor for KV-Cache (only allocate internally when not using external
    * cache) */
@@ -765,11 +759,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
-  // Optional GEMM attention path (non-causal encoder). Avoids the full
-  // [seq x seq x num_heads] score buffer and the per-row dot kernels.
-  if (use_gemm_attention && gqa_size == 1) {
-    gemm_attention_noncausal(query_step, b_cached_key, b_cached_value,
-                             attention_output_step, cache_to);
+  // Optional flash GEMM attention path. Handles both non-causal (encoder)
+  // and causal-prefill paths, supports GQA and sliding window. Gated on a
+  // minimum prefill length: for decode (step_size == 1) the per-row dot
+  // path is preferred (no benefit from blocking + softmax bookkeeping).
+  constexpr unsigned int FLASH_MIN_PREFILL = 32;
+  if (use_gemm_attention && step_size >= FLASH_MIN_PREFILL) {
+    gemm_attention(query_step, b_cached_key, b_cached_value,
+                   attention_output_step, cache_to, step_size, cache_from);
     return;
   }
 
@@ -790,7 +787,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                 cache_to);
 }
 
-#if defined(ENABLE_FP16) && defined(__ARM_NEON)
+#if defined(__ARM_NEON)
 #include <arm_neon.h>
 // Cephes exp() for 4 floats at once (matches neon_mathfun.hxx exp_ps).
 static inline float32x4_t vjepa_expq_f32(float32x4_t x) {
@@ -825,26 +822,190 @@ static inline float32x4_t vjepa_expq_f32(float32x4_t x) {
 }
 #endif
 
-void MHACoreLayer::gemm_attention_noncausal(
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
+// Bulk convert N FP16-bits (uint16_t) values to FP32. Uses AVX2+F16C on x86
+// (_mm256_cvtph_ps, available on Ivy Bridge+) and NEON fp16<->fp32 instructions
+// on ARMv8.2+. Falls back to scalar nntrainer::compute_fp16_to_fp32. Treats the
+// uint16 input as raw IEEE 754 half-precision bits — this is how the KV cache
+// is stored regardless of ENABLE_FP16 build flag.
+static inline void mha_convert_fp16bits_to_fp32(unsigned int N,
+                                                const uint16_t *src,
+                                                float *dst) {
+#if defined(__x86_64__) || defined(__i386__)
+  unsigned int i = 0;
+  for (; i + 16 <= N; i += 16) {
+    __m256 a =
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + i)));
+    __m256 b =
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + i + 8)));
+    _mm256_storeu_ps(dst + i, a);
+    _mm256_storeu_ps(dst + i + 8, b);
+  }
+  for (; i + 8 <= N; i += 8) {
+    _mm256_storeu_ps(
+      dst + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + i))));
+  }
+  for (; i < N; ++i)
+    dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
+#elif defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+  unsigned int i = 0;
+  for (; i + 8 <= N; i += 8) {
+    float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(src + i));
+    vst1q_f32(dst + i, vcvt_f32_f16(vget_low_f16(h)));
+    vst1q_f32(dst + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+  }
+  for (; i < N; ++i)
+    dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
+#else
+  for (unsigned int i = 0; i < N; ++i)
+    dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
+#endif
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+
+// Fused FP32 x FP16-bits -> FP32 GEMM for x86 (AVX2 + F16C). Equivalent of ARM
+// shgemm but reads FP16-bits (uint16_t) directly without materializing an FP32
+// copy of B — saves the temporary buffer and halves memory traffic compared to
+// {convert+sgemm}. Row-major only, alpha applied, beta hard-coded to 0 to keep
+// the kernel small (this is all the flash path needs).
+//
+// Two operand layouts:
+//   TransB=true  (QK): C[m, n] = alpha * sum_k A[m,k] * fp16(B[n,k])
+//                       B is N rows x K cols, row-major, ldb columns
+//   TransB=false (AV): C[m, n] = alpha * sum_k A[m,k] * fp16(B[k,n])
+//                       B is K rows x N cols, row-major, ldb columns
+static inline void
+mha_hsgemm_avx2(unsigned int M, unsigned int N, unsigned int K, float alpha,
+                const float *A, unsigned int lda, const uint16_t *B,
+                unsigned int ldb, bool TransB, float *C, unsigned int ldc) {
+  const __m256 valpha = _mm256_set1_ps(alpha);
+  if (TransB) {
+    // QK path. Block 4 m-rows so we amortize the B (K-row) conversion across 4
+    // accumulators per inner k-step.
+    unsigned int m = 0;
+    for (; m + 4 <= M; m += 4) {
+      const float *a0 = A + (size_t)(m + 0) * lda;
+      const float *a1 = A + (size_t)(m + 1) * lda;
+      const float *a2 = A + (size_t)(m + 2) * lda;
+      const float *a3 = A + (size_t)(m + 3) * lda;
+      for (unsigned int n = 0; n < N; ++n) {
+        const uint16_t *b_row = B + (size_t)n * ldb;
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        unsigned int k = 0;
+        for (; k + 8 <= K; k += 8) {
+          __m256 b = _mm256_cvtph_ps(
+            _mm_loadu_si128((const __m128i *)(b_row + k)));
+          acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a0 + k), b, acc0);
+          acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a1 + k), b, acc1);
+          acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a2 + k), b, acc2);
+          acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a3 + k), b, acc3);
+        }
+        // Horizontal-reduce 4 accumulators in parallel via two hadd-pairs.
+        // acc0 = [s00 s01 s02 s03 | s04 s05 s06 s07] -> partial sums
+        __m256 h01 = _mm256_hadd_ps(acc0, acc1);
+        __m256 h23 = _mm256_hadd_ps(acc2, acc3);
+        __m256 h = _mm256_hadd_ps(h01, h23);
+        // h lanes: [s0_lo s1_lo s2_lo s3_lo | s0_hi s1_hi s2_hi s3_hi]
+        __m128 lo = _mm256_castps256_ps128(h);
+        __m128 hi = _mm256_extractf128_ps(h, 1);
+        __m128 sums = _mm_add_ps(lo, hi); // [s0 s1 s2 s3]
+        float s[4];
+        _mm_storeu_ps(s, sums);
+        // tail k
+        for (; k < K; ++k) {
+          const float bv = nntrainer::compute_fp16_to_fp32(b_row[k]);
+          s[0] += a0[k] * bv;
+          s[1] += a1[k] * bv;
+          s[2] += a2[k] * bv;
+          s[3] += a3[k] * bv;
+        }
+        C[(size_t)(m + 0) * ldc + n] = alpha * s[0];
+        C[(size_t)(m + 1) * ldc + n] = alpha * s[1];
+        C[(size_t)(m + 2) * ldc + n] = alpha * s[2];
+        C[(size_t)(m + 3) * ldc + n] = alpha * s[3];
+      }
+    }
+    // m tail (unblocked)
+    for (; m < M; ++m) {
+      const float *a_row = A + (size_t)m * lda;
+      for (unsigned int n = 0; n < N; ++n) {
+        const uint16_t *b_row = B + (size_t)n * ldb;
+        __m256 acc = _mm256_setzero_ps();
+        unsigned int k = 0;
+        for (; k + 8 <= K; k += 8) {
+          __m256 a = _mm256_loadu_ps(a_row + k);
+          __m256 b = _mm256_cvtph_ps(
+            _mm_loadu_si128((const __m128i *)(b_row + k)));
+          acc = _mm256_fmadd_ps(a, b, acc);
+        }
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        float sum = _mm_cvtss_f32(s);
+        for (; k < K; ++k)
+          sum += a_row[k] * nntrainer::compute_fp16_to_fp32(b_row[k]);
+        C[(size_t)m * ldc + n] = alpha * sum;
+      }
+    }
+  } else {
+    // AV path. Block n in 8-wide vector lanes; broadcast A[m,k] inside loop.
+    for (unsigned int m = 0; m < M; ++m) {
+      const float *a_row = A + (size_t)m * lda;
+      float *c_row = C + (size_t)m * ldc;
+      unsigned int n = 0;
+      for (; n + 8 <= N; n += 8) {
+        __m256 acc = _mm256_setzero_ps();
+        for (unsigned int k = 0; k < K; ++k) {
+          __m256 a_b = _mm256_set1_ps(a_row[k]);
+          __m256 b = _mm256_cvtph_ps(
+            _mm_loadu_si128((const __m128i *)(B + (size_t)k * ldb + n)));
+          acc = _mm256_fmadd_ps(a_b, b, acc);
+        }
+        _mm256_storeu_ps(c_row + n, _mm256_mul_ps(valpha, acc));
+      }
+      // n tail
+      for (; n < N; ++n) {
+        float sum = 0.0f;
+        for (unsigned int k = 0; k < K; ++k)
+          sum += a_row[k] * nntrainer::compute_fp16_to_fp32(B[(size_t)k * ldb + n]);
+        c_row[n] = alpha * sum;
+      }
+    }
+  }
+}
+
+#endif // __x86_64__ || __i386__
+
+void MHACoreLayer::gemm_attention(
   nntrainer::Tensor &query_step, nntrainer::Tensor &b_cached_key,
   nntrainer::Tensor &b_cached_value,
-  nntrainer::Tensor &attention_output_step, unsigned int seq_len) {
-  const unsigned int N = seq_len;
+  nntrainer::Tensor &attention_output_step, unsigned int N_kv, unsigned int N_q,
+  unsigned int cache_from) {
   const unsigned int d = head_dim;
-  const unsigned int HD = num_heads_Q * d; // row stride (interleaved heads)
+  const unsigned int HD_Q = num_heads_Q * d;
+  const unsigned int HD_KV = num_heads_KV * d;
+  const unsigned int gqa = (num_heads_KV > 0)
+                             ? static_cast<unsigned int>(num_heads_Q / num_heads_KV)
+                             : 1u;
   const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(d));
   const unsigned int order =
     static_cast<unsigned int>(query_step.getDim().getStorageOrder());
+  const bool causal = is_causal;
+  // Treat any local_window_size >= cache length as "no window".
+  const bool windowed = (local_window_size < N_kv);
+  const size_t W = static_cast<size_t>(local_window_size);
 
   const float *Q = query_step.getData<float>();
   float *O = attention_output_step.getData<float>();
-
-  // Flash attention, parallelized over heads (one head per worker; shgemm is
-  // single-threaded so this uses all cores). 2D tiling (query block x key
-  // block) with an online (running max/sum) softmax: only [Bq x Bk] scores
-  // exist at a time, so the O(N^2) score buffer and its RAM round-trip are
-  // avoided. QK uses shgemm (FP32 Q x FP16 K -> FP32; block0 logits ~457k
-  // overflow FP16) and AV uses shgemm (FP32 probs x FP16 V).
 
   // tile sizes (cache-resident S); overridable via env for tuning
   unsigned int Bq = 256, Bk = 512;
@@ -853,46 +1014,87 @@ void MHACoreLayer::gemm_attention_noncausal(
   if (const char *e = std::getenv("VJEPA_BK"))
     Bk = static_cast<unsigned int>(std::stoul(e));
 
-  const unsigned int num_qb = (N + Bq - 1) / Bq;
+  const unsigned int num_qb = (N_q + Bq - 1) / Bq;
   auto &tm = nntrainer::ThreadManager::Global();
 
+  // Cache always stores half-precision (FP16-bit) values; read as raw uint16_t
+  // bits so we don't depend on ENABLE_FP16 / _FP16 / _Float16 being defined.
+  const uint16_t *Kbase;
+  const uint16_t *Vbase;
 #ifdef ENABLE_FP16
-  // Phase 1: de-interleave heads once into shared contiguous [H, N, d] buffers
-  // (Q FP32, K/V FP16). Parallel over heads.
-  std::vector<float> Qa((size_t)num_heads_Q * N * d);
-  std::vector<_FP16> Ka((size_t)num_heads_Q * N * d);
-  std::vector<_FP16> Va((size_t)num_heads_Q * N * d);
+  Kbase = reinterpret_cast<const uint16_t *>(b_cached_key.getData<_FP16>());
+  Vbase = reinterpret_cast<const uint16_t *>(b_cached_value.getData<_FP16>());
+#else
+  Kbase = b_cached_key.getData<uint16_t>();
+  Vbase = b_cached_value.getData<uint16_t>();
+#endif
+
+  // Phase 1: de-interleave heads once into shared contiguous buffers.
+  // Q uses num_heads_Q heads (FP32). K/V use num_heads_KV heads (GQA-aware).
+  // On x86 we keep K/V in FP16-bits (uint16_t) and convert inline inside the
+  // fused hsgemm kernel — saves ~14MB FP32 staging memory and one full pass
+  // over K/V. On other arches we materialize FP32 K/V so Phase 2 can use
+  // generic nntrainer::sgemm.
+  std::vector<float> Qa((size_t)num_heads_Q * N_q * d);
+#if defined(__x86_64__) || defined(__i386__)
+  std::vector<uint16_t> Ka((size_t)num_heads_KV * N_kv * d);
+  std::vector<uint16_t> Va((size_t)num_heads_KV * N_kv * d);
+#else
+  std::vector<float> Ka((size_t)num_heads_KV * N_kv * d);
+  std::vector<float> Va((size_t)num_heads_KV * N_kv * d);
+#endif
   {
-    const _FP16 *Kbase = b_cached_key.getData<_FP16>();
-    const _FP16 *Vbase = b_cached_value.getData<_FP16>();
     tm.parallel_for(0, static_cast<size_t>(num_heads_Q), [&](size_t h) {
-      float *qa = Qa.data() + (size_t)h * N * d;
-      _FP16 *ka = Ka.data() + (size_t)h * N * d;
-      _FP16 *va = Va.data() + (size_t)h * N * d;
+      float *qa = Qa.data() + (size_t)h * N_q * d;
       const float *qh = Q + h * d;
-      const _FP16 *kh = Kbase + h * d;
-      const _FP16 *vh = Vbase + h * d;
-      for (unsigned int n = 0; n < N; ++n) {
-        std::memcpy(qa + (size_t)n * d, qh + (size_t)n * HD, d * sizeof(float));
-        std::memcpy(ka + (size_t)n * d, kh + (size_t)n * HD, d * sizeof(_FP16));
-        std::memcpy(va + (size_t)n * d, vh + (size_t)n * HD, d * sizeof(_FP16));
+      for (unsigned int n = 0; n < N_q; ++n)
+        std::memcpy(qa + (size_t)n * d, qh + (size_t)n * HD_Q,
+                    d * sizeof(float));
+    });
+    tm.parallel_for(0, static_cast<size_t>(num_heads_KV), [&](size_t hkv) {
+#if defined(__x86_64__) || defined(__i386__)
+      uint16_t *ka = Ka.data() + (size_t)hkv * N_kv * d;
+      uint16_t *va = Va.data() + (size_t)hkv * N_kv * d;
+      const uint16_t *kh = Kbase + hkv * d;
+      const uint16_t *vh = Vbase + hkv * d;
+      for (unsigned int n = 0; n < N_kv; ++n) {
+        std::memcpy(ka + (size_t)n * d, kh + (size_t)n * HD_KV,
+                    d * sizeof(uint16_t));
+        std::memcpy(va + (size_t)n * d, vh + (size_t)n * HD_KV,
+                    d * sizeof(uint16_t));
       }
+#else
+      float *ka = Ka.data() + (size_t)hkv * N_kv * d;
+      float *va = Va.data() + (size_t)hkv * N_kv * d;
+      const uint16_t *kh = Kbase + hkv * d;
+      const uint16_t *vh = Vbase + hkv * d;
+      for (unsigned int n = 0; n < N_kv; ++n) {
+        mha_convert_fp16bits_to_fp32(d, kh + (size_t)n * HD_KV,
+                                     ka + (size_t)n * d);
+        mha_convert_fp16bits_to_fp32(d, vh + (size_t)n * HD_KV,
+                                     va + (size_t)n * d);
+      }
+#endif
     });
   }
 
-  // Phase 2: flash attention over balanced (head x query-block) work units so
-  // all workers stay busy (num_heads is not a multiple of the worker count).
+  // Phase 2: flash attention over balanced (h_q, query-block) work units.
   tm.parallel_for(
     0, static_cast<size_t>(num_heads_Q) * num_qb, [&](size_t u) {
-      const unsigned int h = static_cast<unsigned int>(u / num_qb);
+      const unsigned int h_q = static_cast<unsigned int>(u / num_qb);
+      const unsigned int h_kv = h_q / gqa;
       const unsigned int qb = static_cast<unsigned int>(u % num_qb) * Bq;
-      const unsigned int bq = std::min(Bq, N - qb);
-      const float *Qp = Qa.data() + (size_t)h * N * d;
-      const _FP16 *Kp = Ka.data() + (size_t)h * N * d;
-      const _FP16 *Vp = Va.data() + (size_t)h * N * d;
-      float *Oh = O + h * d;
+      const unsigned int bq = std::min(Bq, N_q - qb);
+      const float *Qp = Qa.data() + (size_t)h_q * N_q * d;
+#if defined(__x86_64__) || defined(__i386__)
+      const uint16_t *Kp = Ka.data() + (size_t)h_kv * N_kv * d;
+      const uint16_t *Vp = Va.data() + (size_t)h_kv * N_kv * d;
+#else
+      const float *Kp = Ka.data() + (size_t)h_kv * N_kv * d;
+      const float *Vp = Va.data() + (size_t)h_kv * N_kv * d;
+#endif
+      float *Oh = O + h_q * d;
 
-      // per-thread scratch, reused across work units (no per-unit alloc)
       thread_local std::vector<float> S, Pacc, Ol, mrow, lrow;
       S.resize((size_t)Bq * Bk);
       Pacc.resize((size_t)Bq * d);
@@ -906,15 +1108,75 @@ void MHACoreLayer::gemm_attention_noncausal(
         lrow[i] = 0.0f;
       }
 
-      for (unsigned int kb = 0; kb < N; kb += Bk) {
-        const unsigned int bk = std::min(Bk, N - kb);
-        nntrainer::shgemm(order, false, true, bq, bk, d, inv_sqrt,
-                          Qp + (size_t)qb * d, d, Kp + (size_t)kb * d, d, 0.0f,
-                          S.data(), bk);
+      // The absolute query positions in this work unit are
+      // [cache_from + qb, cache_from + qb + bq).
+      const size_t q_abs_lo = (size_t)cache_from + qb;
+      const size_t q_abs_hi = q_abs_lo + bq - 1; // inclusive
+
+      for (unsigned int kb = 0; kb < N_kv; kb += Bk) {
+        const unsigned int bk = std::min(Bk, N_kv - kb);
+
+        // Causal upper-bound block-skip: smallest k_abs in block > largest
+        // q_abs -> this and all later key blocks contribute nothing.
+        if (causal && (size_t)kb > q_abs_hi)
+          break;
+
+        // Sliding-window lower-bound block-skip: largest k_abs in block <
+        // smallest visible threshold (q_abs_lo - W + 1, i.e., k_abs must
+        // satisfy k_abs > q_abs - W).
+        if (windowed && (size_t)kb + bk + W <= q_abs_lo + 1)
+          continue;
+
+#if defined(__x86_64__) || defined(__i386__)
+        // Fused AVX2+F16C QK: FP32 Q x FP16-bits K -> FP32 S (TransB=true).
+        mha_hsgemm_avx2(bq, bk, d, inv_sqrt, Qp + (size_t)qb * d, d,
+                        Kp + (size_t)kb * d, d, /*TransB=*/true, S.data(), bk);
+#else
+        nntrainer::sgemm(order, false, true, bq, bk, d, inv_sqrt,
+                         Qp + (size_t)qb * d, d, Kp + (size_t)kb * d, d, 0.0f,
+                         S.data(), bk);
+#endif
+
+        // Does this block straddle the causal diagonal for any row?
+        const bool causal_boundary =
+          causal && ((size_t)kb + bk > q_abs_lo + 1);
+        // Does this block straddle the sliding-window lower bound for any row?
+        const bool window_boundary =
+          windowed && ((size_t)kb + W < q_abs_hi + 1);
 
         for (unsigned int i = 0; i < bq; ++i) {
           float *s = S.data() + (size_t)i * bk;
+          const long long q_abs = (long long)cache_from + qb + i;
+
+          if (causal_boundary) {
+            // valid k: kb + k <= q_abs -> k <= q_abs - kb
+            long long valid_count_ll = q_abs + 1 - (long long)kb;
+            unsigned int valid_count =
+              (valid_count_ll <= 0)
+                ? 0u
+                : (valid_count_ll >= (long long)bk
+                     ? bk
+                     : (unsigned int)valid_count_ll);
+            for (unsigned int k = valid_count; k < bk; ++k)
+              s[k] = -INFINITY;
+          }
+          if (window_boundary) {
+            // valid k: kb + k > q_abs - W -> k > q_abs - W - kb
+            long long first_valid_ll =
+              q_abs - (long long)W - (long long)kb + 1;
+            unsigned int first_valid =
+              (first_valid_ll <= 0)
+                ? 0u
+                : (first_valid_ll >= (long long)bk
+                     ? bk
+                     : (unsigned int)first_valid_ll);
+            for (unsigned int k = 0; k < first_valid; ++k)
+              s[k] = -INFINITY;
+          }
+
+          // Block max (row-wise)
           float bm = -3.0e38f;
+#if defined(__ARM_NEON)
           {
             float32x4_t vmx = vdupq_n_f32(-3.0e38f);
             unsigned int k = 0;
@@ -924,14 +1186,20 @@ void MHACoreLayer::gemm_attention_noncausal(
             for (; k < bk; ++k)
               bm = std::max(bm, s[k]);
           }
+#else
+          for (unsigned int k = 0; k < bk; ++k)
+            bm = std::max(bm, s[k]);
+#endif
           const float nm = std::max(mrow[i], bm);
           const float c = std::exp(mrow[i] - nm);
           float bs = 0.0f;
+#if defined(__ARM_NEON)
           {
             float32x4_t vsum = vdupq_n_f32(0.0f), vnm = vdupq_n_f32(nm);
             unsigned int k = 0;
             for (; k + 4 <= bk; k += 4) {
-              float32x4_t e = vjepa_expq_f32(vsubq_f32(vld1q_f32(s + k), vnm));
+              float32x4_t e =
+                vjepa_expq_f32(vsubq_f32(vld1q_f32(s + k), vnm));
               vst1q_f32(s + k, e);
               vsum = vaddq_f32(vsum, e);
             }
@@ -942,6 +1210,13 @@ void MHACoreLayer::gemm_attention_noncausal(
               bs += e;
             }
           }
+#else
+          for (unsigned int k = 0; k < bk; ++k) {
+            float e = std::exp(s[k] - nm);
+            s[k] = e;
+            bs += e;
+          }
+#endif
           lrow[i] = lrow[i] * c + bs;
           mrow[i] = nm;
           float *ol = Ol.data() + (size_t)i * d;
@@ -949,8 +1224,14 @@ void MHACoreLayer::gemm_attention_noncausal(
             ol[x] *= c;
         }
 
-        nntrainer::shgemm(order, false, false, bq, d, bk, 1.0f, S.data(), bk,
-                          Vp + (size_t)kb * d, d, 0.0f, Pacc.data(), d);
+#if defined(__x86_64__) || defined(__i386__)
+        // Fused AVX2+F16C AV: FP32 S x FP16-bits V -> FP32 Pacc (TransB=false).
+        mha_hsgemm_avx2(bq, d, bk, 1.0f, S.data(), bk, Vp + (size_t)kb * d, d,
+                        /*TransB=*/false, Pacc.data(), d);
+#else
+        nntrainer::sgemm(order, false, false, bq, d, bk, 1.0f, S.data(), bk,
+                         Vp + (size_t)kb * d, d, 0.0f, Pacc.data(), d);
+#endif
         for (unsigned int i = 0; i < bq; ++i) {
           float *ol = Ol.data() + (size_t)i * d;
           const float *pa = Pacc.data() + (size_t)i * d;
@@ -959,23 +1240,13 @@ void MHACoreLayer::gemm_attention_noncausal(
         }
       }
       for (unsigned int i = 0; i < bq; ++i) {
-        const float inv = 1.0f / lrow[i];
+        const float inv = (lrow[i] > 0.0f) ? (1.0f / lrow[i]) : 0.0f;
         const float *ol = Ol.data() + (size_t)i * d;
-        float *oh = Oh + (size_t)(qb + i) * HD;
+        float *oh = Oh + (size_t)(qb + i) * HD_Q;
         for (unsigned int x = 0; x < d; ++x)
           oh[x] = ol[x] * inv;
       }
     });
-#else
-  (void)Q;
-  (void)O;
-  (void)HD;
-  (void)inv_sqrt;
-  (void)order;
-  (void)num_qb;
-  (void)tm;
-  (void)Bk;
-#endif
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
