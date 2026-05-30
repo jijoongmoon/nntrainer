@@ -157,6 +157,7 @@ protected:
    *        cache_k_l<i> / cache_v_l<i> via Model::setExternalTensors.
    */
   KVCacheManager kv_cache;
+  bool kv_cache_bound = false; /**< True once KV cache tensors are bound */
 
   /**
    * @brief Allocate kv_cache and bind it to all mha_core layers via

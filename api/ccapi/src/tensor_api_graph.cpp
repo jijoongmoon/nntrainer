@@ -406,8 +406,49 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
     std::string leaf_shape = std::to_string(leaf_info.dim.channel()) + ":" +
                              std::to_string(leaf_info.dim.height()) + ":" +
                              std::to_string(leaf_info.dim.width());
-    auto leaf_layer =
-      createLayer("input", {"name=" + leaf_name, "input_shape=" + leaf_shape});
+    auto dtype_to_str = [](nntrainer::TensorDim::DataType dt) -> const char * {
+      using DT = nntrainer::TensorDim::DataType;
+      switch (dt) {
+      case DT::FP32:
+        return "FP32";
+      case DT::FP16:
+        return "FP16";
+      case DT::QINT4:
+        return "QINT4";
+      case DT::QINT8:
+        return "QINT8";
+      case DT::QINT16:
+        return "QINT16";
+      case DT::UINT4:
+        return "UINT4";
+      case DT::UINT8:
+        return "UINT8";
+      case DT::UINT16:
+        return "UINT16";
+      case DT::Q4_0:
+        return "Q4_0";
+      case DT::Q4_K:
+        return "Q4_K";
+      case DT::Q6_K:
+        return "Q6_K";
+      case DT::BCQ:
+        return "BCQ";
+      default:
+        return "FP32";
+      }
+    };
+    std::vector<std::string> leaf_props = {"name=" + leaf_name,
+                                           "input_shape=" + leaf_shape};
+    // Only emit input_dtype when the leaf tensor explicitly carries a
+    // dtype other than FP32 — the input layer already defaults to the
+    // model's activation dtype, and threading FP32 through redundantly
+    // would shadow that default for callers that intentionally inherit
+    // it (the existing single-input "graph_input" path).
+    if (leaf_info.dim.getDataType() != nntrainer::TensorDim::DataType::FP32) {
+      leaf_props.push_back(std::string("input_dtype=") +
+                           dtype_to_str(leaf_info.dim.getDataType()));
+    }
+    auto leaf_layer = createLayer("input", leaf_props);
     status = addLayer(std::move(leaf_layer));
     if (status != ML_ERROR_NONE) {
       return status;

@@ -27,6 +27,9 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/timm_vit \
+    $(LOCAL_PATH)/../models/deberta_v2 \
+    $(LOCAL_PATH)/../third_party/minja/include \
+    $(LOCAL_PATH)/../third_party \
 
 # Prebuilt nntrainer libraries
 include $(CLEAR_VARS)
@@ -94,6 +97,9 @@ LOCAL_SRC_FILES := \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma3/function.cpp \
     ../models/timm_vit/timm_vit_transformer.cpp \
+    ../models/deberta_v2/deberta_v2.cpp \
+    ../layers/deberta_attention_layer.cpp \
+    ../layers/shared_fully_connected_layer.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -219,6 +225,10 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
+    ../models/gemma3/function.cpp \
+    ../models/deberta_v2/deberta_v2.cpp \
+    ../layers/deberta_attention_layer.cpp \
+    ../layers/shared_fully_connected_layer.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -235,5 +245,6 @@ LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
     $(LOCAL_PATH)/../models/gemma3 \
+    $(LOCAL_PATH)/../models/deberta_v2 \
 
 include $(BUILD_EXECUTABLE)

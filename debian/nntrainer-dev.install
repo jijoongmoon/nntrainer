@@ -65,6 +65,7 @@
 /usr/include/nntrainer/singleton.h
 /usr/include/nntrainer/thread_manager.h
 /usr/include/nntrainer/thread_manager_util.h
+/usr/include/nntrainer/safetensors_util.h
 /usr/include/nntrainer/fp16.h
 /usr/include/nntrainer/util_simd.h
 /usr/include/nntrainer/dynamic_library_loader.h

@@ -121,7 +121,11 @@ void CausalLM::allocateAndBindKVCache() {
                       max_timestep,
                       static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
                       static_cast<unsigned int>(HEAD_DIM), cache_dtype);
+    kv_cache_bound = false;
   }
+
+  if (kv_cache_bound)
+    return;
 
   // Bind each (layer, K|V) buffer into the corresponding input layer
   // declared by Transformer::createKVCachePlaceholders(). The names here
@@ -162,6 +166,8 @@ void CausalLM::allocateAndBindKVCache() {
     kp->setData(kc.getMemoryData(), kc.getOffset(), false);
     vp->setData(vc.getMemoryData(), vc.getOffset(), false);
   }
+
+  kv_cache_bound = true;
 }
 
 void CausalLM::setKVCachePosition(unsigned int pos) {

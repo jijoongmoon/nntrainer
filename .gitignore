@@ -25,6 +25,9 @@ Applications/**/data
 cifar-100-binary*
 Applications/**/*.bin
 Applications/**/res/*
+!Applications/CausalLM/res/deberta_v2/
+Applications/CausalLM/res/deberta_v2/*
+!Applications/CausalLM/res/deberta_v2/weight_converter.py
 Applications/**/tokenizers-cpp-build/*
 
 # CTag

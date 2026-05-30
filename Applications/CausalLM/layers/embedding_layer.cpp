@@ -174,7 +174,8 @@ void EmbeddingLayer::exportTo(nntrainer::Exporter &exporter,
 void EmbeddingLayer::save(std::ofstream &file,
                           nntrainer::RunLayerContext &run_context, bool opt_var,
                           ml::train::ExecutionMode mode, bool trainable,
-                          nntrainer::TensorDim::DataType dtype) const {
+                          nntrainer::TensorDim::DataType dtype,
+                          ml::train::ISA target_isa) const {
   // @note shared weights are only be saved at the first access
   for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
     if (run_context.isGradientFirstAccess(i)) {

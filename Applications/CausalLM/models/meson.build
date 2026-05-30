@@ -6,6 +6,7 @@ causallm_src += [
 
 causallm_inc += include_directories('.')
 
+subdir('deberta_v2')
 subdir('gpt_oss')
 subdir('qwen2')
 subdir('qwen3')

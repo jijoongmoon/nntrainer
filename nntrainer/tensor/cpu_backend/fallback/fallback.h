@@ -15,6 +15,7 @@
 #define __FALLBACK_H__
 #ifdef __cplusplus
 
+#include <common.h>
 #include <cstdint>
 #include <limits.h>
 #include <limits>
@@ -1228,7 +1229,7 @@ template <typename T = float>
 void quantize_row_q8_K(const T *x, void *y, int64_t k);
 
 /**
- * @brief repack q40 to q40x8
+ * @brief repack q40 to q40x8 or q40x4 depending on target ISA
  *
  * @param dst output repacked q40x8
  * @param src input q40
@@ -1259,9 +1260,12 @@ void repack_q4_K_to_q4_K_8(void *dst, void *src, size_t data_size,
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
+ * @param target target ISA format (DEFAULT uses current backend, X86 forces
+ * x86 format, ARM forces ARM format)
  */
 void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
-                 const unsigned int N);
+                 const unsigned int N,
+                 ml::train::ISA target = ml::train::ISA::DEFAULT);
 
 /**
  * @brief unpack q40x8 to q40 - invers method: repack_q4_0

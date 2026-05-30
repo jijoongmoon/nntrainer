@@ -13,6 +13,8 @@ executable_src = [
 
 causallm_inc_abs = [meson.current_source_dir()]
 causallm_inc = [include_directories('.')]
+causallm_inc_minja_inc = include_directories('third_party/minja/include')
+causallm_inc_nlohmann_inc = include_directories('third_party')
 
 # Build layer dependency
 causallm_layer_dependencies = []
@@ -31,6 +33,8 @@ causallm_layer_dependencies += [
     causallm_qkv_layer_dep,
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
+    causallm_deberta_attention_layer_dep,
+    causallm_shared_fully_connected_layer_dep,
 ]
 
 subdir('models')
@@ -122,7 +126,11 @@ if get_option('platform') == 'windows'
             causallm_layer_dependencies,
             tokenizer_dependencies
         ],
-        include_directories: causallm_inc,
+        include_directories: [
+            causallm_inc,
+            causallm_inc_minja_inc,
+            causallm_inc_nlohmann_inc
+        ],
         install: true,
         cpp_args: cpp_args
     )
@@ -135,7 +143,11 @@ else
             causallm_layer_dependencies,
             tokenizer_dependencies
         ],
-        include_directories: causallm_inc,
+        include_directories: [
+            causallm_inc,
+            causallm_inc_minja_inc,
+            causallm_inc_nlohmann_inc
+        ],
         install: true,
         install_dir: application_install_dir,
         link_args: tokenizer_link_args,
@@ -151,7 +163,7 @@ causallm_dep = declare_dependency(
 
 e = executable('nntr_causallm',
     executable_src,
-    include_directories: causallm_inc,
+    include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
 )
 

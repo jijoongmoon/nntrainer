@@ -113,7 +113,7 @@ std::pair<Tensor, Tensor> SentenceTransformer::constructModel() {
     std::string component = getLastComponent(type);
 
     if (component == "Transformer") {
-      auto result = Transformer::constructModel();
+      auto result = constructTransformerModule();
       x = result.first;
       h = result.second;
     } else {
@@ -135,6 +135,10 @@ std::pair<Tensor, Tensor> SentenceTransformer::constructModel() {
   }
 
   return {x, h};
+}
+
+std::pair<Tensor, Tensor> SentenceTransformer::constructTransformerModule() {
+  return Transformer::constructModel();
 }
 
 Tensor SentenceTransformer::addModule(const std::string &type, int idx,

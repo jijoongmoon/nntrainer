@@ -14,9 +14,16 @@
 #include <algorithm>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
+/**
+ * @brief Namespace for CausalLM application components
+ */
 namespace causallm {
+/**
+ * @brief Namespace for Gemma3 chat formatting helpers
+ */
 namespace gemma3 {
 
 // Helper to escape string values
@@ -87,8 +94,15 @@ std::string format_parameters(const json &properties) {
 
 std::string format_function_declaration(const json &tool) {
   std::stringstream ss;
+  const json *func_ptr = nullptr;
   if (tool.contains("function")) {
-    const auto &func = tool["function"];
+    func_ptr = &tool["function"];
+  } else if (tool.contains("name")) {
+    func_ptr = &tool;
+  }
+
+  if (func_ptr != nullptr) {
+    const auto &func = *func_ptr;
     ss << "declaration:" << func.value("name", "") << ",";
     ss << "description:" << escape_value(func.value("description", "")) << ",";
 
@@ -136,6 +150,7 @@ std::string apply_function_gemma_template(const json &chat_input) {
   prompt << "<bos>";
   const auto &messages = chat_input["messages"];
   bool tools_inserted = false;
+  std::unordered_map<std::string, std::string> tool_call_names;
 
   for (size_t i = 0; i < messages.size(); ++i) {
     const auto &message = messages[i];
@@ -149,16 +164,20 @@ std::string apply_function_gemma_template(const json &chat_input) {
     }
 
     // Content
-    if (message.contains("content")) {
+    if (role != "tool" && message.contains("content")) {
       if (message["content"].is_string()) {
         prompt << message["content"].get<std::string>();
       }
     }
 
     // Insert tools if this is the first message and it is developer/system
-    if (!tools_inserted && chat_input.contains("tools") &&
+    if (!tools_inserted &&
+        (chat_input.contains("tools") || chat_input.contains("functions")) &&
         (role == "developer" || role == "system")) {
-      for (const auto &tool : chat_input["tools"]) {
+      const auto &tools = chat_input.contains("tools")
+                            ? chat_input["tools"]
+                            : chat_input["functions"];
+      for (const auto &tool : tools) {
         prompt << "<start_function_declaration>";
         prompt << format_function_declaration(tool);
         prompt << "<end_function_declaration>";
@@ -170,8 +189,11 @@ std::string apply_function_gemma_template(const json &chat_input) {
     if (message.contains("tool_calls")) {
       for (const auto &tool_call : message["tool_calls"]) {
         const auto &func = tool_call["function"];
-        prompt << "<start_function_call>call:"
-               << func["name"].get<std::string>() << "{";
+        std::string func_name = func["name"].get<std::string>();
+        if (tool_call.contains("id") && tool_call["id"].is_string())
+          tool_call_names[tool_call["id"].get<std::string>()] = func_name;
+
+        prompt << "<start_function_call>call:" << func_name << "{";
         // Simplistic argument formatting
         if (func.contains("arguments")) {
           if (func["arguments"].is_object()) {
@@ -196,6 +218,14 @@ std::string apply_function_gemma_template(const json &chat_input) {
     } else {
       if (message.contains("content")) {
         std::string name = message.value("name", "");
+        if (name.empty() && message.contains("tool_call_id") &&
+            message["tool_call_id"].is_string()) {
+          const auto it =
+            tool_call_names.find(message["tool_call_id"].get<std::string>());
+          if (it != tool_call_names.end())
+            name = it->second;
+        }
+
         std::string content_str;
         if (message["content"].is_string())
           content_str = message["content"].get<std::string>();

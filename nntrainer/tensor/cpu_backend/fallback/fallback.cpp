@@ -299,8 +299,16 @@ template <> void quantize_row_q8_K(const void *x, float *y, int64_t k) {
 }
 
 void repack_q4_0(void *W, void *repacked_W, size_t data_size,
-                 const unsigned int M, const unsigned int N) {
-  return __fallback_repack_q4_0_to_q4_0_8(W, repacked_W, data_size, M, N);
+                 const unsigned int M, const unsigned int N,
+                 ml::train::ISA target) {
+  switch (target) {
+  case ml::train::ISA::ARM:
+    return __fallback_repack_q4_0_to_q4_0_4(W, repacked_W, data_size, M, N);
+  case ml::train::ISA::X86:
+  case ml::train::ISA::DEFAULT:
+  default:
+    return __fallback_repack_q4_0_to_q4_0_8(W, repacked_W, data_size, M, N);
+  }
 }
 
 void repack_q4_0_to_q4_0_8(void *W, void *repacked_W, size_t data_size,

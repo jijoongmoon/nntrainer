@@ -429,7 +429,8 @@ void TieWordEmbedding::save(std::ofstream &file,
                             nntrainer::RunLayerContext &run_context,
                             bool opt_var, ml::train::ExecutionMode mode,
                             bool trainable,
-                            nntrainer::TensorDim::DataType dtype) const {
+                            nntrainer::TensorDim::DataType dtype,
+                            ml::train::ISA target_isa) const {
   // Only read when mode is embedding
   if (mode_ == mode::embedding) {
     // @note shared weights are only be saved at the first access
@@ -472,7 +473,6 @@ void TieWordEmbedding::save(std::ofstream &file,
             //////////////////////////////////////////////////////////////////
             nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                            {nntrainer::Tformat::NCHW, dtype});
-
             nntrainer::quantize_q6_K(weight.getData<float>(),
                                      quant_weight.getData<uint8_t>(), K, N,
                                      nullptr);

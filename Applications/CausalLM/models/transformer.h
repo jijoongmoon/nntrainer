@@ -98,18 +98,19 @@ public:
    * @brief Save the weight to a file
    */
   virtual void save_weight(const std::string &weight_path);
-
   /**
    * @brief Save the weight to a file with type conversion
    * @param weight_path Path to save the weight file
    * @param dtype Global target data type for all layers (NONE = keep original)
    * @param layer_dtype_map Per-layer data type overrides (layer_name -> dtype)
+   * @param target_isa Target ISA for quantization (default: DEFAULT)
    */
   virtual void
   save_weight(const std::string &weight_path,
               ml::train::TensorDim::DataType dtype,
               const std::map<std::string, ml::train::TensorDim::DataType>
-                &layer_dtype_map = {});
+                &layer_dtype_map = {},
+              ml::train::ISA target_isa = ml::train::ISA::DEFAULT);
 
   /**
    * @brief run the Transformer model
@@ -188,6 +189,14 @@ protected:
    * @brief register CustomLayers
    */
   virtual void registerCustomLayers();
+
+  /**
+   * @brief Get model format from weight file extension.
+   * @param weight_path Path to the weight file.
+   * @return Model format for the given file extension.
+   */
+  virtual ml::train::ModelFormat
+  formatFromExtension(const std::string &weight_path);
 
   /**
    * @brief register Outputs

@@ -55,8 +55,9 @@ public:
    * @param tail_prompt Tail prompt
    * @return SentenceTransformer output from the model
    */
-  std::vector<float *> encode(const WSTR prompt, const WSTR system_prompt = "",
-                              const WSTR tail_prompt = "");
+  virtual std::vector<float *> encode(const WSTR prompt,
+                                      const WSTR system_prompt = "",
+                                      const WSTR tail_prompt = "");
 
 protected:
   /**
@@ -69,6 +70,13 @@ protected:
    * @brief Construct Model
    */
   std::pair<Tensor, Tensor> constructModel() override;
+
+  /**
+   * @brief Construct the base transformer module before SentenceTransformer
+   * modules are appended.
+   * @return {input_tensor, output_tensor} pair for the base encoder/decoder.
+   */
+  virtual std::pair<Tensor, Tensor> constructTransformerModule();
 
   /**
    * @brief Map of module type suffix to layer type name
