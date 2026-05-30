@@ -733,6 +733,29 @@ public:
 };
 
 /**
+ * @brief Input Data Type Enumeration Information
+ *  This property can be used by input layers to preserve a non-default
+ *  placeholder dtype instead of inheriting the model activation dtype.
+ */
+class InputDtype final : public EnumProperty<TensorDataTypeInfo> {
+public:
+  using prop_tag = enum_class_prop_tag;
+  static constexpr const char *key = "input_dtype";
+
+  /**
+   * @brief Constructor
+   */
+  InputDtype(){};
+
+  /**
+   * @brief Constructor
+   *
+   * @param value value to set
+   */
+  InputDtype(TensorDataTypeInfo::Enum value) { set(value); };
+};
+
+/**
  * @brief Per-role weight dtype map property.
  *
  * Lets a layer specify a different dtype for each of the weights it

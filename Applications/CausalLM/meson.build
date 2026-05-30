@@ -241,6 +241,7 @@ if get_option('enable-test')
       timeout: 60,
       suite: 'unittests'
     )
+  endif
 
   # ClipVitTransformer structural unit tests
   unittest_clip_vit_transformer = executable(
