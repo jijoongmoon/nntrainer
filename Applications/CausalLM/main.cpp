@@ -35,6 +35,7 @@
 #include "chat_template.h"
 #include "deberta_v2.h"
 #include "embedding_gemma.h"
+#include "lfm2_vl_vision_transformer.h"
 #include "gemma3_causallm.h"
 #if !defined(_WIN32)
 #include "gptoss_cached_slim_causallm.h"
@@ -175,6 +176,8 @@ std::string resolve_architecture(std::string model_type,
                architecture == "DebertaV2Model" ||
                architecture == "DebertaV2ForMaskedLM") {
       return "DebertaV2";
+    } else if (architecture == "Lfm2VlVisionTransformer") {
+      return "Lfm2VlVisionTransformer";
     } else {
       throw std::invalid_argument(
         "Unsupported architecture for embedding model: " + architecture);
@@ -284,6 +287,12 @@ int main(int argc, char *argv[]) {
     "TimmViT", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::TimmViTTransformer>(cfg, generation_cfg,
                                                             nntr_cfg);
+    });							    
+
+  causallm::Factory::Instance().registerModel(
+    "Lfm2VlVisionTransformer", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Lfm2VlVisionTransformer>(cfg, generation_cfg,
+                                                            nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
     "VJEPA2ViT", [](json cfg, json generation_cfg, json nntr_cfg) {
@@ -389,7 +398,12 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
     model->initialize();
-    model->load_weight(weight_file);
+    if (std::filesystem::exists(weight_file)) {
+      model->load_weight(weight_file);
+    } else {
+      std::cout << "[Warning] weight file not found (" << weight_file
+                << "); running with randomly-initialized weights." << std::endl;
+    }
 
     bool do_sample = generation_cfg.value("do_sample", false);
 
