@@ -5,6 +5,8 @@
  * @file   vjepa_gelu_layer.cpp
  * @date   22 May 2026
  * @brief  Token-parallel GELU activation (NEON gelu_v2 split over the pool).
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #include "vjepa_gelu_layer.h"

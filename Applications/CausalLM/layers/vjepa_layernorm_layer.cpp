@@ -5,6 +5,8 @@
  * @file   vjepa_layernorm_layer.cpp
  * @date   22 May 2026
  * @brief  Per-token-parallel LayerNorm over the width axis.
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #include "vjepa_layernorm_layer.h"
