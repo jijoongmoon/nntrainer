@@ -333,11 +333,10 @@ void registerAllModels() {
                           return std::make_unique<causallm::EmbeddingGemma>(
                             cfg, generation_cfg, nntr_cfg);
                         });
-  factory.registerModel("VJEPA2ViT",
-                        [](json cfg, json generation_cfg, json nntr_cfg) {
-                          return std::make_unique<causallm::VJEPA2ViT>(
-                            cfg, generation_cfg, nntr_cfg);
-                        });
+  factory.registerModel("VJEPA2ViT", [](json cfg, json generation_cfg,
+                                        json nntr_cfg) {
+    return std::make_unique<causallm::VJEPA2ViT>(cfg, generation_cfg, nntr_cfg);
+  });
 }
 
 /**

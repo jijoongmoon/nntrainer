@@ -156,8 +156,7 @@ public:
     auto out_fp32_dims = to_fp32_dims(out_dims);
 
     // Read-buffers: always FP32 to match the golden-file binary layout.
-    inputs_fp32 =
-      std::vector<Tensor>(in_fp32_dims.begin(), in_fp32_dims.end());
+    inputs_fp32 = std::vector<Tensor>(in_fp32_dims.begin(), in_fp32_dims.end());
     labels_fp32 =
       std::vector<Tensor>(out_fp32_dims.begin(), out_fp32_dims.end());
     expected_outputs =
@@ -263,10 +262,10 @@ public:
 
 private:
   NeuralNetwork *nn;
-  std::vector<Tensor> inputs;         /**< model-dtype forwarding buffer */
-  std::vector<Tensor> labels;         /**< model-dtype forwarding buffer */
-  std::vector<Tensor> inputs_fp32;    /**< FP32 read-buffer (golden layout) */
-  std::vector<Tensor> labels_fp32;    /**< FP32 read-buffer (golden layout) */
+  std::vector<Tensor> inputs;      /**< model-dtype forwarding buffer */
+  std::vector<Tensor> labels;      /**< model-dtype forwarding buffer */
+  std::vector<Tensor> inputs_fp32; /**< FP32 read-buffer (golden layout) */
+  std::vector<Tensor> labels_fp32; /**< FP32 read-buffer (golden layout) */
   std::vector<Tensor> weights;
   std::vector<Tensor> weights32;
   std::vector<Tensor> expected_weights;
