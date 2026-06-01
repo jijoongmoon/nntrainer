@@ -24,6 +24,7 @@
 #include "layer_context.h"
 #include "model.h"
 #include "model_common_properties.h"
+#include <safetensors_header.h>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstring>
@@ -76,7 +77,8 @@ NeuralNetwork::NeuralNetwork() :
                    props::SavePath(), props::ContinueTrain(),
                    props::SaveBestPath(), props::MemoryOptimization(),
                    props::Fsu(), props::FsuPath(), props::FsuLookahead(),
-                   props::TensorFormat(), props::ModelTensorDataType()),
+                   props::TensorFormat(), props::ModelTensorDataType(),
+                   props::WeightSource()),
   load_path(std::string()),
   epoch_idx(0),
   iter(0),
@@ -95,7 +97,8 @@ NeuralNetwork::NeuralNetwork(const Engine *ct_engine_) :
                    props::SavePath(), props::ContinueTrain(),
                    props::SaveBestPath(), props::MemoryOptimization(),
                    props::Fsu(), props::FsuPath(), props::FsuLookahead(),
-                   props::TensorFormat(), props::ModelTensorDataType()),
+                   props::TensorFormat(), props::ModelTensorDataType(),
+                   props::WeightSource()),
   load_path(std::string()),
   epoch_idx(0),
   iter(0),
@@ -193,6 +196,48 @@ int NeuralNetwork::compile(ExecutionMode mode) {
 
   model_graph.setMemoryOptimizations(
     std::get<props::MemoryOptimization>(model_flex_props));
+
+  // If the user provided a .safetensors file via weight_source=..., parse
+  // its header once and translate the per-tensor dtype info into a
+  // per-layer `weight_dtype_map` property. This drives
+  // InitLayerContext::getDataTypeForRole() at finalize so each weight's
+  // TensorDim picks up the correct dtype before the tensor manager
+  // allocates it.
+  //
+  // Tensor name convention: "<layer_name>.<role>" (e.g. "fc1.weight",
+  // "fc1.bias"). Tensor names not matching any layer are silently
+  // ignored — the user's safetensors file may contain extras (e.g. the
+  // optimizer state of a HF checkpoint) we don't care about.
+  std::map<std::string, std::map<std::string, std::string>>
+    per_layer_role_dtype;
+  if (const auto &ws =
+        std::get<props::WeightSource>(model_flex_props); !ws.empty() &&
+                                                          !ws.get().empty()) {
+    const std::string &path = ws.get();
+    try {
+      auto hdr = parseSafetensorsHeaderFromFile(path);
+      for (const auto &kv : hdr.tensors) {
+        const auto &full = kv.first;
+        const auto &info = kv.second;
+        auto dot = full.rfind('.');
+        if (dot == std::string::npos)
+          continue;
+        const std::string layer_name = full.substr(0, dot);
+        const std::string role = full.substr(dot + 1);
+        const std::string nntr_str =
+          safetensorsDtypeToNntrainerString(info.dtype_raw);
+        // Untranslatable safetensors dtypes (BF16, F64, I32, ...) are
+        // skipped — the user-side converter is responsible for them.
+        if (nntr_str.empty())
+          continue;
+        per_layer_role_dtype[layer_name][role] = nntr_str;
+      }
+    } catch (const std::exception &e) {
+      throw std::invalid_argument(
+        "weight_source: failed to parse '" + path + "': " + e.what());
+    }
+  }
+
   for (auto &node : graph_representation) {
     if (auto &prop = std::get<props::ClipGradByGlobalNorm>(model_props);
         !prop.empty()) {
@@ -201,6 +246,18 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     if (auto &prop = std::get<props::LossScale>(model_props); !prop.empty()) {
       node->setProperty({"loss_scale=" + to_string(prop)});
     }
+
+    auto it = per_layer_role_dtype.find(node->getName());
+    if (it != per_layer_role_dtype.end() && !it->second.empty()) {
+      std::string s;
+      for (const auto &rd : it->second) {
+        if (!s.empty())
+          s += ",";
+        s += rd.first + ":" + rd.second;
+      }
+      node->setProperty({"weight_dtype_map=" + s});
+    }
+
     model_graph.addLayer(node);
   }
 

@@ -75,16 +75,26 @@ void LayerNormalizationLayer::finalize(InitLayerContext &context) {
     std::unique(normalize_axes.begin(), normalize_axes.end()),
     normalize_axes.end());
 
-  TensorDim normalize_dim(context.getFormat(), context.getWeightDataType());
+  // gamma is multiplicative -> weight dtype channel by default.
+  // beta is additive -> activation dtype channel by default (mirrors FC bias).
+  // Both can be overridden per-role by the weight_dtype_map property
+  // (e.g. weight_dtype_map = "gamma:FP32,beta:FP32").
+  TensorDim gamma_dim(
+    context.getFormat(),
+    context.getDataTypeForRole("gamma", context.getWeightDataType()));
+  TensorDim beta_dim(
+    context.getFormat(),
+    context.getDataTypeForRole("beta", context.getActivationDataType()));
   for (unsigned int axis : normalize_axes) {
-    normalize_dim.setTensorDim(axis, input_dim.getTensorDim(axis));
+    gamma_dim.setTensorDim(axis, input_dim.getTensorDim(axis));
+    beta_dim.setTensorDim(axis, input_dim.getTensorDim(axis));
   }
 
   wt_idx[LNParams::gamma] = context.requestWeight(
-    normalize_dim, gamma_initializer, WeightRegularizer::NONE, 1.0f,
-    weight_decay, "gamma", true);
+    gamma_dim, gamma_initializer, WeightRegularizer::NONE, 1.0f, weight_decay,
+    "gamma", true);
   wt_idx[LNParams::beta] = context.requestWeight(
-    normalize_dim, beta_initializer, WeightRegularizer::NONE, 1.0f, bias_decay,
+    beta_dim, beta_initializer, WeightRegularizer::NONE, 1.0f, bias_decay,
     "beta", true);
 
   TensorDim remain_dim(context.getFormat(), context.getWeightDataType());

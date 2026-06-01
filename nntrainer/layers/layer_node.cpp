@@ -199,11 +199,12 @@ LayerNode::LayerNode(std::unique_ptr<nntrainer::Layer> &&l) :
 
   output_connections(),
   run_context(nullptr),
-  layer_node_props(
-    new PropsType(props::Name(), props::Distribute(), props::Trainable(), {},
-                  {}, props::SharedFrom(), props::ClipGradByGlobalNorm(),
-                  props::Packed(), props::WeightDtype(), props::InputDtype(),
-                  props::LossScaleForMixed(), props::ComputeEngine())),
+  layer_node_props(new PropsType(
+    props::Name(), props::Distribute(), props::Trainable(), {}, {},
+    props::SharedFrom(), props::ClipGradByGlobalNorm(), props::Packed(),
+    props::WeightDtype(), props::WeightDtypeMap(), props::InputDtype(),
+    props::LossScaleForMixed(), props::ComputeEngine())),
+  
   layer_node_props_realization(
     new RealizationPropsType(props::Flatten(), props::Activation())),
   loss(new props::Loss()),
@@ -665,6 +666,11 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
   auto context = InitLayerContext(
     actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
     getName(), scope, max_norm, tensor_type, loss_scale, mode, compute_engine);
+
+  // Per-role weight dtype overrides (weight_dtype_map property). Empty
+  // string disables; layers fall back to model-level tensor_type defaults.
+  context.setWeightDtypeMap(
+    std::get<props::WeightDtypeMap>(*layer_node_props).get());
 
   layer->finalize(context);
 

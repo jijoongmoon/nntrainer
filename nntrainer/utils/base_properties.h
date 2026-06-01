@@ -664,10 +664,12 @@ struct TensorDataTypeInfo {
   static constexpr std::initializer_list<Enum> EnumList = {
     Enum::BCQ,    Enum::QINT4, Enum::QINT8, Enum::QINT16,
     Enum::FP16,   Enum::FP32,  Enum::UINT4, Enum::UINT8,
-    Enum::UINT16, Enum::Q4_K,  Enum::Q6_K,  Enum::Q4_0};
+    Enum::UINT16, Enum::Q4_K,  Enum::Q6_K,  Enum::Q4_0,
+    Enum::Q8_0};
   static constexpr const char *EnumStr[] = {
     "BCQ",   "QINT4", "QINT8",  "QINT16", "FP16", "FP32",
-    "UINT4", "UINT8", "UINT16", "Q4_K",   "Q6_K", "Q4_0"};
+    "UINT4", "UINT8", "UINT16", "Q4_K",   "Q6_K", "Q4_0",
+    "Q8_0"};
 };
 
 /**
@@ -751,6 +753,34 @@ public:
    * @param value value to set
    */
   InputDtype(TensorDataTypeInfo::Enum value) { set(value); };
+};
+
+/**
+ * @brief Per-role weight dtype map property.
+ *
+ * Lets a layer specify a different dtype for each of the weights it
+ * requests (e.g. FC `weight` separate from FC `bias`, LayerNorm `gamma`
+ * separate from `beta`). Format is a comma-separated list of
+ * `role:dtype` pairs:
+ *
+ *     weight_dtype_map = "weight:Q8_0,bias:FP32"
+ *     weight_dtype_map = "filter:Q4_0,bias:FP32"          // Conv2D
+ *     weight_dtype_map = "gamma:FP32,beta:FP32"           // LayerNorm
+ *
+ * Whitespace is tolerated. Empty / missing values fall back to the
+ * model-level (model_tensor_type) defaults the layer would have used
+ * otherwise, so this property is purely additive — pre-existing models
+ * keep their current dtype assignment without setting it.
+ *
+ * Role names match the third argument the layer passes to
+ * `context.requestWeight(... , name, ...)` (see fc_layer.cpp / etc.).
+ */
+class WeightDtypeMap final : public Property<std::string> {
+public:
+  WeightDtypeMap() : Property<std::string>("") {}
+  WeightDtypeMap(const std::string &value) : Property<std::string>(value) {}
+  static constexpr const char *key = "weight_dtype_map";
+  using prop_tag = str_prop_tag;
 };
 
 /**
