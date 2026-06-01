@@ -97,8 +97,8 @@ void CpuMemAllocator::free(void *ptr) { MemAllocator::free(ptr); }
 #if defined(__ANDROID__) && ENABLE_NPU
 // Full RpcMemAllocator implementation (Android + NPU only).
 
-RpcMemAllocator::RpcMemAllocator(int heap_id_, uint32_t flags_)
-  : heap_id(heap_id_), flags(flags_) {
+RpcMemAllocator::RpcMemAllocator(int heap_id_, uint32_t flags_) :
+  heap_id(heap_id_), flags(flags_) {
   library_handle = dlopen("libcdsprpc.so", RTLD_NOW);
   if (library_handle) {
     rpcmem_alloc_fn =

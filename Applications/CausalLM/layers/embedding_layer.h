@@ -134,10 +134,9 @@ struct QuantLut {
  *        auto-detected from the extension. `in_dim` / `out_dim` are
  *        only used to validate / size the raw-uint16 case.
  */
-std::shared_ptr<QuantLut>
-get_or_load_quant_lut(const std::string &path,
-                      size_t in_dim_hint = 0,
-                      size_t out_dim_hint = 0);
+std::shared_ptr<QuantLut> get_or_load_quant_lut(const std::string &path,
+                                                size_t in_dim_hint = 0,
+                                                size_t out_dim_hint = 0);
 
 /**
  * @class   EmbeddingLayer
@@ -233,7 +232,6 @@ public:
     ml::train::ExecutionMode mode, bool trainable,
     nntrainer::TensorDim::DataType dtype = nntrainer::TensorDim::DataType::NONE,
     ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
-
 
   inline static const std::string type = "embedding_layer";
 

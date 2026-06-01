@@ -39,8 +39,8 @@ namespace {
 
 // Path-keyed cache so two graphs (or two layers) that reference the same
 // manifest share a single in-memory copy of the 4-bit LUT.
-std::mutex                                                  g_lut_cache_mtx;
-std::unordered_map<std::string, std::weak_ptr<QuantLut>>    g_lut_cache;
+std::mutex g_lut_cache_mtx;
+std::unordered_map<std::string, std::weak_ptr<QuantLut>> g_lut_cache;
 
 std::string dirname(const std::string &p) {
   auto pos = p.find_last_of('/');
@@ -76,21 +76,21 @@ load_ufixed8_manifest_(const std::string &manifest_path,
   // Tensorwise unsigned 4-bit (legacy). One (scale, offset) for the
   // whole table.
   const std::string lut_rel = j.at("lut-path").get<std::string>();
-  const int per_row         = j.at("size").get<int>();
-  const auto &qp            = j.at("quant-param");
+  const int per_row = j.at("size").get<int>();
+  const auto &qp = j.at("quant-param");
 
-  auto lut         = std::make_shared<QuantLut>();
-  lut->is_raw_u16  = false;
-  lut->is_signed4  = false;
-  lut->scale       = qp.at("scale").get<float>();
-  lut->offset      = qp.at("offset").get<int>();
-  lut->out_dim     = static_cast<size_t>(per_row);
+  auto lut = std::make_shared<QuantLut>();
+  lut->is_raw_u16 = false;
+  lut->is_signed4 = false;
+  lut->scale = qp.at("scale").get<float>();
+  lut->offset = qp.at("offset").get<int>();
+  lut->out_dim = static_cast<size_t>(per_row);
 
   const std::string lut_abs = resolve_relative(lut_rel, dirname(manifest_path));
 
   std::ifstream bin(lut_abs, std::ios::binary | std::ios::ate);
   NNTR_THROW_IF(!bin.is_open(), std::runtime_error)
-      << "Failed to open LUT binary: " << lut_abs;
+    << "Failed to open LUT binary: " << lut_abs;
   const std::streamsize sz = bin.tellg();
   bin.seekg(0, std::ios::beg);
   lut->bytes.resize(static_cast<size_t>(sz));
@@ -98,8 +98,8 @@ load_ufixed8_manifest_(const std::string &manifest_path,
 
   NNTR_THROW_IF(lut->out_dim == 0 || (2 * lut->bytes.size()) % lut->out_dim,
                 std::runtime_error)
-      << "LUT binary size " << lut->bytes.size()
-      << " is not consistent with out_dim=" << lut->out_dim;
+    << "LUT binary size " << lut->bytes.size()
+    << " is not consistent with out_dim=" << lut->out_dim;
   lut->in_dim = (2 * lut->bytes.size()) / lut->out_dim;
 
   ml_logi("Loaded ufixed8 (tensorwise) LUT '%s' (in_dim=%zu, out_dim=%zu, "
@@ -115,27 +115,28 @@ load_sfixed4_manifest_(const std::string &manifest_path,
   // Per-row signed 4-bit (-8..7), 2 packed per byte, no offset.
   // quant-param.scale is an array of length == in_dim (vocab size).
   const std::string lut_rel = j.at("lut-path").get<std::string>();
-  const int per_row         = j.at("size").get<int>();
-  const auto &qp            = j.at("quant-param");
+  const int per_row = j.at("size").get<int>();
+  const auto &qp = j.at("quant-param");
 
-  auto lut         = std::make_shared<QuantLut>();
-  lut->is_raw_u16  = false;
-  lut->is_signed4  = true;
-  lut->offset      = 0;
-  lut->out_dim     = static_cast<size_t>(per_row);
+  auto lut = std::make_shared<QuantLut>();
+  lut->is_raw_u16 = false;
+  lut->is_signed4 = true;
+  lut->offset = 0;
+  lut->out_dim = static_cast<size_t>(per_row);
 
   // scale array, one entry per vocab row.
   const auto &scale_arr = qp.at("scale");
   NNTR_THROW_IF(!scale_arr.is_array(), std::runtime_error)
-      << "sfixed4 manifest expects quant-param.scale as an array";
+    << "sfixed4 manifest expects quant-param.scale as an array";
   lut->row_scales.reserve(scale_arr.size());
-  for (const auto &v : scale_arr) lut->row_scales.push_back(v.get<float>());
+  for (const auto &v : scale_arr)
+    lut->row_scales.push_back(v.get<float>());
 
   const std::string lut_abs = resolve_relative(lut_rel, dirname(manifest_path));
 
   std::ifstream bin(lut_abs, std::ios::binary | std::ios::ate);
   NNTR_THROW_IF(!bin.is_open(), std::runtime_error)
-      << "Failed to open LUT binary: " << lut_abs;
+    << "Failed to open LUT binary: " << lut_abs;
   const std::streamsize sz = bin.tellg();
   bin.seekg(0, std::ios::beg);
   lut->bytes.resize(static_cast<size_t>(sz));
@@ -143,13 +144,13 @@ load_sfixed4_manifest_(const std::string &manifest_path,
 
   NNTR_THROW_IF(lut->out_dim == 0 || (2 * lut->bytes.size()) % lut->out_dim,
                 std::runtime_error)
-      << "LUT binary size " << lut->bytes.size()
-      << " is not consistent with out_dim=" << lut->out_dim;
+    << "LUT binary size " << lut->bytes.size()
+    << " is not consistent with out_dim=" << lut->out_dim;
   lut->in_dim = (2 * lut->bytes.size()) / lut->out_dim;
 
   NNTR_THROW_IF(lut->row_scales.size() != lut->in_dim, std::invalid_argument)
-      << "sfixed4 row_scales.size=" << lut->row_scales.size()
-      << " != in_dim=" << lut->in_dim;
+    << "sfixed4 row_scales.size=" << lut->row_scales.size()
+    << " != in_dim=" << lut->in_dim;
 
   ml_logi("Loaded sfixed4 (rowwise) LUT '%s' (in_dim=%zu, out_dim=%zu, "
           "row_scales=%zu, bytes=%zu)",
@@ -164,42 +165,43 @@ load_4bit_manifest_(const std::string &manifest_path) {
   // "sfixed4" = rowwise signed (per-row scale, no offset).
   std::ifstream f(manifest_path);
   NNTR_THROW_IF(!f.is_open(), std::runtime_error)
-      << "Failed to open LUT manifest: " << manifest_path;
+    << "Failed to open LUT manifest: " << manifest_path;
 
   nlohmann::json j;
   f >> j;
 
   const std::string datatype = j.value("datatype", std::string("ufixed8"));
 
-  if (datatype == "sfixed4") return load_sfixed4_manifest_(manifest_path, j);
-  if (datatype == "ufixed8") return load_ufixed8_manifest_(manifest_path, j);
+  if (datatype == "sfixed4")
+    return load_sfixed4_manifest_(manifest_path, j);
+  if (datatype == "ufixed8")
+    return load_ufixed8_manifest_(manifest_path, j);
 
   NNTR_THROW_IF(true, std::runtime_error)
-      << "Unsupported LUT datatype: " << datatype
-      << " (expected 'ufixed8' or 'sfixed4')";
+    << "Unsupported LUT datatype: " << datatype
+    << " (expected 'ufixed8' or 'sfixed4')";
   return nullptr; // unreachable
 }
 
-std::shared_ptr<QuantLut>
-load_raw_u16_(const std::string &bin_path, size_t in_dim, size_t out_dim) {
+std::shared_ptr<QuantLut> load_raw_u16_(const std::string &bin_path,
+                                        size_t in_dim, size_t out_dim) {
   NNTR_THROW_IF(in_dim == 0 || out_dim == 0, std::invalid_argument)
-      << "Raw UINT16 embedding requires in_dim/out_dim hints from layer";
+    << "Raw UINT16 embedding requires in_dim/out_dim hints from layer";
 
   std::ifstream bin(bin_path, std::ios::binary | std::ios::ate);
   NNTR_THROW_IF(!bin.is_open(), std::runtime_error)
-      << "Failed to open raw UINT16 embedding: " << bin_path;
+    << "Failed to open raw UINT16 embedding: " << bin_path;
   const std::streamsize sz = bin.tellg();
   bin.seekg(0, std::ios::beg);
 
   const size_t expected = in_dim * out_dim * sizeof(uint16_t);
   NNTR_THROW_IF(static_cast<size_t>(sz) != expected, std::runtime_error)
-      << "Raw UINT16 file size " << sz << " != in_dim*out_dim*2 = "
-      << expected;
+    << "Raw UINT16 file size " << sz << " != in_dim*out_dim*2 = " << expected;
 
-  auto lut         = std::make_shared<QuantLut>();
-  lut->is_raw_u16  = true;
-  lut->in_dim      = in_dim;
-  lut->out_dim     = out_dim;
+  auto lut = std::make_shared<QuantLut>();
+  lut->is_raw_u16 = true;
+  lut->in_dim = in_dim;
+  lut->out_dim = out_dim;
   lut->bytes.resize(static_cast<size_t>(sz));
   bin.read(reinterpret_cast<char *>(lut->bytes.data()), sz);
 
@@ -210,9 +212,9 @@ load_raw_u16_(const std::string &bin_path, size_t in_dim, size_t out_dim) {
 }
 } // namespace
 
-std::shared_ptr<QuantLut>
-get_or_load_quant_lut(const std::string &path, size_t in_dim_hint,
-                      size_t out_dim_hint) {
+std::shared_ptr<QuantLut> get_or_load_quant_lut(const std::string &path,
+                                                size_t in_dim_hint,
+                                                size_t out_dim_hint) {
   std::lock_guard<std::mutex> lk(g_lut_cache_mtx);
 
   auto it = g_lut_cache.find(path);
@@ -224,9 +226,9 @@ get_or_load_quant_lut(const std::string &path, size_t in_dim_hint,
 
   // Auto-detect mode by extension: `.json` → 4-bit manifest, otherwise
   // assume a raw UINT16 binary (consumer-space, no requant needed).
-  std::shared_ptr<QuantLut> lut = ends_with(path, ".json")
-    ? load_4bit_manifest_(path)
-    : load_raw_u16_(path, in_dim_hint, out_dim_hint);
+  std::shared_ptr<QuantLut> lut =
+    ends_with(path, ".json") ? load_4bit_manifest_(path)
+                             : load_raw_u16_(path, in_dim_hint, out_dim_hint);
 
   g_lut_cache[path] = lut;
   return lut;
@@ -276,16 +278,14 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   // skip the standard managed weight allocation. The LUT is owned by
   // this layer via shared_ptr, and shared with any other layer that
   // references the same manifest path.
-  auto &quant_path_prop =
-    std::get<props::QuantizedLutPath>(embedding_props);
+  auto &quant_path_prop = std::get<props::QuantizedLutPath>(embedding_props);
   if (!quant_path_prop.empty()) {
     // Hints are only consulted in raw-uint16 mode (no manifest); the
     // 4-bit path derives in_dim/out_dim from manifest+file size.
     quant_lut_ = get_or_load_quant_lut(quant_path_prop.get(), in_dim, out_dim);
 
     NNTR_THROW_IF(quant_lut_->in_dim != in_dim, std::invalid_argument)
-      << "in_dim mismatch: layer=" << in_dim
-      << " file=" << quant_lut_->in_dim;
+      << "in_dim mismatch: layer=" << in_dim << " file=" << quant_lut_->in_dim;
     NNTR_THROW_IF(quant_lut_->out_dim != out_dim, std::invalid_argument)
       << "out_dim mismatch: layer=" << out_dim
       << " file=" << quant_lut_->out_dim;
@@ -395,19 +395,18 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
     }
 
     NNTR_THROW_IF(out_dim % 2 != 0, std::runtime_error)
-      << "4-bit packed embedding requires out_dim to be even, got "
-      << out_dim;
+      << "4-bit packed embedding requires out_dim to be even, got " << out_dim;
 
     const uint8_t *packed = quant_lut_->bytes.data();
     const size_t bytes_per_row = out_dim / 2;
 
-    auto &out_scale_prop  = std::get<props::OutputQuantScale>(embedding_props);
+    auto &out_scale_prop = std::get<props::OutputQuantScale>(embedding_props);
     auto &out_offset_prop = std::get<props::OutputQuantOffset>(embedding_props);
-    const bool   has_out_quant = !out_scale_prop.empty();
-    const float  out_scale     = has_out_quant ? out_scale_prop.get() : 1.0f;
-    const int    out_offset    =
+    const bool has_out_quant = !out_scale_prop.empty();
+    const float out_scale = has_out_quant ? out_scale_prop.get() : 1.0f;
+    const int out_offset =
       (!out_offset_prop.empty()) ? out_offset_prop.get() : 0;
-    const float  inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
+    const float inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
 
     // ─── Per-row signed-4-bit (sfixed4) path ──────────────────────────
     // f = s4(nib) * row_scales[token_id] * scale (props::Scale modifier);
@@ -428,7 +427,7 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
               "input word index is greater than in_dim");
           }
           const uint8_t *row = packed + bytes_per_row * embed_idx;
-          const float  row_scale = row_scales[embed_idx] * scale;
+          const float row_scale = row_scales[embed_idx] * scale;
           const size_t out_off = static_cast<size_t>(out_dim) * i;
 
           if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
@@ -436,21 +435,23 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
             if (has_out_quant) {
               for (size_t k = 0; k < bytes_per_row; ++k) {
                 const uint8_t byte = row[k];
-                const float f_lo = s4(byte & 0x0F)        * row_scale;
+                const float f_lo = s4(byte & 0x0F) * row_scale;
                 const float f_hi = s4((byte >> 4) & 0x0F) * row_scale;
-                const int q_lo = static_cast<int>(
-                  std::lrintf(f_lo * inv_out_scale)) - out_offset;
-                const int q_hi = static_cast<int>(
-                  std::lrintf(f_hi * inv_out_scale)) - out_offset;
-                dst[2 * k]     = static_cast<uint16_t>(
-                  std::max(0, std::min(65535, q_lo)));
-                dst[2 * k + 1] = static_cast<uint16_t>(
-                  std::max(0, std::min(65535, q_hi)));
+                const int q_lo =
+                  static_cast<int>(std::lrintf(f_lo * inv_out_scale)) -
+                  out_offset;
+                const int q_hi =
+                  static_cast<int>(std::lrintf(f_hi * inv_out_scale)) -
+                  out_offset;
+                dst[2 * k] =
+                  static_cast<uint16_t>(std::max(0, std::min(65535, q_lo)));
+                dst[2 * k + 1] =
+                  static_cast<uint16_t>(std::max(0, std::min(65535, q_hi)));
               }
             } else {
               for (size_t k = 0; k < bytes_per_row; ++k) {
                 const uint8_t byte = row[k];
-                dst[2 * k]     = clamp_u16(s4(byte & 0x0F)        * row_scale);
+                dst[2 * k] = clamp_u16(s4(byte & 0x0F) * row_scale);
                 dst[2 * k + 1] = clamp_u16(s4((byte >> 4) & 0x0F) * row_scale);
               }
             }
@@ -458,7 +459,7 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
             float *dst = batchsliced_hidden.getData<float>() + out_off;
             for (size_t k = 0; k < bytes_per_row; ++k) {
               const uint8_t byte = row[k];
-              dst[2 * k]     = s4(byte & 0x0F)        * row_scale;
+              dst[2 * k] = s4(byte & 0x0F) * row_scale;
               dst[2 * k + 1] = s4((byte >> 4) & 0x0F) * row_scale;
             }
 #ifdef ENABLE_FP16
@@ -466,10 +467,9 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
             _FP16 *dst = batchsliced_hidden.getData<_FP16>() + out_off;
             for (size_t k = 0; k < bytes_per_row; ++k) {
               const uint8_t byte = row[k];
-              dst[2 * k]     = static_cast<_FP16>(
-                s4(byte & 0x0F) * row_scale);
-              dst[2 * k + 1] = static_cast<_FP16>(
-                s4((byte >> 4) & 0x0F) * row_scale);
+              dst[2 * k] = static_cast<_FP16>(s4(byte & 0x0F) * row_scale);
+              dst[2 * k + 1] =
+                static_cast<_FP16>(s4((byte >> 4) & 0x0F) * row_scale);
             }
 #endif
           } else {
@@ -517,8 +517,7 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
         const size_t out_off = static_cast<size_t>(out_dim) * i;
 
         if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
-          uint16_t *dst =
-            batchsliced_hidden.getData<uint16_t>() + out_off;
+          uint16_t *dst = batchsliced_hidden.getData<uint16_t>() + out_off;
           if (has_out_quant) {
             for (size_t k = 0; k < bytes_per_row; ++k) {
               const uint8_t byte = row[k];
@@ -527,14 +526,16 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
               const float f_hi =
                 (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
                 lut_scale;
-              const int q_lo = static_cast<int>(
-                std::lrintf(f_lo * inv_out_scale)) - out_offset;
-              const int q_hi = static_cast<int>(
-                std::lrintf(f_hi * inv_out_scale)) - out_offset;
-              dst[2 * k]     = static_cast<uint16_t>(
-                std::max(0, std::min(65535, q_lo)));
-              dst[2 * k + 1] = static_cast<uint16_t>(
-                std::max(0, std::min(65535, q_hi)));
+              const int q_lo =
+                static_cast<int>(std::lrintf(f_lo * inv_out_scale)) -
+                out_offset;
+              const int q_hi =
+                static_cast<int>(std::lrintf(f_hi * inv_out_scale)) -
+                out_offset;
+              dst[2 * k] =
+                static_cast<uint16_t>(std::max(0, std::min(65535, q_lo)));
+              dst[2 * k + 1] =
+                static_cast<uint16_t>(std::max(0, std::min(65535, q_hi)));
             }
           } else {
             for (size_t k = 0; k < bytes_per_row; ++k) {
@@ -553,8 +554,7 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
             dst[2 * k] =
               (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale;
             dst[2 * k + 1] =
-              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
-              lut_scale;
+              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) * lut_scale;
           }
 #ifdef ENABLE_FP16
         } else if (out_dtype == nntrainer::TensorDim::DataType::FP16) {
@@ -703,8 +703,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
 
     NNTR_THROW_IF(out_dim % 2 != 0, std::runtime_error)
-      << "4-bit packed embedding requires out_dim to be even, got "
-      << out_dim;
+      << "4-bit packed embedding requires out_dim to be even, got " << out_dim;
 
     const uint8_t *packed = quant_lut_->bytes.data();
     const size_t bytes_per_row = out_dim / 2;
@@ -714,13 +713,13 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     //   q16bit = round(f / out_scale - out_offset)  ← QNN convention
     // When the consumer's quant params are missing we fall back to a
     // naive clamp (only valid if LUT and consumer share quant space).
-    auto &out_scale_prop  = std::get<props::OutputQuantScale>(embedding_props);
+    auto &out_scale_prop = std::get<props::OutputQuantScale>(embedding_props);
     auto &out_offset_prop = std::get<props::OutputQuantOffset>(embedding_props);
-    const bool   has_out_quant = !out_scale_prop.empty();
-    const float  out_scale     = has_out_quant ? out_scale_prop.get() : 1.0f;
-    const int    out_offset    =
+    const bool has_out_quant = !out_scale_prop.empty();
+    const float out_scale = has_out_quant ? out_scale_prop.get() : 1.0f;
+    const int out_offset =
       (!out_offset_prop.empty()) ? out_offset_prop.get() : 0;
-    const float  inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
+    const float inv_out_scale = has_out_quant ? (1.0f / out_scale) : 1.0f;
 
     // ─── Per-row signed-4-bit (sfixed4) path ──────────────────────────
     if (quant_lut_->is_signed4 && !quant_lut_->row_scales.empty()) {
@@ -740,7 +739,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
               "input word index is greater than in_dim");
           }
           const uint8_t *row = packed + bytes_per_row * embed_idx;
-          const float  row_scale = row_scales[embed_idx] * scale;
+          const float row_scale = row_scales[embed_idx] * scale;
           const size_t out_off = static_cast<size_t>(out_dim) * i;
 
           if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
@@ -748,21 +747,23 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
             if (has_out_quant) {
               for (size_t k = 0; k < bytes_per_row; ++k) {
                 const uint8_t byte = row[k];
-                const float f_lo = s4(byte & 0x0F)        * row_scale;
+                const float f_lo = s4(byte & 0x0F) * row_scale;
                 const float f_hi = s4((byte >> 4) & 0x0F) * row_scale;
-                const int q_lo = static_cast<int>(
-                  std::lrintf(f_lo * inv_out_scale)) - out_offset;
-                const int q_hi = static_cast<int>(
-                  std::lrintf(f_hi * inv_out_scale)) - out_offset;
-                dst[2 * k]     = static_cast<uint16_t>(
-                  std::max(0, std::min(65535, q_lo)));
-                dst[2 * k + 1] = static_cast<uint16_t>(
-                  std::max(0, std::min(65535, q_hi)));
+                const int q_lo =
+                  static_cast<int>(std::lrintf(f_lo * inv_out_scale)) -
+                  out_offset;
+                const int q_hi =
+                  static_cast<int>(std::lrintf(f_hi * inv_out_scale)) -
+                  out_offset;
+                dst[2 * k] =
+                  static_cast<uint16_t>(std::max(0, std::min(65535, q_lo)));
+                dst[2 * k + 1] =
+                  static_cast<uint16_t>(std::max(0, std::min(65535, q_hi)));
               }
             } else {
               for (size_t k = 0; k < bytes_per_row; ++k) {
                 const uint8_t byte = row[k];
-                dst[2 * k]     = clamp_u16(s4(byte & 0x0F)        * row_scale);
+                dst[2 * k] = clamp_u16(s4(byte & 0x0F) * row_scale);
                 dst[2 * k + 1] = clamp_u16(s4((byte >> 4) & 0x0F) * row_scale);
               }
             }
@@ -770,7 +771,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
             float *dst = batchsliced_hidden.getData<float>() + out_off;
             for (size_t k = 0; k < bytes_per_row; ++k) {
               const uint8_t byte = row[k];
-              dst[2 * k]     = s4(byte & 0x0F)        * row_scale;
+              dst[2 * k] = s4(byte & 0x0F) * row_scale;
               dst[2 * k + 1] = s4((byte >> 4) & 0x0F) * row_scale;
             }
 #ifdef ENABLE_FP16
@@ -778,10 +779,9 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
             _FP16 *dst = batchsliced_hidden.getData<_FP16>() + out_off;
             for (size_t k = 0; k < bytes_per_row; ++k) {
               const uint8_t byte = row[k];
-              dst[2 * k]     = static_cast<_FP16>(
-                s4(byte & 0x0F) * row_scale);
-              dst[2 * k + 1] = static_cast<_FP16>(
-                s4((byte >> 4) & 0x0F) * row_scale);
+              dst[2 * k] = static_cast<_FP16>(s4(byte & 0x0F) * row_scale);
+              dst[2 * k + 1] =
+                static_cast<_FP16>(s4((byte >> 4) & 0x0F) * row_scale);
             }
 #endif
           } else {
@@ -817,8 +817,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         const size_t out_off = static_cast<size_t>(out_dim) * i;
 
         if (out_dtype == nntrainer::TensorDim::DataType::UINT16) {
-          uint16_t *dst =
-            batchsliced_hidden.getData<uint16_t>() + out_off;
+          uint16_t *dst = batchsliced_hidden.getData<uint16_t>() + out_off;
           if (has_out_quant) {
             for (size_t k = 0; k < bytes_per_row; ++k) {
               const uint8_t byte = row[k];
@@ -827,14 +826,16 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
               const float f_hi =
                 (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
                 lut_scale;
-              const int q_lo = static_cast<int>(
-                std::lrintf(f_lo * inv_out_scale)) - out_offset;
-              const int q_hi = static_cast<int>(
-                std::lrintf(f_hi * inv_out_scale)) - out_offset;
-              dst[2 * k]     = static_cast<uint16_t>(
-                std::max(0, std::min(65535, q_lo)));
-              dst[2 * k + 1] = static_cast<uint16_t>(
-                std::max(0, std::min(65535, q_hi)));
+              const int q_lo =
+                static_cast<int>(std::lrintf(f_lo * inv_out_scale)) -
+                out_offset;
+              const int q_hi =
+                static_cast<int>(std::lrintf(f_hi * inv_out_scale)) -
+                out_offset;
+              dst[2 * k] =
+                static_cast<uint16_t>(std::max(0, std::min(65535, q_lo)));
+              dst[2 * k + 1] =
+                static_cast<uint16_t>(std::max(0, std::min(65535, q_hi)));
             }
           } else {
             // Naive clamp (legacy / same-quant-space).
@@ -854,8 +855,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
             dst[2 * k] =
               (static_cast<float>(byte & 0x0F) + lut_offset) * lut_scale;
             dst[2 * k + 1] =
-              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) *
-              lut_scale;
+              (static_cast<float>((byte >> 4) & 0x0F) + lut_offset) * lut_scale;
           }
 #ifdef ENABLE_FP16
         } else if (out_dtype == nntrainer::TensorDim::DataType::FP16) {
@@ -1013,7 +1013,6 @@ void EmbeddingLayer::save(std::ofstream &file,
     }
   }
 }
-
 
 #ifdef PLUGGABLE
 

@@ -95,8 +95,8 @@ class RpcMemAllocator : public MemAllocator {
 public:
 #if defined(__ANDROID__) && ENABLE_NPU
   /// Default heap id and flags used by the previous in-pool implementation.
-  static constexpr int kDefaultHeapId = 25;        // RPCMEM_HEAP_ID_SYSTEM
-  static constexpr uint32_t kDefaultFlags = 1;     // RPCMEM_DEFAULT_FLAGS
+  static constexpr int kDefaultHeapId = 25;    // RPCMEM_HEAP_ID_SYSTEM
+  static constexpr uint32_t kDefaultFlags = 1; // RPCMEM_DEFAULT_FLAGS
 
   explicit RpcMemAllocator(int heap_id = kDefaultHeapId,
                            uint32_t flags = kDefaultFlags);

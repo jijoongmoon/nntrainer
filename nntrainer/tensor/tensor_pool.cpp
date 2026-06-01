@@ -40,8 +40,8 @@ void TensorPool::setAllocator(const std::string &name) {
     auto registry = Engine::Global().getAllocators();
     auto it = registry.find(name);
     if (it == registry.end())
-      throw std::invalid_argument(
-        "[TensorPool] unknown allocator name: " + name);
+      throw std::invalid_argument("[TensorPool] unknown allocator name: " +
+                                  name);
     alloc = it->second;
   }
 
