@@ -45,7 +45,11 @@ void TensorPool::setAllocator(const std::string &name) {
     alloc = it->second;
   }
 
-  mem_pool->setAllocator(std::move(alloc));
+  // Store the allocator and recreate the MemoryPool with it.
+  // MemoryPool accepts the allocator only at construction; setAllocator()
+  // is the TensorPool-level API that replaces both allocator_ and mem_pool.
+  allocator_ = std::move(alloc);
+  mem_pool = std::make_shared<MemoryPool>(allocator_);
 }
 
 /**

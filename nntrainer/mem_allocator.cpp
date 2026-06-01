@@ -21,6 +21,10 @@
 #include <malloc.h>
 #endif
 
+#if defined(__ANDROID__) && ENABLE_NPU
+#include <dlfcn.h>
+#endif
+
 namespace nntrainer {
 
 namespace {
@@ -73,5 +77,63 @@ void MemAllocator::free(void *ptr) {
   std::free(ptr);
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// CpuMemAllocator — thin subclass that forwards to the base implementation.
+// The base MemAllocator already uses aligned_alloc/_aligned_malloc and
+// zero-fills, so no extra logic is required here.
+// ---------------------------------------------------------------------------
+void CpuMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
+  MemAllocator::alloc(ptr, size, alignment);
+}
+
+void CpuMemAllocator::free(void *ptr) { MemAllocator::free(ptr); }
+
+// ---------------------------------------------------------------------------
+// tryCreateRpcMemAllocator — factory for the Hexagon NPU rpcmem allocator.
+// Only available on Android+NPU builds; returns nullptr everywhere else so
+// callers can fall back to CpuMemAllocator without their own #ifdef.
+// ---------------------------------------------------------------------------
+#if defined(__ANDROID__) && ENABLE_NPU
+// Full RpcMemAllocator implementation (Android + NPU only).
+
+RpcMemAllocator::RpcMemAllocator(int heap_id_, uint32_t flags_)
+  : heap_id(heap_id_), flags(flags_) {
+  library_handle = dlopen("libcdsprpc.so", RTLD_NOW);
+  if (library_handle) {
+    rpcmem_alloc_fn =
+      reinterpret_cast<RpcMemAllocFn>(dlsym(library_handle, "rpcmem_alloc"));
+    rpcmem_free_fn =
+      reinterpret_cast<RpcMemFreeFn>(dlsym(library_handle, "rpcmem_free"));
+  }
+}
+
+RpcMemAllocator::~RpcMemAllocator() {
+  if (library_handle)
+    dlclose(library_handle);
+}
+
+void RpcMemAllocator::alloc(void **ptr, size_t size, size_t /*alignment*/) {
+  NNTR_THROW_IF(!rpcmem_alloc_fn, std::runtime_error)
+    << "RpcMemAllocator: rpcmem_alloc symbol not found in libcdsprpc.so";
+  *ptr = rpcmem_alloc_fn(heap_id, flags, static_cast<int>(size));
+  NNTR_THROW_IF(*ptr == nullptr, std::runtime_error)
+    << "RpcMemAllocator::alloc: rpcmem_alloc failed for size " << size;
+}
+
+void RpcMemAllocator::free(void *ptr) {
+  if (ptr == nullptr)
+    return;
+  NNTR_THROW_IF(!rpcmem_free_fn, std::runtime_error)
+    << "RpcMemAllocator: rpcmem_free symbol not found in libcdsprpc.so";
+  rpcmem_free_fn(ptr);
+}
+
+std::shared_ptr<MemAllocator> tryCreateRpcMemAllocator() {
+  return std::make_shared<RpcMemAllocator>();
+}
+#else
+std::shared_ptr<MemAllocator> tryCreateRpcMemAllocator() { return nullptr; }
+#endif
 
 } // namespace nntrainer
