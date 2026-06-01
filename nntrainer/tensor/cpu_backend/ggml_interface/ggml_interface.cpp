@@ -121,4 +121,33 @@ void __ggml_repack_q4_K_to_q4_K_8(void *dst, void *src, size_t data_size,
   nntr_repack_q4_K_to_q4_K_8_bl(dst, 8, src, data_size, M, N);
 }
 
+// Q8_0 x Q8_0 GEMM dispatcher. Lives in the common interface file so every
+// thread-backend variant (bs_threadpool / omp / mixed) picks it up. The
+// underlying AVX2 kernel nntr_gemm_q8_0_q8_0 is in nntr_ggml_impl_avx.cpp;
+// NEON/SVE/fallback builds get NYI stubs at link time (phase C-2 / C-3).
+void __ggml_q8_0_q8_0_GEMM(const unsigned int M, const unsigned int N,
+                           const unsigned int K, const float *A,
+                           const unsigned int /*lda*/, const void *B,
+                           const unsigned int /*ldb*/, float *C,
+                           const unsigned int ldc) {
+  // Online-quantise A row-by-row to Q8_0 in a scratch buffer the SIMD
+  // micro-kernel reads back. nntr_quantize_row_q8_0 produces the exact
+  // block_q8_0 layout (fp16 scale + 32 int8 quants per 32-element block).
+  const unsigned int nb_per_row = K / QK8_0;
+  const size_t qa_row_bytes = sizeof(block_q8_0) * nb_per_row;
+
+  std::vector<char> QA(static_cast<size_t>(M) * qa_row_bytes);
+  for (unsigned int m = 0; m < M; ++m) {
+    nntr_quantize_row_q8_0(A + static_cast<size_t>(m) * K,
+                           QA.data() + static_cast<size_t>(m) * qa_row_bytes,
+                           static_cast<int64_t>(K));
+  }
+
+  // One unified inner kernel for now; a GEMV specialisation + Q8_0x8
+  // interleaved weight layout to match the Q4_0 8x8 micro-tile is a
+  // follow-up.
+  nntr_gemm_q8_0_q8_0(static_cast<int>(K), C, ldc, B, QA.data(),
+                      static_cast<int>(M), static_cast<int>(N));
+}
+
 } // namespace nntrainer

@@ -978,6 +978,30 @@ void __fallback_gemm_q4_0(const unsigned int M, const unsigned int N,
                           const unsigned int ldb, T *C, const unsigned int ldc);
 
 /**
+ * @brief q8_0 GEMM (scalar reference) : A (M,K) * W.T (N,K) = O (M,N)
+ *
+ * Activations FP32; weights are pre-quantised Q8_0 blocks. Activations are
+ * online-quantised to Q8_0 inside the function; per-block dot is an
+ * int8 x int8 -> int32 accumulate scaled by both fp16 block-level deltas.
+ * Output FP32.
+ *
+ * @param M Original row size of output
+ * @param N Original col size of output
+ * @param K Hidden size (must be a multiple of 32)
+ * @param A FP32 input activation [M x lda]
+ * @param lda Leading dim of A (>= K)
+ * @param B (const block_q8_0*) offline-quantised transposed weight [N x K/32]
+ * @param ldb Leading dim of B in element units (>= K)
+ * @param C T* output [M x ldc]
+ * @param ldc Leading dim of C (>= N)
+ */
+template <typename T = float>
+void __fallback_gemm_q8_0(const unsigned int M, const unsigned int N,
+                          const unsigned int K, const T *A,
+                          const unsigned int lda, const void *B,
+                          const unsigned int ldb, T *C, const unsigned int ldc);
+
+/**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
  * @param M Original row size of output
