@@ -1021,6 +1021,70 @@ void hgemm_classify(const __fp16 *A, const __fp16 *B, float *C32,
 namespace causallm {
 #endif
 
+#if !defined(__x86_64__) && !defined(__i386__) && defined(__ARM_NEON)
+// QK micro-kernel for the FP16-query + FP32-score attention path.
+// Computes S[m, n] = alpha * sum_k A[m, k] * B[n, k]   (TransB-style dot)
+// using ARMv8.2-A FMLAL (vfmlalq_low/high_f16): each pair of intrinsics
+// widens 8 FP16 products into two FP32 accumulators, so the per-element
+// product is computed in FP32 from the start. This avoids the FP16-product
+// overflow that custom_hgemm hits when packing wide encoder logits
+// (V-JEPA-2 block 0 Q,K magnitudes ~400 -> products ~160k > FP16 max
+// 65504), and unlike a cast-up-Q+shgemm path it never materialises an
+// FP32 copy of Q.
+//
+// Layout: A row-major (M rows, lda cols), B row-major (N rows, ldb cols),
+// C row-major (M rows, ldc cols). Inner length K is the dot length and
+// must match both A's and B's stride argument (i.e. lda == ldb == K when
+// the rows are contiguous, which is how Phase 1 of gemm_attention packs).
+//
+// Requires FEAT_FHM (asimdfhm in /proc/cpuinfo). Confirmed on Cortex-A78/X4
+// derivatives used by S25/S26 Ultra; the target attribute pulls the
+// fp16fml ISA extension in only for this function so the rest of the TU
+// can stay on the build-wide -march flags.
+__attribute__((target(
+  "arch=armv8.2-a+fp16+fp16fml+dotprod+i8mm"))) static inline void
+mha_qk_fmlal_f16xf16_to_f32(
+  const __fp16 *A, const __fp16 *B, float *C, unsigned int M, unsigned int N,
+  unsigned int K, float alpha, unsigned int lda, unsigned int ldb,
+  unsigned int ldc) {
+  for (unsigned int m = 0; m < M; ++m) {
+    const __fp16 *a_row = A + (size_t)m * lda;
+    float *c_row = C + (size_t)m * ldc;
+    for (unsigned int n = 0; n < N; ++n) {
+      const __fp16 *b_row = B + (size_t)n * ldb;
+      float32x4_t acc0 = vdupq_n_f32(0.0f);
+      float32x4_t acc1 = vdupq_n_f32(0.0f);
+      unsigned int k = 0;
+      // Process 16 lanes per iter (two 8-lane fmlal pairs) to keep the
+      // FP32 pipelines busy on Cortex-A76 (FMLAL latency ~4, two FP units).
+      for (; k + 16 <= K; k += 16) {
+        float16x8_t a0 = vld1q_f16(a_row + k);
+        float16x8_t b0 = vld1q_f16(b_row + k);
+        float16x8_t a1 = vld1q_f16(a_row + k + 8);
+        float16x8_t b1 = vld1q_f16(b_row + k + 8);
+        acc0 = vfmlalq_low_f16(acc0, a0, b0);
+        acc1 = vfmlalq_high_f16(acc1, a0, b0);
+        acc0 = vfmlalq_low_f16(acc0, a1, b1);
+        acc1 = vfmlalq_high_f16(acc1, a1, b1);
+      }
+      // 8-lane tail.
+      if (k + 8 <= K) {
+        float16x8_t a0 = vld1q_f16(a_row + k);
+        float16x8_t b0 = vld1q_f16(b_row + k);
+        acc0 = vfmlalq_low_f16(acc0, a0, b0);
+        acc1 = vfmlalq_high_f16(acc1, a0, b0);
+        k += 8;
+      }
+      float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+      // <8 tail (head_dim is usually a multiple of 8, but be safe).
+      for (; k < K; ++k)
+        sum += (float)a_row[k] * (float)b_row[k];
+      c_row[n] = alpha * sum;
+    }
+  }
+}
+#endif
+
 void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
                                   nntrainer::Tensor &b_cached_key,
                                   nntrainer::Tensor &b_cached_value,
@@ -1197,124 +1261,34 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
       // Does this block straddle the sliding-window lower bound for any row?
       const bool window_boundary = windowed && ((size_t)kb + W < q_abs_hi + 1);
 
-#if !defined(__x86_64__) && !defined(__i386__) && defined(__ARM_NEON)
-      if (q_fp16) {
-        // ALL-FP16 PATH (matches pre-V-JEPA mha_core precision: FP16
-        // storage with FP32 partial accumulation inside NEON kernels,
-        // no upgrade to FP32 in the score buffer).
-        // QK: FP16 × FP16 -> FP16 (custom_hgemm with FP32 partial acc).
-        nntrainer::neon::custom_hgemm(
-          reinterpret_cast<const __fp16 *>(Qp_fp16 + (size_t)qb * d),
-          reinterpret_cast<const __fp16 *>(Kp + (size_t)kb * d),
-          reinterpret_cast<__fp16 *>(Sp16.data()), bq, bk, d, inv_sqrt, 0.0f,
-          /*TransA=*/false, /*TransB=*/true);
-
-        // Boundary masking in FP16: write -INFINITY as bit pattern 0xFC00.
-        for (unsigned int i = 0; i < bq; ++i) {
-          uint16_t *sp16 = Sp16.data() + (size_t)i * bk;
-          const long long q_abs = (long long)cache_from + qb + i;
-          if (causal_boundary) {
-            long long valid_count_ll = q_abs + 1 - (long long)kb;
-            unsigned int valid_count = (valid_count_ll <= 0)
-                                         ? 0u
-                                         : (valid_count_ll >= (long long)bk
-                                              ? bk
-                                              : (unsigned int)valid_count_ll);
-            for (unsigned int k = valid_count; k < bk; ++k)
-              sp16[k] = 0xFC00; // FP16 -infinity
-          }
-          if (window_boundary) {
-            long long first_valid_ll = q_abs - (long long)W - (long long)kb + 1;
-            unsigned int first_valid = (first_valid_ll <= 0)
-                                         ? 0u
-                                         : (first_valid_ll >= (long long)bk
-                                              ? bk
-                                              : (unsigned int)first_valid_ll);
-            for (unsigned int k = 0; k < first_valid; ++k)
-              sp16[k] = 0xFC00;
-          }
-
-          // Block max (read FP16, compute FP32 register for stability).
-          float bm = -3.0e38f;
-          {
-            float32x4_t vmx = vdupq_n_f32(-3.0e38f);
-            unsigned int k = 0;
-            for (; k + 4 <= bk; k += 4) {
-              float16x4_t h = vreinterpret_f16_u16(vld1_u16(sp16 + k));
-              vmx = vmaxq_f32(vmx, vcvt_f32_f16(h));
-            }
-            bm = vmaxvq_f32(vmx);
-            for (; k < bk; ++k)
-              bm = std::max(bm, nntrainer::compute_fp16_to_fp32(sp16[k]));
-          }
-          const float nm = std::max(mrow[i], bm);
-          const float c = std::exp(mrow[i] - nm);
-          float bs = 0.0f;
-          {
-            // Softmax: read FP16 -> FP32 register, exp, store FP16.
-            float32x4_t vsum = vdupq_n_f32(0.0f), vnm = vdupq_n_f32(nm);
-            unsigned int k = 0;
-            for (; k + 4 <= bk; k += 4) {
-              float16x4_t h = vreinterpret_f16_u16(vld1_u16(sp16 + k));
-              float32x4_t v = vcvt_f32_f16(h);
-              float32x4_t e = vjepa_expq_f32(vsubq_f32(v, vnm));
-              float16x4_t e_h = vcvt_f16_f32(e);
-              vst1_u16(sp16 + k, vreinterpret_u16_f16(e_h));
-              vsum = vaddq_f32(vsum, e);
-            }
-            bs = vaddvq_f32(vsum);
-            for (; k < bk; ++k) {
-              float v = nntrainer::compute_fp16_to_fp32(sp16[k]);
-              float e = std::exp(v - nm);
-              sp16[k] = nntrainer::compute_fp32_to_fp16(e);
-              bs += e;
-            }
-          }
-          lrow[i] = lrow[i] * c + bs;
-          mrow[i] = nm;
-          float *ol = Ol.data() + (size_t)i * d;
-          for (unsigned int x = 0; x < d; ++x)
-            ol[x] *= c;
-        }
-
-        // AV: FP16 × FP16 -> FP16 (custom_hgemm).
-        nntrainer::neon::custom_hgemm(
-          reinterpret_cast<const __fp16 *>(Sp16.data()),
-          reinterpret_cast<const __fp16 *>(Vp + (size_t)kb * d),
-          reinterpret_cast<__fp16 *>(Pacc16.data()), bq, d, bk, 1.0f, 0.0f,
-          /*TransA=*/false, /*TransB=*/false);
-        // Accumulate Pacc16 -> Ol FP32 (FP32 accumulator across kb).
-        for (unsigned int i = 0; i < bq; ++i) {
-          float *ol = Ol.data() + (size_t)i * d;
-          const uint16_t *pa = Pacc16.data() + (size_t)i * d;
-          unsigned int x = 0;
-          for (; x + 8 <= d; x += 8) {
-            float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(pa + x));
-            float32x4_t lo = vcvt_f32_f16(vget_low_f16(h));
-            float32x4_t hi = vcvt_f32_f16(vget_high_f16(h));
-            vst1q_f32(ol + x, vaddq_f32(vld1q_f32(ol + x), lo));
-            vst1q_f32(ol + x + 4, vaddq_f32(vld1q_f32(ol + x + 4), hi));
-          }
-          for (; x < d; ++x)
-            ol[x] += nntrainer::compute_fp16_to_fp32(pa[x]);
-        }
-      } else
-#endif // ARM NEON q_fp16 branch
       {
-        // FP32 Q path: QK -> FP32 S, fused FP16 softmax store to Sp16, AV.
+        // QK -> FP32 score buffer S. One buffer, two query sources:
+        //   - q_fp16:  FP16 Q × FP16 K via FMLAL-widening — every product is
+        //     accumulated in FP32 (vfmlalq_low/high_f16), so V-JEPA-2 block-0's
+        //     ~160k per-element products and ~457k logits never overflow FP16.
+        //     No FP32 copy of Q is materialized.
+        //   - !q_fp16: FP32 Q × FP16 K via shgemm / avx2 / sgemm.
+        // The softmax below reads S (FP32) and stores normalized FP16 probs to
+        // Sp16 for the AV custom_hgemm.
 #if defined(__x86_64__) || defined(__i386__)
         mha_hsgemm_avx2(bq, bk, d, inv_sqrt, Qp_fp32 + (size_t)qb * d, d,
                         Kp + (size_t)kb * d, d, /*TransB=*/true, S.data(), bk);
 #elif defined(__ARM_NEON)
+        if (q_fp16) {
+          mha_qk_fmlal_f16xf16_to_f32(
+            reinterpret_cast<const __fp16 *>(Qp_fp16 + (size_t)qb * d),
+            reinterpret_cast<const __fp16 *>(Kp + (size_t)kb * d), S.data(), bq,
+            bk, d, inv_sqrt, d, d, bk);
+        } else {
           nntrainer::shgemm(
-            order, false, true, bq, bk, d, inv_sqrt,
-            Qp_fp32 + (size_t)qb * d, d,
-            reinterpret_cast<const __fp16 *>(Kp + (size_t)kb * d), d, 0.0f,
+            order, false, true, bq, bk, d, inv_sqrt, Qp_fp32 + (size_t)qb * d,
+            d, reinterpret_cast<const __fp16 *>(Kp + (size_t)kb * d), d, 0.0f,
             S.data(), bk);
+        }
 #else
-          nntrainer::sgemm(order, false, true, bq, bk, d, inv_sqrt,
-                           Qp_fp32 + (size_t)qb * d, d,
-                           Kp + (size_t)kb * d, d, 0.0f, S.data(), bk);
+        nntrainer::sgemm(order, false, true, bq, bk, d, inv_sqrt,
+                         Qp_fp32 + (size_t)qb * d, d, Kp + (size_t)kb * d, d,
+                         0.0f, S.data(), bk);
 #endif
 
         for (unsigned int i = 0; i < bq; ++i) {
@@ -1447,7 +1421,7 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
               ol[x] += pa[x];
           }
 #endif
-      } // FP32 Q path
+      } // unified QK (fmlal/shgemm) -> FP32 S -> softmax -> AV
     }
     for (unsigned int i = 0; i < bq; ++i) {
       const float inv = (lrow[i] > 0.0f) ? (1.0f / lrow[i]) : 0.0f;

@@ -124,10 +124,10 @@ Tensor VJEPA2ViT::createPatchEmbed(Tensor input) {
   // patch_embed is a plain FC, so it follows the model's global weight dtype
   // (FP32 for the FP32 model, Q4_0 for the quantized model — nntr_quantize
   // includes "patch_embed/proj" in its FC dtype map).
-  LayerHandle proj(
-    createLayer("fully_connected", {withKey("name", "patch_embed/proj"),
-                                    withKey("unit", std::to_string(DIM)),
-                                    withKey("disable_bias", "false")}));
+  LayerHandle proj(createLayer(
+    "fully_connected", {withKey("name", "patch_embed/proj"),
+                        withKey("unit", std::to_string(DIM)),
+                        withKey("disable_bias", "false")}));
   return proj(input);
 }
 
@@ -137,9 +137,10 @@ Tensor VJEPA2ViT::createPatchEmbed(Tensor input) {
 Tensor VJEPA2ViT::createAttention(const int layer_id, Tensor input) {
   const std::string prefix = "layer" + std::to_string(layer_id) + "_";
 
-  LayerHandle norm(createLayer("vjepa_layernorm",
-                               {withKey("name", prefix + "attention_norm"),
-                                withKey("epsilon", std::to_string(NORM_EPS))}));
+  LayerHandle norm(
+    createLayer("vjepa_layernorm",
+                {withKey("name", prefix + "attention_norm"),
+                 withKey("epsilon", std::to_string(NORM_EPS))}));
   Tensor normed = norm(input);
 
   // Names follow the LLM convention (wq/wk/wv/attention_out, ffn_up/ffn_down)
@@ -187,6 +188,10 @@ Tensor VJEPA2ViT::createAttention(const int layer_id, Tensor input) {
      withKey("num_heads_KV", std::to_string(NUM_HEADS)),
      withKey("max_timestep", std::to_string(NUM_PATCHES + 1)),
      withKey("is_causal", "false"), withKey("rope_theta", "0"),
+     // V-JEPA-2 block-0 attention logits reach ~457k, past FP16's 65504 ceiling.
+     // The fmlal-widening QK kernel computes the FP16 Q*K products in FP32
+     // accumulators, so the wide logits never overflow — no separate
+     // use_fp32_scores path is needed.
      withKey("use_gemm_attention", "true")}));
   Tensor context = attention({query, key, value});
 
@@ -203,9 +208,10 @@ Tensor VJEPA2ViT::createAttention(const int layer_id, Tensor input) {
 Tensor VJEPA2ViT::createMlp(const int layer_id, Tensor input) {
   const std::string prefix = "layer" + std::to_string(layer_id) + "_";
 
-  LayerHandle norm(createLayer("vjepa_layernorm",
-                               {withKey("name", prefix + "ffn_norm"),
-                                withKey("epsilon", std::to_string(NORM_EPS))}));
+  LayerHandle norm(
+    createLayer("vjepa_layernorm",
+                {withKey("name", prefix + "ffn_norm"),
+                 withKey("epsilon", std::to_string(NORM_EPS))}));
   Tensor h = norm(input);
 
   LayerHandle fc_up(createLayer(
@@ -214,6 +220,9 @@ Tensor VJEPA2ViT::createMlp(const int layer_id, Tensor input) {
                         withKey("disable_bias", "false")}));
   h = fc_up(h);
 
+  // Core "activation" gelu has no FP16 path (ActiFunc::gelu<half> calls the
+  // FP32 gelu_v2 on FP16 data and crashes), so use the custom token-parallel
+  // vjepa_gelu which casts each FP16 element up to FP32 for the exact-erf eval.
   LayerHandle gelu(
     createLayer("vjepa_gelu", {withKey("name", prefix + "ffn_gelu")}));
   h = gelu(h);
@@ -255,9 +264,10 @@ std::pair<Tensor, Tensor> VJEPA2ViT::constructModel() {
     h = createTransformerDecoderBlock(i, h);
   }
 
-  LayerHandle output_norm(createLayer(
-    "vjepa_layernorm", {withKey("name", "output_norm"),
-                        withKey("epsilon", std::to_string(NORM_EPS))}));
+  LayerHandle output_norm(
+    createLayer("vjepa_layernorm",
+                {withKey("name", "output_norm"),
+                 withKey("epsilon", std::to_string(NORM_EPS))}));
   h = output_norm(h);
 
   return {input, h};
