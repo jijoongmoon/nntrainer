@@ -224,6 +224,13 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
   use_gemm_attention = std::get<props::UseGemmAttention>(mha_core_props).get();
+#if !(ENABLE_FP16 && defined(__ANDROID__))
+  // The GEMM / flash-attention path (gemm_attention) is built and verified
+  // only for the ARM FP16 device build. On x86 / non-FP16 builds the AVX2
+  // flash path is unvalidated and NaNs on the wide V-JEPA encoder logits, so
+  // fall back to the reference attention kernels there.
+  use_gemm_attention = false;
+#endif
 
   if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
     skip_prefill =

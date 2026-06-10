@@ -188,6 +188,12 @@ Tensor VJEPA2ViT::createAttention(const int layer_id, Tensor input) {
      withKey("num_heads_KV", std::to_string(NUM_HEADS)),
      withKey("max_timestep", std::to_string(NUM_PATCHES + 1)),
      withKey("is_causal", "false"), withKey("rope_theta", "0"),
+     // V-JEPA applies 3D axial RoPE in the custom vjepa_rope layer *before*
+     // mha_core, so mha_core must NOT apply its own rotary embedding. Upstream
+     // gates the internal rope on use_rope (default true) rather than the old
+     // rope_theta>0 check, so disable it explicitly here — otherwise rope runs
+     // with theta=0 and produces inf/NaN frequencies.
+     withKey("use_rope", "false"),
      // V-JEPA-2 block-0 attention logits reach ~457k, past FP16's 65504 ceiling.
      // The fmlal-widening QK kernel computes the FP16 Q*K products in FP32
      // accumulators, so the wide logits never overflow — no separate
