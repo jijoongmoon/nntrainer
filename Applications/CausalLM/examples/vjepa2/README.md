@@ -77,10 +77,14 @@ values + `[e2e time]` + peak RSS.
 
 | Activation | threads | e2e (cool) | peak RAM | cosine vs torch |
 | --- | --- | --- | --- | --- |
-| Q4_0-FP16 | 8 | **~2.3 s** | 366 MB | **0.9898** |
-| Q4_0-FP16 | 4 | ~3.4 s | 362 MB | 0.9898 |
+| Q4_0-FP16 | 8 | **~2.3 s** | 369 MB | **0.9898** |
+| Q4_0-FP16 | 4 | ~3.8 s | 365 MB | 0.9898 |
 | Q4_0-FP16 | 1 | ~9.4 s | 359 MB | 0.9898 |
-| Q4_0-FP32 | 8 | ~2.5 s | 428 MB | 0.9906 |
+| Q4_0-FP32 | 8 | ~2.6 s | 431 MB | 0.9906 |
+| Q4_0-FP32 | 4 | ~4.0 s | 426 MB | 0.9906 |
+
+(Re-verified 2026-06-10 on the current build: token-0 output bit-identical to the
+cosine-reference run — `[0]=0.06958` FP16 / `[0]=0.07917` FP32, NaN-free.)
 
 FP16 activation is a bit faster and ~60 MB lighter; FP32 activation is a hair
 more accurate. Sustained back-to-back runs thermally throttle (timings drift
