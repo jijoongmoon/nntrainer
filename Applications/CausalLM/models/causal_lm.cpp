@@ -105,6 +105,33 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   global_token_len = 0;
 }
 
+std::vector<float *> CausalLM::buildInferenceInputs(float *input_sample) {
+  // Extra graph inputs ("input" layers beyond input0) are fed positionally in
+  // name-sorted order after the primary token-id buffer.
+  std::vector<std::pair<std::string, float *>> extra_inputs;
+  extra_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    extra_inputs.emplace_back(
+      "cache_k_l" + std::to_string(i),
+      reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
+    extra_inputs.emplace_back(
+      "cache_v_l" + std::to_string(i),
+      reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
+  }
+  appendExtraInputs(extra_inputs);
+
+  std::sort(
+    extra_inputs.begin(), extra_inputs.end(),
+    [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+
+  std::vector<float *> inference_inputs;
+  inference_inputs.reserve(1 + extra_inputs.size());
+  inference_inputs.push_back(input_sample);
+  for (const auto &extra : extra_inputs)
+    inference_inputs.push_back(extra.second);
+  return inference_inputs;
+}
+
 void CausalLM::allocateAndBindKVCache() {
   if (!kv_cache.isAllocated()) {
     // dtype matches mha_core's cache placeholders so external cache storage
@@ -433,30 +460,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    */
   std::vector<int64_t> token_ids;
   input.push_back(input_sample);
-  auto build_inference_inputs = [&]() {
-    std::vector<std::pair<std::string, float *>> cache_inputs;
-    cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
-    for (int i = 0; i < NUM_LAYERS; ++i) {
-      cache_inputs.emplace_back(
-        "cache_k_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
-      cache_inputs.emplace_back(
-        "cache_v_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
-    }
-
-    std::sort(
-      cache_inputs.begin(), cache_inputs.end(),
-      [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
-
-    std::vector<float *> inference_inputs;
-    inference_inputs.reserve(1 + cache_inputs.size());
-    inference_inputs.push_back(input_sample);
-    for (const auto &cache_input : cache_inputs)
-      inference_inputs.push_back(cache_input.second);
-    return inference_inputs;
-  };
-  input = build_inference_inputs();
+  input = buildInferenceInputs(input_sample);
 
   ///@note contains possible bug
   // std::vector<ml::train::TensorDim> input_dims;

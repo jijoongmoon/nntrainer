@@ -125,6 +125,22 @@ protected:
    */
   void registerCustomLayers() override;
 
+  /**
+   * @brief Assemble the positional input buffers for incremental_inference:
+   *        the token-id buffer first, then every extra "input" layer's buffer
+   *        in name-sorted order (matching the compiled graph's input order).
+   */
+  virtual std::vector<float *> buildInferenceInputs(float *input_sample);
+
+  /**
+   * @brief Hook for derived models to contribute extra named input buffers
+   *        (e.g. multimodal embedding side inputs) beyond the KV cache.
+   */
+  virtual void
+  appendExtraInputs(std::vector<std::pair<std::string, float *>> &inputs) {
+    (void)inputs;
+  }
+
   /** internal buffer */
   std::vector<std::string>
     output_list;             /**< List of output names for the model */

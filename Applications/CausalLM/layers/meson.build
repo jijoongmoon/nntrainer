@@ -11,6 +11,62 @@ causallm_reshaped_rms_norm_src_abs = [meson.current_source_dir() / 'reshaped_rms
 causallm_qkv_layer_src_abs = [meson.current_source_dir() / 'qkv_layer.cpp']
 causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_pooling_layer.cpp']
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
+causallm_embedding_injection_src_abs = [meson.current_source_dir() / 'embedding_injection.cpp']
+
+causallm_embedding_injection = shared_library(
+    'embedding_injection_layer',
+    causallm_embedding_injection_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_embedding_injection_dep = declare_dependency(
+    link_with: causallm_embedding_injection,
+    include_directories: causallm_layer_inc
+)
+
+causallm_vision_rope_src_abs = [meson.current_source_dir() / 'vision_rope.cpp']
+causallm_vision_rope = shared_library(
+    'vision_rope_layer',
+    causallm_vision_rope_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_vision_rope_dep = declare_dependency(
+    link_with: causallm_vision_rope,
+    include_directories: causallm_layer_inc
+)
+
+causallm_mrope_apply_src_abs = [meson.current_source_dir() / 'mrope_apply.cpp']
+causallm_mrope_apply = shared_library(
+    'mrope_apply_layer',
+    causallm_mrope_apply_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_mrope_apply_dep = declare_dependency(
+    link_with: causallm_mrope_apply,
+    include_directories: causallm_layer_inc
+)
+
+causallm_vision_attention_src_abs = [meson.current_source_dir() / 'vision_attention.cpp']
+causallm_vision_attention = shared_library(
+    'vision_attention_layer',
+    causallm_vision_attention_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_vision_attention_dep = declare_dependency(
+    link_with: causallm_vision_attention,
+    include_directories: causallm_layer_inc
+)
 
 causallm_rms_norm = shared_library(
     'rms_norm_layer', 

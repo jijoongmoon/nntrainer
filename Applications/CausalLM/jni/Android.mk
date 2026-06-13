@@ -21,6 +21,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/gpt_oss \
     $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
     $(LOCAL_PATH)/../models/qwen2 \
+    $(LOCAL_PATH)/../models/qwen25_omni \
     $(LOCAL_PATH)/../models/qwen3 \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
@@ -65,6 +66,12 @@ LOCAL_SRC_FILES := \
     ../models/sentence_transformer.cpp \
     ../kv_cache_manager.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
+    ../models/qwen25_omni/qwen25_omni_causallm.cpp \
+    ../models/qwen25_omni/qwen25_omni_audio_encoder.cpp \
+    ../models/qwen25_omni/qwen25_omni_audio_causallm.cpp \
+    ../models/qwen25_omni/whisper_mel.cpp \
+    ../models/qwen25_omni/qwen25_omni_vision_encoder.cpp \
+    ../models/qwen25_omni/qwen25_omni_vision_causallm.cpp \
     ../models/qwen2/qwen2_embedding.cpp \
     ../models/qwen3/qwen3_causallm.cpp \
     ../models/qwen3/qwen3_embedding.cpp \
@@ -87,6 +94,10 @@ LOCAL_SRC_FILES := \
     ../layers/tie_word_embedding.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../layers/qkv_layer.cpp \
+    ../layers/embedding_injection.cpp \
+    ../layers/vision_rope.cpp \
+    ../layers/mrope_apply.cpp \
+    ../layers/vision_attention.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
@@ -193,6 +204,12 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/sentence_transformer.cpp \
     ../kv_cache_manager.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
+    ../models/qwen25_omni/qwen25_omni_causallm.cpp \
+    ../models/qwen25_omni/qwen25_omni_audio_encoder.cpp \
+    ../models/qwen25_omni/qwen25_omni_audio_causallm.cpp \
+    ../models/qwen25_omni/whisper_mel.cpp \
+    ../models/qwen25_omni/qwen25_omni_vision_encoder.cpp \
+    ../models/qwen25_omni/qwen25_omni_vision_causallm.cpp \
     ../models/qwen2/qwen2_embedding.cpp \
     ../models/qwen3/qwen3_causallm.cpp \
     ../models/qwen3/qwen3_embedding.cpp \
@@ -214,6 +231,10 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/lm_head.cpp\
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../layers/qkv_layer.cpp \
+    ../layers/embedding_injection.cpp \
+    ../layers/vision_rope.cpp \
+    ../layers/mrope_apply.cpp \
+    ../layers/vision_attention.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
@@ -230,6 +251,7 @@ LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/../models/gpt_oss \
     $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
     $(LOCAL_PATH)/../models/qwen2 \
+    $(LOCAL_PATH)/../models/qwen25_omni \
     $(LOCAL_PATH)/../models/qwen3 \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \

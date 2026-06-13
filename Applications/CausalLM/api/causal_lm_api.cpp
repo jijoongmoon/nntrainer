@@ -29,6 +29,9 @@
 #include "gptoss_causallm.h"
 #include "json.hpp"
 #include "model_config_internal.h"
+#include "qwen25_omni_audio_causallm.h"
+#include "qwen25_omni_audio_encoder.h"
+#include "qwen25_omni_causallm.h"
 #include "qwen2_causallm.h"
 #if !defined(_WIN32)
 #include "qwen3_cached_slim_moe_causallm.h"
@@ -85,6 +88,26 @@ static void register_models() {
       "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::Qwen2CausalLM>(cfg, generation_cfg,
                                                          nntr_cfg);
+      });
+    for (const char *omni_arch :
+         {"Qwen2_5OmniModel", "Qwen2_5OmniForConditionalGeneration",
+          "Qwen2_5OmniThinkerForConditionalGeneration"}) {
+      causallm::Factory::Instance().registerModel(
+        omni_arch, [](json cfg, json generation_cfg, json nntr_cfg) {
+          return std::make_unique<causallm::Qwen25OmniCausalLM>(
+            cfg, generation_cfg, nntr_cfg);
+        });
+    }
+    causallm::Factory::Instance().registerModel(
+      "Qwen25OmniAudioEncoder",
+      [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::Qwen25OmniAudioEncoder>(
+          cfg, generation_cfg, nntr_cfg);
+      });
+    causallm::Factory::Instance().registerModel(
+      "Qwen25OmniAudioChat", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::Qwen25OmniAudioCausalLM>(
+          cfg, generation_cfg, nntr_cfg);
       });
     causallm::Factory::Instance().registerModel(
       "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {

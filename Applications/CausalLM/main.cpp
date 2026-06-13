@@ -42,6 +42,11 @@
 #if !defined(_WIN32) && !defined(__ANDROID__)
 #include "multilingual_tinybert_16mb.h"
 #endif
+#include "qwen25_omni_audio_causallm.h"
+#include "qwen25_omni_audio_encoder.h"
+#include "qwen25_omni_causallm.h"
+#include "qwen25_omni_vision_causallm.h"
+#include "qwen25_omni_vision_encoder.h"
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
 #if !defined(_WIN32)
@@ -205,6 +210,39 @@ int main(int argc, char *argv[]) {
     "Qwen2Embedding", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen2Embedding>(cfg, generation_cfg,
                                                         nntr_cfg);
+    });
+  /** Qwen2.5-Omni Thinker text model (text-only). The first name is what the
+   * HF repo config ships; the latter two appear in configs (re-)saved with
+   * newer transformers versions. */
+  for (const auto *omni_arch :
+       {"Qwen2_5OmniModel", "Qwen2_5OmniForConditionalGeneration",
+        "Qwen2_5OmniThinkerForConditionalGeneration"}) {
+    causallm::Factory::Instance().registerModel(
+      omni_arch, [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::Qwen25OmniCausalLM>(
+          cfg, generation_cfg, nntr_cfg);
+      });
+  }
+  causallm::Factory::Instance().registerModel(
+    "Qwen25OmniAudioEncoder", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen25OmniAudioEncoder>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen25OmniAudioChat", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen25OmniAudioCausalLM>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen25OmniVisionEncoder",
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen25OmniVisionEncoder>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen25OmniVisionChat", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen25OmniVisionCausalLM>(
+        cfg, generation_cfg, nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
     "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {

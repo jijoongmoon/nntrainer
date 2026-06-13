@@ -8,6 +8,7 @@ causallm_inc += include_directories('.')
 
 subdir('gpt_oss')
 subdir('qwen2')
+subdir('qwen25_omni')
 subdir('qwen3')
 subdir('qwen3_moe')
 subdir('qwen3_slim_moe')
@@ -19,7 +20,7 @@ if get_option('platform') != 'windows'
     subdir('gpt_oss_cached_slim')
     subdir('qwen3_cached_slim_moe')
 endif
-subdir('clip_vit')
+# subdir('clip_vit')  # disabled: directory missing from repo (pre-existing breakage)
 
 subdir('lfm2')
 

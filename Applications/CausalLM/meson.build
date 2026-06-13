@@ -31,6 +31,10 @@ causallm_layer_dependencies += [
     causallm_qkv_layer_dep,
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
+    causallm_embedding_injection_dep,
+    causallm_vision_rope_dep,
+    causallm_mrope_apply_dep,
+    causallm_vision_attention_dep,
 ]
 
 subdir('models')
@@ -229,15 +233,17 @@ if get_option('enable-test')
       timeout: 60,
       suite: 'unittests'
     )
+  endif
 
   # ClipVitTransformer structural unit tests
-  unittest_clip_vit_transformer = executable(
-    'unittest_clip_vit_transformer',
-    meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_clip_vit_transformer.cpp',
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_dep, causallm_layer_dependencies, causallm_dep],
-    build_by_default: true,
-    install: false,
-  )
+  # disabled: test source missing from repo (pre-existing breakage)
+  # unittest_clip_vit_transformer = executable(
+  #   'unittest_clip_vit_transformer',
+  #   meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_clip_vit_transformer.cpp',
+  #   dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_dep, causallm_layer_dependencies, causallm_dep],
+  #   build_by_default: true,
+  #   install: false,
+  # )
 
   # Lfm2VlVisionTransformer structural unit tests
   unittest_lfm2_vl_vision_transformer = executable(

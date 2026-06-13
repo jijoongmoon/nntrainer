@@ -681,8 +681,13 @@ def convert(args):
             write_fc(n("attn_v"),       kv_size, hidden,  fc_dtype)
             write_fc(n("attn_output"),  hidden,  q_size,  fc_dtype)
             write_norm(out, reader, n("ffn_norm"), hidden)
-            write_fc(n("ffn_up"),       ff_dim,  hidden,  fc_dtype)
+            # gate BEFORE up: the nntrainer graph wires swiglu({gate, up}) and
+            # loads weights in DFS-from-output order, which visits the gate
+            # branch first. Verified against HF Qwen3-0.6B greedy decoding
+            # (gate-first is coherent; up-first produces garbage). Matches the
+            # qwen2 converter fix (commit de8f981cf).
             write_fc(n("ffn_gate"),     ff_dim,  hidden,  fc_dtype)
+            write_fc(n("ffn_up"),       ff_dim,  hidden,  fc_dtype)
             write_fc(n("ffn_down"),     hidden,  ff_dim,  ffn_down_dtype)
             print(f"  layer {i:2d}/{n_layers} written")
 

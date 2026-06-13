@@ -73,6 +73,7 @@
 #include "gptoss_cached_slim_causallm.h"
 #endif
 #include "gptoss_causallm.h"
+#include "qwen25_omni_causallm.h"
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
 #if !defined(_WIN32)
@@ -241,6 +242,15 @@ void registerAllModels() {
                           return std::make_unique<causallm::Qwen2Embedding>(
                             cfg, generation_cfg, nntr_cfg);
                         });
+  for (const auto *omni_arch :
+       {"Qwen2_5OmniModel", "Qwen2_5OmniForConditionalGeneration",
+        "Qwen2_5OmniThinkerForConditionalGeneration"}) {
+    factory.registerModel(omni_arch,
+                          [](json cfg, json generation_cfg, json nntr_cfg) {
+                            return std::make_unique<causallm::Qwen25OmniCausalLM>(
+                              cfg, generation_cfg, nntr_cfg);
+                          });
+  }
   factory.registerModel("Qwen3ForCausalLM",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::Qwen3CausalLM>(
@@ -501,6 +511,11 @@ int main(int argc, char *argv[]) {
     json generation_cfg =
       causallm::LoadJsonFile(model_path + "/generation_config.json");
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+
+    // Qwen2.5-Omni nests the text model config under
+    // thinker_config.text_config; flatten so num_hidden_layers & friends are
+    // readable below. No-op for already-flat configs.
+    causallm::Qwen25OmniCausalLM::flattenThinkerTextConfig(cfg);
 
     // If a target config is specified, read dtypes from it
     if (!target_config_path.empty()) {
