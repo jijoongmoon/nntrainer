@@ -45,6 +45,7 @@
 #include "qwen25_omni_audio_causallm.h"
 #include "qwen25_omni_audio_encoder.h"
 #include "qwen25_omni_causallm.h"
+#include "qwen25_omni_talker_causallm.h"
 #include "qwen25_omni_vision_causallm.h"
 #include "qwen25_omni_vision_encoder.h"
 #include "qwen2_causallm.h"
@@ -242,6 +243,11 @@ int main(int argc, char *argv[]) {
   causallm::Factory::Instance().registerModel(
     "Qwen25OmniVisionChat", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen25OmniVisionCausalLM>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen25OmniTalker", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen25OmniTalkerCausalLM>(
         cfg, generation_cfg, nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
