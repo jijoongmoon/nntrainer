@@ -34,6 +34,8 @@ causallm_layer_dependencies += [
     causallm_embedding_injection_dep,
     causallm_vision_rope_dep,
     causallm_mrope_apply_dep,
+    causallm_snake_beta_dep,
+    causallm_conv1d_transpose_dep,
     causallm_vision_attention_dep,
 ]
 

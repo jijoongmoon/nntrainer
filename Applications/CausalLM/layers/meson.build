@@ -54,6 +54,34 @@ causallm_mrope_apply_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
+causallm_snake_beta_src_abs = [meson.current_source_dir() / 'snake_beta.cpp']
+causallm_snake_beta = shared_library(
+    'snake_beta_layer',
+    causallm_snake_beta_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_snake_beta_dep = declare_dependency(
+    link_with: causallm_snake_beta,
+    include_directories: causallm_layer_inc
+)
+
+causallm_conv1d_transpose_src_abs = [meson.current_source_dir() / 'conv1d_transpose.cpp']
+causallm_conv1d_transpose = shared_library(
+    'conv1d_transpose_layer',
+    causallm_conv1d_transpose_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_conv1d_transpose_dep = declare_dependency(
+    link_with: causallm_conv1d_transpose,
+    include_directories: causallm_layer_inc
+)
+
 causallm_vision_attention_src_abs = [meson.current_source_dir() / 'vision_attention.cpp']
 causallm_vision_attention = shared_library(
     'vision_attention_layer',
