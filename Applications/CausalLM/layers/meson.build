@@ -82,6 +82,20 @@ causallm_conv1d_transpose_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
+causallm_antialiased_snake_src_abs = [meson.current_source_dir() / 'antialiased_snake.cpp']
+causallm_antialiased_snake = shared_library(
+    'antialiased_snake_layer',
+    causallm_antialiased_snake_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_antialiased_snake_dep = declare_dependency(
+    link_with: causallm_antialiased_snake,
+    include_directories: causallm_layer_inc
+)
+
 causallm_vision_attention_src_abs = [meson.current_source_dir() / 'vision_attention.cpp']
 causallm_vision_attention = shared_library(
     'vision_attention_layer',
