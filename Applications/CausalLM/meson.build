@@ -37,6 +37,7 @@ causallm_layer_dependencies += [
     causallm_snake_beta_dep,
     causallm_conv1d_transpose_dep,
     causallm_antialiased_snake_dep,
+    causallm_scale_dep,
     causallm_vision_attention_dep,
 ]
 
