@@ -202,8 +202,8 @@ LayerNode::LayerNode(std::unique_ptr<nntrainer::Layer> &&l) :
   layer_node_props(new PropsType(
     props::Name(), props::Distribute(), props::Trainable(), {}, {},
     props::SharedFrom(), props::ClipGradByGlobalNorm(), props::Packed(),
-    props::WeightDtype(), props::WeightDtypeMap(), props::LossScaleForMixed(),
-    props::ComputeEngine())),
+    props::WeightDtype(), props::InputDtype(), props::WeightDtypeMap(),
+    props::LossScaleForMixed(), props::ComputeEngine())),
   
   layer_node_props_realization(
     new RealizationPropsType(props::Flatten(), props::Activation())),

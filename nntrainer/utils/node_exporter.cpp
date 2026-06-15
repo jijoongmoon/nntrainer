@@ -93,7 +93,8 @@ void Exporter::saveTflResult(
                    std::vector<props::InputShape>, props::SharedFrom,
                    props::ClipGradByGlobalNorm, props::Packed,
                    props::WeightDtype, props::InputDtype,
-                   props::LossScaleForMixed, props::ComputeEngine> &props,
+                   props::WeightDtypeMap, props::LossScaleForMixed,
+                   props::ComputeEngine> &props,
   const LayerNode *self) {
   createIfNull(tf_node);
   tf_node->setLayerNode(*self);
