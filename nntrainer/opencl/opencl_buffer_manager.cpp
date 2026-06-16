@@ -86,34 +86,22 @@ void *ClBufferManager::getSVMOutput(unsigned int idx) {
 }
 
 ClBufferManager::~ClBufferManager() {
-  if (inBufferA) {
-    delete inBufferA;
-  }
-  if (inBufferB) {
-    delete inBufferB;
-  }
-  if (inBufferC) {
-    delete inBufferC;
-  }
-  if (outBufferA) {
-    delete outBufferA;
-  }
-  if (outBufferB) {
-    delete outBufferB;
-  }
-
-  if (data_input) {
-    context_inst_.releaseSVMRegion(data_input);
-  }
-  for (auto &ptr : scale_vec) {
-    context_inst_.releaseSVMRegion(ptr);
-  }
-  for (auto &ptr : quant_vec) {
-    context_inst_.releaseSVMRegion(ptr);
-  }
-  for (auto &ptr : output_vec) {
-    context_inst_.releaseSVMRegion(ptr);
-  }
+  /** Intentionally a no-op (leak at process exit).
+   *
+   * The singleton lives in a function-local static
+   * (Singleton<T>::Global), so this destructor only ever runs from
+   * __cxa_finalize at process teardown. By then the Adreno user-mode
+   * driver has already run its own finalizers, and releasing CL
+   * resources here (clSVMFree via releaseSVMRegion, clReleaseMemObject
+   * via the Buffer deletes) null-derefs inside libgsl
+   * (gsl_memory_free_pure): every on-device CausalLM run exited with
+   * SIGSEGV after printing its results, and the crash raced the stdio
+   * flush, randomly truncating redirected output. The OS reclaims all
+   * GPU memory at process death, so the right move is to not touch the
+   * driver at all. (Trade-off: a dlclose() of the library mid-process
+   * would now leak these regions until exit; nntrainer is not used that
+   * way.)
+   */
 }
 
 } // namespace nntrainer

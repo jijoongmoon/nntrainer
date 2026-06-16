@@ -168,6 +168,25 @@ protected:
   virtual void allocateAndBindKVCache();
 
   /**
+   * @brief incremental_inference wrapper that feeds the REAL KV-cache tensors
+   *        (with their original MemoryData, isSVM() intact) into the graph's
+   *        input placeholders instead of letting the framework re-wrap the
+   *        raw pointers in fresh (flag-less) Tensor::Map MemoryData.
+   * @details With in-place input layers (NNTR_INPUT_INPLACE relaxation) the
+   *          mha_core cache input views alias the input placeholder directly
+   *          (view-of-view flattening), so whatever MemoryData fills the
+   *          placeholder reaches mha_core's svm_ok gate. A Map wrap of the
+   *          same pointer would report isSVM()=false and silently kill the
+   *          GPU attention path. Non-cache inputs (the prompt sample) keep
+   *          the framework's Map wrapping, byte-identical to
+   *          Model::incremental_inference(float* ...).
+   */
+  std::vector<float *> incrementalInference(unsigned int batch_size,
+                                            const std::vector<float *> &input,
+                                            unsigned int init_seq_len,
+                                            unsigned int from, unsigned int to);
+
+  /**
    * @brief Reset all mha_core layers' cache_index to @p pos and the
    *        KVCacheManager's tracked write position.
    */

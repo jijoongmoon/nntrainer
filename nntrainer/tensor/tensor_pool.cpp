@@ -23,6 +23,64 @@
 
 namespace nntrainer {
 
+namespace {
+/**
+ * @brief Derive the static residency class for an activation tensor.
+ * @details Planner-decided, applied uniformly to a tensor and (via the shared
+ *          MemoryData) its view dependents. GPU_CLMEM requires:
+ *  - the GPU-SVM backend (otherwise HOST: CPU build / CPU allocator),
+ *  - a GPU-engine producer,
+ *  - ALL view consumers on GPU (a CPU/SVM reader -- mha_core on the wq/wk/wv
+ *    outputs, lm_head on the final norm -- downgrades the tensor to SVM so no
+ *    reader is left on a stale plane),
+ *  - FP16 dtype (the FP32 layer paths are host/NEON; keeping FP32 tensors on
+ *    SVM protects them by construction).
+ *  Everything else on the GPU-SVM backend stays SVM (device-visible AND
+ *  host-addressable, as today).
+ */
+ResidencyClass deriveResidency(ml::train::LayerComputeEngine engine,
+                               bool all_consumers_gpu, bool is_fp16,
+                               bool gpu_svm_backend) {
+  if (!gpu_svm_backend)
+    return ResidencyClass::HOST;
+  if (engine == ml::train::LayerComputeEngine::GPU && all_consumers_gpu &&
+      is_fp16)
+    return ResidencyClass::GPU_CLMEM;
+  return ResidencyClass::SVM;
+}
+
+/** comma-separated any-substring match (bisect filters). */
+bool nameMatchesAny(const std::string &name, const char *list) {
+  if (list == nullptr)
+    return false;
+  const std::string s(list);
+  size_t pos = 0;
+  while (pos <= s.size()) {
+    size_t comma = s.find(',', pos);
+    const std::string tok =
+      s.substr(pos, comma == std::string::npos ? std::string::npos
+                                               : comma - pos);
+    if (!tok.empty() && name.find(tok) != std::string::npos)
+      return true;
+    if (comma == std::string::npos)
+      break;
+    pos = comma + 1;
+  }
+  return false;
+}
+
+const char *residencyName(ResidencyClass c) {
+  switch (c) {
+  case ResidencyClass::GPU_CLMEM:
+    return "GPU_CLMEM";
+  case ResidencyClass::SVM:
+    return "SVM";
+  default:
+    return "HOST";
+  }
+}
+} // namespace
+
 /**
  * @brief     Request tensor with the given spec
  *
@@ -33,7 +91,8 @@ namespace nntrainer {
 Tensor *TensorPool::request(const std::string &name, const TensorDim &dim,
                             const std::vector<unsigned int> &exec_order,
                             TensorLifespan lifespan, const Initializer &init,
-                            bool is_weight_grad) {
+                            bool is_weight_grad,
+                            ml::train::LayerComputeEngine engine) {
 
   bool is_virtual = lifespan == TensorLifespan::VIRTUAL;
   lifespan = is_virtual ? TensorLifespan::UNMANAGED : lifespan;
@@ -41,7 +100,7 @@ Tensor *TensorPool::request(const std::string &name, const TensorDim &dim,
     {is_weight_grad,
      std::make_unique<Tensor>(dim, false, init, name,
                               QScheme::PER_CHANNEL_AFFINE, is_virtual),
-     TensorPool::SourceDetails{0, lifespan, exec_order, {}}});
+     TensorPool::SourceDetails{0, lifespan, exec_order, {}, engine}});
 }
 
 /**
@@ -64,7 +123,8 @@ Tensor *TensorPool::placeholder(const std::string &name, const TensorDim &dim) {
 Tensor *TensorPool::view(const std::string &name, const std::string &reference,
                          const TensorDim &dim,
                          const std::vector<unsigned int> &exec_order,
-                         TensorLifespan lifespan, const size_t offset) {
+                         TensorLifespan lifespan, const size_t offset,
+                         ml::train::LayerComputeEngine consumer_engine) {
   auto &spec = getSourceSpec(reference);
 
   NNTR_THROW_IF(spec.tensor->getDataType() != dim.getDataType() ||
@@ -95,7 +155,15 @@ Tensor *TensorPool::view(const std::string &name, const std::string &reference,
     << " name: " << spec.tensor->getName();
 
   expandLifespan(spec, exec_order, lifespan);
-  std::get<SourceDetails>(spec.details).dependents.push_back(pool.size());
+  {
+    auto &src_details = std::get<SourceDetails>(spec.details);
+    src_details.dependents.push_back(pool.size());
+    /** static residency: a non-GPU consumer of this view downgrades the source
+     * out of GPU_CLMEM (every reader must be able to bind the chosen plane). */
+    src_details.all_consumers_gpu &=
+      (consumer_engine == ml::train::LayerComputeEngine::GPU);
+    src_details.view_count++;
+  }
 
   /** @note below invalidates spec reference */
   /** @note in case of view of view, internal datastructure saves the src to
@@ -224,6 +292,48 @@ void TensorPool::allocate(bool init) {
     return;
   mem_pool->allocate();
 
+  /** S0: planner-decided static residency. The backend allocator (resolved
+   * once) tells us whether GPU cl_mem residency is even possible. INERT: the
+   * class is stamped on the MemoryData but no layer binds by it yet, so the
+   * output is byte-identical (and token-identical). */
+  /** GPU_CLMEM is only meaningful when the cl_mem plane actually exists, i.e.
+   * the ClBufferPool was selected (same condition as the factory): class ⟺
+   * handle. With the pool off every tensor derives SVM/HOST and all binding
+   * sites fall through to today's paths (byte-identical). */
+  static const bool clmem_pool_on =
+    std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr;
+  const bool gpu_svm_backend =
+    allocator_ && allocator_->getName() == "gpu-svm";
+  const bool clmem_eligible = gpu_svm_backend && clmem_pool_on;
+  static const bool dump_residency =
+    std::getenv("NNTR_CLMEM_RESIDENCY_DUMP") != nullptr;
+  /** Tensor-granular bisect: when set, only GPU_CLMEM-eligible tensors whose
+   * name contains the substring keep the class; the rest downgrade to SVM.
+   * EXCLUDE is the inverse (matching tensors downgrade). Tensor-consistent by
+   * construction (the WHOLE tensor flips, all its producers and consumers with
+   * it) -- unlike the per-edge NORM_ONE gates. */
+  static const char *clmem_filter = std::getenv("NNTR_CLMEM_CLASS_FILTER");
+  static const char *clmem_exclude = std::getenv("NNTR_CLMEM_CLASS_EXCLUDE");
+  /** Input-boundary RAISE list (design §2.5): tensors written by a HOST
+   * producer that explicitly uploads them to the cl_mem plane afterwards
+   * (clmem_raise_cl in the producing layer -- the embedding dequant loop).
+   * Such a tensor may be GPU_CLMEM despite its CPU producer engine, removing
+   * the layer0 coarse-SVM ingress (the measured visibility hazard). Default
+   * covers the CausalLM embedding output; override via NNTR_CLMEM_RAISE. */
+  static const char *clmem_raise = [] {
+    const char *e = std::getenv("NNTR_CLMEM_RAISE");
+    return e ? e : "embedding0:out0";
+  }();
+  /** Output-boundary LOWER list (design §2.5): GPU-produced tensors whose
+   * HOST consumer explicitly lowers them (clmem_lower_cl: one blocking
+   * readback -- the lm_head reading the final norm). Such a tensor may be
+   * GPU_CLMEM despite its CPU consumer. Default covers the CausalLM final
+   * norm output; override via NNTR_CLMEM_LOWER. */
+  static const char *clmem_lower = [] {
+    const char *e = std::getenv("NNTR_CLMEM_LOWER");
+    return e ? e : "output_norm:out0";
+  }();
+
   /** set the pointers using the token for all the tensors */
   for (auto &spec : pool) {
     auto details = std::get_if<SourceDetails>(&spec.details);
@@ -234,6 +344,95 @@ void TensorPool::allocate(bool init) {
     ml_logi("Memory Alloc Details (Tensor): %s : %zu : address %p",
             spec.tensor->getName().c_str(), spec.tensor->getMemoryBytes(),
             spec.tensor->getData());
+
+    /** Stamp the static residency class on the freshly-bound MemoryData.
+     * Dependents (views) share this MemoryData via syncDependents and thus
+     * inherit the same class for free. */
+    if (auto md = spec.tensor->getMemoryData()) {
+      const bool is_fp16 =
+        spec.tensor->getDataType() == ml::train::TensorDim::DataType::FP16;
+      ResidencyClass cls =
+        deriveResidency(details->engine, details->all_consumers_gpu, is_fp16,
+                        gpu_svm_backend);
+      /** Input-boundary raise: host-produced but producer-uploaded tensors
+       * (see clmem_raise above) join the cl_mem plane when their consumers
+       * are all GPU. The fan-out restriction below does NOT apply to them --
+       * the producer's explicit upload IS the coherence point. */
+      const bool boundary_raise =
+        cls == ResidencyClass::SVM && gpu_svm_backend && is_fp16 &&
+        details->all_consumers_gpu &&
+        nameMatchesAny(spec.tensor->getName(), clmem_raise);
+      /** Output-boundary lower: GPU producer + a HOST consumer that
+       * explicitly lowers (see clmem_lower above) -- bypass the consumer-AND. */
+      const bool boundary_lower =
+        cls == ResidencyClass::SVM && gpu_svm_backend && is_fp16 &&
+        details->engine == ml::train::LayerComputeEngine::GPU &&
+        nameMatchesAny(spec.tensor->getName(), clmem_lower);
+      if (boundary_raise || boundary_lower)
+        cls = ResidencyClass::GPU_CLMEM;
+      /** Fan-out restriction (device-measured): tensors consumed through the
+       * multiout fan-out (view_count > 1) corrupt on the cl_mem plane (every
+       * single-consumer tensor is token-identical; root cause of the fan-out
+       * interaction is still open -- 20+ structural hypotheses eliminated).
+       * Keep them SVM until that is resolved. NNTR_CLMEM_FANOUT=1 lifts the
+       * restriction for debugging. */
+      // 2026-06-15: the fan-out cl_mem coherence bug this guarded against
+      // ("garbage from token 1" for view_count>1 edges) is FIXED on the current
+      // build (QKV-CLMEM default + value-probe campaign + the per-offset
+      // SVM-plane fix). NNTR_CLMEM_FANOUT=1 now yields token-IDENTICAL,
+      // deterministic output on both Qwen3-0.6B (md5-stable) and Gemma2-2B
+      // (md5 58f11688, 2 runs) with the fan-out residual+norm edges
+      // (attention_norm/post_attention/decoder_output:out0) on cl_mem -- which
+      // removes the 3 forced SVM unmap/map round-trips per block, lifting decode
+      // (Qwen3 +15% 15.5->17.8 TPS, Gemma2-2B +3%; prefill unchanged). Default
+      // ON; NNTR_CLMEM_FANOUT=0 restores the SVM fan-out demotion.
+      static const bool allow_fanout = []() {
+        const char *e = std::getenv("NNTR_CLMEM_FANOUT");
+        return !e || e[0] != '0';
+      }();
+      if (cls == ResidencyClass::GPU_CLMEM &&
+          (!clmem_eligible ||
+           (!allow_fanout && !boundary_raise && !boundary_lower &&
+            details->view_count > 1) ||
+           (clmem_filter != nullptr &&
+            !nameMatchesAny(spec.tensor->getName(), clmem_filter)) ||
+           nameMatchesAny(spec.tensor->getName(), clmem_exclude) ||
+           /** KV cache stays OFF the cl_mem plane by design (sequence-
+            * persistent, SVM-consumed throughout mha; the mha-as-GPU-consumer
+            * rule would otherwise flip it with zero binding code). */
+           nameMatchesAny(spec.tensor->getName(), "cache_") ||
+           /** Q/K/V projections stay SVM by default: their cl_mem consumption
+            * chain (FC kernel-write -> rope/qk reads) lands in deterministic
+            * schedule-dependent divergence on this driver -- every drained
+            * inspection shows correct bytes, every consume path through
+            * cl_mem diverges, values-forced-legacy matches baseline
+            * (device-bisected exhaustively). Re-enable for debugging with
+            * NNTR_CLMEM_QKV=1. The attention OUTPUT (o) conversion is
+            * baseline-identical and stays on. */
+           ([]() {
+              // 2026-06-12 re-baseline: QKV CLMEM is the DEFAULT (the
+              // value-probe campaign proved the converted path computes
+              // bit-identical math; the old exclusion preserved a race
+              // pattern, not correctness). NNTR_CLMEM_QKV=0 restores it.
+              static const bool qkv_off = []() {
+                const char *e = std::getenv("NNTR_CLMEM_QKV");
+                return e && e[0] == '0';
+              }();
+              return qkv_off;
+            }() &&
+            (nameMatchesAny(spec.tensor->getName(), "_wq:out0,_wk:out0") ||
+             nameMatchesAny(spec.tensor->getName(), "_wv:out0")))))
+        cls = ResidencyClass::SVM;
+      md->setResidency(cls);
+      if (dump_residency) {
+        // stderr (not logcat): the ring buffer drops lines under load, making
+        // partition counts lie. stderr is lossless and grep-able per run.
+        std::fprintf(stderr, "[residency] %-40s %-9s clmem=%p\n",
+                     spec.tensor->getName().c_str(), residencyName(cls),
+                     spec.tensor->getClMem());
+        std::fflush(stderr);
+      }
+    }
 
     syncDependents(spec);
   }
@@ -369,7 +568,8 @@ Tensor *TensorPool::requestOrExtend(const std::string &name,
                                     const TensorDim &dim,
                                     const std::vector<unsigned int> &exec_order,
                                     TensorLifespan lifespan,
-                                    const Initializer &init) {
+                                    const Initializer &init,
+                                    ml::train::LayerComputeEngine engine) {
   NNTR_THROW_IF(lifespan == TensorLifespan::UNMANAGED, std::invalid_argument)
     << "unmanaged life span is not supported";
 
@@ -381,7 +581,8 @@ Tensor *TensorPool::requestOrExtend(const std::string &name,
       << "tensor initializer mismatch for requestOrExtend name: " << name;
     return extend(name, dim, exec_order, lifespan);
   } else {
-    return request(name, dim, exec_order, lifespan, init);
+    return request(name, dim, exec_order, lifespan, init,
+                   /*is_weight_grad=*/false, engine);
   }
 }
 

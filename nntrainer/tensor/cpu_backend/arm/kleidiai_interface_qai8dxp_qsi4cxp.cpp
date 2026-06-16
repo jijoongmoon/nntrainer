@@ -62,6 +62,8 @@ using std::chrono::seconds;      // or microseconds
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_4x8x32_neon_i8mm.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp_qsi4cxp_interface.h"
+#include "kai/matmul_clamp_f16_qai8dxp_qsi4cxp/kai_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm.h"
+#include "kai/pack/kai_lhs_quant_pack_qai8dxp_f16.h"
 #include "kai/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
 #include "kai/pack/kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.h"
 #include "kai/pack/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.h"
@@ -491,4 +493,50 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp(size_t m, size_t n, size_t k,
       m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
       idx_variant, transB, lower_bound, upper_bound);
   }
+}
+
+void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_f16(
+  size_t m, size_t n, size_t k, const void *lhs_native_mtx_f16,
+  void *rhs_packed_mtx_qs4cx, void *dst_act_mtx_f16, bool transB,
+  float lower_bound, float upper_bound) {
+  // Locked to the 4x4x32 i8mm variant — the only KAI matmul we have a
+  // fp16-dst fork for. The packed RHS bytes must come from a 4x4x32-
+  // compatible packing (nr=4, kr=16, sr=2), which is what
+  // Int4Utils::quantizeAndPackKai emits and what the load-time
+  // assembleKaiRhsPacked helper turns into a full KAI rhs_packed buffer.
+  (void)transB; // RHS layout is fixed for this fp16 path
+
+  constexpr size_t mr = 4;
+  constexpr size_t kr = 16;
+  constexpr size_t sr = 2;
+  constexpr size_t kai_fp16_size = sizeof(uint16_t);
+
+  // LHS packing direct from fp16 — no fp32 promotion buffer.
+  const size_t lhs_packed_size =
+    kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f16(m, k, mr, kr, sr);
+  uint8_t *lhs_packed_mtx_qa8dx = new uint8_t[lhs_packed_size];
+  kai_run_lhs_quant_pack_qai8dxp_f16(m, k, mr, kr, sr, /*m_idx_start=*/0,
+                                     lhs_native_mtx_f16, k * kai_fp16_size,
+                                     lhs_packed_mtx_qa8dx);
+
+  const size_t dst_stride = n * kai_fp16_size;
+  const size_t lhs_offset =
+    kai_get_lhs_packed_offset_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
+      0, k);
+  const size_t rhs_offset =
+    kai_get_rhs_packed_offset_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
+      0, k);
+  const size_t dst_offset =
+    kai_get_dst_offset_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
+      0, 0, dst_stride);
+
+  const void *lhs_ptr = (const char *)lhs_packed_mtx_qa8dx + lhs_offset;
+  const void *rhs_ptr = (const char *)rhs_packed_mtx_qs4cx + rhs_offset;
+  void *dst_ptr = (uint8_t *)dst_act_mtx_f16 + dst_offset;
+
+  kai_run_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
+    m, n, k, lhs_ptr, rhs_ptr, dst_ptr, dst_stride, kai_fp16_size, lower_bound,
+    upper_bound);
+
+  delete[] lhs_packed_mtx_qa8dx;
 }

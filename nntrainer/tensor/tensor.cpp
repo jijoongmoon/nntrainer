@@ -249,7 +249,7 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
   } else if (d.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, buf, qscheme);
   } else if (d.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(d, buf);
+    itensor_ = std::make_unique<Int4QTensor>(d, buf, qscheme);
   } else if (d.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(d, buf);
@@ -1265,6 +1265,16 @@ const std::shared_ptr<MemoryData> Tensor::getMemoryData() const {
 
 size_t Tensor::getOffset() const { return itensor_->getOffset(); }
 
+bool Tensor::isClMem() const {
+  auto md = itensor_->getMemoryData();
+  return md && md->isClMem();
+}
+
+void *Tensor::getClMem() const {
+  auto md = itensor_->getMemoryData();
+  return md ? md->deviceMem() : nullptr;
+}
+
 void Tensor::copy(const Tensor &from) {
   /// @todo enable copy to non-contiguous tensor
   if (!itensor_->getContiguous() || !from.getContiguous()) {
@@ -1618,6 +1628,16 @@ size_t Tensor::scale_size() const { return itensor_->scale_size(); }
 
 QScheme Tensor::q_scheme() const { return itensor_->q_scheme(); }
 
+const uint8_t *Tensor::getOrBuildKaiRhsPacked(size_t n, size_t k) const {
+  // Only Int4QTensor implements the cache; for any other backing tensor
+  // type the caller falls back to its own pack path.
+  if (getDataType() != ml::train::TensorDim::DataType::QINT4) {
+    return nullptr;
+  }
+  auto *int4_t = static_cast<Int4QTensor *>(itensor_.get());
+  return int4_t->getOrBuildKaiRhsPacked(n, k);
+}
+
 void Tensor::mergeAxis(unsigned int axis1, unsigned int axis2) {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot merge axis";
@@ -1641,6 +1661,14 @@ Tensor Tensor::getSharedDataTensor(const TensorDim dim_, size_t offset,
   Tensor ret = *this;
   itensor_->getSharedDataTensor(dim_, offset, reset_stride, name_,
                                 ret.itensor_.get());
+  // Propagate the GPU backing pointer to the view (Segment A residency).
+  // Shared-data views share the same underlying buffer; if the source
+  // Tensor was tagged with a GPU TensorBacking, downstream consumers
+  // that receive the view (e.g., dotCl_v8c's input_step) must see the
+  // same backing. The copy ctor invoked by `Tensor ret = *this` resets
+  // gpu_backing_ to nullptr (by design — copies don't claim ownership);
+  // explicit propagation here is the share-data exception.
+  ret.gpu_backing_ = this->gpu_backing_;
   return ret;
 }
 

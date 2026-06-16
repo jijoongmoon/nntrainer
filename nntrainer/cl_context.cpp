@@ -15,12 +15,16 @@
  */
 
 #include <addition_layer_cl.h>
+#include <attention_kernels.h>
+#include <blas_kernel_interface.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
 #include <compute_ops.h>
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
+#include <geglu_cl.h>
+#include <mutex>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
@@ -120,6 +124,12 @@ void ClContext::add_default_object() {
   if (SwiGLULayerCl::registerClKernels(*this)) {
     registerFactory(nntrainer::createLayer<SwiGLULayerCl>, SwiGLULayerCl::type,
                     ml::train::LayerType::LAYER_SWIGLU);
+  }
+
+  if (GeGLULayerCl::registerClKernels(*this)) {
+    // No dedicated LayerType enum for GeGLU; register by type string only
+    // (int_key auto-assigned). createLayer("geglu", {engine=gpu}) routes here.
+    registerFactory(nntrainer::createLayer<GeGLULayerCl>, GeGLULayerCl::type);
   }
 
   if (ReshapeLayerCl::registerClKernels(*this)) {
@@ -241,28 +251,58 @@ void ClContext::initAttentionClKernels() {
 
 #ifdef ENABLE_FP16
   registerClKernel(rotary_emb_fp16_kernel, "rotary_emb_cl_fp16");
+
+  // Pre-build the prefill-critical PROGRAMS at context init (model load) so
+  // their ~300ms clCreateProgramWithBinary cost does not land inside the
+  // first timed prefill. One kernel per program suffices: the program cache
+  // in clCreateKernel makes sibling kernels of the same source free.
+  // Skipped under NNTR_V8C_BUF (Intel buffer path) where these programs use
+  // different compile options -- the hot path builds them on first use as
+  // before.
+  if (std::getenv("NNTR_V8C_BUF") == nullptr) {
+    registerClKernel(two_conv_attention_kernel, "softmax_row_f16");
+    registerClKernel(int8_int4_gemm_v8c_kernel, "v8c_act_quant_f16_par");
+    // rope/scatter program (file-local source in attention_kernels.cpp).
+    attention_prewarm_programs(*this);
+    // Remaining first-use builds the CL-event profiler still shows inside
+    // the first prefill as one-time idle outliers (first>>p50): the fp16
+    // norm program and the Q6_K lm_head GEMV program (~30-40ms each).
+    registerClKernel(rmsnorm_fp16_kernel, "rmsnorm_cl_fp16_coop");
+    registerClKernel(q6_k_sgemv_kernel, "kernel_mul_mv_q6_K_f32");
+    // v8c output-residency program (copy_h2h/add_h2h, file-local source in
+    // blas_kernel_interface.cpp) -- the rmsnorm->copy_h2h and gemm->copy_h2h
+    // first-call outliers (~25ms each, clprof 2026-06-12).
+    v8c_prewarm_programs(*this);
+  }
 #endif
   attention_kernels_initialized = true;
 }
 
 const ClContext::SharedPtrClKernel
-ClContext::registerClKernel(std::string kernel_string, std::string kernel_name,
-                            std::string compile_options) {
-  // check if created before
-  if (ocl_kernel_map.find(kernel_name + compile_options) !=
-      ocl_kernel_map.end()) {
-    return ocl_kernel_map[kernel_name + compile_options];
-  }
+ClContext::registerClKernel(const std::string &kernel_string,
+                            const std::string &kernel_name,
+                            const std::string &compile_options) {
+  // check if created before. Hot path: single key construction + one lookup,
+  // and (crucially) NO copy of the multi-10KB kernel source -- the previous
+  // by-value parameters copied the full source string on every cached lookup,
+  // which measured ~12ms per call on Adreno/Android (~36ms host issue tax per
+  // layer in the attention path alone; the GPU sat idle exactly that long).
+  const std::string key = kernel_name + compile_options;
+  auto it = ocl_kernel_map.find(key);
+  if (it != ocl_kernel_map.end())
+    return it->second;
 
-  // creating shared_ptr for kernel object
+  // creating shared_ptr for kernel object (cold path: copies are fine here,
+  // clCreateKernel takes mutable refs)
+  std::string ks = kernel_string, kn = kernel_name, co = compile_options;
   SharedPtrClKernel kernelPtr = std::make_shared<opencl::Kernel>();
-  if (!clCreateKernel(kernel_string, kernel_name, compile_options, kernelPtr)) {
+  if (!clCreateKernel(ks, kn, co, kernelPtr)) {
     ml_loge("Failed to register kernel %s", kernel_name.c_str());
     return nullptr;
   }
   // add to map
-  ocl_kernel_map.emplace(kernel_name + compile_options, kernelPtr);
-  return ocl_kernel_map[kernel_name + compile_options];
+  ocl_kernel_map.emplace(key, kernelPtr);
+  return ocl_kernel_map[key];
 }
 
 bool ClContext::clCreateKernel(std::string &kernel_string,
@@ -276,20 +316,56 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 
   opencl::Program program;
 
-  // reading binary
+  // In-memory program cache: kernels that share one source+options reuse the
+  // built cl_program. Without this every kernel re-did its own binary-file
+  // read + clCreateProgramWithBinary (~300ms for the large sources on
+  // Adreno 840) -- e.g. the 3 attention kernels of one program paid ~0.9s,
+  // all inside the FIRST timed prefill (mis-read as a per-layer issue tax).
+  static std::unordered_map<std::string, opencl::Program> program_cache;
+  static std::mutex program_cache_mtx;
+  const std::string pc_key =
+    std::to_string(program.GetKernelHash(kernel_string, "")) + "|" +
+    compile_options;
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    auto it = program_cache.find(pc_key);
+    if (it != program_cache.end())
+      return kernel_ptr_->CreateKernelFromProgram(it->second, kernel_name);
+  }
+
+  // On-disk kernel binary cache. The cache key folds in the per-kernel
+  // compile_options AND the device signature (name + driver version): a stored
+  // binary is only valid for the exact source + options it was built from and
+  // for the same GPU/driver, so a binary from another device or a driver update
+  // must never be loaded as-is. clCreateProgramWithBinary still validates and
+  // can reject a stale binary, so a load failure falls back to a source compile
+  // (and re-caches), never a hard failure.
+  static const std::string device_sig =
+    opencl::ContextManager::Global().GetDeviceSignature();
   std::string binary_file_path =
     opencl::Program::DEFAULT_KERNEL_PATH + "/" +
-    std::to_string(program.GetKernelHash(kernel_string, "")) + ".cl.bin";
+    std::to_string(program.GetKernelHash(kernel_string,
+                                         compile_options + "|" + device_sig)) +
+    ".cl.bin";
   auto binary_data = KERNEL_CACHE_ENABLED ? readBinaryFile(binary_file_path)
                                           : std::vector<std::byte>();
 
+  bool loaded_from_binary = false;
   if (KERNEL_CACHE_ENABLED && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
             kernel_name.c_str(), binary_file_path.c_str());
-    result = program.CreateCLProgramWithBinary(
+    loaded_from_binary = program.CreateCLProgramWithBinary(
       opencl::ContextManager::Global().GetContext(),
       opencl::ContextManager::Global().GetDeviceId(), binary_data,
       binary_file_path, "");
+    if (!loaded_from_binary)
+      ml_logw("Cached kernel binary %s rejected (stale device/driver?); "
+              "recompiling from source",
+              binary_file_path.c_str());
+  }
+
+  if (loaded_from_binary) {
+    result = true;
   } else {
     ml_logi("Binary for kernel %s not found, compiling from source...",
             kernel_name.c_str());
@@ -299,14 +375,16 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
                               kernel_string, compile_options);
 
     if (KERNEL_CACHE_ENABLED && result) {
+      // Best-effort cache write: a failure to persist must not fail the build,
+      // the freshly compiled program is already usable.
       auto binary = program.GetProgramBinary(
         opencl::ContextManager::Global().GetDeviceId());
-
       if (binary.empty()) {
-        ml_loge("Failed retrieving binary for kernel %s", kernel_name.c_str());
-        result = false;
-      } else {
-        result &= writeBinaryFile(binary_file_path, binary);
+        ml_logw("Failed retrieving binary for kernel %s; skipping cache write",
+                kernel_name.c_str());
+      } else if (!writeBinaryFile(binary_file_path, binary)) {
+        ml_logw("Failed writing kernel cache %s; continuing",
+                binary_file_path.c_str());
       }
     }
   }
@@ -315,6 +393,10 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
     return false;
   }
 
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    program_cache.emplace(pc_key, program);
+  }
   result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
 
   return result;

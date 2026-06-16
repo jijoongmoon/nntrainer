@@ -71,6 +71,7 @@
 #include "causal_lm.h"
 #include "deberta_v2.h"
 #include "embedding_gemma.h"
+#include "gemma2_causallm.h"
 #include "gemma3_causallm.h"
 #include "gemma4_causallm.h"
 #if !defined(_WIN32)
@@ -99,8 +100,10 @@ namespace {
  * @brief Map of string data type names to DataType enum values
  */
 const std::map<std::string, DataType> dtype_str_map = {
-  {"FP32", DataType::FP32}, {"FP16", DataType::FP16}, {"Q4_0", DataType::Q4_0},
-  {"Q6_K", DataType::Q6_K}, {"Q4_K", DataType::Q4_K}, {"NONE", DataType::NONE},
+  {"FP32", DataType::FP32},   {"FP16", DataType::FP16},
+  {"Q4_0", DataType::Q4_0},   {"Q6_K", DataType::Q6_K},
+  {"Q4_K", DataType::Q4_K},   {"QINT4", DataType::QINT4},
+  {"NONE", DataType::NONE},
 };
 
 /**
@@ -165,11 +168,20 @@ std::string dataTypeToStr(DataType dt) {
 }
 
 /**
- * @brief Build model_tensor_type string from fc_dtype and activation dtype
- *        Format: "<weight_type>-<activation_type>"
+ * @brief Build model_tensor_type string from fc_dtype and the source's
+ *        activation dtype. Format: "<weight_type>-<activation_type>".
+ *        Quantization only changes weight bytes; the activation/compute dtype
+ *        (and the packed=false norm weights that follow it) is preserved from
+ *        the source model_tensor_type. So an FP16-FP16 source yields
+ *        "<fc>-FP16" (fp16 norms), an FP32-FP32 source yields "<fc>-FP32".
  */
-std::string buildModelTensorType(const std::string &fc_dtype) {
-  return fc_dtype + "-FP32";
+std::string buildModelTensorType(const std::string &fc_dtype,
+                                 const std::string &src_tensor_type) {
+  auto dash = src_tensor_type.find('-');
+  std::string act = (dash != std::string::npos && dash + 1 < src_tensor_type.size())
+                      ? src_tensor_type.substr(dash + 1)
+                      : std::string("FP32");
+  return fc_dtype + "-" + act;
 }
 
 /**
@@ -342,6 +354,11 @@ void registerAllModels() {
         cfg, generation_cfg, nntr_cfg);
     });
 #endif
+  factory.registerModel("Gemma2ForCausalLM",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::Gemma2CausalLM>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
   factory.registerModel("Gemma3ForCausalLM",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::Gemma3CausalLM>(
@@ -386,6 +403,9 @@ void printUsage(const char *prog) {
     << "\n"
     << "Options:\n"
     << "  --output, -o <path>   Output directory (default: <model_path>)\n"
+    << "  --container <form>    QINT4 on-disk container: section_a (legacy,\n"
+    << "                        default) or plain (engine-neutral, shared\n"
+    << "                        with the upstream KAI CPU path)\n"
     << "  --fc_dtype <type>     Target dtype for FC layers (default: Q4_0)\n"
     << "  --embd_dtype <type>   Target dtype for embedding (default: FP32)\n"
     << "  --lmhead_dtype <type> Target dtype for LM head (default: same as "
@@ -457,6 +477,10 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
     dtype_map["embedding0"] = embd_dtype;
   }
 
+  // ViT (TimmViT) patch-embedding projection is a plain FC layer.
+  if (fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE) {
+    dtype_map["patch_embed/proj"] = fc_dtype;
+  }
   // Gemma4 PLE layers - set to Q4_0 first
   dtype_map["per_layer_input_embedding"] = fc_dtype;
   // Gemma4 PLE projection
@@ -614,6 +638,35 @@ int main(int argc, char *argv[]) {
       }
     } else if (arg == "--config" && i + 1 < argc) {
       target_config_path = argv[++i];
+    } else if (arg == "--container" && i + 1 < argc) {
+      std::string container = argv[++i];
+      if (container == "plain") {
+        // Engine-neutral QINT4 record (PR#3978-compatible): plain nibbles +
+        // fp32 scales; loaders repack per engine (CPU KAI / GPU Section A).
+#if defined(_WIN32)
+        _putenv_s("NNTR_QINT4_PLAIN", "1");
+#else
+        setenv("NNTR_QINT4_PLAIN", "1", 1);
+#endif
+      } else if (container != "section_a") {
+        std::cerr << "Unknown --container (use plain or section_a): "
+                  << container << "\n";
+        return EXIT_FAILURE;
+      }
+    } else if (arg == "--int4_scale" && i + 1 < argc) {
+      std::string formula = argv[++i];
+      if (formula == "range15") {
+        // PR#3978/KAI quantizer formula (plain container only).
+#if defined(_WIN32)
+        _putenv_s("NNTR_QINT4_RANGE15", "1");
+#else
+        setenv("NNTR_QINT4_RANGE15", "1", 1);
+#endif
+      } else if (formula != "absmax7") {
+        std::cerr << "Unknown --int4_scale (use absmax7 or range15): "
+                  << formula << "\n";
+        return EXIT_FAILURE;
+      }
     } else if (arg == "--help" || arg == "-h") {
       printUsage(argv[0]);
       return EXIT_SUCCESS;
@@ -809,7 +862,7 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["embedding_dtype"] = dataTypeToStr(embd_dtype);
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
     new_nntr_cfg["model_tensor_type"] =
-      buildModelTensorType(dataTypeToStr(fc_dtype));
+      buildModelTensorType(dataTypeToStr(fc_dtype), src_tensor_type);
 
     std::string output_config_path = output_dir + "/nntr_config.json";
 

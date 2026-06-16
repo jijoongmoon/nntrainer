@@ -528,6 +528,16 @@ private:
                  float beta, Tdatatype dtype) const;
 
   /**
+   * @brief dotQInteger — fp16 activation × QINT4 weight (KAI qsi4cxp
+   *        Section A on disk, reassembled to full KAI rhs_packed on the
+   *        fly). Routes through the forked fp16 KAI lhs packer +
+   *        fp16-dst matmul micro-kernel, so neither the LHS nor the DST
+   *        is promoted to fp32.
+   */
+  Tensor &dotQInteger(Tensor const &input, Tensor &output, bool trans,
+                      bool trans_in, float beta, Tdatatype dtype) const;
+
+  /**
    * @copydoc Tensor::isValid()
    */
   bool isValid() const override;

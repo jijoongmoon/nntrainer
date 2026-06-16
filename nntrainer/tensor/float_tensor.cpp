@@ -17,6 +17,7 @@
 #include <cpu_backend.h>
 #include <float_tensor.h>
 #include <int4_tensor.h>
+#include <int4_utils.h>
 #include <q4_0_utils.h>
 #include <thread_manager.h>
 
@@ -1020,14 +1021,29 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
     }
   } else {
 #ifdef ENABLE_FP16
-    if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
+    if (input.q_scheme() == QScheme::KAI_QSI4CXP_4x4x32) {
+      // Disk layout is KAI Section A (nibbles) + per-channel fp16 scales,
+      // no inline KAI trailer. The full KAI rhs_packed buffer (nibbles +
+      // per-super-row sums / scales * 0.0625 / bias = 0) is assembled once
+      // and cached on the weight tensor; subsequent forwards reuse it.
+      const uint8_t *kai_rhs = input.getOrBuildKaiRhsPacked(N, K);
+      // Both variant 0 (qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod, M=1
+      // tuned) and variant 2 (qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm,
+      // M>=4 tuned) share the qsi4cxp4x8 RHS pack (nr=4 kr=16 sr=2), so
+      // both consume our assembled buffer unchanged.
+      uint32_t idx_variant = (M == 1) ? 0u : 2u;
+      nntr_gemm_qai8dxp_qsi4cxp_packed(M, N, K, (void *)data,
+                                       (void *)kai_rhs, rdata,
+                                       idx_variant, true);
+    } else if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
       uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
       nntr_gemm_qai8dxp_qsi4cxp_packed(
         M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx,
         true); /// @todo kernel supports both trans / noTrans situation
     } else {
       throw std::runtime_error(
-        "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
+        "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE or "
+        "KAI_QSI4CXP_4x4x32 scheme");
     }
 #else
     /// @todo Replace with standard CPU INT4 computation
@@ -1239,9 +1255,13 @@ Tensor &FloatTensor::transpose(const std::string &direction,
       }
     } else {
       if (is_format_nchw) {
+        // transpose is not a GPU-accelerated ComputeOp: on the GPU build
+        // getOps() is ClComputeOps (accel-only) and would throw NI. Use the
+        // per-backend free function directly (CpuComputeOps::transpose_matrix_fp32
+        // forwards to the same impl, so CPU behavior is unchanged).
         for (unsigned int b = 0; b < batch(); ++b) {
           for (unsigned int c = 0; c < channel(); ++c) {
-            getOps()->transpose_matrix_fp32(
+            nntrainer::transpose_matrix(
               height(), width(), (float *)getData() + getIndex(b, c, 0, 0),
               width(), (float *)output.getData() + output.getIndex(b, c, 0, 0),
               output.width());

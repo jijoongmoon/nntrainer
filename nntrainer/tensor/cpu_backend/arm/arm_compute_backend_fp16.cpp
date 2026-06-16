@@ -490,6 +490,27 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
     idx_variant, transB, lower_bound, upper_bound);
 }
 
+template <>
+void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
+                                      void *lhs_native_mtx_f16,
+                                      void *rhs_packed_mtx_qs4cx,
+                                      _FP16 *dst_act_mtx_f16,
+                                      uint32_t idx_variant, bool transB,
+                                      _FP16 lower_bound, _FP16 upper_bound) {
+  // Direct call into the forked fp16 KAI path — no fp32 promotion of LHS
+  // or DST. The forked LHS packer reads __fp16 and lifts to fp32 in
+  // registers, and the forked 4x4x32 matmul kernel does fcvtn just before
+  // the store. idx_variant is informational here; the fp16 path is locked
+  // to the 4x4x32 micro-kernel (the only variant we have a fp16-dst fork
+  // of). Callers should pass idx_variant=2 to make this contract obvious.
+  (void)idx_variant;
+  nntr_kai_gemm_qai8dxp_qsi4cxp_olp_f16(m, n, k, lhs_native_mtx_f16,
+                                        rhs_packed_mtx_qs4cx, dst_act_mtx_f16,
+                                        transB,
+                                        static_cast<float>(lower_bound),
+                                        static_cast<float>(upper_bound));
+}
+
 } /* namespace nntrainer */
 
 namespace nntrainer {

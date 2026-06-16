@@ -11,23 +11,39 @@
 #include <iomanip>
 #include <iostream>
 
+#include <cstring>
+
 #include <compute_ops.h>
+#include <fp16.h>
 #include <int4_tensor.h>
+#include <int4_utils.h>
 #include <tensor.h>
 
 namespace nntrainer {
 
 size_t Int4QTensor::group_size = 32;
 
+// Tensor's QINT4 construction path forwards qscheme = PER_TENSOR_AFFINE from
+// Tensor::Tensor default, and TensorPool::request hard-codes
+// PER_CHANNEL_AFFINE. Neither matches what save/load emits, which is always
+// KAI_QSI4CXP_4x4x32 (per-output-channel fp16 scales). The pre-KAI schemes
+// would mis-size getMemoryBytes() / file_offset pre-allocation. Upgrade them
+// here so the pool sizes and load offsets match what's actually on disk.
+static inline QScheme upgradeQScheme(QScheme s) {
+  return (s == QScheme::PER_TENSOR_AFFINE || s == QScheme::PER_CHANNEL_AFFINE)
+           ? QScheme::KAI_QSI4CXP_4x4x32
+           : s;
+}
+
 Int4QTensor::Int4QTensor(std::string name_, Tformat fm, QScheme qscheme_,
                          size_t g_size) :
-  TensorBase(name_, fm, Tdatatype::QINT4), qscheme(qscheme_) {
+  TensorBase(name_, fm, Tdatatype::QINT4), qscheme(upgradeQScheme(qscheme_)) {
   group_size = g_size;
 }
 
 Int4QTensor::Int4QTensor(const TensorDim &d, bool alloc_now, Initializer init,
                          std::string name, QScheme qscheme_, size_t g_size) :
-  TensorBase(d, alloc_now, init, name), qscheme(qscheme_) {
+  TensorBase(d, alloc_now, init, name), qscheme(upgradeQScheme(qscheme_)) {
   group_size = g_size;
   if (alloc_now)
     allocate();
@@ -35,7 +51,8 @@ Int4QTensor::Int4QTensor(const TensorDim &d, bool alloc_now, Initializer init,
 
 Int4QTensor::Int4QTensor(const TensorDim &d, const void *buf, QScheme qscheme_,
                          size_t g_size) :
-  Int4QTensor(d, true, Initializer::NONE, "", qscheme_, g_size) {
+  Int4QTensor(d, true, Initializer::NONE, "", upgradeQScheme(qscheme_),
+              g_size) {
   if (d.getDataLen() != 0) {
     if (buf != nullptr)
       copy(buf);
@@ -354,12 +371,64 @@ void Int4QTensor::save(std::ostream &file) {
   putData();
 }
 
+void Int4QTensor::readPlainContainer(ReadSource src, size_t start_offset,
+                                     bool read_from_offset) {
+  const size_t N = width();
+  const size_t K = height();
+  const size_t payload_bytes = Int4Utils::plainRecordPayloadBytes(N, K);
+
+  // The in-memory form is Section A nibbles + per-channel fp16 scales —
+  // identical to a qscheme-0x06 record. Repacking below requires the
+  // Section A payload to fill the data area exactly.
+  NNTR_THROW_IF(Int4Utils::kaiNibblePayloadBytes(N, K) != (size() + 1) / 2,
+                std::runtime_error)
+    << "[Int4QTensor::read] plain-container shape unsupported: N=" << N
+    << " K=" << K << " (need N%4==0 and K%32==0)";
+
+  if (read_from_offset) {
+    start_offset += sizeof(uint16_t);
+  }
+
+  std::vector<uint8_t> payload(payload_bytes);
+  checkedRead(src, (char *)payload.data(),
+              static_cast<std::streamsize>(payload_bytes),
+              "[Int4QTensor::read] plain-container payload read failed",
+              start_offset, read_from_offset);
+
+  // Upgrade the scheme first so scale_size()/getScale() see the in-memory
+  // (Section A) layout while we fill it.
+  qscheme = QScheme::KAI_QSI4CXP_4x4x32;
+
+  Int4Utils::packPlainToSectionA(payload.data(), N, K, (uint8_t *)getData());
+
+  const uint8_t *scales_src =
+    payload.data() + Int4Utils::plainScalesOffsetBytes(N, K);
+  uint16_t *scales_dst = (uint16_t *)getScale();
+  for (size_t n = 0; n < N; ++n) {
+    float s;
+    std::memcpy(&s, scales_src + n * sizeof(float), sizeof(float));
+    scales_dst[n] = compute_fp32_to_fp16(s);
+  }
+}
+
 void Int4QTensor::read(std::ifstream &file, size_t start_offset,
                        bool read_from_offset) {
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
   read_quantization_info(file, start_offset, read_from_offset);
+
+  if (qscheme == QScheme::PER_CHANNEL_AFFINE) {
+    // Shared plain container (PR#3978 record) — repack to Section A.
+    readPlainContainer(ReadSource{&file}, start_offset, read_from_offset);
+    invalidateKaiRhsPackedCache();
+    putData();
+    return;
+  }
+  NNTR_THROW_IF(qscheme != QScheme::KAI_QSI4CXP_4x4x32, std::runtime_error)
+    << "[Int4QTensor::read] unsupported on-disk qscheme 0x" << std::hex
+    << static_cast<unsigned>(qscheme)
+    << " — decoding it as Section A would silently produce garbage";
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -374,6 +443,7 @@ void Int4QTensor::read(std::ifstream &file, size_t start_offset,
   checkedRead(file, (char *)getData(), sz,
               "[Int4QTensor::read] operation failed", start_offset,
               read_from_offset);
+  invalidateKaiRhsPackedCache();
   putData();
 }
 
@@ -383,6 +453,18 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
     start_offset = file_offset;
   }
   read_quantization_info(src, start_offset, read_from_offset);
+
+  if (qscheme == QScheme::PER_CHANNEL_AFFINE) {
+    // Shared plain container (PR#3978 record) — repack to Section A.
+    readPlainContainer(src, start_offset, read_from_offset);
+    invalidateKaiRhsPackedCache();
+    putData();
+    return;
+  }
+  NNTR_THROW_IF(qscheme != QScheme::KAI_QSI4CXP_4x4x32, std::runtime_error)
+    << "[Int4QTensor::read] unsupported on-disk qscheme 0x" << std::hex
+    << static_cast<unsigned>(qscheme)
+    << " — decoding it as Section A would silently produce garbage";
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -397,6 +479,7 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
   checkedRead(src, (char *)getData(), sz,
               "[Int4QTensor::read] operation failed", start_offset,
               read_from_offset);
+  invalidateKaiRhsPackedCache();
   putData();
 }
 
@@ -566,6 +649,11 @@ size_t Int4QTensor::scale_size() const {
   case QScheme::PER_CHANNEL_AFFINE:
     return height() * width() / group_size;
     break;
+  case QScheme::KAI_QSI4CXP_4x4x32:
+    // One fp16 scale per output channel. Dim is laid out (B, C, K, N) at
+    // save time (see Layer::save QINT4 branch), so width() == N.
+    return width();
+    break;
   default:
     break;
   }
@@ -601,7 +689,9 @@ void Int4QTensor::read_quantization_info(std::ifstream &file,
   checkedRead(file, (char *)&qscheme, sizeof(uint16_t),
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
-  group_size = 32; /// Remove me
+  if (qscheme != QScheme::KAI_QSI4CXP_4x4x32) {
+    group_size = 32; /// Remove me — legacy OSV32_ISV2 path only
+  }
 }
 
 void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
@@ -609,9 +699,31 @@ void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
   checkedRead(src, (char *)&qscheme, sizeof(uint16_t),
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
-  group_size = 32; /// Remove me
+  if (qscheme != QScheme::KAI_QSI4CXP_4x4x32) {
+    group_size = 32; /// Remove me — legacy OSV32_ISV2 path only
+  }
 }
 
 size_t Int4QTensor::getGroupSize() { return group_size; }
+
+const uint8_t *Int4QTensor::getOrBuildKaiRhsPacked(size_t n, size_t k) const {
+  // Only meaningful for the KAI scheme; other schemes don't go through the
+  // assembled rhs_packed code path.
+  if (qscheme != QScheme::KAI_QSI4CXP_4x4x32) {
+    return nullptr;
+  }
+  if (!kai_rhs_packed_cache.empty()) {
+    return kai_rhs_packed_cache.data();
+  }
+  const uint8_t *section_a = (const uint8_t *)getData();
+  const uint16_t *fp16_scales = (const uint16_t *)getScale();
+  Int4Utils::assembleKaiRhsPacked(section_a, fp16_scales, n, k,
+                                  kai_rhs_packed_cache);
+  return kai_rhs_packed_cache.data();
+}
+
+void Int4QTensor::invalidateKaiRhsPackedCache() {
+  std::vector<uint8_t>().swap(kai_rhs_packed_cache);
+}
 
 } // namespace nntrainer

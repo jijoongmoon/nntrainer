@@ -196,11 +196,14 @@ static Tensor *requestTensor_(const TensorSpecV2 &spec,
   case RT::PLACEHOLDER:
     return tp.placeholder(name, spec.dim);
   case RT::UNIQUE:
-    return tp.request(name, spec.dim, order, spec.ls, spec.initializer);
+    return tp.request(name, spec.dim, order, spec.ls, spec.initializer,
+                      /*is_weight_grad=*/false, spec.engine);
   case RT::SHARED:
-    return tp.requestOrExtend(name, spec.dim, order, spec.ls, spec.initializer);
+    return tp.requestOrExtend(name, spec.dim, order, spec.ls, spec.initializer,
+                              spec.engine);
   case RT::READ_ONLY_VIEW:
-    return tp.view(name, spec.reference_name, spec.dim, order, spec.ls);
+    return tp.view(name, spec.reference_name, spec.dim, order, spec.ls,
+                   /*offset=*/0, spec.engine);
   case RT::MAYBE_MODIFYING_VIEW:
   default:
     throw std::logic_error("requestTensor_ should not reach here");
@@ -563,20 +566,21 @@ std::vector<Var_Grad *> Manager::requestTensors(
     if (is_dependent) {
       const auto &shared_name = shared_names.at(i);
       var = tensor_pool.requestOrExtend(shared_name, dim, var_exec_order, tspan,
-                                        t_init);
+                                        t_init, t_engine);
       if (need_grad && tspan > TensorLifespan::FORWARD_FUNC_LIFESPAN) {
         grad = tensor_pool.requestOrExtend(shared_name + Var_Grad::grad_suffix,
                                            dim, grad_exec_order, tspan,
-                                           Initializer::ZEROS);
+                                           Initializer::ZEROS, t_engine);
       }
     } else {
-      var = tensor_pool.request(name, dim, var_exec_order, tspan, t_init);
+      var = tensor_pool.request(name, dim, var_exec_order, tspan, t_init,
+                                /*is_weight_grad=*/false, t_engine);
       if (is_train_mode && need_grad &&
           tspan > TensorLifespan::FORWARD_FUNC_LIFESPAN) {
         grad = tensor_pool.request(name + Var_Grad::grad_suffix, /// name
                                    dim, grad_exec_order, tspan,
-                                   Initializer::ZEROS /// tensor initializer
-        );
+                                   Initializer::ZEROS, /// tensor initializer
+                                   /*is_weight_grad=*/false, t_engine);
       }
     }
 
@@ -627,11 +631,33 @@ Manager::requestInputs(const GraphNode &node,
   std::vector<Var_Grad *> ret;
   size_t current_size = inputs_v2.size();
 
+  /** static residency: an input view carries the CONSUMING layer's engine so
+   * the source tensor's all_consumers_gpu can be AND-accumulated -- a CPU/SVM
+   * reader (mha_core, lm_head) downgrades its producer's output out of
+   * GPU_CLMEM. isComputeEngineGPU() reads the `engine` property directly.
+   * MultiOut (the auto-inserted fan-out node) is ENGINE-NEUTRAL: it is an
+   * in-place identity (RESTRICTING, no data touch), so it must not veto -- its
+   * real consumers' input views resolve (view-of-view flattening) to the same
+   * source and register their own engines. */
+  const auto *consumer_lnode = dynamic_cast<const LayerNode *>(&node);
+  /** mha_core (the CausalLM attention layer; CPU-registered but
+   * cl_mem-converted: it binds GPU_CLMEM Q/K/V directly and bridges every
+   * host path via clmem_lower/raise) counts as a GPU consumer. String literal
+   * since the layer lives in the application. */
+  const bool engine_neutral =
+    node.getType() == MultiOutLayer::type || node.getType() == "mha_core";
+  const auto consumer_engine =
+    (engine_neutral ||
+     (consumer_lnode != nullptr && consumer_lnode->isComputeEngineGPU()))
+      ? ml::train::LayerComputeEngine::GPU
+      : ml::train::LayerComputeEngine::CPU;
+
   for (unsigned int idx = 0; idx < inputs_dim.size(); idx++) {
     TensorSpecV2 var_spec = var_common_spec, grad_spec = grad_common_spec;
 
     var_spec.name = std::string("input") + std::to_string(idx);
     var_spec.dim = inputs_dim[idx];
+    var_spec.engine = consumer_engine;
 
     grad_spec.name = var_spec.name + Var_Grad::grad_suffix;
     grad_spec.dim = inputs_dim[idx];

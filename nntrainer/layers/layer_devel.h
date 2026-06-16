@@ -23,6 +23,8 @@
 #define __LAYER_DEVEL_H__
 #ifdef __cplusplus
 
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +32,9 @@
 #include <base_properties.h>
 #include <common.h>
 #include <cpu_backend.h>
+#include <fp16.h>
+#include <int4_tensor.h>
+#include <int4_utils.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 
@@ -410,6 +415,77 @@ public:
                 repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
                             quant_weight.size(), N, K, target_isa);
                 quant_weight.save(file);
+              }
+            } else if (dtype == TensorDim::DataType::QINT4) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                // KAI qsi4cxp Section A: N must be multiple of nr=4 so each
+                // super-row covers exactly 4 output channels; K must be a
+                // multiple of 32 so the packer needs no in-row K padding.
+                NNTR_THROW_IF(N % Int4Utils::KAI_NR != 0 ||
+                                K % Int4Utils::KAI_K_PAD_MULTIPLE != 0,
+                              std::invalid_argument)
+                  << "QINT4/KAI requires width divisible by "
+                  << Int4Utils::KAI_NR << " and height divisible by "
+                  << Int4Utils::KAI_K_PAD_MULTIPLE << ", but got height=" << K
+                  << ", width=" << N;
+
+                Tensor weight_t = weight.transpose("0:2:1");
+
+                if (const char *plain_env = std::getenv("NNTR_QINT4_PLAIN");
+                    plain_env && plain_env[0] == '1') {
+                  // Shared plain container (engine-neutral, byte-compatible
+                  // with the upstream PR#3978 record): plain nibbles + fp32
+                  // scales + zero pad. Loaders repack per engine at read
+                  // time. NNTR_QINT4_RANGE15=1 switches the quantizer to the
+                  // PR#3978/KAI range/15 formula (better small-model
+                  // quality); default keeps absmax/7 = Section A values.
+                  const char *r15_env = std::getenv("NNTR_QINT4_RANGE15");
+                  const bool range15 = r15_env && r15_env[0] == '1';
+                  std::vector<uint8_t> plain_nibbles;
+                  std::vector<uint16_t> qs;
+                  Int4Utils::quantizePlain(weight_t.getData<float>(), N, K,
+                                           plain_nibbles, qs, range15);
+
+                  std::vector<uint8_t> payload(
+                    Int4Utils::plainRecordPayloadBytes(N, K), 0u);
+                  std::memcpy(payload.data(), plain_nibbles.data(),
+                              plain_nibbles.size());
+                  float *scales_dst = reinterpret_cast<float *>(
+                    payload.data() + Int4Utils::plainScalesOffsetBytes(N, K));
+                  for (unsigned int n = 0; n < N; ++n) {
+                    scales_dst[n] = compute_fp16_to_fp32(qs[n]);
+                  }
+
+                  const uint16_t code =
+                    static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE);
+                  file.write(reinterpret_cast<const char *>(&code),
+                             sizeof(uint16_t));
+                  file.write(reinterpret_cast<const char *>(payload.data()),
+                             payload.size());
+                } else {
+                  std::vector<uint8_t> qw;
+                  std::vector<uint16_t> qs;
+                  Int4Utils::quantizeAndPackKai(weight_t.getData<float>(), N,
+                                                K, qw, qs);
+
+                  Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                      {Tformat::NCHW, dtype},
+                                      QScheme::KAI_QSI4CXP_4x4x32);
+                  std::memcpy(quant_weight.getData<uint8_t>(), qw.data(),
+                              qw.size());
+                  std::memcpy(quant_weight.getScale<uint16_t>(), qs.data(),
+                              qs.size() * sizeof(uint16_t));
+                  quant_weight.save(file);
+                }
               }
             } else {
               NNTR_THROW_IF(true, std::runtime_error)

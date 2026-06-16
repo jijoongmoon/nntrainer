@@ -15,6 +15,8 @@
 #include <quantizer.h>
 #include <tensor_base.h>
 
+#include <vector>
+
 namespace nntrainer {
 
 /**
@@ -35,7 +37,7 @@ public:
    * @brief     Basic Constructor of Tensor
    */
   Int4QTensor(std::string name_ = "", Tformat fm = Tformat::NCHW,
-              QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
+              QScheme qscheme_ = QScheme::KAI_QSI4CXP_4x4x32,
               size_t g_size = 32);
 
   /**
@@ -49,7 +51,7 @@ public:
    */
   Int4QTensor(const TensorDim &d, bool alloc_now,
               Initializer init = Initializer::NONE, std::string name = "",
-              QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
+              QScheme qscheme_ = QScheme::KAI_QSI4CXP_4x4x32,
               size_t g_size = 32);
 
   /**
@@ -60,7 +62,7 @@ public:
    * @param qscheme_ quantization scheme of the tensor
    */
   Int4QTensor(const TensorDim &d, const void *buf = nullptr,
-              QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
+              QScheme qscheme_ = QScheme::KAI_QSI4CXP_4x4x32,
               size_t g_size = 32);
 
   /**
@@ -81,7 +83,7 @@ public:
    * @param rhs TensorBase object to copy
    */
   Int4QTensor(TensorBase &rhs) :
-    TensorBase(rhs), qscheme(QScheme::PER_CHANNEL_AFFINE) {}
+    TensorBase(rhs), qscheme(QScheme::KAI_QSI4CXP_4x4x32) {}
 
   /**
    * @brief Basic Destructor
@@ -305,11 +307,45 @@ public:
    */
   static size_t getGroupSize();
 
+  /**
+   * @brief Return the cached full KAI rhs_packed buffer (nibbles + per-
+   *        super-row sums/scales/bias trailer), building it on first call.
+   *        Only valid for KAI_QSI4CXP_4x4x32 weights. Caller must pass the
+   *        N, K dims so we can build on demand without circular deps.
+   *
+   *        Cleared by read() / setData() since either invalidates the
+   *        underlying nibble bytes.
+   */
+  const uint8_t *getOrBuildKaiRhsPacked(size_t n, size_t k) const;
+
+  /**
+   * @brief Drop the cached rhs_packed buffer. Called from read paths and
+   *        setData() so the next dot rebuilds from the new nibbles.
+   */
+  void invalidateKaiRhsPackedCache();
+
 private:
+  /**
+   * @brief Load a shared plain-container record (on-disk qscheme
+   *        PER_CHANNEL_AFFINE = 0x01, the engine-neutral PR#3978 form:
+   *        plain nibbles + fp32 scales + KAI pad) and repack it into the
+   *        in-memory Section A layout. On return qscheme is upgraded to
+   *        KAI_QSI4CXP_4x4x32 so all consumers see the usual layout.
+   */
+  void readPlainContainer(ReadSource src, size_t start_offset,
+                          bool read_from_offset);
+
   /**
    * @brief quantization scheme
    */
   QScheme qscheme;
+
+  /**
+   * @brief Cached full KAI rhs_packed bytes (nibbles + super-row trailer)
+   *        assembled from on-disk Section A layout. mutable so dotQInteger
+   *        const-callers can fill it lazily.
+   */
+  mutable std::vector<uint8_t> kai_rhs_packed_cache;
 
   /**
    * @brief Quantization group size

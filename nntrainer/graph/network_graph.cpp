@@ -43,9 +43,12 @@
 #include <weight_layer.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include "graph_node.h"
 #include "tensor.h"
@@ -696,7 +699,18 @@ NetworkGraph::canExecuteInPlace(const std::shared_ptr<LayerNode> &lnode) {
 
   if (lnode->getType() == InputLayer::type &&
       !istrequal(getTensorType()[2], "FP32")) {
-    return InPlaceType::NONE;
+    /** Legacy veto from the implicit FP32->activation-dtype promotion era.
+     * InputLayer::finalize no longer promotes (output dims+dtype are always
+     * identical to the declared input dims+dtype), and the actual memory
+     * sharing at finalizeContext is still gated on the layer's own
+     * supportInPlace() (is_inplace = dims+dtype comparison in finalize), so
+     * trusting it is safe. The veto forced a full-tensor copyData per input
+     * layer per forwarding -- for CausalLM's external KV-cache placeholder
+     * inputs that is 52 x ~2MB of pure host copy per prefill (~54ms).
+     * NNTR_INPUT_INPLACE=0 restores the old unconditional veto. */
+    static const char *input_inplace_env = std::getenv("NNTR_INPUT_INPLACE");
+    if (input_inplace_env != nullptr && input_inplace_env[0] == '0')
+      return InPlaceType::NONE;
   }
 
   if (lnode->getType() == MultiOutLayer::type) {
@@ -764,6 +778,53 @@ setInplaceSharedMemoryConfigByLayer(const std::shared_ptr<LayerNode> &lnode,
    */
 }
 
+// cl_mem activation-residency edge map (NNTR_RESIDENT_ACT overlay). Plain
+// string->string so it links in the CPU build; populated at finalizeContext.
+static std::unordered_map<std::string, std::string> &resident_edge_map() {
+  static std::unordered_map<std::string, std::string> m;
+  return m;
+}
+static std::mutex &resident_edge_mtx() {
+  static std::mutex m;
+  return m;
+}
+void registerResidentEdge(const std::string &consumer_input_name,
+                          const std::string &producer_output_name) {
+  std::lock_guard<std::mutex> lk(resident_edge_mtx());
+  resident_edge_map()[consumer_input_name] = producer_output_name;
+}
+std::string resolveResidentEdge(const std::string &consumer_input_name) {
+  std::lock_guard<std::mutex> lk(resident_edge_mtx());
+  auto it = resident_edge_map().find(consumer_input_name);
+  return it == resident_edge_map().end() ? std::string() : it->second;
+}
+
+// NNTR_DEVRES Step 0: per-producer-output "are ALL consumers GPU?" stamp.
+// A producer activation may stay GPU-resident only if every consumer reads it
+// on the GPU; one CPU consumer forces a device->host sync at that edge. We
+// AND-accumulate consumer-GPU-ness here (string-keyed so it links in the CPU
+// build), populated at finalizeContext alongside the edge map. WRITTEN in S0
+// but not READ until S2 (boundary forcing) -> inert. Unknown producer (e.g. a
+// graph output like lm_head with no recorded consumer) resolves to false =
+// "needs host", the safe default.
+static std::unordered_map<std::string, bool> &consumer_gpu_map() {
+  static std::unordered_map<std::string, bool> m;
+  return m;
+}
+void registerConsumerEngine(const std::string &producer_output_name,
+                            bool consumer_is_gpu) {
+  std::lock_guard<std::mutex> lk(resident_edge_mtx());
+  auto &m = consumer_gpu_map();
+  auto it = m.find(producer_output_name);
+  m[producer_output_name] =
+    (it == m.end()) ? consumer_is_gpu : (it->second && consumer_is_gpu);
+}
+bool resolveProducerAllConsumersGpu(const std::string &producer_output_name) {
+  std::lock_guard<std::mutex> lk(resident_edge_mtx());
+  auto it = consumer_gpu_map().find(producer_output_name);
+  return it == consumer_gpu_map().end() ? false : it->second;
+}
+
 std::vector<Var_Grad *>
 NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
                               const std::vector<Var_Grad *> &prev_inputs) {
@@ -790,6 +851,20 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
     [](auto const &vg) -> const auto & { return vg->getName(); });
   const std::vector<Var_Grad *> &inputs = tensor_manager->requestInputs(
     gnode, init_context.getInputDimensions(), input_names);
+
+  // Record the producer->consumer activation edge for the cl_mem residency
+  // overlay: consumer's input view name (inputs[i]) -> producer's output name
+  // (input_names[i]). The runtime input Tensor only knows its own view name, so
+  // a GPU CL layer resolves its producing edge through this map to find the
+  // resident cl_mem backing. Inert unless NNTR_RESIDENT_ACT is set.
+  for (size_t i = 0; i < inputs.size() && i < input_names.size(); ++i)
+    registerResidentEdge(inputs[i]->getName(), input_names[i]);
+
+  // NNTR_DEVRES Step 0: stamp this consumer's engine onto each producer output
+  // it reads. AND-accumulated across all consumers (inert; read at S2). lnode
+  // has been finalized above so its compute_engine is set.
+  for (const auto &producer_output_name : input_names)
+    registerConsumerEngine(producer_output_name, lnode->isComputeEngineGPU());
 
   /** In-Place optimizations */
   /**
@@ -983,6 +1058,20 @@ NetworkGraph::refinalizeContext(const std::shared_ptr<LayerNode> &lnode,
     [](auto const &vg) -> const auto & { return vg->getName(); });
   const std::vector<Var_Grad *> &inputs = tensor_manager->requestInputs(
     gnode, init_context.getInputDimensions(), input_names);
+
+  // Record the producer->consumer activation edge for the cl_mem residency
+  // overlay: consumer's input view name (inputs[i]) -> producer's output name
+  // (input_names[i]). The runtime input Tensor only knows its own view name, so
+  // a GPU CL layer resolves its producing edge through this map to find the
+  // resident cl_mem backing. Inert unless NNTR_RESIDENT_ACT is set.
+  for (size_t i = 0; i < inputs.size() && i < input_names.size(); ++i)
+    registerResidentEdge(inputs[i]->getName(), input_names[i]);
+
+  // NNTR_DEVRES Step 0: stamp this consumer's engine onto each producer output
+  // it reads. AND-accumulated across all consumers (inert; read at S2). lnode
+  // has been finalized above so its compute_engine is set.
+  for (const auto &producer_output_name : input_names)
+    registerConsumerEngine(producer_output_name, lnode->isComputeEngineGPU());
 
   /** In-Place optimizations */
   /**

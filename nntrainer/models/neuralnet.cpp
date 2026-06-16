@@ -24,7 +24,9 @@
 #include "layer_context.h"
 #include "model.h"
 #include "model_common_properties.h"
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <compute_ops.h>
 #include <cstdint>
 #include <cstdio>
@@ -42,7 +44,9 @@
 #include <ini_interpreter.h>
 #include <ini_wrapper.h>
 #include <input_realizer.h>
+#include <int4_utils.h>
 #include <model_loader.h>
+#include <quantizer.h>
 #include <multiout_realizer.h>
 #include <neuralnet.h>
 #include <nntrainer_error.h>
@@ -224,8 +228,29 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   const std::string tensor_type =
     to_string(std::get<props::ModelTensorDataType>(model_flex_props));
 
-  model_graph =
-    NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format, tensor_type);
+  // Step 1 (GPU generalization): opt the graph-wide memory pool into the GPU
+  // (SVM) allocator so RunContext activation/weight tensors become GPU-resident
+  // and avoid the per-layer host round-trip. Conservative and gated:
+  //   - only under an OpenCL build,
+  //   - only when NNTR_GPU_SVM_POOL is set (default off => zero behavior change),
+  //   - only when the graph actually contains an engine=gpu node.
+  // Pure-CPU graphs and OpenCL-disabled builds always keep the "cpu" allocator,
+  // so CPU execution stays byte-identical. See
+  // tensor/cl_operations/GPU_GENERALIZATION_PLAN.md.
+  std::string engine_name = "cpu";
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+  if (std::getenv("NNTR_GPU_SVM_POOL") != nullptr) {
+    for (auto &n : graph_representation) {
+      if (n->isComputeEngineGPU()) {
+        engine_name = "gpu";
+        break;
+      }
+    }
+  }
+#endif
+
+  model_graph = NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format,
+                             tensor_type, engine_name);
 
   model_graph.setMemoryOptimizations(
     std::get<props::MemoryOptimization>(model_flex_props));
@@ -407,7 +432,32 @@ sharedConstTensors NeuralNetwork::forwarding(
     if (exec_mode == ExecutionMode::TRAIN or
         (exec_mode == ExecutionMode::INFERENCE and !fsu_mode)) {
       model_graph.flushCacheExcept(f);
-      node->forwarding(training);
+      {
+        // NNTR_LAYER_PROF: per-layer-type HOST time (no clFinish). Host-blocking
+        // ops (e.g. host rmsnorm) show their full cost; async GPU ops show only
+        // enqueue time -> reveals where the host timeline is spent. Dumps the
+        // running per-type totals to stderr every 64 layer calls.
+        static const bool lprof = std::getenv("NNTR_LAYER_PROF") != nullptr;
+        if (lprof) {
+          auto t0 = std::chrono::high_resolution_clock::now();
+          node->forwarding(training);
+          auto t1 = std::chrono::high_resolution_clock::now();
+          static std::unordered_map<std::string, std::pair<double, int>> acc;
+          static int total = 0;
+          auto &e = acc[node->getType()];
+          e.first += std::chrono::duration<double, std::milli>(t1 - t0).count();
+          e.second++;
+          if (++total % 64 == 0) {
+            std::string s;
+            for (auto &kv : acc)
+              s += kv.first + "=" + std::to_string(kv.second.first) + "ms/" +
+                   std::to_string(kv.second.second) + " ";
+            std::fprintf(stderr, "[lprof] %s\n", s.c_str());
+          }
+        } else {
+          node->forwarding(training);
+        }
+      }
     } else {
       /**
          currently, it supports FSU asynch mode for inference. The prcedure of
@@ -496,7 +546,31 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
       //      std::chrono::high_resolution_clock::now(); // log the
       //      start_prefill time
       model_graph.flushCacheExcept(f);
-      node->incremental_forwarding(from, to, training);
+      {
+        // NNTR_LAYER_PROF: per-layer-type HOST time (no clFinish). Host-blocking
+        // ops (host rmsnorm etc.) show full cost; async GPU ops show only enqueue
+        // time -> where the host timeline goes. Dumps per-type totals every 64.
+        static const bool lprof = std::getenv("NNTR_LAYER_PROF") != nullptr;
+        if (lprof) {
+          auto t0 = std::chrono::high_resolution_clock::now();
+          node->incremental_forwarding(from, to, training);
+          auto t1 = std::chrono::high_resolution_clock::now();
+          static std::unordered_map<std::string, std::pair<double, int>> acc;
+          static int total = 0;
+          auto &e = acc[node->getType()];
+          e.first += std::chrono::duration<double, std::milli>(t1 - t0).count();
+          e.second++;
+          if (++total % 64 == 0) {
+            std::string s;
+            for (auto &kv : acc)
+              s += kv.first + "=" + std::to_string(kv.second.first) + "ms/" +
+                   std::to_string(kv.second.second) + " ";
+            std::fprintf(stderr, "[lprof] %s\n", s.c_str());
+          }
+        } else {
+          node->incremental_forwarding(from, to, training);
+        }
+      }
       // auto end_layer =
       //  std::chrono::high_resolution_clock::now(); // log th
       //   auto duration_ =
@@ -917,6 +991,13 @@ void NeuralNetwork::load(const std::string &file_path,
   size_t start_from = 0;
   std::vector<std::pair<size_t, size_t>> file_offset;
   std::unordered_set<const Tensor *> visited_weights;
+  // A QINT4 record's on-disk size depends on its container: the shared
+  // plain container (qscheme PER_CHANNEL_AFFINE at the record head; the
+  // PR#3978 form) carries fp32 scales plus KAI pad and is NOT the in-memory
+  // Section A size that getMemoryBytes() reports. Peek each QINT4 record's
+  // qscheme so the running offset matches the actual file layout.
+  std::ifstream qint4_peek_stream;
+  bool qint4_peek_tried = false;
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
     auto weights = (*iter)->getRunContext().getWeights();
     for (auto weight : weights) {
@@ -943,6 +1024,28 @@ void NeuralNetwork::load(const std::string &file_path,
           tensor_data_type != TensorDim::DataType::Q4_0) {
         // for tensor with qparam
         size += sizeof(uint16_t);
+      }
+      if (tensor_data_type == TensorDim::DataType::QINT4) {
+        if (!qint4_peek_tried) {
+          qint4_peek_tried = true;
+          qint4_peek_stream.open((v.size() == 2) ? v[1] : v[0],
+                                 std::ios::in | std::ios::binary);
+        }
+        uint16_t disk_scheme = 0xFFFF;
+        if (qint4_peek_stream.is_open()) {
+          qint4_peek_stream.clear();
+          qint4_peek_stream.seekg(static_cast<std::streamoff>(start_from),
+                                  std::ios::beg);
+          qint4_peek_stream.read(reinterpret_cast<char *>(&disk_scheme),
+                                 sizeof(uint16_t));
+        }
+        if (qint4_peek_stream.is_open() && qint4_peek_stream.good() &&
+            disk_scheme ==
+              static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE)) {
+          const TensorDim &d = weight->getDim();
+          size = sizeof(uint16_t) +
+                 Int4Utils::plainRecordPayloadBytes(d.width(), d.height());
+        }
       }
       file_offset.emplace_back(std::make_pair(start_from, size));
       start_from += size;
@@ -998,60 +1101,85 @@ void NeuralNetwork::load(const std::string &file_path,
         NNTR_THROW_IF((shared_mmap_ptr == MAP_FAILED), std::runtime_error)
           << "mmap failed for " << f_path << " (" << shared_mmap_size
           << " bytes)";
+        // Prefetch the whole weight region: the parallel workers each read a
+        // node's (sequential) sub-range, so MADV_RANDOM was defeating readahead
+        // and every 4 KB page faulted individually (cold cache, dropped by the
+        // MADV_DONTNEED below each run) -> ~24s aggregate read vs ~1s for a
+        // sequential `cat` of the same file. WILLNEED kicks off readahead so the
+        // workers hit warm pages.
         (void)::posix_madvise(shared_mmap_ptr, shared_mmap_size,
-                              POSIX_MADV_RANDOM);
+                              POSIX_MADV_WILLNEED);
       }
 #endif
 
-      // std::vector<std::future<void>> futures;
-      std::vector<std::thread> threads;
-      threads.reserve(model_graph.size());
-      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
-           ++iter) {
-        auto node = *iter;
-        auto exec_order = std::get<0>((*iter)->getExecutionOrder());
+      // Bounded-concurrency parallel load. Spawning one std::thread per graph
+      // node (250+ on a 4B model) oversubscribes the CPU and collapses on the
+      // glibc malloc-arena lock — every worker allocates its tensor buffer at
+      // the same time — which for large models stalls the load effectively
+      // forever (observed: Qwen3-4B host quantize hung with ~250 threads all
+      // parked in futex_wait). Cap in-flight workers at the hardware
+      // concurrency and pull nodes off a shared atomic cursor. Each node is
+      // still read exactly once; only the degree of parallelism changes, so
+      // the loaded bytes are identical to the per-node-thread version.
+      std::vector<std::shared_ptr<LayerNode>> load_nodes(model_graph.cbegin(),
+                                                         model_graph.cend());
 
-        threads.emplace_back([&, node]() {
-          if (!MMAP_READ) {
-            auto local_model_file = checkedOpenStream<std::ifstream>(
-              (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
-            node->read(local_model_file, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
-          } else {
+      auto read_one = [&](const std::shared_ptr<LayerNode> &node) {
+        if (!MMAP_READ) {
+          auto local_model_file = checkedOpenStream<std::ifstream>(
+            (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
+          node->read(local_model_file, false, exec_mode, fsu_mode,
+                     std::numeric_limits<size_t>::max(), true, model_file_fd);
+        } else {
 #if defined(_WIN32)
-            // Map per-ask, then unmap immediately after: enables early release
-            // of pages
-            HANDLE hFile =
-              CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
-                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
-              << "CreateFileA failed";
+          // Map per-ask, then unmap immediately after: enables early release
+          // of pages
+          HANDLE hFile =
+            CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+          NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
+            << "CreateFileA failed";
 
-            HANDLE hMap =
-              CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-            NNTR_THROW_IF((hMap == NULL), std::runtime_error)
-              << "CreateFileMapping failed";
+          HANDLE hMap =
+            CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+          NNTR_THROW_IF((hMap == NULL), std::runtime_error)
+            << "CreateFileMapping failed";
 
-            char *view =
-              static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-            NNTR_THROW_IF((view == nullptr), std::runtime_error)
-              << "MapViewOfFile failed";
+          char *view =
+            static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+          NNTR_THROW_IF((view == nullptr), std::runtime_error)
+            << "MapViewOfFile failed";
 
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+          node->read(view, false, exec_mode, fsu_mode,
+                     std::numeric_limits<size_t>::max(), true, model_file_fd);
 
-            // Early unmap: let the OS reclaim the working set ASAP
-            UnmapViewOfFile(view);
-            CloseHandle(hMap);
-            CloseHandle(hFile);
+          // Early unmap: let the OS reclaim the working set ASAP
+          UnmapViewOfFile(view);
+          CloseHandle(hMap);
+          CloseHandle(hFile);
 #else
-            // POSIX: read from the parent-owned shared mmap. No per-thread
-            // mmap/munmap — see the comment on shared_mmap_ptr above.
-            char *view = static_cast<char *>(shared_mmap_ptr);
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+          // POSIX: read from the parent-owned shared mmap. No per-thread
+          // mmap/munmap — see the comment on shared_mmap_ptr above.
+          char *view = static_cast<char *>(shared_mmap_ptr);
+          node->read(view, false, exec_mode, fsu_mode,
+                     std::numeric_limits<size_t>::max(), true, model_file_fd);
 #endif
-          }
+        }
+      };
+
+      unsigned int hw_threads = std::thread::hardware_concurrency();
+      if (hw_threads == 0)
+        hw_threads = 4;
+      const size_t worker_count =
+        std::min<size_t>(load_nodes.size(), static_cast<size_t>(hw_threads));
+      std::atomic<size_t> load_cursor{0};
+      std::vector<std::thread> threads;
+      threads.reserve(worker_count);
+      for (size_t worker = 0; worker < worker_count; ++worker) {
+        threads.emplace_back([&]() {
+          size_t i;
+          while ((i = load_cursor.fetch_add(1)) < load_nodes.size())
+            read_one(load_nodes[i]);
         });
       }
       for (auto &t : threads) {

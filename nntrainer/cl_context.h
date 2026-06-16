@@ -209,10 +209,16 @@ public:
    * @param kernel_string kernel implementation string
    * @param kernel_name kernel name
    * @return std::shared_ptr<opencl::Kernel>
+   * @note by-const-ref on purpose: kernel sources are tens of KB and the
+   *       previous by-value signature copied the full source on EVERY cached
+   *       lookup -- measured ~12ms per call on Adreno/Android (scudo
+   *       large-alloc), ~36ms host issue tax per layer in the attention hot
+   *       path alone.
    */
-  const SharedPtrClKernel registerClKernel(std::string kernel_string,
-                                           std::string kernel_name,
-                                           std::string compile_options = {});
+  const SharedPtrClKernel
+  registerClKernel(const std::string &kernel_string,
+                   const std::string &kernel_name,
+                   const std::string &compile_options = {});
 
   /**
    * @brief Initialize and register all blas OpenCl kernels

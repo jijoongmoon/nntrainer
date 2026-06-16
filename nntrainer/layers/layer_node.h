@@ -1002,6 +1002,16 @@ public:
     return "cpu";
   }
 
+  /**
+   * @brief Query whether this node requests the GPU compute engine via its
+   *        `engine` property. Unlike getComputeEngineType() (which reflects the
+   *        cached member set only during finalize()), this reads the property
+   *        directly and is therefore valid earlier, e.g. when choosing the
+   *        graph-wide memory allocator at NetworkGraph construction.
+   * @return true iff the `engine` property is set and equals GPU
+   */
+  bool isComputeEngineGPU() const;
+
 private:
   /**
    * @brief     Get the Input Layers object

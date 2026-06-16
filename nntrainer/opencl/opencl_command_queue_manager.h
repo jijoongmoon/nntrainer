@@ -18,6 +18,7 @@
 #include "opencl_kernel.h"
 #include "singleton.h"
 #include <memory>
+#include <string>
 
 namespace nntrainer::opencl {
 
@@ -34,6 +35,34 @@ class CommandQueueManager : public Singleton<CommandQueueManager> {
    *
    */
   cl_command_queue command_queue_{nullptr};
+
+  /**
+   * @brief optional suffix appended to the NEXT enqueued kernel's profile key
+   * (consumed + cleared on the next enqueueKernel). Lets a caller split one
+   * kernel's profile entry by shape, e.g. v8c_gemm_int8_int4 -> ...:N9216_K2304.
+   * Host-only; never affects kernel behavior. Only read when profiling is on.
+   */
+  std::string next_prof_label_;
+
+  /**
+   * @brief Optional Qualcomm recordable command queue + a plain host-I/O queue,
+   * created only when NNTR_RECQ is set (cl_qcom_recordable_queues, phase-1
+   * foundation). The recordable queue is used to record a per-token decode
+   * dispatch sequence once and replay it per token; it rejects plain enqueues
+   * (e.g. clEnqueueReadBuffer -> CL_INVALID_OPERATION), so host readback must go
+   * through io_command_queue_. Both stay null when NNTR_RECQ is unset, and the
+   * canonical path is unaffected (it keeps using command_queue_).
+   */
+  cl_command_queue recordable_command_queue_{nullptr};
+  cl_command_queue io_command_queue_{nullptr};
+
+  /**
+   * @brief Resolve the cl_qcom_recordable_queues entry points and create the
+   * recordable + host-I/O queues. Called from CreateCommandQueue only when
+   * NNTR_RECQ is set; degrades gracefully (logs + leaves both queues null) if
+   * the extension is unavailable on the device.
+   */
+  void initRecordableQueues(cl_context context, cl_device_id device_id);
 
 public:
   /**
@@ -145,7 +174,8 @@ public:
    * @return true if mapping is successful, false otherwise.
    */
   bool enqueueSVMMap(void *svm_ptr, size_t size, bool read_only,
-                     cl_event *event = nullptr);
+                     bool async = false, cl_event *event = nullptr,
+                     bool force = false);
 
   /**
    * @brief Enqueue SVM memory unmap operation.
@@ -158,7 +188,8 @@ public:
    * blocking.
    * @return true if unmapping is successful, false otherwise.
    */
-  bool enqueueSVMUnmap(void *svm_ptr, cl_event *event = nullptr);
+  bool enqueueSVMUnmap(void *svm_ptr, cl_event *event = nullptr,
+                       bool force = false);
 
   /**
    * @brief Function to initiate execution of the command queue.
@@ -201,6 +232,23 @@ public:
   const cl_command_queue GetCommandQueue();
 
   /**
+   * @brief Get the Qualcomm recordable command queue. Null unless NNTR_RECQ is
+   * set and the cl_qcom_recordable_queues extension is available.
+   *
+   * @return cl_command_queue (recordable) or nullptr
+   */
+  cl_command_queue getRecordableQueue() { return recordable_command_queue_; }
+
+  /**
+   * @brief Get the plain host-I/O queue paired with the recordable queue (used
+   * for readbacks the recordable queue rejects). Null unless NNTR_RECQ is set
+   * and the extension is available.
+   *
+   * @return cl_command_queue (plain) or nullptr
+   */
+  cl_command_queue getIoQueue() { return io_command_queue_; }
+
+  /**
    * @brief Destroy the Command Queue Manager object
    *
    */
@@ -229,6 +277,33 @@ public:
                      cl_uint num_events_in_wait_list = 0,
                      const cl_event *event_wait_list = nullptr,
                      cl_event *event = nullptr);
+
+  /**
+   * @brief Finish the queue, then accumulate per-kernel GPU execution time
+   * (from CL_PROFILING_COMMAND_START/END of events captured during
+   * enqueueKernel) by kernel name and print a sorted breakdown. No-op unless
+   * NNTR_OPENCL_PROFILING is set. Releases and clears captured events.
+   *
+   * Unlike clFinish-bracketed host stage timing (which measures out-of-order
+   * queue catch-up, not real work), this reports true on-device kernel time.
+   *
+   * @param tag short label printed in the report header (e.g. "PREFILL").
+   */
+  void dumpProfile(const char *tag);
+
+  /**
+   * @brief set a suffix appended to the next enqueued kernel's profile key,
+   * to split one kernel's aggregate entry by call-site/shape. No-op for kernel
+   * execution; the label is consumed and cleared by the next enqueueKernel.
+   */
+  void setNextProfileLabel(std::string s) { next_prof_label_ = std::move(s); }
+
+  /**
+   * @brief Block until all previously enqueued commands have completed
+   * (clFinish). Used as the host-coherence barrier before a host op reads a
+   * GPU-resident (SVM) buffer that was written/mapped asynchronously.
+   */
+  void finish();
 };
 } // namespace nntrainer::opencl
 

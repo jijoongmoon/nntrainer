@@ -80,6 +80,45 @@ public:
                              unsigned int K, unsigned int group_size) override {
     nntrainer::sgemm_int4_cl(input, weight, scale, output, M, N, K, group_size);
   }
+
+  // Plain elementwise copy (Y = X). Tensor::copy() calls this unconditionally
+  // (no supports_*() guard), so the GPU backend must provide it or copy()
+  // throws "not implemented" -- which blocks any GPU layer that copies a tensor
+  // (e.g. AdditionLayerCl's first-input copy). A host copy is correct for host
+  // and (host-coherent) SVM pointers; a GPU-kernel copy is a later residency
+  // refinement.
+  void scopy_fp32(const unsigned int N, const float *X, const unsigned int incX,
+                  float *Y, const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = X[i * incX];
+  }
+
+#ifdef ENABLE_FP16
+  // fp16 counterpart of scopy_fp32 (needed for FP16-activation graphs, e.g.
+  // AdditionLayerCl's first-input copy on a HalfTensor).
+  void scopy_fp16(const unsigned int N, const _FP16 *X, const unsigned int incX,
+                  _FP16 *Y, const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = X[i * incX];
+  }
+  // Mixed-precision host copies. Tensor::copy()/copyData() across dtypes (e.g.
+  // an FP32 source feeding an FP16-activation graph, or reading an FP16 result
+  // back to FP32) routes here on the GPU backend. Host-side conversion is
+  // correct for host and (host-coherent) SVM pointers; a later residency
+  // refinement could move these onto a GPU kernel.
+  void scopy_fp32_to_fp16(const unsigned int N, const float *X,
+                          const unsigned int incX, _FP16 *Y,
+                          const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = static_cast<_FP16>(X[i * incX]);
+  }
+  void scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
+                          const unsigned int incX, float *Y,
+                          const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = static_cast<float>(X[i * incX]);
+  }
+#endif
 };
 
 ComputeOps *get_cl_ops() {

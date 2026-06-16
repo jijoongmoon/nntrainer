@@ -15,6 +15,11 @@
 #include <cpu_backend.h>
 #include <reshaped_rms_norm.h>
 
+#include <blas_kernels.h>
+#include <memory_data.h>
+
+#include "_layer_prof.h"
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -46,15 +51,24 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
 }
 
 void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
-                                      bool training) {}
+                                      bool training) {
+  // incremental_forwarding() is being phased out as the inference entry point,
+  // so run the full-sequence reshaped RMS norm through forwarding(). The shared
+  // worker (incremental_forwarding) handles both the host and the GPU-resident
+  // (isSVM) paths over the whole input [0, height).
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  incremental_forwarding(context, 0, in.height(), training);
+}
 
 void ReshapedRMSNormLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
+  causallm::LayerProfScope _prof("rms_norm", (to - from) == 1);
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
 
   ml::train::TensorDim in_dim = in.getDim();
   ml::train::TensorDim out_dim = out.getDim();
@@ -91,31 +105,87 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     in_step.reshape(step_reshaped_dim);
     out_step.reshape(step_reshaped_dim);
 
-    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      ///@todo rms_norm_wrt_width_something() should be refactored to
-      /// nntrainer::Tensor operation.
-#ifdef ENABLE_FP16
-      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
-        in_step.getData<float>(), out_step.getData<float>(),
-        in_step.getDim().height(), in_step.getDim().width(), epsilon);
-
-      // DO NOT USE rms_norm_wrt_width_fp16_intrinsic. It causes overflow!
-
-      // nntrainer::rms_norm_wrt_width_fp16_intrinsic(
-      //   in_step.getData<float>(), out_step.getData<float>(),
-      //   in_step.getDim().height(), in_step.getDim().width(), epsilon);
-#else
-      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
-        in_step.getData<float>(), out_step.getData<float>(),
-        in_step.getDim().height(), in_step.getDim().width(), epsilon);
-#endif
-    } else {
-      throw std::invalid_argument(
-        "Error: not yet implemented for this data type");
+    // GPU-resident path: when the activation, output and gamma are all SVM
+    // (the graph runs on the SVM pool), normalize each feature_size chunk on
+    // the GPU SVM-direct -- no host round-trip. The GPU rmsnorm kernel folds
+    // gamma in, so the separate multiply_i(gamma) is skipped on this path.
+    const auto in_md = in_step.getMemoryData();
+    const auto out_md = out_step.getMemoryData();
+    const auto gamma_md = gamma.getMemoryData();
+    const bool use_svm = in_md && in_md->isSVM() && out_md &&
+                         out_md->isSVM() && gamma_md && gamma_md->isSVM();
+    // NNTR_DEVRES Step 3 diagnostic: why is rmsnorm host? Log which operand is
+    // not SVM (in/out/gamma). One-shot per process; gated by the trace flag.
+    {
+      static const bool devres_trace =
+        std::getenv("NNTR_DEVRES_TRACE") != nullptr;
+      static bool logged = false;
+      if (devres_trace && !logged) {
+        logged = true;
+        std::fprintf(stderr,
+                     "[devres] rmsnorm use_svm=%d  in.svm=%d out.svm=%d "
+                     "gamma.svm=%d (in_md=%d out_md=%d gamma_md=%d)\n",
+                     (int)use_svm, in_md ? (int)in_md->isSVM() : -1,
+                     out_md ? (int)out_md->isSVM() : -1,
+                     gamma_md ? (int)gamma_md->isSVM() : -1, in_md ? 1 : 0,
+                     out_md ? 1 : 0, gamma_md ? 1 : 0);
+      }
     }
-    if (use_gamma) {
-      nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
+    const unsigned int n_rows = in_step.getDim().height();
+    bool gpu_done = false;
+    if (use_svm) {
+      if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+        nntrainer::rmsnorm_cl(in_step.getData<float>(), gamma.getData<float>(),
+                              out_step.getData<float>(), epsilon, n_rows,
+                              feature_size, /*use_svm=*/true);
+        gpu_done = true;
+#ifdef ENABLE_FP16
+      } else if (in_step.getDataType() ==
+                 ml::train::TensorDim::DataType::FP16) {
+        nntrainer::rmsnorm_cl_fp16(
+          in_step.getData<_FP16>(), gamma.getData<_FP16>(),
+          out_step.getData<_FP16>(), epsilon, n_rows, feature_size,
+          /*use_svm=*/true);
+        gpu_done = true;
+#endif
+      }
+    }
+
+    if (!gpu_done) {
+      if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+        ///@todo rms_norm_wrt_width_something() should be refactored to
+        /// nntrainer::Tensor operation.
+        // fp32_intrinsic (not fp16_intrinsic) even under ENABLE_FP16 -- the
+        // fp16 variant overflows (upstream RMSNorm FP16 overflow fix).
+        nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+          in_step.getData<float>(), out_step.getData<float>(),
+          in_step.getDim().height(), in_step.getDim().width(), epsilon);
+      } else if (in_step.getDataType() ==
+                 ml::train::TensorDim::DataType::FP16) {
+        // FP16 path: fall back to the generic Tensor::multiply/average/
+        // inv_sqrt_i sequence. Avoids a separate intrinsic; still inside
+        // the FP16 residual stream.
+        auto t = in_step.multiply(in_step).average(3).add(epsilon);
+        t.inv_sqrt_i();
+        in_step.multiply(t, out_step);
+      } else {
+        throw std::invalid_argument(
+          "Error: not yet implemented for this data type");
+      }
       out_step.multiply_i(gamma);
+    }
+
+    // NNTR_DEVRES Step 1: flag the rmsnorm output device-resident iff the GPU
+    // wrote it (gpu_done); clear it on the host path so a stale bit from a prior
+    // token can't falsely mark a host-written buffer (clear-on-write). out_step
+    // shares out's MemoryData (slice view), so this rides the producer->consumer
+    // edge to the downstream FC (QKV / gate-up). Gated; off => bit untouched.
+    static const bool devres_rms = std::getenv("NNTR_DEVRES") != nullptr;
+    if (devres_rms && out_md) {
+      if (gpu_done)
+        out_md->setDeviceValid(true, out_step.getData<uint8_t>());
+      else
+        out_md->setDeviceValid(false);
     }
 
     // reshape again out_step

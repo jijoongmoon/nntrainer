@@ -189,9 +189,11 @@ void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
  * @param[in] res float * for result/output
  * @param[in] size_input number of elements in input vector
  * @param[in] size_res number of elements in result vector
+ * @param[in] use_svm whether input/res are GPU-resident SVM pointers (bind
+ * directly and accumulate in place) vs host pointers (host round-trip)
  */
 void addition_cl(const float *input, float *res, unsigned int size_input,
-                 unsigned int size_res);
+                 unsigned int size_res, bool use_svm = false);
 
 /**
  * @brief rmsnorm each row of the tensor
@@ -206,6 +208,86 @@ void addition_cl(const float *input, float *res, unsigned int size_input,
 void rmsnorm_cl(const float *input, const float *gamma, float *result,
                 const float epsilon, unsigned int height, unsigned int width,
                 const bool use_svm = true);
+
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16 SVM-direct rmsnorm (each row over width, scaled by gamma).
+ *        Mirrors rmsnorm_cl but for the FP16 residual stream; use_svm binds
+ *        in/out/gamma SVM-direct (residency) on the SVM pool, else host-bounce.
+ * @param[in] input/gamma/result _FP16* buffers
+ * @param[in] epsilon float epsilon (converted to half for the kernel)
+ * @param[in] height/width tensor shape; @param[in] use_svm SVM binding
+ */
+// NNTR_GPU_CLMEM_POOL: when out_clmem != nullptr the normed output is written to
+// that device cl_mem (the tensor's planner sub-buffer) with NO host map, so a
+// device-direct FC can consume it without the rmsnorm->FC SVM map/unmap blocker.
+// When in_clmem != nullptr the input is read from that device cl_mem (a
+// GPU_CLMEM-resident producer wrote it, e.g. the residual add); mixing a cl_mem
+// arg with SVM args in one kernel is valid. Coop path only (width % 8 == 0).
+// skip_out_map (NNTR_DEVRES pair-removal, S4 mechanism): leave the SVM output
+// GPU-owned -- no trailing blocking map (measured 16.9ms/call cache-coherence
+// stall on the two fan-out pre-norms = 912ms/1K-prefill), clFlush instead
+// (submission point). The caller MUST flag the output MemoryData device_valid
+// so the consuming FC skips its matching unmap/map (one-sided skip = crash,
+// G4). Only valid when every consumer is a GPU kernel.
+void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
+                     const float epsilon, unsigned int height,
+                     unsigned int width, const bool use_svm = true,
+                     void *out_clmem = nullptr, void *in_clmem = nullptr,
+                     bool skip_out_map = false);
+
+/**
+ * @brief Fused RMSNorm + residual add: out = rmsnorm(input)*gamma + residual,
+ *        in one kernel (removes the separate v8c_add_h2h residual-add + its
+ *        dispatch idle at the Gemma2 sandwich-norm boundary). Math is identical
+ *        to [rmsnorm_cl_fp16 then add] (gamma carries Gemma2's (1+w)). width%8==0
+ *        + use_svm required; each of in/out/residual may be a cl_mem sub-buffer
+ *        (GPU_CLMEM) or SVM. Returns false (caller falls back) on unsupported shape.
+ */
+bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
+                         const _FP16 *residual, _FP16 *result, float epsilon,
+                         unsigned int height, unsigned int width,
+                         bool use_svm = true, void *out_clmem = nullptr,
+                         void *in_clmem = nullptr, void *resid_clmem = nullptr);
+
+/**
+ * @brief Block until the GPU command queue drains (clFinish). Host-coherence
+ *        barrier before a host op reads an SVM buffer that a prior GPU op
+ *        mapped asynchronously (e.g. lm_head reading the final RMSNorm output).
+ */
+void cl_queue_finish();
+
+/**
+ * @brief Force a blocking host-coherent SVM map (bypasses NNTR_SVM_RESIDENT).
+ *        Use at genuine GPU->host read boundaries when resident mode has skipped
+ *        the per-op maps (e.g. lm_head reading the final RMSNorm output).
+ */
+void cl_svm_map_force(void *ptr, size_t bytes, bool read_only);
+
+/**
+ * @brief Force an SVM unmap (bypasses NNTR_SVM_RESIDENT). Use after a genuine
+ *        HOST write to an SVM activation (e.g. input embedding) so following GPU
+ *        kernels read coherent data when resident mode skipped the per-op maps.
+ */
+void cl_svm_unmap_force(void *ptr);
+
+/**
+ * @brief Fused SwiGLU + asymmetric int8 activation-quant (FFN down-proj input).
+ *        silu(gate)*up per row, quantized to int8 with the v8c-compatible
+ *        asymmetric scheme; outputs feed gemm_int8_v8c_cl directly (skips the
+ *        FC's own input-quant + the fp16 [M,K] round-trip). SVM-direct only.
+ * @param[in] gate/up  _FP16* [M,K] gate_proj / up_proj outputs
+ * @param[out] act_int8 int8_t* [M,K] quantized silu(gate)*up
+ * @param[out] scale_per_row float* [M] recip-scale; zp_per_row int* [M];
+ *             row_sum_act int* [M] (sum of int8, for the int4 weight offset)
+ * @param[in] M rows, K feature size; use_svm must be true
+ * @return true if the GPU fused path ran; false otherwise (caller unfuses)
+ */
+bool fused_swiglu_quant_cl(const _FP16 *gate, const _FP16 *up, int8_t *act_int8,
+                           float *scale_per_row, int *zp_per_row,
+                           int *row_sum_act, unsigned int M, unsigned int K,
+                           bool use_svm = true);
+#endif
 
 /**
  * @brief     sscal value element by element immediately
@@ -336,7 +418,7 @@ void sgemm_cl(bool TransA, bool TransB, const _FP16 *A, const _FP16 *B,
  * @param[in] size_res number of elements in result vector
  */
 void addition_cl(const _FP16 *input, _FP16 *res, unsigned int size_input,
-                 unsigned int size_res);
+                 unsigned int size_res, bool use_svm = false);
 
 /**
  * @brief     fp16 sscal value element by element immediately
@@ -364,6 +446,207 @@ void transpose_cl_axis(const _FP16 *in, _FP16 *res,
                        unsigned int input_channels, unsigned int input_height,
                        unsigned int input_width, unsigned int axis);
 #endif
+
+/**
+ * @brief v8c int8 act × int4(channel-wise QINT4, offset-encoded) GEMM
+ *        (paper-aligned 8/4/4 prefill, validated 87% of Adreno 830 dp4a peak).
+ * @param[in] act_image image2d_from_buffer view over int8 act buffer
+ *            (CL_RGBA UINT32, width=K/16, height=M)
+ * @param[in] weight_image image2d_from_buffer view over int4-offset weight buf
+ *            (CL_RGBA UINT32, width=K/32, height=N)
+ * @param[in] scale_act per-row fp32 act recip-scale buffer [M]
+ * @param[in] scale_wgt per-channel fp32 weight recip-scale buffer [N]
+ * @param[in] row_sum_act per-row int32 sum of int8 acts [M]
+ * @param[in] zp_act per-row int32 asymmetric zero-point [M]
+ * @param[in] row_sum_w_int4 per-channel int32 sum_k(int4 w_nk) [N], precomputed
+ *            once at weight upload (depends only on weight bytes).
+ * @param[out] output_fp16 fp16 output buffer [M*N]
+ * @param[in] M,N,K shape; K must be multiple of 32
+ * @param[in] M_valid valid output rows (0 = M): stores with row >= M_valid
+ *            are skipped by the TM=4 kernels. Direct-output mode passes the
+ *            unpadded row count with output_fp16 = the FC's planner
+ *            sub-buffer (sized M_valid x N), so the M_pad padding rows
+ *            cannot write out of bounds.
+ */
+void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
+                      cl_mem scale_wgt, cl_mem row_sum_act, cl_mem zp_act,
+                      cl_mem row_sum_w_int4, cl_mem output_fp16, unsigned int M,
+                      unsigned int N, unsigned int K,
+                      unsigned int M_valid = 0);
+
+/**
+ * @brief #46l: v8c GEMM with fused OHWI-reversed V scatter. Same compute as
+ *        gemm_int8_v8c_cl but writes outputs directly into V cache at the
+ *        OHWI-reversed layout positions, eliminating the separate
+ *        v_scatter_ohwi_t pass. Requires N == hKV * head_dim and
+ *        V8C_TN (= 8) divides head_dim (so per-WI 8-wide n-tile stays in
+ *        one head). N is the same FC output channel count; head_dim and
+ *        S_max parameterize the OHWI cache geometry; position is the start
+ *        token offset in the t-axis.
+ *
+ * @param[out] v_ohwi  cl_mem [hKV * head_dim * S_max] fp16
+ * @param[in]  position  start token offset along the S_max axis
+ */
+void gemm_int8_v8c_v_ohwi_cl(cl_mem act_image, cl_mem weight_image,
+                             cl_mem scale_act, cl_mem scale_wgt,
+                             cl_mem row_sum_act, cl_mem zp_act,
+                             cl_mem row_sum_w_int4, cl_mem v_ohwi,
+                             unsigned int M_pad, unsigned int N, unsigned int K,
+                             unsigned int head_dim, unsigned int S_max,
+                             unsigned int position, unsigned int M_real);
+
+/**
+ * @brief Asymmetric int8 activation quantization for v8c.
+ *        fp16/fp32 → int8 + per-row recip-scale + per-row int32 zero-point
+ *        + per-row int32 sum. The scale/zp form matches KAI's qai8dxp_f32
+ *        host packer so the v8c GPU path has the same robustness to
+ *        single-sided outliers (post-SwiGLU activations etc.).
+ * @param[in] act_fp16 or act_fp32 input buffer [M*K]
+ * @param[out] out_int8 [M*K] int8 (row-major; later wrapped in image2d view)
+ * @param[out] out_scale [M] fp32 per-row recip-scale = (rmax-rmin)/255
+ * @param[out] out_zp [M] int32 per-row nudged zero-point
+ * @param[out] out_row_sum [M] int32 sum_k(int8_value)
+ * @param[in] M,K shape
+ */
+void quantize_act_v8c_fp16_cl(cl_mem act_fp16, cl_mem out_int8, cl_mem out_scale,
+                              cl_mem out_zp, cl_mem out_row_sum, unsigned int M,
+                              unsigned int K);
+void quantize_act_v8c_fp32_cl(cl_mem act_fp32, cl_mem out_int8, cl_mem out_scale,
+                              cl_mem out_zp, cl_mem out_row_sum, unsigned int M,
+                              unsigned int K);
+
+} // namespace nntrainer
+
+#include "cl_tensor_view.h"
+#include <memory>
+namespace nntrainer {
+/**
+ * @brief Convert a channel-wise QINT4 weight (Int4QTensor osv32_isv2 + fp16
+ *        per-group scales) into a v8c-ready backing: row-major + offset-encoded
+ *        int4 in a single cl_mem buffer (image2d view created on demand via
+ *        TensorBacking::imageView), plus a fp32 per-channel scale cl_mem.
+ *        Paper §4.2 alignment: re-quantize from per-group (32) → per-channel
+ *        (one scale per output row) during the conversion. ONE-TIME at FC init.
+ * @param[in] osv32_packed   pointer to osv32 packed int4 bytes (N*K/2 bytes)
+ * @param[in] fp16_scales    pointer to fp16 scales (N*K/group_size values)
+ * @param[in] group_size     32 (Int4QTensor default)
+ * @param[in] N              output channels
+ * @param[in] K              input dim
+ * @param[out] out_scale_buf cl_mem (fp32, [N], CL_MEM_READ_ONLY) — caller owns
+ * @return TensorBacking holding the v8c row-major+offset weight buffer
+ *         (Encoding::INT4_OFFSET, Layout::ROW_MAJOR, bytes = N*K/2)
+ */
+std::unique_ptr<tv::TensorBacking>
+make_v8c_weight_backing(const uint8_t *osv32_packed,
+                        const uint16_t *fp16_scales, unsigned int group_size,
+                        unsigned int N, unsigned int K,
+                        cl_mem *out_scale_buf);
+
+/**
+ * @brief Build a v8c weight backing directly from the on-disk KAI Section A
+ *        nibble bytes — no dequant→fp32→requant cycle. Both formats use
+ *        per-output-channel scale (KAI fp16 saved, v8c fp32 uploaded) and
+ *        offset-encoded nibbles (KAI XOR 0x88, v8c (+8) & 0xF — same bit
+ *        pattern). Differences are limited to K-axis byte permutation:
+ *
+ *          KAI Section A super-row layout (nr=4, kr=16, sr=2):
+ *            For each super-row of 4 output channels, the 4 channels are
+ *            byte-block interleaved (8 bytes per nr-block), and within each
+ *            byte the lo/hi nibbles are K and K+kr=K+16. Two super_blocks
+ *            (8+8 bytes per nr) together cover one 32-K span.
+ *
+ *          v8c per-channel row-major layout:
+ *            For each output channel n, K/2 bytes; per 32-K block, 16 bytes
+ *            arranged as byte(c*4 + b) = (qH<<4) | qL where qL = K(c*8+b)
+ *            and qH = K(c*8+b+4). Image2d view: width=K/32, height=N, RGBA
+ *            UINT32 (16 bytes per texel = 32 K-channels).
+ *
+ *        Output: per-channel fp32 scale (from KAI's saved fp16 scales,
+ *        promoted) and the permuted offset-encoded nibble buffer wrapped
+ *        in a TensorBacking. No quantization-noise added.
+ *
+ * @param[in]  section_a    pointer to KAI Section A nibble bytes
+ *                          (= Int4Utils::kaiNibblePayloadBytes(N,K))
+ * @param[in]  fp16_scales  pointer to per-channel fp16 scales (length N)
+ * @param[in]  N            output channels (must be multiple of 4 — KAI nr)
+ * @param[in]  K            input dim (must be multiple of 32)
+ * @param[out] out_scale_buf cl_mem (fp32, [N], CL_MEM_READ_ONLY) — caller owns
+ */
+std::unique_ptr<tv::TensorBacking>
+make_v8c_weight_backing_from_kai_section_a(const uint8_t *section_a,
+                                           const uint16_t *fp16_scales,
+                                           unsigned int N, unsigned int K,
+                                           cl_mem *out_scale_buf,
+                                           cl_mem *out_row_sum_w_int4_buf);
+
+/**
+ * @brief 8/4/4 paper attention path: int8(act) × int8(weight) channel-wise GEMM.
+ *        Signature mirrors gemm_int8_v8c_cl (row_sum_act ignored). Weight image
+ *        must be the plain row-major int8 view (width K/16). Dispatches the
+ *        v8c_gemm_int8_int8 kernel (or _m1 for M<=4).
+ */
+void gemm_int8_int8_v8c_cl(cl_mem act_image, cl_mem weight_image,
+                           cl_mem scale_act, cl_mem scale_wgt,
+                           cl_mem row_sum_act, cl_mem zp_act, cl_mem row_sum_w,
+                           cl_mem output_fp16, unsigned int M, unsigned int N,
+                           unsigned int K);
+
+/** @brief int8×int8 variant of gemm_int8_v8c_v_ohwi_cl (fused OHWI V scatter). */
+void gemm_int8_int8_v8c_v_ohwi_cl(cl_mem act_image, cl_mem weight_image,
+                                  cl_mem scale_act, cl_mem scale_wgt,
+                                  cl_mem row_sum_act, cl_mem zp_act,
+                                  cl_mem row_sum_w, cl_mem v_ohwi,
+                                  unsigned int M_pad, unsigned int N,
+                                  unsigned int K, unsigned int head_dim,
+                                  unsigned int S_max, unsigned int position,
+                                  unsigned int M_real);
+
+/**
+ * @brief Build a v8c int8-weight backing from a plain row-major int8 weight
+ *        buffer + per-channel fp16 scales. Computes the fp32 scale buffer and
+ *        per-channel signed int8 row sums (row_sum_w[n] = Σ_k int8 w[n,k]).
+ *        Caller creates the image2d view (width=K/16, CL_UNSIGNED_INT32).
+ */
+std::unique_ptr<tv::TensorBacking>
+make_v8c_int8_weight_backing(const int8_t *int8_weights,
+                             const uint16_t *fp16_scales, unsigned int N,
+                             unsigned int K, cl_mem *out_scale_buf,
+                             cl_mem *out_row_sum_w_buf);
+
+/**
+ * @brief Decode lm_head GEMV on a Q6_K weight: logits[v] = Σ_k act[k] *
+ *        dequant_q6_K(w[v,k]). One fp32 act row in, vocab fp32 logits out
+ *        (blocking readback). The kernel is the gpu_native q6k_gemv_lmhead
+ *        (ML Drift reaudit #1) verbatim: it replicates
+ *        dequantize_row_q6_K_impl exactly; only the fp32 summation ORDER
+ *        differs from the host dequant+sdot loop (per-WI partials + LDS
+ *        tree), so logits drift in the lsb — the verification gate is
+ *        token-ID equality over the greedy sequence. The Q6_K table
+ *        (210 B per 256-elem block) is uploaded to a cached device buffer
+ *        on first call (keyed by host pointer).
+ * @return false when the GPU path is unavailable (no CL context, or hidden
+ *         not a multiple of 256) — the caller must fall back to the host
+ *         loop.
+ */
+bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
+                         float *logits_f32_host, unsigned int vocab,
+                         unsigned int hidden);
+
+/**
+ * @brief High-precision lm_head GEMV on an UNQUANTIZED FP32 weight (the tied
+ *        embed table, --embd_dtype FP32): logits[v] = Σ_k W_fp32[v,k]*act[k],
+ *        fp32 W × fp16 act, fp32 accumulate. The Q6_K lm_head loses ~1.66
+ *        logit on the first-token argmax (the <think> vs garbage decision on
+ *        Qwen3 thinking models => a garbage "noise prefix"); this reads the
+ *        full-precision weight and matches the HF reference that ranks the
+ *        correct token first. One 64-WI workgroup per vocab row, LDS tree
+ *        reduce; weight uploaded to a cached device buffer on first call.
+ * @param act_fp16_host  pointer to the fp16 activation row (hidden halfs).
+ * @return false when the GPU path is unavailable — caller falls back.
+ */
+bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
+                          float *logits_f32_host, unsigned int vocab,
+                          unsigned int hidden);
 
 } // namespace nntrainer
 #endif /* __BLAS_KERNELS_H__ */

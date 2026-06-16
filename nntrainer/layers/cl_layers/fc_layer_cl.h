@@ -67,6 +67,30 @@ public:
                               unsigned int to, bool training) override;
 
   /**
+   * @copydoc Layer::read(std::ifstream &file, RunLayerContext &run_context,
+   * ...)
+   * @note after the base read, eagerly builds the v8c GPU weight entry
+   *       (dotCl_v8c_prebuild_weight) so the first prefill does not pay the
+   *       lazy per-weight nibble-permute + upload (~753ms across 182 FCs on
+   *       Gemma2-2B). Skipped under FSU (the weight data may be streamed out
+   *       again); no-op off the v8c path.
+   */
+  void read(std::ifstream &file, RunLayerContext &run_context, bool opt_var,
+            ml::train::ExecutionMode mode, bool trainable,
+            TensorDim::DataType defineWeightDataType, bool fsu,
+            size_t start_offset = 0, bool read_from_offset = false,
+            int file_fd = -1) override;
+
+  /**
+   * @copydoc Layer::read(ReadSource src, RunLayerContext &run_context, ...)
+   */
+  void read(ReadSource src, RunLayerContext &run_context, bool opt_var,
+            ml::train::ExecutionMode mode, bool trainable,
+            TensorDim::DataType defineWeightDataType, bool fsu,
+            size_t start_offset = 0, bool read_from_offset = false,
+            int file_fd = -1) override;
+
+  /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
   void calcDerivative(RunLayerContext &context) override;

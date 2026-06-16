@@ -24,13 +24,18 @@
 #include <app_context.h>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <engine.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <compute_ops.h>
+#include <neuralnet.h>
 
 #include <common.h>
 #include <layer_context.h>
@@ -110,6 +115,15 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
 }
 
 void CausalLM::allocateAndBindKVCache() {
+  // KV int8 path: mha_core allocates its own UINT8 cache + FP16 scale
+  // tensors. There are no external cache_k_l*/cache_v_l* placeholders to
+  // bind, so this helper is a no-op (paper section 3.7 internal cache
+  // mode under kv_int8). The mha layer was switched to 3-input form in
+  // qwen3_causallm.cpp when the env var is set.
+  if (std::getenv("NNTR_KV_INT8") != nullptr) {
+    kv_cache_bound = true;
+    return;
+  }
   if (!kv_cache.isAllocated()) {
     // dtype matches mha_core's cache placeholders so external cache storage
     // is interpreted consistently across platforms.
@@ -174,6 +188,81 @@ void CausalLM::allocateAndBindKVCache() {
   kv_cache_bound = true;
 }
 
+std::vector<float *>
+CausalLM::incrementalInference(unsigned int batch_size,
+                               const std::vector<float *> &input,
+                               unsigned int init_seq_len, unsigned int from,
+                               unsigned int to) {
+  // Same contract as NeuralNetwork::incremental_inference(float* ...), except
+  // inputs whose raw pointer belongs to a KVCacheManager cache tensor are fed
+  // as the REAL tensor (sharing its MemoryData, so isSVM() set by the SVM
+  // MemoryPool survives the per-call fillPlaceholder/syncDependents). With
+  // in-place input layers the mha_core cache views are dependents of the
+  // input placeholder; a fresh Tensor::Map MemoryData of the same pointer
+  // would clobber the SVM flag and drop attention to the host path.
+  auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
+
+  std::unordered_map<const void *, nntrainer::Tensor *> cache_by_ptr;
+  if (kv_cache.isAllocated()) {
+    for (unsigned int i = 0; i < kv_cache.getNumLayers(); ++i) {
+      auto &kc = kv_cache.getKeyCache(i);
+      auto &vc = kv_cache.getValueCache(i);
+      cache_by_ptr.emplace(reinterpret_cast<const void *>(kc.getData()), &kc);
+      cache_by_ptr.emplace(reinterpret_cast<const void *>(vc.getData()), &vc);
+    }
+  }
+
+  auto in_dim = nn->getInputDimension();
+  NNTR_THROW_IF(input.size() < in_dim.size(), std::invalid_argument)
+    << "incrementalInference: model expects " << in_dim.size()
+    << " inputs, got " << input.size();
+
+  nntrainer::sharedConstTensors input_tensors;
+  input_tensors.reserve(in_dim.size());
+  for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
+    auto it = cache_by_ptr.find(reinterpret_cast<const void *>(input[idx]));
+    if (it != cache_by_ptr.end()) {
+      // shallow copy: shares the cache's MemoryData (isSVM intact)
+      input_tensors.emplace_back(MAKE_SHARED_TENSOR(*it->second));
+    } else {
+      in_dim[idx].batch(batch_size);
+      input_tensors.emplace_back(MAKE_SHARED_TENSOR(
+        nntrainer::Tensor::Map(input[idx],
+                               in_dim[idx].getDataLen() * sizeof(float),
+                               in_dim[idx], 0)));
+    }
+  }
+
+  nntrainer::sharedConstTensors output_tensors =
+    nn->incremental_inference(input_tensors, init_seq_len, from, to);
+
+  // Output conversion identical to the float* overload in neuralnet.cpp.
+  std::vector<float *> output;
+  output.reserve(output_tensors.size());
+  for (auto &out : output_tensors) {
+    auto out_t = *out.get();
+    const size_t buf_size =
+      (size_t)batch_size * out_t.getDim().getFeatureLen();
+    float *last_out_buf_data = new float[buf_size];
+
+    if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+      nntrainer::getComputeOps()->scopy_fp16_to_fp32(
+        buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data, 1);
+#else
+      throw std::invalid_argument("Error: enable-fp16 is not set");
+#endif
+    } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
+      std::memcpy(last_out_buf_data, out_t.getData(),
+                  sizeof(float) * buf_size);
+    }
+
+    output.push_back(last_out_buf_data);
+  }
+
+  return output;
+}
+
 void CausalLM::setKVCachePosition(unsigned int pos) {
   kv_cache.setPosition(pos);
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
@@ -203,6 +292,7 @@ std::pair<Tensor, Tensor> CausalLM::constructModel() {
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),
+    withKey("engine", "gpu"),
   };
 
   if (TIE_WORD_EMBEDDINGS)
@@ -397,9 +487,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
     SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
 
-  auto _input = tokenizer->Encode(prompt_);
-  ///@note insert bos token at the beginning of the input
-  // _input.insert(_input.begin(), BOS_TOKEN_ID);
+  ///@note add_special_tokens=true lets each model's OWN tokenizer decide whether
+  /// to prepend a BOS, rather than hard-coding it. The 1-arg Encode skips special
+  /// tokens, so the leading BOS that Gemma2 (TemplateProcessing, add_bos_token=
+  /// true) needs was dropped -> short prompts degenerated into pure repetition
+  /// ("The capital of France is" -> "is is is..."); long prompts masked it.
+  /// Verified to match HF add_special_tokens=True per model: Gemma2 gains its
+  /// BOS(2); models whose tokenizer adds no BOS (e.g. Qwen3 — ByteLevel post-
+  /// processor, add_bos_token=false) are byte-identical to the old behavior, so
+  /// they are unaffected. (sentence_transformer.cpp already encodes this way.)
+  auto _input = tokenizer->Encode(prompt_, /*add_special_tokens=*/true);
 
   // | <------------------- MAX_SEQ_LEN -------------------> |
   //                       ||             ||
@@ -407,7 +504,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   std::vector<int64_t> init_input;
   unsigned int _len = _input.size();
-  unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
+  // The prefill activation buffers are built at INIT_SEQ_LEN (transformer.cpp
+  // constructModel, {1,1,1,INIT_SEQ_LEN}); resetInputDimension is disabled, so
+  // a prompt longer than INIT_SEQ_LEN overflows the shared activation tensor
+  // (getSharedDataTensor bounds-check throw). Cap the prompt to the smaller of
+  // the prefill buffer (INIT_SEQ_LEN) and the KV budget (MAX_SEQ_LEN - gen).
+  unsigned int num_allow_str =
+    std::min<unsigned int>(INIT_SEQ_LEN, MAX_SEQ_LEN - NUM_TO_GENERATE);
   unsigned int text_len = _len;
 
   if (_len > num_allow_str)
@@ -443,7 +546,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    */
   std::vector<int64_t> token_ids;
   input.push_back(input_sample);
+  // KV int8 path: mha layers were switched to 3-input mode in
+  // qwen3_causallm.cpp, so the external cache_k_l*/cache_v_l* inputs
+  // do not exist in the compiled graph. The inference call only needs
+  // the prompt sample buffer; mha_core's internal int8 cache + scale
+  // tensors are managed by the framework's TensorPool.
+  static const bool _kv_int8_runtime = std::getenv("NNTR_KV_INT8") != nullptr;
   auto build_inference_inputs = [&]() {
+    if (_kv_int8_runtime) {
+      return std::vector<float *>{input_sample};
+    }
     std::vector<std::pair<std::string, float *>> cache_inputs;
     cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
     for (int i = 0; i < NUM_LAYERS; ++i) {
@@ -494,8 +606,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
     allocateAndBindKVCache();
     setKVCachePosition(0);
-    output = model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                          0, input_len, false);
+    output = incrementalInference(BATCH_SIZE, input, input_len, 0, input_len);
 
     SYS_PROMP_LEN = input_len;
     save_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
@@ -530,8 +641,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     const unsigned int prefill_to = prefill_from + input_len - 1;
     setKVCachePosition(prefill_from);
-    output = model->incremental_inference(
-      BATCH_SIZE, input, label, init_len - 1, prefill_from, prefill_to, false);
+    output = incrementalInference(BATCH_SIZE, input, init_len - 1, prefill_from,
+                                  prefill_to);
 
     for (unsigned int b = 0; b < BATCH_SIZE; ++b)
       id_list.push_back(skipped_token);
@@ -543,8 +654,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   } else {
     const unsigned int prefill_to = prefill_from + input_len;
     setKVCachePosition(prefill_from);
-    output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
-                                          prefill_from, prefill_to, false);
+    output = incrementalInference(BATCH_SIZE, input, init_len, prefill_from,
+                                  prefill_to);
 
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
@@ -580,9 +691,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     allocateAndBindKVCache();
     auto output_interval =
-      model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                   token_generation_idx - 1 + global_token_len,
-                                   token_generation_idx + global_token_len);
+      incrementalInference(BATCH_SIZE, input, input_len,
+                           token_generation_idx - 1 + global_token_len,
+                           token_generation_idx + global_token_len);
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
 
     // Feed the newly generated token back as the next input token.

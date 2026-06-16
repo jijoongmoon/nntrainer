@@ -13,6 +13,7 @@
 #include <fstream>
 
 #include <app_context.h>
+#include <cl_context.h>
 #include <engine.h>
 #include <model.h>
 
@@ -23,6 +24,7 @@
 #include <embedding_layer.h>
 #include <mha_core.h>
 #include <rms_norm.h>
+#include <rms_norm_gpu.h>
 #include <swiglu.h>
 #include <tie_word_embedding.h>
 
@@ -136,6 +138,9 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
+  USE_FLASH_ATTENTION = nntr_cfg.contains("use_flash_attention")
+                          ? nntr_cfg["use_flash_attention"].get<bool>()
+                          : true;
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -247,11 +252,16 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
     h = createTransformerDecoderBlock(i, h);
   }
 
-  // final rms_norm
+  // final rms_norm. NOTE: stays on CausalLM's custom RMSNormLayer
+  // ("rms_norm" type, app_context only) so the fused-rmsq + v8c FC
+  // consumer chain works. The nntrainer GPU RMSNormLayerCl uses type
+  // "rmsnorm" (different) and has a separate reduction-order drift
+  // issue documented in [chain-robustification-dead].
   LayerHandle out_norm(
     createLayer("rms_norm", {withKey("name", "output_norm"),
                              withKey("epsilon", std::to_string(NORM_EPS)),
-                             withKey("packed", "false")}));
+                             withKey("packed", "false"),
+                             withKey("engine", "gpu")}));
   h = out_norm(h);
 
   return {x, h};
@@ -343,7 +353,8 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("packed", "false"),
+     withKey("engine", "gpu")}));
   Tensor normed = attn_norm(input);
 
   Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
@@ -351,21 +362,24 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
 
   LayerHandle decoder_add(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"),
+     withKey("engine", "gpu")}));
   Tensor residual = decoder_add({input, att_out});
 
   LayerHandle ffn_norm(createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("packed", "false"),
+     withKey("engine", "gpu")}));
   Tensor ffn_normed = ffn_norm(residual);
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
 
   LayerHandle decoder_output(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
+     withKey("engine", "gpu")}));
   return decoder_output({residual, ffn_out});
 }
 
@@ -415,7 +429,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
   Tensor q = wq(query);
 
   // K layer
@@ -423,7 +437,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", "gpu")}));
   Tensor k = wk(key);
 
   // V layer
@@ -431,7 +446,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", "gpu")}));
   Tensor v = wv(value);
 
   // External KV cache placeholders (per-layer). Their actual storage is owned
@@ -449,7 +465,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
                                  : UINT_MAX),
      withKey("rope_theta", ROPE_THETA),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+     withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+     withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false")}));
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer
@@ -457,7 +474,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
   return wo(a);
 }
 
@@ -467,35 +484,38 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
-  LayerHandle ffn_up(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
-     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
-  Tensor up = ffn_up(input);
-
+  // Create gate BEFORE up: the model loader assigns file offsets in graph
+  // creation order (positional, not by name), and the converters write the
+  // FFN weights gate_proj -> up_proj -> down_proj (the HF convention). If up
+  // is created first, ffn_up loads the gate_proj bytes and ffn_gate loads the
+  // up_proj bytes, so swiglu computes silu(up)*gate instead of silu(gate)*up
+  // -- coherent-looking but wrong (the global gate/up swap; Gemma2/3 avoided
+  // it by overriding createMlp gate-first).
   LayerHandle ffn_gate(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
   Tensor gate = ffn_gate(input);
 
-  /// @note nntrainer binary stores mlp weights in up, gate order.
-  /// For backward compatibility,
-  /// * layers are in up, gate order
-  /// * swiglu input[0] = gate
-  /// * swiglu input[1] = up
+  LayerHandle ffn_up(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
+     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
+  Tensor up = ffn_up(input);
+
   LayerHandle swiglu(createLayer(
     "swiglu",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
-  Tensor act = swiglu({up, gate}, {1, 0});
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+     withKey("engine", "gpu")}));
+  Tensor act = swiglu({gate, up});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
   return ffn_down(act);
 }
 
@@ -522,6 +542,41 @@ void Transformer::registerCustomLayers() {
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
+  }
+
+  // GPU variants: same type strings as the CPU classes but registered
+  // on cl_context so engine=gpu createLayer routes there. The GPU
+  // classes use raw getData() pointers + GPU dispatches; they avoid
+  // any CPU-only Tensor ops (Tensor::multiply / add_i / dot) that
+  // crash on gpu-context-allocated tensors.
+  const auto cl_context =
+    static_cast<nntrainer::ClContext *>(ct_engine.getRegisteredContext("gpu"));
+  if (cl_context != nullptr) {
+    try {
+      cl_context->registerFactory(
+        nntrainer::createLayer<causallm::RMSNormLayerGPU>);
+      // TieWordEmbedding is registered on cl_context with its existing
+      // class — the manual Q6_K + Q4_0 paths in incremental_forwarding_
+      // lmhead use raw-pointer compute (no Tensor::dot), so it survives
+      // gpu-context tensor allocation. The embedding-mode path is also
+      // raw-pointer-based for these dtypes. FP32 weight + Tensor::dot
+      // fallback could still crash, but Qwen3 + similar models use
+      // Q6_K so the common path is safe.
+      cl_context->registerFactory(
+        nntrainer::createLayer<causallm::TieWordEmbedding>);
+      // MHACoreLayer on cl_context enables engine=gpu attention. The same
+      // class runs on both backends: its forwarding() dispatches the GPU
+      // two_conv_attention kernels when NNTR_MHA_GPU is set and the Q/K/V/
+      // cache tensors are SVM-resident (isSVM()), else falls back to the
+      // CPU NEON path. Registration is additive — existing models whose mha
+      // node carries no engine= property keep routing to the CPU app_context
+      // (unchanged); only a node explicitly built with engine=gpu lands here.
+      cl_context->registerFactory(
+        nntrainer::createLayer<causallm::MHACoreLayer>);
+    } catch (std::invalid_argument &e) {
+      std::cerr << "failed to register GPU-routed layer on cl_context: "
+                << e.what() << std::endl;
+    }
   }
 }
 

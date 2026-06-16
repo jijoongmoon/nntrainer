@@ -94,6 +94,26 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp(size_t m, size_t n, size_t k,
                                        float lower_bound, float upper_bound);
 
 /**
+ * @brief fp16 in / fp16 out variant of nntr_kai_gemm_qai8dxp_qsi4cxp_olp.
+ *
+ * Uses the forked kai_lhs_quant_pack_qai8dxp_f16 packer and the forked
+ * kai_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm matmul, so
+ * no fp16↔fp32 cast pass over the LHS / DST tensors is needed.
+ *
+ * Locked to the 4x4x32 micro-kernel (qsi4cxp4x8 family, nr=4 kr=16 sr=2)
+ * — the only KAI variant we currently have a fp16-dst fork for. The
+ * passed rhs_packed_mtx_qs4cx must be a KAI rhs_packed buffer for that
+ * same variant.
+ *
+ * @param lower_bound / upper_bound  fp32 clamp values applied before the
+ * fcvtn; magnitudes should stay below 65504 to avoid +Inf on the cast.
+ */
+void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_f16(
+  size_t m, size_t n, size_t k, const void *lhs_native_mtx_f16,
+  void *rhs_packed_mtx_qs4cx, void *dst_act_mtx_f16, bool transB,
+  float lower_bound, float upper_bound);
+
+/**
  * @brief get size of memory to allocate for rhs weight packing of qsi8d32p to
  * qsi4c32p
  *

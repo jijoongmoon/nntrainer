@@ -66,6 +66,22 @@ public:
   const cl_device_id GetDeviceId();
 
   /**
+   * @brief Get a stable signature of the active device (name + driver version).
+   *        Used to key the on-disk kernel binary cache so a binary built for a
+   *        different GPU or before a driver update is never loaded.
+   *
+   * @return std::string "<device-name>|<driver-version>"
+   */
+  std::string GetDeviceSignature();
+
+  /**
+   * @brief Get the Platform Id object
+   *
+   * @return const cl_platform_id
+   */
+  const cl_platform_id GetPlatformId();
+
+  /**
    * @brief Get the Device Info
    *
    * @return const DeviceInfo *

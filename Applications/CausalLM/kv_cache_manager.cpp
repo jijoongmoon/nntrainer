@@ -12,7 +12,12 @@
 
 #include "kv_cache_manager.h"
 
+#include <cstdlib>
 #include <stdexcept>
+
+#include <basic_planner.h>
+#include <engine.h>
+#include <mem_allocator.h>
 
 namespace causallm {
 
@@ -63,11 +68,63 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   cache_pos_ = 0;
 
   layer_caches_.resize(num_layers);
-  for (unsigned int i = 0; i < num_layers; ++i) {
-    ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_widths_[i]},
-                                   {format, dtype});
-    layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
-    layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
+
+  // GPU-resident KV cache: when the graph runs on the SVM pool
+  // (NNTR_GPU_SVM_POOL) and the gpu-svm allocator is available, allocate the
+  // per-layer K/V from an SVM MemoryPool so their MemoryData reports
+  // isSVM()=true. That is the precondition for mha_core's GPU flash attention
+  // path (svm_ok); without it attention falls back to the host (CPU) GEMM and
+  // is ~60x slower. Mirrors gpu_native's SVM K/V cache.
+  std::shared_ptr<nntrainer::MemAllocator> svm_alloc;
+  if (std::getenv("NNTR_GPU_SVM_POOL") != nullptr) {
+    auto allocs = nntrainer::Engine::Global().getAllocators();
+    auto it = allocs.find("gpu");
+    if (it != allocs.end() && it->second &&
+        it->second->getName() == "gpu-svm") {
+      svm_alloc = it->second;
+    }
+  }
+
+  const size_t elem_size =
+    (dtype == ml::train::TensorDim::DataType::FP16) ? 2u : 4u;
+
+  if (svm_alloc) {
+    svm_pool_ = std::make_shared<nntrainer::MemoryPool>(svm_alloc);
+    std::vector<unsigned int> tokens;
+    tokens.reserve((size_t)num_layers * 2);
+    // All caches are live for the whole run; BasicPlanner gives each its own
+    // (non-overlapping) region so the total pool is the sum. Size each region
+    // per-layer so models with non-uniform KV widths stay correct.
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      const size_t bytes =
+        (size_t)batch_size * max_seq_len * kv_widths_[i] * elem_size;
+      tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // key
+      tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // value
+    }
+    svm_pool_->planLayout(nntrainer::BasicPlanner());
+    svm_pool_->allocate();
+
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_widths_[i]},
+                                     {format, dtype});
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].key_cache.setData(svm_pool_->getMemory(tokens[2 * i]), 0,
+                                         false);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].value_cache.setData(
+        svm_pool_->getMemory(tokens[2 * i + 1]), 0, false);
+      layer_caches_[i].key_cache.setZero();
+      layer_caches_[i].value_cache.setZero();
+    }
+  } else {
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_widths_[i]},
+                                     {format, dtype});
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
+      layer_caches_[i].key_cache.setZero();
+      layer_caches_[i].value_cache.setZero();
+    }
   }
 }
 

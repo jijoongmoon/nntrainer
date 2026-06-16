@@ -146,6 +146,12 @@ struct TensorSpecV2 {
   /** ONLY FOR THE GRANULAR CONTROL OF LIFE OUTSIDE OF LAYER NODE */
   /// @todo make this as an opaque information with PIMPL
   std::vector<unsigned> additional_exec_order = {};
+
+  /** compute engine of the producing layer; threaded to TensorPool so the
+   * static residency class (GPU_CLMEM vs SVM/HOST) can be derived at allocation
+   * for layer I/O activations. CPU by default => unchanged for non-GPU layers.
+   */
+  ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU;
 };
 
 /**

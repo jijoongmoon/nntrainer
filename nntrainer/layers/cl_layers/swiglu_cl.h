@@ -97,7 +97,8 @@ public:
    * @param[in] input2 Tensor
    * @param[in] result Tensor
    */
-  void swigluProcess(Tensor const &in1, Tensor const &in2, Tensor &result);
+  void swigluProcess(Tensor const &in1, Tensor const &in2, Tensor &result,
+                     unsigned int active_rows, unsigned int row_offset);
 
   /**
    * @brief     swiglu computation
@@ -120,7 +121,9 @@ public:
    * @param[in] dim1 number of elements in input vector X
    */
   void swiglu_cl_fp16(_FP16 *matAdata, _FP16 *vecXdata, _FP16 *vecYdata,
-                      unsigned int dim1, unsigned int dim2, bool svm = true);
+                      unsigned int dim1, unsigned int dim2, bool svm = true,
+                      void *resident_out = nullptr, bool skip_out_map = false,
+                      void *in1_clmem = nullptr, void *in2_clmem = nullptr);
 #endif
 
   /**

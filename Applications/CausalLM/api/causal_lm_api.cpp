@@ -22,6 +22,7 @@
 
 #include "causal_lm.h"
 #include "chat_template.h"
+#include "gemma2_causallm.h"
 #include "gemma3_causallm.h"
 #if !defined(_WIN32)
 #include "gptoss_cached_slim_causallm.h"
@@ -125,6 +126,11 @@ static void register_models() {
       });
 #endif
     causallm::Factory::Instance().registerModel(
+      "Gemma2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::Gemma2CausalLM>(cfg, generation_cfg,
+                                                          nntr_cfg);
+      });
+    causallm::Factory::Instance().registerModel(
       "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
                                                           nntr_cfg);
@@ -168,7 +174,8 @@ static std::string apply_chat_template(const std::string &architecture,
              architecture == "Qwen3SlimMoeForCausalLM" ||
              architecture == "Qwen3CachedSlimMoeForCausalLM") {
     return "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
-  } else if (architecture == "Gemma3ForCausalLM") {
+  } else if (architecture == "Gemma2ForCausalLM" ||
+             architecture == "Gemma3ForCausalLM") {
     return "<start_of_turn>user\n" + input +
            "<end_of_turn>\n<start_of_turn>model\n";
   }

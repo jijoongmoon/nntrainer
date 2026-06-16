@@ -37,6 +37,13 @@ static const size_t kai_num_bytes_offset_lhs = sizeof(int32_t);
 static const size_t kai_num_bytes_sum_rhs = sizeof(int32_t);
 static const size_t kai_num_bytes_bias = sizeof(float);
 
+// NOTE: upstream KAI's kai_rhs_packed_stride below omits the bias term,
+// while the actual packer (kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0) and the
+// matmul kernel asm both account for it (nr * 4 extra bytes per super-row).
+// This makes kai_get_rhs_packed_offset return offsets 16 bytes early per
+// super-row, garbling any caller that chunks N. Include the bias term to
+// match the packer.
+
 inline static size_t kai_k_roundedup(size_t k) {
   // Since we pack a float and int32 value at the end of the row,
   // we must make sure that k is a multiple of 4 for alignment

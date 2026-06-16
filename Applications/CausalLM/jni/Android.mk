@@ -25,6 +25,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/timm_vit \
     $(LOCAL_PATH)/../models/deberta_v2 \
@@ -41,6 +42,15 @@ include $(PREBUILT_SHARED_LIBRARY)
 include $(CLEAR_VARS)
 LOCAL_MODULE := ccapi-nntrainer
 LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/android_build_result/lib/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+# OpenCL driver: linked by the GPU-native binary that calls clSVMAlloc /
+# clEnqueueSVM* directly. libnntrainer.so resolves these dynamically via
+# its own loader; standalone binaries need the link explicitly.
+include $(CLEAR_VARS)
+LOCAL_MODULE := OpenCL
+LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/opencl/lib/$(TARGET_ARCH_ABI)/libOpenCL.so
+LOCAL_EXPORT_C_INCLUDES := $(NNTRAINER_ROOT)/builddir/opencl/include
 include $(PREBUILT_SHARED_LIBRARY)
 
 # Tokenizer library
@@ -90,6 +100,7 @@ LOCAL_SRC_FILES := \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/rms_norm.cpp \
+    ../layers/rms_norm_gpu.cpp \
     ../layers/swiglu.cpp \
     ../layers/tie_word_embedding.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
@@ -97,6 +108,7 @@ LOCAL_SRC_FILES := \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -156,6 +168,30 @@ LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
 LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES)
+
+include $(BUILD_EXECUTABLE)
+
+# Build nntrainer_qwen3_gpu executable — paper-aligned GPU-native Qwen3
+# forward (bypasses the layer graph; activations live in SVM cl_mem).
+include $(CLEAR_VARS)
+
+LOCAL_ARM_NEON := true
+LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math -DCL_TARGET_OPENCL_VERSION=200
+LOCAL_CXXFLAGS += -std=c++17 -frtti
+LOCAL_CFLAGS += -pthread -fexceptions -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_LDFLAGS += -fexceptions -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i8mm -DUSE_NEON=1 -mtune=cortex-a76 -O3 -ffast-math
+LOCAL_MODULE_TAGS := optional
+LOCAL_ARM_MODE := arm
+LOCAL_MODULE := nntrainer_qwen3_gpu
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := \
+    ../gpu_native/main.cpp \
+    ../gpu_native/qwen3_forward.cpp
+
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer OpenCL
+
+LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(LOCAL_PATH)/../gpu_native
 
 include $(BUILD_EXECUTABLE)
 
@@ -223,6 +259,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/rms_norm.cpp \
+    ../layers/rms_norm_gpu.cpp \
     ../layers/swiglu.cpp \
     ../layers/tie_word_embedding.cpp\
     ../layers/lm_head.cpp\
@@ -231,6 +268,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -253,6 +291,7 @@ LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \

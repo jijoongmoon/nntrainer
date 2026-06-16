@@ -16,10 +16,97 @@
 #include "opencl_context_manager.h"
 #include "opencl_loader.h"
 
+#include <cstdlib>
+#include <algorithm>
+#include <cstdio>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
 namespace nntrainer::opencl {
+
+// ---------------------------------------------------------------------------
+// cl_qcom_recordable_queues tokens/types — absent from the base CL/cl.h shipped
+// in this tree; the Adreno 840 driver implements them at runtime. Values from
+// CL/cl_ext_qcom.h (Qualcomm AI stack), same local-define pattern as the QCOM
+// perf/priority hints in opencl_context_manager.cpp.
+// ---------------------------------------------------------------------------
+#ifndef CL_QUEUE_RECORDABLE_QCOM
+#define CL_QUEUE_RECORDABLE_QCOM (1u << 30u) /* 0x40000000 */
+#endif
+
+typedef struct _cl_recording_qcom *cl_recording_qcom;
+
+// Per-replay kernel-argument update descriptor (phase-2 uses this to bump the
+// attention N_kv / KV-scatter position between token replays).
+typedef struct _cl_array_arg_qcom {
+  cl_uint dispatch_index;
+  cl_uint arg_index;
+  size_t arg_size;
+  const void *arg_value;
+} cl_array_arg_qcom;
+
+typedef struct _cl_offset_qcom {
+  cl_uint dispatch_index;
+  size_t offsets[3];
+} cl_offset_qcom;
+
+typedef struct _cl_workgroup_qcom {
+  cl_uint dispatch_index;
+  const size_t *workgroup_size;
+} cl_workgroup_qcom;
+
+typedef cl_recording_qcom(CL_API_CALL *PFN_clNewRecordingQCOM)(cl_command_queue,
+                                                               cl_int *);
+typedef cl_int(CL_API_CALL *PFN_clEndRecordingQCOM)(cl_recording_qcom);
+typedef cl_int(CL_API_CALL *PFN_clReleaseRecordingQCOM)(cl_recording_qcom);
+typedef cl_int(CL_API_CALL *PFN_clEnqueueRecordingQCOM)(
+  cl_command_queue, cl_recording_qcom, size_t, const cl_array_arg_qcom *,
+  size_t, const cl_offset_qcom *, size_t, const cl_workgroup_qcom *, size_t,
+  const cl_workgroup_qcom *, cl_uint, const cl_event *, cl_event *);
+
+namespace {
+// Per-kernel GPU profiling registry, populated by enqueueKernel when
+// NNTR_OPENCL_PROFILING is set. Each entry owns one cl_event reference that
+// dumpProfile() releases. Single-threaded dispatch path, so no lock needed.
+struct ProfRec {
+  std::string name;
+  cl_event evt;
+};
+
+std::vector<ProfRec> &profRecs() {
+  static std::vector<ProfRec> v;
+  return v;
+}
+
+bool profEnabled() {
+  static const int e = std::getenv("NNTR_OPENCL_PROFILING") ? 1 : 0;
+  return e != 0;
+}
+
+// recordable-queue feasibility trace (NNTR_RECQ_TRACE): one shared op counter
+// across kernel dispatches and host ops (SVM map/unmap, buffer read/map), so we
+// can see whether host ops intersperse the decode kernel run (which would break
+// the single-recording replay model).
+void rqt_op(const char *tag, const char *name) {
+  static const bool on = std::getenv("NNTR_RECQ_TRACE") != nullptr;
+  if (!on)
+    return;
+  static int n = 0;
+  fprintf(stderr, "[rqt] %5d %s %s\n", n++, tag, name ? name : "");
+}
+
+// cl_qcom_recordable_queues entry points, resolved once at queue-creation time
+// when NNTR_RECQ is set (null otherwise). TU scope so the enqueue chokepoint and
+// the decode-loop record/replay (phase-2) can reach them.
+PFN_clNewRecordingQCOM recq_new_ = nullptr;
+PFN_clEndRecordingQCOM recq_end_ = nullptr;
+PFN_clEnqueueRecordingQCOM recq_enqueue_ = nullptr;
+PFN_clReleaseRecordingQCOM recq_release_ = nullptr;
+} // namespace
 
 /**
  * @brief Create a Command Queue object
@@ -48,9 +135,25 @@ bool CommandQueueManager::CreateCommandQueue() {
   // getting GPU device ID
   cl_device_id device_id = context_instance.GetDeviceId();
 
+  // Queue ordering policy. Default: out-of-order (unchanged) — the existing
+  // path serializes via per-layer host round-trips, so OOO is harmless, and
+  // gpu_native manages its own ordering/barriers on top of it. When the graph
+  // opts into the GPU-resident SVM pool (NNTR_GPU_SVM_POOL), consecutive CL
+  // layers hand off through a shared buffer with no host round-trip, so the
+  // queue must execute in submission order -> use an in-order queue.
+  // See tensor/cl_operations/GPU_GENERALIZATION_PLAN.md Step 1.
+  cl_command_queue_properties qprops = 0;
+  if (std::getenv("NNTR_GPU_SVM_POOL") == nullptr) {
+    qprops |= CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
+  }
+  // Env-gated CL_QUEUE_PROFILING_ENABLE so v8c (and any other) callers can
+  // collect per-command start/end timestamps without paying the profiling
+  // tax in production runs. Set NNTR_OPENCL_PROFILING=1 to enable.
+  if (std::getenv("NNTR_OPENCL_PROFILING")) {
+    qprops |= CL_QUEUE_PROFILING_ENABLE;
+  }
   // returns NULL with error code if fails
-  command_queue_ = clCreateCommandQueue(
-    context, device_id, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &error_code);
+  command_queue_ = clCreateCommandQueue(context, device_id, qprops, &error_code);
   if (!command_queue_) {
     ml_loge("Failed to create a command queue. OpenCL error code: %d : ",
             error_code, OpenCLErrorCodeToString(error_code));
@@ -60,7 +163,94 @@ bool CommandQueueManager::CreateCommandQueue() {
   // increments the command_queue reference count
   clRetainCommandQueue(command_queue_);
   ml_logi("opencl_command_queue_manager: Retained command queue");
+
+  // cl_qcom_recordable_queues foundation (phase-1). Opt-in via NNTR_RECQ
+  // (default off). Purely additive: the canonical path keeps using
+  // command_queue_ regardless. Failure to set up the recordable queues is
+  // non-fatal (logged), so a device without the extension still runs normally.
+  if (std::getenv("NNTR_RECQ")) {
+    initRecordableQueues(context, device_id);
+  }
   return true;
+}
+
+/**
+ * @brief Resolve the cl_qcom_recordable_queues entry points and create the
+ * recordable + host-I/O queues (NNTR_RECQ). Non-fatal on failure.
+ */
+void CommandQueueManager::initRecordableQueues(cl_context context,
+                                               cl_device_id device_id) {
+  cl_platform_id platform = ContextManager::Global().GetPlatformId();
+  if (!platform || !clGetExtensionFunctionAddressForPlatform) {
+    ml_logw("NNTR_RECQ: platform id or extension resolver unavailable; "
+            "recordable queues disabled.");
+    return;
+  }
+
+  // The QCOM recording functions are extension entry points, not base ICD
+  // symbols, so they must be resolved through the platform (not dlsym).
+  recq_new_ = reinterpret_cast<PFN_clNewRecordingQCOM>(
+    clGetExtensionFunctionAddressForPlatform(platform, "clNewRecordingQCOM"));
+  recq_end_ = reinterpret_cast<PFN_clEndRecordingQCOM>(
+    clGetExtensionFunctionAddressForPlatform(platform, "clEndRecordingQCOM"));
+  recq_enqueue_ = reinterpret_cast<PFN_clEnqueueRecordingQCOM>(
+    clGetExtensionFunctionAddressForPlatform(platform,
+                                             "clEnqueueRecordingQCOM"));
+  recq_release_ = reinterpret_cast<PFN_clReleaseRecordingQCOM>(
+    clGetExtensionFunctionAddressForPlatform(platform,
+                                             "clReleaseRecordingQCOM"));
+
+  if (!recq_new_ || !recq_end_ || !recq_enqueue_ || !recq_release_) {
+    ml_logw("NNTR_RECQ: the loaded libOpenCL.so does not export the QCOM "
+            "recording entry points (New=%p End=%p Enq=%p Rel=%p). The Adreno "
+            "profiler shim libOpenCL.so advertises the extension but does not "
+            "forward these functions - run against the system ICD loader "
+            "(/vendor/lib64/libOpenCL.so) to use NNTR_RECQ. Recordable queues "
+            "disabled.",
+            (void *)recq_new_, (void *)recq_end_, (void *)recq_enqueue_,
+            (void *)recq_release_);
+    recq_new_ = nullptr;
+    recq_end_ = nullptr;
+    recq_enqueue_ = nullptr;
+    recq_release_ = nullptr;
+    return;
+  }
+
+  if (!clCreateCommandQueueWithProperties) {
+    ml_logw("NNTR_RECQ: clCreateCommandQueueWithProperties unavailable; "
+            "recordable queues disabled.");
+    return;
+  }
+
+  // The recordable queue carries the CL_QUEUE_RECORDABLE_QCOM property; the
+  // separate io queue is a plain default queue for host readback (the
+  // recordable queue rejects clEnqueueReadBuffer with CL_INVALID_OPERATION).
+  int error_code = CL_SUCCESS;
+  const cl_queue_properties recq_props[] = {CL_QUEUE_PROPERTIES,
+                                            CL_QUEUE_RECORDABLE_QCOM, 0};
+  recordable_command_queue_ = clCreateCommandQueueWithProperties(
+    context, device_id, recq_props, &error_code);
+  if (!recordable_command_queue_) {
+    ml_logw("NNTR_RECQ: failed to create the recordable command queue "
+            "(%d : %s); recordable queues disabled.",
+            error_code, OpenCLErrorCodeToString(error_code));
+    return;
+  }
+
+  io_command_queue_ = clCreateCommandQueueWithProperties(context, device_id,
+                                                         nullptr, &error_code);
+  if (!io_command_queue_) {
+    ml_logw("NNTR_RECQ: failed to create the host-I/O command queue "
+            "(%d : %s); recordable queues disabled.",
+            error_code, OpenCLErrorCodeToString(error_code));
+    clReleaseCommandQueue(recordable_command_queue_);
+    recordable_command_queue_ = nullptr;
+    return;
+  }
+
+  ml_logi("NNTR_RECQ: cl_qcom_recordable_queues ready - recordable queue %p + "
+          "host-I/O queue %p, all 4 QCOM entry points resolved.",
+          (void *)recordable_command_queue_, (void *)io_command_queue_);
 }
 
 /**
@@ -79,6 +269,16 @@ void CommandQueueManager::ReleaseCommandQueue() {
  *
  */
 CommandQueueManager::~CommandQueueManager() {
+  // Recordable + host-I/O queues (NNTR_RECQ) are created once with refcount 1,
+  // so a single release each is correct.
+  if (recordable_command_queue_) {
+    clReleaseCommandQueue(recordable_command_queue_);
+    recordable_command_queue_ = nullptr;
+  }
+  if (io_command_queue_) {
+    clReleaseCommandQueue(io_command_queue_);
+    io_command_queue_ = nullptr;
+  }
   if (command_queue_) {
     ml_logi("opencl_command_queue_manager: Destroyed command queue");
     // decrements the command_queue reference count
@@ -115,6 +315,7 @@ bool CommandQueueManager::EnqueueReadBuffer(cl_mem buffer, size_t size_in_bytes,
   // managing synchronization
   const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
   // returns NULL with error code if fails
+  rqt_op("HOST_readbuf", nullptr);
   auto error_code =
     clEnqueueReadBuffer(command_queue_, buffer, blocking, 0, size_in_bytes,
                         data, 0, nullptr, nullptr);
@@ -253,6 +454,7 @@ void *CommandQueueManager::EnqueueMapBuffer(cl_mem buffer,
 
   cl_int error_code;
 
+  rqt_op("HOST_mapbuf", nullptr);
   void *host_mem_buf = clEnqueueMapBuffer(
     command_queue_, buffer, blocking, map_flag, offset_in_bytes, size_in_bytes,
     0, nullptr, event, &error_code);
@@ -290,13 +492,42 @@ bool CommandQueueManager::EnqueueUnmapMemObject(cl_mem buffer, void *mapped_ptr,
   return true;
 }
 
+void CommandQueueManager::finish() {
+  if (command_queue_)
+    clFinish(command_queue_);
+}
+
+// NNTR_SVM_RESIDENT: keep the activation chain fully GPU-resident. On the
+// in-order SVM queue (NNTR_GPU_SVM_POOL) consecutive GPU kernels are already
+// device-coherent without host map/unmap; the per-op maps exist only as a
+// defensive host-coherence guard that no all-GPU consumer needs. Skipping them
+// removes the coarse-grain SVM coherence ops (cache flush/invalidate) that
+// serialize the layer-graph forward and lose the GPU/host overlap gpu_native
+// keeps. Genuine host boundaries (e.g. lm_head input read) pass force=true to
+// map anyway. Default off (original blocking behavior).
+static bool svm_resident_mode() {
+  static const bool v = std::getenv("NNTR_SVM_RESIDENT") != nullptr;
+  return v;
+}
+
 bool CommandQueueManager::enqueueSVMMap(void *svm_ptr, size_t size,
-                                        bool read_only, cl_event *event) {
+                                        bool read_only, bool async,
+                                        cl_event *event, bool force) {
+  if (svm_resident_mode() && !force)
+    return true; // resident: stays device-coherent, no host map needed
   // managing read/write flags
   const cl_map_flags map_flag = read_only ? CL_MAP_READ : CL_MAP_WRITE;
 
-  cl_int error_code = clEnqueueSVMMap(command_queue_, CL_TRUE, map_flag,
-                                      svm_ptr, size, 0, nullptr, nullptr);
+  // async=true => non-blocking map (CL_FALSE). Safe ONLY on an in-order queue
+  // (NNTR_GPU_SVM_POOL path) where the map is ordered before the next op's
+  // unmap/kernel, AND when no host access of this region happens before that
+  // next GPU op. Removes the per-op host stall that otherwise drains the queue
+  // to idle. Default (false) keeps the original blocking behavior.
+  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+
+  rqt_op(blocking ? "HOST_svmmap_BLOCK" : "HOST_svmmap_async", nullptr);
+  cl_int error_code = clEnqueueSVMMap(command_queue_, blocking, map_flag,
+                                      svm_ptr, size, 0, nullptr, event);
 
   if (error_code != CL_SUCCESS) {
     ml_loge(
@@ -307,7 +538,10 @@ bool CommandQueueManager::enqueueSVMMap(void *svm_ptr, size_t size,
   return true;
 }
 
-bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event) {
+bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event,
+                                          bool force) {
+  if (svm_resident_mode() && !force)
+    return true; // resident: stays device-coherent, no host unmap needed
   cl_int error_code =
     clEnqueueSVMUnmap(command_queue_, svm_ptr, 0, nullptr, event);
 
@@ -353,15 +587,43 @@ bool CommandQueueManager::DispatchCommand(
 
   cl_kernel kernel_ = kernel.GetKernel();
 
+  // Profiling: capture a tracked event like enqueueKernel does. Without this,
+  // every DispatchCommand-dispatched kernel (rmsnorm/geglu/v8c writers/...)
+  // is INVISIBLE to dumpProfile and its GPU time is mis-attributed as
+  // "inter-kernel idle" of the surrounding tracked kernels.
+  cl_event local_evt = nullptr;
+  cl_event *evt_arg = event;
+  const bool track = profEnabled() && evt_arg == nullptr;
+  if (track)
+    evt_arg = &local_evt;
+
   // returns NULL with error code if fails
-  const int error_code =
-    clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
-                           events_to_wait.size(), events_to_wait.data(), event);
+  const int error_code = clEnqueueNDRangeKernel(
+    command_queue_, kernel_, 3, nullptr, global, local,
+    events_to_wait.size(), events_to_wait.data(), evt_arg);
+  static const bool rqt_on2 = std::getenv("NNTR_RECQ_TRACE") != nullptr;
+  if (rqt_on2) {
+    char nm[96] = {0};
+    clGetKernelInfo(kernel_, CL_KERNEL_FUNCTION_NAME, sizeof(nm) - 1, nm,
+                    nullptr);
+    rqt_op("DISPATCH", nm);
+  }
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
     return false;
   }
+  if (track && local_evt != nullptr) {
+    char nm[128] = {0};
+    if (clGetKernelInfo(kernel_, CL_KERNEL_FUNCTION_NAME, sizeof(nm) - 1, nm,
+                        nullptr) != CL_SUCCESS)
+      nm[0] = '\0';
+    std::string key(nm);
+    if (!next_prof_label_.empty())
+      key += next_prof_label_;
+    profRecs().push_back({std::move(key), local_evt});
+  }
+  next_prof_label_.clear();
 
   return true;
 }
@@ -387,15 +649,40 @@ bool CommandQueueManager::DispatchCommand(
 
   cl_kernel kernel_ = kernel_ptr->GetKernel();
 
+  // Profiling capture: see the by-value overload above.
+  cl_event local_evt = nullptr;
+  cl_event *evt_arg = event;
+  const bool track = profEnabled() && evt_arg == nullptr;
+  if (track)
+    evt_arg = &local_evt;
+
   // returns NULL with error code if fails
-  const int error_code =
-    clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
-                           events_to_wait.size(), events_to_wait.data(), event);
+  const int error_code = clEnqueueNDRangeKernel(
+    command_queue_, kernel_, 3, nullptr, global, local,
+    events_to_wait.size(), events_to_wait.data(), evt_arg);
+  static const bool rqt_on2 = std::getenv("NNTR_RECQ_TRACE") != nullptr;
+  if (rqt_on2) {
+    char nm[96] = {0};
+    clGetKernelInfo(kernel_, CL_KERNEL_FUNCTION_NAME, sizeof(nm) - 1, nm,
+                    nullptr);
+    rqt_op("DISPATCH", nm);
+  }
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
     return false;
   }
+  if (track && local_evt != nullptr) {
+    char nm[128] = {0};
+    if (clGetKernelInfo(kernel_, CL_KERNEL_FUNCTION_NAME, sizeof(nm) - 1, nm,
+                        nullptr) != CL_SUCCESS)
+      nm[0] = '\0';
+    std::string key(nm);
+    if (!next_prof_label_.empty())
+      key += next_prof_label_;
+    profRecs().push_back({std::move(key), local_evt});
+  }
+  next_prof_label_.clear();
 
   return true;
 }
@@ -408,13 +695,166 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
                                         const cl_event *event_wait_list,
                                         cl_event *event) {
 
+  // When profiling and the caller did not request its own event, capture a
+  // tracked event so dumpProfile() can read true per-kernel GPU time. We own
+  // the single reference and release it in dumpProfile(). (Calls that pass
+  // their own event — e.g. the act-quant path — are left untracked to avoid
+  // event-ownership complexity; they are a negligible slice anyway.)
+  cl_event local_evt = nullptr;
+  cl_event *evt_arg = event;
+  const bool track = profEnabled() && evt_arg == nullptr;
+  if (track)
+    evt_arg = &local_evt;
+
   const auto error_code = clEnqueueNDRangeKernel(
     command_queue_, kernel, work_dim, nullptr, global_work_size,
-    local_work_size, num_events_in_wait_list, event_wait_list, event);
+    local_work_size, num_events_in_wait_list, event_wait_list, evt_arg);
+
+  static const bool rqt_on = std::getenv("NNTR_RECQ_TRACE") != nullptr;
+  if (rqt_on) {
+    char nm[96] = {0};
+    clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(nm) - 1, nm,
+                    nullptr);
+    rqt_op("KERNEL", nm);
+  }
 
   NNTR_THROW_IF(error_code != CL_SUCCESS, std::runtime_error)
     << "clEnqueueNDRangeKernel failed. OpenCL error code: " << error_code
     << ", error: " << OpenCLErrorCodeToString(error_code);
+
+  if (track && local_evt != nullptr) {
+    char nm[128] = {0};
+    if (clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(nm) - 1, nm,
+                        nullptr) != CL_SUCCESS)
+      nm[0] = '\0';
+    std::string key(nm);
+    if (!next_prof_label_.empty())
+      key += next_prof_label_;
+    profRecs().push_back({std::move(key), local_evt});
+  }
+  // consume the per-call shape label regardless of tracking, so it never
+  // leaks onto a subsequent kernel's profile entry.
+  next_prof_label_.clear();
+}
+
+void CommandQueueManager::dumpProfile(const char *tag) {
+  if (!profEnabled())
+    return;
+  auto &recs = profRecs();
+  if (command_queue_)
+    clFinish(command_queue_);
+
+  struct Agg {
+    double total_ns = 0.0;
+    unsigned long count = 0;
+  };
+  std::unordered_map<std::string, Agg> agg;
+  double grand_ns = 0.0;
+  // ordered timeline (name, start, end) for inter-kernel GPU-idle attribution
+  std::vector<std::string> tl_name;
+  std::vector<cl_ulong> tl_start, tl_end;
+  for (auto &r : recs) {
+    cl_ulong start = 0, end = 0;
+    if (r.evt) {
+      clGetEventProfilingInfo(r.evt, CL_PROFILING_COMMAND_START,
+                              sizeof(start), &start, nullptr);
+      clGetEventProfilingInfo(r.evt, CL_PROFILING_COMMAND_END, sizeof(end),
+                              &end, nullptr);
+      if (end > start) {
+        double ns = (double)(end - start);
+        agg[r.name].total_ns += ns;
+        grand_ns += ns;
+        tl_name.push_back(r.name);
+        tl_start.push_back(start);
+        tl_end.push_back(end);
+      }
+      agg[r.name].count++;
+      clReleaseEvent(r.evt);
+    }
+  }
+  recs.clear();
+
+  // Inter-kernel GPU-idle: gap between kernel i's end and i+1's start = host-
+  // bound dispatch overhead (the GPU waiting for the host to enqueue/prep the
+  // next kernel). Attribute each gap to the "A -> B" transition (base names,
+  // shape label stripped) so we see where the idle concentrates.
+  auto base = [](const std::string &s) {
+    auto p = s.find(':');
+    return p == std::string::npos ? s : s.substr(0, p);
+  };
+  std::unordered_map<std::string, Agg> idle;
+  // Per-transition gap list for distribution stats (first/median/max). An
+  // aggregate "avg x count" can hide a one-time cost diluted across N
+  // instances -- exactly how the first-prefill kernel-program builds
+  // masqueraded as a 39ms/layer issue tax (G9).
+  std::unordered_map<std::string, std::vector<double>> idle_gaps;
+  double total_idle_ns = 0.0;
+  for (size_t i = 1; i < tl_start.size(); ++i) {
+    if (tl_start[i] > tl_end[i - 1]) {
+      double g = (double)(tl_start[i] - tl_end[i - 1]);
+      std::string key = base(tl_name[i - 1]) + " -> " + base(tl_name[i]);
+      idle[key].total_ns += g;
+      idle[key].count++;
+      idle_gaps[key].push_back(g);
+      total_idle_ns += g;
+    }
+  }
+
+  std::vector<std::pair<std::string, Agg>> sorted(agg.begin(), agg.end());
+  std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) {
+    return a.second.total_ns > b.second.total_ns;
+  });
+
+  printf("\n==== GPU kernel profile [%s] : true on-device time ====\n",
+         tag ? tag : "");
+  printf("  %-34s %10s %8s %10s %7s\n", "kernel", "total_ms", "calls",
+         "avg_us", "%%");
+  for (auto &kv : sorted) {
+    double tot_ms = kv.second.total_ns / 1e6;
+    double avg_us = kv.second.count
+                      ? (kv.second.total_ns / 1e3) / (double)kv.second.count
+                      : 0.0;
+    double pct = grand_ns > 0.0 ? 100.0 * kv.second.total_ns / grand_ns : 0.0;
+    printf("  %-34s %10.2f %8lu %10.2f %6.1f%%\n", kv.first.c_str(), tot_ms,
+           kv.second.count, avg_us, pct);
+  }
+  printf("  %-34s %10.2f\n", "TOTAL (sum of kernel GPU time)", grand_ns / 1e6);
+
+  // host-bound inter-kernel idle (GPU waiting for host between dispatches)
+  std::vector<std::pair<std::string, Agg>> idle_sorted(idle.begin(), idle.end());
+  std::sort(idle_sorted.begin(), idle_sorted.end(),
+            [](const auto &a, const auto &b) {
+              return a.second.total_ns > b.second.total_ns;
+            });
+  printf("\n  --- inter-kernel GPU-idle (host-bound dispatch overhead) ---\n");
+  printf("  %-44s %10s %8s %9s %9s %9s %9s\n", "transition (A -> B)", "idle_ms",
+         "count", "avg_us", "first_us", "p50_us", "max_us");
+  size_t shown = 0;
+  for (auto &kv : idle_sorted) {
+    if (shown++ >= 15)
+      break;
+    double ms = kv.second.total_ns / 1e6;
+    double avg_us = kv.second.count
+                      ? (kv.second.total_ns / 1e3) / (double)kv.second.count
+                      : 0.0;
+    double pct = total_idle_ns > 0.0 ? 100.0 * kv.second.total_ns / total_idle_ns : 0.0;
+    // distribution: first occurrence vs median vs max -- uniform per-layer
+    // cost has first~p50~max; a one-time cost has max>>p50.
+    auto &gaps = idle_gaps[kv.first];
+    double first_us = gaps.empty() ? 0.0 : gaps.front() / 1e3;
+    double max_us = 0.0;
+    for (double g : gaps)
+      max_us = std::max(max_us, g / 1e3);
+    std::vector<double> tmp(gaps);
+    std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+    double p50_us = tmp.empty() ? 0.0 : tmp[tmp.size() / 2] / 1e3;
+    printf("  %-44s %10.2f %8lu %9.1f %9.1f %9.1f %9.1f  (%4.1f%%)\n",
+           kv.first.c_str(), ms, kv.second.count, avg_us, first_us, p50_us,
+           max_us, pct);
+  }
+  printf("  %-44s %10.2f\n", "TOTAL inter-kernel idle", total_idle_ns / 1e6);
+  printf("=========================================================\n\n");
+  fflush(stdout);
 }
 
 } // namespace nntrainer::opencl

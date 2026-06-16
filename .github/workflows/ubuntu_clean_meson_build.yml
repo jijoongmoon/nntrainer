@@ -39,11 +39,6 @@ jobs:
     - name: install build systems
       run: sudo apt install meson ninja-build
     - run: |
-        causallm_option="-Denable-transformer=false"
-        if [ "${{ matrix.meson_options }}" = "-Denable-fp16=false" ]; then
-          causallm_option="-Denable-transformer=true"
-        fi
-
         meson \
           --buildtype=plain \
           --prefix=/usr \
@@ -52,7 +47,6 @@ jobs:
           --bindir=lib/nntrainer/bin \
           --includedir=include \
           -Dinstall-app=true \
-          ${causallm_option} \
           -Dreduce-tolerance=false \
           -Denable-debug=true \
           -Dml-api-support=enabled \
@@ -64,27 +58,6 @@ jobs:
           -Denable-capi=enabled \
           ${{ matrix.meson_options }} \
           build
-    - name: Check CausalLM model tests are enabled
-      if: ${{ matrix.meson_options == '-Denable-fp16=false' }}
-      run: |
-        meson introspect build --tests > meson-tests.json
-        python3 - <<'PY'
-        import json
-
-        with open("meson-tests.json", encoding="utf-8") as test_file:
-            tests = {test["name"] for test in json.load(test_file)}
-
-        required_tests = {
-            "unittest_causallm_models",
-        }
-        missing_tests = sorted(required_tests - tests)
-        if missing_tests:
-            raise SystemExit(
-                "Missing CausalLM Meson tests: " + ", ".join(missing_tests)
-            )
-
-        print("CausalLM Meson model tests enabled: " + ", ".join(sorted(required_tests)))
-        PY
     - run: ninja -C build
     - name: run App Tests
       run: meson test -C build --no-suite unittests

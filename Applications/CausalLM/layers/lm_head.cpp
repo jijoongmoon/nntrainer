@@ -14,6 +14,8 @@
 #include <cpu_backend.h>
 #include <layer_context.h>
 #include <lm_head.h>
+
+#include "_layer_prof.h"
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -115,6 +117,7 @@ void LmHeadLayer::setProperty(const std::vector<std::string> &values) {
 
 void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
                              bool training) {
+  causallm::LayerProfScope _prof("lm_head_fwd", false);
   throw nntrainer::exception::not_supported(
     "Forwarding for LMHead layer is not supported");
 }
@@ -122,6 +125,7 @@ void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
 void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) {
+  causallm::LayerProfScope _prof("lm_head", (to - from) == 1);
   bool is_prefill = !from;
   if (skip_prefill && is_prefill)
     return;

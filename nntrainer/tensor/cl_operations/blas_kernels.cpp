@@ -14,8 +14,14 @@
 #include "blas_kernels_templates.h"
 #include <cl_kernels/cl_kernels.h>
 
+#include "cl_tensor_view.h"
 #include "util_func.h"
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fp16.h>
+#include <unordered_map>
 
 namespace nntrainer {
 
@@ -1060,7 +1066,7 @@ void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
 }
 
 void addition_cl(const float *input, float *res, unsigned int size_input,
-                 unsigned int size_res) {
+                 unsigned int size_res, bool use_svm) {
   bool result = false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -1072,7 +1078,7 @@ void addition_cl(const float *input, float *res, unsigned int size_input,
   }
 
   addition_cl_internal<float>(kernel_addition_ptr, input, res, size_input,
-                              size_res);
+                              size_res, use_svm);
 }
 
 void rmsnorm_cl(const float *input, const float *gamma, float *result,
@@ -1090,6 +1096,441 @@ void rmsnorm_cl(const float *input, const float *gamma, float *result,
   rmsnorm_cl_internal<float>(kernel_rmsnorm_ptr, input, gamma, result, epsilon,
                              height, width, use_svm);
 }
+
+#ifdef ENABLE_FP16
+void cl_queue_finish() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc)
+    blas_cc->command_queue_inst_.finish();
+}
+
+void cl_svm_map_force(void *ptr, size_t bytes, bool read_only) {
+  // Force a blocking host-coherent SVM map even when NNTR_SVM_RESIDENT skips the
+  // per-op maps. Used at genuine GPU->host boundaries (e.g. lm_head reads the
+  // final RMSNorm output on the host) so the resident chain stays correct.
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc && ptr && bytes)
+    blas_cc->command_queue_inst_.enqueueSVMMap(ptr, bytes, read_only,
+                                               /*async=*/false, nullptr,
+                                               /*force=*/true);
+}
+
+void cl_svm_unmap_force(void *ptr) {
+  // Force an SVM unmap (hand the buffer back to the device) even under
+  // NNTR_SVM_RESIDENT. Used after a genuine HOST write to an SVM activation
+  // (e.g. the input token embedding) so the following GPU kernels read coherent
+  // data when the per-op maps are skipped.
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc && ptr)
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(ptr, nullptr, /*force=*/true);
+}
+
+// Fused RMSNorm + residual add (Gemma2 sandwich-norm boundary): computes
+// out = rmsnorm(input)*gamma + residual in one kernel, removing the separate
+// v8c_add_h2h residual-add kernel (~42 ms/prefill GPU) AND the rmsnorm->add /
+// add->next dispatch idle. Mirrors rmsnorm_cl_fp16_coop exactly (LWS=64, LDS-tree
+// reduce, gamma carries Gemma2's (1+w)) then folds the residual add. Inline
+// string so no .cl regen step is needed.
+//
+// Bit-identity to the separate [rmsnorm_cl_fp16_coop then v8c_add_h2h] path:
+// `nv` is a named half8 intermediate, so norm*gamma rounds to fp16 (rounding #1)
+// before the residual add rounds again (rounding #2) -- exactly the two
+// roundings of the separate path (the norm kernel stores fp16, the add kernel
+// re-rounds). This holds when built without mad-contraction, i.e. under
+// NNTR_NO_FASTMATH=1, which is this fusion's intended/committed config. (An
+// earlier as_half8(as_ushort8(.)) bitcast meant to defeat fast-math contraction
+// tripped an Adreno arg-binding bug -- CL_INVALID_ARG_VALUE on the gamma SVM
+// arg; the plain named intermediate avoids it.)
+static const std::string rmsnorm_add_fp16_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__attribute__((reqd_work_group_size(64, 1, 1)))
+__kernel void rmsnorm_cl_fp16_coop_add(__global const half *input,
+                                       __global half *output,
+                                       __global const half *alpha,
+                                       half epsilon, int n_rows, int W,
+                                       __global const half *residual) {
+  const int row = get_group_id(0);
+  const int tid = get_local_id(0);   // 0..63
+  if (row >= n_rows)
+    return;
+  const long base = (long)row * (long)W;
+  const int W8 = W >> 3;
+  __global const half8 *in8 = (__global const half8 *)(input + base);
+  float partial = 0.0f;
+  for (int i = tid; i < W8; i += 64) {
+    const float8 v = convert_float8(in8[i]);
+    partial += dot(v.lo, v.lo) + dot(v.hi, v.hi);
+  }
+  __local float lsum[64];
+  lsum[tid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = 32; s > 0; s >>= 1) {
+    if (tid < s)
+      lsum[tid] += lsum[tid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float mean = lsum[0] / (float)W;
+  const float scale = rsqrt(mean + (float)epsilon);
+  __global half8 *out8 = (__global half8 *)(output + base);
+  __global const half8 *a8 = (__global const half8 *)(alpha);
+  __global const half8 *r8 = (__global const half8 *)(residual + base);
+  for (int i = tid; i < W8; i += 64) {
+    const half8 nv = convert_half8(convert_float8(in8[i]) * scale) * a8[i];
+    out8[i] = nv + r8[i];
+  }
+}
+)CL";
+
+// width%8==0 (Gemma2 hidden=2304) coop fused norm+add. in/out/residual each may
+// be a cl_mem sub-buffer (GPU_CLMEM resident) or SVM; gamma stays SVM. Returns
+// false (caller falls back to separate norm+add) on unsupported shape.
+bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
+                         const _FP16 *residual, _FP16 *result, float epsilon,
+                         unsigned int height, unsigned int width, bool use_svm,
+                         void *out_clmem, void *in_clmem, void *resid_clmem) {
+  if ((width % 8u) != 0u || !use_svm)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return false;
+  const cl_half eps_h = static_cast<cl_half>(0);
+  const _FP16 eps_f = static_cast<_FP16>(epsilon);
+  std::memcpy((void *)&eps_h, &eps_f, sizeof(cl_half));
+  cl_mem out_cl = static_cast<cl_mem>(out_clmem);
+  cl_mem in_cl = static_cast<cl_mem>(in_clmem);
+  cl_mem resid_cl = static_cast<cl_mem>(resid_clmem);
+  const int n_rows = (int)height, w = (int)width;
+
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    rmsnorm_add_fp16_kernel, "rmsnorm_cl_fp16_coop_add");
+  if (!kp)
+    return false;
+  // Arg order mirrors rmsnorm_cl_fp16_coop (in,out,alpha,eps,n_rows,W) with the
+  // residual pointer appended LAST.
+  bool ok = true;
+  bool a0 = in_cl ? kp->SetKernelArguments(0, &in_cl, sizeof(cl_mem))
+                  : kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+  bool a1 = out_cl ? kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem))
+                   : kp->SetKernelSVMArguments(1, result);
+  bool a2 = kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma));
+  bool a3 = kp->SetKernelArguments(3, &eps_h, sizeof(cl_half));
+  bool a4 = kp->SetKernelArguments(4, &n_rows, sizeof(int));
+  bool a5 = kp->SetKernelArguments(5, &w, sizeof(int));
+  bool a6 = resid_cl
+              ? kp->SetKernelArguments(6, &resid_cl, sizeof(cl_mem))
+              : kp->SetKernelSVMArguments(6, const_cast<_FP16 *>(residual));
+  ok = a0 && a1 && a2 && a3 && a4 && a5 && a6;
+  if (!ok)
+    return false;
+  constexpr int RMSN_LWS = 64;
+  const int gws[3] = {RMSN_LWS * n_rows, 1, 1};
+  const int lws[3] = {RMSN_LWS, 1, 1};
+  blas_cc->command_queue_inst_.setNextProfileLabel(":rmsnorm_add");
+  return blas_cc->command_queue_inst_.DispatchCommand(kp, gws, lws);
+}
+
+void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
+                     const float epsilon, unsigned int height,
+                     unsigned int width, bool use_svm, void *out_clmem,
+                     void *in_clmem, bool skip_out_map) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  const _FP16 eps_h = static_cast<_FP16>(epsilon);
+  const size_t in_bytes = (size_t)height * width * sizeof(_FP16);
+
+  // NNTR_GPU_CLMEM_POOL (cl_mem residency): write the normed output to the
+  // tensor's planner cl_mem sub-buffer (out_clmem) instead of the SVM `result`,
+  // with NO host map -- the device-direct FC consumes it (no SVM map/unmap, the
+  // measured prefill blocker). in_clmem likewise reads the input from a
+  // GPU_CLMEM-resident producer's sub-buffer (mixed cl_mem/SVM args are valid).
+  // Only the coop path (width%8==0, Gemma2 hidden); gamma stays SVM.
+  cl_mem out_cl = static_cast<cl_mem>(out_clmem);
+  cl_mem in_cl = static_cast<cl_mem>(in_clmem);
+  const bool to_clmem = (out_cl != nullptr) && use_svm && (width % 8u == 0u);
+  const bool from_clmem = (in_cl != nullptr) && (width % 8u == 0u);
+
+  // The scalar rmsnorm_cl_fp16 kernel sets the OpenCL LOCAL work-group size to W
+  // (one WI loops the whole row). For full-hidden norms (Gemma2 hidden=2304)
+  // that exceeds CL_DEVICE_MAX_WORK_GROUP_SIZE (1024 on Intel Arc) =>
+  // CL_INVALID_WORK_GROUP_SIZE => the dispatch silently fails and the output is
+  // left stale (garbage). Use the cooperative kernel (RMSN_LWS=64 WIs per row,
+  // half8-vectorized, fp32 accumulation, gamma folded) whenever W%8==0 — it is
+  // the same kernel gpu_native uses. Fall back to the scalar kernel with a
+  // valid local size only for the rare W%8!=0 case.
+  const int n_rows = (int)height;
+  const int w = (int)width;
+  const bool use_coop = (width % 8u == 0u);
+
+  if (use_coop) {
+    constexpr int RMSN_LWS = 64;
+    ClContext::SharedPtrClKernel kp =
+      blas_cc->registerClKernel(rmsnorm_fp16_kernel, "rmsnorm_cl_fp16_coop");
+    if (!kp)
+      return;
+    if (to_clmem || from_clmem) {
+      // Mixed bind: each of in/out is its tensor's static plane (cl_mem
+      // sub-buffer when GPU_CLMEM, SVM otherwise); gamma stays SVM.
+      bool ok = true;
+      if (from_clmem)
+        ok = ok && kp->SetKernelArguments(0, &in_cl, sizeof(cl_mem));
+      else
+        ok = ok && kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+      if (to_clmem)
+        ok = ok && kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem));
+      else
+        ok = ok && kp->SetKernelSVMArguments(1, result);
+      ok = ok && kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma));
+      if (!ok)
+        return;
+    } else if (use_svm) {
+      if (!kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input)) ||
+          !kp->SetKernelSVMArguments(1, result) ||
+          !kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma)))
+        return;
+    } else {
+      auto &clbuf = ClBufferManager::Global();
+      if (!clbuf.getInBufferA()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                                 in_bytes, input) ||
+          !clbuf.getInBufferB()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                                 width * sizeof(_FP16), gamma))
+        return;
+      if (!kp->SetKernelArguments(0, &clbuf.getInBufferA()->GetBuffer(),
+                                  sizeof(cl_mem)) ||
+          !kp->SetKernelArguments(1, &clbuf.getOutBufferA()->GetBuffer(),
+                                  sizeof(cl_mem)) ||
+          !kp->SetKernelArguments(2, &clbuf.getInBufferB()->GetBuffer(),
+                                  sizeof(cl_mem)))
+        return;
+    }
+    if (!kp->SetKernelArguments(3, &eps_h, sizeof(cl_half)) ||
+        !kp->SetKernelArguments(4, &n_rows, sizeof(int)) ||
+        !kp->SetKernelArguments(5, &w, sizeof(int)))
+      return;
+    const int work_groups_count[3] = {RMSN_LWS * n_rows, 1, 1};
+    const int work_group_size[3] = {RMSN_LWS, 1, 1};
+    if (!blas_cc->command_queue_inst_.DispatchCommand(kp, work_groups_count,
+                                                      work_group_size))
+      return;
+  } else {
+    // Scalar fallback (W%8!=0): one WI per (n,h) row; local must be a valid
+    // size (NOT W). Bind the 8-arg [B,C,H,W] signature with local={1,1,1}.
+    ClContext::SharedPtrClKernel kp =
+      blas_cc->registerClKernel(rmsnorm_fp16_kernel, "rmsnorm_cl_fp16");
+    if (!kp)
+      return;
+    const int b = 1, c = 1, h = (int)height;
+    if (use_svm) {
+      if (!kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input)) ||
+          !kp->SetKernelSVMArguments(1, result) ||
+          !kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma)))
+        return;
+    } else {
+      auto &clbuf = ClBufferManager::Global();
+      if (!clbuf.getInBufferA()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                                 in_bytes, input) ||
+          !clbuf.getInBufferB()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                                 width * sizeof(_FP16), gamma))
+        return;
+      if (!kp->SetKernelArguments(0, &clbuf.getInBufferA()->GetBuffer(),
+                                  sizeof(cl_mem)) ||
+          !kp->SetKernelArguments(1, &clbuf.getOutBufferA()->GetBuffer(),
+                                  sizeof(cl_mem)) ||
+          !kp->SetKernelArguments(2, &clbuf.getInBufferB()->GetBuffer(),
+                                  sizeof(cl_mem)))
+        return;
+    }
+    if (!kp->SetKernelArguments(3, &eps_h, sizeof(cl_half)) ||
+        !kp->SetKernelArguments(4, &b, sizeof(int)) ||
+        !kp->SetKernelArguments(5, &c, sizeof(int)) ||
+        !kp->SetKernelArguments(6, &h, sizeof(int)) ||
+        !kp->SetKernelArguments(7, &w, sizeof(int)))
+      return;
+    const int work_groups_count[3] = {b * c, h, 1};
+    const int work_group_size[3] = {1, 1, 1};
+    if (!blas_cc->command_queue_inst_.DispatchCommand(kp, work_groups_count,
+                                                      work_group_size))
+      return;
+  }
+
+  if (use_svm) {
+    // NOTE: kept BLOCKING. rmsnorm output is consumed by the AdditionLayerCL
+    // residual add (post_attn_norm/post_ffn_norm), which has a host fast-path
+    // that reads the buffer on the CPU — an async map there races and corrupts
+    // output (verified: async here -> <pad>). Making this async requires the
+    // addition (and any other host consumer) to be GPU-resident first.
+    // NOTE(2026-06): even the all-GPU FP16 chain is NOT safe to async here —
+    // measured +5% prefill but the output diverged (base <eos> vs async garbage),
+    // i.e. a real coherence race. Closing the gpu_native residency gap requires
+    // removing the host map/unmap pair entirely (coordinated producer + consumer),
+    // not flipping this to async.
+    // NNTR_GPU_CLMEM_POOL: the normed output went to the cl_mem sub-buffer, not
+    // the SVM `result`; there is no host map to restore (the FC reads it direct).
+    // skip_out_map (NNTR_DEVRES pair-removal): the caller guarantees every
+    // consumer is a GPU kernel and flags the output device_valid, so the
+    // matching consumer-side unmap/map is skipped too (S4 mechanism). The
+    // blocking map here measured 16.9ms/call of cache-coherence stall on the
+    // fan-out pre-norms (attention_norm/ffn_norm = 912ms per 1K prefill).
+    // clFlush keeps the submission point the blocking map used to provide.
+    if (!to_clmem) {
+      if (skip_out_map) {
+        clFlush(blas_cc->command_queue_inst_.GetCommandQueue());
+      } else {
+        // NNTR_NORM_TPROF=1: time the blocking map (suspected ~7ms/call
+        // coherence stall on the 3.9MB fan-out norm outputs).
+        static const bool tprof = std::getenv("NNTR_NORM_TPROF") != nullptr;
+        static double acc = 0;
+        static int n = 0;
+        struct timespec t0, t1;
+        if (tprof)
+          clock_gettime(CLOCK_MONOTONIC, &t0);
+        blas_cc->command_queue_inst_.enqueueSVMMap(result, in_bytes, false);
+        if (tprof) {
+          clock_gettime(CLOCK_MONOTONIC, &t1);
+          acc += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+          if (++n % 54 == 0) {
+            std::fprintf(stderr, "[NORM-TPROF] n=%d map_total=%.2fms\n", n, acc);
+            std::fflush(stderr);
+            acc = 0;
+          }
+        }
+      }
+    }
+  } else {
+    auto &clbuf = ClBufferManager::Global();
+    clbuf.getOutBufferA()->ReadDataRegion(blas_cc->command_queue_inst_, in_bytes,
+                                          result);
+  }
+}
+
+// Fused SwiGLU + asymmetric int8 activation-quant (FFN down-proj input). One
+// work-group (64 WIs) per row computes silu(gate)*up in fp32, reduces per-row
+// min/max, then recomputes + quantizes to int8 with the v8c-compatible
+// asymmetric scheme (recip-scale=(rmax-rmin)/255 with range forced to include
+// 0, nudged zero-point, row_sum of int8). Output (act_int8/scale/zp/row_sum)
+// feeds gemm_int8_v8c_cl directly, dropping the fp16 [M,K] DRAM round-trip the
+// unfused (swiglu -> separate act-quant) path pays. Mirrors gpu_native
+// kFusedGegluQuantKernel but with silu (mainline SwiGLU). SVM-direct only.
+static const std::string fused_swiglu_quant_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#define FSQ_LWS 64
+__attribute__((reqd_work_group_size(FSQ_LWS, 1, 1)))
+__kernel void fused_swiglu_quant(__global const half *gate,
+                                 __global const half *up,
+                                 __global       char  *act_int8,
+                                 __global       float *scale_per_row,
+                                 __global       int   *zp_per_row,
+                                 __global       int   *row_sum_act,
+                                 const int M, const int K) {
+  const int row = get_group_id(0);
+  if (row >= M) return;
+  const int tid = get_local_id(0);
+  __local float lmin[FSQ_LWS];
+  __local float lmax[FSQ_LWS];
+  __local int   lsum[FSQ_LWS];
+  __local float l_scale_q;
+  __local int   l_zp;
+  float pmin = 0.0f, pmax = 0.0f;
+  for (int k = tid; k < K; k += FSQ_LWS) {
+    float g = (float)gate[(long)row * K + k];
+    float u = (float)up[(long)row * K + k];
+    float v = (g / (1.0f + exp(-g))) * u; // silu(gate) * up
+    pmin = fmin(pmin, v);
+    pmax = fmax(pmax, v);
+  }
+  lmin[tid] = pmin;
+  lmax[tid] = pmax;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = FSQ_LWS / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      lmin[tid] = fmin(lmin[tid], lmin[tid + s]);
+      lmax[tid] = fmax(lmax[tid], lmax[tid + s]);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (tid == 0) {
+    const float fmn = lmin[0], fmx = lmax[0];
+    const float rmin = fmn < 0.0f ? fmn : 0.0f;
+    const float rmax = fmx > 0.0f ? fmx : 0.0f;
+    const float qmin = -128.0f, qmax = 127.0f;
+    const float range = rmax - rmin;
+    const float scale_q = range > 0.0f ? 255.0f / range : 1.0f;
+    const float recip = range > 0.0f ? range / 255.0f : 1.0f;
+    const float dmin = rmin * scale_q, dmax = rmax * scale_q;
+    const float zp_lo = qmin - dmin, zp_hi = qmax - dmax;
+    float zp_f = (qmin + dmin) + (qmax + dmax) > 0.0f ? zp_lo : zp_hi;
+    if (zp_f < qmin) zp_f = qmin;
+    if (zp_f > qmax) zp_f = qmax;
+    l_scale_q = scale_q;
+    l_zp = (int)rint(zp_f);
+    scale_per_row[row] = recip;
+    zp_per_row[row] = l_zp;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const float scale_q = l_scale_q;
+  const int zp = l_zp;
+  int psum = 0;
+  for (int k = tid; k < K; k += FSQ_LWS) {
+    float g = (float)gate[(long)row * K + k];
+    float u = (float)up[(long)row * K + k];
+    float v = (g / (1.0f + exp(-g))) * u;
+    int q = (int)rint(v * scale_q) + zp;
+    if (q < -128) q = -128;
+    if (q > 127) q = 127;
+    act_int8[(long)row * K + k] = (char)q;
+    psum += q;
+  }
+  lsum[tid] = psum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = FSQ_LWS / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      lsum[tid] += lsum[tid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (tid == 0)
+    row_sum_act[row] = lsum[0];
+}
+)CL";
+
+bool fused_swiglu_quant_cl(const _FP16 *gate, const _FP16 *up, int8_t *act_int8,
+                           float *scale_per_row, int *zp_per_row,
+                           int *row_sum_act, unsigned int M, unsigned int K,
+                           bool use_svm) {
+  if (M == 0 || K == 0)
+    return false;
+  if (!use_svm)
+    return false; // residency path only; caller falls back to unfused
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(fused_swiglu_quant_kernel, "fused_swiglu_quant");
+  if (!kp)
+    return false;
+  if (!kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(gate)) ||
+      !kp->SetKernelSVMArguments(1, const_cast<_FP16 *>(up)) ||
+      !kp->SetKernelSVMArguments(2, act_int8) ||
+      !kp->SetKernelSVMArguments(3, scale_per_row) ||
+      !kp->SetKernelSVMArguments(4, zp_per_row) ||
+      !kp->SetKernelSVMArguments(5, row_sum_act))
+    return false;
+  int Mi = (int)M, Ki = (int)K;
+  if (!kp->SetKernelArguments(6, &Mi, sizeof(int)) ||
+      !kp->SetKernelArguments(7, &Ki, sizeof(int)))
+    return false;
+  constexpr size_t LWS = 64;
+  std::array<size_t, 3> gws = {(size_t)M * LWS, 1, 1};
+  std::array<size_t, 3> lws = {LWS, 1, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  clFinish(q);
+  return true;
+}
+#endif
 
 void sscal_cl(float *X, const unsigned int N, const float alpha) {
   auto *blas_cc =
@@ -1347,4 +1788,1156 @@ void transpose_16(void *input, void *output, int width, int height,
   }
 }
 */
+
+// =============================================================================
+// v8c (paper 8/4/4) host wrappers — channel-wise QINT4 weight + int8 activation
+// dot_4x8packed_su_int with bias-subtraction trick. Validated 87% of Adreno 830
+// dp4a peak (4499 GFLOP/s ffn_down, 4344 GFLOP/s ffn_gate at t4×8 LWS 4×16).
+// All inputs are plain cl_mem (image2d_from_buffer or buffer), no SVM.
+// =============================================================================
+
+// Device caps for v8c dispatch (paper §3.4 device specialization), queried once.
+// Used to cap the LWS work-group product to the device's max — so the tuned
+// 4×16 sweet spot is honored on Adreno 830 (max 1024) yet auto-reduced on a
+// device with a smaller max work-group instead of silently dropping to NULL.
+static const tv::DeviceImageCaps &v8c_device_caps() {
+  static const tv::DeviceImageCaps caps = []() {
+    auto *cc =
+      static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+    cl_device_id dev = cc ? cc->context_inst_.GetDeviceId() : nullptr;
+    return tv::queryDeviceImageCaps(dev);
+  }();
+  return caps;
+}
+
+// Shared v8c LWS policy: preferred 4×16 (env NNTR_V8C_LWS overrides), capped to
+// the device max work-group size and required to divide gws. Returns whether a
+// valid LWS was chosen; out is filled when true.
+static bool v8c_pick_lws(size_t gws_x, size_t gws_y, std::array<size_t, 2> &out) {
+  static const std::array<size_t, 2> pref = []() {
+    const char *e = std::getenv("NNTR_V8C_LWS");
+    size_t lx = 4, ly = 16; // swept sweet spot @ M=1024 (WG=64), 8.9× vs NULL.
+    if (e) {
+      long a = 0, b = 0;
+      if (std::sscanf(e, "%ld,%ld", &a, &b) == 2 && a > 0 && b > 0) {
+        lx = (size_t)a;
+        ly = (size_t)b;
+      }
+    }
+    return std::array<size_t, 2>{lx, ly};
+  }();
+  size_t ox = 0, oy = 0;
+  bool ok = tv::select2dLws(gws_x, gws_y, pref[0], pref[1], v8c_device_caps(),
+                            &ox, &oy);
+  out = {ox, oy};
+  return ok;
+}
+
+// Device-specialization gate (paper §3.4). NNTR_V8C_BUF=1 selects the
+// BUFFER-LOAD v8c GEMM kernels (no sampled-image reads) for runtimes that
+// advertise cl_khr_image2d_from_buffer but cannot compile integer-coordinate
+// read_imageui (e.g. Intel NEO). Default 0 = image path (Adreno BIT-identical).
+// Queried once per process.
+static bool v8c_use_buffer_path() {
+  static const bool use_buf = []() {
+    const char *e = std::getenv("NNTR_V8C_BUF");
+    return e && std::atoi(e) != 0;
+  }();
+  return use_buf;
+}
+
+// Compile options for the buffer-load v8c program. -DV8C_BUFFER_ONLY excludes
+// the image-sampling kernel bodies; -cl-std=CL3.0 exposes the core OpenCL C
+// 3.0 dot_4x8packed_* builtins (Intel NEO does not declare them under the
+// default CL1.2 std, and the legacy cl_khr_integer_dot_product #pragma is
+// ignored by its front-end). All v8c registration sites on the buffer path
+// must pass the IDENTICAL string so the same cached program is reused.
+static const char *kV8cBufCompileOpts = "-DV8C_BUFFER_ONLY -cl-std=CL3.0";
+
+void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
+                      cl_mem scale_wgt, cl_mem row_sum_act, cl_mem zp_act,
+                      cl_mem row_sum_w_int4, cl_mem output_fp16, unsigned int M,
+                      unsigned int N, unsigned int K, unsigned int M_valid) {
+  if (M_valid == 0)
+    M_valid = M; // legacy: store every (padded) row
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  // For the M=1 (M_pad=4) decode case the default TM=4 kernel burns ~4×
+  // the work needed (3 zero-padded rows). Dispatch a TM=1 variant
+  // instead. The caller passes M_pad here, not M, so M_pad <= 4 means
+  // "the real input had 1 valid row" (no QINT4 model has padded prefill
+  // with M_pad <= 4 except via the M=1 decode rounding).
+  // Buffer path (NNTR_V8C_BUF=1): act_image/weight_image carry the raw cl_mem
+  // buffers; widths derived from K (int4 weight texel = 32 K, act texel = 16 K).
+  const bool use_buf = v8c_use_buffer_path();
+  // NNTR_FC_BUF=1 (probe): route ONLY the FC GEMMs through the buffer-load
+  // kernels while the rest of the pipeline (attention images, copts) stays
+  // on the image path. The image-capable program always contains the buffer
+  // kernels too, so the compile opts stay "" — this also sidesteps the
+  // on-disk .cl.bin cache collision (its filename ignores copts). Callers
+  // must pass buffer handles for act/weight when setting this.
+  static const bool fc_buf_probe = []() {
+    const char *e = getenv("NNTR_FC_BUF");
+    return e && atoi(e) != 0;
+  }();
+  const bool buf_kernel = use_buf || fc_buf_probe;
+  const char *kname =
+    buf_kernel
+      ? ((M <= 4) ? "v8c_gemm_int8_int4_m1_buf" : "v8c_gemm_int8_int4_buf")
+      : ((M <= 4) ? "v8c_gemm_int8_int4_m1" : "v8c_gemm_int8_int4");
+  // Buffer path compiles the program with -DV8C_BUFFER_ONLY so the
+  // image-sampling kernel bodies are excluded (Intel NEO can't compile them).
+  std::string copts = use_buf ? kV8cBufCompileOpts : "";
+  // NNTR_V8C_KCLOCK: in-kernel cl_khr_kernel_clock measurement build (off by
+  // default). "1" = time the full K-loop; "2" = also drop the dp4a (fetch-only
+  // floor) to isolate fetch-stall from compute. Measurement-only; the printf is
+  // emitted by one work-item per dispatch.
+  // NNTR_V8C_KCLOCK loop-decomposition modes (in-kernel clock_read_device):
+  //   1 full | 2 no-dp4a (fetch+unpack) | 3 no-weight-fetch | 4 no-act-fetch |
+  //   5 compute-only (no fetch). Diff of modes isolates weight- vs act-fetch
+  //   vs pure compute. Synthetic runtime values suppress a stream w/o DCE.
+  // Env-gated diagnostic/experimental compile flags — process-constant, so read
+  // ONCE (static), not per dispatch. NNTR_V8C_KCLOCK {1..5} (in-kernel clock
+  // decomposition), NNTR_V8C_PREFETCH=1 (1-ahead weight prefetch), NNTR_V8C_MFAST
+  // =1 (M-fast dispatch order). All bit-identical / default-off.
+  static const std::string v8c_env_copts = []() {
+    std::string s;
+    if (const char *kc = getenv("NNTR_V8C_KCLOCK")) {
+      const char m = kc[0];
+      if (m >= '1' && m <= '5')
+        s += " -DV8C_KCLOCK";
+      if (m == '2')
+        s += " -DV8C_KCLOCK_NOCOMPUTE";
+      if (m == '3' || m == '5')
+        s += " -DV8C_KCLOCK_NOWFETCH";
+      if (m == '4' || m == '5')
+        s += " -DV8C_KCLOCK_NOAFETCH";
+    }
+    if (const char *pf = getenv("NNTR_V8C_PREFETCH"))
+      if (pf[0] == '1')
+        s += " -DV8C_PREFETCH";
+    if (const char *mf = getenv("NNTR_V8C_MFAST"))
+      if (mf[0] == '1')
+        s += " -DV8C_MFAST";
+    return s;
+  }();
+  static const bool v8c_mfast = []() {
+    const char *mf = getenv("NNTR_V8C_MFAST");
+    return mf && mf[0] == '1';
+  }();
+  copts += v8c_env_copts;
+  // ML Drift reaudit (decode, 2026-06-12): cooperative M=1 GEMV. The m1
+  // kernels' total parallelism is only N/8 work-items (at N=2304 that is
+  // ~4.5 waves device-wide) = latency-bound at 12-22 GB/s effective, while
+  // the decode FC stream is ~977 MB/token — the whole decode budget. The
+  // coop kernel splits K 8-way per column under a 64-WI workgroup
+  // (parallelism x64, LDS tree reduce) and reads the images' BACKING
+  // buffers via uint4 vloads (clGetImageInfo(CL_IMAGE_BUFFER) — the images
+  // are image2d-from-buffer views, so no extra copies exist). Output is
+  // BIT-IDENTICAL to the m1 kernels: int32 dp4a accumulation is
+  // order-independent and the per-column float epilogue is unchanged.
+  // NNTR_GEMV_COOP=0 restores the m1 dispatch.
+  static const bool gemv_coop = []() {
+    const char *e = getenv("NNTR_GEMV_COOP");
+    return !e || atoi(e) != 0;
+  }();
+  // K cap: the coop kernel stages the act row in a 640-uint4 LDS array.
+  if (!buf_kernel && M <= 4 && gemv_coop && (N % 8) == 0 && (K % 32) == 0 &&
+      K <= 10240) {
+    cl_mem wbuf = nullptr, abuf = nullptr;
+    clGetImageInfo(weight_image, CL_IMAGE_BUFFER, sizeof(cl_mem), &wbuf,
+                   nullptr);
+    clGetImageInfo(act_image, CL_IMAGE_BUFFER, sizeof(cl_mem), &abuf, nullptr);
+    if (wbuf != nullptr && abuf != nullptr) {
+      ClContext::SharedPtrClKernel ck = blas_cc->registerClKernel(
+        int8_int4_gemm_v8c_kernel, "v8c_gemv_int8_int4_coop", copts);
+      if (ck) {
+        int Ni = (int)N, Ki = (int)K, Ww = (int)(K / 32);
+        int a = 0;
+        const bool ok =
+          ck->SetKernelArguments(a++, &abuf, sizeof(cl_mem)) &&
+          ck->SetKernelArguments(a++, &wbuf, sizeof(cl_mem)) &&
+          ck->SetKernelArguments(a++, &scale_act, sizeof(cl_mem)) &&
+          ck->SetKernelArguments(a++, &scale_wgt, sizeof(cl_mem)) &&
+          ck->SetKernelArguments(a++, &row_sum_act, sizeof(cl_mem)) &&
+          ck->SetKernelArguments(a++, &zp_act, sizeof(cl_mem)) &&
+          ck->SetKernelArguments(a++, &row_sum_w_int4, sizeof(cl_mem)) &&
+          ck->SetKernelArguments(a++, &output_fp16, sizeof(cl_mem)) &&
+          ck->SetKernelArguments(a++, &Ni, sizeof(int)) &&
+          ck->SetKernelArguments(a++, &Ki, sizeof(int)) &&
+          ck->SetKernelArguments(a++, &Ww, sizeof(int));
+        if (ok) {
+          {
+            char lbl[48];
+            snprintf(lbl, sizeof(lbl), ":N%u_K%u", N, K);
+            blas_cc->command_queue_inst_.setNextProfileLabel(lbl);
+          }
+          std::array<size_t, 3> gws = {(size_t)(N / 8) * 64, 1, 1};
+          std::array<size_t, 3> lws = {64, 1, 1};
+          blas_cc->command_queue_inst_.enqueueKernel(
+            ck->GetKernel(), 1, gws.data(), lws.data(), 0, nullptr, nullptr);
+          return;
+        }
+      }
+    }
+    // Fall through to the m1 dispatch on any setup failure.
+  }
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(int8_int4_gemm_v8c_kernel, kname, copts);
+  if (!kp)
+    throw std::runtime_error(std::string("v8c_gemm: registerClKernel failed: ") +
+                             kname);
+
+  int arg = 0;
+  if (!kp->SetKernelArguments(arg++, &act_image, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 0 (act_image)");
+  if (!kp->SetKernelArguments(arg++, &weight_image, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 1 (weight_image)");
+  if (!kp->SetKernelArguments(arg++, &scale_act, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 2 (scale_act)");
+  if (!kp->SetKernelArguments(arg++, &scale_wgt, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 3 (scale_wgt)");
+  if (!kp->SetKernelArguments(arg++, &row_sum_act, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 4 (row_sum_act)");
+  if (!kp->SetKernelArguments(arg++, &zp_act, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 5 (zp_act)");
+  if (!kp->SetKernelArguments(arg++, &row_sum_w_int4, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 6 (row_sum_w_int4)");
+  if (!kp->SetKernelArguments(arg++, &output_fp16, sizeof(cl_mem)))
+    throw std::runtime_error("v8c gemm arg 7 (output_fp16)");
+  int Mi = (int)M, Ni = (int)N, Ki = (int)K;
+  if (!kp->SetKernelArguments(arg++, &Mi, sizeof(int)))
+    throw std::runtime_error("v8c gemm arg 8 (M)");
+  if (!kp->SetKernelArguments(arg++, &Ni, sizeof(int)))
+    throw std::runtime_error("v8c gemm arg 9 (N)");
+  if (!kp->SetKernelArguments(arg++, &Ki, sizeof(int)))
+    throw std::runtime_error("v8c gemm arg 10 (K)");
+  if (buf_kernel) {
+    int W_act = (int)(K / 16), W_wgt = (int)(K / 32);
+    if (!kp->SetKernelArguments(arg++, &W_act, sizeof(int)))
+      throw std::runtime_error("v8c gemm arg 11 (W_act)");
+    if (!kp->SetKernelArguments(arg++, &W_wgt, sizeof(int)))
+      throw std::runtime_error("v8c gemm arg 12 (W_wgt)");
+  }
+  // TM=4 kernels take the trailing M_valid store guard; the m1 (M<=4)
+  // variants only ever write row 0 and keep their legacy signature.
+  if (M > 4) {
+    int Mv = (int)M_valid;
+    if (!kp->SetKernelArguments(arg++, &Mv, sizeof(int)))
+      throw std::runtime_error("v8c gemm arg (M_valid)");
+  }
+
+  // V8C_TM=4, V8C_TN=8 (defaults in the .cl). global = (N/TN, M/TM); kernel
+  // requires M%4=0, N%8=0, K%32=0. The historic 4×16 LWS is only valid when
+  // gws[1] = M/TM is a multiple of 16, i.e. M is a multiple of 64. The
+  // QINT4 caller pads M up to V8C_TM (=4) for the M=1 decode / M=18 prefill
+  // cases, so M/TM can be as small as 1 or 5 and never satisfies that
+  // constraint. Pass NULL lws so the runtime picks a compatible
+  // workgroup shape — the kernel has no in-flight cross-thread sync, so
+  // any LWS that divides gws works. (OpenCL 3.0 on Adreno 830 allows
+  // non-uniform groups, but staying uniform with a runtime-chosen LWS is
+  // the conservative win.)
+  // Tag this dispatch's profile entry with its shape (N,K uniquely identify
+  // each transformer FC: q/k/v/o/gate/up/down) so NNTR_OPENCL_PROFILING splits
+  // the aggregate v8c_gemm_int8_int4 number per GEMM shape. Host-only; consumed
+  // by the next enqueueKernel; no effect on kernel output.
+  {
+    char lbl[48];
+    snprintf(lbl, sizeof(lbl), ":N%u_K%u", N, K);
+    blas_cc->command_queue_inst_.setNextProfileLabel(lbl);
+  }
+  if (M <= 4) {
+    // M=1 (TM=1) GEMV-style dispatch: 1-D grid over output channels.
+    constexpr size_t TN_M1 = 8;
+    std::array<size_t, 3> gws = {(size_t)N / TN_M1, 1, 1};
+    blas_cc->command_queue_inst_.enqueueKernel(
+      kp->GetKernel(), 1, gws.data(), nullptr, 0, nullptr, nullptr);
+  } else {
+    constexpr size_t TM = 4, TN = 8;
+    // NNTR_V8C_MFAST: swap so M/TM is the fast-varying (dim0) axis; the kernel
+    // (-DV8C_MFAST) reads m0 from gid0, n0 from gid1 to match. Weight-reuse
+    // dispatch order. Default keeps {N/TN, M/TM}.
+    std::array<size_t, 3> gws = v8c_mfast
+                                  ? std::array<size_t, 3>{(size_t)M / TM,
+                                                          (size_t)N / TN, 1}
+                                  : std::array<size_t, 3>{(size_t)N / TN,
+                                                          (size_t)M / TM, 1};
+    // CL-event profiling showed the historic NULL lws (driver-chosen
+    // workgroup) lands the GEMM at ~14% of dp4a peak in-forward, vs 87%
+    // in the standalone microbench which used a tuned LWS. Pick a device-
+    // specialized LWS (4×16 sweet spot, capped to the device max work-group
+    // size and required to divide gws); fall back to NULL when none fits
+    // (small-M prefill). NNTR_V8C_LWS="lx,ly" overrides.
+    std::array<size_t, 2> picked{};
+    const bool lws_ok = v8c_pick_lws(gws[0], gws[1], picked);
+    std::array<size_t, 3> lws = {picked[0], picked[1], 1};
+    blas_cc->command_queue_inst_.enqueueKernel(
+      kp->GetKernel(), 2, gws.data(), lws_ok ? lws.data() : nullptr, 0, nullptr,
+      nullptr);
+  }
+}
+
+void gemm_int8_v8c_v_ohwi_cl(cl_mem act_image, cl_mem weight_image,
+                             cl_mem scale_act, cl_mem scale_wgt,
+                             cl_mem row_sum_act, cl_mem zp_act,
+                             cl_mem row_sum_w_int4, cl_mem v_ohwi,
+                             unsigned int M_pad, unsigned int N, unsigned int K,
+                             unsigned int head_dim, unsigned int S_max,
+                             unsigned int position, unsigned int M_real) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (M_pad == 0 || N == 0 || K == 0 || head_dim == 0 || S_max == 0)
+    throw std::runtime_error("gemm_int8_v8c_v_ohwi: zero dim");
+  constexpr unsigned int V8C_TM = 4, V8C_TN = 8;
+  if (M_pad % V8C_TM != 0 || N % V8C_TN != 0 || K % 32 != 0)
+    throw std::runtime_error("gemm_int8_v8c_v_ohwi: M/N/K not aligned");
+  if (head_dim % V8C_TN != 0)
+    throw std::runtime_error("gemm_int8_v8c_v_ohwi: head_dim % TN != 0");
+  if (N % head_dim != 0)
+    throw std::runtime_error("gemm_int8_v8c_v_ohwi: N % head_dim != 0");
+  if (M_real > M_pad) M_real = M_pad;
+
+  const bool use_buf = v8c_use_buffer_path();
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    int8_int4_gemm_v8c_kernel,
+    use_buf ? "v8c_gemm_int8_int4_v_ohwi_buf" : "v8c_gemm_int8_int4_v_ohwi",
+    use_buf ? kV8cBufCompileOpts : "");
+  if (!kp)
+    throw std::runtime_error("v8c_v_ohwi: registerClKernel failed");
+
+  int arg = 0;
+  if (!kp->SetKernelArguments(arg++, &act_image, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &weight_image, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &scale_act, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &scale_wgt, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &row_sum_act, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &zp_act, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &row_sum_w_int4, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &v_ohwi, sizeof(cl_mem)))
+    throw std::runtime_error("v8c_v_ohwi: cl_mem arg failed");
+  int Mi = (int)M_pad, Ni = (int)N, Ki = (int)K;
+  int di = (int)head_dim, Si = (int)S_max, pi = (int)position;
+  int Mr = (int)M_real;
+  if (!kp->SetKernelArguments(arg++, &Mi, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Ni, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Ki, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &di, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Si, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &pi, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Mr, sizeof(int)))
+    throw std::runtime_error("v8c_v_ohwi: int arg failed");
+  if (use_buf) {
+    int W_act = (int)(K / 16), W_wgt = (int)(K / 32);
+    if (!kp->SetKernelArguments(arg++, &W_act, sizeof(int)) ||
+        !kp->SetKernelArguments(arg++, &W_wgt, sizeof(int)))
+      throw std::runtime_error("v8c_v_ohwi: width arg failed");
+  }
+  std::array<size_t, 3> gws = {(size_t)N / V8C_TN, (size_t)M_pad / V8C_TM, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(
+    kp->GetKernel(), 2, gws.data(), nullptr, 0, nullptr, nullptr);
+}
+
+static void quantize_act_v8c_cl_impl(cl_mem act_in, cl_mem out_int8,
+                                     cl_mem out_scale, cl_mem out_zp,
+                                     cl_mem out_row_sum, unsigned int M,
+                                     unsigned int K, const char *kernel_name,
+                                     bool parallel) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  // The act-quant kernels are image-free, but they live in the same program
+  // string as the image GEMMs. On the buffer path we must build that program
+  // with -DV8C_BUFFER_ONLY too, otherwise this (option-less) build compiles
+  // the image kernels and fails on Intel NEO. Matches the GEMM wrappers so the
+  // same cached program is reused.
+  const std::string copts = v8c_use_buffer_path() ? kV8cBufCompileOpts : "";
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(int8_int4_gemm_v8c_kernel, kernel_name, copts);
+  if (!kp)
+    throw std::runtime_error(std::string("v8c quant: registerClKernel failed: ") +
+                             kernel_name);
+  int arg = 0;
+  if (!kp->SetKernelArguments(arg++, &act_in, sizeof(cl_mem)))
+    throw std::runtime_error("v8c quant arg 0");
+  if (!kp->SetKernelArguments(arg++, &out_int8, sizeof(cl_mem)))
+    throw std::runtime_error("v8c quant arg 1");
+  if (!kp->SetKernelArguments(arg++, &out_scale, sizeof(cl_mem)))
+    throw std::runtime_error("v8c quant arg 2");
+  if (!kp->SetKernelArguments(arg++, &out_zp, sizeof(cl_mem)))
+    throw std::runtime_error("v8c quant arg 3 (out_zp)");
+  if (!kp->SetKernelArguments(arg++, &out_row_sum, sizeof(cl_mem)))
+    throw std::runtime_error("v8c quant arg 4");
+  int Mi = (int)M, Ki = (int)K;
+  if (!kp->SetKernelArguments(arg++, &Mi, sizeof(int)))
+    throw std::runtime_error("v8c quant arg 5");
+  if (!kp->SetKernelArguments(arg++, &Ki, sizeof(int)))
+    throw std::runtime_error("v8c quant arg 6");
+
+  if (parallel) {
+    // _par variant: one workgroup (LWS=64) per row. gws = M * 64.
+    constexpr size_t LWS = 64;
+    std::array<size_t, 3> gws = {(size_t)M * LWS, 1, 1};
+    std::array<size_t, 3> lws = {LWS, 1, 1};
+    blas_cc->command_queue_inst_.enqueueKernel(
+      kp->GetKernel(), 1, gws.data(), lws.data(), 0, nullptr, nullptr);
+  } else {
+    std::array<size_t, 3> gws = {(size_t)M, 1, 1};
+    blas_cc->command_queue_inst_.enqueueKernel(
+      kp->GetKernel(), 1, gws.data(), nullptr, 0, nullptr, nullptr);
+  }
+}
+
+void quantize_act_v8c_fp16_cl(cl_mem act_fp16, cl_mem out_int8, cl_mem out_scale,
+                              cl_mem out_zp, cl_mem out_row_sum, unsigned int M,
+                              unsigned int K) {
+  // The _par variant requires K % LWS == 0 (LWS=64). Qwen3 hidden dims
+  // (1024/2048/3072/etc.) all satisfy this; smaller K paths fall back.
+  const bool can_par = (K % 64 == 0);
+  quantize_act_v8c_cl_impl(act_fp16, out_int8, out_scale, out_zp, out_row_sum, M,
+                           K, can_par ? "v8c_act_quant_f16_par"
+                                      : "v8c_act_quant_f16",
+                           can_par);
+}
+
+void quantize_act_v8c_fp32_cl(cl_mem act_fp32, cl_mem out_int8, cl_mem out_scale,
+                              cl_mem out_zp, cl_mem out_row_sum, unsigned int M,
+                              unsigned int K) {
+  const bool can_par = (K % 64 == 0);
+  quantize_act_v8c_cl_impl(act_fp32, out_int8, out_scale, out_zp, out_row_sum, M,
+                           K, can_par ? "v8c_act_quant_f32_par"
+                                      : "v8c_act_quant_f32",
+                           can_par);
+}
+
+// fp16 (uint16 bit pattern) → fp32 host helper. Standard IEEE 754 half decode.
+static inline float h2f_host(uint16_t h) {
+  uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t e = (h >> 10) & 0x1fu;
+  uint32_t m = h & 0x3ffu;
+  uint32_t o;
+  if (e == 0) {
+    if (m == 0)
+      o = s;
+    else {
+      e = 1;
+      while ((m & 0x400u) == 0) {
+        m <<= 1;
+        e--;
+      }
+      m &= 0x3ffu;
+      o = s | ((e + 112) << 23) | (m << 13);
+    }
+  } else if (e == 0x1f) {
+    o = s | 0x7f800000u | (m << 13);
+  } else {
+    o = s | ((e + 112) << 23) | (m << 13);
+  }
+  float f;
+  std::memcpy(&f, &o, 4);
+  return f;
+}
+
+} // namespace nntrainer
+
+// Use Int4Utils for osv32 row dequant; keep include inside the helper file
+// (TU-local) to avoid leaking the dependency through the public header.
+#include "../int4_utils.h"
+#include <cmath>
+#include <cstring>
+#include <vector>
+
+namespace nntrainer {
+
+std::unique_ptr<tv::TensorBacking>
+make_v8c_weight_backing(const uint8_t *osv32_packed,
+                        const uint16_t *fp16_scales, unsigned int group_size,
+                        unsigned int N, unsigned int K,
+                        cl_mem *out_scale_buf) {
+  if (K % 32 != 0)
+    throw std::invalid_argument(
+      "make_v8c_weight_backing: K must be a multiple of 32");
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_context ctx =
+    blas_cc->context_inst_.GetContext(); // OpenCL context handle
+
+  // 1) Walk osv32 row by row, dequantize → re-quantize per-channel (paper §4.2)
+  //    Pack into row-major v8c layout: per row N, K/2 bytes; per K-block of 32
+  //    one 16-byte texel; byte offset = (k_outer/32)*16 + c*4 + b within row.
+  //    Byte content: low_nib = (q[k_outer+c*8+b] + 8) & 0xF,
+  //                  high_nib = (q[k_outer+c*8+b+4] + 8) & 0xF.
+  const size_t row_bytes = (size_t)K / 2;
+  std::vector<uint8_t> packed((size_t)N * row_bytes);
+  std::vector<float> per_channel_scale(N);
+  std::vector<float> deq_row((size_t)K);
+
+  // dequantizePackedRow takes non-const pointers; cast safely (it reads only).
+  uint8_t *osv_nonconst = const_cast<uint8_t *>(osv32_packed);
+  uint16_t *scales_nonconst = const_cast<uint16_t *>(fp16_scales);
+
+  for (unsigned int n = 0; n < N; ++n) {
+    // (a) Dequantize this row from osv32 + per-group scales → fp32 [K].
+    Int4Utils::dequantizePackedRow(osv_nonconst, scales_nonconst,
+                                   /*rows_count*/ N, /*cols_count*/ K,
+                                   /*group_size*/ group_size,
+                                   /*row_index*/ n, deq_row.data());
+    // (b) Compute per-channel scale = max|.| / 7
+    float amax = 0.0f;
+    for (unsigned int k = 0; k < K; ++k) {
+      float a = std::fabs(deq_row[k]);
+      if (a > amax)
+        amax = a;
+    }
+    float s = (amax > 0.0f) ? (amax / 7.0f) : 1.0f;
+    per_channel_scale[n] = s;
+    float inv_s = 1.0f / s;
+    // (c) Re-quantize to int4 in [-7,7], offset-encode, pack to v8c layout
+    uint8_t *out_row = packed.data() + (size_t)n * row_bytes;
+    for (unsigned int k_outer = 0; k_outer < K; k_outer += 32) {
+      for (int c = 0; c < 4; ++c) {
+        for (int b = 0; b < 4; ++b) {
+          unsigned int kLo = k_outer + (unsigned int)(c * 8 + b);
+          unsigned int kHi = kLo + 4;
+          int qL = (int)std::lrint(deq_row[kLo] * inv_s);
+          int qH = (int)std::lrint(deq_row[kHi] * inv_s);
+          qL = qL < -7 ? -7 : (qL > 7 ? 7 : qL);
+          qH = qH < -7 ? -7 : (qH > 7 ? 7 : qH);
+          uint8_t lo = (uint8_t)((qL + 8) & 0xF);
+          uint8_t hi = (uint8_t)((qH + 8) & 0xF);
+          size_t off = (size_t)(k_outer / 32) * 16 + (size_t)(c * 4 + b);
+          out_row[off] = (uint8_t)((hi << 4) | lo);
+        }
+      }
+    }
+  }
+
+  // 2) Upload packed weight to a new cl_mem buffer, wrap in TensorBacking.
+  cl_int err = CL_SUCCESS;
+  cl_mem w_buf =
+    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                   packed.size(), packed.data(), &err);
+  if (err != CL_SUCCESS || !w_buf)
+    throw std::runtime_error("make_v8c_weight_backing: clCreateBuffer (weight) "
+                             "failed: " +
+                             std::to_string(err));
+  auto backing = std::make_unique<tv::TensorBacking>(
+    ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, packed.size(),
+    /*owned=*/true);
+
+  // 3) Upload per-channel scale buffer.
+  cl_mem sb = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                             sizeof(float) * N, per_channel_scale.data(), &err);
+  if (err != CL_SUCCESS || !sb)
+    throw std::runtime_error("make_v8c_weight_backing: clCreateBuffer (scale) "
+                             "failed: " +
+                             std::to_string(err));
+  *out_scale_buf = sb;
+  return backing;
+}
+
+std::unique_ptr<tv::TensorBacking>
+make_v8c_weight_backing_from_kai_section_a(const uint8_t *section_a,
+                                           const uint16_t *fp16_scales,
+                                           unsigned int N, unsigned int K,
+                                           cl_mem *out_scale_buf,
+                                           cl_mem *out_row_sum_w_int4_buf) {
+  if (K % 32 != 0)
+    throw std::invalid_argument(
+      "make_v8c_weight_backing_from_kai_section_a: K must be a multiple of 32");
+  if (N % 4 != 0)
+    throw std::invalid_argument("make_v8c_weight_backing_from_kai_section_a: "
+                                "N must be a multiple of KAI nr=4");
+
+  // Constants from the KAI Section A producer (Int4Utils::quantizeAndPackKai).
+  constexpr size_t KAI_NR = 4;             // output-channel super-row width
+  constexpr size_t KAI_KR_BY_SR = 8;       // bytes per nr-block (= KR/SR = 16/2)
+  constexpr size_t KAI_K_INTERLEAVE = 16;  // lo/hi nibble K stride within a byte
+
+  const size_t k_blocks = K / 32;
+  const size_t super_row_count = N / KAI_NR;
+  const size_t nibble_bytes_per_super_row = KAI_NR * (K / 2);
+  // Bytes consumed by one 32-K span across all 4 channels:
+  //   4 nr * 8 bytes (super_block_a, K=[0..7] lo + K=[16..23] hi) +
+  //   4 nr * 8 bytes (super_block_b, K=[8..15] lo + K=[24..31] hi) = 64
+  constexpr size_t KAI_BYTES_PER_KBLK = 2 * KAI_NR * KAI_KR_BY_SR;
+
+  // v8c per-channel row buffer (row-major, K/2 bytes per channel).
+  const size_t v8c_row_bytes = (size_t)K / 2;
+  std::vector<uint8_t> packed((size_t)N * v8c_row_bytes);
+
+  for (size_t sr = 0; sr < super_row_count; ++sr) {
+    const uint8_t *sr_base = section_a + sr * nibble_bytes_per_super_row;
+    for (size_t nr = 0; nr < KAI_NR; ++nr) {
+      const size_t n = sr * KAI_NR + nr;
+      uint8_t *v8c_row = packed.data() + n * v8c_row_bytes;
+      for (size_t kblk = 0; kblk < k_blocks; ++kblk) {
+        // KAI: this channel's 16 bytes for K=[kblk*32 .. kblk*32+31] live in
+        // two 8-byte nr-blocks at kblk*64 + nr*8 (super_block_a) and
+        // kblk*64 + 32 + nr*8 (super_block_b).
+        const uint8_t *blk_a =
+          sr_base + kblk * KAI_BYTES_PER_KBLK + nr * KAI_KR_BY_SR;
+        const uint8_t *blk_b = blk_a + KAI_NR * KAI_KR_BY_SR; // +32 bytes
+        // Decode to per-K offset-encoded nibbles (0..15 = int4+8). Both KAI
+        // and v8c use the same +8 offset, but KAI bytes are XOR'd with 0x88
+        // — undoing the XOR yields the raw uint4 pair.
+        uint8_t k_nibbles[32];
+        for (size_t i = 0; i < KAI_KR_BY_SR; ++i) {
+          const uint8_t b_a = blk_a[i] ^ 0x88;
+          k_nibbles[i + 0] = (uint8_t)(b_a & 0x0F);                // K = kblk*32 + i
+          k_nibbles[i + KAI_K_INTERLEAVE] =                        // K = kblk*32 + 16 + i
+            (uint8_t)((b_a >> 4) & 0x0F);
+          const uint8_t b_b = blk_b[i] ^ 0x88;
+          k_nibbles[i + KAI_KR_BY_SR] = (uint8_t)(b_b & 0x0F);     // K = kblk*32 + 8 + i
+          k_nibbles[i + KAI_KR_BY_SR + KAI_K_INTERLEAVE] =         // K = kblk*32 + 24 + i
+            (uint8_t)((b_b >> 4) & 0x0F);
+        }
+        // Repack to v8c order: byte(c*4+b) at v8c K-block offset = (qH<<4)|qL
+        // where qL = K(c*8+b), qH = K(c*8+b+4). Already offset-encoded.
+        uint8_t *v8c_kblk = v8c_row + kblk * 16;
+        for (size_t c = 0; c < 4; ++c) {
+          for (size_t b = 0; b < 4; ++b) {
+            const uint8_t qL = k_nibbles[c * 8 + b];
+            const uint8_t qH = k_nibbles[c * 8 + b + 4];
+            v8c_kblk[c * 4 + b] = (uint8_t)((qH << 4) | qL);
+          }
+        }
+      }
+    }
+  }
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+
+  // Upload packed weight buffer.
+  cl_int err = CL_SUCCESS;
+  cl_mem w_buf =
+    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, packed.size(),
+                   packed.data(), &err);
+  if (err != CL_SUCCESS || !w_buf)
+    throw std::runtime_error(
+      "make_v8c_weight_backing_from_kai_section_a: clCreateBuffer (weight) "
+      "failed: " +
+      std::to_string(err));
+  auto backing = std::make_unique<tv::TensorBacking>(
+    ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, packed.size(),
+    /*owned=*/true);
+
+  // Per-channel scale: promote fp16 → fp32 (v8c gemm reads scale_wgt as fp32).
+  std::vector<float> per_channel_scale(N);
+  for (unsigned int n = 0; n < N; ++n)
+    per_channel_scale[n] = compute_fp16_to_fp32(fp16_scales[n]);
+  cl_mem sb =
+    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                   sizeof(float) * N, per_channel_scale.data(), &err);
+  if (err != CL_SUCCESS || !sb)
+    throw std::runtime_error(
+      "make_v8c_weight_backing_from_kai_section_a: clCreateBuffer (scale) "
+      "failed: " +
+      std::to_string(err));
+  *out_scale_buf = sb;
+
+  // Per-channel int4 row sum: Σ_k int4_w[n,k]. The GEMM kernel needs this to
+  // back out the asymmetric act zero-point contribution (see kernel comment
+  // above the bias-correction loop). Decode from the freshly-packed v8c
+  // bytes (cheaper than re-walking the KAI Section A) — same int4 value, just
+  // already in v8c byte order. byte(c*4+b) within each 32-K block has:
+  //   lo nibble = uint4(K = c*8+b)  → int4 = lo - 8
+  //   hi nibble = uint4(K = c*8+b+4) → int4 = hi - 8
+  std::vector<int32_t> row_sum_w_int4(N, 0);
+  for (unsigned int n = 0; n < N; ++n) {
+    const uint8_t *row = packed.data() + n * v8c_row_bytes;
+    int32_t s = 0;
+    for (size_t off = 0; off < v8c_row_bytes; ++off) {
+      const uint8_t byte = row[off];
+      const int lo = (int)(byte & 0x0Fu) - 8;
+      const int hi = (int)((byte >> 4) & 0x0Fu) - 8;
+      s += lo + hi;
+    }
+    row_sum_w_int4[n] = s;
+  }
+  cl_mem rsw_buf =
+    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                   sizeof(int32_t) * N, row_sum_w_int4.data(), &err);
+  if (err != CL_SUCCESS || !rsw_buf)
+    throw std::runtime_error(
+      "make_v8c_weight_backing_from_kai_section_a: clCreateBuffer "
+      "(row_sum_w_int4) failed: " +
+      std::to_string(err));
+  *out_row_sum_w_int4_buf = rsw_buf;
+
+  return backing;
+}
+
+// ---------------------------------------------------------------------------
+// 8/4/4 paper attention path: int8(act) × int8(weight) channel-wise GEMM.
+// ---------------------------------------------------------------------------
+void gemm_int8_int8_v8c_cl(cl_mem act_image, cl_mem weight_image,
+                           cl_mem scale_act, cl_mem scale_wgt,
+                           cl_mem row_sum_act, cl_mem zp_act, cl_mem row_sum_w,
+                           cl_mem output_fp16, unsigned int M, unsigned int N,
+                           unsigned int K) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  // Buffer path (NNTR_V8C_BUF=1): int8 weight texel = 16 K, act texel = 16 K.
+  const bool use_buf = v8c_use_buffer_path();
+  const char *kname =
+    use_buf ? ((M <= 4) ? "v8c_gemm_int8_int8_m1_buf" : "v8c_gemm_int8_int8_buf")
+            : ((M <= 4) ? "v8c_gemm_int8_int8_m1" : "v8c_gemm_int8_int8");
+  const std::string copts = use_buf ? kV8cBufCompileOpts : "";
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(int8_int4_gemm_v8c_kernel, kname, copts);
+  if (!kp)
+    throw std::runtime_error(
+      std::string("v8c_gemm_int8_int8: registerClKernel failed: ") + kname);
+
+  int arg = 0;
+  if (!kp->SetKernelArguments(arg++, &act_image, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &weight_image, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &scale_act, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &scale_wgt, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &row_sum_act, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &zp_act, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &row_sum_w, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &output_fp16, sizeof(cl_mem)))
+    throw std::runtime_error("v8c_gemm_int8_int8: cl_mem arg failed");
+  int Mi = (int)M, Ni = (int)N, Ki = (int)K;
+  if (!kp->SetKernelArguments(arg++, &Mi, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Ni, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Ki, sizeof(int)))
+    throw std::runtime_error("v8c_gemm_int8_int8: int arg failed");
+  if (use_buf) {
+    int W_act = (int)(K / 16), W_wgt = (int)(K / 16);
+    if (!kp->SetKernelArguments(arg++, &W_act, sizeof(int)) ||
+        !kp->SetKernelArguments(arg++, &W_wgt, sizeof(int)))
+      throw std::runtime_error("v8c_gemm_int8_int8: width arg failed");
+  }
+
+  if (M <= 4) {
+    constexpr size_t TN_M1 = 8;
+    std::array<size_t, 3> gws = {(size_t)N / TN_M1, 1, 1};
+    blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
+                                               nullptr, 0, nullptr, nullptr);
+  } else {
+    constexpr size_t TM = 4, TN = 8;
+    std::array<size_t, 3> gws = {(size_t)N / TN, (size_t)M / TM, 1};
+    // Device-specialized LWS (shared with the int4 path): 4×16 sweet spot
+    // capped to device max work-group size + must divide gws, else NULL.
+    std::array<size_t, 2> picked{};
+    const bool lws_ok = v8c_pick_lws(gws[0], gws[1], picked);
+    std::array<size_t, 3> lws = {picked[0], picked[1], 1};
+    blas_cc->command_queue_inst_.enqueueKernel(
+      kp->GetKernel(), 2, gws.data(), lws_ok ? lws.data() : nullptr, 0, nullptr,
+      nullptr);
+  }
+}
+
+void gemm_int8_int8_v8c_v_ohwi_cl(cl_mem act_image, cl_mem weight_image,
+                                  cl_mem scale_act, cl_mem scale_wgt,
+                                  cl_mem row_sum_act, cl_mem zp_act,
+                                  cl_mem row_sum_w, cl_mem v_ohwi,
+                                  unsigned int M_pad, unsigned int N,
+                                  unsigned int K, unsigned int head_dim,
+                                  unsigned int S_max, unsigned int position,
+                                  unsigned int M_real) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (M_pad == 0 || N == 0 || K == 0 || head_dim == 0 || S_max == 0)
+    throw std::runtime_error("gemm_int8_int8_v8c_v_ohwi: zero dim");
+  constexpr unsigned int V8C_TM = 4, V8C_TN = 8;
+  if (M_pad % V8C_TM != 0 || N % V8C_TN != 0 || K % 32 != 0)
+    throw std::runtime_error("gemm_int8_int8_v8c_v_ohwi: M/N/K not aligned");
+  if (head_dim % V8C_TN != 0 || N % head_dim != 0)
+    throw std::runtime_error("gemm_int8_int8_v8c_v_ohwi: head_dim constraint");
+  if (M_real > M_pad) M_real = M_pad;
+
+  const bool use_buf = v8c_use_buffer_path();
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    int8_int4_gemm_v8c_kernel,
+    use_buf ? "v8c_gemm_int8_int8_v_ohwi_buf" : "v8c_gemm_int8_int8_v_ohwi",
+    use_buf ? kV8cBufCompileOpts : "");
+  if (!kp)
+    throw std::runtime_error("v8c_int8_v_ohwi: registerClKernel failed");
+
+  int arg = 0;
+  if (!kp->SetKernelArguments(arg++, &act_image, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &weight_image, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &scale_act, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &scale_wgt, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &row_sum_act, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &zp_act, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &row_sum_w, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(arg++, &v_ohwi, sizeof(cl_mem)))
+    throw std::runtime_error("v8c_int8_v_ohwi: cl_mem arg failed");
+  int Mi = (int)M_pad, Ni = (int)N, Ki = (int)K;
+  int di = (int)head_dim, Si = (int)S_max, pi = (int)position, Mr = (int)M_real;
+  if (!kp->SetKernelArguments(arg++, &Mi, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Ni, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Ki, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &di, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Si, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &pi, sizeof(int)) ||
+      !kp->SetKernelArguments(arg++, &Mr, sizeof(int)))
+    throw std::runtime_error("v8c_int8_v_ohwi: int arg failed");
+  if (use_buf) {
+    int W_act = (int)(K / 16), W_wgt = (int)(K / 16);
+    if (!kp->SetKernelArguments(arg++, &W_act, sizeof(int)) ||
+        !kp->SetKernelArguments(arg++, &W_wgt, sizeof(int)))
+      throw std::runtime_error("v8c_int8_v_ohwi: width arg failed");
+  }
+  std::array<size_t, 3> gws = {(size_t)N / V8C_TN, (size_t)M_pad / V8C_TM, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 2, gws.data(),
+                                             nullptr, 0, nullptr, nullptr);
+}
+
+std::unique_ptr<tv::TensorBacking>
+make_v8c_int8_weight_backing(const int8_t *int8_weights,
+                             const uint16_t *fp16_scales, unsigned int N,
+                             unsigned int K, cl_mem *out_scale_buf,
+                             cl_mem *out_row_sum_w_buf) {
+  if (K % 16 != 0)
+    throw std::invalid_argument("make_v8c_int8_weight_backing: K%16!=0");
+  if (N % 4 != 0)
+    throw std::invalid_argument("make_v8c_int8_weight_backing: N%4!=0");
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+  const size_t nbytes = (size_t)N * K; // 1 byte/int8 weight, plain row-major
+
+  cl_int err = CL_SUCCESS;
+  cl_mem w_buf =
+    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, nbytes,
+                   const_cast<int8_t *>(int8_weights), &err);
+  if (err != CL_SUCCESS || !w_buf)
+    throw std::runtime_error(
+      "make_v8c_int8_weight_backing: clCreateBuffer (weight) failed: " +
+      std::to_string(err));
+  auto backing = std::make_unique<tv::TensorBacking>(
+    ctx, w_buf, tv::Encoding::INT8, tv::Layout::ROW_MAJOR, nbytes,
+    /*owned=*/true);
+
+  std::vector<float> per_channel_scale(N);
+  for (unsigned int n = 0; n < N; ++n)
+    per_channel_scale[n] = compute_fp16_to_fp32(fp16_scales[n]);
+  cl_mem sb = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                             sizeof(float) * N, per_channel_scale.data(), &err);
+  if (err != CL_SUCCESS || !sb)
+    throw std::runtime_error(
+      "make_v8c_int8_weight_backing: clCreateBuffer (scale) failed");
+  *out_scale_buf = sb;
+
+  std::vector<int32_t> row_sum_w(N, 0);
+  for (unsigned int n = 0; n < N; ++n) {
+    const int8_t *row = int8_weights + (size_t)n * K;
+    int32_t s = 0;
+    for (unsigned int k = 0; k < K; ++k) s += (int)row[k];
+    row_sum_w[n] = s;
+  }
+  cl_mem rb = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                             sizeof(int32_t) * N, row_sum_w.data(), &err);
+  if (err != CL_SUCCESS || !rb)
+    throw std::runtime_error(
+      "make_v8c_int8_weight_backing: clCreateBuffer (row_sum_w) failed");
+  *out_row_sum_w_buf = rb;
+
+  return backing;
+}
+
+// Decode lm_head GEMV on a Q6_K weight — the gpu_native q6k_gemv_lmhead
+// kernel verbatim (ML Drift reaudit #1; see blas_kernels.h doc). One 64-WI
+// workgroup per vocab row; each WI owns one (block-lane, n-half, l-quad)
+// unit with direct per-field uchar4 loads. Replicates
+// dequantize_row_q6_K_impl exactly; only the fp32 summation order differs
+// from the host loop, so the verification gate is greedy token-ID equality.
+static const std::string lmhead_q6k_gemv_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void q6k_gemv_lmhead(__global const uchar *W,   // [V rows][H/256 blocks][210 B]
+                              __constant float *x,        // [H] post-norm hidden
+                              __global float *logits,     // [V]
+                              const int V, const int H) {
+  const int row = get_group_id(0);
+  const int t = get_local_id(0); // 0..63
+  const int nb = H >> 8;         // Q6_K blocks per row
+  __global const uchar *rb = W + (size_t)row * (size_t)(nb * 210);
+  const int bl = t >> 4;         // block lane 0..3
+  const int u = t & 15;          // unit within block
+  const int nh = u >> 3;         // n-half: 0 -> elems [0,128), 1 -> [128,256)
+  const int q = u & 7;           // l-quad: l = 4q .. 4q+3
+  float sum = 0.0f;
+  for (int s = 0; s < nb; s += 4) {
+    const int bi = s + bl;
+    if (bi < nb) {
+      __global const uchar *blk = rb + bi * 210;
+      const uchar4 qlo = vload4(0, blk + (nh << 6) + (q << 2));
+      const uchar4 qhi = vload4(0, blk + (nh << 6) + 32 + (q << 2));
+      const uchar4 qh4 = vload4(0, blk + 128 + (nh << 5) + (q << 2));
+      const float d = vload_half(0, (__global const half *)(blk + 208));
+      const int is = q >> 2;     // (4q)/16 == (4q+3)/16 for q in 0..7
+      const int sbase = 192 + (nh << 3);
+      const float s0 = d * (float)((__global const char *)blk)[sbase + is];
+      const float s2 = d * (float)((__global const char *)blk)[sbase + is + 2];
+      const float s4 = d * (float)((__global const char *)blk)[sbase + is + 4];
+      const float s6 = d * (float)((__global const char *)blk)[sbase + is + 6];
+    const int yb = (bi << 8) + (nh << 7) + (q << 2);
+    float4 a1, a2, a3, a4;
+    a1.x = (float)((int)((qlo.x & 0xF) | (((qh4.x >> 0) & 3) << 4)) - 32);
+    a1.y = (float)((int)((qlo.y & 0xF) | (((qh4.y >> 0) & 3) << 4)) - 32);
+    a1.z = (float)((int)((qlo.z & 0xF) | (((qh4.z >> 0) & 3) << 4)) - 32);
+    a1.w = (float)((int)((qlo.w & 0xF) | (((qh4.w >> 0) & 3) << 4)) - 32);
+    a2.x = (float)((int)((qhi.x & 0xF) | (((qh4.x >> 2) & 3) << 4)) - 32);
+    a2.y = (float)((int)((qhi.y & 0xF) | (((qh4.y >> 2) & 3) << 4)) - 32);
+    a2.z = (float)((int)((qhi.z & 0xF) | (((qh4.z >> 2) & 3) << 4)) - 32);
+    a2.w = (float)((int)((qhi.w & 0xF) | (((qh4.w >> 2) & 3) << 4)) - 32);
+    a3.x = (float)((int)((qlo.x >> 4) | (((qh4.x >> 4) & 3) << 4)) - 32);
+    a3.y = (float)((int)((qlo.y >> 4) | (((qh4.y >> 4) & 3) << 4)) - 32);
+    a3.z = (float)((int)((qlo.z >> 4) | (((qh4.z >> 4) & 3) << 4)) - 32);
+    a3.w = (float)((int)((qlo.w >> 4) | (((qh4.w >> 4) & 3) << 4)) - 32);
+    a4.x = (float)((int)((qhi.x >> 4) | (((qh4.x >> 6) & 3) << 4)) - 32);
+    a4.y = (float)((int)((qhi.y >> 4) | (((qh4.y >> 6) & 3) << 4)) - 32);
+    a4.z = (float)((int)((qhi.z >> 4) | (((qh4.z >> 6) & 3) << 4)) - 32);
+    a4.w = (float)((int)((qhi.w >> 4) | (((qh4.w >> 6) & 3) << 4)) - 32);
+    const float4 x1 = (float4)(x[yb], x[yb + 1], x[yb + 2], x[yb + 3]);
+    const float4 x2 = (float4)(x[yb + 32], x[yb + 33], x[yb + 34], x[yb + 35]);
+    const float4 x3 = (float4)(x[yb + 64], x[yb + 65], x[yb + 66], x[yb + 67]);
+    const float4 x4 = (float4)(x[yb + 96], x[yb + 97], x[yb + 98], x[yb + 99]);
+    sum += s0 * dot(a1, x1) + s2 * dot(a2, x2) + s4 * dot(a3, x3) +
+           s6 * dot(a4, x4);
+    }
+  }
+  __local float red[64];
+  red[t] = sum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = 32; off > 0; off >>= 1) {
+    if (t < off) red[t] += red[t + off];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (t == 0) logits[row] = red[0];
+}
+)CL";
+
+bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
+                         float *logits_f32_host, unsigned int vocab,
+                         unsigned int hidden) {
+  if (hidden == 0 || (hidden % 256) != 0 || vocab == 0)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return false;
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  if (!ctx || !q)
+    return false;
+
+  // Per-weight device residency (the Q6_K table never changes after load):
+  // weight + act + logits buffers keyed by the weight host pointer.
+  struct LmheadEntry {
+    cl_mem w = nullptr;
+    cl_mem x = nullptr;
+    cl_mem out = nullptr;
+  };
+  static std::unordered_map<const void *, LmheadEntry> cache;
+  LmheadEntry &e = cache[w_q6k_host];
+  const size_t nb = hidden / 256;
+  const size_t w_bytes = (size_t)vocab * nb * 210;
+  cl_int err = CL_SUCCESS;
+  if (e.w == nullptr) {
+    e.w = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, w_bytes,
+                         const_cast<void *>(w_q6k_host), &err);
+    if (err != CL_SUCCESS || !e.w) {
+      std::fprintf(stderr, "[lmhead-q6k] weight clCreateBuffer(%zu B) err=%d\n",
+                   w_bytes, err);
+      e.w = nullptr;
+      return false;
+    }
+    e.x = clCreateBuffer(ctx, CL_MEM_READ_ONLY, sizeof(float) * hidden,
+                         nullptr, &err);
+    e.out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, sizeof(float) * vocab,
+                           nullptr, &err);
+    if (!e.x || !e.out) {
+      std::fprintf(stderr, "[lmhead-q6k] act/out clCreateBuffer err=%d\n", err);
+      if (e.w) clReleaseMemObject(e.w);
+      if (e.x) clReleaseMemObject(e.x);
+      if (e.out) clReleaseMemObject(e.out);
+      cache.erase(w_q6k_host);
+      return false;
+    }
+  }
+
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(lmhead_q6k_gemv_kernel, "q6k_gemv_lmhead");
+  if (!kp) {
+    static int logged = 0;
+    if (!logged++)
+      std::fprintf(stderr, "[lmhead-q6k] registerClKernel failed\n");
+    return false;
+  }
+
+  if (clEnqueueWriteBuffer(q, e.x, CL_FALSE, 0, sizeof(float) * hidden,
+                           act_f32_host, 0, nullptr, nullptr) != CL_SUCCESS) {
+    std::fprintf(stderr, "[lmhead-q6k] act write failed\n");
+    return false;
+  }
+
+  int Vi = (int)vocab, Hi = (int)hidden;
+  int a = 0;
+  if (!(kp->SetKernelArguments(a++, &e.w, sizeof(cl_mem)) &&
+        kp->SetKernelArguments(a++, &e.x, sizeof(cl_mem)) &&
+        kp->SetKernelArguments(a++, &e.out, sizeof(cl_mem)) &&
+        kp->SetKernelArguments(a++, &Vi, sizeof(int)) &&
+        kp->SetKernelArguments(a++, &Hi, sizeof(int))))
+    return false;
+
+  blas_cc->command_queue_inst_.setNextProfileLabel(":lmhead_q6k");
+  std::array<size_t, 3> gws = {(size_t)vocab * 64, 1, 1};
+  std::array<size_t, 3> lws = {64, 1, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+
+  // Blocking readback = the decode-step GPU->host boundary (one per token).
+  const auto t_pre_read = std::chrono::steady_clock::now();
+  if (clEnqueueReadBuffer(q, e.out, CL_TRUE, 0, sizeof(float) * vocab,
+                          logits_f32_host, 0, nullptr, nullptr) != CL_SUCCESS) {
+    std::fprintf(stderr, "[lmhead-q6k] logits read failed\n");
+    return false;
+  }
+  static int announced = 0;
+  if (announced < 6) {
+    ++announced;
+    const auto t_end = std::chrono::steady_clock::now();
+    std::fprintf(
+      stderr, "[lmhead-q6k] call#%d V=%u H=%u drain+gemv+read=%.2f ms\n",
+      announced, vocab, hidden,
+      std::chrono::duration<double, std::milli>(t_end - t_pre_read).count());
+  }
+  return true;
+}
+
+// High-precision lm_head GEMV on an UNQUANTIZED FP32 weight. The Q6_K lm_head
+// (q6k_gemv_lmhead above) loses ~1.66 logit on the first-token argmax (the
+// <think> vs garbage decision on Qwen3 thinking models => garbage "noise
+// prefix"). This reads the full-precision FP32 embed weight directly — fp32 W ×
+// fp16 act, fp32 accumulate — matching the HF reference that ranks the correct
+// token at 0. Same 64-WI-per-row + LDS-tree-reduce shape as the Q6_K kernel.
+static const std::string lmhead_fp32w_gemv_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void lmhead_gemv_fp32w(__global const float *W,  // [V*H] row-major
+                                __global const half *x,    // [H] fp16 act
+                                __global float *logits,    // [V]
+                                const int V, const int H) {
+  const int row = get_group_id(0);
+  const int t = get_local_id(0); // 0..63
+  __global const float *rb = W + (size_t)row * (size_t)H;
+  float sum = 0.0f;
+  for (int k = t; k < H; k += 64)
+    sum += rb[k] * (float)x[k];
+  __local float red[64];
+  red[t] = sum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = 32; off > 0; off >>= 1) {
+    if (t < off) red[t] += red[t + off];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (t == 0) logits[row] = red[0];
+}
+)CL";
+
+bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
+                          float *logits_f32_host, unsigned int vocab,
+                          unsigned int hidden) {
+  if (hidden == 0 || vocab == 0)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return false;
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  if (!ctx || !q)
+    return false;
+
+  // Per-weight device residency: the embed/lm_head table never changes after
+  // load, so cache the device weight buffer (+ act/out scratch) keyed by the
+  // weight host pointer.
+  struct LmheadFp32Entry {
+    cl_mem w = nullptr;
+    cl_mem x = nullptr;
+    cl_mem out = nullptr;
+  };
+  static std::unordered_map<const void *, LmheadFp32Entry> cache;
+  LmheadFp32Entry &e = cache[w_fp32_host];
+  const size_t w_bytes = (size_t)vocab * (size_t)hidden * sizeof(float);
+  cl_int err = CL_SUCCESS;
+  if (e.w == nullptr) {
+    e.w = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, w_bytes,
+                         const_cast<void *>(w_fp32_host), &err);
+    if (err != CL_SUCCESS || !e.w) {
+      std::fprintf(stderr,
+                   "[lmhead-fp32w] weight clCreateBuffer(%zu B) err=%d\n",
+                   w_bytes, err);
+      e.w = nullptr;
+      return false;
+    }
+    e.x = clCreateBuffer(ctx, CL_MEM_READ_ONLY, sizeof(uint16_t) * hidden,
+                         nullptr, &err);
+    e.out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, sizeof(float) * vocab,
+                           nullptr, &err);
+    if (!e.x || !e.out) {
+      std::fprintf(stderr, "[lmhead-fp32w] act/out clCreateBuffer err=%d\n",
+                   err);
+      if (e.w) clReleaseMemObject(e.w);
+      if (e.x) clReleaseMemObject(e.x);
+      if (e.out) clReleaseMemObject(e.out);
+      cache.erase(w_fp32_host);
+      return false;
+    }
+  }
+
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(lmhead_fp32w_gemv_kernel, "lmhead_gemv_fp32w");
+  if (!kp) {
+    static int logged = 0;
+    if (!logged++)
+      std::fprintf(stderr, "[lmhead-fp32w] registerClKernel failed\n");
+    return false;
+  }
+
+  // act_fp16_host is `hidden` IEEE-binary16 values (byte-identical to OpenCL
+  // half); upload as raw uint16 bytes.
+  if (clEnqueueWriteBuffer(q, e.x, CL_FALSE, 0, sizeof(uint16_t) * hidden,
+                           act_fp16_host, 0, nullptr, nullptr) != CL_SUCCESS) {
+    std::fprintf(stderr, "[lmhead-fp32w] act write failed\n");
+    return false;
+  }
+
+  int Vi = (int)vocab, Hi = (int)hidden;
+  int a = 0;
+  if (!(kp->SetKernelArguments(a++, &e.w, sizeof(cl_mem)) &&
+        kp->SetKernelArguments(a++, &e.x, sizeof(cl_mem)) &&
+        kp->SetKernelArguments(a++, &e.out, sizeof(cl_mem)) &&
+        kp->SetKernelArguments(a++, &Vi, sizeof(int)) &&
+        kp->SetKernelArguments(a++, &Hi, sizeof(int))))
+    return false;
+
+  blas_cc->command_queue_inst_.setNextProfileLabel(":lmhead_fp32w");
+  std::array<size_t, 3> gws = {(size_t)vocab * 64, 1, 1};
+  std::array<size_t, 3> lws = {64, 1, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+
+  if (clEnqueueReadBuffer(q, e.out, CL_TRUE, 0, sizeof(float) * vocab,
+                          logits_f32_host, 0, nullptr, nullptr) != CL_SUCCESS) {
+    std::fprintf(stderr, "[lmhead-fp32w] logits read failed\n");
+    return false;
+  }
+  static int announced = 0;
+  if (announced < 3) {
+    ++announced;
+    std::fprintf(stderr, "[lmhead-fp32w] call#%d V=%u H=%u (fp32 weight GEMV)\n",
+                 announced, vocab, hidden);
+  }
+  return true;
+}
+
 } // namespace nntrainer

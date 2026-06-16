@@ -16,6 +16,7 @@
 #define __TENSOR_POOL_H__
 #ifdef __cplusplus
 
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -28,6 +29,10 @@
 #include <common.h>
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
+
+#ifdef ENABLE_OPENCL
+#include <cl_buffer_pool.h>
+#endif
 
 namespace nntrainer {
 
@@ -68,7 +73,20 @@ public:
       cache_loader = std::make_unique<CacheLoader>(cache_pool);
       mem_pool = cache_pool;
     } else {
+#ifdef ENABLE_OPENCL
+      // NNTR_GPU_CLMEM_POOL: back the activation plane with a device cl_mem pool
+      // (ClBufferPool) so activations can be GPU-resident as plain cl_mem (the
+      // gpu_native residency model). Only when the backend is the GPU SVM
+      // allocator; default OFF => the SVM-backed MemoryPool (byte-identical).
+      if (allocator_->getName() == "gpu-svm" &&
+          std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr) {
+        mem_pool = std::make_shared<ClBufferPool>(allocator_);
+      } else {
+        mem_pool = std::make_shared<MemoryPool>(allocator_);
+      }
+#else
       mem_pool = std::make_shared<MemoryPool>(allocator_);
+#endif
     }
   }
 
@@ -181,6 +199,8 @@ public:
    * @param lifespan Lifespan of this tensor.
    * @param init Initializer of the tensor.
    * @param is_weight_grad Identification of weight gradient
+   * @param engine compute engine of the requesting layer (for static residency
+   *        class derivation; CPU by default keeps non-GPU callers unchanged)
    *
    * @return ptr to the created tensor
    *
@@ -188,11 +208,11 @@ public:
    * @note we assume that the caller checks if the exec_order and lifespan are
    * compatible.
    */
-  Tensor *request(const std::string &name, const TensorDim &dim,
-                  const std::vector<unsigned int> &exec_order,
-                  TensorLifespan lifespan,
-                  const Initializer &init = Initializer::NONE,
-                  bool is_weight_grad = false);
+  Tensor *request(
+    const std::string &name, const TensorDim &dim,
+    const std::vector<unsigned int> &exec_order, TensorLifespan lifespan,
+    const Initializer &init = Initializer::NONE, bool is_weight_grad = false,
+    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU);
 
   /**
    * @brief     Request tensor which is a view of already requested with the
@@ -204,6 +224,9 @@ public:
    * @param exec_order The execution orders for this tensors
    * @param lifespan Lifespan of this tensor
    * @param offset offset from the reference
+   * @param consumer_engine compute engine of the layer consuming this view;
+   *        AND-accumulated into the source's all_consumers_gpu for static
+   *        residency derivation (CPU by default = conservative downgrade)
    *
    * @return ptr to a tensor which is sharing the same data with
    * reference.
@@ -217,7 +240,9 @@ public:
   Tensor *view(const std::string &name, const std::string &reference,
                const TensorDim &dim,
                const std::vector<unsigned int> &exec_order,
-               TensorLifespan lifespan, const size_t offset = 0);
+               TensorLifespan lifespan, const size_t offset = 0,
+               ml::train::LayerComputeEngine consumer_engine =
+                 ml::train::LayerComputeEngine::CPU);
 
   /**
    * @brief extend a tensor life as tensor is being shared.
@@ -249,10 +274,11 @@ public:
    * @return Tensor* ptr to either to the existing tensor or newly created
    * tensor
    */
-  Tensor *requestOrExtend(const std::string &name, const TensorDim &dim,
-                          const std::vector<unsigned int> &exec_order,
-                          TensorLifespan lifespan,
-                          const Initializer &init = Initializer::NONE);
+  Tensor *requestOrExtend(
+    const std::string &name, const TensorDim &dim,
+    const std::vector<unsigned int> &exec_order, TensorLifespan lifespan,
+    const Initializer &init = Initializer::NONE,
+    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU);
 
   /**
    * @brief reidentify the source of already created tensor (or view).
@@ -364,6 +390,24 @@ private:
     std::vector<unsigned int> exec_order; /**< exec order */
     std::vector<unsigned int>
       dependents; /**< list of dependents to the source */
+    ml::train::LayerComputeEngine engine =
+      ml::train::LayerComputeEngine::CPU; /**< compute engine of the requesting
+                            layer; drives static residency-class derivation at
+                            allocate(). Dependents (views) inherit the source's
+                            residency via the shared MemoryData. */
+    bool all_consumers_gpu =
+      true; /**< AND of every view-consumer's engine==GPU (accumulated at
+                 view()). A tensor is GPU_CLMEM only when its producer AND all
+                 consumers are GPU: a CPU/SVM reader (e.g. mha_core consuming
+                 the wq/wk/wv outputs via host SVM pointers) downgrades the
+                 source to SVM so no consumer is left reading a stale plane. */
+    unsigned int view_count =
+      0; /**< number of views registered on this source. Device-measured: a
+              FAN-OUT tensor (>1 view chain, i.e. consumed through the
+              auto-inserted multiout) corrupts on the cl_mem plane while every
+              single-consumer tensor is token-identical -- so GPU_CLMEM is
+              currently restricted to view_count<=1 (the verified-clean
+              partition) until the fan-out interaction is root-caused. */
   };
 
   /**

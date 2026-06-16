@@ -26,6 +26,7 @@
 #include <context.h>
 #include <engine.h>
 #include <layer_node.h>
+#include <multiout_layer.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -309,6 +310,13 @@ void LayerNode::setComputeEngine(
   // setting compute_engine of LayerNode
   // can be reused later to propagate this info
   this->compute_engine = compute_engine;
+}
+
+bool LayerNode::isComputeEngineGPU() const {
+  if (!layer_node_props)
+    return false;
+  auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
+  return !ce.empty() && ce.get() == ml::train::LayerComputeEngine::GPU;
 }
 
 const std::string LayerNode::getName() const {
@@ -665,6 +673,12 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
   auto context = InitLayerContext(
     actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
     getName(), scope, max_norm, tensor_type, loss_scale, mode, compute_engine);
+  /** static residency: MultiOut is an in-place identity fan-out (no data
+   * touch), so its output specs must not stamp CPU onto the shared source
+   * tensor -- engine-neutral (GPU = no veto); the REAL consumers' input views
+   * resolve to the same source and register their own engines. */
+  if (getType() == MultiOutLayer::type || getType() == "mha_core")
+    context.setComputeEngine(ml::train::LayerComputeEngine::GPU);
 
   layer->finalize(context);
 
@@ -758,6 +772,15 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
   auto context = InitLayerContext(actual_input_dims, out_info,
                                   getInPlaceType() != InPlaceType::NONE,
                                   getName(), scope, max_norm);
+  /** refinalize omits the engine arg; stamp it so output activations carry the
+   * layer's compute engine for static residency derivation (must precede
+   * layer->finalize, which requests outputs via outSpec). MultiOut is
+   * engine-neutral (in-place identity fan-out): GPU = no veto, the real
+   * consumers' input views register their own engines on the shared source. */
+  context.setComputeEngine(
+    (getType() == MultiOutLayer::type || getType() == "mha_core")
+      ? ml::train::LayerComputeEngine::GPU
+      : compute_engine);
 
   layer->finalize(context);
 
@@ -969,6 +992,10 @@ void LayerNode::configureRunContext(const std::vector<Weight *> &weights,
   run_context = std::make_unique<RunLayerContext>(
     getName(), getTrainable(), 0.0f, getInPlaceType() != InPlaceType::NONE,
     loss_scale, ct_data, false, weights, inputs, outputs, tensors);
+  // NNTR_DEVRES Step 0: thread the layer's compute engine onto the run context
+  // so the residency overlay can tell CPU vs GPU consumers at getInput/getOutput.
+  // Inert (default CPU; nothing reads it yet).
+  run_context->setRunComputeEngine(compute_engine);
 }
 
 /**

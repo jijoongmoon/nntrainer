@@ -306,4 +306,17 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
                                          idx_variant, lower_bound, upper_bound);
 }
 
+template <>
+void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
+                                      void *lhs_native_mtx_f16,
+                                      void *rhs_packed_mtx_qs4cx,
+                                      _FP16 *dst_act_mtx_f16,
+                                      uint32_t idx_variant, bool transB,
+                                      _FP16 lower_bound, _FP16 upper_bound) {
+  // No fp16 KleidiAI packed micro-kernel; the runtime path is GPU/v8c, so this
+  // CPU branch is link-only. (Upstream removed the old __fallback_nntr_* stub
+  // in the kleidiai fallback refactor.)
+  throw std::runtime_error("NYI : nntr_gemm_qai8dxp_qsi4cxp_packed<_FP16>");
+}
+
 } /* namespace nntrainer */

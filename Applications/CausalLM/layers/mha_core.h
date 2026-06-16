@@ -32,8 +32,6 @@
 #endif
 
 #include <complex>
-#include <memory>
-#include <unordered_map>
 
 #include <acti_func.h>
 #include <common_properties.h>
@@ -109,16 +107,6 @@ public:
 };
 
 /**
- * @brief UseRope property
- */
-class UseRope : public nntrainer::Property<bool> {
-public:
-  UseRope(bool value = true) { set(value); };
-  static constexpr const char *key = "use_rope"; /**< unique key to access */
-  using prop_tag = nntrainer::bool_prop_tag;     /**< property type */
-};
-
-/**
  * @brief UseSink property
  */
 class UseSink : public nntrainer::Property<bool> {
@@ -150,6 +138,19 @@ public:
 };
 
 /**
+ * @brief UseGemmAttention property
+ * @note  Optional GEMM-based attention path for the non-causal (encoder) case.
+ *        QK and AV are computed with (s)gemm per head instead of the per-row
+ *        dot kernels, improving cache reuse for large sequence lengths.
+ */
+class UseGemmAttention : public nntrainer::Property<bool> {
+public:
+  UseGemmAttention(bool value = false) { set(value); };
+  static constexpr const char *key = "use_gemm_attention";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
  * @brief RopeScalingType
  * - default
  * - yarn
@@ -169,17 +170,6 @@ public:
   RopeScalingFactor(float value = 1.0) { set(value); };
   static constexpr const char *key =
     "rope_scaling_factor";                    /**< unique key to access */
-  using prop_tag = nntrainer::float_prop_tag; /**< property type */
-};
-
-/**
- * @brief RopePartialRotaryFactor
- */
-class RopePartialRotaryFactor : public nntrainer::Property<float> {
-public:
-  RopePartialRotaryFactor(float value = 1.0f) { set(value); };
-  static constexpr const char *key =
-    "rope_partial_rotary_factor";             /**< unique key to access */
   using prop_tag = nntrainer::float_prop_tag; /**< property type */
 };
 
@@ -341,11 +331,10 @@ private:
     nntrainer::props::OutputShape, nntrainer::props::DropOutRate,
     nntrainer::props::ReturnAttentionWeight,
     nntrainer::props::AverageAttentionWeight, nntrainer::props::MaxTimestep,
-    props::SlidingWindow, props::MaxNewTokens, props::RopeTheta, props::UseRope,
+    props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
-    props::RopeScalingFactor, props::RopePartialRotaryFactor,
-    props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
-    props::IsCausal>
+    props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
+    props::AttnLogitSoftcapping, props::IsCausal, props::UseGemmAttention>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -371,10 +360,83 @@ private:
   float theta;
   size_t local_window_size;
   bool use_sink = false;
-  bool use_rope = true;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
-  bool skip_prefill = false;
+  bool use_gemm_attention = false;
+
+  /**
+   * @brief Adreno image-attention path (paper §3.7/§3.8). gpu_native runs
+   *        prefill attention by reading K/V through image2d_from_buffer
+   *        (read_imageui texture cache) — ~9x faster than the SVM buffer
+   *        flash kernel on Adreno. The layer-graph KV cache is SVM, which
+   *        cannot back an image (clCreateImage needs a cl_mem handle), so we
+   *        keep per-layer cl_mem OHWI mirrors of K (layout [H_kv, S_max, d])
+   *        and reversed-V ([H_kv, d, S_max]) plus their image2d views. Each
+   *        prefill step scatters this step's rotated K / raw V from the SVM
+   *        cache slice into the mirrors (k_scatter_ohwi_cl /
+   *        v_scatter_ohwi_t_cl); attention then reads the images. Lazy-init on
+   *        the first prefill step. Stored as void* so the layer header stays
+   *        free of the OpenCL headers (cast to cl_mem in the .cpp).
+   *        Gated by NNTR_KV_IMG_ATTN — Adreno only, since read_imageui fails
+   *        to build on Intel NEO (use_image_attn: -1 unprobed, 0 off, 1 on).
+   */
+  void *k_buf_ohwi = nullptr;
+  void *v_buf_ohwi = nullptr;
+  void *k_image_ohwi = nullptr;
+  void *v_image_ohwi = nullptr;
+  bool kv_mirror_init = false;
+  unsigned int kv_mirror_S_max = 0;
+  int use_image_attn = -1;
+
+  /**
+   * @brief Tight-stride V image view + mirror content tracking (texture-cache
+   *        cliff fix, NNTR_KV_VTIGHT=0 disables). A V image pitch sized to the
+   *        allocation cap (S_max, e.g. 2048) instead of the live sequence
+   *        wastes texture cache on padding (sv_matmul 63 -> 41ms @M=843 when
+   *        tight). v_image_tight is a view over the SAME v_buf_ohwi with
+   *        stride kv_v_img_S; kv_v_cur_stride is the stride the buffer's
+   *        CURRENT contents were scattered at (a stride change invalidates
+   *        them); kv_{k,v}_valid_to track which rows [0, n) the mirrors hold
+   *        (decode writes the SVM cache only, so a follow-up prefill
+   *        back-fills the gap from the SVM cache before engaging the image
+   *        attention).
+   */
+  void *v_image_tight = nullptr;
+  unsigned int kv_v_img_S = 0;
+  unsigned int kv_v_cur_stride = 0;
+  unsigned int kv_v_valid_to = 0;
+  unsigned int kv_k_valid_to = 0;
+
+  /**
+   * @brief NNTR_MHA_CLMEM slab-sync watermark: concat SVM slab rows [0, n)
+   *        hold valid K/V. In that mode the prefill window writes ONLY the
+   *        OHWI mirrors (no SVM side-fill); host readers (decode NEON,
+   *        gemm_attention, flash fallback) gather the missing rows back
+   *        from the mirrors first (k/v_gather_ohwi, one drained sync).
+   */
+  unsigned int kv_slab_synced_to = 0;
+
+  /**
+   * @brief GEMM-based flash attention for one batch (covers both encoder
+   *        non-causal and causal-LLM prefill paths).
+   *        2-phase: (1) de-interleave Q (num_heads_Q heads) and K/V
+   *        (num_heads_KV heads) into shared contiguous [H,N,d] buffers; (2)
+   *        balanced parallel_for over (h_q, query_block) units with online
+   *        softmax over key-blocks (shgemm QK -> NEON exp -> shgemm AV).
+   *        GQA: h_kv = h_q / gqa_size. Causal: key-block upper-bound break
+   *        + in-block boundary mask. Sliding window: key-block lower-bound
+   *        skip + in-block lower mask.
+   * @param[in] N_kv      total cache length (= cache_to, keys [0, N_kv))
+   * @param[in] N_q       step length (= step_size, rows of the output)
+   * @param[in] cache_from absolute starting position of queries in the cache
+   *                      (so q_abs(i) = cache_from + i, k_abs(k) = k)
+   */
+  void gemm_attention(nntrainer::Tensor &query_step,
+                      nntrainer::Tensor &b_cached_key,
+                      nntrainer::Tensor &b_cached_value,
+                      nntrainer::Tensor &attention_output_step,
+                      unsigned int N_kv, unsigned int N_q,
+                      unsigned int cache_from);
 
   enum INOUT_INDEX {
     /** input index */
@@ -399,8 +461,30 @@ private:
     attention_weight,
     dropout_mask,
     attention_output,
+    /** Per-(token, head) FP16 scales for int8 KV cache (paper section
+     * 3.7 int8 KV path; only requested when kv_int8 mode is active). */
+    cache_key_scale,
+    cache_value_scale,
   };
-  std::array<unsigned int, 7> tensor_idx;
+  std::array<unsigned int, 9> tensor_idx;
+
+  /** True when KV cache is stored as int8 (raw bytes treated as
+   * int8) + per-(token, head) FP16 scales. Enabled by setting the
+   * NNTR_KV_INT8 env var; default false keeps the FP16 cache layout. */
+  bool kv_int8 = false;
+
+  /** Scale tensors for the int8 KV cache; populated by the forwarding
+   * entry points when kv_int8 is active. Lifespan is the layer's, so
+   * the pointers are valid for as long as the layer node exists. */
+  nntrainer::Tensor *kv_int8_key_scale = nullptr;
+  nntrainer::Tensor *kv_int8_value_scale = nullptr;
+  /** Per-batch raw pointers into the scale tensors above, set by
+   * one_batch_incremental_forwarding before the read-path call to
+   * compute_kcaches / compute_fp16vcache_transposed / gemm_attention.
+   * Single-batch dispatch is sequential, so racing the helpers (which
+   * parallelize over heads) against these is safe. */
+  const uint16_t *cur_kv_int8_key_scale_batch = nullptr;
+  const uint16_t *cur_kv_int8_value_scale_batch = nullptr;
   unsigned int sink_idx;
 
   /** attention parameters */
@@ -411,36 +495,56 @@ private:
   float attention_scaling = 1.0f;
   float mscale = 1.0f;
   float scale = 1.0f;
-  float rope_partial_rotary_factor = 1.0f;
   unsigned int original_max_position_embeddings = 4096;
 
   /** set by incremental_forwarding, used by forwarding */
   unsigned int incremental_step_size = 0;
 
   /****************** ROTARY EMBEDDING *****************/
+  /** static variable - they are all expected to be initialized once */
   /**
-   * @brief FP32 rotary embedding cache entries.
+   * @brief Rotary frequency cache for FP32 and optional FP16 lookup tables
    */
-  struct RopeCacheFP32 {
+  struct RopeFreqCache {
     std::vector<std::vector<float>> cos;
     std::vector<std::vector<float>> sin;
-  };
-  inline static std::unordered_map<std::string, std::shared_ptr<RopeCacheFP32>>
-    rope_cache_fp32;
-  std::shared_ptr<RopeCacheFP32> freqs_fp32 = nullptr;
 #ifdef ENABLE_FP16
-  /**
-   * @brief FP16 rotary embedding cache entries.
-   */
-  struct RopeCacheFP16 {
-    std::vector<std::vector<_FP16>> cos;
-    std::vector<std::vector<_FP16>> sin;
-  };
-  inline static std::unordered_map<std::string, std::shared_ptr<RopeCacheFP16>>
-    rope_cache_fp16;
-  std::shared_ptr<RopeCacheFP16> freqs_fp16 = nullptr;
+    std::vector<std::vector<_FP16>> cos_fp16;
+    std::vector<std::vector<_FP16>> sin_fp16;
 #endif
-  std::vector<float> thetas;
+  };
+  inline static std::unordered_map<std::string, RopeFreqCache> rope_freq_cache;
+  inline static std::vector<std::vector<float>> *freqs_cos = {};
+  inline static std::vector<std::vector<float>> *freqs_sin = {};
+  inline static std::vector<float> thetas;
+  std::vector<std::vector<float>> *cached_freqs_cos = {};
+  std::vector<std::vector<float>> *cached_freqs_sin = {};
+#ifdef ENABLE_FP16
+  inline static std::vector<std::vector<_FP16>> *freqs_cos_fp16 = {};
+  inline static std::vector<std::vector<_FP16>> *freqs_sin_fp16 = {};
+  std::vector<std::vector<_FP16>> *cached_freqs_cos_fp16 = {};
+  std::vector<std::vector<_FP16>> *cached_freqs_sin_fp16 = {};
+  // Flattened [max_pos * head_dim/2] cos/sin LUT (fp16 bits) for the GPU RoPE
+  // path (rope_inplace_f16_cl). PROCESS-WIDE static (inline static): every
+  // layer shares one theta/head_dim/max_pos, so a per-instance member meant
+  // 26 identical rebuilds = ~305ms of GPU idle inside the first prefill
+  // (measured, the copy_h2h->rope first-forward gap). Built once, keyed by
+  // (theta, max_pos, head_dim); the GPU wrapper uploads it once.
+  inline static std::vector<uint16_t> rope_cos_flat_fp16;
+  inline static std::vector<uint16_t> rope_sin_flat_fp16;
+  inline static float rope_flat_theta = -1.0f;
+  inline static unsigned int rope_flat_pos = 0;
+  inline static int rope_flat_hd = -1;
+
+  /**
+   * @brief Build (or reuse) the process-wide flat RoPE LUT. Idempotent,
+   *        keyed by (theta, max_position_embeddings, head_dim). Called from
+   *        finalize() so the ~40ms build lands at model load instead of
+   *        inside the first timed prefill (KVST "lutcheck" segment), and
+   *        from the GPU-RoPE hot path as the fallback.
+   */
+  void ensure_rope_flat_lut();
+#endif
 
   /**
    * @brief pre_compute frequencies for Rotary Embedding.
@@ -461,10 +565,6 @@ private:
    * @brief _compute frequency parameters for default ROPE
    */
   void _compute_yarn_parameters(int head_dim, float theta);
-  void _compute_proportional_parameters(int head_dim, float theta);
-
-  std::string getRopeCacheKey(int head_dim, unsigned int seq_len,
-                              float theta) const;
 
   /**
    * @brief     apply rotary embedding
@@ -472,11 +572,12 @@ private:
    * @param[out] out output tensor
    * @param[in] dim hidden dim size
    * @param[in] from sequence order
-   * @param[in] convert_only true to only store the tensor into the cache dtype
+   * @param[in] apply_rope true to apply rotary embedding, false to only store
+   *                       the tensor into the cache dtype
    */
   void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
                                   unsigned int dim, unsigned int from,
-                                  bool convert_only = false);
+                                  bool apply_rope = true);
 
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,

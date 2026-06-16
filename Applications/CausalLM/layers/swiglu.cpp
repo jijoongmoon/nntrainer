@@ -13,6 +13,7 @@
 
 #include <util_simd.h>
 
+#include "_layer_prof.h"
 #include "swiglu.h"
 
 namespace causallm {
@@ -43,6 +44,7 @@ void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
 void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) {
+  causallm::LayerProfScope _prof("swiglu", (to - from) == 1);
   nntrainer::Tensor &in1 = context.getInput(INPUT_IDX_1);
   nntrainer::Tensor &in2 = context.getInput(INPUT_IDX_2);
   nntrainer::Tensor &out = context.getOutput(OUT_IDX);
