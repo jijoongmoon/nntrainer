@@ -12,7 +12,9 @@
 
 #include "cl_buffer_pool.h"
 
+#include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 #include <cl_context.h>
 #include <engine.h>
@@ -125,10 +127,37 @@ void ClBufferPool::allocate() {
   cl_command_queue q = cc->command_queue_inst_.GetCommandQueue();
   const cl_uchar zero = 0;
   size_t alloc_total = 0, alloc_max = 0;
+  if (getenv("NNTR_POOL_DUMP")) {
+    std::vector<std::pair<size_t, size_t>> dbg(offset_maxsize_.begin(),
+                                               offset_maxsize_.end());
+    std::sort(dbg.begin(), dbg.end(),
+              [](auto &a, auto &b) { return a.second > b.second; });
+    ml_logw("[POOL_DUMP] %zu distinct offsets, top sizes:", dbg.size());
+    for (size_t i = 0; i < dbg.size() && i < 8; ++i)
+      ml_logw("[POOL_DUMP]   off=%zu  size=%zu bytes (%.1f MB)", dbg[i].first,
+              dbg[i].second, dbg[i].second / 1048576.0);
+  }
   for (const auto &kv : offset_maxsize_) {
     const size_t sz = kv.second;
     if (sz == 0)
       continue;
+    // A single tensor larger than the device single-allocation cap cannot be a
+    // cl_mem at all (clCreateBuffer -> CL_INVALID_BUFFER_SIZE). The only tensor
+    // that hits this is a host-resident quantized weight plane (e.g. Gemma4's
+    // Q6_K per-layer-embedding table, ~1.84 GB > Adreno's 1.45 GB cap) which is
+    // dequantized ON THE HOST and never bound as a device cl_mem -- it already
+    // has an SVM-backed MemoryData (host pointer). Skip the (unused) cl_mem for
+    // such offsets: getMemory() then leaves device_mem unstamped and the tensor
+    // falls back to its SVM backing. This is NOT the corrupting hybrid (that was
+    // about activations silently losing their cl_mem); an oversized buffer
+    // physically cannot be cl_mem, so SVM is the only correct home.
+    if (sz > (size_t)max_alloc) {
+      ml_logw("ClBufferPool: per-offset buffer %.1f MB exceeds device "
+              "MAX_MEM_ALLOC_SIZE %.1f MB -> keep on SVM (host-resident plane, "
+              "e.g. quantized embedding table), no device cl_mem",
+              sz / 1048576.0, max_alloc / 1048576.0);
+      continue;
+    }
     cl_int err = CL_SUCCESS;
     cl_mem buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sz, nullptr, &err);
     if (err != CL_SUCCESS || buf == nullptr)

@@ -93,7 +93,9 @@ LOCAL_SRC_FILES := \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/scalar_multiply.cpp \
+    ../layers/scalar_multiply_gpu.cpp \
     ../layers/logit_softcapping.cpp \
     ../layers/mha_core.cpp \
     ../layers/lm_head.cpp \

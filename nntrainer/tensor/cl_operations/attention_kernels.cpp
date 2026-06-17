@@ -2771,7 +2771,10 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
   // model with TWO head_dims (gemma4: 256 sliding / 512 full) gets the right
   // VPL=d/LWS<=8 per call. The kernel cache (key = name+copts) still dedups the
   // compile per distinct (head_dim,...) so this stays a single compile per d.
-  const int flash_coop_lws = [head_dim, flash_blockq, flash_blockq_tm]() {
+  // flash_blockq / flash_blockq_tm are static const (file/function-static) -- they
+  // have static storage duration and are accessible inside the lambda WITHOUT a
+  // capture; capturing them is ill-formed (ARM/NDK clang rejects it, x86 was lax).
+  const int flash_coop_lws = [head_dim]() {
     const char *e = std::getenv("NNTR_FLASH_COOP_LWS");
     int v;
     if (e && std::atoi(e) > 0) {
