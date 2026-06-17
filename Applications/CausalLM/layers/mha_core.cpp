@@ -587,6 +587,14 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   use_gemm_attention =
     std::get<props::UseGemmAttention>(mha_core_props).get();
 
+  // Honor the LayerImpl `skip_prefill` property (parsed into layer_impl_props
+  // by LayerImpl::setProperty). When set, mha_core writes its KV cache during
+  // the prefill big-step but skips the (unused) prefill attention compute --
+  // see the skip_prefill member doc in mha_core.h.
+  if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill =
+      std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
+
   // Paper section 3.7 int8 KV cache path. Reduces KV cache memory + read
   // bandwidth ~2x. The byte buffer is stored as UINT8; we treat the
   // bytes as signed int8 in the read/write code paths. Per-(token,
@@ -1760,6 +1768,17 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   unsigned int step_size = to - from;
   unsigned int cache_from = cache_index;
   unsigned int cache_to = cache_from + step_size;
+
+  // skip_prefill (Gemma4 KV-shared layers): K/V are now written + scattered
+  // into this layer's own cache slab above, which is all decode needs (decode
+  // re-derives cache_index from the absolute `from` each step, and attends to
+  // these cached positions). The prefill attention OUTPUT is unused -- the O
+  // FC and every downstream per-layer op for a KV-shared layer also skip the
+  // prefill big-step -- so skip the heavy attention compute + output write.
+  // Decode (step_size == 1) always runs the full path. The CLMEM output raise
+  // is skipped intentionally: the downstream wo FC does not read O in prefill.
+  if (skip_prefill && step_size > 1)
+    return;
 
   // NNTR_MHA_CLMEM boundary sync (see mha_clmem_mode): gather the mirror
   // rows the slab is missing back into the concat SVM slab, capped by the
@@ -3074,6 +3093,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
+
+  // skip_prefill (see the non-sink overload above): K/V are written into the
+  // cache; skip the unused prefill attention compute + output write. The
+  // _oraise guard above raises the (untouched) output on return -- a no-op for
+  // the SVM/host case and harmless for cl_mem since the downstream wo FC also
+  // skips the prefill big-step.
+  if (skip_prefill && (to - from) > 1)
+    return;
 
   nntrainer::Tensor out_(
     1, 1,

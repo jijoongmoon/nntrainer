@@ -368,6 +368,27 @@ private:
   unsigned int cache_index; /** idx of kv cache */
 
   /**
+   * @brief Honor the LayerImpl `skip_prefill` property. Gemma4 KV-shared
+   *        layers (the last num_kv_shared_layers) reuse an earlier layer's
+   *        K/V projection as their attention K/V *inputs* but still own a
+   *        dedicated KV-cache slab (cache_k_l{id}/cache_v_l{id}, bound 1:1
+   *        per layer by CausalLM::allocateAndBindKVCache). The per-layer
+   *        ops around mha (Q/O FC, q_norm, scalar, the post-attention add)
+   *        all honor skip_prefill and skip the prefill big-step; mha_core
+   *        previously ignored it and STILL ran the (heavy) prefill attention
+   *        for these shared layers. When set AND this is the prefill call
+   *        (to - from > 1), mha_core still WRITES + scatters K/V into its own
+   *        cache slab (decode attends to those positions, so they MUST be
+   *        populated), then early-returns BEFORE the attention compute and
+   *        the (unused, downstream-also-skipped) attention output write.
+   *        cache_index is re-set from the absolute `from` argument on every
+   *        forward (CausalLM::setKVCachePosition / incremental_forwarding),
+   *        so the skipped tail's internal advance is irrelevant to decode.
+   *        Parsed from layer_impl_props::SkipPrefill in finalize().
+   */
+  bool skip_prefill = false;
+
+  /**
    * @brief Whether to use externally provided cache tensors
    *        (true when num_inputs >= 5, i.e., Q, K, V + cache_key + cache_value)
    *        In external mode mha_core does not allocate its own cache tensors,
