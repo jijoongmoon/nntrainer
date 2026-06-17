@@ -2236,8 +2236,26 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // The wo FC consumes O through its static plane: raise it into the
         // planner sub-buffer when a non-cl_mem path (flash/two_conv/kvi8)
         // wrote the SVM shadow instead.
-        if (o_cl != nullptr && !o_written_clmem)
+        if (o_cl != nullptr && !o_written_clmem) {
+          // The flash/two_conv prefill kernel wrote O into the SVM shadow and,
+          // on the in-order SVM-pool queue, deliberately SKIPS its post-kernel
+          // drain (attention_kernels.cpp) on the assumption that the next GPU
+          // op orders behind it. But clmem_raise_cl below is NOT a GPU->GPU
+          // dependency: it reads the SVM shadow as a plain HOST pointer
+          // (the clEnqueueWriteBuffer source). The host view of a kernel-
+          // written coarse-grained SVM region is not coherent until the
+          // kernel completes, so at large prefill M (sliding-window prefill at
+          // ctx > window is the first config that runs a long flash kernel on
+          // this path) the raise can snapshot a partially-written O => corrupt
+          // last-position hidden state => non-deterministic immediate EOS /
+          // garbage. Drain once here so the host source is coherent before the
+          // raise. Measured no prefill regression (M=1024 ~737 TPS, identical
+          // to the undrained path within noise) because the flash kernel has
+          // effectively completed by the time this layer's O is consumed; the
+          // host gemm path below wrote O on the host and needs no such drain.
+          nntrainer::cl_queue_finish();
           nntrainer::clmem_raise_cl(attention_output_step, 0);
+        }
         return;
       }
 #endif
