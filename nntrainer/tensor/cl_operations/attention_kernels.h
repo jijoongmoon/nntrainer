@@ -314,7 +314,8 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
                                     unsigned int head_dim,
                                     unsigned int max_seq_len, bool causal,
                                     bool svm_inputs = false,
-                                    float attn_softcap = 0.0f);
+                                    float attn_softcap = 0.0f,
+                                    unsigned int local_window = 0u);
 
 /**
  * @brief Pre-build the rope/scatter/copy kernel PROGRAM (rope_inplace source,

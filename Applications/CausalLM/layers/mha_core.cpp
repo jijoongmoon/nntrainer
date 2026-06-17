@@ -2202,10 +2202,19 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         if (!ok)
           lower_q();
         if (!ok && svm_ok) {
+          // Gemma4 sliding-window: pass local_window_size so the flash kernel
+          // masks keys older than the window (n + W <= m). UINT_MAX (full
+          // attention) and any window >= cache length are treated as "no
+          // window" inside the kernel. Prefill big-step writes from
+          // cache_from==0 so the kernel's row index m == absolute query pos.
+          const unsigned int win =
+            (local_window_size >= (size_t)cache_to)
+              ? 0u
+              : (unsigned int)local_window_size;
           ok = nntrainer::flash_attention_prefill_f16_cl(
             Q_p, K_p, V_p, O_p, step_size, cache_to, num_heads_Q, num_heads_KV,
             head_dim, /*max_seq_len=*/0u, is_causal, /*svm_inputs=*/true,
-            attn_logit_softcapping);
+            attn_logit_softcapping, /*local_window=*/win);
         }
         // image2d_from_buffer variant gated by NNTR_MHA_GPU_IMG=1. Uses 8-half
         // texel loads (RGBA UINT32) for the d-axis reduction, ~8x fewer
@@ -2593,16 +2602,41 @@ void MHACoreLayer::gemm_attention(
   // Android). The FP16 Q path keeps the entire attention in FP16
   // (custom_hgemm for QK and AV, FP16 softmax) without ever materializing
   // an FP32 score buffer.
+  //
+  // x86 guardrail (Gemma4): the ALL-FP16 NEON QK/AV branch is compiled out on
+  // x86, and the FP32 fallback dereferences Qp_fp32. So when q_fp16 is set on
+  // x86 we must materialize an FP32 de-interleaved Q (Qa_fp32) and take the
+  // FP32 path; otherwise Qp_fp32==nullptr -> SIGSEGV (the crash the diagnosis
+  // hit when use_gemm_attention was flipped and a d=512 layer fell to here).
+#if defined(__x86_64__) || defined(__i386__)
+  const bool q_fp16_to_fp32 = q_fp16; // x86 has no NEON FP16-Q kernel
+#else
+  const bool q_fp16_to_fp32 = false;
+#endif
   std::vector<float> Qa_fp32;
   std::vector<uint16_t> Qa_fp16;
-  if (q_fp16)
+  if (q_fp16 && !q_fp16_to_fp32)
     Qa_fp16.resize((size_t)num_heads_Q * N_q * d);
   else
     Qa_fp32.resize((size_t)num_heads_Q * N_q * d);
   std::vector<uint16_t> Ka((size_t)num_heads_KV * N_kv * d);
   std::vector<uint16_t> Va((size_t)num_heads_KV * N_kv * d);
   {
-    if (q_fp16) {
+    if (q_fp16_to_fp32) {
+#ifdef ENABLE_FP16
+      // FP16 bits -> FP32, de-interleaved per head (x86 FP32 attention path).
+      tm.parallel_for(0, static_cast<size_t>(num_heads_Q), [&](size_t h) {
+        float *qa = Qa_fp32.data() + (size_t)h * N_q * d;
+        const uint16_t *qh = Q_fp16_src + h * d;
+        for (unsigned int n = 0; n < N_q; ++n) {
+          const uint16_t *qsrc = qh + (size_t)n * HD_Q;
+          float *qdst = qa + (size_t)n * d;
+          for (unsigned int x = 0; x < d; ++x)
+            qdst[x] = nntrainer::compute_fp16_to_fp32(qsrc[x]);
+        }
+      });
+#endif
+    } else if (q_fp16) {
       tm.parallel_for(0, static_cast<size_t>(num_heads_Q), [&](size_t h) {
         uint16_t *qa = Qa_fp16.data() + (size_t)h * N_q * d;
         const uint16_t *qh = Q_fp16_src + h * d;
@@ -2677,9 +2711,13 @@ void MHACoreLayer::gemm_attention(
       const unsigned int qb = static_cast<unsigned int>(u % num_qb) * Bq;
       const unsigned int bq = std::min(Bq, N_q - qb);
       const float *Qp_fp32 =
-        q_fp16 ? nullptr : (Qa_fp32.data() + (size_t)h_q * N_q * d);
+        (q_fp16 && !q_fp16_to_fp32)
+          ? nullptr
+          : (Qa_fp32.data() + (size_t)h_q * N_q * d);
       const uint16_t *Qp_fp16 =
-        q_fp16 ? (Qa_fp16.data() + (size_t)h_q * N_q * d) : nullptr;
+        (q_fp16 && !q_fp16_to_fp32)
+          ? (Qa_fp16.data() + (size_t)h_q * N_q * d)
+          : nullptr;
       const uint16_t *Kp = Ka.data() + (size_t)h_kv * N_kv * d;
       const uint16_t *Vp = Va.data() + (size_t)h_kv * N_kv * d;
       float *Oh = o_fp16 ? nullptr : (O + h_q * d);

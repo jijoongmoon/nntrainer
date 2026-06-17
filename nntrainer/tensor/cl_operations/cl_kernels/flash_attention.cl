@@ -579,7 +579,7 @@ __kernel void flash_attention_prefill_f16_blockq(
     const int M, const int N_kv, const int d,
     const int HD_Q, const int HD_KV, const int gqa,
     const int is_causal, const float scale, const int k_stride,
-    const float softcap) {
+    const float softcap, const int local_window) {
   const int lid = get_local_id(0);
   const int grp = get_group_id(0);                 // -> (head_q, row-tile)
   const int n_row_tiles = (M + FBQ_TM - 1) / FBQ_TM;
@@ -641,7 +641,11 @@ __kernel void flash_attention_prefill_f16_blockq(
     #pragma unroll
     for (int r = 0; r < FBQ_TM; ++r) {
       const int m = m0 + r;
-      if (!row_valid[r] || (is_causal && n > m))
+      // Causal mask (n > m) + Gemma4 sliding-window mask (n + W <= m, i.e.
+      // key n is older than the window of W keys ending at m). local_window<=0
+      // disables the window (full causal attention).
+      if (!row_valid[r] ||
+          (is_causal && (n > m || (local_window > 0 && n + local_window <= m))))
         continue;
 #ifdef FLASH_FP16_SCORE
       float s = (float)((half)(scale * sdot[r]));
@@ -691,8 +695,12 @@ __kernel void flash_attention_prefill_f16_blockq(
       #pragma unroll
       for (int r = 0; r < FBQ_TM; ++r) {
         const int m = m0 + r;
-        if (!row_valid[r] || (is_causal && n > m))
-          continue;                               // PER-ROW causal mask
+        // PER-ROW causal mask (n > m) + Gemma4 sliding-window mask
+        // (n + W <= m). local_window<=0 disables the window.
+        if (!row_valid[r] ||
+            (is_causal &&
+             (n > m || (local_window > 0 && n + local_window <= m))))
+          continue;
 #ifdef FLASH_FP16_SCORE
         float s =
             (float)((half)(scale * red_sh[(j * FBQ_TM + r) * FLASH_VEC_LWS]));

@@ -2635,7 +2635,8 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
                                     unsigned int num_heads_KV,
                                     unsigned int head_dim,
                                     unsigned int max_seq_len, bool causal,
-                                    bool svm_inputs, float attn_softcap) {
+                                    bool svm_inputs, float attn_softcap,
+                                    unsigned int local_window) {
   if (num_heads_Q == 0 || num_heads_KV == 0 || head_dim == 0 || M == 0 ||
       N_kv == 0)
     return false;
@@ -2766,8 +2767,11 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
   // over head_dim). Default 64. LDS footprint is tiny (q_sh[d]+acc_sh[d]+
   // red_sh[BLOCK_KV*LWS] ~ 1-3 KB), well within Adreno's 32 KB at any LWS.
   // Must be a power of two (log-step reduction). Override via env.
-  // head_dim captured (constant across a run) so d=256 can force LWS=32 (VPL=8).
-  static const int flash_coop_lws = [head_dim]() {
+  // NOTE (gemma4): NOT process-wide static — depends on the LIVE head_dim so a
+  // model with TWO head_dims (gemma4: 256 sliding / 512 full) gets the right
+  // VPL=d/LWS<=8 per call. The kernel cache (key = name+copts) still dedups the
+  // compile per distinct (head_dim,...) so this stays a single compile per d.
+  const int flash_coop_lws = [head_dim, flash_blockq, flash_blockq_tm]() {
     const char *e = std::getenv("NNTR_FLASH_COOP_LWS");
     int v;
     if (e && std::atoi(e) > 0) {
@@ -2804,7 +2808,11 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
   // before the online-softmax update, matching the 3-kernel baseline
   // (which stores scores as fp16). Used to confirm the flash vs baseline
   // greedy divergence is fp16-score precision, not an indexing bug.
-  static const std::string flash_copts = [&]() {
+  // NOTE (gemma4): NOT process-wide static — bakes FLASH_VEC_D=head_dim and
+  // FLASH_COOP_LWS=flash_coop_lws, both of which vary per call when a model has
+  // two head_dims. cl_context keys the compiled kernel on name+copts so each
+  // distinct head_dim compiles its own variant exactly once.
+  const std::string flash_copts = [&]() {
     const char *e = std::getenv("NNTR_FLASH_FP16_SCORE");
     std::string base = tca_copts();
     if (e && std::atoi(e) != 0)
@@ -2872,11 +2880,15 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
       !kp->SetKernelArguments(11, &scale, sizeof(float)) ||
       !kp->SetKernelArguments(12, &k_stride, sizeof(int)))
     return false;
-  // softcap (arg 13) exists only on the Block-Q kernel (Gemma2 attn logit
-  // soft-cap). The coop/vec/skeleton variants (Qwen3 d=128, no softcap) don't
-  // declare it, so only bind it for the blockq path.
+  // softcap (arg 13) and local_window (arg 14) exist only on the Block-Q kernel
+  // (Gemma2 attn logit soft-cap; Gemma4 sliding-window). The coop/vec/skeleton
+  // variants (Qwen3 d=128, no softcap/window) don't declare them, so only bind
+  // them for the blockq path. local_window<=0 or >=N_kv => no window mask.
   if (flash_blockq) {
-    if (!kp->SetKernelArguments(13, &attn_softcap, sizeof(float)))
+    int win_i = (local_window > 0 && local_window < N_kv) ? (int)local_window
+                                                          : 0;
+    if (!kp->SetKernelArguments(13, &attn_softcap, sizeof(float)) ||
+        !kp->SetKernelArguments(14, &win_i, sizeof(int)))
       return false;
   }
 

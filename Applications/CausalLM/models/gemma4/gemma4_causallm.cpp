@@ -583,6 +583,11 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   layer_v_norms[layer_id] = shared_v_norm;
 
   // Shared attention core receives [Q_norm, shared_K_norm, shared_V_norm].
+  // use_gemm_attention=true routes prefill onto the GPU flash path
+  // (mha_core.cpp:1941). The flash kernel handles d=256 sliding (window mask)
+  // + GQA; the d=512 full layers fail the VPL<=8 check and fall back to the
+  // (x86-FP16-Q-safe) CPU gemm_attention. Without this flag prefill attention
+  // runs entirely on the slow CPU non-gemm path (~222 TPS @ M=1024).
   std::vector<std::string> a_params = {
     withKey("name", A),
     withKey("num_heads", n_heads),
@@ -597,6 +602,7 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
             std::to_string(rope_partial_rotary_factor)),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
+    withKey("use_gemm_attention", "true"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));
@@ -725,6 +731,11 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     createGemma4KVCachePlaceholders(layer_id, getKVCacheWidth(layer_id));
 
   // Attention core receives [Q_norm, K_norm, V_norm].
+  // use_gemm_attention=true routes prefill onto the GPU flash path
+  // (mha_core.cpp:1941). The flash kernel handles d=256 sliding (window mask)
+  // + GQA; the d=512 full layers fail the VPL<=8 check and fall back to the
+  // (x86-FP16-Q-safe) CPU gemm_attention. Without this flag prefill attention
+  // runs entirely on the slow CPU non-gemm path (~222 TPS @ M=1024).
   std::vector<std::string> a_params = {
     withKey("name", A),
     withKey("num_heads", n_heads),
@@ -739,6 +750,7 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
             std::to_string(rope_partial_rotary_factor)),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
+    withKey("use_gemm_attention", "true"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));
