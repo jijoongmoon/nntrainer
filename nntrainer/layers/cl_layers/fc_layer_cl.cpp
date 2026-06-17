@@ -110,6 +110,8 @@ FullyConnectedLayerCl::FullyConnectedLayerCl() :
 }
 
 void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
+  if (!std::get<props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(*layer_impl_props).get();
   auto &weight_regularizer =
     std::get<props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
@@ -229,6 +231,8 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
                                                    unsigned int from,
                                                    unsigned int to,
                                                    bool training) {
+  if (skip_prefill && from == 0)
+    return;
   auto _fc_t0 = fc_prof_enabled() ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
   // Use the by-reference getWeight so QINT4 callers see the same Int4QTensor

@@ -12,13 +12,18 @@
  */
 
 #include "_layer_prof.h"
+#include <blas_kernel_interface.h>
+#include <blas_kernels.h>
 #include <embedding_layer.h>
 #include <layer_context.h>
+#include <memory_data.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <thread_manager.h>
 #include <util_func.h>
+
+#include <vector>
 
 namespace causallm {
 
@@ -132,26 +137,61 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       nntrainer::Tensor out_tensor =
         batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
-      if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
-        ///@note this should be replaced with quantizer operation
-        int num_blocks_per_row = (weight.width() + 256 - 1) / 256;
-        nntrainer::dequantize_row_q6_K(
-          (void *)((char *)weight.getData<uint8_t>() +
-                   (210 * num_blocks_per_row) * embed_idx),
-          out_tensor.getData(), out_dim);
-      } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
-        ///@note this should be replaced with quantizer operation
-        int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
-        nntrainer::dequantize_row_q4_0(
-          (void *)((char *)weight.getData<uint8_t>() +
-                   (18 * num_blocks_per_row) * embed_idx),
-          out_tensor.getData(), out_dim);
+      const auto wt = weight.getDataType();
+      if (wt == nntrainer::TensorDim::DataType::Q6_K ||
+          wt == nntrainer::TensorDim::DataType::Q4_0) {
+        // dequantize_row_q{6_K,4_0} ALWAYS writes out_dim FP32 values. In an
+        // FP16-activation run out_tensor is FP16, so writing FP32 straight in
+        // (the old `out_tensor.getData()` == float*) overruns the buffer 2x and
+        // corrupts every value => garbage PLE row added to every layer =>
+        // prompt-independent garbage output. Mirror TieWordEmbedding: dequant
+        // into an FP32 scratch, then cast into the output's real dtype, folding
+        // the embed scale.
+        std::vector<float> tmp(out_dim);
+        if (wt == nntrainer::TensorDim::DataType::Q6_K) {
+          int num_blocks_per_row = (weight.width() + 256 - 1) / 256;
+          nntrainer::dequantize_row_q6_K(
+            (void *)((char *)weight.getData<uint8_t>() +
+                     (210 * num_blocks_per_row) * embed_idx),
+            tmp.data(), out_dim);
+        } else {
+          int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
+          nntrainer::dequantize_row_q4_0(
+            (void *)((char *)weight.getData<uint8_t>() +
+                     (18 * num_blocks_per_row) * embed_idx),
+            tmp.data(), out_dim);
+        }
+        if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+          _FP16 *o = out_tensor.getData<_FP16>();
+          for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+            o[k] = static_cast<_FP16>(tmp[k] * scale);
+#else
+          throw std::invalid_argument("FP16 out_tensor requires ENABLE_FP16");
+#endif
+        } else {
+          float *o = out_tensor.getData<float>();
+          for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+            o[k] = tmp[k] * scale;
+        }
+      } else if (wt == nntrainer::TensorDim::DataType::FP32 &&
+                 out_tensor.getDataType() ==
+                   nntrainer::TensorDim::DataType::FP16) {
+        // FP32 weight row -> FP16 activation needs an explicit narrowing cast;
+        // copyData would byte-copy out_dim*4 bytes into an out_dim*2 buffer.
+#ifdef ENABLE_FP16
+        const float *src = cur_weight.getData<float>();
+        _FP16 *o = out_tensor.getData<_FP16>();
+        for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+          o[k] = static_cast<_FP16>(src[k] * scale);
+#else
+        throw std::invalid_argument("FP16 out_tensor requires ENABLE_FP16");
+#endif
       } else {
         out_tensor.copyData(cur_weight);
-      }
-
-      if (scale != 1.0f) {
-        out_tensor.multiply_i(scale);
+        if (scale != 1.0f) {
+          out_tensor.multiply_i(scale);
+        }
       }
     });
 
@@ -161,6 +201,24 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
               << "\n hidden: " << hidden_ << std::endl;
 #endif
   }
+
+  // The embedding row is written on the HOST (dequant loop above) into the
+  // output activation. When the output is SVM-resident, hand the buffer back
+  // to the device so the GPU consumer (e.g. gemma4 per_layer_input_sum
+  // addition) reads fresh data instead of a stale host-mapped shadow. This is
+  // looked up EVERY token (prefill + each decode step), so a missing handoff
+  // corrupts every step. No-op when not SVM-resident. Mirror TieWordEmbedding.
+  {
+    const auto h_md = hidden_.getMemoryData();
+    if (h_md && h_md->isSVM())
+      nntrainer::cl_svm_unmap_force(hidden_.getData<uint8_t>());
+  }
+  // GPU_CLMEM residency: upload host-written rows into the planner cl_mem
+  // sub-buffer so GPU consumers read fresh device memory. No-op when the class
+  // is SVM (handled above).
+  nntrainer::clmem_raise_cl(
+    hidden_, (unsigned int)((size_t)(to - from) * out_dim *
+                            hidden_.getDim().getDataTypeSize()));
 }
 
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {

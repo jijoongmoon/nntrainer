@@ -470,8 +470,9 @@ MHACoreLayer::MHACoreLayer() :
     nntrainer::props::ReturnAttentionWeight(),
     nntrainer::props::AverageAttentionWeight(), nntrainer::props::MaxTimestep(),
     props::SlidingWindow(), props::MaxNewTokens(), props::RopeTheta(),
-    props::MaxPositionEmbeddings(), props::UseSink(), props::RopeScalingType(),
-    props::RopeScalingFactor(), props::RopeScalingMaxPositionEmbeddings(),
+    props::UseRope(), props::MaxPositionEmbeddings(), props::UseSink(),
+    props::RopeScalingType(), props::RopeScalingFactor(),
+    props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
     props::AttnLogitSoftcapping(), props::IsCausal(),
     props::UseGemmAttention()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
@@ -529,6 +530,8 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** attention scaling computation */
   rope_scaling_type = std::get<props::RopeScalingType>(mha_core_props).get();
   scale = std::get<props::RopeScalingFactor>(mha_core_props).get();
+  rope_partial_rotary_factor =
+    std::get<props::RopePartialRotaryFactor>(mha_core_props).get();
   if (rope_scaling_type == "yarn")
     original_max_position_embeddings =
       std::get<props::RopeScalingMaxPositionEmbeddings>(mha_core_props).get();
@@ -3119,12 +3122,31 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
   }
 
   thetas.clear();
-  if (rope_scaling_type == "default")
-    _compute_default_parameters(head_dim, theta);
-  else if (rope_scaling_type == "yarn")
+  if (rope_scaling_type == "yarn")
     _compute_yarn_parameters(head_dim, theta);
-  else
-    NNTR_THROW_IF(true, std::invalid_argument) << "Unsupported rope type!";
+  else if (rope_scaling_type == "proportional" ||
+           rope_partial_rotary_factor != 1.0f)
+    // Proportional rope (Gemma3n/Gemma4 E2B). Also routes here when a
+    // partial_rotary_factor < 1 is configured even under the "default" type,
+    // since _compute_proportional_parameters is the one that zeroes the
+    // non-rotary tail of the frequency table.
+    _compute_proportional_parameters(head_dim, theta);
+  else {
+    // "default" plus any model-specific type we don't special-case (e.g.
+    // Gemma4/Gemma3n "linear"/local rope) -> standard RoPE frequencies. Warn
+    // once so the unhandled type is visible without aborting the run.
+    if (rope_scaling_type != "default") {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        std::fprintf(stderr,
+                     "[mha_core] rope_scaling_type='%s' not special-cased; "
+                     "using default RoPE.\n",
+                     rope_scaling_type.c_str());
+      }
+    }
+    _compute_default_parameters(head_dim, theta);
+  }
 
   unsigned int half_ = head_dim / 2;
   auto &cache = rope_freq_cache[cache_key];
@@ -3207,6 +3229,29 @@ void MHACoreLayer::_compute_default_parameters(int head_dim, float theta) {
     thetas.push_back(1.0 /
                      (std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
   }
+}
+
+void MHACoreLayer::_compute_proportional_parameters(int head_dim, float theta) {
+
+  // no attention scaling for proportional rope
+  attention_scaling = 1.0f;
+
+  // Partial rotary: only the first rope_angles frequencies receive rotary
+  // embedding; the rest of the head_dim/2 entries are zeroed so cos=1/sin=0,
+  // i.e. those channels pass through unrotated. With
+  // rope_partial_rotary_factor == 1.0 this reduces to default RoPE scaled by
+  // 1/scale.
+  const int half_dim = static_cast<int>(head_dim / 2);
+  const int rope_angles =
+    static_cast<int>((rope_partial_rotary_factor * head_dim) / 2.0f);
+  thetas.reserve(half_dim);
+  for (int i = 0; i < rope_angles; ++i)
+    thetas.push_back(
+      1.0f / (std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
+  for (int i = rope_angles; i < half_dim; ++i)
+    thetas.push_back(0.0f);
+  for (auto &val : thetas)
+    val /= scale;
 }
 
 void MHACoreLayer::_compute_yarn_parameters(int head_dim, float theta) {

@@ -31,7 +31,8 @@ public:
   /**
    * @brief     Constructor of Addition Layer
    */
-  AdditionLayerCL() : LayerImplCl(), add_props(props::Print()) {}
+  AdditionLayerCL() :
+    LayerImplCl(), add_props(props::Print(), props::SkipPrefill()) {}
 
   /**
    * @brief     Destructor of Addition Layer
@@ -107,7 +108,9 @@ public:
   static constexpr const char *type = "addition";
 
 private:
-  std::tuple<props::Print>
+  bool skip_prefill = false; /**< skip compute during prefill (Gemma4 KV-share) */
+
+  std::tuple<props::Print, props::SkipPrefill>
     add_props; /**< fc layer properties : unit - number of output neurons */
 };
 

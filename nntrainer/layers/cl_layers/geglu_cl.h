@@ -36,7 +36,8 @@ public:
   /**
    * @brief Construct a new GeGLU layer object
    */
-  GeGLULayerCl() : LayerImplCl(), geglu_props(props::Print()) {}
+  GeGLULayerCl() :
+    LayerImplCl(), geglu_props(props::Print(), props::SkipPrefill()) {}
 
   /**
    * @brief Destroy the GeGLU layer object
@@ -123,7 +124,10 @@ public:
   static bool registerClKernels(ClContext &cl_context);
 
 private:
-  std::tuple<props::Print> geglu_props; /**< geglu layer properties */
+  bool skip_prefill = false; /**< skip compute during prefill (Gemma4 KV-share) */
+
+  std::tuple<props::Print, props::SkipPrefill>
+    geglu_props; /**< geglu layer properties */
 
   static std::vector<ClContext::SharedPtrClKernel> &getLayerKernelPtrs();
 

@@ -68,7 +68,12 @@ void ReshapedRMSNormLayer::incremental_forwarding(
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
+  // gamma weight is only requested in finalize() when use_gamma is true
+  // (e.g. Gemma4 v_norm sets use_gamma=false). When false, wt_idx[gamma] is
+  // left at UINT_MAX, so reading it would index out of bounds -- the norm is
+  // gamma-free (identity scale) in that case.
+  nntrainer::Tensor *gamma =
+    use_gamma ? &context.getWeight(wt_idx[RMSParams::gamma]) : nullptr;
 
   ml::train::TensorDim in_dim = in.getDim();
   ml::train::TensorDim out_dim = out.getDim();
@@ -111,8 +116,10 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     // gamma in, so the separate multiply_i(gamma) is skipped on this path.
     const auto in_md = in_step.getMemoryData();
     const auto out_md = out_step.getMemoryData();
-    const auto gamma_md = gamma.getMemoryData();
-    const bool use_svm = in_md && in_md->isSVM() && out_md &&
+    const auto gamma_md = gamma ? gamma->getMemoryData() : nullptr;
+    // The GPU rmsnorm kernel folds gamma in, so the SVM-direct path requires a
+    // gamma weight; fall back to the host path when use_gamma is false.
+    const bool use_svm = gamma && in_md && in_md->isSVM() && out_md &&
                          out_md->isSVM() && gamma_md && gamma_md->isSVM();
     // NNTR_DEVRES Step 3 diagnostic: why is rmsnorm host? Log which operand is
     // not SVM (in/out/gamma). One-shot per process; gated by the trace flag.
@@ -135,23 +142,51 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     bool gpu_done = false;
     if (use_svm) {
       if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-        nntrainer::rmsnorm_cl(in_step.getData<float>(), gamma.getData<float>(),
+        nntrainer::rmsnorm_cl(in_step.getData<float>(), gamma->getData<float>(),
                               out_step.getData<float>(), epsilon, n_rows,
                               feature_size, /*use_svm=*/true);
         gpu_done = true;
 #ifdef ENABLE_FP16
       } else if (in_step.getDataType() ==
                  ml::train::TensorDim::DataType::FP16) {
+        // Bind cl_mem sub-buffers when the operands are GPU_CLMEM-resident
+        // (Gemma4 q/k/projection norms consume v8c FC outputs that are direct-
+        // to-cl_mem). Without this the SVM path reads a stale host shadow of
+        // the cl_mem plane -> garbage (gemma2 has no per-head norm so never hit
+        // this). gamma stays SVM, matching rms_norm_gpu.
+        void *in_cl = in_step.isClMem() ? in_step.getClMem() : nullptr;
+        void *out_cl = out_step.isClMem() ? out_step.getClMem() : nullptr;
         nntrainer::rmsnorm_cl_fp16(
-          in_step.getData<_FP16>(), gamma.getData<_FP16>(),
+          in_step.getData<_FP16>(), gamma->getData<_FP16>(),
           out_step.getData<_FP16>(), epsilon, n_rows, feature_size,
-          /*use_svm=*/true);
+          /*use_svm=*/true, out_cl, in_cl);
         gpu_done = true;
 #endif
       }
     }
 
     if (!gpu_done) {
+#ifdef ENABLE_FP16
+      // Coherent SVM hand-off for a GPU-produced FP16 input read on the host
+      // (Gemma4 v_norm, use_gamma=false, is the only norm that reaches this
+      // fallback): the v8c FC async-maps its SVM output for a next-GPU consumer,
+      // so a host reader must drain + blocking-map first or it reads a stale
+      // shadow -> garbage V -> garbage attention (the prompt-independent bug).
+      // Map out for the host write too, and unmap it after so the next consumer
+      // (mha_core) sees the result.
+      const bool fp16_svm =
+        in_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        in_md && in_md->isSVM() && out_md && out_md->isSVM();
+      if (fp16_svm) {
+        nntrainer::cl_queue_finish();
+        nntrainer::cl_svm_map_force(in_step.getData<_FP16>(),
+                                    (size_t)in_step.size() * sizeof(_FP16),
+                                    /*read_only=*/true);
+        nntrainer::cl_svm_map_force(out_step.getData<_FP16>(),
+                                    (size_t)out_step.size() * sizeof(_FP16),
+                                    /*read_only=*/false);
+      }
+#endif
       if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
         ///@todo rms_norm_wrt_width_something() should be refactored to
         /// nntrainer::Tensor operation.
@@ -162,17 +197,33 @@ void ReshapedRMSNormLayer::incremental_forwarding(
           in_step.getDim().height(), in_step.getDim().width(), epsilon);
       } else if (in_step.getDataType() ==
                  ml::train::TensorDim::DataType::FP16) {
-        // FP16 path: fall back to the generic Tensor::multiply/average/
-        // inv_sqrt_i sequence. Avoids a separate intrinsic; still inside
-        // the FP16 residual stream.
-        auto t = in_step.multiply(in_step).average(3).add(epsilon);
-        t.inv_sqrt_i();
-        in_step.multiply(t, out_step);
+        // FP16 path: the sum-of-squares MUST be computed in FP32. Doing
+        // in_step.multiply(in_step) in FP16 squares each element in FP16, so
+        // any per-row element |x|>~256 (sqrt(65504)) overflows to +Inf ->
+        // average->Inf -> inv_sqrt=0 -> the whole row is zeroed (Gemma4 v_norm
+        // row 0, |x|=674, was zeroed -> all-zero attention -> NaN cascade).
+        // Normalize via the same FP32 intrinsic the FP32 branch uses by
+        // converting in to FP32, then cast the normalized result back to FP16.
+        // This stays inside the residual stream (out is still FP16) and reuses
+        // the proven-correct FP32 RMSNorm (no overflow).
+        nntrainer::Tensor in_f32 =
+          in_step.clone(ml::train::TensorDim::DataType::FP32);
+        nntrainer::Tensor out_f32(in_f32.getDim());
+        nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+          in_f32.getData<float>(), out_f32.getData<float>(),
+          in_step.getDim().height(), in_step.getDim().width(), epsilon);
+        out_step.copyData(out_f32);
       } else {
         throw std::invalid_argument(
           "Error: not yet implemented for this data type");
       }
-      out_step.multiply_i(gamma);
+      if (gamma)
+        out_step.multiply_i(*gamma);
+#ifdef ENABLE_FP16
+      // Hand the host-written output back to the device for the next consumer.
+      if (fp16_svm)
+        nntrainer::cl_svm_unmap_force(out_step.getData<_FP16>());
+#endif
     }
 
     // NNTR_DEVRES Step 1: flag the rmsnorm output device-resident iff the GPU

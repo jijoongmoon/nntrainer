@@ -237,6 +237,25 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
                      bool skip_out_map = false);
 
 /**
+ * @brief out[i] = in[i] * scalar over n elements (Gemma4 scalar_multiply GPU
+ *        path). cl_mem-resident (out_clmem/in_clmem) under GPU_CLMEM, else SVM.
+ */
+void scalar_mul_cl_fp16(const _FP16 *input, _FP16 *result, float scalar,
+                        unsigned int n, bool use_svm, void *out_clmem = nullptr,
+                        void *in_clmem = nullptr, unsigned int row_off = 0);
+
+/**
+ * @brief Gemma4 per_layer_slice GPU path: out[r*fs+j] = in[r*in_width+off+j].
+ *        Gathers this layer's per-layer-input slice (off=layer_index*fs) from
+ *        the packed per-layer input. cl_mem-resident under GPU_CLMEM, else SVM.
+ */
+void per_layer_slice_cl_fp16(const _FP16 *input, _FP16 *result,
+                             unsigned int rows, unsigned int fs,
+                             unsigned int in_width, unsigned int off,
+                             bool use_svm, void *out_clmem = nullptr,
+                             void *in_clmem = nullptr);
+
+/**
  * @brief Fused RMSNorm + residual add: out = rmsnorm(input)*gamma + residual,
  *        in one kernel (removes the separate v8c_add_h2h residual-add + its
  *        dispatch idle at the Gemma2 sandwich-norm boundary). Math is identical

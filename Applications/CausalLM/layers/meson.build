@@ -15,8 +15,8 @@ causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_po
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
 causallm_deberta_attention_src_abs = [meson.current_source_dir() / 'deberta_attention_layer.cpp']
 causallm_shared_fully_connected_src_abs = [meson.current_source_dir() / 'shared_fully_connected_layer.cpp']
-causallm_per_layer_slice_src_abs = [meson.current_source_dir() / 'per_layer_slice.cpp']
-causallm_scalar_multiply_src_abs = [meson.current_source_dir() / 'scalar_multiply.cpp']
+causallm_per_layer_slice_src_abs = [meson.current_source_dir() / 'per_layer_slice.cpp', meson.current_source_dir() / 'per_layer_slice_gpu.cpp']
+causallm_scalar_multiply_src_abs = [meson.current_source_dir() / 'scalar_multiply.cpp', meson.current_source_dir() / 'scalar_multiply_gpu.cpp']
 causallm_logit_softcapping_src_abs = [meson.current_source_dir() / 'logit_softcapping.cpp']
 
 causallm_rms_norm = shared_library(

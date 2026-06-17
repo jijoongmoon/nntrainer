@@ -481,9 +481,13 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
   if (fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE) {
     dtype_map["patch_embed/proj"] = fc_dtype;
   }
-  // Gemma4 PLE layers - set to Q4_0 first
-  dtype_map["per_layer_input_embedding"] = fc_dtype;
-  // Gemma4 PLE projection
+  // Gemma4 PLE input embedding is a lookup table (EmbeddingLayer), whose save
+  // supports only Q4_0/Q6_K/FP32 — NOT QINT4 (a matmul-weight packing). Use
+  // embd_dtype, not fc_dtype, so QINT4 FC runs don't choke on this embedding.
+  if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE) {
+    dtype_map["per_layer_input_embedding"] = embd_dtype;
+  }
+  // Gemma4 PLE projection is a plain FC layer -> fc_dtype.
   dtype_map["per_layer_input_projection"] = fc_dtype;
 
   // Transformer decoder layers
@@ -527,8 +531,10 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       // for PLE
       dtype_map[prefix + "_per_layer_input_gate"] = fc_dtype;
       dtype_map[prefix + "_per_layer_input_proj"] = fc_dtype;
+      // per-layer PLE embedding is a lookup table -> embd_dtype (EmbeddingLayer
+      // save supports Q4_0/Q6_K/FP32, not QINT4).
       if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE) {
-        dtype_map[prefix + "_ple"] = fc_dtype;
+        dtype_map[prefix + "_ple"] = embd_dtype;
       }
 
       dtype_map[prefix + "_ple_projection"] = fc_dtype;

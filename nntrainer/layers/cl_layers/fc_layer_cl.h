@@ -132,6 +132,7 @@ public:
   static constexpr const char *type = "fully_connected";
 
 private:
+  bool skip_prefill = false; /**< skip compute during prefill (Gemma4 KV-share) */
   std::tuple<props::Unit>
     fc_props; /**< fc layer properties : unit - number of output neurons */
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */

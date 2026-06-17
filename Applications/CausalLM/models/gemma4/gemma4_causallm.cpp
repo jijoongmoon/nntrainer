@@ -262,13 +262,15 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   const unsigned int per_layer_total_dim =
     NUM_LAYERS * HIDDEN_SIZE_PER_LAYER_INPUT;
 
-  // try using same low bit precision as fc layers
+  // per-layer input embedding is a lookup table -> use EMBEDDING_DTYPE.
+  // (EmbeddingLayer save/load supports FP32/Q4_0/Q6_K, not QINT4, so it must
+  // not inherit FC_LAYER_DTYPE; quantize.cpp maps it to embd_dtype to match.)
   LayerHandle per_layer_embedding(
     createLayer("embedding_layer",
                 {withKey("name", "per_layer_input_embedding"),
                  withKey("in_dim", std::to_string(VOCAB_SIZE_PER_LAYER_INPUT)),
                  withKey("out_dim", std::to_string(per_layer_total_dim)),
-                 withKey("weight_dtype", FC_LAYER_DTYPE),
+                 withKey("weight_dtype", EMBEDDING_DTYPE),
                  withKey("scale", EMBEDDING_PER_LAYER_SCALE)}));
   Tensor per_layer_embedding_out = per_layer_embedding(x);
 
@@ -277,14 +279,16 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
     {withKey("name", "per_layer_input_projection"),
      withKey("unit", std::to_string(per_layer_total_dim)),
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE)}));
+     withKey("weight_dtype", FC_LAYER_DTYPE),
+     withKey("engine", causallm_engine())}));
   Tensor per_layer_projected = per_layer_projection(h);
 
   float ple_proj_scale = 1.0f / std::sqrt(static_cast<float>(DIM));
   LayerHandle model_proj_scale(createLayer(
     "scalar_multiply",
     {withKey("name", "per_layer_model_proj_scale"), withKey("packed", "false"),
-     withKey("multiplier", std::to_string(ple_proj_scale))}));
+     withKey("multiplier", std::to_string(ple_proj_scale)),
+     withKey("engine", causallm_engine())}));
   Tensor scaled_projection = model_proj_scale(per_layer_projected);
 
   LayerHandle projection_norm(createLayer(
@@ -298,7 +302,8 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   Tensor normalized_projection = projection_norm(scaled_projection);
 
   LayerHandle per_layer_sum(
-    createLayer("addition", {withKey("name", "per_layer_input_sum")}));
+    createLayer("addition", {withKey("name", "per_layer_input_sum"),
+                             withKey("engine", causallm_engine())}));
   Tensor per_layer_sum_out =
     per_layer_sum({per_layer_embedding_out, normalized_projection});
 
@@ -312,6 +317,7 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
                   withKey("name", "per_layer_input_scale"),
                   withKey("packed", "false"),
                   withKey("multiplier", std::to_string(per_layer_input_scale)),
+                  withKey("engine", causallm_engine()),
                 }));
   per_layer_input = per_layer_input_scale_layer(per_layer_sum_out);
 
@@ -324,6 +330,7 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   std::vector<std::string> output_norm_props = {
     withKey("name", "output_norm"),
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  output_norm_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(output_norm_props, true);
   LayerHandle out_norm(createLayer("rms_norm", output_norm_props));
   h = out_norm(h);
@@ -340,6 +347,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   std::vector<std::string> attn_norm_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  attn_norm_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(attn_norm_props, is_kv_shared_layer);
   LayerHandle attn_norm(createLayer("rms_norm", attn_norm_props));
   Tensor normed = attn_norm(input);
@@ -376,12 +384,14 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("name",
             "layer" + std::to_string(layer_id) + "_post_attention_norm"),
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  post_attn_norm_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(post_attn_norm_props, is_kv_shared_layer);
   LayerHandle post_attn_norm(createLayer("rms_norm", post_attn_norm_props));
   Tensor post_normed = post_attn_norm(att_out);
 
   std::vector<std::string> post_attention_add_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_post_attention")};
+  post_attention_add_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(post_attention_add_props, is_kv_shared_layer);
   LayerHandle post_attention_add(
     createLayer("addition", post_attention_add_props));
@@ -390,6 +400,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   std::vector<std::string> pre_ffn_norm_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_pre_ffn_norm"),
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  pre_ffn_norm_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(pre_ffn_norm_props, is_kv_shared_layer);
   LayerHandle pre_ffn_norm(createLayer("rms_norm", pre_ffn_norm_props));
   Tensor pre_ffn = pre_ffn_norm(post_attention);
@@ -399,12 +410,14 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   std::vector<std::string> post_ffn_norm_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_post_ffn_norm"),
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  post_ffn_norm_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(post_ffn_norm_props, is_kv_shared_layer);
   LayerHandle post_ffn_norm(createLayer("rms_norm", post_ffn_norm_props));
   Tensor post_ffn = post_ffn_norm(ffn_out);
 
   std::vector<std::string> decoder_output_base_props = {withKey(
     "name", "layer" + std::to_string(layer_id) + "_decoder_output_base")};
+  decoder_output_base_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(decoder_output_base_props, is_kv_shared_layer);
   LayerHandle decoder_output_base_layer(
     createLayer("addition", decoder_output_base_props));
@@ -417,6 +430,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("name", "layer" + std::to_string(layer_id) + "_per_layer_input"),
     withKey("feature_size", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
     withKey("layer_index", std::to_string(layer_id))};
+  per_layer_slice_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(per_layer_slice_props, is_kv_shared_layer);
   LayerHandle per_layer_slice(
     createLayer("per_layer_slice", per_layer_slice_props));
@@ -427,36 +441,34 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
             "layer" + std::to_string(layer_id) + "_per_layer_input_gate"),
     withKey("unit", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(per_layer_input_gate_props, is_kv_shared_layer);
   LayerHandle per_layer_input_gate(
     createLayer("fully_connected", per_layer_input_gate_props));
   Tensor per_layer_input_gate_out = per_layer_input_gate(decoder_output_base);
 
-  std::vector<std::string> per_layer_input_act_props = {
+  // Fused GeGLU: gelu_tanh(gate) * per_layer_input_slice on GPU. Replaces the
+  // separate tanh_gelu activation + element-wise multiply (same gelu(a)*b
+  // pattern as the FFN GeGLU); no CL activation/multiply exists and those CPU
+  // ops break SVM/cl_mem residency.
+  std::vector<std::string> per_layer_input_mul_props = {
     withKey("name",
-            "layer" + std::to_string(layer_id) + "_per_layer_input_act"),
-    withKey("activation", "tanh_gelu")};
-  appendSkipPrefillIfNeeded(per_layer_input_act_props, is_kv_shared_layer);
-  LayerHandle per_layer_input_act(
-    createLayer("activation", per_layer_input_act_props));
-  Tensor per_layer_input_activated =
-    per_layer_input_act(per_layer_input_gate_out);
-
-  std::vector<std::string> per_layer_input_mul_props = {withKey(
-    "name", "layer" + std::to_string(layer_id) + "_per_layer_input_mul")};
+            "layer" + std::to_string(layer_id) + "_per_layer_input_mul"),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(per_layer_input_mul_props, is_kv_shared_layer);
   LayerHandle per_layer_input_mul(
-    createLayer("multiply", per_layer_input_mul_props));
+    createLayer("geglu", per_layer_input_mul_props));
   Tensor per_layer_input_multiplied =
-    per_layer_input_mul({per_layer_input_activated, per_layer_input_slice});
+    per_layer_input_mul({per_layer_input_gate_out, per_layer_input_slice});
 
   std::vector<std::string> per_layer_input_proj_props = {
     withKey("name",
             "layer" + std::to_string(layer_id) + "_per_layer_input_proj"),
     withKey("unit", std::to_string(DIM)), withKey("disable_bias", "true"),
     withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(per_layer_input_proj_props, is_kv_shared_layer);
   LayerHandle per_layer_input_proj(
     createLayer("fully_connected", per_layer_input_proj_props));
@@ -467,6 +479,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("name",
             "layer" + std::to_string(layer_id) + "_post_per_layer_input_norm"),
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  post_per_layer_input_norm_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(post_per_layer_input_norm_props,
                             is_kv_shared_layer);
   LayerHandle post_per_layer_input_norm(
@@ -476,6 +489,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
 
   std::vector<std::string> decoder_output_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")};
+  decoder_output_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(decoder_output_props, is_kv_shared_layer);
   LayerHandle decoder_output_layer(
     createLayer("addition", decoder_output_props));
@@ -487,6 +501,7 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("packed", "false"),
     withKey("use_weight", "true"),
   };
+  layer_scalar_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(layer_scalar_props, is_kv_shared_layer);
   LayerHandle layer_scalar(createLayer("scalar_multiply", layer_scalar_props));
 
@@ -521,7 +536,8 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   std::vector<std::string> q_params = {
     withKey("name", Q), withKey("unit", curr_head_dim * n_heads),
     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(q_params, is_kv_shared_layer);
   LayerHandle wq(createLayer("fully_connected", q_params));
   Tensor q = wq(query);
@@ -544,7 +560,8 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
     "scalar_multiply",
     {withKey("name", Q_scaled), withKey("packed", "false"),
      withKey("multiplier",
-             std::to_string(std::sqrt(static_cast<float>(curr_head_dim))))}));
+             std::to_string(std::sqrt(static_cast<float>(curr_head_dim)))),
+     withKey("engine", causallm_engine())}));
   Tensor q_scaled = q_scale(q_normed);
 
   unsigned int window_size = is_sliding ? SLIDING_WINDOW : UINT_MAX;
@@ -590,6 +607,7 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
                                        withKey("disable_bias", "true"),
                                        withKey("weight_initializer", "ones"),
                                        withKey("weight_dtype", FC_LAYER_DTYPE)};
+  o_params.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(o_params, is_kv_shared_layer);
   LayerHandle wo(createLayer("fully_connected", o_params));
 
@@ -622,7 +640,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   std::vector<std::string> q_params = {
     withKey("name", Q), withKey("unit", curr_head_dim * n_heads),
     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(q_params, is_kv_shared_layer);
   LayerHandle wq(createLayer("fully_connected", q_params));
   Tensor q = wq(query);
@@ -631,7 +650,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   std::vector<std::string> k_params = {
     withKey("name", K), withKey("unit", curr_head_dim * curr_kv_heads),
     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(k_params, is_kv_shared_layer);
   LayerHandle wk(createLayer("fully_connected", k_params));
   Tensor k = wk(key);
@@ -640,7 +660,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   std::vector<std::string> v_params = {
     withKey("name", V), withKey("unit", curr_head_dim * curr_kv_heads),
     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(v_params, is_kv_shared_layer);
   LayerHandle wv(createLayer("fully_connected", v_params));
   Tensor v = wv(value);
@@ -661,7 +682,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     "scalar_multiply",
     {withKey("name", Q_scaled), withKey("packed", "false"),
      withKey("multiplier",
-             std::to_string(std::sqrt(static_cast<float>(curr_head_dim))))}));
+             std::to_string(std::sqrt(static_cast<float>(curr_head_dim)))),
+     withKey("engine", causallm_engine())}));
   Tensor q_scaled = q_scale(q_normed);
 
   // k_norm on per-head projection [B, S, Nk*Dh]
@@ -727,6 +749,7 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
                                        withKey("disable_bias", "true"),
                                        withKey("weight_initializer", "ones"),
                                        withKey("weight_dtype", FC_LAYER_DTYPE)};
+  o_params.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(o_params, is_kv_shared_layer);
   LayerHandle wo(createLayer("fully_connected", o_params));
 
@@ -743,38 +766,38 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
     withKey("unit", curr_hidden_dim), withKey("disable_bias", "true"),
     withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(ffn_gate_props, is_kv_shared_layer);
   LayerHandle ffn_gate(createLayer("fully_connected", ffn_gate_props));
   Tensor gate = ffn_gate(input);
-
-  std::vector<std::string> ffn_gate_gelu_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate_gelu"),
-    withKey("activation", "tanh_gelu")};
-  appendSkipPrefillIfNeeded(ffn_gate_gelu_props, is_kv_shared_layer);
-  LayerHandle ffn_gate_gelu(createLayer("activation", ffn_gate_gelu_props));
-  Tensor gate_gelu = ffn_gate_gelu(gate);
 
   std::vector<std::string> ffn_up_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
     withKey("unit", curr_hidden_dim), withKey("disable_bias", "true"),
     withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(ffn_up_props, is_kv_shared_layer);
   LayerHandle ffn_up(createLayer("fully_connected", ffn_up_props));
   Tensor up = ffn_up(input);
 
+  // Fused GeGLU: gelu_tanh(gate) * up on GPU (GeGLULayerCl). Replaces the
+  // separate tanh_gelu activation + element-wise multiply -- there is no CL
+  // activation/multiply, and those CPU ops break SVM/cl_mem residency.
   std::vector<std::string> ffn_geglu_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu")};
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu"),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(ffn_geglu_props, is_kv_shared_layer);
-  LayerHandle ffn_geglu(createLayer("multiply", ffn_geglu_props));
-  Tensor geglu = ffn_geglu({gate_gelu, up});
+  LayerHandle ffn_geglu(createLayer("geglu", ffn_geglu_props));
+  Tensor geglu = ffn_geglu({gate, up});
 
   std::vector<std::string> ffn_down_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
     withKey("unit", dim), withKey("disable_bias", "true"),
     withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", causallm_engine())};
   appendSkipPrefillIfNeeded(ffn_down_props, is_kv_shared_layer);
   LayerHandle ffn_down(createLayer("fully_connected", ffn_down_props));
 
@@ -820,6 +843,7 @@ std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
+  lmhead_prop.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(lmhead_prop, true);
 
   if (TIE_WORD_EMBEDDINGS)

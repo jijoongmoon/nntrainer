@@ -12,13 +12,39 @@
  */
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
+#include <string>
 
 #include "scalar_multiply.h"
 
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
+
+// NNTR_DUMP_LAYERS=1 -> per-call stats of the scalar_multiply input/output and
+// the multiplier. Every Gemma4 decoder block ends with a layer_scalar
+// scalar_multiply, so this traces the per-layer hidden state (and verifies the
+// learned layer_scalar value, e.g. layer0 ~= 0.0178) for HF-parity debugging.
+static std::string nntr_tensor_stats(nntrainer::Tensor &t) {
+  const float *d = t.getData<float>();
+  size_t n = t.size();
+  double s = 0, s2 = 0, amax = 0;
+  for (size_t i = 0; i < n; ++i) {
+    double v = d[i];
+    s += v;
+    s2 += v * v;
+    if (std::fabs(v) > amax)
+      amax = std::fabs(v);
+  }
+  double mean = n ? s / n : 0;
+  double var = n ? s2 / n - mean * mean : 0;
+  char buf[160];
+  std::snprintf(buf, sizeof buf, "mean=%.5g std=%.5g absmax=%.5g", mean,
+                std::sqrt(var < 0 ? 0 : var), amax);
+  return std::string(buf);
+}
 
 void ScalarMultiplyLayer::finalize(nntrainer::InitLayerContext &context) {
   std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
@@ -101,6 +127,14 @@ void ScalarMultiplyLayer::incremental_forwarding(
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
     in_step.multiply(multiplier, out_step);
+
+    static const bool dump_layers = std::getenv("NNTR_DUMP_LAYERS") != nullptr;
+    if (dump_layers) {
+      std::fprintf(stderr, "[DUMP] %-34s from=%u to=%u mult=%.6g | in %s | out %s\n",
+                   context.getName().c_str(), from, to, multiplier,
+                   nntr_tensor_stats(in_step).c_str(),
+                   nntr_tensor_stats(out_step).c_str());
+    }
 
 #ifdef DEBUG
     std::cout << context.getName() << " \n input:" << in_step

@@ -75,6 +75,8 @@ bool RMSNormLayerCl::registerClKernels(ClContext &cl_context) {
 void RMSNormLayerCl::finalize(InitLayerContext &context) {
   std::vector<TensorDim> dim = context.getInputDimensions();
   context.setOutputDimensions(dim);
+  if (!std::get<props::SkipPrefill>(rmsnorm_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(rmsnorm_props).get();
   auto &rmsparams_gamma = std::get<props::GammaInitializer>(rmsnorm_props);
 
   TensorDim gamma_dim(
@@ -226,6 +228,10 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
 void RMSNormLayerCl::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
                                             bool training) {
+  // Gemma4 KV-shared layers skip compute during prefill (from==0); the live
+  // token is recomputed at decode. Matches the CPU layers' skip_prefill.
+  if (skip_prefill && from == 0)
+    return;
   Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);

@@ -489,7 +489,10 @@ public:
               }
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
-                << "This dtype is not supported in save with quantization";
+                << "This dtype is not supported in save with quantization: "
+                << "weight=" << weight.getName()
+                << " target_dtype=" << static_cast<int>(dtype)
+                << " weight_dtype=" << static_cast<int>(weight.getDataType());
             }
           }
         }

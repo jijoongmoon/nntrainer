@@ -15,6 +15,7 @@
 #define __LLM_UTIL_HPP__ __LLM_UTIL_HPP__
 
 #include <algorithm> // sort
+#include <cstdlib>   // getenv
 #include <math.h>    // INFINITY
 #include <optional>
 
@@ -80,6 +81,25 @@ T unwrap(std::optional<T> &&value, const std::string &error_msg) {
   } else {
     throw std::runtime_error(error_msg);
   }
+}
+
+/**
+ * @brief Compute engine for CausalLM model layers.
+ * @return "gpu" by default (the v8c OpenCL inference path), or "cpu" when the
+ *         NNTR_ENGINE=cpu env var is set. engine=cpu runs the model on the
+ *         standard CPU layers + CpuComputeOps (e.g. Q4_0-FP32 host inference /
+ *         CPU-only deployment), instead of the engine=gpu Cl layers whose
+ *         ClComputeOps throws NI for plain CPU BLAS ops. An absent engine prop
+ *         already defaults to CPU in LayerNode; this keeps the explicit GPU
+ *         default for backward compatibility while making CPU one env away.
+ */
+static std::string causallm_engine() {
+  static const std::string eng =
+    (std::getenv("NNTR_ENGINE") != nullptr &&
+     std::string(std::getenv("NNTR_ENGINE")) == "cpu")
+      ? std::string("cpu")
+      : std::string("gpu");
+  return eng;
 }
 
 /**

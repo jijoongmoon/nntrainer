@@ -1098,6 +1098,143 @@ void rmsnorm_cl(const float *input, const float *gamma, float *result,
 }
 
 #ifdef ENABLE_FP16
+// out[i] = in[i] * scalar (Gemma4 scalar_multiply: q_scale / layer_scalar /
+// per_layer projection scales). cl_mem-resident (out_clmem/in_clmem) when the
+// graph uses the GPU_CLMEM pool, else SVM-direct. n = total element count
+// (height*width); a single linear pass keeps every activation on-device so the
+// next QINT4 GEMM reads a coherent buffer (no host round-trip that would break
+// residency -- the gemma4 incoherence root cause).
+static const std::string scalar_mul_fp16_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void scalar_mul_cl_fp16(__global const half *in, __global half *out,
+                                 float s, int n, int row_off) {
+  int i = get_global_id(0);
+  if (i < n)
+    out[i + row_off] = convert_half(convert_float(in[i + row_off]) * s);
+}
+)CL";
+
+// row_off: when cl_mem-bound (whole buffer at index 0) it offsets to the live
+// rows; SVM/host pointers are pre-offset by the caller so row_off stays 0.
+void scalar_mul_cl_fp16(const _FP16 *input, _FP16 *result, float scalar,
+                        unsigned int n, bool use_svm, void *out_clmem,
+                        void *in_clmem, unsigned int row_off) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(scalar_mul_fp16_kernel, "scalar_mul_cl_fp16");
+  if (!kp)
+    return;
+
+  cl_mem out_cl = static_cast<cl_mem>(out_clmem);
+  cl_mem in_cl = static_cast<cl_mem>(in_clmem);
+  const bool from_clmem = in_cl != nullptr;
+  const bool to_clmem = out_cl != nullptr && use_svm;
+
+  bool ok = true;
+  if (from_clmem) {
+    ok = ok && kp->SetKernelArguments(0, &in_cl, sizeof(cl_mem));
+  } else if (use_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(const_cast<_FP16 *>(input));
+    ok = ok && kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+  }
+  if (to_clmem) {
+    ok = ok && kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem));
+  } else if (use_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(result);
+    ok = ok && kp->SetKernelSVMArguments(1, result);
+  }
+  int ni = (int)n;
+  // cl_mem binds the whole buffer (apply row_off in-kernel); SVM/host pointers
+  // are pre-offset by the caller, so row_off stays 0 there.
+  int kern_row_off = (from_clmem && to_clmem) ? (int)row_off : 0;
+  ok = ok && kp->SetKernelArguments(2, &scalar, sizeof(float));
+  ok = ok && kp->SetKernelArguments(3, &ni, sizeof(int));
+  ok = ok && kp->SetKernelArguments(4, &kern_row_off, sizeof(int));
+  if (!ok)
+    return;
+
+  const int lws = 64;
+  const int gws = ((ni + lws - 1) / lws) * lws;
+  const int wgc[3] = {gws, 1, 1};
+  const int wgs[3] = {lws, 1, 1};
+  if (!blas_cc->command_queue_inst_.DispatchCommand(kp, wgc, wgs))
+    return;
+
+  if (!to_clmem && use_svm)
+    blas_cc->command_queue_inst_.enqueueSVMMap(result, (size_t)n * sizeof(_FP16),
+                                               true);
+}
+
+// out[r*fs + j] = in[r*in_width + off + j] for r in [0,rows), j in [0,fs).
+// Gemma4 per_layer_slice: gather this layer's hidden_size_per_layer_input slice
+// (off = layer_index*fs) from the packed [.., num_layers*fs] per-layer input.
+// cl_mem-resident when both planes are GPU_CLMEM, else SVM-direct.
+static const std::string per_layer_slice_fp16_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void per_layer_slice_cl_fp16(__global const half *in,
+                                      __global half *out, int fs, int in_width,
+                                      int off, int rows) {
+  int gid = get_global_id(0);
+  int total = rows * fs;
+  if (gid >= total)
+    return;
+  int r = gid / fs;
+  int j = gid - r * fs;
+  out[gid] = in[r * in_width + off + j];
+}
+)CL";
+
+void per_layer_slice_cl_fp16(const _FP16 *input, _FP16 *result,
+                             unsigned int rows, unsigned int fs,
+                             unsigned int in_width, unsigned int off,
+                             bool use_svm, void *out_clmem, void *in_clmem) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    per_layer_slice_fp16_kernel, "per_layer_slice_cl_fp16");
+  if (!kp)
+    return;
+
+  cl_mem out_cl = static_cast<cl_mem>(out_clmem);
+  cl_mem in_cl = static_cast<cl_mem>(in_clmem);
+  const bool from_clmem = in_cl != nullptr;
+  const bool to_clmem = out_cl != nullptr && use_svm;
+
+  bool ok = true;
+  if (from_clmem) {
+    ok = ok && kp->SetKernelArguments(0, &in_cl, sizeof(cl_mem));
+  } else if (use_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(const_cast<_FP16 *>(input));
+    ok = ok && kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+  }
+  if (to_clmem) {
+    ok = ok && kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem));
+  } else if (use_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(result);
+    ok = ok && kp->SetKernelSVMArguments(1, result);
+  }
+  int fsi = (int)fs, iwi = (int)in_width, offi = (int)off, rowsi = (int)rows;
+  ok = ok && kp->SetKernelArguments(2, &fsi, sizeof(int));
+  ok = ok && kp->SetKernelArguments(3, &iwi, sizeof(int));
+  ok = ok && kp->SetKernelArguments(4, &offi, sizeof(int));
+  ok = ok && kp->SetKernelArguments(5, &rowsi, sizeof(int));
+  if (!ok)
+    return;
+
+  const int total = (int)(rows * fs);
+  const int lws = 64;
+  const int gws = ((total + lws - 1) / lws) * lws;
+  const int wgc[3] = {gws, 1, 1};
+  const int wgs[3] = {lws, 1, 1};
+  if (!blas_cc->command_queue_inst_.DispatchCommand(kp, wgc, wgs))
+    return;
+
+  if (!to_clmem && use_svm)
+    blas_cc->command_queue_inst_.enqueueSVMMap(
+      result, (size_t)rows * fs * sizeof(_FP16), true);
+}
+
 void cl_queue_finish() {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -1175,11 +1312,21 @@ __kernel void rmsnorm_cl_fp16_coop_add(__global const half *input,
   const float mean = lsum[0] / (float)W;
   const float scale = rsqrt(mean + (float)epsilon);
   __global half8 *out8 = (__global half8 *)(output + base);
-  __global const half8 *a8 = (__global const half8 *)(alpha);
   __global const half8 *r8 = (__global const half8 *)(residual + base);
   for (int i = tid; i < W8; i += 64) {
-    const half8 nv = convert_half8(convert_float8(in8[i]) * scale) * a8[i];
-    out8[i] = nv + r8[i];
+    // Gemma4 large-gamma FP16 overflow guard (see rmsnorm_fp16.cl): gamma
+    // multiply in FP32 + clamp to FP16-safe range before the residual add.
+    // gamma (alpha) is a WEIGHT pointer with no 16-byte alignment guarantee
+    // (Gemma4 lands it 2-byte-aligned), so a half8 vector load reads garbage.
+    // Load it per-element (scalar gather) -- same fix as rmsnorm_cl_fp16_coop.
+    const float8 v = convert_float8(in8[i]) * scale;
+    const int gi = i << 3;
+    const float8 a = (float8)(
+      (float)alpha[gi + 0], (float)alpha[gi + 1], (float)alpha[gi + 2],
+      (float)alpha[gi + 3], (float)alpha[gi + 4], (float)alpha[gi + 5],
+      (float)alpha[gi + 6], (float)alpha[gi + 7]);
+    const float8 nv = clamp(v * a, -60000.0f, 60000.0f);
+    out8[i] = convert_half8(nv) + r8[i];
   }
 }
 )CL";

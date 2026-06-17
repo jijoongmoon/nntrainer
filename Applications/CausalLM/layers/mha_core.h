@@ -107,6 +107,17 @@ public:
 };
 
 /**
+ * @brief UseRope property (Gemma4/Gemma3n). Accepted but our mha_core derives
+ *        rope-enable from theta>0, so it is informational here.
+ */
+class UseRope : public nntrainer::Property<bool> {
+public:
+  UseRope(bool value = true) { set(value); };
+  static constexpr const char *key = "use_rope"; /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag;     /**< property type */
+};
+
+/**
  * @brief UseSink property
  */
 class UseSink : public nntrainer::Property<bool> {
@@ -170,6 +181,18 @@ public:
   RopeScalingFactor(float value = 1.0) { set(value); };
   static constexpr const char *key =
     "rope_scaling_factor";                    /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
+ * @brief RopePartialRotaryFactor (Gemma4/Gemma3n). Accepted for model
+ *        compatibility; our mha_core applies full rotary.
+ */
+class RopePartialRotaryFactor : public nntrainer::Property<float> {
+public:
+  RopePartialRotaryFactor(float value = 1.0f) { set(value); };
+  static constexpr const char *key =
+    "rope_partial_rotary_factor";             /**< unique key to access */
   using prop_tag = nntrainer::float_prop_tag; /**< property type */
 };
 
@@ -331,10 +354,11 @@ private:
     nntrainer::props::OutputShape, nntrainer::props::DropOutRate,
     nntrainer::props::ReturnAttentionWeight,
     nntrainer::props::AverageAttentionWeight, nntrainer::props::MaxTimestep,
-    props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
+    props::SlidingWindow, props::MaxNewTokens, props::RopeTheta, props::UseRope,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
-    props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::AttnLogitSoftcapping, props::IsCausal, props::UseGemmAttention>
+    props::RopeScalingFactor, props::RopePartialRotaryFactor,
+    props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
+    props::IsCausal, props::UseGemmAttention>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -495,6 +519,10 @@ private:
   float attention_scaling = 1.0f;
   float mscale = 1.0f;
   float scale = 1.0f;
+  /** fraction of head_dim that receives rotary embedding (1.0 = full rope).
+   * Frequencies past partial_rotary_factor*head_dim/2 are set to 0 (identity
+   * passthrough) by _compute_proportional_parameters. */
+  float rope_partial_rotary_factor = 1.0f;
   unsigned int original_max_position_embeddings = 4096;
 
   /** set by incremental_forwarding, used by forwarding */
@@ -565,6 +593,13 @@ private:
    * @brief _compute frequency parameters for default ROPE
    */
   void _compute_yarn_parameters(int head_dim, float theta);
+
+  /**
+   * @brief _compute frequency parameters for proportional ROPE (also handles
+   *        partial rotary via rope_partial_rotary_factor: frequencies beyond
+   *        partial_rotary_factor*head_dim/2 are zeroed = identity passthrough)
+   */
+  void _compute_proportional_parameters(int head_dim, float theta);
 
   /**
    * @brief     apply rotary embedding

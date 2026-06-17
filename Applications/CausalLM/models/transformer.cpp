@@ -24,7 +24,9 @@
 #include <embedding_layer.h>
 #include <mha_core.h>
 #include <rms_norm.h>
+#include <per_layer_slice_gpu.h>
 #include <rms_norm_gpu.h>
+#include <scalar_multiply_gpu.h>
 #include <swiglu.h>
 #include <tie_word_embedding.h>
 
@@ -261,7 +263,7 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
     createLayer("rms_norm", {withKey("name", "output_norm"),
                              withKey("epsilon", std::to_string(NORM_EPS)),
                              withKey("packed", "false"),
-                             withKey("engine", "gpu")}));
+                             withKey("engine", causallm_engine())}));
   h = out_norm(h);
 
   return {x, h};
@@ -354,7 +356,7 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
      withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("packed", "false"),
-     withKey("engine", "gpu")}));
+     withKey("engine", causallm_engine())}));
   Tensor normed = attn_norm(input);
 
   Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
@@ -363,7 +365,7 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   LayerHandle decoder_add(createLayer(
     "addition",
     {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"),
-     withKey("engine", "gpu")}));
+     withKey("engine", causallm_engine())}));
   Tensor residual = decoder_add({input, att_out});
 
   LayerHandle ffn_norm(createLayer(
@@ -371,7 +373,7 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
      withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("packed", "false"),
-     withKey("engine", "gpu")}));
+     withKey("engine", causallm_engine())}));
   Tensor ffn_normed = ffn_norm(residual);
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
@@ -379,7 +381,7 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   LayerHandle decoder_output(createLayer(
     "addition",
     {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
-     withKey("engine", "gpu")}));
+     withKey("engine", causallm_engine())}));
   return decoder_output({residual, ffn_out});
 }
 
@@ -429,7 +431,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
+     withKey("weight_initializer", "ones"), withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
   // K layer
@@ -438,7 +440,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-     withKey("engine", "gpu")}));
+     withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
   // V layer
@@ -447,7 +449,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-     withKey("engine", "gpu")}));
+     withKey("engine", causallm_engine())}));
   Tensor v = wv(value);
 
   // External KV cache placeholders (per-layer). Their actual storage is owned
@@ -474,7 +476,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
+     withKey("weight_initializer", "ones"), withKey("engine", causallm_engine())}));
   return wo(a);
 }
 
@@ -495,27 +497,27 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
+     withKey("weight_initializer", "ones"), withKey("engine", causallm_engine())}));
   Tensor gate = ffn_gate(input);
 
   LayerHandle ffn_up(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
+     withKey("weight_initializer", "ones"), withKey("engine", causallm_engine())}));
   Tensor up = ffn_up(input);
 
   LayerHandle swiglu(createLayer(
     "swiglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
-     withKey("engine", "gpu")}));
+     withKey("engine", causallm_engine())}));
   Tensor act = swiglu({gate, up});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones"), withKey("engine", "gpu")}));
+     withKey("weight_initializer", "ones"), withKey("engine", causallm_engine())}));
   return ffn_down(act);
 }
 
@@ -555,6 +557,13 @@ void Transformer::registerCustomLayers() {
     try {
       cl_context->registerFactory(
         nntrainer::createLayer<causallm::RMSNormLayerGPU>);
+      // Gemma4 GPU-resident scalar_multiply / per_layer_slice: same type
+      // strings as the CPU classes, registered here so engine=gpu routes to
+      // the GPU kernels (no host round-trip that would break residency).
+      cl_context->registerFactory(
+        nntrainer::createLayer<causallm::ScalarMultiplyLayerGPU>);
+      cl_context->registerFactory(
+        nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
       // TieWordEmbedding is registered on cl_context with its existing
       // class — the manual Q6_K + Q4_0 paths in incremental_forwarding_
       // lmhead use raw-pointer compute (no Tensor::dot), so it survives

@@ -99,10 +99,23 @@ __kernel void rmsnorm_cl_fp16_coop(__global const half *input,
   const float mean = ssum / (float)W;
   const float scale = rsqrt(mean + (float)epsilon);
   __global half8 *out8 = (__global half8 *)(output + base);
-  __global const half8 *a8 = (__global const half8 *)(alpha);
   for (int i = tid; i < W8; i += RMSN_LWS) {
-    const half8 hv = convert_half8(convert_float8(in8[i]) * scale);
-    out8[i] = hv * a8[i];
+    // Gemma4 has very large RMSNorm gammas (absmax ~83-116 vs Gemma2 ~1), so
+    // normalized*gamma can exceed FP16 max (65504) on small-RMS rows -> inf/NaN.
+    // Compute the gamma multiply in FP32 and clamp to a FP16-safe range; the
+    // downstream QINT4 FC re-quantizes the activation to int8 so the clamp is
+    // numerically negligible. No-op for Gemma2 (values << 60000).
+    // gamma (alpha) is a WEIGHT pointer with no SVM alignment guarantee (Gemma4
+    // lands it 2-byte-aligned), so a half8 vector load (16-byte align required)
+    // reads garbage -> wrong gamma -> 60000 overflow. Load gamma per-element.
+    const float8 nv = convert_float8(in8[i]) * scale;
+    const int gi = i << 3;
+    const float8 a = (float8)(
+      (float)alpha[gi + 0], (float)alpha[gi + 1], (float)alpha[gi + 2],
+      (float)alpha[gi + 3], (float)alpha[gi + 4], (float)alpha[gi + 5],
+      (float)alpha[gi + 6], (float)alpha[gi + 7]);
+    const float8 o = clamp(nv * a, -60000.0f, 60000.0f);
+    out8[i] = convert_half8(o);
   }
 }
 

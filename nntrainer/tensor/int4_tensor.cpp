@@ -426,9 +426,10 @@ void Int4QTensor::read(std::ifstream &file, size_t start_offset,
     return;
   }
   NNTR_THROW_IF(qscheme != QScheme::KAI_QSI4CXP_4x4x32, std::runtime_error)
-    << "[Int4QTensor::read] unsupported on-disk qscheme 0x" << std::hex
-    << static_cast<unsigned>(qscheme)
-    << " — decoding it as Section A would silently produce garbage";
+    << "[Int4QTensor::read] weight=" << getName()
+    << " unsupported on-disk qscheme 0x" << std::hex
+    << static_cast<unsigned>(qscheme) << std::dec << " (K=" << height()
+    << " N=" << width() << ")";
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -462,9 +463,10 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
     return;
   }
   NNTR_THROW_IF(qscheme != QScheme::KAI_QSI4CXP_4x4x32, std::runtime_error)
-    << "[Int4QTensor::read] unsupported on-disk qscheme 0x" << std::hex
-    << static_cast<unsigned>(qscheme)
-    << " — decoding it as Section A would silently produce garbage";
+    << "[Int4QTensor::read] weight=" << getName()
+    << " unsupported on-disk qscheme 0x" << std::hex
+    << static_cast<unsigned>(qscheme) << std::dec << " (K=" << height()
+    << " N=" << width() << ")";
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 

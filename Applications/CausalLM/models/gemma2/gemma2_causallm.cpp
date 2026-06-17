@@ -89,7 +89,7 @@ Tensor Gemma2Transformer::createTransformerDecoderBlock(const int layer_id,
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false"), withKey("engine", "gpu")}));
+     withKey("packed", "false"), withKey("engine", causallm_engine())}));
   Tensor normed = attn_norm(input);
 
   Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
@@ -105,7 +105,7 @@ Tensor Gemma2Transformer::createTransformerDecoderBlock(const int layer_id,
     "rms_norm", {withKey("name", "layer" + std::to_string(layer_id) +
                                    "_post_attention_norm"),
                  withKey("epsilon", std::to_string(NORM_EPS)),
-                 withKey("packed", "false"), withKey("engine", "gpu")}));
+                 withKey("packed", "false"), withKey("engine", causallm_engine())}));
   Tensor post_attn;
   if (fuse_addnorm) {
     post_attn = post_attn_norm({att_out, input});
@@ -114,7 +114,7 @@ Tensor Gemma2Transformer::createTransformerDecoderBlock(const int layer_id,
     LayerHandle post_attn_add(createLayer(
       "addition",
       {withKey("name", "layer" + std::to_string(layer_id) + "_post_attention"),
-       withKey("engine", "gpu")}));
+       withKey("engine", causallm_engine())}));
     post_attn = post_attn_add({input, post_normed});
   }
 
@@ -122,7 +122,7 @@ Tensor Gemma2Transformer::createTransformerDecoderBlock(const int layer_id,
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "pre_ffn_norm"),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false"), withKey("engine", "gpu")}));
+     withKey("packed", "false"), withKey("engine", causallm_engine())}));
   Tensor pre_ffn = pre_ffn_norm(post_attn);
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
@@ -131,7 +131,7 @@ Tensor Gemma2Transformer::createTransformerDecoderBlock(const int layer_id,
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "post_ffn_norm"),
      withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false"), withKey("engine", "gpu")}));
+     withKey("packed", "false"), withKey("engine", causallm_engine())}));
   if (fuse_addnorm)
     return post_ffn_norm({ffn_out, post_attn});
 
@@ -140,7 +140,7 @@ Tensor Gemma2Transformer::createTransformerDecoderBlock(const int layer_id,
   LayerHandle decoder_output(createLayer(
     "addition",
     {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
-     withKey("engine", "gpu")}));
+     withKey("engine", causallm_engine())}));
   return decoder_output({post_attn, post_ffn});
 }
 
@@ -155,7 +155,7 @@ Tensor Gemma2Transformer::createAttention(const int layer_id, int seq_len,
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
      withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "gpu")}));
+     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
   // K layer
@@ -164,7 +164,7 @@ Tensor Gemma2Transformer::createAttention(const int layer_id, int seq_len,
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "gpu")}));
+     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
   // V layer
@@ -173,7 +173,7 @@ Tensor Gemma2Transformer::createAttention(const int layer_id, int seq_len,
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "gpu")}));
+     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", causallm_engine())}));
   Tensor v = wv(value);
 
   // NOTE: Gemma2 has NO per-head q/k RMSNorm (unlike Gemma3). Q and K feed the
@@ -218,7 +218,7 @@ Tensor Gemma2Transformer::createAttention(const int layer_id, int seq_len,
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
      withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "gpu")}));
+     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", causallm_engine())}));
   return wo(a);
 }
 
@@ -231,7 +231,7 @@ Tensor Gemma2Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
      withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "gpu")}));
+     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", causallm_engine())}));
   Tensor gate = ffn_gate(input);
 
   // Up projection
@@ -240,7 +240,7 @@ Tensor Gemma2Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
      withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "gpu")}));
+     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", causallm_engine())}));
   Tensor up = ffn_up(input);
 
   // Fused GeGLU: gelu_tanh(gate) * up (GPU GeGLULayerCl). Replaces the separate
@@ -249,7 +249,7 @@ Tensor Gemma2Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   LayerHandle geglu(createLayer(
     "geglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu"),
-     withKey("engine", "gpu")}));
+     withKey("engine", causallm_engine())}));
   Tensor act = geglu({gate, up});
 
   // Down projection
@@ -258,7 +258,7 @@ Tensor Gemma2Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
      withKey("weight_initializer", "ones"),
-     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", "gpu")}));
+     withKey("weight_dtype", FC_LAYER_DTYPE), withKey("engine", causallm_engine())}));
   return ffn_down(act);
 }
 

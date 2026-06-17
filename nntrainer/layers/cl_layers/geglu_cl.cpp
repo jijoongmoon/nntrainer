@@ -68,6 +68,8 @@ bool GeGLULayerCl::registerClKernels(ClContext &cl_context) {
 }
 
 void GeGLULayerCl::finalize(nntrainer::InitLayerContext &context) {
+  if (!std::get<props::SkipPrefill>(geglu_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(geglu_props).get();
   context.setOutputDimensions({context.getInputDimensions()[0]});
 }
 
@@ -82,6 +84,8 @@ void GeGLULayerCl::forwarding(RunLayerContext &context, bool training) {
 void GeGLULayerCl::incremental_forwarding(RunLayerContext &context,
                                           unsigned int from, unsigned int to,
                                           bool training) {
+  if (skip_prefill && from == 0)
+    return;
   Tensor &in1 = context.getInput(INPUT_IDX_1);
   Tensor &in2 = context.getInput(INPUT_IDX_2);
   Tensor &out = context.getOutput(OUT_IDX);
@@ -116,7 +120,11 @@ void GeGLULayerCl::incremental_forwarding(RunLayerContext &context,
   else if (any_clmem)
     gegluProcess(in1, in2, out, to, 0);
   else
-    gegluProcess(in1, in2, out, to - from, from);
+    // Gemma4: at decode the live token is at ROW 0 (the v8c FC / cl_mem path is
+    // offset-0-only; the producers write row 0). The old absolute-row `from`
+    // read a never-written stale row -> prompt-independent garbage. Use 0.
+    // (Gemma2's geglu is all-cl_mem, so it never reaches this branch.)
+    gegluProcess(in1, in2, out, to - from, 0);
 }
 
 void GeGLULayerCl::gegluProcess(Tensor const &in1, Tensor const &in2,

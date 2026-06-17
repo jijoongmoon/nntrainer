@@ -32,6 +32,8 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 enum class RMSParamsGPU : unsigned int { GAMMA = 0 };
 
 void RMSNormLayerGPU::finalize(nntrainer::InitLayerContext &context) {
+  if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
+    skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
   std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
   // 1 input (plain RMSNorm) or 2 inputs (fused RMSNorm + residual add at the
   // Gemma2 sandwich-norm boundary): output is always a single tensor sized like
@@ -108,6 +110,8 @@ static void rms_norm_host_fp32(const float *in, const float *gamma,
 void RMSNormLayerGPU::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
+  if (skip_prefill && from == 0)
+    return;
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
@@ -182,6 +186,12 @@ void RMSNormLayerGPU::incremental_forwarding(
                       resid->getClMem())
                        ? resid->getClMem()
                        : nullptr;
+    // FP16 epsilon underflow guard: rms_norm_eps (1e-6) rounds to 0 in FP16
+    // (min normal ~6e-5), so a near-zero activation row gets 1/rms = inf ->
+    // overflow/NaN (Gemma4 has such rows; Gemma2 happened not to). Floor the
+    // eps to a FP16-representable value; mathematically negligible for normal
+    // rows (mean >> eps).
+    const float eps16 = epsilon < 1.0e-4f ? 1.0e-4f : epsilon;
     for (unsigned int b = 0; b < b_size; ++b) {
       _FP16 *in_p = in.getData<_FP16>() + (size_t)b * in_dim.getFeatureLen();
       _FP16 *out_p = out.getData<_FP16>() + (size_t)b * out_dim.getFeatureLen();
@@ -189,19 +199,75 @@ void RMSNormLayerGPU::incremental_forwarding(
         _FP16 *resid_p =
           resid->getData<_FP16>() + (size_t)b * resid->getDim().getFeatureLen();
         if (!nntrainer::rmsnorm_add_cl_fp16(in_p, gamma_p, resid_p, out_p,
-                                            epsilon, H, W, use_svm, out_cl,
+                                            eps16, H, W, use_svm, out_cl,
                                             in_cl, resid_cl))
           throw std::runtime_error(
             "RMSNormLayerGPU: fused norm+add dispatch failed (NNTR_FUSE_ADDNORM "
             "requires the GPU_CLMEM residency path: set NNTR_GPU_CLMEM_POOL=1)");
       } else {
-        nntrainer::rmsnorm_cl_fp16(in_p, gamma_p, out_p, epsilon, H, W, use_svm,
+        nntrainer::rmsnorm_cl_fp16(in_p, gamma_p, out_p, eps16, H, W, use_svm,
                                    out_cl, in_cl, skip_out_map);
       }
     }
     if (skip_out_map) {
       if (auto md = out.getMemoryData())
         md->setDeviceValid(true, out.getData<_FP16>());
+    }
+    static const bool gdump = std::getenv("NNTR_DUMP_LAYERS") != nullptr;
+    if (gdump) {
+      const _FP16 *od = out.getData<_FP16>();
+      const _FP16 *idp = in.getData<_FP16>();
+      size_t n = (size_t)H * W;
+      double oamax = 0, iamax = 0;
+      int onan = 0, inan = 0;
+      for (size_t i = 0; i < n; ++i) {
+        float ov = (float)od[i], iv = (float)idp[i];
+        if (std::isnan(ov) || std::isinf(ov))
+          onan++;
+        else if (std::fabs(ov) > oamax)
+          oamax = std::fabs(ov);
+        if (std::isnan(iv) || std::isinf(iv))
+          inan++;
+        else if (std::fabs(iv) > iamax)
+          iamax = std::fabs(iv);
+      }
+      const _FP16 *gd = gamma.getData<_FP16>();
+      double gamax = 0;
+      int gnan = 0;
+      for (unsigned int i = 0; i < W; ++i) {
+        float gv = (float)gd[i];
+        if (std::isnan(gv) || std::isinf(gv))
+          gnan++;
+        else if (std::fabs(gv) > gamax)
+          gamax = std::fabs(gv);
+      }
+      // per-row RMS range over H rows (detect anomalous near-zero rows)
+      double rmin = 1e30, rmax = 0;
+      for (unsigned int r = 0; r < H; ++r) {
+        double ss = 0;
+        int rnan = 0;
+        for (unsigned int c = 0; c < W; ++c) {
+          float v = (float)idp[(size_t)r * W + c];
+          if (std::isnan(v) || std::isinf(v))
+            rnan++;
+          else
+            ss += (double)v * v;
+        }
+        if (rnan)
+          continue;
+        double rms = std::sqrt(ss / W);
+        if (rms < rmin)
+          rmin = rms;
+        if (rms > rmax)
+          rmax = rms;
+      }
+      std::fprintf(stderr, "[RDUMP+] %-30s row-rms min=%.4g max=%.4g\n",
+                   context.getName().c_str(), rmin, rmax);
+      std::fprintf(
+        stderr,
+        "[RDUMP] %-34s in absmax=%.5g nan=%d | gamma absmax=%.5g nan=%d | out "
+        "absmax=%.5g nan=%d\n",
+        context.getName().c_str(), iamax, inan, gamax, gnan, oamax, onan);
     }
     // NNTR_CLMEM_PROBE: device-side captures of the norm in/out for the
     // fan-out corruption bisect (no host sync; dumped at PROBE_MAX). All
