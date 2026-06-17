@@ -2782,7 +2782,13 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
       // half4 (LWS=32) to avoid spill (half8/TM>=4 = 96 floats spills).
       // #85 Gemma2 d=256: VPL must stay <=8, so LWS=d/8=32 (VPL=8, half8); at
       // TM=2 that is 2*2*8=32 acc/q floats — no spill. (d=128 keeps LWS=16.)
-      v = ((int)head_dim > 128 || flash_blockq_tm >= 4) ? 32 : 16;
+      // Gemma4 full_attention d=512: VPL must stay <=8 => LWS=d/8=64. A 64-wide
+      // workgroup is valid on Intel for the LDS-tree path (reqd_work_group_size
+      // only); the SG path is forced off for it below (intel_reqd_sub_group_size
+      // (64) is INVALID — Intel subgroups are {8,16,32}).
+      v = ((int)head_dim >= 512)
+            ? 64
+            : (((int)head_dim > 128 || flash_blockq_tm >= 4) ? 32 : 16);
     } else {
       // #59: Intel/buffer path default LWS=16 => VPL = d/16 = 8 (half8 vloads),
       // the measured Intel-Arc optimum (1153 TPS @ M=1024 vs 981 at LWS=64).
@@ -2795,6 +2801,15 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
       v = 64;
     return v;
   }();
+  // Per-call effective SG flag. The subgroup-reduce path bakes
+  // intel_reqd_sub_group_size(FLASH_VEC_LWS), so it is only valid when LWS is a
+  // real Intel subgroup size {8,16,32}. Gemma4's d=512 layers need LWS=64
+  // (VPL=8) which is NOT a valid subgroup size, so force the SG path off and
+  // use the LDS-tree reduction (reqd_work_group_size only -> 64 is fine). The
+  // d=256 sliding path keeps LWS=32 + SG (untouched). The kernel cache keys on
+  // name+copts, so d256(LWS32,SG) and d512(LWS64,no-SG) are distinct variants.
+  const int flash_blockq_sg_eff =
+    (flash_blockq_sg && flash_coop_lws <= 32) ? 1 : 0;
   // FLASH_COOP_BLOCK_KV: keys reduced per phase (tunable; 1 = no blocking).
   static const int flash_coop_block_kv = []() {
     const char *e = std::getenv("NNTR_FLASH_COOP_BLOCK_KV");
@@ -2834,7 +2849,7 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
     }
     if (flash_blockq) {
       base += " -DFBQ_TM=" + std::to_string(flash_blockq_tm);
-      if (flash_blockq_sg)
+      if (flash_blockq_sg_eff)
         base += " -DFBQ_SG";
     }
     return base;
@@ -2918,6 +2933,14 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
     const size_t gws_x = ((total + LWS - 1) / LWS) * LWS;
     gws = {gws_x};
     lws = {LWS};
+  }
+  static const bool _flash_trace = std::getenv("NNTR_FLASH_TRACE") != nullptr;
+  if (_flash_trace) {
+    std::fprintf(stderr,
+                 "[FLASH-DISPATCH] d=%d LWS=%d VPL=%d SG=%d gws=%zu groups\n",
+                 (int)head_dim, flash_coop_lws,
+                 (int)head_dim / flash_coop_lws, flash_blockq_sg_eff,
+                 gws[0] / lws[0]);
   }
   blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
                                              lws.data(), 0, nullptr, nullptr);
