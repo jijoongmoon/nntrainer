@@ -119,6 +119,54 @@ __kernel void rmsnorm_cl_fp16_coop(__global const half *input,
   }
 }
 
+// Gamma-free cooperative RMSNorm (Gemma4 v_norm: use_gamma=false). Identical to
+// rmsnorm_cl_fp16_coop but skips the per-element gamma fold (pure normalization),
+// so the host fallback (cl_queue_finish + 2x blocking SVM map + FP32 intrinsic +
+// unmap, ~0.18 ms/call x ~30 calls/token) is avoided when the attention path is
+// GPU-resident (NNTR_MHA_GPU_DECODE). Keeps the SAME 6-arg signature as the coop
+// kernel (input, output, alpha, epsilon, n_rows, W) so the host wrapper's dispatch
+// is unchanged -- alpha is bound (to the input pointer) but never read here. The
+// sum-of-squares is in fp32 (convert_float8 before squaring), matching the host
+// rms_norm_wrt_width_fp32_intrinsic, so v_norm's |x|~674 rows do not overflow the
+// fp16 range the way an in-half squaring would.
+__attribute__((reqd_work_group_size(RMSN_LWS, 1, 1)))
+__kernel void rmsnorm_cl_fp16_coop_ng(__global const half *input,
+                                      __global half *output,
+                                      __global const half *alpha, half epsilon,
+                                      int n_rows, int W) {
+  const int row = get_group_id(0);
+  const int tid = get_local_id(0);
+  if (row >= n_rows)
+    return;
+  const long base = (long)row * (long)W;
+  const int W8 = W >> 3;
+  __global const half8 *in8 = (__global const half8 *)(input + base);
+
+  float partial = 0.0f;
+  for (int i = tid; i < W8; i += RMSN_LWS) {
+    const float8 v = convert_float8(in8[i]);
+    partial += dot(v.lo, v.lo) + dot(v.hi, v.hi);
+  }
+
+  __local float lsum[RMSN_LWS];
+  lsum[tid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = RMSN_LWS >> 1; s > 0; s >>= 1) {
+    if (tid < s)
+      lsum[tid] += lsum[tid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float ssum = lsum[0];
+
+  const float mean = ssum / (float)W;
+  const float scale = rsqrt(mean + (float)epsilon);
+  __global half8 *out8 = (__global half8 *)(output + base);
+  for (int i = tid; i < W8; i += RMSN_LWS) {
+    const float8 nv = convert_float8(in8[i]) * scale;
+    out8[i] = convert_half8(nv);
+  }
+}
+
 // Same cooperative RMSNorm but with an FP32 input (the residual stream is
 // accumulated in fp32 to avoid the last-layer massive-activation overflow of
 // fp16, #47j). Output stays fp16 (normalized values are O(1), feed int8 quant).

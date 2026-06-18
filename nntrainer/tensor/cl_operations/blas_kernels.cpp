@@ -1415,8 +1415,15 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
 
   if (use_coop) {
     constexpr int RMSN_LWS = 64;
-    ClContext::SharedPtrClKernel kp =
-      blas_cc->registerClKernel(rmsnorm_fp16_kernel, "rmsnorm_cl_fp16_coop");
+    // Gamma-free path (Gemma4 v_norm, use_gamma=false => gamma==nullptr): the
+    // _ng kernel keeps the same 6-arg signature but never reads alpha (arg 2),
+    // so bind arg 2 to a valid-but-unread pointer (input) instead of a null SVM
+    // gamma. Lets the v_norm run on the GPU rmsnorm coop kernel (fp32 reduction,
+    // overflow-safe) instead of the host drain+map fallback.
+    const bool no_gamma = (gamma == nullptr);
+    ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+      rmsnorm_fp16_kernel,
+      no_gamma ? "rmsnorm_cl_fp16_coop_ng" : "rmsnorm_cl_fp16_coop");
     if (!kp)
       return;
     if (to_clmem || from_clmem) {
@@ -1431,27 +1438,36 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
         ok = ok && kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem));
       else
         ok = ok && kp->SetKernelSVMArguments(1, result);
-      ok = ok && kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma));
+      ok = ok && kp->SetKernelSVMArguments(
+                   2, const_cast<_FP16 *>(no_gamma ? input : gamma));
       if (!ok)
         return;
     } else if (use_svm) {
       if (!kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input)) ||
           !kp->SetKernelSVMArguments(1, result) ||
-          !kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma)))
+          !kp->SetKernelSVMArguments(
+            2, const_cast<_FP16 *>(no_gamma ? input : gamma)))
         return;
     } else {
       auto &clbuf = ClBufferManager::Global();
+      // no_gamma reaches here only via a non-SVM caller (v_norm is always SVM);
+      // the _ng kernel ignores arg 2, so skip the null-gamma write and bind
+      // InBufferA for it rather than crashing on a null source.
       if (!clbuf.getInBufferA()->WriteDataRegion(blas_cc->command_queue_inst_,
                                                  in_bytes, input) ||
-          !clbuf.getInBufferB()->WriteDataRegion(blas_cc->command_queue_inst_,
-                                                 width * sizeof(_FP16), gamma))
+          (!no_gamma &&
+           !clbuf.getInBufferB()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                                  width * sizeof(_FP16), gamma)))
         return;
       if (!kp->SetKernelArguments(0, &clbuf.getInBufferA()->GetBuffer(),
                                   sizeof(cl_mem)) ||
           !kp->SetKernelArguments(1, &clbuf.getOutBufferA()->GetBuffer(),
                                   sizeof(cl_mem)) ||
-          !kp->SetKernelArguments(2, &clbuf.getInBufferB()->GetBuffer(),
-                                  sizeof(cl_mem)))
+          !kp->SetKernelArguments(
+            2,
+            &(no_gamma ? clbuf.getInBufferA() : clbuf.getInBufferB())
+               ->GetBuffer(),
+            sizeof(cl_mem)))
         return;
     }
     if (!kp->SetKernelArguments(3, &eps_h, sizeof(cl_half)) ||

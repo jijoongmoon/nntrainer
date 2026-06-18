@@ -121,6 +121,20 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     // gamma weight; fall back to the host path when use_gamma is false.
     const bool use_svm = gamma && in_md && in_md->isSVM() && out_md &&
                          out_md->isSVM() && gamma_md && gamma_md->isSVM();
+    // S2 gamma-free GPU v_norm (NNTR_VNORM_GPU): Gemma4 v_norm sets
+    // use_gamma=false, so there is no gamma weight and the path above falls to
+    // the host (cl_queue_finish + 2x blocking SVM map + FP32 intrinsic + unmap,
+    // ~0.18 ms/call x ~30 calls/token). Route it to the gamma-free coop kernel
+    // (rmsnorm_cl_fp16_coop_ng) when in/out are SVM FP16: the kernel does the
+    // sum-of-squares in fp32 (overflow-safe like the host intrinsic) and skips
+    // the gamma fold. Standalone this only moves the host wait to the next drain
+    // (measured ~0 TPS), so it is gated and meant to pair with the GPU decode
+    // attention (NNTR_MHA_GPU_DECODE) that consumes the V it produces.
+    static const bool vnorm_gpu = std::getenv("NNTR_VNORM_GPU") != nullptr;
+    const bool use_svm_ng =
+      !gamma && vnorm_gpu && in_md && in_md->isSVM() && out_md &&
+      out_md->isSVM() &&
+      in_step.getDataType() == ml::train::TensorDim::DataType::FP16;
     // NNTR_DEVRES Step 3 diagnostic: why is rmsnorm host? Log which operand is
     // not SVM (in/out/gamma). One-shot per process; gated by the trace flag.
     {
@@ -163,6 +177,18 @@ void ReshapedRMSNormLayer::incremental_forwarding(
         gpu_done = true;
 #endif
       }
+#ifdef ENABLE_FP16
+    } else if (use_svm_ng) {
+      // Gamma-free GPU v_norm: same cl_mem/SVM operand binding as above, gamma
+      // is null so the wrapper dispatches the _ng kernel (no gamma fold).
+      void *in_cl = in_step.isClMem() ? in_step.getClMem() : nullptr;
+      void *out_cl = out_step.isClMem() ? out_step.getClMem() : nullptr;
+      nntrainer::rmsnorm_cl_fp16(in_step.getData<_FP16>(), /*gamma=*/nullptr,
+                                 out_step.getData<_FP16>(), epsilon, n_rows,
+                                 feature_size,
+                                 /*use_svm=*/true, out_cl, in_cl);
+      gpu_done = true;
+#endif
     }
 
     if (!gpu_done) {
