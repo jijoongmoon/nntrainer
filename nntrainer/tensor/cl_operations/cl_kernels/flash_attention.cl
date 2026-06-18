@@ -620,8 +620,15 @@ __kernel void flash_attention_prefill_f16_blockq(
     q_reg[r] = FV_CVT_F(FV_VLOAD(Q, (q_base + lane0) / VPL));
   }
 
-  // Largest causal key any VALID row in this tile attends.
-  const int last_row = (m0 + FBQ_TM - 1 < M) ? (m0 + FBQ_TM - 1) : (M - 1);
+  // Decode/chunked: the M query rows are the LAST M positions of the N_kv
+  // context (cache_from = N_kv - M), so query row r maps to ABSOLUTE position
+  // (N_kv - M) + (m0 + r). Causal/window masks must compare keys against the
+  // absolute query position, not the local row index. Prefill big-step has
+  // N_kv == M (q_pos_off = 0), so this is a no-op there.
+  const int q_pos_off = N_kv - M;
+  // Largest causal key any VALID row in this tile attends (absolute pos).
+  const int last_row =
+    (((m0 + FBQ_TM - 1) < M) ? (m0 + FBQ_TM - 1) : (M - 1)) + q_pos_off;
   const int n_last = is_causal ? min(N_kv - 1, last_row) : (N_kv - 1);
 
 #ifdef FBQ_SG
@@ -640,7 +647,7 @@ __kernel void flash_attention_prefill_f16_blockq(
     const FVFLOAT v_reg = FV_CVT_F(FV_VLOAD(V, (v_base + lane0) / VPL));
     #pragma unroll
     for (int r = 0; r < FBQ_TM; ++r) {
-      const int m = m0 + r;
+      const int m = m0 + r + q_pos_off;   // ABSOLUTE query position (decode-safe)
       // Causal mask (n > m) + Gemma4 sliding-window mask (n + W <= m, i.e.
       // key n is older than the window of W keys ending at m). local_window<=0
       // disables the window (full causal attention).
@@ -694,7 +701,7 @@ __kernel void flash_attention_prefill_f16_blockq(
       const FVFLOAT v_reg = FV_CVT_F(FV_VLOAD(V, (v_base + lane0) / VPL));
       #pragma unroll
       for (int r = 0; r < FBQ_TM; ++r) {
-        const int m = m0 + r;
+        const int m = m0 + r + q_pos_off;   // ABSOLUTE query position (decode-safe)
         // PER-ROW causal mask (n > m) + Gemma4 sliding-window mask
         // (n + W <= m). local_window<=0 disables the window.
         if (!row_valid[r] ||
