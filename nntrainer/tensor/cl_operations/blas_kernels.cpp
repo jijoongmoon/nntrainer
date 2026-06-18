@@ -2108,12 +2108,25 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   // (12 KB). 12288 admits Gemma4's double-wide-MLP FFN-down (K=12288), which
   // previously exceeded the old 10240 cap and fell to the ~15x slower m1 GEMM
   // at decode (measured 2389us vs 158us/call).
-  if (!buf_kernel && M <= 4 && gemv_coop && (N % 8) == 0 && (K % 32) == 0 &&
-      K <= 12288) {
+  // Coop GEMV also serves the Intel buffer path (NNTR_V8C_BUF). The kernel
+  // (v8c_gemv_int8_int4_coop) lives outside the V8C_BUFFER_ONLY guard and reads
+  // plain uint4 buffers with the SAME byte layout the m1_buf kernel uses
+  // (W_wgt = K/32 weight row stride; act row 0 = K/16 uint4). On the buffer
+  // path act_image/weight_image ARE the raw cl_mem buffers, so feed them
+  // directly; Adreno (image path) still extracts the image2d-from-buffer
+  // backing via clGetImageInfo. This lifts Intel decode FC off the
+  // latency-bound m1_buf GEMV (only N/8 work-items) onto the 64-WI K-split
+  // coop kernel.
+  if (M <= 4 && gemv_coop && (N % 8) == 0 && (K % 32) == 0 && K <= 12288) {
     cl_mem wbuf = nullptr, abuf = nullptr;
-    clGetImageInfo(weight_image, CL_IMAGE_BUFFER, sizeof(cl_mem), &wbuf,
-                   nullptr);
-    clGetImageInfo(act_image, CL_IMAGE_BUFFER, sizeof(cl_mem), &abuf, nullptr);
+    if (buf_kernel) {
+      wbuf = weight_image; // raw cl_mem on the buffer path
+      abuf = act_image;
+    } else {
+      clGetImageInfo(weight_image, CL_IMAGE_BUFFER, sizeof(cl_mem), &wbuf,
+                     nullptr);
+      clGetImageInfo(act_image, CL_IMAGE_BUFFER, sizeof(cl_mem), &abuf, nullptr);
+    }
     if (wbuf != nullptr && abuf != nullptr) {
       ClContext::SharedPtrClKernel ck = blas_cc->registerClKernel(
         int8_int4_gemm_v8c_kernel, "v8c_gemv_int8_int4_coop", copts);
