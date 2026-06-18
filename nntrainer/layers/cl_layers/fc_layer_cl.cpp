@@ -248,6 +248,18 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
                                                    unsigned int from,
                                                    unsigned int to,
                                                    bool training) {
+  // NNTR_OPENCL_PROFILING prefill dump: the first decode FC call (from != 0)
+  // marks the end of the single prefill forward (35 layers; the lm_head is
+  // skip_prefill'd). Dump+clear the accumulated prefill events ONCE here so the
+  // "prefill" profile is pure prefill (no decode kernels yet this token).
+  {
+    static const bool clprof = std::getenv("NNTR_OPENCL_PROFILING") != nullptr;
+    static bool prefill_dumped = false;
+    if (clprof && from != 0 && !prefill_dumped) {
+      prefill_dumped = true;
+      nntrainer::clmem_dump_clprof("prefill");
+    }
+  }
   if (skip_prefill && from == 0)
     return;
   auto _fc_t0 = fc_prof_enabled() ? std::chrono::steady_clock::now()
@@ -339,6 +351,26 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
       ++p.pre_pre_v8c.calls;
       p.pre_post_v8c.ns_total += post_ns;
       ++p.pre_post_v8c.calls;
+    }
+  }
+
+  // NNTR_OPENCL_PROFILING decode dump: the untied lm_head ("output_of_causallm")
+  // is the last layer of each DECODE forward (it is skip_prefill'd in prefill,
+  // see line ~251), so count its decode calls and dump the per-kernel GPU/idle
+  // profile at the NNTR_CLPROF_DECODE_AT-th. The "prefill" dump is triggered
+  // separately at the prefill->decode transition (top of this function).
+  if (context.getName() == "output_of_causallm") {
+    static const bool clprof = std::getenv("NNTR_OPENCL_PROFILING") != nullptr;
+    static const int decode_at = []() {
+      const char *e = std::getenv("NNTR_CLPROF_DECODE_AT");
+      int v = e ? std::atoi(e) : 12;
+      return v < 2 ? 2 : v;
+    }();
+    static int lmhead_calls = 0;
+    if (clprof) {
+      ++lmhead_calls;
+      if (lmhead_calls == decode_at)
+        nntrainer::clmem_dump_clprof("decode");
     }
   }
 }
