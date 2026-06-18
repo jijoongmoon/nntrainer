@@ -207,11 +207,18 @@ __kernel void qk_matmul_f16_ohwi_img(
 
   if (m0 >= M || n0 >= N_kv) return;
 
+  // Causal mask uses the query's ABSOLUTE position. Query row m holds the last
+  // M positions of the N_kv context, so its absolute position is (N_kv-M)+m.
+  // For prefill M==N_kv (q_off=0, the old `n > m`); for decode M=1, N_kv=N the
+  // single query sits at N-1 and must see ALL keys (q_off=N-1). Without this the
+  // decode query masks every key but n0=0 -> garbage.
+  const int q_off = N_kv - M;
+
   // Causal whole-tile skip: if the smallest key index in this tile (n0)
-  // exceeds the largest query index (m0+TM_QK-1), every element is masked
-  // (matches the per-element `n > m` rule below). Write -INF and skip the
-  // d-reduction — ~half the tiles for a square causal prefill.
-  if (causal && n0 > m0 + (TM_QK - 1)) {
+  // exceeds the largest query absolute index (q_off+m0+TM_QK-1), every element
+  // is masked. Write -INF and skip the d-reduction — ~half the tiles for a
+  // square causal prefill (q_off=0).
+  if (causal && n0 > q_off + m0 + (TM_QK - 1)) {
     const long sb = (long)head_q * (long)M * (long)N_kv;
     #pragma unroll
     for (int i = 0; i < TM_QK; i++) {
@@ -282,7 +289,7 @@ __kernel void qk_matmul_f16_ohwi_img(
       if (n >= N_kv) continue;
       float v = acc[i][j] * scale;
       if (softcap > 0.0f) v = softcap * tanh(v / softcap); // #63 Gemma2 score cap
-      if (causal && n > m) v = -INFINITY;
+      if (causal && n > q_off + m) v = -INFINITY;
       scores[score_base + (long)m * N_kv + n] = (half)v;
     }
   }
@@ -855,11 +862,15 @@ __kernel void sv_matmul_f16_ohwi_img(
   const int v_row0 = head_kv * d + x0;
   const long score_base =
       (long)head_q * (long)M * (long)N_kv + (long)m * (long)N_kv;
-  // Causal prefill: scores[m][n]=0 for n>m (softmax of the -inf qk wrote),
-  // so only the first ceil((m+1)/8) score chunks contribute. Cap the
-  // reduction here — paired with qk_matmul_f16_ohwi_img's causal tile-skip.
+  // Causal: scores[m][n]=0 for n > the query's ABSOLUTE position, so only the
+  // first ceil((q_abs+1)/8) score chunks contribute. Query row m holds the last
+  // M positions of the N_kv context -> q_abs = (N_kv-M)+m. For prefill M==N_kv
+  // (q_off=0, the old (m>>3)+1); for decode M=1 the single query at N-1 must sum
+  // ALL N_kv keys (else it sums only V[0..7] -> garbage). Paired with
+  // qk_matmul_f16_ohwi_img's q_off causal mask.
+  const int q_off = N_kv - M;
   int N_kv_tex = (N_kv + 7) >> 3;
-  const int N_kv_tex_causal = (m >> 3) + 1;
+  const int N_kv_tex_causal = ((q_off + m) >> 3) + 1;
   if (N_kv_tex_causal < N_kv_tex) N_kv_tex = N_kv_tex_causal;
 
   float acc[8];
@@ -919,9 +930,12 @@ __kernel void sv_matmul_f16_ohwi_img_tm2(
   const int v_row0 = head_kv * d + x0;
   const long sb0 = (long)head_q * (long)M * (long)N_kv + (long)m0 * (long)N_kv;
   const long sb1 = (long)head_q * (long)M * (long)N_kv + (long)m1 * (long)N_kv;
+  // Causal cap on the query's ABSOLUTE position (q_off=N_kv-M); decode (M=1)
+  // sits at N-1 and must sum ALL keys, not just V[0..7]. See the non-tm2 kernel.
+  const int q_off = N_kv - M;
   int N_kv_tex = (N_kv + 7) >> 3;
   const int cap_m = has1 ? m1 : m0;
-  const int N_kv_tex_causal = (cap_m >> 3) + 1;
+  const int N_kv_tex_causal = ((q_off + cap_m) >> 3) + 1;
   if (N_kv_tex_causal < N_kv_tex) N_kv_tex = N_kv_tex_causal;
 
   float acc0[8], acc1[8];

@@ -1689,11 +1689,63 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       }
     }
 #endif
+    if (std::getenv("NNTR_ROPE_TPROF")) {
+      static int _dbg_pf = 0, _dbg_dec = 0;
+      const bool _dec = (to - from) == 1;
+      if ((_dec && _dbg_dec < 1) || (!_dec && _dbg_pf < 1)) {
+        if (_dec) ++_dbg_dec; else ++_dbg_pf;
+        std::fprintf(stderr,
+                     "[ROPE-PATH] %s M=%u gpu_rope_done=%d kv_ohwi=%d -> %s RoPE\n",
+                     _dec ? "DECODE" : "PREFILL", to - from, (int)gpu_rope_done,
+                     (int)kv_ohwi_now, gpu_rope_done ? "GPU" : "HOST(lower)");
+        std::fflush(stderr);
+      }
+    }
     if (!gpu_rope_done) {
       // Host RoPE reads/writes Q/K/V on the host: lower first (decode and any
       // GPU-RoPE-ineligible path).
+      // NNTR_ROPE_TPROF: per-token wall time of the host-RoPE lower_q+lower_kv
+      // drains (decode only). Accumulated across layers; printed each decode
+      // token (reset). Measures whether GPU-RoPE-for-OHWI is worth the work.
+      static const bool _rope_tprof = std::getenv("NNTR_ROPE_TPROF") != nullptr;
+      static double _rope_acc = 0.0;
+      static int _rope_layers = 0;
+      static unsigned int _rope_M = 0;
+      std::chrono::steady_clock::time_point _rt0;
+      if (_rope_tprof)
+        _rt0 = std::chrono::steady_clock::now();
       lower_q();
       lower_kv();
+      if (_rope_tprof) {
+        const double _dt = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - _rt0)
+                             .count();
+        if ((to - from) > 1) {
+          // Prefill: accumulate across its (skip_prefill) producing layers and
+          // print a running cumulative — the last line before decode = the
+          // total prefill host-RoPE lower cost.
+          static double _pf_acc = 0.0;
+          static int _pf_n = 0;
+          _pf_acc += _dt;
+          ++_pf_n;
+          std::fprintf(stderr,
+                       "[ROPE-TPROF-PREFILL] layer lower=%.2fms (M=%u) cum=%.2fms "
+                       "(%d layers)\n",
+                       _dt, to - from, _pf_acc, _pf_n);
+          std::fflush(stderr);
+        } else {
+          _rope_acc += _dt;
+          if (++_rope_layers >= 35) {
+            std::fprintf(stderr,
+                         "[ROPE-TPROF-DECODE] host lower_q+lower_kv = %.2f "
+                         "ms/token (%d layers)\n",
+                         _rope_acc, _rope_layers);
+            std::fflush(stderr);
+            _rope_acc = 0.0;
+            _rope_layers = 0;
+          }
+        }
+      }
       // apply rotary embedding for query
       apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
                                  true);
@@ -1874,14 +1926,26 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       static const bool _ohwi_force =
         std::getenv("NNTR_KV_OHWI_GPU_FORCE") != nullptr;
       static int _ohwi_logged = 0;
-      if (!_ohwi_logged) {
+      static int _ohwi_dec_logged = 0;
+      const bool _is_dec = (step_size_p2 == 1);
+      if (!_ohwi_logged || (_is_dec && _ohwi_dec_logged < 3)) {
         _ohwi_logged = 1;
+        if (_is_dec)
+          ++_ohwi_dec_logged;
         std::fprintf(stderr,
-                     "[OHWI-P2] M=%u N_kv=%u S_max=%u H_q=%u H_kv=%u "
-                     "d=%u svm=%d force=%d\n",
-                     step_size_p2, cache_to_p2, cache_key_dim.height(),
-                     num_heads_Q, num_heads_KV, head_dim, (int)svm_ok,
-                     (int)_ohwi_force);
+                     "[OHWI-P2] %s M=%u N_kv=%u S_max=%u H_q=%u H_kv=%u "
+                     "d=%u svm=%d force=%d qSVM=%d kSVM=%d vSVM=%d oSVM=%d\n",
+                     _is_dec ? "DECODE" : "PREFILL", step_size_p2, cache_to_p2,
+                     cache_key_dim.height(), num_heads_Q, num_heads_KV, head_dim,
+                     (int)svm_ok, (int)_ohwi_force,
+                     (int)(query_step.getMemoryData() &&
+                           query_step.getMemoryData()->isSVM()),
+                     (int)(cache_key.getMemoryData() &&
+                           cache_key.getMemoryData()->isSVM()),
+                     (int)(cache_value.getMemoryData() &&
+                           cache_value.getMemoryData()->isSVM()),
+                     (int)(attention_output_step.getMemoryData() &&
+                           attention_output_step.getMemoryData()->isSVM()));
         std::fflush(stderr);
       }
       if (svm_ok || _ohwi_force) {
@@ -1935,7 +1999,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // minimum prefill length: for decode (step_size == 1) the per-row dot
   // path is preferred (no benefit from blocking + softmax bookkeeping).
   constexpr unsigned int FLASH_MIN_PREFILL = 32;
-  if (use_gemm_attention && step_size >= FLASH_MIN_PREFILL) {
+  // S3 (decode GPU attention): NNTR_MHA_GPU_DECODE lets step_size==1 (decode)
+  // enter the GPU attention block too. The KV-image (kvimg_view) path scatters
+  // the single new token into the mirrors and reads the full N_kv context, so
+  // M=1 is handled; otherwise decode falls to the host compute_kcaches NEON
+  // path (a per-layer GPU->host queue drain). Pays off only with the host
+  // RoPE/v_norm drains also removed (land S1+S2+S3 as a SET).
+  static const bool _mha_gpu_decode =
+    std::getenv("NNTR_MHA_GPU_DECODE") != nullptr;
+  if (use_gemm_attention &&
+      (step_size >= FLASH_MIN_PREFILL || (_mha_gpu_decode && step_size == 1))) {
     // GPU two-1x1-conv attention path (paper section 3.7). Env-gated via
     // NNTR_MHA_GPU=1. FP16-Q + FP16-out only; K/V is either FP16 or, when
     // kv_int8 is set, int8 + per-(token, head) FP16 scale. Falls back to
@@ -2139,11 +2212,19 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               /*src_clmem=*/v_stage_clmem);
             kv_v_valid_to = cache_to;
             const double _kvst_tv = _kvst_on() ? _kvst_now() : 0;
+            // S3 decode: OHWI rotates Q on the HOST (query_step SVM, in-place);
+            // q_attn_clmem (= q_cl, the FC output cl_mem) is NOT rotated because
+            // the GPU-RoPE staging path is gated off for OHWI. Binding it would
+            // feed the qk kernel an UNROTATED Q -> degenerate decode attention.
+            // For decode (step_size==1) pass null so the kernel reads Q_p (the
+            // host-rotated SVM query). Prefill keeps q_attn_clmem (the prefill
+            // RoPE/residency path keeps it consistent).
+            void *q_clmem_use = (step_size == 1) ? nullptr : q_attn_clmem;
             ok = nntrainer::two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
               Q_p, reinterpret_cast<cl_mem>(k_image_ohwi),
               reinterpret_cast<cl_mem>(v_img_use), O_p, step_size, cache_to,
               num_heads_Q, num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
-              attn_logit_softcapping, /*q_clmem=*/q_attn_clmem,
+              attn_logit_softcapping, /*q_clmem=*/q_clmem_use,
               /*o_clmem=*/o_cl);
             if (_kvst_on())
               _kvst_mark_scatter(_kvst_t1, _kvst_tk, _kvst_tv, _kvst_now());
