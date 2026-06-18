@@ -845,8 +845,25 @@ std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
   auto [x, h] = Gemma4Transformer::constructModel();
 
   // create lm_head layer (using fully_connected option)
+  // QINT4 lm_head (S4): UNTIE from the Q6_K input embedding so the output
+  // projection runs as a v8c QINT4 GPU GEMV (dotCl_v8c, fully_connected path,
+  // ~3ms) instead of the ALU-bound gpu_native Q6_K GEMV (~17.5ms/token). The
+  // input embedding must stay Q6_K (row-gather dequant) so the two cannot share
+  // one weight; output_of_causallm carries a separate, transposed [hidden,vocab]
+  // QINT4 copy. Used by BOTH nntr_quantize (constructs this model to quantize
+  // output_of_causallm as a per-channel section-A FC weight) and inference.
+  // Gated on LMHEAD_DTYPE == QINT4 so Q6_K/Q4_0 lmheads keep the tied path.
+  // Untie is a config flag (LMHEAD_UNTIE), NOT derived from LMHEAD_DTYPE: the
+  // quantizer builds this same untied graph with an FP32 source weight
+  // (weight_dtype follows the source dtype) and the dtype map quantizes
+  // output_of_causallm to QINT4 on save; inference rebuilds it with the QINT4
+  // weight. Gating on the dtype would force a QINT4 tensor at quantize time and
+  // fail to load the FP32 source.
+  const bool lmhead_untied = LMHEAD_UNTIE;
   const std::string lmhead_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
+    lmhead_untied
+      ? "fully_connected"
+      : (TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head");
 
   // add lmhead
   std::vector<std::string> lmhead_prop = {
@@ -858,7 +875,7 @@ std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
   lmhead_prop.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(lmhead_prop, true);
 
-  if (TIE_WORD_EMBEDDINGS)
+  if (TIE_WORD_EMBEDDINGS && !lmhead_untied)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
 
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));

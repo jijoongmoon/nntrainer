@@ -133,6 +133,13 @@ protected:
   std::vector<int> pending_ids_;
 
   std::string LMHEAD_DTYPE; /** embedding dtype */
+  bool LMHEAD_UNTIE = false; /**< untie lm_head from the input embedding (Gemma4
+                                QINT4 lm_head = separate FC weight, not shared
+                                with the Q6_K input embedding). A dedicated flag
+                                (not derived from LMHEAD_DTYPE) so the quantizer
+                                builds the same untied graph from FP32 source
+                                weights while the dtype map quantizes
+                                output_of_causallm to QINT4 on save. */
   std::vector<unsigned int> EOS_TOKEN_ID;
   unsigned int BOS_TOKEN_ID;
   float TEMPERATURE;

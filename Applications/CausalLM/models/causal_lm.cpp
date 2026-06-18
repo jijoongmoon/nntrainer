@@ -71,6 +71,9 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                    ? nntr_cfg["lmhead_dtype"]
                    : nntr_cfg["embedding_dtype"];
 
+  LMHEAD_UNTIE =
+    nntr_cfg.contains("lmhead_untie") && nntr_cfg["lmhead_untie"].get<bool>();
+
   SKIP_PREFILL = nntr_cfg.contains("skip_prefill")
                    ? nntr_cfg["skip_prefill"].get<bool>()
                    : false;
