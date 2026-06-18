@@ -725,9 +725,26 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 /************************************************************** */
 
 #ifdef ENABLE_FP16
+// The RoPE LUT only needs to cover positions [0, max sequence). Models expose
+// max_position_embeddings (the theoretical RoPE max, e.g. Gemma4 = 131072) but
+// the live KV cache is only max_seq_len (e.g. 1024); sizing/uploading the LUT
+// at 131072 is a 128x waste (the rope angle theta_j is position-independent, so
+// a shorter LUT is exact). Cap to MaxTimestep (the model's max sequence).
+// NNTR_ROPE_LUT_CAP overrides for experiments. (Capping the per-layer-transition
+// re-upload from ~33-67MB to ~256-512KB was worth ~+500 TPS at M=1024.)
+unsigned int MHACoreLayer::rope_lut_positions() const {
+  unsigned int cap =
+    (unsigned int)std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
+  if (const char *e = std::getenv("NNTR_ROPE_LUT_CAP"))
+    cap = (unsigned int)std::atoi(e);
+  if (cap == 0 || cap > max_position_embeddings)
+    cap = max_position_embeddings;
+  return cap;
+}
+
 void MHACoreLayer::ensure_rope_flat_lut() {
   const unsigned int half_ = head_dim / 2;
-  const unsigned int mp = max_position_embeddings;
+  const unsigned int mp = rope_lut_positions();
   if (rope_flat_theta == theta && rope_flat_pos == mp &&
       rope_flat_hd == (int)head_dim)
     return;
@@ -1436,9 +1453,19 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     const char *e = std::getenv("NNTR_MHA_CLMEM");
     return !(e && e[0] == '0');
   }();
-  // Kill-switch: NNTR_NO_KV_STAGE=1 restores the per-op drains.
+  // The cl_mem staging temps (q_stage/k_stage, tca_ensure device buffers) are
+  // NOT coherent with the in-order SVM queue on Adreno: scatter/qk read garbage
+  // from them at M>=32 (bisected 2026-06-18; the non-staged path, which routes
+  // the GPU RoPE through the planner cl_mem q_cl in-place + the SVM cache, IS
+  // coherent -- e.g. gemma4 "what is the capital of South Korea" -> "Seoul").
+  // So staging is DISABLED BY DEFAULT. The non-staged path is still GPU-resident
+  // (no host RoPE bounce) and, after the RoPE-LUT cap fix (rope_lut_positions),
+  // is within ~2% of the broken-staged TPS at M=1024 (1520 vs 1556). Opt back
+  // into staging with NNTR_KV_STAGE=1 (to test an SVM-backed staging fix);
+  // NNTR_NO_KV_STAGE still force-disables.
   static const bool kv_stage_on =
     std::getenv("NNTR_KV_IMG_ATTN") != nullptr &&
+    std::getenv("NNTR_KV_STAGE") != nullptr &&
     std::getenv("NNTR_NO_KV_STAGE") == nullptr;
   void *k_stage = nullptr;                 // rope-K wrote the staging temp
   const uint16_t *v_stage_svm = nullptr;   // v_scatter source (value_step)
@@ -1532,7 +1559,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       // Flat [max_pos, half_d] cos/sin LUT (fp16 bits) from the cached trig
       // table. Built once (cached by theta/head_dim/max_pos) so the GPU RoPE
       // path has no per-call flatten; rope_inplace_f16_cl uploads it once.
-      const unsigned int mp = max_position_embeddings;
+      const unsigned int mp = rope_lut_positions();
       if (mp >= cache_index + (to - from)) {
         ensure_rope_flat_lut();
         const double _mha_t_lut = _kvst_on() ? _kvst_now() : 0;
