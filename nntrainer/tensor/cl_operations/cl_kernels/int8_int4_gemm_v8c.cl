@@ -960,9 +960,11 @@ __kernel void v8c_gemv_int8_int4_coop(
   const int K32 = K >> 5;
   // Stage the act row in LDS once per workgroup: the 8 column lanes
   // otherwise each load the SAME act uint4s (2 of 3 load issues were
-  // redundant act traffic). 64 WIs load it coalesced; K <= 10240 is
-  // guaranteed by the host-side dispatch guard (640 uint4 = 10 KB LDS).
-  __local uint4 axl[640];
+  // redundant act traffic). 64 WIs load it coalesced; K <= 12288 is
+  // guaranteed by the host-side dispatch guard (768 uint4 = 12 KB LDS).
+  // 12288 covers Gemma4's double-wide-MLP FFN-down (K=12288) which previously
+  // exceeded the 10240 cap and fell to the ~15x slower m1 GEMM at decode.
+  __local uint4 axl[768];
   const int K16 = K >> 4;
   for (int i = t; i < K16; i += 64)
     axl[i] = Xbuf[i];

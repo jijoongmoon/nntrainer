@@ -2088,9 +2088,12 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     const char *e = getenv("NNTR_GEMV_COOP");
     return !e || atoi(e) != 0;
   }();
-  // K cap: the coop kernel stages the act row in a 640-uint4 LDS array.
+  // K cap: the coop kernel stages the act row in a 768-uint4 LDS array
+  // (12 KB). 12288 admits Gemma4's double-wide-MLP FFN-down (K=12288), which
+  // previously exceeded the old 10240 cap and fell to the ~15x slower m1 GEMM
+  // at decode (measured 2389us vs 158us/call).
   if (!buf_kernel && M <= 4 && gemv_coop && (N % 8) == 0 && (K % 32) == 0 &&
-      K <= 10240) {
+      K <= 12288) {
     cl_mem wbuf = nullptr, abuf = nullptr;
     clGetImageInfo(weight_image, CL_IMAGE_BUFFER, sizeof(cl_mem), &wbuf,
                    nullptr);
@@ -2939,8 +2942,19 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
   blas_cc->command_queue_inst_.setNextProfileLabel(":lmhead_q6k");
   std::array<size_t, 3> gws = {(size_t)vocab * 64, 1, 1};
   std::array<size_t, 3> lws = {64, 1, 1};
+  static const bool split_tprof = std::getenv("NNTR_LMHEAD_TPROF") != nullptr;
+  const auto t_pre_kernel = std::chrono::steady_clock::now();
   blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
                                              lws.data(), 0, nullptr, nullptr);
+
+  // NNTR_LMHEAD_TPROF: split the kernel vs readback cost (adds a clFinish, so
+  // measurement only) to decide whether to optimize the GEMV kernel or the
+  // host-readback path.
+  std::chrono::steady_clock::time_point t_post_kernel;
+  if (split_tprof) {
+    clFinish(q);
+    t_post_kernel = std::chrono::steady_clock::now();
+  }
 
   // Blocking readback = the decode-step GPU->host boundary (one per token).
   const auto t_pre_read = std::chrono::steady_clock::now();
@@ -2953,10 +2967,20 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
   if (announced < 6) {
     ++announced;
     const auto t_end = std::chrono::steady_clock::now();
-    std::fprintf(
-      stderr, "[lmhead-q6k] call#%d V=%u H=%u drain+gemv+read=%.2f ms\n",
-      announced, vocab, hidden,
-      std::chrono::duration<double, std::milli>(t_end - t_pre_read).count());
+    if (split_tprof)
+      std::fprintf(
+        stderr,
+        "[lmhead-q6k] call#%d V=%u H=%u kernel=%.2f read=%.2f total=%.2f ms\n",
+        announced, vocab, hidden,
+        std::chrono::duration<double, std::milli>(t_post_kernel - t_pre_kernel)
+          .count(),
+        std::chrono::duration<double, std::milli>(t_end - t_post_kernel).count(),
+        std::chrono::duration<double, std::milli>(t_end - t_pre_kernel).count());
+    else
+      std::fprintf(
+        stderr, "[lmhead-q6k] call#%d V=%u H=%u drain+gemv+read=%.2f ms\n",
+        announced, vocab, hidden,
+        std::chrono::duration<double, std::milli>(t_end - t_pre_read).count());
   }
   return true;
 }
