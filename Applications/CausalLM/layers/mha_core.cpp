@@ -1553,8 +1553,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
     constexpr unsigned int ROPE_MIN_PREFILL = 32; // matches FLASH_MIN_PREFILL
+    // S3 decode: NNTR_MHA_GPU_DECODE moves the M=1 decode RoPE onto the GPU so Q
+    // stays SVM-resident (q_cl handled in-place) and lower_q/lower_kv become
+    // no-ops -- those are clEnqueueReadBuffer(CL_TRUE) blocking drains that cost
+    // ~65 ms/token (35 layers x 2) on the host-RoPE decode path.
+    static const bool _gpu_rope_decode =
+      std::getenv("NNTR_MHA_GPU_DECODE") != nullptr;
+    const bool _rope_len_ok = (to - from) >= ROPE_MIN_PREFILL ||
+                              (_gpu_rope_decode && (to - from) == 1);
     if (!_gpu_rope_off && _mha_gpu_on && use_gemm_attention && !kv_int8 &&
-        !kv_ohwi_now && (to - from) >= ROPE_MIN_PREFILL &&
+        !kv_ohwi_now && _rope_len_ok &&
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       // Flat [max_pos, half_d] cos/sin LUT (fp16 bits) from the cached trig
       // table. Built once (cached by theta/head_dim/max_pos) so the GPU RoPE
@@ -2316,10 +2324,20 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             (local_window_size >= (size_t)cache_to)
               ? 0u
               : (unsigned int)local_window_size;
-          ok = nntrainer::flash_attention_prefill_f16_cl(
-            Q_p, K_p, V_p, O_p, step_size, cache_to, num_heads_Q, num_heads_KV,
-            head_dim, /*max_seq_len=*/0u, is_causal, /*svm_inputs=*/true,
-            attn_logit_softcapping, /*local_window=*/win);
+          // Decode (step_size==1): single query starves blockq/coop_vec
+          // (num_heads_Q groups). flash_decode splits the KV axis into chunks
+          // (num_heads_Q * n_chunks groups) for parallelism. Falls back to the
+          // prefill flash kernel on shape mismatch / softcap.
+          if (step_size == 1)
+            ok = nntrainer::flash_decode_f16_cl(
+              Q_p, K_p, V_p, O_p, cache_to, num_heads_Q, num_heads_KV, head_dim,
+              /*max_seq_len=*/0u, /*svm_inputs=*/true, attn_logit_softcapping,
+              /*local_window=*/win);
+          if (!ok)
+            ok = nntrainer::flash_attention_prefill_f16_cl(
+              Q_p, K_p, V_p, O_p, step_size, cache_to, num_heads_Q, num_heads_KV,
+              head_dim, /*max_seq_len=*/0u, is_causal, /*svm_inputs=*/true,
+              attn_logit_softcapping, /*local_window=*/win);
         }
         // image2d_from_buffer variant gated by NNTR_MHA_GPU_IMG=1. Uses 8-half
         // texel loads (RGBA UINT32) for the d-axis reduction, ~8x fewer

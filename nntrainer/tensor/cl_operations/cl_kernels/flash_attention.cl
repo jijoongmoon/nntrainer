@@ -373,6 +373,8 @@ __kernel void flash_attention_prefill_f16_coop(
 #define FV_VSTORE(v, off, p) vstore8((v), (off), (p))
 #define FV_CVT_F(v) convert_float8(v)
 #define FV_CVT_H(v) convert_half8(v)
+#define FV_VLOAD_F(p, off) vload8((off), (p))
+#define FV_VSTORE_F(v, off, p) vstore8((v), (off), (p))
 #elif FLASH_VEC_VPL == 4
 #define FVHALF half4
 #define FVFLOAT float4
@@ -380,6 +382,8 @@ __kernel void flash_attention_prefill_f16_coop(
 #define FV_VSTORE(v, off, p) vstore4((v), (off), (p))
 #define FV_CVT_F(v) convert_float4(v)
 #define FV_CVT_H(v) convert_half4(v)
+#define FV_VLOAD_F(p, off) vload4((off), (p))
+#define FV_VSTORE_F(v, off, p) vstore4((v), (off), (p))
 #elif FLASH_VEC_VPL == 2
 #define FVHALF half2
 #define FVFLOAT float2
@@ -387,6 +391,8 @@ __kernel void flash_attention_prefill_f16_coop(
 #define FV_VSTORE(v, off, p) vstore2((v), (off), (p))
 #define FV_CVT_F(v) convert_float2(v)
 #define FV_CVT_H(v) convert_half2(v)
+#define FV_VLOAD_F(p, off) vload2((off), (p))
+#define FV_VSTORE_F(v, off, p) vstore2((v), (off), (p))
 #else
 #error FLASH_VEC_VPL must be 2 4 or 8 set FLASH_VEC_LWS to half quarter eighth of d
 #endif
@@ -738,4 +744,124 @@ __kernel void flash_attention_prefill_f16_blockq(
     const FVHALF o_reg = FV_CVT_H(acc_reg[r] * inv);
     FV_VSTORE(o_reg, (o_base + lane0) / VPL, O);
   }
+}
+
+// ===========================================================================
+// FLASH-DECODING (split-KV) for M=1 decode. The decode query is a single row,
+// so blockq/coop_vec only spawn num_heads_q workgroups (the EU array starves).
+// Here the KV axis is split into n_chunks: gws = num_heads_q * n_chunks groups,
+// each running online softmax over its KV chunk and writing an UNNORMALIZED
+// partial (acc[d] fp32 + running max m + denom l). flash_decode_reduce then
+// combines the n_chunks partials per head. Mirrors vLLM / llama.cpp
+// flash-decoding. M=1 query is row 0; the query is the LAST position so causal
+// needs no mask (every key 0..N_kv-1 is valid); Gemma4 sliding window keeps
+// only keys [N_kv-W, N_kv). Reuses FLASH_VEC_* (VPL = d / LWS half vloads).
+__kernel void flash_decode_partial(
+    __global const half  *Q,           // [1, HD_Q]
+    __global const half  *K,           // OHWI [H_kv,S_max,d] or concat [N_kv,HD_KV]
+    __global const half  *V,           // [N_kv, HD_KV]
+    __global       float *part_acc,    // [H_q][n_chunks][d] fp32 (unnormalized)
+    __global       float *part_ml,     // [H_q][n_chunks][2] fp32 (m, l)
+    const int N_kv, const int d, const int HD_Q, const int HD_KV, const int gqa,
+    const float scale, const int k_stride, const int local_window,
+    const int chunk_kv, const int n_chunks) {
+  const int lid = get_local_id(0);
+  const int grp = get_group_id(0);     // -> (head_q, chunk)
+  const int head_q = grp / n_chunks;
+  const int chunk  = grp % n_chunks;
+  if (head_q >= (HD_Q / d))
+    return;
+  const int head_kv = head_q / gqa;
+  const long k_head_base =
+      (k_stride > 0) ? ((long)head_kv * (long)k_stride * (long)d)
+                     : ((long)head_kv * (long)d);
+  const long k_row_stride = (k_stride > 0) ? (long)d : (long)HD_KV;
+  const long q_base = (long)head_q * d; // M=1: query row 0
+
+  const int VPL = FLASH_VEC_VPL;
+  const int lane0 = lid * VPL;
+  const FVFLOAT q_reg = FV_CVT_F(FV_VLOAD(Q, (q_base + lane0) / VPL));
+  FVFLOAT acc_reg = (FVFLOAT)(0.0f);
+  float m_i = -INFINITY, l_i = 0.0f;
+
+  // This chunk's KV range, clipped to the sliding window low bound.
+  int n0 = chunk * chunk_kv;
+  int n1 = min(n0 + chunk_kv, N_kv);
+  const int win_start =
+      (local_window > 0 && local_window < N_kv) ? (N_kv - local_window) : 0;
+  if (n0 < win_start)
+    n0 = win_start;
+
+  __local float red_sh[FLASH_VEC_BLOCK_KV * FLASH_VEC_LWS];
+  for (int nb0 = n0; nb0 < n1; nb0 += FLASH_VEC_BLOCK_KV) {
+    const int nb = min(FLASH_VEC_BLOCK_KV, n1 - nb0);
+    for (int j = 0; j < nb; ++j) {
+      const long k_base = k_head_base + (long)(nb0 + j) * k_row_stride;
+      const FVFLOAT k_reg = FV_CVT_F(FV_VLOAD(K, (k_base + lane0) / VPL));
+      red_sh[j * FLASH_VEC_LWS + lid] = fv_hsum(q_reg * k_reg);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = FLASH_VEC_LWS >> 1; off > 0; off >>= 1) {
+      if (lid < off)
+        for (int j = 0; j < nb; ++j)
+          red_sh[j * FLASH_VEC_LWS + lid] +=
+              red_sh[j * FLASH_VEC_LWS + lid + off];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (int j = 0; j < nb; ++j) {
+      const float s = scale * red_sh[j * FLASH_VEC_LWS];
+      const float m_new = fmax(m_i, s);
+      const float alpha = exp(m_i - m_new);
+      const float p = exp(s - m_new);
+      const long v_base = (long)(nb0 + j) * HD_KV + (long)head_kv * d;
+      const FVFLOAT v_reg = FV_CVT_F(FV_VLOAD(V, (v_base + lane0) / VPL));
+      acc_reg = alpha * acc_reg + p * v_reg;
+      l_i = alpha * l_i + p;
+      m_i = m_new;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  // Unnormalized partial. l_i==0 => empty chunk (fully window-masked).
+  const long pa = ((long)head_q * n_chunks + chunk) * d;
+  FV_VSTORE_F(acc_reg, (pa + lane0) / VPL, part_acc);
+  if (lid == 0) {
+    const long pm = ((long)head_q * n_chunks + chunk) * 2;
+    part_ml[pm + 0] = (l_i > 0.0f) ? m_i : -INFINITY;
+    part_ml[pm + 1] = l_i;
+  }
+}
+
+// Flash-decoding REDUCE: combine the n_chunks partials per head -> O[1, HD_Q].
+__kernel void flash_decode_reduce(
+    __global const float *part_acc,    // [H_q][n_chunks][d]
+    __global const float *part_ml,     // [H_q][n_chunks][2]
+    __global       half  *O,           // [1, HD_Q]
+    const int d, const int HD_Q, const int n_chunks) {
+  const int lid = get_local_id(0);
+  const int head_q = get_group_id(0);
+  if (head_q >= (HD_Q / d))
+    return;
+  const int VPL = FLASH_VEC_VPL;
+  const int lane0 = lid * VPL;
+
+  float m_g = -INFINITY;
+  for (int c = 0; c < n_chunks; ++c)
+    m_g = fmax(m_g, part_ml[((long)head_q * n_chunks + c) * 2 + 0]);
+
+  FVFLOAT acc_g = (FVFLOAT)(0.0f);
+  float l_g = 0.0f;
+  for (int c = 0; c < n_chunks; ++c) {
+    const float m_c = part_ml[((long)head_q * n_chunks + c) * 2 + 0];
+    const float l_c = part_ml[((long)head_q * n_chunks + c) * 2 + 1];
+    if (l_c <= 0.0f)
+      continue; // empty (window-masked) chunk
+    const float w = exp(m_c - m_g);
+    const long pa = ((long)head_q * n_chunks + c) * d;
+    const FVFLOAT acc_c = FV_VLOAD_F(part_acc, (pa + lane0) / VPL);
+    acc_g += w * acc_c;
+    l_g += w * l_c;
+  }
+  const float inv = (l_g > 0.0f) ? (1.0f / l_g) : 0.0f;
+  const long o_base = (long)head_q * d;
+  FV_VSTORE(FV_CVT_H(acc_g * inv), (o_base + lane0) / VPL, O);
 }

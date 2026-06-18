@@ -317,6 +317,19 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
                                     float attn_softcap = 0.0f,
                                     unsigned int local_window = 0u);
 
+/// Flash-decoding (split-KV) for M=1 decode: KV axis split into chunks so
+/// gws = num_heads_Q * n_chunks workgroups (restores parallelism the single
+/// decode query starves on the blockq/coop_vec path). Two passes (partial +
+/// reduce) via cl_mem partial buffers. SVM Q/K/V/O. Gemma4 only (softcap<=0).
+/// Returns false on shape mismatch / softcap>0; caller falls back to flash.
+bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
+                         const uint16_t *V_host, uint16_t *O_host,
+                         unsigned int N_kv, unsigned int num_heads_Q,
+                         unsigned int num_heads_KV, unsigned int head_dim,
+                         unsigned int max_seq_len, bool svm_inputs = false,
+                         float attn_softcap = 0.0f,
+                         unsigned int local_window = 0u);
+
 /**
  * @brief Pre-build the rope/scatter/copy kernel PROGRAM (rope_inplace source,
  *        file-local to attention_kernels.cpp) on the given context. Called from

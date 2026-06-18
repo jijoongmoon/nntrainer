@@ -2977,4 +2977,123 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
   return true;
 }
 
+// Flash-decoding (split-KV) for M=1 decode. Splits the KV axis into n_chunks so
+// gws = num_heads_Q * n_chunks workgroups (vs num_heads_Q for blockq/coop_vec),
+// restoring parallelism the single decode query otherwise starves. Pass 1
+// (flash_decode_partial) writes per-(head,chunk) unnormalized partials; pass 2
+// (flash_decode_reduce) combines them online-softmax per head into O. SVM Q/K/V/O
+// + cl_mem partial buffers. Gemma4 only (no attn-logit softcap).
+bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
+                         const uint16_t *V_host, uint16_t *O_host,
+                         unsigned int N_kv, unsigned int num_heads_Q,
+                         unsigned int num_heads_KV, unsigned int head_dim,
+                         unsigned int max_seq_len, bool svm_inputs,
+                         float attn_softcap, unsigned int local_window) {
+  if (num_heads_Q == 0 || num_heads_KV == 0 || head_dim == 0 || N_kv == 0)
+    return false;
+  if (num_heads_Q % num_heads_KV != 0)
+    return false;
+  if (!svm_inputs)
+    return false;
+  if (attn_softcap > 0.0f)
+    return false; // decode kernel has no softcap (Gemma2); Gemma4 only
+
+  // LWS so VPL = head_dim / LWS in {1..8} (half2/4/8 vloads): d=256->32,
+  // d=512->64, d=128->16.
+  const int lws = (head_dim >= 512) ? 64 : ((head_dim > 128) ? 32 : 16);
+  if ((int)head_dim % lws != 0 || (int)head_dim / lws > 8 ||
+      (int)head_dim / lws < 1)
+    return false;
+  const int block_kv = 4; // FLASH_VEC_BLOCK_KV
+
+  static const int chunk_kv = []() {
+    const char *e = std::getenv("NNTR_FLASH_DEC_CHUNK");
+    // 64 KV/chunk measured best (more chunks = more parallelism for the lone
+    // decode query): Gemma4 long-ctx decode 7.15 (chunk 256) -> 7.74 (64).
+    return (e && std::atoi(e) > 0) ? std::atoi(e) : 64;
+  }();
+  const int n_chunks = (int)((N_kv + chunk_kv - 1) / chunk_kv);
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+
+  const int HD_Q = (int)(num_heads_Q * head_dim);
+  const int HD_KV = (int)(num_heads_KV * head_dim);
+  const int k_stride = (int)max_seq_len; // >0 OHWI, 0 concat
+
+  const std::string copts = "-DFLASH_VEC_LWS=" + std::to_string(lws) +
+                            " -DFLASH_VEC_BLOCK_KV=" + std::to_string(block_kv) +
+                            " -DFLASH_VEC_D=" + std::to_string((int)head_dim);
+
+  static void *part_acc = nullptr, *part_ml = nullptr;
+  static size_t pa_cap = 0, pm_cap = 0;
+  const size_t pa_bytes =
+    (size_t)num_heads_Q * n_chunks * head_dim * sizeof(float);
+  const size_t pm_bytes = (size_t)num_heads_Q * n_chunks * 2 * sizeof(float);
+  if (!ensure_cl_stage_buf(&part_acc, &pa_cap, pa_bytes) ||
+      !ensure_cl_stage_buf(&part_ml, &pm_cap, pm_bytes))
+    return false;
+  cl_mem pa_clmem = (cl_mem)part_acc;
+  cl_mem pm_clmem = (cl_mem)part_ml;
+
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    flash_attention_kernel, "flash_decode_partial", copts);
+  ClContext::SharedPtrClKernel kr = blas_cc->registerClKernel(
+    flash_attention_kernel, "flash_decode_reduce", copts);
+  if (!kp || !kr)
+    return false;
+
+  static const bool _inorder_q = std::getenv("NNTR_GPU_SVM_POOL") != nullptr;
+  if (!_inorder_q)
+    clFinish(q);
+
+  const float scale = 1.0f / std::sqrt((float)head_dim);
+  int Ni = (int)N_kv, di = (int)head_dim, hq = HD_Q, hkv = HD_KV;
+  int gqa = (int)(num_heads_Q / num_heads_KV);
+  int ks = k_stride;
+  int win_i = (local_window > 0 && local_window < N_kv) ? (int)local_window : 0;
+  int ck = chunk_kv, nc = n_chunks;
+
+  if (!kp->SetKernelSVMArguments(0, const_cast<uint16_t *>(Q_host)) ||
+      !kp->SetKernelSVMArguments(1, const_cast<uint16_t *>(K_host)) ||
+      !kp->SetKernelSVMArguments(2, const_cast<uint16_t *>(V_host)) ||
+      !kp->SetKernelArguments(3, &pa_clmem, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(4, &pm_clmem, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(5, &Ni, sizeof(int)) ||
+      !kp->SetKernelArguments(6, &di, sizeof(int)) ||
+      !kp->SetKernelArguments(7, &hq, sizeof(int)) ||
+      !kp->SetKernelArguments(8, &hkv, sizeof(int)) ||
+      !kp->SetKernelArguments(9, &gqa, sizeof(int)) ||
+      !kp->SetKernelArguments(10, &scale, sizeof(float)) ||
+      !kp->SetKernelArguments(11, &ks, sizeof(int)) ||
+      !kp->SetKernelArguments(12, &win_i, sizeof(int)) ||
+      !kp->SetKernelArguments(13, &ck, sizeof(int)) ||
+      !kp->SetKernelArguments(14, &nc, sizeof(int)))
+    return false;
+  {
+    std::array<size_t, 1> gws = {(size_t)num_heads_Q * (size_t)n_chunks *
+                                 (size_t)lws};
+    std::array<size_t, 1> lwsa = {(size_t)lws};
+    blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
+                                               lwsa.data(), 0, nullptr, nullptr);
+  }
+  if (!kr->SetKernelArguments(0, &pa_clmem, sizeof(cl_mem)) ||
+      !kr->SetKernelArguments(1, &pm_clmem, sizeof(cl_mem)) ||
+      !kr->SetKernelSVMArguments(2, O_host) ||
+      !kr->SetKernelArguments(3, &di, sizeof(int)) ||
+      !kr->SetKernelArguments(4, &hq, sizeof(int)) ||
+      !kr->SetKernelArguments(5, &nc, sizeof(int)))
+    return false;
+  {
+    std::array<size_t, 1> gws = {(size_t)num_heads_Q * (size_t)lws};
+    std::array<size_t, 1> lwsa = {(size_t)lws};
+    blas_cc->command_queue_inst_.enqueueKernel(kr->GetKernel(), 1, gws.data(),
+                                               lwsa.data(), 0, nullptr, nullptr);
+  }
+  if (!_inorder_q)
+    clFinish(q);
+  return true;
+}
+
 } // namespace nntrainer
