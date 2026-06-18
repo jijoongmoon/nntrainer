@@ -16,6 +16,7 @@
 #include <cmath>
 
 #include <app_context.h>
+#include <cl_context.h>
 #include <engine.h>
 #include <llm_util.hpp>
 #include <logit_softcapping.h>
@@ -298,6 +299,7 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
       withKey("epsilon", std::to_string(NORM_EPS)),
       withKey("feature_size", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
       withKey("packed", "false"),
+      withKey("engine", causallm_engine()), // S1.1: GPU_CLMEM output, no map
     }));
   Tensor normalized_projection = projection_norm(scaled_projection);
 
@@ -546,7 +548,8 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   std::vector<std::string> q_norm_params = {
     withKey("name", Q_norm), withKey("packed", "false"),
     withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(curr_head_dim))};
+    withKey("feature_size", std::to_string(curr_head_dim)),
+    withKey("engine", causallm_engine())}; // S1.1: GPU_CLMEM output, no map
   appendSkipPrefillIfNeeded(q_norm_params, is_kv_shared_layer);
   LayerHandle q_norm(createLayer("reshaped_rms_norm", q_norm_params));
   Tensor q_normed = q_norm(q);
@@ -676,7 +679,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   std::vector<std::string> q_norm_params = {
     withKey("name", Q_norm), withKey("packed", "false"),
     withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(curr_head_dim))};
+    withKey("feature_size", std::to_string(curr_head_dim)),
+    withKey("engine", causallm_engine())}; // S1.1: GPU_CLMEM output, no map
   appendSkipPrefillIfNeeded(q_norm_params, is_kv_shared_layer);
   LayerHandle q_norm(createLayer("reshaped_rms_norm", q_norm_params));
   Tensor q_normed = q_norm(q);
@@ -696,7 +700,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   std::vector<std::string> k_norm_params = {
     withKey("name", K_norm), withKey("packed", "false"),
     withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(curr_head_dim))};
+    withKey("feature_size", std::to_string(curr_head_dim)),
+    withKey("engine", causallm_engine())}; // S1.1: GPU_CLMEM output, no map
   appendSkipPrefillIfNeeded(k_norm_params, is_kv_shared_layer);
   LayerHandle k_norm(createLayer("reshaped_rms_norm", k_norm_params));
   Tensor k_normed = k_norm(k);
@@ -705,7 +710,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   std::vector<std::string> v_norm_params = {
     withKey("name", V_norm), withKey("packed", "false"),
     withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(curr_head_dim))};
+    withKey("feature_size", std::to_string(curr_head_dim)),
+    withKey("engine", causallm_engine())}; // S1.1: GPU_CLMEM output, no map
   v_norm_params.push_back(withKey("use_gamma", "false"));
   appendSkipPrefillIfNeeded(v_norm_params, is_kv_shared_layer);
   LayerHandle v_norm(createLayer("reshaped_rms_norm", v_norm_params));
@@ -834,6 +840,28 @@ void Gemma4Transformer::registerCustomLayers() {
   tryRegister(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
   tryRegister(nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
   tryRegister(nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
+
+  // S1.1: register ReshapedRMSNormLayer on the GPU (cl) context too, so the
+  // q/k/v_norm + per_layer_projection_norm built with engine=GPU resolve here
+  // (engine=GPU routes the factory lookup to cl_context). The SAME class runs
+  // on both backends -- it already dispatches the GPU rmsnorm kernel when its
+  // operands are SVM/cl_mem-resident. With engine=GPU its OUTPUT is classified
+  // GPU_CLMEM (no trailing blocking SVM map). MUST pair with NNTR_VNORM_GPU=1
+  // (S1.2): v_norm/PLE-norm are gamma-free and would otherwise take the host
+  // FP32 fallback, whose CPU Tensor ops (clone/multiply_i) crash on
+  // gpu-context-allocated tensors. q/k_norm have gamma so take the GPU coop
+  // path regardless.
+  auto cl_context = static_cast<nntrainer::ClContext *>(
+    ct_engine.getRegisteredContext("gpu"));
+  if (cl_context != nullptr) {
+    try {
+      cl_context->registerFactory(
+        nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    } catch (std::invalid_argument &e) {
+      std::cerr << "failed to register reshaped_rms_norm on gpu ctx: "
+                << e.what() << std::endl;
+    }
+  }
 }
 
 void Gemma4CausalLM::registerCustomLayers() {

@@ -121,18 +121,20 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     // gamma weight; fall back to the host path when use_gamma is false.
     const bool use_svm = gamma && in_md && in_md->isSVM() && out_md &&
                          out_md->isSVM() && gamma_md && gamma_md->isSVM();
-    // S2 gamma-free GPU v_norm (NNTR_VNORM_GPU): Gemma4 v_norm sets
+    // S2 gamma-free GPU v_norm (S1.2, default-ON): Gemma4 v_norm/PLE-norm set
     // use_gamma=false, so there is no gamma weight and the path above falls to
     // the host (cl_queue_finish + 2x blocking SVM map + FP32 intrinsic + unmap,
-    // ~0.18 ms/call x ~30 calls/token). Route it to the gamma-free coop kernel
-    // (rmsnorm_cl_fp16_coop_ng) when in/out are SVM FP16: the kernel does the
-    // sum-of-squares in fp32 (overflow-safe like the host intrinsic) and skips
-    // the gamma fold. Standalone this only moves the host wait to the next drain
-    // (measured ~0 TPS), so it is gated and meant to pair with the GPU decode
-    // attention (NNTR_MHA_GPU_DECODE) that consumes the V it produces.
-    static const bool vnorm_gpu = std::getenv("NNTR_VNORM_GPU") != nullptr;
+    // ~0.18 ms/call x ~30 calls/token = ~15 full queue drains/token). Route it
+    // to the gamma-free coop kernel (rmsnorm_cl_fp16_coop_ng) when in/out are
+    // SVM FP16: the kernel does the sum-of-squares in fp32 (overflow-safe like
+    // the host intrinsic) and skips the gamma fold. DEFAULT-ON now (kill-switch
+    // NNTR_VNORM_HOST): with the S1.1 engine key the gamma-free norms are
+    // GPU-context layers, so the host fallback's CPU Tensor ops (clone/
+    // multiply_i) would crash on gpu-allocated tensors -- the GPU path is
+    // required, not optional. Coupled with S1.1 this measured 18.9 -> 23 TPS.
+    static const bool vnorm_host = std::getenv("NNTR_VNORM_HOST") != nullptr;
     const bool use_svm_ng =
-      !gamma && vnorm_gpu && in_md && in_md->isSVM() && out_md &&
+      !gamma && !vnorm_host && in_md && in_md->isSVM() && out_md &&
       out_md->isSVM() &&
       in_step.getDataType() == ml::train::TensorDim::DataType::FP16;
     // NNTR_DEVRES Step 3 diagnostic: why is rmsnorm host? Log which operand is
