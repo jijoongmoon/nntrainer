@@ -141,6 +141,23 @@ void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
   output_dims[0] = in_dim;
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
 
+  // CausalLM lm_head (name "output_of_causallm"): an untied QINT4 vocab
+  // projection (unit=vocab). It is skip_prefill, so it only ever computes the
+  // last position (decode M=1) -- the prefill rows are never written. Planning
+  // its output at the full graph-build height (INIT_SEQ_LEN) makes a vocab-wide
+  // activation tensor (e.g. 1024*262144*2 = 512MB for Gemma4) that the pool
+  // allocates as device cl_mem up front yet never uses past row 0, adding ~1GB
+  // of resident-but-dead GPU memory -> global bandwidth pressure that uniformly
+  // slows every decode kernel (measured: untied decode ~5.5 vs tied ~12.7 TPS,
+  // with identical transformer weights). Force height=1, mirroring the tied
+  // tie_word_embedding lm_head which does the same. Math-identical (rows>0 were
+  // never produced). NNTR_LMHEAD_OUT_FULL restores the old full-height planning.
+  if (skip_prefill && context.getName() == "output_of_causallm") {
+    static const bool keep_full = std::getenv("NNTR_LMHEAD_OUT_FULL") != nullptr;
+    if (!keep_full)
+      output_dims[0].height(1);
+  }
+
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});
 
