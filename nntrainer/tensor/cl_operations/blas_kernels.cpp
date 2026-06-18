@@ -3001,6 +3001,179 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
   return true;
 }
 
+// Decode lm_head GEMV on a QINT4 (v8c row-major) weight buffer. For the untied
+// int4 lm_head N=vocab=262144 exceeds the image2d height cap (~16384) so
+// dotCl_v8c's image GEMM cannot run; this reads the already-built v8c row-major
+// nibble buffer directly. v8c layout (make_v8c_weight_backing_from_kai_section_a):
+// row n is K/2 contiguous bytes; within a row each 32-K block is 16 bytes at
+// kblk*16; within a 16-byte block the byte at (c*4+b) (c,b in 0..3) holds two
+// offset-encoded nibbles -- low = K(c*8+b), high = K(c*8+b+4), value = nibble-8.
+// Activation stays fp16, accumulated in fp32 (no int8 act quant -> best argmax
+// fidelity, matching q6k/fp32w lm_head). 64-WI workgroup per row, LDS-tree
+// reduce; the coalesced row read (768 B/row) streams ~0.6x the q6k table bytes
+// with a far simpler unpack.
+static const std::string lmhead_int4_v8c_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void lmhead_int4_v8c_gemv(__global const uchar *W,    // [N][K/2] nibbles
+                                   __global const half *x,      // [K] fp16 act
+                                   __global const float *scale, // [N] fp32
+                                   __global half *logits,       // [N]
+                                   const int N, const int K) {
+  const int row = get_group_id(0);
+  const int t = get_local_id(0); // 0..63
+  const int kblocks = K >> 5;    // K/32
+  __global const uchar *wr = W + (size_t)row * (size_t)(K >> 1);
+  float sum = 0.0f;
+  for (int kb = t; kb < kblocks; kb += 64) {
+    __global const uchar *blk = wr + (kb << 4); // 16 bytes
+    __global const half *xb = x + (kb << 5);    // K base for this block
+    // Vectorized: each 4-byte group c (uchar4) decodes to 8 nibbles whose K
+    // indices are contiguous -- lo nibbles -> K=[c*8 .. c*8+3], hi nibbles ->
+    // K=[c*8+4 .. c*8+7] -- so the activation is one contiguous half8 and the
+    // whole group is two dot4s.
+    for (int c = 0; c < 4; ++c) {
+      const uchar4 by = vload4(0, blk + (c << 2));
+      const float4 lo = convert_float4(convert_int4(by & (uchar4)0x0F) - 8);
+      const float4 hi = convert_float4(convert_int4(by >> (uchar4)4) - 8);
+      const float8 a = convert_float8(vload8(0, xb + (c << 3)));
+      sum += dot(a.lo, lo) + dot(a.hi, hi);
+    }
+  }
+  __local float red[64];
+  red[t] = sum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = 32; off > 0; off >>= 1) {
+    if (t < off) red[t] += red[t + off];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (t == 0) logits[row] = (half)(red[0] * scale[row]);
+}
+)CL";
+
+bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem, void *act,
+                             bool act_is_clmem, void *logits_host, bool out_fp16,
+                             unsigned int N, unsigned int K) {
+  if (K == 0 || (K % 32) != 0 || N == 0 || !w_buf_clmem || !scale_buf_clmem ||
+      !act || !logits_host)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return false;
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  if (!ctx || !q)
+    return false;
+
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(lmhead_int4_v8c_kernel, "lmhead_int4_v8c_gemv");
+  if (!kp) {
+    static int logged = 0;
+    if (!logged++)
+      std::fprintf(stderr, "[lmhead-int4] registerClKernel failed\n");
+    return false;
+  }
+
+  // Cached device logits buffer (fp16, [N]); the lm_head N never changes.
+  static cl_mem out_buf = nullptr;
+  static size_t out_cap = 0;
+  const size_t out_bytes = sizeof(uint16_t) * (size_t)N;
+  if (out_buf == nullptr || out_cap < out_bytes) {
+    if (out_buf)
+      clReleaseMemObject(out_buf);
+    cl_int e = CL_SUCCESS;
+    out_buf = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, out_bytes, nullptr, &e);
+    if (e != CL_SUCCESS || !out_buf) {
+      out_buf = nullptr;
+      out_cap = 0;
+      return false;
+    }
+    out_cap = out_bytes;
+  }
+
+  cl_mem w_buf = static_cast<cl_mem>(w_buf_clmem);
+  cl_mem scale_buf = static_cast<cl_mem>(scale_buf_clmem);
+  int Ni = (int)N, Ki = (int)K;
+  bool ok = kp->SetKernelArguments(0, &w_buf, sizeof(cl_mem));
+  if (act_is_clmem) {
+    cl_mem a = static_cast<cl_mem>(act);
+    ok = ok && kp->SetKernelArguments(1, &a, sizeof(cl_mem));
+  } else {
+    ok = ok && kp->SetKernelSVMArguments(1, act);
+  }
+  ok = ok && kp->SetKernelArguments(2, &scale_buf, sizeof(cl_mem)) &&
+       kp->SetKernelArguments(3, &out_buf, sizeof(cl_mem)) &&
+       kp->SetKernelArguments(4, &Ni, sizeof(int)) &&
+       kp->SetKernelArguments(5, &Ki, sizeof(int));
+  if (!ok)
+    return false;
+
+  blas_cc->command_queue_inst_.setNextProfileLabel(":lmhead_int4");
+  const int work_groups_count[3] = {(int)N * 64, 1, 1};
+  const int work_group_size[3] = {64, 1, 1};
+  static const bool tprof = std::getenv("NNTR_LMHEAD_TPROF") != nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!blas_cc->command_queue_inst_.DispatchCommand(kp, work_groups_count,
+                                                    work_group_size))
+    return false;
+  std::chrono::steady_clock::time_point t1;
+  if (tprof) {
+    clFinish(q);
+    t1 = std::chrono::steady_clock::now();
+  }
+
+  // Blocking readback to the host output (consumed by the host argmax/sampler).
+  if (out_fp16) {
+    if (clEnqueueReadBuffer(q, out_buf, CL_TRUE, 0, out_bytes, logits_host, 0,
+                            nullptr, nullptr) != CL_SUCCESS)
+      return false;
+  } else {
+    std::vector<uint16_t> y_host(N);
+    if (clEnqueueReadBuffer(q, out_buf, CL_TRUE, 0, out_bytes, y_host.data(), 0,
+                            nullptr, nullptr) != CL_SUCCESS)
+      return false;
+    float *o = static_cast<float *>(logits_host);
+    for (unsigned int i = 0; i < N; ++i) {
+      // fp16 -> fp32 (matches v8c_h2f / the q6k host conversion).
+      const uint16_t h = y_host[i];
+      const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+      uint32_t ex = (h >> 10) & 0x1fu, m = h & 0x3ffu, bits;
+      if (ex == 0) {
+        if (m == 0)
+          bits = s;
+        else {
+          ex = 1;
+          while ((m & 0x400u) == 0) {
+            m <<= 1;
+            ex--;
+          }
+          m &= 0x3ffu;
+          bits = s | ((ex + 112) << 23) | (m << 13);
+        }
+      } else if (ex == 0x1f) {
+        bits = s | 0x7f800000u | (m << 13);
+      } else {
+        bits = s | ((ex + 112) << 23) | (m << 13);
+      }
+      std::memcpy(&o[i], &bits, 4);
+    }
+  }
+  if (tprof) {
+    const auto t2 = std::chrono::steady_clock::now();
+    static int announced = 0;
+    if (announced < 6) {
+      ++announced;
+      std::fprintf(
+        stderr,
+        "[lmhead-int4] call#%d N=%u K=%u kernel=%.2f read+cvt=%.2f ms\n",
+        announced, N, K,
+        std::chrono::duration<double, std::milli>(t1 - t0).count(),
+        std::chrono::duration<double, std::milli>(t2 - t1).count());
+    }
+  }
+  return true;
+}
+
 // High-precision lm_head GEMV on an UNQUANTIZED FP32 weight. The Q6_K lm_head
 // (q6k_gemv_lmhead above) loses ~1.66 logit on the first-token argmax (the
 // <think> vs garbage decision on Qwen3 thinking models => garbage "noise

@@ -667,5 +667,31 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
                           float *logits_f32_host, unsigned int vocab,
                           unsigned int hidden);
 
+/**
+ * @brief Decode lm_head GEMV on a QINT4 (v8c row-major) weight buffer, for the
+ *        untied int4 lm_head whose N=vocab (262144) exceeds the image2d height
+ *        cap so dotCl_v8c's image path cannot run. Reads the already-built v8c
+ *        row-major nibble buffer directly (offset-encoded uint4, value = nibble
+ *        - 8), with the activation kept fp16 and accumulated in fp32 (no int8
+ *        act quant => best argmax fidelity, matching the q6k/fp32w lm_head
+ *        kernels): logits[n] = scale_w[n] * Σ_k act[k] * (w_nibble[n,k] - 8).
+ *        One 64-WI workgroup per vocab row, LDS-tree reduce. Reuses dotCl_v8c's
+ *        cached weight_buf + scale_buf cl_mem (no extra upload).
+ * Self-contained like lmhead_gemv_q6_k_cl: dispatches to a cached device logits
+ * buffer and reads back to the host output (the lm_head output is consumed by
+ * the host argmax/sampler), so the caller just passes its output host pointer.
+ * @param w_buf_clmem     cl_mem: v8c row-major nibbles [N][K/2] (offset-encoded)
+ * @param scale_buf_clmem cl_mem: fp32 per-channel scale [N]
+ * @param act             fp16 activation row [K] -- cl_mem if act_is_clmem else
+ *                        an SVM pointer
+ * @param logits_host     output host buffer [N], written as fp16 (out_fp16) or
+ *                        fp32
+ * @return false when the GPU path is unavailable (no CL context / kernel build
+ *         failure) -- the caller falls back.
+ */
+bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem, void *act,
+                             bool act_is_clmem, void *logits_host, bool out_fp16,
+                             unsigned int N, unsigned int K);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNELS_H__ */

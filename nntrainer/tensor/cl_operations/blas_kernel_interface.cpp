@@ -607,9 +607,20 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   try {
     e.weight_image = e.backing->imageView(ws);
   } catch (...) {
-    if (sb)
-      clReleaseMemObject(sb);
-    return nullptr;
+    // The image2d view fails when N (height) exceeds the device image cap
+    // (~16384) -- the untied int4 lm_head has N=vocab=262144. The row-major
+    // weight_buf + scale_buf are still valid, so keep the entry with a null
+    // image: dotCl_v8c routes the (M=1 decode) huge-N case to the buffer GEMV
+    // (lmhead_int4_v8c_gemv_cl) instead of failing to the CPU KAI path. Every
+    // other (image-sized) weight builds its image normally, so this only
+    // affects the oversized lm_head.
+    e.weight_image = nullptr;
+    static int logged = 0;
+    if (!logged++)
+      std::fprintf(stderr,
+                   "[v8c] image view unavailable for N=%u K=%u (>image cap); "
+                   "keeping buffer path for the GEMV\n",
+                   N, K);
   }
   auto inserted = cache.emplace(key, std::move(e));
   return &inserted.first->second;
@@ -1203,6 +1214,34 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   V8cWeightEntry *w = v8c_get_or_build_weight(weight, K, N);
   if (!w)
     return false;
+
+  // Imageless v8c weight (N > image2d height cap, e.g. the untied int4 lm_head
+  // with N=vocab=262144): the image GEMM path cannot run, so dispatch the
+  // dedicated fp-act int4 GEMV over the row-major weight buffer (best argmax
+  // fidelity; no int8 act quant). Only decode (M=1) is supported -- the lm_head
+  // FC runs only on the last position and prefill is skipped; any larger M with
+  // no image legitimately falls back to the host path.
+  if (w->weight_image == nullptr) {
+#ifdef ENABLE_FP16
+    if (M == 1 &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        (output.getDataType() == ml::train::TensorDim::DataType::FP16 ||
+         output.getDataType() == ml::train::TensorDim::DataType::FP32)) {
+      void *act = input.isClMem() ? input.getClMem()
+                                  : static_cast<void *>(input.getData<_FP16>());
+      const bool act_clmem = input.isClMem();
+      const bool out_fp16 =
+        output.getDataType() == ml::train::TensorDim::DataType::FP16;
+      void *logits_host =
+        out_fp16 ? static_cast<void *>(output.getData<_FP16>())
+                 : static_cast<void *>(output.getData<float>());
+      if (lmhead_int4_v8c_gemv_cl(w->weight_buf, w->scale_buf, act, act_clmem,
+                                  logits_host, out_fp16, N, K))
+        return true;
+    }
+#endif
+    return false;
+  }
 
   // Reused scratch buffers (grow-only pool). The weight backing + scale are
   // already cached per-weight; only the activation/output scratch scales with
