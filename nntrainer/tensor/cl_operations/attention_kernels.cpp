@@ -2341,9 +2341,13 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     // NULL-fallback). If any gws[i] % lws[i] != 0 (e.g. an lws.y that does not
     // divide mx) we fall back to NULL (driver-chosen workgroup); the log's
     // kernel time reveals it.
-    // Parse NNTR_QK_LWS once. Unset/garbage => default {16,4,1}.
+    // Parse NNTR_QK_LWS once. Unset/garbage => default {8,8,1}.
+    // 2026-06-18 re-sweep on Adreno 840 / M=999 (gemma4 prompt_1p2k, after the
+    // M_pad-align fix): {8,8,1} best (best-of-3 prefill 2430 vs {16,4,1} 2345,
+    // +3.5%); {32,2,1}/{64,1,1} regress. The old {16,4,1} (Adreno 830 / M=1024)
+    // is recoverable via NNTR_QK_LWS=16,4,1.
     static const std::array<size_t, 3> qk_lws_env = []() {
-      std::array<size_t, 3> v = {16, 4, 1}; // default (measured best, see above)
+      std::array<size_t, 3> v = {8, 8, 1}; // default (measured best, see above)
       const char *s = std::getenv("NNTR_QK_LWS");
       if (s != nullptr) {
         int a = 0, b = 0, c = 0;
@@ -2502,8 +2506,11 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     // gws[i] % lws[i] != 0 we fall back to NULL (driver-chosen workgroup).
     constexpr size_t TDX = 8;
     // Parse NNTR_SV_LWS once. "0,0,0" (or unset/garbage) => NULL lws.
+    // 2026-06-18 re-sweep on Adreno 840 / M=999 (after the M_pad-align fix):
+    // {4,16,1} best (paired with QK {8,8,1}); the old {8,8,1} (Adreno 830 /
+    // M=1024) is recoverable via NNTR_SV_LWS=8,8,1.
     static const std::array<size_t, 3> sv_lws_env = []() {
-      std::array<size_t, 3> v = {8, 8, 1}; // default (measured best, see above)
+      std::array<size_t, 3> v = {4, 16, 1}; // default (measured best, see above)
       const char *s = std::getenv("NNTR_SV_LWS");
       if (s != nullptr) {
         int a = 0, b = 0, c = 0;
