@@ -1163,24 +1163,27 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // "M not divisible by 4 → CPU fallback" cliff so v8c runs for any prefill
   // length (the 18-token Qwen3 chat-template case in particular).
   constexpr unsigned int V8C_TM = 4;
-  // M_pad alignment. The v8c GEMM dispatches gws M-axis = M_pad / V8C_TM; on
-  // the Intel/buffer path (NNTR_V8C_BUF) a non-power-of-2 M-workgroup count
-  // maps poorly to the EU array and the large-N (FFN N=9216) GEMM runs ~4.7x
-  // slower for e.g. M=842 (211 wg) vs M=1024 (256 wg). Rounding M_pad up to a
-  // coarser granularity (default 64 on the buffer path) restores the fast
-  // regime: M=842 prefill 175 -> 671 TPS, token-identical (padded rows are
-  // computed but never read back -- M-valid store guard). The Adreno/image
-  // path is NOT affected by the cliff (texture-cache GEMM) so it keeps the
-  // original V8C_TM granularity. Override with NNTR_FC_MPAD_ALIGN (mult of
-  // V8C_TM). Only applied for prefill-sized M (M >= align): decode (M=1) must
-  // never pad to 64 (that would be a 64x FC blow-up).
+  // M_pad alignment. The v8c GEMM dispatches gws M-axis = M_pad / V8C_TM; the
+  // tuned 4x16 work-group needs gws_y = M_pad/4 to be a multiple of 16, i.e.
+  // M_pad a multiple of 64, or select2dLws (cl_tensor_view.cpp) fails its
+  // divisibility gate and falls back to a NULL (driver-chosen) work-group.
+  // On BOTH paths that fallback is a cliff:
+  //   - Intel/buffer (NNTR_V8C_BUF): a non-power-of-2 M-workgroup count maps
+  //     poorly to the EU array (M=842 prefill 175 -> 671 TPS at align 64).
+  //   - Adreno/image: measured 2026-06-18 on gemma4 (M=999 -> M_pad=1000,
+  //     gws_y=250, 250%16=10 != 0 -> NULL LWS). The driver's NULL choice is
+  //     near-optimal for some N (gate/up N6144 = 5.5 TFLOP/s) but PATHOLOGICAL
+  //     for others (full-Q N4096 = 0.41, per_layer_input N8960 = 0.36 -- 13x
+  //     slower, ~28% of prefill). Forcing M_pad%64=0 restores the tuned 4x16
+  //     to every FC shape: M=1024 prefill 1527 -> ~2280 TPS (+50%), coherent.
+  // Padded rows are computed but never stored (M-valid store guard in
+  // v8c_gemm_int8_int4), so output is bit-identical. So align to 64 by default
+  // on BOTH paths. Override with NNTR_FC_MPAD_ALIGN (mult of V8C_TM). Only
+  // applied for prefill-sized M (M >= align): decode (M=1) must never pad to 64
+  // (that would be a 64x FC blow-up) -- guarded by eff_align below.
   static const unsigned int _mpad_align = []() {
     const char *e = std::getenv("NNTR_FC_MPAD_ALIGN");
-    unsigned int v;
-    if (e)
-      v = (unsigned int)std::atoi(e);
-    else
-      v = (std::getenv("NNTR_V8C_BUF") != nullptr) ? 64u : V8C_TM;
+    unsigned int v = e ? (unsigned int)std::atoi(e) : 64u;
     if (v < V8C_TM)
       v = V8C_TM;
     v = (v + V8C_TM - 1) / V8C_TM * V8C_TM; // keep a multiple of V8C_TM
