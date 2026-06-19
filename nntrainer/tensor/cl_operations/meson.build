@@ -11,7 +11,9 @@ cl_op_sources = [
 ]
 
 cl_op_headers = [
+  'blas_kernels.h',
   'blas_kernel_interface.h',
+  'attention_kernels.h',
   'attention_kernel_interface.h',
   'clblast_interface.h',
   'cl_tensor_view.h',
