@@ -37,10 +37,12 @@
 #include <compute_ops.h>
 #include <neuralnet.h>
 
+#include <cl_context.h>
 #include <common.h>
 #include <layer_context.h>
 #include <lm_head.h>
 #include <mha_core.h>
+#include <reshaped_rms_norm.h>
 #include <nntrainer_error.h>
 #include <tensor.h>
 
@@ -424,6 +426,26 @@ void CausalLM::registerCustomLayers() {
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
+  }
+
+  // Register ReshapedRMSNormLayer on the GPU (cl) context once, centrally, so
+  // ANY model can build its per-head q/k/v norms with engine=GPU and keep them
+  // GPU_CLMEM-resident (Gemma4 S1.1 / Qwen3 q/k norm) instead of draining to
+  // the host every layer. Future q/k-norm models get GPU residency for free:
+  // they only need their existing cpu-context registration plus
+  // engine=causallm_engine() on the reshaped_rms_norm layer. Inert (skipped)
+  // when there is no GPU context (CPU-only / NNTR_ENGINE=cpu builds). The
+  // per-model registerCustomLayers still registers it on the cpu context.
+  auto *cl_context = static_cast<nntrainer::ClContext *>(
+    ct_engine.getRegisteredContext("gpu"));
+  if (cl_context != nullptr) {
+    try {
+      cl_context->registerFactory(
+        nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    } catch (std::invalid_argument &e) {
+      std::cerr << "failed to register reshaped_rms_norm on gpu ctx: "
+                << e.what() << std::endl;
+    }
   }
 }
 

@@ -25,7 +25,6 @@
 #include <qwen3_causallm.h>
 
 #include <app_context.h>
-#include <cl_context.h>
 #include <engine.h>
 #include <reshaped_rms_norm.h>
 
@@ -136,21 +135,9 @@ void Qwen3Transformer::registerCustomLayers() {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
   }
-
-  // S1.1 (mirror of Gemma4): register ReshapedRMSNormLayer on the GPU (cl)
-  // context too, so q/k_norm built with engine=GPU resolve here and keep their
-  // output GPU_CLMEM-resident instead of draining to host every layer.
-  auto cl_context = static_cast<nntrainer::ClContext *>(
-    ct_engine.getRegisteredContext("gpu"));
-  if (cl_context != nullptr) {
-    try {
-      cl_context->registerFactory(
-        nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-    } catch (std::invalid_argument &e) {
-      std::cerr << "failed to register reshaped_rms_norm on gpu ctx: "
-                << e.what() << std::endl;
-    }
-  }
+  // GPU-context registration of ReshapedRMSNormLayer is centralized in
+  // CausalLM::registerCustomLayers (shared by all models); q/k norm above build
+  // with engine=GPU and resolve there to stay GPU_CLMEM-resident.
 }
 
 void Qwen3CausalLM::registerCustomLayers() {

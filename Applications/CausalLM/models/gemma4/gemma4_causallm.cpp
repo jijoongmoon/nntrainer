@@ -16,7 +16,6 @@
 #include <cmath>
 
 #include <app_context.h>
-#include <cl_context.h>
 #include <engine.h>
 #include <llm_util.hpp>
 #include <logit_softcapping.h>
@@ -840,28 +839,10 @@ void Gemma4Transformer::registerCustomLayers() {
   tryRegister(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
   tryRegister(nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
   tryRegister(nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
-
-  // S1.1: register ReshapedRMSNormLayer on the GPU (cl) context too, so the
-  // q/k/v_norm + per_layer_projection_norm built with engine=GPU resolve here
-  // (engine=GPU routes the factory lookup to cl_context). The SAME class runs
-  // on both backends -- it already dispatches the GPU rmsnorm kernel when its
-  // operands are SVM/cl_mem-resident. With engine=GPU its OUTPUT is classified
-  // GPU_CLMEM (no trailing blocking SVM map). MUST pair with NNTR_VNORM_GPU=1
-  // (S1.2): v_norm/PLE-norm are gamma-free and would otherwise take the host
-  // FP32 fallback, whose CPU Tensor ops (clone/multiply_i) crash on
-  // gpu-context-allocated tensors. q/k_norm have gamma so take the GPU coop
-  // path regardless.
-  auto cl_context = static_cast<nntrainer::ClContext *>(
-    ct_engine.getRegisteredContext("gpu"));
-  if (cl_context != nullptr) {
-    try {
-      cl_context->registerFactory(
-        nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-    } catch (std::invalid_argument &e) {
-      std::cerr << "failed to register reshaped_rms_norm on gpu ctx: "
-                << e.what() << std::endl;
-    }
-  }
+  // S1.1 GPU-context registration of ReshapedRMSNormLayer is now centralized in
+  // CausalLM::registerCustomLayers (shared by all models). The q/k/v_norm +
+  // per_layer_projection_norm here still build with engine=GPU; pairs with
+  // NNTR_VNORM_GPU=1 for the gamma-free v_norm/PLE-norm GPU path.
 }
 
 void Gemma4CausalLM::registerCustomLayers() {
