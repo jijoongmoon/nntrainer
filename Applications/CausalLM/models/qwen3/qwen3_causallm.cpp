@@ -25,6 +25,7 @@
 #include <qwen3_causallm.h>
 
 #include <app_context.h>
+#include <cl_context.h>
 #include <engine.h>
 #include <reshaped_rms_norm.h>
 
@@ -43,12 +44,18 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("weight_initializer", "ones"), withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
-  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape)))
-  LayerHandle q_norm(createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape))).
+  // engine=GPU (mirror of Gemma4 S1.1): keeps q_norm output GPU_CLMEM-resident
+  // (the layer is registered on the cl context in registerCustomLayers) instead
+  // of draining q to the host for a CPU RMS norm every layer. Decode ~+20% on
+  // Adreno, prefill neutral, token-identical. q/k norm carry gamma so they take
+  // the GPU coop kernel directly (no gamma-free v_norm fallback concern).
+  std::vector<std::string> q_norm_params = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
+    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("feature_size", std::to_string(head_dim)),
+    withKey("engine", causallm_engine())};
+  LayerHandle q_norm(createLayer("reshaped_rms_norm", q_norm_params));
   Tensor q_normed = q_norm(q);
 
   // K layer
@@ -60,12 +67,14 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
-  // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
-  LayerHandle k_norm(createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+  // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape))). engine=GPU as
+  // with q_norm above (GPU_CLMEM-resident, no per-layer host drain).
+  std::vector<std::string> k_norm_params = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
+    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("feature_size", std::to_string(head_dim)),
+    withKey("engine", causallm_engine())};
+  LayerHandle k_norm(createLayer("reshaped_rms_norm", k_norm_params));
   Tensor k_normed = k_norm(k);
 
   // V layer
@@ -126,6 +135,21 @@ void Qwen3Transformer::registerCustomLayers() {
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
+  }
+
+  // S1.1 (mirror of Gemma4): register ReshapedRMSNormLayer on the GPU (cl)
+  // context too, so q/k_norm built with engine=GPU resolve here and keep their
+  // output GPU_CLMEM-resident instead of draining to host every layer.
+  auto cl_context = static_cast<nntrainer::ClContext *>(
+    ct_engine.getRegisteredContext("gpu"));
+  if (cl_context != nullptr) {
+    try {
+      cl_context->registerFactory(
+        nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    } catch (std::invalid_argument &e) {
+      std::cerr << "failed to register reshaped_rms_norm on gpu ctx: "
+                << e.what() << std::endl;
+    }
   }
 }
 
