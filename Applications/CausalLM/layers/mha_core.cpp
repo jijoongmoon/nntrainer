@@ -2430,8 +2430,25 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // to the undrained path within noise) because the flash kernel has
           // effectively completed by the time this layer's O is consumed; the
           // host gemm path below wrote O on the host and needs no such drain.
-          nntrainer::cl_queue_finish();
-          nntrainer::clmem_raise_cl(attention_output_step, 0);
+          // NNTR_GPU_OBRIDGE: replace the host clFinish+raise (SVM shadow -> o_cl
+          // via clEnqueueWriteBuffer, which reads the SVM as a HOST pointer and
+          // so needs the drain for coherence) with a GPU-side copy of the SVM
+          // shadow into o_cl. The copy kernel orders behind the flash kernel on
+          // the in-order queue (GPU->GPU, no host coherence), so NO drain and NO
+          // host bounce -- the decode-step single-submission precondition.
+          static const bool _gpu_obridge =
+            std::getenv("NNTR_GPU_OBRIDGE") != nullptr;
+          if (_gpu_obridge) {
+            uint16_t *o_svm = reinterpret_cast<uint16_t *>(
+              attention_output_step.getData<_FP16>());
+            nntrainer::gpu_copy_f16_cl(
+              o_svm, o_svm, (unsigned int)attention_output_step.size(),
+              /*svm_inputs=*/true, /*in_clmem=*/nullptr, /*out_clmem=*/o_cl,
+              /*drain=*/false);
+          } else {
+            nntrainer::cl_queue_finish();
+            nntrainer::clmem_raise_cl(attention_output_step, 0);
+          }
         }
         return;
       }
