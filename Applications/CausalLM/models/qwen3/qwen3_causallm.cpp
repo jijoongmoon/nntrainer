@@ -104,7 +104,14 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false"),
      withKey("use_gemm_attention",
-             USE_FLASH_ATTENTION ? "true" : "false")}));
+             USE_FLASH_ATTENTION ? "true" : "false"),
+     // Decode-GPU: qwen3 flash decode attention DIVERGES (a separate
+     // head_dim=128 bug) even with host RoPE, so keep BOTH the decode flash
+     // attention (B) and the GPU-RoPE-decode (A) OFF for now (explicit; both
+     // default false anyway). NNTR_MHA_GPU_DECODE env still forces them on for
+     // testing.
+     withKey("gpu_decode_attn", "false"),
+     withKey("gpu_decode_rope", "false")}));
   Tensor a;
   if (_kv_int8_setup) {
     a = mha({q_normed, k_normed, v});

@@ -474,7 +474,7 @@ MHACoreLayer::MHACoreLayer() :
     props::RopeScalingType(), props::RopeScalingFactor(),
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
     props::AttnLogitSoftcapping(), props::IsCausal(),
-    props::UseGemmAttention()),
+    props::UseGemmAttention(), props::GpuDecodeAttn(), props::GpuDecodeRope()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -1575,8 +1575,24 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // stays SVM-resident (q_cl handled in-place) and lower_q/lower_kv become
     // no-ops -- those are clEnqueueReadBuffer(CL_TRUE) blocking drains that cost
     // ~65 ms/token (35 layers x 2) on the host-RoPE decode path.
-    static const bool _gpu_rope_decode =
+    // (A) GPU-RoPE-decode gate. Enabled by the NNTR_MHA_GPU_DECODE env flag
+    // (global testing override) OR per-LAYER via the gpu_decode_rope property
+    // (DEFAULT-ON only for models where decode GPU-RoPE is token-identical,
+    // e.g. gemma4). The env read stays process-wide static; the property is
+    // read PER-CALL (per-layer state) and OR'd in. The NNTR_NO_GPU_ROPE
+    // kill-switch (_gpu_rope_off, checked at the if() below) still wins.
+    static const bool _gpu_rope_decode_env =
       std::getenv("NNTR_MHA_GPU_DECODE") != nullptr;
+    // The gpu_decode_rope property default is validated ONLY on the Intel
+    // buffer/flash decode path. On the Adreno image-attention path
+    // (NNTR_KV_IMG_ATTN) GPU-RoPE-at-decode produces garbage (the image KV/attn
+    // consumes host-RoPE'd Q/K in a different layout), so suppress the property
+    // there. The explicit NNTR_MHA_GPU_DECODE env override is unaffected.
+    static const bool _kv_img_attn_env =
+      std::getenv("NNTR_KV_IMG_ATTN") != nullptr;
+    const bool _gpu_rope_decode =
+      _gpu_rope_decode_env ||
+      (std::get<props::GpuDecodeRope>(mha_core_props).get() && !_kv_img_attn_env);
     const bool _rope_len_ok = (to - from) >= ROPE_MIN_PREFILL ||
                               (_gpu_rope_decode && (to - from) == 1);
     if (!_gpu_rope_off && _mha_gpu_on && use_gemm_attention && !kv_int8 &&
@@ -1941,8 +1957,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // OHWI image-attention path. The decode CPU NEON path (compute_kcaches) is
     // the long-context bottleneck; the OHWI qk/sv image kernels + KV scatter
     // already handle M=1. Falls through to CPU on not-ok.
-    static const bool _ohwi_decode_on =
+    // (B) flash/OHWI decode-attention gate. Enabled by the NNTR_MHA_GPU_DECODE
+    // env flag (global testing override) OR per-LAYER via the gpu_decode_attn
+    // property (DEFAULT-ON for models where decode flash attention is
+    // token-identical, e.g. gemma4, gemma2). Env read stays static; property
+    // read PER-CALL and OR'd in.
+    static const bool _ohwi_decode_env =
       std::getenv("NNTR_MHA_GPU_DECODE") != nullptr;
+    const bool _ohwi_decode_on =
+      _ohwi_decode_env || std::get<props::GpuDecodeAttn>(mha_core_props).get();
     const unsigned int step_size_p2 = to - from;
     const unsigned int cache_to_p2 = cache_index + step_size_p2;
     if (_ohwi_gpu_on && use_gemm_attention &&
@@ -2063,8 +2086,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // M=1 is handled; otherwise decode falls to the host compute_kcaches NEON
   // path (a per-layer GPU->host queue drain). Pays off only with the host
   // RoPE/v_norm drains also removed (land S1+S2+S3 as a SET).
-  static const bool _mha_gpu_decode =
+  // (B) flash decode-attention gate. Enabled by NNTR_MHA_GPU_DECODE env
+  // (global testing override) OR per-LAYER via the gpu_decode_attn property
+  // (DEFAULT-ON for gemma4 / gemma2). Env read static; property read PER-CALL.
+  static const bool _mha_gpu_decode_env =
     std::getenv("NNTR_MHA_GPU_DECODE") != nullptr;
+  const bool _mha_gpu_decode =
+    _mha_gpu_decode_env || std::get<props::GpuDecodeAttn>(mha_core_props).get();
   if (use_gemm_attention &&
       (step_size >= FLASH_MIN_PREFILL || (_mha_gpu_decode && step_size == 1))) {
     // GPU two-1x1-conv attention path (paper section 3.7). Env-gated via

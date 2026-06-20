@@ -164,6 +164,41 @@ public:
 };
 
 /**
+ * @brief GpuDecodeAttn property (per-model decode-GPU gate).
+ * @note  When true, the M=1 (decode) attention runs the validated GPU flash /
+ *        OHWI image-attention path instead of bouncing K/V to the host NEON
+ *        path. Mirrors the NNTR_MHA_GPU_DECODE env flag's flash-attention half
+ *        ((B)), but per-LAYER so it can be DEFAULT-ON only for the models where
+ *        decode flash attention is token-identical (gemma4, gemma2). The env
+ *        flag, when set, forces it on globally (testing override). Default
+ *        false keeps the host decode attention.
+ */
+class GpuDecodeAttn : public nntrainer::Property<bool> {
+public:
+  GpuDecodeAttn(bool value = false) { set(value); };
+  static constexpr const char *key = "gpu_decode_attn";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
+ * @brief GpuDecodeRope property (per-model decode-GPU gate).
+ * @note  When true, the M=1 (decode) RoPE runs on the GPU (rope_inplace_f16_cl)
+ *        so Q/K stay SVM-resident and lower_q/lower_kv drains are skipped.
+ *        Mirrors the NNTR_MHA_GPU_DECODE env flag's GPU-RoPE half ((A)), but
+ *        per-LAYER so it is DEFAULT-ON only where decode GPU-RoPE is
+ *        token-identical (gemma4). gemma2 diverges on GPU-RoPE-decode, so it
+ *        keeps this false (flash attention + host RoPE). Still gated off by the
+ *        NNTR_NO_GPU_ROPE kill-switch. The env flag, when set, forces it on
+ *        globally (testing override). Default false keeps the host decode RoPE.
+ */
+class GpuDecodeRope : public nntrainer::Property<bool> {
+public:
+  GpuDecodeRope(bool value = false) { set(value); };
+  static constexpr const char *key = "gpu_decode_rope";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
  * @brief RopeScalingType
  * - default
  * - yarn
@@ -360,7 +395,8 @@ private:
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopePartialRotaryFactor,
     props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
-    props::IsCausal, props::UseGemmAttention>
+    props::IsCausal, props::UseGemmAttention, props::GpuDecodeAttn,
+    props::GpuDecodeRope>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
