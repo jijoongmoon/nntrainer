@@ -215,7 +215,8 @@ Tensor Gemma2Transformer::createAttention(const int layer_id, int seq_len,
      // keep it OFF -> decode runs GPU flash attention + HOST RoPE (the fast,
      // token-identical combination). NNTR_MHA_GPU_DECODE env still forces both.
      withKey("gpu_decode_attn", "true"),
-     withKey("gpu_decode_rope", "false")}));
+     withKey("gpu_decode_rope", "false"),
+     withKey("gpu_ohwi_rope", "true")}));
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer

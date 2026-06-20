@@ -474,7 +474,8 @@ MHACoreLayer::MHACoreLayer() :
     props::RopeScalingType(), props::RopeScalingFactor(),
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
     props::AttnLogitSoftcapping(), props::IsCausal(),
-    props::UseGemmAttention(), props::GpuDecodeAttn(), props::GpuDecodeRope()),
+    props::UseGemmAttention(), props::GpuDecodeAttn(), props::GpuDecodeRope(),
+    props::GpuOhwiRope()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -1829,8 +1830,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // Falls back (leaves gpu_rope_done=false -> host RoPE) if: not the IMG-ATTN
     // env, not a decode step (M!=1), not FP16, kv_int8, the rope LUT does not
     // cover the position, the cache slices are not SVM, or any GPU op fails.
-    static const bool _ohwi_gpu_rope =
+    // Enabled by the NNTR_OHWI_GPU_ROPE env (global override) OR per-LAYER via
+    // the gpu_ohwi_rope property (default-on where token-identical: gemma4 +32%,
+    // gemma2 +8%; qwen3 stays false -- head_dim=128/q-k-norm diverges).
+    static const bool _ohwi_gpu_rope_env =
       std::getenv("NNTR_OHWI_GPU_ROPE") != nullptr;
+    const bool _ohwi_gpu_rope =
+      _ohwi_gpu_rope_env || std::get<props::GpuOhwiRope>(mha_core_props).get();
     if (!gpu_rope_done && _ohwi_gpu_rope && !_gpu_rope_off && _mha_gpu_on &&
         _kv_img_attn_env && use_gemm_attention && !kv_int8 &&
         (to - from) == 1 &&

@@ -199,6 +199,23 @@ public:
 };
 
 /**
+ * @brief GpuOhwiRope property (per-model Adreno OHWI decode-RoPE gate).
+ * @note  When true, the M=1 (decode) RoPE on the OHWI image-attention path
+ *        (NNTR_KV_IMG_ATTN) runs on the GPU (rope_inplace_f16_cl) so Q/K stay
+ *        SVM-resident and the per-layer lower_q/lower_kv drain (16-35ms/token)
+ *        is skipped. DEFAULT-ON where it is token-identical (gemma4 +32%,
+ *        gemma2 +8%); qwen3 diverges (head_dim=128 / q-k-norm), so it stays
+ *        false. The NNTR_OHWI_GPU_ROPE env forces it on globally (override);
+ *        NNTR_NO_GPU_ROPE kills it. Default false keeps the host decode RoPE.
+ */
+class GpuOhwiRope : public nntrainer::Property<bool> {
+public:
+  GpuOhwiRope(bool value = false) { set(value); };
+  static constexpr const char *key = "gpu_ohwi_rope";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
  * @brief RopeScalingType
  * - default
  * - yarn
@@ -396,7 +413,7 @@ private:
     props::RopeScalingFactor, props::RopePartialRotaryFactor,
     props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
     props::IsCausal, props::UseGemmAttention, props::GpuDecodeAttn,
-    props::GpuDecodeRope>
+    props::GpuDecodeRope, props::GpuOhwiRope>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
