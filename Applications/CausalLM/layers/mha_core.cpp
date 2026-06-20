@@ -1675,6 +1675,12 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // a DIFFERENT cl_mem handle (q_stage) than it reads, which is
         // coherent without a drain (the K/V chain shape); the qk kernel then
         // binds q_stage. Non-staged keeps the drained in-place form.
+        // NNTR_RECQ_KVSCALAR (Stage 0 of record/replay): route the K/V cache
+        // side-fills through a STABLE base + scalar row-offset (see the side-fill
+        // sites below) so a recorded decode KV-write can replay with the offset
+        // overridden per token. Byte-identical; opt-in, default off.
+        static const bool _recq_kvscalar =
+          std::getenv("NNTR_RECQ_KVSCALAR") != nullptr;
         bool ok = nntrainer::rope_inplace_f16_cl(
                     q_p, q_p, cos_lut, sin_lut, to - from, num_heads_Q, head_dim,
                     cache_index, mp, q_svm, /*in_clmem=*/q_cl,
@@ -1690,15 +1696,30 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         if (ok && k_out_stage != nullptr) {
           // Side-fill the SVM cache slice for host decode (consumed only
           // after the lm_head lower drains the queue): no per-op drain.
+          // K side-fill into the STABLE cache base at a scalar row-offset (= the
+          // b_cache_key_step pointer offset) when _recq_kvscalar -- byte-identical
+          // to the offset-baked pointer kc_p, but replay-overridable per token.
+          const unsigned int kc_n =
+            (to - from) * (unsigned int)num_heads_KV * (unsigned int)head_dim;
+          const int kc_woff =
+            (int)((size_t)batch * cache_key_dim.getFeatureLen() +
+                  (size_t)cache_index * cache_key_dim.width());
           if (mha_clmem_mode) {
             // MHA_CLMEM: mirror-only store; the boundary gather syncs the
             // slab for host decode/save. No SVM write here.
             k_stage = k_stage_buf;
-          } else if (nntrainer::gpu_copy_f16_cl(
-                k_p, kc_p, (to - from) * (unsigned int)num_heads_KV *
-                             (unsigned int)head_dim,
-                /*svm_inputs=*/true, /*in_clmem=*/k_stage_buf,
-                /*out_clmem=*/nullptr, /*drain=*/false)) {
+          } else if (_recq_kvscalar
+                       ? nntrainer::gpu_copy_f16_row_cl(
+                           k_p,
+                           reinterpret_cast<uint16_t *>(
+                             cache_key.getData<_FP16>()),
+                           kc_n, kc_woff, /*svm_inputs=*/true,
+                           /*in_clmem=*/k_stage_buf,
+                           /*out_base_clmem=*/nullptr, /*drain=*/false)
+                       : nntrainer::gpu_copy_f16_cl(
+                           k_p, kc_p, kc_n, /*svm_inputs=*/true,
+                           /*in_clmem=*/k_stage_buf, /*out_clmem=*/nullptr,
+                           /*drain=*/false)) {
             k_stage = k_stage_buf;
             static int _kv_stage_logged = 0;
             if (!_kv_stage_logged) {
@@ -1740,7 +1761,18 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             v_stage_clmem = v_cl;
             if (_kvst_on())
               _kvst_t0 = _kvst_now();
-          } else if (nntrainer::gpu_copy_f16_cl(v_in, v_out, v_n, v_svm,
+          } else if ((_recq_kvscalar && v_svm)
+                       ? nntrainer::gpu_copy_f16_row_cl(
+                           v_in,
+                           reinterpret_cast<uint16_t *>(
+                             cache_value.getData<_FP16>()),
+                           v_n,
+                           (int)((size_t)batch *
+                                   cache_value_dim.getFeatureLen() +
+                                 (size_t)cache_index * cache_value_dim.width()),
+                           v_svm, /*in_clmem=*/v_cl,
+                           /*out_base_clmem=*/nullptr, /*drain=*/!v_stage)
+                       : nntrainer::gpu_copy_f16_cl(v_in, v_out, v_n, v_svm,
                                          /*in_clmem=*/v_cl,
                                          /*out_clmem=*/nullptr,
                                          /*drain=*/!v_stage)) {

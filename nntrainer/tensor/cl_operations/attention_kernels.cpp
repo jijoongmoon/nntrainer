@@ -796,6 +796,17 @@ __kernel void scatter_copy_f16(__global const half *in, __global half *out,
   int i = get_global_id(0);
   if (i < N) out[i] = in[i];
 }
+// Row-offset variant: writes into a STABLE base at out[write_off + i] instead of
+// baking the destination offset into the pointer. write_off (= cache_index *
+// num_heads_KV * head_dim) is a scalar arg, so a recorded decode KV-write can be
+// replayed with write_off overridden per token (cl_qcom_recordable_queues can
+// override scalar args but NOT SVM pointers). Same address as the offset-baked
+// pointer form -> byte-identical output.
+__kernel void scatter_copy_f16_row(__global const half *in, __global half *out,
+                                   const int N, const int write_off) {
+  int i = get_global_id(0);
+  if (i < N) out[write_off + i] = in[i];
+}
 // OHWI K scatter: src concat [t, hKV, d] -> dst OHWI [hKV, max_S, d] at
 // (position+t). Feeds the K image2d view (qk_matmul_f16_ohwi_img). Mirrors
 // gpu_native k_scatter_ohwi.
@@ -1130,6 +1141,56 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
                             nullptr) != CL_SUCCESS)
       return false;
   }
+  return true;
+}
+
+// Row-offset KV side-fill: same as gpu_copy_f16_cl's SVM path but writes into a
+// STABLE out_base at [write_off + i] (scatter_copy_f16_row) instead of an
+// offset-baked destination pointer. write_off = cache_index * num_heads_KV *
+// head_dim. Byte-identical to passing out_base + write_off as the pointer, but
+// keeps the destination handle stable so a recorded decode KV-write can replay
+// with write_off overridden per token (SVM-only; the cache is SVM/cl_mem
+// resident). Returns false for the non-SVM (host-readback) shape.
+bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
+                         int write_off, bool svm_inputs, void *in_clmem,
+                         void *out_base_clmem, bool drain) {
+  if (N == 0 || in == nullptr || out_base == nullptr || !svm_inputs)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(rope_inplace_kernel, "scatter_copy_f16_row");
+  if (!kp)
+    return false;
+  bool okb = true;
+  if (in_clmem != nullptr) {
+    cl_mem h = static_cast<cl_mem>(in_clmem);
+    okb = okb && kp->SetKernelArguments(0, &h, sizeof(cl_mem));
+  } else {
+    okb = okb && kp->SetKernelSVMArguments(0, const_cast<uint16_t *>(in));
+  }
+  if (out_base_clmem != nullptr) {
+    cl_mem oh = static_cast<cl_mem>(out_base_clmem);
+    okb = okb && kp->SetKernelArguments(1, &oh, sizeof(cl_mem));
+  } else {
+    okb = okb && kp->SetKernelSVMArguments(1, out_base);
+  }
+  int Ni = (int)N;
+  okb = okb && kp->SetKernelArguments(2, &Ni, sizeof(int));
+  okb = okb && kp->SetKernelArguments(3, &write_off, sizeof(int));
+  if (!okb)
+    return false;
+  constexpr size_t LWS = 64;
+  const size_t gws_x = (((size_t)N + LWS - 1) / LWS) * LWS;
+  std::array<size_t, 3> gws = {gws_x, 1, 1};
+  std::array<size_t, 3> lws = {LWS, 1, 1};
+  blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
+                                             lws.data(), 0, nullptr, nullptr);
+  if (out_base_clmem == nullptr && drain)
+    clFinish(q);
+  else
+    clFlush(q);
   return true;
 }
 

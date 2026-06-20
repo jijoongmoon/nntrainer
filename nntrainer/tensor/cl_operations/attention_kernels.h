@@ -154,6 +154,17 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
                      bool svm_inputs = false, void *in_clmem = nullptr,
                      void *out_clmem = nullptr, bool drain = true);
 
+/// Row-offset KV side-fill: writes into a STABLE out_base at [write_off + i]
+/// (write_off = cache_index * num_heads_KV * head_dim) instead of an
+/// offset-baked destination pointer. Byte-identical, but keeps the destination
+/// handle stable so a recorded decode KV-write can replay with write_off
+/// overridden per token (cl_qcom_recordable_queues overrides scalars, not SVM
+/// pointers). SVM-only; returns false otherwise.
+bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
+                         int write_off, bool svm_inputs = false,
+                         void *in_clmem = nullptr, void *out_base_clmem = nullptr,
+                         bool drain = true);
+
 /// Grow-only cl_mem staging buffer for kernel-chain temporaries (e.g. the
 /// rotated-K staging temp between RoPE and k_scatter). *buf/*cap persist at
 /// the caller (opaque void* so callers need not include CL headers); the
