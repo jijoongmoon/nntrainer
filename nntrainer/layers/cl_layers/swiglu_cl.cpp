@@ -88,15 +88,26 @@ void SwiGLULayerCl::incremental_forwarding(RunLayerContext &context,
       << "incremental step size is not 1";
   }
 
-  // [decode active-row fix] mirrors GeGLULayerCl: the current token at decode
-  // lives at its ABSOLUTE row (to-1) of the full [INIT_SEQ,I] tensor, so process
-  // only the live rows [from, to). Without this, swiglu re-ran the whole
-  // [INIT_SEQ,I] tensor every decode step -- a ~1024x waste (264us/op on Qwen3
-  // I=3072). SVM tensors offset the data pointers (O(1) at decode); cl_mem
-  // tensors bind the whole buffer at index 0, so process [0, to) to cover the
-  // live row (O(position) fallback).
+  // [decode active-row fix] mirrors GeGLULayerCl. At decode the gate/up FC and
+  // every cl_mem producer write the live token to ROW 0 of their full
+  // [INIT_SEQ,I] buffers (fc_layer_cl rebases from->0, to->1, offset-0 view), so
+  // the consumed row is row 0, not the absolute row (to-1). When every operand
+  // is a whole-buffer cl_mem binding (index 0, no pointer offset) on the FP16
+  // path, process EXACTLY the single live row at offset 0. The old all-cl_mem
+  // branch dispatched [0, to) rows: O(position) waste, and -- once the live
+  // sequence passes INIT_SEQ_LEN -- a one-row out-of-bounds GPU write into the
+  // INIT_SEQ_LEN-sized cl_mem sub-buffer (to=INIT_SEQ_LEN+1 indexes row
+  // INIT_SEQ_LEN), which faults the queue (CL_OUT_OF_RESOURCES). Mixed
+  // cl_mem/SVM or FP32 keep the [0, to) fallback (a whole-buffer cl_mem arg and
+  // a pointer-offset SVM arg can't share one dispatch); SVM-only offsets the
+  // pointers to row `from`.
   const bool any_clmem = in1.isClMem() || in2.isClMem() || out.isClMem();
-  if (any_clmem)
+  const bool all_clmem = in1.isClMem() && in2.isClMem() && out.isClMem();
+  const bool is_fp16 =
+    in1.getDataType() == ml::train::TensorDim::DataType::FP16;
+  if (from && all_clmem && is_fp16)
+    swigluProcess(in1, in2, out, 1, 0);
+  else if (any_clmem)
     swigluProcess(in1, in2, out, to, 0);
   else
     swigluProcess(in1, in2, out, to - from, from);

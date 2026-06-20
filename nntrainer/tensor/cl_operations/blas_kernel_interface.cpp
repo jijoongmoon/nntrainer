@@ -868,10 +868,14 @@ bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes) {
   // BLOCKING read on the in-order queue: waits for every prior command (the
   // whole forward), then lands the bytes in host memory (the SVM shadow used
   // as a plain host pointer). The host consumer reads ordinary memory next.
-  if (clEnqueueReadBuffer(q, static_cast<cl_mem>(sub), CL_TRUE, 0, bytes,
-                          t.getData<uint8_t>(), 0, nullptr,
-                          nullptr) != CL_SUCCESS)
-    throw std::runtime_error("clmem_lower_cl: clEnqueueReadBuffer failed");
+  cl_int rb_err = clEnqueueReadBuffer(q, static_cast<cl_mem>(sub), CL_TRUE, 0,
+                                      bytes, t.getData<uint8_t>(), 0, nullptr,
+                                      nullptr);
+  if (rb_err != CL_SUCCESS)
+    throw std::runtime_error(
+      "clmem_lower_cl: clEnqueueReadBuffer failed err=" +
+      std::to_string(rb_err) + " bytes=" + std::to_string(bytes) +
+      " name=" + t.getName());
   return true;
 }
 
