@@ -2174,10 +2174,33 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     return e && atoi(e) != 0;
   }();
   if (xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0) {
-    static const std::string xmx_copts =
-      "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread";
+    // Shape-adaptive tile. The microbench's NT=4/SG_M=1 (tuned for the square
+    // N=K=4096 case) badly underutilizes the real FC shapes: NT=2 is broadly
+    // best, and SG_M (subgroups stacked along M, re-using the fetched N-block
+    // weight) must grow with the problem -- measured best/shape: large-K down
+    // proj -> SG8, large-N gate/up -> SG4..8, small (qwen3) -> SG1. e.g. gemma4
+    // gate/up (N6144,K1536) 2.76 -> 13.5 TOP/s, gemma2 down (N2304,K9216) ->
+    // 10.4. Each (MT,NT,SG_M) is a distinct -D copts string => registerClKernel
+    // caches a separate compiled program (key = name+copts). NNTR_XMX_NT /
+    // NNTR_XMX_SGM override the heuristic for tuning.
+    // NT=2 + SG_M=4 measured uniformly best IN-MODEL across gemma2/qwen3/gemma4
+    // (prefill +3% / +32% / +50% vs the microbench NT=4/SG_M=1). The standalone
+    // sweep favored SG_M=8 for the large-K down-proj, but that collapses
+    // occupancy in-model (gemma2 -32%), so SG_M=4 is the robust default.
+    int xmx_mt = 4, xmx_nt = 2, xmx_sgm = 4;
+    if (const char *e = getenv("NNTR_XMX_NT"))
+      xmx_nt = atoi(e);
+    if (const char *e = getenv("NNTR_XMX_SGM"))
+      xmx_sgm = atoi(e);
+    if (N % ((unsigned)xmx_nt * 16) != 0)
+      xmx_nt = 4; // N%64==0 guaranteed by the dispatch gate
+    char xmx_co[176];
+    snprintf(
+      xmx_co, sizeof(xmx_co),
+      "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -DMT=%d -DNT=%d -DSG_M=%d",
+      xmx_mt, xmx_nt, xmx_sgm);
     ClContext::SharedPtrClKernel kx = blas_cc->registerClKernel(
-      int8_int8_gemm_xmx_kernel, "gemm_xmx_i4", xmx_copts);
+      int8_int8_gemm_xmx_kernel, "gemm_xmx_i4", std::string(xmx_co));
     if (kx) {
       int Mi = (int)M, Ni = (int)N, Ki = (int)K, Wa = (int)(K / 16),
           Ww = (int)(K / 32), Mv = (int)M_valid;
@@ -2203,9 +2226,12 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
           snprintf(lbl, sizeof(lbl), ":N%u_K%u", N, K);
           blas_cc->command_queue_inst_.setNextProfileLabel(lbl);
         }
-        const size_t Mpad = (((size_t)M + 31) / 32) * 32;
-        std::array<size_t, 3> gws = {(size_t)(N / 64) * 16, Mpad / 32, 1};
-        std::array<size_t, 3> lws = {16, 1, 1};
+        const size_t mpwg = (size_t)xmx_mt * 8 * xmx_sgm; // rows per workgroup
+        const size_t Mpad = (((size_t)M + mpwg - 1) / mpwg) * mpwg;
+        const size_t npsz = (size_t)xmx_nt * 16;           // cols per subgroup
+        std::array<size_t, 3> gws = {(size_t)(N / npsz) * 16,
+                                     Mpad / ((size_t)xmx_mt * 8), 1};
+        std::array<size_t, 3> lws = {16, (size_t)xmx_sgm, 1};
         blas_cc->command_queue_inst_.enqueueKernel(
           kx->GetKernel(), 2, gws.data(), lws.data(), 0, nullptr, nullptr);
         return;
