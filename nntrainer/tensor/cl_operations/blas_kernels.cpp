@@ -2161,6 +2161,58 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     }
     // Fall through to the m1 dispatch on any setup failure.
   }
+  // --- NNTR_FC_XMX: Intel Xe2 (Lunar Lake) XMX/DPAS prefill GEMM ------------
+  // Drop-in for the M>4 buffer-path v8c GEMM using int8 DPAS (systolic array).
+  // Raw-nibble + i8_u8 MMA -> acc_raw, then the SAME bias-correction + scale
+  // epilogue as the dp4a kernel (byte-identical output). Requires the buffer
+  // path (raw cl_mem) + the Intel matrix-multiply / 2d_block_io extensions; on
+  // a non-XMX device registerClKernel fails -> kx null -> fall through to dp4a.
+  // M is padded up to MT*8*SG_M (=32) by the grid; M_valid guards the stores
+  // and the A/weight 2D-block reads clamp OOB rows to 0 (surface height = M).
+  static const bool xmx_fc = []() {
+    const char *e = getenv("NNTR_FC_XMX");
+    return e && atoi(e) != 0;
+  }();
+  if (xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0) {
+    static const std::string xmx_copts =
+      "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread";
+    ClContext::SharedPtrClKernel kx = blas_cc->registerClKernel(
+      int8_int8_gemm_xmx_kernel, "gemm_xmx_i4", xmx_copts);
+    if (kx) {
+      int Mi = (int)M, Ni = (int)N, Ki = (int)K, Wa = (int)(K / 16),
+          Ww = (int)(K / 32), Mv = (int)M_valid;
+      int a = 0;
+      const bool ok =
+        kx->SetKernelArguments(a++, &act_image, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &weight_image, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &scale_act, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &scale_wgt, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &row_sum_act, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &zp_act, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &row_sum_w_int4, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &output_fp16, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &Mi, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Ni, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Ki, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Wa, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Ww, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Mv, sizeof(int));
+      if (ok) {
+        {
+          char lbl[48];
+          snprintf(lbl, sizeof(lbl), ":N%u_K%u", N, K);
+          blas_cc->command_queue_inst_.setNextProfileLabel(lbl);
+        }
+        const size_t Mpad = (((size_t)M + 31) / 32) * 32;
+        std::array<size_t, 3> gws = {(size_t)(N / 64) * 16, Mpad / 32, 1};
+        std::array<size_t, 3> lws = {16, 1, 1};
+        blas_cc->command_queue_inst_.enqueueKernel(
+          kx->GetKernel(), 2, gws.data(), lws.data(), 0, nullptr, nullptr);
+        return;
+      }
+    }
+    // fall through to dp4a on any failure
+  }
   ClContext::SharedPtrClKernel kp =
     blas_cc->registerClKernel(int8_int4_gemm_v8c_kernel, kname, copts);
   if (!kp)
@@ -2895,6 +2947,154 @@ __kernel void q6k_gemv_lmhead(__global const uchar *W,   // [V rows][H/256 block
 }
 )CL";
 
+// =========================================================================
+// On-GPU argmax (greedy on-GPU sampler — the single-submission precondition).
+// Reduces the device logits cl_mem to ONE token id and reads back only 4 bytes
+// instead of the full V-vocab logits + host std::max_element. Portable plain
+// OpenCL (no subgroup builtins, lws=64) => byte-identical on Adreno + Intel.
+// Two-pass: pass1 = G work-groups stride over V -> per-WG (max,idx); pass2 = 1
+// WG reduces the G partials -> token id. Ties break to the LOWER index to match
+// std::max_element (first max). Gated by NNTR_GPU_ARGMAX via request/consume.
+// =========================================================================
+static const std::string argmax_logits_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#define AMX_LWS 64
+#define AMX_REDUCE(lv, li, t)                                                  \
+  for (int off = AMX_LWS / 2; off > 0; off >>= 1) {                           \
+    if (t < off) {                                                            \
+      if (lv[t + off] > lv[t] || (lv[t + off] == lv[t] && li[t + off] < li[t])) { \
+        lv[t] = lv[t + off]; li[t] = li[t + off]; }                          \
+    }                                                                         \
+    barrier(CLK_LOCAL_MEM_FENCE);                                            \
+  }
+__kernel void argmax_p1_f32(__global const float *logits, const int N,
+                            __global float *pval, __global uint *pidx) {
+  const int t = get_local_id(0);
+  const int base = get_group_id(0) * AMX_LWS + t;
+  const int stride = get_num_groups(0) * AMX_LWS;
+  float bv = -INFINITY; uint bi = 0u; int seen = 0;
+  for (int i = base; i < N; i += stride) {
+    float v = logits[i];
+    if (!seen || v > bv) { bv = v; bi = (uint)i; seen = 1; }
+  }
+  __local float lv[AMX_LWS]; __local uint li[AMX_LWS];
+  lv[t] = bv; li[t] = bi; barrier(CLK_LOCAL_MEM_FENCE);
+  AMX_REDUCE(lv, li, t)
+  if (t == 0) { pval[get_group_id(0)] = lv[0]; pidx[get_group_id(0)] = li[0]; }
+}
+__kernel void argmax_p1_f16(__global const half *logits, const int N,
+                            __global float *pval, __global uint *pidx) {
+  const int t = get_local_id(0);
+  const int base = get_group_id(0) * AMX_LWS + t;
+  const int stride = get_num_groups(0) * AMX_LWS;
+  float bv = -INFINITY; uint bi = 0u; int seen = 0;
+  for (int i = base; i < N; i += stride) {
+    float v = (float)logits[i];
+    if (!seen || v > bv) { bv = v; bi = (uint)i; seen = 1; }
+  }
+  __local float lv[AMX_LWS]; __local uint li[AMX_LWS];
+  lv[t] = bv; li[t] = bi; barrier(CLK_LOCAL_MEM_FENCE);
+  AMX_REDUCE(lv, li, t)
+  if (t == 0) { pval[get_group_id(0)] = lv[0]; pidx[get_group_id(0)] = li[0]; }
+}
+__kernel void argmax_p2(__global const float *pval, __global const uint *pidx,
+                        const int G, __global uint *out_idx) {
+  const int t = get_local_id(0);
+  float bv = -INFINITY; uint bi = 0u; int seen = 0;
+  for (int i = t; i < G; i += AMX_LWS) {
+    float v = pval[i]; uint idx = pidx[i];
+    if (!seen || v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; seen = 1; }
+  }
+  __local float lv[AMX_LWS]; __local uint li[AMX_LWS];
+  lv[t] = bv; li[t] = bi; barrier(CLK_LOCAL_MEM_FENCE);
+  AMX_REDUCE(lv, li, t)
+  if (t == 0) out_idx[0] = li[0];
+}
+)CL";
+
+// request/result plumbing: the generation loop sets the request (pure greedy
+// only); the lm_head GEMVs reduce on-GPU + skip the full readback; generate()
+// consumes the token. Globals are file-scope; accessors are external for the
+// CausalLM generation loop (forward-declared there).
+static bool g_argmax_requested = false;
+static bool g_argmax_valid = false;
+static unsigned int g_argmax_token = 0;
+void request_gpu_argmax(bool on) {
+  g_argmax_requested = on;
+  g_argmax_valid = false;
+}
+bool consume_gpu_argmax(unsigned int *tok) {
+  if (!g_argmax_valid)
+    return false;
+  if (tok)
+    *tok = g_argmax_token;
+  g_argmax_valid = false;
+  return true;
+}
+
+// Reduce `logits` (cl_mem, [N] fp16 or fp32) to its argmax index on the GPU.
+static bool argmax_logits_cl(cl_mem logits, bool is_fp16, unsigned int N,
+                             unsigned int *out_idx) {
+  if (!logits || N == 0 || !out_idx)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return false;
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  if (!ctx || !q)
+    return false;
+  constexpr int G = 256; // pass-1 work-groups
+  ClContext::SharedPtrClKernel kp1 = blas_cc->registerClKernel(
+    argmax_logits_kernel, is_fp16 ? "argmax_p1_f16" : "argmax_p1_f32");
+  ClContext::SharedPtrClKernel kp2 =
+    blas_cc->registerClKernel(argmax_logits_kernel, "argmax_p2");
+  if (!kp1 || !kp2)
+    return false;
+  static cl_mem pval = nullptr, pidx = nullptr, oidx = nullptr;
+  if (!pval) {
+    cl_int e = CL_SUCCESS;
+    pval = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(float) * G, nullptr, &e);
+    pidx =
+      clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(cl_uint) * G, nullptr, &e);
+    oidx = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, sizeof(cl_uint), nullptr, &e);
+    if (!pval || !pidx || !oidx) {
+      pval = pidx = oidx = nullptr;
+      return false;
+    }
+  }
+  int Ni = (int)N, Gi = G;
+  if (!(kp1->SetKernelArguments(0, &logits, sizeof(cl_mem)) &&
+        kp1->SetKernelArguments(1, &Ni, sizeof(int)) &&
+        kp1->SetKernelArguments(2, &pval, sizeof(cl_mem)) &&
+        kp1->SetKernelArguments(3, &pidx, sizeof(cl_mem))))
+    return false;
+  blas_cc->command_queue_inst_.setNextProfileLabel(":argmax_p1");
+  {
+    const int wgc[3] = {G * 64, 1, 1}, wgs[3] = {64, 1, 1};
+    if (!blas_cc->command_queue_inst_.DispatchCommand(kp1, wgc, wgs))
+      return false;
+  }
+  if (!(kp2->SetKernelArguments(0, &pval, sizeof(cl_mem)) &&
+        kp2->SetKernelArguments(1, &pidx, sizeof(cl_mem)) &&
+        kp2->SetKernelArguments(2, &Gi, sizeof(int)) &&
+        kp2->SetKernelArguments(3, &oidx, sizeof(cl_mem))))
+    return false;
+  blas_cc->command_queue_inst_.setNextProfileLabel(":argmax_p2");
+  {
+    const int wgc[3] = {64, 1, 1}, wgs[3] = {64, 1, 1};
+    if (!blas_cc->command_queue_inst_.DispatchCommand(kp2, wgc, wgs))
+      return false;
+  }
+  cl_uint idx = 0;
+  if (clEnqueueReadBuffer(q, oidx, CL_TRUE, 0, sizeof(cl_uint), &idx, 0, nullptr,
+                          nullptr) != CL_SUCCESS)
+    return false;
+  *out_idx = (unsigned int)idx;
+  return true;
+}
+
 bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
                          float *logits_f32_host, unsigned int vocab,
                          unsigned int hidden) {
@@ -2985,6 +3185,16 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
     t_post_kernel = std::chrono::steady_clock::now();
   }
 
+  // On-GPU greedy argmax: reduce logits on the GPU, skip the full-vocab D->H
+  // readback, decide the token from a 4-byte index (the single-submission seed).
+  if (g_argmax_requested) {
+    unsigned int tok = 0;
+    if (argmax_logits_cl(e.out, /*is_fp16=*/false, vocab, &tok)) {
+      g_argmax_token = tok;
+      g_argmax_valid = true;
+      return true;
+    }
+  }
   // Blocking readback = the decode-step GPU->host boundary (one per token).
   const auto t_pre_read = std::chrono::steady_clock::now();
   if (clEnqueueReadBuffer(q, e.out, CL_TRUE, 0, sizeof(float) * vocab,
@@ -3135,6 +3345,15 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem, void *act
     t1 = std::chrono::steady_clock::now();
   }
 
+  // On-GPU greedy argmax over the fp16 device logits; skip the full readback.
+  if (g_argmax_requested) {
+    unsigned int tok = 0;
+    if (argmax_logits_cl(out_buf, /*is_fp16=*/true, N, &tok)) {
+      g_argmax_token = tok;
+      g_argmax_valid = true;
+      return true;
+    }
+  }
   // Blocking readback to the host output (consumed by the host argmax/sampler).
   if (out_fp16) {
     if (clEnqueueReadBuffer(q, out_buf, CL_TRUE, 0, out_bytes, logits_host, 0,
@@ -3299,6 +3518,14 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
   blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
                                              lws.data(), 0, nullptr, nullptr);
 
+  if (g_argmax_requested) {
+    unsigned int tok = 0;
+    if (argmax_logits_cl(e.out, /*is_fp16=*/false, vocab, &tok)) {
+      g_argmax_token = tok;
+      g_argmax_valid = true;
+      return true;
+    }
+  }
   if (clEnqueueReadBuffer(q, e.out, CL_TRUE, 0, sizeof(float) * vocab,
                           logits_f32_host, 0, nullptr, nullptr) != CL_SUCCESS) {
     std::fprintf(stderr, "[lmhead-fp32w] logits read failed\n");

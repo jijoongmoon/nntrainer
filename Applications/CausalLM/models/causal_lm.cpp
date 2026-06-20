@@ -49,6 +49,14 @@
 #include <causal_lm.h>
 #include <llm_util.hpp>
 
+// On-GPU greedy argmax sampler (defined in libnntrainer blas_kernels.cpp): when
+// requested (pure greedy), the lm_head GEMV reduces logits on the GPU and skips
+// the full-vocab D->H readback; generate() consumes the 4-byte token id.
+namespace nntrainer {
+void request_gpu_argmax(bool on);
+bool consume_gpu_argmax(unsigned int *tok);
+} // namespace nntrainer
+
 namespace causallm {
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
@@ -369,6 +377,18 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
   std::vector<unsigned int> outputs;
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
 
+    // On-GPU greedy argmax already produced the token (lm_head logits never left
+    // the GPU; only the 4-byte id came back). Only set under pure-greedy gating.
+    {
+      unsigned int gpu_tok = 0;
+      if (nntrainer::consume_gpu_argmax(&gpu_tok)) {
+        outputs.push_back(gpu_tok);
+        logits = logits + NUM_VOCAB;
+        input_ids = input_ids + MAX_SEQ_LEN;
+        continue;
+      }
+    }
+
     // apply repetition penalty
     if (repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0) {
       applyRepetitionPenalty(logits, input_ids, NUM_INPUT_IDS,
@@ -453,6 +473,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
   auto start_total = std::chrono::high_resolution_clock::now();
+  // On-GPU greedy argmax sampler (NNTR_GPU_ARGMAX): keep lm_head logits on the
+  // GPU, reduce to the token id on-device, read back only 4 bytes (vs the full
+  // V-vocab D->H pass + host max_element). Only safe for pure greedy: no
+  // sampling, no bad-words penalty (those mutate logits on host), batch == 1.
+  nntrainer::request_gpu_argmax(std::getenv("NNTR_GPU_ARGMAX") != nullptr &&
+                                !do_sample && BAD_WORD_IDS.empty() &&
+                                BATCH_SIZE == 1);
   if (!is_initialized) {
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
