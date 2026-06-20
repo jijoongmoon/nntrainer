@@ -21,7 +21,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
+#include <tuple>
 #include <vector>
 
 namespace nntrainer {
@@ -849,28 +851,32 @@ __kernel void v_gather_ohwi_t(__global const half *src, __global half *dst,
 struct RopeScratch {
   cl_mem io = nullptr;
   size_t io_bytes = 0;
-  cl_mem cos = nullptr;
-  size_t cos_bytes = 0;
-  cl_mem sin = nullptr;
-  size_t sin_bytes = 0;
-  // LUT upload cache, keyed by source host pointer + uploaded row count +
-  // half_d. The half_d key is LOAD-BEARING for models with per-layer-type RoPE
-  // tables (Gemma4: sliding head_dim=256/theta=1e4, full head_dim=512/theta=1e6).
-  // Those models rebuild the flat cos/sin table IN-PLACE in one host buffer, so
-  // `cos_src` (the host pointer) is IDENTICAL across every layer even though the
-  // CONTENT changes at each sliding<->full transition -- and the device buffer
-  // is REALLOCATED (grown) when half_d doubles. Without the half_d key the
-  // pointer-only cache wrongly skips the re-upload, leaving the just-grown
-  // device LUT uninitialised -> the full-attention layers get an all-zero
-  // cos/sin LUT -> rope outputs zero -> qk scores zero -> garbage from the first
-  // full layer on. (Latent on single-head_dim models where the table never
-  // changes.) Every sliding<->full transition changes half_d, so this key forces
-  // exactly the needed re-uploads and still caches within a run of same-type
-  // layers.
-  const void *cos_src = nullptr;
-  const void *sin_src = nullptr;
-  unsigned int lut_positions = 0;
-  int lut_half_d = -1;
+  // Per-slot device LUT cache. Keyed by (cos_src host pointer, sin_src host
+  // pointer, half_d): each distinct RoPE slot keeps its OWN resident device
+  // cos/sin buffer, uploaded exactly ONCE. Models that alternate RoPE slots
+  // per layer (Gemma4: sliding head_dim=256/theta=1e4, full
+  // head_dim=512/theta=1e6) thus stop re-uploading the LUT at every
+  // sliding<->full transition -- the previous single (cos/sin) buffer was
+  // REALLOCATED + re-uploaded each transition because one device buffer cannot
+  // hold both slots. The caller (MHACoreLayer) now hands a STABLE, distinct
+  // host pointer per slot (std::map-node-stable flat-LUT cache), so the host
+  // pointer is a sound cache key here (it was already the key; what changed is
+  // that there is now one device buffer PER pointer, not one shared buffer).
+  // Single-head_dim models populate exactly one slot, matching the previous
+  // "uploaded once" behaviour. The half_d component disambiguates the (rare)
+  // case where two slots' host buffers were freed + reallocated to the same
+  // address but differ in width; positions are covered by sizing each slot's
+  // buffer to its own max (grow-only via tca_ensure on the cached entry).
+  struct LutSlot {
+    cl_mem cos = nullptr;
+    size_t cos_bytes = 0;
+    cl_mem sin = nullptr;
+    size_t sin_bytes = 0;
+    unsigned int positions = 0;
+    bool uploaded = false;
+  };
+  using LutKey = std::tuple<const void *, const void *, int>;
+  std::map<LutKey, LutSlot> lut_slots;
 };
 static RopeScratch &rope_scratch() {
   static RopeScratch s;
@@ -907,30 +913,35 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
   const size_t lut_bytes = (size_t)max_positions * half_d * sizeof(uint16_t);
 
   // The cos/sin LUT is a constant table (not the activation), staged through
-  // cl_mem scratch and uploaded ONCE (keyed by source pointer + row count) —
-  // repeated RoPE calls reuse it, no per-call upload. The activation (in/out)
-  // is bound SVM-direct (residency) when svm_inputs, else uploaded/read-back
-  // via cl_mem. Mixing an SVM arg with cl_mem args in one kernel is valid.
+  // cl_mem scratch and uploaded ONCE PER SLOT (keyed by source pointer pair +
+  // half_d) — repeated RoPE calls on the same slot reuse the resident device
+  // buffer, no per-call upload, and alternating slots (Gemma4 sliding<->full)
+  // each keep their own resident buffer so a transition is a cache HIT not a
+  // re-upload. The activation (in/out) is bound SVM-direct (residency) when
+  // svm_inputs, else uploaded/read-back via cl_mem. Mixing an SVM arg with
+  // cl_mem args in one kernel is valid.
   RopeScratch &sc = rope_scratch();
-  if (!tca_ensure(ctx, &sc.cos, &sc.cos_bytes, lut_bytes, CL_MEM_READ_ONLY) ||
-      !tca_ensure(ctx, &sc.sin, &sc.sin_bytes, lut_bytes, CL_MEM_READ_ONLY))
+  RopeScratch::LutSlot &slot =
+    sc.lut_slots[RopeScratch::LutKey{cos_lut, sin_lut, half_d}];
+  if (!tca_ensure(ctx, &slot.cos, &slot.cos_bytes, lut_bytes,
+                  CL_MEM_READ_ONLY) ||
+      !tca_ensure(ctx, &slot.sin, &slot.sin_bytes, lut_bytes, CL_MEM_READ_ONLY))
     return false;
   bool lut_uploaded = false;
   // NNTR_ROPE_REUPLOAD=1 (bisect): force the per-call LUT re-upload +
   // clFinish that the per-instance LUT pointers used to cause (52 hidden
   // drains/forward) -- isolates that ordering change from the FC flush.
   static const bool rope_reup = std::getenv("NNTR_ROPE_REUPLOAD") != nullptr;
-  if (rope_reup || sc.cos_src != cos_lut || sc.sin_src != sin_lut ||
-      sc.lut_positions < max_positions || sc.lut_half_d != half_d) {
-    if (clEnqueueWriteBuffer(q, sc.cos, CL_FALSE, 0, lut_bytes, cos_lut, 0,
+  // (re)upload only when this slot has not been uploaded yet, its buffer was
+  // (re)allocated to cover more positions, or the bisect flag forces it.
+  if (rope_reup || !slot.uploaded || slot.positions < max_positions) {
+    if (clEnqueueWriteBuffer(q, slot.cos, CL_FALSE, 0, lut_bytes, cos_lut, 0,
                              nullptr, nullptr) != CL_SUCCESS ||
-        clEnqueueWriteBuffer(q, sc.sin, CL_FALSE, 0, lut_bytes, sin_lut, 0,
+        clEnqueueWriteBuffer(q, slot.sin, CL_FALSE, 0, lut_bytes, sin_lut, 0,
                              nullptr, nullptr) != CL_SUCCESS)
       return false;
-    sc.cos_src = cos_lut;
-    sc.sin_src = sin_lut;
-    sc.lut_positions = max_positions;
-    sc.lut_half_d = half_d;
+    slot.positions = max_positions;
+    slot.uploaded = true;
     lut_uploaded = true;
   }
 
@@ -977,8 +988,8 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
         !kp->SetKernelArguments(1, &io_arg, sizeof(cl_mem)))
       return false;
   }
-  if (!kp->SetKernelArguments(2, &sc.cos, sizeof(cl_mem)) ||
-      !kp->SetKernelArguments(3, &sc.sin, sizeof(cl_mem)))
+  if (!kp->SetKernelArguments(2, &slot.cos, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(3, &slot.sin, sizeof(cl_mem)))
     return false;
 
   int Mi = (int)M, nh = (int)num_heads, hd = half_d, sp = (int)start_pos;

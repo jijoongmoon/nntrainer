@@ -113,9 +113,12 @@ bool two_conv_attention_prefill_f16_cl(const uint16_t *Q_host,
 ///   start_pos:     absolute sequence position of row 0 (cache_index).
 /// in/out are bound SVM-direct when `svm_inputs` (no host round-trip), else
 /// uploaded/read-back via cl_mem scratch. The cos/sin LUT is a constant table
-/// staged through cl_mem and cached across calls: the full [max_positions,
-/// head_dim/2] table is uploaded once (keyed by source pointer) and reused, so
-/// repeated RoPE calls incur no per-call LUT upload. `max_positions` is the row
+/// staged through cl_mem and cached PER SLOT across calls: each distinct
+/// (cos_lut, sin_lut, head_dim/2) gets its OWN resident device buffer, uploaded
+/// once and reused, so repeated RoPE calls incur no per-call LUT upload AND
+/// models that alternate RoPE slots per layer (Gemma4 sliding<->full) hit the
+/// cache on every transition instead of re-uploading (the caller must hand a
+/// STABLE host pointer per slot for this to hold). `max_positions` is the row
 /// count of the cos_lut/sin_lut tables.
 /// Returns false if unsupported (caller falls back to the host RoPE).
 /// in_clmem/out_clmem (static GPU_CLMEM residency): bind that side as a device

@@ -745,24 +745,42 @@ unsigned int MHACoreLayer::rope_lut_positions() const {
 void MHACoreLayer::ensure_rope_flat_lut() {
   const unsigned int half_ = head_dim / 2;
   const unsigned int mp = rope_lut_positions();
-  if (rope_flat_theta == theta && rope_flat_pos == mp &&
-      rope_flat_hd == (int)head_dim)
+  const RopeFlatKey key{(int)head_dim, theta, mp};
+
+  // The cache is process-wide static and shared by every layer instance; guard
+  // both the lookup and the build under rope_init_mtx (the flatten was already
+  // run single-threaded at finalize, but the GPU-RoPE fallback can re-enter
+  // from the forward path, and a per-slot insert must not race a concurrent
+  // slot's insert -- std::map node stability protects EXISTING entries' data()
+  // pointers across inserts, but the insert itself must be serialized).
+  std::lock_guard<std::mutex> lock(rope_init_mtx);
+
+  auto it = rope_flat_cache.find(key);
+  if (it != rope_flat_cache.end()) {
+    // Existing slot: just repoint the current-slot pointers. Stable across
+    // calls (std::map nodes never move) so the GPU upload stays cached.
+    rope_cos_flat_cur = it->second.first.data();
+    rope_sin_flat_cur = it->second.second.data();
     return;
+  }
+
+  // New slot: build the flat table (math identical to the previous path).
   precompute_freqs((int)head_dim, mp, theta, true);
-  rope_cos_flat_fp16.assign((size_t)mp * half_, 0);
-  rope_sin_flat_fp16.assign((size_t)mp * half_, 0);
+  RopeFlatVal val;
+  val.first.assign((size_t)mp * half_, 0);
+  val.second.assign((size_t)mp * half_, 0);
   // Row-wise bulk copy (rows are contiguous _FP16 = 2 bytes, same as the
   // uint16 bit view): the old per-element memcpy pair was ~12ms for
   // [2048 x 128].
   for (unsigned int p = 0; p < mp; ++p) {
-    std::memcpy(&rope_cos_flat_fp16[(size_t)p * half_],
-                (*freqs_cos_fp16)[p].data(), (size_t)half_ * sizeof(uint16_t));
-    std::memcpy(&rope_sin_flat_fp16[(size_t)p * half_],
-                (*freqs_sin_fp16)[p].data(), (size_t)half_ * sizeof(uint16_t));
+    std::memcpy(&val.first[(size_t)p * half_], (*freqs_cos_fp16)[p].data(),
+                (size_t)half_ * sizeof(uint16_t));
+    std::memcpy(&val.second[(size_t)p * half_], (*freqs_sin_fp16)[p].data(),
+                (size_t)half_ * sizeof(uint16_t));
   }
-  rope_flat_theta = theta;
-  rope_flat_pos = mp;
-  rope_flat_hd = (int)head_dim;
+  auto ins = rope_flat_cache.emplace(key, std::move(val));
+  rope_cos_flat_cur = ins.first->second.first.data();
+  rope_sin_flat_cur = ins.first->second.second.data();
 }
 #endif
 
@@ -1571,8 +1589,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       if (mp >= cache_index + (to - from)) {
         ensure_rope_flat_lut();
         const double _mha_t_lut = _kvst_on() ? _kvst_now() : 0;
-        const uint16_t *cos_lut = rope_cos_flat_fp16.data();
-        const uint16_t *sin_lut = rope_sin_flat_fp16.data();
+        // Current-slot stable pointers (per-(head_dim, theta, max_pos) cache):
+        // for Gemma4 the two attention slots each keep their own resident table,
+        // so the sliding<->full transition no longer rebuilds + re-uploads the
+        // shared LUT every layer. The pointers are std::map-node-stable, which
+        // keeps the rope_inplace_f16_cl device-LUT upload cached per slot.
+        const uint16_t *cos_lut = rope_cos_flat_cur;
+        const uint16_t *sin_lut = rope_sin_flat_cur;
         uint16_t *q_p =
           reinterpret_cast<uint16_t *>(query_step.getData<_FP16>());
         const uint16_t *k_p =

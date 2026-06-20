@@ -40,7 +40,9 @@
 #include <limits.h>
 #include <util_simd.h>
 
+#include <map>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -574,23 +576,36 @@ private:
   std::vector<std::vector<_FP16>> *cached_freqs_cos_fp16 = {};
   std::vector<std::vector<_FP16>> *cached_freqs_sin_fp16 = {};
   // Flattened [max_pos * head_dim/2] cos/sin LUT (fp16 bits) for the GPU RoPE
-  // path (rope_inplace_f16_cl). PROCESS-WIDE static (inline static): every
-  // layer shares one theta/head_dim/max_pos, so a per-instance member meant
-  // 26 identical rebuilds = ~305ms of GPU idle inside the first prefill
-  // (measured, the copy_h2h->rope first-forward gap). Built once, keyed by
-  // (theta, max_pos, head_dim); the GPU wrapper uploads it once.
-  inline static std::vector<uint16_t> rope_cos_flat_fp16;
-  inline static std::vector<uint16_t> rope_sin_flat_fp16;
-  inline static float rope_flat_theta = -1.0f;
-  inline static unsigned int rope_flat_pos = 0;
-  inline static int rope_flat_hd = -1;
+  // path (rope_inplace_f16_cl). PROCESS-WIDE static (inline static) CACHE keyed
+  // by (head_dim, theta, max_pos): models that alternate RoPE slots per layer
+  // (Gemma4: sliding head_dim=256/theta=1e4, full head_dim=512/theta=1e6) keep
+  // a SEPARATE, STABLE table per slot instead of rebuilding + re-uploading the
+  // single shared table on every sliding<->full transition. std::map is chosen
+  // for NODE STABILITY: the cos/sin vector storage never moves on insert, so
+  // the .data() pointer handed to the GPU wrapper stays valid for the whole run
+  // -- the rope_inplace_f16_cl device-LUT cache is keyed by that host pointer,
+  // so stable pointers keep the upload cached per slot (no per-layer thrash).
+  // Single-head_dim models (Qwen3/Gemma2) populate exactly one entry, matching
+  // the previous "built once" behaviour.
+  using RopeFlatKey = std::tuple<int, float, unsigned int>; // head_dim,theta,mp
+  using RopeFlatVal =
+    std::pair<std::vector<uint16_t>, std::vector<uint16_t>>; // (cos, sin)
+  inline static std::map<RopeFlatKey, RopeFlatVal> rope_flat_cache;
+  // Stable pointers into the cache entry for the CURRENT slot (set by
+  // ensure_rope_flat_lut). Per-instance: each layer instance points at its own
+  // slot's cached table; the underlying storage lives in the shared map so the
+  // pointers stay valid (and identical) across calls for a given slot.
+  const uint16_t *rope_cos_flat_cur = nullptr;
+  const uint16_t *rope_sin_flat_cur = nullptr;
 
   /**
-   * @brief Build (or reuse) the process-wide flat RoPE LUT. Idempotent,
-   *        keyed by (theta, max_position_embeddings, head_dim). Called from
-   *        finalize() so the ~40ms build lands at model load instead of
-   *        inside the first timed prefill (KVST "lutcheck" segment), and
-   *        from the GPU-RoPE hot path as the fallback.
+   * @brief Build (or reuse) the process-wide flat RoPE LUT for THIS instance's
+   *        current (head_dim, theta, max_pos) slot. Idempotent: an existing
+   *        cache entry is reused (just repoints rope_cos/sin_flat_cur); a new
+   *        slot is built (precompute_freqs + the flatten fill) and inserted.
+   *        Called from finalize() so the build lands at model load instead of
+   *        inside the first timed prefill (KVST "lutcheck" segment), and from
+   *        the GPU-RoPE hot path as the fallback.
    */
   void ensure_rope_flat_lut();
   /** @brief positions the RoPE LUT must cover = min(max_position_embeddings,
