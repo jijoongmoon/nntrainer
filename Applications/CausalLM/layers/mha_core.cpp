@@ -1795,6 +1795,129 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       }
     }
 #endif
+#ifdef ENABLE_FP16
+    // ---- (C) Adreno OHWI image-attention DECODE GPU-RoPE ---------------------
+    // The concat GPU-RoPE branch above is gated `!kv_ohwi_now`, but the live
+    // Adreno gemma4 decode path is the IMAGE-attention path (NNTR_KV_IMG_ATTN),
+    // which is a SEPARATE env from NNTR_KV_OHWI: is_kv_ohwi_enabled()/kv_ohwi_now
+    // are FALSE there, so the concat branch is also skipped and gpu_rope_done
+    // stays false -> the host fallback (1810) runs lower_q()+lower_kv() (two
+    // BLOCKING clEnqueueReadBuffer drains, ~16-35 ms/token over 35 layers) and
+    // host apply_rotary_emb. Rotate Q/K/V ON THE GPU instead, landing the bytes
+    // in exactly the SVM buffers the existing GPU OHWI scatter + image attention
+    // already consume:
+    //   * Q  -> rotate IN-PLACE into query_step's SVM plane (Q_p). The OHWI
+    //          decode qk kernel reads Q_p with q_clmem=nullptr (see 2340), so
+    //          the rotation must land in the SVM shadow. When the FC parked Q in
+    //          a planner cl_mem (q_cl != null) we read cl_mem -> SVM (drained
+    //          once, then null q_cl) so Q_p is fresh.
+    //   * K  -> rotate from key_step into b_cache_key_step's SVM concat cache
+    //          slice (kc_p). k_scatter_ohwi_cl reads b_cache_key_step (2317).
+    //          This is the SAME destination the host `else` branch writes (1881)
+    //          and the SAME destination the concat GPU-RoPE writes (kc_p, 1619).
+    //   * V  -> flat copy value_step -> b_cache_value_step's SVM slice (no RoPE).
+    //          v_scatter_ohwi_t_cl reads b_cache_value_step (2326) when
+    //          v_stage_svm is null (the unstaged decode path here). Matches the
+    //          host V copy (1892) byte-for-byte.
+    // Token-identical: rope_inplace_f16_cl == apply_rotary_emb_tensor_v2 for the
+    // rotated bytes (the concat GPU-RoPE already depends on this equivalence) and
+    // the destinations are identical to the host fallback's. drain_svm_out=false
+    // / drain=false keep the writes as in-order enqueues consumed only by the
+    // same-queue GPU OHWI scatter + image attention (the SVM cache is read on the
+    // host only after the lm_head lower drains the queue) -- the residency win.
+    // Gate: NNTR_OHWI_GPU_ROPE (default OFF -> host path unchanged, A/B-able).
+    // Falls back (leaves gpu_rope_done=false -> host RoPE) if: not the IMG-ATTN
+    // env, not a decode step (M!=1), not FP16, kv_int8, the rope LUT does not
+    // cover the position, the cache slices are not SVM, or any GPU op fails.
+    static const bool _ohwi_gpu_rope =
+      std::getenv("NNTR_OHWI_GPU_ROPE") != nullptr;
+    if (!gpu_rope_done && _ohwi_gpu_rope && !_gpu_rope_off && _mha_gpu_on &&
+        _kv_img_attn_env && use_gemm_attention && !kv_int8 &&
+        (to - from) == 1 &&
+        query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        value_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        cache_key.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        cache_value.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      const unsigned int mp = rope_lut_positions();
+      // SVM cache slices are the scatter sources; require them SVM-backed (they
+      // are on the live NNTR_GPU_SVM_POOL path). Q may be cl_mem (FC output) or
+      // SVM; rope_inplace handles cl_mem-in -> SVM-out.
+      const bool kc_svm = b_cache_key_step.getMemoryData() &&
+                          b_cache_key_step.getMemoryData()->isSVM();
+      const bool vc_svm = b_cache_value_step.getMemoryData() &&
+                          b_cache_value_step.getMemoryData()->isSVM();
+      const bool q_svm = query_step.getMemoryData() &&
+                         query_step.getMemoryData()->isSVM();
+      const bool v_svm = value_step.getMemoryData() &&
+                         value_step.getMemoryData()->isSVM();
+      if (mp >= cache_index + (to - from) && kc_svm && vc_svm) {
+        ensure_rope_flat_lut();
+        const uint16_t *cos_lut = rope_cos_flat_cur;
+        const uint16_t *sin_lut = rope_sin_flat_cur;
+        uint16_t *q_p =
+          reinterpret_cast<uint16_t *>(query_step.getData<_FP16>());
+        const uint16_t *k_p =
+          reinterpret_cast<const uint16_t *>(key_step.getData<_FP16>());
+        uint16_t *kc_p =
+          reinterpret_cast<uint16_t *>(b_cache_key_step.getData<_FP16>());
+        const uint16_t *v_in =
+          reinterpret_cast<const uint16_t *>(value_step.getData<_FP16>());
+        uint16_t *v_out =
+          reinterpret_cast<uint16_t *>(b_cache_value_step.getData<_FP16>());
+        const unsigned int kv_n =
+          (to - from) * (unsigned int)num_heads_KV * (unsigned int)head_dim;
+        // ORDER MATTERS for safe partial-failure fallback: rotate K and V into
+        // the cache slices FIRST (these read the UNMODIFIED key_step/value_step
+        // and write b_cache_key/value_step), and rotate Q IN-PLACE LAST. If any
+        // op fails, gpu_rope_done stays false and the host fallback re-reads the
+        // still-untouched key_step/value_step/query_step (the partial GPU writes
+        // into the cache slices get overwritten by the host RoPE; Q is untouched
+        // unless every op already succeeded). So Q is never double-rotated.
+        // K: rotate key_step -> b_cache_key_step SVM slice (the OHWI scatter
+        // source, 2317). cl_mem-in (k_cl) -> SVM-out. key_step left unmodified.
+        bool ok = nntrainer::rope_inplace_f16_cl(
+          k_p, kc_p, cos_lut, sin_lut, to - from, num_heads_KV, head_dim,
+          cache_index, mp, kc_svm, /*in_clmem=*/k_cl, /*out_clmem=*/nullptr,
+          /*drain_svm_out=*/false);
+        // V: flat copy value_step -> b_cache_value_step SVM slice (no RoPE, the
+        // OHWI v-scatter source, 2326). value_step left unmodified.
+        if (ok)
+          ok = nntrainer::gpu_copy_f16_cl(v_in, v_out, kv_n, v_svm,
+                                          /*in_clmem=*/v_cl, /*out_clmem=*/nullptr,
+                                          /*drain=*/false);
+        // Q LAST: in-place into the SVM shadow (the OHWI decode qk reads Q_p
+        // with q_clmem=null, 2340). cl_mem-in -> SVM-out when the FC parked Q in
+        // cl_mem. Only run once K+V are committed so a Q failure cannot leave a
+        // half-rotated, then re-rotated, Q.
+        if (ok)
+          ok = nntrainer::rope_inplace_f16_cl(
+            q_p, q_p, cos_lut, sin_lut, to - from, num_heads_Q, head_dim,
+            cache_index, mp, q_svm, /*in_clmem=*/q_cl, /*out_clmem=*/nullptr,
+            /*drain_svm_out=*/false);
+        if (ok) {
+          // All committed. Q/K/V no longer read on the host: null their cl_mem
+          // handles (the GPU rotation already read them, SVM shadows are fresh)
+          // so no later lower_q/lower_kv fires.
+          q_cl = nullptr;
+          k_cl = nullptr;
+          v_cl = nullptr;
+          gpu_rope_done = true;
+          static int _ohwi_rope_logged = 0;
+          if (!_ohwi_rope_logged) {
+            _ohwi_rope_logged = 1;
+            std::fprintf(stderr,
+                         "[OHWI-GPU-ROPE] engaged M=%u cache_index=%u mp=%u\n",
+                         to - from, cache_index, mp);
+            std::fflush(stderr);
+          }
+        }
+        // ok==false -> gpu_rope_done stays false: host fallback runs unchanged
+        // (the partial GPU writes above are harmless -- the host RoPE rewrites
+        // Q/K/V over them after lower_q/lower_kv).
+      }
+    }
+#endif
     if (std::getenv("NNTR_ROPE_TPROF")) {
       static int _dbg_pf = 0, _dbg_dec = 0;
       const bool _dec = (to - from) == 1;
