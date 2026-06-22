@@ -38,26 +38,9 @@ namespace nntrainer::opencl {
 #define CL_QUEUE_RECORDABLE_QCOM (1u << 30u) /* 0x40000000 */
 #endif
 
-typedef struct _cl_recording_qcom *cl_recording_qcom;
-
-// Per-replay kernel-argument update descriptor (phase-2 uses this to bump the
-// attention N_kv / KV-scatter position between token replays).
-typedef struct _cl_array_arg_qcom {
-  cl_uint dispatch_index;
-  cl_uint arg_index;
-  size_t arg_size;
-  const void *arg_value;
-} cl_array_arg_qcom;
-
-typedef struct _cl_offset_qcom {
-  cl_uint dispatch_index;
-  size_t offsets[3];
-} cl_offset_qcom;
-
-typedef struct _cl_workgroup_qcom {
-  cl_uint dispatch_index;
-  const size_t *workgroup_size;
-} cl_workgroup_qcom;
+// cl_recording_qcom + cl_array_arg_qcom / cl_offset_qcom / cl_workgroup_qcom are
+// now declared in opencl_command_queue_manager.h (shared with the R3 override
+// builder). The function-pointer typedefs + entry-point resolution stay here.
 
 typedef cl_recording_qcom(CL_API_CALL *PFN_clNewRecordingQCOM)(cl_command_queue,
                                                                cl_int *);
@@ -253,6 +236,70 @@ void CommandQueueManager::initRecordableQueues(cl_context context,
           (void *)recordable_command_queue_, (void *)io_command_queue_);
 }
 
+// ---------------------------------------------------------------------------
+// Record/replay API (R1). The three clEnqueueNDRangeKernel chokepoints above
+// target active_recording_queue_ while it is non-null, so beginRecording()
+// flips the WHOLE kernel-dispatch chain into capture mode without touching any
+// caller. Default (null) path is byte-identical.
+// ---------------------------------------------------------------------------
+bool CommandQueueManager::beginRecording() {
+  if (recq_new_ == nullptr || recordable_command_queue_ == nullptr) {
+    ml_logw("NNTR_RECQ: beginRecording requested but the recordable queue / "
+            "entry points are unavailable (needs NNTR_RECQ on a QCOM device).");
+    return false;
+  }
+  releaseRecording(); // a prior recording must be freed first
+  cl_int err = CL_SUCCESS;
+  active_recording_handle_ = recq_new_(recordable_command_queue_, &err);
+  if (active_recording_handle_ == nullptr || err != CL_SUCCESS) {
+    ml_loge("NNTR_RECQ: clNewRecordingQCOM failed (err %d).", err);
+    active_recording_handle_ = nullptr;
+    return false;
+  }
+  recq_dispatch_index_ = 0;
+  active_recording_queue_ = recordable_command_queue_; // enter capture mode
+  return true;
+}
+
+bool CommandQueueManager::endRecording() {
+  if (active_recording_queue_ == nullptr || active_recording_handle_ == nullptr)
+    return false;
+  const cl_int err =
+    recq_end_ ? recq_end_(active_recording_handle_) : CL_INVALID_OPERATION;
+  active_recording_queue_ = nullptr; // leave capture mode regardless
+  if (err != CL_SUCCESS) {
+    ml_loge("NNTR_RECQ: clEndRecordingQCOM failed (err %d).", err);
+    return false;
+  }
+  return true;
+}
+
+bool CommandQueueManager::replayRecording(const cl_array_arg_qcom *args,
+                                          size_t n_args,
+                                          const cl_workgroup_qcom *gws,
+                                          size_t n_gws, cl_event *event) {
+  if (active_recording_handle_ == nullptr || recq_enqueue_ == nullptr ||
+      command_queue_ == nullptr)
+    return false;
+  // Replay on the LIVE in-order command_queue_ (NOT the recordable queue). Only
+  // scalar-arg + global-work-size overrides are used (decode de-SVM needs no
+  // global-offset or local-work-size overrides).
+  const cl_int err =
+    recq_enqueue_(command_queue_, active_recording_handle_, n_args, args, 0,
+                  nullptr, n_gws, gws, 0, nullptr, 0, nullptr, event);
+  if (err != CL_SUCCESS) {
+    ml_loge("NNTR_RECQ: clEnqueueRecordingQCOM failed (err %d).", err);
+    return false;
+  }
+  return true;
+}
+
+void CommandQueueManager::releaseRecording() {
+  if (active_recording_handle_ != nullptr && recq_release_ != nullptr)
+    recq_release_(active_recording_handle_);
+  active_recording_handle_ = nullptr;
+}
+
 /**
  * @brief Release th OpenCL command queue instance
  *
@@ -269,6 +316,8 @@ void CommandQueueManager::ReleaseCommandQueue() {
  *
  */
 CommandQueueManager::~CommandQueueManager() {
+  // Release any held record/replay recording before its queues go away.
+  releaseRecording();
   // Recordable + host-I/O queues (NNTR_RECQ) are created once with refcount 1,
   // so a single release each is correct.
   if (recordable_command_queue_) {
@@ -597,10 +646,16 @@ bool CommandQueueManager::DispatchCommand(
   if (track)
     evt_arg = &local_evt;
 
-  // returns NULL with error code if fails
+  // returns NULL with error code if fails. R1: while recording, capture onto
+  // the recordable queue instead of executing on command_queue_; count the
+  // captured dispatch so the caller can map it to a per-token override.
+  cl_command_queue rq_target =
+    active_recording_queue_ ? active_recording_queue_ : command_queue_;
   const int error_code = clEnqueueNDRangeKernel(
-    command_queue_, kernel_, 3, nullptr, global, local,
+    rq_target, kernel_, 3, nullptr, global, local,
     events_to_wait.size(), events_to_wait.data(), evt_arg);
+  if (active_recording_queue_ != nullptr && error_code == CL_SUCCESS)
+    ++recq_dispatch_index_;
   static const bool rqt_on2 = std::getenv("NNTR_RECQ_TRACE") != nullptr;
   if (rqt_on2) {
     char nm[96] = {0};
@@ -656,10 +711,16 @@ bool CommandQueueManager::DispatchCommand(
   if (track)
     evt_arg = &local_evt;
 
-  // returns NULL with error code if fails
+  // returns NULL with error code if fails. R1: while recording, capture onto
+  // the recordable queue instead of executing on command_queue_; count the
+  // captured dispatch so the caller can map it to a per-token override.
+  cl_command_queue rq_target =
+    active_recording_queue_ ? active_recording_queue_ : command_queue_;
   const int error_code = clEnqueueNDRangeKernel(
-    command_queue_, kernel_, 3, nullptr, global, local,
+    rq_target, kernel_, 3, nullptr, global, local,
     events_to_wait.size(), events_to_wait.data(), evt_arg);
+  if (active_recording_queue_ != nullptr && error_code == CL_SUCCESS)
+    ++recq_dispatch_index_;
   static const bool rqt_on2 = std::getenv("NNTR_RECQ_TRACE") != nullptr;
   if (rqt_on2) {
     char nm[96] = {0};
@@ -706,9 +767,15 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
   if (track)
     evt_arg = &local_evt;
 
+  // R1: while recording, capture onto the recordable queue instead of executing
+  // on command_queue_; count the captured dispatch for the override mapping.
+  cl_command_queue rq_target =
+    active_recording_queue_ ? active_recording_queue_ : command_queue_;
   const auto error_code = clEnqueueNDRangeKernel(
-    command_queue_, kernel, work_dim, nullptr, global_work_size,
+    rq_target, kernel, work_dim, nullptr, global_work_size,
     local_work_size, num_events_in_wait_list, event_wait_list, evt_arg);
+  if (active_recording_queue_ != nullptr && error_code == CL_SUCCESS)
+    ++recq_dispatch_index_;
 
   static const bool rqt_on = std::getenv("NNTR_RECQ_TRACE") != nullptr;
   if (rqt_on) {

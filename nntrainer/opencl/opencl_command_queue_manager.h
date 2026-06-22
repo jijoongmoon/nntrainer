@@ -22,6 +22,38 @@
 
 namespace nntrainer::opencl {
 
+// ---------------------------------------------------------------------------
+// cl_qcom_recordable_queues data types — absent from the base CL/cl.h in this
+// tree; the Adreno 840 driver implements them at runtime. Shared between the
+// command-queue manager (record/replay API below) and the decode-loop
+// override builder (R3). The function-pointer typedefs + runtime entry-point
+// resolution stay TU-private in the .cpp.
+// ---------------------------------------------------------------------------
+typedef struct _cl_recording_qcom *cl_recording_qcom;
+
+/// Per-replay kernel-argument override. dispatch_index = the kernel's 0-based
+/// ordinal in the recorded chain (queried via getRecordDispatchIndex() during
+/// the record pass); arg_index = the kernel-arg ordinal; arg_value points at a
+/// value that must outlive the replayRecording() call.
+typedef struct _cl_array_arg_qcom {
+  cl_uint dispatch_index;
+  cl_uint arg_index;
+  size_t arg_size;
+  const void *arg_value;
+} cl_array_arg_qcom;
+
+typedef struct _cl_offset_qcom {
+  cl_uint dispatch_index;
+  size_t offsets[3];
+} cl_offset_qcom;
+
+/// Per-replay global-work-size override (workgroup_size points at a size_t[3]
+/// that must outlive the replayRecording() call).
+typedef struct _cl_workgroup_qcom {
+  cl_uint dispatch_index;
+  const size_t *workgroup_size;
+} cl_workgroup_qcom;
+
 /**
  * @class CommandQueueManager contains wrappers for managing OpenCL command
  * queue
@@ -55,6 +87,21 @@ class CommandQueueManager : public Singleton<CommandQueueManager> {
    */
   cl_command_queue recordable_command_queue_{nullptr};
   cl_command_queue io_command_queue_{nullptr};
+
+  /**
+   * @brief Record/replay state (R1). While recording (beginRecording ->
+   * endRecording), the three clEnqueueNDRangeKernel chokepoints target
+   * active_recording_queue_ (= recordable_command_queue_) instead of
+   * command_queue_, so the per-token decode dispatch chain is CAPTURED (not
+   * executed). recq_dispatch_index_ counts captured dispatches since
+   * beginRecording so the caller can map {layer, op} -> dispatch_index for the
+   * per-token override arrays. active_recording_handle_ holds the finalized
+   * recording for replayRecording(). All null/0 on the canonical path =>
+   * byte-identical.
+   */
+  cl_command_queue active_recording_queue_{nullptr};
+  cl_uint recq_dispatch_index_{0};
+  cl_recording_qcom active_recording_handle_{nullptr};
 
   /**
    * @brief Resolve the cl_qcom_recordable_queues entry points and create the
@@ -247,6 +294,56 @@ public:
    * @return cl_command_queue (plain) or nullptr
    */
   cl_command_queue getIoQueue() { return io_command_queue_; }
+
+  /**
+   * @brief Start capturing the kernel dispatch chain (R1). Subsequent kernel
+   * enqueues (DispatchCommand / enqueueKernel) are CAPTURED onto the recordable
+   * queue instead of executing on command_queue_. Resets the dispatch counter.
+   * Requires NNTR_RECQ (recordable queue + entry points available); returns
+   * false otherwise (caller falls back to normal per-token inference).
+   */
+  bool beginRecording();
+
+  /**
+   * @brief Finalize the recording started by beginRecording() and restore
+   * normal (command_queue_) dispatch. The recording is held for replay until
+   * the next beginRecording() or releaseRecording(). Returns false if not
+   * recording or the driver rejected the finalize.
+   */
+  bool endRecording();
+
+  /**
+   * @brief Replay the finalized recording on the LIVE command_queue_ with the
+   * given per-token scalar-arg / global-work-size overrides (R3/R4). Each call
+   * must re-specify ALL overrides it needs (overrides are not cumulative).
+   * @param args  scalar-arg overrides (may be null if n_args==0)
+   * @param gws   global-work-size overrides (may be null if n_gws==0)
+   * @param event optional out event (signaled on replay completion; used to
+   *              gate the argmax readback on io_command_queue_)
+   * @return true on CL_SUCCESS
+   */
+  bool replayRecording(const cl_array_arg_qcom *args, size_t n_args,
+                       const cl_workgroup_qcom *gws, size_t n_gws,
+                       cl_event *event);
+
+  /**
+   * @brief Release the held recording (called at decode-loop teardown; also
+   * called implicitly by the destructor and by a subsequent beginRecording()).
+   */
+  void releaseRecording();
+
+  /**
+   * @brief Number of dispatches captured since beginRecording(). During the
+   * record pass the caller reads this to learn each enqueued kernel's
+   * dispatch_index for the override arrays.
+   */
+  cl_uint getRecordDispatchIndex() const { return recq_dispatch_index_; }
+
+  /**
+   * @brief True between beginRecording() and endRecording() (dispatches are
+   * being captured, not executed).
+   */
+  bool isRecording() const { return active_recording_queue_ != nullptr; }
 
   /**
    * @brief Destroy the Command Queue Manager object
