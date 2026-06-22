@@ -18,6 +18,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
@@ -402,6 +403,37 @@ static inline void compute_fp16vcache_transposed_int8(
 #endif
 
 namespace causallm {
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+// Upload a vector<vector<_FP16>> RoPE LUT to a flat device buffer ONCE (cached
+// by table identity), [num_positions * half] row-major. The per-call host LUT
+// row would otherwise force a blocking host->device cudaMemcpy in cuda_rope --
+// nsys showed that at 74% of API time under NNTR_CUDA_ASYNC. There are only a
+// couple of distinct tables (one per head_dim), so this is a few MB, uploaded
+// once. Returns a device pointer; cuda_rope's dev check then skips the mirror.
+static const unsigned short *
+rope_lut_device(std::vector<std::vector<_FP16>> *table, int half) {
+  static std::unordered_map<const void *, unsigned short *> cache;
+  static std::mutex mtx;
+  std::lock_guard<std::mutex> lk(mtx);
+  auto it = cache.find(table);
+  if (it != cache.end())
+    return it->second;
+  const size_t npos = table->size();
+  std::vector<unsigned short> flat(npos * (size_t)half);
+  for (size_t p = 0; p < npos; ++p)
+    std::memcpy(&flat[p * half], (*table)[p].data(),
+                (size_t)half * sizeof(unsigned short));
+  unsigned short *dev = nullptr;
+  if (cudaMalloc(&dev, flat.size() * sizeof(unsigned short)) != cudaSuccess)
+    dev = nullptr;
+  else
+    cudaMemcpy(dev, flat.data(), flat.size() * sizeof(unsigned short),
+               cudaMemcpyHostToDevice);
+  cache[table] = dev;
+  return dev;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Record/replay (recq) per-token override registry (R3). Populated by the MHA
@@ -2144,12 +2176,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                         pa.type == cudaMemoryTypeDevice);
             cudaGetLastError();
             if (dev) {
-              auto &cosv = (*cached_freqs_cos_fp16)[cache_index];
-              auto &sinv = (*cached_freqs_sin_fp16)[cache_index];
-              q_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
-                q, q, reinterpret_cast<const unsigned short *>(cosv.data()),
-                reinterpret_cast<const unsigned short *>(sinv.data()),
-                query_step.width() / head_dim, head_dim);
+              const int half = head_dim / 2;
+              const unsigned short *cosd =
+                rope_lut_device(cached_freqs_cos_fp16, half);
+              const unsigned short *sind =
+                rope_lut_device(cached_freqs_sin_fp16, half);
+              if (cosd && sind)
+                q_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
+                  q, q, cosd + (size_t)cache_index * half,
+                  sind + (size_t)cache_index * half,
+                  query_step.width() / head_dim, head_dim);
             }
           }
         }
@@ -2211,13 +2247,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             auto *kout = reinterpret_cast<unsigned short *>(
               b_cache_key_step.getData<_FP16>());
             if (dev(kin) && dev(kout)) {
-              auto &cosv = (*cached_freqs_cos_fp16)[cache_index];
-              auto &sinv = (*cached_freqs_sin_fp16)[cache_index];
-              k_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
-                kin, kout,
-                reinterpret_cast<const unsigned short *>(cosv.data()),
-                reinterpret_cast<const unsigned short *>(sinv.data()),
-                key_step.width() / head_dim, head_dim);
+              const int half = head_dim / 2;
+              const unsigned short *cosd =
+                rope_lut_device(cached_freqs_cos_fp16, half);
+              const unsigned short *sind =
+                rope_lut_device(cached_freqs_sin_fp16, half);
+              if (cosd && sind)
+                k_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
+                  kin, kout, cosd + (size_t)cache_index * half,
+                  sind + (size_t)cache_index * half,
+                  key_step.width() / head_dim, head_dim);
             }
           }
         }
