@@ -37,10 +37,14 @@ void CudaContext::initialize() noexcept {
     // separate copy step. Falls back to host memory if UVM is unavailable.
     setMemAllocator(std::make_shared<CudaMemAllocator>());
 
-    // CUDA ComputeOps: host-side copy ops so Tensor::copy() works on managed
-    // (host-coherent) memory. Accelerator quantized GEMM/GEMV predicates stay
-    // false (base default) -> CPU fallback until the CUDA kernels land in P3.
-    getContextData()->setComputeOps(get_cuda_ops());
+    // ComputeOps = the CPU ops table. Unlike OpenCL cl_mem (not host-
+    // addressable, hence ClComputeOps), engine=cuda tensors are Unified Memory
+    // (cudaMallocManaged) = host-coherent, so every standard tensor op
+    // (sgemv/sgemm/scopy/dot/elementwise) runs correctly on the managed buffers
+    // via the CPU backend. GPU-accelerated ops are layered on top by the CUDA
+    // layer classes (CudaFcLayer's cuBLAS path); anything not yet ported simply
+    // falls back to a correct CPU computation on the same UVM pointer.
+    getContextData()->setComputeOps(get_cpu_ops());
 
   } catch (std::exception &e) {
     ml_loge("cuda_context: initialization failed!!, reason: %s", e.what());

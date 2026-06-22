@@ -41,6 +41,19 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
   const DT at = input_.getDataType();
 
   if (wt == DT::FP32 && at == DT::FP32) {
+    // cuBLAS requires device-accessible pointers. Weights/output are on the
+    // cuda context (UVM), but the input may come from a host (engine=cpu) layer
+    // across an engine boundary -- feeding a host-only pointer to cuBLAS yields
+    // garbage. Only take the GPU path when the input is managed/device memory;
+    // otherwise fall through to the CPU path (correct on the UVM buffers).
+    auto deviceAccessible = [](const void *p) {
+      cudaPointerAttributes a{};
+      bool ok = (cudaPointerGetAttributes(&a, p) == cudaSuccess) &&
+                (a.type == cudaMemoryTypeManaged ||
+                 a.type == cudaMemoryTypeDevice);
+      cudaGetLastError(); // clear the benign error a host pointer may set
+      return ok;
+    };
     const auto &id = input_.getDim();
     const auto &od = hidden_.getDim();
     // FC flattens all leading dims into M; width is the contracted dim K, the
@@ -48,7 +61,9 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
     const int K = (int)id.width();
     const int N = (int)od.width();
     const int M = (int)(id.batch() * id.channel() * id.height());
-    if (M > 0 && N > 0 && K > 0 &&
+    if (M > 0 && N > 0 && K > 0 && deviceAccessible(input_.getData<float>()) &&
+        deviceAccessible(weight.getData<float>()) &&
+        deviceAccessible(hidden_.getData<float>()) &&
         cuda::BlasManager::Global().sgemmRowMajor(
           M, N, K, input_.getData<float>(), weight.getData<float>(),
           hidden_.getData<float>())) {
@@ -57,7 +72,7 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
       cuda::StreamManager::Global().finish();
       return;
     }
-    // cuBLAS unavailable / failed -> fall through to the host path.
+    // cuBLAS unavailable / host-side input / failed -> fall through to host.
   }
 
   // Host fallback: correct for FP16 / QINT4 / Q4_x / Q6_K (and any cuBLAS
