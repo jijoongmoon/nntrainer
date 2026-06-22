@@ -65,33 +65,62 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
   const int N = (int)od.width();
   const int M = (int)(id.batch() * id.channel() * id.height());
 
-  // QINT4 weight: fused dequant-GEMM on device. Reads the int4 weight inline
-  // (no dense FP32 weight buffer) -> fits real-size (e2b) memory. FP32 act.
+  static const bool fc_dbg = std::getenv("NNTR_FC_DEBUG") != nullptr;
+  if (fc_dbg) {
+    auto ptype = [](const void *p) {
+      cudaPointerAttributes a{};
+      bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess;
+      cudaGetLastError();
+      if (!ok) return 'u'; // unregistered / error
+      switch (a.type) {
+      case cudaMemoryTypeManaged: return 'm';
+      case cudaMemoryTypeDevice: return 'd';
+      case cudaMemoryTypeHost: return 'h';
+      default: return '0';
+      }
+    };
+    fprintf(stderr,
+            "[FCDBG] wt=%d at=%d M=%d N=%d K=%d in=%c w=%c out=%c\n", (int)wt,
+            (int)at, M, N, K, ptype(input_.getData<float>()),
+            ptype(weight.getData<uint8_t>()), ptype(hidden_.getData<float>()));
+  }
+
+  // QINT4 weight: fused dequant-GEMM on device. Decodes the int4 weight inline
+  // from the KAI Section-A super-row layout (no dense FP32 weight buffer) ->
+  // fits real-size (e2b) memory. FP32 act.
   //
-  // NOTE: default OFF. This path assumes a PLAIN row-major [K,N] PER_CHANNEL_
-  // AFFINE layout (signed nibbles + FP32 scale[i/group]); but nntrainer ALWAYS
-  // upgrades a loaded QINT4 weight to KAI_QSI4CXP_4x4x32 in memory (Section-A
-  // packing, fp16 per-channel scales -- see Int4QTensor::upgradeQScheme /
-  // Int4Utils::packPlainToSectionA). So the in-memory bytes do NOT match this
-  // kernel; a correct GPU QINT4 GEMM must read the KAI Section-A layout (the
-  // v8c CUDA port, pending). The arithmetic here is validated standalone and
-  // kept as the foundation; enable only for a genuinely plain weight.
+  // A loaded QINT4 weight is ALWAYS KAI_QSI4CXP_4x4x32 in memory (Section-A
+  // packing + fp16 per-channel scales -- see Int4QTensor::upgradeQScheme /
+  // Int4Utils::packPlainToSectionA), so we read that layout directly. Default
+  // ON: the host Tensor::dot path is NYI for QINT4 on x86 (KAI is ARM-only),
+  // so the device kernel is the only correct x86/CUDA path. Set
+  // NNTR_FC_CUDA_QINT4=0 to force the host fallback (correct only on ARM).
+  // The older plain-layout kernel (cuda_fc_qint4_gemm_fp32) is kept as a
+  // foundation for genuinely plain weights but is not on this path.
   if (wt == DT::QINT4 && at == DT::FP32 && M > 0 && N > 0 && K > 0) {
-    static const bool cuda_qint4 = []() {
+    static const bool seca_enabled = []() {
       const char *e = std::getenv("NNTR_FC_CUDA_QINT4");
-      return e != nullptr && e[0] == '1'; // default OFF (see note above)
+      return !(e != nullptr && e[0] == '0'); // default ON
     }();
-    if (cuda_qint4 && (int)weight.getDim().height() == K &&
-        deviceAccessible(input_.getData<float>()) &&
-        deviceAccessible(weight.getData<uint8_t>()) &&
-        deviceAccessible(hidden_.getData<float>()) &&
-        cuda::cuda_fc_qint4_gemm_fp32(
-          input_.getData<float>(), weight.getData<uint8_t>(),
-          weight.getScale<float>(), hidden_.getData<float>(), (unsigned)M,
-          (unsigned)N, (unsigned)K, (unsigned)Int4QTensor::getGroupSize())) {
-      return;
+    if (seca_enabled && (int)weight.getDim().height() == K) {
+      const float *X = input_.getData<float>();
+      const uint8_t *W = weight.getData<uint8_t>();
+      const uint16_t *S = weight.getScale<uint16_t>();
+      float *Y = hidden_.getData<float>();
+      // Zero-copy when the tensors are device-accessible (UVM); otherwise mirror
+      // the host-heap tensors into device memory (the QINT4 host GEMM is NYI on
+      // x86, so this device path is the only correct one there).
+      const bool all_dev =
+        deviceAccessible(X) && deviceAccessible(W) && deviceAccessible(Y);
+      const bool ok =
+        all_dev ? cuda::cuda_fc_qint4_sectionA_gemm_fp32(X, W, S, Y, (unsigned)M,
+                                                         (unsigned)N, (unsigned)K)
+                : cuda::cuda_fc_qint4_sectionA_gemm_fp32_resident(
+                    X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K);
+      if (ok)
+        return;
     }
-    // gated off / host input / failed -> fall through to the host path.
+    // disabled / failed -> fall through to the host path (NYI for QINT4 x86).
   }
 
   // FP32 weight: cuBLAS SGEMM on the UVM pointers.
