@@ -359,35 +359,39 @@ __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
   Y[(long)m * N + n] = (float)acc * ascale[m] * dp4a_h2f(wscale[n]);
 }
 
-// Shared-memory tiled dp4a GEMM. A 16x16 output tile per block; each K-chunk of
-// 64 is cooperatively staged into shared int8 tiles (weight nibbles unpacked on
-// load), so every global weight/act byte is reused across the 16 rows/cols of
-// the tile -- ~16x less global traffic than the per-output kernel, which is the
-// real lever (the per-output kernels are memory-bound, not compute-bound).
-#define DP4A_TM 16
-#define DP4A_TN 16
-#define DP4A_TK 64
-__global__ void dp4a_gemm_tiled(const signed char *q8, const signed char *plain,
-                                const float *ascale,
-                                const unsigned short *wscale, float *Y, int M,
-                                int N, int K) {
-  __shared__ signed char As[DP4A_TM][DP4A_TK];
-  __shared__ signed char Ws[DP4A_TN][DP4A_TK];
-  int tx = threadIdx.x, ty = threadIdx.y;
-  int row = blockIdx.y * DP4A_TM + ty; // m
-  int col = blockIdx.x * DP4A_TN + tx; // n
+// Register-blocked dp4a GEMM: a 64x64 output tile per block; each of the 256
+// threads accumulates a 4x4 micro-tile in registers, so a K-chunk of 32 staged
+// once into shared memory feeds 16 dp4a per thread before the next load -- much
+// higher arithmetic intensity than the 1-output-per-thread tiled kernel.
+#define RB_BM 64
+#define RB_BN 64
+#define RB_BK 32
+#define RB_TM 4
+#define RB_TN 4
+__global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
+                              const float *ascale, const unsigned short *wscale,
+                              float *Y, int M, int N, int K) {
+  __shared__ signed char As[RB_BM][RB_BK];
+  __shared__ signed char Ws[RB_BN][RB_BK];
+  int tx = threadIdx.x, ty = threadIdx.y; // 0..15 each
+  int tid = ty * 16 + tx;
+  int blockM = blockIdx.y * RB_BM, blockN = blockIdx.x * RB_BN;
   int Kh = (K + 1) >> 1;
-  int tid = ty * DP4A_TN + tx;
-  int acc = 0;
-  for (int k0 = 0; k0 < K; k0 += DP4A_TK) {
-    for (int e = tid; e < DP4A_TM * DP4A_TK; e += DP4A_TM * DP4A_TN) {
-      int i = e / DP4A_TK, j = e % DP4A_TK;
-      int mm = blockIdx.y * DP4A_TM + i, kk = k0 + j;
+  int acc[RB_TM][RB_TN];
+#pragma unroll
+  for (int i = 0; i < RB_TM; i++)
+#pragma unroll
+    for (int j = 0; j < RB_TN; j++)
+      acc[i][j] = 0;
+  for (int k0 = 0; k0 < K; k0 += RB_BK) {
+    for (int e = tid; e < RB_BM * RB_BK; e += 256) {
+      int i = e / RB_BK, j = e % RB_BK;
+      int mm = blockM + i, kk = k0 + j;
       As[i][j] = (mm < M && kk < K) ? q8[(long)mm * K + kk] : (signed char)0;
     }
-    for (int e = tid; e < DP4A_TN * DP4A_TK; e += DP4A_TM * DP4A_TN) {
-      int i = e / DP4A_TK, j = e % DP4A_TK;
-      int nn = blockIdx.x * DP4A_TN + i, kk = k0 + j;
+    for (int e = tid; e < RB_BN * RB_BK; e += 256) {
+      int i = e / RB_BK, j = e % RB_BK;
+      int nn = blockN + i, kk = k0 + j;
       signed char wv = 0;
       if (nn < N && kk < K) {
         unsigned char b = (unsigned char)plain[(long)nn * Kh + (kk >> 1)];
@@ -398,12 +402,35 @@ __global__ void dp4a_gemm_tiled(const signed char *q8, const signed char *plain,
     }
     __syncthreads();
 #pragma unroll
-    for (int kk = 0; kk < DP4A_TK; kk += 4)
-      acc = __dp4a(*(const int *)&As[ty][kk], *(const int *)&Ws[tx][kk], acc);
+    for (int kk = 0; kk < RB_BK; kk += 4) {
+      int af[RB_TM], wf[RB_TN];
+#pragma unroll
+      for (int i = 0; i < RB_TM; i++)
+        af[i] = *(const int *)&As[ty * RB_TM + i][kk];
+#pragma unroll
+      for (int j = 0; j < RB_TN; j++)
+        wf[j] = *(const int *)&Ws[tx * RB_TN + j][kk];
+#pragma unroll
+      for (int i = 0; i < RB_TM; i++)
+#pragma unroll
+        for (int j = 0; j < RB_TN; j++)
+          acc[i][j] = __dp4a(af[i], wf[j], acc[i][j]);
+    }
     __syncthreads();
   }
-  if (row < M && col < N)
-    Y[(long)row * N + col] = (float)acc * ascale[row] * dp4a_h2f(wscale[col]);
+#pragma unroll
+  for (int i = 0; i < RB_TM; i++) {
+    int row = blockM + ty * RB_TM + i;
+    if (row >= M)
+      continue;
+    float as = ascale[row];
+#pragma unroll
+    for (int j = 0; j < RB_TN; j++) {
+      int col = blockN + tx * RB_TN + j;
+      if (col < N)
+        Y[(long)row * N + col] = (float)acc[i][j] * as * dp4a_h2f(wscale[col]);
+    }
+  }
 }
 
 }
@@ -431,11 +458,11 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
                                                      "act_quant_i8");
   auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                      "repack_seca_i4");
-  // tiled GEMM for batched M (prefill); the per-output kernel for tiny M
-  // (decode), where a 16x16 tile would mostly idle.
+  // register-blocked 64x64-tile GEMM for batched M (prefill); the per-output
+  // kernel for tiny M (decode), where a big tile would mostly idle.
   const bool tiled = (M >= 8);
   auto kg = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC, tiled ? "dp4a_gemm_tiled" : "dp4a_gemm");
+    FC_QINT4_DP4A_SRC, tiled ? "dp4a_gemm_reg" : "dp4a_gemm");
   if (!kq || !kr || !kg) {
     ml_loge("[CUDA] fc_qint4 dp4a: kernel registration failed");
     return false;
@@ -511,8 +538,11 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
   kg->SetKernelArguments(6, &n, sizeof(n));
   kg->SetKernelArguments(7, &k, sizeof(k));
   const int gb[3] = {16, 16, 1};
-  const int gg[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
-  if (!StreamManager::Global().DispatchCommand(*kg, gg, gb))
+  // reg-blocked kernel: 64x64 output tile/block; per-output kernel: 16x16.
+  const int tile = tiled ? 64 : 16;
+  const int grid[3] = {((int)N + tile - 1) / tile, ((int)M + tile - 1) / tile,
+                       1};
+  if (!StreamManager::Global().DispatchCommand(*kg, grid, gb))
     return false;
   StreamManager::Global().finish();
   return true;
