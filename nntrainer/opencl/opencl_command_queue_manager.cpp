@@ -295,7 +295,14 @@ bool CommandQueueManager::replayRecording(const cl_array_arg_qcom *args,
 }
 
 void CommandQueueManager::releaseRecording() {
-  if (active_recording_handle_ != nullptr && recq_release_ != nullptr)
+  // NNTR_RECQ_NORELEASE: skip clReleaseRecordingQCOM (the Adreno driver's
+  // cb_release_recording_qcom has been observed to SIGSEGV at teardown on some
+  // recordings; leaking the handle in a one-shot process is harmless and lets a
+  // run finish cleanly while the release crash is investigated separately).
+  static const bool _no_release =
+    std::getenv("NNTR_RECQ_NORELEASE") != nullptr;
+  if (!_no_release && active_recording_handle_ != nullptr &&
+      recq_release_ != nullptr)
     recq_release_(active_recording_handle_);
   active_recording_handle_ = nullptr;
 }

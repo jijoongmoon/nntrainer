@@ -48,6 +48,7 @@
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
+#include <recq_overrides.h> // R3/R4 record/replay override registry + CL types
 
 // On-GPU greedy argmax sampler (defined in libnntrainer blas_kernels.cpp): when
 // requested (pure greedy), the lm_head GEMV reduces logits on the GPU and skips
@@ -55,6 +56,9 @@
 namespace nntrainer {
 void request_gpu_argmax(bool on);
 bool consume_gpu_argmax(unsigned int *tok);
+// recq (R4): read the 4-byte on-GPU argmax token on the host-I/O queue after a
+// recorded-chain replay (waiting on the replay event).
+bool recq_read_argmax_io(unsigned int *tok, cl_event wait_evt);
 } // namespace nntrainer
 
 namespace causallm {
@@ -737,15 +741,75 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   auto start_generation = std::chrono::high_resolution_clock::now();
 
+  // recq (R4): record/replay single-submission decode. Currently a MECHANISM
+  // self-test -- the FIRST decode token is produced by recording one forward
+  // (captured, not executed) then replaying it with this token's scalar/gws
+  // overrides; the on-GPU argmax is read back on the host-I/O queue. If the
+  // replayed first token matches the non-recq baseline, the record+replay+
+  // override+argmax path is proven (the full per-token replay loop additionally
+  // needs the per-token input-placeholder feed). Gated NNTR_RECQ_REPLAY +
+  // NNTR_SVM_RESIDENT (host-op-zero forward). Default off => unchanged.
+  static const bool _recq_replay = std::getenv("NNTR_RECQ_REPLAY") != nullptr;
+  auto &_cqm = nntrainer::opencl::CommandQueueManager::Global();
+  bool _recq_recorded = false;
+
   for (unsigned int token_generation_idx = input_len + 1;
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
        ++token_generation_idx) {
 
     allocateAndBindKVCache();
-    auto output_interval =
-      incrementalInference(BATCH_SIZE, input, input_len,
-                           token_generation_idx - 1 + global_token_len,
-                           token_generation_idx + global_token_len);
+    const unsigned int _recq_ci = token_generation_idx - 1 + global_token_len;
+    std::vector<float *> output_interval;
+    bool _did_replay = false;
+    if (_recq_replay && !_recq_recorded &&
+        _cqm.getRecordableQueue() != nullptr) {
+      causallm::recq_reset_overrides();
+      if (_cqm.beginRecording()) {
+        // Record pass: dispatches are CAPTURED onto the recordable queue; the
+        // MHA decode path fills the override registry. The forward is not
+        // executed, so its output / host argmax are garbage (overwritten below).
+        output_interval = incrementalInference(BATCH_SIZE, input, input_len,
+                                               _recq_ci, _recq_ci + 1);
+        _cqm.endRecording();
+        _recq_recorded = true;
+        std::fprintf(
+          stderr, "[RECQ] recorded decode forward: %u dispatches, %zu overrides\n",
+          (unsigned int)_cqm.getRecordDispatchIndex(),
+          causallm::recq_override_count());
+        std::vector<nntrainer::opencl::cl_array_arg_qcom> _rargs;
+        std::vector<nntrainer::opencl::cl_workgroup_qcom> _rgws;
+        std::vector<int> _rints;
+        std::vector<std::array<std::size_t, 3>> _rgwss;
+        causallm::recq_build_token_overrides(_recq_ci, _rargs, _rgws, _rints,
+                                             _rgwss);
+        // NNTR_RECQ_NOOVR diagnostic: replay with ZERO overrides. Since the
+        // replay uses the SAME cache_index as the record pass, the overrides are
+        // no-ops (they set the recorded values back); a correct recording should
+        // therefore reproduce the baseline token with OR without them. If NOOVR
+        // reproduces but the override path does not, the override map is wrong;
+        // if neither reproduces, the recording/replay itself is not faithful.
+        static const bool _recq_noovr = std::getenv("NNTR_RECQ_NOOVR") != nullptr;
+        cl_event _revt = nullptr;
+        const bool _rok =
+          _recq_noovr ? _cqm.replayRecording(nullptr, 0, nullptr, 0, &_revt)
+                      : _cqm.replayRecording(_rargs.data(), _rargs.size(),
+                                             _rgws.data(), _rgws.size(), &_revt);
+        if (_rok) {
+          unsigned int _rtok = 0;
+          if (nntrainer::recq_read_argmax_io(&_rtok, _revt)) {
+            _did_replay = true;
+            std::fprintf(stderr, "[RECQ] replayed first token id=%u\n", _rtok);
+          }
+        }
+        if (!_did_replay)
+          std::fprintf(stderr,
+                       "[RECQ] replay/readback FAILED; falling back to normal "
+                       "inference for this token.\n");
+      }
+    }
+    if (!_did_replay)
+      output_interval = incrementalInference(BATCH_SIZE, input, input_len,
+                                             _recq_ci, _recq_ci + 1);
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
 
     // Feed the newly generated token back as the next input token.

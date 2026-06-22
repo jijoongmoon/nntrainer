@@ -2294,8 +2294,19 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
 
   const size_t HD_Q = (size_t)num_heads_Q * head_dim;
   const size_t HD_KV = (size_t)num_heads_KV * head_dim;
+  // BLOCKER A (recq de-SVM): the scores cl_mem is bound as a kernel arg (qk/
+  // softmax/sv) and grows with N_kv per decode token -> tca_ensure would
+  // realloc the handle mid-decode, which a recording captured at token 1 cannot
+  // follow. Pin it to the max-decode footprint ONCE (N_kv -> max_seq_len) so the
+  // handle is stable for the whole replayed run. The kernels still use the N_kv
+  // ARG as the row stride, so the extra columns are simply unused -> byte-
+  // identical. Decode only (M==1); prefill keeps the tight N_kv allocation.
+  static const bool _recq_desvm_attn =
+    std::getenv("NNTR_RECQ_DESVM") != nullptr;
+  const size_t scores_cols =
+    (_recq_desvm_attn && M == 1) ? (size_t)max_seq_len : (size_t)N_kv;
   const size_t scores_bytes =
-    (size_t)num_heads_Q * M * N_kv * sizeof(uint16_t);
+    (size_t)num_heads_Q * M * scores_cols * sizeof(uint16_t);
 
   std::lock_guard<std::mutex> lock(tca_mtx());
   TcaScratch &sc = tca_scratch();

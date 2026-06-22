@@ -30,6 +30,7 @@ static std::mutex rope_init_mtx;
 #include <mha_core.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
+#include <recq_overrides.h>
 #include <thread_manager.h>
 #include <util_func.h>
 
@@ -392,6 +393,70 @@ static inline void compute_fp16vcache_transposed_int8(
 #endif
 
 namespace causallm {
+
+// ---------------------------------------------------------------------------
+// Record/replay (recq) per-token override registry (R3). Populated by the MHA
+// decode path during the record pass (isRecording()), consumed by the decode
+// loop (causal_lm) to rebuild per-token override arrays. Single-threaded decode
+// path, so no lock needed.
+// ---------------------------------------------------------------------------
+static std::vector<RecqOverride> &recq_registry() {
+  static std::vector<RecqOverride> v;
+  return v;
+}
+void recq_reset_overrides() { recq_registry().clear(); }
+void recq_add_override(const RecqOverride &ov) {
+  recq_registry().push_back(ov);
+}
+std::size_t recq_override_count() { return recq_registry().size(); }
+
+void recq_build_token_overrides(
+  unsigned int cache_index,
+  std::vector<nntrainer::opencl::cl_array_arg_qcom> &args,
+  std::vector<nntrainer::opencl::cl_workgroup_qcom> &gws,
+  std::vector<int> &int_scratch,
+  std::vector<std::array<std::size_t, 3>> &gws_scratch) {
+  const auto &reg = recq_registry();
+  args.clear();
+  gws.clear();
+  int_scratch.clear();
+  gws_scratch.clear();
+  // Reserve up-front so the backing vectors never reallocate while we take the
+  // address of their elements (arg_value / workgroup_size are raw pointers).
+  int_scratch.reserve(reg.size());
+  gws_scratch.reserve(reg.size());
+  constexpr int TN_QK = 8; // qk_matmul_f16_ohwi_img N tile (matches the kernel)
+  for (const auto &ov : reg) {
+    if (ov.kind == RecqOverride::QK_GWS0) {
+      const int lx = ov.base, mx_pad = ov.stride, hQ = ov.aux;
+      const int N_kv = (int)cache_index + 1;
+      const int nx = (N_kv + TN_QK - 1) / TN_QK;
+      const int nx_pad = (lx > 0) ? ((nx + lx - 1) / lx) * lx : nx;
+      gws_scratch.push_back({(std::size_t)nx_pad, (std::size_t)mx_pad,
+                             (std::size_t)hQ});
+      gws.push_back({ov.dispatch_index, gws_scratch.back().data()});
+      continue;
+    }
+    int v = 0;
+    switch (ov.kind) {
+    case RecqOverride::ROPE_POS:
+    case RecqOverride::SCATTER_POS:
+      v = (int)cache_index;
+      break;
+    case RecqOverride::ATTN_NKV:
+      v = (int)cache_index + 1;
+      break;
+    case RecqOverride::ROW_OFFSET:
+      v = ov.base + (int)cache_index * ov.stride;
+      break;
+    default:
+      break;
+    }
+    int_scratch.push_back(v);
+    args.push_back({ov.dispatch_index, ov.arg_index, sizeof(int),
+                    &int_scratch.back()});
+  }
+}
 
 #define tile_size 4
 
@@ -1902,21 +1967,48 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           reinterpret_cast<uint16_t *>(cache_key.getData<_FP16>());
         uint16_t *cache_value_base =
           reinterpret_cast<uint16_t *>(cache_value.getData<_FP16>());
+        // R3 record/replay capture: while recording the decode forward, record
+        // each de-SVM kernel's dispatch ordinal + the per-token scalar rule so
+        // the replay can override it. getRecordDispatchIndex() (read BEFORE the
+        // enqueue) is the ordinal the wrapper's single kernel will get.
+        auto &_cqm = nntrainer::opencl::CommandQueueManager::Global();
+        const bool _rec = _recq_desvm && _cqm.isRecording();
+        if (_rec && recq_override_count() == 0)
+          std::fprintf(stderr,
+                       "[RECQ-CAPTURE] record pass: cache_index=%u to-from=%u "
+                       "N_kv(cache_to)=%u num_heads_Q=%u\n",
+                       cache_index, to - from, cache_index + (to - from),
+                       (unsigned int)num_heads_Q);
         // K: rotate key_step -> b_cache_key_step SVM slice (the OHWI scatter
         // source, 2317). cl_mem-in (k_cl) -> SVM-out. key_step left unmodified.
+        const cl_uint _d_ropeK = _rec ? _cqm.getRecordDispatchIndex() : 0u;
         bool ok = nntrainer::rope_inplace_f16_cl(
           k_p, _recq_desvm ? cache_key_base : kc_p, cos_lut, sin_lut, to - from,
           num_heads_KV, head_dim, cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
           /*out_clmem=*/nullptr, /*drain_svm_out=*/false,
           /*write_off=*/_recq_desvm ? kc_woff : 0u);
+        if (_rec) {
+          recq_add_override({_d_ropeK, 7u, RecqOverride::ROPE_POS, 0, 0, 0});
+          recq_add_override(
+            {_d_ropeK, 8u, RecqOverride::ROW_OFFSET,
+             (int)((size_t)batch * cache_key_dim.getFeatureLen()),
+             (int)cache_key_dim.width(), 0});
+        }
         // V: flat copy value_step -> b_cache_value_step SVM slice (no RoPE, the
         // OHWI v-scatter source, 2326). value_step left unmodified.
         if (ok) {
-          if (_recq_desvm)
+          if (_recq_desvm) {
+            const cl_uint _d_vcopy = _rec ? _cqm.getRecordDispatchIndex() : 0u;
             ok = nntrainer::gpu_copy_f16_row_cl(
               v_in, cache_value_base, kv_n, (int)v_woff, v_svm,
               /*in_clmem=*/v_cl, /*out_base_clmem=*/nullptr, /*drain=*/false);
-          else
+            // scatter_copy_f16_row: in0,out1,N2,write_off3.
+            if (_rec)
+              recq_add_override(
+                {_d_vcopy, 3u, RecqOverride::ROW_OFFSET,
+                 (int)((size_t)batch * cache_value_dim.getFeatureLen()),
+                 (int)cache_value_dim.width(), 0});
+          } else
             ok = nntrainer::gpu_copy_f16_cl(v_in, v_out, kv_n, v_svm,
                                             /*in_clmem=*/v_cl,
                                             /*out_clmem=*/nullptr,
@@ -1926,11 +2018,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // with q_clmem=null, 2340). cl_mem-in -> SVM-out when the FC parked Q in
         // cl_mem. Only run once K+V are committed so a Q failure cannot leave a
         // half-rotated, then re-rotated, Q.
+        const cl_uint _d_ropeQ =
+          (_rec && ok) ? _cqm.getRecordDispatchIndex() : 0u;
         if (ok)
           ok = nntrainer::rope_inplace_f16_cl(
             q_p, q_p, cos_lut, sin_lut, to - from, num_heads_Q, head_dim,
             cache_index, mp, q_svm, /*in_clmem=*/q_cl, /*out_clmem=*/nullptr,
             /*drain_svm_out=*/false);
+        if (_rec && ok)
+          // Q in-place: only start_pos (arg7) varies; write_off stays 0.
+          recq_add_override({_d_ropeQ, 7u, RecqOverride::ROPE_POS, 0, 0, 0});
         if (ok) {
           // All committed. Q/K/V no longer read on the host: null their cl_mem
           // handles (the GPU rotation already read them, SVM shadows are fresh)
@@ -2394,9 +2491,19 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               const char *e = std::getenv("NNTR_KV_VTIGHT");
               return !(e && e[0] == '0');
             }();
+            // BLOCKER B (recq de-SVM): the tight V image handle is released +
+            // recreated as cache_to grows, but it is bound as the sv kernel's V
+            // arg -- a recording captured at token 1 would replay a freed image.
+            // Force the once-allocated full-stride v_image_ohwi (constant handle
+            // + constant v_stride) for the decode replay; pay the texture-cache
+            // padding cost. Output is identical (the sv kernel reads the same V
+            // values via the full-stride image). Decode only (step_size==1).
+            static const bool _recq_desvm_vimg =
+              std::getenv("NNTR_RECQ_DESVM") != nullptr;
+            const bool _recq_full_v = _recq_desvm_vimg && step_size == 1;
             void *v_img_use = v_image_ohwi;
             unsigned int v_stride = kv_mirror_S_max;
-            if (v_tight_on) {
+            if (v_tight_on && !_recq_full_v) {
               unsigned int need = (cache_to + 7u) & ~7u;
               if (need > kv_v_img_S) {
                 void *nimg = nullptr;
@@ -2486,6 +2593,21 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             const unsigned int v_soff =
               (unsigned int)((size_t)batch * cache_value_dim.getFeatureLen() +
                              (size_t)cache_index * cache_value_dim.width());
+            // R3 capture (scatter + attention block). qk gws LWS must match the
+            // attention impl's qk_lws_env default {8,8,1} (NNTR_QK_LWS override).
+            auto &_cqm2 = nntrainer::opencl::CommandQueueManager::Global();
+            const bool _rec_s = _recq_kv && _cqm2.isRecording();
+            static const std::array<int, 2> _qk_lws = []() {
+              std::array<int, 2> v = {8, 8};
+              const char *s = std::getenv("NNTR_QK_LWS");
+              if (s) {
+                int a = 0, b = 0, c = 0;
+                if (std::sscanf(s, "%d,%d,%d", &a, &b, &c) == 3)
+                  v = {a, b};
+              }
+              return v;
+            }();
+            const cl_uint _d_kscat = _rec_s ? _cqm2.getRecordDispatchIndex() : 0u;
             nntrainer::k_scatter_ohwi_cl(
               _recq_kv ? reinterpret_cast<const uint16_t *>(
                            cache_key.getData<_FP16>())
@@ -2494,8 +2616,17 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               reinterpret_cast<cl_mem>(k_buf_ohwi), step_size, num_heads_KV,
               head_dim, kv_mirror_S_max, cache_from, /*src_clmem=*/k_stage,
               /*src_off=*/_recq_kv ? kc_soff : 0u);
+            if (_rec_s) {
+              // k_scatter_ohwi: position=arg6, src_off=arg7.
+              recq_add_override({_d_kscat, 6u, RecqOverride::SCATTER_POS, 0, 0, 0});
+              recq_add_override(
+                {_d_kscat, 7u, RecqOverride::ROW_OFFSET,
+                 (int)((size_t)batch * cache_key_dim.getFeatureLen()),
+                 (int)cache_key_dim.width(), 0});
+            }
             kv_k_valid_to = cache_to;
             const double _kvst_tk = _kvst_on() ? _kvst_now() : 0;
+            const cl_uint _d_vscat = _rec_s ? _cqm2.getRecordDispatchIndex() : 0u;
             nntrainer::v_scatter_ohwi_t_cl(
               _recq_kv ? reinterpret_cast<const uint16_t *>(
                            cache_value.getData<_FP16>())
@@ -2507,6 +2638,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               head_dim, v_stride, cache_from,
               /*src_clmem=*/_recq_kv ? nullptr : v_stage_clmem,
               /*src_off=*/_recq_kv ? v_soff : 0u);
+            if (_rec_s) {
+              // v_scatter_ohwi_t: position=arg6, src_off=arg7.
+              recq_add_override({_d_vscat, 6u, RecqOverride::SCATTER_POS, 0, 0, 0});
+              recq_add_override(
+                {_d_vscat, 7u, RecqOverride::ROW_OFFSET,
+                 (int)((size_t)batch * cache_value_dim.getFeatureLen()),
+                 (int)cache_value_dim.width(), 0});
+            }
             kv_v_valid_to = cache_to;
             const double _kvst_tv = _kvst_on() ? _kvst_now() : 0;
             // S3 decode: OHWI rotates Q on the HOST (query_step SVM, in-place);
@@ -2517,12 +2656,34 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // host-rotated SVM query). Prefill keeps q_attn_clmem (the prefill
             // RoPE/residency path keeps it consistent).
             void *q_clmem_use = (step_size == 1) ? nullptr : q_attn_clmem;
+            // The OHWI image attention enqueues exactly qk -> softmax -> sv (3
+            // consecutive dispatches); capture the base ordinal before the call.
+            const cl_uint _d_qk = _rec_s ? _cqm2.getRecordDispatchIndex() : 0u;
             ok = nntrainer::two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
               Q_p, reinterpret_cast<cl_mem>(k_image_ohwi),
               reinterpret_cast<cl_mem>(v_img_use), O_p, step_size, cache_to,
               num_heads_Q, num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
               attn_logit_softcapping, /*q_clmem=*/q_clmem_use,
               /*o_clmem=*/o_cl);
+            if (_rec_s && ok) {
+              const cl_uint _n_disp = _cqm2.getRecordDispatchIndex() - _d_qk;
+              if (_n_disp != 3u) {
+                std::fprintf(stderr,
+                             "[RECQ-CAPTURE] WARN attention emitted %u dispatches "
+                             "(expected qk,softmax,sv=3); override map will be "
+                             "wrong.\n",
+                             _n_disp);
+                std::fflush(stderr);
+              }
+              // qk: N_kv=arg4 + gws[0]; softmax: N_kv=arg2; sv: N_kv=arg4.
+              recq_add_override({_d_qk, 4u, RecqOverride::ATTN_NKV, 0, 0, 0});
+              recq_add_override({_d_qk, 0u, RecqOverride::QK_GWS0, _qk_lws[0],
+                                 _qk_lws[1], (int)num_heads_Q});
+              recq_add_override(
+                {_d_qk + 1u, 2u, RecqOverride::ATTN_NKV, 0, 0, 0});
+              recq_add_override(
+                {_d_qk + 2u, 4u, RecqOverride::ATTN_NKV, 0, 0, 0});
+            }
             if (_kvst_on())
               _kvst_mark_scatter(_kvst_t1, _kvst_tk, _kvst_tv, _kvst_now());
             if (ok && o_cl != nullptr)

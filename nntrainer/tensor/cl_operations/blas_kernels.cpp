@@ -3045,6 +3045,10 @@ __kernel void argmax_p2(__global const float *pval, __global const uint *pidx,
 static bool g_argmax_requested = false;
 static bool g_argmax_valid = false;
 static unsigned int g_argmax_token = 0;
+// recq: alias of the on-GPU argmax output buffer (oidx) so the record/replay
+// loop can read the 4-byte token on the host-I/O queue after a replay (the
+// recordable queue rejects reads). Set when argmax_logits_cl first creates it.
+static cl_mem g_recq_argmax_oidx = nullptr;
 void request_gpu_argmax(bool on) {
   g_argmax_requested = on;
   g_argmax_valid = false;
@@ -3055,6 +3059,33 @@ bool consume_gpu_argmax(unsigned int *tok) {
   if (tok)
     *tok = g_argmax_token;
   g_argmax_valid = false;
+  return true;
+}
+
+// recq (R4): after a recorded-chain replay executes the on-GPU argmax (p1/p2 ->
+// g_recq_argmax_oidx) on the LIVE queue, read the 4-byte token on the host-I/O
+// queue (the recordable queue rejects reads), waiting on the replay event. Sets
+// g_argmax_token / g_argmax_valid so the next consume_gpu_argmax() returns it.
+bool recq_read_argmax_io(unsigned int *tok, cl_event wait_evt) {
+  if (g_recq_argmax_oidx == nullptr)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return false;
+  cl_command_queue io = blas_cc->command_queue_inst_.getIoQueue();
+  if (io == nullptr)
+    return false;
+  cl_uint idx = 0;
+  const cl_uint nwait = (wait_evt != nullptr) ? 1u : 0u;
+  const cl_event *wl = (wait_evt != nullptr) ? &wait_evt : nullptr;
+  if (clEnqueueReadBuffer(io, g_recq_argmax_oidx, CL_TRUE, 0, sizeof(cl_uint),
+                          &idx, nwait, wl, nullptr) != CL_SUCCESS)
+    return false;
+  if (tok)
+    *tok = (unsigned int)idx;
+  g_argmax_token = (unsigned int)idx;
+  g_argmax_valid = true;
   return true;
 }
 
@@ -3089,6 +3120,7 @@ static bool argmax_logits_cl(cl_mem logits, bool is_fp16, unsigned int N,
       pval = pidx = oidx = nullptr;
       return false;
     }
+    g_recq_argmax_oidx = oidx; // recq: expose for the io-queue readback
   }
   int Ni = (int)N, Gi = G;
   if (!(kp1->SetKernelArguments(0, &logits, sizeof(cl_mem)) &&
