@@ -25,12 +25,6 @@
 
 #include <vector>
 
-namespace nntrainer {
-// recq debug: expose the embedding (residual seed) buffer for the first-
-// divergence dump (defined in libnntrainer blas_kernels.cpp).
-void recq_set_seed_probe(void *p, bool is_clmem, unsigned int bytes);
-} // namespace nntrainer
-
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -225,23 +219,6 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::clmem_raise_cl(
     hidden_, (unsigned int)((size_t)(to - from) * out_dim *
                             hidden_.getDim().getDataTypeSize()));
-
-  // recq first-divergence dump (NNTR_RECQ_DUMP): expose the MAIN embedding's
-  // output (the residual seed = layer-0 input) for the decode token so the
-  // dump can split input-handoff vs decoder-layer-kernel divergence.
-  {
-    static const bool _recq_dump = std::getenv("NNTR_RECQ_DUMP") != nullptr;
-    if (_recq_dump && (to - from) == 1 &&
-        context.getName().find("embedding0") != std::string::npos) {
-      const unsigned int bytes = (unsigned int)((size_t)out_dim *
-                                                hidden_.getDim().getDataTypeSize());
-      if (hidden_.isClMem() && hidden_.getOffset() == 0)
-        nntrainer::recq_set_seed_probe(hidden_.getClMem(), true, bytes);
-      else
-        nntrainer::recq_set_seed_probe(
-          (void *)hidden_.getData<uint8_t>(), false, bytes);
-    }
-  }
 }
 
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {

@@ -3049,22 +3049,6 @@ static unsigned int g_argmax_token = 0;
 // loop can read the 4-byte token on the host-I/O queue after a replay (the
 // recordable queue rejects reads). Set when argmax_logits_cl first creates it.
 static cl_mem g_recq_argmax_oidx = nullptr;
-// recq first-divergence localization: the lm_head INPUT (final hidden) + its
-// shape, set each lm_head GEMV; recq_dump_lmhead() checksums them.
-static void *g_recq_lmhead_act = nullptr;
-static bool g_recq_lmhead_act_clmem = false;
-static unsigned int g_recq_lmhead_K = 0;
-static cl_mem g_recq_lmhead_out = nullptr;
-// recq: residual SEED probe (embedding0 output = layer-0 input) for the
-// input-vs-layers split. Set by the embedding layer (recq_set_seed_probe).
-static void *g_recq_seed = nullptr;
-static bool g_recq_seed_clmem = false;
-static unsigned int g_recq_seed_bytes = 0;
-void recq_set_seed_probe(void *p, bool is_clmem, unsigned int bytes) {
-  g_recq_seed = p;
-  g_recq_seed_clmem = is_clmem;
-  g_recq_seed_bytes = bytes;
-}
 
 // recq R4 feed pass: true while incrementalInference is running host-only (GPU
 // dispatches skipped) so the graph executor can also skip non-embedding nodes'
@@ -3099,108 +3083,23 @@ bool recq_read_argmax_io(unsigned int *tok, cl_event wait_evt) {
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (!blas_cc)
     return false;
-  // The replay runs on the LIVE command_queue_ (not the recordable queue), so we
-  // can read oidx on it directly. DEBUG: drain the live queue first to remove any
-  // race between the replayed argmax write and this read (the recorded enqueue
-  // may not populate wait_evt). NNTR_RECQ_IOREAD=1 reverts to the io-queue +
-  // wait_evt path (the eventual single-submission form, no full drain).
-  static const bool _ioread = std::getenv("NNTR_RECQ_IOREAD") != nullptr;
+  // Read the 4-byte token on the host-I/O queue (the recordable queue rejects
+  // reads), waiting on the replay completion event so the read is ordered after
+  // the replayed argmax write on the live queue.
+  cl_command_queue io = blas_cc->command_queue_inst_.getIoQueue();
+  if (io == nullptr)
+    return false;
   cl_uint idx = 0;
-  if (_ioread) {
-    cl_command_queue io = blas_cc->command_queue_inst_.getIoQueue();
-    if (io == nullptr)
-      return false;
-    const cl_uint nwait = (wait_evt != nullptr) ? 1u : 0u;
-    const cl_event *wl = (wait_evt != nullptr) ? &wait_evt : nullptr;
-    if (clEnqueueReadBuffer(io, g_recq_argmax_oidx, CL_TRUE, 0, sizeof(cl_uint),
-                            &idx, nwait, wl, nullptr) != CL_SUCCESS)
-      return false;
-  } else {
-    cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
-    if (q == nullptr)
-      return false;
-    clFinish(q); // ensure the replayed chain (incl. argmax) completed
-    if (clEnqueueReadBuffer(q, g_recq_argmax_oidx, CL_TRUE, 0, sizeof(cl_uint),
-                            &idx, 0, nullptr, nullptr) != CL_SUCCESS)
-      return false;
-  }
+  const cl_uint nwait = (wait_evt != nullptr) ? 1u : 0u;
+  const cl_event *wl = (wait_evt != nullptr) ? &wait_evt : nullptr;
+  if (clEnqueueReadBuffer(io, g_recq_argmax_oidx, CL_TRUE, 0, sizeof(cl_uint),
+                          &idx, nwait, wl, nullptr) != CL_SUCCESS)
+    return false;
   if (tok)
     *tok = (unsigned int)idx;
   g_argmax_token = (unsigned int)idx;
   g_argmax_valid = true;
   return true;
-}
-
-// recq first-divergence localization (NNTR_RECQ_DUMP). Checksum the lm_head INPUT
-// (final hidden) + the logits out_buf on the live queue after a forward (normal
-// or replay). Compare a NORMAL-forward run's "[RECQ-DUMP]" line to a zero-override
-// REPLAY run's: act_sum differs => the layers diverged; act_sum identical but
-// logits_argmax differs => the lm_head GEMV / argmax replays wrong.
-void recq_dump_lmhead(const char *tag) {
-  auto *blas_cc =
-    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  if (!blas_cc)
-    return;
-  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
-  if (!q)
-    return;
-  clFinish(q);
-  // The lm_head act/logits may be unset on a NNTR_RECQ_MAXDISP prefix that stops
-  // before the lm_head; the SEED probe is still valid (embedding runs early).
-  const unsigned int K = g_recq_lmhead_K;
-  std::vector<uint16_t> act(K ? K : 4, 0);
-  unsigned long long act_sum = 0;
-  if (g_recq_lmhead_act != nullptr && K > 0) {
-    bool got = true;
-    if (g_recq_lmhead_act_clmem)
-      got = clEnqueueReadBuffer(q, static_cast<cl_mem>(g_recq_lmhead_act),
-                                CL_TRUE, 0, sizeof(uint16_t) * K, act.data(), 0,
-                                nullptr, nullptr) == CL_SUCCESS;
-    else
-      std::memcpy(act.data(), g_recq_lmhead_act, sizeof(uint16_t) * K);
-    if (got)
-      for (unsigned int i = 0; i < K; i++)
-        act_sum += (unsigned long long)act[i] * (i + 1u); // position-weighted
-  }
-  // logits prefix checksum (cheap signature; raw fp16 bits, position-weighted).
-  unsigned long long lg_sum = 0;
-  if (g_recq_lmhead_out) {
-    const unsigned int NP = 4096;
-    std::vector<uint16_t> lg(NP, 0);
-    if (clEnqueueReadBuffer(q, g_recq_lmhead_out, CL_TRUE, 0,
-                            sizeof(uint16_t) * NP, lg.data(), 0, nullptr,
-                            nullptr) == CL_SUCCESS) {
-      for (unsigned int i = 0; i < NP; i++)
-        lg_sum += (unsigned long long)lg[i] * (i + 1u);
-    }
-  }
-  // Residual SEED checksum (embedding0 output = layer-0 input). If this differs
-  // normal-vs-replay => the input/embedding handoff is wrong at replay; if it
-  // matches but act_sum differs => a decoder-layer KERNEL replays wrong.
-  unsigned long long seed_sum = 0;
-  unsigned int seed_n = 0;
-  if (g_recq_seed && g_recq_seed_bytes >= 2) {
-    seed_n = g_recq_seed_bytes / 2;
-    std::vector<uint16_t> sd(seed_n, 0);
-    bool got = false;
-    if (g_recq_seed_clmem) {
-      got = clEnqueueReadBuffer(q, static_cast<cl_mem>(g_recq_seed), CL_TRUE, 0,
-                                (size_t)seed_n * 2, sd.data(), 0, nullptr,
-                                nullptr) == CL_SUCCESS;
-    } else {
-      std::memcpy(sd.data(), g_recq_seed, (size_t)seed_n * 2);
-      got = true;
-    }
-    if (got)
-      for (unsigned int i = 0; i < seed_n; i++)
-        seed_sum += (unsigned long long)sd[i] * (i + 1u);
-  }
-  std::fprintf(stderr,
-               "[RECQ-DUMP] %s: K=%u act_sum=%llu act[0..3]=%u,%u,%u,%u "
-               "logits_sum=%llu seed_n=%u seed_sum=%llu gpu_tok=%u\n",
-               tag ? tag : "", K, act_sum, act[0], act[1], act[2], act[3],
-               lg_sum, seed_n, seed_sum, g_argmax_token);
-  std::fflush(stderr);
 }
 
 // Reduce `logits` (cl_mem, [N] fp16 or fp32) to its argmax index on the GPU.
@@ -3489,14 +3388,6 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem, void *act
   cl_mem w_buf = static_cast<cl_mem>(w_buf_clmem);
   cl_mem scale_buf = static_cast<cl_mem>(scale_buf_clmem);
   int Ni = (int)N, Ki = (int)K;
-  // recq first-divergence localization: expose the lm_head INPUT (final hidden)
-  // + the logits out_buf so recq_dump_lmhead() can checksum them after a normal
-  // forward vs a zero-override replay (act differs => the 35 layers diverged;
-  // act identical but token differs => lm_head GEMV / argmax replays wrong).
-  g_recq_lmhead_act = act;
-  g_recq_lmhead_act_clmem = act_is_clmem;
-  g_recq_lmhead_K = K;
-  g_recq_lmhead_out = out_buf;
   bool ok = kp->SetKernelArguments(0, &w_buf, sizeof(cl_mem));
   if (act_is_clmem) {
     cl_mem a = static_cast<cl_mem>(act);

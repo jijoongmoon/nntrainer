@@ -29,12 +29,6 @@
 #include <cstring>
 #include <vector>
 
-namespace nntrainer {
-// recq debug: expose the (tied) embedding output = residual seed for the
-// first-divergence dump (defined in libnntrainer blas_kernels.cpp).
-void recq_set_seed_probe(void *p, bool is_clmem, unsigned int bytes);
-} // namespace nntrainer
-
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -367,23 +361,6 @@ void TieWordEmbedding::incremental_forwarding_embedding(
   nntrainer::clmem_raise_cl(
     hidden_, (unsigned int)((size_t)(to - from) * out_dim *
                             hidden_.getDim().getDataTypeSize()));
-
-  // recq first-divergence dump (NNTR_RECQ_DUMP): expose embedding0's output
-  // (residual seed = layer-0 input) for the decode token (input-handoff vs
-  // decoder-layer-kernel split).
-  {
-    static const bool _recq_dump = std::getenv("NNTR_RECQ_DUMP") != nullptr;
-    if (_recq_dump && (to - from) == 1 &&
-        context.getName().find("embedding0") != std::string::npos) {
-      const unsigned int bytes =
-        (unsigned int)((size_t)out_dim * hidden_.getDim().getDataTypeSize());
-      if (hidden_.isClMem() && hidden_.getOffset() == 0)
-        nntrainer::recq_set_seed_probe(hidden_.getClMem(), true, bytes);
-      else
-        nntrainer::recq_set_seed_probe((void *)hidden_.getData<uint8_t>(), false,
-                                       bytes);
-    }
-  }
 }
 
 void TieWordEmbedding::incremental_forwarding_lmhead(

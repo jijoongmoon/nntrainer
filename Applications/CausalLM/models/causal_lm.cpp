@@ -59,9 +59,6 @@ bool consume_gpu_argmax(unsigned int *tok);
 // recq (R4): read the 4-byte on-GPU argmax token on the host-I/O queue after a
 // recorded-chain replay (waiting on the replay event).
 bool recq_read_argmax_io(unsigned int *tok, cl_event wait_evt);
-// recq debug: checksum the lm_head input (final hidden) + logits for
-// first-divergence localization (NNTR_RECQ_DUMP).
-void recq_dump_lmhead(const char *tag);
 } // namespace nntrainer
 
 namespace causallm {
@@ -762,11 +759,6 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     allocateAndBindKVCache();
     const unsigned int _recq_ci = token_generation_idx - 1 + global_token_len;
-    // NNTR_RECQ_MAXDISP debug: reset the per-forward dispatch counter so the
-    // prefix-cap counts from this decode forward's first dispatch (applies to
-    // both the normal and the record passes below).
-    if (token_generation_idx == input_len + 1)
-      _cqm.resetDispatchCounter();
     std::vector<float *> output_interval;
     bool _did_replay = false;
     if (_recq_replay && _cqm.getRecordableQueue() != nullptr) {
@@ -802,24 +794,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         std::vector<std::array<std::size_t, 3>> _rgwss;
         causallm::recq_build_token_overrides(_recq_ci, _rargs, _rgws, _rints,
                                              _rgwss);
-        static const bool _recq_noovr = std::getenv("NNTR_RECQ_NOOVR") != nullptr;
         cl_event _revt = nullptr;
-        const bool _rok =
-          _recq_noovr ? _cqm.replayRecording(nullptr, 0, nullptr, 0, &_revt)
-                      : _cqm.replayRecording(_rargs.data(), _rargs.size(),
-                                             _rgws.data(), _rgws.size(), &_revt);
-        // NNTR_RECQ_MAXDISP prefix debug (first token only): dump the residual
-        // probe before any fallback overwrites it, then stop.
-        static const bool _recq_maxdisp =
-          std::getenv("NNTR_RECQ_MAXDISP") != nullptr;
-        if (_recq_maxdisp) {
-          if (_rok)
-            nntrainer::recq_dump_lmhead("replay-prefix");
-          else
-            std::fprintf(stderr, "[RECQ] prefix replay FAILED\n");
-          break;
-        }
-        if (_rok) {
+        if (_cqm.replayRecording(_rargs.data(), _rargs.size(), _rgws.data(),
+                                 _rgws.size(), &_revt)) {
           unsigned int _rtok = 0;
           if (nntrainer::recq_read_argmax_io(&_rtok, _revt))
             _did_replay = true;
@@ -833,13 +810,6 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (!_did_replay)
       output_interval = incrementalInference(BATCH_SIZE, input, input_len,
                                              _recq_ci, _recq_ci + 1);
-    // recq first-divergence dump (NNTR_RECQ_DUMP): one line for the FIRST decode
-    // token. Compare a NORMAL-forward run ("normal") to a zero-override REPLAY
-    // run ("replay"): act_sum differs => layers diverged; act_sum same but
-    // gpu_tok differs => lm_head/argmax replays wrong.
-    static const bool _recq_dump = std::getenv("NNTR_RECQ_DUMP") != nullptr;
-    if (_recq_dump && token_generation_idx == input_len + 1)
-      nntrainer::recq_dump_lmhead(_did_replay ? "replay" : "normal");
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
 
     // Feed the newly generated token back as the next input token.

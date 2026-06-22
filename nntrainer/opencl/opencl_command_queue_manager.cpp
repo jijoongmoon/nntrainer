@@ -294,31 +294,14 @@ bool CommandQueueManager::replayRecording(const cl_array_arg_qcom *args,
   return true;
 }
 
-bool CommandQueueManager::recqSkipDispatch() {
-  if (recq_skip_all_) // R4 feed pass: host-only forward
-    return true;
-  static const cl_uint maxd = []() {
-    const char *e = std::getenv("NNTR_RECQ_MAXDISP");
-    return e ? (cl_uint)std::atoi(e) : 0u;
-  }();
-  // The cap is ARMED only after resetDispatchCounter() (called at the start of
-  // the probed decode forward), so PREFILL runs uncapped/complete.
-  if (!recq_cap_armed_)
-    return false;
-  const cl_uint idx = recq_global_dispatch_++;
-  return maxd > 0u && idx >= maxd;
-}
-
 void CommandQueueManager::releaseRecording() {
-  // NNTR_RECQ_NORELEASE: skip clReleaseRecordingQCOM (the Adreno driver's
-  // cb_release_recording_qcom has been observed to SIGSEGV at teardown on some
-  // recordings; leaking the handle in a one-shot process is harmless and lets a
-  // run finish cleanly while the release crash is investigated separately).
-  static const bool _no_release =
-    std::getenv("NNTR_RECQ_NORELEASE") != nullptr;
-  if (!_no_release && active_recording_handle_ != nullptr &&
-      recq_release_ != nullptr)
-    recq_release_(active_recording_handle_);
+  // NOTE: the Adreno driver's clReleaseRecordingQCOM (libCB cb_release_recording_
+  // qcom) has been observed to SIGSEGV at process teardown on a finalized
+  // recording. Since recq is experimental/gated and this is a one-shot
+  // teardown, we intentionally DO NOT call recq_release_ (the handle leaks for
+  // the remainder of the process, which the OS reclaims on exit) -- this keeps
+  // recq-replay runs from crashing at shutdown. Revisit if the driver issue is
+  // resolved.
   active_recording_handle_ = nullptr;
 }
 
@@ -668,9 +651,9 @@ bool CommandQueueManager::DispatchCommand(
   if (track)
     evt_arg = &local_evt;
 
-  // NNTR_RECQ_MAXDISP: prefix-cap for first-divergence localization (skip = no
-  // capture, no execute) so NORMAL and REPLAY both stop after the same N.
-  if (recqSkipDispatch()) {
+  // recq R4 feed pass: skip ALL dispatches (host-only forward) so only the host
+  // embedding refreshes its output; the GPU forward comes from the replay.
+  if (recq_skip_all_) {
     next_prof_label_.clear();
     return true;
   }
@@ -739,9 +722,9 @@ bool CommandQueueManager::DispatchCommand(
   if (track)
     evt_arg = &local_evt;
 
-  // NNTR_RECQ_MAXDISP: prefix-cap for first-divergence localization (skip = no
-  // capture, no execute) so NORMAL and REPLAY both stop after the same N.
-  if (recqSkipDispatch()) {
+  // recq R4 feed pass: skip ALL dispatches (host-only forward) so only the host
+  // embedding refreshes its output; the GPU forward comes from the replay.
+  if (recq_skip_all_) {
     next_prof_label_.clear();
     return true;
   }
@@ -801,8 +784,8 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
   if (track)
     evt_arg = &local_evt;
 
-  // NNTR_RECQ_MAXDISP: prefix-cap (skip = no capture, no execute).
-  if (recqSkipDispatch()) {
+  // recq R4 feed pass: skip ALL dispatches (host-only forward).
+  if (recq_skip_all_) {
     next_prof_label_.clear();
     return;
   }

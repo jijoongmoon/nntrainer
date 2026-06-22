@@ -103,22 +103,11 @@ class CommandQueueManager : public Singleton<CommandQueueManager> {
   cl_uint recq_dispatch_index_{0};
   cl_recording_qcom active_recording_handle_{nullptr};
 
-  /**
-   * @brief Debug (NNTR_RECQ_MAXDISP): per-forward dispatch counter + cap for
-   * first-divergence localization. resetDispatchCounter() is called at the start
-   * of the probed forward; while the cap is set, the chokepoints SKIP (neither
-   * capture nor execute) every dispatch at/after the cap, so both a NORMAL and a
-   * REPLAY run stop after the same N dispatches and the residual buffer can be
-   * compared. Default cap 0 = disabled (no skipping).
-   */
-  cl_uint recq_global_dispatch_{0};
-  bool recq_cap_armed_{false};
   /// When set, ALL kernel dispatches are skipped (no capture, no execute). Used
   /// by the R4 per-token "feed pass": run incrementalInference so the HOST
   /// embedding writes this token's embedding output, while the GPU forward is
   /// skipped (it will be supplied by the recorded-chain replay instead).
   bool recq_skip_all_{false};
-  bool recqSkipDispatch();
 
   /**
    * @brief Resolve the cl_qcom_recordable_queues entry points and create the
@@ -361,15 +350,6 @@ public:
    * being captured, not executed).
    */
   bool isRecording() const { return active_recording_queue_ != nullptr; }
-
-  /**
-   * @brief Reset the per-forward dispatch counter (NNTR_RECQ_MAXDISP debug).
-   * Call once at the start of the forward to be prefix-capped.
-   */
-  void resetDispatchCounter() {
-    recq_global_dispatch_ = 0;
-    recq_cap_armed_ = true;
-  }
 
   /// R4 feed pass: skip ALL kernel dispatches (host-only forward). See
   /// recq_skip_all_.
