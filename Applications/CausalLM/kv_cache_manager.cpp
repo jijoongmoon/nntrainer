@@ -84,6 +84,21 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
       svm_alloc = it->second;
     }
   }
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // CUDA UVM-resident KV cache: route the per-layer K/V through the cuda-uvm
+  // (cudaMallocManaged) allocator so the cache is device-accessible. That lets
+  // GPU attention read it without the per-call host->device mirror and lets GPU
+  // RoPE write K straight into the device cache -- the precondition for a fully
+  // on-GPU decode chain. Same pooled path as the OpenCL SVM cache below.
+  if (!svm_alloc && std::getenv("NNTR_CUDA_KV_UVM") != nullptr) {
+    auto allocs = nntrainer::Engine::Global().getAllocators();
+    auto it = allocs.find("cuda");
+    if (it != allocs.end() && it->second &&
+        it->second->getName() == "cuda-uvm") {
+      svm_alloc = it->second;
+    }
+  }
+#endif
 
   const size_t elem_size =
     (dtype == ml::train::TensorDim::DataType::FP16) ? 2u : 4u;
