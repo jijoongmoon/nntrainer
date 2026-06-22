@@ -33,6 +33,11 @@ namespace nntrainer::cuda {
 bool cuda_rmsnorm_fp32(const float *in, const float *gamma, float *out,
                        float eps, unsigned int rows, unsigned int width);
 
+/** @brief fp16 I/O variant (gemma4 activations); FP32 sum-of-squares. */
+bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
+                       unsigned short *out, float eps, unsigned int rows,
+                       unsigned int width);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_RMSNORM_H__

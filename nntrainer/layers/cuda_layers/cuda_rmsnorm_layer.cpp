@@ -16,6 +16,9 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <cuda_rmsnorm.h>
+#include <cuda_runtime.h>
+
 #include <layer_context.h>
 #include <nntrainer_error.h>
 
@@ -59,11 +62,44 @@ void rmsnorm_rows(const T *x, const G *g, T *y, unsigned int rows,
   }
 }
 
+bool dev_ok(const void *p) {
+  cudaPointerAttributes a{};
+  bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess &&
+            (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice);
+  cudaGetLastError();
+  return ok;
+}
+
 void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
                       unsigned int rows, unsigned int width, float eps) {
   using DT = ml::train::TensorDim::DataType;
   const DT dt = in.getDataType();
   const DT gt = gamma.getDataType();
+#ifdef ENABLE_FP16
+  // GPU path: fp16 in/out/gamma all device-resident (UVM). Block-per-row, FP32
+  // sum-of-squares. Used only for small row counts (decode, rows~1): the kernel
+  // syncs per call, so for the wide prefill norm (rows=seq_len) the multi-thread
+  // host norm wins -- gating by rows gives the decode speedup (+~13%) without a
+  // prefill regression. NNTR_RMSNORM_CUDA_OFF disables; =all forces all rows.
+  static const int gpu_max_rows = []() {
+    const char *e = std::getenv("NNTR_RMSNORM_CUDA_OFF");
+    if (e && e[0] == 'a') return 1 << 30; // "all"
+    if (e) return 0;                       // off
+    return 32;                             // decode-only default
+  }();
+  if (dt == DT::FP16 && gt == DT::FP16 && out.getDataType() == DT::FP16 &&
+      (int)rows <= gpu_max_rows) {
+    const unsigned short *xi =
+      reinterpret_cast<const unsigned short *>(in.getData<_FP16>());
+    const unsigned short *gi =
+      reinterpret_cast<const unsigned short *>(gamma.getData<_FP16>());
+    unsigned short *yi =
+      reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+    if (dev_ok(xi) && dev_ok(gi) && dev_ok(yi) &&
+        cuda::cuda_rmsnorm_fp16(xi, gi, yi, eps, rows, width))
+      return;
+  }
+#endif
   if (dt == DT::FP32 && gt == DT::FP32) {
     rmsnorm_rows(in.getData<float>(), gamma.getData<float>(),
                  out.getData<float>(), rows, width, eps);
