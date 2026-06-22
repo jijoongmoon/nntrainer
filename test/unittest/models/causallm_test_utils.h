@@ -635,6 +635,15 @@ void runFp32DifferentialChecks(const DifferentialModel &model);
 void runQ40DifferentialChecks(const DifferentialModel &model);
 
 /**
+ * @brief Quantize the FP32 fixture to QINT4 (channelwise int4, plain container)
+ *        and verify the logits/tokens stay within tolerance of the HF reference.
+ *        Used to exercise the CUDA backend's fused QINT4 dequant-GEMM FC path.
+ *
+ * @param model Differential model descriptor
+ */
+void runQINT4DifferentialChecks(const DifferentialModel &model);
+
+/**
  * @brief Run the FP32 differential checks for an embedding model
  *
  * Skips (via GTEST_SKIP) when the fixture or FP32 weights are absent.
