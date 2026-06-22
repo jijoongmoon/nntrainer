@@ -1053,7 +1053,14 @@ bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate) {
   const size_t bytes = (size_t)n * sizeof(uint16_t);
 
   // Pure cl_mem->cl_mem copy: a plain buffer copy beats a kernel dispatch.
-  if (!accumulate && dst_cl != nullptr && src_cl != nullptr) {
+  // BUT clEnqueueCopyBuffer is a NON-NDRange op that the recq recordable queue
+  // does NOT capture -> it would be dropped from a recorded decode replay,
+  // leaving the destination stale. Under recq (NNTR_RECQ_DESVM) fall through to
+  // the v8c_copy_h2h KERNEL (captured, byte-identical) instead.
+  static const bool _recq_no_copyfast =
+    std::getenv("NNTR_RECQ_DESVM") != nullptr;
+  if (!accumulate && dst_cl != nullptr && src_cl != nullptr &&
+      !_recq_no_copyfast) {
     cl_command_queue q = cc->command_queue_inst_.GetCommandQueue();
     if (clEnqueueCopyBuffer(q, static_cast<cl_mem>(src_cl),
                             static_cast<cl_mem>(dst_cl), 0, 0, bytes, 0,
