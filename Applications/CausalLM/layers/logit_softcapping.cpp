@@ -15,6 +15,10 @@
 #include <algorithm>
 #include <stdexcept>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_stream_manager.h>
+#endif
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -69,6 +73,12 @@ void LogitSoftCappingLayer::incremental_forwarding(
 
 void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) path: this is the
+  // first host read of the lm_head logits, so the one-per-token GPU pipeline
+  // drains here. A no-op in default mode (every GPU op already drained).
+  nntrainer::cuda::StreamManager::Global().finish();
+#endif
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
 

@@ -71,6 +71,15 @@ public:
   void maybeFinish();
 
   /**
+   * @brief Inverse of maybeFinish: drain ONLY when NNTR_CUDA_ASYNC=1. Call this
+   *        right before a HOST op reads GPU output on a path that stays on the
+   *        host (e.g. the prefill RoPE fallback): in async mode the GPU ops did
+   *        not drain, so the host read must sync first; in default mode the
+   *        stream is already drained so it is a cheap no-op.
+   */
+  void finishIfAsync();
+
+  /**
    * @brief Destroy the stream
    */
   ~StreamManager() override;

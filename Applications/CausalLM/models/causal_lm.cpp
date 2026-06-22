@@ -54,6 +54,10 @@
 #include <llm_util.hpp>
 #include <recq_overrides.h> // R3/R4 record/replay override registry + CL types
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_stream_manager.h>
+#endif
+
 // On-GPU greedy argmax sampler (defined in libnntrainer blas_kernels.cpp): when
 // requested (pure greedy), the lm_head GEMV reduces logits on the GPU and skips
 // the full-vocab D->H readback; generate() consumes the 4-byte token id.
@@ -381,6 +385,13 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
                                              float repetition_penalty,
                                              unsigned int *input_ids,
                                              unsigned int NUM_INPUT_IDS) {
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) decode path: ensure
+  // the GPU has finished producing the logits before the host reads them here.
+  // No-op in default mode (every GPU op already drained per-op).
+  nntrainer::cuda::StreamManager::Global().finish();
+#endif
 
   std::vector<unsigned int> outputs;
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {

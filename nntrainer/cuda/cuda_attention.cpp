@@ -265,7 +265,7 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
             softcap, shmem);
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block, shmem))
     return false;
-  StreamManager::Global().finish();
+  StreamManager::Global().maybeFinish();
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) {
     ml_loge("[CUDA] attn_core_il_fp16 runtime error: %s", cudaGetErrorString(e));
@@ -308,7 +308,7 @@ bool cuda_attention_core_fp32(const float *Q, const float *K, const float *V,
     (unsigned int)(sizeof(float) * ((size_t)head_dim + B));
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block, shmem))
     return false;
-  StreamManager::Global().finish();
+  StreamManager::Global().maybeFinish();
   return true;
 }
 

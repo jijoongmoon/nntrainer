@@ -132,7 +132,7 @@ bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
   const int grid[3] = {num_heads, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  StreamManager::Global().finish();
+  StreamManager::Global().maybeFinish();
   return true;
 }
 

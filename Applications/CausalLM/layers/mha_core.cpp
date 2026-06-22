@@ -25,6 +25,7 @@
 #include <cuda_elementwise.h>
 #include <cuda_rope.h>
 #include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
 #endif
 
 static std::mutex rope_init_mtx;
@@ -2153,10 +2154,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           }
         }
       }
-      if (!q_rope_gpu)
+      if (!q_rope_gpu) {
+        // host RoPE fallback (prefill height>1): sync first so the host read of
+        // GPU-produced q is coherent under NNTR_CUDA_ASYNC.
+        nntrainer::cuda::StreamManager::Global().finishIfAsync();
 #endif
         apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
                                    true);
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+      }
+#endif
 
       // append kcache with rotary embedding. §3.8 OHWI write path: when
       // enabled and on the FP16 cache path, rotate K in-place on key_step then
@@ -2215,9 +2222,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           }
         }
 #endif
-        if (!k_rope_gpu)
+        if (!k_rope_gpu) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#endif
           apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
                                      cache_index, true);
+        }
       }
 
       // append vcache without rotary embedding
@@ -2241,14 +2252,18 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                      (pa.type == cudaMemoryTypeManaged ||
                       pa.type == cudaMemoryTypeDevice);
           cudaGetLastError();
-          if (cuda_elt && dev &&
+          if (cuda_elt && dev && value_step.height() == 1 &&
               nntrainer::cuda::cuda_scalar_mul_fp16(
                 vin, vout, (unsigned int)value_step.size(), 1.0f))
             v_copy_gpu = true;
         }
 #endif
-        if (!v_copy_gpu)
+        if (!v_copy_gpu) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#endif
           b_cache_value_step.copyData(value_step);
+        }
 #else
         NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif

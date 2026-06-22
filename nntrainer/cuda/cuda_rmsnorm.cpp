@@ -129,7 +129,7 @@ bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
   const int grid[3] = {(int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  StreamManager::Global().finish();
+  StreamManager::Global().maybeFinish();
   return true;
 }
 
@@ -160,7 +160,7 @@ bool cuda_rmsnorm_fp32(const float *in, const float *gamma, float *out,
   const int grid[3] = {(int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  StreamManager::Global().finish();
+  StreamManager::Global().maybeFinish();
   return true;
 }
 

@@ -161,7 +161,7 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
         hidden_.getData<float>())) {
     // GEMM is enqueued on the backend stream; drain before host consumers
     // (bias add_i / the next layer) read the managed output.
-    cuda::StreamManager::Global().finish();
+    cuda::StreamManager::Global().maybeFinish();
     return;
   }
 

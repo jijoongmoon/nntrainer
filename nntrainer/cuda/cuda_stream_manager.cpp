@@ -70,12 +70,21 @@ void StreamManager::finish() {
     cudaStreamSynchronize(stream_);
 }
 
-void StreamManager::maybeFinish() {
+static bool cuda_async_mode() {
   static const bool async = []() {
     const char *e = std::getenv("NNTR_CUDA_ASYNC");
     return e != nullptr && e[0] == '1';
   }();
-  if (!async)
+  return async;
+}
+
+void StreamManager::maybeFinish() {
+  if (!cuda_async_mode())
+    finish();
+}
+
+void StreamManager::finishIfAsync() {
+  if (cuda_async_mode())
     finish();
 }
 
