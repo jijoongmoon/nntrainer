@@ -3055,6 +3055,16 @@ static void *g_recq_lmhead_act = nullptr;
 static bool g_recq_lmhead_act_clmem = false;
 static unsigned int g_recq_lmhead_K = 0;
 static cl_mem g_recq_lmhead_out = nullptr;
+// recq: residual SEED probe (embedding0 output = layer-0 input) for the
+// input-vs-layers split. Set by the embedding layer (recq_set_seed_probe).
+static void *g_recq_seed = nullptr;
+static bool g_recq_seed_clmem = false;
+static unsigned int g_recq_seed_bytes = 0;
+void recq_set_seed_probe(void *p, bool is_clmem, unsigned int bytes) {
+  g_recq_seed = p;
+  g_recq_seed_clmem = is_clmem;
+  g_recq_seed_bytes = bytes;
+}
 void request_gpu_argmax(bool on) {
   g_argmax_requested = on;
   g_argmax_valid = false;
@@ -3150,11 +3160,32 @@ void recq_dump_lmhead(const char *tag) {
         lg_sum += (unsigned long long)lg[i] * (i + 1u);
     }
   }
+  // Residual SEED checksum (embedding0 output = layer-0 input). If this differs
+  // normal-vs-replay => the input/embedding handoff is wrong at replay; if it
+  // matches but act_sum differs => a decoder-layer KERNEL replays wrong.
+  unsigned long long seed_sum = 0;
+  unsigned int seed_n = 0;
+  if (g_recq_seed && g_recq_seed_bytes >= 2) {
+    seed_n = g_recq_seed_bytes / 2;
+    std::vector<uint16_t> sd(seed_n, 0);
+    bool got = false;
+    if (g_recq_seed_clmem) {
+      got = clEnqueueReadBuffer(q, static_cast<cl_mem>(g_recq_seed), CL_TRUE, 0,
+                                (size_t)seed_n * 2, sd.data(), 0, nullptr,
+                                nullptr) == CL_SUCCESS;
+    } else {
+      std::memcpy(sd.data(), g_recq_seed, (size_t)seed_n * 2);
+      got = true;
+    }
+    if (got)
+      for (unsigned int i = 0; i < seed_n; i++)
+        seed_sum += (unsigned long long)sd[i] * (i + 1u);
+  }
   std::fprintf(stderr,
                "[RECQ-DUMP] %s: K=%u act_sum=%llu act[0..3]=%u,%u,%u,%u "
-               "logits_sum=%llu gpu_tok=%u\n",
+               "logits_sum=%llu seed_n=%u seed_sum=%llu gpu_tok=%u\n",
                tag ? tag : "", K, act_sum, act[0], act[1], act[2], act[3],
-               lg_sum, g_argmax_token);
+               lg_sum, seed_n, seed_sum, g_argmax_token);
   std::fflush(stderr);
 }
 
