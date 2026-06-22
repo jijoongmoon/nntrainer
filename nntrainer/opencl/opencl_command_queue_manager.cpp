@@ -295,6 +295,8 @@ bool CommandQueueManager::replayRecording(const cl_array_arg_qcom *args,
 }
 
 bool CommandQueueManager::recqSkipDispatch() {
+  if (recq_skip_all_) // R4 feed pass: host-only forward
+    return true;
   static const cl_uint maxd = []() {
     const char *e = std::getenv("NNTR_RECQ_MAXDISP");
     return e ? (cl_uint)std::atoi(e) : 0u;

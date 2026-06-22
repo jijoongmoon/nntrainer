@@ -769,42 +769,47 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       _cqm.resetDispatchCounter();
     std::vector<float *> output_interval;
     bool _did_replay = false;
-    if (_recq_replay && !_recq_recorded &&
-        _cqm.getRecordableQueue() != nullptr) {
-      causallm::recq_reset_overrides();
-      if (_cqm.beginRecording()) {
-        // Record pass: dispatches are CAPTURED onto the recordable queue; the
-        // MHA decode path fills the override registry. The forward is not
-        // executed, so its output / host argmax are garbage (overwritten below).
+    if (_recq_replay && _cqm.getRecordableQueue() != nullptr) {
+      if (!_recq_recorded) {
+        // First decode token: RECORD the full forward (capture-only). The host
+        // embedding ran here, so embedding0:out0 holds this token's embedding for
+        // the replay below.
+        causallm::recq_reset_overrides();
+        if (_cqm.beginRecording()) {
+          output_interval = incrementalInference(BATCH_SIZE, input, input_len,
+                                                 _recq_ci, _recq_ci + 1);
+          _cqm.endRecording();
+          _recq_recorded = true;
+          std::fprintf(stderr,
+                       "[RECQ] recorded decode forward: %u dispatches, %zu "
+                       "overrides\n",
+                       (unsigned int)_cqm.getRecordDispatchIndex(),
+                       causallm::recq_override_count());
+        }
+      } else {
+        // Subsequent tokens: FEED pass -- run incrementalInference with ALL GPU
+        // dispatches skipped, so only the HOST embedding refreshes embedding0:out0
+        // with this token's embedding; the GPU forward comes from the replay.
+        _cqm.setSkipAllDispatches(true);
         output_interval = incrementalInference(BATCH_SIZE, input, input_len,
                                                _recq_ci, _recq_ci + 1);
-        _cqm.endRecording();
-        _recq_recorded = true;
-        std::fprintf(
-          stderr, "[RECQ] recorded decode forward: %u dispatches, %zu overrides\n",
-          (unsigned int)_cqm.getRecordDispatchIndex(),
-          causallm::recq_override_count());
+        _cqm.setSkipAllDispatches(false);
+      }
+      if (_recq_recorded) {
         std::vector<nntrainer::opencl::cl_array_arg_qcom> _rargs;
         std::vector<nntrainer::opencl::cl_workgroup_qcom> _rgws;
         std::vector<int> _rints;
         std::vector<std::array<std::size_t, 3>> _rgwss;
         causallm::recq_build_token_overrides(_recq_ci, _rargs, _rgws, _rints,
                                              _rgwss);
-        // NNTR_RECQ_NOOVR diagnostic: replay with ZERO overrides. Since the
-        // replay uses the SAME cache_index as the record pass, the overrides are
-        // no-ops (they set the recorded values back); a correct recording should
-        // therefore reproduce the baseline token with OR without them. If NOOVR
-        // reproduces but the override path does not, the override map is wrong;
-        // if neither reproduces, the recording/replay itself is not faithful.
         static const bool _recq_noovr = std::getenv("NNTR_RECQ_NOOVR") != nullptr;
         cl_event _revt = nullptr;
         const bool _rok =
           _recq_noovr ? _cqm.replayRecording(nullptr, 0, nullptr, 0, &_revt)
                       : _cqm.replayRecording(_rargs.data(), _rargs.size(),
                                              _rgws.data(), _rgws.size(), &_revt);
-        // NNTR_RECQ_MAXDISP prefix test: the recording captured only the first N
-        // dispatches; the replay ran them. Dump the residual probe (seed) NOW,
-        // before any fallback overwrites the buffers, then stop (no token).
+        // NNTR_RECQ_MAXDISP prefix debug (first token only): dump the residual
+        // probe before any fallback overwrites it, then stop.
         static const bool _recq_maxdisp =
           std::getenv("NNTR_RECQ_MAXDISP") != nullptr;
         if (_recq_maxdisp) {
@@ -816,15 +821,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         }
         if (_rok) {
           unsigned int _rtok = 0;
-          if (nntrainer::recq_read_argmax_io(&_rtok, _revt)) {
+          if (nntrainer::recq_read_argmax_io(&_rtok, _revt))
             _did_replay = true;
-            std::fprintf(stderr, "[RECQ] replayed first token id=%u\n", _rtok);
-          }
         }
         if (!_did_replay)
           std::fprintf(stderr,
-                       "[RECQ] replay/readback FAILED; falling back to normal "
-                       "inference for this token.\n");
+                       "[RECQ] replay/readback FAILED @ci=%u; fallback to normal\n",
+                       _recq_ci);
       }
     }
     if (!_did_replay)

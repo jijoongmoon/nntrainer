@@ -113,6 +113,11 @@ class CommandQueueManager : public Singleton<CommandQueueManager> {
    */
   cl_uint recq_global_dispatch_{0};
   bool recq_cap_armed_{false};
+  /// When set, ALL kernel dispatches are skipped (no capture, no execute). Used
+  /// by the R4 per-token "feed pass": run incrementalInference so the HOST
+  /// embedding writes this token's embedding output, while the GPU forward is
+  /// skipped (it will be supplied by the recorded-chain replay instead).
+  bool recq_skip_all_{false};
   bool recqSkipDispatch();
 
   /**
@@ -365,6 +370,10 @@ public:
     recq_global_dispatch_ = 0;
     recq_cap_armed_ = true;
   }
+
+  /// R4 feed pass: skip ALL kernel dispatches (host-only forward). See
+  /// recq_skip_all_.
+  void setSkipAllDispatches(bool v) { recq_skip_all_ = v; }
 
   /**
    * @brief Destroy the Command Queue Manager object
