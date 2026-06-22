@@ -6,6 +6,7 @@ cuda_sources = [
   'cuda_module.cpp',
   'cuda_kernel.cpp',
   'cuda_compute_ops.cpp',
+  'cuda_blas_manager.cpp',
 ]
 
 cuda_headers = [
@@ -16,6 +17,7 @@ cuda_headers = [
   'cuda_buffer_manager.h',
   'cuda_module.h',
   'cuda_kernel.h',
+  'cuda_blas_manager.h',
 ]
 
 foreach s : cuda_sources

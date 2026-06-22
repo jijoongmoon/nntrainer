@@ -15,6 +15,7 @@
 #include <mutex>
 
 #include <compute_ops.h>
+#include <cuda_fc_layer.h>
 #include <cuda_mem_allocator.h>
 
 namespace nntrainer {
@@ -49,9 +50,11 @@ void CudaContext::initialize() noexcept {
 }
 
 void CudaContext::add_default_object() {
-  // P0: no CUDA layer classes yet. nntrainer/layers/cuda_layers/ (CudaFcLayer,
-  // CudaRmsNormLayer, ...) are added in P2 (Gemma4 first-light) and registered
-  // here, mirroring ClContext::add_default_object().
+  // P2: register the CUDA FC layer. More CUDA layers (rmsnorm, swiglu/geglu,
+  // attention, ...) are added here as they land, mirroring
+  // ClContext::add_default_object().
+  registerFactory(nntrainer::createLayer<CudaFcLayer>, CudaFcLayer::type,
+                  ml::train::LayerType::LAYER_FC);
 }
 
 template <typename T>
