@@ -43,6 +43,32 @@ bool cuda_attention_core_fp32(const float *Q, const float *K, const float *V,
                               int q_rows, int kv_len, int q_pos0, int head_dim,
                               int window, float softcap);
 
+/**
+ * @brief Drop-in GPU replacement for the host gemm_attention: reads the
+ *        head-interleaved fp16 query step [N_q, num_heads_Q*head_dim] and the
+ *        fp16 KV cache [N_kv, num_heads_KV*head_dim] directly (de-interleave +
+ *        fp16->fp32 happen inside the kernel), runs the flash core in FP32, and
+ *        writes the interleaved fp16 output [N_q, num_heads_Q*head_dim]. Matches
+ *        gemm_attention's math: scale 1/sqrt(d), causal + sliding mask with the
+ *        cache_from offset, GQA; softcap<=0 (gemm_attention applies none).
+ *
+ * @param q_fp16   query step, fp16 bits (device-accessible)
+ * @param k_fp16   KV cache key, fp16 bits
+ * @param v_fp16   KV cache value, fp16 bits
+ * @param o_fp16   output, fp16 bits (written)
+ * @param num_heads_Q / num_heads_KV  GQA heads
+ * @param N_q / N_kv  query rows / cached keys
+ * @param cache_from  absolute position of query row 0
+ * @param head_dim, window, softcap
+ */
+bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
+                                     const unsigned short *k_fp16,
+                                     const unsigned short *v_fp16,
+                                     unsigned short *o_fp16, int num_heads_Q,
+                                     int num_heads_KV, int N_q, int N_kv,
+                                     int cache_from, int head_dim, int window,
+                                     float softcap);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_ATTENTION_H__

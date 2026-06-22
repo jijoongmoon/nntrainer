@@ -12,12 +12,18 @@
  *         This code is a part of the break down version of the mha layer.
  */
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_attention.h>
+#include <cuda_runtime.h>
+#endif
 
 static std::mutex rope_init_mtx;
 
@@ -3176,6 +3182,40 @@ void MHACoreLayer::gemm_attention(
     Vbase = b_cached_value.getData<uint16_t>();
 #endif
   }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Opt-in GPU attention (engine=cuda, UVM): the interleaved fp16 query +
+  // fp16 KV cache feed a flash core on the device, replacing the host O(M^2)
+  // loop below. Matches gemm_attention exactly (scale 1/sqrt(d), causal +
+  // sliding mask, GQA, NO softcap). Default OFF (NNTR_CUDA_ATTN) until verified;
+  // falls through to the host path when off / not device-resident.
+  {
+    static const bool cuda_attn = std::getenv("NNTR_CUDA_ATTN") != nullptr;
+    if (cuda_attn && q_fp16 && o_fp16 && !kv_int8 && Q_fp16_src && O_fp16) {
+      auto dev_ok = [](const void *p) {
+        cudaPointerAttributes a{};
+        bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess &&
+                  (a.type == cudaMemoryTypeManaged ||
+                   a.type == cudaMemoryTypeDevice);
+        cudaGetLastError();
+        return ok;
+      };
+      // ALL operands must be device-resident (UVM); the KV cache or output may
+      // be host-heap -- a device kernel touching host memory faults and
+      // corrupts the context (subsequent FC dp4a then fails -> host NYI).
+      bool dev = dev_ok(Q_fp16_src) && dev_ok(Kbase) && dev_ok(Vbase) &&
+                 dev_ok(O_fp16);
+      if (dev) {
+        const int win = windowed ? (int)local_window_size : INT_MAX;
+        if (nntrainer::cuda::cuda_attention_interleaved_fp16(
+              Q_fp16_src, Kbase, Vbase, O_fp16, (int)num_heads_Q,
+              (int)num_heads_KV, (int)N_q, (int)N_kv, (int)cache_from, (int)d,
+              win, /*softcap=*/0.0f))
+          return;
+      }
+    }
+  }
+#endif
 
   // Phase 1: de-interleave heads once into shared contiguous buffers.
   // K/V always kept as raw FP16 bits (uint16). Q either FP32 (V-JEPA
