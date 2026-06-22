@@ -3200,11 +3200,11 @@ void MHACoreLayer::gemm_attention(
         cudaGetLastError();
         return ok;
       };
-      // ALL operands must be device-resident (UVM); the KV cache or output may
-      // be host-heap -- a device kernel touching host memory faults and
-      // corrupts the context (subsequent FC dp4a then fails -> host NYI).
-      bool dev = dev_ok(Q_fp16_src) && dev_ok(Kbase) && dev_ok(Vbase) &&
-                 dev_ok(O_fp16);
+      // Query + output must be device-resident (the kernel uses them directly);
+      // the KV cache may be host-heap (it is, on engine=cuda) -- the launcher
+      // mirrors it to the device. A device kernel touching host memory faults
+      // and corrupts the context, so this guard is required.
+      bool dev = dev_ok(Q_fp16_src) && dev_ok(O_fp16);
       if (dev) {
         const int win = windowed ? (int)local_window_size : INT_MAX;
         if (nntrainer::cuda::cuda_attention_interleaved_fp16(

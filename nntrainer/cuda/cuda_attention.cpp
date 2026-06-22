@@ -21,6 +21,9 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 
+#include <mutex>
+#include <unordered_map>
+
 namespace nntrainer::cuda {
 
 // One block per (query head h, query row i). Online (flash) softmax in FP32.
@@ -175,6 +178,44 @@ __global__ void attn_core_il_fp16(const unsigned short *q, const unsigned short 
 }
 )CU";
 
+namespace {
+// device mirror of a host-resident KV cache (keyed by host pointer). The cache
+// (cache_key/cache_value) is a MAX_LIFESPAN tensor that is NOT UVM-resident on
+// engine=cuda, so a device kernel can't read it directly; mirror it (small:
+// num_kv_heads=1). Re-copied each call (the cache grows) -- correct, and cheap
+// for the per-layer cache size.
+struct DevKV {
+  unsigned short *buf = nullptr;
+  size_t cap = 0;
+};
+std::unordered_map<const void *, DevKV> g_kv_mirror;
+std::mutex g_kv_mtx;
+
+const unsigned short *mirror_kv(const unsigned short *host, size_t elems) {
+  cudaPointerAttributes a{};
+  bool dev = cudaPointerGetAttributes(&a, host) == cudaSuccess &&
+             (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice);
+  cudaGetLastError();
+  if (dev)
+    return host; // already device-accessible
+  std::lock_guard<std::mutex> lk(g_kv_mtx);
+  auto &e = g_kv_mirror[host];
+  size_t bytes = elems * sizeof(unsigned short);
+  if (bytes > e.cap) {
+    if (e.buf)
+      cudaFree(e.buf);
+    if (cudaMalloc(&e.buf, bytes) != cudaSuccess) {
+      e.buf = nullptr;
+      e.cap = 0;
+      return nullptr;
+    }
+    e.cap = bytes;
+  }
+  cudaMemcpy(e.buf, host, bytes, cudaMemcpyHostToDevice);
+  return e.buf;
+}
+} // namespace
+
 bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                      const unsigned short *k_fp16,
                                      const unsigned short *v_fp16,
@@ -184,6 +225,14 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                      float softcap) {
   if (num_heads_Q == 0 || N_q == 0 || N_kv == 0 || head_dim == 0)
     return true;
+
+  // mirror the KV cache to the device if it is host-resident (engine=cuda KV
+  // cache is not UVM). K/V are [N_kv, num_heads_KV*head_dim] interleaved.
+  const size_t kv_elems = (size_t)N_kv * num_heads_KV * head_dim;
+  k_fp16 = mirror_kv(k_fp16, kv_elems);
+  v_fp16 = mirror_kv(v_fp16, kv_elems);
+  if (!k_fp16 || !v_fp16)
+    return false;
   auto kernel = CudaContext::Global().registerCudaKernel(ATTN_IL_FP16_SRC,
                                                          "attn_core_il_fp16");
   if (!kernel) {
