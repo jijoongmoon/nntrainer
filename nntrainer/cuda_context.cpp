@@ -14,8 +14,10 @@
 
 #include <mutex>
 
+#include <addition_layer.h>
 #include <compute_ops.h>
 #include <cuda_fc_layer.h>
+#include <cuda_geglu_layer.h>
 #include <cuda_mem_allocator.h>
 
 namespace nntrainer {
@@ -59,6 +61,13 @@ void CudaContext::add_default_object() {
   // ClContext::add_default_object().
   registerFactory(nntrainer::createLayer<CudaFcLayer>, CudaFcLayer::type,
                   ml::train::LayerType::LAYER_FC);
+  // addition: the core CPU AdditionLayer is pure host Tensor ops -> correct on
+  // the host-coherent UVM tensors (do NOT use the OpenCL AdditionLayerCL).
+  registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
+                  ml::train::LayerType::LAYER_ADDITION);
+  // geglu: no host class exists in the tree (only OpenCL GeGLULayerCl), so
+  // provide a host-on-UVM gelu_tanh(gate)*up implementation.
+  registerFactory(nntrainer::createLayer<CudaGeGLULayer>, CudaGeGLULayer::type);
 }
 
 template <typename T>
