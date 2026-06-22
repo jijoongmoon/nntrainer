@@ -7,14 +7,15 @@
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @bug     No known bugs except for NYI items
- * @brief   Device RoPE (rotary position embedding) for the gemma4 decode path.
+ * @brief   Device RoPE (rotary position embedding) for the gemma4 path.
  *
  * Matches the host compute_rotary_emb_value split-half convention exactly:
- * for each head and each k in [0, head_dim/2):
- *   out[k]        = in[k]*cos[k] - in[k+half]*sin[k]
- *   out[k+half]   = in[k]*sin[k] + in[k+half]*cos[k]
- * (full rotation over head_dim; the per-position cos/sin LUT row has head_dim/2
- * fp16 entries). FP32 math, fp16 I/O. One block per head.
+ * for each row (token), head and each k in [0, head_dim/2):
+ *   out[k]      = in[k]*cos[k] - in[k+half]*sin[k]
+ *   out[k+half] = in[k]*sin[k] + in[k+half]*cos[k]
+ * Full rotation over head_dim; FP32 math, fp16 I/O. Handles num_rows>1 (prefill)
+ * with a per-row position from+row. The cos/sin LUTs are flat device buffers
+ * [num_positions * head_dim/2] (uploaded once by the caller).
  */
 
 #ifndef __CUDA_ROPE_H__
@@ -23,21 +24,21 @@
 namespace nntrainer::cuda {
 
 /**
- * @brief  Apply RoPE on the device to an interleaved fp16 [num_heads*head_dim]
- *         row (one token). in/out are device-accessible (UVM); cos_row/sin_row
- *         are the host LUT row for the token's absolute position (head_dim/2
- *         fp16 entries) -- mirrored to the device internally.
- * @param in        [num_heads*head_dim] fp16 bits (device-accessible), one token
- * @param out       [num_heads*head_dim] fp16 bits (device-accessible); may == in
- * @param cos_row   [head_dim/2] fp16 bits (host or device) for this position
- * @param sin_row   [head_dim/2] fp16 bits
- * @param num_heads number of heads packed in the row
+ * @brief  Apply RoPE on the device to interleaved fp16 rows
+ *         [num_rows, num_heads*head_dim]. in/out + the LUTs are device-resident.
+ * @param in        [num_rows, num_heads*head_dim] fp16 bits (device)
+ * @param out       same shape (device); may == in
+ * @param cos_lut   flat device LUT [num_positions, head_dim/2] fp16 bits
+ * @param sin_lut   flat device LUT [num_positions, head_dim/2] fp16 bits
+ * @param num_heads heads packed per row
  * @param head_dim  per-head dim (256 sliding / 512 full); half = head_dim/2
+ * @param num_rows  number of token rows (1 = decode, >1 = prefill big-step)
+ * @param from      absolute position of row 0 (LUT row = from + row index)
  * @return true on success
  */
 bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
-                    const unsigned short *cos_row, const unsigned short *sin_row,
-                    int num_heads, int head_dim);
+                    const unsigned short *cos_lut, const unsigned short *sin_lut,
+                    int num_heads, int head_dim, int num_rows, int from);
 
 } // namespace nntrainer::cuda
 

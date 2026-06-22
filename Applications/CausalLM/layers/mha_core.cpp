@@ -2158,8 +2158,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       {
         static const bool cuda_rope = std::getenv("NNTR_CUDA_ROPE") != nullptr;
         if (cuda_rope &&
-            query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
-            query_step.height() == 1) {
+            query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
           if (cached_freqs_cos_fp16 == nullptr ||
               cached_freqs_sin_fp16 == nullptr) {
             const std::lock_guard<std::mutex> lock(rope_init_mtx);
@@ -2167,7 +2166,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             cached_freqs_cos_fp16 = freqs_cos_fp16;
             cached_freqs_sin_fp16 = freqs_sin_fp16;
           }
-          if (cache_index < (*cached_freqs_cos_fp16).size()) {
+          const unsigned int nrows = query_step.height();
+          if ((size_t)cache_index + nrows <= (*cached_freqs_cos_fp16).size()) {
             unsigned short *q =
               reinterpret_cast<unsigned short *>(query_step.getData<_FP16>());
             cudaPointerAttributes pa{};
@@ -2183,9 +2183,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 rope_lut_device(cached_freqs_sin_fp16, half);
               if (cosd && sind)
                 q_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
-                  q, q, cosd + (size_t)cache_index * half,
-                  sind + (size_t)cache_index * half,
-                  query_step.width() / head_dim, head_dim);
+                  q, q, cosd, sind, query_step.width() / head_dim, head_dim,
+                  (int)nrows, (int)cache_index);
             }
           }
         }
@@ -2238,10 +2237,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             cudaGetLastError();
             return ok;
           };
+          const unsigned int knrows = key_step.height();
           if (cuda_rope &&
               key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
-              key_step.height() == 1 && cached_freqs_cos_fp16 != nullptr &&
-              cache_index < (*cached_freqs_cos_fp16).size()) {
+              cached_freqs_cos_fp16 != nullptr &&
+              (size_t)cache_index + knrows <= (*cached_freqs_cos_fp16).size()) {
             auto *kin =
               reinterpret_cast<unsigned short *>(key_step.getData<_FP16>());
             auto *kout = reinterpret_cast<unsigned short *>(
@@ -2254,9 +2254,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 rope_lut_device(cached_freqs_sin_fp16, half);
               if (cosd && sind)
                 k_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
-                  kin, kout, cosd + (size_t)cache_index * half,
-                  sind + (size_t)cache_index * half,
-                  key_step.width() / head_dim, head_dim);
+                  kin, kout, cosd, sind, key_step.width() / head_dim, head_dim,
+                  (int)knrows, (int)cache_index);
             }
           }
         }

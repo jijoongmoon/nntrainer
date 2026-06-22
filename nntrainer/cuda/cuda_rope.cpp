@@ -17,15 +17,10 @@
 
 #include <nntrainer_log.h>
 
-#include <cuda_runtime.h>
-
-#include <mutex>
-#include <unordered_map>
-
 namespace nntrainer::cuda {
 
-// One block per head; threads sweep the rotated-pair index k in [0, half).
-// Reuses the fp16<->fp32 codec from cuda_rmsnorm.
+// One block per (row, head); threads sweep the rotated-pair index k in [0,half).
+// Per-row position is from + blockIdx.x, indexing the flat device cos/sin LUTs.
 static const char *ROPE_FP16_SRC = R"CU(
 extern "C" {
 __device__ __forceinline__ float rp_h2f(unsigned short h) {
@@ -53,11 +48,15 @@ __device__ __forceinline__ unsigned short rp_f2h(float f) {
   return (unsigned short)(s|hh);
 }
 __global__ void rope_fp16(const unsigned short *in, unsigned short *out,
-                          const unsigned short *cosr, const unsigned short *sinr,
-                          int head_dim, int half) {
-  int head = blockIdx.x;
-  const unsigned short *xr = in + (size_t)head * head_dim;
-  unsigned short *yr = out + (size_t)head * head_dim;
+                          const unsigned short *cos_lut,
+                          const unsigned short *sin_lut, int num_heads,
+                          int head_dim, int half, int from) {
+  int row = blockIdx.x, head = blockIdx.y;
+  long HD = (long)num_heads * head_dim;
+  const unsigned short *xr = in + (long)row * HD + (long)head * head_dim;
+  unsigned short *yr = out + (long)row * HD + (long)head * head_dim;
+  const unsigned short *cosr = cos_lut + (long)(from + row) * half;
+  const unsigned short *sinr = sin_lut + (long)(from + row) * half;
   for (int k = threadIdx.x; k < half; k += blockDim.x) {
     float a = rp_h2f(xr[k]);
     float b = rp_h2f(xr[k + half]);
@@ -70,52 +69,12 @@ __global__ void rope_fp16(const unsigned short *in, unsigned short *out,
 }
 )CU";
 
-namespace {
-// Mirror a host LUT row to the device (keyed by host ptr; rows are tiny and
-// immutable per position, so the cached copy can be reused for the same row).
-struct DevRow {
-  unsigned short *buf = nullptr;
-  size_t cap = 0;
-};
-std::unordered_map<const void *, DevRow> g_lut_mirror;
-std::mutex g_lut_mtx;
-
-const unsigned short *mirror_row(const unsigned short *host, size_t elems) {
-  cudaPointerAttributes a{};
-  bool dev = cudaPointerGetAttributes(&a, host) == cudaSuccess &&
-             (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice);
-  cudaGetLastError();
-  if (dev)
-    return host;
-  std::lock_guard<std::mutex> lk(g_lut_mtx);
-  auto &e = g_lut_mirror[host];
-  size_t bytes = elems * sizeof(unsigned short);
-  if (bytes > e.cap) {
-    if (e.buf)
-      cudaFree(e.buf);
-    if (cudaMalloc(&e.buf, bytes) != cudaSuccess) {
-      e.buf = nullptr;
-      e.cap = 0;
-      return nullptr;
-    }
-    e.cap = bytes;
-  }
-  cudaMemcpy(e.buf, host, bytes, cudaMemcpyHostToDevice);
-  return e.buf;
-}
-} // namespace
-
 bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
-                    const unsigned short *cos_row, const unsigned short *sin_row,
-                    int num_heads, int head_dim) {
-  if (num_heads == 0 || head_dim == 0)
+                    const unsigned short *cos_lut, const unsigned short *sin_lut,
+                    int num_heads, int head_dim, int num_rows, int from) {
+  if (num_heads == 0 || head_dim == 0 || num_rows == 0)
     return true;
   const int half = head_dim / 2;
-  cos_row = mirror_row(cos_row, half);
-  sin_row = mirror_row(sin_row, half);
-  if (!cos_row || !sin_row)
-    return false;
-
   auto kernel =
     CudaContext::Global().registerCudaKernel(ROPE_FP16_SRC, "rope_fp16");
   if (!kernel) {
@@ -124,12 +83,14 @@ bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
   }
   kernel->SetKernelArguments(0, &in, sizeof(in));
   kernel->SetKernelArguments(1, &out, sizeof(out));
-  kernel->SetKernelArguments(2, &cos_row, sizeof(cos_row));
-  kernel->SetKernelArguments(3, &sin_row, sizeof(sin_row));
-  kernel->SetKernelArguments(4, &head_dim, sizeof(head_dim));
-  kernel->SetKernelArguments(5, &half, sizeof(half));
+  kernel->SetKernelArguments(2, &cos_lut, sizeof(cos_lut));
+  kernel->SetKernelArguments(3, &sin_lut, sizeof(sin_lut));
+  kernel->SetKernelArguments(4, &num_heads, sizeof(num_heads));
+  kernel->SetKernelArguments(5, &head_dim, sizeof(head_dim));
+  kernel->SetKernelArguments(6, &half, sizeof(half));
+  kernel->SetKernelArguments(7, &from, sizeof(from));
   const int block[3] = {half < 256 ? half : 256, 1, 1};
-  const int grid[3] = {num_heads, 1, 1};
+  const int grid[3] = {num_rows, num_heads, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
   StreamManager::Global().maybeFinish();
