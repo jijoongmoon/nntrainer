@@ -12,6 +12,8 @@
 
 #include <cuda_mem_allocator.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_set>
 
@@ -45,12 +47,19 @@ bool CudaMemAllocator::consume_host_owned(void *ptr) {
 }
 
 void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
+  static const bool dbg = std::getenv("NNTR_UVM_DEBUG") != nullptr;
   if (size > 0) {
     void *managed = nullptr;
     if (cudaMallocManaged(&managed, size) == cudaSuccess && managed != nullptr) {
       *ptr = managed;
+      if (dbg)
+        fprintf(stderr, "[UVMDBG] cudaMallocManaged %zu bytes -> %p OK\n", size,
+                managed);
       return;
     }
+    if (dbg)
+      fprintf(stderr, "[UVMDBG] cudaMallocManaged %zu bytes FAILED -> host\n",
+              size);
     // a failed managed alloc leaves the runtime error state set; clear it so a
     // subsequent real CUDA op does not see this benign fallback as an error.
     cudaGetLastError();

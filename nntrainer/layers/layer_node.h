@@ -1012,6 +1012,15 @@ public:
    */
   bool isComputeEngineGPU() const;
 
+  /**
+   * @brief Query whether this node requests the CUDA compute engine via its
+   *        `engine` property (the additive NVIDIA backend). Same direct-read
+   *        rationale as isComputeEngineGPU(); used to route the graph's memory
+   *        allocator to CUDA Unified Memory.
+   * @return true iff the `engine` property is set and equals CUDA
+   */
+  bool isComputeEngineCUDA() const;
+
 private:
   /**
    * @brief     Get the Input Layers object

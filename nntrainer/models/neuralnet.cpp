@@ -248,6 +248,25 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     }
   }
 #endif
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // engine=cuda: route the graph's tensor pool through the CUDA Unified Memory
+  // allocator (cudaMallocManaged) so weights/activations are device-resident,
+  // letting the cuBLAS / QINT4 GPU FC paths engage instead of the host
+  // fallback. UVM is host-coherent, so unported host layers keep working on the
+  // same pointers. Default ON when the graph has a cuda node;
+  // NNTR_CUDA_UVM_POOL=0 forces the host allocator (correct, runs on host).
+  if (engine_name == "cpu") {
+    const char *uvm = std::getenv("NNTR_CUDA_UVM_POOL");
+    if (!(uvm != nullptr && uvm[0] == '0')) {
+      for (auto &n : graph_representation) {
+        if (n->isComputeEngineCUDA()) {
+          engine_name = "cuda";
+          break;
+        }
+      }
+    }
+  }
+#endif
 
   model_graph = NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format,
                              tensor_type, engine_name);
