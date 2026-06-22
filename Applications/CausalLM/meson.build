@@ -307,4 +307,28 @@ if get_option('enable-test')
       env: {'NNTR_QUANTIZE_BIN': e_quantize.full_path()}
     )
   endif
+
+  # Dedicated gemma4_tiny differential test for the additive CUDA backend.
+  # Built even in FP16-enabled builds (where the broad model-unittest set above
+  # is skipped), so engine=cuda first-light can be validated against the HF
+  # reference. Run with NNTR_ENGINE=cuda (or cpu for a baseline).
+  if get_option('enable-cuda')
+    unittest_cuda_gemma4 = executable(
+      'unittest_cuda_gemma4',
+      [
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'causallm_test_utils.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+      ],
+      dependencies: [
+        nntrainer_dep,
+        nntrainer_ccapi_dep,
+        gtest_main_dep,
+        causallm_layer_dependencies,
+        causallm_dep
+      ],
+      include_directories: causallm_inc + [causallm_unittest_inc],
+      build_by_default: false,
+      install: false,
+    )
+  endif
 endif
