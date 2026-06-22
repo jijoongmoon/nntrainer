@@ -265,6 +265,128 @@ __device__ __forceinline__ float dp4a_h2f(unsigned short h) {
   return __int_as_float((int)out);
 }
 
+// float -> fp16 (IEEE half), round to nearest even.
+__device__ __forceinline__ unsigned short dp4a_f2h(float f) {
+  unsigned int x = (unsigned int)__float_as_int(f);
+  unsigned int sign = (x >> 16) & 0x8000u;
+  int e = (int)((x >> 23) & 0xFFu);
+  unsigned int mant = x & 0x7FFFFFu;
+  if (e == 0xFF)
+    return (unsigned short)(sign | 0x7C00u | (mant ? 0x200u : 0u)); // inf/nan
+  int exp = e - 127 + 15;
+  if (exp >= 0x1F)
+    return (unsigned short)(sign | 0x7C00u); // overflow -> inf
+  if (exp <= 0) {
+    if (exp < -10)
+      return (unsigned short)sign; // underflow -> 0
+    mant |= 0x800000u;
+    int shift = 14 - exp;
+    unsigned int h = mant >> shift;
+    unsigned int rem = mant & ((1u << shift) - 1u);
+    unsigned int half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (h & 1u)))
+      h++;
+    return (unsigned short)(sign | h);
+  }
+  unsigned int h = ((unsigned int)exp << 10) | (mant >> 13);
+  unsigned int rem = mant & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (h & 1u)))
+    h++;
+  return (unsigned short)(sign | h);
+}
+
+// asymmetric int8 quant params for a row's [min,max] (range forced to include
+// 0, nudged zero-point) -- mirrors the OpenCL v8c act-quant. Returns recip
+// (dequant scale) and zp; sets scale_q (quant multiplier) by reference.
+__device__ __forceinline__ void asym_qparams(float fmn, float fmx,
+                                             float &scale_q, float &recip,
+                                             int &zp) {
+  float rmin = fminf(0.f, fmn), rmax = fmaxf(0.f, fmx);
+  float range = rmax - rmin;
+  scale_q = range > 0.f ? 255.f / range : 1.f;
+  recip = range > 0.f ? range / 255.f : 1.f;
+  float dmin = rmin * scale_q, dmax = rmax * scale_q;
+  float zp_lo = -128.f - dmin, zp_hi = 127.f - dmax;
+  float zp_f = ((-128.f + dmin) + (127.f + dmax) > 0.f) ? zp_lo : zp_hi;
+  zp_f = fmaxf(-128.f, fminf(127.f, zp_f));
+  zp = (int)rintf(zp_f);
+}
+
+// per-row asymmetric int8 quant of an fp16 activation (one block per row).
+// stores recip in ascale[m], zero-point in azp[m].
+__global__ void act_quant_i8_h(const unsigned short *Xh, signed char *q8,
+                               float *ascale, int *azp, int M, int K) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+  __shared__ float smn[256];
+  __shared__ float smx[256];
+  const unsigned short *xr = Xh + (long)m * K;
+  float lmn = 0.f, lmx = 0.f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    float v = dp4a_h2f(xr[k]);
+    lmn = fminf(lmn, v);
+    lmx = fmaxf(lmx, v);
+  }
+  smn[threadIdx.x] = lmn;
+  smx[threadIdx.x] = lmx;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      smn[threadIdx.x] = fminf(smn[threadIdx.x], smn[threadIdx.x + s]);
+      smx[threadIdx.x] = fmaxf(smx[threadIdx.x], smx[threadIdx.x + s]);
+    }
+    __syncthreads();
+  }
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) {
+    ascale[m] = recip;
+    azp[m] = zp;
+  }
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    int q = (int)rintf(dp4a_h2f(xr[k]) * scale_q) + zp;
+    q = max(-128, min(127, q));
+    q8[(long)m * K + k] = (signed char)q;
+  }
+}
+
+// per-output-channel weight row-sum (sum of signed int4) for the activation
+// zero-point correction: Y -= recip[m]*scale_w[n]*zp[m]*rowsum_w[n].
+__global__ void weight_rowsum(const signed char *plain, int *rowsum, int N,
+                              int K) {
+  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= N)
+    return;
+  int Kh = (K + 1) >> 1;
+  const signed char *wrow = plain + (long)n * Kh;
+  int s = 0;
+  for (int kb = 0; kb < Kh; ++kb) {
+    int b = (unsigned char)wrow[kb];
+    int k0 = 2 * kb, k1 = 2 * kb + 1;
+    if (k0 < K)
+      s += ((int)(signed char)(b << 4)) >> 4;
+    if (k1 < K)
+      s += ((int)(signed char)b) >> 4;
+  }
+  rowsum[n] = s;
+}
+
+// float buffer -> fp16 buffer.
+__global__ void cvt_f2h(const float *src, unsigned short *dst, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+    dst[i] = dp4a_f2h(src[i]);
+}
+
+// fp16 buffer -> float buffer.
+__global__ void cvt_h2f(const unsigned short *src, float *dst, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+    dst[i] = dp4a_h2f(src[i]);
+}
+
 // signed int4 weight for (output n, input k) from the Section-A payload.
 __device__ __forceinline__ int seca_decode(const unsigned char *secA, int n,
                                             int k, int k_internal) {
@@ -280,31 +402,41 @@ __device__ __forceinline__ int seca_decode(const unsigned char *secA, int n,
   return (nib ^ 8) - 8;
 }
 
-// per-row symmetric int8 quant of the activation (one block per row).
+// per-row asymmetric int8 quant of the activation (one block per row).
 __global__ void act_quant_i8(const float *X, signed char *q8, float *ascale,
-                             int M, int K) {
+                             int *azp, int M, int K) {
   int m = blockIdx.x;
   if (m >= M)
     return;
-  __shared__ float sm[256];
+  __shared__ float smn[256];
+  __shared__ float smx[256];
   const float *xr = X + (long)m * K;
-  float local = 0.f;
-  for (int k = threadIdx.x; k < K; k += blockDim.x)
-    local = fmaxf(local, fabsf(xr[k]));
-  sm[threadIdx.x] = local;
+  float lmn = 0.f, lmx = 0.f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    float v = xr[k];
+    lmn = fminf(lmn, v);
+    lmx = fmaxf(lmx, v);
+  }
+  smn[threadIdx.x] = lmn;
+  smx[threadIdx.x] = lmx;
   __syncthreads();
   for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-    if (threadIdx.x < s)
-      sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x + s]);
+    if (threadIdx.x < s) {
+      smn[threadIdx.x] = fminf(smn[threadIdx.x], smn[threadIdx.x + s]);
+      smx[threadIdx.x] = fmaxf(smx[threadIdx.x], smx[threadIdx.x + s]);
+    }
     __syncthreads();
   }
-  float amax = sm[0];
-  float inv = amax > 0.f ? 127.0f / amax : 0.f;
-  if (threadIdx.x == 0)
-    ascale[m] = amax > 0.f ? amax / 127.0f : 1.0f;
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) {
+    ascale[m] = recip;
+    azp[m] = zp;
+  }
   for (int k = threadIdx.x; k < K; k += blockDim.x) {
-    int q = __float2int_rn(xr[k] * inv);
-    q = max(-127, min(127, q));
+    int q = (int)rintf(xr[k] * scale_q) + zp;
+    q = max(-128, min(127, q));
     q8[(long)m * K + k] = (signed char)q;
   }
 }
@@ -324,9 +456,12 @@ __global__ void repack_seca_i4(const unsigned char *secA, signed char *plain,
   plain[(long)n * Kh + kb] = (signed char)((v0 & 0xF) | ((v1 & 0xF) << 4));
 }
 
-// Y[m,n] = ascale[m] * w_scale[n] * sum_k q8[m,k] * int4(n,k), via __dp4a.
+// Y[m,n] = recip[m]*w_scale[n]*(sum_k q8[m,k]*int4(n,k) - zp[m]*rowsum_w[n]),
+// the asymmetric-activation dequant (zp from act_quant, rowsum_w from the
+// weight). via __dp4a.
 __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
-                          const float *ascale, const unsigned short *wscale,
+                          const float *ascale, const int *azp,
+                          const int *wrowsum, const unsigned short *wscale,
                           float *Y, int M, int N, int K) {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   int m = blockIdx.y * blockDim.y + threadIdx.y;
@@ -356,7 +491,8 @@ __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
                      : (((int)(signed char)(b << 4)) >> 4);
     acc += (int)qrow[k] * wv;
   }
-  Y[(long)m * N + n] = (float)acc * ascale[m] * dp4a_h2f(wscale[n]);
+  Y[(long)m * N + n] =
+    (float)(acc - azp[m] * wrowsum[n]) * ascale[m] * dp4a_h2f(wscale[n]);
 }
 
 // Register-blocked dp4a GEMM: a 64x64 output tile per block; each of the 256
@@ -369,7 +505,8 @@ __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
 #define RB_TM 4
 #define RB_TN 4
 __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
-                              const float *ascale, const unsigned short *wscale,
+                              const float *ascale, const int *azp,
+                              const int *wrowsum, const unsigned short *wscale,
                               float *Y, int M, int N, int K) {
   __shared__ signed char As[RB_BM][RB_BK];
   __shared__ signed char Ws[RB_BN][RB_BK];
@@ -424,11 +561,13 @@ __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
     if (row >= M)
       continue;
     float as = ascale[row];
+    int zp = azp[row];
 #pragma unroll
     for (int j = 0; j < RB_TN; j++) {
       int col = blockN + tx * RB_TN + j;
       if (col < N)
-        Y[(long)row * N + col] = (float)acc[i][j] * as * dp4a_h2f(wscale[col]);
+        Y[(long)row * N + col] = (float)(acc[i][j] - zp * wrowsum[col]) * as *
+                                 dp4a_h2f(wscale[col]);
     }
   }
 }
@@ -438,13 +577,119 @@ __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
 
 namespace {
 // cached plain-int4 repack of each Section-A weight (keyed by host/UVM pointer).
-std::unordered_map<const void *, signed char *> g_dp4a_plain_cache;
+struct DevWeightQ {
+  signed char *plain = nullptr; // plain row-major int4 [N, ceil(K/2)]
+  int *rowsum = nullptr;        // per-channel sum of signed int4 [N]
+};
+std::unordered_map<const void *, DevWeightQ> g_dp4a_plain_cache;
 signed char *g_dp4a_q8 = nullptr;
 size_t g_dp4a_q8_cap = 0;
-float *g_dp4a_ascale = nullptr;
+float *g_dp4a_ascale = nullptr; // per-row recip (dequant scale)
 size_t g_dp4a_ascale_cap = 0;
+int *g_dp4a_azp = nullptr; // per-row activation zero-point
+size_t g_dp4a_azp_cap = 0;
+float *g_dp4a_yf = nullptr; // float Y staging for the fp16-output path
+size_t g_dp4a_yf_cap = 0;
+float *g_dp4a_xf = nullptr; // float X staging for the naive fp16 path
+size_t g_dp4a_xf_cap = 0;
 std::mutex g_dp4a_mtx;
+
+// repack (cached) + GEMM into a device float Y, using the already-staged
+// q8/ascale scratch. Caller holds g_dp4a_mtx and has run act-quant.
+bool dp4a_repack_and_gemm(const unsigned char *section_a,
+                          const unsigned short *scales_fp16, float *Yf,
+                          unsigned int M, unsigned int N, unsigned int K) {
+  const int n = (int)N, k = (int)K;
+  const int k_internal = (int)(((K + 31u) / 32u) * 32u);
+  const size_t Kh = (K + 1u) / 2u;
+  auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "repack_seca_i4");
+  auto krs = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                      "weight_rowsum");
+  const bool tiled = (M >= 8);
+  auto kg = CudaContext::Global().registerCudaKernel(
+    FC_QINT4_DP4A_SRC, tiled ? "dp4a_gemm_reg" : "dp4a_gemm");
+  if (!kr || !krs || !kg)
+    return false;
+
+  auto it = g_dp4a_plain_cache.find(section_a);
+  if (it == g_dp4a_plain_cache.end()) {
+    DevWeightQ dw;
+    if (cudaMalloc(&dw.plain, (size_t)N * Kh) != cudaSuccess)
+      return false;
+    if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
+      cudaFree(dw.plain);
+      return false;
+    }
+    kr->SetKernelArguments(0, &section_a, sizeof(section_a));
+    kr->SetKernelArguments(1, &dw.plain, sizeof(dw.plain));
+    kr->SetKernelArguments(2, &n, sizeof(n));
+    kr->SetKernelArguments(3, &k, sizeof(k));
+    kr->SetKernelArguments(4, &k_internal, sizeof(k_internal));
+    const int rb[3] = {16, 16, 1};
+    const int rg[3] = {((int)Kh + 15) / 16, ((int)N + 15) / 16, 1};
+    if (!StreamManager::Global().DispatchCommand(*kr, rg, rb)) {
+      cudaFree(dw.plain);
+      cudaFree(dw.rowsum);
+      return false;
+    }
+    // per-channel weight row-sum (for the activation zero-point correction).
+    krs->SetKernelArguments(0, &dw.plain, sizeof(dw.plain));
+    krs->SetKernelArguments(1, &dw.rowsum, sizeof(dw.rowsum));
+    krs->SetKernelArguments(2, &n, sizeof(n));
+    krs->SetKernelArguments(3, &k, sizeof(k));
+    const int sb[3] = {128, 1, 1};
+    const int sg[3] = {((int)N + 127) / 128, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*krs, sg, sb)) {
+      cudaFree(dw.plain);
+      cudaFree(dw.rowsum);
+      return false;
+    }
+    it = g_dp4a_plain_cache.emplace(section_a, dw).first;
+  }
+  signed char *plain = it->second.plain;
+  int *wrowsum = it->second.rowsum;
+
+  const int mm = (int)M;
+  kg->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
+  kg->SetKernelArguments(1, &plain, sizeof(plain));
+  kg->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+  kg->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+  kg->SetKernelArguments(4, &wrowsum, sizeof(wrowsum));
+  kg->SetKernelArguments(5, &scales_fp16, sizeof(scales_fp16));
+  kg->SetKernelArguments(6, &Yf, sizeof(Yf));
+  kg->SetKernelArguments(7, &mm, sizeof(mm));
+  kg->SetKernelArguments(8, &n, sizeof(n));
+  kg->SetKernelArguments(9, &k, sizeof(k));
+  const int gb[3] = {16, 16, 1};
+  const int tile = tiled ? 64 : 16;
+  const int gg[3] = {((int)N + tile - 1) / tile, ((int)M + tile - 1) / tile, 1};
+  return StreamManager::Global().DispatchCommand(*kg, gg, gb);
+}
+
+bool ensure_buf(void **buf, size_t *cap, size_t bytes) {
+  if (bytes <= *cap)
+    return true;
+  if (*buf)
+    cudaFree(*buf);
+  if (cudaMalloc(buf, bytes) != cudaSuccess) {
+    *buf = nullptr;
+    *cap = 0;
+    return false;
+  }
+  *cap = bytes;
+  return true;
+}
 } // namespace
+
+// stage q8 + ascale + azp scratch (caller holds the mutex). False on OOM.
+static bool dp4a_stage_scratch(unsigned int M, unsigned int K) {
+  return ensure_buf((void **)&g_dp4a_q8, &g_dp4a_q8_cap, (size_t)M * K) &&
+         ensure_buf((void **)&g_dp4a_ascale, &g_dp4a_ascale_cap,
+                    sizeof(float) * (size_t)M) &&
+         ensure_buf((void **)&g_dp4a_azp, &g_dp4a_azp_cap,
+                    sizeof(int) * (size_t)M);
+}
 
 bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
                                            const unsigned char *section_a,
@@ -453,96 +698,118 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
                                            unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
-
   auto kq = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                      "act_quant_i8");
-  auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
-                                                     "repack_seca_i4");
-  // register-blocked 64x64-tile GEMM for batched M (prefill); the per-output
-  // kernel for tiny M (decode), where a big tile would mostly idle.
-  const bool tiled = (M >= 8);
-  auto kg = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC, tiled ? "dp4a_gemm_reg" : "dp4a_gemm");
-  if (!kq || !kr || !kg) {
+  if (!kq) {
     ml_loge("[CUDA] fc_qint4 dp4a: kernel registration failed");
     return false;
   }
-
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
-
-  const int m = (int)M, n = (int)N, k = (int)K;
-  const int k_internal = (int)(((K + 31u) / 32u) * 32u);
-  const size_t Kh = (K + 1u) / 2u;
-
-  // 1) one-time Section-A -> plain int4 repack (cached on device).
-  auto it = g_dp4a_plain_cache.find(section_a);
-  if (it == g_dp4a_plain_cache.end()) {
-    signed char *plain = nullptr;
-    if (cudaMalloc(&plain, (size_t)N * Kh) != cudaSuccess)
-      return false;
-    kr->SetKernelArguments(0, &section_a, sizeof(section_a));
-    kr->SetKernelArguments(1, &plain, sizeof(plain));
-    kr->SetKernelArguments(2, &n, sizeof(n));
-    kr->SetKernelArguments(3, &k, sizeof(k));
-    kr->SetKernelArguments(4, &k_internal, sizeof(k_internal));
-    const int rb[3] = {16, 16, 1};
-    const int rg[3] = {((int)Kh + 15) / 16, ((int)N + 15) / 16, 1};
-    if (!StreamManager::Global().DispatchCommand(*kr, rg, rb)) {
-      cudaFree(plain);
-      return false;
-    }
-    it = g_dp4a_plain_cache.emplace(section_a, plain).first;
-  }
-  signed char *plain = it->second;
-
-  // 2) int8 activation quant (per-row), into grown device scratch.
-  const size_t q8b = (size_t)M * K;
-  const size_t asb = sizeof(float) * (size_t)M;
-  if (q8b > g_dp4a_q8_cap) {
-    if (g_dp4a_q8)
-      cudaFree(g_dp4a_q8);
-    if (cudaMalloc(&g_dp4a_q8, q8b) != cudaSuccess) {
-      g_dp4a_q8 = nullptr;
-      g_dp4a_q8_cap = 0;
-      return false;
-    }
-    g_dp4a_q8_cap = q8b;
-  }
-  if (asb > g_dp4a_ascale_cap) {
-    if (g_dp4a_ascale)
-      cudaFree(g_dp4a_ascale);
-    if (cudaMalloc(&g_dp4a_ascale, asb) != cudaSuccess) {
-      g_dp4a_ascale = nullptr;
-      g_dp4a_ascale_cap = 0;
-      return false;
-    }
-    g_dp4a_ascale_cap = asb;
-  }
+  if (!dp4a_stage_scratch(M, K))
+    return false;
+  int m = (int)M, k = (int)K;
   kq->SetKernelArguments(0, &X, sizeof(X));
   kq->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
   kq->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
-  kq->SetKernelArguments(3, &m, sizeof(m));
-  kq->SetKernelArguments(4, &k, sizeof(k));
+  kq->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+  kq->SetKernelArguments(4, &m, sizeof(m));
+  kq->SetKernelArguments(5, &k, sizeof(k));
   const int qb[3] = {256, 1, 1};
   const int qg[3] = {(int)M, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kq, qg, qb))
     return false;
+  if (!dp4a_repack_and_gemm(section_a, scales_fp16, Y, M, N, K))
+    return false;
+  StreamManager::Global().finish();
+  return true;
+}
 
-  // 3) dp4a GEMM.
-  kg->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
-  kg->SetKernelArguments(1, &plain, sizeof(plain));
-  kg->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
-  kg->SetKernelArguments(3, &scales_fp16, sizeof(scales_fp16));
-  kg->SetKernelArguments(4, &Y, sizeof(Y));
-  kg->SetKernelArguments(5, &m, sizeof(m));
-  kg->SetKernelArguments(6, &n, sizeof(n));
-  kg->SetKernelArguments(7, &k, sizeof(k));
-  const int gb[3] = {16, 16, 1};
-  // reg-blocked kernel: 64x64 output tile/block; per-output kernel: 16x16.
-  const int tile = tiled ? 64 : 16;
-  const int grid[3] = {((int)N + tile - 1) / tile, ((int)M + tile - 1) / tile,
-                       1};
-  if (!StreamManager::Global().DispatchCommand(*kg, grid, gb))
+bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
+                                           const unsigned char *section_a,
+                                           const unsigned short *scales_fp16,
+                                           unsigned short *Yh, unsigned int M,
+                                           unsigned int N, unsigned int K) {
+  if (M == 0 || N == 0 || K == 0)
+    return true;
+  auto kqh = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                      "act_quant_i8_h");
+  auto kc =
+    CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC, "cvt_f2h");
+  if (!kqh || !kc) {
+    ml_loge("[CUDA] fc_qint4 dp4a fp16: kernel registration failed");
+    return false;
+  }
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  const size_t yn = (size_t)M * N;
+  if (!dp4a_stage_scratch(M, K) ||
+      !ensure_buf((void **)&g_dp4a_yf, &g_dp4a_yf_cap, sizeof(float) * yn))
+    return false;
+  int m = (int)M, k = (int)K;
+  // 1) int8 activation quant from the fp16 input.
+  kqh->SetKernelArguments(0, &Xh, sizeof(Xh));
+  kqh->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
+  kqh->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+  kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+  kqh->SetKernelArguments(4, &m, sizeof(m));
+  kqh->SetKernelArguments(5, &k, sizeof(k));
+  const int qb[3] = {256, 1, 1};
+  const int qg[3] = {(int)M, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
+    return false;
+  // 2) repack + GEMM into the float staging buffer.
+  if (!dp4a_repack_and_gemm(section_a, scales_fp16, g_dp4a_yf, M, N, K))
+    return false;
+  // 3) float -> fp16 output.
+  int yni = (int)yn;
+  kc->SetKernelArguments(0, &g_dp4a_yf, sizeof(g_dp4a_yf));
+  kc->SetKernelArguments(1, &Yh, sizeof(Yh));
+  kc->SetKernelArguments(2, &yni, sizeof(yni));
+  const int cb[3] = {256, 1, 1};
+  const int cg[3] = {((int)yn + 255) / 256, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kc, cg, cb))
+    return false;
+  StreamManager::Global().finish();
+  return true;
+}
+
+// Diagnostic / high-accuracy fp16 path: FP32-precision activation (no int8
+// quant). fp16 -> fp32, naive Section-A FP32-act GEMM, fp32 -> fp16. Used when
+// NNTR_FC_CUDA_DP4A=0 with an fp16 activation.
+bool cuda_fc_qint4_sectionA_gemm_fp16_naive(const unsigned short *Xh,
+                                            const unsigned char *section_a,
+                                            const unsigned short *scales_fp16,
+                                            unsigned short *Yh, unsigned int M,
+                                            unsigned int N, unsigned int K) {
+  if (M == 0 || N == 0 || K == 0)
+    return true;
+  auto kh2f = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                       "cvt_h2f");
+  auto kf2h =
+    CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC, "cvt_f2h");
+  if (!kh2f || !kf2h)
+    return false;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  const size_t xn = (size_t)M * K, yn = (size_t)M * N;
+  if (!ensure_buf((void **)&g_dp4a_xf, &g_dp4a_xf_cap, sizeof(float) * xn) ||
+      !ensure_buf((void **)&g_dp4a_yf, &g_dp4a_yf_cap, sizeof(float) * yn))
+    return false;
+  int xni = (int)xn, yni = (int)yn;
+  const int cb[3] = {256, 1, 1};
+  kh2f->SetKernelArguments(0, &Xh, sizeof(Xh));
+  kh2f->SetKernelArguments(1, &g_dp4a_xf, sizeof(g_dp4a_xf));
+  kh2f->SetKernelArguments(2, &xni, sizeof(xni));
+  const int xg[3] = {((int)xn + 255) / 256, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kh2f, xg, cb))
+    return false;
+  // naive Section-A FP32-act GEMM (mutex-free; its own dispatch + finish).
+  if (!cuda_fc_qint4_sectionA_gemm_fp32(g_dp4a_xf, section_a, scales_fp16,
+                                        g_dp4a_yf, M, N, K))
+    return false;
+  kf2h->SetKernelArguments(0, &g_dp4a_yf, sizeof(g_dp4a_yf));
+  kf2h->SetKernelArguments(1, &Yh, sizeof(Yh));
+  kf2h->SetKernelArguments(2, &yni, sizeof(yni));
+  const int yg[3] = {((int)yn + 255) / 256, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kf2h, yg, cb))
     return false;
   StreamManager::Global().finish();
   return true;

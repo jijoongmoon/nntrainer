@@ -80,9 +80,10 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
       }
     };
     fprintf(stderr,
-            "[FCDBG] wt=%d at=%d M=%d N=%d K=%d in=%c w=%c out=%c\n", (int)wt,
-            (int)at, M, N, K, ptype(input_.getData<float>()),
-            ptype(weight.getData<uint8_t>()), ptype(hidden_.getData<float>()));
+            "[FCDBG] wt=%d at=%d ot=%d M=%d N=%d K=%d in=%c w=%c out=%c\n",
+            (int)wt, (int)at, (int)hidden_.getDataType(), M, N, K,
+            ptype(input_.getData<float>()), ptype(weight.getData<uint8_t>()),
+            ptype(hidden_.getData<float>()));
   }
 
   // QINT4 weight: fused dequant-GEMM on device. Decodes the int4 weight inline
@@ -97,38 +98,52 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
   // NNTR_FC_CUDA_QINT4=0 to force the host fallback (correct only on ARM).
   // The older plain-layout kernel (cuda_fc_qint4_gemm_fp32) is kept as a
   // foundation for genuinely plain weights but is not on this path.
-  if (wt == DT::QINT4 && at == DT::FP32 && M > 0 && N > 0 && K > 0) {
+  if (wt == DT::QINT4 && (at == DT::FP32 || at == DT::FP16) && M > 0 && N > 0 &&
+      K > 0) {
     static const bool seca_enabled = []() {
       const char *e = std::getenv("NNTR_FC_CUDA_QINT4");
       return !(e != nullptr && e[0] == '0'); // default ON
     }();
     if (seca_enabled && (int)weight.getDim().height() == K) {
-      const float *X = input_.getData<float>();
       const uint8_t *W = weight.getData<uint8_t>();
       const uint16_t *S = weight.getScale<uint16_t>();
-      float *Y = hidden_.getData<float>();
-      // Zero-copy when the tensors are device-accessible (UVM); otherwise mirror
-      // the host-heap tensors into device memory (the QINT4 host GEMM is NYI on
-      // x86, so this device path is the only correct one there). On the
-      // device-resident path, default to the w4a8 __dp4a kernel (int8 act x int4
-      // weight, repacked plain int4) -- much higher throughput than the naive
-      // FP32-act decode-GEMM. NNTR_FC_CUDA_DP4A=0 selects the naive kernel
-      // (FP32 act, highest accuracy).
+      // Real CausalLM models are QINT4-FP16 (fp16 activations); the reference
+      // test is FP32. Pick the pointer/launcher by the activation dtype. The
+      // device path defaults to the w4a8 __dp4a kernel (int8 act x int4 weight,
+      // repacked plain int4) -- much higher throughput than the naive FP32-act
+      // decode-GEMM. NNTR_FC_CUDA_DP4A=0 selects the naive FP32 kernel.
+      const bool fp16 = (at == DT::FP16);
+      const void *Xp = fp16 ? (const void *)input_.getData<uint16_t>()
+                            : (const void *)input_.getData<float>();
+      void *Yp = fp16 ? (void *)hidden_.getData<uint16_t>()
+                      : (void *)hidden_.getData<float>();
+      static const bool use_dp4a = []() {
+        const char *e = std::getenv("NNTR_FC_CUDA_DP4A");
+        return !(e != nullptr && e[0] == '0'); // default ON
+      }();
       const bool all_dev =
-        deviceAccessible(X) && deviceAccessible(W) && deviceAccessible(Y);
-      bool ok;
-      if (all_dev) {
-        static const bool use_dp4a = []() {
-          const char *e = std::getenv("NNTR_FC_CUDA_DP4A");
-          return !(e != nullptr && e[0] == '0'); // default ON
-        }();
-        ok = use_dp4a ? cuda::cuda_fc_qint4_sectionA_dp4a_gemm_fp32(
-                          X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K)
-                      : cuda::cuda_fc_qint4_sectionA_gemm_fp32(
-                          X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K);
-      } else {
+        deviceAccessible(Xp) && deviceAccessible(W) && deviceAccessible(Yp);
+      bool ok = false;
+      if (all_dev && fp16) {
+        ok = use_dp4a ? cuda::cuda_fc_qint4_sectionA_dp4a_gemm_fp16(
+                          (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
+                          (unsigned)M, (unsigned)N, (unsigned)K)
+                      : cuda::cuda_fc_qint4_sectionA_gemm_fp16_naive(
+                          (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
+                          (unsigned)M, (unsigned)N, (unsigned)K);
+      } else if (all_dev) {
+        ok = use_dp4a
+               ? cuda::cuda_fc_qint4_sectionA_dp4a_gemm_fp32(
+                   (const float *)Xp, W, S, (float *)Yp, (unsigned)M,
+                   (unsigned)N, (unsigned)K)
+               : cuda::cuda_fc_qint4_sectionA_gemm_fp32(
+                   (const float *)Xp, W, S, (float *)Yp, (unsigned)M,
+                   (unsigned)N, (unsigned)K);
+      } else if (!fp16) {
+        // host-resident (UVM disabled) FP32 path; the FP16 host fallback is NYI.
         ok = cuda::cuda_fc_qint4_sectionA_gemm_fp32_resident(
-          X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K);
+          (const float *)Xp, W, S, (float *)Yp, (unsigned)M, (unsigned)N,
+          (unsigned)K);
       }
       if (ok)
         return;

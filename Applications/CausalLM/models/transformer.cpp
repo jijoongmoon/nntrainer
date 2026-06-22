@@ -19,6 +19,9 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context.h>
+#include <cuda_rmsnorm_layer.h>
+#include <per_layer_slice.h>
+#include <scalar_multiply.h>
 #endif
 
 #include <llm_util.hpp>
@@ -603,14 +606,25 @@ void Transformer::registerCustomLayers() {
     try {
       cuda_context->registerFactory(
         nntrainer::createLayer<causallm::SwiGLULayer>);
+      // CUDA RMSNorm (FP32-safe sum-of-squares) instead of the host
+      // causallm::RMSNormLayer, whose FP16 path squares in FP16 and overflows
+      // on gemma4's large residual (pre_ffn_norm |x|~1688 -> +Inf -> row
+      // zeroed -> garbage). Same "rms_norm" type, so it takes this slot.
       cuda_context->registerFactory(
-        nntrainer::createLayer<causallm::RMSNormLayer>);
+        nntrainer::createLayer<nntrainer::CudaRMSNormLayer>);
       cuda_context->registerFactory(
         nntrainer::createLayer<causallm::MHACoreLayer>);
       cuda_context->registerFactory(
         nntrainer::createLayer<causallm::TieWordEmbedding>);
       cuda_context->registerFactory(
         nntrainer::createLayer<causallm::EmbeddingLayer>);
+      // gemma4 PLE + q-scale: host impls (the GPU variants are OpenCL-only and
+      // would mis-run on UVM). Without these on the cuda context the types fall
+      // back to the wrong factory.
+      cuda_context->registerFactory(
+        nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
+      cuda_context->registerFactory(
+        nntrainer::createLayer<causallm::PerLayerSliceLayer>);
     } catch (std::invalid_argument &e) {
       std::cerr << "failed to register layer on cuda_context: " << e.what()
                 << std::endl;

@@ -105,6 +105,34 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
                                            float *Y, unsigned int M,
                                            unsigned int N, unsigned int K);
 
+/**
+ * @brief FP16-activation variant of the dp4a fast path (the real CausalLM
+ *        models use QINT4-FP16: int4 weight + fp16 activations). The fp16
+ *        activation is read directly into the int8 quantizer and the fp16
+ *        output is produced by a final float->half conversion.
+ *
+ * @param Xh           [M,K] row-major fp16 activation (device-accessible)
+ * @param section_a    Section-A nibble payload (device-accessible)
+ * @param scales_fp16  N fp16 per-channel scales (device-accessible)
+ * @param Yh           [M,N] row-major fp16 output (device-accessible)
+ */
+bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
+                                           const unsigned char *section_a,
+                                           const unsigned short *scales_fp16,
+                                           unsigned short *Yh, unsigned int M,
+                                           unsigned int N, unsigned int K);
+
+/**
+ * @brief High-accuracy fp16 path: FP32-precision activation (no int8 quant),
+ *        naive Section-A decode-GEMM. Selected by NNTR_FC_CUDA_DP4A=0 for an
+ *        fp16 activation (and as an accuracy reference vs the dp4a w4a8 path).
+ */
+bool cuda_fc_qint4_sectionA_gemm_fp16_naive(const unsigned short *Xh,
+                                            const unsigned char *section_a,
+                                            const unsigned short *scales_fp16,
+                                            unsigned short *Yh, unsigned int M,
+                                            unsigned int N, unsigned int K);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_FC_QINT4_H__
