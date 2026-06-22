@@ -22,6 +22,7 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_attention.h>
+#include <cuda_elementwise.h>
 #include <cuda_rope.h>
 #include <cuda_runtime.h>
 #endif
@@ -2179,8 +2180,44 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           << "NNTR_KV_OHWI requires ENABLE_FP16";
 #endif
       } else {
-        apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
-                                   cache_index, true);
+        // GPU RoPE for K straight into the (UVM) cache slice + GPU V copy:
+        // keeps the whole KV-cache write off the host. Requires NNTR_CUDA_ROPE
+        // and a device-resident cache (NNTR_CUDA_KV_UVM); the dev checks gate it.
+        bool k_rope_gpu = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+        {
+          static const bool cuda_rope = std::getenv("NNTR_CUDA_ROPE") != nullptr;
+          auto dev = [](const void *p) {
+            cudaPointerAttributes a{};
+            bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess &&
+                      (a.type == cudaMemoryTypeManaged ||
+                       a.type == cudaMemoryTypeDevice);
+            cudaGetLastError();
+            return ok;
+          };
+          if (cuda_rope &&
+              key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+              key_step.height() == 1 && cached_freqs_cos_fp16 != nullptr &&
+              cache_index < (*cached_freqs_cos_fp16).size()) {
+            auto *kin =
+              reinterpret_cast<unsigned short *>(key_step.getData<_FP16>());
+            auto *kout = reinterpret_cast<unsigned short *>(
+              b_cache_key_step.getData<_FP16>());
+            if (dev(kin) && dev(kout)) {
+              auto &cosv = (*cached_freqs_cos_fp16)[cache_index];
+              auto &sinv = (*cached_freqs_sin_fp16)[cache_index];
+              k_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
+                kin, kout,
+                reinterpret_cast<const unsigned short *>(cosv.data()),
+                reinterpret_cast<const unsigned short *>(sinv.data()),
+                key_step.width() / head_dim, head_dim);
+            }
+          }
+        }
+#endif
+        if (!k_rope_gpu)
+          apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
+                                     cache_index, true);
       }
 
       // append vcache without rotary embedding
@@ -2190,7 +2227,28 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       } else if (query_step.getDataType() ==
                  ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-        b_cache_value_step.copyData(value_step);
+        bool v_copy_gpu = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+        {
+          static const bool cuda_elt =
+            std::getenv("NNTR_CUDA_ROPE") != nullptr;
+          auto *vin =
+            reinterpret_cast<unsigned short *>(value_step.getData<_FP16>());
+          auto *vout = reinterpret_cast<unsigned short *>(
+            b_cache_value_step.getData<_FP16>());
+          cudaPointerAttributes pa{};
+          bool dev = cudaPointerGetAttributes(&pa, vout) == cudaSuccess &&
+                     (pa.type == cudaMemoryTypeManaged ||
+                      pa.type == cudaMemoryTypeDevice);
+          cudaGetLastError();
+          if (cuda_elt && dev &&
+              nntrainer::cuda::cuda_scalar_mul_fp16(
+                vin, vout, (unsigned int)value_step.size(), 1.0f))
+            v_copy_gpu = true;
+        }
+#endif
+        if (!v_copy_gpu)
+          b_cache_value_step.copyData(value_step);
 #else
         NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
