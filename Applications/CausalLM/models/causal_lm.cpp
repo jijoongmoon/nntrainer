@@ -59,6 +59,9 @@ bool consume_gpu_argmax(unsigned int *tok);
 // recq (R4): read the 4-byte on-GPU argmax token on the host-I/O queue after a
 // recorded-chain replay (waiting on the replay event).
 bool recq_read_argmax_io(unsigned int *tok, cl_event wait_evt);
+// recq debug: checksum the lm_head input (final hidden) + logits for
+// first-divergence localization (NNTR_RECQ_DUMP).
+void recq_dump_lmhead(const char *tag);
 } // namespace nntrainer
 
 namespace causallm {
@@ -810,6 +813,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (!_did_replay)
       output_interval = incrementalInference(BATCH_SIZE, input, input_len,
                                              _recq_ci, _recq_ci + 1);
+    // recq first-divergence dump (NNTR_RECQ_DUMP): one line for the FIRST decode
+    // token. Compare a NORMAL-forward run ("normal") to a zero-override REPLAY
+    // run ("replay"): act_sum differs => layers diverged; act_sum same but
+    // gpu_tok differs => lm_head/argmax replays wrong.
+    static const bool _recq_dump = std::getenv("NNTR_RECQ_DUMP") != nullptr;
+    if (_recq_dump && token_generation_idx == input_len + 1)
+      nntrainer::recq_dump_lmhead(_did_replay ? "replay" : "normal");
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
 
     // Feed the newly generated token back as the next input token.
