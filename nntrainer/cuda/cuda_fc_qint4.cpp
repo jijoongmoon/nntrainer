@@ -485,7 +485,7 @@ __global__ void repack_seca_i4(const unsigned char *secA, signed char *plain,
 __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
                           const float *ascale, const int *azp,
                           const int *wrowsum, const unsigned short *wscale,
-                          float *Y, int M, int N, int K) {
+                          float *Y, int M, int N, int K, int out_fp16) {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   int m = blockIdx.y * blockDim.y + threadIdx.y;
   if (m >= M || n >= N)
@@ -514,8 +514,11 @@ __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
                      : (((int)(signed char)(b << 4)) >> 4);
     acc += (int)qrow[k] * wv;
   }
-  Y[(long)m * N + n] =
-    (float)(acc - azp[m] * wrowsum[n]) * ascale[m] * dp4a_h2f(wscale[n]);
+  float r = (float)(acc - azp[m] * wrowsum[n]) * ascale[m] * dp4a_h2f(wscale[n]);
+  if (out_fp16)
+    ((unsigned short *)Y)[(long)m * N + n] = dp4a_f2h(r);
+  else
+    Y[(long)m * N + n] = r;
 }
 
 // Register-blocked dp4a GEMM: a 64x64 output tile per block; each of the 256
@@ -530,7 +533,7 @@ __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
 __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
                               const float *ascale, const int *azp,
                               const int *wrowsum, const unsigned short *wscale,
-                              float *Y, int M, int N, int K) {
+                              float *Y, int M, int N, int K, int out_fp16) {
   __shared__ signed char As[RB_BM][RB_BK];
   __shared__ signed char Ws[RB_BN][RB_BK];
   int tx = threadIdx.x, ty = threadIdx.y; // 0..15 each
@@ -588,9 +591,14 @@ __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
 #pragma unroll
     for (int j = 0; j < RB_TN; j++) {
       int col = blockN + tx * RB_TN + j;
-      if (col < N)
-        Y[(long)row * N + col] = (float)(acc[i][j] - zp * wrowsum[col]) * as *
-                                 dp4a_h2f(wscale[col]);
+      if (col < N) {
+        float r =
+          (float)(acc[i][j] - zp * wrowsum[col]) * as * dp4a_h2f(wscale[col]);
+        if (out_fp16)
+          ((unsigned short *)Y)[(long)row * N + col] = dp4a_f2h(r);
+        else
+          Y[(long)row * N + col] = r;
+      }
     }
   }
 }
@@ -621,7 +629,8 @@ std::mutex g_dp4a_mtx;
 // q8/ascale scratch. Caller holds g_dp4a_mtx and has run act-quant.
 bool dp4a_repack_and_gemm(const unsigned char *section_a,
                           const unsigned short *scales_fp16, float *Yf,
-                          unsigned int M, unsigned int N, unsigned int K) {
+                          unsigned int M, unsigned int N, unsigned int K,
+                          int out_fp16 = 0) {
   const int n = (int)N, k = (int)K;
   const int k_internal = (int)(((K + 31u) / 32u) * 32u);
   const size_t Kh = (K + 1u) / 2u;
@@ -684,6 +693,7 @@ bool dp4a_repack_and_gemm(const unsigned char *section_a,
   kg->SetKernelArguments(7, &mm, sizeof(mm));
   kg->SetKernelArguments(8, &n, sizeof(n));
   kg->SetKernelArguments(9, &k, sizeof(k));
+  kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
   const int gb[3] = {16, 16, 1};
   const int tile = tiled ? 64 : 16;
   const int gg[3] = {((int)N + tile - 1) / tile, ((int)M + tile - 1) / tile, 1};
@@ -779,17 +789,15 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
   const int qg[3] = {(int)M, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
     return false;
-  // 2) repack + GEMM into the float staging buffer.
-  if (!dp4a_repack_and_gemm(section_a, scales_fp16, g_dp4a_yf, M, N, K))
-    return false;
-  // 3) float -> fp16 output.
-  int yni = (int)yn;
-  kc->SetKernelArguments(0, &g_dp4a_yf, sizeof(g_dp4a_yf));
-  kc->SetKernelArguments(1, &Yh, sizeof(Yh));
-  kc->SetKernelArguments(2, &yni, sizeof(yni));
-  const int cb[3] = {256, 1, 1};
-  const int cg[3] = {((int)yn + 255) / 256, 1, 1};
-  if (!StreamManager::Global().DispatchCommand(*kc, cg, cb))
+  // 2) repack + GEMM writing fp16 directly: the float->fp16 conversion is folded
+  // into the GEMM epilogue (out_fp16=1), removing the separate cvt_f2h kernel +
+  // the FP32 staging buffer (one fewer kernel per FC -- a decode launch-overhead
+  // win). (void)kc keeps the registration check above harmless.
+  (void)kc;
+  (void)g_dp4a_yf;
+  if (!dp4a_repack_and_gemm(section_a, scales_fp16,
+                            reinterpret_cast<float *>(Yh), M, N, K,
+                            /*out_fp16=*/1))
     return false;
   maybe_finish();
   return true;
