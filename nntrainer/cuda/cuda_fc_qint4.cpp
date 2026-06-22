@@ -521,6 +521,53 @@ __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
     Y[(long)m * N + n] = r;
 }
 
+// Dedicated M=1 decode GEMV: one block per output n, threads split K and
+// block-reduce. The tiled dp4a_gemm wastes 15/16 rows of its 16x16 block at M=1
+// (94% idle) and reads weight rows with a stride; here every thread is active
+// and reads a contiguous K-slice of one weight row (coalesced). Activation row
+// is row 0 (q8). out_fp16 folds the fp16 conversion in.
+__global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
+                          const float *ascale, const int *azp,
+                          const int *wrowsum, const unsigned short *wscale,
+                          float *Y, int N, int K, int out_fp16) {
+  int n = blockIdx.x;
+  if (n >= N)
+    return;
+  int Kh = (K + 1) >> 1;
+  const signed char *wrow = plain + (long)n * Kh;
+  int tid = threadIdx.x, B = blockDim.x;
+  int acc = 0;
+  for (int k = tid * 4; k + 4 <= K; k += B * 4) {
+    int a = *(const int *)(q8 + k);
+    int kb = k >> 1;
+    int b0 = (unsigned char)wrow[kb];
+    int b1 = (unsigned char)wrow[kb + 1];
+    int w0 = ((int)(signed char)(b0 << 4)) >> 4;
+    int w1 = ((int)(signed char)b0) >> 4;
+    int w2 = ((int)(signed char)(b1 << 4)) >> 4;
+    int w3 = ((int)(signed char)b1) >> 4;
+    int w = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |
+            ((w3 & 0xFF) << 24);
+    acc = __dp4a(a, w, acc);
+  }
+  __shared__ int red[256];
+  red[tid] = acc;
+  __syncthreads();
+  for (int s = B >> 1; s > 0; s >>= 1) {
+    if (tid < s)
+      red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float r = (float)(red[0] - azp[0] * wrowsum[n]) * ascale[0] *
+              dp4a_h2f(wscale[n]);
+    if (out_fp16)
+      ((unsigned short *)Y)[n] = dp4a_f2h(r);
+    else
+      Y[n] = r;
+  }
+}
+
 // Register-blocked dp4a GEMM: a 64x64 output tile per block; each of the 256
 // threads accumulates a 4x4 micro-tile in registers, so a K-chunk of 32 staged
 // once into shared memory feeds 16 dp4a per thread before the next load -- much
@@ -638,9 +685,11 @@ bool dp4a_repack_and_gemm(const unsigned char *section_a,
                                                      "repack_seca_i4");
   auto krs = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                       "weight_rowsum");
+  const bool gemv = (M == 1);
   const bool tiled = (M >= 8);
   auto kg = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC, tiled ? "dp4a_gemm_reg" : "dp4a_gemm");
+    FC_QINT4_DP4A_SRC,
+    gemv ? "dp4a_gemv" : (tiled ? "dp4a_gemm_reg" : "dp4a_gemm"));
   if (!kr || !krs || !kg)
     return false;
 
@@ -690,6 +739,15 @@ bool dp4a_repack_and_gemm(const unsigned char *section_a,
   kg->SetKernelArguments(4, &wrowsum, sizeof(wrowsum));
   kg->SetKernelArguments(5, &scales_fp16, sizeof(scales_fp16));
   kg->SetKernelArguments(6, &Yf, sizeof(Yf));
+  if (gemv) {
+    // dp4a_gemv(..., Y, N, K, out_fp16): one block per output, 128-thread K-split.
+    kg->SetKernelArguments(7, &n, sizeof(n));
+    kg->SetKernelArguments(8, &k, sizeof(k));
+    kg->SetKernelArguments(9, &out_fp16, sizeof(out_fp16));
+    const int gvb[3] = {128, 1, 1};
+    const int gvg[3] = {(int)N, 1, 1};
+    return StreamManager::Global().DispatchCommand(*kg, gvg, gvb);
+  }
   kg->SetKernelArguments(7, &mm, sizeof(mm));
   kg->SetKernelArguments(8, &n, sizeof(n));
   kg->SetKernelArguments(9, &k, sizeof(k));
