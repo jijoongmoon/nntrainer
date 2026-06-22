@@ -374,6 +374,7 @@ public:
   /// R4 feed pass: skip ALL kernel dispatches (host-only forward). See
   /// recq_skip_all_.
   void setSkipAllDispatches(bool v) { recq_skip_all_ = v; }
+  bool isSkipAllDispatches() const { return recq_skip_all_; }
 
   /**
    * @brief Destroy the Command Queue Manager object

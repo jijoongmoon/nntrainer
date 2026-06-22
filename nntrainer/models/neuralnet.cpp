@@ -521,6 +521,11 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   return forwarding(training);
 }
 
+// recq R4 lightweight feed pass (defined in libnntrainer blas_kernels.cpp):
+// true while the decode loop runs a host-only forward to refresh the embedding
+// output; lets us skip every non-input-embedding node's host forward.
+bool recq_skip_all_active();
+
 sharedConstTensors NeuralNetwork::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
@@ -538,6 +543,17 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     [this, from, to, stop_cb, fsu_mode,
      lookahead](std::shared_ptr<LayerNode> node, bool training) -> void {
     PROFILE_MEM_ANNOTATE("Forwarding for layer: " + node->getName());
+
+    // recq R4 feed pass: run ONLY the input-embedding nodes (they refresh the
+    // residual seed for this token); skip every other node's host forward so the
+    // GPU forward is supplied solely by the recorded-chain replay (lightweight
+    // feed -- avoids re-running the full per-layer host iteration).
+    static const bool _recq_feed = std::getenv("NNTR_RECQ_REPLAY") != nullptr;
+    if (_recq_feed && recq_skip_all_active()) {
+      const std::string &nm = node->getName();
+      if (nm != "embedding0" && nm != "per_layer_input_embedding")
+        return;
+    }
 
     auto f = std::get<0>(node->getExecutionOrder());
     if (exec_mode == ExecutionMode::TRAIN or

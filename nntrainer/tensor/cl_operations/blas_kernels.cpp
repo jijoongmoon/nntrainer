@@ -3065,6 +3065,16 @@ void recq_set_seed_probe(void *p, bool is_clmem, unsigned int bytes) {
   g_recq_seed_clmem = is_clmem;
   g_recq_seed_bytes = bytes;
 }
+
+// recq R4 feed pass: true while incrementalInference is running host-only (GPU
+// dispatches skipped) so the graph executor can also skip non-embedding nodes'
+// host forward (the lightweight input feed). Decoupled accessor so core
+// neuralnet need not include the CL manager header.
+bool recq_skip_all_active() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  return blas_cc && blas_cc->command_queue_inst_.isSkipAllDispatches();
+}
 void request_gpu_argmax(bool on) {
   g_argmax_requested = on;
   g_argmax_valid = false;
