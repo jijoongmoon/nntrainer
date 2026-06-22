@@ -38,6 +38,10 @@ if get_option('enable-opencl')
   nntrainer_base_deps += opencl_loader_dep
 endif
 
+if get_option('enable-cuda')
+  nntrainer_base_deps += cuda_dep
+endif
+
 if get_option('platform') == 'tizen'
   nntrainer_base_deps += dependency('dlog')
 endif
@@ -60,6 +64,10 @@ if get_option('enable-opencl')
   nntrainer_elements += 'layers/cl_layers'
 
   nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
+endif
+
+if get_option('enable-cuda')
+  nntrainer_elements += 'cuda'
 endif
 
 if get_option('enable-npu')
@@ -98,6 +106,11 @@ if get_option('enable-opencl')
   nntrainer_headers += meson.current_source_dir() / 'cl_svm_allocator.h'
   nntrainer_common_sources += 'cl_context.cpp'
   nntrainer_common_sources += 'cl_svm_allocator.cpp'
+endif
+
+if get_option('enable-cuda')
+  nntrainer_headers += meson.current_source_dir() / 'cuda_context.h'
+  nntrainer_common_sources += 'cuda_context.cpp'
 endif
 
 foreach s : nntrainer_common_sources

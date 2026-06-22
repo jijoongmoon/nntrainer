@@ -24,6 +24,10 @@
 #include <dynamic_library_loader.h>
 #include <engine.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context.h>
+#endif
+
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
 static const std::string func_tag = "[Engine] ";
@@ -53,6 +57,14 @@ void Engine::add_default_object() {
   auto &cl_context = nntrainer::ClContext::Global();
 
   registerContext("gpu", &cl_context);
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Additive NVIDIA CUDA backend, registered alongside (not replacing) the
+  // OpenCL "gpu" context. Selected at runtime via engine=cuda.
+  auto &cuda_context = nntrainer::CudaContext::Global();
+
+  registerContext("cuda", &cuda_context);
 #endif
 
 #if defined(ENABLE_NPU) && ENABLE_NPU == 1
