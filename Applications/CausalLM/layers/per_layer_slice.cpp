@@ -70,13 +70,27 @@ void PerLayerSliceLayer::incremental_forwarding(
       out_step_dim, b * out.getDim().getFeatureLen(), true);
 
     unsigned int tokens = in_step_dim.height();
-    float *in_data = in_step.getData<float>();
-    float *out_data = out_step.getData<float>();
-    for (unsigned int t = 0; t < tokens; ++t) {
-      const float *src =
-        in_data + t * in_dim.width() + layer_index * feature_size;
-      float *dst = out_data + t * feature_size;
-      std::memcpy(dst, src, sizeof(float) * feature_size);
+    const unsigned int W = in_dim.width();
+    // dtype-aware slice: getData<float> on an FP16 tensor strides by 4 bytes
+    // over 2-byte cells (wrong offset) and memcpy(sizeof(float)*fs) copies twice
+    // the bytes -> a corrupt PLE slice. gemma4 QINT4-FP16 activations are FP16.
+#ifdef ENABLE_FP16
+    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      _FP16 *in_data = in_step.getData<_FP16>();
+      _FP16 *out_data = out_step.getData<_FP16>();
+      for (unsigned int t = 0; t < tokens; ++t)
+        std::memcpy(out_data + t * feature_size,
+                    in_data + t * W + layer_index * feature_size,
+                    sizeof(_FP16) * feature_size);
+    } else
+#endif
+    {
+      float *in_data = in_step.getData<float>();
+      float *out_data = out_step.getData<float>();
+      for (unsigned int t = 0; t < tokens; ++t)
+        std::memcpy(out_data + t * feature_size,
+                    in_data + t * W + layer_index * feature_size,
+                    sizeof(float) * feature_size);
     }
   }
 }
