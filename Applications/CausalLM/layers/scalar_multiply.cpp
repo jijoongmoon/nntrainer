@@ -79,7 +79,18 @@ void ScalarMultiplyLayer::forwarding(nntrainer::RunLayerContext &context,
   float multiplier;
   if (use_weight) {
     nntrainer::Tensor &weight = context.getWeight(wt_idx[0]);
+    // dtype-aware scalar read: getValue<float> on an FP16 weight reads 4 bytes
+    // from the 2-byte cell (garbage). gemma4 layer_scalar / q_scale /
+    // model_proj_scale weights are FP16 in QINT4-FP16 models -> reading them as
+    // float gave a huge multiplier and overflowed the residual to +Inf.
+#ifdef ENABLE_FP16
+    multiplier =
+      (weight.getDataType() == ml::train::TensorDim::DataType::FP16)
+        ? static_cast<float>(weight.getValue<_FP16>(0, 0, 0, 0))
+        : weight.getValue<float>(0, 0, 0, 0);
+#else
     multiplier = weight.getValue<float>(0, 0, 0, 0);
+#endif
   } else {
     multiplier = std::get<props::ScalarMultiplier>(scalar_multiply_props).get();
   }
@@ -99,7 +110,18 @@ void ScalarMultiplyLayer::incremental_forwarding(
   float multiplier;
   if (use_weight) {
     nntrainer::Tensor &weight = context.getWeight(wt_idx[0]);
+    // dtype-aware scalar read: getValue<float> on an FP16 weight reads 4 bytes
+    // from the 2-byte cell (garbage). gemma4 layer_scalar / q_scale /
+    // model_proj_scale weights are FP16 in QINT4-FP16 models -> reading them as
+    // float gave a huge multiplier and overflowed the residual to +Inf.
+#ifdef ENABLE_FP16
+    multiplier =
+      (weight.getDataType() == ml::train::TensorDim::DataType::FP16)
+        ? static_cast<float>(weight.getValue<_FP16>(0, 0, 0, 0))
+        : weight.getValue<float>(0, 0, 0, 0);
+#else
     multiplier = weight.getValue<float>(0, 0, 0, 0);
+#endif
   } else {
     multiplier = std::get<props::ScalarMultiplier>(scalar_multiply_props).get();
   }
