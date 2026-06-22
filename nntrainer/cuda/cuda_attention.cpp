@@ -216,6 +216,177 @@ const unsigned short *mirror_kv(const unsigned short *host, size_t elems) {
 }
 } // namespace
 
+// Flash-decoding (split-KV) for M=1 decode: the single-pass kernel launches only
+// num_heads blocks (8 for gemma4) -- it underutilizes the SMs and serializes the
+// long KV loop. Split the KV axis into chunks so num_heads*n_chunks blocks run a
+// partial online-softmax in parallel, then a small reduce combines the chunks.
+static const char *ATTN_SPLITKV_SRC = R"CU(
+extern "C" {
+__device__ __forceinline__ float s_h2f(unsigned short h) {
+  unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
+  unsigned int e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, o;
+  if (e == 0u) {
+    if (m == 0u) o = s;
+    else { int x=-1; do{m<<=1;x++;}while((m&0x400u)==0u); m&=0x3FFu;
+           o = s | ((unsigned int)(127-15-x)<<23) | (m<<13); }
+  } else if (e == 0x1Fu) o = s | 0x7F800000u | (m<<13);
+  else o = s | ((e + (127u-15u))<<23) | (m<<13);
+  return __int_as_float((int)o);
+}
+__device__ __forceinline__ unsigned short s_f2h(float f) {
+  unsigned int x=(unsigned int)__float_as_int(f), s=(x>>16)&0x8000u, mant=x&0x7FFFFFu;
+  int e=(int)((x>>23)&0xFFu);
+  if (e==0xFF) return (unsigned short)(s|0x7C00u|(mant?0x200u:0u));
+  int exp=e-127+15;
+  if (exp>=0x1F) return (unsigned short)(s|0x7C00u);
+  if (exp<=0){ if(exp<-10) return (unsigned short)s; mant|=0x800000u; int sh=14-exp;
+    unsigned int hh=mant>>sh, rem=mant&((1u<<sh)-1u), half=1u<<(sh-1);
+    if(rem>half||(rem==half&&(hh&1u))) hh++; return (unsigned short)(s|hh); }
+  unsigned int hh=((unsigned int)exp<<10)|(mant>>13), rem=mant&0x1FFFu;
+  if(rem>0x1000u||(rem==0x1000u&&(hh&1u))) hh++;
+  return (unsigned short)(s|hh);
+}
+// One block per (head h, chunk c); query row is 0 (decode M=1). Online softmax
+// over the chunk's keys; writes (m, l, acc[d]) to scratch[h*n_chunks + c].
+__global__ void attn_partial(const unsigned short *q, const unsigned short *k,
+                             const unsigned short *v, float *pm, float *pl,
+                             float *pacc, int HQ, int HKV, int N_kv,
+                             int cache_from, int d, int window, float softcap,
+                             int chunk_kv, int n_chunks) {
+  int h = blockIdx.x, c = blockIdx.y;
+  int gqa = HQ / HKV, hkv = h / gqa;
+  int HD_KV = HKV * d;
+  const unsigned short *qrow = q + (long)h * d; // i=0
+  int tid = threadIdx.x, B = blockDim.x;
+  extern __shared__ float sh[];
+  float *Qsh = sh; float *red = sh + d;
+  for (int dd = tid; dd < d; dd += B) Qsh[dd] = s_h2f(qrow[dd]);
+  __syncthreads();
+  float scale = rsqrtf((float)d);
+  int i_abs = cache_from; // i=0
+  int j_lo_g = i_abs - window + 1; if (j_lo_g < 0) j_lo_g = 0;
+  int j_hi_g = i_abs; if (j_hi_g >= N_kv) j_hi_g = N_kv - 1;
+  int j_lo = c * chunk_kv; if (j_lo < j_lo_g) j_lo = j_lo_g;
+  int j_hi = (c + 1) * chunk_kv - 1; if (j_hi > j_hi_g) j_hi = j_hi_g;
+  float acc[4];
+#pragma unroll
+  for (int r = 0; r < 4; r++) acc[r] = 0.f;
+  float mmax = -1e30f, l = 0.f;
+  for (int j = j_lo; j <= j_hi; ++j) {
+    const unsigned short *kr = k + (long)j * HD_KV + (long)hkv * d;
+    float pd = 0.f;
+    for (int dd = tid; dd < d; dd += B) pd += Qsh[dd] * s_h2f(kr[dd]);
+    red[tid] = pd; __syncthreads();
+    for (int s = B >> 1; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; __syncthreads(); }
+    float score = red[0] * scale; __syncthreads();
+    if (softcap > 0.f) score = softcap * tanhf(score / softcap);
+    float mn = fmaxf(mmax, score), corr = __expf(mmax - mn), p = __expf(score - mn);
+    l = l * corr + p; mmax = mn;
+    const unsigned short *vr = v + (long)j * HD_KV + (long)hkv * d;
+    int r = 0; for (int dd = tid; dd < d; dd += B, ++r) acc[r] = acc[r]*corr + p*s_h2f(vr[dd]);
+  }
+  if (j_lo > j_hi) { mmax = -1e30f; l = 0.f; }
+  int base = h * n_chunks + c;
+  if (tid == 0) { pm[base] = mmax; pl[base] = l; }
+  int r = 0; for (int dd = tid; dd < d; dd += B, ++r) pacc[(long)base * d + dd] = acc[r];
+}
+// One block per head; combine the n_chunks partials into the fp16 output row.
+__global__ void attn_reduce(const float *pm, const float *pl, const float *pacc,
+                            unsigned short *o, int HQ, int d, int n_chunks) {
+  int h = blockIdx.x;
+  int tid = threadIdx.x, B = blockDim.x;
+  int base = h * n_chunks;
+  __shared__ float M, L;
+  if (tid == 0) {
+    float mx = -1e30f;
+    for (int c = 0; c < n_chunks; ++c) mx = fmaxf(mx, pm[base + c]);
+    float l = 0.f;
+    for (int c = 0; c < n_chunks; ++c) l += pl[base + c] * __expf(pm[base + c] - mx);
+    M = mx; L = l;
+  }
+  __syncthreads();
+  float inv = L > 0.f ? 1.f / L : 0.f;
+  unsigned short *orow = o + (long)h * d; // i=0
+  for (int dd = tid; dd < d; dd += B) {
+    float a = 0.f;
+    for (int c = 0; c < n_chunks; ++c)
+      a += pacc[((long)(base + c)) * d + dd] * __expf(pm[base + c] - M);
+    orow[dd] = s_f2h(a * inv);
+  }
+}
+}
+)CU";
+
+namespace {
+float *g_pm = nullptr, *g_pl = nullptr, *g_pacc = nullptr;
+size_t g_pm_cap = 0, g_pacc_cap = 0;
+std::mutex g_sk_mtx;
+bool ensure_sk(size_t mn, size_t acc) {
+  if (mn > g_pm_cap) {
+    if (g_pm) cudaFree(g_pm);
+    if (g_pl) cudaFree(g_pl);
+    if (cudaMalloc(&g_pm, mn * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g_pl, mn * sizeof(float)) != cudaSuccess)
+      return false;
+    g_pm_cap = mn;
+  }
+  if (acc > g_pacc_cap) {
+    if (g_pacc) cudaFree(g_pacc);
+    if (cudaMalloc(&g_pacc, acc * sizeof(float)) != cudaSuccess)
+      return false;
+    g_pacc_cap = acc;
+  }
+  return true;
+}
+
+bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
+                              const unsigned short *v, unsigned short *o, int HQ,
+                              int HKV, int N_kv, int cache_from, int d,
+                              int window, float softcap, int chunk_kv) {
+  const int n_chunks = (N_kv + chunk_kv - 1) / chunk_kv;
+  std::lock_guard<std::mutex> lk(g_sk_mtx);
+  if (!ensure_sk((size_t)HQ * n_chunks, (size_t)HQ * n_chunks * d))
+    return false;
+  auto kp = CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC, "attn_partial");
+  auto kr = CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC, "attn_reduce");
+  if (!kp || !kr)
+    return false;
+  const int B = 128;
+  kp->SetKernelArguments(0, &q, sizeof(q));
+  kp->SetKernelArguments(1, &k, sizeof(k));
+  kp->SetKernelArguments(2, &v, sizeof(v));
+  kp->SetKernelArguments(3, &g_pm, sizeof(g_pm));
+  kp->SetKernelArguments(4, &g_pl, sizeof(g_pl));
+  kp->SetKernelArguments(5, &g_pacc, sizeof(g_pacc));
+  kp->SetKernelArguments(6, &HQ, sizeof(HQ));
+  kp->SetKernelArguments(7, &HKV, sizeof(HKV));
+  kp->SetKernelArguments(8, &N_kv, sizeof(N_kv));
+  kp->SetKernelArguments(9, &cache_from, sizeof(cache_from));
+  kp->SetKernelArguments(10, &d, sizeof(d));
+  kp->SetKernelArguments(11, &window, sizeof(window));
+  kp->SetKernelArguments(12, &softcap, sizeof(softcap));
+  kp->SetKernelArguments(13, &chunk_kv, sizeof(chunk_kv));
+  kp->SetKernelArguments(14, &n_chunks, sizeof(n_chunks));
+  const int pg[3] = {HQ, n_chunks, 1};
+  const int pb[3] = {B, 1, 1};
+  const unsigned int shmem = (unsigned int)(sizeof(float) * ((size_t)d + B));
+  if (!StreamManager::Global().DispatchCommand(*kp, pg, pb, shmem))
+    return false;
+  kr->SetKernelArguments(0, &g_pm, sizeof(g_pm));
+  kr->SetKernelArguments(1, &g_pl, sizeof(g_pl));
+  kr->SetKernelArguments(2, &g_pacc, sizeof(g_pacc));
+  kr->SetKernelArguments(3, &o, sizeof(o));
+  kr->SetKernelArguments(4, &HQ, sizeof(HQ));
+  kr->SetKernelArguments(5, &d, sizeof(d));
+  kr->SetKernelArguments(6, &n_chunks, sizeof(n_chunks));
+  const int rg[3] = {HQ, 1, 1};
+  const int rb[3] = {B, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kr, rg, rb))
+    return false;
+  return true;
+}
+} // namespace
+
 bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                      const unsigned short *k_fp16,
                                      const unsigned short *v_fp16,
@@ -233,6 +404,24 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   v_fp16 = mirror_kv(v_fp16, kv_elems);
   if (!k_fp16 || !v_fp16)
     return false;
+
+  // Flash-decoding (split-KV) for M=1 decode with enough keys to fill the SMs.
+  static const int sk_chunk = []() {
+    const char *e = std::getenv("NNTR_CUDA_FLASH_DECODE");
+    if (!e)
+      return 0;            // off
+    int c = atoi(e);
+    return c > 0 ? c : 64; // =1 -> default chunk 64; or an explicit chunk size
+  }();
+  if (sk_chunk > 0 && N_q == 1 && N_kv > sk_chunk) {
+    if (attention_splitkv_decode(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
+                                 num_heads_KV, N_kv, cache_from, head_dim, window,
+                                 softcap, sk_chunk)) {
+      StreamManager::Global().maybeFinish();
+      return true;
+    }
+  }
+
   auto kernel = CudaContext::Global().registerCudaKernel(ATTN_IL_FP16_SRC,
                                                          "attn_core_il_fp16");
   if (!kernel) {

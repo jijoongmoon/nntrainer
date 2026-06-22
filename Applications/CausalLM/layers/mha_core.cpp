@@ -2290,6 +2290,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                      (pa.type == cudaMemoryTypeManaged ||
                       pa.type == cudaMemoryTypeDevice);
           cudaGetLastError();
+          // V-copy stays host for the prefill big-step (height>1): a host op
+          // still reads the V cache during prefill, so a GPU async V copy races
+          // (verified: sync-mode coherent, async-mode garbage). Decode only.
           if (cuda_elt && dev && value_step.height() == 1 &&
               nntrainer::cuda::cuda_scalar_mul_fp16(
                 vin, vout, (unsigned int)value_step.size(), 1.0f))
