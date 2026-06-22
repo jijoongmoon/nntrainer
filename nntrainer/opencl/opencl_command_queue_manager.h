@@ -104,6 +104,18 @@ class CommandQueueManager : public Singleton<CommandQueueManager> {
   cl_recording_qcom active_recording_handle_{nullptr};
 
   /**
+   * @brief Debug (NNTR_RECQ_MAXDISP): per-forward dispatch counter + cap for
+   * first-divergence localization. resetDispatchCounter() is called at the start
+   * of the probed forward; while the cap is set, the chokepoints SKIP (neither
+   * capture nor execute) every dispatch at/after the cap, so both a NORMAL and a
+   * REPLAY run stop after the same N dispatches and the residual buffer can be
+   * compared. Default cap 0 = disabled (no skipping).
+   */
+  cl_uint recq_global_dispatch_{0};
+  bool recq_cap_armed_{false};
+  bool recqSkipDispatch();
+
+  /**
    * @brief Resolve the cl_qcom_recordable_queues entry points and create the
    * recordable + host-I/O queues. Called from CreateCommandQueue only when
    * NNTR_RECQ is set; degrades gracefully (logs + leaves both queues null) if
@@ -344,6 +356,15 @@ public:
    * being captured, not executed).
    */
   bool isRecording() const { return active_recording_queue_ != nullptr; }
+
+  /**
+   * @brief Reset the per-forward dispatch counter (NNTR_RECQ_MAXDISP debug).
+   * Call once at the start of the forward to be prefix-capped.
+   */
+  void resetDispatchCounter() {
+    recq_global_dispatch_ = 0;
+    recq_cap_armed_ = true;
+  }
 
   /**
    * @brief Destroy the Command Queue Manager object

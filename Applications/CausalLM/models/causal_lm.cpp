@@ -762,6 +762,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     allocateAndBindKVCache();
     const unsigned int _recq_ci = token_generation_idx - 1 + global_token_len;
+    // NNTR_RECQ_MAXDISP debug: reset the per-forward dispatch counter so the
+    // prefix-cap counts from this decode forward's first dispatch (applies to
+    // both the normal and the record passes below).
+    if (token_generation_idx == input_len + 1)
+      _cqm.resetDispatchCounter();
     std::vector<float *> output_interval;
     bool _did_replay = false;
     if (_recq_replay && !_recq_recorded &&
@@ -797,6 +802,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
           _recq_noovr ? _cqm.replayRecording(nullptr, 0, nullptr, 0, &_revt)
                       : _cqm.replayRecording(_rargs.data(), _rargs.size(),
                                              _rgws.data(), _rgws.size(), &_revt);
+        // NNTR_RECQ_MAXDISP prefix test: the recording captured only the first N
+        // dispatches; the replay ran them. Dump the residual probe (seed) NOW,
+        // before any fallback overwrites the buffers, then stop (no token).
+        static const bool _recq_maxdisp =
+          std::getenv("NNTR_RECQ_MAXDISP") != nullptr;
+        if (_recq_maxdisp) {
+          if (_rok)
+            nntrainer::recq_dump_lmhead("replay-prefix");
+          else
+            std::fprintf(stderr, "[RECQ] prefix replay FAILED\n");
+          break;
+        }
         if (_rok) {
           unsigned int _rtok = 0;
           if (nntrainer::recq_read_argmax_io(&_rtok, _revt)) {

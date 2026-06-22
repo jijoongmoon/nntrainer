@@ -294,6 +294,19 @@ bool CommandQueueManager::replayRecording(const cl_array_arg_qcom *args,
   return true;
 }
 
+bool CommandQueueManager::recqSkipDispatch() {
+  static const cl_uint maxd = []() {
+    const char *e = std::getenv("NNTR_RECQ_MAXDISP");
+    return e ? (cl_uint)std::atoi(e) : 0u;
+  }();
+  // The cap is ARMED only after resetDispatchCounter() (called at the start of
+  // the probed decode forward), so PREFILL runs uncapped/complete.
+  if (!recq_cap_armed_)
+    return false;
+  const cl_uint idx = recq_global_dispatch_++;
+  return maxd > 0u && idx >= maxd;
+}
+
 void CommandQueueManager::releaseRecording() {
   // NNTR_RECQ_NORELEASE: skip clReleaseRecordingQCOM (the Adreno driver's
   // cb_release_recording_qcom has been observed to SIGSEGV at teardown on some
@@ -653,6 +666,12 @@ bool CommandQueueManager::DispatchCommand(
   if (track)
     evt_arg = &local_evt;
 
+  // NNTR_RECQ_MAXDISP: prefix-cap for first-divergence localization (skip = no
+  // capture, no execute) so NORMAL and REPLAY both stop after the same N.
+  if (recqSkipDispatch()) {
+    next_prof_label_.clear();
+    return true;
+  }
   // returns NULL with error code if fails. R1: while recording, capture onto
   // the recordable queue instead of executing on command_queue_; count the
   // captured dispatch so the caller can map it to a per-token override.
@@ -718,6 +737,12 @@ bool CommandQueueManager::DispatchCommand(
   if (track)
     evt_arg = &local_evt;
 
+  // NNTR_RECQ_MAXDISP: prefix-cap for first-divergence localization (skip = no
+  // capture, no execute) so NORMAL and REPLAY both stop after the same N.
+  if (recqSkipDispatch()) {
+    next_prof_label_.clear();
+    return true;
+  }
   // returns NULL with error code if fails. R1: while recording, capture onto
   // the recordable queue instead of executing on command_queue_; count the
   // captured dispatch so the caller can map it to a per-token override.
@@ -774,6 +799,11 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
   if (track)
     evt_arg = &local_evt;
 
+  // NNTR_RECQ_MAXDISP: prefix-cap (skip = no capture, no execute).
+  if (recqSkipDispatch()) {
+    next_prof_label_.clear();
+    return;
+  }
   // R1: while recording, capture onto the recordable queue instead of executing
   // on command_queue_; count the captured dispatch for the override mapping.
   cl_command_queue rq_target =

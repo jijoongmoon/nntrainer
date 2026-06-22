@@ -3129,25 +3129,29 @@ bool recq_read_argmax_io(unsigned int *tok, cl_event wait_evt) {
 void recq_dump_lmhead(const char *tag) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  if (!blas_cc || g_recq_lmhead_act == nullptr || g_recq_lmhead_K == 0)
+  if (!blas_cc)
     return;
   cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
   if (!q)
     return;
   clFinish(q);
+  // The lm_head act/logits may be unset on a NNTR_RECQ_MAXDISP prefix that stops
+  // before the lm_head; the SEED probe is still valid (embedding runs early).
   const unsigned int K = g_recq_lmhead_K;
-  std::vector<uint16_t> act(K, 0);
-  if (g_recq_lmhead_act_clmem) {
-    if (clEnqueueReadBuffer(q, static_cast<cl_mem>(g_recq_lmhead_act), CL_TRUE, 0,
-                            sizeof(uint16_t) * K, act.data(), 0, nullptr,
-                            nullptr) != CL_SUCCESS)
-      return;
-  } else {
-    std::memcpy(act.data(), g_recq_lmhead_act, sizeof(uint16_t) * K);
-  }
+  std::vector<uint16_t> act(K ? K : 4, 0);
   unsigned long long act_sum = 0;
-  for (unsigned int i = 0; i < K; i++)
-    act_sum += (unsigned long long)act[i] * (i + 1u); // position-weighted
+  if (g_recq_lmhead_act != nullptr && K > 0) {
+    bool got = true;
+    if (g_recq_lmhead_act_clmem)
+      got = clEnqueueReadBuffer(q, static_cast<cl_mem>(g_recq_lmhead_act),
+                                CL_TRUE, 0, sizeof(uint16_t) * K, act.data(), 0,
+                                nullptr, nullptr) == CL_SUCCESS;
+    else
+      std::memcpy(act.data(), g_recq_lmhead_act, sizeof(uint16_t) * K);
+    if (got)
+      for (unsigned int i = 0; i < K; i++)
+        act_sum += (unsigned long long)act[i] * (i + 1u); // position-weighted
+  }
   // logits prefix checksum (cheap signature; raw fp16 bits, position-weighted).
   unsigned long long lg_sum = 0;
   if (g_recq_lmhead_out) {
