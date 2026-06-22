@@ -110,7 +110,9 @@ endif
 
 if get_option('enable-cuda')
   nntrainer_headers += meson.current_source_dir() / 'cuda_context.h'
+  nntrainer_headers += meson.current_source_dir() / 'cuda_mem_allocator.h'
   nntrainer_common_sources += 'cuda_context.cpp'
+  nntrainer_common_sources += 'cuda_mem_allocator.cpp'
 endif
 
 foreach s : nntrainer_common_sources

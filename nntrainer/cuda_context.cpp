@@ -14,6 +14,9 @@
 
 #include <mutex>
 
+#include <compute_ops.h>
+#include <cuda_mem_allocator.h>
+
 namespace nntrainer {
 
 std::mutex cuda_factory_mutex;
@@ -27,9 +30,16 @@ void CudaContext::initialize() noexcept {
 
     add_default_object();
 
-    // P0: no CUDA MemAllocator / ComputeOps yet. Device-resident tensors and
-    // the accelerator op dispatch are wired in P1 (memory/residency). Until
-    // then a tensor attached to this context uses the base defaults.
+    // Unified-Memory allocator: MemoryPool buffers for engine=cuda tensors are
+    // cudaMallocManaged -> host-addressable AND device-accessible (the SVM
+    // analogue), so a tensor on this context is device-resident with no
+    // separate copy step. Falls back to host memory if UVM is unavailable.
+    setMemAllocator(std::make_shared<CudaMemAllocator>());
+
+    // CUDA ComputeOps: host-side copy ops so Tensor::copy() works on managed
+    // (host-coherent) memory. Accelerator quantized GEMM/GEMV predicates stay
+    // false (base default) -> CPU fallback until the CUDA kernels land in P3.
+    getContextData()->setComputeOps(get_cuda_ops());
 
   } catch (std::exception &e) {
     ml_loge("cuda_context: initialization failed!!, reason: %s", e.what());
