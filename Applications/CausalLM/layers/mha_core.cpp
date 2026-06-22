@@ -22,6 +22,7 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_attention.h>
+#include <cuda_rope.h>
 #include <cuda_runtime.h>
 #endif
 
@@ -2115,8 +2116,46 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         }
       }
       // apply rotary embedding for query
-      apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
-                                 true);
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+      // GPU RoPE (decode, device-resident query): split-half rotation on the
+      // device matching apply_rotary_emb_tensor_v2, keeping the query off the
+      // host. Opt-in (NNTR_CUDA_ROPE) until the whole decode chain is on-GPU.
+      bool q_rope_gpu = false;
+      {
+        static const bool cuda_rope = std::getenv("NNTR_CUDA_ROPE") != nullptr;
+        if (cuda_rope &&
+            query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+            query_step.height() == 1) {
+          if (cached_freqs_cos_fp16 == nullptr ||
+              cached_freqs_sin_fp16 == nullptr) {
+            const std::lock_guard<std::mutex> lock(rope_init_mtx);
+            precompute_freqs(head_dim, max_position_embeddings, theta, true);
+            cached_freqs_cos_fp16 = freqs_cos_fp16;
+            cached_freqs_sin_fp16 = freqs_sin_fp16;
+          }
+          if (cache_index < (*cached_freqs_cos_fp16).size()) {
+            unsigned short *q =
+              reinterpret_cast<unsigned short *>(query_step.getData<_FP16>());
+            cudaPointerAttributes pa{};
+            bool dev = cudaPointerGetAttributes(&pa, q) == cudaSuccess &&
+                       (pa.type == cudaMemoryTypeManaged ||
+                        pa.type == cudaMemoryTypeDevice);
+            cudaGetLastError();
+            if (dev) {
+              auto &cosv = (*cached_freqs_cos_fp16)[cache_index];
+              auto &sinv = (*cached_freqs_sin_fp16)[cache_index];
+              q_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
+                q, q, reinterpret_cast<const unsigned short *>(cosv.data()),
+                reinterpret_cast<const unsigned short *>(sinv.data()),
+                query_step.width() / head_dim, head_dim);
+            }
+          }
+        }
+      }
+      if (!q_rope_gpu)
+#endif
+        apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
+                                   true);
 
       // append kcache with rotary embedding. §3.8 OHWI write path: when
       // enabled and on the FP16 cache path, rotate K in-place on key_step then

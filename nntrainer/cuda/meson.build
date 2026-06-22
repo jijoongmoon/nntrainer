@@ -10,6 +10,7 @@ cuda_sources = [
   'cuda_rmsnorm.cpp',
   'cuda_fc_qint4.cpp',
   'cuda_attention.cpp',
+  'cuda_rope.cpp',
 ]
 
 cuda_headers = [
@@ -24,6 +25,7 @@ cuda_headers = [
   'cuda_rmsnorm.h',
   'cuda_fc_qint4.h',
   'cuda_attention.h',
+  'cuda_rope.h',
 ]
 
 foreach s : cuda_sources
