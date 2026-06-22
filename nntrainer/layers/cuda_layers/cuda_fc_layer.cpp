@@ -109,14 +109,27 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
       float *Y = hidden_.getData<float>();
       // Zero-copy when the tensors are device-accessible (UVM); otherwise mirror
       // the host-heap tensors into device memory (the QINT4 host GEMM is NYI on
-      // x86, so this device path is the only correct one there).
+      // x86, so this device path is the only correct one there). On the
+      // device-resident path, default to the w4a8 __dp4a kernel (int8 act x int4
+      // weight, repacked plain int4) -- much higher throughput than the naive
+      // FP32-act decode-GEMM. NNTR_FC_CUDA_DP4A=0 selects the naive kernel
+      // (FP32 act, highest accuracy).
       const bool all_dev =
         deviceAccessible(X) && deviceAccessible(W) && deviceAccessible(Y);
-      const bool ok =
-        all_dev ? cuda::cuda_fc_qint4_sectionA_gemm_fp32(X, W, S, Y, (unsigned)M,
-                                                         (unsigned)N, (unsigned)K)
-                : cuda::cuda_fc_qint4_sectionA_gemm_fp32_resident(
-                    X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K);
+      bool ok;
+      if (all_dev) {
+        static const bool use_dp4a = []() {
+          const char *e = std::getenv("NNTR_FC_CUDA_DP4A");
+          return !(e != nullptr && e[0] == '0'); // default ON
+        }();
+        ok = use_dp4a ? cuda::cuda_fc_qint4_sectionA_dp4a_gemm_fp32(
+                          X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K)
+                      : cuda::cuda_fc_qint4_sectionA_gemm_fp32(
+                          X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K);
+      } else {
+        ok = cuda::cuda_fc_qint4_sectionA_gemm_fp32_resident(
+          X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K);
+      }
       if (ok)
         return;
     }

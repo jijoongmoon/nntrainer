@@ -233,6 +233,291 @@ bool cuda_fc_qint4_sectionA_gemm_fp32_resident(const float *host_X,
   return true;
 }
 
+// ===========================================================================
+// w4a8 dp4a fast path
+// ===========================================================================
+// Three NVRTC kernels (one module): per-row int8 activation quant, a one-time
+// Section-A -> plain row-major int4 repack (reuses the validated inverse
+// mapping), and a __dp4a int8xint4 GEMM. Compiled for the device arch
+// (compute_89 on Ada), so __dp4a lowers to the dp4a PTX instruction.
+static const char *FC_QINT4_DP4A_SRC = R"CU(
+extern "C" {
+
+__device__ __forceinline__ float dp4a_h2f(unsigned short h) {
+  unsigned int sign = ((unsigned int)(h & 0x8000u)) << 16;
+  unsigned int exp = (h >> 10) & 0x1Fu;
+  unsigned int mant = h & 0x3FFu;
+  unsigned int out;
+  if (exp == 0u) {
+    if (mant == 0u) {
+      out = sign;
+    } else {
+      int e = -1;
+      do { mant <<= 1; e++; } while ((mant & 0x400u) == 0u);
+      mant &= 0x3FFu;
+      out = sign | ((unsigned int)(127 - 15 - e) << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1Fu) {
+    out = sign | 0x7F800000u | (mant << 13);
+  } else {
+    out = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
+  }
+  return __int_as_float((int)out);
+}
+
+// signed int4 weight for (output n, input k) from the Section-A payload.
+__device__ __forceinline__ int seca_decode(const unsigned char *secA, int n,
+                                            int k, int k_internal) {
+  int a = k >> 5, r = k & 31;
+  int is_high = (r >= 16) ? 1 : 0;
+  int kb = is_high ? (r - 16) : r;
+  int t = (a << 4) + kb;
+  int nr_idx = n & 3;
+  int byte_off = (n >> 2) * (2 * k_internal) + (((t >> 3) << 2) + nr_idx) * 8 +
+                 (t & 7);
+  unsigned char s = secA[byte_off];
+  int nib = is_high ? ((s >> 4) & 0xF) : (s & 0xF);
+  return (nib ^ 8) - 8;
+}
+
+// per-row symmetric int8 quant of the activation (one block per row).
+__global__ void act_quant_i8(const float *X, signed char *q8, float *ascale,
+                             int M, int K) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+  __shared__ float sm[256];
+  const float *xr = X + (long)m * K;
+  float local = 0.f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x)
+    local = fmaxf(local, fabsf(xr[k]));
+  sm[threadIdx.x] = local;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s)
+      sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x + s]);
+    __syncthreads();
+  }
+  float amax = sm[0];
+  float inv = amax > 0.f ? 127.0f / amax : 0.f;
+  if (threadIdx.x == 0)
+    ascale[m] = amax > 0.f ? amax / 127.0f : 1.0f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    int q = __float2int_rn(xr[k] * inv);
+    q = max(-127, min(127, q));
+    q8[(long)m * K + k] = (signed char)q;
+  }
+}
+
+// Section-A -> plain row-major int4 [N, ceil(K/2)]: byte[n][kb] low nibble =
+// int4(n, 2kb), high nibble = int4(n, 2kb+1), each stored two's-complement.
+__global__ void repack_seca_i4(const unsigned char *secA, signed char *plain,
+                               int N, int K, int k_internal) {
+  int kb = blockIdx.x * blockDim.x + threadIdx.x;
+  int n = blockIdx.y * blockDim.y + threadIdx.y;
+  int Kh = (K + 1) >> 1;
+  if (n >= N || kb >= Kh)
+    return;
+  int k0 = 2 * kb, k1 = 2 * kb + 1;
+  int v0 = seca_decode(secA, n, k0, k_internal);
+  int v1 = (k1 < K) ? seca_decode(secA, n, k1, k_internal) : 0;
+  plain[(long)n * Kh + kb] = (signed char)((v0 & 0xF) | ((v1 & 0xF) << 4));
+}
+
+// Y[m,n] = ascale[m] * w_scale[n] * sum_k q8[m,k] * int4(n,k), via __dp4a.
+__global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
+                          const float *ascale, const unsigned short *wscale,
+                          float *Y, int M, int N, int K) {
+  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  int m = blockIdx.y * blockDim.y + threadIdx.y;
+  if (m >= M || n >= N)
+    return;
+  int Kh = (K + 1) >> 1;
+  const signed char *qrow = q8 + (long)m * K;
+  const signed char *wrow = plain + (long)n * Kh;
+  int acc = 0, k = 0;
+  for (; k + 4 <= K; k += 4) {
+    int a = *(const int *)(qrow + k); // lanes = act k,k+1,k+2,k+3
+    int kb = k >> 1;
+    int b0 = (unsigned char)wrow[kb];     // k(low), k+1(high)
+    int b1 = (unsigned char)wrow[kb + 1]; // k+2(low), k+3(high)
+    int w0 = ((int)(signed char)(b0 << 4)) >> 4;
+    int w1 = ((int)(signed char)b0) >> 4;
+    int w2 = ((int)(signed char)(b1 << 4)) >> 4;
+    int w3 = ((int)(signed char)b1) >> 4;
+    int w = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |
+            ((w3 & 0xFF) << 24);
+    acc = __dp4a(a, w, acc);
+  }
+  for (; k < K; ++k) { // tail (none when K%32==0)
+    int kb = k >> 1;
+    int b = (unsigned char)wrow[kb];
+    int wv = (k & 1) ? (((int)(signed char)b) >> 4)
+                     : (((int)(signed char)(b << 4)) >> 4);
+    acc += (int)qrow[k] * wv;
+  }
+  Y[(long)m * N + n] = (float)acc * ascale[m] * dp4a_h2f(wscale[n]);
+}
+
+// Shared-memory tiled dp4a GEMM. A 16x16 output tile per block; each K-chunk of
+// 64 is cooperatively staged into shared int8 tiles (weight nibbles unpacked on
+// load), so every global weight/act byte is reused across the 16 rows/cols of
+// the tile -- ~16x less global traffic than the per-output kernel, which is the
+// real lever (the per-output kernels are memory-bound, not compute-bound).
+#define DP4A_TM 16
+#define DP4A_TN 16
+#define DP4A_TK 64
+__global__ void dp4a_gemm_tiled(const signed char *q8, const signed char *plain,
+                                const float *ascale,
+                                const unsigned short *wscale, float *Y, int M,
+                                int N, int K) {
+  __shared__ signed char As[DP4A_TM][DP4A_TK];
+  __shared__ signed char Ws[DP4A_TN][DP4A_TK];
+  int tx = threadIdx.x, ty = threadIdx.y;
+  int row = blockIdx.y * DP4A_TM + ty; // m
+  int col = blockIdx.x * DP4A_TN + tx; // n
+  int Kh = (K + 1) >> 1;
+  int tid = ty * DP4A_TN + tx;
+  int acc = 0;
+  for (int k0 = 0; k0 < K; k0 += DP4A_TK) {
+    for (int e = tid; e < DP4A_TM * DP4A_TK; e += DP4A_TM * DP4A_TN) {
+      int i = e / DP4A_TK, j = e % DP4A_TK;
+      int mm = blockIdx.y * DP4A_TM + i, kk = k0 + j;
+      As[i][j] = (mm < M && kk < K) ? q8[(long)mm * K + kk] : (signed char)0;
+    }
+    for (int e = tid; e < DP4A_TN * DP4A_TK; e += DP4A_TM * DP4A_TN) {
+      int i = e / DP4A_TK, j = e % DP4A_TK;
+      int nn = blockIdx.x * DP4A_TN + i, kk = k0 + j;
+      signed char wv = 0;
+      if (nn < N && kk < K) {
+        unsigned char b = (unsigned char)plain[(long)nn * Kh + (kk >> 1)];
+        wv = (kk & 1) ? (((signed char)b) >> 4)
+                      : (((signed char)(b << 4)) >> 4);
+      }
+      Ws[i][j] = wv;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < DP4A_TK; kk += 4)
+      acc = __dp4a(*(const int *)&As[ty][kk], *(const int *)&Ws[tx][kk], acc);
+    __syncthreads();
+  }
+  if (row < M && col < N)
+    Y[(long)row * N + col] = (float)acc * ascale[row] * dp4a_h2f(wscale[col]);
+}
+
+}
+)CU";
+
+namespace {
+// cached plain-int4 repack of each Section-A weight (keyed by host/UVM pointer).
+std::unordered_map<const void *, signed char *> g_dp4a_plain_cache;
+signed char *g_dp4a_q8 = nullptr;
+size_t g_dp4a_q8_cap = 0;
+float *g_dp4a_ascale = nullptr;
+size_t g_dp4a_ascale_cap = 0;
+std::mutex g_dp4a_mtx;
+} // namespace
+
+bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
+                                           const unsigned char *section_a,
+                                           const unsigned short *scales_fp16,
+                                           float *Y, unsigned int M,
+                                           unsigned int N, unsigned int K) {
+  if (M == 0 || N == 0 || K == 0)
+    return true;
+
+  auto kq = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "act_quant_i8");
+  auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "repack_seca_i4");
+  // tiled GEMM for batched M (prefill); the per-output kernel for tiny M
+  // (decode), where a 16x16 tile would mostly idle.
+  const bool tiled = (M >= 8);
+  auto kg = CudaContext::Global().registerCudaKernel(
+    FC_QINT4_DP4A_SRC, tiled ? "dp4a_gemm_tiled" : "dp4a_gemm");
+  if (!kq || !kr || !kg) {
+    ml_loge("[CUDA] fc_qint4 dp4a: kernel registration failed");
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+
+  const int m = (int)M, n = (int)N, k = (int)K;
+  const int k_internal = (int)(((K + 31u) / 32u) * 32u);
+  const size_t Kh = (K + 1u) / 2u;
+
+  // 1) one-time Section-A -> plain int4 repack (cached on device).
+  auto it = g_dp4a_plain_cache.find(section_a);
+  if (it == g_dp4a_plain_cache.end()) {
+    signed char *plain = nullptr;
+    if (cudaMalloc(&plain, (size_t)N * Kh) != cudaSuccess)
+      return false;
+    kr->SetKernelArguments(0, &section_a, sizeof(section_a));
+    kr->SetKernelArguments(1, &plain, sizeof(plain));
+    kr->SetKernelArguments(2, &n, sizeof(n));
+    kr->SetKernelArguments(3, &k, sizeof(k));
+    kr->SetKernelArguments(4, &k_internal, sizeof(k_internal));
+    const int rb[3] = {16, 16, 1};
+    const int rg[3] = {((int)Kh + 15) / 16, ((int)N + 15) / 16, 1};
+    if (!StreamManager::Global().DispatchCommand(*kr, rg, rb)) {
+      cudaFree(plain);
+      return false;
+    }
+    it = g_dp4a_plain_cache.emplace(section_a, plain).first;
+  }
+  signed char *plain = it->second;
+
+  // 2) int8 activation quant (per-row), into grown device scratch.
+  const size_t q8b = (size_t)M * K;
+  const size_t asb = sizeof(float) * (size_t)M;
+  if (q8b > g_dp4a_q8_cap) {
+    if (g_dp4a_q8)
+      cudaFree(g_dp4a_q8);
+    if (cudaMalloc(&g_dp4a_q8, q8b) != cudaSuccess) {
+      g_dp4a_q8 = nullptr;
+      g_dp4a_q8_cap = 0;
+      return false;
+    }
+    g_dp4a_q8_cap = q8b;
+  }
+  if (asb > g_dp4a_ascale_cap) {
+    if (g_dp4a_ascale)
+      cudaFree(g_dp4a_ascale);
+    if (cudaMalloc(&g_dp4a_ascale, asb) != cudaSuccess) {
+      g_dp4a_ascale = nullptr;
+      g_dp4a_ascale_cap = 0;
+      return false;
+    }
+    g_dp4a_ascale_cap = asb;
+  }
+  kq->SetKernelArguments(0, &X, sizeof(X));
+  kq->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
+  kq->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+  kq->SetKernelArguments(3, &m, sizeof(m));
+  kq->SetKernelArguments(4, &k, sizeof(k));
+  const int qb[3] = {256, 1, 1};
+  const int qg[3] = {(int)M, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kq, qg, qb))
+    return false;
+
+  // 3) dp4a GEMM.
+  kg->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
+  kg->SetKernelArguments(1, &plain, sizeof(plain));
+  kg->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+  kg->SetKernelArguments(3, &scales_fp16, sizeof(scales_fp16));
+  kg->SetKernelArguments(4, &Y, sizeof(Y));
+  kg->SetKernelArguments(5, &m, sizeof(m));
+  kg->SetKernelArguments(6, &n, sizeof(n));
+  kg->SetKernelArguments(7, &k, sizeof(k));
+  const int gb[3] = {16, 16, 1};
+  const int gg[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
+  if (!StreamManager::Global().DispatchCommand(*kg, gg, gb))
+    return false;
+  StreamManager::Global().finish();
+  return true;
+}
+
 bool cuda_fc_qint4_gemm_fp32(const float *X, const unsigned char *nibbles,
                              const float *scales, float *Y, unsigned int M,
                              unsigned int N, unsigned int K,

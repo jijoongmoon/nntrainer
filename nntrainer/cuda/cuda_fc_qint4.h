@@ -81,6 +81,30 @@ bool cuda_fc_qint4_sectionA_gemm_fp32_resident(const float *host_X,
                                                float *host_Y, unsigned int M,
                                                unsigned int N, unsigned int K);
 
+/**
+ * @brief w4a8 dp4a fast path: Y[M,N] = X[M,K] * dequant(QINT4 W) using Ada
+ *        __dp4a (4-way int8 dot-accumulate). The FP32 activation is quantized
+ *        to int8 per-row (symmetric, absmax/127); the KAI Section-A int4 weight
+ *        is repacked ONCE into plain row-major int4 [N,K] (cached by the
+ *        section_a pointer, reusing the validated inverse mapping); the GEMM
+ *        accumulates int32 via __dp4a and rescales by act_scale[m]*w_scale[n].
+ *        Much higher arithmetic throughput than the naive FP32 kernel, and no
+ *        FP32 weight blow-up (stays int4 in memory). All pointers must be
+ *        device-accessible (UVM). Requires N%4==0, K%32==0 (load invariant).
+ *
+ * @param X            [M,K] row-major FP32 activation (device-accessible)
+ * @param section_a    Section-A nibble payload = weight.getData() (device-acc)
+ * @param scales_fp16  N fp16 per-channel scales = weight.getScale() (device-acc)
+ * @param Y            [M,N] row-major FP32 output (device-accessible)
+ * @param M,N,K        GEMM dims
+ * @return true on success
+ */
+bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
+                                           const unsigned char *section_a,
+                                           const unsigned short *scales_fp16,
+                                           float *Y, unsigned int M,
+                                           unsigned int N, unsigned int K);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_FC_QINT4_H__
