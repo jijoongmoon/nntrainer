@@ -18,6 +18,10 @@
 #include <app_context.h>
 #include <engine.h>
 #include <llm_util.hpp>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context.h>
+#endif
 #include <logit_softcapping.h>
 #include <model.h>
 #include <per_layer_slice.h>
@@ -853,6 +857,27 @@ void Gemma4Transformer::registerCustomLayers() {
   tryRegister(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
   tryRegister(nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
   tryRegister(nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Additive CUDA backend: register the gemma4-specific host layers on the cuda
+  // context (host-on-UVM). reshaped_rms_norm is centralized in
+  // CausalLM::registerCustomLayers (cuda), so it is not repeated here.
+  auto *cuda_context = static_cast<nntrainer::CudaContext *>(
+    ct_engine.getRegisteredContext("cuda"));
+  if (cuda_context != nullptr) {
+    auto tryRegisterCuda = [&](auto factory_fn) {
+      try {
+        cuda_context->registerFactory(factory_fn);
+      } catch (std::invalid_argument &e) {
+        std::cerr << "failed to register cuda factory, reason: " << e.what()
+                  << std::endl;
+      }
+    };
+    tryRegisterCuda(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
+    tryRegisterCuda(nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
+    tryRegisterCuda(nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
+  }
+#endif
   // S1.1 GPU-context registration of ReshapedRMSNormLayer is now centralized in
   // CausalLM::registerCustomLayers (shared by all models). The q/k/v_norm +
   // per_layer_projection_norm here still build with engine=GPU; pairs with

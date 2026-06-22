@@ -94,11 +94,17 @@ T unwrap(std::optional<T> &&value, const std::string &error_msg) {
  *         default for backward compatibility while making CPU one env away.
  */
 static std::string causallm_engine() {
-  static const std::string eng =
-    (std::getenv("NNTR_ENGINE") != nullptr &&
-     std::string(std::getenv("NNTR_ENGINE")) == "cpu")
-      ? std::string("cpu")
-      : std::string("gpu");
+  static const std::string eng = []() -> std::string {
+    const char *e = std::getenv("NNTR_ENGINE");
+    if (e != nullptr) {
+      const std::string s(e);
+      if (s == "cpu")
+        return "cpu";
+      if (s == "cuda") // additive NVIDIA CUDA backend (engine=cuda)
+        return "cuda";
+    }
+    return "gpu";
+  }();
   return eng;
 }
 

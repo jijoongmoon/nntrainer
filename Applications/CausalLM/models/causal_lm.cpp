@@ -39,6 +39,10 @@
 
 #include <cl_context.h>
 #include <common.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context.h>
+#endif
 #include <layer_context.h>
 #include <lm_head.h>
 #include <mha_core.h>
@@ -471,6 +475,23 @@ void CausalLM::registerCustomLayers() {
                 << e.what() << std::endl;
     }
   }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Centralized cuda-context registration of ReshapedRMSNormLayer (mirror of
+  // the cl block above). engine=cuda tensors are UVM (host-coherent) and not
+  // isSVM()-flagged, so its forwarding takes the correct host path.
+  auto *cuda_context = static_cast<nntrainer::CudaContext *>(
+    ct_engine.getRegisteredContext("cuda"));
+  if (cuda_context != nullptr) {
+    try {
+      cuda_context->registerFactory(
+        nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    } catch (std::invalid_argument &e) {
+      std::cerr << "failed to register reshaped_rms_norm on cuda ctx: "
+                << e.what() << std::endl;
+    }
+  }
+#endif
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,

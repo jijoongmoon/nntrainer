@@ -17,6 +17,10 @@
 #include <engine.h>
 #include <model.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context.h>
+#endif
+
 #include <llm_util.hpp>
 #include <tokenizers_cpp.h>
 #include <transformer.h>
@@ -587,6 +591,32 @@ void Transformer::registerCustomLayers() {
                 << e.what() << std::endl;
     }
   }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Additive CUDA backend: register the host CausalLM layer classes on the cuda
+  // context too. engine=cuda tensors are Unified Memory (host-coherent), so the
+  // CPU implementations run correctly on them (no cl_mem); GPU kernels are
+  // layered on per-layer later. Guarded by getRegisteredContext("cuda").
+  auto *cuda_context = static_cast<nntrainer::CudaContext *>(
+    ct_engine.getRegisteredContext("cuda"));
+  if (cuda_context != nullptr) {
+    try {
+      cuda_context->registerFactory(
+        nntrainer::createLayer<causallm::SwiGLULayer>);
+      cuda_context->registerFactory(
+        nntrainer::createLayer<causallm::RMSNormLayer>);
+      cuda_context->registerFactory(
+        nntrainer::createLayer<causallm::MHACoreLayer>);
+      cuda_context->registerFactory(
+        nntrainer::createLayer<causallm::TieWordEmbedding>);
+      cuda_context->registerFactory(
+        nntrainer::createLayer<causallm::EmbeddingLayer>);
+    } catch (std::invalid_argument &e) {
+      std::cerr << "failed to register layer on cuda_context: " << e.what()
+                << std::endl;
+    }
+  }
+#endif
 }
 
 } // namespace causallm
