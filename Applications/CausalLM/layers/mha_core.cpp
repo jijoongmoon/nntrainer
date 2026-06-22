@@ -1880,18 +1880,48 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // still-untouched key_step/value_step/query_step (the partial GPU writes
         // into the cache slices get overwritten by the host RoPE; Q is untouched
         // unless every op already succeeded). So Q is never double-rotated.
+        // NNTR_RECQ_DESVM (record/replay de-SVM): write the rotated K / raw V
+        // into the STABLE cache_key/cache_value BASE at a SCALAR row offset
+        // (write_off) instead of the per-token offset-baked b_cache_*_step SVM
+        // slice pointer. The scatters below then read the same stable base at a
+        // SCALAR src_off (see the scatter calls). This is the ONLY change vs the
+        // default path -- the bytes written are identical (same address), but
+        // every per-token-varying input becomes a recordable SCALAR rather than
+        // an un-overridable SVM pointer. key_step/value_step stay unmodified so
+        // the partial-failure host fallback is preserved. Default off => the
+        // offset-baked b_cache_*_step path is byte-identical.
+        static const bool _recq_desvm =
+          std::getenv("NNTR_RECQ_DESVM") != nullptr;
+        const unsigned int kc_woff =
+          (unsigned int)((size_t)batch * cache_key_dim.getFeatureLen() +
+                         (size_t)cache_index * cache_key_dim.width());
+        const unsigned int v_woff =
+          (unsigned int)((size_t)batch * cache_value_dim.getFeatureLen() +
+                         (size_t)cache_index * cache_value_dim.width());
+        uint16_t *cache_key_base =
+          reinterpret_cast<uint16_t *>(cache_key.getData<_FP16>());
+        uint16_t *cache_value_base =
+          reinterpret_cast<uint16_t *>(cache_value.getData<_FP16>());
         // K: rotate key_step -> b_cache_key_step SVM slice (the OHWI scatter
         // source, 2317). cl_mem-in (k_cl) -> SVM-out. key_step left unmodified.
         bool ok = nntrainer::rope_inplace_f16_cl(
-          k_p, kc_p, cos_lut, sin_lut, to - from, num_heads_KV, head_dim,
-          cache_index, mp, kc_svm, /*in_clmem=*/k_cl, /*out_clmem=*/nullptr,
-          /*drain_svm_out=*/false);
+          k_p, _recq_desvm ? cache_key_base : kc_p, cos_lut, sin_lut, to - from,
+          num_heads_KV, head_dim, cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
+          /*out_clmem=*/nullptr, /*drain_svm_out=*/false,
+          /*write_off=*/_recq_desvm ? kc_woff : 0u);
         // V: flat copy value_step -> b_cache_value_step SVM slice (no RoPE, the
         // OHWI v-scatter source, 2326). value_step left unmodified.
-        if (ok)
-          ok = nntrainer::gpu_copy_f16_cl(v_in, v_out, kv_n, v_svm,
-                                          /*in_clmem=*/v_cl, /*out_clmem=*/nullptr,
-                                          /*drain=*/false);
+        if (ok) {
+          if (_recq_desvm)
+            ok = nntrainer::gpu_copy_f16_row_cl(
+              v_in, cache_value_base, kv_n, (int)v_woff, v_svm,
+              /*in_clmem=*/v_cl, /*out_base_clmem=*/nullptr, /*drain=*/false);
+          else
+            ok = nntrainer::gpu_copy_f16_cl(v_in, v_out, kv_n, v_svm,
+                                            /*in_clmem=*/v_cl,
+                                            /*out_clmem=*/nullptr,
+                                            /*drain=*/false);
+        }
         // Q LAST: in-place into the SVM shadow (the OHWI decode qk reads Q_p
         // with q_clmem=null, 2340). cl_mem-in -> SVM-out when the FC parked Q in
         // cl_mem. Only run once K+V are committed so a Q failure cannot leave a
@@ -2442,21 +2472,41 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // RoPE/copy wrote. In-order queue (NNTR_GPU_SVM_POOL) keeps
             // RoPE -> scatter -> attention ordered with no explicit sync.
             const double _kvst_t1 = _kvst_on() ? _kvst_now() : 0;
+            // NNTR_RECQ_DESVM (decode only): read the scatter SOURCE from the
+            // STABLE cache_key/cache_value BASE at a SCALAR src_off (= the same
+            // address as b_cache_*_step, so byte-identical) so a recorded decode
+            // scatter can replay with src_off overridden per token. Must match
+            // the rope/copy write_off above (both keyed on cache_index).
+            static const bool _recq_desvm_scat =
+              std::getenv("NNTR_RECQ_DESVM") != nullptr;
+            const bool _recq_kv = _recq_desvm_scat && step_size == 1;
+            const unsigned int kc_soff =
+              (unsigned int)((size_t)batch * cache_key_dim.getFeatureLen() +
+                             (size_t)cache_index * cache_key_dim.width());
+            const unsigned int v_soff =
+              (unsigned int)((size_t)batch * cache_value_dim.getFeatureLen() +
+                             (size_t)cache_index * cache_value_dim.width());
             nntrainer::k_scatter_ohwi_cl(
-              reinterpret_cast<const uint16_t *>(
-                b_cache_key_step.getData<_FP16>()),
+              _recq_kv ? reinterpret_cast<const uint16_t *>(
+                           cache_key.getData<_FP16>())
+                       : reinterpret_cast<const uint16_t *>(
+                           b_cache_key_step.getData<_FP16>()),
               reinterpret_cast<cl_mem>(k_buf_ohwi), step_size, num_heads_KV,
-              head_dim, kv_mirror_S_max, cache_from, /*src_clmem=*/k_stage);
+              head_dim, kv_mirror_S_max, cache_from, /*src_clmem=*/k_stage,
+              /*src_off=*/_recq_kv ? kc_soff : 0u);
             kv_k_valid_to = cache_to;
             const double _kvst_tk = _kvst_on() ? _kvst_now() : 0;
             nntrainer::v_scatter_ohwi_t_cl(
-              v_stage_svm != nullptr
-                ? v_stage_svm
-                : reinterpret_cast<const uint16_t *>(
-                    b_cache_value_step.getData<_FP16>()),
+              _recq_kv ? reinterpret_cast<const uint16_t *>(
+                           cache_value.getData<_FP16>())
+                       : (v_stage_svm != nullptr
+                            ? v_stage_svm
+                            : reinterpret_cast<const uint16_t *>(
+                                b_cache_value_step.getData<_FP16>())),
               reinterpret_cast<cl_mem>(v_buf_ohwi), step_size, num_heads_KV,
               head_dim, v_stride, cache_from,
-              /*src_clmem=*/v_stage_clmem);
+              /*src_clmem=*/_recq_kv ? nullptr : v_stage_clmem,
+              /*src_off=*/_recq_kv ? v_soff : 0u);
             kv_v_valid_to = cache_to;
             const double _kvst_tv = _kvst_on() ? _kvst_now() : 0;
             // S3 decode: OHWI rotates Q on the HOST (query_step SVM, in-place);

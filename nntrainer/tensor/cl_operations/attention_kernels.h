@@ -129,13 +129,17 @@ bool two_conv_attention_prefill_f16_cl(const uint16_t *Q_host,
 /// rotated output is a same-queue GPU kernel (the staged image-attention
 /// chain; its non-image fallbacks drain separately before reading) -- the
 /// per-call drain measured 19ms of GPU idle per 1K prefill (rope->rope).
+/// write_off (recq de-SVM): when nonzero, the rotated output is written to
+/// out[write_off + ..] so the K rotation can target a STABLE base handle
+/// (cache_key) at a SCALAR per-token row offset (recordable) instead of an
+/// offset-baked SVM slice pointer. Default 0 == byte-identical.
 bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
                          const uint16_t *cos_lut, const uint16_t *sin_lut,
                          unsigned int M, unsigned int num_heads,
                          unsigned int head_dim, unsigned int start_pos,
                          unsigned int max_positions, bool svm_inputs = false,
                          void *in_clmem = nullptr, void *out_clmem = nullptr,
-                         bool drain_svm_out = true);
+                         bool drain_svm_out = true, unsigned int write_off = 0);
 
 /// SVM-direct flat FP16 copy (out[i] = in[i], i in [0, N)). Used to scatter a
 /// V projection slice into its KV-cache window on the device without a host
@@ -411,10 +415,15 @@ bool create_ohwi_v_image_view(void *v_buf, unsigned int num_heads_KV,
  *        cl_mem staging temp instead of the SVM pointer (kernel-chain path —
  *        no host drain needed between the producer kernel and this scatter).
  */
+/// src_off (recq de-SVM): when nonzero, the current token's rotated K is read
+/// from src[src_off + ..] so the scatter SOURCE can be a STABLE base handle
+/// (cache_key) at a SCALAR per-token row offset (recordable) instead of an
+/// offset-baked SVM slice pointer. `position` still offsets only the DEST
+/// mirror row. Default 0 == byte-identical (src points at the token).
 bool k_scatter_ohwi_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M,
                        unsigned int num_heads_KV, unsigned int head_dim,
                        unsigned int max_S, unsigned int position,
-                       void *src_clmem = nullptr);
+                       void *src_clmem = nullptr, unsigned int src_off = 0);
 
 /**
  * @brief Scatter this step's V (SVM concat [M, hKV, d]) into the reversed-OHWI
@@ -424,7 +433,7 @@ bool k_scatter_ohwi_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M,
 bool v_scatter_ohwi_t_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M,
                          unsigned int num_heads_KV, unsigned int head_dim,
                          unsigned int max_S, unsigned int position,
-                         void *src_clmem = nullptr);
+                         void *src_clmem = nullptr, unsigned int src_off = 0);
 
 } // namespace nntrainer
 #endif /* __ATTENTION_KERNELS_H__ */

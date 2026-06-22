@@ -777,7 +777,12 @@ __kernel void rope_inplace_f16(__global const half *in,
                                __global const half *cos_lut,
                                __global const half *sin_lut,
                                const int M, const int num_heads,
-                               const int half_d, const int start_pos) {
+                               const int half_d, const int start_pos,
+                               const int write_off) {
+  // write_off (recq de-SVM): when writing the rotated K into a STABLE base
+  // (cache_key) instead of an offset-baked slice pointer, out[write_off + ..]
+  // addresses the per-token row via a SCALAR (recordable) instead of an SVM
+  // pointer. Default 0 == in-place / offset-baked-out behaviour (byte-identical).
   int t = get_global_id(0);
   int h = get_global_id(1);
   int k = get_global_id(2);
@@ -788,8 +793,8 @@ __kernel void rope_inplace_f16(__global const half *in,
   half s = sin_lut[lut];
   half lo = in[row + k];
   half hi = in[row + k + half_d];
-  out[row + k]          = lo * c - hi * s;
-  out[row + k + half_d] = hi * c + lo * s;
+  out[write_off + row + k]          = lo * c - hi * s;
+  out[write_off + row + k + half_d] = hi * c + lo * s;
 }
 __kernel void scatter_copy_f16(__global const half *in, __global half *out,
                                const int N) {
@@ -812,26 +817,34 @@ __kernel void scatter_copy_f16_row(__global const half *in, __global half *out,
 // gpu_native k_scatter_ohwi.
 __kernel void k_scatter_ohwi(__global const half *src, __global half *dst,
                              const int M, const int hKV, const int d,
-                             const int max_S, const int position) {
+                             const int max_S, const int position,
+                             const int src_off) {
+  // src_off (recq de-SVM): read the current token's rotated K from a STABLE
+  // base (cache_key) at a SCALAR row offset instead of a per-token slice
+  // pointer. Default 0 == src already points at the token (byte-identical).
   int t = get_global_id(0);
   int h = get_global_id(1);
   int x = get_global_id(2);
   if (t >= M || h >= hKV || x >= d) return;
   dst[(long)h * max_S * d + (long)(position + t) * d + x] =
-    src[(long)t * hKV * d + (long)h * d + x];
+    src[(long)src_off + (long)t * hKV * d + (long)h * d + x];
 }
 // OHWI-transposed V scatter: src concat [t, hKV, d] -> dst reversed-OHWI
 // [hKV, d, max_S] at (position+t). Feeds the V image2d view
 // (sv_matmul_f16_ohwi_img). Mirrors gpu_native v_scatter_ohwi_t.
 __kernel void v_scatter_ohwi_t(__global const half *src, __global half *dst,
                                const int M, const int hKV, const int d,
-                               const int max_S, const int position) {
+                               const int max_S, const int position,
+                               const int src_off) {
+  // src_off (recq de-SVM): read the current token's V from a STABLE base
+  // (cache_value) at a SCALAR row offset instead of a per-token slice pointer.
+  // `position` still offsets only the DEST column. Default 0 == byte-identical.
   int t = get_global_id(0);
   int h = get_global_id(1);
   int x = get_global_id(2);
   if (t >= M || h >= hKV || x >= d) return;
   dst[(long)h * d * max_S + (long)x * max_S + position + t] =
-    src[(long)t * hKV * d + (long)h * d + x];
+    src[(long)src_off + (long)t * hKV * d + (long)h * d + x];
 }
 // Inverse gathers (mirror -> concat SVM cache slice): the NNTR_MHA_CLMEM
 // mode promotes the OHWI mirrors to the PRIMARY prefill store (no SVM
@@ -900,7 +913,7 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
                          unsigned int head_dim, unsigned int start_pos,
                          unsigned int max_positions, bool svm_inputs,
                          void *in_clmem, void *out_clmem,
-                         bool drain_svm_out) {
+                         bool drain_svm_out, unsigned int write_off) {
   if (M == 0 || num_heads == 0 || head_dim == 0 || (head_dim & 1u))
     return false;
   if (in == nullptr || out == nullptr || cos_lut == nullptr ||
@@ -1004,10 +1017,12 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
     return false;
 
   int Mi = (int)M, nh = (int)num_heads, hd = half_d, sp = (int)start_pos;
+  int woff = (int)write_off;
   if (!kp->SetKernelArguments(4, &Mi, sizeof(int)) ||
       !kp->SetKernelArguments(5, &nh, sizeof(int)) ||
       !kp->SetKernelArguments(6, &hd, sizeof(int)) ||
-      !kp->SetKernelArguments(7, &sp, sizeof(int)))
+      !kp->SetKernelArguments(7, &sp, sizeof(int)) ||
+      !kp->SetKernelArguments(8, &woff, sizeof(int)))
     return false;
 
   constexpr size_t LWS_K = 64;
@@ -1320,7 +1335,7 @@ bool create_ohwi_v_image_view(void *v_buf, unsigned int num_heads_KV,
 bool k_scatter_ohwi_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M,
                        unsigned int num_heads_KV, unsigned int head_dim,
                        unsigned int max_S, unsigned int position,
-                       void *src_clmem) {
+                       void *src_clmem, unsigned int src_off) {
   if (M == 0 || num_heads_KV == 0 || head_dim == 0)
     return false;
   auto *blas_cc =
@@ -1330,7 +1345,7 @@ bool k_scatter_ohwi_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M,
   if (!kp)
     return false;
   int Mi = (int)M, hKVi = (int)num_heads_KV, di = (int)head_dim,
-      maxSi = (int)max_S, posi = (int)position;
+      maxSi = (int)max_S, posi = (int)position, soff = (int)src_off;
   bool ok0;
   if (src_clmem != nullptr) {
     cl_mem sh = static_cast<cl_mem>(src_clmem);
@@ -1344,7 +1359,8 @@ bool k_scatter_ohwi_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M,
       !kp->SetKernelArguments(3, &hKVi, sizeof(int)) ||
       !kp->SetKernelArguments(4, &di, sizeof(int)) ||
       !kp->SetKernelArguments(5, &maxSi, sizeof(int)) ||
-      !kp->SetKernelArguments(6, &posi, sizeof(int)))
+      !kp->SetKernelArguments(6, &posi, sizeof(int)) ||
+      !kp->SetKernelArguments(7, &soff, sizeof(int)))
     return false;
   constexpr size_t LWS_Z = 64;
   std::array<size_t, 3> gws = {(size_t)M, (size_t)num_heads_KV,
@@ -1360,7 +1376,7 @@ bool k_scatter_ohwi_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M,
 bool v_scatter_ohwi_t_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M,
                          unsigned int num_heads_KV, unsigned int head_dim,
                          unsigned int max_S, unsigned int position,
-                         void *src_clmem) {
+                         void *src_clmem, unsigned int src_off) {
   if (M == 0 || num_heads_KV == 0 || head_dim == 0)
     return false;
   auto *blas_cc =
@@ -1370,7 +1386,7 @@ bool v_scatter_ohwi_t_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M
   if (!kp)
     return false;
   int Mi = (int)M, hKVi = (int)num_heads_KV, di = (int)head_dim,
-      maxSi = (int)max_S, posi = (int)position;
+      maxSi = (int)max_S, posi = (int)position, soff = (int)src_off;
   bool ok0;
   if (src_clmem != nullptr) {
     cl_mem sh = static_cast<cl_mem>(src_clmem);
@@ -1384,7 +1400,8 @@ bool v_scatter_ohwi_t_cl(const uint16_t *src_svm, cl_mem dst_buf, unsigned int M
       !kp->SetKernelArguments(3, &hKVi, sizeof(int)) ||
       !kp->SetKernelArguments(4, &di, sizeof(int)) ||
       !kp->SetKernelArguments(5, &maxSi, sizeof(int)) ||
-      !kp->SetKernelArguments(6, &posi, sizeof(int)))
+      !kp->SetKernelArguments(6, &posi, sizeof(int)) ||
+      !kp->SetKernelArguments(7, &soff, sizeof(int)))
     return false;
   constexpr size_t LWS_Z = 64;
   std::array<size_t, 3> gws = {(size_t)M, (size_t)num_heads_KV,
