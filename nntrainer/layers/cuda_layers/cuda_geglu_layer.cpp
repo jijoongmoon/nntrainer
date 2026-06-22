@@ -13,10 +13,16 @@
 #include <cuda_geglu_layer.h>
 
 #include <cmath>
+#include <cstdlib>
 
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#endif
 
 namespace nntrainer {
 
@@ -48,6 +54,27 @@ void CudaGeGLULayer::gegluProcess(const Tensor &in1, const Tensor &in2,
   const unsigned int dim2 = in1.width();
   const size_t n = (size_t)rows * dim2;
   const auto dt = in1.getDataType();
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  // GPU geglu (device-resident fp16): one kernel instead of the host loop, so
+  // the FFN/PLE activation stays on the device. Opt-in (NNTR_CUDA_GEGLU) until
+  // the whole decode chain is on-GPU. NNTR_CUDA_ASYNC governs the drain.
+  if (dt == ml::train::TensorDim::DataType::FP16) {
+    static const bool gpu = std::getenv("NNTR_CUDA_GEGLU") != nullptr;
+    if (gpu && n > 0) {
+      auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>());
+      auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>());
+      auto *o = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+      cudaPointerAttributes pa{};
+      bool dev = cudaPointerGetAttributes(&pa, a) == cudaSuccess &&
+                 (pa.type == cudaMemoryTypeManaged ||
+                  pa.type == cudaMemoryTypeDevice);
+      cudaGetLastError();
+      if (dev && cuda::cuda_geglu_fp16(a, b, o, (unsigned int)n))
+        return;
+    }
+  }
+#endif
 
   if (dt == ml::train::TensorDim::DataType::FP32) {
     const float *a = in1.getData<float>();

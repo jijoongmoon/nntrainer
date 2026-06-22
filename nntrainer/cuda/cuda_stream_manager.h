@@ -61,6 +61,16 @@ public:
   void finish();
 
   /**
+   * @brief Conditional drain: finish() unless NNTR_CUDA_ASYNC=1. Per-op
+   *        cudaStreamSynchronize is ~90% of decode wall time (it serializes
+   *        CPU/GPU); once every decode op is on-GPU (no host op reads UVM
+   *        mid-chain), NNTR_CUDA_ASYNC=1 turns these into no-ops so the GPU
+   *        pipeline fills and only the final host read (sampling) drains once
+   *        per token. Until then, default (sync) keeps coherence.
+   */
+  void maybeFinish();
+
+  /**
    * @brief Destroy the stream
    */
   ~StreamManager() override;

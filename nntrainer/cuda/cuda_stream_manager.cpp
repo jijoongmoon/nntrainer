@@ -15,6 +15,8 @@
 #include "cuda_context_manager.h"
 #include "cuda_kernel.h"
 
+#include <cstdlib>
+
 namespace nntrainer::cuda {
 
 void StreamManager::initialize() noexcept {
@@ -66,6 +68,15 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
 void StreamManager::finish() {
   if (stream_)
     cudaStreamSynchronize(stream_);
+}
+
+void StreamManager::maybeFinish() {
+  static const bool async = []() {
+    const char *e = std::getenv("NNTR_CUDA_ASYNC");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (!async)
+    finish();
 }
 
 StreamManager::~StreamManager() {

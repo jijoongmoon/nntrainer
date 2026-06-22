@@ -10,8 +10,14 @@
  * @brief  Selects per-layer input chunk from packed per-layer embedding tensor.
  */
 
+#include <cstdlib>
 #include <cstring>
 #include <per_layer_slice.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#endif
 
 namespace causallm {
 
@@ -78,10 +84,27 @@ void PerLayerSliceLayer::incremental_forwarding(
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       _FP16 *in_data = in_step.getData<_FP16>();
       _FP16 *out_data = out_step.getData<_FP16>();
-      for (unsigned int t = 0; t < tokens; ++t)
-        std::memcpy(out_data + t * feature_size,
-                    in_data + t * W + layer_index * feature_size,
-                    sizeof(_FP16) * feature_size);
+      bool done = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      static const bool gpu = std::getenv("NNTR_CUDA_ELTWISE") != nullptr;
+      if (gpu) {
+        cudaPointerAttributes pa{};
+        bool dev = cudaPointerGetAttributes(&pa, in_data) == cudaSuccess &&
+                   (pa.type == cudaMemoryTypeManaged ||
+                    pa.type == cudaMemoryTypeDevice);
+        cudaGetLastError();
+        if (dev && nntrainer::cuda::cuda_slice_copy_fp16(
+                     reinterpret_cast<const unsigned short *>(in_data),
+                     reinterpret_cast<unsigned short *>(out_data), tokens, W,
+                     layer_index * feature_size, feature_size))
+          done = true;
+      }
+#endif
+      if (!done)
+        for (unsigned int t = 0; t < tokens; ++t)
+          std::memcpy(out_data + t * feature_size,
+                      in_data + t * W + layer_index * feature_size,
+                      sizeof(_FP16) * feature_size);
     } else
 #endif
     {
