@@ -19,10 +19,33 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 
 namespace nntrainer::cuda {
+
+// Per-op cudaStreamSynchronize is ~90% of inference wall time (nsys): each GPU
+// op drains the stream, fully serializing CPU and GPU. This drain is a sync
+// point hook for the future selective-sync work (sync only before a HOST
+// consumer reads a UVM output, not after every FC).
+//
+// NNTR_CUDA_ASYNC=1 drops the drains -- EXPERIMENTAL/UNSAFE: it makes decode
+// ~40% faster but produces GARBAGE, because the host ops between FCs (RoPE,
+// attention, geglu) then read UVM the GPU is still writing -- the
+// concurrentManagedAccess page-fault does NOT order a host read against an
+// in-flight kernel write. The coherent path to that speedup is to move those
+// decode host ops onto the GPU too (GPU RoPE/geglu, the GPU attention exists)
+// so the whole decode step is one ordered GPU chain drained once per token.
+// Default (sync) is coherent.
+static inline void maybe_finish() {
+  static const bool async = []() {
+    const char *e = std::getenv("NNTR_CUDA_ASYNC");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (!async)
+    StreamManager::Global().finish();
+}
 
 // One thread per output element Y[m,n]; loops K reading the int4 weight at the
 // row-major [K,N] linear index i = k*N + n, dequantizing inline (even i = high
@@ -152,7 +175,7 @@ bool cuda_fc_qint4_sectionA_gemm_fp32(const float *X,
   const int grid[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  StreamManager::Global().finish();
+  maybe_finish();
   return true;
 }
 
@@ -720,7 +743,7 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
     return false;
   if (!dp4a_repack_and_gemm(section_a, scales_fp16, Y, M, N, K))
     return false;
-  StreamManager::Global().finish();
+  maybe_finish();
   return true;
 }
 
@@ -768,7 +791,7 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
   const int cg[3] = {((int)yn + 255) / 256, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kc, cg, cb))
     return false;
-  StreamManager::Global().finish();
+  maybe_finish();
   return true;
 }
 
@@ -811,7 +834,7 @@ bool cuda_fc_qint4_sectionA_gemm_fp16_naive(const unsigned short *Xh,
   const int yg[3] = {((int)yn + 255) / 256, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kf2h, yg, cb))
     return false;
-  StreamManager::Global().finish();
+  maybe_finish();
   return true;
 }
 
@@ -843,7 +866,7 @@ bool cuda_fc_qint4_gemm_fp32(const float *X, const unsigned char *nibbles,
   const int grid[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  StreamManager::Global().finish();
+  maybe_finish();
   return true;
 }
 
