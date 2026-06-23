@@ -135,8 +135,17 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // device memory (not host-addressable). Dequant into a host staging buffer
     // and push it H2D on the backend stream -- the CUDA mirror of the
     // clmem_raise_cl device-upload OpenCL already does below.
+    // Persistent + PINNED host staging (was a local std::vector). Under
+    // CUDA-graph stream capture a local vector fails twice: (a) a pageable
+    // cudaMemcpyAsync is NOT capturable, and (b) the vector is freed when this
+    // function returns, but the captured graph REPLAYS afterwards -- it would
+    // copy from freed memory => garbage. A process-lifetime pinned (cudaHostAlloc)
+    // buffer is capturable and survives the replay. Grows monotonically (decode
+    // iter==1; prefill iter<=max_seq_len); single sequence (b_size==1) so one
+    // shared buffer per layer is sufficient.
+    static _FP16 *emb_stage = nullptr;
+    static size_t emb_stage_cap = 0; // capacity in _FP16 elements
     bool emb_dev_only = false;
-    std::vector<_FP16> emb_stage;
     if (hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
       cudaPointerAttributes pa{};
       emb_dev_only =
@@ -144,8 +153,16 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           cudaSuccess &&
         pa.type == cudaMemoryTypeDevice;
       cudaGetLastError();
-      if (emb_dev_only)
-        emb_stage.resize((size_t)iter * out_dim);
+      if (emb_dev_only) {
+        size_t need = (size_t)iter * out_dim;
+        if (need > emb_stage_cap) {
+          if (emb_stage)
+            cudaFreeHost(emb_stage);
+          cudaHostAlloc((void **)&emb_stage, need * sizeof(_FP16),
+                        cudaHostAllocDefault);
+          emb_stage_cap = need;
+        }
+      }
     }
 #endif
 
@@ -189,7 +206,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 #ifdef ENABLE_FP16
           _FP16 *o =
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-            emb_dev_only ? (emb_stage.data() + (size_t)i * out_dim) :
+            emb_dev_only ? (emb_stage + (size_t)i * out_dim) :
 #endif
                          out_tensor.getData<_FP16>();
           for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
@@ -211,7 +228,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         const float *src = cur_weight.getData<float>();
         _FP16 *o =
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          emb_dev_only ? (emb_stage.data() + (size_t)i * out_dim) :
+          emb_dev_only ? (emb_stage + (size_t)i * out_dim) :
 #endif
                        out_tensor.getData<_FP16>();
         for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
@@ -231,7 +248,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // CUDA mirror of clmem_raise_cl: push the host-dequantized PLE rows into the
     // device-only output on the backend stream (ordered before the GPU consumer).
     if (emb_dev_only)
-      cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage.data(),
+      cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
                       (size_t)iter * out_dim * sizeof(_FP16),
                       cudaMemcpyHostToDevice,
                       nntrainer::cuda::StreamManager::Global().GetStream());

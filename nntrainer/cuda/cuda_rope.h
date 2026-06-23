@@ -40,6 +40,20 @@ bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
                     const unsigned short *cos_lut, const unsigned short *sin_lut,
                     int num_heads, int head_dim, int num_rows, int from);
 
+/**
+ * @brief M2-B variant of cuda_rope_fp16: the RoPE position `from` is read from
+ *        the device cuda_pos_buffer() ([0]) instead of a baked int, so a captured
+ *        CUDA graph stays valid across decode tokens. When @p out_slot_dpos != 0,
+ *        each input row is written to OUTPUT row (from + row) -- pass @p out as the
+ *        cache BASE pointer for the K-into-cache write so the slot is computed
+ *        on-device from the live position. out_slot_dpos == 0 keeps row-relative
+ *        output (query, in-place). Same math as cuda_rope_fp16.
+ */
+bool cuda_rope_fp16_dpos(const unsigned short *in, unsigned short *out,
+                         const unsigned short *cos_lut,
+                         const unsigned short *sin_lut, int num_heads,
+                         int head_dim, int num_rows, int out_slot_dpos);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_ROPE_H__

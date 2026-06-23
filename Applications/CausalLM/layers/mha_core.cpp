@@ -2211,10 +2211,25 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 rope_lut_device(cached_freqs_cos_fp16, half);
               const unsigned short *sind =
                 rope_lut_device(cached_freqs_sin_fp16, half);
-              if (cosd && sind)
-                q_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
-                  q, q, cosd, sind, query_step.width() / head_dim, head_dim,
-                  (int)nrows, (int)cache_index);
+              if (cosd && sind) {
+                // M2-B: read the RoPE position from the device d_pos buffer so a
+                // captured decode graph stays valid across tokens. Set d_pos here
+                // only when NOT capturing (non-graph decode); under capture the
+                // neuralnet scaffold sets it once per token before the replay.
+                static const bool m2b = std::getenv("NNTR_CUDA_M2B") != nullptr;
+                if (m2b) {
+                  if (!nntrainer::cuda::StreamManager::Global().isCapturing())
+                    nntrainer::cuda::cuda_set_pos((int)cache_index,
+                                                  (int)cache_index + 1);
+                  q_rope_gpu = nntrainer::cuda::cuda_rope_fp16_dpos(
+                    q, q, cosd, sind, query_step.width() / head_dim, head_dim,
+                    (int)nrows, /*out_slot_dpos=*/0);
+                } else {
+                  q_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
+                    q, q, cosd, sind, query_step.width() / head_dim, head_dim,
+                    (int)nrows, (int)cache_index);
+                }
+              }
             }
           }
         }
@@ -2282,10 +2297,23 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 rope_lut_device(cached_freqs_cos_fp16, half);
               const unsigned short *sind =
                 rope_lut_device(cached_freqs_sin_fp16, half);
-              if (cosd && sind)
+              static const bool m2b_k = std::getenv("NNTR_CUDA_M2B") != nullptr;
+              if (cosd && sind && m2b_k) {
+                // M2-B: write RoPE'd K into the cache at the live slot computed
+                // on-device from d_pos[0] (kbase = cache BASE for this batch, not
+                // the host pre-offset b_cache_key_step) -> correct slot on replay.
+                unsigned short *kbase =
+                  reinterpret_cast<unsigned short *>(
+                    cache_key.getData<_FP16>()) +
+                  (size_t)batch * cache_key_dim.getFeatureLen();
+                k_rope_gpu = nntrainer::cuda::cuda_rope_fp16_dpos(
+                  kin, kbase, cosd, sind, key_step.width() / head_dim, head_dim,
+                  (int)knrows, /*out_slot_dpos=*/1);
+              } else if (cosd && sind) {
                 k_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
                   kin, kout, cosd, sind, key_step.width() / head_dim, head_dim,
                   (int)knrows, (int)cache_index);
+              }
             }
           }
         }
@@ -2329,11 +2357,24 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                      (pa.type == cudaMemoryTypeManaged ||
                       pa.type == cudaMemoryTypeDevice);
           cudaGetLastError();
-          if (cuda_elt && dev &&
-              (value_step.height() == 1 || vcopy_prefill) &&
-              nntrainer::cuda::cuda_scalar_mul_fp16(
-                vin, vout, (unsigned int)value_step.size(), 1.0f))
-            v_copy_gpu = true;
+          static const bool m2b_v = std::getenv("NNTR_CUDA_M2B") != nullptr;
+          if (cuda_elt && dev && (value_step.height() == 1 || vcopy_prefill)) {
+            if (m2b_v) {
+              // M2-B: write V into the cache at the live slot d_pos[0] computed
+              // on-device (vbase = cache BASE for this batch) -> correct on replay.
+              unsigned short *vbase =
+                reinterpret_cast<unsigned short *>(
+                  cache_value.getData<_FP16>()) +
+                (size_t)batch * cache_value_dim.getFeatureLen();
+              if (nntrainer::cuda::cuda_scalar_mul_fp16_slot(
+                    vin, vbase, (unsigned int)value_step.size(), 1.0f,
+                    (int)cache_value_dim.width()))
+                v_copy_gpu = true;
+            } else if (nntrainer::cuda::cuda_scalar_mul_fp16(
+                         vin, vout, (unsigned int)value_step.size(), 1.0f)) {
+              v_copy_gpu = true;
+            }
+          }
         }
 #endif
         if (!v_copy_gpu) {

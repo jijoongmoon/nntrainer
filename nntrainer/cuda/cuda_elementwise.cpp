@@ -66,6 +66,16 @@ __global__ void scalar_mul_fp16(const unsigned short *in, unsigned short *out,
   if (i >= n) return;
   out[i] = ew_f2h(ew_h2f(in[i]) * scalar);
 }
+// M2-B V-copy: write into the KV cache at the live slot d_pos[0] computed
+// on-device (out_base is the cache BASE, width = per-row element count), so a
+// captured graph writes V to the correct (new-token) slot on every replay.
+__global__ void scalar_mul_fp16_slot(const unsigned short *in,
+                                     unsigned short *out_base, int n, float scalar,
+                                     const int *d_pos, int width) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out_base[(long)d_pos[0] * width + i] = ew_f2h(ew_h2f(in[i]) * scalar);
+}
 __global__ void slice_copy_fp16(const unsigned short *in, unsigned short *out,
                                 int rows, int in_width, int layer_off, int fs) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -140,6 +150,28 @@ bool cuda_scalar_mul_fp16(const unsigned short *in, unsigned short *out,
   k->SetKernelArguments(1, &out, sizeof(out));
   k->SetKernelArguments(2, &ni, sizeof(ni));
   k->SetKernelArguments(3, &scalar, sizeof(scalar));
+  return dispatch1d(k, n);
+}
+
+bool cuda_scalar_mul_fp16_slot(const unsigned short *in,
+                               unsigned short *out_base, unsigned int n,
+                               float scalar, int width) {
+  if (n == 0)
+    return true;
+  auto k = CudaContext::Global().registerCudaKernel(ELTWISE_SRC,
+                                                    "scalar_mul_fp16_slot");
+  if (!k) {
+    ml_loge("[CUDA] scalar_mul_fp16_slot: registration failed");
+    return false;
+  }
+  int ni = (int)n;
+  const int *d_pos = cuda_pos_buffer();
+  k->SetKernelArguments(0, &in, sizeof(in));
+  k->SetKernelArguments(1, &out_base, sizeof(out_base));
+  k->SetKernelArguments(2, &ni, sizeof(ni));
+  k->SetKernelArguments(3, &scalar, sizeof(scalar));
+  k->SetKernelArguments(4, &d_pos, sizeof(d_pos));
+  k->SetKernelArguments(5, &width, sizeof(width));
   return dispatch1d(k, n);
 }
 

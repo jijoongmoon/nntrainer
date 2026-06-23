@@ -69,6 +69,17 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                      int cache_from, int head_dim, int window,
                                      float softcap);
 
+/**
+ * @brief Pre-grow the split-KV decode scratch buffers to the model's max decode
+ *        capacity at load, so the M=1 flash-decode path never cudaMalloc/Frees
+ *        during a CUDA-graph stream capture (which would invalidate the graph).
+ * @param max_seq_len max KV length (=> max chunks at NNTR_CUDA_FLASH_DECODE size)
+ * @param max_hq      max number of query heads across attention layers
+ * @param max_head_dim max head_dim across layers (gemma4: global 512 vs 256)
+ */
+bool cuda_attention_splitkv_prewarm(int max_seq_len, int max_hq,
+                                    int max_head_dim);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_ATTENTION_H__

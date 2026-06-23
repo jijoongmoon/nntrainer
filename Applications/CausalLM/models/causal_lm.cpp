@@ -55,6 +55,7 @@
 #include <recq_overrides.h> // R3/R4 record/replay override registry + CL types
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_attention.h>
 #include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
@@ -777,6 +778,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
           }
         };
       model->forEachLayer(fn, nullptr);
+      // Pre-grow the split-KV decode scratch so the M=1 flash-decode path never
+      // cudaMallocs inside a CUDA-graph capture (NNTR_CUDA_GRAPH). 2*HEAD_DIM
+      // covers gemma4's global-attention head_dim (512 vs base 256); over-
+      // allocation is a few hundred KB. ensure_sk's isCapturing() guard is the
+      // safety net if a model exceeds these bounds.
+      nntrainer::cuda::cuda_attention_splitkv_prewarm(
+        static_cast<int>(MAX_SEQ_LEN), NUM_HEADS, 2 * HEAD_DIM);
       start_prefill = std::chrono::high_resolution_clock::now();
     }
   }

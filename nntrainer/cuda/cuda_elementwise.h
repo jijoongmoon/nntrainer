@@ -29,6 +29,16 @@ bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
 bool cuda_scalar_mul_fp16(const unsigned short *in, unsigned short *out,
                           unsigned int n, float scalar);
 
+/**
+ * @brief M2-B KV V-copy: out_base[d_pos[0]*width + i] = scalar * in[i], with the
+ *        cache slot read from the device cuda_pos_buffer() so a captured graph
+ *        writes V to the live (new-token) slot on every replay. @p out_base is
+ *        the cache BASE (batch) pointer; @p width is the per-row element count.
+ */
+bool cuda_scalar_mul_fp16_slot(const unsigned short *in,
+                               unsigned short *out_base, unsigned int n,
+                               float scalar, int width);
+
 /** @brief out[i] = cap * tanh(in[i] / cap) -- final logit softcapping */
 bool cuda_softcap_fp16(const unsigned short *in, unsigned short *out,
                        unsigned int n, float cap);

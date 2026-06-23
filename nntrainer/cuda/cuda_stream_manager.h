@@ -123,6 +123,23 @@ private:
   bool capturing_{false};
 };
 
+/**
+ * @brief Process-lifetime device int[2] holding the per-token DECODE position:
+ *        [0] = pos (== cache_index / RoPE `from`), [1] = N_kv (== pos+1). The
+ *        M2-B single-capture decode graph bakes this FIXED device pointer into
+ *        its RoPE / attention / KV-write kernel nodes, so cross-token replay only
+ *        rewrites these 8 bytes (cuda_set_pos) instead of re-recording the graph.
+ *        Allocated once on first use.
+ */
+int *cuda_pos_buffer();
+
+/**
+ * @brief Update the per-token decode position (8-byte H2D on the backend stream,
+ *        issued OUTSIDE graph capture, ordered before the cudaGraphLaunch that
+ *        reads it). pos == cache_index for the token; n_kv == pos+1.
+ */
+void cuda_set_pos(int pos, int n_kv);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_STREAM_MANAGER_H__

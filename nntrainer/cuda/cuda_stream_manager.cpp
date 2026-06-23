@@ -119,4 +119,32 @@ StreamManager::~StreamManager() {
   }
 }
 
+int *cuda_pos_buffer() {
+  static int *g_pos_dev = []() -> int * {
+    int *p = nullptr;
+    cudaMalloc((void **)&p, 2 * sizeof(int));
+    return p;
+  }();
+  return g_pos_dev;
+}
+
+void cuda_set_pos(int pos, int n_kv) {
+  // Pinned host source so the H2D is a real async DMA (also keeps it capturable
+  // should it ever be issued inside a capture). The copy is on the backend
+  // stream, so it is ordered before a subsequent cudaGraphLaunch on the same
+  // stream -- the replayed kernels read the fresh pos.
+  static int *g_pos_host = []() -> int * {
+    int *p = nullptr;
+    cudaHostAlloc((void **)&p, 2 * sizeof(int), cudaHostAllocDefault);
+    return p;
+  }();
+  int *d = cuda_pos_buffer();
+  if (!d || !g_pos_host)
+    return;
+  g_pos_host[0] = pos;
+  g_pos_host[1] = n_kv;
+  cudaMemcpyAsync(d, g_pos_host, 2 * sizeof(int), cudaMemcpyHostToDevice,
+                  StreamManager::Global().GetStream());
+}
+
 } // namespace nntrainer::cuda

@@ -138,8 +138,14 @@ __device__ __forceinline__ unsigned short a_f2h(float f) {
 __global__ void attn_core_il_fp16(const unsigned short *q, const unsigned short *k,
                                   const unsigned short *v, unsigned short *o,
                                   int HQ, int HKV, int N_q, int N_kv,
-                                  int cache_from, int d, int window, float softcap) {
+                                  int cache_from, int d, int window, float softcap,
+                                  const int *d_pos) {
   int i = blockIdx.x, h = blockIdx.y;
+  // M2-B: when d_pos is bound, read the live position/key-count from the device
+  // buffer so a captured graph reads the new token's state on replay (else use
+  // the baked int args = original non-graph behaviour).
+  int cf = d_pos ? d_pos[0] : cache_from;
+  int nkv = d_pos ? d_pos[1] : N_kv;
   if (i >= N_q || h >= HQ) return;
   int gqa = HQ / HKV, hkv = h / gqa;
   int HD_Q = HQ * d, HD_KV = HKV * d;
@@ -154,9 +160,9 @@ __global__ void attn_core_il_fp16(const unsigned short *q, const unsigned short 
   float acc[4];
 #pragma unroll
   for (int r=0;r<4;r++) acc[r]=0.f;
-  int i_abs = cache_from + i;
+  int i_abs = cf + i;
   int j_lo = i_abs - window + 1; if (j_lo<0) j_lo=0;
-  int j_hi = i_abs; if (j_hi>=N_kv) j_hi=N_kv-1;
+  int j_hi = i_abs; if (j_hi>=nkv) j_hi=nkv-1;
   float mmax=-1e30f, l=0.f;
   for (int j=j_lo;j<=j_hi;++j) {
     const unsigned short *kr = k + (long)j*HD_KV + (long)hkv*d;
@@ -450,6 +456,13 @@ size_t g_pm_cap = 0, g_pacc_cap = 0;
 std::mutex g_sk_mtx;
 bool ensure_sk(size_t mn, size_t acc) {
   if (mn > g_pm_cap) {
+    // cudaMalloc/cudaFree inside a CUDA-graph stream capture invalidates the
+    // capture. The decode split-KV scratch is pre-grown at load by
+    // cuda_attention_splitkv_prewarm() so this branch must not run under
+    // capture; if it ever would (an under-sized prewarm), bail so the caller
+    // falls back rather than corrupting the graph.
+    if (StreamManager::Global().isCapturing())
+      return false;
     if (g_pm) cudaFree(g_pm);
     if (g_pl) cudaFree(g_pl);
     if (cudaMalloc(&g_pm, mn * sizeof(float)) != cudaSuccess ||
@@ -458,6 +471,8 @@ bool ensure_sk(size_t mn, size_t acc) {
     g_pm_cap = mn;
   }
   if (acc > g_pacc_cap) {
+    if (StreamManager::Global().isCapturing())
+      return false;
     if (g_pacc) cudaFree(g_pacc);
     if (cudaMalloc(&g_pacc, acc * sizeof(float)) != cudaSuccess)
       return false;
@@ -513,6 +528,28 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   return true;
 }
 } // namespace
+
+// Pre-grow the split-KV decode scratch (g_pm/g_pl/g_pacc) to the model's max
+// decode capacity at load. The M=1 split-KV path is only reached under graph
+// capture once NNTR_CUDA_GRAPH is on; a cudaMalloc/Free inside
+// cudaStreamBeginCapture..EndCapture invalidates the capture. Warming here
+// (before any capture) makes every captured ensure_sk a pure cap-hit, so the
+// fast flash-decode path stays usable under the graph. Idempotent (cap check).
+bool cuda_attention_splitkv_prewarm(int max_seq_len, int max_hq,
+                                    int max_head_dim) {
+  const char *e = std::getenv("NNTR_CUDA_FLASH_DECODE");
+  if (!e)
+    return true; // split-KV off -> no scratch needed (mirror of interleaved)
+  int chunk = atoi(e);
+  if (chunk <= 0)
+    chunk = 64;
+  if (max_seq_len <= 0 || max_hq <= 0 || max_head_dim <= 0)
+    return true;
+  const int max_nchunks = (max_seq_len + chunk - 1) / chunk;
+  const size_t mn = (size_t)max_hq * (size_t)max_nchunks;
+  std::lock_guard<std::mutex> lk(g_sk_mtx);
+  return ensure_sk(mn, mn * (size_t)max_head_dim);
+}
 
 bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                      const unsigned short *k_fp16,
@@ -604,6 +641,11 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   kernel->SetKernelArguments(9, &head_dim, sizeof(head_dim));
   kernel->SetKernelArguments(10, &window, sizeof(window));
   kernel->SetKernelArguments(11, &softcap, sizeof(softcap));
+  // M2-B: bind the device position buffer so the captured graph reads the live
+  // cache_from/N_kv on replay; nullptr keeps the baked-arg (non-graph) path.
+  static const bool m2b_attn = std::getenv("NNTR_CUDA_M2B") != nullptr;
+  const int *attn_dpos = m2b_attn ? cuda_pos_buffer() : nullptr;
+  kernel->SetKernelArguments(12, &attn_dpos, sizeof(attn_dpos));
   const int grid[3] = {N_q, num_heads_Q, 1};
   const int block[3] = {B, 1, 1};
   const unsigned int shmem =
