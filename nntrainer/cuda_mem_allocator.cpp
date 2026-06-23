@@ -31,7 +31,8 @@ std::mutex host_owned_mtx;
 std::unordered_set<void *> host_owned;
 } // namespace
 
-CudaMemAllocator::CudaMemAllocator() {
+CudaMemAllocator::CudaMemAllocator(bool device_only) :
+  device_only_(device_only) {
   // bring up the device + primary context once (idempotent)
   cuda::ContextManager::Global();
 }
@@ -49,18 +50,41 @@ bool CudaMemAllocator::consume_host_owned(void *ptr) {
 void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   static const bool dbg = std::getenv("NNTR_UVM_DEBUG") != nullptr;
   if (size > 0) {
-    void *managed = nullptr;
-    if (cudaMallocManaged(&managed, size) == cudaSuccess && managed != nullptr) {
-      *ptr = managed;
+    void *dptr = nullptr;
+    // device_only -> real device memory (cudaMalloc, NOT host-addressable);
+    // else UVM (cudaMallocManaged, host-coherent). The activation pool uses
+    // device_only so the CPU never migrates its pages (the async thrash);
+    // weights stay UVM (host writes them at load).
+    const cudaError_t e = device_only_ ? cudaMalloc(&dptr, size)
+                                       : cudaMallocManaged(&dptr, size);
+    if (e == cudaSuccess && dptr != nullptr) {
+      if (!device_only_) {
+        // Optionally pin the managed pages to the device. Opt-in
+        // (NNTR_CUDA_UVM_DEVICE); a partial, weaker alternative to device_only
+        // (kept for A/B). Meaningless for real device memory.
+        static const bool pin_device =
+          std::getenv("NNTR_CUDA_UVM_DEVICE") != nullptr;
+        if (pin_device) {
+          int dev = 0;
+          cudaGetDevice(&dev);
+          cudaMemLocation loc;
+          loc.type = cudaMemLocationTypeDevice;
+          loc.id = dev;
+          cudaMemAdvise(dptr, size, cudaMemAdviseSetPreferredLocation, loc);
+          cudaMemAdvise(dptr, size, cudaMemAdviseSetAccessedBy, loc);
+          cudaGetLastError(); // clear any benign advise error
+        }
+      }
+      *ptr = dptr;
       if (dbg)
-        fprintf(stderr, "[UVMDBG] cudaMallocManaged %zu bytes -> %p OK\n", size,
-                managed);
+        fprintf(stderr, "[UVMDBG] %s %zu bytes -> %p OK\n",
+                device_only_ ? "cudaMalloc" : "cudaMallocManaged", size, dptr);
       return;
     }
     if (dbg)
-      fprintf(stderr, "[UVMDBG] cudaMallocManaged %zu bytes FAILED -> host\n",
-              size);
-    // a failed managed alloc leaves the runtime error state set; clear it so a
+      fprintf(stderr, "[UVMDBG] %s %zu bytes FAILED -> host\n",
+              device_only_ ? "cudaMalloc" : "cudaMallocManaged", size);
+    // a failed device alloc leaves the runtime error state set; clear it so a
     // subsequent real CUDA op does not see this benign fallback as an error.
     cudaGetLastError();
   }

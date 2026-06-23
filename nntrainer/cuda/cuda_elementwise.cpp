@@ -73,6 +73,12 @@ __global__ void slice_copy_fp16(const unsigned short *in, unsigned short *out,
   int r = idx / fs, f = idx % fs;
   out[(size_t)r * fs + f] = in[(size_t)r * in_width + layer_off + f];
 }
+__global__ void softcap_fp16(const unsigned short *in, unsigned short *out,
+                             int n, float cap) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = ew_f2h(cap * tanhf(ew_h2f(in[i]) / cap));
+}
 }
 )CU";
 
@@ -134,6 +140,24 @@ bool cuda_scalar_mul_fp16(const unsigned short *in, unsigned short *out,
   k->SetKernelArguments(1, &out, sizeof(out));
   k->SetKernelArguments(2, &ni, sizeof(ni));
   k->SetKernelArguments(3, &scalar, sizeof(scalar));
+  return dispatch1d(k, n);
+}
+
+bool cuda_softcap_fp16(const unsigned short *in, unsigned short *out,
+                       unsigned int n, float cap) {
+  if (n == 0)
+    return true;
+  auto k =
+    CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "softcap_fp16");
+  if (!k) {
+    ml_loge("[CUDA] softcap_fp16: registration failed");
+    return false;
+  }
+  int ni = (int)n;
+  k->SetKernelArguments(0, &in, sizeof(in));
+  k->SetKernelArguments(1, &out, sizeof(out));
+  k->SetKernelArguments(2, &ni, sizeof(ni));
+  k->SetKernelArguments(3, &cap, sizeof(cap));
   return dispatch1d(k, n);
 }
 

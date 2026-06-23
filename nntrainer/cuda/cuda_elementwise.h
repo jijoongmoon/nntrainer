@@ -29,6 +29,10 @@ bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
 bool cuda_scalar_mul_fp16(const unsigned short *in, unsigned short *out,
                           unsigned int n, float scalar);
 
+/** @brief out[i] = cap * tanh(in[i] / cap) -- final logit softcapping */
+bool cuda_softcap_fp16(const unsigned short *in, unsigned short *out,
+                       unsigned int n, float cap);
+
 /** @brief out[r*fs + f] = in[r*in_width + layer_off + f] (per-layer slice) */
 bool cuda_slice_copy_fp16(const unsigned short *in, unsigned short *out,
                           unsigned int rows, unsigned int in_width,

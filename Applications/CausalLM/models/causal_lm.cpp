@@ -55,6 +55,7 @@
 #include <recq_overrides.h> // R3/R4 record/replay override registry + CL types
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
 
@@ -272,8 +273,29 @@ CausalLM::incrementalInference(unsigned int batch_size,
 
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-      nntrainer::getComputeOps()->scopy_fp16_to_fp32(
-        buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data, 1);
+      const _FP16 *out_src = out_t.getData<_FP16>();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Device-only activation pool (NNTR_CUDA_DEV_ACT): the model output is
+      // real device memory, not host-addressable. Drain the backend stream and
+      // copy it D2H into a host buffer before the host fp16->fp32 convert (=the
+      // one sync-per-token boundary). For UVM the pointer is host-coherent so
+      // this is skipped.
+      std::vector<_FP16> out_host;
+      {
+        cudaPointerAttributes pa{};
+        if (cudaPointerGetAttributes(&pa, out_src) == cudaSuccess &&
+            pa.type == cudaMemoryTypeDevice) {
+          nntrainer::cuda::StreamManager::Global().finish();
+          out_host.resize(buf_size);
+          cudaMemcpy(out_host.data(), out_src, buf_size * sizeof(_FP16),
+                     cudaMemcpyDeviceToHost);
+          out_src = out_host.data();
+        }
+        cudaGetLastError();
+      }
+#endif
+      nntrainer::getComputeOps()->scopy_fp16_to_fp32(buf_size, out_src, 1,
+                                                     last_out_buf_data, 1);
 #else
       throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif

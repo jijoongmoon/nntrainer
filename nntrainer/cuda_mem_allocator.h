@@ -33,8 +33,14 @@ public:
   /**
    * @brief Ensure the CUDA device + primary context exist before any
    *        managed allocation.
+   *
+   * @param device_only when true, alloc() uses cudaMalloc (real device memory,
+   *        NOT host-addressable) instead of cudaMallocManaged (UVM). Used for
+   *        the activation pool so the CPU never touches it -> no host<->device
+   *        page migration under async (the UVM thrash). Weights keep UVM (false)
+   *        because the host writes them at load. The OpenCL cl_mem analog.
    */
-  CudaMemAllocator();
+  explicit CudaMemAllocator(bool device_only = false);
 
   /**
    * @copydoc MemAllocator::alloc
@@ -52,9 +58,10 @@ public:
    */
   void free(void *ptr) override;
 
-  std::string getName() override { return "cuda-uvm"; }
+  std::string getName() override { return device_only_ ? "cuda-dev" : "cuda-uvm"; }
 
 private:
+  bool device_only_;
   void track_host_owned(void *ptr);
   bool consume_host_owned(void *ptr);
 };

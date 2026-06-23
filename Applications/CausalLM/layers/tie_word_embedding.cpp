@@ -29,6 +29,11 @@
 #include <cstring>
 #include <vector>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -234,6 +239,27 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
     int iter = to - from;
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // Device-only activation pool (NNTR_CUDA_DEV_ACT): the output is real
+    // device memory (cudaMalloc), NOT host-addressable. The host dequant below
+    // cannot store into it directly (segfault). Dequant into a host staging
+    // buffer, then push it H2D on the backend stream (ordered before the first
+    // GPU layer reads the residual seed). Keeps the CPU off device memory =
+    // no page-fault thrash.
+    bool emb_dev_only = false;
+    std::vector<_FP16> emb_stage;
+    if (hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+      cudaPointerAttributes pa{};
+      emb_dev_only =
+        cudaPointerGetAttributes(&pa, batchsliced_hidden.getData<_FP16>()) ==
+          cudaSuccess &&
+        pa.type == cudaMemoryTypeDevice;
+      cudaGetLastError();
+      if (emb_dev_only)
+        emb_stage.resize((size_t)iter * out_dim);
+    }
+#endif
+
     auto &tm = nntrainer::ThreadManager::Global();
     tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
       unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
@@ -270,7 +296,11 @@ void TieWordEmbedding::incremental_forwarding_embedding(
         }
         if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-          _FP16 *o = out_tensor.getData<_FP16>();
+          _FP16 *o =
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+            emb_dev_only ? (emb_stage.data() + (size_t)i * out_dim) :
+#endif
+                         out_tensor.getData<_FP16>();
           for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
             o[k] = static_cast<_FP16>(tmp[k] * scale);
 #else
@@ -291,7 +321,11 @@ void TieWordEmbedding::incremental_forwarding_embedding(
         // Q6_K/Q4_0 cast path above.
 #ifdef ENABLE_FP16
         const float *src = cur_weight.getData<float>();
-        _FP16 *o = out_tensor.getData<_FP16>();
+        _FP16 *o =
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          emb_dev_only ? (emb_stage.data() + (size_t)i * out_dim) :
+#endif
+                       out_tensor.getData<_FP16>();
         for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
           o[k] = static_cast<_FP16>(src[k] * scale);
 #else
@@ -304,6 +338,16 @@ void TieWordEmbedding::incremental_forwarding_embedding(
         }
       }
     });
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // push the host-dequantized embedding rows into the device-only output on
+    // the backend stream (ordered before the first GPU layer consumes them).
+    if (emb_dev_only)
+      cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage.data(),
+                      (size_t)iter * out_dim * sizeof(_FP16),
+                      cudaMemcpyHostToDevice,
+                      nntrainer::cuda::StreamManager::Global().GetStream());
+#endif
 
 #ifdef DEBUG
     std::cout << context.getName() << " : "

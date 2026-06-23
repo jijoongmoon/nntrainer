@@ -2281,6 +2281,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         {
           static const bool cuda_elt =
             std::getenv("NNTR_CUDA_ROPE") != nullptr;
+          // V-copy historically stayed host for the prefill big-step (height>1)
+          // because a host attention path could read the V cache unsynced. With
+          // GPU attention (NNTR_CUDA_ATTN) + UVM KV cache (NNTR_CUDA_KV_UVM),
+          // prefill attention reads the cache on the GPU (same stream), so a GPU
+          // V copy is a GPU->GPU handoff -- no host read, no drain. Gated by
+          // NNTR_CUDA_VCOPY_PREFILL while validating; removes the per-layer
+          // finishIfAsync bubble that made async-on prefill slow.
+          static const bool vcopy_prefill =
+            std::getenv("NNTR_CUDA_VCOPY_PREFILL") != nullptr;
           auto *vin =
             reinterpret_cast<unsigned short *>(value_step.getData<_FP16>());
           auto *vout = reinterpret_cast<unsigned short *>(
@@ -2290,10 +2299,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                      (pa.type == cudaMemoryTypeManaged ||
                       pa.type == cudaMemoryTypeDevice);
           cudaGetLastError();
-          // V-copy stays host for the prefill big-step (height>1): a host op
-          // still reads the V cache during prefill, so a GPU async V copy races
-          // (verified: sync-mode coherent, async-mode garbage). Decode only.
-          if (cuda_elt && dev && value_step.height() == 1 &&
+          if (cuda_elt && dev &&
+              (value_step.height() == 1 || vcopy_prefill) &&
               nntrainer::cuda::cuda_scalar_mul_fp16(
                 vin, vout, (unsigned int)value_step.size(), 1.0f))
             v_copy_gpu = true;
