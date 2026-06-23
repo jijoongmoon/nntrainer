@@ -317,6 +317,133 @@ __global__ void attn_reduce(const float *pm, const float *pl, const float *pacc,
 }
 )CU";
 
+// Block-Q multi-row prefill attention (CUDA mirror of the Intel OpenCL
+// flash_attention_prefill_f16_blockq + FBQ_SG kernel). One WARP (32 lanes) owns
+// a tile of TM query rows of one head; lane owns VPL = head_dim/32 CONTIGUOUS
+// head dims so the K/V/Q loads are coalesced. Per key: the full d-dot is a
+// single warp butterfly all-reduce (__shfl_xor, NO __syncthreads / shared mem),
+// and K[n]/V[n] are loaded ONCE and reused across all TM rows (register
+// online-softmax). Replaces attn_core_il_fp16's per-key 128-way LDS tree-reduce
+// (7 __syncthreads x #keys, only 1 key in flight). Measured 3-4x faster on
+// gemma4 shapes, fp16-identical output. GQA via hkv = head_q / (HQ/HKV).
+static const char *ATTN_BLOCKQ_SRC = R"CU(
+__device__ __forceinline__ float bq_h2f(unsigned short h) {
+  unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
+  unsigned int e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, o;
+  if (e == 0u) {
+    if (m == 0u) o = s;
+    else { int x=-1; do{m<<=1;x++;}while((m&0x400u)==0u); m&=0x3FFu;
+           o = s | ((unsigned int)(127-15-x)<<23) | (m<<13); }
+  } else if (e == 0x1Fu) o = s | 0x7F800000u | (m<<13);
+  else o = s | ((e + (127u-15u))<<23) | (m<<13);
+  return __int_as_float((int)o);
+}
+__device__ __forceinline__ unsigned short bq_f2h(float f) {
+  unsigned int x=(unsigned int)__float_as_int(f), s=(x>>16)&0x8000u, mant=x&0x7FFFFFu;
+  int e=(int)((x>>23)&0xFFu);
+  if (e==0xFF) return (unsigned short)(s|0x7C00u|(mant?0x200u:0u));
+  int exp=e-127+15;
+  if (exp>=0x1F) return (unsigned short)(s|0x7C00u);
+  if (exp<=0){ if(exp<-10) return (unsigned short)s; mant|=0x800000u; int sh=14-exp;
+    unsigned int hh=mant>>sh, rem=mant&((1u<<sh)-1u), half=1u<<(sh-1);
+    if(rem>half||(rem==half&&(hh&1u))) hh++; return (unsigned short)(s|hh); }
+  unsigned int hh=((unsigned int)exp<<10)|(mant>>13), rem=mant&0x1FFFu;
+  if(rem>0x1000u||(rem==0x1000u&&(hh&1u))) hh++;
+  return (unsigned short)(s|hh);
+}
+__device__ __forceinline__ float bq_wreduce(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_xor_sync(0xffffffffu, v, off);
+  return v;
+}
+template <int TM, int VPL>
+__device__ __forceinline__ void
+blockq_body(const unsigned short *q, const unsigned short *k,
+            const unsigned short *v, unsigned short *o, int HQ, int HKV, int N_q,
+            int N_kv, int cache_from, int d, int window, float softcap) {
+  const int lane = threadIdx.x;             // 0..31
+  const int grp = blockIdx.x;
+  const int n_row_tiles = (N_q + TM - 1) / TM;
+  const int head_q = grp / n_row_tiles;
+  const int tile = grp % n_row_tiles;
+  const int m0 = tile * TM;
+  if (head_q >= HQ || m0 >= N_q) return;
+  const int gqa = HQ / HKV, hkv = head_q / gqa;
+  const int HD_Q = HQ * d, HD_KV = HKV * d;
+  const float scale = rsqrtf((float)d);
+  const int lane0 = lane * VPL;
+  float q_reg[TM][VPL], acc_reg[TM][VPL], m_i[TM], l_i[TM];
+  int valid[TM];
+#pragma unroll
+  for (int r = 0; r < TM; r++) {
+    int m = m0 + r; valid[r] = (m < N_q) ? 1 : 0; m_i[r] = -1e30f; l_i[r] = 0.f;
+    long q_base = (long)(valid[r] ? m : 0) * HD_Q + (long)head_q * d;
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++) {
+      q_reg[r][vv] = bq_h2f(q[q_base + lane0 + vv]); acc_reg[r][vv] = 0.f;
+    }
+  }
+  const int q_pos_off = cache_from;          // absolute query pos = m0+r+cache_from
+  int last_row = ((m0 + TM - 1 < N_q) ? (m0 + TM - 1) : (N_q - 1)) + q_pos_off;
+  int n_last = (N_kv - 1 < last_row) ? (N_kv - 1) : last_row;   // causal
+  for (int n = 0; n <= n_last; ++n) {
+    long k_base = (long)n * HD_KV + (long)hkv * d;
+    float k_reg[VPL];
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++) k_reg[vv] = bq_h2f(k[k_base + lane0 + vv]);
+    float sdot[TM];
+#pragma unroll
+    for (int r = 0; r < TM; r++) {
+      float p = 0.f;
+#pragma unroll
+      for (int vv = 0; vv < VPL; vv++) p += q_reg[r][vv] * k_reg[vv];
+      sdot[r] = bq_wreduce(p);
+    }
+    long v_base = (long)n * HD_KV + (long)hkv * d;
+    float v_reg[VPL];
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++) v_reg[vv] = bq_h2f(v[v_base + lane0 + vv]);
+#pragma unroll
+    for (int r = 0; r < TM; r++) {
+      int m = m0 + r + q_pos_off;
+      if (!valid[r] || n > m || (window > 0 && n + window <= m)) continue;
+      float s = scale * sdot[r];
+      if (softcap > 0.f) s = softcap * tanhf(s / softcap);
+      float m_new = fmaxf(m_i[r], s), alpha = __expf(m_i[r] - m_new),
+            pp = __expf(s - m_new);
+#pragma unroll
+      for (int vv = 0; vv < VPL; vv++)
+        acc_reg[r][vv] = alpha * acc_reg[r][vv] + pp * v_reg[vv];
+      l_i[r] = alpha * l_i[r] + pp; m_i[r] = m_new;
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < TM; r++) {
+    if (!valid[r]) continue;
+    float inv = l_i[r] > 0.f ? 1.f / l_i[r] : 0.f;
+    long o_base = (long)(m0 + r) * HD_Q + (long)head_q * d;
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++)
+      o[o_base + lane0 + vv] = bq_f2h(acc_reg[r][vv] * inv);
+  }
+}
+extern "C" __global__ void
+attn_blockq_d256(const unsigned short *q, const unsigned short *k,
+                 const unsigned short *v, unsigned short *o, int HQ, int HKV,
+                 int N_q, int N_kv, int cache_from, int d, int window,
+                 float softcap) {
+  blockq_body<4, 8>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window, softcap);
+}
+extern "C" __global__ void
+attn_blockq_d512(const unsigned short *q, const unsigned short *k,
+                 const unsigned short *v, unsigned short *o, int HQ, int HKV,
+                 int N_q, int N_kv, int cache_from, int d, int window,
+                 float softcap) {
+  blockq_body<4, 16>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window, softcap);
+}
+)CU";
+
 namespace {
 float *g_pm = nullptr, *g_pl = nullptr, *g_pacc = nullptr;
 size_t g_pm_cap = 0, g_pacc_cap = 0;
@@ -419,6 +546,42 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                  softcap, sk_chunk)) {
       StreamManager::Global().maybeFinish();
       return true;
+    }
+  }
+
+  // Block-Q multi-row prefill: one warp per (head, TM=4 row tile), warp-shuffle
+  // d-dot, K/V reused across rows. 3-4x faster than the per-key LDS-reduce
+  // attn_core_il_fp16 below, fp16-identical. Opt-in (NNTR_CUDA_BLOCKQ) until
+  // folded; only the multi-row (prefill) path with head_dim in {256, 512}
+  // (gemma4 sliding/global) -- decode (N_q==1) keeps split-KV above.
+  static const bool blockq_on = std::getenv("NNTR_CUDA_BLOCKQ") != nullptr;
+  if (blockq_on && N_q > 1 && (head_dim == 256 || head_dim == 512)) {
+    const char *fn = (head_dim == 256) ? "attn_blockq_d256" : "attn_blockq_d512";
+    auto kb = CudaContext::Global().registerCudaKernel(ATTN_BLOCKQ_SRC, fn);
+    if (kb) {
+      // window<=0 or window>=N_kv -> disable the sliding mask (full causal);
+      // avoids n+window overflow when mha passes INT_MAX for global layers.
+      int win_bq = (window <= 0 || window >= N_kv) ? 0 : window;
+      const int TM = 4;
+      const int n_row_tiles = (N_q + TM - 1) / TM;
+      kb->SetKernelArguments(0, &q_fp16, sizeof(q_fp16));
+      kb->SetKernelArguments(1, &k_fp16, sizeof(k_fp16));
+      kb->SetKernelArguments(2, &v_fp16, sizeof(v_fp16));
+      kb->SetKernelArguments(3, &o_fp16, sizeof(o_fp16));
+      kb->SetKernelArguments(4, &num_heads_Q, sizeof(num_heads_Q));
+      kb->SetKernelArguments(5, &num_heads_KV, sizeof(num_heads_KV));
+      kb->SetKernelArguments(6, &N_q, sizeof(N_q));
+      kb->SetKernelArguments(7, &N_kv, sizeof(N_kv));
+      kb->SetKernelArguments(8, &cache_from, sizeof(cache_from));
+      kb->SetKernelArguments(9, &head_dim, sizeof(head_dim));
+      kb->SetKernelArguments(10, &win_bq, sizeof(win_bq));
+      kb->SetKernelArguments(11, &softcap, sizeof(softcap));
+      const int grid[3] = {num_heads_Q * n_row_tiles, 1, 1};
+      const int block[3] = {32, 1, 1};
+      if (StreamManager::Global().DispatchCommand(*kb, grid, block, 0)) {
+        StreamManager::Global().maybeFinish();
+        return true;
+      }
     }
   }
 
