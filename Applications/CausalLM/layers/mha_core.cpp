@@ -31,6 +31,27 @@
 
 static std::mutex rope_init_mtx;
 
+// Minimum prefill step_size for routing attention/RoPE onto the GPU paths.
+// Below it the GPU paths (flash/OHWI/RoPE, kernel-launch + cl_mem setup) were
+// historically gated off in favour of the host path. That crossover only holds
+// on ARM, where the host has NEON kernels: on x86 the host path is the slow
+// generic loop, so GPU wins even at tiny step_size (measured on Intel Arc, a
+// 16-token prefill: GPU attention ~8x faster, end-to-end prefill 5.7x). Hence
+// the default is platform-aware. Env override: NNTR_MIN_PREFILL.
+static unsigned int min_prefill_thr() {
+  static const unsigned int v = []() {
+    const char *e = std::getenv("NNTR_MIN_PREFILL");
+    if (e)
+      return (unsigned int)std::atoi(e);
+#if defined(__x86_64__) || defined(__i386__)
+    return 1u; // x86 (Intel OpenCL / CUDA): no host NEON -> always GPU
+#else
+    return 32u; // ARM (Adreno): host NEON is fast for tiny prefill -> crossover
+#endif
+  }();
+  return v;
+}
+
 #include "_layer_prof.h"
 #include <attention_kernels.h>
 #include <blas_kernel_interface.h>
@@ -1677,7 +1698,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       is_kv_ohwi_enabled() && !kv_int8 &&
       key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
-    constexpr unsigned int ROPE_MIN_PREFILL = 32; // matches FLASH_MIN_PREFILL
+    const unsigned int ROPE_MIN_PREFILL = min_prefill_thr(); // env NNTR_MIN_PREFILL
     // S3 decode: NNTR_MHA_GPU_DECODE moves the M=1 decode RoPE onto the GPU so Q
     // stays SVM-resident (q_cl handled in-place) and lower_q/lower_kv become
     // no-ops -- those are clEnqueueReadBuffer(CL_TRUE) blocking drains that cost
@@ -2403,7 +2424,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // success; on failure falls through to the Phase 1 gather + concat
   // path below. Opt-in by both env vars together; no broken-gate.
   {
-    constexpr unsigned int FLASH_MIN_PREFILL = 32;
+    const unsigned int FLASH_MIN_PREFILL = min_prefill_thr(); // env NNTR_MIN_PREFILL
     static const bool _ohwi_gpu_on =
       is_kv_ohwi_enabled() && !kv_int8 &&
       std::getenv("NNTR_MHA_GPU") != nullptr;
@@ -2533,7 +2554,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // and causal-prefill paths, supports GQA and sliding window. Gated on a
   // minimum prefill length: for decode (step_size == 1) the per-row dot
   // path is preferred (no benefit from blocking + softmax bookkeeping).
-  constexpr unsigned int FLASH_MIN_PREFILL = 32;
+  const unsigned int FLASH_MIN_PREFILL = min_prefill_thr(); // env NNTR_MIN_PREFILL
   // S3 (decode GPU attention): NNTR_MHA_GPU_DECODE lets step_size==1 (decode)
   // enter the GPU attention block too. The KV-image (kvimg_view) path scatters
   // the single new token into the mirrors and reads the full N_kv context, so
