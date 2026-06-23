@@ -12,6 +12,7 @@
 
 #include "cuda_fc_qint4.h"
 
+#include <cuda_blas_manager.h>
 #include <cuda_context.h>
 #include <cuda_stream_manager.h>
 
@@ -650,6 +651,53 @@ __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
   }
 }
 
+// === cuBLAS INT8 IMMA (Tensor Core) prefill FC support ===
+// The __dp4a kernels run on the int ALU (ceiling ~21 TOPS on Ada). cuBLAS int8
+// IMMA runs on the Tensor Cores (~30 TOPS measured, ~10x our dp4a GEMM). These
+// three kernels feed it: unpack the int4 weight -> int8 ONCE (cached), and the
+// int32 GEMM result is bit-identical to the __dp4a acc, so the SAME dequant
+// applies in the epilogue.
+
+// int4 Section-A weight -> int8 [K,N] (w8[k*N+n] = int4(n,k)). Unpacked once and
+// cached (weights are static), so cuBLAS reads contiguous int8 -- doing this per
+// call would add a memory pass that erases the Tensor-Core win.
+__global__ void repack_seca_i8_kn(const unsigned char *secA, signed char *w8,
+                                  int N, int K, int k_internal) {
+  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  int k = blockIdx.y * blockDim.y + threadIdx.y;
+  if (n >= N || k >= K)
+    return;
+  w8[(long)k * N + n] = (signed char)seca_decode(secA, n, k, k_internal);
+}
+
+// per-output-channel sum of the int8 weight column (k-strided), for the
+// activation zero-point correction. one thread per output channel n.
+__global__ void weight_rowsum_kn(const signed char *w8, int *rowsum, int N,
+                                 int K) {
+  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= N)
+    return;
+  long s = 0;
+  for (int k = 0; k < K; ++k)
+    s += (int)w8[(long)k * N + n];
+  rowsum[n] = (int)s;
+}
+
+// dequant epilogue for the int8 IMMA GEMM: C is the int32 dot-product (== the
+// __dp4a acc, bit-identical). Y[m,n]=(C - zp[m]*rowsum[n])*recip[m]*wscale[n].
+__global__ void dequant_i32_fp16(const int *C, const float *ascale,
+                                 const int *azp, const int *wrowsum,
+                                 const unsigned short *wscale, unsigned short *Y,
+                                 int M, int N) {
+  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  int m = blockIdx.y * blockDim.y + threadIdx.y;
+  if (m >= M || n >= N)
+    return;
+  float r = (float)(C[(long)m * N + n] - azp[m] * wrowsum[n]) * ascale[m] *
+            dp4a_h2f(wscale[n]);
+  Y[(long)m * N + n] = dp4a_f2h(r);
+}
+
 }
 )CU";
 
@@ -660,6 +708,15 @@ struct DevWeightQ {
   int *rowsum = nullptr;        // per-channel sum of signed int4 [N]
 };
 std::unordered_map<const void *, DevWeightQ> g_dp4a_plain_cache;
+// int8-unpacked weight [K,N] + per-channel rowsum, for the cuBLAS int8 path
+// (keyed by the Section-A host/UVM pointer; unpacked once, weights are static).
+struct DevWeightI8 {
+  signed char *w8 = nullptr; // int8 weight [K,N] (w8[k*N+n] = int4(n,k))
+  int *rowsum = nullptr;     // per-channel sum of int8 weight [N]
+};
+std::unordered_map<const void *, DevWeightI8> g_i8_weight_cache;
+int *g_i8_c = nullptr; // int32 GEMM output scratch [M,N]
+size_t g_i8_c_cap = 0;
 signed char *g_dp4a_q8 = nullptr;
 size_t g_dp4a_q8_cap = 0;
 float *g_dp4a_ascale = nullptr; // per-row recip (dequant scale)
@@ -856,6 +913,120 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
   if (!dp4a_repack_and_gemm(section_a, scales_fp16,
                             reinterpret_cast<float *>(Yh), M, N, K,
                             /*out_fp16=*/1))
+    return false;
+  maybe_finish();
+  return true;
+}
+
+// w4a8 on the INT8 Tensor Cores via cuBLAS (prefill FC). Same quant scheme as
+// the dp4a path -- per-row asym int8 activation + symmetric int4 weight -- but
+// the int8xint8->int32 GEMM runs on IMMA Tensor Cores instead of __dp4a on the
+// int ALU (~10x the GEMM throughput at prefill M). The int32 accumulate is
+// exact so the result is bit-identical to dp4a; the int4->int8 weight unpack is
+// cached (one-time) to keep it off the per-call critical path.
+bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
+  const unsigned short *Xh, const unsigned char *section_a,
+  const unsigned short *scales_fp16, unsigned short *Yh, unsigned int M,
+  unsigned int N, unsigned int K) {
+  if (M == 0 || N == 0 || K == 0)
+    return true;
+  auto kqh = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                      "act_quant_i8_h");
+  auto krp = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                      "repack_seca_i8_kn");
+  auto krs = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                      "weight_rowsum_kn");
+  auto kde = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                      "dequant_i32_fp16");
+  if (!kqh || !krp || !krs || !kde) {
+    ml_loge("[CUDA] fc_qint4 cublas-i8: kernel registration failed");
+    return false;
+  }
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  // cuBLAS int8 IMMA requires the GEMM dims to be multiples of 32 (measured:
+  // M=260/272 -> CUBLAS_STATUS_NOT_SUPPORTED, 256/320/512 OK). The prefill token
+  // count M is arbitrary (e.g. 511), so pad the activation row count up to a
+  // multiple of 32 for the GEMM only -- the extra rows are computed from
+  // (harmless int8) scratch and ignored by the epilogue, which writes just the
+  // real M rows. N and K are multiples of 32 by the load invariant.
+  const unsigned Mpad = ((M + 31u) / 32u) * 32u;
+  if (!dp4a_stage_scratch(Mpad, K))
+    return false;
+  const int m = (int)M, n = (int)N, k = (int)K, mpad = (int)Mpad;
+  const int k_internal = (int)(((K + 31u) / 32u) * 32u);
+
+  // 1) int8 activation quant from the fp16 input (reuse the dp4a quantizer).
+  kqh->SetKernelArguments(0, &Xh, sizeof(Xh));
+  kqh->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
+  kqh->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+  kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+  kqh->SetKernelArguments(4, &m, sizeof(m));
+  kqh->SetKernelArguments(5, &k, sizeof(k));
+  const int qb[3] = {256, 1, 1};
+  const int qg[3] = {(int)M, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
+    return false;
+
+  // 2) int8 weight [K,N] + per-channel rowsum (cached one-time unpack).
+  auto it = g_i8_weight_cache.find(section_a);
+  if (it == g_i8_weight_cache.end()) {
+    DevWeightI8 dw;
+    if (cudaMalloc(&dw.w8, (size_t)N * K) != cudaSuccess)
+      return false;
+    if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
+      cudaFree(dw.w8);
+      return false;
+    }
+    krp->SetKernelArguments(0, &section_a, sizeof(section_a));
+    krp->SetKernelArguments(1, &dw.w8, sizeof(dw.w8));
+    krp->SetKernelArguments(2, &n, sizeof(n));
+    krp->SetKernelArguments(3, &k, sizeof(k));
+    krp->SetKernelArguments(4, &k_internal, sizeof(k_internal));
+    const int pb[3] = {16, 16, 1};
+    const int pg[3] = {((int)N + 15) / 16, ((int)K + 15) / 16, 1};
+    if (!StreamManager::Global().DispatchCommand(*krp, pg, pb)) {
+      cudaFree(dw.w8);
+      cudaFree(dw.rowsum);
+      return false;
+    }
+    krs->SetKernelArguments(0, &dw.w8, sizeof(dw.w8));
+    krs->SetKernelArguments(1, &dw.rowsum, sizeof(dw.rowsum));
+    krs->SetKernelArguments(2, &n, sizeof(n));
+    krs->SetKernelArguments(3, &k, sizeof(k));
+    const int sb[3] = {128, 1, 1};
+    const int sg[3] = {((int)N + 127) / 128, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*krs, sg, sb)) {
+      cudaFree(dw.w8);
+      cudaFree(dw.rowsum);
+      return false;
+    }
+    it = g_i8_weight_cache.emplace(section_a, dw).first;
+  }
+
+  // 3) int32 GEMM output scratch [Mpad,N].
+  if (!ensure_buf((void **)&g_i8_c, &g_i8_c_cap, sizeof(int) * (size_t)Mpad * N))
+    return false;
+
+  // 4) INT8 IMMA GEMM on the Tensor Cores (Mpad rows; same backend stream as
+  // the kernels). C is [Mpad,N] row-major; the real M rows are at the same
+  // offsets so the epilogue reads C[m*N+n] for m<M directly.
+  if (!BlasManager::Global().igemmRowMajor(mpad, n, k, g_dp4a_q8, it->second.w8,
+                                           g_i8_c))
+    return false;
+
+  // 5) dequant epilogue (bit-identical math to the dp4a kernel) -> fp16 Y.
+  int *rowsum = it->second.rowsum;
+  kde->SetKernelArguments(0, &g_i8_c, sizeof(g_i8_c));
+  kde->SetKernelArguments(1, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+  kde->SetKernelArguments(2, &g_dp4a_azp, sizeof(g_dp4a_azp));
+  kde->SetKernelArguments(3, &rowsum, sizeof(rowsum));
+  kde->SetKernelArguments(4, &scales_fp16, sizeof(scales_fp16));
+  kde->SetKernelArguments(5, &Yh, sizeof(Yh));
+  kde->SetKernelArguments(6, &m, sizeof(m));
+  kde->SetKernelArguments(7, &n, sizeof(n));
+  const int db[3] = {16, 16, 1};
+  const int dg[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
+  if (!StreamManager::Global().DispatchCommand(*kde, dg, db))
     return false;
   maybe_finish();
   return true;

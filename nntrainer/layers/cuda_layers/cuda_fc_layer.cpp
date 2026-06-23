@@ -121,16 +121,28 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
         const char *e = std::getenv("NNTR_FC_CUDA_DP4A");
         return !(e != nullptr && e[0] == '0'); // default ON
       }();
+      // Prefill (large M) FC on the INT8 Tensor Cores via cuBLAS -- ~10x the
+      // dp4a GEMM. Opt-in (NNTR_FC_CUDA_CUBLAS=1) until measured; decode (M=1)
+      // and small M stay on dp4a (BW-bound, Tensor Cores do not help there).
+      static const bool use_cublas_i8 = []() {
+        const char *e = std::getenv("NNTR_FC_CUDA_CUBLAS");
+        return e != nullptr && e[0] == '1'; // default OFF
+      }();
       const bool all_dev =
         deviceAccessible(Xp) && deviceAccessible(W) && deviceAccessible(Yp);
       bool ok = false;
       if (all_dev && fp16) {
-        ok = use_dp4a ? cuda::cuda_fc_qint4_sectionA_dp4a_gemm_fp16(
-                          (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
-                          (unsigned)M, (unsigned)N, (unsigned)K)
-                      : cuda::cuda_fc_qint4_sectionA_gemm_fp16_naive(
-                          (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
-                          (unsigned)M, (unsigned)N, (unsigned)K);
+        if (use_cublas_i8 && use_dp4a && M >= 32)
+          ok = cuda::cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
+            (const uint16_t *)Xp, W, S, (uint16_t *)Yp, (unsigned)M,
+            (unsigned)N, (unsigned)K);
+        if (!ok)
+          ok = use_dp4a ? cuda::cuda_fc_qint4_sectionA_dp4a_gemm_fp16(
+                            (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
+                            (unsigned)M, (unsigned)N, (unsigned)K)
+                        : cuda::cuda_fc_qint4_sectionA_gemm_fp16_naive(
+                            (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
+                            (unsigned)M, (unsigned)N, (unsigned)K);
       } else if (all_dev) {
         ok = use_dp4a
                ? cuda::cuda_fc_qint4_sectionA_dp4a_gemm_fp32(

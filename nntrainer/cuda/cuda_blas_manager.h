@@ -46,6 +46,21 @@ public:
                      float *Y);
 
   /**
+   * @brief Row-major INT8 IMMA GEMM: C[M,N] = A[M,K] * B[K,N], int8 in /
+   *        int32 out, on the Tensor Cores (cublasGemmEx CUDA_R_8I /
+   *        CUBLAS_COMPUTE_32I). A = per-row int8 activation [M,K], B = int8
+   *        weight [K,N] (the int4 weight unpacked once into int8). The int32
+   *        accumulate is exact, so C is bit-identical to the __dp4a path; the
+   *        dequant (act scale/zp + weight scale) is applied in a separate
+   *        epilogue. This is the w4a8 Tensor-Core prefill FC (dp4a is the int
+   *        ALU fallback, ~10x slower).
+   *
+   * @return true on CUBLAS_STATUS_SUCCESS
+   */
+  bool igemmRowMajor(int M, int N, int K, const signed char *A,
+                     const signed char *B, int *C);
+
+  /**
    * @brief Destroy the cuBLAS handle.
    */
   ~BlasManager() override;

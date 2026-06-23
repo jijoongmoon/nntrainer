@@ -123,6 +123,24 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
                                            unsigned int N, unsigned int K);
 
 /**
+ * @brief w4a8 on the INT8 Tensor Cores via cuBLAS (prefill FC). Same quant
+ *        scheme as the dp4a path (per-row asym int8 activation + symmetric int4
+ *        weight, fp16 io), but the int8xint8->int32 matmul runs on IMMA Tensor
+ *        Cores (cublasGemmEx CUDA_R_8I) instead of __dp4a on the int ALU --
+ *        ~10x the GEMM throughput at prefill M. The int4 weight is unpacked to
+ *        int8 [K,N] ONCE (cached by section_a) so the unpack stays off the
+ *        per-call path. Bit-identical to dp4a (exact int32 accumulate). Best
+ *        for large M (prefill); decode M=1 stays on the dp4a GEMV (BW-bound,
+ *        Tensor Cores do not help).
+ */
+bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(const unsigned short *Xh,
+                                                const unsigned char *section_a,
+                                                const unsigned short *scales_fp16,
+                                                unsigned short *Yh,
+                                                unsigned int M, unsigned int N,
+                                                unsigned int K);
+
+/**
  * @brief High-accuracy fp16 path: FP32-precision activation (no int8 quant),
  *        naive Section-A decode-GEMM. Selected by NNTR_FC_CUDA_DP4A=0 for an
  *        fp16 activation (and as an accuracy reference vs the dp4a w4a8 path).
