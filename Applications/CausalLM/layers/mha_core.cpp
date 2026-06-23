@@ -2183,7 +2183,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           if (cached_freqs_cos_fp16 == nullptr ||
               cached_freqs_sin_fp16 == nullptr) {
             const std::lock_guard<std::mutex> lock(rope_init_mtx);
-            precompute_freqs(head_dim, max_position_embeddings, theta, true);
+            // Cap the RoPE trig table to the live max sequence length
+            // (rope_lut_positions() = MaxTimestep ~= max_seq_len) instead of the
+            // model's max_position_embeddings (131072 for gemma4). The table is
+            // already shared across layers via precompute_freqs' rope_freq_cache
+            // (only the 2 distinct (head_dim, theta) configs are built), but
+            // each build was the full 128K positions => ~376ms of prefill host
+            // time for the 2 trig builds + ~113ms flatten/H2D, when prefill only
+            // touches <=max_seq_len positions. The OpenCL GPU-RoPE path already
+            // caps via rope_lut_positions(); this mirrors it for the CUDA path.
+            precompute_freqs(head_dim, rope_lut_positions(), theta, true);
             cached_freqs_cos_fp16 = freqs_cos_fp16;
             cached_freqs_sin_fp16 = freqs_sin_fp16;
           }
