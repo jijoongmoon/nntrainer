@@ -66,6 +66,8 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
 }
 
 void StreamManager::finish() {
+  if (capturing_) // an in-capture cudaStreamSynchronize is illegal; the drain is
+    return;       // deferred to after the graph replay (endCapture caller)
   if (stream_)
     cudaStreamSynchronize(stream_);
 }
@@ -79,13 +81,35 @@ static bool cuda_async_mode() {
 }
 
 void StreamManager::maybeFinish() {
+  if (capturing_)
+    return;
   if (!cuda_async_mode())
     finish();
 }
 
 void StreamManager::finishIfAsync() {
+  if (capturing_)
+    return;
   if (cuda_async_mode())
     finish();
+}
+
+bool StreamManager::beginCapture() {
+  if (!stream_)
+    return false;
+  cudaStreamSynchronize(stream_); // drain pre-capture work; start from idle
+  if (!cudaCheck(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed),
+                 "cudaStreamBeginCapture"))
+    return false;
+  capturing_ = true;
+  return true;
+}
+
+bool StreamManager::endCapture(cudaGraph_t *graph) {
+  capturing_ = false;
+  if (!stream_ || graph == nullptr)
+    return false;
+  return cudaCheck(cudaStreamEndCapture(stream_, graph), "cudaStreamEndCapture");
 }
 
 StreamManager::~StreamManager() {

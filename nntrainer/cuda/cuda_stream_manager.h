@@ -80,6 +80,34 @@ public:
   void finishIfAsync();
 
   /**
+   * @brief Begin CUDA-graph stream capture on the backend stream (Relaxed mode,
+   *        which allows the driver-API cuLaunchKernel + cuBLAS sub-launches).
+   *        Drains the stream first (start from idle), then enters capture. While
+   *        capturing, kernel/cuBLAS calls are RECORDED into a graph rather than
+   *        executed, and finish()/maybeFinish()/finishIfAsync() become no-ops
+   *        (an in-capture cudaStreamSynchronize is illegal -- drains are deferred
+   *        to after the graph replay). Returns false if the stream is missing /
+   *        begin fails.
+   * @note  Decode CUDA-graph (NNTR_CUDA_GRAPH) foundation. Capturing the whole
+   *        per-token forward additionally needs the embedding host-staging
+   *        buffers (embedding_layer.cpp / tie_word_embedding.cpp `emb_stage`) to
+   *        be PERSISTENT + PINNED (a local std::vector is freed before the graph
+   *        replays, and a pageable cudaMemcpyAsync is not capturable). TODO.
+   */
+  bool beginCapture();
+
+  /**
+   * @brief End stream capture; returns the captured graph in @p graph. After
+   *        this, isCapturing() is false again.
+   */
+  bool endCapture(cudaGraph_t *graph);
+
+  /**
+   * @brief True while a capture is in progress (drains are suppressed).
+   */
+  bool isCapturing() const { return capturing_; }
+
+  /**
    * @brief Destroy the stream
    */
   ~StreamManager() override;
@@ -92,6 +120,7 @@ protected:
 
 private:
   cudaStream_t stream_{nullptr};
+  bool capturing_{false};
 };
 
 } // namespace nntrainer::cuda
