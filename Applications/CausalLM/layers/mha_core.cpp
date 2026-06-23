@@ -2547,8 +2547,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     std::getenv("NNTR_MHA_GPU_DECODE") != nullptr;
   const bool _mha_gpu_decode =
     _mha_gpu_decode_env || std::get<props::GpuDecodeAttn>(mha_core_props).get();
+  // CUDA GPU attention (NNTR_CUDA_ATTN) handles any step_size via gemm_attention
+  // -> cuda_attention. Route ALL step_size to it so the short-prefill window
+  // (2..FLASH_MIN_PREFILL-1) does not fall to the host compute_kcaches path,
+  // which faults on a device-only activation pool (NNTR_CUDA_DEV_ACT) and was
+  // the short-prompt crash. OpenCL is unaffected (NNTR_CUDA_ATTN is cuda-only).
+  static const bool _cuda_attn_on = std::getenv("NNTR_CUDA_ATTN") != nullptr;
   if (use_gemm_attention &&
-      (step_size >= FLASH_MIN_PREFILL || (_mha_gpu_decode && step_size == 1))) {
+      (step_size >= FLASH_MIN_PREFILL || (_mha_gpu_decode && step_size == 1) ||
+       _cuda_attn_on)) {
     // GPU two-1x1-conv attention path (paper section 3.7). Env-gated via
     // NNTR_MHA_GPU=1. FP16-Q + FP16-out only; K/V is either FP16 or, when
     // kv_int8 is set, int8 + per-(token, head) FP16 scale. Falls back to
