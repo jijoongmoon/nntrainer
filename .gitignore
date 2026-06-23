@@ -37,6 +37,23 @@ Applications/CausalLM/res/qwen3/*
 Applications/CausalLM/res/qwen3/test/*
 !Applications/CausalLM/res/qwen3/test/generate_qwen3_moe_reference.py
 !Applications/CausalLM/res/qwen3/test/generate_qwen3_reference.py
+# qwen3-0.6b QINT4-FP16 conversion pipeline
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/
+Applications/CausalLM/res/qwen3/qwen3-0.6b/*
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/weight_converter.py
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/weight_converter_layergraph.py
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/gguf_to_nntrainer.py
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/README.md
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/build_qint4.sh
+# gemma2-2b QINT4-FP16 conversion pipeline
+!Applications/CausalLM/res/gemma2/
+Applications/CausalLM/res/gemma2/*
+!Applications/CausalLM/res/gemma2/weight_converter.py
+!Applications/CausalLM/res/gemma2/build_qint4.sh
+!Applications/CausalLM/res/gemma2/README.md
+# gemma4 QINT4-FP16 build script + docs
+!Applications/CausalLM/res/gemma4/build_qint4.sh
+!Applications/CausalLM/res/gemma4/README.md
 Applications/**/tokenizers-cpp-build/*
 
 # CTag

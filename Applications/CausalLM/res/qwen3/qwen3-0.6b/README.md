@@ -71,3 +71,26 @@ python3 gguf_to_nntrainer.py \
   --target arm \
   --emit-nntr-config
 ```
+
+---
+
+# QINT4-FP16 path (GPU 1K benchmark model)
+
+The GPU benchmark model `qwen3_lg_q6k` uses a different recipe: **embedding
+Q6_K, FC QINT4, lm_head Q6_K, FP16 activations** (`model_tensor_type:
+QINT4-FP16`). It is produced from the HF checkpoint (not GGUF) via a two-step
+pipeline:
+
+1. `weight_converter_layergraph.py` — numpy-only HF Qwen3 → FP32-weights /
+   FP16-norms nntrainer layer-graph `.bin` (the quantize source). This is the
+   numpy sibling of the torch `weight_converter.py`; it needs no torch/
+   transformers.
+2. `nntr_quantize ... --fc_dtype QINT4 --embd_dtype Q6_K --lmhead_dtype Q6_K`.
+
+```bash
+# one-shot (auto-detects nntr_quantize under <repo>/build*/):
+./build_qint4.sh /path/to/hf/Qwen3-0.6B /path/to/out_qwen3_qint4
+```
+
+`weight_converter.py` (torch) remains for FP32 / safetensors exports;
+`gguf_to_nntrainer.py` above is the separate GGUF→Q4_0 (x86/ARM) path.
