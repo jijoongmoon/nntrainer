@@ -23,6 +23,9 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
+
+#include <thread_manager.h>
 
 namespace nntrainer::cuda {
 
@@ -837,6 +840,68 @@ static bool dp4a_stage_scratch(unsigned int M, unsigned int K) {
                     sizeof(float) * (size_t)M) &&
          ensure_buf((void **)&g_dp4a_azp, &g_dp4a_azp_cap,
                     sizeof(int) * (size_t)M);
+}
+
+// CPU mirror of the device seca_decode: signed int4 weight for (output channel
+// n, input k) from the KAI Section-A payload. Must match the GPU exactly so the
+// prewarmed cache is bit-identical to the repack_seca_i4 kernel.
+static inline int seca_decode_cpu(const unsigned char *secA, int n, int k,
+                                  int k_internal) {
+  int a = k >> 5, r = k & 31;
+  int is_high = (r >= 16) ? 1 : 0;
+  int kb = is_high ? (r - 16) : r;
+  int t = (a << 4) + kb;
+  int nr_idx = n & 3;
+  long byte_off = (long)(n >> 2) * (2 * k_internal) +
+                  (((t >> 3) << 2) + nr_idx) * 8 + (t & 7);
+  unsigned char s = secA[byte_off];
+  int nib = is_high ? ((s >> 4) & 0xF) : (s & 0xF);
+  return (nib ^ 8) - 8;
+}
+
+// Prewarm the dp4a plain-int4 weight cache on the CPU at LOAD (nntrainer
+// ThreadManager-parallel), so the first inference does not pay the one-time
+// Section-A -> plain int4 repack (nsys: ~38% of the cold-run GPU time) and the
+// GPU is free of it. Mirrors repack_seca_i4 + weight_rowsum bit-exactly, then
+// uploads the plain int4 + per-channel rowsum to the device cache (keyed by the
+// Section-A pointer, same key the dp4a path looks up at forward). Idempotent.
+bool cuda_fc_qint4_prewarm(const unsigned char *section_a, unsigned int N,
+                           unsigned int K) {
+  if (section_a == nullptr || N == 0 || K == 0)
+    return true;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  if (g_dp4a_plain_cache.count(section_a))
+    return true; // already cached
+  const int k_internal = (int)(((K + 31u) / 32u) * 32u);
+  const size_t Kh = (K + 1u) / 2u;
+  std::vector<signed char> plain((size_t)N * Kh);
+  std::vector<int> rowsum(N, 0);
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, (size_t)N, [&](size_t n) {
+    signed char *prow = plain.data() + n * Kh;
+    long acc = 0;
+    for (size_t kb = 0; kb < Kh; ++kb) {
+      int k0 = 2 * (int)kb, k1 = k0 + 1;
+      int v0 = seca_decode_cpu(section_a, (int)n, k0, k_internal);
+      int v1 =
+        (k1 < (int)K) ? seca_decode_cpu(section_a, (int)n, k1, k_internal) : 0;
+      prow[kb] = (signed char)((v0 & 0xF) | ((v1 & 0xF) << 4));
+      acc += v0 + ((k1 < (int)K) ? v1 : 0);
+    }
+    rowsum[n] = (int)acc;
+  });
+  DevWeightQ dw;
+  if (cudaMalloc(&dw.plain, (size_t)N * Kh) != cudaSuccess)
+    return false;
+  if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
+    cudaFree(dw.plain);
+    return false;
+  }
+  cudaMemcpy(dw.plain, plain.data(), (size_t)N * Kh, cudaMemcpyHostToDevice);
+  cudaMemcpy(dw.rowsum, rowsum.data(), sizeof(int) * (size_t)N,
+             cudaMemcpyHostToDevice);
+  g_dp4a_plain_cache.emplace(section_a, dw);
+  return true;
 }
 
 bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,

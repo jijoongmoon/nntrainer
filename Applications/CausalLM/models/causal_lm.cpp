@@ -55,6 +55,7 @@
 #include <recq_overrides.h> // R3/R4 record/replay override registry + CL types
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -742,6 +743,44 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   allocateAndBindKVCache();
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
   std::vector<unsigned int> id_list;
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Prewarm the QINT4 dp4a weight caches on the CPU (ThreadManager-parallel) at
+  // load: the one-time Section-A -> plain int4 repack is ~38% of the cold-run
+  // GPU time (nsys). Doing it here -- once, before start_prefill is reset --
+  // keeps it off the first prefill and off the GPU. Idempotent (per-weight
+  // cache check), gated by NNTR_CUDA_PREWARM (default on).
+  {
+    static bool cuda_prewarmed = false;
+    static const char *_pw = std::getenv("NNTR_CUDA_PREWARM");
+    static const bool cuda_prewarm_on = !(_pw && _pw[0] == '0');
+    if (!cuda_prewarmed && cuda_prewarm_on) {
+      cuda_prewarmed = true;
+      std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
+                         void *)>
+        fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &ctx, void *) {
+          if (l.getType() != "fully_connected")
+            return;
+          for (unsigned int w = 0; w < ctx.getNumWeights(); ++w) {
+            nntrainer::Tensor &wt = ctx.getWeight(w);
+            if (wt.getDataType() != ml::train::TensorDim::DataType::QINT4)
+              continue;
+            const unsigned char *secA = wt.getData<uint8_t>();
+            cudaPointerAttributes pa{};
+            bool dev = cudaPointerGetAttributes(&pa, secA) == cudaSuccess &&
+                       (pa.type == cudaMemoryTypeManaged ||
+                        pa.type == cudaMemoryTypeDevice);
+            cudaGetLastError();
+            if (dev)
+              nntrainer::cuda::cuda_fc_qint4_prewarm(secA, wt.width(),
+                                                     wt.height());
+          }
+        };
+      model->forEachLayer(fn, nullptr);
+      start_prefill = std::chrono::high_resolution_clock::now();
+    }
+  }
+#endif
 
   if (SKIP_PREFILL && init_len > 1) {
     // Prefill only N-1 tokens; the last input token will be used as the first

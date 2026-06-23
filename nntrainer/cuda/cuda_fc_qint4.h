@@ -141,6 +141,19 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(const unsigned short *Xh,
                                                 unsigned int K);
 
 /**
+ * @brief Prewarm the dp4a plain-int4 weight cache at LOAD on the CPU (nntrainer
+ *        ThreadManager-parallel), so the first inference skips the one-time
+ *        Section-A -> plain int4 repack (the dominant cold-run GPU cost) and the
+ *        GPU never runs it. Mirrors repack_seca_i4 + weight_rowsum bit-exactly
+ *        and uploads to the device cache keyed by section_a. Idempotent.
+ *
+ * @param section_a Section-A nibble payload = weight.getData() (host or device)
+ * @param N,K       FC weight dims (N output channels, K input)
+ */
+bool cuda_fc_qint4_prewarm(const unsigned char *section_a, unsigned int N,
+                           unsigned int K);
+
+/**
  * @brief High-accuracy fp16 path: FP32-precision activation (no int8 quant),
  *        naive Section-A decode-GEMM. Selected by NNTR_FC_CUDA_DP4A=0 for an
  *        fp16 activation (and as an accuracy reference vs the dp4a w4a8 path).
