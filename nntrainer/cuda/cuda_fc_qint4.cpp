@@ -534,18 +534,26 @@ __global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
                           const float *ascale, const int *azp,
                           const int *wrowsum, const unsigned short *wscale,
                           float *Y, int N, int K, int out_fp16) {
-  int n = blockIdx.x;
+  // One WARP per output n (warps_per_block outputs per block) -> N/warps_per_block
+  // blocks instead of N, amortizing the per-block launch/epilogue overhead that
+  // dominated the old one-block-per-tiny-output design. No shared memory, no
+  // __syncthreads: each lane reads a coalesced K-slice of the weight row and the
+  // warp-shuffle reduces. dp4a int32 accumulate is integer-associative so the
+  // result is BIT-IDENTICAL to the block-reduce version. (llama.cpp MMVQ shape.)
+  const int warps_per_block = blockDim.x >> 5;
+  int n = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
   if (n >= N)
     return;
+  const int lane = threadIdx.x & 31;
   int Kh = (K + 1) >> 1;
   const signed char *wrow = plain + (long)n * Kh;
-  int tid = threadIdx.x, B = blockDim.x;
   int acc = 0;
-  for (int k = tid * 4; k + 4 <= K; k += B * 4) {
+  for (int k = lane * 4; k + 4 <= K; k += 32 * 4) {
     int a = *(const int *)(q8 + k);
-    int kb = k >> 1;
-    int b0 = (unsigned char)wrow[kb];
-    int b1 = (unsigned char)wrow[kb + 1];
+    int kb = k >> 1; // = lane*2 -> 2-byte aligned for the short load (K even)
+    unsigned int w16 = *(const unsigned short *)(wrow + kb);
+    int b0 = w16 & 0xFF;
+    int b1 = (w16 >> 8) & 0xFF;
     int w0 = ((int)(signed char)(b0 << 4)) >> 4;
     int w1 = ((int)(signed char)b0) >> 4;
     int w2 = ((int)(signed char)(b1 << 4)) >> 4;
@@ -554,16 +562,11 @@ __global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
             ((w3 & 0xFF) << 24);
     acc = __dp4a(a, w, acc);
   }
-  __shared__ int red[256];
-  red[tid] = acc;
-  __syncthreads();
-  for (int s = B >> 1; s > 0; s >>= 1) {
-    if (tid < s)
-      red[tid] += red[tid + s];
-    __syncthreads();
-  }
-  if (tid == 0) {
-    float r = (float)(red[0] - azp[0] * wrowsum[n]) * ascale[0] *
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0) {
+    float r = (float)(acc - azp[0] * wrowsum[n]) * ascale[0] *
               dp4a_h2f(wscale[n]);
     if (out_fp16)
       ((unsigned short *)Y)[n] = dp4a_f2h(r);
@@ -800,12 +803,13 @@ bool dp4a_repack_and_gemm(const unsigned char *section_a,
   kg->SetKernelArguments(5, &scales_fp16, sizeof(scales_fp16));
   kg->SetKernelArguments(6, &Yf, sizeof(Yf));
   if (gemv) {
-    // dp4a_gemv(..., Y, N, K, out_fp16): one block per output, 128-thread K-split.
+    // dp4a_gemv: one WARP per output, 4 warps (128 threads) per block -> ceil(N/4)
+    // blocks instead of N (4x fewer per-block launch/epilogue overheads).
     kg->SetKernelArguments(7, &n, sizeof(n));
     kg->SetKernelArguments(8, &k, sizeof(k));
     kg->SetKernelArguments(9, &out_fp16, sizeof(out_fp16));
     const int gvb[3] = {128, 1, 1};
-    const int gvg[3] = {(int)N, 1, 1};
+    const int gvg[3] = {((int)N + 3) / 4, 1, 1};
     return StreamManager::Global().DispatchCommand(*kg, gvg, gvb);
   }
   kg->SetKernelArguments(7, &mm, sizeof(mm));
@@ -982,9 +986,11 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
     return false;
   }
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
-  const size_t yn = (size_t)M * N;
-  if (!dp4a_stage_scratch(M, K) ||
-      !ensure_buf((void **)&g_dp4a_yf, &g_dp4a_yf_cap, sizeof(float) * yn))
+  // No float Y staging here: the GEMM writes fp16 directly (out_fp16=1 below),
+  // so g_dp4a_yf is unused on this path. Allocating it lazily would cudaMalloc
+  // inside a CUDA-graph capture (NNTR_CUDA_GRAPH) on the first captured decode
+  // token and invalidate the graph -- so it is deliberately NOT sized here.
+  if (!dp4a_stage_scratch(M, K))
     return false;
   int m = (int)M, k = (int)K;
   // 1) int8 activation quant from the fp16 input.
@@ -1003,7 +1009,6 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
   // the FP32 staging buffer (one fewer kernel per FC -- a decode launch-overhead
   // win). (void)kc keeps the registration check above harmless.
   (void)kc;
-  (void)g_dp4a_yf;
   if (!dp4a_repack_and_gemm(section_a, scales_fp16,
                             reinterpret_cast<float *>(Yh), M, N, K,
                             /*out_fp16=*/1))
