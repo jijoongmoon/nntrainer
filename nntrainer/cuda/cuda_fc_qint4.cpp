@@ -901,6 +901,35 @@ bool cuda_fc_qint4_prewarm(const unsigned char *section_a, unsigned int N,
   cudaMemcpy(dw.rowsum, rowsum.data(), sizeof(int) * (size_t)N,
              cudaMemcpyHostToDevice);
   g_dp4a_plain_cache.emplace(section_a, dw);
+
+  // Also prewarm the cuBLAS int8 [K,N] weight cache when the cuBLAS prefill FC
+  // path is on: otherwise its one-time GPU repack (repack_seca_i8_kn, ~32% of
+  // cold prefill GPU time) runs on the first prefill instead of at load. Mirrors
+  // repack_seca_i8_kn (w8[k*N+n]=int4(n,k)) + weight_rowsum_kn bit-exactly.
+  static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
+  if (_cb && _cb[0] != '0' && !g_i8_weight_cache.count(section_a)) {
+    std::vector<signed char> w8((size_t)K * N);
+    std::vector<int> rs8(N, 0);
+    tm.parallel_for(0, (size_t)N, [&](size_t n) {
+      long acc = 0;
+      for (int kk = 0; kk < (int)K; ++kk) {
+        int v = seca_decode_cpu(section_a, (int)n, kk, k_internal);
+        w8[(long)kk * N + n] = (signed char)v;
+        acc += v;
+      }
+      rs8[n] = (int)acc;
+    });
+    DevWeightI8 dw8;
+    if (cudaMalloc(&dw8.w8, (size_t)K * N) == cudaSuccess &&
+        cudaMalloc(&dw8.rowsum, sizeof(int) * (size_t)N) == cudaSuccess) {
+      cudaMemcpy(dw8.w8, w8.data(), (size_t)K * N, cudaMemcpyHostToDevice);
+      cudaMemcpy(dw8.rowsum, rs8.data(), sizeof(int) * (size_t)N,
+                 cudaMemcpyHostToDevice);
+      g_i8_weight_cache.emplace(section_a, dw8);
+    } else if (dw8.w8) {
+      cudaFree(dw8.w8);
+    }
+  }
   return true;
 }
 
