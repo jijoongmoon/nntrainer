@@ -4297,7 +4297,13 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
 #ifdef ENABLE_FP16
     if (cached_freqs_cos_fp16 == nullptr || cached_freqs_sin_fp16 == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      precompute_freqs(head_dim, max_position_embeddings, theta, true);
+      // Cap to the live max sequence length (= the `from < max_timestep` bound
+      // used below), not the model's max_position_embeddings (131072 for
+      // gemma4). The host-RoPE table is indexed [from + h] with from+height <=
+      // max_timestep, so rope_lut_positions() positions suffice. Mirrors the
+      // CUDA/OpenCL GPU-RoPE paths which already cap; avoids a 128K-position
+      // trig build on any platform that falls back to host RoPE.
+      precompute_freqs(head_dim, rope_lut_positions(), theta, true);
       cached_freqs_cos_fp16 = freqs_cos_fp16;
       cached_freqs_sin_fp16 = freqs_sin_fp16;
     }
