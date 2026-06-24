@@ -12,9 +12,12 @@
 
 #include "cuda_attention.h"
 
+#include <cuda_blas_manager.h>
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
 #include <cuda_stream_manager.h>
+
+#include <cublas_v2.h>
 
 #include <nntrainer_log.h>
 
@@ -459,6 +462,75 @@ attn_blockq_d512(const unsigned short *q, const unsigned short *k,
 }
 )CU";
 
+// Row-wise causal+window softmax over a per-head scores matrix [N_q, N_kv]
+// (row-major: scores[i*N_kv + j] = dot(Q_i, K_j) already scaled). Masks
+// j>i_abs (causal) and j<i_abs-window+1 (sliding) to 0, softmax in FP32 over
+// the valid range, writes fp16 probabilities in place. One block per query row.
+static const char *ATTN_SOFTMAX_SRC = R"CU(
+extern "C" {
+__device__ __forceinline__ float sm_h2f(unsigned short h) {
+  unsigned int s=((unsigned int)(h&0x8000u))<<16, e=(h>>10)&0x1Fu, m=h&0x3FFu, o;
+  if(e==0u){ if(m==0u)o=s; else{int x=-1;do{m<<=1;x++;}while((m&0x400u)==0u);m&=0x3FFu;
+    o=s|((unsigned int)(127-15-x)<<23)|(m<<13);} }
+  else if(e==0x1Fu)o=s|0x7F800000u|(m<<13);
+  else o=s|((e+(127u-15u))<<23)|(m<<13);
+  return __int_as_float((int)o);
+}
+__device__ __forceinline__ unsigned short sm_f2h(float f) {
+  unsigned int x=(unsigned int)__float_as_int(f), s=(x>>16)&0x8000u, mant=x&0x7FFFFFu;
+  int e=(int)((x>>23)&0xFFu);
+  if(e==0xFF)return (unsigned short)(s|0x7C00u|(mant?0x200u:0u));
+  int exp=e-127+15;
+  if(exp>=0x1F)return (unsigned short)(s|0x7C00u);
+  if(exp<=0){ if(exp<-10)return (unsigned short)s; mant|=0x800000u; int sh=14-exp;
+    unsigned int hh=mant>>sh, rem=mant&((1u<<sh)-1u), half=1u<<(sh-1);
+    if(rem>half||(rem==half&&(hh&1u)))hh++; return (unsigned short)(s|hh); }
+  unsigned int hh=((unsigned int)exp<<10)|(mant>>13), rem=mant&0x1FFFu;
+  if(rem>0x1000u||(rem==0x1000u&&(hh&1u)))hh++;
+  return (unsigned short)(s|hh);
+}
+__global__ void attn_softmax_fp16(unsigned short *scores, int N_q, int N_kv,
+                                  int cache_from, int window, float softcap) {
+  int i = blockIdx.x;
+  if (i >= N_q) return;
+  unsigned short *row = scores + (long)i * N_kv;
+  int i_abs = cache_from + i;
+  int j_hi = i_abs < N_kv - 1 ? i_abs : N_kv - 1;
+  int j_lo = (window > 0) ? i_abs - window + 1 : 0;
+  if (j_lo < 0) j_lo = 0;
+  int tid = threadIdx.x, B = blockDim.x;
+  extern __shared__ float sh[];
+  float lm = -1e30f;
+  for (int j = j_lo + tid; j <= j_hi; j += B) {
+    float v = sm_h2f(row[j]);
+    if (softcap > 0.f) v = softcap * tanhf(v / softcap);
+    lm = fmaxf(lm, v);
+  }
+  sh[tid] = lm; __syncthreads();
+  for (int s = B >> 1; s > 0; s >>= 1) { if (tid < s) sh[tid] = fmaxf(sh[tid], sh[tid + s]); __syncthreads(); }
+  float mx = sh[0]; __syncthreads();
+  float ls = 0.f;
+  for (int j = j_lo + tid; j <= j_hi; j += B) {
+    float v = sm_h2f(row[j]);
+    if (softcap > 0.f) v = softcap * tanhf(v / softcap);
+    ls += __expf(v - mx);
+  }
+  sh[tid] = ls; __syncthreads();
+  for (int s = B >> 1; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; __syncthreads(); }
+  float inv = sh[0] > 0.f ? 1.f / sh[0] : 0.f; __syncthreads();
+  for (int j = tid; j < N_kv; j += B) {
+    float p = 0.f;
+    if (j >= j_lo && j <= j_hi) {
+      float v = sm_h2f(row[j]);
+      if (softcap > 0.f) v = softcap * tanhf(v / softcap);
+      p = __expf(v - mx) * inv;
+    }
+    row[j] = sm_f2h(p);
+  }
+}
+}
+)CU";
+
 namespace {
 float *g_pm = nullptr, *g_pl = nullptr, *g_pacc = nullptr;
 size_t g_pm_cap = 0, g_pacc_cap = 0;
@@ -536,6 +608,85 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
     return false;
   return true;
 }
+
+// GEMM-based multi-row prefill attention. The per-key flash kernel
+// (attn_core_il) is fetch/sync-bound (~0.4% of peak on d=128) because it serial-
+// reduces every key; for prefill (N_q>1) materialising scores via cuBLAS fp16
+// GEMMs (QK^T -> softmax -> PV) is far faster and head_dim-agnostic, so it also
+// helps the head_dim=128 (qwen3/llama) case that block-Q does not.
+// Layout (interleaved fp16, column-major cuBLAS): per query-head h (kv-head
+// hkv=h/gqa) scores_cm[N_kv,N_q] = K_h^T@Q_h reads back as row-major
+// scores[N_q,N_kv]; then O_cm[d,N_q] = V_h@scores_cm.
+float *g_scores = nullptr;
+size_t g_scores_cap = 0;
+std::mutex g_ga_mtx;
+bool attention_gemm_prefill_fp16(const unsigned short *q, const unsigned short *k,
+                                 const unsigned short *v, unsigned short *o,
+                                 int HQ, int HKV, int N_q, int N_kv,
+                                 int cache_from, int d, int window,
+                                 float softcap) {
+  std::lock_guard<std::mutex> lk(g_ga_mtx);
+  cublasHandle_t bh = BlasManager::Global().handle();
+  if (!bh)
+    return false;
+  auto sm = CudaContext::Global().registerCudaKernel(ATTN_SOFTMAX_SRC,
+                                                     "attn_softmax_fp16");
+  if (!sm)
+    return false;
+  // scratch scores [N_q, N_kv] fp16 reused across heads (heads run serially).
+  const size_t need = (size_t)N_q * N_kv;
+  if (need > g_scores_cap) {
+    if (g_scores)
+      cudaFree(g_scores);
+    if (cudaMalloc(&g_scores, need * sizeof(unsigned short)) != cudaSuccess) {
+      g_scores = nullptr;
+      g_scores_cap = 0;
+      return false;
+    }
+    g_scores_cap = need;
+  }
+  auto *scores = reinterpret_cast<unsigned short *>(g_scores);
+  const int gqa = HQ / HKV;
+  const int HD_Q = HQ * d, HD_KV = HKV * d;
+  const float scale = 1.0f / sqrtf((float)d);
+  const float one = 1.0f, zero = 0.0f;
+  const int win = (window <= 0 || window >= N_kv) ? 0 : window;
+  const int B = 256;
+  const size_t shmem = (size_t)B * sizeof(float);
+  for (int h = 0; h < HQ; ++h) {
+    const int hkv = h / gqa;
+    const unsigned short *Qh = q + (long)h * d;     // [N_q,d] ld=HD_Q
+    const unsigned short *Kh = k + (long)hkv * d;   // [N_kv,d] ld=HD_KV
+    const unsigned short *Vh = v + (long)hkv * d;   // [N_kv,d] ld=HD_KV
+    unsigned short *Oh = o + (long)h * d;           // [N_q,d] ld=HD_Q
+    // scores_cm[N_kv,N_q] = (K_h^T)[N_kv,d] @ Q_h[d,N_q] * scale -> row-major
+    // scores[i*N_kv+j] = scale*dot(Q_i,K_j).
+    cublasStatus_t s1 = cublasGemmEx(
+      bh, CUBLAS_OP_T, CUBLAS_OP_N, N_kv, N_q, d, &scale, Kh, CUDA_R_16F, HD_KV,
+      Qh, CUDA_R_16F, HD_Q, &zero, scores, CUDA_R_16F, N_kv, CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT);
+    if (s1 != CUBLAS_STATUS_SUCCESS)
+      return false;
+    sm->SetKernelArguments(0, &scores, sizeof(scores));
+    sm->SetKernelArguments(1, &N_q, sizeof(N_q));
+    sm->SetKernelArguments(2, &N_kv, sizeof(N_kv));
+    sm->SetKernelArguments(3, &cache_from, sizeof(cache_from));
+    sm->SetKernelArguments(4, &win, sizeof(win));
+    sm->SetKernelArguments(5, &softcap, sizeof(softcap));
+    const int sg[3] = {N_q, 1, 1};
+    const int sb[3] = {B, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*sm, sg, sb, shmem))
+      return false;
+    // O_cm[d,N_q] = V_h[d,N_kv] @ scores_cm[N_kv,N_q] -> row-major O[i,e].
+    cublasStatus_t s2 = cublasGemmEx(
+      bh, CUBLAS_OP_N, CUBLAS_OP_N, d, N_q, N_kv, &one, Vh, CUDA_R_16F, HD_KV,
+      scores, CUDA_R_16F, N_kv, &zero, Oh, CUDA_R_16F, HD_Q, CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT);
+    if (s2 != CUBLAS_STATUS_SUCCESS)
+      return false;
+  }
+  return true;
+}
 } // namespace
 
 // Pre-grow the split-KV decode scratch (g_pm/g_pl/g_pacc) to the model's max
@@ -590,6 +741,23 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
     if (attention_splitkv_decode(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
                                  num_heads_KV, N_kv, cache_from, head_dim, window,
                                  softcap, sk_chunk)) {
+      StreamManager::Global().maybeFinish();
+      return true;
+    }
+  }
+
+  // GEMM prefill attention (cuBLAS fp16 QK^T -> softmax -> PV): materialises
+  // scores instead of the per-key flash reduce, so it is far faster for prefill
+  // and head_dim-agnostic -- the lever for head_dim=128 (qwen3/llama) where
+  // block-Q underperforms. Opt-in (NNTR_CUDA_GEMM_ATTN); falls through on any
+  // cuBLAS/registration failure.
+  // head_dim 256/512 are faster on block-Q (warp-shuffle, K/V reuse); GEMM wins
+  // for the smaller head dims (128 = qwen3/llama) where block-Q underutilises.
+  static const bool gemm_attn_on = std::getenv("NNTR_CUDA_GEMM_ATTN") != nullptr;
+  if (gemm_attn_on && N_q > 1 && head_dim != 256 && head_dim != 512) {
+    if (attention_gemm_prefill_fp16(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
+                                    num_heads_KV, N_q, N_kv, cache_from, head_dim,
+                                    window, softcap)) {
       StreamManager::Global().maybeFinish();
       return true;
     }
