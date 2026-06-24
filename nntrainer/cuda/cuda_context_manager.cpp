@@ -13,6 +13,7 @@
 #include "cuda_context_manager.h"
 #include "cuda_common.h"
 
+#include <cstdio>
 #include <cstdlib>
 
 #include <cuda_runtime.h>
@@ -70,6 +71,45 @@ bool ContextManager::CreateDefaultGPUDevice() {
           device_ordinal_, device_name_.c_str(), cc_major_, cc_minor_,
           driver_version_, prop.totalGlobalMem / 1073741824.0,
           integrated_ ? "integrated" : "discrete");
+
+  // NNTR_CUDA_DBG: a VISIBLE (stderr, logger-independent) dump of the residency
+  // facts the GPU-vs-host dispatch gates depend on. On Tegra/Orin the critical
+  // unknown is whether cudaMallocManaged memory reports as cudaMemoryTypeManaged
+  // (==2) -- if it instead reports Host(1)/Unregistered(0), every dev()/dev_ok()
+  // gate (mha_core RoPE/V-copy, cuda_attention) fails and the GPU ops silently
+  // fall to the host => deterministic garbage + low GPU% + slow. This self-probe
+  // prints the actual type so that hypothesis is confirmable in one run.
+  if (std::getenv("NNTR_CUDA_DBG") != nullptr) {
+    int cma = 0, pma = 0;
+    cudaDeviceGetAttribute(&cma, cudaDevAttrConcurrentManagedAccess,
+                           device_ordinal_);
+    cudaDeviceGetAttribute(&pma, cudaDevAttrPageableMemoryAccess,
+                           device_ordinal_);
+    int mtype = -2, dtype = -2;
+    void *mp = nullptr, *dp = nullptr;
+    if (cudaMallocManaged(&mp, 256) == cudaSuccess && mp) {
+      cudaPointerAttributes a{};
+      if (cudaPointerGetAttributes(&a, mp) == cudaSuccess)
+        mtype = (int)a.type;
+      cudaFree(mp);
+    }
+    if (cudaMalloc(&dp, 256) == cudaSuccess && dp) {
+      cudaPointerAttributes a{};
+      if (cudaPointerGetAttributes(&a, dp) == cudaSuccess)
+        dtype = (int)a.type;
+      cudaFree(dp);
+    }
+    cudaGetLastError();
+    std::fprintf(stderr,
+                 "[CUDA-DBG] %s sm_%d%d integrated=%d concurrentManagedAccess=%d "
+                 "pageableMemoryAccess=%d | cudaPointerGetAttributes.type: "
+                 "managed=%d device=%d (expect managed==2 device==2; "
+                 "type enum 0=unreg 1=host 2=device... NOTE managed reports as "
+                 "type 2/Device OR 3 depending on driver -- gates accept 2&3)\n",
+                 device_name_.c_str(), cc_major_, cc_minor_, (int)integrated_,
+                 cma, pma, mtype, dtype);
+    std::fflush(stderr);
+  }
   return true;
 }
 
