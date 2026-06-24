@@ -471,8 +471,36 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
             h ^= p[i];
             h *= 1099511628211ull;
           }
-        std::fprintf(stderr, "[LH] %3u %-28s out%u bytes=%zu fnv=%016llx\n",
-                     _lh_idx, ln->getName().c_str(), j, n, h);
+        // min/max (FP16 / FP32) to spot a layer whose output blew up / went
+        // abnormal (the divergence signature, e.g. an exploded norm) without a
+        // reference run.
+        float lo = 0.f, hi = 0.f;
+        const auto dt = t.getDataType();
+        if (p && n > 0) {
+          lo = 1e30f;
+          hi = -1e30f;
+#ifdef ENABLE_FP16
+          if (dt == ml::train::TensorDim::DataType::FP16) {
+            const _FP16 *q = reinterpret_cast<const _FP16 *>(p);
+            for (size_t i = 0; i < n / sizeof(_FP16); ++i) {
+              float v = static_cast<float>(q[i]);
+              if (v < lo) lo = v;
+              if (v > hi) hi = v;
+            }
+          } else
+#endif
+            if (dt == ml::train::TensorDim::DataType::FP32) {
+            const float *q = reinterpret_cast<const float *>(p);
+            for (size_t i = 0; i < n / sizeof(float); ++i) {
+              if (q[i] < lo) lo = q[i];
+              if (q[i] > hi) hi = q[i];
+            }
+          }
+        }
+        std::fprintf(stderr,
+                     "[LH] %3u %-28s out%u bytes=%zu min=%.3g max=%.3g "
+                     "fnv=%016llx\n",
+                     _lh_idx, ln->getName().c_str(), j, n, lo, hi, h);
       }
       std::fflush(stderr);
     }
