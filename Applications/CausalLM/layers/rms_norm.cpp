@@ -151,14 +151,40 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       nntrainer::Tensor out_step =
         out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
-      if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32 ||
-          in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-        // FP16 path: stays in fp16 throughout for residual-stream
-        // consistency. Tensor::multiply/average/add/inv_sqrt_i dispatch
-        // on the tensor's dtype, so the same expression works for both.
+      if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
         auto t = in_step.multiply(in_step).average(3).add(epsilon);
         t.inv_sqrt_i();
         in_step.multiply(t, out_step);
+#ifdef ENABLE_FP16
+      } else if (in_step.getDataType() ==
+                 ml::train::TensorDim::DataType::FP16) {
+        // FP16 path: the sum-of-squares MUST be accumulated in FP32. Doing it
+        // in fp16 (in_step.multiply(in_step).average(3)) loses precision and
+        // overflows on a large residual (|x| up to ~1700 in gemma4 ->
+        // x^2 > fp16 max 65504 -> +Inf -> wrong scale -> exploded norm). On x86
+        // Tensor::average(fp16) happens to accumulate in fp32, but the aarch64
+        // NEON fp16 path accumulates in fp16 -> garbage on Jetson/Orin (the norm
+        // exploded to +-1389 there while reshaped_rms_norm/CudaRMSNormLayer,
+        // which already use fp32, stayed correct). Explicit fp32 reduction here
+        // makes the host norm correct on every arch. gamma is applied below.
+        const unsigned int rows =
+          in_step_dim.channel() * in_step_dim.height();
+        const unsigned int W = in_step_dim.width();
+        const _FP16 *xi = in_step.getData<_FP16>();
+        _FP16 *yi = out_step.getData<_FP16>();
+        for (unsigned int r = 0; r < rows; ++r) {
+          const _FP16 *xr = xi + (size_t)r * W;
+          _FP16 *yr = yi + (size_t)r * W;
+          float ss = 0.f;
+          for (unsigned int k = 0; k < W; ++k) {
+            float v = static_cast<float>(xr[k]);
+            ss += v * v;
+          }
+          float inv = 1.0f / std::sqrt(ss / static_cast<float>(W) + epsilon);
+          for (unsigned int k = 0; k < W; ++k)
+            yr[k] = static_cast<_FP16>(static_cast<float>(xr[k]) * inv);
+        }
+#endif
       } else {
         throw std::invalid_argument(
           "Error: not yet implemented for this data type");

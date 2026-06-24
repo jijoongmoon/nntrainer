@@ -72,6 +72,12 @@ bool dev_ok(const void *p) {
 
 void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
                       unsigned int rows, unsigned int width, float eps) {
+  if (std::getenv("NNTR_CUDA_DBG")) {
+    static int _n = 0;
+    if (_n++ < 3)
+      std::fprintf(stderr, "[CUDA-DBG] CudaRMSNormLayer USED rows=%u width=%u\n",
+                   rows, width);
+  }
   using DT = ml::train::TensorDim::DataType;
   const DT dt = in.getDataType();
   const DT gt = gamma.getDataType();
