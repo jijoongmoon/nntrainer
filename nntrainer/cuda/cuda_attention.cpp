@@ -13,6 +13,7 @@
 #include "cuda_attention.h"
 
 #include <cuda_context.h>
+#include <cuda_context_manager.h>
 #include <cuda_stream_manager.h>
 
 #include <nntrainer_log.h>
@@ -198,6 +199,14 @@ std::unordered_map<const void *, DevKV> g_kv_mirror;
 std::mutex g_kv_mtx;
 
 const unsigned short *mirror_kv(const unsigned short *host, size_t elems) {
+  // Integrated GPU (Tegra/Jetson Orin): the iGPU reads ordinary host memory
+  // directly (one shared physical pool), so NO device mirror is needed. Passing
+  // through also avoids a latent stale-KV bug -- the mirror snapshots the host
+  // cache, and a host-side V-copy that updates the slot AFTER the snapshot would
+  // be served stale keys/values. Discrete GPUs keep the mirror.
+  static const bool integrated = ContextManager::Global().isIntegrated();
+  if (integrated)
+    return host;
   cudaPointerAttributes a{};
   bool dev = cudaPointerGetAttributes(&a, host) == cudaSuccess &&
              (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice);

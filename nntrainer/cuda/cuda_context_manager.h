@@ -56,6 +56,16 @@ public:
   const std::string &GetDeviceName() const { return device_name_; }
 
   /**
+   * @brief true if the device is an INTEGRATED GPU (Tegra/Jetson Orin etc.)
+   *        where host and device share one physical memory pool. On such
+   *        devices the discrete-GPU residency tricks (device-only cudaMalloc
+   *        activation pool, KV mirror copies, MemAdvise device-pin) give no
+   *        bandwidth benefit and BREAK host-coherence -- callers gate those
+   *        off when this returns true. Read from cudaDevAttrIntegrated once.
+   */
+  bool isIntegrated() const { return integrated_; }
+
+  /**
    * @brief Stable signature used to key the on-disk PTX cache so a module built
    *        for a different GPU / driver / arch is never loaded.
    * @return "<name>|drv<driver>|sm_<cc>"
@@ -94,6 +104,7 @@ private:
   int cc_major_{0};
   int cc_minor_{0};
   int driver_version_{0};
+  bool integrated_{false};
   bool initialized_ok_{false};
 };
 

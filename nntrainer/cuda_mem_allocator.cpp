@@ -55,16 +55,30 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
     // else UVM (cudaMallocManaged, host-coherent). The activation pool uses
     // device_only so the CPU never migrates its pages (the async thrash);
     // weights stay UVM (host writes them at load).
-    const cudaError_t e = device_only_ ? cudaMalloc(&dptr, size)
-                                       : cudaMallocManaged(&dptr, size);
+    //
+    // INTEGRATED GPU (Tegra/Jetson Orin): host and device share one physical
+    // memory pool, so a device-only cudaMalloc gives ZERO bandwidth benefit
+    // yet makes the buffer host-INCOHERENT -- the host RoPE/short-attention/
+    // norm fallbacks then dereference a device pointer and fault/garbage. Force
+    // the managed (host-coherent) pool there regardless of the device_only_
+    // request, so the same binary stays coherent on Orin even if a launch
+    // script leaks NNTR_CUDA_DEV_ACT. The dev()/dev_ok() GPU gates still pass
+    // because they accept Managed too. Discrete GPUs are unaffected.
+    const bool integrated = cuda::ContextManager::Global().isIntegrated();
+    const bool dev_only = device_only_ && !integrated;
+    const cudaError_t e = dev_only ? cudaMalloc(&dptr, size)
+                                   : cudaMallocManaged(&dptr, size);
     if (e == cudaSuccess && dptr != nullptr) {
-      if (!device_only_) {
+      if (!dev_only && !integrated) {
         // Optionally pin the managed pages to the device. Opt-in
         // (NNTR_CUDA_UVM_DEVICE); a partial, weaker alternative to device_only
-        // (kept for A/B). Meaningless for real device memory.
+        // (kept for A/B). Meaningless for real device memory AND for an
+        // integrated GPU (no distinct device location to migrate to; can
+        // mis-pin on some Tegra drivers), so it is skipped when integrated.
         static const bool pin_device =
           std::getenv("NNTR_CUDA_UVM_DEVICE") != nullptr;
         if (pin_device) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12020
           int dev = 0;
           cudaGetDevice(&dev);
           cudaMemLocation loc;
@@ -73,17 +87,18 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
           cudaMemAdvise(dptr, size, cudaMemAdviseSetPreferredLocation, loc);
           cudaMemAdvise(dptr, size, cudaMemAdviseSetAccessedBy, loc);
           cudaGetLastError(); // clear any benign advise error
+#endif
         }
       }
       *ptr = dptr;
       if (dbg)
         fprintf(stderr, "[UVMDBG] %s %zu bytes -> %p OK\n",
-                device_only_ ? "cudaMalloc" : "cudaMallocManaged", size, dptr);
+                dev_only ? "cudaMalloc" : "cudaMallocManaged", size, dptr);
       return;
     }
     if (dbg)
       fprintf(stderr, "[UVMDBG] %s %zu bytes FAILED -> host\n",
-              device_only_ ? "cudaMalloc" : "cudaMallocManaged", size);
+              dev_only ? "cudaMalloc" : "cudaMallocManaged", size);
     // a failed device alloc leaves the runtime error state set; clear it so a
     // subsequent real CUDA op does not see this benign fallback as an error.
     cudaGetLastError();

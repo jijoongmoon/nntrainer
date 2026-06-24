@@ -57,12 +57,19 @@ bool ContextManager::CreateDefaultGPUDevice() {
     device_name_ = prop.name;
     cc_major_ = prop.major;
     cc_minor_ = prop.minor;
+    // Integrated GPU (Tegra/Jetson Orin): host+device share one physical memory
+    // pool. prop.integrated is 1 there, 0 on discrete GPUs (RTX4070). This bit
+    // gates every "is this discrete VRAM?" residency assumption (device-only
+    // activation pool, KV mirror copies, MemAdvise device-pin) so the same
+    // binary stays coherent on both -- see isIntegrated().
+    integrated_ = prop.integrated != 0;
   }
   cudaDriverGetVersion(&driver_version_);
 
-  ml_logi("[CUDA] device %d: %s (sm_%d%d, driver %d, %.1f GiB)", device_ordinal_,
-          device_name_.c_str(), cc_major_, cc_minor_, driver_version_,
-          prop.totalGlobalMem / 1073741824.0);
+  ml_logi("[CUDA] device %d: %s (sm_%d%d, driver %d, %.1f GiB, %s)",
+          device_ordinal_, device_name_.c_str(), cc_major_, cc_minor_,
+          driver_version_, prop.totalGlobalMem / 1073741824.0,
+          integrated_ ? "integrated" : "discrete");
   return true;
 }
 

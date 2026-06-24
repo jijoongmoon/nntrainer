@@ -14,6 +14,7 @@
 
 #include <cuda_blas_manager.h>
 #include <cuda_context.h>
+#include <cuda_context_manager.h>
 #include <cuda_stream_manager.h>
 
 #include <nntrainer_log.h>
@@ -45,7 +46,11 @@ namespace nntrainer::cuda {
 static inline void maybe_finish() {
   static const bool async = []() {
     const char *e = std::getenv("NNTR_CUDA_ASYNC");
-    return e != nullptr && e[0] == '1';
+    if (e == nullptr || e[0] != '1')
+      return false;
+    // Integrated GPU (Tegra/Orin): force sync -- async is non-coherent on the
+    // shared-memory iGPU (see cuda_stream_manager cuda_async_mode()).
+    return !ContextManager::Global().isIntegrated();
   }();
   if (!async)
     StreamManager::Global().finish();
