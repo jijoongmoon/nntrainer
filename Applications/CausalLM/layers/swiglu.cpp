@@ -16,6 +16,11 @@
 #include "_layer_prof.h"
 #include "swiglu.h"
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#endif
+
 namespace causallm {
 
 static constexpr size_t OUT_IDX = 0;
@@ -54,6 +59,29 @@ void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     return;
 
   int iter = to - from;
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  // GPU SwiGLU (engine=cuda, device-resident fp16): one kernel instead of the
+  // host loop, so the qwen3 FFN activation stays on the device. Without it the
+  // host swiglu reads the device-only activation pool (NNTR_CUDA_DEV_ACT) and
+  // faults. Gated on FP16 + batch/channel==1 (inference) + device-resident;
+  // falls through to the host loop otherwise (OpenCL/CPU unaffected).
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+      in1.batch() == 1 && in1.channel() == 1) {
+    const size_t n = (size_t)iter * in1.width();
+    auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>());
+    auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>());
+    auto *o = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+    cudaPointerAttributes pa{};
+    const bool dev =
+      a && cudaPointerGetAttributes(&pa, a) == cudaSuccess &&
+      (pa.type == cudaMemoryTypeManaged || pa.type == cudaMemoryTypeDevice);
+    cudaGetLastError();
+    if (dev && n > 0 &&
+        nntrainer::cuda::cuda_swiglu_fp16(a, b, o, (unsigned int)n))
+      return;
+  }
+#endif
 
   if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
     for (unsigned int b = 0; b < in1.batch(); b++) {

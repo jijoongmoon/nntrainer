@@ -21,6 +21,10 @@ namespace nntrainer::cuda {
 bool cuda_geglu_fp16(const unsigned short *gate, const unsigned short *up,
                      unsigned short *out, unsigned int n);
 
+/** @brief out[i] = silu(gate[i]) * up[i], silu(x) = x/(1+exp(-x)) (qwen3 FFN) */
+bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
+                      unsigned short *out, unsigned int n);
+
 /** @brief out[i] = a[i] + b[i] (residual add) */
 bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
                    unsigned short *out, unsigned int n);

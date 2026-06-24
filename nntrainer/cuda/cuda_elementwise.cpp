@@ -54,6 +54,16 @@ __global__ void geglu_fp16(const unsigned short *gate, const unsigned short *up,
   float g = 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
   out[i] = ew_f2h(g * ew_h2f(up[i]));
 }
+// SwiGLU: out[i] = silu(gate[i]) * up[i], silu(x) = x / (1 + exp(-x)) (qwen3/
+// llama FFN). Same shape as geglu_fp16, SiLU gate instead of gelu_tanh.
+__global__ void swiglu_fp16(const unsigned short *gate, const unsigned short *up,
+                            unsigned short *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float x = ew_h2f(gate[i]);
+  float s = x / (1.0f + expf(-x));
+  out[i] = ew_f2h(s * ew_h2f(up[i]));
+}
 __global__ void add_fp16(const unsigned short *a, const unsigned short *b,
                          unsigned short *out, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -108,6 +118,23 @@ bool cuda_geglu_fp16(const unsigned short *gate, const unsigned short *up,
   auto k = CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "geglu_fp16");
   if (!k) {
     ml_loge("[CUDA] geglu_fp16: registration failed");
+    return false;
+  }
+  int ni = (int)n;
+  k->SetKernelArguments(0, &gate, sizeof(gate));
+  k->SetKernelArguments(1, &up, sizeof(up));
+  k->SetKernelArguments(2, &out, sizeof(out));
+  k->SetKernelArguments(3, &ni, sizeof(ni));
+  return dispatch1d(k, n);
+}
+
+bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
+                      unsigned short *out, unsigned int n) {
+  if (n == 0)
+    return true;
+  auto k = CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "swiglu_fp16");
+  if (!k) {
+    ml_loge("[CUDA] swiglu_fp16: registration failed");
     return false;
   }
   int ni = (int)n;
