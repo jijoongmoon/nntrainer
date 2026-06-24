@@ -43,12 +43,18 @@
 #include <weight_layer.h>
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_runtime.h>
+#endif
 
 #include "graph_node.h"
 #include "tensor.h"
@@ -423,11 +429,54 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
+  // NNTR_LAYER_HASH: per-layer output FNV-1a hash dump for the FIRST (prefill)
+  // forward, to pinpoint where two runs diverge -- e.g. an sm_87 GPU kernel vs
+  // the host path on the SAME machine+model, or Orin vs RTX4070. Compare the
+  // [LH] lines from two runs; the first mismatching layer is the culprit.
+  // Managed activations need a device sync before the host read (Tegra
+  // concurrentManagedAccess=0); a device-only pointer is mirrored to host.
+  static const bool _layer_hash = std::getenv("NNTR_LAYER_HASH") != nullptr;
+  unsigned int _lh_idx = 0;
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
     forwarding_op(*iter, training);
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
+
+    if (_layer_hash && from == 0) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      cudaDeviceSynchronize();
+#endif
+      for (unsigned int j = 0; j < ln->getNumOutputs(); ++j) {
+        Tensor &t = ln->getOutput(j);
+        const size_t n = t.bytes();
+        const uint8_t *src = t.getData<uint8_t>();
+        const uint8_t *p = src;
+        std::vector<uint8_t> mirror;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+        if (src) {
+          cudaPointerAttributes a{};
+          if (cudaPointerGetAttributes(&a, src) == cudaSuccess &&
+              a.type == cudaMemoryTypeDevice) {
+            mirror.resize(n);
+            cudaMemcpy(mirror.data(), src, n, cudaMemcpyDeviceToHost);
+            p = mirror.data();
+          }
+          cudaGetLastError();
+        }
+#endif
+        unsigned long long h = 1469598103934665603ull;
+        if (p)
+          for (size_t i = 0; i < n; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ull;
+          }
+        std::fprintf(stderr, "[LH] %3u %-28s out%u bytes=%zu fnv=%016llx\n",
+                     _lh_idx, ln->getName().c_str(), j, n, h);
+      }
+      std::fflush(stderr);
+    }
+    ++_lh_idx;
   }
 
   sharedConstTensors out;
