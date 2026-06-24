@@ -30,6 +30,7 @@
 #include <vector>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -647,6 +648,35 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       const unsigned int num_blocks_per_row = (hidden_size + 256 - 1) / 256;
       const size_t row_stride = 210 * num_blocks_per_row;
       const uint8_t *weight_data = weight.getData<uint8_t>();
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // engine=cuda GPU Q6_K lm_head: reads the device FP16 hidden + (managed)
+      // Q6_K weight directly and writes FP16 logits to the device output -- no
+      // host bounce, so it works with a device-only activation pool
+      // (NNTR_CUDA_DEV_ACT) where the host GEMV below faults on the device-only
+      // hidden/logits. Gated on FP16 in/out that are device-resident; falls
+      // through to the host loop otherwise (OpenCL/CPU unaffected).
+      if (input_step.getDataType() == nntrainer::TensorDim::DataType::FP16 &&
+          hidden_step.getDataType() == nntrainer::TensorDim::DataType::FP16 &&
+          (hidden_size % 256) == 0) {
+#ifdef ENABLE_FP16
+        const _FP16 *hin = input_step.getData<_FP16>();
+        _FP16 *hout = hidden_step.getData<_FP16>();
+        cudaPointerAttributes pa{};
+        const bool dev =
+          hin && cudaPointerGetAttributes(&pa, hin) == cudaSuccess &&
+          (pa.type == cudaMemoryTypeDevice || pa.type == cudaMemoryTypeManaged);
+        cudaGetLastError();
+        if (dev &&
+            nntrainer::cuda::lmhead_gemv_q6_k_cuda(
+              weight_data, reinterpret_cast<const unsigned short *>(hin),
+              reinterpret_cast<unsigned short *>(hout), (int)vocab_size,
+              (int)hidden_size))
+          return;
+#endif
+      }
+#endif
+
       // dtype-aware I/O (see Q4_0 path above): FP16 hidden -> fp32 row; logits
       // written back as the output tensor's dtype.
       std::vector<float> input_f32;
