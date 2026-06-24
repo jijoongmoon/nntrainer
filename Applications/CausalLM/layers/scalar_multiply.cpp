@@ -20,6 +20,7 @@
 #include "scalar_multiply.h"
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
 #endif
@@ -162,11 +163,7 @@ void ScalarMultiplyLayer::incremental_forwarding(
           reinterpret_cast<const unsigned short *>(in_step.getData<_FP16>());
         auto *op =
           reinterpret_cast<unsigned short *>(out_step.getData<_FP16>());
-        cudaPointerAttributes pa{};
-        bool dev = cudaPointerGetAttributes(&pa, ip) == cudaSuccess &&
-                   (pa.type == cudaMemoryTypeManaged ||
-                    pa.type == cudaMemoryTypeDevice);
-        cudaGetLastError();
+        const bool dev = nntrainer::cuda::dev_accessible(ip);
         if (dev && nntrainer::cuda::cuda_scalar_mul_fp16(
                      ip, op, (unsigned int)in_step.size(), multiplier))
           done = true;

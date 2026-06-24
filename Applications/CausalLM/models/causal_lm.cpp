@@ -56,6 +56,7 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_attention.h>
+#include <cuda_context_manager.h>
 #include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
@@ -767,11 +768,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             if (wt.getDataType() != ml::train::TensorDim::DataType::QINT4)
               continue;
             const unsigned char *secA = wt.getData<uint8_t>();
-            cudaPointerAttributes pa{};
-            bool dev = cudaPointerGetAttributes(&pa, secA) == cudaSuccess &&
-                       (pa.type == cudaMemoryTypeManaged ||
-                        pa.type == cudaMemoryTypeDevice);
-            cudaGetLastError();
+            const bool dev = nntrainer::cuda::dev_accessible(secA);
             if (dev)
               nntrainer::cuda::cuda_fc_qint4_prewarm(secA, wt.width(),
                                                      wt.height());

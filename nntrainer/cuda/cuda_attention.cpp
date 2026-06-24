@@ -210,10 +210,7 @@ const unsigned short *mirror_kv(const unsigned short *host, size_t elems) {
   static const bool integrated = ContextManager::Global().isIntegrated();
   if (integrated)
     return host;
-  cudaPointerAttributes a{};
-  bool dev = cudaPointerGetAttributes(&a, host) == cudaSuccess &&
-             (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice);
-  cudaGetLastError();
+  const bool dev = nntrainer::cuda::dev_accessible(host);
   if (dev)
     return host; // already device-accessible
   std::lock_guard<std::mutex> lk(g_kv_mtx);

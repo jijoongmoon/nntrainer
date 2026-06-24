@@ -15,6 +15,7 @@
 #include <per_layer_slice.h>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
 #endif
@@ -88,11 +89,7 @@ void PerLayerSliceLayer::incremental_forwarding(
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       static const bool gpu = std::getenv("NNTR_CUDA_ELTWISE") != nullptr;
       if (gpu) {
-        cudaPointerAttributes pa{};
-        bool dev = cudaPointerGetAttributes(&pa, in_data) == cudaSuccess &&
-                   (pa.type == cudaMemoryTypeManaged ||
-                    pa.type == cudaMemoryTypeDevice);
-        cudaGetLastError();
+        const bool dev = nntrainer::cuda::dev_accessible(in_data);
         if (dev && nntrainer::cuda::cuda_slice_copy_fp16(
                      reinterpret_cast<const unsigned short *>(in_data),
                      reinterpret_cast<unsigned short *>(out_data), tokens, W,

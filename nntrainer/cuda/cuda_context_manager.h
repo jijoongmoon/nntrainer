@@ -108,6 +108,17 @@ private:
   bool initialized_ok_{false};
 };
 
+/**
+ * @brief  Is pointer @p p reachable by a CUDA kernel? Accepts Managed/Device
+ *         always; on an INTEGRATED GPU (Tegra/Orin) also accepts Host, because
+ *         there cudaMallocManaged memory can report as cudaMemoryTypeHost yet is
+ *         GPU-accessible (one shared physical pool). Without this every dev()
+ *         gate rejects the (managed) activation pool on Orin and the GPU ops
+ *         silently fall to the host => correct-but-slow (2 TPS). Single source
+ *         of truth for the residency gates.
+ */
+bool dev_accessible(const void *p);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_CONTEXT_MANAGER_H__

@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <cuda_context_manager.h>
 #include <cuda_rmsnorm.h>
 #include <cuda_runtime.h>
 
@@ -62,13 +63,7 @@ void rmsnorm_rows(const T *x, const G *g, T *y, unsigned int rows,
   }
 }
 
-bool dev_ok(const void *p) {
-  cudaPointerAttributes a{};
-  bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess &&
-            (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice);
-  cudaGetLastError();
-  return ok;
-}
+bool dev_ok(const void *p) { return nntrainer::cuda::dev_accessible(p); }
 
 void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
                       unsigned int rows, unsigned int width, float eps) {

@@ -20,6 +20,7 @@
 #include <node_exporter.h>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
 #endif
@@ -65,11 +66,7 @@ void CudaGeGLULayer::gegluProcess(const Tensor &in1, const Tensor &in2,
       auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>());
       auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>());
       auto *o = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
-      cudaPointerAttributes pa{};
-      bool dev = cudaPointerGetAttributes(&pa, a) == cudaSuccess &&
-                 (pa.type == cudaMemoryTypeManaged ||
-                  pa.type == cudaMemoryTypeDevice);
-      cudaGetLastError();
+      const bool dev = nntrainer::cuda::dev_accessible(a);
       if (dev && cuda::cuda_geglu_fp16(a, b, o, (unsigned int)n))
         return;
     }

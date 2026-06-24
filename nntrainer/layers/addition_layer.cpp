@@ -23,6 +23,7 @@
 #include <blas_kernel_interface.h>
 #endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
 #endif
@@ -92,11 +93,7 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
         auto *bb = reinterpret_cast<const unsigned short *>(s1.getData<_FP16>());
         auto *o =
           reinterpret_cast<unsigned short *>(hidden_step.getData<_FP16>());
-        cudaPointerAttributes pa{};
-        bool dev = cudaPointerGetAttributes(&pa, a) == cudaSuccess &&
-                   (pa.type == cudaMemoryTypeManaged ||
-                    pa.type == cudaMemoryTypeDevice);
-        cudaGetLastError();
+        const bool dev = nntrainer::cuda::dev_accessible(a);
         if (dev &&
             cuda::cuda_add_fp16(a, bb, o, (unsigned int)hidden_step.size()))
           continue;

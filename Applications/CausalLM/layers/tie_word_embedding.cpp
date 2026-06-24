@@ -30,6 +30,7 @@
 #include <vector>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
 #include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
@@ -662,11 +663,7 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 #ifdef ENABLE_FP16
         const _FP16 *hin = input_step.getData<_FP16>();
         _FP16 *hout = hidden_step.getData<_FP16>();
-        cudaPointerAttributes pa{};
-        const bool dev =
-          hin && cudaPointerGetAttributes(&pa, hin) == cudaSuccess &&
-          (pa.type == cudaMemoryTypeDevice || pa.type == cudaMemoryTypeManaged);
-        cudaGetLastError();
+        const bool dev = hin && nntrainer::cuda::dev_accessible(hin);
         if (dev &&
             nntrainer::cuda::lmhead_gemv_q6_k_cuda(
               weight_data, reinterpret_cast<const unsigned short *>(hin),

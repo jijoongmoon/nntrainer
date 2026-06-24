@@ -23,6 +23,7 @@
 #include <cstdlib>
 
 #include <cuda_blas_manager.h>
+#include <cuda_context_manager.h>
 #include <cuda_fc_qint4.h>
 #include <cuda_stream_manager.h>
 #include <int4_tensor.h>
@@ -45,11 +46,7 @@ namespace {
 // kernel yields garbage. Only take a GPU path when the buffer is managed/device
 // memory; otherwise fall through to the host path (correct on the UVM buffers).
 static bool deviceAccessible(const void *p) {
-  cudaPointerAttributes a{};
-  bool ok = (cudaPointerGetAttributes(&a, p) == cudaSuccess) &&
-            (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice);
-  cudaGetLastError(); // clear the benign error a host pointer may set
-  return ok;
+  return nntrainer::cuda::dev_accessible(p);
 }
 
 void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {

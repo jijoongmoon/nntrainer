@@ -23,6 +23,7 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_attention.h>
+#include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_rope.h>
 #include <cuda_runtime.h>
@@ -2200,11 +2201,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           if ((size_t)cache_index + nrows <= (*cached_freqs_cos_fp16).size()) {
             unsigned short *q =
               reinterpret_cast<unsigned short *>(query_step.getData<_FP16>());
-            cudaPointerAttributes pa{};
-            bool dev = cudaPointerGetAttributes(&pa, q) == cudaSuccess &&
-                       (pa.type == cudaMemoryTypeManaged ||
-                        pa.type == cudaMemoryTypeDevice);
-            cudaGetLastError();
+            const bool dev = nntrainer::cuda::dev_accessible(q);
             if (dev) {
               const int half = head_dim / 2;
               const unsigned short *cosd =
@@ -2275,12 +2272,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         {
           static const bool cuda_rope = std::getenv("NNTR_CUDA_ROPE") != nullptr;
           auto dev = [](const void *p) {
-            cudaPointerAttributes a{};
-            bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess &&
-                      (a.type == cudaMemoryTypeManaged ||
-                       a.type == cudaMemoryTypeDevice);
-            cudaGetLastError();
-            return ok;
+            return nntrainer::cuda::dev_accessible(p);
           };
           const unsigned int knrows = key_step.height();
           if (cuda_rope &&
@@ -2352,11 +2344,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             reinterpret_cast<unsigned short *>(value_step.getData<_FP16>());
           auto *vout = reinterpret_cast<unsigned short *>(
             b_cache_value_step.getData<_FP16>());
-          cudaPointerAttributes pa{};
-          bool dev = cudaPointerGetAttributes(&pa, vout) == cudaSuccess &&
-                     (pa.type == cudaMemoryTypeManaged ||
-                      pa.type == cudaMemoryTypeDevice);
-          cudaGetLastError();
+          const bool dev = nntrainer::cuda::dev_accessible(vout);
           static const bool m2b_v = std::getenv("NNTR_CUDA_M2B") != nullptr;
           if (cuda_elt && dev && (value_step.height() == 1 || vcopy_prefill)) {
             if (m2b_v) {
@@ -3431,12 +3419,7 @@ void MHACoreLayer::gemm_attention(
     static const bool cuda_attn = std::getenv("NNTR_CUDA_ATTN") != nullptr;
     if (cuda_attn && q_fp16 && o_fp16 && !kv_int8 && Q_fp16_src && O_fp16) {
       auto dev_ok = [](const void *p) {
-        cudaPointerAttributes a{};
-        bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess &&
-                  (a.type == cudaMemoryTypeManaged ||
-                   a.type == cudaMemoryTypeDevice);
-        cudaGetLastError();
-        return ok;
+        return nntrainer::cuda::dev_accessible(p);
       };
       // Query + output must be device-resident (the kernel uses them directly);
       // the KV cache may be host-heap (it is, on engine=cuda) -- the launcher

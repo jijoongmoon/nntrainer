@@ -134,4 +134,21 @@ ContextManager::~ContextManager() {
   }
 }
 
+bool dev_accessible(const void *p) {
+  if (p == nullptr)
+    return false;
+  cudaPointerAttributes a{};
+  const bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess;
+  cudaGetLastError(); // clear the benign "invalid pointer" state for host ptrs
+  if (!ok)
+    return false;
+  if (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice)
+    return true;
+  // Integrated GPU (Tegra/Orin): managed memory may report as Host, but it is
+  // GPU-accessible (shared physical pool) -- accept so the kernel engages.
+  if (a.type == cudaMemoryTypeHost && ContextManager::Global().isIntegrated())
+    return true;
+  return false;
+}
+
 } // namespace nntrainer::cuda

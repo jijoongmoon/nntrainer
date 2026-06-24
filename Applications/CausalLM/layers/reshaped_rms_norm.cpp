@@ -19,6 +19,7 @@
 #include <memory_data.h>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
 #include <cuda_rmsnorm.h>
 #include <cuda_runtime.h>
 #endif
@@ -216,12 +217,7 @@ void ReshapedRMSNormLayer::incremental_forwarding(
         auto dev_ok = [](const void *p) {
           if (!p)
             return true;
-          cudaPointerAttributes a{};
-          bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess &&
-                    (a.type == cudaMemoryTypeManaged ||
-                     a.type == cudaMemoryTypeDevice);
-          cudaGetLastError();
-          return ok;
+          return nntrainer::cuda::dev_accessible(p);
         };
         if (dev_ok(ip) && dev_ok(op) && dev_ok(gp) &&
             nntrainer::cuda::cuda_rmsnorm_fp16(ip, gp, op, epsilon, n_rows,
