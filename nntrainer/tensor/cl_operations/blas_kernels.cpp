@@ -1479,6 +1479,47 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
     if (!blas_cc->command_queue_inst_.DispatchCommand(kp, work_groups_count,
                                                       work_group_size))
       return;
+    // NNTR_RMSN_VERIFY=1 (Xe3 regression): GPU rmsnorm output vs CPU reference
+    // (x / sqrt(mean(x^2)+eps) * gamma) from the SAME buffers the kernel used.
+    if (std::getenv("NNTR_RMSN_VERIFY")) {
+      cl_command_queue cq = blas_cc->command_queue_inst_.GetCommandQueue();
+      clFinish(cq);
+      const size_t cnt = (size_t)n_rows * w;
+      std::vector<_FP16> hin(cnt), hout(cnt);
+      if (from_clmem)
+        clEnqueueReadBuffer(cq, in_cl, CL_TRUE, 0, cnt * 2, hin.data(), 0,
+                            nullptr, nullptr);
+      else
+        std::memcpy(hin.data(), input, cnt * 2);
+      if (to_clmem)
+        clEnqueueReadBuffer(cq, out_cl, CL_TRUE, 0, cnt * 2, hout.data(), 0,
+                            nullptr, nullptr);
+      else
+        std::memcpy(hout.data(), result, cnt * 2);
+      float maxrel = -1, gat = 0, rat = 0;
+      int wr = 0, wd = 0;
+      for (int r = 0; r < std::min(n_rows, 2); ++r) {
+        double ss = 0;
+        for (int d = 0; d < w; ++d) {
+          float x = (float)hin[(size_t)r * w + d];
+          ss += (double)x * x;
+        }
+        float inv = 1.0f / std::sqrt((float)(ss / w) + epsilon);
+        for (int d = 0; d < std::min(w, 16); ++d) {
+          float x = (float)hin[(size_t)r * w + d];
+          float g = no_gamma ? 1.0f : (float)gamma[d];
+          float ref = x * inv * g;
+          float gpu = (float)hout[(size_t)r * w + d];
+          float rel = std::fabs(gpu - ref) / (std::fabs(ref) + 1e-3f);
+          if (rel > maxrel) { maxrel = rel; gat = gpu; rat = ref; wr = r; wd = d; }
+        }
+      }
+      std::fprintf(stderr,
+                   "[RMSNVERIFY] w=%d rows=%d gamma=%d RELERR=%.4f @(%d,%d) "
+                   "gpu=%.4f ref=%.4f\n",
+                   w, n_rows, (int)!no_gamma, maxrel, wr, wd, gat, rat);
+      std::fflush(stderr);
+    }
   } else {
     // Scalar fallback (W%8!=0): one WI per (n,h) row; local must be a valid
     // size (NOT W). Bind the 8-arg [B,C,H,W] signature with local={1,1,1}.

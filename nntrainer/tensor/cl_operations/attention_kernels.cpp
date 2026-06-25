@@ -764,6 +764,14 @@ bool two_conv_attention_prefill_f16_cl(const uint16_t *Q_host,
   return true;
 }
 
+// NNTR_ATTN_VERIFY cross-check: the rope stashes its rotated Q[pos1,head0,0..15]
+// here; the flash compares the Q it actually reads against it -> tells whether
+// the rope output reached the attention input (vs a stale un-rotated read).
+static float g_rope_qcheck[16];
+static bool g_rope_qcheck_set = false;
+static float g_rope_kcheck[16];
+static bool g_rope_kcheck_set = false;
+
 // =============================================================================
 // SVM-direct GPU RoPE. Keeps the activation on the device: rotate the
 // (k, k+half_d) pairs of each [M, num_heads*head_dim] FP16 row by a cos/sin LUT
@@ -1029,8 +1037,46 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
   const size_t kx_pad = (((size_t)half_d + LWS_K - 1) / LWS_K) * LWS_K;
   std::array<size_t, 3> gws = {(size_t)M, (size_t)num_heads, kx_pad};
   std::array<size_t, 3> lws = {1, 1, LWS_K};
+  // NNTR_ROPE_VERIFY=1 (Xe3 regression): snapshot the rope INPUT before the
+  // kernel so we can compare the GPU rotated output against a CPU reference.
+  static const bool rope_verify = std::getenv("NNTR_ROPE_VERIFY") != nullptr;
+  std::vector<uint16_t> rv_in;
+  if (rope_verify) {
+    clFinish(q);
+    rv_in.resize((size_t)M * num_heads * head_dim);
+    if (in_clmem)
+      clEnqueueReadBuffer(q, static_cast<cl_mem>(in_clmem), CL_TRUE, 0,
+                          rv_in.size() * 2, rv_in.data(), 0, nullptr, nullptr);
+    else if (in)
+      std::memcpy(rv_in.data(), in, rv_in.size() * 2);
+  }
   blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
                                              lws.data(), 0, nullptr, nullptr);
+  // NNTR_ATTN_VERIFY: stash the rotated Q[pos1,head0,0..15] (Q rope = the call
+  // with num_heads>=2; K rope has num_heads==1) so the flash can confirm the Q
+  // it reads is this rotated value, not a stale un-rotated one.
+  if (std::getenv("NNTR_ATTN_VERIFY") && M > 1 && head_dim >= 16) {
+    clFinish(q);
+    uint16_t tmp[16];
+    // Q rope: write_off==0 in-place, num_heads>=2. K rope: scatters into the
+    // cache at write_off, num_heads==1. Read pos1,head0,d0..15 from whichever.
+    const size_t off =
+      (size_t)write_off + (size_t)1 * num_heads * head_dim;
+    if (out_clmem)
+      clEnqueueReadBuffer(q, static_cast<cl_mem>(out_clmem), CL_TRUE,
+                          off * sizeof(uint16_t), 16 * sizeof(uint16_t), tmp, 0,
+                          nullptr, nullptr);
+    else if (out)
+      std::memcpy(tmp, reinterpret_cast<const uint16_t *>(out) + off,
+                  16 * sizeof(uint16_t));
+    if ((int)num_heads >= 2) {
+      for (int d = 0; d < 16; ++d) g_rope_qcheck[d] = mha_h2f(tmp[d]);
+      g_rope_qcheck_set = true;
+    } else {
+      for (int d = 0; d < 16; ++d) g_rope_kcheck[d] = mha_h2f(tmp[d]);
+      g_rope_kcheck_set = true;
+    }
+  }
   if (svm_inputs) {
     // Trailing drain only when the OUTPUT went to SVM (a downstream device
     // SVM read depends on it). A cl_mem output feeds a pure kernel chain
@@ -1053,10 +1099,89 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
       clFinish(q);
     else if (out_clmem == nullptr || !rope_noflush)
       clFlush(q);
+    // NNTR_ROPE_FINISH=1 (Xe3 regression probe): force a full drain after the
+    // rope kernel so the cl_mem rotated-Q write completes before the attention
+    // reads it in a separate submission (the suspected cross-submission Q-flip).
+    static const bool rope_finish = std::getenv("NNTR_ROPE_FINISH") != nullptr;
+    if (rope_finish)
+      clFinish(q);
+    // NNTR_ROPE_SYNC_SVM=1 (Xe3 cl_mem<->SVM coherence fix probe): the kernel
+    // wrote the rotated values to out_clmem, but on Xe3 the aliased SVM plane is
+    // NOT updated -> an SVM-reading consumer gets the stale (pre-rotation) Q.
+    // Copy cl_mem -> SVM so both planes agree.
+    static const bool rope_sync_svm =
+      std::getenv("NNTR_ROPE_SYNC_SVM") != nullptr;
+    if (rope_sync_svm && out_clmem && out) {
+      clFinish(q);
+      clEnqueueReadBuffer(q, static_cast<cl_mem>(out_clmem), CL_TRUE, 0, io_bytes,
+                          out, 0, nullptr, nullptr);
+    }
   } else {
     if (clEnqueueReadBuffer(q, rope_scratch().io, CL_TRUE, 0, io_bytes, out, 0,
                             nullptr, nullptr) != CL_SUCCESS)
       return false;
+  }
+  if (rope_verify) {
+    clFinish(q);
+    std::vector<uint16_t> rv_out((size_t)M * num_heads * head_dim);
+    if (out_clmem)
+      clEnqueueReadBuffer(q, static_cast<cl_mem>(out_clmem), CL_TRUE, 0,
+                          rv_out.size() * 2, rv_out.data(), 0, nullptr, nullptr);
+    else if (out)
+      std::memcpy(rv_out.data(), out, rv_out.size() * 2);
+    auto h2f = [](uint16_t h) -> float {
+      uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+      uint32_t exp = (h >> 10) & 0x1F, mant = h & 0x3FF, f;
+      if (exp == 0) {
+        if (mant == 0) f = sign;
+        else {
+          int e = 127 - 15 + 1;
+          while (!(mant & 0x400)) { mant <<= 1; e--; }
+          mant &= 0x3FF;
+          f = sign | ((uint32_t)e << 23) | (mant << 13);
+        }
+      } else if (exp == 0x1F) f = sign | 0x7F800000u | (mant << 13);
+      else f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+      float r;
+      std::memcpy(&r, &f, 4);
+      return r;
+    };
+    float maxrel = -1.0f, gat = 0, rat = 0;
+    unsigned wt = 0, wh = 0, wk = 0;
+    for (unsigned t = 0; t < std::min<unsigned>(M, 2); ++t)
+      for (unsigned h = 0; h < std::min<unsigned>(num_heads, 2); ++h)
+        for (int k = 0; k < std::min(half_d, 8); ++k) {
+          long rrow = (long)t * num_heads * (2 * half_d) + (long)h * (2 * half_d);
+          long llut = (long)(start_pos + t) * half_d + k;
+          float c = h2f(cos_lut[llut]), s = h2f(sin_lut[llut]);
+          float lo = h2f(rv_in[rrow + k]), hi = h2f(rv_in[rrow + k + half_d]);
+          float rlo = lo * c - hi * s, rhi = hi * c + lo * s;
+          float glo = h2f(rv_out[write_off + rrow + k]);
+          float ghi = h2f(rv_out[write_off + rrow + k + half_d]);
+          float r1 = std::fabs(glo - rlo) / (std::fabs(rlo) + 1e-3f);
+          float r2 = std::fabs(ghi - rhi) / (std::fabs(rhi) + 1e-3f);
+          if (r1 > maxrel) { maxrel = r1; gat = glo; rat = rlo; wt = t; wh = h; wk = k; }
+          if (r2 > maxrel) { maxrel = r2; gat = ghi; rat = rhi; wt = t; wh = h; wk = k; }
+        }
+    // cl_mem (kernel wrote) vs SVM alias (what an SVM-reading consumer sees):
+    // if these DIFFER, the cl_mem<->SVM coherence is broken (Xe3 driver) and a
+    // consumer reading the SVM plane gets a stale value -> garbage.
+    float svm_diff = -1.0f;
+    if (out_clmem && out) {
+      svm_diff = 0.0f;
+      size_t lim = std::min<size_t>((size_t)M * num_heads * head_dim, 4096);
+      const uint16_t *osvm = reinterpret_cast<const uint16_t *>(out);
+      for (size_t i = 0; i < lim; ++i) {
+        float d = std::fabs(h2f(rv_out[i]) - h2f(osvm[i]));
+        if (d > svm_diff) svm_diff = d;
+      }
+    }
+    std::fprintf(stderr,
+                 "[ROPEVERIFY] M=%u nh=%u head_dim=%u start=%u woff=%u "
+                 "RELERR=%.4f @(%u,%u,%u) gpu=%.3f ref=%.3f CLMEMvsSVM_maxdiff=%.4f\n",
+                 M, num_heads, head_dim, start_pos, write_off, maxrel, wt, wh,
+                 wk, gat, rat, svm_diff);
+    std::fflush(stderr);
   }
   return true;
 }
@@ -3074,6 +3199,98 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
   // so the post-kernel drain is unnecessary. Keep it only on the OOO queue.
   if (!_inorder_q)
     clFinish(q);
+  // NNTR_ATTN_VERIFY=1 (Xe3): position 0 attends only to key 0 (causal) =>
+  // O[0,h] == V[0, kv=0] for every query head (GQA maps all to kv head 0).
+  // Robust to scale/softcap/window. A large diff => attention core is wrong.
+  if (causal && std::getenv("NNTR_ATTN_VERIFY")) {
+    clFinish(q);
+    auto h2f = [](uint16_t hh) -> float {
+      uint32_t sign = (uint32_t)(hh & 0x8000) << 16;
+      uint32_t exp = (hh >> 10) & 0x1F, mant = hh & 0x3FF, f;
+      if (exp == 0) {
+        if (mant == 0) f = sign;
+        else {
+          int e = 127 - 15 + 1;
+          while (!(mant & 0x400)) { mant <<= 1; e--; }
+          mant &= 0x3FF;
+          f = sign | ((uint32_t)e << 23) | (mant << 13);
+        }
+      } else if (exp == 0x1F) f = sign | 0x7F800000u | (mant << 13);
+      else f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+      float r;
+      std::memcpy(&r, &f, 4);
+      return r;
+    };
+    float maxd = -1, go = 0, gv = 0;
+    unsigned wh = 0, wd = 0;
+    for (unsigned h = 0; h < num_heads_Q; ++h)
+      for (unsigned d = 0; d < std::min(head_dim, 8u); ++d) {
+        float o = h2f(O_host[(size_t)h * head_dim + d]);
+        float v = h2f(V_host[d]);
+        float df = std::fabs(o - v);
+        if (df > maxd) { maxd = df; wh = h; wd = d; go = o; gv = v; }
+      }
+    std::fprintf(stderr,
+                 "[ATTNVERIFY] M=%u N_kv=%u nhQ=%u nhKV=%u hd=%u "
+                 "O[0]vsV[0]_maxdiff=%.4f @h%u,d%u O=%.3f V=%.3f\n",
+                 M, N_kv, num_heads_Q, num_heads_KV, head_dim, maxd, wh, wd, go,
+                 gv);
+    // Multi-key check: full CPU attention (head 0, pos m) from the SAME
+    // Q/K/V_host the GPU read. Match => kernel correct (any garbage is stale
+    // INPUT); mismatch => kernel wrong. Try scale=1 (Q pre-scaled by q_scaled)
+    // and scale=1/sqrt(d) to disambiguate the scaling convention.
+    const unsigned HD_Q = num_heads_Q * head_dim, HD_KV = num_heads_KV * head_dim;
+    // Check EVERY query position (incl. the last, which produces the first
+    // generated token) against the CPU reference. Worst diff over all m, head 0.
+    const float scale = 1.0f / std::sqrt((double)head_dim);
+    const unsigned gq = num_heads_Q / num_heads_KV;
+    float worst = -1; unsigned worst_m = 0, worst_h = 0;
+    for (unsigned hq = 0; hq < num_heads_Q; ++hq)
+      for (unsigned m = 1; m < M && N_kv > 1; ++m) {
+        const unsigned hkv = hq / gq;
+        std::vector<float> scores, oref;
+        mha_cpu_qk_row(Q_host, K_host, m, hq, hkv, N_kv, HD_Q, HD_KV, head_dim,
+                       causal, scale, scores);
+        if (attn_softcap > 0)
+          for (auto &s : scores)
+            if (std::isfinite(s)) s = attn_softcap * std::tanh(s / attn_softcap);
+        mha_softmax_in_place(scores);
+        mha_cpu_sv_row(scores, V_host, hkv, N_kv, HD_KV, head_dim, oref);
+        float md = 0;
+        for (unsigned d = 0; d < std::min(head_dim, 16u); ++d)
+          md = std::max(
+            md, std::fabs(h2f(O_host[(size_t)m * HD_Q + hq * head_dim + d]) -
+                          oref[d]));
+        if (md > worst) { worst = md; worst_m = m; worst_h = hq; }
+      }
+    std::fprintf(stderr,
+                 "[ATTNVERIFY2] worst_maxdiff=%.4f @m=%u,h=%u (ALL %u heads x %u "
+                 "positions)\n",
+                 worst, worst_m, worst_h, num_heads_Q, M);
+    // Does the Q the flash reads match the rope's rotated output? 0 => the
+    // rope output reached the attention; large => stale (un-rotated) read.
+    if (g_rope_qcheck_set && M > 1 && head_dim >= 16) {
+      float qd = 0;
+      for (int d = 0; d < 16; ++d)
+        qd = std::max(qd, std::fabs(h2f(Q_host[(size_t)1 * HD_Q + d]) -
+                                    g_rope_qcheck[d]));
+      std::fprintf(stderr,
+                   "[ATTNQCHECK] Q_host[pos1] vs rope_rotated maxdiff=%.4f "
+                   "(0=flash reads rotated Q; large=STALE un-rotated)\n",
+                   qd);
+    }
+    if (g_rope_kcheck_set && N_kv > 1 && head_dim >= 16) {
+      float kd = 0;
+      for (int d = 0; d < 16; ++d)
+        kd = std::max(kd, std::fabs(h2f(K_host[(size_t)1 * HD_KV + d]) -
+                                    g_rope_kcheck[d]));
+      std::fprintf(stderr,
+                   "[ATTNKCHECK] K_host[pos1] vs rope_rotated maxdiff=%.4f "
+                   "(0=flash reads rotated K; large=STALE un-rotated)\n",
+                   kd);
+    }
+    std::fflush(stderr);
+  }
   return true;
 }
 

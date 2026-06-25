@@ -768,7 +768,12 @@ static void v8c_write_output_resident(cl_mem y_fp16, Tensor &output,
   // geglu, next FC) — never read on the host — so the in-order queue orders
   // this map before the next op's unmap and the host need not block here.
   // Removes ~182 per-forward queue drains (the dominant FC sync band).
-  cc->command_queue_inst_.enqueueSVMMap(out_svm, out_bytes, true, /*async=*/true);
+  // NNTR_FC_SVM_SYNC=1 (Xe3 coherence regression probe): make the FC-output SVM
+  // map BLOCKING so the GPU writes are guaranteed visible to the next consumer
+  // before it reads (the suspected coarse-grained-SVM stale-shadow on NEO 26.22).
+  static const bool fc_svm_sync = std::getenv("NNTR_FC_SVM_SYNC") != nullptr;
+  cc->command_queue_inst_.enqueueSVMMap(out_svm, out_bytes, true,
+                                        /*async=*/!fc_svm_sync);
   // NNTR_DEVRES Step 1: the GPU now holds the fresh FC output in out_svm. Flag
   // it device-resident so a downstream GPU consumer sharing this MemoryData
   // (edge view) sees a HIT. No map is skipped yet (Step 4+); this only sets the
@@ -844,6 +849,24 @@ bool clmem_raise_cl(const Tensor &t, unsigned int valid_bytes) {
                            t.getData<uint8_t>(), 0, nullptr,
                            nullptr) != CL_SUCCESS)
     throw std::runtime_error("clmem_raise_cl: clEnqueueWriteBuffer failed");
+  // NNTR_RAISE_VERIFY=1 (Xe3): confirm the SVM->cl_mem upload landed (the
+  // cl_mem the next consumer reads == the SVM source the attention wrote).
+  if (std::getenv("NNTR_RAISE_VERIFY")) {
+    clFinish(q);
+    const size_t cnt = std::min(bytes, (size_t)4096) / 2;
+    std::vector<uint16_t> back(cnt);
+    clEnqueueReadBuffer(q, static_cast<cl_mem>(sub), CL_TRUE, 0, cnt * 2,
+                        back.data(), 0, nullptr, nullptr);
+    const uint16_t *svmsrc =
+      reinterpret_cast<const uint16_t *>(t.getData<uint8_t>());
+    float maxd = 0;
+    for (size_t i = 0; i < cnt; ++i)
+      maxd = std::max(maxd, std::fabs(v8c_h2f(back[i]) - v8c_h2f(svmsrc[i])));
+    std::fprintf(stderr,
+                 "[RAISEVERIFY] %-26s cl_mem vs SVM maxdiff=%.4f bytes=%zu\n",
+                 t.getName().c_str(), maxd, bytes);
+    std::fflush(stderr);
+  }
   return true;
 }
 
@@ -1104,10 +1127,54 @@ bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate) {
   if (!ok)
     throw std::runtime_error("clmem_residual_op_cl: arg binding");
 
+  // NNTR_RESID_VERIFY=1 (Xe3): snapshot src and dst before the op so we can
+  // confirm the result == (accumulate ? src+dst : src) from the SAME buffers
+  // the kernel reads. A large diff => the residual add/copy itself is wrong;
+  // correct here but garbage output => an UPSTREAM op fed it a stale buffer.
+  const bool resid_verify = std::getenv("NNTR_RESID_VERIFY") != nullptr;
+  std::vector<uint16_t> rv_s, rv_d0;
+  if (resid_verify) {
+    cl_command_queue qq = cc->command_queue_inst_.GetCommandQueue();
+    clFinish(qq);
+    const size_t cnt = std::min((size_t)n, (size_t)2048);
+    rv_s.resize(cnt);
+    rv_d0.resize(cnt);
+    if (src_cl)
+      clEnqueueReadBuffer(qq, static_cast<cl_mem>(src_cl), CL_TRUE, 0, cnt * 2,
+                          rv_s.data(), 0, nullptr, nullptr);
+    else
+      std::memcpy(rv_s.data(), src_svm, cnt * 2);
+    if (dst_cl)
+      clEnqueueReadBuffer(qq, static_cast<cl_mem>(dst_cl), CL_TRUE, 0, cnt * 2,
+                          rv_d0.data(), 0, nullptr, nullptr);
+    else
+      std::memcpy(rv_d0.data(), dst_svm, cnt * 2);
+  }
+
   const int gws[3] = {(int)(((size_t)n + 63) / 64 * 64), 1, 1};
   const int lws[3] = {64, 1, 1};
   if (!cc->command_queue_inst_.DispatchCommand(kp, gws, lws))
     throw std::runtime_error("clmem_residual_op_cl: dispatch");
+  if (resid_verify) {
+    cl_command_queue qq = cc->command_queue_inst_.GetCommandQueue();
+    clFinish(qq);
+    const size_t cnt = rv_s.size();
+    std::vector<uint16_t> rv_d1(cnt);
+    if (dst_cl)
+      clEnqueueReadBuffer(qq, static_cast<cl_mem>(dst_cl), CL_TRUE, 0, cnt * 2,
+                          rv_d1.data(), 0, nullptr, nullptr);
+    else
+      std::memcpy(rv_d1.data(), dst_svm, cnt * 2);
+    float maxd = 0;
+    for (size_t i = 0; i < cnt; ++i) {
+      float exp = accumulate ? (v8c_h2f(rv_s[i]) + v8c_h2f(rv_d0[i]))
+                             : v8c_h2f(rv_s[i]);
+      maxd = std::max(maxd, std::fabs(v8c_h2f(rv_d1[i]) - exp));
+    }
+    std::fprintf(stderr, "[RESIDVERIFY] %-28s acc=%d maxdiff=%.4f\n",
+                 dst.getName().c_str(), (int)accumulate, maxd);
+    std::fflush(stderr);
+  }
 
   if (src_cl == nullptr)
     cc->command_queue_inst_.enqueueSVMMap(src_svm, bytes, true, /*async=*/true);
@@ -1929,10 +1996,104 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     gemm_int8_v8c_cl(gemm_act_arg, gemm_wgt_arg, act_scale_arg, w->scale_buf,
                      act_rs_arg, act_zp_arg, w->row_sum_w_int4, gemm_y_arg,
                      M_pad, N, K, direct_out ? M : M_pad);
+    // NNTR_XE3_FC_SYNC: narrowed Xe3 coherence fix. The in-order queue does not
+    // give kernel->kernel coarse-grained-SVM coherence on NEO 26.22; the global
+    // hammer (NNTR_XE3_SYNC, clFinish after EVERY dispatch) fixes it but serializes
+    // decode. The bisect showed a clFinish after the FC GEMM alone is sufficient
+    // (it is the dominant SVM-producing op and lands between most consumers), so
+    // draining only here keeps coherence while restoring decode pipelining.
+    static const bool xe3_fc_sync = std::getenv("NNTR_XE3_FC_SYNC") != nullptr;
+    if (xe3_fc_sync)
+      clFinish(q);
     if (prof_enabled) {
       clFinish(q);
       T1 = NOW();
       prof.bin[prof_bin].gemm_ns += NS(T1, T0);
+    }
+
+    // === FP16 v8c GEMM output sum/min/max trace (NNTR_V8C_FP16_TRACE) ===
+    // Debug: which FC (by N) produces a degenerate (all-zero / Inf) output.
+    if (std::getenv("NNTR_V8C_FP16_TRACE")) {
+      clFinish(q);
+      const size_t rows_dbg = direct_out ? (size_t)M : (size_t)M_pad;
+      const size_t cnt_dbg = rows_dbg * (size_t)N;
+      std::vector<uint16_t> ph_dbg(cnt_dbg);
+      clEnqueueReadBuffer(q, gemm_y_arg, CL_TRUE, 0,
+                          sizeof(uint16_t) * cnt_dbg, ph_dbg.data(), 0, nullptr,
+                          nullptr);
+      double s_dbg = 0.0;
+      float mn_dbg = 1e30f, mx_dbg = -1e30f;
+      size_t nz_dbg = 0;
+      for (size_t i = 0; i < (size_t)M * N; ++i) {
+        float v = v8c_h2f(ph_dbg[i]);
+        s_dbg += v;
+        if (v != 0.0f) ++nz_dbg;
+        if (v < mn_dbg) mn_dbg = v;
+        if (v > mx_dbg) mx_dbg = v;
+      }
+      std::vector<float> wsc_dbg(N);
+      clEnqueueReadBuffer(q, w->scale_buf, CL_TRUE, 0, sizeof(float) * N,
+                          wsc_dbg.data(), 0, nullptr, nullptr);
+      float wsc_mn = 1e30f, wsc_mx = -1e30f;
+      double wsc_sum = 0;
+      for (unsigned int i = 0; i < N; ++i) {
+        if (wsc_dbg[i] < wsc_mn) wsc_mn = wsc_dbg[i];
+        if (wsc_dbg[i] > wsc_mx) wsc_mx = wsc_dbg[i];
+        wsc_sum += wsc_dbg[i];
+      }
+      // === Definitive per-FC CPU reference (int8 act × int4 w + bias-corr) ===
+      // No cross-engine confound: checks the GPU output against the math-correct
+      // value computed from the SAME quantized inputs the GPU used.
+      float max_rel = -1.0f, gpu_at = 0, ref_at = 0;
+      unsigned worst_m = 0, worst_n = 0;
+      if (use_buf) {
+        std::vector<int8_t> gq((size_t)M_pad * K);
+        std::vector<float> gsa(M_pad);
+        std::vector<int32_t> gzp(M_pad), grs(M_pad), grsw(N);
+        clEnqueueReadBuffer(q, act_i8_arg, CL_TRUE, 0, (size_t)M_pad * K,
+                            gq.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(q, act_scale_arg, CL_TRUE, 0, sizeof(float) * M_pad,
+                            gsa.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(q, act_zp_arg, CL_TRUE, 0, sizeof(int) * M_pad,
+                            gzp.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(q, act_rs_arg, CL_TRUE, 0, sizeof(int) * M_pad,
+                            grs.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(q, w->row_sum_w_int4, CL_TRUE, 0, sizeof(int) * N,
+                            grsw.data(), 0, nullptr, nullptr);
+        const uint8_t *sa = weight.getData<uint8_t>();
+        const size_t NR = 4, KRSR = 8, BPK = 2 * NR * KRSR, nbpsr = NR * (K / 2);
+        auto dec = [&](unsigned n, unsigned k) -> int {
+          size_t kbl = k / 32, kp = k % 32, sr = n / NR, nr = n % NR;
+          const uint8_t *ba = sa + sr * nbpsr + kbl * BPK + nr * KRSR;
+          const uint8_t *bb = ba + NR * KRSR;
+          uint8_t nib;
+          if (kp < 8) nib = (ba[kp] ^ 0x88) & 0xF;
+          else if (kp < 16) nib = (bb[kp - 8] ^ 0x88) & 0xF;
+          else if (kp < 24) nib = ((ba[kp - 16] ^ 0x88) >> 4) & 0xF;
+          else nib = ((bb[kp - 24] ^ 0x88) >> 4) & 0xF;
+          return (int)nib - 8;
+        };
+        for (unsigned m = 0; m < std::min(M, 2u); ++m) {
+          for (unsigned n = 0; n < std::min(N, 16u); ++n) {
+            long acc = 0;
+            for (unsigned k = 0; k < K; ++k)
+              acc += (long)gq[m * (size_t)K + k] * (dec(n, k) + 8);
+            long corr = acc - 8L * grs[m] - (long)gzp[m] * grsw[n];
+            float ref = (float)corr * gsa[m] * wsc_dbg[n];
+            float gv = v8c_h2f(ph_dbg[m * (size_t)N + n]);
+            float rel = std::fabs(gv - ref) / (std::fabs(ref) + 1e-3f);
+            if (rel > max_rel) {
+              max_rel = rel; gpu_at = gv; ref_at = ref; worst_m = m; worst_n = n;
+            }
+          }
+        }
+      }
+      std::fprintf(stderr,
+                   "[FP16FC] %-28s M=%u N=%u K=%u out[%.2f,%.2f] wsc=%.4g "
+                   "RELERR=%.4f @(%u,%u) gpu=%.3f ref=%.3f\n",
+                   weight.getName().c_str(), M, N, K, mn_dbg, mx_dbg,
+                   wsc_sum / N, max_rel, worst_m, worst_n, gpu_at, ref_at);
+      std::fflush(stderr);
     }
 
     // === GEMM-output check: same int8 act + same int4 w + same formula. ===

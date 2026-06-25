@@ -408,6 +408,36 @@ void GeGLULayerCl::geglu_cl_fp16(_FP16 *matAdata, _FP16 *vecXdata,
       ml_loge("Failed to run");
       break;
     }
+    // NNTR_GEGLU_VERIFY=1 (Xe3): out == gelu(in1) * in2 from the SAME buffers
+    // the kernel used. Correct => geglu fine (any garbage is a stale INPUT).
+    if (std::getenv("NNTR_GEGLU_VERIFY")) {
+      cl_command_queue qq =
+        global_cl_context->command_queue_inst_.GetCommandQueue();
+      clFinish(qq);
+      const size_t cnt = std::min((size_t)dim, (size_t)2048);
+      std::vector<uint16_t> a(cnt), b(cnt), o(cnt);
+      auto rd = [&](void *clm, _FP16 *svm, std::vector<uint16_t> &v) {
+        if (clm)
+          clEnqueueReadBuffer(qq, static_cast<cl_mem>(clm), CL_TRUE, 0, cnt * 2,
+                              v.data(), 0, nullptr, nullptr);
+        else
+          std::memcpy(v.data(), svm, cnt * 2);
+      };
+      rd(in1_clmem, matAdata, a);
+      rd(in2_clmem, vecXdata, b);
+      rd(resident_out, vecYdata, o);
+      auto h2f = [](uint16_t hh) { _FP16 t; std::memcpy(&t, &hh, 2); return (float)t; };
+      float maxd = 0;
+      for (size_t i = 0; i < cnt; ++i) {
+        float x = h2f(a[i]);
+        float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+        float ref = 0.5f * x * (1.0f + std::tanh(inner)) * h2f(b[i]);
+        maxd = std::max(maxd, std::fabs(h2f(o[i]) - ref));
+      }
+      std::fprintf(stderr, "[GEGLUVERIFY] dim1=%u dim2=%u maxdiff=%.4f\n", dim1,
+                   dim2, maxd);
+      std::fflush(stderr);
+    }
 
     if (!svm) {
       if (!clbuffInstance.getOutBufferA()->ReadDataRegion(

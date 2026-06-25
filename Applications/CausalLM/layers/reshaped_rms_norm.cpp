@@ -162,6 +162,15 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       }
     }
     const unsigned int n_rows = in_step.getDim().height();
+    if (std::getenv("NNTR_RMSN_TRACE")) {
+      std::fprintf(stderr,
+                   "[RMSN] %-26s use_svm=%d use_svm_ng=%d in.clmem=%d "
+                   "out.clmem=%d use_gamma=%d fs=%u rows=%u\n",
+                   context.getName().c_str(), (int)use_svm, (int)use_svm_ng,
+                   (int)in_step.isClMem(), (int)out_step.isClMem(),
+                   (int)use_gamma, feature_size, n_rows);
+      std::fflush(stderr);
+    }
     bool gpu_done = false;
     if (use_svm) {
       if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
