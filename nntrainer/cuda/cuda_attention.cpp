@@ -472,6 +472,13 @@ attn_blockq_d512(const unsigned short *q, const unsigned short *k,
                  float softcap) {
   blockq_body<4, 16>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window, softcap);
 }
+extern "C" __global__ void
+attn_blockq_d128(const unsigned short *q, const unsigned short *k,
+                 const unsigned short *v, unsigned short *o, int HQ, int HKV,
+                 int N_q, int N_kv, int cache_from, int d, int window,
+                 float softcap) {
+  blockq_body<4, 4>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window, softcap);
+}
 )CU";
 
 // Row-wise causal+window softmax over a per-head scores matrix [N_q, N_kv]
@@ -807,8 +814,11 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // folded; only the multi-row (prefill) path with head_dim in {256, 512}
   // (gemma4 sliding/global) -- decode (N_q==1) keeps split-KV above.
   static const bool blockq_on = std::getenv("NNTR_CUDA_BLOCKQ") != nullptr;
-  if (blockq_on && N_q > 1 && (head_dim == 256 || head_dim == 512)) {
-    const char *fn = (head_dim == 256) ? "attn_blockq_d256" : "attn_blockq_d512";
+  if (blockq_on && N_q > 1 &&
+      (head_dim == 128 || head_dim == 256 || head_dim == 512)) {
+    const char *fn = (head_dim == 256)   ? "attn_blockq_d256"
+                     : (head_dim == 512) ? "attn_blockq_d512"
+                                         : "attn_blockq_d128";
     auto kb = CudaContext::Global().registerCudaKernel(ATTN_BLOCKQ_SRC, fn);
     if (kb) {
       // window<=0 or window>=N_kv -> disable the sliding mask (full causal);
