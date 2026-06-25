@@ -625,7 +625,9 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
       static const bool dump_stats = std::getenv("NNTR_DUMP_STATS") != nullptr;
       if (dump_stats) {
         try {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
           cudaDeviceSynchronize();
+#endif
           Tensor &o = node->getOutput(0);
           float mn = o.minValue(), mx = o.maxValue();
           bool bad = std::isnan(mn) || std::isnan(mx) || std::isinf(mn) ||

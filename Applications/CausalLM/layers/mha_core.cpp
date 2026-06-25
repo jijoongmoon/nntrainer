@@ -3098,7 +3098,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   // Host decode attention reads GPU-produced Q/K on the host: sync first so the
   // read is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#endif
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
                   cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
 
