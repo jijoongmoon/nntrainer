@@ -107,8 +107,15 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
   // col-major ld=N -> k-slice = B + k0*N (cols). Tunable: NNTR_CUBLAS_KCHUNK.
   static const int kchunk = []() {
     const char *e = std::getenv("NNTR_CUBLAS_KCHUNK");
-    int v = e ? atoi(e) : 2048;
-    return v > 0 ? v : 2048;
+    if (e) {
+      int v = atoi(e);
+      return v > 0 ? v : 2048;
+    }
+    // The K-chunk only works around an sm_87 (integrated Orin) large-K int8 IMMA
+    // algo-selection bug. Discrete GPUs (RTX) run the full-K call correctly and
+    // a few % faster (no per-chunk repack + extra accumulating GEMMs), so don't
+    // chunk there: a huge kchunk makes K>kchunk false -> one full-K call.
+    return ContextManager::Global().isIntegrated() ? 2048 : (1 << 28);
   }();
   // GEMM algo probe (NNTR_CUBLAS_ALGO): the int8 GEMM is the prefill critical
   // path at only ~20 TOPS. cublasGemmEx defaults to CUBLAS_GEMM_DEFAULT(-1);
