@@ -96,33 +96,73 @@ optional tuning / diagnostics.
 
 ## 3. Measured performance
 
-Prefill measured at **M=1024** (`prompt_1p2k.txt`, 1024-token prompt). Decode TPS
-is reported at the corresponding ~1K context (decode throughput decreases as the
-KV context grows). Measured 2026-06-19 at HEAD.
+Prefill at **M=1024** (`prompt_1p2k.txt`); decode at the corresponding ~1K
+context. Measured **2026-06-25** on the unified branch (`gpu/v8c-unified`),
+best-of-3, all coherent. Models are Gemma4-E2B / Gemma2-2B / Qwen3-0.6B, all
+QINT4-FP16 (`gemma4_lmint4` / `gemma2_lg_q6k` / `qwen3_lg_q6k`).
 
 ### Adreno 840 (S26 Ultra) — image2d, FP16
 
-| Model | dir | prefill (TPS) | decode @~1K (TPS) |
-|-------|-----|--------------:|------------------:|
-| Gemma4-E2B (QINT4-FP16, untied lm_head int4) | `gemma4_lmint4` | **2401** | 16.1 (≈22.9 short-ctx) |
-| Gemma2-2B (QINT4-FP16, Q6_K lm_head) | `gemma2_lg_q6k` | **839** | 13.8 |
-| Qwen3-0.6B (QINT4-FP16, Q6_K lm_head) | `qwen3_lg_q6k` | **2116** | 21.9 |
-
-### Intel Arc 0x7d55 (Meteor Lake) — `cl_mem` buffer, FP16
+```
+LD_LIBRARY_PATH=$PWD NNTR_FC_INT8_GPU=1 NNTR_MHA_GPU=1 NNTR_GPU_SVM_POOL=1 \
+NNTR_KV_IMG_ATTN=1 NNTR_GPU_CLMEM_POOL=1 ./nntrainer_causallm models/<DIR> "$PROMPT"
+```
 
 | Model | prefill (TPS) | decode @~1K (TPS) |
 |-------|--------------:|------------------:|
-| Gemma4-E2B | **1602** | 5.15 (→ ~7.9 with `NNTR_MHA_GPU_DECODE` flash-decode) |
-| Gemma2-2B | **686** | 7.75 |
-| Qwen3-0.6B | **1939** | 9.29 |
+| Gemma4-E2B | **2454** | 18.2 |
+| Gemma2-2B | **827** | 14.5 |
+| Qwen3-0.6B | **2151** | 30.0 |
+
+### Intel Xe3 (Panther Lake iGPU) — `cl_mem` buffer + XMX, FP16
+
+`NNTR_FC_XMX=1` (DPAS prefill GEMM, ~1.7–1.9× over dp4a) + `NNTR_XE3_SYNC=1`
+(Xe3 coherence — **mandatory**) on the canonical Intel set:
+
+```
+NNTR_GPU_SVM_POOL=1 NNTR_V8C_BUF=1 NNTR_MHA_GPU=1 NNTR_FC_INT8_GPU=1 \
+NNTR_GPU_CLMEM_POOL=1 NNTR_XE3_SYNC=1 NNTR_FC_XMX=1 \
+  ./build_cl/Applications/CausalLM/nntr_causallm <MODEL_DIR> "$PROMPT"
+```
+
+| Model | prefill (TPS) | decode @~1K (TPS) |
+|-------|--------------:|------------------:|
+| Gemma4-E2B | **2964** | 18.2 |
+| Gemma2-2B | **1756** | 13.8 |
+| Qwen3-0.6B | **2301** | 37.6 |
+
+### NVIDIA CUDA — RTX 5060 Laptop (Blackwell sm_120), discrete
+
+block-Q attention (incl. the head_dim=128 kernel) → Qwen3 needs **no**
+`NNTR_CUDA_GEMM_ATTN`. Integrated Orin (sm_87) instead appends
+`NNTR_CUDA_GEMM_ATTN=1 NNTR_CUDA_GRAPH=1 NNTR_CUDA_M2B=1` (see `run_gemma4_fast.sh`).
+
+```
+NNTR_ENGINE=cuda NNTR_CUDA_DEV_ACT=1 NNTR_RMSNORM_CUDA_OFF=all \
+NNTR_CUDA_ROPE=1 NNTR_CUDA_ATTN=1 NNTR_CUDA_QKNORM=1 NNTR_CUDA_GEGLU=1 \
+NNTR_CUDA_ELTWISE=1 NNTR_CUDA_KV_UVM=1 NNTR_CUDA_VCOPY_PREFILL=1 \
+NNTR_CUDA_FLASH_DECODE=64 NNTR_CUDA_BLOCKQ=1 NNTR_FC_CUDA_CUBLAS=1 NNTR_CUDA_PREWARM=1 \
+  ./build_cuda/Applications/CausalLM/nntr_causallm <MODEL_DIR> "$PROMPT"
+```
+
+| Model | prefill (TPS) | decode @~1K (TPS) |
+|-------|--------------:|------------------:|
+| Gemma4-E2B | **5400** | 35.3 |
+| Gemma2-2B | **3151** | 50.7 |
+| Qwen3-0.6B | **4511** | 84.2 |
 
 Notes:
-- Gemma4 prefill is fast despite being ~2B because ~57% of its layers share KV
-  and are skipped during prefill (`skip_prefill`, Gemma4-only — see §6).
-- Adreno prefill > Intel because the image2d FC path benefits from the texture
-  cache; Adreno decode > Intel because of the image-backed cooperative GEMV.
-- All three models produce coherent output (e.g. *"The capital of South Korea is
-  **Seoul**."*) on both backends.
+- Gemma4 prefill is fast despite ~2B params because ~57% of its layers share KV
+  and skip prefill (`skip_prefill`, Gemma4-only — see §6).
+- Intel: XMX (`NNTR_FC_XMX`) lifts Xe3 prefill ~1.7–1.9× over dp4a.
+- CUDA: block-Q attention beats cuBLAS for every head_dim on RTX; the new d128
+  kernel takes Qwen3 prefill 916 (block-Q fall-through) → 4511 (vs 3969 with
+  `NNTR_CUDA_GEMM_ATTN`). On integrated Orin (sm_87) cuBLAS still wins, so the
+  Orin recipe keeps `NNTR_CUDA_GEMM_ATTN`.
+- The cublas int8 K-chunk (sm_87 large-K workaround) is gated to integrated only,
+  so discrete RTX runs the full-K FC (gemma4/gemma2 +3–6% vs chunking everywhere).
+- All three models produce coherent output (continuing the 1K passage) on all
+  backends.
 
 ---
 
