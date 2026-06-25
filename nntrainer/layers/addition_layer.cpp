@@ -26,6 +26,7 @@
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
 #endif
 #include <layer_context.h>
 
@@ -99,6 +100,13 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
           continue;
       }
     }
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // The host residual path below reads GPU-produced UVM inputs on the CPU
+    // (copy()/add_i()). In async mode the producing kernels have not drained,
+    // so sync first; no-op in default (sync) mode.
+    nntrainer::cuda::StreamManager::Global().finishIfAsync();
 #endif
 
     /** @todo check possibility for in-place of addition layer */

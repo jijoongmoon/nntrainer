@@ -17,6 +17,8 @@
 
 #include <nntrainer_log.h>
 
+#include <cuda_runtime.h>
+
 namespace nntrainer::cuda {
 
 static const char *ELTWISE_SRC = R"CU(
@@ -101,6 +103,183 @@ __global__ void softcap_fp16(const unsigned short *in, unsigned short *out,
 }
 }
 )CU";
+
+// Two-pass on-GPU greedy argmax over the vocab logits. Pass 1: each of GRIDDIM
+// blocks reduces a grid-strided slice of [N] to one (max, idx) pair, written to
+// the per-block scratch (pmax[b], pidx[b]). Pass 2: a single block reduces the
+// GRIDDIM partials to the final (max, idx) and writes the 4-byte index to
+// oidx[0]. Ties resolve to the LOWEST index (matches std::max_element, which
+// keeps the first of equal maxima). fp32 and fp16 variants (fp16 decoded inline
+// with the same half->float as the other elementwise kernels).
+static const char *ARGMAX_SRC = R"CU(
+extern "C" {
+__device__ __forceinline__ float am_h2f(unsigned short h) {
+  unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
+  unsigned int e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, o;
+  if (e == 0u) {
+    if (m == 0u) o = s;
+    else { int x=-1; do{m<<=1;x++;}while((m&0x400u)==0u); m&=0x3FFu;
+           o = s | ((unsigned int)(127-15-x)<<23) | (m<<13); }
+  } else if (e == 0x1Fu) o = s | 0x7F800000u | (m<<13);
+  else o = s | ((e + (127u-15u))<<23) | (m<<13);
+  return __int_as_float((int)o);
+}
+// Block-reduce shared (val,idx), tie -> lowest idx. blockDim.x must be 256.
+__device__ __forceinline__ void am_block_reduce(float *sv, int *si) {
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      int j = threadIdx.x + s;
+      if (sv[j] > sv[threadIdx.x] ||
+          (sv[j] == sv[threadIdx.x] && si[j] < si[threadIdx.x])) {
+        sv[threadIdx.x] = sv[j];
+        si[threadIdx.x] = si[j];
+      }
+    }
+    __syncthreads();
+  }
+}
+__global__ void argmax_p1_f32(const float *logits, int n, float *pmax,
+                              int *pidx) {
+  __shared__ float sv[256];
+  __shared__ int si[256];
+  float bv = -3.402823466e+38f; // -FLT_MAX
+  int bi = 0;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += blockDim.x * gridDim.x) {
+    float v = logits[i];
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+  }
+  sv[threadIdx.x] = bv;
+  si[threadIdx.x] = bi;
+  __syncthreads();
+  am_block_reduce(sv, si);
+  if (threadIdx.x == 0) { pmax[blockIdx.x] = sv[0]; pidx[blockIdx.x] = si[0]; }
+}
+__global__ void argmax_p1_f16(const unsigned short *logits, int n, float *pmax,
+                              int *pidx) {
+  __shared__ float sv[256];
+  __shared__ int si[256];
+  float bv = -3.402823466e+38f;
+  int bi = 0;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += blockDim.x * gridDim.x) {
+    float v = am_h2f(logits[i]);
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+  }
+  sv[threadIdx.x] = bv;
+  si[threadIdx.x] = bi;
+  __syncthreads();
+  am_block_reduce(sv, si);
+  if (threadIdx.x == 0) { pmax[blockIdx.x] = sv[0]; pidx[blockIdx.x] = si[0]; }
+}
+__global__ void argmax_p2(const float *pmax, const int *pidx, int g,
+                          unsigned int *oidx) {
+  __shared__ float sv[256];
+  __shared__ int si[256];
+  float bv = -3.402823466e+38f;
+  int bi = 0;
+  for (int i = threadIdx.x; i < g; i += blockDim.x) {
+    float v = pmax[i];
+    int idx = pidx[i];
+    if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
+  }
+  sv[threadIdx.x] = bv;
+  si[threadIdx.x] = bi;
+  __syncthreads();
+  am_block_reduce(sv, si);
+  if (threadIdx.x == 0) oidx[0] = (unsigned int)si[0];
+}
+}
+)CU";
+
+namespace {
+constexpr int ARGMAX_GRID = 256; // pass-1 blocks (== pass-2 reduction width)
+float *g_am_pmax = nullptr;       // [ARGMAX_GRID] per-block partial max
+int *g_am_pidx = nullptr;         // [ARGMAX_GRID] per-block partial idx
+unsigned int *g_am_oidx = nullptr; // [1] device final index
+unsigned int *g_am_oidx_host = nullptr; // pinned host staging for the 4-byte D2H
+
+// One-time allocation of the small fixed-size argmax scratch (partials + the
+// 1-int device/host result). Capture-safe: a cudaMalloc inside stream capture
+// invalidates the graph, so bail under capture (the buffers are tiny and are
+// allocated on the first non-captured call -- the gating env makes this opt-in).
+bool ensure_argmax_scratch() {
+  if (g_am_pmax && g_am_pidx && g_am_oidx && g_am_oidx_host)
+    return true;
+  if (StreamManager::Global().isCapturing())
+    return false;
+  if (!g_am_pmax &&
+      cudaMalloc(&g_am_pmax, sizeof(float) * ARGMAX_GRID) != cudaSuccess)
+    return false;
+  if (!g_am_pidx &&
+      cudaMalloc(&g_am_pidx, sizeof(int) * ARGMAX_GRID) != cudaSuccess)
+    return false;
+  if (!g_am_oidx &&
+      cudaMalloc(&g_am_oidx, sizeof(unsigned int)) != cudaSuccess)
+    return false;
+  if (!g_am_oidx_host &&
+      cudaHostAlloc(&g_am_oidx_host, sizeof(unsigned int),
+                    cudaHostAllocDefault) != cudaSuccess)
+    return false;
+  return true;
+}
+
+// Run the two-pass reduction over a device-resident logits pointer (fp32 or
+// fp16) and copy the 4-byte token id back to the host. Shared by both dtypes.
+bool argmax_dispatch(const void *logits_dev, bool is_fp16, unsigned int vocab,
+                     unsigned int *token_out_host) {
+  if (logits_dev == nullptr || vocab == 0 || token_out_host == nullptr)
+    return false;
+  // Capture-safe scratch (no cudaMalloc under graph capture).
+  if (!ensure_argmax_scratch())
+    return false;
+
+  auto kp1 = CudaContext::Global().registerCudaKernel(
+    ARGMAX_SRC, is_fp16 ? "argmax_p1_f16" : "argmax_p1_f32");
+  auto kp2 = CudaContext::Global().registerCudaKernel(ARGMAX_SRC, "argmax_p2");
+  if (!kp1 || !kp2) {
+    ml_loge("[CUDA] argmax: kernel registration failed");
+    return false;
+  }
+
+  int n = (int)vocab, g = ARGMAX_GRID;
+  kp1->SetKernelArguments(0, &logits_dev, sizeof(logits_dev));
+  kp1->SetKernelArguments(1, &n, sizeof(n));
+  kp1->SetKernelArguments(2, &g_am_pmax, sizeof(g_am_pmax));
+  kp1->SetKernelArguments(3, &g_am_pidx, sizeof(g_am_pidx));
+  const int b1[3] = {256, 1, 1};
+  const int g1[3] = {ARGMAX_GRID, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kp1, g1, b1))
+    return false;
+
+  kp2->SetKernelArguments(0, &g_am_pmax, sizeof(g_am_pmax));
+  kp2->SetKernelArguments(1, &g_am_pidx, sizeof(g_am_pidx));
+  kp2->SetKernelArguments(2, &g, sizeof(g));
+  kp2->SetKernelArguments(3, &g_am_oidx, sizeof(g_am_oidx));
+  const int b2[3] = {256, 1, 1};
+  const int g2[3] = {1, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kp2, g2, b2))
+    return false;
+
+  // Drain so the 4-byte D2H sees the final write, then copy the token id.
+  StreamManager::Global().finish();
+  if (cudaMemcpy(g_am_oidx_host, g_am_oidx, sizeof(unsigned int),
+                 cudaMemcpyDeviceToHost) != cudaSuccess)
+    return false;
+  *token_out_host = *g_am_oidx_host;
+  return true;
+}
+} // namespace
+
+bool cuda_argmax_fp32(const float *logits_dev, unsigned int vocab,
+                      unsigned int *token_out_host) {
+  return argmax_dispatch(logits_dev, /*is_fp16=*/false, vocab, token_out_host);
+}
+
+bool cuda_argmax_fp16(const unsigned short *logits_dev, unsigned int vocab,
+                      unsigned int *token_out_host) {
+  return argmax_dispatch(logits_dev, /*is_fp16=*/true, vocab, token_out_host);
+}
 
 template <typename K> static bool dispatch1d(K &kernel, unsigned int n) {
   const int block[3] = {256, 1, 1};

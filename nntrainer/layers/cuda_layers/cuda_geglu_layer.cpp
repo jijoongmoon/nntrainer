@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdlib>
 
+#include <cuda_stream_manager.h>
+
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
@@ -72,6 +74,10 @@ void CudaGeGLULayer::gegluProcess(const Tensor &in1, const Tensor &in2,
     }
   }
 #endif
+
+  // Host gelu fallback: sync first so the host read of GPU-produced gate/up is
+  // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+  cuda::StreamManager::Global().finishIfAsync();
 
   if (dt == ml::train::TensorDim::DataType::FP32) {
     const float *a = in1.getData<float>();

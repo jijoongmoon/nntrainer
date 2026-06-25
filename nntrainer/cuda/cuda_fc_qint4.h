@@ -154,6 +154,62 @@ bool cuda_fc_qint4_prewarm(const unsigned char *section_a, unsigned int N,
                            unsigned int K);
 
 /**
+ * @brief Pre-grow ALL the static dp4a decode scratch buffers (g_dp4a_q8 /
+ *        ascale / azp / xf / yf) to the model's max decode capacity at LOAD, so
+ *        the M=1 dp4a decode FC path never cudaMallocs inside a CUDA-graph
+ *        capture (NNTR_CUDA_GRAPH). A cudaMalloc/Free between
+ *        cudaStreamBeginCapture..EndCapture invalidates the capture
+ *        ("NvMapMemAllocInternalTagged failed: error 12"); warming here (before
+ *        any capture) makes every captured ensure_buf a pure cap-hit. The
+ *        in-path isCapturing() guard is the safety net if a model exceeds these
+ *        bounds. Idempotent (cap check).
+ *
+ * @param maxM max decode token rows (1 for decode; larger is a harmless grow)
+ * @param maxK max FC input dim (hidden size; covers every decode FC's K)
+ * @param maxN max FC output dim (max(vocab, intermediate); covers lm_head + FFN)
+ */
+bool cuda_fc_qint4_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
+                                unsigned int maxN);
+
+/**
+ * @brief Stage a HOST-resident [M,K] fp16 activation into a device buffer for
+ *        the fp16 GPU qint4 path. When the FC input pointer is host memory (the
+ *        weight/output are still device-resident), the fp16 dp4a/cublas kernels
+ *        cannot read it directly; this copies it H2D (async, on the backend
+ *        stream so it is ordered before the kernels) into a reusable staging
+ *        buffer and returns the device pointer. Returns nullptr if the buffer
+ *        can't be obtained (OOM, or a graph capture before the buffer was
+ *        prewarmed) so the caller falls back to the host path. Pre-grown by
+ *        cuda_fc_qint4_dp4a_prewarm so the copy is a pure cap-hit under capture.
+ *
+ * @param host_Xh [M,K] row-major fp16 activation on the host heap
+ * @param M,K     activation dims
+ * @return device pointer to the staged fp16 X, or nullptr on failure
+ */
+const unsigned short *cuda_fc_qint4_stage_host_x_fp16(const unsigned short *host_Xh,
+                                                      unsigned int M,
+                                                      unsigned int K);
+
+/**
+ * @brief Stage a HOST-resident QINT4 weight (section-A + scales) to cached
+ *        device buffers. A model-load race can leave a weight unregistered on
+ *        the host heap; the dp4a repack reads it on the GPU, so without this the
+ *        FC falls to the i8mm host dot (SIGILL on Orin). Cached by host
+ *        section_a pointer (uploaded once, on a non-capture forward).
+ * @param host_secA   host section-A weight payload
+ * @param host_scales host fp16 scales [N]
+ * @param N,K         output / contraction dims
+ * @param dev_secA    out: device section-A pointer
+ * @param dev_scales  out: device scales pointer
+ * @return true if device pointers are available, false to fall back
+ */
+bool cuda_fc_qint4_stage_host_weight(const unsigned char *host_secA,
+                                     const unsigned short *host_scales,
+                                     unsigned int N, unsigned int K,
+                                     const unsigned char **dev_secA,
+                                     const unsigned short **dev_scales);
+
+/**
  * @brief High-accuracy fp16 path: FP32-precision activation (no int8 quant),
  *        naive Section-A decode-GEMM. Selected by NNTR_FC_CUDA_DP4A=0 for an
  *        fp16 activation (and as an accuracy reference vs the dp4a w4a8 path).

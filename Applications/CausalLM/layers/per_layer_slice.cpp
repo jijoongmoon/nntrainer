@@ -18,6 +18,7 @@
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
 #endif
 
 namespace causallm {
@@ -97,16 +98,27 @@ void PerLayerSliceLayer::incremental_forwarding(
           done = true;
       }
 #endif
-      if (!done)
+      if (!done) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+        // Host memcpy slicing reads the GPU-produced UVM input on the CPU; sync
+        // first in async mode (no-op in default sync mode).
+        nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#endif
         for (unsigned int t = 0; t < tokens; ++t)
           std::memcpy(out_data + t * feature_size,
                       in_data + t * W + layer_index * feature_size,
                       sizeof(_FP16) * feature_size);
+      }
     } else
 #endif
     {
       float *in_data = in_step.getData<float>();
       float *out_data = out_step.getData<float>();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Host memcpy slicing reads the GPU-produced UVM input on the CPU; sync
+      // first in async mode (no-op in default sync mode).
+      nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#endif
       for (unsigned int t = 0; t < tokens; ++t)
         std::memcpy(out_data + t * feature_size,
                     in_data + t * W + layer_index * feature_size,

@@ -19,6 +19,7 @@
 #include <cuda_context_manager.h>
 #include <cuda_rmsnorm.h>
 #include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
 
 #include <layer_context.h>
 #include <nntrainer_error.h>
@@ -101,6 +102,9 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
       return;
   }
 #endif
+  // Host rmsnorm fallback: sync first so the host read of GPU-produced input is
+  // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+  cuda::StreamManager::Global().finishIfAsync();
   if (dt == DT::FP32 && gt == DT::FP32) {
     rmsnorm_rows(in.getData<float>(), gamma.getData<float>(),
                  out.getData<float>(), rows, width, eps);

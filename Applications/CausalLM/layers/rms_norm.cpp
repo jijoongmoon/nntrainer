@@ -181,6 +181,13 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
             ss += v * v;
           }
           float inv = 1.0f / std::sqrt(ss / static_cast<float>(W) + epsilon);
+          if (std::getenv("NNTR_RMS_PROBE")) {
+            static int _n = 0;
+            if (_n++ < 6)
+              std::fprintf(stderr,
+                           "[RMS-HOST-FP16] rows=%u W=%u ss=%.3g inv=%.3g\n",
+                           rows, W, ss, inv);
+          }
           for (unsigned int k = 0; k < W; ++k)
             yr[k] = static_cast<_FP16>(static_cast<float>(xr[k]) * inv);
         }

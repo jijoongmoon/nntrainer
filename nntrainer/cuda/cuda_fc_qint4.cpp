@@ -206,6 +206,13 @@ std::mutex g_qint4_mtx;
 bool ensure_stage(float **buf, size_t *cap, size_t bytes) {
   if (bytes <= *cap)
     return true;
+  // cudaMalloc/cudaFree inside a CUDA-graph stream capture invalidates the
+  // capture. The fp32-resident staging buffers are pre-grown at load by
+  // cuda_fc_qint4_dp4a_prewarm() so this branch must not run under capture; if
+  // it ever would (an under-sized prewarm), bail so the caller falls back
+  // rather than corrupting the graph.
+  if (StreamManager::Global().isCapturing())
+    return false;
   if (*buf)
     cudaFree(*buf);
   if (cudaMalloc(buf, bytes) != cudaSuccess) {
@@ -261,6 +268,7 @@ bool cuda_fc_qint4_sectionA_gemm_fp32_resident(const float *host_X,
     return false;
 
   // 4) output back to the host tensor.
+  StreamManager::Global().finishIfAsync();
   cudaMemcpy(host_Y, g_stage_y, yb, cudaMemcpyDeviceToHost);
   return true;
 }
@@ -738,6 +746,13 @@ float *g_dp4a_yf = nullptr; // float Y staging for the fp16-output path
 size_t g_dp4a_yf_cap = 0;
 float *g_dp4a_xf = nullptr; // float X staging for the naive fp16 path
 size_t g_dp4a_xf_cap = 0;
+// fp16 X staging for a HOST-resident input on the device GPU qint4 path: when
+// the FC input pointer is host memory (e.g. NNTR_CUDA_M2B feeds the token via
+// pinned host memory), the fp16 dp4a/cublas kernels still need a device X. The
+// M*K fp16 input is copied H2D into this buffer and the device pointer is used
+// instead of falling to the i8mm host dot (which SIGILLs on Orin).
+unsigned short *g_stage_xh = nullptr;
+size_t g_stage_xh_cap = 0;
 std::mutex g_dp4a_mtx;
 
 // repack (cached) + GEMM into a device float Y, using the already-staged
@@ -830,6 +845,13 @@ bool dp4a_repack_and_gemm(const unsigned char *section_a,
 bool ensure_buf(void **buf, size_t *cap, size_t bytes) {
   if (bytes <= *cap)
     return true;
+  // cudaMalloc/cudaFree inside a CUDA-graph stream capture invalidates the
+  // capture. The dp4a decode scratch is pre-grown at load by
+  // cuda_fc_qint4_dp4a_prewarm() so this branch must not run under capture; if
+  // it ever would (an under-sized prewarm), bail so the caller falls back
+  // rather than corrupting the graph.
+  if (StreamManager::Global().isCapturing())
+    return false;
   if (*buf)
     cudaFree(*buf);
   if (cudaMalloc(buf, bytes) != cudaSuccess) {
@@ -843,12 +865,120 @@ bool ensure_buf(void **buf, size_t *cap, size_t bytes) {
 } // namespace
 
 // stage q8 + ascale + azp scratch (caller holds the mutex). False on OOM.
+// +256B tail pad on the int8 activation: the cuBLAS int8 IMMA GEMM reads A with
+// wide vectorized (>=16B) Tensor-Core loads that can run past the last real
+// element; an exactly-sized buffer (esp. large K=6144 down-proj) then faults
+// with cudaErrorIllegalAddress. The pad keeps those reads in mapped memory.
+static constexpr size_t FC_I8_TAIL_PAD = 256;
 static bool dp4a_stage_scratch(unsigned int M, unsigned int K) {
-  return ensure_buf((void **)&g_dp4a_q8, &g_dp4a_q8_cap, (size_t)M * K) &&
+  return ensure_buf((void **)&g_dp4a_q8, &g_dp4a_q8_cap,
+                    (size_t)M * K + FC_I8_TAIL_PAD) &&
          ensure_buf((void **)&g_dp4a_ascale, &g_dp4a_ascale_cap,
                     sizeof(float) * (size_t)M) &&
          ensure_buf((void **)&g_dp4a_azp, &g_dp4a_azp_cap,
                     sizeof(int) * (size_t)M);
+}
+
+// Pre-grow ALL the static dp4a decode scratch buffers to the model's max decode
+// capacity at load. The M=1 dp4a decode FC path is reached under graph capture
+// once NNTR_CUDA_GRAPH is on; a cudaMalloc/Free inside
+// cudaStreamBeginCapture..EndCapture invalidates the capture and surfaces as
+// "NvMapMemAllocInternalTagged failed: error 12". Warming here (before any
+// capture) makes every captured ensure_buf a pure cap-hit, so the dp4a path
+// stays usable under the graph. ensure_buf's isCapturing() guard is the safety
+// net if a model exceeds these bounds. Idempotent (cap check). False on OOM.
+//
+// maxM   max decode token rows (1 for decode; larger is a harmless over-grow)
+// maxK   max FC input dim  (hidden DIM; covers every decode FC's K)
+// maxN   max FC output dim (max(vocab, intermediate); covers lm_head + FFN)
+bool cuda_fc_qint4_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
+                                unsigned int maxN) {
+  if (maxM == 0 || maxK == 0 || maxN == 0)
+    return true;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  // q8/ascale/azp staging: exact sizes dp4a_stage_scratch() computes.
+  if (!dp4a_stage_scratch(maxM, maxK))
+    return false;
+  // float X/Y staging: exact sizes the fp16-naive / fp32-resident paths use
+  // (g_dp4a_xf = M*K floats, g_dp4a_yf = M*N floats). yf is grown to maxM*maxN
+  // so the largest decode FC (lm_head N = vocab) is covered.
+  // g_stage_xh (M*K fp16) covers the host-resident-input staging on the fp16 GPU
+  // path, so that copy is also a pure cap-hit under capture.
+  return ensure_buf((void **)&g_dp4a_xf, &g_dp4a_xf_cap,
+                    sizeof(float) * (size_t)maxM * maxK) &&
+         ensure_buf((void **)&g_dp4a_yf, &g_dp4a_yf_cap,
+                    sizeof(float) * (size_t)maxM * maxN) &&
+         ensure_buf((void **)&g_stage_xh, &g_stage_xh_cap,
+                    sizeof(unsigned short) * (size_t)maxM * maxK);
+}
+
+// Stage a HOST-resident M*K fp16 activation into a device buffer for the fp16
+// GPU qint4 path. Copies host_Xh H2D (async, on the backend stream so it is
+// ordered before the kernels that read it) into the reusable g_stage_xh buffer
+// and returns the device pointer. Returns nullptr if the buffer can't be grown
+// (OOM, or a capture before prewarm sized it) so the caller falls back to the
+// host path. The copy is enqueued on the backend stream; the subsequent kernel
+// launch on the same stream sees it complete.
+const unsigned short *cuda_fc_qint4_stage_host_x_fp16(const unsigned short *host_Xh,
+                                                      unsigned int M,
+                                                      unsigned int K) {
+  if (host_Xh == nullptr || M == 0 || K == 0)
+    return nullptr;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  const size_t bytes = sizeof(unsigned short) * (size_t)M * K;
+  if (!ensure_buf((void **)&g_stage_xh, &g_stage_xh_cap, bytes))
+    return nullptr; // OOM, or capturing before the buffer was prewarmed
+  if (cudaMemcpyAsync(g_stage_xh, host_Xh, bytes, cudaMemcpyHostToDevice,
+                      StreamManager::Global().GetStream()) != cudaSuccess) {
+    cudaGetLastError();
+    return nullptr;
+  }
+  return g_stage_xh;
+}
+
+// Stage a HOST-resident QINT4 section-A weight + scales into cached device
+// buffers and return the device pointers. A model-load timing race can leave a
+// weight in plain host memory (cudaPointerGetAttributes type Unregistered)
+// instead of the managed pool; the dp4a repack kernel reads section_a on the
+// GPU, so a host pointer makes the cudaFcGemm gate fall to the i8mm host dot,
+// which SIGILLs on Orin (no i8mm). Reuses g_qint4_weight_cache (weights are
+// constant, uploaded once, keyed by host section_a). Uploads happen on the
+// first/prefill forward, NOT under graph capture; bails if asked to allocate
+// under capture so the caller can fall back. Returns false on failure.
+bool cuda_fc_qint4_stage_host_weight(const unsigned char *host_secA,
+                                     const unsigned short *host_scales,
+                                     unsigned int N, unsigned int K,
+                                     const unsigned char **dev_secA,
+                                     const unsigned short **dev_scales) {
+  if (host_secA == nullptr || host_scales == nullptr || N == 0 || K == 0)
+    return false;
+  std::lock_guard<std::mutex> lk(g_qint4_mtx);
+  auto it = g_qint4_weight_cache.find(host_secA);
+  if (it == g_qint4_weight_cache.end()) {
+    if (StreamManager::Global().isCapturing())
+      return false;
+    const unsigned k_internal = ((K + 31u) / 32u) * 32u;
+    const size_t secA_bytes =
+      (size_t)(((N + 3u) / 4u) * 4u) * (k_internal / 2u);
+    DevWeight dw;
+    if (cudaMalloc(&dw.d_secA, secA_bytes) != cudaSuccess) {
+      cudaGetLastError();
+      return false;
+    }
+    if (cudaMalloc(&dw.d_sc, sizeof(unsigned short) * (size_t)N) !=
+        cudaSuccess) {
+      cudaFree(dw.d_secA);
+      cudaGetLastError();
+      return false;
+    }
+    cudaMemcpy(dw.d_secA, host_secA, secA_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw.d_sc, host_scales, sizeof(unsigned short) * (size_t)N,
+               cudaMemcpyHostToDevice);
+    it = g_qint4_weight_cache.emplace(host_secA, dw).first;
+  }
+  *dev_secA = it->second.d_secA;
+  *dev_scales = it->second.d_sc;
+  return true;
 }
 
 // CPU mirror of the device seca_decode: signed int4 weight for (output channel
@@ -1075,7 +1205,7 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
   auto it = g_i8_weight_cache.find(section_a);
   if (it == g_i8_weight_cache.end()) {
     DevWeightI8 dw;
-    if (cudaMalloc(&dw.w8, (size_t)N * K) != cudaSuccess)
+    if (cudaMalloc(&dw.w8, (size_t)N * K + FC_I8_TAIL_PAD) != cudaSuccess)
       return false;
     if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
       cudaFree(dw.w8);
@@ -1107,8 +1237,10 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
     it = g_i8_weight_cache.emplace(section_a, dw).first;
   }
 
-  // 3) int32 GEMM output scratch [Mpad,N].
-  if (!ensure_buf((void **)&g_i8_c, &g_i8_c_cap, sizeof(int) * (size_t)Mpad * N))
+  // 3) int32 GEMM output scratch [Mpad,N] (+tail pad: IMMA can write/read C in
+  // wide vectorized tiles past the last element on large shapes).
+  if (!ensure_buf((void **)&g_i8_c, &g_i8_c_cap,
+                  sizeof(int) * (size_t)Mpad * N + FC_I8_TAIL_PAD))
     return false;
 
   // 4) INT8 IMMA GEMM on the Tensor Cores (Mpad rows; same backend stream as
@@ -1133,6 +1265,24 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
   if (!StreamManager::Global().DispatchCommand(*kde, dg, db))
     return false;
   maybe_finish();
+  // Catch an ASYNC failure in the cuBLAS IMMA GEMM / epilogue (the sync cuBLAS
+  // status was already checked). On Orin a large-M IMMA can fault at runtime and
+  // leave a STICKY cuda error -- which then makes the NEXT layer's
+  // cudaPointerGetAttributes (rms_norm dev_ok gate) fail, dropping rms_norm to
+  // its host path that reads device/managed activations under cMA=0 -> SIGSEGV.
+  // Clearing + returning false makes the caller fall back to the (correct) dp4a
+  // GEMM cleanly instead of corrupting the rest of the forward.
+  {
+    cudaError_t _e = cudaGetLastError();
+    if (_e != cudaSuccess) {
+      if (std::getenv("NNTR_IGEMM_DBG"))
+        std::fprintf(stderr,
+                     "[IGEMM] async error after GEMM M=%d N=%d K=%d: %s -> dp4a "
+                     "fallback\n",
+                     m, n, k, cudaGetErrorString(_e));
+      return false;
+    }
+  }
   return true;
 }
 

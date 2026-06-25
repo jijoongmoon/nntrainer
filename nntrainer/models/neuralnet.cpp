@@ -618,6 +618,23 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
           node->incremental_forwarding(from, to, training);
         }
       }
+      // NNTR_DUMP_STATS: per-node output min/max + NaN/Inf flag, to pinpoint the
+      // first layer whose output diverges (Orin/sm_87 triage). Draining first so
+      // any async GPU op's result is visible to the host stat read.
+      static const bool dump_stats = std::getenv("NNTR_DUMP_STATS") != nullptr;
+      if (dump_stats) {
+        try {
+          cudaDeviceSynchronize();
+          Tensor &o = node->getOutput(0);
+          float mn = o.minValue(), mx = o.maxValue();
+          bool bad = std::isnan(mn) || std::isnan(mx) || std::isinf(mn) ||
+                     std::isinf(mx);
+          std::fprintf(stderr, "[stats] %-30s %-16s min=%.4g max=%.4g%s\n",
+                       node->getName().c_str(), node->getType().c_str(), mn, mx,
+                       bad ? "  <<< NaN/Inf" : "");
+        } catch (...) {
+        }
+      }
       // auto end_layer =
       //  std::chrono::high_resolution_clock::now(); // log th
       //   auto duration_ =
@@ -1634,6 +1651,11 @@ NeuralNetwork::inference(unsigned int batch_size,
 
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // The caller reads the GPU-produced UVM model output on the host; sync first
+    // in async mode (no-op in default sync mode).
+    nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#endif
     output.push_back(out_t.getData());
   }
 
@@ -1893,6 +1915,11 @@ std::vector<float *> NeuralNetwork::incremental_inference(
     const size_t buf_size = batch_size * out_t.getDim().getFeatureLen();
     last_out_buf_data = new float[buf_size];
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // The host reads the GPU-produced UVM model output below (scopy_fp16_to_fp32
+    // / memcpy); sync first in async mode (no-op in default sync mode).
+    nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#endif
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
 

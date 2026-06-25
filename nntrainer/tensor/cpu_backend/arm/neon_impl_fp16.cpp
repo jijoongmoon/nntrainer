@@ -485,7 +485,7 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
         if (n < 4)
           Y32[idx + n] = y0_3[n];
         else
-          Y32[idx + n] = y4_7[n];
+          Y32[idx + n] = y4_7[n - 4];
       }
     }
   }
@@ -576,7 +576,7 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
         if (n < 4)
           Y32[idx + n] = y0_3[n];
         else
-          Y32[idx + n] = y4_7[n];
+          Y32[idx + n] = y4_7[n - 4];
       }
     }
   }
@@ -642,7 +642,7 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
         if (n < 4)
           Y32[idx + n] = y0_3[n];
         else
-          Y32[idx + n] = y4_7[n];
+          Y32[idx + n] = y4_7[n - 4];
       }
     }
   }

@@ -104,6 +104,21 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
     if (seca_enabled && (int)weight.getDim().height() == K) {
       const uint8_t *W = weight.getData<uint8_t>();
       const uint16_t *S = weight.getScale<uint16_t>();
+      // Robust host-weight handling: a model-load timing race can leave the
+      // QINT4 weight in plain host memory (cudaPointerGetAttributes type
+      // Unregistered) instead of the managed pool. The dp4a repack reads
+      // section_a on the GPU, so a host weight makes the device gate below fail
+      // and the FC falls to the i8mm host dot -- which SIGILLs on Orin (no
+      // i8mm). Stage the host weight to a cached device copy and use that.
+      if (!deviceAccessible(W)) {
+        const uint8_t *dW = nullptr;
+        const uint16_t *dS = nullptr;
+        if (cuda::cuda_fc_qint4_stage_host_weight(W, S, (unsigned)N, (unsigned)K,
+                                                  &dW, &dS)) {
+          W = dW;
+          S = dS;
+        }
+      }
       // Real CausalLM models are QINT4-FP16 (fp16 activations); the reference
       // test is FP32. Pick the pointer/launcher by the activation dtype. The
       // device path defaults to the w4a8 __dp4a kernel (int8 act x int4 weight,
@@ -125,11 +140,44 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
         const char *e = std::getenv("NNTR_FC_CUDA_CUBLAS");
         return e != nullptr && e[0] == '1'; // default OFF
       }();
-      const bool all_dev =
-        deviceAccessible(Xp) && deviceAccessible(W) && deviceAccessible(Yp);
+      const bool x_dev = deviceAccessible(Xp);
+      const bool wy_dev = deviceAccessible(W) && deviceAccessible(Yp);
+      bool all_dev = x_dev && wy_dev;
+      // Host-resident INPUT on an otherwise device-resident fp16 qint4 FC: stage
+      // the M*K fp16 input into a device buffer (H2D on the backend stream) and
+      // run the GPU kernel on it, instead of falling to the i8mm host dot
+      // (HalfTensor::dotQInteger -> KAI ..._neon_i8mm), which SIGILLs on Orin.
+      // Reuses the prewarmed g_stage_xh buffer; bails (-> host path) if it can't
+      // be obtained (e.g. graph capture before prewarm). Normal case (X already
+      // device-resident) is untouched: x_dev short-circuits the stage.
+      if (!x_dev && wy_dev && fp16) {
+        if (const uint16_t *Xd = cuda::cuda_fc_qint4_stage_host_x_fp16(
+              (const uint16_t *)Xp, (unsigned)M, (unsigned)K)) {
+          Xp = (const void *)Xd;
+          all_dev = true;
+        }
+      }
+      if (std::getenv("NNTR_FC_HOSTDBG") && !x_dev) {
+        std::fprintf(stderr,
+                     "[FC-HOSTDBG] host-input M=%u K=%u N=%u wy_dev=%d fp16=%d "
+                     "staged=%d capturing=%d\n",
+                     (unsigned)M, (unsigned)K, (unsigned)N, (int)wy_dev,
+                     (int)fp16, (int)all_dev,
+                     (int)cuda::StreamManager::Global().isCapturing());
+      }
       bool ok = false;
       if (all_dev && fp16) {
-        if (use_cublas_i8 && use_dp4a && M >= 32)
+        // The large-K FFN down-proj (Orin sm_87: M=992 N=1536 K=6144) used to
+        // crash the cuBLAS int8 IMMA path (cudaErrorIllegalAddress, sm_87 large-K
+        // algo bug). That is now handled inside igemmRowMajor by K-chunking with a
+        // contiguous per-slice repack, so cuBLAS int8 IMMA is safe for all K and
+        // the cap defaults to unlimited. NNTR_FC_CUBLAS_KMAX still lets you force
+        // large-K FCs back onto dp4a if a future shape regresses.
+        static const unsigned cublas_kmax = []() {
+          const char *e = std::getenv("NNTR_FC_CUBLAS_KMAX");
+          return e ? (unsigned)atoi(e) : (1u << 20);
+        }();
+        if (use_cublas_i8 && use_dp4a && M >= 32 && K <= cublas_kmax)
           ok = cuda::cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
             (const uint16_t *)Xp, W, S, (uint16_t *)Yp, (unsigned)M,
             (unsigned)N, (unsigned)K);
@@ -153,6 +201,18 @@ void cudaFcGemm(Tensor &input_, Tensor &weight, Tensor &hidden_) {
         ok = cuda::cuda_fc_qint4_sectionA_gemm_fp32_resident(
           (const float *)Xp, W, S, (float *)Yp, (unsigned)M, (unsigned)N,
           (unsigned)K);
+      }
+      if (std::getenv("NNTR_FC_HOSTDBG") && !ok) {
+        cudaPointerAttributes aw{}, ay{};
+        cudaError_t ew = cudaPointerGetAttributes(&aw, W);
+        cudaError_t ey = cudaPointerGetAttributes(&ay, Yp);
+        cudaGetLastError();
+        std::fprintf(stderr,
+                     "[FC-GPUFAIL] ok=0 -> HOST i8mm: M=%u K=%u N=%u x_dev=%d "
+                     "wy_dev=%d | W: err=%d type=%d  Y: err=%d type=%d  cap=%d\n",
+                     (unsigned)M, (unsigned)K, (unsigned)N, (int)x_dev,
+                     (int)wy_dev, (int)ew, (int)aw.type, (int)ey, (int)ay.type,
+                     (int)cuda::StreamManager::Global().isCapturing());
       }
       if (ok)
         return;

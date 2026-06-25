@@ -124,8 +124,14 @@ void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
         unsigned short *op =
           reinterpret_cast<unsigned short *>(out_chunk.getData<_FP16>());
         cudaPointerAttributes pa{};
+        // Accept Managed (UVM) too, not just Device: on integrated GPUs (Jetson
+        // Orin) the activation pool is cudaMallocManaged, so a Device-only gate
+        // sends the softcap to the host loop below -- which, inside a CUDA-graph
+        // capture, reads the not-yet-run lm_head logits (stale) and is itself not
+        // captured -> garbage output. Managed pointers run the GPU kernel fine.
         if (cudaPointerGetAttributes(&pa, ip) == cudaSuccess &&
-            pa.type == cudaMemoryTypeDevice &&
+            (pa.type == cudaMemoryTypeDevice ||
+             pa.type == cudaMemoryTypeManaged) &&
             nntrainer::cuda::cuda_softcap_fp16(ip, op,
                                                (unsigned int)in_chunk.size(),
                                                softcap)) {

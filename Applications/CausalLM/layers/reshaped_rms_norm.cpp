@@ -22,6 +22,7 @@
 #include <cuda_context_manager.h>
 #include <cuda_rmsnorm.h>
 #include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
 #endif
 
 #include "_layer_prof.h"
@@ -203,6 +204,11 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     // CUDA per-head norm: each feature_size chunk is one rmsnorm row, so reuse
     // cuda_rmsnorm_fp16 with rows=n_rows, width=feature_size (gamma null for the
     // gamma-free v_norm). Keeps q/k/v_norm on the device. Opt-in NNTR_CUDA_QKNORM.
+    // The host fallback below reads the GPU-produced UVM in_step/gamma on the CPU
+    // (rms_norm_wrt_width_fp32_intrinsic); sync first in async mode (no-op in
+    // default sync mode). Placed before the dtype-read entry, off the SVM
+    // GPU->GPU and cl_queue_finish-guarded paths.
+    nntrainer::cuda::StreamManager::Global().finishIfAsync();
     if (!gpu_done &&
         in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       static const bool gpu = std::getenv("NNTR_CUDA_QKNORM") != nullptr;

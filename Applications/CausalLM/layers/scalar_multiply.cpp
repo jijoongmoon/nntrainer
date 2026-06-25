@@ -23,6 +23,7 @@
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
 #endif
 
 namespace causallm {
@@ -170,8 +171,14 @@ void ScalarMultiplyLayer::incremental_forwarding(
       }
     }
 #endif
-    if (!done)
+    if (!done) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Host multiply() reads the GPU-produced UVM input on the CPU; sync first
+      // in async mode (no-op in default sync mode).
+      nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#endif
       in_step.multiply(multiplier, out_step);
+    }
 
     static const bool dump_layers = std::getenv("NNTR_DUMP_LAYERS") != nullptr;
     if (dump_layers) {
