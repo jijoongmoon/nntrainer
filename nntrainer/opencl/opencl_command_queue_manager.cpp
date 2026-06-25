@@ -691,6 +691,15 @@ bool CommandQueueManager::DispatchCommand(
   }
   next_prof_label_.clear();
 
+  // NNTR_XE3_SYNC=1: Xe3 (NEO 26.22) does not honor in-order kernel->kernel
+  // memory consistency for the GPU-resident (coarse-grained SVM) handoffs that
+  // the residency model relies on (Meteor's fine-grained SVM did). Serialize
+  // each dispatch as a coherence point. Heavy hammer to confirm the race; the
+  // production fix narrows this to the actual producer->consumer boundaries.
+  static const bool xe3_sync = std::getenv("NNTR_XE3_SYNC") != nullptr;
+  if (xe3_sync && active_recording_queue_ == nullptr)
+    clFinish(command_queue_);
+
   return true;
 }
 
@@ -761,6 +770,15 @@ bool CommandQueueManager::DispatchCommand(
     profRecs().push_back({std::move(key), local_evt});
   }
   next_prof_label_.clear();
+
+  // NNTR_XE3_SYNC=1: Xe3 (NEO 26.22) does not honor in-order kernel->kernel
+  // memory consistency for the GPU-resident (coarse-grained SVM) handoffs that
+  // the residency model relies on (Meteor's fine-grained SVM did). Serialize
+  // each dispatch as a coherence point. Heavy hammer to confirm the race; the
+  // production fix narrows this to the actual producer->consumer boundaries.
+  static const bool xe3_sync = std::getenv("NNTR_XE3_SYNC") != nullptr;
+  if (xe3_sync && active_recording_queue_ == nullptr)
+    clFinish(command_queue_);
 
   return true;
 }
