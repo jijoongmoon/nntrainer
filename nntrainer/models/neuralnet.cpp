@@ -68,6 +68,7 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <chrono>
+#include <cuda_context_manager.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -1703,6 +1704,21 @@ sharedConstTensors NeuralNetwork::incremental_inference(
   static const char *_cgraph_env = std::getenv("NNTR_CUDA_GRAPH");
   static const bool cuda_graph_decode =
     _cgraph_env != nullptr && _cgraph_env[0] == '1';
+  // PREFILL graph (W3): capture the M>1 prefill forward like decode, collapsing
+  // the ~190 per-op cudaStreamSynchronize drains (the cMA=0 sync floor) into one
+  // submission. Default ON for INTEGRATED GPUs (Orin) when the graph path is
+  // enabled; discrete GPUs (RTX) keep their existing eager-async prefill (they
+  // are not sync-bound -- isIntegrated()==false). Override: NNTR_CUDA_PREFILL_GRAPH
+  // =1/0. A capture abort (e.g. an in-capture cudaMalloc on un-pre-grown scratch)
+  // falls back to eager, which also grows the scratch so the NEXT prefill captures.
+  static const bool cuda_graph_prefill = []() {
+    const char *e = std::getenv("NNTR_CUDA_PREFILL_GRAPH");
+    if (e != nullptr)
+      return e[0] != '0';
+    const char *g = std::getenv("NNTR_CUDA_GRAPH");
+    return g != nullptr && g[0] == '1' &&
+           nntrainer::cuda::ContextManager::Global().isIntegrated();
+  }();
   static const bool cuda_graph_dbg =
     std::getenv("NNTR_CUDA_GRAPH_DBG") != nullptr;
   // Diagnostic: cache the exec from the first captured token and RE-LAUNCH it for
@@ -1850,6 +1866,59 @@ sharedConstTensors NeuralNetwork::incremental_inference(
         std::fprintf(stderr,
                      "[CUDA_GRAPH] fell back (captured=%lu fallback=%lu) stage=%s err=%d\n",
                      _cg_ok, _cg_fallback, stage, (int)cerr);
+    }
+  }
+  // PREFILL graph capture (W3): same machinery as the decode M1 branch above,
+  // for the M>1 prefill (from==0). One beginCapture -> forward -> endCapture ->
+  // instantiate -> launch -> single sync, replacing the ~190 per-op drains. The
+  // StreamManager capturing_ guard suppresses the in-forward syncs; an in-capture
+  // cudaMalloc (un-pre-grown scratch) invalidates the graph -> clean eager
+  // fallback below (which also grows the scratch so the next prefill captures).
+  if (!cuda_graph_captured && cuda_graph_prefill && !prefill_capture_disabled_ &&
+      from == 0 && (to - from) > 1) {
+    auto &sm = nntrainer::cuda::StreamManager::Global();
+    using _clk = std::chrono::high_resolution_clock;
+    auto _us = [](_clk::time_point a, _clk::time_point b) {
+      return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    long t_rec = 0, t_inst = 0, t_rep = 0;
+    const char *stage = "beginCapture";
+    cudaError_t cerr = cudaSuccess;
+    if (sm.beginCapture()) {
+      auto p0 = _clk::now();
+      out = incremental_forwarding(from, to, X, label, false);
+      cudaGraph_t graph = nullptr;
+      bool ended = sm.endCapture(&graph);
+      auto p1 = _clk::now();
+      t_rec = _us(p0, p1);
+      if (ended && graph != nullptr) {
+        cudaGraphExec_t exec = nullptr;
+        cerr = cudaGraphInstantiate(&exec, graph, 0);
+        auto p2 = _clk::now();
+        t_inst = _us(p1, p2);
+        if (cerr == cudaSuccess) {
+          cudaGraphLaunch(exec, sm.GetStream());
+          cudaStreamSynchronize(sm.GetStream());
+          t_rep = _us(p2, _clk::now());
+          cudaGraphExecDestroy(exec);
+          cuda_graph_captured = true;
+        } else {
+          stage = "cudaGraphInstantiate";
+        }
+        cudaGraphDestroy(graph);
+      } else {
+        stage = "endCapture";
+        cerr = cudaGetLastError();
+      }
+    }
+    if (cuda_graph_dbg) {
+      static unsigned long _pf = 0;
+      std::fprintf(stderr,
+                   "[PREFILL_GRAPH] #%lu M=%u %s record=%ldus instantiate=%ldus "
+                   "replay+sync=%ldus stage=%s err=%d\n",
+                   ++_pf, (unsigned)(to - from),
+                   cuda_graph_captured ? "CAPTURED" : "FALLBACK", t_rec, t_inst,
+                   t_rep, stage, (int)cerr);
     }
   }
   if (!cuda_graph_captured)

@@ -886,6 +886,39 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         std::max(static_cast<unsigned int>(DIM),
                  static_cast<unsigned int>(INTERMEDIATE_SIZE)),
         std::max(NUM_VOCAB, static_cast<unsigned int>(INTERMEDIATE_SIZE)));
+
+      // W2: when the PREFILL CUDA graph is active (integrated), run ONE eager
+      // prefill forward at the real M here (load phase) so EVERY prefill scratch
+      // buffer (g_dp4a_q8/ascale/azp, g_i8_c, g_i8_bchunk, attention scratch) is
+      // grown and the cuBLASLt algos are selected. Otherwise the FIRST (and only,
+      // in a single-shot run) real prefill would hit an in-capture cudaMalloc and
+      // fall back to eager. This warmup itself captures->aborts(malloc)->eager,
+      // which is exactly what grows the scratch; the timed prefill then captures.
+      // Reset the KV position after so the real prefill is unaffected.
+      {
+        const char *_pgenv = std::getenv("NNTR_CUDA_PREFILL_GRAPH");
+        const char *_genv = std::getenv("NNTR_CUDA_GRAPH");
+        const bool prefill_graph_on =
+          _pgenv ? (_pgenv[0] != '0')
+                 : (_genv && _genv[0] == '1' &&
+                    nntrainer::cuda::ContextManager::Global().isIntegrated());
+        if (prefill_graph_on && init_len > 1) {
+          const unsigned int wlen =
+            (SKIP_PREFILL && init_len > 1) ? init_len - 1 : init_len;
+          auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
+          // EAGER warmup: disable prefill-graph capture so the FCs grow their
+          // scratch via cudaMalloc (a malloc inside capture would make the FC
+          // bail to host i8mm -> SIGILL on Orin). Re-enable after.
+          nn->setPrefillCaptureDisabled(true);
+          setKVCachePosition(prefill_from);
+          auto wout = incrementalInference(BATCH_SIZE, input, wlen, prefill_from,
+                                           prefill_from + wlen);
+          for (auto &o : wout)
+            delete[] o;
+          setKVCachePosition(prefill_from);
+          nn->setPrefillCaptureDisabled(false);
+        }
+      }
       start_prefill = std::chrono::high_resolution_clock::now();
     }
   }

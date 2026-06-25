@@ -751,7 +751,11 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // head_dim 256/512 are faster on block-Q (warp-shuffle, K/V reuse); GEMM wins
   // for the smaller head dims (128 = qwen3/llama) where block-Q underutilises.
   static const bool gemm_attn_on = std::getenv("NNTR_CUDA_GEMM_ATTN") != nullptr;
-  if (gemm_attn_on && N_q > 1 && head_dim != 256 && head_dim != 512) {
+  // head_dim 256/512 (gemma4 sliding/global) were historically excluded because
+  // block-Q beat the cuBLAS path on RTX/Adreno. On Orin (sm_87) block-Q runs at
+  // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth trying
+  // here -- opt-in via NNTR_CUDA_GEMM_ATTN, so other arches keep block-Q.
+  if (gemm_attn_on && N_q > 1) {
     if (attention_gemm_prefill_fp16(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
                                     num_heads_KV, N_q, N_kv, cache_from, head_dim,
                                     window, softcap)) {
