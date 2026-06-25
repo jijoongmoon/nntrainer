@@ -44,10 +44,20 @@ static unsigned int min_prefill_thr() {
     const char *e = std::getenv("NNTR_MIN_PREFILL");
     if (e)
       return (unsigned int)std::atoi(e);
+    // The ARM=32 crossover historically routed tiny prefill to the host NEON
+    // attention/RoPE for speed. But that is a CPU heuristic, not a correctness
+    // gate: when GPU mode is requested (NNTR_MHA_GPU) the host fallback must NOT
+    // be taken for short prefill. For q/k-norm models (gemma4/qwen3) the host
+    // RoPE re-reads the stale SVM shadow of the GPU-resident q/k-norm output and
+    // produces garbage, while the GPU path stays coherent. So force the GPU path
+    // at any step_size whenever GPU attention is on -- the threshold then only
+    // governs the pure-host (engine=cpu) ARM build.
+    if (std::getenv("NNTR_MHA_GPU") != nullptr)
+      return 1u;
 #if defined(__x86_64__) || defined(__i386__)
     return 1u; // x86 (Intel OpenCL / CUDA): no host NEON -> always GPU
 #else
-    return 32u; // ARM (Adreno): host NEON is fast for tiny prefill -> crossover
+    return 32u; // ARM host (engine=cpu): host NEON is fast for tiny prefill
 #endif
   }();
   return v;
