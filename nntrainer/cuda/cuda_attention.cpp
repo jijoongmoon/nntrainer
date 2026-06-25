@@ -267,8 +267,18 @@ __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
                              const unsigned short *v, float *pm, float *pl,
                              float *pacc, int HQ, int HKV, int N_kv,
                              int cache_from, int d, int window, float softcap,
-                             int chunk_kv, int n_chunks) {
+                             int chunk_kv, int n_chunks,
+                             const int *d_pos, int max_n_chunks) {
   int h = blockIdx.x, c = blockIdx.y;
+  // M2-B: read the live query position / key-count from the device d_pos buffer
+  // (mirrors attn_core_il_fp16) so ONE captured graph is valid for every token.
+  // The grid is captured at gridDim.y=max_n_chunks; blocks past the live chunk
+  // count early-return without writing, and the partial->reduce stride uses the
+  // FIXED max_n_chunks so writer and reader always agree.
+  int cf = d_pos ? d_pos[0] : cache_from;
+  int nkv = d_pos ? d_pos[1] : N_kv;
+  int live_nchunks = (nkv + chunk_kv - 1) / chunk_kv;
+  if (c >= live_nchunks) return;
   int gqa = HQ / HKV, hkv = h / gqa;
   int HD_KV = HKV * d;
   const unsigned short *qrow = q + (long)h * d; // i=0
@@ -278,9 +288,9 @@ __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
   for (int dd = tid; dd < d; dd += B) Qsh[dd] = s_h2f(qrow[dd]);
   __syncthreads();
   float scale = rsqrtf((float)d);
-  int i_abs = cache_from; // i=0
+  int i_abs = cf; // i=0
   int j_lo_g = i_abs - window + 1; if (j_lo_g < 0) j_lo_g = 0;
-  int j_hi_g = i_abs; if (j_hi_g >= N_kv) j_hi_g = N_kv - 1;
+  int j_hi_g = i_abs; if (j_hi_g >= nkv) j_hi_g = nkv - 1;
   int j_lo = c * chunk_kv; if (j_lo < j_lo_g) j_lo = j_lo_g;
   int j_hi = (c + 1) * chunk_kv - 1; if (j_hi > j_hi_g) j_hi = j_hi_g;
   float acc[4];
@@ -301,22 +311,27 @@ __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
     int r = 0; for (int dd = tid; dd < d; dd += B, ++r) acc[r] = acc[r]*corr + p*s_h2f(vr[dd]);
   }
   if (j_lo > j_hi) { mmax = -1e30f; l = 0.f; }
-  int base = h * n_chunks + c;
+  int base = h * max_n_chunks + c;
   if (tid == 0) { pm[base] = mmax; pl[base] = l; }
   int r = 0; for (int dd = tid; dd < d; dd += B, ++r) pacc[(long)base * d + dd] = acc[r];
 }
 // One block per head; combine the n_chunks partials into the fp16 output row.
 __global__ void attn_reduce(const float *pm, const float *pl, const float *pacc,
-                            unsigned short *o, int HQ, int d, int n_chunks) {
+                            unsigned short *o, int HQ, int d, int n_chunks,
+                            const int *d_pos, int chunk_kv, int max_n_chunks) {
   int h = blockIdx.x;
   int tid = threadIdx.x, B = blockDim.x;
-  int base = h * n_chunks;
+  // M2-B: live chunk count from d_pos; FIXED max_n_chunks stride to match the
+  // partial writer (must be the SAME constant the scratch was sized with).
+  int nkv = d_pos ? d_pos[1] : (n_chunks * chunk_kv);
+  int live_nchunks = d_pos ? (nkv + chunk_kv - 1) / chunk_kv : n_chunks;
+  int base = h * max_n_chunks;
   __shared__ float M, L;
   if (tid == 0) {
     float mx = -1e30f;
-    for (int c = 0; c < n_chunks; ++c) mx = fmaxf(mx, pm[base + c]);
+    for (int c = 0; c < live_nchunks; ++c) mx = fmaxf(mx, pm[base + c]);
     float l = 0.f;
-    for (int c = 0; c < n_chunks; ++c) l += pl[base + c] * __expf(pm[base + c] - mx);
+    for (int c = 0; c < live_nchunks; ++c) l += pl[base + c] * __expf(pm[base + c] - mx);
     M = mx; L = l;
   }
   __syncthreads();
@@ -324,7 +339,7 @@ __global__ void attn_reduce(const float *pm, const float *pl, const float *pacc,
   unsigned short *orow = o + (long)h * d; // i=0
   for (int dd = tid; dd < d; dd += B) {
     float a = 0.f;
-    for (int c = 0; c < n_chunks; ++c)
+    for (int c = 0; c < live_nchunks; ++c)
       a += pacc[((long)(base + c)) * d + dd] * __expf(pm[base + c] - M);
     orow[dd] = s_f2h(a * inv);
   }
@@ -532,6 +547,11 @@ namespace {
 float *g_pm = nullptr, *g_pl = nullptr, *g_pacc = nullptr;
 size_t g_pm_cap = 0, g_pacc_cap = 0;
 std::mutex g_sk_mtx;
+// M2-B: the FIXED chunk-count stride that the split-KV scratch (g_pm/g_pl/g_pacc)
+// is pre-sized to at prewarm. The captured graph launches gridDim.y and strides
+// partial<->reduce by THIS value (not the per-token live n_chunks) so one capture
+// is valid for every token. 0 until prewarm runs (then M2-B is unavailable -> M1).
+int g_sk_max_nchunks = 0;
 bool ensure_sk(size_t mn, size_t acc) {
   if (mn > g_pm_cap) {
     // cudaMalloc/cudaFree inside a CUDA-graph stream capture invalidates the
@@ -564,8 +584,15 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
                               int HKV, int N_kv, int cache_from, int d,
                               int window, float softcap, int chunk_kv) {
   const int n_chunks = (N_kv + chunk_kv - 1) / chunk_kv;
+  // M2-B: when the device pos buffer is bound, the captured graph uses the FIXED
+  // max-chunk stride/grid (g_sk_max_nchunks, published at prewarm) so one capture
+  // serves every token. M1/non-graph (dpos=nullptr) uses the live n_chunks ->
+  // bit-identical to the original. Mirror the dense path's m2b gate (line ~839).
+  static const bool m2b = std::getenv("NNTR_CUDA_M2B") != nullptr;
+  const int *dpos = (m2b && g_sk_max_nchunks > 0) ? cuda_pos_buffer() : nullptr;
+  const int max_nc = dpos ? g_sk_max_nchunks : n_chunks;
   std::lock_guard<std::mutex> lk(g_sk_mtx);
-  if (!ensure_sk((size_t)HQ * n_chunks, (size_t)HQ * n_chunks * d))
+  if (!ensure_sk((size_t)HQ * max_nc, (size_t)HQ * max_nc * d))
     return false;
   auto kp = CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC, "attn_partial");
   auto kr = CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC, "attn_reduce");
@@ -587,7 +614,9 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   kp->SetKernelArguments(12, &softcap, sizeof(softcap));
   kp->SetKernelArguments(13, &chunk_kv, sizeof(chunk_kv));
   kp->SetKernelArguments(14, &n_chunks, sizeof(n_chunks));
-  const int pg[3] = {HQ, n_chunks, 1};
+  kp->SetKernelArguments(15, &dpos, sizeof(dpos));
+  kp->SetKernelArguments(16, &max_nc, sizeof(max_nc));
+  const int pg[3] = {HQ, max_nc, 1};
   const int pb[3] = {B, 1, 1};
   const unsigned int shmem = (unsigned int)(sizeof(float) * ((size_t)d + B));
   if (!StreamManager::Global().DispatchCommand(*kp, pg, pb, shmem))
@@ -599,6 +628,9 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   kr->SetKernelArguments(4, &HQ, sizeof(HQ));
   kr->SetKernelArguments(5, &d, sizeof(d));
   kr->SetKernelArguments(6, &n_chunks, sizeof(n_chunks));
+  kr->SetKernelArguments(7, &dpos, sizeof(dpos));
+  kr->SetKernelArguments(8, &chunk_kv, sizeof(chunk_kv));
+  kr->SetKernelArguments(9, &max_nc, sizeof(max_nc));
   const int rg[3] = {HQ, 1, 1};
   const int rb[3] = {B, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kr, rg, rb))
@@ -705,7 +737,12 @@ bool cuda_attention_splitkv_prewarm(int max_seq_len, int max_hq,
   const int max_nchunks = (max_seq_len + chunk - 1) / chunk;
   const size_t mn = (size_t)max_hq * (size_t)max_nchunks;
   std::lock_guard<std::mutex> lk(g_sk_mtx);
-  return ensure_sk(mn, mn * (size_t)max_head_dim);
+  if (!ensure_sk(mn, mn * (size_t)max_head_dim))
+    return false;
+  // Publish the fixed stride so attention_splitkv_decode + the kernels all use
+  // the SAME value the scratch was just sized with (M2-B capture correctness).
+  g_sk_max_nchunks = max_nchunks;
+  return true;
 }
 
 bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
