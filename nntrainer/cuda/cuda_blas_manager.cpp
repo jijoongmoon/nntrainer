@@ -110,6 +110,14 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
     int v = e ? atoi(e) : 2048;
     return v > 0 ? v : 2048;
   }();
+  // GEMM algo probe (NNTR_CUBLAS_ALGO): the int8 GEMM is the prefill critical
+  // path at only ~20 TOPS. cublasGemmEx defaults to CUBLAS_GEMM_DEFAULT(-1);
+  // sweep ALGO0..23 / DEFAULT_TENSOR_OP(99) / ALGO0..15_TENSOR_OP(100..115) to
+  // see if a better IMMA kernel exists for these shapes. -1 = library default.
+  static const cublasGemmAlgo_t igemm_algo = []() {
+    const char *e = std::getenv("NNTR_CUBLAS_ALGO");
+    return e ? (cublasGemmAlgo_t)atoi(e) : CUBLAS_GEMM_DEFAULT;
+  }();
   const bool chunked = K > kchunk;
   // When chunking, cublas's B operand = the activation A viewed [K,M] col-major
   // ld=K -> a k-row-slice is STRIDED (ld=K>kc), which int8 IMMA rejects (illegal
@@ -148,7 +156,7 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
     cublasStatus_t s = cublasGemmEx(
       handle_, CUBLAS_OP_N, CUBLAS_OP_N, N, M, kc, &alpha,
       B + (size_t)k0 * N, CUDA_R_8I, N, actB, CUDA_R_8I, ldB, &beta_c, C,
-      CUDA_R_32I, N, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+      CUDA_R_32I, N, CUBLAS_COMPUTE_32I, igemm_algo);
     if (s != CUBLAS_STATUS_SUCCESS) {
       if (dbg)
         fprintf(stderr,
