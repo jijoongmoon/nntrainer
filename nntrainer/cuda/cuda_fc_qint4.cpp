@@ -742,6 +742,19 @@ float *g_dp4a_ascale = nullptr; // per-row recip (dequant scale)
 size_t g_dp4a_ascale_cap = 0;
 int *g_dp4a_azp = nullptr; // per-row activation zero-point
 size_t g_dp4a_azp_cap = 0;
+
+// act_quant dedup (cuBLAS prefill path): sibling FCs that share an input
+// activation (q/k/v <- attention_norm; gate/up <- ffn_norm) re-quantize the
+// IDENTICAL fp16 rows into the shared g_dp4a_q8/ascale/azp. Since those buffers
+// persist across the sibling's GEMM+dequant (neither writes them), the 2nd/3rd
+// sibling can reuse the 1st's quantization. Model-graph tensors have stable
+// distinct addresses, so keying on (Xh ptr, K) is safe within AND across
+// forwards: a different FC has a different input tensor -> different ptr ->
+// re-quantizes; only the immediate same-ptr siblings skip. Removes ~244 of 413
+// act_quant launches. Decision is made at graph-record time, so the captured
+// graph simply omits the redundant nodes (capture-safe). Disable: NNTR_QUANT_DEDUP=0.
+const void *g_last_quant_xh = nullptr;
+int g_last_quant_k = 0;
 float *g_dp4a_yf = nullptr; // float Y staging for the fp16-output path
 size_t g_dp4a_yf_cap = 0;
 float *g_dp4a_xf = nullptr; // float X staging for the naive fp16 path
@@ -1190,16 +1203,32 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
   const int k_internal = (int)(((K + 31u) / 32u) * 32u);
 
   // 1) int8 activation quant from the fp16 input (reuse the dp4a quantizer).
-  kqh->SetKernelArguments(0, &Xh, sizeof(Xh));
-  kqh->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
-  kqh->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
-  kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
-  kqh->SetKernelArguments(4, &m, sizeof(m));
-  kqh->SetKernelArguments(5, &k, sizeof(k));
-  const int qb[3] = {256, 1, 1};
-  const int qg[3] = {(int)M, 1, 1};
-  if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
-    return false;
+  // Skip when this exact (Xh,K) was just quantized into g_dp4a_q8 by a sibling
+  // FC (q/k/v share attention_norm; gate/up share ffn_norm) -- the buffer still
+  // holds it. See g_last_quant_xh above.
+  // Opt-in: measured gain is within the thermal noise floor on Orin (act_quant
+  // is not on the critical path -- the GEMM is), so default OFF; correct + ready
+  // if a less-throttled host or a power budget makes the redundant launches matter.
+  static const bool quant_dedup = []() {
+    const char *e = std::getenv("NNTR_QUANT_DEDUP");
+    return e != nullptr && e[0] == '1';
+  }();
+  const bool reuse_quant =
+    quant_dedup && Xh == g_last_quant_xh && k == g_last_quant_k;
+  if (!reuse_quant) {
+    kqh->SetKernelArguments(0, &Xh, sizeof(Xh));
+    kqh->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
+    kqh->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+    kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+    kqh->SetKernelArguments(4, &m, sizeof(m));
+    kqh->SetKernelArguments(5, &k, sizeof(k));
+    const int qb[3] = {256, 1, 1};
+    const int qg[3] = {(int)M, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
+      return false;
+    g_last_quant_xh = Xh;
+    g_last_quant_k = k;
+  }
 
   // 2) int8 weight [K,N] + per-channel rowsum (cached one-time unpack).
   auto it = g_i8_weight_cache.find(section_a);
