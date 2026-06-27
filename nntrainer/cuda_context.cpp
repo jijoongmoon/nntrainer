@@ -41,6 +41,11 @@ void CudaContext::initialize() noexcept {
     caps_.unified_memory = true; // cudaMallocManaged (UVM) is the default pool
     ml_logi("[CudaContext] %s", caps_.toString().c_str());
 
+    // ExecPlan resolver SHADOW (docs/ARCHITECTURE_REFACTOR.md §10 T4): CUDA
+    // resolves to gemm_path=CUBLAS (cuBLAS int8 + dp4a) with host_coherent =
+    // isIntegrated(); no env to assert against, so it is logged only.
+    ml_logi("[CudaContext] %s (shadow)", resolveExecPlan(caps_).toString().c_str());
+
     add_default_object();
 
     // Unified-Memory allocator: MemoryPool buffers for engine=cuda tensors are

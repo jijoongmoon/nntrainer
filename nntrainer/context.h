@@ -81,6 +81,81 @@ struct DeviceCaps {
 };
 
 /**
+ * @brief Which quantized FC GEMM family this device should run. Derived from
+ *        DeviceCaps (attributes), never from env flags or a device name.
+ */
+enum class GemmPath {
+  CPU,    /**< host CPU backend */
+  DP4A,   /**< OpenCL dp4a / buffer int8xint4 (Adreno, non-XMX Intel) */
+  XMX,    /**< Intel Xe2/Xe3 systolic DPAS (cl_intel_subgroups present) */
+  CUBLAS, /**< CUDA cuBLAS int8 + dp4a */
+};
+
+/**
+ * @brief Convert a GemmPath to its log string.
+ */
+inline const char *toString(GemmPath p) {
+  switch (p) {
+  case GemmPath::CPU: return "CPU";
+  case GemmPath::DP4A: return "DP4A";
+  case GemmPath::XMX: return "XMX";
+  case GemmPath::CUBLAS: return "CUBLAS";
+  }
+  return "?";
+}
+
+/**
+ * @struct ExecPlan
+ * @brief The backend's resolved execution decisions, derived from DeviceCaps.
+ *        This is the output of the ExecPlan resolver — the single place where
+ *        device attributes (and later ModelFeatures) decide which kernels run,
+ *        replacing scattered NNTR_* env flags. Currently a SHADOW
+ *        (docs/ARCHITECTURE_REFACTOR.md §10 T4): resolved + logged + asserted
+ *        ==  the current env-driven choice, but NOT yet authoritative — no
+ *        decision site reads it, so it is byte-identical.
+ *
+ *        Only cleanly caps-derivable cells are resolved here. Cells that are NOT
+ *        a pure function of caps stay env overrides for now and are NOT shadowed:
+ *        - kv_backing (Adreno image2d vs Intel cl_mem buffer) — both advertise
+ *          image2d; the split is the NEO "cannot compile read_imageui" quirk,
+ *          which has no probe. (NNTR_V8C_BUF / NNTR_KV_IMG_ATTN)
+ *        - queue sync (NNTR_XE3_SYNC) — a new-ISA coherence regression; wrong ⇒
+ *          garbage, so it stays a conservative override.
+ *        Model-dependent cells (head_dim attention path, KV-share/skip-prefill)
+ *        arrive with ModelFeatures (T11).
+ */
+struct ExecPlan {
+  GemmPath gemm_path = GemmPath::CPU;
+  bool host_coherent = true; /**< host+device share one pool (no copy needed) */
+
+  /**
+   * @brief One-line dump for the shadow log.
+   */
+  std::string toString() const {
+    std::ostringstream os;
+    os << "ExecPlan{gemm_path=" << nntrainer::toString(gemm_path)
+       << ", host_coherent=" << host_coherent << "}";
+    return os.str();
+  }
+};
+
+/**
+ * @brief Resolve the ExecPlan from device capabilities alone (no env, no
+ *        device-name branch). Pure function — the seam the resolver owns.
+ */
+inline ExecPlan resolveExecPlan(const DeviceCaps &c) {
+  ExecPlan p;
+  p.host_coherent = c.integrated;
+  if (c.backend == "cuda")
+    p.gemm_path = GemmPath::CUBLAS;
+  else if (c.backend == "gpu")
+    p.gemm_path = c.subgroups ? GemmPath::XMX : GemmPath::DP4A;
+  else
+    p.gemm_path = GemmPath::CPU;
+  return p;
+}
+
+/**
  * @class Context contains user-dependent configuration for  support
  * @brief  support for app context
  */

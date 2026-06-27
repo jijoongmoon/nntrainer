@@ -23,6 +23,7 @@
 #include <compute_ops.h>
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
+#include <cstdlib>
 #include <geglu_cl.h>
 #include <mutex>
 #include <opencl_context_manager.h>
@@ -109,6 +110,23 @@ void ClContext::initialize() noexcept {
                          &host_unified, nullptr) == CL_SUCCESS) &&
         (host_unified == CL_TRUE);
       ml_logi("[ClContext] %s", caps_.toString().c_str());
+
+      // ExecPlan resolver SHADOW (docs/ARCHITECTURE_REFACTOR.md §10 T4): derive
+      // the plan from caps, log it, and assert the resolver's gemm_path agrees
+      // with the current env-driven FC choice. XMX is the cleanly caps-derivable
+      // cell (cl_intel_subgroups); on the canonical Intel env (NNTR_FC_XMX=1)
+      // resolver and env agree, so no mismatch on README baselines. Log-only —
+      // nothing reads the plan yet (byte-identical).
+      const ExecPlan plan = resolveExecPlan(caps_);
+      const char *xmx_env = std::getenv("NNTR_FC_XMX");
+      const bool env_xmx = xmx_env && std::atoi(xmx_env) != 0;
+      const bool resolver_xmx = plan.gemm_path == GemmPath::XMX;
+      ml_logi(
+        "[ClContext] %s (shadow) | env NNTR_FC_XMX=%d resolver-XMX=%d -> %s",
+        plan.toString().c_str(), (int)env_xmx, (int)resolver_xmx,
+        (env_xmx == resolver_xmx)
+          ? "MATCH"
+          : "MISMATCH (XMX-capable but env XMX off — conservative default)");
     }
 
     if (KERNEL_CACHE_ENABLED) {
