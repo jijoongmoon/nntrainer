@@ -80,6 +80,37 @@ void ClContext::initialize() noexcept {
       ml_loge("Error: ClContext::initialize() failed");
       return;
     }
+
+    // Probe device capabilities once (log-only; the ExecPlan resolver consumes
+    // this later, docs/ARCHITECTURE_REFACTOR.md §10 T1). Truth from the existing
+    // DeviceInfo queries — adds no decision site, so it is byte-identical.
+    if (const auto *di = context_inst_.getDeviceInfo()) {
+      caps_.backend = "gpu";
+      caps_.device_name = di->getDeviceName();
+      // CL_DEVICE_NAME is stored sized to include the query's trailing NUL; an
+      // embedded NUL would truncate the %s log line, so strip trailing NUL/ws.
+      while (!caps_.device_name.empty()) {
+        const char c = caps_.device_name.back();
+        if (c == '\0' || c == ' ' || c == '\n' || c == '\r' || c == '\t')
+          caps_.device_name.pop_back();
+        else
+          break;
+      }
+      caps_.vendor_id = di->getDeviceVendorId();
+      caps_.compute_units = di->getDeviceMaxComputeUnits();
+      caps_.max_alloc_bytes = di->getDeviceMaxMemAllocSize();
+      caps_.unified_memory = di->getDeviceSVMCapabilities() != 0;
+      caps_.subgroups = di->getDeviceExtensions().find("cl_intel_subgroups") !=
+                        std::string::npos;
+      cl_bool host_unified = CL_FALSE;
+      caps_.integrated =
+        (clGetDeviceInfo(context_inst_.GetDeviceId(),
+                         CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(host_unified),
+                         &host_unified, nullptr) == CL_SUCCESS) &&
+        (host_unified == CL_TRUE);
+      ml_logi("[ClContext] %s", caps_.toString().c_str());
+    }
+
     if (KERNEL_CACHE_ENABLED) {
       std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH);
     }

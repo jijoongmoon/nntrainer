@@ -15,6 +15,7 @@
 #define __CONTEXT_H__
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -39,6 +40,45 @@ namespace nntrainer {
 
 // ContextData lives in its own header so that layer_context.h / layer_node.h
 // can pull it in without triggering the context.h → layer_devel.h cycle.
+
+/**
+ * @struct DeviceCaps
+ * @brief Read-only snapshot of device capabilities, probed ONCE per backend at
+ *        Context init from real device queries (clGetDeviceInfo /
+ *        cudaGetDeviceProperties via the per-backend ContextManagers) rather
+ *        than from NNTR_* env flags. Currently LOG-ONLY — no decision site
+ *        reads it yet; it is the input the ExecPlan resolver will consume (see
+ *        docs/ARCHITECTURE_REFACTOR.md §10 T1/T4). Fields describe attributes
+ *        (what the device can do), never identity (who it is); unknown values
+ *        stay at the defaults below.
+ */
+struct DeviceCaps {
+  std::string backend = "cpu";  /**< "cpu" / "gpu" (OpenCL) / "cuda" */
+  std::string device_name = ""; /**< human-readable device name */
+  std::string arch = "";        /**< backend arch tag, e.g. "compute_120" */
+  uint32_t vendor_id = 0;       /**< OpenCL CL_DEVICE_VENDOR_ID; 0 = n/a */
+  bool integrated = true;       /**< host+device share one physical pool
+                                     (host-coherent); CPU = true */
+  bool unified_memory = false;  /**< single-pointer SVM/UVM available */
+  bool subgroups = false;       /**< OpenCL cl_intel_subgroups (XMX/DPAS) */
+  uint32_t compute_units = 0;   /**< OpenCL CL_DEVICE_MAX_COMPUTE_UNITS */
+  uint64_t max_alloc_bytes = 0; /**< per-alloc cap (CL MAX_MEM_ALLOC_SIZE);
+                                     0 = unknown/unbounded */
+
+  /**
+   * @brief One-line human-readable dump for the init-time log.
+   */
+  std::string toString() const {
+    std::ostringstream os;
+    os << "DeviceCaps{backend=" << backend << ", device=\"" << device_name
+       << "\", arch=" << (arch.empty() ? "-" : arch) << ", vendor_id=0x"
+       << std::hex << vendor_id << std::dec << ", integrated=" << integrated
+       << ", unified_memory=" << unified_memory << ", subgroups=" << subgroups
+       << ", compute_units=" << compute_units
+       << ", max_alloc_bytes=" << max_alloc_bytes << "}";
+    return os.str();
+  }
+};
 
 /**
  * @class Context contains user-dependent configuration for  support
@@ -196,6 +236,20 @@ public:
    * @return return 0 for success
    */
   virtual int load(const std::string &file_path) { return 0; };
+
+  /**
+   * @brief Read-only device capability snapshot for this backend, probed once
+   *        at init. The base returns CPU caps (host-coherent, no accelerator);
+   *        ClContext / CudaContext override with a probed snapshot. LOG-ONLY for
+   *        now (docs/ARCHITECTURE_REFACTOR.md §10 T1) — no decision site reads
+   *        it yet, so adding/overriding it is byte-identical.
+   *
+   * @return const DeviceCaps& capabilities of the device backing this context
+   */
+  virtual const DeviceCaps &caps() const {
+    static const DeviceCaps cpu_caps; // backend="cpu", integrated=true, defaults
+    return cpu_caps;
+  }
 
 private:
   /**

@@ -236,6 +236,11 @@ public:
   std::string getName() override { return "gpu"; }
 
   /**
+   * @brief Device capability snapshot, probed once in initialize(). LOG-ONLY.
+   */
+  const DeviceCaps &caps() const override { return caps_; }
+
+  /**
    * @brief Set the Mem Allocator object
    *
    * @param mem Memory allocator object
@@ -249,6 +254,9 @@ private:
    * @brief   Overriden initialization function
    */
   void initialize() noexcept override;
+
+  /** device capabilities probed once at initialize() (log-only, T1) */
+  DeviceCaps caps_;
 
   void add_default_object();
 

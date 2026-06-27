@@ -31,6 +31,16 @@ void CudaContext::initialize() noexcept {
       return;
     }
 
+    // Probe device capabilities once (log-only; the ExecPlan resolver consumes
+    // this later, docs/ARCHITECTURE_REFACTOR.md §10 T1). Truth from the existing
+    // cuda::ContextManager queries — adds no decision site, so byte-identical.
+    caps_.backend = "cuda";
+    caps_.device_name = context_inst_.GetDeviceName();
+    caps_.arch = context_inst_.GetComputeArch();
+    caps_.integrated = context_inst_.isIntegrated();
+    caps_.unified_memory = true; // cudaMallocManaged (UVM) is the default pool
+    ml_logi("[CudaContext] %s", caps_.toString().c_str());
+
     add_default_object();
 
     // Unified-Memory allocator: MemoryPool buffers for engine=cuda tensors are

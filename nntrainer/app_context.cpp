@@ -260,6 +260,10 @@ void AppContext::initialize() noexcept {
 
     add_default_object();
     add_extension_object();
+
+    // Log device capabilities once (log-only, docs/ARCHITECTURE_REFACTOR.md
+    // §10 T1). AppContext inherits the base CPU snapshot (host-coherent).
+    ml_logi("[AppContext] %s", caps().toString().c_str());
   } catch (std::exception &e) {
     ml_loge("registering layers failed!!, reason: %s", e.what());
   } catch (...) {

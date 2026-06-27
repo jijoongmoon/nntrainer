@@ -170,6 +170,11 @@ public:
   std::string getName() override { return "cuda"; }
 
   /**
+   * @brief Device capability snapshot, probed once in initialize(). LOG-ONLY.
+   */
+  const DeviceCaps &caps() const override { return caps_; }
+
+  /**
    * @brief Set the Mem Allocator object
    */
   void setMemAllocator(std::shared_ptr<MemAllocator> mem) {
@@ -183,6 +188,9 @@ private:
   void initialize() noexcept override;
 
   void add_default_object();
+
+  /** device capabilities probed once at initialize() (log-only, T1) */
+  DeviceCaps caps_;
 
   /// true once the CUDA device/context/stream were created
   bool cuda_initialized = false;
