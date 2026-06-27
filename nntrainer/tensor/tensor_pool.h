@@ -401,6 +401,11 @@ private:
               single-consumer tensor is token-identical -- so GPU_CLMEM is
               currently restricted to view_count<=1 (the verified-clean
               partition) until the fan-out interaction is root-caused. */
+    TensorRole role =
+      TensorRole::GENERIC; /**< semantic role hint (Mem M3/M4), threaded to
+              deriveResidency. GENERIC today -- no layer tags it yet -- so it is
+              byte-identical; the residency resolver will read it for per-role
+              crossovers (e.g. KV->image2d on Adreno) in a later step. */
   };
 
   /**

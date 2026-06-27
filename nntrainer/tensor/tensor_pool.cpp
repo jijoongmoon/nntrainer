@@ -40,7 +40,12 @@ namespace {
  */
 ResidencyClass deriveResidency(ml::train::LayerComputeEngine engine,
                                bool all_consumers_gpu, bool is_fp16,
-                               bool gpu_svm_backend) {
+                               bool gpu_svm_backend,
+                               [[maybe_unused]] TensorRole role) {
+  // M4 foundation: `role` is threaded to the decision point but not yet
+  // consumed (every tensor is GENERIC today), so this is byte-identical. The
+  // per-role residency crossovers (e.g. KV -> image2d on Adreno) will read it
+  // here once role-bearing layers tag their tensors. [Mem M4]
   if (!gpu_svm_backend)
     return ResidencyClass::HOST;
   if (engine == ml::train::LayerComputeEngine::GPU && all_consumers_gpu &&
@@ -355,7 +360,7 @@ void TensorPool::allocate(bool init) {
         spec.tensor->getDataType() == ml::train::TensorDim::DataType::FP16;
       ResidencyClass cls =
         deriveResidency(details->engine, details->all_consumers_gpu, is_fp16,
-                        gpu_svm_backend);
+                        gpu_svm_backend, details->role);
       /** Input-boundary raise: host-produced but producer-uploaded tensors
        * (see clmem_raise above) join the cl_mem plane when their consumers
        * are all GPU. The fan-out restriction below does NOT apply to them --
