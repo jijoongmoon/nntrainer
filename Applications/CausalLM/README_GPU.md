@@ -243,3 +243,148 @@ prefer pushing from `obj/local/arm64-v8a/` and check timestamps.
 | `Failed to open file` (tokenizer) | `tokenizer_file` points at a device path; set the local absolute path for x86. |
 | Silent garbage after editing a `.cl` kernel (Android) | ndk-build does **not** re-run meson's `.cl`→`.cpp` codegen. Regenerate kernels (`.claude/regen_cl.py` / `build_lib.sh`) before rebuilding the lib. |
 | dlopen/undefined-symbol for `clSVM*` on Android | `libnntrainer.so` was built without OpenCL. Reconfigure `builddir` with `-Denable-opencl=true` and `ninja install`. |
+
+---
+
+## 8. How GPU support is implemented
+
+This section is the engineering overview — *what we did to make nntrainer run a
+transformer on the GPU*, and why it is structured the way it is. The guiding
+principle is **additive**: nothing in the CPU / training path changed. Adding a
+GPU backend is a new `Context` + allocator + op-table + a handful of GPU layers
++ a kernel library, all behind `#if ENABLE_OPENCL` (and `#if ENABLE_CUDA` for
+NVIDIA), so an `enable-opencl=false`/`enable-cuda=false` build is byte-identical
+to before.
+
+### 8.1 An additive backend, in four pieces
+
+`engine=gpu` selects `ClContext` — registered next to `"cpu"`/`"cuda"`/`"npu"`
+in `Engine::add_default_object()` (`engine.cpp`), each under its own `#if`.
+`parseComputeEngine()` resolves the name; the graph threads the chosen context's
+`ContextData` into every layer's `RunContext` (`network_graph.cpp`). A backend is
+exactly four things:
+
+1. **Context** — `ClContext : Context, Singleton<ClContext>` (`cl_context.h`), the
+   per-engine layer-factory map + kernel cache.
+2. **MemAllocator** — `ClSVMAllocator` (`cl_svm_allocator.h`) routes `MemoryPool`
+   alloc/free through `clSVMAlloc`, so a tensor on a CL context is **device-resident
+   with no copy step**.
+3. **ComputeOps op-table** — routes tensor ops to GPU kernels (§8.2).
+4. **GPU layer factories** — the `cl_layers` (`FullyConnectedLayerCl`,
+   `RMSNormLayerCl`, `SwiGLULayerCl`, `GeGLULayerCl`, `AdditionLayerCL`,
+   `Concat/Reshape/TransposeLayerCl`), each registered only if its kernels compile.
+
+### 8.2 The op-table (`ComputeOps`)
+
+`ComputeOps` (`tensor/cpu_backend/compute_ops.h`) is an abstract virtual table:
+base bodies throw "not implemented", and every accelerator-only op is paired with
+a `supports_*()` predicate that defaults `false`. `ClComputeOps`
+(`cl_operations/cl_compute_ops.cpp`) overrides **only** the int4/Q4_0 GEMM/GEMV
+virtuals, flipping their `supports_*()` to `true` and forwarding to the CL
+kernels; everything else falls through to the CPU base. `Tensor::getOps()` returns
+the per-context table, and call sites check `supports_*()` before taking the GPU
+path. That is how one `Tensor` implementation serves both backends — a tensor on a
+CL context dispatches to GPU kernels, one on a CPU context computes on the host.
+
+### 8.3 The quantized FC GEMM — the core compute (`v8c`, w4a8)
+
+The FC layers dominate cost, so this is where the speedup lives
+(`blas_kernels.cpp` + `cl_kernels/int8_int4_gemm_v8c.cl`). The scheme is **w4a8**:
+4-bit weights × FP16 activations, with the activation quantized to **int8 on the
+GPU** at the FC input.
+
+- **Quantization.** Weights are offset-encoded int4 nibbles (`value+8`) with a
+  per-channel scale and a precomputed row-sum; the activation is quantized per row
+  to int8 with an **asymmetric** zero-point (asymmetric was necessary — symmetric
+  `amax/127` let skewed post-SwiGLU outliers flip token logits). The epilogue
+  removes the offset/zero-point terms and scales back to FP16 — **bit-identical
+  across every kernel variant**.
+- **GEMM vs GEMV split.** `M>4` (prefill) runs a tiled GEMM (`TM=4,TN=8`, ~87% of
+  HW peak on Adreno). `M≤4` (decode) collapses to a GEMV, and preferentially a
+  **64-wide K-split cooperative GEMV** that restores parallelism for the single
+  decode row (which is otherwise fetch/latency-bound). The "4" is the GEMM tile
+  height — it is the prefill(GEMM)↔decode(GEMV) boundary.
+- **One source, two device paths.** Adreno reads weights/acts as `image2d`
+  (`read_imageui`, texture-L1 cache); Intel NEO cannot *compile* integer-coordinate
+  `read_imageui`, so the same bytes are loaded as plain buffers (`-DV8C_BUFFER_ONLY`,
+  byte-identical math). This is the `NNTR_V8C_BUF` switch.
+- **dp4a vs XMX/DPAS.** The portable path uses `dp4a` builtins. On Intel Xe2/Xe3,
+  `gemm_xmx_i4` (`int8_int8_gemm_xmx.cl`) is a drop-in for the `M>4` GEMM using the
+  systolic `i8_u8` DPAS (~30 TOP/s, `NNTR_FC_XMX`, **prefill-only**). It is
+  prefill-only because decode (`M=1`) is a memory-bandwidth-bound GEMV — a
+  compute-throughput engine can't speed up a fetch-bound kernel — so the `M>4` gate
+  keeps it out of the decode path. Non-XMX devices fail kernel registration and
+  fall through to dp4a.
+- **lm_head + on-GPU argmax.** The decode lm_head is a Q6_K GEMV
+  (`q6_k_sgemv.cl`); greedy sampling stays on-device via a 2-pass `argmax` that
+  reads back **4 bytes**, not the full vocab — the precondition for a
+  single-submission decode step.
+
+### 8.4 Attention, RoPE, norms — full GPU residency
+
+The per-token transformer path runs on-device through `MHACoreLayer`
+(`Applications/CausalLM/layers/mha_core.cpp`) + `attention_kernels.cpp`:
+
+- **GPU attention** (`NNTR_MHA_GPU`): Q·Kᵀ / softmax / ·V on-device. Adreno uses
+  per-layer `image2d` KV mirrors (texture cache); Intel uses an SVM-buffer flash
+  path.
+- **GPU RoPE + LUT-cap fix.** Capping the cos/sin LUT to the actual max timestep
+  (not `max_position_embeddings`=131072) shrinks the per-layer re-upload from tens
+  of MB to hundreds of KB — this is what made `M≥32` prefill GPU-RoPE coherent
+  (~+500 TPS @ M=1024).
+- **q/k/v-norm residency** is structural, not a flag: the per-head
+  `reshaped_rms_norm` layers carry `engine=gpu` (registered centrally in
+  `CausalLM::registerCustomLayers`), so their outputs stay GPU-resident instead of
+  bouncing to the host.
+- **Flash-decoding (split-KV).** `M=1` decode splits the KV axis into chunks
+  (`num_heads × n_chunks` parallel partials + a reduce), recovering parallelism for
+  the lone query. Decode is the structurally hard case: `M=1` is bandwidth-bound
+  with a per-op dispatch floor and host bounces.
+
+### 8.5 Residency & coherence
+
+- `NNTR_GPU_SVM_POOL` switches the CL queue to **in-order** with SVM-resident
+  buffers, so consecutive layers hand off device→device with no host round-trip and
+  no per-layer `clFinish`.
+- `NNTR_GPU_CLMEM_POOL` stamps `GPU_CLMEM` residency on activation tensors, so an FC
+  consumes its producer's device output directly. Both are mandatory for coherence.
+- All pool memory flows through one `MemAllocator` (`MemoryPool` no longer embeds
+  calloc/SVM macros); the base is host `aligned_alloc`, the GPU contexts install
+  `ClSVMAllocator` (SVM = a single host+device pointer).
+
+### 8.6 The CUDA backend — a peer, not a fork
+
+`CudaContext` (`cuda_context.h`) is the direct mirror of `ClContext`, registered as
+`"cuda"` alongside `"gpu"`, with NVRTC runtime kernel compilation + an on-disk PTX
+cache. `CudaMemAllocator` is the SVM analogue: `cudaMallocManaged` (UVM — one
+pointer host- and device-addressable) plus a `device_only` `cudaMalloc` variant for
+the activation pool. Its `ComputeOps` is the **CPU table running on UVM**
+(host-coherent), with CUDA layers/kernels layered on top; an unported op simply
+falls back to a correct CPU computation on the same pointer. Techniques: cuBLAS int8
+FC, block-Q attention (incl. a `head_dim=128` kernel so qwen3 needs no
+`GEMM_ATTN` on RTX), flash-decode, and CUDA-graph capture/replay for decode.
+Integrated (Orin sm_87) vs discrete (RTX) is one truth source —
+`cuda::ContextManager::isIntegrated()` — which gates every discrete-VRAM assumption
+(device-only act pool, K-chunk, sync, KV mirror).
+
+### 8.7 One source, four devices
+
+The same code drives **Adreno 840 / Intel Xe3 / RTX 5060 / Orin**. Device
+differences are runtime knobs, not forks: Adreno image vs Intel buffer
+(`NNTR_V8C_BUF`); Xe3's new-ISA in-order SVM coherence regression needs
+`NNTR_XE3_SYNC` (a `clFinish` at the producer→consumer boundary); CUDA K-chunk
+gated to Orin only. Each is gated so the other three are unaffected.
+
+### 8.8 Where this is going — the multi-HW refactor
+
+The knobs above and the residual `#if` leakage are being folded into a principled
+**add-only** model (`nntrainer/docs/ARCHITECTURE_REFACTOR.md`): express backend
+differences solely as op-table virtuals + `Context` capability/sync + `MemAllocator`
+capability predicates, so a new device becomes "register a `Context`, report its
+caps, provide an op-table subset" with **zero** edits to models or core. **Phase 0
+has landed**: a read-only `DeviceCaps` probe (`Context::caps()`, log-only) and
+`MemAllocator` capability predicates (`isHostAddressable`/`isDeviceVisible`/`isSVM`/
+`needsRegister`) replacing the name-string hacks — both byte-identical and
+TPS-neutral on all three backends. Next is opening the registry so vendors add a
+backend without editing a closed enum, then collapsing the `cl_layers`/`cuda_layers`
+forks into neutral layers over a completed op-table.
