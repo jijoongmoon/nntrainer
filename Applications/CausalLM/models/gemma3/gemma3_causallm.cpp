@@ -262,11 +262,11 @@ Tensor Gemma3Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
 
 void Gemma3Transformer::registerCustomLayers() {
   auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  // cpu-context registration goes through Engine::registerLayerFactory below
+  // (no static_cast to AppContext). [T3]
 
   try {
-    app_context->registerFactory(
+    ct_engine.registerLayerFactory("cpu",
       nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
