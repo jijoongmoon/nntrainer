@@ -60,6 +60,18 @@ public:
 
   std::string getName() override { return device_only_ ? "cuda-dev" : "cuda-uvm"; }
 
+  // UVM (device_only_=false) is unified host+device memory (the SVM analogue)
+  // -> host-addressable + device-visible -> isSVM() derives true, fixing the
+  // old getName()=="gpu-svm" mis-tag. A device_only_ allocator's CONTRACT is
+  // "device memory, the host must not touch it" (manager.h's activation pool)
+  // -> host-addressable false -> isSVM() false. NOTE: on an integrated GPU
+  // (Tegra/Orin) alloc() upgrades a device_only request to cudaMallocManaged
+  // (host-coherent); that runtime upgrade does not change the contract, so the
+  // predicate stays static here. The residency track refines this once a
+  // DeviceCaps.integrated probe consumes it.
+  bool isHostAddressable() const override { return !device_only_; }
+  bool isDeviceVisible() const override { return true; }
+
 private:
   bool device_only_;
   void track_host_owned(void *ptr);

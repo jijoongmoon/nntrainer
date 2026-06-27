@@ -199,9 +199,10 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
     throw std::invalid_argument("Getting memory before allocation");
 
   auto mem_data = std::make_shared<MemoryData>((void *)memory_ptrs.at(idx - 1));
-  // SVM-ness propagates implicitly through the allocator name now;
-  // callers that need to know inspect getAllocator()->getName().
-  mem_data->setSVM(allocator_->getName() == "gpu-svm");
+  // SVM-ness comes from what the allocator produces, not its name: a
+  // single-pointer unified allocation (OpenCL SVM, CUDA UVM) is both
+  // host-addressable and device-visible. See MemAllocator::isSVM().
+  mem_data->setSVM(allocator_->isSVM());
   return mem_data;
 }
 

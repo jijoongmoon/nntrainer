@@ -46,6 +46,13 @@ public:
 
   std::string getName() override { return "qnn"; }
 
+  // rpcmem/ION is CPU-mapped (host-addressable inherits the base default true),
+  // but the DSP can only use it after registerQnnTensor() builds a
+  // QNN_MEM_TYPE_ION handle -> needsRegister()=true. Not unified memory:
+  // device-visible inherits the base default false (pre-register), so isSVM()
+  // derives false, matching the old getName()!="gpu-svm".
+  bool needsRegister() const override { return true; }
+
   void setQnnInterfaceAndContext(void *context);
 
   void registerQnnTensor(void *ptr, Qnn_Tensor_t &qnnTensor,

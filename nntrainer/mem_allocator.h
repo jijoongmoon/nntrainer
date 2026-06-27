@@ -60,10 +60,52 @@ public:
   /**
    * @brief Backend identifier ("cpu" / "gpu-svm" / "qnn-rpc").
    *
-   * MemoryPool uses this in error messages and lets callers reason
-   * about pointer ownership (e.g. SVM vs host memory).
+   * MemoryPool uses this in error messages. Prefer the capability
+   * predicates below for reasoning about pointer ownership — the name
+   * is now log-only, not a capability signal.
    */
   virtual std::string getName() { return "cpu"; };
+
+  /**
+   * @brief Capability predicates — what KIND of memory alloc() produces,
+   *        derived from what the allocator actually does rather than from
+   *        its name string. MemoryPool / TensorPool reason about residency
+   *        and SVM-ness through these instead of comparing getName(). The
+   *        base is the plain host allocator (aligned_alloc): host-addressable
+   *        and not device-visible. Vendor subclasses override.
+   * @{
+   */
+
+  /**
+   * @brief True if the CPU can dereference pointers from alloc() directly.
+   *        Base host allocator: true. Device-only memory (cudaMalloc): false.
+   */
+  virtual bool isHostAddressable() const { return true; }
+
+  /**
+   * @brief True if an accelerator can read the pointer without an explicit
+   *        host->device copy. Base host allocator: false.
+   */
+  virtual bool isDeviceVisible() const { return false; }
+
+  /**
+   * @brief True for single-pointer unified memory usable directly by both
+   *        host and device (OpenCL SVM, CUDA UVM). Derived, not stored: a
+   *        unified allocation is exactly one that is both host-addressable
+   *        and device-visible. Replaces the getName()=="gpu-svm" hack in
+   *        MemoryPool::getMemory().
+   */
+  virtual bool isSVM() const {
+    return isHostAddressable() && isDeviceVisible();
+  }
+
+  /**
+   * @brief True if the pointer must be registered with the backend (e.g.
+   *        rpcmem/ION -> Qnn_MemHandle) before the device can use it.
+   *        Base / SVM / UVM: false. QNN rpcmem: true.
+   */
+  virtual bool needsRegister() const { return false; }
+  /** @} */
 };
 } // namespace nntrainer
 
