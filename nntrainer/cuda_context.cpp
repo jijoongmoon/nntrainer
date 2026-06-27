@@ -167,4 +167,13 @@ template const int CudaContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
 
+// Non-template seam (Context::registerLayerFactory override): forwards to the
+// per-class registerFactory<Layer> here in the same TU so the explicit
+// instantiation is used and no template crosses the .so boundary. [T3]
+int CudaContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                                      const std::string &key,
+                                      const int int_key) {
+  return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
+
 } // namespace nntrainer

@@ -573,10 +573,9 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 void CausalLM::registerCustomLayers() {
   Transformer::registerCustomLayers();
   const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
   try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::LmHeadLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::LmHeadLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
@@ -590,32 +589,23 @@ void CausalLM::registerCustomLayers() {
   // engine=causallm_engine() on the reshaped_rms_norm layer. Inert (skipped)
   // when there is no GPU context (CPU-only / NNTR_ENGINE=cpu builds). The
   // per-model registerCustomLayers still registers it on the cpu context.
-  auto *cl_context = static_cast<nntrainer::ClContext *>(
-    ct_engine.getRegisteredContext("gpu"));
-  if (cl_context != nullptr) {
-    try {
-      cl_context->registerFactory(
-        nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-    } catch (std::invalid_argument &e) {
-      std::cerr << "failed to register reshaped_rms_norm on gpu ctx: "
-                << e.what() << std::endl;
-    }
+  // Goes through Engine's registration facade — no static_cast to ClContext.
+  try {
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "gpu" context (CPU-only build) or already registered — both benign.
   }
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Centralized cuda-context registration of ReshapedRMSNormLayer (mirror of
   // the cl block above). engine=cuda tensors are UVM (host-coherent) and not
   // isSVM()-flagged, so its forwarding takes the correct host path.
-  auto *cuda_context = static_cast<nntrainer::CudaContext *>(
-    ct_engine.getRegisteredContext("cuda"));
-  if (cuda_context != nullptr) {
-    try {
-      cuda_context->registerFactory(
-        nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-    } catch (std::invalid_argument &e) {
-      std::cerr << "failed to register reshaped_rms_norm on cuda ctx: "
-                << e.what() << std::endl;
-    }
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "cuda" context or already registered — both benign.
   }
 #endif
 }

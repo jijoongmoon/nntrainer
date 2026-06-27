@@ -434,6 +434,15 @@ template const int QNNContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
 
+// Non-template seam (Context::registerLayerFactory override): forwards to the
+// per-class registerFactory<Layer> here in the same TU so the explicit
+// instantiation is used and no template crosses the .so boundary. [T3]
+int QNNContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                                     const std::string &key,
+                                     const int int_key) {
+  return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
+
 #ifdef PLUGGABLE
 nntrainer::Context *create_qnn_context() {
   nntrainer::QNNContext *qnn_context = new nntrainer::QNNContext();

@@ -90,6 +90,12 @@ public:
                             const int int_key = -1);
 
   /**
+   * @copydoc Context::registerLayerFactory
+   */
+  int registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                           const std::string &key, const int int_key) override;
+
+  /**
    * @brief Create an Object from the integer key
    */
   template <typename T>

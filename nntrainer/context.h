@@ -251,6 +251,28 @@ public:
     return cpu_caps;
   }
 
+  /**
+   * @brief Register a layer factory under this backend. The base default is
+   *        "unsupported" (returns -1); each concrete Context overrides it to
+   *        forward to its own registerFactory<Layer>. This is the non-template
+   *        seam that lets callers register a layer on any backend through
+   *        Engine::registerLayerFactory(engine, creator) WITHOUT a
+   *        static_cast to a concrete ClContext/CudaContext (whose
+   *        registerFactory is a per-class explicit template instantiation, an
+   *        ABI hazard across the .so boundary). [docs/ARCHITECTURE_REFACTOR.md
+   *        §10 T3 / §11 S1]
+   *
+   * @param factory layer creator (createLayer<T> result)
+   * @param key string key (empty ⇒ derived from the layer's getType())
+   * @param int_key integer key (-1 ⇒ auto-assigned)
+   * @return registered integer key, or -1 if the backend cannot register
+   */
+  virtual int registerLayerFactory(PtrFactoryType<nntrainer::Layer>,
+                                   const std::string & = "", const int = -1) {
+    ml_logw("[Context] this backend does not support layer registration");
+    return -1;
+  }
+
 private:
   /**
    * @brief map of context

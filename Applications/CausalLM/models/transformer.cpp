@@ -534,101 +534,85 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
 void Transformer::registerCustomLayers() {
   ///
   const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
-
+  // CPU layer classes on the cpu (app) context — through Engine's registration
+  // facade, no static_cast to AppContext.
   try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::RMSNormLayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::MHACoreLayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::TieWordEmbedding>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::EmbeddingLayer>);
-
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::SwiGLULayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::RMSNormLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::MHACoreLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::TieWordEmbedding>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::EmbeddingLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
   }
 
-  // GPU variants: same type strings as the CPU classes but registered
-  // on cl_context so engine=gpu createLayer routes there. The GPU
-  // classes use raw getData() pointers + GPU dispatches; they avoid
-  // any CPU-only Tensor ops (Tensor::multiply / add_i / dot) that
-  // crash on gpu-context-allocated tensors.
-  const auto cl_context =
-    static_cast<nntrainer::ClContext *>(ct_engine.getRegisteredContext("gpu"));
-  if (cl_context != nullptr) {
-    try {
-      cl_context->registerFactory(
-        nntrainer::createLayer<causallm::RMSNormLayerGPU>);
-      // Gemma4 GPU-resident scalar_multiply / per_layer_slice: same type
-      // strings as the CPU classes, registered here so engine=gpu routes to
-      // the GPU kernels (no host round-trip that would break residency).
-      cl_context->registerFactory(
-        nntrainer::createLayer<causallm::ScalarMultiplyLayerGPU>);
-      cl_context->registerFactory(
-        nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
-      // TieWordEmbedding is registered on cl_context with its existing
-      // class — the manual Q6_K + Q4_0 paths in incremental_forwarding_
-      // lmhead use raw-pointer compute (no Tensor::dot), so it survives
-      // gpu-context tensor allocation. The embedding-mode path is also
-      // raw-pointer-based for these dtypes. FP32 weight + Tensor::dot
-      // fallback could still crash, but Qwen3 + similar models use
-      // Q6_K so the common path is safe.
-      cl_context->registerFactory(
-        nntrainer::createLayer<causallm::TieWordEmbedding>);
-      // MHACoreLayer on cl_context enables engine=gpu attention. The same
-      // class runs on both backends: its forwarding() dispatches the GPU
-      // two_conv_attention kernels when NNTR_MHA_GPU is set and the Q/K/V/
-      // cache tensors are SVM-resident (isSVM()), else falls back to the
-      // CPU NEON path. Registration is additive — existing models whose mha
-      // node carries no engine= property keep routing to the CPU app_context
-      // (unchanged); only a node explicitly built with engine=gpu lands here.
-      cl_context->registerFactory(
-        nntrainer::createLayer<causallm::MHACoreLayer>);
-    } catch (std::invalid_argument &e) {
-      std::cerr << "failed to register GPU-routed layer on cl_context: "
-                << e.what() << std::endl;
-    }
+  // GPU variants: same type strings as the CPU classes but registered on the
+  // gpu context so engine=gpu createLayer routes there. The GPU classes use raw
+  // getData() pointers + GPU dispatches; they avoid any CPU-only Tensor ops
+  // (Tensor::multiply / add_i / dot) that crash on gpu-context tensors. Inert
+  // when there is no "gpu" context (CPU-only / NNTR_ENGINE=cpu builds).
+  try {
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::RMSNormLayerGPU>);
+    // Gemma4 GPU-resident scalar_multiply / per_layer_slice: same type strings
+    // as the CPU classes, registered here so engine=gpu routes to the GPU
+    // kernels (no host round-trip that would break residency).
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::ScalarMultiplyLayerGPU>);
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
+    // TieWordEmbedding on the gpu context with its existing class — the manual
+    // Q6_K + Q4_0 lmhead paths use raw-pointer compute (no Tensor::dot), so it
+    // survives gpu-context tensor allocation (Qwen3 et al. use Q6_K).
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::TieWordEmbedding>);
+    // MHACoreLayer on the gpu context enables engine=gpu attention. The same
+    // class runs on both backends: forwarding() dispatches the GPU kernels when
+    // NNTR_MHA_GPU is set and Q/K/V/cache are SVM-resident, else the CPU NEON
+    // path. Additive — a node with no engine= property keeps routing to CPU.
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::MHACoreLayer>);
+  } catch (std::invalid_argument &e) {
+    std::cerr << "failed to register GPU-routed layer on gpu ctx: " << e.what()
+              << std::endl;
   }
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Additive CUDA backend: register the host CausalLM layer classes on the cuda
   // context too. engine=cuda tensors are Unified Memory (host-coherent), so the
   // CPU implementations run correctly on them (no cl_mem); GPU kernels are
-  // layered on per-layer later. Guarded by getRegisteredContext("cuda").
-  auto *cuda_context = static_cast<nntrainer::CudaContext *>(
-    ct_engine.getRegisteredContext("cuda"));
-  if (cuda_context != nullptr) {
-    try {
-      cuda_context->registerFactory(
-        nntrainer::createLayer<causallm::SwiGLULayer>);
-      // CUDA RMSNorm (FP32-safe sum-of-squares) instead of the host
-      // causallm::RMSNormLayer, whose FP16 path squares in FP16 and overflows
-      // on gemma4's large residual (pre_ffn_norm |x|~1688 -> +Inf -> row
-      // zeroed -> garbage). Same "rms_norm" type, so it takes this slot.
-      cuda_context->registerFactory(
-        nntrainer::createLayer<nntrainer::CudaRMSNormLayer>);
-      cuda_context->registerFactory(
-        nntrainer::createLayer<causallm::MHACoreLayer>);
-      cuda_context->registerFactory(
-        nntrainer::createLayer<causallm::TieWordEmbedding>);
-      cuda_context->registerFactory(
-        nntrainer::createLayer<causallm::EmbeddingLayer>);
-      // gemma4 PLE + q-scale: host impls (the GPU variants are OpenCL-only and
-      // would mis-run on UVM). Without these on the cuda context the types fall
-      // back to the wrong factory.
-      cuda_context->registerFactory(
-        nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
-      cuda_context->registerFactory(
-        nntrainer::createLayer<causallm::PerLayerSliceLayer>);
-    } catch (std::invalid_argument &e) {
-      std::cerr << "failed to register layer on cuda_context: " << e.what()
-                << std::endl;
-    }
+  // layered on per-layer later. Inert when there is no "cuda" context.
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::SwiGLULayer>);
+    // CUDA RMSNorm (FP32-safe sum-of-squares) instead of the host
+    // causallm::RMSNormLayer, whose FP16 path squares in FP16 and overflows on
+    // gemma4's large residual (pre_ffn_norm |x|~1688 -> +Inf -> garbage). Same
+    // "rms_norm" type, so it takes this slot.
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<nntrainer::CudaRMSNormLayer>);
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::MHACoreLayer>);
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::TieWordEmbedding>);
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::EmbeddingLayer>);
+    // gemma4 PLE + q-scale: host impls (the GPU variants are OpenCL-only and
+    // would mis-run on UVM). Without these on the cuda context the types fall
+    // back to the wrong factory.
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
+  } catch (std::invalid_argument &e) {
+    std::cerr << "failed to register layer on cuda ctx: " << e.what()
+              << std::endl;
   }
 #endif
 }
