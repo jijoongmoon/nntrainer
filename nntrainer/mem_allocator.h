@@ -19,6 +19,8 @@
 
 namespace nntrainer {
 
+class MemoryPool;
+
 /**
  * @brief MemAllocator, Memory allocator class
  *
@@ -106,6 +108,20 @@ public:
    */
   virtual bool needsRegister() const { return false; }
   /** @} */
+
+  /**
+   * @brief Construct the MemoryPool that backs a TensorPool for this allocator.
+   *        The allocator owns the pool-KIND decision (a plain offset-planned
+   *        MemoryPool vs a device cl_mem ClBufferPool) instead of TensorPool
+   *        branching on getName()=="gpu-svm". The base returns a MemoryPool;
+   *        ClSVMAllocator overrides to return a device pool when enabled.
+   *        [docs/ARCHITECTURE_REFACTOR.md §10 T5 / Mem M2]
+   *
+   * @param self shared_ptr to THIS allocator (the pool holds it for alloc/free)
+   * @return the backing pool
+   */
+  virtual std::shared_ptr<MemoryPool>
+  makePool(const std::shared_ptr<MemAllocator> &self);
 };
 } // namespace nntrainer
 

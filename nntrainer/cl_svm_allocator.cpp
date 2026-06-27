@@ -10,7 +10,10 @@
  * @brief   Implementation of OpenCL SVM-backed MemAllocator subclass.
  */
 
+#include <cl_buffer_pool.h>
 #include <cl_svm_allocator.h>
+#include <cstdlib>
+#include <memory_pool.h>
 #include <mutex>
 #include <opencl_context_manager.h>
 #include <unordered_set>
@@ -26,6 +29,17 @@ std::unordered_set<void *> host_owned;
 } // namespace
 
 ClSVMAllocator::ClSVMAllocator(opencl::ContextManager &ctx) : ctx_(ctx) {}
+
+std::shared_ptr<MemoryPool>
+ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self) {
+  // NNTR_GPU_CLMEM_POOL: back the activation plane with a device cl_mem pool
+  // (ClBufferPool) so activations stay GPU-resident as plain cl_mem; default
+  // OFF => the SVM-backed MemoryPool. Same condition as the old TensorPool
+  // getName()=="gpu-svm" && env check — now owned by the allocator. [Mem M2]
+  if (std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr)
+    return std::make_shared<ClBufferPool>(self);
+  return std::make_shared<MemoryPool>(self);
+}
 
 void ClSVMAllocator::track_host_owned(void *ptr) {
   std::lock_guard<std::mutex> lk(host_owned_mtx);

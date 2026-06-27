@@ -30,9 +30,9 @@
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
 
-#ifdef ENABLE_OPENCL
-#include <cl_buffer_pool.h>
-#endif
+// ClBufferPool is no longer referenced here — the device-pool decision moved
+// into ClSVMAllocator::makePool (Mem M2), decoupling tensor_pool.h from the
+// OpenCL pool type.
 
 namespace nntrainer {
 
@@ -73,20 +73,13 @@ public:
       cache_loader = std::make_unique<CacheLoader>(cache_pool);
       mem_pool = cache_pool;
     } else {
-#ifdef ENABLE_OPENCL
-      // NNTR_GPU_CLMEM_POOL: back the activation plane with a device cl_mem pool
-      // (ClBufferPool) so activations can be GPU-resident as plain cl_mem (the
-      // gpu_native residency model). Only when the backend is the GPU SVM
-      // allocator; default OFF => the SVM-backed MemoryPool (byte-identical).
-      if (allocator_->getName() == "gpu-svm" &&
-          std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr) {
-        mem_pool = std::make_shared<ClBufferPool>(allocator_);
-      } else {
-        mem_pool = std::make_shared<MemoryPool>(allocator_);
-      }
-#else
-      mem_pool = std::make_shared<MemoryPool>(allocator_);
-#endif
+      // The allocator owns the pool-KIND decision (a plain offset-planned
+      // MemoryPool vs a device cl_mem ClBufferPool), so this site no longer
+      // branches on getName()=="gpu-svm" or #ifdef ENABLE_OPENCL:
+      // ClSVMAllocator::makePool returns the device pool when
+      // NNTR_GPU_CLMEM_POOL is set, the base returns a MemoryPool
+      // (byte-identical). [docs/ARCHITECTURE_REFACTOR.md §10 T5 / Mem M2]
+      mem_pool = allocator_->makePool(allocator_);
     }
   }
 

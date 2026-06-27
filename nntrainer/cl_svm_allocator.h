@@ -76,6 +76,15 @@ public:
   // isSVM() derives true, matching the old getName()=="gpu-svm".
   bool isDeviceVisible() const override { return true; }
 
+  /**
+   * @copydoc MemAllocator::makePool
+   *
+   * Returns a device cl_mem ClBufferPool when NNTR_GPU_CLMEM_POOL is set
+   * (GPU-resident activations), else the SVM-backed MemoryPool. [Mem M2]
+   */
+  std::shared_ptr<MemoryPool>
+  makePool(const std::shared_ptr<MemAllocator> &self) override;
+
 private:
   opencl::ContextManager &ctx_;
   // Host-owned set: pointers that came from MemAllocator::alloc
