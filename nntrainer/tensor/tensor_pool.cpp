@@ -97,15 +97,20 @@ Tensor *TensorPool::request(const std::string &name, const TensorDim &dim,
                             const std::vector<unsigned int> &exec_order,
                             TensorLifespan lifespan, const Initializer &init,
                             bool is_weight_grad,
-                            ml::train::LayerComputeEngine engine) {
+                            ml::train::LayerComputeEngine engine,
+                            TensorRole role) {
 
   bool is_virtual = lifespan == TensorLifespan::VIRTUAL;
   lifespan = is_virtual ? TensorLifespan::UNMANAGED : lifespan;
+  // Set role after aggregate construction (it follows the defaulted
+  // all_consumers_gpu / view_count fields). GENERIC by default ⇒ byte-identical.
+  TensorPool::SourceDetails sd{0, lifespan, exec_order, {}, engine};
+  sd.role = role;
   return registerRequestSpec(
     {is_weight_grad,
      std::make_unique<Tensor>(dim, false, init, name,
                               QScheme::PER_CHANNEL_AFFINE, is_virtual),
-     TensorPool::SourceDetails{0, lifespan, exec_order, {}, engine}});
+     std::move(sd)});
 }
 
 /**
@@ -576,7 +581,8 @@ Tensor *TensorPool::requestOrExtend(const std::string &name,
                                     const std::vector<unsigned int> &exec_order,
                                     TensorLifespan lifespan,
                                     const Initializer &init,
-                                    ml::train::LayerComputeEngine engine) {
+                                    ml::train::LayerComputeEngine engine,
+                                    TensorRole role) {
   NNTR_THROW_IF(lifespan == TensorLifespan::UNMANAGED, std::invalid_argument)
     << "unmanaged life span is not supported";
 
@@ -589,7 +595,7 @@ Tensor *TensorPool::requestOrExtend(const std::string &name,
     return extend(name, dim, exec_order, lifespan);
   } else {
     return request(name, dim, exec_order, lifespan, init,
-                   /*is_weight_grad=*/false, engine);
+                   /*is_weight_grad=*/false, engine, role);
   }
 }
 

@@ -205,7 +205,8 @@ public:
     const std::string &name, const TensorDim &dim,
     const std::vector<unsigned int> &exec_order, TensorLifespan lifespan,
     const Initializer &init = Initializer::NONE, bool is_weight_grad = false,
-    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU);
+    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU,
+    TensorRole role = TensorRole::GENERIC);
 
   /**
    * @brief     Request tensor which is a view of already requested with the
@@ -271,7 +272,8 @@ public:
     const std::string &name, const TensorDim &dim,
     const std::vector<unsigned int> &exec_order, TensorLifespan lifespan,
     const Initializer &init = Initializer::NONE,
-    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU);
+    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU,
+    TensorRole role = TensorRole::GENERIC);
 
   /**
    * @brief reidentify the source of already created tensor (or view).
