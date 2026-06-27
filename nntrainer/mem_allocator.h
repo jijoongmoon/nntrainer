@@ -107,6 +107,16 @@ public:
    *        Base / SVM / UVM: false. QNN rpcmem: true.
    */
   virtual bool needsRegister() const { return false; }
+
+  /**
+   * @brief True if this allocator can back a device-resident cl_mem pool
+   *        (ClBufferPool) — the prerequisite for GPU_CLMEM tensor residency.
+   *        Base / CUDA UVM / rpcmem: false; ClSVMAllocator (OpenCL): true.
+   *        Distinct from isSVM() because CUDA UVM is also SVM yet has no OpenCL
+   *        cl_mem plane. This is the capability behind makePool's device-pool
+   *        branch — the residency planner asks it instead of getName().
+   */
+  virtual bool supportsDevicePool() const { return false; }
   /** @} */
 
   /**

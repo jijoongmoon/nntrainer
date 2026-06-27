@@ -302,8 +302,10 @@ void TensorPool::allocate(bool init) {
    * sites fall through to today's paths (byte-identical). */
   static const bool clmem_pool_on =
     std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr;
-  const bool gpu_svm_backend =
-    allocator_ && allocator_->getName() == "gpu-svm";
+  // Capability, not name: can this allocator back a device cl_mem pool
+  // (ClBufferPool)? True only for ClSVMAllocator — same set as the old
+  // getName()=="gpu-svm", byte-identical. [#4=B allocator-owns-residency]
+  const bool gpu_svm_backend = allocator_ && allocator_->supportsDevicePool();
   const bool clmem_eligible = gpu_svm_backend && clmem_pool_on;
   static const bool dump_residency =
     std::getenv("NNTR_CLMEM_RESIDENCY_DUMP") != nullptr;

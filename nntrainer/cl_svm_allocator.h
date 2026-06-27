@@ -76,6 +76,10 @@ public:
   // isSVM() derives true, matching the old getName()=="gpu-svm".
   bool isDeviceVisible() const override { return true; }
 
+  // OpenCL SVM can be promoted to a device cl_mem ClBufferPool (GPU_CLMEM
+  // residency); CUDA UVM cannot, hence this is separate from isSVM().
+  bool supportsDevicePool() const override { return true; }
+
   /**
    * @copydoc MemAllocator::makePool
    *
