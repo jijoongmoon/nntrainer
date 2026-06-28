@@ -16,10 +16,17 @@
  */
 
 #include <compute_ops.h>
+#include <cpu_ops_table.h>
 
 namespace nntrainer {
 
-class CudaComputeOps : public ComputeOps {
+// CudaComputeOps derives from CpuComputeOps (not the abstract ComputeOps base):
+// engine=cuda tensors are Unified Memory (host-coherent), so every standard op
+// runs correctly via the CPU implementations; this class only overrides the
+// host-side copy ops for now. Inheriting CpuComputeOps means get_cuda_ops() can
+// be installed without throwing on the un-accelerated ops (prereq for the CUDA
+// op kernels in a later phase). [T6]
+class CudaComputeOps : public CpuComputeOps {
 public:
   // Plain elementwise copy (Y = X). Tensor::copy() calls this unconditionally
   // (no supports_*() guard); correct for host and (host-coherent) managed
