@@ -65,6 +65,21 @@ public:
                    Tensor input) override;
 
   void registerCustomLayers() override;
+
+  /** @copydoc Transformer::getModelFeatures() — gemma2: no q/k-norm, GeGLU,
+   *  sandwich norm, alternating sliding window, attn+final soft-cap, tied
+   *  lm_head, decode-GPU on (attn; rope host). */
+  nntrainer::ModelFeatures getModelFeatures() const override {
+    nntrainer::ModelFeatures f;
+    f.mlp_kind = nntrainer::MlpKind::GEGLU;
+    f.norm_style = nntrainer::NormStyle::SANDWICH;
+    f.sliding_window = true;
+    f.attn_softcap = true;
+    f.final_softcap = true;
+    f.lmhead_kind = nntrainer::LmHeadKind::TIED;
+    f.decode_gpu = true;
+    return f;
+  }
 };
 
 /**

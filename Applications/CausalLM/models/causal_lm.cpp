@@ -48,6 +48,7 @@
 #include <mha_core.h>
 #include <reshaped_rms_norm.h>
 #include <nntrainer_error.h>
+#include <nntrainer_log.h>
 #include <tensor.h>
 
 #include <causal_lm.h>
@@ -409,6 +410,18 @@ std::pair<Tensor, Tensor> CausalLM::constructModel() {
 
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
   Tensor y = lmhead(h);
+
+  // [T11] ModelFeatures x DeviceCaps matcher SHADOW: the model declares its
+  // features, the resolver combines them with the chosen backend's device caps
+  // into an ExecPlan. Log-only (no decision site reads the plan yet) — the model
+  // graph is unchanged, so this is byte-identical. docs §10 T11.
+  if (const auto *ct =
+        nntrainer::Engine::Global().getRegisteredContext(causallm_engine())) {
+    const auto feats = getModelFeatures();
+    const auto plan = nntrainer::resolveExecPlan(ct->caps(), feats);
+    ml_logi("[CausalLM] %s | %s (shadow)", feats.toString().c_str(),
+            plan.toString().c_str());
+  }
 
   return {x, y};
 }

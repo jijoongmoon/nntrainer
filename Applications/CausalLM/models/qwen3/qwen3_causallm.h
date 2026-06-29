@@ -35,6 +35,19 @@ public:
                          Tensor value) override;
 
   void registerCustomLayers() override;
+
+  /** @copydoc Transformer::getModelFeatures() — qwen3: q/k-norm, SwiGLU,
+   *  pre-norm, head_dim=128, decode-GPU OFF (d=128 diverges), tied lm_head. */
+  nntrainer::ModelFeatures getModelFeatures() const override {
+    nntrainer::ModelFeatures f;
+    f.has_qk_norm = true;
+    f.mlp_kind = nntrainer::MlpKind::SWIGLU;
+    f.norm_style = nntrainer::NormStyle::PRE;
+    f.lmhead_kind = nntrainer::LmHeadKind::TIED;
+    f.decode_gpu = false;
+    f.head_dim = 128;
+    return f;
+  }
 };
 
 /**

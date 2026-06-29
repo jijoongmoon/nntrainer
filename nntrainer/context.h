@@ -127,6 +127,10 @@ inline const char *toString(GemmPath p) {
 struct ExecPlan {
   GemmPath gemm_path = GemmPath::CPU;
   bool host_coherent = true; /**< host+device share one pool (no copy needed) */
+  bool decode_gpu = false;   /**< run attention/RoPE on the GPU at the M=1 decode
+                                  step (model-dependent: gemma2/gemma4 yes, qwen3
+                                  no — d=128 diverges). Filled by the ModelFeatures
+                                  matcher overload; default off. [T11] */
 
   /**
    * @brief One-line dump for the shadow log.
@@ -134,7 +138,8 @@ struct ExecPlan {
   std::string toString() const {
     std::ostringstream os;
     os << "ExecPlan{gemm_path=" << nntrainer::toString(gemm_path)
-       << ", host_coherent=" << host_coherent << "}";
+       << ", host_coherent=" << host_coherent << ", decode_gpu=" << decode_gpu
+       << "}";
     return os.str();
   }
 };
@@ -152,6 +157,80 @@ inline ExecPlan resolveExecPlan(const DeviceCaps &c) {
     p.gemm_path = c.subgroups ? GemmPath::XMX : GemmPath::DP4A;
   else
     p.gemm_path = GemmPath::CPU;
+  return p;
+}
+
+/** @brief MLP kind a model uses (the gate activation). */
+enum class MlpKind { SWIGLU, GEGLU };
+/** @brief Transformer-block normalization placement. */
+enum class NormStyle { PRE, SANDWICH };
+/** @brief LM-head weight scheme. */
+enum class LmHeadKind { TIED, UNTIED_QINT4 };
+
+inline const char *toString(MlpKind k) {
+  return k == MlpKind::SWIGLU ? "swiglu" : "geglu";
+}
+inline const char *toString(NormStyle s) {
+  return s == NormStyle::SANDWICH ? "sandwich" : "pre";
+}
+inline const char *toString(LmHeadKind k) {
+  return k == LmHeadKind::UNTIED_QINT4 ? "untied_qint4" : "tied";
+}
+
+/**
+ * @struct ModelFeatures
+ * @brief What the model IS, declared by the model itself (NOT inferred from a
+ *        model-name/`is_gemma2` proxy). This is the other half of the resolver
+ *        input: `ModelFeatures × DeviceCaps → ExecPlan`. Fields are attributes
+ *        (independent feature combos), so a new model is "set the flags" with no
+ *        backend edit. Currently consumed only by the SHADOW matcher overload
+ *        below (log-only, byte-identical). docs/ARCHITECTURE_REFACTOR.md §10 T11.
+ */
+struct ModelFeatures {
+  bool has_qk_norm = false;          /**< per-head q/k RMSNorm (qwen3, gemma4) */
+  bool has_v_norm = false;           /**< gamma-free v-norm (gemma4) */
+  MlpKind mlp_kind = MlpKind::SWIGLU;
+  NormStyle norm_style = NormStyle::PRE;
+  bool sliding_window = false;       /**< any sliding-window attention layers */
+  bool kv_share_skip_prefill = false; /**< KV-shared layers skip prefill (gemma4) */
+  bool dual_head_dim = false;        /**< two head_dims (gemma4 sliding/global) */
+  bool ple = false;                  /**< per-layer input embedding (gemma4) */
+  bool attn_softcap = false;         /**< QK logit soft-cap (gemma2/gemma4) */
+  bool final_softcap = false;        /**< final-logit soft-cap */
+  LmHeadKind lmhead_kind = LmHeadKind::TIED;
+  bool decode_gpu = false;           /**< GPU attn/rope at decode (off for d=128) */
+  unsigned int head_dim = 0;         /**< attention head dim (0 = derive) */
+
+  /**
+   * @brief One-line dump for the shadow log.
+   */
+  std::string toString() const {
+    std::ostringstream os;
+    os << "ModelFeatures{qk_norm=" << has_qk_norm << ", v_norm=" << has_v_norm
+       << ", mlp=" << nntrainer::toString(mlp_kind)
+       << ", norm=" << nntrainer::toString(norm_style)
+       << ", sliding=" << sliding_window
+       << ", kv_share=" << kv_share_skip_prefill
+       << ", dual_head_dim=" << dual_head_dim << ", ple=" << ple
+       << ", attn_softcap=" << attn_softcap << ", final_softcap=" << final_softcap
+       << ", lmhead=" << nntrainer::toString(lmhead_kind)
+       << ", decode_gpu=" << decode_gpu << ", head_dim=" << head_dim << "}";
+    return os.str();
+  }
+};
+
+/**
+ * @brief The matcher: resolve the ExecPlan from device caps AND the model's
+ *        declared features. The caps-only cells (gemm_path, host_coherent) come
+ *        from resolveExecPlan(caps); the model-dependent cells (decode_gpu, and
+ *        later the head_dim attention path / KV-share) come from ModelFeatures.
+ *        SHADOW for now (no decision site reads it) — byte-identical. [T11]
+ */
+inline ExecPlan resolveExecPlan(const DeviceCaps &c, const ModelFeatures &m) {
+  ExecPlan p = resolveExecPlan(c);
+  // A model that wants GPU decode only gets it on a device that can actually run
+  // the resident decode path (a real GPU backend, not the host CPU).
+  p.decode_gpu = m.decode_gpu && (c.backend == "gpu" || c.backend == "cuda");
   return p;
 }
 

@@ -34,6 +34,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <context.h> // nntrainer::ModelFeatures (T11)
 #include <layer.h>
 #include <map>
 #include <model.h>
@@ -177,6 +178,17 @@ protected:
    */
   virtual Tensor createMlp(const int layer_id, int dim, int hidden_dim,
                            Tensor input);
+
+  /**
+   * @brief Declare WHAT THIS MODEL IS as a flat ModelFeatures struct (mlp kind,
+   *        q/k/v-norm, sliding window, KV-share, PLE, soft-caps, lm_head, decode
+   *        path, ...). The resolver pairs it with the backend's DeviceCaps to
+   *        produce an ExecPlan, replacing per-model-identity branching. Base
+   *        returns the defaults; each {Model}Transformer overrides it. [T11]
+   */
+  virtual nntrainer::ModelFeatures getModelFeatures() const {
+    return nntrainer::ModelFeatures{};
+  }
 
   /**
    * @brief Create the per-layer external KV-cache placeholder Tensors that

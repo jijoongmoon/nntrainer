@@ -95,6 +95,26 @@ public:
 
   void registerCustomLayers() override;
 
+  /** @copydoc Transformer::getModelFeatures() — gemma4: q/k/v-norm, GeGLU,
+   *  sandwich norm, dual head_dim (sliding/global), PLE, KV-share+skip-prefill,
+   *  attn+final soft-cap, untie-able QINT4 lm_head, decode-GPU ON. */
+  nntrainer::ModelFeatures getModelFeatures() const override {
+    nntrainer::ModelFeatures f;
+    f.has_qk_norm = true;
+    f.has_v_norm = true;
+    f.mlp_kind = nntrainer::MlpKind::GEGLU;
+    f.norm_style = nntrainer::NormStyle::SANDWICH;
+    f.sliding_window = true;
+    f.kv_share_skip_prefill = true;
+    f.dual_head_dim = true;
+    f.ple = true;
+    f.attn_softcap = true;
+    f.final_softcap = true;
+    f.lmhead_kind = nntrainer::LmHeadKind::UNTIED_QINT4;
+    f.decode_gpu = true;
+    return f;
+  }
+
 protected:
   Tensor per_layer_input;
   std::vector<Tensor> layer_k_norms;
