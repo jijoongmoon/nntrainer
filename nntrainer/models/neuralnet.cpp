@@ -245,14 +245,18 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   // (SVM) allocator so RunContext activation/weight tensors become GPU-resident
   // and avoid the per-layer host round-trip. Conservative and gated:
   //   - only under an OpenCL build,
-  //   - only when NNTR_GPU_SVM_POOL is set (default off => zero behavior change),
-  //   - only when the graph actually contains an engine=gpu node.
+  //   - only when the graph actually contains an engine=gpu node,
+  //   - [engine=gpu fold] NOW DEFAULT-ON for such graphs — the SVM-resident pool
+  //     is the GPU path's intended residency, so it no longer needs the must-set
+  //     NNTR_GPU_SVM_POOL. The flag still DISABLES it (=0) for A/B.
   // Pure-CPU graphs and OpenCL-disabled builds always keep the "cpu" allocator,
   // so CPU execution stays byte-identical. See
   // tensor/cl_operations/GPU_GENERALIZATION_PLAN.md.
   std::string engine_name = "cpu";
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-  if (std::getenv("NNTR_GPU_SVM_POOL") != nullptr) {
+  const char *_svm_pool_env = std::getenv("NNTR_GPU_SVM_POOL");
+  const bool svm_pool_on = !_svm_pool_env || std::atoi(_svm_pool_env) != 0;
+  if (svm_pool_on) {
     for (auto &n : graph_representation) {
       if (n->isComputeEngineGPU()) {
         engine_name = "gpu";

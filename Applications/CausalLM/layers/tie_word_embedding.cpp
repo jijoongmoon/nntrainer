@@ -708,8 +708,11 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       static const int lmhead_gpu = []() {
         if (const char *e = std::getenv("NNTR_LMHEAD_GPU"))
           return std::atoi(e);
+        // [engine=gpu fold] track the FC_INT8 default-on (GPU FC path default):
+        // the GPU lm_head GEMV is the dominant decode op, so leaving it OFF when
+        // NNTR_FC_INT8_GPU is unset costs ~40% decode. Default-on; =0 disables.
         const char *fc = std::getenv("NNTR_FC_INT8_GPU");
-        return (fc && std::atoi(fc) != 0) ? 1 : 0;
+        return (!fc || std::atoi(fc) != 0) ? 1 : 0;
       }();
       bool gpu_done = false;
       if (lmhead_gpu != 0 && (hidden_size % 256) == 0) {

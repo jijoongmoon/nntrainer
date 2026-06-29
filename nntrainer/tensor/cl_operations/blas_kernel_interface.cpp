@@ -433,10 +433,16 @@ struct V8cWeightEntry {
 // flag still overrides); this file-local name forwards to it.
 static bool v8c_buffer_path() { return v8c_use_buffer_path(); }
 
+// [engine=gpu fold] The v8c int8×QINT4 FC GEMM is the GPU FC path's default —
+// this gate is only reached from dotCl_v8c (ClComputeOps::fc), i.e. an engine=gpu
+// FC, and the host fallback it guards is byte-identical, so defaulting it ON
+// retires the must-set NNTR_FC_INT8_GPU. The flag still DISABLES it (=0) for A/B.
 static bool v8c_env_enabled() {
   static int cached = -1;
-  if (cached < 0)
-    cached = std::getenv("NNTR_FC_INT8_GPU") != nullptr ? 1 : 0;
+  if (cached < 0) {
+    const char *e = std::getenv("NNTR_FC_INT8_GPU");
+    cached = e ? (std::atoi(e) != 0) : 1; // default ON on the GPU FC path
+  }
   return cached != 0;
 }
 
@@ -1490,8 +1496,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // ordered after the producer's cl_mem write ONLY on the in-order queue (the
   // default is out-of-order and the copy could race ahead -> garbage).
   static const bool clmem_pool =
-    std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr &&
-    std::getenv("NNTR_GPU_SVM_POOL") != nullptr;
+    std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr && svm_pool_default_on();
   const bool device_clmem_in =
     clmem_pool && input.getMemoryData() &&
     input.getMemoryData()->isClMem() &&

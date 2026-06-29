@@ -150,8 +150,12 @@ bool CommandQueueManager::CreateCommandQueue() {
   // layers hand off through a shared buffer with no host round-trip, so the
   // queue must execute in submission order -> use an in-order queue.
   // See tensor/cl_operations/GPU_GENERALIZATION_PLAN.md Step 1.
+  // [engine=gpu fold] the SVM-resident pool (and hence the in-order handoff) is
+  // now the default; only an explicit NNTR_GPU_SVM_POOL=0 reverts to the legacy
+  // out-of-order queue. Matches the allocator default in neuralnet.cpp.
   cl_command_queue_properties qprops = 0;
-  if (std::getenv("NNTR_GPU_SVM_POOL") == nullptr) {
+  const char *_svm_pool_env = std::getenv("NNTR_GPU_SVM_POOL");
+  if (_svm_pool_env && std::atoi(_svm_pool_env) == 0) {
     qprops |= CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
   }
   // Env-gated CL_QUEUE_PROFILING_ENABLE so v8c (and any other) callers can

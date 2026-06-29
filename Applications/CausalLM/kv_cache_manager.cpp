@@ -75,8 +75,19 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // isSVM()=true. That is the precondition for mha_core's GPU flash attention
   // path (svm_ok); without it attention falls back to the host (CPU) GEMM and
   // is ~60x slower. Mirrors gpu_native's SVM K/V cache.
+  // [engine=gpu fold] the SVM-resident pool is now the default — but ONLY for the
+  // OpenCL gpu engine. On a CUDA build the gpu-svm (OpenCL) allocator is also
+  // registered, so without the engine guard a cuda run would wrongly bind the KV
+  // cache to it; the #if ENABLE_CUDA block below owns the cuda-uvm KV cache. The
+  // env proxy (NNTR_GPU_SVM_POOL set ⇒ OpenCL) used to carry that distinction;
+  // now it is explicit. NNTR_GPU_SVM_POOL=0 reverts to a host KV cache.
   std::shared_ptr<nntrainer::MemAllocator> svm_alloc;
-  if (std::getenv("NNTR_GPU_SVM_POOL") != nullptr) {
+  const char *_svm_pool_env = std::getenv("NNTR_GPU_SVM_POOL");
+  const char *_eng = std::getenv("NNTR_ENGINE");
+  const bool svm_pool_on = !_svm_pool_env || std::atoi(_svm_pool_env) != 0;
+  const bool gpu_engine =
+    !_eng || (std::string(_eng) != "cpu" && std::string(_eng) != "cuda");
+  if (svm_pool_on && gpu_engine) {
     auto allocs = nntrainer::Engine::Global().getAllocators();
     auto it = allocs.find("gpu");
     if (it != allocs.end() && it->second &&

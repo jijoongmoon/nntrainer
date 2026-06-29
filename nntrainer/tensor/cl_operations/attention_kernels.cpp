@@ -2927,7 +2927,7 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
   // SVM-pool queue (NNTR_GPU_SVM_POOL) the queue already orders those writes
   // before this kernel, so the per-layer drain is pure overhead — skip it
   // (~52 clFinish/forward of attention dead time recovered).
-  static const bool _inorder_q = std::getenv("NNTR_GPU_SVM_POOL") != nullptr;
+  static const bool _inorder_q = svm_pool_default_on(); // [engine=gpu fold]
   if (!_inorder_q)
     clFinish(q);
 
@@ -3353,7 +3353,7 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
   if (!kp || !kr)
     return false;
 
-  static const bool _inorder_q = std::getenv("NNTR_GPU_SVM_POOL") != nullptr;
+  static const bool _inorder_q = svm_pool_default_on(); // [engine=gpu fold]
   if (!_inorder_q)
     clFinish(q);
 

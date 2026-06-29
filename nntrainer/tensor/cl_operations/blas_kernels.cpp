@@ -2054,6 +2054,15 @@ bool v8c_use_buffer_path() {
   return use_buf;
 }
 
+// [engine=gpu fold] The GPU-resident SVM pool + in-order queue is the GPU path's
+// default; NNTR_GPU_SVM_POOL=0 reverts to the legacy host-bounce/out-of-order
+// path. Single source mirrored by the inline checks in neuralnet.cpp (allocator)
+// and opencl_command_queue_manager.cpp (queue ordering).
+bool svm_pool_default_on() {
+  const char *e = std::getenv("NNTR_GPU_SVM_POOL");
+  return !e || std::atoi(e) != 0;
+}
+
 // Compile options for the buffer-load v8c program. -DV8C_BUFFER_ONLY excludes
 // the image-sampling kernel bodies; -cl-std=CL3.0 exposes the core OpenCL C
 // 3.0 dot_4x8packed_* builtins (Intel NEO does not declare them under the

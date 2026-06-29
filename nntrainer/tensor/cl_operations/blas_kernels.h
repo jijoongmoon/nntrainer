@@ -701,5 +701,13 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem, void *act
  */
 bool v8c_use_buffer_path();
 
+/**
+ * @brief Whether the GPU-resident SVM pool + in-order queue is active. [engine=gpu
+ *        fold] default ON; NNTR_GPU_SVM_POOL=0 reverts to the legacy host-bounce /
+ *        out-of-order path. Mirrors the inline checks in neuralnet.cpp and the
+ *        command-queue manager.
+ */
+bool svm_pool_default_on();
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNELS_H__ */
