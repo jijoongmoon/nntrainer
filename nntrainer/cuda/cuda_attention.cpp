@@ -794,7 +794,15 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // cuBLAS/registration failure.
   // head_dim 256/512 are faster on block-Q (warp-shuffle, K/V reuse); GEMM wins
   // for the smaller head dims (128 = qwen3/llama) where block-Q underutilises.
-  static const bool gemm_attn_on = std::getenv("NNTR_CUDA_GEMM_ATTN") != nullptr;
+  static const bool gemm_attn_on = []() {
+    if (std::getenv("NNTR_CUDA_GEMM_ATTN") != nullptr)
+      return true; // explicit opt-in (presence), preserves prior semantics
+    // Caps-derived default (resolver attention cell): integrated GPUs (Orin
+    // sm_87) need the cuBLAS GEMM attention because block-Q runs ~0.2 TFLOP/s
+    // there; discrete (RTX) keeps block-Q. Safe — any cuBLAS/registration
+    // failure falls through to block-Q, never wrong output.
+    return ContextManager::Global().isIntegrated();
+  }();
   // head_dim 256/512 (gemma4 sliding/global) were historically excluded because
   // block-Q beat the cuBLAS path on RTX/Adreno. On Orin (sm_87) block-Q runs at
   // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth trying
