@@ -110,12 +110,11 @@ void CudaContext::add_default_object() {
   // the gemma4 tryRegister it replaces; the _gpu variant is OpenCL-only).
   registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
                   ScalarMultiplyLayer::type);
-#if defined(ENABLE_OPENCL)
   // tie_word_embedding (promoted [T12]): host lm_head on UVM (the GPU GEMV is the
-  // OpenCL path). Only compiled with the OpenCL backend, which build_cuda enables.
+  // OpenCL path, now #if ENABLE_OPENCL-guarded inside the layer so it builds
+  // without OpenCL). Register unconditionally.
   registerFactory(nntrainer::createLayer<TieWordEmbedding>,
                   TieWordEmbedding::type);
-#endif
 }
 
 template <typename T>

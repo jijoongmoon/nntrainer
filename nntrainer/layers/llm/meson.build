@@ -7,6 +7,9 @@ llm_layer_sources = [
   'qkv_layer.cpp',
   'geglu_layer.cpp',
   'swiglu_layer.cpp',
+  # tie_word_embedding's OpenCL lm_head GEMV is #if defined(ENABLE_OPENCL)-guarded
+  # internally, so it compiles host-only without OpenCL (the FP32 unittest build).
+  'tie_word_embedding.cpp',
 ]
 
 llm_layer_headers = [
@@ -24,9 +27,6 @@ llm_layer_headers = [
 # registration that consumes it (a CPU-only libnntrainer must not pull it in).
 if get_option('enable-opencl')
   llm_layer_sources += 'scalar_multiply_gpu.cpp'
-  # tie_word_embedding calls the OpenCL lm_head GEMV (lmhead_gemv_*_cl,
-  # clmem_raise/lower) unguarded, so it too is OpenCL-only.
-  llm_layer_sources += 'tie_word_embedding.cpp'
 endif
 
 foreach s : llm_layer_sources

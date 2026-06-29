@@ -462,12 +462,11 @@ void AppContext::add_default_object() {
   // swiglu on cpu: the merged backend-neutral SwiGLULayer (getOps dispatch +
   // skip + the cuda fast path); replaces the former app causallm::SwiGLULayer.
   registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
-#if defined(ENABLE_OPENCL)
-  // tie_word_embedding hard-depends on the OpenCL lm_head GEMV (blas_kernels), so
-  // it is only compiled/registered when the OpenCL backend is on.
+  // tie_word_embedding: the GPU lm_head GEMV is internally #if ENABLE_OPENCL, so
+  // the layer compiles host-only without OpenCL — register unconditionally so the
+  // models (lm_head) construct on the FP32 reference / CPU build too. [T12]
   registerFactory(nntrainer::createLayer<TieWordEmbedding>,
                   TieWordEmbedding::type);
-#endif
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);

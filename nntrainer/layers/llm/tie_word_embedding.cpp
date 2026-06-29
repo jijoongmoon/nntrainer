@@ -11,8 +11,13 @@
  *
  */
 
+#if defined(ENABLE_OPENCL)
+// The OpenCL GPU lm_head GEMV path (lmhead_gemv_*_cl / clmem_*). Guarded so the
+// FP32 CPU build (enable-opencl=false — the causallm model unittests) compiles
+// tie as a host-only lm_head. [T12]
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
+#endif
 #include <cpu_backend.h>
 #include <layer_context.h>
 #include <memory_data.h>
@@ -409,11 +414,15 @@ void TieWordEmbedding::incremental_forwarding_embedding(
   // output SVM activation. Under NNTR_SVM_RESIDENT the per-op maps are skipped,
   // so explicitly hand the buffer back to the device here; otherwise the first
   // decoder layer's GPU kernels read stale data. No-op when not SVM-resident.
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+  // SVM residency hand-back is FP16-OpenCL-only (FP32 reference activations are
+  // host, not SVM). Guard so the FP32/no-OpenCL unittest build compiles. [T12]
   {
     const auto h_md = hidden_.getMemoryData();
     if (h_md && h_md->isSVM())
       nntrainer::cl_svm_unmap_force(hidden_.getData<uint8_t>());
   }
+#endif
 
   // Design §2.5 input boundary RAISE: when the embedding output is classified
   // GPU_CLMEM (NNTR_CLMEM_RAISE), upload the host-written rows into its
@@ -421,9 +430,11 @@ void TieWordEmbedding::incremental_forwarding_embedding(
   // post_attention addition) read fresh device memory instead of a coarse-SVM
   // handoff (the measured visibility hazard). Non-blocking, in-order-queue
   // ordered before all consumers. No-op when the class is SVM.
+#if defined(ENABLE_OPENCL)
   nntrainer::clmem_raise_cl(
     hidden_, (unsigned int)((size_t)(to - from) * out_dim *
                             hidden_.getDim().getDataTypeSize()));
+#endif
 }
 
 void TieWordEmbedding::incremental_forwarding_lmhead(
@@ -447,16 +458,22 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
   // coarse-SVM map protocol is NOT trustworthy on this driver -- device
   // access to host-mapped SVM intermittently sees zeros, measured).
   // SVM input: drain + force a host-coherent map as before.
+#if defined(ENABLE_OPENCL)
+  // GPU->host LOWER barrier for a cl_mem/SVM input. No-op for the FP32/no-OpenCL
+  // build (the input is plain host memory there). [T12]
   if (!nntrainer::clmem_lower_cl(
         input_, (unsigned int)((size_t)(to - from) * input_.width() *
                                input_.getDim().getDataTypeSize()))) {
     const auto in_md = input_.getMemoryData();
     if (in_md && in_md->isSVM()) {
+#ifdef ENABLE_FP16
       nntrainer::cl_queue_finish();
       nntrainer::cl_svm_map_force(input_.getData<uint8_t>(), input_.bytes(),
                                   /*read_only=*/true);
+#endif
     }
   }
+#endif
 
   // NNTR_OPENCL_PROFILING: dump the per-kernel GPU/idle profile. dumpProfile()
   // CLEARS the captured-event log on each call, so two dumps partition the
@@ -475,6 +492,7 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       int v = e ? std::atoi(e) : 12;
       return v < 2 ? 2 : v;
     }();
+#if defined(ENABLE_OPENCL)
     static int lmhead_calls = 0;
     if (clprof) {
       ++lmhead_calls;
@@ -483,6 +501,7 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       else if (lmhead_calls == decode_at)
         nntrainer::clmem_dump_clprof("decode");
     }
+#endif
   }
 
   // NNTR_CLMEM_PROBE: HOST-view hash of the lm_head input (the final norm
@@ -715,6 +734,9 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
         return (!fc || std::atoi(fc) != 0) ? 1 : 0;
       }();
       bool gpu_done = false;
+#if defined(ENABLE_OPENCL)
+      // GPU Q6_K lm_head GEMV; falls through to the host loop (gpu_done=false) on
+      // the no-OpenCL build. [T12]
       if (lmhead_gpu != 0 && (hidden_size % 256) == 0) {
         std::vector<float> logits_f32(vocab_size);
         gpu_done = nntrainer::lmhead_gemv_q6_k_cl(
@@ -732,6 +754,8 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
           }
         }
       }
+#endif
+      (void)lmhead_gpu;
 
       if (!gpu_done) {
         auto &tm = nntrainer::ThreadManager::Global();
