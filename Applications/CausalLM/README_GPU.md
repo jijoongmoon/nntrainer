@@ -208,6 +208,62 @@ every tensor a layer owns (`LayerNode::configureRunContext`), so even activation
 tensors reach the right backend. This is the mechanism the layer-fork collapse
 (§6.6, §12) builds on.
 
+### 4.2 Implementation matrix — what each device class uses
+
+The four pieces above, instantiated per device class. The key structural fact:
+the three **OpenCL** classes (Adreno / Intel / Intel-XMX) share one `ClContext` /
+`ClSVMAllocator` / `ClComputeOps` — the device difference is **not** a separate
+class but the *kernel path the op-table picks*, derived from `DeviceCaps`. **CUDA**
+has its own trio. The **GPU layers are backend-neutral** (the same class on every
+backend; the divergence is inside `ComputeOps`).
+
+| Device class | Context | MemAllocator | ComputeOps | GPU layer |
+|---|---|---|---|---|
+| **Adreno** (Qualcomm) | `ClContext` | `ClSVMAllocator` (coarse SVM) | `ClComputeOps` | neutral (shared) |
+| **Intel** non-XMX (Meteor/NEO) | `ClContext` | `ClSVMAllocator` | `ClComputeOps` | neutral (shared) |
+| **Intel-XMX** (Xe2/Xe3) | `ClContext` | `ClSVMAllocator` | `ClComputeOps` | neutral (shared) |
+| **CUDA** (RTX/Orin) | `CudaContext` | `CudaMemAllocator` (UVM + device-only act pool) | `CudaComputeOps : CpuComputeOps` | neutral (shared) |
+
+Per-piece highlights (full detail in §6–§7, §12):
+
+- **Context** — link-time self-registration (`"gpu"` / `"cuda"`); kernel compile +
+  cache (OpenCL `clBuildProgram` + disk KERNEL_CACHE; CUDA **NVRTC** + PTX disk
+  cache + CUmodule cache); a once-probed `DeviceCaps`; the `ExecPlan` resolver
+  (`DP4A` / **`XMX`** if `caps.subgroups` / `CUBLAS`) and the `ModelFeatures ×
+  DeviceCaps` matcher; in-order SVM queue (+ `NNTR_XE3_SYNC` on Xe3) vs CUDA-graph
+  capture/replay.
+- **MemAllocator** — OpenCL `clSVMAlloc` (one host+device pointer) vs CUDA
+  `cudaMallocManaged` (UVM) + a `device_only cudaMalloc` activation pool; the
+  capability predicates (`isHostAddressable`/`isDeviceVisible`/`isSVM`/
+  `supportsDevicePool`); `makePool()` chooses SVM pool ↔ `ClBufferPool`
+  (`GPU_CLMEM`).
+- **ComputeOps** — the accelerator quantized GEMM/GEMV (`gemm_q4_0_*`,
+  `gemv_int4_*`, `sgemm_int4_*`) plus the whole-op table (`fc`,
+  `fc_prebuild_weight`, `geglu`, `swiglu`, `residual_op`) and the host copies.
+- **GPU layer** — one neutral class per op (`FullyConnectedLayerCl`, `GeGLULayer`,
+  `SwiGLULayer`, the core `AdditionLayer`, …), registered on both the gpu and cuda
+  contexts; the not-yet-collapsed forks (`RMSNormLayerCl`/`CudaRMSNormLayer`,
+  `Concat`/`Reshape`/`TransposeLayerCl`); the app-side `MHACoreLayer` /
+  `reshaped_rms_norm` / lm_head / `per_layer_slice`.
+
+**Where the device difference actually lives** — the kernel path each op-table op
+dispatches to per device class:
+
+| op-table op | Adreno | Intel (non-XMX) | Intel-XMX | CUDA |
+|---|---|---|---|---|
+| `fc` prefill GEMM | image2d v8c (`read_imageui`) | buffer v8c (dp4a) | `gemm_xmx_i4` systolic DPAS | `cuda_fc_qint4` dp4a / cuBLAS int8 IMMA |
+| `fc` decode GEMV | 64-wide coop split-K | 64-wide coop split-K | dp4a (XMX is prefill-only) | dp4a GEMV |
+| attention (`mha_core`) | image2d KV mirror (`two_conv_attention`) | SVM flash + split-KV flash-decode | SVM flash + split-KV | block-Q (d128/256/512) + flash-decode + cuBLAS GEMM-attn |
+| `geglu` / `swiglu` | `geglu_cl_op` / `swiglu_cl_op` (SVM/cl_mem) | same | same | device fp16 kernel / host-on-UVM |
+| `residual_op` (add) | `clmem_residual` / `add_i_cl` / `gpu_copy_f16` | same | same | host add on UVM (+ fused `cuda_add_fp16`) |
+| RoPE | `rotary_emb` + LUT-cap | same | same | `cuda_rope` (device-pos) |
+| q/k/v-norm | `reshaped_rms_norm` GPU-resident | same | same | `cuda_rmsnorm` + QKNORM |
+| lm_head | Q6_K GEMV + on-GPU 2-pass argmax | same | same | cuda Q6_K GEMV + argmax |
+
+Only **FC** and **attention** truly diverge per OpenCL device (image vs buffer vs
+DPAS); the activations / residual / RoPE / norms run the *same* OpenCL kernel on
+Adreno and both Intel variants, and only split host-vs-device on CUDA.
+
 ## 5. Engine selection
 
 `causallm_engine()` returns `"gpu"` by default, `"cpu"` under `NNTR_ENGINE=cpu`,
