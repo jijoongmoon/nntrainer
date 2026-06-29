@@ -433,6 +433,25 @@ public:
   bool isPrefillCaptureDisabled() const { return prefill_capture_disabled_; }
 
   /**
+   * @brief Accessors used by the runDecode seam (Context::runDecode / its
+   *        CudaContext override, T9) so the relocated CUDA-graph state machine
+   *        can drive a forward step without reaching into NeuralNetwork privates.
+   */
+  /// set the M2-B "feed only, skip the heavy compute" flag (read inside
+  /// incremental_forwarding); used by the M2-B per-token embedding refresh.
+  void setM2BSkipAll(bool v);
+  /// look up a graph node by name (M2-B light embedding refresh).
+  std::shared_ptr<LayerNode> getLayerNode(const std::string &name) const {
+    return model_graph.getLayerNode(name);
+  }
+  /// bind the current step's inputs/labels to the graph (M2-B light refresh).
+  void feedInputsLabels(const sharedConstTensors &inputs,
+                        const sharedConstTensors &labels) {
+    sharedConstTensors in = inputs, lb = labels;
+    model_graph.setInputsLabels(in, lb);
+  }
+
+  /**
    * @brief     reset input dimensions of a model
    * @param[in] dims input dimensions
    * @note Similar to reinitialize, the resetInputDimension API is used for
@@ -726,6 +745,21 @@ private:
 
   const Engine *ct_engine =
     nullptr; /** Configurations bound to current engine */
+
+  Context *decode_ctx_ =
+    nullptr; /**< resolved-once Context for the runDecode seam (T9); see
+                  getDecodeContext() */
+
+  /**
+   * @brief Resolve (once, then cache) the Context whose runDecode() drives the
+   *        decode/prefill forward. The CUDA backend overrides runDecode with the
+   *        graph state machine; every other backend uses the base plain walk, so
+   *        any registered context gives a byte-identical forward. Prefers the
+   *        "cuda" context when present (CUDA build), else falls back to "cpu".
+   * @return the decode Context, or nullptr if none is registered (caller then
+   *         walks directly).
+   */
+  Context *getDecodeContext();
 
   NetworkGraph model_graph; /** Network Model Graph */
 

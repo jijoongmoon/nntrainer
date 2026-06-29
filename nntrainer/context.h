@@ -38,6 +38,14 @@
 
 namespace nntrainer {
 
+// Forward decls for the runDecode seam (T9) — kept as forward declarations so
+// context.h does NOT pull in the heavy tensor.h / neuralnet.h. The seam's
+// tensor type is sharedConstTensors == std::vector<std::shared_ptr<const
+// Tensor>>, which only needs Tensor to be *declared* (shared_ptr of an
+// incomplete type is fine).
+class NeuralNetwork;
+class Tensor;
+
 // ContextData lives in its own header so that layer_context.h / layer_node.h
 // can pull it in without triggering the context.h → layer_devel.h cycle.
 
@@ -426,6 +434,26 @@ public:
     ml_logw("[Context] this backend does not support layer registration");
     return -1;
   }
+
+  /**
+   * @brief SEAM-2: run ONE decode/prefill forward step for the model — the
+   *        exec-engine seam (docs/ARCHITECTURE_REFACTOR.md §10 T9). The base is a
+   *        plain graph walk (`nn.incremental_forwarding(...)`), so CPU and OpenCL
+   *        are byte-identical; `CudaContext` overrides it with the CUDA-graph
+   *        capture/replay state machine (M1 / M2-B / prefill-graph) that used to
+   *        live as an `#if ENABLE_CUDA` block in neuralnet.cpp.
+   * @note  DECLARED LAST on purpose: appending the virtual at the vtable tail
+   *        leaves every existing slot's index unmoved, so a new libnntrainer.so
+   *        stays ABI-compatible with an app/ccapi built against the old vtable
+   *        (Adreno is verified by swapping only libnntrainer.so).
+   * @note  Return/param type is `sharedConstTensors`
+   *        (std::vector<std::shared_ptr<const Tensor>>); spelled out to keep
+   *        context.h free of tensor.h. Defined out-of-line in neuralnet.cpp.
+   */
+  virtual std::vector<std::shared_ptr<const Tensor>>
+  runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
+            const std::vector<std::shared_ptr<const Tensor>> &input,
+            const std::vector<std::shared_ptr<const Tensor>> &label);
 
 private:
   /**

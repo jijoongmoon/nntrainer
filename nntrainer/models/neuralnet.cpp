@@ -558,6 +558,39 @@ bool recq_skip_all_active();
 // every other node's host forward (the GPU work comes from the replayed graph).
 static bool g_m2b_skip_all = false;
 
+void NeuralNetwork::setM2BSkipAll(bool v) { g_m2b_skip_all = v; }
+
+// SEAM-2 base (docs/ARCHITECTURE_REFACTOR.md §10 T9): one decode/prefill forward
+// step is a plain graph walk. CPU and OpenCL use this base unchanged, so they are
+// byte-identical to the pre-seam code; only CudaContext overrides it with the
+// CUDA-graph capture/replay state machine.
+sharedConstTensors Context::runDecode(NeuralNetwork &nn, unsigned int from,
+                                      unsigned int to,
+                                      const sharedConstTensors &input,
+                                      const sharedConstTensors &label) {
+  return nn.incremental_forwarding(from, to, input, label, false);
+}
+
+// Resolve (once, then cache) the context whose runDecode() drives decode. Only
+// CUDA overrides runDecode; every other backend's base runDecode is the same
+// plain walk, so the choice among non-cuda contexts is immaterial. Prefer "cuda"
+// (present only on a CUDA build), else "cpu", else "gpu".
+Context *NeuralNetwork::getDecodeContext() {
+  if (decode_ctx_ != nullptr)
+    return decode_ctx_;
+  if (ct_engine == nullptr)
+    return nullptr;
+  for (const char *name : {"cuda", "cpu", "gpu"}) {
+    try {
+      decode_ctx_ = ct_engine->getRegisteredContext(name);
+      if (decode_ctx_ != nullptr)
+        return decode_ctx_;
+    } catch (...) {
+    }
+  }
+  return decode_ctx_;
+}
+
 sharedConstTensors NeuralNetwork::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
@@ -1691,243 +1724,15 @@ sharedConstTensors NeuralNetwork::incremental_inference(
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
   PROFILE_TIME_START(nn_foward);
 
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-  // CUDA-graph capture of a whole DECODE forward (NNTR_CUDA_GRAPH, M1). A decode
-  // step issues ~1000 tiny kernels; the CPU launch/dispatch between them is the
-  // decode bottleneck (GPU ~30-47% utilized). Capturing the per-token forward
-  // into one graph and replaying it collapses that launch overhead. M1
-  // re-instantiates every step (still pays cudaGraphInstantiate) purely to prove
-  // capture+replay COHERENCE; M2 will cache the graphExec and patch params.
-  // Prerequisite: every decode op stays on the backend stream with no host op
-  // reading device memory mid-chain -- provided by the NNTR_CUDA_* device-
-  // residency flags + pinned embedding staging. Drains inside the captured
-  // region are suppressed by StreamManager's capturing_ guard; the single sync
-  // below makes the output valid before the caller (sampling) reads it.
-  static const char *_cgraph_env = std::getenv("NNTR_CUDA_GRAPH");
-  static const bool cuda_graph_decode =
-    _cgraph_env != nullptr && _cgraph_env[0] == '1';
-  // PREFILL graph (W3): capture the M>1 prefill forward like decode, collapsing
-  // the ~190 per-op cudaStreamSynchronize drains (the cMA=0 sync floor) into one
-  // submission. Default ON for INTEGRATED GPUs (Orin) when the graph path is
-  // enabled; discrete GPUs (RTX) keep their existing eager-async prefill (they
-  // are not sync-bound -- isIntegrated()==false). Override: NNTR_CUDA_PREFILL_GRAPH
-  // =1/0. A capture abort (e.g. an in-capture cudaMalloc on un-pre-grown scratch)
-  // falls back to eager, which also grows the scratch so the NEXT prefill captures.
-  static const bool cuda_graph_prefill = []() {
-    const char *e = std::getenv("NNTR_CUDA_PREFILL_GRAPH");
-    if (e != nullptr)
-      return e[0] != '0';
-    const char *g = std::getenv("NNTR_CUDA_GRAPH");
-    return g != nullptr && g[0] == '1' &&
-           nntrainer::cuda::ContextManager::Global().isIntegrated();
-  }();
-  static const bool cuda_graph_dbg =
-    std::getenv("NNTR_CUDA_GRAPH_DBG") != nullptr;
-  // Diagnostic: cache the exec from the first captured token and RE-LAUNCH it for
-  // subsequent tokens (no re-capture / re-instantiate). Output is INCOHERENT
-  // (per-token params are stale) -- this exists ONLY to measure the pure
-  // cudaGraphLaunch+sync ceiling that a real cross-token M2-B would hit, free of
-  // the per-token graph-upload that contaminates the M1 replay number.
-  static const bool cuda_graph_replay =
-    std::getenv("NNTR_CUDA_GRAPH_REPLAY") != nullptr;
-  static cudaGraphExec_t _cg_cached_exec = nullptr;
-  static sharedConstTensors _cg_cached_out;
-  static unsigned long _cg_ok = 0, _cg_fallback = 0;
-  bool cuda_graph_captured = false;
-
-  // M2-B: single-capture COHERENT decode. Capture the full forward ONCE (first
-  // decode token); for every later token, refresh ONLY the embeddings on the host
-  // (g_m2b_skip_all feed pass) so the pinned staging holds the new token's rows,
-  // update the device position (cuda_set_pos -> d_pos), and REPLAY the cached
-  // graph -- skipping the ~350-op C++ dispatch (the decode bottleneck). Every
-  // per-token RoPE/attention/KV-write position is read from d_pos by the
-  // NNTR_CUDA_M2B kernels, so the frozen graph stays correct across tokens.
-  static const bool cuda_m2b = std::getenv("NNTR_CUDA_M2B") != nullptr;
-  if (cuda_m2b && from == 0 && _cg_cached_exec != nullptr) {
-    // new sequence (prefill boundary): drop the previous sequence's cached graph.
-    cudaGraphExecDestroy(_cg_cached_exec);
-    _cg_cached_exec = nullptr;
-    _cg_cached_out = {};
-  }
-  if (cuda_m2b && from != 0 && (to - from) == 1) {
-    auto &sm = nntrainer::cuda::StreamManager::Global();
-    if (_cg_cached_exec != nullptr) {
-      // subsequent token: embed-only feed (refresh emb_stage) -> set pos -> replay
-      static const bool m2b_light =
-        std::getenv("NNTR_CUDA_M2B_LIGHT") != nullptr;
-      if (m2b_light) {
-        // lighter feed: set the new token input + run ONLY the two embedding
-        // nodes directly, bypassing the full ~350-node graph iteration.
-        model_graph.setInputsLabels(X, label);
-        auto emb0 = model_graph.getLayerNode("embedding0");
-        auto ple = model_graph.getLayerNode("per_layer_input_embedding");
-        if (emb0)
-          emb0->incremental_forwarding(from, to, false);
-        if (ple)
-          ple->incremental_forwarding(from, to, false);
-      } else {
-        g_m2b_skip_all = true;
-        out = incremental_forwarding(from, to, X, label, false);
-        g_m2b_skip_all = false;
-      }
-      nntrainer::cuda::cuda_set_pos((int)from, (int)from + 1);
-      cudaGraphLaunch(_cg_cached_exec, sm.GetStream());
-      cudaStreamSynchronize(sm.GetStream());
-      out = _cg_cached_out;
-      cuda_graph_captured = true;
-    } else if (sm.beginCapture()) {
-      // first decode token: set pos, capture the full forward, cache the exec
-      nntrainer::cuda::cuda_set_pos((int)from, (int)from + 1);
-      out = incremental_forwarding(from, to, X, label, false);
-      cudaGraph_t graph = nullptr;
-      if (sm.endCapture(&graph) && graph != nullptr) {
-        if (cudaGraphInstantiate(&_cg_cached_exec, graph, 0) == cudaSuccess) {
-          cudaGraphLaunch(_cg_cached_exec, sm.GetStream());
-          cudaStreamSynchronize(sm.GetStream());
-          _cg_cached_out = out;
-          cuda_graph_captured = true;
-        }
-        cudaGraphDestroy(graph);
-      } else {
-        cudaGetLastError();
-      }
-    }
-    if (cuda_graph_dbg) {
-      static unsigned long _m2b_tok = 0;
-      if (++_m2b_tok <= 16)
-        std::fprintf(stderr, "[M2B] tok#%lu %s (exec=%p)\n", _m2b_tok,
-                     cuda_graph_captured ? "ok" : "FALLBACK",
-                     (void *)_cg_cached_exec);
-    }
-  }
-
-  if (!cuda_graph_captured && cuda_graph_decode && from != 0 &&
-      (to - from) == 1) {
-    auto &sm = nntrainer::cuda::StreamManager::Global();
-    const char *stage = "beginCapture";
-    cudaError_t cerr = cudaSuccess;
-    using _clk = std::chrono::high_resolution_clock;
-    auto _us = [](_clk::time_point a, _clk::time_point b) {
-      return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
-    };
-    long t_rec = 0, t_inst = 0, t_rep = 0;
-    if (cuda_graph_replay && _cg_cached_exec != nullptr) {
-      // replay-only: relaunch the cached exec (timing ceiling, incoherent)
-      auto p2 = _clk::now();
-      cudaGraphLaunch(_cg_cached_exec, sm.GetStream());
-      cudaStreamSynchronize(sm.GetStream());
-      t_rep = _us(p2, _clk::now());
-      out = _cg_cached_out; // persistent output tensors, refilled by the replay
-      cuda_graph_captured = true;
-    } else if (sm.beginCapture()) {
-      auto p0 = _clk::now();
-      out = incremental_forwarding(from, to, X, label, false);
-      cudaGraph_t graph = nullptr;
-      bool ended = sm.endCapture(&graph);
-      auto p1 = _clk::now();
-      t_rec = _us(p0, p1);
-      if (ended && graph != nullptr) {
-        cudaGraphExec_t exec = nullptr;
-        cerr = cudaGraphInstantiate(&exec, graph, 0);
-        auto p2 = _clk::now();
-        t_inst = _us(p1, p2);
-        if (cerr == cudaSuccess) {
-          cudaGraphLaunch(exec, sm.GetStream());
-          cudaStreamSynchronize(sm.GetStream());
-          t_rep = _us(p2, _clk::now());
-          if (cuda_graph_replay) {
-            _cg_cached_exec = exec; // keep for replay-only relaunch
-            _cg_cached_out = out;
-          } else {
-            cudaGraphExecDestroy(exec);
-          }
-          cuda_graph_captured = true;
-        } else {
-          stage = "cudaGraphInstantiate";
-        }
-        cudaGraphDestroy(graph);
-      } else {
-        // capture invalidated (e.g. a mid-capture cudaMalloc): record the error
-        // and clear the sticky flag so the eager fallback is not falsely flagged.
-        stage = "endCapture";
-        cerr = cudaGetLastError();
-      }
-    }
-    if (cuda_graph_captured)
-      ++_cg_ok;
-    else
-      ++_cg_fallback;
-    if (cuda_graph_dbg && (_cg_ok + _cg_fallback) <= 12) {
-      if (cuda_graph_captured)
-        std::fprintf(stderr,
-                     "[CUDA_GRAPH] tok#%lu %s  record=%ldus instantiate=%ldus "
-                     "replay+sync=%ldus\n",
-                     _cg_ok, t_rec ? "CAPTURED+REPLAYED" : "REPLAY-ONLY(cached)",
-                     t_rec, t_inst, t_rep);
-      else
-        std::fprintf(stderr,
-                     "[CUDA_GRAPH] fell back (captured=%lu fallback=%lu) stage=%s err=%d\n",
-                     _cg_ok, _cg_fallback, stage, (int)cerr);
-    }
-  }
-  // PREFILL graph capture (W3): same machinery as the decode M1 branch above,
-  // for the M>1 prefill (from==0). One beginCapture -> forward -> endCapture ->
-  // instantiate -> launch -> single sync, replacing the ~190 per-op drains. The
-  // StreamManager capturing_ guard suppresses the in-forward syncs; an in-capture
-  // cudaMalloc (un-pre-grown scratch) invalidates the graph -> clean eager
-  // fallback below (which also grows the scratch so the next prefill captures).
-  if (!cuda_graph_captured && cuda_graph_prefill && !prefill_capture_disabled_ &&
-      from == 0 && (to - from) > 1) {
-    auto &sm = nntrainer::cuda::StreamManager::Global();
-    using _clk = std::chrono::high_resolution_clock;
-    auto _us = [](_clk::time_point a, _clk::time_point b) {
-      return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
-    };
-    long t_rec = 0, t_inst = 0, t_rep = 0;
-    const char *stage = "beginCapture";
-    cudaError_t cerr = cudaSuccess;
-    if (sm.beginCapture()) {
-      auto p0 = _clk::now();
-      out = incremental_forwarding(from, to, X, label, false);
-      cudaGraph_t graph = nullptr;
-      bool ended = sm.endCapture(&graph);
-      auto p1 = _clk::now();
-      t_rec = _us(p0, p1);
-      if (ended && graph != nullptr) {
-        cudaGraphExec_t exec = nullptr;
-        cerr = cudaGraphInstantiate(&exec, graph, 0);
-        auto p2 = _clk::now();
-        t_inst = _us(p1, p2);
-        if (cerr == cudaSuccess) {
-          cudaGraphLaunch(exec, sm.GetStream());
-          cudaStreamSynchronize(sm.GetStream());
-          t_rep = _us(p2, _clk::now());
-          cudaGraphExecDestroy(exec);
-          cuda_graph_captured = true;
-        } else {
-          stage = "cudaGraphInstantiate";
-        }
-        cudaGraphDestroy(graph);
-      } else {
-        stage = "endCapture";
-        cerr = cudaGetLastError();
-      }
-    }
-    if (cuda_graph_dbg) {
-      static unsigned long _pf = 0;
-      std::fprintf(stderr,
-                   "[PREFILL_GRAPH] #%lu M=%u %s record=%ldus instantiate=%ldus "
-                   "replay+sync=%ldus stage=%s err=%d\n",
-                   ++_pf, (unsigned)(to - from),
-                   cuda_graph_captured ? "CAPTURED" : "FALLBACK", t_rec, t_inst,
-                   t_rep, stage, (int)cerr);
-    }
-  }
-  if (!cuda_graph_captured)
+  // SEAM-2 (docs/ARCHITECTURE_REFACTOR.md §10 T9): one decode/prefill forward
+  // step is dispatched through the resolved Context. The base runDecode is a
+  // plain walk (incremental_forwarding) — CPU/OpenCL are byte-identical; only
+  // CudaContext::runDecode overrides it with the CUDA-graph capture/replay state
+  // machine that used to live inline here as an #if ENABLE_CUDA block.
+  if (Context *dctx = getDecodeContext())
+    out = dctx->runDecode(*this, from, to, X, label);
+  else
     out = incremental_forwarding(from, to, X, label, false);
-#else
-  out = incremental_forwarding(from, to, X, label, false);
-#endif
 
   PROFILE_TIME_END(nn_foward);
 
