@@ -4,6 +4,7 @@
 llm_layer_sources = [
   'logit_softcapping.cpp',
   'scalar_multiply.cpp',
+  'qkv_layer.cpp',
 ]
 
 llm_layer_headers = [
@@ -11,6 +12,7 @@ llm_layer_headers = [
   'scalar_multiply.h',
   'scalar_multiply_gpu.h',
   'tie_word_embedding.h',
+  'qkv_layer.h',
 ]
 
 # scalar_multiply's GPU variant uses OpenCL directly (cl_mem / ClContext), so it
