@@ -110,9 +110,13 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      // attention (B) and the GPU-RoPE-decode (A) OFF for now (explicit; both
      // default false anyway). NNTR_MHA_GPU_DECODE env still forces them on for
      // testing.
-     withKey("gpu_decode_attn", "false"),
-     withKey("gpu_decode_rope", "false"),
-     withKey("gpu_ohwi_rope", "false")}));
+     // [T11-consume] derive from getModelFeatures() (single source). Values
+     // unchanged (qwen3: host decode, head_dim=128 diverges), so token-identical.
+     withKey("gpu_decode_attn", getModelFeatures().decode_gpu ? "true" : "false"),
+     withKey("gpu_decode_rope",
+             getModelFeatures().decode_rope_gpu ? "true" : "false"),
+     withKey("gpu_ohwi_rope",
+             getModelFeatures().decode_gpu ? "true" : "false")}));
   Tensor a;
   if (_kv_int8_setup) {
     a = mha({q_normed, k_normed, v});

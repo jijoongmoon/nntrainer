@@ -214,9 +214,13 @@ Tensor Gemma2Transformer::createAttention(const int layer_id, int seq_len,
      // so enable it by default. GPU-RoPE-decode (A) DIVERGES on gemma2, so
      // keep it OFF -> decode runs GPU flash attention + HOST RoPE (the fast,
      // token-identical combination). NNTR_MHA_GPU_DECODE env still forces both.
-     withKey("gpu_decode_attn", "true"),
-     withKey("gpu_decode_rope", "false"),
-     withKey("gpu_ohwi_rope", "true")}));
+     // [T11-consume] derive from getModelFeatures() (single source). Values
+     // unchanged (gemma2: attn/ohwi GPU, rope HOST), so token-identical.
+     withKey("gpu_decode_attn", getModelFeatures().decode_gpu ? "true" : "false"),
+     withKey("gpu_decode_rope",
+             getModelFeatures().decode_rope_gpu ? "true" : "false"),
+     withKey("gpu_ohwi_rope",
+             getModelFeatures().decode_gpu ? "true" : "false")}));
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer

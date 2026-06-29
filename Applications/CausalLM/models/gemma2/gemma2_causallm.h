@@ -78,6 +78,7 @@ public:
     f.final_softcap = true;
     f.lmhead_kind = nntrainer::LmHeadKind::TIED;
     f.decode_gpu = true;
+    f.decode_rope_gpu = false; // gemma2: GPU attn but HOST decode-RoPE (diverges)
     return f;
   }
 };

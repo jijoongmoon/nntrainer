@@ -613,9 +613,13 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
     // attention and the GPU-RoPE-decode are validated, so enable both by
     // default (no NNTR_MHA_GPU_DECODE env needed). The env flag still forces
     // them on globally and NNTR_NO_GPU_ROPE still disables (A).
-    withKey("gpu_decode_attn", "true"),
-    withKey("gpu_decode_rope", "true"),
-    withKey("gpu_ohwi_rope", "true"),
+    // [T11-consume] decode-GPU gates now derive from getModelFeatures() (the
+    // single source) instead of per-call literals. Values unchanged (gemma4: all
+    // GPU), so token-identical.
+    withKey("gpu_decode_attn", getModelFeatures().decode_gpu ? "true" : "false"),
+    withKey("gpu_decode_rope",
+            getModelFeatures().decode_rope_gpu ? "true" : "false"),
+    withKey("gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));
@@ -771,9 +775,13 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     // attention and the GPU-RoPE-decode are validated, so enable both by
     // default (no NNTR_MHA_GPU_DECODE env needed). The env flag still forces
     // them on globally and NNTR_NO_GPU_ROPE still disables (A).
-    withKey("gpu_decode_attn", "true"),
-    withKey("gpu_decode_rope", "true"),
-    withKey("gpu_ohwi_rope", "true"),
+    // [T11-consume] decode-GPU gates now derive from getModelFeatures() (the
+    // single source) instead of per-call literals. Values unchanged (gemma4: all
+    // GPU), so token-identical.
+    withKey("gpu_decode_attn", getModelFeatures().decode_gpu ? "true" : "false"),
+    withKey("gpu_decode_rope",
+            getModelFeatures().decode_rope_gpu ? "true" : "false"),
+    withKey("gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));

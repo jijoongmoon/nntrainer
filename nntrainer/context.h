@@ -217,7 +217,12 @@ struct ModelFeatures {
   bool attn_softcap = false;         /**< QK logit soft-cap (gemma2/gemma4) */
   bool final_softcap = false;        /**< final-logit soft-cap */
   LmHeadKind lmhead_kind = LmHeadKind::TIED;
-  bool decode_gpu = false;           /**< GPU attn/rope at decode (off for d=128) */
+  bool decode_gpu = false;           /**< GPU attn + OHWI-rope at decode (off for
+                                          d=128); drives gpu_decode_attn /
+                                          gpu_ohwi_rope on the attention layer */
+  bool decode_rope_gpu = false;      /**< GPU decode-RoPE (a strict subset of
+                                          decode_gpu: gemma2 diverges, so attn=GPU
+                                          but rope=HOST); drives gpu_decode_rope */
   unsigned int head_dim = 0;         /**< attention head dim (0 = derive) */
 
   /**
@@ -233,7 +238,9 @@ struct ModelFeatures {
        << ", dual_head_dim=" << dual_head_dim << ", ple=" << ple
        << ", attn_softcap=" << attn_softcap << ", final_softcap=" << final_softcap
        << ", lmhead=" << nntrainer::toString(lmhead_kind)
-       << ", decode_gpu=" << decode_gpu << ", head_dim=" << head_dim << "}";
+       << ", decode_gpu=" << decode_gpu
+       << ", decode_rope_gpu=" << decode_rope_gpu << ", head_dim=" << head_dim
+       << "}";
     return os.str();
   }
 };

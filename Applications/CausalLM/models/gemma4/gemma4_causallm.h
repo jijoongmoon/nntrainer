@@ -112,6 +112,7 @@ public:
     f.final_softcap = true;
     f.lmhead_kind = nntrainer::LmHeadKind::UNTIED_QINT4;
     f.decode_gpu = true;
+    f.decode_rope_gpu = true; // gemma4: decode RoPE on GPU (token-identical)
     return f;
   }
 

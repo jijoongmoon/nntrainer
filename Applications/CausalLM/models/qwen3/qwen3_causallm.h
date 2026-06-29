@@ -45,6 +45,7 @@ public:
     f.norm_style = nntrainer::NormStyle::PRE;
     f.lmhead_kind = nntrainer::LmHeadKind::TIED;
     f.decode_gpu = false;
+    f.decode_rope_gpu = false; // qwen3: host decode (head_dim=128 diverges)
     f.head_dim = 128;
     return f;
   }
