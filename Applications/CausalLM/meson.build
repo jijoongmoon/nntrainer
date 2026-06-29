@@ -38,7 +38,7 @@ causallm_layer_dependencies += [
     causallm_shared_fully_connected_layer_dep,
     causallm_per_layer_slice_dep,
     causallm_scalar_multiply_dep,
-    causallm_logit_softcapping_dep,
+    # logit_softcapping promoted to core libnntrainer [T12]
 ]
 
 # Additive CUDA backend: the model TUs (transformer/causal_lm/gemma4) include

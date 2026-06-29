@@ -17,7 +17,7 @@ causallm_deberta_attention_src_abs = [meson.current_source_dir() / 'deberta_atte
 causallm_shared_fully_connected_src_abs = [meson.current_source_dir() / 'shared_fully_connected_layer.cpp']
 causallm_per_layer_slice_src_abs = [meson.current_source_dir() / 'per_layer_slice.cpp', meson.current_source_dir() / 'per_layer_slice_gpu.cpp']
 causallm_scalar_multiply_src_abs = [meson.current_source_dir() / 'scalar_multiply.cpp', meson.current_source_dir() / 'scalar_multiply_gpu.cpp']
-causallm_logit_softcapping_src_abs = [meson.current_source_dir() / 'logit_softcapping.cpp']
+# logit_softcapping promoted to core nntrainer/layers/llm/ [T12]
 
 causallm_rms_norm = shared_library(
     'rms_norm_layer', 
@@ -235,15 +235,4 @@ causallm_scalar_multiply_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_logit_softcapping = shared_library(
-    'logit_softcapping_layer',
-    causallm_logit_softcapping_src_abs,
-    include_directories: causallm_layer_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
-    install: true,
-    install_dir: application_install_dir
-)
-causallm_logit_softcapping_dep = declare_dependency(
-    link_with: causallm_logit_softcapping,
-    include_directories: causallm_layer_inc
-)
+# logit_softcapping promoted to core nntrainer/layers/llm/ [T12] — no app plugin

@@ -19,6 +19,7 @@
 #include <cuda_mem_allocator.h>
 #include <fc_layer_cl.h>
 #include <geglu_layer.h>
+#include <logit_softcapping.h>
 
 // runDecode (T9): the CUDA-graph decode/prefill state machine, relocated verbatim
 // from neuralnet.cpp. Needs the model walk + graph-node access + the CUDA graph
@@ -94,6 +95,10 @@ void CudaContext::add_default_object() {
   // geglu: the backend-neutral GeGLULayer dispatches via CudaComputeOps::geglu
   // (device-resident fp16 kernel under NNTR_CUDA_GEGLU, else host-on-UVM).
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  // logit_softcapping (promoted to core [T12]): host op on UVM-resident logits;
+  // the CUDA-only device-softcap path lives inside the layer (ENABLE_CUDA).
+  registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
+                  LogitSoftCappingLayer::type);
 }
 
 template <typename T>

@@ -22,7 +22,6 @@
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context.h>
 #endif
-#include <logit_softcapping.h>
 #include <model.h>
 #include <per_layer_slice.h>
 #include <reshaped_rms_norm.h>
@@ -865,7 +864,8 @@ void Gemma4Transformer::registerCustomLayers() {
   tryRegister("cpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   tryRegister("cpu", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
   tryRegister("cpu", nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
-  tryRegister("cpu", nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
+  // logit_softcapping promoted to core [T12] — self-registered on cpu/cuda
+  // contexts (app_context.cpp / cuda_context.cpp).
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Additive CUDA backend: register the gemma4-specific host layers on the cuda
@@ -873,7 +873,6 @@ void Gemma4Transformer::registerCustomLayers() {
   // CausalLM::registerCustomLayers (cuda), so it is not repeated here.
   tryRegister("cuda", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
   tryRegister("cuda", nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
-  tryRegister("cuda", nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
 #endif
   // S1.1 GPU-context registration of ReshapedRMSNormLayer is now centralized in
   // CausalLM::registerCustomLayers (shared by all models). The q/k/v_norm +
