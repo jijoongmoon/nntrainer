@@ -52,6 +52,31 @@ typedef cl_int(CL_API_CALL *PFN_clEnqueueRecordingQCOM)(
   const cl_workgroup_qcom *, cl_uint, const cl_event *, cl_event *);
 
 namespace {
+// [T8] NNTR_XE3_SYNC cell, now CAPS-DERIVED. The Xe3 (Panther Lake / NEO 26.22)
+// in-order queue does not preserve kernel->kernel coherence for the COARSE-grain
+// SVM handoffs the residency model relies on; Meteor's FINE-grain SVM is
+// auto-coherent. The distinguishing factor is a queryable attribute —
+// CL_DEVICE_SVM_FINE_GRAIN_BUFFER — so the per-dispatch clFinish no longer needs
+// the mandatory NNTR_XE3_SYNC flag: an Intel device WITHOUT fine-grain SVM gets
+// it, a fine-grain Intel (Meteor) and non-Intel devices do not. The env flag
+// still overrides. Scoped to vendor=Intel so a coarse-grain Adreno (which is
+// coherent without the hammer and would only lose throughput) is unaffected.
+// Resolved once per process.
+inline bool xe3_needs_sync() {
+  static const bool sync = []() {
+    const char *e = std::getenv("NNTR_XE3_SYNC");
+    if (e)
+      return std::atoi(e) != 0; // explicit override
+    const auto *di = ContextManager::Global().getDeviceInfo();
+    if (!di)
+      return false;
+    const bool fine_grain =
+      (di->getDeviceSVMCapabilities() & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
+    return di->getDeviceVendorId() == 0x8086u && !fine_grain; // Intel coarse-grain
+  }();
+  return sync;
+}
+
 // Per-kernel GPU profiling registry, populated by enqueueKernel when
 // NNTR_OPENCL_PROFILING is set. Each entry owns one cl_event reference that
 // dumpProfile() releases. Single-threaded dispatch path, so no lock needed.
@@ -696,7 +721,7 @@ bool CommandQueueManager::DispatchCommand(
   // the residency model relies on (Meteor's fine-grained SVM did). Serialize
   // each dispatch as a coherence point. Heavy hammer to confirm the race; the
   // production fix narrows this to the actual producer->consumer boundaries.
-  static const bool xe3_sync = std::getenv("NNTR_XE3_SYNC") != nullptr;
+  const bool xe3_sync = xe3_needs_sync();
   if (xe3_sync && active_recording_queue_ == nullptr)
     clFinish(command_queue_);
 
@@ -776,7 +801,7 @@ bool CommandQueueManager::DispatchCommand(
   // the residency model relies on (Meteor's fine-grained SVM did). Serialize
   // each dispatch as a coherence point. Heavy hammer to confirm the race; the
   // production fix narrows this to the actual producer->consumer boundaries.
-  static const bool xe3_sync = std::getenv("NNTR_XE3_SYNC") != nullptr;
+  const bool xe3_sync = xe3_needs_sync();
   if (xe3_sync && active_recording_queue_ == nullptr)
     clFinish(command_queue_);
 
