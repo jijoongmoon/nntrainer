@@ -411,6 +411,10 @@ void ComputeOps::geglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
                        unsigned int) {
   NI(geglu);
 }
+void ComputeOps::swiglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
+                        unsigned int) {
+  NI(swiglu);
+}
 
 #undef NI
 

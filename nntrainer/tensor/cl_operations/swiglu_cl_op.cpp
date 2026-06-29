@@ -1,169 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
+ * Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
  *
- * @file   swiglu_cl.cpp
- * @date   6th June 2024
- * @brief  Implementation of SwiGLU activation function
+ * @file   swiglu_cl_op.cpp
+ * @date   29 June 2026
+ * @brief  OpenCL SwiGLU whole-op kernel dispatch (silu(gate) * up).
  * @see    https://github.com/nntrainer/nntrainer
- * @author Niket Agarwal <niket.a@samsung.com>
- * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  *
+ * Relocated verbatim from swiglu_cl.cpp (SwiGLULayerCl::swigluProcess /
+ * swiglu_cl / swiglu_cl_fp16 / registerClKernels) into free functions so the
+ * SwiGLU layer can be a single backend-neutral Layer. [T7]
  */
 
-#include "swiglu_cl.h"
-#include "nntrainer_log.h"
+#include "swiglu_cl_op.h"
+
+#include <vector>
+
 #include <cl_kernels/swiglu.h>
+#include <engine.h> // Engine::Global().getRegisteredContext("gpu")
+#include <nntrainer_log.h>
+#include <tensor.h>
 #ifdef ENABLE_FP16
 #include <cl_kernels/swiglu_fp16.h>
 #endif
-#include <iostream>
 
 namespace nntrainer {
 
-static constexpr size_t OUT_IDX = 0;
-static constexpr size_t INPUT_IDX_1 = 0;
-static constexpr size_t INPUT_IDX_2 = 1;
+namespace {
 
-bool SwiGLULayerCl::registerClKernels(ClContext &cl_context) {
-  auto &layer_kernel_ptrs = getLayerKernelPtrs();
+enum Kernels { SWIGLU_CL, SWIGLU_CL_FP16 }; /** kernels enum */
 
-  // check if the kernels are already registered.
-  if (!layer_kernel_ptrs.empty()) {
-    ml_loge("kernels for swiglu_cl are already registered.");
-    return false;
-  }
-
-  do {
-    ClContext::SharedPtrClKernel kernel_swiglu_ptr = nullptr;
-
-    kernel_swiglu_ptr = cl_context.registerClKernel(swiglu_kernel, "swiglu_cl");
-
-    if (!kernel_swiglu_ptr) {
-      ml_loge("OpenCL Error: Fail to register swiglu_cl kernel");
-      break;
-    }
-    layer_kernel_ptrs.emplace_back(kernel_swiglu_ptr);
-
-#ifdef ENABLE_FP16
-    kernel_swiglu_ptr =
-      cl_context.registerClKernel(swiglu_fp16_kernel, "swiglu_cl_fp16");
-
-    if (!kernel_swiglu_ptr) {
-      ml_loge("OpenCL Error: Fail to register swiglu_cl_fp16 kernel");
-      break;
-    }
-    layer_kernel_ptrs.emplace_back(kernel_swiglu_ptr);
-#endif
-
-    return true;
-  } while (false);
-
-  // clear all registered kernels if any error occurs during registration
-  layer_kernel_ptrs.clear();
-
-  return false;
+std::vector<ClContext::SharedPtrClKernel> &getLayerKernelPtrs() {
+  /**< kernel list relevant with this layer */
+  static std::vector<ClContext::SharedPtrClKernel> layer_kernel_ptrs;
+  return layer_kernel_ptrs;
 }
 
-void SwiGLULayerCl::finalize(nntrainer::InitLayerContext &context) {
-  context.setOutputDimensions({context.getInputDimensions()[0]});
-}
+} // namespace
 
-void SwiGLULayerCl::forwarding(RunLayerContext &context, bool training) {
-  Tensor &in1 = context.getInput(INPUT_IDX_1);
-  Tensor &in2 = context.getInput(INPUT_IDX_2);
-  Tensor &out = context.getOutput(OUT_IDX);
-  swigluProcess(in1, in2, out, in1.batch() * in1.channel() * in1.height(), 0);
-}
-
-void SwiGLULayerCl::incremental_forwarding(RunLayerContext &context,
-                                           unsigned int from, unsigned int to,
-                                           bool training) {
-  Tensor &in1 = context.getInput(INPUT_IDX_1);
-  Tensor &in2 = context.getInput(INPUT_IDX_2);
-  Tensor &out = context.getOutput(OUT_IDX);
-
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-  }
-
-  // [decode active-row fix] mirrors GeGLULayerCl. At decode the gate/up FC and
-  // every cl_mem producer write the live token to ROW 0 of their full
-  // [INIT_SEQ,I] buffers (fc_layer_cl rebases from->0, to->1, offset-0 view), so
-  // the consumed row is row 0, not the absolute row (to-1). When every operand
-  // is a whole-buffer cl_mem binding (index 0, no pointer offset) on the FP16
-  // path, process EXACTLY the single live row at offset 0. The old all-cl_mem
-  // branch dispatched [0, to) rows: O(position) waste, and -- once the live
-  // sequence passes INIT_SEQ_LEN -- a one-row out-of-bounds GPU write into the
-  // INIT_SEQ_LEN-sized cl_mem sub-buffer (to=INIT_SEQ_LEN+1 indexes row
-  // INIT_SEQ_LEN), which faults the queue (CL_OUT_OF_RESOURCES). Mixed
-  // cl_mem/SVM or FP32 keep the [0, to) fallback (a whole-buffer cl_mem arg and
-  // a pointer-offset SVM arg can't share one dispatch); SVM-only offsets the
-  // pointers to row `from`.
-  const bool any_clmem = in1.isClMem() || in2.isClMem() || out.isClMem();
-  const bool all_clmem = in1.isClMem() && in2.isClMem() && out.isClMem();
-  const bool is_fp16 =
-    in1.getDataType() == ml::train::TensorDim::DataType::FP16;
-  if (from && all_clmem && is_fp16)
-    swigluProcess(in1, in2, out, 1, 0);
-  else if (any_clmem)
-    swigluProcess(in1, in2, out, to, 0);
-  else
-    swigluProcess(in1, in2, out, to - from, from);
-}
-
-void SwiGLULayerCl::swigluProcess(Tensor const &in1, Tensor const &in2,
-                                  Tensor &result, unsigned int active_rows,
-                                  unsigned int row_offset) {
-
-  unsigned int dim1, dim2;
-  dim1 = active_rows;
-  dim2 = in1.width();
-
-  // Element offset into the SVM pointers so the kernel processes rows
-  // [row_offset, row_offset+active_rows). row_offset is 0 for the cl_mem path.
-  const size_t elem_off = (size_t)row_offset * dim2;
-
-  // SVM-direct only when the tensors are GPU-resident (SVM pool). On the
-  // default host (cpu) pool getData() returns host pointers, so use the
-  // host-bounce path; passing host pointers as SVM kernel arguments produces
-  // garbage. When the graph opts into the SVM pool (NNTR_GPU_SVM_POOL), this
-  // becomes a zero-copy SVM-direct dispatch (residency).
-  // See tensor/cl_operations/GPU_GENERALIZATION_PLAN.md Step 3.
-  const auto md = in1.getMemoryData();
-  const bool use_svm = md && md->isSVM();
-
-  if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    float *data1 = in1.getData() + elem_off;
-    float *data2 = in2.getData() + elem_off;
-    float *rdata = result.getData() + elem_off;
-    swiglu_cl(data1, data2, rdata, dim1, dim2, use_svm);
-  } else if (in1.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    _FP16 *data1 = in1.getData<_FP16>() + elem_off;
-    _FP16 *data2 = in2.getData<_FP16>() + elem_off;
-    _FP16 *rdata = result.getData<_FP16>() + elem_off;
-    // Planner-decided STATIC cl_mem residency (mirrors GeGLULayerCl): under
-    // NNTR_GPU_CLMEM_POOL the gate/up FC outputs and the swiglu output are
-    // GPU_CLMEM, so getData() is NOT host-addressable -- bind the planner
-    // cl_mem sub-buffers directly. Without this the host-bounce path reads the
-    // cl_mem handle as a host pointer => the swiglu output is never written =>
-    // the FFN contributes nothing to the residual (measured: qwen3 MLP drops
-    // out, layer-0 output collapses to embed+attention).
-    void *in1_cl = (use_svm && in1.isClMem()) ? in1.getClMem() : nullptr;
-    void *in2_cl = (use_svm && in2.isClMem()) ? in2.getClMem() : nullptr;
-    void *out_cl = (use_svm && result.isClMem()) ? result.getClMem() : nullptr;
-    swiglu_cl_fp16(data1, data2, rdata, dim1, dim2, use_svm, out_cl,
-                   /*skip_out_map=*/false, in1_cl, in2_cl);
-#else
-    throw std::invalid_argument("Error: enable-fp16 is not enabled");
-#endif
-  }
-}
-
-void SwiGLULayerCl::swiglu_cl(float *matAdata, float *vecXdata, float *vecYdata,
-                              unsigned int dim1, unsigned int dim2, bool svm) {
+// Exposed (declared in swiglu_cl_op.h) for the OpenCL kernel micro-benchmarks;
+// the layer dispatch goes through swiglu_cl_op() below.
+void swiglu_cl(float *matAdata, float *vecXdata, float *vecYdata,
+               unsigned int dim1, unsigned int dim2, bool svm) {
   auto *global_cl_context =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   auto &clbuffInstance = ClBufferManager::Global();
@@ -250,12 +130,12 @@ void SwiGLULayerCl::swiglu_cl(float *matAdata, float *vecXdata, float *vecYdata,
   } while (false);
 }
 
+namespace {
 #ifdef ENABLE_FP16
-void SwiGLULayerCl::swiglu_cl_fp16(_FP16 *matAdata, _FP16 *vecXdata,
-                                   _FP16 *vecYdata, unsigned int dim1,
-                                   unsigned int dim2, bool svm,
-                                   void *resident_out, bool skip_out_map,
-                                   void *in1_clmem, void *in2_clmem) {
+void swiglu_cl_fp16(_FP16 *matAdata, _FP16 *vecXdata, _FP16 *vecYdata,
+                    unsigned int dim1, unsigned int dim2, bool svm,
+                    void *resident_out, bool skip_out_map, void *in1_clmem,
+                    void *in2_clmem) {
 
   bool result = false;
 
@@ -375,23 +255,93 @@ void SwiGLULayerCl::swiglu_cl_fp16(_FP16 *matAdata, _FP16 *vecXdata,
 }
 #endif
 
-void SwiGLULayerCl::calcDerivative(nntrainer::RunLayerContext &context) {
-  std::throw_with_nested(std::runtime_error("Training is not supported yet."));
-}
+} // namespace
 
-void SwiGLULayerCl::setProperty(const std::vector<std::string> &values) {
-  auto remain_props = loadProperties(values, swiglu_props);
-  if (!remain_props.empty()) {
-    std::string msg = "[SwigluLayerCl] Unknown Layer Properties count " +
-                      std::to_string(values.size());
-    throw exception::not_supported(msg);
+bool registerSwiGLUClKernels(ClContext &cl_context) {
+  auto &layer_kernel_ptrs = getLayerKernelPtrs();
+
+  // check if the kernels are already registered.
+  if (!layer_kernel_ptrs.empty()) {
+    ml_loge("kernels for swiglu_cl are already registered.");
+    return false;
   }
+
+  do {
+    ClContext::SharedPtrClKernel kernel_swiglu_ptr = nullptr;
+
+    kernel_swiglu_ptr = cl_context.registerClKernel(swiglu_kernel, "swiglu_cl");
+
+    if (!kernel_swiglu_ptr) {
+      ml_loge("OpenCL Error: Fail to register swiglu_cl kernel");
+      break;
+    }
+    layer_kernel_ptrs.emplace_back(kernel_swiglu_ptr);
+
+#ifdef ENABLE_FP16
+    kernel_swiglu_ptr =
+      cl_context.registerClKernel(swiglu_fp16_kernel, "swiglu_cl_fp16");
+
+    if (!kernel_swiglu_ptr) {
+      ml_loge("OpenCL Error: Fail to register swiglu_cl_fp16 kernel");
+      break;
+    }
+    layer_kernel_ptrs.emplace_back(kernel_swiglu_ptr);
+#endif
+
+    return true;
+  } while (false);
+
+  // clear all registered kernels if any error occurs during registration
+  layer_kernel_ptrs.clear();
+
+  return false;
 }
 
-std::vector<ClContext::SharedPtrClKernel> &SwiGLULayerCl::getLayerKernelPtrs() {
-  /**< kernel list relevant with this layer */
-  static std::vector<ClContext::SharedPtrClKernel> layer_kernel_ptrs;
-  return layer_kernel_ptrs;
+void swiglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &result,
+                  unsigned int active_rows, unsigned int row_offset) {
+
+  unsigned int dim1, dim2;
+  dim1 = active_rows;
+  dim2 = in1.width();
+
+  // Element offset into the SVM pointers so the kernel processes rows
+  // [row_offset, row_offset+active_rows). row_offset is 0 for the cl_mem path.
+  const size_t elem_off = (size_t)row_offset * dim2;
+
+  // SVM-direct only when the tensors are GPU-resident (SVM pool). On the
+  // default host (cpu) pool getData() returns host pointers, so use the
+  // host-bounce path; passing host pointers as SVM kernel arguments produces
+  // garbage. When the graph opts into the SVM pool (NNTR_GPU_SVM_POOL), this
+  // becomes a zero-copy SVM-direct dispatch (residency).
+  const auto md = in1.getMemoryData();
+  const bool use_svm = md && md->isSVM();
+
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    float *data1 = in1.getData() + elem_off;
+    float *data2 = in2.getData() + elem_off;
+    float *rdata = result.getData() + elem_off;
+    swiglu_cl(data1, data2, rdata, dim1, dim2, use_svm);
+  } else if (in1.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    _FP16 *data1 = in1.getData<_FP16>() + elem_off;
+    _FP16 *data2 = in2.getData<_FP16>() + elem_off;
+    _FP16 *rdata = result.getData<_FP16>() + elem_off;
+    // Planner-decided STATIC cl_mem residency (mirrors GeGLULayerCl): under
+    // NNTR_GPU_CLMEM_POOL the gate/up FC outputs and the swiglu output are
+    // GPU_CLMEM, so getData() is NOT host-addressable -- bind the planner
+    // cl_mem sub-buffers directly. Without this the host-bounce path reads the
+    // cl_mem handle as a host pointer => the swiglu output is never written =>
+    // the FFN contributes nothing to the residual (measured: qwen3 MLP drops
+    // out, layer-0 output collapses to embed+attention).
+    void *in1_cl = (use_svm && in1.isClMem()) ? in1.getClMem() : nullptr;
+    void *in2_cl = (use_svm && in2.isClMem()) ? in2.getClMem() : nullptr;
+    void *out_cl = (use_svm && result.isClMem()) ? result.getClMem() : nullptr;
+    swiglu_cl_fp16(data1, data2, rdata, dim1, dim2, use_svm, out_cl,
+                   /*skip_out_map=*/false, in1_cl, in2_cl);
+#else
+    throw std::invalid_argument("Error: enable-fp16 is not enabled");
+#endif
+  }
 }
 
 } // namespace nntrainer

@@ -364,6 +364,9 @@ public:
   // (correct for host and host-coherent SVM/UVM pointers). [T7]
   void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
              unsigned int active_rows, unsigned int row_offset) override;
+  // out = silu(gate) * up over the live rows (numerically stable SiLU). [T7]
+  void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+              unsigned int active_rows, unsigned int row_offset) override;
 };
 
 } // namespace nntrainer

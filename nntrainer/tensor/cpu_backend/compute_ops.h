@@ -393,6 +393,15 @@ public:
   virtual void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
                      unsigned int active_rows, unsigned int row_offset);
 
+  /**
+   * @brief SwiGLU activation over the first `active_rows` rows starting at
+   *        `row_offset`: out = silu(in1) * in2 = (in1 * sigmoid(in1)) * in2
+   *        ({gate, up} -> result). in1/in2/out share shape; width() is the
+   *        per-row element count.
+   */
+  virtual void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                      unsigned int active_rows, unsigned int row_offset);
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not

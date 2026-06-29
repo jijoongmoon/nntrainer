@@ -27,6 +27,7 @@
 #include <blas_kernels.h>
 #include <compute_ops.h>
 #include <geglu_cl_op.h>
+#include <swiglu_cl_op.h>
 #include <tensor.h>
 
 namespace nntrainer {
@@ -130,6 +131,12 @@ public:
   void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
              unsigned int active_rows, unsigned int row_offset) override {
     nntrainer::geglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+  // SwiGLU: out = silu(gate) * up. Forwards to the relocated OpenCL kernel
+  // dispatch (cl_mem/SVM residency, all-cl_mem decode live-row path). [T7]
+  void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+              unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::swiglu_cl_op(in1, in2, out, active_rows, row_offset);
   }
 };
 

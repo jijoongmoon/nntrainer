@@ -30,7 +30,8 @@
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
-#include <swiglu_cl.h>
+#include <swiglu_cl_op.h>
+#include <swiglu_layer.h>
 #include <transpose_cl.h>
 
 #include <filesystem>
@@ -171,8 +172,11 @@ void ClContext::add_default_object() {
                     ml::train::LayerType::LAYER_ADDITION);
   }
 
-  if (SwiGLULayerCl::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<SwiGLULayerCl>, SwiGLULayerCl::type,
+  if (registerSwiGLUClKernels(*this)) {
+    // createLayer("swiglu", {engine=gpu}) routes to the backend-neutral
+    // SwiGLULayer, which dispatches via ClComputeOps::swiglu. (CPU/CUDA use the
+    // app-side causallm::SwiGLU layer registered elsewhere.)
+    registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type,
                     ml::train::LayerType::LAYER_SWIGLU);
   }
 
