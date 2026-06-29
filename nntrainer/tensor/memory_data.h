@@ -34,11 +34,18 @@ using MemoryDataValidateCallback = std::function<void(unsigned int)>;
  *            access.
  *          - GPU_CLMEM: device cl_mem, NOT host-addressable; layers bind it as
  *            a cl_mem kernel argument (see Tensor::isClMem / getClMem).
+ *          - IMAGE2D: device image2d (texture-cached read_imageui); the Adreno
+ *            v8c weight / KV-attention plane. Not produced by deriveResidency
+ *            yet — reserved for the role-driven KV->image crossover (Mem M4/M6).
+ *          - RPCMEM: ION/rpcmem shared buffer for the QNN/NPU backend (DSP-
+ *            visible). Reserved for the NPU bring-up (Mem M6, §10 T13/T14).
  */
 enum class ResidencyClass : unsigned char {
   HOST = 0,      /**< host-only (CPU) memory */
   SVM = 1,       /**< shared virtual memory (device + host addressable) */
   GPU_CLMEM = 2, /**< device cl_mem (not host-addressable) */
+  IMAGE2D = 3,   /**< device image2d texture (Adreno v8c/KV); [Mem M6] reserved */
+  RPCMEM = 4,    /**< ION/rpcmem DSP-visible buffer (QNN/NPU); [Mem M6] reserved */
 };
 
 /**

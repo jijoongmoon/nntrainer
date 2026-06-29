@@ -21,6 +21,10 @@ namespace nntrainer {
 
 class MemoryPool;
 
+/** Residency classes (defined in tensor/memory_data.h); forward-declared so the
+ * allocator base does not pull in the tensor headers. [Mem M6] */
+enum class ResidencyClass : unsigned char;
+
 /**
  * @brief MemAllocator, Memory allocator class
  *
@@ -117,6 +121,19 @@ public:
    *        branch — the residency planner asks it instead of getName().
    */
   virtual bool supportsDevicePool() const { return false; }
+
+  /**
+   * @brief [Mem M6 register hook] Whether this allocator can back a tensor of
+   *        the given residency class. The residency planner (and a future backend
+   *        registering its memory plane) asks this instead of hard-coding the
+   *        allocator identity. Default maps the classes onto the existing
+   *        capability predicates (HOST always; SVM<-isSVM; GPU_CLMEM/IMAGE2D<-
+   *        supportsDevicePool; RPCMEM<-needsRegister); a backend overrides to
+   *        advertise IMAGE2D / RPCMEM explicitly. Additive — no decision site
+   *        consumes it yet, so byte-identical.
+   *        [docs/ARCHITECTURE_REFACTOR.md §10 T5 / Mem M6]
+   */
+  virtual bool supportsResidency(ResidencyClass cls) const;
   /** @} */
 
   /**

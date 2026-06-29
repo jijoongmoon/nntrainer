@@ -40,18 +40,35 @@ namespace {
  */
 ResidencyClass deriveResidency(ml::train::LayerComputeEngine engine,
                                bool all_consumers_gpu, bool is_fp16,
-                               bool gpu_svm_backend,
-                               [[maybe_unused]] TensorRole role) {
-  // M4 foundation: `role` is threaded to the decision point but not yet
-  // consumed (every tensor is GENERIC today), so this is byte-identical. The
-  // per-role residency crossovers (e.g. KV -> image2d on Adreno) will read it
-  // here once role-bearing layers tag their tensors. [Mem M4]
+                               bool gpu_svm_backend, TensorRole role) {
+  // Non-GPU backends (CPU build / CPU allocator) keep everything on the host.
   if (!gpu_svm_backend)
     return ResidencyClass::HOST;
-  if (engine == ml::train::LayerComputeEngine::GPU && all_consumers_gpu &&
-      is_fp16)
-    return ResidencyClass::GPU_CLMEM;
-  return ResidencyClass::SVM;
+
+  // The engine/consumer/dtype heuristic — the only path taken today, since every
+  // tensor is still GENERIC (no layer tags a role yet).
+  const ResidencyClass by_heuristic =
+    (engine == ml::train::LayerComputeEngine::GPU && all_consumers_gpu &&
+     is_fp16)
+      ? ResidencyClass::GPU_CLMEM
+      : ResidencyClass::SVM;
+
+  // [Mem M4-consume] `role` is now a live input to the decision (it was threaded
+  // but unused before). Every role currently falls through to by_heuristic, so
+  // this is byte-identical; the comments mark where the per-role residency
+  // crossovers slot in once role-bearing layers tag their tensors (a later,
+  // authoritative step — keeping T5 residency-unchanged):
+  switch (role) {
+  case TensorRole::KV:    // -> IMAGE2D on the Adreno image path (M6 reserved)
+  case TensorRole::QKV:   // q/k/v projection: device-resident for GPU attention
+  case TensorRole::ACT:   // layer I/O: the by_heuristic GPU_CLMEM/SVM split
+  case TensorRole::EMB:   // token embedding table
+  case TensorRole::NORM:  // norm gamma/output
+  case TensorRole::WEIGHT:// model weight
+  case TensorRole::GENERIC:
+  default:
+    return by_heuristic;
+  }
 }
 
 /** comma-separated any-substring match (bisect filters). */
@@ -78,6 +95,10 @@ const char *residencyName(ResidencyClass c) {
   switch (c) {
   case ResidencyClass::GPU_CLMEM:
     return "GPU_CLMEM";
+  case ResidencyClass::IMAGE2D:
+    return "IMAGE2D";
+  case ResidencyClass::RPCMEM:
+    return "RPCMEM";
   case ResidencyClass::SVM:
     return "SVM";
   default:
