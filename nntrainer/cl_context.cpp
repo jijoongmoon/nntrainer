@@ -14,7 +14,7 @@
  * creates the OpenCL command queue and context.
  */
 
-#include <addition_layer_cl.h>
+#include <addition_layer.h>
 #include <attention_kernels.h>
 #include <blas_kernel_interface.h>
 #include <cl_context.h>
@@ -166,11 +166,12 @@ void ClContext::add_default_object() {
                     ml::train::LayerType::LAYER_FC);
   }
 
-  if (AdditionLayerCL::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<AdditionLayerCL>,
-                    AdditionLayerCL::type,
-                    ml::train::LayerType::LAYER_ADDITION);
-  }
+  // The core AdditionLayer is now backend-neutral (its per-input copy/add
+  // dispatches via ComputeOps::residual_op — the GPU residency body lives in
+  // ClComputeOps::residual_op). createLayer("addition", {engine=gpu}) routes
+  // here; the former AdditionLayerCL fork is deleted. [T7]
+  registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
+                  ml::train::LayerType::LAYER_ADDITION);
 
   if (registerSwiGLUClKernels(*this)) {
     // createLayer("swiglu", {engine=gpu}) routes to the backend-neutral

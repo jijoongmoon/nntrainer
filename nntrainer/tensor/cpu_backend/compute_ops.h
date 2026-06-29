@@ -402,6 +402,16 @@ public:
   virtual void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
                       unsigned int active_rows, unsigned int row_offset);
 
+  /**
+   * @brief One residual-add operand: hidden = input (accumulate=false, the
+   *        first operand) or hidden += input (accumulate=true). The neutral
+   *        AdditionLayer calls this per input so the GPU backend can keep the
+   *        residual stream device-resident (cl_mem/SVM) while CPU/CUDA run the
+   *        host Tensor copy/add on the managed buffer.
+   */
+  virtual void residual_op(Tensor &hidden, const Tensor &input,
+                           bool accumulate);
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not

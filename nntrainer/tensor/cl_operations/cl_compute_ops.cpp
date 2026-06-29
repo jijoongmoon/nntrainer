@@ -24,6 +24,11 @@
  *   -> nntrainer::gemm_q4_0_async_cl(...) -> OpenCL kernel queue.
  */
 
+#include <cstdlib>
+#include <cstring>
+
+#include <attention_kernels.h>     // gpu_copy_f16_cl
+#include <blas_kernel_interface.h> // clmem_residual_op_cl, add_i_cl
 #include <blas_kernels.h>
 #include <compute_ops.h>
 #include <geglu_cl_op.h>
@@ -137,6 +142,56 @@ public:
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override {
     nntrainer::swiglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+
+  // Residual-add operand on the GPU residency path (the former AdditionLayerCl
+  // per-input body, verbatim): an FP32 host fast-path (Tensor::copy/add_i_cl
+  // misbehave for FP32 here), else the FP16 cl_mem/SVM-resident copy/add. [T7]
+  void residual_op(Tensor &hidden, const Tensor &input,
+                   bool accumulate) override {
+    const bool fp32_fast =
+      hidden.getDataType() == ml::train::TensorDim::DataType::FP32;
+    if (fp32_fast && hidden.size() == input.size() &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      const size_t n = hidden.size();
+      if (!accumulate) {
+        std::memcpy(hidden.getData<uint8_t>(), input.getData<uint8_t>(),
+                    n * sizeof(float));
+      } else {
+        float *out = hidden.getData<float>();
+        const float *in = input.getData<float>();
+        for (size_t k = 0; k < n; ++k)
+          out[k] += in[k];
+      }
+    } else if (!accumulate) {
+      // First residual operand: copy input -> hidden.
+#ifdef ENABLE_FP16
+      if (nntrainer::clmem_residual_op_cl(hidden, input, /*accumulate=*/false))
+        return;
+      const bool svm16 =
+        hidden.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        hidden.getMemoryData() && hidden.getMemoryData()->isSVM() &&
+        input.getMemoryData() && input.getMemoryData()->isSVM() &&
+        hidden.size() == input.size();
+      static const bool add_drain = std::getenv("NNTR_ADD_DRAIN") != nullptr;
+      if (svm16 &&
+          nntrainer::gpu_copy_f16_cl(
+            reinterpret_cast<const uint16_t *>(input.getData<_FP16>()),
+            reinterpret_cast<uint16_t *>(hidden.getData<_FP16>()),
+            (unsigned int)hidden.size(), /*svm=*/true,
+            /*in_clmem=*/nullptr, /*out_clmem=*/nullptr, /*drain=*/add_drain)) {
+        // GPU copy done.
+      } else
+#endif
+        hidden.copy(input);
+    } else {
+#ifdef ENABLE_FP16
+      if (nntrainer::clmem_residual_op_cl(hidden, input, /*accumulate=*/true))
+        return;
+#endif
+      nntrainer::add_i_cl(hidden, input);
+    }
   }
 };
 

@@ -367,6 +367,9 @@ public:
   // out = silu(gate) * up over the live rows (numerically stable SiLU). [T7]
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override;
+  // hidden = input (copy) / hidden += input (add) via host Tensor ops. [T7]
+  void residual_op(Tensor &hidden, const Tensor &input,
+                   bool accumulate) override;
 };
 
 } // namespace nntrainer

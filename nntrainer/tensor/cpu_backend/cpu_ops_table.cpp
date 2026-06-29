@@ -98,4 +98,14 @@ void CpuComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
   }
 }
 
+// hidden = input (copy) or hidden += input (add) on the host buffer. Mirrors the
+// core AdditionLayer's per-input copy()/add_i() (correct for host and UVM).
+void CpuComputeOps::residual_op(Tensor &hidden, const Tensor &input,
+                                bool accumulate) {
+  if (accumulate)
+    hidden.add_i(input);
+  else
+    hidden.copy(input);
+}
+
 } // namespace nntrainer

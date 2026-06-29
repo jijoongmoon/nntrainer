@@ -17,6 +17,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <tensor.h>
 #include <util_func.h>
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
@@ -46,11 +47,9 @@ void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
   /** @todo check possibility for in-place of addition layer */
   for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
     const Tensor &input_ = context.getInput(idx);
-    if (!idx) {
-      hidden_.copy(input_);
-    } else {
-      hidden_.add_i(input_);
-    }
+    // idx 0 copies into hidden, the rest accumulate. The active backend's
+    // ComputeOps decides the residency path (GPU cl_mem/SVM vs host). [T7]
+    hidden_.getOps()->residual_op(hidden_, input_, /*accumulate=*/idx != 0);
   }
 }
 
@@ -120,11 +119,11 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
 
       Tensor input_step = input_.getSharedDataTensor(
         input_step_dim, b * input_dim.getFeatureLen(), true);
-      if (!idx) {
-        hidden_step.copy(input_step);
-      } else {
-        hidden_step.add_i(input_step);
-      }
+      // idx 0 copies into hidden_step, the rest accumulate. ComputeOps picks the
+      // residency path (the former AdditionLayerCl GPU body lives in
+      // ClComputeOps::residual_op; CPU/CUDA run the host copy/add). [T7]
+      hidden_step.getOps()->residual_op(hidden_step, input_step,
+                                        /*accumulate=*/idx != 0);
     }
   }
 
