@@ -25,7 +25,6 @@
 #include <model.h>
 #include <per_layer_slice.h>
 #include <reshaped_rms_norm.h>
-#include <scalar_multiply.h>
 
 namespace causallm {
 
@@ -863,16 +862,14 @@ void Gemma4Transformer::registerCustomLayers() {
 
   tryRegister("cpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   tryRegister("cpu", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
-  tryRegister("cpu", nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
-  // logit_softcapping promoted to core [T12] — self-registered on cpu/cuda
-  // contexts (app_context.cpp / cuda_context.cpp).
+  // scalar_multiply + logit_softcapping promoted to core [T12] — self-registered
+  // on cpu/gpu/cuda contexts (app_context.cpp / cl_context.cpp / cuda_context.cpp).
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Additive CUDA backend: register the gemma4-specific host layers on the cuda
   // context (host-on-UVM). reshaped_rms_norm is centralized in
   // CausalLM::registerCustomLayers (cuda), so it is not repeated here.
   tryRegister("cuda", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
-  tryRegister("cuda", nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
 #endif
   // S1.1 GPU-context registration of ReshapedRMSNormLayer is now centralized in
   // CausalLM::registerCustomLayers (shared by all models). The q/k/v_norm +

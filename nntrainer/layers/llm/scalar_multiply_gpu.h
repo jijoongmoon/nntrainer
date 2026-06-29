@@ -29,7 +29,7 @@
 
 #include <scalar_multiply.h> // reuse props::ScalarMultiplier / props::UseWeight
 
-namespace causallm {
+namespace nntrainer {
 
 WIN_EXPORT class ScalarMultiplyLayerGPU final : public nntrainer::Layer {
 public:
@@ -85,6 +85,6 @@ private:
     scalar_props;
 };
 
-} // namespace causallm
+} // namespace nntrainer
 
 #endif /* __SCALAR_MULTIPLY_GPU_LAYER_H__ */

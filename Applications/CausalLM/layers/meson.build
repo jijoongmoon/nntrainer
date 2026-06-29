@@ -16,7 +16,7 @@ causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_
 causallm_deberta_attention_src_abs = [meson.current_source_dir() / 'deberta_attention_layer.cpp']
 causallm_shared_fully_connected_src_abs = [meson.current_source_dir() / 'shared_fully_connected_layer.cpp']
 causallm_per_layer_slice_src_abs = [meson.current_source_dir() / 'per_layer_slice.cpp', meson.current_source_dir() / 'per_layer_slice_gpu.cpp']
-causallm_scalar_multiply_src_abs = [meson.current_source_dir() / 'scalar_multiply.cpp', meson.current_source_dir() / 'scalar_multiply_gpu.cpp']
+# scalar_multiply (+gpu) promoted to core nntrainer/layers/llm/ [T12]
 # logit_softcapping promoted to core nntrainer/layers/llm/ [T12]
 
 causallm_rms_norm = shared_library(
@@ -222,17 +222,6 @@ causallm_per_layer_slice_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_scalar_multiply = shared_library(
-    'scalar_multiply_layer',
-    causallm_scalar_multiply_src_abs,
-    include_directories: causallm_layer_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
-    install: true,
-    install_dir: application_install_dir
-)
-causallm_scalar_multiply_dep = declare_dependency(
-    link_with: causallm_scalar_multiply,
-    include_directories: causallm_layer_inc
-)
+# scalar_multiply (+gpu) promoted to core nntrainer/layers/llm/ [T12] — no app plugin
 
 # logit_softcapping promoted to core nntrainer/layers/llm/ [T12] — no app plugin

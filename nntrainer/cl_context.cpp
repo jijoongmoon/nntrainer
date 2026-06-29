@@ -27,6 +27,7 @@
 #include <geglu_cl_op.h>
 #include <geglu_layer.h>
 #include <mutex>
+#include <scalar_multiply_gpu.h> // LLM layer promoted to core [T12]
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
@@ -195,6 +196,10 @@ void ClContext::add_default_object() {
     // (int_key auto-assigned). createLayer("geglu", {engine=gpu}) routes to the
     // backend-neutral GeGLULayer, which dispatches via ClComputeOps::geglu.
     registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+    // scalar_multiply GPU variant (promoted [T12]): the OpenCL-resident class for
+    // the "scalar_multiply" type on the gpu context (CPU class stays on cpu/cuda).
+    registerFactory(nntrainer::createLayer<ScalarMultiplyLayerGPU>,
+                    ScalarMultiplyLayerGPU::type);
   }
 
   if (ReshapeLayerCl::registerClKernels(*this)) {

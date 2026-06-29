@@ -37,7 +37,8 @@
 #include <add_layer.h>
 #include <addition_layer.h>
 #include <attention_layer.h>
-#include <logit_softcapping.h> // LLM layer promoted to core [T12]
+#include <logit_softcapping.h> // LLM layers promoted to core [T12]
+#include <scalar_multiply.h>
 #include <bn_layer.h>
 #include <cast_layer.h>
 #include <centroid_knn.h>
@@ -450,6 +451,8 @@ void AppContext::add_default_object() {
   // the GPU geglu/swiglu registered on the CL/CUDA contexts.
   registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
                   LogitSoftCappingLayer::type);
+  registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
+                  ScalarMultiplyLayer::type);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);

@@ -13,7 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace causallm {
+namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
@@ -147,4 +147,4 @@ void ScalarMultiplyLayerGPU::incremental_forwarding(
 #endif
 }
 
-} // namespace causallm
+} // namespace nntrainer

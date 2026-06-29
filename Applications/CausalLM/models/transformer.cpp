@@ -21,7 +21,6 @@
 #include <cuda_context.h>
 #include <cuda_rmsnorm_layer.h>
 #include <per_layer_slice.h>
-#include <scalar_multiply.h>
 #endif
 
 #include <llm_util.hpp>
@@ -33,7 +32,6 @@
 #include <rms_norm.h>
 #include <per_layer_slice_gpu.h>
 #include <rms_norm_gpu.h>
-#include <scalar_multiply_gpu.h>
 #include <swiglu.h>
 #include <tie_word_embedding.h>
 
@@ -560,11 +558,10 @@ void Transformer::registerCustomLayers() {
   try {
     ct_engine.registerLayerFactory(
       "gpu", nntrainer::createLayer<causallm::RMSNormLayerGPU>);
-    // Gemma4 GPU-resident scalar_multiply / per_layer_slice: same type strings
-    // as the CPU classes, registered here so engine=gpu routes to the GPU
-    // kernels (no host round-trip that would break residency).
-    ct_engine.registerLayerFactory(
-      "gpu", nntrainer::createLayer<causallm::ScalarMultiplyLayerGPU>);
+    // Gemma4 GPU-resident per_layer_slice: same type string as the CPU class,
+    // registered here so engine=gpu routes to the GPU kernel (no host round-trip
+    // that would break residency). scalar_multiply's GPU variant is now
+    // self-registered in core cl_context.cpp [T12].
     ct_engine.registerLayerFactory(
       "gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
     // TieWordEmbedding on the gpu context with its existing class — the manual
@@ -603,11 +600,9 @@ void Transformer::registerCustomLayers() {
       "cuda", nntrainer::createLayer<causallm::TieWordEmbedding>);
     ct_engine.registerLayerFactory(
       "cuda", nntrainer::createLayer<causallm::EmbeddingLayer>);
-    // gemma4 PLE + q-scale: host impls (the GPU variants are OpenCL-only and
-    // would mis-run on UVM). Without these on the cuda context the types fall
-    // back to the wrong factory.
-    ct_engine.registerLayerFactory(
-      "cuda", nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
+    // gemma4 PLE host impl (the GPU variant is OpenCL-only and would mis-run on
+    // UVM). Without it on the cuda context the type falls back to the wrong
+    // factory. scalar_multiply is now self-registered in core cuda_context.cpp [T12].
     ct_engine.registerLayerFactory(
       "cuda", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
   } catch (std::invalid_argument &e) {

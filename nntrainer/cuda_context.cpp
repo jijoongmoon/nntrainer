@@ -20,6 +20,7 @@
 #include <fc_layer_cl.h>
 #include <geglu_layer.h>
 #include <logit_softcapping.h>
+#include <scalar_multiply.h>
 
 // runDecode (T9): the CUDA-graph decode/prefill state machine, relocated verbatim
 // from neuralnet.cpp. Needs the model walk + graph-node access + the CUDA graph
@@ -99,6 +100,10 @@ void CudaContext::add_default_object() {
   // the CUDA-only device-softcap path lives inside the layer (ENABLE_CUDA).
   registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
                   LogitSoftCappingLayer::type);
+  // scalar_multiply (promoted [T12]): host op on UVM (the CPU class on cuda, like
+  // the gemma4 tryRegister it replaces; the _gpu variant is OpenCL-only).
+  registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
+                  ScalarMultiplyLayer::type);
 }
 
 template <typename T>

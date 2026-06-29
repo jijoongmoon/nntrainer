@@ -3,11 +3,21 @@
 # shared_library plugins. Add sources incrementally, one per promotion.
 llm_layer_sources = [
   'logit_softcapping.cpp',
+  'scalar_multiply.cpp',
 ]
 
 llm_layer_headers = [
   'logit_softcapping.h',
+  'scalar_multiply.h',
+  'scalar_multiply_gpu.h',
 ]
+
+# scalar_multiply's GPU variant uses OpenCL directly (cl_mem / ClContext), so it
+# compiles only when the OpenCL backend is on — mirroring the cl_context.cpp
+# registration that consumes it (a CPU-only libnntrainer must not pull it in).
+if get_option('enable-opencl')
+  llm_layer_sources += 'scalar_multiply_gpu.cpp'
+endif
 
 foreach s : llm_layer_sources
   nntrainer_sources += meson.current_source_dir() / s
