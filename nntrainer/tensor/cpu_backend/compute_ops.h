@@ -412,6 +412,22 @@ public:
   virtual void residual_op(Tensor &hidden, const Tensor &input,
                            bool accumulate);
 
+  /**
+   * @brief Fully-connected GEMM: output = input * weight. The neutral
+   *        FullyConnectedLayer owns the weight/bias binding and calls this for
+   *        the matmul, so the quantized accelerator path (OpenCL v8c w4a8 /
+   *        CUDA cuda_fc_qint4) lives in the op table instead of a forked Layer.
+   *        input/weight may carry residency state the impl reads, hence non-const.
+   */
+  virtual void fc(Tensor &input, Tensor &weight, Tensor &output);
+
+  /**
+   * @brief Optional one-time weight transform at load (e.g. the OpenCL v8c
+   *        repack). Default no-op; backends that benefit override it. Called
+   *        from the layer's read() after the weights are loaded.
+   */
+  virtual void fc_prebuild_weight(Tensor &weight) { (void)weight; }
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not

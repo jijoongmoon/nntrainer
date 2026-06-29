@@ -160,11 +160,11 @@ void ClContext::initialize() noexcept {
 };
 
 void ClContext::add_default_object() {
-  if (FullyConnectedLayerCl::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
-                    FullyConnectedLayerCl::type,
-                    ml::train::LayerType::LAYER_FC);
-  }
+  // The FC layer is now backend-neutral (dispatches its GEMM via
+  // ClComputeOps::fc); no per-layer kernel registration. The same class is
+  // registered on the cuda context. [T7]
+  registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
+                  FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
 
   // The core AdditionLayer is now backend-neutral (its per-input copy/add
   // dispatches via ComputeOps::residual_op — the GPU residency body lives in

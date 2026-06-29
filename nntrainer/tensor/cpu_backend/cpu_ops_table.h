@@ -370,6 +370,8 @@ public:
   // hidden = input (copy) / hidden += input (add) via host Tensor ops. [T7]
   void residual_op(Tensor &hidden, const Tensor &input,
                    bool accumulate) override;
+  // output = input * weight via host Tensor::dot (the CPU FC matmul). [T7]
+  void fc(Tensor &input, Tensor &weight, Tensor &output) override;
 };
 
 } // namespace nntrainer

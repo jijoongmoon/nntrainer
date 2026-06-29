@@ -108,4 +108,10 @@ void CpuComputeOps::residual_op(Tensor &hidden, const Tensor &input,
     hidden.copy(input);
 }
 
+// output = input * weight. Host Tensor::dot (CPU/UVM FC matmul). The CL/CUDA
+// quantized GEMM paths override this in their ComputeOps subclasses.
+void CpuComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
+  input.dot(weight, output, false, false);
+}
+
 } // namespace nntrainer

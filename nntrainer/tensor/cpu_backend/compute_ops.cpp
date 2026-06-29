@@ -418,6 +418,7 @@ void ComputeOps::swiglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
 void ComputeOps::residual_op(Tensor &, const Tensor &, bool) {
   NI(residual_op);
 }
+void ComputeOps::fc(Tensor &, Tensor &, Tensor &) { NI(fc); }
 
 #undef NI
 

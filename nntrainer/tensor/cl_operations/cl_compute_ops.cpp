@@ -193,6 +193,47 @@ public:
       nntrainer::add_i_cl(hidden, input);
     }
   }
+
+  // FC GEMM: output = input * weight. The former FullyConnectedLayerCl
+  // forwarding body verbatim — the v8c (paper 8/4/4 QINT4 w4a8) GPU path via
+  // dotCl_v8c, with a host/SVM fallback for non-v8c weights bridged across the
+  // GPU_CLMEM residency boundary (clmem_lower/raise). [T7]
+  void fc(Tensor &input, Tensor &weight, Tensor &output) override {
+    // Pre-zero the output plane: redundant on the v8c path (it overwrites the
+    // full MxN region) but kept for the fallbacks. Default OFF (a race-pattern
+    // anchor only); NNTR_FC_OUTZERO=1 restores it.
+    static const bool fc_out_zero = []() {
+      const char *e = std::getenv("NNTR_FC_OUTZERO");
+      return e && e[0] == '1';
+    }();
+    if (fc_out_zero)
+      output.setZero();
+    if (!nntrainer::dotCl_v8c(input, weight, output)) {
+      if (!fc_out_zero)
+        output.setZero();
+      // Static GPU_CLMEM residency: the fallbacks read input / write output
+      // through host/SVM pointers only, so bridge a resident input down first
+      // and raise a resident output afterwards (a v8c rejection must not leave
+      // a GPU_CLMEM tensor's planes inconsistent).
+      nntrainer::clmem_lower_cl(input, 0);
+      auto wt = weight.getDataType();
+      if (wt == ml::train::TensorDim::DataType::QINT4 ||
+          wt == ml::train::TensorDim::DataType::Q4_0 ||
+          wt == ml::train::TensorDim::DataType::Q4_K ||
+          wt == ml::train::TensorDim::DataType::Q6_K) {
+        input.dot(weight, output, false, false);
+      } else {
+        nntrainer::dotCl(input, weight, output);
+      }
+      nntrainer::clmem_raise_cl(output, 0);
+    }
+  }
+
+  // Eager v8c GPU weight build at load (so the first prefill does not pay the
+  // one-time transform). [T7]
+  void fc_prebuild_weight(Tensor &weight) override {
+    nntrainer::dotCl_v8c_prebuild_weight(weight);
+  }
 };
 
 ComputeOps *get_cl_ops() {

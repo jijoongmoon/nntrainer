@@ -16,8 +16,8 @@
 
 #include <addition_layer.h>
 #include <compute_ops.h>
-#include <cuda_fc_layer.h>
 #include <cuda_mem_allocator.h>
+#include <fc_layer_cl.h>
 #include <geglu_layer.h>
 
 namespace nntrainer {
@@ -72,11 +72,11 @@ void CudaContext::initialize() noexcept {
 }
 
 void CudaContext::add_default_object() {
-  // P2: register the CUDA FC layer. More CUDA layers (rmsnorm, swiglu/geglu,
-  // attention, ...) are added here as they land, mirroring
-  // ClContext::add_default_object().
-  registerFactory(nntrainer::createLayer<CudaFcLayer>, CudaFcLayer::type,
-                  ml::train::LayerType::LAYER_FC);
+  // FC: the backend-neutral FullyConnectedLayerCl dispatches its GEMM via
+  // CudaComputeOps::fc (cuda_fc_qint4 / cuBLAS / host dot). Same class as the
+  // gpu context. [T7]
+  registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
+                  FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
   // addition: the core CPU AdditionLayer is pure host Tensor ops -> correct on
   // the host-coherent UVM tensors (do NOT use the OpenCL AdditionLayerCL).
   registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,

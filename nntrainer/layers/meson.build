@@ -64,7 +64,8 @@ layer_sources = [
   'upsample2d_layer.cpp',
   'channel_shuffle.cpp',
   'geglu_layer.cpp',
-  'swiglu_layer.cpp'
+  'swiglu_layer.cpp',
+  'fc_layer_cl.cpp'
 ]
 
 layer_headers = [
