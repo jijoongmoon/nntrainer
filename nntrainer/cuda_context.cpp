@@ -21,6 +21,7 @@
 #include <geglu_layer.h>
 #include <logit_softcapping.h>
 #include <scalar_multiply.h>
+#include <tie_word_embedding.h>
 
 // runDecode (T9): the CUDA-graph decode/prefill state machine, relocated verbatim
 // from neuralnet.cpp. Needs the model walk + graph-node access + the CUDA graph
@@ -104,6 +105,12 @@ void CudaContext::add_default_object() {
   // the gemma4 tryRegister it replaces; the _gpu variant is OpenCL-only).
   registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
                   ScalarMultiplyLayer::type);
+#if defined(ENABLE_OPENCL)
+  // tie_word_embedding (promoted [T12]): host lm_head on UVM (the GPU GEMV is the
+  // OpenCL path). Only compiled with the OpenCL backend, which build_cuda enables.
+  registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                  TieWordEmbedding::type);
+#endif
 }
 
 template <typename T>

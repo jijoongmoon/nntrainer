@@ -10,6 +10,7 @@ llm_layer_headers = [
   'logit_softcapping.h',
   'scalar_multiply.h',
   'scalar_multiply_gpu.h',
+  'tie_word_embedding.h',
 ]
 
 # scalar_multiply's GPU variant uses OpenCL directly (cl_mem / ClContext), so it
@@ -17,6 +18,9 @@ llm_layer_headers = [
 # registration that consumes it (a CPU-only libnntrainer must not pull it in).
 if get_option('enable-opencl')
   llm_layer_sources += 'scalar_multiply_gpu.cpp'
+  # tie_word_embedding calls the OpenCL lm_head GEMV (lmhead_gemv_*_cl,
+  # clmem_raise/lower) unguarded, so it too is OpenCL-only.
+  llm_layer_sources += 'tie_word_embedding.cpp'
 endif
 
 foreach s : llm_layer_sources

@@ -27,7 +27,8 @@
 #include <geglu_cl_op.h>
 #include <geglu_layer.h>
 #include <mutex>
-#include <scalar_multiply_gpu.h> // LLM layer promoted to core [T12]
+#include <scalar_multiply_gpu.h> // LLM layers promoted to core [T12]
+#include <tie_word_embedding.h>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
@@ -200,6 +201,10 @@ void ClContext::add_default_object() {
     // the "scalar_multiply" type on the gpu context (CPU class stays on cpu/cuda).
     registerFactory(nntrainer::createLayer<ScalarMultiplyLayerGPU>,
                     ScalarMultiplyLayerGPU::type);
+    // tie_word_embedding (promoted [T12]): the lm_head (GPU Q6_K/Q4_0 GEMV on the
+    // gpu context, host loop otherwise). Same class on cpu/gpu/cuda.
+    registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                    TieWordEmbedding::type);
   }
 
   if (ReshapeLayerCl::registerClKernels(*this)) {

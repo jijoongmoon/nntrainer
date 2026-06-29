@@ -4,7 +4,7 @@ causallm_layer_inc = [include_directories('.')]
 causallm_rms_norm_src_abs = [meson.current_source_dir() / 'rms_norm.cpp']
 causallm_rms_norm_gpu_src_abs = [meson.current_source_dir() / 'rms_norm_gpu.cpp']
 causallm_swiglu_src_abs = [meson.current_source_dir() / 'swiglu.cpp']
-causallm_tie_word_embedding_src_abs = [meson.current_source_dir() / 'tie_word_embedding.cpp']
+# tie_word_embedding promoted to core nntrainer/layers/llm/ [T12]
 causallm_lmhead_src_abs = [meson.current_source_dir() / 'lm_head.cpp']
 causallm_mha_core_abs = [meson.current_source_dir()/ 'mha_core.cpp']
 causallm_embedding_src_abs = [meson.current_source_dir() / 'embedding_layer.cpp']
@@ -60,18 +60,7 @@ causallm_swiglu_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-causallm_tie_word_embedding = shared_library(
-    'tie_word_embedding_layer',
-    causallm_tie_word_embedding_src_abs,
-    include_directories: causallm_layer_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
-    install: true,
-    install_dir: application_install_dir
-)
-causallm_tie_word_embedding_dep = declare_dependency(
-    link_with: causallm_tie_word_embedding,
-    include_directories: causallm_layer_inc
-)
+# tie_word_embedding promoted to core nntrainer/layers/llm/ [T12] — no app plugin
 
 causallm_lm_head = shared_library(
     'lm_head',

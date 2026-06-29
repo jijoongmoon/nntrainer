@@ -33,7 +33,6 @@
 #include <per_layer_slice_gpu.h>
 #include <rms_norm_gpu.h>
 #include <swiglu.h>
-#include <tie_word_embedding.h>
 
 namespace causallm {
 
@@ -541,8 +540,7 @@ void Transformer::registerCustomLayers() {
       "cpu", nntrainer::createLayer<causallm::RMSNormLayer>);
     ct_engine.registerLayerFactory(
       "cpu", nntrainer::createLayer<causallm::MHACoreLayer>);
-    ct_engine.registerLayerFactory(
-      "cpu", nntrainer::createLayer<causallm::TieWordEmbedding>);
+    // tie_word_embedding promoted to core [T12] — self-registered on cpu/gpu/cuda.
     ct_engine.registerLayerFactory(
       "cpu", nntrainer::createLayer<causallm::EmbeddingLayer>);
   } catch (std::invalid_argument &e) {
@@ -564,11 +562,7 @@ void Transformer::registerCustomLayers() {
     // self-registered in core cl_context.cpp [T12].
     ct_engine.registerLayerFactory(
       "gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
-    // TieWordEmbedding on the gpu context with its existing class — the manual
-    // Q6_K + Q4_0 lmhead paths use raw-pointer compute (no Tensor::dot), so it
-    // survives gpu-context tensor allocation (Qwen3 et al. use Q6_K).
-    ct_engine.registerLayerFactory(
-      "gpu", nntrainer::createLayer<causallm::TieWordEmbedding>);
+    // tie_word_embedding promoted to core cl_context.cpp [T12].
     // MHACoreLayer on the gpu context enables engine=gpu attention. The same
     // class runs on both backends: forwarding() dispatches the GPU kernels when
     // NNTR_MHA_GPU is set and Q/K/V/cache are SVM-resident, else the CPU NEON
@@ -596,8 +590,7 @@ void Transformer::registerCustomLayers() {
       "cuda", nntrainer::createLayer<nntrainer::CudaRMSNormLayer>);
     ct_engine.registerLayerFactory(
       "cuda", nntrainer::createLayer<causallm::MHACoreLayer>);
-    ct_engine.registerLayerFactory(
-      "cuda", nntrainer::createLayer<causallm::TieWordEmbedding>);
+    // tie_word_embedding promoted to core cuda_context.cpp [T12].
     ct_engine.registerLayerFactory(
       "cuda", nntrainer::createLayer<causallm::EmbeddingLayer>);
     // gemma4 PLE host impl (the GPU variant is OpenCL-only and would mis-run on

@@ -39,6 +39,7 @@
 #include <attention_layer.h>
 #include <logit_softcapping.h> // LLM layers promoted to core [T12]
 #include <scalar_multiply.h>
+#include <tie_word_embedding.h>
 #include <bn_layer.h>
 #include <cast_layer.h>
 #include <centroid_knn.h>
@@ -453,6 +454,12 @@ void AppContext::add_default_object() {
                   LogitSoftCappingLayer::type);
   registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
                   ScalarMultiplyLayer::type);
+#if defined(ENABLE_OPENCL)
+  // tie_word_embedding hard-depends on the OpenCL lm_head GEMV (blas_kernels), so
+  // it is only compiled/registered when the OpenCL backend is on.
+  registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                  TieWordEmbedding::type);
+#endif
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);
