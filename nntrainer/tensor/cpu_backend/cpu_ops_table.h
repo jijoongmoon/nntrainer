@@ -372,6 +372,8 @@ public:
                    bool accumulate) override;
   // output = input * weight via host Tensor::dot (the CPU FC matmul). [T7]
   void fc(Tensor &input, Tensor &weight, Tensor &output) override;
+
+  void apply_activation(Tensor &out, int act_type) override;
 };
 
 } // namespace nntrainer

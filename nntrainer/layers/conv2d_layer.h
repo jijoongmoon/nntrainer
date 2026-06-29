@@ -17,7 +17,6 @@
 
 #include <memory.h>
 
-#include <acti_func.h>
 #include <common_properties.h>
 #include <layer_impl.h>
 
@@ -117,8 +116,6 @@ private:
     conv_props;
 
   std::array<unsigned int, 5> wt_idx; /**< indices of the weights and tensors */
-  ActiFunc acti_func; /**< inline fused activation (T10); inert unless
-                           fused_activation is set by the FusionRealizer */
 };
 
 } // namespace nntrainer

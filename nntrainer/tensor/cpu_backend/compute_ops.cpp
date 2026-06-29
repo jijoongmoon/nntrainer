@@ -419,6 +419,7 @@ void ComputeOps::residual_op(Tensor &, const Tensor &, bool) {
   NI(residual_op);
 }
 void ComputeOps::fc(Tensor &, Tensor &, Tensor &) { NI(fc); }
+void ComputeOps::apply_activation(Tensor &, int) { NI(apply_activation); }
 
 #undef NI
 

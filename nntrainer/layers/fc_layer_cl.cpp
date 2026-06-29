@@ -30,7 +30,7 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 enum FCParams { weight, bias };
 
 FullyConnectedLayerCl::FullyConnectedLayerCl() :
-  LayerImpl(), fc_props(props::Unit()) {
+  LayerImpl(), fc_props(props::Unit(), props::FusedActivation()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -130,6 +130,14 @@ void FullyConnectedLayerCl::forwarding(RunLayerContext &context, bool training) 
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
     hidden_.add_i(bias);
   }
+
+  // [T10] fused activation epilogue via the op table — same backend-neutral
+  // dispatch as the core FC (ClComputeOps on gpu, CudaComputeOps on cuda). Inert
+  // for the LLM stack (no fc+activation); fires only when a FusionRealizer sets
+  // fused_activation (a GPU CNN/MLP).
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+    hidden_.getOps()->apply_activation(hidden_, (int)fused_act.get());
 }
 
 void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
@@ -173,6 +181,11 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
     hidden_step.add_i(bias);
   }
+
+  // [T10] fused activation epilogue via the op table (see forwarding()).
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+    hidden_step.getOps()->apply_activation(hidden_step, (int)fused_act.get());
 }
 
 void FullyConnectedLayerCl::read(std::ifstream &file,

@@ -21,6 +21,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include <acti_func.h>
 #include <tensor.h>
 
 namespace nntrainer {
@@ -112,6 +113,32 @@ void CpuComputeOps::residual_op(Tensor &hidden, const Tensor &input,
 // quantized GEMM paths override this in their ComputeOps subclasses.
 void CpuComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
   input.dot(weight, output, false, false);
+}
+
+// Fused activation epilogue on the host: build the SAME ActiFunc the standalone
+// ActivationLayer would (so the fused result is value-identical), and run it in
+// place when the activation supports it (relu/sigmoid/tanh) or via a temp input
+// copy otherwise — mirroring ActivationLayer::run_fn(input, output) exactly.
+void CpuComputeOps::apply_activation(Tensor &out, int act_type) {
+  const auto at = static_cast<ActivationType>(act_type);
+  if (at == ActivationType::ACT_NONE)
+    return;
+  ActiFunc f;
+  if (out.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    f.setActiFunc<_FP16>(at);
+#else
+    throw std::invalid_argument("apply_activation: fp16 needs enable-fp16");
+#endif
+  } else {
+    f.setActiFunc<float>(at);
+  }
+  if (f.supportInPlace()) {
+    f.run_fn(out, out);
+  } else {
+    Tensor in_copy = out.clone();
+    f.run_fn(in_copy, out);
+  }
 }
 
 } // namespace nntrainer

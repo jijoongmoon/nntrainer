@@ -376,21 +376,6 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
                   eff_in_width - padding[2] - kernel_size[1] > IM,
                 std::invalid_argument)
     << "Failed to initialize: Calculated patch end is over int max";
-
-  // [T10] inline fused activation (set by the FusionRealizer): build the same
-  // ActiFunc a standalone ActivationLayer would, for a value-identical epilogue.
-  auto &fused_act = std::get<props::FusedActivation>(conv_props);
-  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
-    if (context.getActivationDataType() == TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-      acti_func.setActiFunc<_FP16>(fused_act.get());
-#else
-      throw std::invalid_argument("[Conv2D] fused fp16 act needs enable-fp16");
-#endif
-    } else {
-      acti_func.setActiFunc<float>(fused_act.get());
-    }
-  }
 }
 
 void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
@@ -490,17 +475,12 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     }
   }
 
-  // [T10] fused activation epilogue (value-identical to a standalone
-  // ActivationLayer); in-place for relu/sigmoid/tanh, else via a temp copy.
+  // [T10] fused activation epilogue dispatched through the op table (backend-
+  // neutral: CPU host ActiFunc / GPU kernel). Value-identical to the standalone
+  // ActivationLayer node it replaces.
   auto &fused_act = std::get<props::FusedActivation>(conv_props);
-  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
-    if (acti_func.supportInPlace()) {
-      acti_func.run_fn(hidden_, hidden_);
-    } else {
-      Tensor in_copy = hidden_.clone();
-      acti_func.run_fn(in_copy, hidden_);
-    }
-  }
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+    hidden_.getOps()->apply_activation(hidden_, (int)fused_act.get());
 }
 
 void Conv2DLayer::calcDerivative(RunLayerContext &context) {

@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <acti_func.h>
 #include <attention_kernels.h>     // gpu_copy_f16_cl
 #include <blas_kernel_interface.h> // clmem_residual_op_cl, add_i_cl
 #include <blas_kernels.h>
@@ -233,6 +234,33 @@ public:
   // one-time transform). [T7]
   void fc_prebuild_weight(Tensor &weight) override {
     nntrainer::dotCl_v8c_prebuild_weight(weight);
+  }
+
+  // Fused activation epilogue on the GPU FC. For now this runs the same host
+  // ActiFunc as CpuComputeOps (value-identical, correct on SVM-resident output);
+  // a GPU activation kernel fused into the GEMM epilogue is the perf follow-up.
+  // The LLM GPU stack never reaches here (GeGLU/SwiGLU, no fc+activation), so it
+  // is inert until a GPU CNN/MLP sets fused_activation. [T10]
+  void apply_activation(Tensor &out, int act_type) override {
+    const auto at = static_cast<ActivationType>(act_type);
+    if (at == ActivationType::ACT_NONE)
+      return;
+    ActiFunc f;
+    if (out.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+      f.setActiFunc<_FP16>(at);
+#else
+      throw std::invalid_argument("apply_activation: fp16 needs enable-fp16");
+#endif
+    } else {
+      f.setActiFunc<float>(at);
+    }
+    if (f.supportInPlace()) {
+      f.run_fn(out, out);
+    } else {
+      Tensor in_copy = out.clone();
+      f.run_fn(in_copy, out);
+    }
   }
 };
 

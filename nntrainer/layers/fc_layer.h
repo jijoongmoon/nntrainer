@@ -15,7 +15,6 @@
 #define __FC_LAYER_H__
 #ifdef __cplusplus
 
-#include <acti_func.h>
 #include <common_properties.h>
 #include <layer_impl.h>
 
@@ -127,8 +126,6 @@ private:
   std::array<unsigned int, 4> lora_idx;   /**< indices of the lora weights */
   std::unique_ptr<nntrainer::Quantizer> quantizer;
   bool skip_prefill = false;
-  ActiFunc acti_func; /**< inline fused activation (T10); inert unless
-                           fused_activation is set by the FusionRealizer */
 };
 } // namespace nntrainer
 

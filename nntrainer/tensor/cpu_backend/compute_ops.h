@@ -428,6 +428,20 @@ public:
    */
   virtual void fc_prebuild_weight(Tensor &weight) { (void)weight; }
 
+  /**
+   * @brief Fused activation epilogue: apply an element-wise activation in place
+   *        on a compute layer's output, after GEMM+bias. This is the op-table
+   *        half of the FusionRealizer (§10 T10): the neutral conv/fc layer calls
+   *        out.getOps()->apply_activation(out, act) instead of routing the data
+   *        through a separate ActivationLayer node, so the fusion is
+   *        backend-neutral — CpuComputeOps runs the host ActiFunc, and a GPU
+   *        backend can override with a kernel that fuses it into the GEMM
+   *        epilogue. @p act_type is an nntrainer::ActivationType cast to int (kept
+   *        as int here so compute_ops.h stays free of the layers headers); ACT_NONE
+   *        is a no-op.
+   */
+  virtual void apply_activation(Tensor &out, int act_type);
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not

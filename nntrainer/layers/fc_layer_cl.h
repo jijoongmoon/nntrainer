@@ -134,8 +134,9 @@ public:
 
 private:
   bool skip_prefill = false; /**< skip compute during prefill (Gemma4 KV-share) */
-  std::tuple<props::Unit>
-    fc_props; /**< fc layer properties : unit - number of output neurons */
+  std::tuple<props::Unit, props::FusedActivation>
+    fc_props; /**< fc layer properties : unit - number of output neurons;
+                   fused_activation - inline activation epilogue (T10) */
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
 };
 } // namespace nntrainer
