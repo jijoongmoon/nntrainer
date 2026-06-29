@@ -6,6 +6,7 @@ llm_layer_sources = [
   'scalar_multiply.cpp',
   'qkv_layer.cpp',
   'geglu_layer.cpp',
+  'swiglu_layer.cpp',
 ]
 
 llm_layer_headers = [
@@ -15,6 +16,7 @@ llm_layer_headers = [
   'tie_word_embedding.h',
   'qkv_layer.h',
   'geglu_layer.h',
+  'swiglu_layer.h',
 ]
 
 # scalar_multiply's GPU variant uses OpenCL directly (cl_mem / ClContext), so it

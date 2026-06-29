@@ -32,7 +32,6 @@
 #include <rms_norm.h>
 #include <per_layer_slice_gpu.h>
 #include <rms_norm_gpu.h>
-#include <swiglu.h>
 
 namespace causallm {
 
@@ -534,8 +533,8 @@ void Transformer::registerCustomLayers() {
   // CPU layer classes on the cpu (app) context — through Engine's registration
   // facade, no static_cast to AppContext.
   try {
-    ct_engine.registerLayerFactory(
-      "cpu", nntrainer::createLayer<causallm::SwiGLULayer>);
+    // swiglu promoted to core app_context.cpp [T12] (merged app fork into the
+    // backend-neutral nntrainer::SwiGLULayer).
     ct_engine.registerLayerFactory(
       "cpu", nntrainer::createLayer<causallm::RMSNormLayer>);
     ct_engine.registerLayerFactory(
@@ -580,8 +579,7 @@ void Transformer::registerCustomLayers() {
   // CPU implementations run correctly on them (no cl_mem); GPU kernels are
   // layered on per-layer later. Inert when there is no "cuda" context.
   try {
-    ct_engine.registerLayerFactory(
-      "cuda", nntrainer::createLayer<causallm::SwiGLULayer>);
+    // swiglu promoted to core cuda_context.cpp [T12].
     // CUDA RMSNorm (FP32-safe sum-of-squares) instead of the host
     // causallm::RMSNormLayer, whose FP16 path squares in FP16 and overflows on
     // gemma4's large residual (pre_ffn_norm |x|~1688 -> +Inf -> garbage). Same

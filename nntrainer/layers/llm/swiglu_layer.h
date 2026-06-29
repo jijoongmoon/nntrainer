@@ -39,7 +39,7 @@ public:
   /**
    * @brief Construct a new SwiGLULayer object
    */
-  SwiGLULayer() : Layer(), swiglu_props(props::Print()) {}
+  SwiGLULayer() : Layer(), swiglu_props(props::Print(), props::SkipPrefill()) {}
 
   /**
    * @brief Destroy the SwiGLULayer object
@@ -92,7 +92,10 @@ public:
   static constexpr const char *type = "swiglu";
 
 private:
-  std::tuple<props::Print> swiglu_props;
+  // SkipPrefill: gemma-style KV-share layers skip the prefill activation [T12,
+  // merged from the former app fork]. props::Print kept for the base layer.
+  std::tuple<props::Print, props::SkipPrefill> swiglu_props;
+  bool skip_prefill = false;
 };
 
 } // namespace nntrainer

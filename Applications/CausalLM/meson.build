@@ -26,7 +26,7 @@ causallm_layer_dependencies += [
     causallm_rms_norm_gpu_dep,
     # tie_word_embedding promoted to core libnntrainer [T12]
     causallm_lm_head_dep,
-    causallm_swiglu_dep,
+    # swiglu merged into core libnntrainer [T12]
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
     causallm_lm_head_dep,

@@ -40,6 +40,7 @@
 #include <logit_softcapping.h> // LLM layers promoted to core [T12]
 #include <qkv_layer.h>
 #include <scalar_multiply.h>
+#include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 #include <bn_layer.h>
 #include <cast_layer.h>
@@ -458,6 +459,9 @@ void AppContext::add_default_object() {
   // qkv_layer: pure-host QKV projection (no GPU/OpenCL variant); a reusable SDK
   // layer (no model wires it yet, so its registration is inert/additive).
   registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
+  // swiglu on cpu: the merged backend-neutral SwiGLULayer (getOps dispatch +
+  // skip + the cuda fast path); replaces the former app causallm::SwiGLULayer.
+  registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
 #if defined(ENABLE_OPENCL)
   // tie_word_embedding hard-depends on the OpenCL lm_head GEMV (blas_kernels), so
   // it is only compiled/registered when the OpenCL backend is on.

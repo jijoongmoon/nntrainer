@@ -21,6 +21,7 @@
 #include <geglu_layer.h>
 #include <logit_softcapping.h>
 #include <scalar_multiply.h>
+#include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
 // runDecode (T9): the CUDA-graph decode/prefill state machine, relocated verbatim
@@ -97,6 +98,10 @@ void CudaContext::add_default_object() {
   // geglu: the backend-neutral GeGLULayer dispatches via CudaComputeOps::geglu
   // (device-resident fp16 kernel under NNTR_CUDA_GEGLU, else host-on-UVM).
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  // swiglu: the merged backend-neutral SwiGLULayer dispatches via
+  // CudaComputeOps::swiglu, with the device-resident fp16 one-kernel fast path
+  // (cuda_swiglu_fp16) for the qwen3 FFN. Replaces the app causallm::SwiGLULayer.
+  registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
   // logit_softcapping (promoted to core [T12]): host op on UVM-resident logits;
   // the CUDA-only device-softcap path lives inside the layer (ENABLE_CUDA).
   registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,

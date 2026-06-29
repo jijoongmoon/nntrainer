@@ -16,6 +16,12 @@
 #include <node_exporter.h>
 #include <tensor.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#endif
+
 namespace nntrainer {
 
 static constexpr size_t OUT_IDX = 0;
@@ -24,6 +30,8 @@ static constexpr size_t INPUT_IDX_2 = 1; // up
 
 void SwiGLULayer::finalize(InitLayerContext &context) {
   context.setOutputDimensions({context.getInputDimensions()[0]});
+  if (!std::get<props::SkipPrefill>(swiglu_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(swiglu_props).get();
 }
 
 void SwiGLULayer::setProperty(const std::vector<std::string> &values) {
@@ -55,6 +63,29 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
     NNTR_THROW_IF(to - from != 1, std::invalid_argument)
       << "incremental step size is not 1";
   }
+
+  // skip-prefill gate (merged from the former app fork [T12]): KV-shared layers
+  // skip the prefill activation. Inert unless a model sets skip_prefill on swiglu.
+  if (skip_prefill && from == 0)
+    return;
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  // engine=cuda device-resident fp16: one kernel instead of the host loop (the
+  // getOps host path below would fault on the device-only activation pool under
+  // NNTR_CUDA_DEV_ACT). Gated on FP16 + batch/channel==1; falls through for
+  // OpenCL/CPU (cl_mem / host) and non-device tensors. [merged from app fork]
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+      in1.batch() == 1 && in1.channel() == 1) {
+    const size_t n = (size_t)(to - from) * in1.width();
+    auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>());
+    auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>());
+    auto *o = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+    const bool dev = a && nntrainer::cuda::dev_accessible(a);
+    if (dev && n > 0 &&
+        nntrainer::cuda::cuda_swiglu_fp16(a, b, o, (unsigned int)n))
+      return;
+  }
+#endif
 
   // active-row decision (unifies the former SwiGLULayerCl branches; mirrors
   // GeGLULayer except the SVM/host path offsets the pointer to row `from`):
