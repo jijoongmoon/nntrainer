@@ -358,6 +358,12 @@ public:
                                               sin_);
   }
 #endif // ENABLE_FP16
+
+  // Whole-op (Tensor-level). Out-of-line in cpu_ops_table.cpp so this header
+  // stays free of <tensor.h>. Pure host gelu_tanh(gate)*up over the live rows
+  // (correct for host and host-coherent SVM/UVM pointers). [T7]
+  void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+             unsigned int active_rows, unsigned int row_offset) override;
 };
 
 } // namespace nntrainer

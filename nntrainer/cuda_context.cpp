@@ -17,8 +17,8 @@
 #include <addition_layer.h>
 #include <compute_ops.h>
 #include <cuda_fc_layer.h>
-#include <cuda_geglu_layer.h>
 #include <cuda_mem_allocator.h>
+#include <geglu_layer.h>
 
 namespace nntrainer {
 
@@ -54,14 +54,15 @@ void CudaContext::initialize() noexcept {
     // separate copy step. Falls back to host memory if UVM is unavailable.
     setMemAllocator(std::make_shared<CudaMemAllocator>());
 
-    // ComputeOps = the CPU ops table. Unlike OpenCL cl_mem (not host-
-    // addressable, hence ClComputeOps), engine=cuda tensors are Unified Memory
-    // (cudaMallocManaged) = host-coherent, so every standard tensor op
-    // (sgemv/sgemm/scopy/dot/elementwise) runs correctly on the managed buffers
-    // via the CPU backend. GPU-accelerated ops are layered on top by the CUDA
-    // layer classes (CudaFcLayer's cuBLAS path); anything not yet ported simply
-    // falls back to a correct CPU computation on the same UVM pointer.
-    getContextData()->setComputeOps(get_cpu_ops());
+    // ComputeOps = the CUDA ops table. CudaComputeOps derives from CpuComputeOps
+    // (engine=cuda tensors are Unified Memory = host-coherent, so every standard
+    // op runs correctly on the managed buffers via the CPU implementations) and
+    // overrides only the ops it accelerates — currently the whole-op geglu
+    // (device-resident fp16 kernel, opt-in NNTR_CUDA_GEGLU) and the host copies.
+    // A neutral Layer's in1.getOps()->geglu(...) thus lands on the GPU path. The
+    // bulkier GPU-accelerated layers (CudaFcLayer's cuBLAS) still bind directly;
+    // anything not overridden falls back to a correct CPU computation. [T6/T7]
+    getContextData()->setComputeOps(get_cuda_ops());
 
   } catch (std::exception &e) {
     ml_loge("cuda_context: initialization failed!!, reason: %s", e.what());
@@ -80,9 +81,9 @@ void CudaContext::add_default_object() {
   // the host-coherent UVM tensors (do NOT use the OpenCL AdditionLayerCL).
   registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
                   ml::train::LayerType::LAYER_ADDITION);
-  // geglu: no host class exists in the tree (only OpenCL GeGLULayerCl), so
-  // provide a host-on-UVM gelu_tanh(gate)*up implementation.
-  registerFactory(nntrainer::createLayer<CudaGeGLULayer>, CudaGeGLULayer::type);
+  // geglu: the backend-neutral GeGLULayer dispatches via CudaComputeOps::geglu
+  // (device-resident fp16 kernel under NNTR_CUDA_GEGLU, else host-on-UVM).
+  registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
 }
 
 template <typename T>

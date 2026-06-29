@@ -406,6 +406,12 @@ void ComputeOps::compute_rotary_embedding_value(unsigned int, unsigned int,
 }
 #endif // ENABLE_FP16
 
+// Whole-op (Tensor-level) — default throw; Cpu/Cl/Cuda subclasses override.
+void ComputeOps::geglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
+                       unsigned int) {
+  NI(geglu);
+}
+
 #undef NI
 
 } // namespace nntrainer

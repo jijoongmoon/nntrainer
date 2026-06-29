@@ -18,6 +18,16 @@
 #include <compute_ops.h>
 #include <cpu_ops_table.h>
 
+#include <cstdlib>
+
+#include <tensor.h>
+
+#include <cuda_stream_manager.h>
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#endif
+
 namespace nntrainer {
 
 // CudaComputeOps derives from CpuComputeOps (not the abstract ComputeOps base):
@@ -56,6 +66,46 @@ public:
       Y[i * incY] = static_cast<float>(X[i * incX]);
   }
 #endif
+
+  // ── Whole-op (Tensor-level) ───────────────────────────────────────────────
+  // GeGLU: out = gelu_tanh(gate) * up. Device-resident fp16 kernel (opt-in via
+  // NNTR_CUDA_GEGLU until the whole decode chain is on-GPU); otherwise the host
+  // gelu loop on the host-coherent UVM tensors (CpuComputeOps::geglu). Matches
+  // the former CudaGeGLULayer::gegluProcess byte-for-byte. [T7]
+  void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+             unsigned int active_rows, unsigned int row_offset) override {
+    const unsigned int dim2 = in1.width();
+    const size_t elem_off = (size_t)row_offset * dim2;
+    const size_t n = (size_t)active_rows * dim2;
+    const auto dt = in1.getDataType();
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // GPU geglu (device-resident fp16): one kernel instead of the host loop, so
+    // the FFN/PLE activation stays on the device. NNTR_CUDA_ASYNC governs the
+    // drain.
+    if (dt == ml::train::TensorDim::DataType::FP16) {
+      static const bool gpu = std::getenv("NNTR_CUDA_GEGLU") != nullptr;
+      if (gpu && n > 0) {
+        auto *a =
+          reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +
+                                                   elem_off);
+        auto *b =
+          reinterpret_cast<const unsigned short *>(in2.getData<_FP16>() +
+                                                   elem_off);
+        auto *o = reinterpret_cast<unsigned short *>(out.getData<_FP16>() +
+                                                     elem_off);
+        const bool dev = nntrainer::cuda::dev_accessible(a);
+        if (dev && cuda::cuda_geglu_fp16(a, b, o, (unsigned int)n))
+          return;
+      }
+    }
+#endif
+
+    // Host gelu fallback: sync first so the host read of GPU-produced gate/up is
+    // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+    cuda::StreamManager::Global().finishIfAsync();
+    CpuComputeOps::geglu(in1, in2, out, active_rows, row_offset);
+  }
 };
 
 ComputeOps *get_cuda_ops() {

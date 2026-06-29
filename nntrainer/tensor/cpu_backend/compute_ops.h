@@ -40,6 +40,8 @@
 
 namespace nntrainer {
 
+class Tensor;
+
 /**
  * @class ComputeOps
  * @brief Abstract dispatch interface for tensor compute kernels.
@@ -374,6 +376,22 @@ public:
                                               _FP16 *out, float *cos_,
                                               float *sin_);
 #endif // ENABLE_FP16
+
+  // ===========================================================================
+  // Whole-op (Tensor-level) ops — the §11 op_table pattern: a thin neutral
+  // Layer owns structure/shape/orchestration while ComputeOps owns the whole
+  // kernel. Unlike the raw-pointer ops above, these take Tensors so the backend
+  // impl can introspect residency (isClMem/getClMem/isSVM) and bind device
+  // buffers directly. Default throws; CPU/CL/CUDA subclasses override. [T7]
+  // ===========================================================================
+
+  /**
+   * @brief GeGLU activation over the first `active_rows` rows starting at
+   *        `row_offset`: out = gelu_tanh(in1) * in2 ({gate, up} -> result).
+   *        in1/in2/out share shape; width() is the per-row element count.
+   */
+  virtual void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                     unsigned int active_rows, unsigned int row_offset);
 
 protected:
   /**

@@ -24,7 +24,8 @@
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
 #include <cstdlib>
-#include <geglu_cl.h>
+#include <geglu_cl_op.h>
+#include <geglu_layer.h>
 #include <mutex>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
@@ -175,10 +176,11 @@ void ClContext::add_default_object() {
                     ml::train::LayerType::LAYER_SWIGLU);
   }
 
-  if (GeGLULayerCl::registerClKernels(*this)) {
+  if (registerGeGLUClKernels(*this)) {
     // No dedicated LayerType enum for GeGLU; register by type string only
-    // (int_key auto-assigned). createLayer("geglu", {engine=gpu}) routes here.
-    registerFactory(nntrainer::createLayer<GeGLULayerCl>, GeGLULayerCl::type);
+    // (int_key auto-assigned). createLayer("geglu", {engine=gpu}) routes to the
+    // backend-neutral GeGLULayer, which dispatches via ClComputeOps::geglu.
+    registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
   }
 
   if (ReshapeLayerCl::registerClKernels(*this)) {

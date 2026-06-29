@@ -2,207 +2,51 @@
 /**
  * Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
  *
- * @file   geglu_cl.cpp
- * @date   08 Jun 2026
- * @brief  GPU GeGLU: gelu_tanh(gate) * up. Cloned from swiglu_cl.cpp with the
- *         SiLU gate replaced by the tanh-approx GELU (Gemma2).
+ * @file   geglu_cl_op.cpp
+ * @date   29 June 2026
+ * @brief  OpenCL GeGLU whole-op kernel dispatch (gelu_tanh(gate) * up).
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
+ *
+ * Relocated verbatim from geglu_cl.cpp (GeGLULayerCl::gegluProcess /
+ * geglu_cl / geglu_cl_fp16 / registerClKernels) into free functions so the
+ * GeGLU layer can be a single backend-neutral Layer. [T7]
  */
 
-#include "geglu_cl.h"
-#include "nntrainer_log.h"
-#include <blas_kernel_interface.h> // publish_resident_act (cl_mem residency)
-#include <cl_kernels/geglu.h>
+#include "geglu_cl_op.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include <blas_kernel_interface.h> // get_or_create_resident_backing (residency)
+#include <cl_kernels/geglu.h>
+#include <engine.h> // Engine::Global().getRegisteredContext("gpu")
+#include <nntrainer_log.h>
+#include <tensor.h>
 #ifdef ENABLE_FP16
 #include <cl_kernels/geglu_fp16.h>
 #endif
-#include <iostream>
 
 namespace nntrainer {
 
-static constexpr size_t OUT_IDX = 0;
-static constexpr size_t INPUT_IDX_1 = 0;
-static constexpr size_t INPUT_IDX_2 = 1;
+namespace {
 
-bool GeGLULayerCl::registerClKernels(ClContext &cl_context) {
-  auto &layer_kernel_ptrs = getLayerKernelPtrs();
+enum Kernels { GEGLU_CL, GEGLU_CL_FP16 }; /** kernels enum */
 
-  // check if the kernels are already registered.
-  if (!layer_kernel_ptrs.empty()) {
-    ml_loge("kernels for geglu_cl are already registered.");
-    return false;
-  }
-
-  do {
-    ClContext::SharedPtrClKernel kernel_geglu_ptr = nullptr;
-
-    kernel_geglu_ptr = cl_context.registerClKernel(geglu_kernel, "geglu_cl");
-
-    if (!kernel_geglu_ptr) {
-      ml_loge("OpenCL Error: Fail to register geglu_cl kernel");
-      break;
-    }
-    layer_kernel_ptrs.emplace_back(kernel_geglu_ptr);
-
-#ifdef ENABLE_FP16
-    kernel_geglu_ptr =
-      cl_context.registerClKernel(geglu_fp16_kernel, "geglu_cl_fp16");
-
-    if (!kernel_geglu_ptr) {
-      ml_loge("OpenCL Error: Fail to register geglu_cl_fp16 kernel");
-      break;
-    }
-    layer_kernel_ptrs.emplace_back(kernel_geglu_ptr);
-#endif
-
-    return true;
-  } while (false);
-
-  // clear all registered kernels if any error occurs during registration
-  layer_kernel_ptrs.clear();
-
-  return false;
+std::vector<ClContext::SharedPtrClKernel> &getLayerKernelPtrs() {
+  /**< kernel list relevant with this layer */
+  static std::vector<ClContext::SharedPtrClKernel> layer_kernel_ptrs;
+  return layer_kernel_ptrs;
 }
 
-void GeGLULayerCl::finalize(nntrainer::InitLayerContext &context) {
-  if (!std::get<props::SkipPrefill>(geglu_props).empty())
-    skip_prefill = std::get<props::SkipPrefill>(geglu_props).get();
-  context.setOutputDimensions({context.getInputDimensions()[0]});
-}
-
-void GeGLULayerCl::forwarding(RunLayerContext &context, bool training) {
-  Tensor &in1 = context.getInput(INPUT_IDX_1);
-  Tensor &in2 = context.getInput(INPUT_IDX_2);
-  Tensor &out = context.getOutput(OUT_IDX);
-  gegluProcess(in1, in2, out,
-               in1.batch() * in1.channel() * in1.height(), 0);
-}
-
-void GeGLULayerCl::incremental_forwarding(RunLayerContext &context,
-                                          unsigned int from, unsigned int to,
-                                          bool training) {
-  if (skip_prefill && from == 0)
-    return;
-  Tensor &in1 = context.getInput(INPUT_IDX_1);
-  Tensor &in2 = context.getInput(INPUT_IDX_2);
-  Tensor &out = context.getOutput(OUT_IDX);
-
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-  }
-
-  // [decode active-row fix] The activation buffers are NOT re-based at decode --
-  // the current token lives at its ABSOLUTE row (to-1) of the full [INIT_SEQ,I]
-  // tensor (confirmed empirically: processing rows [0,to) is token-identical to
-  // processing the full height, while processing row 0 diverges). So process
-  // only the live rows [from, to): at decode that is the single row `from`.
-  // Without this, geglu re-ran the whole [1024,I] tensor every decode step -- a
-  // ~1024x waste (the 806us/op decode cost on Gemma2 I=9216).
-  //
-  // SVM tensors: offset the data pointers to row `from` (getData()+from*width),
-  //   process exactly (to-from) rows -> O(1) at decode regardless of position.
-  // cl_mem tensors: getClMem() binds the whole buffer at index 0 (no pointer
-  //   offset). The kernel now takes a row_off arg, so an all-cl_mem fp16 decode
-  //   can still process ONLY the live row (to-1) by dispatching GWS=width with
-  //   row_off=(to-1)*width -> O(1) (was [0,to) = O(position), the 804us/op cost).
-  //   Mixed cl_mem/SVM or fp32 keep the [0,to) fallback (row_off can't serve a
-  //   pointer-offset SVM arg and a base-bound cl_mem arg at once).
-  const bool any_clmem = in1.isClMem() || in2.isClMem() || out.isClMem();
-  const bool all_clmem = in1.isClMem() && in2.isClMem() && out.isClMem();
-  const bool is_fp16 =
-    in1.getDataType() == ml::train::TensorDim::DataType::FP16;
-  if (from && all_clmem && is_fp16)
-    gegluProcess(in1, in2, out, 1, 0);
-  else if (any_clmem)
-    gegluProcess(in1, in2, out, to, 0);
-  else
-    // Gemma4: at decode the live token is at ROW 0 (the v8c FC / cl_mem path is
-    // offset-0-only; the producers write row 0). The old absolute-row `from`
-    // read a never-written stale row -> prompt-independent garbage. Use 0.
-    // (Gemma2's geglu is all-cl_mem, so it never reaches this branch.)
-    gegluProcess(in1, in2, out, to - from, 0);
-}
-
-void GeGLULayerCl::gegluProcess(Tensor const &in1, Tensor const &in2,
-                                Tensor &result, unsigned int active_rows,
-                                unsigned int row_offset) {
-
-  unsigned int dim1, dim2;
-  dim1 = active_rows;
-  dim2 = in1.width();
-
-  // Element offset into the SVM pointers so the kernel processes rows
-  // [row_offset, row_offset+active_rows). row_offset must be 0 for the cl_mem
-  // path (getClMem() returns the whole buffer with no offset applied -- the
-  // caller passes row_offset=0 + active_rows=to in that case).
-  const size_t elem_off = (size_t)row_offset * dim2;
-
-  // SVM-direct only when the tensors are GPU-resident (SVM pool). On the
-  // default host (cpu) pool getData() returns host pointers, so use the
-  // host-bounce path; passing host pointers as SVM kernel arguments produces
-  // garbage. When the graph opts into the SVM pool (NNTR_GPU_SVM_POOL), this
-  // becomes a zero-copy SVM-direct dispatch (residency).
-  const auto md = in1.getMemoryData();
-  const bool use_svm = md && md->isSVM();
-
-  if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    float *data1 = in1.getData() + elem_off;
-    float *data2 = in2.getData() + elem_off;
-    float *rdata = result.getData() + elem_off;
-    geglu_cl(data1, data2, rdata, dim1, dim2, use_svm);
-  } else if (in1.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    _FP16 *data1 = in1.getData<_FP16>() + elem_off;
-    _FP16 *data2 = in2.getData<_FP16>() + elem_off;
-    _FP16 *rdata = result.getData<_FP16>() + elem_off;
-    // Planner-decided STATIC residency: each of in1/in2/out binds the plane
-    // its ResidencyClass picked at allocation -- the gate/up FC outputs and the
-    // geglu output are GPU_CLMEM on the live Gemma2 path, so the kernel reads
-    // and writes the planner cl_mem sub-buffers directly (no SVM map at all on
-    // this op). Mixed cl_mem/SVM args are valid for partial classification.
-    void *in1_cl = (use_svm && in1.isClMem()) ? in1.getClMem() : nullptr;
-    void *in2_cl = (use_svm && in2.isClMem()) ? in2.getClMem() : nullptr;
-    void *out_cl = (use_svm && result.isClMem()) ? result.getClMem() : nullptr;
-    // [resident-act Step 1.5, legacy overlay] only when the static class did
-    // not already place the output in cl_mem.
-    void *res_backing = out_cl;
-    if (res_backing == nullptr) {
-      static const bool resident_act =
-        std::getenv("NNTR_RESIDENT_ACT") != nullptr;
-      const auto rmd = result.getMemoryData();
-      if (resident_act && use_svm && rmd && rmd->isSVM())
-        res_backing = static_cast<void *>(nntrainer::get_or_create_resident_backing(
-          result.getName(), (unsigned int)result.size(), /*fp16=*/true));
-    }
-    // NNTR_DEVRES (legacy runtime overlay, default off): unchanged semantics
-    // when no static class applies.
-    static const bool devres_geglu = std::getenv("NNTR_DEVRES") != nullptr;
-    const bool resident_edge = devres_geglu && use_svm && res_backing == nullptr;
-    // When every buffer is bound as a whole cl_mem (index 0, no pointer offset),
-    // the kernel applies elem_off itself so a single live row at row_offset is
-    // processed in place. SVM/host args carry the offset on their pointer, so
-    // row_off stays 0 there (mixing the two in one dispatch is gated out above).
-    const unsigned int kern_row_off =
-      (in1_cl && in2_cl && res_backing) ? (unsigned int)elem_off : 0u;
-    geglu_cl_fp16(data1, data2, rdata, dim1, dim2, use_svm, res_backing,
-                  /*skip_out_map=*/resident_edge, in1_cl, in2_cl, kern_row_off);
-    if (devres_geglu)
-      if (auto rmd = result.getMemoryData())
-        rmd->setDeviceValid(resident_edge,
-                            resident_edge ? result.getData<uint8_t>() : nullptr);
-#else
-    throw std::invalid_argument("Error: enable-fp16 is not enabled");
-#endif
-  }
-}
-
-void GeGLULayerCl::geglu_cl(float *matAdata, float *vecXdata, float *vecYdata,
-                            unsigned int dim1, unsigned int dim2, bool svm,
-                            void *resident_out) {
+void geglu_cl(float *matAdata, float *vecXdata, float *vecYdata,
+              unsigned int dim1, unsigned int dim2, bool svm,
+              void *resident_out) {
   (void)resident_out; // FP32 path: residency overlay is FP16-only (no-op here)
   auto *global_cl_context =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -299,12 +143,10 @@ void GeGLULayerCl::geglu_cl(float *matAdata, float *vecXdata, float *vecYdata,
 }
 
 #ifdef ENABLE_FP16
-void GeGLULayerCl::geglu_cl_fp16(_FP16 *matAdata, _FP16 *vecXdata,
-                                 _FP16 *vecYdata, unsigned int dim1,
-                                 unsigned int dim2, bool svm,
-                                 void *resident_out, bool skip_out_map,
-                                 void *in1_clmem, void *in2_clmem,
-                                 unsigned int row_off) {
+void geglu_cl_fp16(_FP16 *matAdata, _FP16 *vecXdata, _FP16 *vecYdata,
+                   unsigned int dim1, unsigned int dim2, bool svm,
+                   void *resident_out, bool skip_out_map, void *in1_clmem,
+                   void *in2_clmem, unsigned int row_off) {
 
   auto *global_cl_context =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -466,23 +308,118 @@ void GeGLULayerCl::geglu_cl_fp16(_FP16 *matAdata, _FP16 *vecXdata,
 }
 #endif
 
-void GeGLULayerCl::calcDerivative(nntrainer::RunLayerContext &context) {
-  std::throw_with_nested(std::runtime_error("Training is not supported yet."));
-}
+} // namespace
 
-void GeGLULayerCl::setProperty(const std::vector<std::string> &values) {
-  auto remain_props = loadProperties(values, geglu_props);
-  if (!remain_props.empty()) {
-    std::string msg = "[GeGLULayerCl] Unknown Layer Properties count " +
-                      std::to_string(values.size());
-    throw exception::not_supported(msg);
+bool registerGeGLUClKernels(ClContext &cl_context) {
+  auto &layer_kernel_ptrs = getLayerKernelPtrs();
+
+  // check if the kernels are already registered.
+  if (!layer_kernel_ptrs.empty()) {
+    ml_loge("kernels for geglu_cl are already registered.");
+    return false;
   }
+
+  do {
+    ClContext::SharedPtrClKernel kernel_geglu_ptr = nullptr;
+
+    kernel_geglu_ptr = cl_context.registerClKernel(geglu_kernel, "geglu_cl");
+
+    if (!kernel_geglu_ptr) {
+      ml_loge("OpenCL Error: Fail to register geglu_cl kernel");
+      break;
+    }
+    layer_kernel_ptrs.emplace_back(kernel_geglu_ptr);
+
+#ifdef ENABLE_FP16
+    kernel_geglu_ptr =
+      cl_context.registerClKernel(geglu_fp16_kernel, "geglu_cl_fp16");
+
+    if (!kernel_geglu_ptr) {
+      ml_loge("OpenCL Error: Fail to register geglu_cl_fp16 kernel");
+      break;
+    }
+    layer_kernel_ptrs.emplace_back(kernel_geglu_ptr);
+#endif
+
+    return true;
+  } while (false);
+
+  // clear all registered kernels if any error occurs during registration
+  layer_kernel_ptrs.clear();
+
+  return false;
 }
 
-std::vector<ClContext::SharedPtrClKernel> &GeGLULayerCl::getLayerKernelPtrs() {
-  /**< kernel list relevant with this layer */
-  static std::vector<ClContext::SharedPtrClKernel> layer_kernel_ptrs;
-  return layer_kernel_ptrs;
+void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &result,
+                 unsigned int active_rows, unsigned int row_offset) {
+
+  unsigned int dim1, dim2;
+  dim1 = active_rows;
+  dim2 = in1.width();
+
+  // Element offset into the SVM pointers so the kernel processes rows
+  // [row_offset, row_offset+active_rows). row_offset must be 0 for the cl_mem
+  // path (getClMem() returns the whole buffer with no offset applied -- the
+  // caller passes row_offset=0 + active_rows=to in that case).
+  const size_t elem_off = (size_t)row_offset * dim2;
+
+  // SVM-direct only when the tensors are GPU-resident (SVM pool). On the
+  // default host (cpu) pool getData() returns host pointers, so use the
+  // host-bounce path; passing host pointers as SVM kernel arguments produces
+  // garbage. When the graph opts into the SVM pool (NNTR_GPU_SVM_POOL), this
+  // becomes a zero-copy SVM-direct dispatch (residency).
+  const auto md = in1.getMemoryData();
+  const bool use_svm = md && md->isSVM();
+
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    float *data1 = in1.getData() + elem_off;
+    float *data2 = in2.getData() + elem_off;
+    float *rdata = result.getData() + elem_off;
+    geglu_cl(data1, data2, rdata, dim1, dim2, use_svm, /*resident_out=*/nullptr);
+  } else if (in1.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    _FP16 *data1 = in1.getData<_FP16>() + elem_off;
+    _FP16 *data2 = in2.getData<_FP16>() + elem_off;
+    _FP16 *rdata = result.getData<_FP16>() + elem_off;
+    // Planner-decided STATIC residency: each of in1/in2/out binds the plane
+    // its ResidencyClass picked at allocation -- the gate/up FC outputs and the
+    // geglu output are GPU_CLMEM on the live Gemma2 path, so the kernel reads
+    // and writes the planner cl_mem sub-buffers directly (no SVM map at all on
+    // this op). Mixed cl_mem/SVM args are valid for partial classification.
+    void *in1_cl = (use_svm && in1.isClMem()) ? in1.getClMem() : nullptr;
+    void *in2_cl = (use_svm && in2.isClMem()) ? in2.getClMem() : nullptr;
+    void *out_cl = (use_svm && result.isClMem()) ? result.getClMem() : nullptr;
+    // [resident-act Step 1.5, legacy overlay] only when the static class did
+    // not already place the output in cl_mem.
+    void *res_backing = out_cl;
+    if (res_backing == nullptr) {
+      static const bool resident_act =
+        std::getenv("NNTR_RESIDENT_ACT") != nullptr;
+      const auto rmd = result.getMemoryData();
+      if (resident_act && use_svm && rmd && rmd->isSVM())
+        res_backing = static_cast<void *>(nntrainer::get_or_create_resident_backing(
+          result.getName(), (unsigned int)result.size(), /*fp16=*/true));
+    }
+    // NNTR_DEVRES (legacy runtime overlay, default off): unchanged semantics
+    // when no static class applies.
+    static const bool devres_geglu = std::getenv("NNTR_DEVRES") != nullptr;
+    const bool resident_edge = devres_geglu && use_svm && res_backing == nullptr;
+    // When every buffer is bound as a whole cl_mem (index 0, no pointer offset),
+    // the kernel applies elem_off itself so a single live row at row_offset is
+    // processed in place. SVM/host args carry the offset on their pointer, so
+    // row_off stays 0 there (mixing the two in one dispatch is gated out above).
+    const unsigned int kern_row_off =
+      (in1_cl && in2_cl && res_backing) ? (unsigned int)elem_off : 0u;
+    geglu_cl_fp16(data1, data2, rdata, dim1, dim2, use_svm, res_backing,
+                  /*skip_out_map=*/resident_edge, in1_cl, in2_cl, kern_row_off);
+    if (devres_geglu)
+      if (auto rmd = result.getMemoryData())
+        rmd->setDeviceValid(resident_edge,
+                            resident_edge ? result.getData<uint8_t>() : nullptr);
+#else
+    throw std::invalid_argument("Error: enable-fp16 is not enabled");
+#endif
+  }
 }
 
 } // namespace nntrainer

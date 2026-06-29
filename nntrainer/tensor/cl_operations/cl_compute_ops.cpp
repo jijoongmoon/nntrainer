@@ -26,6 +26,8 @@
 
 #include <blas_kernels.h>
 #include <compute_ops.h>
+#include <geglu_cl_op.h>
+#include <tensor.h>
 
 namespace nntrainer {
 
@@ -119,6 +121,16 @@ public:
       Y[i * incY] = static_cast<float>(X[i * incX]);
   }
 #endif
+
+  // ── Whole-op (Tensor-level) ───────────────────────────────────────────────
+  // GeGLU: out = gelu_tanh(gate) * up. Forwards to the relocated OpenCL kernel
+  // dispatch (cl_mem/SVM residency, resident-act overlay, row_off decode path).
+  // The neutral GeGLULayer calls in1.getOps()->geglu(...) which lands here on a
+  // CL-attached tensor. [T7]
+  void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+             unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::geglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
 };
 
 ComputeOps *get_cl_ops() {

@@ -2,23 +2,23 @@
 /**
  * Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
  *
- * @file   cuda_geglu_layer.h
- * @date   22 Jun 2026
- * @brief  GeGLU activation for the CUDA backend: out = gelu_tanh(gate) * up.
+ * @file   geglu_layer.h
+ * @date   29 June 2026
+ * @brief  Backend-neutral GeGLU activation: out = gelu_tanh(gate) * up.
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
  *
- * @details geglu has no CPU/host class in the tree (only the OpenCL
- * GeGLULayerCl), but gemma4 builds it with engine=cuda. This is a minimal
- * host-on-UVM GeGLU (two inputs {gate, up} -> gelu_tanh(gate) * up) that runs
- * directly on the cudaMallocManaged (host-coherent) tensors. A GPU kernel is a
- * later optimization. Mirrors GeGLULayerCl's interface (Print/SkipPrefill
- * props, type "geglu").
+ * @details A single thin Layer that owns structure/shape/orchestration and
+ * delegates the kernel to the active backend's ComputeOps whole-op
+ * (in1.getOps()->geglu(...)): OpenCL -> ClComputeOps::geglu (cl_mem/SVM
+ * residency), CUDA -> CudaComputeOps::geglu (device fp16 / host-on-UVM), CPU ->
+ * CpuComputeOps::geglu (host loop). Replaces the former GeGLULayerCl and
+ * CudaGeGLULayer forks. Two inputs {gate, up}; type "geglu". [T7]
  */
 
-#ifndef __CUDA_GEGLU_LAYER_H__
-#define __CUDA_GEGLU_LAYER_H__
+#ifndef __GEGLU_LAYER_H__
+#define __GEGLU_LAYER_H__
 #ifdef __cplusplus
 
 #include <tuple>
@@ -30,20 +30,20 @@
 namespace nntrainer {
 
 /**
- * @class CudaGeGLULayer
- * @brief GeGLU (gelu_tanh(gate) * up) on the CUDA backend (host-on-UVM).
+ * @class GeGLULayer
+ * @brief GeGLU (gelu_tanh(gate) * up), backend-neutral via ComputeOps.
  */
-class CudaGeGLULayer final : public Layer {
+class GeGLULayer final : public Layer {
 public:
   /**
-   * @brief Construct a new CudaGeGLULayer object
+   * @brief Construct a new GeGLULayer object
    */
-  CudaGeGLULayer() : Layer(), geglu_props(props::Print(), props::SkipPrefill()) {}
+  GeGLULayer() : Layer(), geglu_props(props::Print(), props::SkipPrefill()) {}
 
   /**
-   * @brief Destroy the CudaGeGLULayer object
+   * @brief Destroy the GeGLULayer object
    */
-  ~CudaGeGLULayer() {}
+  ~GeGLULayer() {}
 
   /**
    * @copydoc Layer::finalize(InitLayerContext &context)
@@ -81,7 +81,7 @@ public:
   /**
    * @copydoc Layer::getType()
    */
-  const std::string getType() const override { return CudaGeGLULayer::type; };
+  const std::string getType() const override { return GeGLULayer::type; };
 
   /**
    * @copydoc Layer::setProperty(const std::vector<std::string> &values)
@@ -93,15 +93,9 @@ public:
 private:
   bool skip_prefill = false; /**< skip compute during prefill (Gemma4 KV-share) */
   std::tuple<props::Print, props::SkipPrefill> geglu_props;
-
-  /**
-   * @brief out = gelu_tanh(in1) * in2 over the first `rows` rows (host-on-UVM)
-   */
-  void gegluProcess(const Tensor &in1, const Tensor &in2, Tensor &out,
-                    unsigned int rows);
 };
 
 } // namespace nntrainer
 
 #endif /* __cplusplus */
-#endif /* __CUDA_GEGLU_LAYER_H__ */
+#endif /* __GEGLU_LAYER_H__ */
