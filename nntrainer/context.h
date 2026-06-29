@@ -72,6 +72,17 @@ struct DeviceCaps {
   uint32_t compute_units = 0;   /**< OpenCL CL_DEVICE_MAX_COMPUTE_UNITS */
   uint64_t max_alloc_bytes = 0; /**< per-alloc cap (CL MAX_MEM_ALLOC_SIZE);
                                      0 = unknown/unbounded */
+  bool image_v8c = true;        /**< device uses the image2d v8c path (FC GEMM +
+                                     KV attention) rather than the cl_mem buffer
+                                     path. Both report CL_DEVICE_IMAGE_SUPPORT, so
+                                     this is not a clean query — it is set from
+                                     vendor_id at init (Intel NEO's compiler
+                                     rejects the integer-coord read_imageui v8c
+                                     kernel ⇒ buffer; Adreno/unknown ⇒ image). The
+                                     V8C_BUF cell of the resolver. Declared LAST so
+                                     appending it leaves the other field offsets
+                                     unmoved (ABI-safe for an app built against the
+                                     old DeviceCaps). [T8] */
 
   /**
    * @brief One-line human-readable dump for the init-time log.
@@ -82,7 +93,7 @@ struct DeviceCaps {
        << "\", arch=" << (arch.empty() ? "-" : arch) << ", vendor_id=0x"
        << std::hex << vendor_id << std::dec << ", integrated=" << integrated
        << ", unified_memory=" << unified_memory << ", subgroups=" << subgroups
-       << ", compute_units=" << compute_units
+       << ", image_v8c=" << image_v8c << ", compute_units=" << compute_units
        << ", max_alloc_bytes=" << max_alloc_bytes << "}";
     return os.str();
   }

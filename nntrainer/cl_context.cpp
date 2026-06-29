@@ -105,6 +105,15 @@ void ClContext::initialize() noexcept {
       caps_.unified_memory = di->getDeviceSVMCapabilities() != 0;
       caps_.subgroups = di->getDeviceExtensions().find("cl_intel_subgroups") !=
                         std::string::npos;
+      // [T8] V8C_BUF cell: image2d v8c path vs cl_mem buffer path. No clean query
+      // distinguishes them (both advertise CL_DEVICE_IMAGE_SUPPORT); the split is
+      // Intel NEO's compiler rejecting the integer-coord read_imageui v8c kernel.
+      // Keyed off vendor_id — a stable, queryable, vendor-WIDE attribute (the
+      // quirk is a NEO compiler trait, not a per-model one), not the brittle
+      // device_name. Intel (0x8086) ⇒ buffer; Adreno/unknown ⇒ image (the prior
+      // default). NNTR_V8C_BUF still overrides.
+      constexpr uint32_t INTEL_VENDOR_ID = 0x8086;
+      caps_.image_v8c = (caps_.vendor_id != INTEL_VENDOR_ID);
       cl_bool host_unified = CL_FALSE;
       caps_.integrated =
         (clGetDeviceInfo(context_inst_.GetDeviceId(),

@@ -2037,15 +2037,19 @@ static bool v8c_pick_lws(size_t gws_x, size_t gws_y, std::array<size_t, 2> &out)
   return ok;
 }
 
-// Device-specialization gate (paper §3.4). NNTR_V8C_BUF=1 selects the
-// BUFFER-LOAD v8c GEMM kernels (no sampled-image reads) for runtimes that
-// advertise cl_khr_image2d_from_buffer but cannot compile integer-coordinate
-// read_imageui (e.g. Intel NEO). Default 0 = image path (Adreno BIT-identical).
-// Queried once per process.
-static bool v8c_use_buffer_path() {
+// Device-specialization gate (paper §3.4). Selects the BUFFER-LOAD v8c GEMM
+// kernels (no sampled-image reads) for runtimes that advertise
+// cl_khr_image2d_from_buffer but cannot compile integer-coordinate read_imageui
+// (e.g. Intel NEO); the image path is the Adreno default. [T8] Now caps-derived:
+// NNTR_V8C_BUF still overrides, but with the flag unset the choice comes from
+// DeviceCaps::image_v8c (set from vendor_id at ClContext init), so the buffer
+// path no longer needs the mandatory flag on Intel. Queried once per process.
+bool v8c_use_buffer_path() {
   static const bool use_buf = []() {
     const char *e = std::getenv("NNTR_V8C_BUF");
-    return e && std::atoi(e) != 0;
+    if (e)
+      return std::atoi(e) != 0;                   // explicit override (set wins)
+    return !ClContext::Global().caps().image_v8c; // Intel ⇒ buffer
   }();
   return use_buf;
 }

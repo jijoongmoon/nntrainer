@@ -428,14 +428,10 @@ struct V8cWeightEntry {
 
 // Buffer-path (NNTR_V8C_BUF): on Intel NEO the v8c GEMM uses the *_buf kernels
 // whose args are declared __global uint4* — they must be bound to raw cl_mem
-// BUFFERS, not image2d objects. Mirror blas_kernels.cpp::v8c_use_buffer_path().
-static bool v8c_buffer_path() {
-  static const bool use_buf = []() {
-    const char *e = std::getenv("NNTR_V8C_BUF");
-    return e && std::atoi(e) != 0;
-  }();
-  return use_buf;
-}
+// BUFFERS, not image2d objects. [T8] single source of truth is
+// blas_kernels.cpp::v8c_use_buffer_path() (caps-derived from vendor_id; the env
+// flag still overrides); this file-local name forwards to it.
+static bool v8c_buffer_path() { return v8c_use_buffer_path(); }
 
 static bool v8c_env_enabled() {
   static int cached = -1;
@@ -1715,7 +1711,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // FC) -- the submit-split output perturbation it caused is a race
     // pattern, not a math change (drained-capture proof), and the
     // re-baselined reference outputs absorb it. +15%-class idle recovery.
-    return std::getenv("NNTR_V8C_BUF") != nullptr ? 0 : 1;
+    return v8c_use_buffer_path() ? 0 : 1; // [T8] Intel buffer ⇒ mode 0
   }();
   if (fc_flush_mode == 2 && !skip_upload_and_quant)
     clFlush(q);

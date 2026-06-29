@@ -14,6 +14,7 @@
 #include "attention_kernels_templates.h"
 #include <array>
 #include <blas_kernel_interface.h>
+#include <blas_kernels.h> // v8c_use_buffer_path() — the V8C_BUF cell [T8]
 #include <chrono>
 #include <cl_kernels/flash_attention.h>
 #include <cl_kernels/rotary_emb.h>
@@ -109,9 +110,8 @@ inline std::mutex &tca_mtx() {
 // down with it). Default "" keeps the Adreno image path bit-identical.
 static const std::string &tca_copts() {
   static const std::string opts = []() {
-    const char *e = std::getenv("NNTR_V8C_BUF");
-    std::string o = (e && std::atoi(e) != 0) ? std::string("-DTCA_BUFFER_ONLY")
-                                             : std::string();
+    std::string o = v8c_use_buffer_path() ? std::string("-DTCA_BUFFER_ONLY")
+                                          : std::string();
     return o;
   }();
   return opts;
@@ -2061,10 +2061,7 @@ bool two_conv_attention_prefill_f16_ohwi_cl(
   // (NNTR_V8C_BUF, the existing Intel device-specialization signal)
   // keeps the Adreno path bit-identical. The barriers carry no math
   // change — pure ordering.
-  static const bool ooo_barriers = []() {
-    const char *e = std::getenv("NNTR_V8C_BUF");
-    return e && std::atoi(e) != 0;
-  }();
+  static const bool ooo_barriers = v8c_use_buffer_path();
   auto serialize = [&]() {
     if (ooo_barriers) clEnqueueBarrierWithWaitList(q, 0, nullptr, nullptr);
   };
@@ -2893,10 +2890,9 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
   // of head_dim — NOT by the full-private-d coop/skeleton path. blockq/vec are
   // the Intel/buffer default; reject only when a non-tiling path would be used.
   {
-    const char *b = std::getenv("NNTR_V8C_BUF");
     const char *bq = std::getenv("NNTR_FLASH_BLOCKQ");
     const char *vc = std::getenv("NNTR_FLASH_VEC");
-    const bool tiled = (bq ? std::atoi(bq) != 0 : (b && std::atoi(b) != 0)) ||
+    const bool tiled = (bq ? std::atoi(bq) != 0 : v8c_use_buffer_path()) ||
                        (vc && std::atoi(vc) != 0);
     if (head_dim > 128 && !tiled)
       return false; // FLASH_MAX_D private-acc bound (coop/skeleton, Qwen3 d=128)
@@ -2965,8 +2961,7 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
     // M=1024 1153 TPS vs scalar 3-kernel 727), so default it ON there. Adreno
     // (NNTR_V8C_BUF unset) keeps the naive flash OFF and uses the image
     // 3-kernel path — image attention beats flash 3x on Adreno.
-    const char *b = std::getenv("NNTR_V8C_BUF");
-    return (b && std::atoi(b) != 0) ? 1 : 0;
+    return v8c_use_buffer_path() ? 1 : 0; // [T8] Intel buffer ⇒ 1
   }();
   // LDS staging (lever B) measured a NET LOSS on Intel Arc (per-tile barrier +
   // LDS pressure cut occupancy; the K/V row is small and L2-cached): 1257 ms vs
@@ -2986,8 +2981,7 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
     // #60: default ON for the Intel/buffer path (NNTR_V8C_BUF) — Block-Q +
     // subgroup-reduce is the measured-best Intel attention (M=1024 ~2075 TPS
     // vs vec-flash ~1119, token-identical). Adreno (unset) uses the image path.
-    const char *b = std::getenv("NNTR_V8C_BUF");
-    return (b && std::atoi(b) != 0) ? 1 : 0;
+    return v8c_use_buffer_path() ? 1 : 0; // [T8] Intel buffer ⇒ 1
   }();
   // FBQ_TM: query rows per workgroup. Default 4 (=> acc+q 2*TM*VPL floats stays
   // in registers at LWS>=32). Only 1/2/4/8 supported.
@@ -3006,8 +3000,7 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
     const char *e = std::getenv("NNTR_FLASH_SG");
     if (e)
       return std::atoi(e) != 0 ? 1 : 0;
-    const char *b = std::getenv("NNTR_V8C_BUF");
-    return (b && std::atoi(b) != 0) ? 1 : 0;
+    return v8c_use_buffer_path() ? 1 : 0; // [T8] Intel buffer ⇒ 1
   }();
   // FLASH_COOP_LWS: WG size for the coop variant (work-items cooperating
   // over head_dim). Default 64. LDS footprint is tiny (q_sh[d]+acc_sh[d]+
@@ -3042,8 +3035,7 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
       // #59: Intel/buffer path default LWS=16 => VPL = d/16 = 8 (half8 vloads),
       // the measured Intel-Arc optimum (1153 TPS @ M=1024 vs 981 at LWS=64).
       // Adreno default stays 64.
-      const char *b = std::getenv("NNTR_V8C_BUF");
-      v = (b && std::atoi(b) != 0) ? 16 : 64;
+      v = v8c_use_buffer_path() ? 16 : 64; // [T8] Intel buffer ⇒ 16
     }
     // Must be a power of two for the log-step tree reduction.
     if (v != 16 && v != 32 && v != 64 && v != 128 && v != 256)
