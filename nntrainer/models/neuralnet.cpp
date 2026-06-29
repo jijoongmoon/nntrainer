@@ -37,6 +37,7 @@
 #include <sstream>
 
 #include <activation_realizer.h>
+#include <fusion_realizer.h>
 #include <adamw.h>
 #include <common_properties.h>
 #include <databuffer.h>
@@ -219,6 +220,11 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     std::vector<Connection>(input_conn.begin(), input_conn.end())));
   realizers.emplace_back(new MultioutRealizer());
   realizers.emplace_back(new FlattenRealizer());
+  // [T10] fuse a compute layer's activation epilogue (conv+relu / fc+act) BEFORE
+  // ActivationRealizer would split it into a node — so it stays inline. Gated by
+  // NNTR_FUSE_ACT (default on); a no-op for graphs whose compute layers carry no
+  // activation property (e.g. the CausalLM GPU stack uses GeGLU/SwiGLU).
+  realizers.emplace_back(new FusionRealizer());
   realizers.emplace_back(new ActivationRealizer());
 
   for (auto &realizer : realizers) {

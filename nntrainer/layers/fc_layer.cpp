@@ -42,7 +42,8 @@ enum LORAParams { loraA, loraB, loraTmp, loraOut };
 FullyConnectedLayer::FullyConnectedLayer() :
   LayerImpl(),
   lora_scaling(1.0f),
-  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha()),
+  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(),
+           props::FusedActivation()),
   quantizer(nullptr) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   lora_idx.fill(std::numeric_limits<unsigned>::max());
@@ -184,6 +185,22 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
     quantizer = nullptr;
     break;
   }
+
+  // [T10] inline fused activation: if the FusionRealizer moved an activation onto
+  // this FC (fused_activation set), build the SAME ActiFunc the standalone
+  // ActivationLayer would use, so the fused forward is value-identical.
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
+    if (context.getActivationDataType() == TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+      acti_func.setActiFunc<_FP16>(fused_act.get());
+#else
+      throw std::invalid_argument("[FC] fused fp16 activation needs enable-fp16");
+#endif
+    } else {
+      acti_func.setActiFunc<float>(fused_act.get());
+    }
+  }
 }
 
 void FullyConnectedLayer::exportTo(
@@ -235,6 +252,20 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
     hidden_.add_i(bias);
+  }
+
+  // [T10] fused activation epilogue: apply the activation inline on the GEMM
+  // output, eliminating the separate ActivationLayer node. In-place when the
+  // activation supports it (relu/sigmoid/tanh); otherwise via a temp input copy,
+  // exactly mirroring ActivationLayer's run_fn(input, output) -> value-identical.
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
+    if (acti_func.supportInPlace()) {
+      acti_func.run_fn(hidden_, hidden_);
+    } else {
+      Tensor in_copy = hidden_.clone();
+      acti_func.run_fn(in_copy, hidden_);
+    }
   }
 }
 
