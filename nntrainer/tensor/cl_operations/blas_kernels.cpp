@@ -2212,7 +2212,15 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   // and the A/weight 2D-block reads clamp OOB rows to 0 (surface height = M).
   static const bool xmx_fc = []() {
     const char *e = getenv("NNTR_FC_XMX");
-    return e && atoi(e) != 0;
+    if (e)
+      return atoi(e) != 0; // explicit override always wins
+    // Caps-derived default (resolver gemm_path cell): enable XMX when the device
+    // advertises the Intel subgroup extension (Xe2/Xe3). The DPAS path is
+    // byte-identical to dp4a (same v8c packing + epilogue) but faster on prefill,
+    // and on a device without the matrix-MAD the kernel registration fails and we
+    // fall through to dp4a — so defaulting it on is safe (never garbage, at worst
+    // dp4a). This retires the NNTR_FC_XMX opt-in on capable Intel GPUs.
+    return ClContext::Global().caps().subgroups;
   }();
   if (xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0) {
     // Shape-adaptive tile. The microbench's NT=4/SG_M=1 (tuned for the square
