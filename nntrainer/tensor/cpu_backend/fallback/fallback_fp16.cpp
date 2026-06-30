@@ -12,6 +12,7 @@
  */
 
 #include <assert.h>
+#include <fallback.h>
 #include <fallback_internal.h>
 #include <nntrainer_error.h>
 

@@ -248,6 +248,18 @@ public:
   }
 
   /**
+   * @copydoc Tensor::getPackedData()
+   */
+  virtual void *getPackedData() const { return getData(); }
+
+  /**
+   * @brief Pack the weight data eagerly (for quantized tensors)
+   * @note Default implementation does nothing; override in subclasses that
+   * require packing
+   */
+  virtual void pack() {}
+
+  /**
    * @brief     i data index
    * @retval    address of ith data
    */

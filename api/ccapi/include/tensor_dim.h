@@ -60,6 +60,7 @@ public:
     Q4_K,   /** Q4_K quantized*/
     Q6_K,   /** q6 k quantized */
     Q4_0,   /** Q4_0 k quantized */
+    QS4CX,  /** QS4CX quantized */
     UINT4,  /** quantized unsigned int 4*/
     UINT8,  /** unsigned int 8 bit */
     UINT16, /** unsigned int 16 bit */

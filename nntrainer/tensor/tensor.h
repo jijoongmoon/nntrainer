@@ -604,6 +604,20 @@ public:
   }
 
   /**
+   * @brief     return Packed data pointer of Tensor
+   * @retval    template T pointer
+   */
+  template <typename T = float> T *getPackedData() const {
+    return (T *)itensor_->getPackedData();
+  }
+
+  /**
+   * @brief     Pack the weight data eagerly (for quantized tensors)
+   * @note      Must be called after loading for tensors that require packing
+   */
+  void pack() { itensor_->pack(); }
+
+  /**
    * @brief     i data index
    * @retval    template T pointer (address of ith data)
    */

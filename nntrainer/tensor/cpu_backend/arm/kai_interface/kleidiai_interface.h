@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Arm Limited and/or its affiliates
+ * Copyright (C) 2024 Sungsik Kong <ss.kong@samsung.com>
+ *
+ * @file   kleidiai_interface.h
+ * @date   15 September 2025
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Sungsik Kong
+ *
+ * @brief  Modified computational backend components of
+ * kleidiai. Portions of this file are derived from Arm
+ * Limited code licensed under the Apache License, Version 2.0, with
+ * modifications
+ *
+ * @note   Licensed under the Apache License, Version 2.0 (the "License");
+ *         you may not use this file except in compliance with the License.
+ *         You may obtain a copy of the License at
+ *             http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * @modifications
+ *   - [2025-09-15] Integrated and adapted Arm-provided code into
+ *     nntrainer CPU backend
+ *
+ * @bug    No known bugs except for NYI items
+ */
+
+#include <cfloat>
+#include <cstdint>
+#include <string>
+
+namespace nntrainer {
+/**
+ * matmul_clamp_f32_qai8dxp_qsi4cxp
+ */
+
+/**
+ * @brief get name of ukernel
+ *
+ * @param[in] idx_variant index of ukernel
+ * @return std::string name of ukernel
+ */
+std::string __kai_get_num_ukernel_name_qai8dxp_qsi4cxp(size_t idx_variant);
+
+/**
+ * @brief get number of ukernels
+ *
+ * @return size_t number of ukernels
+ */
+size_t __kai_get_num_ukernel_variants_qai8dxp_qsi4cxp();
+
+/**
+ * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
+ * qsi4cxp
+ * Note that nxk is the format of quantized rhs, not the shape of rhs
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] is_nxk true if rhs is in nxk format
+ * @return size_t size of memory to allocate
+ */
+size_t __kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                                   size_t idx_variant,
+                                                   bool is_nxk);
+
+/**
+ * @brief rhs matrix packing from nxk qs4cxs1s0 to qsi4cxp
+ * Note that rhs_qs4cx must be stored with UINT4 shape (zero point = 8)
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[out] rhs_packed_mtx_qs4cx packed rhs
+ * @param[in] rhs_native_mtx_qs4cx quantized matrix data
+ * @param[in] rhs_scales_f32 qparam data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] is_nxk true if rhs is in nxk format
+ */
+void __kai_rhs_pack_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                      void *rhs_packed_mtx_qs4cx,
+                                      void *rhs_native_mtx_qs4cx,
+                                      void *rhs_scales_f32, size_t idx_variant,
+                                      bool is_nxk);
+
+/**
+ * @brief run qai8dxp_qsi4cxp GEMM with online rhs packing
+ *
+ * @param[in] m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] lhs_native_mtx_f32 matrix data
+ * @param[in] rhs_native_mtx_qs4cx quantized matrix data
+ * @param[in] rhs_scales_f32 qparam data
+ * @param[out] dst_act_mtx_f32 output data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] is_nxk true if rhs is in nxk format
+ * @param[in] lower_bound clipping param
+ * @param[in] upper_bound clipping param
+ */
+void __kai_gemm_qai8dxp_qsi4cxp_rhs_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
+  size_t idx_variant, bool is_nxk, float lower_bound = -FLT_MAX,
+  float upper_bound = FLT_MAX);
+
+/**
+ * @brief run qai8dxp_qsi4cxp GEMM with offline packed rhs
+ *
+ * @param[in] m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] lhs_native_mtx_f32 matrix data
+ * @param[in] rhs_packed_mtx_qs4cx quantized matrix data, packed already
+ * @param[out] dst_act_mtx_f32 output data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] lower_bound clipping param
+ * @param[in] upper_bound clipping param
+ */
+void __kai_gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
+                                void *lhs_native_mtx_f32,
+                                void *rhs_packed_mtx_qs4cx,
+                                float *dst_act_mtx_f32, size_t idx_variant,
+                                float lower_bound = -FLT_MAX,
+                                float upper_bound = FLT_MAX);
+
+} // namespace nntrainer
+
+/**
+ * matmul_clamp_f32_qsi8dx32p_qsi4cx32p
+ * @todo refactor likewise qai8dxp_qsi4cxp
+ */
+
+/**
+ * @brief fp16 in / fp16 out variant of nntr_kai_gemm_qai8dxp_qsi4cxp_olp.
+ *
+ * Uses the forked kai_lhs_quant_pack_qai8dxp_f16 packer and the forked
+ * kai_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm matmul, so
+ * no fp16↔fp32 cast pass over the LHS / DST tensors is needed.
+ *
+ * Locked to the 4x4x32 micro-kernel (qsi4cxp4x8 family, nr=4 kr=16 sr=2)
+ * — the only KAI variant we currently have a fp16-dst fork for. The
+ * passed rhs_packed_mtx_qs4cx must be a KAI rhs_packed buffer for that
+ * same variant.
+ *
+ * @param lower_bound / upper_bound  fp32 clamp values applied before the
+ * fcvtn; magnitudes should stay below 65504 to avoid +Inf on the cast.
+ */
+void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_f16(
+  size_t m, size_t n, size_t k, const void *lhs_native_mtx_f16,
+  void *rhs_packed_mtx_qs4cx, void *dst_act_mtx_f16, bool transB,
+  float lower_bound, float upper_bound);
+
+/**
+ * @brief get size of memory to allocate for rhs weight packing of qsi8d32p to
+ * qsi4c32p
+ *
+ * @param n row length if not transposed
+ * @param k col length if not transposed
+ * @return size_t size of memory to allocate
+ */
+size_t nntr_kai_get_rhs_packed_size_qsi8d32p_qsi4c32p(size_t n, size_t k,
+                                                      uint32_t idx_variant,
+                                                      bool transB);
+
+/**
+ * @brief rhs matrix packing for qsi8d32p format
+ *
+ * @param n row length if not transposed
+ * @param k col length if not transposed
+ * @param rhs_packed_mtx_qs4cx dst* to store results
+ * @param rhs_native_mtx_qs4cx input matrix data
+ * @param rhs_scales_f32 input qparam data
+ * @param transB rather the matrix is transposed or not
+ */
+void nntr_kai_qsi8d32p_qsi4c32p_rhs_pack(size_t n, size_t k,
+                                         void *rhs_packed_mtx_qs4cx,
+                                         void *rhs_native_mtx_qs4cx,
+                                         void *rhs_scales_f32,
+                                         uint32_t idx_variant, bool transB);
+
+/**
+ * @brief run qsi8d32p_qsi4c32p GEMM with runtime weight packing
+ *
+ * @param m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param lhs_native_mtx_f32 activation
+ * @param rhs_native_mtx_qs4cx qs4cx quantized weight matrix data
+ * @param rhs_scales_f32 qs4cx quantized weight matrix scale data
+ * @param dst_act_mtx_f32 dst data
+ * @param transB rather the weight matrix is transposed or not
+ * @param lower_bound clipping param
+ * @param upper_bound clipping param
+ */
+uint32_t nntr_kai_gemm_qsi8d32p_qsi4c32p_rtp(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
+  bool transB, float lower_bound, float upper_bound);
+
+/**
+ * @brief qs4c32 quantization of (n*k) matrix with block size 32.
+ * qsi4c32p refers to quantized symmetric 4-bit quantization with block size 32.
+ *
+ * @param n N length of the matrix
+ * @param k K length of the matrix (must be divisible by bl)
+ * @param bl block length (typically 32)
+ * @param rhs_f32 matrix data before quantization to load
+ * @param rhs_qs4c32 matrix data after quantization to store
+ */
+void nntr_kai_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
+                               const float *rhs_f32, uint8_t *rhs_qs4c32);
+
+/**
+ * @brief run qsi8d32p_qsi4c32p GEMM with offline weight packing
+ *
+ * @param m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param lhs_native_mtx_f32 activation
+ * @param rhs_packed_mtx_qs4cx qs4cx quantized weight, packed already
+ * @param dst_act_mtx_f32 dst data
+ * @param transB rather the weight matrix is transposed or not
+ * @param lower_bound clipping param
+ * @param upper_bound clipping param
+ */
+void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp(size_t m, size_t n, size_t k,
+                                         void *lhs_native_mtx_f32,
+                                         void *rhs_packed_mtx_qs4cx,
+                                         float *dst_act_mtx_f32,
+                                         uint32_t idx_variant, bool transB,
+                                         float lower_bound, float upper_bound);
+
+/**
+ * @brief Transform osv32_isv2 quantized weights to qsi4c32p packed format.
+ *
+ * This function transforms weights from OpenVINO GPU format (osv32_isv2) to
+ * ARM KleidiAI packed format (qsi4c32p) without going through FP32
+ * dequantization.
+ *
+ * @param n Number of rows (output channels)
+ * @param k Number of columns (input channels), must be divisible by 32
+ * @param osv32_weights Input weights in osv32_isv2 format
+ * @param osv32_scales Input scales in FP16 format (indexed per row)
+ * @param qsi4c32p_packed Output buffer for packed qsi4c32p weights
+ * @param packed_size Output size of the packed buffer
+ * @param kernel_idx Kernel variant index (default=3 for GEMM, 1 for GEMV)
+ * @param transB Whether the matrix is transposed (default=true for NxK)
+ */
+void nntr_kai_repack_osv32_to_qsi4c32p(
+  size_t n, size_t k, const uint8_t *osv32_weights,
+  const uint16_t *osv32_scales, void *qsi4c32p_packed, size_t &packed_size,
+  uint32_t kernel_idx = 3, bool transB = true);

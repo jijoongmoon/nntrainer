@@ -254,11 +254,13 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   const std::string embedding_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
 
+  NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
+                std::invalid_argument)
+    << "embedding_file_name requires untied embedding_layer";
   LayerHandle embedding(createLayer(
     embedding_type,
-    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
-     "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
-     "scale=" + std::to_string(EMBEDDING_SCALE)}));
+    buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM, EMBEDDING_DTYPE,
+                                  EMBEDDING_SCALE, EMBEDDING_FILE_NAME)));
   Tensor h = embedding(x);
 
   const unsigned int per_layer_total_dim =
@@ -267,6 +269,8 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   // per-layer input embedding is a lookup table -> use EMBEDDING_DTYPE.
   // (EmbeddingLayer save/load supports FP32/Q4_0/Q6_K, not QINT4, so it must
   // not inherit FC_LAYER_DTYPE; quantize.cpp maps it to embd_dtype to match.)
+  // [merge 2026-06-30] kept OURS over upstream's buildEmbeddingLayerProperties/
+  // PLE_FILE_NAME sidecar path (our canonical gemma4 has no sidecar artifact).
   LayerHandle per_layer_embedding(
     createLayer("embedding_layer",
                 {withKey("name", "per_layer_input_embedding"),

@@ -106,6 +106,10 @@ if get_option('enable-profile')
   endif
 endif
 
+if host_machine.cpu_family() == 'aarch64'
+  test_target += [['unittest_nntrainer_kleidiai', []]]
+endif
+
 foreach target: test_target
   exe = executable(
     target[0],
@@ -138,6 +142,20 @@ unittest_ddtree_exe = executable(
 )
 test('unittest_ddtree', unittest_ddtree_exe,
   args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_ddtree')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+unittest_memory_pool_exe = executable(
+  'unittest_memory_pool',
+  'memory' / 'unittest_memory_pool.cpp',
+  include_directories: include_directories('models', 'memory'),
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_memory_pool', unittest_memory_pool_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_memory_pool')],
   timeout: test_timeout,
   suite: 'unittests'
 )

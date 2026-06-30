@@ -2,8 +2,10 @@ causallm_src = [
     meson.current_source_dir() / 'chat_template.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
+    meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
     meson.current_source_dir() / 'api' / 'model_config.cpp',
+    meson.current_source_dir() / 'api' / 'streamer.cpp',
     meson.current_source_dir() / 'kv_cache_manager.cpp',
 ]
 
@@ -217,6 +219,21 @@ if get_option('enable-test')
     '../../test/unittest/models'
   )
 
+  unittest_embedding_sidecar_lut = executable(
+    'unittest_embedding_sidecar_lut',
+    meson.current_source_dir() / 'layers' / 'unittest_embedding_sidecar_lut.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_embedding_layer_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_embedding_sidecar_lut', unittest_embedding_sidecar_lut,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_embedding_sidecar_lut'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   unittest_kv_cache_manager = executable(
     'unittest_kv_cache_manager',
     meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',
@@ -251,6 +268,48 @@ if get_option('enable-test')
       run_command(['tar', 'xzf', fixture_tar, '-C', causallm_fixture_dest], check: false)
     endif
   endforeach
+
+  unittest_callback_streamer = executable(
+    'unittest_callback_streamer',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_callback_streamer.cpp',
+      meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
+      meson.current_source_dir() / 'api' / 'streamer.cpp',
+    ],
+    dependencies: [gtest_main_dep],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_callback_streamer', unittest_callback_streamer,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_callback_streamer'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  unittest_cancel_api = executable(
+    'unittest_cancel_api',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_cancel_api.cpp',
+    ],
+    dependencies: [
+      nntrainer_dep,
+      nntrainer_ccapi_dep,
+      gtest_main_dep,
+      causallm_layer_dependencies,
+      causallm_dep
+    ],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_cancel_api', unittest_cancel_api,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_cancel_api'),
+    timeout: 60,
+    suite: 'unittests'
+  )
 
   # Ubuntu native builds use platform=none.
   model_unittest_platforms = ['none', 'windows', 'android']

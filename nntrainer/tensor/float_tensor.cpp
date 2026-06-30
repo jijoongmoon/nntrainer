@@ -760,6 +760,9 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::QINT4:
     dotQInteger(input, output, trans, trans_in, beta, input.getDataType());
     break;
+  case Tdatatype::QS4CX:
+    dotQs4cx(input, output, trans, trans_in, beta, input.getDataType());
+    break;
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
@@ -1050,6 +1053,54 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
     o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
 #endif
   }
+
+  return output;
+}
+
+Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
+                              bool trans_in, float beta,
+                              Tdatatype dtype) const {
+  unsigned int M = getDim().height();
+  unsigned int K = getDim().width();
+  unsigned int N = output.getDim().width();
+#if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
+  defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
+  defined(_M_ARM64)
+  float *lhs = (float *)getData();
+  char *rhs = input.getPackedData<char>();
+  float *out = output.getData<float>();
+
+  /**
+   * @note INT4 weight gemm for CPU
+   * As of now, QINT4 tensor denotes per channel quantization with group
+   * length 32. But it will be a tensor for kleidiai only format.
+   * Below code assumes that weight tensor is quantized in qs4cx and unpacked.
+   * @todo rewrite QINT4 tensor and below code
+   */
+
+  /**
+   * GEMV
+   * matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod
+   * GEMM
+   * matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm
+   * @todo update kernel index for SVE, SME
+   */
+  size_t opt_kernel_idx = (M == 1) ? 2 : 8;
+
+  gemm_qai8dxp_qsi4cxp(M, N, K, lhs, rhs, out, opt_kernel_idx);
+#elif defined(__x86_64__) || defined(__i586__) || defined(_M_X64) ||           \
+  defined(_M_IX86)
+
+  float *lhs = (float *)getData();
+  char *rhs = input.getData<char>();
+  float *scale = input.getScale();
+  float *out = output.getData<float>();
+
+  size_t opt_kernel_idx = 0; // unused
+
+  gemm_qai8dxp_qsi4cxp_rhs_unpacked(M, N, K, lhs, rhs, scale, out,
+                                    opt_kernel_idx, true);
+#endif
 
   return output;
 }

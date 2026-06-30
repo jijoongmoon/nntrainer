@@ -39,8 +39,10 @@
 #include <map>
 #include <model.h>
 #include <random>
+#include <stdexcept>
 #include <tensor_api.h>
 #include <utility>
+#include <vector>
 
 #include <limits.h>
 
@@ -63,6 +65,45 @@ using json = nlohmann::json;
  * @brief Model Type Enum
  */
 enum class ModelType { MODEL, CAUSALLM, EMBEDDING, UNKNOWN };
+
+/**
+ * @brief {data, size} pointer pair produced/consumed by multimodal vision
+ *        models. The buffer is heap-allocated by the producer (run_image) and
+ *        ownership transfers to the caller.
+ */
+using multimodal_pointer = std::pair<void *, size_t>;
+
+/**
+ * @brief Non-owning logits processor hook for token generation
+ */
+class LogitsProcessor {
+public:
+  /**
+   * @brief Destroy the LogitsProcessor object
+   */
+  virtual ~LogitsProcessor() = default;
+
+  /**
+   * @brief Mutate one batch row of logits before token selection
+   * @param logits FP32 logits for a single batch row
+   * @param vocab_size Number of logits in the row
+   * @param batch_index Batch row index
+   */
+  virtual void process(float *logits, unsigned int vocab_size,
+                       unsigned int batch_index) = 0;
+
+  /**
+   * @brief Receive the selected token after token selection
+   * @param token_id Selected token id
+   * @param batch_index Batch row index
+   */
+  virtual void acceptToken(unsigned int token_id, unsigned int batch_index) = 0;
+
+  /**
+   * @brief Reset processor state when requested by the caller
+   */
+  virtual void reset() {}
+};
 
 /**
  * @brief Transformer Class
@@ -103,6 +144,13 @@ public:
   virtual void load_weight(const std::string &weight_path);
 
   /**
+   * @brief Repack all QS4CX weights after loading
+   * @note Must be called after load_weight() for QS4CX quantized tensors
+   * @note Prepares weights for efficient computation by eagerly packing them
+   */
+  virtual void repack_weight();
+
+  /**
    * @brief Save the weight to a file
    */
   virtual void save_weight(const std::string &weight_path);
@@ -127,6 +175,63 @@ public:
                    const WSTR system_prompt = WSTR(),
                    const WSTR tail_prompt = WSTR(), bool log_output = true);
 
+  // ── Multimodal composition interface (model-agnostic) ──────────────────
+  // Lets a generic composer drive any [vision producer, LLM consumer] pair
+  // through base pointers, without knowing the concrete model type.
+  // Default implementations mean "this role is not supported by this model".
+
+  /** Embedding-CONSUMER (LLM): bytes of one token embedding (0 ⇒ no table). */
+  virtual size_t embeddingBytesPerToken() const { return 0; }
+
+  /** Embedding-CONSUMER (LLM): embedding of @p token_id, or nullptr. */
+  virtual const void *lookupEmbedding(int token_id) const {
+    (void)token_id;
+    return nullptr;
+  }
+
+  /** Embedding-CONSUMER (LLM): (scale, offset) of the embedding quant space. */
+  virtual std::pair<float, int> get_embedding_info() { return {1.0f, 0}; }
+
+  /** Embedding-CONSUMER (LLM): run generation from precomputed embeddings. */
+  virtual void run_with_embeddings(const void *prefill_embeds, size_t n_tokens,
+                                   std::vector<int> seed_tokens, bool do_sample,
+                                   bool log_output) {
+    (void)prefill_embeds;
+    (void)n_tokens;
+    (void)seed_tokens;
+    (void)do_sample;
+    (void)log_output;
+    throw std::runtime_error("run_with_embeddings not supported by this model");
+  }
+
+  /** Embedding-PRODUCER (vision): set the (scale, offset) it should emit in. */
+  virtual void set_quant_param(float scale, int offset) {
+    (void)scale;
+    (void)offset;
+  }
+
+  /** Embedding-PRODUCER (vision): encode an image into LLM-space embeddings.
+   *  Returns a heap buffer (caller frees) of size {bytes}; the default
+   *  {nullptr,0} means "this model is not a vision producer". */
+  virtual multimodal_pointer
+  run_image(const WSTR prompt, multimodal_pointer image, int image_height,
+            int image_width, bool do_sample = false,
+            const WSTR system_prompt = WSTR(), const WSTR tail_prompt = WSTR(),
+            bool log_output = true) {
+    (void)prompt;
+    (void)image;
+    (void)image_height;
+    (void)image_width;
+    (void)do_sample;
+    (void)system_prompt;
+    (void)tail_prompt;
+    (void)log_output;
+    return {nullptr, 0};
+  }
+
+  /** Current KV-cache length (0 if the model has no persistent KV cache). */
+  virtual int getKvLen() const { return 0; }
+
   /**
    * @brief Get TransformerPerformanceMetrics
    */
@@ -138,6 +243,28 @@ public:
    * @brief get the status of run
    */
   bool hasRun() const { return has_run_; }
+
+  /**
+   * @brief Get configured vocabulary size
+   * @return Vocabulary size
+   */
+  unsigned int getVocabSize() const { return NUM_VOCAB; }
+
+  /**
+   * @brief Get tokenizer owned by this model, or nullptr if no tokenizer exists
+   */
+  tokenizers::Tokenizer *getTokenizer() { return tokenizer.get(); }
+
+  /**
+   * @brief Attach a non-owning logits processor
+   * @param processor Processor pointer, or nullptr to detach
+   */
+  virtual void setLogitsProcessor(LogitsProcessor *) {}
+
+  /**
+   * @brief Reset attached logits processor state
+   */
+  virtual void resetLogitsProcessor() {}
 
 protected:
   /**
@@ -152,6 +279,22 @@ protected:
    *         and feeding additional layers before returning.
    */
   virtual std::pair<Tensor, Tensor> constructModel();
+
+  /**
+   * @brief Build common CausalLM embedding layer properties
+   * @param name Layer name
+   * @param in_dim Vocabulary/input dimension
+   * @param out_dim Embedding output dimension
+   * @param weight_dtype Layer weight dtype
+   * @param scale Embedding scale
+   * @param quantized_lut_path Optional sidecar LUT path
+   * @return Layer property strings
+   */
+  std::vector<std::string>
+  buildEmbeddingLayerProperties(const std::string &name, unsigned int in_dim,
+                                unsigned int out_dim,
+                                const std::string &weight_dtype, float scale,
+                                const std::string &quantized_lut_path) const;
 
   /**
    * @brief Create one Transformer decoder block (norm + attention + residual +
@@ -240,6 +383,8 @@ protected:
   std::string MODEL_TENSOR_TYPE;
   std::string EMBEDDING_DTYPE; /** embedding dtype */
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
+  std::string EMBEDDING_FILE_NAME;
+  std::string PLE_FILE_NAME;
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;

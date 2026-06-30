@@ -112,6 +112,7 @@ LOCAL_SRC_FILES := \
     ../models/deberta_v2/deberta_v2.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
+    ../api/streamer.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -134,7 +135,8 @@ LOCAL_LDLIBS := -llog -landroid -DENABLE_FP16=1 -DUSE__FP16=1 -D__ARM_NEON__=1 -
 
 LOCAL_SRC_FILES := \
     ../api/causal_lm_api.cpp \
-    ../api/model_config.cpp
+    ../api/model_config.cpp \
+    ../api/callback_streamer.cpp
 
 LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -264,7 +266,8 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gemma3/function.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../layers/deberta_attention_layer.cpp \
-    ../layers/shared_fully_connected_layer.cpp
+    ../layers/shared_fully_connected_layer.cpp \
+    ../api/streamer.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
