@@ -145,10 +145,15 @@ void __kai_gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
  * @param lower_bound / upper_bound  fp32 clamp values applied before the
  * fcvtn; magnitudes should stay below 65504 to avoid +Inf on the cast.
  */
+// [merge 2026-06-30] declared in namespace nntrainer to match the definition
+// (kleidiai_interface_qai8dxp_qsi4cxp.cpp wraps it in nntrainer); the global
+// decl here mismatched the nntrainer:: definition -> undefined symbol at link.
+namespace nntrainer {
 void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_f16(
   size_t m, size_t n, size_t k, const void *lhs_native_mtx_f16,
   void *rhs_packed_mtx_qs4cx, void *dst_act_mtx_f16, bool transB,
   float lower_bound, float upper_bound);
+} // namespace nntrainer
 
 /**
  * @brief get size of memory to allocate for rhs weight packing of qsi8d32p to

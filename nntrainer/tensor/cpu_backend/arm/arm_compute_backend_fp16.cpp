@@ -444,16 +444,22 @@ uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
   void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_mtx_f32,
   bool transB, float lower_bound, float upper_bound) {
-  return nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
+  // [merge 2026-06-30] facade: upstream replaced our benchmark-and-pick rtp
+  // (looped idx_variant 0..7 for min latency) with the fixed-variant
+  // __kai_gemm_qai8dxp_qsi4cxp_rhs_unpacked (packs rhs online + runs the
+  // matching ukernel). idx_variant only selects the ukernel — the math is
+  // variant-independent — and this unpacked path is not hot (canonical weights
+  // are pre-packed at load), so use a fixed valid variant instead of probing.
+  __kai_gemm_qai8dxp_qsi4cxp_rhs_unpacked(
     m, n, k, lhs_native_mtx_f32, rhs_native_mtx_qs4cx, rhs_scales_f32,
-    dst_mtx_f32, transB, lower_bound, upper_bound);
+    dst_mtx_f32, /*idx_variant=*/0, transB, lower_bound, upper_bound);
+  return 1;
 }
 
 size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
                                                   uint32_t idx_variant,
                                                   bool transB) {
-  return nntr_kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant,
-                                                        transB);
+  return __kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant, transB);
 }
 
 void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
@@ -461,9 +467,9 @@ void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
                                      void *rhs_native_mtx_qs4cx,
                                      void *rhs_scales_f32, uint32_t idx_variant,
                                      bool transB) {
-  nntr_kai_qsi4cxp_qs4cxs1s0_rhs_pack(n, k, rhs_packed_mtx_qs4cx,
-                                      rhs_native_mtx_qs4cx, rhs_scales_f32,
-                                      idx_variant, transB);
+  __kai_rhs_pack_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx,
+                                   rhs_native_mtx_qs4cx, rhs_scales_f32,
+                                   idx_variant, transB);
 }
 
 template <>
