@@ -599,6 +599,20 @@ make_v8c_weight_backing_from_kai_section_a(const uint8_t *section_a,
                                            cl_mem *out_row_sum_w_int4_buf);
 
 /**
+ * @brief Same as make_v8c_weight_backing_from_kai_section_a but from an upstream
+ * QS4CX plain weight: row-major nibbles (N x (K+1)/2 bytes, even k=low nibble,
+ * uint4=int4+8, no XOR) + per-output-channel fp32 scale (range/15). Produces the
+ * identical v8c backing/scale/row-sum the GEMM consumes [weight 한벌 / Phase B].
+ * @param[in] plain_nibbles QS4CX nibble payload (length N*((K+1)/2))
+ * @param[in] fp32_scales   per-channel fp32 dequant scales (length N)
+ */
+std::unique_ptr<tv::TensorBacking>
+make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
+                                   const float *fp32_scales, unsigned int N,
+                                   unsigned int K, cl_mem *out_scale_buf,
+                                   cl_mem *out_row_sum_w_int4_buf);
+
+/**
  * @brief 8/4/4 paper attention path: int8(act) × int8(weight) channel-wise GEMM.
  *        Signature mirrors gemm_int8_v8c_cl (row_sum_act ignored). Weight image
  *        must be the plain row-major int8 view (width K/16). Dispatches the

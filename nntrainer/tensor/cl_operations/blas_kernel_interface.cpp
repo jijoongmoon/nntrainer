@@ -571,23 +571,39 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   auto it = cache.find(key);
   if (it != cache.end())
     return &it->second;
-  const uint8_t *section_a = weight.getData<uint8_t>();
-  const uint16_t *fp16_scales = weight.getScale<uint16_t>();
-  if (!section_a || !fp16_scales)
+  const uint8_t *nibbles = weight.getData<uint8_t>();
+  if (!nibbles)
     return nullptr;
+  const bool is_qs4cx =
+    weight.getDataType() == ml::train::TensorDim::DataType::QS4CX;
   V8cWeightEntry e;
   cl_mem sb = nullptr;
   cl_mem rsw = nullptr;
   try {
-    // The on-disk QINT4 weight is the KAI Section A nibble payload + a
-    // per-output-channel fp16 scale (one fp16 per N). Permute the nibbles
-    // straight to the v8c row-major + offset-encoded layout — no dequant→
-    // requant round-trip, so no extra quantization noise and no fp32
-    // intermediate buffer. The scales transfer 1:1 (fp16 → fp32). The
-    // helper also precomputes per-channel Σ_k int4_w[n,k] for the
-    // asymmetric-act zero-point correction the GEMM applies later.
-    e.backing = make_v8c_weight_backing_from_kai_section_a(
-      section_a, fp16_scales, N, K, &sb, &rsw);
+    if (is_qs4cx) {
+      // [weight 한벌 / Phase B] Upstream QS4CX plain weight: row-major nibbles
+      // (uint4 = int4+8, no XOR) + per-output-channel fp32 scale (range/15).
+      // Builds the identical v8c backing as the KAI path (zero GEMM change);
+      // only the load-time decode source + scale dtype differ.
+      const float *fp32_scales = weight.getScale<float>();
+      if (!fp32_scales)
+        return nullptr;
+      e.backing = make_v8c_weight_backing_from_qs4cx(nibbles, fp32_scales, N, K,
+                                                     &sb, &rsw);
+    } else {
+      // The on-disk QINT4 weight is the KAI Section A nibble payload + a
+      // per-output-channel fp16 scale (one fp16 per N). Permute the nibbles
+      // straight to the v8c row-major + offset-encoded layout — no dequant→
+      // requant round-trip, so no extra quantization noise and no fp32
+      // intermediate buffer. The scales transfer 1:1 (fp16 → fp32). The
+      // helper also precomputes per-channel Σ_k int4_w[n,k] for the
+      // asymmetric-act zero-point correction the GEMM applies later.
+      const uint16_t *fp16_scales = weight.getScale<uint16_t>();
+      if (!fp16_scales)
+        return nullptr;
+      e.backing = make_v8c_weight_backing_from_kai_section_a(
+        nibbles, fp16_scales, N, K, &sb, &rsw);
+    }
   } catch (...) {
     return nullptr;
   }
@@ -666,7 +682,8 @@ static inline float v8c_h2f(uint16_t h) {
 bool dotCl_v8c_prebuild_weight(const Tensor &weight) {
   if (!v8c_env_enabled())
     return false;
-  if (weight.getDataType() != ml::train::TensorDim::DataType::QINT4)
+  if (weight.getDataType() != ml::train::TensorDim::DataType::QINT4 &&
+      weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
     return false;
   const unsigned int N = weight.width();
   const unsigned int K = weight.height();
@@ -1208,7 +1225,8 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   const double _fc_t0 = fc_tprof_on() ? fc_tprof_now() : 0;
   if (!v8c_env_enabled())
     return false;
-  if (weight.getDataType() != ml::train::TensorDim::DataType::QINT4)
+  if (weight.getDataType() != ml::train::TensorDim::DataType::QINT4 &&
+      weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
     return false;
   // Derive M, K, N from tensor dims (no-transpose case only).
   unsigned int M, K, N;

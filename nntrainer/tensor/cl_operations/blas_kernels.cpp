@@ -2788,6 +2788,106 @@ make_v8c_weight_backing_from_kai_section_a(const uint8_t *section_a,
   return backing;
 }
 
+// [Phase B / weight 한벌] Build the SAME v8c GEMM backing from an upstream QS4CX
+// plain weight instead of our KAI Section-A. QS4CX on-disk = plain row-major
+// nibbles (N rows of (K+1)/2 bytes; even k = low nibble, odd k = high nibble;
+// stored uint4 = int4 + 8, NO XOR 0x88) + per-output-channel fp32 scale
+// (range/15 dequant multiplier). Because the v8c GEMM only ever consumes the
+// prebuilt backing + scale_buf + row_sum_buf, swapping the load-time decode
+// source (plain index-by-K vs Section-A super-row inverse) leaves the GEMM, the
+// scale buffer, and the row-sum byte-identical => zero GEMM/perf change. The
+// only semantic differences vs the KAI path are: no XOR undo, and the scale is
+// already fp32 (no fp16->fp32 promotion).
+std::unique_ptr<tv::TensorBacking>
+make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
+                                   const float *fp32_scales, unsigned int N,
+                                   unsigned int K, cl_mem *out_scale_buf,
+                                   cl_mem *out_row_sum_w_int4_buf) {
+  if (K % 32 != 0)
+    throw std::invalid_argument(
+      "make_v8c_weight_backing_from_qs4cx: K must be a multiple of 32");
+  if (N % 4 != 0)
+    throw std::invalid_argument(
+      "make_v8c_weight_backing_from_qs4cx: N must be a multiple of 4");
+
+  const size_t plain_row_bytes = ((size_t)K + 1) / 2; // QS4CX nibble stride
+  const size_t k_blocks = K / 32;
+  const size_t v8c_row_bytes = (size_t)K / 2;
+  std::vector<uint8_t> packed((size_t)N * v8c_row_bytes);
+
+  // Read the offset-encoded (int4+8) nibble for input index k of a plain row.
+  auto plain_nib = [](const uint8_t *row, size_t k) -> uint8_t {
+    const uint8_t byte = row[k >> 1];
+    return (k & 1) ? (uint8_t)((byte >> 4) & 0x0F) : (uint8_t)(byte & 0x0F);
+  };
+
+  // v8c K-block byte order (matches the KAI builder): byte(c*4+b) = (qH<<4)|qL
+  // with qL = K(kblk*32 + c*8 + b), qH = K(kblk*32 + c*8 + b + 4).
+  for (size_t n = 0; n < N; ++n) {
+    const uint8_t *plain_row = plain_nibbles + n * plain_row_bytes;
+    uint8_t *v8c_row = packed.data() + n * v8c_row_bytes;
+    for (size_t kblk = 0; kblk < k_blocks; ++kblk) {
+      uint8_t *v8c_kblk = v8c_row + kblk * 16;
+      const size_t kbase = kblk * 32;
+      for (size_t c = 0; c < 4; ++c) {
+        for (size_t b = 0; b < 4; ++b) {
+          const uint8_t qL = plain_nib(plain_row, kbase + c * 8 + b);
+          const uint8_t qH = plain_nib(plain_row, kbase + c * 8 + b + 4);
+          v8c_kblk[c * 4 + b] = (uint8_t)((qH << 4) | qL);
+        }
+      }
+    }
+  }
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+
+  cl_int err = CL_SUCCESS;
+  cl_mem w_buf =
+    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, packed.size(),
+                   packed.data(), &err);
+  if (err != CL_SUCCESS || !w_buf)
+    throw std::runtime_error(
+      "make_v8c_weight_backing_from_qs4cx: clCreateBuffer (weight) failed: " +
+      std::to_string(err));
+  auto backing = std::make_unique<tv::TensorBacking>(
+    ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, packed.size(),
+    /*owned=*/true);
+
+  // Per-channel scale: QS4CX stores fp32 directly (no fp16->fp32 promotion).
+  cl_mem sb = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                             sizeof(float) * N, (void *)fp32_scales, &err);
+  if (err != CL_SUCCESS || !sb)
+    throw std::runtime_error(
+      "make_v8c_weight_backing_from_qs4cx: clCreateBuffer (scale) failed: " +
+      std::to_string(err));
+  *out_scale_buf = sb;
+
+  // Per-channel int4 row sum (Σ_k int4) for the asymmetric-act zero-point
+  // correction — identical to the KAI path, decoded from the v8c bytes.
+  std::vector<int32_t> row_sum_w_int4(N, 0);
+  for (unsigned int n = 0; n < N; ++n) {
+    const uint8_t *row = packed.data() + n * v8c_row_bytes;
+    int32_t s = 0;
+    for (size_t off = 0; off < v8c_row_bytes; ++off) {
+      const uint8_t byte = row[off];
+      s += ((int)(byte & 0x0Fu) - 8) + ((int)((byte >> 4) & 0x0Fu) - 8);
+    }
+    row_sum_w_int4[n] = s;
+  }
+  cl_mem rsw_buf =
+    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                   sizeof(int32_t) * N, row_sum_w_int4.data(), &err);
+  if (err != CL_SUCCESS || !rsw_buf)
+    throw std::runtime_error(
+      "make_v8c_weight_backing_from_qs4cx: clCreateBuffer (row_sum) failed: " +
+      std::to_string(err));
+  *out_row_sum_w_int4_buf = rsw_buf;
+
+  return backing;
+}
+
 // ---------------------------------------------------------------------------
 // 8/4/4 paper attention path: int8(act) × int8(weight) channel-wise GEMM.
 // ---------------------------------------------------------------------------
