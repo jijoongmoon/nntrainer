@@ -62,6 +62,17 @@ void Engine::add_default_object() {
   ensureComputeOps();
   registerContext("cpu", &app_context);
 
+  // [T13] NPU Mode-1 seam: register an "npu" compute context that delegates to
+  // the CPU (AppContext) so a model built with engine=npu constructs and runs
+  // byte-identical to engine=cpu — an all-CPU fallback that needs no NPU HW or
+  // QNN SDK. This is the resolver seam the QNN whole-graph offload (T14) plugs
+  // into: a real NPU/QNN Context can later register under "npu" (registerContext
+  // is a no-op if a name is already taken, so a plugin registering "npu" first
+  // wins). parseComputeEngine validates engine= against the live registry, so
+  // engine=npu now resolves here instead of silently falling back to "cpu".
+  // [docs/ARCHITECTURE_REFACTOR.md §10 Phase 5 T13]
+  registerContext("npu", &app_context);
+
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
   auto &cl_context = nntrainer::ClContext::Global();
 
