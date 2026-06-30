@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
 #
-# Build the Gemma2-2B QINT4-FP16 model used in the 1K benchmark
+# Build the Gemma2-2B QS4CX-FP16 model used in the 1K benchmark
 # (gemma2_lg_q6k): embedding Q6_K, FC QINT4, lm_head Q6_K, FP16 activations.
 #
 # Pipeline (verified to reproduce the tested nntr_config recipe):
 #   1. weight_converter.py : HF Gemma2-2B -> FP32-weights / FP16-norms .bin
-#   2. nntr_quantize       : --fc_dtype QINT4 --embd_dtype Q6_K --lmhead_dtype Q6_K
-#                            => model_tensor_type QINT4-FP16
+#   2. nntr_quantize       : --fc_dtype QS4CX --embd_dtype Q6_K --lmhead_dtype Q6_K
+#                            => model_tensor_type QS4CX-FP16
 #
 # Usage:
 #   build_qint4.sh <hf_gemma2_dir> <out_dir> [nntr_quantize_binary]
@@ -62,9 +62,9 @@ EOF
 
 # 3) quantize to the 1K-benchmark recipe: FC QINT4 + embedding Q6_K + lm_head Q6_K
 "$NNTR_QUANTIZE" "$STAGE" \
-  --fc_dtype QINT4 --embd_dtype Q6_K --lmhead_dtype Q6_K \
+  --fc_dtype QS4CX --embd_dtype Q6_K --lmhead_dtype Q6_K \
   -o "$OUT"
 
 rm -rf "$(dirname "$STAGE")"
-echo "Gemma2-2B QINT4-FP16 (Q6_K embed/lm_head) written to: $OUT"
+echo "Gemma2-2B QS4CX-FP16 (Q6_K embed/lm_head) written to: $OUT"
 echo "Update nntr_config.json:tokenizer_file to the deployed tokenizer.json path before running."

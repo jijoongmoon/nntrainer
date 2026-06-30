@@ -53,14 +53,20 @@ public:
    * FP16 & FP32
    */
   enum class DataType {
-    QINT4,  /** quantized int 4*/
+    QINT4,  /** [DEPRECATED — use QS4CX] per-channel int4 (KAI Section-A on
+               disk). QS4CX is now the canonical int4 weight format (single
+               format read by CPU-KAI / GPU-v8c / CUDA / HexKL-NPU). QINT4 is
+               kept read-only for legacy .bin loading; new models build QS4CX
+               (res/*/build_qs4cx.sh). [Phase C 2026-07-01] */
     QINT8,  /** quantized int 8*/
     QINT16, /** quantized int 16*/
     BCQ,    /** binary-code-based quantized*/
     Q4_K,   /** Q4_K quantized*/
     Q6_K,   /** q6 k quantized */
     Q4_0,   /** Q4_0 k quantized */
-    QS4CX,  /** QS4CX quantized */
+    QS4CX,  /** QS4CX per-channel int4 — CANONICAL int4 weight format (plain
+               row-major nibbles + per-channel fp32 scale). Read natively by the
+               CPU KAI, GPU v8c, CUDA, and (future) HexKL NPU FC paths. */
     UINT4,  /** quantized unsigned int 4*/
     UINT8,  /** unsigned int 8 bit */
     UINT16, /** unsigned int 16 bit */
