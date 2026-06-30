@@ -22,13 +22,53 @@
 #include <cuda_runtime.h>
 
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
+#include <fp16.h>
+#include <int4_utils.h>
 #include <thread_manager.h>
 
 namespace nntrainer::cuda {
+
+// [weight 한벌] Convert a QS4CX plain weight (row-major nibbles + per-channel
+// fp32 scales) to a UVM (cudaMallocManaged) KAI Section-A nibble buffer + fp16
+// scale buffer, cached by the plain-weight pointer. UVM is host-AND-device
+// readable, so the existing QINT4 prewarm (CPU repack) + dp4a/cuBLAS GEMM
+// (device) treat it identically to a native QINT4 weight — same prewarmed fast
+// path, no per-call host->device staging. Done once at load; never under a
+// graph capture (cudaMallocManaged here would otherwise break it).
+bool cuda_fc_qs4cx_to_uvm_seca(const unsigned char *plain,
+                               const float *fp32_scales, unsigned int N,
+                               unsigned int K, const unsigned char **out_secA,
+                               const unsigned short **out_sc) {
+  static std::map<const void *, std::pair<unsigned char *, unsigned short *>>
+    cache;
+  static std::mutex mtx;
+  std::lock_guard<std::mutex> lk(mtx);
+  auto it = cache.find(plain);
+  if (it == cache.end()) {
+    const size_t secA_bytes = Int4Utils::kaiNibblePayloadBytes(N, K);
+    unsigned char *usecA = nullptr;
+    unsigned short *usc = nullptr;
+    if (cudaMallocManaged(&usecA, secA_bytes) != cudaSuccess)
+      return false;
+    if (cudaMallocManaged(&usc, sizeof(unsigned short) * (size_t)N) !=
+        cudaSuccess) {
+      cudaFree(usecA);
+      return false;
+    }
+    Int4Utils::packPlainToSectionA(plain, (size_t)N, (size_t)K, usecA);
+    for (unsigned int n = 0; n < N; ++n)
+      usc[n] = compute_fp32_to_fp16(fp32_scales[n]);
+    it = cache.emplace(plain, std::make_pair(usecA, usc)).first;
+  }
+  *out_secA = it->second.first;
+  *out_sc = it->second.second;
+  return true;
+}
 
 // Per-op cudaStreamSynchronize is ~90% of inference wall time (nsys): each GPU
 // op drains the stream, fully serializing CPU and GPU. This drain is a sync

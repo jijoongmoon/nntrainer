@@ -169,31 +169,18 @@ public:
         const uint8_t *W = weight.getData<uint8_t>();
         const uint16_t *S = weight.getScale<uint16_t>();
         // [weight 한벌] QS4CX plain weight -> reuse the QINT4 Section-A CUDA
-        // path: convert (once, cached) the plain nibbles to KAI Section-A and
-        // the fp32 scales to fp16, so every CUDA dequant-GEMM kernel runs
-        // unchanged. Zero kernel/GEMM change, like the OpenCL v8c path.
+        // path: resolve (once, cached) to a UVM Section-A + fp16 buffer so it is
+        // device-resident exactly like a native QINT4 weight (prewarmed, no
+        // per-call staging, same dp4a/cuBLAS fast path + repack cache).
         if (wt == DT::QS4CX) {
-          static std::map<const void *,
-                          std::pair<std::vector<uint8_t>, std::vector<uint16_t>>>
-            qs4cx_seca_cache;
-          static std::mutex qs4cx_mtx;
-          const void *key = W;
-          std::lock_guard<std::mutex> lk(qs4cx_mtx);
-          auto it = qs4cx_seca_cache.find(key);
-          if (it == qs4cx_seca_cache.end()) {
-            std::vector<uint8_t> seca(
-              Int4Utils::kaiNibblePayloadBytes((size_t)N, (size_t)K));
-            Int4Utils::packPlainToSectionA(W, (size_t)N, (size_t)K, seca.data());
-            std::vector<uint16_t> sc((size_t)N);
-            const float *fs = weight.getScale<float>();
-            for (int n = 0; n < N; ++n)
-              sc[n] = compute_fp32_to_fp16(fs[n]);
-            it = qs4cx_seca_cache
-                   .emplace(key, std::make_pair(std::move(seca), std::move(sc)))
-                   .first;
+          const unsigned char *uW = nullptr;
+          const unsigned short *uS = nullptr;
+          if (cuda::cuda_fc_qs4cx_to_uvm_seca(W, weight.getScale<float>(),
+                                              (unsigned)N, (unsigned)K, &uW,
+                                              &uS)) {
+            W = uW;
+            S = uS;
           }
-          W = it->second.first.data();
-          S = it->second.second.data();
         }
         if (!nntrainer::cuda::dev_accessible(W)) {
           const uint8_t *dW = nullptr;

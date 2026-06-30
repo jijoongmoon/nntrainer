@@ -210,6 +210,23 @@ bool cuda_fc_qint4_stage_host_weight(const unsigned char *host_secA,
                                      const unsigned short **dev_scales);
 
 /**
+ * @brief [weight 한벌] Convert a QS4CX plain weight (row-major nibbles +
+ *        per-channel fp32 scales) to a cached UVM KAI Section-A nibble buffer +
+ *        fp16 scales, so the QINT4 prewarm + GEMM fast path consume it like a
+ *        native QINT4 weight (no per-call staging). Call once at load (not under
+ *        graph capture). Cached by the plain-weight pointer.
+ * @param plain       QS4CX plain nibble payload (getData<uint8_t>())
+ * @param fp32_scales per-channel fp32 scales (getScale<float>())
+ * @param out_secA    out: UVM Section-A pointer (host+device readable)
+ * @param out_sc      out: UVM fp16 scales pointer
+ * @return true on success
+ */
+bool cuda_fc_qs4cx_to_uvm_seca(const unsigned char *plain,
+                               const float *fp32_scales, unsigned int N,
+                               unsigned int K, const unsigned char **out_secA,
+                               const unsigned short **out_sc);
+
+/**
  * @brief High-accuracy fp16 path: FP32-precision activation (no int8 quant),
  *        naive Section-A decode-GEMM. Selected by NNTR_FC_CUDA_DP4A=0 for an
  *        fp16 activation (and as an accuracy reference vs the dp4a w4a8 path).

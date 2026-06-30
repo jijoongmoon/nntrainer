@@ -889,13 +889,24 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             return;
           for (unsigned int w = 0; w < ctx.getNumWeights(); ++w) {
             nntrainer::Tensor &wt = ctx.getWeight(w);
-            if (wt.getDataType() != ml::train::TensorDim::DataType::QINT4)
-              continue;
-            const unsigned char *secA = wt.getData<uint8_t>();
-            const bool dev = nntrainer::cuda::dev_accessible(secA);
-            if (dev)
-              nntrainer::cuda::cuda_fc_qint4_prewarm(secA, wt.width(),
-                                                     wt.height());
+            const auto wdt = wt.getDataType();
+            if (wdt == ml::train::TensorDim::DataType::QINT4) {
+              const unsigned char *secA = wt.getData<uint8_t>();
+              if (nntrainer::cuda::dev_accessible(secA))
+                nntrainer::cuda::cuda_fc_qint4_prewarm(secA, wt.width(),
+                                                       wt.height());
+            } else if (wdt == ml::train::TensorDim::DataType::QS4CX) {
+              // [weight 한벌] QS4CX -> UVM Section-A (cached, shared with the
+              // GEMM path) then prewarm exactly like a QINT4 weight, so QS4CX
+              // gets the same device-resident fast path + repack cache.
+              const unsigned char *uW = nullptr;
+              const unsigned short *uS = nullptr;
+              if (nntrainer::cuda::cuda_fc_qs4cx_to_uvm_seca(
+                    wt.getData<uint8_t>(), wt.getScale<float>(), wt.width(),
+                    wt.height(), &uW, &uS))
+                nntrainer::cuda::cuda_fc_qint4_prewarm(uW, wt.width(),
+                                                       wt.height());
+            }
           }
         };
       model->forEachLayer(fn, nullptr);
