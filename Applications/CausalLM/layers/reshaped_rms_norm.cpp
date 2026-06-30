@@ -29,7 +29,7 @@
 #include <cuda_stream_manager.h>
 #endif
 
-#include "_layer_prof.h"
+#include <layer_prof.h>
 
 namespace causallm {
 
@@ -74,7 +74,7 @@ void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
 void ReshapedRMSNormLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  causallm::LayerProfScope _prof("rms_norm", (to - from) == 1);
+  nntrainer::LayerProfScope _prof("rms_norm", (to - from) == 1);
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);

@@ -7,12 +7,15 @@ llm_layer_sources = [
   'qkv_layer.cpp',
   'geglu_layer.cpp',
   'swiglu_layer.cpp',
+  'lm_head.cpp', # untied host lm_head FC (no OpenCL) [T12 Wave B]
   # tie_word_embedding's OpenCL lm_head GEMV is #if defined(ENABLE_OPENCL)-guarded
   # internally, so it compiles host-only without OpenCL (the FP32 unittest build).
   'tie_word_embedding.cpp',
 ]
 
 llm_layer_headers = [
+  'layer_prof.h', # env-gated per-layer profiler (header-only) [T12 Wave B]
+  'lm_head.h',
   'logit_softcapping.h',
   'scalar_multiply.h',
   'scalar_multiply_gpu.h',

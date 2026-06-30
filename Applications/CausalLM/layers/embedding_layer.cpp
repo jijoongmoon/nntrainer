@@ -11,7 +11,7 @@
  * @note   This embedding layer supports FP32/FP16/Q6_K data type only.
  */
 
-#include "_layer_prof.h"
+#include <layer_prof.h>
 #if defined(ENABLE_OPENCL)
 // OpenCL GPU residency handoff (clmem_raise_cl / cl_svm_unmap_force). Guarded so
 // the FP32 CPU build (enable-opencl=false) compiles as a host-only embedding. [T12]
@@ -102,13 +102,13 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
                                 bool training) {
-  causallm::LayerProfScope _prof("embedding_fwd", false);
+  nntrainer::LayerProfScope _prof("embedding_fwd", false);
 }
 
 void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
                                             bool training) {
-  causallm::LayerProfScope _prof("embedding", (to - from) == 1);
+  nntrainer::LayerProfScope _prof("embedding", (to - from) == 1);
 
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);

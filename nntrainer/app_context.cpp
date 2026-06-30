@@ -38,6 +38,7 @@
 #include <addition_layer.h>
 #include <attention_layer.h>
 #include <geglu_layer.h> // LLM layers promoted to core [T12]
+#include <lm_head.h>
 #include <logit_softcapping.h>
 #include <qkv_layer.h>
 #include <scalar_multiply.h>
@@ -467,6 +468,9 @@ void AppContext::add_default_object() {
   // Was previously registered only on the CL/CUDA contexts; needed on cpu too so
   // engine=cpu (the FP32 reference / Gemma models) finds it. [T12]
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  // lm_head (untied host lm_head FC): promoted from the app cpu registration.
+  // Host-only (no GPU variant); only untied models construct it. [T12 Wave B]
+  registerFactory(nntrainer::createLayer<LmHeadLayer>, LmHeadLayer::type);
   // tie_word_embedding: the GPU lm_head GEMV is internally #if ENABLE_OPENCL, so
   // the layer compiles host-only without OpenCL — register unconditionally so the
   // models (lm_head) construct on the FP32 reference / CPU build too. [T12]

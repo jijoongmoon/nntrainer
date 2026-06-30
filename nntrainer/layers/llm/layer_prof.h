@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Tiny env-gated per-layer wall-clock profiler for prefill/decode breakdown.
 // Activated via NNTR_LAYER_PROFILE=1. Dumps an aggregated table at process exit.
+// Promoted from Applications/CausalLM/layers/_layer_prof.h to core [T12 Wave B].
 
 #pragma once
 
@@ -11,7 +12,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace causallm {
+namespace nntrainer {
 
 struct LayerProfAgg {
   long long ns_pre = 0;     // M > 1
@@ -98,4 +99,4 @@ struct LayerProfScope {
   }
 };
 
-} // namespace causallm
+} // namespace nntrainer

@@ -46,7 +46,6 @@
 #include <cuda_context.h>
 #endif
 #include <layer_context.h>
-#include <lm_head.h>
 #include <mha_core.h>
 #include <reshaped_rms_norm.h>
 #include <nntrainer_error.h>
@@ -596,13 +595,7 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 void CausalLM::registerCustomLayers() {
   Transformer::registerCustomLayers();
   const auto &ct_engine = nntrainer::Engine::Global();
-  try {
-    ct_engine.registerLayerFactory(
-      "cpu", nntrainer::createLayer<causallm::LmHeadLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-  }
+  // lm_head promoted to core app_context.cpp (cpu) [T12 Wave B].
 
   // Register ReshapedRMSNormLayer on the GPU (cl) context once, centrally, so
   // ANY model can build its per-head q/k/v norms with engine=GPU and keep them

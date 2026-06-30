@@ -63,7 +63,7 @@ static unsigned int min_prefill_thr() {
   return v;
 }
 
-#include "_layer_prof.h"
+#include <layer_prof.h>
 #if defined(ENABLE_OPENCL)
 // OpenCL attention/blas kernel interfaces (GPU attention + clmem residency).
 // Guarded so the no-OpenCL CPU build compiles the host attention path. [T12]
@@ -1124,7 +1124,7 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
-  causallm::LayerProfScope _prof("mha_core", (_to - _from) == 1);
+  nntrainer::LayerProfScope _prof("mha_core", (_to - _from) == 1);
   // External KV cache path: from/to are interpreted as the absolute write
   // position; route through forwarding() which reads cache_key/cache_value
   // from input slots 3/4. forwarding() advances cache_index internally.
