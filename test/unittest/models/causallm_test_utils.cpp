@@ -660,6 +660,15 @@ void runQ40DifferentialChecks(const DifferentialModel &model) {
 }
 
 void runQINT4DifferentialChecks(const DifferentialModel &model) {
+#if !defined(__aarch64__) && !defined(__ARM_NEON)
+  // QINT4 weights are loaded into the KAI (KAI_QSI4CXP_4x4x32) osv32/Section-A
+  // layout with per-channel fp16 scales; that int4 dequant/matmul path is
+  // ARM-NEON-only (i8mm). There is no x86 cpu dequant for it, so the QINT4 ->
+  // FP32 reference comparison cannot run on a non-ARM build. (Q40 has a portable
+  // cpu path and its differential test runs everywhere.)
+  GTEST_SKIP() << "QINT4 uses the NEON-only KAI int4 packing; no x86 cpu dequant "
+                  "path — skipping on this non-ARM build.";
+#endif
   std::filesystem::path fixture_dir;
   ReferenceFixture fixture;
   std::string skip_reason;
