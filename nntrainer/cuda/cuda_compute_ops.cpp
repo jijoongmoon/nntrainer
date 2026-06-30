@@ -29,7 +29,13 @@
 #include <cuda_elementwise.h>
 #include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
+#include <fp16.h>
 #include <int4_tensor.h>
+#include <int4_utils.h>
+#include <map>
+#include <mutex>
+#include <utility>
+#include <vector>
 #endif
 
 namespace nntrainer {
@@ -153,8 +159,8 @@ public:
 
     // QINT4 weight: fused dequant-GEMM on device (KAI Section-A layout). Default
     // ON; the host Tensor::dot path is NYI for QINT4 on x86 (KAI ARM-only).
-    if (wt == DT::QINT4 && (at == DT::FP32 || at == DT::FP16) && M > 0 &&
-        N > 0 && K > 0) {
+    if ((wt == DT::QINT4 || wt == DT::QS4CX) &&
+        (at == DT::FP32 || at == DT::FP16) && M > 0 && N > 0 && K > 0) {
       static const bool seca_enabled = []() {
         const char *e = std::getenv("NNTR_FC_CUDA_QINT4");
         return !(e != nullptr && e[0] == '0');
@@ -162,6 +168,33 @@ public:
       if (seca_enabled && (int)weight.getDim().height() == K) {
         const uint8_t *W = weight.getData<uint8_t>();
         const uint16_t *S = weight.getScale<uint16_t>();
+        // [weight 한벌] QS4CX plain weight -> reuse the QINT4 Section-A CUDA
+        // path: convert (once, cached) the plain nibbles to KAI Section-A and
+        // the fp32 scales to fp16, so every CUDA dequant-GEMM kernel runs
+        // unchanged. Zero kernel/GEMM change, like the OpenCL v8c path.
+        if (wt == DT::QS4CX) {
+          static std::map<const void *,
+                          std::pair<std::vector<uint8_t>, std::vector<uint16_t>>>
+            qs4cx_seca_cache;
+          static std::mutex qs4cx_mtx;
+          const void *key = W;
+          std::lock_guard<std::mutex> lk(qs4cx_mtx);
+          auto it = qs4cx_seca_cache.find(key);
+          if (it == qs4cx_seca_cache.end()) {
+            std::vector<uint8_t> seca(
+              Int4Utils::kaiNibblePayloadBytes((size_t)N, (size_t)K));
+            Int4Utils::packPlainToSectionA(W, (size_t)N, (size_t)K, seca.data());
+            std::vector<uint16_t> sc((size_t)N);
+            const float *fs = weight.getScale<float>();
+            for (int n = 0; n < N; ++n)
+              sc[n] = compute_fp32_to_fp16(fs[n]);
+            it = qs4cx_seca_cache
+                   .emplace(key, std::make_pair(std::move(seca), std::move(sc)))
+                   .first;
+          }
+          W = it->second.first.data();
+          S = it->second.second.data();
+        }
         if (!nntrainer::cuda::dev_accessible(W)) {
           const uint8_t *dW = nullptr;
           const uint16_t *dS = nullptr;
