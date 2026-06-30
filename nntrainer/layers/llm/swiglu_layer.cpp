@@ -87,31 +87,31 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
   }
 #endif
 
-  // active-row decision (unifies the former SwiGLULayerCl branches; mirrors
-  // GeGLULayer except the SVM/host path offsets the pointer to row `from`):
-  //  - all-cl_mem fp16 decode: the producers write the live token to row 0, so
-  //    process exactly 1 row at the buffer base (O(1); also avoids the
+  // active-row decision -- mirror GeGLULayer EXACTLY: the producers write the
+  // live decode token to row 0 on every backend (cl_mem, SVM, and host), so the
+  // row offset is always 0; only the row COUNT differs. (The earlier
+  // `row_offset = from` on the host branch was wrong -- it read the wrong row for
+  // engine=cpu decode, diverging the FP32 reference; the GPU branches and the
+  // GeGLU host branch all use offset 0, and engine=gpu was token-identical only
+  // because it never took this host branch.)
+  //  - all-cl_mem fp16 decode: exactly 1 row at the buffer base (also avoids the
   //    one-row-out-of-bounds cl_mem write the old [0,to) branch could trigger).
-  //  - any other cl_mem (mixed / fp32): process the whole [0,to) window.
-  //  - SVM/host: process rows [from, to) by offsetting the pointer to `from`.
+  //  - any other cl_mem (mixed / fp32): the whole [0,to) window.
+  //  - SVM/host: [0, to-from) (== row 0 for decode, the live token's slot).
   const bool any_clmem = in1.isClMem() || in2.isClMem() || out.isClMem();
   const bool all_clmem = in1.isClMem() && in2.isClMem() && out.isClMem();
   const bool is_fp16 =
     in1.getDataType() == ml::train::TensorDim::DataType::FP16;
 
-  unsigned int active_rows, row_offset;
-  if (from && all_clmem && is_fp16) {
+  unsigned int active_rows;
+  if (from && all_clmem && is_fp16)
     active_rows = 1;
-    row_offset = 0;
-  } else if (any_clmem) {
+  else if (any_clmem)
     active_rows = to;
-    row_offset = 0;
-  } else {
+  else
     active_rows = to - from;
-    row_offset = from;
-  }
 
-  in1.getOps()->swiglu(in1, in2, out, active_rows, row_offset);
+  in1.getOps()->swiglu(in1, in2, out, active_rows, /*row_offset=*/0);
 }
 
 void SwiGLULayer::calcDerivative(RunLayerContext &context) {
