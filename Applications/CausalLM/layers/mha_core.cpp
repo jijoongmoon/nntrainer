@@ -64,15 +64,22 @@ static unsigned int min_prefill_thr() {
 }
 
 #include "_layer_prof.h"
+#if defined(ENABLE_OPENCL)
+// OpenCL attention/blas kernel interfaces (GPU attention + clmem residency).
+// Guarded so the no-OpenCL CPU build compiles the host attention path. [T12]
 #include <attention_kernels.h>
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
+#endif
 #include <fp16.h>
 #include <layer_context.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
+#if defined(ENABLE_OPENCL)
+// recq_overrides.h pulls opencl_command_queue_manager.h (cl_*_qcom). [T12]
 #include <recq_overrides.h>
+#endif
 #include <thread_manager.h>
 #include <util_func.h>
 
@@ -473,6 +480,9 @@ rope_lut_device(std::vector<std::vector<_FP16>> *table, int half) {
 // loop (causal_lm) to rebuild per-token override arrays. Single-threaded decode
 // path, so no lock needed.
 // ---------------------------------------------------------------------------
+#if defined(ENABLE_OPENCL)
+// recq (record/replay) registry: uses RecqOverride + nntrainer::opencl::
+// cl_*_qcom types from recq_overrides.h, OpenCL-only. [T12]
 static std::vector<RecqOverride> &recq_registry() {
   static std::vector<RecqOverride> v;
   return v;
@@ -530,6 +540,7 @@ void recq_build_token_overrides(
                     &int_scratch.back()});
   }
 }
+#endif // ENABLE_OPENCL (recq registry) [T12]
 
 #define tile_size 4
 
@@ -628,11 +639,14 @@ MHACoreLayer::~MHACoreLayer() {
   // Release the Adreno image-attention OHWI mirrors / image views, if any.
   // Routed through libnntrainer (release_cl_mem) so this layer needn't link
   // OpenCL directly.
+#if defined(ENABLE_OPENCL)
+  // [T12] release_cl_mem is OpenCL-only; the mirror handles stay null without it.
   nntrainer::release_cl_mem(k_image_ohwi);
   nntrainer::release_cl_mem(v_image_ohwi);
   nntrainer::release_cl_mem(v_image_tight);
   nntrainer::release_cl_mem(k_buf_ohwi);
   nntrainer::release_cl_mem(v_buf_ohwi);
+#endif
 }
 
 /************************************************************** */
@@ -817,6 +831,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   // only -- no forward-path command ordering changes.
   if (theta > 0.0f && head_dim > 0 && head_dim % 2 == 0)
     ensure_rope_flat_lut();
+#if defined(ENABLE_OPENCL)
+  // OHWI K/V mirror + image-view prebuild (create_ohwi_kv_mirror etc.) is
+  // OpenCL-only. [T12]
   if (std::getenv("NNTR_KV_IMG_ATTN") != nullptr && !kv_int8 &&
       head_dim % 8 == 0 && !kv_mirror_init) {
     static const unsigned int mirror_cap = []() {
@@ -858,6 +875,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
                           // the lazy-init failure path)
     }
   }
+#endif // ENABLE_OPENCL (OHWI mirror prebuild) [T12]
 #endif
 }
 
@@ -1549,12 +1567,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   void *q_attn_clmem = q_cl;
   void *q_rope_staged = nullptr;
   auto lower_q = [&]() {
+#if defined(ENABLE_OPENCL)
     if (q_cl) {
       nntrainer::clmem_lower_cl(query_step, 0);
       q_cl = nullptr;
     }
+#endif // [T12] clmem_lower_cl is OpenCL-only; q_cl is null without it
   };
   auto lower_kv = [&]() {
+#if defined(ENABLE_OPENCL)
     if (k_cl) {
       nntrainer::clmem_lower_cl(key_step, 0);
       k_cl = nullptr;
@@ -1563,6 +1584,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       nntrainer::clmem_lower_cl(value_step, 0);
       v_cl = nullptr;
     }
+#endif // [T12]
   };
 
   // NNTR_CLMEM_MHA_LOWER=1 (bisect): lower Q/K/V at entry unconditionally --
@@ -1578,11 +1600,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     bool any = q_cl || k_cl || v_cl;
     lower_q();
     lower_kv();
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+    // cl_svm_unmap_force lives in the FP16 OpenCL kernel block. [T12]
     if (any) {
       nntrainer::cl_svm_unmap_force(query_step.getData<uint8_t>());
       nntrainer::cl_svm_unmap_force(key_step.getData<uint8_t>());
       nntrainer::cl_svm_unmap_force(value_step.getData<uint8_t>());
     }
+#else
+    (void)any;
+#endif
   }
 
   // Kernel-chain K/V staging (drain removal). When the Adreno image attention
@@ -1696,6 +1723,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   } else if (use_rope) {
     bool gpu_rope_done = false;
 #ifdef ENABLE_FP16
+#if defined(ENABLE_OPENCL) // [T12] GPU concat-RoPE (rope_inplace_f16_cl) path
     // GPU-resident RoPE (residency): rotate Q in place and K into its cache
     // slice on the device, so the activation never bounces to the host. Active
     // only when the GPU attention path will follow (same NNTR_MHA_GPU +
@@ -1933,8 +1961,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         }
       }
     }
+#endif // ENABLE_OPENCL (GPU concat-RoPE) [T12]
 #endif
 #ifdef ENABLE_FP16
+#if defined(ENABLE_OPENCL) // [T12] OHWI image GPU-RoPE (rope_inplace_f16_cl)
     // ---- (C) Adreno OHWI image-attention DECODE GPU-RoPE ---------------------
     // The concat GPU-RoPE branch above is gated `!kv_ohwi_now`, but the live
     // Adreno gemma4 decode path is the IMAGE-attention path (NNTR_KV_IMG_ATTN),
@@ -2123,7 +2153,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // Q/K/V over them after lower_q/lower_kv).
       }
     }
+#endif // ENABLE_OPENCL (OHWI image GPU-RoPE) [T12]
 #endif
+#if defined(ENABLE_OPENCL) // [T12] GPU-RoPE debug log refs guarded kv_ohwi_now
     if (std::getenv("NNTR_ROPE_TPROF")) {
       static int _dbg_pf = 0, _dbg_dec = 0;
       const bool _dec = (to - from) == 1;
@@ -2136,6 +2168,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         std::fflush(stderr);
       }
     }
+#endif
     if (!gpu_rope_done) {
       // Host RoPE reads/writes Q/K/V on the host: lower first (decode and any
       // GPU-RoPE-ineligible path).
@@ -2430,6 +2463,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // rows the slab is missing back into the concat SVM slab, capped by the
   // mirror's valid range, then drain once so the host may read immediately.
   auto sync_kv_slab = [&](unsigned int upto) {
+#if defined(ENABLE_OPENCL)
+    // OHWI mirror gather (k_gather_ohwi_cl / v_gather_ohwi_t_cl, cl_mem) is
+    // OpenCL-only; no mirror exists without it. [T12]
     if (!mha_clmem_mode || !kv_mirror_init)
       return;
     if (upto > kv_k_valid_to)
@@ -2456,6 +2492,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       kv_v_cur_stride != 0 ? kv_v_cur_stride : kv_mirror_S_max,
       kv_slab_synced_to, /*drain=*/true);
     kv_slab_synced_to = upto;
+#else
+    (void)upto;
+#endif // ENABLE_OPENCL (sync_kv_slab) [T12]
   };
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
@@ -2500,6 +2539,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         head_dim > 0 && num_heads_KV > 0 &&
         num_heads_Q % num_heads_KV == 0) {
 #ifdef ENABLE_FP16
+#if defined(ENABLE_OPENCL) // [T12] OHWI-direct GPU prefill attention
       const uint16_t *Q_p =
         reinterpret_cast<const uint16_t *>(query_step.getData<_FP16>());
       uint16_t *O_p = reinterpret_cast<uint16_t *>(
@@ -2560,6 +2600,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         if (ok)
           return;
       }
+#endif // ENABLE_OPENCL (OHWI-direct GPU prefill) [T12]
 #endif
     }
   }
@@ -2637,6 +2678,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         head_dim > 0 && num_heads_KV > 0 &&
         num_heads_Q % num_heads_KV == 0) {
 #ifdef ENABLE_FP16
+#if defined(ENABLE_OPENCL) // [T12] GPU two-conv/image/flash attention path
       const uint16_t *Q_p =
         reinterpret_cast<const uint16_t *>(query_step.getData<_FP16>());
       uint16_t *O_p = reinterpret_cast<uint16_t *>(
@@ -3066,6 +3108,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         }
         return;
       }
+#endif // ENABLE_OPENCL (GPU two-conv/image/flash attention) [T12]
 #endif
     }
     // Host/NEON attention reads Q and writes O on the host.
@@ -3075,8 +3118,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       kv_slab_synced_to = cache_to; // this step's rows were host-written
     gemm_attention(query_step, b_cached_key, b_cached_value,
                    attention_output_step, cache_to, step_size, cache_from);
+    // [T12] raise host-written O into its planner cl_mem (OpenCL-only)
+#if defined(ENABLE_OPENCL)
     if (o_cl != nullptr)
       nntrainer::clmem_raise_cl(attention_output_step, 0);
+#endif
     return;
   }
 
@@ -3109,8 +3155,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
                                 cache_to);
+#if defined(ENABLE_OPENCL)
   if (o_cl != nullptr)
     nntrainer::clmem_raise_cl(attention_output_step, 0);
+#endif
 }
 
 #if defined(__ARM_NEON)
@@ -3922,6 +3970,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // variant is not cl_mem-converted -- lower any resident I/O up front and
   // raise the output at exit so a GPU_CLMEM classification cannot leave it
   // reading/writing a stale plane. No-ops when the classes are SVM.
+#if defined(ENABLE_OPENCL)
+  // [T12] GPU_CLMEM lower/raise bridge is OpenCL-only (I/O is plain host memory
+  // without it).
   if (query_step.isClMem())
     nntrainer::clmem_lower_cl(query_step, 0);
   if (key_step.isClMem())
@@ -3935,6 +3986,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         nntrainer::clmem_raise_cl(t, 0);
     }
   } _oraise{attention_output_step};
+#endif
 
   /**
    *  cache_key

@@ -12,8 +12,12 @@
  */
 
 #include "_layer_prof.h"
+#if defined(ENABLE_OPENCL)
+// OpenCL GPU residency handoff (clmem_raise_cl / cl_svm_unmap_force). Guarded so
+// the FP32 CPU build (enable-opencl=false) compiles as a host-only embedding. [T12]
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
+#endif
 #include <embedding_layer.h>
 #include <layer_context.h>
 #include <memory_data.h>
@@ -267,17 +271,24 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // addition) reads fresh data instead of a stale host-mapped shadow. This is
   // looked up EVERY token (prefill + each decode step), so a missing handoff
   // corrupts every step. No-op when not SVM-resident. Mirror TieWordEmbedding.
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+  // SVM residency hand-back is FP16-OpenCL-only; guard so the FP32/no-OpenCL
+  // build compiles as host-only. [T12]
   {
     const auto h_md = hidden_.getMemoryData();
     if (h_md && h_md->isSVM())
       nntrainer::cl_svm_unmap_force(hidden_.getData<uint8_t>());
   }
+#endif
   // GPU_CLMEM residency: upload host-written rows into the planner cl_mem
   // sub-buffer so GPU consumers read fresh device memory. No-op when the class
   // is SVM (handled above).
+#if defined(ENABLE_OPENCL)
+  // GPU cl_mem device-upload; no-op on the no-OpenCL host build. [T12]
   nntrainer::clmem_raise_cl(
     hidden_, (unsigned int)((size_t)(to - from) * out_dim *
                             hidden_.getDim().getDataTypeSize()));
+#endif
 }
 
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {

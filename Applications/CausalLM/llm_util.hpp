@@ -103,7 +103,14 @@ static std::string causallm_engine() {
       if (s == "cuda") // additive NVIDIA CUDA backend (engine=cuda)
         return "cuda";
     }
+#if defined(ENABLE_OPENCL)
     return "gpu";
+#else
+    // No OpenCL "gpu" Context is registered in this build (e.g. the FP32 CPU
+    // reference / unittest build), so default to cpu instead of throwing
+    // "[Engine] gpu Context is not registered" at model build. [T12]
+    return "cpu";
+#endif
   }();
   return eng;
 }

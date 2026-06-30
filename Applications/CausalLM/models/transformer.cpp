@@ -13,7 +13,10 @@
 #include <fstream>
 
 #include <app_context.h>
-#include <cl_context.h>
+#if defined(ENABLE_OPENCL)
+#include <cl_context.h> // GPU registration goes via the Engine facade now; the
+                        // header is OpenCL-only -> guard for the no-OpenCL build.
+#endif
 #include <engine.h>
 #include <model.h>
 

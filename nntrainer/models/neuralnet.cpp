@@ -557,10 +557,13 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   return forwarding(training);
 }
 
-// recq R4 lightweight feed pass (defined in libnntrainer blas_kernels.cpp):
-// true while the decode loop runs a host-only forward to refresh the embedding
-// output; lets us skip every non-input-embedding node's host forward.
+// recq R4 lightweight feed pass (defined in libnntrainer blas_kernels.cpp, the
+// OpenCL recordable-queue path): true while the decode loop runs a host-only
+// forward to refresh the embedding output; lets us skip every non-input-embedding
+// node's host forward. OpenCL-only -- guarded so the no-OpenCL build links. [T12]
+#if defined(ENABLE_OPENCL)
 bool recq_skip_all_active();
+#endif
 
 // CUDA M2-B embed-only feed flag (decoupled from the OpenCL recq skip): true
 // while the single-capture replay re-runs ONLY the embedding nodes to refresh the
@@ -623,8 +626,13 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     // residual seed for this token); skip every other node's host forward so the
     // GPU forward is supplied solely by the recorded-chain replay (lightweight
     // feed -- avoids re-running the full per-layer host iteration).
+#if defined(ENABLE_OPENCL)
     static const bool _recq_feed = std::getenv("NNTR_RECQ_REPLAY") != nullptr;
-    if ((_recq_feed && recq_skip_all_active()) || g_m2b_skip_all) {
+    const bool _recq_skip = _recq_feed && recq_skip_all_active();
+#else
+    const bool _recq_skip = false; // OpenCL recordable-queue path absent [T12]
+#endif
+    if (_recq_skip || g_m2b_skip_all) {
       const std::string &nm = node->getName();
       if (nm != "embedding0" && nm != "per_layer_input_embedding")
         return;

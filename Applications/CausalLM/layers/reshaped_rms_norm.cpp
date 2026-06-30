@@ -15,7 +15,11 @@
 #include <cpu_backend.h>
 #include <reshaped_rms_norm.h>
 
+#if defined(ENABLE_OPENCL)
+// OpenCL GPU rmsnorm kernels (rmsnorm_cl / rmsnorm_cl_fp16 / cl_svm_*). Guarded so
+// the FP32 CPU build (enable-opencl=false) compiles host-only. [T12]
 #include <blas_kernels.h>
+#endif
 #include <memory_data.h>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
@@ -172,6 +176,9 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       std::fflush(stderr);
     }
     bool gpu_done = false;
+#if defined(ENABLE_OPENCL)
+    // GPU-resident SVM rmsnorm dispatch. Without OpenCL gpu_done stays false and
+    // the host RMSNorm loop below runs. [T12]
     if (use_svm) {
       if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
         nntrainer::rmsnorm_cl(in_step.getData<float>(), gamma->getData<float>(),
@@ -208,6 +215,7 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       gpu_done = true;
 #endif
     }
+#endif // ENABLE_OPENCL [T12]
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     // CUDA per-head norm: each feature_size chunk is one rmsnorm row, so reuse
@@ -254,6 +262,8 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       const bool fp16_svm =
         in_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         in_md && in_md->isSVM() && out_md && out_md->isSVM();
+#if defined(ENABLE_OPENCL)
+      // SVM map/drain is OpenCL-only (fp16_svm is always false without SVM). [T12]
       if (fp16_svm) {
         nntrainer::cl_queue_finish();
         nntrainer::cl_svm_map_force(in_step.getData<_FP16>(),
@@ -263,6 +273,7 @@ void ReshapedRMSNormLayer::incremental_forwarding(
                                     (size_t)out_step.size() * sizeof(_FP16),
                                     /*read_only=*/false);
       }
+#endif
 #endif
       if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
         ///@todo rms_norm_wrt_width_something() should be refactored to
@@ -298,8 +309,11 @@ void ReshapedRMSNormLayer::incremental_forwarding(
         out_step.multiply_i(*gamma);
 #ifdef ENABLE_FP16
       // Hand the host-written output back to the device for the next consumer.
+#if defined(ENABLE_OPENCL)
+      // OpenCL-only SVM hand-back. [T12]
       if (fp16_svm)
         nntrainer::cl_svm_unmap_force(out_step.getData<_FP16>());
+#endif
 #endif
     }
 

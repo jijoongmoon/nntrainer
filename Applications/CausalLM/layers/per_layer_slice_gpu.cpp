@@ -8,7 +8,11 @@
 
 #include "per_layer_slice_gpu.h"
 
+#if defined(ENABLE_OPENCL)
+// OpenCL GPU FP16 slice kernel (per_layer_slice_cl_fp16). Guarded so the
+// no-OpenCL build (enable-opencl=false) compiles via the host memcpy path. [T12]
 #include <blas_kernels.h>
+#endif
 #include <cstring>
 
 namespace causallm {
@@ -70,6 +74,9 @@ void PerLayerSliceLayerGPU::incremental_forwarding(
     const unsigned int rows = in_step_dim.height();
 
 #ifdef ENABLE_FP16
+#if defined(ENABLE_OPENCL)
+    // GPU SVM/cl_mem FP16 slice path; falls through to host memcpy below
+    // when OpenCL is off. [T12]
     const auto in_md = in_step.getMemoryData();
     const auto out_md = out_step.getMemoryData();
     const bool use_svm =
@@ -84,6 +91,7 @@ void PerLayerSliceLayerGPU::incremental_forwarding(
         in_width, off, /*use_svm=*/true, out_cl, in_cl);
       continue;
     }
+#endif // ENABLE_OPENCL [T12]
 #endif
 
     // Raw-pointer host fallback (FP32 / non-SVM).

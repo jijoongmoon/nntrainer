@@ -37,7 +37,9 @@
 #include <compute_ops.h>
 #include <neuralnet.h>
 
-#include <cl_context.h>
+#if defined(ENABLE_OPENCL)
+#include <cl_context.h> // OpenCL-only; registration uses the Engine facade. [T12]
+#endif
 #include <common.h>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
@@ -53,7 +55,10 @@
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
+#if defined(ENABLE_OPENCL)
 #include <recq_overrides.h> // R3/R4 record/replay override registry + CL types
+                            // (pulls opencl_command_queue_manager.h) -> OpenCL-only [T12]
+#endif
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_attention.h>
@@ -71,8 +76,10 @@ namespace nntrainer {
 void request_gpu_argmax(bool on);
 bool consume_gpu_argmax(unsigned int *tok);
 // recq (R4): read the 4-byte on-GPU argmax token on the host-I/O queue after a
-// recorded-chain replay (waiting on the replay event).
+// recorded-chain replay (waiting on the replay event). cl_event -> OpenCL-only [T12]
+#if defined(ENABLE_OPENCL)
 bool recq_read_argmax_io(unsigned int *tok, cl_event wait_evt);
+#endif
 } // namespace nntrainer
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
@@ -493,8 +500,10 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
   std::vector<unsigned int> outputs;
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
 
+#if defined(ENABLE_OPENCL)
     // On-GPU greedy argmax already produced the token (lm_head logits never left
     // the GPU; only the 4-byte id came back). Only set under pure-greedy gating.
+    // OpenCL-only -> on the no-OpenCL build the host sampler below runs. [T12]
     {
       unsigned int gpu_tok = 0;
       if (nntrainer::consume_gpu_argmax(&gpu_tok)) {
@@ -504,6 +513,7 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
         continue;
       }
     }
+#endif
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     // CUDA on-GPU greedy argmax (NNTR_CUDA_ARGMAX): reduce the device-resident
@@ -631,9 +641,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // GPU, reduce to the token id on-device, read back only 4 bytes (vs the full
   // V-vocab D->H pass + host max_element). Only safe for pure greedy: no
   // sampling, no bad-words penalty (those mutate logits on host), batch == 1.
+#if defined(ENABLE_OPENCL)
   nntrainer::request_gpu_argmax(std::getenv("NNTR_GPU_ARGMAX") != nullptr &&
                                 !do_sample && BAD_WORD_IDS.empty() &&
                                 BATCH_SIZE == 1);
+#endif
   if (!is_initialized) {
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
@@ -987,9 +999,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // override+argmax path is proven (the full per-token replay loop additionally
   // needs the per-token input-placeholder feed). Gated NNTR_RECQ_REPLAY +
   // NNTR_SVM_RESIDENT (host-op-zero forward). Default off => unchanged.
+#if defined(ENABLE_OPENCL) // [T12] recq (OpenCL recordable-queue) decode state
   static const bool _recq_replay = std::getenv("NNTR_RECQ_REPLAY") != nullptr;
   auto &_cqm = nntrainer::opencl::CommandQueueManager::Global();
   bool _recq_recorded = false;
+#endif
 
   for (unsigned int token_generation_idx = input_len + 1;
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
@@ -999,6 +1013,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     const unsigned int _recq_ci = token_generation_idx - 1 + global_token_len;
     std::vector<float *> output_interval;
     bool _did_replay = false;
+#if defined(ENABLE_OPENCL) // [T12] recq record/replay path (OpenCL-only)
     if (_recq_replay && _cqm.getRecordableQueue() != nullptr) {
       if (!_recq_recorded) {
         // First decode token: RECORD the full forward (capture-only). The host
@@ -1045,6 +1060,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                        _recq_ci);
       }
     }
+#endif // ENABLE_OPENCL (recq record/replay) [T12]
     if (!_did_replay)
       output_interval = incrementalInference(BATCH_SIZE, input, input_len,
                                              _recq_ci, _recq_ci + 1);

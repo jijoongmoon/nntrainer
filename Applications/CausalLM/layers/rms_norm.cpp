@@ -19,7 +19,12 @@
 
 #include "rms_norm.h"
 
+#if defined(ENABLE_OPENCL)
+// GPU rmsnorm / fused-quant resident path (rmsnorm_resident_* /
+// fused_rmsnorm_quant_resident_fp32 / publish/readback). Guarded so the
+// FP32 CPU build (enable-opencl=false) compiles rms_norm as host-only. [T12]
 #include <blas_kernel_interface.h>
+#endif
 
 namespace causallm {
 
@@ -85,6 +90,7 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // ptr:out_host) so v8c FC can find them and skip its own activation
   // quant (paper §3.6 #2). If the consumer wire is also on, the CPU
   // RMSNorm below is redundant and can be skipped.
+#if defined(ENABLE_OPENCL) // [T12] GPU fused rmsnorm+quant resident path
   bool fused_ok = false;
   if (b_size == 1 &&
       in.getDataType() == ml::train::TensorDim::DataType::FP32 &&
@@ -107,8 +113,10 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // (resident-input mode in fused_rmsnorm_quant_resident_fp32, fires
   // when the producer of this layer's input publishes a backing).
   (void)fused_ok;
+#endif // ENABLE_OPENCL (fused rmsnorm+quant) [T12]
 
   bool gpu_handled = false;
+#if defined(ENABLE_OPENCL) // [T12] GPU rmsnorm resident dispatch
   if (b_size == 1 && std::getenv("NNTR_RMSNORM_GPU") != nullptr) {
     const auto &d = in_step_dim;
     bool ok = false;
@@ -143,6 +151,7 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
   }
+#endif // ENABLE_OPENCL (rmsnorm resident dispatch) [T12]
 
   if (!gpu_handled) {
     for (unsigned int b = 0; b < b_size; ++b) {
@@ -211,10 +220,12 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // exact w.r.t. baseline because the math runs on CPU exactly as
   // before; this just makes the result reachable by GPU consumers.
   // Env-gated so the original CPU-only path remains intact when off.
+#if defined(ENABLE_OPENCL) // [T12] GPU-resident publish of CPU rmsnorm output
   if (std::getenv("NNTR_SEGA_RMSNORM_PUBLISH") != nullptr && b_size == 1 &&
       out.getDataType() == ml::train::TensorDim::DataType::FP32) {
     nntrainer::publish_host_fp32_to_backing(out, out.getName());
   }
+#endif // ENABLE_OPENCL (rmsnorm publish) [T12]
 }
 
 void RMSNormLayer::updateTensorsByInputDimensions(

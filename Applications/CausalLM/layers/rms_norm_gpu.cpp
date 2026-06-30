@@ -21,8 +21,12 @@
 
 #include "rms_norm_gpu.h"
 
+#if defined(ENABLE_OPENCL)
+// [T12] OpenCL GPU rmsnorm dispatch headers (rmsnorm_cl / rmsnorm_cl_fp16 /
+// clmem_*). Guarded so the no-OpenCL CPU build compiles with the host norm.
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
+#endif
 #include <memory_data.h>
 
 namespace causallm {
@@ -129,7 +133,8 @@ void RMSNormLayerGPU::incremental_forwarding(
     gamma.getDataType() == ml::train::TensorDim::DataType::FP32 &&
     out.getDataType() == ml::train::TensorDim::DataType::FP32;
 
-#ifdef ENABLE_FP16
+// [T12] FP16 residency path is GPU-only -> also requires ENABLE_OPENCL.
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
   // FP16 residual stream (Gemma2 / gpu_native parity path): run the norm as a
   // GPU kernel (rmsnorm_cl_fp16, SVM-direct when the graph uses the SVM pool),
   // NOT on the host. This is the residency path — the host scalar fp32 norm
@@ -349,6 +354,7 @@ void RMSNormLayerGPU::incremental_forwarding(
       const char *e = std::getenv("NNTR_RMSQ_GPU_MIN_H");
       return e != nullptr ? (unsigned int)std::atoi(e) : 8u;
     }();
+#if defined(ENABLE_OPENCL)
     if (rms_on_gpu) {
       // NNTR_DEVRES Step 3a: GPU FP32 RMSNorm (SVM-direct). The kernel folds
       // gamma in and writes out_p on the GPU — no host norm pass.
@@ -361,6 +367,10 @@ void RMSNormLayerGPU::incremental_forwarding(
       }
       rms_norm_host_fp32(in_p, gamma_p, out_p, epsilon, H, W);
     }
+#else
+    // [T12] No-OpenCL build: host CPU RMSNorm is the only path.
+    rms_norm_host_fp32(in_p, gamma_p, out_p, epsilon, H, W);
+#endif
   }
 }
 

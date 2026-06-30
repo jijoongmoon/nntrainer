@@ -37,7 +37,8 @@
 #include <add_layer.h>
 #include <addition_layer.h>
 #include <attention_layer.h>
-#include <logit_softcapping.h> // LLM layers promoted to core [T12]
+#include <geglu_layer.h> // LLM layers promoted to core [T12]
+#include <logit_softcapping.h>
 #include <qkv_layer.h>
 #include <scalar_multiply.h>
 #include <swiglu_layer.h>
@@ -462,6 +463,10 @@ void AppContext::add_default_object() {
   // swiglu on cpu: the merged backend-neutral SwiGLULayer (getOps dispatch +
   // skip + the cuda fast path); replaces the former app causallm::SwiGLULayer.
   registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
+  // geglu on cpu: the backend-neutral GeGLULayer (getOps -> CpuComputeOps::geglu).
+  // Was previously registered only on the CL/CUDA contexts; needed on cpu too so
+  // engine=cpu (the FP32 reference / Gemma models) finds it. [T12]
+  registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
   // tie_word_embedding: the GPU lm_head GEMV is internally #if ENABLE_OPENCL, so
   // the layer compiles host-only without OpenCL — register unconditionally so the
   // models (lm_head) construct on the FP32 reference / CPU build too. [T12]
