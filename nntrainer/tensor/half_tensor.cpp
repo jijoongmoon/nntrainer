@@ -11,9 +11,12 @@
 
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <mutex>
 
 #include <compute_ops.h>
 #include <cpu_backend.h>
+#include <fp16.h>
 #include <half_tensor.h>
 #include <int4_utils.h>
 #include <tensor.h>
@@ -743,6 +746,48 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::QINT4:
     dotQInteger(input, output, trans, trans_in, beta, input.getDataType());
     break;
+  case Tdatatype::QS4CX: {
+    // [weight 한벌] Host fp16 GEMM for an upstream QS4CX weight — e.g. the
+    // Adreno lm_head (N=vocab) that exceeds the GPU image cap and falls back to
+    // host. Build the 4x4x32 KAI rhs-packed buffer from the plain QS4CX
+    // (nibbles + per-channel fp32 scale): plain -> Section-A
+    // (packPlainToSectionA), fp32 -> fp16 scales, then assembleKaiRhsPacked —
+    // and run the same fp16 KAI matmul as the QINT4 path. Cached by weight ptr.
+    // ARM-only (the fp16 KAI micro-kernel is i8mm; x86 throws NYI, but x86 uses
+    // the GPU/CUDA QS4CX path instead).
+    const unsigned int M = getDim().height();
+    const unsigned int K = getDim().width();
+    const unsigned int N = output.getDim().width();
+    const uint8_t *plain = input.getData<uint8_t>();
+    static std::map<const void *, std::vector<uint8_t>> qs4cx_rhs_cache;
+    static std::mutex qs4cx_rhs_mtx;
+    const uint8_t *kai_rhs = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(qs4cx_rhs_mtx);
+      auto it = qs4cx_rhs_cache.find(plain);
+      if (it == qs4cx_rhs_cache.end()) {
+        std::vector<uint8_t> seca(Int4Utils::kaiNibblePayloadBytes(N, K));
+        Int4Utils::packPlainToSectionA(plain, N, K, seca.data());
+        std::vector<uint16_t> fp16sc(N);
+        const float *fs = input.getScale<float>();
+        for (unsigned int n = 0; n < N; ++n)
+          fp16sc[n] = compute_fp32_to_fp16(fs[n]);
+        std::vector<uint8_t> packed;
+        Int4Utils::assembleKaiRhsPacked(seca.data(), fp16sc.data(), N, K,
+                                        packed);
+        it = qs4cx_rhs_cache.emplace(plain, std::move(packed)).first;
+      }
+      kai_rhs = it->second.data();
+    }
+    _FP16 *data = (_FP16 *)getData();
+    _FP16 *rdata = output.getData<_FP16>();
+    const _FP16 lb = static_cast<_FP16>(-65504.0f);
+    const _FP16 ub = static_cast<_FP16>(65504.0f);
+    nntr_gemm_qai8dxp_qsi4cxp_packed<_FP16>(M, N, K, (void *)data,
+                                            (void *)kai_rhs, rdata, 2u,
+                                            /*transB=*/true, lb, ub);
+    break;
+  }
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
