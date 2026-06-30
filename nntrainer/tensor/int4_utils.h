@@ -188,6 +188,21 @@ public:
                                   uint8_t *out_section_a);
 
   /**
+   * @brief Inverse of packPlainToSectionA + dequant: decode a KAI Section A
+   *        nibble payload (+ per-channel fp16 scales) back to a row-major
+   *        [rows_count(N) x columns_count(K)] fp32 weight (out[n*K+k] =
+   *        (int4(n,k)) * scale[n]). Used to transcode a loaded QINT4 weight
+   *        to fp32 so it can be re-quantized into another int4 format (QS4CX)
+   *        [weight 한벌]. rows_count must be a multiple of 4 and columns_count
+   *        a multiple of 32 (the Section A packing constraint).
+   * @param out_nk caller-provided buffer of rows_count*columns_count floats
+   */
+  static void dequantizeSectionAToFp32(const uint8_t *section_a,
+                                       const uint16_t *fp16_scales,
+                                       size_t rows_count, size_t columns_count,
+                                       float *out_nk);
+
+  /**
    * @brief Convenience: byte size of the KAI Section A nibble payload for
    *        the given (N, K) shape.
    */

@@ -488,15 +488,11 @@ public:
                 }
               }
             } else if (dtype == TensorDim::DataType::QS4CX) {
-              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
-                            std::runtime_error)
-                << "Save with quantization only supports for FP32 weight.";
               ///@note The codelines below can be replaced with quantizer's
               /// quantize()
               TensorDim dim = weight.getDim();
               unsigned int K = dim.height();
               unsigned int N = dim.width();
-              Tensor weight_t = weight.transpose("0:2:1");
 
               size_t q_size = N * (K + 1) / 2;
               size_t scale_size = N * sizeof(float);
@@ -504,11 +500,30 @@ public:
               // allocate packed size, not an unpacked size
               std::vector<uint8_t> rhs_q(q_size + scale_size);
               uint8_t *data = rhs_q.data();
-
               uint8_t *scale = data + q_size;
 
-              nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
-                                         true);
+              if (weight.getDataType() == TensorDim::DataType::QINT4) {
+                // [weight 한벌] Transcode a loaded QINT4 (KAI Section A nibbles +
+                // fp16 scale) weight to QS4CX: dequant Section A -> row-major
+                // [N,K] fp32, then re-quantize with the QS4CX (range/15)
+                // quantizer. Produces a single QS4CX .bin from an existing
+                // QINT4-FP16 model (which carries the FP16 norms a QS4CX-FP16
+                // model needs). dequant emits [N,K] already, so no transpose.
+                std::vector<float> nk_fp32((size_t)N * K);
+                Int4Utils::dequantizeSectionAToFp32(
+                  weight.getData<uint8_t>(), weight.getScale<uint16_t>(), N, K,
+                  nk_fp32.data());
+                nntrainer::quant_qs4cx_f32(N, K, nk_fp32.data(), data, scale,
+                                           true);
+              } else {
+                NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                              std::runtime_error)
+                  << "Save with quantization supports only FP32 or QINT4 "
+                     "(transcode) weight.";
+                Tensor weight_t = weight.transpose("0:2:1");
+                nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
+                                           true);
+              }
               file.write((const char *)data, q_size + scale_size);
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
