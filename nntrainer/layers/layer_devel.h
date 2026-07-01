@@ -503,18 +503,26 @@ public:
               uint8_t *scale = data + q_size;
 
               if (weight.getDataType() == TensorDim::DataType::QINT4) {
-                // [weight 한벌] Transcode a loaded QINT4 (KAI Section A nibbles +
-                // fp16 scale) weight to QS4CX: dequant Section A -> row-major
-                // [N,K] fp32, then re-quantize with the QS4CX (range/15)
-                // quantizer. Produces a single QS4CX .bin from an existing
-                // QINT4-FP16 model (which carries the FP16 norms a QS4CX-FP16
-                // model needs). dequant emits [N,K] already, so no transpose.
-                std::vector<float> nk_fp32((size_t)N * K);
-                Int4Utils::dequantizeSectionAToFp32(
-                  weight.getData<uint8_t>(), weight.getScale<uint16_t>(), N, K,
-                  nk_fp32.data());
-                nntrainer::quant_qs4cx_f32(N, K, nk_fp32.data(), data, scale,
-                                           true);
+                // [Phase C 2/n STEP1 — weight 한벌] LOSSLESS transcode of a loaded
+                // QINT4 (KAI Section A nibbles + per-channel fp16 scale) weight to
+                // QS4CX. The int4 values are PRESERVED by re-laying out Section A
+                // -> plain row-major nibbles (Int4Utils::sectionAToPlain, the
+                // bit-exact inverse of the KAI pack, == the QS4CX plain layout),
+                // and the fp16 scales are widened to fp32 (exact). This replaces
+                // the old dequant->requant path (dequantizeSectionAToFp32 ->
+                // quant_qs4cx_f32 with a different range/15 quantizer), which
+                // perturbed the nibbles and made the migrated QS4CX .bin drift
+                // from the source QINT4 model (e.g. gemma2's continuation
+                // diverged; gemma4's robust answer masked the same drift). The
+                // produced QS4CX weight is now numerically identical to the
+                // source QINT4 weight. Layout: data = N*(K+1)/2 plain nibbles,
+                // scale = N fp32 (matches the QS4CX on-disk record above).
+                Int4Utils::sectionAToPlain(weight.getData<uint8_t>(), N, K, data);
+                float *scale_f32 = reinterpret_cast<float *>(scale);
+                const uint16_t *fp16_scales = weight.getScale<uint16_t>();
+                for (unsigned int n = 0; n < N; ++n) {
+                  scale_f32[n] = compute_fp16_to_fp32(fp16_scales[n]);
+                }
               } else {
                 NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
                               std::runtime_error)
