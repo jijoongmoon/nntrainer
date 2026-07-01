@@ -2667,125 +2667,22 @@ make_v8c_weight_backing_from_kai_section_a(const uint8_t *section_a,
     throw std::invalid_argument("make_v8c_weight_backing_from_kai_section_a: "
                                 "N must be a multiple of KAI nr=4");
 
-  // Constants from the KAI Section A producer (Int4Utils::quantizeAndPackKai).
-  constexpr size_t KAI_NR = 4;             // output-channel super-row width
-  constexpr size_t KAI_KR_BY_SR = 8;       // bytes per nr-block (= KR/SR = 16/2)
-  constexpr size_t KAI_K_INTERLEAVE = 16;  // lo/hi nibble K stride within a byte
-
-  const size_t k_blocks = K / 32;
-  const size_t super_row_count = N / KAI_NR;
-  const size_t nibble_bytes_per_super_row = KAI_NR * (K / 2);
-  // Bytes consumed by one 32-K span across all 4 channels:
-  //   4 nr * 8 bytes (super_block_a, K=[0..7] lo + K=[16..23] hi) +
-  //   4 nr * 8 bytes (super_block_b, K=[8..15] lo + K=[24..31] hi) = 64
-  constexpr size_t KAI_BYTES_PER_KBLK = 2 * KAI_NR * KAI_KR_BY_SR;
-
-  // v8c per-channel row buffer (row-major, K/2 bytes per channel).
-  const size_t v8c_row_bytes = (size_t)K / 2;
-  std::vector<uint8_t> packed((size_t)N * v8c_row_bytes);
-
-  for (size_t sr = 0; sr < super_row_count; ++sr) {
-    const uint8_t *sr_base = section_a + sr * nibble_bytes_per_super_row;
-    for (size_t nr = 0; nr < KAI_NR; ++nr) {
-      const size_t n = sr * KAI_NR + nr;
-      uint8_t *v8c_row = packed.data() + n * v8c_row_bytes;
-      for (size_t kblk = 0; kblk < k_blocks; ++kblk) {
-        // KAI: this channel's 16 bytes for K=[kblk*32 .. kblk*32+31] live in
-        // two 8-byte nr-blocks at kblk*64 + nr*8 (super_block_a) and
-        // kblk*64 + 32 + nr*8 (super_block_b).
-        const uint8_t *blk_a =
-          sr_base + kblk * KAI_BYTES_PER_KBLK + nr * KAI_KR_BY_SR;
-        const uint8_t *blk_b = blk_a + KAI_NR * KAI_KR_BY_SR; // +32 bytes
-        // Decode to per-K offset-encoded nibbles (0..15 = int4+8). Both KAI
-        // and v8c use the same +8 offset, but KAI bytes are XOR'd with 0x88
-        // — undoing the XOR yields the raw uint4 pair.
-        uint8_t k_nibbles[32];
-        for (size_t i = 0; i < KAI_KR_BY_SR; ++i) {
-          const uint8_t b_a = blk_a[i] ^ 0x88;
-          k_nibbles[i + 0] = (uint8_t)(b_a & 0x0F);                // K = kblk*32 + i
-          k_nibbles[i + KAI_K_INTERLEAVE] =                        // K = kblk*32 + 16 + i
-            (uint8_t)((b_a >> 4) & 0x0F);
-          const uint8_t b_b = blk_b[i] ^ 0x88;
-          k_nibbles[i + KAI_KR_BY_SR] = (uint8_t)(b_b & 0x0F);     // K = kblk*32 + 8 + i
-          k_nibbles[i + KAI_KR_BY_SR + KAI_K_INTERLEAVE] =         // K = kblk*32 + 24 + i
-            (uint8_t)((b_b >> 4) & 0x0F);
-        }
-        // Repack to v8c order: byte(c*4+b) at v8c K-block offset = (qH<<4)|qL
-        // where qL = K(c*8+b), qH = K(c*8+b+4). Already offset-encoded.
-        uint8_t *v8c_kblk = v8c_row + kblk * 16;
-        for (size_t c = 0; c < 4; ++c) {
-          for (size_t b = 0; b < 4; ++b) {
-            const uint8_t qL = k_nibbles[c * 8 + b];
-            const uint8_t qH = k_nibbles[c * 8 + b + 4];
-            v8c_kblk[c * 4 + b] = (uint8_t)((qH << 4) | qL);
-          }
-        }
-      }
-    }
-  }
-
-  auto *blas_cc =
-    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  cl_context ctx = blas_cc->context_inst_.GetContext();
-
-  // Upload packed weight buffer.
-  cl_int err = CL_SUCCESS;
-  cl_mem w_buf =
-    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, packed.size(),
-                   packed.data(), &err);
-  if (err != CL_SUCCESS || !w_buf)
-    throw std::runtime_error(
-      "make_v8c_weight_backing_from_kai_section_a: clCreateBuffer (weight) "
-      "failed: " +
-      std::to_string(err));
-  auto backing = std::make_unique<tv::TensorBacking>(
-    ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, packed.size(),
-    /*owned=*/true);
-
-  // Per-channel scale: promote fp16 → fp32 (v8c gemm reads scale_wgt as fp32).
-  std::vector<float> per_channel_scale(N);
+  // [Phase C 2/n] Single v8c int4 decode path. A legacy QINT4 (KAI Section-A
+  // nibbles + fp16 scale) weight is losslessly re-laid to the canonical QS4CX
+  // plain form (Int4Utils::sectionAToPlain — exact nibble de-permutation, no
+  // dequant/requant) and its fp16 scales widened to fp32, then built through
+  // the one v8c builder below. Proven byte-identical to the old direct
+  // Section-A decode (same int4 values => identical v8c backing/scale/row-sum),
+  // so the GEMM is unchanged; this collapses the two int4 v8c builders into one.
+  std::vector<uint8_t> plain_nibbles((size_t)N * ((K + 1) / 2));
+  Int4Utils::sectionAToPlain(section_a, N, K, plain_nibbles.data());
+  std::vector<float> fp32_scales(N);
   for (unsigned int n = 0; n < N; ++n)
-    per_channel_scale[n] = compute_fp16_to_fp32(fp16_scales[n]);
-  cl_mem sb =
-    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                   sizeof(float) * N, per_channel_scale.data(), &err);
-  if (err != CL_SUCCESS || !sb)
-    throw std::runtime_error(
-      "make_v8c_weight_backing_from_kai_section_a: clCreateBuffer (scale) "
-      "failed: " +
-      std::to_string(err));
-  *out_scale_buf = sb;
-
-  // Per-channel int4 row sum: Σ_k int4_w[n,k]. The GEMM kernel needs this to
-  // back out the asymmetric act zero-point contribution (see kernel comment
-  // above the bias-correction loop). Decode from the freshly-packed v8c
-  // bytes (cheaper than re-walking the KAI Section A) — same int4 value, just
-  // already in v8c byte order. byte(c*4+b) within each 32-K block has:
-  //   lo nibble = uint4(K = c*8+b)  → int4 = lo - 8
-  //   hi nibble = uint4(K = c*8+b+4) → int4 = hi - 8
-  std::vector<int32_t> row_sum_w_int4(N, 0);
-  for (unsigned int n = 0; n < N; ++n) {
-    const uint8_t *row = packed.data() + n * v8c_row_bytes;
-    int32_t s = 0;
-    for (size_t off = 0; off < v8c_row_bytes; ++off) {
-      const uint8_t byte = row[off];
-      const int lo = (int)(byte & 0x0Fu) - 8;
-      const int hi = (int)((byte >> 4) & 0x0Fu) - 8;
-      s += lo + hi;
-    }
-    row_sum_w_int4[n] = s;
-  }
-  cl_mem rsw_buf =
-    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                   sizeof(int32_t) * N, row_sum_w_int4.data(), &err);
-  if (err != CL_SUCCESS || !rsw_buf)
-    throw std::runtime_error(
-      "make_v8c_weight_backing_from_kai_section_a: clCreateBuffer "
-      "(row_sum_w_int4) failed: " +
-      std::to_string(err));
-  *out_row_sum_w_int4_buf = rsw_buf;
-
-  return backing;
+    fp32_scales[n] = compute_fp16_to_fp32(fp16_scales[n]);
+  return make_v8c_weight_backing_from_qs4cx(plain_nibbles.data(),
+                                            fp32_scales.data(), N, K,
+                                            out_scale_buf,
+                                            out_row_sum_w_int4_buf);
 }
 
 // [Phase B / weight 한벌] Build the SAME v8c GEMM backing from an upstream QS4CX
