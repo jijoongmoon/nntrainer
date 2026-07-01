@@ -218,7 +218,7 @@ public:
       // a GPU_CLMEM tensor's planes inconsistent).
       nntrainer::clmem_lower_cl(input, 0);
       auto wt = weight.getDataType();
-      if (wt == ml::train::TensorDim::DataType::QINT4 ||
+      if (ml::train::TensorDim::isInt4Weight(wt) || // QINT4 + QS4CX [Phase C]
           wt == ml::train::TensorDim::DataType::Q4_0 ||
           wt == ml::train::TensorDim::DataType::Q4_K ||
           wt == ml::train::TensorDim::DataType::Q6_K) {

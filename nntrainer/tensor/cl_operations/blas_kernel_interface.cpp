@@ -682,8 +682,7 @@ static inline float v8c_h2f(uint16_t h) {
 bool dotCl_v8c_prebuild_weight(const Tensor &weight) {
   if (!v8c_env_enabled())
     return false;
-  if (weight.getDataType() != ml::train::TensorDim::DataType::QINT4 &&
-      weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+  if (!ml::train::TensorDim::isInt4Weight(weight.getDataType()))
     return false;
   const unsigned int N = weight.width();
   const unsigned int K = weight.height();
@@ -1225,8 +1224,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   const double _fc_t0 = fc_tprof_on() ? fc_tprof_now() : 0;
   if (!v8c_env_enabled())
     return false;
-  if (weight.getDataType() != ml::train::TensorDim::DataType::QINT4 &&
-      weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+  if (!ml::train::TensorDim::isInt4Weight(weight.getDataType()))
     return false;
   // Derive M, K, N from tensor dims (no-transpose case only).
   unsigned int M, K, N;

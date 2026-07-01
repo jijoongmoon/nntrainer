@@ -57,7 +57,7 @@ public:
                disk). QS4CX is now the canonical int4 weight format (single
                format read by CPU-KAI / GPU-v8c / CUDA / HexKL-NPU). QINT4 is
                kept read-only for legacy .bin loading; new models build QS4CX
-               (res/*/build_qs4cx.sh). [Phase C 2026-07-01] */
+               (res/<model>/build_qs4cx.sh). [Phase C 2026-07-01] */
     QINT8,  /** quantized int 8*/
     QINT16, /** quantized int 16*/
     BCQ,    /** binary-code-based quantized*/
@@ -75,6 +75,17 @@ public:
     FP32,   /** single precision */
     NONE,   /** not specified */
   };
+
+  /**
+   * @brief True if @p d is a per-channel int4 WEIGHT format — the canonical
+   *        QS4CX or the deprecated QINT4 (both KAI qsi4cxp). Centralizes int4
+   *        dispatch so call sites stop enumerating (QINT4 || QS4CX). Once the
+   *        Phase C tensor-class collapse lands (single int4 DataType), this
+   *        reduces to one comparison. [Phase C 2026-07-01]
+   */
+  static bool isInt4Weight(DataType d) {
+    return d == DataType::QINT4 || d == DataType::QS4CX;
+  }
 
   /**
    * @brief Tensor Data Storage Order. Row-major or Column-major
