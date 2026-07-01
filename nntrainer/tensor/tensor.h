@@ -1883,6 +1883,12 @@ public:
   void setFileOffset(size_t file_offset);
 
   /**
+   * @brief Mark on-disk bytes as a legacy QINT4 record (transcode to QS4CX on
+   *        read). [Phase C Path B]
+   */
+  void setOnDiskLegacyQint4(bool v);
+
+  /**
    * @brief     get FileOffset of Tensor
    * @return    size_t fileOffset
    */

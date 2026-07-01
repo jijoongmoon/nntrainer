@@ -146,6 +146,10 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   LMHEAD_DTYPE = nntr_cfg.contains("lmhead_dtype")
                    ? nntr_cfg["lmhead_dtype"]
                    : nntr_cfg["embedding_dtype"];
+  // [Phase C Path B] a legacy int4 lm_head loads as the canonical QS4CX class
+  // (on-disk stays legacy QINT4, transcoded at read time). See transformer.cpp.
+  if (LMHEAD_DTYPE == "QINT4")
+    LMHEAD_DTYPE = "QS4CX";
 
   LMHEAD_UNTIE =
     nntr_cfg.contains("lmhead_untie") && nntr_cfg["lmhead_untie"].get<bool>();

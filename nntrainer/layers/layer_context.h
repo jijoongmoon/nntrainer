@@ -531,11 +531,12 @@ public:
         t_w.getDataType() == Tdatatype::FP16 ||
         t_w.getDataType() == Tdatatype::BCQ ||
         t_w.getDataType() == Tdatatype::Q4_K ||
-        t_w.getDataType() == Tdatatype::QINT4) {
-      // QINT4 weights are consumed directly by the v8c GPU path (or by
-      // FloatTensor::dotQInteger on CPU); the legacy placeholder-FP32
-      // branch below would hand back an uninitialised dequant buffer and
-      // make dotCl_v8c reject the call as "weight not QINT4".
+        t_w.getDataType() == Tdatatype::QINT4 ||
+        t_w.getDataType() == Tdatatype::QS4CX) {
+      // QINT4/QS4CX int4 weights are consumed directly by the v8c GPU path (or
+      // by FloatTensor::dotQInteger / dotQs4cx on CPU); the legacy
+      // placeholder-FP32 branch below would hand back an uninitialised dequant
+      // buffer and make dotCl_v8c reject the call as "weight not int4".
       w = t_w;
       return;
     }

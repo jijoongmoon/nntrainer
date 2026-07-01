@@ -99,6 +99,7 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   case TensorDim::DataType::UINT4:
   case TensorDim::DataType::QINT8:
   case TensorDim::DataType::QINT4:
+  case TensorDim::DataType::QS4CX:
   case TensorDim::DataType::Q4_K:
   case TensorDim::DataType::Q6_K:
   case TensorDim::DataType::Q4_0:
@@ -1148,6 +1149,14 @@ void NeuralNetwork::load(const std::string &file_path,
   // qscheme so the running offset matches the actual file layout.
   std::ifstream qint4_peek_stream;
   bool qint4_peek_tried = false;
+  // [Phase C Path B] A legacy QINT4 model (model_tensor_type "QINT4-*") now
+  // builds QS4CX weights; its int4 records are still the legacy on-disk form
+  // (u16 header + Section A fp16 scales, or plain container) whose size differs
+  // from the QS4CX in-memory getMemoryBytes(). Size them explicitly and flag
+  // the tensors so QS4CX_Tensor::read() transcodes.
+  const std::string model_tensor_type_str =
+    to_string(std::get<props::ModelTensorDataType>(model_flex_props));
+  const bool legacy_int4_model = model_tensor_type_str.rfind("QINT4", 0) == 0;
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
     auto weights = (*iter)->getRunContext().getWeights();
     for (auto weight : weights) {
@@ -1197,6 +1206,34 @@ void NeuralNetwork::load(const std::string &file_path,
           size = sizeof(uint16_t) +
                  Int4Utils::plainRecordPayloadBytes(d.width(), d.height());
         }
+      }
+      if (legacy_int4_model &&
+          tensor_data_type == TensorDim::DataType::QS4CX) {
+        // [Phase C Path B] Legacy QINT4 record loaded as a QS4CX tensor: the
+        // on-disk record is the legacy form, not the QS4CX in-memory size. Flag
+        // the tensor so read() transcodes, and size by the peeked container.
+        weight->getVariableRef().setOnDiskLegacyQint4(true);
+        if (!qint4_peek_tried) {
+          qint4_peek_tried = true;
+          qint4_peek_stream.open((v.size() == 2) ? v[1] : v[0],
+                                 std::ios::in | std::ios::binary);
+        }
+        uint16_t disk_scheme = 0xFFFF;
+        if (qint4_peek_stream.is_open()) {
+          qint4_peek_stream.clear();
+          qint4_peek_stream.seekg(static_cast<std::streamoff>(start_from),
+                                  std::ios::beg);
+          qint4_peek_stream.read(reinterpret_cast<char *>(&disk_scheme),
+                                 sizeof(uint16_t));
+        }
+        const TensorDim &d = weight->getDim();
+        if (disk_scheme == static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE))
+          size = sizeof(uint16_t) +
+                 Int4Utils::plainRecordPayloadBytes(d.width(), d.height());
+        else
+          size = sizeof(uint16_t) +
+                 Int4Utils::kaiNibblePayloadBytes(d.width(), d.height()) +
+                 static_cast<size_t>(d.width()) * sizeof(uint16_t);
       }
       file_offset.emplace_back(std::make_pair(start_from, size));
       start_from += size;

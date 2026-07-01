@@ -152,6 +152,13 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
+  // [Phase C Path B] Legacy QINT4 weights now load as the canonical QS4CX class;
+  // remap the config dtype so the whole pipeline (tensor factory + runtime
+  // consumers) is QS4CX. The on-disk bytes stay legacy QINT4 and are transcoded
+  // losslessly at read time, keyed on model_tensor_type ("QINT4-*"), which is
+  // intentionally NOT remapped so the loader still knows the on-disk format.
+  if (FC_LAYER_DTYPE == "QINT4")
+    FC_LAYER_DTYPE = "QS4CX";
   USE_FLASH_ATTENTION = nntr_cfg.contains("use_flash_attention")
                           ? nntr_cfg["use_flash_attention"].get<bool>()
                           : true;

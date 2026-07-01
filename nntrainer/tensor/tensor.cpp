@@ -1602,6 +1602,8 @@ bool Tensor::checkContinuous(unsigned int np1, unsigned int np2) const {
   return false;
 }
 
+void Tensor::setOnDiskLegacyQint4(bool v) { itensor_->setOnDiskLegacyQint4(v); }
+
 void Tensor::setFileOffset(const size_t file_offset) {
   itensor_->setFileOffset(file_offset);
 }

@@ -685,6 +685,20 @@ public:
   void setFileOffset(size_t off);
 
   /**
+   * @brief Mark that this tensor's on-disk bytes are a legacy QINT4 record
+   *        (u16 qscheme header + KAI Section A / plain container) that must be
+   *        transcoded losslessly to the canonical QS4CX in-memory layout on
+   *        read. Set by NeuralNetwork::load for QS4CX weights of a legacy
+   *        ("QINT4-*" model_tensor_type) model. [Phase C Path B]
+   */
+  void setOnDiskLegacyQint4(bool v) { on_disk_legacy_qint4_ = v; }
+
+  /**
+   * @brief Whether this tensor's on-disk bytes are a legacy QINT4 record.
+   */
+  bool isOnDiskLegacyQint4() const { return on_disk_legacy_qint4_; }
+
+  /**
    * @brief     set Tensor Dim
    * @param[in] d TensorDim
    * @note      Throws std::invalid_argument if size mismatch
@@ -912,6 +926,8 @@ protected:
   std::shared_ptr<ContextData> ct_data_; /**< per-Context dispatch table */
   size_t offset;
   size_t file_offset; /**< offset of the tensor in the file */
+  bool on_disk_legacy_qint4_ =
+    false; /**< on-disk bytes are a legacy QINT4 record to transcode to QS4CX */
 
   /**<
    * When using shared_data with tensor, this stores the ptr of the source
