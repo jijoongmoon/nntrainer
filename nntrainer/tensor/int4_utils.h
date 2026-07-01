@@ -203,6 +203,36 @@ public:
                               size_t columns_count, uint8_t *out_plain_nibbles);
 
   /**
+   * @brief Standalone reader for a legacy on-disk QINT4 weight record (the
+   *        format Int4QTensor::read parses) that emits the CANONICAL QS4CX
+   *        in-memory form WITHOUT any tensor class. @a record points at the
+   *        start of the record (the u16 qscheme header). Dispatches on it:
+   *          - KAI_QSI4CXP_4x4x32 (0x06): Section A nibbles + per-channel fp16
+   *            scales -> plain row-major nibbles (sectionAToPlain, lossless) +
+   *            fp32 scales (compute_fp16_to_fp32, exact).
+   *          - PER_CHANNEL_AFFINE (0x01): PR#3978 plain container -> canonical
+   *            plain nibbles (packPlainToSectionA -> sectionAToPlain, drops the
+   *            KAI padding) + its fp32 scales copied as-is.
+   *        LOSSLESS: preserves the exact int4 values and scale magnitudes. The
+   *        output is byte-identical to what layer_devel.h's QINT4->QS4CX
+   *        transcode produces from a loaded Int4QTensor, so it can replace that
+   *        load path once Int4QTensor is removed (Phase C Path B). Depends on no
+   *        tensor class. Throws on any other on-disk qscheme.
+   * @param record       start of the on-disk record (the u16 header).
+   * @param record_bytes size of the @a record buffer (bounds-checked).
+   * @param rows_count   N (output channels); N % 4 == 0.
+   * @param columns_count K (input channels); K % 32 == 0.
+   * @param out_plain_nibbles caller buffer of rows_count * ((K + 1) / 2) bytes.
+   * @param out_fp32_scales   caller buffer of rows_count floats.
+   */
+  static void readLegacyQint4RecordToQs4cx(const uint8_t *record,
+                                           size_t record_bytes,
+                                           size_t rows_count,
+                                           size_t columns_count,
+                                           uint8_t *out_plain_nibbles,
+                                           float *out_fp32_scales);
+
+  /**
    * @brief Inverse of packPlainToSectionA + dequant: decode a KAI Section A
    *        nibble payload (+ per-channel fp16 scales) back to a row-major
    *        [rows_count(N) x columns_count(K)] fp32 weight (out[n*K+k] =

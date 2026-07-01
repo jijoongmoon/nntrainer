@@ -19,6 +19,7 @@
 #include "cpu_backend.h"
 #include "fp16.h"
 #include "nntrainer_error.h"
+#include "quantizer.h"
 #include "util_func.h"
 
 namespace nntrainer {
@@ -478,6 +479,61 @@ void Int4Utils::sectionAToPlain(const uint8_t *section_a, size_t rows_count,
         out_plain_nibbles[bi] |= (uint8_t)(src_x0_hi << ((k1_idx % 2) * 4));
       }
     }
+  }
+}
+
+void Int4Utils::readLegacyQint4RecordToQs4cx(const uint8_t *record,
+                                             size_t record_bytes,
+                                             size_t rows_count,
+                                             size_t columns_count,
+                                             uint8_t *out_plain_nibbles,
+                                             float *out_fp32_scales) {
+  const size_t N = rows_count;
+  const size_t K = columns_count;
+  const size_t hdr = sizeof(uint16_t);
+
+  NNTR_THROW_IF(record_bytes < hdr, std::runtime_error)
+    << "[readLegacyQint4RecordToQs4cx] record too small for qscheme header";
+
+  uint16_t scheme = 0;
+  std::memcpy(&scheme, record, hdr);
+  const uint8_t *body = record + hdr;
+
+  if (scheme == static_cast<uint16_t>(QScheme::KAI_QSI4CXP_4x4x32)) {
+    // 0x06: Section A nibbles + per-channel fp16 scales.
+    const size_t nib = kaiNibblePayloadBytes(N, K);
+    NNTR_THROW_IF(record_bytes < hdr + nib + N * sizeof(uint16_t),
+                  std::runtime_error)
+      << "[readLegacyQint4RecordToQs4cx] Section A record truncated: have "
+      << record_bytes << " need " << (hdr + nib + N * sizeof(uint16_t));
+    // Lossless re-layout of the int4 values.
+    sectionAToPlain(body, N, K, out_plain_nibbles);
+    // Exact fp16 -> fp32 widening of the per-channel scales.
+    const uint8_t *scale_src = body + nib;
+    for (size_t n = 0; n < N; ++n) {
+      uint16_t h;
+      std::memcpy(&h, scale_src + n * sizeof(uint16_t), sizeof(uint16_t));
+      out_fp32_scales[n] = compute_fp16_to_fp32(h);
+    }
+  } else if (scheme == static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE)) {
+    // 0x01: PR#3978 plain container (padded plain nibbles + fp32 scales).
+    const size_t pay = plainRecordPayloadBytes(N, K);
+    NNTR_THROW_IF(record_bytes < hdr + pay, std::runtime_error)
+      << "[readLegacyQint4RecordToQs4cx] plain-container record truncated: have "
+      << record_bytes << " need " << (hdr + pay);
+    // Normalize the padded plain nibbles to the canonical (unpadded) plain
+    // layout by round-tripping through Section A (drops the KAI nr=8 / K->32
+    // padding); both directions are lossless int4 re-layouts.
+    std::vector<uint8_t> sec_a(kaiNibblePayloadBytes(N, K));
+    packPlainToSectionA(body, N, K, sec_a.data());
+    sectionAToPlain(sec_a.data(), N, K, out_plain_nibbles);
+    // The plain container already stores fp32 scales — copy verbatim.
+    std::memcpy(out_fp32_scales, body + plainScalesOffsetBytes(N, K),
+                N * sizeof(float));
+  } else {
+    NNTR_THROW_IF(true, std::runtime_error)
+      << "[readLegacyQint4RecordToQs4cx] unsupported on-disk qscheme 0x"
+      << std::hex << scheme << std::dec << " (N=" << N << " K=" << K << ")";
   }
 }
 
