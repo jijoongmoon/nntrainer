@@ -225,7 +225,12 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   // ActivationRealizer would split it into a node — so it stays inline. Gated by
   // NNTR_FUSE_ACT (default on); a no-op for graphs whose compute layers carry no
   // activation property (e.g. the CausalLM GPU stack uses GeGLU/SwiGLU).
-  realizers.emplace_back(new FusionRealizer());
+  // INFERENCE-ONLY: the fused layers apply the activation in forwarding but
+  // their calcDerivative/calcGradient stay pure-linear (no act'), so a fused
+  // graph must not be trained — training keeps the standalone ActivationLayer
+  // split whose backward applies the activation derivative.
+  if (exec_mode == ExecutionMode::INFERENCE)
+    realizers.emplace_back(new FusionRealizer());
   realizers.emplace_back(new ActivationRealizer());
 
   for (auto &realizer : realizers) {

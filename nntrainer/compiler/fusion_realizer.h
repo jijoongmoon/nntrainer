@@ -37,6 +37,13 @@ namespace nntrainer {
  * @note  Gated by NNTR_FUSE_ACT (default ON; set NNTR_FUSE_ACT=0 to disable).
  *        Skips softmax / none / unknown (softmax is row-wise, not a pointwise
  *        epilogue), and skips a node that already carries a fused activation.
+ *
+ * @note  INFERENCE-ONLY (NeuralNetwork::compile adds this realizer only for
+ *        ExecutionMode::INFERENCE): the fused compute layers apply the
+ *        activation in forwarding but their calcDerivative/calcGradient remain
+ *        pure-linear (no activation derivative), so a fused graph must never
+ *        be trained. Training keeps the ActivationRealizer split, whose
+ *        standalone node backpropagates act' correctly.
  */
 class FusionRealizer final : public GraphRealizer {
 public:
