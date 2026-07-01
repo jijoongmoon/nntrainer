@@ -188,6 +188,21 @@ public:
                                   uint8_t *out_section_a);
 
   /**
+   * @brief LOSSLESS inverse of packPlainToSectionA: de-permute a KAI Section A
+   *        nibble payload back into plain row-major [rows_count(N)][ceil(K/2)]
+   *        nibbles (uint4 = int4+8, no XOR), byte-identical to the plain form
+   *        that produced it. Unlike dequantizeSectionAToFp32 this does NOT
+   *        touch scales or dequantize — it only re-lays-out the int4 nibbles,
+   *        so a QINT4 (Section A) weight becomes the QS4CX plain nibble layout
+   *        with its exact original values preserved (the Phase C int4-format
+   *        collapse: one in-memory int4 form). [Phase C 2/n]
+   * @param out_plain_nibbles caller-provided buffer of
+   *        rows_count * ((columns_count + 1) / 2) bytes
+   */
+  static void sectionAToPlain(const uint8_t *section_a, size_t rows_count,
+                              size_t columns_count, uint8_t *out_plain_nibbles);
+
+  /**
    * @brief Inverse of packPlainToSectionA + dequant: decode a KAI Section A
    *        nibble payload (+ per-channel fp16 scales) back to a row-major
    *        [rows_count(N) x columns_count(K)] fp32 weight (out[n*K+k] =

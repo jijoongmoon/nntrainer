@@ -421,6 +421,66 @@ void Int4Utils::packPlainToSectionA(const uint8_t *plain_nibbles,
   }
 }
 
+void Int4Utils::sectionAToPlain(const uint8_t *section_a, size_t rows_count,
+                                size_t columns_count,
+                                uint8_t *out_plain_nibbles) {
+  // Exact inverse of packPlainToSectionA: walk the same Section A super-row /
+  // block iteration, un-XOR 0x88, and scatter each recovered nibble back to its
+  // plain [n][k] position. Padding entries (n >= rows_count, k >= columns_count)
+  // come from clamped / pad reads in the forward and carry no unique data, so
+  // they are skipped. A valid plain nibble may be produced by more than one
+  // Section A byte (the forward reads it as both a k0 and a k1); every such copy
+  // holds the same value, so writing with |= over a zeroed buffer is idempotent
+  // and reproduces the plain layout byte-for-byte.
+  const size_t rhs_row_bytes = (columns_count + 1) / 2;
+  std::memset(out_plain_nibbles, 0, rows_count * rhs_row_bytes);
+
+  const size_t k_internal =
+    ((columns_count + KAI_K_PAD_MULTIPLE - 1) / KAI_K_PAD_MULTIPLE) *
+    KAI_K_PAD_MULTIPLE;
+  const size_t super_row_count = (rows_count + KAI_NR - 1) / KAI_NR;
+  const size_t nibble_bytes_per_super_row = KAI_NR * (k_internal / 2);
+  const size_t dst_num_bytes_per_row = nibble_bytes_per_super_row;
+  const size_t block_length_in_bytes = KAI_KR / KAI_SR; // = 8
+
+  for (size_t dst_row_idx = 0; dst_row_idx < super_row_count; ++dst_row_idx) {
+    const uint8_t *src_row = section_a + dst_row_idx * nibble_bytes_per_super_row;
+
+    for (size_t dst_byte_idx = 0; dst_byte_idx < dst_num_bytes_per_row;
+         ++dst_byte_idx) {
+      const size_t block_idx = dst_byte_idx / block_length_in_bytes;
+      const size_t block_byte_idx = dst_byte_idx % block_length_in_bytes;
+      const size_t super_block_idx = block_idx / KAI_NR;
+      const size_t nr_idx = block_idx % KAI_NR;
+
+      const size_t k_adjustment =
+        ((block_byte_idx + super_block_idx * block_length_in_bytes) /
+         KAI_K_INTERLEAVE) *
+        KAI_K_INTERLEAVE;
+      const size_t k0_idx =
+        block_byte_idx + super_block_idx * block_length_in_bytes + k_adjustment;
+      const size_t k1_idx = k0_idx + KAI_K_INTERLEAVE;
+      const size_t n0_idx = dst_row_idx * KAI_NR + nr_idx;
+
+      if (n0_idx >= rows_count)
+        continue; // padding super-row (clamped in the forward)
+
+      const uint8_t qs0 = (uint8_t)(src_row[dst_byte_idx] ^ 0x88);
+      const uint8_t src_x0_lo = (uint8_t)(qs0 & 0x0F);        // nibble at (n0,k0)
+      const uint8_t src_x0_hi = (uint8_t)((qs0 >> 4) & 0x0F); // nibble at (n0,k1)
+
+      if (k0_idx < columns_count) {
+        const size_t bi = n0_idx * rhs_row_bytes + (k0_idx / 2);
+        out_plain_nibbles[bi] |= (uint8_t)(src_x0_lo << ((k0_idx % 2) * 4));
+      }
+      if (k1_idx < columns_count) {
+        const size_t bi = n0_idx * rhs_row_bytes + (k1_idx / 2);
+        out_plain_nibbles[bi] |= (uint8_t)(src_x0_hi << ((k1_idx % 2) * 4));
+      }
+    }
+  }
+}
+
 void Int4Utils::dequantizeSectionAToFp32(const uint8_t *section_a,
                                          const uint16_t *fp16_scales, size_t N,
                                          size_t K, float *out_nk) {
