@@ -82,8 +82,18 @@ public:
    * @return Tensor DataType of the the Weight
    */
   TensorDim::DataType getWeightDataType() {
-    return str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
+    auto dt = str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
       from_string(tensor_type[1]);
+    // [Phase C Path B] A legacy QINT4 weight dtype (whether inherited from the
+    // model_tensor_type "QINT4-*" graph default, e.g. Qwen3 whose FC layers set
+    // no explicit weight_dtype, or set per-layer) is materialised as the
+    // canonical QS4CX class. The on-disk bytes stay the legacy QINT4 record and
+    // are transcoded at read time (keyed on model_tensor_type "QINT4-*", which is
+    // intentionally left as the legacy signal). This is the single point that
+    // makes the QINT4->QS4CX runtime cutover universal across all models.
+    if (dt == TensorDim::DataType::QINT4)
+      return TensorDim::DataType::QS4CX;
+    return dt;
   };
 
   /**
