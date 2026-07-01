@@ -15,7 +15,6 @@
 
 #include <char_tensor.h>
 #include <float_tensor.h>
-#include <int4_tensor.h>
 #include <lazy_tensor.h>
 #include <q4_0_tensor.h>
 #include <q4_k_tensor.h>
@@ -64,8 +63,7 @@ Tensor::Tensor(
   std::vector<float> const &scales, ml::train::TensorDim::TensorType t_type,
   QScheme qscheme_) {
   if (t_type.data_type == Tdatatype::QINT4) {
-    itensor_ =
-      std::make_unique<Int4QTensor>(d, scales, t_type.format, qscheme_);
+    throw std::invalid_argument("Int4QTensor removed (Phase C Path B): int4 weights materialise as QS4CX.");
   } else if (t_type.data_type == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, scales, t_type.format, qscheme_);
   } else {
@@ -149,7 +147,7 @@ Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
   } else if (d_type == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(name_, fm);
   } else if (d_type == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(name_, fm);
+    throw std::invalid_argument("Int4QTensor removed (Phase C Path B): int4 weights materialise as QS4CX.");
   } else if (d_type == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(name_, fm);
@@ -205,7 +203,7 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
   } else if (d.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, alloc_now, init, name, qscheme);
   } else if (d.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(d, alloc_now, init, name, qscheme);
+    throw std::invalid_argument("Int4QTensor removed (Phase C Path B): int4 weights materialise as QS4CX.");
   } else if (d.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(d, alloc_now, init, name);
@@ -256,7 +254,7 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
   } else if (d.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, buf, qscheme);
   } else if (d.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(d, buf, qscheme);
+    throw std::invalid_argument("Int4QTensor removed (Phase C Path B): int4 weights materialise as QS4CX.");
   } else if (d.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(d, buf);
@@ -302,7 +300,7 @@ Tensor::Tensor(const Tensor &rhs) {
   } else if (rhs.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(*rhs.itensor_);
+    throw std::invalid_argument("Int4QTensor removed (Phase C Path B): int4 weights materialise as QS4CX.");
   } else if (rhs.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(*rhs.itensor_);
@@ -344,7 +342,7 @@ Tensor::Tensor(const std::unique_ptr<TensorBase> &rhs) {
   } else if (rhs->getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(*rhs.get());
   } else if (rhs->getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(*rhs.get());
+    throw std::invalid_argument("Int4QTensor removed (Phase C Path B): int4 weights materialise as QS4CX.");
   } else if (rhs->getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(*rhs.get());
@@ -383,7 +381,7 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
   } else if (rhs.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(*rhs.itensor_);
+    throw std::invalid_argument("Int4QTensor removed (Phase C Path B): int4 weights materialise as QS4CX.");
   } else if (rhs.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(*rhs.itensor_);
@@ -434,7 +432,7 @@ bool Tensor::operator==(const Tensor &rhs) const {
     } else if (getDataType() == Tdatatype::QINT8) {
       return itensorCompare<CharTensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::QINT4) {
-      return itensorCompare<Int4QTensor>(itensor_.get(), rhs.itensor_.get());
+      throw std::invalid_argument("Int4QTensor removed (Phase C Path B): int4 weights materialise as QS4CX.");
     } else if (getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
       return itensorCompare<BCQTensor>(itensor_.get(), rhs.itensor_.get());
@@ -1640,13 +1638,10 @@ size_t Tensor::scale_size() const { return itensor_->scale_size(); }
 QScheme Tensor::q_scheme() const { return itensor_->q_scheme(); }
 
 const uint8_t *Tensor::getOrBuildKaiRhsPacked(size_t n, size_t k) const {
-  // Only Int4QTensor implements the cache; for any other backing tensor
-  // type the caller falls back to its own pack path.
-  if (getDataType() != ml::train::TensorDim::DataType::QINT4) {
-    return nullptr;
-  }
-  auto *int4_t = static_cast<Int4QTensor *>(itensor_.get());
-  return int4_t->getOrBuildKaiRhsPacked(n, k);
+  // The KAI rhs-packed cache lived on the removed Int4QTensor; int4 weights are
+  // now QS4CX and build their pack via QS4CX_Tensor::pack(). [Phase C Path B]
+  (void)n; (void)k;
+  return nullptr;
 }
 
 void Tensor::mergeAxis(unsigned int axis1, unsigned int axis2) {

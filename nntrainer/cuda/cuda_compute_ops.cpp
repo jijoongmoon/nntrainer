@@ -30,7 +30,6 @@
 #include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <fp16.h>
-#include <int4_tensor.h>
 #include <int4_utils.h>
 #include <map>
 #include <mutex>

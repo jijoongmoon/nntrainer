@@ -16,7 +16,6 @@
 #include <chrono>
 #include <cpu_backend.h>
 #include <float_tensor.h>
-#include <int4_tensor.h>
 #include <int4_utils.h>
 #include <q4_0_utils.h>
 #include <thread_manager.h>
@@ -814,10 +813,10 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
       }
       if (M == 1) {
         o->gemv_int4_batch_fp32(mdatas, scales, data, rdatas, K, Ns,
-                                Int4QTensor::getGroupSize());
+                                32);
       } else {
         o->gemm_int4_batch_fp32(data, mdatas, scales, rdatas, M, Ns, K,
-                                Int4QTensor::getGroupSize());
+                                32);
       }
     } else {
       /// @todo Replace with standard CPU INT4 computation
@@ -1017,10 +1016,10 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
       output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
     if (M == 1) {
       o->gemv_int4_accel_fp32(mdata, input.getScale<uint16_t>(), data, rdata, K,
-                              N, Int4QTensor::getGroupSize());
+                              N, 32);
     } else {
       o->sgemm_int4_accel_fp32(data, mdata, input.getScale<uint16_t>(), rdata,
-                               M, N, K, Int4QTensor::getGroupSize());
+                               M, N, K, 32);
     }
   } else {
 #ifdef ENABLE_FP16

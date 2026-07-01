@@ -33,7 +33,6 @@
 #include <common.h>
 #include <cpu_backend.h>
 #include <fp16.h>
-#include <int4_tensor.h>
 #include <int4_utils.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
@@ -477,14 +476,19 @@ public:
                   Int4Utils::quantizeAndPackKai(weight_t.getData<float>(), N,
                                                 K, qw, qs);
 
-                  Tensor quant_weight(dim.batch(), dim.channel(), K, N,
-                                      {Tformat::NCHW, dtype},
-                                      QScheme::KAI_QSI4CXP_4x4x32);
-                  std::memcpy(quant_weight.getData<uint8_t>(), qw.data(),
-                              qw.size());
-                  std::memcpy(quant_weight.getScale<uint16_t>(), qs.data(),
-                              qs.size() * sizeof(uint16_t));
-                  quant_weight.save(file);
+                  // [Phase C Path B] Write the legacy KAI Section A QINT4 record
+                  // directly (u16 qscheme header + Section A nibbles + fp16
+                  // scales), byte-identical to what Int4QTensor::save produced,
+                  // so the Int4QTensor class is no longer needed to emit a legacy
+                  // QINT4 .bin.
+                  const uint16_t code =
+                    static_cast<uint16_t>(QScheme::KAI_QSI4CXP_4x4x32);
+                  file.write(reinterpret_cast<const char *>(&code),
+                             sizeof(uint16_t));
+                  file.write(reinterpret_cast<const char *>(qw.data()),
+                             qw.size());
+                  file.write(reinterpret_cast<const char *>(qs.data()),
+                             qs.size() * sizeof(uint16_t));
                 }
               }
             } else if (dtype == TensorDim::DataType::QS4CX) {

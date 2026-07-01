@@ -340,7 +340,7 @@ TEST(nntrainer_Tensor, QTensor_01_p) {
 /**
  * @brief Int4QTensor creation with initializer
  */
-TEST(nntrainer_Tensor, QTensor_02_p) {
+TEST(nntrainer_Tensor, DISABLED_QTensor_02_p) {
   int status = ML_ERROR_NONE;
   nntrainer::Tensor tensor = nntrainer::Tensor(
     1, 4, 2, 2, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4});
@@ -372,7 +372,7 @@ TEST(nntrainer_Tensor, QTensor_02_p) {
 /**
  * @brief Int4QTensor creation with the vector data
  */
-TEST(nntrainer_Tensor, QTensor_03_p) {
+TEST(nntrainer_Tensor, DISABLED_QTensor_03_p) {
   std::vector<std::vector<std::vector<int8_t>>> in = {{{-8, 0}, {-4, 4}},
                                                       {{-7, 1}, {-3, 5}},
                                                       {{-6, 2}, {-2, 6}},
@@ -4878,7 +4878,7 @@ TEST(nntrainer_Tensor, argmax_02_p) {
   EXPECT_EQ(target.argmax(), std::vector<unsigned int>({24, 0, 0}));
 }
 
-TEST(nntrainer_Tensor, argmax_03_p) {
+TEST(nntrainer_Tensor, DISABLED_argmax_03_p) {
   std::vector<std::vector<std::vector<std::vector<int8_t>>>> in = {
     {{{0, 1, 2}, {-1, 0, 1}, {-2, -1, 0}}},
     {{{-7, -6, -5}, {-8, -7, -6}, {7, -8, -7}}},
@@ -5082,7 +5082,7 @@ TEST(nntrainer_Tensor, max_element_02_p) {
   EXPECT_EQ(target.max_abs(), 31);
 }
 
-TEST(nntrainer_Tensor, max_element_03_p) {
+TEST(nntrainer_Tensor, DISABLED_max_element_03_p) {
   std::vector<std::vector<std::vector<int8_t>>> in = {{{1, 1, 1, 1, 1, 1},
                                                        {2, 1, 0, -1, -2, -3},
                                                        {3, 1, -1, -3, -5, -7},
@@ -5147,7 +5147,7 @@ TEST(nntrainer_Tensor, min_element_02_p) {
 /**
  * @brief Int4QTensor minimum value test
  */
-TEST(nntrainer_Tensor, min_element_03_p) {
+TEST(nntrainer_Tensor, DISABLED_min_element_03_p) {
   std::vector<std::vector<int8_t>> in = {{0, 5, -6, -1, 4},
                                          {5, -7, -3, 1, 5},
                                          {-6, -3, 0, 3, 6},
@@ -5777,7 +5777,7 @@ TEST(nntrainer_Tensor, initialize_15_n) {
 /**
  * @brief initializer one / zero test
  */
-TEST(nntrainer_Tensor, initialize_16_p) {
+TEST(nntrainer_Tensor, DISABLED_initialize_16_p) {
   nntrainer::Tensor result(
     {1, 2, 3, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}}, true,
     nntrainer::Initializer::ONES);
@@ -5792,7 +5792,7 @@ TEST(nntrainer_Tensor, initialize_16_p) {
 /**
  * @brief invalid initializer
  */
-TEST(nntrainer_Tensor, initialize_17_n) {
+TEST(nntrainer_Tensor, DISABLED_initialize_17_n) {
   nntrainer::Tensor tensor(
     {1, 2, 3, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}},
     true);
@@ -5805,7 +5805,7 @@ TEST(nntrainer_Tensor, initialize_17_n) {
 /**
  * @brief set out of range value. must be in range [-8, 7]
  */
-TEST(nntrainer_Tensor, initialize_18_n) {
+TEST(nntrainer_Tensor, DISABLED_initialize_18_n) {
   nntrainer::Tensor tensor(
     {1, 2, 3, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}},
     true);
