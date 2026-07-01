@@ -2654,37 +2654,6 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
   return backing;
 }
 
-std::unique_ptr<tv::TensorBacking>
-make_v8c_weight_backing_from_kai_section_a(const uint8_t *section_a,
-                                           const uint16_t *fp16_scales,
-                                           unsigned int N, unsigned int K,
-                                           cl_mem *out_scale_buf,
-                                           cl_mem *out_row_sum_w_int4_buf) {
-  if (K % 32 != 0)
-    throw std::invalid_argument(
-      "make_v8c_weight_backing_from_kai_section_a: K must be a multiple of 32");
-  if (N % 4 != 0)
-    throw std::invalid_argument("make_v8c_weight_backing_from_kai_section_a: "
-                                "N must be a multiple of KAI nr=4");
-
-  // [Phase C 2/n] Single v8c int4 decode path. A legacy QINT4 (KAI Section-A
-  // nibbles + fp16 scale) weight is losslessly re-laid to the canonical QS4CX
-  // plain form (Int4Utils::sectionAToPlain — exact nibble de-permutation, no
-  // dequant/requant) and its fp16 scales widened to fp32, then built through
-  // the one v8c builder below. Proven byte-identical to the old direct
-  // Section-A decode (same int4 values => identical v8c backing/scale/row-sum),
-  // so the GEMM is unchanged; this collapses the two int4 v8c builders into one.
-  std::vector<uint8_t> plain_nibbles((size_t)N * ((K + 1) / 2));
-  Int4Utils::sectionAToPlain(section_a, N, K, plain_nibbles.data());
-  std::vector<float> fp32_scales(N);
-  for (unsigned int n = 0; n < N; ++n)
-    fp32_scales[n] = compute_fp16_to_fp32(fp16_scales[n]);
-  return make_v8c_weight_backing_from_qs4cx(plain_nibbles.data(),
-                                            fp32_scales.data(), N, K,
-                                            out_scale_buf,
-                                            out_row_sum_w_int4_buf);
-}
-
 // [Phase B / weight 한벌] Build the SAME v8c GEMM backing from an upstream QS4CX
 // plain weight instead of our KAI Section-A. QS4CX on-disk = plain row-major
 // nibbles (N rows of (K+1)/2 bytes; even k = low nibble, odd k = high nibble;

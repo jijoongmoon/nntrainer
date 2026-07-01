@@ -562,44 +562,7 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
                         cl_mem *out_scale_buf);
 
 /**
- * @brief Build a v8c weight backing directly from the on-disk KAI Section A
- *        nibble bytes — no dequant→fp32→requant cycle. Both formats use
- *        per-output-channel scale (KAI fp16 saved, v8c fp32 uploaded) and
- *        offset-encoded nibbles (KAI XOR 0x88, v8c (+8) & 0xF — same bit
- *        pattern). Differences are limited to K-axis byte permutation:
- *
- *          KAI Section A super-row layout (nr=4, kr=16, sr=2):
- *            For each super-row of 4 output channels, the 4 channels are
- *            byte-block interleaved (8 bytes per nr-block), and within each
- *            byte the lo/hi nibbles are K and K+kr=K+16. Two super_blocks
- *            (8+8 bytes per nr) together cover one 32-K span.
- *
- *          v8c per-channel row-major layout:
- *            For each output channel n, K/2 bytes; per 32-K block, 16 bytes
- *            arranged as byte(c*4 + b) = (qH<<4) | qL where qL = K(c*8+b)
- *            and qH = K(c*8+b+4). Image2d view: width=K/32, height=N, RGBA
- *            UINT32 (16 bytes per texel = 32 K-channels).
- *
- *        Output: per-channel fp32 scale (from KAI's saved fp16 scales,
- *        promoted) and the permuted offset-encoded nibble buffer wrapped
- *        in a TensorBacking. No quantization-noise added.
- *
- * @param[in]  section_a    pointer to KAI Section A nibble bytes
- *                          (= Int4Utils::kaiNibblePayloadBytes(N,K))
- * @param[in]  fp16_scales  pointer to per-channel fp16 scales (length N)
- * @param[in]  N            output channels (must be multiple of 4 — KAI nr)
- * @param[in]  K            input dim (must be multiple of 32)
- * @param[out] out_scale_buf cl_mem (fp32, [N], CL_MEM_READ_ONLY) — caller owns
- */
-std::unique_ptr<tv::TensorBacking>
-make_v8c_weight_backing_from_kai_section_a(const uint8_t *section_a,
-                                           const uint16_t *fp16_scales,
-                                           unsigned int N, unsigned int K,
-                                           cl_mem *out_scale_buf,
-                                           cl_mem *out_row_sum_w_int4_buf);
-
-/**
- * @brief Same as make_v8c_weight_backing_from_kai_section_a but from an upstream
+ * @brief Build the v8c GEMM weight backing from an upstream
  * QS4CX plain weight: row-major nibbles (N x (K+1)/2 bytes, even k=low nibble,
  * uint4=int4+8, no XOR) + per-output-channel fp32 scale (range/15). Produces the
  * identical v8c backing/scale/row-sum the GEMM consumes [weight 한벌 / Phase B].
