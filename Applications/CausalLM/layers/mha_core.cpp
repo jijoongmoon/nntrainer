@@ -1767,8 +1767,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     const bool _gpu_rope_decode =
       _gpu_rope_decode_env ||
       (std::get<props::GpuDecodeRope>(mha_core_props).get() && !_kv_img_attn_env);
-    const bool _rope_len_ok = (to - from) >= ROPE_MIN_PREFILL ||
-                              (_gpu_rope_decode && (to - from) == 1);
+    // Image path (Adreno): a GPU RoPE kernel dispatch per layer for the M=1
+    // decode step is SLOWER than the trivial host rotation of a single row
+    // (measured ~14.7 vs ~18 TPS); keep the GPU path for prefill (the big win)
+    // and let decode fall to the host RoPE. Non-image (Intel/CUDA) unchanged.
+    // NNTR_MHA_GPU_DECODE still forces the GPU decode path (_gpu_rope_decode).
+    const bool _rope_len_ok =
+      ((to - from) >= ROPE_MIN_PREFILL &&
+       !(_kv_img_attn_env && (to - from) == 1)) ||
+      (_gpu_rope_decode && (to - from) == 1);
     if (!_gpu_rope_off && _mha_gpu_on && use_gemm_attention && !kv_int8 &&
         !kv_ohwi_now && _rope_len_ok &&
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
