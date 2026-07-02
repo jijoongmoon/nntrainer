@@ -329,6 +329,14 @@ Tensor::Tensor(const std::unique_ptr<TensorBase> &rhs) {
 #else
     throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif
+  } else if (rhs->getDataType() == Tdatatype::Q4_K) {
+    itensor_ = std::make_unique<Q4_K_Tensor>(*rhs.get());
+  } else if (rhs->getDataType() == Tdatatype::Q6_K) {
+    itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.get());
+  } else if (rhs->getDataType() == Tdatatype::Q4_0) {
+    itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.get());
+  } else if (rhs->getDataType() == Tdatatype::QS4CX) {
+    itensor_ = std::make_unique<QS4CX_Tensor>(*rhs.get());
   } else if (rhs->getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.get());
   } else if (rhs->getDataType() == Tdatatype::UINT8) {
@@ -350,6 +358,10 @@ Tensor::Tensor(const std::unique_ptr<TensorBase> &rhs) {
     throw std::invalid_argument("Error: enable-biqgemm is not activated. "
                                 "Enable only if your system supports BiQGEMM.");
 #endif
+  } else {
+    throw std::invalid_argument(
+      "Tensor(unique_ptr<TensorBase>): unsupported data type " +
+      std::to_string(static_cast<int>(rhs->getDataType())));
   }
 }
 
@@ -368,6 +380,8 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::QS4CX) {
+    itensor_ = std::make_unique<QS4CX_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -389,6 +403,10 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
     throw std::invalid_argument("Error: enable-biqgemm is not activated. "
                                 "Enable only if your system supports BiQGEMM.");
 #endif
+  } else {
+    throw std::invalid_argument(
+      "Tensor::operator=: unsupported data type " +
+      std::to_string(static_cast<int>(rhs.getDataType())));
   }
 
   /** copy tensor properties */
@@ -419,6 +437,8 @@ bool Tensor::operator==(const Tensor &rhs) const {
       return itensorCompare<Q6_K_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::Q4_0) {
       return itensorCompare<Q4_0_Tensor>(itensor_.get(), rhs.itensor_.get());
+    } else if (getDataType() == Tdatatype::QS4CX) {
+      return itensorCompare<QS4CX_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT4) {
       return itensorCompare<Uint4QTensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT8) {
