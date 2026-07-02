@@ -1,8 +1,20 @@
 # nntrainer Multi-HW Backend Refactor — Architecture
 
-> **Status: DESIGN / DISCUSSION DRAFT (2026-06-26).** No code changed yet.
-> This document is the materials for deciding *what to implement*. After review we
-> split into add / keep / drop and only then write the task list (§10).
+> **Status: PARTIALLY IMPLEMENTED (updated 2026-07-02).** The design below has landed in
+> code in large part; this section now tracks *what is built vs. still to-add* (§10 task IDs).
+> **Implemented [E]:** T1 `DeviceCaps`+`Context::caps()` (`context.h:63,429`); T2 `MemAllocator`
+> capability predicates (`mem_allocator.h:89-151`, wired `memory_pool.cpp:256`); T6
+> `CudaComputeOps : CpuComputeOps` + `get_cuda_ops()` bound (`cuda_compute_ops.cpp:48`,
+> `cuda_context.cpp:79`); T9 `Context::runDecode` SEAM-2 (`context.h:471`, base `neuralnet.cpp:618`,
+> CUDA override `cuda_context.cpp:224`); T13 `engine=npu`→QNN alias (`engine.cpp:93`); T10
+> `FusionRealizer` (`compiler/fusion_realizer.cpp`) — env-gated `NNTR_FUSE_ACT` + **inference-gated**
+> (`neuralnet.cpp:232`, commit `bfc0f2f0b`, after a training-gradient bug). **Partial:** T3 registry
+> open — engine-level done (`engine.cpp:113` validates the live registered-name set) but the
+> layer-level closed enum still loops (`layer_node.cpp:142`); T7 op_table — fc/geglu/swiglu absorbed,
+> but attention/rmsnorm/rope still bypass. **Shadow / inert:** T4 `ExecPlan` resolver + T11
+> `ModelFeatures` are SHADOW (resolved+logged, not authoritative; `context.h:146,208,255`); T5
+> `TensorRole` threaded but inert. **Not started:** T8 (flip resolver authoritative), T14 (QNN
+> `OffloadNode`). Anchors below are being updated to match the tree.
 > Every node/step is tagged **[E]** existing in tree, **[N]** to-add, **[E→collapse]**
 > exists but folds away. Anchors are `file:line` against the current tree.
 
@@ -232,22 +244,22 @@ NeutralLayer ..> ComputeOpsExt : dispatches
 |---|---|---|
 | Engine, Context(+subclasses), ContextData | **[E]** | spine works; `getName()` returns cpu/gpu/cuda/qnn |
 | ComputeOps (+Cpu/Cl/Cuda), get_*_ops singletons | **[E]** | whole-op virtuals incl. `swiglu_fp32`/`tanh_gelu_mul_fp32`/`gemm_q4_*` exist (`compute_ops.h:109/116/154`) **but hot kernels bypass it** |
-| MemAllocator (+ClSVM/Cuda/QNNRpc) | **[E]** | `getName()` should become logs-only |
+| MemAllocator (+ClSVM/Cuda/QNNRpc) | **[E]** | capability predicates LANDED (`mem_allocator.h:89-151`: `isHostAddressable`/`isDeviceVisible`/`isSVM`/`needsRegister`); residency now derives from `isSVM()` (`memory_pool.cpp:256`), not `getName()` (T2 done) |
 | ResidencyClass {HOST,SVM,GPU_CLMEM} | **[E]** | `memory_data.h:38`, OpenCL-shaped/closed |
 | QNNGraph (fat-node) | **[E]** | `QNNGraph.cpp:196` = makeContext+graphExecute over offline `.bin` |
-| CUDA-graph capture/replay | **[E→move]** | `neuralnet.cpp:1694-1928` — *prototype/ceiling harness* (re-instantiates per step, comment "purely to prove"); to be MOVED into `CudaContext::runDecode`, not written |
+| CUDA-graph capture/replay | **[E]** | **MOVED** into `CudaContext::runDecode` (`cuda_context.cpp:224`+); still the per-step re-instantiate *prototype/ceiling harness* (comment "purely to prove" `cuda_context.cpp:233`); `neuralnet.cpp:618` now holds only the base no-op walk (`incremental_forwarding`) |
 | BackendLayerForks (cl_layers/cuda_layers/`*_gpu`) | **[E→collapse]** | fold into NeutralLayer + op_table |
-| DeviceCaps, ContextCapsExt(caps/residencyFor/runDecode) | **[N]** | grep-confirmed absent |
+| DeviceCaps, `Context::caps()`, `Context::runDecode()` | **[E]** | LANDED: struct `context.h:63`, `caps()` `context.h:429`, `runDecode()` `context.h:471` + base `neuralnet.cpp:618` + CUDA override `cuda_context.cpp:224`; **`residencyFor` still [N]** (absent) |
 | ComputeOpsExt (fc_qint4/rmsnorm/rope/attention/fused_*) | **[N]** | absorbs `dotCl_v8c`+`cudaFcGemm` |
 | QualcommComputeOps (HexKL) | **[N]** | Mode-2 op-by-op NPU |
-| MemAllocatorCapsExt, ResidencyClassExt (RPCMEM/IMAGE2D) | **[N]** | UVM rides SVM tag |
-| ExecPlanResolver, ModelFeatures | **[N]** | ModelFeatures replaces the `is_gemma2` proxy (`aa3d7530`) |
-| FusionRealizer, OffloadNode, NeutralLayer | **[N]** | FusionRealizer is a sibling of `bn_realizer` |
+| MemAllocatorCapsExt, ResidencyClassExt (RPCMEM/IMAGE2D) | **[E]** | predicates landed (`mem_allocator.h:89-151`); RPCMEM/IMAGE2D enum values reserved (`memory_data.h:47-48`) with consumers pending (M4-M7); UVM rides SVM tag |
+| ExecPlan resolver, ModelFeatures | **[E shadow]** | landed as free fns + structs (`context.h:146,170,208,255`); resolved+logged only, zero authoritative consumers (flip = T8). ModelFeatures replaces the `is_gemma2` proxy |
+| FusionRealizer **[E]**; OffloadNode, NeutralLayer **[N]** | mixed | FusionRealizer landed (`compiler/fusion_realizer.cpp`, inference- + CPU-engine-gated); OffloadNode/NeutralLayer absent |
 
-> ⚠ **CudaContext→CudaComputeOps is target-state.** Today `cuda_context.cpp:49` binds
-> `get_cpu_ops()` (UVM is host-coherent so unported ops run the CPU path on managed pointers);
-> `get_cuda_ops()` exists (`cuda_compute_ops.cpp:54`) but is unwired. The flip requires
-> `CudaComputeOps : public CpuComputeOps` first, else unported ops throw.
+> ✅ **CudaContext→CudaComputeOps DONE (T6).** `cuda_context.cpp:79` now binds `get_cuda_ops()`
+> (not `get_cpu_ops()`); `CudaComputeOps : public CpuComputeOps` exists (`cuda_compute_ops.cpp:48`,
+> `get_cuda_ops()` singleton `:291`), so unported ops fall through to the CPU path on host-coherent
+> UVM pointers rather than throwing.
 
 ---
 
@@ -403,7 +415,7 @@ op_table BYPASSED** (graphExecute over an offline `.bin`).
 | **engine/pool** `:247-279` [E] | host-malloc pool (default `MemAllocator`) | `GPU_SVM_POOL`→ClSVMAllocator | `CUDA_UVM_POOL`→CudaMemAllocator | RPCMEM pool (QNNRpcManager) |
 | **finalize** `network_graph.cpp:1096` [E] | CpuComputeOps | ClComputeOps; **dotCl_v8c→fc_qint4, collapse cl_layers** [E/N] | CudaComputeOps; **cudaFcGemm→fc_qint4, collapse cuda_layers** [E/N] | op_table **BYPASSED** — OffloadNode binds `.bin` |
 | **allocate** `:2035` [E] | HOST | **Intel** = SVM + cl_mem buffer (`V8C_BUF`); **IMAGE2D-KV = Adreno only** (`read_imageui` won't compile on Intel NEO) [E / N IMAGE2D tag] | UVM device-resident → SVM tag [E/N] | **RPCMEM, needsRegister** [E alloc / N predicate] |
-| **run/decode** SEAM-2 `runDecode` [N] | **default walk()** | eager **or** recq replay (Adreno); Xe3 clFinish [N hook / E recq+xe3] | **CUDA-graph capture+replay** wraps `:1694-1928` [N hook / E logic] | **eager** (no capture) |
+| **run/decode** SEAM-2 `runDecode` [E hook] | **default walk()** | eager **or** recq replay (Adreno); Xe3 clFinish [E hook / E recq+xe3] | **CUDA-graph capture+replay** in `cuda_context.cpp:224` [E hook / E logic] | **eager** (no capture) |
 | **decode (1-line)** | eager, no hook | eager + opt recq | eager → whole-graph **CAPTURE/replay** | whole-graph **OFFLOAD** |
 
 ### CPU — eager op-by-op, no decode hook
@@ -461,7 +473,7 @@ sequenceDiagram
     participant SM as "StreamManager [E]"
     participant Walk as "incremental_forwarding [E]"
     participant Ops as "CudaComputeOps op_table [E/N]"
-    NN->>Ctx: runDecode SEAM-2 [N wraps 1694-1928]
+    NN->>Ctx: runDecode SEAM-2 [E cuda_context.cpp:224]
     alt first token capture [E]
         Ctx->>SM: beginCapture [E]
         Ctx->>Walk: walk eager kernels [E]
@@ -478,9 +490,10 @@ sequenceDiagram
     Ctx-->>NN: next-token logits [E]
 ```
 
-> ⚠ The CUDA-graph block (`neuralnet.cpp:1694-1928`) is today a **prototype/ceiling harness**
-> (re-instantiates per step, comment "purely to prove"). The refactor *moves* it behind
-> `CudaContext::runDecode` and turns it into a real single-capture replay.
+> ⚠ The CUDA-graph block has been **MOVED** behind `CudaContext::runDecode` (`cuda_context.cpp:224`+);
+> it is still the **prototype/ceiling harness** (re-instantiates per step, comment "purely to prove"
+> `cuda_context.cpp:233`). Remaining work: turn it into a real single-capture replay. `neuralnet.cpp`
+> now holds only the base no-op `runDecode` walk (`neuralnet.cpp:618`).
 
 ### QNN (Qualcomm HTP) — whole-graph OffloadNode, op_table BYPASSED
 
@@ -720,12 +733,17 @@ seam already exists) and is the only category that benefits the **training / CNN
 Exynos uses its **own SDK** (Exynos Neural Network / ENN), not QNN — the generality test. Goal: light
 it up without touching CPU/CL/CUDA hot paths or any model `.cpp`.
 
-1. **Open the closed enum [edit existing — the ONLY unavoidable shared edit until the registry is opened].**
+1. **Open the closed enum [edit existing — the ONLY unavoidable shared edit until the *layer-level*
+   registry is opened].** ⚠ `parseComputeEngine` **no longer** reads the enum — it validates `engine=`
+   against the live registered-context name set (`engine.cpp:113-133`), so a self-registering vendor
+   Context resolves with no enum edit. The remaining closed-enum consumer is the **layer-level**
+   `getComputeEngine` (`layer_node.cpp:142`), which still loops `ComputeEngineTypeInfo::EnumList`/
+   `EnumStr` to map `engine=` → `LayerComputeEngine`:
    - `api/ccapi/include/common.h:49` — add `EXYNOS` to `enum LayerComputeEngine {CPU,GPU,QNN,CUDA}`.
    - `nntrainer/utils/base_properties.h:816` — add `"exynos"` to `ComputeEngineTypeInfo::EnumStr[]`
-     (the string list `parseComputeEngine` validates against, `engine.cpp:99-106`).
-   - *Both* are real and both must change until §9-item "open the registry" replaces the closed-enum
-     validation with the registered-name set — after which a new backend touches neither.
+     (the string list `getComputeEngine` matches against, `layer_node.cpp:142-159`).
+   - *Both* are real and both must change until §9-item "open the registry" replaces the layer-level
+     closed-enum lookup with the registered-name set — after which a new backend touches neither.
 2. **Add the Context [new files].** `exynos_context.{h,cpp}` : subclass `Context`; `getName()→"exynos"`;
    self-register at link time (CL/CUDA pattern) OR `dlopen` (QNN pattern, since the SDK is closed);
    `caps()→DeviceCaps{isIntegrated, needsRegister, supportsImage2D=false, wholeGraphOffload, eager_op}`.
@@ -761,19 +779,27 @@ MemAllocator + 3 subclasses; SEAM-1 `Layer::forwarding()`; QNNGraph fat-node pro
 capture/replay logic (move, don't write); pool/residency env routing; backend Layer forks (collapse
 targets); per-model graph builders (single-source).
 
-### TO-ADD — genuinely absent (grep-clean)
-DeviceCaps + `Context::caps()`; `Context::residencyFor()` + ResidencyClass ext (RPCMEM/IMAGE2D, UVM
-rides SVM); `Context::runDecode()` (SEAM-2, default `walk()`); ComputeOps completion (fc_qint4 absorbing
-dotCl_v8c/cudaFcGemm, rmsnorm, rope, attention, fused_* incl. **conv_relu/fc_act**); NeutralLayer set +
-collapse of forks; MemAllocator capability predicates; ModelFeatures struct + ExecPlanResolver;
-FusionRealizer + OffloadNode; open the enum/registry; (optional) QualcommComputeOps (HexKL) for Mode-2.
+### LANDED — now in tree (updated 2026-07-02)
+DeviceCaps + `Context::caps()` (`context.h:63,429`); `Context::runDecode()` (SEAM-2, default `walk()`;
+`context.h:471`, base `neuralnet.cpp:618`, CUDA override `cuda_context.cpp:224`); MemAllocator capability
+predicates (`mem_allocator.h:89-151`, wired `memory_pool.cpp:256`); ModelFeatures struct + ExecPlan
+resolver — SHADOW (resolved+logged, not authoritative; `context.h:146,208,255`); FusionRealizer
+(`compiler/fusion_realizer.cpp`, inference-gated `neuralnet.cpp:232`); open the enum/registry —
+engine-level done (`engine.cpp:113` validates the registered-name set) though the layer-level enum still
+loops (`layer_node.cpp:142`); partial ComputeOps completion (fc/geglu/swiglu absorbed).
+
+### STILL ABSENT — genuinely to-add (grep-clean)
+`Context::residencyFor()` + ResidencyClass ext (RPCMEM/IMAGE2D, UVM rides SVM); ComputeOps completion
+for **rmsnorm/rope/attention** (still bypass the op_table) + fused_* incl. **conv_relu/fc_act**;
+NeutralLayer set + collapse of `*_cl`/`*_cuda` forks; `OffloadNode` (QNN Mode-1 generalize); (optional)
+`QualcommComputeOps` (HexKL) for Mode-2.
 
 ### DECISIONS MADE (2026-06-26)
 - **#3 NPU default mode → Mode-1 (whole-graph offload, QNN HTP `.bin`).** Works today (QNNGraph), best perf, fastest to ship. Roadmap: resolver-ize the existing `QNNGraph` into a `FuseRealizer` claim-all `OffloadNode` (NPU N0→N1, SHIP). **Mode-2 (HexKL op-by-op / `QualcommComputeOps`) is deferred**, not the first target.
 - **§11 Quick.AI split timing → split LAST, after the FULL refactor is complete.** Rationale: consistency — keep `Applications/CausalLM` in-tree while the whole multi-HW refactor lands (so every change stays token-identical-gated and consistent across CPU/CL/CUDA/NPU in one repo), then cut `Quick.AI`. The §11 prerequisites (S1 registration facade, S2 layer-author SDK, S4 op_table collapse) are done as part of the refactor; **S5 (the repo cut) is the very last step**, after all decisions land and the refactor is stable.
 - **#1 Layer promotion scope → CRITERION: promote if the variability is expressible as PARAMETERS / ModelFeatures; keep if single-model or model-tuned code.** This is the §4 generality line = the §11 nntrainer/Quick.AI boundary. **PROMOTE** (param-general): RMSNorm, ReshapedRMSNorm, SwiGLU, GeGLU, RoPE, `llm_mha` (sliding/softcap/GQA/head_dim are params), QKV, FC/shared_FC, lm_head, scalar_multiply, tie_word_embedding, **logit_softcapping** (a parametrized activation). **KEEP** (model-specific): per_layer_slice (gemma4 PLE), deberta_attention, embedding_normalize/pooling, rms_reverse_norm, **MoE** (qwen_moe/gpt_oss_moe — impl is model-tuned cached/fsu; future-promote once parameterized into a clean general MoE primitive). Note: KEEP layers still register via the public `registerLayerFactory` API and dispatch through the same op_table.
 - **#5 runDecode generality → ONE `Context::runDecode` hook, per-backend and performance/caps-driven.** Each backend implements it for its best path (CPU eager default `walk()`, CUDA capture-replay, Adreno recq, Intel eager); the **Orin-vs-RTX prefill-graph** difference is a `caps.isIntegrated`/`graph_capture` decision *inside* `CudaContext::runDecode`, not a separate context. The mode is `ExecPlan.mode` resolved by `caps × ExecMode` for performance — situation-driven, not one forced uniform behavior.
-- **#6 Fusion ownership & scope → DO NOW, as part of the refactor.** `FusionRealizer` in the compile realizer chain (sibling of `bn_realizer`), caps-gated. **Activation/epilogue fusion first** (conv+relu, fc+act — most general, benefits CPU/CNN/training too, reuses the existing `ActivationRealizer` seam). **CPU gets fusion by default** (it is a cache-locality win, not accelerator-only).
+- **#6 Fusion ownership & scope → DO NOW, as part of the refactor.** `FusionRealizer` in the compile realizer chain (sibling of `bn_realizer`), caps-gated. **Activation/epilogue fusion first** (conv+relu, fc+act — most general, benefits CPU/CNN/training too, reuses the existing `ActivationRealizer` seam). **CPU gets fusion by default** (it is a cache-locality win, not accelerator-only). *(As-built T10: `FusionRealizer` is env-gated `NNTR_FUSE_ACT` (default on) + **inference-gated** (`neuralnet.cpp:232`, commit `bfc0f2f0b`) because the fused backward drops `act'`; **caps-gating for profitability is future work**, not yet wired.)*
 - **#2 NeutralLayer vs op_table split → A: thin Layer + whole-op op_table.** The Layer owns structure/shape/weight-binding/orchestration; ComputeOps owns the whole-op kernel (one `ops->rmsnorm/rope/attention/fc(...)` per op, never per-element). `mha_core` is a Layer that orchestrates several op_table calls. Matches the existing `swiglu_fp32`/`tanh_gelu_mul_fp32` pattern.
 - **#4 Residency policy ownership → B: MemAllocator capability predicates OWN residency** (no separate `Context::residencyFor` method). The `ResidencyClass` derives from the allocator (`isHostAddressable`/`isDeviceVisible`/`isSVM`); the per-role crossover (Adreno image2d-KV vs SVM) is carried via the allocator's `makePool`/capabilities (or a role hint to the allocator), keeping per-backend planes in the allocator. *(Supersedes the memory-synthesis lean toward `Context::residencyFor`; revisit only if a tensor's role needs model knowledge the allocator lacks.)*
 - **#7 Registry opening → A: open the closed enum to registered-names NOW.** `parseComputeEngine` validates `engine=` against the registered-context name set, not the closed `LayerComputeEngine` enum (`common.h:49`) + string list (`base_properties.h:816`). Shared foundation for vendor add-only (S.LSI) and the Quick.AI registration facade (§11 S1) — done as part of the refactor even though the repo cut (S5) is last.
@@ -872,9 +898,10 @@ meson-installed, just unversioned with no stability contract).
 The include/link dependency is **already one-directional** — zero real `nntrainer/ → CausalLM`
 `#include` (the 15 `CausalLM` matches are comments or `void*` forward-decls, e.g.
 `attention_kernels.h:372`). ⚠ But two **semantic back-edges** must be cleaned (nntrainer core knowing
-app conventions): (a) CL/CUDA FC layers branch on the app layer-name string
-`context.getName()=="output_of_causallm"` (`fc_layer_cl.cpp:155/362`, `cuda_fc_layer.cpp:280`) to gate
-skip_prefill — replace with a generic layer **role/property**; (b) the on-GPU argmax control
+app conventions): (a) the CL FC layer branches on the app layer-name string
+`context.getName()=="output_of_causallm"` (`fc_layer_cl.cpp:73`) to gate skip_prefill — replace with a
+generic layer **role/property** (the CUDA FC path is `nntrainer/cuda/cuda_fc_qint4.cpp` — there is no
+`cuda_fc_layer.cpp` — and carries no such string); (b) the on-GPU argmax control
 (`g_argmax_requested`, `blas_kernels.cpp:3084`) driven by CausalLM — make it a public API or app-owned.
 
 | Component | Goes to | Why |
