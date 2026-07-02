@@ -105,3 +105,9 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 
+
+# runtime OpenCL kernel-binary cache (auto-regenerated on first run; driver-specific)
+nntrainer_opencl_kernels/
+# session analysis artifacts (not procedure-encoding)
+.claude/reports/
+.claude/profiles/
