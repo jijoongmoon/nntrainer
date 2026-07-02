@@ -33,34 +33,41 @@
 static std::mutex rope_init_mtx;
 
 // Minimum prefill step_size for routing attention/RoPE onto the GPU paths.
-// Below it the GPU paths (flash/OHWI/RoPE, kernel-launch + cl_mem setup) were
-// historically gated off in favour of the host path. That crossover only holds
-// on ARM, where the host has NEON kernels: on x86 the host path is the slow
-// generic loop, so GPU wins even at tiny step_size (measured on Intel Arc, a
-// 16-token prefill: GPU attention ~8x faster, end-to-end prefill 5.7x). Hence
-// the default is platform-aware. Env override: NNTR_MIN_PREFILL.
-static unsigned int min_prefill_thr() {
-  static const unsigned int v = []() {
+// Below the threshold the prefill falls to the host path. This is HEAD-DIM
+// AWARE because the GPU flash/RoPE prefill kernels are only verified correct
+// for head_dim 256/512 (e.g. gemma): those models keep q/k-norm GPU-resident,
+// so the host fallback would read a stale SVM shadow -> they MUST take the GPU
+// path, which is also a big win even at tiny step_size (~5.7x on Intel Arc,
+// 16-token prefill). head_dim 128 (e.g. qwen3) keeps q/k-norm on the HOST, so
+// the host prefill path is numerically correct there, whereas the Intel GPU
+// flash kernel (flash_attention_prefill_f16_cl) produces GARBAGE for head_dim
+// 128 at small/medium step_size (only very long prefill happens to survive) --
+// so route its prefill to the host path. Env override: NNTR_MIN_PREFILL.
+//   Regression context: commit 143543f71 lowered the x86 gate to 1 for ALL
+//   head_dims (verified only on gemma / head_dim 256); that silently broke
+//   qwen3 short-prompt coherence on Intel while the 1k-prompt benchmarks (long
+//   prefill) kept passing.
+static unsigned int min_prefill_thr(unsigned int head_dim) {
+  static const int env = []() {
     const char *e = std::getenv("NNTR_MIN_PREFILL");
-    if (e)
-      return (unsigned int)std::atoi(e);
-    // The ARM=32 crossover historically routed tiny prefill to the host NEON
-    // attention/RoPE for speed. But that is a CPU heuristic, not a correctness
-    // gate: when GPU mode is requested (NNTR_MHA_GPU) the host fallback must NOT
-    // be taken for short prefill. For q/k-norm models (gemma4/qwen3) the host
-    // RoPE re-reads the stale SVM shadow of the GPU-resident q/k-norm output and
-    // produces garbage, while the GPU path stays coherent. So force the GPU path
-    // at any step_size whenever GPU attention is on -- the threshold then only
-    // governs the pure-host (engine=cpu) ARM build.
-    if (std::getenv("NNTR_MHA_GPU") != nullptr)
-      return 1u;
-#if defined(__x86_64__) || defined(__i386__)
-    return 1u; // x86 (Intel OpenCL / CUDA): no host NEON -> always GPU
-#else
-    return 32u; // ARM host (engine=cpu): host NEON is fast for tiny prefill
-#endif
+    return e ? std::atoi(e) : -1;
   }();
-  return v;
+  if (env >= 0)
+    return (unsigned int)env;
+
+#if defined(__x86_64__) || defined(__i386__)
+  // Intel/CUDA: no host NEON, so the GPU wins even at tiny step_size -- but only
+  // where the flash kernel is verified (head_dim 256/512). head_dim 128 keeps
+  // the (correct) host prefill path until the d128 flash kernel is fixed.
+  return (head_dim >= 256u) ? 1u : UINT_MAX;
+#else
+  // ARM (Adreno): the image attention path is coherent (incl. qwen3); the
+  // host-NEON crossover / GPU-request behaviour is unchanged from before.
+  (void)head_dim;
+  if (std::getenv("NNTR_MHA_GPU") != nullptr)
+    return 1u;
+  return 32u;
+#endif
 }
 
 #include <layer_prof.h>
@@ -1737,7 +1744,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       is_kv_ohwi_enabled() && !kv_int8 &&
       key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       cache_key.getDataType() == ml::train::TensorDim::DataType::FP16;
-    const unsigned int ROPE_MIN_PREFILL = min_prefill_thr(); // env NNTR_MIN_PREFILL
+    const unsigned int ROPE_MIN_PREFILL = min_prefill_thr((unsigned int)head_dim); // env NNTR_MIN_PREFILL
     // S3 decode: NNTR_MHA_GPU_DECODE moves the M=1 decode RoPE onto the GPU so Q
     // stays SVM-resident (q_cl handled in-place) and lower_q/lower_kv become
     // no-ops -- those are clEnqueueReadBuffer(CL_TRUE) blocking drains that cost
@@ -2511,7 +2518,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // success; on failure falls through to the Phase 1 gather + concat
   // path below. Opt-in by both env vars together; no broken-gate.
   {
-    const unsigned int FLASH_MIN_PREFILL = min_prefill_thr(); // env NNTR_MIN_PREFILL
+    const unsigned int FLASH_MIN_PREFILL = min_prefill_thr((unsigned int)head_dim); // env NNTR_MIN_PREFILL
     static const bool _ohwi_gpu_on =
       is_kv_ohwi_enabled() && !kv_int8 &&
       std::getenv("NNTR_MHA_GPU") != nullptr;
@@ -2643,7 +2650,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // and causal-prefill paths, supports GQA and sliding window. Gated on a
   // minimum prefill length: for decode (step_size == 1) the per-row dot
   // path is preferred (no benefit from blocking + softmax bookkeeping).
-  const unsigned int FLASH_MIN_PREFILL = min_prefill_thr(); // env NNTR_MIN_PREFILL
+  const unsigned int FLASH_MIN_PREFILL = min_prefill_thr((unsigned int)head_dim); // env NNTR_MIN_PREFILL
   // S3 (decode GPU attention): NNTR_MHA_GPU_DECODE lets step_size==1 (decode)
   // enter the GPU attention block too. The KV-image (kvimg_view) path scatters
   // the single new token into the mirrors and reads the full N_kv context, so
