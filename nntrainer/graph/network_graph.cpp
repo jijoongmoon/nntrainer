@@ -290,6 +290,12 @@ void NetworkGraph::markNodesForBackwarding() {
   /** mark all the required nodes support backwarding */
   for (auto const &node_name : must_support_backwarding) {
     auto ln = LNODE(graph.getNode(node_name)).get();
+    NNTR_THROW_IF(!ln->supportBackwarding(), std::invalid_argument)
+      << "training requires backwarding through node '" << node_name
+      << "' (type: " << ln->getType()
+      << ") which does not support backwarding — an upstream layer is "
+         "trainable, so its gradient cannot flow. Set trainable=false on the "
+         "upstream layers or compile with ExecutionMode::INFERENCE.";
     ln->needsCalcDerivative(true);
   }
 }
