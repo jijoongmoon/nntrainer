@@ -142,14 +142,29 @@ LayerNode::~LayerNode() = default;
  */
 static ml::train::LayerComputeEngine
 toLayerComputeEngine(const std::string &name) {
+  // Resolve the requested engine NAME through the live Engine registry to the
+  // backing context's CANONICAL name (Context::getName()) before mapping it to
+  // the residency-plane enum. This collapses registry ALIASES onto their
+  // backend with no per-alias special case here: "npu" is registered as an
+  // alias of the "qnn" context (engine.cpp), so it resolves to "qnn" and maps
+  // to QNN below -- the same for any future aliased backend (add-only: register
+  // the context, no edit here). Names not registered in this build (e.g. a
+  // cpu-only build that still parsed "cuda") keep their raw spelling and fall
+  // through the enum table to CPU. [docs/ARCHITECTURE_REFACTOR.md §10 T3]
+  std::string canonical = name;
+  try {
+    auto ctx = nntrainer::Engine::Global().getRegisteredContext(name);
+    if (ctx != nullptr)
+      canonical = ctx->getName();
+  } catch (...) {
+    // unregistered name: fall back to the enum table on the raw spelling
+  }
   constexpr const auto data = std::data(props::ComputeEngineTypeInfo::EnumList);
   for (unsigned int i = 0; i < props::ComputeEngineTypeInfo::EnumList.size();
        ++i) {
-    if (nntrainer::istrequal(name, props::ComputeEngineTypeInfo::EnumStr[i]))
+    if (nntrainer::istrequal(canonical, props::ComputeEngineTypeInfo::EnumStr[i]))
       return data[i];
   }
-  if (nntrainer::istrequal(name, "npu"))
-    return ml::train::LayerComputeEngine::QNN;
   return ml::train::LayerComputeEngine::CPU;
 }
 
