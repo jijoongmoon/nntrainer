@@ -1855,10 +1855,27 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // overridden per token. Byte-identical; opt-in, default off.
         static const bool _recq_kvscalar =
           std::getenv("NNTR_RECQ_KVSCALAR") != nullptr;
+        // On the Adreno image-attention path the qk kernel reads Q from the SVM
+        // plane (Q_p, q_clmem=null; see the OHWI dispatch below). Rotating INTO
+        // the FC's planner cl_mem (q_cl) leaves that SVM plane stale on this
+        // driver (a cl_mem write is not visible through the aliased SVM pointer),
+        // so the qk reads the UN-rotated Q -> garbage. Rotate straight into the
+        // SVM plane (out_clmem=null -> writes Q_p) instead: read the FC output
+        // from q_cl, write the rotation to the SVM Q_p the qk actually consumes.
+        // GPU-resident, no cl_mem->SVM copy. (Non-image/flash keeps q_cl.)
+        void *q_rope_out =
+          q_out_stage != nullptr ? q_out_stage
+                                 : (_kv_img_attn_env ? nullptr : q_cl);
         bool ok = nntrainer::rope_inplace_f16_cl(
                     q_p, q_p, cos_lut, sin_lut, to - from, num_heads_Q, head_dim,
                     cache_index, mp, q_svm, /*in_clmem=*/q_cl,
-                    /*out_clmem=*/q_out_stage != nullptr ? q_out_stage : q_cl) &&
+                    /*out_clmem=*/q_rope_out,
+                    // Image path: rotation lands in the SVM plane the same-queue
+                    // qk kernel reads next; the in-order queue serializes it, so
+                    // only a submission flush is needed (no full clFinish drain).
+                    // This is the pre-regression cost (a drain here cost ~5 TPS
+                    // of decode). Non-image keeps the default drain.
+                    /*drain_svm_out=*/!_kv_img_attn_env) &&
                   nntrainer::rope_inplace_f16_cl(
                     k_p, kc_p, cos_lut, sin_lut, to - from, num_heads_KV,
                     head_dim, cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
@@ -2944,9 +2961,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // the GPU-RoPE staging path is gated off for OHWI. Binding it would
             // feed the qk kernel an UNROTATED Q -> degenerate decode attention.
             // For decode (step_size==1) pass null so the kernel reads Q_p (the
-            // host-rotated SVM query). Prefill keeps q_attn_clmem (the prefill
-            // RoPE/residency path keeps it consistent).
-            void *q_clmem_use = (step_size == 1) ? nullptr : q_attn_clmem;
+            // SVM query). Prefill: the concat GPU-RoPE now rotates straight into
+            // the SVM plane Q_p on the image path (out_clmem=null above), so the
+            // qk must ALSO read Q_p (null) -- binding q_cl would feed the
+            // UN-rotated FC output. Only the (opt-in) staged path writes a
+            // separate cl_mem handle the qk should bind (q_rope_staged).
+            void *q_clmem_use =
+              (step_size == 1 || q_rope_staged == nullptr) ? nullptr
+                                                           : q_attn_clmem;
             // The OHWI image attention enqueues exactly qk -> softmax -> sv (3
             // consecutive dispatches); capture the base ordinal before the call.
             const cl_uint _d_qk = _rec_s ? _cqm2.getRecordDispatchIndex() : 0u;
