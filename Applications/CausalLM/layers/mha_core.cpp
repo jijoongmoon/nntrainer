@@ -56,10 +56,13 @@ static unsigned int min_prefill_thr(unsigned int head_dim) {
     return (unsigned int)env;
 
 #if defined(__x86_64__) || defined(__i386__)
-  // Intel/CUDA: no host NEON, so the GPU wins even at tiny step_size -- but only
-  // where the flash kernel is verified (head_dim 256/512). head_dim 128 keeps
-  // the (correct) host prefill path until the d128 flash kernel is fixed.
-  return (head_dim >= 256u) ? 1u : UINT_MAX;
+  // Intel/CUDA: no host NEON, so the GPU wins even at tiny step_size, for every
+  // head_dim. The head_dim=128 (qwen3) degeneration under sampling was NOT the
+  // flash kernel -- it was the GPU RoPE doing the cos/sin rotation in fp16
+  // (rope_inplace_f16), which distorted the softmax distribution; fixed to fp32
+  // rotation. So GPU flash + GPU RoPE is correct for all head_dims now.
+  (void)head_dim;
+  return 1u;
 #else
   // ARM (Adreno): the image attention path is coherent (incl. qwen3); the
   // host-NEON crossover / GPU-request behaviour is unchanged from before.

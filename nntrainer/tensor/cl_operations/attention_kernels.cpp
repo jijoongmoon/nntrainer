@@ -797,12 +797,19 @@ __kernel void rope_inplace_f16(__global const half *in,
   if (t >= M || h >= num_heads || k >= half_d) return;
   long row = (long)t * num_heads * (2 * half_d) + (long)h * (2 * half_d);
   long lut = (long)(start_pos + t) * half_d + k;
-  half c = cos_lut[lut];
-  half s = sin_lut[lut];
-  half lo = in[row + k];
-  half hi = in[row + k + half_d];
-  out[write_off + row + k]          = lo * c - hi * s;
-  out[write_off + row + k + half_d] = hi * c + lo * s;
+  // Rotate in FP32. Activations (Q/K) are FP16 by design, but doing the
+  // cos/sin multiply-add in half loses enough precision that the rotated Q/K
+  // are subtly wrong -- the ATTENTION SCORE argmax survives (greedy stays
+  // coherent) but the softmax DISTRIBUTION is distorted, which SAMPLING
+  // exposes (qwen3 head_dim=128 / high rope_theta degenerates under
+  // do_sample=true). fp32 rotation makes the distribution match the host RoPE;
+  // only the final store is FP16 (the activation dtype).
+  float c = (float)cos_lut[lut];
+  float s = (float)sin_lut[lut];
+  float lo = (float)in[row + k];
+  float hi = (float)in[row + k + half_d];
+  out[write_off + row + k]          = (half)(lo * c - hi * s);
+  out[write_off + row + k + half_d] = (half)(hi * c + lo * s);
 }
 __kernel void scatter_copy_f16(__global const half *in, __global half *out,
                                const int N) {
