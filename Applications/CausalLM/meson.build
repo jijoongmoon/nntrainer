@@ -38,6 +38,9 @@ causallm_layer_dependencies += [
     causallm_conv1d_transpose_dep,
     causallm_antialiased_snake_dep,
     causallm_scale_dep,
+    causallm_dit_rope_dep,
+    causallm_dit_modulate_dep,
+    causallm_dit_gate_dep,
     causallm_vision_attention_dep,
 ]
 
@@ -181,6 +184,30 @@ test_api_src = [
 
 test_api = executable('test_api',
     test_api_src,
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+    build_by_default: true,
+    install: false,
+)
+
+# Dev micro-spikes (local, sources in the gitignored res/qwen2.5-omni dir):
+# BigVGAN layers/graph vs HF dump. Inputs from res/qwen2.5-omni/spike_*_prep.py.
+spike_ups0 = executable('spike_ups0',
+    meson.current_source_dir() / 'res' / 'qwen2.5-omni' / 'spike_ups0.cpp',
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+    build_by_default: true,
+    install: false,
+)
+spike_antialias = executable('spike_antialias',
+    meson.current_source_dir() / 'res' / 'qwen2.5-omni' / 'spike_antialias.cpp',
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+    build_by_default: true,
+    install: false,
+)
+spike_bigvgan = executable('spike_bigvgan',
+    meson.current_source_dir() / 'res' / 'qwen2.5-omni' / 'spike_bigvgan.cpp',
     include_directories: causallm_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
     build_by_default: true,

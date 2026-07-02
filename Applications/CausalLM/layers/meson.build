@@ -110,6 +110,20 @@ causallm_scale_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
+foreach _dl : ['dit_rope', 'dit_modulate', 'dit_gate']
+    _lib = shared_library(_dl + '_layer',
+        [meson.current_source_dir() / (_dl + '.cpp')],
+        include_directories: causallm_layer_inc,
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+        install: true,
+        install_dir: application_install_dir
+    )
+    set_variable('causallm_' + _dl + '_dep', declare_dependency(
+        link_with: _lib,
+        include_directories: causallm_layer_inc
+    ))
+endforeach
+
 causallm_vision_attention_src_abs = [meson.current_source_dir() / 'vision_attention.cpp']
 causallm_vision_attention = shared_library(
     'vision_attention_layer',
