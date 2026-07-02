@@ -103,13 +103,21 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
   const bool is_fp16 =
     in1.getDataType() == ml::train::TensorDim::DataType::FP16;
 
+  // Rows are (batch*channel*height) flattened — scale the count like
+  // forwarding() does, or batch/channel>1 shapes only process the first
+  // (to-from) of batch*channel*height rows (stale output beyond them).
+  // Production decode has batch=channel=1, where this is a no-op. A partial
+  // window (to<height) with batch*channel>1 is inexpressible as one contiguous
+  // row span and stays unsupported.
+  const unsigned int bc = in1.batch() * in1.channel();
+
   unsigned int active_rows;
   if (from && all_clmem && is_fp16)
-    active_rows = 1;
+    active_rows = bc;
   else if (any_clmem)
-    active_rows = to;
+    active_rows = to * bc;
   else
-    active_rows = to - from;
+    active_rows = (to - from) * bc;
 
   in1.getOps()->swiglu(in1, in2, out, active_rows, /*row_offset=*/0);
 }
