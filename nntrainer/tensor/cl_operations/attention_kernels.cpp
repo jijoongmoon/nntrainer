@@ -801,15 +801,14 @@ __kernel void rope_inplace_f16(__global const half *in,
   half s = sin_lut[lut];
   half lo = in[row + k];
   half hi = in[row + k + half_d];
-  // FP32 rotation ONLY for small head_dim (half_d < 128 => head_dim < 256, i.e.
-  // qwen3 d=128 with a high rope_theta). There the half cos/sin multiply-add
-  // loses enough precision to distort the softmax DISTRIBUTION (argmax survives
-  // -> greedy coherent, but SAMPLING degenerates). fp32 makes it match the host
-  // RoPE. For head_dim >= 256 (gemma d=256, greedy/argmax) the half rotation is
-  // accurate enough and ~6% faster on the big prefill RoPE, so keep it -- this
-  // matches the 2026-06-25 gemma4 prefill baseline. Store is always FP16 (the
-  // activation dtype). See [reference_working_run_combos] regression guard.
-  if (half_d < 128) {
+  // FP32 rotation for SMALL step size (M < 32): decode (M=1) and short prefill,
+  // where the half cos/sin multiply-add's precision loss distorts the softmax
+  // DISTRIBUTION enough for SAMPLING to degenerate (argmax survives -> greedy
+  // coherent). fp32 there is ~free (few rows) and makes it match the host RoPE.
+  // For a large prefill (M >= 32) the half rotation is kept: it is ~6% faster on
+  // the big RoPE and the model-agnostic threshold avoids a head_dim hack. Store
+  // is always FP16 (the activation dtype). See reference_working_run_combos.
+  if (M < 32) {
     float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
     out[write_off + row + k]          = (half)(lof * cf - hif * sf);
     out[write_off + row + k + half_d] = (half)(hif * cf + lof * sf);
