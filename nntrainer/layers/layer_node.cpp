@@ -133,29 +133,23 @@ public:
 LayerNode::~LayerNode() = default;
 
 /**
- * @brief get the compute engine property from property string vector
- *  : default is CPU
- * @return LayerComputeEngine Enum : CPU, GPU, QNN
- *
+ * @brief map a registered engine NAME onto the residency-plane enum: the
+ *        tensor/residency plane (tensor_wrap_specs, InitLayerContext,
+ *        RunLayerContext) still speaks LayerComputeEngine. cpu/gpu/qnn/cuda
+ *        map 1:1; "npu" is a QNN context alias; any other registered name
+ *        gets CPU (host) residency — its DISPATCH is name-based via
+ *        getRegisteredContext, only the memory plane defaults to host.
  */
-ml::train::LayerComputeEngine
-getComputeEngine(const std::vector<std::string> &props) {
-  for (auto &prop : props) {
-    std::string key, value;
-    int status = nntrainer::getKeyValue(prop, key, value);
-    if (nntrainer::istrequal(key, "engine")) {
-      constexpr const auto data =
-        std::data(props::ComputeEngineTypeInfo::EnumList);
-      for (unsigned int i = 0;
-           i < props::ComputeEngineTypeInfo::EnumList.size(); ++i) {
-        if (nntrainer::istrequal(value.c_str(),
-                                 props::ComputeEngineTypeInfo::EnumStr[i])) {
-          return data[i];
-        }
-      }
-    }
+static ml::train::LayerComputeEngine
+toLayerComputeEngine(const std::string &name) {
+  constexpr const auto data = std::data(props::ComputeEngineTypeInfo::EnumList);
+  for (unsigned int i = 0; i < props::ComputeEngineTypeInfo::EnumList.size();
+       ++i) {
+    if (nntrainer::istrequal(name, props::ComputeEngineTypeInfo::EnumStr[i]))
+      return data[i];
   }
-
+  if (nntrainer::istrequal(name, "npu"))
+    return ml::train::LayerComputeEngine::QNN;
   return ml::train::LayerComputeEngine::CPU;
 }
 
@@ -220,6 +214,17 @@ void LayerNode::setProperty(const std::vector<std::string> &properties) {
   auto left_properties = loadProperties(properties, *layer_node_props);
   left_properties =
     loadProperties(left_properties, *layer_node_props_realization);
+
+  /// registry-open engine name [§10 T3]: normalize the parsed name against
+  /// the live Engine registry (lowercase; unregistered -> "cpu" fallback), so
+  /// the node's engine always names a context that getRegisteredContext() can
+  /// resolve and always matches the backend createLayerObject() chose via the
+  /// same parseComputeEngine call.
+  auto &ce_prop = std::get<props::ComputeEngine>(*layer_node_props);
+  if (!ce_prop.empty())
+    ce_prop.set(
+      Engine::Global().parseComputeEngine({"engine=" + ce_prop.get()}));
+
   layer->setProperty(left_properties);
 
   if (getType() == ActivationLayer::type) {
@@ -307,30 +312,38 @@ void LayerNode::setOutputConnection(unsigned nth, const std::string &name,
 
 void LayerNode::setComputeEngine(
   const ml::train::LayerComputeEngine &compute_engine) {
-  // setting compute_engine of LayerNode
-  // can be reused later to propagate this info
-  this->compute_engine = compute_engine;
+  // compat shim (no callers in-tree): the node-level engine is stored as the
+  // registered context NAME now; map the legacy enum to its canonical name.
+  constexpr const auto data = std::data(props::ComputeEngineTypeInfo::EnumList);
+  for (unsigned int i = 0; i < props::ComputeEngineTypeInfo::EnumList.size();
+       ++i) {
+    if (data[i] == compute_engine) {
+      this->compute_engine = props::ComputeEngineTypeInfo::EnumStr[i];
+      return;
+    }
+  }
+  this->compute_engine = "cpu";
 }
 
 bool LayerNode::isComputeEngineGPU() const {
   if (!layer_node_props)
     return false;
   auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
-  return !ce.empty() && ce.get() == ml::train::LayerComputeEngine::GPU;
+  return !ce.empty() && istrequal(ce.get(), "gpu");
 }
 
 bool LayerNode::isComputeEngineCUDA() const {
   if (!layer_node_props)
     return false;
   auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
-  return !ce.empty() && ce.get() == ml::train::LayerComputeEngine::CUDA;
+  return !ce.empty() && istrequal(ce.get(), "cuda");
 }
 
 bool LayerNode::isComputeEngineCPU() const {
   if (!layer_node_props)
     return true;
   auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
-  return ce.empty() || ce.get() == ml::train::LayerComputeEngine::CPU;
+  return ce.empty() || istrequal(ce.get(), "cpu");
 }
 
 const std::string LayerNode::getName() const {
@@ -686,7 +699,8 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
 
   auto context = InitLayerContext(
     actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
-    getName(), scope, max_norm, tensor_type, loss_scale, mode, compute_engine);
+    getName(), scope, max_norm, tensor_type, loss_scale, mode,
+    toLayerComputeEngine(compute_engine));
   /** static residency: MultiOut is an in-place identity fan-out (no data
    * touch), so its output specs must not stamp CPU onto the shared source
    * tensor -- engine-neutral (GPU = no veto); the REAL consumers' input views
@@ -794,7 +808,7 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
   context.setComputeEngine(
     (getType() == MultiOutLayer::type || getType() == "mha_core")
       ? ml::train::LayerComputeEngine::GPU
-      : compute_engine);
+      : toLayerComputeEngine(compute_engine));
 
   layer->finalize(context);
 
@@ -1009,7 +1023,7 @@ void LayerNode::configureRunContext(const std::vector<Weight *> &weights,
   // NNTR_DEVRES Step 0: thread the layer's compute engine onto the run context
   // so the residency overlay can tell CPU vs GPU consumers at getInput/getOutput.
   // Inert (default CPU; nothing reads it yet).
-  run_context->setRunComputeEngine(compute_engine);
+  run_context->setRunComputeEngine(toLayerComputeEngine(compute_engine));
 }
 
 /**

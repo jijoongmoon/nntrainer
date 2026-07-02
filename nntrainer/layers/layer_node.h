@@ -991,16 +991,13 @@ public:
    */
   bool reStoreData() { return needs_restore_data; }
 
-  std::string getComputeEngineType() {
-    auto size = props::ComputeEngineTypeInfo::EnumList.size();
-    auto data = std::data(props::ComputeEngineTypeInfo::EnumList);
-    for (unsigned i = 0; i < size; ++i) {
-      if (data[i] == compute_engine) {
-        return props::ComputeEngineTypeInfo::EnumStr[i];
-      }
-    }
-    return "cpu";
-  }
+  /**
+   * @brief the node's compute-engine NAME — a registered Context name, cached
+   *        from the `engine=` property at finalize() ("cpu" until then).
+   *        Registry-open: may be any Engine-registered name (e.g. "npu"), not
+   *        just the closed enum's four; feeds getRegisteredContext() directly.
+   */
+  std::string getComputeEngineType() { return compute_engine; }
 
   /**
    * @brief Query whether this node requests the GPU compute engine via its
@@ -1058,11 +1055,13 @@ private:
     output_connections; /**< output layer names */
 
   /**
-   * @brief compute_engine Information about the compute backend being used
-   *
+   * @brief compute_engine — the compute backend as a registered Context NAME
+   *        (registry-open; "npu"/"vulkan"-style self-registered backends need
+   *        no enum edit). The residency plane still speaks the
+   *        LayerComputeEngine enum via toLayerComputeEngine() in
+   *        layer_node.cpp.
    */
-  ml::train::LayerComputeEngine compute_engine =
-    ml::train::LayerComputeEngine::CPU;
+  std::string compute_engine = "cpu";
 
 #ifdef ENABLE_TEST
   /**
