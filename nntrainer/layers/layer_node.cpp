@@ -326,6 +326,13 @@ bool LayerNode::isComputeEngineCUDA() const {
   return !ce.empty() && ce.get() == ml::train::LayerComputeEngine::CUDA;
 }
 
+bool LayerNode::isComputeEngineCPU() const {
+  if (!layer_node_props)
+    return true;
+  auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
+  return ce.empty() || ce.get() == ml::train::LayerComputeEngine::CPU;
+}
+
 const std::string LayerNode::getName() const {
   auto &name = std::get<props::Name>(*layer_node_props);
   return name.empty() ? "" : name.get();

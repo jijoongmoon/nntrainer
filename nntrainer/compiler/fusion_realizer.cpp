@@ -39,6 +39,15 @@ FusionRealizer::realize(const GraphRepresentation &reference) {
         !istrequal(node->getType(), "conv2d"))
       continue;
 
+    /// CPU-engine nodes only: the fused epilogue runs through
+    /// ComputeOps::apply_activation, which is a host ActiFunc loop on every
+    /// backend today — correct on host-resident tensors, garbage on
+    /// device-resident ones (GPU cl_mem / CUDA device pools). Non-CPU nodes
+    /// keep the ActivationRealizer split until their op tables gain a
+    /// device-side apply_activation.
+    if (!node->isComputeEngineCPU())
+      continue;
+
     const ActivationType act = node->getActivationType();
     /// pointwise epilogues only: softmax is row-wise (needs the full row), and
     /// none/unknown are nothing to fuse.

@@ -37,6 +37,10 @@ namespace nntrainer {
  * @note  Gated by NNTR_FUSE_ACT (default ON; set NNTR_FUSE_ACT=0 to disable).
  *        Skips softmax / none / unknown (softmax is row-wise, not a pointwise
  *        epilogue), and skips a node that already carries a fused activation.
+ *        CPU-ENGINE NODES ONLY: apply_activation is a host loop on every
+ *        backend, so fusing a GPU/CUDA node would run host math over
+ *        device-resident tensors; those nodes keep the ActivationRealizer
+ *        split instead.
  *
  * @note  INFERENCE-ONLY (NeuralNetwork::compile adds this realizer only for
  *        ExecutionMode::INFERENCE): the fused compute layers apply the

@@ -1021,6 +1021,15 @@ public:
    */
   bool isComputeEngineCUDA() const;
 
+  /**
+   * @brief Query whether this node runs on the CPU compute engine (the
+   *        `engine` property is unset — CPU is the default — or explicitly
+   *        CPU). Same direct-read rationale as isComputeEngineGPU(): valid
+   *        before finalize(), e.g. for compile-time graph realizers.
+   * @return true iff the node's engine resolves to CPU
+   */
+  bool isComputeEngineCPU() const;
+
 private:
   /**
    * @brief     Get the Input Layers object
