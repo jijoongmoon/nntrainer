@@ -797,19 +797,26 @@ __kernel void rope_inplace_f16(__global const half *in,
   if (t >= M || h >= num_heads || k >= half_d) return;
   long row = (long)t * num_heads * (2 * half_d) + (long)h * (2 * half_d);
   long lut = (long)(start_pos + t) * half_d + k;
-  // Rotate in FP32. Activations (Q/K) are FP16 by design, but doing the
-  // cos/sin multiply-add in half loses enough precision that the rotated Q/K
-  // are subtly wrong -- the ATTENTION SCORE argmax survives (greedy stays
-  // coherent) but the softmax DISTRIBUTION is distorted, which SAMPLING
-  // exposes (qwen3 head_dim=128 / high rope_theta degenerates under
-  // do_sample=true). fp32 rotation makes the distribution match the host RoPE;
-  // only the final store is FP16 (the activation dtype).
-  float c = (float)cos_lut[lut];
-  float s = (float)sin_lut[lut];
-  float lo = (float)in[row + k];
-  float hi = (float)in[row + k + half_d];
-  out[write_off + row + k]          = (half)(lo * c - hi * s);
-  out[write_off + row + k + half_d] = (half)(hi * c + lo * s);
+  half c = cos_lut[lut];
+  half s = sin_lut[lut];
+  half lo = in[row + k];
+  half hi = in[row + k + half_d];
+  // FP32 rotation ONLY for small head_dim (half_d < 128 => head_dim < 256, i.e.
+  // qwen3 d=128 with a high rope_theta). There the half cos/sin multiply-add
+  // loses enough precision to distort the softmax DISTRIBUTION (argmax survives
+  // -> greedy coherent, but SAMPLING degenerates). fp32 makes it match the host
+  // RoPE. For head_dim >= 256 (gemma d=256, greedy/argmax) the half rotation is
+  // accurate enough and ~6% faster on the big prefill RoPE, so keep it -- this
+  // matches the 2026-06-25 gemma4 prefill baseline. Store is always FP16 (the
+  // activation dtype). See [reference_working_run_combos] regression guard.
+  if (half_d < 128) {
+    float cf = (float)c, sf = (float)s, lof = (float)lo, hif = (float)hi;
+    out[write_off + row + k]          = (half)(lof * cf - hif * sf);
+    out[write_off + row + k + half_d] = (half)(hif * cf + lof * sf);
+  } else {
+    out[write_off + row + k]          = lo * c - hi * s;
+    out[write_off + row + k + half_d] = hi * c + lo * s;
+  }
 }
 __kernel void scatter_copy_f16(__global const half *in, __global half *out,
                                const int N) {
