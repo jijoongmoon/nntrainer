@@ -42,6 +42,10 @@ if get_option('enable-cuda')
   nntrainer_base_deps += cuda_dep
 endif
 
+if get_option('enable-htp')
+  nntrainer_base_deps += hexkl_dep
+endif
+
 if get_option('platform') == 'tizen'
   nntrainer_base_deps += dependency('dlog')
 endif
@@ -115,6 +119,11 @@ if get_option('enable-cuda')
   nntrainer_headers += meson.current_source_dir() / 'layers' / 'cuda_layers' / 'cuda_rmsnorm_layer.h'
   nntrainer_common_sources += 'cuda_context.cpp'
   nntrainer_common_sources += 'cuda_mem_allocator.cpp'
+endif
+
+if get_option('enable-htp')
+  nntrainer_headers += meson.current_source_dir() / 'htp_context.h'
+  nntrainer_common_sources += 'htp_context.cpp'
 endif
 
 foreach s : nntrainer_common_sources

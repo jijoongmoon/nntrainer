@@ -323,6 +323,35 @@ if get_option('enable-cuda')
   message('CUDA backend enabled. Toolkit: ' + cuda_path)
 endif
 
+# Additive HexKL/HTP (Hexagon HMX NPU) backend. When enable-htp is false this
+# block is skipped and CPU/GPU builds are byte-identical; hexkl_dep is referenced
+# only under this guard (nntrainer/meson.build, tensor/htp_backend). ARM/Android
+# only — there is no x86 libsdkl.so.
+if get_option('enable-htp')
+  hexkl_root = get_option('hexkl-sdk-root')
+  if hexkl_root == ''
+    error('enable-htp=true requires -Dhexkl-sdk-root=<path to hexkl_addon>')
+  endif
+  hexkl_lib_dir = hexkl_root / 'lib' / get_option('hexkl-lib-subdir')
+  # remote.h / AEEStdErr.h live under <sdk_root>/incs and <sdk_root>/incs/stddef;
+  # the Hexagon SDK root is two levels up from the addon.
+  hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  hexkl_inc = include_directories(
+    hexkl_root / 'include',
+    hexagon_sdk_root / 'incs',
+    hexagon_sdk_root / 'incs' / 'stddef',
+    is_system: true)
+  libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
+  hexkl_dep = declare_dependency(
+    dependencies: libsdkl,
+    include_directories: hexkl_inc)
+  extra_defines += '-DENABLE_HEXKL=1'
+  # sdkl.h uses the C99 `restrict` keyword in C++ function signatures; the NDK
+  # C++ compiler needs it mapped to the builtin.
+  extra_defines += '-Drestrict=__restrict'
+  message('HTP/HexKL backend enabled, linking ' + hexkl_lib_dir / 'libsdkl.so')
+endif
+
 if get_option('enable-biqgemm')
   # In order to enable biqgemm, BiQGEMM lib, which is header-only library, is required.
   # This meson tries to find its installation.

@@ -28,6 +28,10 @@
 #include <cuda_context.h>
 #endif
 
+#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
+#include <htp_context.h>
+#endif
+
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
 static const std::string func_tag = "[Engine] ";
@@ -74,6 +78,16 @@ void Engine::add_default_object() {
   auto &cuda_context = nntrainer::CudaContext::Global();
 
   registerContext("cuda", &cuda_context);
+#endif
+
+#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
+  // Additive HexKL/HTP NPU backend (Hexagon HMX), registered alongside the
+  // others; selected at runtime via engine=htp. HtpContext::initialize()
+  // degrades to plain CPU ops when the NPU/skel is unavailable, so engine=htp
+  // never aborts on a non-HTP device.
+  auto &htp_context = nntrainer::HtpContext::Global();
+
+  registerContext("htp", &htp_context);
 #endif
 
 #if defined(ENABLE_NPU) && ENABLE_NPU == 1

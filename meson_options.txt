@@ -61,6 +61,16 @@ option('enable-cuda', type: 'boolean', value: false,
        description: 'Build the additive NVIDIA CUDA GPU backend (NVRTC runtime kernel compilation + cudart + cuBLAS + driver API). Independent of and non-exclusive with enable-opencl; selected at runtime via engine=cuda. Desktop NVIDIA only (not android).')
 option('cuda-path', type: 'string', value: '/usr/local/cuda',
        description: 'CUDA toolkit root used when enable-cuda is set (expects include/ and lib64/).')
+# Additive HexKL/HTP NPU backend (Qualcomm Hexagon HMX). ARM/Android only (no
+# x86 libsdkl.so). When false the block is skipped and CPU/GPU builds are
+# byte-identical; selected at runtime via engine=htp. Point hexkl-sdk-root at the
+# extracted hexkl_addon (remote.h/AEEStdErr.h resolve from <root>/../../incs).
+option('enable-htp', type: 'boolean', value: false,
+       description: 'Build the additive HexKL/HTP (Hexagon HMX NPU) backend. ARM/Android only; selected at runtime via engine=htp.')
+option('hexkl-sdk-root', type: 'string', value: '',
+       description: 'Path to the extracted hexkl_addon (has include/sdkl.h and lib/<subdir>/libsdkl.so). Required when enable-htp=true.')
+option('hexkl-lib-subdir', type: 'string', value: 'armv8_android26',
+       description: 'Which prebuilt libsdkl.so to link: lib/<hexkl-lib-subdir>/libsdkl.so.')
 option('enable-clblast', type: 'boolean', value: true,
        description: 'Link the CLBlast subproject for general-purpose OpenCL BLAS routines. Disable when only the paper-aligned v8c int8/int4 GPU paths are needed — drops the multi-minute CLBlast compile.')
 option('enable-biqgemm', type: 'boolean', value: false)

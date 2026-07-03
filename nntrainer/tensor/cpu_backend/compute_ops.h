@@ -544,6 +544,12 @@ ComputeOps *get_cl_ops();
  *  on, in cuda/cuda_compute_ops.cpp. */
 ComputeOps *get_cuda_ops();
 #endif
+#ifdef ENABLE_HEXKL
+/** @brief HexKL/HTP (Hexagon HMX NPU) ComputeOps singleton. Defined when
+ *  enable-htp is on, in tensor/htp_backend/htp_compute_ops.cpp. Degrades to the
+ *  CPU ops (HtpComputeOps : CpuComputeOps) when the NPU/skel is unavailable. */
+ComputeOps *get_htp_ops();
+#endif
 
 } // namespace nntrainer
 
