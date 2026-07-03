@@ -1038,6 +1038,23 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   unsigned int M = getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
+
+  // [HexKL/HTP] Route the QS4CX (int4) FC onto the Hexagon NPU when a HexKL
+  // ComputeOps is installed (engine=htp) and N is HMX-tile-aligned. This is the
+  // op-table seam for our int4 models: `this` is the fp32 activation A[M,K],
+  // `input` the QS4CX weight (plain nibbles N x ceil(K/2) + per-channel fp32
+  // scales), `output` is C[M,N]. shgemm_u8i4 quantizes A to u8 and derives the
+  // activation zero-point correction internally, so no zp_corr is passed.
+  // Off-HTP every backend returns supports_shgemm_u8i4()==false, so this is
+  // byte-identical and the existing KleidiAI path below runs unchanged.
+  auto *o = getOps();
+  if (o->supports_shgemm_u8i4() && (N % 32) == 0) {
+    o->shgemm_u8i4(0, M, N, K, static_cast<const float *>(getData()), K,
+                   input.getData<uint8_t>(), input.getScale<float>(), nullptr,
+                   output.getData<float>(), N);
+    return output;
+  }
+
 #if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
   defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
   defined(_M_ARM64)
