@@ -2235,6 +2235,21 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     // dp4a). This retires the NNTR_FC_XMX opt-in on capable Intel GPUs.
     return ClContext::Global().caps().subgroups;
   }();
+  // One-shot diagnostic (stderr): why XMX/DPAS is or is not selected. On Windows
+  // the Intel driver may fail to compile gemm_xmx_i4 (matrix-MAD / 2d_block_io /
+  // 256-GRF), silently falling back to the ~40%-slower dp4a path.
+  static bool xmx_gate_logged = false;
+  if (!xmx_gate_logged) {
+    xmx_gate_logged = true;
+    const bool gate =
+      xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0;
+    fprintf(stderr,
+            "[XMX] xmx_fc=%d subgroups=%d buf_kernel=%d M=%u N=%u K=%u -> "
+            "gate=%d%s\n",
+            (int)xmx_fc, (int)ClContext::Global().caps().subgroups,
+            (int)buf_kernel, M, N, K, (int)gate,
+            gate ? "" : " (XMX skipped -> dp4a)");
+  }
   if (xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0) {
     // Shape-adaptive tile. The microbench's NT=4/SG_M=1 (tuned for the square
     // N=K=4096 case) badly underutilizes the real FC shapes: NT=2 is broadly
@@ -2263,6 +2278,13 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
       xmx_mt, xmx_nt, xmx_sgm);
     ClContext::SharedPtrClKernel kx = blas_cc->registerClKernel(
       int8_int8_gemm_xmx_kernel, "gemm_xmx_i4", std::string(xmx_co));
+    static bool xmx_reg_logged = false;
+    if (!xmx_reg_logged) {
+      xmx_reg_logged = true;
+      fprintf(stderr, "[XMX] gemm_xmx_i4 registerClKernel -> %s\n",
+              kx ? "OK (DPAS/XMX engaged)"
+                 : "FAILED -> silent fallback to dp4a (slower)");
+    }
     if (kx) {
       int Mi = (int)M, Ni = (int)N, Ki = (int)K, Wa = (int)(K / 16),
           Ww = (int)(K / 32), Mv = (int)M_valid;
