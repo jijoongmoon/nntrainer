@@ -460,10 +460,10 @@ public:
    *        are byte-identical; `CudaContext` overrides it with the CUDA-graph
    *        capture/replay state machine (M1 / M2-B / prefill-graph) that used to
    *        live as an `#if ENABLE_CUDA` block in neuralnet.cpp.
-   * @note  DECLARED LAST on purpose: appending the virtual at the vtable tail
-   *        leaves every existing slot's index unmoved, so a new libnntrainer.so
-   *        stays ABI-compatible with an app/ccapi built against the old vtable
-   *        (Adreno is verified by swapping only libnntrainer.so).
+   * @note  Appended at the vtable tail (its slot follows every pre-existing
+   *        one; residencyEngine() is now appended after it under the same rule)
+   *        so a rebuilt libnntrainer.so stays ABI-compatible with an app/ccapi
+   *        built against the old vtable (Adreno verified by swapping .so).
    * @note  Return/param type is `sharedConstTensors`
    *        (std::vector<std::shared_ptr<const Tensor>>); spelled out to keep
    *        context.h free of tensor.h. Defined out-of-line in neuralnet.cpp.
@@ -472,6 +472,28 @@ public:
   runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
             const std::vector<std::shared_ptr<const Tensor>> &input,
             const std::vector<std::shared_ptr<const Tensor>> &label);
+
+  /**
+   * @brief Which residency plane (LayerComputeEngine) this backend's tensors
+   *        live on. This is the single authority the layer graph consults to
+   *        map a registered engine NAME onto the tensor/residency-plane enum
+   *        (toLayerComputeEngine, layer_node.cpp) — retiring the central
+   *        name→enum string table (ComputeEngineTypeInfo::EnumStr) in favour of
+   *        a per-context declaration. The base is CPU (host residency);
+   *        ClContext→GPU, CudaContext→CUDA, QNNContext→QNN override it. A new
+   *        aliased/added backend just declares its plane here, with no central
+   *        table to edit (add-only). [docs/ARCHITECTURE_REFACTOR.md §10 T3]
+   * @note  NEW vtable tail: declared after runDecode so every existing slot's
+   *        index is unmoved and a rebuilt libnntrainer.so stays ABI-compatible
+   *        with an app/ccapi built against the old vtable. The QNN context lives
+   *        in the libqnn_context.so plugin, which subclasses Context, so that
+   *        plugin must be rebuilt alongside libnntrainer.so (an old plugin lacks
+   *        this slot entirely — calling residencyEngine() on it is UB).
+   * @return residency-plane enum backing this context's tensors
+   */
+  virtual ml::train::LayerComputeEngine residencyEngine() const {
+    return ml::train::LayerComputeEngine::CPU;
+  }
 
 private:
   /**

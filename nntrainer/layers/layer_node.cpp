@@ -142,27 +142,27 @@ LayerNode::~LayerNode() = default;
  */
 static ml::train::LayerComputeEngine
 toLayerComputeEngine(const std::string &name) {
-  // Resolve the requested engine NAME through the live Engine registry to the
-  // backing context's CANONICAL name (Context::getName()) before mapping it to
-  // the residency-plane enum. This collapses registry ALIASES onto their
-  // backend with no per-alias special case here: "npu" is registered as an
-  // alias of the "qnn" context (engine.cpp), so it resolves to "qnn" and maps
-  // to QNN below -- the same for any future aliased backend (add-only: register
-  // the context, no edit here). Names not registered in this build (e.g. a
-  // cpu-only build that still parsed "cuda") keep their raw spelling and fall
-  // through the enum table to CPU. [docs/ARCHITECTURE_REFACTOR.md §10 T3]
-  std::string canonical = name;
+  // A registered context DECLARES its own residency plane via
+  // Context::residencyEngine() -- the single authority, retiring the central
+  // name->enum string table below. Registry ALIASES collapse onto their backend
+  // for free: "npu" is registered as an alias of the "qnn" context
+  // (engine.cpp), so getRegisteredContext("npu") returns the QNN context and
+  // residencyEngine() reports QNN -- no per-alias special case here, and a new
+  // aliased/added backend just declares its plane in its Context override
+  // (add-only, no edit here). [docs/ARCHITECTURE_REFACTOR.md §10 T3]
   try {
     auto ctx = nntrainer::Engine::Global().getRegisteredContext(name);
     if (ctx != nullptr)
-      canonical = ctx->getName();
+      return ctx->residencyEngine();
   } catch (...) {
-    // unregistered name: fall back to the enum table on the raw spelling
+    // fall through to the enum table below
   }
+  // Name not registered in this build (e.g. a cpu-only build that still parsed
+  // "cuda"): map the raw spelling through the string table, defaulting to CPU.
   constexpr const auto data = std::data(props::ComputeEngineTypeInfo::EnumList);
   for (unsigned int i = 0; i < props::ComputeEngineTypeInfo::EnumList.size();
        ++i) {
-    if (nntrainer::istrequal(canonical, props::ComputeEngineTypeInfo::EnumStr[i]))
+    if (nntrainer::istrequal(name, props::ComputeEngineTypeInfo::EnumStr[i]))
       return data[i];
   }
   return ml::train::LayerComputeEngine::CPU;

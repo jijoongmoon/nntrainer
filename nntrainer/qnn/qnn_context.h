@@ -237,6 +237,14 @@ public:
   std::string getName() override { return "qnn"; }
 
   /**
+   * @copydoc Context::residencyEngine
+   * @brief QNN tensors live on the QNN residency plane.
+   */
+  ml::train::LayerComputeEngine residencyEngine() const override {
+    return ml::train::LayerComputeEngine::QNN;
+  }
+
+  /**
    * @brief   Set the default backend extension config path before singleton
    * initialization. Must be called before QNNContext::Global() or any
    * operation that triggers context creation. Relative paths are resolved from

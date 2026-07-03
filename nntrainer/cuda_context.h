@@ -190,6 +190,14 @@ public:
   std::string getName() override { return "cuda"; }
 
   /**
+   * @copydoc Context::residencyEngine
+   * @brief CUDA (NVIDIA GPU) tensors live on the CUDA residency plane.
+   */
+  ml::train::LayerComputeEngine residencyEngine() const override {
+    return ml::train::LayerComputeEngine::CUDA;
+  }
+
+  /**
    * @brief Device capability snapshot, probed once in initialize(). LOG-ONLY.
    */
   const DeviceCaps &caps() const override { return caps_; }
