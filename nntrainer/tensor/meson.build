@@ -51,6 +51,7 @@ tensor_headers = [
   'quantizer.h',    
   'tensor_wrap_specs.h',
   'residency_policy.h',
+  'residency_planner.h',
   'manager.h',
   'basic_planner.h',
   'memory_planner.h',
