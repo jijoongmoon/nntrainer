@@ -12,6 +12,7 @@
  */
 #include <arm_compute_backend.h>
 #include <assert.h>
+#include <cstdlib>
 #ifdef USE_BLAS
 #include <cblas_interface.h>
 #endif
@@ -34,6 +35,17 @@ void init_backend() {
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
 #endif
   g_compute_ops = get_cpu_ops();
+#ifdef ENABLE_HEXKL
+  // Whole-model HTP (Mode-2) switch: point the global op table at the HexKL/HTP
+  // ops so every quantized FC (FloatTensor::dotQs4cx -> shgemm_u8i4) routes to
+  // the NPU without per-layer engine=htp — a Tensor with no ContextData falls
+  // back to g_compute_ops. HtpComputeOps : CpuComputeOps, so all non-accelerated
+  // ops still run on CPU, and supports_shgemm_u8i4() gates on the NPU being up
+  // (else the FC stays on CPU too). Opt-in via NNTR_HTP_OPS so default builds are
+  // unaffected.
+  if (std::getenv("NNTR_HTP_OPS") != nullptr)
+    g_compute_ops = get_htp_ops();
+#endif
 }
 
 void unpack_q4_0x8_transpose16(const void *src, uint16_t *d_out,
