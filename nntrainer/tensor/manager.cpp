@@ -48,6 +48,7 @@
 #include <optimized_v1_planner.h>
 #include <optimized_v2_planner.h>
 #include <optimized_v3_planner.h>
+#include <residency_policy.h>
 #include <tensor_pool.h>
 #include <tensor_wrap_specs.h>
 #include <util_func.h>
@@ -640,12 +641,16 @@ Manager::requestInputs(const GraphNode &node,
    * real consumers' input views resolve (view-of-view flattening) to the same
    * source and register their own engines. */
   const auto *consumer_lnode = dynamic_cast<const LayerNode *>(&node);
-  /** mha_core (the CausalLM attention layer; CPU-registered but
-   * cl_mem-converted: it binds GPU_CLMEM Q/K/V directly and bridges every
-   * host path via clmem_lower/raise) counts as a GPU consumer. String literal
-   * since the layer lives in the application. */
+  /** An engine-neutral consumer must NOT downgrade its producer's output out of
+   * GPU_CLMEM. MultiOut (the auto fan-out node) is a core in-place identity.
+   * The application also declares CPU-engine layers that actually bind/consume
+   * on the GPU plane -- e.g. CausalLM's mha_core, which is CPU-registered but
+   * cl_mem-converted (binds GPU_CLMEM Q/K/V directly, bridges host paths via
+   * clmem_lower/raise). [Mem M4] Those types come from ResidencyPolicy, declared
+   * by the app, so core carries no app-specific layer name here. */
   const bool engine_neutral =
-    node.getType() == MultiOutLayer::type || node.getType() == "mha_core";
+    node.getType() == MultiOutLayer::type ||
+    ResidencyPolicy::global().isEngineNeutral(node.getType());
   const auto consumer_engine =
     (engine_neutral ||
      (consumer_lnode != nullptr && consumer_lnode->isComputeEngineGPU()))

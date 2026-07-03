@@ -16,12 +16,21 @@
 
 #include <memory_pool.h>
 #include <nntrainer_log.h>
+#include <residency_policy.h>
 #include <tensor.h>
 #include <tensor_pool.h>
 #include <tensor_wrap_specs.h>
 #include <util_func.h>
 
 namespace nntrainer {
+
+/** [Mem M4] The single process-wide residency policy instance, populated by the
+ * application (e.g. CausalLM) before allocation. Out-of-line here so both
+ * libnntrainer (planner) and the app (.so that populates it) share one copy. */
+ResidencyPolicy &ResidencyPolicy::global() {
+  static ResidencyPolicy instance;
+  return instance;
+}
 
 namespace {
 /**
@@ -351,21 +360,22 @@ void TensorPool::allocate(bool init) {
    * producer that explicitly uploads them to the cl_mem plane afterwards
    * (clmem_raise_cl in the producing layer -- the embedding dequant loop).
    * Such a tensor may be GPU_CLMEM despite its CPU producer engine, removing
-   * the layer0 coarse-SVM ingress (the measured visibility hazard). Default
-   * covers the CausalLM embedding output; override via NNTR_CLMEM_RAISE. */
-  static const char *clmem_raise = [] {
-    const char *e = std::getenv("NNTR_CLMEM_RAISE");
-    return e ? e : "embedding0:out0";
-  }();
-  /** Output-boundary LOWER list (design §2.5): GPU-produced tensors whose
-   * HOST consumer explicitly lowers them (clmem_lower_cl: one blocking
-   * readback -- the lm_head reading the final norm). Such a tensor may be
-   * GPU_CLMEM despite its CPU consumer. Default covers the CausalLM final
-   * norm output; override via NNTR_CLMEM_LOWER. */
-  static const char *clmem_lower = [] {
-    const char *e = std::getenv("NNTR_CLMEM_LOWER");
-    return e ? e : "output_norm:out0";
-  }();
+   * the layer0 coarse-SVM ingress (the measured visibility hazard). Output-
+   * boundary LOWER: GPU-produced tensors whose lone HOST consumer explicitly
+   * reads them back once (clmem_lower_cl -- the lm_head reading the final norm);
+   * they may stay GPU_CLMEM despite that CPU consumer. [Mem M4] The patterns are
+   * declared by the application via ResidencyPolicy (CausalLM registers its
+   * embedding-output raise + final-norm lower), NOT hardcoded here -- so core
+   * carries no app-specific tensor names. NNTR_CLMEM_RAISE/LOWER still override
+   * for debugging. Non-static: the policy is app-populated per model build. */
+  const std::string &raise_pat = ResidencyPolicy::global().raise_patterns;
+  const std::string &lower_pat = ResidencyPolicy::global().lower_patterns;
+  const char *env_raise = std::getenv("NNTR_CLMEM_RAISE");
+  const char *env_lower = std::getenv("NNTR_CLMEM_LOWER");
+  const char *clmem_raise =
+    env_raise ? env_raise : (raise_pat.empty() ? nullptr : raise_pat.c_str());
+  const char *clmem_lower =
+    env_lower ? env_lower : (lower_pat.empty() ? nullptr : lower_pat.c_str());
 
   /** set the pointers using the token for all the tensors */
   for (auto &spec : pool) {

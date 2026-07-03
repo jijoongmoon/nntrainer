@@ -47,6 +47,7 @@
 #include <cuda_context.h>
 #endif
 #include <layer_context.h>
+#include <residency_policy.h>
 #include <mha_core.h>
 #include <reshaped_rms_norm.h>
 #include <nntrainer_error.h>
@@ -107,6 +108,20 @@ namespace causallm {
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
+  // [Mem M4] Declare CausalLM's static-residency boundaries so the core planner
+  // (tensor_pool / manager) needs no app-specific tensor/layer names. These are
+  // byte-identical to the former hardcoded core defaults: the embedding output
+  // is host-produced but uploaded to cl_mem (RAISE), the final norm output is
+  // GPU-produced but read back once by the host lm_head (LOWER), and mha_core is
+  // a CPU-registered layer that binds/consumes Q/K/V on the GPU plane (engine-
+  // neutral). NNTR_CLMEM_RAISE/LOWER still override the raise/lower patterns.
+  auto &rp = nntrainer::ResidencyPolicy::global();
+  if (rp.raise_patterns.empty())
+    rp.raise_patterns = "embedding0:out0";
+  if (rp.lower_patterns.empty())
+    rp.lower_patterns = "output_norm:out0";
+  if (rp.engine_neutral_types.empty())
+    rp.engine_neutral_types = {"mha_core"};
   setupParameters(cfg, generation_cfg, nntr_cfg);
 }
 
