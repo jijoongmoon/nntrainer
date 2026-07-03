@@ -46,6 +46,18 @@ public:
   // derives false, matching the old getName()!="gpu-svm".
   bool needsRegister() const override { return true; }
 
+  /**
+   * @brief Did THIS allocator produce @p ptr (rpcmem/ION)?
+   * @note  The register leg of the host<->rpcmem residency bridge uses this to
+   *        tell an already-DSP-shareable buffer (register directly, zero-copy)
+   *        from a foreign host buffer (must be staged into rpcmem first). This
+   *        is the ownership half of the needsRegister() capability predicate --
+   *        no getName()=="qnn" string test. [multi-hw M6 register marker]
+   */
+  bool owns(const void *ptr) const {
+    return qnnMemPtrMap_.count(const_cast<void *>(ptr)) != 0;
+  }
+
   void setQnnInterfaceAndContext(void *context);
 
   void registerQnnTensor(void *ptr, Qnn_Tensor_t &qnnTensor,

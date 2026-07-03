@@ -79,9 +79,31 @@ public:
 
   void populateTensor(std::shared_ptr<QNNVar> qc_var,
                       Qnn_Context_Graph_t &context_i, BufferTypePtr buffer,
-                      Qnn_Tensor_t *T);
+                      Qnn_Tensor_t *T, bool is_output);
 
 private:
+  /** @brief raw void* backing a BufferTypePtr variant (nullptr if empty). */
+  static void *rawPtr(const BufferTypePtr &b);
+
+  /**
+   * @brief host<->rpcmem residency bridge for needsRegister() allocators.
+   *
+   * When the I/O buffer is NOT owned by the DSP-registering allocator (a
+   * foreign host buffer, e.g. the model's external input/output), it cannot be
+   * rpcmem_to_fd()'d. Stage it through a per-tensor rpcmem buffer owned by the
+   * allocator: inputs are (quantized) into the stage before registration;
+   * outputs are copied back to the host buffer after graphExecute. Cached by
+   * host pointer so the rpcmem address is STABLE across decode tokens (a fresh
+   * alloc per call would leak a new Qnn_MemHandle each time). This is the
+   * COPY-then-REGISTER leg of the closed cross-residency bridge, kept entirely
+   * inside the QNN backend and gated on the needsRegister()/owns() capability
+   * predicates -- never on getName()=="qnn". [multi-hw M6]
+   */
+  std::map<const void *, void *> io_staging_;
+  /** (stage rpcmem, host dst, bytes) queued during output setup, copied back
+   *  after graphExecute. */
+  std::vector<std::tuple<void *, void *, size_t>> output_copyback_;
+
   std::tuple<std::vector<props::TensorDimension>,
              std::vector<props::TensorDataType>, std::vector<props::TensorType>,
              props::FilePath, std::vector<props::InputQuantParam>,

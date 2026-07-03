@@ -228,28 +228,33 @@ void QNNGraph::forwarding(RunLayerContext &context, bool training) {
     output_quant_param_map[p.first] = p.second;
   }
 
+  // Quant params (scale/offset) are embedded in the serialized context .bin and
+  // already populated on inputs[]/outputs[] by setupInputAndOutputTensors (from
+  // graphInfo, i.e. systemContextGetBinaryInfo). The input_quant_param /
+  // output_quant_param properties are therefore an OPTIONAL override, not
+  // mandatory: when a tensor has no matching property, keep the .bin's encoding.
   for (size_t i = 0; i < context.getNumInputs(); ++i) {
     auto key = inputs[i].v1.name;
-    NNTR_THROW_IF(input_quant_param_map.find(key) ==
-                    input_quant_param_map.end(),
-                  std::invalid_argument)
-      << key;
-    auto value = input_quant_param_map[key];
-    inputs[i].v1.quantizeParams.scaleOffsetEncoding.scale = value.first;
-    inputs[i].v1.quantizeParams.scaleOffsetEncoding.offset = value.second;
-    populateTensor(qc_var, context_i, currentInputBuffers[i], &(inputs[i]));
+    auto it = input_quant_param_map.find(key);
+    if (it != input_quant_param_map.end()) {
+      inputs[i].v1.quantizeParams.scaleOffsetEncoding.scale = it->second.first;
+      inputs[i].v1.quantizeParams.scaleOffsetEncoding.offset = it->second.second;
+    }
+    populateTensor(qc_var, context_i, currentInputBuffers[i], &(inputs[i]),
+                   /*is_output=*/false);
   }
 
+  output_copyback_.clear();
   for (size_t i = 0; i < context.getNumOutputs(); ++i) {
     auto key = outputs[i].v1.name;
-    NNTR_THROW_IF(output_quant_param_map.find(key) ==
-                    output_quant_param_map.end(),
-                  std::invalid_argument)
-      << key;
-    auto value = output_quant_param_map[key];
-    outputs[i].v1.quantizeParams.scaleOffsetEncoding.scale = value.first;
-    outputs[i].v1.quantizeParams.scaleOffsetEncoding.offset = value.second;
-    populateTensor(qc_var, context_i, currentOutputBuffers[i], &(outputs[i]));
+    auto it = output_quant_param_map.find(key);
+    if (it != output_quant_param_map.end()) {
+      outputs[i].v1.quantizeParams.scaleOffsetEncoding.scale = it->second.first;
+      outputs[i].v1.quantizeParams.scaleOffsetEncoding.offset =
+        it->second.second;
+    }
+    populateTensor(qc_var, context_i, currentOutputBuffers[i], &(outputs[i]),
+                   /*is_output=*/true);
   }
 
   auto start = std::chrono::system_clock::now();
@@ -293,6 +298,12 @@ void QNNGraph::forwarding(RunLayerContext &context, bool training) {
     returnStatus = StatusCode::FAILURE;
   }
 
+  // host<->rpcmem bridge (output leg): the DSP wrote each staged output into
+  // its rpcmem buffer; copy it back into the foreign host output buffer.
+  for (auto &cb : output_copyback_)
+    std::memcpy(std::get<1>(cb), std::get<0>(cb), std::get<2>(cb));
+  output_copyback_.clear();
+
   // std::cout << context.getOutput(0) << std::endl;
 
   auto end = std::chrono::system_clock::now();
@@ -332,34 +343,80 @@ void QNNGraph::updateBufferType(std::vector<BufferTypePtr> &buffers,
   }
 }
 
+void *QNNGraph::rawPtr(const BufferTypePtr &b) {
+  switch (b.index()) {
+  case 1:
+    return std::get<uint8_t *>(b);
+  case 2:
+    return std::get<uint16_t *>(b);
+  case 3:
+    return std::get<float *>(b);
+  default:
+    return nullptr;
+  }
+}
+
 void QNNGraph::populateTensor(std::shared_ptr<QNNVar> qc_var,
                               Qnn_Context_Graph_t &context_i,
-                              BufferTypePtr buffers, Qnn_Tensor_t *T) {
-  switch (buffers.index()) {
-  case 1: // uint8_t *
-  {
-    qc_var->m_ioTensor.populateInputTensor(std::get<uint8_t *>(buffers), T,
-                                           m_inputDataType);
-    qc_var->RpcMem->registerQnnTensor(std::get<uint8_t *>(buffers), *T,
-                                      context_i.m_context);
-  } break;
-  case 2: // uint16_t*
-  {
-    qc_var->m_ioTensor.populateInputTensor(std::get<uint16_t *>(buffers), T,
-                                           m_inputDataType);
-    qc_var->RpcMem->registerQnnTensor(std::get<uint16_t *>(buffers), *T,
-                                      context_i.m_context);
-  } break;
-  case 3: {
-    qc_var->m_ioTensor.populateInputTensor(std::get<float *>(buffers), T,
-                                           m_inputDataType);
-    qc_var->RpcMem->registerQnnTensor(std::get<float *>(buffers), *T,
-                                      context_i.m_context);
-  } break;
-  default:
-    std::cout << "Unknown type: " << buffers.index() << std::endl;
-    break;
+                              BufferTypePtr buffers, Qnn_Tensor_t *T,
+                              bool is_output) {
+  auto populate = [&](Qnn_Tensor_t *tensor) {
+    switch (buffers.index()) {
+    case 1:
+      qc_var->m_ioTensor.populateInputTensor(std::get<uint8_t *>(buffers),
+                                             tensor, m_inputDataType);
+      break;
+    case 2:
+      qc_var->m_ioTensor.populateInputTensor(std::get<uint16_t *>(buffers),
+                                             tensor, m_inputDataType);
+      break;
+    case 3:
+      qc_var->m_ioTensor.populateInputTensor(std::get<float *>(buffers), tensor,
+                                             m_inputDataType);
+      break;
+    default:
+      std::cout << "Unknown type: " << buffers.index() << std::endl;
+      break;
+    }
+  };
+
+  auto rpc = qc_var->RpcMem;
+  void *host = rawPtr(buffers);
+
+  // host<->rpcmem residency bridge: the DSP-registering allocator can only
+  // to_fd() a buffer it produced. A foreign host I/O buffer (the model's
+  // external input/output, which nntrainer maps zero-copy and never routes to
+  // an allocator) is staged through a per-tensor rpcmem buffer here.
+  if (rpc->needsRegister() && host != nullptr && !rpc->owns(host)) {
+    std::vector<size_t> dims;
+    for (uint32_t i = 0; i < QNN_TENSOR_GET_RANK(T); ++i)
+      dims.push_back(QNN_TENSOR_GET_DIMENSIONS(T)[i]);
+    size_t bytes = 0;
+    datautil::StatusCode ds;
+    std::tie(ds, bytes) =
+      datautil::calculateLength(dims, QNN_TENSOR_GET_DATA_TYPE(T));
+
+    void *&stage = io_staging_[host];
+    if (stage == nullptr)
+      rpc->alloc(&stage, bytes, 64); // owned rpcmem, stable address, cached
+
+    // point the QNN tensor at the rpcmem stage so populateInputTensor writes
+    // the (quantized) bytes there and the DSP reads them via the ION handle.
+    Qnn_ClientBuffer_t cb{stage, static_cast<uint32_t>(bytes)};
+    QNN_TENSOR_SET_CLIENT_BUF(T, cb);
+
+    if (!is_output)
+      populate(T); // quantize/copy host input -> stage
+    else
+      output_copyback_.emplace_back(stage, host, bytes); // DSP writes -> stage
+
+    rpc->registerQnnTensor(stage, *T, context_i.m_context);
+    return;
   }
+
+  // owned (already rpcmem) or non-registering allocator: original zero-copy.
+  populate(T);
+  rpc->registerQnnTensor(host, *T, context_i.m_context);
 }
 
 } // namespace nntrainer
