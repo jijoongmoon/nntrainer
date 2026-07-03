@@ -300,8 +300,16 @@ void QNNGraph::forwarding(RunLayerContext &context, bool training) {
 
   // host<->rpcmem bridge (output leg): the DSP wrote each staged output into
   // its rpcmem buffer; copy it back into the foreign host output buffer.
-  for (auto &cb : output_copyback_)
+  const bool _dump = std::getenv("NNTR_QNN_DUMP") != nullptr;
+  for (size_t oi = 0; oi < output_copyback_.size(); ++oi) {
+    auto &cb = output_copyback_[oi];
     std::memcpy(std::get<1>(cb), std::get<0>(cb), std::get<2>(cb));
+    if (_dump) { // the (native, on-DSP) OUTPUT bytes the DSP produced
+      std::ofstream f("dbg_out_" + std::to_string(oi) + ".raw",
+                      std::ios::binary);
+      f.write(reinterpret_cast<char *>(std::get<0>(cb)), std::get<2>(cb));
+    }
+  }
   output_copyback_.clear();
 
   // std::cout << context.getOutput(0) << std::endl;
@@ -362,17 +370,22 @@ void QNNGraph::populateTensor(std::shared_ptr<QNNVar> qc_var,
                               bool is_output) {
   auto populate = [&](Qnn_Tensor_t *tensor) {
     switch (buffers.index()) {
-    case 1:
+    case 1: // uint8_t* source: same bytes as a native QNN tensor -> memscpy
       qc_var->m_ioTensor.populateInputTensor(std::get<uint8_t *>(buffers),
-                                             tensor, m_inputDataType);
+                                             tensor,
+                                             iotensor::InputDataType::NATIVE);
       break;
-    case 2:
+    case 2: // uint16_t* source: native
       qc_var->m_ioTensor.populateInputTensor(std::get<uint16_t *>(buffers),
-                                             tensor, m_inputDataType);
+                                             tensor,
+                                             iotensor::InputDataType::NATIVE);
       break;
-    case 3:
+    case 3: // float* source: (re)QUANTIZE into the tensor's native dtype using
+            // the tensor's quant encoding -- NOT a raw byte memcpy. The hardware
+            // input is quantized (e.g. uint8), so a float model activation must
+            // go through copyFromFloatToNative.
       qc_var->m_ioTensor.populateInputTensor(std::get<float *>(buffers), tensor,
-                                             m_inputDataType);
+                                             iotensor::InputDataType::FLOAT);
       break;
     default:
       std::cout << "Unknown type: " << buffers.index() << std::endl;
@@ -405,10 +418,19 @@ void QNNGraph::populateTensor(std::shared_ptr<QNNVar> qc_var,
     Qnn_ClientBuffer_t cb{stage, static_cast<uint32_t>(bytes)};
     QNN_TENSOR_SET_CLIENT_BUF(T, cb);
 
-    if (!is_output)
+    if (!is_output) {
       populate(T); // quantize/copy host input -> stage
-    else
+      // [debug] NNTR_QNN_DUMP: the (native, on-DSP) INPUT bytes we feed.
+      if (std::getenv("NNTR_QNN_DUMP") != nullptr) {
+        const char *nm = QNN_TENSOR_GET_NAME(T);
+        std::string fn = std::string("dbg_in_") + (nm ? nm : "t") + ".raw";
+        std::replace(fn.begin(), fn.end(), '/', '_');
+        std::ofstream f(fn, std::ios::binary);
+        f.write(reinterpret_cast<char *>(stage), bytes);
+      }
+    } else {
       output_copyback_.emplace_back(stage, host, bytes); // DSP writes -> stage
+    }
 
     rpc->registerQnnTensor(stage, *T, context_i.m_context);
     return;
