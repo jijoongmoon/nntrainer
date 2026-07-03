@@ -799,7 +799,12 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
         return (fc && std::atoi(fc) != 0) ? 1 : 0;
       }();
       bool gpu_done = false;
-#ifdef ENABLE_FP16
+      // lmhead_gemv_fp32w_cl is only declared/defined under ENABLE_OPENCL
+      // (blas_kernels.h is included behind that guard above). Requiring
+      // ENABLE_OPENCL here too keeps the FP16-but-no-OpenCL build (e.g. the
+      // CPU/HTP libnntrainer) compiling — gpu_done stays false and the host
+      // lm_head path below runs.
+#if defined(ENABLE_FP16) && defined(ENABLE_OPENCL)
       if (lmhead_gpu_fp32 != 0 &&
           input_step.getDataType() == nntrainer::TensorDim::DataType::FP16 &&
           weight.width() == hidden_size && hidden_step.width() == vocab_size) {
