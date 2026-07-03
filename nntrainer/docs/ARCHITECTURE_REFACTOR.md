@@ -9,8 +9,12 @@
 > CUDA override `cuda_context.cpp:224`); T13 `engine=npu`→QNN alias (`engine.cpp:93`); T10
 > `FusionRealizer` (`compiler/fusion_realizer.cpp`) — env-gated `NNTR_FUSE_ACT` + **inference-gated**
 > (`neuralnet.cpp:232`, commit `bfc0f2f0b`, after a training-gradient bug). **Partial:** T3 registry
-> open — engine-level done (`engine.cpp:113` validates the live registered-name set) but the
-> layer-level closed enum still loops (`layer_node.cpp:142`); T7 op_table — fc/geglu/swiglu absorbed,
+> open — engine-level done (`engine.cpp:113` validates the live registered-name set); layer-level
+> residency mapping (`layer_node.cpp:143` toLayerComputeEngine) now reads each context's
+> `Context::residencyEngine()` declaration instead of string-matching the closed EnumStr table (which
+> is demoted to an unregistered-name fallback) — the `LayerComputeEngine` enum itself
+> (`common.h:49`) stays closed at cpu/gpu/qnn/cuda for the residency plane; T7 op_table —
+> fc/geglu/swiglu absorbed,
 > but attention/rmsnorm/rope still bypass. **Shadow / inert:** T4 `ExecPlan` resolver + T11
 > `ModelFeatures` are SHADOW (resolved+logged, not authoritative; `context.h:146,208,255`); T5
 > `TensorRole` threaded but inert. **Not started:** T8 (flip resolver authoritative), T14 (QNN
