@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
 #
 # Build the Qwen3-0.6B QS4CX-FP16 model used in the 1K benchmark
-# (qwen3_lg_q6k): embedding Q6_K, FC QINT4, lm_head Q6_K, FP16 activations.
+# (qwen3_lg_q6k): embedding Q6_K, FC QS4CX, lm_head Q6_K, FP16 activations.
 #
 # Pipeline (matches the tested nntr_config recipe):
 #   1. weight_converter_layergraph.py : HF Qwen3-0.6B -> FP32 weights / FP16 norms .bin
@@ -11,11 +11,11 @@
 #                                       => model_tensor_type QS4CX-FP16
 #
 # Usage:
-#   build_qint4.sh <hf_qwen3_0.6b_dir> <out_dir> [nntr_quantize_binary]
+#   build_qs4cx.sh <hf_qwen3_0.6b_dir> <out_dir> [nntr_quantize_binary]
 set -euo pipefail
 
-HF="${1:?usage: build_qint4.sh <hf_qwen3_0.6b_dir> <out_dir> [nntr_quantize]}"
-OUT="${2:?usage: build_qint4.sh <hf_qwen3_0.6b_dir> <out_dir> [nntr_quantize]}"
+HF="${1:?usage: build_qs4cx.sh <hf_qwen3_0.6b_dir> <out_dir> [nntr_quantize]}"
+OUT="${2:?usage: build_qs4cx.sh <hf_qwen3_0.6b_dir> <out_dir> [nntr_quantize]}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../../../.." && pwd)"
 
@@ -54,7 +54,7 @@ cat > "$STAGE/nntr_config.json" <<EOF
 }
 EOF
 
-# 3) quantize to the 1K-benchmark recipe: FC QINT4 + embedding Q6_K + lm_head Q6_K
+# 3) quantize to the 1K-benchmark recipe: FC QS4CX + embedding Q6_K + lm_head Q6_K
 "$NNTR_QUANTIZE" "$STAGE" \
   --fc_dtype QS4CX --embd_dtype Q6_K --lmhead_dtype Q6_K \
   -o "$OUT"

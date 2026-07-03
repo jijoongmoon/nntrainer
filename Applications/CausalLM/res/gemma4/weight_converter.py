@@ -314,7 +314,7 @@ def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings,
     norm_dtype (optional): when set, the RMSNorm gamma and scalar_multiply
     weights are written in this dtype while the FC/embedding weights use
     `dtype`. This yields a "FP32-FP16" source (FP32 weights, FP16 norms) that
-    nntr_quantize can quantize to QINT4 while preserving FP16 norms/activations.
+    nntr_quantize can quantize to QS4CX int4 while preserving FP16 norms/activations.
     """
     total_bytes = 0
     count = 0

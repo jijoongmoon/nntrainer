@@ -3,16 +3,16 @@
 # Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
 #
 ## @file   weight_converter.py
-## @brief  HF Gemma2-2B -> nntrainer layer-graph .bin converter (QINT4 source).
+## @brief  HF Gemma2-2B -> nntrainer layer-graph .bin converter (int4-quantize source).
 ## @author Jijoong Moon <jijoong.moon@samsung.com>
 ##
 ## numpy-only converter: HF Gemma2-2B (model.safetensors, bf16) -> nntrainer
 ## layer-graph FP32 positional .bin, matching the weight order produced by the
 ## Gemma2CausalLM graph (= gemma3 weight_converter.py order minus q/k-norm).
 ##
-## This is STEP 1 of the QINT4-FP16 pipeline (see build_qint4.sh): it produces
+## This is STEP 1 of the QS4CX-FP16 pipeline (see build_qs4cx.sh): it produces
 ## the FP32-weight / FP16-norm source .bin that nntr_quantize then quantizes to
-## the 1K-benchmark recipe (embedding Q6_K, FC QINT4, lm_head Q6_K, QINT4-FP16).
+## the 1K-benchmark recipe (embedding Q6_K, FC QS4CX, lm_head Q6_K, QS4CX-FP16).
 ## Use --data_type float32 --norm_fp16 for that source.
 ##
 ## No torch / transformers / safetensors lib needed: safetensors is a JSON header

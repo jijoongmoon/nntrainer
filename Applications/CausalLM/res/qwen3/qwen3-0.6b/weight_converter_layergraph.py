@@ -3,16 +3,16 @@
 # Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
 #
 ## @file   weight_converter_layergraph.py
-## @brief  HF Qwen3 -> nntrainer layer-graph .bin converter (QINT4 source).
+## @brief  HF Qwen3 -> nntrainer layer-graph .bin converter (int4-quantize source).
 ## @author Jijoong Moon <jijoong.moon@samsung.com>
 ##
 ## numpy-only converter: HF Qwen3 (model.safetensors) -> nntrainer layer-graph
 ## FP32 positional .bin, matching the weight order of the torch
 ## weight_converter.py in this directory (and res/qwen3/qwen3-4b/).
 ##
-## This is STEP 1 of the QINT4-FP16 pipeline (see build_qint4.sh): it produces
+## This is STEP 1 of the QS4CX-FP16 pipeline (see build_qs4cx.sh): it produces
 ## the FP32-weight / FP16-norm source that nntr_quantize quantizes to the
-## 1K-benchmark recipe (embedding Q6_K, FC QINT4, lm_head Q6_K, QINT4-FP16).
+## 1K-benchmark recipe (embedding Q6_K, FC QS4CX, lm_head Q6_K, QS4CX-FP16).
 ## Use --data_type float32 --norm_fp16 for that source. No torch/transformers
 ## lib needed (reads model.safetensors directly; bf16 -> fp32 is an exact widen).
 ##
