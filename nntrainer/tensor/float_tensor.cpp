@@ -14,6 +14,7 @@
 #include <numeric>
 
 #include <chrono>
+#include <cstdlib>
 #include <cpu_backend.h>
 #include <float_tensor.h>
 #include <int4_utils.h>
@@ -1047,8 +1048,17 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   // activation zero-point correction internally, so no zp_corr is passed.
   // Off-HTP every backend returns supports_shgemm_u8i4()==false, so this is
   // byte-identical and the existing KleidiAI path below runs unchanged.
+  //
+  // M gate: the HMX pads M up to the 64-row tile, so small-M calls (decode,
+  // M=1) would run a full 64-row matmul for a handful of real rows and lose to
+  // the CPU KleidiAI GEMV. Route only prefill-sized M to the NPU; decode stays
+  // on CPU. NNTR_HTP_FC_MIN_M overrides the threshold (default 8) for tuning.
+  static const unsigned htp_fc_min_m = []() {
+    const char *e = std::getenv("NNTR_HTP_FC_MIN_M");
+    return (e != nullptr) ? static_cast<unsigned>(std::atoi(e)) : 8u;
+  }();
   auto *o = getOps();
-  if (o->supports_shgemm_u8i4() && (N % 32) == 0) {
+  if (o->supports_shgemm_u8i4() && (N % 32) == 0 && M >= htp_fc_min_m) {
     o->shgemm_u8i4(0, M, N, K, static_cast<const float *>(getData()), K,
                    input.getData<uint8_t>(), input.getScale<float>(), nullptr,
                    output.getData<float>(), N);
