@@ -55,6 +55,20 @@ if iniparser_dep.found()
   and_conf.set('MESON_INIPARSER_ROOT', iniparser_root)
 endif
 
+# HexKL/HTP: expose the addon (sdkl.h + libsdkl.so) to the ndk-build as a
+# prebuilt shared library so the htp_backend sources compile and link without a
+# manual Android.mk patch. hexkl_root / hexkl_lib_dir come from the top-level
+# meson.build enable-htp block. All three vars must be defined for configure_file.
+if get_option('enable-htp')
+  and_conf.set('MESON_ENABLE_HEXKL', 1)
+  and_conf.set('MESON_HEXKL_ROOT', hexkl_root)
+  and_conf.set('MESON_HEXKL_LIB_DIR', hexkl_lib_dir)
+else
+  and_conf.set('MESON_ENABLE_HEXKL', 0)
+  and_conf.set('MESON_HEXKL_ROOT', '')
+  and_conf.set('MESON_HEXKL_LIB_DIR', '')
+endif
+
 if get_option('enable-ruy')
   if ruy_dep.found()
     and_conf.set('MESON_RUY_ROOT', ruy_root)
