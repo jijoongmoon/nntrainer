@@ -184,28 +184,40 @@ int main(int argc, char **argv) {
   }
   std::printf("[ok] output non-zero: %u/%u\n", nonzero, OUT_ELEMS);
 
-  // (2) golden compare: both are native uint8 and HTP is deterministic, so the
-  //     bytes should match the qnn-net-run reference EXACTLY (allow a tiny
-  //     count of +-1 quant-step differences from any setup nuance).
-  if (golden_u8.size() == OUT_ELEMS) {
+  // (2) golden compare. qnn-net-run matches its I/O dtype to the INPUT dtype:
+  //     a FLOAT input (what this test feeds, and what QNNGraph quantizes) yields
+  //     a dequantized FLOAT golden of OUT_ELEMS*4 bytes; a native uint8 input
+  //     yields a uint8 golden of OUT_ELEMS bytes. Our output is native uint8, so
+  //     DEQUANTIZE it (o*scale) to compare against the float golden.
+  if (golden_u8.size() == OUT_ELEMS * sizeof(float)) {
+    const float *g = reinterpret_cast<const float *>(golden_u8.data());
+    double max_abs = 0.0, sum_abs = 0.0;
+    for (unsigned int i = 0; i < OUT_ELEMS; ++i) {
+      float deq = (static_cast<int>(o[i]) - OUT_OFFSET) * OUT_SCALE;
+      double d = std::fabs(static_cast<double>(deq) - g[i]);
+      max_abs = std::max(max_abs, d);
+      sum_abs += d;
+    }
+    std::printf("[ok] vs float golden: mean_abs=%.6g max_abs=%.6g (1 step=%.6g)\n",
+                sum_abs / OUT_ELEMS, max_abs, OUT_SCALE);
+    if (max_abs > 1.5 * OUT_SCALE) { // within ~1 quant step everywhere
+      std::fprintf(stderr, "[FAIL] output diverges from golden\n");
+      return 1;
+    }
+  } else if (golden_u8.size() == OUT_ELEMS) {
     unsigned int exact = 0, off_by_1 = 0, worse = 0;
     for (unsigned int i = 0; i < OUT_ELEMS; ++i) {
       int d = std::abs(static_cast<int>(o[i]) - static_cast<int>(golden_u8[i]));
-      if (d == 0)
-        ++exact;
-      else if (d == 1)
-        ++off_by_1;
-      else
-        ++worse;
+      (d == 0 ? exact : (d == 1 ? off_by_1 : worse))++;
     }
-    std::printf("[ok] vs golden: exact=%u off1=%u worse=%u / %u\n", exact,
+    std::printf("[ok] vs uint8 golden: exact=%u off1=%u worse=%u / %u\n", exact,
                 off_by_1, worse, OUT_ELEMS);
-    if (worse > OUT_ELEMS / 1000) { // >0.1% differ by >1 step => real mismatch
+    if (worse > OUT_ELEMS / 1000) {
       std::fprintf(stderr, "[FAIL] output diverges from golden\n");
       return 1;
     }
   } else {
-    std::printf("[warn] golden absent/size-mismatch (%zu) — non-zero only\n",
+    std::printf("[warn] golden size %zu unexpected — non-zero only\n",
                 golden_u8.size());
   }
 
