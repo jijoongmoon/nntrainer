@@ -65,14 +65,33 @@ namespace {
 inline bool xe3_needs_sync() {
   static const bool sync = []() {
     const char *e = std::getenv("NNTR_XE3_SYNC");
-    if (e)
-      return std::atoi(e) != 0; // explicit override
+    if (e) {
+      const bool ov = std::atoi(e) != 0;
+      fprintf(stderr, "[XE3_SYNC] env override NNTR_XE3_SYNC=%s -> drain %s\n", e,
+              ov ? "ON" : "OFF");
+      return ov; // explicit override
+    }
     const auto *di = ContextManager::Global().getDeviceInfo();
-    if (!di)
+    if (!di) {
+      // Resolved before DeviceInfo was populated: a possible platform-specific
+      // init-order gap. Fail safe to OFF but say so, since it silently disables
+      // the coherence drain.
+      fprintf(stderr, "[XE3_SYNC] DeviceInfo null at resolve time -> drain OFF "
+                      "(set NNTR_XE3_SYNC=1 if the GPU output races)\n");
       return false;
-    const bool fine_grain =
-      (di->getDeviceSVMCapabilities() & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
-    return di->getDeviceVendorId() == 0x8086u && !fine_grain; // Intel coarse-grain
+    }
+    const cl_device_svm_capabilities svm = di->getDeviceSVMCapabilities();
+    const unsigned vendor = (unsigned)di->getDeviceVendorId();
+    const bool fine_grain = (svm & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
+    const bool decision = vendor == 0x8086u && !fine_grain; // Intel coarse-grain
+    // One-shot to stderr: this is exactly what flips Linux (fine_grain=0 -> drain
+    // ON) vs a driver that advertises fine-grain buffer SVM (-> drain OFF, which
+    // races if that advertisement is not honored for kernel->kernel SVM handoffs).
+    fprintf(stderr,
+            "[XE3_SYNC] vendor=0x%x svm_caps=0x%x fine_grain_buffer=%d -> "
+            "auto drain %s (override with NNTR_XE3_SYNC=1)\n",
+            vendor, (unsigned)svm, (int)fine_grain, decision ? "ON" : "OFF");
+    return decision;
   }();
   return sync;
 }
@@ -720,13 +739,16 @@ bool CommandQueueManager::DispatchCommand(
   }
   next_prof_label_.clear();
 
-  // NNTR_XE3_SYNC=1: Xe3 (NEO 26.22) does not honor in-order kernel->kernel
-  // memory consistency for the GPU-resident (coarse-grained SVM) handoffs that
-  // the residency model relies on (Meteor's fine-grained SVM did). Serialize
-  // each dispatch as a coherence point. Heavy hammer to confirm the race; the
-  // production fix narrows this to the actual producer->consumer boundaries.
-  const bool xe3_sync = xe3_needs_sync();
-  if (xe3_sync && active_recording_queue_ == nullptr)
+  // NNTR_XE3_SYNC: Xe3 (coarse-grain SVM, no fine-grain-buffer coherence) does
+  // not honor in-order kernel->kernel memory consistency for the GPU-resident
+  // SVM handoffs the residency model relies on. [fix #3] Narrowed from the
+  // every-dispatch hammer to only the dispatches that bound an SVM pointer — the
+  // real coarse-grain-SVM producer->consumer boundary (RoPE->KV, KV->attention,
+  // SVM norm) — which slashes the clFinish count and its WDDM submission cost
+  // while keeping those handoffs coherent. Always consume the flag so it never
+  // leaks onto the next dispatch (cl_mem-only dispatches read false and skip).
+  const bool touched_svm = Kernel::takeDispatchTouchedSVM();
+  if (xe3_needs_sync() && active_recording_queue_ == nullptr && touched_svm)
     clFinish(command_queue_);
 
   return true;
@@ -800,13 +822,16 @@ bool CommandQueueManager::DispatchCommand(
   }
   next_prof_label_.clear();
 
-  // NNTR_XE3_SYNC=1: Xe3 (NEO 26.22) does not honor in-order kernel->kernel
-  // memory consistency for the GPU-resident (coarse-grained SVM) handoffs that
-  // the residency model relies on (Meteor's fine-grained SVM did). Serialize
-  // each dispatch as a coherence point. Heavy hammer to confirm the race; the
-  // production fix narrows this to the actual producer->consumer boundaries.
-  const bool xe3_sync = xe3_needs_sync();
-  if (xe3_sync && active_recording_queue_ == nullptr)
+  // NNTR_XE3_SYNC: Xe3 (coarse-grain SVM, no fine-grain-buffer coherence) does
+  // not honor in-order kernel->kernel memory consistency for the GPU-resident
+  // SVM handoffs the residency model relies on. [fix #3] Narrowed from the
+  // every-dispatch hammer to only the dispatches that bound an SVM pointer — the
+  // real coarse-grain-SVM producer->consumer boundary (RoPE->KV, KV->attention,
+  // SVM norm) — which slashes the clFinish count and its WDDM submission cost
+  // while keeping those handoffs coherent. Always consume the flag so it never
+  // leaks onto the next dispatch (cl_mem-only dispatches read false and skip).
+  const bool touched_svm = Kernel::takeDispatchTouchedSVM();
+  if (xe3_needs_sync() && active_recording_queue_ == nullptr && touched_svm)
     clFinish(command_queue_);
 
   return true;
@@ -868,6 +893,15 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
       key += next_prof_label_;
     profRecs().push_back({std::move(key), local_evt});
   }
+  // [fix #3] SVM coherence drain, same policy as DispatchCommand. The attention
+  // and RoPE/KV-scatter kernels — the coarse-grain-SVM producers and consumers —
+  // dispatch through enqueueKernel (not DispatchCommand), so the flush that keeps
+  // their handoff coherent must live here too. Flush only when this dispatch
+  // bound an SVM pointer; always consume the flag so it never leaks.
+  const bool touched_svm = Kernel::takeDispatchTouchedSVM();
+  if (xe3_needs_sync() && active_recording_queue_ == nullptr && touched_svm)
+    clFinish(command_queue_);
+
   // consume the per-call shape label regardless of tracking, so it never
   // leaks onto a subsequent kernel's profile entry.
   next_prof_label_.clear();
