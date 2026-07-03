@@ -59,6 +59,22 @@ public:
                    unsigned int /*ldc*/) override {
     hmx::shgemm_u8i8_i32(M, N, K, A, B, wt_scale, zp_corr, C);
   }
+
+  // U8 activations x I4 weights (QS4CX packed nibbles) -> I32 -> FP32. This is
+  // the op our CausalLM models actually hit (QS4CX is int4). zp_corr is derived
+  // inside hexkl_mm from the unpacked weight (QS4CX is symmetric), so the base
+  // interface's zp_corr argument is unused here.
+  bool supports_shgemm_u8i4() const override {
+    return HtpBackend::global().enabled();
+  }
+
+  void shgemm_u8i4(unsigned int /*order*/, unsigned int M, unsigned int N,
+                   unsigned int K, const float *A, unsigned int /*lda*/,
+                   const uint8_t *B_packed, const float *wt_scale,
+                   const int32_t * /*zp_corr*/, float *C,
+                   unsigned int /*ldc*/) override {
+    hmx::shgemm_u8i4_i32(M, N, K, A, B_packed, wt_scale, C);
+  }
 };
 
 ComputeOps *get_htp_ops() {

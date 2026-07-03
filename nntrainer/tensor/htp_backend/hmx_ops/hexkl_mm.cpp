@@ -298,6 +298,7 @@ void shgemm_f32f16_f32(const unsigned int TStorageOrder, bool TransA,
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace nntrainer {
 namespace hmx {
@@ -469,6 +470,179 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
 
   // --- Dequantize: I32 accumulator → FP32 ---
   // C[m,n] = act_scale * wt_scale[n] * (C_i32[m,n] - zp_corr[n])
+  const int32_t *C_i32 = static_cast<const int32_t *>(C_npu);
+  for (size_t m = 0; m < M_sz; ++m) {
+    const size_t row_offset = m * N_sz;
+    for (size_t n = 0; n < N_sz; ++n) {
+      C[row_offset + n] = act_scale * wt_scale[n] *
+                          (static_cast<float>(C_i32[row_offset + n]) -
+                           static_cast<float>(zp_corr[n]));
+    }
+  }
+
+  cleanup();
+}
+
+// U8 activations × I4 weights (QS4CX packed nibbles) → I32 accumulator → FP32.
+//
+// Quantization scheme (per-tensor activation zp=128, per-channel symmetric i4):
+//   act_scale = max_abs(A) / 127;  X_u8 = clamp(round(A/act_scale)+128, 0, 255)
+//   W_i4[n,k] = (nibble - 8) in [-8, 7]        (QS4CX even k = low nibble)
+//   zp_corr[n] = 128 * Σ_k W_i4[n,k]           (activation-zp offset, derived)
+//   C_i32 = X_u8 · W_wh^T ;  C = act_scale·wt_scale[n]·(C_i32[m,n] - zp_corr[n])
+//
+// Differs from shgemm_u8i8_i32 only in the weight path: QS4CX ships packed
+// nibbles + fp32 scales with no stored zero point, so we unpack to signed i4
+// (int8 RM), derive zp_corr, and convert RM→WH with sdkl_cpu_rm_to_wh_i4 before
+// dispatching sdkl_npu_mm_u8i4_i32.
+void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
+                     const float *A, const uint8_t *B_packed,
+                     const float *wt_scale, float *C) {
+  if (N % 32 != 0)
+    throw std::runtime_error("shgemm_u8i4_i32: N must be a multiple of 32 (N=" +
+                             std::to_string(N) + ")");
+
+  const size_t M_sz = M;
+  const size_t Mp_sz = ((M_sz + 63U) / 64U) * 64U;
+  const size_t N_sz = N;
+  const size_t K_sz = K;
+  const size_t Kp = (K_sz + 1U) / 2U; // packed nibble columns per weight row
+  const size_t mk_elems = checkedMulSizeT(M_sz, K_sz, "M*K elements");
+  const size_t mpk_elems = checkedMulSizeT(Mp_sz, K_sz, "Mp*K elements");
+  const size_t mpn_elems = checkedMulSizeT(Mp_sz, N_sz, "Mp*N elements");
+  const size_t nk_elems = checkedMulSizeT(N_sz, K_sz, "N*K elements");
+  const size_t x_bytes =
+    checkedBytes(mpk_elems, sizeof(uint8_t), "X_npu bytes");
+  const size_t c_bytes =
+    checkedBytes(mpn_elems, sizeof(int32_t), "C_npu bytes");
+  // WH-tiled i4 weight buffer: ceil(N/32) * ceil(K/32) * 512 bytes (sdkl.h).
+  const size_t wh_tiles = checkedMulSizeT((N_sz + 31U) / 32U,
+                                          (K_sz + 31U) / 32U, "WH tile count");
+  const size_t w_wh_bytes = checkedMulSizeT(wh_tiles, 512U, "W_wh bytes");
+
+  int domain = HtpBackend::global().domain();
+
+  // --- Per-tensor activation scale (zp = 128), identical to the u8i8 path ---
+  float max_abs = 0.0f;
+  for (size_t i = 0; i < mk_elems; ++i) {
+    if (!std::isfinite(A[i]))
+      continue;
+
+    float v = std::fabs(A[i]);
+    if (v > max_abs)
+      max_abs = v;
+  }
+  constexpr float kActQuantMax = 127.0f;
+  constexpr float kActZeroPoint = 128.0f;
+  const double scale_candidate =
+    static_cast<double>(max_abs) / static_cast<double>(kActQuantMax);
+  const float act_scale =
+    (std::isfinite(scale_candidate) &&
+     scale_candidate >= static_cast<double>(std::numeric_limits<float>::min()))
+      ? static_cast<float>(scale_candidate)
+      : 1.0f;
+  const float inv_act_scale = 1.0f / act_scale;
+
+  // --- Unpack QS4CX nibbles → signed int8 RM [N*K], derive zp_corr[n] ---
+  std::vector<int8_t> W_rm(nk_elems);
+  std::vector<int32_t> zp_corr(N_sz);
+  for (size_t n = 0; n < N_sz; ++n) {
+    const uint8_t *row = B_packed + n * Kp;
+    int32_t acc = 0;
+    for (size_t k = 0; k < K_sz; ++k) {
+      const uint8_t byte = row[k >> 1];
+      const int nib = (k & 1U) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+      const int w = nib - 8; // stored uint4 (int4 + 8) → signed int4 [-8, 7]
+      W_rm[n * K_sz + k] = static_cast<int8_t>(w);
+      acc += w;
+    }
+    zp_corr[n] = static_cast<int32_t>(kActZeroPoint) * acc;
+  }
+
+  // --- Allocate NPU-accessible staging buffers ---
+  void *X_npu = nullptr; // uint8  [Mp * K]
+  void *C_npu = nullptr; // int32  [Mp * N]
+  void *W_npu = nullptr; // i4 WH  [w_wh_bytes]
+
+  auto cleanup = [&]() {
+    if (X_npu)
+      sdkl_npu_free(X_npu);
+    if (C_npu)
+      sdkl_npu_free(C_npu);
+    if (W_npu)
+      sdkl_npu_free(W_npu);
+  };
+
+  int err = 0;
+
+  err = sdkl_npu_alloc(x_bytes, &X_npu);
+  if (err != 0 || X_npu == nullptr) {
+    cleanup();
+    throw std::runtime_error("shgemm_u8i4_i32: sdkl_npu_alloc X_npu failed: " +
+                             std::to_string(err));
+  }
+
+  err = sdkl_npu_alloc(c_bytes, &C_npu);
+  if (err != 0 || C_npu == nullptr) {
+    cleanup();
+    throw std::runtime_error("shgemm_u8i4_i32: sdkl_npu_alloc C_npu failed: " +
+                             std::to_string(err));
+  }
+
+  err = sdkl_npu_alloc(w_wh_bytes, &W_npu);
+  if (err != 0 || W_npu == nullptr) {
+    cleanup();
+    throw std::runtime_error("shgemm_u8i4_i32: sdkl_npu_alloc W_npu failed: " +
+                             std::to_string(err));
+  }
+
+  // --- FP32 → U8 quantization (zp = 128), padded rows zero-point-filled ---
+  uint8_t *X_u8 = static_cast<uint8_t *>(X_npu);
+  for (size_t m = 0; m < Mp_sz; ++m) {
+    const size_t row_offset = m * K_sz;
+    if (m >= M_sz) {
+      std::memset(X_u8 + row_offset, static_cast<int>(kActZeroPoint), K_sz);
+      continue;
+    }
+
+    for (size_t k = 0; k < K_sz; ++k) {
+      const float a = A[row_offset + k];
+      if (!std::isfinite(a)) {
+        X_u8[row_offset + k] = static_cast<uint8_t>(kActZeroPoint);
+        continue;
+      }
+
+      float q = std::round(a * inv_act_scale) + kActZeroPoint;
+      if (q < 0.0f)
+        q = 0.0f;
+      if (q > 255.0f)
+        q = 255.0f;
+      X_u8[row_offset + k] = static_cast<uint8_t>(q);
+    }
+  }
+
+  // --- Convert the unpacked RM i4 weight into SDKL's WH-tiled layout ---
+  int werr =
+    sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(W_npu), W_rm.data(), N_sz, K_sz);
+  if (werr != 0) {
+    cleanup();
+    throw std::runtime_error("sdkl_cpu_rm_to_wh_i4 failed: " +
+                             std::to_string(werr));
+  }
+
+  // --- NPU matrix multiply (u8 × i4 → i32) ---
+  std::memset(C_npu, 0, c_bytes);
+  err = sdkl_npu_mm_u8i4_i32(domain, Mp_sz, N_sz, K_sz,
+                             static_cast<int32_t *>(C_npu),
+                             static_cast<const uint8_t *>(X_npu),
+                             static_cast<const uint8_t *>(W_npu));
+  if (err != 0) {
+    cleanup();
+    throw std::runtime_error("sdkl_npu_mm_u8i4_i32 failed: " +
+                             std::to_string(err));
+  }
+
+  // --- Dequantize: C[m,n] = act_scale * wt_scale[n] * (C_i32 - zp_corr[n]) ---
   const int32_t *C_i32 = static_cast<const int32_t *>(C_npu);
   for (size_t m = 0; m < M_sz; ++m) {
     const size_t row_offset = m * N_sz;

@@ -57,6 +57,17 @@ void shgemm_u8i8_i32(unsigned int M, unsigned int N, unsigned int K,
                      const float *A, const int8_t *B_wh, const float *wt_scale,
                      const int32_t *zp_corr, float *C);
 
+// U8 activations x I4 weights (QS4CX packed nibbles) -> I32 accumulator ->
+// FP32 output. B_packed is N x ceil(K/2) plain nibbles, row-major, even k in the
+// low nibble, each stored uint4 = int4 + 8 (the canonical QS4CX layout);
+// wt_scale is the per-channel fp32 weight scale [N]. Unlike the u8i8 path the
+// activation-zero-point correction zp_corr[n] = 128 * sum_k(W_i4[n,k]) is
+// derived here from the unpacked weight, because QS4CX is symmetric and stores
+// no per-weight zero point. N must be 32-aligned; M is padded to the 64-row tile.
+void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
+                     const float *A, const uint8_t *B_packed,
+                     const float *wt_scale, float *C);
+
 } // namespace hmx
 } // namespace nntrainer
 
