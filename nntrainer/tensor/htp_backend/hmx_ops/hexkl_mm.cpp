@@ -543,9 +543,15 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
       : 1.0f;
   const float inv_act_scale = 1.0f / act_scale;
 
-  // --- Unpack QS4CX nibbles → signed int8 RM [N*K], derive zp_corr[n] ---
+  // --- Unpack QS4CX nibbles → signed int8 [N, K], derive zp_corr[n] ---
+  // The QS4CX weight is [N, K] row-major (output-major), and that is exactly the
+  // layout sdkl_cpu_rm_to_wh_i4 consumes — but it is called with (wt_rows=K,
+  // wt_cols=N), i.e. the DIM ARGS are swapped relative to the [N,K] data (this
+  // matches the device-passing Accuracy_u8i4 kernel test / official Qualcomm
+  // example: reference is C[m,n]=sum_k X[m,k]*W[n,k], W stored [N,K], packed via
+  // rm_to_wh_i4(out, W, K_aligned, N_aligned)). zp_corr[n] = 128*sum_k W[n,k].
   std::vector<int8_t> W_rm(nk_elems);
-  std::vector<int32_t> zp_corr(N_sz);
+  std::vector<int32_t> zp_corr(N_sz, 0);
   for (size_t n = 0; n < N_sz; ++n) {
     const uint8_t *row = B_packed + n * Kp;
     int32_t acc = 0;
@@ -623,7 +629,7 @@ void shgemm_u8i4_i32(unsigned int M, unsigned int N, unsigned int K,
 
   // --- Convert the unpacked RM i4 weight into SDKL's WH-tiled layout ---
   int werr =
-    sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(W_npu), W_rm.data(), N_sz, K_sz);
+    sdkl_cpu_rm_to_wh_i4(static_cast<uint8_t *>(W_npu), W_rm.data(), K_sz, N_sz);
   if (werr != 0) {
     cleanup();
     throw std::runtime_error("sdkl_cpu_rm_to_wh_i4 failed: " +
