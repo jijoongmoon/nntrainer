@@ -464,6 +464,22 @@ public:
       (void)wt_scale, (void)zp_corr, (void)C, (void)ldc;
     throwNotImplemented("shgemm_u8i8");
   }
+  /** whether the u8 act x i4 weight -> i32 -> fp32 matmul is HMX-accelerated */
+  virtual bool supports_shgemm_u8i4() const { return false; }
+  /**
+   * u8 activation x i4 weight -> i32 accumulate -> fp32 C (HexKL HMX FC op for
+   * our QS4CX int4 weights). @p B_packed holds two signed 4-bit weights per byte
+   * (the QS4CX nibble layout); a HexKL/HTP ComputeOps repacks it into SDKL's WH
+   * format and dispatches sdkl_npu_mm_u8i4_i32.
+   */
+  virtual void shgemm_u8i4(unsigned int order, unsigned int M, unsigned int N,
+                           unsigned int K, const float *A, unsigned int lda,
+                           const uint8_t *B_packed, const float *wt_scale,
+                           const int32_t *zp_corr, float *C, unsigned int ldc) {
+    (void)order, (void)M, (void)N, (void)K, (void)A, (void)lda, (void)B_packed,
+      (void)wt_scale, (void)zp_corr, (void)C, (void)ldc;
+    throwNotImplemented("shgemm_u8i4");
+  }
 
 protected:
   /**
