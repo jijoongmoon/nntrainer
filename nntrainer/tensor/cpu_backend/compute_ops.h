@@ -442,6 +442,29 @@ public:
    */
   virtual void apply_activation(Tensor &out, int act_type);
 
+  // ===========================================================================
+  // [HexKL/HTP] Accelerated NPU matmul ops. Declared LAST, at the vtable tail:
+  // appending here leaves every existing slot's index unmoved, so a rebuilt
+  // libnntrainer.so stays ABI-compatible with an app/ccapi built against the old
+  // vtable (Adreno verified by swapping only libnntrainer.so). A HexKL/HTP
+  // ComputeOps overrides these to route the matmul onto the Hexagon HMX tiles;
+  // every other backend keeps the defaults below, so callers that gate on
+  // supports_*() keep their existing path (byte-identical off-HTP).
+  // ===========================================================================
+  /** whether shgemm() (f32 act x f16 weight) is HMX-accelerated here */
+  virtual bool supports_shgemm() const { return false; }
+  /** whether the u8 act x i8 weight -> i32 -> fp32 matmul is HMX-accelerated */
+  virtual bool supports_shgemm_u8i8() const { return false; }
+  /** u8 activation x i8 weight -> i32 accumulate -> fp32 C (HexKL HMX FC op) */
+  virtual void shgemm_u8i8(unsigned int order, unsigned int M, unsigned int N,
+                           unsigned int K, const float *A, unsigned int lda,
+                           const int8_t *B, const float *wt_scale,
+                           const int32_t *zp_corr, float *C, unsigned int ldc) {
+    (void)order, (void)M, (void)N, (void)K, (void)A, (void)lda, (void)B,
+      (void)wt_scale, (void)zp_corr, (void)C, (void)ldc;
+    throwNotImplemented("shgemm_u8i8");
+  }
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not
