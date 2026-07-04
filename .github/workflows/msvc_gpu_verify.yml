@@ -64,5 +64,5 @@ jobs:
       - name: meson setup (opencl+cuda+fp16 ON via Half wrapper, clblast OFF)
         run: meson setup --native-file configurations/windows-native-gpu.ini -Dcuda-path="$env:CUDA_PATH" -Denable-clblast=false builddir
 
-      - name: meson compile (keep-going: surface ALL errors in one run)
+      - name: meson compile (keep-going, surface all errors in one run)
         run: ninja -C builddir -k 0
