@@ -302,18 +302,30 @@ if get_option('enable-cuda')
 
   cuda_path = get_option('cuda-path')
   cuda_incdir = include_directories(cuda_path / 'include')
-  cuda_libdir = cuda_path / 'lib64'
+  # Toolkit import/shared libs: Windows ships them in <cuda_path>\lib\x64,
+  # Linux in <cuda_path>/lib64. Import-lib base names (cudart/nvrtc/cublas/
+  # cublasLt/cuda) are identical on both; meson appends the platform suffix.
+  if host_machine.system() == 'windows'
+    cuda_libdir = cuda_path / 'lib' / 'x64'
+  else
+    cuda_libdir = cuda_path / 'lib64'
+  endif
 
   cudart_dep   = cxx.find_library('cudart',   dirs: cuda_libdir, required: true)
   nvrtc_dep    = cxx.find_library('nvrtc',    dirs: cuda_libdir, required: true)
   cublas_dep   = cxx.find_library('cublas',   dirs: cuda_libdir, required: true)
   cublaslt_dep = cxx.find_library('cublasLt', dirs: cuda_libdir, required: true)
   # libcuda (driver API: cuModuleLoad/cuLaunchKernel) ships with the NVIDIA
-  # driver; fall back to the toolkit stub if the driver lib is not on the
-  # default search path.
+  # driver; fall back to the toolkit copy if the driver lib is not on the
+  # default search path. On Linux that copy is a stub under lib64/stubs; on
+  # Windows the real cuda.lib import library sits directly in lib/x64.
   cudadrv_dep = cxx.find_library('cuda', required: false)
   if not cudadrv_dep.found()
-    cudadrv_dep = cxx.find_library('cuda', dirs: cuda_libdir / 'stubs', required: true)
+    if host_machine.system() == 'windows'
+      cudadrv_dep = cxx.find_library('cuda', dirs: cuda_libdir, required: true)
+    else
+      cudadrv_dep = cxx.find_library('cuda', dirs: cuda_libdir / 'stubs', required: true)
+    endif
   endif
 
   cuda_dep = declare_dependency(
