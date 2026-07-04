@@ -60,6 +60,35 @@ void CudaContext::initialize() noexcept {
     // isIntegrated(); no env to assert against, so it is logged only.
     ml_logi("[CudaContext] %s (shadow)", resolveExecPlan(caps_).toString().c_str());
 
+    // HW-optimal CUDA env defaults (same rationale/semantics as ClContext):
+    // NNTR_ENGINE=cuda already selected this context (so no engine guard is
+    // needed here — this only runs on a CUDA run), fill the tuned GPU-op flag set
+    // so a bare CUDA run gets full-GPU residency without exporting ~15 flags.
+    // setenv(..., 0): overwrite=0, so an explicit env ALWAYS wins (=0 disables).
+    // These are the run_gemma4_cuda.sh COMMON flags — "all models, both HW
+    // classes" — that move rope/attn/geglu/eltwise/qknorm/FC onto the GPU.
+    setenv("NNTR_CUDA_ROPE", "1", 0);
+    setenv("NNTR_CUDA_ATTN", "1", 0);
+    setenv("NNTR_CUDA_KV_UVM", "1", 0);
+    setenv("NNTR_CUDA_GEGLU", "1", 0);
+    setenv("NNTR_CUDA_ELTWISE", "1", 0);
+    setenv("NNTR_CUDA_QKNORM", "1", 0);
+    setenv("NNTR_CUDA_FLASH_DECODE", "64", 0);
+    setenv("NNTR_CUDA_BLOCKQ", "1", 0);
+    setenv("NNTR_FC_CUDA_CUBLAS", "1", 0);
+    setenv("NNTR_CUDA_PREWARM", "1", 0);
+    if (!caps_.integrated) {
+      // Discrete (RTX/dGPU) residency + decode-CUDA-graph add-ons: device-only
+      // activations, prefill v-copy, host RMSNorm (CUDA RMSNorm is not a win on
+      // discrete), the M2-B decode graph, and async submission. On integrated
+      // (Tegra/Orin) these are skipped — managed activations are the right pool.
+      setenv("NNTR_CUDA_DEV_ACT", "1", 0);
+      setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
+      setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+      setenv("NNTR_CUDA_M2B", "1", 0);
+      setenv("NNTR_CUDA_ASYNC", "1", 0);
+    }
+
     add_default_object();
 
     // Unified-Memory allocator: MemoryPool buffers for engine=cuda tensors are
