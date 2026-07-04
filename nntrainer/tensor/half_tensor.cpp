@@ -13,6 +13,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <numeric>
 
 #include <compute_ops.h>
 #include <cpu_backend.h>

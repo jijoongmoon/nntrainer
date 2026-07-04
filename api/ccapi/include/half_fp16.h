@@ -120,9 +120,11 @@ static inline float f16_bits_to_f32_sw(uint16_t h) {
 /** float -> half bits (F16C on MSVC, no /arch flag needed; software elsewhere) */
 static inline uint16_t f32_to_f16_bits(float f) {
 #if defined(_MSC_VER)
+  // Rounding immediate must be in 0-7 on MSVC (C4556); _MM_FROUND_NO_EXC (0x08)
+  // is rejected. _MM_FROUND_TO_NEAREST_INT (0x00) keeps round-to-nearest-even
+  // (via default MXCSR) — bit-identical conversion, only drops exception masking.
   return (uint16_t)_mm_extract_epi16(
-    _mm_cvtps_ph(_mm_set_ss(f), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC),
-    0);
+    _mm_cvtps_ph(_mm_set_ss(f), _MM_FROUND_TO_NEAREST_INT), 0);
 #else
   return f32_to_f16_bits_sw(f);
 #endif
