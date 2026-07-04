@@ -140,6 +140,42 @@ void ClContext::initialize() noexcept {
         (env_xmx == resolver_xmx)
           ? "MATCH"
           : "MISMATCH (XMX-capable but env XMX off — conservative default)");
+
+      // HW-optimal env DEFAULTS: give each GPU vendor its validated
+      // max-performance flag set out of the box so a bare GPU run matches the
+      // tuned README baselines with no flags set. setenv(..., 0) means
+      // overwrite=0 — an explicitly-set env ALWAYS wins (and =0 still disables
+      // for A/B), so this is a default layer, not a mandate. This is the seam a
+      // future nntr_config.json profile plugs into. Full catalog: docs/ENV_FLAGS.md.
+      // Vendor_id is a stable vendor-WIDE attribute (not brittle device_name);
+      // resolved before the model's first forward, so the app-side reads
+      // (NNTR_MHA_GPU/NNTR_KV_IMG_ATTN in CausalLM) observe these.
+      //
+      // CRITICAL: apply ONLY when OpenCL is the ACTIVE compute engine. On a
+      // dual-backend build (enable-cuda + enable-opencl) an engine=cuda run still
+      // initializes this CL context for the OpenCL kernels it links, but it must
+      // run on CUDA — setenv NNTR_MHA_GPU here would route that run's attention
+      // to the OpenCL MHA/RoPE path (rope_inplace_f16_cl) on the machine's iGPU
+      // and crash. engine=htp likewise owns its path. So skip unless
+      // NNTR_ENGINE is unset (OpenCL is the default) or explicitly "gpu".
+      const char *active_engine = std::getenv("NNTR_ENGINE");
+      const bool opencl_is_active =
+        (active_engine == nullptr) || std::string(active_engine) == "gpu";
+      constexpr uint32_t ADRENO_VENDOR_ID = 0x5143;
+      if (opencl_is_active && caps_.vendor_id == INTEL_VENDOR_ID) {
+        if (caps_.subgroups)
+          setenv("NNTR_FC_XMX", "1", 0); // DPAS/XMX GEMM — Xe2/Xe3 prefill +70~151%
+        setenv("NNTR_MHA_GPU", "1", 0);        // GPU attention (no host NEON → GPU wins)
+        setenv("NNTR_GPU_CLMEM_POOL", "1", 0); // cl_mem device residency sub-pool
+      } else if (opencl_is_active && caps_.vendor_id == ADRENO_VENDOR_ID) {
+        setenv("NNTR_MHA_GPU", "1", 0);        // GPU attention
+        setenv("NNTR_KV_IMG_ATTN", "1", 0);    // image2d KV/attention (Adreno read_imageui)
+        setenv("NNTR_GPU_CLMEM_POOL", "1", 0); // cl_mem device residency sub-pool
+      }
+      // NNTR_GPU_SVM_POOL (GPU-graph default-on in NeuralNetwork), NNTR_FC_INT8_GPU
+      // (GPU-FC default-on), NNTR_XE3_SYNC (caps-derived: Intel coarse-grain), and
+      // V8C buffer-vs-image (caps_.image_v8c above) are already HW-defaulted, so
+      // they are intentionally NOT re-set here.
     }
 
     if (KERNEL_CACHE_ENABLED) {
