@@ -30,6 +30,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/timm_vit \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
+    $(LOCAL_PATH)/../models/gauss4 \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
 
@@ -97,6 +98,7 @@ LOCAL_SRC_FILES := \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../layers/rms_norm.cpp \
     ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
@@ -107,6 +109,7 @@ LOCAL_SRC_FILES := \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
+    ../models/gauss4/gauss4_causallm.cpp \
     ../models/gemma3/function.cpp \
     ../models/timm_vit/timm_vit_transformer.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
@@ -250,9 +253,11 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../layers/rms_norm.cpp \
     ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
@@ -263,6 +268,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
+    ../models/gauss4/gauss4_causallm.cpp \
     ../models/gemma3/function.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../layers/deberta_attention_layer.cpp \
@@ -287,6 +293,7 @@ LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
+    $(LOCAL_PATH)/../models/gauss4 \
 
 include $(BUILD_EXECUTABLE)
 

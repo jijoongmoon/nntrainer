@@ -71,6 +71,7 @@
 #include "causal_lm.h"
 #include "deberta_v2.h"
 #include "embedding_gemma.h"
+#include "gauss4_causallm.h"
 #include "gemma2_causallm.h"
 #include "gemma3_causallm.h"
 #include "gemma4_causallm.h"
@@ -370,6 +371,11 @@ void registerAllModels() {
                           return std::make_unique<causallm::Gemma4CausalLM>(
                             cfg, generation_cfg, nntr_cfg);
                         });
+  factory.registerModel("Gauss4ForCausalLM",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::Gauss4CausalLM>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
   factory.registerModel("EmbeddingGemma",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::EmbeddingGemma>(
@@ -550,7 +556,25 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
 
       dtype_map[prefix + "_ple_projection"] = fc_dtype;
       dtype_map[prefix + "_ple_input_gate"] = fc_dtype;
+
+      // Gauss4 PLE (per-layer embedding) naming: each decoder layer owns its
+      // own PLE input-gate FC, projection FC, and embedding lookup table.
+      dtype_map[prefix + "_PLE_input_gate"] = fc_dtype;
+      dtype_map[prefix + "_PLE_projection"] = fc_dtype;
+      // Gauss4 per-layer PLE embedding is a lookup table -> embd_dtype
+      // (EmbeddingLayer save supports Q4_0/Q6_K/FP32, not QINT4). The
+      // reverse-norm (layer{i}_PLE_post_norm) is intentionally left out so it
+      // keeps its source (FP16) dtype.
+      if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE) {
+        dtype_map[prefix + "_PLE"] = embd_dtype;
+      }
     }
+  }
+
+  // Gauss4 global KV-sharing rotation projections (two plain FC layers).
+  if (fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE) {
+    dtype_map["rotation_sliding"] = fc_dtype;
+    dtype_map["rotation_full"] = fc_dtype;
   }
 
   // LM Head layer
