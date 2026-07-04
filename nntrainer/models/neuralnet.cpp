@@ -259,6 +259,23 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   // so CPU execution stays byte-identical. See
   // tensor/cl_operations/GPU_GENERALIZATION_PLAN.md.
   std::string engine_name = "cpu";
+#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
+  // NNTR_ENGINE=htp: run the whole model's FC on the Hexagon NPU through the
+  // DESIGNED per-layer compute-engine path — stamp every layer compute_engine=
+  // "htp" so its tensors carry HtpContext's ContextData and getOps() resolves to
+  // HtpComputeOps (FloatTensor::dotQs4cx -> shgemm_u8i4 -> NPU; non-accelerated
+  // ops fall through to CPU via HtpComputeOps:CpuComputeOps). This is the proper
+  // engine=htp selection, replacing the coarse global g_compute_ops swap: HTP is
+  // chosen at RUNTIME via engine=htp, not at compile time via ENABLE_HEXKL (which
+  // is only the ARM/libsdkl availability gate). The tensor pool stays host-
+  // resident (engine_name unchanged) and HexKL self-stages weights into rpcmem
+  // per call; wiring a rpcmem residency pool is deferred to the M6 residency work.
+  if (const char *_eng = std::getenv("NNTR_ENGINE");
+      _eng != nullptr && std::string(_eng) == "htp") {
+    for (auto &n : graph_representation)
+      n->setProperty({"engine=htp"});
+  }
+#endif
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
   const char *_svm_pool_env = std::getenv("NNTR_GPU_SVM_POOL");
   const bool svm_pool_on = !_svm_pool_env || std::atoi(_svm_pool_env) != 0;

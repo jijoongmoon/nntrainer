@@ -18,9 +18,6 @@
 #endif
 #include <compute_ops.h>
 #include <fallback_internal.h>
-#ifdef ENABLE_HEXKL
-#include <htp_backend.h> // HtpBackend::global().enabled() for the NNTR_HTP_OPS gate
-#endif
 #include <ggml_interface.h>
 #ifndef ARMV7
 #include <kleidiai_interface.h>
@@ -38,23 +35,11 @@ void init_backend() {
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
 #endif
   g_compute_ops = get_cpu_ops();
-#ifdef ENABLE_HEXKL
-  // Whole-model HTP (Mode-2) switch: point the global op table at the HexKL/HTP
-  // ops so every quantized FC (FloatTensor::dotQs4cx -> shgemm_u8i4) routes to
-  // the NPU without per-layer engine=htp — a Tensor with no ContextData falls
-  // back to g_compute_ops. HtpComputeOps : CpuComputeOps, so all non-accelerated
-  // ops still run on CPU. Opt-in via NNTR_HTP_OPS so default builds are
-  // unaffected.
-  //
-  // Gate on HtpBackend::enabled() (mirroring the per-context install in
-  // htp_context.cpp): only swap when the NPU actually came up. dotQs4cx self-
-  // guards via supports_shgemm_u8i4(), but the fp16 dotFloat32Float16 path calls
-  // getOps()->shgemm WITHOUT querying supports_shgemm(), so an ungated swap onto
-  // a down NPU would make that path throw. Gating here keeps g_compute_ops on
-  // CPU whenever the NPU is unavailable, so every op-table caller stays safe.
-  if (std::getenv("NNTR_HTP_OPS") != nullptr && HtpBackend::global().enabled())
-    g_compute_ops = get_htp_ops();
-#endif
+  // NOTE: HTP/HexKL is selected at RUNTIME via engine=htp (per-layer
+  // compute_engine -> HtpContext ContextData -> getOps()==HtpComputeOps), driven
+  // by NNTR_ENGINE=htp in NeuralNetwork (neuralnet.cpp). It is intentionally NOT
+  // a global g_compute_ops swap here: the op table stays CPU by default and only
+  // htp-stamped tensors resolve to the NPU ops, matching the gpu/cuda/qnn design.
 }
 
 void unpack_q4_0x8_transpose16(const void *src, uint16_t *d_out,
