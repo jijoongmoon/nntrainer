@@ -535,7 +535,10 @@ __global__ void repack_seca_i4(const unsigned char *secA, signed char *plain,
   int v1 = (k1 < K) ? seca_decode(secA, n, k1, k_internal) : 0;
   plain[(long)n * Kh + kb] = (signed char)((v0 & 0xF) | ((v1 & 0xF) << 4));
 }
-
+)CU"
+// NOTE: split here into two adjacent raw-string literals — MSVC caps a single
+// string literal at 16380 bytes (C2026); the two concatenate byte-identically.
+R"CU(
 // Y[m,n] = recip[m]*w_scale[n]*(sum_k q8[m,k]*int4(n,k) - zp[m]*rowsum_w[n]),
 // the asymmetric-activation dequant (zp from act_quant, rowsum_w from the
 // weight). via __dp4a.
