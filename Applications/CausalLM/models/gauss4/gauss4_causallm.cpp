@@ -58,22 +58,26 @@ void Gauss4Transformer::setupParameters(json &cfg, json &generation_cfg,
   }
 
   // Gauss4 stores per-attention-type rope_theta under
-  // rope_parameters.{sliding_attention,full_attention}.rope_theta  (= 500000).
-  // The base class reads rope_parameters.rope_theta (= 10000, the legacy global
-  // default) instead.  Override ROPE_THETA here with the per-type value when
-  // the per-type block exists, so that both sliding and full attention layers
-  // use the correct theta.
+  // rope_parameters.{sliding_attention,full_attention}.rope_theta
+  // (sliding = 500000, full = 8000000). Apply the correct theta PER LAYER TYPE:
+  // sliding layers use the sliding value, full-attention layers (every 5th) use
+  // the full value. (The base ROPE_THETA reads the legacy global
+  // rope_parameters.rope_theta = 10000 and is not used by the attention
+  // builders, which read the per-type members below.)
   if (cfg.contains("rope_parameters")) {
     const auto &rp = cfg["rope_parameters"];
-    // Prefer sliding_attention theta; fall back to full_attention; ignore the
-    // legacy global rope_parameters.rope_theta (= 10000 default).
     if (rp.contains("sliding_attention") &&
         rp["sliding_attention"].contains("rope_theta")) {
-      ROPE_THETA = rp["sliding_attention"]["rope_theta"].get<double>();
-    } else if (rp.contains("full_attention") &&
-               rp["full_attention"].contains("rope_theta")) {
-      ROPE_THETA = rp["full_attention"]["rope_theta"].get<double>();
+      SLIDING_ATTENTION_ROPE_THETA =
+        rp["sliding_attention"]["rope_theta"].get<double>();
     }
+    if (rp.contains("full_attention") &&
+        rp["full_attention"].contains("rope_theta")) {
+      FULL_ATTENTION_ROPE_THETA =
+        rp["full_attention"]["rope_theta"].get<double>();
+    }
+    // Keep the base single ROPE_THETA in sync (defensive) for any legacy path.
+    ROPE_THETA = SLIDING_ATTENTION_ROPE_THETA;
   }
 
   USE_KV_SHARING =
@@ -378,7 +382,9 @@ Tensor Gauss4Transformer::createAttention(const int layer_id, int /*seq_len*/,
 
   const bool is_sliding =
     ((layer_id + 1) % static_cast<int>(SLIDING_WINDOW_PATTERN)) != 0;
-  const float rope_theta = static_cast<float>(ROPE_THETA);
+  const float rope_theta =
+    is_sliding ? static_cast<float>(SLIDING_ATTENTION_ROPE_THETA)
+               : static_cast<float>(FULL_ATTENTION_ROPE_THETA);
   const unsigned int window_size = is_sliding ? SLIDING_WINDOW : UINT_MAX;
 
   const std::string lname = "layer" + std::to_string(layer_id);
@@ -495,7 +501,9 @@ Tensor Gauss4Transformer::createSharedAttention(const int layer_id,
   const unsigned int kv_width = kv_unit;
   const bool is_sliding =
     ((layer_id + 1) % static_cast<int>(SLIDING_WINDOW_PATTERN)) != 0;
-  const float rope_theta = static_cast<float>(ROPE_THETA);
+  const float rope_theta =
+    is_sliding ? static_cast<float>(SLIDING_ATTENTION_ROPE_THETA)
+               : static_cast<float>(FULL_ATTENTION_ROPE_THETA);
   const unsigned int window_size = is_sliding ? SLIDING_WINDOW : UINT_MAX;
 
   const std::string lname = "layer" + std::to_string(layer_id);

@@ -104,6 +104,12 @@ protected:
   unsigned int NUM_SEQUENTIAL_LAYERS = 20;      // normal: layers 0..19
   unsigned int SLIDING_ATTENTION_KV_LAYER = 18; // config.json=19, -1 = 18
   unsigned int FULL_ATTENTION_KV_LAYER = 19;    // config.json=20, -1 = 19
+  // Per-attention-type RoPE theta (config.json rope_parameters). Sliding layers
+  // use sliding_attention.rope_theta (500000); full-attention layers (every 5th)
+  // use full_attention.rope_theta (8000000). The CPU reference applied a single
+  // (sliding) value to all layers; per-type application is the RoPE fix.
+  double SLIDING_ATTENTION_ROPE_THETA = 500000.0;
+  double FULL_ATTENTION_ROPE_THETA = 8000000.0;
   unsigned int LATENT_SIZE_PER_GATE = 256;
   unsigned int MLP_LRA_RANK = 512;
   unsigned int HIDDEN_SIZE_PER_LAYER_INPUT = 192;
