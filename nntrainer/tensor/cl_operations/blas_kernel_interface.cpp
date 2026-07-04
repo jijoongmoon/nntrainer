@@ -1198,9 +1198,12 @@ static bool fc_tprof_on() {
   return on;
 }
 static double fc_tprof_now() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+  // steady_clock == monotonic; ms as double from a monotonic epoch, used only
+  // in differences so the epoch offset is irrelevant (identical to the old
+  // clock_gettime(CLOCK_MONOTONIC) ms computation).
+  return std::chrono::duration<double, std::milli>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
 }
 static double fc_tp_entry = 0, fc_tp_stage = 0, fc_tp_tail = 0;
 static int fc_tp_n = 0;

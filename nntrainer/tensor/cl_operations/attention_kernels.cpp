@@ -2487,9 +2487,10 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   // (which call blocks ~35ms/layer despite being enqueue-only).
   static const bool attn_tprof = std::getenv("NNTR_ATTN_TPROF") != nullptr;
   auto tnow = []() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+    // steady_clock == monotonic; ms as double (used only in differences).
+    return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
   };
   static double tp_k1a = 0, tp_k1e = 0, tp_k2 = 0, tp_k3 = 0, tp_fl = 0;
   static int tp_n = 0;

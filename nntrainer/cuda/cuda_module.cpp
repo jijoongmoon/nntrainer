@@ -15,11 +15,11 @@
 #include "cuda_context_manager.h"
 
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <sstream>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <system_error>
 #include <vector>
 
 namespace nntrainer::cuda {
@@ -39,13 +39,12 @@ static std::string cacheDir() {
 
 /// best-effort recursive mkdir (mkdir -p semantics)
 static void makeDirs(const std::string &path) {
-  std::string cur;
-  for (size_t i = 0; i < path.size(); ++i) {
-    cur.push_back(path[i]);
-    if (path[i] == '/' && cur.size() > 1)
-      mkdir(cur.c_str(), 0755);
-  }
-  mkdir(path.c_str(), 0755);
+  // std::filesystem::create_directories creates every missing parent (the
+  // recursive case the hand-rolled loop handled) and is portable. Best-effort:
+  // swallow errors via the error_code overload (dir may already exist or be
+  // uncreatable) — matches the old ignore-return behaviour.
+  std::error_code ec;
+  std::filesystem::create_directories(path, ec);
 }
 
 static bool readFile(const std::string &p, std::string &out) {

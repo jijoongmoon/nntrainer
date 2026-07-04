@@ -1589,13 +1589,13 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
         static const bool tprof = std::getenv("NNTR_NORM_TPROF") != nullptr;
         static double acc = 0;
         static int n = 0;
-        struct timespec t0, t1;
+        std::chrono::steady_clock::time_point t0, t1;
         if (tprof)
-          clock_gettime(CLOCK_MONOTONIC, &t0);
+          t0 = std::chrono::steady_clock::now();
         blas_cc->command_queue_inst_.enqueueSVMMap(result, in_bytes, false);
         if (tprof) {
-          clock_gettime(CLOCK_MONOTONIC, &t1);
-          acc += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+          t1 = std::chrono::steady_clock::now();
+          acc += std::chrono::duration<double, std::milli>(t1 - t0).count();
           if (++n % 54 == 0) {
             std::fprintf(stderr, "[NORM-TPROF] n=%d map_total=%.2fms\n", n, acc);
             std::fflush(stderr);
