@@ -1,10 +1,13 @@
-name: "Windows GPU MSVC verify (opencl+cuda, fp16 off)"
+name: "Windows GPU MSVC verify (opencl+cuda+fp16)"
 
-# Phase-0 verification for the Windows/MSVC GPU port.
-# See docs/design/msvc_fp16_half_wrapper.md (§4 Phase 0, §6.1-6.3).
+# Verification for the Windows/MSVC GPU port.
+# See docs/design/msvc_fp16_half_wrapper.md.
 #
-# Compiles + links nntrainer with Intel-OpenCL + NVIDIA-CUDA enabled and fp16 OFF,
-# using MSVC cl.exe (x64). fp32 activation is a first-class supported config.
+# Compiles + links nntrainer with Intel-OpenCL + NVIDIA-CUDA + fp16 ENABLED,
+# using MSVC cl.exe (x64). MSVC has no native _Float16, so fp16-impl=auto probes
+# and selects the uint16-backed nntrainer::Half wrapper. Runtime fp16/fp32 is
+# chosen by tensor dtype (both supported). Half already validated on Linux
+# (compile + token-identical inference + 1K perf-parity vs native _Float16).
 #
 # NOTE: GitHub-hosted runners have NO Intel/NVIDIA GPU, so this job verifies
 # COMPILE + LINK ONLY (no `meson test`). Runtime perf/accuracy on Windows must be
@@ -20,7 +23,7 @@ on:
 jobs:
   build:
     runs-on: windows-2022
-    name: MSVC opencl+cuda compile (fp16 off)
+    name: MSVC opencl+cuda+fp16 compile (Half wrapper)
     defaults:
       run:
         shell: pwsh
@@ -58,7 +61,7 @@ jobs:
           Write-Host "cuda lib    = $cudalib"    ; Test-Path $cudalib
           Write-Host "opencl lib  = $opencl"     ; Test-Path "$opencl\OpenCL.lib"
 
-      - name: meson setup (opencl+cuda ON, fp16 OFF, clblast OFF for first pass)
+      - name: meson setup (opencl+cuda+fp16 ON via Half wrapper, clblast OFF)
         run: meson setup --native-file configurations/windows-native-gpu.ini -Dcuda-path="$env:CUDA_PATH" -Denable-clblast=false builddir
 
       - name: meson compile
