@@ -16,6 +16,7 @@ subdir('gemma2')
 subdir('gemma3')
 subdir('timm_vit')
 subdir('gemma4')
+subdir('gauss4')
 if get_option('platform') != 'windows'
     subdir('bert')
     subdir('gpt_oss_cached_slim')
