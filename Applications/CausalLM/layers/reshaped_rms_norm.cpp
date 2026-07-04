@@ -303,7 +303,9 @@ void ReshapedRMSNormLayer::incremental_forwarding(
         out_step.copyData(out_f32);
       } else {
         throw std::invalid_argument(
-          "Error: not yet implemented for this data type");
+          "reshaped_rms_norm NYI dtype=" +
+          std::to_string(static_cast<int>(in_step.getDataType())) +
+          " layer=" + context.getName());
       }
       if (gamma)
         out_step.multiply_i(*gamma);

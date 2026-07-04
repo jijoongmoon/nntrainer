@@ -203,7 +203,9 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 #endif
       } else {
         throw std::invalid_argument(
-          "Error: not yet implemented for this data type");
+          "rms_norm NYI dtype=" +
+          std::to_string(static_cast<int>(in_step.getDataType())) +
+          " layer=" + context.getName());
       }
       out_step.multiply_i(gamma);
 
