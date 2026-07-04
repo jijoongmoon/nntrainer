@@ -18,6 +18,9 @@
 #endif
 #include <compute_ops.h>
 #include <fallback_internal.h>
+#ifdef ENABLE_HEXKL
+#include <htp_backend.h> // HtpBackend::global().enabled() for the NNTR_HTP_OPS gate
+#endif
 #include <ggml_interface.h>
 #ifndef ARMV7
 #include <kleidiai_interface.h>
@@ -40,10 +43,16 @@ void init_backend() {
   // ops so every quantized FC (FloatTensor::dotQs4cx -> shgemm_u8i4) routes to
   // the NPU without per-layer engine=htp — a Tensor with no ContextData falls
   // back to g_compute_ops. HtpComputeOps : CpuComputeOps, so all non-accelerated
-  // ops still run on CPU, and supports_shgemm_u8i4() gates on the NPU being up
-  // (else the FC stays on CPU too). Opt-in via NNTR_HTP_OPS so default builds are
+  // ops still run on CPU. Opt-in via NNTR_HTP_OPS so default builds are
   // unaffected.
-  if (std::getenv("NNTR_HTP_OPS") != nullptr)
+  //
+  // Gate on HtpBackend::enabled() (mirroring the per-context install in
+  // htp_context.cpp): only swap when the NPU actually came up. dotQs4cx self-
+  // guards via supports_shgemm_u8i4(), but the fp16 dotFloat32Float16 path calls
+  // getOps()->shgemm WITHOUT querying supports_shgemm(), so an ungated swap onto
+  // a down NPU would make that path throw. Gating here keeps g_compute_ops on
+  // CPU whenever the NPU is unavailable, so every op-table caller stays safe.
+  if (std::getenv("NNTR_HTP_OPS") != nullptr && HtpBackend::global().enabled())
     g_compute_ops = get_htp_ops();
 #endif
 }

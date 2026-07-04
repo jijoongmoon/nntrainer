@@ -1057,8 +1057,14 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
     const char *e = std::getenv("NNTR_HTP_FC_MIN_M");
     return (e != nullptr) ? static_cast<unsigned>(std::atoi(e)) : 8u;
   }();
+  // N and K must both be 32-aligned: shgemm_u8i4 pads the weight to full
+  // ceil(N/32)*ceil(K/32) HMX tiles and rm_to_wh_i4 tiles by 32, so an unaligned
+  // K would contract a 32-padded weight against K real activation columns. All
+  // current gemma/qwen FC dims are multiples of 32; anything else falls back to
+  // the CPU KleidiAI path below.
   auto *o = getOps();
-  if (o->supports_shgemm_u8i4() && (N % 32) == 0 && M >= htp_fc_min_m) {
+  if (o->supports_shgemm_u8i4() && (N % 32) == 0 && (K % 32) == 0 &&
+      M >= htp_fc_min_m) {
     o->shgemm_u8i4(0, M, N, K, static_cast<const float *>(getData()), K,
                    input.getData<uint8_t>(), input.getScale<float>(), nullptr,
                    output.getData<float>(), N);
