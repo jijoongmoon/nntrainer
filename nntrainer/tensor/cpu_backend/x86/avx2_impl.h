@@ -20,6 +20,10 @@
 #include <limits>
 #include <stddef.h>
 
+#ifdef ENABLE_FP16
+#include <tensor_dim.h> // for the _FP16 macro (native _Float16 or Half wrapper)
+#endif
+
 namespace nntrainer::avx2 {
 
 #ifdef ENABLE_FP16
@@ -31,7 +35,7 @@ namespace nntrainer::avx2 {
  * @param[in]  input vector containing 16-bit floating point values
  * @param[out] output vector containing single-precision floating point values.
  */
-void vcvt_f16_f32(unsigned int N, const _Float16 *input, float *output);
+void vcvt_f16_f32(unsigned int N, const _FP16 *input, float *output);
 
 /**
  * @brief  Converts single-precision floating point values to half-precision
@@ -41,7 +45,7 @@ void vcvt_f16_f32(unsigned int N, const _Float16 *input, float *output);
  * @param[in]  input vector containing single-precision floating point values
  * @param[out] output vector containing 16-bit floating point values
  */
-void vcvt_f32_f16(unsigned int N, const float *input, _Float16 *output);
+void vcvt_f32_f16(unsigned int N, const float *input, _FP16 *output);
 
 /**
  * @brief     check if the X has NaN value
@@ -50,7 +54,7 @@ void vcvt_f32_f16(unsigned int N, const float *input, _Float16 *output);
  * @param[in] X half-precision * for Vector X
  * @param[out] false if it has NaN or inf
  */
-bool is_valid(const unsigned int N, const _Float16 *X);
+bool is_valid(const unsigned int N, const _FP16 *X);
 #endif
 
 /**
