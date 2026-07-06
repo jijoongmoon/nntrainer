@@ -425,7 +425,8 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_f16(
   constexpr size_t sr = 2;
   constexpr size_t kai_fp16_size = sizeof(uint16_t);
 
-  // LHS packing direct from fp16 — no fp32 promotion buffer.
+  // LHS packing direct from fp16 — no fp32 promotion buffer. Packed once here
+  // (shared, read-only) and reused by every N-column worker below.
   const size_t lhs_packed_size =
     kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f16(m, k, mr, kr, sr);
   uint8_t *lhs_packed_mtx_qa8dx = new uint8_t[lhs_packed_size];
@@ -437,20 +438,37 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_f16(
   const size_t lhs_offset =
     kai_get_lhs_packed_offset_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
       0, k);
-  const size_t rhs_offset =
-    kai_get_rhs_packed_offset_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
-      0, k);
-  const size_t dst_offset =
-    kai_get_dst_offset_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
-      0, 0, dst_stride);
-
   const void *lhs_ptr = (const char *)lhs_packed_mtx_qa8dx + lhs_offset;
-  const void *rhs_ptr = (const char *)rhs_packed_mtx_qs4cx + rhs_offset;
-  void *dst_ptr = (uint8_t *)dst_act_mtx_f16 + dst_offset;
 
-  kai_run_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
-    m, n, k, lhs_ptr, rhs_ptr, dst_ptr, dst_stride, kai_fp16_size, lower_bound,
-    upper_bound);
+  // Parallelize the matmul over N (output columns). Each worker owns a disjoint
+  // n_step-wide band of the RHS/DST (LHS is shared read-only), so no sync is
+  // needed and parallel_for is a barrier before the free below. Without
+  // this the whole GEMM ran on a single core — the FP32 facade
+  // (__kai_gemm_qai8dxp_qsi4cxp) already splits n this way; the fp16-dst fork
+  // had been left single-threaded, which made every QS4CX-FP16 FC (and the
+  // untied QS4CX lm_head) the decode bottleneck.
+  const size_t n_step =
+    kai_get_n_step_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm();
+  const size_t n_loop = (n + n_step - 1) / n_step;
+  auto &tm = nntrainer::ThreadManager::Global();
+
+  tm.parallel_for(0, n_loop, [&](size_t i) {
+    const size_t n_start = i * n_step;
+    const size_t n_to_process = std::min(n_step, n - n_start);
+
+    const size_t rhs_offset =
+      kai_get_rhs_packed_offset_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
+        n_start, k);
+    const size_t dst_offset =
+      kai_get_dst_offset_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
+        0, n_start, dst_stride);
+    const void *rhs_ptr = (const char *)rhs_packed_mtx_qs4cx + rhs_offset;
+    void *dst_ptr = (uint8_t *)dst_act_mtx_f16 + dst_offset;
+
+    kai_run_matmul_clamp_f16_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm(
+      m, n_to_process, k, lhs_ptr, rhs_ptr, dst_ptr, dst_stride, kai_fp16_size,
+      lower_bound, upper_bound);
+  });
 
   delete[] lhs_packed_mtx_qa8dx;
 }
