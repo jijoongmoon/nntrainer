@@ -92,8 +92,8 @@ public:
     f.attn_softcap = false;
     f.final_softcap = false;
     f.lmhead_kind = nntrainer::LmHeadKind::TIED;
-    f.decode_gpu = false;      // start off (d=128); flip after decode validated
-    f.decode_rope_gpu = false;
+    f.decode_gpu = true;       // full GPU: prefill + decode (like gemma4/qwen3)
+    f.decode_rope_gpu = true;
     f.head_dim = 128;
     return f;
   }

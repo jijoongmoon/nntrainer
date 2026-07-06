@@ -432,6 +432,13 @@ Tensor Gauss4Transformer::createAttention(const int layer_id, int /*seq_len*/,
      withKey("attn_logit_softcapping", "0.0"),
      withKey("is_causal", IS_CAUSAL ? "true" : "false"),
      withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false"),
+     // gemma4-family full-GPU gates (decode attn + GPU RoPE-decode LUT).
+     withKey("gpu_decode_attn",
+             getModelFeatures().decode_gpu ? "true" : "false"),
+     withKey("gpu_decode_rope",
+             getModelFeatures().decode_rope_gpu ? "true" : "false"),
+     withKey("gpu_ohwi_rope",
+             getModelFeatures().decode_gpu ? "true" : "false"),
      withKey("engine", causallm_engine())}));
   Tensor attn_raw = mha({q, k, v, cache_k, cache_v});
 
@@ -557,6 +564,13 @@ Tensor Gauss4Transformer::createSharedAttention(const int layer_id,
   mha_props.push_back(withKey("engine", causallm_engine()));
   mha_props.push_back(
     withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false"));
+  // gemma4-family full-GPU gates (decode attn + GPU RoPE-decode LUT).
+  mha_props.push_back(withKey(
+    "gpu_decode_attn", getModelFeatures().decode_gpu ? "true" : "false"));
+  mha_props.push_back(withKey(
+    "gpu_decode_rope", getModelFeatures().decode_rope_gpu ? "true" : "false"));
+  mha_props.push_back(withKey(
+    "gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"));
   appendSkipPrefillIfNeeded(mha_props, true);
   LayerHandle mha(createLayer("mha_core", mha_props));
   Tensor attn_raw = mha({q, k, v, cache_k, cache_v});
@@ -747,7 +761,8 @@ Tensor Gauss4Transformer::createPerLayerEmbedding(const int layer_id,
     // post_norm: ReverseRMSNorm (weight + out_scale)
     std::vector<std::string> pn_props = {
       withKey("name", lname + "_PLE_post_norm"),
-      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+      withKey("engine", causallm_engine())};
     appendSkipPrefillIfNeeded(pn_props, skip_prefill);
     LayerHandle ple_norm(createLayer("rms_reverse_norm", pn_props));
     return ple_norm(projected);
@@ -790,7 +805,8 @@ Tensor Gauss4Transformer::createPerLayerEmbedding(const int layer_id,
     // post_norm: ReverseRMSNorm (weight + out_scale)
     std::vector<std::string> pn_props = {
       withKey("name", lname + "_PLE_post_norm"),
-      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+      withKey("engine", causallm_engine())};
     appendSkipPrefillIfNeeded(pn_props, skip_prefill);
     LayerHandle ple_norm(createLayer("rms_reverse_norm", pn_props));
     return ple_norm(projected);

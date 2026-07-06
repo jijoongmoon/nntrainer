@@ -207,3 +207,45 @@ __kernel void rmsnorm_f32in_f16out_coop(__global const float *input,
     out8[i] = hv * a8[i];
   }
 }
+
+// gauss4 PLE reverse-RMSNorm (RMSReverseNormLayer GPU path):
+//   out = out_scale * normalize(input * weight)
+// The per-feature `weight` is applied BEFORE the RMS denominator (it couples all
+// features, so this can NOT be expressed as a plain rmsnorm*gamma), and
+// `out_scale` is a POST-norm SCALAR. Sum-of-squares in fp32 (matches the host
+// rms_reverse_norm FP32 path). One workgroup (RMSN_LWS WIs) per row; each WI
+// strides the row. `weight` is a model-weight pointer with NO 16-byte alignment
+// guarantee, so it is loaded PER-ELEMENT (a half8 vload would read garbage --
+// same caveat as the coop gamma above). W need not be %8 (scalar per-element).
+__attribute__((reqd_work_group_size(RMSN_LWS, 1, 1)))
+__kernel void rms_reverse_norm_cl_fp16_coop(__global const half *input,
+                                            __global half *output,
+                                            __global const half *weight,
+                                            half out_scale, half epsilon,
+                                            int n_rows, int W) {
+  const int row = get_group_id(0);
+  const int tid = get_local_id(0);
+  if (row >= n_rows)
+    return;
+  const long base = (long)row * (long)W;
+
+  float partial = 0.0f;
+  for (int j = tid; j < W; j += RMSN_LWS) {
+    const float t = (float)input[base + j] * (float)weight[j];
+    partial += t * t;
+  }
+  __local float lsum[RMSN_LWS];
+  lsum[tid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = RMSN_LWS >> 1; s > 0; s >>= 1) {
+    if (tid < s)
+      lsum[tid] += lsum[tid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float mean = lsum[0] / (float)W;
+  const float scale = rsqrt(mean + (float)epsilon) * (float)out_scale;
+  for (int j = tid; j < W; j += RMSN_LWS) {
+    const float t = (float)input[base + j] * (float)weight[j];
+    output[base + j] = (half)(t * scale);
+  }
+}

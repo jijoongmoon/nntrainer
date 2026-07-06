@@ -1611,6 +1611,87 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
   }
 }
 
+// gauss4 PLE reverse-RMSNorm GPU path: out = out_scale * normalize(in * weight).
+// Mirrors rmsnorm_cl_fp16's coop dispatch (fp32 accumulation, SVM-direct or
+// planner cl_mem sub-buffer bind), with the extra per-feature `weight` (arg 2,
+// applied inside the RMS denom) and the post-norm SCALAR `out_scale` (arg 3).
+// One workgroup (RMSN_LWS WIs) per row; W need not be %8 (scalar per-element).
+void rms_reverse_norm_cl_fp16(const _FP16 *input, const _FP16 *weight,
+                              _FP16 out_scale, _FP16 *result,
+                              const float epsilon, unsigned int height,
+                              unsigned int width, bool use_svm, void *out_clmem,
+                              void *in_clmem) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  const _FP16 eps_h = static_cast<_FP16>(epsilon);
+  const size_t in_bytes = (size_t)height * width * sizeof(_FP16);
+  cl_mem out_cl = static_cast<cl_mem>(out_clmem);
+  cl_mem in_cl = static_cast<cl_mem>(in_clmem);
+  const bool to_clmem = (out_cl != nullptr) && use_svm;
+  const bool from_clmem = (in_cl != nullptr);
+  const int n_rows = (int)height;
+  const int w = (int)width;
+  constexpr int RMSN_LWS = 64;
+
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    rmsnorm_fp16_kernel, "rms_reverse_norm_cl_fp16_coop");
+  if (!kp)
+    return;
+
+  if (to_clmem || from_clmem) {
+    bool ok = true;
+    if (from_clmem)
+      ok = ok && kp->SetKernelArguments(0, &in_cl, sizeof(cl_mem));
+    else
+      ok = ok && kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+    if (to_clmem)
+      ok = ok && kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem));
+    else
+      ok = ok && kp->SetKernelSVMArguments(1, result);
+    ok = ok && kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(weight));
+    if (!ok)
+      return;
+  } else if (use_svm) {
+    if (!kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input)) ||
+        !kp->SetKernelSVMArguments(1, result) ||
+        !kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(weight)))
+      return;
+  } else {
+    auto &clbuf = ClBufferManager::Global();
+    if (!clbuf.getInBufferA()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                               in_bytes, input) ||
+        !clbuf.getInBufferB()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                               width * sizeof(_FP16), weight))
+      return;
+    if (!kp->SetKernelArguments(0, &clbuf.getInBufferA()->GetBuffer(),
+                                sizeof(cl_mem)) ||
+        !kp->SetKernelArguments(1, &clbuf.getOutBufferA()->GetBuffer(),
+                                sizeof(cl_mem)) ||
+        !kp->SetKernelArguments(2, &clbuf.getInBufferB()->GetBuffer(),
+                                sizeof(cl_mem)))
+      return;
+  }
+  // out_scale is a native _FP16; pass its 2 bytes straight through as a `half`
+  // kernel arg (same as eps_h). static_cast<cl_half> would convert the VALUE to
+  // a uint16 (0.0292 -> 0) and zero the scale -> all-zero output.
+  if (!kp->SetKernelArguments(3, &out_scale, sizeof(cl_half)) ||
+      !kp->SetKernelArguments(4, &eps_h, sizeof(cl_half)) ||
+      !kp->SetKernelArguments(5, &n_rows, sizeof(int)) ||
+      !kp->SetKernelArguments(6, &w, sizeof(int)))
+    return;
+  const int work_groups_count[3] = {RMSN_LWS * n_rows, 1, 1};
+  const int work_group_size[3] = {RMSN_LWS, 1, 1};
+  if (!blas_cc->command_queue_inst_.DispatchCommand(kp, work_groups_count,
+                                                    work_group_size))
+    return;
+  if (!use_svm && !to_clmem) {
+    auto &clbuf = ClBufferManager::Global();
+    clbuf.getOutBufferA()->ReadDataRegion(blas_cc->command_queue_inst_, in_bytes,
+                                          result);
+  }
+}
+
 // Fused SwiGLU + asymmetric int8 activation-quant (FFN down-proj input). One
 // work-group (64 WIs) per row computes silu(gate)*up in fp32, reduces per-row
 // min/max, then recomputes + quantizes to int8 with the v8c-compatible

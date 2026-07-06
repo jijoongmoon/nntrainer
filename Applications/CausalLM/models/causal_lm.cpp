@@ -50,6 +50,7 @@
 #include <residency_policy.h>
 #include <mha_core.h>
 #include <reshaped_rms_norm.h>
+#include <rms_reverse_norm.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <tensor.h>
@@ -650,6 +651,17 @@ void CausalLM::registerCustomLayers() {
       "gpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   } catch (std::invalid_argument &e) {
     // no "gpu" context (CPU-only build) or already registered — both benign.
+  }
+
+  // gauss4 PLE post_norm (RMSReverseNormLayer) on the GPU context: its
+  // incremental_forwarding runs the reverse-norm as a GPU op (no host op inside
+  // the async GPU graph). Same central-registration pattern as the reshaped norm
+  // above; inert on CPU-only builds.
+  try {
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "gpu" context or already registered — both benign.
   }
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
