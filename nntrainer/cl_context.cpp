@@ -171,6 +171,12 @@ void ClContext::initialize() noexcept {
           setenv("NNTR_FC_XMX", "1", 0); // DPAS/XMX GEMM — Xe2/Xe3 prefill +70~151%
         setenv("NNTR_MHA_GPU", "1", 0);        // GPU attention (no host NEON → GPU wins)
         setenv("NNTR_GPU_CLMEM_POOL", "1", 0); // cl_mem device residency sub-pool
+        // Xe3 (NEO 26.22) in-order queue does NOT give kernel->kernel coarse-grain
+        // SVM coherence; the global NNTR_XE3_SYNC drain misses the v8c int8 FC GEMM
+        // (its SVM output is read stale by the next kernel). Drain after the FC GEMM
+        // (blas_kernel_interface.cpp) -- needed for gauss4 small-M prefill coherence,
+        // ~negligible cost (prefill unchanged, decode ~7%). Override NNTR_XE3_FC_SYNC=0.
+        setenv("NNTR_XE3_FC_SYNC", "1", 0);
       } else if (opencl_is_active && caps_.vendor_id == ADRENO_VENDOR_ID) {
         setenv("NNTR_MHA_GPU", "1", 0);        // GPU attention
         setenv("NNTR_KV_IMG_ATTN", "1", 0);    // image2d KV/attention (Adreno read_imageui)

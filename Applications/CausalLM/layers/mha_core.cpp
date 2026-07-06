@@ -3125,14 +3125,19 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // to the undrained path within noise) because the flash kernel has
           // effectively completed by the time this layer's O is consumed; the
           // host gemm path below wrote O on the host and needs no such drain.
-          // NNTR_GPU_OBRIDGE: replace the host clFinish+raise (SVM shadow -> o_cl
-          // via clEnqueueWriteBuffer, which reads the SVM as a HOST pointer and
-          // so needs the drain for coherence) with a GPU-side copy of the SVM
-          // shadow into o_cl. The copy kernel orders behind the flash kernel on
-          // the in-order queue (GPU->GPU, no host coherence), so NO drain and NO
-          // host bounce -- the decode-step single-submission precondition.
+          // GPU-side O raise (o_svm -> o_cl, GPU->GPU on the in-order queue): the
+          // host clmem_raise_cl reads the O SVM shadow as a HOST pointer
+          // (clEnqueueWriteBuffer source), which is NOT coherent on coarse-grain
+          // SVM (Xe3 / Panther Lake) even after cl_queue_finish -- a finish drains
+          // the queue but does NOT map the SVM for host access, so the raise
+          // snapshots a stale/partially-written O. gauss4 short prefill (M~4)
+          // exposes this: the flash completes just before the raise -> corrupt
+          // last-position hidden -> garbage (large-M survived because the flash
+          // finished long before the raise). The GPU copy needs no host coherence
+          // and is perf-neutral (no drain, no host bounce). DEFAULT-ON; override
+          // with NNTR_NO_GPU_OBRIDGE for the legacy host-raise path.
           static const bool _gpu_obridge =
-            std::getenv("NNTR_GPU_OBRIDGE") != nullptr;
+            std::getenv("NNTR_NO_GPU_OBRIDGE") == nullptr;
           if (_gpu_obridge) {
             uint16_t *o_svm = reinterpret_cast<uint16_t *>(
               attention_output_step.getData<_FP16>());

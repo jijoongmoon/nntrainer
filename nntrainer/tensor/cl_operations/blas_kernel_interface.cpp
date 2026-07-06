@@ -2004,7 +2004,12 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // decode. The bisect showed a clFinish after the FC GEMM alone is sufficient
     // (it is the dominant SVM-producing op and lands between most consumers), so
     // draining only here keeps coherence while restoring decode pipelining.
-    static const bool xe3_fc_sync = std::getenv("NNTR_XE3_FC_SYNC") != nullptr;
+    // Default-ON for Xe3 (cl_context.cpp setenv on Intel); value-parsed so
+    // NNTR_XE3_FC_SYNC=0 disables. See the coherence note at the setenv site.
+    static const bool xe3_fc_sync = []() {
+      const char *e = std::getenv("NNTR_XE3_FC_SYNC");
+      return e && std::atoi(e) != 0;
+    }();
     if (xe3_fc_sync)
       clFinish(q);
     if (prof_enabled) {
