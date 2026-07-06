@@ -32,6 +32,10 @@
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
+#include <sigmoid_add_cl_op.h>
+#include <sigmoid_add_layer.h>
+#include <sigmoid_glu_cl_op.h>
+#include <sigmoid_glu_layer.h>
 #include <swiglu_cl_op.h>
 #include <swiglu_layer.h>
 #include <transpose_cl.h>
@@ -226,6 +230,20 @@ void ClContext::add_default_object() {
     // app-side causallm::SwiGLU layer registered elsewhere.)
     registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type,
                     ml::train::LayerType::LAYER_SWIGLU);
+  }
+
+  // gauss4 fused gates: sigmoid_glu (attn output gate = sigmoid(gate)*x) and
+  // sigmoid_add (PLE mix = sigmoid(gate)+emb). No dedicated LayerType enum;
+  // register by type string only, gated on the CL kernels registering (mirrors
+  // GeGLU). createLayer("sigmoid_glu"/"sigmoid_add", {engine=gpu}) routes to
+  // the backend-neutral layer -> ClComputeOps::sigmoid_glu/sigmoid_add.
+  if (registerSigmoidGluClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                    SigmoidGluLayer::type);
+  }
+  if (registerSigmoidAddClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                    SigmoidAddLayer::type);
   }
 
   if (registerGeGLUClKernels(*this)) {
