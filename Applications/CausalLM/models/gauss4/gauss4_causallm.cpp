@@ -467,16 +467,12 @@ Tensor Gauss4Transformer::createAttention(const int layer_id, int /*seq_len*/,
      withKey("engine", causallm_engine())}));
   Tensor g_up = gate_up(g_down);
 
-  // sigmoid activation
-  LayerHandle gate_sigmoid(
-    createLayer("activation", {withKey("name", gate_name + "_sigmoid"),
-                               withKey("activation", "sigmoid")}));
-  Tensor gate_act = gate_sigmoid(g_up);
-
-  // multiply: sigmoid(gate) * reshaped_rms_norm(attn_out)
-  LayerHandle gate_mult(
-    createLayer("multiply", {withKey("name", gate_name + "_mult")}));
-  Tensor gated = gate_mult({gate_act, normed_attn});
+  // Fused gate: sigmoid(g_up) * reshaped_rms_norm(attn_out). One whole-op so the
+  // gate runs on GPU too (standalone sigmoid/multiply are unregistered there).
+  LayerHandle gate_glu(createLayer(
+    "sigmoid_glu", {withKey("name", gate_name + "_sigmoid_glu"),
+                    withKey("engine", causallm_engine())}));
+  Tensor gated = gate_glu({g_up, normed_attn});
 
   // ── O projection ─────────────────────────────────────────────────────────
   LayerHandle wo(createLayer(
@@ -597,16 +593,13 @@ Tensor Gauss4Transformer::createSharedAttention(const int layer_id,
   LayerHandle gate_up(createLayer("fully_connected", gu_props));
   Tensor g_up = gate_up(g_down);
 
-  std::vector<std::string> gs_props = {withKey("name", gate_name + "_sigmoid"),
-                                       withKey("activation", "sigmoid")};
-  appendSkipPrefillIfNeeded(gs_props, true);
-  LayerHandle gate_sigmoid(createLayer("activation", gs_props));
-  Tensor gate_act = gate_sigmoid(g_up);
-
-  std::vector<std::string> gm_props = {withKey("name", gate_name + "_mult")};
-  appendSkipPrefillIfNeeded(gm_props, true);
-  LayerHandle gate_mult(createLayer("multiply", gm_props));
-  Tensor gated = gate_mult({gate_act, normed_attn});
+  // Fused gate: sigmoid(g_up) * reshaped_rms_norm(attn_out) (skip_prefill=true).
+  std::vector<std::string> gg_props = {
+    withKey("name", gate_name + "_sigmoid_glu"),
+    withKey("engine", causallm_engine())};
+  appendSkipPrefillIfNeeded(gg_props, true);
+  LayerHandle gate_glu(createLayer("sigmoid_glu", gg_props));
+  Tensor gated = gate_glu({g_up, normed_attn});
 
   // O projection
   std::vector<std::string> o_props = {
@@ -720,14 +713,9 @@ Tensor Gauss4Transformer::createPerLayerEmbedding(const int layer_id,
   Tensor gate = ple_gate(ple_input);
 
   if (PLE_MIX_METHOD == 1) {
-    // method=1: sigmoid(gate) THEN add(emb)
-    // sigmoid activation FIRST
-    std::vector<std::string> act_props = {
-      withKey("name", lname + "_PLE_activation"),
-      withKey("activation", PLE_ACT)};
-    appendSkipPrefillIfNeeded(act_props, skip_prefill);
-    LayerHandle ple_act_layer(createLayer("activation", act_props));
-    Tensor activated = ple_act_layer(gate);
+    // method=1: fused sigmoid(gate) + emb. One whole-op so it runs on GPU too
+    // (standalone sigmoid/addition split residency there). PLE_ACT is sigmoid
+    // for gauss4; the fused sigmoid_add op is sigmoid-specific.
 
     // embedding lookup: vocab -> HIDDEN_SIZE_PER_LAYER_INPUT
     LayerHandle ple_emb(createLayer(
@@ -738,12 +726,13 @@ Tensor Gauss4Transformer::createPerLayerEmbedding(const int layer_id,
        withKey("weight_dtype", EMBEDDING_DTYPE)}));
     Tensor emb = ple_emb(input0);
 
-    // add: sigmoid(gate) + emb
-    std::vector<std::string> add_props = {withKey("name", lname + "_PLE_add")};
-    add_props.push_back(withKey("engine", causallm_engine()));
-    appendSkipPrefillIfNeeded(add_props, skip_prefill);
-    LayerHandle ple_add(createLayer("addition", add_props));
-    Tensor mix_out = ple_add({activated, emb});
+    // fused mix: sigmoid(gate) + emb
+    std::vector<std::string> mix_props = {
+      withKey("name", lname + "_PLE_sigmoid_add"),
+      withKey("engine", causallm_engine())};
+    appendSkipPrefillIfNeeded(mix_props, skip_prefill);
+    LayerHandle ple_mix(createLayer("sigmoid_add", mix_props));
+    Tensor mix_out = ple_mix({gate, emb});
 
     // projection: HIDDEN_SIZE_PER_LAYER_INPUT -> DIM
     std::vector<std::string> pp_props = {

@@ -42,6 +42,8 @@
 #include <logit_softcapping.h>
 #include <qkv_layer.h>
 #include <scalar_multiply.h>
+#include <sigmoid_add_layer.h> // gauss4 PLE mix (fused sigmoid+x) [gauss4]
+#include <sigmoid_glu_layer.h> // gauss4 attention gate (fused sigmoid*x) [gauss4]
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 #include <bn_layer.h>
@@ -464,6 +466,12 @@ void AppContext::add_default_object() {
   // swiglu on cpu: the merged backend-neutral SwiGLULayer (getOps dispatch +
   // skip + the cuda fast path); replaces the former app causallm::SwiGLULayer.
   registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
+  // gauss4 fused gates on cpu: sigmoid_glu (attn output gate = sigmoid(g)*x)
+  // and sigmoid_add (PLE mix = sigmoid(g)+emb). Backend-neutral getOps dispatch.
+  registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                  SigmoidGluLayer::type);
+  registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                  SigmoidAddLayer::type);
   // geglu on cpu: the backend-neutral GeGLULayer (getOps -> CpuComputeOps::geglu).
   // Was previously registered only on the CL/CUDA contexts; needed on cpu too so
   // engine=cpu (the FP32 reference / Gemma models) finds it. [T12]

@@ -403,6 +403,24 @@ public:
                       unsigned int active_rows, unsigned int row_offset);
 
   /**
+   * @brief Sigmoid-GLU over the first `active_rows` rows starting at
+   *        `row_offset`: out = sigmoid(in1) * in2 ({gate, up} -> result).
+   *        in1/in2/out share shape; width() is the per-row element count.
+   *        gauss4 attention output gate.
+   */
+  virtual void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                           unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief Sigmoid-add over the first `active_rows` rows starting at
+   *        `row_offset`: out = sigmoid(in1) + in2 ({gate, emb} -> result).
+   *        in1/in2/out share shape; width() is the per-row element count.
+   *        gauss4 PLE mix (method=1).
+   */
+  virtual void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
+                           unsigned int active_rows, unsigned int row_offset);
+
+  /**
    * @brief One residual-add operand: hidden = input (accumulate=false, the
    *        first operand) or hidden += input (accumulate=true). The neutral
    *        AdditionLayer calls this per input so the GPU backend can keep the
