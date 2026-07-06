@@ -431,6 +431,7 @@ Tensor Gauss4Transformer::createAttention(const int layer_id, int /*seq_len*/,
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("attn_logit_softcapping", "0.0"),
      withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+     withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false"),
      withKey("engine", causallm_engine())}));
   Tensor attn_raw = mha({q, k, v, cache_k, cache_v});
 
@@ -558,6 +559,8 @@ Tensor Gauss4Transformer::createSharedAttention(const int layer_id,
     withKey("attn_logit_softcapping", "0.0"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   mha_props.push_back(withKey("engine", causallm_engine()));
+  mha_props.push_back(
+    withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false"));
   appendSkipPrefillIfNeeded(mha_props, true);
   LayerHandle mha(createLayer("mha_core", mha_props));
   Tensor attn_raw = mha({q, k, v, cache_k, cache_v});
