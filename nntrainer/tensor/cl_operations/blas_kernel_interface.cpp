@@ -2531,8 +2531,9 @@ bool fused_qkv_rope_layout_gpu(
       stderr,
       "[Step2a] fused_qkv_rope_layout_gpu stub reached: "
       "S=%u hidden=%u hq=%u hkv=%u dh=%u from=%u\n",
-      input.height(),
-      (input.getFormat() == Tformat::NHWC) ? input.channel() : input.width(),
+      (unsigned)input.height(),
+      (unsigned)((input.getFormat() == Tformat::NHWC) ? input.channel()
+                                                      : input.width()),
       hq, hkv, dh, from_pos);
     std::fflush(stderr);
   }

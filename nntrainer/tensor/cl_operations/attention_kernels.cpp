@@ -180,7 +180,7 @@ static McaProf &mca_prof() {
   static McaProf p;
   return p;
 }
-static bool mca_prof_enabled() {
+[[maybe_unused]] static bool mca_prof_enabled() {
   static int cached = -1;
   if (cached < 0)
     cached = std::getenv("NNTR_MHA_PROFILE") != nullptr ? 1 : 0;
