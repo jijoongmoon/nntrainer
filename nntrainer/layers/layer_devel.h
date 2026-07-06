@@ -533,8 +533,8 @@ public:
                   << "Save with quantization supports only FP32 or QINT4 "
                      "(transcode) weight.";
                 Tensor weight_t = weight.transpose("0:2:1");
-                nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
-                                           true);
+                nntrainer::quant_qs4cx_f32(N, K, weight_t.getData<float>(), data,
+                                           scale, true);
               }
               file.write((const char *)data, q_size + scale_size);
             } else {

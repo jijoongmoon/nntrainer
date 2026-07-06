@@ -832,10 +832,24 @@ void Gauss4Transformer::registerCustomLayers() {
 std::pair<Tensor, Tensor> Gauss4CausalLM::constructModel() {
   auto [x, h] = Gauss4Transformer::constructModel();
 
-  // tie_word_embeddings=false -> use "lm_head" (separate FC, own weight)
-  // tie_word_embeddings=true  -> use "tie_word_embeddings" (shares embedding0)
+  // lm_head selection:
+  //   LMHEAD_UNTIE=true  -> "fully_connected": output_of_causallm carries its
+  //     OWN weight (a separate transposed [hidden,vocab] copy of the tied
+  //     embedding, synthesized by the converter). gauss4 is tied in HF and its
+  //     embedding must stay Q4_0 (hidden=2688 / PLE=192 are not 256-divisible,
+  //     so Q6_K is impossible), but a Q4_0 lm_head has NO GPU GEMV kernel
+  //     (tie_word_embedding.cpp's Q4_0 branch is CPU-only). Untying to a
+  //     per-channel QS4CX lm_head lets the output projection run the fast v8c
+  //     int4 GPU GEMV, mirroring gemma4. The quantizer builds this same untied
+  //     graph with an FP32 source weight and the dtype map quantizes
+  //     output_of_causallm to QS4CX on save; inference rebuilds it as QS4CX.
+  //   tie_word_embeddings=true (not untied) -> "tie_word_embeddings" (shares
+  //     embedding0); tie_word_embeddings=false -> "lm_head" (separate FC).
+  const bool lmhead_untied = LMHEAD_UNTIE;
   const std::string lmhead_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
+    lmhead_untied
+      ? "fully_connected"
+      : (TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head");
 
   std::vector<std::string> lmhead_props = {
     withKey("name", "output_of_causallm"), withKey("unit", NUM_VOCAB),
@@ -843,7 +857,7 @@ std::pair<Tensor, Tensor> Gauss4CausalLM::constructModel() {
   lmhead_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(lmhead_props, true);
 
-  if (TIE_WORD_EMBEDDINGS)
+  if (TIE_WORD_EMBEDDINGS && !lmhead_untied)
     lmhead_props.emplace_back(withKey("shared_from", "embedding0"));
 
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_props));
