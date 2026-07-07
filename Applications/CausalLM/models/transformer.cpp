@@ -214,6 +214,28 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   NORM_EPS = cfg["rms_norm_eps"];
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
+  // [Adreno image-attn model vetting] The OHWI image-attention kernels
+  // (NNTR_KV_IMG_ATTN) carry only the causal upper-bound mask — no sliding
+  // -window lower bound — and the image pipeline is all-or-nothing per
+  // process (mixing image and flash layers desyncs the RoPE/staging/drain
+  // stages; empirically garbage even at short context). So if ANY layer of
+  // this model can have its window clipped within MAX_SEQ_LEN, force the
+  // whole run onto the (correctly windowed) flash path. Model classes with
+  // extra geometry (e.g. gemma4's global_head_dim=512 > the proven d<=256
+  // tiling) apply their own additional vetting after this.
+  if (const char *e = std::getenv("NNTR_KV_IMG_ATTN");
+      e != nullptr && std::atoi(e) != 0) {
+    if (SLIDING_WINDOW < static_cast<unsigned int>(MAX_SEQ_LEN)) {
+      setenv("NNTR_KV_IMG_ATTN", "0", 1);
+      std::fprintf(stderr,
+                   "[IMG-ATTN] model-vetted OFF: sliding_window=%u < "
+                   "max_seq_len=%u (OHWI kernels lack the window mask); "
+                   "using the flash attention path.\n",
+                   SLIDING_WINDOW, static_cast<unsigned int>(MAX_SEQ_LEN));
+      std::fflush(stderr);
+    }
+  }
+
   return;
 };
 

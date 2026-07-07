@@ -844,8 +844,18 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 #if defined(ENABLE_OPENCL)
   // OHWI K/V mirror + image-view prebuild (create_ohwi_kv_mirror etc.) is
   // OpenCL-only. [T12]
-  if (std::getenv("NNTR_KV_IMG_ATTN") != nullptr && !kv_int8 &&
-      head_dim % 8 == 0 && !kv_mirror_init) {
+  // NOTE: image attn is ALL-OR-NOTHING per process. use_image_attn is the
+  // switch the whole pipeline keys on (concat-RoPE drain mode, Q staging,
+  // OHWI decode RoPE, engage); mixing image and flash layers (or flipping
+  // per call) desyncs those stages — empirically garbage even at short
+  // context. The per-MODEL safety decision (window can clip / d > 256 →
+  // force NNTR_KV_IMG_ATTN=0) is made in the model class before layers
+  // finalize; here we only honor the env uniformly (value-checked).
+  if ([] {
+        const char *e = std::getenv("NNTR_KV_IMG_ATTN");
+        return e != nullptr && std::atoi(e) != 0; // value-checked: =0 disables
+      }() &&
+      !kv_int8 && head_dim % 8 == 0 && !kv_mirror_init) {
     static const unsigned int mirror_cap = []() {
       const char *e = std::getenv("NNTR_KV_MIRROR_CAP");
       return e ? (unsigned int)std::atoi(e) : 0u;
@@ -1658,7 +1668,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // into staging with NNTR_KV_STAGE=1 (to test an SVM-backed staging fix);
   // NNTR_NO_KV_STAGE still force-disables.
   static const bool kv_stage_on =
-    std::getenv("NNTR_KV_IMG_ATTN") != nullptr &&
+    [] {
+      const char *e = std::getenv("NNTR_KV_IMG_ATTN");
+      return e != nullptr && std::atoi(e) != 0; // value-checked: =0 disables
+    }() &&
     std::getenv("NNTR_KV_STAGE") != nullptr &&
     std::getenv("NNTR_NO_KV_STAGE") == nullptr;
   void *k_stage = nullptr;                 // rope-K wrote the staging temp
@@ -1765,8 +1778,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // (NNTR_KV_IMG_ATTN) GPU-RoPE-at-decode produces garbage (the image KV/attn
     // consumes host-RoPE'd Q/K in a different layout), so suppress the property
     // there. The explicit NNTR_MHA_GPU_DECODE env override is unaffected.
-    static const bool _kv_img_attn_env =
-      std::getenv("NNTR_KV_IMG_ATTN") != nullptr;
+    static const bool _kv_img_attn_env = [] {
+      const char *e = std::getenv("NNTR_KV_IMG_ATTN");
+      return e != nullptr && std::atoi(e) != 0; // value-checked: =0 disables
+    }();
     const bool _gpu_rope_decode =
       _gpu_rope_decode_env ||
       (std::get<props::GpuDecodeRope>(mha_core_props).get() && !_kv_img_attn_env);
@@ -2039,9 +2054,12 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       std::getenv("NNTR_OHWI_GPU_ROPE") != nullptr;
     const bool _ohwi_gpu_rope =
       _ohwi_gpu_rope_env || std::get<props::GpuOhwiRope>(mha_core_props).get();
+    // Invariant: OHWI GPU-RoPE only feeds the image-attention layout — run
+    // it only when this layer's attention actually takes the image path
+    // (use_image_attn == 1; uniform per process, see the prebuild note).
     if (!gpu_rope_done && _ohwi_gpu_rope && !_gpu_rope_off && _mha_gpu_on &&
-        _kv_img_attn_env && use_gemm_attention && !kv_int8 &&
-        (to - from) == 1 &&
+        _kv_img_attn_env && use_image_attn == 1 && use_gemm_attention &&
+        !kv_int8 && (to - from) == 1 &&
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         value_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
@@ -2764,9 +2782,20 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // SVM cache slice into them, then attention reads the images. Gated by
         // NNTR_KV_IMG_ATTN (Adreno only — read_imageui won't build on Intel
         // NEO, which keeps the flash path below). Preempts flash on success.
-        if (use_image_attn < 0)
-          use_image_attn =
-            (std::getenv("NNTR_KV_IMG_ATTN") != nullptr) ? 1 : 0;
+        if (use_image_attn < 0) {
+          // Value-checked so NNTR_KV_IMG_ATTN=0 really disables the image
+          // path (the Adreno auto-default in cl_context uses overwrite=0 and
+          // cannot override a user-provided 0).
+          const char *e = std::getenv("NNTR_KV_IMG_ATTN");
+          use_image_attn = (e != nullptr && std::atoi(e) != 0) ? 1 : 0;
+        }
+        // Sliding-window layers past their window must NOT take the image
+        // path: qk_matmul_f16_ohwi_img has only the causal upper-bound mask
+        // (n > q_off + m) and no window lower bound (n + W <= m), so once
+        // cache_to exceeds the window it silently computes full causal
+        // attention over evicted keys (gemma4 W=512: 999-tok Adreno prefill
+        // degenerates into word salad, severity ~ (cache_to - W)). Route
+        // those calls to the flash kernels below, which take local_window.
         if (use_image_attn == 1 && svm_ok && !kv_int8 && head_dim % 8 == 0) {
           // NNTR_KV_MIRROR_CAP (experiment): clamp the OHWI mirror S_max.
           // gpu_native runs S_max=1024 and its qk_matmul_f16_ohwi_img is
