@@ -674,6 +674,15 @@ void CausalLM::registerCustomLayers() {
   } catch (std::invalid_argument &e) {
     // no "cuda" context or already registered — both benign.
   }
+  // gauss4 PLE post_norm (RMSReverseNormLayer) on the cuda context: UVM
+  // tensors are host-coherent and not isSVM()-flagged, so its forwarding
+  // takes the correct host FP32-temp path (mirror of the "gpu" block above).
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "cuda" context or already registered — both benign.
+  }
 #endif
 }
 

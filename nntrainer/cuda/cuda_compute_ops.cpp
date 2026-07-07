@@ -116,6 +116,68 @@ public:
     CpuComputeOps::geglu(in1, in2, out, active_rows, row_offset);
   }
 
+  // gauss4 fused gates on cuda (mirror of geglu above). The cuda activation
+  // pool is device-resident, so the DEVICE kernel is the primary path (the
+  // base CpuComputeOps host loop faults on it -- that was the gauss4-CUDA
+  // SIGSEGV in runDecode). Host loop only for genuinely host tensors.
+  // Kill-switch: NNTR_CUDA_SIGMOID_GATE=0.
+  void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows,
+                   unsigned int row_offset) override {
+    const unsigned int dim2 = in1.width();
+    const size_t elem_off = (size_t)row_offset * dim2;
+    const size_t n = (size_t)active_rows * dim2;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 && n > 0) {
+      static const bool gpu = []() {
+        const char *e = std::getenv("NNTR_CUDA_SIGMOID_GATE");
+        return !(e && e[0] == '0');
+      }();
+      if (gpu) {
+        auto *a = reinterpret_cast<const unsigned short *>(
+          in1.getData<_FP16>() + elem_off);
+        auto *b = reinterpret_cast<const unsigned short *>(
+          in2.getData<_FP16>() + elem_off);
+        auto *o =
+          reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+        if (nntrainer::cuda::dev_accessible(a) &&
+            cuda::cuda_sigmoid_glu_fp16(a, b, o, (unsigned int)n))
+          return;
+      }
+    }
+#endif
+    cuda::StreamManager::Global().finishIfAsync();
+    CpuComputeOps::sigmoid_glu(in1, in2, out, active_rows, row_offset);
+  }
+  void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows,
+                   unsigned int row_offset) override {
+    const unsigned int dim2 = in1.width();
+    const size_t elem_off = (size_t)row_offset * dim2;
+    const size_t n = (size_t)active_rows * dim2;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 && n > 0) {
+      static const bool gpu = []() {
+        const char *e = std::getenv("NNTR_CUDA_SIGMOID_GATE");
+        return !(e && e[0] == '0');
+      }();
+      if (gpu) {
+        auto *a = reinterpret_cast<const unsigned short *>(
+          in1.getData<_FP16>() + elem_off);
+        auto *b = reinterpret_cast<const unsigned short *>(
+          in2.getData<_FP16>() + elem_off);
+        auto *o =
+          reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+        if (nntrainer::cuda::dev_accessible(a) &&
+            cuda::cuda_sigmoid_add_fp16(a, b, o, (unsigned int)n))
+          return;
+      }
+    }
+#endif
+    cuda::StreamManager::Global().finishIfAsync();
+    CpuComputeOps::sigmoid_add(in1, in2, out, active_rows, row_offset);
+  }
+
   // FC GEMM: output = input * weight. The former CudaFcLayer::cudaFcGemm body
   // verbatim — QINT4 fused dequant-GEMM on device (KAI Section-A, w4a8 dp4a /
   // cuBLAS int8 IMMA) with host-weight/host-input staging, an FP32 cuBLAS path,

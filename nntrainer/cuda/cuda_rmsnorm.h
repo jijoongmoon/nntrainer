@@ -38,6 +38,15 @@ bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
                        unsigned short *out, float eps, unsigned int rows,
                        unsigned int width);
 
+/**
+ * @brief gauss4 ReverseRMSNorm on device: y = ((x*w)/rms(x*w)) * out_scale[0].
+ */
+bool cuda_rms_reverse_norm_fp16(const unsigned short *in,
+                                const unsigned short *w,
+                                const unsigned short *out_scale,
+                                unsigned short *out, float eps,
+                                unsigned int rows, unsigned int width);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_RMSNORM_H__

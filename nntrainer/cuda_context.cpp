@@ -21,6 +21,8 @@
 #include <geglu_layer.h>
 #include <logit_softcapping.h>
 #include <scalar_multiply.h>
+#include <sigmoid_add_layer.h>
+#include <sigmoid_glu_layer.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
@@ -131,6 +133,13 @@ void CudaContext::add_default_object() {
   // CudaComputeOps::swiglu, with the device-resident fp16 one-kernel fast path
   // (cuda_swiglu_fp16) for the qwen3 FFN. Replaces the app causallm::SwiGLULayer.
   registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
+  // gauss4 fused gates (sigmoid_glu = sigmoid(gate)*x, sigmoid_add =
+  // sigmoid(gate)+emb): pure host Tensor ops -> correct on the host-coherent
+  // UVM tensors (mirrors the cpu app_context / gpu cl_context registrations).
+  registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                  SigmoidGluLayer::type);
+  registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                  SigmoidAddLayer::type);
   // logit_softcapping (promoted to core [T12]): host op on UVM-resident logits;
   // the CUDA-only device-softcap path lives inside the layer (ENABLE_CUDA).
   registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,

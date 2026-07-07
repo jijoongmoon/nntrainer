@@ -17,6 +17,11 @@
 #include "rms_reverse_norm.h"
 
 #include <memory_data.h>
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_rmsnorm.h>
+#include <cuda_stream_manager.h>
+#endif
 #if defined(ENABLE_OPENCL)
 #include <blas_kernels.h> // cl_queue_finish / cl_svm_map_force / cl_svm_unmap_force
 #endif
@@ -162,6 +167,33 @@ void RMSReverseNormLayer::incremental_forwarding(
           in_step_dim.height(), in_step_dim.width(), /*use_svm=*/true, out_cl,
           in_cl);
         continue;
+      }
+#endif
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // engine=cuda device path: the FC-produced input lives on the device
+      // activation pool, so the host FP32-temp fallback below FAULTS reading
+      // it (gauss4-CUDA SIGSEGV in avx2::vcvt_f16_f32). Run the reverse-norm
+      // as a device kernel (cuda_rms_reverse_norm_fp16, FP32-accumulated,
+      // weight-before-norm + scalar out_scale read on-device) -- the CUDA
+      // mirror of the OpenCL rms_reverse_norm_cl_fp16 branch above.
+      if (weight.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+          out_scale.getDataType() == ml::train::TensorDim::DataType::FP16) {
+        auto *ip = reinterpret_cast<const unsigned short *>(
+          in_step.getData<_FP16>());
+        auto *wp =
+          reinterpret_cast<const unsigned short *>(weight.getData<_FP16>());
+        auto *osp =
+          reinterpret_cast<const unsigned short *>(out_scale.getData<_FP16>());
+        auto *op =
+          reinterpret_cast<unsigned short *>(out_step.getData<_FP16>());
+        auto dev_ok = [](const void *ptr) {
+          return ptr && nntrainer::cuda::dev_accessible(ptr);
+        };
+        if (dev_ok(ip) && dev_ok(wp) && dev_ok(osp) && dev_ok(op) &&
+            nntrainer::cuda::cuda_rms_reverse_norm_fp16(
+              ip, wp, osp, op, epsilon, in_step_dim.height(),
+              in_step_dim.width()))
+          continue;
       }
 #endif
       // Host path (ARM CPU / non-GPU-resident): FP32-temp compute.

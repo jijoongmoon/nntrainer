@@ -375,13 +375,28 @@ Tensor Gauss4Transformer::createTransformerDecoderBlock(const int layer_id,
   Tensor ple_out =
     createPerLayerEmbedding(layer_id, ple_gate_input, is_shared_layer);
 
-  // ── 3-way residual: decoder_add + ffn_output + ple_out ───────────────
+  // ── residual: (decoder_add + ffn_output) then + ple_out ──────────────
+  // Two chained 2-input adds instead of one 3-input add, matching gemma4
+  // (decoder_output_base = post_attn + post_ffn; decoder_output = base +
+  // per_layer_input). The backends' fused/device add paths only cover the
+  // 2-input case: on CUDA the NNTR_CUDA_ELTWISE kernel requires
+  // getNumInputs()==2, so a 3-input add fell to the host residual loop and
+  // FAULTED on the device-resident activations (gauss4-CUDA SIGSEGV in
+  // AdditionLayer -> scopy_fp16); on OpenCL the 3-input case is an
+  // unvalidated 3-dispatch accumulation gemma4 never exercises.
+  std::vector<std::string> dec_base_props = {withKey(
+    "name", "layer" + std::to_string(layer_id) + "_decoder_output_base")};
+  dec_base_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(dec_base_props, is_shared_layer);
+  LayerHandle dec_base_layer(createLayer("addition", dec_base_props));
+  Tensor decoder_base = dec_base_layer({decoder_add, ffn_out});
+
   std::vector<std::string> dec_out_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")};
   dec_out_props.push_back(withKey("engine", causallm_engine()));
   appendSkipPrefillIfNeeded(dec_out_props, is_shared_layer);
   LayerHandle dec_out_layer(createLayer("addition", dec_out_props));
-  Tensor decoder_output = dec_out_layer({decoder_add, ffn_out, ple_out});
+  Tensor decoder_output = dec_out_layer({decoder_base, ple_out});
 
   return decoder_output;
 }
@@ -860,6 +875,19 @@ void Gauss4Transformer::registerCustomLayers() {
     std::cerr << "[Gauss4] registerCustomLayers warning: " << e.what()
               << std::endl;
   }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Additive CUDA backend (mirror of gemma4): the CPU per_layer_slice is a
+  // pure host op -> correct on host-coherent UVM tensors. sigmoid_glu /
+  // sigmoid_add are lib layers registered in cuda_context.cpp; the reshaped /
+  // reverse RMS norms are centralized in CausalLM::registerCustomLayers.
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
+  } catch (const std::invalid_argument &e) {
+    // no "cuda" context or already registered — both benign.
+  }
+#endif
 }
 
 // ---------------------------------------------------------------------------
