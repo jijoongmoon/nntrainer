@@ -2012,7 +2012,7 @@ bool two_conv_attention_prefill_f16_ohwi_cl(
   const uint16_t *Q_host, const uint16_t *K_host, const uint16_t *V_host,
   uint16_t *O_host, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
-  bool causal, bool svm_inputs) {
+  bool causal, bool svm_inputs, unsigned int local_window) {
   if (head_dim == 0 || M == 0 || N_kv == 0 || max_seq_len == 0) return false;
   if (num_heads_KV == 0 || num_heads_Q % num_heads_KV != 0) return false;
   if (N_kv > max_seq_len) return false;
@@ -2108,6 +2108,8 @@ bool two_conv_attention_prefill_f16_ohwi_cl(
         !kp->SetKernelArguments(9, &causal_i, sizeof(int)) ||
         !kp->SetKernelArguments(10, &scale, sizeof(float)))
       return false;
+    int lw = (int)local_window;
+    if (!kp->SetKernelArguments(11, &lw, sizeof(int))) return false;
     const size_t nx = (N_kv + TN_QK - 1) / TN_QK;
     const size_t mx = (M + TM_QK - 1) / TM_QK;
     constexpr size_t LWS_QK_X = 64;
@@ -2193,7 +2195,7 @@ bool two_conv_attention_prefill_f16_ohwi_full_cl(
   const uint16_t *Q_host, const uint16_t *K_host, const uint16_t *V_host,
   uint16_t *O_host, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
-  bool causal, bool svm_inputs) {
+  bool causal, bool svm_inputs, unsigned int local_window) {
   if (head_dim == 0 || M == 0 || N_kv == 0 || max_seq_len == 0) return false;
   if (num_heads_KV == 0 || num_heads_Q % num_heads_KV != 0) return false;
   if (N_kv > max_seq_len) return false;
@@ -2275,6 +2277,8 @@ bool two_conv_attention_prefill_f16_ohwi_full_cl(
         !kp->SetKernelArguments(9, &causal_i, sizeof(int)) ||
         !kp->SetKernelArguments(10, &scale, sizeof(float)))
       return false;
+    int lw = (int)local_window;
+    if (!kp->SetKernelArguments(11, &lw, sizeof(int))) return false;
     const size_t nx = (N_kv + TN_QK - 1) / TN_QK;
     const size_t mx = (M + TM_QK - 1) / TM_QK;
     constexpr size_t LWS_QK_X = 64;
@@ -2359,7 +2363,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   uint16_t *O_svm, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
   bool causal, float attn_softcap = 0.0f, // #63 Gemma2 QK soft-cap (image-K)
-  void *q_clmem = nullptr, void *o_clmem = nullptr);
+  void *q_clmem = nullptr, void *o_clmem = nullptr,
+  unsigned int local_window = 0); // >0: sliding-window mask (n+W <= q_pos)
 
 bool two_conv_attention_prefill_f16_ohwi_img_cl(
   const uint16_t *Q_svm, const uint16_t *K_svm, cl_mem V_buf_ohwi,
@@ -2388,13 +2393,14 @@ bool two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
   const uint16_t *Q_svm, cl_mem K_image_ohwi, cl_mem V_image_ohwi,
   uint16_t *O_svm, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
-  bool causal, float attn_softcap, void *q_clmem, void *o_clmem) {
+  bool causal, float attn_softcap, void *q_clmem, void *o_clmem,
+  unsigned int local_window) {
   if (!K_image_ohwi || !V_image_ohwi) return false;
   return two_conv_attention_prefill_f16_ohwi_img_impl(
     Q_svm, /*K_svm=*/nullptr, /*v_buf_in=*/nullptr, V_image_ohwi,
     K_image_ohwi, O_svm, M, N_kv,
     num_heads_Q, num_heads_KV, head_dim, max_seq_len, causal, attn_softcap,
-    q_clmem, o_clmem);
+    q_clmem, o_clmem, local_window);
 }
 
 // =============================================================================
@@ -2409,7 +2415,8 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
   cl_mem v_buf_in, cl_mem v_image_in, cl_mem k_image_in,
   uint16_t *O_svm, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
-  bool causal, float attn_softcap, void *q_clmem, void *o_clmem) {
+  bool causal, float attn_softcap, void *q_clmem, void *o_clmem,
+  unsigned int local_window) {
   if (head_dim == 0 || M == 0 || N_kv == 0 || max_seq_len == 0) return false;
   if (num_heads_KV == 0 || num_heads_Q % num_heads_KV != 0) return false;
   if (N_kv > max_seq_len) return false;
@@ -2555,11 +2562,18 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
         !kp->SetKernelArguments(9, &causal_i, sizeof(int)) ||
         !kp->SetKernelArguments(10, &scale, sizeof(float)))
       return false;
-    // #63 Gemma2: arg 11 = QK soft-cap. Only the image-K kernel
-    // (qk_matmul_f16_ohwi_img) has this param; SVM-K does not.
-    if (k_image_in != nullptr &&
-        !kp->SetKernelArguments(11, &attn_softcap, sizeof(float)))
-      return false;
+    // #63 Gemma2: arg 11 = QK soft-cap (image-K kernel only; SVM-K has no
+    // softcap param). local_window is the LAST arg of both kernels: 12 on
+    // the image kernel, 11 on the SVM-K kernel.
+    int lw = (int)local_window;
+    if (k_image_in != nullptr) {
+      if (!kp->SetKernelArguments(11, &attn_softcap, sizeof(float)) ||
+          !kp->SetKernelArguments(12, &lw, sizeof(int)))
+        return false;
+    } else {
+      if (!kp->SetKernelArguments(11, &lw, sizeof(int)))
+        return false;
+    }
     const size_t nx = (N_kv + TN_QK - 1) / TN_QK;
     const size_t mx = (M + TM_QK - 1) / TM_QK;
     // The LWS is env-overridable + measured (NNTR_QK_LWS="x,y,z"); default

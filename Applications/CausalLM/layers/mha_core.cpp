@@ -848,9 +848,11 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   // switch the whole pipeline keys on (concat-RoPE drain mode, Q staging,
   // OHWI decode RoPE, engage); mixing image and flash layers (or flipping
   // per call) desyncs those stages — empirically garbage even at short
-  // context. The per-MODEL safety decision (window can clip / d > 256 →
-  // force NNTR_KV_IMG_ATTN=0) is made in the model class before layers
-  // finalize; here we only honor the env uniformly (value-checked).
+  // context. Sliding windows are handled IN the OHWI kernels (local_window
+  // arg); the per-MODEL safety decision for geometry the kernels cannot
+  // serve (d > 256 → force NNTR_KV_IMG_ATTN=0) is made in the model class
+  // before layers finalize; here we only honor the env uniformly
+  // (value-checked).
   if ([] {
         const char *e = std::getenv("NNTR_KV_IMG_ATTN");
         return e != nullptr && std::atoi(e) != 0; // value-checked: =0 disables
@@ -2645,10 +2647,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         std::fflush(stderr);
       }
       if (svm_ok || _ohwi_force) {
+        const unsigned int win_p2 =
+          (local_window_size >= (size_t)cache_to_p2)
+            ? 0u
+            : (unsigned int)local_window_size;
         bool ok = nntrainer::two_conv_attention_prefill_f16_ohwi_cl(
           Q_p, K_ohwi, V_concat, O_p, step_size_p2, cache_to_p2, num_heads_Q,
           num_heads_KV, head_dim, cache_key_dim.height(), is_causal,
-          /*svm_inputs=*/svm_ok);
+          /*svm_inputs=*/svm_ok, win_p2);
         if (ok)
           return;
       }
@@ -3011,12 +3017,19 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // The OHWI image attention enqueues exactly qk -> softmax -> sv (3
             // consecutive dispatches); capture the base ordinal before the call.
             const cl_uint _d_qk = _rec_s ? _cqm2.getRecordDispatchIndex() : 0u;
+            // Sliding-window layers: pass the effective window so the OHWI
+            // kernels mask keys older than the window (n + W <= q_pos) —
+            // same convention as the flash call below (0 = no window).
+            const unsigned int win_img =
+              (local_window_size >= (size_t)cache_to)
+                ? 0u
+                : (unsigned int)local_window_size;
             ok = nntrainer::two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
               Q_p, reinterpret_cast<cl_mem>(k_image_ohwi),
               reinterpret_cast<cl_mem>(v_img_use), O_p, step_size, cache_to,
               num_heads_Q, num_heads_KV, head_dim, kv_mirror_S_max, is_causal,
               attn_logit_softcapping, /*q_clmem=*/q_clmem_use,
-              /*o_clmem=*/o_cl);
+              /*o_clmem=*/o_cl, win_img);
             if (_rec_s && ok) {
               const cl_uint _n_disp = _cqm2.getRecordDispatchIndex() - _d_qk;
               if (_n_disp != 3u) {

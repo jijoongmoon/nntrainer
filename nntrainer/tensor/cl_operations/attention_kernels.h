@@ -218,7 +218,8 @@ bool two_conv_attention_prefill_f16_ohwi_cl(
   const uint16_t *Q_host, const uint16_t *K_host, const uint16_t *V_host,
   uint16_t *O_host, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
-  bool causal, bool svm_inputs = false);
+  bool causal, bool svm_inputs = false,
+  unsigned int local_window = 0); // >0: sliding-window mask (n+W <= q_pos)
 
 /// §3.8 FULL-OHWI variant: K is OHWI [H_kv, S_max, d] AND V is OHWI-
 /// reversed [H_kv, d, S_max]. Same three-kernel pipeline as the
@@ -231,7 +232,8 @@ bool two_conv_attention_prefill_f16_ohwi_full_cl(
   const uint16_t *Q_host, const uint16_t *K_host, const uint16_t *V_host,
   uint16_t *O_host, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
-  bool causal, bool svm_inputs = false);
+  bool causal, bool svm_inputs = false,
+  unsigned int local_window = 0); // >0: sliding-window mask (n+W <= q_pos)
 
 /// §3.8 + paper-style image2d_from_buffer V variant. Same pipeline as
 /// _ohwi_full_cl but the SV kernel reads V via image2d_from_buffer
@@ -276,7 +278,8 @@ bool two_conv_attention_prefill_f16_ohwi_kvimg_view_cl(
   uint16_t *O_svm, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
   bool causal, float attn_softcap = 0.0f, // #63 Gemma2 QK soft-cap (0=off)
-  void *q_clmem = nullptr, void *o_clmem = nullptr);
+  void *q_clmem = nullptr, void *o_clmem = nullptr,
+  unsigned int local_window = 0); // >0: sliding-window mask (n+W <= q_pos)
 
 /// Fused single-kernel attention over the SAME two OHWI images as
 /// _ohwi_kvimg_view_cl (K image [H_kv,S_max,d], reversed-V image
