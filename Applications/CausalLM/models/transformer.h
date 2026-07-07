@@ -385,6 +385,9 @@ protected:
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
+  /** nntr_quantize --ple_sidecar: save() writes the PLE table here instead of
+   *  the model file (extraction-time key, not a runtime one) */
+  std::string PLE_SIDECAR_EXPORT;
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;

@@ -205,12 +205,24 @@ std::pair<Tensor, Tensor> Gauss4Transformer::constructModel() {
   // the vendor-scoped coherence drains). Host lookup + raise happens once here.
   const unsigned int per_layer_total_dim =
     static_cast<unsigned int>(NUM_LAYERS) * HIDDEN_SIZE_PER_LAYER_INPUT;
-  LayerHandle per_layer_embedding(createLayer(
-    "embedding_layer",
-    {withKey("name", "per_layer_input_embedding"),
-     withKey("in_dim", std::to_string(NUM_VOCAB)),
-     withKey("out_dim", std::to_string(per_layer_total_dim)),
-     withKey("weight_dtype", EMBEDDING_DTYPE)}));
+  // ple_file_name (nntr_config.json) points at a GGML q4_0/q6_k sidecar
+  // manifest: the table then lives OUTSIDE the model .bin, mmap'd and
+  // dequantized per token on demand instead of held resident (~1GB saved).
+  // ple_sidecar_export is the matching extraction key (nntr_quantize
+  // --ple_sidecar); mutually exclusive with ple_file_name.
+  std::vector<std::string> ple_embedding_props = {
+    withKey("name", "per_layer_input_embedding"),
+    withKey("in_dim", std::to_string(NUM_VOCAB)),
+    withKey("out_dim", std::to_string(per_layer_total_dim)),
+    withKey("weight_dtype", EMBEDDING_DTYPE)};
+  if (!PLE_FILE_NAME.empty())
+    ple_embedding_props.emplace_back(
+      withKey("quantized_lut_path", PLE_FILE_NAME));
+  if (!PLE_SIDECAR_EXPORT.empty())
+    ple_embedding_props.emplace_back(
+      withKey("sidecar_export_path", PLE_SIDECAR_EXPORT));
+  LayerHandle per_layer_embedding(
+    createLayer("embedding_layer", ple_embedding_props));
   per_layer_input = per_layer_embedding(x);
 
   // ── Normal decoder layers 0 .. NUM_SEQUENTIAL_LAYERS-1 ──────────────────

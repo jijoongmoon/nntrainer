@@ -429,6 +429,15 @@ void printUsage(const char *prog) {
     << "                        individual dtype options. The fc_layer_dtype,\n"
     << "                        embedding_dtype, and lmhead_dtype fields\n"
     << "                        from this config will be used.\n"
+    << "  --ple_sidecar         Write the per-layer-embedding (PLE) table to a\n"
+    << "                        sidecar file (<bin>_ple.bin + _ple.json GGML\n"
+    << "                        manifest) instead of embedding it in the model\n"
+    << "                        .bin; the output config gains ple_file_name so\n"
+    << "                        the runtime mmaps it and dequantizes rows on\n"
+    << "                        demand. gemma4/gauss4 only; requires Q4_0 or\n"
+    << "                        Q6_K --embd_dtype and 'bin' output format.\n"
+    << "                        Also works on an already-quantized source with\n"
+    << "                        matching dtypes (pure repack, bit-identical).\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
     << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K, QS4CX\n"
@@ -655,6 +664,7 @@ int main(int argc, char *argv[]) {
   std::string output_bin_name = "";
   std::string target_config_path = "";
   std::string output_format = "bin";
+  bool ple_sidecar = false;
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
@@ -679,6 +689,8 @@ int main(int argc, char *argv[]) {
       }
     } else if (arg == "--config" && i + 1 < argc) {
       target_config_path = argv[++i];
+    } else if (arg == "--ple_sidecar") {
+      ple_sidecar = true;
     } else if (arg == "--container" && i + 1 < argc) {
       std::string container = argv[++i];
       if (container == "plain") {
@@ -795,6 +807,31 @@ int main(int argc, char *argv[]) {
     std::string src_weight_path = model_path + "/" + original_bin;
     std::string dst_weight_path = output_dir + "/" + output_bin_name;
 
+    // PLE sidecar extraction: names derived from the output bin; the payload
+    // path is injected into nntr_cfg so the model wires sidecar_export_path
+    // onto the per_layer_input_embedding layer during save.
+    std::string ple_payload_name, ple_manifest_name;
+    if (ple_sidecar) {
+      if (output_format != "bin")
+        throw std::invalid_argument(
+          "--ple_sidecar supports only the 'bin' output format");
+      if (embd_dtype != DataType::Q4_0 && embd_dtype != DataType::Q6_K)
+        throw std::invalid_argument(
+          "--ple_sidecar requires --embd_dtype Q4_0 or Q6_K (got " +
+          dataTypeToStr(embd_dtype) + ")");
+      if (!nntr_cfg.value("ple_file_name", std::string()).empty())
+        throw std::invalid_argument(
+          "source model already uses a PLE sidecar (ple_file_name set); "
+          "nothing to extract");
+      std::string base = output_bin_name;
+      auto pos = base.rfind(".bin");
+      if (pos != std::string::npos && pos + 4 == base.size())
+        base = base.substr(0, pos);
+      ple_payload_name = base + "_ple.bin";
+      ple_manifest_name = base + "_ple.json";
+      nntr_cfg["ple_sidecar_export"] = output_dir + "/" + ple_payload_name;
+    }
+
     int num_layers = cfg["num_hidden_layers"].get<int>();
     std::string architecture =
       cfg["architectures"].get<std::vector<std::string>>()[0];
@@ -827,6 +864,13 @@ int main(int argc, char *argv[]) {
     // baked in on the build host but running on an Android device) fall back to
     // the bare filename resolved against model_path, so the file is found as
     // long as it lives next to nntr_config.json.
+    // Keep the ORIGINAL (unresolved) values for the output config — baking the
+    // build host's absolute paths into it breaks the model dir on-device.
+    json orig_path_cfg;
+    for (const char *key : {"module_config_path", "tokenizer_file"}) {
+      if (nntr_cfg.contains(key))
+        orig_path_cfg[key] = nntr_cfg[key];
+    }
     for (const char *key : {"module_config_path", "tokenizer_file"}) {
       if (!nntr_cfg.contains(key))
         continue;
@@ -882,6 +926,48 @@ int main(int argc, char *argv[]) {
     model->save_weight(dst_weight_path, DataType::NONE, layer_dtype_map,
                        target_isa);
 
+    if (ple_sidecar) {
+      const std::string ple_payload_path =
+        output_dir + "/" + ple_payload_name;
+      if (!std::filesystem::exists(ple_payload_path) ||
+          std::filesystem::file_size(ple_payload_path) == 0)
+        throw std::runtime_error(
+          "PLE sidecar was not written — does this architecture (" +
+          architecture + ") build a per_layer_input_embedding layer?");
+
+      // Manifest: GGML row payload; rows/size cross-checked by the loader
+      // against the payload byte count.
+      if (!cfg.contains("hidden_size_per_layer_input"))
+        throw std::runtime_error(
+          "--ple_sidecar: config.json lacks hidden_size_per_layer_input");
+      const bool q6k = (embd_dtype == DataType::Q6_K);
+      const size_t out_dim =
+        static_cast<size_t>(num_layers) *
+        cfg["hidden_size_per_layer_input"].get<size_t>();
+      const size_t row_bytes = q6k ? 210 * ((out_dim + 255) / 256)
+                                   : 18 * ((out_dim + 31) / 32);
+      const size_t payload = std::filesystem::file_size(ple_payload_path);
+      if (payload % row_bytes != 0)
+        throw std::runtime_error(
+          "PLE sidecar size " + std::to_string(payload) +
+          " is not a multiple of the row stride " + std::to_string(row_bytes));
+
+      json manifest;
+      manifest["datatype"] = q6k ? "q6_k" : "q4_0";
+      manifest["size"] = out_dim;
+      manifest["rows"] = payload / row_bytes;
+      manifest["lut-path"] = ple_payload_name;
+      std::ofstream mf(output_dir + "/" + ple_manifest_name);
+      if (!mf.is_open())
+        throw std::runtime_error("Failed to open PLE manifest for write");
+      mf << manifest.dump(4) << std::endl;
+
+      std::cout << "  PLE sidecar:  " << ple_payload_name << " ("
+                << (payload / (1024 * 1024)) << " MB, "
+                << payload / row_bytes << " rows x " << out_dim << ") + "
+                << ple_manifest_name << "\n";
+    }
+
     // Report file size
     auto src_size = std::filesystem::file_size(src_weight_path);
     auto dst_size = std::filesystem::file_size(dst_weight_path);
@@ -904,6 +990,13 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype), src_tensor_type);
+    // ple_sidecar_export is an extraction-time key only — the runtime key is
+    // ple_file_name, pointing at the manifest next to the model file.
+    new_nntr_cfg.erase("ple_sidecar_export");
+    if (ple_sidecar)
+      new_nntr_cfg["ple_file_name"] = ple_manifest_name;
+    for (auto &[key, value] : orig_path_cfg.items())
+      new_nntr_cfg[key] = value;
 
     std::string output_config_path = output_dir + "/nntr_config.json";
 

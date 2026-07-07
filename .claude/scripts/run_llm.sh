@@ -52,6 +52,14 @@ case "$MODEL" in
     LOCAL_DIR=/home/nntrainer/GAUSS4/nntr_model_untie2_qs4cx
     DEV_DIR=gauss4_packed
     TMPL=gauss4 ;;                # gemma4 턴 마커 + no-think 고스트 채널
+  gauss4-ple)                     # PLE sidecar 분리(mmap on-demand dequant) — 출력은 gauss4와 bit-exact
+    LOCAL_DIR=/home/nntrainer/GAUSS4/nntr_model_untie2_qs4cx_ple
+    DEV_DIR=gauss4_ple
+    TMPL=gauss4 ;;
+  gemma4-ple)                     # PLE sidecar 분리 — 출력은 gemma4와 bit-exact, peak mem -1.8GB
+    LOCAL_DIR=/home/nntrainer/qwen3_e2e/gemma4_qs4cx_fp16_ple
+    DEV_DIR=gemma4_ple
+    TMPL=gemma4 ;;
   gemma4)
     LOCAL_DIR=/home/nntrainer/qwen3_e2e/gemma4_qs4cx_fp16
     DEV_DIR=gemma4_qs4cx_fp16
@@ -68,7 +76,7 @@ case "$MODEL" in
     LOCAL_DIR=/home/nntrainer/qwen3_e2e/qwen3_lg_q6k_qs4cx
     DEV_DIR=qwen3_qs4cx_regen     # bin md5는 LOCAL_DIR와 동일
     TMPL=chatml ;;
-  *) echo "unknown model: $MODEL (gauss4|gemma4|gemma4-lmint4|gemma2|qwen3)"; exit 2 ;;
+  *) echo "unknown model: $MODEL (gauss4|gauss4-ple|gemma4|gemma4-ple|gemma4-lmint4|gemma2|qwen3)"; exit 2 ;;
 esac
 
 # ---------- 프롬프트 구성 ---------------------------------------------------

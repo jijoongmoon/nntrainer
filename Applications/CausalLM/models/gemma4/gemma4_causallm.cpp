@@ -277,15 +277,25 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   // per-layer input embedding is a lookup table -> use EMBEDDING_DTYPE.
   // (EmbeddingLayer save/load supports FP32/Q4_0/Q6_K, not QINT4, so it must
   // not inherit FC_LAYER_DTYPE; quantize.cpp maps it to embd_dtype to match.)
-  // [merge 2026-06-30] kept OURS over upstream's buildEmbeddingLayerProperties/
-  // PLE_FILE_NAME sidecar path (our canonical gemma4 has no sidecar artifact).
+  // ple_file_name (nntr_config.json) points at a GGML q4_0/q6_k sidecar
+  // manifest: the table then lives OUTSIDE the model .bin, mmap'd and
+  // dequantized per token on demand instead of held resident (~GB saved).
+  // ple_sidecar_export is the matching extraction key (nntr_quantize
+  // --ple_sidecar); mutually exclusive with ple_file_name.
+  std::vector<std::string> ple_embedding_props = {
+    withKey("name", "per_layer_input_embedding"),
+    withKey("in_dim", std::to_string(VOCAB_SIZE_PER_LAYER_INPUT)),
+    withKey("out_dim", std::to_string(per_layer_total_dim)),
+    withKey("weight_dtype", EMBEDDING_DTYPE),
+    withKey("scale", EMBEDDING_PER_LAYER_SCALE)};
+  if (!PLE_FILE_NAME.empty())
+    ple_embedding_props.emplace_back(
+      withKey("quantized_lut_path", PLE_FILE_NAME));
+  if (!PLE_SIDECAR_EXPORT.empty())
+    ple_embedding_props.emplace_back(
+      withKey("sidecar_export_path", PLE_SIDECAR_EXPORT));
   LayerHandle per_layer_embedding(
-    createLayer("embedding_layer",
-                {withKey("name", "per_layer_input_embedding"),
-                 withKey("in_dim", std::to_string(VOCAB_SIZE_PER_LAYER_INPUT)),
-                 withKey("out_dim", std::to_string(per_layer_total_dim)),
-                 withKey("weight_dtype", EMBEDDING_DTYPE),
-                 withKey("scale", EMBEDDING_PER_LAYER_SCALE)}));
+    createLayer("embedding_layer", ple_embedding_props));
   Tensor per_layer_embedding_out = per_layer_embedding(x);
 
   LayerHandle per_layer_projection(createLayer(
