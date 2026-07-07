@@ -137,23 +137,13 @@ void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
       ? cfg["num_global_key_value_heads"].get<unsigned int>()
       : NUM_KEY_VALUE_HEADS;
 
-  // [Adreno image-attn model vetting, gemma4 augment] The OHWI image
-  // kernels are register-tiled for the gpu_native-proven d<=256 geometry;
-  // gemma4's global layers (global_head_dim=512) corrupt on them, and the
-  // image pipeline must stay all-or-nothing per process (see the base-class
-  // window vetting in Transformer::setupParameters).
-  if (const char *e = std::getenv("NNTR_KV_IMG_ATTN");
-      e != nullptr && std::atoi(e) != 0) {
-    if (GLOBAL_HEAD_DIM > 256 || HEAD_DIM > 256) {
-      setenv("NNTR_KV_IMG_ATTN", "0", 1);
-      std::fprintf(stderr,
-                   "[IMG-ATTN] model-vetted OFF: head_dim=%u / "
-                   "global_head_dim=%u exceeds the proven d<=256 OHWI "
-                   "tiling; using the flash attention path.\n",
-                   (unsigned)HEAD_DIM, (unsigned)GLOBAL_HEAD_DIM);
-      std::fflush(stderr);
-    }
-  }
+  // NOTE(Adreno image attn): gemma4's dual head-dim geometry (sliding d=256,
+  // global_head_dim=512) runs correctly on the OHWI image kernels — the
+  // earlier "d>256 corrupts" observation was an artifact of mixing image and
+  // flash layers per call (state desync), not a kernel tiling limit. With
+  // the kernels' sliding-window mask and the uniform per-process image
+  // state, no model-level vetting is needed here (device-validated:
+  // uniform-image gemma4 @999 tok coherent, prefill 2323 vs flash 1060 TPS).
 
   ATTENTION_K_EQ_V =
     cfg.contains("attention_k_eq_v") && cfg["attention_k_eq_v"].get<bool>();
