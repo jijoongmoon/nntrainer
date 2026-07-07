@@ -606,9 +606,19 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   ws.image_channel_type = CL_UNSIGNED_INT32;
   ws.width = K / 32;
   ws.height = N;
-  ws.row_pitch_bytes = K / 2;
+  // [Adreno pitch fix] Row pitch padded to a 256-byte multiple to match the
+  // padded weight backing rows (make_v8c_weight_backing_from_qs4cx) so
+  // image2d-from-buffer creation satisfies CL_DEVICE_IMAGE_PITCH_ALIGNMENT on
+  // Adreno. Intel NEO (no image) keeps K/2. The logical texel width stays K/32.
+  ws.row_pitch_bytes = ClContext::Global().caps().image_v8c
+                         ? (((size_t)K / 2 + 63) / 64) * 64
+                         : (size_t)K / 2;
   try {
     e.weight_image = e.backing->imageView(ws);
+    if (std::getenv("NNTR_V8C_IMG_TRACE"))
+      std::fprintf(stderr, "[v8cimg] OK   N=%u K=%u wpitch=%u(=K/2)\n", N, K,
+                   K / 2),
+        std::fflush(stderr);
   } catch (...) {
     // The image2d view fails when N (height) exceeds the device image cap
     // (~16384) -- the untied int4 lm_head has N=vocab=262144. The row-major
@@ -618,6 +628,10 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
     // other (image-sized) weight builds its image normally, so this only
     // affects the oversized lm_head.
     e.weight_image = nullptr;
+    if (std::getenv("NNTR_V8C_IMG_TRACE"))
+      std::fprintf(stderr, "[v8cimg] FAIL N=%u K=%u wpitch=%u(=K/2)\n", N, K,
+                   K / 2),
+        std::fflush(stderr);
     static int logged = 0;
     if (!logged++)
       std::fprintf(stderr,

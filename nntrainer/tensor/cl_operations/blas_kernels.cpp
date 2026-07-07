@@ -2152,6 +2152,25 @@ bool svm_pool_default_on() {
 // must pass the IDENTICAL string so the same cached program is reused.
 static const char *kV8cBufCompileOpts = "-DV8C_BUFFER_ONLY -cl-std=CL3.0";
 
+// [Adreno pitch fix] int4-weight row stride in BYTES. On the ADRENO image path
+// (caps.image_v8c, i.e. non-Intel) the weight backing rows are padded up to a
+// 256-byte multiple so image2d-from-buffer creation satisfies
+// CL_DEVICE_IMAGE_PITCH_ALIGNMENT (an unaligned K/2, e.g. gauss4's K=192 PLE
+// projection -> 96 B, otherwise fails clCreateImage and mis-routes the FC to
+// the lm-head GEMV). Intel NEO (buffer path) has no image and keeps the tight
+// K/2 stride UNCHANGED -- padding it broke the XMX/DPAS 2D-block weight reads.
+// The kernel K-loop still uses K/32 texels; only the ROW stride grows, and the
+// padding bytes are zero. Keep this in sync with make_v8c_weight_backing_from_
+// qs4cx and the image row_pitch in blas_kernel_interface.cpp.
+static inline size_t v8c_wrow_bytes(unsigned int K) {
+  return ClContext::Global().caps().image_v8c
+           ? (((size_t)K / 2 + 63) / 64) * 64
+           : (size_t)K / 2;
+}
+static inline unsigned int v8c_wrow_texels(unsigned int K) {
+  return (unsigned int)(v8c_wrow_bytes(K) / 16);
+}
+
 void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
                       cl_mem scale_wgt, cl_mem row_sum_act, cl_mem zp_act,
                       cl_mem row_sum_w_int4, cl_mem output_fp16, unsigned int M,
@@ -2266,7 +2285,7 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
       ClContext::SharedPtrClKernel ck = blas_cc->registerClKernel(
         int8_int4_gemm_v8c_kernel, "v8c_gemv_int8_int4_coop", copts);
       if (ck) {
-        int Ni = (int)N, Ki = (int)K, Ww = (int)(K / 32);
+        int Ni = (int)N, Ki = (int)K, Ww = (int)v8c_wrow_texels(K);
         int a = 0;
         const bool ok =
           ck->SetKernelArguments(a++, &abuf, sizeof(cl_mem)) &&
@@ -2368,7 +2387,7 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     }
     if (kx) {
       int Mi = (int)M, Ni = (int)N, Ki = (int)K, Wa = (int)(K / 16),
-          Ww = (int)(K / 32), Mv = (int)M_valid;
+          Ww = (int)v8c_wrow_texels(K), Mv = (int)M_valid;
       int a = 0;
       const bool ok =
         kx->SetKernelArguments(a++, &act_image, sizeof(cl_mem)) &&
@@ -2435,7 +2454,7 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   if (!kp->SetKernelArguments(arg++, &Ki, sizeof(int)))
     throw std::runtime_error("v8c gemm arg 10 (K)");
   if (buf_kernel) {
-    int W_act = (int)(K / 16), W_wgt = (int)(K / 32);
+    int W_act = (int)(K / 16), W_wgt = (int)v8c_wrow_texels(K);
     if (!kp->SetKernelArguments(arg++, &W_act, sizeof(int)))
       throw std::runtime_error("v8c gemm arg 11 (W_act)");
     if (!kp->SetKernelArguments(arg++, &W_wgt, sizeof(int)))
@@ -2549,7 +2568,7 @@ void gemm_int8_v8c_v_ohwi_cl(cl_mem act_image, cl_mem weight_image,
       !kp->SetKernelArguments(arg++, &Mr, sizeof(int)))
     throw std::runtime_error("v8c_v_ohwi: int arg failed");
   if (use_buf) {
-    int W_act = (int)(K / 16), W_wgt = (int)(K / 32);
+    int W_act = (int)(K / 16), W_wgt = (int)v8c_wrow_texels(K);
     if (!kp->SetKernelArguments(arg++, &W_act, sizeof(int)) ||
         !kp->SetKernelArguments(arg++, &W_wgt, sizeof(int)))
       throw std::runtime_error("v8c_v_ohwi: width arg failed");
@@ -2781,7 +2800,16 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
 
   const size_t plain_row_bytes = ((size_t)K + 1) / 2; // QS4CX nibble stride
   const size_t k_blocks = K / 32;
-  const size_t v8c_row_bytes = (size_t)K / 2;
+  // [Adreno pitch fix] image2d-from-buffer requires the row pitch to be a
+  // multiple of the device CL_DEVICE_IMAGE_PITCH_ALIGNMENT; on Adreno an
+  // unaligned pitch (e.g. gauss4's K=192 PLE projection -> K/2=96 B) fails
+  // clCreateImage, forcing a wrong fallback (the lm-head GEMV) that corrupts a
+  // normal per-layer FC. Pad each weight row up to a 256-byte multiple so the
+  // image always builds and the FC stays on the correct v8c GPU path. The
+  // padding bytes are zero and never read (the kernel K-loop uses K/32 texels;
+  // only the ROW STRIDE grows -- W_wgt is set to this padded texel stride).
+  // Adreno-only (v8c_wrow_bytes gates on caps.image_v8c); Intel keeps K/2.
+  const size_t v8c_row_bytes = v8c_wrow_bytes(K);
   std::vector<uint8_t> packed((size_t)N * v8c_row_bytes);
 
   // Read the offset-encoded (int4+8) nibble for input index k of a plain row.
@@ -2836,10 +2864,16 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
   // Per-channel int4 row sum (Σ_k int4) for the asymmetric-act zero-point
   // correction — identical to the KAI path, decoded from the v8c bytes.
   std::vector<int32_t> row_sum_w_int4(N, 0);
+  // [Adreno pitch fix] Sum ONLY the real K/2 nibble bytes, NOT the zero padding
+  // added to v8c_row_bytes: a padding byte 0x00 decodes as two int4 values of
+  // (0-8)=-8, so including it would subtract 16 per padding byte from every
+  // row-sum and corrupt the zero-point correction. The permute writes the K/32
+  // 16-byte blocks (= K/2 bytes) at the front of each padded row.
+  const size_t real_row_bytes = (size_t)K / 2;
   for (unsigned int n = 0; n < N; ++n) {
     const uint8_t *row = packed.data() + n * v8c_row_bytes;
     int32_t s = 0;
-    for (size_t off = 0; off < v8c_row_bytes; ++off) {
+    for (size_t off = 0; off < real_row_bytes; ++off) {
       const uint8_t byte = row[off];
       s += ((int)(byte & 0x0Fu) - 8) + ((int)((byte >> 4) & 0x0Fu) - 8);
     }
