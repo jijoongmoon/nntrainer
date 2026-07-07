@@ -438,6 +438,12 @@ void printUsage(const char *prog) {
     << "                        Q6_K --embd_dtype and 'bin' output format.\n"
     << "                        Also works on an already-quantized source with\n"
     << "                        matching dtypes (pure repack, bit-identical).\n"
+    << "  --embd_sidecar        Same for the embedding0 token-embedding table\n"
+    << "                        (<bin>_embd.bin + _embd.json; output config\n"
+    << "                        gains embedding_file_name). Requires an UNTIED\n"
+    << "                        lm_head (lmhead_untie=true) — a tied head scans\n"
+    << "                        every table row per decode step, so a sidecar\n"
+    << "                        saves nothing. Composes with --ple_sidecar.\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
     << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K, QS4CX\n"
@@ -665,6 +671,7 @@ int main(int argc, char *argv[]) {
   std::string target_config_path = "";
   std::string output_format = "bin";
   bool ple_sidecar = false;
+  bool embd_sidecar = false;
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
@@ -691,6 +698,8 @@ int main(int argc, char *argv[]) {
       target_config_path = argv[++i];
     } else if (arg == "--ple_sidecar") {
       ple_sidecar = true;
+    } else if (arg == "--embd_sidecar") {
+      embd_sidecar = true;
     } else if (arg == "--container" && i + 1 < argc) {
       std::string container = argv[++i];
       if (container == "plain") {
@@ -832,6 +841,36 @@ int main(int argc, char *argv[]) {
       nntr_cfg["ple_sidecar_export"] = output_dir + "/" + ple_payload_name;
     }
 
+    // embedding0 sidecar: same scheme, gated on an UNTIED lm_head (a tied
+    // head shares the table and scans every row per decode step — a sidecar
+    // would fault the whole file back in and save nothing).
+    std::string embd_payload_name, embd_manifest_name;
+    if (embd_sidecar) {
+      if (output_format != "bin")
+        throw std::invalid_argument(
+          "--embd_sidecar supports only the 'bin' output format");
+      if (embd_dtype != DataType::Q4_0 && embd_dtype != DataType::Q6_K)
+        throw std::invalid_argument(
+          "--embd_sidecar requires --embd_dtype Q4_0 or Q6_K (got " +
+          dataTypeToStr(embd_dtype) + ")");
+      if (!(nntr_cfg.contains("lmhead_untie") &&
+            nntr_cfg["lmhead_untie"].get<bool>()))
+        throw std::invalid_argument(
+          "--embd_sidecar requires an untied lm_head (lmhead_untie=true); a "
+          "tied lm_head shares the embedding table and would gain nothing");
+      if (!nntr_cfg.value("embedding_file_name", std::string()).empty())
+        throw std::invalid_argument(
+          "source model already uses an embedding sidecar "
+          "(embedding_file_name set); nothing to extract");
+      std::string base = output_bin_name;
+      auto pos = base.rfind(".bin");
+      if (pos != std::string::npos && pos + 4 == base.size())
+        base = base.substr(0, pos);
+      embd_payload_name = base + "_embd.bin";
+      embd_manifest_name = base + "_embd.json";
+      nntr_cfg["embd_sidecar_export"] = output_dir + "/" + embd_payload_name;
+    }
+
     int num_layers = cfg["num_hidden_layers"].get<int>();
     std::string architecture =
       cfg["architectures"].get<std::vector<std::string>>()[0];
@@ -968,6 +1007,41 @@ int main(int argc, char *argv[]) {
                 << ple_manifest_name << "\n";
     }
 
+    if (embd_sidecar) {
+      const std::string embd_payload_path =
+        output_dir + "/" + embd_payload_name;
+      if (!std::filesystem::exists(embd_payload_path) ||
+          std::filesystem::file_size(embd_payload_path) == 0)
+        throw std::runtime_error(
+          "embedding sidecar was not written — embedding0 must be an untied "
+          "embedding_layer for architecture " + architecture);
+
+      const bool q6k = (embd_dtype == DataType::Q6_K);
+      const size_t hidden = cfg["hidden_size"].get<size_t>();
+      const size_t row_bytes =
+        q6k ? 210 * ((hidden + 255) / 256) : 18 * ((hidden + 31) / 32);
+      const size_t payload = std::filesystem::file_size(embd_payload_path);
+      if (payload % row_bytes != 0)
+        throw std::runtime_error(
+          "embedding sidecar size " + std::to_string(payload) +
+          " is not a multiple of the row stride " + std::to_string(row_bytes));
+
+      json manifest;
+      manifest["datatype"] = q6k ? "q6_k" : "q4_0";
+      manifest["size"] = hidden;
+      manifest["rows"] = payload / row_bytes;
+      manifest["lut-path"] = embd_payload_name;
+      std::ofstream mf(output_dir + "/" + embd_manifest_name);
+      if (!mf.is_open())
+        throw std::runtime_error("Failed to open embd manifest for write");
+      mf << manifest.dump(4) << std::endl;
+
+      std::cout << "  EMBD sidecar: " << embd_payload_name << " ("
+                << (payload / (1024 * 1024)) << " MB, "
+                << payload / row_bytes << " rows x " << hidden << ") + "
+                << embd_manifest_name << "\n";
+    }
+
     // Report file size
     auto src_size = std::filesystem::file_size(src_weight_path);
     auto dst_size = std::filesystem::file_size(dst_weight_path);
@@ -990,11 +1064,15 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype), src_tensor_type);
-    // ple_sidecar_export is an extraction-time key only — the runtime key is
-    // ple_file_name, pointing at the manifest next to the model file.
+    // *_sidecar_export are extraction-time keys only — the runtime keys are
+    // ple_file_name / embedding_file_name, pointing at the manifests next to
+    // the model file.
     new_nntr_cfg.erase("ple_sidecar_export");
+    new_nntr_cfg.erase("embd_sidecar_export");
     if (ple_sidecar)
       new_nntr_cfg["ple_file_name"] = ple_manifest_name;
+    if (embd_sidecar)
+      new_nntr_cfg["embedding_file_name"] = embd_manifest_name;
     for (auto &[key, value] : orig_path_cfg.items())
       new_nntr_cfg[key] = value;
 

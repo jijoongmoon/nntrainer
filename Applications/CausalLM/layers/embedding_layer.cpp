@@ -794,12 +794,14 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // CUDA-graph stream capture a local vector fails twice: (a) a pageable
     // cudaMemcpyAsync is NOT capturable, and (b) the vector is freed when this
     // function returns, but the captured graph REPLAYS afterwards -- it would
-    // copy from freed memory => garbage. A process-lifetime pinned (cudaHostAlloc)
-    // buffer is capturable and survives the replay. Grows monotonically (decode
-    // iter==1; prefill iter<=max_seq_len); single sequence (b_size==1) so one
-    // shared buffer per layer is sufficient.
-    static _FP16 *emb_stage = nullptr;
-    static size_t emb_stage_cap = 0; // capacity in _FP16 elements
+    // copy from freed memory => garbage. A layer-lifetime pinned
+    // (cudaHostAlloc) buffer is capturable and survives the replay. PER
+    // INSTANCE (member, NOT a function static): embedding0 and the PLE both run
+    // this method now, and a shared static let the PLE overwrite embedding0's
+    // still-in-flight async copy (CUDA garbage). Grows monotonically (decode
+    // iter==1; prefill iter<=max_seq_len); single sequence (b_size==1).
+    _FP16 *&emb_stage = *reinterpret_cast<_FP16 **>(&cuda_stage);
+    size_t &emb_stage_cap = cuda_stage_cap;
     bool emb_dev_only = false;
     if (hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
       cudaPointerAttributes pa{};

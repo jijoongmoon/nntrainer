@@ -186,13 +186,10 @@ protected:
   std::atomic<bool> stop_prepared_for_run_{false};
 
   std::string LMHEAD_DTYPE; /** embedding dtype */
-  bool LMHEAD_UNTIE = false; /**< untie lm_head from the input embedding (Gemma4
-                                QINT4 lm_head = separate FC weight, not shared
-                                with the Q6_K input embedding). A dedicated flag
-                                (not derived from LMHEAD_DTYPE) so the quantizer
-                                builds the same untied graph from FP32 source
-                                weights while the dtype map quantizes
-                                output_of_causallm to QINT4 on save. */
+  // LMHEAD_UNTIE moved to Transformer: embedding0's layer-type choice (tied
+  // TieWordEmbedding vs untied embedding_layer) needs it in
+  // <model>Transformer::constructModel scope, which does not see CausalLM
+  // members (the diamond joins only at <Model>CausalLM).
   std::vector<unsigned int> EOS_TOKEN_ID;
   unsigned int BOS_TOKEN_ID;
   float TEMPERATURE;

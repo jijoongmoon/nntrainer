@@ -24,6 +24,8 @@ CL 공통: `NNTR_GPU_SVM_POOL=1 NNTR_V8C_BUF=1 NNTR_MHA_GPU=1 NNTR_FC_GPU=1 NNTR
 | `gauss4` | GAUSS4/nntr_model_untie2_qs4cx | models/gauss4_packed | gemma4 턴마커 + no-think 고스트 채널(`<|channel>thought\n<channel|>`), eos=106 |
 | `gauss4-ple` | GAUSS4/nntr_model_untie2_qs4cx_ple | models/gauss4_ple | 〃 — PLE sidecar(mmap) 분리, 출력은 gauss4와 **bit-exact** |
 | `gemma4-ple` | qwen3_e2e/gemma4_qs4cx_fp16_ple | models/gemma4_ple | gemma4와 동일 — PLE sidecar(mmap) 분리, 출력 bit-exact |
+| `gauss4-side` | GAUSS4/nntr_model_untie2_qs4cx_side | models/gauss4_side | 〃 — **PLE+embedding0 둘 다** sidecar(mmap), 출력 bit-exact, 상주 최소 |
+| `gemma4-side` | qwen3_e2e/gemma4_qs4cx_fp16_side | models/gemma4_side | 〃 — PLE+embedding0 sidecar, 출력 bit-exact |
 | `gemma4` | qwen3_e2e/gemma4_qs4cx_fp16 | models/gemma4_qs4cx_fp16 | `<bos><|turn>user\n…<turn|>\n<|turn>model\n` |
 | `gemma4-lmint4` | qwen3_e2e/gemma4_lmint4 | models/gemma4_lmint4 | 〃 (README known-good/CUDA 기준 모델) |
 | `gemma2` | qwen3_e2e/gemma2_lg_q6k_qs4cx | models/gemma2_qs4cx_regen (md5 동일) | 없음(base) — raw 이어쓰기 |
@@ -45,6 +47,8 @@ CL 공통: `NNTR_GPU_SVM_POOL=1 NNTR_V8C_BUF=1 NNTR_MHA_GPU=1 NNTR_FC_GPU=1 NNTR
 | gauss4 | ~2100/16.4 | 5134/62.5 | **1249/19.2** | (느림, 골든용) |
 | gauss4-ple | 2140/16.7 (**peak 3616→2662MB**) | 5193/60 (peak 6071→4879MB) | 1252/18.5 | — |
 | gemma4-ple | 2595/16.6 (**peak 3784→2152MB**) | (coh 검증) | 2437/21.7 (peak 5497→4274MB) | — |
+| gauss4-side | 2163/18.5 (**peak 2285MB**) | 5064/61 (peak 4501MB) | 1258/19.1 (peak 4908MB) | — |
+| gemma4-side | 2760/17.2 (**peak 1842MB**) | (coh 검증, peak 3488MB) | 2390/22.1 (peak 3913MB) | — |
 | gemma4 qs4cx | ~2500/16+ | — | **2373/21.9** | 170/2.0 |
 | gemma4-lmint4 | — | **5808/64** (cuda-fast, 목표 5550/36 초과) | **2461/21.8** (README 2454/18.2 일치) | — |
 | gemma2 | ~1839/15 | 3246/52 | 835/16.0 | 75/8.4 |
@@ -60,4 +64,5 @@ CL 공통: `NNTR_GPU_SVM_POOL=1 NNTR_V8C_BUF=1 NNTR_MHA_GPU=1 NNTR_FC_GPU=1 NNTR
 - 진단: `NNTR_V8C_FP16_TRACE=1`(FC별 RELERR, **buffer 경로 전용** — image 경로는 -1), `NNTR_V8C_BUF=1`(Adreno에서 buffer 경로 강제 → 프로브 활성), `[IMG-ATTN] engaged ... hQ/hKV/d` 라인으로 engage 인스턴스 판별.
 - 단말은 폰 2대 연결 가능 — 항상 `adb -s R3CY70LV96T`.
 - **PLE sidecar**: `nntr_quantize <이미-양자화된 모델dir> --fc_dtype <동일> --embd_dtype <동일> --lmhead_dtype <동일> --ple_sidecar -o <새dir>` = 무재양자화 repack (dtype 일치 → passthrough, old bin = new bin + ple.bin 바이트 일치). 런타임 키는 nntr_config.json `ple_file_name`(= 매니페스트 .json). mmap(MADV_RANDOM)+prefill시 배치 row MADV_WILLNEED 선인출 — 선인출 없으면 cold prefill이 ~25% 느려짐(랜덤 major fault 직렬화). 출력은 in-bin과 bit-exact (같은 GGML row를 같은 dequant로 읽음).
+- **embedding0 sidecar** (`--embd_sidecar`, 런타임 키 `embedding_file_name`): **untied lm_head(lmhead_untie=true) 전용** — tied lm_head는 decode마다 테이블 전 row를 스캔하므로 sidecar 이득 0. untie 시 embedding0가 tie_word_embeddings → embedding_layer로 전환됨(lookup 코드는 거울상이라 bit-exact; 전환은 gemma4/gauss4 한정). `--ple_sidecar`와 한 번에 조합 가능. **함정(해결됨)**: CUDA dev-act staging 버퍼가 함수-static이어서 embedding0·PLE가 같은 클래스가 되자 공유→레이스(가비지) — 인스턴스 멤버로 분리 완료. UVM 풀도 device-only 판정이라 minimal env에서도 staging 경로가 쓰임.
 - 단말 peak RSS는 SVM 풀 성장 순서에 따라 수백 MB 편차 — gauss4-ple가 base보다 높게 찍히기도 함. **PLE 상주 아님이 실측으로 확정**: 1K prefill 중 /proc/smaps에서 PLE 매핑 Rss = 945MB 중 **3.5MB**(터치된 ~1023 rows뿐). 메모리 비교는 x86 수치가 깨끗함.

@@ -165,6 +165,9 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
   PLE_SIDECAR_EXPORT = nntr_cfg.value("ple_sidecar_export", std::string());
+  EMBD_SIDECAR_EXPORT = nntr_cfg.value("embd_sidecar_export", std::string());
+  LMHEAD_UNTIE =
+    nntr_cfg.contains("lmhead_untie") && nntr_cfg["lmhead_untie"].get<bool>();
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();

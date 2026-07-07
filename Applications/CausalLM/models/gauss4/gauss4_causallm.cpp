@@ -184,13 +184,29 @@ std::pair<Tensor, Tensor> Gauss4Transformer::constructModel() {
   Tensor x({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)}, "input0");
 
   // Main embedding (no sqrt scaling -- PyTorch: h = embed_tokens(ids))
+  // TieWordEmbedding exists to share the table with a tied lm_head. With
+  // LMHEAD_UNTIE the head is a separate FC, so embedding0 is a plain
+  // embedding_layer — lookup-identical (mirrored dequant/scale/handoff code,
+  // same weight record) and it unlocks the mmap'd sidecar (embedding_file_name)
+  // that TieWordEmbedding structurally lacks.
+  const bool embedding_tied = TIE_WORD_EMBEDDINGS && !LMHEAD_UNTIE;
   const std::string embedding_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
-  LayerHandle embedding(createLayer(
-    embedding_type,
-    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
-     "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
-     "scale=" + std::to_string(EMBEDDING_SCALE)}));
+    embedding_tied ? "tie_word_embeddings" : "embedding_layer";
+  NNTR_THROW_IF(embedding_tied && !EMBEDDING_FILE_NAME.empty(),
+                std::invalid_argument)
+    << "embedding_file_name requires an untied embedding_layer (tied lm_head "
+       "scans every row per decode step, so a sidecar saves nothing)";
+  std::vector<std::string> embedding0_props = {
+    "name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
+    "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
+    "scale=" + std::to_string(EMBEDDING_SCALE)};
+  if (!embedding_tied && !EMBEDDING_FILE_NAME.empty())
+    embedding0_props.emplace_back(
+      withKey("quantized_lut_path", EMBEDDING_FILE_NAME));
+  if (!embedding_tied && !EMBD_SIDECAR_EXPORT.empty())
+    embedding0_props.emplace_back(
+      withKey("sidecar_export_path", EMBD_SIDECAR_EXPORT));
+  LayerHandle embedding(createLayer(embedding_type, embedding0_props));
   Tensor h = embedding(x);
 
   // ── Packed per-layer embedding (PLE) ────────────────────────────────────

@@ -256,6 +256,13 @@ private:
     embedding_props;
   unsigned int weight_idx;
   std::shared_ptr<QuantLut> quant_lut;
+  /** CUDA dev-act pinned staging (cudaHostAlloc), PER INSTANCE. This was a
+   *  function-scope static, which was safe while only the PLE used this class;
+   *  once embedding0 became an EmbeddingLayer too, both layers shared one
+   *  buffer and the second lookup overwrote the first one's still-in-flight
+   *  async H2D copy => corrupted residual seed => CUDA garbage. */
+  void *cuda_stage = nullptr;
+  size_t cuda_stage_cap = 0; ///< capacity in _FP16 elements
 };
 } // namespace causallm
 

@@ -167,8 +167,8 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   if (LMHEAD_DTYPE == "QINT4")
     LMHEAD_DTYPE = "QS4CX";
 
-  LMHEAD_UNTIE =
-    nntr_cfg.contains("lmhead_untie") && nntr_cfg["lmhead_untie"].get<bool>();
+  // LMHEAD_UNTIE is parsed in Transformer::setupParameters (member moved
+  // there so <model>Transformer::constructModel can gate embedding0's type).
 
   SKIP_PREFILL = nntr_cfg.contains("skip_prefill")
                    ? nntr_cfg["skip_prefill"].get<bool>()

@@ -385,9 +385,19 @@ protected:
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
-  /** nntr_quantize --ple_sidecar: save() writes the PLE table here instead of
-   *  the model file (extraction-time key, not a runtime one) */
+  /** nntr_quantize --ple_sidecar / --embd_sidecar: save() writes the table to
+   *  these paths instead of the model file (extraction-time keys, not runtime
+   *  ones) */
   std::string PLE_SIDECAR_EXPORT;
+  std::string EMBD_SIDECAR_EXPORT;
+  /** untie lm_head from the input embedding (separate FC weight, not shared
+   *  with the embedding table). Lives here (not CausalLM) because embedding0's
+   *  layer-type choice — tied TieWordEmbedding vs untied embedding_layer —
+   *  happens in <model>Transformer::constructModel scope. A dedicated flag
+   *  (not derived from LMHEAD_DTYPE) so the quantizer builds the same untied
+   *  graph from FP32 source weights while the dtype map quantizes
+   *  output_of_causallm on save. */
+  bool LMHEAD_UNTIE = false;
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;
