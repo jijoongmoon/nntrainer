@@ -380,6 +380,18 @@ void Transformer::repack_weight() {
       "Transformer model is not initialized. Please call "
       "initialize() before repack_weight().");
   }
+
+  // [perf/thermal] The KAI rhs-pack below is consumed ONLY by the ARM CPU
+  // KleidiAI GEMM. The GPU (v8c) and x86 paths read the plain on-disk QS4CX
+  // blob directly (see the comment at the pack() call). On a GPU run the whole
+  // loop is therefore redundant CPU work — and it is single-threaded, so for a
+  // large model it pins one core to a thermal shutdown (Adreno: GPU idle at 0%,
+  // one CPU core -> ~104C -> device reboot; 96%+ of CPU was in
+  // kai_run_rhs_pack). Skip it on the GPU engine; ARM CPU (KAI) runs still pack.
+  if (causallm_engine() == "gpu") {
+    ml_logd("repack_weight: skipped on GPU engine (consumes plain QS4CX blob)");
+    return;
+  }
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
       auto weights = context.getWeights();
