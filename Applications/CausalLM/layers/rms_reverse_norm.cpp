@@ -13,6 +13,12 @@
 
 #include "rms_reverse_norm.h"
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_rmsnorm.h>
+#include <cuda_stream_manager.h>
+#endif
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
