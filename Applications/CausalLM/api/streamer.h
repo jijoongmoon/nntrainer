@@ -3,13 +3,25 @@
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
  * @file    streamer.h
- * @brief   Minimal non-owning streamer abstraction for CausalLM decoded deltas.
- * @author  Joonseok Oh <jrock.oh@samsung.com>
- * @bug     No known bugs except for NYI items
+ * @brief   Minimal C-callable base streamer used by the handle-based
+ *          `runModelHandleStreaming` entry point in quick_dot_ai_api.h.
+ *
+ * This is intentionally a very thin vtable-based polymorphism layer so
+ * that:
+ *   - the CausalLM inference loop can push decoded tokens through a
+ *     single pointer,
+ *   - concrete streamers (currently only CallbackStreamer) can be
+ *     implemented in plain C without dragging C++ headers into the
+ *     CausalLM internals,
+ *   - the same mechanism is reusable from JNI callers (the JNI bridge
+ *     instantiates a CallbackStreamer on the stack and lets the C API
+ *     drive it).
+ *
+ * See AsyncAndStreaming.md §3.1 at the repo root for the full design
+ * rationale.
  */
-
-#ifndef __CAUSAL_LM_STREAMER_H__
-#define __CAUSAL_LM_STREAMER_H__
+#ifndef __QUICK_DOT_AI_STREAMER_H__
+#define __QUICK_DOT_AI_STREAMER_H__
 
 #ifndef WIN_EXPORT
 #ifdef _WIN32
@@ -27,39 +39,56 @@ typedef struct BaseStreamer BaseStreamer;
 
 /**
  * @brief Vtable for a BaseStreamer.
+ *
+ * Both function pointers may be NULL — the streamer_put / streamer_end
+ * helpers below are null-safe so the caller never has to check.
  */
 typedef struct {
   /**
-   * @brief Forward one UTF-8 decoded delta to the streamer.
-   * @return 0 to continue, non-zero to request cooperative stop.
+   * @brief Forward one UTF-8 delta string to the streamer.
+   *
+   * The pointer is only valid for the duration of the call; the
+   * streamer implementation must copy if it needs to retain the data.
+   *
+   * @return 0 to continue generation, non-zero to request cancellation
+   *         at the next token boundary.
    */
   int (*put)(BaseStreamer *self, const char *decoded_utf8);
 
   /**
-   * @brief Notify the streamer that the current run has ended.
+   * @brief Called exactly once after the last put, regardless of whether
+   *        generation finished normally, was cancelled via the callback
+   *        return value, or ended because an exception propagated out of
+   *        the run loop.
    */
   void (*end)(BaseStreamer *self);
 } BaseStreamerVTable;
 
 /**
- * @brief Base streamer. Concrete streamers embed this as their first field.
+ * @brief Base streamer. Concrete streamers embed this as their first
+ *        field and set @c vtable to a static const instance of
+ *        BaseStreamerVTable.
  */
 struct BaseStreamer {
   const BaseStreamerVTable *vtable;
 };
 
 /**
- * @brief NULL-safe wrapper around the streamer's put hook.
+ * @brief NULL-safe wrapper around the vtable's put() hook. Returns
+ *        non-zero if the streamer requested cancellation.
  */
 WIN_EXPORT int streamer_put(BaseStreamer *self, const char *decoded_utf8);
 
 /**
- * @brief NULL-safe wrapper around the streamer's end hook.
+ * @brief NULL-safe wrapper around the vtable's end() hook. Idempotent
+ *        from the caller's perspective — concrete implementations
+ *        should tolerate being called multiple times, but the CausalLM
+ *        inference path calls this at most once.
  */
 WIN_EXPORT void streamer_end(BaseStreamer *self);
 
 #ifdef __cplusplus
-}
+} // extern "C"
 #endif
 
-#endif // __CAUSAL_LM_STREAMER_H__
+#endif // __QUICK_DOT_AI_STREAMER_H__

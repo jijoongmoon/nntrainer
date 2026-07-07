@@ -1,11 +1,14 @@
+# api/{causal_lm_api,model_config,streamer,callback_streamer}.cpp were removed
+# here (Move Slice B, UNVERIFIED in this standalone build — not exercised by
+# QuickAI's ./build.sh): the API layer is now quick_dot_ai_api, a separate lib
+# there. NOTE: models/causal_lm.cpp still calls streamer_put()/streamer_end()
+# (declared in api/streamer.h) — with streamer.cpp no longer compiled into
+# `causallm` below, this build likely needs a mirrored libquick_dot_ai_api
+# target (or api/streamer.cpp re-added) to link; left for Slice E.
 causallm_src = [
     meson.current_source_dir() / 'chat_template.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
-    meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
-    meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
-    meson.current_source_dir() / 'api' / 'model_config.cpp',
-    meson.current_source_dir() / 'api' / 'streamer.cpp',
     meson.current_source_dir() / 'kv_cache_manager.cpp',
 ]
 
@@ -226,17 +229,10 @@ e_safetensors_info = executable('nntr_safetensors_info',
 )
 
 
-test_api_src = [
-    meson.current_source_dir() / 'api' / 'test_api.cpp',
-]
-
-test_api = executable('test_api',
-    test_api_src,
-    include_directories: causallm_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
-    build_by_default: true,
-    install: false,
-)
+# NOTE: the api/test_api.cpp + 'test_api' executable target were removed here
+# (UNVERIFIED — this standalone meson.build is not exercised by QuickAI's
+# ./build.sh, see Move Slice B doc). test_api.cpp used the removed global
+# runModel() API and has no replacement in this standalone build yet.
 
 # KVCacheManager unit tests
 if get_option('enable-test')
@@ -331,28 +327,10 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
-  unittest_cancel_api = executable(
-    'unittest_cancel_api',
-    [
-      meson.current_source_dir() / 'api' / 'unittest_cancel_api.cpp',
-    ],
-    dependencies: [
-      nntrainer_dep,
-      nntrainer_ccapi_dep,
-      gtest_main_dep,
-      causallm_layer_dependencies,
-      causallm_dep
-    ],
-    include_directories: causallm_inc,
-    build_by_default: true,
-    install: false,
-  )
-
-  test('unittest_cancel_api', unittest_cancel_api,
-    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_cancel_api'),
-    timeout: 60,
-    suite: 'unittests'
-  )
+  # NOTE: the 'unittest_cancel_api' target (api/unittest_cancel_api.cpp) was
+  # removed here (UNVERIFIED — see note above test_api). It exercised the
+  # removed causal_lm_api.{cpp,h} global cancel + '*ForTest' seams, which no
+  # longer exist after Move Slice B.
 
   # Ubuntu native builds use platform=none.
   model_unittest_platforms = ['none', 'windows', 'android']
