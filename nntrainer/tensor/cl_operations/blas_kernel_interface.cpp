@@ -522,6 +522,19 @@ struct V8cScratch {
   int last_quant_dtype = -1;
   int last_quant_slot = 0; /**< slot whose int8 the cache hit refers to */
   unsigned long long last_quant_resident_generation = 0;
+
+  // [FC->FC chained edge] Identity + ACTUAL cl_mem store target of the last
+  // v8c FC's cl_mem-plane output. gauss4 uniquely chains two v8c FCs with no
+  // op in between (attention_gate_down->gate_up, ffn_gate_up->ffn_gate_down);
+  // the consumer's act-quant source derived via input.getMemoryData()->
+  // deviceMem() must resolve to the exact buffer the producer stored to
+  // (direct_out GEMM store or the kernel writer). Recording the producer's
+  // real target lets the consumer rebind when the derivations diverge
+  // (ClBufferPool per-padded-offset dedup). Single entry, overwritten by
+  // every FC call; never matches for gemma4/qwen3/gemma2 (no FC->FC edges).
+  const void *last_fc_out_md = nullptr;
+  cl_mem last_fc_out_clmem = nullptr;
+  unsigned int last_fc_out_M = 0, last_fc_out_N = 0;
 };
 
 // Process-global Segment A resident-buffer generation counter. Producers
@@ -569,8 +582,18 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   std::lock_guard<std::mutex> lock(v8c_cache_mtx());
   auto &cache = v8c_weight_cache();
   auto it = cache.find(key);
-  if (it != cache.end())
-    return &it->second;
+  if (it != cache.end()) {
+    // Validate the pointer-keyed hit: a freed/re-used host weight pointer
+    // (e.g. FSU) would otherwise silently return ANOTHER weight's device
+    // pack (wrong N/K backing bound to the GEMM). Rebuild on mismatch.
+    if (it->second.N == N && it->second.K == K)
+      return &it->second;
+    std::fprintf(stderr,
+                 "[v8c] weight-cache shape mismatch for key=%p: cached N=%u "
+                 "K=%u vs requested N=%u K=%u -- rebuilding\n",
+                 key, it->second.N, it->second.K, N, K);
+    cache.erase(it);
+  }
   const uint8_t *nibbles = weight.getData<uint8_t>();
   if (!nibbles)
     return nullptr;
@@ -1520,6 +1543,30 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     device_clmem_in
       ? static_cast<cl_mem>(input.getMemoryData()->deviceMem())
       : nullptr;
+  // [FC->FC chained edge] If this FC's input MemoryData IS the previous v8c
+  // FC's output MemoryData and the shapes chain (K == producer N, same M),
+  // bind the producer's ACTUAL store target instead of the re-derived handle.
+  // ClBufferPool's per-padded-offset cl_mem dedup can resolve the two
+  // derivations to different buffers, making the consumer's act-quant read
+  // zero-initialized pool bytes the producer never wrote (gauss4
+  // gate_down->gate_up / ffn_gate_up->ffn_gate_down; fluent-but-wrong text).
+  // No-op when the derivations already agree; structurally never fires for
+  // models without FC->FC edges (gemma4/qwen3/gemma2). All-GPU, no drains.
+  if (device_clmem_in && input.getMemoryData() &&
+      sc.last_fc_out_md ==
+        static_cast<const void *>(input.getMemoryData().get()) &&
+      sc.last_fc_out_clmem != nullptr && sc.last_fc_out_M == M &&
+      sc.last_fc_out_N == K) {
+    static const bool chain_trace =
+      std::getenv("NNTR_V8C_CHAIN_TRACE") != nullptr;
+    if (chain_trace && clmem_in != sc.last_fc_out_clmem)
+      std::fprintf(stderr,
+                   "[V8C-CHAIN] %s: derived in=%p != producer target=%p "
+                   "(M=%u K=%u) REBOUND\n",
+                   output.getName().c_str(), (void *)clmem_in,
+                   (void *)sc.last_fc_out_clmem, M, K);
+    clmem_in = sc.last_fc_out_clmem; // bind the producer's ACTUAL store target
+  }
   // Input GPU-residency: when the activation lives in the SVM pool (and no
   // cl_mem backing was found), copy it into the quant scratch device-side
   // instead of uploading it from the host -- removing the input round-trip.
@@ -2009,9 +2056,16 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
                  : sc.y_fp16;
     cl_mem gemm_act_arg = use_buf ? act_i8_arg : act_image;
     cl_mem gemm_wgt_arg = use_buf ? w->weight_buf : w->weight_image;
+    // M_valid = the REAL row count, always. The kernel routes single-row calls
+    // to the fast GEMV (M=1 decode) and multi-row calls to the TM=4 tiled
+    // kernel with the M_valid store guard. Passing M_pad here when !direct_out
+    // (the old behavior) made real M=1 decode FCs with non-clmem outputs look
+    // like 4-row calls -> TM=4 at 4x the GEMV work (decode TPS regression);
+    // consumers only ever read the real M rows, so storing exactly M is safe
+    // on every output path (writer kernel / SVM / host bounce all copy M*N).
     gemm_int8_v8c_cl(gemm_act_arg, gemm_wgt_arg, act_scale_arg, w->scale_buf,
                      act_rs_arg, act_zp_arg, w->row_sum_w_int4, gemm_y_arg,
-                     M_pad, N, K, direct_out ? M : M_pad);
+                     M_pad, N, K, M);
     // NNTR_XE3_FC_SYNC: narrowed Xe3 coherence fix. The in-order queue does not
     // give kernel->kernel coarse-grained-SVM coherence on NEO 26.22; the global
     // hammer (NNTR_XE3_SYNC, clFinish after EVERY dispatch) fixes it but serializes
@@ -2082,16 +2136,17 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
         clEnqueueReadBuffer(q, w->row_sum_w_int4, CL_TRUE, 0, sizeof(int) * N,
                             grsw.data(), 0, nullptr, nullptr);
         const uint8_t *sa = weight.getData<uint8_t>();
-        const size_t NR = 4, KRSR = 8, BPK = 2 * NR * KRSR, nbpsr = NR * (K / 2);
+        // Plain row-major QS4CX decode -- MUST match what
+        // make_v8c_weight_backing_from_qs4cx packs the GPU weight from:
+        // N rows of (K+1)/2 bytes, even k = low nibble, stored uint4 =
+        // int4 + 8, NO XOR. (The previous decode here used the obsolete KAI
+        // Section-A layout -- nr=4/kr=16/sr=2 super-rows + XOR 0x88 -- which
+        // matched the host blob when the probe was written but NOT after the
+        // Phase C 'Path B' switch to plain QS4CX: the reference was decoding
+        // scrambled weights, so RELERR was noise for every FC.)
         auto dec = [&](unsigned n, unsigned k) -> int {
-          size_t kbl = k / 32, kp = k % 32, sr = n / NR, nr = n % NR;
-          const uint8_t *ba = sa + sr * nbpsr + kbl * BPK + nr * KRSR;
-          const uint8_t *bb = ba + NR * KRSR;
-          uint8_t nib;
-          if (kp < 8) nib = (ba[kp] ^ 0x88) & 0xF;
-          else if (kp < 16) nib = (bb[kp - 8] ^ 0x88) & 0xF;
-          else if (kp < 24) nib = ((ba[kp - 16] ^ 0x88) >> 4) & 0xF;
-          else nib = ((bb[kp - 24] ^ 0x88) >> 4) & 0xF;
+          const uint8_t byte = sa[(size_t)n * (K / 2) + (k >> 1)];
+          const uint8_t nib = (k & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
           return (int)nib - 8;
         };
         for (unsigned m = 0; m < std::min(M, 2u); ++m) {
@@ -2431,6 +2486,20 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
         throw std::runtime_error("unsupported output dtype");
       }
     }
+    // [FC->FC chained edge] Register this FC's output identity + the ACTUAL
+    // cl_mem it was stored to (== gemm_y_arg under direct_out, == out_sub
+    // under the kernel-writer path) so a directly-chained consumer FC can
+    // rebind its act-quant source to the real bytes (see the clmem_in rebind
+    // above). Non-clmem outputs clear the record.
+    sc.last_fc_out_md =
+      out_clmem ? static_cast<const void *>(output.getMemoryData().get())
+                : nullptr;
+    sc.last_fc_out_clmem =
+      out_clmem ? static_cast<cl_mem>(output.getMemoryData()->deviceMem())
+                : nullptr;
+    sc.last_fc_out_M = M;
+    sc.last_fc_out_N = N;
+
     // Only the transient (fused-rmsq) view is owned here; the per-fanout
     // slot views are cached on V8cScratch and released on rebuild.
     if (act_image_transient && act_image)

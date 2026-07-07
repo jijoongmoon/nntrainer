@@ -2177,13 +2177,26 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
                       unsigned int N, unsigned int K, unsigned int M_valid) {
   if (M_valid == 0)
     M_valid = M; // legacy: store every (padded) row
+  // [M=2..4 row-gap fix] The m1/coop GEMV kernels compute ONLY row 0. That is
+  // correct for the M=1 decode (M_pad=4, M_valid=1) they were built for, but
+  // a REAL 2-4-row call must compute every valid row: gauss4's 5-token prompt
+  // prefills at M=4, and the old "M_pad <= 4 means the real input had 1 valid
+  // row" assumption (below) silently left rows 1..M-1 of EVERY FC output as
+  // stale garbage (KV cache poisoned -> deterministic fluent-but-off-topic
+  // text; gemma4/qwen3/gemma2 prompts all prefill at M>4 and never hit this).
+  // Route by the REAL row count (M_valid): single-row -> GEMV/m1 (fast decode
+  // path unchanged); multi-row -> the TM=4 tiled kernel, which takes the
+  // M_valid store guard. (When !direct_out the caller passes M_valid=M_pad;
+  // the TM=4 kernel then also computes the zero-padded rows into scratch --
+  // harmless, consumers read only the real rows.)
+  const bool use_m1 = (M_valid == 1) && M <= 4;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   // For the M=1 (M_pad=4) decode case the default TM=4 kernel burns ~4×
   // the work needed (3 zero-padded rows). Dispatch a TM=1 variant
-  // instead. The caller passes M_pad here, not M, so M_pad <= 4 means
-  // "the real input had 1 valid row" (no QINT4 model has padded prefill
-  // with M_pad <= 4 except via the M=1 decode rounding).
+  // instead. (HISTORICAL BUG, fixed above: the caller passes M_pad here, and
+  // this used to assume M_pad <= 4 implies "1 valid row" -- false for gauss4's
+  // M=4 prefill. Routing now keys on M_valid, not M_pad.)
   // Buffer path (NNTR_V8C_BUF=1): act_image/weight_image carry the raw cl_mem
   // buffers; widths derived from K (int4 weight texel = 32 K, act texel = 16 K).
   const bool use_buf = v8c_use_buffer_path();
@@ -2200,8 +2213,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   const bool buf_kernel = use_buf || fc_buf_probe;
   const char *kname =
     buf_kernel
-      ? ((M <= 4) ? "v8c_gemm_int8_int4_m1_buf" : "v8c_gemm_int8_int4_buf")
-      : ((M <= 4) ? "v8c_gemm_int8_int4_m1" : "v8c_gemm_int8_int4");
+      ? (use_m1 ? "v8c_gemm_int8_int4_m1_buf" : "v8c_gemm_int8_int4_buf")
+      : (use_m1 ? "v8c_gemm_int8_int4_m1" : "v8c_gemm_int8_int4");
   // Buffer path compiles the program with -DV8C_BUFFER_ONLY so the
   // image-sampling kernel bodies are excluded (Intel NEO can't compile them).
   std::string copts = use_buf ? kV8cBufCompileOpts : "";
@@ -2271,7 +2284,7 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   // backing via clGetImageInfo. This lifts Intel decode FC off the
   // latency-bound m1_buf GEMV (only N/8 work-items) onto the 64-WI K-split
   // coop kernel.
-  if (M <= 4 && gemv_coop && (N % 8) == 0 && (K % 32) == 0 && K <= 12288) {
+  if (use_m1 && gemv_coop && (N % 8) == 0 && (K % 32) == 0 && K <= 12288) {
     cl_mem wbuf = nullptr, abuf = nullptr;
     if (buf_kernel) {
       wbuf = weight_image; // raw cl_mem on the buffer path
@@ -2460,9 +2473,9 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     if (!kp->SetKernelArguments(arg++, &W_wgt, sizeof(int)))
       throw std::runtime_error("v8c gemm arg 12 (W_wgt)");
   }
-  // TM=4 kernels take the trailing M_valid store guard; the m1 (M<=4)
+  // TM=4 kernels take the trailing M_valid store guard; the m1 (single-row)
   // variants only ever write row 0 and keep their legacy signature.
-  if (M > 4) {
+  if (!use_m1) {
     int Mv = (int)M_valid;
     if (!kp->SetKernelArguments(arg++, &Mv, sizeof(int)))
       throw std::runtime_error("v8c gemm arg (M_valid)");
@@ -2487,7 +2500,7 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     snprintf(lbl, sizeof(lbl), ":N%u_K%u", N, K);
     blas_cc->command_queue_inst_.setNextProfileLabel(lbl);
   }
-  if (M <= 4) {
+  if (use_m1) {
     // M=1 (TM=1) GEMV-style dispatch: 1-D grid over output channels.
     constexpr size_t TN_M1 = 8;
     std::array<size_t, 3> gws = {(size_t)N / TN_M1, 1, 1};
