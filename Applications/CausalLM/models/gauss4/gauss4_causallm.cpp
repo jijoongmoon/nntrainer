@@ -17,6 +17,7 @@
 #include <llm_util.hpp>
 #include <model.h>
 #include <reshaped_rms_norm.h>
+#include <per_layer_slice.h>
 #include <rms_reverse_norm.h>
 
 #include <fp16.h>
@@ -192,6 +193,26 @@ std::pair<Tensor, Tensor> Gauss4Transformer::constructModel() {
      "scale=" + std::to_string(EMBEDDING_SCALE)}));
   Tensor h = embedding(x);
 
+  // ── Packed per-layer embedding (PLE) ────────────────────────────────────
+  // ONE lookup for ALL layers' per-layer embeddings, packed to
+  // [.., NUM_LAYERS * HIDDEN_SIZE_PER_LAYER_INPUT]. This mirrors HF gauss4
+  // (Gauss4Model.forward: per_layer_inputs[:, :, i, :]) and gemma4, where the
+  // per-layer embedding is materialized once and each decoder layer takes a
+  // GPU per_layer_slice. It replaces the previous per-layer host embedding
+  // lookup (a fresh embedding_layer inside every decoder block), which crossed
+  // a host->GPU boundary 35x per forward and raced the async GPU graph on
+  // coarse-grain SVM (Adreno crash/garbage; on Intel XMX it was masked only by
+  // the vendor-scoped coherence drains). Host lookup + raise happens once here.
+  const unsigned int per_layer_total_dim =
+    static_cast<unsigned int>(NUM_LAYERS) * HIDDEN_SIZE_PER_LAYER_INPUT;
+  LayerHandle per_layer_embedding(createLayer(
+    "embedding_layer",
+    {withKey("name", "per_layer_input_embedding"),
+     withKey("in_dim", std::to_string(NUM_VOCAB)),
+     withKey("out_dim", std::to_string(per_layer_total_dim)),
+     withKey("weight_dtype", EMBEDDING_DTYPE)}));
+  per_layer_input = per_layer_embedding(x);
+
   // ── Normal decoder layers 0 .. NUM_SEQUENTIAL_LAYERS-1 ──────────────────
   kv_sharing_sliding_tensor = Tensor();
   kv_sharing_full_tensor = Tensor();
@@ -350,10 +371,9 @@ Tensor Gauss4Transformer::createTransformerDecoderBlock(const int layer_id,
   // ── Per-Layer Embedding (PLE) ─────────────────────────────────────────
   // For ple_pre_mlp=true: PLE gate input = ffn_norm output (pre-MLP)
   // For ple_pre_mlp=false (old): PLE gate input = ffn_output (post-MLP)
-  Tensor input0({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)}, "input0");
   Tensor ple_gate_input = PLE_PRE_MLP ? ple_input : ffn_out;
   Tensor ple_out =
-    createPerLayerEmbedding(layer_id, ple_gate_input, input0, is_shared_layer);
+    createPerLayerEmbedding(layer_id, ple_gate_input, is_shared_layer);
 
   // ── 3-way residual: decoder_add + ffn_output + ple_out ───────────────
   std::vector<std::string> dec_out_props = {
@@ -711,7 +731,6 @@ Tensor Gauss4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
 
 Tensor Gauss4Transformer::createPerLayerEmbedding(const int layer_id,
                                                   Tensor ple_input,
-                                                  Tensor input0,
                                                   bool skip_prefill) {
   const std::string lname = "layer" + std::to_string(layer_id);
 
@@ -731,14 +750,17 @@ Tensor Gauss4Transformer::createPerLayerEmbedding(const int layer_id,
     // (standalone sigmoid/addition split residency there). PLE_ACT is sigmoid
     // for gauss4; the fused sigmoid_add op is sigmoid-specific.
 
-    // embedding lookup: vocab -> HIDDEN_SIZE_PER_LAYER_INPUT
-    LayerHandle ple_emb(createLayer(
-      "embedding_layer",
-      {withKey("name", lname + "_PLE"),
-       withKey("in_dim", std::to_string(NUM_VOCAB)),
-       withKey("out_dim", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
-       withKey("weight_dtype", EMBEDDING_DTYPE)}));
-    Tensor emb = ple_emb(input0);
+    // per-layer slice: select this layer's HIDDEN_SIZE_PER_LAYER_INPUT chunk
+    // from the packed per_layer_input (GPU-resident; no per-layer host embedding
+    // lookup). layer_index selects columns [i*192 : (i+1)*192].
+    std::vector<std::string> slice_props = {
+      withKey("name", lname + "_PLE_slice"),
+      withKey("feature_size", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
+      withKey("layer_index", std::to_string(layer_id)),
+      withKey("engine", causallm_engine())};
+    appendSkipPrefillIfNeeded(slice_props, skip_prefill);
+    LayerHandle ple_slice(createLayer("per_layer_slice", slice_props));
+    Tensor emb = ple_slice(per_layer_input);
 
     // fused mix: sigmoid(gate) + emb
     std::vector<std::string> mix_props = {
@@ -768,14 +790,17 @@ Tensor Gauss4Transformer::createPerLayerEmbedding(const int layer_id,
     return ple_norm(projected);
   } else {
     // method=3 (legacy): sigmoid(gate * emb) -> projection -> post_norm
-    // embedding lookup: vocab -> HIDDEN_SIZE_PER_LAYER_INPUT
-    LayerHandle ple_emb(createLayer(
-      "embedding_layer",
-      {withKey("name", lname + "_PLE"),
-       withKey("in_dim", std::to_string(NUM_VOCAB)),
-       withKey("out_dim", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
-       withKey("weight_dtype", EMBEDDING_DTYPE)}));
-    Tensor emb = ple_emb(input0);
+    // per-layer slice: select this layer's HIDDEN_SIZE_PER_LAYER_INPUT chunk
+    // from the packed per_layer_input (GPU-resident; no per-layer host embedding
+    // lookup). layer_index selects columns [i*192 : (i+1)*192].
+    std::vector<std::string> slice_props = {
+      withKey("name", lname + "_PLE_slice"),
+      withKey("feature_size", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
+      withKey("layer_index", std::to_string(layer_id)),
+      withKey("engine", causallm_engine())};
+    appendSkipPrefillIfNeeded(slice_props, skip_prefill);
+    LayerHandle ple_slice(createLayer("per_layer_slice", slice_props));
+    Tensor emb = ple_slice(per_layer_input);
 
     // multiply: gate * emb (element-wise)
     std::vector<std::string> mul_props = {
@@ -827,6 +852,10 @@ void Gauss4Transformer::registerCustomLayers() {
       nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+    // CPU per_layer_slice (the GPU variant PerLayerSliceLayerGPU is registered
+    // centrally in Transformer::registerCustomLayers on the "gpu" context).
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::PerLayerSliceLayer>);
   } catch (const std::invalid_argument &e) {
     std::cerr << "[Gauss4] registerCustomLayers warning: " << e.what()
               << std::endl;

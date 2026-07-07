@@ -67,7 +67,7 @@ public:
    *   out  = PLE_post_norm(PLE_projection(mix))  <- rms_reverse_norm
    */
   Tensor createPerLayerEmbedding(const int layer_id, Tensor ple_input,
-                                 Tensor input0, bool skip_prefill);
+                                 bool skip_prefill);
 
   void registerCustomLayers() override;
 
@@ -124,6 +124,12 @@ protected:
   // After rotation FC: rotation_sliding / rotation_full outputs
   Tensor kv_sharing_sliding_tensor;
   Tensor kv_sharing_full_tensor;
+
+  // Packed per-layer embedding (all layers' PLE tables in one lookup), produced
+  // ONCE at the front of constructModel() and sliced per-layer on the GPU via
+  // per_layer_slice. Mirrors gemma4/HF (per_layer_inputs) and removes the 35x
+  // per-forward host embedding lookup that raced the async GPU graph.
+  Tensor per_layer_input;
 
   void appendSkipPrefillIfNeeded(std::vector<std::string> &props,
                                  bool skip) const;
