@@ -70,6 +70,7 @@
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <chrono>
 #include <cuda_context_manager.h>
+#include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -1334,6 +1335,29 @@ void NeuralNetwork::load(const std::string &file_path,
       std::vector<std::shared_ptr<LayerNode>> load_nodes(model_graph.cbegin(),
                                                          model_graph.cend());
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // [wprefetch level 2] NNTR_CUDA_WPREFETCH>=2 on a cuda graph: migrate
+      // each QS4CX weight's plain payload to the device AS IT IS READ, so the
+      // FC bytes never accumulate in host RSS during load (the load-time RSS
+      // peak). The engine gate keeps this off OpenCL/CPU runs of a
+      // dual-enabled binary (a stray CUDA call would create the CUDA
+      // context). Scale conversion at first answer() briefly faults the small
+      // fp32-scale tail back -- that is expected and tiny.
+      bool cuda_wprefetch_load = false;
+      {
+        static const int _wpf = []() {
+          const char *e = std::getenv("NNTR_CUDA_WPREFETCH");
+          return e ? atoi(e) : 0;
+        }();
+        if (_wpf >= 2)
+          for (auto &n : load_nodes)
+            if (n->isComputeEngineCUDA()) {
+              cuda_wprefetch_load = true;
+              break;
+            }
+      }
+#endif
+
       auto read_one = [&](const std::shared_ptr<LayerNode> &node) {
         if (!MMAP_READ) {
           auto local_model_file = checkedOpenStream<std::ifstream>(
@@ -1375,6 +1399,16 @@ void NeuralNetwork::load(const std::string &file_path,
                      std::numeric_limits<size_t>::max(), true, model_file_fd);
 #endif
         }
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+        if (cuda_wprefetch_load) {
+          for (unsigned int wi = 0; wi < node->getNumWeights(); ++wi) {
+            nntrainer::Tensor &wt = node->getWeight(wi);
+            if (wt.getDataType() == ml::train::TensorDim::DataType::QS4CX)
+              (void)nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
+                wt.getData<uint8_t>(), wt.width(), wt.height());
+          }
+        }
+#endif
       };
 
       unsigned int hw_threads = std::thread::hardware_concurrency();

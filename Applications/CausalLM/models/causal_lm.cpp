@@ -944,12 +944,28 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             // from the plain QS4CX payload (keyed by its pointer) -- no UVM
             // Section-A copy. Building the fp16-scale UVM side buffer here
             // too makes the first forward (and any CUDA-graph capture) a pure
-            // cache hit.
+            // cache hit. NOTE the scale conversion host-READS the fp32 tail,
+            // so it must run before any wprefetch migration below.
             const unsigned short *uS = nullptr;
             nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
               wt.getScale<float>(), wt.width(), &uS);
-            nntrainer::cuda::cuda_fc_qs4cx_prewarm(wt.getData<uint8_t>(),
-                                                   wt.width(), wt.height());
+            // [wprefetch] NNTR_CUDA_WPREFETCH>=1: release the plain payload
+            // from host RSS (migrate to VRAM) and build the derived caches
+            // with the GPU repack kernels -- the CPU prewarm would fault the
+            // pages straight back. Discrete only; VRAM must fit pool+caches
+            // (8GB-class cards: measure before enabling). Fallback = the CPU
+            // prewarm, byte-identical caches either way.
+            static const int wprefetch = []() {
+              const char *e = std::getenv("NNTR_CUDA_WPREFETCH");
+              return e ? atoi(e) : 0;
+            }();
+            if (!(wprefetch >= 1 &&
+                  nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
+                    wt.getData<uint8_t>(), wt.width(), wt.height()) &&
+                  nntrainer::cuda::cuda_fc_qs4cx_prewarm_gpu(
+                    wt.getData<uint8_t>(), wt.width(), wt.height())))
+              nntrainer::cuda::cuda_fc_qs4cx_prewarm(wt.getData<uint8_t>(),
+                                                     wt.width(), wt.height());
           }
         };
       model->forEachLayer(fn, nullptr);

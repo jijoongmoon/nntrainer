@@ -150,6 +150,30 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
                            unsigned int K);
 
 /**
+ * @brief [wprefetch] Migrate a QS4CX weight's plain payload (+ fp32 scale
+ *        tail) to the device (cudaMemPrefetchAsync on the backend stream).
+ *        Managed pages live in exactly one place, so this releases them from
+ *        host RSS; a later host touch just migrates them back. Discrete GPUs
+ *        only; returns false (no-op) on integrated / non-managed pointers.
+ * @param plain_w plain QS4CX nibble payload = weight.getData()
+ * @param N,K     FC weight dims
+ * @return true if the prefetch was enqueued
+ */
+bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w,
+                                   unsigned int N, unsigned int K);
+
+/**
+ * @brief [wprefetch] GPU-side prewarm: build the derived dp4a/cuBLAS device
+ *        caches with the repack kernels reading the (device-resident) plain
+ *        payload -- the CPU prewarm would fault prefetched pages back to the
+ *        host. Byte-identical caches; idempotent.
+ * @param plain_w plain QS4CX nibble payload (device-accessible)
+ * @param N,K     FC weight dims
+ */
+bool cuda_fc_qs4cx_prewarm_gpu(const unsigned char *plain_w, unsigned int N,
+                               unsigned int K);
+
+/**
  * @brief Pre-grow ALL the static dp4a decode scratch buffers (g_dp4a_q8 /
  *        ascale / azp / xf / yf) to the model's max decode capacity at LOAD, so
  *        the M=1 dp4a decode FC path never cudaMallocs inside a CUDA-graph

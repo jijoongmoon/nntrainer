@@ -786,6 +786,58 @@ unsigned short *g_stage_xh = nullptr;
 size_t g_stage_xh_cap = 0;
 std::mutex g_dp4a_mtx;
 
+// Build (once) the dp4a signed-packed-int4 + rowsum device cache for plain_w
+// by dispatching the repack kernels on the backend stream -- the GPU reads
+// the plain payload directly, so it must be device-accessible. Caller holds
+// g_dp4a_mtx. Returns the cache entry, or nullptr on failure.
+DevWeightQ *ensure_dp4a_cache_locked(const unsigned char *plain_w,
+                                     unsigned int N, unsigned int K) {
+  auto it = g_dp4a_plain_cache.find(plain_w);
+  if (it != g_dp4a_plain_cache.end())
+    return &it->second;
+  const int n = (int)N, k = (int)K;
+  const size_t Kh = (K + 1u) / 2u;
+  auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                     "repack_plain_i4");
+  auto krs = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                      "weight_rowsum");
+  if (!kr || !krs)
+    return nullptr;
+  DevWeightQ dw;
+  if (cudaMalloc(&dw.plain, (size_t)N * Kh) != cudaSuccess)
+    return nullptr;
+  if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
+    cudaFree(dw.plain);
+    return nullptr;
+  }
+  const int khi = (int)Kh;
+  kr->SetKernelArguments(0, &plain_w, sizeof(plain_w));
+  kr->SetKernelArguments(1, &dw.plain, sizeof(dw.plain));
+  kr->SetKernelArguments(2, &n, sizeof(n));
+  kr->SetKernelArguments(3, &khi, sizeof(khi));
+  const int rb[3] = {256, 1, 1};
+  const int rg[3] = {(int)(((size_t)N * Kh + 255) / 256), 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kr, rg, rb)) {
+    cudaFree(dw.plain);
+    cudaFree(dw.rowsum);
+    return nullptr;
+  }
+  // per-channel weight row-sum (for the activation zero-point correction).
+  krs->SetKernelArguments(0, &dw.plain, sizeof(dw.plain));
+  krs->SetKernelArguments(1, &dw.rowsum, sizeof(dw.rowsum));
+  krs->SetKernelArguments(2, &n, sizeof(n));
+  krs->SetKernelArguments(3, &k, sizeof(k));
+  const int sb[3] = {128, 1, 1};
+  const int sg[3] = {((int)N + 127) / 128, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*krs, sg, sb)) {
+    cudaFree(dw.plain);
+    cudaFree(dw.rowsum);
+    return nullptr;
+  }
+  it = g_dp4a_plain_cache.emplace(plain_w, dw).first;
+  return &it->second;
+}
+
 // repack (cached) + GEMM into a device float Y, using the already-staged
 // q8/ascale scratch. Caller holds g_dp4a_mtx and has run act-quant.
 bool dp4a_repack_and_gemm(const unsigned char *plain_w,
@@ -793,56 +845,19 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
                           unsigned int M, unsigned int N, unsigned int K,
                           int out_fp16 = 0) {
   const int n = (int)N, k = (int)K;
-  const size_t Kh = (K + 1u) / 2u;
-  auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
-                                                     "repack_plain_i4");
-  auto krs = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
-                                                      "weight_rowsum");
   const bool gemv = (M == 1);
   const bool tiled = (M >= 8);
   auto kg = CudaContext::Global().registerCudaKernel(
     FC_QINT4_DP4A_SRC,
     gemv ? "dp4a_gemv" : (tiled ? "dp4a_gemm_reg" : "dp4a_gemm"));
-  if (!kr || !krs || !kg)
+  if (!kg)
     return false;
 
-  auto it = g_dp4a_plain_cache.find(plain_w);
-  if (it == g_dp4a_plain_cache.end()) {
-    DevWeightQ dw;
-    if (cudaMalloc(&dw.plain, (size_t)N * Kh) != cudaSuccess)
-      return false;
-    if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
-      cudaFree(dw.plain);
-      return false;
-    }
-    const int khi = (int)Kh;
-    kr->SetKernelArguments(0, &plain_w, sizeof(plain_w));
-    kr->SetKernelArguments(1, &dw.plain, sizeof(dw.plain));
-    kr->SetKernelArguments(2, &n, sizeof(n));
-    kr->SetKernelArguments(3, &khi, sizeof(khi));
-    const int rb[3] = {256, 1, 1};
-    const int rg[3] = {(int)(((size_t)N * Kh + 255) / 256), 1, 1};
-    if (!StreamManager::Global().DispatchCommand(*kr, rg, rb)) {
-      cudaFree(dw.plain);
-      cudaFree(dw.rowsum);
-      return false;
-    }
-    // per-channel weight row-sum (for the activation zero-point correction).
-    krs->SetKernelArguments(0, &dw.plain, sizeof(dw.plain));
-    krs->SetKernelArguments(1, &dw.rowsum, sizeof(dw.rowsum));
-    krs->SetKernelArguments(2, &n, sizeof(n));
-    krs->SetKernelArguments(3, &k, sizeof(k));
-    const int sb[3] = {128, 1, 1};
-    const int sg[3] = {((int)N + 127) / 128, 1, 1};
-    if (!StreamManager::Global().DispatchCommand(*krs, sg, sb)) {
-      cudaFree(dw.plain);
-      cudaFree(dw.rowsum);
-      return false;
-    }
-    it = g_dp4a_plain_cache.emplace(plain_w, dw).first;
-  }
-  signed char *plain = it->second.plain;
-  int *wrowsum = it->second.rowsum;
+  DevWeightQ *dwp = ensure_dp4a_cache_locked(plain_w, N, K);
+  if (!dwp)
+    return false;
+  signed char *plain = dwp->plain;
+  int *wrowsum = dwp->rowsum;
 
   const int mm = (int)M;
   kg->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
@@ -900,6 +915,57 @@ bool ensure_buf(void **buf, size_t *cap, size_t bytes) {
 // element; an exactly-sized buffer (esp. large K=6144 down-proj) then faults
 // with cudaErrorIllegalAddress. The pad keeps those reads in mapped memory.
 static constexpr size_t FC_I8_TAIL_PAD = 256;
+
+// Build (once) the cuBLAS int8 [K,N] + rowsum device cache for plain_w by
+// dispatching the unpack kernels on the backend stream (the GPU reads the
+// plain payload directly). Caller holds g_dp4a_mtx. Returns the cache entry,
+// or nullptr on failure.
+static DevWeightI8 *ensure_i8_cache_locked(const unsigned char *plain_w,
+                                           unsigned int N, unsigned int K) {
+  auto it = g_i8_weight_cache.find(plain_w);
+  if (it != g_i8_weight_cache.end())
+    return &it->second;
+  const int n = (int)N, k = (int)K, kh = (int)((K + 1u) / 2u);
+  auto krp = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                      "repack_plain_i8_kn");
+  auto krs = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
+                                                      "weight_rowsum_kn");
+  if (!krp || !krs)
+    return nullptr;
+  DevWeightI8 dw;
+  if (cudaMalloc(&dw.w8, (size_t)N * K + FC_I8_TAIL_PAD) != cudaSuccess)
+    return nullptr;
+  if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
+    cudaFree(dw.w8);
+    return nullptr;
+  }
+  krp->SetKernelArguments(0, &plain_w, sizeof(plain_w));
+  krp->SetKernelArguments(1, &dw.w8, sizeof(dw.w8));
+  krp->SetKernelArguments(2, &n, sizeof(n));
+  krp->SetKernelArguments(3, &k, sizeof(k));
+  krp->SetKernelArguments(4, &kh, sizeof(kh));
+  const int pb[3] = {16, 16, 1};
+  const int pg[3] = {((int)N + 15) / 16, ((int)K + 15) / 16, 1};
+  if (!StreamManager::Global().DispatchCommand(*krp, pg, pb)) {
+    cudaFree(dw.w8);
+    cudaFree(dw.rowsum);
+    return nullptr;
+  }
+  krs->SetKernelArguments(0, &dw.w8, sizeof(dw.w8));
+  krs->SetKernelArguments(1, &dw.rowsum, sizeof(dw.rowsum));
+  krs->SetKernelArguments(2, &n, sizeof(n));
+  krs->SetKernelArguments(3, &k, sizeof(k));
+  const int sb[3] = {128, 1, 1};
+  const int sg[3] = {((int)N + 127) / 128, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*krs, sg, sb)) {
+    cudaFree(dw.w8);
+    cudaFree(dw.rowsum);
+    return nullptr;
+  }
+  it = g_i8_weight_cache.emplace(plain_w, dw).first;
+  return &it->second;
+}
+
 static bool dp4a_stage_scratch(unsigned int M, unsigned int K) {
   return ensure_buf((void **)&g_dp4a_q8, &g_dp4a_q8_cap,
                     (size_t)M * K + FC_I8_TAIL_PAD) &&
@@ -1116,6 +1182,67 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
   return true;
 }
 
+// [wprefetch] Migrate a QS4CX weight's plain payload (+ its fp32 scale tail)
+// to the device. With the derived dp4a/cuBLAS caches device-resident and the
+// fp16 scales converted, the GPU path never host-reads these pages again --
+// keeping them host-resident only inflates RSS. Managed pages live in exactly
+// one place, so prefetching them off the host IS the host-RSS release. A
+// later host touch (host-fallback dot) just migrates pages back; correctness
+// is unaffected. Discrete GPUs only (integrated has one physical pool), and
+// VRAM must fit pool + derived caches or UVM eviction churns. Enqueued async
+// on the backend stream, so GPU-prewarm repack kernels queued after it read
+// post-migration pages.
+bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w,
+                                   unsigned int N, unsigned int K) {
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return false;
+  if (ContextManager::Global().isIntegrated())
+    return false;
+  cudaPointerAttributes attr{};
+  if (cudaPointerGetAttributes(&attr, plain_w) != cudaSuccess ||
+      attr.type != cudaMemoryTypeManaged) {
+    cudaGetLastError();
+    return false;
+  }
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  const size_t bytes =
+    (size_t)N * ((K + 1u) / 2u) + (size_t)N * sizeof(float);
+  // CUDA 13 signature (cudaMemLocation + flags).
+  cudaMemLocation loc{};
+  loc.type = cudaMemLocationTypeDevice;
+  loc.id = dev;
+  if (cudaMemPrefetchAsync(plain_w, bytes, loc, /*flags=*/0,
+                           StreamManager::Global().GetStream()) !=
+      cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  return true;
+}
+
+// [wprefetch] GPU-side equivalent of cuda_fc_qs4cx_prewarm: build the derived
+// device caches by dispatching the repack kernels (byte-XOR packed-int4 +
+// int8 [K,N]) that read the plain payload ON DEVICE -- used when the payload
+// was prefetched to VRAM, where the CPU prewarm would fault every page
+// straight back to the host. Byte-identical caches (same kernels the
+// on-miss path uses). Idempotent.
+bool cuda_fc_qs4cx_prewarm_gpu(const unsigned char *plain_w, unsigned int N,
+                               unsigned int K) {
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return true;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  if (!ensure_dp4a_cache_locked(plain_w, N, K))
+    return false;
+  static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
+  if (_cb && _cb[0] != '0' && !ensure_i8_cache_locked(plain_w, N, K))
+    return false;
+  return true;
+}
+
 bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X,
                                   const unsigned char *plain_w,
                                   const unsigned short *scales_fp16, float *Y,
@@ -1210,13 +1337,9 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
     return true;
   auto kqh = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                       "act_quant_i8_h");
-  auto krp = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
-                                                      "repack_plain_i8_kn");
-  auto krs = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
-                                                      "weight_rowsum_kn");
   auto kde = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                       "dequant_i32_fp16");
-  if (!kqh || !krp || !krs || !kde) {
+  if (!kqh || !kde) {
     ml_loge("[CUDA] fc_qint4 cublas-i8: kernel registration failed");
     return false;
   }
@@ -1231,7 +1354,6 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
   if (!dp4a_stage_scratch(Mpad, K))
     return false;
   const int m = (int)M, n = (int)N, k = (int)K, mpad = (int)Mpad;
-  const int kh = (int)((K + 1u) / 2u);
 
   // 1) int8 activation quant from the fp16 input (reuse the dp4a quantizer).
   // Skip when this exact (Xh,K) was just quantized into g_dp4a_q8 by a sibling
@@ -1262,40 +1384,9 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
   }
 
   // 2) int8 weight [K,N] + per-channel rowsum (cached one-time unpack).
-  auto it = g_i8_weight_cache.find(plain_w);
-  if (it == g_i8_weight_cache.end()) {
-    DevWeightI8 dw;
-    if (cudaMalloc(&dw.w8, (size_t)N * K + FC_I8_TAIL_PAD) != cudaSuccess)
-      return false;
-    if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
-      cudaFree(dw.w8);
-      return false;
-    }
-    krp->SetKernelArguments(0, &plain_w, sizeof(plain_w));
-    krp->SetKernelArguments(1, &dw.w8, sizeof(dw.w8));
-    krp->SetKernelArguments(2, &n, sizeof(n));
-    krp->SetKernelArguments(3, &k, sizeof(k));
-    krp->SetKernelArguments(4, &kh, sizeof(kh));
-    const int pb[3] = {16, 16, 1};
-    const int pg[3] = {((int)N + 15) / 16, ((int)K + 15) / 16, 1};
-    if (!StreamManager::Global().DispatchCommand(*krp, pg, pb)) {
-      cudaFree(dw.w8);
-      cudaFree(dw.rowsum);
-      return false;
-    }
-    krs->SetKernelArguments(0, &dw.w8, sizeof(dw.w8));
-    krs->SetKernelArguments(1, &dw.rowsum, sizeof(dw.rowsum));
-    krs->SetKernelArguments(2, &n, sizeof(n));
-    krs->SetKernelArguments(3, &k, sizeof(k));
-    const int sb[3] = {128, 1, 1};
-    const int sg[3] = {((int)N + 127) / 128, 1, 1};
-    if (!StreamManager::Global().DispatchCommand(*krs, sg, sb)) {
-      cudaFree(dw.w8);
-      cudaFree(dw.rowsum);
-      return false;
-    }
-    it = g_i8_weight_cache.emplace(plain_w, dw).first;
-  }
+  DevWeightI8 *dw8 = ensure_i8_cache_locked(plain_w, N, K);
+  if (!dw8)
+    return false;
 
   // 3) int32 GEMM output scratch [Mpad,N] (+tail pad: IMMA can write/read C in
   // wide vectorized tiles past the last element on large shapes).
@@ -1306,12 +1397,12 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
   // 4) INT8 IMMA GEMM on the Tensor Cores (Mpad rows; same backend stream as
   // the kernels). C is [Mpad,N] row-major; the real M rows are at the same
   // offsets so the epilogue reads C[m*N+n] for m<M directly.
-  if (!BlasManager::Global().igemmRowMajor(mpad, n, k, g_dp4a_q8, it->second.w8,
+  if (!BlasManager::Global().igemmRowMajor(mpad, n, k, g_dp4a_q8, dw8->w8,
                                            g_i8_c))
     return false;
 
   // 5) dequant epilogue (bit-identical math to the dp4a kernel) -> fp16 Y.
-  int *rowsum = it->second.rowsum;
+  int *rowsum = dw8->rowsum;
   kde->SetKernelArguments(0, &g_i8_c, sizeof(g_i8_c));
   kde->SetKernelArguments(1, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
   kde->SetKernelArguments(2, &g_dp4a_azp, sizeof(g_dp4a_azp));
