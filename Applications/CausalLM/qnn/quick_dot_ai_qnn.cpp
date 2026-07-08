@@ -534,7 +534,7 @@ void causallm::Quick_Dot_AI_QNN::setupParameters(json &cfg,
   // input(s)_embeds tensor is fed with pre-computed uint16 embeddings
   // rather than token IDs via an embedding layer. Derived classes
   // also mmap embedding_file_name for per-token lookup during
-  // generation (see e.g. Gauss3_8_QNN::lookupEmbedding).
+  // generation (see a model's lookupEmbedding override).
   if (nntr_cfg.contains("uses_embedding")) {
     uses_embedding = nntr_cfg["uses_embedding"].get<bool>();
   }

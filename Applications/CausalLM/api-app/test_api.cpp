@@ -99,7 +99,7 @@ static void print_usage(const char *prog) {
             << prog << clr::reset << " <model> [prompt] [chat_tpl] [quant] "
             << "[verbose]\n";
   std::cout << clr::yellow << "│" << clr::reset << "\n";
-  print_kv("model", "qwen3-0.6b | gauss2.5-1b | gauss-3.6-qnn", clr::yellow);
+  print_kv("model", "qwen3-0.6b | gemma4-e2b-qnn | <catalog id>", clr::yellow);
   print_kv("", "ouro → embedding smoke (encodeModelHandle)", clr::yellow);
   print_kv("prompt", "\"Hello, how are you?\"", clr::yellow);
   print_kv("chat_tpl", "true | false  (default: true)", clr::yellow);
@@ -326,7 +326,8 @@ int main(int argc, char *argv[]) {
     verbose = (arg == "1" || arg == "true");
   }
 
-  bool use_sd = false; // set inside ENABLE_QNN routing block for gauss-4-sd-qnn
+  bool use_sd = false; // set inside a speculative-decoding QNN model's routing
+                        // block, if one is matched
 
   // Model base path: CLI arg > env var > nullptr (uses C API default)
   const char *model_base_path = nullptr;
@@ -370,8 +371,10 @@ int main(int argc, char *argv[]) {
 
   // ── Resolve model type ─────────────────────────────────────────────────
   // Public models use the compat enum path (loadModelHandle).
-  // Gauss models are no longer in the enum — they use loadModelHandleByName
-  // via catalog id.
+  // Other catalog-registered models are not in the enum — they use
+  // loadModelHandleByName via catalog id. Any model_name that doesn't match
+  // a known branch below falls through to the generic catalog-id path, so
+  // any registered model can still be loaded by its full catalog id.
   std::string model_name_str(model_name);
   std::transform(model_name_str.begin(), model_name_str.end(),
                  model_name_str.begin(), ::tolower);
@@ -410,51 +413,6 @@ int main(int argc, char *argv[]) {
   } else if (model_name_str == "gemma4_e2b_qnn" ||
              model_name_str == "gemma4-e2b-qnn") {
     model_type = CAUSAL_LM_MODEL_GEMMA4_E2B_QNN;
-  } else if (model_name_str == "gauss2.5" || model_name_str == "gauss2.5-1b") {
-    // Gauss models use loadModelHandleByName (catalog-registered, no enum)
-    catalog_id = "gauss2.5-1b";
-    use_by_name = true;
-  } else if (model_name_str == "gauss-3.8-cpu" ||
-             model_name_str == "gauss-3.8" || model_name_str == "gauss3.8") {
-    // Gauss 3.8 CPU (symbolic-tensor graph). Catalog id matches the
-    // descriptor registered in gauss3_causallm.cpp.
-    catalog_id = "gauss-3.8-cpu";
-    use_by_name = true;
-  } else if (model_name_str == "gauss-3.6-qnn" ||
-             model_name_str == "gauss-3.6_qnn") {
-#ifdef ENABLE_QNN_MODELS
-    catalog_id = "gauss-3.6-qnn";
-    use_by_name = true;
-    load_backend = CAUSAL_LM_BACKEND_NPU;  // QNN-only (backend mask 0x4)
-#else
-    print_error("Model '" + std::string(model_name) +
-                "' requires QNN support. Rebuild with -Denable-qnn=true.");
-    return 1;
-#endif
-  } else if (model_name_str == "gauss-3.8-qnn" ||
-             model_name_str == "gauss-3.8_qnn") {
-#ifdef ENABLE_QNN_MODELS
-    catalog_id = "gauss-3.8-qnn";
-    use_by_name = true;
-    load_backend = CAUSAL_LM_BACKEND_NPU;  // QNN-only (backend mask 0x4)
-#else
-    print_error("Model '" + std::string(model_name) +
-                "' requires QNN support. Rebuild with -Denable-qnn=true.");
-    return 1;
-#endif
-  } else if (model_name_str == "gauss-4-qnn" ||
-             model_name_str == "gauss-4_qnn" || model_name_str == "gauss4-qnn") {
-#ifdef ENABLE_QNN_MODELS
-    // catalog id owned by Gauss4_E2B_QNN (gauss4_e2b_qnn.cpp); config.json in
-    // the gauss-4-qnn model dir names "Gauss_4_E2B_QNN" as the Factory key.
-    catalog_id = "gauss-4-qnn";
-    use_by_name = true;
-    load_backend = CAUSAL_LM_BACKEND_NPU;  // QNN-only (backend mask 0x4)
-#else
-    print_error("Model '" + std::string(model_name) +
-                "' requires QNN support. Rebuild with -Denable-qnn=true.");
-    return 1;
-#endif
   } else if (model_name_str == "vjepa2-qnn" ||
              model_name_str == "vjepa2_qnn" || model_name_str == "vjepa") {
 #ifdef ENABLE_QNN_MODELS
@@ -467,30 +425,13 @@ int main(int argc, char *argv[]) {
                 "' requires QNN support. Rebuild with -Denable-qnn=true.");
     return 1;
 #endif
-  } else if (model_name_str == "gauss-4-qnn") {
-#ifdef ENABLE_QNN
-    catalog_id = "gauss-4-qnn";
-    use_by_name = true;
-    load_backend = CAUSAL_LM_BACKEND_NPU;
-#else
-    print_error("Model '" + std::string(model_name) +
-                "' requires QNN support. Rebuild with -Denable-qnn=true.");
-    return 1;
-#endif
-  } else if (model_name_str == "gauss-4-sd-qnn") {
-#ifdef ENABLE_QNN
-    catalog_id = "gauss-4-sd-qnn";
-    use_by_name = true;
-    load_backend = CAUSAL_LM_BACKEND_NPU;
-    use_sd = true;
-#else
-    print_error("Model '" + std::string(model_name) +
-                "' requires QNN support. Rebuild with -Denable-qnn=true.");
-    return 1;
-#endif
   } else {
-    print_error("Unknown model: " + std::string(model_name));
-    return 1;
+    // Generic fallback: any name that doesn't match a known branch above is
+    // treated as a full catalog id and loaded via loadModelHandleByName, so
+    // any catalog-registered model (including QNN-only ones) can still be
+    // loaded without a dedicated branch here.
+    catalog_id = model_name_str;
+    use_by_name = true;
   }
 
 #ifdef ENABLE_QNN

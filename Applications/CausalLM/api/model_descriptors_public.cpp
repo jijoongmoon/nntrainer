@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * @file   model_descriptors_public.cpp
- * @brief  Public (non-gauss) model descriptor self-registration. Zero gauss
- *         literals — gauss models register themselves in their own TUs.
+ * @brief  Public model descriptor self-registration. Zero proprietary-model
+ *         literals — proprietary/extension models register themselves in
+ *         their own TUs.
  *
  * config_name values verified against get_model_name_from_type() in
  * quick_dot_ai_api.cpp.  arch_string values verified against

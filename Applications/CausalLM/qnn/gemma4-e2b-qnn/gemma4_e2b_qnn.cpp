@@ -2,7 +2,8 @@
 /**
  * @file   gemma4_e2b_qnn.cpp
  * @brief  QNN model implementation for Gemma 4 E2B with PLE.
- *         Follows Gauss 3.6 KV-cache pattern; PLE handling layered on top.
+ *         Follows the shared QNN KV-cache pattern; PLE handling layered on
+ *         top.
  */
 
 #include "gemma4_e2b_qnn.h"
@@ -852,7 +853,7 @@ void Gemma4_E2B_QNN::initialize() {
 
   open_ple_file_();
 
-  // ── KV cache mapping (Gauss 3.6 pattern, 2 KV per layer) ──
+  // ── KV cache mapping (shared QNN KV-cache pattern, 2 KV per layer) ──
   this->kvs.clear();
   this->fresh_kvs.clear();
   this->kv_sizes.clear();
@@ -1245,7 +1246,8 @@ void Gemma4_E2B_QNN::run(const WSTR prompt, bool /*do_sample*/,
     // fill_attention_mask_with_length above). Using
     // generation_full_kv_past_length here would overlap chunk cols when
     // kv_len > prefill_attention_mask_columns - context_size, corrupting
-    // the mask on multi-chunk prefill. Match Gauss 3.6 convention:
+    // the mask on multi-chunk prefill. Match the shared QNN KV-cache
+    // convention:
     //   past_max = mask_columns - context_size
     {
       const int prefill_full_past_max =

@@ -62,9 +62,10 @@ public:
   // [.,.,head_dim,seq] (one column gathered per head_dim from the verify output
   // [head_dim, src_row_length]); values are seq-major [.,.,seq,head_dim] (one
   // row gathered from [src_row_length, head_dim]). UFIXED8 (1 byte/elem) target
-  // path only. Mirrors gauss4.cpp sd_target.cpp acceptAndAppend(); replaces the
-  // append-whole-tree + compact_cache_by_indices() path (which cannot
-  // ring-wrap). Does NOT change kv_len_ (the caller sets the new length).
+  // path only. Mirrors the speculative-decoding target's acceptAndAppend();
+  // replaces the append-whole-tree + compact_cache_by_indices() path (which
+  // cannot ring-wrap). Does NOT change kv_len_ (the caller sets the new
+  // length).
   void appendAcceptedGenerationOutputsRing(
     const std::vector<IO_TensorType> &step_outputs,
     const std::vector<int32_t> &accepted_indices, int base_position,

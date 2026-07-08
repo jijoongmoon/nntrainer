@@ -120,7 +120,8 @@ private:
   float *generation_sample;
 
   // -------------------------------------------------------------------
-  // KV cache (Gauss 3.6 pattern adapted for Gemma 4: 2 KV per layer)
+  // KV cache (shared QNN KV-cache pattern adapted for Gemma 4: 2 KV per
+  // layer)
   // -------------------------------------------------------------------
   int kv_len = 0;
   bool conversation_started_ = false;

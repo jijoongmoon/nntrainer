@@ -20,10 +20,10 @@ PLATFORM="x86"
 CLEAN=false
 TARGETS="all"
 ENABLE_QNN=false
-# Build the QuickAI product QNN models (src/models/qnn: gauss-*/gemma4-*).
+# Build the product QNN models (src/models/qnn: e.g. gemma4-e2b-qnn).
 # OFF by default; enable with --qnn-models. The libqnn_context.so QNN infra
-# still builds with --enable-qnn alone. Multimodal QNN models
-# (gauss-3.8-vit-qnn, vjepa2-qnn) stay excluded — see
+# still builds with --enable-qnn alone. Product multimodal models
+# (e.g. the vit-qnn model, vjepa2-qnn) stay excluded — see
 # docs/qnn-model-main-adaptation-todo.ko.md.
 ENABLE_QNN_MODELS=false
 ENABLE_EXPERIMENTAL_MULTIMODAL=false

@@ -66,7 +66,7 @@ echo "      ANDROID_NDK set to: ${ANDROID_NDK}"
 # ==========================================================
 echo "[2/6] Building project for Android (with QNN + QNN models, nntr_threads=${NNTR_THREADS}, clean build)..."
 # --qnn-models is required: the API layer (api/quick_dot_ai_api.cpp) registers
-# the product QNN models (gauss-*-qnn, gemma4-e2b-qnn), so their sources under
+# the product QNN models (e.g. gemma4-e2b-qnn), so their sources under
 # src/models/qnn/ must be compiled too — otherwise libquick_dot_ai_api.so fails
 # to link (undefined Quick_Dot_AI_QNN vtable/dtor). --enable-qnn alone only
 # builds the libqnn_context.so QNN infra without the product models.

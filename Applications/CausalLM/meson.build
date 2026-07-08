@@ -10,9 +10,10 @@
 # submodule's own standalone build can produce the API layer without
 # QuickAI's root meson project. Unlike QuickAI's api/meson.build — which
 # borrows the xgrammar wrapper + xgrammar library symbols from
-# quick_dot_ai_dep (the Gauss plugin target, built below) — there is no
-# plugin target in this standalone tree, so quick_dot_ai_api here compiles
-# the xgrammar wrapper (api/xgrammar_wrapper.cpp, api/xgrammar_manager.cpp)
+# quick_dot_ai_dep (the model/extension plugin target, built by QuickAI's own
+# project, not in this standalone tree) — there is no plugin target here, so
+# quick_dot_ai_api here compiles the xgrammar wrapper
+# (api/xgrammar_wrapper.cpp, api/xgrammar_manager.cpp)
 # and the xgrammar library sources itself (see quick_dot_ai_api_xgrammar_src
 # below), keeping a single XGrammarManager singleton within the one shared
 # library. Scope is CPU/public-only: ENABLE_QNN_MODELS is never defined here,
@@ -245,9 +246,10 @@ e_safetensors_info = executable('nntr_safetensors_info',
 
 
 # ── E4: libquick_dot_ai_api.so (+ quick_dot_ai_test smoke exe) ──────────
-# Mirrors QuickAI's api/meson.build, but — since this standalone tree has no
-# Gauss plugin target to borrow xgrammar symbols from — compiles the
-# xgrammar wrapper and xgrammar library sources directly into
+# Mirrors QuickAI's api/meson.build, but the model/extension plugin target
+# is built by QuickAI's own project, not present in this standalone tree —
+# so there's no plugin target here to borrow xgrammar symbols from —
+# compiles the xgrammar wrapper and xgrammar library sources directly into
 # quick_dot_ai_api itself (single copy, single XGrammarManager singleton).
 # CPU/public-only: ENABLE_QNN_MODELS is never defined for this target.
 if get_option('enable-api')
