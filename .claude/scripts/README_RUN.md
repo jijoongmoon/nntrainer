@@ -42,20 +42,23 @@ CL 공통: `NNTR_GPU_SVM_POOL=1 NNTR_V8C_BUF=1 NNTR_MHA_GPU=1 NNTR_FC_GPU=1 NNTR
 | qwen3 | CUDA/adreno-cpu: "**Seoul**" | Intel "Da Yon"·"Hae Soo"류/Adreno "trick question" = OpenCL fp16 마진(0.6B 한계, 버그 아님) |
 
 ### perf @~1K prefill (`perf` 모드, prompt_1p2k, tok/s prefill/decode)
-| model | xmx | cuda(-fast) | adreno | adreno-cpu |
-|---|---|---|---|---|
-| gauss4 | ~2100/16.4 | 5134/62.5 | **1249/19.2** | (느림, 골든용) |
-| gauss4-ple | 2140/16.7 (**peak 3616→2662MB**) | 5193/60 (peak 6071→4879MB) | 1252/18.5 | — |
-| gemma4-ple | 2595/16.6 (**peak 3784→2152MB**) | (coh 검증) | 2437/21.7 (peak 5497→4274MB) | — |
-| gauss4-side | 2163/18.5 (**peak 2285MB**) | 5064/61 (peak 4501MB) | 1258/19.1 (peak 4908MB) | — |
-| gemma4-side | 2760/17.2 (**peak 1842MB**) | (coh 검증, peak 3488MB) | 2390/22.1 (peak 3913MB) | — |
-| gemma4 qs4cx | ~2500/16+ | — | **2373/21.9** | 170/2.0 |
-| gemma4-lmint4 | — | **5808/64** (cuda-fast, 목표 5550/36 초과) | **2461/21.8** (README 2454/18.2 일치) | — |
-| gemma2 | ~1839/15 | 3246/52 | 835/16.0 | 75/8.4 |
-| qwen3 | ~2551/38 | 4861/145 | 2198/33 | 315/34.7 |
+(측정: 2026-07-08 10:40–11:04 x86 전체 / gauss4 adreno-cpu와 wrap의 gauss4-side·gemma4 두 셀은 2026-07-08 오후 별도 측정 — 전부 `run_llm.sh perf`)
+| model | xmx | wrap | intel(dp4a) | cuda(-fast) | adreno | adreno-cpu |
+|---|---|---|---|---|---|---|
+| gauss4 | ~2100/16.4 | 2002.0/17.0 (peak 1723MB) | 1032.3/18.4 (peak 1787MB) | 5115.0/61.0 (peak 5826MB) | **1249/19.2** | 240.1/3.2 (peak 6308MB, f16 prepack 444d0ed5) |
+| gauss4-ple | 2140/16.7 (**peak 3616→2662MB**) | 2058.4/17.3 (peak 1149MB) | 945.5/16.9 (peak 1162MB) | 5166.7/60.8 (peak 4882MB) | 1252/18.5 | — |
+| gemma4-ple | 2595/16.6 (**peak 3784→2152MB**) | 2361.7/17.4 (peak 1152MB) | 1518.2/16.5 (peak 850MB) | 5676.1/65.0 (cuda-fast, peak 3805MB) | 2437/21.7 (peak 5497→4274MB) | — |
+| gauss4-side | 2163/18.5 (**peak 2285MB**) | 2162.8/21.1 (peak 1086MB) | 1029.2/18.6 (peak 1151MB) | 5166.7/61.2 (peak 4503MB) | 1258/19.1 (peak 4908MB) | — |
+| gemma4-side | 2760/17.2 (**peak 1842MB**) | 2581.4/17.8 (peak 851MB) | 1598.4/17.9 (peak 850MB) | 5676.1/62.8 (cuda-fast, peak 3490MB) | 2390/22.1 (peak 3913MB) | — |
+| gemma4 qs4cx | ~2500/16+ | 2190.8/19.5 (peak 1860MB) | 1601.0/18.0 (peak 2293MB) | 5774.6/64.9 (cuda-fast, peak 5762MB) | **2373/21.9** | 170/2.0 |
+| gemma4-lmint4 | 2378.6/16.9 (peak 2489MB) | 2296.6/18.6 (peak 1557MB) | 1627.0/18.1 (peak 2293MB) | **5774.6/62.5** (cuda, peak 5817MB, 목표 5550/36 초과) | **2461/21.8** (README 2454/18.2 일치) | — |
+| gemma2 | 1510.3/13.0 (peak 747MB) | 1692.6/14.2 (peak 747MB) | 656.4/13.5 (peak 768MB) | 3436.2/62.9 (cuda-fast, peak 3208MB) | 831.8/16.0 (peak 4056MB) | 75/8.4 |
+| qwen3 | 2221.3/31.7 (peak 306MB) | 2381.4/34.6 (peak 306MB) | 1610.1/34.6 (peak 308MB) | 4899.5/138.5 (cuda-fast, peak 1269MB) | 2155.8/35.0 (peak 1088MB) | 315/34.7 |
 
 ## 함정 모음 (이 매트릭스와 얽힌 것만)
 - **842tok 완결 지문(prompt_1k.txt)에 chat 모델이 1토큰 EOS를 내는 건 정상** (버그 아님). perf는 중간 절단되는 prompt_1p2k 기준.
+- **wrap 수치는 Windows-MSVC(wrapper) 빌드의 기대 기준치 역할** — 동일한 uint16-Half wrapper(`build_wrap`)이므로 Windows 포트 검증 시 직접 비교 대상.
+- **adreno-cpu 수치(gauss4 제외)는 `444d0ed5`(f16 prepack) 패치 이전 측정** — 이 패치가 FP16-act CPU 실행 전반을 가속(예: qwen3 short-run decode 34.7→54.2) → qwen3/gemma2/gemma4(qs4cx) adreno-cpu 값은 1.2K 기준 재측정 전까지 패치 전 수치 그대로 둠(참고용).
 - `NNTR_KV_IMG_ATTN`은 `ca7e36a9` 이후 **값-체크** — `=0`이 실제로 끔 (그 전엔 presence-check라 못 껐음). image attn은 프로세스 단위 all-or-nothing — 레이어/콜 단위로 섞으면 안 됨.
 - sliding window는 OHWI 커널이 직접 마스킹(`local_window` 인자) — window<max_seq 모델(gauss4 W=1024, gemma4 W=512)도 image 경로 안전.
 - x86에서 no-env 실행은 CPU가 아님(XMX/lmhead-q6k auto-on). 진짜 CPU 레버는 `NNTR_ENGINE=cpu`지만 **x86 int4 CPU GEMM은 NYI** — quant CPU 골든은 단말(`adreno-cpu`)에서.
