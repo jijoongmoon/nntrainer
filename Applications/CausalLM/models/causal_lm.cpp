@@ -539,8 +539,12 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) decode path: ensure
   // the GPU has finished producing the logits before the host reads them here.
-  // No-op in default mode (every GPU op already drained per-op).
-  nntrainer::cuda::StreamManager::Global().finish();
+  // No-op in default mode (every GPU op already drained per-op). cuda engine
+  // ONLY: in a dual-enabled (CUDA+OpenCL) binary this ran on OpenCL runs too,
+  // and StreamManager::Global() lazily CREATES the CUDA context -- the first
+  // stray CUDA touch on a non-cuda run (NVIDIA VRAM burned on an Intel run).
+  if (causallm_engine() == "cuda")
+    nntrainer::cuda::StreamManager::Global().finish();
 #endif
 
   std::vector<unsigned int> outputs;
@@ -920,7 +924,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     static bool cuda_prewarmed = false;
     static const char *_pw = std::getenv("NNTR_CUDA_PREWARM");
     static const bool cuda_prewarm_on = !(_pw && _pw[0] == '0');
-    if (!cuda_prewarmed && cuda_prewarm_on) {
+    // cuda engine ONLY: without this gate a dual-enabled (CUDA+OpenCL) binary
+    // ran the whole prewarm on OpenCL runs too, allocating every FC's derived
+    // cache on the NVIDIA device (measured: 4.4GB VRAM on an Intel xmx run of
+    // gauss4 -- the ~6GB "idle" NVIDIA usage seen on Windows).
+    if (!cuda_prewarmed && cuda_prewarm_on && causallm_engine() == "cuda") {
       cuda_prewarmed = true;
       std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
                          void *)>
