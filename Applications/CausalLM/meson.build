@@ -1,15 +1,27 @@
 # api/{causal_lm_api,model_config,streamer,callback_streamer}.cpp were removed
-# here (Move Slice B, UNVERIFIED in this standalone build — not exercised by
-# QuickAI's ./build.sh): the API layer is now quick_dot_ai_api, a separate lib
+# here (Move Slice B): the API layer is now quick_dot_ai_api, a separate lib
 # there. NOTE: models/causal_lm.cpp still calls streamer_put()/streamer_end()
-# (declared in api/streamer.h) — with streamer.cpp no longer compiled into
-# `causallm` below, this build likely needs a mirrored libquick_dot_ai_api
-# target (or api/streamer.cpp re-added) to link; left for Slice E.
+# (declared in api/streamer.h). streamer.cpp is self-contained (only depends
+# on streamer.h, no other api/ sources), so it is re-added directly to
+# causallm_src below (Slice E / E4, UNVERIFIED — this standalone
+# enable-transformer build is not exercised by QuickAI's ./build.sh).
+#
+# TODO(Slice E follow-up, UNVERIFIED): the rest of api/ (quick_dot_ai_api,
+# model_callbacks, model_config, model_descriptors_public, callback_streamer)
+# has no mirrored target here, unlike QuickAI's api/meson.build. Building one
+# would additionally require: an `enable-api` option (doesn't exist in this
+# tree's meson_options.txt), the xgrammar dependency wired up (the
+# `xgrammar/` checkout under this directory is currently unreferenced by any
+# meson.build here), and QNN model registration sources that live under
+# QuickAI's src/models/qnn, outside this submodule. Left as a TODO rather
+# than attempted blind, since none of it can be verified from this repo
+# alone.
 causallm_src = [
     meson.current_source_dir() / 'chat_template.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'kv_cache_manager.cpp',
+    meson.current_source_dir() / 'api' / 'streamer.cpp',
 ]
 
 executable_src = [

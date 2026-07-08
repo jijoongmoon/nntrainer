@@ -553,16 +553,6 @@ static size_t text_generation_model_index(const CausalLmModel &h) {
   return (h.models.size() > 1) ? 1 : 0;
 }
 
-static std::string trim_wrapping_newlines(std::string value) {
-  while (!value.empty() && (value.front() == '\n' || value.front() == '\r')) {
-    value.erase(value.begin());
-  }
-  while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) {
-    value.pop_back();
-  }
-  return value;
-}
-
 static void reset_handle_session_state(CausalLmModel &h) { h.kv_len = 0; }
 
 static void update_handle_session_after_run(CausalLmModel &h,
