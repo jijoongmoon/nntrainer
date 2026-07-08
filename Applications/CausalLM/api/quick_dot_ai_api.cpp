@@ -1294,7 +1294,7 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
                      .count();
         LOGD("[DEBUG] load_into_handle: MULTI-MODEL SUCCESS "
              "(%zu models, %lld ms e2e)",
-             h.models.size(), e2e);
+             h.models.size(), (long long)e2e);
         return CAUSAL_LM_ERROR_NONE;
       }
 
@@ -1458,7 +1458,7 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
     }
 
     LOGD("[DEBUG] load_into_handle: SINGLE SUCCESS (init took %lld ms)",
-         init_duration.count());
+         (long long)init_duration.count());
   } catch (...) {
     // RTTI may not match across shared libraries — query the current
     // exception's typeinfo directly via the Itanium ABI hook. This
@@ -1480,9 +1480,6 @@ static ErrorCode load_into_handle(CausalLmModel &h, BackendType compute,
     try {
       throw;
     } catch (const std::exception &e) {
-      LOGE("[DEBUG] load_into_handle: rethrown std::exception what()=%s",
-           e.what());
-    } catch (const std::invalid_argument &e) {
       LOGE("[DEBUG] load_into_handle: rethrown std::exception what()=%s",
            e.what());
     } catch (...) {

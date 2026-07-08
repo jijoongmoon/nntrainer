@@ -3,19 +3,22 @@
 # there. NOTE: models/causal_lm.cpp still calls streamer_put()/streamer_end()
 # (declared in api/streamer.h). streamer.cpp is self-contained (only depends
 # on streamer.h, no other api/ sources), so it is re-added directly to
-# causallm_src below (Slice E / E4, UNVERIFIED — this standalone
-# enable-transformer build is not exercised by QuickAI's ./build.sh).
+# causallm_src below (Slice E / E4).
 #
-# TODO(Slice E follow-up, UNVERIFIED): the rest of api/ (quick_dot_ai_api,
-# model_callbacks, model_config, model_descriptors_public, callback_streamer)
-# has no mirrored target here, unlike QuickAI's api/meson.build. Building one
-# would additionally require: an `enable-api` option (doesn't exist in this
-# tree's meson_options.txt), the xgrammar dependency wired up (the
-# `xgrammar/` checkout under this directory is currently unreferenced by any
-# meson.build here), and QNN model registration sources that live under
-# QuickAI's src/models/qnn, outside this submodule. Left as a TODO rather
-# than attempted blind, since none of it can be verified from this repo
-# alone.
+# E4 (this block, gated on get_option('enable-api')): provides the
+# libquick_dot_ai_api.so target mirroring QuickAI's api/meson.build, so this
+# submodule's own standalone build can produce the API layer without
+# QuickAI's root meson project. Unlike QuickAI's api/meson.build — which
+# borrows the xgrammar wrapper + xgrammar library symbols from
+# quick_dot_ai_dep (the Gauss plugin target, built below) — there is no
+# plugin target in this standalone tree, so quick_dot_ai_api here compiles
+# the xgrammar wrapper (api/xgrammar_wrapper.cpp, api/xgrammar_manager.cpp)
+# and the xgrammar library sources itself (see quick_dot_ai_api_xgrammar_src
+# below), keeping a single XGrammarManager singleton within the one shared
+# library. Scope is CPU/public-only: ENABLE_QNN_MODELS is never defined here,
+# so the QNN-gated code paths in api/quick_dot_ai_api.cpp compile out.
+# QNN model registration (QuickAI's src/models/qnn) is out of scope for E4
+# and remains a later step, tracked separately.
 causallm_src = [
     meson.current_source_dir() / 'chat_template.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
@@ -241,10 +244,93 @@ e_safetensors_info = executable('nntr_safetensors_info',
 )
 
 
-# NOTE: the api/test_api.cpp + 'test_api' executable target were removed here
-# (UNVERIFIED — this standalone meson.build is not exercised by QuickAI's
-# ./build.sh, see Move Slice B doc). test_api.cpp used the removed global
-# runModel() API and has no replacement in this standalone build yet.
+# ── E4: libquick_dot_ai_api.so (+ quick_dot_ai_test smoke exe) ──────────
+# Mirrors QuickAI's api/meson.build, but — since this standalone tree has no
+# Gauss plugin target to borrow xgrammar symbols from — compiles the
+# xgrammar wrapper and xgrammar library sources directly into
+# quick_dot_ai_api itself (single copy, single XGrammarManager singleton).
+# CPU/public-only: ENABLE_QNN_MODELS is never defined for this target.
+if get_option('enable-api')
+  quick_dot_ai_api_inc = [
+    causallm_inc,
+    causallm_inc_minja_inc,
+    causallm_inc_nlohmann_inc,
+    include_directories('api'),
+    include_directories('xgrammar' / 'include'),
+    include_directories('xgrammar' / '3rdparty' / 'picojson'),
+    include_directories('xgrammar' / '3rdparty' / 'dlpack' / 'include'),
+  ]
+
+  quick_dot_ai_api_src = [
+    meson.current_source_dir() / 'api' / 'quick_dot_ai_api.cpp',
+    meson.current_source_dir() / 'api' / 'model_callbacks.cpp',
+    meson.current_source_dir() / 'api' / 'model_config.cpp',
+    meson.current_source_dir() / 'api' / 'model_descriptors_public.cpp',
+    meson.current_source_dir() / 'api' / 'streamer.cpp',
+    meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
+  ]
+
+  # xgrammar wrapper: bridges causallm::XGrammar to the xgrammar library.
+  # Compiled once here (see block comment above causallm_src for why).
+  quick_dot_ai_api_xgrammar_wrapper_src = [
+    meson.current_source_dir() / 'api' / 'xgrammar_wrapper.cpp',
+    meson.current_source_dir() / 'api' / 'xgrammar_manager.cpp',
+  ]
+
+  # xgrammar library sources (from the xgrammar submodule checkout under
+  # this directory). Mirrors QuickAI's src/meson.build xgrammar_lib_src list.
+  quick_dot_ai_api_xgrammar_lib_src = [
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'compiled_grammar.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'config.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'earley_parser.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'fsm_builder.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'fsm.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_builder.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_compiler.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_functor.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_matcher.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_parser.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar_printer.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'grammar.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'json_schema_converter_ext.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'json_schema_converter.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'regex_converter.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'structural_tag.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'tokenizer_info.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'testing.cc',
+    # Support files (required for linking)
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'support' / 'logging.cc',
+    meson.current_source_dir() / 'xgrammar' / 'cpp' / 'support' / 'recursion_guard.cc',
+  ]
+
+  quick_dot_ai_api_lib = shared_library('quick_dot_ai_api',
+    quick_dot_ai_api_src,
+    quick_dot_ai_api_xgrammar_wrapper_src,
+    quick_dot_ai_api_xgrammar_lib_src,
+    include_directories: quick_dot_ai_api_inc,
+    dependencies: [nntrainer_dep, causallm_dep, dependency('threads')],
+    # nntrainer's root project() sets werror=true (QuickAI's sets
+    # werror=false). The vendored xgrammar sources were only ever compiled
+    # under QuickAI's relaxed setting and are not warning-clean under
+    # nntrainer's stricter one. Relax werror for this target only, mirroring
+    # QuickAI's own project-wide policy, rather than patching third-party
+    # source here. (api/*.cpp is warning-clean and doesn't need this.)
+    override_options: ['werror=false'],
+    install: true,
+  )
+
+  quick_dot_ai_api_dep = declare_dependency(
+    link_with: quick_dot_ai_api_lib,
+    include_directories: include_directories('api'),
+    dependencies: [causallm_dep],
+  )
+
+  executable('quick_dot_ai_test',
+    meson.current_source_dir() / 'api-app' / 'test_api.cpp',
+    dependencies: [quick_dot_ai_api_dep],
+    install: false,
+  )
+endif
 
 # KVCacheManager unit tests
 if get_option('enable-test')
