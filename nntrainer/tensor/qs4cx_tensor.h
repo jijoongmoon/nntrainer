@@ -215,6 +215,24 @@ public:
   void pack() override;
 
   /**
+   * @brief Eagerly build the fp16-activation KAI rhs after loading
+   * @note Byte-identical to the buffer HalfTensor::dot's QS4CX case assembles
+   * lazily on its first call (plain -> Section A -> fp16 scales ->
+   * assembleKaiRhsPacked), so this only moves WHEN it is built. The layout is
+   * NOT interchangeable with pack()'s fp32-facade rhs; repack_weight() picks
+   * one of the two by the model's activation dtype. ARM-only (no-op
+   * elsewhere, mirroring pack()'s NYI behavior on x86).
+   */
+  void packF16Activation() override;
+
+  /**
+   * @copydoc TensorBase::isPackedF16Activation()
+   */
+  bool isPackedF16Activation() const override {
+    return packed_f16 && packed_data != nullptr;
+  }
+
+  /**
    * @copydoc Tensor::read(std::ifstream &file, size_t, bool)
    * @note When this tensor is flagged on-disk-legacy-QINT4
    *   (setOnDiskLegacyQint4), the record is a legacy QINT4 (u16 header + KAI
@@ -252,6 +270,8 @@ private:
   bool isValid() const override { return true; }
 
   std::unique_ptr<uint8_t[]> packed_data = nullptr;
+  bool packed_f16 = false; /**< packed_data holds the fp16-activation KAI rhs
+                              (packF16Activation), not pack()'s fp32 layout */
 };
 
 } // namespace nntrainer

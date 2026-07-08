@@ -746,20 +746,25 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::QS4CX: {
     // [weight 한벌] Host fp16 GEMM for an upstream QS4CX weight — e.g. the
     // Adreno lm_head (N=vocab) that exceeds the GPU image cap and falls back to
-    // host. Build the 4x4x32 KAI rhs-packed buffer from the plain QS4CX
-    // (nibbles + per-channel fp32 scale): plain -> Section-A
-    // (packPlainToSectionA), fp32 -> fp16 scales, then assembleKaiRhsPacked —
-    // and run the same fp16 KAI matmul as the QINT4 path. Cached by weight ptr.
+    // host. Preferred source of the 4x4x32 KAI rhs-packed buffer is the one
+    // Transformer::repack_weight() builds at load (packF16Activation, CPU
+    // engine); when that didn't run (GPU engine skips the repack loop), fall
+    // back to assembling it lazily from the plain QS4CX (nibbles + per-channel
+    // fp32 scale): plain -> Section-A (packPlainToSectionA), fp32 -> fp16
+    // scales, then assembleKaiRhsPacked — cached by weight ptr. Both sources
+    // are byte-identical; the fp16 KAI matmul is the same as the QINT4 path.
     // ARM-only (the fp16 KAI micro-kernel is i8mm; x86 throws NYI, but x86 uses
     // the GPU/CUDA QS4CX path instead).
     const unsigned int M = getDim().height();
     const unsigned int K = getDim().width();
     const unsigned int N = output.getDim().width();
-    const uint8_t *plain = input.getData<uint8_t>();
-    static std::map<const void *, std::vector<uint8_t>> qs4cx_rhs_cache;
-    static std::mutex qs4cx_rhs_mtx;
     const uint8_t *kai_rhs = nullptr;
-    {
+    if (input.isPackedF16Activation()) {
+      kai_rhs = input.getPackedData<uint8_t>();
+    } else {
+      const uint8_t *plain = input.getData<uint8_t>();
+      static std::map<const void *, std::vector<uint8_t>> qs4cx_rhs_cache;
+      static std::mutex qs4cx_rhs_mtx;
       std::lock_guard<std::mutex> lk(qs4cx_rhs_mtx);
       auto it = qs4cx_rhs_cache.find(plain);
       if (it == qs4cx_rhs_cache.end()) {

@@ -403,8 +403,17 @@ void Transformer::repack_weight() {
     ml_logd("repack_weight: skipped on GPU engine (consumes plain QS4CX blob)");
     return;
   }
+  // fp16-act graphs dispatch QS4CX FCs through HalfTensor::dot, whose KAI rhs
+  // is the fp16-scale layout (packF16Activation) — pack()'s fp32-facade rhs
+  // would be dead weight there (an unconsumed full extra copy of every FC in
+  // RAM, and ~11% of a 1K-run's CPU in kai_run_rhs_pack). fp32-act graphs
+  // dispatch through FloatTensor::dotQs4cx and need pack() as before.
+  const bool f16_act =
+    MODEL_TENSOR_TYPE.size() >= 5 &&
+    MODEL_TENSOR_TYPE.compare(MODEL_TENSOR_TYPE.size() - 5, 5, "-FP16") == 0;
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+    fn = [f16_act](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+                   void *) {
       auto weights = context.getWeights();
       for (auto &w : weights) {
         if (w->getVariableRef().getDataType() ==
@@ -415,7 +424,11 @@ void Transformer::repack_weight() {
           // directly. Skip-on-NYI so a single QS4CX weight set loads on every
           // backend (ARM packs, x86/GPU use the plain blob). [weight 한벌]
           try {
-            w->getVariableRef().pack();
+            if (f16_act) {
+              w->getVariableRef().packF16Activation();
+            } else {
+              w->getVariableRef().pack();
+            }
           } catch (const std::exception &e) {
             ml_logd("QS4CX pack skipped (engine consumes plain blob): %s",
                     e.what());

@@ -260,6 +260,19 @@ public:
   virtual void pack() {}
 
   /**
+   * @brief Pack the weight data eagerly for the fp16-activation KAI path
+   * @note Default implementation does nothing. QS4CX overrides this to build
+   * the fp16-scale KAI rhs consumed by HalfTensor::dot — a different byte
+   * layout than pack(), which builds the fp32-activation facade's rhs.
+   */
+  virtual void packF16Activation() {}
+
+  /**
+   * @brief Whether packF16Activation() has produced a packed buffer
+   */
+  virtual bool isPackedF16Activation() const { return false; }
+
+  /**
    * @brief     i data index
    * @retval    address of ith data
    */

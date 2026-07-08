@@ -13,6 +13,7 @@
 #include <tensor.h>
 
 #include <cstring>
+#include <fp16.h>
 #include <functional>
 #include <int4_utils.h>
 #include <limits>
@@ -135,6 +136,42 @@ void *QS4CX_Tensor::getPackedData() const {
   }
 
   return packed_data.get();
+}
+
+void QS4CX_Tensor::packF16Activation() {
+#if defined(__aarch64__) || defined(__arm__)
+  if (packed_data) {
+    return;
+  }
+
+  // fp16-activation KAI rhs, built once at load. Byte-identical to the buffer
+  // HalfTensor::dot's QS4CX case used to assemble lazily on its first forward
+  // call, so this changes when it is built, not what is computed. fp16-act
+  // graphs never touch pack()'s fp32-facade layout, so packed_data can hold
+  // this one instead — one packed copy in RAM instead of two.
+  const size_t K = height();
+  const size_t N = width();
+
+  std::vector<uint8_t> section_a(Int4Utils::kaiNibblePayloadBytes(N, K));
+  Int4Utils::packPlainToSectionA((const uint8_t *)getData(), N, K,
+                                 section_a.data());
+
+  std::vector<uint16_t> fp16_scales(N);
+  const float *scales = (const float *)getScale();
+  for (size_t n = 0; n < N; ++n)
+    fp16_scales[n] = compute_fp32_to_fp16(scales[n]);
+
+  std::vector<uint8_t> packed;
+  Int4Utils::assembleKaiRhsPacked(section_a.data(), fp16_scales.data(), N, K,
+                                  packed);
+
+  packed_data = std::make_unique<uint8_t[]>(packed.size());
+  std::memcpy(packed_data.get(), packed.data(), packed.size());
+  packed_f16 = true;
+#else
+  // The fp16 KAI micro-kernel is ARM(i8mm)-only; x86 CPU/GPU/CUDA consume the
+  // plain QS4CX blob. Leave unpacked so isPackedF16Activation() stays false.
+#endif
 }
 
 size_t QS4CX_Tensor::size() const {
