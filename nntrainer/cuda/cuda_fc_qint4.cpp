@@ -28,45 +28,44 @@
 #include <vector>
 
 #include <fp16.h>
-#include <int4_utils.h>
 #include <thread_manager.h>
 
 namespace nntrainer::cuda {
 
-// [weight 한벌] Convert a QS4CX plain weight (row-major nibbles + per-channel
-// fp32 scales) to a UVM (cudaMallocManaged) KAI Section-A nibble buffer + fp16
-// scale buffer, cached by the plain-weight pointer. UVM is host-AND-device
-// readable, so the existing QINT4 prewarm (CPU repack) + dp4a/cuBLAS GEMM
-// (device) treat it identically to a native QINT4 weight — same prewarmed fast
-// path, no per-call host->device staging. Done once at load; never under a
-// graph capture (cudaMallocManaged here would otherwise break it).
-bool cuda_fc_qs4cx_to_uvm_seca(const unsigned char *plain,
-                               const float *fp32_scales, unsigned int N,
-                               unsigned int K, const unsigned char **out_secA,
-                               const unsigned short **out_sc) {
-  static std::map<const void *, std::pair<unsigned char *, unsigned short *>>
-    cache;
+// [weight 한벌] The QS4CX plain payload (row-major [N][(K+1)/2] nibbles,
+// stored uint4 = int4+8, even k = low nibble) is consumed by the CUDA FC
+// paths DIRECTLY, the way the OpenCL v8c kernel consumes it: the derived
+// device-only caches (dp4a packed-int4 / cuBLAS int8) are built straight from
+// it and keyed by its pointer, so no host/UVM Section-A copy of the nibble
+// payload exists anymore (it used to double every FC weight's host RSS —
+// CUDA 2x vs OpenCL 1x). The only per-weight side allocation left is this
+// N-entry fp16 scale buffer: the dequant kernels read the per-channel scale
+// on device every call, while the tensor stores fp32 scales. UVM (host+device
+// readable, host-readable matters for the _resident staging path), built once
+// at load, cached by the fp32-scale pointer with no erase (weights live for
+// the process lifetime), never under a graph capture.
+bool cuda_fc_qs4cx_scales_to_uvm_fp16(const float *fp32_scales, unsigned int N,
+                                      const unsigned short **out_sc) {
+  static std::map<const void *, unsigned short *> cache;
   static std::mutex mtx;
   std::lock_guard<std::mutex> lk(mtx);
-  auto it = cache.find(plain);
+  auto it = cache.find(fp32_scales);
   if (it == cache.end()) {
-    const size_t secA_bytes = Int4Utils::kaiNibblePayloadBytes(N, K);
-    unsigned char *usecA = nullptr;
+    // cudaMallocManaged inside a CUDA-graph capture invalidates the capture;
+    // the load-time prewarm builds this before any capture, so a miss here
+    // under capture only happens on an un-prewarmed weight -- bail so the
+    // caller falls back instead of corrupting the graph.
+    if (StreamManager::Global().isCapturing())
+      return false;
     unsigned short *usc = nullptr;
-    if (cudaMallocManaged(&usecA, secA_bytes) != cudaSuccess)
-      return false;
     if (cudaMallocManaged(&usc, sizeof(unsigned short) * (size_t)N) !=
-        cudaSuccess) {
-      cudaFree(usecA);
+        cudaSuccess)
       return false;
-    }
-    Int4Utils::packPlainToSectionA(plain, (size_t)N, (size_t)K, usecA);
     for (unsigned int n = 0; n < N; ++n)
       usc[n] = compute_fp32_to_fp16(fp32_scales[n]);
-    it = cache.emplace(plain, std::make_pair(usecA, usc)).first;
+    it = cache.emplace(fp32_scales, usc).first;
   }
-  *out_secA = it->second.first;
-  *out_sc = it->second.second;
+  *out_sc = it->second;
   return true;
 }
 
@@ -127,22 +126,17 @@ extern "C" __global__ void fc_qint4_gemm(const float *X,
 )CU";
 
 // One thread per output Y[m,n]. Loops K, decoding the signed int4 weight for
-// (n, k) straight from the KAI Section-A super-row payload by inverting
-// Int4Utils::packPlainToSectionA (NR=4, KR=16, SR=2, 16-K interleave,
-// block_length=8, byte = plain_nibbles ^ 0x88). Constants are baked in. The
-// per-output-channel fp16 scale (one per n) is read once and converted to fp32
-// with a self-contained half->float (no NVRTC header dependency). float accum.
-//   k_internal = roundup(K,32); for a loaded weight K%32==0 so k_internal==K.
-//   stride (nibble_bytes_per_super_row) = NR*(k_internal/2) = 2*k_internal.
-// Inverse index for (n,k): a=k/32, r=k%32, is_high=(r>=16),
-//   kb = is_high? r-16 : r,  t = 16*a + kb,
-//   byte_off = (n/4)*2*k_internal + ((t/8)*4 + (n%4))*8 + (t%8),
-//   nib = is_high ? hi-nibble : lo-nibble of section_a[byte_off],
-//   int4 = (nib ^ 8) - 8.
-static const char *FC_QINT4_SECA_SRC = R"CU(
+// (n, k) straight from the QS4CX PLAIN payload: row-major [N][(K+1)/2] bytes,
+// even k = low nibble, odd k = high nibble, stored uint4 = int4 + 8 (matches
+// Int4Utils::quantizePlain; same decode the OpenCL v8c kernel uses). The
+// per-output-channel fp16 scale (one per n) is read once and converted to
+// fp32 with a self-contained half->float (no NVRTC header dependency). float
+// accum. An odd-K pad nibble is stored as uint4 8 = int4 0, but the k-loop
+// never reads it anyway.
+static const char *FC_QINT4_PLAIN_SRC = R"CU(
 extern "C" {
 
-__device__ __forceinline__ float seca_h2f(unsigned short h) {
+__device__ __forceinline__ float plain_h2f(unsigned short h) {
   unsigned int sign = ((unsigned int)(h & 0x8000u)) << 16;
   unsigned int exp = (h >> 10) & 0x1Fu;
   unsigned int mant = h & 0x3FFu;
@@ -164,61 +158,50 @@ __device__ __forceinline__ float seca_h2f(unsigned short h) {
   return __int_as_float((int)out);
 }
 
-__global__ void fc_qint4_seca_gemm(const float *X, const unsigned char *secA,
-                                   const unsigned short *sc, float *Y, int M,
-                                   int N, int K, int k_internal) {
+__global__ void fc_qint4_plain_gemm(const float *X, const unsigned char *W,
+                                    const unsigned short *sc, float *Y, int M,
+                                    int N, int K, int Kh) {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   int m = blockIdx.y * blockDim.y + threadIdx.y;
   if (m >= M || n >= N)
     return;
-  const int stride = 2 * k_internal;        // bytes per super-row
-  const int base = (n >> 2) * stride;        // super-row start
-  const int nr_idx = n & 3;
+  const unsigned char *wrow = W + (long)n * Kh;
   const float *xr = X + (long)m * K;
   float acc = 0.f;
   for (int k = 0; k < K; ++k) {
-    int a = k >> 5;          // k / 32
-    int r = k & 31;          // k % 32
-    int is_high = (r >= 16) ? 1 : 0;
-    int kb = is_high ? (r - 16) : r;
-    int t = (a << 4) + kb;   // 16*a + kb
-    int byte_off = base + (((t >> 3) << 2) + nr_idx) * 8 + (t & 7);
-    unsigned char s = secA[byte_off];
-    int nib = is_high ? ((s >> 4) & 0xF) : (s & 0xF);
-    int q = (nib ^ 8) - 8;   // signed int4 in [-8,7]
-    acc += xr[k] * (float)q;
+    unsigned char b = wrow[k >> 1];
+    int nib = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
+    acc += xr[k] * (float)(nib - 8);
   }
-  Y[(long)m * N + n] = acc * seca_h2f(sc[n]);
+  Y[(long)m * N + n] = acc * plain_h2f(sc[n]);
 }
 
 }
 )CU";
 
-bool cuda_fc_qint4_sectionA_gemm_fp32(const float *X,
-                                      const unsigned char *section_a,
-                                      const unsigned short *scales_fp16,
-                                      float *Y, unsigned int M, unsigned int N,
-                                      unsigned int K) {
+bool cuda_fc_qs4cx_gemm_fp32(const float *X, const unsigned char *plain_w,
+                             const unsigned short *scales_fp16, float *Y,
+                             unsigned int M, unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
 
-  auto kernel = CudaContext::Global().registerCudaKernel(FC_QINT4_SECA_SRC,
-                                                         "fc_qint4_seca_gemm");
+  auto kernel = CudaContext::Global().registerCudaKernel(FC_QINT4_PLAIN_SRC,
+                                                         "fc_qint4_plain_gemm");
   if (!kernel) {
-    ml_loge("[CUDA] fc_qint4_seca: kernel registration failed");
+    ml_loge("[CUDA] fc_qint4_plain: kernel registration failed");
     return false;
   }
 
   int m = (int)M, n = (int)N, k = (int)K;
-  int k_internal = (int)(((K + 31u) / 32u) * 32u);
+  int kh = (int)((K + 1u) / 2u);
   kernel->SetKernelArguments(0, &X, sizeof(X));
-  kernel->SetKernelArguments(1, &section_a, sizeof(section_a));
+  kernel->SetKernelArguments(1, &plain_w, sizeof(plain_w));
   kernel->SetKernelArguments(2, &scales_fp16, sizeof(scales_fp16));
   kernel->SetKernelArguments(3, &Y, sizeof(Y));
   kernel->SetKernelArguments(4, &m, sizeof(m));
   kernel->SetKernelArguments(5, &n, sizeof(n));
   kernel->SetKernelArguments(6, &k, sizeof(k));
-  kernel->SetKernelArguments(7, &k_internal, sizeof(k_internal));
+  kernel->SetKernelArguments(7, &kh, sizeof(kh));
 
   const int block[3] = {16, 16, 1};
   const int grid[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
@@ -229,11 +212,11 @@ bool cuda_fc_qint4_sectionA_gemm_fp32(const float *X,
 }
 
 namespace {
-// Device mirror of a host-resident QINT4 weight + reusable activation/output
-// staging buffers. Weights are constant for the model lifetime, so the
-// Section-A payload + scales are uploaded once and cached by host pointer.
+// Device mirror of a host-resident QS4CX weight + reusable activation/output
+// staging buffers. Weights are constant for the model lifetime, so the plain
+// nibble payload + fp16 scales are uploaded once and cached by host pointer.
 struct DevWeight {
-  unsigned char *d_secA = nullptr;
+  unsigned char *d_w = nullptr;
   unsigned short *d_sc = nullptr;
 };
 std::unordered_map<const void *, DevWeight> g_qint4_weight_cache;
@@ -265,33 +248,31 @@ bool ensure_stage(float **buf, size_t *cap, size_t bytes) {
 }
 } // namespace
 
-bool cuda_fc_qint4_sectionA_gemm_fp32_resident(const float *host_X,
-                                               const unsigned char *host_secA,
-                                               const unsigned short *host_scales,
-                                               float *host_Y, unsigned int M,
-                                               unsigned int N, unsigned int K) {
+bool cuda_fc_qs4cx_gemm_fp32_resident(const float *host_X,
+                                      const unsigned char *host_plain,
+                                      const unsigned short *host_scales,
+                                      float *host_Y, unsigned int M,
+                                      unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
   std::lock_guard<std::mutex> lk(g_qint4_mtx);
 
   // 1) device weight (upload once, cache by host pointer).
-  auto it = g_qint4_weight_cache.find(host_secA);
+  auto it = g_qint4_weight_cache.find(host_plain);
   if (it == g_qint4_weight_cache.end()) {
-    const unsigned k_internal = ((K + 31u) / 32u) * 32u;
-    const size_t secA_bytes =
-      (size_t)(((N + 3u) / 4u) * 4u) * (k_internal / 2u);
+    const size_t w_bytes = (size_t)N * ((K + 1u) / 2u);
     DevWeight dw;
-    if (cudaMalloc(&dw.d_secA, secA_bytes) != cudaSuccess)
+    if (cudaMalloc(&dw.d_w, w_bytes) != cudaSuccess)
       return false;
     if (cudaMalloc(&dw.d_sc, sizeof(unsigned short) * (size_t)N) !=
         cudaSuccess) {
-      cudaFree(dw.d_secA);
+      cudaFree(dw.d_w);
       return false;
     }
-    cudaMemcpy(dw.d_secA, host_secA, secA_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw.d_w, host_plain, w_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(dw.d_sc, host_scales, sizeof(unsigned short) * (size_t)N,
                cudaMemcpyHostToDevice);
-    it = g_qint4_weight_cache.emplace(host_secA, dw).first;
+    it = g_qint4_weight_cache.emplace(host_plain, dw).first;
   }
 
   // 2) stage activation in, output buffer out (grown as needed).
@@ -303,8 +284,8 @@ bool cuda_fc_qint4_sectionA_gemm_fp32_resident(const float *host_X,
   cudaMemcpy(g_stage_x, host_X, xb, cudaMemcpyHostToDevice);
 
   // 3) device GEMM (synchronizes the backend stream internally).
-  if (!cuda_fc_qint4_sectionA_gemm_fp32(g_stage_x, it->second.d_secA,
-                                        it->second.d_sc, g_stage_y, M, N, K))
+  if (!cuda_fc_qs4cx_gemm_fp32(g_stage_x, it->second.d_w, it->second.d_sc,
+                               g_stage_y, M, N, K))
     return false;
 
   // 4) output back to the host tensor.
@@ -317,9 +298,10 @@ bool cuda_fc_qint4_sectionA_gemm_fp32_resident(const float *host_X,
 // w4a8 dp4a fast path
 // ===========================================================================
 // Three NVRTC kernels (one module): per-row int8 activation quant, a one-time
-// Section-A -> plain row-major int4 repack (reuses the validated inverse
-// mapping), and a __dp4a int8xint4 GEMM. Compiled for the device arch
-// (compute_89 on Ada), so __dp4a lowers to the dp4a PTX instruction.
+// QS4CX-plain -> signed packed int4 repack (a byte-wise XOR — same indexing,
+// only the nibble encoding differs), and a __dp4a int8xint4 GEMM. Compiled for
+// the device arch (compute_89 on Ada), so __dp4a lowers to the dp4a PTX
+// instruction.
 static const char *FC_QINT4_DP4A_SRC = R"CU(
 extern "C" {
 
@@ -467,19 +449,13 @@ __global__ void cvt_h2f(const unsigned short *src, float *dst, int n) {
     dst[i] = dp4a_h2f(src[i]);
 }
 
-// signed int4 weight for (output n, input k) from the Section-A payload.
-__device__ __forceinline__ int seca_decode(const unsigned char *secA, int n,
-                                            int k, int k_internal) {
-  int a = k >> 5, r = k & 31;
-  int is_high = (r >= 16) ? 1 : 0;
-  int kb = is_high ? (r - 16) : r;
-  int t = (a << 4) + kb;
-  int nr_idx = n & 3;
-  int byte_off = (n >> 2) * (2 * k_internal) + (((t >> 3) << 2) + nr_idx) * 8 +
-                 (t & 7);
-  unsigned char s = secA[byte_off];
-  int nib = is_high ? ((s >> 4) & 0xF) : (s & 0xF);
-  return (nib ^ 8) - 8;
+// signed int4 weight for (output n, input k) from the QS4CX plain payload
+// (row-major [N][Kh] bytes, even k = low nibble, stored uint4 = int4+8).
+__device__ __forceinline__ int plain_decode(const unsigned char *qw, int n,
+                                            int k, int Kh) {
+  unsigned char b = qw[(long)n * Kh + (k >> 1)];
+  int nib = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
+  return nib - 8;
 }
 
 // per-row asymmetric int8 quant of the activation (one block per row).
@@ -521,21 +497,22 @@ __global__ void act_quant_i8(const float *X, signed char *q8, float *ascale,
   }
 }
 
-// Section-A -> plain row-major int4 [N, ceil(K/2)]: byte[n][kb] low nibble =
+// QS4CX plain -> signed packed int4 [N, ceil(K/2)]: byte[n][kb] low nibble =
 // int4(n, 2kb), high nibble = int4(n, 2kb+1), each stored two's-complement.
-__global__ void repack_seca_i4(const unsigned char *secA, signed char *plain,
-                               int N, int K, int k_internal) {
-  int kb = blockIdx.x * blockDim.x + threadIdx.x;
-  int n = blockIdx.y * blockDim.y + threadIdx.y;
-  int Kh = (K + 1) >> 1;
-  if (n >= N || kb >= Kh)
-    return;
-  int k0 = 2 * kb, k1 = 2 * kb + 1;
-  int v0 = seca_decode(secA, n, k0, k_internal);
-  int v1 = (k1 < K) ? seca_decode(secA, n, k1, k_internal) : 0;
-  plain[(long)n * Kh + kb] = (signed char)((v0 & 0xF) | ((v1 & 0xF) << 4));
+// The source has the SAME [N][Kh] byte indexing with uint4 = int4+8 nibbles,
+// and (x-8)&0xF == x^8 on a 4-bit lane, so the whole repack is one byte-wise
+// XOR with 0x88 (an odd-K pad nibble 8 becomes signed 0, as before).
+__global__ void repack_plain_i4(const unsigned char *qw, signed char *packed,
+                                int N, int Kh) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < (long long)N * Kh)
+    packed[i] = (signed char)(qw[i] ^ 0x88);
 }
 
+)CU"
+// NOTE: split here into two adjacent raw-string literals — MSVC caps a single
+// string literal at 16380 bytes (C2026); the two concatenate byte-identically.
+R"CU(
 // Y[m,n] = recip[m]*w_scale[n]*(sum_k q8[m,k]*int4(n,k) - zp[m]*rowsum_w[n]),
 // the asymmetric-activation dequant (zp from act_quant, rowsum_w from the
 // weight). via __dp4a.
@@ -717,16 +694,16 @@ __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
 // int32 GEMM result is bit-identical to the __dp4a acc, so the SAME dequant
 // applies in the epilogue.
 
-// int4 Section-A weight -> int8 [K,N] (w8[k*N+n] = int4(n,k)). Unpacked once and
+// int4 plain weight -> int8 [K,N] (w8[k*N+n] = int4(n,k)). Unpacked once and
 // cached (weights are static), so cuBLAS reads contiguous int8 -- doing this per
 // call would add a memory pass that erases the Tensor-Core win.
-__global__ void repack_seca_i8_kn(const unsigned char *secA, signed char *w8,
-                                  int N, int K, int k_internal) {
+__global__ void repack_plain_i8_kn(const unsigned char *qw, signed char *w8,
+                                   int N, int K, int Kh) {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   int k = blockIdx.y * blockDim.y + threadIdx.y;
   if (n >= N || k >= K)
     return;
-  w8[(long)k * N + n] = (signed char)seca_decode(secA, n, k, k_internal);
+  w8[(long)k * N + n] = (signed char)plain_decode(qw, n, k, Kh);
 }
 
 // per-output-channel sum of the int8 weight column (k-strided), for the
@@ -761,14 +738,15 @@ __global__ void dequant_i32_fp16(const int *C, const float *ascale,
 )CU";
 
 namespace {
-// cached plain-int4 repack of each Section-A weight (keyed by host/UVM pointer).
+// cached signed-packed-int4 repack of each QS4CX weight (keyed by the plain
+// host/UVM payload pointer = weight.getData()).
 struct DevWeightQ {
-  signed char *plain = nullptr; // plain row-major int4 [N, ceil(K/2)]
+  signed char *plain = nullptr; // signed packed int4 [N, ceil(K/2)]
   int *rowsum = nullptr;        // per-channel sum of signed int4 [N]
 };
 std::unordered_map<const void *, DevWeightQ> g_dp4a_plain_cache;
 // int8-unpacked weight [K,N] + per-channel rowsum, for the cuBLAS int8 path
-// (keyed by the Section-A host/UVM pointer; unpacked once, weights are static).
+// (keyed by the QS4CX plain payload pointer; unpacked once, weights are static).
 struct DevWeightI8 {
   signed char *w8 = nullptr; // int8 weight [K,N] (w8[k*N+n] = int4(n,k))
   int *rowsum = nullptr;     // per-channel sum of int8 weight [N]
@@ -810,15 +788,14 @@ std::mutex g_dp4a_mtx;
 
 // repack (cached) + GEMM into a device float Y, using the already-staged
 // q8/ascale scratch. Caller holds g_dp4a_mtx and has run act-quant.
-bool dp4a_repack_and_gemm(const unsigned char *section_a,
+bool dp4a_repack_and_gemm(const unsigned char *plain_w,
                           const unsigned short *scales_fp16, float *Yf,
                           unsigned int M, unsigned int N, unsigned int K,
                           int out_fp16 = 0) {
   const int n = (int)N, k = (int)K;
-  const int k_internal = (int)(((K + 31u) / 32u) * 32u);
   const size_t Kh = (K + 1u) / 2u;
   auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
-                                                     "repack_seca_i4");
+                                                     "repack_plain_i4");
   auto krs = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                       "weight_rowsum");
   const bool gemv = (M == 1);
@@ -829,7 +806,7 @@ bool dp4a_repack_and_gemm(const unsigned char *section_a,
   if (!kr || !krs || !kg)
     return false;
 
-  auto it = g_dp4a_plain_cache.find(section_a);
+  auto it = g_dp4a_plain_cache.find(plain_w);
   if (it == g_dp4a_plain_cache.end()) {
     DevWeightQ dw;
     if (cudaMalloc(&dw.plain, (size_t)N * Kh) != cudaSuccess)
@@ -838,13 +815,13 @@ bool dp4a_repack_and_gemm(const unsigned char *section_a,
       cudaFree(dw.plain);
       return false;
     }
-    kr->SetKernelArguments(0, &section_a, sizeof(section_a));
+    const int khi = (int)Kh;
+    kr->SetKernelArguments(0, &plain_w, sizeof(plain_w));
     kr->SetKernelArguments(1, &dw.plain, sizeof(dw.plain));
     kr->SetKernelArguments(2, &n, sizeof(n));
-    kr->SetKernelArguments(3, &k, sizeof(k));
-    kr->SetKernelArguments(4, &k_internal, sizeof(k_internal));
-    const int rb[3] = {16, 16, 1};
-    const int rg[3] = {((int)Kh + 15) / 16, ((int)N + 15) / 16, 1};
+    kr->SetKernelArguments(3, &khi, sizeof(khi));
+    const int rb[3] = {256, 1, 1};
+    const int rg[3] = {(int)(((size_t)N * Kh + 255) / 256), 1, 1};
     if (!StreamManager::Global().DispatchCommand(*kr, rg, rb)) {
       cudaFree(dw.plain);
       cudaFree(dw.rowsum);
@@ -862,7 +839,7 @@ bool dp4a_repack_and_gemm(const unsigned char *section_a,
       cudaFree(dw.rowsum);
       return false;
     }
-    it = g_dp4a_plain_cache.emplace(section_a, dw).first;
+    it = g_dp4a_plain_cache.emplace(plain_w, dw).first;
   }
   signed char *plain = it->second.plain;
   int *wrowsum = it->second.rowsum;
@@ -989,96 +966,79 @@ const unsigned short *cuda_fc_qint4_stage_host_x_fp16(const unsigned short *host
   return g_stage_xh;
 }
 
-// Stage a HOST-resident QINT4 section-A weight + scales into cached device
+// Stage a HOST-resident QS4CX plain weight + fp16 scales into cached device
 // buffers and return the device pointers. A model-load timing race can leave a
-// weight in plain host memory (cudaPointerGetAttributes type Unregistered)
-// instead of the managed pool; the dp4a repack kernel reads section_a on the
-// GPU, so a host pointer makes the cudaFcGemm gate fall to the i8mm host dot,
-// which SIGILLs on Orin (no i8mm). Reuses g_qint4_weight_cache (weights are
-// constant, uploaded once, keyed by host section_a). Uploads happen on the
-// first/prefill forward, NOT under graph capture; bails if asked to allocate
-// under capture so the caller can fall back. Returns false on failure.
-bool cuda_fc_qint4_stage_host_weight(const unsigned char *host_secA,
+// weight in unregistered host memory (cudaPointerGetAttributes Unregistered)
+// instead of the managed pool; the dp4a repack kernel reads the plain payload
+// on the GPU, so a host pointer makes the cudaFcGemm gate fall to the i8mm
+// host dot, which SIGILLs on Orin (no i8mm). Reuses g_qint4_weight_cache
+// (weights are constant, uploaded once, keyed by the host plain pointer).
+// Uploads happen on the first/prefill forward, NOT under graph capture; bails
+// if asked to allocate under capture so the caller can fall back. Returns
+// false on failure.
+bool cuda_fc_qs4cx_stage_host_weight(const unsigned char *host_plain,
                                      const unsigned short *host_scales,
                                      unsigned int N, unsigned int K,
-                                     const unsigned char **dev_secA,
+                                     const unsigned char **dev_w,
                                      const unsigned short **dev_scales) {
-  if (host_secA == nullptr || host_scales == nullptr || N == 0 || K == 0)
+  if (host_plain == nullptr || host_scales == nullptr || N == 0 || K == 0)
     return false;
   std::lock_guard<std::mutex> lk(g_qint4_mtx);
-  auto it = g_qint4_weight_cache.find(host_secA);
+  auto it = g_qint4_weight_cache.find(host_plain);
   if (it == g_qint4_weight_cache.end()) {
     if (StreamManager::Global().isCapturing())
       return false;
-    const unsigned k_internal = ((K + 31u) / 32u) * 32u;
-    const size_t secA_bytes =
-      (size_t)(((N + 3u) / 4u) * 4u) * (k_internal / 2u);
+    const size_t w_bytes = (size_t)N * ((K + 1u) / 2u);
     DevWeight dw;
-    if (cudaMalloc(&dw.d_secA, secA_bytes) != cudaSuccess) {
+    if (cudaMalloc(&dw.d_w, w_bytes) != cudaSuccess) {
       cudaGetLastError();
       return false;
     }
     if (cudaMalloc(&dw.d_sc, sizeof(unsigned short) * (size_t)N) !=
         cudaSuccess) {
-      cudaFree(dw.d_secA);
+      cudaFree(dw.d_w);
       cudaGetLastError();
       return false;
     }
-    cudaMemcpy(dw.d_secA, host_secA, secA_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw.d_w, host_plain, w_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(dw.d_sc, host_scales, sizeof(unsigned short) * (size_t)N,
                cudaMemcpyHostToDevice);
-    it = g_qint4_weight_cache.emplace(host_secA, dw).first;
+    it = g_qint4_weight_cache.emplace(host_plain, dw).first;
   }
-  *dev_secA = it->second.d_secA;
+  *dev_w = it->second.d_w;
   *dev_scales = it->second.d_sc;
   return true;
 }
 
-// CPU mirror of the device seca_decode: signed int4 weight for (output channel
-// n, input k) from the KAI Section-A payload. Must match the GPU exactly so the
-// prewarmed cache is bit-identical to the repack_seca_i4 kernel.
-static inline int seca_decode_cpu(const unsigned char *secA, int n, int k,
-                                  int k_internal) {
-  int a = k >> 5, r = k & 31;
-  int is_high = (r >= 16) ? 1 : 0;
-  int kb = is_high ? (r - 16) : r;
-  int t = (a << 4) + kb;
-  int nr_idx = n & 3;
-  long byte_off = (long)(n >> 2) * (2 * k_internal) +
-                  (((t >> 3) << 2) + nr_idx) * 8 + (t & 7);
-  unsigned char s = secA[byte_off];
-  int nib = is_high ? ((s >> 4) & 0xF) : (s & 0xF);
-  return (nib ^ 8) - 8;
-}
-
-// Prewarm the dp4a plain-int4 weight cache on the CPU at LOAD (nntrainer
+// Prewarm the dp4a packed-int4 weight cache on the CPU at LOAD (nntrainer
 // ThreadManager-parallel), so the first inference does not pay the one-time
-// Section-A -> plain int4 repack (nsys: ~38% of the cold-run GPU time) and the
-// GPU is free of it. Mirrors repack_seca_i4 + weight_rowsum bit-exactly, then
-// uploads the plain int4 + per-channel rowsum to the device cache (keyed by the
-// Section-A pointer, same key the dp4a path looks up at forward). Idempotent.
-bool cuda_fc_qint4_prewarm(const unsigned char *section_a, unsigned int N,
+// plain -> signed packed int4 repack (nsys: ~38% of the cold-run GPU time when
+// it was the Section-A repack) and the GPU is free of it. Mirrors
+// repack_plain_i4 + weight_rowsum bit-exactly (the repack is a byte-wise
+// XOR 0x88, see the kernel comment), then uploads the packed int4 +
+// per-channel rowsum to the device cache (keyed by the plain payload pointer,
+// same key the dp4a path looks up at forward). Idempotent.
+bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
                            unsigned int K) {
-  if (section_a == nullptr || N == 0 || K == 0)
+  if (plain_w == nullptr || N == 0 || K == 0)
     return true;
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
-  if (g_dp4a_plain_cache.count(section_a))
+  if (g_dp4a_plain_cache.count(plain_w))
     return true; // already cached
-  const int k_internal = (int)(((K + 31u) / 32u) * 32u);
   const size_t Kh = (K + 1u) / 2u;
-  std::vector<signed char> plain((size_t)N * Kh);
+  std::vector<signed char> packed((size_t)N * Kh);
   std::vector<int> rowsum(N, 0);
   auto &tm = nntrainer::ThreadManager::Global();
   tm.parallel_for(0, (size_t)N, [&](size_t n) {
-    signed char *prow = plain.data() + n * Kh;
+    const unsigned char *src = plain_w + n * Kh;
+    signed char *prow = packed.data() + n * Kh;
     long acc = 0;
     for (size_t kb = 0; kb < Kh; ++kb) {
-      int k0 = 2 * (int)kb, k1 = k0 + 1;
-      int v0 = seca_decode_cpu(section_a, (int)n, k0, k_internal);
-      int v1 =
-        (k1 < (int)K) ? seca_decode_cpu(section_a, (int)n, k1, k_internal) : 0;
-      prow[kb] = (signed char)((v0 & 0xF) | ((v1 & 0xF) << 4));
-      acc += v0 + ((k1 < (int)K) ? v1 : 0);
+      const unsigned char b = src[kb];
+      prow[kb] = (signed char)(b ^ 0x88);
+      // odd-K pad nibble is stored 8 (= int4 0), so it adds 0 here -- same
+      // rowsum the old k1<K guard produced.
+      acc += ((int)(b & 0xF) - 8) + ((int)((b >> 4) & 0xF) - 8);
     }
     rowsum[n] = (int)acc;
   });
@@ -1089,23 +1049,25 @@ bool cuda_fc_qint4_prewarm(const unsigned char *section_a, unsigned int N,
     cudaFree(dw.plain);
     return false;
   }
-  cudaMemcpy(dw.plain, plain.data(), (size_t)N * Kh, cudaMemcpyHostToDevice);
+  cudaMemcpy(dw.plain, packed.data(), (size_t)N * Kh, cudaMemcpyHostToDevice);
   cudaMemcpy(dw.rowsum, rowsum.data(), sizeof(int) * (size_t)N,
              cudaMemcpyHostToDevice);
-  g_dp4a_plain_cache.emplace(section_a, dw);
+  g_dp4a_plain_cache.emplace(plain_w, dw);
 
   // Also prewarm the cuBLAS int8 [K,N] weight cache when the cuBLAS prefill FC
-  // path is on: otherwise its one-time GPU repack (repack_seca_i8_kn, ~32% of
+  // path is on: otherwise its one-time GPU repack (repack_plain_i8_kn, ~32% of
   // cold prefill GPU time) runs on the first prefill instead of at load. Mirrors
-  // repack_seca_i8_kn (w8[k*N+n]=int4(n,k)) + weight_rowsum_kn bit-exactly.
+  // repack_plain_i8_kn (w8[k*N+n]=int4(n,k)) + weight_rowsum_kn bit-exactly.
   static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
-  if (_cb && _cb[0] != '0' && !g_i8_weight_cache.count(section_a)) {
+  if (_cb && _cb[0] != '0' && !g_i8_weight_cache.count(plain_w)) {
     std::vector<signed char> w8((size_t)K * N);
     std::vector<int> rs8(N, 0);
     tm.parallel_for(0, (size_t)N, [&](size_t n) {
+      const unsigned char *src = plain_w + n * Kh;
       long acc = 0;
       for (int kk = 0; kk < (int)K; ++kk) {
-        int v = seca_decode_cpu(section_a, (int)n, kk, k_internal);
+        const unsigned char b = src[kk >> 1];
+        const int v = (int)((kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF)) - 8;
         w8[(long)kk * N + n] = (signed char)v;
         acc += v;
       }
@@ -1117,7 +1079,7 @@ bool cuda_fc_qint4_prewarm(const unsigned char *section_a, unsigned int N,
       cudaMemcpy(dw8.w8, w8.data(), (size_t)K * N, cudaMemcpyHostToDevice);
       cudaMemcpy(dw8.rowsum, rs8.data(), sizeof(int) * (size_t)N,
                  cudaMemcpyHostToDevice);
-      g_i8_weight_cache.emplace(section_a, dw8);
+      g_i8_weight_cache.emplace(plain_w, dw8);
     } else if (dw8.w8) {
       cudaFree(dw8.w8);
     }
@@ -1125,11 +1087,11 @@ bool cuda_fc_qint4_prewarm(const unsigned char *section_a, unsigned int N,
   return true;
 }
 
-bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
-                                           const unsigned char *section_a,
-                                           const unsigned short *scales_fp16,
-                                           float *Y, unsigned int M,
-                                           unsigned int N, unsigned int K) {
+bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X,
+                                  const unsigned char *plain_w,
+                                  const unsigned short *scales_fp16, float *Y,
+                                  unsigned int M, unsigned int N,
+                                  unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
   auto kq = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
@@ -1152,17 +1114,17 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp32(const float *X,
   const int qg[3] = {(int)M, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kq, qg, qb))
     return false;
-  if (!dp4a_repack_and_gemm(section_a, scales_fp16, Y, M, N, K))
+  if (!dp4a_repack_and_gemm(plain_w, scales_fp16, Y, M, N, K))
     return false;
   maybe_finish();
   return true;
 }
 
-bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
-                                           const unsigned char *section_a,
-                                           const unsigned short *scales_fp16,
-                                           unsigned short *Yh, unsigned int M,
-                                           unsigned int N, unsigned int K) {
+bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
+                                  const unsigned char *plain_w,
+                                  const unsigned short *scales_fp16,
+                                  unsigned short *Yh, unsigned int M,
+                                  unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
   auto kqh = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
@@ -1197,7 +1159,7 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
   // the FP32 staging buffer (one fewer kernel per FC -- a decode launch-overhead
   // win). (void)kc keeps the registration check above harmless.
   (void)kc;
-  if (!dp4a_repack_and_gemm(section_a, scales_fp16,
+  if (!dp4a_repack_and_gemm(plain_w, scales_fp16,
                             reinterpret_cast<float *>(Yh), M, N, K,
                             /*out_fp16=*/1))
     return false;
@@ -1211,8 +1173,8 @@ bool cuda_fc_qint4_sectionA_dp4a_gemm_fp16(const unsigned short *Xh,
 // int ALU (~10x the GEMM throughput at prefill M). The int32 accumulate is
 // exact so the result is bit-identical to dp4a; the int4->int8 weight unpack is
 // cached (one-time) to keep it off the per-call critical path.
-bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
-  const unsigned short *Xh, const unsigned char *section_a,
+bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
+  const unsigned short *Xh, const unsigned char *plain_w,
   const unsigned short *scales_fp16, unsigned short *Yh, unsigned int M,
   unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
@@ -1220,7 +1182,7 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
   auto kqh = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                       "act_quant_i8_h");
   auto krp = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
-                                                      "repack_seca_i8_kn");
+                                                      "repack_plain_i8_kn");
   auto krs = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                       "weight_rowsum_kn");
   auto kde = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
@@ -1240,7 +1202,7 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
   if (!dp4a_stage_scratch(Mpad, K))
     return false;
   const int m = (int)M, n = (int)N, k = (int)K, mpad = (int)Mpad;
-  const int k_internal = (int)(((K + 31u) / 32u) * 32u);
+  const int kh = (int)((K + 1u) / 2u);
 
   // 1) int8 activation quant from the fp16 input (reuse the dp4a quantizer).
   // Skip when this exact (Xh,K) was just quantized into g_dp4a_q8 by a sibling
@@ -1271,7 +1233,7 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
   }
 
   // 2) int8 weight [K,N] + per-channel rowsum (cached one-time unpack).
-  auto it = g_i8_weight_cache.find(section_a);
+  auto it = g_i8_weight_cache.find(plain_w);
   if (it == g_i8_weight_cache.end()) {
     DevWeightI8 dw;
     if (cudaMalloc(&dw.w8, (size_t)N * K + FC_I8_TAIL_PAD) != cudaSuccess)
@@ -1280,11 +1242,11 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
       cudaFree(dw.w8);
       return false;
     }
-    krp->SetKernelArguments(0, &section_a, sizeof(section_a));
+    krp->SetKernelArguments(0, &plain_w, sizeof(plain_w));
     krp->SetKernelArguments(1, &dw.w8, sizeof(dw.w8));
     krp->SetKernelArguments(2, &n, sizeof(n));
     krp->SetKernelArguments(3, &k, sizeof(k));
-    krp->SetKernelArguments(4, &k_internal, sizeof(k_internal));
+    krp->SetKernelArguments(4, &kh, sizeof(kh));
     const int pb[3] = {16, 16, 1};
     const int pg[3] = {((int)N + 15) / 16, ((int)K + 15) / 16, 1};
     if (!StreamManager::Global().DispatchCommand(*krp, pg, pb)) {
@@ -1303,7 +1265,7 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
       cudaFree(dw.rowsum);
       return false;
     }
-    it = g_i8_weight_cache.emplace(section_a, dw).first;
+    it = g_i8_weight_cache.emplace(plain_w, dw).first;
   }
 
   // 3) int32 GEMM output scratch [Mpad,N] (+tail pad: IMMA can write/read C in
@@ -1356,13 +1318,13 @@ bool cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
 }
 
 // Diagnostic / high-accuracy fp16 path: FP32-precision activation (no int8
-// quant). fp16 -> fp32, naive Section-A FP32-act GEMM, fp32 -> fp16. Used when
-// NNTR_FC_CUDA_DP4A=0 with an fp16 activation.
-bool cuda_fc_qint4_sectionA_gemm_fp16_naive(const unsigned short *Xh,
-                                            const unsigned char *section_a,
-                                            const unsigned short *scales_fp16,
-                                            unsigned short *Yh, unsigned int M,
-                                            unsigned int N, unsigned int K) {
+// quant). fp16 -> fp32, naive plain-decode FP32-act GEMM, fp32 -> fp16. Used
+// when NNTR_FC_CUDA_DP4A=0 with an fp16 activation.
+bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
+                                   const unsigned char *plain_w,
+                                   const unsigned short *scales_fp16,
+                                   unsigned short *Yh, unsigned int M,
+                                   unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
   auto kh2f = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
@@ -1384,9 +1346,9 @@ bool cuda_fc_qint4_sectionA_gemm_fp16_naive(const unsigned short *Xh,
   const int xg[3] = {((int)xn + 255) / 256, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kh2f, xg, cb))
     return false;
-  // naive Section-A FP32-act GEMM (mutex-free; its own dispatch + finish).
-  if (!cuda_fc_qint4_sectionA_gemm_fp32(g_dp4a_xf, section_a, scales_fp16,
-                                        g_dp4a_yf, M, N, K))
+  // naive plain-decode FP32-act GEMM (mutex-free; its own dispatch + finish).
+  if (!cuda_fc_qs4cx_gemm_fp32(g_dp4a_xf, plain_w, scales_fp16, g_dp4a_yf, M,
+                               N, K))
     return false;
   kf2h->SetKernelArguments(0, &g_dp4a_yf, sizeof(g_dp4a_yf));
   kf2h->SetKernelArguments(1, &Yh, sizeof(Yh));

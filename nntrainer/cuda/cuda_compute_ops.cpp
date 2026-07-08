@@ -179,9 +179,10 @@ public:
   }
 
   // FC GEMM: output = input * weight. The former CudaFcLayer::cudaFcGemm body
-  // verbatim — QINT4 fused dequant-GEMM on device (KAI Section-A, w4a8 dp4a /
-  // cuBLAS int8 IMMA) with host-weight/host-input staging, an FP32 cuBLAS path,
-  // and a host Tensor::dot fallback (correct on the host-coherent UVM). [T7]
+  // — QS4CX fused dequant-GEMM on device (plain payload consumed in place,
+  // w4a8 dp4a / cuBLAS int8 IMMA) with host-weight/host-input staging, an FP32
+  // cuBLAS path, and a host Tensor::dot fallback (correct on the host-coherent
+  // UVM). [T7]
   void fc(Tensor &input, Tensor &weight, Tensor &output) override {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     using DT = ml::train::TensorDim::DataType;
@@ -218,35 +219,30 @@ public:
               ptype(hidden_.getData<float>()));
     }
 
-    // QINT4 weight: fused dequant-GEMM on device (KAI Section-A layout). Default
-    // ON; the host Tensor::dot path is NYI for QINT4 on x86 (KAI ARM-only).
-    if ((wt == DT::QINT4 || wt == DT::QS4CX) &&
-        (at == DT::FP32 || at == DT::FP16) && M > 0 && N > 0 && K > 0) {
-      static const bool seca_enabled = []() {
+    // QS4CX weight: fused dequant-GEMM on device, consuming the PLAIN nibble
+    // payload in place (the derived dp4a/cuBLAS device caches are keyed by its
+    // pointer -- no UVM Section-A copy; [weight 한벌]). QINT4 never reaches
+    // here: layer_context coerces it to QS4CX at init. Default ON; the host
+    // Tensor::dot path is NYI for QS4CX on x86 (KAI ARM-only).
+    if (wt == DT::QS4CX && (at == DT::FP32 || at == DT::FP16) && M > 0 &&
+        N > 0 && K > 0) {
+      static const bool qs4cx_enabled = []() {
         const char *e = std::getenv("NNTR_FC_CUDA_QINT4");
         return !(e != nullptr && e[0] == '0');
       }();
-      if (seca_enabled && (int)weight.getDim().height() == K) {
-        const uint8_t *W = weight.getData<uint8_t>();
-        const uint16_t *S = weight.getScale<uint16_t>();
-        // [weight 한벌] QS4CX plain weight -> reuse the QINT4 Section-A CUDA
-        // path: resolve (once, cached) to a UVM Section-A + fp16 buffer so it is
-        // device-resident exactly like a native QINT4 weight (prewarmed, no
-        // per-call staging, same dp4a/cuBLAS fast path + repack cache).
-        if (wt == DT::QS4CX) {
-          const unsigned char *uW = nullptr;
-          const unsigned short *uS = nullptr;
-          if (cuda::cuda_fc_qs4cx_to_uvm_seca(W, weight.getScale<float>(),
-                                              (unsigned)N, (unsigned)K, &uW,
-                                              &uS)) {
-            W = uW;
-            S = uS;
-          }
-        }
+      const uint8_t *W = weight.getData<uint8_t>();
+      // The only per-weight side buffer: the N fp16 per-channel scales the
+      // dequant kernels read every call (cached UVM; built at load by the
+      // prewarm, so this is a pure cache hit -- a miss under graph capture
+      // returns false and the FC falls to the host path).
+      const uint16_t *S = nullptr;
+      if (qs4cx_enabled && (int)weight.getDim().height() == K &&
+          cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(weight.getScale<float>(),
+                                                 (unsigned)N, &S)) {
         if (!nntrainer::cuda::dev_accessible(W)) {
           const uint8_t *dW = nullptr;
           const uint16_t *dS = nullptr;
-          if (cuda::cuda_fc_qint4_stage_host_weight(W, S, (unsigned)N,
+          if (cuda::cuda_fc_qs4cx_stage_host_weight(W, S, (unsigned)N,
                                                     (unsigned)K, &dW, &dS)) {
             W = dW;
             S = dS;
@@ -291,25 +287,25 @@ public:
             return e ? (unsigned)atoi(e) : (1u << 20);
           }();
           if (use_cublas_i8 && use_dp4a && M >= 32 && K <= (int)cublas_kmax)
-            ok = cuda::cuda_fc_qint4_sectionA_cublas_i8_gemm_fp16(
+            ok = cuda::cuda_fc_qs4cx_cublas_i8_gemm_fp16(
               (const uint16_t *)Xp, W, S, (uint16_t *)Yp, (unsigned)M,
               (unsigned)N, (unsigned)K);
           if (!ok)
-            ok = use_dp4a ? cuda::cuda_fc_qint4_sectionA_dp4a_gemm_fp16(
+            ok = use_dp4a ? cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(
                               (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
                               (unsigned)M, (unsigned)N, (unsigned)K)
-                          : cuda::cuda_fc_qint4_sectionA_gemm_fp16_naive(
+                          : cuda::cuda_fc_qs4cx_gemm_fp16_naive(
                               (const uint16_t *)Xp, W, S, (uint16_t *)Yp,
                               (unsigned)M, (unsigned)N, (unsigned)K);
         } else if (all_dev) {
-          ok = use_dp4a ? cuda::cuda_fc_qint4_sectionA_dp4a_gemm_fp32(
+          ok = use_dp4a ? cuda::cuda_fc_qs4cx_dp4a_gemm_fp32(
                             (const float *)Xp, W, S, (float *)Yp, (unsigned)M,
                             (unsigned)N, (unsigned)K)
-                        : cuda::cuda_fc_qint4_sectionA_gemm_fp32(
+                        : cuda::cuda_fc_qs4cx_gemm_fp32(
                             (const float *)Xp, W, S, (float *)Yp, (unsigned)M,
                             (unsigned)N, (unsigned)K);
         } else if (!fp16) {
-          ok = cuda::cuda_fc_qint4_sectionA_gemm_fp32_resident(
+          ok = cuda::cuda_fc_qs4cx_gemm_fp32_resident(
             (const float *)Xp, W, S, (float *)Yp, (unsigned)M, (unsigned)N,
             (unsigned)K);
         }

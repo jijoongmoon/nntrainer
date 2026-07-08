@@ -911,8 +911,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   std::vector<unsigned int> id_list;
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-  // Prewarm the QINT4 dp4a weight caches on the CPU (ThreadManager-parallel) at
-  // load: the one-time Section-A -> plain int4 repack is ~38% of the cold-run
+  // Prewarm the QS4CX dp4a weight caches on the CPU (ThreadManager-parallel) at
+  // load: the one-time plain -> packed int4 repack is ~38% of the cold-run
   // GPU time (nsys). Doing it here -- once, before start_prefill is reset --
   // keeps it off the first prefill and off the GPU. Idempotent (per-weight
   // cache check), gated by NNTR_CUDA_PREWARM (default on).
@@ -929,24 +929,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             return;
           for (unsigned int w = 0; w < ctx.getNumWeights(); ++w) {
             nntrainer::Tensor &wt = ctx.getWeight(w);
-            const auto wdt = wt.getDataType();
-            if (wdt == ml::train::TensorDim::DataType::QINT4) {
-              const unsigned char *secA = wt.getData<uint8_t>();
-              if (nntrainer::cuda::dev_accessible(secA))
-                nntrainer::cuda::cuda_fc_qint4_prewarm(secA, wt.width(),
-                                                       wt.height());
-            } else if (wdt == ml::train::TensorDim::DataType::QS4CX) {
-              // [weight 한벌] QS4CX -> UVM Section-A (cached, shared with the
-              // GEMM path) then prewarm exactly like a QINT4 weight, so QS4CX
-              // gets the same device-resident fast path + repack cache.
-              const unsigned char *uW = nullptr;
-              const unsigned short *uS = nullptr;
-              if (nntrainer::cuda::cuda_fc_qs4cx_to_uvm_seca(
-                    wt.getData<uint8_t>(), wt.getScale<float>(), wt.width(),
-                    wt.height(), &uW, &uS))
-                nntrainer::cuda::cuda_fc_qint4_prewarm(uW, wt.width(),
-                                                       wt.height());
-            }
+            // QINT4 never appears here: layer_context coerces it to QS4CX.
+            if (wt.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+              continue;
+            // [weight 한벌] The dp4a/cuBLAS device caches are built straight
+            // from the plain QS4CX payload (keyed by its pointer) -- no UVM
+            // Section-A copy. Building the fp16-scale UVM side buffer here
+            // too makes the first forward (and any CUDA-graph capture) a pure
+            // cache hit.
+            const unsigned short *uS = nullptr;
+            nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+              wt.getScale<float>(), wt.width(), &uS);
+            nntrainer::cuda::cuda_fc_qs4cx_prewarm(wt.getData<uint8_t>(),
+                                                   wt.width(), wt.height());
           }
         };
       model->forEachLayer(fn, nullptr);
