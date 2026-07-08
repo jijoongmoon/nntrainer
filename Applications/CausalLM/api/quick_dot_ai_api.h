@@ -75,7 +75,6 @@ typedef enum {
   CAUSAL_LM_MODEL_GEMMA4_E2B_QNN = 12, /* original */
   CAUSAL_LM_MODEL_VJEPA2_QNN = 13,
   CAUSAL_LM_MODEL_OURO_EMBEDDING = 14,
-  CAUSAL_LM_MODEL_GAUSS4_QNN = 15,
 } ModelType;
 #endif /* __TRANSFORMER_H__ */
 
