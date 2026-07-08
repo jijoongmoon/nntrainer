@@ -1026,22 +1026,16 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
   if (g_dp4a_plain_cache.count(plain_w))
     return true; // already cached
   const size_t Kh = (K + 1u) / 2u;
-  std::vector<signed char> packed((size_t)N * Kh);
-  std::vector<int> rowsum(N, 0);
   auto &tm = nntrainer::ThreadManager::Global();
-  tm.parallel_for(0, (size_t)N, [&](size_t n) {
-    const unsigned char *src = plain_w + n * Kh;
-    signed char *prow = packed.data() + n * Kh;
-    long acc = 0;
-    for (size_t kb = 0; kb < Kh; ++kb) {
-      const unsigned char b = src[kb];
-      prow[kb] = (signed char)(b ^ 0x88);
-      // odd-K pad nibble is stored 8 (= int4 0), so it adds 0 here -- same
-      // rowsum the old k1<K guard produced.
-      acc += ((int)(b & 0xF) - 8) + ((int)((b >> 4) & 0xF) - 8);
-    }
-    rowsum[n] = (int)acc;
-  });
+
+  // Build + upload in bounded chunks: a full host mirror of the untied
+  // lm_head (N=262144) is ~350MB packed + ~700MB int8 and those transients
+  // WERE the process peak RSS once the Section-A copy was gone (RSS timeline:
+  // a +1GB step right at the peak, late in load). ~64MB chunks keep the
+  // prewarm off the peak entirely; results are byte-identical (same values,
+  // same device offsets).
+  static constexpr size_t PREWARM_CHUNK_BYTES = 64u << 20;
+
   DevWeightQ dw;
   if (cudaMalloc(&dw.plain, (size_t)N * Kh) != cudaSuccess)
     return false;
@@ -1049,35 +1043,70 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
     cudaFree(dw.plain);
     return false;
   }
-  cudaMemcpy(dw.plain, packed.data(), (size_t)N * Kh, cudaMemcpyHostToDevice);
-  cudaMemcpy(dw.rowsum, rowsum.data(), sizeof(int) * (size_t)N,
-             cudaMemcpyHostToDevice);
+  {
+    // packed int4 [N][Kh] in row chunks (rows are contiguous on both sides).
+    const size_t chunk_rows =
+      std::max<size_t>(1, std::min<size_t>(N, PREWARM_CHUNK_BYTES / Kh));
+    std::vector<signed char> packed(chunk_rows * Kh);
+    std::vector<int> rowsum(N, 0);
+    for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
+      const size_t rows = std::min(chunk_rows, (size_t)N - n0);
+      tm.parallel_for(0, rows, [&](size_t r) {
+        const unsigned char *src = plain_w + (n0 + r) * Kh;
+        signed char *prow = packed.data() + r * Kh;
+        long acc = 0;
+        for (size_t kb = 0; kb < Kh; ++kb) {
+          const unsigned char b = src[kb];
+          prow[kb] = (signed char)(b ^ 0x88);
+          // odd-K pad nibble is stored 8 (= int4 0), so it adds 0 here --
+          // same rowsum the old k1<K guard produced.
+          acc += ((int)(b & 0xF) - 8) + ((int)((b >> 4) & 0xF) - 8);
+        }
+        rowsum[n0 + r] = (int)acc;
+      });
+      cudaMemcpy(dw.plain + n0 * Kh, packed.data(), rows * Kh,
+                 cudaMemcpyHostToDevice);
+    }
+    cudaMemcpy(dw.rowsum, rowsum.data(), sizeof(int) * (size_t)N,
+               cudaMemcpyHostToDevice);
+  }
   g_dp4a_plain_cache.emplace(plain_w, dw);
 
   // Also prewarm the cuBLAS int8 [K,N] weight cache when the cuBLAS prefill FC
   // path is on: otherwise its one-time GPU repack (repack_plain_i8_kn, ~32% of
   // cold prefill GPU time) runs on the first prefill instead of at load. Mirrors
   // repack_plain_i8_kn (w8[k*N+n]=int4(n,k)) + weight_rowsum_kn bit-exactly.
+  // Chunked along K ([k0,k1) rows of the [K,N] buffer are contiguous on both
+  // sides); the per-channel rowsum accumulates across chunks.
   static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
   if (_cb && _cb[0] != '0' && !g_i8_weight_cache.count(plain_w)) {
-    std::vector<signed char> w8((size_t)K * N);
-    std::vector<int> rs8(N, 0);
-    tm.parallel_for(0, (size_t)N, [&](size_t n) {
-      const unsigned char *src = plain_w + n * Kh;
-      long acc = 0;
-      for (int kk = 0; kk < (int)K; ++kk) {
-        const unsigned char b = src[kk >> 1];
-        const int v = (int)((kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF)) - 8;
-        w8[(long)kk * N + n] = (signed char)v;
-        acc += v;
-      }
-      rs8[n] = (int)acc;
-    });
+    const size_t chunk_k =
+      std::max<size_t>(1, std::min<size_t>(K, PREWARM_CHUNK_BYTES / N));
+    std::vector<signed char> w8(chunk_k * (size_t)N);
+    std::vector<long> rs8(N, 0);
     DevWeightI8 dw8;
     if (cudaMalloc(&dw8.w8, (size_t)K * N) == cudaSuccess &&
         cudaMalloc(&dw8.rowsum, sizeof(int) * (size_t)N) == cudaSuccess) {
-      cudaMemcpy(dw8.w8, w8.data(), (size_t)K * N, cudaMemcpyHostToDevice);
-      cudaMemcpy(dw8.rowsum, rs8.data(), sizeof(int) * (size_t)N,
+      for (size_t k0 = 0; k0 < K; k0 += chunk_k) {
+        const size_t ks = std::min(chunk_k, (size_t)K - k0);
+        tm.parallel_for(0, (size_t)N, [&](size_t n) {
+          const unsigned char *src = plain_w + n * Kh;
+          long acc = 0;
+          for (size_t kk = k0; kk < k0 + ks; ++kk) {
+            const unsigned char b = src[kk >> 1];
+            const int v = (int)((kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF)) - 8;
+            w8[(kk - k0) * N + n] = (signed char)v;
+            acc += v;
+          }
+          rs8[n] += acc;
+        });
+        cudaMemcpy(dw8.w8 + k0 * N, w8.data(), ks * (size_t)N,
+                   cudaMemcpyHostToDevice);
+      }
+      std::vector<int> rs8i(N);
+      for (size_t n = 0; n < N; ++n)
+        rs8i[n] = (int)rs8[n];
+      cudaMemcpy(dw8.rowsum, rs8i.data(), sizeof(int) * (size_t)N,
                  cudaMemcpyHostToDevice);
       g_i8_weight_cache.emplace(plain_w, dw8);
     } else if (dw8.w8) {
