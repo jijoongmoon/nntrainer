@@ -13,7 +13,7 @@
 #include "graph_parser.h"
 #include <climits>
 #include <unistd.h>
-#include <xgrammar/xgrammar_wrapper.h>
+#include "xgrammar_wrapper.h"
 
 #include <algorithm>
 #include <cmath>
