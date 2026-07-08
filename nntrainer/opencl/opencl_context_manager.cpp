@@ -222,6 +222,30 @@ bool ContextManager::CreateDefaultGPUDevice() {
 
   ml_logi("Looking for suitable OpenCL platform and device ...");
 
+  // Explicit device pin: NNTR_CL_DEVICE_FILTER=<substring of CL_DEVICE_NAME>.
+  // A multi-ICD host (Windows: Intel AND NVIDIA OpenCL platforms both
+  // installed) makes the built-in name preference ambiguous; this selects the
+  // first enumerated device whose name contains the substring. Falls through
+  // to the default preference when nothing matches.
+  if (const char *dev_filter = std::getenv("NNTR_CL_DEVICE_FILTER")) {
+    for (const std::pair<cl_platform_id, cl_device_id> &platform_device :
+         platform_device_pairs) {
+      auto device_info = std::make_unique<DeviceInfo>();
+      if (!device_info->read(platform_device.second))
+        continue;
+      if (device_info->getDeviceName().find(dev_filter) != std::string::npos) {
+        platform_id_ = platform_device.first;
+        device_id_ = platform_device.second;
+        device_info_ = std::move(device_info);
+        break;
+      }
+    }
+    if (nullptr == platform_id_)
+      ml_loge("NNTR_CL_DEVICE_FILTER='%s' matched no device -- falling back "
+              "to the default device preference",
+              dev_filter);
+  }
+
   // Vendor ID of Intel : 0x8086
   // Vendor ID of NVidia : 0x10DE / 0x13B5
   constexpr static cl_uint intel_igpu_vendor_id = 0x8086;
@@ -232,13 +256,18 @@ bool ContextManager::CreateDefaultGPUDevice() {
 
   for (const std::pair<cl_platform_id, cl_device_id> &platform_device :
        platform_device_pairs) {
+    if (nullptr != platform_id_)
+      break; // already pinned via NNTR_CL_DEVICE_FILTER
+
     cl_platform_id platform = platform_device.first;
     cl_device_id device = platform_device.second;
 
     auto device_info = std::make_unique<DeviceInfo>();
     if (!device_info->read(device)) {
-      ml_loge("Failed to read device info");
-      return false;
+      // One unreadable device (e.g. a foreign ICD's entry on a multi-platform
+      // host) must not abort the whole selection -- skip it and keep looking.
+      ml_loge("Failed to read device info -- skipping this device");
+      continue;
     }
 
     const bool type_check =
