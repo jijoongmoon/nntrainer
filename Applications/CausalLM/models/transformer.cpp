@@ -398,9 +398,13 @@ void Transformer::repack_weight() {
   // loop is therefore redundant CPU work — and it is single-threaded, so for a
   // large model it pins one core to a thermal shutdown (Adreno: GPU idle at 0%,
   // one CPU core -> ~104C -> device reboot; 96%+ of CPU was in
-  // kai_run_rhs_pack). Skip it on the GPU engine; ARM CPU (KAI) runs still pack.
-  if (causallm_engine() == "gpu") {
-    ml_logd("repack_weight: skipped on GPU engine (consumes plain QS4CX blob)");
+  // kai_run_rhs_pack). Skip it on every non-CPU engine — "gpu" (OpenCL) AND
+  // "cuda" both consume the plain blob; only the ARM CPU (KAI) run packs.
+  // (On ARM64 CUDA the old =="gpu" check let packF16Activation allocate a
+  // full unconsumed host copy of every FC weight.)
+  if (causallm_engine() != "cpu") {
+    ml_logd("repack_weight: skipped on %s engine (consumes plain QS4CX blob)",
+            causallm_engine().c_str());
     return;
   }
   // fp16-act graphs dispatch QS4CX FCs through HalfTensor::dot, whose KAI rhs
