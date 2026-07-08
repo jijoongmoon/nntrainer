@@ -24,6 +24,9 @@ typedef enum {
   QDA_CAP_MULTI_IMAGE = 1u << 5, /**< supports multiple images (e.g. V-JEPA) */
   QDA_CAP_VISION_ENCODER =
     1u << 6, /**< standalone vision embedding producer; pair with an LLM */
+  QDA_CAP_SPECULATIVE =
+    1u
+    << 7, /**< supports speculative decoding; load sd_variant_id when enabled */
 } CapabilityFlag;
 
 /**
@@ -40,8 +43,10 @@ typedef struct {
   unsigned int capabilities; /**< CapabilityFlag OR */
   const char
     *config_name; /**< g_model_registry lookup key e.g. "Qwen3-0.6B-W4A32" */
-  const char
-    *arch_string; /**< causallm::Factory key e.g. "Qwen3ForCausalLM" */
+  const char *arch_string; /**< causallm::Factory key e.g. "Qwen3ForCausalLM" */
+  const char *sd_variant_id; /**< catalog id of the speculative-decoding
+                                  variant to load when SD is enabled; NULL if
+                                  none */
 } ModelDescriptor;
 
 #ifdef __cplusplus

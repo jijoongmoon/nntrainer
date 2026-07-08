@@ -17,7 +17,7 @@ import android.util.Log
 import org.json.JSONArray
 
 enum class RuntimeKind { NATIVE, LITERT }
-enum class Capability { STREAMING, MESSAGES_API, MULTIMODAL, TOOL_USE, EMBEDDING, MULTI_IMAGE }
+enum class Capability { STREAMING, MESSAGES_API, MULTIMODAL, TOOL_USE, EMBEDDING, MULTI_IMAGE, SPECULATIVE }
 
 data class ModelDescriptor(
     val id: String,
@@ -26,6 +26,7 @@ data class ModelDescriptor(
     val runtime: RuntimeKind,
     val backends: Set<BackendType>,
     val capabilities: Set<Capability>,
+    val sdVariantId: String? = null,
 )
 
 /** String constants for public model ids (migration convenience). */
@@ -39,9 +40,6 @@ object ModelIds {
     const val GEMMA4_E2B_QNN    = "gemma4-e2b-qnn"
     const val VJEPA_QNN         = "vjepa2-qnn"   // V-JEPA 2 multi-image (QNN)
     const val VJEPA_LFM2        = "vjepa-lfm2"        // V-JEPA 2 + LFM2 video (CPU)
-    const val GAUSS4_QNN        = "gauss-4-qnn"       // Gauss 4 with PLE (QNN)
-    const val GAUSS4_SD_QNN     = "gauss-4-sd-qnn"    // Gauss 4 with SD draft graphs (QNN)
-    const val GAUSS4_CPU        = "gauss-4-cpu"       // Gauss 4 (CPU)
 }
 
 object ModelCatalog {
@@ -98,6 +96,7 @@ object ModelCatalog {
                 runtime = if (o.getInt("runtime") == 1) RuntimeKind.LITERT else RuntimeKind.NATIVE,
                 backends = decodeBackends(o.getInt("backend_mask")),
                 capabilities = decodeCaps(o.getInt("capabilities")),
+                sdVariantId = if (o.has("sd_variant_id")) o.getString("sd_variant_id") else null,
             )
         }
     }
@@ -112,6 +111,7 @@ object ModelCatalog {
         if (bits and 0b001000 != 0) add(Capability.TOOL_USE)
         if (bits and 0b010000 != 0) add(Capability.EMBEDDING)
         if (bits and 0b100000 != 0) add(Capability.MULTI_IMAGE)
+        if (bits and 0b10000000 != 0) add(Capability.SPECULATIVE)
     }
 
     fun byId(id: String): ModelDescriptor? = all().firstOrNull { it.id == id }

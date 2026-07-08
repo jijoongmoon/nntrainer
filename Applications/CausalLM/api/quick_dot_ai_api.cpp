@@ -364,7 +364,10 @@ extern "C" const char *getModelCatalogJson(void) {
        << json_escape(d.display_name ? d.display_name : d.id)
        << "\",\"runtime\":" << static_cast<int>(d.runtime)
        << ",\"backend_mask\":" << d.backend_mask
-       << ",\"capabilities\":" << d.capabilities << "}";
+       << ",\"capabilities\":" << d.capabilities;
+    if (d.sd_variant_id)
+      os << ",\"sd_variant_id\":\"" << json_escape(d.sd_variant_id) << "\"";
+    os << "}";
   }
   os << "]";
   g_catalog_json_cache = os.str();

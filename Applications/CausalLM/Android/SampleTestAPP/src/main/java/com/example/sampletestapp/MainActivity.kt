@@ -2054,10 +2054,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isSdCapableModel(): Boolean =
-        selDescriptor?.runtime == RuntimeKind.NATIVE && selDescriptor?.id == ModelIds.GAUSS4_QNN
+        selDescriptor?.runtime == RuntimeKind.NATIVE && selDescriptor?.capabilities?.contains(Capability.SPECULATIVE) == true
 
     private fun isChatSdCapableModel(): Boolean =
-        chatSelDescriptor?.runtime == RuntimeKind.NATIVE && chatSelDescriptor?.id == ModelIds.GAUSS4_QNN
+        chatSelDescriptor?.runtime == RuntimeKind.NATIVE && chatSelDescriptor?.capabilities?.contains(Capability.SPECULATIVE) == true
 
     /**
      * @brief Build a [LoadModelRequest] from the current UI state. Must
@@ -2071,8 +2071,8 @@ class MainActivity : AppCompatActivity() {
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
         val basePath = (if (::modelBasePathField.isInitialized) modelBasePathField.text.toString()
                         else modelBasePathText).trim().ifEmpty { modelBasePathText }
-        val effectiveModelId = if (selSdEnabled && d?.id == ModelIds.GAUSS4_QNN) ModelIds.GAUSS4_SD_QNN
-                               else d?.id ?: selFamily
+        val effectiveModelId = (if (selSdEnabled) (d?.sdVariantId ?: d?.id) else d?.id)
+                               ?: selFamily
         return LoadModelRequest(
             backend = backend,
             modelId = effectiveModelId,
@@ -2093,8 +2093,8 @@ class MainActivity : AppCompatActivity() {
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
         val basePath = (if (::chatModelBasePathField.isInitialized) chatModelBasePathField.text.toString()
                         else modelBasePathText).trim().ifEmpty { modelBasePathText }
-        val effectiveModelId = if (chatSelSdEnabled && d?.id == ModelIds.GAUSS4_QNN) ModelIds.GAUSS4_SD_QNN
-                               else d?.id ?: chatSelFamily
+        val effectiveModelId = (if (chatSelSdEnabled) (d?.sdVariantId ?: d?.id) else d?.id)
+                               ?: chatSelFamily
         return LoadModelRequest(
             backend = backend,
             modelId = effectiveModelId,
@@ -2870,9 +2870,6 @@ class MainActivity : AppCompatActivity() {
         ModelIds.GEMMA4_CPU     to "gemma4_cpu",
         ModelIds.GEMMA4_E2B_QNN to "gemma-4-e2b-qnn",
         ModelIds.VJEPA_QNN      to "vjepa2-qnn",
-        ModelIds.GAUSS4_QNN     to "gauss-4-qnn",
-        ModelIds.GAUSS4_SD_QNN  to "gauss-4-sd-qnn",
-        ModelIds.GAUSS4_CPU     to "gauss-4-cpu",
     )
 
     private fun checkAllFilesAccess() {
