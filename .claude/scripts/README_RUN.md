@@ -56,6 +56,7 @@ CL 공통: `NNTR_GPU_SVM_POOL=1 NNTR_V8C_BUF=1 NNTR_MHA_GPU=1 NNTR_FC_GPU=1 NNTR
 | qwen3 | 2221.3/31.7 (peak 306→325MB) | 2381.4/34.6 (peak 306MB) | 1610.1/34.6 (peak 308MB) | 4899.5/138.5 (**peak 1269→1041MB**) | 2155.8/35.0 (peak 1088MB) | 315/34.7 |
 
 - cuda 구표 `cuda-fast` TPS는 secA 제거 전 측정 — peak은 위 갱신값이 정본. xmx TPS 셀은 오전 측정값 유지, xmx peak만 심야 로더-reaper 후 재측정(심야 xmx prefill은 기지의 저녁 −15% 변동으로 미채택). **reaper 이전의 peak은 페이지캐시 상태 의존으로 비결정적**이었음(gemma2 무reaper 2463↔3456 관측) — reaper가 결정적 상한으로 고정. 끄기: `NNTR_LOAD_REAP_MB=0`.
+- **`NNTR_CUDA_WPREFETCH=2` (opt-in, `84c93e89a`)**: QS4CX FC plain을 로드 중 VRAM으로 이주(+GPU repack prewarm) → cuda peak 추가 절감, decode 노이즈 내·골든 유지 (RTX 5060 8GB 실측): gauss4 3507→**2278** · gauss4-ple→**1528** · gauss4-side→**1137** · gemma4→**2904** · gemma4-ple→**1574** · gemma4-side→**1440** · lmint4→**3040** · gemma2→**1785** · qwen3→**830MB**. 기본 OFF — VRAM에 pool+파생캐시가 들어가야 함(자동 게이트는 후속). `=1`은 첫 answer 시점 이주(스테디만 절감).
 
 ## 함정 모음 (이 매트릭스와 얽힌 것만)
 - **842tok 완결 지문(prompt_1k.txt)에 chat 모델이 1토큰 EOS를 내는 건 정상** (버그 아님). perf는 중간 절단되는 prompt_1p2k 기준.
