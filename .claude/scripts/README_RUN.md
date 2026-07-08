@@ -42,18 +42,20 @@ CL 공통: `NNTR_GPU_SVM_POOL=1 NNTR_V8C_BUF=1 NNTR_MHA_GPU=1 NNTR_FC_GPU=1 NNTR
 | qwen3 | CUDA/adreno-cpu: "**Seoul**" | Intel "Da Yon"·"Hae Soo"류/Adreno "trick question" = OpenCL fp16 마진(0.6B 한계, 버그 아님) |
 
 ### perf @~1K prefill (`perf` 모드, prompt_1p2k, tok/s prefill/decode)
-(측정: 2026-07-08 10:40–11:04 x86 전체 / gauss4 adreno-cpu와 wrap의 gauss4-side·gemma4 두 셀은 2026-07-08 오후 별도 측정 — 전부 `run_llm.sh perf`)
-| model | xmx | wrap | intel(dp4a) | cuda(-fast) | adreno | adreno-cpu |
+(측정: 2026-07-08 10:40–11:04 x86 전체 / gauss4 adreno-cpu와 wrap의 gauss4-side·gemma4 두 셀은 2026-07-08 오후 별도 측정 — 전부 `run_llm.sh perf`. **cuda 컬럼은 2026-07-08 심야 재측정**: plain-QS4CX 직소비로 secA UVM 사본 제거 + prewarm 청크화(`13ca3cb3b`+`b5dcea873`) 반영, 전부 SAFE `cuda` 구성.)
+| model | xmx | wrap | intel(dp4a) | cuda | adreno | adreno-cpu |
 |---|---|---|---|---|---|---|
-| gauss4 | ~2100/16.4 | 2002.0/17.0 (peak 1723MB) | 1032.3/18.4 (peak 1787MB) | 5115.0/61.0 (peak 5826MB) | **1249/19.2** | 240.1/3.2 (peak 6308MB, f16 prepack 444d0ed5) |
-| gauss4-ple | 2140/16.7 (**peak 3616→2662MB**) | 2058.4/17.3 (peak 1149MB) | 945.5/16.9 (peak 1162MB) | 5166.7/60.8 (peak 4882MB) | 1252/18.5 | — |
-| gemma4-ple | 2595/16.6 (**peak 3784→2152MB**) | 2361.7/17.4 (peak 1152MB) | 1518.2/16.5 (peak 850MB) | 5676.1/65.0 (cuda-fast, peak 3805MB) | 2437/21.7 (peak 5497→4274MB) | — |
-| gauss4-side | 2163/18.5 (**peak 2285MB**) | 2162.8/21.1 (peak 1086MB) | 1029.2/18.6 (peak 1151MB) | 5166.7/61.2 (peak 4503MB) | 1258/19.1 (peak 4908MB) | — |
-| gemma4-side | 2760/17.2 (**peak 1842MB**) | 2581.4/17.8 (peak 851MB) | 1598.4/17.9 (peak 850MB) | 5676.1/62.8 (cuda-fast, peak 3490MB) | 2390/22.1 (peak 3913MB) | — |
-| gemma4 qs4cx | ~2500/16+ | 2190.8/19.5 (peak 1860MB) | 1601.0/18.0 (peak 2293MB) | 5774.6/64.9 (cuda-fast, peak 5762MB) | **2373/21.9** | 170/2.0 |
-| gemma4-lmint4 | 2378.6/16.9 (peak 2489MB) | 2296.6/18.6 (peak 1557MB) | 1627.0/18.1 (peak 2293MB) | **5774.6/62.5** (cuda, peak 5817MB, 목표 5550/36 초과) | **2461/21.8** (README 2454/18.2 일치) | — |
-| gemma2 | 1510.3/13.0 (peak 747MB) | 1692.6/14.2 (peak 747MB) | 656.4/13.5 (peak 768MB) | 3436.2/62.9 (cuda-fast, peak 3208MB) | 831.8/16.0 (peak 4056MB) | 75/8.4 |
-| qwen3 | 2221.3/31.7 (peak 306MB) | 2381.4/34.6 (peak 306MB) | 1610.1/34.6 (peak 308MB) | 4899.5/138.5 (cuda-fast, peak 1269MB) | 2155.8/35.0 (peak 1088MB) | 315/34.7 |
+| gauss4 | ~2100/16.4 | 2002.0/17.0 (peak 1723MB) | 1032.3/18.4 (peak 1787MB) | 5470.6/61.8 (**peak 5826→4324MB**) | **1249/19.2** | 240.1/3.2 (peak 6308MB, f16 prepack 444d0ed5) |
+| gauss4-ple | 2140/16.7 (**peak 3616→2662MB**) | 2058.4/17.3 (peak 1149MB) | 945.5/16.9 (peak 1162MB) | 4371.8/61.7 (**peak 4882→2898MB**) | 1252/18.5 | — |
+| gemma4-ple | 2595/16.6 (**peak 3784→2152MB**) | 2361.7/17.4 (peak 1152MB) | 1518.2/16.5 (peak 850MB) | 5519.3/65.2 (**peak 3805→2569MB**) | 2437/21.7 (peak 5497→4274MB) | — |
+| gauss4-side | 2163/18.5 (**peak 2285MB**) | 2162.8/21.1 (peak 1086MB) | 1029.2/18.6 (peak 1151MB) | 5441.5/61.4 (**peak 4503→2393MB**, xmx 2285 동급) | 1258/19.1 (peak 4908MB) | — |
+| gemma4-side | 2760/17.2 (**peak 1842MB**) | 2581.4/17.8 (peak 851MB) | 1598.4/17.9 (peak 850MB) | 5581.0/65.2 (**peak 3490→1968MB**) | 2390/22.1 (peak 3913MB) | — |
+| gemma4 qs4cx | ~2500/16+ | 2190.8/19.5 (peak 1860MB) | 1601.0/18.0 (peak 2293MB) | 5808.1/64.5 (peak 5765MB — **불변**: 로드경계 ~1.8GB 스파이크가 peak, HANDOFF §NEXT-1) | **2373/21.9** | 170/2.0 |
+| gemma4-lmint4 | 2378.6/16.9 (peak 2489MB) | 2296.6/18.6 (peak 1557MB) | 1627.0/18.1 (peak 2293MB) | **5982.0/63.7** (**peak 5817→4876MB**, 목표 5550/36 초과) | **2461/21.8** (README 2454/18.2 일치) | — |
+| gemma2 | 1510.3/13.0 (peak 747MB) | 1692.6/14.2 (peak 747MB) | 656.4/13.5 (peak 768MB) | 3335.5/62.6 (**peak 3208→2407MB**) | 831.8/16.0 (peak 4056MB) | 75/8.4 |
+| qwen3 | 2221.3/31.7 (peak 306MB) | 2381.4/34.6 (peak 306MB) | 1610.1/34.6 (peak 308MB) | 4853.1/138.5 (**peak 1269→1043MB**) | 2155.8/35.0 (peak 1088MB) | 315/34.7 |
+
+- cuda 구표 `cuda-fast` TPS(gemma4-ple 5676.1/65.0 · gemma4-side 5676.1/62.8 · gemma4 5774.6/64.9 · gemma2 3436.2/62.9 · qwen3 4899.5/138.5)는 secA 제거 전 측정 — 속도 참고용, peak은 위 갱신값이 정본. 이 머신 prefill TPS는 런간 ±15% 변동(gauss4-side 3693↔5441 관측) — decode가 안정 지표.
 
 ## 함정 모음 (이 매트릭스와 얽힌 것만)
 - **842tok 완결 지문(prompt_1k.txt)에 chat 모델이 1토큰 EOS를 내는 건 정상** (버그 아님). perf는 중간 절단되는 prompt_1p2k 기준.
