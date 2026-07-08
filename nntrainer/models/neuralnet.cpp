@@ -1383,6 +1383,54 @@ void NeuralNetwork::load(const std::string &file_path,
       const size_t worker_count =
         std::min<size_t>(load_nodes.size(), static_cast<size_t>(hw_threads));
       std::atomic<size_t> load_cursor{0};
+
+#if !defined(_WIN32)
+      // Bound the loader's double residency. Staging-map pages a worker has
+      // already copied into the weight pool can stay resident until the final
+      // munmap, so the process RSS peaks at pool + touched-file overlap right
+      // at the end of the copy (~+0.9GB gauss4 / ~+1.8GB gemma4 — the
+      // recorded RUN peak, above the steady state). While the workers run,
+      // sample the map's resident size every 25ms (mincore) and, only when
+      // it exceeds a threshold, drop it with madvise(MADV_DONTNEED): the
+      // mapping is read-only MAP_PRIVATE, so dropped pages simply re-fault
+      // from the (WILLNEED-warmed) page cache if touched again — bytes loaded
+      // are identical. Without the reaper the overlap is CACHE-STATE
+      // DEPENDENT and nondeterministic (measured gemma2 unreaped: 2463MB
+      // right after a many-model sweep had pressured the page cache, 3456MB
+      // on a quiet warm cache); the reaper turns it into a deterministic
+      // bound of ~one interval's touch rate above the pool. The threshold
+      // keeps it from churning maps whose overlap stays naturally small.
+      // NOTE posix_madvise(POSIX_MADV_DONTNEED) is a documented no-op in
+      // glibc; the raw madvise is required.
+      std::atomic<bool> load_reaper_stop{false};
+      std::thread load_reaper;
+      if (MMAP_READ && shared_mmap_ptr != MAP_FAILED) {
+        load_reaper = std::thread([&]() {
+          const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+          const size_t npages = (shared_mmap_size + page - 1) / page;
+          static const size_t reap_threshold = []() {
+            const char *e = std::getenv("NNTR_LOAD_REAP_MB");
+            return (size_t)(e ? atol(e) : 256) << 20;
+          }();
+          if (reap_threshold == 0)
+            return; // NNTR_LOAD_REAP_MB=0 disables the reaper
+          std::vector<unsigned char> incore(npages);
+          while (!load_reaper_stop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            if (::mincore(shared_mmap_ptr, shared_mmap_size, incore.data()) !=
+                0)
+              continue;
+            size_t resident = 0;
+            for (size_t i = 0; i < npages; ++i)
+              resident += (incore[i] & 1);
+            if (resident * page > reap_threshold)
+              (void)::madvise(shared_mmap_ptr, shared_mmap_size,
+                              MADV_DONTNEED);
+          }
+        });
+      }
+#endif
+
       std::vector<std::thread> threads;
       threads.reserve(worker_count);
       for (size_t worker = 0; worker < worker_count; ++worker) {
@@ -1398,9 +1446,12 @@ void NeuralNetwork::load(const std::string &file_path,
       }
 
 #if !defined(_WIN32)
+      if (load_reaper.joinable()) {
+        load_reaper_stop.store(true, std::memory_order_relaxed);
+        load_reaper.join();
+      }
       if (shared_mmap_ptr != MAP_FAILED) {
-        (void)::posix_madvise(shared_mmap_ptr, shared_mmap_size,
-                              POSIX_MADV_DONTNEED);
+        (void)::madvise(shared_mmap_ptr, shared_mmap_size, MADV_DONTNEED);
         ::munmap(shared_mmap_ptr, shared_mmap_size);
       }
 #endif
