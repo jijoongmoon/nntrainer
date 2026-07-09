@@ -412,9 +412,25 @@ CausalLM::incrementalInference(unsigned int batch_size,
       // Host read of the GPU-produced logits: sync first so the read is coherent
       // under NNTR_CUDA_ASYNC (no-op in sync mode).
       nntrainer::cuda::StreamManager::Global().finishIfAsync();
-#endif
+      // Device-only activation pool (NNTR_CUDA_DEV_ACT): fp32 logits are real
+      // device memory the raw memcpy below cannot read -- drain and stage D2H,
+      // symmetric to the fp16 branch above. (Campaign scout gap: only the fp16
+      // branch staged; the fp32 branch would fault under DEV_ACT.)
+      if (nntrainer::cuda::dev_only((const void *)out_t.getData())) {
+        nntrainer::cuda::StreamManager::Global().finish();
+        if (!nntrainer::cuda::copy_any((void *)last_out_buf_data,
+                                       (const void *)out_t.getData(),
+                                       sizeof(float) * buf_size))
+          throw std::runtime_error(
+            "CausalLM: D2H staging of the fp32 logits failed");
+      } else {
+        std::memcpy(last_out_buf_data, out_t.getData(),
+                    sizeof(float) * buf_size);
+      }
+#else
       std::memcpy(last_out_buf_data, out_t.getData(),
                   sizeof(float) * buf_size);
+#endif
     }
 
     output.push_back(last_out_buf_data);

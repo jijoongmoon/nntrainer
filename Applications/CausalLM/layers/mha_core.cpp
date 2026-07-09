@@ -2419,6 +2419,17 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         if (!k_rope_gpu) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
           nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#if defined(ENABLE_FP16)
+          NNTR_THROW_IF(
+            b_cache_key_step.getDataType() ==
+                ml::train::TensorDim::DataType::FP16 &&
+              nntrainer::cuda::dev_only(
+                (void *)b_cache_key_step.getData<_FP16>()),
+            std::runtime_error)
+            << "device-only KV (NNTR_CUDA_KV_DEV) requires GPU RoPE for K; the "
+               "host fallback would fault (NNTR_CUDA_ROPE off or RoPE LUT "
+               "range miss at cache_index=" << cache_index << ")";
+#endif
 #endif
           apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
                                      cache_index, true);
@@ -2451,8 +2462,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           auto *vout = reinterpret_cast<unsigned short *>(
             b_cache_value_step.getData<_FP16>());
           const bool dev = nntrainer::cuda::dev_accessible(vout);
+          // Device-only KV (NNTR_CUDA_KV_DEV): the host copyData fallback
+          // below would dereference a cudaMalloc pointer -- always take the
+          // GPU copy for a device-only destination, independent of the
+          // VCOPY_PREFILL opt-in.
+          const bool v_dev_only = nntrainer::cuda::dev_only(vout);
           static const bool m2b_v = nntr_env_on("NNTR_CUDA_M2B");
-          if (cuda_elt && dev && (value_step.height() == 1 || vcopy_prefill)) {
+          if (cuda_elt && dev &&
+              (value_step.height() == 1 || vcopy_prefill || v_dev_only)) {
             if (m2b_v) {
               // M2-B: write V into the cache at the live slot d_pos[0] computed
               // on-device (vbase = cache BASE for this batch) -> correct on replay.
@@ -2474,6 +2491,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         if (!v_copy_gpu) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
           nntrainer::cuda::StreamManager::Global().finishIfAsync();
+          NNTR_THROW_IF(nntrainer::cuda::dev_only(
+                          (void *)b_cache_value_step.getData<_FP16>()),
+                        std::runtime_error)
+            << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
+               "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";
 #endif
           b_cache_value_step.copyData(value_step);
         }

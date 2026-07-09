@@ -164,4 +164,31 @@ bool dev_accessible(const void *p) {
   return false;
 }
 
+bool dev_only(const void *p) {
+  if (p == nullptr)
+    return false;
+  cudaPointerAttributes a{};
+  const bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess;
+  cudaGetLastError();
+  return ok && a.type == cudaMemoryTypeDevice;
+}
+
+bool device_memset0(void *p, size_t bytes) {
+  if (p == nullptr || bytes == 0)
+    return false;
+  const bool ok = cudaMemset(p, 0, bytes) == cudaSuccess;
+  cudaGetLastError();
+  return ok;
+}
+
+bool copy_any(void *dst, const void *src, size_t bytes) {
+  if (dst == nullptr || src == nullptr || bytes == 0)
+    return false;
+  // cudaMemcpyDefault resolves H2D/D2H/D2D/H2H from the pointer attributes;
+  // synchronous, so the caller may immediately consume the destination.
+  const bool ok = cudaMemcpy(dst, src, bytes, cudaMemcpyDefault) == cudaSuccess;
+  cudaGetLastError();
+  return ok;
+}
+
 } // namespace nntrainer::cuda

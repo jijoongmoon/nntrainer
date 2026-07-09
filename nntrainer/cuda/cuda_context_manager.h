@@ -130,6 +130,24 @@ private:
  */
 bool dev_accessible(const void *p);
 
+/**
+ * @brief True iff the pointer is DEVICE-ONLY memory (cudaMalloc): the host
+ *        cannot dereference it, so every host read/write must stage. False for
+ *        managed/pinned/host memory. Companion of dev_accessible() for the
+ *        device-resident (NNTR_CUDA_DEV_ACT / NNTR_CUDA_KV_DEV) pools -- the
+ *        gate for "auto-route to the GPU kernel / staged copy instead of the
+ *        host fallback" decisions.
+ */
+bool dev_only(const void *p);
+
+/**
+ * @brief Staged-copy + memset helpers for device-only pool tensors, so app
+ *        code (KV manager, logits readback) does not include cuda_runtime.
+ *        All return false on failure (caller keeps its host path).
+ */
+bool device_memset0(void *p, size_t bytes);
+bool copy_any(void *dst, const void *src, size_t bytes); // cudaMemcpyDefault
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_CONTEXT_MANAGER_H__

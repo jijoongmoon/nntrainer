@@ -20,6 +20,7 @@
 #include <cpu_ops_table.h>
 
 #include <cstdlib>
+#include <cstring>
 
 #include <tensor.h>
 
@@ -50,9 +51,36 @@ class CudaComputeOps : public CpuComputeOps {
 public:
   // Plain elementwise copy (Y = X). Tensor::copy() calls this unconditionally
   // (no supports_*() guard); correct for host and (host-coherent) managed
-  // pointers. A device-kernel copy is a later residency refinement.
+  // pointers. Under the device-only pools (NNTR_CUDA_DEV_ACT / KV_DEV) either
+  // endpoint may be cudaMalloc memory the host loop below would fault on --
+  // device_copy() routes contiguous same-type copies through a stream-ordered
+  // cudaMemcpyAsync (legal inside graph capture, ordered against the
+  // producing kernels on the same stream); a copy the host reads next (D2H)
+  // drains first. Strided device copies do not occur in the forward path --
+  // fail loudly rather than fault.
+  static bool device_copy(const void *X, void *Y, size_t bytes,
+                          bool contiguous) {
+    if (!(cuda::dev_only(X) || cuda::dev_only(Y)))
+      return false;
+    if (!contiguous)
+      throw std::runtime_error(
+        "CudaComputeOps: strided copy on device-only memory is unsupported");
+    auto &sm = cuda::StreamManager::Global();
+    if (cudaMemcpyAsync(Y, X, bytes, cudaMemcpyDefault, sm.GetStream()) !=
+        cudaSuccess) {
+      cudaGetLastError();
+      throw std::runtime_error(
+        "CudaComputeOps: device copy (cudaMemcpyAsync) failed");
+    }
+    if (!cuda::dev_only(Y))
+      sm.finish(); // D2H: the host consumes the destination immediately
+    return true;
+  }
+
   void scopy_fp32(const unsigned int N, const float *X, const unsigned int incX,
                   float *Y, const unsigned int incY) override {
+    if (device_copy(X, Y, (size_t)N * sizeof(float), incX == 1 && incY == 1))
+      return;
     for (unsigned int i = 0; i < N; ++i)
       Y[i * incY] = X[i * incX];
   }
@@ -60,18 +88,64 @@ public:
 #ifdef ENABLE_FP16
   void scopy_fp16(const unsigned int N, const _FP16 *X, const unsigned int incX,
                   _FP16 *Y, const unsigned int incY) override {
+    if (device_copy(X, Y, (size_t)N * sizeof(_FP16), incX == 1 && incY == 1))
+      return;
     for (unsigned int i = 0; i < N; ++i)
       Y[i * incY] = X[i * incX];
   }
+  // Converting copies with a device-only endpoint: stage through host temps
+  // (synchronous; these do not occur inside graph capture today).
   void scopy_fp32_to_fp16(const unsigned int N, const float *X,
                           const unsigned int incX, _FP16 *Y,
                           const unsigned int incY) override {
+    if (cuda::dev_only(X) || cuda::dev_only(Y)) {
+      if (incX != 1 || incY != 1)
+        throw std::runtime_error(
+          "CudaComputeOps: strided converting copy on device-only memory");
+      cuda::StreamManager::Global().finish();
+      std::vector<float> xs;
+      const float *xp = X;
+      if (cuda::dev_only(X)) {
+        xs.resize(N);
+        cuda::copy_any(xs.data(), X, (size_t)N * sizeof(float));
+        xp = xs.data();
+      }
+      std::vector<_FP16> ys(N);
+      for (unsigned int i = 0; i < N; ++i)
+        ys[i] = static_cast<_FP16>(xp[i]);
+      if (cuda::dev_only(Y))
+        cuda::copy_any(Y, ys.data(), (size_t)N * sizeof(_FP16));
+      else
+        std::memcpy(Y, ys.data(), (size_t)N * sizeof(_FP16));
+      return;
+    }
     for (unsigned int i = 0; i < N; ++i)
       Y[i * incY] = static_cast<_FP16>(X[i * incX]);
   }
   void scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
                           const unsigned int incX, float *Y,
                           const unsigned int incY) override {
+    if (cuda::dev_only(X) || cuda::dev_only(Y)) {
+      if (incX != 1 || incY != 1)
+        throw std::runtime_error(
+          "CudaComputeOps: strided converting copy on device-only memory");
+      cuda::StreamManager::Global().finish();
+      std::vector<_FP16> xs;
+      const _FP16 *xp = X;
+      if (cuda::dev_only(X)) {
+        xs.resize(N);
+        cuda::copy_any(xs.data(), X, (size_t)N * sizeof(_FP16));
+        xp = xs.data();
+      }
+      std::vector<float> ys(N);
+      for (unsigned int i = 0; i < N; ++i)
+        ys[i] = static_cast<float>(xp[i]);
+      if (cuda::dev_only(Y))
+        cuda::copy_any(Y, ys.data(), (size_t)N * sizeof(float));
+      else
+        std::memcpy(Y, ys.data(), (size_t)N * sizeof(float));
+      return;
+    }
     for (unsigned int i = 0; i < N; ++i)
       Y[i * incY] = static_cast<float>(X[i * incX]);
   }

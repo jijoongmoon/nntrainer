@@ -19,6 +19,11 @@
 #include <engine.h>
 #include <mem_allocator.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_mem_allocator.h>
+#endif
+
 namespace causallm {
 
 void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
@@ -106,6 +111,24 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // check made =0 impossible to honor -- the only way to force a plain-host KV
   // cache (WDDM, where the UVM setZero host-faults / attention can't reach a
   // managed cache) is an explicit NNTR_CUDA_KV_UVM=0.
+  // Device-resident KV (NNTR_CUDA_KV_DEV=1, opt-in): the cache lives in
+  // cudaMalloc DEVICE memory instead of UVM/pinned. WDDM (cMA==0) campaign
+  // tier: managed KV hangs (remigration storm) and pinned KV pays PCIe on
+  // every attention read; device-resident reads at VRAM speed. Steady state
+  // has zero host KV-byte touches on the SAFE profile (GPU rope writes K,
+  // GPU scalar-mul writes V -- the V-copy gate auto-routes for a device-only
+  // destination -- and split-KV flash reads); setZero/save/load stage through
+  // cuda::device_memset0/copy_any. Falls back to the UVM path if the cuda
+  // engine is not registered. Takes precedence over NNTR_CUDA_KV_UVM.
+  const char *kv_dev = std::getenv("NNTR_CUDA_KV_DEV");
+  if (!svm_alloc && kv_dev != nullptr && kv_dev[0] == '1') {
+    auto allocs = nntrainer::Engine::Global().getAllocators();
+    if (allocs.find("cuda") != allocs.end()) {
+      svm_alloc =
+        std::make_shared<nntrainer::CudaMemAllocator>(/*device_only=*/true);
+    }
+  }
+
   const char *kv_uvm = std::getenv("NNTR_CUDA_KV_UVM");
   if (!svm_alloc && kv_uvm != nullptr && kv_uvm[0] != '0') {
     auto allocs = nntrainer::Engine::Global().getAllocators();
@@ -145,8 +168,26 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
       layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
       layer_caches_[i].value_cache.setData(
         svm_pool_->getMemory(tokens[2 * i + 1]), 0, false);
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Device-only KV (NNTR_CUDA_KV_DEV): host setZero would dereference a
+      // cudaMalloc pointer -- zero on the device instead. Detected from the
+      // pointer itself so the UVM/pinned/SVM paths keep the host memset.
+      auto zero_kv = [](nntrainer::Tensor &t) {
+        void *ptr = (void *)t.getData<char>();
+        if (nntrainer::cuda::dev_only(ptr)) {
+          if (!nntrainer::cuda::device_memset0(ptr, t.bytes()))
+            throw std::runtime_error(
+              "KVCacheManager: device memset of the KV cache failed");
+        } else {
+          t.setZero();
+        }
+      };
+      zero_kv(layer_caches_[i].key_cache);
+      zero_kv(layer_caches_[i].value_cache);
+#else
       layer_caches_[i].key_cache.setZero();
       layer_caches_[i].value_cache.setZero();
+#endif
     }
   } else {
     for (unsigned int i = 0; i < num_layers; ++i) {
@@ -302,8 +343,27 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len) const {
     nntrainer::Tensor v_slice = const_cast<nntrainer::Tensor &>(lc.value_cache)
                                   .getSharedDataTensor(save_dim, 0, true);
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // Device-only KV: Tensor::save reads on the host -- stage D2H first.
+    auto save_slice = [&f](nntrainer::Tensor &slice) {
+      void *ptr = (void *)slice.getData<char>();
+      if (nntrainer::cuda::dev_only(ptr)) {
+        nntrainer::Tensor host_t(slice.getDim(), true);
+        if (!nntrainer::cuda::copy_any((void *)host_t.getData<char>(), ptr,
+                                       host_t.bytes()))
+          throw std::runtime_error(
+            "KVCacheManager::save: D2H staging of the device KV failed");
+        host_t.save(f);
+      } else {
+        slice.save(f);
+      }
+    };
+    save_slice(k_slice);
+    save_slice(v_slice);
+#else
     k_slice.save(f);
     v_slice.save(f);
+#endif
   }
 }
 
@@ -330,8 +390,28 @@ void KVCacheManager::load(const std::string &path, unsigned int seq_len) {
     nntrainer::Tensor v_slice =
       lc.value_cache.getSharedDataTensor(load_dim, 0, true);
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // Device-only KV: Tensor::read writes on the host -- read into a host
+    // temp, then push H2D.
+    auto load_slice = [&f](nntrainer::Tensor &slice) {
+      void *ptr = (void *)slice.getData<char>();
+      if (nntrainer::cuda::dev_only(ptr)) {
+        nntrainer::Tensor host_t(slice.getDim(), true);
+        host_t.read(f);
+        if (!nntrainer::cuda::copy_any(ptr, (const void *)host_t.getData<char>(),
+                                       host_t.bytes()))
+          throw std::runtime_error(
+            "KVCacheManager::load: H2D staging of the device KV failed");
+      } else {
+        slice.read(f);
+      }
+    };
+    load_slice(k_slice);
+    load_slice(v_slice);
+#else
     k_slice.read(f);
     v_slice.read(f);
+#endif
   }
 
   cache_pos_ = seq_len;
