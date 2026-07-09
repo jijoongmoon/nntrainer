@@ -14,6 +14,7 @@
  * @todo   check before allocate that finalize is done
  */
 
+#include <env_compat.h>
 #include <memory_pool.h>
 #include <nntrainer_log.h>
 #include <residency_planner.h>
@@ -281,7 +282,7 @@ void TensorPool::allocate(bool init) {
    * handle. With the pool off every tensor derives SVM/HOST and all binding
    * sites fall through to today's paths (byte-identical). */
   static const bool clmem_pool_on =
-    std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr;
+    nntr_env_on("NNTR_GPU_CLMEM_POOL");
   // Capability, not name: can this allocator back a device cl_mem pool
   // (ClBufferPool)? True only for ClSVMAllocator — same set as the old
   // getName()=="gpu-svm", byte-identical. [#4=B allocator-owns-residency]

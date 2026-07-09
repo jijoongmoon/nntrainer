@@ -87,7 +87,8 @@ public:
    * (GPU-resident activations), else the SVM-backed MemoryPool. [Mem M2]
    */
   std::shared_ptr<MemoryPool>
-  makePool(const std::shared_ptr<MemAllocator> &self) override;
+  makePool(const std::shared_ptr<MemAllocator> &self,
+           const std::string &pool_name = "") override;
 
 private:
   opencl::ContextManager &ctx_;

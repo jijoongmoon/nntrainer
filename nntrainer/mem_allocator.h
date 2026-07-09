@@ -148,7 +148,8 @@ public:
    * @return the backing pool
    */
   virtual std::shared_ptr<MemoryPool>
-  makePool(const std::shared_ptr<MemAllocator> &self);
+  makePool(const std::shared_ptr<MemAllocator> &self,
+           const std::string &pool_name = "");
 };
 } // namespace nntrainer
 

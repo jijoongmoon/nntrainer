@@ -10,6 +10,7 @@
  * @brief   Implementation of OpenCL SVM-backed MemAllocator subclass.
  */
 
+#include <env_compat.h>
 #include <cl_buffer_pool.h>
 #include <cl_svm_allocator.h>
 #include <cstdlib>
@@ -31,13 +32,38 @@ std::unordered_set<void *> host_owned;
 ClSVMAllocator::ClSVMAllocator(opencl::ContextManager &ctx) : ctx_(ctx) {}
 
 std::shared_ptr<MemoryPool>
-ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self) {
+ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self,
+                         const std::string &pool_name) {
   // NNTR_GPU_CLMEM_POOL: back the activation plane with a device cl_mem pool
   // (ClBufferPool) so activations stay GPU-resident as plain cl_mem; default
   // OFF => the SVM-backed MemoryPool. Same condition as the old TensorPool
   // getName()=="gpu-svm" && env check — now owned by the allocator. [Mem M2]
-  if (std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr)
-    return std::make_shared<ClBufferPool>(self);
+  if (nntr_env_on("NNTR_GPU_CLMEM_POOL")) {
+    // [weight plane skip] No WEIGHT tensor ever binds its per-offset cl_mem:
+    // the v8c FCs read their own packed backing and the norms are host-read
+    // (runtime residency dump: 566/566 gauss4 weights classify SVM), yet the
+    // shadow plane is fully committed by the Windows/WDDM driver (~1373MB in
+    // the process working set for gauss4). Give the never-consumed plane only
+    // to the pools that use it (activations); the weight pool keeps the plain
+    // SVM MemoryPool. NNTR_CLMEM_WEIGHT_PLANE=1 restores the old behavior.
+    static const bool force_weight_plane = []() {
+      const char *e = std::getenv("NNTR_CLMEM_WEIGHT_PLANE");
+      return e != nullptr && e[0] == '1';
+    }();
+    // x86 only for now: the never-bound claim is field-verified on Intel
+    // (Windows residency dump + Linux A/B: no RSS/golden change). Adreno also
+    // auto-sets NNTR_GPU_CLMEM_POOL and its binding pattern is unverified on
+    // device -- keep the old plane there until a device A/B clears it.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    const bool skip_weight_plane =
+      pool_name == "weight_pool" && !force_weight_plane;
+#else
+    const bool skip_weight_plane = false;
+    (void)force_weight_plane;
+#endif
+    if (!skip_weight_plane)
+      return std::make_shared<ClBufferPool>(self);
+  }
   return std::make_shared<MemoryPool>(self);
 }
 

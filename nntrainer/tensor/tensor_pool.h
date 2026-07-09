@@ -79,7 +79,7 @@ public:
       // ClSVMAllocator::makePool returns the device pool when
       // NNTR_GPU_CLMEM_POOL is set, the base returns a MemoryPool
       // (byte-identical). [docs/ARCHITECTURE_REFACTOR.md §10 T5 / Mem M2]
-      mem_pool = allocator_->makePool(allocator_);
+      mem_pool = allocator_->makePool(allocator_, fsu_name);
     }
   }
 

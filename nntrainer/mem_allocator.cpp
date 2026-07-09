@@ -96,7 +96,9 @@ void MemAllocator::free(void *ptr) {
 }
 
 std::shared_ptr<MemoryPool>
-MemAllocator::makePool(const std::shared_ptr<MemAllocator> &self) {
+MemAllocator::makePool(const std::shared_ptr<MemAllocator> &self,
+                       const std::string &pool_name) {
+  (void)pool_name; // identity only matters to device-plane allocators
   return std::make_shared<MemoryPool>(self);
 }
 
