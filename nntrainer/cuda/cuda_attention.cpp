@@ -12,6 +12,7 @@
 
 #include "cuda_attention.h"
 
+#include <env_compat.h>
 #include <cuda_blas_manager.h>
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
@@ -595,7 +596,7 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   // max-chunk stride/grid (g_sk_max_nchunks, published at prewarm) so one capture
   // serves every token. M1/non-graph (dpos=nullptr) uses the live n_chunks ->
   // bit-identical to the original. Mirror the dense path's m2b gate (line ~839).
-  static const bool m2b = std::getenv("NNTR_CUDA_M2B") != nullptr;
+  static const bool m2b = nntr_env_on("NNTR_CUDA_M2B");
   const int *dpos = (m2b && g_sk_max_nchunks > 0) ? cuda_pos_buffer() : nullptr;
   const int max_nc = dpos ? g_sk_max_nchunks : n_chunks;
   std::lock_guard<std::mutex> lk(g_sk_mtx);
@@ -821,7 +822,7 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // attn_core_il_fp16 below, fp16-identical. Opt-in (NNTR_CUDA_BLOCKQ) until
   // folded; only the multi-row (prefill) path with head_dim in {256, 512}
   // (gemma4 sliding/global) -- decode (N_q==1) keeps split-KV above.
-  static const bool blockq_on = std::getenv("NNTR_CUDA_BLOCKQ") != nullptr;
+  static const bool blockq_on = nntr_env_on("NNTR_CUDA_BLOCKQ");
   if (blockq_on && N_q > 1 &&
       (head_dim == 128 || head_dim == 256 || head_dim == 512)) {
     const char *fn = (head_dim == 256)   ? "attn_blockq_d256"
@@ -876,7 +877,7 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   kernel->SetKernelArguments(11, &softcap, sizeof(softcap));
   // M2-B: bind the device position buffer so the captured graph reads the live
   // cache_from/N_kv on replay; nullptr keeps the baked-arg (non-graph) path.
-  static const bool m2b_attn = std::getenv("NNTR_CUDA_M2B") != nullptr;
+  static const bool m2b_attn = nntr_env_on("NNTR_CUDA_M2B");
   const int *attn_dpos = m2b_attn ? cuda_pos_buffer() : nullptr;
   kernel->SetKernelArguments(12, &attn_dpos, sizeof(attn_dpos));
   const int grid[3] = {N_q, num_heads_Q, 1};

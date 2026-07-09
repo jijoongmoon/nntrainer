@@ -11,6 +11,7 @@
  *
  */
 
+#include <env_compat.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -158,7 +159,7 @@ void ScalarMultiplyLayer::incremental_forwarding(
     bool done = false;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-      static const bool gpu = std::getenv("NNTR_CUDA_ELTWISE") != nullptr;
+      static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
       if (gpu) {
         auto *ip =
           reinterpret_cast<const unsigned short *>(in_step.getData<_FP16>());

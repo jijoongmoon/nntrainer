@@ -11,6 +11,7 @@
  *
  */
 
+#include <env_compat.h>
 #include <addition_layer.h>
 #include <cstdio>
 #include <cstdlib>
@@ -76,7 +77,7 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
     // in one kernel, keeping the residual on-device. Opt-in (NNTR_CUDA_ELTWISE).
     if (context.getNumInputs() == 2 &&
         hidden_.getDataType() == ml::train::TensorDim::DataType::FP16) {
-      static const bool gpu = std::getenv("NNTR_CUDA_ELTWISE") != nullptr;
+      static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
       if (gpu) {
         const Tensor &i0 = context.getInput(0);
         const Tensor &i1 = context.getInput(1);

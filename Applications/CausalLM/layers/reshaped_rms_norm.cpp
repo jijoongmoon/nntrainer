@@ -11,6 +11,7 @@
  *
  */
 
+#include <env_compat.h>
 #include <cmath>
 #include <cpu_backend.h>
 #include <reshaped_rms_norm.h>
@@ -228,7 +229,7 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     nntrainer::cuda::StreamManager::Global().finishIfAsync();
     if (!gpu_done &&
         in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-      static const bool gpu = std::getenv("NNTR_CUDA_QKNORM") != nullptr;
+      static const bool gpu = nntr_env_on("NNTR_CUDA_QKNORM");
       if (gpu) {
         auto *ip =
           reinterpret_cast<const unsigned short *>(in_step.getData<_FP16>());

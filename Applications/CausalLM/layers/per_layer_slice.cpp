@@ -10,6 +10,7 @@
  * @brief  Selects per-layer input chunk from packed per-layer embedding tensor.
  */
 
+#include <env_compat.h>
 #include <cstdlib>
 #include <cstring>
 #include <per_layer_slice.h>
@@ -88,7 +89,7 @@ void PerLayerSliceLayer::incremental_forwarding(
       _FP16 *out_data = out_step.getData<_FP16>();
       bool done = false;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-      static const bool gpu = std::getenv("NNTR_CUDA_ELTWISE") != nullptr;
+      static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
       if (gpu) {
         const bool dev = nntrainer::cuda::dev_accessible(in_data);
         if (dev && nntrainer::cuda::cuda_slice_copy_fp16(

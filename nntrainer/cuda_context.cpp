@@ -82,8 +82,10 @@ void CudaContext::initialize() noexcept {
     setenv("NNTR_CUDA_PREWARM", "1", 0);
     if (!caps_.integrated && context_inst_.concurrentManagedAccess()) {
       // Discrete (RTX/dGPU) residency + decode-CUDA-graph add-ons: device-only
-      // activations, prefill v-copy, host RMSNorm (CUDA RMSNorm is not a win on
-      // discrete), the M2-B decode graph, and async submission. On integrated
+      // activations, prefill v-copy, ALL-rows CUDA RMSNorm (despite the env's
+      // name, "=all" RAISES the CUDA row cap to everything -- see
+      // cuda_rmsnorm_layer.cpp; a non-'a' value like =1 is what disables it),
+      // the M2-B decode graph, and async submission. On integrated
       // (Tegra/Orin) these are skipped — managed activations are the right pool.
       // Also skipped when concurrentManagedAccess==0 (Windows WDDM): each of
       // these lets a HOST op touch managed/device pool memory around in-flight

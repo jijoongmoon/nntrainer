@@ -11,6 +11,7 @@
  * @brief  This code is based on custom_multi_head_attention_layer.cpp.
  *         This code is a part of the break down version of the mha layer.
  */
+#include <env_compat.h>
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -2283,7 +2284,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       // host. Opt-in (NNTR_CUDA_ROPE) until the whole decode chain is on-GPU.
       bool q_rope_gpu = false;
       {
-        static const bool cuda_rope = std::getenv("NNTR_CUDA_ROPE") != nullptr;
+        static const bool cuda_rope = nntr_env_on("NNTR_CUDA_ROPE");
         if (cuda_rope &&
             query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
           if (cached_freqs_cos_fp16 == nullptr ||
@@ -2318,7 +2319,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 // captured decode graph stays valid across tokens. Set d_pos here
                 // only when NOT capturing (non-graph decode); under capture the
                 // neuralnet scaffold sets it once per token before the replay.
-                static const bool m2b = std::getenv("NNTR_CUDA_M2B") != nullptr;
+                static const bool m2b = nntr_env_on("NNTR_CUDA_M2B");
                 if (m2b) {
                   if (!nntrainer::cuda::StreamManager::Global().isCapturing())
                     nntrainer::cuda::cuda_set_pos((int)cache_index,
@@ -2375,7 +2376,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         bool k_rope_gpu = false;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
         {
-          static const bool cuda_rope = std::getenv("NNTR_CUDA_ROPE") != nullptr;
+          static const bool cuda_rope = nntr_env_on("NNTR_CUDA_ROPE");
           auto dev = [](const void *p) {
             return nntrainer::cuda::dev_accessible(p);
           };
@@ -2394,7 +2395,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 rope_lut_device(cached_freqs_cos_fp16, half);
               const unsigned short *sind =
                 rope_lut_device(cached_freqs_sin_fp16, half);
-              static const bool m2b_k = std::getenv("NNTR_CUDA_M2B") != nullptr;
+              static const bool m2b_k = nntr_env_on("NNTR_CUDA_M2B");
               if (cosd && sind && m2b_k) {
                 // M2-B: write RoPE'd K into the cache at the live slot computed
                 // on-device from d_pos[0] (kbase = cache BASE for this batch, not
@@ -2435,7 +2436,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
         {
           static const bool cuda_elt =
-            std::getenv("NNTR_CUDA_ROPE") != nullptr;
+            nntr_env_on("NNTR_CUDA_ROPE");
           // V-copy historically stayed host for the prefill big-step (height>1)
           // because a host attention path could read the V cache unsynced. With
           // GPU attention (NNTR_CUDA_ATTN) + UVM KV cache (NNTR_CUDA_KV_UVM),
@@ -2444,13 +2445,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // NNTR_CUDA_VCOPY_PREFILL while validating; removes the per-layer
           // finishIfAsync bubble that made async-on prefill slow.
           static const bool vcopy_prefill =
-            std::getenv("NNTR_CUDA_VCOPY_PREFILL") != nullptr;
+            nntr_env_on("NNTR_CUDA_VCOPY_PREFILL");
           auto *vin =
             reinterpret_cast<unsigned short *>(value_step.getData<_FP16>());
           auto *vout = reinterpret_cast<unsigned short *>(
             b_cache_value_step.getData<_FP16>());
           const bool dev = nntrainer::cuda::dev_accessible(vout);
-          static const bool m2b_v = std::getenv("NNTR_CUDA_M2B") != nullptr;
+          static const bool m2b_v = nntr_env_on("NNTR_CUDA_M2B");
           if (cuda_elt && dev && (value_step.height() == 1 || vcopy_prefill)) {
             if (m2b_v) {
               // M2-B: write V into the cache at the live slot d_pos[0] computed
@@ -2728,7 +2729,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // (2..FLASH_MIN_PREFILL-1) does not fall to the host compute_kcaches path,
   // which faults on a device-only activation pool (NNTR_CUDA_DEV_ACT) and was
   // the short-prompt crash. OpenCL is unaffected (NNTR_CUDA_ATTN is cuda-only).
-  static const bool _cuda_attn_on = std::getenv("NNTR_CUDA_ATTN") != nullptr;
+  static const bool _cuda_attn_on = nntr_env_on("NNTR_CUDA_ATTN");
   if (use_gemm_attention &&
       (step_size >= FLASH_MIN_PREFILL || (_mha_gpu_decode && step_size == 1) ||
        _cuda_attn_on)) {
@@ -3573,7 +3574,7 @@ void MHACoreLayer::gemm_attention(
   // sliding mask, GQA, NO softcap). Default OFF (NNTR_CUDA_ATTN) until verified;
   // falls through to the host path when off / not device-resident.
   {
-    static const bool cuda_attn = std::getenv("NNTR_CUDA_ATTN") != nullptr;
+    static const bool cuda_attn = nntr_env_on("NNTR_CUDA_ATTN");
     if (cuda_attn && q_fp16 && o_fp16 && !kv_int8 && Q_fp16_src && O_fp16) {
       auto dev_ok = [](const void *p) {
         return nntrainer::cuda::dev_accessible(p);

@@ -15,6 +15,7 @@
  *         the CUDA kernels land in P3 (cuda_operations/).
  */
 
+#include <env_compat.h>
 #include <compute_ops.h>
 #include <cpu_ops_table.h>
 
@@ -93,7 +94,7 @@ public:
     // the FFN/PLE activation stays on the device. NNTR_CUDA_ASYNC governs the
     // drain.
     if (dt == ml::train::TensorDim::DataType::FP16) {
-      static const bool gpu = std::getenv("NNTR_CUDA_GEGLU") != nullptr;
+      static const bool gpu = nntr_env_on("NNTR_CUDA_GEGLU");
       if (gpu && n > 0) {
         auto *a =
           reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +

@@ -18,6 +18,22 @@
 #ifndef __NNTR_ENV_COMPAT_H__
 #define __NNTR_ENV_COMPAT_H__
 
+#include <cstdlib>
+
+/**
+ * @brief VALUE-checked env truthiness: set AND not starting with '0'.
+ *        The GPU contexts auto-inject their tuned defaults with
+ *        setenv(..., overwrite=0), so a consumer that only checks presence
+ *        can never be turned off with =0 -- three separate debugging
+ *        sessions hit that trap (DEV_ACT, KV_UVM, ELTWISE). Every consumer
+ *        of an auto-injected flag must use this instead of a raw
+ *        getenv()!=nullptr.
+ */
+static inline bool nntr_env_on(const char *name) {
+  const char *e = std::getenv(name);
+  return e != nullptr && e[0] != '0';
+}
+
 #if defined(_WIN32)
 #include <cstdlib>
 
