@@ -10,6 +10,7 @@
  * @brief   NVIDIA CUDA application context implementation (mirror of ClContext).
  */
 
+#include <env_compat.h>
 #include <cuda_context.h>
 
 #include <mutex>

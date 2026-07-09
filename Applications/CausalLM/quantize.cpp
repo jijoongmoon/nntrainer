@@ -54,6 +54,7 @@
  *     nntr_quantize /path/to/qwen3-4b --config /path/to/target_nntr_config.json
  */
 
+#include <env_compat.h>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>

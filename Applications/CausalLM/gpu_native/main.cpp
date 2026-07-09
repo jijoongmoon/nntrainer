@@ -22,6 +22,7 @@
 
 #include "qwen3_forward.h"
 
+#include <env_compat.h>
 #include <chrono>
 #include <functional>
 #include <cl_context.h>

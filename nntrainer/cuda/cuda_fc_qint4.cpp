@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 #include <mutex>
