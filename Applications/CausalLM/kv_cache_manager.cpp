@@ -101,7 +101,13 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // GPU attention read it without the per-call host->device mirror and lets GPU
   // RoPE write K straight into the device cache -- the precondition for a fully
   // on-GPU decode chain. Same pooled path as the OpenCL SVM cache below.
-  if (!svm_alloc && std::getenv("NNTR_CUDA_KV_UVM") != nullptr) {
+  // VALUE-checked (=0 disables), same contract as the other SAFE cuda env:
+  // CudaContext auto-defaults it to "1" (setenv overwrite=0), so a presence
+  // check made =0 impossible to honor -- the only way to force a plain-host KV
+  // cache (WDDM, where the UVM setZero host-faults / attention can't reach a
+  // managed cache) is an explicit NNTR_CUDA_KV_UVM=0.
+  const char *kv_uvm = std::getenv("NNTR_CUDA_KV_UVM");
+  if (!svm_alloc && kv_uvm != nullptr && kv_uvm[0] != '0') {
     auto allocs = nntrainer::Engine::Global().getAllocators();
     auto it = allocs.find("cuda");
     if (it != allocs.end() && it->second &&
