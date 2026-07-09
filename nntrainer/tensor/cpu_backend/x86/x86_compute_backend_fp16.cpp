@@ -413,10 +413,25 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
                                       _FP16 *dst_act_mtx_f16,
                                       uint32_t idx_variant, bool transB,
                                       _FP16 lower_bound, _FP16 upper_bound) {
-  // x86 has no KAI fp16 micro-kernel; the GPU/v8c path is used at runtime, so
-  // this CPU branch is link-only. (Upstream removed the old __fallback_nntr_*
-  // stub in the kleidiai fallback refactor.)
-  throw std::runtime_error("NYI : nntr_gemm_qai8dxp_qsi4cxp_packed<_FP16>");
+  // x86 has no KAI fp16 micro-kernel. Route through the f32 fallback instead
+  // of throwing: fp16 LHS -> f32 staging, f32 GEMM (the qai8dx dynamic quant
+  // happens inside the fallback), clamp+narrow back to fp16. Correct-but-slow;
+  // this branch only runs when a GPU path bails (diagnostics, gate misfires) --
+  // the previous NYI throw killed the whole process there (field 2026-07-09:
+  // every NNTR_DUMP_STATS CUDA run died at decode step 1 on the first host
+  // fallback). Wrapper-safe: the element conversions go through operator
+  // float() on both the MSVC uint16 Half wrapper and native _Float16.
+  const _FP16 *lhs16 = static_cast<const _FP16 *>(lhs_native_mtx_f16);
+  std::vector<float> lhs32((size_t)m * k);
+  for (size_t i = 0; i < (size_t)m * k; ++i)
+    lhs32[i] = (float)lhs16[i];
+  std::vector<float> dst32((size_t)m * n);
+  __fallback_gemm_qai8dxp_qsi4cxp_packed(m, n, k, lhs32.data(),
+                                         rhs_packed_mtx_qs4cx, dst32.data(),
+                                         idx_variant, (float)lower_bound,
+                                         (float)upper_bound);
+  for (size_t i = 0; i < (size_t)m * n; ++i)
+    dst_act_mtx_f16[i] = (_FP16)dst32[i];
 }
 
 } /* namespace nntrainer */

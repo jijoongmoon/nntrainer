@@ -9,10 +9,12 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <atomic>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <thread>
 
 #include <compute_ops.h>
 #include <cpu_backend.h>
@@ -758,6 +760,62 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     const unsigned int M = getDim().height();
     const unsigned int K = getDim().width();
     const unsigned int N = output.getDim().width();
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||             \
+  defined(__i386__)
+    // x86 reference GEMM: there is no KAI fp16 micro-kernel here (ARM i8mm)
+    // and the packed-GEMM fallback is NYI, so this branch used to kill the
+    // process ("NYI : nntr_gemm_qai8dxp_qsi4cxp_packed<_FP16>") whenever a
+    // GPU path bailed. Compute directly from the PLAIN nibbles + per-channel
+    // fp32 scales in fp32: correct-but-slow, diagnostics/fallback only.
+    // Nibble convention (field-validated by the CUDA dp4a/naive kernels that
+    // read the SAME plain bytes): row-major [K,N] linear index i = k*N + n,
+    // byte i/2, EVEN i -> HIGH nibble, signed two's complement. NOTE the
+    // __fallback_matmul_* reference uses even->LOW + unsigned-offset-8 -- NOT
+    // this layout, do not route there.
+    if (!input.isPackedF16Activation()) {
+      const uint8_t *plain = input.getData<uint8_t>();
+      const float *fscale = input.getScale<float>();
+      const _FP16 *xact = (const _FP16 *)getData();
+      _FP16 *yout = output.getData<_FP16>();
+      const size_t Ms = M, Ns = N, Ks = K;
+      const unsigned int nthreads =
+        std::max(1u, std::thread::hardware_concurrency());
+      std::atomic<size_t> next_n{0};
+      const size_t chunk = 256;
+      auto worker = [&]() {
+        for (;;) {
+          const size_t n0 = next_n.fetch_add(chunk);
+          if (n0 >= Ns)
+            return;
+          const size_t n1 = std::min(Ns, n0 + chunk);
+          for (size_t mi = 0; mi < Ms; ++mi) {
+            const _FP16 *xr = xact + mi * Ks;
+            _FP16 *yr = yout + mi * Ns;
+            for (size_t nn = n0; nn < n1; ++nn) {
+              float acc = 0.f;
+              for (size_t kk = 0; kk < Ks; ++kk) {
+                const size_t i = kk * Ns + nn;
+                const uint8_t byte = plain[i >> 1];
+                const int32_t w4 =
+                  (i & 1) ? ((int32_t)(int8_t)(uint8_t)(byte << 4) >> 4)
+                          : ((int32_t)(int8_t)byte >> 4);
+                acc += (float)xr[kk] * (float)w4;
+              }
+              float v = acc * fscale[nn];
+              v = std::min(std::max(v, -65504.f), 65504.f);
+              yr[nn] = (_FP16)v;
+            }
+          }
+        }
+      };
+      std::vector<std::thread> pool;
+      for (unsigned int t = 0; t < nthreads; ++t)
+        pool.emplace_back(worker);
+      for (auto &t : pool)
+        t.join();
+      break;
+    }
+#endif
     const uint8_t *kai_rhs = nullptr;
     if (input.isPackedF16Activation()) {
       kai_rhs = input.getPackedData<uint8_t>();
