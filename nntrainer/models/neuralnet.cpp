@@ -775,7 +775,13 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
             const TensorDim &d = o.getDim();
             const unsigned int H = d.height(), W = d.width(), C = d.channel(),
                                B = d.batch();
-            const unsigned int h0 = std::min(from, H), h1 = std::min(to, H);
+            // The graph writes step outputs at ROW 0 of the (INIT_SEQ_LEN-
+            // padded) tensors -- absolute token indices [from,to) land in the
+            // zero-filled padding on decode steps (field: every decode-window
+            // stat printed 0/0 in the round-6 fnv logs). Scan the actual
+            // written rows [0, to-from).
+            const unsigned int h0 = 0,
+                               h1 = std::min(to > from ? to - from : 0u, H);
             auto scan = [&](auto *base) {
               for (unsigned int b2 = 0; b2 < B; ++b2)
                 for (unsigned int c2 = 0; c2 < C; ++c2)
@@ -812,9 +818,7 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
             float r0[4] = {0, 0, 0, 0};
             {
               const TensorDim &d2 = o.getDim();
-              const size_t off0 =
-                std::min((size_t)from, (size_t)d2.height() - 1) *
-                (size_t)d2.width();
+              const size_t off0 = 0; // first WRITTEN row (see window note)
               const unsigned int nprint =
                 d2.width() < 4 ? d2.width() : 4;
               if (o.getDataType() == ml::train::TensorDim::DataType::FP32) {
@@ -840,8 +844,8 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
               const TensorDim &d3 = o.getDim();
               const unsigned int H3 = d3.height(), W3 = d3.width(),
                                  C3 = d3.channel(), B3 = d3.batch();
-              const unsigned int h0b = std::min(from, H3),
-                                 h1b = std::min(to, H3);
+              const unsigned int h0b = 0,
+                                 h1b = std::min(to > from ? to - from : 0u, H3);
               const size_t esz =
                 o.getDataType() == ml::train::TensorDim::DataType::FP32 ? 4
                                                                         : 2;
