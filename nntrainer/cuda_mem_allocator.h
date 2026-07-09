@@ -61,16 +61,30 @@ public:
   std::string getName() override { return device_only_ ? "cuda-dev" : "cuda-uvm"; }
 
   // UVM (device_only_=false) is unified host+device memory (the SVM analogue)
-  // -> host-addressable + device-visible -> isSVM() derives true, fixing the
-  // old getName()=="gpu-svm" mis-tag. A device_only_ allocator's CONTRACT is
-  // "device memory, the host must not touch it" (manager.h's activation pool)
-  // -> host-addressable false -> isSVM() false. NOTE: on an integrated GPU
-  // (Tegra/Orin) alloc() upgrades a device_only request to cudaMallocManaged
-  // (host-coherent); that runtime upgrade does not change the contract, so the
-  // predicate stays static here. The residency track refines this once a
-  // DeviceCaps.integrated probe consumes it.
+  // -> host-addressable; a device_only_ allocator's CONTRACT is "device
+  // memory, the host must not touch it" (manager.h's activation pool). NOTE:
+  // on an integrated GPU (Tegra/Orin) alloc() upgrades a device_only request
+  // to cudaMallocManaged (host-coherent); that runtime upgrade does not change
+  // the contract, so the predicate stays static here.
   bool isHostAddressable() const override { return !device_only_; }
   bool isDeviceVisible() const override { return true; }
+
+  // [field 2026-07-09, Windows unified-binary hijack] Every isSVM() CONSUMER
+  // in the tree is an OpenCL kernel-binding gate (clSetKernelArgSVMPointer
+  // paths: reshaped_rms_norm / rms_norm_gpu / rms_reverse_norm / mha_core /
+  // per_layer_slice / float_tensor gemv-int4 / ...). Deriving true for UVM
+  // (base isSVM = host-addressable && device-visible, "the SVM analogue")
+  // made the UNIFIED build's OpenCL fast paths hijack CUDA-engine tensors:
+  // the Intel CL kernel silently fails on a non-OpenCL pointer, gpu_done is
+  // set unconditionally, the layer output is NEVER WRITTEN, and the planner's
+  // previous tenant leaks downstream (measured: gauss4 layer0_gated_norm r0
+  // bit-equal to layer0_wq -> whole-model deterministic garbage in every
+  // CUDA-on-Windows config). Linux never sees it: build_cl / build_cuda are
+  // SEPARATE binaries there -- only the Windows unified build compiles both
+  // engines in. To every consumer this flag means "OpenCL SVM", so CUDA
+  // memory must report false; CUDA-side device checks use
+  // cuda::dev_accessible(), not this flag.
+  bool isSVM() const override { return false; }
 
 private:
   bool device_only_;
