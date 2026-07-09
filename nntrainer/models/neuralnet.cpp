@@ -763,9 +763,113 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
           float mn = o.minValue(), mx = o.maxValue();
           bool bad = std::isnan(mn) || std::isnan(mx) || std::isinf(mn) ||
                      std::isinf(mx);
-          std::fprintf(stderr, "[stats] %-30s %-16s min=%.4g max=%.4g%s\n",
-                       node->getName().c_str(), node->getType().c_str(), mn, mx,
-                       bad ? "  <<< NaN/Inf" : "");
+          // Valid-window min/max over rows [from,to) ONLY: the activation
+          // tensors are padded to INIT_SEQ_LEN rows and the padding content is
+          // ENGINE-DEPENDENT junk (zero-filled CL pool vs previous-tenant
+          // bytes on the CUDA managed/pinned pool), so the whole-tensor scan
+          // above is not comparable across engines. win = the actual computed
+          // rows, comparable.
+          float wmn = 0.f, wmx = 0.f;
+          bool have_win = false;
+          {
+            const TensorDim &d = o.getDim();
+            const unsigned int H = d.height(), W = d.width(), C = d.channel(),
+                               B = d.batch();
+            const unsigned int h0 = std::min(from, H), h1 = std::min(to, H);
+            auto scan = [&](auto *base) {
+              for (unsigned int b2 = 0; b2 < B; ++b2)
+                for (unsigned int c2 = 0; c2 < C; ++c2)
+                  for (unsigned int h2 = h0; h2 < h1; ++h2) {
+                    const size_t off =
+                      (((size_t)b2 * C + c2) * H + h2) * (size_t)W;
+                    for (unsigned int k2 = 0; k2 < W; ++k2) {
+                      const float v = (float)base[off + k2];
+                      if (!have_win) {
+                        wmn = wmx = v;
+                        have_win = true;
+                      } else {
+                        if (v < wmn)
+                          wmn = v;
+                        if (v > wmx)
+                          wmx = v;
+                      }
+                    }
+                  }
+            };
+            if (h1 > h0) {
+              if (o.getDataType() == ml::train::TensorDim::DataType::FP32)
+                scan(o.getData<float>());
+#ifdef ENABLE_FP16
+              else if (o.getDataType() == ml::train::TensorDim::DataType::FP16)
+                scan(o.getData<_FP16>());
+#endif
+            }
+          }
+          if (have_win) {
+            // First 4 elements of the first VALID row (row `from`), for
+            // element-level cross-engine diffing (min/max aggregates proved
+            // too coarse: padding junk + coincidental range equality).
+            float r0[4] = {0, 0, 0, 0};
+            {
+              const TensorDim &d2 = o.getDim();
+              const size_t off0 =
+                std::min((size_t)from, (size_t)d2.height() - 1) *
+                (size_t)d2.width();
+              const unsigned int nprint =
+                d2.width() < 4 ? d2.width() : 4;
+              if (o.getDataType() == ml::train::TensorDim::DataType::FP32) {
+                const float *p = o.getData<float>();
+                for (unsigned int i = 0; i < nprint; ++i)
+                  r0[i] = p[off0 + i];
+#ifdef ENABLE_FP16
+              } else if (o.getDataType() ==
+                         ml::train::TensorDim::DataType::FP16) {
+                const _FP16 *p = o.getData<_FP16>();
+                for (unsigned int i = 0; i < nprint; ++i)
+                  r0[i] = (float)p[off0 + i];
+#endif
+              }
+            }
+            // FNV-1a over the window rows' raw bytes: EXACT equality probe.
+            // Host-computed nodes (embedding dequant, host ops) must hash
+            // identical across engines if their content is identical -- this
+            // catches element differences that min/max coincidences hide
+            // (e.g. a saturated Q4_0 palette).
+            unsigned long long wh = 1469598103934665603ULL;
+            {
+              const TensorDim &d3 = o.getDim();
+              const unsigned int H3 = d3.height(), W3 = d3.width(),
+                                 C3 = d3.channel(), B3 = d3.batch();
+              const unsigned int h0b = std::min(from, H3),
+                                 h1b = std::min(to, H3);
+              const size_t esz =
+                o.getDataType() == ml::train::TensorDim::DataType::FP32 ? 4
+                                                                        : 2;
+              const unsigned char *base =
+                reinterpret_cast<const unsigned char *>(o.getData<char>());
+              if (base != nullptr)
+                for (unsigned int b3 = 0; b3 < B3; ++b3)
+                  for (unsigned int c3 = 0; c3 < C3; ++c3)
+                    for (unsigned int h3 = h0b; h3 < h1b; ++h3) {
+                      const unsigned char *p3 =
+                        base +
+                        ((((size_t)b3 * C3 + c3) * H3 + h3) * W3) * esz;
+                      for (size_t i3 = 0; i3 < (size_t)W3 * esz; ++i3) {
+                        wh ^= p3[i3];
+                        wh *= 1099511628211ULL;
+                      }
+                    }
+            }
+            std::fprintf(stderr,
+                         "[stats] %-30s %-16s min=%.4g max=%.4g win[%u,%u)="
+                         "%.4g/%.4g r0=%.6g %.6g %.6g %.6g fnv=%016llx%s\n",
+                         node->getName().c_str(), node->getType().c_str(), mn,
+                         mx, from, to, wmn, wmx, r0[0], r0[1], r0[2], r0[3],
+                         wh, bad ? "  <<< NaN/Inf" : "");
+          } else
+            std::fprintf(stderr, "[stats] %-30s %-16s min=%.4g max=%.4g%s\n",
+                         node->getName().c_str(), node->getType().c_str(), mn,
+                         mx, bad ? "  <<< NaN/Inf" : "");
         } catch (...) {
         }
       }

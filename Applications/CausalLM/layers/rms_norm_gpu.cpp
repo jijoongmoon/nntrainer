@@ -122,6 +122,33 @@ void RMSNormLayerGPU::incremental_forwarding(
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &gamma = context.getWeight(wt_idx[(unsigned int)RMSParamsGPU::GAMMA]);
 
+  // [NNTR_NORM_DBG] one-shot raw-operand dump (see CudaRMSNormLayer twin):
+  // compares ACTUAL gamma/input bytes across engines. gamma/in are SVM
+  // host-visible on the OpenCL path.
+  if (std::getenv("NNTR_NORM_DBG") != nullptr &&
+      in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    static bool once = false;
+    if (!once) {
+      once = true;
+      const _FP16 *gp = gamma.getData<_FP16>();
+      const _FP16 *xp = in.getData<_FP16>();
+      const unsigned int w = in.getDim().width();
+      const unsigned char *gb = reinterpret_cast<const unsigned char *>(gp);
+      unsigned long long h = 1469598103934665603ULL;
+      for (size_t i = 0; i < (size_t)w * 2; ++i) {
+        h ^= gb[i];
+        h *= 1099511628211ULL;
+      }
+      std::fprintf(stderr,
+                   "[NORM-DBG] opencl eps=%.3e gammafnv=%016llx g[0..3]=%.6f "
+                   "%.6f %.6f %.6f x[0..3]=%.6f %.6f %.6f %.6f\n",
+                   (float)epsilon, h, (float)gp[0], (float)gp[1], (float)gp[2],
+                   (float)gp[3], (float)xp[0], (float)xp[1], (float)xp[2],
+                   (float)xp[3]);
+      std::fflush(stderr);
+    }
+  }
+
   const ml::train::TensorDim in_dim = in.getDim();
   const ml::train::TensorDim out_dim = out.getDim();
   const unsigned int b_size = in_dim.batch();

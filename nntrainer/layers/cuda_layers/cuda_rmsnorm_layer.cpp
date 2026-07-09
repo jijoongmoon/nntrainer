@@ -74,6 +74,31 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
       std::fprintf(stderr, "[CUDA-DBG] CudaRMSNormLayer USED rows=%u width=%u\n",
                    rows, width);
   }
+  // [NNTR_NORM_DBG] one-shot raw-operand dump (first dispatch only): FNV-1a
+  // over the gamma bytes + first elements of gamma/input, to compare the
+  // ACTUAL operand bytes across engines (CUDA-vs-OpenCL first-divergence
+  // triage; formulas and registration already proven identical).
+  if (std::getenv("NNTR_NORM_DBG")) {
+    static bool once = false;
+    if (!once && in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      once = true;
+      const _FP16 *gp = gamma.getData<_FP16>();
+      const _FP16 *xp = in.getData<_FP16>();
+      const unsigned char *gb = reinterpret_cast<const unsigned char *>(gp);
+      unsigned long long h = 1469598103934665603ULL;
+      for (size_t i = 0; i < (size_t)width * 2; ++i) {
+        h ^= gb[i];
+        h *= 1099511628211ULL;
+      }
+      std::fprintf(stderr,
+                   "[NORM-DBG] cuda eps=%.3e gammafnv=%016llx g[0..3]=%.6f %.6f "
+                   "%.6f %.6f x[0..3]=%.6f %.6f %.6f %.6f\n",
+                   eps, h, (float)gp[0], (float)gp[1], (float)gp[2],
+                   (float)gp[3], (float)xp[0], (float)xp[1], (float)xp[2],
+                   (float)xp[3]);
+      std::fflush(stderr);
+    }
+  }
   using DT = ml::train::TensorDim::DataType;
   const DT dt = in.getDataType();
   const DT gt = gamma.getDataType();
