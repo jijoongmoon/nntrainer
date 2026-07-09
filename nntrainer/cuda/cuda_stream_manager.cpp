@@ -68,8 +68,19 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
 void StreamManager::finish() {
   if (capturing_) // an in-capture cudaStreamSynchronize is illegal; the drain is
     return;       // deferred to after the graph replay (endCapture caller)
-  if (stream_)
+  if (stream_) {
     cudaStreamSynchronize(stream_);
+    // concurrentManagedAccess==0 (Windows WDDM / pre-Pascal model): managed
+    // allocations are GLOBALLY attached, and host coherence after GPU writes
+    // is only guaranteed by a DEVICE synchronize -- a stream sync leaves host
+    // reads of kernel-written managed pages returning STALE data (field
+    // evidence: WDDM round-5 bisect, FC outputs invisible to every host
+    // consumer/DUMP_STATS probe while the same drains are fully coherent on
+    // Linux cMA=1). Device-sync on such devices; the per-op cost there is
+    // equivalent since every op already drains.
+    if (!ContextManager::Global().concurrentManagedAccess())
+      cudaDeviceSynchronize();
+  }
 }
 
 static bool cuda_async_mode() {
