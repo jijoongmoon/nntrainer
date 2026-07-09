@@ -11,6 +11,7 @@
  *
  */
 
+#include <env_compat.h>
 #include <blas_kernel_interface.h>
 
 // NNTR_V8C_DROP_PLAIN page-drop primitives (see the lever in the v8c weight
@@ -687,7 +688,18 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   {
     static const bool drop_plain = []() {
       const char *v = std::getenv("NNTR_V8C_DROP_PLAIN");
-      return v != nullptr && v[0] == '1';
+      if (v != nullptr)
+        return v[0] == '1';
+#if defined(_WIN32)
+      // Default ON for Windows x86: field-verified rc=0 on all 423 weights
+      // (DiscardVirtualMemory works on the WDDM SVM host shadow; -1370MB peak
+      // WS, goldens byte-identical), and the only host consumer of the plain
+      // payload is NYI/dead on x86. Linux stays opt-in: NEO refuses the drop
+      // (madvise EINVAL), so a default would only add log noise.
+      return true;
+#else
+      return false;
+#endif
     }();
     if (drop_plain) {
       const size_t payload = (size_t)N * (((size_t)K + 1) / 2) // nibbles
@@ -1587,7 +1599,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // ordered after the producer's cl_mem write ONLY on the in-order queue (the
   // default is out-of-order and the copy could race ahead -> garbage).
   static const bool clmem_pool =
-    std::getenv("NNTR_GPU_CLMEM_POOL") != nullptr && svm_pool_default_on();
+    nntr_env_on("NNTR_GPU_CLMEM_POOL") && svm_pool_default_on();
   const bool device_clmem_in =
     clmem_pool && input.getMemoryData() &&
     input.getMemoryData()->isClMem() &&
