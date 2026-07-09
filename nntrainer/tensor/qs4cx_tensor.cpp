@@ -8,6 +8,10 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <env_compat.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include <cpu_backend.h>
 #include <qs4cx_tensor.h>
 #include <tensor.h>
@@ -88,6 +92,31 @@ void QS4CX_Tensor::allocate() {
     allocateSrcTensor();
   } else {
     MemoryData *mem_data;
+
+#if defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86))
+    // [pool-bypass] Under the heap bypass, back the payload with VirtualAlloc
+    // instead of the CRT heap: VirtualFree(MEM_DECOMMIT) -- the only Windows
+    // primitive that actually RELEASES commit charge while keeping the address
+    // reservation (the derived-cache key) valid -- is legal only on
+    // VirtualAlloc regions; running it on HeapAlloc pages corrupts the heap.
+    // DiscardVirtualMemory (residency only) works on either. Deleter releases
+    // the whole reservation.
+    if (nntr_env_on("NNTR_QS4CX_HEAP_BYPASS")) {
+      void *va = VirtualAlloc(nullptr, size(), MEM_RESERVE | MEM_COMMIT,
+                              PAGE_READWRITE);
+      if (va != nullptr) {
+        mem_data = new MemoryData(va);
+        data = std::shared_ptr<MemoryData>(mem_data, [](auto *md) {
+          VirtualFree(md->template getAddr<uint8_t>(), 0, MEM_RELEASE);
+          delete md;
+        });
+        offset = 0;
+        initialize();
+        return;
+      }
+      // fall through to the CRT heap on VirtualAlloc failure
+    }
+#endif
 
     mem_data = new MemoryData((void *)(new uint8_t[size()]{}));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
