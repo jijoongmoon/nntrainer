@@ -152,6 +152,11 @@ bool dev_accessible(const void *p) {
     return false;
   if (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice)
     return true;
+  // Pinned host-mapped (zero-copy) pool: reports Host but carries a valid
+  // devicePointer (UVA) -- kernel-reachable on ANY GPU. This is the cMA==0
+  // (WDDM) replacement for the incoherent managed pool.
+  if (a.type == cudaMemoryTypeHost && a.devicePointer != nullptr)
+    return true;
   // Integrated GPU (Tegra/Orin): managed memory may report as Host, but it is
   // GPU-accessible (shared physical pool) -- accept so the kernel engages.
   if (a.type == cudaMemoryTypeHost && ContextManager::Global().isIntegrated())

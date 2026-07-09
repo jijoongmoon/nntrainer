@@ -29,6 +29,34 @@ namespace {
 // state is needed; keep this hidden in the .cpp.
 std::mutex host_owned_mtx;
 std::unordered_set<void *> host_owned;
+// cudaHostAlloc(Mapped) ownership -- must be freed with cudaFreeHost, not
+// cudaFree.
+std::mutex pinned_owned_mtx;
+std::unordered_set<void *> pinned_owned;
+
+// [WDDM coherence, field 2026-07-09] On the RTX 5070 Laptop (sm_120, WDDM,
+// concurrentManagedAccess=0) managed memory is empirically incoherent in BOTH
+// directions even with a per-op cudaDeviceSynchronize drain: host reads of
+// kernel-written managed pages return stale "previous tenant" bytes
+// (DUMP_STATS bisect), and host-written managed (e.g. the fp16 scale table
+// every FC reads) is suspect in the same way -- deterministic garbage output
+// invariant across cuBLAS/dp4a. Replace the managed pool with PINNED
+// HOST-MAPPED (zero-copy) memory on such devices: pages never migrate, host
+// R/W is always current, kernels access over the bus at the SAME pointer
+// (UVA). Derived device caches (dp4a pack / v8c / workspaces) stay cudaMalloc
+// so GEMM bandwidth is unaffected; the zero-copy cost is one bus read per
+// staging pass. NNTR_CUDA_HOST_MAPPED overrides both ways (=1 force on any
+// box, =0 restore managed).
+bool use_host_mapped() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_CUDA_HOST_MAPPED");
+    if (e != nullptr)
+      return e[0] == '1';
+    return !nntrainer::cuda::ContextManager::Global()
+              .concurrentManagedAccess();
+  }();
+  return on;
+}
 } // namespace
 
 CudaMemAllocator::CudaMemAllocator(bool device_only) :
@@ -66,6 +94,44 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
     // because they accept Managed too. Discrete GPUs are unaffected.
     const bool integrated = cuda::ContextManager::Global().isIntegrated();
     const bool dev_only = device_only_ && !integrated;
+    // Pinned host-mapped (zero-copy) pool replaces managed on cMA==0 devices
+    // (see use_host_mapped above). Falls through to managed on any failure.
+    if (!dev_only && use_host_mapped()) {
+      void *hp = nullptr;
+      if (cudaHostAlloc(&hp, size, cudaHostAllocMapped) == cudaSuccess &&
+          hp != nullptr) {
+        void *dp = nullptr;
+        const bool uva_same =
+          cudaHostGetDevicePointer(&dp, hp, 0) == cudaSuccess && dp == hp;
+        if (uva_same) {
+          {
+            std::lock_guard<std::mutex> lk(pinned_owned_mtx);
+            pinned_owned.insert(hp);
+          }
+          *ptr = hp;
+          if (dbg)
+            fprintf(stderr, "[UVMDBG] cudaHostAlloc(mapped) %zu bytes -> %p OK\n",
+                    size, hp);
+          return;
+        }
+        // no UVA same-pointer guarantee: every call site hands the host
+        // pointer to kernels, so a distinct device pointer cannot work --
+        // warn once and stay on managed.
+        static bool warned = false;
+        if (!warned) {
+          warned = true;
+          fprintf(stderr,
+                  "[UVMDBG] host-mapped devicePointer differs (host=%p dev=%p)"
+                  " -- pinned pool disabled, using managed\n",
+                  hp, dp);
+        }
+        cudaFreeHost(hp);
+      }
+      cudaGetLastError(); // benign: fall back to managed below
+      if (dbg)
+        fprintf(stderr, "[UVMDBG] cudaHostAlloc %zu bytes FAILED -> managed\n",
+                size);
+    }
     const cudaError_t e = dev_only ? cudaMalloc(&dptr, size)
                                    : cudaMallocManaged(&dptr, size);
     if (e == cudaSuccess && dptr != nullptr) {
@@ -115,6 +181,13 @@ void CudaMemAllocator::free(void *ptr) {
   if (consume_host_owned(ptr)) {
     MemAllocator::free(ptr);
     return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(pinned_owned_mtx);
+    if (pinned_owned.erase(ptr) > 0) {
+      cudaFreeHost(ptr);
+      return;
+    }
   }
   cudaFree(ptr);
 }

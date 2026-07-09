@@ -65,8 +65,22 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp16(const float *fp32_scales, unsigned int N,
     if (StreamManager::Global().isCapturing())
       return false;
     unsigned short *usc = nullptr;
-    if (cudaMallocManaged(&usc, sizeof(unsigned short) * (size_t)N) !=
-        cudaSuccess)
+    // [WDDM coherence] This buffer is host-WRITTEN once and device-READ every
+    // FC call -- exactly the pattern that is incoherent on cMA==0 managed
+    // memory (see cuda_mem_allocator use_host_mapped). Use pinned host-mapped
+    // (zero-copy, UVA same-pointer) there; managed elsewhere.
+    static const bool host_mapped = []() {
+      const char *e = std::getenv("NNTR_CUDA_HOST_MAPPED");
+      if (e != nullptr)
+        return e[0] == '1';
+      return !ContextManager::Global().concurrentManagedAccess();
+    }();
+    if (host_mapped) {
+      if (cudaHostAlloc(&usc, sizeof(unsigned short) * (size_t)N,
+                        cudaHostAllocMapped) != cudaSuccess)
+        return false;
+    } else if (cudaMallocManaged(&usc, sizeof(unsigned short) * (size_t)N) !=
+               cudaSuccess)
       return false;
     for (unsigned int n = 0; n < N; ++n)
       usc[n] = compute_fp32_to_fp16(fp32_scales[n]);
