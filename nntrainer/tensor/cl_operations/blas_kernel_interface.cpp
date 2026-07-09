@@ -12,6 +12,16 @@
  */
 
 #include <blas_kernel_interface.h>
+
+// NNTR_V8C_DROP_PLAIN page-drop primitives (see the lever in the v8c weight
+// cache below).
+#include <cerrno>
+#include <cstdint>
+#if defined(_WIN32)
+#include <windows.h> // DiscardVirtualMemory
+#else
+#include <sys/mman.h> // madvise(MADV_DONTNEED)
+#endif
 #include <blas_kernels.h>
 #include <clblast_interface.h>
 
@@ -663,6 +673,46 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
                    N, K);
   }
   auto inserted = cache.emplace(key, std::move(e));
+
+  // [NNTR_V8C_DROP_PLAIN=1, x86-only EXPERIMENT] The device backing + scale
+  // buf + row-sum built above are the ONLY things the v8c GPU path reads from
+  // now on; on x86 the sole remaining consumer of the plain QS4CX payload is
+  // the HalfTensor::dot host fallback, which is NYI (dead) there. Dropping the
+  // plain pages after the build reclaims ~the whole FC weight footprint from
+  // host RSS (Windows round-3 request). INWARD page alignment so pages shared
+  // with neighboring pool tensors are never touched. Dropped pages read back
+  // as zeros -- do NOT enable where a host consumer exists (ARM/KAI!). May
+  // silently no-op if the driver pinned the SVM pages (result is logged).
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+  {
+    static const bool drop_plain = []() {
+      const char *v = std::getenv("NNTR_V8C_DROP_PLAIN");
+      return v != nullptr && v[0] == '1';
+    }();
+    if (drop_plain) {
+      const size_t payload = (size_t)N * (((size_t)K + 1) / 2) // nibbles
+                             + (size_t)N * sizeof(float);      // fp32 scales
+      const size_t page = 4096;
+      uintptr_t lo = ((uintptr_t)nibbles + page - 1) & ~(page - 1);
+      uintptr_t hi = ((uintptr_t)nibbles + payload) & ~(page - 1);
+      long rc = -1;
+      if (hi > lo) {
+#if defined(_WIN32)
+        rc = DiscardVirtualMemory((void *)lo, (SIZE_T)(hi - lo)) == ERROR_SUCCESS
+               ? 0
+               : -1;
+#else
+        rc = ::madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED);
+#endif
+      }
+      std::fprintf(stderr,
+                   "[v8c] DROP_PLAIN N=%u K=%u bytes=%zu (aligned %zu) rc=%ld "
+                   "errno=%d\n",
+                   N, K, payload, (size_t)(hi > lo ? hi - lo : 0), rc,
+                   rc == 0 ? 0 : errno);
+    }
+  }
+#endif
   return &inserted.first->second;
 }
 
@@ -1235,9 +1285,12 @@ static bool fc_tprof_on() {
   return on;
 }
 static double fc_tprof_now() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+  // steady_clock == monotonic; ms as double from a monotonic epoch, used only
+  // in differences so the epoch offset is irrelevant (identical to the old
+  // clock_gettime(CLOCK_MONOTONIC) ms computation).
+  return std::chrono::duration<double, std::milli>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
 }
 static double fc_tp_entry = 0, fc_tp_stage = 0, fc_tp_tail = 0;
 static int fc_tp_n = 0;
