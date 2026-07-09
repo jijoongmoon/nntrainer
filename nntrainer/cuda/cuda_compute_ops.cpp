@@ -240,7 +240,13 @@ public:
       if (qs4cx_enabled && (int)weight.getDim().height() == K &&
           cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(weight.getScale<float>(),
                                                  (unsigned)N, &S)) {
-        if (!nntrainer::cuda::dev_accessible(W)) {
+        // [pool-bypass] A prewarmed dp4a cache makes W a pure lookup key --
+        // no kernel dereferences the payload -- so a host-heap W (heap-bypass
+        // weights, possibly with dropped pages) must NOT be staged: staging
+        // would upload zeros AND miss the prewarmed cache (it is keyed by the
+        // original pointer). Stage only when there is no cache to hit.
+        const bool w_keyed = cuda::cuda_fc_qs4cx_has_cache(W);
+        if (!w_keyed && !nntrainer::cuda::dev_accessible(W)) {
           const uint8_t *dW = nullptr;
           const uint16_t *dS = nullptr;
           if (cuda::cuda_fc_qs4cx_stage_host_weight(W, S, (unsigned)N,
@@ -263,7 +269,7 @@ public:
           return e != nullptr && e[0] == '1';
         }();
         const bool x_dev = nntrainer::cuda::dev_accessible(Xp);
-        const bool wy_dev = nntrainer::cuda::dev_accessible(W) &&
+        const bool wy_dev = (w_keyed || nntrainer::cuda::dev_accessible(W)) &&
                             nntrainer::cuda::dev_accessible(Yp);
         bool all_dev = x_dev && wy_dev;
         if (!x_dev && wy_dev && fp16) {

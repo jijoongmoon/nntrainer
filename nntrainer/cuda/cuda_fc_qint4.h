@@ -174,6 +174,24 @@ bool cuda_fc_qs4cx_prewarm_gpu(const unsigned char *plain_w, unsigned int N,
                                unsigned int K);
 
 /**
+ * @brief [pool-bypass] Drop the plain payload's fully-owned pages once every
+ *        derived device cache exists (the forward only key-compares the
+ *        pointer). Meaningful with NNTR_QS4CX_HEAP_BYPASS (heap pages);
+ *        harmless EINVAL no-op on managed/pool memory. Refuses when
+ *        NNTR_FC_CUDA_DP4A=0 (the naive path reads the payload). x86 only.
+ * @return true if pages were dropped
+ */
+bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
+                                    unsigned int N, unsigned int K);
+
+/**
+ * @brief [pool-bypass] True when the dp4a derived cache exists for this
+ *        plain pointer -- dispatch may then treat the pointer as a pure key
+ *        (no device access, no staging needed).
+ */
+bool cuda_fc_qs4cx_has_cache(const unsigned char *plain_w);
+
+/**
  * @brief Pre-grow ALL the static dp4a decode scratch buffers (g_dp4a_q8 /
  *        ascale / azp / xf / yf) to the model's max decode capacity at LOAD, so
  *        the M=1 dp4a decode FC path never cudaMallocs inside a CUDA-graph
