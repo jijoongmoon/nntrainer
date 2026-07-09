@@ -1283,6 +1283,36 @@ bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
   if (hi <= lo)
     return false;
 #if defined(_WIN32)
+  // [NNTR_QS4CX_DECOMMIT=1, Windows EXPERIMENT] DiscardVirtualMemory drops the
+  // physical pages but the COMMIT CHARGE stays (17GB+ private observed).
+  // VirtualFree(MEM_DECOMMIT) releases the charge while keeping the address
+  // reservation (the derived-cache key) valid -- but it is ONLY legal on a
+  // dedicated VirtualAlloc region (heap pages would be corrupted). The
+  // HEAP_BYPASS payload on Windows IS such a region (qs4cx_tensor.cpp
+  // VirtualAlloc backing, page-aligned base, offset 0), so guard on exactly
+  // that shape: plain_w page-aligned AND VirtualQuery says plain_w is its own
+  // AllocationBase (a CRT-heap pointer would report the heap segment base
+  // instead). Anything else falls back to Discard. Decommitted pages FAULT on
+  // access (not zero-read) -- key-only dispatch is the prerequisite, and the
+  // DROP-vs-diagnostics incompatibility notes apply doubly here.
+  static const bool decommit = []() {
+    const char *e = std::getenv("NNTR_QS4CX_DECOMMIT");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (decommit && ((uintptr_t)plain_w % page) == 0) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery((const void *)plain_w, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+        mbi.AllocationBase == (void *)plain_w && mbi.Type == MEM_PRIVATE &&
+        mbi.State == MEM_COMMIT) {
+      const bool ok =
+        VirtualFree((void *)lo, (SIZE_T)(hi - lo), MEM_DECOMMIT) != 0;
+      std::fprintf(stderr, "[cuda] QS4CX_DECOMMIT N=%u K=%u bytes=%zu ok=%d\n",
+                   N, K, (size_t)(hi - lo), (int)ok);
+      if (ok)
+        return true;
+      // fall through to Discard on failure
+    }
+  }
   return DiscardVirtualMemory((void *)lo, (SIZE_T)(hi - lo)) == ERROR_SUCCESS;
 #else
   return ::madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED) == 0;
