@@ -46,21 +46,20 @@ ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self,
     // the process working set for gauss4). Give the never-consumed plane only
     // to the pools that use it (activations); the weight pool keeps the plain
     // SVM MemoryPool. NNTR_CLMEM_WEIGHT_PLANE=1 restores the old behavior.
-    static const bool force_weight_plane = []() {
-      const char *e = std::getenv("NNTR_CLMEM_WEIGHT_PLANE");
-      return e != nullptr && e[0] == '1';
-    }();
-    // x86 only for now: the never-bound claim is field-verified on Intel
-    // (Windows residency dump + Linux A/B: no RSS/golden change). Adreno also
-    // auto-sets NNTR_GPU_CLMEM_POOL and its binding pattern is unverified on
-    // device -- keep the old plane there until a device A/B clears it.
+    // Default: skip on x86 (field-verified never-bound on Intel: Windows
+    // residency dump + Linux A/B no change); KEEP on ARM/Adreno until the
+    // device A/B clears it. Explicit env overrides both ways:
+    //   NNTR_CLMEM_WEIGHT_PLANE=1 -> keep the plane everywhere (old behavior)
+    //   NNTR_CLMEM_WEIGHT_PLANE=0 -> skip everywhere (the Adreno A/B lever)
+    static const char *wp_env = std::getenv("NNTR_CLMEM_WEIGHT_PLANE");
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-    const bool skip_weight_plane =
-      pool_name == "weight_pool" && !force_weight_plane;
+    const bool arch_default_skip = true;
 #else
-    const bool skip_weight_plane = false;
-    (void)force_weight_plane;
+    const bool arch_default_skip = false;
 #endif
+    const bool skip_weight_plane =
+      pool_name == "weight_pool" &&
+      (wp_env ? wp_env[0] == '0' : arch_default_skip);
     if (!skip_weight_plane)
       return std::make_shared<ClBufferPool>(self);
   }

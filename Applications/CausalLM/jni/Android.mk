@@ -12,6 +12,9 @@ NNTRAINER_ROOT := $(LOCAL_PATH)/../../..
 endif
 
 NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/builddir/android_build_result/include/nntrainer
+# env_compat.h (nntr_env_on/setenv shim) lives in the source tree's utils and is
+# not part of the installed header set -- include it directly.
+NNTRAINER_INCLUDES += $(NNTRAINER_ROOT)/nntrainer/utils
 
 # Common Includes Definition
 CAUSALLM_COMMON_INCLUDES := \
