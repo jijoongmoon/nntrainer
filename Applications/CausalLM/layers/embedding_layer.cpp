@@ -52,6 +52,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <fcntl.h>        // _O_RDONLY, _O_BINARY
+#include <io.h>           // _wopen, _close
+#include <mman_windows.h> // mmap/munmap (MapViewOfFile), PROT_READ, MAP_PRIVATE
 #endif
 
 namespace causallm {
@@ -128,6 +132,29 @@ void attachPayload(QuantLut &lut, const std::filesystem::path &path) {
       }
     }
     ::close(fd);
+  }
+#else
+  // Windows: map the sidecar with MapViewOfFile via the mman shim
+  // (utils/mman_windows.h) instead of slurping it whole. MapViewOfFile faults
+  // pages on demand -- no whole-file readahead -- so the random token-id lookups
+  // keep only the touched rows resident, the same win MADV_RANDOM gives on POSIX
+  // (the shim has no madvise, and none is needed for that on-demand behaviour).
+  // Without this, readBinaryFile below pulled the entire sidecar into RAM
+  // (e.g. gauss4 PLE ~1 GB + embedding ~0.4 GB), defeating the point of -side.
+  std::error_code ec;
+  const auto fsize = std::filesystem::file_size(path, ec);
+  if (!ec && fsize > 0) {
+    int fd = ::_wopen(path.wstring().c_str(), _O_RDONLY | _O_BINARY);
+    if (fd >= 0) {
+      void *ptr = ::mmap(nullptr, static_cast<size_t>(fsize), PROT_READ,
+                         MAP_PRIVATE, fd, 0);
+      ::_close(fd); // the view keeps its own file-mapping reference
+      if (ptr != MAP_FAILED) {
+        lut.mmap_ptr = ptr;
+        lut.mmap_len = static_cast<size_t>(fsize);
+        return;
+      }
+    }
   }
 #endif
   lut.bytes = readBinaryFile(path);
@@ -458,10 +485,10 @@ void decodePacked4BitRowToFloatType(const QuantLut &lut, size_t token_idx,
 } // namespace
 
 QuantLut::~QuantLut() {
-#if !defined(_WIN32)
+  // ::munmap resolves to the POSIX call or the mman_windows shim
+  // (UnmapViewOfFile) depending on platform; both accept (ptr, len).
   if (mmap_ptr)
     ::munmap(mmap_ptr, mmap_len);
-#endif
 }
 
 std::shared_ptr<QuantLut> get_or_load_quant_lut(const std::string &path,
@@ -574,8 +601,8 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   // FP32-input throw) + adopt upstream's quantized-LUT sidecar wiring.]
   auto &quantized_lut_path = std::get<props::QuantizedLutPath>(embedding_props);
   const bool has_quantized_lut = !quantized_lut_path.empty();
-  if (has_quantized_lut)
-    context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
+  context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
+
   const nntrainer::TensorDim &input_dim =
     context.getInputDimensions()[SINGLE_INOUT_IDX];
   NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
@@ -583,6 +610,9 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
 
   // [merge 2026-06-30] OURS: no FP32-input throw — our FP16-activation models
   // build input0 as plain FP16-default (no explicit FP32 input layer).
+  // [merge 2026-07-08] upstream d87ff6dd3 pins the input DTYPE to FP32
+  // unconditionally (kept above): token ids > 2048 are not exactly
+  // representable in FP16 and our lookup reads ids via getAddress<float>.
   auto &weight_regularizer =
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
