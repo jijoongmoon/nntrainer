@@ -961,6 +961,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                 wt.getData<uint8_t>());
             nntrainer::cuda::cuda_fc_qs4cx_prewarm(wt.getData<uint8_t>(),
                                                    wt.width(), wt.height());
+            // [pool-bypass] every derived cache for this weight now exists
+            // (dp4a packed [+ cuBLAS int8] + fp16 scales) -- with the heap
+            // bypass the plain pages are droppable in place, the same way the
+            // v8c path drops them after its backing build. Opt-in.
+            static const bool cuda_drop = []() {
+              const char *e = std::getenv("NNTR_CUDA_DROP_PLAIN");
+              return e != nullptr && e[0] == '1';
+            }();
+            if (cuda_drop)
+              nntrainer::cuda::cuda_fc_qs4cx_drop_plain_pages(
+                wt.getData<uint8_t>(), wt.width(), wt.height());
           }
         };
       model->forEachLayer(fn, nullptr);
