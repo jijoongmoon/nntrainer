@@ -77,11 +77,13 @@ void StreamManager::finish() {
     // CudaMemAllocator::isSVM). With that fixed, the stream-sync alone may be
     // sufficient (pre-Pascal launch migration + stream drain), and the per-op
     // cudaDeviceSynchronize goes through the WDDM OS scheduler = measurable
-    // cost. Value-gated: NNTR_CUDA_WDDM_DEVSYNC=0 disables (A/B lever),
-    // default stays ON until the =0 variant is validated golden.
+    // cost. The =0 variant was field-validated golden on the WDDM box (1K
+    // 63.0/5.90 TPS, +7% decode vs devsync-on; pinned zero-copy pool), so the
+    // DEFAULT IS OFF -- NNTR_CUDA_WDDM_DEVSYNC=1 re-arms the drain if a future
+    // cMA==0 device shows a genuine post-kernel host-visibility gap.
     static const bool wddm_devsync = []() {
       const char *e = std::getenv("NNTR_CUDA_WDDM_DEVSYNC");
-      return e == nullptr || e[0] != '0';
+      return e != nullptr && e[0] == '1';
     }();
     if (wddm_devsync && !ContextManager::Global().concurrentManagedAccess())
       cudaDeviceSynchronize();

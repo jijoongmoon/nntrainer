@@ -95,11 +95,20 @@ public:
   virtual bool isDeviceVisible() const { return false; }
 
   /**
-   * @brief True for single-pointer unified memory usable directly by both
-   *        host and device (OpenCL SVM, CUDA UVM). Derived, not stored: a
-   *        unified allocation is exactly one that is both host-addressable
-   *        and device-visible. Replaces the getName()=="gpu-svm" hack in
-   *        MemoryPool::getMemory().
+   * @brief CONTRACT: "this pointer may be handed to an OpenCL kernel"
+   *        (clSetKernelArgSVMPointer paths) -- every consumer in the tree is
+   *        an OpenCL kernel-binding gate. NOT a generic "unified memory"
+   *        predicate: CUDA UVM is unified yet must report FALSE, or the
+   *        unified build's (ENABLE_OPENCL && ENABLE_CUDA) OpenCL fast paths
+   *        hijack CUDA-engine tensors -- the CL call fails silently, gpu_done
+   *        is still set, the layer output is never written, and the planner's
+   *        previous tenant leaks downstream (field 2026-07-09, Windows: whole-
+   *        model deterministic garbage; see CudaMemAllocator::isSVM()).
+   *        Derived, not stored, for the CL-side allocators: an OpenCL SVM
+   *        allocation is exactly one that is both host-addressable and
+   *        device-visible. Replaces the getName()=="gpu-svm" hack in
+   *        MemoryPool::getMemory(). Any new non-OpenCL backend MUST override
+   *        this to false.
    */
   virtual bool isSVM() const {
     return isHostAddressable() && isDeviceVisible();
