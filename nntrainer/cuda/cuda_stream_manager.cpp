@@ -70,15 +70,20 @@ void StreamManager::finish() {
     return;       // deferred to after the graph replay (endCapture caller)
   if (stream_) {
     cudaStreamSynchronize(stream_);
-    // concurrentManagedAccess==0 (Windows WDDM / pre-Pascal model): managed
-    // allocations are GLOBALLY attached, and host coherence after GPU writes
-    // is only guaranteed by a DEVICE synchronize -- a stream sync leaves host
-    // reads of kernel-written managed pages returning STALE data (field
-    // evidence: WDDM round-5 bisect, FC outputs invisible to every host
-    // consumer/DUMP_STATS probe while the same drains are fully coherent on
-    // Linux cMA=1). Device-sync on such devices; the per-op cost there is
-    // equivalent since every op already drains.
-    if (!ContextManager::Global().concurrentManagedAccess())
+    // concurrentManagedAccess==0 (Windows WDDM / pre-Pascal model) device-sync
+    // add-on. HISTORY: added when host reads of kernel-written managed pages
+    // appeared stale on WDDM -- but the actual culprit turned out to be the
+    // unified-binary isSVM hijack (outputs were never written at all; see
+    // CudaMemAllocator::isSVM). With that fixed, the stream-sync alone may be
+    // sufficient (pre-Pascal launch migration + stream drain), and the per-op
+    // cudaDeviceSynchronize goes through the WDDM OS scheduler = measurable
+    // cost. Value-gated: NNTR_CUDA_WDDM_DEVSYNC=0 disables (A/B lever),
+    // default stays ON until the =0 variant is validated golden.
+    static const bool wddm_devsync = []() {
+      const char *e = std::getenv("NNTR_CUDA_WDDM_DEVSYNC");
+      return e == nullptr || e[0] != '0';
+    }();
+    if (wddm_devsync && !ContextManager::Global().concurrentManagedAccess())
       cudaDeviceSynchronize();
   }
 }
