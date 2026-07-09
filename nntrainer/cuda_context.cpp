@@ -80,11 +80,17 @@ void CudaContext::initialize() noexcept {
     setenv("NNTR_CUDA_BLOCKQ", "1", 0);
     setenv("NNTR_FC_CUDA_CUBLAS", "1", 0);
     setenv("NNTR_CUDA_PREWARM", "1", 0);
-    if (!caps_.integrated) {
+    if (!caps_.integrated && context_inst_.concurrentManagedAccess()) {
       // Discrete (RTX/dGPU) residency + decode-CUDA-graph add-ons: device-only
       // activations, prefill v-copy, host RMSNorm (CUDA RMSNorm is not a win on
       // discrete), the M2-B decode graph, and async submission. On integrated
       // (Tegra/Orin) these are skipped — managed activations are the right pool.
+      // Also skipped when concurrentManagedAccess==0 (Windows WDDM): each of
+      // these lets a HOST op touch managed/device pool memory around in-flight
+      // kernels (ASYNC drops the per-op drains outright; DEV_ACT+RMSNORM_OFF
+      // put host RMSNorm/staging reads mid-chain), which is only legal under
+      // cMA=1 — on WDDM the first such touch is a 0xC0000005 host AV. The safe
+      // WDDM default is the base profile: managed pools + per-op drains.
       setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);

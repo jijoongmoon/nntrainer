@@ -64,6 +64,14 @@ bool ContextManager::CreateDefaultGPUDevice() {
     // activation pool, KV mirror copies, MemAdvise device-pin) so the same
     // binary stays coherent on both -- see isIntegrated().
     integrated_ = prop.integrated != 0;
+    // Windows WDDM reports 0 here (Linux discrete: 1). Everything that lets a
+    // host thread touch managed memory while kernels may be in flight -- async
+    // submission, and by extension the discrete "FAST" env add-ons tuned
+    // around it -- presumes 1, so the profile gates consult this bit.
+    int cma = 0;
+    cudaDeviceGetAttribute(&cma, cudaDevAttrConcurrentManagedAccess,
+                           device_ordinal_);
+    concurrent_managed_access_ = cma != 0;
   }
   cudaDriverGetVersion(&driver_version_);
 

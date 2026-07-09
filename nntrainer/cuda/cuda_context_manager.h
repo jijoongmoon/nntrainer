@@ -66,6 +66,16 @@ public:
   bool isIntegrated() const { return integrated_; }
 
   /**
+   * @brief true when the device supports CONCURRENT host access to managed
+   *        memory while kernels are in flight (cudaDevAttrConcurrentManagedAccess).
+   *        Linux discrete GPUs: 1. Windows WDDM: 0 -- there, host access to
+   *        ANY managed allocation is only legal while the device is idle
+   *        (pre-Pascal model), so async submission and the discrete env
+   *        add-ons tuned around cMA=1 must be gated off.
+   */
+  bool concurrentManagedAccess() const { return concurrent_managed_access_; }
+
+  /**
    * @brief Stable signature used to key the on-disk PTX cache so a module built
    *        for a different GPU / driver / arch is never loaded.
    * @return "<name>|drv<driver>|sm_<cc>"
@@ -105,6 +115,7 @@ private:
   int cc_minor_{0};
   int driver_version_{0};
   bool integrated_{false};
+  bool concurrent_managed_access_{true};
   bool initialized_ok_{false};
 };
 
