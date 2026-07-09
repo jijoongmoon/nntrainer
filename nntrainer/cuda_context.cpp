@@ -308,7 +308,15 @@ CudaContext::runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
   // decode token); for every later token, refresh ONLY the embeddings on the host
   // (g_m2b_skip_all feed pass), update the device position (cuda_set_pos), and
   // REPLAY the cached graph -- skipping the ~350-op C++ dispatch.
-  static const bool cuda_m2b = std::getenv("NNTR_CUDA_M2B") != nullptr;
+  // VALUE-checked (=0 disables): cuda_context auto-sets NNTR_CUDA_M2B=1 on
+  // discrete+cMA boxes (setenv overwrite=0), so a presence check made =0 a
+  // FRANKEN-state -- graph capture/replay here stayed ON while the mha_core
+  // slot-writes (nntr_env_on, value-checked) turned OFF: replay then rewrites
+  // K/V at the first captured slot every token = deterministic decode garbage
+  // (field 2026-07-10: Linux HOST_MAPPED mimic with M2B=0 looped "toasters,
+  // which in turned" -- the exact same env-check split we swept everywhere
+  // else; see env_compat.h).
+  static const bool cuda_m2b = nntr_env_on("NNTR_CUDA_M2B");
   if (cuda_m2b && from == 0 && _cg_cached_exec != nullptr) {
     // new sequence (prefill boundary): drop the previous sequence's cached graph.
     cudaGraphExecDestroy(_cg_cached_exec);
@@ -319,8 +327,7 @@ CudaContext::runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
     auto &sm = nntrainer::cuda::StreamManager::Global();
     if (_cg_cached_exec != nullptr) {
       // subsequent token: embed-only feed (refresh emb_stage) -> set pos -> replay
-      static const bool m2b_light =
-        std::getenv("NNTR_CUDA_M2B_LIGHT") != nullptr;
+      static const bool m2b_light = nntr_env_on("NNTR_CUDA_M2B_LIGHT");
       if (m2b_light) {
         // lighter feed: set the new token input + run ONLY the two embedding
         // nodes directly, bypassing the full ~350-node graph iteration.
