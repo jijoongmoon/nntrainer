@@ -19,6 +19,12 @@
 
 #include <nntrainer_log.h>
 
+#include <cstdint>
+#if defined(_WIN32)
+#include <windows.h> // DiscardVirtualMemory
+#else
+#include <sys/mman.h> // madvise
+#endif
 #include <algorithm>
 #include <cstdlib>
 #include <map>
@@ -1025,6 +1031,57 @@ bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
     return false;
   StreamManager::Global().maybeFinish();
   return true;
+}
+
+// [pool-bypass] True when the dp4a derived cache for this plain pointer
+// already exists -- the dispatch then only needs the pointer VALUE as a key,
+// so a host-heap (non-device-accessible) payload is fine and the host->device
+// weight staging can be skipped entirely.
+bool cuda_fc_qs4cx_has_cache(const unsigned char *plain_w) {
+  if (plain_w == nullptr)
+    return false;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  return g_dp4a_plain_cache.count(plain_w) != 0;
+}
+
+// [pool-bypass] Drop the plain payload's fully-owned pages after every derived
+// device cache (dp4a packed + cuBLAS int8 + fp16 scales) exists -- the CUDA
+// forward then only compares the pointer VALUE as a cache key, never
+// dereferencing the bytes. Only meaningful when the payload is ordinary heap
+// (NNTR_QS4CX_HEAP_BYPASS): madvise on a managed/UVM pool page fails EINVAL
+// harmlessly. Refuses to run when the naive diagnostic path is selected
+// (NNTR_FC_CUDA_DP4A=0 reads the plain payload per call). Inward page
+// alignment protects neighboring heap metadata. x86-only like the bypass.
+bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
+                                    unsigned int N, unsigned int K) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return false;
+  static const bool naive = []() {
+    const char *e = std::getenv("NNTR_FC_CUDA_DP4A");
+    return e != nullptr && e[0] == '0';
+  }();
+  if (naive)
+    return false;
+  const size_t payload =
+    (size_t)N * (((size_t)K + 1) / 2) + (size_t)N * sizeof(float);
+  const size_t page = 4096;
+  uintptr_t lo = ((uintptr_t)plain_w + page - 1) & ~(page - 1);
+  uintptr_t hi = ((uintptr_t)plain_w + payload) & ~(page - 1);
+  if (hi <= lo)
+    return false;
+#if defined(_WIN32)
+  return DiscardVirtualMemory((void *)lo, (SIZE_T)(hi - lo)) == ERROR_SUCCESS;
+#else
+  return ::madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED) == 0;
+#endif
+#else
+  (void)plain_w;
+  (void)N;
+  (void)K;
+  return false;
+#endif
 }
 
 bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X, const unsigned char *plain_w,
