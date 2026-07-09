@@ -12,6 +12,7 @@
  *         This code is a part of the break down version of the mha layer.
  */
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -55,7 +56,7 @@ static unsigned int min_prefill_thr(unsigned int head_dim) {
   if (env >= 0)
     return (unsigned int)env;
 
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
   // Intel/CUDA: no host NEON, so the GPU wins even at tiny step_size, for every
   // head_dim. The head_dim=128 (qwen3) degeneration under sampling was NOT the
   // flash kernel -- it was the GPU RoPE doing the cos/sin rotation in fp16
@@ -95,7 +96,7 @@ static unsigned int min_prefill_thr(unsigned int head_dim) {
 
 #include <cstdint>
 
-#if (defined(__x86_64__) || defined(__i386__)) && defined(ENABLE_FP16)
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)) && defined(ENABLE_FP16)
 #include <climits>
 // libnntrainer builds the all-FP16 CPU attention kernels (compute_kcaches /
 // compute_fp16vcache_transposed / compute_rotary_emb_value with _FP16 I/O, and
@@ -1487,9 +1488,16 @@ static bool _kvst_on() {
   return on;
 }
 static double _kvst_now() {
+#ifdef _WIN32
+  // No clock_gettime on MSVC; steady_clock is the same monotonic source.
+  return std::chrono::duration<double, std::milli>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+#else
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+#endif
 }
 static double _kvst_t0 = 0;
 static double _kvst_acc01 = 0, _kvst_acc_k = 0, _kvst_acc_v = 0,
@@ -3282,7 +3290,7 @@ static inline float32x4_t vjepa_expq_f32(float32x4_t x) {
 }
 #endif
 
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
 
@@ -3294,7 +3302,7 @@ static inline float32x4_t vjepa_expq_f32(float32x4_t x) {
 static inline void mha_convert_fp16bits_to_fp32(unsigned int N,
                                                 const uint16_t *src,
                                                 float *dst) {
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
   unsigned int i = 0;
   for (; i + 16 <= N; i += 16) {
     __m256 a =
@@ -3325,7 +3333,7 @@ static inline void mha_convert_fp16bits_to_fp32(unsigned int N,
 #endif
 }
 
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 
 // Fused FP32 x FP16-bits -> FP32 GEMM for x86 (AVX2 + F16C). Equivalent of ARM
 // shgemm but reads FP16-bits (uint16_t) directly without materializing an FP32
@@ -3599,7 +3607,7 @@ void MHACoreLayer::gemm_attention(
   // x86 we must materialize an FP32 de-interleaved Q (Qa_fp32) and take the
   // FP32 path; otherwise Qp_fp32==nullptr -> SIGSEGV (the crash the diagnosis
   // hit when use_gemm_attention was flipped and a d=512 layer fell to here).
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
   const bool q_fp16_to_fp32 = q_fp16; // x86 has no NEON FP16-Q kernel
 #else
   const bool q_fp16_to_fp32 = false;
@@ -3871,7 +3879,7 @@ void MHACoreLayer::gemm_attention(
 #endif // ARM NEON q_fp16 branch
         {
           // FP32 Q path: QK -> FP32 S, fused FP16 softmax store to Sp16, AV.
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
           mha_hsgemm_avx2(bq, bk, d, inv_sqrt, Qp_fp32 + (size_t)qb * d, d,
                           Kp + (size_t)kb * d, d, /*TransB=*/true, S.data(),
                           bk);
@@ -3982,7 +3990,7 @@ void MHACoreLayer::gemm_attention(
               ol[x] *= c;
           }
 
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
           mha_hsgemm_avx2(bq, d, bk, 1.0f, S.data(), bk,
                           Vp + (size_t)kb * d, d, /*TransB=*/false,
                           Pacc.data(), d);

@@ -641,15 +641,39 @@ sharedConstTensors Context::runDecode(NeuralNetwork &nn, unsigned int from,
 }
 
 // Resolve (once, then cache) the context whose runDecode() drives decode. Only
-// CUDA overrides runDecode; every other backend's base runDecode is the same
-// plain walk, so the choice among non-cuda contexts is immaterial. Prefer "cuda"
-// (present only on a CUDA build), else "cpu", else "gpu".
+// CudaContext overrides runDecode (with the CUDA-graph capture/replay state
+// machine); every other backend's base runDecode is the same plain walk
+// (incremental_forwarding), which dispatches each layer to the context named by
+// its own engine= property. So the decode seam must drive through "cuda" ONLY
+// when the graph's layers actually run on CUDA.
+//
+// A unified build registers BOTH a "cuda" and a "gpu" (OpenCL) context (e.g. the
+// Windows/MSVC binary with ENABLE_CUDA + ENABLE_OPENCL). A blind "prefer cuda"
+// then hijacked engine=gpu runs -- prefill on OpenCL but decode captured onto
+// CUDA -- so the KV/hidden-state handoff crossed backends incoherently and decode
+// produced garbage (repeated single token). Decide from the authoritative
+// per-layer engine property (the same isComputeEngineCUDA() the graph uses to
+// route each node's context), NOT from a hardcoded backend order.
 Context *NeuralNetwork::getDecodeContext() {
   if (decode_ctx_ != nullptr)
     return decode_ctx_;
   if (ct_engine == nullptr)
     return nullptr;
-  for (const char *name : {"cuda", "cpu", "gpu"}) {
+
+  bool graph_is_cuda = false;
+  for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); ++iter) {
+    if ((*iter)->isComputeEngineCUDA()) {
+      graph_is_cuda = true;
+      break;
+    }
+  }
+
+  // engine=cuda -> the CUDA-graph decode context. engine=gpu/cpu -> the matching
+  // base context, whose runDecode is the per-layer plain walk; NEVER "cuda".
+  const std::vector<const char *> order =
+    graph_is_cuda ? std::vector<const char *>{"cuda", "cpu", "gpu"}
+                  : std::vector<const char *>{"cpu", "gpu"};
+  for (const char *name : order) {
     try {
       decode_ctx_ = ct_engine->getRegisteredContext(name);
       if (decode_ctx_ != nullptr)

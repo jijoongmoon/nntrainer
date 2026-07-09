@@ -22,6 +22,15 @@
 
 #include "opencl_command_queue_manager.h" // cl_array_arg_qcom / cl_workgroup_qcom
 
+// The registry lives in mha_core.cpp, which Windows builds as a DLL — these
+// free functions must be exported for causal_lm (static lib) to link, same
+// WIN_EXPORT pattern as the layer classes.
+#ifdef _WIN32
+#define WIN_EXPORT __declspec(dllexport)
+#else
+#define WIN_EXPORT
+#endif
+
 namespace causallm {
 
 /**
@@ -44,11 +53,11 @@ struct RecqOverride {
 };
 
 /// Clear the registry (call before each record pass).
-void recq_reset_overrides();
+WIN_EXPORT void recq_reset_overrides();
 /// Append a captured override (called by mha_core while isRecording()).
-void recq_add_override(const RecqOverride &ov);
+WIN_EXPORT void recq_add_override(const RecqOverride &ov);
 /// Number of captured overrides.
-std::size_t recq_override_count();
+WIN_EXPORT std::size_t recq_override_count();
 
 /**
  * @brief Build the per-token replay arrays from cache_index. Fills args/gws and
@@ -58,7 +67,7 @@ std::size_t recq_override_count();
  * the build (the pointers stay valid until the next build). The caller must keep
  * all four vectors alive across the replayRecording() call.
  */
-void recq_build_token_overrides(
+WIN_EXPORT void recq_build_token_overrides(
   unsigned int cache_index,
   std::vector<nntrainer::opencl::cl_array_arg_qcom> &args,
   std::vector<nntrainer::opencl::cl_workgroup_qcom> &gws,

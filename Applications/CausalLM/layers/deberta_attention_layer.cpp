@@ -39,7 +39,9 @@
 // dropping ENABLE_FP16 here only compiles out the (ARM-only) FP16 code paths
 // and keeps the x86 build linking. Each FP16 runtime branch falls through to
 // its NYI throw.
-#if (defined(__x86_64__) || defined(__i386__)) && defined(ENABLE_FP16)
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||            \
+     defined(_M_IX86)) &&                                                      \
+  defined(ENABLE_FP16)
 #undef ENABLE_FP16
 #endif
 
