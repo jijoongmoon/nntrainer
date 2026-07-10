@@ -760,7 +760,46 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
           cudaDeviceSynchronize();
 #endif
           Tensor &o = node->getOutput(0);
-          float mn = o.minValue(), mx = o.maxValue();
+          const unsigned char *raw =
+            reinterpret_cast<const unsigned char *>(o.getData<char>());
+          std::vector<unsigned char> staged;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          // Device-only pools (NNTR_CUDA_DEV_ACT activations, NNTR_CUDA_KV_DEV)
+          // hand out bare cudaMalloc pointers: every host scan below would
+          // fault. Stage the payload D2H once and scan the copy instead.
+          if (raw != nullptr && nntrainer::cuda::dev_only(raw)) {
+            staged.resize(o.bytes());
+            if (!nntrainer::cuda::copy_any(staged.data(), raw, o.bytes()))
+              throw std::runtime_error("stats D2H stage failed");
+            raw = staged.data();
+          }
+#endif
+          float mn = 0.f, mx = 0.f;
+          if (staged.empty()) {
+            mn = o.minValue();
+            mx = o.maxValue();
+          } else {
+            const size_t n = o.size();
+            auto mm = [&](auto *base) {
+              for (size_t i = 0; i < n; ++i) {
+                const float v = (float)base[i];
+                if (i == 0) {
+                  mn = mx = v;
+                  continue;
+                }
+                if (v < mn)
+                  mn = v;
+                if (v > mx)
+                  mx = v;
+              }
+            };
+            if (o.getDataType() == ml::train::TensorDim::DataType::FP32)
+              mm(reinterpret_cast<const float *>(raw));
+#ifdef ENABLE_FP16
+            else if (o.getDataType() == ml::train::TensorDim::DataType::FP16)
+              mm(reinterpret_cast<const _FP16 *>(raw));
+#endif
+          }
           bool bad = std::isnan(mn) || std::isnan(mx) || std::isinf(mn) ||
                      std::isinf(mx);
           // Valid-window min/max over rows [from,to) ONLY: the activation
@@ -804,10 +843,10 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
             };
             if (h1 > h0) {
               if (o.getDataType() == ml::train::TensorDim::DataType::FP32)
-                scan(o.getData<float>());
+                scan(reinterpret_cast<const float *>(raw));
 #ifdef ENABLE_FP16
               else if (o.getDataType() == ml::train::TensorDim::DataType::FP16)
-                scan(o.getData<_FP16>());
+                scan(reinterpret_cast<const _FP16 *>(raw));
 #endif
             }
           }
@@ -822,13 +861,13 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
               const unsigned int nprint =
                 d2.width() < 4 ? d2.width() : 4;
               if (o.getDataType() == ml::train::TensorDim::DataType::FP32) {
-                const float *p = o.getData<float>();
+                const float *p = reinterpret_cast<const float *>(raw);
                 for (unsigned int i = 0; i < nprint; ++i)
                   r0[i] = p[off0 + i];
 #ifdef ENABLE_FP16
               } else if (o.getDataType() ==
                          ml::train::TensorDim::DataType::FP16) {
-                const _FP16 *p = o.getData<_FP16>();
+                const _FP16 *p = reinterpret_cast<const _FP16 *>(raw);
                 for (unsigned int i = 0; i < nprint; ++i)
                   r0[i] = (float)p[off0 + i];
 #endif
@@ -849,8 +888,7 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
               const size_t esz =
                 o.getDataType() == ml::train::TensorDim::DataType::FP32 ? 4
                                                                         : 2;
-              const unsigned char *base =
-                reinterpret_cast<const unsigned char *>(o.getData<char>());
+              const unsigned char *base = raw;
               if (base != nullptr)
                 for (unsigned int b3 = 0; b3 < B3; ++b3)
                   for (unsigned int c3 = 0; c3 < C3; ++c3)
