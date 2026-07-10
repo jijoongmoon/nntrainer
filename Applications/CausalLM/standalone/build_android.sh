@@ -13,6 +13,11 @@
 # Usage:
 #   ./build_android.sh                      # engine + app build + stage + install
 #   ./build_android.sh --skip-engine        # reuse existing builddir/android_build_result
+#   ./build_android.sh --skip-install       # build + stage prebuilt_libs/, but skip gradle
+#                                            # install (step 7) and the device CLI push (step
+#                                            # 8) -- lets a downstream overlay script (e.g. one
+#                                            # that stages an extra model plugin into
+#                                            # prebuilt_libs/ first) drive a single final install.
 #   ./build_android.sh --clean              # wipe the app builddir (builddir_standalone_app) first
 #   ./build_android.sh --nntr-threads=4     # override nntrainer compute thread count (default 7)
 #
@@ -25,12 +30,14 @@ set -e
 # ── Parse arguments ─────────────────────────────────────────────────────
 CLEAN=false
 SKIP_ENGINE=false
+SKIP_INSTALL=false
 NNTR_THREADS="${NNTR_THREADS:-7}"
 
 for arg in "$@"; do
     case "$arg" in
         --clean)          CLEAN=true ;;
         --skip-engine)     SKIP_ENGINE=true ;;
+        --skip-install)    SKIP_INSTALL=true ;;
         --nntr-threads=*) NNTR_THREADS="${arg#*=}" ;;
         --help|-h)
             sed -n '2,/^set -e$/p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -73,6 +80,7 @@ echo "APP_BUILD:      $APP_BUILD"
 echo "ANDROID_NDK:    $ANDROID_NDK"
 echo "NNTR_THREADS:   $NNTR_THREADS"
 echo "SKIP_ENGINE:    $SKIP_ENGINE"
+echo "SKIP_INSTALL:   $SKIP_INSTALL"
 echo "CLEAN:          $CLEAN"
 echo ""
 
@@ -276,6 +284,16 @@ ls -la "$PREBUILT_DIR"
 if ls "$PREBUILT_DIR"/libquick_dot_ai.so >/dev/null 2>&1; then
     echo "Error: libquick_dot_ai.so present in prebuilt_libs/ -- staging is NOT public-only!"
     exit 1
+fi
+
+if [ "$SKIP_INSTALL" = true ]; then
+    echo ""
+    echo "[7,8] --skip-install: leaving gradle install + device CLI push to the caller."
+    echo ""
+    echo "=== Done (staged, not installed) ==="
+    echo "App build:     $APP_BUILD"
+    echo "prebuilt_libs: $PREBUILT_DIR (public-only)"
+    exit 0
 fi
 
 # ── Step 7: gradle build + install ───────────────────────────────────────
