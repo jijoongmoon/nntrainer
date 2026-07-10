@@ -13,11 +13,28 @@
 #include "cuda_rmsnorm.h"
 
 #include <cuda_context.h>
+#include <cuda_context_manager.h>
 #include <cuda_stream_manager.h>
 
 #include <nntrainer_log.h>
 
+#include <cstdlib>
+
 namespace nntrainer::cuda {
+
+// Post-op drain, skipped for a device-only (cudaMalloc) destination: host
+// code cannot read it without a stream-ordered staging copy, so the sync-mode
+// per-op drain is provably unnecessary -- and its WDDM submit+wait round-trip
+// dominated the wide-row prefill norm cost (~0.65ms/call in the 1K lprof).
+static inline void rms_maybe_finish(const void *out) {
+  static const bool skip_dev_drain = []() {
+    const char *e = std::getenv("NNTR_CUDA_DRAINSKIP_RMS");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (skip_dev_drain && out != nullptr && dev_only(out))
+    return;
+  StreamManager::Global().maybeFinish();
+}
 
 // One block per row; block-reduces the sum of squares in FP32; scales by
 // rsqrt(mean+eps) and folds the raw gamma (no (1+gamma) bias). has_gamma=0
@@ -160,7 +177,7 @@ bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
   const int grid[3] = {(int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  StreamManager::Global().maybeFinish();
+  rms_maybe_finish(out);
   return true;
 }
 
@@ -188,7 +205,7 @@ bool cuda_rms_reverse_norm_fp16(const unsigned short *in,
   const int grid[3] = {(int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  StreamManager::Global().maybeFinish();
+  rms_maybe_finish(out);
   return true;
 }
 
@@ -219,7 +236,7 @@ bool cuda_rmsnorm_fp32(const float *in, const float *gamma, float *out,
   const int grid[3] = {(int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  StreamManager::Global().maybeFinish();
+  rms_maybe_finish(out);
   return true;
 }
 

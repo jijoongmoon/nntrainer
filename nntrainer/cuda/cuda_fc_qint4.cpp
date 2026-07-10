@@ -103,7 +103,19 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp16(const float *fp32_scales, unsigned int N,
 // decode host ops onto the GPU too (GPU RoPE/geglu, the GPU attention exists)
 // so the whole decode step is one ordered GPU chain drained once per token.
 // Default (sync) is coherent.
-static inline void maybe_finish() {
+static inline void maybe_finish(const void *out = nullptr) {
+  // Device-only (cudaMalloc) destination: host code CANNOT read it directly
+  // (it would AV) -- every legal host access goes through a stream-ordered
+  // staging copy (copy_any / EnqueueReadBuffer / explicit finish), so the
+  // per-op drain is provably unnecessary. Skipping it removes the WDDM
+  // submit+wait round-trip (measured ~0.2-0.6ms/op in the 1K prefill lprof)
+  // while ops with host-visible outputs keep their sync-mode drain.
+  static const bool skip_dev_drain = []() {
+    const char *e = std::getenv("NNTR_CUDA_DRAINSKIP_FC");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (skip_dev_drain && out != nullptr && dev_only(out))
+    return;
   static const bool async = []() {
     const char *e = std::getenv("NNTR_CUDA_ASYNC");
     if (e == nullptr || e[0] != '1')
@@ -237,7 +249,7 @@ bool cuda_fc_qs4cx_gemm_fp32(const float *X, const unsigned char *plain_w,
   const int grid[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  maybe_finish();
+  maybe_finish(Y);
   return true;
 }
 
@@ -1382,7 +1394,7 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X,
     return false;
   if (!dp4a_repack_and_gemm(plain_w, scales_fp16, Y, M, N, K))
     return false;
-  maybe_finish();
+  maybe_finish(Y);
   return true;
 }
 
@@ -1429,7 +1441,7 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
                             reinterpret_cast<float *>(Yh), M, N, K,
                             /*out_fp16=*/1))
     return false;
-  maybe_finish();
+  maybe_finish(Yh);
   return true;
 }
 
@@ -1525,7 +1537,7 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
   const int dg[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
   if (!StreamManager::Global().DispatchCommand(*kde, dg, db))
     return false;
-  maybe_finish();
+  maybe_finish(Yh);
   // Catch an ASYNC failure in the cuBLAS IMMA GEMM / epilogue (the sync cuBLAS
   // status was already checked). On Orin a large-M IMMA can fault at runtime and
   // leave a STICKY cuda error -- which then makes the NEXT layer's
@@ -1586,7 +1598,7 @@ bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
   const int yg[3] = {((int)yn + 255) / 256, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kf2h, yg, cb))
     return false;
-  maybe_finish();
+  maybe_finish(Yh);
   return true;
 }
 
@@ -1618,7 +1630,7 @@ bool cuda_fc_qint4_gemm_fp32(const float *X, const unsigned char *nibbles,
   const int grid[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;
-  maybe_finish();
+  maybe_finish(Y);
   return true;
 }
 
