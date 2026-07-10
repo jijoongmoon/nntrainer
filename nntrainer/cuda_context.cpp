@@ -354,6 +354,21 @@ CudaContext::runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
       out = nn.incremental_forwarding(from, to, input, label, false);
       cudaGraph_t graph = nullptr;
       if (sm.endCapture(&graph) && graph != nullptr) {
+        if (cuda_graph_dbg) {
+          // Capture-fidelity forensics: how much of the ~1000-op forward
+          // actually landed in the graph, and (NNTR_CUDA_GRAPH_DOT=<path>)
+          // the full node dump for op-level diffing against the eager pass.
+          size_t n_nodes = 0;
+          cudaGraphGetNodes(graph, nullptr, &n_nodes);
+          std::fprintf(stderr, "[M2B] captured graph: %zu nodes\n", n_nodes);
+          if (const char *dot = std::getenv("NNTR_CUDA_GRAPH_DOT")) {
+            if (cudaGraphDebugDotPrint(graph, dot,
+                                       cudaGraphDebugDotFlagsVerbose) ==
+                cudaSuccess)
+              std::fprintf(stderr, "[M2B] graph dot -> %s\n", dot);
+            cudaGetLastError();
+          }
+        }
         if (cudaGraphInstantiate(&_cg_cached_exec, graph, 0) == cudaSuccess) {
           cudaGraphLaunch(_cg_cached_exec, sm.GetStream());
           cudaStreamSynchronize(sm.GetStream());

@@ -32,6 +32,46 @@
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
+
+namespace {
+// NNTR_CUDA_ASYNC guard for the pinned embedding staging buffers: in async
+// mode nothing drains the stream per-op, so the NEXT token's host dequant can
+// rewrite (or cudaFreeHost) emb_stage while the PREVIOUS token's H2D from the
+// same buffer is still in flight -> the consumer kernel reads torn rows
+// (field: word-salad decode under ASYNC=1, coherent under sync). One event on
+// the single backend stream marks the most recent staging H2D; stream FIFO
+// means "last H2D done" implies every earlier one is done, so a single shared
+// event safely guards both instances (embedding0 + per_layer_input_embedding).
+// Skipped during graph capture: an in-capture cudaEventSynchronize is illegal
+// and the captured H2D is replay-ordered by the graph itself.
+cudaEvent_t g_emb_h2d_evt = nullptr;
+bool g_emb_h2d_pending = false;
+
+void emb_stage_h2d_record() {
+  auto &sm = nntrainer::cuda::StreamManager::Global();
+  if (sm.isCapturing())
+    return;
+  if (g_emb_h2d_evt == nullptr &&
+      cudaEventCreateWithFlags(&g_emb_h2d_evt, cudaEventDisableTiming) !=
+        cudaSuccess) {
+    g_emb_h2d_evt = nullptr;
+    cudaGetLastError();
+    return;
+  }
+  if (cudaEventRecord(g_emb_h2d_evt, sm.GetStream()) == cudaSuccess)
+    g_emb_h2d_pending = true;
+  else
+    cudaGetLastError();
+}
+
+void emb_stage_h2d_wait() {
+  if (!g_emb_h2d_pending ||
+      nntrainer::cuda::StreamManager::Global().isCapturing())
+    return;
+  cudaEventSynchronize(g_emb_h2d_evt);
+  g_emb_h2d_pending = false;
+}
+} // namespace
 #endif
 
 #include "../third_party/nlohmann/json.hpp"
@@ -841,6 +881,9 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         pa.type == cudaMemoryTypeDevice;
       cudaGetLastError();
       if (emb_dev_only) {
+        // Async-mode: the previous token's H2D from this pinned buffer may
+        // still be in flight -- wait before the host rewrites or frees it.
+        emb_stage_h2d_wait();
         size_t need = (size_t)iter * out_dim;
         if (need > emb_stage_cap) {
           if (emb_stage)
@@ -983,11 +1026,13 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     // CUDA mirror of clmem_raise_cl: push the host-dequantized PLE rows into the
     // device-only output on the backend stream (ordered before the GPU consumer).
-    if (emb_dev_only)
+    if (emb_dev_only) {
       cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
                       (size_t)iter * out_dim * sizeof(_FP16),
                       cudaMemcpyHostToDevice,
                       nntrainer::cuda::StreamManager::Global().GetStream());
+      emb_stage_h2d_record();
+    }
 #endif
 
 #ifdef DEBUG
