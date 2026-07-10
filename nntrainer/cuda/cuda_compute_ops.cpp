@@ -72,8 +72,14 @@ public:
       throw std::runtime_error(
         "CudaComputeOps: device copy (cudaMemcpyAsync) failed");
     }
-    if (!cuda::dev_only(Y))
+    if (!cuda::dev_only(Y)) {
+      if (sm.isCapturing())
+        std::fprintf(
+          stderr,
+          "[CAP-AUDIT] scopy D2H (host-consumed) during capture: %zu bytes\n",
+          bytes);
       sm.finish(); // D2H: the host consumes the destination immediately
+    }
     return true;
   }
 
@@ -102,6 +108,11 @@ public:
       if (incX != 1 || incY != 1)
         throw std::runtime_error(
           "CudaComputeOps: strided converting copy on device-only memory");
+      if (cuda::StreamManager::Global().isCapturing())
+        std::fprintf(stderr,
+                     "[CAP-AUDIT] converting scopy fp32->fp16 during capture: "
+                     "N=%u (host convert frozen into graph)\n",
+                     N);
       cuda::StreamManager::Global().finish();
       std::vector<float> xs;
       const float *xp = X;
@@ -129,6 +140,11 @@ public:
       if (incX != 1 || incY != 1)
         throw std::runtime_error(
           "CudaComputeOps: strided converting copy on device-only memory");
+      if (cuda::StreamManager::Global().isCapturing())
+        std::fprintf(stderr,
+                     "[CAP-AUDIT] converting scopy fp16->fp32 during capture: "
+                     "N=%u (host convert frozen into graph)\n",
+                     N);
       cuda::StreamManager::Global().finish();
       std::vector<_FP16> xs;
       const _FP16 *xp = X;
@@ -423,6 +439,17 @@ public:
 
     // Host fallback: correct for FP16 / Q4_x / Q6_K / cross-engine host input
     // (and any GPU-path failure) on the host-coherent UVM tensors.
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // Inside a CUDA-graph capture this host GEMM (a) reads inputs whose
+    // producer kernels are only RECORDED, and (b) runs exactly once at capture
+    // time -- its output is frozen for every replay. Flag it: any hit here is
+    // an M2B correctness bug, not a perf note.
+    if (cuda::StreamManager::Global().isCapturing())
+      std::fprintf(stderr,
+                   "[CAP-AUDIT] host FC inside graph capture: M=%u K=%u N=%u "
+                   "wtype=%d (output frozen into the graph)\n",
+                   (unsigned)M, (unsigned)K, (unsigned)N, (int)wt);
+#endif
     CpuComputeOps::fc(input, weight, output);
   }
 };

@@ -112,8 +112,17 @@ static inline void maybe_finish() {
     // shared-memory iGPU (see cuda_stream_manager cuda_async_mode()).
     return !ContextManager::Global().isIntegrated();
   }();
-  if (!async)
+  if (!async) {
+    if (StreamManager::Global().isCapturing()) {
+      static int audit_n = 0;
+      if (++audit_n <= 4)
+        std::fprintf(stderr,
+                     "[CAP-AUDIT] fc-qint4 post-GEMM drain during capture "
+                     "(#%d, benign if output stays on-GPU)\n",
+                     audit_n);
+    }
     StreamManager::Global().finish();
+  }
 }
 
 // One thread per output element Y[m,n]; loops K reading the int4 weight at the

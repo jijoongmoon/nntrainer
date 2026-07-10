@@ -566,6 +566,31 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
   std::vector<unsigned int> outputs;
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
 
+    // NNTR_LOGIT_TOPK_DBG: raw top-5 (id:logit) of the first few sampled rows,
+    // BEFORE any penalty/argmax shortcut -- boundary-artifact margin probe.
+    static const bool topk_dbg = std::getenv("NNTR_LOGIT_TOPK_DBG") != nullptr;
+    static int topk_calls = 0;
+    if (topk_dbg && topk_calls < 6) {
+      ++topk_calls;
+      int top[5] = {-1, -1, -1, -1, -1};
+      for (unsigned int v = 0; v < NUM_VOCAB; ++v) {
+        for (int k = 0; k < 5; ++k) {
+          if (top[k] < 0 || logits[v] > logits[top[k]]) {
+            for (int m = 4; m > k; --m)
+              top[m] = top[m - 1];
+            top[k] = (int)v;
+            break;
+          }
+        }
+      }
+      std::fprintf(stderr, "[TOPK] call#%d", topk_calls);
+      for (int k = 0; k < 5; ++k)
+        if (top[k] >= 0)
+          std::fprintf(stderr, "  %d:%.4f", top[k], logits[top[k]]);
+      std::fprintf(stderr, "\n");
+      std::fflush(stderr);
+    }
+
 #if defined(ENABLE_OPENCL)
     // On-GPU greedy argmax already produced the token (lm_head logits never left
     // the GPU; only the 4-byte id came back). Only set under pure-greedy gating.

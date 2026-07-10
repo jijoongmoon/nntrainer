@@ -15,6 +15,7 @@
 #include "cuda_context_manager.h"
 #include "cuda_kernel.h"
 
+#include <cstdio>
 #include <cstdlib>
 
 namespace nntrainer::cuda {
@@ -66,8 +67,16 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
 }
 
 void StreamManager::finish() {
-  if (capturing_) // an in-capture cudaStreamSynchronize is illegal; the drain is
-    return;       // deferred to after the graph replay (endCapture caller)
+  if (capturing_) { // an in-capture cudaStreamSynchronize is illegal; the drain
+    // is deferred to after the graph replay (endCapture caller). A host read
+    // that depended on this drain now consumes stale bytes -- audit-log the
+    // skip so capture-time host fallbacks are visible.
+    static int audit_n = 0;
+    if (++audit_n <= 32)
+      std::fprintf(stderr, "[CAP-AUDIT] finish() skipped during capture (#%d)\n",
+                   audit_n);
+    return;
+  }
   if (stream_) {
     cudaStreamSynchronize(stream_);
     // concurrentManagedAccess==0 (Windows WDDM / pre-Pascal model) device-sync
@@ -114,8 +123,16 @@ void StreamManager::maybeFinish() {
 }
 
 void StreamManager::finishIfAsync() {
-  if (capturing_)
+  if (capturing_) {
+    // Same audit as finish(): callers of finishIfAsync are host-fallback
+    // preambles -- a hit during capture means a host op ran inside the graph.
+    static int audit_n = 0;
+    if (++audit_n <= 32)
+      std::fprintf(stderr,
+                   "[CAP-AUDIT] finishIfAsync() skipped during capture (#%d)\n",
+                   audit_n);
     return;
+  }
   if (cuda_async_mode())
     finish();
 }
