@@ -4,6 +4,7 @@
 # ignore build directory
 /build
 /builddir
+/builddir_standalone_app
 .cache/
 .idea/
 
