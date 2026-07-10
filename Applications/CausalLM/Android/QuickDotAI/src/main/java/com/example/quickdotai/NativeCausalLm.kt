@@ -56,6 +56,20 @@ object NativeCausalLm {
             System.loadLibrary("qnn_context")
             // quickai_jni dlopens libcausallm_api.so as part of its JNI_OnLoad.
             System.loadLibrary("quickai_jni")
+
+            // Optional model-extension plugin. A downstream project may ship a
+            // self-registering plugin (libqai_ext_model.so) that adds extra models to
+            // the catalog; the public build ships without it and runs public models
+            // only. Loaded after quickai_jni so libcausallm.so/libquick_dot_ai_api.so
+            // (and their model/descriptor registries) are already present for the
+            // plugin's constructors to register into. Absence is normal -> ignore.
+            try {
+                System.loadLibrary("qai_ext_model")
+                android.util.Log.i(TAG, "Loaded optional model-extension plugin (qai_ext_model)")
+            } catch (t: UnsatisfiedLinkError) {
+                android.util.Log.d(TAG, "No optional model-extension plugin present (public build)")
+            }
+
             loaded = true
             true
         } catch (t: UnsatisfiedLinkError) {
