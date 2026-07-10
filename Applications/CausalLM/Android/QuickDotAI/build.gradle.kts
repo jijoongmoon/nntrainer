@@ -14,13 +14,16 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
-// Copies the flat prebuilt .so files from QuickDotAI/prebuilt_libs/ into an
+// Mirrors the flat prebuilt .so files from QuickDotAI/prebuilt_libs/ into an
 // ABI-nested directory (build/generated/jniLibs/arm64-v8a/) so that Android
 // Gradle's standard jniLibs machinery can bundle them into the AAR.
+//
+// This MUST be a Sync (not a Copy): the destination has to EXACTLY mirror
+// prebuilt_libs/, deleting any .so that is no longer staged.
 val prebuiltNativeLibsDir =
     layout.buildDirectory.dir("generated/jniLibs/arm64-v8a")
 
-val copyPrebuiltNativeLibs = tasks.register<Copy>("copyPrebuiltNativeLibs") {
+val copyPrebuiltNativeLibs = tasks.register<Sync>("copyPrebuiltNativeLibs") {
     from(project.file("prebuilt_libs"))
     include("*.so")
     include("htp_backend_ext_config.json")

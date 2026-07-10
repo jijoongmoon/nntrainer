@@ -301,6 +301,7 @@ echo ""
 echo "[7] Building + installing APK (SampleTestAPP)..."
 (
     cd "$CAUSALLM_ROOT/Android"
+    ./gradlew "clean"
     ./gradlew ":SampleTestAPP:installDebug"
 )
 
