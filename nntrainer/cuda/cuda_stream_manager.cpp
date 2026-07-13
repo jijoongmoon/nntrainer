@@ -118,6 +118,36 @@ static bool cuda_async_mode() {
 void StreamManager::maybeFinish() {
   if (capturing_)
     return;
+  // NNTR_CUDA_PACE=<N> (default off): depth-N submission pacing -- the middle
+  // ground between the full per-op drain (sync mode; WDDM decode ~29 TPS) and
+  // no drain at all (ASYNC/DRAINSKIP; ~40-53 TPS but corrupt on WDDM, round-9
+  // §5-보강2). Bounds the un-drained op window to N by waiting the (i-N)th
+  // op's event instead of draining op i. Host-read boundaries still use the
+  // full finish(), so correctness of host consumption is unchanged. If the
+  // WDDM corruption scales with N, the driver chokes on deep unpaced queues
+  // (pacing = fix); if even N=4 corrupts while full drain is clean, the defect
+  // is at kernel-boundary granularity (driver bug class).
+  static const int pace_n = []() {
+    const char *e = std::getenv("NNTR_CUDA_PACE");
+    const int v = e ? std::atoi(e) : 0;
+    return v > 120 ? 120 : v; // ring headroom
+  }();
+  if (pace_n > 0 && stream_) {
+    constexpr int RING = 128;
+    static cudaEvent_t ring[RING] = {};
+    static unsigned long long idx = 0;
+    const int slot = (int)(idx % RING);
+    if (ring[slot] == nullptr)
+      cudaEventCreateWithFlags(&ring[slot], cudaEventDisableTiming);
+    cudaEventRecord(ring[slot], stream_);
+    if (idx >= (unsigned long long)pace_n) {
+      const int wslot = (int)((idx - (unsigned long long)pace_n) % RING);
+      if (ring[wslot])
+        cudaEventSynchronize(ring[wslot]);
+    }
+    ++idx;
+    return;
+  }
   if (!cuda_async_mode())
     finish();
 }
