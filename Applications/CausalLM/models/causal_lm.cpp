@@ -89,6 +89,8 @@ namespace nntrainer::cuda {
 // [i8-skip] Defined in cuda_fc_qint4.cpp (declared locally: single-TU contract,
 // no header edit) -- exempts a QS4CX weight from the eager cuBLAS-i8 build.
 void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w);
+// [i8-ephemeral] Frees all cuBLAS-i8 caches at the prefill->decode boundary.
+void cuda_fc_qs4cx_free_i8_caches();
 } // namespace nntrainer::cuda
 
 namespace {
@@ -1133,6 +1135,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (init_len < INIT_SEQ_LEN)
       registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
   }
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // [i8-ephemeral] NNTR_CUDA_I8_EPHEMERAL=1: the prefill just finished and
+  // decode (M=1, dp4a) never reads the cuBLAS-i8 caches -- free them here so
+  // the decode phase runs without their VRAM residency (~1.2GB on gauss4).
+  // Multi-turn: the next prefill lazily rebuilds (slower TTFT on that turn).
+  {
+    static const bool i8_ephemeral = []() {
+      const char *e = std::getenv("NNTR_CUDA_I8_EPHEMERAL");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (i8_ephemeral && causallm_engine() == "cuda")
+      nntrainer::cuda::cuda_fc_qs4cx_free_i8_caches();
+  }
+#endif
   // output should be deallocated after use
   for (auto &out : output) {
     delete[] out;

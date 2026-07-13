@@ -1139,6 +1139,29 @@ void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w) {
   g_i8_exempt.insert(plain_w);
 }
 
+// [i8-ephemeral] Free every cuBLAS-i8 weight cache. Decode (M=1) never reads
+// them, so dropping them at the prefill->decode boundary removes their VRAM
+// residency for the whole decode phase; a LATER prefill (multi-turn) lazily
+// rebuilds per FC via ensure_i8_cache_locked (CPU unpack -- slower TTFT on
+// that turn; the GPU repack upgrade is the follow-up). The dp4a int4 cache
+// and the pinned-host plain source are untouched.
+void cuda_fc_qs4cx_free_i8_caches() {
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  size_t freed = 0;
+  for (auto &kv : g_i8_weight_cache) {
+    if (kv.second.w8) {
+      cudaFree(kv.second.w8);
+      ++freed;
+    }
+    if (kv.second.rowsum)
+      cudaFree(kv.second.rowsum);
+  }
+  g_i8_weight_cache.clear();
+  if (freed)
+    std::fprintf(stderr, "[i8-ephemeral] freed %zu cuBLAS-i8 weight caches\n",
+                 freed);
+}
+
 // per-channel rowsum to the device cache (keyed by the plain payload pointer,
 // same key the dp4a path looks up at forward). Idempotent.
 bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
