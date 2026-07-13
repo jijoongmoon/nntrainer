@@ -1,9 +1,9 @@
 #!/bin/bash
-# nntrainer-native Android orchestration script (Slice S3-後).
+# nntrainer-native Android orchestration script.
 #
 # Builds + installs the CausalLM Android APP end-to-end using ONLY the
 # nntrainer submodule -- no QuickAI root meson project, no QUICKAI_ROOT.
-# It drives the S3-先 standalone meson project (Applications/CausalLM/
+# It drives the standalone meson project (Applications/CausalLM/
 # standalone/meson.build) instead of QuickAI's root meson.build, and stages
 # a public-only set of libraries into the QuickDotAI AAR's prebuilt_libs/
 # (no libquick_dot_ai.so -- the standalone project never builds the

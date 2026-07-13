@@ -29,7 +29,7 @@ data class ModelDescriptor(
     val sdVariantId: String? = null,
 )
 
-/** String constants for public model ids (migration convenience). */
+/** String constants for public model ids. */
 object ModelIds {
     const val QWEN3_0_6B        = "qwen3-0.6b"
     const val QWEN3_1_7B_Q40    = "qwen3-1.7b-q40"

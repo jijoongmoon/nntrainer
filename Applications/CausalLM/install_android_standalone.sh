@@ -2,10 +2,8 @@
 
 # Installation script for the standalone CausalLM Android application
 # (nntr_causallm CLI + unittests, built via build_android.sh /
-# enable-transformer). Renamed from install_android.sh during Slice E of the
-# quick<->causallm migration, which repurposed the `install_android.sh` name
-# for the Quick.AI product installer (installs to /data/local/tmp/Quick.AI;
-# see the sibling script moved in from the Quick.AI project root).
+# enable-transformer). Distinct from install_android.sh, the Quick.AI
+# product installer, which installs to /data/local/tmp/Quick.AI.
 set -e
 
 # Configuration

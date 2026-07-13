@@ -4,7 +4,7 @@
  * @brief  QuickAI-owned compatibility type aliases for the main-based
  * nntrainer.
  *
- * @note   The in-house ("quickdotai_api_refact") nntrainer used to expose two
+ * @note   The old QuickAI nntrainer fork used to expose two
  *         types that QuickAI's QNN product models depend on but that the
  *         upstream `main` nntrainer does not provide:
  *

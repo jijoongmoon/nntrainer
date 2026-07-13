@@ -4,8 +4,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# SCRIPT_DIR is nntrainer/Applications/CausalLM (Slice E move); QUICKAI_ROOT
-# is the Quick.AI superproject root, 3 levels up.
+# SCRIPT_DIR is nntrainer/Applications/CausalLM; QUICKAI_ROOT is the Quick.AI
+# superproject root, 3 levels up.
 QUICKAI_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BUILD_DIR="$QUICKAI_ROOT/builddir_android"
 NNTRAINER_ROOT="$QUICKAI_ROOT/nntrainer"
@@ -55,7 +55,7 @@ QNN_SO="$NNTRAINER_ANDROID/libqnn_context.so"
 # that case, stage the QNN vendor runtime libs directly from $QNN_SDK_ROOT
 # instead of relying on them being manually pre-staged in install_libs/ —
 # this is what makes the AAR's prebuilt_libs/ self-sufficient from a clean
-# checkout (Slice E / E1). Missing individual libs only warn (SDK layouts
+# checkout. Missing individual libs only warn (SDK layouts
 # can vary slightly across versions); a missing QNN_SDK_ROOT also only
 # warns, since install_libs/ may already have these from a previous run.
 if [ -f "$QNN_SO" ]; then

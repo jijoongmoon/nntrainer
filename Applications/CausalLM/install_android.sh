@@ -7,8 +7,8 @@ INSTALL_DIR="/data/local/tmp/Quick.AI"
 MODEL_DIR="$INSTALL_DIR/models"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# SCRIPT_DIR is nntrainer/Applications/CausalLM (Slice E move); QUICKAI_ROOT
-# is the Quick.AI superproject root, 3 levels up.
+# SCRIPT_DIR is nntrainer/Applications/CausalLM; QUICKAI_ROOT is the Quick.AI
+# superproject root, 3 levels up.
 QUICKAI_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BUILD_DIR="$QUICKAI_ROOT/builddir_android"
 NNTRAINER_ROOT="$QUICKAI_ROOT/nntrainer"

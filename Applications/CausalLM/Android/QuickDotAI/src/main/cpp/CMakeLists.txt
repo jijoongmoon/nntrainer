@@ -10,9 +10,8 @@
 # libc++_shared.so) is shipped as a set of prebuilt shared libraries in
 # QuickDotAI/prebuilt_libs/ — see build_api_lib.sh in Applications/CausalLM
 # to regenerate them. API headers are consumed directly from the canonical
-# Applications/CausalLM/api/ directory (this Android/ tree now lives as a
-# sibling of api/ under Applications/CausalLM/), so there is no bundled
-# copy to keep in sync. A Gradle copy task in QuickDotAI/build.gradle.kts
+# Applications/CausalLM/api/ directory, so there is no bundled copy to keep
+# in sync. A Gradle copy task in QuickDotAI/build.gradle.kts
 # copies the prebuilt .so files into the AAR's jniLibs/arm64-v8a at build
 # time, so they are discoverable at runtime via System.loadLibrary from
 # whichever app hosts the AAR.

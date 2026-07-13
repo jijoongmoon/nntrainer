@@ -39,9 +39,9 @@ for arg in "$@"; do
     esac
 done
 
-# SCRIPT_DIR is nntrainer/Applications/CausalLM (Slice E move); QUICKAI_ROOT
-# is the Quick.AI superproject root, 3 levels up (CausalLM -> Applications ->
-# nntrainer -> Quick.AI). The QuickAI meson project stays at QUICKAI_ROOT.
+# SCRIPT_DIR is nntrainer/Applications/CausalLM; QUICKAI_ROOT is the Quick.AI
+# superproject root, 3 levels up (CausalLM -> Applications -> nntrainer ->
+# Quick.AI). The QuickAI meson project stays at QUICKAI_ROOT.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QUICKAI_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 

@@ -1,4 +1,4 @@
-# nntrainer standalone app build (S3-先): a self-contained meson project that
+# nntrainer standalone app build: a self-contained meson project that
 # builds the CausalLM app (libcausallm.so + libquick_dot_ai_api.so +
 # quick_dot_ai_test) by linking a PREBUILT nntrainer engine via
 # cxx.find_library() - exactly how QuickAI's root meson project works today,
@@ -10,11 +10,11 @@
 # NOT include_directories('..'), to avoid meson sandbox violations) while
 # folding the public extension (xgrammar + QNN model-runtime infra + the public
 # gemma4-e2b-qnn model) directly into libcausallm.so, the way
-# Applications/CausalLM/meson.build (S1) does for the in-tree nntrainer build.
+# Applications/CausalLM/meson.build does for the in-tree nntrainer build.
 #
 # Gauss-free: this project must never reference gauss models/descriptors. The
 # proprietary gauss overlay is built by QuickAI's own meson project against
-# the prebuilt libcausallm.so/libqnn_context.so produced here (S4).
+# the prebuilt libcausallm.so/libqnn_context.so produced here.
 project('causallm-app', 'c', 'cpp',
   version: '0.2.0',
   license: ['apache-2.0'],

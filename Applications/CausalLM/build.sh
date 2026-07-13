@@ -61,12 +61,11 @@ if [ "$ENABLE_QNN" = true ] && [ "$PLATFORM" != "android" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# SCRIPT_DIR is nntrainer/Applications/CausalLM (this script's home since the
-# Slice E move). QUICKAI_ROOT is the Quick.AI superproject root, 3 levels up
-# (CausalLM -> Applications -> nntrainer -> Quick.AI). The QuickAI meson
-# project (meson.build, meson_options.txt, src/, api/, api-app/) stays at
-# QUICKAI_ROOT -- only this shell script (and its siblings) moved under
-# CausalLM.
+# SCRIPT_DIR is nntrainer/Applications/CausalLM. QUICKAI_ROOT is the Quick.AI
+# superproject root, 3 levels up (CausalLM -> Applications -> nntrainer ->
+# Quick.AI). The QuickAI meson project (meson.build, meson_options.txt, src/,
+# api/, api-app/) stays at QUICKAI_ROOT; only this shell script (and its
+# siblings) live under CausalLM.
 QUICKAI_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 NNTRAINER_ROOT="$QUICKAI_ROOT/nntrainer"
 XGRAMMAR_ROOT="$SCRIPT_DIR/xgrammar"
@@ -93,8 +92,8 @@ if [ ! -f "$NNTRAINER_ROOT/meson.build" ]; then
     git -C "$QUICKAI_ROOT" submodule update --init --recursive --depth 1
 fi
 
-# xgrammar submodule: since the Slice A relocation it lives INSIDE the nntrainer
-# submodule at Applications/CausalLM/xgrammar (src/meson.build compiles
+# xgrammar submodule lives INSIDE the nntrainer submodule at
+# Applications/CausalLM/xgrammar (src/meson.build compiles
 # xgrammar/cpp/*.cc from causallm_root; root meson.build adds its include dirs).
 # A missing checkout makes meson configuration fail with:
 #   "ERROR: File .../xgrammar/cpp/compiled_grammar.cc does not exist."

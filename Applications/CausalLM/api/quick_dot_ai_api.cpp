@@ -50,8 +50,7 @@
 #include "sentence_transformer.h"
 // V-JEPA2 + LFM2 fused video-language model. Depends on the nntrainer
 // VjepaLfm2ForConditionalGeneration model + Transformer::run_video virtual,
-// which are NOT on the current migration nntrainer branch (they live on
-// origin/vjepa-lfm2-run / lfm2-main). Gated off until they are ported here;
+// which are not present in this tree. Gated off until they are ported here;
 // define QUICKAI_ENABLE_VJEPA_LFM2_VIDEO to re-enable the video path.
 #if defined(QUICKAI_ENABLE_VJEPA_LFM2_VIDEO)
 #include "vjepa_lfm2_vl/vjepa_lfm2_vl.h"
@@ -448,7 +447,7 @@ static void register_models() {
     // projector, LFM2) are constructed internally, so only the combined
     // architecture needs a Factory entry.
     // Gated: see the QUICKAI_ENABLE_VJEPA_LFM2_VIDEO note at the include of
-    // vjepa_lfm2_vl.h. The model is absent from the migration nntrainer branch.
+    // vjepa_lfm2_vl.h.
 #if defined(QUICKAI_ENABLE_VJEPA_LFM2_VIDEO)
     causallm::Factory::Instance().registerModel(
       "Lfm2VLVJepa21BModel", [](json cfg, json generation_cfg, json nntr_cfg) {
@@ -3075,8 +3074,8 @@ ErrorCode runModelHandleWithJsonStreaming(CausalLmHandle handle,
 // Multi-image Multimodal API (V-JEPA)
 // ---------------------------------------------------------------------------
 
-// V-JEPA2 + LFM2 fused video path. Gated off on the migration nntrainer branch
-// (no VjepaLfm2 model / Transformer::run_video). See the include-site note for
+// V-JEPA2 + LFM2 fused video path. Gated off (no VjepaLfm2 model /
+// Transformer::run_video in this tree). See the include-site note for
 // QUICKAI_ENABLE_VJEPA_LFM2_VIDEO.
 #if defined(QUICKAI_ENABLE_VJEPA_LFM2_VIDEO)
 // True when the handle holds a single self-contained video-language model

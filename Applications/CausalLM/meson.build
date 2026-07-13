@@ -1,11 +1,11 @@
 # api/{causal_lm_api,model_config,streamer,callback_streamer}.cpp were removed
-# here (Move Slice B): the API layer is now quick_dot_ai_api, a separate lib
-# there. NOTE: models/causal_lm.cpp still calls streamer_put()/streamer_end()
-# (declared in api/streamer.h). streamer.cpp is self-contained (only depends
-# on streamer.h, no other api/ sources), so it is re-added directly to
-# causallm_src below (Slice E / E4).
+# here: the API layer is now quick_dot_ai_api, a separate lib there. NOTE:
+# models/causal_lm.cpp still calls streamer_put()/streamer_end() (declared in
+# api/streamer.h). streamer.cpp is self-contained (only depends on
+# streamer.h, no other api/ sources), so it is re-added directly to
+# causallm_src below.
 #
-# nntrainer standalone app build (S1): the public extension that used to be
+# nntrainer standalone app build: the public extension that used to be
 # QuickAI-only (xgrammar + the QNN model-runtime infra + the public
 # gemma4-e2b-qnn model) is folded into libcausallm.so here, so this
 # submodule's own meson build can produce the full app — CPU always, QNN
@@ -21,7 +21,7 @@
 #     the QNN block below causallm_src). Proprietary QNN models are layered
 #     on top by a separate downstream project, not in this public tree.
 #
-# E4 (the enable-api block further below): provides the libquick_dot_ai_api.so
+# The enable-api block further below provides the libquick_dot_ai_api.so
 # target (+ quick_dot_ai_test) mirroring QuickAI's api/meson.build. It no
 # longer compiles xgrammar itself — it borrows the single copy from
 # libcausallm.so via causallm_dep. ENABLE_QNN_MODELS is defined for it only
@@ -516,7 +516,7 @@ if get_option('enable-test')
   # NOTE: the 'unittest_cancel_api' target (api/unittest_cancel_api.cpp) was
   # removed here (UNVERIFIED — see note above test_api). It exercised the
   # removed causal_lm_api.{cpp,h} global cancel + '*ForTest' seams, which no
-  # longer exist after Move Slice B.
+  # longer exist.
 
   # Ubuntu native builds use platform=none.
   model_unittest_platforms = ['none', 'windows', 'android']
