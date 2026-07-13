@@ -254,6 +254,10 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
   // single-pointer unified allocation (OpenCL SVM, CUDA UVM) is both
   // host-addressable and device-visible. See MemAllocator::isSVM().
   mem_data->setSVM(allocator_->isSVM());
+  // Device-only pools (CudaMemAllocator(device_only): cudaMalloc) produce
+  // pointers the host cannot dereference -- stamp it so consumers can gate
+  // host fallbacks / staging without driver queries (see isHostAddressable).
+  mem_data->setHostAddressable(allocator_->isHostAddressable());
   return mem_data;
 }
 

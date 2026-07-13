@@ -159,6 +159,18 @@ public:
   bool isSVM() const { return svm_allocation; }
 
   /**
+   * @brief  True unless this memory is DEVICE-ONLY (e.g. cudaMalloc): the host
+   *         must not dereference the pointer and every host read/write has to
+   *         stage. Stamped from MemAllocator::isHostAddressable() at pool bind
+   *         (same pattern as the SVM stamp) so consumers ask the tensor, not
+   *         the driver -- replaces per-call cudaPointerGetAttributes probing
+   *         in app code (ARCH_CONFORMANCE_REVIEW_20260713 V1; layering rule:
+   *         capability flows up via the allocator, no layer calls up).
+   *         Defaults true: plain host buffers / Tensor::Map are host memory.
+   */
+  bool isHostAddressable() const { return host_addressable; }
+
+  /**
    * @brief  GPU activation-residency state (NNTR_DEVRES overlay, Step 0).
    * @details device_valid means "the freshest copy of this activation lives in
    *          the device buffer device_mem", DISTINCT from `valid` (which means
@@ -218,12 +230,19 @@ private:
    */
   void setSVM(bool is_svm) { svm_allocation = is_svm; }
 
+  /**
+   * @brief  Set host-addressability (private -- MemoryPool stamps it at bind,
+   *         mirroring setSVM).
+   */
+  void setHostAddressable(bool v) { host_addressable = v; }
+
   bool valid;
   unsigned int id;
   void *address;
   MemoryDataValidateCallback validate_cb;
   MemoryDataValidateCallback invalidate_cb;
   bool svm_allocation;
+  bool host_addressable = true;
   bool device_valid;  /**< NNTR_DEVRES: freshest copy is in device_mem */
   void *device_mem;   /**< NNTR_DEVRES: resident cl_mem (non-owning, void*) */
   ResidencyClass residency_; /**< static residency class (planner decision) */

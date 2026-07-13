@@ -2420,12 +2420,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
           nntrainer::cuda::StreamManager::Global().finishIfAsync();
 #if defined(ENABLE_FP16)
-          NNTR_THROW_IF(
-            b_cache_key_step.getDataType() ==
-                ml::train::TensorDim::DataType::FP16 &&
-              nntrainer::cuda::dev_only(
-                (void *)b_cache_key_step.getData<_FP16>()),
-            std::runtime_error)
+          NNTR_THROW_IF(b_cache_key_step.getMemoryData() &&
+                          !b_cache_key_step.getMemoryData()->isHostAddressable(),
+                        std::runtime_error)
             << "device-only KV (NNTR_CUDA_KV_DEV) requires GPU RoPE for K; the "
                "host fallback would fault (NNTR_CUDA_ROPE off or RoPE LUT "
                "range miss at cache_index=" << cache_index << ")";
@@ -2465,8 +2462,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // Device-only KV (NNTR_CUDA_KV_DEV): the host copyData fallback
           // below would dereference a cudaMalloc pointer -- always take the
           // GPU copy for a device-only destination, independent of the
-          // VCOPY_PREFILL opt-in.
-          const bool v_dev_only = nntrainer::cuda::dev_only(vout);
+          // VCOPY_PREFILL opt-in. Asked via the MemoryData residency stamp
+          // (pool-bind time), not a per-call driver query -- layering rule.
+          const auto v_md = b_cache_value_step.getMemoryData();
+          const bool v_dev_only = v_md && !v_md->isHostAddressable();
           static const bool m2b_v = nntr_env_on("NNTR_CUDA_M2B");
           if (cuda_elt && dev &&
               (value_step.height() == 1 || vcopy_prefill || v_dev_only)) {
@@ -2491,8 +2490,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         if (!v_copy_gpu) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
           nntrainer::cuda::StreamManager::Global().finishIfAsync();
-          NNTR_THROW_IF(nntrainer::cuda::dev_only(
-                          (void *)b_cache_value_step.getData<_FP16>()),
+          NNTR_THROW_IF(b_cache_value_step.getMemoryData() &&
+                          !b_cache_value_step.getMemoryData()->isHostAddressable(),
                         std::runtime_error)
             << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
                "host copyData fallback would fault -- check NNTR_CUDA_ELTWISE";

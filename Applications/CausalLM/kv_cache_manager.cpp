@@ -174,7 +174,8 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
       // pointer itself so the UVM/pinned/SVM paths keep the host memset.
       auto zero_kv = [](nntrainer::Tensor &t) {
         void *ptr = (void *)t.getData<char>();
-        if (nntrainer::cuda::dev_only(ptr)) {
+        const auto md = t.getMemoryData();
+        if (md && !md->isHostAddressable()) {
           if (!nntrainer::cuda::device_memset0(ptr, t.bytes()))
             throw std::runtime_error(
               "KVCacheManager: device memset of the KV cache failed");
@@ -347,7 +348,8 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len) const {
     // Device-only KV: Tensor::save reads on the host -- stage D2H first.
     auto save_slice = [&f](nntrainer::Tensor &slice) {
       void *ptr = (void *)slice.getData<char>();
-      if (nntrainer::cuda::dev_only(ptr)) {
+      const auto md = slice.getMemoryData();
+      if (md && !md->isHostAddressable()) {
         nntrainer::Tensor host_t(slice.getDim(), true);
         if (!nntrainer::cuda::copy_any((void *)host_t.getData<char>(), ptr,
                                        host_t.bytes()))
@@ -395,7 +397,8 @@ void KVCacheManager::load(const std::string &path, unsigned int seq_len) {
     // temp, then push H2D.
     auto load_slice = [&f](nntrainer::Tensor &slice) {
       void *ptr = (void *)slice.getData<char>();
-      if (nntrainer::cuda::dev_only(ptr)) {
+      const auto md = slice.getMemoryData();
+      if (md && !md->isHostAddressable()) {
         nntrainer::Tensor host_t(slice.getDim(), true);
         host_t.read(f);
         if (!nntrainer::cuda::copy_any(ptr, (const void *)host_t.getData<char>(),

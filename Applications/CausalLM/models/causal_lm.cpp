@@ -416,7 +416,8 @@ CausalLM::incrementalInference(unsigned int batch_size,
       // device memory the raw memcpy below cannot read -- drain and stage D2H,
       // symmetric to the fp16 branch above. (Campaign scout gap: only the fp16
       // branch staged; the fp32 branch would fault under DEV_ACT.)
-      if (nntrainer::cuda::dev_only((const void *)out_t.getData())) {
+      if (out_t.getMemoryData() &&
+          !out_t.getMemoryData()->isHostAddressable()) {
         nntrainer::cuda::StreamManager::Global().finish();
         if (!nntrainer::cuda::copy_any((void *)last_out_buf_data,
                                        (const void *)out_t.getData(),
