@@ -256,7 +256,7 @@ NeutralLayer ..> ComputeOpsExt : dispatches
 | DeviceCaps, `Context::caps()`, `Context::runDecode()` | **[E]** | LANDED: struct `context.h:63`, `caps()` `context.h:429`, `runDecode()` `context.h:471` + base `neuralnet.cpp:618` + CUDA override `cuda_context.cpp:224`; **`residencyFor` still [N]** (absent) |
 | ComputeOpsExt (fc_qint4/rmsnorm/rope/attention/fused_*) | **[N]** | absorbs `dotCl_v8c`+`cudaFcGemm` |
 | QualcommComputeOps (HexKL) | **[N]** | Mode-2 op-by-op NPU |
-| MemAllocatorCapsExt, ResidencyClassExt (RPCMEM/IMAGE2D) | **[E]** | predicates landed (`mem_allocator.h:89-151`); RPCMEM/IMAGE2D enum values reserved (`memory_data.h:47-48`) with consumers pending (M4-M7); UVM rides SVM tag |
+| MemAllocatorCapsExt, ResidencyClassExt (RPCMEM/IMAGE2D) | **[E]** | predicates landed (`mem_allocator.h:89-151`); RPCMEM/IMAGE2D enum values reserved (`memory_data.h:47-48`) with consumers pending (M4-M7). ~~UVM rides SVM tag~~ **2026-07-09 field-corrected: UVM must NOT ride the SVM tag** — every isSVM() consumer is an OpenCL kernel-binding gate, and the unified build hijacked CUDA tensors through it (deterministic whole-model garbage on Windows; see the isSVM() CONTRACT in `mem_allocator.h` and `CudaMemAllocator::isSVM()==false`). A DEVICE residency class (cudaMalloc, host-unreachable) is now implicit via `isHostAddressable()==false` — promote to `ResidencyClass::DEVICE` in M6 |
 | ExecPlan resolver, ModelFeatures | **[E shadow]** | landed as free fns + structs (`context.h:146,170,208,255`); resolved+logged only, zero authoritative consumers (flip = T8). ModelFeatures replaces the `is_gemma2` proxy |
 | FusionRealizer **[E]**; OffloadNode, NeutralLayer **[N]** | mixed | FusionRealizer landed (`compiler/fusion_realizer.cpp`, inference- + CPU-engine-gated); OffloadNode/NeutralLayer absent |
 
@@ -994,3 +994,32 @@ nntrainer `meson.build` **de-installs** `cl_context.h`/`cuda_context.h`/`cuda_rm
 **Bottom line:** the split is gated by the refactor — **S1 (registration facade) + S2 (layer-author SDK)
 + S4 (op_table collapse so layers stop including `cuda_*.h`)** are prerequisites; the repo cut (S5) is
 the payoff. None of it requires the perf work to regress (every step token-identical-gated).
+
+---
+
+## Addendum — 2026-07 field decisions (WDDM campaign, rounds 6-9)
+
+Field work on the Windows/WDDM port produced decisions this document should carry until the
+resolver (T4/T8) and residency (T5/M6) tracks absorb them:
+
+1. **isSVM() contract finalized (T2 completion)**: the flag means "this pointer may be handed to an
+   OpenCL kernel", NOT "unified memory". CUDA UVM reports **false**. Any new non-OpenCL backend must
+   override it to false or the unified build's CL fast paths hijack its tensors (field: whole-model
+   deterministic garbage, Windows rounds 1-6).
+2. **WDDM (cMA==0) residency policy, allocator-owned per decision #4=B**: the non-device_only CUDA
+   pool substitutes pinned zero-copy (`cudaHostAlloc(Mapped)`, UVA same-pointer) for managed —
+   managed is empirically unusable on WDDM (remigration-storm hang at 1K). Device-resident tiers
+   are opt-in levers pending the resolver: `NNTR_CUDA_DEV_ACT` (activations, pre-existing),
+   `NNTR_CUDA_KV_DEV` (KV pool, 2026-07-10). Measured on RTX 5070 Laptop WDDM: base 63/5.5 →
+   activations+KV device 2791-4033/26-29 (the "A2" configuration).
+3. **Submission pacing**: per-op stream drains are a WDDM stability crutch, not a semantic need
+   (Linux runs drain-free via ASYNC). `NNTR_CUDA_PACE=<N>` bounds the un-drained window via events
+   at the single policy point (`StreamManager::maybeFinish`). Un-paced submission (ASYNC/DRAINSKIP/
+   graph replay) corrupts on WDDM with no in-stack cause found — driver-layer investigation open
+   (round-9 P1-P5 discriminators).
+4. **Known conformance debt from the campaign** (see GAUSS4/win_rounds/ARCH_CONFORMANCE_REVIEW_20260713.md):
+   app-layer pointer probing (`cuda::dev_only`) in kv_cache_manager/mha_core/causal_lm should become
+   a MemoryData `host_addressable` stamp (same pattern as setSVM); kv_cache_manager's direct
+   `CudaMemAllocator(device_only)` construction should go through the M6 register hook; the WDDM
+   env bundle is a resolver cell awaiting T4 ("cMA==0 && discrete → act=DEVICE, kv=DEVICE,
+   norm=GPU_ALL, submission=PACE(N)").
