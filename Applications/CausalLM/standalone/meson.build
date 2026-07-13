@@ -171,6 +171,12 @@ endif
 
 # ── Extra defines ───────────────────────────────────────────────────────
 extra_defines = []
+
+# FP16 is ARM-only (__fp16 type not available on x86)
+if get_option('enable-fp16') and is_android
+  extra_defines += ['-DENABLE_FP16=1', '-DUSE__FP16=1']
+endif
+
 # Single QNN switch. enable-qnn on → QNN infra + QNN models (gemma4-e2b-qnn
 # folded into libcausallm) + the multimodal run path (api runMultimodal* →
 # base Transformer::run_image; vision encoders like gauss-3.8-vit are overlaid
