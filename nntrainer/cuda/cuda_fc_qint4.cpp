@@ -32,6 +32,7 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fp16.h>
@@ -794,6 +795,14 @@ struct DevWeightI8 {
   int *rowsum = nullptr;     // per-channel sum of int8 weight [N]
 };
 std::unordered_map<const void *, DevWeightI8> g_i8_weight_cache;
+// [i8-skip] Weights whose FC can never reach the M>=32 cuBLAS gate
+// (skip_prefill layers never see prefill M>1; the untied lm_head decodes at
+// M=1): their [K,N] int8 cache is 2x the int4 payload of pure dead VRAM
+// (gauss4: ~1.5GB, lm_head alone 673MiB). The app marks them before the
+// prewarm walk (load time, single-threaded -- no lock needed); the EAGER
+// build below skips them, while the lazy ensure_i8_cache_locked() runtime
+// build stays as the self-healing fallback if the premise is ever wrong.
+std::unordered_set<const void *> g_i8_exempt;
 int *g_i8_c = nullptr; // int32 GEMM output scratch [M,N]
 size_t g_i8_c_cap = 0;
 signed char *g_dp4a_q8 = nullptr;
@@ -1124,6 +1133,12 @@ bool cuda_fc_qs4cx_stage_host_weight(const unsigned char *host_plain,
 // it was the Section-A repack) and the GPU is free of it. Mirrors
 // repack_plain_i4 + weight_rowsum bit-exactly (the repack is a byte-wise
 // XOR 0x88, see the kernel comment), then uploads the packed int4 +
+// [i8-skip] Mark a QS4CX plain payload as exempt from the eager cuBLAS-i8
+// [K,N] build (see g_i8_exempt). Called at load time before the prewarm walk.
+void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w) {
+  g_i8_exempt.insert(plain_w);
+}
+
 // per-channel rowsum to the device cache (keyed by the plain payload pointer,
 // same key the dp4a path looks up at forward). Idempotent.
 bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
@@ -1187,7 +1202,8 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
   // Chunked along K ([k0,k1) rows of the [K,N] buffer are contiguous on both
   // sides); the per-channel rowsum accumulates across chunks.
   static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
-  if (_cb && _cb[0] != '0' && !g_i8_weight_cache.count(plain_w)) {
+  if (_cb && _cb[0] != '0' && !g_i8_weight_cache.count(plain_w) &&
+      !g_i8_exempt.count(plain_w)) {
     const size_t chunk_k =
       std::max<size_t>(1, std::min<size_t>(K, PREWARM_CHUNK_BYTES / N));
     std::vector<signed char> w8(chunk_k * (size_t)N);

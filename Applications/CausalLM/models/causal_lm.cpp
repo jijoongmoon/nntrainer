@@ -85,6 +85,12 @@ bool recq_read_argmax_io(unsigned int *tok, cl_event wait_evt);
 } // namespace nntrainer
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+namespace nntrainer::cuda {
+// [i8-skip] Defined in cuda_fc_qint4.cpp (declared locally: single-TU contract,
+// no header edit) -- exempts a QS4CX weight from the eager cuBLAS-i8 build.
+void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w);
+} // namespace nntrainer::cuda
+
 namespace {
 // NNTR_CUDA_ARGMAX on-GPU greedy argmax (opt-in). incrementalInference() stashes
 // the DEVICE-resident lm_head logits pointer + dtype here (the tensor data,
@@ -991,6 +997,22 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             const unsigned short *uS = nullptr;
             nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
               wt.getScale<float>(), wt.width(), &uS);
+            // [i8-skip] skip_prefill FCs never see prefill M>1 (fc_layer.cpp
+            // early-return) and the untied lm_head decodes at M=1, so neither
+            // can reach the M>=32 cuBLAS-i8 gate -- their [K,N] int8 cache
+            // (2x the int4 payload; gauss4 ~1.5GB, lm_head alone 673MiB) is
+            // dead VRAM. Exempt them from the EAGER build; the lazy runtime
+            // build remains as the self-healing fallback.
+            bool i8_dead = l.getName() == "output_of_causallm";
+            if (!i8_dead) {
+              try {
+                i8_dead = l.getProperty("skip_prefill") == "true";
+              } catch (...) {
+              }
+            }
+            if (i8_dead)
+              nntrainer::cuda::cuda_fc_qs4cx_prewarm_exempt_i8(
+                wt.getData<uint8_t>());
             // [wprefetch] NNTR_CUDA_WPREFETCH>=1: release the plain payload
             // from host RSS (migrate to VRAM) and build the derived caches
             // with the GPU repack kernels -- the CPU prewarm would fault the
