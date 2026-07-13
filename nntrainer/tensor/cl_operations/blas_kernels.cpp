@@ -2823,7 +2823,7 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
   // only the ROW STRIDE grows -- W_wgt is set to this padded texel stride).
   // Adreno-only (v8c_wrow_bytes gates on caps.image_v8c); Intel keeps K/2.
   const size_t v8c_row_bytes = v8c_wrow_bytes(K);
-  std::vector<uint8_t> packed((size_t)N * v8c_row_bytes);
+  const size_t total_bytes = (size_t)N * v8c_row_bytes;
 
   // Read the offset-encoded (int4+8) nibble for input index k of a plain row.
   auto plain_nib = [](const uint8_t *row, size_t k) -> uint8_t {
@@ -2831,38 +2831,73 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
     return (k & 1) ? (uint8_t)((byte >> 4) & 0x0F) : (uint8_t)(byte & 0x0F);
   };
 
-  // v8c K-block byte order (matches the KAI builder): byte(c*4+b) = (qH<<4)|qL
-  // with qL = K(kblk*32 + c*8 + b), qH = K(kblk*32 + c*8 + b + 4).
-  for (size_t n = 0; n < N; ++n) {
-    const uint8_t *plain_row = plain_nibbles + n * plain_row_bytes;
-    uint8_t *v8c_row = packed.data() + n * v8c_row_bytes;
-    for (size_t kblk = 0; kblk < k_blocks; ++kblk) {
-      uint8_t *v8c_kblk = v8c_row + kblk * 16;
-      const size_t kbase = kblk * 32;
-      for (size_t c = 0; c < 4; ++c) {
-        for (size_t b = 0; b < 4; ++b) {
-          const uint8_t qL = plain_nib(plain_row, kbase + c * 8 + b);
-          const uint8_t qH = plain_nib(plain_row, kbase + c * 8 + b + 4);
-          v8c_kblk[c * 4 + b] = (uint8_t)((qH << 4) | qL);
-        }
-      }
-    }
-  }
-
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   cl_context ctx = blas_cc->context_inst_.GetContext();
 
   cl_int err = CL_SUCCESS;
-  cl_mem w_buf =
-    clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, packed.size(),
-                   packed.data(), &err);
+  // [peak-chunk] The old path built a FULL host mirror then COPY_HOST_PTR'd
+  // it -- for the untied lm_head (N=262144) that is a 336MB peak-only
+  // transient, the single biggest load-time WS spike left after DROP_PLAIN.
+  // Build into an empty buffer via bounded chunks instead: permute + row-sum
+  // fold into ONE pass over each chunk, and the host staging stays at
+  // CHUNK_BYTES regardless of N. Byte-identical output (same permute, same
+  // zeroed padding, same row-sum math).
+  cl_mem w_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY, total_bytes, nullptr, &err);
   if (err != CL_SUCCESS || !w_buf)
     throw std::runtime_error(
       "make_v8c_weight_backing_from_qs4cx: clCreateBuffer (weight) failed: " +
       std::to_string(err));
+
+  std::vector<int32_t> row_sum_w_int4(N, 0);
+  const size_t real_row_bytes = (size_t)K / 2;
+  constexpr size_t CHUNK_BYTES = 16u << 20;
+  const size_t chunk_rows = std::max<size_t>(1, CHUNK_BYTES / v8c_row_bytes);
+  std::vector<uint8_t> packed(chunk_rows * v8c_row_bytes, 0);
+  cl_command_queue cq = blas_cc->command_queue_inst_.GetCommandQueue();
+  for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
+    const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
+    std::memset(packed.data(), 0, nrows * v8c_row_bytes); // padding stays 0
+    for (size_t r = 0; r < nrows; ++r) {
+      const size_t n = n0 + r;
+      const uint8_t *plain_row = plain_nibbles + n * plain_row_bytes;
+      uint8_t *v8c_row = packed.data() + r * v8c_row_bytes;
+      // v8c K-block byte order (matches the KAI builder): byte(c*4+b) =
+      // (qH<<4)|qL with qL = K(kblk*32+c*8+b), qH = K(kblk*32+c*8+b+4).
+      for (size_t kblk = 0; kblk < k_blocks; ++kblk) {
+        uint8_t *v8c_kblk = v8c_row + kblk * 16;
+        const size_t kbase = kblk * 32;
+        for (size_t c = 0; c < 4; ++c) {
+          for (size_t b = 0; b < 4; ++b) {
+          const uint8_t qL = plain_nib(plain_row, kbase + c * 8 + b);
+          const uint8_t qH = plain_nib(plain_row, kbase + c * 8 + b + 4);
+          v8c_kblk[c * 4 + b] = (uint8_t)((qH << 4) | qL);
+          }
+        }
+      }
+      // Per-channel int4 row sum (asymmetric-act zero-point correction),
+      // folded into the same pass -- sum ONLY the real K/2 bytes, not the
+      // Adreno pitch padding (a 0x00 pad byte would decode as two -8s).
+      int32_t s = 0;
+      for (size_t off = 0; off < real_row_bytes; ++off) {
+        const uint8_t byte = v8c_row[off];
+        s += ((int)(byte & 0x0Fu) - 8) + ((int)((byte >> 4) & 0x0Fu) - 8);
+      }
+      row_sum_w_int4[n] = s;
+    }
+    const cl_int werr =
+      clEnqueueWriteBuffer(cq, w_buf, CL_TRUE, n0 * v8c_row_bytes,
+                           nrows * v8c_row_bytes, packed.data(), 0, nullptr,
+                           nullptr);
+    if (werr != CL_SUCCESS) {
+      clReleaseMemObject(w_buf);
+      throw std::runtime_error(
+        "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+        std::to_string(werr));
+    }
+  }
   auto backing = std::make_unique<tv::TensorBacking>(
-    ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, packed.size(),
+    ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, total_bytes,
     /*owned=*/true);
 
   // Per-channel scale: QS4CX stores fp32 directly (no fp16->fp32 promotion).
@@ -2874,24 +2909,7 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
       std::to_string(err));
   *out_scale_buf = sb;
 
-  // Per-channel int4 row sum (Σ_k int4) for the asymmetric-act zero-point
-  // correction — identical to the KAI path, decoded from the v8c bytes.
-  std::vector<int32_t> row_sum_w_int4(N, 0);
-  // [Adreno pitch fix] Sum ONLY the real K/2 nibble bytes, NOT the zero padding
-  // added to v8c_row_bytes: a padding byte 0x00 decodes as two int4 values of
-  // (0-8)=-8, so including it would subtract 16 per padding byte from every
-  // row-sum and corrupt the zero-point correction. The permute writes the K/32
-  // 16-byte blocks (= K/2 bytes) at the front of each padded row.
-  const size_t real_row_bytes = (size_t)K / 2;
-  for (unsigned int n = 0; n < N; ++n) {
-    const uint8_t *row = packed.data() + n * v8c_row_bytes;
-    int32_t s = 0;
-    for (size_t off = 0; off < real_row_bytes; ++off) {
-      const uint8_t byte = row[off];
-      s += ((int)(byte & 0x0Fu) - 8) + ((int)((byte >> 4) & 0x0Fu) - 8);
-    }
-    row_sum_w_int4[n] = s;
-  }
+  // Per-channel int4 row sum: computed in the chunk loop above.
   cl_mem rsw_buf =
     clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                    sizeof(int32_t) * N, row_sum_w_int4.data(), &err);
