@@ -1127,17 +1127,60 @@ bool cuda_fc_qs4cx_stage_host_weight(const unsigned char *host_plain,
   return true;
 }
 
+// [i8-skip] Mark a QS4CX plain payload as exempt from the eager cuBLAS-i8
+// [K,N] build (see g_i8_exempt). Called at load time before the prewarm walk.
+void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w) {
+  g_i8_exempt.insert(plain_w);
+}
+
+// [i8-jit] NNTR_CUDA_I8_JIT=1: no persistent i8 cache exists at all -- the
+// prefill GEMM unpacks the RESIDENT dp4a signed-packed int4 copy (VRAM
+// source; unpacking from the pinned-host plain would re-pay ~700MB of PCIe
+// per prefill) into a reusable scratch right before the IMMA GEMM, shares
+// the dp4a rowsum (same per-channel sums), and leaves nothing resident.
+// Removes the whole i8 term from the prefill VRAM peak at ~4-5ms per 1K
+// prefill (tiled transpose, coalesced both sides).
+static inline bool i8_jit_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_CUDA_I8_JIT");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
+// Tiled transpose-unpack: dp4a packed [N, Kh] (byte = plain^0x88, nibbles =
+// two's-complement signed 4-bit) -> int8 [K, N]. Reads coalesced along Kh,
+// writes coalesced along N via the shared tile.
+static const char *I8_JIT_SRC = R"CU(
+extern "C" __global__ void i8_jit_unpack(const signed char *q4,
+                                         signed char *w8, int N, int K,
+                                         int Kh) {
+  __shared__ signed char t[32][65];
+  int nn0 = blockIdx.y * 32, kh0 = blockIdx.x * 32;
+  int nn = nn0 + threadIdx.y, kh = kh0 + threadIdx.x;
+  if (nn < N && kh < Kh) {
+    unsigned char b = (unsigned char)q4[(long long)nn * Kh + kh];
+    t[threadIdx.y][2 * threadIdx.x] =
+      (signed char)((((b & 0xF) ^ 8) & 0xF) - 8);
+    t[threadIdx.y][2 * threadIdx.x + 1] =
+      (signed char)(((((b >> 4) & 0xF) ^ 8) & 0xF) - 8);
+  }
+  __syncthreads();
+  int k0 = kh0 * 2, wn = nn0 + threadIdx.x;
+  for (int kk = threadIdx.y; kk < 64; kk += 32) {
+    int k = k0 + kk;
+    if (k < K && wn < N)
+      w8[(long long)k * N + wn] = t[threadIdx.x][kk];
+  }
+}
+)CU";
+
 // Prewarm the dp4a packed-int4 weight cache on the CPU at LOAD (nntrainer
 // ThreadManager-parallel), so the first inference does not pay the one-time
 // plain -> signed packed int4 repack (nsys: ~38% of the cold-run GPU time when
 // it was the Section-A repack) and the GPU is free of it. Mirrors
 // repack_plain_i4 + weight_rowsum bit-exactly (the repack is a byte-wise
 // XOR 0x88, see the kernel comment), then uploads the packed int4 +
-// [i8-skip] Mark a QS4CX plain payload as exempt from the eager cuBLAS-i8
-// [K,N] build (see g_i8_exempt). Called at load time before the prewarm walk.
-void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w) {
-  g_i8_exempt.insert(plain_w);
-}
 
 // [i8-ephemeral] Free every cuBLAS-i8 weight cache. Decode (M=1) never reads
 // them, so dropping them at the prefill->decode boundary removes their VRAM
@@ -1225,8 +1268,8 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
   // Chunked along K ([k0,k1) rows of the [K,N] buffer are contiguous on both
   // sides); the per-channel rowsum accumulates across chunks.
   static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
-  if (_cb && _cb[0] != '0' && !g_i8_weight_cache.count(plain_w) &&
-      !g_i8_exempt.count(plain_w)) {
+  if (_cb && _cb[0] != '0' && !i8_jit_on() &&
+      !g_i8_weight_cache.count(plain_w) && !g_i8_exempt.count(plain_w)) {
     const size_t chunk_k =
       std::max<size_t>(1, std::min<size_t>(K, PREWARM_CHUNK_BYTES / N));
     std::vector<signed char> w8(chunk_k * (size_t)N);
@@ -1399,7 +1442,8 @@ bool cuda_fc_qs4cx_prewarm_gpu(const unsigned char *plain_w, unsigned int N,
   if (!ensure_dp4a_cache_locked(plain_w, N, K))
     return false;
   static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
-  if (_cb && _cb[0] != '0' && !ensure_i8_cache_locked(plain_w, N, K))
+  if (_cb && _cb[0] != '0' && !i8_jit_on() &&
+      !ensure_i8_cache_locked(plain_w, N, K))
     return false;
   return true;
 }
@@ -1544,10 +1588,43 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
     g_last_quant_k = k;
   }
 
-  // 2) int8 weight [K,N] + per-channel rowsum (cached one-time unpack).
-  DevWeightI8 *dw8 = ensure_i8_cache_locked(plain_w, N, K);
-  if (!dw8)
-    return false;
+  // 2) int8 weight [K,N] + per-channel rowsum. [i8-jit] JIT mode transpose-
+  // unpacks the RESIDENT dp4a packed copy into a reusable scratch (nothing
+  // stays resident; rowsum shared with the dp4a cache -- same values); else
+  // the persistent per-weight cache (one-time unpack).
+  signed char *w8src = nullptr;
+  int *rowsum = nullptr;
+  if (i8_jit_on()) {
+    DevWeightQ *dw4 = ensure_dp4a_cache_locked(plain_w, N, K);
+    if (!dw4)
+      return false;
+    static signed char *jit_w8 = nullptr;
+    static size_t jit_cap = 0;
+    if (!ensure_buf((void **)&jit_w8, &jit_cap, (size_t)K * N))
+      return false;
+    auto ku =
+      CudaContext::Global().registerCudaKernel(I8_JIT_SRC, "i8_jit_unpack");
+    if (!ku)
+      return false;
+    const int khi = (int)((K + 1u) / 2u);
+    ku->SetKernelArguments(0, &dw4->plain, sizeof(dw4->plain));
+    ku->SetKernelArguments(1, &jit_w8, sizeof(jit_w8));
+    ku->SetKernelArguments(2, &n, sizeof(n));
+    ku->SetKernelArguments(3, &k, sizeof(k));
+    ku->SetKernelArguments(4, &khi, sizeof(khi));
+    const int ub[3] = {32, 32, 1};
+    const int ug[3] = {(khi + 31) / 32, ((int)N + 31) / 32, 1};
+    if (!StreamManager::Global().DispatchCommand(*ku, ug, ub))
+      return false;
+    w8src = jit_w8;
+    rowsum = dw4->rowsum;
+  } else {
+    DevWeightI8 *dw8 = ensure_i8_cache_locked(plain_w, N, K);
+    if (!dw8)
+      return false;
+    w8src = dw8->w8;
+    rowsum = dw8->rowsum;
+  }
 
   // 3) int32 GEMM output scratch [Mpad,N] (+tail pad: IMMA can write/read C in
   // wide vectorized tiles past the last element on large shapes).
@@ -1558,12 +1635,11 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
   // 4) INT8 IMMA GEMM on the Tensor Cores (Mpad rows; same backend stream as
   // the kernels). C is [Mpad,N] row-major; the real M rows are at the same
   // offsets so the epilogue reads C[m*N+n] for m<M directly.
-  if (!BlasManager::Global().igemmRowMajor(mpad, n, k, g_dp4a_q8, dw8->w8,
+  if (!BlasManager::Global().igemmRowMajor(mpad, n, k, g_dp4a_q8, w8src,
                                            g_i8_c))
     return false;
 
   // 5) dequant epilogue (bit-identical math to the dp4a kernel) -> fp16 Y.
-  int *rowsum = dw8->rowsum;
   kde->SetKernelArguments(0, &g_i8_c, sizeof(g_i8_c));
   kde->SetKernelArguments(1, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
   kde->SetKernelArguments(2, &g_dp4a_azp, sizeof(g_dp4a_azp));
