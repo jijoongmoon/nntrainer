@@ -1173,6 +1173,64 @@ extern "C" __global__ void i8_jit_unpack(const signed char *q4,
       w8[(long long)k * N + wn] = t[threadIdx.x][kk];
   }
 }
+
+// Vectorized variant (K%8==0 && N%4==0, which covers every gauss4 FC):
+// 64n x 64k tile, 256 threads; uint (4-byte) global loads along Kh and int
+// (4-byte) coalesced global stores along N -- runs the ~1.8GB/prefill unpack
+// traffic at near-memcpy bandwidth instead of byte-granular transactions.
+extern "C" __global__ void i8_jit_unpack_v4(const unsigned char *q4,
+                                            signed char *w8, int N, int K,
+                                            int Kh) {
+  __shared__ signed char t[64][68]; // [k_local][n_local], row stride 68 (4B)
+  const int nn0 = blockIdx.y * 64;
+  const int kh0 = blockIdx.x * 32; // bytes of Kh covered by this tile
+  const int tid = threadIdx.x;     // 256 threads
+  for (int rep = 0; rep < 2; ++rep) {
+    int idx = tid + rep * 256;
+    int nn = idx >> 3;   // 0..63
+    int kb4 = idx & 7;   // which 4-byte group in the 32-byte span
+    int n = nn0 + nn;
+    int khb = kh0 + kb4 * 4;
+    if (n < N && khb + 3 < Kh) {
+      unsigned int v = *reinterpret_cast<const unsigned int *>(
+        q4 + (long long)n * Kh + khb);
+      int kl = kb4 * 8;
+      for (int j = 0; j < 4; ++j) {
+        unsigned int b = (v >> (8 * j)) & 0xFFu;
+        t[kl + 2 * j][nn] = (signed char)((((b & 0xF) ^ 8) & 0xF) - 8);
+        t[kl + 2 * j + 1][nn] =
+          (signed char)(((((b >> 4) & 0xF) ^ 8) & 0xF) - 8);
+      }
+    } else if (n < N) { // Kh tail (unused when K%8==0, kept for safety)
+      for (int j = 0; j < 4; ++j) {
+        int kb = khb + j;
+        if (kb < Kh) {
+          unsigned char b = q4[(long long)n * Kh + kb];
+          int kl = kb4 * 8 + 2 * j;
+          t[kl][nn] = (signed char)((((b & 0xF) ^ 8) & 0xF) - 8);
+          t[kl + 1][nn] = (signed char)(((((b >> 4) & 0xF) ^ 8) & 0xF) - 8);
+        }
+      }
+    }
+  }
+  __syncthreads();
+  const int k0 = kh0 * 2;
+  for (int rep = 0; rep < 4; ++rep) {
+    int idx = tid + rep * 256;
+    int kl = idx >> 4; // 0..63
+    int ni = idx & 15; // 16 ints cover 64 n
+    int k = k0 + kl;
+    int n = nn0 + ni * 4;
+    if (k < K && n + 3 < N) {
+      int val = *reinterpret_cast<const int *>(&t[kl][ni * 4]);
+      *reinterpret_cast<int *>(w8 + (long long)k * N + n) = val;
+    } else if (k < K) {
+      for (int j = 0; j < 4; ++j)
+        if (n + j < N)
+          w8[(long long)k * N + n + j] = t[kl][ni * 4 + j];
+    }
+  }
+}
 )CU";
 
 // Prewarm the dp4a packed-int4 weight cache on the CPU at LOAD (nntrainer
@@ -1602,8 +1660,11 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
     static size_t jit_cap = 0;
     if (!ensure_buf((void **)&jit_w8, &jit_cap, (size_t)K * N))
       return false;
-    auto ku =
-      CudaContext::Global().registerCudaKernel(I8_JIT_SRC, "i8_jit_unpack");
+    // Vectorized transpose for 8|K && 4|N (every gauss4 FC); byte-granular
+    // fallback otherwise.
+    const bool vec_ok = ((K & 7u) == 0u) && ((N & 3u) == 0u);
+    auto ku = CudaContext::Global().registerCudaKernel(
+      I8_JIT_SRC, vec_ok ? "i8_jit_unpack_v4" : "i8_jit_unpack");
     if (!ku)
       return false;
     const int khi = (int)((K + 1u) / 2u);
@@ -1612,8 +1673,9 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(
     ku->SetKernelArguments(2, &n, sizeof(n));
     ku->SetKernelArguments(3, &k, sizeof(k));
     ku->SetKernelArguments(4, &khi, sizeof(khi));
-    const int ub[3] = {32, 32, 1};
-    const int ug[3] = {(khi + 31) / 32, ((int)N + 31) / 32, 1};
+    const int ub[3] = {vec_ok ? 256 : 32, vec_ok ? 1 : 32, 1};
+    const int ug[3] = {(khi + 31) / 32,
+                       vec_ok ? ((int)N + 63) / 64 : ((int)N + 31) / 32, 1};
     if (!StreamManager::Global().DispatchCommand(*ku, ug, ub))
       return false;
     w8src = jit_w8;
