@@ -153,7 +153,7 @@ causallm_inc_args += ['-I' + causallm_root / 'xgrammar' / '3rdparty' / 'picojson
 causallm_inc_args += ['-I' + causallm_root / 'xgrammar' / '3rdparty' / 'dlpack' / 'include']
 
 # ── QNN shared infra + public gemma4-e2b-qnn model (gated) ──────────────
-if enable_qnn and get_option('enable-qnn-models')
+if enable_qnn
   causallm_inc_args += ['-I' + causallm_root / 'qnn']
   causallm_inc_args += ['-I' + causallm_root / 'qnn' / 'gemma4-e2b-qnn']
 endif
@@ -171,16 +171,17 @@ endif
 
 # ── Extra defines ───────────────────────────────────────────────────────
 extra_defines = []
+# Single QNN switch. enable-qnn on → QNN infra + QNN models (gemma4-e2b-qnn
+# folded into libcausallm) + the multimodal run path (api runMultimodal* →
+# base Transformer::run_image; vision encoders like gauss-3.8-vit are overlaid
+# by the internal-models plugin). The multimodal api code is model-agnostic
+# (base-class virtuals only, no proprietary headers) and unreachable without a
+# 2-model vision+LLM handle, so it is harmless on a QNN build with no vision
+# model present. All three move together — there is no separate qnn-models or
+# experimental-multimodal gate.
 if enable_qnn
   extra_defines += '-DENABLE_QNN=1'
-  # QNN model sources (Quick_Dot_AI_QNN derivatives) only compile when
-  # enable-qnn-models is also set. Keep --enable-qnn alone (libqnn_context.so
-  # infra only, built by nntrainer's own meson) linkable without them.
-  if get_option('enable-qnn-models')
-    extra_defines += '-DENABLE_QNN_MODELS=1'
-  endif
-endif
-if get_option('enable-experimental-multimodal')
+  extra_defines += '-DENABLE_QNN_MODELS=1'
   extra_defines += '-DQUICKAI_ENABLE_EXPERIMENTAL_MULTIMODAL_NNTRAINER_API=1'
 endif
 
@@ -206,6 +207,10 @@ endif
 causallm_src_roots = [
   causallm_root / 'layers',
   causallm_root / 'models',
+  # factory.cpp: the ONE out-of-line Factory::Instance() definition. Must be
+  # compiled into libcausallm.so exactly once so every consumer .so (the api
+  # lib and the optional model plugin) shares a single Factory (see factory.h).
+  causallm_root / 'factory.cpp',
   causallm_root / 'llm_util.cpp',
   causallm_root / 'huggingface_tokenizer.cpp',
   causallm_root / 'chat_template.cpp',
@@ -243,7 +248,7 @@ streamer_src = [
 # linking the QNN SDK directly, so no QNN SDK headers are needed to compile
 # these sources.
 causallm_qnn_src = []
-if enable_qnn and get_option('enable-qnn-models')
+if enable_qnn
   causallm_qnn_src += [
     causallm_root / 'qnn' / 'android_memory_allocator.cpp',
     causallm_root / 'qnn' / 'quick_dot_ai_qnn.cpp',
@@ -328,7 +333,7 @@ causallm_dep = declare_dependency(
 # Mirrors QuickAI's api/meson.build: xgrammar (and, when enabled,
 # QNN model sources) are compiled exactly once into libcausallm.so above;
 # this target borrows those symbols via causallm_dep instead of compiling its
-# own copies. ENABLE_QNN_MODELS is defined only when enable-qnn-models is set,
+# own copies. ENABLE_QNN_MODELS is defined only when enable-qnn is set,
 # matching the QNN sources conditionally compiled into libcausallm.so - the
 # dynamic_cast<Quick_Dot_AI_QNN *> / make_unique<Gemma4_E2B_QNN> paths that
 # define unlocks in api/quick_dot_ai_api.cpp then resolve at link time via
@@ -342,7 +347,7 @@ if get_option('enable-api')
   ]
 
   quick_dot_ai_api_cpp_args = []
-  if enable_qnn and get_option('enable-qnn-models')
+  if enable_qnn
     quick_dot_ai_inc_args += [
       '-I' + causallm_root / 'qnn',
       '-I' + causallm_root / 'qnn' / 'gemma4-e2b-qnn',

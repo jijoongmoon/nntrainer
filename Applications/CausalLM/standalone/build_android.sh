@@ -172,7 +172,6 @@ echo "[4] Generated cross file: $CROSS_FILE"
 MESON_APP_OPTS=(
     -Dplatform=android
     -Denable-qnn=true
-    -Denable-qnn-models=true
     -Denable-api=true
     -Denable-api-test=true
 )

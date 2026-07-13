@@ -3,12 +3,8 @@ option('platform', type: 'combo', choices: ['auto', 'x86', 'android'], value: 'a
 option('nntrainer_builddir', type: 'string', value: 'builddir_x86',
        description: 'nntrainer build directory name, relative to the nntrainer submodule root (x86 only; android always uses builddir/android_build_result)')
 option('enable-qnn', type: 'boolean', value: false,
-       description: 'Build QNN integration - android only (registers libqnn_context.so at runtime; no QNN SDK headers needed to compile)')
-option('enable-qnn-models', type: 'boolean', value: false,
-       description: 'Compile the QNN model-runtime infra + the public gemma4-e2b-qnn model into libcausallm.so. Requires enable-qnn.')
+       description: 'Single QNN switch (android only). When on: registers libqnn_context.so at runtime, compiles the QNN model-runtime infra + public gemma4-e2b-qnn into libcausallm.so, and enables the multimodal run path (base Transformer::run_image; vision encoders are overlaid by the internal-models plugin). No QNN SDK headers needed to compile. Infra, models, and multimodal all move together - there is no separate qnn-models or experimental gate.')
 option('enable-api', type: 'boolean', value: false,
        description: 'Build libquick_dot_ai_api.so')
 option('enable-api-test', type: 'boolean', value: false,
        description: 'Build quick_dot_ai_test executable. Requires enable-api.')
-option('enable-experimental-multimodal', type: 'boolean', value: false,
-       description: 'Define QUICKAI_ENABLE_EXPERIMENTAL_MULTIMODAL_NNTRAINER_API. (No multimodal QNN model sources are built by this Gauss-free standalone project today - this only threads the define through.)')
