@@ -1120,8 +1120,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     const unsigned int prefill_to = prefill_from + input_len - 1;
     setKVCachePosition(prefill_from);
-    if (prefill_from > 0 && init_len - 1 > 1 && causallm_engine() == "gpu") {
-      // Resumed prefill on OpenCL (see the non-skip branch below): feed the
+    if (prefill_from > 0 && init_len - 1 > 1) {
+      // Resumed prefill (see the non-skip branch below): feed the
       // init_len-1 prefill tokens through the decode call shape; their
       // logits are discarded, matching the block skip-prefill semantics.
       for (unsigned int i = 0; i + 1 < init_len; ++i) {
@@ -1148,9 +1148,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   } else {
     const unsigned int prefill_to = prefill_from + input_len;
     setKVCachePosition(prefill_from);
-    if (prefill_from > 0 && init_len > 1 && causallm_engine() == "gpu") {
-      // Resumed prefill (KV loaded at prefill_from) on OpenCL: the CL layers
-      // only accept from>0 with a step of 1 (decode shape), so feed the
+    if (prefill_from > 0 && init_len > 1) {
+      // Resumed prefill (KV loaded at prefill_from): the CL layers AND the
+      // shared llm layers (sigmoid_glu/swiglu/geglu) only accept from>0
+      // with a step of 1 (decode shape) on every engine, so feed the
       // prompt token-by-token through the decode call shape
       // (init_seq_len == from == absolute position, to = position + 1).
       for (unsigned int i = 0; i < init_len; ++i) {
