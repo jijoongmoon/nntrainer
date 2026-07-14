@@ -18,9 +18,32 @@
 
 #include <cuda_runtime.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace nntrainer::cuda {
 
-void ContextManager::initialize() noexcept { initialized_ok_ = CreateDefaultGPUDevice(); }
+void ContextManager::initialize() noexcept {
+  initialized_ok_ = CreateDefaultGPUDevice();
+#ifdef _WIN32
+  // [W2 delay-load follow-up] The unified binary delay-loads cuBLAS/NVRTC
+  // (meson cuda_delayload_args) so XMX runs never map their DLL images. On
+  // CUDA runs the deferred LoadLibrary then landed inside the first in-forward
+  // call, i.e. mid-prefill: +67ms inside the timed 1K window (measured
+  // 4210 -> 3300 TPS; clocks were flat P0/2805MHz, so the round-13 "sustained
+  // clock band" reading was this load tax, not a clock state). Pull the DLLs
+  // in at context bring-up, outside any timed phase. NVRTC alone was not
+  // enough (still 3330): the mid-prefill loader is the cuBLAS pair. LoadLibrary
+  // maps without prefaulting, so most of the delay-load WS win survives —
+  // measured on cuda-a2 right after this change.
+  if (initialized_ok_) {
+    LoadLibraryA("nvrtc64_130_0.dll");
+    LoadLibraryA("cublas64_13.dll");
+    LoadLibraryA("cublasLt64_13.dll");
+  }
+#endif
+}
 
 bool ContextManager::CreateDefaultGPUDevice() {
   if (!cuCheck(cuInit(0), "cuInit"))
