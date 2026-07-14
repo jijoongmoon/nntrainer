@@ -56,6 +56,13 @@ namespace {
 /** Streaming sink: the API delivers UTF-8 deltas as they decode. Return 0 to
  *  keep generating; any nonzero return cancels the generation. */
 int on_delta(const char *delta, void * /*user_data*/) {
+  // [SFLARE_PHASE_TRACE] time-to-first-token marker.
+  static bool first = true;
+  if (first) {
+    first = false;
+    if (std::getenv("SFLARE_PHASE_TRACE"))
+      std::fprintf(stderr, "[phase-example] first token delivered\n");
+  }
   std::fputs(delta, stdout);
   std::fflush(stdout);
   return 0;
@@ -113,6 +120,23 @@ std::vector<std::string> utf8_args() {
 
 int main(int argc, char *argv[]) {
 #if defined(_WIN32)
+  // [SFLARE_PHASE_TRACE] how long the DLL constellation + static inits took
+  // before main() (import-linked nntrainer.dll & 14 layer DLLs attach first).
+  if (std::getenv("SFLARE_PHASE_TRACE")) {
+    FILETIME c, e, k, u, now;
+    if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) {
+      GetSystemTimeAsFileTime(&now);
+      ULARGE_INTEGER a, b;
+      a.LowPart = c.dwLowDateTime;
+      a.HighPart = c.dwHighDateTime;
+      b.LowPart = now.dwLowDateTime;
+      b.HighPart = now.dwHighDateTime;
+      std::fprintf(stderr,
+                   "[phase-example] main() entered %.0f ms after process "
+                   "creation (DLL loads + static init)\n",
+                   (b.QuadPart - a.QuadPart) / 10000.0);
+    }
+  }
   const std::vector<std::string> wargs = utf8_args();
   std::vector<char *> argv_utf8;
   if (!wargs.empty()) {

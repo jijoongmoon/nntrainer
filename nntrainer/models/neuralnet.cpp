@@ -395,6 +395,21 @@ int NeuralNetwork::initialize(ExecutionMode mode) {
   ml_logd("initializing neural network, layer size: %d", n_layers);
   PROFILE_MEM_ANNOTATE("Initialize");
 
+  // [NNTR_INIT_TRACE] init-latency dissection (round-13 follow-up): stderr
+  // laps for the two fat steps of initialize().
+  static const bool init_trace = std::getenv("NNTR_INIT_TRACE") != nullptr;
+  const auto _it0 = std::chrono::steady_clock::now();
+  auto _lap = [&](const char *what) {
+    if (!init_trace)
+      return;
+    std::fprintf(stderr, "[init-trace] %8.1f ms  %s\n",
+                 std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - _it0)
+                   .count(),
+                 what);
+    std::fflush(stderr);
+  };
+
   auto &input_conn_prop =
     std::get<std::vector<props::InputConnection>>(model_props);
   auto &label_layer_prop =
@@ -413,6 +428,7 @@ int NeuralNetwork::initialize(ExecutionMode mode) {
     exec_mode, input_conn,
     std::vector<Connection>(label_layers.begin(), label_layers.end()));
   NN_RETURN_STATUS();
+  _lap("model_graph.initialize (per-layer finalize + planner)");
 
   model_graph.setBatchSize(
     std::get<props::TrainingBatchSize>(model_flex_props));
@@ -440,6 +456,7 @@ int NeuralNetwork::initialize(ExecutionMode mode) {
   model_graph.allocateWeights(exec_mode != ExecutionMode::INFERENCE);
   // enable this to save initialized weights for INFERENCE
   // model_graph.allocateWeights(true);
+  _lap("allocateWeights (weight plane commit)");
 
   initialized = true;
 

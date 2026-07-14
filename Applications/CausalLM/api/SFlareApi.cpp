@@ -77,6 +77,20 @@ struct EnvKV {
   const char *value;
 };
 
+/** [SFLARE_PHASE_TRACE=1] stderr timestamps (ms since first call) at load /
+ *  first-execute phase boundaries — the init-latency dissection probe. */
+void phase_trace(const char *what) {
+  static const bool on = std::getenv("SFLARE_PHASE_TRACE") != nullptr;
+  if (!on)
+    return;
+  static const auto t0 = std::chrono::steady_clock::now();
+  const double ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  std::fprintf(stderr, "[phase] %8.1f ms  %s\n", ms, what);
+  std::fflush(stderr);
+}
+
 /** Common OpenCL kernel-path set (every CL device class). */
 constexpr EnvKV kEnvClCommon[] = {{"NNTR_GPU_SVM_POOL", "1"},
                                   {"NNTR_MHA_GPU", "1"},
@@ -250,7 +264,9 @@ public:
     }
 
     try {
+      phase_trace("load: begin (env bundles applied)");
       causallm::registerAllModels();
+      phase_trace("load: registerAllModels done");
 
       json cfg = causallm::LoadJsonFile(model_path_ + "/config.json");
       json generation_cfg = json::object();
@@ -316,6 +332,7 @@ public:
         return ErrorCode::SFLARE_INVALID_CONFIG;
       }
 
+      phase_trace("load: configs parsed");
       if (causallm::ChatTemplate::Exists(model_path_)) {
         try {
           chat_template_.emplace(causallm::ChatTemplate::Load(model_path_));
@@ -325,6 +342,7 @@ public:
                        e.what());
         }
       }
+      phase_trace("load: chat template loaded");
 
       auto start_init = std::chrono::high_resolution_clock::now();
 
@@ -345,10 +363,14 @@ public:
       }
 
       default_num_to_generate_ = model_->getNumToGenerate();
+      phase_trace("load: model object created (factory)");
 
       model_->initialize();
+      phase_trace("load: initialize() done (graph compile + weight plane)");
       model_->load_weight(weight_file);
+      phase_trace("load: load_weight() done (read + v8c prebuild)");
       model_->repack_weight();
+      phase_trace("load: repack_weight() done");
 
       auto finish_init = std::chrono::high_resolution_clock::now();
       init_ms_ = std::chrono::duration<double, std::milli>(finish_init -
@@ -537,6 +559,7 @@ private:
 
     std::lock_guard<std::mutex> lock(run_mutex_);
     causallm::CausalLM *clm = clm_.load(std::memory_order_acquire);
+    phase_trace("execute: begin");
 
     std::string text(input_utf8);
     const bool want_template = params == nullptr || params->apply_chat_template;
@@ -558,6 +581,8 @@ private:
         ? params->max_new_tokens
         : default_num_to_generate_;
     model_->setNumToGenerate(max_new);
+    phase_trace("execute: template applied, run() entering "
+                "(tokenize + prefill inside)");
 
     clm->prepareForRun();
     clm->setStreamer(streamer);
