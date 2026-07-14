@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   model_callbacks.h
+ * @brief  Per-architecture callback registry bridging proprietary model TUs
+ *         to the public C API.
+ * @author jayden0701 <jrock.oh@samsung.com>
+ * @bug    No known bugs except for NYI items
+ */
 #pragma once
 #include <functional>
 #include <string>
@@ -11,7 +18,7 @@ class Transformer;
 }
 
 /**
- * Per-architecture callbacks registered by proprietary model TU files.
+ * @brief Per-architecture callbacks registered by proprietary model TU files.
  * When a proprietary TU is absent (public build), no callbacks are
  * registered for that architecture; callers should fall back to
  * CAUSAL_LM_ERROR_UNSUPPORTED.
@@ -74,7 +81,7 @@ struct ModelCallbacks {
 };
 
 /**
- * Registry keyed by architecture name string (e.g. "VendorArch_QNN").
+ * @brief Registry keyed by architecture name string (e.g. "VendorArch_QNN").
  * Proprietary model TUs call register_for() at static-init time.
  * quick_dot_ai_api.cpp calls lookup() at runtime.
  */

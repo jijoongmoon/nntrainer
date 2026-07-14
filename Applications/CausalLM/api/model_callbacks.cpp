@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   model_callbacks.cpp
+ * @brief  Per-architecture callback registry bridging proprietary model TUs
+ *         to the public C API.
+ * @author jayden0701 <jrock.oh@samsung.com>
+ * @bug    No known bugs except for NYI items
+ */
 #include "model_callbacks.h"
 
 ModelCallbackRegistry &ModelCallbackRegistry::instance() {

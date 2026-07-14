@@ -6,7 +6,8 @@
  * @date   14 April 2026
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jungwon-Lee <jungone.lee@samsung.com>
- * \brief The header for the support of grammar-guided generation.
+ * @brief  The header for the support of grammar-guided generation.
+ * @bug    No known bugs except for NYI items
  */
 
 #ifndef XGRAMMAR_XGRAMMAR_H_
@@ -42,6 +43,10 @@ class Tokenizer;
 }
 
 namespace causallm {
+/**
+ * @brief Grammar-guided generation helper wrapping xgrammar's compiler and
+ * matcher.
+ */
 WIN_EXPORT class XGrammar {
 
 public:

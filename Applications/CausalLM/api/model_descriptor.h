@@ -2,6 +2,8 @@
 /**
  * @file   model_descriptor.h
  * @brief  T4 string-id model catalog schema (pluggable, self-registering).
+ * @author jayden0701 <jrock.oh@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 #ifndef __QUICK_DOT_AI_MODEL_DESCRIPTOR_H__
 #define __QUICK_DOT_AI_MODEL_DESCRIPTOR_H__
