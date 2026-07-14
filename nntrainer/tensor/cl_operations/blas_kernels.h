@@ -589,6 +589,14 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
                                    cl_mem *out_row_sum_w_int4_buf);
 
 /**
+ * @brief Wait out and free any submit-and-go weight-upload staging queued by
+ *        make_v8c_weight_backing_from_qs4cx (NNTR_V8C_UPLOAD_ASYNC, default
+ *        on). Memory hygiene only: the in-order queue already sequences the
+ *        writes ahead of any later GEMM. Cheap no-op when nothing is pending.
+ */
+void v8c_flush_pending_uploads();
+
+/**
  * @brief 8/4/4 paper attention path: int8(act) × int8(weight) channel-wise GEMM.
  *        Signature mirrors gemm_int8_v8c_cl (row_sum_act ignored). Weight image
  *        must be the plain row-major int8 view (width K/16). Dispatches the

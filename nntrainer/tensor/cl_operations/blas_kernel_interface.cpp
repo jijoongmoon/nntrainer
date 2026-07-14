@@ -1404,6 +1404,10 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   const double _fc_t0 = fc_tprof_on() ? fc_tprof_now() : 0;
   if (!v8c_env_enabled())
     return false;
+  // Reclaim any submit-and-go upload staging from the load phase (memory
+  // hygiene only — the in-order queue already sequences those writes ahead
+  // of this GEMM). Relaxed-atomic no-op after the first forward.
+  v8c_flush_pending_uploads();
   if (!ml::train::TensorDim::isInt4Weight(weight.getDataType()))
     return false;
   // Derive M, K, N from tensor dims (no-transpose case only).
