@@ -103,6 +103,25 @@ constexpr EnvKV kEnvCuda[] = {
   {"NNTR_CUDA_FLASH_DECODE", "64"}, {"NNTR_CUDA_BLOCKQ", "1"},
   {"NNTR_FC_CUDA_CUBLAS", "1"}, {"NNTR_CUDA_PREWARM", "1"}};
 
+#if defined(_WIN32)
+/** CUDA A2 additions for WDDM (Windows). SAFE's UVM/coherence path
+ * serializes under WDDM (~70/6.5 TPS on gauss4-side 1023tok); these are
+ * exactly the accel levers the round-9/10 submit-batching discrimination
+ * proved corruption-free there (M2B/ASYNC failed it and stay excluded).
+ * Measured with this set: 4210/29.0 TPS, VRAM 1898MiB, goldens+kv-resume
+ * green through this API. KV_DEV overrides the SAFE bundle's KV_UVM at
+ * the consumer (both are set; the cuda KV manager prefers KV_DEV).
+ * overwrite=0 like every bundle, so user env still wins — except
+ * NNTR_CUDA_DEV_ACT which is presence-checked upstream (manager.h; known
+ * issue, see HANDOFF §NEXT-2): setting DEV_ACT=0 cannot disable it. */
+constexpr EnvKV kEnvCudaWddmA2[] = {{"NNTR_CUDA_DEV_ACT", "1"},
+                                    {"NNTR_CUDA_VCOPY_PREFILL", "1"},
+                                    {"NNTR_RMSNORM_CUDA_OFF", "all"},
+                                    {"NNTR_CUDA_KV_DEV", "1"},
+                                    {"NNTR_CUBLAS_WS_MB", "16"},
+                                    {"NNTR_QS4CX_DECOMMIT", "1"}};
+#endif
+
 /** MemoryProfile::MINIMAL — steady-residency levers, TPS-neutral. */
 constexpr EnvKV kEnvMinimalCuda[] = {{"NNTR_CUDA_I8_JIT", "1"},
                                      {"NNTR_QS4CX_HEAP_BYPASS", "1"},
@@ -474,6 +493,11 @@ private:
       }
     } else if (engine == "cuda") {
       applyBundle(kEnvCuda);
+#if defined(_WIN32)
+      // WDDM production set — see kEnvCudaWddmA2. The I8_JIT/HEAP_BYPASS/
+      // DROP_PLAIN legs of the full A2 profile come from MINIMAL below.
+      applyBundle(kEnvCudaWddmA2);
+#endif
       if (mem_profile_ == MemoryProfile::MINIMAL)
         applyBundle(kEnvMinimalCuda);
       else if (mem_profile_ == MemoryProfile::PERFORMANCE)
