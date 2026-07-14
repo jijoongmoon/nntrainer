@@ -2799,6 +2799,22 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
 // scale buffer, and the row-sum byte-identical => zero GEMM/perf change. The
 // only semantic differences vs the KAI path are: no XOR undo, and the scale is
 // already fp32 (no fp16->fp32 promotion).
+
+// NNTR_V8C_HOSTPTR: allocate the v8c weight backing as CL_MEM_ALLOC_HOST_PTR
+// (host-visible, GPU reads it in place) instead of a device clCreateBuffer.
+// MEASURED WORSE and therefore default OFF: on Xe3/Windows it does not remove a
+// copy, it ADDS one -- gauss4 peak WS 3797 -> 5231 MB (+1434, i.e. a second full
+// weight image) with prefill 1588 -> 1461 TPS. So a plain device clCreateBuffer
+// is already the single copy; keep it. Kept as an A/B lever (and a warning) for
+// the next driver/platform where the zero-copy assumption might actually hold.
+static bool v8c_hostptr_on() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_V8C_HOSTPTR");
+    return e != nullptr && e[0] != '0';
+  }();
+  return on;
+}
+
 std::unique_ptr<tv::TensorBacking>
 make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
                                    const float *fp32_scales, unsigned int N,
@@ -2843,7 +2859,17 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
   // fold into ONE pass over each chunk, and the host staging stays at
   // CHUNK_BYTES regardless of N. Byte-identical output (same permute, same
   // zeroed padding, same row-sum math).
-  cl_mem w_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY, total_bytes, nullptr, &err);
+  //
+  // [NNTR_V8C_HOSTPTR, default OFF -- measured worse, see v8c_hostptr_on()] The
+  // idea was that a device clCreateBuffer might carry a host shadow on WDDM and
+  // that CL_MEM_ALLOC_HOST_PTR (fill through one map, no staging) would collapse
+  // it to a single zero-copy allocation. It does the opposite: +1434MB peak. The
+  // plain device buffer below is already the single copy.
+  const bool hostptr = v8c_hostptr_on();
+  cl_mem_flags wflags = CL_MEM_READ_ONLY;
+  if (hostptr)
+    wflags |= CL_MEM_ALLOC_HOST_PTR;
+  cl_mem w_buf = clCreateBuffer(ctx, wflags, total_bytes, nullptr, &err);
   if (err != CL_SUCCESS || !w_buf)
     throw std::runtime_error(
       "make_v8c_weight_backing_from_qs4cx: clCreateBuffer (weight) failed: " +
@@ -2851,17 +2877,40 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
 
   std::vector<int32_t> row_sum_w_int4(N, 0);
   const size_t real_row_bytes = (size_t)K / 2;
-  constexpr size_t CHUNK_BYTES = 16u << 20;
-  const size_t chunk_rows = std::max<size_t>(1, CHUNK_BYTES / v8c_row_bytes);
-  std::vector<uint8_t> packed(chunk_rows * v8c_row_bytes, 0);
   cl_command_queue cq = blas_cc->command_queue_inst_.GetCommandQueue();
+
+  // hostptr: map the whole buffer once and build straight into it (no staging).
+  uint8_t *map_ptr = nullptr;
+  if (hostptr) {
+    map_ptr = static_cast<uint8_t *>(
+      clEnqueueMapBuffer(cq, w_buf, CL_TRUE, CL_MAP_WRITE_INVALIDATE_REGION, 0,
+                         total_bytes, 0, nullptr, nullptr, &err));
+    if (err != CL_SUCCESS || !map_ptr) {
+      clReleaseMemObject(w_buf);
+      throw std::runtime_error(
+        "make_v8c_weight_backing_from_qs4cx: clEnqueueMapBuffer failed: " +
+        std::to_string(err));
+    }
+    std::memset(map_ptr, 0, total_bytes); // padding stays 0
+  }
+
+  constexpr size_t CHUNK_BYTES = 16u << 20;
+  // One pass over the whole N when mapped; bounded chunks otherwise.
+  const size_t chunk_rows =
+    hostptr ? (size_t)N : std::max<size_t>(1, CHUNK_BYTES / v8c_row_bytes);
+  std::vector<uint8_t> packed;
+  if (!hostptr)
+    packed.assign(chunk_rows * v8c_row_bytes, 0);
   for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
     const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
-    std::memset(packed.data(), 0, nrows * v8c_row_bytes); // padding stays 0
+    uint8_t *dst =
+      hostptr ? (map_ptr + n0 * v8c_row_bytes) : packed.data();
+    if (!hostptr)
+      std::memset(dst, 0, nrows * v8c_row_bytes); // padding stays 0
     for (size_t r = 0; r < nrows; ++r) {
       const size_t n = n0 + r;
       const uint8_t *plain_row = plain_nibbles + n * plain_row_bytes;
-      uint8_t *v8c_row = packed.data() + r * v8c_row_bytes;
+      uint8_t *v8c_row = dst + r * v8c_row_bytes;
       // v8c K-block byte order (matches the KAI builder): byte(c*4+b) =
       // (qH<<4)|qL with qL = K(kblk*32+c*8+b), qH = K(kblk*32+c*8+b+4).
       for (size_t kblk = 0; kblk < k_blocks; ++kblk) {
@@ -2885,16 +2934,29 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
       }
       row_sum_w_int4[n] = s;
     }
-    const cl_int werr =
-      clEnqueueWriteBuffer(cq, w_buf, CL_TRUE, n0 * v8c_row_bytes,
-                           nrows * v8c_row_bytes, packed.data(), 0, nullptr,
-                           nullptr);
-    if (werr != CL_SUCCESS) {
+    if (!hostptr) {
+      const cl_int werr =
+        clEnqueueWriteBuffer(cq, w_buf, CL_TRUE, n0 * v8c_row_bytes,
+                             nrows * v8c_row_bytes, packed.data(), 0, nullptr,
+                             nullptr);
+      if (werr != CL_SUCCESS) {
+        clReleaseMemObject(w_buf);
+        throw std::runtime_error(
+          "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+          std::to_string(werr));
+      }
+    }
+  }
+  if (hostptr) {
+    const cl_int uerr =
+      clEnqueueUnmapMemObject(cq, w_buf, map_ptr, 0, nullptr, nullptr);
+    if (uerr != CL_SUCCESS) {
       clReleaseMemObject(w_buf);
       throw std::runtime_error(
-        "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
-        std::to_string(werr));
+        "make_v8c_weight_backing_from_qs4cx: clEnqueueUnmapMemObject failed: " +
+        std::to_string(uerr));
     }
+    clFinish(cq); // the unmap must land before the GEMM binds this weight
   }
   auto backing = std::make_unique<tv::TensorBacking>(
     ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, total_bytes,

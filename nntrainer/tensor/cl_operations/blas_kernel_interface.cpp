@@ -20,6 +20,8 @@
 #include <cstdint>
 #if defined(_WIN32)
 #include <windows.h> // DiscardVirtualMemory
+#include <psapi.h>   // GetProcessMemoryInfo (NNTR_MEM_TRACE)
+#pragma comment(lib, "psapi.lib")
 #else
 #include <sys/mman.h> // madvise(MADV_DONTNEED)
 #endif
@@ -435,6 +437,11 @@ struct V8cWeightEntry {
   unsigned int N = 0, K = 0;
   cl_mem weight_image = nullptr; // cached image2d view (also released via TensorBacking)
   cl_mem weight_buf = nullptr;   // raw backing buffer (buffer-path / Intel NEO)
+  // N exceeds the device image2d height cap (the untied lm_head, N=vocab), so an
+  // image view can never exist for this weight. Kept SEPARATE from
+  // (weight_image == nullptr): on the buffer path the image is skipped for every
+  // weight, and only this flag may route to the imageless lm_head GEMV.
+  bool huge_n = false;
 };
 
 // Buffer-path (NNTR_V8C_BUF): on Intel NEO the v8c GEMM uses the *_buf kernels
@@ -647,31 +654,56 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   ws.row_pitch_bytes = ClContext::Global().caps().image_v8c
                          ? (((size_t)K / 2 + 63) / 64) * 64
                          : (size_t)K / 2;
-  try {
-    e.weight_image = e.backing->imageView(ws);
-    if (std::getenv("NNTR_V8C_IMG_TRACE"))
-      std::fprintf(stderr, "[v8cimg] OK   N=%u K=%u wpitch=%u(=K/2)\n", N, K,
-                   K / 2),
-        std::fflush(stderr);
-  } catch (...) {
-    // The image2d view fails when N (height) exceeds the device image cap
-    // (~16384) -- the untied int4 lm_head has N=vocab=262144. The row-major
-    // weight_buf + scale_buf are still valid, so keep the entry with a null
-    // image: dotCl_v8c routes the (M=1 decode) huge-N case to the buffer GEMV
-    // (lmhead_int4_v8c_gemv_cl) instead of failing to the CPU KAI path. Every
-    // other (image-sized) weight builds its image normally, so this only
-    // affects the oversized lm_head.
-    e.weight_image = nullptr;
-    if (std::getenv("NNTR_V8C_IMG_TRACE"))
-      std::fprintf(stderr, "[v8cimg] FAIL N=%u K=%u wpitch=%u(=K/2)\n", N, K,
-                   K / 2),
-        std::fflush(stderr);
-    static int logged = 0;
-    if (!logged++)
-      std::fprintf(stderr,
-                   "[v8c] image view unavailable for N=%u K=%u (>image cap); "
-                   "keeping buffer path for the GEMV\n",
-                   N, K);
+
+  // Is N past the device's image2d height cap? Ask the device instead of
+  // inferring it from a failed clCreateImage, so the buffer path (which never
+  // creates the image) can still identify the oversized lm_head.
+  {
+    auto *cc =
+      static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+    size_t img_h_cap = 0;
+    clGetDeviceInfo(cc->context_inst_.GetDeviceId(), CL_DEVICE_IMAGE2D_MAX_HEIGHT,
+                    sizeof(img_h_cap), &img_h_cap, nullptr);
+    e.huge_n = (img_h_cap != 0 && (size_t)N > img_h_cap);
+  }
+
+  // [buffer-path image skip] On the buffer path (Intel NEO) the GEMM binds
+  // weight_buf and NEVER reads weight_image (see `use_buf ? weight_buf :
+  // weight_image` in the dispatch) -- the image is a dead object. Measured on
+  // gauss4/Xe3 (round-11 A/B, both DLLs): peak WS UNCHANGED at 3798 MB -- NEO
+  // never makes the unused tiled copies resident, so the skip frees no working
+  // set; it only avoids creating ~420 dead cl_mem objects. (The +1.3 GB
+  // first-prefill WS jump is the v8c weight BACKING going WDDM-resident at
+  // first command-buffer submission -- NNTR_MEM_TRACE: cum_v8c 1366.9 MB incl.
+  // the 336 MB lm_head, build-end WS 2776 -> 3798 at submit -- i.e. the real
+  // working set of the weights, not a removable copy.) Goldens byte-identical,
+  // TPS unchanged. gpu_native's qwen3 path already skips the view for the same
+  // reason. Adreno (image path) is unaffected: v8c_buffer_path() is false
+  // there, so the view is still built.
+  if (!v8c_buffer_path() && !e.huge_n) {
+    try {
+      e.weight_image = e.backing->imageView(ws);
+      if (std::getenv("NNTR_V8C_IMG_TRACE"))
+        std::fprintf(stderr, "[v8cimg] OK   N=%u K=%u wpitch=%u(=K/2)\n", N, K,
+                     K / 2),
+          std::fflush(stderr);
+    } catch (...) {
+      // Creation can still fail for a reason the cap query did not predict
+      // (pitch alignment). The row-major weight_buf + scale_buf remain valid, so
+      // fall back to the imageless (GEMV) route rather than the CPU path.
+      e.weight_image = nullptr;
+      e.huge_n = true;
+      if (std::getenv("NNTR_V8C_IMG_TRACE"))
+        std::fprintf(stderr, "[v8cimg] FAIL N=%u K=%u wpitch=%u(=K/2)\n", N, K,
+                     K / 2),
+          std::fflush(stderr);
+      static int logged = 0;
+      if (!logged++)
+        std::fprintf(stderr,
+                     "[v8c] image view unavailable for N=%u K=%u (>image cap); "
+                     "keeping buffer path for the GEMV\n",
+                     N, K);
+    }
   }
   auto inserted = cache.emplace(key, std::move(e));
 
@@ -723,6 +755,26 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
                    N, K, payload, (size_t)(hi > lo ? hi - lo : 0), rc,
                    rc == 0 ? 0 : errno);
     }
+  }
+#endif
+  // [NNTR_MEM_TRACE] Working-set growth per v8c weight, against the bytes we
+  // actually asked the runtime for. If WS climbs faster than the cl_mem bytes,
+  // the driver is keeping more than the one copy we allocated.
+#if defined(_WIN32)
+  if (std::getenv("NNTR_MEM_TRACE")) {
+    static size_t cum_v8c = 0, cum_plain = 0, count = 0;
+    const size_t v8c_bytes = inserted.first->second.backing->bytes();
+    cum_v8c += v8c_bytes;
+    cum_plain += (size_t)N * (((size_t)K + 1) / 2) + (size_t)N * sizeof(float);
+    ++count;
+    PROCESS_MEMORY_COUNTERS pmc{};
+    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+    std::fprintf(stderr,
+                 "[memtrace] w#%zu N=%u K=%u v8c=%.2fMB cum_v8c=%.1fMB "
+                 "cum_plain=%.1fMB WS=%.1fMB\n",
+                 count, N, K, v8c_bytes / 1048576.0, cum_v8c / 1048576.0,
+                 cum_plain / 1048576.0, pmc.WorkingSetSize / 1048576.0);
+    std::fflush(stderr);
   }
 #endif
   return &inserted.first->second;
@@ -1407,7 +1459,10 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // fidelity; no int8 act quant). Only decode (M=1) is supported -- the lm_head
   // FC runs only on the last position and prefill is skipped; any larger M with
   // no image legitimately falls back to the host path.
-  if (w->weight_image == nullptr) {
+  // Keyed on huge_n, NOT (weight_image == nullptr): the buffer path leaves the
+  // image null for EVERY weight (it is dead there), and those must still take
+  // the normal buffer GEMM below.
+  if (w->huge_n) {
 #ifdef ENABLE_FP16
     if (M == 1 &&
         input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
