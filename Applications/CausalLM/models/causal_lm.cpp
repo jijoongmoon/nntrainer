@@ -822,6 +822,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     prompt_ = system_prompt + prompt + tail_prompt;
   }
 
+  // [round-13 init overlap] join the async tokenizer load before first use
+  // (covers both Encode calls below and every later Decode this run).
+  ensureTokenizer();
+
   if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
     SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
 

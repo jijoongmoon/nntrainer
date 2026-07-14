@@ -10,6 +10,7 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <chrono>
 #include <fstream>
 #include <mutex>
 
@@ -128,8 +129,14 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
       nntr_cfg["tokenizer_file"].is_null()) {
     tokenizer = nullptr; // No tokenizer for this model
   } else {
-    tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-      LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+    // [round-13 init overlap] The ~30MB tokenizer.json parse measured ~680ms
+    // and is independent of graph compile + weight load -- run it on a side
+    // thread and join at first use (ensureTokenizer / getTokenizer).
+    const std::string tok_path = nntr_cfg["tokenizer_file"];
+    tokenizer_future_ =
+      std::async(std::launch::async, [tok_path]() {
+        return tokenizers::Tokenizer::FromBlobJSON(LoadBytesFromFile(tok_path));
+      });
   }
 };
 
@@ -231,10 +238,31 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
 /**
  * @brief Build and compile the symbolic transformer graph.
  */
+void Transformer::ensureTokenizer() {
+  std::lock_guard<std::mutex> lk(tokenizer_join_mtx_);
+  if (tokenizer_future_.valid())
+    tokenizer = tokenizer_future_.get();
+}
+
 void Transformer::initialize() {
+
+  // [NNTR_INIT_TRACE] init-latency dissection (round-13 follow-up).
+  static const bool init_trace = std::getenv("NNTR_INIT_TRACE") != nullptr;
+  const auto _tt0 = std::chrono::steady_clock::now();
+  auto _tlap = [&](const char *what) {
+    if (!init_trace)
+      return;
+    std::fprintf(stderr, "[init-trace] %8.1f ms  %s\n",
+                 std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - _tt0)
+                   .count(),
+                 what);
+    std::fflush(stderr);
+  };
 
   // RegisterCustomLayers
   registerCustomLayers();
+  _tlap("registerCustomLayers");
 
   // create model and apply properties before compile()
   model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
@@ -250,10 +278,12 @@ void Transformer::initialize() {
 
   // build symbolic tensor graph and compile from (input, output)
   auto [x, y] = constructModel();
+  _tlap("constructModel (symbolic graph)");
 
   if (model->compile(x, y, ml::train::ExecutionMode::INFERENCE)) {
     throw std::invalid_argument("Model compilation failed.");
   }
+  _tlap("model->compile+initialize (ccapi)");
 
   is_initialized = true;
 #ifdef DEBUG

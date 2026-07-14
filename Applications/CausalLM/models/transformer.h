@@ -35,9 +35,11 @@
 #endif
 
 #include <context.h> // nntrainer::ModelFeatures (T11)
+#include <future> // async tokenizer load (round-13 init overlap)
 #include <layer.h>
 #include <map>
 #include <model.h>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <tensor_api.h>
@@ -269,7 +271,18 @@ public:
   /**
    * @brief Get tokenizer owned by this model, or nullptr if no tokenizer exists
    */
-  tokenizers::Tokenizer *getTokenizer() { return tokenizer.get(); }
+  tokenizers::Tokenizer *getTokenizer() {
+    ensureTokenizer();
+    return tokenizer.get();
+  }
+
+  /**
+   * @brief Join the async tokenizer load (round-13 init overlap: the ~30MB
+   *        tokenizer.json parse runs on a side thread concurrent with graph
+   *        compile + weight load; call this before any direct `tokenizer`
+   *        member access). Idempotent and cheap after the first call.
+   */
+  void ensureTokenizer();
 
   /**
    * @brief Attach a non-owning logits processor
@@ -384,6 +397,9 @@ protected:
 
   /** tokenizer */
   std::unique_ptr<tokenizers::Tokenizer> tokenizer;
+  std::future<std::unique_ptr<tokenizers::Tokenizer>>
+    tokenizer_future_;          /**< async load; joined by ensureTokenizer */
+  std::mutex tokenizer_join_mtx_; /**< ensureTokenizer idempotence guard */
 
   unsigned int NUM_VOCAB;
   int DIM;
