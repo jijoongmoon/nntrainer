@@ -1498,11 +1498,16 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // / scale / zp / rs slot buffers are grown AFTER the slot is selected
   // (below), so only the used slot grows to this call's K -- a slot that only
   // ever serves qkv (K=hidden) never pays for the ffn-down K (the larger one).
-  if (!v8c_ensure_buf(ctx, &sc.act_in, &sc.act_in_bytes,
-                      (size_t)M_pad * K * act_elem, CL_MEM_READ_ONLY) ||
-      !v8c_ensure_buf(ctx, &sc.y_fp16, &sc.y_fp16_bytes,
-                      sizeof(uint16_t) * (size_t)M_pad * N, CL_MEM_READ_WRITE))
-    return false;
+  //
+  // [W3 lazy scratch] act_in / y_fp16 are ensured AT THEIR USE SITES, not
+  // here: under the default direct paths (quant_direct_clmem stages nothing
+  // into act_in; direct_out stores the GEMM straight into the planner
+  // cl_mem) both stay untouched, yet the old unconditional grow-only ensure
+  // committed the LARGEST (M_pad, K/N) shape once per process. Measured on
+  // gauss4-side/Xe3 (round-12 W3 fingerprint): ~212MB of resident, ALL-ZERO
+  // write-combined buffers (16MB fp16 + 31.8MB fp32 K=8192 act_in slots +
+  // y twins). The non-direct paths (SVM/host inputs, debug consumers,
+  // Adreno) still get them on first touch, same grow-only reuse after that.
 
   // === v8c stage profiling (env-gated). Wall-clock with clFinish between
   // stages so each step's elapsed time is isolated. Skipped entirely when
@@ -1903,6 +1908,13 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   if (fc_flush_mode == 2 && !skip_upload_and_quant)
     clFlush(q);
 
+  // [W3 lazy scratch] act_in is consumed only by the staging copies below;
+  // Lever-1 (quant_direct_clmem) and act-cache hits never touch it.
+  if (!skip_upload_and_quant && !quant_direct_clmem &&
+      !v8c_ensure_buf(ctx, &sc.act_in, &sc.act_in_bytes,
+                      (size_t)M_pad * K * act_elem, CL_MEM_READ_ONLY))
+    return false;
+
   if (!skip_upload_and_quant) {
     if (prof_enabled) T0 = NOW();
     if (device_clmem_in) {
@@ -1967,11 +1979,12 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       static const bool probe_on = std::getenv("NNTR_CLMEM_PROBE") != nullptr;
       if (probe_on) {
         const std::string &on_ = output.getName();
-        if (on_.find("ffn_gate") != std::string::npos ||
-            on_.find("ffn_up") != std::string::npos ||
-            on_.find("_wq") != std::string::npos ||
-            on_.find("_wk") != std::string::npos ||
-            on_.find("_wv") != std::string::npos)
+        if (sc.act_in != nullptr && // [W3] never staged under quant-direct
+            (on_.find("ffn_gate") != std::string::npos ||
+             on_.find("ffn_up") != std::string::npos ||
+             on_.find("_wq") != std::string::npos ||
+             on_.find("_wk") != std::string::npos ||
+             on_.find("_wv") != std::string::npos))
           clmem_probe_capture((on_ + ":act_in").c_str(), nullptr, sc.act_in,
                               (unsigned int)((size_t)M * K * act_elem));
       }
@@ -2171,6 +2184,14 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       std::getenv("NNTR_V8C_TRACE") != nullptr;
     const bool direct_out =
       direct_out_enabled && out_clmem && !y_dbg_consumer;
+    // [W3 lazy scratch] y_fp16 only backs the non-direct output paths
+    // (SVM/host bounce, debug consumers force !direct_out via
+    // y_dbg_consumer above).
+    if (!direct_out &&
+        !v8c_ensure_buf(ctx, &sc.y_fp16, &sc.y_fp16_bytes,
+                        sizeof(uint16_t) * (size_t)M_pad * N,
+                        CL_MEM_READ_WRITE))
+      return false;
     cl_mem gemm_y_arg =
       direct_out ? static_cast<cl_mem>(output.getMemoryData()->deviceMem())
                  : sc.y_fp16;

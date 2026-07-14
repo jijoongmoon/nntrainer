@@ -22,6 +22,7 @@
 #define __CL_BUFFER_POOL_H__
 
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #include <mem_allocator.h>
@@ -90,6 +91,19 @@ public:
    */
   size_t baseAddrAlign() const { return base_addr_align_; }
 
+  /**
+   * @brief Zero-fill token idx's per-offset cl_mem ONCE (idempotent per
+   *        offset). [W3] allocate() no longer eagerly FillBuffers every
+   *        per-offset buffer: an untouched cl_mem never becomes WS-resident
+   *        under WDDM, while the eager zero-fill committed every buffer --
+   *        measured ~172MB of resident all-zero memory for offsets no
+   *        GPU_CLMEM tensor ever binds (gauss4-side/Xe3, round-12 W3).
+   *        TensorPool::allocate calls this for each tensor classified
+   *        GPU_CLMEM right after stamping, preserving the zero-init contract
+   *        (padded rows read by geglu et al.) exactly where it matters.
+   */
+  void ensureZeroFilled(unsigned int idx);
+
 private:
   void *cl_pool_;          /**< single device cl_mem over the planned plane */
   size_t base_addr_align_; /**< CL_DEVICE_MEM_BASE_ADDR_ALIGN, bytes */
@@ -109,6 +123,9 @@ private:
                       never alias one region -- distinct handles over a reused
                       offset break Adreno per-handle image/buffer cache
                       coherence (measured). Released in deallocate(). */
+  std::unordered_set<size_t>
+    zero_filled_; /**< padded offsets already zero-filled (ensureZeroFilled
+                       idempotence) */
 };
 
 } // namespace nntrainer

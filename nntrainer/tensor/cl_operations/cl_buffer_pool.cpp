@@ -124,8 +124,6 @@ void ClBufferPool::allocate() {
   //     at the cost of not sharing those overlapped bytes (alloc_total below
   //     reports the real cost vs the plane extent). Hard-fail (no SVM fallback)
   //     so a cl_mem-mode run never silently degrades to the corrupting hybrid.
-  cl_command_queue q = cc->command_queue_inst_.GetCommandQueue();
-  const cl_uchar zero = 0;
   size_t alloc_total = 0, alloc_max = 0;
   if (getenv("NNTR_POOL_DUMP")) {
     std::vector<std::pair<size_t, size_t>> dbg(offset_maxsize_.begin(),
@@ -166,17 +164,12 @@ void ClBufferPool::allocate() {
         "(hard-fail, no SVM fallback): requested " +
         std::to_string(sz) + " bytes, CL err " + std::to_string(err) +
         ", device MAX_MEM_ALLOC_SIZE " + std::to_string(max_alloc));
-    // Zero-init to match the SVM pool's zero-init contract: producers write
-    // only the M valid rows of an M_pad-row activation, downstream ops (geglu)
-    // read all M_pad rows, and uninitialized padded rows were a measured
-    // corruption source. The in-order queue orders these fills before any
-    // kernel.
-    cl_int fe =
-      clEnqueueFillBuffer(q, buf, &zero, sizeof(zero), 0, sz, 0, nullptr,
-                          nullptr);
-    if (fe != CL_SUCCESS)
-      throw std::runtime_error(
-        "ClBufferPool: clEnqueueFillBuffer (zero-init) failed");
+    // [W3] Zero-init moved to ensureZeroFilled(): TensorPool zero-fills only
+    // the offsets a GPU_CLMEM-classified tensor actually binds, right after
+    // classification. An untouched cl_mem never becomes WS-resident under
+    // WDDM, while the eager fill here committed EVERY buffer -- measured
+    // ~172MB of resident all-zero memory for never-bound offsets
+    // (gauss4-side/Xe3, round-12 W3 pool=0 A/B: WC-zero 228 -> 56MB).
     offset_sub_[kv.first] = static_cast<void *>(buf);
     alloc_total += sz;
     if (sz > alloc_max)
@@ -190,6 +183,41 @@ void ClBufferPool::allocate() {
           offset_sub_.size(), alloc_total / 1048576.0,
           cl_pool_bytes_ / 1048576.0, alloc_max / 1048576.0,
           max_alloc / 1048576.0, global_mem / 1048576.0);
+}
+
+void ClBufferPool::ensureZeroFilled(unsigned int idx) {
+  const size_t i = idx - 1;
+  if (i >= padded_offsets_.size())
+    return;
+  const size_t po = padded_offsets_[i];
+  if (zero_filled_.count(po))
+    return;
+  auto hit = offset_sub_.find(po);
+  auto szit = offset_maxsize_.find(po);
+  if (hit == offset_sub_.end() || hit->second == nullptr ||
+      szit == offset_maxsize_.end() || szit->second == 0)
+    return;
+  // Same zero-init contract as the old allocate()-time fill: producers write
+  // only the M valid rows of an M_pad-row activation, downstream ops (geglu)
+  // read all M_pad rows, and uninitialized padded rows were a measured
+  // corruption source. The in-order queue orders this fill before any kernel
+  // (TensorPool calls this during allocate(), before the first forward).
+  auto *cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  cl_command_queue q = cc->command_queue_inst_.GetCommandQueue();
+  const cl_uchar zero = 0;
+  if (clEnqueueFillBuffer(q, static_cast<cl_mem>(hit->second), &zero,
+                          sizeof(zero), 0, szit->second, 0, nullptr,
+                          nullptr) != CL_SUCCESS)
+    throw std::runtime_error(
+      "ClBufferPool: clEnqueueFillBuffer (lazy zero-init) failed");
+  zero_filled_.insert(po);
+  // [W3 probe] token->offset join key for the teardown zero scan below.
+  if (std::getenv("NNTR_CLMEM_ZERO_DUMP")) {
+    std::fprintf(stderr, "[zfill] tok=%u po=%zu sz=%.1fMB\n", idx, po,
+                 szit->second / 1048576.0);
+    std::fflush(stderr);
+  }
 }
 
 std::shared_ptr<MemoryData> ClBufferPool::getMemory(unsigned int idx) {
@@ -215,12 +243,50 @@ std::shared_ptr<MemoryData> ClBufferPool::getMemory(unsigned int idx) {
 }
 
 void ClBufferPool::deallocate() {
+  // [W3 probe, NNTR_CLMEM_ZERO_DUMP] Before releasing, sample 4KB at the
+  // middle of every per-offset buffer and report which are still ALL-ZERO --
+  // i.e. zero-filled for a GPU_CLMEM tensor but never device-written (the
+  // dual-plane residue measured as ~200MB resident on gauss4-side/Xe3).
+  // Join with the [zfill] tok= lines and the [residency] names to identify
+  // the tensors. Teardown-time: the queue is still valid here (the releases
+  // right below use the same context).
+  if (std::getenv("NNTR_CLMEM_ZERO_DUMP") && !offset_sub_.empty()) {
+    auto *cc =
+      static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+    cl_command_queue q = cc->command_queue_inst_.GetCommandQueue();
+    std::vector<uint8_t> probe(4096);
+    for (auto &kv : offset_sub_) {
+      if (kv.second == nullptr)
+        continue;
+      const size_t sz = offset_maxsize_.count(kv.first)
+                          ? offset_maxsize_[kv.first]
+                          : 0;
+      if (sz < probe.size())
+        continue;
+      const size_t off = ((sz / 2) / 64) * 64;
+      if (clEnqueueReadBuffer(q, static_cast<cl_mem>(kv.second), CL_TRUE, off,
+                              probe.size(), probe.data(), 0, nullptr,
+                              nullptr) != CL_SUCCESS)
+        continue;
+      bool all_zero = true;
+      for (uint8_t b : probe)
+        if (b != 0) {
+          all_zero = false;
+          break;
+        }
+      std::fprintf(stderr, "[zscan] po=%zu sz=%.1fMB filled=%d %s\n", kv.first,
+                   sz / 1048576.0, (int)zero_filled_.count(kv.first),
+                   all_zero ? "ALL-ZERO" : "written");
+    }
+    std::fflush(stderr);
+  }
   // Release the one-per-offset shared sub-buffers before their parent cl_mem.
   for (auto &kv : offset_sub_)
     if (kv.second != nullptr)
       clReleaseMemObject(static_cast<cl_mem>(kv.second));
   offset_sub_.clear();
   offset_maxsize_.clear();
+  zero_filled_.clear();
   if (cl_pool_ != nullptr) {
     clReleaseMemObject(static_cast<cl_mem>(cl_pool_));
     cl_pool_ = nullptr;

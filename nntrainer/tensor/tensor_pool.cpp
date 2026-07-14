@@ -17,6 +17,9 @@
 #include <env_compat.h>
 #include <memory_pool.h>
 #include <nntrainer_log.h>
+#ifdef ENABLE_OPENCL
+#include <cl_buffer_pool.h> // [W3] ensureZeroFilled after classification
+#endif
 #include <residency_planner.h>
 #include <residency_policy.h>
 #include <tensor.h>
@@ -358,6 +361,25 @@ void TensorPool::allocate(bool init) {
         spec.tensor->getDataType() == ml::train::TensorDim::DataType::FP16,
         details->role, spec.tensor->getName(), details->view_count);
       md->setResidency(cls);
+#ifdef ENABLE_OPENCL
+      /** [W3] Zero-fill the tensor's per-offset cl_mem only when something
+       * will actually bind it (class == GPU_CLMEM). ClBufferPool::allocate no
+       * longer fills eagerly: an untouched cl_mem never becomes WS-resident
+       * under WDDM, and the eager fill committed ~172MB of never-bound
+       * all-zero buffers (gauss4-side/Xe3, round-12 W3). Idempotent per
+       * padded offset, ordered before the first forward by the in-order
+       * queue. */
+      if (cls == ResidencyClass::GPU_CLMEM) {
+        if (auto *clpool = dynamic_cast<ClBufferPool *>(mem_pool.get())) {
+          static const bool zdump =
+            std::getenv("NNTR_CLMEM_ZERO_DUMP") != nullptr;
+          if (zdump)
+            std::fprintf(stderr, "[zname] tok=%u %s\n", details->token,
+                         spec.tensor->getName().c_str());
+          clpool->ensureZeroFilled(details->token);
+        }
+      }
+#endif
       if (dump_residency) {
         // stderr (not logcat): the ring buffer drops lines under load, making
         // partition counts lie. stderr is lossless and grep-able per run.
