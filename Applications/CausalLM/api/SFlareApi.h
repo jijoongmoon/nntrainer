@@ -138,6 +138,12 @@ struct SFlareConfig {
                                              nntr_config tokenizer_file */
   const char *model_path = nullptr;     /**< REQUIRED model directory */
   MemoryProfile memory_profile = MemoryProfile::MINIMAL;
+  unsigned int max_seq_len = 0;  /**< >0 overrides the model directory's
+                                      max_seq_len (context/KV capacity;
+                                      prompt + generation must fit) */
+  unsigned int init_seq_len = 0; /**< >0 overrides init_seq_len (planned
+                                      prefill activation size); clamped to
+                                      the effective max_seq_len */
 };
 
 /**

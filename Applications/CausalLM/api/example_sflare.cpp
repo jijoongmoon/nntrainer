@@ -17,7 +17,8 @@
  * @bug    No known bugs except for NYI items
  *
  * Usage: example_sflare <model_dir> [cpu|gpu|intel|adreno|cuda]
- *                       ["prompt"] [--kv]
+ *                       ["prompt" | @textfile] [--kv]
+ *                       [--max-seq N] [--init-seq N]
  *
  *   model_dir  directory holding config.json, nntr_config.json, the model
  *              .bin (+ optional sidecars) and tokenizer.json. Put
@@ -25,14 +26,24 @@
  *              raw (no chat template) and instruction models drift.
  *   backend    intel = Intel Xe (XMX), cuda = NVIDIA, gpu = generic OpenCL,
  *              adreno = Qualcomm, cpu = host. First load latches the engine
- *              process-wide.
+ *              process-wide. (Intel dp4a = pass intel and export
+ *              NNTR_FC_XMX=0 beforehand -- user env wins over the bundle.)
+ *   prompt     literal text, or @file to summarize: the file's content is
+ *              wrapped in a three-sentence summarization instruction (the
+ *              SDK ships example/sample_text.txt, ~1K tokens, for this).
  *   --kv       demo the pause / saveKVcache / resume-from-file round trip.
+ *   --max-seq  override the model directory's max_seq_len (context/KV
+ *              capacity); --init-seq overrides the planned prefill size.
+ *              0/omitted = model defaults (SFlareConfig contract).
  */
 
 #include "SFlareApi.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -78,9 +89,38 @@ int main(int argc, char *argv[]) {
   }
   const std::string model_dir = argv[1];
   const std::string backend = argc >= 3 ? argv[2] : "intel";
-  const std::string prompt =
+  std::string prompt =
     argc >= 4 ? argv[3] : "What is the capital of South Korea?";
-  const bool kv_demo = argc >= 5 && std::strcmp(argv[4], "--kv") == 0;
+  bool kv_demo = false;
+  unsigned int max_seq = 0, init_seq = 0;
+  for (int i = 4; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--kv") == 0)
+      kv_demo = true;
+    else if (std::strcmp(argv[i], "--max-seq") == 0 && i + 1 < argc)
+      max_seq = static_cast<unsigned int>(std::atoi(argv[++i]));
+    else if (std::strcmp(argv[i], "--init-seq") == 0 && i + 1 < argc)
+      init_seq = static_cast<unsigned int>(std::atoi(argv[++i]));
+  }
+
+  // @file: summarization demo -- wrap the file's content in a 3-sentence
+  // summary instruction (a ~1K-token file makes a realistic prefill).
+  bool summarize = false;
+  if (!prompt.empty() && prompt[0] == '@') {
+    std::ifstream f(prompt.substr(1), std::ios::binary);
+    if (!f) {
+      std::fprintf(stderr, "[example] cannot open text file: %s\n",
+                   prompt.c_str() + 1);
+      return 1;
+    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    // Instruction AFTER the passage: with it in front, models tend to slide
+    // into continuing the passage instead of summarizing it (measured on
+    // gauss4: verbatim continuation with a leading instruction).
+    prompt = ss.str() +
+             "\n\nSummarize the above text in exactly three sentences.";
+    summarize = true;
+  }
 
   // 1) Context + model directory. MemoryProfile defaults to MINIMAL (the
   //    memory-campaign levers); PERFORMANCE keeps derived weight caches
@@ -93,6 +133,8 @@ int main(int argc, char *argv[]) {
   }
   SFlareApi::SFlareConfig config;
   config.model_path = model_dir.c_str();
+  config.max_seq_len = max_seq;   // 0 = model-directory default
+  config.init_seq_len = init_seq; // 0 = model-directory default
   if (!ok(ctx->setSFlareOptions(config), "setSFlareOptions"))
     return 1;
 
@@ -105,7 +147,7 @@ int main(int argc, char *argv[]) {
   // 3) Streaming generation. GenParams rides both execute overloads;
   //    apply_chat_template=false would feed the prompt raw.
   SFlareApi::GenParams params;
-  params.max_new_tokens = 64;
+  params.max_new_tokens = summarize ? 128 : 64; // 3 sentences need headroom
   std::printf("--- streaming ---\n");
   if (!ok(ctx->executeSFlareLLM(prompt.c_str(), on_delta, nullptr, &params),
           "executeSFlareLLM(streaming)"))

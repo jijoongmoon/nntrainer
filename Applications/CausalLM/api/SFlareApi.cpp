@@ -203,6 +203,8 @@ public:
     tokenizer_override_ =
       config.tokenizer_path ? std::string(config.tokenizer_path) : "";
     mem_profile_ = config.memory_profile;
+    max_seq_override_ = config.max_seq_len;
+    init_seq_override_ = config.init_seq_len;
     options_set_ = true;
     return ErrorCode::SFLARE_SUCCESS;
   }
@@ -264,6 +266,26 @@ public:
       if (!tokenizer_override_.empty()) {
         nntr_cfg["tokenizer_file"] = tokenizer_override_;
       }
+      // [seq override] SFlareConfig.max_seq_len / init_seq_len (>0) replace
+      // the model-directory defaults: max_seq sizes the context/KV capacity,
+      // init_seq the planned prefill activation plane. init is clamped to
+      // max so a lone max override cannot strand init above it.
+      if (max_seq_override_ > 0)
+        nntr_cfg["max_seq_len"] = max_seq_override_;
+      if (init_seq_override_ > 0)
+        nntr_cfg["init_seq_len"] = init_seq_override_;
+      if (nntr_cfg.contains("max_seq_len") &&
+          nntr_cfg.contains("init_seq_len") &&
+          nntr_cfg["init_seq_len"].get<unsigned int>() >
+            nntr_cfg["max_seq_len"].get<unsigned int>()) {
+        nntr_cfg["init_seq_len"] = nntr_cfg["max_seq_len"];
+        std::fprintf(stderr, "[SFlare] init_seq_len clamped to max_seq_len (%u)\n",
+                     nntr_cfg["max_seq_len"].get<unsigned int>());
+      }
+      if (max_seq_override_ > 0 || init_seq_override_ > 0)
+        std::fprintf(stderr, "[SFlare] seq config: max_seq_len=%u init_seq_len=%u\n",
+                     nntr_cfg["max_seq_len"].get<unsigned int>(),
+                     nntr_cfg["init_seq_len"].get<unsigned int>());
 
       if (!nntr_cfg.contains("model_file_name")) {
         std::fprintf(stderr,
@@ -569,6 +591,8 @@ private:
   std::string model_path_;
   std::string tokenizer_override_;
   MemoryProfile mem_profile_ = MemoryProfile::MINIMAL;
+  unsigned int max_seq_override_ = 0;  /**< SFlareConfig.max_seq_len */
+  unsigned int init_seq_override_ = 0; /**< SFlareConfig.init_seq_len */
 
   std::unique_ptr<causallm::Transformer> model_;
   std::atomic<causallm::CausalLM *> clm_{nullptr};
