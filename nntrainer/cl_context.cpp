@@ -192,7 +192,18 @@ void ClContext::initialize() noexcept {
         // (its SVM output is read stale by the next kernel). Drain after the FC GEMM
         // (blas_kernel_interface.cpp) -- needed for gauss4 small-M prefill coherence,
         // ~negligible cost (prefill unchanged, decode ~7%). Override NNTR_XE3_FC_SYNC=0.
+        //
+        // Windows (WDDM) default-OFF: the W1 battery (2026-07-14 — cold-boot run,
+        // 4-model golden, token-class A/B x6, 2K-context summarize, all with
+        // FC_SYNC=0) found no coherence failure attributable to skipping the
+        // drain, and the drain costs ~15-25% decode on this stack. Linux NEO
+        // keeps default-ON (stale-read reproduced there). Explicit env wins
+        // either way (overwrite=0), so =1 restores the drain on Windows.
+#ifdef _WIN32
+        setenv("NNTR_XE3_FC_SYNC", "0", 0);
+#else
         setenv("NNTR_XE3_FC_SYNC", "1", 0);
+#endif
       } else if (opencl_is_active && caps_.vendor_id == ADRENO_VENDOR_ID) {
         setenv("NNTR_MHA_GPU", "1", 0);        // GPU attention
         setenv("NNTR_KV_IMG_ATTN", "1", 0);    // image2d KV/attention (Adreno read_imageui)
