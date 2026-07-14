@@ -851,8 +851,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::min<unsigned int>(INIT_SEQ_LEN, MAX_SEQ_LEN - NUM_TO_GENERATE);
   unsigned int text_len = _len;
 
-  if (_len > num_allow_str)
+  if (_len > num_allow_str) {
     text_len = num_allow_str;
+    // Silent tail truncation loses whatever the prompt ENDS with (round-13
+    // field case: a summarization instruction at the tail was dropped and
+    // the model continued the body instead). Unexpected state -> always warn.
+    std::fprintf(
+      stderr,
+      "[causallm] WARNING: prompt (%u tokens) exceeds the prefill window "
+      "(init_seq_len=%u, max_seq_len-num_to_generate=%u); truncating %u "
+      "tail tokens. Raise init_seq_len to fit the prompt.\n",
+      _len, static_cast<unsigned int>(INIT_SEQ_LEN),
+      static_cast<unsigned int>(MAX_SEQ_LEN - NUM_TO_GENERATE),
+      _len - num_allow_str);
+  }
 
   // feed only available length
   // if _input is allowed, it feeds all of the _input
