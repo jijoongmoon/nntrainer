@@ -29,8 +29,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include <psapi.h> // GetProcessMemoryInfo ([NNTR_CL_FIRSTLAUNCH_WS] probe)
+#include <intrin.h> // _ReturnAddress ([NNTR_CL_ALLOC_TRACE] IAT hook)
+#include <psapi.h>  // GetProcessMemoryInfo ([NNTR_CL_FIRSTLAUNCH_WS] probe)
 #pragma comment(lib, "psapi.lib")
+#include <cstring> // strcmp/strrchr (IAT hook)
 #endif
 
 namespace nntrainer::opencl {
@@ -265,6 +267,114 @@ cl_mem CL_API_CALL alct_createbuffer_hook(cl_context c, cl_mem_flags flags,
   return m;
 }
 
+// ---- [NNTR_CL_ALLOC_TRACE] IAT-level clCreateBuffer hook -------------------
+// The pointer trampoline above only intercepts calls routed through the
+// loader globals; several TUs import-link OpenCL.dll directly (it is in
+// nntrainer.dll's import table), so their clCreateBuffer traffic bypassed the
+// trace entirely — round-12 W3 saw 423 v8c backing creations produce ZERO
+// [alct] buf lines. Patch the OpenCL.dll!clCreateBuffer IAT slot of every
+// loaded module instead, and log the RETURN ADDRESS (module+offset) so the
+// call site class is identifiable.
+using PFN_clCreateBuffer_t = cl_mem(CL_API_CALL *)(cl_context, cl_mem_flags,
+                                                   size_t, void *, cl_int *);
+PFN_clCreateBuffer_t alct_iat_real_createbuffer = nullptr;
+
+cl_mem CL_API_CALL alct_iat_createbuffer_hook(cl_context c, cl_mem_flags flags,
+                                              size_t size, void *host_ptr,
+                                              cl_int *err) {
+  void *ret = _ReturnAddress();
+  cl_mem m = alct_iat_real_createbuffer(c, flags, size, host_ptr, err);
+  if (size >= (4u << 20)) {
+    char modname[64] = "?";
+    long long off = 0;
+    HMODULE hm = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)ret, &hm) &&
+        hm) {
+      char path[MAX_PATH] = {0};
+      GetModuleFileNameA(hm, path, sizeof(path) - 1);
+      const char *base = std::strrchr(path, '\\');
+      std::snprintf(modname, sizeof(modname), "%s", base ? base + 1 : path);
+      off = (long long)((char *)ret - (char *)hm);
+    }
+    std::fprintf(stderr,
+                 "[alct] %6lld ms IATbuf %p size=%zu (%.1fMB) flags=0x%llx "
+                 "ret=%s+0x%llx\n",
+                 alct_ms(), (void *)m, size, size / 1048576.0,
+                 (unsigned long long)flags, modname, off);
+    std::fflush(stderr);
+  }
+  return m;
+}
+
+/** Patch mod's IAT entry for OpenCL.dll!clCreateBuffer. Returns true if a
+ *  slot was replaced. */
+bool alct_patch_module_iat(HMODULE mod) {
+  auto *base = reinterpret_cast<uint8_t *>(mod);
+  auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+    return false;
+  auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE)
+    return false;
+  const auto &dir =
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+  if (dir.VirtualAddress == 0 || dir.Size == 0)
+    return false;
+  auto *imp =
+    reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(base + dir.VirtualAddress);
+  bool patched = false;
+  for (; imp->Name != 0; ++imp) {
+    const char *dll = reinterpret_cast<const char *>(base + imp->Name);
+    if (_stricmp(dll, "OpenCL.dll") != 0)
+      continue;
+    auto *oft =
+      reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->OriginalFirstThunk);
+    auto *ft = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->FirstThunk);
+    for (; oft->u1.AddressOfData != 0; ++oft, ++ft) {
+      if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+        continue;
+      auto *ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(
+        base + oft->u1.AddressOfData);
+      if (std::strcmp(reinterpret_cast<const char *>(ibn->Name),
+                      "clCreateBuffer") != 0)
+        continue;
+      DWORD old = 0;
+      if (!VirtualProtect(&ft->u1.Function, sizeof(void *), PAGE_READWRITE,
+                          &old))
+        continue;
+      ft->u1.Function =
+        reinterpret_cast<ULONG_PTR>(&alct_iat_createbuffer_hook);
+      VirtualProtect(&ft->u1.Function, sizeof(void *), old, &old);
+      patched = true;
+    }
+  }
+  return patched;
+}
+
+void alct_patch_all_modules() {
+  HMODULE ocl = GetModuleHandleA("OpenCL.dll");
+  if (!ocl)
+    return;
+  alct_iat_real_createbuffer = reinterpret_cast<PFN_clCreateBuffer_t>(
+    GetProcAddress(ocl, "clCreateBuffer"));
+  if (!alct_iat_real_createbuffer)
+    return;
+  HMODULE mods[512];
+  DWORD needed = 0;
+  if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+    return;
+  int n = 0;
+  const int count = (int)(needed / sizeof(HMODULE));
+  for (int i = 0; i < count && i < 512; ++i)
+    if (mods[i] != ocl && alct_patch_module_iat(mods[i]))
+      ++n;
+  std::fprintf(stderr, "[alct] IAT clCreateBuffer patched in %d modules\n", n);
+  std::fflush(stderr);
+}
+// ---------------------------------------------------------------------------
+
 cl_int CL_API_CALL flws_enqueue_hook(cl_command_queue q, cl_kernel k,
                                      cl_uint dim, const size_t *goff,
                                      const size_t *gws, const size_t *lws,
@@ -363,6 +473,11 @@ void LoadOpenCLFunctions(void *libopencl) {
       alct_real_createbuffer = clCreateBuffer;
       clCreateBuffer = alct_createbuffer_hook;
     }
+    // Import-linked callers bypass the pointers above — patch every loaded
+    // module's OpenCL.dll!clCreateBuffer IAT slot (idempotent per process:
+    // the first LoadOpenCL instance that runs patches all modules; later
+    // instances re-patch the already-hooked slots to the same function).
+    alct_patch_all_modules();
   }
 #endif
 }
