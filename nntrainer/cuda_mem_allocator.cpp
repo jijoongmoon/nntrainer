@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_set>
 
@@ -108,6 +109,10 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
             std::lock_guard<std::mutex> lk(pinned_owned_mtx);
             pinned_owned.insert(hp);
           }
+          // Honor MemAllocator's calloc contract (round-15 determinism class,
+          // the CUDA analogue of the 0024 ClSVMAllocator fix): cudaHostAlloc
+          // gives no zero guarantee — the runtime may recycle pinned blocks.
+          std::memset(hp, 0, size);
           *ptr = hp;
           if (dbg)
             fprintf(stderr, "[UVMDBG] cudaHostAlloc(mapped) %zu bytes -> %p OK\n",
@@ -156,6 +161,12 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
 #endif
         }
       }
+      // Calloc contract (round-15, CUDA analogue of 0024): cudaMalloc and
+      // cudaMallocManaged contents are undefined. Device-side memset covers
+      // both (legal on managed under WDDM cMA==0 — it is a DEVICE access);
+      // weights are fully overwritten at load so the only lasting cost is a
+      // one-time device fill at allocation.
+      cudaMemset(dptr, 0, size);
       *ptr = dptr;
       if (dbg)
         fprintf(stderr, "[UVMDBG] %s %zu bytes -> %p OK\n",
