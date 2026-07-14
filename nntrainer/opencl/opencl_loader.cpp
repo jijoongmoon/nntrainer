@@ -15,7 +15,23 @@
 
 #include <dynamic_library_loader.h>
 #include <nntrainer_log.h>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <set>
 #include <string>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h> // GetProcessMemoryInfo ([NNTR_CL_FIRSTLAUNCH_WS] probe)
+#pragma comment(lib, "psapi.lib")
+#endif
 
 namespace nntrainer::opencl {
 
@@ -186,6 +202,101 @@ const char *OpenCLErrorCodeToString(const cl_int code) {
 #undef SWITCH_CASE_RETURN
 }
 
+// [NNTR_CL_FIRSTLAUNCH_WS] Per-kernel first-launch working-set delta probe
+// (Windows). The +1.4GB of resident all-zero 24/32MB regions on gauss4/Xe3
+// appears as ~40 driver allocations exactly when the first prefill launches
+// each distinct kernel for the first time (zero-region time series
+// 2026-07-14); CL_KERNEL_SPILL_MEM_SIZE_INTEL reports 0 for every kernel on
+// this driver, so attribute the cost empirically instead: on the FIRST
+// clEnqueueNDRangeKernel of each kernel NAME, drain the queue, snapshot the
+// process WS, launch, drain again, and print the delta. Purely diagnostic,
+// env-gated, and a pass-through trampoline otherwise.
+#if defined(_WIN32)
+namespace {
+PFN_clEnqueueNDRangeKernel flws_real_enqueue = nullptr;
+
+size_t flws_ws_kb() {
+  PROCESS_MEMORY_COUNTERS pmc{};
+  if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+    return 0;
+  return pmc.WorkingSetSize >> 10;
+}
+
+// [NNTR_CL_ALLOC_TRACE] log every clSVMAlloc/clCreateBuffer >= 4MB with the
+// returned VA (SVM) or handle, size, and a monotonic ms timestamp, so large
+// anonymous regions found by the external fingerprint walker can be matched
+// to their allocation site class. Same trampoline pattern as [klws].
+PFN_clSVMAlloc alct_real_svmalloc = nullptr;
+PFN_clCreateBuffer alct_real_createbuffer = nullptr;
+
+long long alct_ms() {
+  static LARGE_INTEGER f = {}, t0 = {};
+  LARGE_INTEGER t;
+  if (f.QuadPart == 0) {
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+  }
+  QueryPerformanceCounter(&t);
+  return (t.QuadPart - t0.QuadPart) * 1000 / f.QuadPart;
+}
+
+void *CL_API_CALL alct_svmalloc_hook(cl_context c, cl_svm_mem_flags flags,
+                                     size_t size, cl_uint align) {
+  void *p = alct_real_svmalloc(c, flags, size, align);
+  if (size >= (4u << 20)) {
+    std::fprintf(stderr, "[alct] %6lld ms svm  %p size=%.1fMB flags=0x%llx\n",
+                 alct_ms(), p, size / 1048576.0,
+                 (unsigned long long)flags);
+    std::fflush(stderr);
+  }
+  return p;
+}
+
+cl_mem CL_API_CALL alct_createbuffer_hook(cl_context c, cl_mem_flags flags,
+                                          size_t size, void *host_ptr,
+                                          cl_int *err) {
+  cl_mem m = alct_real_createbuffer(c, flags, size, host_ptr, err);
+  if (size >= (4u << 20)) {
+    std::fprintf(stderr, "[alct] %6lld ms buf  %p size=%.1fMB flags=0x%llx\n",
+                 alct_ms(), (void *)m, size / 1048576.0,
+                 (unsigned long long)flags);
+    std::fflush(stderr);
+  }
+  return m;
+}
+
+cl_int CL_API_CALL flws_enqueue_hook(cl_command_queue q, cl_kernel k,
+                                     cl_uint dim, const size_t *goff,
+                                     const size_t *gws, const size_t *lws,
+                                     cl_uint nwl, const cl_event *wl,
+                                     cl_event *ev) {
+  static std::mutex mtx;
+  static std::set<std::string> seen;
+  char nm[128] = {0};
+  if (clGetKernelInfo)
+    clGetKernelInfo(k, CL_KERNEL_FUNCTION_NAME, sizeof(nm) - 1, nm, nullptr);
+  bool first = false;
+  {
+    std::lock_guard<std::mutex> lk(mtx);
+    first = seen.insert(nm).second;
+  }
+  if (!first || !clFinish)
+    return flws_real_enqueue(q, k, dim, goff, gws, lws, nwl, wl, ev);
+  clFinish(q);
+  const long long ws0 = (long long)flws_ws_kb();
+  const cl_int rc =
+    flws_real_enqueue(q, k, dim, goff, gws, lws, nwl, wl, ev);
+  clFinish(q);
+  const long long ws1 = (long long)flws_ws_kb();
+  static int seq = 0;
+  std::fprintf(stderr, "[klws] #%03d %-44s dWS=%+lld KB (%.1f MB)\n", ++seq,
+               nm, ws1 - ws0, (ws1 - ws0) / 1024.0);
+  std::fflush(stderr);
+  return rc;
+}
+} // namespace
+#endif // _WIN32
+
 /**
  * @brief Utility to load the required OpenCL APIs
  *
@@ -233,6 +344,27 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clReleaseEvent);
   LoadFunction(clGetExtensionFunctionAddressForPlatform);
   LoadFunction(clCreateCommandQueueWithProperties);
+
+#if defined(_WIN32)
+  // [NNTR_CL_FIRSTLAUNCH_WS] install the first-launch WS probe trampoline.
+  if (std::getenv("NNTR_CL_FIRSTLAUNCH_WS") && clEnqueueNDRangeKernel) {
+    flws_real_enqueue = clEnqueueNDRangeKernel;
+    clEnqueueNDRangeKernel = flws_enqueue_hook;
+    std::fprintf(stderr, "[klws] first-launch WS probe installed\n");
+    std::fflush(stderr);
+  }
+  // [NNTR_CL_ALLOC_TRACE] install the large-allocation trace trampolines.
+  if (std::getenv("NNTR_CL_ALLOC_TRACE")) {
+    if (clSVMAlloc) {
+      alct_real_svmalloc = clSVMAlloc;
+      clSVMAlloc = alct_svmalloc_hook;
+    }
+    if (clCreateBuffer) {
+      alct_real_createbuffer = clCreateBuffer;
+      clCreateBuffer = alct_createbuffer_hook;
+    }
+  }
+#endif
 }
 
 PFN_clGetPlatformIDs clGetPlatformIDs;

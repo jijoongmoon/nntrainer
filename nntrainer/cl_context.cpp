@@ -41,7 +41,22 @@
 #include <swiglu_layer.h>
 #include <transpose_cl.h>
 
+#include <cstdio>
 #include <filesystem>
+
+// [NNTR_CL_SPILL_PROBE] ad-hoc clGetKernelWorkGroupInfo resolution (not in the
+// dynamic loader table) — see registerClKernel.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -439,6 +454,46 @@ ClContext::registerClKernel(const std::string &kernel_string,
   if (!clCreateKernel(ks, kn, co, kernelPtr)) {
     ml_loge("Failed to register kernel %s", kernel_name.c_str());
     return nullptr;
+  }
+  // [NNTR_CL_SPILL_PROBE] Rank kernels by register-spill footprint. NEO
+  // allocates a per-kernel scratch surface sized from the spill size x device
+  // HW-thread count at first enqueue; on gauss4/Xe3 those surfaces measured
+  // ~1.4GB of resident ALL-ZERO private memory (49 x 24/32MB regions, content
+  // fingerprint 2026-07-14). CL_KERNEL_SPILL_MEM_SIZE_INTEL (0x4109,
+  // cl_intel_required_subgroup_size) = per-HW-thread spill bytes;
+  // CL_KERNEL_PRIVATE_MEM_SIZE is the core-spec private-memory figure.
+  // clGetKernelWorkGroupInfo is not in our dynamic loader table; resolve it
+  // here so this stays a single-TU probe (header-safe on the MSVC build).
+  if (std::getenv("NNTR_CL_SPILL_PROBE")) {
+    using PFN_wgInfo = cl_int(CL_API_CALL *)(cl_kernel, cl_device_id,
+                                             cl_kernel_work_group_info, size_t,
+                                             void *, size_t *);
+    static PFN_wgInfo p_wg = []() -> PFN_wgInfo {
+#if defined(_WIN32)
+      HMODULE h = GetModuleHandleA("OpenCL.dll");
+      return h ? reinterpret_cast<PFN_wgInfo>(
+                   GetProcAddress(h, "clGetKernelWorkGroupInfo"))
+               : nullptr;
+#else
+      return reinterpret_cast<PFN_wgInfo>(
+        dlsym(RTLD_DEFAULT, "clGetKernelWorkGroupInfo"));
+#endif
+    }();
+    if (p_wg) {
+      constexpr cl_kernel_work_group_info kSpillIntel = 0x4109;
+      cl_ulong spill = 0, priv = 0;
+      cl_device_id dev = context_inst_.GetDeviceId();
+      cl_kernel k = kernelPtr->GetKernel();
+      if (p_wg(k, dev, kSpillIntel, sizeof(spill), &spill, nullptr) !=
+          CL_SUCCESS)
+        spill = ~0ULL; // query unsupported
+      if (p_wg(k, dev, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(priv), &priv,
+               nullptr) != CL_SUCCESS)
+        priv = ~0ULL;
+      std::fprintf(stderr, "[spill] %-48s spill=%llu priv=%llu\n", key.c_str(),
+                   (unsigned long long)spill, (unsigned long long)priv);
+      std::fflush(stderr);
+    }
   }
   // add to map
   ocl_kernel_map.emplace(key, kernelPtr);
