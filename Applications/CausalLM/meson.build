@@ -253,6 +253,17 @@ test_sflare_api = executable('test_sflare_api',
     install: false,
 )
 
+# SDK consumer example — the file shipped in the sflare_sdk package (which
+# builds it OUT-OF-TREE from the package alone); built here too so it cannot
+# rot against the API.
+example_sflare = executable('example_sflare',
+    meson.current_source_dir() / 'api' / 'example_sflare.cpp',
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep, sflare_api_dep],
+    build_by_default: true,
+    install: false,
+)
+
 # KVCacheManager unit tests
 if get_option('enable-test')
   causallm_unittest_inc = include_directories(
