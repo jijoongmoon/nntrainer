@@ -143,7 +143,8 @@ LOCAL_LDLIBS := -llog -landroid -D__ARM_NEON__=1 -march=armv8.2-a+fp16+dotprod+i
 LOCAL_SRC_FILES := \
     ../api/causal_lm_api.cpp \
     ../api/model_config.cpp \
-    ../api/callback_streamer.cpp
+    ../api/callback_streamer.cpp \
+    ../api/SFlareApi.cpp
 
 LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c

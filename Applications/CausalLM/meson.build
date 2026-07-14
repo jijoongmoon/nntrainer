@@ -214,6 +214,45 @@ test_api = executable('test_api',
     install: false,
 )
 
+
+# SFlare API v2 — SFlare-branded SDK facade over the CausalLM factory
+sflare_api_src = [
+    meson.current_source_dir() / 'api' / 'SFlareApi.cpp',
+]
+
+if get_option('default_library') == 'static'
+    sflare_api = static_library('sflare_api',
+        sflare_api_src,
+        include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+        install: true,
+        install_dir: application_install_dir,
+        cpp_args: cpp_args
+    )
+else
+    sflare_api = shared_library('sflare_api',
+        sflare_api_src,
+        include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+        install: true,
+        install_dir: application_install_dir,
+        cpp_args: cpp_args
+    )
+endif
+
+sflare_api_dep = declare_dependency(
+    link_with: [sflare_api],
+    include_directories: causallm_inc
+)
+
+test_sflare_api = executable('test_sflare_api',
+    meson.current_source_dir() / 'api' / 'test_sflare_api.cpp',
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep, sflare_api_dep],
+    build_by_default: true,
+    install: false,
+)
+
 # KVCacheManager unit tests
 if get_option('enable-test')
   causallm_unittest_inc = include_directories(

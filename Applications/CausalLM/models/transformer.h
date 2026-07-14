@@ -251,6 +251,22 @@ public:
   unsigned int getVocabSize() const { return NUM_VOCAB; }
 
   /**
+   * @brief Override the max number of new tokens for subsequent run() calls
+   * @param num_to_generate Max new tokens per run; must leave room within
+   *        MAX_SEQ_LEN (run() caps the prompt to MAX_SEQ_LEN - NUM_TO_GENERATE)
+   */
+  void setNumToGenerate(unsigned int num_to_generate) {
+    NUM_TO_GENERATE = static_cast<int>(num_to_generate);
+  }
+
+  /**
+   * @brief Get the configured max number of new tokens per run
+   */
+  unsigned int getNumToGenerate() const {
+    return static_cast<unsigned int>(NUM_TO_GENERATE);
+  }
+
+  /**
    * @brief Get tokenizer owned by this model, or nullptr if no tokenizer exists
    */
   tokenizers::Tokenizer *getTokenizer() { return tokenizer.get(); }
