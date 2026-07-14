@@ -894,29 +894,29 @@ Java_com_example_quickdotai_NativeCausalLm_runMultimodalMultiImageStreamingNativ
   StreamCtx ctx{env, listenerObj, onDelta};
 
   // Debug: log multi-image metadata
-  __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
+  __android_log_print(
+    ANDROID_LOG_DEBUG, LOG_TAG,
     "runMultimodalMultiImageStreamingNative: handle=%p, numPatches=%d, "
     "numImages=%d, pixelValues[0..4]=%f,%f,%f,%f,%f",
-    (void *)handle, numPatches, numImages,
-    pixels[0], (numPatches > 1 ? pixels[1] : 0.0f),
-    (numPatches > 2 ? pixels[2] : 0.0f),
-    (numPatches > 3 ? pixels[3] : 0.0f),
-    (numPatches > 4 ? pixels[4] : 0.0f));
+    (void *)handle, numPatches, numImages, pixels[0],
+    (numPatches > 1 ? pixels[1] : 0.0f), (numPatches > 2 ? pixels[2] : 0.0f),
+    (numPatches > 3 ? pixels[3] : 0.0f), (numPatches > 4 ? pixels[4] : 0.0f));
   for (int i = 0; i < numImages; ++i) {
     __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
-      "  image[%d]: patches=%d, height=%d, width=%d",
-      i, patchesPerImage[i], originalHeights[i], originalWidths[i]);
+                        "  image[%d]: patches=%d, height=%d, width=%d", i,
+                        patchesPerImage[i], originalHeights[i],
+                        originalWidths[i]);
   }
 
   ErrorCode ec = runMultimodalMultiImageHandleStreaming(
     handle, prompt, pixels, numPatches, numImages,
     reinterpret_cast<int *>(patchesPerImage),
     reinterpret_cast<int *>(originalHeights),
-    reinterpret_cast<int *>(originalWidths),
-    &stream_trampoline, &ctx);
+    reinterpret_cast<int *>(originalWidths), &stream_trampoline, &ctx);
 
   __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
-    "runMultimodalMultiImageStreamingNative: returned ec=%d", (int)ec);
+                      "runMultimodalMultiImageStreamingNative: returned ec=%d",
+                      (int)ec);
 
   // Release resources
   env->ReleaseIntArrayElements(originalWidthsJ, originalWidths, JNI_ABORT);
@@ -1015,36 +1015,36 @@ Java_com_example_quickdotai_NativeCausalLm_runMultimodalMultiImageWithMessagesSt
   StreamCtx ctx{env, listenerObj, onDelta};
 
   // Debug: log multi-image + messages metadata
-  __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
+  __android_log_print(
+    ANDROID_LOG_DEBUG, LOG_TAG,
     "runMultimodalMultiImageWithMessagesStreamingNative: handle=%p, "
     "numMessages=%zu, numPatches=%d, numImages=%d, "
     "pixelValues[0..4]=%f,%f,%f,%f,%f",
-    (void *)handle, msgs.size(), numPatches, numImages,
-    pixels[0], (numPatches > 1 ? pixels[1] : 0.0f),
-    (numPatches > 2 ? pixels[2] : 0.0f),
-    (numPatches > 3 ? pixels[3] : 0.0f),
-    (numPatches > 4 ? pixels[4] : 0.0f));
+    (void *)handle, msgs.size(), numPatches, numImages, pixels[0],
+    (numPatches > 1 ? pixels[1] : 0.0f), (numPatches > 2 ? pixels[2] : 0.0f),
+    (numPatches > 3 ? pixels[3] : 0.0f), (numPatches > 4 ? pixels[4] : 0.0f));
   for (int i = 0; i < numImages; ++i) {
     __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
-      "  image[%d]: patches=%d, height=%d, width=%d",
-      i, patchesPerImage[i], originalHeights[i], originalWidths[i]);
+                        "  image[%d]: patches=%d, height=%d, width=%d", i,
+                        patchesPerImage[i], originalHeights[i],
+                        originalWidths[i]);
   }
   for (size_t i = 0; i < msgs.size(); ++i) {
     __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
-      "  msg[%zu]: role='%s' contentLen=%zu",
-      i, msgs[i].role, strlen(msgs[i].content));
+                        "  msg[%zu]: role='%s' contentLen=%zu", i, msgs[i].role,
+                        strlen(msgs[i].content));
   }
 
   ErrorCode ec = runMultimodalMultiImageHandleWithMessagesStreaming(
     handle, msgs.data(), msgs.size(), addGenerationPrompt == JNI_TRUE, pixels,
-    numPatches, numImages,
-    reinterpret_cast<int *>(patchesPerImage),
+    numPatches, numImages, reinterpret_cast<int *>(patchesPerImage),
     reinterpret_cast<int *>(originalHeights),
-    reinterpret_cast<int *>(originalWidths),
-    &stream_trampoline, &ctx);
+    reinterpret_cast<int *>(originalWidths), &stream_trampoline, &ctx);
 
-  __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
-    "runMultimodalMultiImageWithMessagesStreamingNative: returned ec=%d", (int)ec);
+  __android_log_print(
+    ANDROID_LOG_DEBUG, LOG_TAG,
+    "runMultimodalMultiImageWithMessagesStreamingNative: returned ec=%d",
+    (int)ec);
 
   // Release resources
   env->ReleaseIntArrayElements(originalWidthsJ, originalWidths, JNI_ABORT);

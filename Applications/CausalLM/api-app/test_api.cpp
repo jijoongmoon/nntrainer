@@ -9,13 +9,13 @@
 #include "quick_dot_ai_api.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
-#include <chrono>
-#include <cstdint>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -112,12 +112,13 @@ static void print_usage(const char *prog) {
 }
 
 // Loads nothing; assumes `handle` is an already-loaded embedding model.
-// Calls encodeModelHandle, prints + sanity-checks the vector. Returns true on success.
+// Calls encodeModelHandle, prints + sanity-checks the vector. Returns true on
+// success.
 static bool run_embedding_smoke(CausalLmHandle handle, const char *text) {
   print_section("Embedding (encode)", clr::green);
   std::cout << clr::green << "│" << clr::reset << "  " << clr::dim
-            << "Input: " << clr::reset << clr::bold_white << text
-            << clr::reset << "\n";
+            << "Input: " << clr::reset << clr::bold_white << text << clr::reset
+            << "\n";
 
   float *vec = nullptr;
   int dim = 0;
@@ -137,7 +138,10 @@ static bool run_embedding_smoke(CausalLmHandle handle, const char *text) {
   bool all_finite = true;
   double sumsq = 0.0;
   for (int i = 0; i < dim; ++i) {
-    if (!std::isfinite(vec[i])) { all_finite = false; break; }
+    if (!std::isfinite(vec[i])) {
+      all_finite = false;
+      break;
+    }
     sumsq += static_cast<double>(vec[i]) * vec[i];
   }
   const double norm = std::sqrt(sumsq);
@@ -154,9 +158,11 @@ static bool run_embedding_smoke(CausalLmHandle handle, const char *text) {
     oss << "[";
     for (int i = 0; i < n; ++i) {
       oss << std::fixed << std::setprecision(4) << vec[i];
-      if (i != n - 1) oss << ", ";
+      if (i != n - 1)
+        oss << ", ";
     }
-    if (dim > 16) oss << ", …";
+    if (dim > 16)
+      oss << ", …";
     oss << "]";
     print_kv(("First " + std::to_string(n)).c_str(), oss.str(), clr::green);
   }
@@ -185,14 +191,16 @@ static bool run_embedding_smoke(CausalLmHandle handle, const char *text) {
 //
 // Env knobs:
 //   VJEPA2_PIXEL_FILL = zero | ramp   (input fill; default ramp)
-//   VJEPA2_RUNS       = N             (timed repetitions on the loaded handle; default 1)
+//   VJEPA2_RUNS       = N             (timed repetitions on the loaded handle;
+//   default 1)
 static bool run_vision_smoke(CausalLmHandle handle) {
   print_section("Vision Encode (dummy)", clr::green);
 
   const size_t numFloats = 1ull * 24 * 3 * 256 * 256; // 4,718,592
   std::vector<float> dummy(numFloats);
   const char *fill_env = std::getenv("VJEPA2_PIXEL_FILL");
-  const bool zero_fill = (fill_env != nullptr && std::string(fill_env) == "zero");
+  const bool zero_fill =
+    (fill_env != nullptr && std::string(fill_env) == "zero");
   if (zero_fill) {
     std::fill(dummy.begin(), dummy.end(), 0.0f);
   } else {
@@ -209,9 +217,9 @@ static bool run_vision_smoke(CausalLmHandle handle) {
 
   std::cout << clr::green << "│" << clr::reset << "  " << clr::dim
             << "Dummy input: " << clr::reset << clr::bold_white << numFloats
-            << " floats (" << (numFloats * sizeof(float)) << " bytes, fill="
-            << (zero_fill ? "zero" : "ramp") << "), runs=" << runs
-            << clr::reset << "\n";
+            << " floats (" << (numFloats * sizeof(float))
+            << " bytes, fill=" << (zero_fill ? "zero" : "ramp")
+            << "), runs=" << runs << clr::reset << "\n";
 
   void *out = nullptr;
   int out_bytes = 0;
@@ -231,7 +239,8 @@ static bool run_vision_smoke(CausalLmHandle handle) {
                   ")");
       return false;
     }
-    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double ms =
+      std::chrono::duration<double, std::milli>(t1 - t0).count();
     sum_ms += ms;
     if (i == 0 || ms < min_ms)
       min_ms = ms;
@@ -240,8 +249,8 @@ static bool run_vision_smoke(CausalLmHandle handle) {
     std::ostringstream rss;
     rss << "run " << std::setw(2) << (i + 1) << "/" << runs << ": "
         << std::fixed << std::setprecision(2) << ms << " ms";
-    std::cout << clr::green << "│" << clr::reset << "  " << clr::dim << rss.str()
-              << clr::reset << "\n";
+    std::cout << clr::green << "│" << clr::reset << "  " << clr::dim
+              << rss.str() << clr::reset << "\n";
   }
 
   const double avg_ms = sum_ms / runs;
@@ -327,7 +336,7 @@ int main(int argc, char *argv[]) {
   }
 
   bool use_sd = false; // set inside a speculative-decoding QNN model's routing
-                        // block, if one is matched
+                       // block, if one is matched
 
   // Model base path: CLI arg > env var > nullptr (uses C API default)
   const char *model_base_path = nullptr;
@@ -413,8 +422,8 @@ int main(int argc, char *argv[]) {
   } else if (model_name_str == "gemma4_e2b_qnn" ||
              model_name_str == "gemma4-e2b-qnn") {
     model_type = CAUSAL_LM_MODEL_GEMMA4_E2B_QNN;
-  } else if (model_name_str == "vjepa2-qnn" ||
-             model_name_str == "vjepa2_qnn" || model_name_str == "vjepa") {
+  } else if (model_name_str == "vjepa2-qnn" || model_name_str == "vjepa2_qnn" ||
+             model_name_str == "vjepa") {
 #ifdef ENABLE_QNN_MODELS
     catalog_id = "vjepa2-qnn";
     use_by_name = true;
@@ -445,7 +454,8 @@ int main(int argc, char *argv[]) {
   int STRESS_CYCLES = 1;
   if (const char *sc = std::getenv("STRESS_CYCLES")) {
     STRESS_CYCLES = std::atoi(sc);
-    if (STRESS_CYCLES < 0) STRESS_CYCLES = 0;
+    if (STRESS_CYCLES < 0)
+      STRESS_CYCLES = 0;
   }
   print_section("Load/Unload Stress Test", clr::blue);
 
@@ -567,9 +577,10 @@ int main(int argc, char *argv[]) {
   // err = runModelHandleWithMessages(handle, &msg, 1, true, &outputText);
 
   // QDA_STREAM=1: unconstrained per-token streaming generation, matching the
-  // GUI app's Chat path (runChatModelHandleStreaming → runModelHandleStreaming).
-  // The default tool/grammar path below produces only a short constrained JSON,
-  // which never reaches the longer free-text generation the app does.
+  // GUI app's Chat path (runChatModelHandleStreaming →
+  // runModelHandleStreaming). The default tool/grammar path below produces only
+  // a short constrained JSON, which never reaches the longer free-text
+  // generation the app does.
   if (std::getenv("QDA_STREAM")) {
     struct Cb {
       static int on_token(const char *delta, void *) {
@@ -584,16 +595,18 @@ int main(int argc, char *argv[]) {
     err = runModelHandleStreaming(handle, prompt, &Cb::on_token, nullptr);
     std::cout << "\n";
   } else {
-  // XGrammar Test
-  auto tool_name = "web_search";
-  auto schema =
-    "{\"type\": \"object\",\"properties\": {\"query\": {\"type\": \"string\", "
-    "\"description\": \"Search query in the most effective language for "
-    "results (use Korean for Korean local info, English for global "
-    "topics)\"},\"count\": {\"type\": \"integer\", \"minimum\": 1, "
-    "\"maximum\": 10, \"description\": \"Number of results to return "
-    "(default 5, max 10)\"}},\"required\": [\"query\"]}";
-  err = runModelHandleWithTool(handle, prompt, &outputText, tool_name, schema);
+    // XGrammar Test
+    auto tool_name = "web_search";
+    auto schema =
+      "{\"type\": \"object\",\"properties\": {\"query\": {\"type\": "
+      "\"string\", "
+      "\"description\": \"Search query in the most effective language for "
+      "results (use Korean for Korean local info, English for global "
+      "topics)\"},\"count\": {\"type\": \"integer\", \"minimum\": 1, "
+      "\"maximum\": 10, \"description\": \"Number of results to return "
+      "(default 5, max 10)\"}},\"required\": [\"query\"]}";
+    err =
+      runModelHandleWithTool(handle, prompt, &outputText, tool_name, schema);
   }
 
   if (err != CAUSAL_LM_ERROR_NONE) {

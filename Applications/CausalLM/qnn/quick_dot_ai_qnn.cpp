@@ -11,9 +11,9 @@
 #include "engine.h"
 #include "generate_qnn_utils.h"
 #include "graph_parser.h"
+#include "xgrammar_wrapper.h"
 #include <climits>
 #include <unistd.h>
-#include "xgrammar_wrapper.h"
 
 #include <algorithm>
 #include <cmath>

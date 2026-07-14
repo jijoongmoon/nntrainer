@@ -48,7 +48,7 @@ public:
   /**
    * @brief Get singleton instance
    */
-  static XGrammarManager& Instance();
+  static XGrammarManager &Instance();
 
   /**
    * @brief Load toolset from JSON file and pre-compile all grammars
@@ -57,40 +57,39 @@ public:
    * @param vocab_size Size of the vocabulary
    * @return true on success, false on failure
    */
-  bool loadToolset(const std::string& toolset_path,
-                   tokenizers::Tokenizer* tokenizer,
-                   unsigned int vocab_size);
+  bool loadToolset(const std::string &toolset_path,
+                   tokenizers::Tokenizer *tokenizer, unsigned int vocab_size);
 
   /**
    * @brief Get pre-compiled XGrammar for a specific tool
    * @param tool_name Name of the tool (e.g., "alarm", "send_email", "memo")
    * @return Pointer to XGrammar, or nullptr if not found
    */
-  XGrammar* getGrammar(const std::string& tool_name);
+  XGrammar *getGrammar(const std::string &tool_name);
 
   /**
    * @brief Reset grammar matcher state for a specific tool
    * @param tool_name Name of the tool
    */
-  void resetGrammar(const std::string& tool_name);
+  void resetGrammar(const std::string &tool_name);
 
   /**
    * @brief Check if a tool exists in the loaded toolset
    * @param tool_name Name of the tool
    * @return true if tool exists, false otherwise
    */
-  bool hasTool(const std::string& tool_name) const;
+  bool hasTool(const std::string &tool_name) const;
 
   /**
    * @brief Get list of all available tool names
    * @return Vector of tool names
    */
   std::vector<std::string> getToolNames() const;
-  
+
   /**
-   * @brief Initialize 
+   * @brief Initialize
    */
-  bool initialize(tokenizers::Tokenizer* tokenizer, unsigned int vocab_size);
+  bool initialize(tokenizers::Tokenizer *tokenizer, unsigned int vocab_size);
 
   /**
    * @brief Check if manager is initialized with a toolset
@@ -103,9 +102,11 @@ public:
    * @param tool_name Name of the tool
    * @param json_schema JSON schema string for the tool
    * @return true on success, false on failure
-   * @note Requires loadToolset() to be called first to initialize tokenizer/compiler
+   * @note Requires loadToolset() to be called first to initialize
+   * tokenizer/compiler
    */
-  bool registerTool(const std::string& tool_name, const std::string& json_schema);
+  bool registerTool(const std::string &tool_name,
+                    const std::string &json_schema);
 
   /**
    * @brief Clear all compiled grammars
@@ -115,8 +116,8 @@ public:
 private:
   XGrammarManager() = default;
   ~XGrammarManager() = default;
-  XGrammarManager(const XGrammarManager&) = delete;
-  XGrammarManager& operator=(const XGrammarManager&) = delete;
+  XGrammarManager(const XGrammarManager &) = delete;
+  XGrammarManager &operator=(const XGrammarManager &) = delete;
 
   // Pre-compiled grammars: tool_name -> XGrammar
   std::unordered_map<std::string, std::unique_ptr<XGrammar>> compiled_grammars_;

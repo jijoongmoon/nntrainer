@@ -25,7 +25,7 @@ XGrammar::XGrammar() {
 
 void XGrammar::initializeGrammar(const std::string &grammar_type,
                                  const std::string &json_schema,
-                                 tokenizers::Tokenizer* tokenizer,
+                                 tokenizers::Tokenizer *tokenizer,
                                  unsigned int vocab_size) {
   if (tokenizer == nullptr) {
     throw std::runtime_error("Tokenizer is null. Cannot initialize grammar.");
@@ -50,18 +50,21 @@ void XGrammar::initializeGrammar(const std::string &grammar_type,
 
   // Step 3: Create GrammarCompiler
   // std::cout << "[xgrammar] Creating GrammarCompiler...\n";
-  grammar_compiler_ = std::make_unique<xgrammar::GrammarCompiler>(*tokenizer_info_);
+  grammar_compiler_ =
+    std::make_unique<xgrammar::GrammarCompiler>(*tokenizer_info_);
 
   // Step 4: Compile grammar using the shared helper
-  compileGrammar(grammar_type, json_schema, grammar_compiler_.get(), vocab_size);
+  compileGrammar(grammar_type, json_schema, grammar_compiler_.get(),
+                 vocab_size);
 }
 
 void XGrammar::initializeGrammar(const std::string &grammar_type,
                                  const std::string &json_schema,
-                                 xgrammar::GrammarCompiler* grammar_compiler,
+                                 xgrammar::GrammarCompiler *grammar_compiler,
                                  unsigned int vocab_size) {
   if (grammar_compiler == nullptr) {
-    throw std::runtime_error("GrammarCompiler is null. Cannot initialize grammar.");
+    throw std::runtime_error(
+      "GrammarCompiler is null. Cannot initialize grammar.");
   }
   // Skip encoded vocab extraction - reuse shared GrammarCompiler
   // Compile grammar using the shared helper
@@ -70,7 +73,7 @@ void XGrammar::initializeGrammar(const std::string &grammar_type,
 
 void XGrammar::compileGrammar(const std::string &grammar_type,
                               const std::string &json_schema,
-                              xgrammar::GrammarCompiler* grammar_compiler,
+                              xgrammar::GrammarCompiler *grammar_compiler,
                               unsigned int vocab_size) {
   if (grammar_type == "json") {
     if (!json_schema.empty()) {
@@ -108,10 +111,11 @@ void XGrammar::compileGrammar(const std::string &grammar_type,
 
   // Create GrammarMatcher
   // std::cout << "[xgrammar] Creating GrammarMatcher...\n";
-  grammar_matcher_ = std::make_unique<xgrammar::GrammarMatcher>(*compiled_grammar_);
+  grammar_matcher_ =
+    std::make_unique<xgrammar::GrammarMatcher>(*compiled_grammar_);
 
-  // std::cout << "[xgrammar] Grammar constraints initialized successfully!\n\n";
-  // Allocate bitmask storage (optimized - allocated once)
+  // std::cout << "[xgrammar] Grammar constraints initialized
+  // successfully!\n\n"; Allocate bitmask storage (optimized - allocated once)
   bitmask_size_ = (vocab_size + 31) / 32;
   bitmask_data_ = std::vector<int32_t>(bitmask_size_);
   bitmask_tensor_.data = bitmask_data_.data();
@@ -135,16 +139,18 @@ void XGrammar::resetGrammar() {
 }
 
 bool XGrammar::loadFromCache(const std::string &serialized_json,
-                             xgrammar::TokenizerInfo* tokenizer_info,
+                             xgrammar::TokenizerInfo *tokenizer_info,
                              unsigned int vocab_size) {
   if (tokenizer_info == nullptr) {
     std::cerr << "[xgrammar] Error: TokenizerInfo is null for cache loading\n";
     return false;
   }
 
-  auto result = xgrammar::CompiledGrammar::DeserializeJSON(serialized_json, *tokenizer_info);
+  auto result = xgrammar::CompiledGrammar::DeserializeJSON(serialized_json,
+                                                           *tokenizer_info);
   if (!std::holds_alternative<xgrammar::CompiledGrammar>(result)) {
-    std::cerr << "[xgrammar] Error: Failed to deserialize compiled grammar from cache\n";
+    std::cerr << "[xgrammar] Error: Failed to deserialize compiled grammar "
+                 "from cache\n";
     return false;
   }
 
@@ -152,7 +158,8 @@ bool XGrammar::loadFromCache(const std::string &serialized_json,
     std::get<xgrammar::CompiledGrammar>(std::move(result)));
 
   // Create GrammarMatcher
-  grammar_matcher_ = std::make_unique<xgrammar::GrammarMatcher>(*compiled_grammar_);
+  grammar_matcher_ =
+    std::make_unique<xgrammar::GrammarMatcher>(*compiled_grammar_);
 
   // Allocate bitmask storage
   bitmask_size_ = (vocab_size + 31) / 32;
@@ -177,36 +184,30 @@ std::string XGrammar::serialize() const {
   return compiled_grammar_->SerializeJSON();
 }
 
-std::vector<int32_t>& XGrammar::getBitmaskData() {
-  return bitmask_data_;
-}
+std::vector<int32_t> &XGrammar::getBitmaskData() { return bitmask_data_; }
 
-DLTensor& XGrammar::getBitmaskTensor() {
-  return bitmask_tensor_;
-}
+DLTensor &XGrammar::getBitmaskTensor() { return bitmask_tensor_; }
 
-int64_t XGrammar::getBitmaskSize() {
-  return bitmask_size_;
-}
+int64_t XGrammar::getBitmaskSize() { return bitmask_size_; }
 
-xgrammar::GrammarMatcher* XGrammar::getGrammarMatcher() {
+xgrammar::GrammarMatcher *XGrammar::getGrammarMatcher() {
   return grammar_matcher_.get();
 }
 
-void XGrammar::applyGrammarMask(float* logits, int vocab_size) {
-  for( int i=0; i<vocab_size; ++i){
-    int32_t block = bitmask_data_[i/32];
-    bool is_accepted = (block >> (i%32)) &1;
+void XGrammar::applyGrammarMask(float *logits, int vocab_size) {
+  for (int i = 0; i < vocab_size; ++i) {
+    int32_t block = bitmask_data_[i / 32];
+    bool is_accepted = (block >> (i % 32)) & 1;
 
-    if(!is_accepted){
+    if (!is_accepted) {
       // logits[i] = std::numeric_limits<float>::infinity();
       logits[i] = -INFINITY;
     }
   }
 }
 
-void XGrammar::applyGrammarMask(uint16_t* logits, int vocab_size, 
-                                 float logit_scale, int logit_offset) {
+void XGrammar::applyGrammarMask(uint16_t *logits, int vocab_size,
+                                float logit_scale, int logit_offset) {
   // Apply grammar mask to quantized uint16_t logits
   // Set masked tokens to minimum value (will be rejected by sampling)
   for (int i = 0; i < vocab_size; ++i) {
@@ -214,7 +215,8 @@ void XGrammar::applyGrammarMask(uint16_t* logits, int vocab_size,
     bool is_accepted = (block >> (i % 32)) & 1;
 
     if (!is_accepted) {
-      // Set to minimum uint16_t value (0) which will result in -inf after scaling
+      // Set to minimum uint16_t value (0) which will result in -inf after
+      // scaling
       logits[i] = 0;
     }
   }
