@@ -446,6 +446,13 @@ CausalLM::incrementalInference(unsigned int batch_size,
     first_output = false;
   }
 
+  // Keep the host-side KV tracker at the absolute position just written:
+  // mha_core advances only its own internal cache_index during forwarding,
+  // so without this getKvLen()/save_kvcache() would report the stale
+  // prefill-start position (advanceKVCachePosition had no caller).
+  if (kv_cache.isAllocated() && to <= kv_cache.getMaxSeqLen())
+    kv_cache.setPosition(to);
+
   return output;
 }
 
@@ -1113,8 +1120,23 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     const unsigned int prefill_to = prefill_from + input_len - 1;
     setKVCachePosition(prefill_from);
-    output = incrementalInference(BATCH_SIZE, input, init_len - 1, prefill_from,
-                                  prefill_to);
+    if (prefill_from > 0 && init_len - 1 > 1 && causallm_engine() == "gpu") {
+      // Resumed prefill on OpenCL (see the non-skip branch below): feed the
+      // init_len-1 prefill tokens through the decode call shape; their
+      // logits are discarded, matching the block skip-prefill semantics.
+      for (unsigned int i = 0; i + 1 < init_len; ++i) {
+        for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+            static_cast<float>(init_input[i]);
+        const unsigned int p = prefill_from + i;
+        auto step_out = incrementalInference(BATCH_SIZE, input, p, p, p + 1);
+        for (auto &o : step_out)
+          delete[] o;
+      }
+    } else {
+      output = incrementalInference(BATCH_SIZE, input, init_len - 1,
+                                    prefill_from, prefill_to);
+    }
 
     for (unsigned int b = 0; b < BATCH_SIZE; ++b)
       id_list.push_back(skipped_token);
@@ -1126,8 +1148,28 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   } else {
     const unsigned int prefill_to = prefill_from + input_len;
     setKVCachePosition(prefill_from);
-    output = incrementalInference(BATCH_SIZE, input, init_len, prefill_from,
-                                  prefill_to);
+    if (prefill_from > 0 && init_len > 1 && causallm_engine() == "gpu") {
+      // Resumed prefill (KV loaded at prefill_from) on OpenCL: the CL layers
+      // only accept from>0 with a step of 1 (decode shape), so feed the
+      // prompt token-by-token through the decode call shape
+      // (init_seq_len == from == absolute position, to = position + 1).
+      for (unsigned int i = 0; i < init_len; ++i) {
+        for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+            static_cast<float>(init_input[i]);
+        const unsigned int p = prefill_from + i;
+        auto step_out = incrementalInference(BATCH_SIZE, input, p, p, p + 1);
+        if (i + 1 < init_len) {
+          for (auto &o : step_out)
+            delete[] o;
+        } else {
+          output = std::move(step_out);
+        }
+      }
+    } else {
+      output = incrementalInference(BATCH_SIZE, input, init_len, prefill_from,
+                                    prefill_to);
+    }
 
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);

@@ -124,6 +124,43 @@ public:
    */
   void resetLogitsProcessor() override;
 
+  /**
+   * @brief Current KV-cache write position (absolute token position)
+   */
+  int getKvLen() const override {
+    return static_cast<int>(kv_cache.getPosition());
+  }
+
+  /**
+   * @brief save kv cache (all layers, first @p to positions) to @p path
+   */
+  WIN_EXPORT virtual void save_kvcache(std::string path, int to);
+
+  /**
+   * @brief load kv cache from @p path and sync every layer's cache index
+   *        to position @p to
+   */
+  WIN_EXPORT virtual void load_kvcache(std::string path, int to);
+
+  /**
+   * @brief Arm (or disarm) resume-from-saved-KV for the next run() call.
+   * @param path Saved KV-cache file produced by save_kvcache(); an empty
+   *             string disarms and restores plain-prefill behavior.
+   * @param sys_prompt_token_len Absolute token position the cache was saved
+   *             at; the next run() reloads the cache and prefills the new
+   *             prompt starting from this offset.
+   * @note  Drives the same USE_KVCACHE flow that nntr_config.json's
+   *        system_prompt.kvcache block configures, without needing the
+   *        config entry.
+   */
+  void setPrecomputedKVCache(const std::string &path,
+                             unsigned int sys_prompt_token_len) {
+    USE_KVCACHE = !path.empty();
+    PRE_COMPUTED_CACHE_PATH = path;
+    SYS_PROMP_LEN = USE_KVCACHE ? sys_prompt_token_len : 0;
+    global_token_len = 0;
+  }
+
 protected:
   /**
    * @brief Setup the parameters for the CausalLM model
@@ -144,16 +181,6 @@ protected:
   registerOutputs(std::unique_ptr<tokenizers::Tokenizer> &tokenizer,
                   std::vector<unsigned int> ids, unsigned int pos,
                   const std::vector<bool> &eos_list, bool log_output = true);
-
-  /**
-   * @brief save kv cache
-   */
-  WIN_EXPORT virtual void save_kvcache(std::string path, int to);
-
-  /**
-   * @brief load kv cache
-   */
-  WIN_EXPORT virtual void load_kvcache(std::string path, int to);
 
   /**
    * @brief generate
