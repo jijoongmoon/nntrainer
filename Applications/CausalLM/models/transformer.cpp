@@ -14,6 +14,16 @@
 #include <fstream>
 #include <mutex>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h> // SetThreadPriority (async tokenizer, below-normal)
+#endif
+
 #include <app_context.h>
 #if defined(ENABLE_OPENCL)
 #include <cl_context.h> // GPU registration goes via the Engine facade now; the
@@ -135,7 +145,25 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
     const std::string tok_path = nntr_cfg["tokenizer_file"];
     tokenizer_future_ =
       std::async(std::launch::async, [tok_path]() {
-        return tokenizers::Tokenizer::FromBlobJSON(LoadBytesFromFile(tok_path));
+        // Below-normal priority: the parse tail (~100-300ms) overlaps the
+        // parallel v8c prebuild workers (round-13 ordering trace), so let
+        // the load workers win contention -- the parse still finishes long
+        // before its first use joins it.
+#if defined(_WIN32)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+        auto tok =
+          tokenizers::Tokenizer::FromBlobJSON(LoadBytesFromFile(tok_path));
+        // [NNTR_INIT_TRACE] ordering marker: where in the load pipeline the
+        // async parse actually completes (contention forensics -- if this
+        // lands after "load_weight begins" the side thread competes with the
+        // parallel v8c prebuild workers; observed: it completes during the
+        // single-threaded compile/planner phase instead).
+        if (std::getenv("NNTR_INIT_TRACE")) {
+          std::fprintf(stderr, "[init-trace] tokenizer async parse done\n");
+          std::fflush(stderr);
+        }
+        return tok;
       });
   }
 };

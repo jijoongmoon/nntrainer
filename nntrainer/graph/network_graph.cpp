@@ -1355,6 +1355,21 @@ int NetworkGraph::initialize(ExecutionMode mode,
                              const std::vector<Connection> &model_label_names) {
   exec_mode = mode;
   tensor_manager->setExecutionMode(mode);
+
+  // [NNTR_INIT_TRACE] sub-dissection of the graph-initialize share of init
+  // latency (round-13 follow-up).
+  static const bool init_trace = std::getenv("NNTR_INIT_TRACE") != nullptr;
+  const auto _gt0 = std::chrono::steady_clock::now();
+  auto _glap = [&](const char *what) {
+    if (!init_trace)
+      return;
+    std::fprintf(stderr, "[init-trace]   graph: %8.1f ms  %s\n",
+                 std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - _gt0)
+                   .count(),
+                 what);
+    std::fflush(stderr);
+  };
   /**
    * this contains the map from node name to its input tensor names
    * @note: these input tensors have already been allocated
@@ -1463,6 +1478,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
       }
     }
   }
+  _glap("gradient first/last-access marking");
 
   /**** identify model input / output to be set externally later ****/
   auto identify_as_model_input = [this](LayerNode *node) {
@@ -1557,6 +1573,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
       break;
     }
   }
+  _glap("io identify + backward marking + total");
   return ML_ERROR_NONE;
 }
 
