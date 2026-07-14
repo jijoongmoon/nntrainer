@@ -17,10 +17,12 @@
 #include "cl_tensor_view.h"
 #include "util_func.h"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fp16.h>
+#include <thread>
 #include <unordered_map>
 
 namespace nntrainer {
@@ -2904,15 +2906,11 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
   // One pass over the whole N when mapped; bounded chunks otherwise.
   const size_t chunk_rows =
     hostptr ? (size_t)N : std::max<size_t>(1, CHUNK_BYTES / v8c_row_bytes);
-  std::vector<uint8_t> packed;
-  if (!hostptr)
-    packed.assign(chunk_rows * v8c_row_bytes, 0);
-  for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
-    const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
-    uint8_t *dst =
-      hostptr ? (map_ptr + n0 * v8c_row_bytes) : packed.data();
-    if (!hostptr)
-      std::memset(dst, 0, nrows * v8c_row_bytes); // padding stays 0
+
+  // Pack rows [n0, n0+nrows) into dst and fold the per-channel int4 row
+  // sums. Rows are disjoint across calls, so parallel chunk workers may run
+  // this concurrently.
+  auto pack_rows = [&](size_t n0, size_t nrows, uint8_t *dst) {
     for (size_t r = 0; r < nrows; ++r) {
       const size_t n = n0 + r;
       const uint8_t *plain_row = plain_nibbles + n * plain_row_bytes;
@@ -2924,9 +2922,9 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
         const size_t kbase = kblk * 32;
         for (size_t c = 0; c < 4; ++c) {
           for (size_t b = 0; b < 4; ++b) {
-          const uint8_t qL = plain_nib(plain_row, kbase + c * 8 + b);
-          const uint8_t qH = plain_nib(plain_row, kbase + c * 8 + b + 4);
-          v8c_kblk[c * 4 + b] = (uint8_t)((qH << 4) | qL);
+            const uint8_t qL = plain_nib(plain_row, kbase + c * 8 + b);
+            const uint8_t qH = plain_nib(plain_row, kbase + c * 8 + b + 4);
+            v8c_kblk[c * 4 + b] = (uint8_t)((qH << 4) | qL);
           }
         }
       }
@@ -2940,16 +2938,76 @@ make_v8c_weight_backing_from_qs4cx(const uint8_t *plain_nibbles,
       }
       row_sum_w_int4[n] = s;
     }
-    if (!hostptr) {
-      const cl_int werr =
-        clEnqueueWriteBuffer(cq, w_buf, CL_TRUE, n0 * v8c_row_bytes,
-                             nrows * v8c_row_bytes, packed.data(), 0, nullptr,
-                             nullptr);
-      if (werr != CL_SUCCESS) {
-        clReleaseMemObject(w_buf);
-        throw std::runtime_error(
-          "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
-          std::to_string(werr));
+  };
+
+  // [init-parallel] For the big weights (in practice the untied lm_head,
+  // N=262144 -> 336MB) the single-threaded permute is the longest pole of
+  // model init even once the per-weight builds run concurrently (the map
+  // lock split in blas_kernel_interface.cpp). Pack+upload independent
+  // chunks from a small crew: staging stays bounded at workers x
+  // CHUNK_BYTES (4 x 16MB), blocking writes to disjoint offsets are
+  // thread-safe on the shared queue, and row_sum rows are disjoint. Small
+  // weights keep the serial path (thread spin-up would dominate).
+  constexpr size_t PAR_THRESHOLD_BYTES = 64u << 20;
+  const size_t n_chunks = ((size_t)N + chunk_rows - 1) / chunk_rows;
+  if (!hostptr && total_bytes >= PAR_THRESHOLD_BYTES && n_chunks > 1) {
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0)
+      hw = 4;
+    const size_t n_workers =
+      std::min(std::min((size_t)hw, n_chunks), (size_t)4);
+    std::atomic<size_t> next_chunk{0};
+    std::atomic<cl_int> chunk_err{CL_SUCCESS};
+    std::vector<std::thread> crew;
+    crew.reserve(n_workers);
+    for (size_t t = 0; t < n_workers; ++t) {
+      crew.emplace_back([&]() {
+        std::vector<uint8_t> staging(chunk_rows * v8c_row_bytes);
+        for (;;) {
+          const size_t ci = next_chunk.fetch_add(1);
+          if (ci >= n_chunks || chunk_err.load() != CL_SUCCESS)
+            break;
+          const size_t n0 = ci * chunk_rows;
+          const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
+          std::memset(staging.data(), 0, nrows * v8c_row_bytes);
+          pack_rows(n0, nrows, staging.data());
+          const cl_int werr = clEnqueueWriteBuffer(
+            cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
+            staging.data(), 0, nullptr, nullptr);
+          if (werr != CL_SUCCESS)
+            chunk_err.store(werr);
+        }
+      });
+    }
+    for (auto &th : crew)
+      th.join();
+    if (chunk_err.load() != CL_SUCCESS) {
+      clReleaseMemObject(w_buf);
+      throw std::runtime_error(
+        "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+        std::to_string(chunk_err.load()));
+    }
+  } else {
+    std::vector<uint8_t> packed;
+    if (!hostptr)
+      packed.assign(chunk_rows * v8c_row_bytes, 0);
+    for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
+      const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
+      uint8_t *dst = hostptr ? (map_ptr + n0 * v8c_row_bytes) : packed.data();
+      if (!hostptr)
+        std::memset(dst, 0, nrows * v8c_row_bytes); // padding stays 0
+      pack_rows(n0, nrows, dst);
+      if (!hostptr) {
+        const cl_int werr =
+          clEnqueueWriteBuffer(cq, w_buf, CL_TRUE, n0 * v8c_row_bytes,
+                               nrows * v8c_row_bytes, packed.data(), 0, nullptr,
+                               nullptr);
+        if (werr != CL_SUCCESS) {
+          clReleaseMemObject(w_buf);
+          throw std::runtime_error(
+            "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+            std::to_string(werr));
+        }
       }
     }
   }

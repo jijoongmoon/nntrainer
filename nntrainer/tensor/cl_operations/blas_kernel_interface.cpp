@@ -597,20 +597,33 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   const void *key = weight.getData<uint8_t>();
   if (!key)
     return nullptr;
-  std::lock_guard<std::mutex> lock(v8c_cache_mtx());
-  auto &cache = v8c_weight_cache();
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    // Validate the pointer-keyed hit: a freed/re-used host weight pointer
-    // (e.g. FSU) would otherwise silently return ANOTHER weight's device
-    // pack (wrong N/K backing bound to the GEMM). Rebuild on mismatch.
-    if (it->second.N == N && it->second.K == K)
-      return &it->second;
-    std::fprintf(stderr,
-                 "[v8c] weight-cache shape mismatch for key=%p: cached N=%u "
-                 "K=%u vs requested N=%u K=%u -- rebuilding\n",
-                 key, it->second.N, it->second.K, N, K);
-    cache.erase(it);
+  // [init-parallel] The map lock covers ONLY lookup/insert. The build below
+  // (CPU nibble repack + chunked upload + row-sum) runs OUTSIDE it so the
+  // hw_concurrency weight-load workers repack in parallel: with the build
+  // inside this lock all 423 weights went through one core -- Windows
+  // round-13 IAT timeline (first backing 47ms, last 6,916ms) put ~97% of a
+  // 7.1s intel init in this section; Linux paid the same shape (~5s).
+  // Safety: no cross-weight ordering exists (disjoint device buffers; the
+  // in-order queue only sequences the blocking per-weight chunk writes),
+  // the per-call 16MB staging vector is function-local, and unordered_map
+  // element pointers survive rehash, so entry pointers handed out earlier
+  // stay valid under concurrent inserts.
+  {
+    std::lock_guard<std::mutex> lock(v8c_cache_mtx());
+    auto &cache = v8c_weight_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+      // Validate the pointer-keyed hit: a freed/re-used host weight pointer
+      // (e.g. FSU) would otherwise silently return ANOTHER weight's device
+      // pack (wrong N/K backing bound to the GEMM). Rebuild on mismatch.
+      if (it->second.N == N && it->second.K == K)
+        return &it->second;
+      std::fprintf(stderr,
+                   "[v8c] weight-cache shape mismatch for key=%p: cached N=%u "
+                   "K=%u vs requested N=%u K=%u -- rebuilding\n",
+                   key, it->second.N, it->second.K, N, K);
+      cache.erase(it);
+    }
   }
   const uint8_t *nibbles = weight.getData<uint8_t>();
   if (!nibbles)
@@ -704,6 +717,29 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
                      "keeping buffer path for the GEMV\n",
                      N, K);
     }
+  }
+  // Re-take the map lock for insertion; DROP_PLAIN below stays inside it so
+  // only the WINNING insertion drops the plain pages (a losing duplicate
+  // builder may still be reading them).
+  std::lock_guard<std::mutex> lock(v8c_cache_mtx());
+  auto &cache = v8c_weight_cache();
+  {
+    auto it = cache.find(key);
+    if (it != cache.end() && it->second.N == N && it->second.K == K) {
+      // A concurrent caller built this weight while we were outside the
+      // lock (theoretical: the load-time prebuild fires once per weight).
+      // Keep the first entry; release our duplicate device objects (the
+      // weight backing frees itself via e.backing's unique_ptr).
+      if (e.scale_buf)
+        clReleaseMemObject(e.scale_buf);
+      if (e.row_sum_w_int4)
+        clReleaseMemObject(e.row_sum_w_int4);
+      if (e.weight_image)
+        clReleaseMemObject(e.weight_image);
+      return &it->second;
+    }
+    if (it != cache.end())
+      cache.erase(it); // a stale mismatched entry raced back in; replace it
   }
   auto inserted = cache.emplace(key, std::move(e));
 
