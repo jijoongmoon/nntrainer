@@ -81,6 +81,7 @@ LOCAL_SRC_FILES := \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/sentence_transformer.cpp \
+    ../models/model_registry.cpp \
     ../kv_cache_manager.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
     ../models/qwen2/qwen2_embedding.cpp \
