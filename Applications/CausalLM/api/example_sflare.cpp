@@ -45,6 +45,11 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -77,9 +82,46 @@ bool ok(SFlareApi::ErrorCode ec, const char *what) {
   return true;
 }
 
+#if defined(_WIN32)
+/** The API takes UTF-8, but Windows hands main() its argv in the ANSI code
+ *  page (949/1252/...), so a non-ASCII literal prompt arrives mojibake and
+ *  the tokenizer sees garbage. Re-read the command line as UTF-16 and
+ *  convert to UTF-8. (A @file prompt is unaffected -- the file is read as
+ *  bytes.) Console OUTPUT likewise needs a UTF-8 code page. */
+std::vector<std::string> utf8_args() {
+  SetConsoleOutputCP(CP_UTF8);
+  std::vector<std::string> out;
+  int n = 0;
+  LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &n);
+  if (wargv == nullptr)
+    return out;
+  for (int i = 0; i < n; ++i) {
+    const int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0,
+                                        nullptr, nullptr);
+    std::string s(len > 0 ? len - 1 : 0, '\0');
+    if (len > 1)
+      WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, &s[0], len, nullptr,
+                          nullptr);
+    out.push_back(std::move(s));
+  }
+  LocalFree(wargv);
+  return out;
+}
+#endif
+
 } // namespace
 
 int main(int argc, char *argv[]) {
+#if defined(_WIN32)
+  const std::vector<std::string> wargs = utf8_args();
+  std::vector<char *> argv_utf8;
+  if (!wargs.empty()) {
+    for (const auto &a : wargs)
+      argv_utf8.push_back(const_cast<char *>(a.c_str()));
+    argc = static_cast<int>(argv_utf8.size());
+    argv = argv_utf8.data();
+  }
+#endif
   // Token deltas must reach the console in real time even when stdout is a
   // pipe (bat/ps1 launcher chains) -- unbuffer it up front.
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -147,6 +189,16 @@ int main(int argc, char *argv[]) {
   //    beforehand wins over the bundle.
   if (!ok(ctx->loadSFlareLLMModel(backend_of(backend)), "loadSFlareLLMModel"))
     return 1;
+
+  // Debug aid: what bytes actually reached us (UTF-8 expected on every
+  // platform -- see utf8_args()).
+  if (std::getenv("SFLARE_EXAMPLE_DEBUG")) {
+    std::fprintf(stderr, "[example] prompt %zu bytes:", prompt.size());
+    for (size_t i = 0; i < prompt.size() && i < 24; ++i)
+      std::fprintf(stderr, " %02x",
+                   static_cast<unsigned char>(prompt[i]));
+    std::fprintf(stderr, "\n");
+  }
 
   // 3) Streaming generation. GenParams rides both execute overloads;
   //    apply_chat_template=false would feed the prompt raw.
