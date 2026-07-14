@@ -749,11 +749,16 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
         rc = ::madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED);
 #endif
       }
-      std::fprintf(stderr,
-                   "[v8c] DROP_PLAIN N=%u K=%u bytes=%zu (aligned %zu) rc=%ld "
-                   "errno=%d\n",
-                   N, K, payload, (size_t)(hi > lo ? hi - lo : 0), rc,
-                   rc == 0 ? 0 : errno);
+      // Per-weight success spam is diagnostics, not production output (an
+      // SDK run printed 423 of these): success only under NNTR_MEM_TRACE,
+      // failures always.
+      static const bool drop_trace = std::getenv("NNTR_MEM_TRACE") != nullptr;
+      if (rc != 0 || drop_trace)
+        std::fprintf(stderr,
+                     "[v8c] DROP_PLAIN N=%u K=%u bytes=%zu (aligned %zu) "
+                     "rc=%ld errno=%d\n",
+                     N, K, payload, (size_t)(hi > lo ? hi - lo : 0), rc,
+                     rc == 0 ? 0 : errno);
     }
   }
 #endif

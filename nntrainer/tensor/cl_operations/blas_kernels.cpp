@@ -2356,6 +2356,10 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     xmx_gate_logged = true;
     const bool gate =
       xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0;
+    // Quiet by default (SDK surface): always report the surprising case
+    // (XMX requested but gated OFF = silent perf loss), the rest only
+    // under NNTR_GPU_VERBOSE.
+    if ((xmx_fc && !gate) || std::getenv("NNTR_GPU_VERBOSE"))
     fprintf(stderr,
             "[XMX] xmx_fc=%d subgroups=%d buf_kernel=%d M=%u N=%u K=%u -> "
             "gate=%d%s\n",
@@ -2394,9 +2398,11 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     static bool xmx_reg_logged = false;
     if (!xmx_reg_logged) {
       xmx_reg_logged = true;
-      fprintf(stderr, "[XMX] gemm_xmx_i4 registerClKernel -> %s\n",
-              kx ? "OK (DPAS/XMX engaged)"
-                 : "FAILED -> silent fallback to dp4a (slower)");
+      // FAILED always (silent perf loss otherwise); OK only when verbose.
+      if (!kx || std::getenv("NNTR_GPU_VERBOSE"))
+        fprintf(stderr, "[XMX] gemm_xmx_i4 registerClKernel -> %s\n",
+                kx ? "OK (DPAS/XMX engaged)"
+                   : "FAILED -> silent fallback to dp4a (slower)");
     }
     if (kx) {
       int Mi = (int)M, Ni = (int)N, Ki = (int)K, Wa = (int)(K / 16),

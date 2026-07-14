@@ -1467,8 +1467,14 @@ bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
         mbi.State == MEM_COMMIT) {
       const bool ok =
         VirtualFree((void *)lo, (SIZE_T)(hi - lo), MEM_DECOMMIT) != 0;
-      std::fprintf(stderr, "[cuda] QS4CX_DECOMMIT N=%u K=%u bytes=%zu ok=%d\n",
-                   N, K, (size_t)(hi - lo), (int)ok);
+      // Per-weight success spam is diagnostics, not production output (an
+      // SDK run printed 400+ of these): success only under NNTR_MEM_TRACE,
+      // failures always.
+      static const bool mem_trace = std::getenv("NNTR_MEM_TRACE") != nullptr;
+      if (!ok || mem_trace)
+        std::fprintf(stderr,
+                     "[cuda] QS4CX_DECOMMIT N=%u K=%u bytes=%zu ok=%d\n", N, K,
+                     (size_t)(hi - lo), (int)ok);
       if (ok)
         return true;
       // fall through to Discard on failure

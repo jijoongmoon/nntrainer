@@ -84,13 +84,14 @@ inline bool xe3_needs_sync() {
     const unsigned vendor = (unsigned)di->getDeviceVendorId();
     const bool fine_grain = (svm & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
     const bool decision = vendor == 0x8086u && !fine_grain; // Intel coarse-grain
-    // One-shot to stderr: this is exactly what flips Linux (fine_grain=0 -> drain
-    // ON) vs a driver that advertises fine-grain buffer SVM (-> drain OFF, which
-    // races if that advertisement is not honored for kernel->kernel SVM handoffs).
-    fprintf(stderr,
-            "[XE3_SYNC] vendor=0x%x svm_caps=0x%x fine_grain_buffer=%d -> "
-            "auto drain %s (override with NNTR_XE3_SYNC=1)\n",
-            vendor, (unsigned)svm, (int)fine_grain, decision ? "ON" : "OFF");
+    // Bring-up banner (what flips Linux fine_grain=0 -> drain ON vs a
+    // fine-grain driver): NNTR_GPU_VERBOSE only — it printed once per DLL
+    // module (7x on Windows) and an SDK surface must stay quiet by default.
+    if (std::getenv("NNTR_GPU_VERBOSE"))
+      fprintf(stderr,
+              "[XE3_SYNC] vendor=0x%x svm_caps=0x%x fine_grain_buffer=%d -> "
+              "auto drain %s (override with NNTR_XE3_SYNC=1)\n",
+              vendor, (unsigned)svm, (int)fine_grain, decision ? "ON" : "OFF");
     return decision;
   }();
   return sync;
