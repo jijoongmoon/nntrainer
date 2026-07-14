@@ -80,6 +80,10 @@ bool ok(SFlareApi::ErrorCode ec, const char *what) {
 } // namespace
 
 int main(int argc, char *argv[]) {
+  // Token deltas must reach the console in real time even when stdout is a
+  // pipe (bat/ps1 launcher chains) -- unbuffer it up front.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: %s <model_dir> [cpu|gpu|intel|adreno|cuda] "
@@ -165,7 +169,9 @@ int main(int argc, char *argv[]) {
   }
 
   // 5) Optional: pause -> save the KV cache -> resume from file with new
-  //    text appended. The resumed run continues the saved context.
+  //    text appended. loadKVcache() arms the saved cache for the NEXT
+  //    execute call, so the resume can use the STREAMING overload too --
+  //    tokens appear live, same as the first generation.
   if (kv_demo) {
     std::printf("--- kv save / resume ---\n");
     unsigned int position = 0;
@@ -176,12 +182,14 @@ int main(int argc, char *argv[]) {
       return 1;
     std::printf("saved kv at token position %u\n", position);
 
-    char output[8192];
-    if (!ok(ctx->executeSFlareLLM(" Tell me more.", output, sizeof(output),
-                                  position, kv_path, &params),
-            "executeSFlareLLM(resume)"))
+    if (!ok(ctx->loadKVcache(kv_path, position), "loadKVcache"))
       return 1;
-    std::printf("resume output: %s\n", output);
+    std::printf("resume (streaming): ");
+    if (!ok(ctx->executeSFlareLLM(" Tell me more.", on_delta, nullptr,
+                                  &params),
+            "executeSFlareLLM(resume,streaming)"))
+      return 1;
+    std::printf("\n");
   }
 
   if (!ok(SFlareApi::DestroySFlareContext(ctx), "DestroySFlareContext"))
