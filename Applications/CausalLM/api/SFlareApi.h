@@ -144,6 +144,12 @@ struct SFlareConfig {
   unsigned int init_seq_len = 0; /**< >0 overrides init_seq_len (planned
                                       prefill activation size); clamped to
                                       the effective max_seq_len */
+  bool deterministic = false; /**< reproducible outputs: same input + same
+                                   settings => same tokens, run to run
+                                   (greedy assumed). Pins the vendor-opaque
+                                   reduction and async-overlap levers
+                                   (NNTR_DETERMINISTIC=1); may cost prefill
+                                   throughput on Intel. */
 };
 
 /**

@@ -79,6 +79,13 @@ bool ClSVMAllocator::consume_host_owned(void *ptr) {
 void ClSVMAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   void *svm = ctx_.createSVMRegion(size);
   if (svm != nullptr) {
+    // Honor MemAllocator's documented calloc semantics on the SVM path too
+    // (the host path memsets; this one silently didn't). clSVMAlloc gives NO
+    // zero guarantee: Linux NEO happens to hand kernel-zeroed pages, but a
+    // WDDM driver may recycle non-zero pool pages — any consumer relying on
+    // the zero contract then reads per-process garbage, the round-15
+    // run-to-run divergence class. One-time cost at allocation.
+    std::memset(svm, 0, size);
     *ptr = svm;
     return;
   }

@@ -584,6 +584,20 @@ static bool v8c_ensure_buf(cl_context ctx, cl_mem *buf, size_t *cap,
     *cap = 0;
     return false;
   }
+  // clCreateBuffer content is UNDEFINED until first write. Padded rows
+  // ([M, M_pad) under quant-direct) and partial first uses read these bytes
+  // before any producer writes them: Linux NEO hands zeroed pages (masking
+  // this), WDDM may recycle garbage that differs per process — the round-15
+  // knife-edge divergence class. Zero once per (re)allocation; the in-order
+  // queue sequences the fill ahead of every later consumer. Cost: create-time
+  // only (scratch buffers are grow-only).
+  {
+    auto *cc =
+      static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+    const cl_uchar zero = 0;
+    clEnqueueFillBuffer(cc->command_queue_inst_.GetCommandQueue(), *buf, &zero,
+                        sizeof(zero), 0, bytes, 0, nullptr, nullptr);
+  }
   *cap = bytes;
   return true;
 }

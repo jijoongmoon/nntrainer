@@ -219,6 +219,7 @@ public:
     mem_profile_ = config.memory_profile;
     max_seq_override_ = config.max_seq_len;
     init_seq_override_ = config.init_seq_len;
+    deterministic_ = config.deterministic;
     options_set_ = true;
     return ErrorCode::SFLARE_SUCCESS;
   }
@@ -252,6 +253,11 @@ public:
         // Must precede the first Engine::Global()/initialize() in the
         // process: the engine string is latched on first read.
         sflare_setenv("NNTR_ENGINE", engine.c_str(), /*overwrite=*/1);
+        // Must precede the engine bundles and the first Engine::Global():
+        // the deterministic contract pins levers those would otherwise
+        // auto-set (CUDA ASYNC) or default on (Intel FLASH_SG).
+        if (deterministic_)
+          sflare_setenv("NNTR_DETERMINISTIC", "1", /*overwrite=*/0);
         applyEnvBundles(compute, engine);
         s_process_engine = engine;
       } else if (s_process_engine != engine) {
@@ -616,6 +622,7 @@ private:
   std::string model_path_;
   std::string tokenizer_override_;
   MemoryProfile mem_profile_ = MemoryProfile::MINIMAL;
+  bool deterministic_ = false;         /**< SFlareConfig.deterministic */
   unsigned int max_seq_override_ = 0;  /**< SFlareConfig.max_seq_len */
   unsigned int init_seq_override_ = 0; /**< SFlareConfig.init_seq_len */
 

@@ -391,6 +391,12 @@ CausalLM::incrementalInference(unsigned int batch_size,
           cudaMemcpy(out_host.data(), out_src, buf_size * sizeof(_FP16),
                      cudaMemcpyDeviceToHost);
           out_src = out_host.data();
+        } else {
+          // UVM/managed pointer: host-coherent for ADDRESSING, but under
+          // NNTR_CUDA_ASYNC the producing kernel may still be in flight —
+          // reading now is a torn-read (round-15 determinism audit, the fp32
+          // branch already drains). No-op in sync mode.
+          nntrainer::cuda::StreamManager::Global().finishIfAsync();
         }
         cudaGetLastError();
       }

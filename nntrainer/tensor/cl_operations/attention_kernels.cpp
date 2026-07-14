@@ -3027,6 +3027,14 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
     const char *e = std::getenv("NNTR_FLASH_SG");
     if (e)
       return std::atoi(e) != 0 ? 1 : 0;
+    // NNTR_DETERMINISTIC: sub_group_reduce_add's internal order is the one
+    // vendor-opaque reduction on this path (every other reduce is an explicit
+    // fixed LDS tree). Prefer the tree under the determinism contract unless
+    // the user explicitly asked for SG. Cost: the +85% M=1024 attention lever
+    // is lost (494 vs 136 ms) — prefill-only.
+    const char *det = std::getenv("NNTR_DETERMINISTIC");
+    if (det && det[0] == '1')
+      return 0;
     return v8c_use_buffer_path() ? 1 : 0; // [T8] Intel buffer ⇒ 1
   }();
   // FLASH_COOP_LWS: WG size for the coop variant (work-items cooperating

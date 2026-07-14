@@ -97,7 +97,13 @@ void CudaContext::initialize() noexcept {
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
       setenv("NNTR_CUDA_M2B", "1", 0);
-      setenv("NNTR_CUDA_ASYNC", "1", 0);
+      // NNTR_DETERMINISTIC keeps the per-op drains: ASYNC removes them and
+      // is the one auto-set lever whose host/device overlap can turn a
+      // knife-edge logit into a run-to-run coin flip (round-15 audit).
+      {
+        const char *det = getenv("NNTR_DETERMINISTIC");
+        setenv("NNTR_CUDA_ASYNC", (det && det[0] == '1') ? "0" : "1", 0);
+      }
     }
 
     add_default_object();
