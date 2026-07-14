@@ -1,4 +1,4 @@
-# nntrainer standalone app build: a self-contained meson project that
+# nntrainer app build: a self-contained meson project that
 # builds the CausalLM app (libcausallm.so + libquick_dot_ai_api.so +
 # quick_dot_ai_test) by linking a PREBUILT nntrainer engine via
 # cxx.find_library() - exactly how QuickAI's root meson project works today,
@@ -51,12 +51,12 @@ if enable_qnn and not is_android
 endif
 
 # ── Path configuration ───────────────────────────────────────────────────
-# standalone/ lives at Applications/CausalLM/standalone; sources are one
+# app_build/ lives at Applications/CausalLM/app_build; sources are one
 # level up (Applications/CausalLM), the nntrainer submodule root is three
-# levels up (standalone -> CausalLM -> Applications -> nntrainer).
-standalone_root = meson.current_source_dir()
-causallm_root   = standalone_root / '..'
-nntrainer_root  = standalone_root / '..' / '..' / '..'
+# levels up (app_build -> CausalLM -> Applications -> nntrainer).
+app_build_root = meson.current_source_dir()
+causallm_root   = app_build_root / '..'
+nntrainer_root  = app_build_root / '..' / '..' / '..'
 
 # ── Find pre-built nntrainer libraries ──────────────────────────────────
 if is_android
@@ -392,3 +392,16 @@ if get_option('enable-api-test')
       install: false,
   )
 endif
+
+# ── nntr_causallm: simple path-based CLI (main.cpp) ──────────────────────
+# Unlike quick_dot_ai_test (which takes a catalog model *name* via the C API),
+# this links libcausallm directly and takes a filesystem <model_path> [prompt],
+# loading config.json / nntr_config.json from that directory (mirrors the
+# in-tree Applications/CausalLM/meson.build target). Public CPU models only —
+# the architectures main.cpp registers; gauss/QNN models are not registered here.
+executable('nntr_causallm',
+    causallm_root / 'main.cpp',
+    dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
+    cpp_args: causallm_inc_args,
+    install: false,
+)

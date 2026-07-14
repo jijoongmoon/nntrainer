@@ -1,237 +1,359 @@
 #!/bin/bash
-
-# Build script for CausalLM Android application
-# This script builds libcausallm_core.so and nntrainer_causallm executable
+# nntrainer-native Android orchestration script.
+#
+# Builds + installs the CausalLM Android APP end-to-end using ONLY the
+# nntrainer submodule -- no QuickAI root meson project, no QUICKAI_ROOT.
+# It drives the standalone meson project (Applications/CausalLM/
+# app_build/meson.build) instead of QuickAI's root meson.build, and stages
+# a public-only set of libraries into the QuickDotAI AAR's prebuilt_libs/
+# (no libquick_dot_ai.so -- the standalone project never builds the
+# proprietary overlay plugin, so the result contains public models only,
+# by construction).
+#
+# Usage:
+#   ./build_android.sh                      # engine + app build + stage + install
+#   ./build_android.sh --skip-engine        # reuse existing builddir/android_build_result
+#   ./build_android.sh --skip-install       # build + stage prebuilt_libs/, but skip gradle
+#                                            # install (step 7) and the device CLI push (step
+#                                            # 8) -- lets a downstream overlay script (e.g. one
+#                                            # that stages an extra model plugin into
+#                                            # prebuilt_libs/ first) drive a single final install.
+#   ./build_android.sh --clean              # wipe the app builddir (builddir_app) first
+#   ./build_android.sh --nntr-threads=4     # override nntrainer compute thread count (default 7)
+#   ./build_android.sh -Denable-opencl=true # extra -D / --arm-arch=<v> options go to the engine build
+#
+# Environment:
+#   ANDROID_NDK / NDK_ROOT  - required (either name accepted)
+#   QNN_SDK_ROOT            - optional; enables staging the QNN vendor runtime libs
+#   ANDROID_SERIAL          - optional; select a specific adb/gradle target device
 set -e
 
-# Parse options
-USE_BUILD_CACHE=0
+# ── Parse arguments ─────────────────────────────────────────────────────
+CLEAN=false
+SKIP_ENGINE=false
+SKIP_INSTALL=false
+NNTR_THREADS="${NNTR_THREADS:-7}"
+# -D<option>=<value> and --arm-arch=<version> are forwarded to
+# tools/package_android.sh (and from there to meson) for the engine build, so
+# e.g. -Denable-opencl=true produces a GPU-enabled engine.
 MESON_ARGS=()
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --cache)
-            USE_BUILD_CACHE=1
-            shift
-            ;;
-        -D*|--arm-arch=*)
-            # Forwarded verbatim to tools/package_android.sh, which already
-            # filters these out of its own argv and hands them to meson. Without
-            # this, enable-opencl keeps its false default and the only android
-            # binaries this script can produce are CPU-only.
-            MESON_ARGS+=("$1")
-            shift
-            ;;
-        --arm-arch)
-            # The space-separated spelling reaches here rather than the case
-            # above. tools/package_android.sh only matches --arm-arch=<version>,
-            # so say which spelling to use instead of reporting the option as
-            # unknown -- it is the option name that is right and the separator
-            # that is wrong.
-            echo "Error: use --arm-arch=<version>, not --arm-arch <version>"
-            echo "  tools/package_android.sh, which this forwards to, parses"
-            echo "  only the '=' form."
-            exit 1
-            ;;
+
+for arg in "$@"; do
+    case "$arg" in
+        --clean)          CLEAN=true ;;
+        --skip-engine)     SKIP_ENGINE=true ;;
+        --skip-install)    SKIP_INSTALL=true ;;
+        --nntr-threads=*) NNTR_THREADS="${arg#*=}" ;;
+        -D*|--arm-arch=*) MESON_ARGS+=("$arg") ;;
+        --help|-h)
+            sed -n '2,/^set -e$/p' "$0" | grep '^#' | sed 's/^# \?//'
+            exit 0 ;;
         *)
-            echo "Unknown option: $1"
-            echo "Usage: $0 [--cache] [-Doption=value ...] [--arm-arch=<version>]"
-            echo "  --cache        Reuse existing nntrainer builddir if available"
-            echo "  -D*            Passed through to meson via tools/package_android.sh"
-            echo "  --arm-arch=*   Passed through to tools/package_android.sh."
-            echo "                 The '=' form only: the space-separated"
-            echo "                 spelling is not accepted downstream."
-            echo "Example: $0 -Denable-opencl=true"
-            exit 1
-            ;;
+            echo "Warning: Unknown option: $arg" ;;
     esac
 done
 
-
-# Color codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-log_header() {
-    echo -e "\n${CYAN}========================================${NC}"
-    echo -e "${CYAN} $1 ${NC}"
-    echo -e "${CYAN}========================================${NC}"
-}
-
-log_step() {
-    echo -e "\n${YELLOW}[Step $1]${NC} $2"
-    echo -e "${YELLOW}----------------------------------------${NC}"
-}
-
-# Function to check and fix artifact location
-check_artifact() {
-    local filename=$1
-    local libs_path="libs/arm64-v8a/$filename"
-    local obj_path="obj/local/arm64-v8a/$filename"
-
-    if [ -f "$libs_path" ]; then
-        size=$(ls -lh "$libs_path" | awk '{print $5}')
-        echo -e "  ${GREEN}[OK]${NC} $filename ($size)"
-        return 0
-    elif [ -f "$obj_path" ]; then
-        echo -e "  ${YELLOW}[WARN]${NC} $filename found in obj but not in libs. Copying..."
-        mkdir -p "libs/arm64-v8a"
-        cp "$obj_path" "$libs_path"
-        if [ -x "$obj_path" ]; then
-            chmod +x "$libs_path"
-        fi
-        size=$(ls -lh "$libs_path" | awk '{print $5}')
-        echo -e "  ${GREEN}[OK]${NC} $filename ($size) (Copied from obj)"
-        return 0
-    else
-        echo -e "  ${RED}[ERROR]${NC} $filename not found!"
-        log_info "  Checked paths:"
-        log_info "    - $libs_path"
-        log_info "    - $obj_path"
-        return 1
-    fi
-}
-
-# Check if NDK path is set
-if [ -z "$ANDROID_NDK" ]; then
-    log_error "ANDROID_NDK is not set. Please set it to your Android NDK path."
-    log_info "Example: export ANDROID_NDK=/path/to/android-ndk-r21d"
-    exit 1
-fi
-
-# Set NNTRAINER_ROOT
+# ── Path configuration (self-contained inside the nntrainer submodule) ──
+# This script lives at Applications/CausalLM/build_android.sh:
+#   SCRIPT_DIR      = .../nntrainer/Applications/CausalLM
+#   CAUSALLM_ROOT   = .../nntrainer/Applications/CausalLM        (SCRIPT_DIR)
+#   NNTRAINER_ROOT  = .../nntrainer                              (SCRIPT_DIR/../..)
+# There is intentionally NO QUICKAI_ROOT anywhere in this script.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CAUSALLM_ROOT="$SCRIPT_DIR"
 NNTRAINER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-export NNTRAINER_ROOT
+XGRAMMAR_ROOT="$CAUSALLM_ROOT/xgrammar"
 
-log_header "Build CausalLM Android Application"
-log_info "NNTRAINER_ROOT: $NNTRAINER_ROOT"
-log_info "Build cache: $([ "$USE_BUILD_CACHE" -eq 1 ] && echo 'enabled' || echo 'disabled (default)')"
-log_info "ANDROID_NDK: $ANDROID_NDK"
-log_info "Working directory: $(pwd)"
-log_info "meson args: ${MESON_ARGS[*]:-(none)}"
+# The app build gets a NEW build directory, separate from nntrainer/build,
+# nntrainer/builddir (android engine) and nntrainer/builddir_x86 -- none of
+# those are touched by this script.
+APP_BUILD="$NNTRAINER_ROOT/builddir_app"
 
-if [ "$USE_BUILD_CACHE" -eq 1 ] && [ ${#MESON_ARGS[@]} -gt 0 ]; then
-    log_warning "--cache skips the nntrainer reconfigure, so the cached builddir"
-    log_warning "options win and ${MESON_ARGS[*]} will have no effect."
+# Accept either ANDROID_NDK or NDK_ROOT.
+if [ -z "$ANDROID_NDK" ] && [ -n "$NDK_ROOT" ]; then
+    ANDROID_NDK="$NDK_ROOT"
 fi
-
-# Step 1: Build nntrainer for Android if not already built
-log_step "1/4" "Build nntrainer for Android"
-
-if [ "$USE_BUILD_CACHE" -eq 1 ] && [ -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
-    log_info "Build cache enabled: reusing existing nntrainer builddir (skipping)"
-else
-    log_info "Building nntrainer for Android..."
-    cd "$NNTRAINER_ROOT"
-    if [ -d "$NNTRAINER_ROOT/builddir" ]; then
-        log_info "Removing existing builddir..."
-        rm -rf builddir
-    fi
-    ./tools/package_android.sh "${MESON_ARGS[@]}"
-fi
-
-# Check if build was successful
-if [ ! -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
-    log_error "nntrainer build failed. Please check the build logs."
+if [ -z "$ANDROID_NDK" ]; then
+    echo "Error: ANDROID_NDK (or NDK_ROOT) is not set."
+    echo "Example: export ANDROID_NDK=/path/to/android-ndk-r28c"
     exit 1
 fi
-log_success "nntrainer ready"
 
-# Step 2: Build tokenizer library if not present
-log_step "2/4" "Build Tokenizer Library"
+echo "=== nntrainer Android app build (public-only) ==="
+echo "NNTRAINER_ROOT: $NNTRAINER_ROOT"
+echo "CAUSALLM_ROOT:  $CAUSALLM_ROOT"
+echo "APP_BUILD:      $APP_BUILD"
+echo "ANDROID_NDK:    $ANDROID_NDK"
+echo "NNTR_THREADS:   $NNTR_THREADS"
+echo "SKIP_ENGINE:    $SKIP_ENGINE"
+echo "SKIP_INSTALL:   $SKIP_INSTALL"
+echo "CLEAN:          $CLEAN"
+echo ""
 
-cd "$SCRIPT_DIR"
-if [ ! -f "lib/libtokenizers_android_c.a" ]; then
-    log_warning "libtokenizers_android_c.a not found in lib directory."
-    log_info "Attempting to build tokenizer library..."
-    if [ -f "build_tokenizer_android.sh" ]; then
-        ./build_tokenizer_android.sh
+# ── Step 0: Submodule init guard ────────────────────────────────────────
+# xgrammar lives inside the nntrainer submodule at
+# Applications/CausalLM/xgrammar. A missing checkout makes the standalone
+# meson configure fail with "File .../xgrammar/cpp/compiled_grammar.cc does
+# not exist." Only the dlpack nested submodule is required by the build
+# (cpptrace is compiled out; googletest is test-only).
+if [ ! -f "$XGRAMMAR_ROOT/cpp/compiled_grammar.cc" ]; then
+    echo "[0] Initializing xgrammar submodule..."
+    git -C "$NNTRAINER_ROOT" submodule update --init Applications/CausalLM/xgrammar
+fi
+
+if [ ! -d "$XGRAMMAR_ROOT/3rdparty/dlpack/include" ]; then
+    echo "[0] Initializing xgrammar nested submodule (dlpack)..."
+    git -C "$XGRAMMAR_ROOT" submodule update --init 3rdparty/dlpack
+fi
+
+# nntrainer's own nested submodule (iniparser), required by the engine
+# build (tools/package_android.sh). Guarded the same way build.sh does it,
+# for a truly fresh checkout.
+if [ ! -f "$NNTRAINER_ROOT/subprojects/iniparser/src/iniparser.h" ]; then
+    echo "[0] Initializing nntrainer nested submodules (iniparser)..."
+    git -C "$NNTRAINER_ROOT" submodule update --init --recursive --depth 1
+fi
+
+# ── Step 1: json.hpp guard ───────────────────────────────────────────────
+if [ ! -f "$CAUSALLM_ROOT/json.hpp" ]; then
+    echo "[1] Preparing json.hpp..."
+    "$NNTRAINER_ROOT/jni/prepare_encoder.sh" "$NNTRAINER_ROOT/builddir" "0.2" || true
+
+    if [ ! -f "$CAUSALLM_ROOT/json.hpp" ]; then
+        for candidate in "$NNTRAINER_ROOT/builddir_x86/json.hpp" "$NNTRAINER_ROOT/builddir/json.hpp"; do
+            if [ -f "$candidate" ]; then
+                cp "$candidate" "$CAUSALLM_ROOT/"
+                break
+            fi
+        done
+    fi
+
+    if [ ! -f "$CAUSALLM_ROOT/json.hpp" ]; then
+        echo "Error: Failed to prepare json.hpp"
+        exit 1
+    fi
+else
+    echo "[1] json.hpp already present, skipping."
+fi
+
+# ── Step 2: Tokenizer check ──────────────────────────────────────────────
+TOKENIZER="$CAUSALLM_ROOT/lib/libtokenizers_android_c.a"
+if [ ! -f "$TOKENIZER" ]; then
+    echo "Error: Tokenizer library missing. Place it at: $TOKENIZER"
+    exit 1
+fi
+echo "[2] Tokenizer library present: $TOKENIZER"
+
+# ── Step 3: Engine build (nntrainer core + libqnn_context.so) ───────────
+NNTRAINER_ANDROID_LIB="$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so"
+
+if [ "$SKIP_ENGINE" = true ]; then
+    if [ ! -f "$NNTRAINER_ANDROID_LIB" ]; then
+        echo "Error: --skip-engine given but no existing engine build found at:"
+        echo "  $NNTRAINER_ANDROID_LIB"
+        echo "Run without --skip-engine at least once."
+        exit 1
+    fi
+    echo "[3] --skip-engine: reusing existing engine build ($NNTRAINER_ANDROID_LIB)"
+else
+    echo "[3] Building nntrainer engine for Android (mmap-read=false, nntr-num-threads=$NNTR_THREADS, enable-npu=true)..."
+    (
+        cd "$NNTRAINER_ROOT"
+        ./tools/package_android.sh -Dmmap-read=false -Dnntr-num-threads="$NNTR_THREADS" -Denable-npu=true "${MESON_ARGS[@]}"
+    )
+    if [ ! -f "$NNTRAINER_ANDROID_LIB" ]; then
+        echo "Error: engine build did not produce $NNTRAINER_ANDROID_LIB"
+        exit 1
+    fi
+fi
+
+# ── Step 4: Generate the android cross file ─────────────────────────────
+CROSS_FILE_IN="$CAUSALLM_ROOT/app_build/android-aarch64.cross.in"
+CROSS_FILE="$APP_BUILD/android-aarch64.cross"
+mkdir -p "$APP_BUILD"
+sed "s|@ANDROID_NDK@|$ANDROID_NDK|g" "$CROSS_FILE_IN" > "$CROSS_FILE"
+echo "[4] Generated cross file: $CROSS_FILE"
+
+# ── Step 5: App meson build (standalone project, public-only) ───────────
+MESON_APP_OPTS=(
+    -Dplatform=android
+    -Denable-qnn=true
+    -Denable-api=true
+    -Denable-api-test=true
+)
+
+echo "[5] Configuring app meson build..."
+if [ "$CLEAN" = true ] || [ ! -f "$APP_BUILD/build.ninja" ]; then
+    if [ "$CLEAN" = true ]; then
+        echo "    --clean: wiping $APP_BUILD"
+        rm -rf "$APP_BUILD"
+        mkdir -p "$APP_BUILD"
+        sed "s|@ANDROID_NDK@|$ANDROID_NDK|g" "$CROSS_FILE_IN" > "$CROSS_FILE"
+    fi
+    meson setup "$APP_BUILD" "$CAUSALLM_ROOT/app_build" --cross-file "$CROSS_FILE" "${MESON_APP_OPTS[@]}"
+else
+    meson setup "$APP_BUILD" "$CAUSALLM_ROOT/app_build" --reconfigure --cross-file "$CROSS_FILE" "${MESON_APP_OPTS[@]}" || true
+fi
+
+echo "[5] Building app (libcausallm.so, libquick_dot_ai_api.so, quick_dot_ai_test)..."
+ninja -C "$APP_BUILD" -j "$(nproc)"
+
+for f in libcausallm.so libquick_dot_ai_api.so quick_dot_ai_test nntr_causallm; do
+    if [ ! -f "$APP_BUILD/$f" ]; then
+        echo "Error: expected app build artifact missing: $APP_BUILD/$f"
+        exit 1
+    fi
+done
+echo "[5] App build artifacts present in: $APP_BUILD"
+
+# ── Step 6: Stage into the AAR prebuilt_libs/ (public-only) ─────────────
+NNTRAINER_ANDROID_LIBDIR="$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a"
+PREBUILT_DIR="$CAUSALLM_ROOT/Android/QuickDotAI/prebuilt_libs"
+
+echo "[6] Staging public-only libraries into $PREBUILT_DIR ..."
+mkdir -p "$PREBUILT_DIR"
+# Clear first so no stale libquick_dot_ai.so (or anything else) survives from
+# a previous QuickAI-driven build -- this project never builds the
+# proprietary overlay plugin, so a fresh directory contains public models
+# only, by construction.
+rm -f "$PREBUILT_DIR"/*.so
+
+# nntrainer engine libs
+for f in libnntrainer.so libccapi-nntrainer.so libqnn_context.so; do
+    if [ -f "$NNTRAINER_ANDROID_LIBDIR/$f" ]; then
+        cp "$NNTRAINER_ANDROID_LIBDIR/$f" "$PREBUILT_DIR/"
     else
-        log_error "tokenizer library not found and build script is missing."
-        log_info "Please build or download the tokenizer library for Android arm64-v8a"
-        log_info "and place it in: $SCRIPT_DIR/lib/libtokenizers_android_c.a"
-        exit 1
+        echo "Warning: engine lib not found, skipping: $NNTRAINER_ANDROID_LIBDIR/$f"
     fi
+done
+
+# app libs (public: causallm + api only -- no proprietary overlay plugin exists to copy)
+for f in libcausallm.so libquick_dot_ai_api.so; do
+    cp "$APP_BUILD/$f" "$PREBUILT_DIR/"
+done
+
+# QNN vendor runtime libs from the QNN SDK (mirrors apk_install_android.sh)
+if [ -n "$QNN_SDK_ROOT" ]; then
+    echo "    Copying QNN vendor libraries from QNN_SDK_ROOT ($QNN_SDK_ROOT)..."
+    QNN_AARCH64_LIB_DIR="$QNN_SDK_ROOT/lib/aarch64-android"
+    QNN_AARCH64_LIBS=(
+        libQnnHtp.so
+        libQnnHtpNetRunExtensions.so
+        libQnnHtpPrepare.so
+        libQnnHtpProfilingReader.so
+        libQnnHtpOptraceProfilingReader.so
+        libQnnSaver.so
+        libQnnSystem.so
+        libQnnHtpV75Stub.so
+        libQnnHtpV75CalculatorStub.so
+        libQnnHtpV79Stub.so
+        libQnnHtpV79CalculatorStub.so
+        libQnnHtpV81Stub.so
+        libQnnHtpV81CalculatorStub.so
+    )
+    for lib in "${QNN_AARCH64_LIBS[@]}"; do
+        if [ -f "$QNN_AARCH64_LIB_DIR/$lib" ]; then
+            cp "$QNN_AARCH64_LIB_DIR/$lib" "$PREBUILT_DIR/"
+        else
+            echo "Warning: QNN lib not found, skipping: $QNN_AARCH64_LIB_DIR/$lib"
+        fi
+    done
+
+    QNN_SKEL_LIBS=(
+        "hexagon-v75/unsigned/libQnnHtpV75Skel.so"
+        "hexagon-v79/unsigned/libQnnHtpV79Skel.so"
+        "hexagon-v81/unsigned/libQnnHtpV81Skel.so"
+    )
+    for rel in "${QNN_SKEL_LIBS[@]}"; do
+        if [ -f "$QNN_SDK_ROOT/lib/$rel" ]; then
+            cp "$QNN_SDK_ROOT/lib/$rel" "$PREBUILT_DIR/"
+        else
+            echo "Warning: QNN lib not found, skipping: $QNN_SDK_ROOT/lib/$rel"
+        fi
+    done
 else
-    log_info "Tokenizer library already built (skipping)"
+    echo "Warning: QNN_SDK_ROOT not set; QNN vendor libs (libQnnHtp*.so etc.) not staged."
 fi
-log_success "Tokenizer library ready"
 
-# Step 3: Prepare json.hpp if not present
-log_step "3/4" "Prepare json.hpp"
-
-if [ ! -f "$SCRIPT_DIR/json.hpp" ]; then
-    log_info "json.hpp not found. Downloading..."
-    # prepare_encoder.sh expects target directory as first argument and version as second
-    # It copies json.hpp to ../Applications/CausalLM/ if version is 0.2
-    "$NNTRAINER_ROOT/jni/prepare_encoder.sh" "$NNTRAINER_ROOT/builddir" "0.2"
-    
-    if [ ! -f "$SCRIPT_DIR/json.hpp" ]; then
-        log_error "Failed to download json.hpp"
-        exit 1
-    fi
+# libc++_shared.so from the NDK
+LIBCXX=$(find "$ANDROID_NDK" -name "libc++_shared.so" -path "*/aarch64*" 2>/dev/null | head -1)
+if [ -n "$LIBCXX" ]; then
+    cp "$LIBCXX" "$PREBUILT_DIR/"
 else
-    log_info "json.hpp already exists (skipping)"
+    echo "Warning: libc++_shared.so not found under $ANDROID_NDK"
 fi
-log_success "json.hpp ready"
 
-# Step 4: Build CausalLM (libcausallm_core.so and nntrainer_causallm)
-log_step "4/4" "Build CausalLM Core (library + executable)"
-
-cd "$SCRIPT_DIR/jni"
-
-# Clean previous builds
-rm -rf libs obj
-
-log_info "Building with ndk-build (builds causallm_core, nntrainer_causallm, nntr_quantize, nntr_safetensors_info)..."
-# We explicitly set paths to ensure outputs are predictable
-if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm  nntr_quantize nntr_safetensors_info -j $(nproc); then
-    log_success "Build completed successfully"
-else
-    log_error "Build failed"
+echo ""
+echo "[6] prebuilt_libs/ staged (public-only). Contents:"
+ls -la "$PREBUILT_DIR"
+if ls "$PREBUILT_DIR"/libquick_dot_ai.so >/dev/null 2>&1; then
+    echo "Error: libquick_dot_ai.so present in prebuilt_libs/ -- staging is NOT public-only!"
     exit 1
 fi
 
-# Verify outputs
-log_info "Build artifacts:"
+if [ "$SKIP_INSTALL" = true ]; then
+    echo ""
+    echo "[7,8] --skip-install: leaving gradle install + device CLI push to the caller."
+    echo ""
+    echo "=== Done (staged, not installed) ==="
+    echo "App build:     $APP_BUILD"
+    echo "prebuilt_libs: $PREBUILT_DIR (public-only)"
+    exit 0
+fi
 
-check_artifact "libcausallm_core.so" || exit 1
-check_artifact "nntrainer_causallm" || exit 1
-check_artifact "nntr_quantize" || exit 1
-check_artifact "nntr_safetensors_info" || exit 1
+# ── Step 7: gradle build + install ───────────────────────────────────────
+echo ""
+echo "[7] Building + installing APK (SampleTestAPP)..."
+(
+    cd "$CAUSALLM_ROOT/Android"
+    ./gradlew "clean"
+    ./gradlew ":SampleTestAPP:installDebug"
+)
 
-# Summary
-log_header "Build Summary"
-log_success "Build completed successfully!"
-log_info "Output files are in: $SCRIPT_DIR/jni/libs/arm64-v8a/"
-log_info "Executables:"
-log_info "  - nntrainer_causallm (main application), nntr_quantize, nntr_safetensors_info"
-log_info "Libraries:"
-log_info "  - libcausallm_core.so (CausalLM Core library)"
-log_info "  - libnntrainer.so (nntrainer library)"
-log_info "  - libccapi-nntrainer.so (nntrainer C/C API)"
-log_info "  - libc++_shared.so (C++ runtime)"
-log_info "To build API library, run:"
-log_info "  ./build_api_lib.sh"
-log_info "To install and run:"
-log_info "  ./install_android.sh"
+# ── Step 8: Stage the CLI on-device for CPU verification ────────────────
+DEVICE_DIR="/data/local/tmp/Quick.AI"
+echo ""
+echo "[8] Pushing CLI + fresh libraries to $DEVICE_DIR (device CPU verification)..."
+if command -v adb >/dev/null 2>&1 && adb devices | grep -q "device$"; then
+    adb shell "mkdir -p $DEVICE_DIR"
+    adb push "$APP_BUILD/quick_dot_ai_test"                 "$DEVICE_DIR/"
+    adb push "$APP_BUILD/nntr_causallm"                     "$DEVICE_DIR/"
+    adb push "$APP_BUILD/libcausallm.so"                    "$DEVICE_DIR/"
+    adb push "$APP_BUILD/libquick_dot_ai_api.so"             "$DEVICE_DIR/"
+    adb push "$NNTRAINER_ANDROID_LIBDIR/libnntrainer.so"     "$DEVICE_DIR/"
+    adb push "$NNTRAINER_ANDROID_LIBDIR/libccapi-nntrainer.so" "$DEVICE_DIR/"
+    [ -f "$NNTRAINER_ANDROID_LIBDIR/libqnn_context.so" ] && \
+        adb push "$NNTRAINER_ANDROID_LIBDIR/libqnn_context.so" "$DEVICE_DIR/"
+    [ -n "$LIBCXX" ] && adb push "$LIBCXX" "$DEVICE_DIR/"
+    adb shell "chmod 755 $DEVICE_DIR/quick_dot_ai_test"
+    # On-device convenience wrapper (ported from the retired install_android.sh):
+    # run_test.sh <model> [prompt] ... -> sets LD_LIBRARY_PATH + threads, runs the CLI.
+    adb shell "cat > $DEVICE_DIR/run_test.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$DEVICE_DIR:\$LD_LIBRARY_PATH
+cd $DEVICE_DIR
+export NNTR_NUM_THREADS=$NNTR_THREADS
+./quick_dot_ai_test \"\$@\"
+EOF"
+    adb shell "chmod 755 $DEVICE_DIR/run_test.sh"
+    adb shell "chmod 755 $DEVICE_DIR/nntr_causallm"
+    # Simple path-based CLI wrapper: run_causallm.sh <model_dir> [prompt]
+    adb shell "cat > $DEVICE_DIR/run_causallm.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$DEVICE_DIR:\$LD_LIBRARY_PATH
+cd $DEVICE_DIR
+export NNTR_NUM_THREADS=$NNTR_THREADS
+./nntr_causallm \"\$@\"
+EOF"
+    adb shell "chmod 755 $DEVICE_DIR/run_causallm.sh"
+    echo "    CLI staged. Example CPU run:"
+    echo "      adb shell \"cd $DEVICE_DIR && LD_LIBRARY_PATH=$DEVICE_DIR NNTR_NUM_THREADS=$NNTR_THREADS ./quick_dot_ai_test <model> [prompt]\""
+else
+    echo "    (skipped: no adb device connected)"
+fi
+
+echo ""
+echo "=== Done ==="
+echo "App build:     $APP_BUILD"
+echo "prebuilt_libs: $PREBUILT_DIR (public-only)"
+echo "Device CLI:    $DEVICE_DIR"
