@@ -316,8 +316,26 @@ if get_option('enable-cuda')
     cudadrv_dep = cxx.find_library('cuda', dirs: cuda_libdir / 'stubs', required: true)
   endif
 
+  # [W2 delay-load] On Windows the unified binary import-links cublas/nvrtc,
+  # which maps + faults ~245MB of CUDA DLL images into the working set of
+  # EVERY run — including pure OpenCL/XMX ones that never call CUDA
+  # (cublasLt64 alone measured 146MB resident on gauss4/Xe3, round-11
+  # fingerprint). /DELAYLOAD defers the LoadLibrary to the first actual
+  # call: engine=gpu runs never load them, engine=cuda is unchanged (the
+  # first cuBLAS/NVRTC call triggers the load). DLL names track the
+  # toolkit major (13.x); a stale name only costs a benign LNK4199.
+  if host_machine.system() == 'windows'
+    cuda_delayload_args = ['/DELAYLOAD:cublas64_13.dll',
+                           '/DELAYLOAD:cublasLt64_13.dll',
+                           '/DELAYLOAD:nvrtc64_130_0.dll',
+                           'delayimp.lib']
+  else
+    cuda_delayload_args = []
+  endif
+
   cuda_dep = declare_dependency(
     include_directories: cuda_incdir,
+    link_args: cuda_delayload_args,
     dependencies: [cudart_dep, nvrtc_dep, cublas_dep, cublaslt_dep, cudadrv_dep],
   )
   message('CUDA backend enabled. Toolkit: ' + cuda_path)
