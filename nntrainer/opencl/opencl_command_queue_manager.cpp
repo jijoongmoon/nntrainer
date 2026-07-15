@@ -19,6 +19,19 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstdio>
+
+// NNTR_CL_LOCKSTEP=1 (round-17 upper-bound discriminator): clFinish after
+// EVERY kernel enqueue — closes the sub-dispatch windows that per-op drains
+// (X4) and per-FC flush (B1b) leave open. If runs STILL diverge under this,
+// the submit/arg-rebind mechanism class is refuted outright. Diagnosis only
+// (brutal cost); not part of NNTR_DETERMINISTIC.
+static bool cl_lockstep_on() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_CL_LOCKSTEP");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -716,6 +729,9 @@ bool CommandQueueManager::DispatchCommand(
     events_to_wait.size(), events_to_wait.data(), evt_arg);
   if (active_recording_queue_ != nullptr && error_code == CL_SUCCESS)
     ++recq_dispatch_index_;
+  if (error_code == CL_SUCCESS && active_recording_queue_ == nullptr &&
+      cl_lockstep_on())
+    clFinish(command_queue_);
   static const bool rqt_on2 = std::getenv("NNTR_RECQ_TRACE") != nullptr;
   if (rqt_on2) {
     char nm[96] = {0};
@@ -799,6 +815,9 @@ bool CommandQueueManager::DispatchCommand(
     events_to_wait.size(), events_to_wait.data(), evt_arg);
   if (active_recording_queue_ != nullptr && error_code == CL_SUCCESS)
     ++recq_dispatch_index_;
+  if (error_code == CL_SUCCESS && active_recording_queue_ == nullptr &&
+      cl_lockstep_on())
+    clFinish(command_queue_);
   static const bool rqt_on2 = std::getenv("NNTR_RECQ_TRACE") != nullptr;
   if (rqt_on2) {
     char nm[96] = {0};
@@ -871,6 +890,9 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
     local_work_size, num_events_in_wait_list, event_wait_list, evt_arg);
   if (active_recording_queue_ != nullptr && error_code == CL_SUCCESS)
     ++recq_dispatch_index_;
+  if (error_code == CL_SUCCESS && active_recording_queue_ == nullptr &&
+      cl_lockstep_on())
+    clFinish(command_queue_);
 
   static const bool rqt_on = std::getenv("NNTR_RECQ_TRACE") != nullptr;
   if (rqt_on) {

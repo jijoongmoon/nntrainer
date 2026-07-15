@@ -454,6 +454,50 @@ ClContext::registerClKernel(const std::string &kernel_string,
   // which measured ~12ms per call on Adreno/Android (~36ms host issue tax per
   // layer in the attention path alone; the GPU sat idle exactly that long).
   const std::string key = kernel_name + compile_options;
+
+  // [round-17 ring-rotation] Under NNTR_DETERMINISTIC=1 (or an explicit
+  // NNTR_CL_KERNEL_RING=K), hand out K rotating CLONES of each kernel
+  // instead of one process-global singleton. Every dispatcher re-binds args
+  // on the object this returns; with a singleton that re-bind can hit an
+  // object whose previous enqueue the driver has not locked in yet — a
+  // measured token-altering hazard on this stack (see the v8c_probe_copy
+  // precedent in blas_kernel_interface.cpp) and round-17's Windows verdict
+  // ("submission/kernel level", per-FC flush only reduces frequency).
+  // Rotation guarantees the re-bound object is the one enqueued K calls
+  // ago. Cost: K-1 extra clCreateKernel per kernel (program cache makes the
+  // clones cheap), zero per-call overhead. Call sites that cache the
+  // returned pointer statically keep singleton behavior (documented gap).
+  {
+    static const int ring_k = []() {
+      const char *r = std::getenv("NNTR_CL_KERNEL_RING");
+      if (r)
+        return std::max(1, std::atoi(r));
+      const char *d = std::getenv("NNTR_DETERMINISTIC");
+      return (d && d[0] == '1') ? 8 : 1;
+    }();
+    if (ring_k > 1) {
+      static std::unordered_map<std::string,
+                                std::pair<std::vector<SharedPtrClKernel>,
+                                          size_t>>
+        ring_map;
+      auto &slot = ring_map[key];
+      auto &clones = slot.first;
+      if ((int)clones.size() < ring_k) {
+        std::string ks = kernel_string, kn = kernel_name,
+                    co = compile_options;
+        SharedPtrClKernel kp = std::make_shared<opencl::Kernel>();
+        if (clCreateKernel(ks, kn, co, kp)) {
+          clones.push_back(kp);
+          return clones.back();
+        }
+        // clone creation failed: fall through to the singleton path below
+      } else {
+        slot.second = (slot.second + 1) % clones.size();
+        return clones[slot.second];
+      }
+    }
+  }
+
   auto it = ocl_kernel_map.find(key);
   if (it != ocl_kernel_map.end())
     return it->second;
