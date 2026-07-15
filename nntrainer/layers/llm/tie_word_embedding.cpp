@@ -305,7 +305,8 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     static _FP16 *emb_stage = nullptr;
     static size_t emb_stage_cap = 0; // capacity in _FP16 elements
     bool emb_dev_only = false;
-    if (hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+    if (nntrainer::cuda::engine_selected() &&
+        hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
       cudaPointerAttributes pa{};
       emb_dev_only =
         cudaPointerGetAttributes(&pa, batchsliced_hidden.getData<_FP16>()) ==

@@ -226,7 +226,7 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     // (rms_norm_wrt_width_fp32_intrinsic); sync first in async mode (no-op in
     // default sync mode). Placed before the dtype-read entry, off the SVM
     // GPU->GPU and cl_queue_finish-guarded paths.
-    nntrainer::cuda::StreamManager::Global().finishIfAsync();
+    nntrainer::cuda::drain_if_async();
     if (!gpu_done &&
         in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       static const bool gpu = nntr_env_on("NNTR_CUDA_QKNORM");

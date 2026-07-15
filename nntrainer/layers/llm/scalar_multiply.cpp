@@ -176,7 +176,7 @@ void ScalarMultiplyLayer::incremental_forwarding(
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       // Host multiply() reads the GPU-produced UVM input on the CPU; sync first
       // in async mode (no-op in default sync mode).
-      nntrainer::cuda::StreamManager::Global().finishIfAsync();
+      nntrainer::cuda::drain_if_async();
 #endif
       in_step.multiply(multiplier, out_step);
     }

@@ -374,26 +374,29 @@ CausalLM::incrementalInference(unsigned int batch_size,
 #ifdef ENABLE_FP16
       const _FP16 *out_src = out_t.getData<_FP16>();
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-      // NNTR_CUDA_ARGMAX: stash the device logits pointer (before the D2H copy)
-      // when device-accessible, for generate()'s on-GPU argmax. batch_size==1
-      // only (the argmax reduces a single [vocab] row).
-      if (cuda_argmax_enabled() && first_output && batch_size == 1) {
-        cudaPointerAttributes pa0{};
-        if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
-            (pa0.type == cudaMemoryTypeDevice ||
-             pa0.type == cudaMemoryTypeManaged)) {
-          g_cuda_logits_dev = out_src;
-          g_cuda_logits_fp16 = true;
-        }
-        cudaGetLastError();
-      }
-      // Device-only activation pool (NNTR_CUDA_DEV_ACT): the model output is
-      // real device memory, not host-addressable. Drain the backend stream and
-      // copy it D2H into a host buffer before the host fp16->fp32 convert (=the
-      // one sync-per-token boundary). For UVM the pointer is host-coherent so
-      // this is skipped.
+      // Per-token cudart touches (pointer probes + stream drains) are cuda-run
+      // only: on a non-cuda run of the unified binary the first cudart call
+      // boots the statically-linked runtime inside this (timed) path.
       std::vector<_FP16> out_host;
-      {
+      if (causallm_engine() == "cuda") {
+        // NNTR_CUDA_ARGMAX: stash the device logits pointer (before the D2H
+        // copy) when device-accessible, for generate()'s on-GPU argmax.
+        // batch_size==1 only (the argmax reduces a single [vocab] row).
+        if (cuda_argmax_enabled() && first_output && batch_size == 1) {
+          cudaPointerAttributes pa0{};
+          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
+              (pa0.type == cudaMemoryTypeDevice ||
+               pa0.type == cudaMemoryTypeManaged)) {
+            g_cuda_logits_dev = out_src;
+            g_cuda_logits_fp16 = true;
+          }
+          cudaGetLastError();
+        }
+        // Device-only activation pool (NNTR_CUDA_DEV_ACT): the model output is
+        // real device memory, not host-addressable. Drain the backend stream
+        // and copy it D2H into a host buffer before the host fp16->fp32
+        // convert (=the one sync-per-token boundary). For UVM the pointer is
+        // host-coherent so this is skipped.
         cudaPointerAttributes pa{};
         if (cudaPointerGetAttributes(&pa, out_src) == cudaSuccess &&
             pa.type == cudaMemoryTypeDevice) {
@@ -419,24 +422,27 @@ CausalLM::incrementalInference(unsigned int batch_size,
 #endif
     } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-      // NNTR_CUDA_ARGMAX: stash the device logits pointer (the tensor data,
-      // before the host memcpy below) when device-accessible. UVM/managed
-      // pointers are host-coherent, so this same pointer feeds both the on-GPU
-      // argmax kernel and -- as the fallback -- the host memcpy.
-      if (cuda_argmax_enabled() && first_output && batch_size == 1) {
-        const float *out_src = out_t.getData();
-        cudaPointerAttributes pa0{};
-        if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
-            (pa0.type == cudaMemoryTypeDevice ||
-             pa0.type == cudaMemoryTypeManaged)) {
-          g_cuda_logits_dev = out_src;
-          g_cuda_logits_fp16 = false;
+      // Per-token cudart touches are cuda-run only (see the fp16 branch note).
+      if (causallm_engine() == "cuda") {
+        // NNTR_CUDA_ARGMAX: stash the device logits pointer (the tensor data,
+        // before the host memcpy below) when device-accessible. UVM/managed
+        // pointers are host-coherent, so this same pointer feeds both the
+        // on-GPU argmax kernel and -- as the fallback -- the host memcpy.
+        if (cuda_argmax_enabled() && first_output && batch_size == 1) {
+          const float *out_src = out_t.getData();
+          cudaPointerAttributes pa0{};
+          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
+              (pa0.type == cudaMemoryTypeDevice ||
+               pa0.type == cudaMemoryTypeManaged)) {
+            g_cuda_logits_dev = out_src;
+            g_cuda_logits_fp16 = false;
+          }
+          cudaGetLastError();
         }
-        cudaGetLastError();
+        // Host read of the GPU-produced logits: sync first so the read is
+        // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+        nntrainer::cuda::StreamManager::Global().finishIfAsync();
       }
-      // Host read of the GPU-produced logits: sync first so the read is coherent
-      // under NNTR_CUDA_ASYNC (no-op in sync mode).
-      nntrainer::cuda::StreamManager::Global().finishIfAsync();
       // Device-only activation pool (NNTR_CUDA_DEV_ACT): fp32 logits are real
       // device memory the raw memcpy below cannot read -- drain and stage D2H,
       // symmetric to the fp16 branch above. (Campaign scout gap: only the fp16

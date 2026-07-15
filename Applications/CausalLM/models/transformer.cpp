@@ -751,8 +751,13 @@ void Transformer::registerCustomLayers() {
   // Additive CUDA backend: register the host CausalLM layer classes on the cuda
   // context too. engine=cuda tensors are Unified Memory (host-coherent), so the
   // CPU implementations run correctly on them (no cl_mem); GPU kernels are
-  // layered on per-layer later. Inert when there is no "cuda" context.
-  try {
+  // layered on per-layer later. Runtime-gated to match the engine.cpp context
+  // bring-up gate: on a non-cuda run there is no "cuda" context and the
+  // registration would just throw per layer.
+  const char *eager_env = std::getenv("NNTR_CUDA_EAGER_CTX");
+  if (causallm_engine() == "cuda" ||
+      (eager_env != nullptr && eager_env[0] != '0'))
+    try {
     // swiglu promoted to core cuda_context.cpp [T12].
     // CUDA RMSNorm (FP32-safe sum-of-squares) instead of the host
     // causallm::RMSNormLayer, whose FP16 path squares in FP16 and overflows on

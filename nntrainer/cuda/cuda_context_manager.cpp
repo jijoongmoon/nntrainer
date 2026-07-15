@@ -12,6 +12,7 @@
 
 #include "cuda_context_manager.h"
 #include "cuda_common.h"
+#include "cuda_stream_manager.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -165,7 +166,23 @@ ContextManager::~ContextManager() {
   }
 }
 
+bool engine_selected() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_ENGINE");
+    return e != nullptr && std::string(e) == "cuda";
+  }();
+  return on;
+}
+
+void drain_if_async() {
+  if (!engine_selected())
+    return;
+  StreamManager::Global().finishIfAsync();
+}
+
 bool dev_accessible(const void *p) {
+  if (!engine_selected())
+    return false;
   if (p == nullptr)
     return false;
   cudaPointerAttributes a{};
@@ -188,6 +205,8 @@ bool dev_accessible(const void *p) {
 }
 
 bool dev_only(const void *p) {
+  if (!engine_selected())
+    return false;
   if (p == nullptr)
     return false;
   cudaPointerAttributes a{};

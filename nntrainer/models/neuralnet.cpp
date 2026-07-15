@@ -774,7 +774,8 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
       if (dump_stats) {
         try {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-          cudaDeviceSynchronize();
+          if (nntrainer::cuda::engine_selected())
+            cudaDeviceSynchronize();
 #endif
           Tensor &o = node->getOutput(0);
           const unsigned char *raw =
@@ -2087,7 +2088,7 @@ NeuralNetwork::inference(unsigned int batch_size,
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     // The caller reads the GPU-produced UVM model output on the host; sync first
     // in async mode (no-op in default sync mode).
-    nntrainer::cuda::StreamManager::Global().finishIfAsync();
+    nntrainer::cuda::drain_if_async();
 #endif
     output.push_back(out_t.getData());
   }
@@ -2191,7 +2192,7 @@ std::vector<float *> NeuralNetwork::incremental_inference(
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     // The host reads the GPU-produced UVM model output below (scopy_fp16_to_fp32
     // / memcpy); sync first in async mode (no-op in default sync mode).
-    nntrainer::cuda::StreamManager::Global().finishIfAsync();
+    nntrainer::cuda::drain_if_async();
 #endif
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16

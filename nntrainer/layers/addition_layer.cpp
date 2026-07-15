@@ -106,7 +106,7 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
     // The host residual path below reads GPU-produced UVM inputs on the CPU
     // (copy()/add_i()). In async mode the producing kernels have not drained,
     // so sync first; no-op in default (sync) mode.
-    nntrainer::cuda::StreamManager::Global().finishIfAsync();
+    nntrainer::cuda::drain_if_async();
 #endif
 
     /** @todo check possibility for in-place of addition layer */

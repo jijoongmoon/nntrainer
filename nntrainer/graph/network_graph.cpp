@@ -53,6 +53,7 @@
 #include <vector>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
 #include <cuda_runtime.h>
 #endif
 
@@ -451,7 +452,8 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
 
     if (_layer_hash && from == 0) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-      cudaDeviceSynchronize();
+      if (nntrainer::cuda::engine_selected())
+        cudaDeviceSynchronize();
 #endif
       for (unsigned int j = 0; j < ln->getNumOutputs(); ++j) {
         Tensor &t = ln->getOutput(j);
@@ -460,7 +462,7 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
         const uint8_t *p = src;
         std::vector<uint8_t> mirror;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-        if (src) {
+        if (src && nntrainer::cuda::engine_selected()) {
           cudaPointerAttributes a{};
           if (cudaPointerGetAttributes(&a, src) == cudaSuccess &&
               a.type == cudaMemoryTypeDevice) {

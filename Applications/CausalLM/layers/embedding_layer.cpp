@@ -30,6 +30,7 @@
 #include <vector>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 
@@ -873,7 +874,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     _FP16 *&emb_stage = *reinterpret_cast<_FP16 **>(&cuda_stage);
     size_t &emb_stage_cap = cuda_stage_cap;
     bool emb_dev_only = false;
-    if (hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+    if (nntrainer::cuda::engine_selected() &&
+        hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
       cudaPointerAttributes pa{};
       emb_dev_only =
         cudaPointerGetAttributes(&pa, batchsliced_hidden.getData<_FP16>()) ==

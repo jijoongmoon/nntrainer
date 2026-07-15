@@ -103,7 +103,7 @@ void PerLayerSliceLayer::incremental_forwarding(
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
         // Host memcpy slicing reads the GPU-produced UVM input on the CPU; sync
         // first in async mode (no-op in default sync mode).
-        nntrainer::cuda::StreamManager::Global().finishIfAsync();
+        nntrainer::cuda::drain_if_async();
 #endif
         for (unsigned int t = 0; t < tokens; ++t)
           std::memcpy(out_data + t * feature_size,
@@ -118,7 +118,7 @@ void PerLayerSliceLayer::incremental_forwarding(
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       // Host memcpy slicing reads the GPU-produced UVM input on the CPU; sync
       // first in async mode (no-op in default sync mode).
-      nntrainer::cuda::StreamManager::Global().finishIfAsync();
+      nntrainer::cuda::drain_if_async();
 #endif
       for (unsigned int t = 0; t < tokens; ++t)
         std::memcpy(out_data + t * feature_size,

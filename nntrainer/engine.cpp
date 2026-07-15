@@ -11,6 +11,7 @@
  * @bug    No known bugs except for NYI items
  *
  */
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -75,9 +76,29 @@ void Engine::add_default_object() {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Additive NVIDIA CUDA backend, registered alongside (not replacing) the
   // OpenCL "gpu" context. Selected at runtime via engine=cuda.
-  auto &cuda_context = nntrainer::CudaContext::Global();
+  //
+  // Runtime-gated on NNTR_ENGINE=cuda (exact-match, same read as
+  // causallm_engine()): constructing CudaContext retains a real CUDA primary
+  // context (cuInit + device retain) and on Windows preloads the delay-loaded
+  // cuBLAS/cublasLt/NVRTC images (cuda_context_manager.cpp) — on a unified
+  // CUDA+OpenCL binary that cost lands on every cpu/OpenCL run too (~170MB
+  // host WS). Unregistered "cuda" falls back to cpu in parseComputeEngine,
+  // so CUDA runs must set NNTR_ENGINE=cuda (run_llm.ps1 and SFlareApi do).
+  // NNTR_CUDA_EAGER_CTX=1 restores the old unconditional bring-up for A/B.
+  {
+    const char *eng_env = std::getenv("NNTR_ENGINE");
+    const char *eager_env = std::getenv("NNTR_CUDA_EAGER_CTX");
+    const bool want_cuda = eng_env != nullptr && std::string(eng_env) == "cuda";
+    const bool eager_ctx = eager_env != nullptr && eager_env[0] != '0';
+    if (want_cuda || eager_ctx) {
+      auto &cuda_context = nntrainer::CudaContext::Global();
 
-  registerContext("cuda", &cuda_context);
+      registerContext("cuda", &cuda_context);
+    } else {
+      ml_logi("CUDA backend compiled in but not brought up "
+              "(NNTR_ENGINE!=cuda); engine=cuda layers fall back to cpu.");
+    }
+  }
 #endif
 
 #if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1

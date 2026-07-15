@@ -16,6 +16,7 @@
 #include <stdexcept>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
@@ -79,7 +80,9 @@ void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
   // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) path: this is the
   // first host read of the lm_head logits, so the one-per-token GPU pipeline
   // drains here. A no-op in default mode (every GPU op already drained).
-  nntrainer::cuda::StreamManager::Global().finish();
+  // cuda runs only: StreamManager::Global() would CREATE the CUDA context.
+  if (nntrainer::cuda::engine_selected())
+    nntrainer::cuda::StreamManager::Global().finish();
 #endif
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
@@ -129,7 +132,8 @@ void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
         // sends the softcap to the host loop below -- which, inside a CUDA-graph
         // capture, reads the not-yet-run lm_head logits (stale) and is itself not
         // captured -> garbage output. Managed pointers run the GPU kernel fine.
-        if (cudaPointerGetAttributes(&pa, ip) == cudaSuccess &&
+        if (nntrainer::cuda::engine_selected() &&
+            cudaPointerGetAttributes(&pa, ip) == cudaSuccess &&
             (pa.type == cudaMemoryTypeDevice ||
              pa.type == cudaMemoryTypeManaged) &&
             nntrainer::cuda::cuda_softcap_fp16(ip, op,

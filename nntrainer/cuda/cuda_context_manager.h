@@ -120,13 +120,35 @@ private:
 };
 
 /**
+ * @brief True iff this run selected the CUDA engine (NNTR_ENGINE=cuda,
+ *        static-cached). The residency probes below and every shared-layer
+ *        CUDA touch must short-circuit on this: cudart is statically linked,
+ *        so on a non-cuda run of the unified binary the first cudart call
+ *        boots the runtime (LoadLibrary nvcuda + driver init) wherever it
+ *        lands — with the engine-gated context bring-up (engine.cpp) no longer
+ *        hiding it at startup, that was the first forward = inside the timed
+ *        prefill window (measured -55% XMX prefill).
+ */
+bool engine_selected();
+
+/**
+ * @brief Engine-gated stream drain for the host-fallback paths of SHARED
+ *        layers (residual add, slicing, norms, logits readback): no-op unless
+ *        the cuda engine is selected. Calling
+ *        StreamManager::Global().finishIfAsync() directly there CREATES the
+ *        CUDA stream/context on a non-cuda run — use this instead.
+ */
+void drain_if_async();
+
+/**
  * @brief  Is pointer @p p reachable by a CUDA kernel? Accepts Managed/Device
  *         always; on an INTEGRATED GPU (Tegra/Orin) also accepts Host, because
  *         there cudaMallocManaged memory can report as cudaMemoryTypeHost yet is
  *         GPU-accessible (one shared physical pool). Without this every dev()
  *         gate rejects the (managed) activation pool on Orin and the GPU ops
  *         silently fall to the host => correct-but-slow (2 TPS). Single source
- *         of truth for the residency gates.
+ *         of truth for the residency gates. Always false when the cuda engine
+ *         was not selected (see engine_selected()).
  */
 bool dev_accessible(const void *p);
 
