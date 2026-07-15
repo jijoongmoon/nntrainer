@@ -183,6 +183,13 @@ void ClContext::initialize() noexcept {
         (active_engine == nullptr) || std::string(active_engine) == "gpu";
       constexpr uint32_t ADRENO_VENDOR_ID = 0x5143;
       if (opencl_is_active && caps_.vendor_id == INTEL_VENDOR_ID) {
+        // [round-19 Windows determinism] The NNTR_DETERMINISTIC=1 contract on
+        // Windows pins the minimal reproducibility pair (no cl_mem pool
+        // offsets + post-FC drain, measured 9/9 identical det256) at the
+        // CONSUMER sites — tensor_pool.cpp / cl_svm_allocator.cpp /
+        // blas_kernel_interface.cpp / attention_kernels.cpp — because runner
+        // and API bundles set NNTR_GPU_CLMEM_POOL=1 explicitly, which an
+        // overwrite=0 env layer here cannot beat. No setenv for it here.
         if (caps_.subgroups)
           setenv("NNTR_FC_XMX", "1", 0); // DPAS/XMX GEMM — Xe2/Xe3 prefill +70~151%
         setenv("NNTR_MHA_GPU", "1", 0);        // GPU attention (no host NEON → GPU wins)

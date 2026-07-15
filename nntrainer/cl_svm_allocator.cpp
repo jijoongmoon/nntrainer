@@ -38,7 +38,14 @@ ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self,
   // (ClBufferPool) so activations stay GPU-resident as plain cl_mem; default
   // OFF => the SVM-backed MemoryPool. Same condition as the old TensorPool
   // getName()=="gpu-svm" && env check — now owned by the allocator. [Mem M2]
-  if (nntr_env_on("NNTR_GPU_CLMEM_POOL")) {
+#ifdef _WIN32
+  // [r19 determinism] contract beats the pool bundle — see tensor_pool.cpp.
+  const char *det_env = std::getenv("NNTR_DETERMINISTIC");
+  const bool det_pool_off = det_env && det_env[0] == '1';
+#else
+  constexpr bool det_pool_off = false;
+#endif
+  if (!det_pool_off && nntr_env_on("NNTR_GPU_CLMEM_POOL")) {
     // [weight plane skip] No WEIGHT tensor ever binds its per-offset cl_mem:
     // the v8c FCs read their own packed backing and the norms are host-read
     // (runtime residency dump: 566/566 gauss4 weights classify SVM), yet the

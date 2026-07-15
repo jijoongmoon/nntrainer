@@ -284,8 +284,18 @@ void TensorPool::allocate(bool init) {
    * the ClBufferPool was selected (same condition as the factory): class ⟺
    * handle. With the pool off every tensor derives SVM/HOST and all binding
    * sites fall through to today's paths (byte-identical). */
-  static const bool clmem_pool_on =
-    nntr_env_on("NNTR_GPU_CLMEM_POOL");
+  static const bool clmem_pool_on = []() {
+#ifdef _WIN32
+    // [r19 determinism] The contract beats the perf bundle: pool offsets are
+    // one half of the minimal Windows reproducibility pair (with the post-FC
+    // drain). Runner/API bundles set NNTR_GPU_CLMEM_POOL=1 as a performance
+    // default, not a determinism decision — the contract overrides it.
+    const char *det = std::getenv("NNTR_DETERMINISTIC");
+    if (det && det[0] == '1')
+      return false;
+#endif
+    return nntr_env_on("NNTR_GPU_CLMEM_POOL");
+  }();
   // Capability, not name: can this allocator back a device cl_mem pool
   // (ClBufferPool)? True only for ClSVMAllocator — same set as the old
   // getName()=="gpu-svm", byte-identical. [#4=B allocator-owns-residency]
