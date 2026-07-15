@@ -76,6 +76,18 @@ bool ClSVMAllocator::consume_host_owned(void *ptr) {
   return host_owned.erase(ptr) > 0;
 }
 
+// NNTR_POISON_FILL=1: fill fresh allocations with 0x55 instead of 0 —
+// round-16 discriminator. If outputs CHANGE but stay run-stable, an
+// initialized-content consumer exists (uninit class); if divergence stays
+// intermittent, the mechanism is in-kernel / schedule-dependent.
+static unsigned char nntr_fill_byte() {
+  static const unsigned char b = []() -> unsigned char {
+    const char *e = std::getenv("NNTR_POISON_FILL");
+    return (e && e[0] == '1') ? (unsigned char)0x55 : (unsigned char)0x00;
+  }();
+  return b;
+}
+
 void ClSVMAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   void *svm = ctx_.createSVMRegion(size);
   if (svm != nullptr) {
@@ -85,7 +97,7 @@ void ClSVMAllocator::alloc(void **ptr, size_t size, size_t alignment) {
     // WDDM driver may recycle non-zero pool pages — any consumer relying on
     // the zero contract then reads per-process garbage, the round-15
     // run-to-run divergence class. One-time cost at allocation.
-    std::memset(svm, 0, size);
+    std::memset(svm, nntr_fill_byte(), size);
     *ptr = svm;
     return;
   }
