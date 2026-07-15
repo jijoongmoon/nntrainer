@@ -1027,11 +1027,36 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // CUDA mirror of clmem_raise_cl: push the host-dequantized PLE rows into the
     // device-only output on the backend stream (ordered before the GPU consumer).
     if (emb_dev_only) {
-      cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
-                      (size_t)iter * out_dim * sizeof(_FP16),
-                      cudaMemcpyHostToDevice,
-                      nntrainer::cuda::StreamManager::Global().GetStream());
-      emb_stage_h2d_record();
+      // [r22] Windows default: fully-synchronous upload. This edge is the
+      // self-documented mirror of the Intel embedding raise whose upload was
+      // the SINGLE Windows divergence source (r21, 0031). Measured: the async
+      // H2D under DEV_ACT is the CUDA divergence source (C4 6/6 and full A2
+      // 3/3 identical with the sync copy; async diverges every battery), and
+      // the sync copy costs nothing measurable (a2 4158-4227/28.9-29.0 either
+      // way — one ~4KB/token DMA). NNTR_CUDA_EMB_SYNCCOPY=0 restores async
+      // for A/B; non-Windows keeps async (Linux 12/12 was already clean).
+      static const bool emb_synccopy = []() {
+        const char *e = std::getenv("NNTR_CUDA_EMB_SYNCCOPY");
+        if (e)
+          return e[0] == '1';
+#ifdef _WIN32
+        return true;
+#else
+        return false;
+#endif
+      }();
+      if (emb_synccopy &&
+          !nntrainer::cuda::StreamManager::Global().isCapturing()) {
+        cudaMemcpy(batchsliced_hidden.getData<_FP16>(), emb_stage,
+                   (size_t)iter * out_dim * sizeof(_FP16),
+                   cudaMemcpyHostToDevice);
+      } else {
+        cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
+                        (size_t)iter * out_dim * sizeof(_FP16),
+                        cudaMemcpyHostToDevice,
+                        nntrainer::cuda::StreamManager::Global().GetStream());
+        emb_stage_h2d_record();
+      }
     }
 #endif
 

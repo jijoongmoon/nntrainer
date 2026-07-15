@@ -411,11 +411,32 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     // push the host-dequantized embedding rows into the device-only output on
     // the backend stream (ordered before the first GPU layer consumes them).
     if (emb_dev_only) {
-      cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
-                      (size_t)iter * out_dim * sizeof(_FP16),
-                      cudaMemcpyHostToDevice,
-                      nntrainer::cuda::StreamManager::Global().GetStream());
-      tie_emb_stage_h2d_record();
+      // [r22] Windows default: synchronous upload — sibling of the
+      // embedding_layer.cpp emb H2D, the measured Windows divergence source
+      // (see the verdict comment there). NNTR_CUDA_EMB_SYNCCOPY=0 restores
+      // the async copy; non-Windows keeps async.
+      static const bool emb_synccopy = []() {
+        const char *e = std::getenv("NNTR_CUDA_EMB_SYNCCOPY");
+        if (e)
+          return e[0] == '1';
+#ifdef _WIN32
+        return true;
+#else
+        return false;
+#endif
+      }();
+      if (emb_synccopy &&
+          !nntrainer::cuda::StreamManager::Global().isCapturing()) {
+        cudaMemcpy(batchsliced_hidden.getData<_FP16>(), emb_stage,
+                   (size_t)iter * out_dim * sizeof(_FP16),
+                   cudaMemcpyHostToDevice);
+      } else {
+        cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
+                        (size_t)iter * out_dim * sizeof(_FP16),
+                        cudaMemcpyHostToDevice,
+                        nntrainer::cuda::StreamManager::Global().GetStream());
+        tie_emb_stage_h2d_record();
+      }
     }
 #endif
 
