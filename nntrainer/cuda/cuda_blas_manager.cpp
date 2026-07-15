@@ -67,6 +67,23 @@ bool BlasManager::sgemmRowMajor(int M, int N, int K, const float *X,
                                 const float *W, float *Y) {
   if (!ok_)
     return false;
+  // NNTR_DETERMINISTIC / NNTR_CUBLAS_PEDANTIC: pin the FP32 path's math
+  // mode. Default cuBLAS math on Ampere+ may pick TF32 tensor-core kernels
+  // whose split-K epilogues carry documented run-to-run ulp drift — the
+  // int8 IMMA path is int32-exact and unaffected (round-16 audit). One-time
+  // per handle; no effect on quantized models (this path needs FP32 weights).
+  {
+    static const bool pedantic = []() {
+      const char *d = std::getenv("NNTR_DETERMINISTIC");
+      const char *p = std::getenv("NNTR_CUBLAS_PEDANTIC");
+      return (d && d[0] == '1') || (p && p[0] == '1');
+    }();
+    static bool pinned = false;
+    if (pedantic && !pinned) {
+      cublasSetMathMode(handle_, CUBLAS_PEDANTIC_MATH);
+      pinned = true;
+    }
+  }
   const float alpha = 1.0f;
   const float beta = 0.0f;
   // Column-major C[N,M] = W_view[N,K] * X_view[K,M] = (X*W)^T, read back

@@ -39,6 +39,47 @@
 #include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
+
+namespace {
+// NNTR_CUDA_ASYNC guard for the pinned tie-embedding staging buffer: in async
+// mode nothing drains the stream per-op, so the NEXT token's host dequant can
+// rewrite (or cudaFreeHost) emb_stage while the PREVIOUS token's H2D from the
+// same buffer is still in flight -> the consumer kernel reads torn rows
+// (field: word-salad decode under ASYNC=1, coherent under sync). Mirrors the
+// embedding_layer.cpp emb_stage guard (same failure mode, same pinned-staging
+// buffer, but tie_word_embedding's is a separate static so it needs its own
+// event). One event on the single backend stream marks the most recent
+// staging H2D; stream FIFO means "last H2D done" implies every earlier one is
+// done. Skipped during graph capture: an in-capture cudaEventSynchronize is
+// illegal and the captured H2D is replay-ordered by the graph itself.
+cudaEvent_t g_tie_emb_h2d_evt = nullptr;
+bool g_tie_emb_h2d_pending = false;
+
+void tie_emb_stage_h2d_record() {
+  auto &sm = nntrainer::cuda::StreamManager::Global();
+  if (sm.isCapturing())
+    return;
+  if (g_tie_emb_h2d_evt == nullptr &&
+      cudaEventCreateWithFlags(&g_tie_emb_h2d_evt, cudaEventDisableTiming) !=
+        cudaSuccess) {
+    g_tie_emb_h2d_evt = nullptr;
+    cudaGetLastError();
+    return;
+  }
+  if (cudaEventRecord(g_tie_emb_h2d_evt, sm.GetStream()) == cudaSuccess)
+    g_tie_emb_h2d_pending = true;
+  else
+    cudaGetLastError();
+}
+
+void tie_emb_stage_h2d_wait() {
+  if (!g_tie_emb_h2d_pending ||
+      nntrainer::cuda::StreamManager::Global().isCapturing())
+    return;
+  cudaEventSynchronize(g_tie_emb_h2d_evt);
+  g_tie_emb_h2d_pending = false;
+}
+} // namespace
 #endif
 
 namespace nntrainer {
@@ -272,6 +313,9 @@ void TieWordEmbedding::incremental_forwarding_embedding(
         pa.type == cudaMemoryTypeDevice;
       cudaGetLastError();
       if (emb_dev_only) {
+        // Async-mode: the previous token's H2D from this pinned buffer may
+        // still be in flight -- wait before the host rewrites or frees it.
+        tie_emb_stage_h2d_wait();
         size_t need = (size_t)iter * out_dim;
         if (need > emb_stage_cap) {
           if (emb_stage)
@@ -366,11 +410,13 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     // push the host-dequantized embedding rows into the device-only output on
     // the backend stream (ordered before the first GPU layer consumes them).
-    if (emb_dev_only)
+    if (emb_dev_only) {
       cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
                       (size_t)iter * out_dim * sizeof(_FP16),
                       cudaMemcpyHostToDevice,
                       nntrainer::cuda::StreamManager::Global().GetStream());
+      tie_emb_stage_h2d_record();
+    }
 #endif
 
 #ifdef DEBUG
