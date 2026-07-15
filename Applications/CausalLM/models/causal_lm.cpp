@@ -125,8 +125,19 @@ CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   // a CPU-registered layer that binds/consumes Q/K/V on the GPU plane (engine-
   // neutral). NNTR_CLMEM_RAISE/LOWER still override the raise/lower patterns.
   auto &rp = nntrainer::ResidencyPolicy::global();
+#ifndef _WIN32
   if (rp.raise_patterns.empty())
     rp.raise_patterns = "embedding0:out0";
+#else
+  // [r21 determinism] The embedding-output RAISE (host-written per token, then
+  // uploaded to the cl_mem plane) is the single tensor whose cl_mem binding
+  // makes Windows/Intel runs nondeterministic: keep-one bisection over every
+  // GPU_CLMEM class reproduced run-to-run divergence ONLY here, and excluding
+  // just this tensor is bit-reproducible 6/6 with NO drain at baseline cost
+  // (2079/18.5 vs base 2075/18.2 — zero). The raise's own rationale (layer0
+  // coarse-SVM ingress) did not reproduce in any of those runs. Keep the
+  // embedding on SVM on Windows; NNTR_CLMEM_RAISE overrides for A/B.
+#endif
   if (rp.lower_patterns.empty())
     rp.lower_patterns = "output_norm:out0";
   if (rp.engine_neutral_types.empty())

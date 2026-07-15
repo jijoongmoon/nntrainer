@@ -284,6 +284,9 @@ void TensorPool::allocate(bool init) {
    * the ClBufferPool was selected (same condition as the factory): class ⟺
    * handle. With the pool off every tensor derives SVM/HOST and all binding
    * sites fall through to today's paths (byte-identical). */
+  // [r21] The r19 DETERMINISTIC pool-off override is gone: the real culprit
+  // was the embedding0 boundary-raise upload (causal_lm.cpp), fixed at zero
+  // cost — the pool stays on under the determinism contract.
   static const bool clmem_pool_on =
     nntr_env_on("NNTR_GPU_CLMEM_POOL");
   // Capability, not name: can this allocator back a device cl_mem pool

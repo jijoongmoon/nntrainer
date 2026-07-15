@@ -425,11 +425,22 @@ const cl_command_queue CommandQueueManager::GetCommandQueue() {
  * @param async flag for asynchronous operation
  * @return true if reading is successful or false otherwise
  */
+// [r19 determinism probe] NNTR_CL_SYNC_IO=1 forces every host-I/O enqueue
+// blocking (reads/writes/SVM maps) -- discriminator for the async host-I/O
+// divergence class: kernel-side LOCKSTEP cannot order these.
+static bool cl_sync_io_forced() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_CL_SYNC_IO");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
+
 bool CommandQueueManager::EnqueueReadBuffer(cl_mem buffer, size_t size_in_bytes,
                                             void *data, bool async) {
 
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
   // returns NULL with error code if fails
   rqt_op("HOST_readbuf", nullptr);
   auto error_code =
@@ -450,7 +461,7 @@ bool CommandQueueManager::EnqueueReadBufferRegion(
   size_t buffer_origin_offset, bool async) {
 
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
 
   // (x, y, z) offset in the memory region associated with buffer
   const size_t buffer_origin[] = {buffer_origin_offset, 0, 0};
@@ -494,7 +505,7 @@ bool CommandQueueManager::EnqueueWriteBuffer(cl_mem buffer,
                                              const void *data, bool async) {
 
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
   // returns NULL with error code if fails
   auto error_code =
     clEnqueueWriteBuffer(command_queue_, buffer, blocking, 0, size_in_bytes,
@@ -515,7 +526,7 @@ bool CommandQueueManager::EnqueueWriteBufferRegion(
   size_t host_origin_offset, size_t buffer_origin_offset, bool async) {
 
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
 
   // (x, y, z) offset in the memory region associated with buffer
   const size_t buffer_origin[] = {buffer_origin_offset, 0, 0};
@@ -564,7 +575,7 @@ void *CommandQueueManager::EnqueueMapBuffer(cl_mem buffer,
                                             bool read_only, bool async,
                                             cl_event *event) {
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
   // managing read/write flags
   const cl_map_flags map_flag = read_only ? CL_MAP_READ : CL_MAP_WRITE;
 
@@ -639,7 +650,7 @@ bool CommandQueueManager::enqueueSVMMap(void *svm_ptr, size_t size,
   // unmap/kernel, AND when no host access of this region happens before that
   // next GPU op. Removes the per-op host stall that otherwise drains the queue
   // to idle. Default (false) keeps the original blocking behavior.
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
 
   rqt_op(blocking ? "HOST_svmmap_BLOCK" : "HOST_svmmap_async", nullptr);
   cl_int error_code = clEnqueueSVMMap(command_queue_, blocking, map_flag,
