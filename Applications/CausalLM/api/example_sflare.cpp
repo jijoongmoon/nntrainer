@@ -90,6 +90,40 @@ bool ok(SFlareApi::ErrorCode ec, const char *what) {
 }
 
 #if defined(_WIN32)
+/** Exit-tail keeper (opt out: SFLARE_EXIT_KEEPER=0). Spawn the bundled
+ *  helper in --watch mode right after the model loads: it pings the GPU
+ *  once per 100ms while this process lives (negligible contention), then
+ *  goes continuous for ~3s after this process dies — so the deferred
+ *  kernel-side teardown (see the note at the end of main) runs at awake
+ *  speed: measured prompt-return 2.4s -> ~0.4s on Xe3. It must be RUNNING
+ *  before death (a spawn at exit is too late to matter), which is why it
+ *  is launched here. Silently skipped if the exe isn't next to ours. */
+void spawn_exit_keeper() {
+  const char *ek = std::getenv("SFLARE_EXIT_KEEPER");
+  if (ek && std::strcmp(ek, "0") == 0)
+    return;
+  char path[MAX_PATH] = {0};
+  DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH)
+    return;
+  char *slash = std::strrchr(path, '\\');
+  if (!slash ||
+      (slash - path) + std::strlen("\\sflare_exit_keeper.exe") >= MAX_PATH)
+    return;
+  std::strcpy(slash + 1, "sflare_exit_keeper.exe");
+  STARTUPINFOA si = {sizeof(si)};
+  PROCESS_INFORMATION pi = {0};
+  char cmdline[MAX_PATH + 48];
+  std::snprintf(cmdline, sizeof(cmdline), "\"%s\" --watch %lu 3000 100", path,
+                (unsigned long)GetCurrentProcessId());
+  if (CreateProcessA(path, cmdline, NULL, NULL, FALSE,
+                     CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si,
+                     &pi)) {
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+  }
+}
+
 /** The API takes UTF-8, but Windows hands main() its argv in the ANSI code
  *  page (949/1252/...), so a non-ASCII literal prompt arrives mojibake and
  *  the tokenizer sees garbage. Re-read the command line as UTF-16 and
@@ -213,6 +247,9 @@ int main(int argc, char *argv[]) {
   //    beforehand wins over the bundle.
   if (!ok(ctx->loadSFlareLLMModel(backend_of(backend)), "loadSFlareLLMModel"))
     return 1;
+#if defined(_WIN32)
+  spawn_exit_keeper();
+#endif
 
   // Debug aid: what bytes actually reached us (UTF-8 expected on every
   // platform -- see utf8_args()).
@@ -272,8 +309,9 @@ int main(int argc, char *argv[]) {
     return 1;
   std::printf("[example_sflare] done\n");
   // Note: on Windows/Intel iGPU the console prompt returns ~0.8-2.4s after
-  // this line. Two kernel-side costs land after the process's last
-  // instruction (every release call above returns in milliseconds):
+  // this line (~0.4s with the exit keeper above). Two kernel-side costs land
+  // after the process's last instruction (every release call above returns
+  // in milliseconds):
   // (1) WDDM VidMm's deferred allocation teardown — destroy calls return
   //     immediately by contract (AssumeNotInUse) and the actual GPU-VA
   //     unmap/unpin of the model pages is force-drained at process death
