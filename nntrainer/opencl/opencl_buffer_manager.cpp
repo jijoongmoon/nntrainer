@@ -111,6 +111,13 @@ void *ClBufferManager::getSVMOutput(unsigned int idx) {
   return output_vec[idx];
 }
 
+ClBufferManager &ClBufferManager::Global() {
+  // Out-of-line on purpose — single process-wide instance (see header note).
+  static ClBufferManager instance;
+  instance.initializeOnce();
+  return instance;
+}
+
 ClBufferManager::~ClBufferManager() {
   /** Intentionally a no-op (leak at process exit).
    *

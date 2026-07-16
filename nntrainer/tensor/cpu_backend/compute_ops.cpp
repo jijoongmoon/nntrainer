@@ -48,6 +48,13 @@ void ensureComputeOps() {
   std::call_once(g_compute_ops_init_flag, []() { init_backend(); });
 }
 
+ComputeOps *getComputeOps() {
+  // Out-of-line on purpose — see the header note (shared-build data-export).
+  if (g_compute_ops == nullptr)
+    ensureComputeOps();
+  return g_compute_ops;
+}
+
 [[noreturn]] void ComputeOps::throwNotImplemented(const char *op) {
   throw std::runtime_error(std::string("ComputeOps::") + op +
                            " not implemented by this backend");

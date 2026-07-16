@@ -360,6 +360,14 @@ public:
    * @brief Destroy the Command Queue Manager object
    *
    */
+  /**
+   * @brief Get the process-wide instance (out-of-line override of
+   *        Singleton<T>::Global() — one cl_command_queue set per process
+   *        under shared linking; see ContextManager::Global() for the full
+   *        static-vs-shared note).
+   */
+  static CommandQueueManager &Global();
+
   ~CommandQueueManager();
 
   /**

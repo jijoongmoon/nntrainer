@@ -522,16 +522,14 @@ void ensureComputeOps();
 
 /**
  * @brief Get the active compute ops with lazy initialization.
+ * @note  Out-of-line on purpose (defined in compute_ops.cpp): the previous
+ *        inline definition dereferenced the extern g_compute_ops data symbol
+ *        from consumer modules — under default_library=shared on Windows the
+ *        auto-generated export .def covers functions but not data, so every
+ *        external TU that inlined this failed to link (LNK2019 on
+ *        g_compute_ops). An exported function keeps the data module-private.
  */
-inline ComputeOps *getComputeOps() {
-#if defined(__GNUC__) || defined(__clang__)
-  if (__builtin_expect(g_compute_ops == nullptr, 0))
-#else
-  if (g_compute_ops == nullptr)
-#endif
-    ensureComputeOps();
-  return g_compute_ops;
-}
+ComputeOps *getComputeOps();
 
 /**
  * @brief Initialize the CPU compute backend.

@@ -131,6 +131,13 @@ void *ContextManager::createSVMRegion(size_t size) {
   return clSVMAlloc(context_, CL_MEM_READ_WRITE, size, 0);
 }
 
+ContextManager &ContextManager::Global() {
+  // Out-of-line on purpose — single process-wide instance (see header note).
+  static ContextManager instance;
+  instance.initializeOnce();
+  return instance;
+}
+
 void ContextManager::releaseSVMRegion(void *svm_ptr) {
   if (svm_ptr) {
     // deallocates the SVM memory

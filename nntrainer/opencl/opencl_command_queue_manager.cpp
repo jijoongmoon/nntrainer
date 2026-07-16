@@ -378,6 +378,13 @@ void CommandQueueManager::ReleaseCommandQueue() {
   }
 }
 
+CommandQueueManager &CommandQueueManager::Global() {
+  // Out-of-line on purpose — single process-wide instance (see header note).
+  static CommandQueueManager instance;
+  instance.initializeOnce();
+  return instance;
+}
+
 /**
  * @brief Destroy the Command Queue Manager object
  *

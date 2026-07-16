@@ -271,5 +271,16 @@ int main(int argc, char *argv[]) {
   if (!ok(SFlareApi::DestroySFlareContext(ctx), "DestroySFlareContext"))
     return 1;
   std::printf("[example_sflare] done\n");
+  // Note: on Windows/Intel iGPU the console prompt returns ~0.7-2.5s after
+  // this line. That tail is the kernel unmapping/unpinning the GPU-mapped
+  // (UMA/SVM) pages the process still owns at death — and the Intel driver
+  // pools clSVMFree'd memory without returning the kernel-side mappings, so
+  // the cost is paid at process death REGARDLESS of cleanup discipline
+  // (minimal repro: hello-world CL exits in ~0.2s; +2GiB touched SVM, freed
+  // or leaked, ~0.7-0.9s; cold driver kernel-cache flush adds up to ~2.2s).
+  // A TerminateProcess fast-exit only shifts the wait onto the parent
+  // process. Harmless, scales with SVM footprint, not addressable from user
+  // mode; amortize it by reusing the process for many requests instead of
+  // one process per inference.
   return 0;
 }
