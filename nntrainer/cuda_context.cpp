@@ -43,6 +43,32 @@ std::mutex cuda_factory_mutex;
 
 void CudaContext::initialize() noexcept {
   try {
+    // [r20 fresh-init tax] On a dual-backend build this runs at the FIRST
+    // Engine::Global() touch of ANY run — including engine=cpu/gpu — and
+    // cudaInit()'s cuInit wakes a runtime-PM-suspended dGPU over PCIe
+    // (measured: nvidia-smi-alone D3cold wake 2.27s on RTX 5060 = the whole
+    // "fresh intel init +2.4s" constant; waking the card first drops a fresh
+    // intel init from 3451 to 1133 ms). Defer the bring-up when CUDA is not
+    // the active engine: explicit NNTR_ENGINE != cuda, or NNTR_ENGINE unset
+    // on an OpenCL-enabled build (where the engine default is "gpu",
+    // mirroring causallm_engine()). Non-cuda runs never legitimately touch
+    // this context (prewarm/StreamManager gate on the engine string).
+    // NNTR_CUDA_EAGER_INIT=1 restores the old eager behavior.
+    {
+      const char *eng = std::getenv("NNTR_ENGINE");
+      const char *eager = std::getenv("NNTR_CUDA_EAGER_INIT");
+      const bool eager_on = eager && eager[0] == '1';
+#if defined(ENABLE_OPENCL)
+      const bool cuda_active = eng && std::string(eng) == "cuda";
+#else
+      const bool cuda_active = !eng || std::string(eng) == "cuda";
+#endif
+      if (!cuda_active && !eager_on) {
+        ml_logi("[CudaContext] bring-up deferred (engine=%s)",
+                eng ? eng : "(unset; OpenCL default)");
+        return;
+      }
+    }
     if (!cudaInit()) {
       ml_loge("Error: CudaContext::initialize() failed (no usable CUDA device)");
       return;
