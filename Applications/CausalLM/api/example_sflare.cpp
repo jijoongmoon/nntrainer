@@ -271,16 +271,20 @@ int main(int argc, char *argv[]) {
   if (!ok(SFlareApi::DestroySFlareContext(ctx), "DestroySFlareContext"))
     return 1;
   std::printf("[example_sflare] done\n");
-  // Note: on Windows/Intel iGPU the console prompt returns ~0.7-2.5s after
-  // this line. That tail is the kernel unmapping/unpinning the GPU-mapped
-  // (UMA/SVM) pages the process still owns at death — and the Intel driver
-  // pools clSVMFree'd memory without returning the kernel-side mappings, so
-  // the cost is paid at process death REGARDLESS of cleanup discipline
-  // (minimal repro: hello-world CL exits in ~0.2s; +2GiB touched SVM, freed
-  // or leaked, ~0.7-0.9s; cold driver kernel-cache flush adds up to ~2.2s).
-  // A TerminateProcess fast-exit only shifts the wait onto the parent
-  // process. Harmless, scales with SVM footprint, not addressable from user
-  // mode; amortize it by reusing the process for many requests instead of
-  // one process per inference.
+  // Note: on Windows/Intel iGPU the console prompt returns ~0.8-2.4s after
+  // this line. Two kernel-side costs land after the process's last
+  // instruction (every release call above returns in milliseconds):
+  // (1) WDDM VidMm's deferred allocation teardown — destroy calls return
+  //     immediately by contract (AssumeNotInUse) and the actual GPU-VA
+  //     unmap/unpin of the model pages is force-drained at process death
+  //     (~0.6s per 2GiB when the GPU is active);
+  // (2) a fixed ~1.5-1.9s device-teardown penalty that latches once the GPU
+  //     has accumulated a few seconds of idle while the process held a CL
+  //     context — ANY real workload crosses it, an empty hello-world CL
+  //     context reproduces it, and no user-mode action (frees, pre-exit GPU
+  //     bursts, driver debug keys) avoids or resets it.
+  // Both run below the user-mode driver (dxgkrnl/VidMm + KMD); vendor report
+  // filed. Amortize by reusing the process for many requests instead of one
+  // process per inference.
   return 0;
 }
