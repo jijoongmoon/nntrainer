@@ -69,7 +69,9 @@ static unsigned int min_prefill_thr(unsigned int head_dim) {
   // ARM (Adreno): the image attention path is coherent (incl. qwen3); the
   // host-NEON crossover / GPU-request behaviour is unchanged from before.
   (void)head_dim;
-  if (std::getenv("NNTR_MHA_GPU") != nullptr)
+  // value-checked (=0 disables): the CL bundle auto-injects NNTR_MHA_GPU=1,
+  // so a presence check could never be turned off (env_compat.h trap).
+  if (nntr_env_on("NNTR_MHA_GPU"))
     return 1u;
   return 32u;
 #endif
@@ -1766,7 +1768,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // Kill-switch: NNTR_NO_GPU_ROPE. cos/sin LUT is uploaded as a small
     // constant; Q/K stay SVM-direct when the pool is SVM.
     static const bool _gpu_rope_off = std::getenv("NNTR_NO_GPU_ROPE") != nullptr;
-    static const bool _mha_gpu_on = std::getenv("NNTR_MHA_GPU") != nullptr;
+    static const bool _mha_gpu_on = nntr_env_on("NNTR_MHA_GPU");
     const bool kv_ohwi_now =
       is_kv_ohwi_enabled() && !kv_int8 &&
       key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
@@ -2597,8 +2599,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   {
     const unsigned int FLASH_MIN_PREFILL = min_prefill_thr((unsigned int)head_dim); // env NNTR_MIN_PREFILL
     static const bool _ohwi_gpu_on =
-      is_kv_ohwi_enabled() && !kv_int8 &&
-      std::getenv("NNTR_MHA_GPU") != nullptr;
+      is_kv_ohwi_enabled() && !kv_int8 && nntr_env_on("NNTR_MHA_GPU");
     // NNTR_MHA_GPU_DECODE=1 also routes DECODE (step_size==1) through this
     // OHWI image-attention path. The decode CPU NEON path (compute_kcaches) is
     // the long-context bottleneck; the OHWI qk/sv image kernels + KV scatter
@@ -2758,7 +2759,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     // NNTR_MHA_GPU=1. FP16-Q + FP16-out only; K/V is either FP16 or, when
     // kv_int8 is set, int8 + per-(token, head) FP16 scale. Falls back to
     // the CPU path on any shape mismatch.
-    static const bool _tca_on = std::getenv("NNTR_MHA_GPU") != nullptr;
+    static const bool _tca_on = nntr_env_on("NNTR_MHA_GPU");
     if (_tca_on &&
         query_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         attention_output_step.getDataType() ==
