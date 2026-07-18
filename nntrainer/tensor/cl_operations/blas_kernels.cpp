@@ -2339,18 +2339,45 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   // a non-XMX device registerClKernel fails -> kx null -> fall through to dp4a.
   // M is padded up to MT*8*SG_M (=32) by the grid; M_valid guards the stores
   // and the A/weight 2D-block reads clamp OOB rows to 0 (surface height = M).
+  // FIX 1 (XMX/DPAS capability gate): NNTR_FC_XMX=0 force-disables (explicit
+  // override always wins). Otherwise (=1 or unset) XMX is only actually used
+  // when the device has a real matrix engine (caps().dpas, i.e.
+  // cl_intel_subgroup_matrix_multiply_accumulate) — cl_intel_subgroups alone
+  // (the old gate) is advertised by every Intel GPU since Gen9, including
+  // non-DPAS Xe-LPG "Arc" iGPUs, and registering gemm_xmx_i4 there let IGC
+  // silently emulate the DPAS builtin in software (~4.9 TPS observed).
+  // NNTR_FC_XMX_FORCE=1 (value-checked, not presence-checked — see
+  // docs/ENV_FLAGS.md env-trap history) bypasses the capability requirement
+  // for debugging/benchmarking a non-DPAS device against the DPAS kernel.
   static const bool xmx_fc = []() {
     const char *e = getenv("NNTR_FC_XMX");
-    if (e)
-      return atoi(e) != 0; // explicit override always wins
-    // Caps-derived default (resolver gemm_path cell): enable XMX when the device
-    // advertises the Intel subgroup extension (Xe2/Xe3). The DPAS path is
-    // byte-identical to dp4a (same v8c packing + epilogue) but faster on prefill,
-    // and on a device without the matrix-MAD the kernel registration fails and we
-    // fall through to dp4a — so defaulting it on is safe (never garbage, at worst
-    // dp4a). This retires the NNTR_FC_XMX opt-in on capable Intel GPUs.
-    return ClContext::Global().caps().subgroups;
+    const bool requested = e ? (atoi(e) != 0) : true; // unset = default-on
+    if (e && atoi(e) == 0)
+      return false; // NNTR_FC_XMX=0 force-disables regardless of caps
+    const char *force = getenv("NNTR_FC_XMX_FORCE");
+    if (force && std::string(force) == "1")
+      return requested; // debug escape hatch: skip the capability check
+    return requested && ClContext::Global().caps().dpas;
   }();
+  // One-shot warning (stderr + ml_logw): XMX was requested/defaulted but this
+  // device has no DPAS matrix engine, so the honest dp4a fallback runs
+  // instead (~1.8x slower than XMX, not a correctness issue).
+  static bool xmx_no_dpas_warned = false;
+  if (!xmx_no_dpas_warned) {
+    xmx_no_dpas_warned = true;
+    const char *e = getenv("NNTR_FC_XMX");
+    const bool requested = e ? (atoi(e) != 0) : true;
+    const char *force = getenv("NNTR_FC_XMX_FORCE");
+    const bool forced = force && std::string(force) == "1";
+    if (requested && !forced && !ClContext::Global().caps().dpas) {
+      ml_logw("[XMX] Intel GPU \"%s\" lacks the XMX/DPAS matrix engine "
+              "(no cl_intel_subgroup_matrix_multiply_accumulate) — using the "
+              "dp4a GEMM fallback (~1.8x slower than XMX, not a correctness "
+              "issue). If an NVIDIA GPU is present, backend=cuda will be "
+              "faster. Set NNTR_FC_XMX_FORCE=1 to force XMX for debugging.",
+              ClContext::Global().caps().device_name.c_str());
+    }
+  }
   // One-shot diagnostic (stderr): why XMX/DPAS is or is not selected. On Windows
   // the Intel driver may fail to compile gemm_xmx_i4 (matrix-MAD / 2d_block_io /
   // 256-GRF), silently falling back to the ~40%-slower dp4a path.
@@ -2364,9 +2391,9 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     // under NNTR_GPU_VERBOSE.
     if ((xmx_fc && !gate) || std::getenv("NNTR_GPU_VERBOSE"))
     fprintf(stderr,
-            "[XMX] xmx_fc=%d subgroups=%d buf_kernel=%d M=%u N=%u K=%u -> "
+            "[XMX] xmx_fc=%d dpas=%d buf_kernel=%d M=%u N=%u K=%u -> "
             "gate=%d%s\n",
-            (int)xmx_fc, (int)ClContext::Global().caps().subgroups,
+            (int)xmx_fc, (int)ClContext::Global().caps().dpas,
             (int)buf_kernel, M, N, K, (int)gate,
             gate ? "" : " (XMX skipped -> dp4a)");
   }

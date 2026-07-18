@@ -127,6 +127,14 @@ void ClContext::initialize() noexcept {
       caps_.unified_memory = di->getDeviceSVMCapabilities() != 0;
       caps_.subgroups = di->getDeviceExtensions().find("cl_intel_subgroups") !=
                         std::string::npos;
+      // FIX 1 (XMX/DPAS capability gate): cl_intel_subgroups is advertised by
+      // every Intel GPU since Gen9 (incl. non-DPAS Meteor-Lake Xe-LPG), so it
+      // cannot gate the DPAS kernel. The matrix-multiply-accumulate extension
+      // is DPAS-specific (confirmed present on this Xe3 dev machine, absent on
+      // the Xe-LPG "Arc" iGPU that mis-ran gemm_xmx_i4 at 4.9 TPS).
+      caps_.dpas = di->getDeviceExtensions().find(
+                     "cl_intel_subgroup_matrix_multiply_accumulate") !=
+                   std::string::npos;
       // [T8] V8C_BUF cell: image2d v8c path vs cl_mem buffer path. No clean query
       // distinguishes them (both advertise CL_DEVICE_IMAGE_SUPPORT); the split is
       // Intel NEO's compiler rejecting the integer-coord read_imageui v8c kernel.
@@ -147,9 +155,10 @@ void ClContext::initialize() noexcept {
       // ExecPlan resolver SHADOW (docs/ARCHITECTURE_REFACTOR.md §10 T4): derive
       // the plan from caps, log it, and assert the resolver's gemm_path agrees
       // with the current env-driven FC choice. XMX is the cleanly caps-derivable
-      // cell (cl_intel_subgroups); on the canonical Intel env (NNTR_FC_XMX=1)
-      // resolver and env agree, so no mismatch on README baselines. Log-only —
-      // nothing reads the plan yet (byte-identical).
+      // cell (cl_intel_subgroup_matrix_multiply_accumulate, i.e. caps_.dpas); on
+      // the canonical DPAS-capable Intel env (NNTR_FC_XMX=1) resolver and env
+      // agree, so no mismatch on README baselines. Log-only — nothing reads the
+      // plan yet (byte-identical).
       const ExecPlan plan = resolveExecPlan(caps_);
       const char *xmx_env = std::getenv("NNTR_FC_XMX");
       const bool env_xmx = xmx_env && std::atoi(xmx_env) != 0;
@@ -183,7 +192,18 @@ void ClContext::initialize() noexcept {
         (active_engine == nullptr) || std::string(active_engine) == "gpu";
       constexpr uint32_t ADRENO_VENDOR_ID = 0x5143;
       if (opencl_is_active && caps_.vendor_id == INTEL_VENDOR_ID) {
-        if (caps_.subgroups)
+        // [round-19 Windows determinism] The NNTR_DETERMINISTIC=1 contract on
+        // Windows pins the minimal reproducibility pair (no cl_mem pool
+        // offsets + post-FC drain, measured 9/9 identical det256) at the
+        // CONSUMER sites — tensor_pool.cpp / cl_svm_allocator.cpp /
+        // blas_kernel_interface.cpp / attention_kernels.cpp — because runner
+        // and API bundles set NNTR_GPU_CLMEM_POOL=1 explicitly, which an
+        // overwrite=0 env layer here cannot beat. No setenv for it here.
+        // FIX 1: gate the auto-default on the DPAS-specific extension, not the
+        // generic cl_intel_subgroups (present on every Intel GPU since Gen9,
+        // including non-DPAS Xe-LPG "Arc" iGPUs — defaulting XMX there ropes a
+        // matrix-engine-less device into the DPAS kernel; ~4.9 TPS observed).
+        if (caps_.dpas)
           setenv("NNTR_FC_XMX", "1", 0); // DPAS/XMX GEMM — Xe2/Xe3 prefill +70~151%
         setenv("NNTR_MHA_GPU", "1", 0);        // GPU attention (no host NEON → GPU wins)
         setenv("NNTR_GPU_CLMEM_POOL", "1", 0); // cl_mem device residency sub-pool

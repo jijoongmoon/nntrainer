@@ -48,6 +48,15 @@
 // -----------------------------------------------------------------------------
 
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
+// FIX 1 (defense in depth): this kernel calls the DPAS matrix-MAD builtin
+// (intel_sub_group_i8_u8_matrix_mad_k32, below) which requires the actual
+// systolic array, not just cl_intel_subgroups (advertised by every Intel GPU
+// since Gen9). Declaring the extension explicitly makes a non-DPAS compiler
+// fail this build cleanly instead of silently software-emulating the DPAS
+// builtin -- the host-side gate (caps().dpas in blas_kernels.cpp) should
+// already keep this kernel off such devices, but this is a second line of
+// defense at the compiler.
+#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 // Tuned on Intel Arc Lunar Lake Xe2 (NEO 25.18) at M1024/N4096/K4096:

@@ -79,10 +79,20 @@ struct DeviceCaps {
                                      vendor_id at init (Intel NEO's compiler
                                      rejects the integer-coord read_imageui v8c
                                      kernel ⇒ buffer; Adreno/unknown ⇒ image). The
-                                     V8C_BUF cell of the resolver. Declared LAST so
-                                     appending it leaves the other field offsets
+                                     V8C_BUF cell of the resolver. [T8] */
+  bool dpas = false;            /**< OpenCL cl_intel_subgroup_matrix_multiply_accumulate
+                                     — the actual systolic-array/DPAS matrix engine
+                                     (Xe2/Xe3 "Arc"/"Battlemage" and later). NOT the
+                                     same as `subgroups`: cl_intel_subgroups is
+                                     advertised by every Intel GPU since Gen9
+                                     (Meteor-Lake Xe-LPG included) and has no matrix
+                                     unit, so gating XMX on it silently ropes
+                                     non-DPAS Intel iGPUs into the DPAS kernel
+                                     (IGC emulates it — catastrophic slowdown). This
+                                     is the real XMX-capability gate. Declared LAST
+                                     so appending it leaves the other field offsets
                                      unmoved (ABI-safe for an app built against the
-                                     old DeviceCaps). [T8] */
+                                     old DeviceCaps). */
 
   /**
    * @brief One-line human-readable dump for the init-time log.
@@ -93,7 +103,8 @@ struct DeviceCaps {
        << "\", arch=" << (arch.empty() ? "-" : arch) << ", vendor_id=0x"
        << std::hex << vendor_id << std::dec << ", integrated=" << integrated
        << ", unified_memory=" << unified_memory << ", subgroups=" << subgroups
-       << ", image_v8c=" << image_v8c << ", compute_units=" << compute_units
+       << ", image_v8c=" << image_v8c << ", dpas=" << dpas
+       << ", compute_units=" << compute_units
        << ", max_alloc_bytes=" << max_alloc_bytes << "}";
     return os.str();
   }
@@ -106,7 +117,7 @@ struct DeviceCaps {
 enum class GemmPath {
   CPU,    /**< host CPU backend */
   DP4A,   /**< OpenCL dp4a / buffer int8xint4 (Adreno, non-XMX Intel) */
-  XMX,    /**< Intel Xe2/Xe3 systolic DPAS (cl_intel_subgroups present) */
+  XMX,    /**< Intel Xe2/Xe3 systolic DPAS (cl_intel_subgroup_matrix_multiply_accumulate present) */
   CUBLAS, /**< CUDA cuBLAS int8 + dp4a */
 };
 
@@ -173,7 +184,7 @@ inline ExecPlan resolveExecPlan(const DeviceCaps &c) {
   if (c.backend == "cuda")
     p.gemm_path = GemmPath::CUBLAS;
   else if (c.backend == "gpu")
-    p.gemm_path = c.subgroups ? GemmPath::XMX : GemmPath::DP4A;
+    p.gemm_path = c.dpas ? GemmPath::XMX : GemmPath::DP4A;
   else
     p.gemm_path = GemmPath::CPU;
   return p;
