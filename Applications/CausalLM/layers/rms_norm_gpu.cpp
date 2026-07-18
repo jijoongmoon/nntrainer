@@ -125,6 +125,7 @@ void RMSNormLayerGPU::incremental_forwarding(
   // [NNTR_NORM_DBG] one-shot raw-operand dump (see CudaRMSNormLayer twin):
   // compares ACTUAL gamma/input bytes across engines. gamma/in are SVM
   // host-visible on the OpenCL path.
+#ifdef ENABLE_FP16
   if (std::getenv("NNTR_NORM_DBG") != nullptr &&
       in.getDataType() == ml::train::TensorDim::DataType::FP16) {
     static bool once = false;
@@ -148,6 +149,7 @@ void RMSNormLayerGPU::incremental_forwarding(
       std::fflush(stderr);
     }
   }
+#endif
 
   const ml::train::TensorDim in_dim = in.getDim();
   const ml::train::TensorDim out_dim = out.getDim();

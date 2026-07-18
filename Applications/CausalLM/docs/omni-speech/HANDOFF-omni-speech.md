@@ -55,10 +55,28 @@ NNTR_CUDA_HOST_MAPPED=1, DEV_ACT=0, M2B=0) but only CPU-parity speed:
   31.1 s → 25.8 s. COORDINATE core (gauss) changes with the e1 PR effort
   before touching the allocator/async paths.
 
-**NEXT ACTION:** ① wire the Talker in-process (Talker codes currently arrive
-via codes.bin; full input→speech in one nntr_causallm run), ② the two CUDA
-perf items above if worth it after ①, ③ streaming/chunked synthesis for
-long replies.
+**ONE-SHOT PROMPT→SPEECH WORKS (2026-07-18 night):** `NNTR_ENGINE=cpu
+nntr_causallm <talker-dir> "<prompt>"` runs Thinker→Talker→DiT→BigVGAN in
+one process (talker nntr_config: thinker_model_path + token2wav_model_path
++ speech_output). Verified: thinker reply 16/16 HF-exact, talker codes
+127/127 HF-exact, 61440-sample wav out; ~180 s CPU e2e.
+⚠️ **MUST build with `-Denable-fp16=false` on x86 for the talker**: with
+fp16 ON, the ENABLE_FP16-gated mha_core x86 path (fp16 KV cache) produces
+WILDLY wrong codec ids (first code 3505 vs 8028; degenerate 4216 repeats)
+— reproduced by Stage A with HF inputs, and confirmed absent pre-merge
+(worktree at 138d315fa) AND absent with fp16 off on the merged tree.
+This is a real bug (not precision) in the gauss x86 fp16 KV/attention
+path for the talker's GQA 14/2 + head_dim 64 shape; the thinker's shape
+is unaffected. Root-cause pending — coordinate with e1 before touching
+mha_core. Two merge-era fixes already landed: async-tokenizer join in
+runEndToEnd, and fp16-off build portability (rms_norm_gpu _FP16 guard,
+[[maybe_unused]] in mha_core/causal_lm).
+
+**NEXT ACTION:** ① root-cause the x86 fp16 KV mha_core bug (Stage A repro
+above makes it a 30-second test), ② the two CUDA perf items, ③ streaming/
+chunked synthesis, ④ ECAPA/DiT graph reuse polish (per-utterance Token2Wav
+construction in speakCodes re-loads 1.7 GB each call — cache it for
+multi-utterance sessions).
 
 **FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3, and MIND THE transformers<5 PIN (§3.7).
 

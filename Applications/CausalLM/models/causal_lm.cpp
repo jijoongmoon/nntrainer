@@ -399,7 +399,7 @@ CausalLM::incrementalInference(unsigned int batch_size,
   // device) so generate() can run the on-GPU argmax instead of host max_element.
   g_cuda_logits_dev = nullptr;
 #endif
-  bool first_output = true;
+  [[maybe_unused]] bool first_output = true;
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
     const size_t buf_size =

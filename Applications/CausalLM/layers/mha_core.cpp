@@ -1506,7 +1506,8 @@ static double _kvst_t0 = 0;
 static double _kvst_acc01 = 0, _kvst_acc_k = 0, _kvst_acc_v = 0,
               _kvst_acc_a = 0;
 static int _kvst_n = 0;
-static void _kvst_mark_scatter(double t1, double tk, double tv, double t2) {
+[[maybe_unused]] static void _kvst_mark_scatter(double t1, double tk,
+                                                double tv, double t2) {
   if (_kvst_t0 == 0)
     return;
   _kvst_acc01 += t1 - _kvst_t0;
@@ -3568,8 +3569,8 @@ void MHACoreLayer::gemm_attention(
   // loop below dequantizes on the fly using cur_kv_int8_*_scale_batch.
   const uint16_t *Kbase = nullptr;
   const uint16_t *Vbase = nullptr;
-  const int8_t *Kbase_i8 = nullptr;
-  const int8_t *Vbase_i8 = nullptr;
+  [[maybe_unused]] const int8_t *Kbase_i8 = nullptr;
+  [[maybe_unused]] const int8_t *Vbase_i8 = nullptr;
   if (kv_int8) {
     Kbase_i8 =
       reinterpret_cast<const int8_t *>(b_cached_key.getData<uint8_t>());
