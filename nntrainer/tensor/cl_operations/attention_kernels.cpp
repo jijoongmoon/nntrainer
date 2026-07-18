@@ -3032,14 +3032,9 @@ bool flash_attention_prefill_f16_cl(const uint16_t *Q_host,
     // fixed LDS tree). Prefer the tree under the determinism contract unless
     // the user explicitly asked for SG. Cost: the +85% M=1024 attention lever
     // is lost (494 vs 136 ms) — prefill-only.
-    // Windows (r19): keep the SG path under the contract — measured 9/9
-    // reproducible WITH the vendor reduce on this driver, while the tree pin
-    // re-introduced divergence (r16 X2 4/4, r19 bundle 5/6) at −26% prefill.
-#ifndef _WIN32
     const char *det = std::getenv("NNTR_DETERMINISTIC");
     if (det && det[0] == '1')
       return 0;
-#endif
     return v8c_use_buffer_path() ? 1 : 0; // [T8] Intel buffer ⇒ 1
   }();
   // FLASH_COOP_LWS: WG size for the coop variant (work-items cooperating

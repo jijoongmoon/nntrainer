@@ -2279,13 +2279,6 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // Default-ON for Xe3 (cl_context.cpp setenv on Intel); value-parsed so
     // NNTR_XE3_FC_SYNC=0 disables. See the coherence note at the setenv site.
     static const bool xe3_fc_sync = []() {
-#ifdef _WIN32
-      // [r19 determinism] the post-FC drain is the other half of the minimal
-      // Windows reproducibility pair — the contract forces it on.
-      const char *det = std::getenv("NNTR_DETERMINISTIC");
-      if (det && det[0] == '1')
-        return true;
-#endif
       const char *e = std::getenv("NNTR_XE3_FC_SYNC");
       return e && std::atoi(e) != 0;
     }();
