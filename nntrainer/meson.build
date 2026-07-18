@@ -42,6 +42,10 @@ if get_option('enable-htp')
   nntrainer_base_deps += hexkl_dep
 endif
 
+if get_option('enable-cuda')
+  nntrainer_base_deps += cuda_dep
+endif
+
 if host_machine.system() == 'android'
   nntrainer_base_deps += meson.get_compiler('cpp').find_library('log')
   nntrainer_base_deps += meson.get_compiler('cpp').find_library('android')
@@ -69,6 +73,10 @@ if get_option('enable-opencl')
   nntrainer_elements += 'layers/cl_layers'
 
   nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
+endif
+
+if get_option('enable-cuda')
+  nntrainer_elements += 'cuda'
 endif
 
 if get_option('enable-npu')
@@ -112,6 +120,13 @@ endif
 if get_option('enable-htp')
   nntrainer_headers += meson.current_source_dir() / 'htp_context.h'
   nntrainer_common_sources += 'htp_context.cpp'
+endif
+
+if get_option('enable-cuda')
+  nntrainer_headers += meson.current_source_dir() / 'cuda_context.h'
+  nntrainer_headers += meson.current_source_dir() / 'cuda_mem_allocator.h'
+  nntrainer_common_sources += 'cuda_context.cpp'
+  nntrainer_common_sources += 'cuda_mem_allocator.cpp'
 endif
 
 foreach s : nntrainer_common_sources
