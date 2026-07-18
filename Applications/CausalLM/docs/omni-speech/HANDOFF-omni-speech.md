@@ -60,23 +60,30 @@ nntr_causallm <talker-dir> "<prompt>"` runs Thinker→Talker→DiT→BigVGAN in
 one process (talker nntr_config: thinker_model_path + token2wav_model_path
 + speech_output). Verified: thinker reply 16/16 HF-exact, talker codes
 127/127 HF-exact, 61440-sample wav out; ~180 s CPU e2e.
-⚠️ **MUST build with `-Denable-fp16=false` on x86 for the talker**: with
-fp16 ON, the ENABLE_FP16-gated mha_core x86 path (fp16 KV cache) produces
-WILDLY wrong codec ids (first code 3505 vs 8028; degenerate 4216 repeats)
-— reproduced by Stage A with HF inputs, and confirmed absent pre-merge
-(worktree at 138d315fa) AND absent with fp16 off on the merged tree.
-This is a real bug (not precision) in the gauss x86 fp16 KV/attention
-path for the talker's GQA 14/2 + head_dim 64 shape; the thinker's shape
-is unaffected. Root-cause pending — coordinate with e1 before touching
-mha_core. Two merge-era fixes already landed: async-tokenizer join in
-runEndToEnd, and fp16-off build portability (rms_norm_gpu _FP16 guard,
-[[maybe_unused]] in mha_core/causal_lm).
+**RESOLVED (same night): the "fp16 bug" was an input-ORDER mismatch, not
+a kernel bug.** The compiled graph's external-input order depends on the
+cache-placeholder kind: UINT16 builds (input layers) give [input0,
+mrope_cos, mrope_sin, caches...]; ENABLE_FP16 builds (raw named tensors,
+createKVCachePlaceholders #ifdef) realize the caches BETWEEN input0 and
+the mrope inputs -> [input0, caches..., mrope_cos, mrope_sin]. The
+talker's buildInferenceInputs hardcoded the pre-merge layout, so on fp16
+builds the zero-filled cache slabs were mapped onto mrope_cos/sin
+(cos==0 wipes Q/K -> first code 3505 vs 8028). Cache-slab misordering is
+harmless (slabs are interchangeable), which is why every no-side-input
+model (thinker, gemma, qwen3) never noticed. Fixed by probing
+model->getInputDimension() (graph input #1 width == HEAD_DIM -> mrope
+first). Both builds now pass Stage A 127/127; fp16 KV precision is
+sufficient (exact codes). Diagnosis trail: pre-merge worktree baseline,
+fp16-off differential, NNTR_DUMP_STATS node diff (mrope_cos == 0), and a
+temporary graph-input map dump. Also landed: async-tokenizer join in
+runEndToEnd, fp16-off build portability (rms_norm_gpu _FP16 guard,
+[[maybe_unused]] in mha_core/causal_lm). LESSON for future side-input
+models: never assume graph input order — probe dims or widths.
 
-**NEXT ACTION:** ① root-cause the x86 fp16 KV mha_core bug (Stage A repro
-above makes it a 30-second test), ② the two CUDA perf items, ③ streaming/
-chunked synthesis, ④ ECAPA/DiT graph reuse polish (per-utterance Token2Wav
+**NEXT ACTION:** ① the two CUDA perf items (§DiT-on-CUDA), ② streaming/
+chunked synthesis, ③ ECAPA/DiT graph reuse polish (per-utterance Token2Wav
 construction in speakCodes re-loads 1.7 GB each call — cache it for
-multi-utterance sessions).
+multi-utterance sessions), ④ push the branch / upstream the fixes.
 
 **FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3, and MIND THE transformers<5 PIN (§3.7).
 

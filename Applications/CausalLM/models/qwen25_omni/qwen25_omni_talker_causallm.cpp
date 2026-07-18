@@ -441,8 +441,16 @@ void Qwen25OmniTalkerCausalLM::initialize() {
 
 std::vector<float *>
 Qwen25OmniTalkerCausalLM::buildInferenceInputs(float *input_sample) {
-  // Compiled graph order: input0, mrope_cos, mrope_sin (created right after
-  // the proj), then the per-layer KV caches (name-sorted).
+  // The compiled graph's external-input ORDER differs by cache-placeholder
+  // kind: UINT16 builds create explicit input layers inside the decoder
+  // blocks -> [input0, mrope_cos, mrope_sin, caches...]; ENABLE_FP16 builds
+  // create raw named tensors (createKVCachePlaceholders #ifdef) that the
+  // graph realizes AFTER the explicit inputs -> [input0, caches...,
+  // mrope_cos, mrope_sin]. Feeding mrope at the wrong slots maps the
+  // zero-filled cache slabs onto the M-RoPE tables (cos==0 wipes Q/K —
+  // wildly wrong codec ids), so disambiguate against the actual graph:
+  // graph input #1 is mrope_cos (width == HEAD_DIM) in the first layout
+  // and a cache slab (width == 2 * n_kv * HEAD_DIM) in the second.
   std::vector<std::pair<std::string, float *>> caches;
   caches.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
   for (int i = 0; i < NUM_LAYERS; ++i) {
@@ -456,13 +464,25 @@ Qwen25OmniTalkerCausalLM::buildInferenceInputs(float *input_sample) {
   std::sort(caches.begin(), caches.end(),
             [](const auto &a, const auto &b) { return a.first < b.first; });
 
+  bool mrope_first = true;
+  const auto in_dims = model->getInputDimension();
+  if (in_dims.size() >= 2 &&
+      in_dims[1].width() != static_cast<size_t>(HEAD_DIM))
+    mrope_first = false;
+
   std::vector<float *> in;
   in.reserve(3 + caches.size());
   in.push_back(input_sample);
-  in.push_back(mrope_cos.data());
-  in.push_back(mrope_sin.data());
+  if (mrope_first) {
+    in.push_back(mrope_cos.data());
+    in.push_back(mrope_sin.data());
+  }
   for (const auto &c : caches)
     in.push_back(c.second);
+  if (!mrope_first) {
+    in.push_back(mrope_cos.data());
+    in.push_back(mrope_sin.data());
+  }
   return in;
 }
 
