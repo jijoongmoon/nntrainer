@@ -156,18 +156,26 @@ void ClContext::initialize() noexcept {
       const bool opencl_is_active =
         (active_engine == nullptr) || std::string(active_engine) == "gpu";
       if (opencl_is_active && caps_.vendor_id == DeviceCaps::VENDOR_INTEL) {
-        // Some Intel in-order-queue drivers do not give kernel->kernel
-        // coarse-grain SVM coherence for the v8c int8 FC GEMM (its SVM output
-        // is read stale by the next kernel), and the global NNTR_XE3_SYNC
-        // drain misses it. Drain after the FC GEMM instead
-        // (blas_kernel_interface.cpp) -- needed for small-M prefill
-        // coherence at ~negligible prefill cost. Override NNTR_XE3_FC_SYNC=0.
-        //
-        // Windows (WDDM) default-OFF: an extensive battery (cold-boot goldens,
-        // token-class A/B, long-context summarize, all with FC_SYNC=0) found
-        // no coherence failure attributable to skipping the drain there, and
-        // the drain costs ~15-25% decode on that stack. Linux keeps default-ON
-        // (the stale read reproduces there). Explicit env wins either way.
+        // XMX/DPAS GEMM default. Gated on the DPAS-specific extension
+        // (caps_.dpas), NOT the generic cl_intel_subgroups (present on every
+        // Intel GPU since Gen9, including matrix-engine-less Xe-LPG parts —
+        // defaulting XMX there ropes the device into software-emulated DPAS
+        // at a fraction of the dp4a fallback's speed).
+        if (caps_.dpas)
+          setenv("NNTR_FC_XMX", "1", 0);
+          // Some Intel in-order-queue drivers do not give kernel->kernel
+          // coarse-grain SVM coherence for the v8c int8 FC GEMM (its SVM output
+          // is read stale by the next kernel), and the global NNTR_XE3_SYNC
+          // drain misses it. Drain after the FC GEMM instead
+          // (blas_kernel_interface.cpp) -- needed for small-M prefill
+          // coherence at ~negligible prefill cost. Override NNTR_XE3_FC_SYNC=0.
+          //
+          // Windows (WDDM) default-OFF: an extensive battery (cold-boot
+          // goldens, token-class A/B, long-context summarize, all with
+          // FC_SYNC=0) found no coherence failure attributable to skipping the
+          // drain there, and the drain costs ~15-25% decode on that stack.
+          // Linux keeps default-ON (the stale read reproduces there). Explicit
+          // env wins either way.
 #ifdef _WIN32
         setenv("NNTR_XE3_FC_SYNC", "0", 0);
 #else
