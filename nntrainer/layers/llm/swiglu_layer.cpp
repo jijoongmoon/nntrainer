@@ -16,11 +16,7 @@
 #include <node_exporter.h>
 #include <tensor.h>
 
-// NOTE: the CUDA fast paths in this file are gated on NNTR_LLM_CUDA_FAST_PATH
-// (not ENABLE_CUDA directly): they call CUDA kernels that land in the later
-// CUDA-backend changes of this series. Those changes flip the gate back to
-// ENABLE_CUDA; until then an enable-cuda build compiles the host paths only.
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
@@ -78,7 +74,7 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
   // regardless of `from`, so the row math below is step-count-agnostic --
   // which is why the old `to - from != 1` assert could simply go.
 
-#if defined(NNTR_LLM_CUDA_FAST_PATH) && defined(ENABLE_FP16)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
   // engine=cuda device-resident fp16: one kernel instead of the host loop (the
   // getOps host path below would fault on the device-only activation pool under
   // NNTR_CUDA_DEV_ACT). Gated on FP16 + batch/channel==1; falls through for
