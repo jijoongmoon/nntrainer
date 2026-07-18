@@ -13,6 +13,10 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#endif
+
 #include "dit_gate.h"
 
 namespace causallm {
@@ -30,6 +34,11 @@ void DiTGateLayer::finalize(nntrainer::InitLayerContext &context) {
 
 void DiTGateLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // producer FCs may be in-flight cuBLAS kernels under NNTR_CUDA_ASYNC
+  nntrainer::cuda::drain_if_async();
+#endif
+
   nntrainer::Tensor &res = context.getInput(RES_IDX);
   nntrainer::Tensor &x = context.getInput(X_IDX);
   nntrainer::Tensor &cond = context.getInput(COND_IDX);

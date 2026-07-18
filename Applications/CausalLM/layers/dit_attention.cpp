@@ -15,6 +15,10 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#endif
+
 #include "dit_attention.h"
 
 namespace causallm {
@@ -64,6 +68,11 @@ void DiTAttentionLayer::setProperty(const std::vector<std::string> &values) {
 
 void DiTAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
                                    bool training) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // producer FCs may be in-flight cuBLAS kernels under NNTR_CUDA_ASYNC
+  nntrainer::cuda::drain_if_async();
+#endif
+
   nntrainer::Tensor &q = context.getInput(Q_IDX);
   nntrainer::Tensor &k = context.getInput(K_IDX);
   nntrainer::Tensor &v = context.getInput(V_IDX);
@@ -79,9 +88,12 @@ void DiTAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
   const int la = static_cast<int>(look_ahead);
   const int lb = static_cast<int>(look_backward);
 
-  std::vector<float> scores(seq);
   for (unsigned int b = 0; b < q.batch(); ++b) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (unsigned int h = 0; h < num_heads; ++h) {
+      std::vector<float> scores(seq);
       const size_t hoff = static_cast<size_t>(h) * hd;
       for (unsigned int i = 0; i < seq; ++i) {
         const float *qi = q.getData<float>() + q.getIndex(b, 0, i, 0) + hoff;

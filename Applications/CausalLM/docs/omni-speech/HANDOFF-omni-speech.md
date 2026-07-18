@@ -37,11 +37,28 @@ file-chained Talker→DiT→BigVGAN wav matches HF at max 2 int16 LSB (99.8% ≤
   (weights are length-agnostic). Full 127-code talker reply verified:
   60960-sample wav matches HF at max 2 int16 LSB (99.93% ≤1).
 
+**DiT-on-CUDA status (2026-07-18 evening):** opt-in via `NNTR_ENGINE=cuda`
+(default stays pure CPU). The 156 block FCs carry engine=cuda tags → cuBLAS
+FP32 SGEMM; custom dit_* layers + activations stay host (UVM-coherent).
+CORRECT in sync mode (Stage A 1.4e-5 / Stage B 2.5e-5; the model auto-sets
+NNTR_CUDA_HOST_MAPPED=1, DEV_ACT=0, M2B=0) but only CPU-parity speed:
+- pinned pool puts the 1.25 GB of WEIGHTS on PCIe every forward (GPU util
+  ~75% memory-bound); managed pool instead ping-pongs activation pages with
+  the host layers. The missing fast config is weights=managed +
+  activations=pinned — needs a small split in the cuda allocator policy
+  (nntrainer/cuda_mem_allocator.cpp use_host_mapped is pool-global today).
+- NNTR_CUDA_ASYNC=1 gives wrong output on this mixed cpu/cuda graph even
+  with drain_if_async() at every host consumer (dit_* layers + dit_act) —
+  ordering bug somewhere in the async submission path; gauss only validated
+  async on the all-managed quantized decode path. Keep ASYNC=0.
+- CPU got faster anyway: OpenMP over dit_attention heads → 64-code Stage B
+  31.1 s → 25.8 s. COORDINATE core (gauss) changes with the e1 PR effort
+  before touching the allocator/async paths.
+
 **NEXT ACTION:** ① wire the Talker in-process (Talker codes currently arrive
-via codes.bin; full input→speech in one nntr_causallm run), ② GPU-accelerate
-the DiT forwards (72 batch-1 evals at seq 254 ≈ 200 s CPU — the gauss v8c
-OpenCL/CUDA baseline is already merged into this branch), ③ streaming/chunked
-synthesis for long replies.
+via codes.bin; full input→speech in one nntr_causallm run), ② the two CUDA
+perf items above if worth it after ①, ③ streaming/chunked synthesis for
+long replies.
 
 **FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3, and MIND THE transformers<5 PIN (§3.7).
 

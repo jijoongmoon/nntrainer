@@ -117,11 +117,19 @@ causallm_scale_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-foreach _dl : ['dit_rope', 'dit_modulate', 'dit_gate', 'dit_attention']
+# dit_attention parallelizes its head loop with OpenMP when available;
+# all dit layers drain the CUDA stream before reading (mixed cpu/cuda graph)
+dit_omp_dep = dependency('openmp', required: false)
+dit_layer_deps = [nntrainer_dep, nntrainer_ccapi_dep, dit_omp_dep]
+if get_option('enable-cuda')
+    dit_layer_deps += cuda_dep
+endif
+
+foreach _dl : ['dit_rope', 'dit_modulate', 'dit_gate', 'dit_attention', 'dit_act']
     _lib = shared_library(_dl + '_layer',
         [meson.current_source_dir() / (_dl + '.cpp')],
         include_directories: causallm_layer_inc,
-        dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+        dependencies: dit_layer_deps,
         install: true,
         install_dir: application_install_dir
     )

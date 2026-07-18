@@ -23,6 +23,7 @@
 #include <llm_util.hpp>
 #include <model.h>
 
+#include <dit_act.h>
 #include <dit_attention.h>
 #include <dit_gate.h>
 #include <dit_modulate.h>
@@ -82,9 +83,21 @@ void Qwen25OmniDiT::registerCustomLayers() {
   reg(nntrainer::createLayer<causallm::DiTModulateLayer>);
   reg(nntrainer::createLayer<causallm::DiTGateLayer>);
   reg(nntrainer::createLayer<causallm::DiTAttentionLayer>);
+  reg(nntrainer::createLayer<causallm::DiTActLayer>);
 }
 
 void Qwen25OmniDiT::initialize() {
+  // Mixed cpu/cuda DiT profile, BEFORE the first Engine::Global() touch
+  // (cuda_context reads these at bring-up; setenv(,,0) keeps user overrides):
+  // pinned zero-copy activations avoid the managed-page ping-pong between the
+  // host dit_* layers and the cuBLAS FCs; the host consumers drain the stream
+  // themselves (dit_act / dit_* forwarding), so async submission is safe.
+  const char *eng = std::getenv("NNTR_ENGINE");
+  if (eng != nullptr && std::string(eng) == "cuda") {
+    setenv("NNTR_CUDA_HOST_MAPPED", "1", 0);
+    setenv("NNTR_CUDA_DEV_ACT", "0", 0);
+    setenv("NNTR_CUDA_M2B", "0", 0);
+  }
   registerCustomLayers();
   build_and_init();
 }
@@ -118,9 +131,20 @@ void Qwen25OmniDiT::build_and_init() {
     layers.push_back(createLayer(type, props));
   };
   auto S = [](unsigned int v) { return std::to_string(v); };
+  // FP32 FC on the CUDA backend (cuBLAS SGEMM over UVM) carries ~99% of the
+  // DiT FLOPs. Only FC goes on-device: activation/input aren't registered on
+  // the cuda context, and the dit_* custom layers are cpu-registered — UVM
+  // host coherence makes the mixed graph correct. engine=cuda tags would
+  // silently fall back to cpu without NNTR_ENGINE=cuda (context not brought
+  // up), so gate on the same env var.
+  const char *eng_env = std::getenv("NNTR_ENGINE");
+  const bool fc_cuda = eng_env != nullptr && std::string(eng_env) == "cuda";
   auto fc = [&](const std::string &name, unsigned int unit,
                 const std::string &inputs) {
-    add("fully_connected", name, {withKey("unit", S(unit))}, inputs);
+    std::vector<std::string> props = {withKey("unit", S(unit))};
+    if (fc_cuda)
+      props.push_back(withKey("engine", "cuda"));
+    add("fully_connected", name, std::move(props), inputs);
   };
 
   // graph inputs -- inference() maps buffers by THIS order (x, time, cos, sin)
@@ -134,10 +158,13 @@ void Qwen25OmniDiT::build_and_init() {
   fc("proj", HIDDEN, "input_x");
 
   // time path: time_mlp = Linear(256->1024) -> SiLU -> Linear(1024->1024);
-  // every AdaLN linear consumes SiLU(time_emb) (shared node).
-  fc("time_mlp0", HIDDEN, "input_time");
+  // every AdaLN linear consumes SiLU(time_emb) (shared node). M=1 GEMVs stay
+  // on cpu in cuda mode (device round-trip costs more than the math).
+  add("fully_connected", "time_mlp0", {withKey("unit", S(HIDDEN))},
+      "input_time");
   add("activation", "time_silu0", {withKey("activation", "swish")}, "time_mlp0");
-  fc("time_mlp1", HIDDEN, "time_silu0");
+  add("fully_connected", "time_mlp1", {withKey("unit", S(HIDDEN))},
+      "time_silu0");
   add("activation", "time_silu", {withKey("activation", "swish")}, "time_mlp1");
 
   std::string h = "proj";
@@ -171,8 +198,10 @@ void Qwen25OmniDiT::build_and_init() {
          withKey("shift_off", S(OFF_SHIFT_MLP))},
         p + "gate_a," + p + "adaln");
     fc(p + "ff0", FF_INNER, p + "mod_f");
-    add("activation", p + "gelu", {withKey("activation", "tanh_gelu")},
-        p + "ff0");
+    // dit_act drains the stream before reading ff0's async cuBLAS output;
+    // math is identical to the core activation layer
+    add(fc_cuda ? "dit_act" : "activation", p + "gelu",
+        {withKey(fc_cuda ? "fn" : "activation", "tanh_gelu")}, p + "ff0");
     fc(p + "ff3", HIDDEN, p + "gelu");
     add("dit_gate", p + "gate_f", {withKey("gate_off", S(OFF_GATE_MLP))},
         p + "gate_a," + p + "ff3," + p + "adaln");

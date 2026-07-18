@@ -14,6 +14,10 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#endif
+
 #include "dit_modulate.h"
 
 namespace causallm {
@@ -31,6 +35,11 @@ void DiTModulateLayer::finalize(nntrainer::InitLayerContext &context) {
 
 void DiTModulateLayer::forwarding(nntrainer::RunLayerContext &context,
                                   bool training) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // producer FCs may be in-flight cuBLAS kernels under NNTR_CUDA_ASYNC
+  nntrainer::cuda::drain_if_async();
+#endif
+
   nntrainer::Tensor &x = context.getInput(X_IDX);
   nntrainer::Tensor &cond = context.getInput(COND_IDX);
   nntrainer::Tensor &out = context.getOutput(OUT_IDX);

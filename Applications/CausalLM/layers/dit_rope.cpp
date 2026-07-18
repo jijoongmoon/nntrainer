@@ -12,6 +12,10 @@
 
 #include <stdexcept>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#endif
+
 #include "dit_rope.h"
 
 namespace causallm {
@@ -36,6 +40,11 @@ void DiTRoPELayer::finalize(nntrainer::InitLayerContext &context) {
 
 void DiTRoPELayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // producer FCs may be in-flight cuBLAS kernels under NNTR_CUDA_ASYNC
+  nntrainer::cuda::drain_if_async();
+#endif
+
   nntrainer::Tensor &x = context.getInput(X_IDX);
   nntrainer::Tensor &cos = context.getInput(COS_IDX);
   nntrainer::Tensor &sin = context.getInput(SIN_IDX);
