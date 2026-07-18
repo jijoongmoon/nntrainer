@@ -115,3 +115,7 @@ nntrainer_opencl_kernels/
 # session analysis artifacts (not procedure-encoding)
 .claude/reports/
 .claude/profiles/
+
+# generated Qwen2.5-Omni model dirs (weights + configs; regenerate with the
+# converters in Applications/CausalLM/res/qwen2.5-omni/, see omni handoff)
+Applications/CausalLM/models/qwen2.5-omni-3b*/
