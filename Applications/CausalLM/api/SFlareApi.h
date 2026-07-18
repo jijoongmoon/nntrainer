@@ -281,6 +281,19 @@ extern "C" WIN_EXPORT SFlareContext *initSFlare(bool &registered);
  */
 extern "C" WIN_EXPORT ErrorCode DestroySFlareContext(SFlareContext *context);
 
+/**
+ * @brief Probe whether an NVIDIA GPU is present, for backend auto-selection.
+ *        Uses only the CUDA RUNTIME API (cudaGetDeviceCount) -- it neither
+ *        creates a CUDA context nor allocates device memory, so calling it
+ *        (even repeatedly, even when the answer is "no GPU") has no
+ *        side effect on the eventual engine choice or its memory cost.
+ *        Safe to call before setSFlareOptions()/loadSFlareLLMModel().
+ * @return true if at least one CUDA-capable device is visible, false
+ *         otherwise (including builds without CUDA support, i.e.
+ *         !ENABLE_CUDA, and machines with no NVIDIA driver installed).
+ */
+extern "C" WIN_EXPORT bool detectNvidiaGpu();
+
 } // namespace SFlareApi
 
 #endif /* __SFLARE_API_H__ */

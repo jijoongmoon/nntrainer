@@ -24,6 +24,10 @@
 #include <factory.h>
 #include <model_registry.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_runtime.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -654,6 +658,28 @@ ErrorCode DestroySFlareContext(SFlareContext *context) {
     return ErrorCode::SFLARE_INVALID_INPUT;
   delete context;
   return ErrorCode::SFLARE_SUCCESS;
+}
+
+bool detectNvidiaGpu() {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // RUNTIME API only (cudart), never the driver API / ContextManager --
+  // cudaGetDeviceCount does not create a context or allocate, and on
+  // Windows cudart delay-loads nvcuda.dll itself, so this returns a clean
+  // "false" (no context/allocation cost) on a machine with no NVIDIA
+  // driver instead of faulting the process.
+  int count = 0;
+  cudaError_t err = cudaGetDeviceCount(&count);
+  if (err != cudaSuccess) {
+    // Not an error worth surfacing: "no NVIDIA driver" is the expected
+    // outcome on non-NVIDIA machines. Clear the sticky CUDA error state so
+    // it cannot leak into a later real CUDA call on this thread.
+    cudaGetLastError();
+    return false;
+  }
+  return count > 0;
+#else
+  return false;
+#endif
 }
 
 } // namespace SFlareApi

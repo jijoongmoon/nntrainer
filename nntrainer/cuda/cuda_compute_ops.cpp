@@ -18,6 +18,7 @@
 #include <env_compat.h>
 #include <compute_ops.h>
 #include <cpu_ops_table.h>
+#include <nntrainer_log.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -383,10 +384,26 @@ public:
             const char *e = std::getenv("NNTR_FC_CUBLAS_KMAX");
             return e ? (unsigned)atoi(e) : (1u << 20);
           }();
-          if (use_cublas_i8 && use_dp4a && M >= 32 && K <= (int)cublas_kmax)
+          const bool tried_cublas =
+            use_cublas_i8 && use_dp4a && M >= 32 && K <= (int)cublas_kmax;
+          if (tried_cublas)
             ok = cuda::cuda_fc_qs4cx_cublas_i8_gemm_fp16(
               (const uint16_t *)Xp, W, S, (uint16_t *)Yp, (unsigned)M,
               (unsigned)N, (unsigned)K);
+          if (tried_cublas && !ok) {
+            // One-time: cuBLAS was attempted (BlasManager initialized OK,
+            // NNTR_FC_CUDA_CUBLAS=1) but this call failed, so every
+            // subsequent qualifying GEMM in this process silently falls back
+            // to dp4a (~10x slower prefill) unless the caller is watching
+            // logs -- surface it once instead of letting it pass unnoticed.
+            static bool warned = false;
+            if (!warned) {
+              warned = true;
+              ml_logw("[CUDA] cuBLAS unavailable, falling back to dp4a GEMM "
+                      "(~10x slower prefill); check that the driver "
+                      "supports CUDA 13.x");
+            }
+          }
           if (!ok)
             ok = use_dp4a ? cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(
                               (const uint16_t *)Xp, W, S, (uint16_t *)Yp,

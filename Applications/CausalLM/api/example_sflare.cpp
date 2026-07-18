@@ -25,9 +25,11 @@
  *              chat_template.jinja there too -- without it the prompt is fed
  *              raw (no chat template) and instruction models drift.
  *   backend    intel = Intel Xe (XMX), cuda = NVIDIA, gpu = generic OpenCL,
- *              adreno = Qualcomm, cpu = host. First load latches the engine
- *              process-wide. (Intel dp4a = pass intel and export
- *              NNTR_FC_XMX=0 beforehand -- user env wins over the bundle.)
+ *              adreno = Qualcomm, cpu = host. Omitted = auto-select: cuda if
+ *              an NVIDIA GPU is detected (cudaGetDeviceCount), else intel.
+ *              First load latches the engine process-wide. (Intel dp4a =
+ *              pass intel and export NNTR_FC_XMX=0 beforehand -- user env
+ *              wins over the bundle.)
  *   prompt     literal text, or @file to summarize: the file's content is
  *              wrapped in a three-sentence summarization instruction (the
  *              SDK ships example/sample_text.txt, ~1K tokens, for this).
@@ -192,7 +194,26 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   const std::string model_dir = argv[1];
-  const std::string backend = argc >= 3 ? argv[2] : "intel";
+  // No explicit backend: auto-select rather than always landing on Intel --
+  // a customer box with both an NVIDIA dGPU and an Intel iGPU should get the
+  // dGPU. Probe is cudaGetDeviceCount() only (CUDA RUNTIME API): it neither
+  // creates a context nor allocates, so a non-NVIDIA machine pays nothing.
+  // An explicit argv[2] backend is untouched -- this only changes the
+  // no-arg default.
+  std::string backend;
+  if (argc >= 3) {
+    backend = argv[2];
+  } else if (SFlareApi::detectNvidiaGpu()) {
+    backend = "cuda";
+    std::fprintf(stderr,
+                 "[example] no backend given -- auto-selected \"cuda\" "
+                 "(NVIDIA GPU detected)\n");
+  } else {
+    backend = "intel";
+    std::fprintf(stderr,
+                 "[example] no backend given -- auto-selected \"intel\" "
+                 "(no NVIDIA GPU detected)\n");
+  }
   std::string prompt =
     argc >= 4 ? argv[3] : "What is the capital of South Korea?";
   bool kv_demo = false;
