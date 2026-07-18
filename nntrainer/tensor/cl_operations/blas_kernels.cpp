@@ -1613,6 +1613,147 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     }
     // Fall through to the m1 dispatch on any setup failure.
   }
+  // --- NNTR_FC_XMX: Intel Xe2 (Lunar Lake) XMX/DPAS prefill GEMM ------------
+  // Drop-in for the M>4 buffer-path v8c GEMM using int8 DPAS (systolic array).
+  // Raw-nibble + i8_u8 MMA -> acc_raw, then the SAME bias-correction + scale
+  // epilogue as the dp4a kernel (byte-identical output). Requires the buffer
+  // path (raw cl_mem) + the Intel matrix-multiply / 2d_block_io extensions; on
+  // a non-XMX device registerClKernel fails -> kx null -> fall through to dp4a.
+  // M is padded up to MT*8*SG_M (=32) by the grid; M_valid guards the stores
+  // and the A/weight 2D-block reads clamp OOB rows to 0 (surface height = M).
+  // FIX 1 (XMX/DPAS capability gate): NNTR_FC_XMX=0 force-disables (explicit
+  // override always wins). Otherwise (=1 or unset) XMX is only actually used
+  // when the device has a real matrix engine (caps().dpas, i.e.
+  // cl_intel_subgroup_matrix_multiply_accumulate) — cl_intel_subgroups alone
+  // (the old gate) is advertised by every Intel GPU since Gen9, including
+  // non-DPAS Xe-LPG "Arc" iGPUs, and registering gemm_xmx_i4 there let IGC
+  // silently emulate the DPAS builtin in software (~4.9 TPS observed).
+  // NNTR_FC_XMX_FORCE=1 (value-checked, not presence-checked) bypasses the
+  // capability requirement for debugging/benchmarking a non-DPAS device
+  // against the DPAS kernel.
+  static const bool xmx_fc = []() {
+    const char *e = getenv("NNTR_FC_XMX");
+    const bool requested = e ? (atoi(e) != 0) : true; // unset = default-on
+    if (e && atoi(e) == 0)
+      return false; // NNTR_FC_XMX=0 force-disables regardless of caps
+    const char *force = getenv("NNTR_FC_XMX_FORCE");
+    if (force && std::string(force) == "1")
+      return requested; // debug escape hatch: skip the capability check
+    return requested && ClContext::Global().caps().dpas;
+  }();
+  // One-shot warning (stderr + ml_logw): XMX was requested/defaulted but this
+  // device has no DPAS matrix engine, so the honest dp4a fallback runs
+  // instead (~1.8x slower than XMX, not a correctness issue).
+  static bool xmx_no_dpas_warned = false;
+  if (!xmx_no_dpas_warned) {
+    xmx_no_dpas_warned = true;
+    const char *e = getenv("NNTR_FC_XMX");
+    const bool requested = e ? (atoi(e) != 0) : true;
+    const char *force = getenv("NNTR_FC_XMX_FORCE");
+    const bool forced = force && std::string(force) == "1";
+    if (requested && !forced && !ClContext::Global().caps().dpas) {
+      ml_logw("[XMX] Intel GPU \"%s\" lacks the XMX/DPAS matrix engine "
+              "(no cl_intel_subgroup_matrix_multiply_accumulate) — using the "
+              "dp4a GEMM fallback (~1.8x slower than XMX, not a correctness "
+              "issue). If an NVIDIA GPU is present, backend=cuda will be "
+              "faster. Set NNTR_FC_XMX_FORCE=1 to force XMX for debugging.",
+              ClContext::Global().caps().device_name.c_str());
+    }
+  }
+  // One-shot diagnostic (stderr): why XMX/DPAS is or is not selected. On
+  // Windows the Intel driver may fail to compile gemm_xmx_i4 (matrix-MAD /
+  // 2d_block_io / 256-GRF), silently falling back to the ~40%-slower dp4a path.
+  static bool xmx_gate_logged = false;
+  if (!xmx_gate_logged) {
+    xmx_gate_logged = true;
+    const bool gate =
+      xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0;
+    // Quiet by default (SDK surface): always report the surprising case
+    // (XMX requested but gated OFF = silent perf loss), the rest only
+    // under NNTR_GPU_VERBOSE.
+    if ((xmx_fc && !gate) || std::getenv("NNTR_GPU_VERBOSE"))
+      fprintf(stderr,
+              "[XMX] xmx_fc=%d dpas=%d buf_kernel=%d M=%u N=%u K=%u -> "
+              "gate=%d%s\n",
+              (int)xmx_fc, (int)ClContext::Global().caps().dpas,
+              (int)buf_kernel, M, N, K, (int)gate,
+              gate ? "" : " (XMX skipped -> dp4a)");
+  }
+  if (xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0) {
+    // Shape-adaptive tile. The microbench's NT=4/SG_M=1 (tuned for the square
+    // N=K=4096 case) badly underutilizes the real FC shapes: NT=2 is broadly
+    // best, and SG_M (subgroups stacked along M, re-using the fetched N-block
+    // weight) must grow with the problem -- measured best/shape: large-K down
+    // proj -> SG8, large-N gate/up -> SG4..8, small (qwen3) -> SG1. e.g. gemma4
+    // gate/up (N6144,K1536) 2.76 -> 13.5 TOP/s, gemma2 down (N2304,K9216) ->
+    // 10.4. Each (MT,NT,SG_M) is a distinct -D copts string => registerClKernel
+    // caches a separate compiled program (key = name+copts). NNTR_XMX_NT /
+    // NNTR_XMX_SGM override the heuristic for tuning.
+    // NT=2 + SG_M=4 measured uniformly best IN-MODEL across gemma2/qwen3/gemma4
+    // (prefill +3% / +32% / +50% vs the microbench NT=4/SG_M=1). The standalone
+    // sweep favored SG_M=8 for the large-K down-proj, but that collapses
+    // occupancy in-model (gemma2 -32%), so SG_M=4 is the robust default.
+    int xmx_mt = 4, xmx_nt = 2, xmx_sgm = 4;
+    if (const char *e = getenv("NNTR_XMX_NT"))
+      xmx_nt = atoi(e);
+    if (const char *e = getenv("NNTR_XMX_SGM"))
+      xmx_sgm = atoi(e);
+    if (N % ((unsigned)xmx_nt * 16) != 0)
+      xmx_nt = 4; // N%64==0 guaranteed by the dispatch gate
+    char xmx_co[176];
+    snprintf(
+      xmx_co, sizeof(xmx_co),
+      "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -DMT=%d -DNT=%d -DSG_M=%d",
+      xmx_mt, xmx_nt, xmx_sgm);
+    ClContext::SharedPtrClKernel kx = blas_cc->registerClKernel(
+      int8_int8_gemm_xmx_kernel, "gemm_xmx_i4", std::string(xmx_co));
+    static bool xmx_reg_logged = false;
+    if (!xmx_reg_logged) {
+      xmx_reg_logged = true;
+      // FAILED always (silent perf loss otherwise); OK only when verbose.
+      if (!kx || std::getenv("NNTR_GPU_VERBOSE"))
+        fprintf(stderr, "[XMX] gemm_xmx_i4 registerClKernel -> %s\n",
+                kx ? "OK (DPAS/XMX engaged)"
+                   : "FAILED -> silent fallback to dp4a (slower)");
+    }
+    if (kx) {
+      int Mi = (int)M, Ni = (int)N, Ki = (int)K, Wa = (int)(K / 16),
+          Ww = (int)v8c_wrow_texels(K), Mv = (int)M_valid;
+      int a = 0;
+      const bool ok =
+        kx->SetKernelArguments(a++, &act_image, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &weight_image, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &scale_act, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &scale_wgt, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &row_sum_act, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &zp_act, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &row_sum_w_int4, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &output_fp16, sizeof(cl_mem)) &&
+        kx->SetKernelArguments(a++, &Mi, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Ni, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Ki, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Wa, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Ww, sizeof(int)) &&
+        kx->SetKernelArguments(a++, &Mv, sizeof(int));
+      if (ok) {
+        {
+          char lbl[48];
+          snprintf(lbl, sizeof(lbl), ":N%u_K%u", N, K);
+          blas_cc->command_queue_inst_.setNextProfileLabel(lbl);
+        }
+        const size_t mpwg = (size_t)xmx_mt * 8 * xmx_sgm; // rows per workgroup
+        const size_t Mpad = (((size_t)M + mpwg - 1) / mpwg) * mpwg;
+        const size_t npsz = (size_t)xmx_nt * 16; // cols per subgroup
+        std::array<size_t, 3> gws = {(size_t)(N / npsz) * 16,
+                                     Mpad / ((size_t)xmx_mt * 8), 1};
+        std::array<size_t, 3> lws = {16, (size_t)xmx_sgm, 1};
+        blas_cc->command_queue_inst_.enqueueKernel(
+          kx->GetKernel(), 2, gws.data(), lws.data(), 0, nullptr, nullptr);
+        return;
+      }
+    }
+    // fall through to dp4a on any failure
+  }
   ClContext::SharedPtrClKernel kp =
     blas_cc->registerClKernel(int8_int4_gemm_v8c_kernel, kname, copts);
   if (!kp)
