@@ -12,33 +12,26 @@
 
 #include "causal_lm_api.h"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "callback_streamer.h"
 #include "causal_lm.h"
 #include "chat_template.h"
-#include "gemma3_causallm.h"
-#if !defined(_WIN32)
-#include "gptoss_cached_slim_causallm.h"
-#endif
-#include "gptoss_causallm.h"
 #include "json.hpp"
 #include "model_config_internal.h"
+#include "model_registry.h"
 #include "qwen25_omni_audio_causallm.h"
 #include "qwen25_omni_audio_encoder.h"
 #include "qwen25_omni_causallm.h"
-#include "qwen2_causallm.h"
-#if !defined(_WIN32)
-#include "qwen3_cached_slim_moe_causallm.h"
-#endif
-#include "qwen3_causallm.h"
-#include "qwen3_moe_causallm.h"
-#include "qwen3_slim_moe_causallm.h"
 #include <factory.h>
 #include <fstream>
 #include <sys/stat.h>
@@ -50,12 +43,17 @@ using json = nlohmann::json;
 
 static std::unique_ptr<causallm::Transformer> g_model;
 static std::mutex g_mutex;
-static bool g_initialized = false;
+// cancelModel() cannot take g_mutex, so this flag is the lock-free published
+// loaded-model predicate. It is set only after g_model is ready to run.
+static std::atomic<bool> g_initialized{false};
+static std::mutex g_active_model_mutex;
+static causallm::CausalLM *g_active_model = nullptr;
+static std::string g_architecture = "";
 static bool g_use_chat_template = false;
 static bool g_verbose = false;
 static std::string g_last_output = "";
 static double g_initialization_duration_ms = 0.0;
-static causallm::ChatTemplate g_chat_template;
+static std::unique_ptr<causallm::ChatTemplate> g_chat_template;
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
@@ -71,24 +69,151 @@ struct RegisteredModel {
 static std::map<std::string, RegisteredModel> g_model_registry;
 static std::map<std::string, ModelArchConfig> g_arch_config_map;
 
-// Helper to register models (similar to main.cpp)
-// ensuring factory is populated.
+#ifdef ENABLE_TEST
+namespace causal_lm_api_test {
+using ActiveRunPublishHook = void (*)(void *);
+using BeforeCancelRequestHook = void (*)(void *);
+} // namespace causal_lm_api_test
+#endif
+
+namespace {
+
+#ifdef ENABLE_TEST
+causal_lm_api_test::ActiveRunPublishHook g_after_active_run_publish_hook =
+  nullptr;
+void *g_after_active_run_publish_user_data = nullptr;
+causal_lm_api_test::BeforeCancelRequestHook g_before_cancel_request_hook =
+  nullptr;
+void *g_before_cancel_request_user_data = nullptr;
+#endif
+
+/** @brief RAII guard that tracks the currently active CausalLM run. */
+class ActiveRunGuard {
+public:
+  explicit ActiveRunGuard(causallm::CausalLM *model) : model_(model) {
+    if (model_ != nullptr) {
+      std::lock_guard<std::mutex> lock(g_active_model_mutex);
+      g_active_model = model_;
+    }
+  }
+
+  ~ActiveRunGuard() {
+    if (model_ != nullptr) {
+      std::lock_guard<std::mutex> lock(g_active_model_mutex);
+      if (g_active_model == model_)
+        g_active_model = nullptr;
+    }
+  }
+
+  ActiveRunGuard(const ActiveRunGuard &) = delete;
+  ActiveRunGuard &operator=(const ActiveRunGuard &) = delete;
+
+private:
+  causallm::CausalLM *model_;
+};
+
+void notifyAfterActiveRunPublishForTest() {
+#ifdef ENABLE_TEST
+  auto *hook = g_after_active_run_publish_hook;
+  if (hook != nullptr)
+    hook(g_after_active_run_publish_user_data);
+#endif
+}
+
+void notifyBeforeCancelRequestForTest() {
+#ifdef ENABLE_TEST
+  auto *hook = g_before_cancel_request_hook;
+  if (hook != nullptr)
+    hook(g_before_cancel_request_user_data);
+#endif
+}
+
+void resolveNntrConfigPath(json &nntr_cfg, const std::string &key,
+                           const std::string &model_dir_path) {
+  if (!nntr_cfg.contains(key) || !nntr_cfg[key].is_string())
+    return;
+
+  std::filesystem::path path = nntr_cfg[key].get<std::string>();
+  if (path.empty() || path.is_absolute())
+    return;
+
+  nntr_cfg[key] = (std::filesystem::path(model_dir_path) / path).string();
+}
+
+} // namespace
+
+#ifdef ENABLE_TEST
+namespace causal_lm_api_test {
+
+void setAfterActiveRunPublishHookForTest(ActiveRunPublishHook hook,
+                                         void *user_data) {
+  g_after_active_run_publish_hook = hook;
+  g_after_active_run_publish_user_data = user_data;
+}
+
+void setBeforeCancelRequestHookForTest(BeforeCancelRequestHook hook,
+                                       void *user_data) {
+  g_before_cancel_request_hook = hook;
+  g_before_cancel_request_user_data = user_data;
+}
+
+void setModelForTest(std::unique_ptr<causallm::Transformer> model,
+                     const std::string &architecture) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  {
+    std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
+    g_active_model = nullptr;
+  }
+  g_model = std::move(model);
+  g_initialized.store(g_model != nullptr, std::memory_order_release);
+  g_architecture = architecture;
+  g_last_output.clear();
+  g_chat_template.reset();
+}
+
+void resetForTest() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  {
+    std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
+    g_active_model = nullptr;
+  }
+  g_model.reset();
+  g_initialized.store(false, std::memory_order_release);
+  g_architecture.clear();
+  g_use_chat_template = false;
+  g_verbose = false;
+  g_last_output.clear();
+  g_initialization_duration_ms = 0.0;
+  g_chat_template.reset();
+  g_after_active_run_publish_hook = nullptr;
+  g_after_active_run_publish_user_data = nullptr;
+  g_before_cancel_request_hook = nullptr;
+  g_before_cancel_request_user_data = nullptr;
+}
+
+std::string resolveNntrConfigPathForTest(const std::string &value,
+                                         const std::string &model_dir_path) {
+  json nntr_cfg;
+  nntr_cfg["path"] = value;
+  resolveNntrConfigPath(nntr_cfg, "path", model_dir_path);
+  return nntr_cfg["path"].get<std::string>();
+}
+
+} // namespace causal_lm_api_test
+#endif
+
+// Helper to register models, ensuring factory is populated.
 // @note: Factory registration is singleton and persistent, but we do it once
-// here to be sure. Since main.cpp is not linked, we must duplicate registration
-// or share it. Assuming this lib is used independently of main.cpp.
+// here to be sure. This delegates to the shared causallm::registerAllModels()
+// (models/model_registry.h) so this lib registers the same set of models as
+// main.cpp without duplicating the registration list.
 static void register_models() {
   static std::once_flag flag;
   std::call_once(flag, []() {
-    causallm::Factory::Instance().registerModel(
-      "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
-                                                    nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen2CausalLM>(cfg, generation_cfg,
-                                                         nntr_cfg);
-      });
+    causallm::registerAllModels();
+
+    // Omni models are not part of the shared registry yet; register them
+    // here in addition to the shared set.
     for (const char *omni_arch :
          {"Qwen2_5OmniModel", "Qwen2_5OmniForConditionalGeneration",
           "Qwen2_5OmniThinkerForConditionalGeneration"}) {
@@ -109,48 +234,6 @@ static void register_models() {
         return std::make_unique<causallm::Qwen25OmniAudioCausalLM>(
           cfg, generation_cfg, nntr_cfg);
       });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3CausalLM>(cfg, generation_cfg,
-                                                         nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3MoECausalLM>(cfg, generation_cfg,
-                                                            nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3SlimMoeForCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3SlimMoECausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#if !defined(_WIN32)
-    causallm::Factory::Instance().registerModel(
-      "Qwen3CachedSlimMoeForCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3CachedSlimMoECausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#endif
-    causallm::Factory::Instance().registerModel(
-      "GptOssForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::GptOssForCausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#if !defined(_WIN32)
-    causallm::Factory::Instance().registerModel(
-      "GptOssCachedSlimCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::GptOssCachedSlimCausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#endif
-    causallm::Factory::Instance().registerModel(
-      "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
-                                                          nntr_cfg);
-      });
 
     // Register built-in configurations
     register_builtin_model_configs();
@@ -166,14 +249,35 @@ static const char *get_model_name_from_type(ModelType type) {
   }
 }
 
-static std::string apply_chat_template(const std::string &input) {
-  if (g_chat_template.isAvailable()) {
-    std::string formatted_input = g_chat_template.apply(input);
-    if (!formatted_input.empty()) {
-      return formatted_input;
+static std::string apply_chat_template(const std::string &architecture,
+                                       const std::string &input) {
+  // Use dynamic chat template from tokenizer_config.json if available
+  if (g_chat_template) {
+    try {
+      nlohmann::json request =
+        nlohmann::json::array({{{"role", "user"}, {"content", input}}});
+      return g_chat_template->apply(request);
+    } catch (const std::exception &e) {
+      std::cerr << "[Warning] Failed to apply chat template: " << e.what()
+                << ". Falling back to hardcoded templates." << std::endl;
     }
   }
 
+  // Fallback: hardcoded per-architecture templates
+  if (architecture == "LlamaForCausalLM") {
+    // Llama 2/3 chat format: [INST] {prompt} [/INST]
+    return "[INST] " + input + " [/INST]";
+  } else if (architecture == "Qwen2ForCausalLM" ||
+             architecture == "Qwen3ForCausalLM" ||
+             architecture == "Qwen3MoeForCausalLM" ||
+             architecture == "Qwen3SlimMoeForCausalLM" ||
+             architecture == "Qwen3CachedSlimMoeForCausalLM") {
+    return "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
+  } else if (architecture == "Gemma2ForCausalLM" ||
+             architecture == "Gemma3ForCausalLM") {
+    return "<start_of_turn>user\n" + input +
+           "<end_of_turn>\n<start_of_turn>model\n";
+  }
   return input;
 }
 
@@ -456,8 +560,14 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       nntr_cfg["fc_layer_dtype"] = std::string(rc.fc_layer_dtype);
       nntr_cfg["model_file_name"] = std::string(rc.model_file_name);
 
-      std::string t_file = rc.tokenizer_file;
-      nntr_cfg["tokenizer_file"] = model_dir_path + "/" + t_file;
+      nntr_cfg["tokenizer_file"] = std::string(rc.tokenizer_file);
+      if (strlen(rc.embedding_file_name) > 0)
+        nntr_cfg["embedding_file_name"] = std::string(rc.embedding_file_name);
+      if (strlen(rc.ple_file_name) > 0)
+        nntr_cfg["ple_file_name"] = std::string(rc.ple_file_name);
+      resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_dir_path);
+      resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_dir_path);
+      resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_dir_path);
 
       if (strlen(rc.lmhead_dtype) > 0) {
         nntr_cfg["lmhead_dtype"] = std::string(rc.lmhead_dtype);
@@ -483,32 +593,27 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
         causallm::LoadJsonFile(model_dir_path + "/generation_config.json");
       nntr_cfg = causallm::LoadJsonFile(model_dir_path + "/nntr_config.json");
 
-      if (nntr_cfg.contains("tokenizer_file")) {
-        std::string t_file = nntr_cfg["tokenizer_file"];
-        nntr_cfg["tokenizer_file"] = model_dir_path + "/" + t_file;
-      }
+      resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_dir_path);
+      resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_dir_path);
+      resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_dir_path);
     }
 
-    // Load chat template from tokenizer_config.json if available
-    std::string tc_path = model_dir_path + "/tokenizer_config.json";
-    if (check_file_exists(tc_path)) {
-      g_chat_template = causallm::ChatTemplate::fromFile(tc_path);
-      if (g_chat_template.isAvailable()) {
-        std::cout << "[Info] Chat template loaded from tokenizer_config.json"
-                  << std::endl;
-      } else {
-        std::cerr
-          << "[Warning] tokenizer_config.json found but chat template could "
-             "not be loaded. Chat formatting will not be applied to raw input."
-          << std::endl;
+    // Load chat template from model directory if available
+    if (causallm::ChatTemplate::Exists(model_dir_path)) {
+      try {
+        g_chat_template = std::make_unique<causallm::ChatTemplate>(
+          causallm::ChatTemplate::Load(model_dir_path));
+        std::cout << "[Info] Chat template loaded from "
+                  << g_chat_template->sourcePath() << std::endl;
+      } catch (const std::exception &e) {
+        g_chat_template.reset();
+        std::cerr << "[Warning] Failed to load chat template: " << e.what()
+                  << ". Falling back to hardcoded templates." << std::endl;
       }
     } else {
-      g_chat_template = causallm::ChatTemplate();
-      std::cerr << "[Warning] tokenizer_config.json not found in "
-                << model_dir_path
-                << ". Chat template will not be available for raw input "
-                   "formatting."
-                << std::endl;
+      g_chat_template.reset();
+      std::cerr << "[Warning] No chat template found in " << model_dir_path
+                << ". Using hardcoded templates." << std::endl;
     }
 
     // Construct weight file path
@@ -535,6 +640,11 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       return CAUSAL_LM_ERROR_INVALID_PARAMETER;
     }
 
+    {
+      std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
+      g_active_model = nullptr;
+    }
+    g_initialized.store(false, std::memory_order_release);
     g_model = causallm::Factory::Instance().create(architecture, cfg,
                                                    generation_cfg, nntr_cfg);
     if (!g_model) {
@@ -544,7 +654,8 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     g_model->initialize();
     g_model->load_weight(weight_file);
 
-    g_initialized = true;
+    g_initialized.store(true, std::memory_order_release);
+    g_architecture = architecture;
 
     auto finish_init = std::chrono::high_resolution_clock::now();
     auto init_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -563,7 +674,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
 }
 
 ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
-  if (!g_initialized || !g_model) {
+  if (!g_initialized.load(std::memory_order_acquire)) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
   if (inputTextPrompt == nullptr || outputText == nullptr) {
@@ -572,17 +683,26 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
 
   try {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized.load(std::memory_order_acquire) || !g_model) {
+      return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+    }
+
+    auto *causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
 
     std::string input(inputTextPrompt);
 
     if (g_use_chat_template) {
-      input = apply_chat_template(input);
+      input = apply_chat_template(g_architecture, input);
     }
+
+    if (causal_lm_model != nullptr)
+      causal_lm_model->prepareForRun();
+    ActiveRunGuard active_run_guard(causal_lm_model);
+    notifyAfterActiveRunPublishForTest();
 
     // We assume single batch request for this API.
     g_model->run(input, false, "", "", g_verbose);
 
-    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
     g_last_output = ""; // Reset last output
     if (causal_lm_model) {
       g_last_output = causal_lm_model->getOutput(0);
@@ -598,8 +718,76 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
   return CAUSAL_LM_ERROR_NONE;
 }
 
+ErrorCode runModelStreaming(const char *inputTextPrompt,
+                            const char **outputText,
+                            CausalLmTokenCallback callback, void *user_data) {
+  if (inputTextPrompt == nullptr || outputText == nullptr ||
+      callback == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+  if (!g_initialized.load(std::memory_order_acquire)) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized.load(std::memory_order_acquire) || !g_model) {
+      return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+    }
+
+    auto *causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
+    if (causal_lm_model == nullptr) {
+      return CAUSAL_LM_ERROR_UNKNOWN;
+    }
+
+    std::string input(inputTextPrompt);
+
+    if (g_use_chat_template) {
+      input = apply_chat_template(g_architecture, input);
+    }
+
+    CallbackStreamer streamer;
+    callback_streamer_init(&streamer, callback, user_data);
+    causal_lm_model->setStreamer(&streamer.base);
+
+    struct StreamerDetachGuard {
+      causallm::CausalLM *model;
+      ~StreamerDetachGuard() { model->setStreamer(nullptr); }
+    } detach_guard{causal_lm_model};
+
+    causal_lm_model->prepareForRun();
+    ActiveRunGuard active_run_guard(causal_lm_model);
+    notifyAfterActiveRunPublishForTest();
+
+    g_model->run(input, false, "", "", g_verbose);
+
+    g_last_output = causal_lm_model->getOutput(0);
+    *outputText = g_last_output.c_str();
+
+  } catch (const std::exception &e) {
+    std::cerr << "Exception in runModelStreaming: " << e.what() << std::endl;
+    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode cancelModel(void) {
+  if (!g_initialized.load(std::memory_order_acquire)) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+
+  std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
+  if (g_active_model != nullptr) {
+    notifyBeforeCancelRequestForTest();
+    g_active_model->requestStop();
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
 ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
-  if (!g_initialized || !g_model) {
+  if (!g_initialized.load(std::memory_order_acquire)) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
   if (metrics == nullptr) {
@@ -608,6 +796,9 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
 
   try {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized.load(std::memory_order_acquire) || !g_model) {
+      return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+    }
 
     if (!g_model->hasRun()) {
       return CAUSAL_LM_ERROR_INFERENCE_NOT_RUN;

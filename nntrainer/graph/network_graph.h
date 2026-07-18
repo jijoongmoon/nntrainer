@@ -100,6 +100,27 @@ public:
   ~NetworkGraph() = default;
 
   /**
+   * @brief Route the weight/activation pools to a registered compute-engine's
+   *        allocator (empty string = leave that pool unchanged). For QNN graphs
+   *        we route ONLY the activation pool to "qnn" (rpcmem) so the QNN graph
+   *        I/O tensors are DMA-registerable, while weights stay on CPU. Must be
+   *        called before allocateTensors()/allocateWeights().
+   */
+  void setComputeBackend(const std::string &weight_backend,
+                         const std::string &tensor_backend) {
+    std::shared_ptr<MemAllocator> w, t;
+    if (!weight_backend.empty())
+      w = Engine::Global()
+            .getRegisteredContext(weight_backend)
+            ->getMemAllocator();
+    if (!tensor_backend.empty())
+      t = Engine::Global()
+            .getRegisteredContext(tensor_backend)
+            ->getMemAllocator();
+    tensor_manager->setComputeBackend(std::move(w), std::move(t));
+  }
+
+  /**
    * @brief     Compile the graph
    * @param[in] loss_type loss for the graph
    * returns ML_ERROR_NONE on success, error on failure
@@ -735,6 +756,34 @@ private:
    */
   LayerNode *computeBackwardEnd();
 };
+
+/**
+ * @brief cl_mem activation-residency edge map (paper §3.2 GPU residency).
+ *        Records, at graph finalize, the producer-output name for each
+ *        consumer-input name so a GPU CL layer can look up the resident cl_mem
+ *        TensorBacking its input was produced into (the runtime input Tensor
+ *        only knows its own view name, not the producing edge). CL-free (plain
+ *        strings) so the CPU build links it without OpenCL. Used by the
+ *        NNTR_RESIDENT_ACT overlay; inert otherwise.
+ */
+void registerResidentEdge(const std::string &consumer_input_name,
+                          const std::string &producer_output_name);
+/** @brief Resolve a consumer-input name to its producer-output name, or "". */
+std::string resolveResidentEdge(const std::string &consumer_input_name);
+
+/**
+ * @brief NNTR_DEVRES Step 0: record that a producer output is read by a consumer
+ *        running on the given engine. AND-accumulated across all consumers so
+ *        resolveProducerAllConsumersGpu() answers "is this activation consumed
+ *        ONLY on the GPU?" — the condition for keeping it device-resident.
+ *        CL-free; inert until a residency step reads it.
+ */
+void registerConsumerEngine(const std::string &producer_output_name,
+                            bool consumer_is_gpu);
+/** @brief True iff every recorded consumer of this producer output is GPU.
+ *         Unknown/graph-output producers resolve to false (needs host). */
+bool resolveProducerAllConsumersGpu(const std::string &producer_output_name);
+
 } // namespace nntrainer
 
 #endif /* __cplusplus */

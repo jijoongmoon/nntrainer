@@ -5,7 +5,7 @@ project('nntrainer', 'c', 'cpp',
   default_options: [
     'werror=true',
     'warning_level=1',
-    'c_std=gnu89',
+    'c_std=gnu17',
     'cpp_std=c++17',
     'buildtype=release'
   ]
@@ -75,7 +75,6 @@ warning_flags = [
   '-Wno-error=varargs',
   '-Wno-error=ignored-attributes',
   '-Wno-error=sign-compare',
-  '-Wdefaulted-function-deleted',
   '-ftree-vectorize',
   '-Wno-unused-variable',
   '-Wno-comment',
@@ -92,15 +91,16 @@ else
   warning_flags += '-Wno-maybe-uninitialized'
 endif
 
+warning_cxx_flags = [
+  '-Wdefaulted-function-deleted'
+]
+
 warning_c_flags = [
   '-Wmissing-declarations',
   '-Wmissing-include-dirs',
   '-Wmissing-prototypes',
   '-Wnested-externs',
-  '-Waggregate-return',
-  '-Wold-style-definition',
-  '-Wdeclaration-after-statement',
-  '-Wno-error=varargs'
+  '-Wold-style-definition'
 ]
 
 arch = host_machine.cpu_family()
@@ -154,9 +154,18 @@ else
   extra_defines += '-DKERNEL_CACHE=0'
 endif
 
+if get_option('platform') != 'android' and host_machine.cpu_family() == 'aarch64'
+  extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
+  extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
+endif
+
 if get_option('enable-fp16')
    if get_option('platform') == 'android'
-     add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+     # NDK clang (and non-ARM host compilers used for the meson-built QNN
+     # plugin) reject -mfp16-format=ieee; only pass it when supported.
+     if cxx.has_argument('-mfp16-format=ieee')
+       add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+     endif
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
    elif arch == 'aarch64'
@@ -213,7 +222,11 @@ if get_option('enable-fp16')
      error ('RISCV64 RVV support and fp16 support is not yet implemented.')
    else
      error ('FP16 support for this arch is not yet implemented.')
-   endif  
+   endif
+else
+  if arch == 'aarch64'
+    add_project_arguments('-march=armv8.2-a+dotprod+i8mm', language: ['c', 'cpp'])
+  endif
 endif
 
 if get_option('enable-mmap')
@@ -227,35 +240,142 @@ if get_option('enable-opencl')
   if get_option('platform') == 'android'
   endif
 
-  message ('OpenCL build is now enabled and will function only if an OpenCL-supported GPU is available. Using CLBlast as the OpenCL backend.')
   extra_defines += '-DENABLE_OPENCL=1'
   extra_defines += '-DCL_TARGET_OPENCL_VERSION=200'
-  clblast_options = cmake.subproject_options()
 
   if get_option('platform') == 'android'
     message('preparing opencl')
     run_command([meson.source_root() / 'jni' / 'prepare_opencl.sh', meson.build_root()], check: true)
-    clblast_root = subprojects_dir_absolute / 'CLBlast'
     opencl_root = meson.build_root() / 'opencl'
-    clblast_dep = declare_dependency()
-  else 
+  endif
+
+  if get_option('enable-clblast')
+    message ('OpenCL build is now enabled and will function only if an OpenCL-supported GPU is available. Using CLBlast as the OpenCL backend.')
+    extra_defines += '-DENABLE_CLBLAST=1'
     clblast_options = cmake.subproject_options()
-    clblast_options.add_cmake_defines({'CMAKE_POLICY_VERSION_MINIMUM': '3.10'})
-    clblast_options.add_cmake_defines({'CMAKE_CXX_STANDARD': '17'})
-    clblast_options.add_cmake_defines({'TUNERS': false})
-    clblast_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
-    if get_option('default_library') == 'static'
-      clblast_options.add_cmake_defines({'OVERRIDE_MSVC_FLAGS_TO_MT': false})
-      clblast_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
+    if get_option('platform') == 'android'
+      clblast_root = subprojects_dir_absolute / 'CLBlast'
+      clblast_dep = declare_dependency()
+    else
+      clblast_options = cmake.subproject_options()
+      clblast_options.add_cmake_defines({'CMAKE_POLICY_VERSION_MINIMUM': '3.10'})
+      clblast_options.add_cmake_defines({'CMAKE_CXX_STANDARD': '17'})
+      clblast_options.add_cmake_defines({'TUNERS': false})
+      clblast_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
+      if get_option('default_library') == 'static'
+        clblast_options.add_cmake_defines({'OVERRIDE_MSVC_FLAGS_TO_MT': false})
+        clblast_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
+      endif
+      clblast_proj = cmake.subproject('clblast', options: clblast_options, required: true)
+      clblast_dep = clblast_proj.dependency('clblast')
     endif
-    clblast_proj = cmake.subproject('clblast', options: clblast_options, required: true)
-    clblast_dep = clblast_proj.dependency('clblast')
+  else
+    message ('OpenCL build enabled WITHOUT CLBlast. Generic BLAS-via-OpenCL routes (clblast_interface.cpp callers) are stubbed; only the paper-aligned v8c int8/int4 GPU path is functional.')
+    # Keep clblast_dep defined as an empty dependency for downstream use.
+    clblast_dep = declare_dependency()
+  endif
+
+  # On non-android platforms, link the host ICD loader directly so libnntrainer.so
+  # resolves clCreateContext/clBuildProgram/etc. (android links a staged libOpenCL).
+  if get_option('platform') != 'android'
+    opencl_loader_dep = cxx.find_library('OpenCL', required: true)
+  else
+    opencl_loader_dep = declare_dependency()
   endif
 endif
 
 if get_option('opencl-kernel-path') != ''
   message ('OpenCL kernel path set to: @0@'.format(get_option('opencl-kernel-path')))
   extra_defines += '-DOPENCL_KERNEL_PATH=@0@'.format(get_option('opencl-kernel-path'))
+endif
+
+# Additive NVIDIA CUDA backend. Mirrors the OpenCL wiring above but is fully
+# independent: when enable-cuda is false this block is skipped and the OpenCL /
+# CPU builds are byte-identical. Kernels are compiled at runtime via NVRTC, so
+# the library build only needs to link cudart/nvrtc/cublas + the driver API.
+if get_option('enable-cuda')
+  if get_option('platform') == 'android'
+    error('enable-cuda is only supported on desktop NVIDIA platforms, not android')
+  endif
+
+  extra_defines += '-DENABLE_CUDA=1'
+
+  cuda_path = get_option('cuda-path')
+  cuda_incdir = include_directories(cuda_path / 'include')
+  cuda_libdir = cuda_path / 'lib64'
+
+  cudart_dep   = cxx.find_library('cudart',   dirs: cuda_libdir, required: true)
+  nvrtc_dep    = cxx.find_library('nvrtc',    dirs: cuda_libdir, required: true)
+  cublas_dep   = cxx.find_library('cublas',   dirs: cuda_libdir, required: true)
+  cublaslt_dep = cxx.find_library('cublasLt', dirs: cuda_libdir, required: true)
+  # libcuda (driver API: cuModuleLoad/cuLaunchKernel) ships with the NVIDIA
+  # driver; fall back to the toolkit stub if the driver lib is not on the
+  # default search path.
+  cudadrv_dep = cxx.find_library('cuda', required: false)
+  if not cudadrv_dep.found()
+    cudadrv_dep = cxx.find_library('cuda', dirs: cuda_libdir / 'stubs', required: true)
+  endif
+
+  # [W2 delay-load] On Windows the unified binary import-links cublas/nvrtc,
+  # which maps + faults ~245MB of CUDA DLL images into the working set of
+  # EVERY run — including pure OpenCL/XMX ones that never call CUDA
+  # (cublasLt64 alone measured 146MB resident on gauss4/Xe3, round-11
+  # fingerprint). /DELAYLOAD defers the LoadLibrary to the first actual
+  # call: engine=gpu runs never load them, engine=cuda is unchanged (the
+  # first cuBLAS/NVRTC call triggers the load). DLL names track the
+  # toolkit major (13.x); a stale name only costs a benign LNK4199.
+  if host_machine.system() == 'windows'
+    cuda_delayload_args = ['/DELAYLOAD:cublas64_13.dll',
+                           '/DELAYLOAD:cublasLt64_13.dll',
+                           '/DELAYLOAD:nvrtc64_130_0.dll',
+                           # nvcuda.dll is the NVIDIA driver's own DLL (not a
+                           # toolkit redistributable); without delay-loading it
+                           # too, the unified binary would hard-fail to load on
+                           # any machine with no NVIDIA driver at all -- the
+                           # backend-auto-probe (cudaGetDeviceCount, which is
+                           # cudart-only) must be callable before nvcuda is
+                           # ever touched.
+                           '/DELAYLOAD:nvcuda.dll',
+                           'delayimp.lib']
+  else
+    cuda_delayload_args = []
+  endif
+
+  cuda_dep = declare_dependency(
+    include_directories: cuda_incdir,
+    link_args: cuda_delayload_args,
+    dependencies: [cudart_dep, nvrtc_dep, cublas_dep, cublaslt_dep, cudadrv_dep],
+  )
+  message('CUDA backend enabled. Toolkit: ' + cuda_path)
+endif
+
+# Additive HexKL/HTP (Hexagon HMX NPU) backend. When enable-htp is false this
+# block is skipped and CPU/GPU builds are byte-identical; hexkl_dep is referenced
+# only under this guard (nntrainer/meson.build, tensor/htp_backend). ARM/Android
+# only — there is no x86 libsdkl.so.
+if get_option('enable-htp')
+  hexkl_root = get_option('hexkl-sdk-root')
+  if hexkl_root == ''
+    error('enable-htp=true requires -Dhexkl-sdk-root=<path to hexkl_addon>')
+  endif
+  hexkl_lib_dir = hexkl_root / 'lib' / get_option('hexkl-lib-subdir')
+  # remote.h / AEEStdErr.h live under <sdk_root>/incs and <sdk_root>/incs/stddef;
+  # the Hexagon SDK root is two levels up from the addon.
+  hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  hexkl_inc = include_directories(
+    hexkl_root / 'include',
+    hexagon_sdk_root / 'incs',
+    hexagon_sdk_root / 'incs' / 'stddef',
+    is_system: true)
+  libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
+  hexkl_dep = declare_dependency(
+    dependencies: libsdkl,
+    include_directories: hexkl_inc)
+  extra_defines += '-DENABLE_HEXKL=1'
+  # sdkl.h uses the C99 `restrict` keyword in C++ function signatures; the NDK
+  # C++ compiler needs it mapped to the builtin.
+  extra_defines += '-Drestrict=__restrict'
+  message('HTP/HexKL backend enabled, linking ' + hexkl_lib_dir / 'libsdkl.so')
 endif
 
 if get_option('enable-biqgemm')
@@ -287,6 +407,12 @@ if cc.get_id() != 'msvc' and cxx.get_id() != 'msvc'
     if cc.has_argument (extra_arg)
       add_project_arguments([extra_arg], language: 'c')
     endif
+    if cxx.has_argument (extra_arg)
+      add_project_arguments([extra_arg], language: 'cpp')
+    endif
+  endforeach
+
+  foreach extra_arg : warning_cxx_flags
     if cxx.has_argument (extra_arg)
       add_project_arguments([extra_arg], language: 'cpp')
     endif

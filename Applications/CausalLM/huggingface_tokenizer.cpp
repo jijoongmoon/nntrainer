@@ -4,6 +4,7 @@
  * \file huggingface_tokenizer.cc
  * \brief Huggingface tokenizer
  */
+#include <env_compat.h>
 #include <tokenizers_c.h>
 #include <tokenizers_cpp.h>
 

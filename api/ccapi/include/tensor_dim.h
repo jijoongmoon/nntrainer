@@ -53,7 +53,11 @@ public:
    * FP16 & FP32
    */
   enum class DataType {
-    QINT4,  /** quantized int 4*/
+    QINT4,  /** [DEPRECATED — use QS4CX] per-channel int4 (KAI Section-A on
+               disk). QS4CX is now the canonical int4 weight format (single
+               format read by CPU-KAI / GPU-v8c / CUDA / HexKL-NPU). QINT4 is
+               kept read-only for legacy .bin loading; new models build QS4CX
+               (res/<model>/build_qs4cx.sh). [Phase C 2026-07-01] */
     QINT8,  /** quantized int 8*/
     QINT16, /** quantized int 16*/
     BCQ,    /** binary-code-based quantized*/
@@ -61,6 +65,9 @@ public:
     Q6_K,   /** q6 k quantized */
     Q4_0,   /** Q4_0 k quantized */
     Q8_0,   /** Q8_0 k quantized (8-bit signed + fp16 scale per 32-element block) */
+    QS4CX,  /** QS4CX per-channel int4 — CANONICAL int4 weight format (plain
+               row-major nibbles + per-channel fp32 scale). Read natively by the
+               CPU KAI, GPU v8c, CUDA, and (future) HexKL NPU FC paths. */
     UINT4,  /** quantized unsigned int 4*/
     UINT8,  /** unsigned int 8 bit */
     UINT16, /** unsigned int 16 bit */
@@ -69,6 +76,17 @@ public:
     FP32,   /** single precision */
     NONE,   /** not specified */
   };
+
+  /**
+   * @brief True if @p d is a per-channel int4 WEIGHT format — the canonical
+   *        QS4CX or the deprecated QINT4 (both KAI qsi4cxp). Centralizes int4
+   *        dispatch so call sites stop enumerating (QINT4 || QS4CX). Once the
+   *        Phase C tensor-class collapse lands (single int4 DataType), this
+   *        reduces to one comparison. [Phase C 2026-07-01]
+   */
+  static bool isInt4Weight(DataType d) {
+    return d == DataType::QINT4 || d == DataType::QS4CX;
+  }
 
   /**
    * @brief Tensor Data Storage Order. Row-major or Column-major

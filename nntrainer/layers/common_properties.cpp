@@ -32,6 +32,11 @@ Name::Name() : nntrainer::Property<std::string>() {}
 Name::Name(const std::string &value) { set(value); }
 
 void Name::set(const std::string &value) {
+  // NOTE: names are lowercased here. Removing this breaks model compilation
+  // because graph connection/name resolution assumes case-normalized names;
+  // a proper case-preserving fix must normalize ALL name references
+  // consistently (definitions, connections, shared_from, ensureName). Until
+  // then, layer names are effectively lowercase — converters must match.
   auto to_lower = [](const std::string &str) {
     std::string ret = str;
     std::transform(ret.begin(), ret.end(), ret.begin(),

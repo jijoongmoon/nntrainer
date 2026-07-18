@@ -11,12 +11,25 @@
  *
  */
 
+#include <env_compat.h>
 #include <addition_layer.h>
+#include <cstdio>
+#include <cstdlib>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <tensor.h>
 #include <util_func.h>
 
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+#include <blas_kernel_interface.h>
+#endif
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
 #include <layer_context.h>
 
 namespace nntrainer {
@@ -24,6 +37,8 @@ namespace nntrainer {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void AdditionLayer::finalize(InitLayerContext &context) {
+  if (!std::get<props::SkipPrefill>(add_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(add_props).get();
   context.setOutputDimensions({context.getInputDimensions()[0]});
 }
 
@@ -33,17 +48,19 @@ void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
   /** @todo check possibility for in-place of addition layer */
   for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
     const Tensor &input_ = context.getInput(idx);
-    if (!idx) {
-      hidden_.copy(input_);
-    } else {
-      hidden_.add_i(input_);
-    }
+    // idx 0 copies into hidden, the rest accumulate. The active backend's
+    // ComputeOps decides the residency path (GPU cl_mem/SVM vs host). [T7]
+    hidden_.getOps()->residual_op(hidden_, input_, /*accumulate=*/idx != 0);
   }
 }
 
 void AdditionLayer::incremental_forwarding(RunLayerContext &context,
                                            unsigned int from, unsigned int to,
                                            bool training) {
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
+
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   TensorDim hidden_dim = hidden_.getDim();
   TensorDim hidden_step_dim = hidden_dim;
@@ -54,6 +71,43 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // GPU residual add (the common 2-input fp16 device case): out = in0 + in1
+    // in one kernel, keeping the residual on-device. Opt-in (NNTR_CUDA_ELTWISE).
+    if (context.getNumInputs() == 2 &&
+        hidden_.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
+      if (gpu) {
+        const Tensor &i0 = context.getInput(0);
+        const Tensor &i1 = context.getInput(1);
+        TensorDim sd0 = i0.getDim(), sd1 = i1.getDim();
+        sd0.batch(1);
+        sd0.height(to - from);
+        sd1.batch(1);
+        sd1.height(to - from);
+        Tensor s0 =
+          i0.getSharedDataTensor(sd0, b * i0.getDim().getFeatureLen(), true);
+        Tensor s1 =
+          i1.getSharedDataTensor(sd1, b * i1.getDim().getFeatureLen(), true);
+        auto *a = reinterpret_cast<const unsigned short *>(s0.getData<_FP16>());
+        auto *bb = reinterpret_cast<const unsigned short *>(s1.getData<_FP16>());
+        auto *o =
+          reinterpret_cast<unsigned short *>(hidden_step.getData<_FP16>());
+        const bool dev = nntrainer::cuda::dev_accessible(a);
+        if (dev &&
+            cuda::cuda_add_fp16(a, bb, o, (unsigned int)hidden_step.size()))
+          continue;
+      }
+    }
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // The host residual path below reads GPU-produced UVM inputs on the CPU
+    // (copy()/add_i()). In async mode the producing kernels have not drained,
+    // so sync first; no-op in default (sync) mode.
+    nntrainer::cuda::drain_if_async();
+#endif
 
     /** @todo check possibility for in-place of addition layer */
     for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
@@ -66,13 +120,38 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
 
       Tensor input_step = input_.getSharedDataTensor(
         input_step_dim, b * input_dim.getFeatureLen(), true);
-      if (!idx) {
-        hidden_step.copy(input_step);
-      } else {
-        hidden_step.add_i(input_step);
-      }
+      // idx 0 copies into hidden_step, the rest accumulate. ComputeOps picks the
+      // residency path (the former AdditionLayerCl GPU body lives in
+      // ClComputeOps::residual_op; CPU/CUDA run the host copy/add). [T7]
+      hidden_step.getOps()->residual_op(hidden_step, input_step,
+                                        /*accumulate=*/idx != 0);
     }
   }
+
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+  // Paper §3.6 chain-residency hand-off: publish the residual_add
+  // output to a GPU TensorBacking so a downstream RMSNorm consumer
+  // (specifically fused_rmsnorm_quant_resident_fp32) can read its
+  // input from cl_mem and skip the per-call host upload. Gated by
+  // NNTR_RESIDUAL_PUBLISH=1; default off keeps the original
+  // pure-CPU contract intact. GPU-only: requires the OpenCL backend.
+  static const bool publish_on =
+    std::getenv("NNTR_RESIDUAL_PUBLISH") != nullptr;
+  if (publish_on &&
+      hidden_.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      hidden_.batch() == 1) {
+    publish_host_fp32_to_backing(hidden_, hidden_.getName());
+    static int trip = 0;
+    if (!trip && std::getenv("NNTR_RESIDUAL_PUBLISH_TRIP") != nullptr) {
+      trip = 1;
+      std::fprintf(stderr,
+                   "[RESIDUAL-PUBLISH] first publish: name=%s host_ptr=%p\n",
+                   hidden_.getName().c_str(),
+                   (void *)hidden_.getData<uint8_t>());
+      std::fflush(stderr);
+    }
+  }
+#endif
 }
 
 void AdditionLayer::calcDerivative(RunLayerContext &context) {

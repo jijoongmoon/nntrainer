@@ -144,6 +144,14 @@ public:
   ~ThreadManager();
 
   /**
+   * @brief Get the process-wide instance (out-of-line override of
+   *        Singleton<T>::Global() — one worker pool per process under shared
+   *        linking; see opencl::ContextManager::Global() for the full
+   *        static-vs-shared note).
+   */
+  static ThreadManager &Global();
+
+  /**
    * @brief parallize loop for given function
    * @param begin loop start index
    * @param end loop end index

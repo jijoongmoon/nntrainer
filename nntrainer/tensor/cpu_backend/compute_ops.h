@@ -40,6 +40,8 @@
 
 namespace nntrainer {
 
+class Tensor;
+
 /**
  * @class ComputeOps
  * @brief Abstract dispatch interface for tensor compute kernels.
@@ -380,6 +382,128 @@ public:
                                               float *sin_);
 #endif // ENABLE_FP16
 
+  // ===========================================================================
+  // Whole-op (Tensor-level) ops — the §11 op_table pattern: a thin neutral
+  // Layer owns structure/shape/orchestration while ComputeOps owns the whole
+  // kernel. Unlike the raw-pointer ops above, these take Tensors so the backend
+  // impl can introspect residency (isClMem/getClMem/isSVM) and bind device
+  // buffers directly. Default throws; CPU/CL/CUDA subclasses override. [T7]
+  // ===========================================================================
+
+  /**
+   * @brief GeGLU activation over the first `active_rows` rows starting at
+   *        `row_offset`: out = gelu_tanh(in1) * in2 ({gate, up} -> result).
+   *        in1/in2/out share shape; width() is the per-row element count.
+   */
+  virtual void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                     unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief SwiGLU activation over the first `active_rows` rows starting at
+   *        `row_offset`: out = silu(in1) * in2 = (in1 * sigmoid(in1)) * in2
+   *        ({gate, up} -> result). in1/in2/out share shape; width() is the
+   *        per-row element count.
+   */
+  virtual void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                      unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief Sigmoid-GLU over the first `active_rows` rows starting at
+   *        `row_offset`: out = sigmoid(in1) * in2 ({gate, up} -> result).
+   *        in1/in2/out share shape; width() is the per-row element count.
+   *        gauss4 attention output gate.
+   */
+  virtual void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                           unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief Sigmoid-add over the first `active_rows` rows starting at
+   *        `row_offset`: out = sigmoid(in1) + in2 ({gate, emb} -> result).
+   *        in1/in2/out share shape; width() is the per-row element count.
+   *        gauss4 PLE mix (method=1).
+   */
+  virtual void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
+                           unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief One residual-add operand: hidden = input (accumulate=false, the
+   *        first operand) or hidden += input (accumulate=true). The neutral
+   *        AdditionLayer calls this per input so the GPU backend can keep the
+   *        residual stream device-resident (cl_mem/SVM) while CPU/CUDA run the
+   *        host Tensor copy/add on the managed buffer.
+   */
+  virtual void residual_op(Tensor &hidden, const Tensor &input,
+                           bool accumulate);
+
+  /**
+   * @brief Fully-connected GEMM: output = input * weight. The neutral
+   *        FullyConnectedLayer owns the weight/bias binding and calls this for
+   *        the matmul, so the quantized accelerator path (OpenCL v8c w4a8 /
+   *        CUDA cuda_fc_qint4) lives in the op table instead of a forked Layer.
+   *        input/weight may carry residency state the impl reads, hence non-const.
+   */
+  virtual void fc(Tensor &input, Tensor &weight, Tensor &output);
+
+  /**
+   * @brief Optional one-time weight transform at load (e.g. the OpenCL v8c
+   *        repack). Default no-op; backends that benefit override it. Called
+   *        from the layer's read() after the weights are loaded.
+   */
+  virtual void fc_prebuild_weight(Tensor &weight) { (void)weight; }
+
+  /**
+   * @brief Fused activation epilogue: apply an element-wise activation in place
+   *        on a compute layer's output, after GEMM+bias. This is the op-table
+   *        half of the FusionRealizer (§10 T10): the neutral conv/fc layer calls
+   *        out.getOps()->apply_activation(out, act) instead of routing the data
+   *        through a separate ActivationLayer node, so the fusion is
+   *        backend-neutral — CpuComputeOps runs the host ActiFunc, and a GPU
+   *        backend can override with a kernel that fuses it into the GEMM
+   *        epilogue. @p act_type is an nntrainer::ActivationType cast to int (kept
+   *        as int here so compute_ops.h stays free of the layers headers); ACT_NONE
+   *        is a no-op.
+   */
+  virtual void apply_activation(Tensor &out, int act_type);
+
+  // ===========================================================================
+  // [HexKL/HTP] Accelerated NPU matmul ops. Declared LAST, at the vtable tail:
+  // appending here leaves every existing slot's index unmoved, so a rebuilt
+  // libnntrainer.so stays ABI-compatible with an app/ccapi built against the old
+  // vtable (Adreno verified by swapping only libnntrainer.so). A HexKL/HTP
+  // ComputeOps overrides these to route the matmul onto the Hexagon HMX tiles;
+  // every other backend keeps the defaults below, so callers that gate on
+  // supports_*() keep their existing path (byte-identical off-HTP).
+  // ===========================================================================
+  /** whether shgemm() (f32 act x f16 weight) is HMX-accelerated here */
+  virtual bool supports_shgemm() const { return false; }
+  /** whether the u8 act x i8 weight -> i32 -> fp32 matmul is HMX-accelerated */
+  virtual bool supports_shgemm_u8i8() const { return false; }
+  /** u8 activation x i8 weight -> i32 accumulate -> fp32 C (HexKL HMX FC op) */
+  virtual void shgemm_u8i8(unsigned int order, unsigned int M, unsigned int N,
+                           unsigned int K, const float *A, unsigned int lda,
+                           const int8_t *B, const float *wt_scale,
+                           const int32_t *zp_corr, float *C, unsigned int ldc) {
+    (void)order, (void)M, (void)N, (void)K, (void)A, (void)lda, (void)B,
+      (void)wt_scale, (void)zp_corr, (void)C, (void)ldc;
+    throwNotImplemented("shgemm_u8i8");
+  }
+  /** whether the u8 act x i4 weight -> i32 -> fp32 matmul is HMX-accelerated */
+  virtual bool supports_shgemm_u8i4() const { return false; }
+  /**
+   * u8 activation x i4 weight -> i32 accumulate -> fp32 C (HexKL HMX FC op for
+   * our QS4CX int4 weights). @p B_packed holds two signed 4-bit weights per byte
+   * (the QS4CX nibble layout); a HexKL/HTP ComputeOps repacks it into SDKL's WH
+   * format and dispatches sdkl_npu_mm_u8i4_i32.
+   */
+  virtual void shgemm_u8i4(unsigned int order, unsigned int M, unsigned int N,
+                           unsigned int K, const float *A, unsigned int lda,
+                           const uint8_t *B_packed, const float *wt_scale,
+                           const int32_t *zp_corr, float *C, unsigned int ldc) {
+    (void)order, (void)M, (void)N, (void)K, (void)A, (void)lda, (void)B_packed,
+      (void)wt_scale, (void)zp_corr, (void)C, (void)ldc;
+    throwNotImplemented("shgemm_u8i4");
+  }
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not
@@ -403,16 +527,14 @@ void ensureComputeOps();
 
 /**
  * @brief Get the active compute ops with lazy initialization.
+ * @note  Out-of-line on purpose (defined in compute_ops.cpp): the previous
+ *        inline definition dereferenced the extern g_compute_ops data symbol
+ *        from consumer modules — under default_library=shared on Windows the
+ *        auto-generated export .def covers functions but not data, so every
+ *        external TU that inlined this failed to link (LNK2019 on
+ *        g_compute_ops). An exported function keeps the data module-private.
  */
-inline ComputeOps *getComputeOps() {
-#if defined(__GNUC__) || defined(__clang__)
-  if (__builtin_expect(g_compute_ops == nullptr, 0))
-#else
-  if (g_compute_ops == nullptr)
-#endif
-    ensureComputeOps();
-  return g_compute_ops;
-}
+ComputeOps *getComputeOps();
 
 /**
  * @brief Initialize the CPU compute backend.
@@ -437,6 +559,17 @@ ComputeOps *get_cpu_ops();
 /** @brief OpenCL accelerator ComputeOps singleton. Defined when
  *  enable-opencl is on, in cl_operations/cl_compute_ops.cpp. */
 ComputeOps *get_cl_ops();
+#endif
+#ifdef ENABLE_CUDA
+/** @brief CUDA accelerator ComputeOps singleton. Defined when enable-cuda is
+ *  on, in cuda/cuda_compute_ops.cpp. */
+ComputeOps *get_cuda_ops();
+#endif
+#ifdef ENABLE_HEXKL
+/** @brief HexKL/HTP (Hexagon HMX NPU) ComputeOps singleton. Defined when
+ *  enable-htp is on, in tensor/htp_backend/htp_compute_ops.cpp. Degrades to the
+ *  CPU ops (HtpComputeOps : CpuComputeOps) when the NPU/skel is unavailable. */
+ComputeOps *get_htp_ops();
 #endif
 
 } // namespace nntrainer

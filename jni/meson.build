@@ -55,6 +55,20 @@ if iniparser_dep.found()
   and_conf.set('MESON_INIPARSER_ROOT', iniparser_root)
 endif
 
+# HexKL/HTP: expose the addon (sdkl.h + libsdkl.so) to the ndk-build as a
+# prebuilt shared library so the htp_backend sources compile and link without a
+# manual Android.mk patch. hexkl_root / hexkl_lib_dir come from the top-level
+# meson.build enable-htp block. All three vars must be defined for configure_file.
+if get_option('enable-htp')
+  and_conf.set('MESON_ENABLE_HEXKL', 1)
+  and_conf.set('MESON_HEXKL_ROOT', hexkl_root)
+  and_conf.set('MESON_HEXKL_LIB_DIR', hexkl_lib_dir)
+else
+  and_conf.set('MESON_ENABLE_HEXKL', 0)
+  and_conf.set('MESON_HEXKL_ROOT', '')
+  and_conf.set('MESON_HEXKL_LIB_DIR', '')
+endif
+
 if get_option('enable-ruy')
   if ruy_dep.found()
     and_conf.set('MESON_RUY_ROOT', ruy_root)
@@ -63,15 +77,20 @@ endif
 
 if get_option('enable-opencl')
   # Set OpenCL block markers to include the OpenCL sections
-  and_conf.set('MESON_ENABLE_OPENCL', 1) 
-  if clblast_dep.found()
+  and_conf.set('MESON_ENABLE_OPENCL', 1)
+  and_conf.set('MESON_CL_ROOT', opencl_root)
+  if get_option('enable-clblast')
+    and_conf.set('MESON_HAS_CLBLAST', 1)
     and_conf.set('MESON_CLBLAST_ROOT', clblast_root)
-    and_conf.set('MESON_CL_ROOT', opencl_root)
+  else
+    and_conf.set('MESON_HAS_CLBLAST', 0)
+    and_conf.set('MESON_CLBLAST_ROOT', '')
   endif
 else
   # Disable OpenCL
   and_conf.set('MESON_ENABLE_OPENCL', 0)
   # No OpenCL libraries needed
+  and_conf.set('MESON_HAS_CLBLAST', 0)
   and_conf.set('MESON_CLBLAST_ROOT', '')
   and_conf.set('MESON_CL_ROOT', '')
 endif
@@ -96,6 +115,16 @@ if ml_api_common_dep.found()
   and_conf.set('MESON_ML_API_COMMON_ROOT', ml_api_common_root)
 else
   error('ml api common dep is needed for the android build')
+endif
+
+if get_option('enable-npu')
+  and_conf.set('MESON_ENABLE_NPU', 1)
+  and_conf.set('MESON_QNN_SRCS', ' '.join(qnn_sources_abs))
+  and_conf.set('MESON_QNN_INCS', ' '.join(qnn_inc_abs))
+else
+  and_conf.set('MESON_ENABLE_NPU', 0)
+  and_conf.set('MESON_QNN_SRCS', '')
+  and_conf.set('MESON_QNN_INCS', '')
 endif
 
 configure_file(input: 'Android.mk.in', output: 'Android.mk',

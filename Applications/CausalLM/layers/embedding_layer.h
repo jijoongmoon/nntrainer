@@ -25,8 +25,128 @@
 
 #include <common_properties.h>
 #include <layer_impl.h>
+#include <tensor_dim.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace causallm {
+
+namespace props {
+
+/**
+ * @brief Path to a sidecar embedding LUT.
+ */
+class QuantizedLutPath final : public nntrainer::Property<std::string> {
+public:
+  static constexpr const char *key = "quantized_lut_path";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+/**
+ * @brief Output requantization scale for sidecar LUT decoding.
+ */
+class OutputQuantScale final : public nntrainer::Property<float> {
+public:
+  static constexpr const char *key = "output_quant_scale";
+  using prop_tag = nntrainer::float_prop_tag;
+};
+
+/**
+ * @brief Output requantization offset for sidecar LUT decoding.
+ */
+class OutputQuantOffset final : public nntrainer::Property<int> {
+public:
+  static constexpr const char *key = "output_quant_offset";
+  using prop_tag = nntrainer::int_prop_tag;
+};
+
+/**
+ * @brief Where save() writes this layer's weight instead of the model file
+ *        (sidecar extraction; used by nntr_quantize --ple_sidecar).
+ */
+class SidecarExportPath final : public nntrainer::Property<std::string> {
+public:
+  static constexpr const char *key = "sidecar_export_path";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+} // namespace props
+
+/**
+ * @brief Shared sidecar embedding LUT loaded from raw UINT16, JSON manifest,
+ *        or GGML (q4_0/q6_k) row payload.
+ *
+ * The payload is mmap'd read-only when possible (POSIX) so a multi-hundred-MB
+ * table stays out of resident memory and rows are paged in on demand; `bytes`
+ * is the fallback container (Windows / mmap failure). Always access the
+ * payload through data()/payload_size().
+ */
+struct QuantLut {
+  std::vector<uint8_t> bytes;
+  std::vector<float> row_scales;
+
+  float scale = 1.0f;
+  int offset = 0;
+  size_t in_dim = 0;
+  size_t out_dim = 0;
+
+  bool is_raw_u16 = false;
+  bool is_signed4 = false;
+
+  /// GGML row-block payload (Q4_0/Q6_K); NONE for the packed-4bit/raw formats.
+  nntrainer::TensorDim::DataType ggml_dtype = nntrainer::TensorDim::DataType::NONE;
+  size_t row_bytes = 0; ///< payload stride per row (ggml mode)
+
+  void *mmap_ptr = nullptr;
+  size_t mmap_len = 0;
+
+  const uint8_t *data() const {
+    return mmap_ptr ? static_cast<const uint8_t *>(mmap_ptr) : bytes.data();
+  }
+  size_t payload_size() const { return mmap_ptr ? mmap_len : bytes.size(); }
+
+  QuantLut() = default;
+  QuantLut(const QuantLut &) = delete;
+  QuantLut &operator=(const QuantLut &) = delete;
+  ~QuantLut();
+};
+
+/**
+ * @brief Load or return a cached sidecar embedding LUT by path.
+ */
+WIN_EXPORT std::shared_ptr<QuantLut>
+get_or_load_quant_lut(const std::string &path, size_t in_dim_hint = 0,
+                      size_t out_dim_hint = 0);
+
+/**
+ * @brief Decode one LUT row to FP32.
+ */
+WIN_EXPORT void decode_quant_lut_row_to_fp32(const QuantLut &lut,
+                                             size_t token_idx,
+                                             float layer_scale, float *output,
+                                             size_t output_len);
+
+/**
+ * @brief Decode one LUT row to UINT16 using naive float clamping.
+ */
+WIN_EXPORT void decode_quant_lut_row_to_uint16(const QuantLut &lut,
+                                               size_t token_idx,
+                                               float layer_scale,
+                                               uint16_t *output,
+                                               size_t output_len);
+
+/**
+ * @brief Decode one LUT row to UINT16 with output requantization.
+ */
+WIN_EXPORT void
+decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
+                               float layer_scale, float output_quant_scale,
+                               int output_quant_offset, uint16_t *output,
+                               size_t output_len);
 
 /**
  * @class   EmbeddingLayer
@@ -115,21 +235,34 @@ public:
   WIN_EXPORT void setProperty(const std::vector<std::string> &values) override;
 
   /**
-   * @copydic Layer::save()
+   * @copydoc Layer::save()
    */
-  WIN_EXPORT void save(std::ofstream &file,
-                       nntrainer::RunLayerContext &run_context, bool opt_var,
-                       ml::train::ExecutionMode mode, bool trainable,
-                       nntrainer::TensorDim::DataType dtype =
-                         nntrainer::TensorDim::DataType::NONE) const override;
+  WIN_EXPORT void save(
+    std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
+    ml::train::ExecutionMode mode, bool trainable,
+    nntrainer::TensorDim::DataType dtype = nntrainer::TensorDim::DataType::NONE,
+    ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
 
   inline static const std::string type = "embedding_layer";
 
 private:
+  void forwardSidecarLut(nntrainer::RunLayerContext &context, unsigned int from,
+                         unsigned int to);
+
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
-             nntrainer::props::Scale>
+             nntrainer::props::Scale, props::QuantizedLutPath,
+             props::OutputQuantScale, props::OutputQuantOffset,
+             props::SidecarExportPath>
     embedding_props;
   unsigned int weight_idx;
+  std::shared_ptr<QuantLut> quant_lut;
+  /** CUDA dev-act pinned staging (cudaHostAlloc), PER INSTANCE. This was a
+   *  function-scope static, which was safe while only the PLE used this class;
+   *  once embedding0 became an EmbeddingLayer too, both layers shared one
+   *  buffer and the second lookup overwrote the first one's still-in-flight
+   *  async H2D copy => corrupted residual seed => CUDA garbage. */
+  void *cuda_stage = nullptr;
+  size_t cuda_stage_cap = 0; ///< capacity in _FP16 elements
 };
 } // namespace causallm
 

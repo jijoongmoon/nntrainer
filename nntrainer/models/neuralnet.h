@@ -270,14 +270,15 @@ public:
   /**
    * @copydoc Model::save(const std::string &file_path, ml::train::ModelFormat
    * format, TensorDim::DataType dtype, const std::map<std::string,
-   * TensorDim::DataType> &layer_dtype_map);
+   * TensorDim::DataType> &layer_dtype_map, ml::train::ISA
+   * target_device);
    */
   void
   save(const std::string &file_path,
        ml::train::ModelFormat format = ml::train::ModelFormat::MODEL_FORMAT_BIN,
        TensorDim::DataType dtype = TensorDim::DataType::NONE,
-       const std::map<std::string, TensorDim::DataType> &layer_dtype_map = {})
-    override;
+       const std::map<std::string, TensorDim::DataType> &layer_dtype_map = {},
+       ml::train::ISA target_isa = ml::train::ISA::DEFAULT) override;
 
   /**
    * @copydoc Model::load(const std::string &file_path, ml::train::ModelFormat
@@ -420,6 +421,35 @@ public:
                         unsigned int init_seq_len, unsigned int from,
                         unsigned int to,
                         bool output_hidden_state = false) override;
+
+  /**
+   * @brief Disable the CUDA prefill-graph capture for the next forward(s).
+   * @note Used by the load-time warmup: the warmup must run EAGER so its FCs can
+   * grow the prefill scratch via cudaMalloc (a malloc inside capture invalidates
+   * the graph and makes the FC bail to the host i8mm path -> SIGILL on Orin).
+   * After the warmup grows all scratch, re-enable so the timed prefill captures.
+   */
+  void setPrefillCaptureDisabled(bool v) { prefill_capture_disabled_ = v; }
+  bool isPrefillCaptureDisabled() const { return prefill_capture_disabled_; }
+
+  /**
+   * @brief Accessors used by the runDecode seam (Context::runDecode / its
+   *        CudaContext override, T9) so the relocated CUDA-graph state machine
+   *        can drive a forward step without reaching into NeuralNetwork privates.
+   */
+  /// set the M2-B "feed only, skip the heavy compute" flag (read inside
+  /// incremental_forwarding); used by the M2-B per-token embedding refresh.
+  void setM2BSkipAll(bool v);
+  /// look up a graph node by name (M2-B light embedding refresh).
+  std::shared_ptr<LayerNode> getLayerNode(const std::string &name) const {
+    return model_graph.getLayerNode(name);
+  }
+  /// bind the current step's inputs/labels to the graph (M2-B light refresh).
+  void feedInputsLabels(const sharedConstTensors &inputs,
+                        const sharedConstTensors &labels) {
+    sharedConstTensors in = inputs, lb = labels;
+    model_graph.setInputsLabels(in, lb);
+  }
 
   /**
    * @brief     reset input dimensions of a model
@@ -657,6 +687,9 @@ public:
                const std::string file_path) override;
 
 private:
+  bool prefill_capture_disabled_ =
+    false; /**< gate for the CUDA prefill-graph capture (warmup runs eager) */
+
   using FlexiblePropTypes =
     std::tuple<props::Epochs, props::TrainingBatchSize, props::SavePath,
                props::ContinueTrain, props::SaveBestPath,
@@ -713,7 +746,33 @@ private:
   const Engine *ct_engine =
     nullptr; /** Configurations bound to current engine */
 
+  Context *decode_ctx_ =
+    nullptr; /**< resolved-once Context for the runDecode seam (T9); see
+                  getDecodeContext() */
+
+  /**
+   * @brief Resolve (once, then cache) the Context whose runDecode() drives the
+   *        decode/prefill forward. The CUDA backend overrides runDecode with the
+   *        graph state machine; every other backend uses the base plain walk, so
+   *        any registered context gives a byte-identical forward. Prefers the
+   *        "cuda" context when present (CUDA build), else falls back to "cpu".
+   * @return the decode Context, or nullptr if none is registered (caller then
+   *         walks directly).
+   */
+  Context *getDecodeContext();
+
   NetworkGraph model_graph; /** Network Model Graph */
+
+  /**< Set in compile() for graphs that contain a QNN/HTP engine. When true,
+   * inference() reuses the already-allocated tensor pool across calls instead
+   * of deallocating+reallocating it every call. QNN registers each activation
+   * tensor's rpcmem buffer with the DSP (rpcmem_to_fd/memRegister), so the
+   * per-tensor address must stay stable across decode tokens; reallocating
+   * every token hands out new addresses, defeats the registration cache, and
+   * churns the scarce contiguous CMA pool (rpcmem_to_fd failures under app UI
+   * dmabuf pressure). CPU/GPU paths keep the realloc-per-call behavior, which
+   * they rely on for correct per-call tensor state. */
+  bool reuse_inference_tensor_pool_ = false;
 
   GraphRepresentation graph_representation; /** Unsorted graph representation */
 

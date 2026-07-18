@@ -1,0 +1,1033 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
+ *
+ * @file   gauss4_causallm.h
+ * @date   16 Jun 2026
+ * @brief  Gauss4 CausalLM model.
+ * @author Joonseok Oh <jrock.oh@samsung.com>
+ *
+ */
+
+#include "gauss4_causallm.h"
+
+#include <app_context.h>
+#include <engine.h>
+#include <factory.h>
+#include <llm_util.hpp>
+#include <model.h>
+#include <reshaped_rms_norm.h>
+#include <per_layer_slice.h>
+#include <rms_reverse_norm.h>
+
+#include <fp16.h>
+#include <iostream>
+#include <string>
+#include <tensor.h>
+
+namespace causallm {
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+void Gauss4Transformer::appendSkipPrefillIfNeeded(
+  std::vector<std::string> &props, bool skip) const {
+  if (skip && ENABLE_SKIP_PREFILL_OPT) {
+    props.emplace_back(withKey("skip_prefill", "true"));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// setupParameters
+// ---------------------------------------------------------------------------
+
+void Gauss4Transformer::setupParameters(json &cfg, json &generation_cfg,
+                                        json &nntr_cfg) {
+  // Let base class read common params (DIM, NUM_HEADS, HEAD_DIM, etc.)
+  Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
+
+  // EMBEDDING_SCALE = 1.0 (PyTorch: h = embed_tokens(ids) -- no scaling)
+  EMBEDDING_SCALE = 1.0f;
+
+  // The new config has NO top-level rope_theta and NO sliding_window_pattern.
+  // Base class: SLIDING_WINDOW_PATTERN defaults to 1 when key absent.
+  // Gauss4 rule: pattern=5 (every 5th layer is full attention).
+  // Override if not explicitly set in config.
+  if (!cfg.contains("sliding_window_pattern")) {
+    SLIDING_WINDOW_PATTERN = 5;
+  }
+
+  // Gauss4 stores per-attention-type rope_theta under
+  // rope_parameters.{sliding_attention,full_attention}.rope_theta
+  // (sliding = 500000, full = 8000000). Apply the correct theta PER LAYER TYPE:
+  // sliding layers use the sliding value, full-attention layers (every 5th) use
+  // the full value. (The base ROPE_THETA reads the legacy global
+  // rope_parameters.rope_theta = 10000 and is not used by the attention
+  // builders, which read the per-type members below.)
+  if (cfg.contains("rope_parameters")) {
+    const auto &rp = cfg["rope_parameters"];
+    if (rp.contains("sliding_attention") &&
+        rp["sliding_attention"].contains("rope_theta")) {
+      SLIDING_ATTENTION_ROPE_THETA =
+        rp["sliding_attention"]["rope_theta"].get<double>();
+    }
+    if (rp.contains("full_attention") &&
+        rp["full_attention"].contains("rope_theta")) {
+      FULL_ATTENTION_ROPE_THETA =
+        rp["full_attention"]["rope_theta"].get<double>();
+    }
+    // Keep the base single ROPE_THETA in sync (defensive) for any legacy path.
+    ROPE_THETA = SLIDING_ATTENTION_ROPE_THETA;
+  }
+
+  USE_KV_SHARING =
+    cfg.contains("kv_sharing") ? cfg["kv_sharing"].get<bool>() : true;
+
+  if (USE_KV_SHARING) {
+    // Read from config.json (nntr_config.json has STALE values)
+    // sliding_attention_kv_layer=19 -> capture at INPUT of layer 19 = output of
+    // 18 full_attention_kv_layer=20    -> capture at INPUT of layer 20 = output
+    // of 19
+    NUM_SEQUENTIAL_LAYERS = cfg.contains("num_sequential_layers")
+                              ? cfg["num_sequential_layers"].get<unsigned int>()
+                              : 20;
+
+    unsigned int sliding_cfg =
+      cfg.contains("sliding_attention_kv_layer")
+        ? cfg["sliding_attention_kv_layer"].get<unsigned int>()
+        : 19;
+    SLIDING_ATTENTION_KV_LAYER = sliding_cfg - 1; // 19-1 = 18
+
+    unsigned int full_cfg =
+      cfg.contains("full_attention_kv_layer")
+        ? cfg["full_attention_kv_layer"].get<unsigned int>()
+        : 20;
+    FULL_ATTENTION_KV_LAYER = full_cfg - 1; // 20-1 = 19
+  } else {
+    NUM_SEQUENTIAL_LAYERS = static_cast<unsigned int>(NUM_LAYERS);
+    SLIDING_ATTENTION_KV_LAYER = 0;
+    FULL_ATTENTION_KV_LAYER = 0;
+  }
+
+  LATENT_SIZE_PER_GATE = cfg.contains("latent_size_per_gate")
+                           ? cfg["latent_size_per_gate"].get<unsigned int>()
+                           : 256;
+
+  MLP_LRA_RANK = cfg.contains("mlp_lra_rank")
+                   ? cfg["mlp_lra_rank"].get<unsigned int>()
+                   : 512;
+
+  HIDDEN_SIZE_PER_LAYER_INPUT =
+    cfg.contains("hidden_size_per_layer_input")
+      ? cfg["hidden_size_per_layer_input"].get<unsigned int>()
+      : 192;
+
+  PLE_ACT =
+    cfg.contains("ple_act") ? cfg["ple_act"].get<std::string>() : "sigmoid";
+
+  PLE_MIX_METHOD =
+    cfg.contains("ple_mix_method") ? cfg["ple_mix_method"].get<int>() : 1;
+
+  PLE_PRE_MLP =
+    cfg.contains("ple_pre_mlp") ? cfg["ple_pre_mlp"].get<bool>() : true;
+
+  ENABLE_SKIP_PREFILL_OPT =
+    nntr_cfg.contains("skip_prefill") && nntr_cfg["skip_prefill"].get<bool>();
+}
+
+// ---------------------------------------------------------------------------
+// KV cache placeholder helpers
+// ---------------------------------------------------------------------------
+
+std::pair<Tensor, Tensor>
+Gauss4Transformer::createGauss4KVCachePlaceholders(const int layer_id,
+                                                   unsigned int kv_width) {
+  const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
+#ifdef ENABLE_FP16
+  // On Android (ENABLE_FP16), the KV cache is FP16 — mirror the base
+  // CausalLM convention (transformer.cpp createKVCachePlaceholders /
+  // causal_lm.cpp allocateAndBindKVCache). The mha_core FP16 path writes FP16
+  // K/V values into the cache via copyData; a UINT16 cache would hit
+  // UIntTensor::copyData which has no FP16 source case and throws
+  // "Unsupported data type".
+  ml::train::TensorDim cache_dim(
+    {BATCH_SIZE, 1, max_timestep, kv_width},
+    {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP16});
+  Tensor cache_k(cache_dim, "cache_k_l" + std::to_string(layer_id));
+  Tensor cache_v(cache_dim, "cache_v_l" + std::to_string(layer_id));
+  return {cache_k, cache_v};
+#else
+  const std::string cache_shape = std::to_string(BATCH_SIZE) +
+                                  ":1:" + std::to_string(max_timestep) + ":" +
+                                  std::to_string(kv_width);
+
+  LayerHandle cache_k_input(createLayer(
+    "input",
+    {withKey("name", "cache_k_l" + std::to_string(layer_id)),
+     withKey("input_shape", cache_shape), withKey("input_dtype", "UINT16")}));
+  LayerHandle cache_v_input(createLayer(
+    "input",
+    {withKey("name", "cache_v_l" + std::to_string(layer_id)),
+     withKey("input_shape", cache_shape), withKey("input_dtype", "UINT16")}));
+
+  return {cache_k_input(Tensor()), cache_v_input(Tensor())};
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// constructModel
+// ---------------------------------------------------------------------------
+
+std::pair<Tensor, Tensor> Gauss4Transformer::constructModel() {
+  // Input token ids
+  Tensor x({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)}, "input0");
+
+  // Main embedding (no sqrt scaling -- PyTorch: h = embed_tokens(ids))
+  // TieWordEmbedding exists to share the table with a tied lm_head. With
+  // LMHEAD_UNTIE the head is a separate FC, so embedding0 is a plain
+  // embedding_layer — lookup-identical (mirrored dequant/scale/handoff code,
+  // same weight record) and it unlocks the mmap'd sidecar (embedding_file_name)
+  // that TieWordEmbedding structurally lacks.
+  const bool embedding_tied = TIE_WORD_EMBEDDINGS && !LMHEAD_UNTIE;
+  const std::string embedding_type =
+    embedding_tied ? "tie_word_embeddings" : "embedding_layer";
+  NNTR_THROW_IF(embedding_tied && !EMBEDDING_FILE_NAME.empty(),
+                std::invalid_argument)
+    << "embedding_file_name requires an untied embedding_layer (tied lm_head "
+       "scans every row per decode step, so a sidecar saves nothing)";
+  std::vector<std::string> embedding0_props = {
+    "name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
+    "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
+    "scale=" + std::to_string(EMBEDDING_SCALE)};
+  if (!embedding_tied && !EMBEDDING_FILE_NAME.empty())
+    embedding0_props.emplace_back(
+      withKey("quantized_lut_path", EMBEDDING_FILE_NAME));
+  if (!embedding_tied && !EMBD_SIDECAR_EXPORT.empty())
+    embedding0_props.emplace_back(
+      withKey("sidecar_export_path", EMBD_SIDECAR_EXPORT));
+  LayerHandle embedding(createLayer(embedding_type, embedding0_props));
+  Tensor h = embedding(x);
+
+  // ── Packed per-layer embedding (PLE) ────────────────────────────────────
+  // ONE lookup for ALL layers' per-layer embeddings, packed to
+  // [.., NUM_LAYERS * HIDDEN_SIZE_PER_LAYER_INPUT]. This mirrors HF gauss4
+  // (Gauss4Model.forward: per_layer_inputs[:, :, i, :]) and gemma4, where the
+  // per-layer embedding is materialized once and each decoder layer takes a
+  // GPU per_layer_slice. It replaces the previous per-layer host embedding
+  // lookup (a fresh embedding_layer inside every decoder block), which crossed
+  // a host->GPU boundary 35x per forward and raced the async GPU graph on
+  // coarse-grain SVM (Adreno crash/garbage; on Intel XMX it was masked only by
+  // the vendor-scoped coherence drains). Host lookup + raise happens once here.
+  const unsigned int per_layer_total_dim =
+    static_cast<unsigned int>(NUM_LAYERS) * HIDDEN_SIZE_PER_LAYER_INPUT;
+  // ple_file_name (nntr_config.json) points at a GGML q4_0/q6_k sidecar
+  // manifest: the table then lives OUTSIDE the model .bin, mmap'd and
+  // dequantized per token on demand instead of held resident (~1GB saved).
+  // ple_sidecar_export is the matching extraction key (nntr_quantize
+  // --ple_sidecar); mutually exclusive with ple_file_name.
+  std::vector<std::string> ple_embedding_props = {
+    withKey("name", "per_layer_input_embedding"),
+    withKey("in_dim", std::to_string(NUM_VOCAB)),
+    withKey("out_dim", std::to_string(per_layer_total_dim)),
+    withKey("weight_dtype", EMBEDDING_DTYPE)};
+  if (!PLE_FILE_NAME.empty())
+    ple_embedding_props.emplace_back(
+      withKey("quantized_lut_path", PLE_FILE_NAME));
+  if (!PLE_SIDECAR_EXPORT.empty())
+    ple_embedding_props.emplace_back(
+      withKey("sidecar_export_path", PLE_SIDECAR_EXPORT));
+  LayerHandle per_layer_embedding(
+    createLayer("embedding_layer", ple_embedding_props));
+  per_layer_input = per_layer_embedding(x);
+
+  // ── Normal decoder layers 0 .. NUM_SEQUENTIAL_LAYERS-1 ──────────────────
+  kv_sharing_sliding_tensor = Tensor();
+  kv_sharing_full_tensor = Tensor();
+
+  for (int i = 0; i < static_cast<int>(NUM_SEQUENTIAL_LAYERS); ++i) {
+    h = createTransformerDecoderBlock(i, h);
+
+    // Capture hidden state AFTER layer i for KV-sharing norms + rotation:
+    // PyTorch (modeling_gauss4.py Gauss4Model.forward()):
+    //   at i == sliding_attention_kv_layer (19):
+    //     shared_sliding = rotation_sliding(norm_kv_sharing_sliding(h))
+    //   at i == full_attention_kv_layer (20):
+    //     shared_full = rotation_full(norm_kv_sharing_full(h))
+    //
+    // C++ captures the ROTATION output as the shared tensor.
+    // SLIDING_ATTENTION_KV_LAYER = 18 (config 19-1) -> after layer 18 = layer
+    // 19 input FULL_ATTENTION_KV_LAYER    = 19 (config 20-1) -> after layer 19
+    // = layer 20 input
+    if (USE_KV_SHARING && i == static_cast<int>(SLIDING_ATTENTION_KV_LAYER)) {
+      // norm_kv_sharing_sliding
+      LayerHandle norm_sliding(
+        createLayer("rms_norm", {withKey("name", "norm_kv_sharing_sliding"),
+                                 withKey("epsilon", std::to_string(NORM_EPS)),
+                                 withKey("packed", "false"),
+                                 withKey("engine", causallm_engine())}));
+      Tensor normed_sliding = norm_sliding(h);
+
+      // rotation_sliding: FC(2688->2688, no bias)
+      LayerHandle rotation_sliding(createLayer(
+        "fully_connected",
+        {withKey("name", "rotation_sliding"), withKey("unit", DIM),
+         withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+         withKey("weight_dtype", FC_LAYER_DTYPE),
+         withKey("engine", causallm_engine())}));
+      kv_sharing_sliding_tensor = rotation_sliding(normed_sliding);
+    }
+    if (USE_KV_SHARING && i == static_cast<int>(FULL_ATTENTION_KV_LAYER)) {
+      // norm_kv_sharing_full
+      LayerHandle norm_full(
+        createLayer("rms_norm", {withKey("name", "norm_kv_sharing_full"),
+                                 withKey("epsilon", std::to_string(NORM_EPS)),
+                                 withKey("packed", "false"),
+                                 withKey("engine", causallm_engine())}));
+      Tensor normed_full = norm_full(h);
+
+      // rotation_full: FC(2688->2688, no bias)
+      LayerHandle rotation_full(createLayer(
+        "fully_connected",
+        {withKey("name", "rotation_full"), withKey("unit", DIM),
+         withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+         withKey("weight_dtype", FC_LAYER_DTYPE),
+         withKey("engine", causallm_engine())}));
+      kv_sharing_full_tensor = rotation_full(normed_full);
+    }
+  }
+
+  // ── KV-shared layers NUM_SEQUENTIAL_LAYERS .. NUM_LAYERS-1 ──────────────
+  if (USE_KV_SHARING) {
+    for (int i = static_cast<int>(NUM_SEQUENTIAL_LAYERS); i < NUM_LAYERS; ++i) {
+      h = createTransformerDecoderBlock(i, h);
+    }
+  }
+
+  // Output norm (skip_prefill=true)
+  std::vector<std::string> output_norm_props = {
+    withKey("name", "output_norm"),
+    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  output_norm_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(output_norm_props, true);
+  LayerHandle out_norm(createLayer("rms_norm", output_norm_props));
+  h = out_norm(h);
+
+  return {x, h};
+}
+
+// ---------------------------------------------------------------------------
+// createTransformerDecoderBlock
+// ---------------------------------------------------------------------------
+
+Tensor Gauss4Transformer::createTransformerDecoderBlock(const int layer_id,
+                                                        Tensor input) {
+  const bool is_shared_layer =
+    USE_KV_SHARING && layer_id >= static_cast<int>(NUM_SEQUENTIAL_LAYERS);
+  const bool is_sliding =
+    ((layer_id + 1) % static_cast<int>(SLIDING_WINDOW_PATTERN)) != 0;
+
+  // ── Input (pre-attention) RMS norm ──────────────────────────────────────
+  std::vector<std::string> attn_norm_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
+    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  attn_norm_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(attn_norm_props, is_shared_layer);
+  LayerHandle attn_norm(createLayer("rms_norm", attn_norm_props));
+  Tensor normed = attn_norm(input);
+
+  // ── Attention ────────────────────────────────────────────────────────────
+  Tensor att_out;
+  if (is_shared_layer) {
+    Tensor shared_kv_raw =
+      is_sliding ? kv_sharing_sliding_tensor : kv_sharing_full_tensor;
+
+    // PyTorch Gauss4DecoderLayer.forward() normalizes shared_states through the
+    // SAME input_layernorm before passing it to k_proj / v_proj:
+    //   shared_states = self.input_layernorm(shared_states)
+    // Mirror that by creating a second rms_norm that shares weights with the
+    // attention_norm already constructed above ("layer{id}_attention_norm").
+    // NOTE: kv_norm intentionally does NOT have skip_prefill=true even though
+    // this is a shared layer.  During prefill, kv_norm must run to produce the
+    // normalized shared_kv tensor so that wk/wv can compute the K/V projections
+    // and populate the KV cache for positions 0..(prefill_len-1).  Without
+    // this, shared-layer KV caches stay zeroed for all prefill positions,
+    // causing a systematic attention error in the first decode steps.
+    const std::string kv_norm_name =
+      "layer" + std::to_string(layer_id) + "_attention_norm_kv";
+    const std::string shared_from_name =
+      "layer" + std::to_string(layer_id) + "_attention_norm";
+    std::vector<std::string> kv_norm_props = {
+      withKey("name", kv_norm_name),
+      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+      withKey("shared_from", shared_from_name)};
+    kv_norm_props.push_back(withKey("engine", causallm_engine()));
+    // skip_prefill deliberately omitted here — see note above.
+    LayerHandle kv_norm(createLayer("rms_norm", kv_norm_props));
+    Tensor shared_kv = kv_norm(shared_kv_raw);
+
+    att_out = createSharedAttention(layer_id, normed, shared_kv);
+  } else {
+    att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
+                              normed, normed, normed);
+  }
+
+  // ── Residual 1: decoder_add = input + attn_out ────────────────────────
+  std::vector<std::string> dec_add_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")};
+  dec_add_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(dec_add_props, is_shared_layer);
+  LayerHandle dec_add_layer(createLayer("addition", dec_add_props));
+  Tensor decoder_add = dec_add_layer({input, att_out});
+
+  // ── Post-attention (pre-FFN) RMS norm ──────────────────────────────────
+  std::vector<std::string> ffn_norm_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
+    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  ffn_norm_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(ffn_norm_props, is_shared_layer);
+  LayerHandle ffn_norm(createLayer("rms_norm", ffn_norm_props));
+  Tensor ffn_in = ffn_norm(decoder_add);
+
+  // ── PLE input capture (ple_pre_mlp=true) ─────────────────────────────
+  // PyTorch: ple_states = hidden_states (= ffn_norm output, BEFORE MLP)
+  Tensor ple_input = PLE_PRE_MLP ? ffn_in : Tensor();
+
+  // ── FFN (LRA MLP) ────────────────────────────────────────────────────────
+  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_in);
+
+  // ── Per-Layer Embedding (PLE) ─────────────────────────────────────────
+  // For ple_pre_mlp=true: PLE gate input = ffn_norm output (pre-MLP)
+  // For ple_pre_mlp=false (old): PLE gate input = ffn_output (post-MLP)
+  Tensor ple_gate_input = PLE_PRE_MLP ? ple_input : ffn_out;
+  Tensor ple_out =
+    createPerLayerEmbedding(layer_id, ple_gate_input, is_shared_layer);
+
+  // ── residual: (decoder_add + ffn_output) then + ple_out ──────────────
+  // Two chained 2-input adds instead of one 3-input add, matching gemma4
+  // (decoder_output_base = post_attn + post_ffn; decoder_output = base +
+  // per_layer_input). The backends' fused/device add paths only cover the
+  // 2-input case: on CUDA the NNTR_CUDA_ELTWISE kernel requires
+  // getNumInputs()==2, so a 3-input add fell to the host residual loop and
+  // FAULTED on the device-resident activations (gauss4-CUDA SIGSEGV in
+  // AdditionLayer -> scopy_fp16); on OpenCL the 3-input case is an
+  // unvalidated 3-dispatch accumulation gemma4 never exercises.
+  std::vector<std::string> dec_base_props = {withKey(
+    "name", "layer" + std::to_string(layer_id) + "_decoder_output_base")};
+  dec_base_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(dec_base_props, is_shared_layer);
+  LayerHandle dec_base_layer(createLayer("addition", dec_base_props));
+  Tensor decoder_base = dec_base_layer({decoder_add, ffn_out});
+
+  std::vector<std::string> dec_out_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")};
+  dec_out_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(dec_out_props, is_shared_layer);
+  LayerHandle dec_out_layer(createLayer("addition", dec_out_props));
+  Tensor decoder_output = dec_out_layer({decoder_base, ple_out});
+
+  return decoder_output;
+}
+
+// ---------------------------------------------------------------------------
+// createAttention (layers 0-19, normal)
+// ---------------------------------------------------------------------------
+
+Tensor Gauss4Transformer::createAttention(const int layer_id, int /*seq_len*/,
+                                          int n_heads, int /*head_dim*/,
+                                          Tensor query, Tensor /*key*/,
+                                          Tensor /*value*/) {
+  const unsigned int kv_unit = static_cast<unsigned int>(HEAD_DIM) *
+                               static_cast<unsigned int>(NUM_KEY_VALUE_HEADS);
+  const unsigned int q_unit =
+    static_cast<unsigned int>(HEAD_DIM) * static_cast<unsigned int>(n_heads);
+  const unsigned int kv_width = kv_unit;
+
+  const bool is_sliding =
+    ((layer_id + 1) % static_cast<int>(SLIDING_WINDOW_PATTERN)) != 0;
+  const float rope_theta =
+    is_sliding ? static_cast<float>(SLIDING_ATTENTION_ROPE_THETA)
+               : static_cast<float>(FULL_ATTENTION_ROPE_THETA);
+  const unsigned int window_size = is_sliding ? SLIDING_WINDOW : UINT_MAX;
+
+  const std::string lname = "layer" + std::to_string(layer_id);
+
+  // ── Q projection ────────────────────────────────────────────────────────
+  LayerHandle wq(createLayer(
+    "fully_connected",
+    {withKey("name", lname + "_wq"), withKey("unit", q_unit),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE),
+     withKey("engine", causallm_engine())}));
+  Tensor q = wq(query);
+
+  // ── K projection ────────────────────────────────────────────────────────
+  LayerHandle wk(createLayer(
+    "fully_connected",
+    {withKey("name", lname + "_wk"), withKey("unit", kv_unit),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE),
+     withKey("engine", causallm_engine())}));
+  Tensor k = wk(query); // K/V also from attn_norm output
+
+  // ── V projection ────────────────────────────────────────────────────────
+  LayerHandle wv(createLayer(
+    "fully_connected",
+    {withKey("name", lname + "_wv"), withKey("unit", kv_unit),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE),
+     withKey("engine", causallm_engine())}));
+  Tensor v = wv(query);
+
+  // ── MHA core with KV cache placeholders ─────────────────────────────────
+  auto [cache_k, cache_v] = createGauss4KVCachePlaceholders(layer_id, kv_width);
+
+  LayerHandle mha(createLayer(
+    "mha_core",
+    {withKey("name", lname + "_attention"), withKey("num_heads", n_heads),
+     withKey("num_heads_kv", NUM_KEY_VALUE_HEADS),
+     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
+     withKey("max_position_embeddings",
+             std::to_string(MAX_POSITION_EMBEDDINGS)),
+     withKey("sliding_window", window_size), withKey("use_rope", "true"),
+     withKey("rope_theta", std::to_string(rope_theta)),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+     withKey("attn_logit_softcapping", "0.0"),
+     withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+     withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false"),
+     // gemma4-family full-GPU gates (decode attn + GPU RoPE-decode LUT).
+     withKey("gpu_decode_attn",
+             getModelFeatures().decode_gpu ? "true" : "false"),
+     withKey("gpu_decode_rope",
+             getModelFeatures().decode_rope_gpu ? "true" : "false"),
+     withKey("gpu_ohwi_rope",
+             getModelFeatures().decode_gpu ? "true" : "false"),
+     withKey("engine", causallm_engine())}));
+  Tensor attn_raw = mha({q, k, v, cache_k, cache_v});
+
+  // ── reshaped_rms_norm on attention output (gated_norm) ──────────────────
+  // feature_size = head_dim = 128 (kv_channels norm)
+  LayerHandle gated_norm(createLayer(
+    "reshaped_rms_norm", {withKey("name", lname + "_gated_norm"),
+                          withKey("epsilon", std::to_string(NORM_EPS)),
+                          withKey("feature_size", std::to_string(HEAD_DIM)),
+                          withKey("packed", "false"),
+                          withKey("engine", causallm_engine())}));
+  Tensor normed_attn = gated_norm(attn_raw);
+
+  // ── Lowrank-element-wise gate ────────────────────────────────────────────
+  // Gate INPUT = attention_norm output = query (PyTorch: gate =
+  // gate_down(hidden_states))
+  const std::string gate_name = lname + "_attention_gate";
+
+  LayerHandle gate_down(
+    createLayer("fully_connected", {withKey("name", gate_name + "_down"),
+                                    withKey("unit", LATENT_SIZE_PER_GATE),
+                                    withKey("disable_bias", "true"),
+                                    withKey("weight_initializer", "ones"),
+                                    withKey("weight_dtype", FC_LAYER_DTYPE),
+                                    withKey("engine", causallm_engine())}));
+  Tensor g_down = gate_down(query);
+
+  LayerHandle gate_up(createLayer(
+    "fully_connected",
+    {withKey("name", gate_name + "_up"), withKey("unit", q_unit),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE),
+     withKey("engine", causallm_engine())}));
+  Tensor g_up = gate_up(g_down);
+
+  // Fused gate: sigmoid(g_up) * reshaped_rms_norm(attn_out). One whole-op so the
+  // gate runs on GPU too (standalone sigmoid/multiply are unregistered there).
+  LayerHandle gate_glu(createLayer(
+    "sigmoid_glu", {withKey("name", gate_name + "_sigmoid_glu"),
+                    withKey("engine", causallm_engine())}));
+  Tensor gated = gate_glu({g_up, normed_attn});
+
+  // ── O projection ─────────────────────────────────────────────────────────
+  LayerHandle wo(createLayer(
+    "fully_connected",
+    {withKey("name", lname + "_attention_out"), withKey("unit", DIM),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("weight_dtype", FC_LAYER_DTYPE),
+     withKey("engine", causallm_engine())}));
+  return wo(gated);
+}
+
+// ---------------------------------------------------------------------------
+// createSharedAttention (layers 20-34, skip_prefill=true)
+// ---------------------------------------------------------------------------
+
+Tensor Gauss4Transformer::createSharedAttention(const int layer_id,
+                                                Tensor query,
+                                                Tensor shared_kv) {
+  const unsigned int kv_unit = static_cast<unsigned int>(HEAD_DIM) *
+                               static_cast<unsigned int>(NUM_KEY_VALUE_HEADS);
+  const unsigned int q_unit =
+    static_cast<unsigned int>(HEAD_DIM) * static_cast<unsigned int>(NUM_HEADS);
+  const unsigned int kv_width = kv_unit;
+  const bool is_sliding =
+    ((layer_id + 1) % static_cast<int>(SLIDING_WINDOW_PATTERN)) != 0;
+  const float rope_theta =
+    is_sliding ? static_cast<float>(SLIDING_ATTENTION_ROPE_THETA)
+               : static_cast<float>(FULL_ATTENTION_ROPE_THETA);
+  const unsigned int window_size = is_sliding ? SLIDING_WINDOW : UINT_MAX;
+
+  const std::string lname = "layer" + std::to_string(layer_id);
+
+  // Q (skip_prefill)
+  std::vector<std::string> q_props = {
+    withKey("name", lname + "_wq"), withKey("unit", q_unit),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  q_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(q_props, true);
+  LayerHandle wq(createLayer("fully_connected", q_props));
+  Tensor q = wq(query);
+
+  // K from shared_kv — NO skip_prefill so K is computed and written to the KV
+  // cache during prefill, populating positions 0..(prefill_len-1).  The
+  // mha_core layer still has skip_prefill=true, so it returns early after
+  // writing K to the cache, skipping the attention computation (which is not
+  // needed during prefill).
+  std::vector<std::string> k_props = {
+    withKey("name", lname + "_wk"), withKey("unit", kv_unit),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  k_props.push_back(withKey("engine", causallm_engine()));
+  // skip_prefill deliberately omitted — K must be written to cache at prefill.
+  LayerHandle wk(createLayer("fully_connected", k_props));
+  Tensor k = wk(shared_kv);
+
+  // V from shared_kv — NO skip_prefill for the same reason as wk above.
+  std::vector<std::string> v_props = {
+    withKey("name", lname + "_wv"), withKey("unit", kv_unit),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  v_props.push_back(withKey("engine", causallm_engine()));
+  // skip_prefill deliberately omitted — V must be written to cache at prefill.
+  LayerHandle wv(createLayer("fully_connected", v_props));
+  Tensor v = wv(shared_kv);
+
+  // KV cache placeholders (each layer has its own cache even when KV-shared)
+  auto [cache_k, cache_v] = createGauss4KVCachePlaceholders(layer_id, kv_width);
+
+  std::vector<std::string> mha_props = {
+    withKey("name", lname + "_attention"),
+    withKey("num_heads", NUM_HEADS),
+    withKey("num_heads_kv", NUM_KEY_VALUE_HEADS),
+    withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
+    withKey("max_position_embeddings", std::to_string(MAX_POSITION_EMBEDDINGS)),
+    withKey("sliding_window", window_size),
+    withKey("use_rope", "true"),
+    withKey("rope_theta", std::to_string(rope_theta)),
+    withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+    withKey("attn_logit_softcapping", "0.0"),
+    withKey("is_causal", IS_CAUSAL ? "true" : "false")};
+  mha_props.push_back(withKey("engine", causallm_engine()));
+  mha_props.push_back(
+    withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false"));
+  // gemma4-family full-GPU gates (decode attn + GPU RoPE-decode LUT).
+  mha_props.push_back(withKey(
+    "gpu_decode_attn", getModelFeatures().decode_gpu ? "true" : "false"));
+  mha_props.push_back(withKey(
+    "gpu_decode_rope", getModelFeatures().decode_rope_gpu ? "true" : "false"));
+  mha_props.push_back(withKey(
+    "gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"));
+  appendSkipPrefillIfNeeded(mha_props, true);
+  LayerHandle mha(createLayer("mha_core", mha_props));
+  Tensor attn_raw = mha({q, k, v, cache_k, cache_v});
+
+  // reshaped_rms_norm -- feature_size = head_dim = 128
+  std::vector<std::string> gn_props = {
+    withKey("name", lname + "_gated_norm"),
+    withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("feature_size", std::to_string(HEAD_DIM)),
+    withKey("packed", "false")};
+  gn_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(gn_props, true);
+  LayerHandle gated_norm(createLayer("reshaped_rms_norm", gn_props));
+  Tensor normed_attn = gated_norm(attn_raw);
+
+  // Gate: input = attention_norm output = query
+  const std::string gate_name = lname + "_attention_gate";
+
+  std::vector<std::string> gd_props = {
+    withKey("name", gate_name + "_down"), withKey("unit", LATENT_SIZE_PER_GATE),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  gd_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(gd_props, true);
+  LayerHandle gate_down(createLayer("fully_connected", gd_props));
+  Tensor g_down = gate_down(query);
+
+  std::vector<std::string> gu_props = {
+    withKey("name", gate_name + "_up"), withKey("unit", q_unit),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  gu_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(gu_props, true);
+  LayerHandle gate_up(createLayer("fully_connected", gu_props));
+  Tensor g_up = gate_up(g_down);
+
+  // Fused gate: sigmoid(g_up) * reshaped_rms_norm(attn_out) (skip_prefill=true).
+  std::vector<std::string> gg_props = {
+    withKey("name", gate_name + "_sigmoid_glu"),
+    withKey("engine", causallm_engine())};
+  appendSkipPrefillIfNeeded(gg_props, true);
+  LayerHandle gate_glu(createLayer("sigmoid_glu", gg_props));
+  Tensor gated = gate_glu({g_up, normed_attn});
+
+  // O projection
+  std::vector<std::string> o_props = {
+    withKey("name", lname + "_attention_out"), withKey("unit", DIM),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  o_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(o_props, true);
+  LayerHandle wo(createLayer("fully_connected", o_props));
+  return wo(gated);
+}
+
+// ---------------------------------------------------------------------------
+// createMlp (LRA MLP)
+// ---------------------------------------------------------------------------
+// PyTorch Gauss4LRAMLP.forward():
+//   up_states = linear_up(x)
+//   gate_states = up_states + gate_down(gate_up(x))     # add
+//   ffn = act_fn(gate_states) * up_states                # silu(add) * up
+//   return linear_fc2(ffn)
+//
+// nntrainer swiglu(input0, input1) = silu(input0) * input1
+//   => swiglu(ffn_add, ffn_linear_up) == silu(add) * linear_up  [matches PT]
+
+Tensor Gauss4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
+                                    Tensor input) {
+  const bool is_shared =
+    USE_KV_SHARING && layer_id >= static_cast<int>(NUM_SEQUENTIAL_LAYERS);
+  const std::string lname = "layer" + std::to_string(layer_id);
+
+  // linear_up: DIM -> intermediate_size
+  std::vector<std::string> lu_props = {
+    withKey("name", lname + "_ffn_linear_up"), withKey("unit", hidden_dim),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  lu_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(lu_props, is_shared);
+  LayerHandle ffn_linear_up(createLayer("fully_connected", lu_props));
+  Tensor linear_up = ffn_linear_up(input);
+
+  // gate_up: DIM -> MLP_LRA_RANK (512)
+  std::vector<std::string> gu_props = {
+    withKey("name", lname + "_ffn_gate_up"), withKey("unit", MLP_LRA_RANK),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  gu_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(gu_props, is_shared);
+  LayerHandle ffn_gate_up(createLayer("fully_connected", gu_props));
+  Tensor g_up = ffn_gate_up(input);
+
+  // gate_down: MLP_LRA_RANK -> intermediate_size
+  std::vector<std::string> gd_props = {
+    withKey("name", lname + "_ffn_gate_down"), withKey("unit", hidden_dim),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  gd_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(gd_props, is_shared);
+  LayerHandle ffn_gate_down(createLayer("fully_connected", gd_props));
+  Tensor g_down = ffn_gate_down(g_up);
+
+  // add: linear_up + gate_down
+  std::vector<std::string> add_props = {withKey("name", lname + "_ffn_add")};
+  add_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(add_props, is_shared);
+  LayerHandle ffn_add(createLayer("addition", add_props));
+  Tensor ffn_sum = ffn_add({linear_up, g_down});
+
+  // swiglu(add, linear_up) = silu(add) * linear_up  [matches PyTorch]
+  std::vector<std::string> swiglu_props = {
+    withKey("name", lname + "_ffn_swiglu")};
+  swiglu_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(swiglu_props, is_shared);
+  LayerHandle ffn_swiglu(createLayer("swiglu", swiglu_props));
+  Tensor swiglu_out = ffn_swiglu({ffn_sum, linear_up});
+
+  // linear_fc2: intermediate_size -> DIM
+  std::vector<std::string> fc2_props = {
+    withKey("name", lname + "_ffn_output"), withKey("unit", dim),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  fc2_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(fc2_props, is_shared);
+  LayerHandle ffn_fc2(createLayer("fully_connected", fc2_props));
+  return ffn_fc2(swiglu_out);
+}
+
+// ---------------------------------------------------------------------------
+// createPerLayerEmbedding (PLE mix_method=1, ple_pre_mlp=true)
+// ---------------------------------------------------------------------------
+// PyTorch PerLayerEmbedding.forward() with ple_mix_method=1, ple_act=sigmoid:
+//   hidden_states = per_layer_input_gate(hidden_states)    # FC 2688->192
+//   output_ple    = sigmoid(hidden_states) + cur_embedding # ADD (method=1)
+//   output_ple    = per_layer_projection(output_ple)        # FC 192->2688
+//   output_ple    = post_per_layer_input_norm(output_ple)   # ReverseRMSNorm
+
+Tensor Gauss4Transformer::createPerLayerEmbedding(const int layer_id,
+                                                  Tensor ple_input,
+                                                  bool skip_prefill) {
+  const std::string lname = "layer" + std::to_string(layer_id);
+
+  // per_layer_input_gate: DIM -> HIDDEN_SIZE_PER_LAYER_INPUT
+  std::vector<std::string> pg_props = {
+    withKey("name", lname + "_PLE_input_gate"),
+    withKey("unit", HIDDEN_SIZE_PER_LAYER_INPUT),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE)};
+  pg_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(pg_props, skip_prefill);
+  LayerHandle ple_gate(createLayer("fully_connected", pg_props));
+  Tensor gate = ple_gate(ple_input);
+
+  if (PLE_MIX_METHOD == 1) {
+    // method=1: fused sigmoid(gate) + emb. One whole-op so it runs on GPU too
+    // (standalone sigmoid/addition split residency there). PLE_ACT is sigmoid
+    // for gauss4; the fused sigmoid_add op is sigmoid-specific.
+
+    // per-layer slice: select this layer's HIDDEN_SIZE_PER_LAYER_INPUT chunk
+    // from the packed per_layer_input (GPU-resident; no per-layer host embedding
+    // lookup). layer_index selects columns [i*192 : (i+1)*192].
+    std::vector<std::string> slice_props = {
+      withKey("name", lname + "_PLE_slice"),
+      withKey("feature_size", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
+      withKey("layer_index", std::to_string(layer_id)),
+      withKey("engine", causallm_engine())};
+    appendSkipPrefillIfNeeded(slice_props, skip_prefill);
+    LayerHandle ple_slice(createLayer("per_layer_slice", slice_props));
+    Tensor emb = ple_slice(per_layer_input);
+
+    // fused mix: sigmoid(gate) + emb
+    std::vector<std::string> mix_props = {
+      withKey("name", lname + "_PLE_sigmoid_add"),
+      withKey("engine", causallm_engine())};
+    appendSkipPrefillIfNeeded(mix_props, skip_prefill);
+    LayerHandle ple_mix(createLayer("sigmoid_add", mix_props));
+    Tensor mix_out = ple_mix({gate, emb});
+
+    // projection: HIDDEN_SIZE_PER_LAYER_INPUT -> DIM
+    std::vector<std::string> pp_props = {
+      withKey("name", lname + "_PLE_projection"), withKey("unit", DIM),
+      withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+      withKey("weight_dtype", FC_LAYER_DTYPE)};
+    pp_props.push_back(withKey("engine", causallm_engine()));
+    appendSkipPrefillIfNeeded(pp_props, skip_prefill);
+    LayerHandle ple_proj(createLayer("fully_connected", pp_props));
+    Tensor projected = ple_proj(mix_out);
+
+    // post_norm: ReverseRMSNorm (weight + out_scale)
+    std::vector<std::string> pn_props = {
+      withKey("name", lname + "_PLE_post_norm"),
+      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+      withKey("engine", causallm_engine())};
+    appendSkipPrefillIfNeeded(pn_props, skip_prefill);
+    LayerHandle ple_norm(createLayer("rms_reverse_norm", pn_props));
+    return ple_norm(projected);
+  } else {
+    // method=3 (legacy): sigmoid(gate * emb) -> projection -> post_norm
+    // per-layer slice: select this layer's HIDDEN_SIZE_PER_LAYER_INPUT chunk
+    // from the packed per_layer_input (GPU-resident; no per-layer host embedding
+    // lookup). layer_index selects columns [i*192 : (i+1)*192].
+    std::vector<std::string> slice_props = {
+      withKey("name", lname + "_PLE_slice"),
+      withKey("feature_size", std::to_string(HIDDEN_SIZE_PER_LAYER_INPUT)),
+      withKey("layer_index", std::to_string(layer_id)),
+      withKey("engine", causallm_engine())};
+    appendSkipPrefillIfNeeded(slice_props, skip_prefill);
+    LayerHandle ple_slice(createLayer("per_layer_slice", slice_props));
+    Tensor emb = ple_slice(per_layer_input);
+
+    // multiply: gate * emb (element-wise)
+    std::vector<std::string> mul_props = {
+      withKey("name", lname + "_PLE_multiply")};
+    appendSkipPrefillIfNeeded(mul_props, skip_prefill);
+    LayerHandle ple_mul(createLayer("multiply", mul_props));
+    Tensor mul_out = ple_mul({gate, emb});
+
+    // sigmoid activation
+    std::vector<std::string> act_props = {
+      withKey("name", lname + "_PLE_activation"),
+      withKey("activation", PLE_ACT)};
+    appendSkipPrefillIfNeeded(act_props, skip_prefill);
+    LayerHandle ple_act_layer(createLayer("activation", act_props));
+    Tensor activated = ple_act_layer(mul_out);
+
+    // projection: HIDDEN_SIZE_PER_LAYER_INPUT -> DIM
+    std::vector<std::string> pp_props = {
+      withKey("name", lname + "_PLE_projection"), withKey("unit", DIM),
+      withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+      withKey("weight_dtype", FC_LAYER_DTYPE)};
+    pp_props.push_back(withKey("engine", causallm_engine()));
+    appendSkipPrefillIfNeeded(pp_props, skip_prefill);
+    LayerHandle ple_proj(createLayer("fully_connected", pp_props));
+    Tensor projected = ple_proj(activated);
+
+    // post_norm: ReverseRMSNorm (weight + out_scale)
+    std::vector<std::string> pn_props = {
+      withKey("name", lname + "_PLE_post_norm"),
+      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+      withKey("engine", causallm_engine())};
+    appendSkipPrefillIfNeeded(pn_props, skip_prefill);
+    LayerHandle ple_norm(createLayer("rms_reverse_norm", pn_props));
+    return ple_norm(projected);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// registerCustomLayers
+// ---------------------------------------------------------------------------
+
+void Gauss4Transformer::registerCustomLayers() {
+  auto &ct_engine = nntrainer::Engine::Global();
+  auto app_context =
+    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+
+  try {
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+    // CPU per_layer_slice (the GPU variant PerLayerSliceLayerGPU is registered
+    // centrally in Transformer::registerCustomLayers on the "gpu" context).
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::PerLayerSliceLayer>);
+  } catch (const std::invalid_argument &e) {
+    std::cerr << "[Gauss4] registerCustomLayers warning: " << e.what()
+              << std::endl;
+  }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Additive CUDA backend (mirror of gemma4): the CPU per_layer_slice is a
+  // pure host op -> correct on host-coherent UVM tensors. sigmoid_glu /
+  // sigmoid_add are lib layers registered in cuda_context.cpp; the reshaped /
+  // reverse RMS norms are centralized in CausalLM::registerCustomLayers.
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
+  } catch (const std::invalid_argument &e) {
+    // no "cuda" context or already registered — both benign.
+  }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Gauss4CausalLM::constructModel
+// ---------------------------------------------------------------------------
+
+std::pair<Tensor, Tensor> Gauss4CausalLM::constructModel() {
+  auto [x, h] = Gauss4Transformer::constructModel();
+
+  // lm_head selection:
+  //   LMHEAD_UNTIE=true  -> "fully_connected": output_of_causallm carries its
+  //     OWN weight (a separate transposed [hidden,vocab] copy of the tied
+  //     embedding, synthesized by the converter). gauss4 is tied in HF and its
+  //     embedding must stay Q4_0 (hidden=2688 / PLE=192 are not 256-divisible,
+  //     so Q6_K is impossible), but a Q4_0 lm_head has NO GPU GEMV kernel
+  //     (tie_word_embedding.cpp's Q4_0 branch is CPU-only). Untying to a
+  //     per-channel QS4CX lm_head lets the output projection run the fast v8c
+  //     int4 GPU GEMV, mirroring gemma4. The quantizer builds this same untied
+  //     graph with an FP32 source weight and the dtype map quantizes
+  //     output_of_causallm to QS4CX on save; inference rebuilds it as QS4CX.
+  //   tie_word_embeddings=true (not untied) -> "tie_word_embeddings" (shares
+  //     embedding0); tie_word_embeddings=false -> "lm_head" (separate FC).
+  const bool lmhead_untied = LMHEAD_UNTIE;
+  const std::string lmhead_type =
+    lmhead_untied
+      ? "fully_connected"
+      : (TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head");
+
+  std::vector<std::string> lmhead_props = {
+    withKey("name", "output_of_causallm"), withKey("unit", NUM_VOCAB),
+    withKey("disable_bias", "true"), withKey("weight_dtype", LMHEAD_DTYPE)};
+  lmhead_props.push_back(withKey("engine", causallm_engine()));
+  appendSkipPrefillIfNeeded(lmhead_props, true);
+
+  if (TIE_WORD_EMBEDDINGS && !lmhead_untied)
+    lmhead_props.emplace_back(withKey("shared_from", "embedding0"));
+
+  LayerHandle lmhead(createLayer(lmhead_type, lmhead_props));
+  Tensor y = lmhead(h);
+
+  return {x, y};
+}
+
+// ---------------------------------------------------------------------------
+// Gauss4CausalLM::registerCustomLayers
+// ---------------------------------------------------------------------------
+
+void Gauss4CausalLM::registerCustomLayers() {
+  CausalLM::registerCustomLayers();
+  Gauss4Transformer::registerCustomLayers();
+}
+
+// ---------------------------------------------------------------------------
+// Gauss4CausalLM::allocateAndBindKVCache
+// ---------------------------------------------------------------------------
+
+void Gauss4CausalLM::allocateAndBindKVCache() {
+  const unsigned int kv_width = static_cast<unsigned int>(HEAD_DIM) *
+                                static_cast<unsigned int>(NUM_KEY_VALUE_HEADS);
+
+  if (!kv_cache.isAllocated()) {
+#ifdef ENABLE_FP16
+    const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
+#else
+    const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+    std::vector<unsigned int> kv_widths(static_cast<size_t>(NUM_LAYERS),
+                                        kv_width);
+
+    kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
+                      static_cast<unsigned int>(MAX_SEQ_LEN), kv_widths,
+                      cache_dtype);
+    kv_cache_bound = false;
+  }
+
+  if (kv_cache_bound)
+    return;
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    auto &kc = kv_cache.getKeyCache(i);
+    auto &vc = kv_cache.getValueCache(i);
+
+    auto find_cache_placeholder = [this](const std::string &base_name) {
+      for (const auto &suffix : {":0", ":input0", ":out0", ""}) {
+        auto *tensor = model->getTensor(base_name + suffix);
+        if (tensor != nullptr)
+          return tensor;
+      }
+      return static_cast<nntrainer::Tensor *>(nullptr);
+    };
+
+    auto *kp =
+      model->getTensor("layer" + std::to_string(i) + "_attention:input3");
+    auto *vp =
+      model->getTensor("layer" + std::to_string(i) + "_attention:input4");
+    if (kp == nullptr)
+      kp = find_cache_placeholder("cache_k_l" + std::to_string(i));
+    if (vp == nullptr)
+      vp = find_cache_placeholder("cache_v_l" + std::to_string(i));
+
+    NNTR_THROW_IF(kp == nullptr || vp == nullptr, std::runtime_error)
+      << "[Gauss4] allocateAndBindKVCache: cache_k_l" << i << " / cache_v_l"
+      << i << " not found in compiled graph";
+    NNTR_THROW_IF(kp->getDim() != kc.getDim() || vp->getDim() != vc.getDim(),
+                  std::runtime_error)
+      << "[Gauss4] allocateAndBindKVCache: shape mismatch for layer " << i;
+
+    kp->setData(kc.getMemoryData(), kc.getOffset(), false);
+    vp->setData(vc.getMemoryData(), vc.getOffset(), false);
+  }
+
+  kv_cache_bound = true;
+}
+
+} // namespace causallm

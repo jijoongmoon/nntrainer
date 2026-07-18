@@ -33,9 +33,13 @@ constexpr int tiny_gemma3_num_layers = 2;
 
 /**
  * @brief Tiny Gemma3 CausalLM adapter for common model tests
+ *
+ * Thin subclass of the shared CausalLMTestAdapter: only the constructor
+ * differs because Gemma3 must sanitize its configs before initializing the
+ * (virtual) Transformer base. All inference methods come from the adapter.
  */
-class TinyGemma3CausalLM final : public causallm::Gemma3CausalLM,
-                                 public causallm_test::TinyCausalLMRunner {
+class TinyGemma3CausalLM final
+  : public causallm_test::CausalLMTestAdapter<causallm::Gemma3CausalLM> {
 public:
   /**
    * @brief Construct a tiny Gemma3 CausalLM test adapter
@@ -45,39 +49,16 @@ public:
     causallm::Transformer(sanitizeConfig(cfg),
                           sanitizeGenerationConfig(generation_cfg, cfg),
                           nntr_cfg, causallm::ModelType::CAUSALLM),
-    causallm::Gemma3CausalLM(cfg, generation_cfg, nntr_cfg) {}
+    causallm_test::CausalLMTestAdapter<causallm::Gemma3CausalLM>(
+      cfg, generation_cfg, nntr_cfg) {}
+};
 
-  /**
-   * @brief Initialize the tiny Gemma3 model
-   */
-  void initializeModel() override { initialize(); }
-
-  /**
-   * @brief Save tiny Gemma3 model weights
-   */
-  void saveWeight(const std::string &path) override { save_weight(path); }
-
-  /**
-   * @brief Save tiny Gemma3 model weights with dtype conversion
-   */
-  void saveWeightWithDtype(
-    const std::string &path,
-    const std::map<std::string, ml::train::TensorDim::DataType>
-      &layer_dtype_map) override {
-    save_weight(path, ml::train::TensorDim::DataType::NONE, layer_dtype_map);
-  }
-
-  /**
-   * @brief Load tiny Gemma3 model weights
-   */
-  void loadWeight(const std::string &path) override { load_weight(path); }
-
-  /**
-   * @brief Set deterministic tiny Gemma3 weights for golden token tests
-   */
-  void setDeterministicWeights() override {
-    auto set_weights = [](ml::train::Layer &layer,
-                          nntrainer::RunLayerContext &context, void *) {
+/**
+ * @brief Populate deterministic tiny Gemma3 weights for golden token tests
+ */
+void setupGemma3DeterministicWeights(TinyGemma3CausalLM &model) {
+  model.forEachLayer(
+    [](ml::train::Layer &layer, nntrainer::RunLayerContext &context, void *) {
       if (layer.getName() == "output_of_causallm")
         return;
 
@@ -95,103 +76,8 @@ public:
           weight.setValue(0, 0, 4, 0, 2.0f);
         }
       }
-    };
-
-    model->forEachLayer(set_weights, nullptr);
-  }
-
-  /**
-   * @brief Run one prompt through the tiny Gemma3 model
-   */
-  void runPrompt(const std::string &prompt) override {
-    run(prompt, false, "", "", false);
-  }
-
-  /**
-   * @brief Run Gemma3 prefill and return logits before sampling
-   */
-  std::vector<float> prefillLogits(const std::string &prompt) override {
-    allocateAndBindKVCache();
-
-    auto encoded = tokenizer->Encode(prompt);
-    if (encoded.empty())
-      throw std::invalid_argument("tiny Gemma3 prompt encoded to no tokens");
-
-    const unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
-    const unsigned int init_len = static_cast<unsigned int>(
-      std::min<size_t>(encoded.size(), num_allow_str));
-    std::vector<float> input_sample(
-      static_cast<size_t>(BATCH_SIZE) * MAX_SEQ_LEN, 0.0f);
-
-    for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-      for (unsigned int i = 0; i < init_len; ++i) {
-        const auto token_id = static_cast<unsigned int>(encoded[i]);
-        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + i] =
-          static_cast<float>(token_id);
-        ids_history[static_cast<size_t>(b) * MAX_SEQ_LEN + i] = token_id;
-      }
-    }
-
-    std::vector<std::pair<std::string, float *>> cache_inputs;
-    cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
-    for (int i = 0; i < NUM_LAYERS; ++i) {
-      cache_inputs.emplace_back(
-        "cache_k_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
-      cache_inputs.emplace_back(
-        "cache_v_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
-    }
-
-    std::sort(
-      cache_inputs.begin(), cache_inputs.end(),
-      [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
-
-    std::vector<float *> input;
-    input.reserve(1 + cache_inputs.size());
-    input.push_back(input_sample.data());
-    for (const auto &cache_input : cache_inputs)
-      input.push_back(cache_input.second);
-
-    std::vector<float *> label;
-    setKVCachePosition(0);
-    auto output = model->incremental_inference(BATCH_SIZE, input, label,
-                                               init_len, 0, init_len, false);
-    std::vector<float> logits(output[0], output[0] + NUM_VOCAB);
-    for (auto &out : output)
-      delete[] out;
-
-    return logits;
-  }
-
-  /**
-   * @brief Get generated output text
-   */
-  std::string getOutputText(int batch_idx = 0) const override {
-    return getOutput(batch_idx);
-  }
-
-  /**
-   * @brief Get whether the tiny Gemma3 model has completed run()
-   */
-  bool hasRun() const override { return causallm::CausalLM::hasRun(); }
-
-  /**
-   * @brief Read one token from the Gemma3 input/output history
-   */
-  unsigned int tokenAt(size_t idx) const override { return ids_history[idx]; }
-
-  /**
-   * @brief Generate ids from logits through Gemma3 decoding logic
-   */
-  std::vector<unsigned int>
-  generateFromLogits(float *logits, bool do_sample, float repetition_penalty,
-                     unsigned int *input_ids,
-                     unsigned int num_input_ids) override {
-    return generate(logits, do_sample, repetition_penalty, input_ids,
-                    num_input_ids);
-  }
-};
+    });
+}
 
 /**
  * @brief Files generated for one tiny EmbeddingGemma test invocation
@@ -543,6 +429,10 @@ makeGemma3Case(const causallm_test::TinyCausalLMDataType &data_type) {
        causallm::json &nntr_cfg) {
       return std::make_unique<TinyGemma3CausalLM>(cfg, generation_cfg,
                                                   nntr_cfg);
+    },
+    [](causallm_test::TinyCausalLMRunner &runner) {
+      setupGemma3DeterministicWeights(
+        static_cast<TinyGemma3CausalLM &>(runner));
     },
   };
 }

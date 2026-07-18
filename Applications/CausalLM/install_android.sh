@@ -65,6 +65,7 @@ REQUIRED_FILES=(
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntrainer_causallm"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_core.so"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize"
+    "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_safetensors_info"
 )
 
 # Optional dependency files (might not be in libs/arm64-v8a depending on build)
@@ -171,6 +172,11 @@ adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" "$INSTALL_DIR/" 2>&1 | t
 adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
 log_success "nntr_quantize pushed"
 
+log_info "Pushing nntr_safetensors_info..."
+adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_safetensors_info" "$INSTALL_DIR/" 2>&1 | tail -1
+adb shell "chmod 755 $INSTALL_DIR/nntr_safetensors_info"
+log_success "nntr_safetensors_info pushed"
+
 # Push shared libraries
 log_info "Pushing shared libraries..."
 log_info "  [1/5] libcausallm_core.so (CausalLM Core library)..."
@@ -216,6 +222,15 @@ EOF"
 
 adb shell "chmod 755 $INSTALL_DIR/run_quantize.sh"
 
+# Create safetensors_info run script on device
+adb shell "cat > $INSTALL_DIR/run_safetensors_info.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+cd $INSTALL_DIR
+./nntr_safetensors_info \$@
+EOF"
+
+adb shell "chmod 755 $INSTALL_DIR/run_safetensors_info.sh"
 # Create test script on device if API lib exists
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     adb shell "cat > $INSTALL_DIR/run_test_api.sh << 'EOF'

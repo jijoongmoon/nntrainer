@@ -20,15 +20,21 @@ option('test-timeout', type: 'integer', value: 90)
 option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
 option('enable-mmap', type: 'boolean', value: true)
 option('enable-npu', type: 'boolean', value: false)
-# Path to a locally-installed Qualcomm QNN SDK. REQUIRED when enable-npu=true.
-# The QNN SDK is "Confidential and Proprietary" Qualcomm code that we cannot
-# carry in this repository. Obtain it from Qualcomm Software Center
+# Path to a locally-installed Qualcomm QNN SDK. When enable-npu=true, either
+# this option or the QNN_SDK_ROOT environment variable must be set; the option
+# takes priority when both are provided. The SDK root is used at configure time
+# by nntrainer/qnn/jni/tools/update_qnn_version.py to auto-generate the
+# vendor/ directory (SDK headers + compatibility patches). vendor/ is gitignored
+# and must NOT be committed — it is always produced from the locally-installed SDK.
+# The QNN SDK is "Confidential and Proprietary" Qualcomm code that cannot be
+# redistributed in this repository. Obtain it from Qualcomm Software Center
 # (https://qpm.qualcomm.com/) and pass the extracted SDK root, e.g.:
-#   meson setup build -Denable-npu=true -Dqnn-sdk-root=/opt/qcom/aistack/qnn-2.x.x
+#   meson setup build -Denable-npu=true -Dqnn-sdk-root=/opt/qcom/aistack/qnn-2.47.0
+# Alternatively: export QNN_SDK_ROOT=/opt/qcom/aistack/qnn-2.47.0
 # See docs/backend_guide/QNN_BUILD.md for details.
 option('qnn-sdk-root', type: 'string', value: '')
 option('mmap-read', type: 'boolean', value: true)
-option('enable-kernel-caching', type: 'boolean', value: false)
+option('enable-kernel-caching', type: 'boolean', value: true)
 
 # dependency conflict resolution
 option('capi-ml-inference-actual', type: 'string', value: 'capi-ml-inference',
@@ -51,6 +57,22 @@ option('enable-blas', type: 'boolean', value: true)
 option('enable-fp16', type: 'boolean', value: false)
 option('enable-cublas', type: 'boolean', value: false)
 option('enable-opencl', type: 'boolean', value: false)
+option('enable-cuda', type: 'boolean', value: false,
+       description: 'Build the additive NVIDIA CUDA GPU backend (NVRTC runtime kernel compilation + cudart + cuBLAS + driver API). Independent of and non-exclusive with enable-opencl; selected at runtime via engine=cuda. Desktop NVIDIA only (not android).')
+option('cuda-path', type: 'string', value: '/usr/local/cuda',
+       description: 'CUDA toolkit root used when enable-cuda is set (expects include/ and lib64/).')
+# Additive HexKL/HTP NPU backend (Qualcomm Hexagon HMX). ARM/Android only (no
+# x86 libsdkl.so). When false the block is skipped and CPU/GPU builds are
+# byte-identical; selected at runtime via engine=htp. Point hexkl-sdk-root at the
+# extracted hexkl_addon (remote.h/AEEStdErr.h resolve from <root>/../../incs).
+option('enable-htp', type: 'boolean', value: false,
+       description: 'Build the additive HexKL/HTP (Hexagon HMX NPU) backend. ARM/Android only; selected at runtime via engine=htp.')
+option('hexkl-sdk-root', type: 'string', value: '',
+       description: 'Path to the extracted hexkl_addon (has include/sdkl.h and lib/<subdir>/libsdkl.so). Required when enable-htp=true.')
+option('hexkl-lib-subdir', type: 'string', value: 'armv8_android26',
+       description: 'Which prebuilt libsdkl.so to link: lib/<hexkl-lib-subdir>/libsdkl.so.')
+option('enable-clblast', type: 'boolean', value: true,
+       description: 'Link the CLBlast subproject for general-purpose OpenCL BLAS routines. Disable when only the paper-aligned v8c int8/int4 GPU paths are needed — drops the multi-minute CLBlast compile.')
 option('enable-biqgemm', type: 'boolean', value: false)
 option('biqgemm-path', type: 'string', value: '../BiQGEMM')
 option('enable-benchmarks', type: 'boolean', value : false)

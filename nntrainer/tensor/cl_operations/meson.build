@@ -4,13 +4,29 @@ cl_op_sources = [
   'attention_kernel_interface.cpp',
   'attention_kernels.cpp',
   'clblast_interface.cpp',
-  'cl_compute_ops.cpp'
+  'cl_compute_ops.cpp',
+  'geglu_cl_op.cpp',
+  'swiglu_cl_op.cpp',
+  'sigmoid_glu_cl_op.cpp',
+  'sigmoid_add_cl_op.cpp',
+  'cl_tensor_view.cpp',
+  'cl_tensor_backing_pool.cpp',
+  'cl_buffer_pool.cpp',
 ]
 
 cl_op_headers = [
+  'blas_kernels.h',
   'blas_kernel_interface.h',
+  'attention_kernels.h',
   'attention_kernel_interface.h',
-  'clblast_interface.h'
+  'clblast_interface.h',
+  'geglu_cl_op.h',
+  'swiglu_cl_op.h',
+  'sigmoid_glu_cl_op.h',
+  'sigmoid_add_cl_op.h',
+  'cl_tensor_view.h',
+  'cl_tensor_backing_pool.h',
+  'cl_buffer_pool.h',
 ]
 
 if get_option('enable-fp16')

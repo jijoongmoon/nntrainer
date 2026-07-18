@@ -2,8 +2,10 @@ causallm_src = [
     meson.current_source_dir() / 'chat_template.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
+    meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
     meson.current_source_dir() / 'api' / 'model_config.cpp',
+    meson.current_source_dir() / 'api' / 'streamer.cpp',
     meson.current_source_dir() / 'kv_cache_manager.cpp',
 ]
 
@@ -13,6 +15,8 @@ executable_src = [
 
 causallm_inc_abs = [meson.current_source_dir()]
 causallm_inc = [include_directories('.')]
+causallm_inc_minja_inc = include_directories('third_party/minja/include')
+causallm_inc_nlohmann_inc = include_directories('third_party')
 
 # Build layer dependency
 causallm_layer_dependencies = []
@@ -21,16 +25,20 @@ subdir('layers')
 # Add common layers to dependencies
 causallm_layer_dependencies += [
     causallm_rms_norm_dep,
-    causallm_tie_word_embedding_dep,
-    causallm_lm_head_dep,
-    causallm_swiglu_dep,
+    causallm_rms_norm_gpu_dep,
+    # tie_word_embedding + lm_head promoted to core libnntrainer [T12]
+    # swiglu merged into core libnntrainer [T12]
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
-    causallm_lm_head_dep,
     causallm_reshaped_rms_norm_dep,
-    causallm_qkv_layer_dep,
+    causallm_rms_reverse_norm_dep,
+    # qkv_layer promoted to core libnntrainer [T12]
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
+    causallm_deberta_attention_layer_dep,
+    causallm_shared_fully_connected_layer_dep,
+    causallm_per_layer_slice_dep,
+    # Omni-specific layers
     causallm_embedding_injection_dep,
     causallm_vision_rope_dep,
     causallm_mrope_apply_dep,
@@ -42,7 +50,16 @@ causallm_layer_dependencies += [
     causallm_dit_modulate_dep,
     causallm_dit_gate_dep,
     causallm_vision_attention_dep,
+    # scalar_multiply + logit_softcapping promoted to core libnntrainer [T12]
 ]
+
+# Additive CUDA backend: the model TUs (transformer/causal_lm/gemma4) include
+# cuda_context.h to register layers on the cuda context, which pulls cuda.h ->
+# they need the CUDA toolkit include path. cuda_dep is defined in the root
+# meson.build only when enable-cuda is set.
+if get_option('enable-cuda')
+    causallm_layer_dependencies += cuda_dep
+endif
 
 subdir('models')
 
@@ -133,7 +150,11 @@ if get_option('platform') == 'windows'
             causallm_layer_dependencies,
             tokenizer_dependencies
         ],
-        include_directories: causallm_inc,
+        include_directories: [
+            causallm_inc,
+            causallm_inc_minja_inc,
+            causallm_inc_nlohmann_inc
+        ],
         install: true,
         cpp_args: cpp_args
     )
@@ -146,7 +167,11 @@ else
             causallm_layer_dependencies,
             tokenizer_dependencies
         ],
-        include_directories: causallm_inc,
+        include_directories: [
+            causallm_inc,
+            causallm_inc_minja_inc,
+            causallm_inc_nlohmann_inc
+        ],
         install: true,
         install_dir: application_install_dir,
         link_args: tokenizer_link_args,
@@ -162,7 +187,7 @@ causallm_dep = declare_dependency(
 
 e = executable('nntr_causallm',
     executable_src,
-    include_directories: causallm_inc,
+    include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
 )
 
@@ -175,6 +200,17 @@ e_quantize = executable('nntr_quantize',
     quantize_src,
     include_directories: causallm_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)
+
+
+safetensors_info_src = [
+    meson.current_source_dir() / 'safetensors_info.cpp',
+]
+
+e_safetensors_info = executable('nntr_safetensors_info',
+    safetensors_info_src,
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep],
 )
 
 
@@ -214,10 +250,74 @@ spike_bigvgan = executable('spike_bigvgan',
     install: false,
 )
 
+# SFlare API v2 — SFlare-branded SDK facade over the CausalLM factory
+sflare_api_src = [
+    meson.current_source_dir() / 'api' / 'SFlareApi.cpp',
+]
+
+if get_option('default_library') == 'static'
+    sflare_api = static_library('sflare_api',
+        sflare_api_src,
+        include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+        install: true,
+        install_dir: application_install_dir,
+        cpp_args: cpp_args
+    )
+else
+    sflare_api = shared_library('sflare_api',
+        sflare_api_src,
+        include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+        install: true,
+        install_dir: application_install_dir,
+        cpp_args: cpp_args
+    )
+endif
+
+sflare_api_dep = declare_dependency(
+    link_with: [sflare_api],
+    include_directories: causallm_inc
+)
+
+test_sflare_api = executable('test_sflare_api',
+    meson.current_source_dir() / 'api' / 'test_sflare_api.cpp',
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep, sflare_api_dep],
+    build_by_default: true,
+    install: false,
+)
+
+# SDK consumer example — the file shipped in the sflare_sdk package (which
+# builds it OUT-OF-TREE from the package alone); built here too so it cannot
+# rot against the API.
+example_sflare = executable('example_sflare',
+    meson.current_source_dir() / 'api' / 'example_sflare.cpp',
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep, sflare_api_dep],
+    build_by_default: true,
+    install: false,
+)
+
 # KVCacheManager unit tests
 if get_option('enable-test')
   causallm_unittest_inc = include_directories(
     '../../test/unittest/models'
+  )
+
+  unittest_embedding_sidecar_lut = executable(
+    'unittest_embedding_sidecar_lut',
+    meson.current_source_dir() / 'layers' / 'unittest_embedding_sidecar_lut.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_embedding_layer_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_embedding_sidecar_lut', unittest_embedding_sidecar_lut,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_embedding_sidecar_lut'),
+    timeout: 60,
+    suite: 'unittests'
   )
 
   unittest_kv_cache_manager = executable(
@@ -234,18 +334,100 @@ if get_option('enable-test')
     timeout: 60,
     suite: 'unittests'
   )
+
+  # Extract causallm_reference fixture binaries from packaging/
+  causallm_fixture_tars = [
+    meson.source_root() / 'packaging' / 'causallm_reference_generation.tar.gz',
+    meson.source_root() / 'packaging' / 'causallm_reference_embedding.tar.gz',
+  ]
+  # The tarballs already contain a top-level `causallm_reference/` directory, so
+  # extract into models/ (NOT models/causallm_reference/, which would double the
+  # path to models/causallm_reference/causallm_reference/ and leave the fixtures
+  # where the tests cannot find them — causing every differential test to skip).
+  causallm_fixture_dest = meson.source_root() / 'test' / 'unittest' / 'models'
+  foreach fixture_tar : causallm_fixture_tars
+    if build_machine.system() == 'windows'
+      run_command([prog_win_cmd, '/C', 'tar', 'xzf',
+                   fixture_tar.replace('/', '\\'),
+                   '-C', causallm_fixture_dest.replace('/', '\\')], check: false)
+    else
+      run_command(['tar', 'xzf', fixture_tar, '-C', causallm_fixture_dest], check: false)
+    endif
+  endforeach
+
+  unittest_callback_streamer = executable(
+    'unittest_callback_streamer',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_callback_streamer.cpp',
+      meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
+      meson.current_source_dir() / 'api' / 'streamer.cpp',
+    ],
+    dependencies: [gtest_main_dep],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_callback_streamer', unittest_callback_streamer,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_callback_streamer'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  unittest_cancel_api = executable(
+    'unittest_cancel_api',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_cancel_api.cpp',
+    ],
+    dependencies: [
+      nntrainer_dep,
+      nntrainer_ccapi_dep,
+      gtest_main_dep,
+      causallm_layer_dependencies,
+      causallm_dep
+    ],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_cancel_api', unittest_cancel_api,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_cancel_api'),
+    timeout: 60,
+    suite: 'unittests'
+  )
   # Ubuntu native builds use platform=none.
   model_unittest_platforms = ['none', 'windows', 'android']
   platform = get_option('platform')
-  enable_causallm_model_unittest = platform in model_unittest_platforms
+  # Tiny model-level tests cover FP32 and Q4_0-FP32 correctness. Keep them out
+  # of FP16 builds, where cache tensors intentionally use FP16 storage.
+  enable_causallm_model_unittest = (
+    platform in model_unittest_platforms and not get_option('enable-fp16')
+  )
   if enable_causallm_model_unittest
     unittest_causallm_models = executable(
       'unittest_causallm_models',
       [
         meson.source_root() / 'test' / 'unittest' / 'models' / 'causallm_test_utils.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_moe_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_slim_moe.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_cached_slim_moe.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gpt_oss.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gpt_oss_cached_slim.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen2.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen2_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen3_embedding_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_qwen2_embedding_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_embedding_gemma_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_tinybert_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_deberta_v2_reference.cpp',
       ],
       dependencies: [
         nntrainer_dep,
@@ -262,7 +444,32 @@ if get_option('enable-test')
     test('unittest_causallm_models', unittest_causallm_models,
       args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_causallm_models'),
       timeout: 60,
-      suite: 'unittests'
+      suite: 'unittests',
+      env: {'NNTR_QUANTIZE_BIN': e_quantize.full_path()}
+    )
+  endif
+
+  # Dedicated gemma4_tiny differential test for the additive CUDA backend.
+  # Built even in FP16-enabled builds (where the broad model-unittest set above
+  # is skipped), so engine=cuda first-light can be validated against the HF
+  # reference. Run with NNTR_ENGINE=cuda (or cpu for a baseline).
+  if get_option('enable-cuda')
+    unittest_cuda_gemma4 = executable(
+      'unittest_cuda_gemma4',
+      [
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'causallm_test_utils.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+      ],
+      dependencies: [
+        nntrainer_dep,
+        nntrainer_ccapi_dep,
+        gtest_main_dep,
+        causallm_layer_dependencies,
+        causallm_dep
+      ],
+      include_directories: causallm_inc + [causallm_unittest_inc],
+      build_by_default: false,
+      install: false,
     )
   endif
 

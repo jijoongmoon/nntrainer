@@ -1,0 +1,27 @@
+{
+    "model_type": "CausalLM",
+    "bad_word_ids": [],
+    "batch_size": 1,
+    "embedding_dtype": "Q6_K",
+    "fc_layer_dtype": "Q4_0",
+    "init_seq_len": 1024,
+    "lmhead_dtype": "Q6_K",
+    "lora_alpha": 0,
+    "lora_rank": 0,
+    "lora_target": [],
+    "max_seq_len": 2048,
+    "model_file_name": "nntr_gemma4_q40_embdq6k.bin",
+    "model_tensor_type": "Q4_0-FP32",
+    "num_to_generate": 256,
+    "skip_prefill": true,
+    "tokenizer_file": "tokenizer.json",
+    "sample_input": "<bos><|turn>system\nYou are a helpful assistant.<turn|>\n<|turn>user\nWhat is 1/3 + 1/4?\n<turn|>\n<|turn>model\n",
+    "chat_input": {
+        "messages": [
+            {
+                "role": "user",
+                "content": "The capital of Korea is"
+            }
+        ]
+    }
+}

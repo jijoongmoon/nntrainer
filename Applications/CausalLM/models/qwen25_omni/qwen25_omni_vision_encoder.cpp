@@ -22,7 +22,6 @@
 #include <llm_util.hpp>
 #include <model.h>
 #include <rms_norm.h>
-#include <swiglu.h>
 #include <vision_attention.h>
 #include <vision_rope.h>
 

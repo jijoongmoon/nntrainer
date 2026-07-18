@@ -247,13 +247,16 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
       for (unsigned int c = 0; c < input_dim.channel(); ++c) {
         const float *src = deviation.getAddress<float>(b, c, row_begin, 0);
         float *dst = output.getAddress<float>(b, c, row_begin, 0);
-        // NOTE: rms_norm_wrt_width_fp16_intrinsic is reused here for Layer
+        // NOTE: rms_norm_wrt_width_fp32_intrinsic is used here for Layer
         // Normalization. Since 'deviation' is already centered (X - mean),
         // computing:
         //   output = deviation / sqrt(mean(deviation^2) + epsilon)
         // is equivalent to Layer Norm's formula:
         //   output = (X - mean_X) / sqrt(variance + epsilon)
-        nntrainer::rms_norm_wrt_width_fp16_intrinsic(src, dst, row_count, W,
+        // DO NOT USE rms_norm_wrt_width_fp16_intrinsic here — it accumulates
+        // squared values in FP16, which overflows for typical LayerNorm inputs
+        // (e.g. DeBERTa). Use the FP32-accumulator variant instead.
+        nntrainer::rms_norm_wrt_width_fp32_intrinsic(src, dst, row_count, W,
                                                      epsilon);
       }
     }

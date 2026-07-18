@@ -15,6 +15,7 @@
 #include "PAL/DynamicLoading.hpp"
 #include "QnnTypes.h"
 #include "Utils/DynamicLoadUtil.hpp"
+#include "rpc_mem.h"
 #include <cstddef>
 #include <dlfcn.h>
 #include <map>
@@ -24,18 +25,10 @@
 
 namespace nntrainer {
 
-typedef void *(*RpcMemAllocFn_t)(int, uint32_t, int);
-typedef void (*RpcMemFreeFn_t)(void *);
-typedef int (*RpcMemToFdFn_t)(void *);
 typedef Qnn_ErrorHandle_t (*QnnInterfaceGetProvidersFn_t)(
   const QnnInterface_t ***providerList, uint32_t *numProviders);
 
-/**
- * @class   QNNRpcManager
- * @brief   MemAllocator subclass that routes alloc/free through libcdsprpc's
- *          rpcmem_alloc/rpcmem_free. Installed on QNNContext so MemoryPool
- *          buffers live in DSP-shared memory without an extra copy.
- */
+/** @brief Manages QNN RPC shared memory allocation via libcdsprpc. */
 class QNNRpcManager : public MemAllocator {
 public:
   QNNRpcManager();
@@ -45,6 +38,25 @@ public:
   void free(void *ptr) override;
 
   std::string getName() override { return "qnn"; }
+
+  // rpcmem/ION is CPU-mapped (host-addressable inherits the base default true),
+  // but the DSP can only use it after registerQnnTensor() builds a
+  // QNN_MEM_TYPE_ION handle -> needsRegister()=true. Not unified memory:
+  // device-visible inherits the base default false (pre-register), so isSVM()
+  // derives false, matching the old getName()!="gpu-svm".
+  bool needsRegister() const override { return true; }
+
+  /**
+   * @brief Did THIS allocator produce @p ptr (rpcmem/ION)?
+   * @note  The register leg of the host<->rpcmem residency bridge uses this to
+   *        tell an already-DSP-shareable buffer (register directly, zero-copy)
+   *        from a foreign host buffer (must be staged into rpcmem first). This
+   *        is the ownership half of the needsRegister() capability predicate --
+   *        no getName()=="qnn" string test. [multi-hw M6 register marker]
+   */
+  bool owns(const void *ptr) const {
+    return qnnMemPtrMap_.count(const_cast<void *>(ptr)) != 0;
+  }
 
   void setQnnInterfaceAndContext(void *context);
 
@@ -64,10 +76,6 @@ private:
   std::map<void *,
            std::pair<Qnn_ContextHandle_t, std::pair<int, Qnn_MemHandle_t>>>
     ptrToFdAndMemHandleMap_;
-
-  RpcMemAllocFn_t rpcmem_alloc;
-  RpcMemFreeFn_t rpcmem_free;
-  RpcMemToFdFn_t rpcmem_to_fd;
 };
 
 } // namespace nntrainer

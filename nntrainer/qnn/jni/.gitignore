@@ -1,0 +1,5 @@
+# vendor/ holds Qualcomm QNN SDK headers + sample sources, auto-generated at
+# meson configure time by tools/update_qnn_version.py from a local QNN SDK.
+# It is proprietary Qualcomm code and must not be committed. See
+# docs/backend_guide/QNN_BUILD.md.
+vendor/

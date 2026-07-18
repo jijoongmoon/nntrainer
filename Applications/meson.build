@@ -51,10 +51,6 @@ if host_machine.system() != 'windows'
 endif
 
 if get_option('enable-transformer')
-  subdir('LLaMA/jni')
-  if host_machine.system() != 'windows'
-  subdir('PicoGPT/jni')
-  endif
   if get_option('platform') != 'tizen'
     subdir('CausalLM')
   endif

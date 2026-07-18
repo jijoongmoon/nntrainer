@@ -24,29 +24,145 @@
 #include <app_context.h>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <engine.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <compute_ops.h>
+#include <neuralnet.h>
+
+#if defined(ENABLE_OPENCL)
+#include <cl_context.h> // OpenCL-only; registration uses the Engine facade. [T12]
+#endif
 #include <common.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context.h>
+#endif
 #include <layer_context.h>
-#include <lm_head.h>
+#include <residency_policy.h>
 #include <mha_core.h>
+#include <reshaped_rms_norm.h>
+#include <rms_reverse_norm.h>
 #include <nntrainer_error.h>
+#include <nntrainer_log.h>
 #include <tensor.h>
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
+#if defined(ENABLE_OPENCL)
+#include <recq_overrides.h> // R3/R4 record/replay override registry + CL types
+                            // (pulls opencl_command_queue_manager.h) -> OpenCL-only [T12]
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_attention.h>
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_fc_qint4.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
+
+// On-GPU greedy argmax sampler (defined in libnntrainer blas_kernels.cpp): when
+// requested (pure greedy), the lm_head GEMV reduces logits on the GPU and skips
+// the full-vocab D->H readback; generate() consumes the 4-byte token id.
+namespace nntrainer {
+void request_gpu_argmax(bool on);
+bool consume_gpu_argmax(unsigned int *tok);
+// recq (R4): read the 4-byte on-GPU argmax token on the host-I/O queue after a
+// recorded-chain replay (waiting on the replay event). cl_event -> OpenCL-only [T12]
+#if defined(ENABLE_OPENCL)
+bool recq_read_argmax_io(unsigned int *tok, cl_event wait_evt);
+#endif
+} // namespace nntrainer
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+namespace nntrainer::cuda {
+// [i8-skip] Defined in cuda_fc_qint4.cpp (declared locally: single-TU contract,
+// no header edit) -- exempts a QS4CX weight from the eager cuBLAS-i8 build.
+void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w);
+// [i8-ephemeral] Frees all cuBLAS-i8 caches at the prefill->decode boundary.
+void cuda_fc_qs4cx_free_i8_caches();
+} // namespace nntrainer::cuda
+
+namespace {
+// NNTR_CUDA_ARGMAX on-GPU greedy argmax (opt-in). incrementalInference() stashes
+// the DEVICE-resident lm_head logits pointer + dtype here (the tensor data,
+// before the host memcpy), so generate() can reduce it to the 4-byte token id on
+// the GPU instead of running host std::max_element over the full-vocab D->H copy.
+// One batch row (BATCH_SIZE==1 only, like the CL argmax gating). Reset every
+// call; valid only when the FP32/FP16 output was confirmed device-accessible.
+const void *g_cuda_logits_dev = nullptr;
+bool g_cuda_logits_fp16 = false;
+bool cuda_argmax_enabled() {
+  static const bool on = std::getenv("NNTR_CUDA_ARGMAX") != nullptr;
+  return on;
+}
+} // namespace
+#endif
+
+#include <utf8_stream_util.h>
+
+#include "api/streamer.h"
 
 namespace causallm {
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
+  // [Mem M4] Declare CausalLM's static-residency boundaries so the core planner
+  // (tensor_pool / manager) needs no app-specific tensor/layer names. These are
+  // byte-identical to the former hardcoded core defaults: the embedding output
+  // is host-produced but uploaded to cl_mem (RAISE), the final norm output is
+  // GPU-produced but read back once by the host lm_head (LOWER), and mha_core is
+  // a CPU-registered layer that binds/consumes Q/K/V on the GPU plane (engine-
+  // neutral). NNTR_CLMEM_RAISE/LOWER still override the raise/lower patterns.
+  auto &rp = nntrainer::ResidencyPolicy::global();
+#ifndef _WIN32
+  if (rp.raise_patterns.empty())
+    rp.raise_patterns = "embedding0:out0";
+#else
+  // [r21 determinism] The embedding-output RAISE (host-written per token, then
+  // uploaded to the cl_mem plane) is the single tensor whose cl_mem binding
+  // makes Windows/Intel runs nondeterministic: keep-one bisection over every
+  // GPU_CLMEM class reproduced run-to-run divergence ONLY here, and excluding
+  // just this tensor is bit-reproducible 6/6 with NO drain at baseline cost
+  // (2079/18.5 vs base 2075/18.2 — zero). The raise's own rationale (layer0
+  // coarse-SVM ingress) did not reproduce in any of those runs. Keep the
+  // embedding on SVM on Windows; NNTR_CLMEM_RAISE overrides for A/B.
+#endif
+  if (rp.lower_patterns.empty())
+    rp.lower_patterns = "output_norm:out0";
+  if (rp.engine_neutral_types.empty())
+    rp.engine_neutral_types = {"mha_core"};
   setupParameters(cfg, generation_cfg, nntr_cfg);
+}
+
+void CausalLM::prepareForRun() {
+  stop_requested_.store(false, std::memory_order_release);
+  stop_prepared_for_run_.store(true, std::memory_order_release);
+}
+
+void CausalLM::prepareStopRequestForRun() {
+  if (!stop_prepared_for_run_.exchange(false, std::memory_order_acq_rel)) {
+    stop_requested_.store(false, std::memory_order_release);
+  }
+}
+
+void CausalLM::setLogitsProcessor(LogitsProcessor *processor) {
+  logits_processor = processor;
+}
+
+void CausalLM::resetLogitsProcessor() {
+  if (logits_processor != nullptr)
+    logits_processor->reset();
 }
 
 void CausalLM::setupParameters(json &cfg, json &generation_cfg,
@@ -65,6 +181,17 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   LMHEAD_DTYPE = nntr_cfg.contains("lmhead_dtype")
                    ? nntr_cfg["lmhead_dtype"]
                    : nntr_cfg["embedding_dtype"];
+  // [Phase C Path B] a legacy int4 lm_head loads as the canonical QS4CX class
+  // (on-disk stays legacy QINT4, transcoded at read time). See transformer.cpp.
+  if (LMHEAD_DTYPE == "QINT4")
+    LMHEAD_DTYPE = "QS4CX";
+
+  // LMHEAD_UNTIE is parsed in Transformer::setupParameters (member moved
+  // there so <model>Transformer::constructModel can gate embedding0's type).
+
+  SKIP_PREFILL = nntr_cfg.contains("skip_prefill")
+                   ? nntr_cfg["skip_prefill"].get<bool>()
+                   : false;
 
   USE_KVCACHE = false;
   PRE_COMPUTED_CACHE_PATH = "";
@@ -109,14 +236,23 @@ std::vector<float *> CausalLM::buildInferenceInputs(float *input_sample) {
   // Extra graph inputs ("input" layers beyond input0) are fed positionally in
   // name-sorted order after the primary token-id buffer.
   std::vector<std::pair<std::string, float *>> extra_inputs;
-  extra_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
-  for (int i = 0; i < NUM_LAYERS; ++i) {
-    extra_inputs.emplace_back(
-      "cache_k_l" + std::to_string(i),
-      reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
-    extra_inputs.emplace_back(
-      "cache_v_l" + std::to_string(i),
-      reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
+  // KV int8 path: mha layers were switched to 3-input mode in
+  // qwen3_causallm.cpp, so the external cache_k_l*/cache_v_l* inputs
+  // do not exist in the compiled graph (and kv_cache is never allocated;
+  // see allocateAndBindKVCache). mha_core's internal int8 cache + scale
+  // tensors are managed by the framework's TensorPool, so only the prompt
+  // sample buffer plus any model-specific side inputs are fed.
+  static const bool _kv_int8_runtime = std::getenv("NNTR_KV_INT8") != nullptr;
+  if (!_kv_int8_runtime) {
+    extra_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      extra_inputs.emplace_back(
+        "cache_k_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
+      extra_inputs.emplace_back(
+        "cache_v_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
+    }
   }
   appendExtraInputs(extra_inputs);
 
@@ -133,6 +269,15 @@ std::vector<float *> CausalLM::buildInferenceInputs(float *input_sample) {
 }
 
 void CausalLM::allocateAndBindKVCache() {
+  // KV int8 path: mha_core allocates its own UINT8 cache + FP16 scale
+  // tensors. There are no external cache_k_l*/cache_v_l* placeholders to
+  // bind, so this helper is a no-op (paper section 3.7 internal cache
+  // mode under kv_int8). The mha layer was switched to 3-input form in
+  // qwen3_causallm.cpp when the env var is set.
+  if (std::getenv("NNTR_KV_INT8") != nullptr) {
+    kv_cache_bound = true;
+    return;
+  }
   if (!kv_cache.isAllocated()) {
     // dtype matches mha_core's cache placeholders so external cache storage
     // is interpreted consistently across platforms.
@@ -148,7 +293,11 @@ void CausalLM::allocateAndBindKVCache() {
                       max_timestep,
                       static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
                       static_cast<unsigned int>(HEAD_DIM), cache_dtype);
+    kv_cache_bound = false;
   }
+
+  if (kv_cache_bound)
+    return;
 
   // Bind each (layer, K|V) buffer into the corresponding input layer
   // declared by Transformer::createKVCachePlaceholders(). The names here
@@ -189,6 +338,181 @@ void CausalLM::allocateAndBindKVCache() {
     kp->setData(kc.getMemoryData(), kc.getOffset(), false);
     vp->setData(vc.getMemoryData(), vc.getOffset(), false);
   }
+
+  kv_cache_bound = true;
+}
+
+std::vector<float *>
+CausalLM::incrementalInference(unsigned int batch_size,
+                               const std::vector<float *> &input,
+                               unsigned int init_seq_len, unsigned int from,
+                               unsigned int to) {
+  // Same contract as NeuralNetwork::incremental_inference(float* ...), except
+  // inputs whose raw pointer belongs to a KVCacheManager cache tensor are fed
+  // as the REAL tensor (sharing its MemoryData, so isSVM() set by the SVM
+  // MemoryPool survives the per-call fillPlaceholder/syncDependents). With
+  // in-place input layers the mha_core cache views are dependents of the
+  // input placeholder; a fresh Tensor::Map MemoryData of the same pointer
+  // would clobber the SVM flag and drop attention to the host path.
+  auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
+
+  std::unordered_map<const void *, nntrainer::Tensor *> cache_by_ptr;
+  if (kv_cache.isAllocated()) {
+    for (unsigned int i = 0; i < kv_cache.getNumLayers(); ++i) {
+      auto &kc = kv_cache.getKeyCache(i);
+      auto &vc = kv_cache.getValueCache(i);
+      cache_by_ptr.emplace(reinterpret_cast<const void *>(kc.getData()), &kc);
+      cache_by_ptr.emplace(reinterpret_cast<const void *>(vc.getData()), &vc);
+    }
+  }
+
+  auto in_dim = nn->getInputDimension();
+  NNTR_THROW_IF(input.size() < in_dim.size(), std::invalid_argument)
+    << "incrementalInference: model expects " << in_dim.size()
+    << " inputs, got " << input.size();
+
+  nntrainer::sharedConstTensors input_tensors;
+  input_tensors.reserve(in_dim.size());
+  for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
+    auto it = cache_by_ptr.find(reinterpret_cast<const void *>(input[idx]));
+    if (it != cache_by_ptr.end()) {
+      // shallow copy: shares the cache's MemoryData (isSVM intact)
+      input_tensors.emplace_back(MAKE_SHARED_TENSOR(*it->second));
+    } else {
+      in_dim[idx].batch(batch_size);
+      input_tensors.emplace_back(MAKE_SHARED_TENSOR(
+        nntrainer::Tensor::Map(input[idx],
+                               in_dim[idx].getDataLen() * sizeof(float),
+                               in_dim[idx], 0)));
+    }
+  }
+
+  nntrainer::sharedConstTensors output_tensors =
+    nn->incremental_inference(input_tensors, init_seq_len, from, to);
+
+  // Output conversion identical to the float* overload in neuralnet.cpp.
+  std::vector<float *> output;
+  output.reserve(output_tensors.size());
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // NNTR_CUDA_ARGMAX: invalidate any stale device-logits stash; re-armed below
+  // only when this call's first output is device-accessible (UVM / managed /
+  // device) so generate() can run the on-GPU argmax instead of host max_element.
+  g_cuda_logits_dev = nullptr;
+#endif
+  bool first_output = true;
+  for (auto &out : output_tensors) {
+    auto out_t = *out.get();
+    const size_t buf_size =
+      (size_t)batch_size * out_t.getDim().getFeatureLen();
+    float *last_out_buf_data = new float[buf_size];
+
+    if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+      const _FP16 *out_src = out_t.getData<_FP16>();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Per-token cudart touches (pointer probes + stream drains) are cuda-run
+      // only: on a non-cuda run of the unified binary the first cudart call
+      // boots the statically-linked runtime inside this (timed) path.
+      std::vector<_FP16> out_host;
+      if (causallm_engine() == "cuda") {
+        // NNTR_CUDA_ARGMAX: stash the device logits pointer (before the D2H
+        // copy) when device-accessible, for generate()'s on-GPU argmax.
+        // batch_size==1 only (the argmax reduces a single [vocab] row).
+        if (cuda_argmax_enabled() && first_output && batch_size == 1) {
+          cudaPointerAttributes pa0{};
+          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
+              (pa0.type == cudaMemoryTypeDevice ||
+               pa0.type == cudaMemoryTypeManaged)) {
+            g_cuda_logits_dev = out_src;
+            g_cuda_logits_fp16 = true;
+          }
+          cudaGetLastError();
+        }
+        // Device-only activation pool (NNTR_CUDA_DEV_ACT): the model output is
+        // real device memory, not host-addressable. Drain the backend stream
+        // and copy it D2H into a host buffer before the host fp16->fp32
+        // convert (=the one sync-per-token boundary). For UVM the pointer is
+        // host-coherent so this is skipped.
+        cudaPointerAttributes pa{};
+        if (cudaPointerGetAttributes(&pa, out_src) == cudaSuccess &&
+            pa.type == cudaMemoryTypeDevice) {
+          nntrainer::cuda::StreamManager::Global().finish();
+          out_host.resize(buf_size);
+          cudaMemcpy(out_host.data(), out_src, buf_size * sizeof(_FP16),
+                     cudaMemcpyDeviceToHost);
+          out_src = out_host.data();
+        } else {
+          // UVM/managed pointer: host-coherent for ADDRESSING, but under
+          // NNTR_CUDA_ASYNC the producing kernel may still be in flight —
+          // reading now is a torn-read (round-15 determinism audit, the fp32
+          // branch already drains). No-op in sync mode.
+          nntrainer::cuda::StreamManager::Global().finishIfAsync();
+        }
+        cudaGetLastError();
+      }
+#endif
+      nntrainer::getComputeOps()->scopy_fp16_to_fp32(buf_size, out_src, 1,
+                                                     last_out_buf_data, 1);
+#else
+      throw std::invalid_argument("Error: enable-fp16 is not set");
+#endif
+    } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Per-token cudart touches are cuda-run only (see the fp16 branch note).
+      if (causallm_engine() == "cuda") {
+        // NNTR_CUDA_ARGMAX: stash the device logits pointer (the tensor data,
+        // before the host memcpy below) when device-accessible. UVM/managed
+        // pointers are host-coherent, so this same pointer feeds both the
+        // on-GPU argmax kernel and -- as the fallback -- the host memcpy.
+        if (cuda_argmax_enabled() && first_output && batch_size == 1) {
+          const float *out_src = out_t.getData();
+          cudaPointerAttributes pa0{};
+          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
+              (pa0.type == cudaMemoryTypeDevice ||
+               pa0.type == cudaMemoryTypeManaged)) {
+            g_cuda_logits_dev = out_src;
+            g_cuda_logits_fp16 = false;
+          }
+          cudaGetLastError();
+        }
+        // Host read of the GPU-produced logits: sync first so the read is
+        // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+        nntrainer::cuda::StreamManager::Global().finishIfAsync();
+      }
+      // Device-only activation pool (NNTR_CUDA_DEV_ACT): fp32 logits are real
+      // device memory the raw memcpy below cannot read -- drain and stage D2H,
+      // symmetric to the fp16 branch above. (Campaign scout gap: only the fp16
+      // branch staged; the fp32 branch would fault under DEV_ACT.)
+      if (out_t.getMemoryData() &&
+          !out_t.getMemoryData()->isHostAddressable()) {
+        nntrainer::cuda::StreamManager::Global().finish();
+        if (!nntrainer::cuda::copy_any((void *)last_out_buf_data,
+                                       (const void *)out_t.getData(),
+                                       sizeof(float) * buf_size))
+          throw std::runtime_error(
+            "CausalLM: D2H staging of the fp32 logits failed");
+      } else {
+        std::memcpy(last_out_buf_data, out_t.getData(),
+                    sizeof(float) * buf_size);
+      }
+#else
+      std::memcpy(last_out_buf_data, out_t.getData(),
+                  sizeof(float) * buf_size);
+#endif
+    }
+
+    output.push_back(last_out_buf_data);
+    first_output = false;
+  }
+
+  // Keep the host-side KV tracker at the absolute position just written:
+  // mha_core advances only its own internal cache_index during forwarding,
+  // so without this getKvLen()/save_kvcache() would report the stale
+  // prefill-start position (advanceKVCachePosition had no caller).
+  if (kv_cache.isAllocated() && to <= kv_cache.getMaxSeqLen())
+    kv_cache.setPosition(to);
+
+  return output;
 }
 
 void CausalLM::setKVCachePosition(unsigned int pos) {
@@ -220,6 +544,7 @@ std::pair<Tensor, Tensor> CausalLM::constructModel() {
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),
+    withKey("engine", causallm_engine()),
   };
 
   if (TIE_WORD_EMBEDDINGS)
@@ -227,6 +552,18 @@ std::pair<Tensor, Tensor> CausalLM::constructModel() {
 
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
   Tensor y = lmhead(h);
+
+  // [T11] ModelFeatures x DeviceCaps matcher SHADOW: the model declares its
+  // features, the resolver combines them with the chosen backend's device caps
+  // into an ExecPlan. Log-only (no decision site reads the plan yet) — the model
+  // graph is unchanged, so this is byte-identical. docs §10 T11.
+  if (const auto *ct =
+        nntrainer::Engine::Global().getRegisteredContext(causallm_engine())) {
+    const auto feats = getModelFeatures();
+    const auto plan = nntrainer::resolveExecPlan(ct->caps(), feats);
+    ml_logi("[CausalLM] %s | %s (shadow)", feats.toString().c_str(),
+            plan.toString().c_str());
+  }
 
   return {x, y};
 }
@@ -250,15 +587,17 @@ void CausalLM::registerOutputs(
       if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
           puncts.end()) {
         // last symbol is a punctuation, hold on
-      } else if (decoded_str.size() >= 3 &&
-                 decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
-        // ends with an incomplete token, hold on
+      } else if (utf8stream::shouldHold(decoded_str, pending_ids_.size())) {
       } else {
-        if (log_output) {
+        if (log_output && streamer_ == nullptr) {
           std::cout << decoded_str;
           std::cout.flush();
         }
         output_list[b].append(decoded_str);
+        if (streamer_ != nullptr &&
+            streamer_put(streamer_, decoded_str.c_str()) != 0) {
+          requestStop();
+        }
         pending_ids_.clear();
       }
     }
@@ -288,8 +627,90 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
                                              unsigned int *input_ids,
                                              unsigned int NUM_INPUT_IDS) {
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) decode path: ensure
+  // the GPU has finished producing the logits before the host reads them here.
+  // No-op in default mode (every GPU op already drained per-op). cuda engine
+  // ONLY: in a dual-enabled (CUDA+OpenCL) binary this ran on OpenCL runs too,
+  // and StreamManager::Global() lazily CREATES the CUDA context -- the first
+  // stray CUDA touch on a non-cuda run (NVIDIA VRAM burned on an Intel run).
+  if (causallm_engine() == "cuda")
+    nntrainer::cuda::StreamManager::Global().finish();
+#endif
+
   std::vector<unsigned int> outputs;
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
+
+    // NNTR_LOGIT_TOPK_DBG: raw top-5 (id:logit) of the first few sampled rows,
+    // BEFORE any penalty/argmax shortcut -- boundary-artifact margin probe.
+    static const bool topk_dbg = std::getenv("NNTR_LOGIT_TOPK_DBG") != nullptr;
+    static int topk_calls = 0;
+    if (topk_dbg && topk_calls < 6) {
+      ++topk_calls;
+      int top[5] = {-1, -1, -1, -1, -1};
+      for (unsigned int v = 0; v < NUM_VOCAB; ++v) {
+        for (int k = 0; k < 5; ++k) {
+          if (top[k] < 0 || logits[v] > logits[top[k]]) {
+            for (int m = 4; m > k; --m)
+              top[m] = top[m - 1];
+            top[k] = (int)v;
+            break;
+          }
+        }
+      }
+      std::fprintf(stderr, "[TOPK] call#%d", topk_calls);
+      for (int k = 0; k < 5; ++k)
+        if (top[k] >= 0)
+          std::fprintf(stderr, "  %d:%.4f", top[k], logits[top[k]]);
+      std::fprintf(stderr, "\n");
+      std::fflush(stderr);
+    }
+
+#if defined(ENABLE_OPENCL)
+    // On-GPU greedy argmax already produced the token (lm_head logits never left
+    // the GPU; only the 4-byte id came back). Only set under pure-greedy gating.
+    // OpenCL-only -> on the no-OpenCL build the host sampler below runs. [T12]
+    {
+      unsigned int gpu_tok = 0;
+      if (nntrainer::consume_gpu_argmax(&gpu_tok)) {
+        outputs.push_back(gpu_tok);
+        logits = logits + NUM_VOCAB;
+        input_ids = input_ids + MAX_SEQ_LEN;
+        continue;
+      }
+    }
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // CUDA on-GPU greedy argmax (NNTR_CUDA_ARGMAX): reduce the device-resident
+    // lm_head logits to the token id on the GPU and read back only 4 bytes,
+    // skipping the host std::max_element over the full-vocab buffer. Gated to
+    // pure greedy (no sampling, no repetition penalty, no bad words -- those
+    // mutate logits on host) and only when incrementalInference stashed a
+    // device-accessible logits pointer for this (single, BATCH_SIZE==1) row.
+    if (cuda_argmax_enabled() && g_cuda_logits_dev != nullptr &&
+        do_sample == false &&
+        (repetition_penalty == 1 || input_ids == nullptr || NUM_INPUT_IDS == 0) &&
+        (BAD_WORD_IDS.size() == 0 || NUM_BADWORDS == 0)) {
+      unsigned int tok = 0;
+      bool ok = g_cuda_logits_fp16
+                  ? nntrainer::cuda::cuda_argmax_fp16(
+                      reinterpret_cast<const unsigned short *>(g_cuda_logits_dev),
+                      NUM_VOCAB, &tok)
+                  : nntrainer::cuda::cuda_argmax_fp32(
+                      reinterpret_cast<const float *>(g_cuda_logits_dev),
+                      NUM_VOCAB, &tok);
+      // Consume the stash regardless (it belongs to this call's logits row).
+      g_cuda_logits_dev = nullptr;
+      if (ok) {
+        outputs.push_back(tok);
+        logits = logits + NUM_VOCAB;
+        input_ids = input_ids + MAX_SEQ_LEN;
+        continue;
+      }
+      // else: fall through to the host path below (host buffer still valid).
+    }
+#endif
 
     // apply repetition penalty
     if (repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0) {
@@ -302,37 +723,30 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
       applyBadWordsPenalty(logits, BAD_WORD_IDS.data(), NUM_BADWORDS);
     }
 
+    if (logits_processor != nullptr)
+      logits_processor->process(logits, NUM_VOCAB, iteration);
+
+    unsigned int output_id;
+
     // return argmax if do_sample is false
     if (do_sample == false) {
-      unsigned int argmax_idx =
+      output_id =
         std::distance(logits, std::max_element(logits, logits + NUM_VOCAB));
-      outputs.push_back(argmax_idx);
     } else {
-      // apply temperature & top-k & top-p to logits
-      float max_logits = applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P);
-      // transform logits to softmax
-      float sum_exp_logits = 0;
-      for (unsigned int i = 0; i < NUM_VOCAB; i++) {
-        float exp_x = exp(logits[i] - max_logits);
-        sum_exp_logits += exp_x;
-        logits[i] = exp_x;
-      }
-
-      for (unsigned int i = 0; i < NUM_VOCAB; ++i) {
-        logits[i] /= sum_exp_logits;
-      }
-
-      // sample from final logits
-      std::discrete_distribution<int> dist(logits, logits + NUM_VOCAB);
-      unsigned int sampled_idx = dist(rng);
-
-      // add sampled word
-      outputs.push_back(sampled_idx);
+      // apply temperature & top-k & top-p and sample with original logits
+      // unchanged
+      output_id = applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P, rng);
     }
+
+    outputs.push_back(output_id);
+
+    if (logits_processor != nullptr)
+      logits_processor->acceptToken(output_id, iteration);
 
     // set batch offset
     logits = logits + NUM_VOCAB;
-    input_ids = input_ids + MAX_SEQ_LEN;
+    if (input_ids != nullptr)
+      input_ids = input_ids + MAX_SEQ_LEN;
   }
 
   return outputs;
@@ -341,24 +755,79 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 void CausalLM::registerCustomLayers() {
   Transformer::registerCustomLayers();
   const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  // lm_head promoted to core app_context.cpp (cpu) [T12 Wave B].
+
+  // Register ReshapedRMSNormLayer on the GPU (cl) context once, centrally, so
+  // ANY model can build its per-head q/k/v norms with engine=GPU and keep them
+  // GPU_CLMEM-resident (Gemma4 S1.1 / Qwen3 q/k norm) instead of draining to
+  // the host every layer. Future q/k-norm models get GPU residency for free:
+  // they only need their existing cpu-context registration plus
+  // engine=causallm_engine() on the reshaped_rms_norm layer. Inert (skipped)
+  // when there is no GPU context (CPU-only / NNTR_ENGINE=cpu builds). The
+  // per-model registerCustomLayers still registers it on the cpu context.
+  // Goes through Engine's registration facade — no static_cast to ClContext.
   try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::LmHeadLayer>);
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
+    // no "gpu" context (CPU-only build) or already registered — both benign.
   }
+
+  // gauss4 PLE post_norm (RMSReverseNormLayer) on the GPU context: its
+  // incremental_forwarding runs the reverse-norm as a GPU op (no host op inside
+  // the async GPU graph). Same central-registration pattern as the reshaped norm
+  // above; inert on CPU-only builds.
+  try {
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "gpu" context or already registered — both benign.
+  }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Centralized cuda-context registration of ReshapedRMSNormLayer (mirror of
+  // the cl block above). engine=cuda tensors are UVM (host-coherent) and not
+  // isSVM()-flagged, so its forwarding takes the correct host path.
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "cuda" context or already registered — both benign.
+  }
+  // gauss4 PLE post_norm (RMSReverseNormLayer) on the cuda context: UVM
+  // tensors are host-coherent and not isSVM()-flagged, so its forwarding
+  // takes the correct host FP32-temp path (mirror of the "gpu" block above).
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "cuda" context or already registered — both benign.
+  }
+#endif
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
   auto start_total = std::chrono::high_resolution_clock::now();
+  // On-GPU greedy argmax sampler (NNTR_GPU_ARGMAX): keep lm_head logits on the
+  // GPU, reduce to the token id on-device, read back only 4 bytes (vs the full
+  // V-vocab D->H pass + host max_element). Only safe for pure greedy: no
+  // sampling, no bad-words penalty (those mutate logits on host), batch == 1.
+#if defined(ENABLE_OPENCL)
+  nntrainer::request_gpu_argmax(std::getenv("NNTR_GPU_ARGMAX") != nullptr &&
+                                !do_sample && BAD_WORD_IDS.empty() &&
+                                BATCH_SIZE == 1);
+#endif
   if (!is_initialized) {
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
   }
+
+  struct StreamerEndGuard {
+    BaseStreamer *streamer;
+    ~StreamerEndGuard() { streamer_end(streamer); }
+  } streamer_end_guard{streamer_};
 
   // Allocate the host-owned KV cache and bind it to mha_core's external cache
   // input slots. Idempotent: only the first call does work; subsequent runs
@@ -367,6 +836,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   allocateAndBindKVCache();
 
   has_run_ = false;
+  prepareStopRequestForRun();
 
   output_list.clear();
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
@@ -411,12 +881,23 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     prompt_ = system_prompt + prompt + tail_prompt;
   }
 
+  // [round-13 init overlap] join the async tokenizer load before first use
+  // (covers both Encode calls below and every later Decode this run).
+  ensureTokenizer();
+
   if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
     SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
 
-  auto _input = tokenizer->Encode(prompt_);
-  ///@note insert bos token at the beginning of the input
-  // _input.insert(_input.begin(), BOS_TOKEN_ID);
+  ///@note add_special_tokens=true lets each model's OWN tokenizer decide whether
+  /// to prepend a BOS, rather than hard-coding it. The 1-arg Encode skips special
+  /// tokens, so the leading BOS that Gemma2 (TemplateProcessing, add_bos_token=
+  /// true) needs was dropped -> short prompts degenerated into pure repetition
+  /// ("The capital of France is" -> "is is is..."); long prompts masked it.
+  /// Verified to match HF add_special_tokens=True per model: Gemma2 gains its
+  /// BOS(2); models whose tokenizer adds no BOS (e.g. Qwen3 — ByteLevel post-
+  /// processor, add_bos_token=false) are byte-identical to the old behavior, so
+  /// they are unaffected. (sentence_transformer.cpp already encodes this way.)
+  auto _input = tokenizer->Encode(prompt_, /*add_special_tokens=*/true);
 
   // | <------------------- MAX_SEQ_LEN -------------------> |
   //                       ||             ||
@@ -424,11 +905,29 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   std::vector<int64_t> init_input;
   unsigned int _len = _input.size();
-  unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
+  // The prefill activation buffers are built at INIT_SEQ_LEN (transformer.cpp
+  // constructModel, {1,1,1,INIT_SEQ_LEN}); resetInputDimension is disabled, so
+  // a prompt longer than INIT_SEQ_LEN overflows the shared activation tensor
+  // (getSharedDataTensor bounds-check throw). Cap the prompt to the smaller of
+  // the prefill buffer (INIT_SEQ_LEN) and the KV budget (MAX_SEQ_LEN - gen).
+  unsigned int num_allow_str =
+    std::min<unsigned int>(INIT_SEQ_LEN, MAX_SEQ_LEN - NUM_TO_GENERATE);
   unsigned int text_len = _len;
 
-  if (_len > num_allow_str)
+  if (_len > num_allow_str) {
     text_len = num_allow_str;
+    // Silent tail truncation loses whatever the prompt ENDS with (round-13
+    // field case: a summarization instruction at the tail was dropped and
+    // the model continued the body instead). Unexpected state -> always warn.
+    std::fprintf(
+      stderr,
+      "[causallm] WARNING: prompt (%u tokens) exceeds the prefill window "
+      "(init_seq_len=%u, max_seq_len-num_to_generate=%u); truncating %u "
+      "tail tokens. Raise init_seq_len to fit the prompt.\n",
+      _len, static_cast<unsigned int>(INIT_SEQ_LEN),
+      static_cast<unsigned int>(MAX_SEQ_LEN - NUM_TO_GENERATE),
+      _len - num_allow_str);
+  }
 
   // feed only available length
   // if _input is allowed, it feeds all of the _input
@@ -488,8 +987,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
     allocateAndBindKVCache();
     setKVCachePosition(0);
-    output = model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                          0, input_len, false);
+    output = incrementalInference(BATCH_SIZE, input, input_len, 0, input_len);
 
     SYS_PROMP_LEN = input_len;
     save_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
@@ -514,18 +1012,229 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
   allocateAndBindKVCache();
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
-  const unsigned int prefill_to = prefill_from + input_len;
-  setKVCachePosition(prefill_from);
-  output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
-                                        prefill_from, prefill_to, false);
+  std::vector<unsigned int> id_list;
 
-  // post process of model output
-  std::vector<unsigned int> id_list(
-    generate(output[0], do_sample, 1, ids_history, init_len));
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Prewarm the QS4CX dp4a weight caches on the CPU (ThreadManager-parallel) at
+  // load: the one-time plain -> packed int4 repack is ~38% of the cold-run
+  // GPU time (nsys). Doing it here -- once, before start_prefill is reset --
+  // keeps it off the first prefill and off the GPU. Idempotent (per-weight
+  // cache check), gated by NNTR_CUDA_PREWARM (default on).
+  {
+    static bool cuda_prewarmed = false;
+    static const char *_pw = std::getenv("NNTR_CUDA_PREWARM");
+    static const bool cuda_prewarm_on = !(_pw && _pw[0] == '0');
+    // cuda engine ONLY: without this gate a dual-enabled (CUDA+OpenCL) binary
+    // ran the whole prewarm on OpenCL runs too, allocating every FC's derived
+    // cache on the NVIDIA device (measured: 4.4GB VRAM on an Intel xmx run of
+    // gauss4 -- the ~6GB "idle" NVIDIA usage seen on Windows).
+    if (!cuda_prewarmed && cuda_prewarm_on && causallm_engine() == "cuda") {
+      cuda_prewarmed = true;
+      std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
+                         void *)>
+        fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &ctx, void *) {
+          if (l.getType() != "fully_connected")
+            return;
+          for (unsigned int w = 0; w < ctx.getNumWeights(); ++w) {
+            nntrainer::Tensor &wt = ctx.getWeight(w);
+            // QINT4 never appears here: layer_context coerces it to QS4CX.
+            if (wt.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+              continue;
+            // [weight 한벌] The dp4a/cuBLAS device caches are built straight
+            // from the plain QS4CX payload (keyed by its pointer) -- no UVM
+            // Section-A copy. Building the fp16-scale UVM side buffer here
+            // too makes the first forward (and any CUDA-graph capture) a pure
+            // cache hit. NOTE the scale conversion host-READS the fp32 tail,
+            // so it must run before any wprefetch migration below.
+            const unsigned short *uS = nullptr;
+            nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+              wt.getScale<float>(), wt.width(), &uS);
+            // [i8-skip] skip_prefill FCs never see prefill M>1 (fc_layer.cpp
+            // early-return) and the untied lm_head decodes at M=1, so neither
+            // can reach the M>=32 cuBLAS-i8 gate -- their [K,N] int8 cache
+            // (2x the int4 payload; gauss4 ~1.5GB, lm_head alone 673MiB) is
+            // dead VRAM. Exempt them from the EAGER build; the lazy runtime
+            // build remains as the self-healing fallback.
+            bool i8_dead = l.getName() == "output_of_causallm";
+            if (!i8_dead) {
+              try {
+                i8_dead = l.getProperty("skip_prefill") == "true";
+              } catch (...) {
+              }
+            }
+            if (i8_dead)
+              nntrainer::cuda::cuda_fc_qs4cx_prewarm_exempt_i8(
+                wt.getData<uint8_t>());
+            // [wprefetch] NNTR_CUDA_WPREFETCH>=1: release the plain payload
+            // from host RSS (migrate to VRAM) and build the derived caches
+            // with the GPU repack kernels -- the CPU prewarm would fault the
+            // pages straight back. Discrete only; VRAM must fit pool+caches
+            // (8GB-class cards: measure before enabling). Fallback = the CPU
+            // prewarm, byte-identical caches either way.
+            static const int wprefetch = []() {
+              const char *e = std::getenv("NNTR_CUDA_WPREFETCH");
+              return e ? atoi(e) : 0;
+            }();
+            if (!(wprefetch >= 1 &&
+                  nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
+                    wt.getData<uint8_t>(), wt.width(), wt.height()) &&
+                  nntrainer::cuda::cuda_fc_qs4cx_prewarm_gpu(
+                    wt.getData<uint8_t>(), wt.width(), wt.height())))
+              nntrainer::cuda::cuda_fc_qs4cx_prewarm(wt.getData<uint8_t>(),
+                                                     wt.width(), wt.height());
+            // [pool-bypass] every derived cache for this weight now exists
+            // (dp4a packed [+ cuBLAS int8] + fp16 scales) -- with the heap
+            // bypass the plain pages are droppable in place, the same way the
+            // v8c path drops them after its backing build. Opt-in.
+            static const bool cuda_drop = []() {
+              const char *e = std::getenv("NNTR_CUDA_DROP_PLAIN");
+              return e != nullptr && e[0] == '1';
+            }();
+            if (cuda_drop)
+              nntrainer::cuda::cuda_fc_qs4cx_drop_plain_pages(
+                wt.getData<uint8_t>(), wt.width(), wt.height());
+          }
+        };
+      model->forEachLayer(fn, nullptr);
+      // Pre-grow the split-KV decode scratch so the M=1 flash-decode path never
+      // cudaMallocs inside a CUDA-graph capture (NNTR_CUDA_GRAPH). 2*HEAD_DIM
+      // covers gemma4's global-attention head_dim (512 vs base 256); over-
+      // allocation is a few hundred KB. ensure_sk's isCapturing() guard is the
+      // safety net if a model exceeds these bounds.
+      nntrainer::cuda::cuda_attention_splitkv_prewarm(
+        static_cast<int>(MAX_SEQ_LEN), NUM_HEADS, 2 * HEAD_DIM);
+      // Pre-grow the dp4a decode FC scratch so the M=1 decode path never
+      // cudaMallocs inside a CUDA-graph capture (NNTR_CUDA_GRAPH). Decode is
+      // M=1; K (the FC input/contraction dim) is bounded by max(hidden DIM, FFN
+      // intermediate): the down-projection FC reads the FFN intermediate
+      // activation (K = INTERMEDIATE_SIZE > DIM), so DIM alone under-sizes the
+      // activation-quant staging and that FC would bail under capture -> i8mm
+      // host path (SIGILL on Orin) / stale UVM read. N is bounded by the largest
+      // decode FC output = max(vocab, FFN intermediate). The in-path
+      // isCapturing() guard is the safety net if these bounds are exceeded.
+      nntrainer::cuda::cuda_fc_qint4_dp4a_prewarm(
+        1u,
+        std::max(static_cast<unsigned int>(DIM),
+                 static_cast<unsigned int>(INTERMEDIATE_SIZE)),
+        std::max(NUM_VOCAB, static_cast<unsigned int>(INTERMEDIATE_SIZE)));
 
-  if (init_len < INIT_SEQ_LEN)
-    registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
+      // W2: when the PREFILL CUDA graph is active (integrated), run ONE eager
+      // prefill forward at the real M here (load phase) so EVERY prefill scratch
+      // buffer (g_dp4a_q8/ascale/azp, g_i8_c, g_i8_bchunk, attention scratch) is
+      // grown and the cuBLASLt algos are selected. Otherwise the FIRST (and only,
+      // in a single-shot run) real prefill would hit an in-capture cudaMalloc and
+      // fall back to eager. This warmup itself captures->aborts(malloc)->eager,
+      // which is exactly what grows the scratch; the timed prefill then captures.
+      // Reset the KV position after so the real prefill is unaffected.
+      {
+        const char *_pgenv = std::getenv("NNTR_CUDA_PREFILL_GRAPH");
+        const char *_genv = std::getenv("NNTR_CUDA_GRAPH");
+        const bool prefill_graph_on =
+          _pgenv ? (_pgenv[0] != '0')
+                 : (_genv && _genv[0] == '1' &&
+                    nntrainer::cuda::ContextManager::Global().isIntegrated());
+        if (prefill_graph_on && init_len > 1) {
+          const unsigned int wlen =
+            (SKIP_PREFILL && init_len > 1) ? init_len - 1 : init_len;
+          auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
+          // EAGER warmup: disable prefill-graph capture so the FCs grow their
+          // scratch via cudaMalloc (a malloc inside capture would make the FC
+          // bail to host i8mm -> SIGILL on Orin). Re-enable after.
+          nn->setPrefillCaptureDisabled(true);
+          setKVCachePosition(prefill_from);
+          auto wout = incrementalInference(BATCH_SIZE, input, wlen, prefill_from,
+                                           prefill_from + wlen);
+          for (auto &o : wout)
+            delete[] o;
+          setKVCachePosition(prefill_from);
+          nn->setPrefillCaptureDisabled(false);
+        }
+      }
+      start_prefill = std::chrono::high_resolution_clock::now();
+    }
+  }
+#endif
 
+  if (SKIP_PREFILL && init_len > 1) {
+    // Prefill only N-1 tokens; the last input token will be used as the first
+    // token in the generation phase (assigned directly, not sampled).
+    unsigned int skipped_token =
+      static_cast<unsigned int>(init_input[init_len - 1]);
+
+    const unsigned int prefill_to = prefill_from + input_len - 1;
+    setKVCachePosition(prefill_from);
+    if (prefill_from > 0 && init_len - 1 > 1) {
+      // Resumed prefill (see the non-skip branch below): feed the
+      // init_len-1 prefill tokens through the decode call shape; their
+      // logits are discarded, matching the block skip-prefill semantics.
+      for (unsigned int i = 0; i + 1 < init_len; ++i) {
+        for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+            static_cast<float>(init_input[i]);
+        const unsigned int p = prefill_from + i;
+        auto step_out = incrementalInference(BATCH_SIZE, input, p, p, p + 1);
+        for (auto &o : step_out)
+          delete[] o;
+      }
+    } else {
+      output = incrementalInference(BATCH_SIZE, input, init_len - 1,
+                                    prefill_from, prefill_to);
+    }
+
+    for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+      id_list.push_back(skipped_token);
+
+    // Adjust lengths so the generation loop processes the skipped token
+    // at the correct KV cache position.
+    input_len -= 1;
+    init_len -= 1;
+  } else {
+    const unsigned int prefill_to = prefill_from + input_len;
+    setKVCachePosition(prefill_from);
+    if (prefill_from > 0 && init_len > 1) {
+      // Resumed prefill (KV loaded at prefill_from): the CL layers AND the
+      // shared llm layers (sigmoid_glu/swiglu/geglu) only accept from>0
+      // with a step of 1 (decode shape) on every engine, so feed the
+      // prompt token-by-token through the decode call shape
+      // (init_seq_len == from == absolute position, to = position + 1).
+      for (unsigned int i = 0; i < init_len; ++i) {
+        for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+            static_cast<float>(init_input[i]);
+        const unsigned int p = prefill_from + i;
+        auto step_out = incrementalInference(BATCH_SIZE, input, p, p, p + 1);
+        if (i + 1 < init_len) {
+          for (auto &o : step_out)
+            delete[] o;
+        } else {
+          output = std::move(step_out);
+        }
+      }
+    } else {
+      output = incrementalInference(BATCH_SIZE, input, init_len, prefill_from,
+                                    prefill_to);
+    }
+
+    // post process of model output
+    id_list = generate(output[0], do_sample, 1, ids_history, init_len);
+
+    if (init_len < INIT_SEQ_LEN)
+      registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
+  }
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // [i8-ephemeral] NNTR_CUDA_I8_EPHEMERAL=1: the prefill just finished and
+  // decode (M=1, dp4a) never reads the cuBLAS-i8 caches -- free them here so
+  // the decode phase runs without their VRAM residency (~1.2GB on gauss4).
+  // Multi-turn: the next prefill lazily rebuilds (slower TTFT on that turn).
+  {
+    static const bool i8_ephemeral = []() {
+      const char *e = std::getenv("NNTR_CUDA_I8_EPHEMERAL");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (i8_ephemeral && causallm_engine() == "cuda")
+      nntrainer::cuda::cuda_fc_qs4cx_free_i8_caches();
+  }
+#endif
   // output should be deallocated after use
   for (auto &out : output) {
     delete[] out;
@@ -548,15 +1257,80 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   auto start_generation = std::chrono::high_resolution_clock::now();
 
+  // recq (R4): record/replay single-submission decode. Currently a MECHANISM
+  // self-test -- the FIRST decode token is produced by recording one forward
+  // (captured, not executed) then replaying it with this token's scalar/gws
+  // overrides; the on-GPU argmax is read back on the host-I/O queue. If the
+  // replayed first token matches the non-recq baseline, the record+replay+
+  // override+argmax path is proven (the full per-token replay loop additionally
+  // needs the per-token input-placeholder feed). Gated NNTR_RECQ_REPLAY +
+  // NNTR_SVM_RESIDENT (host-op-zero forward). Default off => unchanged.
+#if defined(ENABLE_OPENCL) // [T12] recq (OpenCL recordable-queue) decode state
+  static const bool _recq_replay = std::getenv("NNTR_RECQ_REPLAY") != nullptr;
+  auto &_cqm = nntrainer::opencl::CommandQueueManager::Global();
+  bool _recq_recorded = false;
+#endif
+
   for (unsigned int token_generation_idx = input_len + 1;
-       token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
+       token_generation_idx < input_len + 1 + NUM_TO_GENERATE &&
+       !stop_requested_.load(std::memory_order_acquire);
        ++token_generation_idx) {
 
     allocateAndBindKVCache();
-    auto output_interval =
-      model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                   token_generation_idx - 1 + global_token_len,
-                                   token_generation_idx + global_token_len);
+    const unsigned int _recq_ci = token_generation_idx - 1 + global_token_len;
+    std::vector<float *> output_interval;
+    bool _did_replay = false;
+#if defined(ENABLE_OPENCL) // [T12] recq record/replay path (OpenCL-only)
+    if (_recq_replay && _cqm.getRecordableQueue() != nullptr) {
+      if (!_recq_recorded) {
+        // First decode token: RECORD the full forward (capture-only). The host
+        // embedding ran here, so embedding0:out0 holds this token's embedding for
+        // the replay below.
+        causallm::recq_reset_overrides();
+        if (_cqm.beginRecording()) {
+          output_interval = incrementalInference(BATCH_SIZE, input, input_len,
+                                                 _recq_ci, _recq_ci + 1);
+          _cqm.endRecording();
+          _recq_recorded = true;
+          std::fprintf(stderr,
+                       "[RECQ] recorded decode forward: %u dispatches, %zu "
+                       "overrides\n",
+                       (unsigned int)_cqm.getRecordDispatchIndex(),
+                       causallm::recq_override_count());
+        }
+      } else {
+        // Subsequent tokens: FEED pass -- run incrementalInference with ALL GPU
+        // dispatches skipped, so only the HOST embedding refreshes embedding0:out0
+        // with this token's embedding; the GPU forward comes from the replay.
+        _cqm.setSkipAllDispatches(true);
+        output_interval = incrementalInference(BATCH_SIZE, input, input_len,
+                                               _recq_ci, _recq_ci + 1);
+        _cqm.setSkipAllDispatches(false);
+      }
+      if (_recq_recorded) {
+        std::vector<nntrainer::opencl::cl_array_arg_qcom> _rargs;
+        std::vector<nntrainer::opencl::cl_workgroup_qcom> _rgws;
+        std::vector<int> _rints;
+        std::vector<std::array<std::size_t, 3>> _rgwss;
+        causallm::recq_build_token_overrides(_recq_ci, _rargs, _rgws, _rints,
+                                             _rgwss);
+        cl_event _revt = nullptr;
+        if (_cqm.replayRecording(_rargs.data(), _rargs.size(), _rgws.data(),
+                                 _rgws.size(), &_revt)) {
+          unsigned int _rtok = 0;
+          if (nntrainer::recq_read_argmax_io(&_rtok, _revt))
+            _did_replay = true;
+        }
+        if (!_did_replay)
+          std::fprintf(stderr,
+                       "[RECQ] replay/readback FAILED @ci=%u; fallback to normal\n",
+                       _recq_ci);
+      }
+    }
+#endif // ENABLE_OPENCL (recq record/replay) [T12]
+    if (!_did_replay)
+      output_interval = incrementalInference(BATCH_SIZE, input, input_len,
+                                             _recq_ci, _recq_ci + 1);
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
 
     // Feed the newly generated token back as the next input token.
@@ -592,6 +1366,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     }
 
     if (is_finish) {
+      break;
+    }
+
+    if (stop_requested_.load(std::memory_order_acquire)) {
       break;
     }
   }

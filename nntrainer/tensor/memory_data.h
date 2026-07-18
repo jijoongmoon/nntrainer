@@ -21,6 +21,34 @@ namespace nntrainer {
 using MemoryDataValidateCallback = std::function<void(unsigned int)>;
 
 /**
+ * @brief  GPU residency class of a tensor's backing memory.
+ * @details Decided STATICALLY by the memory planner / pool at allocation time
+ *          (a tensor property), NOT a per-edge runtime flip. This is the basis
+ *          of the planner-decided cl_mem residency design (S0): the engine and
+ *          role of each tensor are known before execution, so "this tensor
+ *          lives in cl_mem" is an allocation decision applied uniformly to all
+ *          of that tensor's producers and consumers.
+ *          - HOST: host-only (CPU) memory.
+ *          - SVM: shared virtual memory (device-visible AND host-addressable);
+ *            used for attention Q/O/KV today and any GPU tensor needing host
+ *            access.
+ *          - GPU_CLMEM: device cl_mem, NOT host-addressable; layers bind it as
+ *            a cl_mem kernel argument (see Tensor::isClMem / getClMem).
+ *          - IMAGE2D: device image2d (texture-cached read_imageui); the Adreno
+ *            v8c weight / KV-attention plane. Not produced by deriveResidency
+ *            yet — reserved for the role-driven KV->image crossover (Mem M4/M6).
+ *          - RPCMEM: ION/rpcmem shared buffer for the QNN/NPU backend (DSP-
+ *            visible). Reserved for the NPU bring-up (Mem M6, §10 T13/T14).
+ */
+enum class ResidencyClass : unsigned char {
+  HOST = 0,      /**< host-only (CPU) memory */
+  SVM = 1,       /**< shared virtual memory (device + host addressable) */
+  GPU_CLMEM = 2, /**< device cl_mem (not host-addressable) */
+  IMAGE2D = 3,   /**< device image2d texture (Adreno v8c/KV); [Mem M6] reserved */
+  RPCMEM = 4,    /**< ION/rpcmem DSP-visible buffer (QNN/NPU); [Mem M6] reserved */
+};
+
+/**
  * @brief  MemoryData Class
  */
 class MemoryData {
@@ -43,7 +71,10 @@ public:
     address(addr),
     validate_cb([](unsigned int) {}),
     invalidate_cb([](unsigned int) {}),
-    svm_allocation(false) {}
+    svm_allocation(false),
+    device_valid(false),
+    device_mem(nullptr),
+    residency_(ResidencyClass::HOST) {}
 
   /**
    * @brief  Constructor of Memory Data
@@ -59,7 +90,10 @@ public:
     address(memory_ptr),
     validate_cb(v_cb),
     invalidate_cb(i_cb),
-    svm_allocation(false) {}
+    svm_allocation(false),
+    device_valid(false),
+    device_mem(nullptr),
+    residency_(ResidencyClass::HOST) {}
 
   /**
    * @brief  Deleted constructor of Memory Data
@@ -124,6 +158,68 @@ public:
    */
   bool isSVM() const { return svm_allocation; }
 
+  /**
+   * @brief  True unless this memory is DEVICE-ONLY (e.g. cudaMalloc): the host
+   *         must not dereference the pointer and every host read/write has to
+   *         stage. Stamped from MemAllocator::isHostAddressable() at pool bind
+   *         (same pattern as the SVM stamp) so consumers ask the tensor, not
+   *         the driver -- replaces per-call cudaPointerGetAttributes probing
+   *         in app code (ARCH_CONFORMANCE_REVIEW_20260713 V1; layering rule:
+   *         capability flows up via the allocator, no layer calls up).
+   *         Defaults true: plain host buffers / Tensor::Map are host memory.
+   */
+  bool isHostAddressable() const { return host_addressable; }
+
+  /**
+   * @brief  GPU activation-residency state (NNTR_DEVRES overlay, Step 0).
+   * @details device_valid means "the freshest copy of this activation lives in
+   *          the device buffer device_mem", DISTINCT from `valid` (which means
+   *          host-resident and is toggled by CachePool swapOut via setAddr).
+   *          A producer GPU op sets it after writing device_mem; a host consumer
+   *          clears it after syncing down. Default false => the bit is inert and
+   *          every consumer falls through to the existing SVM/host path
+   *          (byte-identical) until a producer opts in. device_mem is held as a
+   *          non-owning void* so this header stays OpenCL-free (CPU build safe).
+   */
+  bool isDeviceValid() const { return device_valid; }
+
+  /**
+   * @brief  Set the device-residency bit and (optionally) the device buffer.
+   */
+  void setDeviceValid(bool v, void *dev = nullptr) {
+    device_valid = v;
+    if (dev != nullptr)
+      device_mem = dev;
+  }
+
+  /**
+   * @brief  Get the resident device buffer (cl_mem as void*), or null.
+   */
+  void *deviceMem() const { return device_mem; }
+
+  /**
+   * @brief  Get the static residency class assigned by the planner/pool.
+   */
+  ResidencyClass residency() const { return residency_; }
+
+  /**
+   * @brief  Set the static residency class (planner/pool allocation decision).
+   * @note   Distinct from the per-edge device_valid runtime bit: residency_ is
+   *         a static tensor property set once at allocation; device_valid is
+   *         the legacy runtime overlay. S0 only STORES residency_ (inert) so
+   *         the output stays byte-identical; S2 makes layers bind by class.
+   */
+  void setResidency(ResidencyClass r) { residency_ = r; }
+
+  /**
+   * @brief  True if this memory lives in device cl_mem (not host-addressable).
+   * @details Layers use this to decide HOW to bind: a cl_mem kernel argument
+   *          (SetKernelArguments) for GPU_CLMEM vs an SVM/host pointer
+   *          (SetKernelSVMArguments) otherwise. Host pointer arithmetic on a
+   *          GPU_CLMEM tensor is a bug by construction.
+   */
+  bool isClMem() const { return residency_ == ResidencyClass::GPU_CLMEM; }
+
 private:
   /**
    * @brief  Set SVM allocation flag (private - only accessible by MemoryPool)
@@ -134,12 +230,22 @@ private:
    */
   void setSVM(bool is_svm) { svm_allocation = is_svm; }
 
+  /**
+   * @brief  Set host-addressability (private -- MemoryPool stamps it at bind,
+   *         mirroring setSVM).
+   */
+  void setHostAddressable(bool v) { host_addressable = v; }
+
   bool valid;
   unsigned int id;
   void *address;
   MemoryDataValidateCallback validate_cb;
   MemoryDataValidateCallback invalidate_cb;
   bool svm_allocation;
+  bool host_addressable = true;
+  bool device_valid;  /**< NNTR_DEVRES: freshest copy is in device_mem */
+  void *device_mem;   /**< NNTR_DEVRES: resident cl_mem (non-owning, void*) */
+  ResidencyClass residency_; /**< static residency class (planner decision) */
 };
 
 } // namespace nntrainer

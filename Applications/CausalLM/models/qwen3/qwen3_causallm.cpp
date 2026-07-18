@@ -40,15 +40,21 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
-  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape)))
-  LayerHandle q_norm(createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape))).
+  // engine=GPU (mirror of Gemma4 S1.1): keeps q_norm output GPU_CLMEM-resident
+  // (the layer is registered on the cl context in registerCustomLayers) instead
+  // of draining q to the host for a CPU RMS norm every layer. Decode ~+20% on
+  // Adreno, prefill neutral, token-identical. q/k norm carry gamma so they take
+  // the GPU coop kernel directly (no gamma-free v_norm fallback concern).
+  std::vector<std::string> q_norm_params = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
+    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("feature_size", std::to_string(head_dim)),
+    withKey("engine", causallm_engine())};
+  LayerHandle q_norm(createLayer("reshaped_rms_norm", q_norm_params));
   Tensor q_normed = q_norm(q);
 
   // K layer
@@ -56,15 +62,18 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
-  // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
-  LayerHandle k_norm(createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+  // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape))). engine=GPU as
+  // with q_norm above (GPU_CLMEM-resident, no per-layer host drain).
+  std::vector<std::string> k_norm_params = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
+    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("feature_size", std::to_string(head_dim)),
+    withKey("engine", causallm_engine())};
+  LayerHandle k_norm(createLayer("reshaped_rms_norm", k_norm_params));
   Tensor k_normed = k_norm(k);
 
   // V layer
@@ -72,12 +81,16 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor v = wv(value);
 
-  // External KV cache placeholders (per-layer). Storage is owned by the host
-  // (KVCacheManager) and bound at runtime via setExternalTensors.
-  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+  // KV cache wiring. Default is external (5-input mha) with FP16
+  // placeholders owned by KVCacheManager. When NNTR_KV_INT8=1, switch to
+  // 3-input mode so mha_core allocates an INT8 cache + FP16 scale
+  // tensors internally - createKVCachePlaceholders only emits FP16
+  // tensors so it can't host the int8 path.
+  static const bool _kv_int8_setup = std::getenv("NNTR_KV_INT8") != nullptr;
 
   // Attention core layer
   LayerHandle mha(createLayer(
@@ -89,31 +102,52 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
-  Tensor a = mha({q_normed, k_normed, v, cache_k, cache_v});
+     withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+     withKey("use_gemm_attention",
+             USE_FLASH_ATTENTION ? "true" : "false"),
+     // Decode-GPU: qwen3 flash decode attention DIVERGES (a separate
+     // head_dim=128 bug) even with host RoPE, so keep BOTH the decode flash
+     // attention (B) and the GPU-RoPE-decode (A) OFF for now (explicit; both
+     // default false anyway). NNTR_MHA_GPU_DECODE env still forces them on for
+     // testing.
+     // [T11-consume] derive from getModelFeatures() (single source). Values
+     // unchanged (qwen3: host decode, head_dim=128 diverges), so token-identical.
+     withKey("gpu_decode_attn", getModelFeatures().decode_gpu ? "true" : "false"),
+     withKey("gpu_decode_rope",
+             getModelFeatures().decode_rope_gpu ? "true" : "false"),
+     withKey("gpu_ohwi_rope",
+             getModelFeatures().decode_gpu ? "true" : "false")}));
+  Tensor a;
+  if (_kv_int8_setup) {
+    a = mha({q_normed, k_normed, v});
+  } else {
+    auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+    a = mha({q_normed, k_normed, v, cache_k, cache_v});
+  }
 
   // O layer
   LayerHandle wo(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"), withKey("engine", causallm_engine())}));
   return wo(a);
 }
 
 void Qwen3Transformer::registerCustomLayers() {
   ///
   auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
   try {
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
   }
+  // GPU-context registration of ReshapedRMSNormLayer is centralized in
+  // CausalLM::registerCustomLayers (shared by all models); q/k norm above build
+  // with engine=GPU and resolve there to stay GPU_CLMEM-resident.
 }
 
 void Qwen3CausalLM::registerCustomLayers() {

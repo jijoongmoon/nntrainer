@@ -48,6 +48,13 @@ void ensureComputeOps() {
   std::call_once(g_compute_ops_init_flag, []() { init_backend(); });
 }
 
+ComputeOps *getComputeOps() {
+  // Out-of-line on purpose — see the header note (shared-build data-export).
+  if (g_compute_ops == nullptr)
+    ensureComputeOps();
+  return g_compute_ops;
+}
+
 [[noreturn]] void ComputeOps::throwNotImplemented(const char *op) {
   throw std::runtime_error(std::string("ComputeOps::") + op +
                            " not implemented by this backend");
@@ -410,6 +417,29 @@ void ComputeOps::compute_rotary_embedding_value(unsigned int, unsigned int,
   NI(compute_rotary_embedding_value);
 }
 #endif // ENABLE_FP16
+
+// Whole-op (Tensor-level) — default throw; Cpu/Cl/Cuda subclasses override.
+void ComputeOps::geglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
+                       unsigned int) {
+  NI(geglu);
+}
+void ComputeOps::swiglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
+                        unsigned int) {
+  NI(swiglu);
+}
+void ComputeOps::sigmoid_glu(const Tensor &, const Tensor &, Tensor &,
+                             unsigned int, unsigned int) {
+  NI(sigmoid_glu);
+}
+void ComputeOps::sigmoid_add(const Tensor &, const Tensor &, Tensor &,
+                             unsigned int, unsigned int) {
+  NI(sigmoid_add);
+}
+void ComputeOps::residual_op(Tensor &, const Tensor &, bool) {
+  NI(residual_op);
+}
+void ComputeOps::fc(Tensor &, Tensor &, Tensor &) { NI(fc); }
+void ComputeOps::apply_activation(Tensor &, int) { NI(apply_activation); }
 
 #undef NI
 

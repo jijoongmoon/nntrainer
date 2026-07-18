@@ -37,6 +37,15 @@
 #include <add_layer.h>
 #include <addition_layer.h>
 #include <attention_layer.h>
+#include <geglu_layer.h> // LLM layers promoted to core [T12]
+#include <lm_head.h>
+#include <logit_softcapping.h>
+#include <qkv_layer.h>
+#include <scalar_multiply.h>
+#include <sigmoid_add_layer.h> // gauss4 PLE mix (fused sigmoid+x) [gauss4]
+#include <sigmoid_glu_layer.h> // gauss4 attention gate (fused sigmoid*x) [gauss4]
+#include <swiglu_layer.h>
+#include <tie_word_embedding.h>
 #include <bn_layer.h>
 #include <cast_layer.h>
 #include <centroid_knn.h>
@@ -260,6 +269,12 @@ void AppContext::initialize() noexcept {
 
     add_default_object();
     add_extension_object();
+
+    // Log device capabilities once (log-only, docs/ARCHITECTURE_REFACTOR.md
+    // §10 T1). AppContext inherits the base CPU snapshot (host-coherent).
+    ml_logi("[AppContext] %s", caps().toString().c_str());
+    // ExecPlan resolver SHADOW (§10 T4): CPU resolves to gemm_path=CPU.
+    ml_logi("[AppContext] %s (shadow)", resolveExecPlan(caps()).toString().c_str());
   } catch (std::exception &e) {
     ml_loge("registering layers failed!!, reason: %s", e.what());
   } catch (...) {
@@ -438,6 +453,37 @@ void AppContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<TimeDistLayer>, TimeDistLayer::type,
                   LayerType::LAYER_TIME_DIST);
+
+  // LLM layers promoted to core [T12]: string-keyed (no LayerType enum), like
+  // the GPU geglu/swiglu registered on the CL/CUDA contexts.
+  registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
+                  LogitSoftCappingLayer::type);
+  registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
+                  ScalarMultiplyLayer::type);
+  // qkv_layer: pure-host QKV projection (no GPU/OpenCL variant); a reusable SDK
+  // layer (no model wires it yet, so its registration is inert/additive).
+  registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
+  // swiglu on cpu: the merged backend-neutral SwiGLULayer (getOps dispatch +
+  // skip + the cuda fast path); replaces the former app causallm::SwiGLULayer.
+  registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
+  // gauss4 fused gates on cpu: sigmoid_glu (attn output gate = sigmoid(g)*x)
+  // and sigmoid_add (PLE mix = sigmoid(g)+emb). Backend-neutral getOps dispatch.
+  registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                  SigmoidGluLayer::type);
+  registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                  SigmoidAddLayer::type);
+  // geglu on cpu: the backend-neutral GeGLULayer (getOps -> CpuComputeOps::geglu).
+  // Was previously registered only on the CL/CUDA contexts; needed on cpu too so
+  // engine=cpu (the FP32 reference / Gemma models) finds it. [T12]
+  registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  // lm_head (untied host lm_head FC): promoted from the app cpu registration.
+  // Host-only (no GPU variant); only untied models construct it. [T12 Wave B]
+  registerFactory(nntrainer::createLayer<LmHeadLayer>, LmHeadLayer::type);
+  // tie_word_embedding: the GPU lm_head GEMV is internally #if ENABLE_OPENCL, so
+  // the layer compiles host-only without OpenCL — register unconditionally so the
+  // models (lm_head) construct on the FP32 reference / CPU build too. [T12]
+  registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                  TieWordEmbedding::type);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);
@@ -659,15 +705,25 @@ const int AppContext::registerFactory(const FactoryType<T> factory,
 
   const std::lock_guard<std::mutex> lock(factory_mutex);
   if (str_map.find(assigned_key) != str_map.end()) {
-    std::stringstream ss;
-    ss << "cannot register factory with already taken key: " << key;
-    throw std::invalid_argument(ss.str().c_str());
+    // Re-registering an already-registered factory key is a no-op, not an
+    // error. QuickAI QNN models register the process-global CausalLM custom
+    // layers (swiglu/rms_norm/embedding_layer/...) once per model via
+    // Transformer::registerCustomLayers(); a multi-model handle (the multimodal
+    // [vision, LLM] pair) therefore re-registers the same keys. Upstream main
+    // throws here, but pr/3963 (the working QNN reference) returns the existing
+    // int key so later models reuse the already-registered factory. Carried
+    // forward from pr/3963.
+    for (const auto &[ik, sk] : int_map) {
+      if (sk == assigned_key)
+        return ik;
+    }
+    return -1;
   }
 
   if (int_key != -1 && int_map.find(int_key) != int_map.end()) {
-    std::stringstream ss;
-    ss << "cannot register factory with already taken int key: " << int_key;
-    throw std::invalid_argument(ss.str().c_str());
+    // Duplicate int key is likewise a no-op (reuse the existing one), per
+    // pr/3963.
+    return int_key;
   }
 
   int assigned_int_key = int_key == -1 ? str_map.size() + 1 : int_key;
@@ -694,6 +750,15 @@ template const int AppContext::registerFactory<nntrainer::Optimizer>(
 template const int AppContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
+
+// Non-template seam (Context::registerLayerFactory override): forwards to the
+// per-class registerFactory<Layer> here in the same TU so the explicit
+// instantiation is used and no template crosses the .so boundary. [T3]
+int AppContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                                     const std::string &key,
+                                     const int int_key) {
+  return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
 
 /**
  * @copydoc const int AppContext::registerFactory

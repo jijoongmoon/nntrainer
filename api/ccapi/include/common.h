@@ -47,9 +47,23 @@ enum class ExecutionMode {
  * @brief     Enumeration of layer compute engine
  */
 enum LayerComputeEngine {
-  CPU, /**< CPU as the compute engine */
-  GPU, /**< GPU as the compute engine */
-  QNN, /**< QNN as the compute engine */
+  CPU,  /**< CPU as the compute engine */
+  GPU,  /**< GPU (OpenCL) as the compute engine */
+  QNN,  /**< QNN as the compute engine */
+  CUDA, /**< CUDA (NVIDIA GPU) as the compute engine */
+};
+
+/**
+ * @brief     Enumeration of ISA (Instruction Set Architecture) for quantization
+ *
+ * @details This enum allows specifying the target ISA format when saving
+ * quantized models, enabling cross-platform quantization (e.g., quantizing on
+ * x86 but saving in ARM format).
+ */
+enum class ISA {
+  DEFAULT = 0, /**< Use the current compiled backend format */
+  X86,         /**< Force x86 format (q4_0x8 for Q4_0) */
+  ARM          /**< Force ARM format (q4_0x4 for Q4_0) */
 };
 
 /**

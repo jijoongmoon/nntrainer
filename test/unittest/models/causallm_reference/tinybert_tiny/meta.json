@@ -1,0 +1,17 @@
+{
+  "seed": 42,
+  "input_ids": [
+    1,
+    4,
+    2,
+    3
+  ],
+  "prompt": "hello tok4 world tok3",
+  "embedding_atol": 0.02,
+  "cosine_min": 0.999,
+  "pooling": "none",
+  "transformers_version": "5.12.0",
+  "torch_version": "2.12.0+cu130",
+  "embedding_atol_q40": 0.1,
+  "cosine_min_q40": 0.99
+}

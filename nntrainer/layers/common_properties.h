@@ -126,6 +126,21 @@ public:
 };
 
 /**
+ * @brief Whether the layer should skip prefill or not
+ *
+ */
+class SkipPrefill : public nntrainer::Property<bool> {
+public:
+  /**
+   * @brief Construct a new SkipPrefill object
+   *
+   */
+  SkipPrefill() : nntrainer::Property<bool>() {}
+  static constexpr const char *key = "skip_prefill";
+  using prop_tag = bool_prop_tag;
+};
+
+/**
  * @brief Inplace operation property
  *
  */
@@ -998,6 +1013,21 @@ class Activation final
 public:
   using prop_tag = enum_class_prop_tag;
   static constexpr const char *key = "activation";
+};
+
+/**
+ * @brief FusedActivation — a layer-internal activation applied inline in the
+ *        compute layer's forward (after GEMM+bias), instead of as a separate
+ *        ActivationLayer node. Distinct key from `activation` (which is a
+ *        LayerNode *realization* property consumed by ActivationRealizer) so the
+ *        FusionRealizer can move the activation onto the compute layer without it
+ *        being split back out into a node. [T10]
+ */
+class FusedActivation final
+  : public EnumProperty<nntrainer::props::ActivationTypeInfo> {
+public:
+  using prop_tag = enum_class_prop_tag;
+  static constexpr const char *key = "fused_activation";
 };
 
 /**

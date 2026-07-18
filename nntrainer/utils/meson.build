@@ -10,7 +10,8 @@ util_sources = [
   'mman_windows.cpp',
   'safetensors_header.cpp',
   'thread_manager.cpp',
-  'thread_manager_util.cpp'
+  'thread_manager_util.cpp',
+  'safetensors_util.cpp',
 ]
 
 util_headers = [
@@ -29,6 +30,7 @@ util_headers = [
   'noncopyable.h',
   'thread_manager.h',
   'thread_manager_util.h',
+  'safetensors_util.h',
 ]
 
 if get_option('enable-trace')

@@ -66,6 +66,22 @@ public:
   const cl_device_id GetDeviceId();
 
   /**
+   * @brief Get a stable signature of the active device (name + driver version).
+   *        Used to key the on-disk kernel binary cache so a binary built for a
+   *        different GPU or before a driver update is never loaded.
+   *
+   * @return std::string "<device-name>|<driver-version>"
+   */
+  std::string GetDeviceSignature();
+
+  /**
+   * @brief Get the Platform Id object
+   *
+   * @return const cl_platform_id
+   */
+  const cl_platform_id GetPlatformId();
+
+  /**
    * @brief Get the Device Info
    *
    * @return const DeviceInfo *
@@ -86,6 +102,24 @@ public:
    * @param svm_ptr pointer to the SVM memory to be deallocated
    */
   void releaseSVMRegion(void *svm_ptr);
+
+  /**
+   * @brief Get the process-wide instance.
+   * @note  Overrides Singleton<ContextManager>::Global() with an out-of-line
+   *        definition (the Engine::Global() precedent): the inherited inline
+   *        template Global() instantiates its function-local static once PER
+   *        MODULE on Windows (MSVC does not merge template statics across
+   *        DLLs the way ELF vague linkage does), so every module that called
+   *        it got its OWN manager — its own cl_context (round-11 measured
+   *        the sibling ClBufferManager duplicated x7). With
+   *        default_library=shared this single definition lives in
+   *        nntrainer.dll and every caller shares one instance / one
+   *        cl_context (verified via dumpbin imports). Under the production
+   *        default_library=static config each binary still embeds its own
+   *        copy — the out-of-line form is then behavior-neutral (lazy
+   *        construction limits which copies materialize).
+   */
+  static ContextManager &Global();
 
   /**
    * @brief Destroy the Context Manager object

@@ -150,9 +150,7 @@ public:
   /**
    * @copydoc Tensor::print()
    */
-  void print(std::ostream &out) const override {
-    throw std::invalid_argument("Q4_0_Tensor::print() is not supported.");
-  }
+  void print(std::ostream &out) const override;
 
   /**
    * @copydoc Tensor::copy()

@@ -42,7 +42,8 @@ enum LORAParams { loraA, loraB, loraTmp, loraOut };
 FullyConnectedLayer::FullyConnectedLayer() :
   LayerImpl(),
   lora_scaling(1.0f),
-  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha()),
+  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(),
+           props::FusedActivation()),
   quantizer(nullptr) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   lora_idx.fill(std::numeric_limits<unsigned>::max());
@@ -67,6 +68,8 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   lora_scaling = (lora_rank && !std::get<props::LoraAlpha>(fc_props).empty())
                    ? (float)std::get<props::LoraAlpha>(fc_props) / lora_rank
                    : 1;
+  if (!std::get<props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(*layer_impl_props).get();
 
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "Fully connected layer takes only one input";
@@ -239,6 +242,14 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
     hidden_.add_i(bias);
   }
+
+  // [T10] fused activation epilogue dispatched through the op table, so the
+  // fusion is backend-neutral: CpuComputeOps runs the host ActiFunc, a GPU
+  // ComputeOps can fuse it into the GEMM epilogue. Eliminates the separate
+  // ActivationLayer node; value-identical to it.
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+    hidden_.getOps()->apply_activation(hidden_, (int)fused_act.get());
 }
 
 void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
@@ -249,6 +260,10 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor loraA, loraB, hidden_tmp_lora, hidden_out_lora;
+
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
 
   if (!std::get<props::LoraRank>(fc_props).empty()) {
     loraA = context.getWeight(lora_idx[LORAParams::loraA]);

@@ -42,6 +42,12 @@
 #include <kv_cache_manager.h>
 #include <transformer.h>
 
+#include <atomic>
+
+extern "C" {
+struct BaseStreamer;
+}
+
 namespace causallm {
 
 /**
@@ -58,6 +64,16 @@ public:
    * @param nntr_cfg Configuration for nntrainer (nntrainer_config.json)
    */
   CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg);
+
+#ifdef ENABLE_TEST
+protected:
+  /**
+   * @brief Construct a lightweight CausalLM test double base.
+   */
+  CausalLM() : Transformer() { output_list.push_back(""); }
+
+public:
+#endif
 
   /**
    * @brief Destroy the CausalLM object
@@ -81,6 +97,70 @@ public:
    */
   std::string getOutput(int batch_idx = 0) const;
 
+  /**
+   * @brief Attach or detach a non-owning streamer for decoded output deltas.
+   * @param streamer Streamer owned by the caller, or nullptr to detach
+   */
+  void setStreamer(::BaseStreamer *streamer) { streamer_ = streamer; }
+
+  /**
+   * @brief Cooperatively request the active generation loop to stop.
+   */
+  void requestStop() { stop_requested_.store(true, std::memory_order_release); }
+
+  /**
+   * @brief Clear stale stop requests before publishing a new cancellable run.
+   */
+  void prepareForRun();
+
+  /**
+   * @brief Attach a non-owning logits processor
+   * @param processor Processor pointer, or nullptr to detach
+   */
+  void setLogitsProcessor(LogitsProcessor *processor) override;
+
+  /**
+   * @brief Reset attached logits processor state
+   */
+  void resetLogitsProcessor() override;
+
+  /**
+   * @brief Current KV-cache write position (absolute token position)
+   */
+  int getKvLen() const override {
+    return static_cast<int>(kv_cache.getPosition());
+  }
+
+  /**
+   * @brief save kv cache (all layers, first @p to positions) to @p path
+   */
+  WIN_EXPORT virtual void save_kvcache(std::string path, int to);
+
+  /**
+   * @brief load kv cache from @p path and sync every layer's cache index
+   *        to position @p to
+   */
+  WIN_EXPORT virtual void load_kvcache(std::string path, int to);
+
+  /**
+   * @brief Arm (or disarm) resume-from-saved-KV for the next run() call.
+   * @param path Saved KV-cache file produced by save_kvcache(); an empty
+   *             string disarms and restores plain-prefill behavior.
+   * @param sys_prompt_token_len Absolute token position the cache was saved
+   *             at; the next run() reloads the cache and prefills the new
+   *             prompt starting from this offset.
+   * @note  Drives the same USE_KVCACHE flow that nntr_config.json's
+   *        system_prompt.kvcache block configures, without needing the
+   *        config entry.
+   */
+  void setPrecomputedKVCache(const std::string &path,
+                             unsigned int sys_prompt_token_len) {
+    USE_KVCACHE = !path.empty();
+    PRE_COMPUTED_CACHE_PATH = path;
+    SYS_PROMP_LEN = USE_KVCACHE ? sys_prompt_token_len : 0;
+    global_token_len = 0;
+  }
+
 protected:
   /**
    * @brief Setup the parameters for the CausalLM model
@@ -101,16 +181,6 @@ protected:
   registerOutputs(std::unique_ptr<tokenizers::Tokenizer> &tokenizer,
                   std::vector<unsigned int> ids, unsigned int pos,
                   const std::vector<bool> &eos_list, bool log_output = true);
-
-  /**
-   * @brief save kv cache
-   */
-  WIN_EXPORT virtual void save_kvcache(std::string path, int to);
-
-  /**
-   * @brief load kv cache
-   */
-  WIN_EXPORT virtual void load_kvcache(std::string path, int to);
 
   /**
    * @brief generate
@@ -141,14 +211,28 @@ protected:
     (void)inputs;
   }
 
+  /**
+   * @brief Clear stale stop state at run start unless caller prepared it.
+   */
+  void prepareStopRequestForRun();
+
   /** internal buffer */
   std::vector<std::string>
-    output_list;             /**< List of output names for the model */
-  unsigned int *ids_history; /**< History of input IDs for the model */
+    output_list; /**< List of output names for the model */
+  unsigned int *ids_history =
+    nullptr; /**< History of input IDs for the model */
 
   std::vector<int> pending_ids_;
 
+  ::BaseStreamer *streamer_ = nullptr;
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> stop_prepared_for_run_{false};
+
   std::string LMHEAD_DTYPE; /** embedding dtype */
+  // LMHEAD_UNTIE moved to Transformer: embedding0's layer-type choice (tied
+  // TieWordEmbedding vs untied embedding_layer) needs it in
+  // <model>Transformer::constructModel scope, which does not see CausalLM
+  // members (the diamond joins only at <Model>CausalLM).
   std::vector<unsigned int> EOS_TOKEN_ID;
   unsigned int BOS_TOKEN_ID;
   float TEMPERATURE;
@@ -162,9 +246,12 @@ protected:
   std::string PRE_COMPUTED_CACHE_PATH;
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
+  bool SKIP_PREFILL;
   unsigned int global_token_len;
 
   std::mt19937 rng; /**< Random Number Gen */
+
+  LogitsProcessor *logits_processor = nullptr; /**< Non-owning processor */
 
   /**
    * @brief Externalized KV cache (host-owned). Allocated by allocateKVCache()
@@ -173,13 +260,33 @@ protected:
    *        cache_k_l<i> / cache_v_l<i> via Model::setExternalTensors.
    */
   KVCacheManager kv_cache;
+  bool kv_cache_bound = false; /**< True once KV cache tensors are bound */
 
   /**
    * @brief Allocate kv_cache and bind it to all mha_core layers via
    *        Model::setExternalTensors. Idempotent — safe to call once after
    *        initialize().
    */
-  void allocateAndBindKVCache();
+  virtual void allocateAndBindKVCache();
+
+  /**
+   * @brief incremental_inference wrapper that feeds the REAL KV-cache tensors
+   *        (with their original MemoryData, isSVM() intact) into the graph's
+   *        input placeholders instead of letting the framework re-wrap the
+   *        raw pointers in fresh (flag-less) Tensor::Map MemoryData.
+   * @details With in-place input layers (NNTR_INPUT_INPLACE relaxation) the
+   *          mha_core cache input views alias the input placeholder directly
+   *          (view-of-view flattening), so whatever MemoryData fills the
+   *          placeholder reaches mha_core's svm_ok gate. A Map wrap of the
+   *          same pointer would report isSVM()=false and silently kill the
+   *          GPU attention path. Non-cache inputs (the prompt sample) keep
+   *          the framework's Map wrapping, byte-identical to
+   *          Model::incremental_inference(float* ...).
+   */
+  std::vector<float *> incrementalInference(unsigned int batch_size,
+                                            const std::vector<float *> &input,
+                                            unsigned int init_seq_len,
+                                            unsigned int from, unsigned int to);
 
   /**
    * @brief Reset all mha_core layers' cache_index to @p pos and the

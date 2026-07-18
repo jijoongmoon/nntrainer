@@ -23,12 +23,17 @@
 #define __LAYER_DEVEL_H__
 #ifdef __cplusplus
 
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <base_properties.h>
 #include <common.h>
+#include <cpu_backend.h>
+#include <fp16.h>
+#include <int4_utils.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 
@@ -350,11 +355,13 @@ public:
    * @param mode Execution mode
    * @param trainable is there trainable weight
    * @param dtype data type to save this layer
+   * @param target_isa target ISA (Instruction Set Architecture) format for
+   * quantization (DEFAULT/X86/ARM)
    */
-  virtual void
-  save(std::ofstream &file, RunLayerContext &run_context, bool opt_var,
-       ml::train::ExecutionMode mode, bool trainable,
-       TensorDim::DataType dtype = TensorDim::DataType::NONE) const {
+  virtual void save(std::ofstream &file, RunLayerContext &run_context,
+                    bool opt_var, ml::train::ExecutionMode mode, bool trainable,
+                    TensorDim::DataType dtype = TensorDim::DataType::NONE,
+                    ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const {
 
     if (opt_var) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
@@ -405,12 +412,137 @@ public:
                 quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
                               nullptr);
                 repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
-                            quant_weight.size(), N, K);
+                            quant_weight.size(), N, K, target_isa);
                 quant_weight.save(file);
               }
+            } else if (dtype == TensorDim::DataType::QINT4) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                // KAI qsi4cxp Section A: N must be multiple of nr=4 so each
+                // super-row covers exactly 4 output channels; K must be a
+                // multiple of 32 so the packer needs no in-row K padding.
+                NNTR_THROW_IF(N % Int4Utils::KAI_NR != 0 ||
+                                K % Int4Utils::KAI_K_PAD_MULTIPLE != 0,
+                              std::invalid_argument)
+                  << "QINT4/KAI requires width divisible by "
+                  << Int4Utils::KAI_NR << " and height divisible by "
+                  << Int4Utils::KAI_K_PAD_MULTIPLE << ", but got height=" << K
+                  << ", width=" << N;
+
+                Tensor weight_t = weight.transpose("0:2:1");
+
+                if (const char *plain_env = std::getenv("NNTR_QINT4_PLAIN");
+                    plain_env && plain_env[0] == '1') {
+                  // Shared plain container (engine-neutral, byte-compatible
+                  // with the upstream PR#3978 record): plain nibbles + fp32
+                  // scales + zero pad. Loaders repack per engine at read
+                  // time. NNTR_QINT4_RANGE15=1 switches the quantizer to the
+                  // PR#3978/KAI range/15 formula (better small-model
+                  // quality); default keeps absmax/7 = Section A values.
+                  const char *r15_env = std::getenv("NNTR_QINT4_RANGE15");
+                  const bool range15 = r15_env && r15_env[0] == '1';
+                  std::vector<uint8_t> plain_nibbles;
+                  std::vector<uint16_t> qs;
+                  Int4Utils::quantizePlain(weight_t.getData<float>(), N, K,
+                                           plain_nibbles, qs, range15);
+
+                  std::vector<uint8_t> payload(
+                    Int4Utils::plainRecordPayloadBytes(N, K), 0u);
+                  std::memcpy(payload.data(), plain_nibbles.data(),
+                              plain_nibbles.size());
+                  float *scales_dst = reinterpret_cast<float *>(
+                    payload.data() + Int4Utils::plainScalesOffsetBytes(N, K));
+                  for (unsigned int n = 0; n < N; ++n) {
+                    scales_dst[n] = compute_fp16_to_fp32(qs[n]);
+                  }
+
+                  const uint16_t code =
+                    static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE);
+                  file.write(reinterpret_cast<const char *>(&code),
+                             sizeof(uint16_t));
+                  file.write(reinterpret_cast<const char *>(payload.data()),
+                             payload.size());
+                } else {
+                  std::vector<uint8_t> qw;
+                  std::vector<uint16_t> qs;
+                  Int4Utils::quantizeAndPackKai(weight_t.getData<float>(), N,
+                                                K, qw, qs);
+
+                  // [Phase C Path B] Write the legacy KAI Section A QINT4 record
+                  // directly (u16 qscheme header + Section A nibbles + fp16
+                  // scales), byte-identical to what Int4QTensor::save produced,
+                  // so the Int4QTensor class is no longer needed to emit a legacy
+                  // QINT4 .bin.
+                  const uint16_t code =
+                    static_cast<uint16_t>(QScheme::KAI_QSI4CXP_4x4x32);
+                  file.write(reinterpret_cast<const char *>(&code),
+                             sizeof(uint16_t));
+                  file.write(reinterpret_cast<const char *>(qw.data()),
+                             qw.size());
+                  file.write(reinterpret_cast<const char *>(qs.data()),
+                             qs.size() * sizeof(uint16_t));
+                }
+              }
+            } else if (dtype == TensorDim::DataType::QS4CX) {
+              ///@note The codelines below can be replaced with quantizer's
+              /// quantize()
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+
+              size_t q_size = N * (K + 1) / 2;
+              size_t scale_size = N * sizeof(float);
+
+              // allocate packed size, not an unpacked size
+              std::vector<uint8_t> rhs_q(q_size + scale_size);
+              uint8_t *data = rhs_q.data();
+              uint8_t *scale = data + q_size;
+
+              if (weight.getDataType() == TensorDim::DataType::QINT4) {
+                // [Phase C 2/n STEP1 — weight 한벌] LOSSLESS transcode of a loaded
+                // QINT4 (KAI Section A nibbles + per-channel fp16 scale) weight to
+                // QS4CX. The int4 values are PRESERVED by re-laying out Section A
+                // -> plain row-major nibbles (Int4Utils::sectionAToPlain, the
+                // bit-exact inverse of the KAI pack, == the QS4CX plain layout),
+                // and the fp16 scales are widened to fp32 (exact). This replaces
+                // the old dequant->requant path (dequantizeSectionAToFp32 ->
+                // quant_qs4cx_f32 with a different range/15 quantizer), which
+                // perturbed the nibbles and made the migrated QS4CX .bin drift
+                // from the source QINT4 model (e.g. gemma2's continuation
+                // diverged; gemma4's robust answer masked the same drift). The
+                // produced QS4CX weight is now numerically identical to the
+                // source QINT4 weight. Layout: data = N*(K+1)/2 plain nibbles,
+                // scale = N fp32 (matches the QS4CX on-disk record above).
+                Int4Utils::sectionAToPlain(weight.getData<uint8_t>(), N, K, data);
+                float *scale_f32 = reinterpret_cast<float *>(scale);
+                const uint16_t *fp16_scales = weight.getScale<uint16_t>();
+                for (unsigned int n = 0; n < N; ++n) {
+                  scale_f32[n] = compute_fp16_to_fp32(fp16_scales[n]);
+                }
+              } else {
+                NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                              std::runtime_error)
+                  << "Save with quantization supports only FP32 or QINT4 "
+                     "(transcode) weight.";
+                Tensor weight_t = weight.transpose("0:2:1");
+                nntrainer::quant_qs4cx_f32(N, K, weight_t.getData<float>(), data,
+                                           scale, true);
+              }
+              file.write((const char *)data, q_size + scale_size);
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
-                << "This dtype is not supported in save with quantization";
+                << "This dtype is not supported in save with quantization: "
+                << "weight=" << weight.getName()
+                << " target_dtype=" << static_cast<int>(dtype)
+                << " weight_dtype=" << static_cast<int>(weight.getDataType());
             }
           }
         }

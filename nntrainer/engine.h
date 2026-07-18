@@ -63,7 +63,9 @@ protected:
 
   void add_default_object();
 
-  void registerContext(std::string name, nntrainer::Context *context) {
+  void registerContext(std::string name, nntrainer::Context *context,
+                       void *library_handle = nullptr,
+                       DestroyContextFunc destroy_func = nullptr) {
     const std::lock_guard<std::mutex> lock(engine_mutex);
     static int registerCount = 0;
 
@@ -71,9 +73,14 @@ protected:
                    [](unsigned char c) { return std::tolower(c); });
 
     if (engines.find(name) != engines.end()) {
-      std::stringstream ss;
-      ss << "Cannot register Context with name : " << name;
-      throw std::invalid_argument(ss.str().c_str());
+      // Re-registering an already-registered Context is a no-op, not an error.
+      // QuickAI QNN models register the process-global "qnn" Context once per
+      // model in Quick_Dot_AI_QNN::initialize(); a multi-model handle (e.g. the
+      // multimodal [vision, LLM] pair) therefore calls this more than once.
+      // Upstream main throws here, but pr/3963 (the working QNN reference)
+      // returns early so the 2nd+ models reuse the existing Context. Carried
+      // forward from pr/3963.
+      return;
     }
     engines.insert(std::make_pair(name, context));
 
@@ -88,6 +95,23 @@ protected:
   }
 
 public:
+  /**
+   * @brief   Get the single process-wide Engine instance.
+   * @note    Overrides Singleton<Engine>::Global() with an out-of-line
+   *          definition in engine.cpp so there is exactly ONE Engine instance
+   *          across all shared libraries. The inherited template Global() is an
+   *          inline method, which under -fvisibility=hidden / per-namespace
+   *          loading gets instantiated separately in each consumer .so
+   *          (libcausallm, libquick_dot_ai, libqnn_context, ...). That produced
+   *          multiple Engine instances: a context registered into one (e.g.
+   *          "qnn" via Quick_Dot_AI_QNN in libquick_dot_ai) was invisible to
+   *          another (NetworkGraph in libnntrainer), surfacing as
+   *          std::invalid_argument "[Engine] qnn Context is not registered".
+   *          A single out-of-line definition in libnntrainer.so makes every
+   *          Engine::Global() caller share the same instance.
+   */
+  static Engine &Global();
+
   /**
    * @brief   Default constructor
    */
@@ -149,6 +173,29 @@ public:
    * @return Context name
    */
   std::string parseComputeEngine(const std::vector<std::string> &props) const;
+
+  /**
+   * @brief Register a layer factory on a backend by engine name, without a
+   *        static_cast to a concrete Context. Resolves the engine to its
+   *        Context and dispatches through the Context::registerLayerFactory
+   *        virtual (each backend forwards to its own registerFactory<Layer>).
+   *        This is the registration facade for vendor add-only backends and
+   *        the Application layer. [docs/ARCHITECTURE_REFACTOR.md §10 T3 / §11 S1]
+   *
+   * @param engine registered context name ("cpu"/"gpu"/"cuda"/...)
+   * @param creator layer creator (createLayer<T> result)
+   * @param key string key (empty ⇒ derived from getType())
+   * @param int_key integer key (-1 ⇒ auto-assigned)
+   * @return registered integer key, or -1 if the backend cannot register
+   */
+  int registerLayerFactory(const std::string &engine,
+                           nntrainer::Context::PtrFactoryType<nntrainer::Layer>
+                             creator,
+                           const std::string &key = "",
+                           const int int_key = -1) const {
+    return getRegisteredContext(engine)->registerLayerFactory(creator, key,
+                                                              int_key);
+  }
 
   /**
    * @brief Create an Layer Object with Layer name

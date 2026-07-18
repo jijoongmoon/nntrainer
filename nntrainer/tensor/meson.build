@@ -7,7 +7,6 @@ tensor_sources = [
   'tensor.cpp',
   'tensor_base.cpp',
   'float_tensor.cpp',
-  'int4_tensor.cpp',
   'int4_utils.cpp',
   'uint4_tensor.cpp',
   'uint_tensor.cpp',
@@ -17,6 +16,7 @@ tensor_sources = [
   'q6_k_tensor.cpp',
   'q4_0_tensor.cpp',
   'q4_0_utils.cpp',
+  'qs4cx_tensor.cpp',
   'q8_0_tensor.cpp',
   'tensor_dim.cpp',
   'var_grad.cpp',
@@ -37,7 +37,6 @@ tensor_headers = [
   'tensor.h',
   'tensor_base.h',
   'float_tensor.h',
-  'int4_tensor.h',
   'int4_utils.h',
   'uint4_tensor.h',
   'char_tensor.h',
@@ -47,11 +46,14 @@ tensor_headers = [
   'q4_k_tensor.h',
   'q4_0_tensor.h',
   'q4_0_utils.h',
+  'qs4cx_tensor.h',
   'q8_0_tensor.h',
   'weight.h',
   'var_grad.h',    
   'quantizer.h',    
   'tensor_wrap_specs.h',
+  'residency_policy.h',
+  'residency_planner.h',
   'manager.h',
   'basic_planner.h',
   'memory_planner.h',
@@ -90,6 +92,17 @@ if get_option('enable-opencl')
   subdir('cl_operations')
   nntrainer_inc += include_directories('cl_operations')
   nntrainer_inc_abs += meson.current_source_dir() / 'cl_operations'
+endif
+
+if get_option('enable-htp')
+  subdir('htp_backend')
+  nntrainer_inc += include_directories('htp_backend')
+  nntrainer_inc_abs += meson.current_source_dir() / 'htp_backend'
+  # Hexagon SDK system headers needed by htp_backend.cpp (<remote.h>, <AEEStdErr.h>,
+  # <sdkl.h>). hexagon_sdk_root is set in the top-level meson.build HTP block
+  # (fs.parent(fs.parent(hexkl_root))) and is in meson's flat scope here.
+  nntrainer_inc_abs += hexagon_sdk_root / 'incs'
+  nntrainer_inc_abs += hexagon_sdk_root / 'incs' / 'stddef'
 endif
 
 foreach s : tensor_sources

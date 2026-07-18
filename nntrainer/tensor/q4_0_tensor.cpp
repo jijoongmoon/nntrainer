@@ -102,6 +102,12 @@ void Q4_0_Tensor::initialize() {
   putData();
 }
 
+void Q4_0_Tensor::print(std::ostream &out) const {
+  out << "data addr: " << getData() << '\n';
+  out << dim;
+  out << "[Q4_0 data print skipped]" << std::endl;
+}
+
 QScheme Q4_0_Tensor::q_scheme() const { return QScheme::Q4_0; }
 
 } // namespace nntrainer

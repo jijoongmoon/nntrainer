@@ -18,8 +18,41 @@
 #include "opencl_kernel.h"
 #include "singleton.h"
 #include <memory>
+#include <string>
 
 namespace nntrainer::opencl {
+
+// ---------------------------------------------------------------------------
+// cl_qcom_recordable_queues data types — absent from the base CL/cl.h in this
+// tree; the Adreno 840 driver implements them at runtime. Shared between the
+// command-queue manager (record/replay API below) and the decode-loop
+// override builder (R3). The function-pointer typedefs + runtime entry-point
+// resolution stay TU-private in the .cpp.
+// ---------------------------------------------------------------------------
+typedef struct _cl_recording_qcom *cl_recording_qcom;
+
+/// Per-replay kernel-argument override. dispatch_index = the kernel's 0-based
+/// ordinal in the recorded chain (queried via getRecordDispatchIndex() during
+/// the record pass); arg_index = the kernel-arg ordinal; arg_value points at a
+/// value that must outlive the replayRecording() call.
+typedef struct _cl_array_arg_qcom {
+  cl_uint dispatch_index;
+  cl_uint arg_index;
+  size_t arg_size;
+  const void *arg_value;
+} cl_array_arg_qcom;
+
+typedef struct _cl_offset_qcom {
+  cl_uint dispatch_index;
+  size_t offsets[3];
+} cl_offset_qcom;
+
+/// Per-replay global-work-size override (workgroup_size points at a size_t[3]
+/// that must outlive the replayRecording() call).
+typedef struct _cl_workgroup_qcom {
+  cl_uint dispatch_index;
+  const size_t *workgroup_size;
+} cl_workgroup_qcom;
 
 /**
  * @class CommandQueueManager contains wrappers for managing OpenCL command
@@ -34,6 +67,55 @@ class CommandQueueManager : public Singleton<CommandQueueManager> {
    *
    */
   cl_command_queue command_queue_{nullptr};
+
+  /**
+   * @brief optional suffix appended to the NEXT enqueued kernel's profile key
+   * (consumed + cleared on the next enqueueKernel). Lets a caller split one
+   * kernel's profile entry by shape, e.g. v8c_gemm_int8_int4 -> ...:N9216_K2304.
+   * Host-only; never affects kernel behavior. Only read when profiling is on.
+   */
+  std::string next_prof_label_;
+
+  /**
+   * @brief Optional Qualcomm recordable command queue + a plain host-I/O queue,
+   * created only when NNTR_RECQ is set (cl_qcom_recordable_queues, phase-1
+   * foundation). The recordable queue is used to record a per-token decode
+   * dispatch sequence once and replay it per token; it rejects plain enqueues
+   * (e.g. clEnqueueReadBuffer -> CL_INVALID_OPERATION), so host readback must go
+   * through io_command_queue_. Both stay null when NNTR_RECQ is unset, and the
+   * canonical path is unaffected (it keeps using command_queue_).
+   */
+  cl_command_queue recordable_command_queue_{nullptr};
+  cl_command_queue io_command_queue_{nullptr};
+
+  /**
+   * @brief Record/replay state (R1). While recording (beginRecording ->
+   * endRecording), the three clEnqueueNDRangeKernel chokepoints target
+   * active_recording_queue_ (= recordable_command_queue_) instead of
+   * command_queue_, so the per-token decode dispatch chain is CAPTURED (not
+   * executed). recq_dispatch_index_ counts captured dispatches since
+   * beginRecording so the caller can map {layer, op} -> dispatch_index for the
+   * per-token override arrays. active_recording_handle_ holds the finalized
+   * recording for replayRecording(). All null/0 on the canonical path =>
+   * byte-identical.
+   */
+  cl_command_queue active_recording_queue_{nullptr};
+  cl_uint recq_dispatch_index_{0};
+  cl_recording_qcom active_recording_handle_{nullptr};
+
+  /// When set, ALL kernel dispatches are skipped (no capture, no execute). Used
+  /// by the R4 per-token "feed pass": run incrementalInference so the HOST
+  /// embedding writes this token's embedding output, while the GPU forward is
+  /// skipped (it will be supplied by the recorded-chain replay instead).
+  bool recq_skip_all_{false};
+
+  /**
+   * @brief Resolve the cl_qcom_recordable_queues entry points and create the
+   * recordable + host-I/O queues. Called from CreateCommandQueue only when
+   * NNTR_RECQ is set; degrades gracefully (logs + leaves both queues null) if
+   * the extension is unavailable on the device.
+   */
+  void initRecordableQueues(cl_context context, cl_device_id device_id);
 
 public:
   /**
@@ -145,7 +227,8 @@ public:
    * @return true if mapping is successful, false otherwise.
    */
   bool enqueueSVMMap(void *svm_ptr, size_t size, bool read_only,
-                     cl_event *event = nullptr);
+                     bool async = false, cl_event *event = nullptr,
+                     bool force = false);
 
   /**
    * @brief Enqueue SVM memory unmap operation.
@@ -158,7 +241,8 @@ public:
    * blocking.
    * @return true if unmapping is successful, false otherwise.
    */
-  bool enqueueSVMUnmap(void *svm_ptr, cl_event *event = nullptr);
+  bool enqueueSVMUnmap(void *svm_ptr, cl_event *event = nullptr,
+                       bool force = false);
 
   /**
    * @brief Function to initiate execution of the command queue.
@@ -201,9 +285,89 @@ public:
   const cl_command_queue GetCommandQueue();
 
   /**
+   * @brief Get the Qualcomm recordable command queue. Null unless NNTR_RECQ is
+   * set and the cl_qcom_recordable_queues extension is available.
+   *
+   * @return cl_command_queue (recordable) or nullptr
+   */
+  cl_command_queue getRecordableQueue() { return recordable_command_queue_; }
+
+  /**
+   * @brief Get the plain host-I/O queue paired with the recordable queue (used
+   * for readbacks the recordable queue rejects). Null unless NNTR_RECQ is set
+   * and the extension is available.
+   *
+   * @return cl_command_queue (plain) or nullptr
+   */
+  cl_command_queue getIoQueue() { return io_command_queue_; }
+
+  /**
+   * @brief Start capturing the kernel dispatch chain (R1). Subsequent kernel
+   * enqueues (DispatchCommand / enqueueKernel) are CAPTURED onto the recordable
+   * queue instead of executing on command_queue_. Resets the dispatch counter.
+   * Requires NNTR_RECQ (recordable queue + entry points available); returns
+   * false otherwise (caller falls back to normal per-token inference).
+   */
+  bool beginRecording();
+
+  /**
+   * @brief Finalize the recording started by beginRecording() and restore
+   * normal (command_queue_) dispatch. The recording is held for replay until
+   * the next beginRecording() or releaseRecording(). Returns false if not
+   * recording or the driver rejected the finalize.
+   */
+  bool endRecording();
+
+  /**
+   * @brief Replay the finalized recording on the LIVE command_queue_ with the
+   * given per-token scalar-arg / global-work-size overrides (R3/R4). Each call
+   * must re-specify ALL overrides it needs (overrides are not cumulative).
+   * @param args  scalar-arg overrides (may be null if n_args==0)
+   * @param gws   global-work-size overrides (may be null if n_gws==0)
+   * @param event optional out event (signaled on replay completion; used to
+   *              gate the argmax readback on io_command_queue_)
+   * @return true on CL_SUCCESS
+   */
+  bool replayRecording(const cl_array_arg_qcom *args, size_t n_args,
+                       const cl_workgroup_qcom *gws, size_t n_gws,
+                       cl_event *event);
+
+  /**
+   * @brief Release the held recording (called at decode-loop teardown; also
+   * called implicitly by the destructor and by a subsequent beginRecording()).
+   */
+  void releaseRecording();
+
+  /**
+   * @brief Number of dispatches captured since beginRecording(). During the
+   * record pass the caller reads this to learn each enqueued kernel's
+   * dispatch_index for the override arrays.
+   */
+  cl_uint getRecordDispatchIndex() const { return recq_dispatch_index_; }
+
+  /**
+   * @brief True between beginRecording() and endRecording() (dispatches are
+   * being captured, not executed).
+   */
+  bool isRecording() const { return active_recording_queue_ != nullptr; }
+
+  /// R4 feed pass: skip ALL kernel dispatches (host-only forward). See
+  /// recq_skip_all_.
+  void setSkipAllDispatches(bool v) { recq_skip_all_ = v; }
+  bool isSkipAllDispatches() const { return recq_skip_all_; }
+
+  /**
    * @brief Destroy the Command Queue Manager object
    *
    */
+  /**
+   * @brief Get the process-wide instance (out-of-line override of
+   *        Singleton<T>::Global() — one cl_command_queue set per process
+   *        under shared linking; see ContextManager::Global() for the full
+   *        static-vs-shared note).
+   */
+  static CommandQueueManager &Global();
+
   ~CommandQueueManager();
 
   /**
@@ -229,6 +393,33 @@ public:
                      cl_uint num_events_in_wait_list = 0,
                      const cl_event *event_wait_list = nullptr,
                      cl_event *event = nullptr);
+
+  /**
+   * @brief Finish the queue, then accumulate per-kernel GPU execution time
+   * (from CL_PROFILING_COMMAND_START/END of events captured during
+   * enqueueKernel) by kernel name and print a sorted breakdown. No-op unless
+   * NNTR_OPENCL_PROFILING is set. Releases and clears captured events.
+   *
+   * Unlike clFinish-bracketed host stage timing (which measures out-of-order
+   * queue catch-up, not real work), this reports true on-device kernel time.
+   *
+   * @param tag short label printed in the report header (e.g. "PREFILL").
+   */
+  void dumpProfile(const char *tag);
+
+  /**
+   * @brief set a suffix appended to the next enqueued kernel's profile key,
+   * to split one kernel's aggregate entry by call-site/shape. No-op for kernel
+   * execution; the label is consumed and cleared by the next enqueueKernel.
+   */
+  void setNextProfileLabel(std::string s) { next_prof_label_ = std::move(s); }
+
+  /**
+   * @brief Block until all previously enqueued commands have completed
+   * (clFinish). Used as the host-coherence barrier before a host op reads a
+   * GPU-resident (SVM) buffer that was written/mapped asynchronously.
+   */
+  void finish();
 };
 } // namespace nntrainer::opencl
 

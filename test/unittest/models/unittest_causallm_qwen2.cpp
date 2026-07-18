@@ -23,6 +23,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -33,51 +34,17 @@
 namespace {
 
 /**
- * @brief Tiny Qwen2 CausalLM adapter for common model tests
+ * @brief Tiny Qwen2 CausalLM adapter (inference shared by CausalLMTestAdapter)
  */
-class TinyQwen2CausalLM final : public causallm::Qwen2CausalLM,
-                                public causallm_test::TinyCausalLMRunner {
-public:
-  /**
-   * @brief Construct a tiny Qwen2 CausalLM test adapter
-   */
-  TinyQwen2CausalLM(causallm::json &cfg, causallm::json &generation_cfg,
-                    causallm::json &nntr_cfg) :
-    causallm::Transformer(cfg, generation_cfg, nntr_cfg,
-                          causallm::ModelType::CAUSALLM),
-    causallm::Qwen2CausalLM(cfg, generation_cfg, nntr_cfg) {}
+using TinyQwen2CausalLM =
+  causallm_test::CausalLMTestAdapter<causallm::Qwen2CausalLM>;
 
-  /**
-   * @brief Initialize the tiny Qwen2 model
-   */
-  void initializeModel() override { initialize(); }
-
-  /**
-   * @brief Save tiny Qwen2 model weights
-   */
-  void saveWeight(const std::string &path) override { save_weight(path); }
-
-  /**
-   * @brief Save tiny Qwen2 model weights with dtype conversion
-   */
-  void saveWeightWithDtype(
-    const std::string &path,
-    const std::map<std::string, ml::train::TensorDim::DataType>
-      &layer_dtype_map) override {
-    save_weight(path, ml::train::TensorDim::DataType::NONE, layer_dtype_map);
-  }
-
-  /**
-   * @brief Load tiny Qwen2 model weights
-   */
-  void loadWeight(const std::string &path) override { load_weight(path); }
-
-  /**
-   * @brief Set deterministic tiny Qwen2 weights for golden token tests
-   */
-  void setDeterministicWeights() override {
-    auto set_weights = [](ml::train::Layer &layer,
-                          nntrainer::RunLayerContext &context, void *) {
+/**
+ * @brief Populate deterministic tiny Qwen2 weights for golden token tests
+ */
+void setupQwen2DeterministicWeights(TinyQwen2CausalLM &model) {
+  model.forEachLayer(
+    [](ml::train::Layer &layer, nntrainer::RunLayerContext &context, void *) {
       if (layer.getName() == "output_of_causallm")
         return;
 
@@ -96,103 +63,8 @@ public:
           weight.setValue(0, 0, 4, 0, 2.0f);
         }
       }
-    };
-
-    model->forEachLayer(set_weights, nullptr);
-  }
-
-  /**
-   * @brief Run one prompt through the tiny Qwen2 model
-   */
-  void runPrompt(const std::string &prompt) override {
-    run(prompt, false, "", "", false);
-  }
-
-  /**
-   * @brief Run Qwen2 prefill and return logits before sampling
-   */
-  std::vector<float> prefillLogits(const std::string &prompt) override {
-    allocateAndBindKVCache();
-
-    auto encoded = tokenizer->Encode(prompt);
-    if (encoded.empty())
-      throw std::invalid_argument("tiny Qwen2 prompt encoded to no tokens");
-
-    const unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
-    const unsigned int init_len = static_cast<unsigned int>(
-      std::min<size_t>(encoded.size(), num_allow_str));
-    std::vector<float> input_sample(
-      static_cast<size_t>(BATCH_SIZE) * MAX_SEQ_LEN, 0.0f);
-
-    for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-      for (unsigned int i = 0; i < init_len; ++i) {
-        const auto token_id = static_cast<unsigned int>(encoded[i]);
-        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + i] =
-          static_cast<float>(token_id);
-        ids_history[static_cast<size_t>(b) * MAX_SEQ_LEN + i] = token_id;
-      }
-    }
-
-    std::vector<std::pair<std::string, float *>> cache_inputs;
-    cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
-    for (int i = 0; i < NUM_LAYERS; ++i) {
-      cache_inputs.emplace_back(
-        "cache_k_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
-      cache_inputs.emplace_back(
-        "cache_v_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
-    }
-
-    std::sort(
-      cache_inputs.begin(), cache_inputs.end(),
-      [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
-
-    std::vector<float *> input;
-    input.reserve(1 + cache_inputs.size());
-    input.push_back(input_sample.data());
-    for (const auto &cache_input : cache_inputs)
-      input.push_back(cache_input.second);
-
-    std::vector<float *> label;
-    setKVCachePosition(0);
-    auto output = model->incremental_inference(BATCH_SIZE, input, label,
-                                               init_len, 0, init_len, false);
-    std::vector<float> logits(output[0], output[0] + NUM_VOCAB);
-    for (auto &out : output)
-      delete[] out;
-
-    return logits;
-  }
-
-  /**
-   * @brief Get generated output text
-   */
-  std::string getOutputText(int batch_idx = 0) const override {
-    return getOutput(batch_idx);
-  }
-
-  /**
-   * @brief Get whether the tiny Qwen2 model has completed run()
-   */
-  bool hasRun() const override { return causallm::CausalLM::hasRun(); }
-
-  /**
-   * @brief Read one token from the Qwen2 input/output history
-   */
-  unsigned int tokenAt(size_t idx) const override { return ids_history[idx]; }
-
-  /**
-   * @brief Generate ids from logits through Qwen2 decoding logic
-   */
-  std::vector<unsigned int>
-  generateFromLogits(float *logits, bool do_sample, float repetition_penalty,
-                     unsigned int *input_ids,
-                     unsigned int num_input_ids) override {
-    return generate(logits, do_sample, repetition_penalty, input_ids,
-                    num_input_ids);
-  }
-};
+    });
+}
 
 /**
  * @brief Files generated for one tiny Qwen2.5 embedding test invocation
@@ -514,6 +386,9 @@ makeQwen2Case(const causallm_test::TinyCausalLMDataType &data_type) {
        causallm::json &nntr_cfg) {
       return std::make_unique<TinyQwen2CausalLM>(cfg, generation_cfg, nntr_cfg);
     },
+    [](causallm_test::TinyCausalLMRunner &runner) {
+      setupQwen2DeterministicWeights(static_cast<TinyQwen2CausalLM &>(runner));
+    },
   };
 }
 
@@ -540,6 +415,167 @@ protected:
                                                 GetParam().name);
   }
 };
+
+/**
+ * @brief Logits processor that forces one token and records callbacks
+ */
+class ForcingLogitsProcessor final : public causallm::LogitsProcessor {
+public:
+  explicit ForcingLogitsProcessor(unsigned int token) : token(token) {}
+
+  /**
+   * @brief Mask every logit except the forced token
+   */
+  void process(float *logits, unsigned int vocab_size,
+               unsigned int batch_index) override {
+    ++process_count;
+    last_batch_index = batch_index;
+    last_vocab_size = vocab_size;
+
+    for (unsigned int i = 0; i < vocab_size; ++i)
+      logits[i] = -std::numeric_limits<float>::infinity();
+    logits[token] = 100.0f;
+  }
+
+  /**
+   * @brief Record the accepted token
+   */
+  void acceptToken(unsigned int token_id, unsigned int batch_index) override {
+    ++accept_count;
+    accepted_token = token_id;
+    accepted_batch_index = batch_index;
+  }
+
+  /**
+   * @brief Record reset calls
+   */
+  void reset() override { ++reset_count; }
+
+  unsigned int token;
+  unsigned int process_count = 0;
+  unsigned int accept_count = 0;
+  unsigned int reset_count = 0;
+  unsigned int last_batch_index = 99;
+  unsigned int accepted_batch_index = 99;
+  unsigned int last_vocab_size = 0;
+  unsigned int accepted_token = 0;
+};
+
+/**
+ * @brief Make a direct tiny Qwen2 model for logits processor hook tests
+ */
+std::unique_ptr<TinyQwen2CausalLM>
+makeDirectTinyQwen2Model(const causallm_test::TinyCausalLMFiles &files,
+                         const causallm_test::TinyCausalLMCase &test_case,
+                         const std::vector<unsigned int> &bad_word_ids = {}) {
+  auto config =
+    causallm_test::makeTinyCausalLMConfig(test_case, files.tokenizer_path);
+  config.nntrainer["bad_word_ids"] = bad_word_ids;
+  return std::make_unique<TinyQwen2CausalLM>(config.model, config.generation,
+                                             config.nntrainer);
+}
+
+/**
+ * @brief Test that Transformer exposes the configured vocabulary size
+ */
+TEST_P(Qwen2CausalLMTinyModelTest, TransformerReturnsConfiguredVocabSize) {
+  const auto files = makeFiles();
+  auto model = makeDirectTinyQwen2Model(files, GetParam());
+
+  EXPECT_EQ(model->getVocabSize(), 32u);
+}
+
+/**
+ * @brief Test that Transformer exposes its owned tokenizer
+ */
+TEST_P(Qwen2CausalLMTinyModelTest, TransformerReturnsOwnedTokenizer) {
+  const auto files = makeFiles();
+  auto model = makeDirectTinyQwen2Model(files, GetParam());
+
+  EXPECT_NE(model->getTokenizer(), nullptr);
+}
+
+/**
+ * @brief Test that embedding_file_name reaches the embedding layer sidecar path
+ */
+TEST_P(Qwen2CausalLMTinyModelTest,
+       EmbeddingFileNameIsPassedToEmbeddingLayerSidecarPath) {
+  const auto files = makeFiles();
+  auto config =
+    causallm_test::makeTinyCausalLMConfig(GetParam(), files.tokenizer_path);
+  config.model["tie_word_embeddings"] = false;
+  config.nntrainer["embedding_file_name"] =
+    (files.dir / "missing_sidecar_lut.bin").string();
+  auto model = std::make_unique<TinyQwen2CausalLM>(
+    config.model, config.generation, config.nntrainer);
+
+  EXPECT_THROW(model->initializeModel(), std::runtime_error);
+}
+
+/**
+ * @brief Test that a logits processor can force greedy generation
+ */
+TEST_P(Qwen2CausalLMTinyModelTest,
+       LogitsProcessorForcesGreedyGenerationAndReceivesAcceptedToken) {
+  const auto files = makeFiles();
+  auto model = makeDirectTinyQwen2Model(files, GetParam(), {7});
+  ForcingLogitsProcessor processor(7);
+  std::vector<float> logits(32, -2.0f);
+  logits[3] = 5.0f;
+  unsigned int input_ids[4] = {1, 0, 0, 0};
+
+  model->setLogitsProcessor(&processor);
+  auto ids =
+    model->generateFromLogits(logits.data(), false, 1.0f, input_ids, 1);
+
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0], 7u);
+  EXPECT_EQ(processor.process_count, 1u);
+  EXPECT_EQ(processor.accept_count, 1u);
+  EXPECT_EQ(processor.last_vocab_size, 32u);
+  EXPECT_EQ(processor.last_batch_index, 0u);
+  EXPECT_EQ(processor.accepted_token, 7u);
+  EXPECT_EQ(processor.accepted_batch_index, 0u);
+}
+
+/**
+ * @brief Test that detaching a logits processor restores greedy argmax
+ */
+TEST_P(Qwen2CausalLMTinyModelTest,
+       DetachingLogitsProcessorRestoresGreedyArgmax) {
+  const auto files = makeFiles();
+  auto model = makeDirectTinyQwen2Model(files, GetParam());
+  ForcingLogitsProcessor processor(7);
+  unsigned int input_ids[4] = {1, 0, 0, 0};
+
+  model->setLogitsProcessor(&processor);
+  model->setLogitsProcessor(nullptr);
+
+  std::vector<float> logits(32, -2.0f);
+  logits[3] = 5.0f;
+  logits[7] = 4.0f;
+  auto ids =
+    model->generateFromLogits(logits.data(), false, 1.0f, input_ids, 1);
+
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0], 3u);
+  EXPECT_EQ(processor.process_count, 0u);
+  EXPECT_EQ(processor.accept_count, 0u);
+}
+
+/**
+ * @brief Test that resetLogitsProcessor forwards to the attached processor
+ */
+TEST_P(Qwen2CausalLMTinyModelTest, ResetLogitsProcessorForwardsReset) {
+  const auto files = makeFiles();
+  auto model = makeDirectTinyQwen2Model(files, GetParam());
+  ForcingLogitsProcessor processor(7);
+
+  model->setLogitsProcessor(&processor);
+  model->resetLogitsProcessor();
+
+  EXPECT_EQ(processor.reset_count, 1u);
+}
 
 /**
  * @brief Test that greedy generation chooses the argmax logit
@@ -587,6 +623,7 @@ TEST(Qwen25EmbeddingTinyModelTest,
   auto model = makeLoadedQwen25Embedding(files);
 
   EXPECT_FALSE(model->isCausalForTest());
+  EXPECT_EQ(model->getEmbeddingDim(), 64);
 
   std::vector<float> embedding;
   ASSERT_NO_THROW(embedding = model->encodePrompt("hello tok4"));

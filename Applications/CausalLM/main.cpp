@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,15 +34,7 @@
 #include "causal_lm.h"
 #include "chat_template.h"
 #include "lfm2_vl_vision_transformer.h"
-#include "embedding_gemma.h"
-#include "gemma3_causallm.h"
-#if !defined(_WIN32)
-#include "gptoss_cached_slim_causallm.h"
-#endif
-#include "gptoss_causallm.h"
-#if !defined(_WIN32) && !defined(__ANDROID__)
-#include "multilingual_tinybert_16mb.h"
-#endif
+#include "model_registry.h"
 #include "qwen25_omni_audio_causallm.h"
 #include "qwen25_omni_audio_encoder.h"
 #include "qwen25_omni_bigvgan.h"
@@ -49,16 +42,6 @@
 #include "qwen25_omni_talker_causallm.h"
 #include "qwen25_omni_vision_causallm.h"
 #include "qwen25_omni_vision_encoder.h"
-#include "qwen2_causallm.h"
-#include "qwen2_embedding.h"
-#if !defined(_WIN32)
-#include "qwen3_cached_slim_moe_causallm.h"
-#endif
-#include "qwen3_causallm.h"
-#include "qwen3_embedding.h"
-#include "qwen3_moe_causallm.h"
-#include "qwen3_slim_moe_causallm.h"
-#include "timm_vit/timm_vit_transformer.h"
 #include <models/gemma3/function.h>
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -73,6 +56,22 @@ using json = nlohmann::json;
 
 std::atomic<size_t> peak_rss_kb{0};
 std::atomic<bool> tracking_enabled{true};
+
+namespace {
+
+void resolveNntrConfigPath(json &nntr_cfg, const std::string &key,
+                           const std::string &model_path) {
+  if (!nntr_cfg.contains(key) || !nntr_cfg[key].is_string())
+    return;
+
+  std::filesystem::path path = nntr_cfg[key].get<std::string>();
+  if (path.empty() || path.is_absolute())
+    return;
+
+  nntr_cfg[key] = (std::filesystem::path(model_path) / path).string();
+}
+
+} // namespace
 
 /**
  * @brief Print the maximum resident set size for the current process.
@@ -176,6 +175,10 @@ std::string resolve_architecture(std::string model_type,
     } else if (architecture == "TimmViT" ||
                architecture == "vit_base_patch16_siglip_224") {
       return "TimmViT";
+    } else if (architecture == "deberta-v2" ||
+               architecture == "DebertaV2Model" ||
+               architecture == "DebertaV2ForMaskedLM") {
+      return "DebertaV2";
     } else {
       throw std::invalid_argument(
         "Unsupported architecture for embedding model: " + architecture);
@@ -185,6 +188,10 @@ std::string resolve_architecture(std::string model_type,
   if (architecture == "TimmViT" ||
       architecture == "vit_base_patch16_siglip_224") {
     return "TimmViT";
+  }
+
+  if (architecture == "Gemma4ForConditionalGeneration") {
+    return "Gemma4ForCausalLM";
   }
 
   return architecture;
@@ -198,21 +205,10 @@ int main(int argc, char *argv[]) {
   auto start_time = std::chrono::high_resolution_clock::now();
 
   /** Register all runnable causallm models to factory */
-  causallm::Factory::Instance().registerModel(
-    "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
-                                                  nntr_cfg);
-    });
-  causallm::Factory::Instance().registerModel(
-    "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::Qwen2CausalLM>(cfg, generation_cfg,
-                                                       nntr_cfg);
-    });
-  causallm::Factory::Instance().registerModel(
-    "Qwen2Embedding", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::Qwen2Embedding>(cfg, generation_cfg,
-                                                        nntr_cfg);
-    });
+  causallm::registerAllModels();
+
+  /** Register Qwen2.5-Omni / LFM2-VL models that are not part of the shared
+   * model registry yet. */
   /** Qwen2.5-Omni Thinker text model (text-only). The first name is what the
    * HF repo config ships; the latter two appear in configs (re-)saved with
    * newer transformers versions. */
@@ -257,71 +253,6 @@ int main(int argc, char *argv[]) {
         cfg, generation_cfg, nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
-    "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::Qwen3CausalLM>(cfg, generation_cfg,
-                                                       nntr_cfg);
-    });
-  causallm::Factory::Instance().registerModel(
-    "Qwen3MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::Qwen3MoECausalLM>(cfg, generation_cfg,
-                                                          nntr_cfg);
-    });
-  causallm::Factory::Instance().registerModel(
-    "Qwen3SlimMoeForCausalLM",
-    [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::Qwen3SlimMoECausalLM>(
-        cfg, generation_cfg, nntr_cfg);
-    });
-#if !defined(_WIN32)
-  causallm::Factory::Instance().registerModel(
-    "Qwen3CachedSlimMoeForCausalLM",
-    [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::Qwen3CachedSlimMoECausalLM>(
-        cfg, generation_cfg, nntr_cfg);
-    });
-#endif
-  causallm::Factory::Instance().registerModel(
-    "Qwen3Embedding", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::Qwen3Embedding>(cfg, generation_cfg,
-                                                        nntr_cfg);
-    });
-  causallm::Factory::Instance().registerModel(
-    "GptOssForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::GptOssForCausalLM>(cfg, generation_cfg,
-                                                           nntr_cfg);
-    });
-#if !defined(_WIN32)
-  causallm::Factory::Instance().registerModel(
-    "GptOssCachedSlimCausalLM",
-    [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::GptOssCachedSlimCausalLM>(
-        cfg, generation_cfg, nntr_cfg);
-    });
-#endif
-  causallm::Factory::Instance().registerModel(
-    "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
-                                                        nntr_cfg);
-    });
-  causallm::Factory::Instance().registerModel(
-    "EmbeddingGemma", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::EmbeddingGemma>(cfg, generation_cfg,
-                                                        nntr_cfg);
-    });
-#if !defined(_WIN32) && !defined(__ANDROID__)
-  causallm::Factory::Instance().registerModel(
-    "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::MultilingualTinyBert>(
-        cfg, generation_cfg, nntr_cfg);
-    });
-#endif
-  causallm::Factory::Instance().registerModel(
-    "TimmViT", [](json cfg, json generation_cfg, json nntr_cfg) {
-      return std::make_unique<causallm::TimmViTTransformer>(cfg, generation_cfg,
-                                                            nntr_cfg);
-    });							    
-
-  causallm::Factory::Instance().registerModel(
     "Lfm2VlVisionTransformer", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Lfm2VlVisionTransformer>(cfg, generation_cfg,
                                                             nntr_cfg);
@@ -352,6 +283,9 @@ int main(int argc, char *argv[]) {
       generation_cfg = causallm::LoadJsonFile(generation_config_path);
     }
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+    resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_path);
+    resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_path);
+    resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_path);
 
     if (nntr_cfg.contains("system_prompt")) {
       system_head_prompt =
@@ -374,9 +308,12 @@ int main(int argc, char *argv[]) {
     } else if (cfg.contains("architecture") &&
                cfg["architecture"].is_string()) {
       architecture = cfg["architecture"].get<std::string>();
+    } else if (cfg.contains("model_type") && cfg["model_type"].is_string()) {
+      architecture = cfg["model_type"].get<std::string>();
     } else {
       throw std::invalid_argument(
-        "config.json must contain 'architectures' or 'architecture'.");
+        "config.json must contain 'architectures', 'architecture', or "
+        "'model_type'.");
     }
 
     if (nntr_cfg.contains("model_type")) {
@@ -384,41 +321,21 @@ int main(int argc, char *argv[]) {
       architecture = resolve_architecture(model_type, architecture);
     }
 
-    // Load chat template from tokenizer_config.json (if available)
-    causallm::ChatTemplate chat_tmpl;
-    std::string tokenizer_config_path = model_path + "/tokenizer_config.json";
-    if (std::filesystem::exists(tokenizer_config_path)) {
-      chat_tmpl = causallm::ChatTemplate::fromFile(tokenizer_config_path);
-      if (chat_tmpl.isAvailable()) {
-        std::cout << "[Info] Chat template loaded from tokenizer_config.json"
-                  << std::endl;
-      } else {
-        std::cerr
-          << "[Warning] tokenizer_config.json found but chat template could "
-             "not be loaded. Chat formatting will not be applied to raw input."
-          << std::endl;
-      }
-    } else {
-      std::cerr
-        << "[Warning] tokenizer_config.json not found in " << model_path
-        << ". Chat template will not be available for raw input formatting."
-        << std::endl;
+    // Load chat template from tokenizer_config.json or jinja (if available)
+    std::optional<causallm::ChatTemplate> chat_template;
+    if (causallm::ChatTemplate::Exists(model_path)) {
+      chat_template.emplace(causallm::ChatTemplate::Load(model_path));
     }
 
     // Determine input text
     if (argc >= 3) {
       input_text = argv[2];
-      if (chat_tmpl.isAvailable()) {
-        auto formatted_input = chat_tmpl.apply(input_text);
-        if (!formatted_input.empty()) {
-          input_text = formatted_input;
-        }
-      }
     } else {
       if (nntr_cfg.contains("chat_input")) {
-        if (architecture == "Gemma3ForCausalLM") {
-          input_text = causallm::gemma3::apply_function_gemma_template(
-            nntr_cfg["chat_input"]);
+        if (chat_template.has_value()) {
+          input_text = chat_template->apply(nntr_cfg["chat_input"]);
+          system_head_prompt.clear();
+          system_tail_prompt.clear();
         } else {
           std::cerr << "[Warning] 'chat_input' is set but support for model "
                        "architecture '"
@@ -443,6 +360,7 @@ int main(int argc, char *argv[]) {
     }
     model->initialize();
     model->load_weight(weight_file);
+    model->repack_weight();
 
     bool do_sample = generation_cfg.value("do_sample", false);
 

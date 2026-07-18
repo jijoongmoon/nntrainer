@@ -18,7 +18,7 @@
 #include "int4_utils.h"
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
-#include "swiglu_cl.h"
+#include "swiglu_cl_op.h"
 #include "tensor_dim.h"
 #include "timer.h"
 #include <blas_kernel_interface.h>
@@ -142,7 +142,7 @@ static void run_q4_0_test(const uint32_t M, const uint32_t K,
   std::vector<float> ref_dst(M * N, 0.0f);
   std::vector<float> cpu_q4_dst(M * N, 0.0f);
 
-  const auto data_size = K * N / Q4_0 * sizeof(block_q4_0);
+  const auto data_size = K * N / QK4_0 * sizeof(block_q4_0);
 
   // Generate result from SGEMM
   nntrainer::sgemm(0, false, true, M, N, K, 1.F, activation.data(), K,

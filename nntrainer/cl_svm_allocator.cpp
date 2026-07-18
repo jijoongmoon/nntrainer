@@ -10,7 +10,11 @@
  * @brief   Implementation of OpenCL SVM-backed MemAllocator subclass.
  */
 
+#include <env_compat.h>
+#include <cl_buffer_pool.h>
 #include <cl_svm_allocator.h>
+#include <cstdlib>
+#include <memory_pool.h>
 #include <mutex>
 #include <opencl_context_manager.h>
 #include <unordered_set>
@@ -27,6 +31,41 @@ std::unordered_set<void *> host_owned;
 
 ClSVMAllocator::ClSVMAllocator(opencl::ContextManager &ctx) : ctx_(ctx) {}
 
+std::shared_ptr<MemoryPool>
+ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self,
+                         const std::string &pool_name) {
+  // NNTR_GPU_CLMEM_POOL: back the activation plane with a device cl_mem pool
+  // (ClBufferPool) so activations stay GPU-resident as plain cl_mem; default
+  // OFF => the SVM-backed MemoryPool. Same condition as the old TensorPool
+  // getName()=="gpu-svm" && env check — now owned by the allocator. [Mem M2]
+  if (nntr_env_on("NNTR_GPU_CLMEM_POOL")) {
+    // [weight plane skip] No WEIGHT tensor ever binds its per-offset cl_mem:
+    // the v8c FCs read their own packed backing and the norms are host-read
+    // (runtime residency dump: 566/566 gauss4 weights classify SVM), yet the
+    // shadow plane is fully committed by the Windows/WDDM driver (~1373MB in
+    // the process working set for gauss4). Give the never-consumed plane only
+    // to the pools that use it (activations); the weight pool keeps the plain
+    // SVM MemoryPool. NNTR_CLMEM_WEIGHT_PLANE=1 restores the old behavior.
+    // Default: skip on x86 (field-verified never-bound on Intel: Windows
+    // residency dump + Linux A/B no change); KEEP on ARM/Adreno until the
+    // device A/B clears it. Explicit env overrides both ways:
+    //   NNTR_CLMEM_WEIGHT_PLANE=1 -> keep the plane everywhere (old behavior)
+    //   NNTR_CLMEM_WEIGHT_PLANE=0 -> skip everywhere (the Adreno A/B lever)
+    static const char *wp_env = std::getenv("NNTR_CLMEM_WEIGHT_PLANE");
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    const bool arch_default_skip = true;
+#else
+    const bool arch_default_skip = false;
+#endif
+    const bool skip_weight_plane =
+      pool_name == "weight_pool" &&
+      (wp_env ? wp_env[0] == '0' : arch_default_skip);
+    if (!skip_weight_plane)
+      return std::make_shared<ClBufferPool>(self);
+  }
+  return std::make_shared<MemoryPool>(self);
+}
+
 void ClSVMAllocator::track_host_owned(void *ptr) {
   std::lock_guard<std::mutex> lk(host_owned_mtx);
   host_owned.insert(ptr);
@@ -37,9 +76,28 @@ bool ClSVMAllocator::consume_host_owned(void *ptr) {
   return host_owned.erase(ptr) > 0;
 }
 
+// NNTR_POISON_FILL=1: fill fresh allocations with 0x55 instead of 0 —
+// round-16 discriminator. If outputs CHANGE but stay run-stable, an
+// initialized-content consumer exists (uninit class); if divergence stays
+// intermittent, the mechanism is in-kernel / schedule-dependent.
+static unsigned char nntr_fill_byte() {
+  static const unsigned char b = []() -> unsigned char {
+    const char *e = std::getenv("NNTR_POISON_FILL");
+    return (e && e[0] == '1') ? (unsigned char)0x55 : (unsigned char)0x00;
+  }();
+  return b;
+}
+
 void ClSVMAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   void *svm = ctx_.createSVMRegion(size);
   if (svm != nullptr) {
+    // Honor MemAllocator's documented calloc semantics on the SVM path too
+    // (the host path memsets; this one silently didn't). clSVMAlloc gives NO
+    // zero guarantee: Linux NEO happens to hand kernel-zeroed pages, but a
+    // WDDM driver may recycle non-zero pool pages — any consumer relying on
+    // the zero contract then reads per-process garbage, the round-15
+    // run-to-run divergence class. One-time cost at allocation.
+    std::memset(svm, nntr_fill_byte(), size);
     *ptr = svm;
     return;
   }

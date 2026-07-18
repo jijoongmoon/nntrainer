@@ -37,7 +37,16 @@ enum class QScheme : uint16_t {
   Q4_Kx8 = 0x03,
   Q6_K = 0x4,
   Q4_0 = 0x5,
-  Q8_0 = 0x6,
+  /**
+   * @brief KAI qsi4cxp nibble Section A layout (nr=4, kr=16, sr=2), per-
+   * output-channel fp16 scale, no group. Used by the GPU v8c INT4 path and
+   * by the ARM CPU KAI qai8dxp4x8_qsi4cxp4x8 matmul (idx_variant=2).
+   * Same KleidiAI qsi4cxp scheme as upstream's QS4CX (both 0x6 = aliases);
+   * kept both names during the upstream merge. [merge 2026-06-30]
+   */
+  KAI_QSI4CXP_4x4x32 = 0x06,
+  QS4CX = 0x6,
+  Q8_0 = 0x7,
   /** this is for custom use */
   CUSTOM_QUANTIZER_01 = 0x10,
   CUSTOM_QUANTIZER_02 = 0x11,

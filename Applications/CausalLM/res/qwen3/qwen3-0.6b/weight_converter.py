@@ -1,142 +1,345 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
+# Copyright (C) 2026 Seunghui Lee <shsh1004.lee@samsung.com>
 
-# @file weight_converter.py
-# @brief HuggingFace -> nntrainer FP32 weight converter for Qwen3 dense
-#        models (e.g. Qwen/Qwen3-0.6B). Streams weights from the safetensors
-#        shards; no full-model RAM or bleeding-edge transformers needed.
-#
-#        The on-disk order is the symbolic graph's DFS-from-output order
-#        (Model::compile), NOT layer creation order. For Qwen3 that is, per
-#        decoder block:
-#          input_layernorm,
-#          q_proj(w^T), q_norm, k_proj(w^T), k_norm, v_proj(w^T),
-#          o_proj(w^T),
-#          post_attention_layernorm,
-#          gate_proj(w^T), up_proj(w^T), down_proj(w^T)
-#        i.e. gate BEFORE up (swiglu({gate, up}) DFS), and the q/k RMSNorms
-#        sit right after their projections. Matches the (corrected) GGUF
-#        converter gguf_to_nntrainer.py.
-#
-#        Qwen3 attention has NO q/k/v/o bias; q_norm/k_norm are RMSNorm over
-#        head_dim. tie_word_embeddings shares lm_head with the embedding, so
-#        no separate lm_head weight is written when tied.
-#
-# @usage
-#   python weight_converter.py --model_path Qwen/Qwen3-0.6B \
-#       --output_dir ./qwen3-0.6b-fp32
-#
-# @author Jijoong Moon <jijoong.moon@samsung.com>
+## @file weight_converter.py
+## @brief weight conversion script for qwen3 model
+## @author Seunghui Lee <shsh1004.lee@samsung.com>
 
 import argparse
 import json
-import os
+import struct
 
 import numpy as np
 import torch
-from safetensors import safe_open
+from transformers import AutoConfig, AutoModelForCausalLM
 
 
-def resolve_model_dir(model_path: str) -> str:
-    if os.path.isdir(model_path):
-        return model_path
-    from huggingface_hub import snapshot_download
-    return snapshot_download(
-        repo_id=model_path,
-        allow_patterns=["config.json", "generation_config.json",
-                        "tokenizer.json", "tokenizer_config.json",
-                        "*.safetensors", "*.safetensors.index.json"])
+SAFETENSORS_DTYPE_MAP = {
+    "float32": "F32",
+}
 
 
-class ShardedSafetensors:
-    def __init__(self, model_dir: str):
-        self.model_dir = model_dir
-        index = os.path.join(model_dir, "model.safetensors.index.json")
-        if os.path.exists(index):
-            with open(index) as f:
-                self.weight_map = json.load(f)["weight_map"]
-        else:
-            single = os.path.join(model_dir, "model.safetensors")
-            with safe_open(single, framework="pt") as f:
-                self.weight_map = {k: "model.safetensors" for k in f.keys()}
-        self._handles = {}
+def tensor_to_numpy(tensor, dtype, transpose=False):
+    """Convert torch tensor to contiguous numpy array."""
+    if transpose:
+        tensor = tensor.permute(1, 0)
 
-    def __contains__(self, key):
-        return key in self.weight_map
+    return np.ascontiguousarray(tensor.detach().cpu().numpy().astype(dtype))
 
-    def get(self, key):
-        shard = self.weight_map[key]
-        if shard not in self._handles:
-            self._handles[shard] = safe_open(
-                os.path.join(self.model_dir, shard), framework="pt")
-        return self._handles[shard].get_tensor(key)
+
+def get_tie_word_embeddings(config):
+    """Return whether the model uses tied word embeddings."""
+    return getattr(config, "tie_word_embeddings", True)
+
+
+def get_safetensors_output_name(output_name):
+    """Return safetensors output path based on the given output name."""
+    if output_name.endswith(".bin"):
+        return output_name[:-4] + ".safetensors"
+
+    if output_name.endswith(".safetensors"):
+        return output_name
+
+    return output_name + ".safetensors"
+
+
+def save_qwen3_for_nntrainer(
+    params,
+    n_layers,
+    dtype,
+    file,
+    tie_word_embeddings=True,
+):
+    """Convert and save weights as nntrainer binary format for Qwen3 model."""
+
+    def save_weight(tensor, transpose=False):
+        arr = tensor_to_numpy(tensor, dtype, transpose=transpose)
+        arr.tofile(file)
+
+    def save_projection(layer_name, proj_name):
+        """Save projection weight.
+
+        If LoRA weights exist, save base, LoRA A, and LoRA B weights in order.
+        """
+        base_key = f"{layer_name}{proj_name}.base_layer.weight"
+        weight_key = f"{layer_name}{proj_name}.weight"
+        lora_a_key = f"{layer_name}{proj_name}.lora_A.default.weight"
+        lora_b_key = f"{layer_name}{proj_name}.lora_B.default.weight"
+
+        if lora_a_key in params:
+            save_weight(params[base_key], transpose=True)
+            save_weight(params[lora_a_key], transpose=True)
+            save_weight(params[lora_b_key], transpose=True)
+            return
+
+        save_weight(params[weight_key], transpose=True)
+
+    def save_attention(layer_name):
+        """Save attention layer weights."""
+        save_weight(params[f"{layer_name}input_layernorm.weight"])
+
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            save_projection(layer_name, f"self_attn.{proj}")
+
+            proj_norm_name = f"{layer_name}self_attn.{proj[0]}_norm.weight"
+            if proj_norm_name in params:
+                save_weight(params[proj_norm_name])
+
+    def save_feed_forward(layer_name):
+        """Save feed-forward layer weights."""
+        save_weight(params[f"{layer_name}post_attention_layernorm.weight"])
+
+        # gate BEFORE up: Transformer::createMlp creates ffn_gate first and
+        # the model loader assigns file offsets in graph creation order
+        # (positional, not by name). If up is written first, ffn_up loads the
+        # gate_proj bytes and swiglu computes silu(up)*gate -- coherent-looking
+        # but wrong. Matches gguf_to_nntrainer.py and
+        # weight_converter_layergraph.py.
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            save_projection(layer_name, f"mlp.{proj}")
+
+    save_weight(params["model.embed_tokens.weight"])
+
+    for layer_idx in range(n_layers):
+        layer_prefix = f"model.layers.{layer_idx}."
+        save_attention(layer_prefix)
+        save_feed_forward(layer_prefix)
+
+    save_weight(params["model.norm.weight"])
+
+    # For tied embedding models, lm_head shares model.embed_tokens.weight.
+    # nntrainer tie_word_embeddings lm_head path does not read a separate weight.
+    if not tie_word_embeddings:
+        save_weight(params["lm_head.weight"], transpose=True)
+
+
+def collect_qwen3_for_nntrainer(
+    params,
+    n_layers,
+    dtype,
+    tie_word_embeddings=True,
+):
+    """Collect weights as ordered (nntrainer_name, ndarray) pairs."""
+    weights = []
+
+    def add(name, tensor, transpose=False):
+        arr = tensor_to_numpy(tensor, dtype, transpose=transpose)
+        weights.append((name, arr))
+
+    def add_projection(nntr_name, layer_name, proj_name):
+        """Add projection weight for safetensors export.
+
+        Note: this safetensors path exports the main projection weight only.
+        If LoRA safetensors export is needed later, LoRA tensor names should be
+        defined and added here explicitly.
+        """
+        base_key = f"{layer_name}{proj_name}.base_layer.weight"
+        weight_key = f"{layer_name}{proj_name}.weight"
+        lora_a_key = f"{layer_name}{proj_name}.lora_A.default.weight"
+
+        if lora_a_key in params:
+            add(nntr_name, params[base_key], transpose=True)
+            return
+
+        add(nntr_name, params[weight_key], transpose=True)
+
+    add("embedding0:Embedding", params["model.embed_tokens.weight"])
+
+    for layer_idx in range(n_layers):
+        hf_prefix = f"model.layers.{layer_idx}."
+        nntr_prefix = f"layer{layer_idx}"
+
+        add(
+            f"{nntr_prefix}_attention_norm:gamma",
+            params[f"{hf_prefix}input_layernorm.weight"],
+        )
+
+        add_projection(
+            f"{nntr_prefix}_wq:weight",
+            hf_prefix,
+            "self_attn.q_proj",
+        )
+
+        q_norm_key = f"{hf_prefix}self_attn.q_norm.weight"
+        if q_norm_key in params:
+            add(f"{nntr_prefix}_q_norm:gamma", params[q_norm_key])
+
+        add_projection(
+            f"{nntr_prefix}_wk:weight",
+            hf_prefix,
+            "self_attn.k_proj",
+        )
+
+        k_norm_key = f"{hf_prefix}self_attn.k_norm.weight"
+        if k_norm_key in params:
+            add(f"{nntr_prefix}_k_norm:gamma", params[k_norm_key])
+
+        add_projection(
+            f"{nntr_prefix}_wv:weight",
+            hf_prefix,
+            "self_attn.v_proj",
+        )
+
+        add_projection(
+            f"{nntr_prefix}_attention_out:weight",
+            hf_prefix,
+            "self_attn.o_proj",
+        )
+
+        add(
+            f"{nntr_prefix}_ffn_norm:gamma",
+            params[f"{hf_prefix}post_attention_layernorm.weight"],
+        )
+
+        # Match the existing nntrainer Qwen3 layer naming.
+        add_projection(
+            f"{nntr_prefix}_ffn_gate:weight",
+            hf_prefix,
+            "mlp.gate_proj",
+        )
+
+        add_projection(
+            f"{nntr_prefix}_ffn_up:weight",
+            hf_prefix,
+            "mlp.up_proj",
+        )
+
+        add_projection(
+            f"{nntr_prefix}_ffn_down:weight",
+            hf_prefix,
+            "mlp.down_proj",
+        )
+
+    add("output_norm:gamma", params["model.norm.weight"])
+
+    if not tie_word_embeddings:
+        add(
+            "output_of_causallm:weight",
+            params["lm_head.weight"],
+            transpose=True,
+        )
+
+    return weights
+
+
+def save_safetensors(weights, output_path, dtype):
+    """Write weights to a safetensors file.
+
+    This writes the safetensors format directly to avoid an extra dependency.
+    """
+    if dtype not in SAFETENSORS_DTYPE_MAP:
+        raise ValueError(f"Unsupported safetensors dtype: {dtype}")
+
+    safetensors_dtype = SAFETENSORS_DTYPE_MAP[dtype]
+    metadata = {"format": "pt"}
+
+    offset = 0
+    tensor_meta = {}
+    raw_buffers = []
+
+    for name, arr in weights:
+        if not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+
+        nbytes = arr.nbytes
+        tensor_meta[name] = {
+            "dtype": safetensors_dtype,
+            "shape": list(arr.shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+
+        raw_buffers.append(arr.tobytes(order="C"))
+        offset += nbytes
+
+    header = {"__metadata__": metadata}
+    header.update(tensor_meta)
+
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    pad = (8 - len(header_bytes) % 8) % 8
+    header_bytes += b" " * pad
+
+    with open(output_path, "wb") as output_file:
+        output_file.write(struct.pack("<Q", len(header_bytes)))
+        output_file.write(header_bytes)
+
+        for buffer in raw_buffers:
+            output_file.write(buffer)
+
+    print(f"Saved safetensors: {output_path}")
+    print(f"Tensor data size: {offset / 1e9:.2f} GB")
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="Qwen/Qwen3-0.6B",
+        help="Hugging Face model path or local model directory",
+    )
+    parser.add_argument(
+        "--output_name",
+        type=str,
+        default="./nntr_qwen3_0.6b_fp32.bin",
+        help="Output weight file path",
+    )
+    parser.add_argument(
+        "--data_type",
+        type=str,
+        default="float32",
+        choices=["float32"],
+        help="Output data type",
+    )
+    parser.add_argument(
+        "--safetensors",
+        action="store_true",
+        help="Save weights in safetensors format instead of binary format",
+    )
+
+    return parser.parse_args()
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Convert a HuggingFace Qwen3 dense model to nntrainer FP32")
-    ap.add_argument("--model_path", type=str, default="Qwen/Qwen3-0.6B")
-    ap.add_argument("--output_dir", type=str, default="./qwen3-0.6b-fp32")
-    ap.add_argument("--output_name", type=str,
-                    default="nntr_qwen3_0.6b_fp32.bin")
-    args = ap.parse_args()
+    """Convert Qwen3 Hugging Face weights to nntrainer weight format."""
+    args = parse_args()
 
-    model_dir = resolve_model_dir(args.model_path)
-    os.makedirs(args.output_dir, exist_ok=True)
-    with open(os.path.join(model_dir, "config.json")) as f:
-        cfg = json.load(f)
+    config = AutoConfig.from_pretrained(args.model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.float32,
+        trust_remote_code=True,
+    )
+    model.eval()
 
-    n_layers = cfg["num_hidden_layers"]
-    hidden = cfg["hidden_size"]
-    inter = cfg["intermediate_size"]
-    vocab = cfg["vocab_size"]
-    n_heads = cfg["num_attention_heads"]
-    n_kv = cfg["num_key_value_heads"]
-    head_dim = cfg.get("head_dim", hidden // n_heads)
-    tied = cfg.get("tie_word_embeddings", False)
-    q_size, kv_size = n_heads * head_dim, n_kv * head_dim
-    print(f"Qwen3: layers={n_layers} hidden={hidden} inter={inter} "
-          f"vocab={vocab} heads={n_heads} kv={n_kv} head_dim={head_dim} "
-          f"tied={tied}")
+    tie_word_embeddings = get_tie_word_embeddings(config)
+    print(f"tie_word_embeddings: {tie_word_embeddings}")
 
-    w = ShardedSafetensors(model_dir)
+    params = model.state_dict()
 
-    def fetch(name):
-        return w.get(name).to(torch.float32).numpy()
+    if args.safetensors:
+        output_name = get_safetensors_output_name(args.output_name)
 
-    out_path = os.path.join(args.output_dir, args.output_name)
-    with open(out_path, "wb") as out:
-        def save(arr, shape):
-            assert arr.shape == tuple(shape), \
-                f"{arr.shape} != {tuple(shape)}"
-            np.ascontiguousarray(arr, dtype=np.float32).tofile(out)
+        weights = collect_qwen3_for_nntrainer(
+            params,
+            config.num_hidden_layers,
+            args.data_type,
+            tie_word_embeddings=tie_word_embeddings,
+        )
 
-        def save_fc(name, out_f, in_f):
-            x = fetch(name)
-            assert x.shape == (out_f, in_f), f"{name}: {x.shape}"
-            np.ascontiguousarray(x.T, dtype=np.float32).tofile(out)
+        save_safetensors(weights, output_name, args.data_type)
+        return
 
-        save(fetch("model.embed_tokens.weight"), (vocab, hidden))
-        for i in range(n_layers):
-            p = f"model.layers.{i}."
-            save(fetch(p + "input_layernorm.weight"), (hidden,))
-            save_fc(p + "self_attn.q_proj.weight", q_size, hidden)
-            save(fetch(p + "self_attn.q_norm.weight"), (head_dim,))
-            save_fc(p + "self_attn.k_proj.weight", kv_size, hidden)
-            save(fetch(p + "self_attn.k_norm.weight"), (head_dim,))
-            save_fc(p + "self_attn.v_proj.weight", kv_size, hidden)
-            save_fc(p + "self_attn.o_proj.weight", hidden, q_size)
-            save(fetch(p + "post_attention_layernorm.weight"), (hidden,))
-            save_fc(p + "mlp.gate_proj.weight", inter, hidden)  # gate first!
-            save_fc(p + "mlp.up_proj.weight", inter, hidden)
-            save_fc(p + "mlp.down_proj.weight", hidden, inter)
-            print(f"  layer {i + 1:2d}/{n_layers}")
-        save(fetch("model.norm.weight"), (hidden,))
-        if not tied:
-            save_fc("lm_head.weight", vocab, hidden)
+    with open(args.output_name, "wb") as output_file:
+        save_qwen3_for_nntrainer(
+            params,
+            config.num_hidden_layers,
+            args.data_type,
+            output_file,
+            tie_word_embeddings=tie_word_embeddings,
+        )
 
-    print(f"Wrote {out_path} "
-          f"({os.path.getsize(out_path) / (1024 * 1024):.1f} MiB)")
+    print(f"Saved binary: {args.output_name}")
 
 
 if __name__ == "__main__":

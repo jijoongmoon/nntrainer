@@ -24,6 +24,9 @@ jobs:
           step-summary: true
           format-review: true
           tidy-checks: '-*' # disable clang-tidy checks.
+          # third_party/ holds vendored upstream code (minja, ...) that is not
+          # formatted to nntrainer style; skip it like static.check.yml does.
+          ignore: '.github|Applications/CausalLM/third_party'
 
       - name: failing fast
         if: steps.linter.outputs.clang-format-checks-failed > 0

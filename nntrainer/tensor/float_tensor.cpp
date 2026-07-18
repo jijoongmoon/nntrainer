@@ -14,9 +14,10 @@
 #include <numeric>
 
 #include <chrono>
+#include <cstdlib>
 #include <cpu_backend.h>
 #include <float_tensor.h>
-#include <int4_tensor.h>
+#include <int4_utils.h>
 #include <q4_0_utils.h>
 #include <thread_manager.h>
 
@@ -757,8 +758,10 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
     break;
   case Tdatatype::QINT16:
   case Tdatatype::QINT8:
-  case Tdatatype::QINT4:
     dotQInteger(input, output, trans, trans_in, beta, input.getDataType());
+    break;
+  case Tdatatype::QS4CX:
+    dotQs4cx(input, output, trans, trans_in, beta, input.getDataType());
     break;
   default:
     throw std::invalid_argument("Error: unsupported datatype");
@@ -773,9 +776,9 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   unsigned int K = getDim().width();
   Tdatatype input_dtype = input[0]->getDataType();
 
-  // Handle standard inputs
-  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::Q8_0 &&
-      input_dtype != Tdatatype::QINT4) {
+  // Handle standard inputs (the direct GEMM fast path is Q4_0/Q8_0-only; int4
+  // weights are QS4CX and go through the per-item dot). [Phase C Path B]
+  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::Q8_0) {
     for (unsigned int i = 0; i < input.size(); ++i) {
       dot(*input[i], *output[i], trans, trans_in, beta);
     }
@@ -802,33 +805,11 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
                           Ns[i]);
       }
     }
-  } else if (input_dtype == Tdatatype::Q8_0) {
+  } else { // Q8_0
     // No batched Q8_0 kernel yet; loop over the inputs.
     for (unsigned int i = 0; i < input.size(); ++i) {
       o->gemm_q8_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
                         Ns[i]);
-    }
-  } else { // QINT4
-    if (o->supports_gemv_int4_batch_fp32() &&
-        input[0]->getMemoryData()->isSVM() &&
-        output[0]->getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
-      std::vector<uint16_t *> scales;
-      for (unsigned int i = 0; i < input.size(); ++i) {
-        scales.push_back(input[i]->getScale<uint16_t>());
-      }
-      if (M == 1) {
-        o->gemv_int4_batch_fp32(mdatas, scales, data, rdatas, K, Ns,
-                                Int4QTensor::getGroupSize());
-      } else {
-        o->gemm_int4_batch_fp32(data, mdatas, scales, rdatas, M, Ns, K,
-                                Int4QTensor::getGroupSize());
-      }
-    } else {
-      /// @todo Replace with standard CPU INT4 computation
-      for (unsigned int i = 0; i < input.size(); ++i) {
-        o->gemm_q4_0_fp32(M, Ns[i], K, data, K, (void *)input[i]->getData(),
-                          Ns[i], rdatas[i], Ns[i]);
-      }
     }
   }
 }
@@ -1021,27 +1002,122 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
       output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
     if (M == 1) {
       o->gemv_int4_accel_fp32(mdata, input.getScale<uint16_t>(), data, rdata, K,
-                              N, Int4QTensor::getGroupSize());
+                              N, 32);
     } else {
       o->sgemm_int4_accel_fp32(data, mdata, input.getScale<uint16_t>(), rdata,
-                               M, N, K, Int4QTensor::getGroupSize());
+                               M, N, K, 32);
     }
   } else {
 #ifdef ENABLE_FP16
-    if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
+    if (input.q_scheme() == QScheme::KAI_QSI4CXP_4x4x32) {
+      // Disk layout is KAI Section A (nibbles) + per-channel fp16 scales,
+      // no inline KAI trailer. The full KAI rhs_packed buffer (nibbles +
+      // per-super-row sums / scales * 0.0625 / bias = 0) is assembled once
+      // and cached on the weight tensor; subsequent forwards reuse it.
+      const uint8_t *kai_rhs = input.getOrBuildKaiRhsPacked(N, K);
+      // Both variant 0 (qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod, M=1
+      // tuned) and variant 2 (qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm,
+      // M>=4 tuned) share the qsi4cxp4x8 RHS pack (nr=4 kr=16 sr=2), so
+      // both consume our assembled buffer unchanged.
+      uint32_t idx_variant = (M == 1) ? 0u : 2u;
+      nntr_gemm_qai8dxp_qsi4cxp_packed(M, N, K, (void *)data,
+                                       (void *)kai_rhs, rdata,
+                                       idx_variant, true);
+    } else if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
       uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
       nntr_gemm_qai8dxp_qsi4cxp_packed(
         M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx,
         true); /// @todo kernel supports both trans / noTrans situation
     } else {
       throw std::runtime_error(
-        "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
+        "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE or "
+        "KAI_QSI4CXP_4x4x32 scheme");
     }
 #else
     /// @todo Replace with standard CPU INT4 computation
     o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
 #endif
   }
+
+  return output;
+}
+
+Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
+                              bool trans_in, float beta,
+                              Tdatatype dtype) const {
+  unsigned int M = getDim().height();
+  unsigned int K = getDim().width();
+  unsigned int N = output.getDim().width();
+
+  // [HexKL/HTP] Route the QS4CX (int4) FC onto the Hexagon NPU when a HexKL
+  // ComputeOps is installed (engine=htp) and N is HMX-tile-aligned. This is the
+  // op-table seam for our int4 models: `this` is the fp32 activation A[M,K],
+  // `input` the QS4CX weight (plain nibbles N x ceil(K/2) + per-channel fp32
+  // scales), `output` is C[M,N]. shgemm_u8i4 quantizes A to u8 and derives the
+  // activation zero-point correction internally, so no zp_corr is passed.
+  // Off-HTP every backend returns supports_shgemm_u8i4()==false, so this is
+  // byte-identical and the existing KleidiAI path below runs unchanged.
+  //
+  // M gate: the HMX pads M up to the 64-row tile, so small-M calls (decode,
+  // M=1) would run a full 64-row matmul for a handful of real rows and lose to
+  // the CPU KleidiAI GEMV. Route only prefill-sized M to the NPU; decode stays
+  // on CPU. NNTR_HTP_FC_MIN_M overrides the threshold (default 8) for tuning.
+  static const unsigned htp_fc_min_m = []() {
+    const char *e = std::getenv("NNTR_HTP_FC_MIN_M");
+    return (e != nullptr) ? static_cast<unsigned>(std::atoi(e)) : 8u;
+  }();
+  // N and K must both be 32-aligned: shgemm_u8i4 pads the weight to full
+  // ceil(N/32)*ceil(K/32) HMX tiles and rm_to_wh_i4 tiles by 32, so an unaligned
+  // K would contract a 32-padded weight against K real activation columns. All
+  // current gemma/qwen FC dims are multiples of 32; anything else falls back to
+  // the CPU KleidiAI path below.
+  auto *o = getOps();
+  if (o->supports_shgemm_u8i4() && (N % 32) == 0 && (K % 32) == 0 &&
+      M >= htp_fc_min_m) {
+    o->shgemm_u8i4(0, M, N, K, static_cast<const float *>(getData()), K,
+                   input.getData<uint8_t>(), input.getScale<float>(), nullptr,
+                   output.getData<float>(), N);
+    return output;
+  }
+
+#if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
+  defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
+  defined(_M_ARM64)
+  float *lhs = (float *)getData();
+  char *rhs = input.getPackedData<char>();
+  float *out = output.getData<float>();
+
+  /**
+   * @note INT4 weight gemm for CPU
+   * As of now, QINT4 tensor denotes per channel quantization with group
+   * length 32. But it will be a tensor for kleidiai only format.
+   * Below code assumes that weight tensor is quantized in qs4cx and unpacked.
+   * @todo rewrite QINT4 tensor and below code
+   */
+
+  /**
+   * GEMV
+   * matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod
+   * GEMM
+   * matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm
+   * @todo update kernel index for SVE, SME
+   */
+  size_t opt_kernel_idx = (M == 1) ? 2 : 8;
+
+  gemm_qai8dxp_qsi4cxp(M, N, K, lhs, rhs, out, opt_kernel_idx);
+#elif defined(__x86_64__) || defined(__i586__) || defined(_M_X64) ||           \
+  defined(_M_IX86)
+
+  float *lhs = (float *)getData();
+  char *rhs = input.getData<char>();
+  float *scale = input.getScale();
+  float *out = output.getData<float>();
+
+  size_t opt_kernel_idx = 0; // unused
+
+  gemm_qai8dxp_qsi4cxp_rhs_unpacked(M, N, K, lhs, rhs, scale, out,
+                                    opt_kernel_idx, true);
+#endif
 
   return output;
 }
@@ -1247,9 +1323,13 @@ Tensor &FloatTensor::transpose(const std::string &direction,
       }
     } else {
       if (is_format_nchw) {
+        // transpose is not a GPU-accelerated ComputeOp: on the GPU build
+        // getOps() is ClComputeOps (accel-only) and would throw NI. Use the
+        // per-backend free function directly (CpuComputeOps::transpose_matrix_fp32
+        // forwards to the same impl, so CPU behavior is unchanged).
         for (unsigned int b = 0; b < batch(); ++b) {
           for (unsigned int c = 0; c < channel(); ++c) {
-            getOps()->transpose_matrix_fp32(
+            nntrainer::transpose_matrix(
               height(), width(), (float *)getData() + getIndex(b, c, 0, 0),
               width(), (float *)output.getData() + output.getIndex(b, c, 0, 0),
               output.width());

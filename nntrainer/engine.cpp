@@ -11,6 +11,7 @@
  * @bug    No known bugs except for NYI items
  *
  */
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -24,6 +25,14 @@
 #include <dynamic_library_loader.h>
 #include <engine.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context.h>
+#endif
+
+#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
+#include <htp_context.h>
+#endif
+
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
 static const std::string func_tag = "[Engine] ";
@@ -36,6 +45,15 @@ std::once_flag global_engine_init_flag;
 
 nntrainer::Context
   *Engine::nntrainerRegisteredContext[Engine::RegisterContextMax];
+
+Engine &Engine::Global() {
+  // Single definition in libnntrainer.so → one Engine instance shared by every
+  // consumer .so (see declaration in engine.h). initializeOnce() registers the
+  // default contexts (cpu/gpu, and qnn when ENABLE_NPU) exactly once.
+  static Engine instance;
+  instance.initializeOnce();
+  return instance;
+}
 
 void Engine::add_default_object() {
   /// @note all layers should be added to the app_context to guarantee that
@@ -55,11 +73,59 @@ void Engine::add_default_object() {
   registerContext("gpu", &cl_context);
 #endif
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Additive NVIDIA CUDA backend, registered alongside (not replacing) the
+  // OpenCL "gpu" context. Selected at runtime via engine=cuda.
+  //
+  // Runtime-gated on NNTR_ENGINE=cuda (exact-match, same read as
+  // causallm_engine()): constructing CudaContext retains a real CUDA primary
+  // context (cuInit + device retain) and on Windows preloads the delay-loaded
+  // cuBLAS/cublasLt/NVRTC images (cuda_context_manager.cpp) — on a unified
+  // CUDA+OpenCL binary that cost lands on every cpu/OpenCL run too (~170MB
+  // host WS). Unregistered "cuda" falls back to cpu in parseComputeEngine,
+  // so CUDA runs must set NNTR_ENGINE=cuda (run_llm.ps1 and SFlareApi do).
+  // NNTR_CUDA_EAGER_CTX=1 restores the old unconditional bring-up for A/B.
+  {
+    const char *eng_env = std::getenv("NNTR_ENGINE");
+    const char *eager_env = std::getenv("NNTR_CUDA_EAGER_CTX");
+    const bool want_cuda = eng_env != nullptr && std::string(eng_env) == "cuda";
+    const bool eager_ctx = eager_env != nullptr && eager_env[0] != '0';
+    if (want_cuda || eager_ctx) {
+      auto &cuda_context = nntrainer::CudaContext::Global();
+
+      registerContext("cuda", &cuda_context);
+    } else {
+      ml_logi("CUDA backend compiled in but not brought up "
+              "(NNTR_ENGINE!=cuda); engine=cuda layers fall back to cpu.");
+    }
+  }
+#endif
+
+#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
+  // Additive HexKL/HTP NPU backend (Hexagon HMX), registered alongside the
+  // others; selected at runtime via engine=htp. HtpContext::initialize()
+  // degrades to plain CPU ops when the NPU/skel is unavailable, so engine=htp
+  // never aborts on a non-HTP device.
+  auto &htp_context = nntrainer::HtpContext::Global();
+
+  registerContext("htp", &htp_context);
+#endif
+
 #if defined(ENABLE_NPU) && ENABLE_NPU == 1
   // QNN context is loaded as a plugin .so for decoupling from QNN SDK.
   // libqnn_context.so exports ml_train_context_pluggable symbol.
   try {
     registerContext("libqnn_context.so", "");
+    // [T13] Map the user-facing engine name "npu" to the QNN context. The QNN
+    // backend keeps getName()=="qnn" (used internally by neuralnet /
+    // QNNGraph / memory_pool getRegisteredContext("qnn")), so alias the same
+    // context pointer under "npu" — engine=npu now selects the QNN backend
+    // instead of silently falling back to "cpu". The qnn_graph fat-node
+    // (registered on the qnn context) loads the offline QNN binary (Mode-1
+    // whole-graph offload); any layer not registered on the qnn context falls
+    // back per-layer to the cpu context. When ENABLE_NPU is off (e.g. x86),
+    // "npu" is unregistered and parseComputeEngine falls back to "cpu".
+    registerContext("npu", getRegisteredContext("qnn"));
   } catch (std::exception &e) {
     ml_logw("QNN context plugin not available: %s", e.what());
   }
@@ -84,15 +150,17 @@ Engine::parseComputeEngine(const std::vector<std::string> &props) const {
     std::string key, value;
     int status = nntrainer::getKeyValue(prop, key, value);
     if (nntrainer::istrequal(key, "engine")) {
-      constexpr const auto data =
-        std::data(props::ComputeEngineTypeInfo::EnumList);
-      for (unsigned int i = 0;
-           i < props::ComputeEngineTypeInfo::EnumList.size(); ++i) {
-        if (nntrainer::istrequal(value.c_str(),
-                                 props::ComputeEngineTypeInfo::EnumStr[i])) {
-          return props::ComputeEngineTypeInfo::EnumStr[i];
-        }
-      }
+      // Validate against the LIVE registered-context name set, not the closed
+      // LayerComputeEngine enum + string list. A vendor backend that
+      // self-registers a Context (e.g. "npu", "exynos") then resolves with no
+      // enum edit; an unknown/unavailable engine falls back to "cpu" instead of
+      // resolving to a name that getRegisteredContext would later reject.
+      // [docs/ARCHITECTURE_REFACTOR.md §10 T3]
+      std::string name = value;
+      std::transform(name.begin(), name.end(), name.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (engines.find(name) != engines.end())
+        return name;
     }
   }
 
@@ -180,6 +248,16 @@ int Engine::registerContext(const std::string &library_path,
   auto type = context->getName();
   NNTR_THROW_IF_CLEANUP(type == "", std::invalid_argument, close_dl)
     << func_tag << "custom layer must specify type name, but it is empty";
+
+  // If this type is already registered (e.g. called again for a second
+  // sub-model in a multi-model handle), free the newly-created context
+  // immediately rather than leaking it. The name-based overload is the
+  // authoritative synchronized check; this is just an early-exit path.
+  if (engines.find(type) != engines.end()) {
+    pluggable->destroyfunc(context);
+    DynamicLibraryLoader::freeLibrary(handle);
+    return 0;
+  }
 
   registerContext(type, context);
 

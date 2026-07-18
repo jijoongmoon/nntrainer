@@ -34,23 +34,10 @@ static inline T resolveSymbol(void *libHandle, const char *sym) {
 
 QNNRpcManager::QNNRpcManager() {
 #ifdef ENABLE_QNN
-  // load libcdsprpc.so
-  void *libCdspHandle = pal::dynamicloading::dlOpen(
-    "libcdsprpc.so",
-    pal::dynamicloading::DL_NOW | pal::dynamicloading::DL_LOCAL);
-  if (nullptr == libCdspHandle) {
-    ml_loge("dlopen libcdsprpc.so failed");
-    exit(-1);
-  }
-
-  rpcmem_alloc = (RpcMemAllocFn_t)dlsym(libCdspHandle, "rpcmem_alloc");
-  rpcmem_free = (RpcMemFreeFn_t)dlsym(libCdspHandle, "rpcmem_free");
-  rpcmem_to_fd = (RpcMemToFdFn_t)dlsym(libCdspHandle, "rpcmem_to_fd");
-
-  if (nullptr == rpcmem_alloc || nullptr == rpcmem_free ||
-      nullptr == rpcmem_to_fd) {
-    dlclose(libCdspHandle);
-    ml_loge("dlsym failed");
+  // libcdsprpc.so / rpcmem_* are loaded once by the shared RpcMem singleton
+  // (see qnn/jni/rpc_mem.h); fail fast here if it could not be resolved.
+  if (!RpcMem::global().valid()) {
+    ml_loge("RpcMem (libcdsprpc.so) is not available");
     exit(-1);
   }
 #endif
@@ -81,17 +68,15 @@ QNNRpcManager::QNNRpcManager() {
 
 QNNRpcManager::~QNNRpcManager() {
 #ifdef ENABLE_QNN
-  // Deregister + free each entry. The map itself is destroyed when this
-  // object dies, so we must NOT erase entries while iterating (range-for
-  // would invalidate the iterator on erase) — just leave the map intact
-  // and let it deallocate normally.
   for (auto &mem : ptrToFdAndMemHandleMap_) {
     Qnn_ErrorHandle_t deregisterRet =
       qnnInterface_.memDeRegister(&mem.second.second.second, 1);
     if (QNN_SUCCESS != deregisterRet) {
+      // handle errors
       ml_loge("qnnInterface_.memDeRegister failed");
     }
-    rpcmem_free(mem.first);
+    RpcMem::global().free(mem.first);
+    ptrToFdAndMemHandleMap_.erase(mem.first);
   }
 #endif
 }
@@ -102,11 +87,9 @@ void QNNRpcManager::alloc(void **ptr, size_t size, size_t alignment) {
   std::cout << "QNN alloc size: " << size << std::endl;
 #endif
 #ifdef ENABLE_QNN
-#define RPCMEM_HEAP_ID_SYSTEM 25
-#define RPCMEM_DEFAULT_FLAGS 1
   // Allocate the shared buffer
-  uint8_t *memPointer =
-    (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
+  uint8_t *memPointer = (uint8_t *)RpcMem::global().alloc(
+    kRpcMemHeapIdSystem, kRpcMemDefaultFlags, static_cast<int>(size));
   if (nullptr == memPointer) {
     ml_loge("rpcmem_alloc failed");
     exit(-1);
@@ -150,7 +133,7 @@ void QNNRpcManager::registerQnnTensor(void *ptr, Qnn_Tensor_t &qnnTensor,
   }
 
   auto start = std::chrono::system_clock::now();
-  int memFd = rpcmem_to_fd(ptr);
+  int memFd = RpcMem::global().to_fd(ptr);
   auto end = std::chrono::system_clock::now();
 
   std::chrono::duration<double> elapsed_seconds = end - start;
@@ -220,7 +203,7 @@ void QNNRpcManager::free(void *ptr) {
     }
     ptrToFdAndMemHandleMap_.erase(it);
   }
-  rpcmem_free(ptr);
+  RpcMem::global().free(ptr);
 #else
   free(ptr);
 #endif

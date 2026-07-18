@@ -558,7 +558,7 @@ private:
                             bool trans_in, float beta) const;
 
   /**
-   * @brief Float.dot(Q4K/Q6K)
+   * @brief Float.dot(Q40/Q4K/Q6K)
    * @return Tensor& reference to the output tensor
    */
   Tensor &dotQnK(Tensor const &input, Tensor &output, bool trans, bool trans_in,
@@ -570,6 +570,13 @@ private:
    */
   Tensor &dotQInteger(Tensor const &input, Tensor &output, bool trans,
                       bool trans_in, float beta, Tdatatype dtype) const;
+
+  /**
+   * @brief Float.dot(QS4CX)
+   * @return Tensor& reference to the output tensor
+   */
+  Tensor &dotQs4cx(Tensor const &input, Tensor &output, bool trans,
+                   bool trans_in, float beta, Tdatatype dtype) const;
 };
 
 } // namespace nntrainer

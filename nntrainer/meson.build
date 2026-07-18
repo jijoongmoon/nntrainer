@@ -35,6 +35,15 @@ nntrainer_base_deps=[
 
 if get_option('enable-opencl')
   nntrainer_base_deps += clblast_dep
+  nntrainer_base_deps += opencl_loader_dep
+endif
+
+if get_option('enable-cuda')
+  nntrainer_base_deps += cuda_dep
+endif
+
+if get_option('enable-htp')
+  nntrainer_base_deps += hexkl_dep
 endif
 
 if get_option('platform') == 'tizen'
@@ -50,6 +59,7 @@ nntrainer_elements = [
   'optimizers',
   'tensor',
   'utils',
+  'utils/ddtree',
   'graph'
 ]
 
@@ -58,6 +68,11 @@ if get_option('enable-opencl')
   nntrainer_elements += 'layers/cl_layers'
 
   nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
+endif
+
+if get_option('enable-cuda')
+  nntrainer_elements += 'cuda'
+  nntrainer_elements += 'layers/cuda_layers'
 endif
 
 if get_option('enable-npu')
@@ -86,7 +101,7 @@ nntrainer_common_sources = [
 # and loaded dynamically by Engine. See qnn/jni/meson.build for the
 # shared_library target. The header is still needed for type definitions.
 if get_option('enable-npu')
-  nntrainer_headers += meson.current_source_dir() / 'qnn_context.h'
+  nntrainer_headers += meson.current_source_dir() / 'qnn' / 'qnn_context.h'
 endif
 
 nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'ruy'
@@ -96,6 +111,19 @@ if get_option('enable-opencl')
   nntrainer_headers += meson.current_source_dir() / 'cl_svm_allocator.h'
   nntrainer_common_sources += 'cl_context.cpp'
   nntrainer_common_sources += 'cl_svm_allocator.cpp'
+endif
+
+if get_option('enable-cuda')
+  nntrainer_headers += meson.current_source_dir() / 'cuda_context.h'
+  nntrainer_headers += meson.current_source_dir() / 'cuda_mem_allocator.h'
+  nntrainer_headers += meson.current_source_dir() / 'layers' / 'cuda_layers' / 'cuda_rmsnorm_layer.h'
+  nntrainer_common_sources += 'cuda_context.cpp'
+  nntrainer_common_sources += 'cuda_mem_allocator.cpp'
+endif
+
+if get_option('enable-htp')
+  nntrainer_headers += meson.current_source_dir() / 'htp_context.h'
+  nntrainer_common_sources += 'htp_context.cpp'
 endif
 
 foreach s : nntrainer_common_sources

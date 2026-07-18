@@ -11,6 +11,12 @@ cl_op_kernels = [
   'int4_gemv.cl',
   'int4_quantize_input.cl',
   'int4_gemm.cl',
+  'int8_int4_gemm_v8c.cl',
+  'int8_int8_gemm_xmx.cl',
+  'fused_qkv_rope.cl',
+  'fused_rmsnorm_quant.cl',
+  'two_conv_attention.cl',
+  'flash_attention.cl',
   'q4_0_ab_bi_8x4.cl',
   'q6_k_sgemv.cl',
   'restore_block_q4_0.cl',
@@ -24,6 +30,9 @@ cl_op_kernels = [
   'sgemv.cl',
   'sscal.cl',
   'swiglu.cl',
+  'geglu.cl',
+  'sigmoid_glu.cl',
+  'sigmoid_add.cl',
   'transpose_16bit.cl',
   'transpose_32bit_16bit.cl',
   'transpose_axis_0.cl',
@@ -49,6 +58,9 @@ if get_option('enable-fp16')
     'rmsnorm_fp16.cl',
     'rotary_emb_fp16.cl',
     'swiglu_fp16.cl',
+    'geglu_fp16.cl',
+    'sigmoid_glu_fp16.cl',
+    'sigmoid_add_fp16.cl',
     'transpose_axis_0_fp16.cl',
     'transpose_axis_1_fp16.cl',
     'transpose_axis_2_fp16.cl',
@@ -85,7 +97,12 @@ foreach k : cl_op_kernels
 
   # source.full_path() does not work: https://github.com/mesonbuild/meson/issues/5273#issuecomment-1851811417
   # can be used when meson is upgraded to 1.4.0
-  nntrainer_headers += meson.current_build_dir() / basename + '.h'
+  # NOTE: the generated per-kernel string headers (e.g. swiglu.h, geglu.h) are
+  # INTERNAL to libnntrainer (consumed by the *.cpp below via the build-dir
+  # include path). They are intentionally NOT added to nntrainer_headers, i.e.
+  # not installed: installing them into <prefix>/include/nntrainer shadows
+  # app-side layer headers of the same name (CausalLM's swiglu.h = SwiGLULayer),
+  # breaking the app build. Only the generated .cpp goes into nntrainer_sources.
   nntrainer_sources += meson.current_build_dir() / basename + '.cpp'
 
   all_includes += f'#include "@basename@.h"\n'
@@ -95,7 +112,6 @@ configure_file(
   output: 'cl_kernels.h',
   configuration: {'includes': all_includes},
 )
-nntrainer_headers += meson.current_build_dir() / 'cl_kernels.h'
 
 nntrainer_inc += include_directories('..')
 nntrainer_inc_abs += meson.current_build_dir() / '..'

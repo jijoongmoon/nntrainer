@@ -34,12 +34,17 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <context.h> // nntrainer::ModelFeatures (T11)
+#include <future> // async tokenizer load (round-13 init overlap)
 #include <layer.h>
 #include <map>
 #include <model.h>
+#include <mutex>
 #include <random>
+#include <stdexcept>
 #include <tensor_api.h>
 #include <utility>
+#include <vector>
 
 #include <limits.h>
 
@@ -64,6 +69,45 @@ using json = nlohmann::json;
 enum class ModelType { MODEL, CAUSALLM, EMBEDDING, UNKNOWN };
 
 /**
+ * @brief {data, size} pointer pair produced/consumed by multimodal vision
+ *        models. The buffer is heap-allocated by the producer (run_image) and
+ *        ownership transfers to the caller.
+ */
+using multimodal_pointer = std::pair<void *, size_t>;
+
+/**
+ * @brief Non-owning logits processor hook for token generation
+ */
+class LogitsProcessor {
+public:
+  /**
+   * @brief Destroy the LogitsProcessor object
+   */
+  virtual ~LogitsProcessor() = default;
+
+  /**
+   * @brief Mutate one batch row of logits before token selection
+   * @param logits FP32 logits for a single batch row
+   * @param vocab_size Number of logits in the row
+   * @param batch_index Batch row index
+   */
+  virtual void process(float *logits, unsigned int vocab_size,
+                       unsigned int batch_index) = 0;
+
+  /**
+   * @brief Receive the selected token after token selection
+   * @param token_id Selected token id
+   * @param batch_index Batch row index
+   */
+  virtual void acceptToken(unsigned int token_id, unsigned int batch_index) = 0;
+
+  /**
+   * @brief Reset processor state when requested by the caller
+   */
+  virtual void reset() {}
+};
+
+/**
  * @brief Transformer Class
  */
 WIN_EXPORT class Transformer {
@@ -78,6 +122,13 @@ public:
    */
   Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
               ModelType model_type = ModelType::MODEL);
+
+  /**
+   * @brief Empty constructor for Transformer.
+   * @brief Child Class Needs to implement all features of the original
+   * Transformer constructor
+   */
+  Transformer() {}
 
   /**
    * @brief Destroy the Transformer object
@@ -95,21 +146,29 @@ public:
   virtual void load_weight(const std::string &weight_path);
 
   /**
+   * @brief Repack all QS4CX weights after loading
+   * @note Must be called after load_weight() for QS4CX quantized tensors
+   * @note Prepares weights for efficient computation by eagerly packing them
+   */
+  virtual void repack_weight();
+
+  /**
    * @brief Save the weight to a file
    */
   virtual void save_weight(const std::string &weight_path);
-
   /**
    * @brief Save the weight to a file with type conversion
    * @param weight_path Path to save the weight file
    * @param dtype Global target data type for all layers (NONE = keep original)
    * @param layer_dtype_map Per-layer data type overrides (layer_name -> dtype)
+   * @param target_isa Target ISA for quantization (default: DEFAULT)
    */
   virtual void
   save_weight(const std::string &weight_path,
               ml::train::TensorDim::DataType dtype,
               const std::map<std::string, ml::train::TensorDim::DataType>
-                &layer_dtype_map = {});
+                &layer_dtype_map = {},
+              ml::train::ISA target_isa = ml::train::ISA::DEFAULT);
 
   /**
    * @brief run the Transformer model
@@ -117,6 +176,63 @@ public:
   virtual void run(const WSTR prompt, bool do_sample = false,
                    const WSTR system_prompt = WSTR(),
                    const WSTR tail_prompt = WSTR(), bool log_output = true);
+
+  // ── Multimodal composition interface (model-agnostic) ──────────────────
+  // Lets a generic composer drive any [vision producer, LLM consumer] pair
+  // through base pointers, without knowing the concrete model type.
+  // Default implementations mean "this role is not supported by this model".
+
+  /** Embedding-CONSUMER (LLM): bytes of one token embedding (0 ⇒ no table). */
+  virtual size_t embeddingBytesPerToken() const { return 0; }
+
+  /** Embedding-CONSUMER (LLM): embedding of @p token_id, or nullptr. */
+  virtual const void *lookupEmbedding(int token_id) const {
+    (void)token_id;
+    return nullptr;
+  }
+
+  /** Embedding-CONSUMER (LLM): (scale, offset) of the embedding quant space. */
+  virtual std::pair<float, int> get_embedding_info() { return {1.0f, 0}; }
+
+  /** Embedding-CONSUMER (LLM): run generation from precomputed embeddings. */
+  virtual void run_with_embeddings(const void *prefill_embeds, size_t n_tokens,
+                                   std::vector<int> seed_tokens, bool do_sample,
+                                   bool log_output) {
+    (void)prefill_embeds;
+    (void)n_tokens;
+    (void)seed_tokens;
+    (void)do_sample;
+    (void)log_output;
+    throw std::runtime_error("run_with_embeddings not supported by this model");
+  }
+
+  /** Embedding-PRODUCER (vision): set the (scale, offset) it should emit in. */
+  virtual void set_quant_param(float scale, int offset) {
+    (void)scale;
+    (void)offset;
+  }
+
+  /** Embedding-PRODUCER (vision): encode an image into LLM-space embeddings.
+   *  Returns a heap buffer (caller frees) of size {bytes}; the default
+   *  {nullptr,0} means "this model is not a vision producer". */
+  virtual multimodal_pointer
+  run_image(const WSTR prompt, multimodal_pointer image, int image_height,
+            int image_width, bool do_sample = false,
+            const WSTR system_prompt = WSTR(), const WSTR tail_prompt = WSTR(),
+            bool log_output = true) {
+    (void)prompt;
+    (void)image;
+    (void)image_height;
+    (void)image_width;
+    (void)do_sample;
+    (void)system_prompt;
+    (void)tail_prompt;
+    (void)log_output;
+    return {nullptr, 0};
+  }
+
+  /** Current KV-cache length (0 if the model has no persistent KV cache). */
+  virtual int getKvLen() const { return 0; }
 
   /**
    * @brief Get TransformerPerformanceMetrics
@@ -129,6 +245,55 @@ public:
    * @brief get the status of run
    */
   bool hasRun() const { return has_run_; }
+
+  /**
+   * @brief Get configured vocabulary size
+   * @return Vocabulary size
+   */
+  unsigned int getVocabSize() const { return NUM_VOCAB; }
+
+  /**
+   * @brief Override the max number of new tokens for subsequent run() calls
+   * @param num_to_generate Max new tokens per run; must leave room within
+   *        MAX_SEQ_LEN (run() caps the prompt to MAX_SEQ_LEN - NUM_TO_GENERATE)
+   */
+  void setNumToGenerate(unsigned int num_to_generate) {
+    NUM_TO_GENERATE = static_cast<int>(num_to_generate);
+  }
+
+  /**
+   * @brief Get the configured max number of new tokens per run
+   */
+  unsigned int getNumToGenerate() const {
+    return static_cast<unsigned int>(NUM_TO_GENERATE);
+  }
+
+  /**
+   * @brief Get tokenizer owned by this model, or nullptr if no tokenizer exists
+   */
+  tokenizers::Tokenizer *getTokenizer() {
+    ensureTokenizer();
+    return tokenizer.get();
+  }
+
+  /**
+   * @brief Join the async tokenizer load (round-13 init overlap: the ~30MB
+   *        tokenizer.json parse runs on a side thread concurrent with graph
+   *        compile + weight load; call this before any direct `tokenizer`
+   *        member access). Idempotent and cheap after the first call.
+   */
+  void ensureTokenizer();
+
+  /**
+   * @brief Attach a non-owning logits processor
+   * @param processor Processor pointer, or nullptr to detach
+   */
+  virtual void setLogitsProcessor(LogitsProcessor *) {}
+
+  /**
+   * @brief Reset attached logits processor state
+   */
+  virtual void resetLogitsProcessor() {}
 
 protected:
   /**
@@ -143,6 +308,22 @@ protected:
    *         and feeding additional layers before returning.
    */
   virtual std::pair<Tensor, Tensor> constructModel();
+
+  /**
+   * @brief Build common CausalLM embedding layer properties
+   * @param name Layer name
+   * @param in_dim Vocabulary/input dimension
+   * @param out_dim Embedding output dimension
+   * @param weight_dtype Layer weight dtype
+   * @param scale Embedding scale
+   * @param quantized_lut_path Optional sidecar LUT path
+   * @return Layer property strings
+   */
+  std::vector<std::string>
+  buildEmbeddingLayerProperties(const std::string &name, unsigned int in_dim,
+                                unsigned int out_dim,
+                                const std::string &weight_dtype, float scale,
+                                const std::string &quantized_lut_path) const;
 
   /**
    * @brief Create one Transformer decoder block (norm + attention + residual +
@@ -171,6 +352,17 @@ protected:
                            Tensor input);
 
   /**
+   * @brief Declare WHAT THIS MODEL IS as a flat ModelFeatures struct (mlp kind,
+   *        q/k/v-norm, sliding window, KV-share, PLE, soft-caps, lm_head, decode
+   *        path, ...). The resolver pairs it with the backend's DeviceCaps to
+   *        produce an ExecPlan, replacing per-model-identity branching. Base
+   *        returns the defaults; each {Model}Transformer overrides it. [T11]
+   */
+  virtual nntrainer::ModelFeatures getModelFeatures() const {
+    return nntrainer::ModelFeatures{};
+  }
+
+  /**
    * @brief Create the per-layer external KV-cache placeholder Tensors that
    *        feed mha_core's input slots 3 and 4. The actual storage is owned
    *        by the host (e.g. KVCacheManager) and is bound at runtime via
@@ -190,6 +382,14 @@ protected:
   virtual void registerCustomLayers();
 
   /**
+   * @brief Get model format from weight file extension.
+   * @param weight_path Path to the weight file.
+   * @return Model format for the given file extension.
+   */
+  virtual ml::train::ModelFormat
+  formatFromExtension(const std::string &weight_path);
+
+  /**
    * @brief register Outputs
    */
   bool is_initialized = false; /**< Flag to check if the model is initialized */
@@ -197,6 +397,9 @@ protected:
 
   /** tokenizer */
   std::unique_ptr<tokenizers::Tokenizer> tokenizer;
+  std::future<std::unique_ptr<tokenizers::Tokenizer>>
+    tokenizer_future_;          /**< async load; joined by ensureTokenizer */
+  std::mutex tokenizer_join_mtx_; /**< ensureTokenizer idempotence guard */
 
   unsigned int NUM_VOCAB;
   int DIM;
@@ -212,6 +415,21 @@ protected:
   std::string MODEL_TENSOR_TYPE;
   std::string EMBEDDING_DTYPE; /** embedding dtype */
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
+  std::string EMBEDDING_FILE_NAME;
+  std::string PLE_FILE_NAME;
+  /** nntr_quantize --ple_sidecar / --embd_sidecar: save() writes the table to
+   *  these paths instead of the model file (extraction-time keys, not runtime
+   *  ones) */
+  std::string PLE_SIDECAR_EXPORT;
+  std::string EMBD_SIDECAR_EXPORT;
+  /** untie lm_head from the input embedding (separate FC weight, not shared
+   *  with the embedding table). Lives here (not CausalLM) because embedding0's
+   *  layer-type choice — tied TieWordEmbedding vs untied embedding_layer —
+   *  happens in <model>Transformer::constructModel scope. A dedicated flag
+   *  (not derived from LMHEAD_DTYPE) so the quantizer builds the same untied
+   *  graph from FP32 source weights while the dtype map quantizes
+   *  output_of_causallm on save. */
+  bool LMHEAD_UNTIE = false;
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;
@@ -227,6 +445,11 @@ protected:
   unsigned int FSU_LOOKAHEAD;
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
+  bool USE_FLASH_ATTENTION = true; /**< Enable flash GEMM attention path for
+                                        prefill (decode always uses the
+                                        per-row dot path). Defaults to true;
+                                        read from nntr_config.json key
+                                        "use_flash_attention". */
 
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;

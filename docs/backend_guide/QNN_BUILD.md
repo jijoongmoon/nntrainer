@@ -8,16 +8,25 @@ The Qualcomm QNN SDK itself is **proprietary** ("Confidential and
 Proprietary - Qualcomm Technologies, Inc."). It cannot be redistributed
 inside this repository. nntrainer therefore follows the standard
 **bring-your-own-SDK** pattern used by CUDA, ROCm, and oneAPI: the user
-installs the SDK locally and points the build at it via a meson option.
+installs the SDK locally and points the build at it.
 
-This document describes how to do that.
+The SDK headers and compatibility shims needed at compile time are
+**not** committed under `nntrainer/qnn/jni/vendor/`. That directory is
+gitignored and is **auto-generated at `meson setup` time** by the script
+`nntrainer/qnn/jni/tools/update_qnn_version.py`, which copies the
+required files out of the locally-installed SDK and applies a small
+set of compatibility patches. You do not need to run the script by hand
+in the normal build flow.
+
+This document describes how to install the SDK and wire it into the
+build.
 
 ## 1. Obtain the QNN SDK
 
 The SDK is distributed by Qualcomm via the *Qualcomm Software Center* /
 *Qualcomm Package Manager*:
 
-  https://qpm.qualcomm.com/
+  https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk
 
 Search for **Qualcomm AI Engine Direct SDK** (a.k.a. QNN SDK). Download
 requires a (free) Qualcomm developer account and acceptance of
@@ -27,15 +36,21 @@ Qualcomm's license terms.
 
 nntrainer's QNN backend has been verified against:
 
-| QNN SDK    | Status |
-| ---------- | ------ |
-| 2.20.x     | OK     |
-| 2.22.x     | OK     |
-| 2.24.x     | OK     |
+| QNN SDK package | QNN API version | Status |
+| --------------- | --------------- | ------ |
+| 2.47.0          | 2.36.0          | OK     |
 
-Older 1.x SDKs and 2.10-2.18 use a different op-package layout and are
-not supported. Newer 2.x releases generally work but are
-unverified — please report regressions.
+> **API-version pin:** the build is gated on **QNN API version 2.36**
+> (i.e. `QNN_API_VERSION_MINOR == 36`). The `update_qnn_version.py`
+> script asserts this at configure time and fails with a clear message
+> if the installed SDK ships a different API version. The SDK *package*
+> version string (2.47.x) may vary across patch releases while the API
+> version remains 2.36; what matters for compatibility is the API
+> version, not the package string.
+
+Older 1.x SDKs and SDKs shipping a QNN API version other than 2.36 are
+not supported. Newer SDK packages that retain QNN API 2.36 should work;
+please report regressions if you encounter them.
 
 ## 2. Extract the SDK
 
@@ -60,28 +75,47 @@ runtime — see §5.
 
 ## 3. Configure the build
 
-Pass the SDK root via `-Dqnn-sdk-root` together with `-Denable-npu=true`:
+The SDK root can be supplied in either of two ways — the meson option
+takes priority when both are set:
+
+**Option A — meson option (recommended for reproducible CI):**
 
 ```bash
 meson setup build \
     -Denable-npu=true \
-    -Dqnn-sdk-root=/opt/qcom/aistack/qnn-2.24.0.240626
+    -Dqnn-sdk-root=/opt/qcom/aistack/qnn-2.47.0
 ninja -C build
 ```
 
-The build will validate the path early and produce a clear error if it
-is missing or not a directory:
+**Option B — environment variable (convenient for interactive dev):**
+
+```bash
+export QNN_SDK_ROOT=/opt/qcom/aistack/qnn-2.47.0
+meson setup build -Denable-npu=true
+ninja -C build
+```
+
+When `-Denable-npu=true`, `meson setup` automatically runs
+`nntrainer/qnn/jni/tools/update_qnn_version.py` to copy the required
+SDK headers and apply compatibility patches into
+`nntrainer/qnn/jni/vendor/`. This happens once at configure time; you
+do not need to run the script by hand unless you later update the SDK
+and want to refresh `vendor/` without reconfiguring from scratch.
+
+The configure step validates the SDK root early and produces a clear
+error if neither `-Dqnn-sdk-root` nor `QNN_SDK_ROOT` is set, or if the
+path does not point at a valid SDK:
 
 ```
 nntrainer/qnn/meson.build:9:0: ERROR: enable-npu=true requires
--Dqnn-sdk-root=<path-to-qcom-qnn-sdk>. Obtain the QNN SDK from
-https://qpm.qualcomm.com/ and pass its root directory. See
-docs/backend_guide/QNN_BUILD.md.
+-Dqnn-sdk-root=<path-to-qcom-qnn-sdk> or QNN_SDK_ROOT env var.
+Obtain the QNN SDK from https://qpm.qualcomm.com/ and pass its root
+directory. See docs/backend_guide/QNN_BUILD.md.
 ```
 
-When `enable-npu=false` (the default) the `qnn-sdk-root` option is
-ignored — default builds need nothing from Qualcomm and are unaffected
-by all of this.
+When `enable-npu=false` (the default) the `qnn-sdk-root` option and
+`QNN_SDK_ROOT` are both ignored — default builds need nothing from
+Qualcomm and are unaffected by all of this.
 
 ## 4. What gets built
 
@@ -123,7 +157,7 @@ At run time the QNN runtime libraries (`libQnnHtp.so`,
 `dlopen`. The simplest option is `LD_LIBRARY_PATH`:
 
 ```bash
-export LD_LIBRARY_PATH=/opt/qcom/aistack/qnn-2.24.0.240626/lib/x86_64-linux-clang:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/opt/qcom/aistack/qnn-2.47.0/lib/x86_64-linux-clang:$LD_LIBRARY_PATH
 ./build/test/unittest/unittest_nntrainer_qnn   # or any binary using the qnn ctx
 ```
 
@@ -154,9 +188,12 @@ no device), expect those tests to be skipped.
 ## 7. Troubleshooting
 
 - **`fatal error: 'QnnInterface.h' file not found`** — `qnn-sdk-root`
-  points at the wrong directory, or your SDK layout has the headers
-  somewhere unexpected. Confirm `<sdk-root>/include/QNN/QnnInterface.h`
-  exists.
+  (or `QNN_SDK_ROOT`) points at the wrong directory, the SDK root was
+  not set before `meson setup` ran, or `update_qnn_version.py` did not
+  populate `vendor/` successfully. Confirm
+  `<sdk-root>/include/QNN/QnnInterface.h` exists in the SDK, then
+  re-run `meson setup` (or run `update_qnn_version.py` directly) to
+  re-generate `nntrainer/qnn/jni/vendor/`.
 - **`undefined reference to QnnInterface_getProviders`** — the QNN
   runtime is `dlopen`'d, not link-time linked, so this should not
   occur during build. If it does, the build is mis-configured: file
@@ -166,11 +203,19 @@ no device), expect those tests to be skipped.
 - **Wrong HTP architecture stub** (`HtpV68Stub` vs `HtpV73Stub` etc.) —
   pick the stub matching your SoC. The QNN SDK README has a table.
 
-## 8. Why this is not a git submodule
+## 8. Why the SDK is not committed to this repository
 
-The QNN SDK has no public git mirror. Qualcomm distributes it
-exclusively through the Software Center as versioned tarballs that
-require accepting a license. A submodule would either point at
-nothing (no public URL) or at a private mirror that most contributors
-cannot access. The BYO-SDK pattern matches the precedent set by
-CUDA / ROCm / oneAPI for the same reason.
+The QNN SDK is "Confidential and Proprietary - Qualcomm Technologies,
+Inc." and cannot be redistributed. Qualcomm distributes it exclusively
+through the Software Center as versioned tarballs that require a free
+developer account and license acceptance — there is no public git
+mirror. Committing the SDK headers directly (or as a submodule pointing
+at a private mirror) would either violate Qualcomm's license or prevent
+most contributors from accessing the repo at all.
+
+The auto-generation approach (`vendor/` is gitignored; populated at
+configure time by `update_qnn_version.py`) keeps proprietary code off
+the repository while still giving every developer a reproducible,
+patch-applied copy of the headers the moment they run `meson setup`.
+This is the same BYO-SDK rationale used by CUDA / ROCm / oneAPI
+backends in this and other open-source ML frameworks.
