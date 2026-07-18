@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 
 #include <llm_util.hpp>
@@ -26,6 +27,7 @@ void Qwen25OmniToken2Wav::setupParameters(json &cfg, json &generation_cfg,
   (void)generation_cfg;
   BATCH_SIZE = 1;
   MODEL_TENSOR_TYPE = nntr_cfg.value("model_tensor_type", "FP32-FP32");
+  noise_seed = nntr_cfg.value("noise_seed", 0);
 
   // sub-configs: use "dit_config"/"bigvgan_config" sub-objects when present,
   // else the wrapper's own cfg (the confirmed class defaults cover the rest).
@@ -53,6 +55,7 @@ void Qwen25OmniToken2Wav::load_weight(const std::string &weight_path) {
   const auto slash = weight_path.find_last_of("/\\");
   const std::string dir =
     slash == std::string::npos ? "." : weight_path.substr(0, slash);
+  model_dir_ = dir;
   dit->load_weight(dir + "/dit.bin");
   vgan->load_weight(dir + "/bigvgan.bin");
   // ECAPA weights are optional: without them run() falls back to injected
@@ -73,6 +76,52 @@ Qwen25OmniToken2Wav::synthesize(const std::vector<int32_t> &codes,
   std::vector<float> mel =
     dit->generate_mel(codes.data(), ecapa_pos, ecapa_neg, spk, noise);
   return vgan->vocode(mel.data(), seq); // vocode ensure_frames(seq) itself
+}
+
+std::vector<float>
+Qwen25OmniToken2Wav::speak(const std::vector<int32_t> &codes) {
+  if (!is_initialized)
+    throw std::runtime_error("Token2Wav is not initialized.");
+  if (!ecapa.loaded())
+    throw std::runtime_error("speak() needs ecapa.bin in " + model_dir_);
+
+  auto read_all_f32 = [&](const std::string &name) {
+    std::ifstream f(model_dir_ + "/" + name,
+                    std::ios::binary | std::ios::ate);
+    if (!f)
+      throw std::runtime_error("speak() needs " + model_dir_ + "/" + name +
+                               " (emit with token2wav_dit_converter.py)");
+    const auto bytes = static_cast<size_t>(f.tellg());
+    std::vector<float> v(bytes / sizeof(float));
+    f.seekg(0);
+    f.read(reinterpret_cast<char *>(v.data()),
+           static_cast<std::streamsize>(bytes));
+    return v;
+  };
+
+  const std::vector<float> ref_mel = read_all_f32("ref_mel.bin"); // [T*80]
+  if (ref_mel.empty() || ref_mel.size() % 80 != 0)
+    throw std::runtime_error("bad ref_mel.bin size");
+  const unsigned int ref_T = static_cast<unsigned int>(ref_mel.size() / 80);
+  const std::vector<float> spk = read_all_f32("spk.bin"); // [192]
+  if (spk.size() != 192)
+    throw std::runtime_error("bad spk.bin size");
+
+  const std::vector<float> ecapa_pos = ecapa.forward(ref_mel.data(), ref_T);
+  const std::vector<float> zeros(static_cast<size_t>(ref_T) * 80, 0.0f);
+  const std::vector<float> ecapa_neg = ecapa.forward(zeros.data(), ref_T);
+
+  // flow-matching start state: standard Gaussian. Deterministic per seed but
+  // NOT the HF noise stream — reference comparisons must inject noise.bin.
+  const size_t n = static_cast<size_t>(2) * codes.size() * 80;
+  std::mt19937 rng(noise_seed);
+  std::normal_distribution<float> gauss(0.0f, 1.0f);
+  std::vector<float> noise(n);
+  for (auto &v : noise)
+    v = gauss(rng);
+
+  return synthesize(codes, ecapa_pos.data(), ecapa_neg.data(), spk.data(),
+                    noise.data());
 }
 
 void Qwen25OmniToken2Wav::run(const WSTR prompt, bool do_sample,

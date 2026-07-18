@@ -117,6 +117,11 @@ private:
   std::unique_ptr<ThinkerForCapture> thinker;
   std::string thinker_model_path;
   std::string thinker_nntr_config;
+  std::string token2wav_model_path; /**< when set, chain codes -> speech.wav */
+  std::string speech_output;        /**< wav path for the chained synthesis */
+
+  /** @brief Synthesize `codes` via Qwen25OmniToken2Wav (strips eos/pad). */
+  void speakCodes(const std::vector<unsigned int> &codes, bool log_output);
 
   Tensor mrope_cos_t, mrope_sin_t;         /**< symbolic side inputs */
   std::vector<float> mrope_cos, mrope_sin; /**< [MAX_SEQ_LEN * HEAD_DIM] */

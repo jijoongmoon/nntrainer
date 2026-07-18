@@ -74,6 +74,15 @@ public:
                                 const float *ecapa_pos, const float *ecapa_neg,
                                 const float *spk, const float *noise);
 
+  /**
+   * @brief Self-contained synthesis from the MODEL-DIR speaker assets
+   *        (ref_mel.bin + spk.bin, emitted by the DiT converter) and
+   *        mt19937(noise_seed) Gaussian noise. Requires ecapa.bin.
+   *        NOT bit-matched to HF (noise differs); use run()'s noise.bin
+   *        injection path for reference comparisons.
+   */
+  std::vector<float> speak(const std::vector<int32_t> &codes);
+
 protected:
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;
@@ -86,6 +95,8 @@ private:
   EcapaTdnn ecapa; /**< C++ speaker encoder (ecapa.bin, optional fallback) */
   /** sub-model configs live here: the sub-ctors keep json references */
   json dit_cfg, vgan_cfg, sub_gen, dit_nntr, vgan_nntr;
+  std::string model_dir_;   /**< set by load_weight; speak() assets live here */
+  unsigned int noise_seed = 0; /**< nntr_config "noise_seed" for speak() */
 };
 
 } // namespace causallm

@@ -31,6 +31,7 @@
 
 #include <qwen25_omni_causallm.h>
 #include <qwen25_omni_talker_causallm.h>
+#include <qwen25_omni_token2wav.h>
 
 namespace causallm {
 
@@ -389,6 +390,9 @@ Qwen25OmniTalkerCausalLM::Qwen25OmniTalkerCausalLM(json &cfg,
   thinker_model_path = nntr_cfg.value("thinker_model_path", std::string());
   thinker_nntr_config =
     nntr_cfg.value("thinker_nntr_config", std::string("nntr_config.json"));
+  token2wav_model_path =
+    nntr_cfg.value("token2wav_model_path", std::string());
+  speech_output = nntr_cfg.value("speech_output", std::string("speech.wav"));
 }
 
 Qwen25OmniTalkerCausalLM::~Qwen25OmniTalkerCausalLM() {
@@ -672,6 +676,10 @@ void Qwen25OmniTalkerCausalLM::runEndToEnd(const std::string &prompt,
       "Team, Alibaba Group, capable of perceiving auditory and visual inputs, "
       "as well as generating text and speech.<|im_end|>\n<|im_start|>user\n" +
       prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    // the tokenizer parses on a side thread since [round-13]; join before use
+    ensureTokenizer();
+    if (!tokenizer)
+      throw std::runtime_error("end-to-end needs a tokenizer_file");
     auto enc = tokenizer->Encode(full);
     prompt_ids.assign(enc.begin(), enc.end());
     reply_ids = thinker->generateReply(prompt_ids, THINKER_MAX_NEW);
@@ -768,6 +776,39 @@ void Qwen25OmniTalkerCausalLM::runEndToEnd(const std::string &prompt,
   for (auto c : codes)
     std::cout << " " << c;
   std::cout << std::endl;
+
+  if (!token2wav_model_path.empty())
+    speakCodes(codes, log_output);
+}
+
+void Qwen25OmniTalkerCausalLM::speakCodes(
+  const std::vector<unsigned int> &codes, bool log_output) {
+  // strip the trailing eos/pad the decode loop pushes before stopping
+  std::vector<int32_t> ids;
+  ids.reserve(codes.size());
+  for (auto c : codes) {
+    if (static_cast<int>(c) == CODEC_EOS || static_cast<int>(c) == CODEC_PAD)
+      break;
+    ids.push_back(static_cast<int32_t>(c));
+  }
+  if (ids.empty()) {
+    std::cout << "[Token2Wav] no speech codes to synthesize" << std::endl;
+    return;
+  }
+
+  json t2w_cfg = LoadJsonFile(token2wav_model_path + "/config.json");
+  json t2w_gen = json::object();
+  json t2w_nntr = LoadJsonFile(token2wav_model_path + "/nntr_config.json");
+  Qwen25OmniToken2Wav t2w(t2w_cfg, t2w_gen, t2w_nntr);
+  t2w.initialize();
+  t2w.load_weight(token2wav_model_path + "/" +
+                  t2w_nntr.value("model_file_name", std::string("dit.bin")));
+
+  std::vector<float> wav = t2w.speak(ids);
+  Qwen25OmniBigVGAN::write_wav(speech_output, wav, 24000);
+  if (log_output)
+    std::cout << "[Token2Wav] wrote " << wav.size() << " samples ("
+              << ids.size() << " codes) to " << speech_output << std::endl;
 }
 
 void Qwen25OmniTalkerCausalLM::run(const WSTR prompt, bool do_sample,

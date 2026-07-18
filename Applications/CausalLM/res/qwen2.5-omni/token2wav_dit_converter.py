@@ -45,6 +45,8 @@ def main():
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--output_name", default="dit.bin")
+    ap.add_argument("--speaker", default="Chelsie",
+                    help="speaker assets (ref_mel.bin/spk.bin) from spk_dict.pt")
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -136,6 +138,26 @@ def main():
                 n_ecapa += 1
     assert n_ecapa == 40, n_ecapa
     print(f"wrote {ec_path}: {n_ecapa} tensors")
+
+    # speaker conditioning assets for the in-process Talker -> Token2Wav
+    # chain: raw f32 ref_mel [T,80] (ECAPA input) + spk [192] (raw speaker
+    # vector, concat'd last into the 912-wide DiT input).
+    spk_dict_path = os.path.join(model_dir, "spk_dict.pt")
+    if os.path.exists(spk_dict_path):
+        spk_dict = torch.load(spk_dict_path, map_location="cpu",
+                              weights_only=False)
+        if args.speaker in spk_dict:
+            entry = spk_dict[args.speaker]
+            ref_mel = entry["ref_mel"].to(torch.float32).numpy().reshape(-1, 80)
+            spk = entry["cond"].to(torch.float32).numpy().reshape(-1)
+            assert spk.shape == (192,), spk.shape
+            with open(os.path.join(args.output_dir, "ref_mel.bin"), "wb") as f:
+                f.write(np.ascontiguousarray(ref_mel, dtype=np.float32).tobytes())
+            with open(os.path.join(args.output_dir, "spk.bin"), "wb") as f:
+                f.write(np.ascontiguousarray(spk, dtype=np.float32).tobytes())
+            print(f"wrote speaker assets ({args.speaker}): ref_mel {ref_mel.shape}, spk {spk.shape}")
+        else:
+            print(f"speaker {args.speaker} not in spk_dict ({list(spk_dict)}); skipped")
 
     cfg = {
         "architectures": ["Qwen25OmniDiT"],
