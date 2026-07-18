@@ -299,7 +299,8 @@ Conv2DLayer::Conv2DLayer(
   padding(padding_),
   conv_props(props::FilterSize(), std::array<props::KernelSize, CONV2D_DIM>(),
              std::array<props::Stride, CONV2D_DIM>(), props::Padding2D(),
-             std::array<props::Dilation, CONV2D_DIM>()) {
+             std::array<props::Dilation, CONV2D_DIM>(),
+             props::FusedActivation()) {
   wt_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -475,6 +476,13 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
       throw std::invalid_argument("[Conv2D] adding bias failed");
     }
   }
+
+  // [T10] fused activation epilogue dispatched through the op table (backend-
+  // neutral: CPU host ActiFunc / GPU kernel). Value-identical to the standalone
+  // ActivationLayer node it replaces.
+  auto &fused_act = std::get<props::FusedActivation>(conv_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+    hidden_.getOps()->apply_activation(hidden_, (int)fused_act.get());
 }
 
 void Conv2DLayer::calcDerivative(RunLayerContext &context) {

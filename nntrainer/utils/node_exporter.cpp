@@ -119,8 +119,17 @@ void Exporter::saveTflResult(
 
 template <>
 void Exporter::saveTflResult(
-  const std::tuple<props::Unit, props::LoraRank, props::LoraAlpha> &props,
+  const std::tuple<props::Unit, props::LoraRank, props::LoraAlpha,
+                   props::FusedActivation> &props,
   const FullyConnectedLayer *self) {
+  auto &fused_activation = std::get<props::FusedActivation>(props);
+  if (!fused_activation.empty() &&
+      fused_activation.get() != ActivationType::ACT_NONE) {
+    throw exception::not_supported(
+      "Tflite export does not support a fused activation on "
+      "fully_connected; use a separate activation layer instead.");
+  }
+
   createIfNull(tf_node);
   tf_node->setOpType(tflite::BuiltinOperator_FULLY_CONNECTED);
   auto options = tflite::CreateFullyConnectedOptions(*fbb).Union();
@@ -199,8 +208,17 @@ template <>
 void Exporter::saveTflResult(
   const std::tuple<props::FilterSize, std::array<props::KernelSize, CONV2D_DIM>,
                    std::array<props::Stride, CONV2D_DIM>, props::Padding2D,
-                   std::array<props::Dilation, CONV2D_DIM>> &props,
+                   std::array<props::Dilation, CONV2D_DIM>,
+                   props::FusedActivation> &props,
   const Conv2DLayer *self) {
+  auto &fused_activation = std::get<props::FusedActivation>(props);
+  if (!fused_activation.empty() &&
+      fused_activation.get() != ActivationType::ACT_NONE) {
+    throw exception::not_supported(
+      "Tflite export does not support a fused activation on conv2d; use a "
+      "separate activation layer instead.");
+  }
+
   createIfNull(tf_node);
 
   auto weight_transform = [](std::vector<const Tensor *> &old_weights) {

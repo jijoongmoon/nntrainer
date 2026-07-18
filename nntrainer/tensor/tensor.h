@@ -2045,6 +2045,16 @@ public:
   }
 
   /**
+   * @brief Get the ComputeOps this tensor dispatches through.
+   *
+   * Priority: attached ContextData (per-vendor ops, e.g. ClComputeOps /
+   * CudaComputeOps) > the global CPU table. This is how a neutral Layer
+   * reaches the right backend's whole-op kernel without an #ifdef: e.g.
+   * `in1.getOps()->geglu(...)`. [T7]
+   */
+  ComputeOps *getOps() const { return itensor_->getOps(); }
+
+  /**
    * @brief Propagate this tensor's ContextData to a result tensor.
    *
    * Used by binary/unary ops so that subsequent calls on the result
