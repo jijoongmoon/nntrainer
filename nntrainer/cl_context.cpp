@@ -15,6 +15,7 @@
  */
 
 #include <addition_layer_cl.h>
+#include <attention_kernels.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
@@ -155,6 +156,7 @@ void ClContext::initialize() noexcept {
       const char *active_engine = std::getenv("NNTR_ENGINE");
       const bool opencl_is_active =
         (active_engine == nullptr) || std::string(active_engine) == "gpu";
+      constexpr uint32_t ADRENO_VENDOR_ID = 0x5143;
       if (opencl_is_active && caps_.vendor_id == DeviceCaps::VENDOR_INTEL) {
         // XMX/DPAS GEMM default. Gated on the DPAS-specific extension
         // (caps_.dpas), NOT the generic cl_intel_subgroups (present on every
@@ -163,24 +165,29 @@ void ClContext::initialize() noexcept {
         // at a fraction of the dp4a fallback's speed).
         if (caps_.dpas)
           setenv("NNTR_FC_XMX", "1", 0);
-          // Some Intel in-order-queue drivers do not give kernel->kernel
-          // coarse-grain SVM coherence for the v8c int8 FC GEMM (its SVM output
-          // is read stale by the next kernel), and the global NNTR_XE3_SYNC
-          // drain misses it. Drain after the FC GEMM instead
-          // (blas_kernel_interface.cpp) -- needed for small-M prefill
-          // coherence at ~negligible prefill cost. Override NNTR_XE3_FC_SYNC=0.
-          //
-          // Windows (WDDM) default-OFF: an extensive battery (cold-boot
-          // goldens, token-class A/B, long-context summarize, all with
-          // FC_SYNC=0) found no coherence failure attributable to skipping the
-          // drain there, and the drain costs ~15-25% decode on that stack.
-          // Linux keeps default-ON (the stale read reproduces there). Explicit
-          // env wins either way.
+        // GPU attention: with no host NEON on these hosts the GPU MHA path
+        // wins outright, so default it on.
+        setenv("NNTR_MHA_GPU", "1", 0);
+        // Some Intel in-order-queue drivers do not give kernel->kernel
+        // coarse-grain SVM coherence for the v8c int8 FC GEMM (its SVM output
+        // is read stale by the next kernel), and the global NNTR_XE3_SYNC
+        // drain misses it. Drain after the FC GEMM instead
+        // (blas_kernel_interface.cpp) -- needed for small-M prefill
+        // coherence at ~negligible prefill cost. Override NNTR_XE3_FC_SYNC=0.
+        //
+        // Windows (WDDM) default-OFF: an extensive battery (cold-boot goldens,
+        // token-class A/B, long-context summarize, all with FC_SYNC=0) found
+        // no coherence failure attributable to skipping the drain there, and
+        // the drain costs ~15-25% decode on that stack. Linux keeps default-ON
+        // (the stale read reproduces there). Explicit env wins either way.
 #ifdef _WIN32
         setenv("NNTR_XE3_FC_SYNC", "0", 0);
 #else
         setenv("NNTR_XE3_FC_SYNC", "1", 0);
 #endif
+      } else if (opencl_is_active && caps_.vendor_id == ADRENO_VENDOR_ID) {
+        setenv("NNTR_MHA_GPU", "1", 0);     // GPU attention
+        setenv("NNTR_KV_IMG_ATTN", "1", 0); // image2d KV/attention path
       }
     }
 
@@ -349,6 +356,25 @@ void ClContext::initAttentionClKernels() {
 
 #ifdef ENABLE_FP16
   registerClKernel(rotary_emb_fp16_kernel, "rotary_emb_cl_fp16");
+
+  // Pre-build the prefill-critical PROGRAMS at context init (model load) so
+  // their one-time build/binary-load cost does not land inside the first
+  // timed prefill. One kernel per program suffices: the program cache in
+  // clCreateKernel makes sibling kernels of the same source free. Skipped
+  // under NNTR_V8C_BUF (Intel buffer path) where these programs use
+  // different compile options -- the hot path builds them on first use as
+  // before.
+  if (std::getenv("NNTR_V8C_BUF") == nullptr) {
+    registerClKernel(two_conv_attention_kernel, "softmax_row_f16");
+    registerClKernel(int8_int4_gemm_v8c_kernel, "v8c_act_quant_f16_par");
+    // rope/scatter program (file-local source in attention_kernels.cpp).
+    attention_prewarm_programs(*this);
+    // Remaining first-use builds profiling shows inside the first prefill as
+    // one-time idle outliers: the fp16 norm program and the Q6_K lm_head
+    // GEMV program.
+    registerClKernel(rmsnorm_fp16_kernel, "rmsnorm_cl_fp16_coop");
+    registerClKernel(q6_k_sgemv_kernel, "kernel_mul_mv_q6_K_f32");
+  }
 #endif
   attention_kernels_initialized = true;
 }
