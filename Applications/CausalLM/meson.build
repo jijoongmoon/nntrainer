@@ -49,6 +49,7 @@ causallm_layer_dependencies += [
     causallm_dit_rope_dep,
     causallm_dit_modulate_dep,
     causallm_dit_gate_dep,
+    causallm_dit_attention_dep,
     causallm_vision_attention_dep,
     # scalar_multiply + logit_softcapping promoted to core libnntrainer [T12]
 ]

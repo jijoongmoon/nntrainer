@@ -117,7 +117,7 @@ causallm_scale_dep = declare_dependency(
     include_directories: causallm_layer_inc
 )
 
-foreach _dl : ['dit_rope', 'dit_modulate', 'dit_gate']
+foreach _dl : ['dit_rope', 'dit_modulate', 'dit_gate', 'dit_attention']
     _lib = shared_library(_dl + '_layer',
         [meson.current_source_dir() / (_dl + '.cpp')],
         include_directories: causallm_layer_inc,

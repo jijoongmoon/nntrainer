@@ -39,6 +39,7 @@
 #include "qwen25_omni_audio_encoder.h"
 #include "qwen25_omni_bigvgan.h"
 #include "qwen25_omni_causallm.h"
+#include "qwen25_omni_dit.h"
 #include "qwen25_omni_talker_causallm.h"
 #include "qwen25_omni_vision_causallm.h"
 #include "qwen25_omni_vision_encoder.h"
@@ -251,6 +252,11 @@ int main(int argc, char *argv[]) {
     "Qwen25OmniBigVGAN", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen25OmniBigVGAN>(
         cfg, generation_cfg, nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Qwen25OmniDiT", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen25OmniDiT>(cfg, generation_cfg,
+                                                       nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(
     "Lfm2VlVisionTransformer", [](json cfg, json generation_cfg, json nntr_cfg) {

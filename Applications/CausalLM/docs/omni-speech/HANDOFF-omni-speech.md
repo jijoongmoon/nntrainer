@@ -19,12 +19,19 @@
 Building Qwen2.5-Omni **speech output** in nntrainer. Pipeline:
 `input → Thinker(text+hidden) → Talker(codec ids) → DiT(mel) → BigVGAN(24kHz wav)`.
 
-**Thinker, Talker, BigVGAN are DONE & HF-verified. Phase 2B DiT is in progress.**
-DiT spec is CONFIRMED (`dit-2B-confirmed.md`), 3 of 4 custom layers built & compiling.
+**Thinker, Talker, BigVGAN, DiT are ALL DONE & HF-verified** (2026-07-18, machine
+nntrainer-Galaxy-Book6-Ultra, branch qwen25-omni-multimodal + gauss GPU merge):
+Stage A velocity max 1.3e-5, Stage B dit_mel max 2.9e-5 / identical stats,
+file-chained Talker→DiT→BigVGAN wav matches HF at max 2 int16 LSB (99.8% ≤1).
 
-**NEXT ACTION:** implement **`dit_attention`** (fork `vision_attention`, swap window mask for the per-layer block-diff mask), then the **`qwen25_omni_dit` model class** (host RK4/CFG + conditioning), then the **DiT converter** (after dumping the graph's actual weight order), then **Stage A/B validation** against `/tmp/omni_dit_dump`.
+**NEXT ACTION (Phase 2C productization):** ① in-process chain (a Token2Wav
+wrapper calling `Qwen25OmniDiT::generate_mel` → `Qwen25OmniBigVGAN::vocode`
+instead of the dit_mel.bin file handoff), ② port ECAPA-TDNN to C++ (bring-up
+injects `ecapa_pos/neg.bin` from the python dump; §6.1 C1, risk R3),
+③ variable-length codes (graph is compiled at SEQ=128 = 64 codes; longer
+replies need recompile-per-length or bucketing).
 
-**FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3.
+**FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3, and MIND THE transformers<5 PIN (§3.7).
 
 ---
 
@@ -35,8 +42,8 @@ DiT spec is CONFIRMED (`dit-2B-confirmed.md`), 3 of 4 custom layers built & comp
 | Thinker (text/audio/image/video → text) | DONE | `85ed8af04` | yes (see [[omni-audio-architecture]]) |
 | Talker Phase 1 (Thinker → codec ids) | DONE | `5ee53d971` | yes (127/127 codec ids exact) |
 | **Phase 2A BigVGAN** (mel → 24kHz wav) | **DONE** | `0b313ad87` (+4 below) | yes (app end-to-end, 1 int16 LSB) |
-| **Phase 2B DiT** (codec ids → mel) | **IN PROGRESS** | uncommitted | spec confirmed; not yet run |
-| Phase 2C end-to-end (Talker→DiT→BigVGAN) | not started | — | — |
+| **Phase 2B DiT** (codec ids → mel) | **DONE** | dit_attention + qwen25_omni_dit + converter (2026-07-18) | yes (Stage A 1.3e-5, Stage B 2.9e-5) |
+| Phase 2C end-to-end (Talker→DiT→BigVGAN) | file-chained wav VERIFIED (max 2 LSB); in-process wrapper + ECAPA port remain | — | yes (vs /tmp/omni_t2w_dump/wav.npy) |
 
 ## 2. Commits (this effort, newest first)
 ```
@@ -80,6 +87,20 @@ DiT spec is CONFIRMED (`dit-2B-confirmed.md`), 3 of 4 custom layers built & comp
 4. **meson regen is SLOW (~5–7 min) and looks hung** at `[0/1] Regenerating build files`. Cause: an unrelated `jni/prepare_encoder.sh` runs a **network download** (PicoGPT encoder) on every regen and fails/retries offline. This is NOT an error — be patient. It only regens when a `meson.build` changes.
 5. Model checkpoint (HF Qwen2.5-Omni-3B) local snapshot `$SNAP` above; DiT/BigVGAN weights live in `model-00003-of-00003.safetensors`; all Token2Wav tensors are **F32**.
 6. Generated model dirs under `Applications/CausalLM/models/qwen2.5-omni-3b-*/` are gitignored (bin+config); regenerate with the converters.
+7. **transformers MUST be <5 (pin 4.57.6).** transformers 5.x refactored the
+   DiT rotary to half-split `cat((freqs,freqs))` cos/sin while keeping the
+   adjacent-pair rotate — silently DIFFERENT model output (dit_mel std
+   2.376→1.641). Dumps made with 5.x are tainted references. Sanity: dit_mel
+   stats must be min −11.616 / max −0.095 / mean −3.989 / std 2.376.
+8. **rotary inv_freq must come from the CHECKPOINT** (`rotary_embed.inv_freq`,
+   bf16-rounded values like 0.75^j), NOT the 10000^(−2j/64) formula — the
+   4.4e-4 relative gap grows to 5e-2 in cos at s=127. The DiT converter emits
+   `inv_freq.bin`; `Qwen25OmniDiT::load_weight` requires it.
+9. Machine paths (Galaxy-Book6-Ultra): `SNAP=$HOME/.cache/huggingface/hub/models--Qwen--Qwen2.5-Omni-3B/snapshots/f75b40e3da2003cdd6e1829b1f420ca70797c34e`,
+   python env `~/venv-omni` (torch CPU + transformers 4.57.6), build dir
+   `build_gpu_verify` (opencl+cuda, clblast OFF). Stage prep:
+   `dit_stage_prep.py --outdir <dir>` then `NNTR_DIT_STAGEA=1 nntr_causallm
+   <dit model dir> <dir>` (Stage A) / same without env (Stage B full RK4).
 
 ---
 
