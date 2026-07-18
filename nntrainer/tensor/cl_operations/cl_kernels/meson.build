@@ -85,7 +85,12 @@ foreach k : cl_op_kernels
 
   # source.full_path() does not work: https://github.com/mesonbuild/meson/issues/5273#issuecomment-1851811417
   # can be used when meson is upgraded to 1.4.0
-  nntrainer_headers += meson.current_build_dir() / basename + '.h'
+  # NOTE: the generated per-kernel string headers (e.g. swiglu.h, geglu.h) are
+  # INTERNAL to libnntrainer (consumed by the *.cpp below via the build-dir
+  # include path). They are intentionally NOT added to nntrainer_headers, i.e.
+  # not installed: installing them into <prefix>/include/nntrainer shadows
+  # app-side layer headers of the same name (CausalLM's swiglu.h = SwiGLULayer),
+  # breaking the app build. Only the generated .cpp goes into nntrainer_sources.
   nntrainer_sources += meson.current_build_dir() / basename + '.cpp'
 
   all_includes += f'#include "@basename@.h"\n'
@@ -95,7 +100,6 @@ configure_file(
   output: 'cl_kernels.h',
   configuration: {'includes': all_includes},
 )
-nntrainer_headers += meson.current_build_dir() / 'cl_kernels.h'
 
 nntrainer_inc += include_directories('..')
 nntrainer_inc_abs += meson.current_build_dir() / '..'
