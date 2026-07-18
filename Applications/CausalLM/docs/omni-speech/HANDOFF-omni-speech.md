@@ -24,12 +24,24 @@ nntrainer-Galaxy-Book6-Ultra, branch qwen25-omni-multimodal + gauss GPU merge):
 Stage A velocity max 1.3e-5, Stage B dit_mel max 2.9e-5 / identical stats,
 file-chained Talker→DiT→BigVGAN wav matches HF at max 2 int16 LSB (99.8% ≤1).
 
-**NEXT ACTION (Phase 2C productization):** ① in-process chain (a Token2Wav
-wrapper calling `Qwen25OmniDiT::generate_mel` → `Qwen25OmniBigVGAN::vocode`
-instead of the dit_mel.bin file handoff), ② port ECAPA-TDNN to C++ (bring-up
-injects `ecapa_pos/neg.bin` from the python dump; §6.1 C1, risk R3),
-③ variable-length codes (graph is compiled at SEQ=128 = 64 codes; longer
-replies need recompile-per-length or bucketing).
+**Phase 2C core is ALSO DONE (2026-07-18, same session):**
+- `Qwen25OmniToken2Wav` (models/qwen25_omni/qwen25_omni_token2wav.*): in-process
+  DiT → BigVGAN chain, arch "Qwen25OmniToken2Wav", model dir = union of both
+  converters' outputs. 64-code output byte-identical to the file-chained path.
+- ECAPA-TDNN ported to host C++ (`ecapa_tdnn.{h,cpp}`, weights `ecapa.bin`
+  emitted by the DiT converter; spec sheet extracted+verified from HF 4.57.6,
+  numpy ref matched 6.6e-7). Wrapper computes pos=ECAPA(ref_mel.bin) and
+  neg=ECAPA(zeros) itself; falls back to injected ecapa_pos/neg.bin.
+- Variable length: `Qwen25OmniDiT::ensure_seq` / `Qwen25OmniBigVGAN::
+  ensure_frames` recompile the graph and reload weights on a length change
+  (weights are length-agnostic). Full 127-code talker reply verified:
+  60960-sample wav matches HF at max 2 int16 LSB (99.93% ≤1).
+
+**NEXT ACTION:** ① wire the Talker in-process (Talker codes currently arrive
+via codes.bin; full input→speech in one nntr_causallm run), ② GPU-accelerate
+the DiT forwards (72 batch-1 evals at seq 254 ≈ 200 s CPU — the gauss v8c
+OpenCL/CUDA baseline is already merged into this branch), ③ streaming/chunked
+synthesis for long replies.
 
 **FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3, and MIND THE transformers<5 PIN (§3.7).
 

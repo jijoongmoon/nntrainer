@@ -63,10 +63,17 @@ public:
   void initialize() override;
 
   /**
-   * @brief Load dit.bin (DFS-from-output order) + codec_embed.bin
-   *        (raw f32 [codec_vocab, codec_dim], same directory).
+   * @brief Load dit.bin (DFS-from-output order) + codec_embed.bin and
+   *        inv_freq.bin (raw f32, same directory).
    */
   void load_weight(const std::string &weight_path) override;
+
+  /**
+   * @brief Recompile the per-step graph for a new sequence length (= 2 *
+   *        num_codes) and reload the weights. No-op if seq already matches.
+   *        The graph weights are seq-independent; only activations resize.
+   */
+  void ensure_seq(unsigned int seq);
 
   /**
    * @brief Sample a mel from side inputs in directory `prompt` (see file
@@ -109,6 +116,9 @@ private:
   /** @brief SinusPositionEmbedding(256, scale=1000) at time t. */
   void fill_time_sin(float t);
 
+  /** @brief Create + compile + initialize the graph at the current SEQ. */
+  void build_and_init();
+
   unsigned int HIDDEN = 1024;
   unsigned int DEPTH = 22;
   unsigned int HEADS = 16;
@@ -136,6 +146,7 @@ private:
   std::vector<float> cos_buf, sin_buf; /**< [SEQ * HEAD_DIM] interleaved */
   std::vector<float> in_x;             /**< [SEQ * 912] graph input 0 */
   std::vector<float> in_t;             /**< [TIME_FREQ] graph input 1 */
+  std::string weight_path_;            /**< dit.bin path, for ensure_seq */
 };
 
 } // namespace causallm

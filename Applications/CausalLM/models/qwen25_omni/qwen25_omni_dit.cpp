@@ -86,7 +86,23 @@ void Qwen25OmniDiT::registerCustomLayers() {
 
 void Qwen25OmniDiT::initialize() {
   registerCustomLayers();
+  build_and_init();
+}
 
+void Qwen25OmniDiT::ensure_seq(unsigned int seq) {
+  if (seq == SEQ && is_initialized)
+    return;
+  if (seq == 0 || seq % REPEATS != 0)
+    throw std::invalid_argument("dit seq must be a positive multiple of " +
+                                std::to_string(REPEATS) + ", got " +
+                                std::to_string(seq));
+  SEQ = seq;
+  build_and_init();
+  if (!weight_path_.empty())
+    model->load(weight_path_, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+}
+
+void Qwen25OmniDiT::build_and_init() {
   model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
   model->setProperty({withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
                       withKey("model_tensor_type", MODEL_TENSOR_TYPE)});
@@ -187,6 +203,7 @@ void Qwen25OmniDiT::initialize() {
 }
 
 void Qwen25OmniDiT::load_weight(const std::string &weight_path) {
+  weight_path_ = weight_path;
   model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
 
   // codec_embed.bin lives next to dit.bin: raw f32 [CODEC_VOCAB, CODEC_DIM],
@@ -384,17 +401,24 @@ void Qwen25OmniDiT::run(const WSTR prompt, bool do_sample,
     return v;
   };
 
-  const unsigned int num_codes = SEQ / REPEATS;
-  std::vector<int32_t> codes(num_codes);
+  // codes.bin length decides the sequence length (SEQ = repeats * n_codes);
+  // recompile the graph if this utterance differs from the compiled length.
+  std::vector<int32_t> codes;
   {
-    std::ifstream f(dir + "/codes.bin", std::ios::binary);
+    std::ifstream f(dir + "/codes.bin", std::ios::binary | std::ios::ate);
     if (!f)
       throw std::runtime_error("cannot open " + dir + "/codes.bin");
+    const auto bytes = static_cast<size_t>(f.tellg());
+    if (bytes == 0 || bytes % sizeof(int32_t) != 0)
+      throw std::runtime_error("bad codes.bin size " + std::to_string(bytes));
+    codes.resize(bytes / sizeof(int32_t));
+    f.seekg(0);
     f.read(reinterpret_cast<char *>(codes.data()),
-           static_cast<std::streamsize>(codes.size() * sizeof(int32_t)));
+           static_cast<std::streamsize>(bytes));
     if (!f)
       throw std::runtime_error("short read on " + dir + "/codes.bin");
   }
+  ensure_seq(REPEATS * static_cast<unsigned int>(codes.size()));
   std::vector<float> ecapa_pos = read_f32("ecapa_pos.bin", ENC_DIM);
   std::vector<float> ecapa_neg = read_f32("ecapa_neg.bin", ENC_DIM);
   std::vector<float> spk = read_f32("spk.bin", SPK_DIM);

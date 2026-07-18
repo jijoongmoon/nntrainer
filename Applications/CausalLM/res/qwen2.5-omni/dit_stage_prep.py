@@ -41,6 +41,10 @@ def main():
     spk = np.load(os.path.join(d, "cond192.npy")).reshape(-1)  # [192]
     save(os.path.join(o, "spk.bin"), spk, np.float32)
 
+    # raw reference mel for the C++ ECAPA path ([T,80] row-major)
+    ref_mel = np.load(os.path.join(d, "ref_mel.npy"))[0]  # [400,80]
+    save(os.path.join(o, "ref_mel.bin"), ref_mel, np.float32)
+
     # Stage A: one-step input + time + per-branch/combined velocity refs
     x_in = np.load(os.path.join(d, "x_in.npy")).reshape(-1)  # [1,128,80]
     save(os.path.join(o, "x_in.bin"), x_in, np.float32)

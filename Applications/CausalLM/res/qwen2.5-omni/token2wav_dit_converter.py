@@ -113,6 +113,30 @@ def main():
         f.write(np.ascontiguousarray(inv, dtype=np.float32).tobytes())
     print(f"wrote {inv_path}: {inv.shape}")
 
+    # ECAPA-TDNN speaker encoder: 40 tensors, raw [C_out, C_in, K] conv
+    # layout, in the fixed order the C++ EcapaTdnn::load consumes
+    # (see ecapa_tdnn.h; validated spec in docs/omni-speech).
+    ecapa_names = ["blocks.0.conv"]
+    for i in (1, 2, 3):
+        ecapa_names += [
+            f"blocks.{i}.tdnn1.conv",
+            f"blocks.{i}.res2net_block.blocks.0.conv",
+            f"blocks.{i}.tdnn2.conv",
+            f"blocks.{i}.se_block.conv1",
+            f"blocks.{i}.se_block.conv2",
+        ]
+    ecapa_names += ["mfa.conv", "asp.tdnn.conv", "asp.conv", "fc"]
+    ec_path = os.path.join(args.output_dir, "ecapa.bin")
+    n_ecapa = 0
+    with open(ec_path, "wb") as f:
+        for name in ecapa_names:
+            for suffix in (".weight", ".bias"):
+                arr = fetch("input_embed.spk_encoder." + name + suffix)
+                f.write(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+                n_ecapa += 1
+    assert n_ecapa == 40, n_ecapa
+    print(f"wrote {ec_path}: {n_ecapa} tensors")
+
     cfg = {
         "architectures": ["Qwen25OmniDiT"],
         "model_type": "qwen2_5_omni_dit",

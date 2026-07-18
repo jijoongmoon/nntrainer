@@ -57,6 +57,12 @@ public:
   void load_weight(const std::string &weight_path) override;
 
   /**
+   * @brief Recompile the conv graph for a new mel length and reload weights.
+   *        No-op if mel_frames already matches (weights are length-agnostic).
+   */
+  void ensure_frames(unsigned int n_frames);
+
+  /**
    * @brief Vocode a mel file into a 24 kHz WAV.
    * @param prompt path to a mel feature file
    *   ([int32 mel_dim][int32 n_frames][fp32 mel[mel_dim][n_frames]]);
@@ -69,10 +75,14 @@ public:
   /**
    * @brief In-memory vocode (end-to-end entry point).
    * @param mel mel_dim x n_frames, mel-bin major (natural-log domain);
-   *   n_frames must equal the compiled mel_frames.
+   *   recompiles the graph if n_frames differs from the compiled length.
    * @return waveform samples in [-1, 1], length n_frames * 240
    */
   std::vector<float> vocode(const float *mel, unsigned int n_frames);
+
+  /** @brief Write a 24 kHz mono 16-bit PCM WAV. */
+  static void write_wav(const std::string &path, const std::vector<float> &wav,
+                        unsigned int sample_rate);
 
 protected:
   void setupParameters(json &cfg, json &generation_cfg,
@@ -84,9 +94,10 @@ private:
   /** @brief HF process_mel_spectrogram (host, per-element). in/out [mel*T]. */
   void process_mel(const float *mel, unsigned int n, std::vector<float> &out);
 
-  /** @brief Write a 24 kHz mono 16-bit PCM WAV. */
-  static void write_wav(const std::string &path, const std::vector<float> &wav,
-                        unsigned int sample_rate);
+  /** @brief Create + compile + initialize the graph at MEL_FRAMES. */
+  void build_and_init();
+
+  std::string weight_path_; /**< bigvgan.bin path, for ensure_frames */
 
   unsigned int MEL_DIM = 80;
   unsigned int UP_INIT_CH = 1536;

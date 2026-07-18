@@ -67,7 +67,21 @@ void Qwen25OmniBigVGAN::registerCustomLayers() {
 
 void Qwen25OmniBigVGAN::initialize() {
   registerCustomLayers();
+  build_and_init();
+}
 
+void Qwen25OmniBigVGAN::ensure_frames(unsigned int n_frames) {
+  if (n_frames == MEL_FRAMES && is_initialized)
+    return;
+  if (n_frames == 0)
+    throw std::invalid_argument("bigvgan mel_frames must be positive");
+  MEL_FRAMES = n_frames;
+  build_and_init();
+  if (!weight_path_.empty())
+    model->load(weight_path_, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+}
+
+void Qwen25OmniBigVGAN::build_and_init() {
   model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
   model->setProperty({withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
                       withKey("model_tensor_type", MODEL_TENSOR_TYPE)});
@@ -149,6 +163,7 @@ void Qwen25OmniBigVGAN::initialize() {
 }
 
 void Qwen25OmniBigVGAN::load_weight(const std::string &weight_path) {
+  weight_path_ = weight_path;
   model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
 }
 
@@ -172,11 +187,7 @@ std::vector<float> Qwen25OmniBigVGAN::vocode(const float *mel,
                                              unsigned int n_frames) {
   if (!is_initialized)
     throw std::runtime_error("BigVGAN is not initialized.");
-  if (n_frames != MEL_FRAMES)
-    throw std::invalid_argument(
-      "BigVGAN compiled for mel_frames=" + std::to_string(MEL_FRAMES) +
-      " but got " + std::to_string(n_frames) +
-      " (recompile with that mel_frames).");
+  ensure_frames(n_frames);
 
   std::vector<float> processed;
   process_mel(mel, MEL_DIM * n_frames, processed);
