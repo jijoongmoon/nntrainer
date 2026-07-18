@@ -328,6 +328,14 @@ if get_option('enable-cuda')
     cuda_delayload_args = ['/DELAYLOAD:cublas64_13.dll',
                            '/DELAYLOAD:cublasLt64_13.dll',
                            '/DELAYLOAD:nvrtc64_130_0.dll',
+                           # nvcuda.dll is the NVIDIA driver's own DLL (not a
+                           # toolkit redistributable); without delay-loading it
+                           # too, the unified binary would hard-fail to load on
+                           # any machine with no NVIDIA driver at all -- the
+                           # backend-auto-probe (cudaGetDeviceCount, which is
+                           # cudart-only) must be callable before nvcuda is
+                           # ever touched.
+                           '/DELAYLOAD:nvcuda.dll',
                            'delayimp.lib']
   else
     cuda_delayload_args = []

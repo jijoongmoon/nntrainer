@@ -16,14 +16,56 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <cuda_runtime.h>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <delayimp.h>
 #endif
 
 namespace nntrainer::cuda {
+
+#ifdef _WIN32
+// [delay-load failure hook] Without this, a missing CUDA runtime DLL (the
+// binary /DELAYLOAD-imports cublas64_13.dll, cublasLt64_13.dll,
+// nvrtc64_130_0.dll and nvcuda.dll -- see meson.build cuda_delayload_args)
+// makes the FIRST call through that import raise an MSVC delay-load SEH
+// exception
+// (0xC06D007E) instead of a normal error return. Unhandled, that looks like
+// a silent hang/crash rather than a diagnosable failure. Installing
+// __pfnDliFailureHook2 intercepts dliFailLoadLib/dliFailGetProc so we can
+// print one clear fatal message and exit deliberately.
+static FARPROC WINAPI nntr_dli_failure_hook(unsigned dliNotify,
+                                             PDelayLoadInfo pdli) {
+  const char *dll = (pdli && pdli->szDll) ? pdli->szDll : "(unknown)";
+  const char *verb = dliNotify == dliFailGetProc ? "resolved" : "loaded";
+  // nvcuda.dll ships with the NVIDIA driver itself (not the CUDA toolkit),
+  // so its absence means "no NVIDIA GPU / no driver" rather than "missing
+  // redistributable DLL" -- point the user at the right fix.
+  if (_stricmp(dll, "nvcuda.dll") == 0) {
+    fprintf(stderr,
+            "[NNTRAINER][FATAL] %s could not be %s: NVIDIA driver not "
+            "installed or no NVIDIA GPU -- the cuda backend needs an "
+            "NVIDIA GPU with a current driver\n",
+            dll, verb);
+  } else {
+    fprintf(stderr,
+            "[NNTRAINER][FATAL] CUDA runtime DLL could not be %s: %s\n"
+            "  The CUDA backend needs the NVIDIA driver plus the CUDA runtime "
+            "DLLs shipped in the SDK bin/ directory\n"
+            "  (cudart64_13.dll, cublas64_13.dll, cublasLt64_13.dll, "
+            "nvrtc64_130_0.dll, nvrtc-builtins64_133.dll).\n"
+            "  Keep them next to the executable or on PATH.\n",
+            verb, dll);
+  }
+  fflush(stderr);
+  TerminateProcess(GetCurrentProcess(), 0xC7);
+  return nullptr;
+}
+extern "C" const PfnDliHook __pfnDliFailureHook2 = nntr_dli_failure_hook;
+#endif
 
 void ContextManager::initialize() noexcept {
   initialized_ok_ = CreateDefaultGPUDevice();
@@ -39,9 +81,20 @@ void ContextManager::initialize() noexcept {
   // maps without prefaulting, so most of the delay-load WS win survives —
   // measured on cuda-a2 right after this change.
   if (initialized_ok_) {
-    LoadLibraryA("nvrtc64_130_0.dll");
-    LoadLibraryA("cublas64_13.dll");
-    LoadLibraryA("cublasLt64_13.dll");
+    if (!LoadLibraryA("nvrtc64_130_0.dll"))
+      ml_logw("[CUDA] preload of nvrtc64_130_0.dll failed (err=%lu); the "
+              "CUDA backend will fail hard on first use if it is still "
+              "missing",
+              GetLastError());
+    if (!LoadLibraryA("cublas64_13.dll"))
+      ml_logw("[CUDA] preload of cublas64_13.dll failed (err=%lu); the CUDA "
+              "backend will fail hard on first use if it is still missing",
+              GetLastError());
+    if (!LoadLibraryA("cublasLt64_13.dll"))
+      ml_logw("[CUDA] preload of cublasLt64_13.dll failed (err=%lu); the "
+              "CUDA backend will fail hard on first use if it is still "
+              "missing",
+              GetLastError());
   }
 #endif
 }
