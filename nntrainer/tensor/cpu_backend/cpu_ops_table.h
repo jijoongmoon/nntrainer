@@ -364,6 +364,28 @@ public:
                                               sin_);
   }
 #endif // ENABLE_FP16
+
+  // Whole-op (Tensor-level). Out-of-line in cpu_ops_table.cpp so this header
+  // stays free of <tensor.h>. Pure host gelu_tanh(gate)*up over the live rows
+  // (correct for host and host-coherent SVM/UVM pointers).
+  void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+             unsigned int active_rows, unsigned int row_offset) override;
+  // out = silu(gate) * up over the live rows (numerically stable SiLU).
+  void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+              unsigned int active_rows, unsigned int row_offset) override;
+  // out = sigmoid(gate) * up over the live rows (fp32-accumulated).
+  void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override;
+  // out = sigmoid(gate) + emb over the live rows (fp32-accumulated).
+  void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override;
+  // hidden = input (copy) / hidden += input (add) via host Tensor ops.
+  void residual_op(Tensor &hidden, const Tensor &input,
+                   bool accumulate) override;
+  // output = input * weight via host Tensor::dot (the CPU FC matmul).
+  void fc(Tensor &input, Tensor &weight, Tensor &output) override;
+
+  void apply_activation(Tensor &out, int act_type) override;
 };
 
 } // namespace nntrainer

@@ -42,7 +42,8 @@ enum LORAParams { loraA, loraB, loraTmp, loraOut };
 FullyConnectedLayer::FullyConnectedLayer() :
   LayerImpl(),
   lora_scaling(1.0f),
-  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha()),
+  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(),
+           props::FusedActivation()),
   quantizer(nullptr) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   lora_idx.fill(std::numeric_limits<unsigned>::max());
@@ -249,6 +250,14 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
       hidden_.add_i(bias);
     }
   }
+
+  // Fused activation epilogue dispatched through the op table, so the
+  // fusion is backend-neutral: CpuComputeOps runs the host ActiFunc, a GPU
+  // ComputeOps can fuse it into the GEMM epilogue. Eliminates the separate
+  // ActivationLayer node; value-identical to it.
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+    hidden_.getOps()->apply_activation(hidden_, (int)fused_act.get());
 }
 
 void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
