@@ -498,6 +498,17 @@ public:
               unsigned int K = dim.height();
               unsigned int N = dim.width();
 
+              // Bias-like tensors (height==1, e.g. qwen2's Q/K/V biases) must
+              // stay FP32: the runtime graph loads them as FP32, so packing
+              // them here (the Q4_0 branch above has the same skip) writes a
+              // different record size and silently shifts EVERY subsequent
+              // tensor in the .bin — the gemma4/qwen3 QS4CX models never hit
+              // this because their FCs are bias-free.
+              if (K == 1) {
+                weight.save(file);
+                continue;
+              }
+
               size_t q_size = N * (K + 1) / 2;
               size_t scale_size = N * sizeof(float);
 

@@ -16,6 +16,9 @@
  * dispatch picks the right symbol at link time.
  */
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "cpu_ops_table.h"
 
 #include <cmath>
@@ -176,6 +179,16 @@ void CpuComputeOps::residual_op(Tensor &hidden, const Tensor &input,
 // output = input * weight. Host Tensor::dot (CPU/UVM FC matmul). The CL/CUDA
 // quantized GEMM paths override this in their ComputeOps subclasses.
 void CpuComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
+  // TEMP DIAG (NNTR_FC_DEBUG): mirror the CudaComputeOps::fc dump so silent
+  // host dispatches are visible during the QS4CX bring-up.
+  static const bool fc_dbg = std::getenv("NNTR_FC_DEBUG") != nullptr;
+  if (fc_dbg)
+    fprintf(stderr, "[FCDBG-CPU] wt=%d at=%d M=%u N=%u K=%u\n",
+            (int)weight.getDataType(), (int)input.getDataType(),
+            (unsigned)(input.getDim().batch() * input.getDim().channel() *
+                       input.getDim().height()),
+            (unsigned)output.getDim().width(),
+            (unsigned)input.getDim().width());
   input.dot(weight, output, false, false);
 }
 

@@ -81,10 +81,15 @@ void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
 
   context.setOutputDimensions(output_dims);
 
-  /** set weight specifications */
+  /** set weight specifications. The BIAS stays in the activation dtype:
+   * quantized weight dtypes (QS4CX/QINT4/...) are matmul packings — a
+   * quantized bias tensor cannot be add_i'ed (silently unapplied: qwen2's
+   * huge K-proj biases vanished on the QS4CX thinker) and the
+   * save-with-quantization path writes biases as plain FP32. */
   TensorDim bias_dim(
     1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+    TensorDim::TensorType(context.getFormat(),
+                          context.getActivationDataType()),
     is_nchw ? 0b0001 : 0b0100);
 
   TensorDim weight_dim(

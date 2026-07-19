@@ -24,12 +24,17 @@ Tensor Qwen2Transformer::createAttention(const int layer_id, int seq_len,
                                          Tensor query, Tensor key,
                                          Tensor value) {
 
-  // Q layer (qwen2 uses bias on Q/K/V)
+  // Q layer (qwen2 uses bias on Q/K/V). engine=causallm_engine() like the
+  // shared transformer.cpp builder: this attention predates the engine
+  // plumbing, so its FCs silently ran on the cpu context — with quantized
+  // (QS4CX) weights the host Tensor::dot path mis-computes the RECTANGULAR
+  // GQA wk/wv (square wq only worked by coincidence of dims).
   LayerHandle wq(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "false"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
   // K layer
@@ -37,7 +42,8 @@ Tensor Qwen2Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
   // V layer
@@ -45,7 +51,8 @@ Tensor Qwen2Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor v = wv(value);
 
   // External KV cache placeholders (per-layer). Storage is owned by the host
@@ -62,7 +69,8 @@ Tensor Qwen2Transformer::createAttention(const int layer_id, int seq_len,
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+     withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+     withKey("engine", causallm_engine())}));
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer
@@ -70,7 +78,8 @@ Tensor Qwen2Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   return wo(a);
 }
 
