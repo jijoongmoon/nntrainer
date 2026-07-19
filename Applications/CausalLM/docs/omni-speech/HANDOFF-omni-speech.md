@@ -152,12 +152,31 @@ q4_0') — treat FP16-act as a separate later step; quantized dir at
 models/qwen2.5-omni-3b-qs4cx (QS4CX-FP32, num_to_generate=3 for probing);
 LmHeadLayer now registered on BOTH gpu and cuda ctxs.
 
-**NEXT ACTION:** ① find the actual prefill FC execution path for the
-thinker's attention projections (instrument fc_layer_cl / check what layer
-class "layer0_wq" resolves to on the cuda ctx; then why rect N=256 breaks
-there), ② rerun quantized-thinker one-shot after the fix, ③ FP16-act
-enablement as a follow-up, ④ true streaming / ensure_seq reload-skip /
-push.
+**QS4CX round 3 (2026-07-20) — ROOT CAUSES FOUND & FIXED (f5a4cf02e):**
+the qwen2-family thinker has Q/K/V BIASES (gemma4/qwen3 QS4CX models are
+bias-free — virgin territory). Three stacked defects: ① qwen2_causallm's
+createAttention had NO engine= props (pre-engine-era file) so q/k/v/o ran
+on the cpu ctx where host Tensor::dot mis-computes rectangular QS4CX;
+② the QS4CX save branch lacked the Q4_0 branch's K==1 bias skip (biases
+nibble-packed on disk); ③ fc_layer_cl built the bias tensor with the
+WEIGHT dtype — a QS4CX bias add_i is silently unapplied, which vaporised
+qwen2's ±90 K-proj bias (THE actual text-garbling mechanism; sizes
+matched so nothing crashed). After the fixes the QS4CX thinker (1.8 GB
+bin, RSS 4.3 GB) generates coherent text on CUDA (direct probe). Debug
+lesson: CpuComputeOps::fc now mirrors the CUDA NNTR_FC_DEBUG dump —
+silent host dispatches were the key clue.
+
+**REMAINING for #18:** the talker's ThinkerForCapture E2E path still
+degenerates with the quantized thinker (reply "user222..." while the
+DIRECT run of the same dir answers "Parigi/Paris") — isolate what that
+driver does differently (its own prefill/capture loop; two cuda models in
+one process; prompt/template handling). Then: quality A/B vs FP32 reply,
+FP16 activations (separate broken area), talker quantization, benchmarks.
+
+**NEXT ACTION:** ① ThinkerForCapture-vs-direct divergence with the
+quantized thinker, ② FP16-act enablement, ③ true streaming / ensure_seq
+reload-skip / upstream the three core fixes (layer_devel + fc_layer_cl
+affect everyone).
 
 **FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3, and MIND THE transformers<5 PIN (§3.7).
 
