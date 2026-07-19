@@ -147,6 +147,7 @@ private:
   std::vector<float> in_x;             /**< [SEQ * 912] graph input 0 */
   std::vector<float> in_t;             /**< [TIME_FREQ] graph input 1 */
   std::string weight_path_;            /**< dit.bin path, for ensure_seq */
+  bool fc_cuda_ = false; /**< DiT FCs on cuBLAS (see initialize()) */
 };
 
 } // namespace causallm

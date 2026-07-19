@@ -80,10 +80,41 @@ runEndToEnd, fp16-off build portability (rms_norm_gpu _FP16 guard,
 [[maybe_unused]] in mha_core/causal_lm). LESSON for future side-input
 models: never assume graph input order — probe dims or widths.
 
-**NEXT ACTION:** ① the two CUDA perf items (§DiT-on-CUDA), ② streaming/
-chunked synthesis, ③ ECAPA/DiT graph reuse polish (per-utterance Token2Wav
-construction in speakCodes re-loads 1.7 GB each call — cache it for
-multi-utterance sessions), ④ push the branch / upstream the fixes.
+**2026-07-19 round: CUDA split pools + chunked streaming + caching.**
+- **DiT-on-CUDA is now a real win on utterance lengths:** NNTR_CUDA_ACT_PINNED
+  (new, auto-set by the DiT) pins ONLY the activation pool while weights stay
+  managed/device-resident (Manager::activationAllocator branch +
+  per-instance host_mapped flag in CudaMemAllocator). 64-code Stage B
+  20.3 s (CPU 25.8), **127-code 45.1 s vs CPU 201.6 s = 4.5×**, numerics
+  1.4e-5. ASYNC=1 remains WRONG on mixed graphs even with split pools and
+  is NOT faster in sync-drain terms — do not spend more time there.
+  **Recommended process profile: `NNTR_ENGINE=cuda NNTR_CAUSALLM_ENGINE=cpu`**
+  (new override in causallm_engine()): full CUDA runtime alive (the
+  engine_selected() string gate makes partial opt-ins impossible — the
+  NNTR_DIT_CUDA/EAGER_CTX experiment died on exactly that), thinker/talker
+  on the verified CPU routing, DiT FCs on cuBLAS. One-shot prompt→speech:
+  168.7 s (RSS ~22 GB — mind the 30 GB box; avoid concurrent big jobs).
+  Also: Token2Wav overrides repack_weight() as no-op (base derefs its null
+  graph — only reached on engine=cuda runs).
+- **Chunked/streamable synthesis** (`Token2Wav::synthesize_chunked`, A/B via
+  NNTR_T2W_CHUNKED=1): block-ALIGNED chunks (starts at 12-code multiples;
+  the mask blocks are 24 frames) with BILATERAL context — the right context
+  is the critical half (L10 look_ahead; left-only ctx left seam max
+  unchanged at 1.59, +right ctx24 dropped mel max|d| to 0.236 vs full in
+  the HF experiment; RoPE restarts per chunk are harmless — shift-invariant
+  dot products). C++ 127-code run: 3 chunks, wav vs full render log-STFT
+  mean |d| 0.11 (std 2.6), frame-energy corr 0.989 — a close streamable
+  approximation, NOT bit-exact (per-chunk audio callback provided; BigVGAN
+  runs per chunk with ±8 mel-frame context). Known cost: ensure_seq
+  recompiles+reloads 1.2 GB per distinct chunk seq (2-3×/utterance) —
+  fixed-seq padding or reload-skip is the next optimization.
+- **Caching:** the talker reuses one Token2Wav instance across utterances
+  and Token2Wav::speak caches the speaker assets + ECAPA embeddings.
+
+**NEXT ACTION:** ① overlap chunked DiT with talker decode (true streaming:
+codes arrive incrementally; DiT time hides behind generation), ② ensure_seq
+weight-reload skip (weights are seq-independent — rebuild graph without
+dropping loaded weights), ③ push / upstream.
 
 **FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3, and MIND THE transformers<5 PIN (§3.7).
 

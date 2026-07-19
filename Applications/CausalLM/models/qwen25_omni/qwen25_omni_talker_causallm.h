@@ -119,6 +119,10 @@ private:
   std::string thinker_nntr_config;
   std::string token2wav_model_path; /**< when set, chain codes -> speech.wav */
   std::string speech_output;        /**< wav path for the chained synthesis */
+  /** lazily built once and reused across utterances (dit.bin + bigvgan.bin
+   *  are ~1.7 GB; ensure_seq/ensure_frames handle later length changes) */
+  std::unique_ptr<class Qwen25OmniToken2Wav> t2w;
+  json t2w_cfg, t2w_gen, t2w_nntr; /**< persistent: the sub-ctor keeps refs */
 
   /** @brief Synthesize `codes` via Qwen25OmniToken2Wav (strips eos/pad). */
   void speakCodes(const std::vector<unsigned int> &codes, bool log_output);

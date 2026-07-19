@@ -139,6 +139,18 @@ public:
   static std::shared_ptr<MemAllocator>
   activationAllocator(const std::shared_ptr<MemAllocator> &allocator) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // NNTR_CUDA_ACT_PINNED (value-checked): pinned host-mapped (zero-copy)
+    // activation pool while the weight pool stays managed/device-resident.
+    // The right profile for mixed cpu/cuda graphs (host layers interleaved
+    // with cuBLAS FCs): host reads/writes never migrate pages, and the
+    // 1GB-class weights are not re-streamed over PCIe every forward (which
+    // is what the pool-global NNTR_CUDA_HOST_MAPPED costs). Wins over
+    // DEV_ACT below when both are set.
+    const char *act_pinned = std::getenv("NNTR_CUDA_ACT_PINNED");
+    if (allocator && allocator->getName() == "cuda-uvm" &&
+        act_pinned != nullptr && act_pinned[0] != '0')
+      return std::make_shared<CudaMemAllocator>(/*device_only=*/false,
+                                                /*host_mapped=*/true);
     const char *dev_act = std::getenv("NNTR_CUDA_DEV_ACT");
     if (allocator && allocator->getName() == "cuda-uvm" &&
         dev_act != nullptr && dev_act[0] != '0')

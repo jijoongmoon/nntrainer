@@ -816,15 +816,17 @@ void Qwen25OmniTalkerCausalLM::speakCodes(
     return;
   }
 
-  json t2w_cfg = LoadJsonFile(token2wav_model_path + "/config.json");
-  json t2w_gen = json::object();
-  json t2w_nntr = LoadJsonFile(token2wav_model_path + "/nntr_config.json");
-  Qwen25OmniToken2Wav t2w(t2w_cfg, t2w_gen, t2w_nntr);
-  t2w.initialize();
-  t2w.load_weight(token2wav_model_path + "/" +
-                  t2w_nntr.value("model_file_name", std::string("dit.bin")));
+  if (!t2w) {
+    t2w_cfg = LoadJsonFile(token2wav_model_path + "/config.json");
+    t2w_gen = json::object();
+    t2w_nntr = LoadJsonFile(token2wav_model_path + "/nntr_config.json");
+    t2w = std::make_unique<Qwen25OmniToken2Wav>(t2w_cfg, t2w_gen, t2w_nntr);
+    t2w->initialize();
+    t2w->load_weight(token2wav_model_path + "/" +
+                     t2w_nntr.value("model_file_name", std::string("dit.bin")));
+  }
 
-  std::vector<float> wav = t2w.speak(ids);
+  std::vector<float> wav = t2w->speak(ids);
   Qwen25OmniBigVGAN::write_wav(speech_output, wav, 24000);
   if (log_output)
     std::cout << "[Token2Wav] wrote " << wav.size() << " samples ("

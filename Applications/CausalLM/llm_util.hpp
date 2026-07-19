@@ -93,6 +93,14 @@ T unwrap(std::optional<T> &&value, const std::string &error_msg) {
  */
 inline std::string causallm_engine() {
   static const std::string eng = []() -> std::string {
+    // NNTR_CAUSALLM_ENGINE overrides the CausalLM layer routing without
+    // touching the process-wide backend selection: NNTR_ENGINE=cuda +
+    // NNTR_CAUSALLM_ENGINE=cpu keeps the thinker/talker on the verified CPU
+    // path while the CUDA machinery (engine_selected() gates, DiT cuBLAS
+    // FCs) stays alive for the Token2Wav stage.
+    const char *ce = std::getenv("NNTR_CAUSALLM_ENGINE");
+    if (ce != nullptr && ce[0] != '\0')
+      return std::string(ce);
     const char *e = std::getenv("NNTR_ENGINE");
     if (e != nullptr) {
       const std::string s(e);

@@ -71,8 +71,8 @@ bool use_host_mapped() {
 }
 } // namespace
 
-CudaMemAllocator::CudaMemAllocator(bool device_only) :
-  device_only_(device_only) {
+CudaMemAllocator::CudaMemAllocator(bool device_only, bool host_mapped) :
+  device_only_(device_only), host_mapped_(host_mapped) {
   // bring up the device + primary context once (idempotent)
   cuda::ContextManager::Global();
 }
@@ -108,7 +108,7 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
     const bool dev_only = device_only_ && !integrated;
     // Pinned host-mapped (zero-copy) pool replaces managed on cMA==0 devices
     // (see use_host_mapped above). Falls through to managed on any failure.
-    if (!dev_only && use_host_mapped()) {
+    if (!dev_only && (host_mapped_ || use_host_mapped())) {
       void *hp = nullptr;
       if (cudaHostAlloc(&hp, size, cudaHostAllocMapped) == cudaSuccess &&
           hp != nullptr) {

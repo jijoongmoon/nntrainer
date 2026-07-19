@@ -23,6 +23,10 @@
 #include <llm_util.hpp>
 #include <model.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_runtime.h>
+#endif
+
 #include <dit_act.h>
 #include <dit_attention.h>
 #include <dit_gate.h>
@@ -89,15 +93,23 @@ void Qwen25OmniDiT::registerCustomLayers() {
 void Qwen25OmniDiT::initialize() {
   // Mixed cpu/cuda DiT profile, BEFORE the first Engine::Global() touch
   // (cuda_context reads these at bring-up; setenv(,,0) keeps user overrides):
-  // pinned zero-copy activations avoid the managed-page ping-pong between the
-  // host dit_* layers and the cuBLAS FCs; the host consumers drain the stream
-  // themselves (dit_act / dit_* forwarding), so async submission is safe.
+  // ACT_PINNED pins ONLY the activation pool (zero-copy: no managed-page
+  // ping-pong between the host dit_* layers and the cuBLAS FCs) while the
+  // 1.25 GB of FC weights stay managed = device-resident (the pool-global
+  // HOST_MAPPED would re-stream them over PCIe every forward).
+  // fc_cuda requires NNTR_ENGINE=cuda: the whole CUDA runtime is gated on
+  // that exact string (engine_selected() -> dev_accessible etc.), so a
+  // partial per-model opt-in cannot work. To keep the thinker/talker on the
+  // verified CPU routing in the same process, set NNTR_CAUSALLM_ENGINE=cpu
+  // alongside (see causallm_engine()).
   const char *eng = std::getenv("NNTR_ENGINE");
-  if (eng != nullptr && std::string(eng) == "cuda") {
-    setenv("NNTR_CUDA_HOST_MAPPED", "1", 0);
+  const bool engine_cuda = eng != nullptr && std::string(eng) == "cuda";
+  if (engine_cuda) {
+    setenv("NNTR_CUDA_ACT_PINNED", "1", 0);
     setenv("NNTR_CUDA_DEV_ACT", "0", 0);
     setenv("NNTR_CUDA_M2B", "0", 0);
   }
+  fc_cuda_ = engine_cuda;
   registerCustomLayers();
   build_and_init();
 }
@@ -131,14 +143,12 @@ void Qwen25OmniDiT::build_and_init() {
     layers.push_back(createLayer(type, props));
   };
   auto S = [](unsigned int v) { return std::to_string(v); };
-  // FP32 FC on the CUDA backend (cuBLAS SGEMM over UVM) carries ~99% of the
-  // DiT FLOPs. Only FC goes on-device: activation/input aren't registered on
-  // the cuda context, and the dit_* custom layers are cpu-registered — UVM
-  // host coherence makes the mixed graph correct. engine=cuda tags would
-  // silently fall back to cpu without NNTR_ENGINE=cuda (context not brought
-  // up), so gate on the same env var.
-  const char *eng_env = std::getenv("NNTR_ENGINE");
-  const bool fc_cuda = eng_env != nullptr && std::string(eng_env) == "cuda";
+  // FP32 FC on the CUDA backend (cuBLAS SGEMM) carries ~99% of the DiT
+  // FLOPs. Only FC goes on-device: activation/input aren't registered on
+  // the cuda context, and the dit_* custom layers are cpu-registered — the
+  // pinned activation pool keeps the mixed graph host-coherent. Gate decided
+  // in initialize() (NNTR_ENGINE=cuda or NNTR_DIT_CUDA=1 + eager ctx).
+  const bool fc_cuda = fc_cuda_;
   auto fc = [&](const std::string &name, unsigned int unit,
                 const std::string &inputs) {
     std::vector<std::string> props = {withKey("unit", S(unit))};
@@ -359,6 +369,25 @@ void Qwen25OmniDiT::prepare_conditioning(const int32_t *codes,
 
   in_x.resize(static_cast<size_t>(SEQ) * cond_w);
   in_t.resize(TIME_FREQ);
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Pin the external concat buffer so the proj FC's input is dev_accessible
+  // and its M=seq GEMM runs on cuBLAS instead of the host fallback (the
+  // mapExternalTensor pointer is otherwise unregistered heap memory).
+  const char *eng = std::getenv("NNTR_ENGINE");
+  if (eng != nullptr && std::string(eng) == "cuda") {
+    static const void *registered = nullptr;
+    if (registered != in_x.data()) {
+      if (registered != nullptr)
+        cudaHostUnregister(const_cast<void *>(registered));
+      if (cudaHostRegister(in_x.data(), in_x.size() * sizeof(float),
+                           cudaHostRegisterMapped) == cudaSuccess)
+        registered = in_x.data();
+      else
+        cudaGetLastError(); // benign: proj stays on the host GEMM
+    }
+  }
+#endif
 }
 
 std::vector<float> Qwen25OmniDiT::generate_mel(const int32_t *codes,

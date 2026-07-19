@@ -89,13 +89,15 @@ void DiTAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
   const int lb = static_cast<int>(look_backward);
 
   for (unsigned int b = 0; b < q.batch(); ++b) {
+    // collapse(2): 16 heads alone under-fill wider CPUs; head x row gives
+    // num_heads*seq independent units (the per-row scores live on the stack)
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (unsigned int h = 0; h < num_heads; ++h) {
-      std::vector<float> scores(seq);
-      const size_t hoff = static_cast<size_t>(h) * hd;
       for (unsigned int i = 0; i < seq; ++i) {
+        std::vector<float> scores(seq);
+        const size_t hoff = static_cast<size_t>(h) * hd;
         const float *qi = q.getData<float>() + q.getIndex(b, 0, i, 0) + hoff;
         const int bi = static_cast<int>(i / block_size);
 

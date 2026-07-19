@@ -39,8 +39,14 @@ public:
    *        the activation pool so the CPU never touches it -> no host<->device
    *        page migration under async (the UVM thrash). Weights keep UVM (false)
    *        because the host writes them at load. The OpenCL cl_mem analog.
+   * @param host_mapped when true (and !device_only), alloc() takes the pinned
+   *        host-mapped (zero-copy) branch for THIS instance regardless of the
+   *        process-global NNTR_CUDA_HOST_MAPPED gate. Used by
+   *        Manager::activationAllocator (NNTR_CUDA_ACT_PINNED) to pin ONLY the
+   *        activation pool: no page migration when host layers interleave with
+   *        device GEMMs, while the weight pool stays managed/device-resident.
    */
-  explicit CudaMemAllocator(bool device_only = false);
+  explicit CudaMemAllocator(bool device_only = false, bool host_mapped = false);
 
   /**
    * @copydoc MemAllocator::alloc
@@ -58,7 +64,9 @@ public:
    */
   void free(void *ptr) override;
 
-  std::string getName() override { return device_only_ ? "cuda-dev" : "cuda-uvm"; }
+  std::string getName() override {
+    return device_only_ ? "cuda-dev" : (host_mapped_ ? "cuda-pinned" : "cuda-uvm");
+  }
 
   // UVM (device_only_=false) is unified host+device memory (the SVM analogue)
   // -> host-addressable; a device_only_ allocator's CONTRACT is "device
@@ -88,6 +96,7 @@ public:
 
 private:
   bool device_only_;
+  bool host_mapped_; /**< per-instance pinned zero-copy mode (see ctor) */
   void track_host_owned(void *ptr);
   bool consume_host_owned(void *ptr);
 };
