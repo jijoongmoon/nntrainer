@@ -111,10 +111,31 @@ models: never assume graph input order — probe dims or widths.
 - **Caching:** the talker reuses one Token2Wav instance across utterances
   and Token2Wav::speak caches the speaker assets + ECAPA embeddings.
 
-**NEXT ACTION:** ① overlap chunked DiT with talker decode (true streaming:
-codes arrive incrementally; DiT time hides behind generation), ② ensure_seq
-weight-reload skip (weights are seq-independent — rebuild graph without
-dropping loaded weights), ③ push / upstream.
+**QS4CX quantization attempt (2026-07-19 late, task #18, IN PROGRESS):**
+thinker quantized fine (8 GB FP32 -> 1.8 GB: `nntr_quantize <staged-dir>
+--fc_dtype QS4CX --embd_dtype Q6_K --lmhead_dtype Q4_0` — lmhead Q6_K save
+unsupported for output_of_causallm, QS4CX lmhead is host-NYI on x86;
+LmHeadLayer is now registered on the cuda ctx (transformer.cpp) since the
+untied thinker needs it there). RSS 22 GB -> 4.3 GB. **BUT the CUDA QS4CX
+FC path mis-computes the thinker's RECTANGULAR GQA projections**: with FP32
+activations layer0_wq (2048x2048, square) is CORRECT while wk/wv
+(2048->256, num_kv=2) come out +-FLT_MAX garbage — both dp4a AND naive
+kernels, so it smells like an [N,K] orientation or per-channel-scale layout
+assumption that is invisible on square weights (gemma4/qwen3 validation
+shapes) and explodes on N=256. With FP16 activations everything goes inf
+AND the Q4_0 lm_head hits "NYI __fallback_gemm_q4_0" (host q4_0 gemm has
+no fp16-activation variant). The built-in unittest_cuda_gemma4 SKIPs its
+int4 cases, so no upstream int4-cuda coverage exists on this branch.
+Talker stays FP32 (bit-exact 127/127 preserved; its nntr_config was
+restored to the FP32 thinker). Quantized dir kept at
+models/qwen2.5-omni-3b-qs4cx (num_to_generate temporarily 3 for probing).
+
+**NEXT ACTION:** ① standalone repro for the rect-N QS4CX cuda FC (quantize
+a 2048->256 FC, compare CudaComputeOps::fc fp32-act vs dequant reference;
+suspects: cuda_fc_qint4.cu payload orientation / scales_to_uvm_fp16 length,
+then fix + rerun the quantized-thinker one-shot), ② overlap chunked DiT
+with talker decode (true streaming), ③ ensure_seq weight-reload skip,
+④ push / upstream.
 
 **FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3, and MIND THE transformers<5 PIN (§3.7).
 

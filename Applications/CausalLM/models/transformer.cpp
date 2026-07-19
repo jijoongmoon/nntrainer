@@ -35,6 +35,7 @@
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context.h>
 #include <cuda_rmsnorm_layer.h>
+#include <lm_head.h>
 #include <per_layer_slice.h>
 #endif
 
@@ -775,6 +776,11 @@ void Transformer::registerCustomLayers() {
     // factory. scalar_multiply is now self-registered in core cuda_context.cpp [T12].
     ct_engine.registerLayerFactory(
       "cuda", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
+    // untied LM head (e.g. the omni thinker: flattenThinkerTextConfig forces
+    // tie_word_embeddings=false). Host impl; its FC-style matmul dispatches
+    // via the tensor's ComputeOps like the other host layers on this ctx.
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<nntrainer::LmHeadLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register layer on cuda ctx: " << e.what()
               << std::endl;
