@@ -743,6 +743,9 @@ void Transformer::registerCustomLayers() {
     // path. Additive — a node with no engine= property keeps routing to CPU.
     ct_engine.registerLayerFactory(
       "gpu", nntrainer::createLayer<causallm::MHACoreLayer>);
+    // untied LM head (omni thinker) — host impl, same slot as on cuda.
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<nntrainer::LmHeadLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register GPU-routed layer on gpu ctx: " << e.what()
               << std::endl;

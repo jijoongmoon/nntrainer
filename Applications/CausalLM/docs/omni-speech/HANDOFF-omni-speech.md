@@ -130,12 +130,34 @@ Talker stays FP32 (bit-exact 127/127 preserved; its nntr_config was
 restored to the FP32 thinker). Quantized dir kept at
 models/qwen2.5-omni-3b-qs4cx (num_to_generate temporarily 3 for probing).
 
-**NEXT ACTION:** ① standalone repro for the rect-N QS4CX cuda FC (quantize
-a 2048->256 FC, compare CudaComputeOps::fc fp32-act vs dequant reference;
-suspects: cuda_fc_qint4.cu payload orientation / scales_to_uvm_fp16 length,
-then fix + rerun the quantized-thinker one-shot), ② overlap chunked DiT
-with talker decode (true streaming), ③ ensure_seq weight-reload skip,
-④ push / upstream.
+**QS4CX debugging round 2 (2026-07-19 night) — kernel EXONERATED, new
+lead:** a standalone micro-repro (scratchpad/fp16diag/qs4cx_rect_repro.cpp:
+quant_qs4cx_f32 pack -> dequant reference vs cuda_fc_qs4cx_gemm_fp32_resident)
+shows the CUDA kernel is CORRECT for N=256/2048/11008 at K=2048 (max|d|
+~1e-4) — the rectangular-kernel theory is dead. The REAL lead from
+NNTR_FC_DEBUG on the failing thinker run: **the attention q/k/v/o
+projections NEVER reach CudaComputeOps::fc** — only the FFN FCs print
+(M=1 decode, wt=8/QS4CX, all correct-looking dims), and NO M>1 (prefill)
+FC of any kind prints, yet the corruption appears in the PREFILL rows of
+wk/wv (wq square = correct, so whatever alternate path runs prefill
+handles square right and rect wrong). fc_layer_cl.cpp's forwarding AND
+incremental_forwarding both call ops->fc unconditionally, so the qkv
+prefill matmul must execute somewhere else entirely — find WHERE (suspects:
+a fused/batched prefill path in causal_lm/mha wiring, fc_prebuild_weight
+consuming the blob differently, or the layers not being
+FullyConnectedLayerCl on this ctx). Breadcrumbs: lmhead must be Q4_0
+(Q6_K save unsupported, QS4CX host-NYI); FP16 activations break
+everything everywhere incl. v8c (+ Q4_0-head fp16 NYI '__fallback_gemm_
+q4_0') — treat FP16-act as a separate later step; quantized dir at
+models/qwen2.5-omni-3b-qs4cx (QS4CX-FP32, num_to_generate=3 for probing);
+LmHeadLayer now registered on BOTH gpu and cuda ctxs.
+
+**NEXT ACTION:** ① find the actual prefill FC execution path for the
+thinker's attention projections (instrument fc_layer_cl / check what layer
+class "layer0_wq" resolves to on the cuda ctx; then why rect N=256 breaks
+there), ② rerun quantized-thinker one-shot after the fix, ③ FP16-act
+enablement as a follow-up, ④ true streaming / ensure_seq reload-skip /
+push.
 
 **FIRST, in a fresh session, REGENERATE THE /tmp DUMPS (they are wiped on reboot)** — see §3, and MIND THE transformers<5 PIN (§3.7).
 
