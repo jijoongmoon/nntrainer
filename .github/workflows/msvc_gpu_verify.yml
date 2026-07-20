@@ -1,0 +1,68 @@
+name: "Windows GPU MSVC verify (opencl+cuda+fp16)"
+
+# Verification for the Windows/MSVC GPU port.
+# See docs/design/msvc_fp16_half_wrapper.md.
+#
+# Compiles + links nntrainer with Intel-OpenCL + NVIDIA-CUDA + fp16 ENABLED,
+# using MSVC cl.exe (x64). MSVC has no native _Float16, so fp16-impl=auto probes
+# and selects the uint16-backed nntrainer::Half wrapper. Runtime fp16/fp32 is
+# chosen by tensor dtype (both supported). Half already validated on Linux
+# (compile + token-identical inference + 1K perf-parity vs native _Float16).
+#
+# NOTE: GitHub-hosted runners have NO Intel/NVIDIA GPU, so this job verifies
+# COMPILE + LINK ONLY (no `meson test`). Runtime perf/accuracy on Windows must be
+# validated on the real machine (Intel Xe3 + RTX 5060).
+#
+# Triggers: push to the working branch (auto-verify each fix) + manual dispatch.
+
+on:
+  push:
+    branches: [ 'ci/msvc-*' ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    name: MSVC opencl+cuda+fp16 compile (Half wrapper)
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install submodules
+        run: git submodule sync && git submodule update --init --recursive
+
+      - name: Install Python deps (meson pinned 1.7.2; 1.8.0 breaks the Windows build)
+        run: pip install meson==1.7.2 ninja
+
+      - name: Install CUDA Toolkit (cudart/nvrtc/cublas/cublasLt + cuda.lib; sets CUDA_PATH)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda
+        with:
+          cuda: '12.6.3'
+          method: 'network'
+
+      - name: Install OpenCL ICD loader via vcpkg (provides OpenCL.lib for find_library)
+        run: vcpkg install opencl:x64-windows
+
+      - name: Prepare MSVC (x64)
+        uses: bus1/cabuild/action/msdevshell@v1
+        with:
+          architecture: x64
+
+      - name: Add CUDA + OpenCL lib dirs to LIB
+        run: |
+          $cudalib = "$env:CUDA_PATH\lib\x64"
+          $opencl  = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib"
+          echo "LIB=$cudalib;$opencl;$env:LIB" >> $env:GITHUB_ENV
+          Write-Host "CUDA_PATH   = $env:CUDA_PATH"
+          Write-Host "cuda lib    = $cudalib"    ; Test-Path $cudalib
+          Write-Host "opencl lib  = $opencl"     ; Test-Path "$opencl\OpenCL.lib"
+
+      - name: meson setup (opencl+cuda+fp16 ON via Half wrapper, clblast OFF)
+        run: meson setup --native-file configurations/windows-native-gpu.ini -Dcuda-path="$env:CUDA_PATH" -Denable-clblast=false builddir
+
+      - name: meson compile (keep-going, surface all errors in one run)
+        run: ninja -C builddir -k 0
