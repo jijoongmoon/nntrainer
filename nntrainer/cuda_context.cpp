@@ -137,31 +137,10 @@ void CudaContext::initialize() noexcept {
       // only legal under cMA=1 — on WDDM the first such touch is a 0xC0000005
       // host AV. The safe WDDM default is the base profile: managed pools +
       // per-op drains.
-      // NNTR_CUDA_DEV_ACT is NOT auto-defaulted in this tree: it swaps the
-      // activation pool to device-only cudaMalloc (manager.h
-      // activationAllocator), which is only legal once the WHOLE forward
-      // chain runs device kernels. This tree still has host layer segments
-      // on the cuda context (reshaped_rms_norm q/k-norm, per_layer_slice,
-      // sigmoid gates, tie_word lm_head) -- any of them touching a
-      // device-only activation is a host SIGSEGV (measured: qwen3 faults in
-      // __fallback_rms_norm_wrt_width_fp16_intrinsic on the first q-norm).
-      // Managed (UVM) activations keep every host segment correct at
-      // cMA-coherent speed; NNTR_CUDA_DEV_ACT=1 remains an explicit opt-in
-      // for trees with a fully device-resident chain.
+      setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
-      // NNTR_CUDA_M2B is NOT auto-defaulted in this tree. The M2-B decode
-      // graph (c1fa0171e) shipped as opt-in with two hard correctness
-      // dependencies that are not present here: (a) the g_m2b_skip_all
-      // embed-only feed is set by runDecode but no graph-walk consumer was
-      // ported (neuralnet.cpp declares the flag; nothing reads it), so every
-      // replay token re-runs the full eager forward on top of the replayed
-      // graph; (b) the decode chain still has host/OpenCL segments (Q6_K
-      // tie_word lm_head -- trackC5e not ported), which read mid-capture UVM
-      // garbage while the stream is capturing. Measured on qwen3 (RTX 5060,
-      // 2026-07-30): M2B=1 -> deterministic decode garbage (" is is are you
-      // in"), M2B=0 -> coherent golden. Explicit NNTR_CUDA_M2B=1 remains an
-      // opt-in for trees that carry both halves.
+      setenv("NNTR_CUDA_M2B", "1", 0);
       // NNTR_DETERMINISTIC keeps the per-op drains: ASYNC removes them and
       // is the one auto-set lever whose host/device overlap can turn a
       // knife-edge logit into a run-to-run coin flip (measured).
@@ -183,11 +162,10 @@ void CudaContext::initialize() noexcept {
       // RMSNORM_CUDA_OFF) still opts out per lever. ASYNC stays off: drain
       // removal is the measured knife-edge nondeterminism lever and adds
       // nothing on top of the graph (58.5 vs 58.4 TPS).
-      // NNTR_CUDA_DEV_ACT / NNTR_CUDA_M2B: not auto-defaulted -- same
-      // missing-dependency rationale as the cMA branch above (host layer
-      // segments remain; no g_m2b_skip_all consumer, no CUDA lm_head).
+      setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+      setenv("NNTR_CUDA_M2B", "1", 0);
     }
 
     add_default_object();
