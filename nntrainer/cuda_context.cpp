@@ -78,6 +78,19 @@ void CudaContext::initialize() noexcept {
     caps_.unified_memory = true; // cudaMallocManaged (UVM) is the default pool
     ml_logi("[CudaContext] %s", caps_.toString().c_str());
 
+    // NNTR_DETERMINISTIC keeps the CUDA per-op drains: the async-submission
+    // lever (NNTR_CUDA_ASYNC) is the one host/device-overlap knob whose overlap
+    // can turn a knife-edge logit into a run-to-run coin flip (measured),
+    // so the determinism contract pins it OFF. overwrite=0 keeps an explicit
+    // user NNTR_CUDA_ASYNC winning. The default path (env unset) is untouched —
+    // NNTR_CUDA_ASYNC keeps its normal default (sync / drains on).
+    // Default-on: keep the CUDA per-op drains (NNTR_CUDA_ASYNC=0) so decode is
+    // reproducible; overwrite=0 lets an explicit NNTR_CUDA_ASYNC win.
+    // NNTR_DETERMINISTIC=0 opts out (async submission allowed).
+    if (const char *det = std::getenv("NNTR_DETERMINISTIC");
+        !(det && det[0] == '0'))
+      setenv("NNTR_CUDA_ASYNC", "0", 0);
+
     add_default_object();
 
     // Unified-Memory allocator: MemoryPool buffers for engine=cuda tensors are
