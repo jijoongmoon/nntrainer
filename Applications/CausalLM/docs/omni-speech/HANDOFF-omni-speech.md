@@ -14,13 +14,46 @@
 
 ---
 
-## 0. TL;DR — the single next action
+## 0. TL;DR — state as of 2026-07-20 (branch pushed through 2dc3d4836)
 
 Building Qwen2.5-Omni **speech output** in nntrainer. Pipeline:
 `input → Thinker(text+hidden) → Talker(codec ids) → DiT(mel) → BigVGAN(24kHz wav)`.
 
-**Thinker, Talker, BigVGAN, DiT are ALL DONE & HF-verified** (2026-07-18, machine
-nntrainer-Galaxy-Book6-Ultra, branch qwen25-omni-multimodal + gauss GPU merge):
+### What WORKS today (all HF-verified, all committed+pushed)
+- **One-shot prompt→speech**, single `nntr_causallm` run, FP32 thinker:
+  `NNTR_ENGINE=cuda NNTR_CAUSALLM_ENGINE=cpu NNTR_CUDA_ASYNC=0 \
+   nntr_causallm <models>/qwen2.5-omni-3b-talker "<prompt>"`
+  → thinker reply 16/16 HF-exact, talker codes 127/127 HF-exact,
+  61440-sample wav, ~168 s, RSS ~22 GB (30 GB box: no concurrent big jobs
+  — background runs of this get OOM-killed; run FOREGROUND).
+- DiT on CUDA: 127-code 45.1 s vs CPU 201.6 s (4.5×), numerics 1.4e-5
+  (split pools via auto NNTR_CUDA_ACT_PINNED; ASYNC=1 is a dead end).
+- Chunked/streamable synthesis (`synthesize_chunked`, NNTR_T2W_CHUNKED=1):
+  block-aligned + bilateral ctx24, log-STFT mean 0.11 vs full render.
+- Build dir: `build_gpu_verify` (opencl+cuda+fp16, clblast OFF). Python:
+  `~/venv-omni` (transformers PINNED 4.57.6 — 5.x has a DiT rotary
+  regression, §3.7). Machine paths §3.9.
+
+### THE single next action (task #18, QS4CX quantization)
+The QS4CX thinker (`<models>/qwen2.5-omni-3b-qs4cx`, 1.8 GB bin, RSS
+4.3 GB) now answers coherently when run DIRECTLY:
+  `NNTR_ENGINE=cuda NNTR_CUDA_ACT_PINNED=1 NNTR_CUDA_DEV_ACT=0 \
+   NNTR_CUDA_M2B=0 NNTR_CUDA_ASYNC=0 nntr_causallm <qs4cx-dir> "<prompt>"`
+  (→ "Parigi. Paris. Paris"; three root-cause fixes in f5a4cf02e, §QS4CX
+  round 3 below). **BUT the talker's ThinkerForCapture E2E path still
+  degenerates with the SAME dir** (reply "user222…", first token 872 then
+  17×15). Repro: point `qwen2.5-omni-3b-talker/nntr_config.json
+  thinker_model_path` at the qs4cx dir (it is currently RESTORED to the
+  FP32 `qwen2.5-omni-3b` dir) and run the one-shot above. Isolate what
+  ThinkerForCapture::generateReply does differently from the direct
+  CausalLM run: its own prefill/decode loop, captureActivations infra,
+  two CUDA models sharing one process (prewarm caches? pool interactions?),
+  prompt/template handling. The direct-vs-E2E pair on the SAME model dir
+  is a perfect A/B — diff their NNTR_DUMP_STATS node streams (the thinker
+  nodes appear after the talker's in the E2E log).
+
+### Older milestone summary (details in the dated sections below)
+**Thinker, Talker, BigVGAN, DiT are ALL DONE & HF-verified** (2026-07-18):
 Stage A velocity max 1.3e-5, Stage B dit_mel max 2.9e-5 / identical stats,
 file-chained Talker→DiT→BigVGAN wav matches HF at max 2 int16 LSB (99.8% ≤1).
 
@@ -248,6 +281,23 @@ affect everyone).
    `build_gpu_verify` (opencl+cuda, clblast OFF). Stage prep:
    `dit_stage_prep.py --outdir <dir>` then `NNTR_DIT_STAGEA=1 nntr_causallm
    <dit model dir> <dir>` (Stage A) / same without env (Stage B full RK4).
+10. Model-dir inventory under Applications/CausalLM/models/ (all gitignored,
+   regenerate with the converters): `qwen2.5-omni-3b` (thinker FP32, the
+   one-shot's verified wiring), `qwen2.5-omni-3b-qs4cx` (QS4CX thinker,
+   direct-run OK / E2E broken; `num_to_generate` currently 1024),
+   `qwen2.5-omni-3b-probe` (FP32 copy with num_to_generate=8 for cheap
+   direct A/B probes — hardlinked bin), `qwen2.5-omni-3b-stage` (FP32
+   staging input for nntr_quantize, `lmhead_untie:true` added),
+   `-talker` (FP32, thinker_model_path toggles the A/B), `-dit`,
+   `-bigvgan`, `-token2wav` (hardlinked union + speaker assets).
+   Quantize recipe: `nntr_quantize <stage> --fc_dtype QS4CX --embd_dtype
+   Q6_K --lmhead_dtype Q4_0 -o <out>` (lmhead Q6_K save unsupported,
+   QS4CX lmhead host-NYI on x86; run it FOREGROUND, NNTR_ENGINE=cpu).
+   Other machine-local build dirs: `build_nofp16` (fp16-off differential
+   build, keep), `/build_gpu_verify` + both in .git/info/exclude.
+   Reference dumps in /tmp (omni_talker_dump / omni_t2w_dump /
+   omni_t2w_full / omni_dit_dump + omni_talker_mini 1-step probe) are
+   EPHEMERAL — regenerate per §3 after reboot.
 
 ---
 
