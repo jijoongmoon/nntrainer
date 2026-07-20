@@ -8,11 +8,46 @@
 // LLMs without linking QuickAIService or any of LauncherApp's REST
 // plumbing.
 
+import java.io.File
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.serialization)
 }
+
+val nntrainerNdkPath =
+    providers.gradleProperty("nntrainerNdkPath").orNull
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: throw GradleException(
+            "Missing -PnntrainerNdkPath. Run " +
+                "Applications/CausalLM/build_android.sh --assemble-aar, or pass " +
+                "the absolute path of the NDK used for the native prebuilts."
+        )
+
+val requestedNdkDirectory = File(nntrainerNdkPath)
+if (!requestedNdkDirectory.isAbsolute) {
+    throw GradleException("nntrainerNdkPath must be absolute: $nntrainerNdkPath")
+}
+val nntrainerNdkDirectory = requestedNdkDirectory.canonicalFile
+val ndkSourcePropertiesFile = nntrainerNdkDirectory.resolve("source.properties")
+if (!ndkSourcePropertiesFile.isFile) {
+    throw GradleException(
+        "Invalid nntrainerNdkPath; source.properties is missing: " +
+            ndkSourcePropertiesFile
+    )
+}
+val installedNdkProperties = Properties()
+ndkSourcePropertiesFile.inputStream().use { installedNdkProperties.load(it) }
+val nntrainerNdkRevision =
+    installedNdkProperties.getProperty("Pkg.Revision")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: throw GradleException(
+            "Pkg.Revision is missing from $ndkSourcePropertiesFile"
+        )
 
 // Sync transitive prebuilts into jniLibs, removing stale files.
 val prebuiltNativeLibsDir =
@@ -30,6 +65,8 @@ val copyPrebuiltNativeLibs = tasks.register<Sync>("copyPrebuiltNativeLibs") {
 android {
     namespace = "com.example.quickdotai"
     compileSdk = 36
+    ndkVersion = nntrainerNdkRevision
+    ndkPath = nntrainerNdkDirectory.path
 
     packaging {
         jniLibs.useLegacyPackaging = true

@@ -61,7 +61,7 @@ typedef enum {
   CAUSAL_LM_BACKEND_NPU = 2,
 } BackendType;
 
-/* causallm::transformer.h defines enum class ModelType at global scope.
+/** causallm::transformer.h defines enum class ModelType at global scope.
  * Suppress our deprecated compat shim when that header is already included
  * to prevent an ambiguous-name error in translation units that include both. */
 #ifndef __TRANSFORMER_H__
@@ -153,7 +153,7 @@ WIN_EXPORT ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
                                        size_t num_messages,
                                        bool add_generation_prompt,
                                        const char **formattedText);
-/*============================================================================
+/**============================================================================
  * Handle-based API (for parallel multi-model execution)
  *
  * The non-handle API above operates on a single process-wide model instance
@@ -484,7 +484,7 @@ WIN_EXPORT ErrorCode runModelHandleWithTool(CausalLmHandle handle,
                                             const char *tool_name,
                                             const char *tool_schema);
 
-/*============================================================================
+/**============================================================================
  * Multimodal API
  *
  * These functions extend the handle-based API to support image+text inputs.
@@ -570,7 +570,7 @@ WIN_EXPORT ErrorCode runMultimodalHandleWithMessagesStreaming(
   int numPatches, int originalHeight, int originalWidth,
   CausalLmTokenCallback callback, void *user_data);
 
-/*============================================================================
+/**============================================================================
  * Multi-image Multimodal API (V-JEPA)
  *
  * These functions extend the multimodal API to support multiple images
@@ -633,7 +633,7 @@ WIN_EXPORT ErrorCode runMultimodalMultiImageHandleWithMessagesStreaming(
   const int *originalHeights, const int *originalWidths,
   CausalLmTokenCallback callback, void *user_data);
 
-/*============================================================================
+/**============================================================================
  * OpenAI JSON streaming API
  *
  * Accepts a JSON string in OpenAI format and processes it through the

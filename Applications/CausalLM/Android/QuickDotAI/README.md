@@ -32,6 +32,8 @@ The CPU-only AAR mode stages `libcausallm.so`,
 `libquick_dot_ai_api.so`, and the nntrainer runtime, builds
 `libquickai_jni.so`, and assembles the QuickDotAI AAR plus SampleTestAPP. It is
 build-only: a connected device is not modified unless `--install` is supplied.
+The script forwards the selected NDK to Gradle. Direct Gradle builds must pass
+`-PnntrainerNdkPath=<absolute-path>`.
 
 Use `--enable-qnn` (and set `QNN_SDK_ROOT`) for a QNN-enabled package.
 `--native-only` skips Gradle assembly, `--cache` reuses a compatible engine

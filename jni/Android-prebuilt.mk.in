@@ -8,6 +8,8 @@ LOCAL_PATH := $(call my-dir)
 # these prebuilts; see the filter in jni/meson.build for what qualifies.
 NNTRAINER_EXPORT_CFLAGS := @NNTRAINER_ABI_FLAGS@
 
+# LOCAL_SRC_FILES is relative to LOCAL_PATH; prefixing it would duplicate the
+# package path when this Android.mk is included relatively.
 include $(CLEAR_VARS)
 
 LOCAL_MODULE := ccapi-nntrainer

@@ -171,6 +171,7 @@ if [[ ! -d "$ANDROID_NDK/toolchains/llvm/prebuilt" ]]; then
     echo "Error: invalid Android NDK root: $ANDROID_NDK" >&2
     exit 1
 fi
+ANDROID_NDK="$(cd "$ANDROID_NDK" && pwd -P)"
 export ANDROID_NDK
 export PATH="$ANDROID_NDK:$PATH"
 
@@ -209,6 +210,8 @@ ANDROID_NDK_MESON="$ANDROID_NDK"
 if [[ "$ANDROID_NDK_HOST" == "windows-x86_64" ]] && command -v cygpath >/dev/null 2>&1; then
     ANDROID_NDK_MESON="$(cygpath -m "$ANDROID_NDK")"
 fi
+
+GRADLE_NDK_ARG="-PnntrainerNdkPath=$ANDROID_NDK_MESON"
 
 if [[ "$ENABLE_QNN" == true && -z "${QNN_SDK_ROOT:-}" ]]; then
     echo "Error: QNN_SDK_ROOT is required with --enable-qnn." >&2
@@ -283,12 +286,24 @@ fi
 NNTRAINER_ANDROID_RESULT="$NNTRAINER_ROOT/builddir/android_build_result"
 NNTRAINER_ANDROID_LIBDIR="$NNTRAINER_ANDROID_RESULT/lib/arm64-v8a"
 NNTRAINER_ABI_FILE="$NNTRAINER_ANDROID_RESULT/nntrainer-abi.ini"
+NNTRAINER_PREBUILT_MK="$NNTRAINER_ANDROID_RESULT/Android.mk"
+
+engine_prebuilt_metadata_valid() {
+    [[ -f "$NNTRAINER_PREBUILT_MK" ]] || return 1
+    grep -Fq 'LOCAL_SRC_FILES := lib/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so' \
+        "$NNTRAINER_PREBUILT_MK" || return 1
+    grep -Fq 'LOCAL_SRC_FILES := lib/$(TARGET_ARCH_ABI)/libnntrainer.so' \
+        "$NNTRAINER_PREBUILT_MK" || return 1
+    ! grep -Fq 'LOCAL_SRC_FILES := $(LOCAL_PATH)/lib/' \
+        "$NNTRAINER_PREBUILT_MK"
+}
 
 engine_cache_valid() {
     local required=(
         "$NNTRAINER_ANDROID_LIBDIR/libnntrainer.so"
         "$NNTRAINER_ANDROID_LIBDIR/libccapi-nntrainer.so"
         "$NNTRAINER_ABI_FILE"
+        "$NNTRAINER_PREBUILT_MK"
     )
     if [[ "$ENABLE_QNN" == true ]]; then
         required+=("$NNTRAINER_ANDROID_LIBDIR/libqnn_context.so")
@@ -297,6 +312,7 @@ engine_cache_valid() {
     for file in "${required[@]}"; do
         [[ -f "$file" ]] || return 1
     done
+    engine_prebuilt_metadata_valid
 }
 
 describe_missing_engine_cache() {
@@ -304,6 +320,7 @@ describe_missing_engine_cache() {
         "$NNTRAINER_ANDROID_LIBDIR/libnntrainer.so"
         "$NNTRAINER_ANDROID_LIBDIR/libccapi-nntrainer.so"
         "$NNTRAINER_ABI_FILE"
+        "$NNTRAINER_PREBUILT_MK"
     )
     if [[ "$ENABLE_QNN" == true ]]; then
         required+=("$NNTRAINER_ANDROID_LIBDIR/libqnn_context.so")
@@ -312,6 +329,9 @@ describe_missing_engine_cache() {
     for file in "${required[@]}"; do
         [[ -f "$file" ]] || echo "  missing: $file" >&2
     done
+    if [[ -f "$NNTRAINER_PREBUILT_MK" ]] && ! engine_prebuilt_metadata_valid; then
+        echo "  incompatible: $NNTRAINER_PREBUILT_MK has stale prebuilt paths" >&2
+    fi
 }
 
 if [[ "$SKIP_ENGINE" == true ]]; then
@@ -343,7 +363,7 @@ else
             "${ENGINE_ARGS[@]}"
     )
     if ! engine_cache_valid; then
-        echo "Error: engine build did not produce all required artifacts." >&2
+        echo "Error: engine build did not produce a compatible artifact set." >&2
         describe_missing_engine_cache
         exit 1
     fi
@@ -352,19 +372,28 @@ fi
 build_legacy_ndk_targets() {
     echo "[4] Building the Android.mk targets."
     local legacy_jni_dir="$CAUSALLM_ROOT/jni"
+    local legacy_modules=(
+        causallm_core
+        nntrainer_causallm
+        nntr_quantize
+        nntr_safetensors_info
+        quick_dot_ai_api
+        quick_dot_ai_test
+    )
     if [[ "$CLEAN" == true ]]; then
         rm -rf "$legacy_jni_dir/libs" "$legacy_jni_dir/obj"
     fi
     (
         cd "$legacy_jni_dir"
+        # APP_MODULES preserves ndk-build's install step; explicit make goals
+        # leave outputs in obj/local instead of copying them to NDK_LIBS_OUT.
         "$NDK_BUILD" \
             NDK_PROJECT_PATH=. \
             NDK_LIBS_OUT=./libs \
             NDK_OUT=./obj \
             APP_BUILD_SCRIPT=./Android.mk \
             NDK_APPLICATION_MK=./Application.mk \
-            causallm_core nntrainer_causallm nntr_quantize \
-            nntr_safetensors_info causallm_api test_api \
+            APP_MODULES="${legacy_modules[*]}" \
             -j "$BUILD_JOBS"
     )
     local file
@@ -536,7 +565,8 @@ fi
 echo "[7] Assembling the QuickDotAI AAR and sample APK."
 (
     cd "$CAUSALLM_ROOT/Android"
-    ./gradlew :QuickDotAI:assembleDebug :SampleTestAPP:assembleDebug
+    ./gradlew "$GRADLE_NDK_ARG" \
+        :QuickDotAI:assembleDebug :SampleTestAPP:assembleDebug
 )
 AAR="$CAUSALLM_ROOT/Android/QuickDotAI/build/outputs/aar/QuickDotAI-debug.aar"
 APK="$CAUSALLM_ROOT/Android/SampleTestAPP/build/outputs/apk/debug/SampleTestAPP-debug.apk"
@@ -576,7 +606,7 @@ fi
 echo "[8] Installing the sample APK and pushing command-line tools."
 (
     cd "$CAUSALLM_ROOT/Android"
-    ./gradlew :SampleTestAPP:installDebug
+    ./gradlew "$GRADLE_NDK_ARG" :SampleTestAPP:installDebug
 )
 
 DEVICE_DIR="/data/local/tmp/Quick.AI"
