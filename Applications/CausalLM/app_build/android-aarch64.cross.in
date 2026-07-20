@@ -3,14 +3,14 @@
 # @ANDROID_NDK@ is substituted with the ANDROID_NDK environment variable.
 
 [binaries]
-c = '@ANDROID_NDK@/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang'
-cpp = '@ANDROID_NDK@/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++'
-ar = '@ANDROID_NDK@/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar'
-strip = '@ANDROID_NDK@/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip'
+c = '@ANDROID_NDK@/toolchains/llvm/prebuilt/@ANDROID_NDK_HOST@/bin/aarch64-linux-android29-clang@ANDROID_CLANG_SUFFIX@'
+cpp = '@ANDROID_NDK@/toolchains/llvm/prebuilt/@ANDROID_NDK_HOST@/bin/aarch64-linux-android29-clang++@ANDROID_CLANG_SUFFIX@'
+ar = '@ANDROID_NDK@/toolchains/llvm/prebuilt/@ANDROID_NDK_HOST@/bin/llvm-ar@ANDROID_EXE_SUFFIX@'
+strip = '@ANDROID_NDK@/toolchains/llvm/prebuilt/@ANDROID_NDK_HOST@/bin/llvm-strip@ANDROID_EXE_SUFFIX@'
 
 [built-in options]
-c_args = ['-march=armv8.2-a+fp16+dotprod+i8mm', '-mcpu=cortex-a53', '-mtune=cortex-a76', '-O3', '-ffast-math']
-cpp_args = ['-march=armv8.2-a+fp16+dotprod+i8mm', '-mcpu=cortex-a53', '-mtune=cortex-a76', '-O3', '-ffast-math', '-frtti', '-fexceptions']
+c_args = ['-O3', '-ffast-math']
+cpp_args = ['-O3', '-ffast-math', '-frtti', '-fexceptions']
 c_link_args = ['-fexceptions', '-fopenmp', '-static-openmp']
 cpp_link_args = ['-fexceptions', '-fopenmp', '-static-openmp']
 

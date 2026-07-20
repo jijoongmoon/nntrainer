@@ -1,42 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
 #
-# QuickDotAI JNI shim build
-#
-# Produces libquickai_jni.so, which forwards JNI calls from Kotlin
-# (com.example.quickdotai.NativeCausalLm) to the C entry points in
-# quick_dot_ai_api.h. The causal_lm_api.so itself (plus its transitive
-# dependencies libnntrainer.so, libccapi-nntrainer.so, libcausallm_core.so,
-# libc++_shared.so) is shipped as a set of prebuilt shared libraries in
-# QuickDotAI/prebuilt_libs/ — see build_api_lib.sh in Applications/CausalLM
-# to regenerate them. API headers are consumed directly from the canonical
-# Applications/CausalLM/api/ directory, so there is no bundled copy to keep
-# in sync. A Gradle copy task in QuickDotAI/build.gradle.kts
-# copies the prebuilt .so files into the AAR's jniLibs/arm64-v8a at build
-# time, so they are discoverable at runtime via System.loadLibrary from
-# whichever app hosts the AAR.
+# Build the JNI shim against the canonical API header and staged arm64-v8a
+# prebuilts. Gradle packages the JNI library and its dependencies.
 cmake_minimum_required(VERSION 3.22.1)
 project(quickai_jni LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Path to the QuickDotAI API headers so we can #include "quick_dot_ai_api.h".
-# Points at the canonical Applications/CausalLM/api/ directory instead of a
-# bundled copy — this file lives at
-# Applications/CausalLM/Android/QuickDotAI/src/main/cpp/CMakeLists.txt, so
-# five levels up reaches Applications/CausalLM/, then into api/.
+# Canonical QuickDotAI API headers.
 set(CAUSALLM_API_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../api")
 
-# Path to the prebuilt native libraries. Layout is flat:
-#   QuickDotAI/prebuilt_libs/lib*.so
-# (only arm64-v8a is supported at the moment — see build_api_lib.sh).
+# Staged arm64-v8a native libraries.
 set(PREBUILT_LIBS_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../prebuilt_libs")
 
-# Register the prebuilt causal_lm_api shared library so the linker can
-# resolve its symbols when linking libquickai_jni.so.
 add_library(quick_dot_ai_api SHARED IMPORTED)
 set_target_properties(quick_dot_ai_api PROPERTIES
     IMPORTED_LOCATION

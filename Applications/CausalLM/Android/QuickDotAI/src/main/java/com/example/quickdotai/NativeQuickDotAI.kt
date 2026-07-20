@@ -5,7 +5,7 @@
  * @file    NativeQuickDotAI.kt
  * @brief   QuickDotAI implementation backed by the handle-based
  *          quick_dot_ai_api.h (routed through libquickai_jni.so → JNI →
- *          libcausallm_api.so).
+ *          libquick_dot_ai_api.so).
  */
 package com.example.quickdotai
 
@@ -65,7 +65,7 @@ class NativeQuickDotAI(
             Log.e(TAG, "load(): native libs unavailable on this device")
             return BackendResult.Err(
                 QuickAiError.MODEL_LOAD_FAILED,
-                "libquickai_jni.so / libcausallm_api.so not available on this device"
+                "libquickai_jni.so / libquick_dot_ai_api.so not available on this device"
             )
         }
 

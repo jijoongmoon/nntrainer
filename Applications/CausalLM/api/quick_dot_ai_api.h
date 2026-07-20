@@ -18,6 +18,10 @@
 #ifndef __QUICK_DOT_AI_API_H__
 #define __QUICK_DOT_AI_API_H__
 
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
+
 /* ── Extended model types (src additions) ────────────────────── */
 #ifdef __CAUSAL_LM_API_H__
 /* Model types already defined from causal_lm_api.h */

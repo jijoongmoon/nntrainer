@@ -56,6 +56,10 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/xlm_roberta \
     $(LOCAL_PATH)/../models/lfm2 \
+    $(LOCAL_PATH)/../api \
+    $(LOCAL_PATH)/../xgrammar/include \
+    $(LOCAL_PATH)/../xgrammar/3rdparty/picojson \
+    $(LOCAL_PATH)/../xgrammar/3rdparty/dlpack/include \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
     $(NNTRAINER_ROOT)/nntrainer/utils \
@@ -109,6 +113,7 @@ LOCAL_LDLIBS := -llog -landroid
 
 LOCAL_SRC_FILES := \
     ../chat_template.cpp \
+    ../factory.cpp \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/sentence_transformer.cpp \
@@ -151,10 +156,33 @@ LOCAL_SRC_FILES := \
     ../models/timm_vit/timm_vit_transformer.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../models/bert/bert_transformer.cpp \
+    ../models/bert/multilingual_tinybert_16mb.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
     ../api/streamer.cpp \
+    ../api/xgrammar_wrapper.cpp \
+    ../api/xgrammar_manager.cpp \
+    ../xgrammar/cpp/compiled_grammar.cc \
+    ../xgrammar/cpp/config.cc \
+    ../xgrammar/cpp/earley_parser.cc \
+    ../xgrammar/cpp/fsm_builder.cc \
+    ../xgrammar/cpp/fsm.cc \
+    ../xgrammar/cpp/grammar_builder.cc \
+    ../xgrammar/cpp/grammar_compiler.cc \
+    ../xgrammar/cpp/grammar_functor.cc \
+    ../xgrammar/cpp/grammar_matcher.cc \
+    ../xgrammar/cpp/grammar_parser.cc \
+    ../xgrammar/cpp/grammar_printer.cc \
+    ../xgrammar/cpp/grammar.cc \
+    ../xgrammar/cpp/json_schema_converter_ext.cc \
+    ../xgrammar/cpp/json_schema_converter.cc \
+    ../xgrammar/cpp/regex_converter.cc \
+    ../xgrammar/cpp/structural_tag.cc \
+    ../xgrammar/cpp/tokenizer_info.cc \
+    ../xgrammar/cpp/testing.cc \
+    ../xgrammar/cpp/support/logging.cc \
+    ../xgrammar/cpp/support/recursion_guard.cc
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -163,25 +191,31 @@ LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_SHARED_LIBRARY)
 
-# Build libcausallm_api.so (shared library - api only)
+# Build libquick_dot_ai_api.so (shared library - api only)
 include $(CLEAR_VARS)
 
 LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
-LOCAL_MODULE := causallm_api
+LOCAL_MODULE := quick_dot_ai_api
 LOCAL_LDLIBS := -llog -landroid
 
 LOCAL_SRC_FILES := \
-    ../api/causal_lm_api.cpp \
+    ../api/quick_dot_ai_api.cpp \
+    ../api/model_callbacks.cpp \
     ../api/model_config.cpp \
+    ../api/model_descriptors_public.cpp \
+    ../api/streamer.cpp \
     ../api/callback_streamer.cpp
 
 LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
-LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES) \
-    $(LOCAL_PATH)/../api
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_SHARED_LIBRARY)
+
+# causallm_api is a build-target alias, not a C ABI alias.
+.PHONY: causallm_api
+causallm_api: quick_dot_ai_api
 
 # Build nntrainer_causallm executable
 include $(CLEAR_VARS)
@@ -199,22 +233,25 @@ LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
 
-# Build test_api executable
+# Build quick_dot_ai_test executable
 include $(CLEAR_VARS)
 
 LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
-LOCAL_MODULE := test_api
+LOCAL_MODULE := quick_dot_ai_test
 LOCAL_LDLIBS := -llog -landroid
 
-LOCAL_SRC_FILES := ../api/test_api.cpp
+LOCAL_SRC_FILES := ../api-app/test_api.cpp
 
-LOCAL_SHARED_LIBRARIES := causallm_api causallm_core nntrainer ccapi-nntrainer
+LOCAL_SHARED_LIBRARIES := quick_dot_ai_api causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
-LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES) \
-    $(LOCAL_PATH)/../api
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
+
+# test_api is a build-target alias for quick_dot_ai_test.
+.PHONY: test_api
+test_api: quick_dot_ai_test
 
 
 # Build nntr_quantize executable
@@ -224,79 +261,12 @@ LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
 LOCAL_MODULE := nntr_quantize
 LOCAL_LDLIBS := -llog -landroid
 
-# Source files
-LOCAL_SRC_FILES := ../quantize.cpp \
-    ../models/causal_lm.cpp \
-    ../models/transformer.cpp \
-    ../models/sentence_transformer.cpp \
-    ../models/model_registry.cpp \
-    ../kv_cache_manager.cpp \
-    ../models/qwen2/qwen2_causallm.cpp \
-    ../models/qwen2/qwen2_embedding.cpp \
-    ../models/qwen3/qwen3_causallm.cpp \
-    ../models/qwen3/qwen3_embedding.cpp \
-    ../models/qwen3_moe/qwen3_moe_causallm.cpp \
-    ../models/qwen3_slim_moe/qwen3_slim_moe_causallm.cpp \
-    ../models/qwen3_cached_slim_moe/qwen3_cached_slim_moe_causallm.cpp \
-    ../models/gpt_oss/gptoss_causallm.cpp \
-    ../models/gpt_oss_cached_slim/gptoss_cached_slim_causallm.cpp \
-    ../huggingface_tokenizer.cpp \
-    ../llm_util.cpp \
-    ../layers/embedding_layer.cpp \
-    ../layers/embedding_pooling_layer.cpp \
-    ../layers/embedding_normalize_layer.cpp \
-    ../layers/per_layer_slice.cpp \
-    ../layers/per_layer_slice_gpu.cpp \
-    ../layers/mha_core.cpp \
-    ../models/qwen3_moe/qwen_moe_layer.cpp \
-    ../layers/reshaped_rms_norm.cpp \
-    ../layers/custom_multiply.cpp \
-    ../layers/causal_conv1d_layer.cpp \
-    ../layers/rms_reverse_norm.cpp \
-    ../layers/rms_norm.cpp \
-    ../layers/rms_norm_gpu.cpp \
-    ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
-    ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
-    ../models/gpt_oss/gpt_oss_moe_layer.cpp \
-    ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
-    ../models/gemma2/gemma2_causallm.cpp \
-    ../models/gemma3/gemma3_causallm.cpp \
-    ../models/gemma3/embedding_gemma.cpp \
-    ../models/gemma4/gemma4_causallm.cpp \
-    ../models/lfm2/lfm2_causallm.cpp \
-    ../models/gemma3/function.cpp \
-    ../models/deberta_v2/deberta_v2.cpp \
-    ../models/bert/bert_transformer.cpp \
-    ../models/xlm_roberta/xlm_roberta.cpp \
-    ../layers/deberta_attention_layer.cpp \
-    ../layers/shared_fully_connected_layer.cpp \
-    ../api/streamer.cpp
+LOCAL_SRC_FILES := ../quantize.cpp
 
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
-LOCAL_C_INCLUDES += \
-    $(LOCAL_PATH)/.. \
-    $(LOCAL_PATH)/../layers \
-    $(LOCAL_PATH)/../models \
-    $(LOCAL_PATH)/../models/gpt_oss \
-    $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
-    $(LOCAL_PATH)/../models/qwen2 \
-    $(LOCAL_PATH)/../models/qwen3 \
-    $(LOCAL_PATH)/../models/qwen3_moe \
-    $(LOCAL_PATH)/../models/qwen3_slim_moe \
-    $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
-    $(LOCAL_PATH)/../models/gemma2 \
-    $(LOCAL_PATH)/../models/gemma3 \
-    $(LOCAL_PATH)/../models/bert \
-    $(LOCAL_PATH)/../models/deberta_v2 \
-    $(LOCAL_PATH)/../models/gemma4 \
-    $(LOCAL_PATH)/../models/xlm_roberta \
-    $(LOCAL_PATH)/../models/lfm2 \
-    $(NNTRAINER_ROOT)/nntrainer/utils \
-    $(NNTRAINER_ROOT)/nntrainer/tensor \
-    $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
-    $(NNTRAINER_ROOT)/nntrainer/layers/llm \
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
 

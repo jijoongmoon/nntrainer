@@ -60,7 +60,25 @@ foreach define : extra_defines
     nntrainer_abi_defines += define
   endif
 endforeach
+nntrainer_abi_flags = []
+if arm_march_flag != ''
+  nntrainer_abi_flags += arm_march_flag
+endif
+nntrainer_abi_flags += nntrainer_abi_defines
+
+nntrainer_abi_meson_args = []
+foreach flag : nntrainer_abi_flags
+  nntrainer_abi_meson_args += '\'@0@\''.format(flag)
+endforeach
+
 and_conf.set('NNTRAINER_ABI_DEFINES', ' '.join(nntrainer_abi_defines))
+and_conf.set('NNTRAINER_ABI_FLAGS', ' '.join(nntrainer_abi_flags))
+and_conf.set('NNTRAINER_ABI_MESON_ARGS', ', '.join(nntrainer_abi_meson_args))
+if get_option('enable-fp16')
+  and_conf.set('NNTRAINER_ENABLE_FP16', 'true')
+else
+  and_conf.set('NNTRAINER_ENABLE_FP16', 'false')
+endif
 
 and_conf.set('VERSION_MAJOR', nntrainer_version_split[0])
 and_conf.set('VERSION_MINOR', nntrainer_version_split[1])
@@ -151,6 +169,13 @@ android_prebuilt_mk = configure_file(input: 'Android-prebuilt.mk.in',
 )
 
 install_data(android_prebuilt_mk, rename: 'Android.mk', install_dir: nntrainer_prefix)
+
+nntrainer_abi_file = configure_file(input: 'nntrainer-abi.ini.template',
+  output: 'nntrainer-abi.ini',
+  configuration: and_conf
+)
+
+install_data(nntrainer_abi_file, install_dir: nntrainer_prefix)
 
 configure_file(input: 'Application.mk', output: 'Application.mk',
   copy: true

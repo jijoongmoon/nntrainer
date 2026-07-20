@@ -273,15 +273,6 @@ if get_option('enable-qnn-models')
         '-DENABLE_QNN=1',
         '-DENABLE_QNN_MODELS=1',
     ]
-    # Mirrors QuickAI's root meson.build Android-specific ARM flags; the QNN
-    # infra/model sources don't strictly need these today, but keep parity
-    # in case a future change relies on them.
-    if get_option('platform') == 'android'
-        cpp_args += [
-            '-D__ARM_NEON__=1',
-            '-DUSE_NEON=1',
-        ]
-    endif
 endif
 
 if get_option('platform') == 'windows'

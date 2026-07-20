@@ -64,6 +64,16 @@ if is_android
   _nntr_libdir = _nntr_result / 'lib' / 'arm64-v8a'
   _nntr_incdir = _nntr_result / 'include' / 'nntrainer'
 
+  nntrainer_abi_schema = meson.get_external_property(
+    'nntrainer_abi_schema', 0)
+  if nntrainer_abi_schema != 1
+    error('nntrainer ABI metadata is missing or unsupported. Rebuild the ' +
+          'Android engine and pass android_build_result/nntrainer-abi.ini ' +
+          'as a cross file.')
+  endif
+  nntrainer_abi_cflags = meson.get_external_property(
+    'nntrainer_abi_cflags', [])
+
   libnntrainer = cxx.find_library('nntrainer', dirs: [_nntr_libdir])
   libccapi     = cxx.find_library('ccapi-nntrainer', dirs: [_nntr_libdir])
 
@@ -102,11 +112,12 @@ else
   ]
     nntrainer_inc_args += ['-I' + p]
   endforeach
+  nntrainer_abi_cflags = []
 endif
 
 nntrainer_dep = declare_dependency(
   dependencies: [libnntrainer, libccapi],
-  compile_args: nntrainer_inc_args,
+  compile_args: nntrainer_inc_args + nntrainer_abi_cflags,
 )
 
 # ── OpenMP / threads ────────────────────────────────────────────────────
@@ -172,11 +183,6 @@ endif
 # ── Extra defines ───────────────────────────────────────────────────────
 extra_defines = []
 
-# FP16 is ARM-only (__fp16 type not available on x86)
-if get_option('enable-fp16') and is_android
-  extra_defines += ['-DENABLE_FP16=1', '-DUSE__FP16=1']
-endif
-
 # Single QNN switch. enable-qnn on → QNN infra + QNN models (gemma4-e2b-qnn
 # folded into libcausallm) + the multimodal run path (api runMultimodal* →
 # base Transformer::run_image; vision encoders like gauss-3.8-vit are overlaid
@@ -194,17 +200,6 @@ endif
 foreach d : extra_defines
   add_project_arguments(d, language: ['c', 'cpp'])
 endforeach
-
-# Android-specific ARM flags
-if is_android
-  _arm_args = [
-    '-D__ARM_NEON__=1',
-    '-DUSE_NEON=1',
-  ]
-  foreach a : _arm_args
-    add_project_arguments(a, language: ['c', 'cpp'])
-  endforeach
-endif
 
 # ── libcausallm.so sources ────────────────────────────────────────────────
 # NOTE: Do NOT include causallm_root / 'api' sources here (besides streamer) -

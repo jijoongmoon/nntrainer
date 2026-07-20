@@ -9,7 +9,7 @@
  * language model. Two concrete implementations are shipped in this AAR:
  *
  *  - [NativeQuickDotAI] — routes non-Gemma models through JNI to
- *    libcausallm_api.so, the handle-based C API built from
+ *    libquick_dot_ai_api.so, the handle-based C API built from
  *    Applications/CausalLM.
  *  - [LiteRTLm]         — routes Gemma-family models through the
  *    LiteRT-LM Kotlin API.

@@ -46,9 +46,10 @@ Key files:
 ```text
 NativeQuickDotAI
   └── NativeCausalLm.ensureLoaded()
-      ├── System.loadLibrary("qnn_context")
-      └── System.loadLibrary("quickai_jni")
+      ├── optionally loads libqnn_context.so when it is packaged
+      └── loads libquickai_jni.so
             └── links/calls libquick_dot_ai_api.so
+                  └── links/calls libcausallm.so
 ```
 
 The native API surface is declared in `api/quick_dot_ai_api.h`.
@@ -154,14 +155,19 @@ contract rather than inventing a separate model API.
 
 ## 📦 Packaging
 
-`apk-build-install.sh` performs the current full Android workflow:
+`../build_android.sh` owns the current Android packaging workflow. Its
+no-option mode builds the CPU-only Android.mk targets. `--assemble-aar` builds
+the standalone app, stages `libcausallm.so`,
+`libquick_dot_ai_api.so`, and their nntrainer dependencies into
+`QuickDotAI/prebuilt_libs/`, and assembles the QuickDotAI AAR and
+SampleTestAPP without touching a device.
 
-1. Build native libraries with `./build.sh --platform=android --enable-qnn --clean`.
-2. Install/copy native shared libraries through `apk_install_android.sh`.
-3. Copy `.so` files into `Android/QuickDotAI/prebuilt_libs/`.
-4. Run Gradle install for `:SampleTestAPP`.
-
-Set `NDK_ROOT` inside `apk-build-install.sh` before using it on a new machine.
+Use `--enable-qnn` with `QNN_SDK_ROOT` to include the QNN backend. Device
+installation and CLI deployment are opt-in through `--install`; use
+`ANDROID_SERIAL` to select a device when necessary. `--native-only` stops after
+native staging, while `--cache` and `--skip-engine` provide permissive and
+strict engine reuse respectively. In an app/AAR mode, `--legacy-ndk` also
+builds the core, CLI, quantizer, and API targets in `jni/Android.mk`.
 
 ## 📎 Related Docs
 

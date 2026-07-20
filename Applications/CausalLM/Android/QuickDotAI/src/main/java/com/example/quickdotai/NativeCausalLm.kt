@@ -3,58 +3,33 @@
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
  * @file    NativeCausalLm.kt
- * @brief   JNI bindings for libcausallm_api.so (handle-based API only).
- *
- * All methods here are 1:1 with the handle-based entry points added to
- * quick_dot_ai_api.h. Higher-level lifecycle (serialization, registry,
- * threading) lives in [NativeQuickDotAI] and in the host app — this
- * file is only the JNI glue.
+ * @brief   JNI bindings for the handle-based QuickDotAI API.
  */
 package com.example.quickdotai
 
 /**
- * @brief Low-level JNI bridge to libcausallm_api.so.
+ * @brief Low-level JNI bridge for QuickDotAI.
  *
- * Loaded libraries (all bundled into the QuickDotAI AAR under
- * jniLibs/arm64-v8a/):
- *   - libquickai_jni.so     (JNI shim produced by src/main/cpp)
- *   - libcausallm_api.so    (the C API lib built from Applications/CausalLM)
- *   - libcausallm_core.so   (transitive)
- *   - libnntrainer.so       (transitive)
- *   - libccapi-nntrainer.so (transitive)
- *
- * Any non-zero `errorCode` value corresponds to `ErrorCode` in
- * quick_dot_ai_api.h — see [QuickAiError.fromNativeCode] for the Kotlin
- * mapping.
- *
+ * Public to preserve JNI symbol names; use [NativeQuickDotAI] instead.
  * @hide
- *
- * Implementation detail: this object is `public` rather than `internal`
- * because Kotlin's `internal`-visibility name mangling (`$modulename`
- * suffix) would interfere with JNI symbol resolution — the JNI entry
- * points in quickai_jni.cpp use the unmangled `Java_com_example_quickdotai_
- * NativeCausalLm_<method>` names. Treat it as implementation detail and
- * always go through [NativeQuickDotAI].
  */
 object NativeCausalLm {
 
     @Volatile
     private var loaded: Boolean = false
 
-    /**
-     * @brief Must be called once before any other method. Swallows
-     * UnsatisfiedLinkError so callers can still return a clean
-     * MODEL_LOAD_FAILED error to their own clients when the native lib
-     * is missing (e.g. during emulator development without the
-     * prebuilt .so files).
-     */
+    /** @brief Load the required native libraries once. */
     @Synchronized
     fun ensureLoaded(): Boolean {
         if (loaded) return true
         return try {
-            // qnn_context must be loaded before quickai_jni
-            System.loadLibrary("qnn_context")
-            // quickai_jni dlopens libcausallm_api.so as part of its JNI_OnLoad.
+            // CPU-only packages omit the optional QNN backend.
+            try {
+                System.loadLibrary("qnn_context")
+                android.util.Log.i(TAG, "Loaded optional QNN backend (qnn_context)")
+            } catch (t: UnsatisfiedLinkError) {
+                android.util.Log.d(TAG, "No optional QNN backend present (CPU build)")
+            }
             System.loadLibrary("quickai_jni")
 
             // Optional model-extension plugin. A downstream project may ship a

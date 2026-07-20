@@ -19,6 +19,27 @@ dependencies {
 
 Only `arm64-v8a` prebuilt native libraries are currently supported.
 
+## Build and packaging
+
+From `Applications/CausalLM`, run:
+
+```bash
+export ANDROID_NDK=/path/to/your/android-ndk
+./build_android.sh --assemble-aar
+```
+
+The CPU-only AAR mode stages `libcausallm.so`,
+`libquick_dot_ai_api.so`, and the nntrainer runtime, builds
+`libquickai_jni.so`, and assembles the QuickDotAI AAR plus SampleTestAPP. It is
+build-only: a connected device is not modified unless `--install` is supplied.
+
+Use `--enable-qnn` (and set `QNN_SDK_ROOT`) for a QNN-enabled package.
+`--native-only` skips Gradle assembly, `--cache` reuses a compatible engine
+when available, and `--skip-engine` requires a reusable engine to exist.
+`--legacy-ndk` additionally builds the core, CLI, quantizer, and API targets
+from `jni/Android.mk`. With no options, the script builds those targets only.
+`--skip-install` stages native outputs without Gradle or device installation.
+
 ## 🧭 API Surface
 
 Package: `com.example.quickdotai`

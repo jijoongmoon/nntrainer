@@ -14,12 +14,7 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
-// Mirrors the flat prebuilt .so files from QuickDotAI/prebuilt_libs/ into an
-// ABI-nested directory (build/generated/jniLibs/arm64-v8a/) so that Android
-// Gradle's standard jniLibs machinery can bundle them into the AAR.
-//
-// This MUST be a Sync (not a Copy): the destination has to EXACTLY mirror
-// prebuilt_libs/, deleting any .so that is no longer staged.
+// Sync transitive prebuilts into jniLibs, removing stale files.
 val prebuiltNativeLibsDir =
     layout.buildDirectory.dir("generated/jniLibs/arm64-v8a")
 
@@ -27,6 +22,8 @@ val copyPrebuiltNativeLibs = tasks.register<Sync>("copyPrebuiltNativeLibs") {
     from(project.file("prebuilt_libs"))
     include("*.so")
     include("htp_backend_ext_config.json")
+    // externalNativeBuild already packages the API library and C++ runtime.
+    exclude("libquick_dot_ai_api.so", "libc++_shared.so")
     into(prebuiltNativeLibsDir)
 }
 
@@ -43,13 +40,15 @@ android {
         minSdk = 33
 
         ndk {
-            // Only arm64-v8a is supported by the prebuilt libcausallm_api.so.
+            // Only arm64-v8a is supported by the prebuilt CausalLM libraries.
             abiFilters += listOf("arm64-v8a")
         }
 
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++17 -frtti -fexceptions"
+                // Match prebuilts and package one shared C++ runtime.
+                arguments += "-DANDROID_STL=c++_shared"
             }
         }
 
@@ -107,7 +106,7 @@ android {
 // The merge*JniLibFolders task reads android.sourceSets.main.jniLibs and
 // stages the native libraries for packaging into the AAR, so make it
 // depend on the copy task. ExternalNativeBuild also benefits because the
-// CMake link step reads libcausallm_api.so directly from prebuilt_libs.
+// CMake link step reads libquick_dot_ai_api.so directly from prebuilt_libs.
 tasks.matching {
     it.name.startsWith("merge") && it.name.endsWith("JniLibFolders")
 }.configureEach {

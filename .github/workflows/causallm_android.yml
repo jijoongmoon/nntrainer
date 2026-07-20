@@ -37,7 +37,7 @@ jobs:
         sudo apt-get install -y tar wget gzip libglib2.0-dev libjson-glib-dev \
           libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libunwind-dev \
           googletest liborc-0.4-dev flex bison libopencv-dev pkg-config \
-          python3-dev python3-numpy python3 meson ninja-build \
+          python3-dev python3-numpy python3 meson ninja-build unzip \
           libflatbuffers-dev flatbuffers-compiler protobuf-compiler
 
     - name: Install submodules
@@ -62,4 +62,51 @@ jobs:
       if: github.event_name != 'pull_request' || env.rebuild == '1'
       run: |
         chmod +x Applications/CausalLM/build_android.sh
-        ./Applications/CausalLM/build_android.sh --skip-qnn --skip-install
+        if ./Applications/CausalLM/build_android.sh --invalid-option; then
+          echo "build_android.sh accepted an invalid option"
+          exit 1
+        fi
+        ./Applications/CausalLM/build_android.sh \
+          --skip-qnn --assemble-aar --legacy-ndk
+
+    - name: Verify ABI propagation and CPU-only AAR
+      run: |
+        ABI_FILE=builddir/android_build_result/nntrainer-abi.ini
+        AAR=Applications/CausalLM/Android/QuickDotAI/build/outputs/aar/QuickDotAI-debug.aar
+
+        test -f "$ABI_FILE"
+        grep -q 'nntrainer_abi_schema = 1' "$ABI_FILE"
+        grep -q -- '-march=' "$ABI_FILE"
+        grep -q -- '-DENABLE_FP16=1' "$ABI_FILE"
+        grep -q -- '-DUSE__FP16=1' "$ABI_FILE"
+
+        unzip -Z1 "$AAR" > /tmp/quickdotai-aar-entries.txt
+        for lib in \
+          libquickai_jni.so libquick_dot_ai_api.so libcausallm.so \
+          libnntrainer.so libccapi-nntrainer.so libc++_shared.so; do
+          grep -qx "jni/arm64-v8a/$lib" /tmp/quickdotai-aar-entries.txt
+        done
+        if grep -E 'jni/arm64-v8a/(libqnn_context|libQnn.*)\.so' \
+          /tmp/quickdotai-aar-entries.txt; then
+          echo "CPU-only AAR contains QNN libraries"
+          exit 1
+        fi
+
+        grep -q -- '-march=armv8.2-a+fp16+dotprod+i8mm' \
+          builddir_app/compile_commands.json
+        grep -q -- '-DENABLE_FP16=1' builddir_app/compile_commands.json
+        grep -q -- '-DUSE__FP16=1' builddir_app/compile_commands.json
+
+    - name: Verify C header and engine cache compatibility
+      run: |
+        cat > /tmp/quick_dot_ai_api_smoke.c <<'EOF'
+        #include "quick_dot_ai_api.h"
+        int main(void) { return 0; }
+        EOF
+        "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang" \
+          -fsyntax-only \
+          -IApplications/CausalLM/api \
+          /tmp/quick_dot_ai_api_smoke.c
+
+        ./Applications/CausalLM/build_android.sh \
+          --cache --skip-qnn --native-only
