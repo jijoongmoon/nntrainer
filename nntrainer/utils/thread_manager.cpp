@@ -38,14 +38,20 @@ namespace nntrainer {
 
 ThreadManagerConfig ThreadManager::config_ = {};
 
-ThreadManager::ThreadManager() {}
-
-ThreadManager &ThreadManager::Global() {
-  // Out-of-line on purpose — single process-wide instance (see header note).
+/** @brief Return the ThreadManager singleton. */
+template <>
+NNTRAINER_SINGLETON_API ThreadManager &Singleton<ThreadManager>::Global() {
   static ThreadManager instance;
   instance.initializeOnce();
   return instance;
 }
+
+/** @brief Return the process-wide ThreadManager singleton. */
+NNTRAINER_SINGLETON_API ThreadManager &ThreadManager::Global() {
+  return Singleton<ThreadManager>::Global();
+}
+
+ThreadManager::ThreadManager() {}
 
 ThreadManager::~ThreadManager() {
 #if defined(__linux__) || defined(__ANDROID__)

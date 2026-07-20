@@ -30,6 +30,14 @@ std::mutex &bufferMutex() {
 }
 } // namespace
 
+/** @brief Return the ClBufferManager singleton. */
+template <>
+NNTRAINER_SINGLETON_API ClBufferManager &Singleton<ClBufferManager>::Global() {
+  static ClBufferManager instance;
+  instance.initializeOnce();
+  return instance;
+}
+
 void ClBufferManager::initBuffers() {
   // Allocation is deferred to the first use of each region, in the getters
   // below. Allocating them here cost data_input plus max_qs x (scale + quant +

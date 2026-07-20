@@ -72,6 +72,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace nntrainer {
 
+/** @brief Forward declaration of ThreadManager. */
+class ThreadManager;
+/** @brief Return the ThreadManager singleton. */
+template <>
+NNTRAINER_SINGLETON_API ThreadManager &Singleton<ThreadManager>::Global();
+
 #if defined(__GNUC__)
 #define CACHELINE_ALIGNED __attribute__((__aligned__(64)))
 #elif defined(_MSC_VER)
@@ -149,13 +155,8 @@ public:
   ThreadManager();
   ~ThreadManager();
 
-  /**
-   * @brief Get the process-wide instance (out-of-line override of
-   *        Singleton<T>::Global() — one worker pool per process under shared
-   *        linking; see opencl::ContextManager::Global() for the full
-   *        static-vs-shared note).
-   */
-  static ThreadManager &Global();
+  /** @brief Return the process-wide ThreadManager singleton. */
+  static NNTRAINER_SINGLETON_API ThreadManager &Global();
 
   /**
    * @brief parallize loop for given function
