@@ -25,6 +25,17 @@
 namespace nntrainer {
 
 namespace {
+// NNTR_POISON_FILL=1: fill fresh allocations with 0x55 instead of 0 —
+// an uninit-consumer discriminator (change-but-stable output => uninit
+// consumer; still-intermittent => in-kernel/schedule-dependent).
+unsigned char cuda_fill_byte() {
+  static const unsigned char b = []() -> unsigned char {
+    const char *e = std::getenv("NNTR_POISON_FILL");
+    return (e && e[0] == '1') ? (unsigned char)0x55 : (unsigned char)0x00;
+  }();
+  return b;
+}
+
 // Host-fallback ownership set (pointers from MemAllocator::alloc, not
 // cudaMallocManaged). ContextManager is a global singleton so no per-instance
 // state is needed; keep this hidden in the .cpp.
@@ -110,8 +121,9 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
           }
           // Honor MemAllocator's calloc contract (per-process nondeterminism
           // class): cudaHostAlloc gives no zero guarantee — the runtime may
-          // recycle pinned blocks.
-          std::memset(hp, 0, size);
+          // recycle pinned blocks. 0x55 under NNTR_POISON_FILL=1
+          // (uninit-consumer discriminator).
+          std::memset(hp, cuda_fill_byte(), size);
           *ptr = hp;
           if (dbg)
             fprintf(stderr,
@@ -165,8 +177,8 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
       // cudaMallocManaged contents are undefined. Device-side memset covers
       // both (legal on managed under WDDM cMA==0 — it is a DEVICE access);
       // weights are fully overwritten at load so the only lasting cost is a
-      // one-time device fill at allocation.
-      cudaMemset(dptr, 0, size);
+      // one-time device fill at allocation. 0x55 under NNTR_POISON_FILL=1.
+      cudaMemset(dptr, cuda_fill_byte(), size);
       *ptr = dptr;
       if (dbg)
         fprintf(stderr, "[UVMDBG] %s %zu bytes -> %p OK\n",
