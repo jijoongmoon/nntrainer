@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   qnn_kv_cache_manager.cpp
+ * @brief  Implementation of QnnKvCacheManager: prefill/generation cache
+ *         bookkeeping, ring-buffer append/compaction for DDTree speculative
+ *         decoding, and cache save/load persistence.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
 #include "qnn_kv_cache_manager.h"
 
 #include <algorithm>

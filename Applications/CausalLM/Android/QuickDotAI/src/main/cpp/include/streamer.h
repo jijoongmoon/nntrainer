@@ -5,6 +5,8 @@
  * @file    streamer.h
  * @brief   Minimal C-callable base streamer used by the handle-based
  *          `runModelHandleStreaming` entry point in quick_dot_ai_api.h.
+ * @author  junbong.yu <junbong.yu@samsung.com>
+ * @bug     No known bugs except for NYI items
  *
  * This is intentionally a very thin vtable-based polymorphism layer so
  * that:

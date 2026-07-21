@@ -1922,7 +1922,7 @@ ErrorCode runModelHandleWithTool(CausalLmHandle handle,
                        kAutoTextGenerationModelIndex, grammar);
 }
 
-/*============================================================================
+/**===========================================================================
  * Legacy non-handle API implementation
  *============================================================================*/
 
@@ -1949,7 +1949,7 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
   return metrics_on_handle(get_default_handle(), metrics);
 }
 
-/*============================================================================
+/**===========================================================================
  * Handle-based API implementation
  *============================================================================*/
 
@@ -2168,7 +2168,7 @@ ErrorCode getPerformanceMetricsHandle(CausalLmHandle handle,
   return metrics_on_handle(*handle, metrics);
 }
 
-/*============================================================================
+/**===========================================================================
  * Internal streaming helper
  *============================================================================*/
 
@@ -2432,7 +2432,7 @@ ErrorCode cancelModelHandle(CausalLmHandle handle) {
   return CAUSAL_LM_ERROR_NONE;
 }
 
-/*============================================================================
+/**===========================================================================
  * Multimodal API Implementation
  *
  * Preconditions: the handle must have been loaded from a multi-model
@@ -2860,7 +2860,7 @@ ErrorCode runMultimodalHandleWithMessages(
   return CAUSAL_LM_ERROR_NONE;
 }
 
-/*============================================================================
+/**===========================================================================
  * OpenAI messages streaming variants
  *============================================================================*/
 
@@ -2998,7 +2998,7 @@ ErrorCode runMultimodalHandleWithMessagesStreaming(
   }
 }
 
-/*============================================================================
+/**===========================================================================
  * OpenAI JSON streaming API implementation
  *============================================================================*/
 

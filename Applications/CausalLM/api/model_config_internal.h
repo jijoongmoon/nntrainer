@@ -3,6 +3,8 @@
  * @file   model_config_internal.h
  * @brief  Internal structures and registration for api.
  *         Self-contained — does NOT depend on upstream causal_lm_api headers.
+ * @author Eunju Yang <ej.yang@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #ifndef __QUICK_DOT_AI_MODEL_CONFIG_INTERNAL_H__

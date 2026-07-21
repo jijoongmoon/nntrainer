@@ -2,6 +2,8 @@
 /**
  * @file    test_api.cpp
  * @brief   Test application for src C API
+ * @author  Eunju Yang <ej.yang@samsung.com>
+ * @bug     No known bugs except for NYI items
  * @note    This file only includes quick_dot_ai_api.h and standard headers.
  *          It links against libquick_dot_ai_api.so.
  */

@@ -2,6 +2,8 @@
 /**
  * @file   quick_dot_ai_qnn_base.h
  * @brief  QNN model for Quick.AI template
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  * @note   This file implements a layer that executes QNN binary file within
  * transformer.h architecture.
  *

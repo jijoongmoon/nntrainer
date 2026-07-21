@@ -4,6 +4,8 @@
  * @brief  Public model descriptor self-registration. Zero proprietary-model
  *         literals — proprietary/extension models register themselves in
  *         their own TUs.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  *
  * config_name values verified against get_model_name_from_type() in
  * quick_dot_ai_api.cpp.  arch_string values verified against

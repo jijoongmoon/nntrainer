@@ -5,6 +5,8 @@
  * @file    callback_streamer.h
  * @brief   BaseStreamer implementation that forwards every delta to a
  *          user-supplied C function pointer.
+ * @author  junbong.yu <junbong.yu@samsung.com>
+ * @bug     No known bugs except for NYI items
  *
  * This is the streamer used by the JNI bridge in QuickAI: the Kotlin
  * side hands the JNI entry point a listener object, and the JNI entry

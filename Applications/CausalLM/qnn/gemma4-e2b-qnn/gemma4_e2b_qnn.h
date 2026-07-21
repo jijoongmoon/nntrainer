@@ -2,6 +2,8 @@
 /**
  * @file   gemma4_e2b_qnn.h
  * @brief  QNN model extension for Gemma 4 E2B (with PLE)
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #ifndef __GEMMA4_E2B_QNN_H__

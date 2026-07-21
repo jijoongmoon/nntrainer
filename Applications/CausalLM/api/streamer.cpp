@@ -5,6 +5,8 @@
  * @file    streamer.cpp
  * @brief   Null-safe wrappers around the BaseStreamer vtable declared in
  *          streamer.h. See AsyncAndStreaming.md §3.1.
+ * @author  junbong.yu <junbong.yu@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #include "streamer.h"

@@ -1,3 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   qnn_kv_cache_manager.h
+ * @brief  Per-layer KV cache buffer management for QNN models: prefill and
+ *         generation cache bookkeeping, ring-buffer append/compaction for
+ *         DDTree speculative decoding, and cache save/load persistence.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
 #ifndef __QNN_KV_CACHE_MANAGER_H__
 #define __QNN_KV_CACHE_MANAGER_H__
 

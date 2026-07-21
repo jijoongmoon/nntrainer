@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-/*
+/**
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
  * @file    quickai_jni.cpp
@@ -7,6 +7,8 @@
  *          com.example.quickdotai.NativeCausalLm object to the
  *          handle-based C entry points declared in
  *          Applications/CausalLM/api/quick_dot_ai_api.h.
+ * @author  junbong.yu <junbong.yu@samsung.com>
+ * @bug     No known bugs except for NYI items
  *
  * This file contains no business logic — only JNI marshalling:
  *   jstring   <-> const char*

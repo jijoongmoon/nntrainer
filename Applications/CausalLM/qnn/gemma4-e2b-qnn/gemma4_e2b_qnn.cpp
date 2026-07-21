@@ -4,6 +4,8 @@
  * @brief  QNN model implementation for Gemma 4 E2B with PLE.
  *         Follows the shared QNN KV-cache pattern; PLE handling layered on
  *         top.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #include "gemma4_e2b_qnn.h"

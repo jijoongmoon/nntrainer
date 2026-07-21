@@ -2,6 +2,8 @@
 /**
  * @file   vjepa2_qnn.cpp
  * @brief  QNN model implementation for V-JEPA2 video encoder.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  * @note   This class is not to be executed alone.
  *
  */

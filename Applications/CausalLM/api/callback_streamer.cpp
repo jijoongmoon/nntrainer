@@ -6,6 +6,8 @@
  * @brief   Implementation of the CallbackStreamer vtable, which routes
  *          every decoded-token delta to a user-supplied callback.
  *          See AsyncAndStreaming.md §3.2 at the repo root.
+ * @author  junbong.yu <junbong.yu@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #include "callback_streamer.h"
