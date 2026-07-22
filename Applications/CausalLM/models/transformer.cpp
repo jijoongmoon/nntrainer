@@ -10,6 +10,7 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <cstdio>
 #include <fstream>
 #include <mutex>
 
@@ -179,6 +180,26 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                              ? cfg["sliding_window_pattern"].get<unsigned int>()
                              : 1;
   MAX_POSITION_EMBEDDINGS = cfg["max_position_embeddings"].get<unsigned int>();
+  // The RoPE frequency tables are precomputed for positions
+  // [0, MAX_POSITION_EMBEDDINGS) (precompute_freqs in mha_core), so a runtime
+  // window past the model cap reads beyond the table -- SIGSEGV in
+  // compute_rotary_emb_value once prefill crosses that position. Clamp
+  // instead of crashing: positions past the trained range carry no value,
+  // and a genuine long-context model raises its config cap so the clamp
+  // adapts.
+  if (MAX_SEQ_LEN > MAX_POSITION_EMBEDDINGS ||
+      INIT_SEQ_LEN > MAX_POSITION_EMBEDDINGS) {
+    std::fprintf(stderr,
+                 "[causallm] WARNING: requested window (max_seq_len=%u, "
+                 "init_seq_len=%u) exceeds the model's "
+                 "max_position_embeddings=%u; clamping (RoPE tables only "
+                 "cover the model range).\n",
+                 MAX_SEQ_LEN, INIT_SEQ_LEN, MAX_POSITION_EMBEDDINGS);
+    if (MAX_SEQ_LEN > MAX_POSITION_EMBEDDINGS)
+      MAX_SEQ_LEN = MAX_POSITION_EMBEDDINGS;
+    if (INIT_SEQ_LEN > MAX_SEQ_LEN)
+      INIT_SEQ_LEN = MAX_SEQ_LEN;
+  }
   if (cfg.contains("rope_theta")) {
     ROPE_THETA = cfg["rope_theta"].get<unsigned int>();
   } else if (cfg.contains("rope_parameters") &&
