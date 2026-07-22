@@ -682,6 +682,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_total - start_total);
   size_t peak_memory = getPeakMemoryKb();
+  size_t peak_commit = getPeakCommitKb();
 
   if (log_output) {
 
@@ -696,7 +697,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
               << ((double)generation_cnt / generation_duration.count() * 1000)
               << " TPS\n";
     std::cout << "total: " << total_duration.count() << " ms\n";
-    std::cout << "peak memory: " << peak_memory << " KB\n";
+    std::cout << "peak memory: " << peak_memory << " KB (working set)\n";
+    if (peak_commit)
+      std::cout << "peak commit: " << peak_commit << " KB (private)\n";
     std::cout << "==========================================================\n";
   }
 
