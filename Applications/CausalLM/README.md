@@ -241,15 +241,15 @@ PS> .\build-causallm-win\Applications\CausalLM\nntr_causallm.exe C:\path\to\mode
 ### 4. Android Build & Test
 
 `build_android.sh` is the single entry point for the Android native libraries,
-QuickDotAI AAR, and sample app. With no options, it builds the CPU-only
-`jni/Android.mk` targets without invoking Gradle or modifying a device.
+QuickDotAI AAR, and sample app. With no options, it builds the six canonical
+CPU native artifacts with Meson, without invoking Gradle or modifying a device.
 
 #### Prerequisites
 
 - Android NDK (`ANDROID_NDK` or `NDK_ROOT`)
 - Meson, Ninja, CMake, and Rust (for tokenizers-cpp)
 - ADB only when using `--install`
-- QNN SDK (`QNN_SDK_ROOT`) only when using `--enable-qnn`
+- QNN SDK (`QNN_SDK_ROOT`) only when using `--qnn`
 
 #### Build
 
@@ -259,30 +259,30 @@ cd Applications/CausalLM
 ./build_android.sh
 ```
 
-The Android.mk artifacts are written under `jni/libs/arm64-v8a/`. To build the
-standalone app and AAR without installing it, run
-`./build_android.sh --assemble-aar`.
-That mode stages `libcausallm.so`, `libquick_dot_ai_api.so`, the nntrainer
-runtime libraries, and `libquickai_jni.so`, then writes the debug AAR under
+CPU native artifacts are written under `builddir_app/cpu/`; QNN artifacts use
+`builddir_app/qnn/`. To additionally build the standalone app and AAR without
+installing them, run `./build_android.sh --app`. That mode stages
+`libcausallm.so`, `libquick_dot_ai_api.so`, and their runtime dependencies;
+Gradle adds `libquickai_jni.so` and writes the debug AAR under
 `Android/QuickDotAI/build/outputs/aar/`.
 
 The most useful options are:
 
 | Option | Behavior |
 |---|---|
-| `--enable-qnn` | Enable the QNN backend and stage its runtime libraries; requires `QNN_SDK_ROOT`. |
-| `--assemble-aar` / `--aar` | Build the standalone app and assemble the QuickDotAI AAR and sample APK. |
-| `--install` | Install SampleTestAPP and push the CLI artifacts to the selected device. |
-| `--skip-install` | Build and stage native libraries without Gradle assembly or device installation. |
-| `--native-only` | Build and stage native artifacts without running the Gradle AAR/app assembly. |
+| `--app` | Add the QuickDotAI AAR and sample APK to the canonical native build. |
+| `--install` | Push the native libraries and tools; with `--app`, also install the built APK. |
+| `--qnn` | Build the QNN variant and include its runtime libraries; requires `QNN_SDK_ROOT`. |
+| `--no-qnn` | Explicitly select the CPU variant, which is also the default. |
 | `--cache` | Reuse a compatible existing nntrainer Android engine build, or build it when absent. |
-| `--skip-engine` | Strictly reuse the existing engine build; fail when required artifacts are absent. |
-| `--legacy-ndk` | Also build the Android.mk targets when an app/AAR mode is selected; this is already the no-option default. |
-| `--clean` | Recreate the standalone CausalLM application build directory. |
+| `--clean` | Recreate the selected CPU or QNN CausalLM build directory. |
 | `--nntr-threads=N` | Set the positive nntrainer compute-thread count. |
 
-`--skip-qnn` explicitly selects the CPU-only mode. Set `ANDROID_SERIAL` when
-more than one device is connected and `--install` is requested.
+`--app`, `--install`, and QNN selection are independent. For example,
+`--install` pushes only native artifacts, while `--app --install` also installs
+the APK. Set `ANDROID_SERIAL` when more than one device is connected.
+QNN deployment supports HTP V75, V79, and V81 SDK runtimes and requires at
+least one complete matching Stub/Skel pair.
 
 ## Quantizing Models
 

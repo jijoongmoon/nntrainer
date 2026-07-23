@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Build the public CausalLM Android native libraries and QuickDotAI AAR.
-# With no options, build the CPU-only Android.mk targets. App modes build the
-# standalone app and AAR.
+# Build the public CausalLM Android native artifacts and optional QuickDotAI
+# app package from one canonical Meson graph.
 set -euo pipefail
 
 usage() {
@@ -9,26 +8,21 @@ usage() {
 Usage: ./build_android.sh [options] [engine Meson options]
 
 Options:
+  --app                   Also assemble the QuickDotAI AAR and sample APK
+  --install               Push native artifacts; with --app, install the APK
+  --qnn                   Build the QNN-enabled native/app variant
+  --no-qnn                Build the CPU-only variant (default)
   --cache                 Reuse a compatible engine build; build on cache miss
-  --skip-engine           Require and reuse an existing compatible engine build
   --clean                 Recreate the selected CausalLM build outputs
-  --enable-qnn            Opt in to the QNN backend and QNN AAR libraries
-  --skip-qnn              Explicitly select CPU-only mode (default)
   --nntr-threads=N        Set the nntrainer compute thread count (default: 7)
-  --legacy-ndk            Also build Android.mk targets in an app/AAR mode
-  --assemble-aar, --aar   Build the standalone app and assemble AAR/APK
-  --native-only           Build/stage the standalone app; skip Gradle
-  --skip-gradle           Alias for --native-only
-  --skip-install          Build/stage standalone native libs; skip Gradle/install
-  --install               Assemble, install the sample APK, and push the CLIs
   --help, -h              Show this help
 
 Engine Meson options beginning with -D, and --arm-arch=..., are forwarded to
-tools/package_android.sh. They cannot be used together with --skip-engine.
+tools/package_android.sh.
 
 Environment:
   ANDROID_NDK / NDK_ROOT  Android NDK root (required)
-  QNN_SDK_ROOT            Qualcomm QNN SDK root (required with --enable-qnn)
+  QNN_SDK_ROOT            Qualcomm QNN SDK root (required with --qnn)
   ANDROID_SERIAL          Device selected for --install (optional if exactly
                           one authorized device is connected)
 EOF
@@ -36,74 +30,67 @@ EOF
 
 CLEAN=false
 USE_BUILD_CACHE=false
-SKIP_ENGINE=false
 ENABLE_QNN=false
 QNN_MODE_SET=""
 INSTALL=false
-INSTALL_REQUESTED=false
-SKIP_INSTALL_REQUESTED=false
-NATIVE_ONLY=false
-ASSEMBLE_AAR=false
-APP_MODE_REQUESTED=false
-LEGACY_NDK_REQUESTED=false
+BUILD_APP=false
 NNTR_THREADS="${NNTR_THREADS:-7}"
 ENGINE_ARGS=()
 
+deprecated_option() {
+    echo "Warning: $1 is deprecated; use $2." >&2
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --cache)
-            USE_BUILD_CACHE=true
+        --app)
+            BUILD_APP=true
             ;;
-        --skip-engine)
-            SKIP_ENGINE=true
+        --install)
+            INSTALL=true
             ;;
-        --clean)
-            CLEAN=true
-            ;;
-        --enable-qnn)
+        --qnn)
             if [[ "$QNN_MODE_SET" == "cpu" ]]; then
-                echo "Error: --enable-qnn and --skip-qnn are mutually exclusive." >&2
+                echo "Error: QNN enable/disable options are mutually exclusive." >&2
                 exit 2
             fi
             ENABLE_QNN=true
             QNN_MODE_SET="qnn"
-            APP_MODE_REQUESTED=true
-            ASSEMBLE_AAR=true
             ;;
-        --skip-qnn)
+        --no-qnn|--skip-qnn)
+            if [[ "$1" == "--skip-qnn" ]]; then
+                deprecated_option "--skip-qnn" "--no-qnn"
+            fi
             if [[ "$QNN_MODE_SET" == "qnn" ]]; then
-                echo "Error: --enable-qnn and --skip-qnn are mutually exclusive." >&2
+                echo "Error: QNN enable/disable options are mutually exclusive." >&2
                 exit 2
             fi
             ENABLE_QNN=false
             QNN_MODE_SET="cpu"
             ;;
+        --assemble-aar|--aar)
+            deprecated_option "$1" "--app"
+            BUILD_APP=true
+            ;;
+        --cache)
+            USE_BUILD_CACHE=true
+            ;;
+        --clean)
+            CLEAN=true
+            ;;
         --nntr-threads=*)
             NNTR_THREADS="${1#*=}"
             ;;
-        --legacy-ndk)
-            LEGACY_NDK_REQUESTED=true
-            ;;
-        --assemble-aar|--aar)
-            APP_MODE_REQUESTED=true
-            ASSEMBLE_AAR=true
-            ;;
-        --native-only|--skip-gradle)
-            APP_MODE_REQUESTED=true
-            NATIVE_ONLY=true
-            ;;
-        --skip-install)
-            APP_MODE_REQUESTED=true
-            NATIVE_ONLY=true
-            SKIP_INSTALL_REQUESTED=true
-            ;;
-        --install)
-            APP_MODE_REQUESTED=true
-            ASSEMBLE_AAR=true
-            INSTALL_REQUESTED=true
-            INSTALL=true
+        --legacy-ndk|--native-only|--skip-gradle|--skip-install)
+            echo "Error: $1 was removed by the single-graph build migration." >&2
+            echo "Use no option for native, --app for AAR/APK, and --install for deployment." >&2
+            exit 2
             ;;
         -D*|--arm-arch=*)
+            if [[ "$1" == -Denable-npu=* ]]; then
+                echo "Error: -Denable-npu is controlled by --qnn/--no-qnn." >&2
+                exit 2
+            fi
             ENGINE_ARGS+=("$1")
             ;;
         --help|-h)
@@ -123,38 +110,18 @@ if ! [[ "$NNTR_THREADS" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: --nntr-threads must be a positive integer." >&2
     exit 2
 fi
-if [[ "$USE_BUILD_CACHE" == true && "$SKIP_ENGINE" == true ]]; then
-    echo "Error: --cache and --skip-engine are mutually exclusive." >&2
-    exit 2
-fi
-if [[ "$SKIP_ENGINE" == true && ${#ENGINE_ARGS[@]} -ne 0 ]]; then
-    echo "Error: engine Meson options cannot be used with --skip-engine." >&2
-    exit 2
-fi
-if [[ "$INSTALL_REQUESTED" == true && "$SKIP_INSTALL_REQUESTED" == true ]]; then
-    echo "Error: --install and --skip-install are mutually exclusive." >&2
-    exit 2
-fi
-if [[ "$INSTALL" == true && "$NATIVE_ONLY" == true ]]; then
-    echo "Error: --install and --native-only are mutually exclusive." >&2
-    exit 2
-fi
-
-if [[ "$NATIVE_ONLY" == true ]]; then
-    ASSEMBLE_AAR=false
-fi
-if [[ "$APP_MODE_REQUESTED" == true ]]; then
-    LEGACY_NDK="$LEGACY_NDK_REQUESTED"
+if [[ "$ENABLE_QNN" == true ]]; then
+    BUILD_VARIANT="qnn"
 else
-    LEGACY_NDK=true
+    BUILD_VARIANT="cpu"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CAUSALLM_ROOT="$SCRIPT_DIR"
 NNTRAINER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 XGRAMMAR_ROOT="$CAUSALLM_ROOT/xgrammar"
-APP_BUILD="$NNTRAINER_ROOT/builddir_app"
-APP_MACHINE_DIR="$NNTRAINER_ROOT/builddir_app_machine"
+NATIVE_BUILD="$NNTRAINER_ROOT/builddir_app/$BUILD_VARIANT"
+NATIVE_MACHINE_DIR="$NNTRAINER_ROOT/builddir_app_machine/$BUILD_VARIANT"
 
 if command -v nproc >/dev/null 2>&1; then
     BUILD_JOBS="$(nproc)"
@@ -180,19 +147,16 @@ case "$(uname -s)" in
         ANDROID_NDK_HOST="linux-x86_64"
         ANDROID_CLANG_SUFFIX=""
         ANDROID_EXE_SUFFIX=""
-        NDK_BUILD="$ANDROID_NDK/ndk-build"
         ;;
     Darwin*)
         ANDROID_NDK_HOST="darwin-x86_64"
         ANDROID_CLANG_SUFFIX=""
         ANDROID_EXE_SUFFIX=""
-        NDK_BUILD="$ANDROID_NDK/ndk-build"
         ;;
     CYGWIN*|MINGW*|MSYS*)
         ANDROID_NDK_HOST="windows-x86_64"
         ANDROID_CLANG_SUFFIX=".cmd"
         ANDROID_EXE_SUFFIX=".exe"
-        NDK_BUILD="$ANDROID_NDK/ndk-build.cmd"
         ;;
     *)
         echo "Error: unsupported NDK host: $(uname -s)" >&2
@@ -213,22 +177,31 @@ fi
 
 GRADLE_NDK_ARG="-PnntrainerNdkPath=$ANDROID_NDK_MESON"
 
-if [[ "$ENABLE_QNN" == true && -z "${QNN_SDK_ROOT:-}" ]]; then
-    echo "Error: QNN_SDK_ROOT is required with --enable-qnn." >&2
-    exit 1
+QNN_SDK_ROOT_SHELL=""
+if [[ "$ENABLE_QNN" == true ]]; then
+    if [[ -z "${QNN_SDK_ROOT:-}" ]]; then
+        echo "Error: QNN_SDK_ROOT is required with --qnn." >&2
+        exit 1
+    fi
+    if [[ ! -f "$QNN_SDK_ROOT/include/QNN/QnnCommon.h" ]]; then
+        echo "Error: invalid QNN SDK root (QnnCommon.h not found): $QNN_SDK_ROOT" >&2
+        exit 1
+    fi
+    QNN_SDK_ROOT_SHELL="$(cd "$QNN_SDK_ROOT" && pwd -P)"
+    QNN_SDK_ROOT_MESON="$QNN_SDK_ROOT_SHELL"
+    if [[ "$ANDROID_NDK_HOST" == "windows-x86_64" ]] && command -v cygpath >/dev/null 2>&1; then
+        QNN_SDK_ROOT_MESON="$(cygpath -m "$QNN_SDK_ROOT_SHELL")"
+    fi
+    export QNN_SDK_ROOT="$QNN_SDK_ROOT_MESON"
 fi
 
 echo "=== nntrainer CausalLM Android build ==="
 echo "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 echo "ANDROID_NDK:    $ANDROID_NDK"
-echo "Mode:           $([[ "$ENABLE_QNN" == true ]] && echo QNN || echo CPU)"
+echo "Variant:        $BUILD_VARIANT"
+echo "App:            $BUILD_APP"
 echo "Install:        $INSTALL"
-echo "App/AAR mode:   $APP_MODE_REQUESTED"
-echo "Assemble AAR:   $ASSEMBLE_AAR"
-echo "Native only:    $NATIVE_ONLY"
-echo "Legacy NDK:     $LEGACY_NDK"
 echo "Engine cache:   $USE_BUILD_CACHE"
-echo "Skip engine:    $SKIP_ENGINE"
 
 # Initialize missing build dependencies.
 if [[ ! -f "$XGRAMMAR_ROOT/cpp/compiled_grammar.cc" ]]; then
@@ -287,6 +260,28 @@ NNTRAINER_ANDROID_RESULT="$NNTRAINER_ROOT/builddir/android_build_result"
 NNTRAINER_ANDROID_LIBDIR="$NNTRAINER_ANDROID_RESULT/lib/arm64-v8a"
 NNTRAINER_ABI_FILE="$NNTRAINER_ANDROID_RESULT/nntrainer-abi.ini"
 NNTRAINER_PREBUILT_MK="$NNTRAINER_ANDROID_RESULT/Android.mk"
+NNTRAINER_MODE_FILE="$NNTRAINER_ANDROID_RESULT/causallm-build-mode.ini"
+
+engine_mode_text() {
+    # Schema 2 invalidates engines built with the former mmap-read override.
+    printf 'schema=2\n'
+    printf 'variant=%s\n' "$BUILD_VARIANT"
+    printf 'enable_qnn=%s\n' "$ENABLE_QNN"
+    printf 'nntr_threads=%s\n' "$NNTR_THREADS"
+    printf 'android_ndk=%s\n' "$ANDROID_NDK"
+    if [[ "$ENABLE_QNN" == true ]]; then
+        printf 'qnn_sdk_root=%s\n' "$QNN_SDK_ROOT"
+    fi
+    local arg
+    for arg in "${ENGINE_ARGS[@]}"; do
+        printf 'engine_arg=%s\n' "$arg"
+    done
+}
+
+engine_mode_matches() {
+    [[ -f "$NNTRAINER_MODE_FILE" ]] || return 1
+    [[ "$(engine_mode_text)" == "$(<"$NNTRAINER_MODE_FILE")" ]]
+}
 
 engine_prebuilt_metadata_valid() {
     [[ -f "$NNTRAINER_PREBUILT_MK" ]] || return 1
@@ -312,7 +307,8 @@ engine_cache_valid() {
     for file in "${required[@]}"; do
         [[ -f "$file" ]] || return 1
     done
-    engine_prebuilt_metadata_valid
+    engine_prebuilt_metadata_valid || return 1
+    engine_mode_matches
 }
 
 describe_missing_engine_cache() {
@@ -332,16 +328,14 @@ describe_missing_engine_cache() {
     if [[ -f "$NNTRAINER_PREBUILT_MK" ]] && ! engine_prebuilt_metadata_valid; then
         echo "  incompatible: $NNTRAINER_PREBUILT_MK has stale prebuilt paths" >&2
     fi
+    if [[ ! -f "$NNTRAINER_MODE_FILE" ]]; then
+        echo "  missing: $NNTRAINER_MODE_FILE" >&2
+    elif ! engine_mode_matches; then
+        echo "  incompatible: cached engine mode does not match $BUILD_VARIANT" >&2
+    fi
 }
 
-if [[ "$SKIP_ENGINE" == true ]]; then
-    if ! engine_cache_valid; then
-        echo "Error: --skip-engine requires a compatible engine build:" >&2
-        describe_missing_engine_cache
-        exit 1
-    fi
-    echo "[3] Reusing the existing engine (--skip-engine)."
-elif [[ "$USE_BUILD_CACHE" == true && ${#ENGINE_ARGS[@]} -eq 0 ]] && engine_cache_valid; then
+if [[ "$USE_BUILD_CACHE" == true && ${#ENGINE_ARGS[@]} -eq 0 ]] && engine_cache_valid; then
     echo "[3] Reusing a compatible engine build (--cache)."
 else
     if [[ "$USE_BUILD_CACHE" == true ]]; then
@@ -357,11 +351,11 @@ else
     (
         cd "$NNTRAINER_ROOT"
         ./tools/package_android.sh \
-            -Dmmap-read=false \
             -Dnntr-num-threads="$NNTR_THREADS" \
             -Denable-npu="$ENABLE_QNN" \
             "${ENGINE_ARGS[@]}"
     )
+    engine_mode_text > "$NNTRAINER_MODE_FILE"
     if ! engine_cache_valid; then
         echo "Error: engine build did not produce a compatible artifact set." >&2
         describe_missing_engine_cache
@@ -369,57 +363,10 @@ else
     fi
 fi
 
-build_legacy_ndk_targets() {
-    echo "[4] Building the Android.mk targets."
-    local legacy_jni_dir="$CAUSALLM_ROOT/jni"
-    local legacy_modules=(
-        causallm_core
-        nntrainer_causallm
-        nntr_quantize
-        nntr_safetensors_info
-        quick_dot_ai_api
-        quick_dot_ai_test
-    )
-    if [[ "$CLEAN" == true ]]; then
-        rm -rf "$legacy_jni_dir/libs" "$legacy_jni_dir/obj"
-    fi
-    (
-        cd "$legacy_jni_dir"
-        # APP_MODULES preserves ndk-build's install step; explicit make goals
-        # leave outputs in obj/local instead of copying them to NDK_LIBS_OUT.
-        "$NDK_BUILD" \
-            NDK_PROJECT_PATH=. \
-            NDK_LIBS_OUT=./libs \
-            NDK_OUT=./obj \
-            APP_BUILD_SCRIPT=./Android.mk \
-            NDK_APPLICATION_MK=./Application.mk \
-            APP_MODULES="${legacy_modules[*]}" \
-            -j "$BUILD_JOBS"
-    )
-    local file
-    for file in \
-        libcausallm_core.so nntrainer_causallm nntr_quantize \
-        nntr_safetensors_info libquick_dot_ai_api.so quick_dot_ai_test; do
-        if [[ ! -f "$legacy_jni_dir/libs/arm64-v8a/$file" ]]; then
-            echo "Error: expected Android.mk artifact missing: $file" >&2
-            exit 1
-        fi
-    done
-}
-
-if [[ "$LEGACY_NDK" == true ]]; then
-    build_legacy_ndk_targets
-fi
-if [[ "$APP_MODE_REQUESTED" == false ]]; then
-    echo "=== Done (Android.mk build) ==="
-    echo "Artifacts: $CAUSALLM_ROOT/jni/libs/arm64-v8a"
-    exit 0
-fi
-
-# Keep machine files outside APP_BUILD so Meson can wipe it safely.
-mkdir -p "$APP_MACHINE_DIR"
-CROSS_FILE="$APP_MACHINE_DIR/android-aarch64.cross"
-ABI_CROSS_FILE="$APP_MACHINE_DIR/nntrainer-abi.ini"
+# Keep machine files outside NATIVE_BUILD so Meson can wipe it safely.
+mkdir -p "$NATIVE_MACHINE_DIR"
+CROSS_FILE="$NATIVE_MACHINE_DIR/android-aarch64.cross"
+ABI_CROSS_FILE="$NATIVE_MACHINE_DIR/nntrainer-abi.ini"
 CROSS_FILE_IN="$CAUSALLM_ROOT/app_build/android-aarch64.cross.in"
 MACHINE_CHANGED=false
 
@@ -447,15 +394,15 @@ if [[ ! -f "$ABI_CROSS_FILE" ]] || ! cmp -s "$rendered_abi" "$ABI_CROSS_FILE"; t
 fi
 
 if [[ "$CLEAN" == true || "$MACHINE_CHANGED" == true ]]; then
-    if [[ -d "$APP_BUILD" ]]; then
+    if [[ -d "$NATIVE_BUILD" ]]; then
         reason="machine configuration changed"
         [[ "$CLEAN" == true ]] && reason="--clean requested"
-        echo "[4] Recreating app build directory ($reason)."
-        rm -rf "$APP_BUILD"
+        echo "[4] Recreating $BUILD_VARIANT native build directory ($reason)."
+        rm -rf "$NATIVE_BUILD"
     fi
 fi
 
-MESON_APP_OPTS=(
+MESON_NATIVE_OPTS=(
     -Dplatform=android
     -Denable-qnn="$ENABLE_QNN"
     -Denable-api=true
@@ -466,121 +413,200 @@ MESON_CROSS_OPTS=(
     --cross-file "$ABI_CROSS_FILE"
 )
 
-echo "[4] Configuring the standalone app build."
-if [[ ! -f "$APP_BUILD/build.ninja" ]]; then
-    meson setup "$APP_BUILD" "$CAUSALLM_ROOT/app_build" \
-        "${MESON_CROSS_OPTS[@]}" "${MESON_APP_OPTS[@]}"
+echo "[4] Configuring the canonical $BUILD_VARIANT native build."
+if [[ ! -f "$NATIVE_BUILD/build.ninja" ]]; then
+    meson setup "$NATIVE_BUILD" "$CAUSALLM_ROOT/app_build" \
+        "${MESON_CROSS_OPTS[@]}" "${MESON_NATIVE_OPTS[@]}"
 else
-    meson setup "$APP_BUILD" "$CAUSALLM_ROOT/app_build" --reconfigure \
-        "${MESON_CROSS_OPTS[@]}" "${MESON_APP_OPTS[@]}"
+    meson setup "$NATIVE_BUILD" "$CAUSALLM_ROOT/app_build" --reconfigure \
+        "${MESON_CROSS_OPTS[@]}" "${MESON_NATIVE_OPTS[@]}"
 fi
 
-echo "[5] Building libcausallm, the public API, and CLIs."
-ninja -C "$APP_BUILD" -j "$BUILD_JOBS"
-for file in libcausallm.so libquick_dot_ai_api.so quick_dot_ai_test nntr_causallm; do
-    if [[ ! -f "$APP_BUILD/$file" ]]; then
-        echo "Error: expected app artifact missing: $APP_BUILD/$file" >&2
+echo "[5] Building the canonical native libraries and tools."
+ninja -C "$NATIVE_BUILD" -j "$BUILD_JOBS"
+NATIVE_ARTIFACT_NAMES=(
+    libcausallm.so
+    libquick_dot_ai_api.so
+    nntr_causallm
+    quick_dot_ai_test
+    nntr_quantize
+    nntr_safetensors_info
+)
+for file in "${NATIVE_ARTIFACT_NAMES[@]}"; do
+    if [[ ! -f "$NATIVE_BUILD/$file" ]]; then
+        echo "Error: expected native artifact missing: $NATIVE_BUILD/$file" >&2
         exit 1
     fi
 done
 
+# Remove only the retired production outputs that older Android.mk builds may
+# have left behind. The test-only Android.mk harness and its artifacts remain.
+LEGACY_ANDROID_MK_ARTIFACT_NAMES=(
+    libcausallm_core.so
+    libquick_dot_ai_api.so
+    nntrainer_causallm
+    quick_dot_ai_test
+    nntr_quantize
+    nntr_safetensors_info
+)
+legacy_artifact_removed=false
+for legacy_output_dir in \
+    "$CAUSALLM_ROOT/jni/libs/arm64-v8a" \
+    "$CAUSALLM_ROOT/jni/obj/local/arm64-v8a"; do
+    for file in "${LEGACY_ANDROID_MK_ARTIFACT_NAMES[@]}"; do
+        if [[ -f "$legacy_output_dir/$file" ]]; then
+            rm -f "$legacy_output_dir/$file"
+            legacy_artifact_removed=true
+        fi
+    done
+done
+if [[ "$legacy_artifact_removed" == true ]]; then
+    echo "[5] Removed retired Android.mk production artifacts."
+fi
+
 PREBUILT_DIR="$CAUSALLM_ROOT/Android/QuickDotAI/prebuilt_libs"
-echo "[6] Staging public native libraries in $PREBUILT_DIR."
-mkdir -p "$PREBUILT_DIR"
-find "$PREBUILT_DIR" -maxdepth 1 -type f -name '*.so' -delete
-
-copy_required() {
-    local source="$1"
-    if [[ ! -f "$source" ]]; then
-        echo "Error: required native library missing: $source" >&2
-        exit 1
-    fi
-    cp "$source" "$PREBUILT_DIR/"
-}
-
-copy_required "$NNTRAINER_ANDROID_LIBDIR/libnntrainer.so"
-copy_required "$NNTRAINER_ANDROID_LIBDIR/libccapi-nntrainer.so"
-copy_required "$APP_BUILD/libcausallm.so"
-copy_required "$APP_BUILD/libquick_dot_ai_api.so"
+LIBCXX="$ANDROID_NDK/toolchains/llvm/prebuilt/$ANDROID_NDK_HOST/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+NATIVE_EXECUTABLES=(
+    "$NATIVE_BUILD/nntr_causallm"
+    "$NATIVE_BUILD/quick_dot_ai_test"
+    "$NATIVE_BUILD/nntr_quantize"
+    "$NATIVE_BUILD/nntr_safetensors_info"
+)
+RUNTIME_LIBRARIES=(
+    "$NNTRAINER_ANDROID_LIBDIR/libnntrainer.so"
+    "$NNTRAINER_ANDROID_LIBDIR/libccapi-nntrainer.so"
+    "$NATIVE_BUILD/libcausallm.so"
+    "$NATIVE_BUILD/libquick_dot_ai_api.so"
+    "$LIBCXX"
+)
+QNN_REQUIRED_AARCH64_LIB_NAMES=(
+    libQnnHtp.so
+    libQnnHtpNetRunExtensions.so
+    libQnnHtpPrepare.so
+    libQnnSystem.so
+)
+QNN_OPTIONAL_AARCH64_LIB_NAMES=(
+    libQnnHtpProfilingReader.so
+    libQnnHtpOptraceProfilingReader.so
+    libQnnSaver.so
+    libQnnHtpV75Stub.so
+    libQnnHtpV75CalculatorStub.so
+    libQnnHtpV79Stub.so
+    libQnnHtpV79CalculatorStub.so
+    libQnnHtpV81Stub.so
+    libQnnHtpV81CalculatorStub.so
+)
+QNN_AARCH64_LIB_NAMES=(
+    "${QNN_REQUIRED_AARCH64_LIB_NAMES[@]}"
+    "${QNN_OPTIONAL_AARCH64_LIB_NAMES[@]}"
+)
+QNN_SKEL_RELATIVE_PATHS=(
+    hexagon-v75/unsigned/libQnnHtpV75Skel.so
+    hexagon-v79/unsigned/libQnnHtpV79Skel.so
+    hexagon-v81/unsigned/libQnnHtpV81Skel.so
+)
 
 if [[ "$ENABLE_QNN" == true ]]; then
-    copy_required "$NNTRAINER_ANDROID_LIBDIR/libqnn_context.so"
-    QNN_AARCH64_LIB_DIR="$QNN_SDK_ROOT/lib/aarch64-android"
-    QNN_AARCH64_LIBS=(
-        libQnnHtp.so
-        libQnnHtpNetRunExtensions.so
-        libQnnHtpPrepare.so
-        libQnnHtpProfilingReader.so
-        libQnnHtpOptraceProfilingReader.so
-        libQnnSaver.so
-        libQnnSystem.so
-        libQnnHtpV75Stub.so
-        libQnnHtpV75CalculatorStub.so
-        libQnnHtpV79Stub.so
-        libQnnHtpV79CalculatorStub.so
-        libQnnHtpV81Stub.so
-        libQnnHtpV81CalculatorStub.so
-    )
-    for file in "${QNN_AARCH64_LIBS[@]}"; do
+    RUNTIME_LIBRARIES+=("$NNTRAINER_ANDROID_LIBDIR/libqnn_context.so")
+    QNN_AARCH64_LIB_DIR="$QNN_SDK_ROOT_SHELL/lib/aarch64-android"
+    for file in "${QNN_REQUIRED_AARCH64_LIB_NAMES[@]}"; do
+        if [[ ! -f "$QNN_AARCH64_LIB_DIR/$file" ]]; then
+            echo "Error: required QNN runtime library not found: $file" >&2
+            exit 1
+        fi
+        RUNTIME_LIBRARIES+=("$QNN_AARCH64_LIB_DIR/$file")
+    done
+    for file in "${QNN_OPTIONAL_AARCH64_LIB_NAMES[@]}"; do
         if [[ -f "$QNN_AARCH64_LIB_DIR/$file" ]]; then
-            cp "$QNN_AARCH64_LIB_DIR/$file" "$PREBUILT_DIR/"
+            RUNTIME_LIBRARIES+=("$QNN_AARCH64_LIB_DIR/$file")
         else
             echo "Warning: optional QNN library not found: $file" >&2
         fi
     done
-    QNN_SKEL_LIBS=(
-        hexagon-v75/unsigned/libQnnHtpV75Skel.so
-        hexagon-v79/unsigned/libQnnHtpV79Skel.so
-        hexagon-v81/unsigned/libQnnHtpV81Skel.so
-    )
-    for relative_path in "${QNN_SKEL_LIBS[@]}"; do
-        if [[ -f "$QNN_SDK_ROOT/lib/$relative_path" ]]; then
-            cp "$QNN_SDK_ROOT/lib/$relative_path" "$PREBUILT_DIR/"
+    for relative_path in "${QNN_SKEL_RELATIVE_PATHS[@]}"; do
+        if [[ -f "$QNN_SDK_ROOT_SHELL/lib/$relative_path" ]]; then
+            RUNTIME_LIBRARIES+=("$QNN_SDK_ROOT_SHELL/lib/$relative_path")
         else
             echo "Warning: optional QNN skel not found: $relative_path" >&2
         fi
     done
-fi
 
-LIBCXX="$ANDROID_NDK/toolchains/llvm/prebuilt/$ANDROID_NDK_HOST/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
-copy_required "$LIBCXX"
-
-if [[ "$ENABLE_QNN" == false ]]; then
-    if find "$PREBUILT_DIR" -maxdepth 1 -type f \
-        \( -name 'libqnn_context.so' -o -name 'libQnn*.so' \) | grep -q .; then
-        echo "Error: a CPU-only stage contains QNN libraries." >&2
+    qnn_soc_pair_count=0
+    for htp_version in 75 79 81; do
+        qnn_stub="$QNN_AARCH64_LIB_DIR/libQnnHtpV${htp_version}Stub.so"
+        qnn_skel="$QNN_SDK_ROOT_SHELL/lib/hexagon-v${htp_version}/unsigned/libQnnHtpV${htp_version}Skel.so"
+        if [[ -f "$qnn_stub" && -f "$qnn_skel" ]]; then
+            qnn_soc_pair_count=$((qnn_soc_pair_count + 1))
+        elif [[ -f "$qnn_stub" || -f "$qnn_skel" ]]; then
+            echo "Error: incomplete QNN HTP V${htp_version} Stub/Skel pair." >&2
+            exit 1
+        fi
+    done
+    if [[ "$qnn_soc_pair_count" -eq 0 ]]; then
+        echo "Error: no complete supported QNN HTP Stub/Skel pair was found." >&2
         exit 1
     fi
 fi
-if [[ -f "$PREBUILT_DIR/libquick_dot_ai.so" ]]; then
-    echo "Error: proprietary model overlay leaked into the public stage." >&2
-    exit 1
-fi
 
-if [[ "$ASSEMBLE_AAR" == false ]]; then
-    echo "=== Done (native libraries staged; Gradle skipped) ==="
-    exit 0
-fi
-
-echo "[7] Assembling the QuickDotAI AAR and sample APK."
-(
-    cd "$CAUSALLM_ROOT/Android"
-    ./gradlew "$GRADLE_NDK_ARG" \
-        :QuickDotAI:assembleDebug :SampleTestAPP:assembleDebug
-)
-AAR="$CAUSALLM_ROOT/Android/QuickDotAI/build/outputs/aar/QuickDotAI-debug.aar"
-APK="$CAUSALLM_ROOT/Android/SampleTestAPP/build/outputs/apk/debug/SampleTestAPP-debug.apk"
-for file in "$AAR" "$APK"; do
-    if [[ ! -f "$file" ]]; then
-        echo "Error: Gradle artifact missing: $file" >&2
+for source in "${NATIVE_EXECUTABLES[@]}" "${RUNTIME_LIBRARIES[@]}"; do
+    if [[ ! -f "$source" ]]; then
+        echo "Error: required native artifact missing: $source" >&2
         exit 1
     fi
 done
 
+stage_runtime_libraries() {
+    echo "[6] Staging public native libraries in $PREBUILT_DIR."
+    mkdir -p "$PREBUILT_DIR"
+    find "$PREBUILT_DIR" -maxdepth 1 -type f -name '*.so' -delete
+
+    local source
+    for source in "${RUNTIME_LIBRARIES[@]}"; do
+        cp "$source" "$PREBUILT_DIR/"
+    done
+
+    if [[ "$ENABLE_QNN" == false ]]; then
+        if find "$PREBUILT_DIR" -maxdepth 1 -type f \
+            \( -name 'libqnn_context.so' -o -name 'libQnn*.so' \) | grep -q .; then
+            echo "Error: a CPU-only stage contains QNN libraries." >&2
+            exit 1
+        fi
+    fi
+    if [[ -f "$PREBUILT_DIR/libquick_dot_ai.so" ]]; then
+        echo "Error: proprietary model overlay leaked into the public stage." >&2
+        exit 1
+    fi
+}
+
+AAR=""
+APK=""
+if [[ "$BUILD_APP" == true ]]; then
+    stage_runtime_libraries
+    echo "[7] Assembling the QuickDotAI AAR and sample APK."
+    (
+        cd "$CAUSALLM_ROOT/Android"
+        ./gradlew "$GRADLE_NDK_ARG" \
+            :QuickDotAI:assembleDebug :SampleTestAPP:assembleDebug
+    )
+    AAR="$CAUSALLM_ROOT/Android/QuickDotAI/build/outputs/aar/QuickDotAI-debug.aar"
+    APK="$CAUSALLM_ROOT/Android/SampleTestAPP/build/outputs/apk/debug/SampleTestAPP-debug.apk"
+    for file in "$AAR" "$APK"; do
+        if [[ ! -f "$file" ]]; then
+            echo "Error: Gradle artifact missing: $file" >&2
+            exit 1
+        fi
+    done
+fi
+
 if [[ "$INSTALL" == false ]]; then
-    echo "=== Done (AAR/APK assembled; no device modified) ==="
-    echo "AAR: $AAR"
-    echo "APK: $APK"
+    if [[ "$BUILD_APP" == true ]]; then
+        echo "=== Done (native + AAR/APK; no device modified) ==="
+        echo "AAR: $AAR"
+        echo "APK: $APK"
+    else
+        echo "=== Done (native $BUILD_VARIANT build) ==="
+        echo "Artifacts: $NATIVE_BUILD"
+    fi
     exit 0
 fi
 
@@ -603,42 +629,69 @@ if [[ "$("${ADB[@]}" get-state 2>/dev/null)" != "device" ]]; then
     exit 1
 fi
 
-echo "[8] Installing the sample APK and pushing command-line tools."
-(
-    cd "$CAUSALLM_ROOT/Android"
-    ./gradlew "$GRADLE_NDK_ARG" :SampleTestAPP:installDebug
-)
+if [[ "$BUILD_APP" == true ]]; then
+    echo "[8] Installing the already-built sample APK."
+    "${ADB[@]}" install -r "$APK"
+fi
 
 DEVICE_DIR="/data/local/tmp/Quick.AI"
 "${ADB[@]}" shell "mkdir -p $DEVICE_DIR"
-"${ADB[@]}" push "$APP_BUILD/quick_dot_ai_test" "$DEVICE_DIR/"
-"${ADB[@]}" push "$APP_BUILD/nntr_causallm" "$DEVICE_DIR/"
-"${ADB[@]}" push "$APP_BUILD/libcausallm.so" "$DEVICE_DIR/"
-"${ADB[@]}" push "$APP_BUILD/libquick_dot_ai_api.so" "$DEVICE_DIR/"
-"${ADB[@]}" push "$NNTRAINER_ANDROID_LIBDIR/libnntrainer.so" "$DEVICE_DIR/"
-"${ADB[@]}" push "$NNTRAINER_ANDROID_LIBDIR/libccapi-nntrainer.so" "$DEVICE_DIR/"
-"${ADB[@]}" push "$LIBCXX" "$DEVICE_DIR/"
-if [[ "$ENABLE_QNN" == true ]]; then
-    "${ADB[@]}" push "$NNTRAINER_ANDROID_LIBDIR/libqnn_context.so" "$DEVICE_DIR/"
-fi
+
+DEVICE_MANAGED_NAMES=(
+    "${NATIVE_ARTIFACT_NAMES[@]}"
+    libcausallm_core.so
+    nntrainer_causallm
+    libnntrainer.so
+    libccapi-nntrainer.so
+    libc++_shared.so
+    libqnn_context.so
+    run_test.sh
+    run_causallm.sh
+)
+DEVICE_MANAGED_NAMES+=("${QNN_AARCH64_LIB_NAMES[@]}")
+for relative_path in "${QNN_SKEL_RELATIVE_PATHS[@]}"; do
+    DEVICE_MANAGED_NAMES+=("${relative_path##*/}")
+done
+DEVICE_MANAGED_PATHS=()
+for file in "${DEVICE_MANAGED_NAMES[@]}"; do
+    DEVICE_MANAGED_PATHS+=("$DEVICE_DIR/$file")
+done
+"${ADB[@]}" shell rm -f "${DEVICE_MANAGED_PATHS[@]}"
+
+echo "[8] Pushing canonical native artifacts."
+for source in "${NATIVE_EXECUTABLES[@]}" "${RUNTIME_LIBRARIES[@]}"; do
+    "${ADB[@]}" push "$source" "$DEVICE_DIR/"
+done
 
 "${ADB[@]}" shell "cat > $DEVICE_DIR/run_test.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$DEVICE_DIR:\$LD_LIBRARY_PATH
+export ADSP_LIBRARY_PATH=$DEVICE_DIR:\$ADSP_LIBRARY_PATH
 export NNTR_NUM_THREADS=$NNTR_THREADS
 cd $DEVICE_DIR
 ./quick_dot_ai_test \"\$@\"
 EOF
-chmod 755 $DEVICE_DIR/run_test.sh $DEVICE_DIR/quick_dot_ai_test"
+chmod 755 $DEVICE_DIR/run_test.sh"
 
 "${ADB[@]}" shell "cat > $DEVICE_DIR/run_causallm.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$DEVICE_DIR:\$LD_LIBRARY_PATH
+export ADSP_LIBRARY_PATH=$DEVICE_DIR:\$ADSP_LIBRARY_PATH
 export NNTR_NUM_THREADS=$NNTR_THREADS
 cd $DEVICE_DIR
 ./nntr_causallm \"\$@\"
 EOF
-chmod 755 $DEVICE_DIR/run_causallm.sh $DEVICE_DIR/nntr_causallm"
+chmod 755 $DEVICE_DIR/run_causallm.sh"
 
-echo "=== Done (installed on $ANDROID_SERIAL) ==="
-echo "Device CLI: $DEVICE_DIR"
+"${ADB[@]}" shell chmod 755 \
+    "$DEVICE_DIR/nntr_causallm" \
+    "$DEVICE_DIR/quick_dot_ai_test" \
+    "$DEVICE_DIR/nntr_quantize" \
+    "$DEVICE_DIR/nntr_safetensors_info"
+
+if [[ "$BUILD_APP" == true ]]; then
+    echo "=== Done (native artifacts pushed and APK installed on $ANDROID_SERIAL) ==="
+else
+    echo "=== Done (native artifacts pushed to $ANDROID_SERIAL) ==="
+fi
+echo "Device artifacts: $DEVICE_DIR"

@@ -1,9 +1,9 @@
 LOCAL_PATH := $(call my-dir)
 CAUSALLM_JNI_PATH := $(LOCAL_PATH)
 
-include $(CLEAR_VARS)
+# This Android.mk is a test-only harness. Production CausalLM libraries,
+# executables, and tools are built once by app_build/meson.build.
 
-# ndk path
 ifndef ANDROID_NDK
 $(error ANDROID_NDK is not defined!)
 endif
@@ -84,211 +84,29 @@ CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math \
     -Wno-nan-infinity-disabled -Wno-deprecated-literal-operator
 
 # Prebuilt nntrainer libraries. The generated Android.mk exports the include
-# paths and the -march/FP16 cflags the prebuilts were built with.
+# paths and ABI-affecting -march/FP16 flags.
 NNTRAINER_PREBUILT_MK := $(NNTRAINER_ROOT)/builddir/android_build_result/Android.mk
 ifeq ($(wildcard $(NNTRAINER_PREBUILT_MK)),)
-$(error $(NNTRAINER_PREBUILT_MK) not found. Build nntrainer first (tools/package_android.sh))
+$(error $(NNTRAINER_PREBUILT_MK) not found. Run ../build_android.sh first)
 endif
 include $(NNTRAINER_PREBUILT_MK)
 LOCAL_PATH := $(CAUSALLM_JNI_PATH)
 
-# No OpenCL prebuilt module here: every module below reaches the driver
-# through libnntrainer.so, which loads it via its own loader. A
-# PREBUILT_SHARED_LIBRARY is validated at parse time, so declaring one for
-# builddir/opencl aborts ndk-build outright whenever nntrainer was configured
-# without -Denable-opencl=true and that tree was never downloaded.
+# Canonical Meson-built CausalLM core. Keep the source path relative to this
+# Android.mk because ndk-build requires LOCAL_SRC_FILES to be relative.
+CAUSALLM_PREBUILT_LIB ?= ../../../builddir_app/cpu/libcausallm.so
+CAUSALLM_PREBUILT_LIB_ABS := $(abspath $(LOCAL_PATH)/$(CAUSALLM_PREBUILT_LIB))
+ifeq ($(wildcard $(CAUSALLM_PREBUILT_LIB_ABS)),)
+$(error $(CAUSALLM_PREBUILT_LIB_ABS) not found. Run ../build_android.sh first)
+endif
 
-# Tokenizer library
 include $(CLEAR_VARS)
-LOCAL_MODULE := tokenizers_c
-LOCAL_SRC_FILES := ../lib/libtokenizers_android_c.a
-include $(PREBUILT_STATIC_LIBRARY)
+LOCAL_MODULE := causallm
+LOCAL_SRC_FILES := $(CAUSALLM_PREBUILT_LIB)
+LOCAL_EXPORT_C_INCLUDES := $(CAUSALLM_COMMON_INCLUDES)
+include $(PREBUILT_SHARED_LIBRARY)
 
-# Build libcausallm_core.so (shared library - without api)
-include $(CLEAR_VARS)
-
-LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
-LOCAL_MODULE := causallm_core
-LOCAL_LDLIBS := -llog -landroid
-
-LOCAL_SRC_FILES := \
-    ../chat_template.cpp \
-    ../factory.cpp \
-    ../models/causal_lm.cpp \
-    ../models/transformer.cpp \
-    ../models/sentence_transformer.cpp \
-    ../models/model_registry.cpp \
-    ../kv_cache_manager.cpp \
-    ../models/qwen2/qwen2_causallm.cpp \
-    ../models/qwen2/qwen2_embedding.cpp \
-    ../models/qwen3/qwen3_causallm.cpp \
-    ../models/qwen3/qwen3_embedding.cpp \
-    ../models/qwen3_moe/qwen3_moe_causallm.cpp \
-    ../models/qwen3_slim_moe/qwen3_slim_moe_causallm.cpp \
-    ../models/qwen3_cached_slim_moe/qwen3_cached_slim_moe_causallm.cpp \
-    ../models/gpt_oss/gptoss_causallm.cpp \
-    ../models/gpt_oss_cached_slim/gptoss_cached_slim_causallm.cpp \
-    ../huggingface_tokenizer.cpp \
-    ../llm_util.cpp \
-    ../layers/embedding_layer.cpp \
-    ../layers/embedding_pooling_layer.cpp \
-    ../layers/embedding_normalize_layer.cpp \
-    ../layers/per_layer_slice.cpp \
-    ../layers/per_layer_slice_gpu.cpp \
-    ../layers/mha_core.cpp \
-    ../models/qwen3_moe/qwen_moe_layer.cpp \
-    ../layers/reshaped_rms_norm.cpp \
-    ../layers/custom_multiply.cpp \
-    ../layers/causal_conv1d_layer.cpp \
-    ../layers/rms_reverse_norm.cpp \
-    ../layers/rms_norm.cpp \
-    ../layers/rms_norm_gpu.cpp \
-    ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
-    ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
-    ../models/gpt_oss/gpt_oss_moe_layer.cpp \
-    ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
-    ../models/gemma2/gemma2_causallm.cpp \
-    ../models/gemma3/gemma3_causallm.cpp \
-    ../models/gemma3/embedding_gemma.cpp \
-    ../models/gemma4/gemma4_causallm.cpp \
-    ../models/lfm2/lfm2_causallm.cpp \
-    ../models/gemma3/function.cpp \
-    ../models/timm_vit/timm_vit_transformer.cpp \
-    ../models/deberta_v2/deberta_v2.cpp \
-    ../models/bert/bert_transformer.cpp \
-    ../models/bert/multilingual_tinybert_16mb.cpp \
-    ../models/xlm_roberta/xlm_roberta.cpp \
-    ../layers/deberta_attention_layer.cpp \
-    ../layers/shared_fully_connected_layer.cpp \
-    ../api/streamer.cpp \
-    ../api/xgrammar_wrapper.cpp \
-    ../api/xgrammar_manager.cpp \
-    ../xgrammar/cpp/compiled_grammar.cc \
-    ../xgrammar/cpp/config.cc \
-    ../xgrammar/cpp/earley_parser.cc \
-    ../xgrammar/cpp/fsm_builder.cc \
-    ../xgrammar/cpp/fsm.cc \
-    ../xgrammar/cpp/grammar_builder.cc \
-    ../xgrammar/cpp/grammar_compiler.cc \
-    ../xgrammar/cpp/grammar_functor.cc \
-    ../xgrammar/cpp/grammar_matcher.cc \
-    ../xgrammar/cpp/grammar_parser.cc \
-    ../xgrammar/cpp/grammar_printer.cc \
-    ../xgrammar/cpp/grammar.cc \
-    ../xgrammar/cpp/json_schema_converter_ext.cc \
-    ../xgrammar/cpp/json_schema_converter.cc \
-    ../xgrammar/cpp/regex_converter.cc \
-    ../xgrammar/cpp/structural_tag.cc \
-    ../xgrammar/cpp/tokenizer_info.cc \
-    ../xgrammar/cpp/testing.cc \
-    ../xgrammar/cpp/support/logging.cc \
-    ../xgrammar/cpp/support/recursion_guard.cc
-
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := tokenizers_c
-
-LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
-
-include $(BUILD_SHARED_LIBRARY)
-
-# Build libquick_dot_ai_api.so (shared library - api only)
-include $(CLEAR_VARS)
-
-LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
-LOCAL_MODULE := quick_dot_ai_api
-LOCAL_LDLIBS := -llog -landroid
-
-LOCAL_SRC_FILES := \
-    ../api/quick_dot_ai_api.cpp \
-    ../api/model_callbacks.cpp \
-    ../api/model_config.cpp \
-    ../api/model_descriptors_public.cpp \
-    ../api/streamer.cpp \
-    ../api/callback_streamer.cpp
-
-LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := tokenizers_c
-
-LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
-
-include $(BUILD_SHARED_LIBRARY)
-
-# causallm_api is a build-target alias, not a C ABI alias.
-.PHONY: causallm_api
-causallm_api: quick_dot_ai_api
-
-# Build nntrainer_causallm executable
-include $(CLEAR_VARS)
-
-LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
-LOCAL_MODULE := nntrainer_causallm
-LOCAL_LDLIBS := -llog -landroid
-
-LOCAL_SRC_FILES := ../main.cpp
-
-LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := tokenizers_c
-
-LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
-
-include $(BUILD_EXECUTABLE)
-
-# Build quick_dot_ai_test executable
-include $(CLEAR_VARS)
-
-LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
-LOCAL_MODULE := quick_dot_ai_test
-LOCAL_LDLIBS := -llog -landroid
-
-LOCAL_SRC_FILES := ../api-app/test_api.cpp
-
-LOCAL_SHARED_LIBRARIES := quick_dot_ai_api causallm_core nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := tokenizers_c
-
-LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
-
-include $(BUILD_EXECUTABLE)
-
-# test_api is a build-target alias for quick_dot_ai_test.
-.PHONY: test_api
-test_api: quick_dot_ai_test
-
-
-# Build nntr_quantize executable
-include $(CLEAR_VARS)
-
-LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
-LOCAL_MODULE := nntr_quantize
-LOCAL_LDLIBS := -llog -landroid
-
-LOCAL_SRC_FILES := ../quantize.cpp
-
-LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
-LOCAL_STATIC_LIBRARIES := tokenizers_c
-
-LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
-
-include $(BUILD_EXECUTABLE)
-
-# Build nntr_safetensors_info executable
-include $(CLEAR_VARS)
-
-LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
-LOCAL_MODULE := nntr_safetensors_info
-LOCAL_LDLIBS := -llog -landroid
-
-# Source files (header-only inspector; uses safetensors_util from libnntrainer)
-LOCAL_SRC_FILES := ../safetensors_info.cpp
-
-LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
-
-LOCAL_C_INCLUDES += $(LOCAL_PATH)/..
-
-include $(BUILD_EXECUTABLE)
-
-# ---- googletest (vendored from $ANDROID_NDK/sources/third_party/googletest) ----
-# Mirrors the pattern used by test/jni/Android.mk so the CausalLM unit tests can
-# be cross-compiled and run on-device via adb.
+# Vendored googletest used only by the on-device CausalLM reference suite.
 include $(CLEAR_VARS)
 GTEST_PATH := googletest
 LOCAL_MODULE := googletest_main
@@ -300,14 +118,8 @@ LOCAL_SRC_FILES := \
     $(GTEST_PATH)/src/gtest_main.cc
 include $(BUILD_STATIC_LIBRARY)
 
-# ---- unittest_causallm_models (CausalLM reference/differential gtest suite) ----
-# Builds the recently-added differential tests (causallm_test_utils.cpp + every
-# unittest_causallm_*.cpp listed in Applications/CausalLM/meson.build). Built
-# with the same FP16 ABI flags as causallm_core so the prebuilt shared libs link.
 include $(CLEAR_VARS)
-
 LOCAL_MODULE := unittest_causallm_models
-
 LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS) -Igoogletest/include -Igoogletest/
 LOCAL_LDLIBS := -llog -landroid
 
@@ -333,15 +145,14 @@ LOCAL_SRC_FILES := \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_embedding_gemma_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_tinybert_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_deberta_v2_reference.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_xlm_roberta_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_reference.cpp
 
-LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
+LOCAL_SHARED_LIBRARIES := causallm nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := googletest_main
-
 LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES) \
     $(LOCAL_PATH)/$(GTEST_PATH)/include \
     $(LOCAL_PATH)/../api \
     $(LOCAL_PATH)/$(UNITTEST_MODELS_DIR)
-
 include $(BUILD_EXECUTABLE)

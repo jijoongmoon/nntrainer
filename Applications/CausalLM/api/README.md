@@ -18,12 +18,12 @@ The standalone Android build produces:
 - `libquick_dot_ai_api.so`: the public C ABI in this directory.
 - `libnntrainer.so` and `libccapi-nntrainer.so`: engine dependencies.
 
-From `Applications/CausalLM`, run `./build_android.sh --assemble-aar`. The AAR
+From `Applications/CausalLM`, run `./build_android.sh --app`. The AAR
 mode is CPU-only unless QNN is explicitly enabled and never installs to a
 device without `--install`. See the parent
-[README](../README.md#4-android-build--test) for cache, QNN, legacy NDK,
-native-only, and device-install options. The no-option command builds the
-CPU-only Android.mk targets.
+[README](../README.md#4-android-build--test) for cache, QNN, and
+device-install options. The no-option command builds the same canonical
+CPU-native libraries and tools without Gradle.
 
 Native consumers should include `quick_dot_ai_api.h` and link
 `libquick_dot_ai_api.so`. Its transitive shared libraries must be available to
@@ -46,6 +46,5 @@ Refer to declarations and ownership comments in
 ## Compatibility
 
 Consumers must use `quick_dot_ai_api.h` and `libquick_dot_ai_api.so`; the
-former `causal_lm_api.h` ABI is not provided. The Android.mk goals
-`causallm_api` and `test_api` are build-target aliases for the current library
-and test executable, not ABI aliases.
+former `causal_lm_api.h` ABI is not provided. Android builds use the same
+canonical `libcausallm.so` core for native tools and app packaging.

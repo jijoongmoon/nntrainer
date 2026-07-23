@@ -25,7 +25,7 @@ From `Applications/CausalLM`, run:
 
 ```bash
 export ANDROID_NDK=/path/to/your/android-ndk
-./build_android.sh --assemble-aar
+./build_android.sh --app
 ```
 
 The CPU-only AAR mode stages `libcausallm.so`,
@@ -35,12 +35,11 @@ build-only: a connected device is not modified unless `--install` is supplied.
 The script forwards the selected NDK to Gradle. Direct Gradle builds must pass
 `-PnntrainerNdkPath=<absolute-path>`.
 
-Use `--enable-qnn` (and set `QNN_SDK_ROOT`) for a QNN-enabled package.
-`--native-only` skips Gradle assembly, `--cache` reuses a compatible engine
-when available, and `--skip-engine` requires a reusable engine to exist.
-`--legacy-ndk` additionally builds the core, CLI, quantizer, and API targets
-from `jni/Android.mk`. With no options, the script builds those targets only.
-`--skip-install` stages native outputs without Gradle or device installation.
+Use `--qnn` (and set `QNN_SDK_ROOT`) for a QNN-enabled package; CPU is the
+default and can be selected explicitly with `--no-qnn`. `--install` pushes the
+native tools and libraries, and installs SampleTestAPP only when combined with
+`--app`. `--cache` reuses a compatible engine when available and rebuilds it
+on a cache miss.
 
 ## 🧭 API Surface
 

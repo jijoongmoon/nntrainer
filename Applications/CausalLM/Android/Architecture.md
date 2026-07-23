@@ -156,18 +156,17 @@ contract rather than inventing a separate model API.
 ## 📦 Packaging
 
 `../build_android.sh` owns the current Android packaging workflow. Its
-no-option mode builds the CPU-only Android.mk targets. `--assemble-aar` builds
-the standalone app, stages `libcausallm.so`,
+no-option mode builds the canonical CPU native artifacts with Meson. `--app`
+adds the standalone app, stages `libcausallm.so`,
 `libquick_dot_ai_api.so`, and their nntrainer dependencies into
 `QuickDotAI/prebuilt_libs/`, and assembles the QuickDotAI AAR and
 SampleTestAPP without touching a device.
 
-Use `--enable-qnn` with `QNN_SDK_ROOT` to include the QNN backend. Device
-installation and CLI deployment are opt-in through `--install`; use
-`ANDROID_SERIAL` to select a device when necessary. `--native-only` stops after
-native staging, while `--cache` and `--skip-engine` provide permissive and
-strict engine reuse respectively. In an app/AAR mode, `--legacy-ndk` also
-builds the core, CLI, quantizer, and API targets in `jni/Android.mk`.
+Use `--qnn` with `QNN_SDK_ROOT` to select the QNN variant; `--no-qnn`
+explicitly selects CPU. `--install` pushes the canonical native libraries and
+tools, and installs SampleTestAPP only when combined with `--app`. Use
+`ANDROID_SERIAL` to select a device when necessary. `--cache` reuses a
+compatible engine build when available and rebuilds it on a cache miss.
 
 ## 📎 Related Docs
 

@@ -69,7 +69,7 @@ cd Applications/CausalLM
 
 # Android
 ./build_android.sh
-# Add --assemble-aar for the QuickDotAI AAR, or --install for device deploy.
+# Add --app for the QuickDotAI AAR/APK and --install for device deployment.
 
 # Linux / PC
 meson build && ninja -C build

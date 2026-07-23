@@ -180,68 +180,88 @@ if not fs.exists(tokenizer_path)
   error('CausalLM tokenizer library not found: @0@'.format(tokenizer_path))
 endif
 
-# ── Extra defines ───────────────────────────────────────────────────────
-extra_defines = []
-
-# Single QNN switch. enable-qnn on → QNN infra + QNN models (gemma4-e2b-qnn
-# folded into libcausallm) + the multimodal run path (api runMultimodal* →
-# base Transformer::run_image; vision encoders like gauss-3.8-vit are overlaid
-# by the internal-models plugin). The multimodal api code is model-agnostic
-# (base-class virtuals only, no proprietary headers) and unreachable without a
-# 2-model vision+LLM handle, so it is harmless on a QNN build with no vision
-# model present. All three move together — there is no separate qnn-models or
-# experimental-multimodal gate.
-if enable_qnn
-  extra_defines += '-DENABLE_QNN=1'
-  extra_defines += '-DENABLE_QNN_MODELS=1'
-  extra_defines += '-DQUICKAI_ENABLE_EXPERIMENTAL_MULTIMODAL_NNTRAINER_API=1'
-endif
-
-foreach d : extra_defines
-  add_project_arguments(d, language: ['c', 'cpp'])
-endforeach
-
 # ── libcausallm.so sources ────────────────────────────────────────────────
 # NOTE: Do NOT include causallm_root / 'api' sources here (besides streamer) -
 # the API layer is provided by libquick_dot_ai_api.so below; compiling it
 # again here would duplicate/interpose symbols.
-causallm_src_roots = [
-  causallm_root / 'layers',
-  causallm_root / 'models',
-  # factory.cpp: the ONE out-of-line Factory::Instance() definition. Must be
-  # compiled into libcausallm.so exactly once so every consumer .so (the api
-  # lib and the optional model plugin) shares a single Factory (see factory.h).
-  causallm_root / 'factory.cpp',
-  causallm_root / 'llm_util.cpp',
-  causallm_root / 'huggingface_tokenizer.cpp',
+#
+# Keep this list explicit. The previous recursive find silently changed the
+# Android ABI whenever an unrelated .cpp file was added under layers/ or
+# models/. This is the canonical Android core source manifest.
+causallm_src = [
   causallm_root / 'chat_template.cpp',
+  causallm_root / 'factory.cpp',
+  causallm_root / 'huggingface_tokenizer.cpp',
   causallm_root / 'kv_cache_manager.cpp',
-]
-
-causallm_auto_src = []
-foreach _causallm_src_root : causallm_src_roots
-  if fs.exists(_causallm_src_root)
-    _found_causallm_src = run_command(
-      'find',
-      _causallm_src_root,
-      '-name', '*.cpp',
-      '-not', '-name', 'main.cpp',
-      '-not', '-name', 'test_api.cpp',
-      '-not', '-name', 'unittest_*.cpp',
-      check: true,
-    ).stdout().strip()
-    if _found_causallm_src != ''
-      causallm_auto_src += _found_causallm_src.split('\n')
-    endif
-  endif
-endforeach
-
-# streamer.cpp lives in causallm_root/api but is self-contained (only depends
-# on streamer.h); models/causal_lm.cpp calls streamer_put()/streamer_end(), so
-# it must be compiled into libcausallm.so.
-streamer_src = [
+  causallm_root / 'llm_util.cpp',
+  causallm_root / 'models' / 'causal_lm.cpp',
+  causallm_root / 'models' / 'transformer.cpp',
+  causallm_root / 'models' / 'sentence_transformer.cpp',
+  causallm_root / 'models' / 'qwen2' / 'qwen2_causallm.cpp',
+  causallm_root / 'models' / 'qwen2' / 'qwen2_embedding.cpp',
+  causallm_root / 'models' / 'qwen3' / 'qwen3_causallm.cpp',
+  causallm_root / 'models' / 'qwen3' / 'qwen3_embedding.cpp',
+  causallm_root / 'models' / 'qwen3_moe' / 'qwen3_moe_causallm.cpp',
+  causallm_root / 'models' / 'qwen3_moe' / 'qwen_moe_layer.cpp',
+  causallm_root / 'models' / 'qwen3_slim_moe' / 'qwen3_slim_moe_causallm.cpp',
+  causallm_root / 'models' / 'qwen3_slim_moe' / 'qwen_moe_layer_fsu.cpp',
+  causallm_root / 'models' / 'qwen3_cached_slim_moe' / 'qwen3_cached_slim_moe_causallm.cpp',
+  causallm_root / 'models' / 'qwen3_cached_slim_moe' / 'qwen_moe_layer_cached.cpp',
+  causallm_root / 'models' / 'gpt_oss' / 'gptoss_causallm.cpp',
+  causallm_root / 'models' / 'gpt_oss' / 'gpt_oss_moe_layer.cpp',
+  causallm_root / 'models' / 'gpt_oss_cached_slim' / 'gptoss_cached_slim_causallm.cpp',
+  causallm_root / 'models' / 'gpt_oss_cached_slim' / 'gpt_oss_moe_layer_cached.cpp',
+  causallm_root / 'models' / 'gemma3' / 'gemma3_causallm.cpp',
+  causallm_root / 'models' / 'gemma3' / 'embedding_gemma.cpp',
+  causallm_root / 'models' / 'gemma3' / 'function.cpp',
+  causallm_root / 'models' / 'gemma4' / 'gemma4_causallm.cpp',
+  causallm_root / 'models' / 'lfm2' / 'lfm2_causallm.cpp',
+  causallm_root / 'models' / 'timm_vit' / 'timm_vit_transformer.cpp',
+  causallm_root / 'models' / 'deberta_v2' / 'deberta_v2.cpp',
+  causallm_root / 'models' / 'bert' / 'bert_transformer.cpp',
+  causallm_root / 'models' / 'bert' / 'multilingual_tinybert_16mb.cpp',
+  causallm_root / 'models' / 'xlm_roberta' / 'xlm_roberta.cpp',
+  causallm_root / 'layers' / 'embedding_layer.cpp',
+  causallm_root / 'layers' / 'embedding_pooling_layer.cpp',
+  causallm_root / 'layers' / 'embedding_normalize_layer.cpp',
+  causallm_root / 'layers' / 'per_layer_slice.cpp',
+  causallm_root / 'layers' / 'scalar_multiply.cpp',
+  causallm_root / 'layers' / 'logit_softcapping.cpp',
+  causallm_root / 'layers' / 'mha_core.cpp',
+  causallm_root / 'layers' / 'lm_head.cpp',
+  causallm_root / 'layers' / 'reshaped_rms_norm.cpp',
+  causallm_root / 'layers' / 'custom_multiply.cpp',
+  causallm_root / 'layers' / 'causal_conv1d_layer.cpp',
+  causallm_root / 'layers' / 'rms_norm.cpp',
+  causallm_root / 'layers' / 'rms_reverse_norm.cpp',
+  causallm_root / 'layers' / 'swiglu.cpp',
+  causallm_root / 'layers' / 'tie_word_embedding.cpp',
+  causallm_root / 'layers' / 'qkv_layer.cpp',
+  causallm_root / 'layers' / 'deberta_attention_layer.cpp',
+  causallm_root / 'layers' / 'shared_fully_connected_layer.cpp',
   causallm_root / 'api' / 'streamer.cpp',
 ]
+
+causallm_core_cpp_args = []
+quick_dot_ai_api_cpp_args = []
+quick_dot_ai_test_cpp_args = []
+
+# Single QNN switch. Keep the QNN ABI-affecting definitions on the targets
+# that consume them instead of applying them to the whole Meson project.
+if enable_qnn
+  causallm_core_cpp_args += [
+    '-DENABLE_QNN=1',
+    '-DENABLE_QNN_MODELS=1',
+  ]
+  quick_dot_ai_api_cpp_args += [
+    '-DENABLE_QNN_MODELS=1',
+    '-DQUICKAI_ENABLE_EXPERIMENTAL_MULTIMODAL_NNTRAINER_API=1',
+  ]
+  quick_dot_ai_test_cpp_args += [
+    '-DENABLE_QNN=1',
+    '-DENABLE_QNN_MODELS=1',
+  ]
+endif
 
 # ── QNN model-runtime infra + public gemma4-e2b-qnn model (gated) ────────
 # quick_dot_ai_qnn.cpp registers the QNN backend at runtime
@@ -315,11 +335,10 @@ causallm_xgrammar_lib = static_library('causallm_xgrammar',
 
 # ── Build libcausallm.so ─────────────────────────────────────────────────
 causallm_lib = shared_library('causallm',
-    causallm_auto_src,
-    streamer_src,
+    causallm_src,
     causallm_qnn_src,
     dependencies: [nntrainer_dep, openmp_dep, log_dep],
-    cpp_args: causallm_inc_args,
+    cpp_args: causallm_inc_args + causallm_core_cpp_args,
     link_args: [tokenizer_path],
     link_whole: [causallm_xgrammar_lib],
     install: true,
@@ -347,13 +366,11 @@ if get_option('enable-api')
     '-I' + causallm_root / 'xgrammar' / '3rdparty' / 'dlpack' / 'include',
   ]
 
-  quick_dot_ai_api_cpp_args = []
   if enable_qnn
     quick_dot_ai_inc_args += [
       '-I' + causallm_root / 'qnn',
       '-I' + causallm_root / 'qnn' / 'gemma4-e2b-qnn',
     ]
-    quick_dot_ai_api_cpp_args += ['-DENABLE_QNN_MODELS=1']
   endif
 
   quick_dot_ai_api_lib = shared_library('quick_dot_ai_api',
@@ -384,6 +401,7 @@ if get_option('enable-api-test')
   executable('quick_dot_ai_test',
       causallm_root / 'api-app' / 'test_api.cpp',
       dependencies: [quick_dot_ai_api_dep],
+      cpp_args: quick_dot_ai_test_cpp_args,
       install: false,
   )
 endif
@@ -397,6 +415,21 @@ endif
 executable('nntr_causallm',
     causallm_root / 'main.cpp',
     dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
+    cpp_args: causallm_inc_args,
+    install: false,
+)
+
+# ── Native tools ─────────────────────────────────────────────────────────
+executable('nntr_quantize',
+    causallm_root / 'quantize.cpp',
+    dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
+    cpp_args: causallm_inc_args,
+    install: false,
+)
+
+executable('nntr_safetensors_info',
+    causallm_root / 'safetensors_info.cpp',
+    dependencies: [nntrainer_dep],
     cpp_args: causallm_inc_args,
     install: false,
 )

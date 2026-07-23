@@ -23,7 +23,7 @@ val nntrainerNdkPath =
         ?.takeIf { it.isNotEmpty() }
         ?: throw GradleException(
             "Missing -PnntrainerNdkPath. Run " +
-                "Applications/CausalLM/build_android.sh --assemble-aar, or pass " +
+                "Applications/CausalLM/build_android.sh --app, or pass " +
                 "the absolute path of the NDK used for the native prebuilts."
         )
 
