@@ -14,7 +14,7 @@
 #include "attention_kernels_templates.h"
 #include <array>
 #include <blas_kernel_interface.h>
-#include <blas_kernels.h> // v8c_use_buffer_path()
+#include <blas_kernels.h> // v8c_use_buffer_path() — the V8C_BUF cell
 #include <chrono>
 #include <cl_kernels/flash_attention.h>
 #include <cl_kernels/rotary_emb.h>
@@ -2576,7 +2576,7 @@ bool flash_attention_prefill_f16_cl(
     // M=1024 1153 TPS vs scalar 3-kernel 727), so default it ON there. Adreno
     // (NNTR_V8C_BUF unset) keeps the naive flash OFF and uses the image
     // 3-kernel path — image attention beats flash 3x on Adreno.
-    return v8c_use_buffer_path() ? 1 : 0; // Intel buffer path => 1
+    return v8c_use_buffer_path() ? 1 : 0; // buffer path ⇒ 1
   }();
   // LDS staging (lever B) measured a NET LOSS on Intel Arc (per-tile barrier +
   // LDS pressure cut occupancy; the K/V row is small and L2-cached): 1257 ms vs
@@ -2596,7 +2596,7 @@ bool flash_attention_prefill_f16_cl(
     // #60: default ON for the Intel/buffer path (NNTR_V8C_BUF) — Block-Q +
     // subgroup-reduce is the measured-best Intel attention (M=1024 ~2075 TPS
     // vs vec-flash ~1119, token-identical). Adreno (unset) uses the image path.
-    return v8c_use_buffer_path() ? 1 : 0; // Intel buffer path => 1
+    return v8c_use_buffer_path() ? 1 : 0; // buffer path ⇒ 1
   }();
   // FBQ_TM: query rows per workgroup. Default 4 (=> acc+q 2*TM*VPL floats stays
   // in registers at LWS>=32). Only 1/2/4/8 supported.
@@ -2672,7 +2672,7 @@ bool flash_attention_prefill_f16_cl(
       // #59: Intel/buffer path default LWS=16 => VPL = d/16 = 8 (half8 vloads),
       // the measured Intel-Arc optimum (1153 TPS @ M=1024 vs 981 at LWS=64).
       // Adreno default stays 64.
-      v = v8c_use_buffer_path() ? 16 : 64; // Intel buffer path => 16
+      v = v8c_use_buffer_path() ? 16 : 64; // buffer path ⇒ 16
     }
     // Must be a power of two for the log-step tree reduction.
     if (v != 16 && v != 32 && v != 64 && v != 128 && v != 256)
@@ -2698,6 +2698,92 @@ bool flash_attention_prefill_f16_cl(
       v = 64;
     return v;
   }();
+
+  // [#r30-q4] The fp16 DPAS tile kernel (flash_attention_prefill_f16_xmx)
+  // for FULL-ATTENTION prefill calls (win==0): subgroup-owned 8-row tiles,
+  // 16-key tiles on the systolic array. DEFAULT ON on DPAS-capable devices
+  // (validated: gemma2 d=256, gemma4 d=512 via the NSG=2 split +72%@32K;
+  // CHECK numerics clean on both, det 2-run byte-identical).
+  // NNTR_FLASH_XMX=0 restores the scalar blockq path;
+  // sliding-window calls are never routed (they keep the measured-best
+  // blockq + window-skip path). NNTR_FLASH_XMX_CHECK=N additionally runs the
+  // blockq kernel first on the same buffers and host-compares (first N
+  // calls).
+  static const int flash_xmx_req = []() {
+    const char *e = std::getenv("NNTR_FLASH_XMX");
+    if (e)
+      return std::atoi(e) != 0 ? 1 : 0;
+    return ClContext::Global().caps().dpas ? 1 : 0; // default ON on DPAS HW
+  }();
+  // NNTR_FLASH_XMX_CHECK: 0/unset = off, 1 = compare the first 6 calls,
+  // N>1 = compare the first N calls (long enough to reach late-layer dims,
+  // e.g. gemma4's d=512 full-attention calls).
+  static const int flash_xmx_check = []() {
+    const char *e = std::getenv("NNTR_FLASH_XMX_CHECK");
+    const int v = e ? std::atoi(e) : 0;
+    return (v <= 0) ? 0 : (v == 1 ? 6 : v);
+  }();
+  const int win_i =
+    (local_window > 0 && local_window < N_kv) ? (int)local_window : 0;
+  const bool use_xmx = flash_blockq && flash_xmx_req && causal && win_i == 0 &&
+                       (int)head_dim % 16 == 0 && (int)head_dim <= 512 &&
+                       ClContext::Global().caps().dpas;
+  // DPAS row-tile (M dimension). TM=8 measured best at every d incl. 512:
+  // the register budget (~FXA_TM*d*6B/16 per lane) spills at TM8/d512, but
+  // halving the per-visit DPAS count + tile count still nets -26% vs TM4
+  // (gemma4 32K full-attn 147->108s). The d=512 kernel remains latency-bound
+  // (~9ns/visit vs 0.56 at d=128 -- 16KB SLM V-tile caps residency and the
+  // KCH=32 SLM VNNI gather serializes); the planned v2 is a dual-subgroup
+  // d-split WG. NNTR_FLASH_XMX_TM=4/8 overrides for experiments.
+  static const int xmx_tm_env = []() {
+    const char *e = std::getenv("NNTR_FLASH_XMX_TM");
+    const int v = e ? std::atoi(e) : 0;
+    return (v == 4 || v == 8 || v == 16) ? v : 0;
+  }();
+  // TM=16 default: the kernel is K/V-bandwidth-bound (TM=4 A/B scales
+  // traffic-proportionally), and 16 rows per K/V pass halves that traffic --
+  // measured 32K full-attn -29% (gemma4 d=512/NSG4).
+  const int xmx_tm = xmx_tm_env ? xmx_tm_env : 16;
+  // v2: subgroups per WG, each owning a d-slice (d=512 -> 2 so the per-lane
+  // chunk count returns to the d=256 register envelope and lane residency
+  // doubles). NNTR_FLASH_XMX_NSG=1/2 overrides for A/B.
+  static const int xmx_nsg_env = []() {
+    const char *e = std::getenv("NNTR_FLASH_XMX_NSG");
+    const int v = e ? std::atoi(e) : 0;
+    return (v == 1 || v == 2 || v == 4) ? v : 0;
+  }();
+  // d=512 default NSG=4: slice chunk count drops to the d=128 register
+  // envelope (qa 128B + acc 256B/lane, spill-free) and lane residency per WG
+  // quadruples -- measured 79.1->50.2s full-attn vs NSG=2 (-37%), beating
+  // even the exchange-free probe floor (55.4s). d<=256 stays NSG=1.
+  int xmx_nsg = xmx_nsg_env ? xmx_nsg_env : (((int)head_dim >= 512) ? 4 : 1);
+  // [r31 note-b] guard: FXA_KCH_SUB truncates silently when 16*NSG does not
+  // divide head_dim (no current dim hits this; env overrides could).
+  if ((int)head_dim % (16 * xmx_nsg) != 0)
+    xmx_nsg = 1;
+  // Exchange batching (NSG>1 only): key-tiles per psum exchange. Default 2
+  // (one WG-barrier pair per 32 keys; +XB*NSG*TM*64B SLM). NNTR_FLASH_XMX_XB
+  // = 1/2/4 overrides for A/B.
+  static const int xmx_xb_env = []() {
+    const char *e = std::getenv("NNTR_FLASH_XMX_XB");
+    const int v = e ? std::atoi(e) : 0;
+    return (v == 1 || v == 2 || v == 4) ? v : 0;
+  }();
+  // XB default 1: batching measured NEUTRAL at NSG=4 (spill-free) and
+  // REGRESSIVE at NSG=2 (scb spill traffic, +14%/+55% at XB=2/4). Env kept
+  // for tuning on other SKUs.
+  int xmx_xb = (xmx_nsg > 1) ? (xmx_xb_env ? xmx_xb_env : 1) : 1;
+  // [r31 note-a] guard: clamp XB so psum + vtile fit the per-WG SLM budget
+  // (XB=4 + d=512 defaults previously exceeded it -> launch failure, no
+  // fallback). Budget 64KB, the conservative Xe per-WG limit.
+  {
+    const size_t vtile_b = (size_t)16 * (size_t)head_dim * 2;
+    auto slm_b = [&](int xb) {
+      return vtile_b + (size_t)xb * xmx_nsg * xmx_tm * 16 * 4;
+    };
+    while (xmx_xb > 1 && slm_b(xmx_xb) > 64 * 1024)
+      xmx_xb /= 2;
+  }
 
   // Diagnostic: NNTR_FLASH_FP16_SCORE=1 truncates each score to fp16
   // before the online-softmax update, matching the 3-kernel baseline
@@ -2732,17 +2818,33 @@ bool flash_attention_prefill_f16_cl(
       if (flash_blockq_sg_eff)
         base += " -DFBQ_SG";
     }
+    if (use_xmx) {
+      base += " -DFLASH_XMX=1 -DFXA_D=" + std::to_string((int)head_dim) +
+              " -DFXA_TM=" + std::to_string(xmx_tm) +
+              " -DFXA_NSG=" + std::to_string(xmx_nsg) +
+              " -DFXA_XB=" + std::to_string(xmx_xb);
+    }
     return base;
   }();
   ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
     flash_attention_kernel,
-    flash_blockq ? "flash_attention_prefill_f16_blockq"
-    : flash_vec  ? "flash_attention_prefill_f16_coop_vec"
-    : flash_coop ? "flash_attention_prefill_f16_coop"
-                 : "flash_attention_prefill_f16_skeleton",
+    use_xmx        ? "flash_attention_prefill_f16_xmx"
+    : flash_blockq ? "flash_attention_prefill_f16_blockq"
+    : flash_vec    ? "flash_attention_prefill_f16_coop_vec"
+    : flash_coop   ? "flash_attention_prefill_f16_coop"
+                   : "flash_attention_prefill_f16_skeleton",
     flash_copts);
   if (!kp)
     return false;
+  // CHECK mode: also register the blockq reference kernel (same copts).
+  ClContext::SharedPtrClKernel kp_ref = nullptr;
+  if (use_xmx && flash_xmx_check) {
+    kp_ref = blas_cc->registerClKernel(flash_attention_kernel,
+                                       "flash_attention_prefill_f16_blockq",
+                                       flash_copts);
+    if (!kp_ref)
+      return false;
+  }
 
   // The vectorized variant tiles head_dim into LWS contiguous blocks of
   // VPL = head_dim / LWS lanes — requires LWS | head_dim and VPL <= 8 (the
@@ -2755,55 +2857,64 @@ bool flash_attention_prefill_f16_cl(
       return false;
   }
 
-  if (!kp->SetKernelSVMArguments(0, const_cast<uint16_t *>(Q_host)) ||
-      !kp->SetKernelSVMArguments(1, const_cast<uint16_t *>(K_host)) ||
-      !kp->SetKernelSVMArguments(2, const_cast<uint16_t *>(V_host)) ||
-      !kp->SetKernelSVMArguments(3, O_host))
-    return false;
-
   int Mi = (int)M, Nkvi = (int)N_kv, di = (int)head_dim;
   int gqa = (int)(num_heads_Q / num_heads_KV);
   int causal_i = causal ? 1 : 0;
   float scale = 1.0f / std::sqrt((float)head_dim);
-  if (!kp->SetKernelArguments(4, &Mi, sizeof(int)) ||
-      !kp->SetKernelArguments(5, &Nkvi, sizeof(int)) ||
-      !kp->SetKernelArguments(6, &di, sizeof(int)) ||
-      !kp->SetKernelArguments(7, &HD_Q, sizeof(int)) ||
-      !kp->SetKernelArguments(8, &HD_KV, sizeof(int)) ||
-      !kp->SetKernelArguments(9, &gqa, sizeof(int)) ||
-      !kp->SetKernelArguments(10, &causal_i, sizeof(int)) ||
-      !kp->SetKernelArguments(11, &scale, sizeof(float)) ||
-      !kp->SetKernelArguments(12, &k_stride, sizeof(int)))
-    return false;
-  // softcap (arg 13) and local_window (arg 14) exist only on the Block-Q kernel
-  // (Gemma2 attn logit soft-cap; Gemma4 sliding-window). The coop/vec/skeleton
-  // variants (Qwen3 d=128, no softcap/window) don't declare them, so only bind
-  // them for the blockq path. local_window<=0 or >=N_kv => no window mask.
-  if (flash_blockq) {
-    int win_i =
-      (local_window > 0 && local_window < N_kv) ? (int)local_window : 0;
-    if (!kp->SetKernelArguments(13, &attn_softcap, sizeof(float)) ||
-        !kp->SetKernelArguments(14, &win_i, sizeof(int)))
+  int win_arg = win_i;
+  // softcap (arg 13) and local_window (arg 14) exist only on the Block-Q/XMX
+  // kernels (Gemma2 attn logit soft-cap; Gemma4 sliding-window). The
+  // coop/vec/skeleton variants (Qwen3 d=128, no softcap/window) don't declare
+  // them, so only bind them for those paths. local_window<=0 or >=N_kv => no
+  // window mask.
+  auto bind_all = [&](ClContext::SharedPtrClKernel &kk) -> bool {
+    if (!kk->SetKernelSVMArguments(0, const_cast<uint16_t *>(Q_host)) ||
+        !kk->SetKernelSVMArguments(1, const_cast<uint16_t *>(K_host)) ||
+        !kk->SetKernelSVMArguments(2, const_cast<uint16_t *>(V_host)) ||
+        !kk->SetKernelSVMArguments(3, O_host))
       return false;
-  }
+    if (!kk->SetKernelArguments(4, &Mi, sizeof(int)) ||
+        !kk->SetKernelArguments(5, &Nkvi, sizeof(int)) ||
+        !kk->SetKernelArguments(6, &di, sizeof(int)) ||
+        !kk->SetKernelArguments(7, &HD_Q, sizeof(int)) ||
+        !kk->SetKernelArguments(8, &HD_KV, sizeof(int)) ||
+        !kk->SetKernelArguments(9, &gqa, sizeof(int)) ||
+        !kk->SetKernelArguments(10, &causal_i, sizeof(int)) ||
+        !kk->SetKernelArguments(11, &scale, sizeof(float)) ||
+        !kk->SetKernelArguments(12, &k_stride, sizeof(int)))
+      return false;
+    if (flash_blockq) {
+      if (!kk->SetKernelArguments(13, &attn_softcap, sizeof(float)) ||
+          !kk->SetKernelArguments(14, &win_arg, sizeof(int)))
+        return false;
+    }
+    return true;
+  };
+  if (!bind_all(kp))
+    return false;
 
   std::array<size_t, 1> gws;
   std::array<size_t, 1> lws;
   if (flash_coop || flash_vec || flash_blockq) {
     // Coop / vec: ONE workgroup per (head_q, query_row). Block-Q: ONE workgroup
-    // per (head_q, row-tile of FBQ_TM rows) => TM x fewer groups. gws = groups
-    // * LWS, lws = LWS (the reqd_work_group_size in the kernel). The kernel
-    // recomputes n_row_tiles = ceil(M/FBQ_TM) from the compile-time FBQ_TM, so
-    // the host ceil(M/TM) below matches exactly (no stray groups dispatched).
+    // per (head_q, row-tile of FBQ_TM rows) => TM x fewer groups. XMX: ONE
+    // subgroup (LWS=16) per (head_q, 8-row tile). gws = groups * LWS, lws =
+    // LWS (the reqd_work_group_size in the kernel). The kernel recomputes
+    // n_row_tiles from its compile-time TM, so the host ceil below matches
+    // exactly (no stray groups dispatched).
     size_t groups;
-    if (flash_blockq) {
+    if (use_xmx) {
+      const size_t n_row_tiles =
+        ((size_t)M + (size_t)xmx_tm - 1) / (size_t)xmx_tm;
+      groups = (size_t)num_heads_Q * n_row_tiles;
+    } else if (flash_blockq) {
       const size_t TM = (size_t)flash_blockq_tm;
       const size_t n_row_tiles = (M + TM - 1) / TM;
       groups = (size_t)num_heads_Q * n_row_tiles;
     } else {
       groups = (size_t)num_heads_Q * M;
     }
-    const size_t L = (size_t)flash_coop_lws;
+    const size_t L = use_xmx ? (size_t)(16 * xmx_nsg) : (size_t)flash_coop_lws;
     gws = {groups * L};
     lws = {L};
   } else {
@@ -2817,12 +2928,109 @@ bool flash_attention_prefill_f16_cl(
   static const bool _flash_trace = std::getenv("NNTR_FLASH_TRACE") != nullptr;
   if (_flash_trace) {
     std::fprintf(stderr,
-                 "[FLASH-DISPATCH] d=%d LWS=%d VPL=%d SG=%d gws=%zu groups\n",
+                 "[FLASH-DISPATCH] d=%d LWS=%d VPL=%d SG=%d XMX=%d gws=%zu "
+                 "groups\n",
                  (int)head_dim, flash_coop_lws, (int)head_dim / flash_coop_lws,
-                 flash_blockq_sg_eff, gws[0] / lws[0]);
+                 flash_blockq_sg_eff, (int)use_xmx, gws[0] / lws[0]);
+  }
+  // [FLASH_XMX_CHECK] Run the blockq reference on the SAME buffers first and
+  // snapshot O, so the xmx result can be host-compared (first calls only).
+  std::vector<uint16_t> _xmx_ref;
+  static int _xmx_check_done = 0;
+  if (kp_ref && _xmx_check_done < flash_xmx_check) {
+    if (!bind_all(kp_ref))
+      return false;
+    const size_t TMr = (size_t)flash_blockq_tm;
+    const size_t g_ref = (size_t)num_heads_Q * (((size_t)M + TMr - 1) / TMr);
+    std::array<size_t, 1> gws_r{g_ref * (size_t)flash_coop_lws};
+    std::array<size_t, 1> lws_r{(size_t)flash_coop_lws};
+    blas_cc->command_queue_inst_.enqueueKernel(
+      kp_ref->GetKernel(), 1, gws_r.data(), lws_r.data(), 0, nullptr, nullptr);
+    clFinish(q);
+    _xmx_ref.assign(O_host, O_host + (size_t)M * (size_t)HD_Q);
+  }
+  // NNTR_FLASH_TIMER=1: true GPU time of THIS kernel (clFinish before and
+  // after, so prior queued work is excluded and the kernel is drained).
+  // Serializes the queue -- diagnostics only. Buckets: full (win==0) vs
+  // sliding; totals printed at process exit.
+  static const bool _flash_timer = std::getenv("NNTR_FLASH_TIMER") != nullptr;
+  struct FlashTimerAgg {
+    long long full_ns = 0, slide_ns = 0, full_calls = 0, slide_calls = 0;
+    ~FlashTimerAgg() {
+      if (full_calls + slide_calls)
+        std::fprintf(stderr,
+                     "[FLASH-TIMER] full-attn %.1f ms / %lld calls; sliding "
+                     "%.1f ms / %lld calls\n",
+                     full_ns / 1.0e6, full_calls, slide_ns / 1.0e6,
+                     slide_calls);
+    }
+  };
+  static FlashTimerAgg _ft_agg;
+  std::chrono::steady_clock::time_point _ft_t0;
+  if (_flash_timer) {
+    clFinish(q);
+    _ft_t0 = std::chrono::steady_clock::now();
   }
   blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 1, gws.data(),
                                              lws.data(), 0, nullptr, nullptr);
+  if (_flash_timer) {
+    clFinish(q);
+    const long long ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - _ft_t0)
+                           .count();
+    if (win_i == 0) {
+      _ft_agg.full_ns += ns;
+      ++_ft_agg.full_calls;
+    } else {
+      _ft_agg.slide_ns += ns;
+      ++_ft_agg.slide_calls;
+    }
+  }
+  if (!_xmx_ref.empty()) {
+    clFinish(q);
+    auto _h2f = [](uint16_t hh) -> float {
+      const uint32_t s = (uint32_t)(hh & 0x8000) << 16;
+      uint32_t e = (hh >> 10) & 0x1F, mt = hh & 0x3FF, f;
+      if (e == 0) {
+        if (mt == 0)
+          f = s;
+        else {
+          int ee = 127 - 15 + 1;
+          while (!(mt & 0x400)) {
+            mt <<= 1;
+            ee--;
+          }
+          mt &= 0x3FF;
+          f = s | ((uint32_t)ee << 23) | (mt << 13);
+        }
+      } else if (e == 0x1F)
+        f = s | 0x7F800000u | (mt << 13);
+      else
+        f = s | ((e - 15 + 127) << 23) | (mt << 13);
+      float r;
+      std::memcpy(&r, &f, 4);
+      return r;
+    };
+    double max_diff = 0.0;
+    size_t over_tol = 0, arg = 0;
+    const size_t total = (size_t)M * (size_t)HD_Q;
+    for (size_t i = 0; i < total; ++i) {
+      const double dd =
+        std::fabs((double)_h2f(O_host[i]) - (double)_h2f(_xmx_ref[i]));
+      if (dd > max_diff) {
+        max_diff = dd;
+        arg = i;
+      }
+      if (dd > 0.02)
+        ++over_tol;
+    }
+    std::fprintf(stderr,
+                 "[FLASH-XMX-CHECK] call=%d M=%u N_kv=%u maxdiff=%.6f at "
+                 "(row=%zu col=%zu) over_tol=%zu/%zu\n",
+                 _xmx_check_done, M, N_kv, max_diff, arg / HD_Q, arg % HD_Q,
+                 over_tol, total);
+    ++_xmx_check_done;
+  }
 
   // In-order SVM-pool queue: the flash output O is consumed by the next GPU op
   // (o_proj FC), which the queue orders after this kernel — no host read of O —
