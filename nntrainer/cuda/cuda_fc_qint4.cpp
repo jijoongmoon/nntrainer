@@ -446,6 +446,85 @@ __global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
   }
 }
 
+// Fused decode GEMV: the per-row asym int8 activation quant folded into the
+// GEMV kernel itself (the ML Drift paper's 3.7 decode prescription: quantize
+// inside the operational kernel). Every block redundantly reduces the row's
+// min/max -- fmin/fmax are order- and partition-independent, so scale/zp and
+// the quantized bytes are BIT-IDENTICAL to the two-kernel (act-quant + GEMV)
+// path, and the dp4a accumulate is integer -- the output matches exactly.
+// The activation row (K fp16, a few KB) re-reads from L2 per block; the win
+// is one launch (+ per-op drain) less per FC call and no q8/ascale/azp
+// global round-trip. M==1 only; dynamic shared = K bytes for the q8 row.
+__global__ void dp4a_gemv_fused_h(const unsigned short *Xh,
+                                  const signed char *plain,
+                                  const int *wrowsum,
+                                  const unsigned short *wscale, float *Y,
+                                  int N, int K, int out_fp16) {
+  extern __shared__ signed char q8s[]; // K bytes (launch-sized), 4-aligned
+  __shared__ float smn[128];
+  __shared__ float smx[128];
+  // Phase A: cooperative row min/max -> qparams -> quantize into shared.
+  // All threads participate (the n>=N early-out must come AFTER the syncs).
+  float lmn = 0.f, lmx = 0.f;
+  for (int kk = threadIdx.x; kk < K; kk += blockDim.x) {
+    float v = dp4a_h2f(Xh[kk]);
+    lmn = fminf(lmn, v);
+    lmx = fmaxf(lmx, v);
+  }
+  smn[threadIdx.x] = lmn;
+  smx[threadIdx.x] = lmx;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      smn[threadIdx.x] = fminf(smn[threadIdx.x], smn[threadIdx.x + s]);
+      smx[threadIdx.x] = fmaxf(smx[threadIdx.x], smx[threadIdx.x + s]);
+    }
+    __syncthreads();
+  }
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  for (int kk = threadIdx.x; kk < K; kk += blockDim.x) {
+    int q = (int)rintf(dp4a_h2f(Xh[kk]) * scale_q) + zp;
+    q = max(-128, min(127, q));
+    q8s[kk] = (signed char)q;
+  }
+  __syncthreads();
+  // Phase B: the dp4a_gemv body over the shared q8 row (same warp mapping).
+  const int warps_per_block = blockDim.x >> 5;
+  int n = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+  if (n >= N)
+    return;
+  const int lane = threadIdx.x & 31;
+  int Kh = (K + 1) >> 1;
+  const signed char *wrow = plain + (long)n * Kh;
+  int acc = 0;
+  for (int kk = lane * 4; kk + 4 <= K; kk += 32 * 4) {
+    int a = *(const int *)(q8s + kk);
+    int kb = kk >> 1;
+    unsigned int w16 = *(const unsigned short *)(wrow + kb);
+    int b0 = w16 & 0xFF;
+    int b1 = (w16 >> 8) & 0xFF;
+    int w0 = ((int)(signed char)(b0 << 4)) >> 4;
+    int w1 = ((int)(signed char)b0) >> 4;
+    int w2 = ((int)(signed char)(b1 << 4)) >> 4;
+    int w3 = ((int)(signed char)b1) >> 4;
+    int w = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |
+            ((w3 & 0xFF) << 24);
+    acc = __dp4a(a, w, acc);
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0) {
+    float r = (float)(acc - zp * wrowsum[n]) * recip * dp4a_h2f(wscale[n]);
+    if (out_fp16)
+      ((unsigned short *)Y)[n] = dp4a_f2h(r);
+    else
+      Y[n] = r;
+  }
+}
+
 // Register-blocked dp4a GEMM: a 64x64 output tile per block; each of the 256
 // threads accumulates a 4x4 micro-tile in registers, so a K-chunk of 32 staged
 // once into shared memory feeds 16 dp4a per thread before the next load -- much
@@ -727,13 +806,19 @@ DevWeightQ *ensure_dp4a_cache_locked(const unsigned char *plain_w,
 bool dp4a_repack_and_gemm(const unsigned char *plain_w,
                           const unsigned short *scales_fp16, float *Yf,
                           unsigned int M, unsigned int N, unsigned int K,
-                          int out_fp16 = 0) {
+                          int out_fp16 = 0,
+                          const unsigned short *Xh_fused = nullptr) {
   const int n = (int)N, k = (int)K;
   const bool gemv = (M == 1);
+  // Fused decode path: activation quant folded into the GEMV (bit-identical
+  // output, one launch fewer, no q8 scratch round-trip). Caller passes the
+  // fp16 activation row instead of pre-staging g_dp4a_q8.
+  const bool fused = gemv && Xh_fused != nullptr;
   const bool tiled = (M >= 8);
   auto kg = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC,
-    gemv ? "dp4a_gemv" : (tiled ? "dp4a_gemm_reg" : "dp4a_gemm"));
+    FC_QINT4_DP4A_SRC, fused  ? "dp4a_gemv_fused_h"
+                       : gemv ? "dp4a_gemv"
+                              : (tiled ? "dp4a_gemm_reg" : "dp4a_gemm"));
   if (!kg)
     return false;
 
@@ -744,6 +829,20 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   int *wrowsum = dwp->rowsum;
 
   const int mm = (int)M;
+  if (fused) {
+    kg->SetKernelArguments(0, &Xh_fused, sizeof(Xh_fused));
+    kg->SetKernelArguments(1, &plain, sizeof(plain));
+    kg->SetKernelArguments(2, &wrowsum, sizeof(wrowsum));
+    kg->SetKernelArguments(3, &scales_fp16, sizeof(scales_fp16));
+    kg->SetKernelArguments(4, &Yf, sizeof(Yf));
+    kg->SetKernelArguments(5, &n, sizeof(n));
+    kg->SetKernelArguments(6, &k, sizeof(k));
+    kg->SetKernelArguments(7, &out_fp16, sizeof(out_fp16));
+    const int gvb[3] = {128, 1, 1};
+    const int gvg[3] = {((int)N + 3) / 4, 1, 1};
+    return StreamManager::Global().DispatchCommand(*kg, gvg, gvb,
+                                                   (unsigned int)K);
+  }
   kg->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
   kg->SetKernelArguments(1, &plain, sizeof(plain));
   kg->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
@@ -967,6 +1066,30 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
     return false;
   }
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  // Fused decode (M==1): fold the activation quant into the GEMV kernel
+  // (the ML Drift paper's 3.7 decode form). Output verified BIT-IDENTICAL
+  // to the two-kernel path (fmin/fmax partition-independence + integer
+  // dp4a), but on RTX 5060 it measured a stable ~31% decode-TPS LOSS on
+  // BOTH the SAFE (per-op drain) and M2B-graph profiles (gemma2 1K:
+  // 63-64 -> 43.9 TPS, 3x back-to-back each): the per-block Phase-A
+  // barriers serialize the weight streaming that the split kernels
+  // pipeline naturally, and on this class of GPU the saved launch +
+  // q8 round-trip is cheaper than that stall. Default OFF; opt-in via
+  // NNTR_CUDA_FC_FUSED_DECQ=1 for environments where the paper's premise
+  // holds (launch/sync-tax-bound: WDDM without graphs, mobile-class) --
+  // measure before enabling.
+  static const bool _fused_decq = []() {
+    const char *e = std::getenv("NNTR_CUDA_FC_FUSED_DECQ");
+    return e && e[0] && e[0] != '0';
+  }();
+  if (M == 1 && _fused_decq) {
+    if (!dp4a_repack_and_gemm(plain_w, scales_fp16,
+                              reinterpret_cast<float *>(Yh), M, N, K,
+                              /** out_fp16 */ 1, Xh))
+      return false;
+    StreamManager::Global().maybeFinish();
+    return true;
+  }
   // No float Y staging here: the GEMM writes fp16 directly (out_fp16=1 below),
   // so g_dp4a_yf is unused on this path. Allocating it lazily would cudaMalloc
   // inside a CUDA-graph capture (NNTR_CUDA_GRAPH) on the first captured decode
