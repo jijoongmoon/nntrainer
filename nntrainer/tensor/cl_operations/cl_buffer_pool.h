@@ -106,6 +106,21 @@ public:
    */
   void ensureZeroFilled(unsigned int idx);
 
+  /**
+   * @brief Mark the tokens the TensorPool classified SVM (never bound as a
+   *        device cl_mem). allocate() then SKIPS the per-offset cl_mem
+   *        sub-buffer for any offset used ONLY by such tokens -- otherwise a
+   *        large MAX_LIFESPAN SVM-resident tensor (e.g. an int8 KV cache at
+   *        long context, read SVM by the kvi8 flash kernels) would otherwise
+   *        also allocate an equally large, never-used cl_mem plane. An offset
+   *        shared with ANY GPU_CLMEM token keeps its cl_mem, so this is
+   *        byte-identical for every GPU_CLMEM binding. Must be called before
+   *        allocate().
+   */
+  void setSvmOnlyTokens(std::unordered_set<unsigned int> tokens) {
+    svm_only_tokens_ = std::move(tokens);
+  }
+
 private:
   void *cl_pool_;          /**< single device cl_mem over the planned plane */
   size_t base_addr_align_; /**< CL_DEVICE_MEM_BASE_ADDR_ALIGN, bytes */
@@ -128,6 +143,9 @@ private:
   std::unordered_set<size_t>
     zero_filled_; /**< padded offsets already zero-filled (ensureZeroFilled
                        idempotence) */
+  std::unordered_set<unsigned int>
+    svm_only_tokens_; /**< tokens classified SVM (never cl_mem-bound); an offset
+                           used only by these skips its cl_mem sub-buffer. */
 };
 
 } // namespace nntrainer

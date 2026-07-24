@@ -123,10 +123,33 @@ void ClBufferPool::allocate() {
   //     Hard-fail (no SVM fallback) so a cl_mem-mode run never silently
   //     degrades to the corrupting hybrid.
   size_t alloc_total = 0, alloc_max = 0;
+  // [kvi8-mem] Offsets that need a device cl_mem = those bound by at least one
+  // GPU_CLMEM (non-SVM) token. An offset used ONLY by SVM-classified tokens
+  // (setSvmOnlyTokens) skips its cl_mem: it is read via SVM and the eager
+  // per-offset buffer is pure committed waste (e.g. a MAX_LIFESPAN int8 KV
+  // cache at long context can waste hundreds of MB this way). Default (no
+  // SVM-only tokens marked) -> every offset needs cl_mem = byte-identical to
+  // the always-allocate path.
+  static const bool _svm_skip = [] {
+    const char *e = std::getenv("NNTR_CLMEM_SVM_SKIP");
+    return !(e && e[0] == '0');
+  }();
+  const bool svm_skip_active = _svm_skip && !svm_only_tokens_.empty();
+  std::unordered_set<size_t> clmem_needed;
+  if (svm_skip_active) {
+    for (size_t i = 0; i < padded_offsets_.size(); ++i)
+      if (!svm_only_tokens_.count(static_cast<unsigned int>(i + 1)))
+        clmem_needed.insert(padded_offsets_[i]);
+  }
+  size_t svm_skipped_bytes = 0;
   for (const auto &kv : offset_maxsize_) {
     const size_t sz = kv.second;
     if (sz == 0)
       continue;
+    if (svm_skip_active && !clmem_needed.count(kv.first)) {
+      svm_skipped_bytes += sz; // SVM-only offset: no device cl_mem plane
+      continue;
+    }
     // A single tensor larger than the device single-allocation cap cannot be a
     // cl_mem at all (clCreateBuffer -> CL_INVALID_BUFFER_SIZE). The only tensor
     // that hits this is a host-resident quantized weight plane (e.g. Gemma4's
@@ -166,10 +189,18 @@ void ClBufferPool::allocate() {
 
   ml_logi("ClBufferPool: allocated %zu per-offset device cl_mem buffers "
           "(total %.1f MB, plane extent %.1f MB, largest single %.1f MB; "
-          "device MAX_MEM_ALLOC_SIZE %.1f MB, GLOBAL_MEM_SIZE %.1f MB)",
+          "device MAX_MEM_ALLOC_SIZE %.1f MB, GLOBAL_MEM_SIZE %.1f MB; "
+          "SVM-only skipped %.1f MB)",
           offset_sub_.size(), alloc_total / 1048576.0,
           cl_pool_bytes_ / 1048576.0, alloc_max / 1048576.0,
-          max_alloc / 1048576.0, global_mem / 1048576.0);
+          max_alloc / 1048576.0, global_mem / 1048576.0,
+          svm_skipped_bytes / 1048576.0);
+  if (std::getenv("NNTR_KVI8_MEMDIAG") != nullptr)
+    std::fprintf(stderr,
+                 "[clmem] %zu cl_mem buffers, total %.1f MB, SVM-only skipped "
+                 "%.1f MB\n",
+                 offset_sub_.size(), alloc_total / 1048576.0,
+                 svm_skipped_bytes / 1048576.0);
 }
 
 void ClBufferPool::ensureZeroFilled(unsigned int idx) {
