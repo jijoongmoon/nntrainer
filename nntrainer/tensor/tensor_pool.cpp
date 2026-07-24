@@ -275,7 +275,6 @@ void TensorPool::setBatchSize(const std::string &name, unsigned int batch) {
 void TensorPool::allocate(bool init) {
   if (minMemoryRequirement() == 0)
     return;
-  mem_pool->allocate();
 
   /** S0: planner-decided static residency. The backend allocator (resolved
    * once) tells us whether GPU cl_mem residency is even possible. INERT: the
@@ -343,6 +342,34 @@ void TensorPool::allocate(bool init) {
     const char *e = std::getenv("NNTR_CLMEM_QKV");
     return e && e[0] == '0';
   }();
+
+  /** [kvi8-mem] Pre-pass: classify every tensor BEFORE the pool allocates its
+   * device cl_mem plane, and hand the ClBufferPool the set of SVM-classified
+   * tokens. It then skips the per-offset cl_mem for any offset used only by
+   * SVM tokens -- e.g. the MAX_LIFESPAN int8 KV cache, read SVM by the kvi8
+   * flash kernels, which otherwise wastes a full cl_mem copy (~568 MB @32K).
+   * The class here MUST match the post-allocate stamp below (same planner). */
+#ifdef ENABLE_OPENCL
+  if (clmem_eligible) {
+    if (auto *clpool = dynamic_cast<ClBufferPool *>(mem_pool.get())) {
+      std::unordered_set<unsigned int> svm_tokens;
+      for (auto &spec : pool) {
+        auto details = std::get_if<SourceDetails>(&spec.details);
+        if (!details || details->token == 0)
+          continue;
+        const ResidencyClass cls = planner.classify(
+          details->engine, details->all_consumers_gpu,
+          spec.tensor->getDataType() == ml::train::TensorDim::DataType::FP16,
+          details->role, spec.tensor->getName(), details->view_count);
+        if (cls != ResidencyClass::GPU_CLMEM)
+          svm_tokens.insert(details->token);
+      }
+      clpool->setSvmOnlyTokens(std::move(svm_tokens));
+    }
+  }
+#endif
+
+  mem_pool->allocate();
 
   /** set the pointers using the token for all the tensors */
   for (auto &spec : pool) {
