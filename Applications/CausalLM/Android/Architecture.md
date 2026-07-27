@@ -162,8 +162,8 @@ adds the standalone app, stages `libcausallm.so`,
 `QuickDotAI/prebuilt_libs/`, and assembles the QuickDotAI AAR and
 SampleTestAPP without touching a device.
 
-Use `--qnn` with `QNN_SDK_ROOT` to select the QNN variant; `--no-qnn`
-explicitly selects CPU. `--install` pushes the canonical native libraries and
+Use `--qnn` with `QNN_SDK_ROOT` to select the QNN variant; CPU is the default.
+`--install` pushes the canonical native libraries and
 tools, and installs SampleTestAPP only when combined with `--app`. Use
 `ANDROID_SERIAL` to select a device when necessary. `--cache` reuses a
 compatible engine build when available and rebuilds it on a cache miss.

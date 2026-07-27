@@ -10,8 +10,7 @@ Usage: ./build_android.sh [options] [engine Meson options]
 Options:
   --app                   Also assemble the QuickDotAI AAR and sample APK
   --install               Push native artifacts; with --app, install the APK
-  --qnn                   Build the QNN-enabled native/app variant
-  --no-qnn                Build the CPU-only variant (default)
+  --qnn                   Build the QNN-enabled native/app variant (default: CPU-only)
   --cache                 Reuse a compatible engine build; build on cache miss
   --clean                 Recreate the selected CausalLM build outputs
   --nntr-threads=N        Set the nntrainer compute thread count (default: 7)
@@ -31,7 +30,6 @@ EOF
 CLEAN=false
 USE_BUILD_CACHE=false
 ENABLE_QNN=false
-QNN_MODE_SET=""
 INSTALL=false
 BUILD_APP=false
 NNTR_THREADS="${NNTR_THREADS:-7}"
@@ -50,23 +48,7 @@ while [[ $# -gt 0 ]]; do
             INSTALL=true
             ;;
         --qnn)
-            if [[ "$QNN_MODE_SET" == "cpu" ]]; then
-                echo "Error: QNN enable/disable options are mutually exclusive." >&2
-                exit 2
-            fi
             ENABLE_QNN=true
-            QNN_MODE_SET="qnn"
-            ;;
-        --no-qnn|--skip-qnn)
-            if [[ "$1" == "--skip-qnn" ]]; then
-                deprecated_option "--skip-qnn" "--no-qnn"
-            fi
-            if [[ "$QNN_MODE_SET" == "qnn" ]]; then
-                echo "Error: QNN enable/disable options are mutually exclusive." >&2
-                exit 2
-            fi
-            ENABLE_QNN=false
-            QNN_MODE_SET="cpu"
             ;;
         --assemble-aar|--aar)
             deprecated_option "$1" "--app"
@@ -88,7 +70,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -D*|--arm-arch=*)
             if [[ "$1" == -Denable-npu=* ]]; then
-                echo "Error: -Denable-npu is controlled by --qnn/--no-qnn." >&2
+                echo "Error: -Denable-npu is controlled by --qnn." >&2
                 exit 2
             fi
             ENGINE_ARGS+=("$1")

@@ -86,7 +86,7 @@ The script handles meson setup, ninja build, fixture extraction, and sets
 ### Step 1: Build the canonical Android native artifacts
 
 ```bash
-./Applications/CausalLM/build_android.sh --no-qnn
+./Applications/CausalLM/build_android.sh
 # core:  builddir_app/cpu/libcausallm.so
 # tools: builddir_app/cpu/nntr_quantize
 ```

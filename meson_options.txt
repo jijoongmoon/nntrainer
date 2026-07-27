@@ -20,18 +20,6 @@ option('test-timeout', type: 'integer', value: 90)
 option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
 option('enable-mmap', type: 'boolean', value: true)
 option('enable-npu', type: 'boolean', value: false)
-# Path to a locally-installed Qualcomm QNN SDK. When enable-npu=true, either
-# this option or the QNN_SDK_ROOT environment variable must be set; the option
-# takes priority when both are provided. The SDK root is used at configure time
-# by nntrainer/qnn/jni/tools/update_qnn_version.py to auto-generate the
-# vendor/ directory (SDK headers + compatibility patches). vendor/ is gitignored
-# and must NOT be committed — it is always produced from the locally-installed SDK.
-# The QNN SDK is "Confidential and Proprietary" Qualcomm code that cannot be
-# redistributed in this repository. Obtain it from Qualcomm Software Center
-# (https://qpm.qualcomm.com/) and pass the extracted SDK root, e.g.:
-#   meson setup build -Denable-npu=true -Dqnn-sdk-root=/opt/qcom/aistack/qnn-2.47.0
-# Alternatively: export QNN_SDK_ROOT=/opt/qcom/aistack/qnn-2.47.0
-# See docs/backend_guide/QNN_BUILD.md for details.
 option('qnn-sdk-root', type: 'string', value: '')
 # HTP (Hexagon Tensor Processor / HMX) backend via the Qualcomm HexKL
 # CPU Macro API (sdkl.h / libsdkl.so). Proprietary SDK is NOT vendored;
@@ -96,20 +84,8 @@ option('nnstreamer-subplugin-install-path', type: 'string', value: 'lib/nnstream
 
 # application related options
 option('enable-transformer', type: 'boolean', value: false)
-# Builds libquick_dot_ai_api.so (+ quick_dot_ai_test smoke exe) from this
-# submodule's own CausalLM tree (E4). CPU/public-only: no QNN model wiring
-# (ENABLE_QNN_MODELS is never defined here). Requires enable-transformer.
+# Builds libquick_dot_ai_api.so (+ quick_dot_ai_test smoke exe)
 option('enable-api', type: 'boolean', value: false)
-# Compiles the public QNN model-runtime infra (Applications/CausalLM/qnn/*)
-# and the public gemma4-e2b-qnn model into libcausallm.so, and defines
-# ENABLE_QNN_MODELS for the api layer (the dynamic_cast<Quick_Dot_AI_QNN *>
-# / make_unique<Gemma4_E2B_QNN> paths in api/quick_dot_ai_api.cpp). Requires
-# enable-transformer + enable-npu: the QNN backend (libqnn_context.so) is
-# registered into nntrainer's Engine at runtime by qnn/quick_dot_ai_qnn.cpp
-# (Engine::Global().registerContext("libqnn_context.so", ...)), not linked
-# directly, so no QNN SDK headers are needed to compile this option's
-# sources. Off by default; proprietary QNN models are layered on top by a
-# separate downstream project, not in this public tree.
 option('enable-qnn-models', type: 'boolean', value: false)
 option('causallm-tokenizer-lib', type: 'string', value: '',
        description: 'Path to a prebuilt CausalLM tokenizer library to link instead of the default. Windows generates its default under <builddir>/tokenizers_c_win/target; elsewhere the tracked Applications/CausalLM/lib/libtokenizers_c.a is staged into the build directory. Use this option for a locally built archive - never overwrite the tracked one.')

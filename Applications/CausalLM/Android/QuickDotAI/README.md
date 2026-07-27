@@ -36,7 +36,7 @@ The script forwards the selected NDK to Gradle. Direct Gradle builds must pass
 `-PnntrainerNdkPath=<absolute-path>`.
 
 Use `--qnn` (and set `QNN_SDK_ROOT`) for a QNN-enabled package; CPU is the
-default and can be selected explicitly with `--no-qnn`. `--install` pushes the
+default. `--install` pushes the
 native tools and libraries, and installs SampleTestAPP only when combined with
 `--app`. `--cache` reuses a compatible engine when available and rebuilds it
 on a cache miss.

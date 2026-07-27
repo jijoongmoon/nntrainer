@@ -272,8 +272,7 @@ The most useful options are:
 |---|---|
 | `--app` | Add the QuickDotAI AAR and sample APK to the canonical native build. |
 | `--install` | Push the native libraries and tools; with `--app`, also install the built APK. |
-| `--qnn` | Build the QNN variant and include its runtime libraries; requires `QNN_SDK_ROOT`. |
-| `--no-qnn` | Explicitly select the CPU variant, which is also the default. |
+| `--qnn` | Build the QNN variant and include its runtime libraries; requires `QNN_SDK_ROOT`. CPU is the default. |
 | `--cache` | Reuse a compatible existing nntrainer Android engine build, or build it when absent. |
 | `--clean` | Recreate the selected CPU or QNN CausalLM build directory. |
 | `--nntr-threads=N` | Set the positive nntrainer compute-thread count. |

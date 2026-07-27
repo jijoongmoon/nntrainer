@@ -79,7 +79,7 @@ log_success "Prerequisites OK"
 log_step "2/6" "Build canonical CausalLM native artifacts"
 # ---------------------------------------------------------------------------
 
-BUILD_ARGS=(--no-qnn)
+BUILD_ARGS=()
 if [[ "$USE_CACHE" -eq 1 ]]; then
     BUILD_ARGS+=(--cache)
 fi
