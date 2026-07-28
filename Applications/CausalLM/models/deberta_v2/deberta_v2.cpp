@@ -349,14 +349,12 @@ void DebertaV2::registerCustomLayers() {
   SentenceTransformer::registerCustomLayers();
 
   const auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
   try {
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::DebertaAttentionLayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::SharedFullyConnectedLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::DebertaAttentionLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::SharedFullyConnectedLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
