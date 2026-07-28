@@ -1,9 +1,12 @@
 LOCAL_PATH := $(call my-dir)
 
 # Flags the prebuilt nntrainer libraries were built with. -march selects the
-# instruction set; the FP16 defines gate the _FP16 type in the public headers
-# (tensor_dim.h), so consumers must compile with the same values or the ABI
-# breaks. Exported automatically to every module that links these prebuilts.
+# instruction set; the feature defines gate declarations in the public headers
+# (FP16 defines gate the _FP16 type in tensor_dim.h; ENABLE_OPENCL gates the
+# ClContext member in engine.h and every GPU code path in consumers), so
+# consumers must compile with the same values or they build against a
+# different library than the one they link. Exported automatically to every
+# module that links these prebuilts.
 NNTRAINER_EXPORT_CFLAGS := @MESON_ARM_MARCH@ @NNTRAINER_ABI_DEFINES@
 
 include $(CLEAR_VARS)

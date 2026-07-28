@@ -36,13 +36,16 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../third_party \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
-# (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
-# prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS.
+# (APP_CPPFLAGS); -march and the feature defines the prebuilts were built with
+# (ENABLE_FP16/USE__FP16/ENABLE_OPENCL/CL_TARGET_OPENCL_VERSION) are inherited
+# from the prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS. Do not
+# hardcode them here: a value that disagrees with the prebuilt silently either
+# breaks the ABI or drops this app's GPU code paths.
 CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math \
     -Wno-nan-infinity-disabled -Wno-deprecated-literal-operator
 
 # Prebuilt nntrainer libraries. The generated Android.mk exports the include
-# paths and the -march/FP16 cflags the prebuilts were built with.
+# paths and the -march/feature-define cflags the prebuilts were built with.
 NNTRAINER_PREBUILT_MK := $(NNTRAINER_ROOT)/builddir/android_build_result/Android.mk
 ifeq ($(wildcard $(NNTRAINER_PREBUILT_MK)),)
 $(error $(NNTRAINER_PREBUILT_MK) not found. Build nntrainer first (tools/package_android.sh))
