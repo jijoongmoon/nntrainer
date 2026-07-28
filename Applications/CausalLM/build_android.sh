@@ -6,16 +6,29 @@ set -e
 
 # Parse options
 USE_BUILD_CACHE=0
+MESON_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --cache)
             USE_BUILD_CACHE=1
             shift
             ;;
+        -D*|--arm-arch=*)
+            # Forwarded verbatim to tools/package_android.sh, which already
+            # filters -D*/--arm-arch=* out of its own argv and hands them to
+            # meson. Without this, options the nntrainer build needs -- most
+            # importantly -Denable-opencl=true for the GPU build -- are
+            # unreachable from this script.
+            MESON_ARGS+=("$1")
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--cache]"
-            echo "  --cache  Reuse existing nntrainer builddir if available"
+            echo "Usage: $0 [--cache] [-D<meson-option>=<value>]... [--arm-arch=<version>]"
+            echo "  --cache           Reuse existing nntrainer builddir if available"
+            echo "  -D<opt>=<val>     Forwarded to meson, e.g."
+            echo "                    -Denable-opencl=true -Denable-clblast=false"
+            echo "  --arm-arch=<ver>  Forwarded to meson, e.g. --arm-arch=armv9.2-a"
             exit 1
             ;;
     esac
@@ -103,12 +116,16 @@ log_info "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 log_info "Build cache: $([ "$USE_BUILD_CACHE" -eq 1 ] && echo 'enabled' || echo 'disabled (default)')"
 log_info "ANDROID_NDK: $ANDROID_NDK"
 log_info "Working directory: $(pwd)"
+log_info "meson args: ${MESON_ARGS[*]:-(none)}"
 
 # Step 1: Build nntrainer for Android if not already built
 log_step "1/4" "Build nntrainer for Android"
 
 if [ "$USE_BUILD_CACHE" -eq 1 ] && [ -f "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so" ]; then
     log_info "Build cache enabled: reusing existing nntrainer builddir (skipping)"
+    if [ ${#MESON_ARGS[@]} -gt 0 ]; then
+        log_warning "meson args are ignored with --cache; the cached builddir keeps its own options."
+    fi
 else
     log_info "Building nntrainer for Android..."
     cd "$NNTRAINER_ROOT"
@@ -116,7 +133,7 @@ else
         log_info "Removing existing builddir..."
         rm -rf builddir
     fi
-    ./tools/package_android.sh
+    ./tools/package_android.sh "${MESON_ARGS[@]}"
 fi
 
 # Check if build was successful
