@@ -196,10 +196,9 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
-  // Opt-in only on this tree; see the member's doc comment in transformer.h.
   USE_FLASH_ATTENTION = nntr_cfg.contains("use_flash_attention")
                           ? nntr_cfg["use_flash_attention"].get<bool>()
-                          : false;
+                          : true;
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
   LMHEAD_UNTIE =

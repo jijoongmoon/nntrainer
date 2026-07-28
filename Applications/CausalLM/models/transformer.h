@@ -469,22 +469,26 @@ protected:
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
   /**
-   * @brief Enable mha_core's flash/GEMM attention block (stamped as the
-   *        layer's "use_gemm_attention" property). Read from nntr_config.json
-   *        key "use_flash_attention".
+   * @brief Enable mha_core's flash/GEMM attention block for prefill (decode
+   *        always uses the per-row dot path). Stamped as the layer's
+   *        "use_gemm_attention" property; read from nntr_config.json key
+   *        "use_flash_attention".
    *
-   * DEFAULT false on this tree, deliberately -- the reference defaults it true.
-   * mha_core gates that whole block on `svm_ok` (q/k/v/o all SVM-resident) and
-   * the KV cache cannot currently report isSVM() through a full inference call
-   * (the per-call placeholder fill re-wraps the cache pointer in a fresh
-   * MemoryData, clobbering the flag), so the GPU attempts all decline and the
-   * block lands on mha_core's `gemm_attention` host prefill reading a
-   * device-written K/V plane through host pointers. MEASURED with this flag
-   * forced true: gemma4 golden -> immediate <eos>, qwen3/gemma2 change
-   * degeneracy class. Flip the default to true only together with the
-   * SVM-resident KV cache surviving `incrementalInference` (see §10).
+   * Defaults to true, matching the reference. This is the flag that makes
+   * mha_core.cpp's `if (use_gemm_attention && ...)` block reachable at all --
+   * with it false the entire GPU/flash/gemm attention subsystem is dead code
+   * and prefill attention runs the slow per-row host path (~222 TPS @ M=1024
+   * on gemma4, which is exactly what this tree measured while it was off).
+   *
+   * The block gates each GPU candidate on `svm_ok` (q/k/v/o all SVM-resident),
+   * so it only pays off once the KV cache is SVM-resident *and* stays that way
+   * across a call -- see kv_cache_manager.cpp's SVM MemoryPool and
+   * CausalLM::incrementalInference's cache_by_ptr remap. Turning this on
+   * without both of those regresses output (the block then lands on
+   * `gemm_attention` reading a device-written K/V plane through host
+   * pointers); the three rungs ship together.
    */
-  bool USE_FLASH_ATTENTION = false;
+  bool USE_FLASH_ATTENTION = true;
 
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;
