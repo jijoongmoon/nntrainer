@@ -1255,8 +1255,18 @@ void NeuralNetwork::load(const std::string &file_path,
           continue;
         const std::string &name = weight->getName();
         auto it = name_offset_map.find(name);
-        if (it == name_offset_map.end())
+        if (it == name_offset_map.end()) {
+          // A name miss used to be a SILENT wrong-data path: file_offset keeps
+          // its default of 0, so the weight is later read from byte 0 of the
+          // file -- the 8-byte header length plus the ASCII JSON header, whose
+          // byte pairs decode as fp16 5.3e4..6.1e4. That is indistinguishable
+          // from a plausible-but-wrong weight downstream, and the EOF tripwire
+          // cannot catch it because offset 0 never overruns. Say so.
+          ml_logw("safetensors: no record named '%s' in %s; this weight keeps "
+                  "file offset 0 and will read the container header as data",
+                  name.c_str(), f_path.c_str());
           continue;
+        }
         const size_t file_off = data_base + it->second.first;
         weight->getVariableRef().setFileOffset(file_off);
       }
