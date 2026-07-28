@@ -16,6 +16,7 @@
 
 #include <cstdlib>
 #include <optional>
+#include <stdexcept>
 
 #include <base_properties.h>
 #include <common.h>
@@ -121,6 +122,8 @@ unsigned int applyTKP(const float *logits, int len, float temperature,
  *         ClComputeOps throws NI for plain CPU BLAS ops. An absent engine prop
  *         already defaults to CPU in LayerNode; this keeps the explicit GPU
  *         default for backward compatibility while making CPU one env away.
+ * @throw  std::invalid_argument when NNTR_ENGINE=gpu is requested but this
+ *         binary was built without OpenCL support.
  */
 [[maybe_unused]] static std::string causallm_engine() {
   static const std::string eng = []() -> std::string {
@@ -131,6 +134,23 @@ unsigned int applyTKP(const float *logits, int len, float temperature,
         return "cpu";
       if (s == "cuda") // additive NVIDIA CUDA backend (engine=cuda)
         return "cuda";
+      if (s == "gpu") {
+#if defined(ENABLE_OPENCL)
+        return "gpu";
+#else
+        // Explicit GPU request against a build that has no OpenCL. Silently
+        // running the CPU fallbacks here costs ~10x throughput and looks like
+        // a GPU regression instead of a build misconfiguration - most often
+        // -DENABLE_OPENCL missing from this app's compile flags while
+        // libnntrainer itself was built with -Denable-opencl=true.
+        throw std::invalid_argument(
+          "NNTR_ENGINE=gpu was requested but this binary was built without "
+          "OpenCL support (ENABLE_OPENCL is not defined). Rebuild nntrainer "
+          "with -Denable-opencl=true; the android app inherits the define "
+          "from the generated android_build_result/Android.mk via "
+          "LOCAL_EXPORT_CFLAGS.");
+#endif
+      }
     }
 #if defined(ENABLE_OPENCL)
     return "gpu";
