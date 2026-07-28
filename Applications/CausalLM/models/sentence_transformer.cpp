@@ -383,14 +383,12 @@ void SentenceTransformer::registerCustomLayers() {
   Transformer::registerCustomLayers();
 
   const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
   try {
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::EmbeddingPoolingLayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::EmbeddingNormalizeLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::EmbeddingPoolingLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::EmbeddingNormalizeLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
