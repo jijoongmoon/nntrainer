@@ -68,7 +68,13 @@ if get_option('enable-opencl')
   nntrainer_elements += 'opencl'
   nntrainer_elements += 'layers/cl_layers'
 
-  nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
+  # On android clblast_dep is a bare declare_dependency() with no include paths,
+  # so this is the only route for CLBlast headers. clblast_interface.cpp still
+  # includes "clblast.h" unconditionally, so a CLBlast-free ndk-build also needs
+  # the #ifdef ENABLE_CLBLAST guard and -DENABLE_CLBLAST=1 from #4191.
+  if get_option('enable-clblast')
+    nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
+  endif
 endif
 
 if get_option('enable-npu')
