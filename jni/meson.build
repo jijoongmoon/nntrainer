@@ -86,15 +86,25 @@ endif
 
 if get_option('enable-opencl')
   # Set OpenCL block markers to include the OpenCL sections
-  and_conf.set('MESON_ENABLE_OPENCL', 1) 
-  if clblast_dep.found()
+  and_conf.set('MESON_ENABLE_OPENCL', 1)
+  # The staged libOpenCL.so / CL headers are required by every OpenCL build,
+  # with or without CLBlast, so this is not gated on enable-clblast.
+  and_conf.set('MESON_CL_ROOT', opencl_root)
+  # Gate on the option, not on clblast_dep.found(): with enable-clblast=false
+  # clblast_dep is a bare declare_dependency() whose .found() is still true,
+  # which made the template reference the then-undefined clblast_root.
+  if get_option('enable-clblast')
+    and_conf.set('MESON_HAS_CLBLAST', 1)
     and_conf.set('MESON_CLBLAST_ROOT', clblast_root)
-    and_conf.set('MESON_CL_ROOT', opencl_root)
+  else
+    and_conf.set('MESON_HAS_CLBLAST', 0)
+    and_conf.set('MESON_CLBLAST_ROOT', '')
   endif
 else
   # Disable OpenCL
   and_conf.set('MESON_ENABLE_OPENCL', 0)
   # No OpenCL libraries needed
+  and_conf.set('MESON_HAS_CLBLAST', 0)
   and_conf.set('MESON_CLBLAST_ROOT', '')
   and_conf.set('MESON_CL_ROOT', '')
 endif
