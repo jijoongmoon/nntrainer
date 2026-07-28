@@ -37,12 +37,26 @@ and_conf.set('MESON_CCAPI_NNTRAINER_SRCS', ' '.join(ccapi_src))
 and_conf.set('MESON_CCAPI_NNTRAINER_INCS', ' '.join(ccapi_inc_abs))
 and_conf.set('MESON_ARM_MARCH', arm_march_flag)
 
-# ABI-affecting defines exported to prebuilt consumers via Android-prebuilt.mk:
-# they gate the _FP16 type in the public headers (tensor_dim.h), so apps that
-# link the prebuilts must compile with the same values.
+# Feature defines exported to prebuilt consumers via Android-prebuilt.mk.
+# All of these gate declarations in the *installed* headers, so an app that
+# links the prebuilts and compiles with different values sees a different
+# library than the one it links against:
+#   ENABLE_FP16 / USE__FP16 -- gate the _FP16 type in tensor_dim.h (USE__FP16
+#     even changes name mangling), i.e. a hard ABI break.
+#   ENABLE_OPENCL -- gates the ClContext member in engine.h and selects the
+#     GPU code paths in consumers; without it an app silently compiles its
+#     CPU fallbacks against a GPU-capable libnntrainer.
+#   CL_TARGET_OPENCL_VERSION -- required by CL/cl.h, reached through
+#     engine.h -> cl_context.h and through blas_kernels.h.
+nntrainer_exported_defines = [
+  '-DENABLE_FP16=1',
+  '-DUSE__FP16=1',
+  '-DENABLE_OPENCL=1',
+  '-DCL_TARGET_OPENCL_VERSION=200',
+]
 nntrainer_abi_defines = []
 foreach define : extra_defines
-  if define == '-DENABLE_FP16=1' or define == '-DUSE__FP16=1'
+  if nntrainer_exported_defines.contains(define)
     nntrainer_abi_defines += define
   endif
 endforeach
