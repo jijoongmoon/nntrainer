@@ -14,9 +14,13 @@
 
 #include <minja/chat-template.hpp>
 
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -169,6 +173,108 @@ struct ChatTemplate::Impl {
     Options::DeveloperRolePolicy::MergeIntoSystem;
   mutable std::unordered_map<std::string, std::unique_ptr<minja::chat_template>>
     renderers;
+  /** [init-latency L3] renderers is now touched by the warm-up thread too. */
+  mutable std::mutex renderers_mtx;
+  mutable std::thread warm_thread;
+  /**
+   * @brief Serialises the warm-up join, and ONLY the join.
+   *
+   * It cannot be `renderers_mtx`: the warm thread takes that lock to publish
+   * its renderer, so joining while holding it deadlocks. That is why the join
+   * was originally left unsynchronised -- but then two concurrent apply()
+   * callers could both observe warm_thread.joinable() and both call join() on
+   * the same thread, which is undefined. It has never fired only because the
+   * SFlare path serialises apply() on its own run_mutex_, which is a property
+   * of one caller and not of this class.
+   *
+   * A dedicated mutex is used rather than a std::once_flag because once_flag
+   * would be consumed by a join attempt made BEFORE startWarmup() assigned the
+   * thread; the flag would then be spent and the thread never joined, which is
+   * std::terminate at destruction. The mutex has no such ordering trap: an
+   * early call simply finds nothing to join and a later one still joins.
+   * Losers block here until the winner's join returns, which is exactly the
+   * "nobody reads renderers until the warm thread is done" contract.
+   */
+  mutable std::mutex warm_join_mtx;
+
+  /**
+   * @brief Join the warm-up thread before anyone reads `renderers`.
+   *        Idempotent and safe to call concurrently.
+   */
+  void joinWarmup() const {
+    std::lock_guard<std::mutex> lk(warm_join_mtx);
+    if (warm_thread.joinable())
+      warm_thread.join();
+  }
+
+  ~Impl() {
+    // A destructor must not let an exception escape, and a std::thread that is
+    // still joinable when destroyed is an unconditional std::terminate --
+    // detaching is the only safe fallback if the join itself failed.
+    try {
+      joinWarmup();
+    } catch (...) {
+      if (warm_thread.joinable())
+        warm_thread.detach();
+    }
+  }
+
+  /**
+   * @brief [init-latency L3] Build the renderer we are almost certainly going
+   *   to need on a side thread, at template-LOAD time instead of at first
+   *   apply().
+   *
+   * minja::chat_template's constructor parses the Jinja source and (for the
+   * polyfill probe) renders it once with a synthetic message set; on the
+   * an 18 KB chat_template.jinja that measured ~170 ms, paid serially inside
+   * the first apply() -- i.e. straight onto the first-token latency, after the
+   * whole model was already loaded. It depends on nothing but the source and
+   * the bos/eos tokens, all of which are final by the end of Load(), so it
+   * overlaps the graph compile + weight load for free (same trick as the
+   * async tokenizer parse in Transformer's ctor).
+   *
+   * Only the key apply() will actually ask for is warmed: "__default__" for a
+   * single-source template (chat_template.jinja or a string chat_template),
+   * else the "default" entry of a template map. A tools/template_name request
+   * simply misses the cache and constructs lazily as before.
+   *
+   * Failures are swallowed: apply() then constructs on its own and raises the
+   * real error at the point the caller can attribute it.
+   * NNTR_CHAT_TEMPLATE_WARM=0 disables the warm-up.
+   */
+  void startWarmup() {
+    const char *e = std::getenv("NNTR_CHAT_TEMPLATE_WARM");
+    if (e != nullptr && e[0] == '0')
+      return;
+
+    std::string key;
+    std::string src;
+    if (!template_source.empty()) {
+      key = "__default__";
+      src = template_source;
+    } else if (template_map.contains("default") &&
+               template_map["default"].is_string()) {
+      key = "default";
+      src = template_map["default"].get<std::string>();
+    } else {
+      return;
+    }
+
+    warm_thread = std::thread([this, key, src]() {
+      try {
+        auto renderer =
+          std::make_unique<minja::chat_template>(src, bos_token, eos_token);
+        std::lock_guard<std::mutex> lk(renderers_mtx);
+        renderers.emplace(key, std::move(renderer));
+      } catch (...) {
+        // Leave the cache empty; apply() will construct and throw properly.
+      }
+      if (std::getenv("NNTR_INIT_TRACE")) {
+        std::fprintf(stderr, "[init-trace] chat-template renderer warm done\n");
+        std::fflush(stderr);
+      }
+    });
+  }
 
   const std::string &selectTemplate(bool has_tools, const Options &options,
                                     std::string &cache_key) const {
@@ -211,6 +317,15 @@ struct ChatTemplate::Impl {
 
   const minja::chat_template &rendererFor(const std::string &key,
                                           const std::string &source) const {
+    // [init-latency L3] The warm-up thread may still be inserting; join it
+    // before the lookup, then take renderers_mtx for the map itself (a later
+    // apply() with a different key can race a concurrent caller on it).
+    // Lock ORDER matters and is enforced by construction: joinWarmup() takes
+    // and releases warm_join_mtx and returns before renderers_mtx is acquired
+    // here, so the two are never held at once -- which is what keeps the join
+    // from deadlocking against the warm thread's own renderers_mtx.
+    joinWarmup();
+    std::lock_guard<std::mutex> lk(renderers_mtx);
     auto it = renderers.find(key);
     if (it != renderers.end())
       return *it->second;
@@ -436,6 +551,8 @@ ChatTemplate ChatTemplate::Load(const std::string &model_path) {
   if (fileExists(template_file_path)) {
     impl->source_path = template_file_path;
     impl->template_source = readTextFile(template_file_path);
+    // [init-latency L3] Everything the renderer needs is final now.
+    impl->startWarmup();
     return ChatTemplate(std::move(impl));
   }
 
@@ -455,6 +572,8 @@ ChatTemplate ChatTemplate::Load(const std::string &model_path) {
                              "object");
   }
 
+  // [init-latency L3] Everything the renderer needs is final now.
+  impl->startWarmup();
   return ChatTemplate(std::move(impl));
 }
 
