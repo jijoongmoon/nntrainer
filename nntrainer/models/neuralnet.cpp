@@ -1075,6 +1075,24 @@ void NeuralNetwork::load(const std::string &file_path,
     auto model_file =
       checkedOpenStream<std::ifstream>(f_path, std::ios::in | std::ios::binary);
 
+    // Layout tripwire: the per-tensor file offsets computed above are trusted
+    // blindly by the (parallel, mmap-backed) reader below — if the graph's
+    // idea of a weight's on-disk size disagrees with what the file actually
+    // contains (e.g. a dtype mismatch between the requested weight and the
+    // stored record), every later tensor is positionally misloaded and the
+    // final reads run PAST THE END of the mapping (SIGSEGV in a load worker,
+    // far from the actual bug). Fail fast with an actionable message instead.
+    {
+      model_file.seekg(0, std::ios::end);
+      const auto f_bytes = static_cast<size_t>(model_file.tellg());
+      model_file.seekg(0, std::ios::beg);
+      NNTR_THROW_IF(start_from > f_bytes, std::runtime_error)
+        << "Model layout mismatch: graph expects " << start_from
+        << " bytes of weights but file '" << f_path << "' has only " << f_bytes
+        << " bytes. A weight's requested dtype/size disagrees with the stored "
+           "record (offsets would run past EOF).";
+    }
+
 #if defined(_WIN32)
     HANDLE hFile, hMap;
 #endif
