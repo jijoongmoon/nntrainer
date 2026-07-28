@@ -141,10 +141,27 @@ void RMSReverseNormLayer::incremental_forwarding(
 
       in_step32.copyData(in_step);
 
+      // weight/out_scale share the activation dtype (packed=false), which is
+      // FP16 on an enable-fp16 build. The math below runs in an FP32 temporary,
+      // so multiplying by the FP16 tensors directly reinterprets their bytes as
+      // FP32 (Tensor::multiply -> apply_broadcast reads getData<float>()) ->
+      // garbage. Upcast the scale tensors to FP32 first so every multiply is
+      // dtype-matched. (Only gauss4 uses this layer; other norms apply their
+      // scale after converting the buffer back to the activation dtype.)
+      ml::train::TensorDim weight32_dim = weight.getDim();
+      weight32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+      nntrainer::Tensor weight32(weight32_dim, true);
+      weight32.copyData(weight);
+
+      ml::train::TensorDim out_scale32_dim = out_scale.getDim();
+      out_scale32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+      nntrainer::Tensor out_scale32(out_scale32_dim, true);
+      out_scale32.copyData(out_scale);
+
       // ReverseRMSNorm order: x * weight → normalize → multiply by out_scale
 
       // Step 1: Multiply input by weight (BEFORE normalization)
-      in_step32.multiply_i(weight);
+      in_step32.multiply_i(weight32);
 
       // Step 2: Compute RMS normalization
       auto t = in_step32.multiply(in_step32).average(3).add(epsilon);
@@ -154,7 +171,7 @@ void RMSReverseNormLayer::incremental_forwarding(
       in_step32.multiply(t, out_step32);
 
       // Step 4: Apply output scale (AFTER normalization)
-      out_step32.multiply_i(out_scale);
+      out_step32.multiply_i(out_scale32);
 
       out_step.copyData(out_step32);
 #else
