@@ -429,6 +429,23 @@ protected:
   unsigned int FSU_LOOKAHEAD;
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
+  /**
+   * @brief Enable mha_core's flash/GEMM attention block (stamped as the
+   *        layer's "use_gemm_attention" property). Read from nntr_config.json
+   *        key "use_flash_attention".
+   *
+   * DEFAULT false on this tree, deliberately -- the reference defaults it true.
+   * mha_core gates that whole block on `svm_ok` (q/k/v/o all SVM-resident) and
+   * the KV cache cannot currently report isSVM() through a full inference call
+   * (the per-call placeholder fill re-wraps the cache pointer in a fresh
+   * MemoryData, clobbering the flag), so the GPU attempts all decline and the
+   * block lands on mha_core's `gemm_attention` host prefill reading a
+   * device-written K/V plane through host pointers. MEASURED with this flag
+   * forced true: gemma4 golden -> immediate <eos>, qwen3/gemma2 change
+   * degeneracy class. Flip the default to true only together with the
+   * SVM-resident KV cache surviving `incrementalInference` (see §10).
+   */
+  bool USE_FLASH_ATTENTION = false;
 
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;
