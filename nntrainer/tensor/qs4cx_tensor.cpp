@@ -9,10 +9,60 @@
  */
 
 #include <cpu_backend.h>
+#include <cstdlib>
 #include <qs4cx_tensor.h>
 #include <tensor.h>
 
 namespace nntrainer {
+
+namespace {
+/**
+ * @brief VALUE-checked env truthiness: set, non-empty, and not starting with
+ *   '0', so that NNTR_QS4CX_ALLOC_ZERO=0 really is "off" rather than "present,
+ *   therefore on". Kept file-local on purpose: this translation unit must
+ *   compile against a tree that ships no shared env helper, and a header that
+ *   only this file would consume does not belong in the public include set.
+ */
+bool envOn(const char *name) {
+  const char *e = std::getenv(name);
+  return e != nullptr && e[0] != '\0' && e[0] != '0';
+}
+
+/**
+ * @brief [init-latency L1] Is this process's QS4CX payload allocation
+ *   load-destined, i.e. may allocate() hand back UNINITIALIZED memory?
+ *
+ * NNTR_QS4CX_HEAP_BYPASS is exactly the "self-owned weight payload about to be
+ * filled from the model file" signal: Manager::requestWeights only takes the
+ * bypass branch (weight_pool.request(UNMANAGED) + var->allocate()) under it,
+ * and every QS4CX tensor reached that way is a weight (the only other producer
+ * is the offline quantize tool, which never sets this env). Both zero passes
+ * that allocate() used to do -- `new uint8_t[size()]{}` and
+ * initialize()->setZero() -- are dead stores there: the payload is
+ * subsequently overwritten IN FULL, either by TensorBase::read (bytes() ==
+ * size() for QS4CX, since its data-type size is 1 and size() is overridden to
+ * the packed nibble+scale byte count) or by copy_qs4cx (scopy over size()).
+ *
+ * TRIPWIRE FOR FUTURE READERS. "Uninitialized is safe" holds only while EVERY
+ * reader of this payload writes all size() bytes. It is true of every reader in
+ * this tree today (TensorBase::read and copy_qs4cx, both above). It is NOT
+ * automatically true of a partial writer, and one such reader exists in the
+ * sibling trees: the legacy on-disk QINT4 -> QS4CX transcode. There, for even
+ * K, the QS4CX scale offset is `N*(K+1)/2` evaluated left-to-right
+ * (= N*K/2 + N/2) while the nibble region is only N*(K/2) bytes, so an
+ * N/2-byte gap sits between them that the transcode never touches; it used to
+ * be zero purely by virtue of the allocation. If that read path (or any other
+ * partial writer) is ever added here, it MUST call setZero() before
+ * transcoding, or the gap becomes uninitialized heap.
+ *
+ * Escape hatch: NNTR_QS4CX_ALLOC_ZERO=1 restores the old double zero-fill.
+ */
+bool qs4cxAllocUninitialized() {
+  static const bool v =
+    envOn("NNTR_QS4CX_HEAP_BYPASS") && !envOn("NNTR_QS4CX_ALLOC_ZERO");
+  return v;
+}
+} // namespace
 
 QS4CX_Tensor::QS4CX_Tensor(std::string name_, Tformat fm) :
   TensorBase(name_, fm) {
@@ -47,14 +97,23 @@ void QS4CX_Tensor::allocate() {
   } else {
     MemoryData *mem_data;
 
-    mem_data = new MemoryData((void *)(new uint8_t[size()]{}));
+    // [init-latency L1] Load-destined payload: allocate UNINITIALIZED and skip
+    // initialize(). See qs4cxAllocUninitialized() for why both zero passes are
+    // dead stores. The page faults are NOT saved -- they move to the read()
+    // that fills the buffer -- but the two full-arena writes are.
+    const bool uninit = qs4cxAllocUninitialized();
+    mem_data = new MemoryData(uninit ? (void *)(new uint8_t[size()])
+                                     : (void *)(new uint8_t[size()]{}));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<uint8_t>();
       delete mem_data;
     });
 
     offset = 0;
-    initialize();
+    if (uninit)
+      putData();
+    else
+      initialize();
   }
 }
 
