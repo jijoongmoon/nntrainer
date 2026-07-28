@@ -19,10 +19,8 @@
 #include <common_properties.h>
 #include <cpu_backend.h>
 
-#if defined(_WIN32)
-#define _USE_MATH_DEFINES
-#include <math.h>
-#endif
+#include <cmath>
+#include <type_traits>
 
 namespace nntrainer {
 
@@ -36,6 +34,19 @@ class ActiFunc {
 
 public:
   constexpr static inline float NEGATIVE_SLOPE = 0.01f;
+
+  /**
+   * @brief pi, as a plain constant of this header.
+   * @note  M_PI is not standard C++. The MSVC CRT only defines it when
+   *        _USE_MATH_DEFINES is defined *before* the first math header of the
+   *        translation unit is pulled in, and a header cannot guarantee that
+   *        for its consumers: <cmath> (here, or in any .cpp that includes this
+   *        file earlier) already brought in the include-guarded CRT math
+   *        header, so a later _USE_MATH_DEFINES has no effect. Carrying the
+   *        value here makes this header independent of include order. The
+   *        value is the same as the CRT/glibc M_PI, so results are unchanged.
+   */
+  constexpr static inline double PI = 3.14159265358979323846;
 
   /**
    * @brief     Constructor of ActiFunc
@@ -436,8 +447,24 @@ public:
    */
   template <typename T = float>
   static Tensor &gelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
-                       t_out.getData<float>());
+    if constexpr (std::is_same_v<T, float>) {
+      nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
+                         t_out.getData<float>());
+    } else {
+      /// @note cpu_backend exposes gelu_v2 for fp32 only, and getData<float>()
+      /// is an unchecked cast -- calling it for a non-fp32 activation would
+      /// read/write t_in.size() floats out of a buffer holding t_in.size()
+      /// T-sized elements. apply<T> walks the tensor with the correct element
+      /// type (and validates the output dtype). The accumulation is done in
+      /// float to match __fallback_gelu_v2's fp16 reference exactly.
+      t_in.apply<T>(
+        [](T x) {
+          const float xf = static_cast<float>(x);
+          return static_cast<T>(0.5f * xf *
+                                (1.0f + std::erf(xf * 0.7071067811f)));
+        },
+        t_out);
+    }
     return t_out;
   }
 
@@ -461,7 +488,7 @@ public:
       [&](T x) {
         return static_cast<T>(
           0.5 * (1 + erf(x * tmp) +
-                 x * ((2 / sqrt(M_PI)) * exp(-pow(x * tmp, 2))) * tmp));
+                 x * ((2 / sqrt(PI)) * exp(-pow(x * tmp, 2))) * tmp));
       },
       outgoing_derivative);
 
@@ -477,8 +504,23 @@ public:
    */
   template <typename T = float>
   static Tensor &tanhGelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
-                         t_out.getData<float>());
+    if constexpr (std::is_same_v<T, float>) {
+      nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
+                           t_out.getData<float>());
+    } else {
+      /// @note see gelu() above: cpu_backend's tanh_gelu declaration is fp32
+      /// only, so a non-fp32 activation must not go through getData<float>().
+      /// Accumulated in float to match __fallback_tanh_gelu's fp16 reference.
+      t_in.apply<T>(
+        [](T x) {
+          const float xf = static_cast<float>(x);
+          return static_cast<T>(
+            0.5f * xf *
+            (1.0f +
+             std::tanh(0.7978845608f * (xf + 0.044715f * xf * xf * xf))));
+        },
+        t_out);
+    }
     return t_out;
   }
 
