@@ -14,8 +14,9 @@
  * creates the OpenCL command queue and context.
  */
 
-#include <addition_layer_cl.h>
+#include <addition_layer.h>
 #include <attention_kernels.h>
+#include <blas_kernel_interface.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
@@ -161,6 +162,8 @@ void ClContext::initialize() noexcept {
         // GPU attention: with no host NEON on these hosts the GPU MHA path
         // wins outright, so default it on.
         setenv("NNTR_MHA_GPU", "1", 0);
+        setenv("NNTR_GPU_CLMEM_POOL", "1",
+               0); // cl_mem device residency sub-pool
         // XMX/DPAS GEMM default. Gated on the DPAS-specific extension
         // (caps_.dpas), NOT the generic cl_intel_subgroups (present on every
         // Intel GPU since Gen9, including matrix-engine-less Xe-LPG parts —
@@ -188,6 +191,8 @@ void ClContext::initialize() noexcept {
       } else if (opencl_is_active && caps_.vendor_id == ADRENO_VENDOR_ID) {
         setenv("NNTR_MHA_GPU", "1", 0);     // GPU attention
         setenv("NNTR_KV_IMG_ATTN", "1", 0); // image2d KV/attention path
+        setenv("NNTR_GPU_CLMEM_POOL", "1",
+               0); // cl_mem device residency sub-pool
       }
     }
 
@@ -226,11 +231,12 @@ void ClContext::add_default_object() {
   registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
                   FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
 
-  if (AdditionLayerCL::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<AdditionLayerCL>,
-                    AdditionLayerCL::type,
-                    ml::train::LayerType::LAYER_ADDITION);
-  }
+  // The core AdditionLayer is backend-neutral: its per-input copy/add
+  // dispatches via ComputeOps::residual_op (the GPU residency body lives in
+  // ClComputeOps::residual_op). createLayer("addition", {engine=gpu}) routes
+  // here; the former AdditionLayerCL fork is deleted.
+  registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
+                  ml::train::LayerType::LAYER_ADDITION);
 
   if (SwiGLULayerCl::registerClKernels(*this)) {
     registerFactory(nntrainer::createLayer<SwiGLULayerCl>, SwiGLULayerCl::type,
@@ -374,6 +380,10 @@ void ClContext::initAttentionClKernels() {
     // GEMV program.
     registerClKernel(rmsnorm_fp16_kernel, "rmsnorm_cl_fp16_coop");
     registerClKernel(q6_k_sgemv_kernel, "kernel_mul_mv_q6_K_f32");
+    // v8c output-residency program (copy_h2h/add_h2h, file-local source in
+    // blas_kernel_interface.cpp) -- the rmsnorm->copy_h2h and gemm->copy_h2h
+    // first-call outliers.
+    v8c_prewarm_programs(*this);
   }
 #endif
   attention_kernels_initialized = true;
