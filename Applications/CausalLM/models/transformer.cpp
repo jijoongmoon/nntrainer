@@ -401,7 +401,17 @@ void Transformer::repack_weight() {
       for (auto &w : weights) {
         if (w->getVariableRef().getDataType() ==
             ml::train::TensorDim::DataType::QS4CX) {
-          w->getVariableRef().pack();
+          // KAI rhs-pack is the ARM (i8mm) CPU GEMM's in-memory derivation;
+          // on x86 it is NYI and the x86 CPU GEMM + the GPU v8c path consume
+          // the plain on-disk QS4CX (nibbles + fp32 scales) directly.
+          // Skip-on-NYI so a single QS4CX weight set loads on every backend
+          // (ARM packs, x86/GPU use the plain blob).
+          try {
+            w->getVariableRef().pack();
+          } catch (const std::exception &e) {
+            ml_logd("QS4CX pack skipped (engine consumes plain blob): %s",
+                    e.what());
+          }
         }
       }
     };
