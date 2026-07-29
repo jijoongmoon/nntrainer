@@ -32,6 +32,17 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#include <fcntl.h>        // _O_RDONLY, _O_BINARY
+#include <io.h>           // _wopen, _close
+#include <mman_windows.h> // mmap/munmap (MapViewOfFile), PROT_READ, MAP_PRIVATE
+#endif
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -78,6 +89,59 @@ std::vector<uint8_t> readBinaryFile(const std::filesystem::path &path) {
   }
 
   return bytes;
+}
+
+/**
+ * @brief Attach the file's contents to the LUT — mmap'd read-only where
+ *        possible so the table pages in on demand instead of residing in
+ *        memory; falls back to a full read into lut.bytes.
+ */
+void attachPayload(QuantLut &lut, const std::filesystem::path &path) {
+#if !defined(_WIN32)
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd >= 0) {
+    struct stat st {};
+    if (::fstat(fd, &st) == 0 && st.st_size > 0) {
+      void *ptr = ::mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ,
+                         MAP_PRIVATE, fd, 0);
+      if (ptr != MAP_FAILED) {
+        // Token-id lookups are random access; don't let readahead pull the
+        // whole table into the page cache.
+        ::madvise(ptr, static_cast<size_t>(st.st_size), MADV_RANDOM);
+        ::close(fd); // mapping keeps its own reference
+        lut.mmap_ptr = ptr;
+        lut.mmap_len = static_cast<size_t>(st.st_size);
+        return;
+      }
+    }
+    ::close(fd);
+  }
+#else
+  // Windows: map the sidecar with MapViewOfFile via the mman shim
+  // (utils/mman_windows.h) instead of slurping it whole. MapViewOfFile faults
+  // pages on demand -- no whole-file readahead -- so the random token-id
+  // lookups keep only the touched rows resident, the same win MADV_RANDOM gives
+  // on POSIX (the shim has no madvise, and none is needed for that on-demand
+  // behaviour). Without this, readBinaryFile below pulled the entire sidecar
+  // into RAM (a large-vocab table can run to hundreds of MB), defeating the
+  // point of shipping it as a sidecar.
+  std::error_code ec;
+  const auto fsize = std::filesystem::file_size(path, ec);
+  if (!ec && fsize > 0) {
+    int fd = ::_wopen(path.wstring().c_str(), _O_RDONLY | _O_BINARY);
+    if (fd >= 0) {
+      void *ptr = ::mmap(nullptr, static_cast<size_t>(fsize), PROT_READ,
+                         MAP_PRIVATE, fd, 0);
+      ::_close(fd); // the view keeps its own file-mapping reference
+      if (ptr != MAP_FAILED) {
+        lut.mmap_ptr = ptr;
+        lut.mmap_len = static_cast<size_t>(fsize);
+        return;
+      }
+    }
+  }
+#endif
+  lut.bytes = readBinaryFile(path);
 }
 
 const nlohmann::json &requireJsonObjectField(const nlohmann::json &json,
@@ -150,12 +214,13 @@ void derivePacked4BitDimensions(QuantLut &lut,
     << ": 4-bit packed LUT requires even out_dim, got " << lut.out_dim;
 
   const size_t bytes_per_row = lut.out_dim / 2;
-  NNTR_THROW_IF(lut.bytes.empty() || lut.bytes.size() % bytes_per_row != 0,
+  NNTR_THROW_IF(lut.payload_size() == 0 ||
+                  lut.payload_size() % bytes_per_row != 0,
                 std::runtime_error)
-    << "LUT binary size " << lut.bytes.size()
+    << "LUT binary size " << lut.payload_size()
     << " is not consistent with out_dim=" << lut.out_dim;
 
-  lut.in_dim = lut.bytes.size() / bytes_per_row;
+  lut.in_dim = lut.payload_size() / bytes_per_row;
   NNTR_THROW_IF(lut.in_dim == 0, std::runtime_error)
     << "LUT binary has no rows: " << manifest_path;
 }
@@ -172,7 +237,7 @@ std::shared_ptr<QuantLut> loadUfixed8Manifest(const std::string &manifest_path,
   lut->offset = requireJsonIntField(quant_param, "offset", manifest_path);
   lut->is_raw_u16 = false;
   lut->is_signed4 = false;
-  lut->bytes = readBinaryFile(resolveLutPath(manifest_path, lut_path));
+  attachPayload(*lut, resolveLutPath(manifest_path, lut_path));
 
   derivePacked4BitDimensions(*lut, manifest_path);
   return lut;
@@ -193,7 +258,7 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
   lut->out_dim = requireJsonSizeField(json, "size", manifest_path);
   lut->is_raw_u16 = false;
   lut->is_signed4 = true;
-  lut->bytes = readBinaryFile(resolveLutPath(manifest_path, lut_path));
+  attachPayload(*lut, resolveLutPath(manifest_path, lut_path));
   lut->row_scales.reserve(quant_param.at("scale").size());
 
   for (const auto &scale : quant_param.at("scale")) {
@@ -255,14 +320,13 @@ std::shared_ptr<QuantLut> loadRawU16(const std::string &path,
     << "Raw UINT16 LUT size overflows size_t for " << path;
 
   const size_t expected_size = in_dim_hint * out_dim_hint * sizeof(uint16_t);
-  auto bytes = readBinaryFile(path);
-  NNTR_THROW_IF(bytes.size() != expected_size, std::runtime_error)
-    << "Raw UINT16 LUT file size " << bytes.size()
+  auto lut = std::make_shared<QuantLut>();
+  attachPayload(*lut, path);
+  NNTR_THROW_IF(lut->payload_size() != expected_size, std::runtime_error)
+    << "Raw UINT16 LUT file size " << lut->payload_size()
     << " does not match in_dim*out_dim*2 (" << expected_size << ") for "
     << path;
 
-  auto lut = std::make_shared<QuantLut>();
-  lut->bytes = std::move(bytes);
   lut->in_dim = in_dim_hint;
   lut->out_dim = out_dim_hint;
   lut->is_raw_u16 = true;
@@ -342,7 +406,7 @@ void decodePacked4BitRowToFloatType(const QuantLut &lut, size_t token_idx,
     << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
 
   const size_t bytes_per_row = lut.out_dim / 2;
-  const uint8_t *row = lut.bytes.data() + token_idx * bytes_per_row;
+  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
 
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
@@ -354,6 +418,13 @@ void decodePacked4BitRowToFloatType(const QuantLut &lut, size_t token_idx,
 }
 
 } // namespace
+
+QuantLut::~QuantLut() {
+  // ::munmap resolves to the POSIX call or the mman_windows shim
+  // (UnmapViewOfFile) depending on platform; both accept (ptr, len).
+  if (mmap_ptr)
+    ::munmap(mmap_ptr, mmap_len);
+}
 
 std::shared_ptr<QuantLut> get_or_load_quant_lut(const std::string &path,
                                                 size_t in_dim_hint,
@@ -390,8 +461,8 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
   validateDecodeArgs(lut, token_idx, output_len);
 
   if (lut.is_raw_u16) {
-    const uint16_t *row = reinterpret_cast<const uint16_t *>(lut.bytes.data()) +
-                          token_idx * lut.out_dim;
+    const uint16_t *row =
+      reinterpret_cast<const uint16_t *>(lut.data()) + token_idx * lut.out_dim;
     std::memcpy(output, row, lut.out_dim * sizeof(uint16_t));
     return;
   }
@@ -400,7 +471,7 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
 
   const size_t bytes_per_row = lut.out_dim / 2;
-  const uint8_t *row = lut.bytes.data() + token_idx * bytes_per_row;
+  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
 
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
@@ -429,7 +500,7 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
 
   const size_t bytes_per_row = lut.out_dim / 2;
-  const uint8_t *row = lut.bytes.data() + token_idx * bytes_per_row;
+  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
 
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
