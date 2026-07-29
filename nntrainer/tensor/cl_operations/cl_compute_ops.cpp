@@ -32,11 +32,28 @@
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
 #include <compute_ops.h>
+#include <cpu_backend.h> // gemm_q4_0 (host route for CL-ineligible shapes)
 #include <geglu_cl_op.h>
 #include <swiglu_cl_op.h>
 #include <tensor.h>
 
 namespace nntrainer {
+
+namespace {
+/**
+ * @brief Whether one (N, K) Q4_0 weight can enter the CL accel route.
+ *
+ * Both CL entry points (gemm_q4_0_cl / gemm_q4_0_async_cl) prepack the
+ * Q4_0x8 weight on the host with unpack_q4_0x8_transpose16, whose x86
+ * implementation is an AVX2 256-wide K unroll asserting (K % 256) == 0 and
+ * (N % 8) == 0 (avx2_impl.cpp); the kernel's NDRange (N/4 columns) needs
+ * N % 4 == 0, subsumed by N % 8. Ineligible shapes (e.g. the hidden=64
+ * tiny test fixtures) take the host gemm_q4_0 below instead.
+ */
+bool cl_q4_0_shape_eligible(unsigned int N, unsigned int K) {
+  return (K % 256) == 0 && (N % 8) == 0;
+}
+} // namespace
 
 /**
  * @brief OpenCL ComputeOps table: the accelerator-backed subset of the
@@ -45,11 +62,27 @@ namespace nntrainer {
 class ClComputeOps : public ComputeOps {
 public:
   // ── Accelerator-only Q4_0 / INT4 GEMM/GEMV ────────────────
+  // The Q4_0 supports_*() predicates are shape-blind, so the shape gate lives
+  // here in the CL wrappers: eligible shapes take the CL kernels unchanged,
+  // ineligible ones bounce to the host gemm_q4_0 — the same generic route the
+  // cpu engine's gemm_q4_0_fp32 uses (cpu_ops_table.h), on the same host/SVM
+  // pointers the caller handed us. That host bounce is deliberate, not hidden:
+  // there is no CL fallback kernel for these shapes.
   bool supports_gemm_q4_0_batch_fp32() const override { return true; }
   void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,
                             std::vector<float *> matCdata, unsigned int M,
                             std::vector<unsigned int> N,
                             unsigned int K) override {
+    bool eligible = true;
+    for (unsigned int n : N)
+      eligible = eligible && cl_q4_0_shape_eligible(n, K);
+    if (!eligible) {
+      // Whole batch on host (mirrors float_tensor.cpp's non-accel loop).
+      for (size_t i = 0; i < matAdata.size(); ++i)
+        nntrainer::gemm_q4_0(M, N[i], K, matBdata, K, matAdata[i], N[i],
+                             matCdata[i], N[i]);
+      return;
+    }
     nntrainer::gemm_q4_0_async_cl(matAdata, matBdata, matCdata, M, N, K);
   }
 
@@ -57,7 +90,24 @@ public:
   void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata, float *matCdata,
                             unsigned int M, unsigned int N,
                             unsigned int K) override {
+    if (!cl_q4_0_shape_eligible(N, K)) {
+      nntrainer::gemm_q4_0(M, N, K, matBdata, K, matAdata, N, matCdata, N);
+      return;
+    }
     nntrainer::gemm_q4_0_cl(matAdata, matBdata, matCdata, M, N, K);
+  }
+
+  // Generic (non-accel) Q4_0 branch of float_tensor.cpp's dispatch — the
+  // M == 1 decode step and any caller that skips the accel predicates land
+  // here. Host GEMM, identical to CpuComputeOps::gemm_q4_0_fp32
+  // (cpu_ops_table.h); without this override the base class throws NI, which
+  // the Q4_0 GPU decode path would hit on its first token.
+  void gemm_q4_0_fp32(const unsigned int M, const unsigned int N,
+                      const unsigned int K, const float *A,
+                      const unsigned int lda, const void *B,
+                      const unsigned int ldb, float *C,
+                      const unsigned int ldc) override {
+    nntrainer::gemm_q4_0(M, N, K, A, lda, B, ldb, C, ldc);
   }
 
   bool supports_gemv_int4_batch_fp32() const override { return true; }
