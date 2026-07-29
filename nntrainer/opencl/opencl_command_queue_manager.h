@@ -18,6 +18,7 @@
 #include "opencl_kernel.h"
 #include "singleton.h"
 #include <memory>
+#include <string>
 
 namespace nntrainer::opencl {
 
@@ -35,7 +36,46 @@ class CommandQueueManager : public Singleton<CommandQueueManager> {
    */
   cl_command_queue command_queue_{nullptr};
 
+  /**
+   * @brief optional suffix appended to the NEXT enqueued kernel's profile key
+   * (consumed + cleared on the next enqueueKernel). Lets a caller split one
+   * kernel's profile entry by shape, e.g. v8c_gemm_int8_int4 ->
+   * ...:N9216_K2304. Host-only; never affects kernel behavior. Only read when
+   * profiling is on.
+   */
+  std::string next_prof_label_;
+
+  /**
+   * @brief tri-state SVM coherence drain policy: -1 = not decided yet, 0 =
+   * off, 1 = on. Decided by the owning Context after device enumeration
+   * (setSvmCoherenceDrain) and never resolved here, so there is no window in
+   * which this class has to guess from a device that may not exist yet.
+   */
+  int svm_coherence_drain_ = -1;
+
+  /**
+   * @brief Whether a dispatch that touched SVM must be drained (clFinish)
+   * before the next one may consume its output.
+   *
+   * NNTR_XE3_SYNC overrides in both directions. Until the owning Context has
+   * decided, this answers YES: a missing drain on a device that needs one
+   * corrupts output silently, while an unnecessary drain only costs
+   * throughput, so the unknown state must fail CLOSED.
+   */
+  bool needsSvmCoherenceDrain() const;
+
 public:
+  /**
+   * @brief Set the SVM coherence drain policy for this queue.
+   *
+   * Called by the owning Context once its DeviceCaps are known
+   * (svm_fine_grain + vendor), so the decision is taken where the capability
+   * lives and this class stays free of device knowledge.
+   *
+   * @param enable true to drain after every SVM-touching dispatch
+   */
+  void setSvmCoherenceDrain(bool enable);
+
   /**
    * @brief Create a Command Queue object
    *
@@ -145,7 +185,7 @@ public:
    * @return true if mapping is successful, false otherwise.
    */
   bool enqueueSVMMap(void *svm_ptr, size_t size, bool read_only,
-                     cl_event *event = nullptr);
+                     bool async = false, cl_event *event = nullptr);
 
   /**
    * @brief Enqueue SVM memory unmap operation.
@@ -204,6 +244,14 @@ public:
    * @brief Destroy the Command Queue Manager object
    *
    */
+  /**
+   * @brief Get the process-wide instance (out-of-line override of
+   *        Singleton<T>::Global() — one cl_command_queue set per process
+   *        under shared linking; see ContextManager::Global() for the full
+   *        static-vs-shared note).
+   */
+  static CommandQueueManager &Global();
+
   ~CommandQueueManager();
 
   /**
@@ -229,6 +277,33 @@ public:
                      cl_uint num_events_in_wait_list = 0,
                      const cl_event *event_wait_list = nullptr,
                      cl_event *event = nullptr);
+
+  /**
+   * @brief Finish the queue, then accumulate per-kernel GPU execution time
+   * (from CL_PROFILING_COMMAND_START/END of events captured during
+   * enqueueKernel) by kernel name and print a sorted breakdown. No-op unless
+   * NNTR_OPENCL_PROFILING is set. Releases and clears captured events.
+   *
+   * Unlike clFinish-bracketed host stage timing (which measures out-of-order
+   * queue catch-up, not real work), this reports true on-device kernel time.
+   *
+   * @param tag short label printed in the report header (e.g. "PREFILL").
+   */
+  void dumpProfile(const char *tag);
+
+  /**
+   * @brief set a suffix appended to the next enqueued kernel's profile key,
+   * to split one kernel's aggregate entry by call-site/shape. No-op for kernel
+   * execution; the label is consumed and cleared by the next enqueueKernel.
+   */
+  void setNextProfileLabel(std::string s) { next_prof_label_ = std::move(s); }
+
+  /**
+   * @brief Block until all previously enqueued commands have completed
+   * (clFinish). Used as the host-coherence barrier before a host op reads a
+   * GPU-resident (SVM) buffer that was written/mapped asynchronously.
+   */
+  void finish();
 };
 } // namespace nntrainer::opencl
 
