@@ -42,7 +42,7 @@ inline bool cl_lockstep_on() {
   return on;
 }
 
-// [r19 determinism probe] NNTR_CL_SYNC_IO=1 forces every host-I/O enqueue
+// Determinism probe: NNTR_CL_SYNC_IO=1 forces every host-I/O enqueue
 // (read/write/map buffer, SVM map) to block, exposing an async host-transfer
 // divergence class: kernel-side LOCKSTEP cannot order these.
 inline bool cl_sync_io_forced() {
