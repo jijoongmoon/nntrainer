@@ -1158,6 +1158,8 @@ bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate) {
                             static_cast<cl_mem>(dst_cl), 0, 0, bytes, 0,
                             nullptr, nullptr) != CL_SUCCESS)
       throw std::runtime_error("clmem_residual_op_cl: clEnqueueCopyBuffer");
+    clmem_probe_capture((dst.getName() + ":cp").c_str(), nullptr, dst_cl,
+                        (unsigned int)bytes);
     return true;
   }
 
@@ -1249,6 +1251,11 @@ bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate) {
   if (dst_cl == nullptr)
     cc->command_queue_inst_.enqueueSVMMap(dst_svm, bytes, true,
                                           /** async */ true);
+  // NNTR_CLMEM_PROBE: capture the residual dst after the op (copy/add) for
+  // the fan-out bisect; cl_mem captures are reliable.
+  clmem_probe_capture((dst.getName() + (accumulate ? ":add" : ":cp")).c_str(),
+                      dst_cl == nullptr ? dst_svm : nullptr, dst_cl,
+                      (unsigned int)bytes);
   return true;
 }
 
@@ -1333,8 +1340,17 @@ void clmem_probe_capture(const char *tag, const void *svm_ptr, void *clmem,
   if (err != CL_SUCCESS || dbg == nullptr)
     return;
   if (clmem != nullptr) {
-    if (clEnqueueCopyBuffer(q, static_cast<cl_mem>(clmem), dbg, 0, 0, bytes, 0,
-                            nullptr, nullptr) != CL_SUCCESS) {
+    const cl_int cerr = clEnqueueCopyBuffer(q, static_cast<cl_mem>(clmem), dbg,
+                                            0, 0, bytes, 0, nullptr, nullptr);
+    if (cerr != CL_SUCCESS) {
+      // NEVER silent: a dropped capture reads as "this op was not
+      // instrumented" in the dump and cost a full investigation round. The
+      // usual cause is a source smaller than `bytes` (a shared scratch sized
+      // by an earlier, narrower FC).
+      std::fprintf(stderr,
+                   "[probe] %s capture-SKIPPED (CopyBuffer err=%d, bytes=%u)\n",
+                   tag, (int)cerr, bytes);
+      std::fflush(stderr);
       clReleaseMemObject(dbg);
       return;
     }
@@ -1357,6 +1373,14 @@ void clmem_probe_capture(const char *tag, const void *svm_ptr, void *clmem,
       return;
     }
   } else {
+    // Neither a cl_mem nor an SVM source: nothing to snapshot. Reached when the
+    // caller hands over a scratch that the current output path never allocated
+    // (the direct-store FC path leaves sc.y_fp16 null -- see y_dbg_consumer).
+    std::fprintf(stderr,
+                 "[probe] %s capture-SKIPPED (no source: clmem and svm both "
+                 "null)\n",
+                 tag);
+    std::fflush(stderr);
     clReleaseMemObject(dbg);
     return;
   }
@@ -1386,13 +1410,31 @@ void clmem_probe_capture(const char *tag, const void *svm_ptr, void *clmem,
   }
 }
 
+// [divert tripwire] Why the last dotCl_v8c call on this thread handed the FC
+// back to its caller. Every `return false` in dotCl_v8c goes through
+// V8C_REJECT so the host bounce it causes can be NAMED (printed by
+// ClComputeOps::fc under NNTR_FC_DIVERT_TRACE=1) instead of being silent --
+// the reject taxonomy was previously recoverable only by reading the function.
+// Thread-local: the eager weight prebuild runs on the loader pool.
+static const char *&v8c_reject_slot() {
+  static thread_local const char *r = "none";
+  return r;
+}
+#define V8C_REJECT(why)                                                        \
+  do {                                                                         \
+    v8c_reject_slot() = (why);                                                 \
+    return false;                                                              \
+  } while (0)
+
+const char *v8c_last_reject_reason() { return v8c_reject_slot(); }
+
 // NNTR_FC_TPROF=1: host wall time of the dotCl_v8c hot path, split at the
 // input-staging boundary (decomposes the rmsnorm->v8c_copy_h2h GPU idle).
 bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   if (!v8c_env_enabled())
-    return false;
+    V8C_REJECT("env NNTR_FC_INT8_GPU=0");
   if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
-    return false;
+    V8C_REJECT("weight dtype != QS4CX");
   // Derive M, K, N from tensor dims (no-transpose case only).
   unsigned int M, K, N;
   if (input.getFormat() == Tformat::NHWC) {
@@ -1404,12 +1446,12 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   }
   N = weight.width();
   if (K != weight.height())
-    return false;
+    V8C_REJECT("K != weight.height()");
   if (N % 8 != 0 || K % 32 != 0)
-    return false;
+    V8C_REJECT("shape N%8 != 0 or K%32 != 0");
   if (input.getDataType() != ml::train::TensorDim::DataType::FP32 &&
       input.getDataType() != ml::train::TensorDim::DataType::FP16)
-    return false;
+    V8C_REJECT("activation dtype not FP32/FP16");
 
   // Round M up to the kernel's tile size (V8C_TM=4). Padded rows produce
   // throwaway output that we never read back to the caller. Skips the
@@ -1452,7 +1494,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
 
   V8cWeightEntry *w = v8c_get_or_build_weight(weight, K, N);
   if (!w)
-    return false;
+    V8C_REJECT("no v8c weight backing (shape / null scale / build threw)");
 
   // Imageless v8c weight (N > image2d height cap, e.g. the untied int4 lm_head
   // with N=vocab=262144): the image GEMM path cannot run, so dispatch the
@@ -1481,7 +1523,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
         return true;
     }
 #endif
-    return false;
+    V8C_REJECT("huge_n weight and not the M==1 lm-head GEMV case");
   }
 
   // Reused scratch buffers (grow-only pool). The weight backing + scale are
@@ -1719,7 +1761,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
                         sizeof(int) * M_pad, CL_MEM_READ_WRITE) ||
         !v8c_ensure_buf(ctx, &sc.act_zp[act_slot], &sc.act_zp_bytes[act_slot],
                         sizeof(int) * M_pad, CL_MEM_READ_WRITE))
-      return false;
+      V8C_REJECT("act-quant scratch alloc failed");
     act_i8_arg = sc.act_i8[act_slot];
     act_scale_arg = sc.act_scale[act_slot];
     act_zp_arg = sc.act_zp[act_slot];
@@ -1758,7 +1800,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   if (!skip_upload_and_quant && !quant_direct_clmem &&
       !v8c_ensure_buf(ctx, &sc.act_in, &sc.act_in_bytes,
                       (size_t)M_pad * K * act_elem, CL_MEM_READ_ONLY))
-    return false;
+    V8C_REJECT("act_in scratch alloc failed");
 
   if (!skip_upload_and_quant) {
     if (device_clmem_in) {
@@ -1772,7 +1814,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
           clEnqueueCopyBuffer(q, clmem_in, sc.act_in, 0, 0,
                               (size_t)M * K * act_elem, 0, nullptr,
                               nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("CopyBuffer clmem_in -> act_in failed");
     } else if (use_resident_input) {
       // GPU→GPU copy of the resident FP32/FP16 activation into sc.act_in.
       // Same shape as a host upload would produce, just without crossing
@@ -1780,7 +1822,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (clEnqueueCopyBuffer(q, in_backing->buffer(), sc.act_in, 0, 0,
                               (size_t)M * K * act_elem, 0, nullptr,
                               nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("CopyBuffer resident act -> act_in failed");
     } else if (in_svm) {
       // GPU copy of the SVM-resident activation into sc.act_in -- no host
       // upload. Downstream quant/image/GEMM see the same sc.act_in as before.
@@ -1791,7 +1833,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (clEnqueueWriteBuffer(q, sc.act_in, CL_FALSE, 0,
                                (size_t)M * K * act_elem, cur_in_ptr, 0, nullptr,
                                nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("WriteBuffer host act -> act_in failed");
     }
     if (M_pad > M && !quant_direct_clmem) {
       const size_t pad_bytes = (size_t)(M_pad - M) * K * act_elem;
@@ -1799,7 +1841,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (clEnqueueWriteBuffer(q, sc.act_in, CL_FALSE, (size_t)M * K * act_elem,
                                pad_bytes, zeros.data(), 0, nullptr,
                                nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("WriteBuffer act pad rows failed");
     }
   }
 
@@ -1902,12 +1944,22 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       const char *e = std::getenv("NNTR_V8C_DIRECT_OUT");
       return !(e && e[0] == '0');
     }();
-    const bool direct_out = direct_out_enabled && out_clmem;
-    // y_fp16 only backs the non-direct output paths (SVM/host bounce).
+    // Any debug consumer of sc.y_fp16 must force the NON-direct path: under
+    // direct_out the GEMM stores into the output's planner sub-buffer and
+    // y_fp16 is never allocated, so the consumer silently observes nothing.
+    // Only NNTR_CLMEM_PROBE has such a consumer on this tree; the reference
+    // additionally lists NNTR_CLMEM_DUALOUT / _OUTCHECK / _OUTBAR /
+    // NNTR_V8C_TRACE -- extend this expression when porting any of them, or
+    // that instrument will observe the wrong buffer.
+    static const bool y_dbg_consumer =
+      std::getenv("NNTR_CLMEM_PROBE") != nullptr;
+    const bool direct_out = direct_out_enabled && out_clmem && !y_dbg_consumer;
+    // y_fp16 only backs the non-direct output paths (SVM/host bounce, plus the
+    // debug consumers forced here by y_dbg_consumer).
     if (!direct_out && !v8c_ensure_buf(ctx, &sc.y_fp16, &sc.y_fp16_bytes,
                                        sizeof(uint16_t) * (size_t)M_pad * N,
                                        CL_MEM_READ_WRITE))
-      return false;
+      V8C_REJECT("y_fp16 scratch alloc failed");
     cl_mem gemm_y_arg =
       direct_out ? static_cast<cl_mem>(output.getMemoryData()->deviceMem())
                  : sc.y_fp16;
@@ -1950,6 +2002,29 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       !out_clmem && output.getMemoryData() && output.getMemoryData()->isSVM() &&
       (output.getDataType() == ml::train::TensorDim::DataType::FP32 ||
        output.getDataType() == ml::train::TensorDim::DataType::FP16);
+    // NNTR_CLMEM_PROBE: capture the raw fp16 GEMM result for the qkv / o-proj /
+    // gate-up FCs. y_dbg_consumer above forces !direct_out whenever the probe
+    // is on, so sc.y_fp16 IS the buffer this GEMM just wrote for every output
+    // class -- which is what makes these hashes comparable between trees. It is
+    // NOT the buffer the model consumes under direct_out (there the GEMM stores
+    // into the planner sub-buffer), i.e. the probe changes the write path, and
+    // a hash taken here characterises the !direct_out path only.
+    // attention_out is in the filter because it is the o-projection FC -- the
+    // first plane observed to diverge, and previously uncovered.
+    {
+      static const bool probe_on = std::getenv("NNTR_CLMEM_PROBE") != nullptr;
+      if (probe_on) {
+        const std::string &on_ = output.getName();
+        if (on_.find("ffn_gate") != std::string::npos ||
+            on_.find("ffn_up") != std::string::npos ||
+            on_.find("_wq") != std::string::npos ||
+            on_.find("_wk") != std::string::npos ||
+            on_.find("_wv") != std::string::npos ||
+            on_.find("attention_out") != std::string::npos)
+          clmem_probe_capture((on_ + ":y").c_str(), nullptr, sc.y_fp16,
+                              (unsigned int)(sizeof(uint16_t) * (size_t)M * N));
+      }
+    }
     if (out_clmem) {
       cl_mem out_sub = static_cast<cl_mem>(output.getMemoryData()->deviceMem());
       // KERNEL writer (not clEnqueueCopyBuffer): see the note inside
@@ -1974,7 +2049,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (clEnqueueReadBuffer(q, sc.y_fp16, CL_TRUE, 0,
                               sizeof(uint16_t) * y_host.size(), y_host.data(),
                               0, nullptr, nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("host-bounce ReadBuffer failed (GEMM already ran)");
       if (output.getDataType() == ml::train::TensorDim::DataType::FP32) {
         float *out = output.getData<float>();
         for (size_t i = 0; i < y_host.size(); ++i)
@@ -2036,7 +2111,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       std::fflush(stderr);
     }
   } catch (...) {
-    return false;
+    V8C_REJECT("exception inside the v8c path");
   }
   return true;
 }
