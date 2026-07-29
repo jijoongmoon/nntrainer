@@ -16,16 +16,6 @@
 #include <node_exporter.h>
 #include <tensor.h>
 
-// NOTE: the CUDA fast paths in this file are gated on NNTR_LLM_CUDA_FAST_PATH
-// (not ENABLE_CUDA directly): they call CUDA kernels that land in the later
-// CUDA-backend changes of this series. Those changes flip the gate back to
-// ENABLE_CUDA; until then an enable-cuda build compiles the host paths only.
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
-#include <cuda_context_manager.h>
-#include <cuda_elementwise.h>
-#include <cuda_runtime.h>
-#endif
-
 namespace nntrainer {
 
 static constexpr size_t OUT_IDX = 0;
@@ -75,24 +65,6 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
     NNTR_THROW_IF(to - from != 1, std::invalid_argument)
       << "incremental step size is not 1";
   }
-
-#if defined(NNTR_LLM_CUDA_FAST_PATH) && defined(ENABLE_FP16)
-  // engine=cuda device-resident fp16: one kernel instead of the host loop (the
-  // getOps host path below would fault on the device-only activation pool under
-  // NNTR_CUDA_DEV_ACT). Gated on FP16 + batch/channel==1; falls through for
-  // OpenCL/CPU (cl_mem / host) and non-device tensors.
-  if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 &&
-      in1.batch() == 1 && in1.channel() == 1) {
-    const size_t n = (size_t)(to - from) * in1.width();
-    auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>());
-    auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>());
-    auto *o = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
-    const bool dev = a && nntrainer::cuda::dev_accessible(a);
-    if (dev && n > 0 &&
-        nntrainer::cuda::cuda_swiglu_fp16(a, b, o, (unsigned int)n))
-      return;
-  }
-#endif
 
   // active-row decision -- mirror GeGLULayer EXACTLY: the producers write the
   // live decode token to row 0 on every backend (cl_mem, SVM, and host), so the
