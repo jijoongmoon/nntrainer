@@ -46,6 +46,49 @@ nntrainer_test_main_deps = [
   nntrainer_testutil_dep
 ]
 
+# KAI qai8dxp/qsi4cxp int4 packing sanity checks (standalone: no gtest, own
+# main()). ARM-only: they link the KleidiAI reference packer/matmul sources
+# under nntrainer/tensor/cpu_backend/arm/, which meson only compiles into
+# nntrainer_dep for aarch64/arm/android builds (see
+# nntrainer/tensor/cpu_backend/meson.build), and they exercise
+# __ARM_FEATURE_MATMUL_INT8 (i8mm) code paths that this project always
+# enables for native aarch64 (see the top-level meson.build extra_defines
+# block). Gate mirrors the existing aarch64-only
+# `unittest_nntrainer_kleidiai` target below.
+if host_machine.cpu_family() == 'aarch64'
+  q4_kai_standalone_targets = [
+    'q4_roundtrip_kai',
+    'q4_kai_bytecompat',
+  ]
+  foreach t : q4_kai_standalone_targets
+    q4_kai_exe = executable(
+      t,
+      t + '.cpp',
+      dependencies: nntrainer_test_deps,
+      install: get_option('enable-test'),
+      install_dir: application_install_dir
+    )
+    test(t, q4_kai_exe, timeout: test_timeout, suite: 'unittests')
+  endforeach
+
+  # The fp16 matmul path additionally needs the enable-fp16-gated
+  # matmul_clamp_f16_qai8dxp_qsi4cxp kernels + qai8dxp_f16 LHS packer
+  # (nntrainer/tensor/cpu_backend/arm/kai_interface/kai/meson.build only
+  # enters that subdir when enable-fp16 is set), so this one test gates on
+  # both.
+  if get_option('enable-fp16')
+    q4_kai_matmul_device_exe = executable(
+      'q4_kai_matmul_device',
+      'q4_kai_matmul_device.cpp',
+      dependencies: nntrainer_test_deps,
+      install: get_option('enable-test'),
+      install_dir: application_install_dir
+    )
+    test('q4_kai_matmul_device', q4_kai_matmul_device_exe,
+      timeout: test_timeout, suite: 'unittests')
+  endif
+endif
+
 if enable_capi
   subdir('tizen_capi')
 endif
