@@ -271,15 +271,31 @@ int main(int argc, char *argv[]) {
       chat_template.emplace(causallm::ChatTemplate::Load(model_path));
     }
 
-    // Determine input text
+    // [init-latency] Decide WHICH input we will use here, but defer the chat
+    // template RENDER to just before run().
+    //
+    // L3 (a3495fdbd) warms the minja renderer on a side thread inside
+    // ChatTemplate::Load(), and apply() joins that thread. Rendering nine
+    // lines after Load() gave the warm thread nothing to overlap, so the CLI
+    // still paid the full ~170-190 ms construction serially -- and paid it
+    // AHEAD of initialize(), i.e. squarely on the path to the first token.
+    // Deferring the render past repack_weight() hands it the same window the
+    // SFlare path already gets for free (create + initialize + load_weight +
+    // repack), where the measured overlap is total.
+    //
+    // Config-shape errors are still raised HERE, before ~800 ms of model load:
+    // the deferred branch is taken only when chat_input exists AND a template
+    // loaded, and both are decided now. The 'sample_input' lookups (which
+    // throw when the key is missing) also stay on this side. Only a template
+    // RENDER failure moves later, and that is not discoverable without
+    // rendering.
+    bool render_chat_input = false;
     if (argc >= 3) {
       input_text = argv[2];
     } else {
       if (nntr_cfg.contains("chat_input")) {
         if (chat_template.has_value()) {
-          input_text = chat_template->apply(nntr_cfg["chat_input"]);
-          system_head_prompt.clear();
-          system_tail_prompt.clear();
+          render_chat_input = true;
         } else {
           std::cerr << "[Warning] 'chat_input' is set but support for model "
                        "architecture '"
@@ -305,6 +321,18 @@ int main(int argc, char *argv[]) {
     model->initialize();
     model->load_weight(weight_file);
     model->repack_weight();
+
+    // [init-latency] The deferred chat-template render. By now L3's warm
+    // thread has had the whole create/initialize/load/repack window to finish,
+    // so this joins an already-completed renderer instead of constructing one.
+    // Clearing the system prompts is part of the contract of using a chat
+    // template (the template carries its own system turn) and must still
+    // happen before run() -- it does, run() is below.
+    if (render_chat_input) {
+      input_text = chat_template->apply(nntr_cfg["chat_input"]);
+      system_head_prompt.clear();
+      system_tail_prompt.clear();
+    }
 
     bool do_sample = generation_cfg.value("do_sample", false);
 
