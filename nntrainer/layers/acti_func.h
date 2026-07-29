@@ -19,6 +19,9 @@
 #include <common_properties.h>
 #include <cpu_backend.h>
 
+#include <cmath>
+#include <type_traits>
+
 #if defined(_WIN32)
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -436,8 +439,24 @@ public:
    */
   template <typename T = float>
   static Tensor &gelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
-                       t_out.getData<float>());
+    if constexpr (std::is_same_v<T, float>) {
+      nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
+                         t_out.getData<float>());
+    } else {
+      /// @note cpu_backend exposes gelu_v2 for fp32 only, and getData<float>()
+      /// is an unchecked cast -- calling it for a non-fp32 activation would
+      /// read/write t_in.size() floats out of a buffer holding t_in.size()
+      /// T-sized elements. apply<T> walks the tensor with the correct element
+      /// type (and validates the output dtype). The accumulation is done in
+      /// float to match __fallback_gelu_v2's fp16 reference exactly.
+      t_in.apply<T>(
+        [](T x) {
+          const float xf = static_cast<float>(x);
+          return static_cast<T>(0.5f * xf *
+                                (1.0f + std::erf(xf * 0.7071067811f)));
+        },
+        t_out);
+    }
     return t_out;
   }
 
@@ -477,8 +496,23 @@ public:
    */
   template <typename T = float>
   static Tensor &tanhGelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
-                         t_out.getData<float>());
+    if constexpr (std::is_same_v<T, float>) {
+      nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
+                           t_out.getData<float>());
+    } else {
+      /// @note see gelu() above: cpu_backend's tanh_gelu declaration is fp32
+      /// only, so a non-fp32 activation must not go through getData<float>().
+      /// Accumulated in float to match __fallback_tanh_gelu's fp16 reference.
+      t_in.apply<T>(
+        [](T x) {
+          const float xf = static_cast<float>(x);
+          return static_cast<T>(
+            0.5f * xf *
+            (1.0f +
+             std::tanh(0.7978845608f * (xf + 0.044715f * xf * xf * xf))));
+        },
+        t_out);
+    }
     return t_out;
   }
 
