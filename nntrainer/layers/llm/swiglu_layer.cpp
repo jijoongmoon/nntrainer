@@ -61,12 +61,12 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
   if (skip_prefill && (from == 0 || (to - from) > 1))
     return;
 
-    // [prefill-chunk] from>0 no longer implies a single-token step: a chunked
-    // prefill (NNTR_PREFILL_CHUNK) arrives as a block call with
-    // from == the absolute chunk start and to-from == the chunk length. The
-    // producers write the live rows at the buffer BASE on every backend
-    // regardless of `from`, so the row math below is step-count-agnostic --
-    // which is why the old `to - from != 1` assert could simply go.
+  // [prefill-chunk] from>0 no longer implies a single-token step: a chunked
+  // prefill (NNTR_PREFILL_CHUNK) arrives as a block call with
+  // from == the absolute chunk start and to-from == the chunk length. The
+  // producers write the live rows at the buffer BASE on every backend
+  // regardless of `from`, so the row math below is step-count-agnostic --
+  // which is why the old `to - from != 1` assert could simply go.
 
 #if defined(NNTR_LLM_CUDA_FAST_PATH) && defined(ENABLE_FP16)
   // engine=cuda device-resident fp16: one kernel instead of the host loop (the
