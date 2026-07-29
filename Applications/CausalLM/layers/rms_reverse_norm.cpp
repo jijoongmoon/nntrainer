@@ -11,9 +11,6 @@
  *
  */
 
-#include <cmath>
-#include <iostream>
-
 #include "rms_reverse_norm.h"
 
 namespace causallm {
@@ -81,10 +78,6 @@ void RMSReverseNormLayer::incremental_forwarding(
     context.getWeight(wt_idx[RMSReverseParams::out_scale]);
 
   ml::train::TensorDim in_dim = in.getDim();
-  ml::train::TensorDim out_dim = out.getDim();
-
-  ml::train::TensorDim in_step_dim = in_dim;
-  ml::train::TensorDim out_step_dim = out_dim;
 
   unsigned int step_size = to - from;
   bool is_prefill = !from || step_size > 1;
@@ -97,76 +90,18 @@ void RMSReverseNormLayer::incremental_forwarding(
     from = 0;
   }
 
-  in_step_dim.batch(1);
-  in_step_dim.height(to - from);
-  out_step_dim.batch(1);
-  out_step_dim.height(to - from);
-
-  unsigned int b_size = in_dim.batch();
-
-  for (unsigned int b = 0; b < b_size; ++b) {
-    nntrainer::Tensor in_step =
-      in.getSharedDataTensor(in_step_dim, b * in_dim.getFeatureLen(), true);
-    nntrainer::Tensor out_step =
-      out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
-
-    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      // ReverseRMSNorm order: x * weight → normalize → multiply by out_scale
-
-      // Step 1: Multiply input by weight (BEFORE normalization)
-      in_step.multiply_i(weight);
-
-      // Step 2: Compute RMS normalization
-      // rsqrt(average(x^2) + eps)
-      auto t = in_step.multiply(in_step).average(3).add(epsilon);
-      t.inv_sqrt_i();
-
-      // Step 3: Apply normalization
-      in_step.multiply(t, out_step);
-
-      // Step 4: Apply output scale (AFTER normalization)
-      out_step.multiply_i(out_scale);
-
-      // TODO : Implement Fast Route for FP16
-    } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-      ml::train::TensorDim instep_dim = in_step_dim;
-      ml::train::TensorDim outstep_dim = out_step_dim;
-
-      instep_dim.setDataType(ml::train::TensorDim::DataType::FP32);
-      outstep_dim.setDataType(ml::train::TensorDim::DataType::FP32);
-
-      nntrainer::Tensor in_step32(instep_dim, true);
-      nntrainer::Tensor out_step32(outstep_dim, true);
-
-      in_step32.copyData(in_step);
-
-      // ReverseRMSNorm order: x * weight → normalize → multiply by out_scale
-
-      // Step 1: Multiply input by weight (BEFORE normalization)
-      in_step32.multiply_i(weight);
-
-      // Step 2: Compute RMS normalization
-      auto t = in_step32.multiply(in_step32).average(3).add(epsilon);
-      t.inv_sqrt_i();
-
-      // Step 3: Apply normalization
-      in_step32.multiply(t, out_step32);
-
-      // Step 4: Apply output scale (AFTER normalization)
-      out_step32.multiply_i(out_scale);
-
-      out_step.copyData(out_step32);
-#else
-      throw std::invalid_argument("Error: enable-fp16 is not set");
-#endif
-    }
-
-#ifdef DEBUG
-    std::cout << context.getName() << " \n input:" << in_step
-              << "output:" << out_step << "weight:" << weight
-              << "out_scale:" << out_scale << std::endl;
-#endif
+  // Whole-op dispatch (N4): the layer owns structure (step window, batch
+  // walk, skip_prefill); ComputeOps owns the math. On a gpu graph this lands
+  // in ClComputeOps::rms_reverse_norm (the SVM-gated GPU kernel, host-bounce
+  // NAMED on a residency miss); on cpu/cuda it is the host FP32-temp math
+  // that used to live in this body. No backend is named here and no raw
+  // kernel wrapper is called from this Layer body.
+  const unsigned int active_rows = (to - from) * in_dim.channel();
+  const unsigned int rows_per_batch = in_dim.channel() * in_dim.height();
+  nntrainer::ComputeOps *ops = in.getOps();
+  for (unsigned int b = 0; b < in_dim.batch(); ++b) {
+    ops->rms_reverse_norm(in, out, weight, out_scale, epsilon, active_rows,
+                          b * rows_per_batch);
   }
 }
 
