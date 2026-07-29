@@ -2747,7 +2747,7 @@ bool flash_attention_prefill_f16_cl(
   // quadruples -- measured 79.1->50.2s full-attn vs NSG=2 (-37%), beating
   // even the exchange-free probe floor (55.4s). d<=256 stays NSG=1.
   int xmx_nsg = xmx_nsg_env ? xmx_nsg_env : (((int)head_dim >= 512) ? 4 : 1);
-  // [r31 note-b] guard: FXA_KCH_SUB truncates silently when 16*NSG does not
+  // Guard: FXA_KCH_SUB truncates silently when 16*NSG does not
   // divide head_dim (no current dim hits this; env overrides could).
   if ((int)head_dim % (16 * xmx_nsg) != 0)
     xmx_nsg = 1;
@@ -2763,7 +2763,7 @@ bool flash_attention_prefill_f16_cl(
   // REGRESSIVE at NSG=2 (scb spill traffic, +14%/+55% at XB=2/4). Env kept
   // for tuning on other SKUs.
   int xmx_xb = (xmx_nsg > 1) ? (xmx_xb_env ? xmx_xb_env : 1) : 1;
-  // [r31 note-a] guard: clamp XB so psum + vtile fit the per-WG SLM budget
+  // Guard: clamp XB so psum + vtile fit the per-WG SLM budget
   // (XB=4 + d=512 defaults previously exceeded it -> launch failure, no
   // fallback). Budget 64KB, the conservative Xe per-WG limit.
   {
