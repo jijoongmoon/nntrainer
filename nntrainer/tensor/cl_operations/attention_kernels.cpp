@@ -2617,15 +2617,25 @@ bool flash_attention_prefill_f16_cl(
     const char *e = std::getenv("NNTR_FLASH_SG");
     if (e)
       return std::atoi(e) != 0 ? 1 : 0;
-    // NNTR_DETERMINISTIC: sub_group_reduce_add's internal order is the one
-    // vendor-opaque reduction on this path (every other reduce is an explicit
-    // fixed LDS tree). Prefer the tree under the determinism contract unless
-    // the user explicitly asked for SG. Cost: the +85% M=1024 attention lever
-    // is lost (494 vs 136 ms) — prefill-only.
+    // NNTR_DETERMINISTIC=1 (explicit strict mode): prefer the fixed LDS tree
+    // over sub_group_reduce_add, the one vendor-opaque reduction on this path.
+    // Cost: the +85% M=1024 attention lever is lost (494 vs 136 ms).
+    //
+    // The default (env unset) keeps SG on the Intel buffer path. Block-Q is
+    // the kernel every sliding-window prefill call lands on (the DPAS/XMX
+    // route requires win==0), so a tree default taxes exactly the past-window
+    // regime: measured -12% 1K / -19% 32K prefill on a W=1024 sliding model
+    // and -21% on gemma4 (W=512) vs the SG lane, while M<=W calls (win==0)
+    // are untouched. It buys no determinism the lane does not already have:
+    // the same default lane runs sub_group_reduce_add/max inside the XMX
+    // flash kernel, and two-run byte-reproducibility of the SG lane is
+    // measured (fixed dispatch on the in-order queue). Strict LDS-only
+    // reduction stays available behind the explicit NNTR_DETERMINISTIC=1
+    // (or NNTR_FLASH_SG=0) opt-in.
     const char *det = std::getenv("NNTR_DETERMINISTIC");
     if (det && det[0] == '1')
       return 0;
-    return v8c_use_buffer_path() ? 1 : 0; // buffer path ⇒ 1
+    return v8c_use_buffer_path() ? 1 : 0; // Intel buffer path => 1
   }();
   // FLASH_COOP_LWS: WG size for the coop variant (work-items cooperating
   // over head_dim). Default 64. LDS footprint is tiny (q_sh[d]+acc_sh[d]+
