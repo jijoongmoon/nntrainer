@@ -306,7 +306,11 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
 
   NNTR_THROW_IF(true, std::runtime_error)
     << "Unsupported LUT datatype '" << datatype << "' in " << manifest_path
-    << " (expected ufixed8 or sfixed4)";
+    << ": this sidecar loader supports 'ufixed8' and 'sfixed4' manifests "
+       "(raw UINT16 tables use a non-.json path). A '"
+    << datatype
+    << "' sidecar needs the package regenerated with a supported LUT dtype, "
+       "or a loader extension for GGML row payloads (not included here).";
   return nullptr;
 }
 
