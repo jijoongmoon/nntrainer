@@ -30,6 +30,16 @@ public:
   /// @brief Numbers of element in one byte of date in the osv32_isv2 layout
   static constexpr const size_t COLUMN_BLOCK_SIZE = 2;
 
+  /// @brief KAI qsi4cxp packing constants for the {nr=4, kr=16, sr=2}
+  ///        qai8dxp/qsi4cxp pack family (matmul_clamp_f32_qai8dxp4x8_
+  ///        qsi4cxp4x8_4x4x32_neon_i8mm and the fp16 16x4 variant share this
+  ///        family, so one rhs_packed buffer serves both).
+  static constexpr const size_t KAI_NR = 4;
+  static constexpr const size_t KAI_KR = 16;
+  static constexpr const size_t KAI_SR = 2;
+  static constexpr const size_t KAI_K_INTERLEAVE = 16;
+  static constexpr const size_t KAI_K_PAD_MULTIPLE = 32;
+
   /**
    * @brief     Compute scale for input weights
    * @param[in] group_weights float * inout vector of weights
@@ -88,6 +98,80 @@ public:
                                 const size_t group_size,
                                 std::vector<uint8_t> &out_weights,
                                 std::vector<uint16_t> &out_scales);
+
+  /**
+   * @brief Quantize float* matrix into the plain per-channel int4 nibble
+   *        form: N x ceil(K/2) bytes, row-major, even k in the low nibble,
+   *        each stored uint4 = int4 + 8. Scale is per-channel absmax/7
+   *        (the same formula quantizeToInt4 expects). This is stage 1 of
+   *        quantizeAndPackKai.
+   * @param out_plain_nibbles N x ceil(K/2) bytes, row-major
+   * @param out_scales per-channel fp16 scales, size = rows_count
+   */
+  static void quantizePlain(const float *weights, const size_t rows_count,
+                            const size_t columns_count,
+                            std::vector<uint8_t> &out_plain_nibbles,
+                            std::vector<uint16_t> &out_scales);
+
+  /**
+   * @brief Permute plain per-channel int4 nibbles (quantizePlain's output)
+   *        into the KAI qsi4cxp Section A super-row payload: mirrors the
+   *        rhs_zero_point=8 path of kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0
+   *        (nntrainer/tensor/cpu_backend/arm/kai_interface/kai/pack/) with
+   *        the trailer (sums, scales, bias) elided — assembleKaiRhsPacked
+   *        reconstructs that separately. This is stage 2 of
+   *        quantizeAndPackKai.
+   * @param out_section_a caller-provided buffer of
+   *        kaiNibblePayloadBytes(rows_count, columns_count) bytes
+   */
+  static void packPlainToSectionA(const uint8_t *plain_nibbles,
+                                  size_t rows_count, size_t columns_count,
+                                  uint8_t *out_section_a);
+
+  /**
+   * @brief Quantize float* matrix into KAI qsi4cxp Section A nibble payload
+   *        (quantizePlain + packPlainToSectionA combined). No sums/scales/
+   *        bias trailer is written — assembleKaiRhsPacked reassembles that
+   *        at load time from the nibbles + per-channel scales this emits.
+   * @param weights float * input matrix (rows_count x columns_count)
+   * @param rows_count N (output channels)
+   * @param columns_count K (input channels)
+   * @param out_weights output nibble payload, size
+   *        = ceil(N/KAI_NR) * KAI_NR * (roundup(K, KAI_K_PAD_MULTIPLE) / 2)
+   * @param out_scales output per-channel fp16 scales, size = rows_count
+   */
+  static void quantizeAndPackKai(const float *weights, const size_t rows_count,
+                                 const size_t columns_count,
+                                 std::vector<uint8_t> &out_weights,
+                                 std::vector<uint16_t> &out_scales);
+
+  /**
+   * @brief Convenience: byte size of the KAI Section A nibble payload for
+   *        the given (N, K) shape.
+   */
+  static size_t kaiNibblePayloadBytes(size_t rows_count, size_t columns_count);
+
+  /**
+   * @brief Reassemble Section A nibbles (quantizeAndPackKai's output) +
+   *        per-channel fp16 scales into a full KAI rhs_packed buffer, ready
+   *        for the qai8dxp_qsi4cxp matmul micro-kernels. Per super-row of
+   *        nr=4 output channels the layout is
+   *          [nibbles : 4*(k_internal/2) bytes (copied as-is)]
+   *          [sums    : 4 * int32, each = sum_k int4[n][k] * 16]
+   *          [scales  : 4 * fp32,  each = (fp16->fp32 scale) * 0.0625]
+   *          [bias    : 4 * fp32 = 0]
+   *
+   * @param section_a       nibble payload; size must be
+   *                        kaiNibblePayloadBytes(rows_count, columns_count).
+   * @param fp16_scales     per-output-channel fp16 scales, size N.
+   * @param rows_count      N (output channels). Must be a multiple of 4.
+   * @param columns_count   K (input channels). Must be a multiple of 32.
+   * @param out_kai_packed  output buffer, sized by this function.
+   */
+  static void assembleKaiRhsPacked(const uint8_t *section_a,
+                                   const uint16_t *fp16_scales,
+                                   size_t rows_count, size_t columns_count,
+                                   std::vector<uint8_t> &out_kai_packed);
 
   /**
    * @brief     Quantize one float value to 4-bits integer

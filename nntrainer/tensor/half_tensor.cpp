@@ -724,7 +724,42 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::Q6_K:
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
-#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
+#if (defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                       \
+     defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||            \
+     defined(_M_ARM64)) &&                                                     \
+  defined(__ARM_FEATURE_MATMUL_INT8)
+  case Tdatatype::QS4CX: {
+    // [KAI fp16 dispatch seam] Host fp16 GEMM for an upstream QS4CX weight —
+    // e.g. an lm_head (N = vocab) that exceeds the GPU image cap and falls
+    // back to host. The rhs is the qai8dxp4x8/qsi4cxp4x8-packed buffer built
+    // at load (QS4CXTensor::getPackedData); it is routed through the
+    // upstream KleidiAI f16 qai8dxp/qsi4cxp ukernel family (added by
+    // `308bdd4f3b` [kleidiai] Add `matmul_clamp_f16_qai8dxp_qsi4cxp`) via the
+    // packed<_FP16> facade, so no fp16<->fp32 cast pass over the LHS / DST.
+    // i8mm-gated because the facade is locked to the qai8dxp4x8/qsi4cxp4x8
+    // (nr=4 kr=16 sr=2) pack family — see arm_compute_backend_fp16.cpp.
+    //
+    // NOTE: the "is this weight already KAI-packed?" gate
+    // (isPackedF16Activation), the lazy plain-QS4CX -> KAI rhs assembly
+    // (Int4Utils::packPlainToSectionA / assembleKaiRhsPacked) and the x86
+    // reference-GEMM fallback are deferred to the QS4CX-FP16 host-FC infra
+    // track — they depend on the packF16Activation / Int4Utils body that is
+    // out of scope for this dispatch seam. This case assumes the weight was
+    // pre-packed at load by that track.
+    const unsigned int M = getDim().height();
+    const unsigned int K = getDim().width();
+    const unsigned int N = output.getDim().width();
+    const uint8_t *kai_rhs = input.getPackedData<uint8_t>();
+    _FP16 *data = (_FP16 *)getData();
+    _FP16 *rdata = output.getData<_FP16>();
+    const _FP16 lb = static_cast<_FP16>(-65504.0f);
+    const _FP16 ub = static_cast<_FP16>(65504.0f);
+    // transB=true: the KAI rhs-packed buffer is always row-major-as-transposed.
+    nntr_gemm_qai8dxp_qsi4cxp_packed<_FP16>(
+      M, N, K, (void *)data, (void *)kai_rhs, rdata, 3u, true, lb, ub);
+    break;
+  }
+#elif defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
   defined(__i386__)
   case Tdatatype::QS4CX: {
     // x86 host fallback: there is no KAI fp16 micro-kernel here (ARM i8mm), so
