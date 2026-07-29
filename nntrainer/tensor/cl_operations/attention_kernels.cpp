@@ -14,7 +14,7 @@
 #include "attention_kernels_templates.h"
 #include <array>
 #include <blas_kernel_interface.h>
-#include <blas_kernels.h> // v8c_use_buffer_path() — the V8C_BUF cell [T8]
+#include <blas_kernels.h> // v8c_use_buffer_path() — the V8C_BUF cell
 #include <chrono>
 #include <cl_kernels/flash_attention.h>
 #include <cl_kernels/rotary_emb.h>
@@ -2576,7 +2576,7 @@ bool flash_attention_prefill_f16_cl(
     // M=1024 1153 TPS vs scalar 3-kernel 727), so default it ON there. Adreno
     // (NNTR_V8C_BUF unset) keeps the naive flash OFF and uses the image
     // 3-kernel path — image attention beats flash 3x on Adreno.
-    return v8c_use_buffer_path() ? 1 : 0; // [T8] Intel buffer ⇒ 1
+    return v8c_use_buffer_path() ? 1 : 0; // buffer path ⇒ 1
   }();
   // LDS staging (lever B) measured a NET LOSS on Intel Arc (per-tile barrier +
   // LDS pressure cut occupancy; the K/V row is small and L2-cached): 1257 ms vs
@@ -2596,7 +2596,7 @@ bool flash_attention_prefill_f16_cl(
     // #60: default ON for the Intel/buffer path (NNTR_V8C_BUF) — Block-Q +
     // subgroup-reduce is the measured-best Intel attention (M=1024 ~2075 TPS
     // vs vec-flash ~1119, token-identical). Adreno (unset) uses the image path.
-    return v8c_use_buffer_path() ? 1 : 0; // [T8] Intel buffer ⇒ 1
+    return v8c_use_buffer_path() ? 1 : 0; // buffer path ⇒ 1
   }();
   // FBQ_TM: query rows per workgroup. Default 4 (=> acc+q 2*TM*VPL floats stays
   // in registers at LWS>=32). Only 1/2/4/8 supported.
@@ -2625,7 +2625,7 @@ bool flash_attention_prefill_f16_cl(
     const char *det = std::getenv("NNTR_DETERMINISTIC");
     if (det && det[0] == '1')
       return 0;
-    return v8c_use_buffer_path() ? 1 : 0; // [T8] Intel buffer ⇒ 1
+    return v8c_use_buffer_path() ? 1 : 0; // buffer path ⇒ 1
   }();
   // FLASH_COOP_LWS: WG size for the coop variant (work-items cooperating
   // over head_dim). Default 64. LDS footprint is tiny (q_sh[d]+acc_sh[d]+
@@ -2662,7 +2662,7 @@ bool flash_attention_prefill_f16_cl(
       // #59: Intel/buffer path default LWS=16 => VPL = d/16 = 8 (half8 vloads),
       // the measured Intel-Arc optimum (1153 TPS @ M=1024 vs 981 at LWS=64).
       // Adreno default stays 64.
-      v = v8c_use_buffer_path() ? 16 : 64; // [T8] Intel buffer ⇒ 16
+      v = v8c_use_buffer_path() ? 16 : 64; // buffer path ⇒ 16
     }
     // Must be a power of two for the log-step tree reduction.
     if (v != 16 && v != 32 && v != 64 && v != 128 && v != 256)
@@ -2747,7 +2747,7 @@ bool flash_attention_prefill_f16_cl(
   // quadruples -- measured 79.1->50.2s full-attn vs NSG=2 (-37%), beating
   // even the exchange-free probe floor (55.4s). d<=256 stays NSG=1.
   int xmx_nsg = xmx_nsg_env ? xmx_nsg_env : (((int)head_dim >= 512) ? 4 : 1);
-  // [r31 note-b] guard: FXA_KCH_SUB truncates silently when 16*NSG does not
+  // Guard: FXA_KCH_SUB truncates silently when 16*NSG does not
   // divide head_dim (no current dim hits this; env overrides could).
   if ((int)head_dim % (16 * xmx_nsg) != 0)
     xmx_nsg = 1;
@@ -2763,7 +2763,7 @@ bool flash_attention_prefill_f16_cl(
   // REGRESSIVE at NSG=2 (scb spill traffic, +14%/+55% at XB=2/4). Env kept
   // for tuning on other SKUs.
   int xmx_xb = (xmx_nsg > 1) ? (xmx_xb_env ? xmx_xb_env : 1) : 1;
-  // [r31 note-a] guard: clamp XB so psum + vtile fit the per-WG SLM budget
+  // Guard: clamp XB so psum + vtile fit the per-WG SLM budget
   // (XB=4 + d=512 defaults previously exceeded it -> launch failure, no
   // fallback). Budget 64KB, the conservative Xe per-WG limit.
   {
