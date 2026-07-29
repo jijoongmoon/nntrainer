@@ -235,6 +235,20 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
                      bool skip_out_map = false);
 
 /**
+ * @brief PLE reverse-RMSNorm on GPU: out = out_scale*normalize(in*weight)
+ *        The per-feature @a weight is folded INSIDE the RMS denominator
+ * (couples all features -- not expressible as rmsnorm*gamma); @a out_scale is a
+ *        post-norm scalar. FP32 accumulation; SVM-direct or planner cl_mem
+ * bind.
+ */
+void rms_reverse_norm_cl_fp16(const _FP16 *input, const _FP16 *weight,
+                              _FP16 out_scale, _FP16 *result,
+                              const float epsilon, unsigned int height,
+                              unsigned int width, bool use_svm = true,
+                              void *out_clmem = nullptr,
+                              void *in_clmem = nullptr);
+
+/**
  * @brief out[i] = in[i] * scalar over n elements (scalar_multiply GPU path).
  *        cl_mem-resident (out_clmem/in_clmem) under GPU_CLMEM, else SVM.
  */
