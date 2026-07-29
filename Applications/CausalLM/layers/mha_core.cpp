@@ -1207,7 +1207,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // sub-buffer whenever a non-cl_mem path wrote it (the wo FC reads cl_mem).
   // Offset-0 views only (batch 0; b_size==1 on the live path).
   // NNTR_CLMEM_MHA_OFF=1 (bisect): ignore residency handles entirely -- the
-  // mha consumes the legacy SVM plane (valid only with NNTR_CLMEM_DUALOUT).
+  // mha consumes the legacy SVM plane, which is only valid while the producer
+  // still writes it.
   // NNTR_KV_STAGE_TPROF: host time from mha entry to the rope-Q enqueue
   // (decomposes the copy_h2h->rope GPU-idle gap: executor/plumbing vs rope
   // wrapper).
@@ -1646,9 +1647,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #endif
       } else {
         // GPU RoPE for K straight into the (UVM) cache slice + GPU V copy:
-        // keeps the whole KV-cache write off the host. Requires NNTR_CUDA_ROPE
-        // and a device-resident cache (NNTR_CUDA_KV_UVM); the dev checks gate
-        // it.
+        // keeps the whole KV-cache write off the host. Requires the CUDA RoPE
+        // kernel and a device-resident cache, neither of which this change set
+        // provides; the checks below gate it.
         bool k_rope_gpu = false;
         if (!k_rope_gpu) {
           apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
