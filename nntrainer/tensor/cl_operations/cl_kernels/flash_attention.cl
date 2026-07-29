@@ -933,6 +933,20 @@ __kernel void flash_decode_reduce(
 #ifndef FXA_XB
 #define FXA_XB 1
 #endif
+// FXA_XRED: exchange-reduction mode (NSG>1 only). 0 (default) = the original
+// all-to-all reduction: EVERY subgroup reads all NSG psum partials for all TM
+// rows and sums (NSG*NSG*TM*KT SLM reads/WG per tile -- redundant NSG-fold).
+// 1 = DISTRIBUTED reduction: each subgroup reduces only the rows it OWNS
+// (r == sg mod NSG) once, writes the full score to a shared ssum buffer, then
+// all subgroups read their rows back. Cuts the psum-read volume from NSG^2 to
+// ~2*NSG per (row,key) (measured: the psum round-trip is ~56% of the d512
+// full-attn kernel and is SLM-traffic-bound, not barrier-bound -- shrinking
+// the traffic is the lever FXA_XB batching alone could not reach). The per-g
+// sum order (g=0..NSG-1) is preserved, so the online-softmax input is
+// BIT-IDENTICAL to FXA_XRED=0; +1 WG barrier and +XB*TM*KT*4B SLM.
+#ifndef FXA_XRED
+#define FXA_XRED 0
+#endif
 #define FXA_DSUB (FXA_D / FXA_NSG)
 #define FXA_KCH_SUB (FXA_DSUB / 16)
 // Row tiles are built from DPAS M<=8 fragments: FXA_FR rows per fragment,
@@ -1025,6 +1039,10 @@ __kernel void flash_attention_prefill_f16_xmx(
   __local half vtile[FXA_KT * FXA_D];
 #if FXA_NSG > 1
   __local float psum[FXA_XB * FXA_NSG * FXA_TM * FXA_KT];
+#if FXA_XRED
+  // Full (NSG-summed) scores, written once by the owning subgroup, read by all.
+  __local float ssum[FXA_XB * FXA_TM * FXA_KT];
+#endif
 #endif
 
   const int n0_start =
@@ -1064,7 +1082,7 @@ __kernel void flash_attention_prefill_f16_xmx(
 
     // ---- one exchange (write + WG barrier + read) per XB tiles
 #if FXA_NSG > 1
-    barrier(CLK_LOCAL_MEM_FENCE); // protect psum from prev-batch readers
+    barrier(CLK_LOCAL_MEM_FENCE); // protect psum/ssum from prev-batch readers
 #pragma unroll
     for (int b = 0; b < FXA_XB; ++b)
       if (n0g + b * FXA_KT <= n_last)
@@ -1072,6 +1090,22 @@ __kernel void flash_attention_prefill_f16_xmx(
         for (int r = 0; r < FXA_TM; ++r)
           psum[((b * FXA_NSG + sg) * FXA_TM + r) * FXA_KT + lane] = scb[b][r];
     barrier(CLK_LOCAL_MEM_FENCE); // psum visible
+#if FXA_XRED
+    // Distributed reduction: this subgroup sums the NSG partials for the rows
+    // it owns (r == sg mod NSG) ONCE and publishes the full score to ssum.
+#pragma unroll
+    for (int b = 0; b < FXA_XB; ++b)
+      if (n0g + b * FXA_KT <= n_last)
+#pragma unroll
+        for (int r = sg; r < FXA_TM; r += FXA_NSG) {
+          float s = 0.0f;
+#pragma unroll
+          for (int g = 0; g < FXA_NSG; ++g)
+            s += psum[((b * FXA_NSG + g) * FXA_TM + r) * FXA_KT + lane];
+          ssum[(b * FXA_TM + r) * FXA_KT + lane] = s;
+        }
+    barrier(CLK_LOCAL_MEM_FENCE); // ssum visible
+#endif
 #endif
 
     // ---- phase 2: per tile -- full scores, softmax, V stage, P*V
@@ -1083,7 +1117,11 @@ __kernel void flash_attention_prefill_f16_xmx(
       const int kt = min(FXA_KT, n_last - n0 + 1);
       const int nk = n0 + ((lane < kt) ? lane : (kt - 1));
       float sc[FXA_TM];
-#if FXA_NSG > 1
+#if FXA_NSG > 1 && FXA_XRED
+#pragma unroll
+      for (int r = 0; r < FXA_TM; ++r)
+        sc[r] = ssum[(b * FXA_TM + r) * FXA_KT + lane];
+#elif FXA_NSG > 1
 #pragma unroll
       for (int r = 0; r < FXA_TM; ++r) {
         float s = 0.0f;
