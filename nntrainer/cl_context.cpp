@@ -164,7 +164,7 @@ void ClContext::initialize() noexcept {
         (active_engine == nullptr) || std::string(active_engine) == "gpu";
       constexpr uint32_t ADRENO_VENDOR_ID = 0x5143;
       if (opencl_is_active && caps_.vendor_id == DeviceCaps::VENDOR_INTEL) {
-        // [round-19 Windows determinism] The NNTR_DETERMINISTIC=1 contract on
+        // The NNTR_DETERMINISTIC=1 contract on
         // Windows pins the minimal reproducibility pair (no cl_mem pool
         // offsets + post-FC drain, measured 9/9 identical det256) at the
         // CONSUMER sites — tensor_pool.cpp / cl_svm_allocator.cpp /

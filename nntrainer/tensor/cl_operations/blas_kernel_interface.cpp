@@ -605,7 +605,7 @@ static bool v8c_ensure_buf(cl_context ctx, cl_mem *buf, size_t *cap,
   {
     auto *cc =
       static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-    // 0x55 under NNTR_POISON_FILL=1 (round-16 uninit-consumer discriminator).
+    // 0x55 under NNTR_POISON_FILL=1 (uninit-consumer discriminator).
     static const cl_uchar fill = []() -> cl_uchar {
       const char *e = std::getenv("NNTR_POISON_FILL");
       return (e && e[0] == '1') ? (cl_uchar)0x55 : (cl_uchar)0x00;

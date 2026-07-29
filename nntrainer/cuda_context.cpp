@@ -80,7 +80,7 @@ void CudaContext::initialize() noexcept {
 
     // NNTR_DETERMINISTIC keeps the CUDA per-op drains: the async-submission
     // lever (NNTR_CUDA_ASYNC) is the one host/device-overlap knob whose overlap
-    // can turn a knife-edge logit into a run-to-run coin flip (round-15 audit),
+    // can turn a knife-edge logit into a run-to-run coin flip (measured),
     // so the determinism contract pins it OFF. overwrite=0 keeps an explicit
     // user NNTR_CUDA_ASYNC winning. The default path (env unset) is untouched —
     // NNTR_CUDA_ASYNC keeps its normal default (sync / drains on).

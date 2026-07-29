@@ -29,7 +29,7 @@
 namespace nntrainer::opencl {
 
 namespace {
-// NNTR_CL_LOCKSTEP=1 (round-17 upper-bound discriminator): clFinish after
+// NNTR_CL_LOCKSTEP=1 (upper-bound discriminator): clFinish after
 // EVERY kernel enqueue — closes the sub-dispatch windows that per-op drains
 // (X4) and per-FC flush (B1b) leave open. If runs STILL diverge under this,
 // the submit/arg-rebind mechanism class is refuted outright. Diagnosis only
@@ -42,7 +42,7 @@ inline bool cl_lockstep_on() {
   return on;
 }
 
-// [r19 determinism probe] NNTR_CL_SYNC_IO=1 forces every host-I/O enqueue
+// Determinism probe: NNTR_CL_SYNC_IO=1 forces every host-I/O enqueue
 // (read/write/map buffer, SVM map) to block, exposing an async host-transfer
 // divergence class: kernel-side LOCKSTEP cannot order these.
 inline bool cl_sync_io_forced() {
@@ -521,7 +521,7 @@ bool CommandQueueManager::DispatchCommand(
   }
   next_prof_label_.clear();
 
-  // NNTR_CL_LOCKSTEP (round-17 upper-bound discriminator): clFinish after
+  // NNTR_CL_LOCKSTEP (upper-bound discriminator): clFinish after
   // every enqueue. Diagnosis only, default-off; not part of NNTR_DETERMINISTIC.
   if (cl_lockstep_on())
     clFinish(command_queue_);
@@ -588,7 +588,7 @@ bool CommandQueueManager::DispatchCommand(
   }
   next_prof_label_.clear();
 
-  // NNTR_CL_LOCKSTEP (round-17 upper-bound discriminator): clFinish after
+  // NNTR_CL_LOCKSTEP (upper-bound discriminator): clFinish after
   // every enqueue. Diagnosis only, default-off; not part of NNTR_DETERMINISTIC.
   if (cl_lockstep_on())
     clFinish(command_queue_);
@@ -643,7 +643,7 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
       key += next_prof_label_;
     profRecs().push_back({std::move(key), local_evt});
   }
-  // NNTR_CL_LOCKSTEP (round-17 upper-bound discriminator): clFinish after
+  // NNTR_CL_LOCKSTEP (upper-bound discriminator): clFinish after
   // every enqueue. Diagnosis only, default-off; not part of NNTR_DETERMINISTIC.
   if (cl_lockstep_on())
     clFinish(command_queue_);

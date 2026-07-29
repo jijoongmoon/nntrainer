@@ -77,7 +77,7 @@ bool ClSVMAllocator::consume_host_owned(void *ptr) {
 }
 
 // NNTR_POISON_FILL=1: fill fresh allocations with 0x55 instead of 0 —
-// round-16 discriminator. If outputs CHANGE but stay run-stable, an
+// an uninit-consumer discriminator. If outputs CHANGE but stay run-stable, an
 // initialized-content consumer exists (uninit class); if divergence stays
 // intermittent, the mechanism is in-kernel / schedule-dependent.
 static unsigned char nntr_fill_byte() {

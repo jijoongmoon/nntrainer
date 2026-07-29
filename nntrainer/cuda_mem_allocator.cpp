@@ -26,8 +26,8 @@ namespace nntrainer {
 
 namespace {
 // NNTR_POISON_FILL=1: fill fresh allocations with 0x55 instead of 0 —
-// round-16 discriminator (change-but-stable output => uninit consumer;
-// still-intermittent => in-kernel/schedule-dependent).
+// an uninit-consumer discriminator (change-but-stable output => uninit
+// consumer; still-intermittent => in-kernel/schedule-dependent).
 unsigned char cuda_fill_byte() {
   static const unsigned char b = []() -> unsigned char {
     const char *e = std::getenv("NNTR_POISON_FILL");
@@ -121,8 +121,8 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
           }
           // Honor MemAllocator's calloc contract (per-process nondeterminism
           // class): cudaHostAlloc gives no zero guarantee — the runtime may
-          // recycle pinned blocks. 0x55 under NNTR_POISON_FILL=1 (round-16
-          // discriminator).
+          // recycle pinned blocks. 0x55 under NNTR_POISON_FILL=1
+          // (uninit-consumer discriminator).
           std::memset(hp, cuda_fill_byte(), size);
           *ptr = hp;
           if (dbg)
