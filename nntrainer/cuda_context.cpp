@@ -28,9 +28,8 @@
 #include <tie_word_embedding.h>
 
 // runDecode (T9): the CUDA-graph decode/prefill state machine, relocated
-// verbatim from neuralnet.cpp. Needs the model walk + graph-node access + the
-// CUDA graph API (cuda_context.h already pulls in StreamManager /
-// ContextManager).
+// from neuralnet.cpp. Needs the model walk / host-feed seam + the CUDA graph
+// API (cuda_context.h already pulls in StreamManager / ContextManager).
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -249,13 +248,11 @@ int CudaContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
   return registerFactory<nntrainer::Layer>(factory, key, int_key);
 }
 
-// SEAM-2 CUDA override (docs/ARCHITECTURE_REFACTOR.md §10 T9). Relocated
-// VERBATIM from neuralnet.cpp's incremental_inference #if ENABLE_CUDA block —
-// the only changes are the model walk (`nn.incremental_forwarding`), graph-node
-// access
-// (`nn.getLayerNode` / `nn.feedInputsLabels`), the M2-B skip flag
-// (`nn.setM2BSkipAll`), and the prefill-capture flag
-// (`nn.isPrefillCaptureDisabled()`). All decisions/env reads/static state are
+// SEAM-2 CUDA override (docs/ARCHITECTURE_REFACTOR.md §10 T9). Relocated from
+// neuralnet.cpp's incremental_inference #if ENABLE_CUDA block — the model side
+// is reached only through neutral seam accessors (`nn.incremental_forwarding`,
+// `nn.runDecodeHostFeed`, `nn.isPrefillCaptureDisabled`), so this backend
+// holds no model-specific node names. All decisions/env reads/static state are
 // unchanged, so engine=cuda decode is behaviorally identical.
 sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
                                           unsigned int to,
@@ -297,21 +294,21 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
   bool cuda_graph_captured = false;
 
   // M2-B: single-capture COHERENT decode. Capture the full forward ONCE (first
-  // decode token); for every later token, refresh ONLY the embeddings on the
-  // host (g_m2b_skip_all feed pass), update the device position (cuda_set_pos),
-  // and REPLAY the cached graph -- skipping the ~350-op C++ dispatch.
-  // VALUE-checked (=0 disables): cuda_context auto-sets NNTR_CUDA_M2B=1 on
-  // discrete+cMA boxes (setenv overwrite=0), so a presence check made =0 a
-  // FRANKEN-state -- graph capture/replay here stayed ON while the mha_core
-  // slot-writes (nntr_env_on, value-checked) turned OFF: replay then rewrites
-  // K/V at the first captured slot every token = deterministic decode garbage
-  // (field 2026-07-10: Linux HOST_MAPPED mimic with M2B=0 looped "toasters,
-  // which in turned" -- the exact same env-check split we swept everywhere
-  // else; see env_compat.h).
+  // decode token); for every later token, re-run ONLY the per-step host feed
+  // (runDecodeHostFeed: forward the graph's input nodes, refreshing the
+  // embedding staging for the new token id), update the device position
+  // (cuda_set_pos), and REPLAY the cached graph -- skipping the ~350-op C++
+  // dispatch. VALUE-checked via nntr_env_on (an explicit NNTR_CUDA_M2B=0
+  // disables; see env_compat.h) so every value-checked consumer of the
+  // variable agrees on ON/OFF -- a bare presence check would keep
+  // capture/replay ON under =0 while value-checked kernels turn OFF.
   static const bool cuda_m2b = nntr_env_on("NNTR_CUDA_M2B");
-  if (cuda_m2b && from == 0 && _cg_cached_exec != nullptr) {
-    // new sequence (prefill boundary): drop the previous sequence's cached
-    // graph.
+  if (cuda_m2b && (from == 0 || (to - from) > 1) &&
+      _cg_cached_exec != nullptr) {
+    // Drop the cached graph on any multi-token forward: a new sequence
+    // (from == 0) AND a resumed/block prefill (from != 0, window > 1) both
+    // re-walk the graph outside the captured topology, so a kept exec would
+    // replay a stale, dangling graph on the next decode token.
     cudaGraphExecDestroy(_cg_cached_exec);
     _cg_cached_exec = nullptr;
     _cg_cached_out = {};
@@ -319,24 +316,9 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
   if (cuda_m2b && from != 0 && (to - from) == 1) {
     auto &sm = nntrainer::cuda::StreamManager::Global();
     if (_cg_cached_exec != nullptr) {
-      // subsequent token: embed-only feed (refresh emb_stage) -> set pos ->
-      // replay
-      static const bool m2b_light = nntr_env_on("NNTR_CUDA_M2B_LIGHT");
-      if (m2b_light) {
-        // lighter feed: set the new token input + run ONLY the two embedding
-        // nodes directly, bypassing the full ~350-node graph iteration.
-        nn.feedInputsLabels(input, label);
-        auto emb0 = nn.getLayerNode("embedding0");
-        auto ple = nn.getLayerNode("per_layer_input_embedding");
-        if (emb0)
-          emb0->incremental_forwarding(from, to, false);
-        if (ple)
-          ple->incremental_forwarding(from, to, false);
-      } else {
-        nn.setM2BSkipAll(true);
-        out = nn.incremental_forwarding(from, to, input, label, false);
-        nn.setM2BSkipAll(false);
-      }
+      // subsequent token: host-feed the graph's input nodes (refresh the
+      // embedding staging for the new token id) -> set pos -> replay
+      nn.runDecodeHostFeed(from, to, input, label);
       nntrainer::cuda::cuda_set_pos((int)from, (int)from + 1);
       cudaGraphLaunch(_cg_cached_exec, sm.GetStream());
       cudaStreamSynchronize(sm.GetStream());

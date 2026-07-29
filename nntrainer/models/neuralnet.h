@@ -434,24 +434,26 @@ public:
   bool isPrefillCaptureDisabled() const { return prefill_capture_disabled_; }
 
   /**
-   * @brief Accessors used by the runDecode seam (Context::runDecode / its
-   *        CudaContext override, T9) so the relocated CUDA-graph state machine
-   *        can drive a forward step without reaching into NeuralNetwork
-   * privates.
+   * @brief Autoregressive-decode host feed for the runDecode seam
+   *        (Context::runDecode / its backend overrides): bind the current
+   *        step's inputs/labels and incrementally forward the graph's input
+   *        (source) nodes — the nodes with no incoming connections — for the
+   *        [from, to) step window.
+   * @details A backend decode engine that replays a captured device graph
+   *          still needs the per-step host-side feed (e.g. refreshing an
+   *          embedding staging buffer with the new token id). Driving the
+   *          graph's own input nodes keeps the backend free of model-specific
+   *          node names: whatever nodes a model declares as its sources are
+   *          fed, and a model without a particular node simply has nothing
+   *          extra to run.
+   * @param[in] from step window start
+   * @param[in] to step window end
+   * @param[in] input inputs for this step
+   * @param[in] label labels for this step (may be empty)
    */
-  /// set the M2-B "feed only, skip the heavy compute" flag (read inside
-  /// incremental_forwarding); used by the M2-B per-token embedding refresh.
-  void setM2BSkipAll(bool v);
-  /// look up a graph node by name (M2-B light embedding refresh).
-  std::shared_ptr<LayerNode> getLayerNode(const std::string &name) const {
-    return model_graph.getLayerNode(name);
-  }
-  /// bind the current step's inputs/labels to the graph (M2-B light refresh).
-  void feedInputsLabels(const sharedConstTensors &inputs,
-                        const sharedConstTensors &labels) {
-    sharedConstTensors in = inputs, lb = labels;
-    model_graph.setInputsLabels(in, lb);
-  }
+  void runDecodeHostFeed(unsigned int from, unsigned int to,
+                         const sharedConstTensors &input,
+                         const sharedConstTensors &label);
 
   /**
    * @brief     reset input dimensions of a model

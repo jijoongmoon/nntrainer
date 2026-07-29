@@ -522,14 +522,22 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   return forwarding(training);
 }
 
-// CUDA M2-B embed-only feed flag (decoupled from the OpenCL recq skip): true
-// while the single-capture replay re-runs ONLY the embedding nodes to refresh
-// the pinned staging buffer for the new token id; the forwarding_op below then
-// skips every other node's host forward (the GPU work comes from the replayed
-// graph).
-static bool g_m2b_skip_all = false;
-
-void NeuralNetwork::setM2BSkipAll(bool v) { g_m2b_skip_all = v; }
+// Autoregressive-decode host feed (runDecode seam): bind this step's inputs/
+// labels and incrementally forward ONLY the graph's input (source) nodes. A
+// backend decode engine that replays a captured device graph calls this to
+// refresh the per-step host-side staging (e.g. the embedding table lookup for
+// the new token id) without naming any model's nodes; the source-node set and
+// its order are fixed at compile time (realizeInputOutputNode), so the same
+// nodes run in the same order every step.
+void NeuralNetwork::runDecodeHostFeed(unsigned int from, unsigned int to,
+                                      const sharedConstTensors &input,
+                                      const sharedConstTensors &label) {
+  sharedConstTensors in = input, lb = label;
+  model_graph.setInputsLabels(in, lb);
+  const unsigned int num_inputs = model_graph.getNumInputNodes();
+  for (unsigned int i = 0; i < num_inputs; ++i)
+    model_graph.getInputLayerNode(i)->incremental_forwarding(from, to, false);
+}
 
 // The exec-engine seam base: one decode/prefill forward step is a plain graph
 // walk. CPU and OpenCL use this base unchanged, so they are byte-identical to
