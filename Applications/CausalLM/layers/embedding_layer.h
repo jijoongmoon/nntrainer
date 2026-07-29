@@ -67,6 +67,11 @@ public:
 
 /**
  * @brief Shared sidecar embedding LUT loaded from raw UINT16 or JSON manifest.
+ *
+ * The payload is mmap'd read-only when possible so a multi-hundred-MB table
+ * stays out of resident memory and rows are paged in on demand; `bytes` is
+ * the fallback container (mmap failure). Always access the payload through
+ * data()/payload_size().
  */
 struct QuantLut {
   std::vector<uint8_t> bytes;
@@ -79,6 +84,19 @@ struct QuantLut {
 
   bool is_raw_u16 = false;
   bool is_signed4 = false;
+
+  void *mmap_ptr = nullptr;
+  size_t mmap_len = 0;
+
+  const uint8_t *data() const {
+    return mmap_ptr ? static_cast<const uint8_t *>(mmap_ptr) : bytes.data();
+  }
+  size_t payload_size() const { return mmap_ptr ? mmap_len : bytes.size(); }
+
+  QuantLut() = default;
+  QuantLut(const QuantLut &) = delete;
+  QuantLut &operator=(const QuantLut &) = delete;
+  ~QuantLut();
 };
 
 /**
