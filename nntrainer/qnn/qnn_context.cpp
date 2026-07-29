@@ -371,7 +371,12 @@ const int QNNContext::registerFactory(const FactoryType<T> factory,
     return int_key;
   }
 
-  int assigned_int_key = int_key == -1 ? str_map.size() + 1 : int_key;
+  // Auto key from max(existing) + 1, not from the registration COUNT: a
+  // count-derived key shifts when a registration is inserted mid-list and can
+  // walk onto an explicitly-requested LayerType value, which the assignment
+  // below would then silently rebind. QNNContext keeps its "duplicate key is a
+  // no-op, reuse it" policy above; this only removes the position dependence.
+  int assigned_int_key = int_key == -1 ? nextAutoIntKey(int_map) : int_key;
 
   str_map[assigned_key] = factory;
   int_map[assigned_int_key] = assigned_key;
