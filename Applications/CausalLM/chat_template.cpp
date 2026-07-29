@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -41,20 +42,29 @@ bool fileExists(const std::string &path) {
   return file.good();
 }
 
-std::string readTextFile(const std::string &path) {
+/**
+ * @brief Read a whole file, or nullopt when it cannot be opened.
+ *
+ * [init-latency] Load() used to probe each file with fileExists() and then
+ * open it a second time to read it -- three files, six opens. Only an OPEN
+ * failure yields nullopt; a malformed file still throws out of the parse,
+ * exactly as the fileExists()-guarded form did, so no error path changes.
+ */
+std::optional<std::string> tryReadTextFile(const std::string &path) {
   std::ifstream file(path, std::ios::binary);
   if (!file.is_open())
-    throw std::runtime_error("Failed to open file: " + path);
+    return std::nullopt;
 
   std::ostringstream buffer;
   buffer << file.rdbuf();
   return buffer.str();
 }
 
-nlohmann::json readJsonFile(const std::string &path) {
+/** @copydoc tryReadTextFile */
+std::optional<nlohmann::json> tryReadJsonFile(const std::string &path) {
   std::ifstream file(path);
   if (!file.is_open())
-    throw std::runtime_error("Failed to open file: " + path);
+    return std::nullopt;
 
   nlohmann::json data;
   file >> data;
@@ -514,15 +524,12 @@ bool ChatTemplate::Exists(const std::string &model_path) {
   if (fileExists(model_path + "/chat_template.jinja"))
     return true;
 
-  const std::string tokenizer_config_path =
-    model_path + "/tokenizer_config.json";
-  if (!fileExists(tokenizer_config_path))
-    return false;
-
   try {
-    nlohmann::json tokenizer_config = readJsonFile(tokenizer_config_path);
-    return tokenizer_config.contains("chat_template") &&
-           !tokenizer_config["chat_template"].is_null();
+    const auto tokenizer_config =
+      tryReadJsonFile(model_path + "/tokenizer_config.json");
+    return tokenizer_config.has_value() &&
+           tokenizer_config->contains("chat_template") &&
+           !(*tokenizer_config)["chat_template"].is_null();
   } catch (...) {
     return false;
   }
@@ -534,13 +541,13 @@ ChatTemplate ChatTemplate::Load(const std::string &model_path) {
 
   const std::string tokenizer_config_path =
     model_path + "/tokenizer_config.json";
-  if (fileExists(tokenizer_config_path))
-    impl->tokenizer_config = readJsonFile(tokenizer_config_path);
+  if (auto tokenizer_config = tryReadJsonFile(tokenizer_config_path))
+    impl->tokenizer_config = std::move(*tokenizer_config);
 
   const std::string special_tokens_path =
     model_path + "/special_tokens_map.json";
-  if (fileExists(special_tokens_path))
-    impl->special_tokens = readJsonFile(special_tokens_path);
+  if (auto special_tokens = tryReadJsonFile(special_tokens_path))
+    impl->special_tokens = std::move(*special_tokens);
 
   impl->bos_token =
     findToken(impl->tokenizer_config, impl->special_tokens, "bos_token");
@@ -548,9 +555,9 @@ ChatTemplate ChatTemplate::Load(const std::string &model_path) {
     findToken(impl->tokenizer_config, impl->special_tokens, "eos_token");
 
   const std::string template_file_path = model_path + "/chat_template.jinja";
-  if (fileExists(template_file_path)) {
+  if (auto template_source = tryReadTextFile(template_file_path)) {
     impl->source_path = template_file_path;
-    impl->template_source = readTextFile(template_file_path);
+    impl->template_source = std::move(*template_source);
     // [init-latency L3] Everything the renderer needs is final now.
     impl->startWarmup();
     return ChatTemplate(std::move(impl));
