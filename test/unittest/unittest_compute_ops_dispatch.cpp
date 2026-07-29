@@ -37,6 +37,7 @@ struct CallCounters {
   std::atomic<int> ele_mul{0};
   std::atomic<int> ele_add{0};
   std::atomic<int> scopy{0};
+  std::atomic<int> rms_reverse_norm{0};
 };
 
 /**
@@ -83,6 +84,15 @@ public:
                   unsigned int iY) override {
     counters_->scopy++;
     real_->scopy_fp32(N, X, iX, Y, iY);
+  }
+  void rms_reverse_norm(nntrainer::Tensor &in, nntrainer::Tensor &out,
+                        const nntrainer::Tensor &weight,
+                        const nntrainer::Tensor &out_scale, float epsilon,
+                        unsigned int active_rows,
+                        unsigned int row_offset) override {
+    counters_->rms_reverse_norm++;
+    real_->rms_reverse_norm(in, out, weight, out_scale, epsilon, active_rows,
+                            row_offset);
   }
 
 private:
@@ -324,6 +334,37 @@ TEST_F(ComputeOpsDispatchTest, ToMigratesContextDataAndUnblocksOp) {
 
   // Now a.multiply(b_migrated) is on the same context — no throw.
   EXPECT_NO_THROW(a.multiply(b_migrated, out));
+}
+
+/**
+ * @brief The reverse-RMSNorm whole-op (PLE post_norm) dispatches
+ *        through the attached ContextData ops — the dispatch seam the layer's
+ *        former open-coded body structurally could not test — and the
+ *        (active_rows, row_offset) window is honoured: rows outside the
+ *        window are untouched.
+ */
+TEST_F(ComputeOpsDispatchTest,
+       RmsReverseNormDispatchesThroughAttachedContextOps) {
+  nntrainer::Tensor in(1, 1, 2, 4);
+  nntrainer::Tensor out(1, 1, 2, 4);
+  nntrainer::Tensor weight(1, 1, 1, 4);
+  nntrainer::Tensor out_scale(1, 1, 1, 1);
+  in.setValue(1.0f);
+  out.setValue(0.0f);
+  weight.setValue(2.0f);
+  out_scale.setValue(3.0f);
+
+  in.setContextData(ct_data);
+  in.getOps()->rms_reverse_norm(in, out, weight, out_scale, /*epsilon=*/0.0f,
+                                /*active_rows=*/1, /*row_offset=*/0);
+
+  EXPECT_GT(counters->rms_reverse_norm.load(), 0);
+  // out = out_scale * (x*w) * rsqrt(mean((x*w)^2) + eps)
+  //     = 3 * (1*2) * rsqrt(4) = 3, exactly, in fp32.
+  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, 0), 3.0f);
+  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, 3), 3.0f);
+  // Row 1 sits outside active_rows=1 and must be untouched.
+  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 1, 0), 0.0f);
 }
 
 int main(int argc, char **argv) {
