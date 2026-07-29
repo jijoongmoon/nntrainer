@@ -13,7 +13,6 @@
 #if defined(ENABLE_OPENCL)
 // OpenCL GPU FP16 slice kernel (per_layer_slice_cl_fp16). Guarded so the
 // no-OpenCL build (enable-opencl=false) compiles via the host memcpy path.
-
 #include <blas_kernels.h>
 #endif
 #include <cstring>
