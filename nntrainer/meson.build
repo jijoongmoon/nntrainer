@@ -64,7 +64,12 @@ if get_option('enable-opencl')
   nntrainer_elements += 'opencl'
   nntrainer_elements += 'layers/cl_layers'
 
-  nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
+  # Only reachable from clblast_interface.cpp, which #includes "clblast.h"
+  # inside #ifdef ENABLE_CLBLAST. With enable-clblast=false the subproject is
+  # not checked out, so do not put its include dir on the command line.
+  if get_option('enable-clblast')
+    nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
+  endif
 endif
 
 if get_option('enable-cuda')
