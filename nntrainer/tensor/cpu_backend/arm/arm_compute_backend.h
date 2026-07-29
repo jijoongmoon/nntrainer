@@ -35,6 +35,25 @@
 
 namespace nntrainer {
 
+// nntr_gemm_qai8dxp_qsi4cxp_* per-channel int4 KAI template decls. Upstream's
+// kleidiai refactor (the qai8dxp/qsi4cxp rhs-packed GEMM path) dropped these
+// from this header; our facade keeps the nntr_*<T> API, and
+// arm_compute_backend_fp16.cpp defines nntrainer::-scoped specializations, so
+// re-declare them here.
+template <typename T = float>
+uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales, T *dst_mtx, bool transB = true,
+  T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
+
+template <typename T = float>
+void nntr_gemm_qai8dxp_qsi4cxp_packed(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
+  bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
+
 #ifdef ENABLE_FP16
 /**
  * @brief F32 * F16 = F32 GEMM
