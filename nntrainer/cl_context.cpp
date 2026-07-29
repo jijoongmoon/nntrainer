@@ -82,12 +82,21 @@ void ClContext::initialize() noexcept {
 
     initBlasClKernels();
     initAttentionClKernels();
-    add_default_object();
+
     // SVM-backed allocator so MemoryPool buffers are device-visible
     // without an explicit copy. Falls back to host memory inside
     // ClSVMAllocator when the driver lacks SVM support.
+    //
+    // Installed BEFORE add_default_object() (matching AppContext::initialize),
+    // and not after: every throw inside add_default_object() is swallowed by
+    // the catch below, so with the old order a single bad registration left
+    // this context with a null MemAllocator and crashed the TensorPool ctor
+    // for EVERY model. The allocator does not depend on any registration, so
+    // ordering it first bounds a registration failure to the registrations.
     setMemAllocator(
       std::make_shared<ClSVMAllocator>(opencl::ContextManager::Global()));
+
+    add_default_object();
 
     // Install the OpenCL ComputeOps subclass so tensors created from
     // this Context dispatch their accelerator-only ops (Q4_0/INT4
@@ -167,14 +176,11 @@ const int ClContext::registerFactory(const FactoryType<T> factory,
     throw std::invalid_argument(ss.str().c_str());
   }
 
-  if (int_key != -1 && int_map.find(int_key) != int_map.end()) {
-    std::stringstream ss;
-    ss << "cl_context: cannot register factory with already taken int key: "
-       << int_key;
-    throw std::invalid_argument(ss.str().c_str());
-  }
-
-  int assigned_int_key = int_key == -1 ? str_map.size() + 1 : int_key;
+  // Auto keys come from max(existing) + 1 and are therefore independent of
+  // where in add_default_object() the registration sits; an explicit key that
+  // is already bound throws here, naming both colliding types.
+  const int assigned_int_key =
+    resolveIntKey(int_map, int_key, assigned_key, "cl_context");
 
   str_map[assigned_key] = factory;
   int_map[assigned_int_key] = assigned_key;

@@ -74,6 +74,76 @@ public:
   template <typename... Ts> using FactoryMap = std::tuple<IndexType<Ts>...>;
 
   /**
+   * @brief   Next int_key that no registration in @a int_map can already hold.
+   *
+   * Every Context used to derive an auto-assigned int_key as
+   * `str_map.size() + 1`, i.e. from a COUNT. That makes the key a function of
+   * how many registrations precede it, so inserting one registration mid-list
+   * walks every later auto key up by one until one lands on a key that was
+   * requested EXPLICITLY (an ml::train::LayerType enum value). Nothing checked
+   * the auto key, so `int_map[k] = type` silently rebound an existing entry,
+   * and the damage surfaced later - as a throw from an unrelated registration,
+   * or as a lookup returning the wrong layer type. The only defence was a
+   * comment asking contributors to append new registrations at the end.
+   *
+   * Deriving the key from max(existing) + 1 instead makes it independent of
+   * insertion position: it cannot collide with anything already registered,
+   * in any order. Explicit keys are still checked (see resolveIntKey).
+   *
+   * @param int_map the context's int -> type-string index
+   * @return an int_key not present in @a int_map
+   */
+  static int nextAutoIntKey(const IntIndexType &int_map) {
+    int next = static_cast<int>(int_map.size()) + 1;
+    for (const auto &entry : int_map) {
+      if (entry.first >= next)
+        next = entry.first + 1;
+    }
+    return next;
+  }
+
+  /**
+   * @brief   Resolve and validate the int_key a factory registration binds.
+   *
+   * @note Failing here is deliberate and must stay loud. The collision this
+   *       replaces used to abort a Context's initialize() from inside
+   *       add_default_object(), which is wrapped in a catch-and-log; the
+   *       context then finished initialisation with NO MemAllocator installed
+   *       and every model crashed later in TensorPool with a null allocator -
+   *       a symptom with no visible connection to the registration that caused
+   *       it. Contexts now install their allocator BEFORE registering, so a
+   *       registration failure can only ever be this message. Both colliding
+   *       type names are named so the message identifies the mistake by
+   *       itself.
+   *
+   * @param int_map      the context's int -> type-string index
+   * @param int_key      requested key, or -1 to auto-assign
+   * @param assigned_key the (lowercased) type string being registered
+   * @param ctx_name     context name, used as the message prefix
+   * @return the int_key to bind
+   * @throw std::invalid_argument if the requested key is already bound
+   */
+  static int resolveIntKey(const IntIndexType &int_map, const int int_key,
+                           const std::string &assigned_key,
+                           const char *ctx_name) {
+    const int assigned_int_key =
+      int_key == -1 ? nextAutoIntKey(int_map) : int_key;
+
+    auto taken = int_map.find(assigned_int_key);
+    if (taken != int_map.end()) {
+      std::stringstream ss;
+      ss << ctx_name << ": cannot register factory '" << assigned_key
+         << "' with int_key " << assigned_int_key
+         << ": that key is already registered to '" << taken->second
+         << "'. Explicit int_keys must be unique within one context; pass "
+            "int_key = -1 to have a free key assigned instead.";
+      throw std::invalid_argument(ss.str());
+    }
+
+    return assigned_int_key;
+  }
+
+  /**
    * @brief   Default constructor
    */
   Context(std::shared_ptr<ContextData> data_ = nullptr) : data(data_) {}
