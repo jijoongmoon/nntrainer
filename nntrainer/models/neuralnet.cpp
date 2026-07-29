@@ -522,6 +522,23 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   return forwarding(training);
 }
 
+// Autoregressive-decode host feed (runDecode seam): bind this step's inputs/
+// labels and incrementally forward ONLY the graph's input (source) nodes. A
+// backend decode engine that replays a captured device graph calls this to
+// refresh the per-step host-side staging (e.g. the embedding table lookup for
+// the new token id) without naming any model's nodes; the source-node set and
+// its order are fixed at compile time (realizeInputOutputNode), so the same
+// nodes run in the same order every step.
+void NeuralNetwork::runDecodeHostFeed(unsigned int from, unsigned int to,
+                                      const sharedConstTensors &input,
+                                      const sharedConstTensors &label) {
+  sharedConstTensors in = input, lb = label;
+  model_graph.setInputsLabels(in, lb);
+  const unsigned int num_inputs = model_graph.getNumInputNodes();
+  for (unsigned int i = 0; i < num_inputs; ++i)
+    model_graph.getInputLayerNode(i)->incremental_forwarding(from, to, false);
+}
+
 // The exec-engine seam base: one decode/prefill forward step is a plain graph
 // walk. CPU and OpenCL use this base unchanged, so they are byte-identical to
 // the pre-seam code; a backend with its own decode engine overrides it.

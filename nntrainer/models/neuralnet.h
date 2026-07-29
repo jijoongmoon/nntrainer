@@ -423,6 +423,39 @@ public:
                         bool output_hidden_state = false) override;
 
   /**
+   * @brief Disable the CUDA prefill-graph capture for the next forward(s).
+   * @note Used by the load-time warmup: the warmup must run EAGER so its FCs
+   * can grow the prefill scratch via cudaMalloc (a malloc inside capture
+   * invalidates the graph and makes the FC bail to the host i8mm path -> SIGILL
+   * on Orin). After the warmup grows all scratch, re-enable so the timed
+   * prefill captures.
+   */
+  void setPrefillCaptureDisabled(bool v) { prefill_capture_disabled_ = v; }
+  bool isPrefillCaptureDisabled() const { return prefill_capture_disabled_; }
+
+  /**
+   * @brief Autoregressive-decode host feed for the runDecode seam
+   *        (Context::runDecode / its backend overrides): bind the current
+   *        step's inputs/labels and incrementally forward the graph's input
+   *        (source) nodes — the nodes with no incoming connections — for the
+   *        [from, to) step window.
+   * @details A backend decode engine that replays a captured device graph
+   *          still needs the per-step host-side feed (e.g. refreshing an
+   *          embedding staging buffer with the new token id). Driving the
+   *          graph's own input nodes keeps the backend free of model-specific
+   *          node names: whatever nodes a model declares as its sources are
+   *          fed, and a model without a particular node simply has nothing
+   *          extra to run.
+   * @param[in] from step window start
+   * @param[in] to step window end
+   * @param[in] input inputs for this step
+   * @param[in] label labels for this step (may be empty)
+   */
+  void runDecodeHostFeed(unsigned int from, unsigned int to,
+                         const sharedConstTensors &input,
+                         const sharedConstTensors &label);
+
+  /**
    * @brief     reset input dimensions of a model
    * @param[in] dims input dimensions
    * @note Similar to reinitialize, the resetInputDimension API is used for
@@ -658,6 +691,9 @@ public:
                const std::string file_path) override;
 
 private:
+  bool prefill_capture_disabled_ =
+    false; /**< gate for the CUDA prefill-graph capture (warmup runs eager) */
+
   using FlexiblePropTypes =
     std::tuple<props::Epochs, props::TrainingBatchSize, props::SavePath,
                props::ContinueTrain, props::SaveBestPath,
