@@ -25,6 +25,7 @@
 
 #include <common_properties.h>
 #include <layer_impl.h>
+#include <tensor_dim.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -66,7 +67,8 @@ public:
 } // namespace props
 
 /**
- * @brief Shared sidecar embedding LUT loaded from raw UINT16 or JSON manifest.
+ * @brief Shared sidecar embedding LUT loaded from raw UINT16, JSON manifest,
+ *        or GGML (q4_0/q6_k) row payload.
  *
  * The payload is mmap'd read-only when possible so a multi-hundred-MB table
  * stays out of resident memory and rows are paged in on demand; `bytes` is
@@ -84,6 +86,11 @@ struct QuantLut {
 
   bool is_raw_u16 = false;
   bool is_signed4 = false;
+
+  /// GGML row-block payload (Q4_0/Q6_K); NONE for the packed-4bit/raw formats.
+  nntrainer::TensorDim::DataType ggml_dtype =
+    nntrainer::TensorDim::DataType::NONE;
+  size_t row_bytes = 0; ///< payload stride per row (ggml mode)
 
   void *mmap_ptr = nullptr;
   size_t mmap_len = 0;
