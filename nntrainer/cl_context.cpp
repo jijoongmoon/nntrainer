@@ -425,28 +425,30 @@ ClContext::registerClKernel(const std::string &kernel_string,
   // layer in the attention path alone; the GPU sat idle exactly that long).
   const std::string key = kernel_name + compile_options;
 
-  // [round-17 ring-rotation] Under NNTR_DETERMINISTIC=1 (or an explicit
-  // NNTR_CL_KERNEL_RING=K), hand out K rotating CLONES of each kernel
-  // instead of one process-global singleton. Every dispatcher re-binds args
-  // on the object this returns; with a singleton that re-bind can hit an
-  // object whose previous enqueue the driver has not locked in yet — a
-  // measured token-altering hazard on this stack (see the v8c_probe_copy
-  // precedent in blas_kernel_interface.cpp) and round-17's Windows verdict
-  // ("submission/kernel level", per-FC flush only reduces frequency).
-  // Rotation guarantees the re-bound object is the one enqueued K calls
-  // ago. Cost: K-1 extra clCreateKernel per kernel (program cache makes the
-  // clones cheap), zero per-call overhead. Call sites that cache the
-  // returned pointer statically keep singleton behavior (documented gap).
+  // Kernel ring-rotation: hand out K rotating CLONES of each kernel instead
+  // of one process-global singleton. Every dispatcher re-binds args on the
+  // object this returns; with a singleton that re-bind can hit an object
+  // whose previous enqueue the driver has not locked in yet — a measured
+  // token-altering hazard on this stack (see the v8c_probe_copy precedent
+  // in blas_kernel_interface.cpp; a per-FC flush only reduces its
+  // frequency). Rotation guarantees the re-bound object is the one enqueued
+  // K calls ago. Cost: K-1 extra clCreateKernel per kernel (program cache
+  // makes the clones cheap), zero per-call overhead. Call sites that cache
+  // the returned pointer statically keep singleton behavior (documented
+  // gap).
+  //
+  // The ring is a correctness fix, so it is UNCONDITIONAL: it does not sit
+  // under the NNTR_DETERMINISTIC opt-out (=0 relaxes only the ordering /
+  // math-mode half of the contract). NNTR_CL_KERNEL_RING=K remains the
+  // explicit diagnostic override; =1 reproduces the legacy singleton
+  // deliberately (bisection aid), which is the one way to re-enable the
+  // known-wrong re-bind behavior.
   {
     static const int ring_k = []() {
       const char *r = std::getenv("NNTR_CL_KERNEL_RING");
       if (r)
         return std::max(1, std::atoi(r));
-      // Default-on: the ring fixes a measured token-altering re-bind hazard at
-      // ~zero cost (program cache makes the clones cheap). NNTR_DETERMINISTIC=0
-      // opts out to the legacy singleton.
-      const char *d = std::getenv("NNTR_DETERMINISTIC");
-      return (d && d[0] == '0') ? 1 : 8;
+      return 8;
     }();
     if (ring_k > 1) {
       static std::unordered_map<
