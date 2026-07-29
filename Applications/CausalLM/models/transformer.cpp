@@ -26,6 +26,7 @@
 #include <neuralnet.h>
 #include <per_layer_slice_gpu.h>
 #include <qs4cx_tensor.h>
+#include <reshaped_rms_norm.h>
 #include <rms_norm.h>
 #include <rms_norm_gpu.h>
 #include <swiglu_layer.h>
@@ -146,6 +147,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
+  LMHEAD_UNTIE =
+    nntr_cfg.contains("lmhead_untie") && nntr_cfg["lmhead_untie"].get<bool>();
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -645,6 +648,13 @@ void Transformer::registerCustomLayers() {
     // round-trip that would break residency).
     ct_engine.registerLayerFactory(
       "gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
+    // Per-head q/k/v norms (Gemma4, Qwen3) on the gpu context. One class for
+    // both backends: its incremental_forwarding dispatches the rmsnorm kernels
+    // when the operands are SVM-resident and keeps the host pass otherwise, so
+    // registering it here is what lets a reshaped_rms_norm node carry engine=
+    // instead of sitting on the host between two device FCs.
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register GPU-routed layer on gpu ctx: " << e.what()
               << std::endl;

@@ -38,6 +38,7 @@
 #include <lm_head.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
+#include <residency_policy.h>
 #include <tensor.h>
 
 #include <causal_lm.h>
@@ -50,6 +51,33 @@ namespace causallm {
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
+  // Declare CausalLM's static-residency boundaries. Core ships the MECHANISM
+  // (ResidencyPolicy::global(), read by manager.cpp's engine_neutral test and
+  // tensor_pool.cpp's planner build) but deliberately carries no app-specific
+  // layer names; the POLICY is the application's to declare. Nothing populated
+  // it here, so `isEngineNeutral()` answered false for every type and the
+  // mechanism was dead code.
+  //
+  // `mha_core` is CPU-registered but binds and consumes Q/K/V on the GPU plane
+  // (it takes the cl_mem handles directly and bridges its host stages through
+  // clmem_lower_cl / clmem_raise_cl). Undeclared, it counts as a CPU consumer,
+  // so `all_consumers_gpu` is false for every wq/wk/wv output and the planner
+  // downgrades the whole attention neighbourhood GPU_CLMEM -> SVM. Observable
+  // proof the declaration is what arms the path: without it NNTR_CLMEM_MHA_OFF
+  // (which nulls exactly those handles) cannot change the output at all,
+  // because they are already null.
+  //
+  // NOT declared here, deliberately: the input-boundary RAISE
+  // ("embedding0:out0") and output-boundary LOWER ("output_norm:out0") that the
+  // reference tree also sets. Both are a REGRESSION on this tree -- measured
+  // 2026-07-28, gemma4 goes from the golden "**Seoul**" to <pad> spam -- so the
+  // raise/lower implementations they feed are not fully on the ladder yet. They
+  // are still reachable for A/B via NNTR_CLMEM_RAISE / NNTR_CLMEM_LOWER.
+  {
+    auto &rp = nntrainer::ResidencyPolicy::global();
+    if (rp.engine_neutral_types.empty())
+      rp.engine_neutral_types = {"mha_core"};
+  }
   setupParameters(cfg, generation_cfg, nntr_cfg);
 }
 
@@ -220,26 +248,64 @@ void CausalLM::advanceKVCachePosition(unsigned int step_size) {
   kv_cache.advance(step_size);
 }
 
-std::pair<Tensor, Tensor> CausalLM::constructModel() {
-
-  // base transformer (input, output_norm)
-  auto [x, h] = Transformer::constructModel();
-
+/**
+ * [lmhead-untie] When nntr_config.json sets lmhead_untie, build
+ * output_of_causallm as an independent fully_connected layer with its own
+ * weight even for a tied-embedding model, so the lm_head can carry a
+ * different dtype than the embedding (untied-serialized packages such as
+ * gemma4_qs4cx_fp16 ship a separate transposed [hidden, vocab] head record
+ * that a tied graph cannot load). Untie is the config flag, NOT derived from
+ * LMHEAD_DTYPE: a quantizer constructs this same untied graph from the FP32
+ * source and quantizes output_of_causallm via the dtype map on save.
+ * skip_prefill keeps the FC lm_head decode-only, the same contract the tied
+ * lm_head types implement internally. Flag off = byte-identical graph.
+ */
+Tensor CausalLM::buildLmHeadOutput(Tensor h, bool add_skip_prefill) {
+  const bool lmhead_untied = LMHEAD_UNTIE;
   const std::string lmhead_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
-
+    lmhead_untied ? "fully_connected"
+                  : (TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head");
   std::vector<std::string> lmhead_prop = {
     withKey("name", "output_of_causallm"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
-
-  if (TIE_WORD_EMBEDDINGS)
+  // The head must carry the graph's engine. It is the LAST node, so it reads
+  // output_norm's activation -- which, once the rest of the graph is
+  // engine-stamped (38de03c46 / 2c2b0d96e), lives on the gpu context's
+  // cl_mem/SVM plane. A host head reads the stale host shadow of that plane, so
+  // the logits are garbage and every model degenerates to one repeated token.
+  // Measured on this tree: unstamped gemma4 answered "<pad>"-class garbage at
+  // 0.23 TPS decode (a 262144-row QS4CX head on the host); stamped it answers
+  // "The capital of South Korea is **Seoul**." at 20.6 TPS.
+  // Both reachable types have a real gpu-context factory, so neither throws
+  // exception::not_supported from createLayer:
+  //   fully_connected     -> FullyConnectedLayerCl (cl_context.cpp
+  //                          add_default_object)
+  //   tie_word_embeddings -> TieWordEmbedding      (cl_context.cpp, gated on
+  //                          registerGeGLUClKernels; same class on
+  //                          cpu/gpu/cuda, it selects its Q6_K/Q4_0 GPU GEMV
+  //                          internally)
+  // "lm_head" (untied via config.json tie_word_embeddings=false, i.e. NOT
+  // LMHEAD_UNTIE) has NO gpu registration and stays unstamped -- no in-tree
+  // package reaches it, and stamping it would throw.
+  if (lmhead_type != "lm_head")
+    lmhead_prop.emplace_back(withKey("engine", causallm_engine()));
+  if (add_skip_prefill)
+    lmhead_prop.emplace_back(withKey("skip_prefill", "true"));
+  if (TIE_WORD_EMBEDDINGS && !lmhead_untied)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
-
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
-  Tensor y = lmhead(h);
+  return lmhead(h);
+}
+
+std::pair<Tensor, Tensor> CausalLM::constructModel() {
+
+  // base transformer (input, output_norm)
+  auto [x, h] = Transformer::constructModel();
+
+  Tensor y = buildLmHeadOutput(h, LMHEAD_UNTIE && SKIP_PREFILL);
 
   return {x, y};
 }
