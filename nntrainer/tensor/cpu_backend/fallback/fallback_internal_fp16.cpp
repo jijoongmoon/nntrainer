@@ -496,9 +496,24 @@ template <>
 void __fallback_rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
                                                   _FP16 *__restrict Y, size_t H,
                                                   size_t W, float epsilon) {
-
-  throw std::runtime_error(
-    "NYI : __fallback_rms_norm_wrt_width_fp16_intrinsic with FP16 type input");
+  // Scalar reference: the sum-of-squares MUST be accumulated in FP32 — a
+  // fp16 accumulator overflows past 65504 on a wide residual row and turns
+  // the scale into +Inf. Matches the neon_impl_fp16 semantics so x86
+  // fp16-activation builds (which have no SIMD impl and land here) compute
+  // the same result instead of throwing NYI.
+  for (size_t r = 0; r < H; ++r) {
+    const _FP16 *xr = X + r * W;
+    _FP16 *yr = Y + r * W;
+    float ss = 0.0f;
+    for (size_t k = 0; k < W; ++k) {
+      const float v = static_cast<float>(xr[k]);
+      ss += v * v;
+    }
+    const float inv = 1.0f / std::sqrt(ss / static_cast<float>(W) + epsilon);
+    for (size_t k = 0; k < W; ++k) {
+      yr[k] = static_cast<_FP16>(static_cast<float>(xr[k]) * inv);
+    }
+  }
 }
 
 template <>

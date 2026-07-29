@@ -9,10 +9,15 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <algorithm>
+#include <atomic>
 #include <iomanip>
 #include <iostream>
+#include <thread>
+#include <vector>
 
 #include <compute_ops.h>
+#include <cpu_backend.h>
 #include <half_tensor.h>
 #include <tensor.h>
 #include <util_func.h>
@@ -719,6 +724,76 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::Q6_K:
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
+  defined(__i386__)
+  case Tdatatype::QS4CX: {
+    // x86 host fallback: there is no KAI fp16 micro-kernel here (ARM i8mm), so
+    // an fp16-activation QS4CX FC that lands on the host (e.g. NNTR_ENGINE=cpu,
+    // or a GPU path that bails) would otherwise kill the process with
+    // "unsupported datatype". Route the CANONICAL x86 QS4CX GEMM -- the same
+    // gemm_qai8dxp_qsi4cxp_rhs_unpacked(is_nxk=true) entry point
+    // FloatTensor::dotQs4cx uses -- with the activation widened to fp32 and the
+    // fp32 result narrowed back to fp16. There is deliberately NO nibble decode
+    // here: the plain QS4CX payload is [N][ceil(K/2)] row-major with K
+    // contiguous, even k in the LOW nibble, each stored uint4 = int4 + 8, and
+    // the per-output-channel fp32 scales appended at QS4CX_Tensor::getScale --
+    // a layout that already has exactly one decoder per backend (host:
+    // __fallback_matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx; GPU:
+    // make_v8c_weight_backing_from_qs4cx). Duplicating it here is what made
+    // every host QS4CX FC produce garbage.
+    //
+    // Work split: one canonical call per (row, N-chunk), parallel over the
+    // chunks. The kernel re-quantizes the row (K work per nb*K of GEMM) on
+    // every chunk -- the per-row scale/offset depends on the row alone, so the
+    // result is chunk-count independent -- and the fp32 staging stays at
+    // `chunk` floats per worker instead of M*N (the untied lm_head is
+    // N = 262144).
+    const unsigned int M = getDim().height();
+    const unsigned int K = getDim().width();
+    const unsigned int N = output.getDim().width();
+    const uint8_t *plain = input.getData<uint8_t>();
+    const float *fscale = input.getScale<float>();
+    const _FP16 *xact = (const _FP16 *)getData();
+    _FP16 *yout = output.getData<_FP16>();
+    const size_t Ms = M, Ns = N, Ks = K;
+    const size_t plain_row_bytes = (Ks + 1) / 2;
+    // The canonical GEMM takes an fp32 lhs (it does its own per-row dynamic
+    // int8 quantization, as the QS4CX weight format requires).
+    std::vector<float> xact_f32(Ms * Ks);
+    for (size_t i = 0; i < Ms * Ks; ++i)
+      xact_f32[i] = (float)xact[i];
+    const unsigned int nthreads =
+      std::max(1u, std::thread::hardware_concurrency());
+    std::atomic<size_t> next_n{0};
+    const size_t chunk = 256;
+    auto worker = [&]() {
+      std::vector<float> acc(chunk);
+      for (;;) {
+        const size_t n0 = next_n.fetch_add(chunk);
+        if (n0 >= Ns)
+          return;
+        const size_t n1 = std::min(Ns, n0 + chunk);
+        const size_t nb = n1 - n0;
+        for (size_t mi = 0; mi < Ms; ++mi) {
+          gemm_qai8dxp_qsi4cxp_rhs_unpacked(
+            1, nb, Ks, (void *)(xact_f32.data() + mi * Ks),
+            (void *)const_cast<uint8_t *>(plain + n0 * plain_row_bytes),
+            (void *)const_cast<float *>(fscale + n0), acc.data(), 0, true,
+            -65504.f, 65504.f);
+          _FP16 *yr = yout + mi * Ns;
+          for (size_t j = 0; j < nb; ++j)
+            yr[n0 + j] = (_FP16)acc[j];
+        }
+      }
+    };
+    std::vector<std::thread> pool;
+    for (unsigned int t = 0; t < nthreads; ++t)
+      pool.emplace_back(worker);
+    for (auto &t : pool)
+      t.join();
+    break;
+  }
+#endif
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
