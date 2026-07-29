@@ -31,6 +31,7 @@
 #include <layer.h>
 #include <layer_devel.h>
 #include <mem_allocator.h>
+#include <model_features.h>
 #include <optimizer.h>
 #include <optimizer_devel.h>
 
@@ -142,14 +143,24 @@ inline const char *toString(GemmPath p) {
  *        decision site reads it, so it is byte-identical.
  *
  *        Only cleanly caps-derivable cells are resolved here. Cells that are
- * NOT a pure function of caps stay env overrides for now and are NOT shadowed:
- *        - kv_backing (Adreno image2d vs Intel cl_mem buffer) — both advertise
- *          image2d; the split is the NEO "cannot compile read_imageui" quirk,
- *          which has no probe. (NNTR_V8C_BUF / NNTR_KV_IMG_ATTN)
- *        - queue sync (NNTR_XE3_SYNC) — a new-ISA coherence regression; wrong ⇒
- *          garbage, so it stays a conservative override.
+ *        NOT a pure function of caps stay env overrides for now and are NOT
+ *        shadowed:
+ *        - kv_backing (image2d vs cl_mem buffer) — both kinds of device
+ *          advertise image2d; the split is a compiler quirk (one vendor's
+ *          driver rejects the integer-coordinate read_imageui kernel), which
+ *          has no direct probe and is derived from the vendor id instead.
+ *        - the SVM coherence drain — a coherence regression whose failure mode
+ *          is wrong output, so it stays a conservative decision. It does have
+ *          a probe (the device's fine-grain-SVM capability), and is the first
+ *          cell scheduled to become resolver-authoritative.
  *        Model-dependent cells (head_dim attention path, KV-share/skip-prefill)
- *        arrive with ModelFeatures (T11).
+ *        arrive with ModelFeatures.
+ *
+ *        Plan ownership: once the resolver is authoritative, the resolved
+ *        ExecPlan belongs to the compiled MODEL (one plan per model instance,
+ *        resolved at compile from that model's ModelFeatures); a Context owns
+ *        only its DeviceCaps. Two models in one process then get two plans
+ *        over one caps.
  */
 struct ExecPlan {
   GemmPath gemm_path = GemmPath::CPU;
@@ -186,74 +197,6 @@ inline ExecPlan resolveExecPlan(const DeviceCaps &c) {
     p.gemm_path = GemmPath::CPU;
   return p;
 }
-
-/** @brief MLP kind a model uses (the gate activation). */
-enum class MlpKind { SWIGLU, GEGLU };
-/** @brief Transformer-block normalization placement. */
-enum class NormStyle { PRE, SANDWICH };
-/** @brief LM-head weight scheme. */
-enum class LmHeadKind { TIED, UNTIED_QINT4 };
-
-inline const char *toString(MlpKind k) {
-  return k == MlpKind::SWIGLU ? "swiglu" : "geglu";
-}
-inline const char *toString(NormStyle s) {
-  return s == NormStyle::SANDWICH ? "sandwich" : "pre";
-}
-inline const char *toString(LmHeadKind k) {
-  return k == LmHeadKind::UNTIED_QINT4 ? "untied_qint4" : "tied";
-}
-
-/**
- * @struct ModelFeatures
- * @brief What the model IS, declared by the model itself (NOT inferred from a
- *        model-name/`is_gemma2` proxy). This is the other half of the resolver
- *        input: `ModelFeatures × DeviceCaps → ExecPlan`. Fields are attributes
- *        (independent feature combos), so a new model is "set the flags" with
- * no backend edit. Currently consumed only by the SHADOW matcher overload below
- * (log-only, byte-identical). docs/ARCHITECTURE_REFACTOR.md §10 T11.
- */
-struct ModelFeatures {
-  bool has_qk_norm = false; /**< per-head q/k RMSNorm (qwen3, gemma4) */
-  bool has_v_norm = false;  /**< gamma-free v-norm (gemma4) */
-  MlpKind mlp_kind = MlpKind::SWIGLU;
-  NormStyle norm_style = NormStyle::PRE;
-  bool sliding_window = false; /**< any sliding-window attention layers */
-  bool kv_share_skip_prefill =
-    false;                    /**< KV-shared layers skip prefill (gemma4) */
-  bool dual_head_dim = false; /**< two head_dims (gemma4 sliding/global) */
-  bool ple = false;           /**< per-layer input embedding (gemma4) */
-  bool attn_softcap = false;  /**< QK logit soft-cap (gemma2/gemma4) */
-  bool final_softcap = false; /**< final-logit soft-cap */
-  LmHeadKind lmhead_kind = LmHeadKind::TIED;
-  bool decode_gpu = false;      /**< GPU attn + OHWI-rope at decode (off for
-                                     d=128); drives gpu_decode_attn /
-                                     gpu_ohwi_rope on the attention layer */
-  bool decode_rope_gpu = false; /**< GPU decode-RoPE (a strict subset of
-                                     decode_gpu: gemma2 diverges, so attn=GPU
-                                     but rope=HOST); drives gpu_decode_rope */
-  unsigned int head_dim = 0;    /**< attention head dim (0 = derive) */
-
-  /**
-   * @brief One-line dump for the shadow log.
-   */
-  std::string toString() const {
-    std::ostringstream os;
-    os << "ModelFeatures{qk_norm=" << has_qk_norm << ", v_norm=" << has_v_norm
-       << ", mlp=" << nntrainer::toString(mlp_kind)
-       << ", norm=" << nntrainer::toString(norm_style)
-       << ", sliding=" << sliding_window
-       << ", kv_share=" << kv_share_skip_prefill
-       << ", dual_head_dim=" << dual_head_dim << ", ple=" << ple
-       << ", attn_softcap=" << attn_softcap
-       << ", final_softcap=" << final_softcap
-       << ", lmhead=" << nntrainer::toString(lmhead_kind)
-       << ", decode_gpu=" << decode_gpu
-       << ", decode_rope_gpu=" << decode_rope_gpu << ", head_dim=" << head_dim
-       << "}";
-    return os.str();
-  }
-};
 
 /**
  * @brief The matcher: resolve the ExecPlan from device caps AND the model's
