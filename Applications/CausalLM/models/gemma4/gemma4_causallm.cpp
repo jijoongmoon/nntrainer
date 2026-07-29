@@ -620,6 +620,12 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   // No engine= on "mha_core": it is registered on the cpu context only, and it
   // selects its own GPU kernels internally per path rather than from the node's
   // engine.
+  // use_gemm_attention (default true; "use_flash_attention": false in
+  // nntr_config.json disables it, like every other model) routes
+  // prefill onto the GPU flash path. The flash kernel handles d=256 sliding
+  // (window mask) + GQA; the d=512 full layers fail the VPL<=8 check and fall
+  // back to the (x86-FP16-Q-safe) CPU gemm_attention. Without this flag prefill
+  // attention runs entirely on the slow per-row host path (~222 TPS @ M=1024).
   std::vector<std::string> a_params = {
     withKey("name", A),
     withKey("num_heads", n_heads),
@@ -775,6 +781,12 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   // Attention core receives [Q_norm, K_norm, V_norm]. No engine=: same reason
   // as createSharedAttention -- "mha_core" is a cpu-context-only type that
   // dispatches its own GPU work.
+  // use_gemm_attention (default true; "use_flash_attention": false in
+  // nntr_config.json disables it, like every other model) routes
+  // prefill onto the GPU flash path. The flash kernel handles d=256 sliding
+  // (window mask) + GQA; the d=512 full layers fail the VPL<=8 check and fall
+  // back to the (x86-FP16-Q-safe) CPU gemm_attention. Without this flag prefill
+  // attention runs entirely on the slow per-row host path (~222 TPS @ M=1024).
   std::vector<std::string> a_params = {
     withKey("name", A),
     withKey("num_heads", n_heads),
