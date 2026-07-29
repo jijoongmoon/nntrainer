@@ -28,14 +28,17 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
     skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
 
-  // gamma is unquantized and stored as FP32 in the bin. Request it as FP32
-  // regardless of the activation dtype; declaring it FP16 reinterprets the
-  // on-disk FP32 bytes as FP16 and corrupts gamma (≈FP16-max garbage). The
-  // FP16 forward path casts gamma down to FP16 at the multiply site.
+  // gamma follows the model weight dtype (packed=false clamps it to the
+  // activation dtype). Quantized *-FP16 bins store the norm weights as FP16;
+  // hardcoding FP32 here positionally misloads every weight after the first
+  // gamma AND overruns the mmap'd file by 2 bytes/element (SIGSEGV in the
+  // parallel load worker). The multiply site carries a dtype-cast guard, so
+  // FP32-gamma bins (upstream's own layout) still load when the model weight
+  // dtype is FP32.
   nntrainer::TensorDim gamma_dim(
     1, 1, 1, dim[0].width(),
     nntrainer::TensorDim::TensorType(context.getFormat(),
-                                     nntrainer::TensorDim::DataType::FP32));
+                                     context.getWeightDataType()));
   wt_idx[RMSParams::gamma] = context.requestWeight(
     gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
     nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
