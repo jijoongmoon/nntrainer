@@ -448,11 +448,7 @@ ClContext::registerClKernel(const std::string &kernel_string,
       const char *r = std::getenv("NNTR_CL_KERNEL_RING");
       if (r)
         return std::max(1, std::atoi(r));
-      // Default-on: the ring fixes a measured token-altering re-bind hazard at
-      // ~zero cost (program cache makes the clones cheap). NNTR_DETERMINISTIC=0
-      // opts out to the legacy singleton.
-      const char *d = std::getenv("NNTR_DETERMINISTIC");
-      return (d && d[0] == '0') ? 1 : 8;
+      return 8;
     }();
     if (ring_k > 1) {
       static std::unordered_map<
