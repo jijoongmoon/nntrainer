@@ -187,6 +187,22 @@ public:
   }
 
   /**
+   * @brief getter of the number of graph input (source) nodes, i.e. nodes
+   * with no incoming connections
+   * @retval number of input nodes
+   */
+  unsigned int getNumInputNodes() const { return graph.getNumInputNodes(); }
+
+  /**
+   * @brief getter of a graph input (source) node with index number
+   * @param[in] idx index of the input node
+   * @retval LayerNode
+   */
+  std::shared_ptr<LayerNode> getInputLayerNode(unsigned int idx) const {
+    return std::static_pointer_cast<LayerNode>(graph.getInputNode(idx));
+  }
+
+  /**
    * @brief getter all the layer nodes in the model
    * @retval Layer nodes
    * @note these layer nodes will be in sorted order if the model is compiled,
