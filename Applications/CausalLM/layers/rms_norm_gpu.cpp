@@ -355,10 +355,9 @@ void RMSNormLayerGPU::incremental_forwarding(
 
   // Try the fused-rmsq path first (paper §3.6 #2): it writes int8 +
   // scale + zp + row_sum into pool backings keyed by
-  // ptr:<out_host>:fused_{i8,scale,zp,rs}. The v8c FC consumer
-  // (NNTR_V8C_CONSUME_FUSED_RMSQ=1) picks those up directly,
-  // bypassing the rmsnorm→FC fp32 boundary. Falls back to plain
-  // GPU rmsnorm or host rmsnorm depending on env.
+  // ptr:<out_host>:fused_{i8,scale,zp,rs}. A v8c FC consumer picks
+  // those up directly, bypassing the rmsnorm→FC fp32 boundary. Falls back to
+  // plain GPU rmsnorm or host rmsnorm depending on env.
   for (unsigned int b = 0; b < b_size; ++b) {
     // Sliced views: in and out are shared with the parent at offset
     // b * featureLen. Operate on the raw float* with explicit offsets
