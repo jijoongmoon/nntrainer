@@ -12,6 +12,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstring>
 
 #include "cpu_backend.h"
 #include "fp16.h"
@@ -180,6 +181,175 @@ int Int4Utils::convertInt4ToInt(const uint8_t int4_value) {
                          -8, -7, -6, -5, -4, -3, -2, -1};
 
   return lookup[int4_value];
+}
+
+void Int4Utils::quantizePlain(const float *weights, const size_t rows_count,
+                              const size_t columns_count,
+                              std::vector<uint8_t> &out_plain_nibbles,
+                              std::vector<uint16_t> &out_scales) {
+  std::vector<float> scales_fp32(rows_count);
+  out_scales.resize(rows_count);
+  for (size_t n = 0; n < rows_count; ++n) {
+    scales_fp32[n] =
+      computeScaleForGroup(weights + n * columns_count, columns_count);
+    out_scales[n] = compute_fp32_to_fp16(scales_fp32[n]);
+  }
+
+  // Build raw nibble matrix in N x roundup(K,2)/2 bytes. Each nibble holds
+  // uint4 = int4 + 8 (the rhs_zero_point=8 input form expected by
+  // kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0).
+  const size_t rhs_row_bytes = (columns_count + 1) / 2;
+  out_plain_nibbles.assign(rows_count * rhs_row_bytes, 0u);
+  for (size_t n = 0; n < rows_count; ++n) {
+    for (size_t k = 0; k < columns_count; k += 2) {
+      const uint8_t u0 =
+        quantizeToInt4(weights[n * columns_count + k], scales_fp32[n]);
+      uint8_t byte = (uint8_t)((u0 + 8) & 0x0F);
+      if (k + 1 < columns_count) {
+        const uint8_t u1 =
+          quantizeToInt4(weights[n * columns_count + k + 1], scales_fp32[n]);
+        byte |= (uint8_t)(((u1 + 8) & 0x0F) << 4);
+      } else {
+        byte |= (uint8_t)(8u << 4); // pad nibble = uint4(0)
+      }
+      out_plain_nibbles[n * rhs_row_bytes + (k / 2)] = byte;
+    }
+  }
+}
+
+void Int4Utils::packPlainToSectionA(const uint8_t *plain_nibbles,
+                                    size_t rows_count, size_t columns_count,
+                                    uint8_t *out_section_a) {
+  const uint8_t *raw_nibbles = plain_nibbles;
+  const size_t rhs_row_bytes = (columns_count + 1) / 2;
+  const size_t k_internal =
+    ((columns_count + KAI_K_PAD_MULTIPLE - 1) / KAI_K_PAD_MULTIPLE) *
+    KAI_K_PAD_MULTIPLE;
+  const size_t super_row_count = (rows_count + KAI_NR - 1) / KAI_NR;
+  const size_t nibble_bytes_per_super_row = KAI_NR * (k_internal / 2);
+  const size_t block_length_in_bytes = KAI_KR / KAI_SR; // = 8
+  const uint8_t pad_byte = (uint8_t)(8u | (8u << 4));   // uint4(0)|uint4(0)
+
+  for (size_t dst_row_idx = 0; dst_row_idx < super_row_count; ++dst_row_idx) {
+    uint8_t *dst_row = out_section_a + dst_row_idx * nibble_bytes_per_super_row;
+
+    for (size_t dst_byte_idx = 0; dst_byte_idx < nibble_bytes_per_super_row;
+         ++dst_byte_idx) {
+      const size_t block_idx = dst_byte_idx / block_length_in_bytes;
+      const size_t block_byte_idx = dst_byte_idx % block_length_in_bytes;
+      const size_t super_block_idx = block_idx / KAI_NR;
+      const size_t nr_idx = block_idx % KAI_NR;
+
+      const size_t k_adjustment =
+        ((block_byte_idx + super_block_idx * block_length_in_bytes) /
+         KAI_K_INTERLEAVE) *
+        KAI_K_INTERLEAVE;
+      const size_t k0_idx =
+        block_byte_idx + super_block_idx * block_length_in_bytes + k_adjustment;
+      const size_t k1_idx = k0_idx + KAI_K_INTERLEAVE;
+      const size_t n0_idx = dst_row_idx * KAI_NR + nr_idx;
+      const size_t n0_valid_idx =
+        (n0_idx < rows_count) ? n0_idx : (rows_count - 1);
+
+      uint8_t byte0 = pad_byte;
+      uint8_t byte1 = pad_byte;
+      if (k0_idx < columns_count) {
+        byte0 = raw_nibbles[n0_valid_idx * rhs_row_bytes + (k0_idx / 2)];
+      }
+      if (k1_idx < columns_count) {
+        byte1 = raw_nibbles[n0_valid_idx * rhs_row_bytes + (k1_idx / 2)];
+      }
+      const size_t shift_right_x0 = (k0_idx % 2) * 4;
+      const size_t shift_right_x1 = (k1_idx % 2) * 4;
+      const uint8_t src_x0_lo = (uint8_t)((byte0 >> shift_right_x0) & 0x0F);
+      const uint8_t src_x0_hi = (uint8_t)((byte1 >> shift_right_x1) & 0x0F);
+      const uint8_t dst_qs0 = (uint8_t)(src_x0_lo | (src_x0_hi << 4));
+      *dst_row = (uint8_t)(dst_qs0 ^ 0x88);
+      ++dst_row;
+    }
+  }
+}
+
+void Int4Utils::quantizeAndPackKai(const float *weights,
+                                   const size_t rows_count,
+                                   const size_t columns_count,
+                                   std::vector<uint8_t> &out_weights,
+                                   std::vector<uint16_t> &out_scales) {
+  std::vector<uint8_t> plain_nibbles;
+  quantizePlain(weights, rows_count, columns_count, plain_nibbles, out_scales);
+  out_weights.assign(kaiNibblePayloadBytes(rows_count, columns_count), 0u);
+  packPlainToSectionA(plain_nibbles.data(), rows_count, columns_count,
+                      out_weights.data());
+}
+
+size_t Int4Utils::kaiNibblePayloadBytes(size_t rows_count,
+                                        size_t columns_count) {
+  const size_t k_internal =
+    ((columns_count + KAI_K_PAD_MULTIPLE - 1) / KAI_K_PAD_MULTIPLE) *
+    KAI_K_PAD_MULTIPLE;
+  const size_t super_row_count = (rows_count + KAI_NR - 1) / KAI_NR;
+  return super_row_count * KAI_NR * (k_internal / 2);
+}
+
+void Int4Utils::assembleKaiRhsPacked(const uint8_t *section_a,
+                                     const uint16_t *fp16_scales,
+                                     size_t rows_count, size_t columns_count,
+                                     std::vector<uint8_t> &out_kai_packed) {
+  const size_t k_internal =
+    ((columns_count + KAI_K_PAD_MULTIPLE - 1) / KAI_K_PAD_MULTIPLE) *
+    KAI_K_PAD_MULTIPLE;
+  const size_t super_row_count = (rows_count + KAI_NR - 1) / KAI_NR;
+  const size_t nibble_bytes_per_super_row = KAI_NR * (k_internal / 2);
+  const size_t trailer_bytes_per_super_row = KAI_NR * (4 + 4 + 4);
+  const size_t super_row_stride =
+    nibble_bytes_per_super_row + trailer_bytes_per_super_row;
+
+  out_kai_packed.assign(super_row_count * super_row_stride, 0u);
+
+  const size_t block_length_in_bytes = KAI_KR / KAI_SR; // = 8
+
+  for (size_t sr_idx = 0; sr_idx < super_row_count; ++sr_idx) {
+    uint8_t *dst_row = out_kai_packed.data() + sr_idx * super_row_stride;
+    const uint8_t *src_row = section_a + sr_idx * nibble_bytes_per_super_row;
+
+    // Nibbles are byte-identical to Section A on disk — just copy them.
+    std::memcpy(dst_row, src_row, nibble_bytes_per_super_row);
+
+    // Per-channel sums = sum_k int4[n][k] * 16. Decode each Section A byte
+    // back to two int4 lanes via XOR 0x88 -> uint4 -> int4 = uint4 - 8.
+    int32_t sums[KAI_NR] = {0, 0, 0, 0};
+    for (size_t dst_byte_idx = 0; dst_byte_idx < nibble_bytes_per_super_row;
+         ++dst_byte_idx) {
+      const size_t block_idx = dst_byte_idx / block_length_in_bytes;
+      const size_t nr_idx = block_idx % KAI_NR;
+
+      const uint8_t stored = src_row[dst_byte_idx] ^ 0x88;
+      const int u_lo = stored & 0x0F;
+      const int u_hi = (stored >> 4) & 0x0F;
+      // Both nibbles belong to the same n0 (= sr_idx * KAI_NR + nr_idx) —
+      // the K interleave shuffles k0/k1 within the same channel.
+      sums[nr_idx] += (u_lo - 8) + (u_hi - 8);
+    }
+
+    int32_t *sums_dst = (int32_t *)(dst_row + nibble_bytes_per_super_row);
+    for (size_t i = 0; i < KAI_NR; ++i) {
+      sums_dst[i] = sums[i] * 16;
+    }
+
+    // Scales: per-channel fp16 -> fp32 -> baked × 0.0625 (matches KAI
+    // packer line 212).
+    float *scales_dst = (float *)(dst_row + nibble_bytes_per_super_row +
+                                  KAI_NR * sizeof(int32_t));
+    for (size_t i = 0; i < KAI_NR; ++i) {
+      const size_t n_idx = std::min(sr_idx * KAI_NR + i, rows_count - 1);
+      const float s = compute_fp16_to_fp32(fp16_scales[n_idx]);
+      scales_dst[i] = s * 0.0625F;
+    }
+
+    // Bias: always zero for FC int4 weights — the bias tensor (if any) is
+    // a separate FP16 weight that the layer adds outside this matmul.
+    // 4 floats already memset to 0 by assign(.., 0u).
+  }
 }
 
 void Int4Utils::dequantizePacked(const std::vector<uint8_t> &weights,
