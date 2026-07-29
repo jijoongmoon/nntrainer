@@ -1666,8 +1666,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   static bool xmx_gate_logged = false;
   if (!xmx_gate_logged) {
     xmx_gate_logged = true;
-    const bool gate =
-      xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0;
+    const bool gate = xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 &&
+                      (K % 64) == 0 && K >= 128;
     // Quiet by default (SDK surface): always report the surprising case
     // (XMX requested but gated OFF = silent perf loss), the rest only
     // under NNTR_GPU_VERBOSE.
@@ -1679,7 +1679,14 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
               (int)buf_kernel, M, N, K, (int)gate,
               gate ? "" : " (XMX skipped -> dp4a)");
   }
-  if (xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0) {
+  // K >= 128: the weight read is issued as a 2D block read with
+  // base_width = base_pitch = K/2 bytes, and the block-io extension leaves
+  // behaviour undefined below a 64-byte width. K % 64 == 0 alone admits
+  // K == 64 -> 32 bytes. At K >= 128, K/2 >= 64 clears the width minimum and
+  // K % 64 == 0 already makes K/2 a multiple of 32, clearing the pitch rule.
+  // Narrower shapes fall through to dp4a: correct, just slower.
+  if (xmx_fc && M > 4 && buf_kernel && (N % 64) == 0 && (K % 64) == 0 &&
+      K >= 128) {
     // Shape-adaptive tile. The microbench's NT=4/SG_M=1 (tuned for the square
     // N=K=4096 case) badly underutilizes the real FC shapes: NT=2 is broadly
     // best, and SG_M (subgroups stacked along M, re-using the fetched N-block
