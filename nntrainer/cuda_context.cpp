@@ -22,6 +22,7 @@
 #include <fc_layer_cl.h>
 #include <geglu_layer.h>
 #include <logit_softcapping.h>
+#include <rms_norm_layer.h>
 #include <scalar_multiply.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
@@ -109,6 +110,13 @@ void CudaContext::add_default_object() {
   // the host-coherent UVM tensors (do NOT use the OpenCL AdditionLayerCL).
   registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
                   ml::train::LayerType::LAYER_ADDITION);
+  // rms_norm: the backend-neutral RMSNormLayer dispatches via
+  // CudaComputeOps::rms_norm — the fp16 device kernel for decode-sized row
+  // counts, else this backend's fused host fallback. Both halves accumulate
+  // the sum of squares in FP32 (an fp16 activation with a large residual
+  // element squares past the fp16 max -> the row zeroes -> garbage).
+  registerFactory(nntrainer::createLayer<RMSNormLayer>, RMSNormLayer::type,
+                  ml::train::LayerType::LAYER_RMSNORM);
   // geglu: the backend-neutral GeGLULayer dispatches via the installed table;
   // no CUDA geglu override exists at this change, so it resolves to the
   // inherited CpuComputeOps host body on UVM.
