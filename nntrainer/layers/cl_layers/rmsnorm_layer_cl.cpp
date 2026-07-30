@@ -229,9 +229,16 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
 void RMSNormLayerCl::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
                                             bool training) {
-  // Gemma4 KV-shared layers skip compute during prefill (from==0); the live
-  // token is recomputed at decode. Matches the CPU layers' skip_prefill.
-  if (skip_prefill && from == 0)
+  // KV-shared layers skip compute during prefill; the live token is recomputed
+  // at decode. A prefill step is any multi-position step, not just the one
+  // starting at 0: chunked prefill issues later chunks with from > 0 and
+  // (to - from) > 1. Use the same predicate as the CPU layers
+  // (fc_layer.cpp / addition_layer.cpp) so every skip_prefill layer agrees on
+  // what prefill is -- otherwise this layer computes a chunk the rest of the
+  // graph skipped, and the (to - from) != 1 guard below throws
+  // "incremental step size is not 1" on that chunk.
+  bool is_prefill = !from || (to - from) > 1;
+  if (skip_prefill && is_prefill)
     return;
   Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
