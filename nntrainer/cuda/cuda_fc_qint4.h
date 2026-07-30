@@ -117,8 +117,22 @@ bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
  * @brief [pool-bypass] True when the dp4a derived cache exists for this
  *        plain pointer -- dispatch may then treat the pointer as a pure key
  *        (no device access, no staging needed).
+ * @note DP4A ONLY. The cuBLAS-i8 [K,N] cache is a separate map with its own
+ *       existence condition, so a true here does NOT license the i8 path to
+ *       assume a hit: on a miss that path binds the payload into
+ *       repack_plain_i8_kn, and it therefore checks device-readability itself
+ *       before building (and reports failure so the caller falls to dp4a).
  */
 bool cuda_fc_qs4cx_has_cache(const unsigned char *plain_w);
+
+/**
+ * @brief [pool-bypass] True once cuda_fc_qs4cx_drop_plain_pages() has actually
+ *        discarded this payload's pages. Reading those bytes afterwards yields
+ *        zero-filled pages, so any path that would dereference the payload --
+ *        the naive plain GEMM, or the host dot() fallback -- must refuse rather
+ *        than compute against zeros.
+ */
+bool cuda_fc_qs4cx_plain_dropped(const unsigned char *plain_w);
 
 /**
  * @brief Build the dp4a derived weight cache (packed int4 + rowsum) for one
