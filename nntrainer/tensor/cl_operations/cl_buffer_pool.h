@@ -80,11 +80,11 @@ public:
   /**
    * @brief Get the allocated memory for token idx. Returns the SVM-backed
    *        MemoryData (so not-yet-converted consumers stay byte-identical) AND
-   *        stamps its device_mem with a clCreateSubBuffer slice of the cl_mem
-   *        plane at the tensor's base-addr-aligned offset. Stage S1: the
-   *        sub-buffer is the per-tensor cl_mem a GPU producer writes and a GPU
-   *        consumer binds; until a consumer reads device_mem (gated separately)
-   *        this is inert and the output stays byte-identical.
+   *        stamps its device_mem with the cl_mem allocated for the tensor's
+   *        planner offset. That buffer is the per-tensor cl_mem a GPU producer
+   *        writes and a GPU consumer binds; until a consumer reads device_mem
+   *        (gated separately) this is inert and the output stays
+   *        byte-identical.
    */
   std::shared_ptr<MemoryData> getMemory(unsigned int idx) override;
 
@@ -124,24 +124,27 @@ public:
 private:
   void *cl_pool_;          /**< single device cl_mem over the planned plane */
   size_t base_addr_align_; /**< CL_DEVICE_MEM_BASE_ADDR_ALIGN, bytes */
-  size_t cl_pool_bytes_;   /**< size of the padded cl_mem plane */
+  size_t cl_pool_bytes_;   /**< extent of the planned cl_mem plane */
   std::vector<size_t>
-    padded_offsets_; /**< per-token offsets rounded up to base_addr_align_ so
-                          clCreateSubBuffer origins are valid (liveness reuse is
-                          preserved: equal planner offsets stay equal) */
+    token_offsets_; /**< per-token planner offset, used verbatim as the
+                         per-buffer identity: equal offsets mean disjoint
+                         lifetimes (share one cl_mem), distinct offsets may be
+                         simultaneously live (must not). Never rounded -- the
+                         planner packs contiguously, so rounding would map
+                         distinct offsets onto one buffer. */
   std::unordered_map<size_t, size_t>
-    offset_maxsize_; /**< padded offset -> max tensor size placed there
-                          (precomputed in allocate so the one shared sub-buffer
+    offset_maxsize_; /**< planner offset -> max tensor size placed there
+                          (precomputed in allocate so the one shared buffer
                           covers the largest tensor reusing that offset) */
   std::unordered_map<size_t, void *>
-    offset_sub_; /**< ONE shared cl_mem sub-buffer per padded offset. Every
-                      token the planner reused at that offset (disjoint
-                      lifetimes) binds the SAME handle, so distinct handles
-                      never alias one region -- distinct handles over a reused
-                      offset break Adreno per-handle image/buffer cache
-                      coherence (measured). Released in deallocate(). */
+    offset_sub_; /**< ONE shared cl_mem per planner offset. Every token the
+                      planner reused at that offset (disjoint lifetimes) binds
+                      the SAME handle, so distinct handles never alias one
+                      region -- distinct handles over a reused offset break
+                      Adreno per-handle image/buffer cache coherence
+                      (measured). Released in deallocate(). */
   std::unordered_set<size_t>
-    zero_filled_; /**< padded offsets already zero-filled (ensureZeroFilled
+    zero_filled_; /**< planner offsets already zero-filled (ensureZeroFilled
                        idempotence) */
   std::unordered_set<unsigned int>
     svm_only_tokens_; /**< tokens classified SVM (never cl_mem-bound); an offset
