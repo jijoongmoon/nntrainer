@@ -167,6 +167,33 @@ public:
   }
 
   /**
+   * @brief Names of every Context the Engine has actually brought up, sorted.
+   *
+   * @details The registry is the only component that knows which backends
+   *          exist in this process: bring-up is conditional (build flags,
+   *          device probes, NNTR_ENGINE / NNTR_CL_EAGER_CTX gates), so the set
+   *          is a runtime fact, not a compile-time one. Callers that need to
+   *          offer something to *every* backend -- a backend-neutral layer
+   *          factory being the motivating case -- must ask for the set instead
+   *          of hard-coding a list of backend names, which is how a backend
+   *          silently loses a layer when it is added or gated off.
+   *
+   *          Sorted so registration order (and therefore auto-assigned
+   *          int_keys) is deterministic and independent of hash order.
+   *
+   * @return sorted registered context names, e.g. {"cpu", "cuda", "gpu"}
+   */
+  std::vector<std::string> getRegisteredContextNames() const {
+    const std::lock_guard<std::mutex> lock(engine_mutex);
+    std::vector<std::string> names;
+    names.reserve(engines.size());
+    for (const auto &e : engines)
+      names.push_back(e.first);
+    std::sort(names.begin(), names.end());
+    return names;
+  }
+
+  /**
    *
    * @brief Parse compute Engine keywords in properties : eg) engine = cpu
    *  default is "cpu"
