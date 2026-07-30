@@ -122,8 +122,10 @@ unsigned int applyTKP(const float *logits, int len, float temperature,
  *         ClComputeOps throws NI for plain CPU BLAS ops. An absent engine prop
  *         already defaults to CPU in LayerNode; this keeps the explicit GPU
  *         default for backward compatibility while making CPU one env away.
- * @throw  std::invalid_argument when NNTR_ENGINE=gpu is requested but this
- *         binary was built without OpenCL support.
+ * @throw  std::invalid_argument when NNTR_ENGINE=gpu or NNTR_ENGINE=cuda is
+ *         requested but this binary was built without the matching backend
+ *         (ENABLE_OPENCL / ENABLE_CUDA). Only an explicit request fails; the
+ *         implicit default still degrades to cpu.
  */
 [[maybe_unused]] static std::string causallm_engine() {
   static const std::string eng = []() -> std::string {
@@ -132,8 +134,23 @@ unsigned int applyTKP(const float *logits, int len, float temperature,
       const std::string s(e);
       if (s == "cpu")
         return "cpu";
-      if (s == "cuda") // additive NVIDIA CUDA backend (engine=cuda)
+      if (s == "cuda") { // additive NVIDIA CUDA backend (engine=cuda)
+#if defined(ENABLE_CUDA)
         return "cuda";
+#else
+        // Explicit CUDA request against a build that has no CUDA backend, so
+        // no "cuda" Context is registered. Returning "cuda" here would defer
+        // the failure to model build, where it surfaces as
+        // "[Engine] cuda Context is not registered" - a message about the
+        // engine registry that reads like a library bug rather than the build
+        // misconfiguration it actually is.
+        throw std::invalid_argument(
+          "NNTR_ENGINE=cuda was requested but this binary was built without "
+          "CUDA support (ENABLE_CUDA is not defined). Rebuild nntrainer with "
+          "-Denable-cuda=true, which is desktop NVIDIA only - the android "
+          "build rejects it - or select NNTR_ENGINE=gpu / NNTR_ENGINE=cpu.");
+#endif
+      }
       if (s == "gpu") {
 #if defined(ENABLE_OPENCL)
         return "gpu";
