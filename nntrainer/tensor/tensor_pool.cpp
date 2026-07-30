@@ -369,7 +369,38 @@ void TensorPool::allocate(bool init) {
   }
 #endif
 
-  mem_pool->allocate();
+  /** Skip the arena-wide fill for the inference weight plane.
+   *
+   * `init == false` reaches here from exactly one call site --
+   * Manager::allocateWeights(_, exec_mode != INFERENCE) -> weight_pool -- so
+   * this is the WEIGHT pool in INFERENCE and nothing else: the activation pool,
+   * the KV cache and every training plane call allocate() with the default
+   * init == true and keep the allocator's calloc contract untouched.
+   *
+   * Every byte of the weight plane is written by NeuralNetwork::load before any
+   * read (a weight the model file does not cover already throws there today),
+   * so the fill is a dead store. On a managed/UVM plane it is worse than a
+   * memset: filling never-touched managed pages makes the driver populate and
+   * migrate the whole arena, which the loader then dirties again from the host.
+   *
+   * Escape hatch: NNTR_WEIGHT_ARENA_ZERO=1 restores the fill. Combined with
+   * NNTR_POISON_FILL=1 it is also the discriminator for this decision: filling
+   * the arena with 0x55 instead of 0x00 must leave the generated output
+   * byte-identical, i.e. nothing reads an arena byte the loader did not write.
+   *
+   * UNION NOTE: the call sits HERE, after the residency pre-pass, and not at
+   * the top of the function where this change was originally written. The
+   * pre-pass has to hand the ClBufferPool its SVM-only token set BEFORE the
+   * pool allocates its device cl_mem plane, so moving the allocate() back up
+   * would silently disable the cl_mem skip. Only the zero-fill argument is
+   * this change's business; the placement belongs to the residency plane.
+   */
+  static const bool force_arena_zero = nntr_env_on("NNTR_WEIGHT_ARENA_ZERO");
+  const bool arena_zero = init || force_arena_zero;
+  mem_pool->allocate(arena_zero);
+  if (!arena_zero)
+    ml_logd("TensorPool::allocate: weight-arena zero-fill SKIPPED (%zu B)",
+            minMemoryRequirement());
 
   /** set the pointers using the token for all the tensors */
   for (auto &spec : pool) {
