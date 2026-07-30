@@ -431,6 +431,7 @@ void Lfm2CausalLM::run(const WSTR prompt, bool do_sample,
   if (log_output)
     std::cout << full_prompt << std::endl;
 
+  ensureTokenizer(); // join the async tokenizer build before use
   auto token_ids = tokenizer->Encode(full_prompt);
 
   // Clamp to INIT_SEQ_LEN (the model's prefill capacity)
@@ -473,6 +474,11 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
       "run_with_embeddings() requires USE_EMBEDDING=true. "
       "Set use_embedding=true in nntr_config.");
   }
+
+  // This entry point takes pre-computed embeddings, so it never calls Encode --
+  // but registerOutputs() below still Decodes through the tokenizer, so the
+  // join belongs here too and not only in run().
+  ensureTokenizer();
 
   const auto *embeds = static_cast<const float *>(inputs_embeds);
   const unsigned int input_len = static_cast<unsigned int>(n_tokens);
