@@ -29,6 +29,8 @@
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_rmsnorm.h>
 #include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#include <nntrainer_error.h>
 #endif
 
 namespace causallm {
@@ -271,6 +273,41 @@ void ReshapedRMSNormLayer::incremental_forwarding(
 #endif
 
     if (!gpu_done) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // The fallback below is host math over raw operand pointers. That is
+      // fine on UVM, and a SIGSEGV on the device-only activation pool
+      // NNTR_CUDA_DEV_ACT installs (auto-armed on a discrete GPU with
+      // concurrentManagedAccess). Unlike the per_layer_slice fallback -- a
+      // pure copy, which a copy engine can carry out in place -- there is no
+      // way to run rms_norm_wrt_width_*_intrinsic and Tensor::multiply_i on
+      // memory the CPU cannot address, so report the contract violation by
+      // name instead of faulting four frames deep in the intrinsic.
+      //
+      // This becomes unreachable when the norm goes through
+      // ComputeOps::rms_norm on every backend (the promotion this layer is
+      // already slated for): a whole-op has a device implementation to fall
+      // back TO, which is the entire point of the op table.
+      {
+        auto host_unreachable = [](const void *p) {
+          if (p == nullptr)
+            return false;
+          cudaPointerAttributes a{};
+          const bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess;
+          cudaGetLastError();
+          return ok && a.type == cudaMemoryTypeDevice;
+        };
+        nntrainer::cuda::StreamManager::Global().finishIfAsync();
+        const void *ip = in_step.getData<char>();
+        const void *op = out_step.getData<char>();
+        NNTR_THROW_IF(host_unreachable(ip) || host_unreachable(op),
+                      std::runtime_error)
+          << "[reshaped_rms_norm] the host fallback cannot run on a "
+             "device-only activation pool. The device path was declined "
+             "(NNTR_CUDA_QKNORM off, a non-FP16 activation, or a gamma this "
+             "kernel cannot bind). Re-run with NNTR_CUDA_DEV_ACT=0 "
+             "NNTR_CUDA_ASYNC=0 for a host-coherent pool.";
+      }
+#endif
 #if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
       // Coherent SVM hand-off for a GPU-produced FP16 input read on the host
       // (Gemma4's gamma-free v_norm is what reaches this in an FP16 graph): a
