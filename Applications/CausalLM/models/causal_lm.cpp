@@ -80,6 +80,10 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
     output_list.push_back("");
 
   // allocate memory for the internal buffer
+  // Row stride is MAX_SEQ_LEN, so every ids_history[b * MAX_SEQ_LEN + pos]
+  // write needs pos < MAX_SEQ_LEN. Transformer::setupParameters keeps
+  // NUM_TO_GENERATE inside [0, MAX_SEQ_LEN) for decoders, and run() caps the
+  // generation loop at the window on top of that.
   ids_history = (unsigned int *)malloc(static_cast<size_t>(BATCH_SIZE) *
                                        MAX_SEQ_LEN * sizeof(unsigned int));
 
@@ -435,7 +439,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   std::vector<int64_t> init_input;
   unsigned int _len = _input.size();
-  unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
+  // Transformer::setupParameters keeps NUM_TO_GENERATE inside
+  // [0, MAX_SEQ_LEN) for decoders on every call, so this reservation is at
+  // most MAX_SEQ_LEN - 1. Spell the subtraction out in a form that cannot wrap
+  // anyway: MAX_SEQ_LEN is unsigned, so a budget at or above the window would
+  // otherwise turn the prompt budget into ~4e9, skip the truncation below and
+  // write the prompt past the ids_history row stride.
+  const unsigned int reserved_for_generation =
+    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u;
+  unsigned int num_allow_str = MAX_SEQ_LEN > reserved_for_generation
+                                 ? MAX_SEQ_LEN - reserved_for_generation
+                                 : 0u;
   unsigned int text_len = _len;
 
   if (_len > num_allow_str) {
@@ -614,8 +628,24 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   auto start_generation = std::chrono::high_resolution_clock::now();
 
-  for (unsigned int token_generation_idx = input_len + 1;
-       token_generation_idx < input_len + 1 + NUM_TO_GENERATE &&
+  // registerOutputs() writes ids_history[b * MAX_SEQ_LEN + idx] with no bounds
+  // check, so the loop index has to stay inside the row stride the buffer was
+  // allocated with. A budget that fits the window is not enough on its own: the
+  // loop starts one past input_len, and input_len carries SYS_PROMP_LEN (added
+  // just above) on top of the already-truncated prompt, so
+  // input_len + NUM_TO_GENERATE can still reach MAX_SEQ_LEN. Derive the end
+  // from the window too and stop at whichever comes first.
+  const unsigned int generation_budget =
+    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u;
+  const unsigned int generation_begin = input_len + 1;
+  const unsigned int generation_end =
+    generation_begin < MAX_SEQ_LEN
+      ? generation_begin +
+          std::min(MAX_SEQ_LEN - generation_begin, generation_budget)
+      : generation_begin;
+
+  for (unsigned int token_generation_idx = generation_begin;
+       token_generation_idx < generation_end &&
        !stop_requested_.load(std::memory_order_acquire);
        ++token_generation_idx) {
 

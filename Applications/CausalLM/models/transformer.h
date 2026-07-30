@@ -382,6 +382,15 @@ protected:
   float EMBEDDING_SCALE = 1.0f;
   int GQA_SIZE;
 
+  /**
+   * @brief Role this model plays, as passed by the most-derived constructor
+   *        and cross-checked against nntr_config's model_type
+   * @note  Set before setupParameters() runs, and unaffected by later
+   *        setupParameters() calls, so config parsing can key decoder-only
+   *        behaviour off it.
+   */
+  ModelType MODEL_TYPE = ModelType::MODEL;
+
   unsigned int BATCH_SIZE;              /**< Batch size for the model */
   unsigned int INIT_SEQ_LEN;            /**< Initial sequence length */
   unsigned int MAX_POSITION_EMBEDDINGS; /**< max_position embeddings */
