@@ -69,7 +69,7 @@ public:
    *        plane. Hard-fails (no SVM fallback) if the cl_mem allocation fails
    * -- a silent fallback would re-introduce the corrupting SVM/cl_mem hybrid.
    */
-  void allocate() override;
+  void allocate(bool zero = true) override;
 
   /**
    * @brief Release the per-tensor sub-buffers and the device cl_mem plane, then

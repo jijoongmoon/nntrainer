@@ -57,7 +57,8 @@ public:
    * to MemAllocator::alloc and records the pointer as host-owned so
    * free() can pick the right path.
    */
-  void alloc(void **ptr, size_t size, size_t alignment) override;
+  void alloc(void **ptr, size_t size, size_t alignment,
+             bool zero = true) override;
 
   /**
    * @copydoc MemAllocator::free

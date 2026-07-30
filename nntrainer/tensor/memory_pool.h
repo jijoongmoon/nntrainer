@@ -109,8 +109,13 @@ public:
   /**
    * @brief Do the allocation of memory
    *
+   * @param zero request the allocator's calloc contract (default). false is the
+   *        inference weight-arena opt-out: TensorPool::allocate(init=false)
+   *        knows every byte of that plane is written from the model file before
+   *        any read, so the arena-wide fill is a dead store. Never pass false
+   *        for the activation / KV / gradient planes.
    */
-  virtual void allocate();
+  virtual void allocate(bool zero = true);
 
   /**
    * @brief Do the allocation of memory for FSU
