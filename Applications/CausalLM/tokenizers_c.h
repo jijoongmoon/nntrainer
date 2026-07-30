@@ -55,6 +55,41 @@ void tokenizers_token_to_id(TokenizerHandle handle, const char *token,
 
 void tokenizers_free(TokenizerHandle handle);
 
+// ---- tokenizer snapshot (persistent post-parse cache payload) ----
+// These three are an addition to the Rust wrapper, so a build may well link a
+// copy of it that predates them: the checked-in lib/libtokenizers_c.a and the
+// upstream mlc-ai/tokenizers-cpp archive that build_tokenizer_android.sh
+// compiles both define only the entry points above. Bind them weakly where the
+// toolchain supports it so those builds still link; the caller treats an absent
+// symbol exactly like a rejected snapshot and takes the JSON parse path. The
+// Windows build compiles tokenizers_c_win from source and gets the real thing.
+// Note when refreshing an archive: an undefined weak reference does not pull an
+// archive member in, so confirm the definitions actually land in the link
+// (nm the binary) rather than assuming a newer .a is enough.
+#if defined(__GNUC__) && !defined(_WIN32)
+#define TOKENIZERS_C_SNAPSHOT_ATTR __attribute__((weak))
+#define TOKENIZERS_C_SNAPSHOT_OPTIONAL 1
+#else
+#define TOKENIZERS_C_SNAPSHOT_ATTR
+#define TOKENIZERS_C_SNAPSHOT_OPTIONAL 0
+#endif
+
+// Build a snapshot payload from tokenizer.json bytes. On success *out_data
+// (malloc'd; free with tokenizers_snapshot_free) and *out_len are set; on ANY
+// failure (non-BPE model, unknown shape) both are zeroed.
+TOKENIZERS_C_SNAPSHOT_ATTR void tokenizers_snapshot_from_json(const char *json,
+                                                              size_t len,
+                                                              char **out_data,
+                                                              size_t *out_len);
+
+TOKENIZERS_C_SNAPSHOT_ATTR void tokenizers_snapshot_free(char *data);
+
+// Rebuild a tokenizer from a snapshot payload. Returns NULL on ANY failure
+// (bad magic/version/bounds/deserialize) -- caller falls back to the JSON
+// parse path.
+TOKENIZERS_C_SNAPSHOT_ATTR TokenizerHandle
+tokenizers_new_from_snapshot(const char *data, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -129,4 +129,45 @@ Tokenizer::FromBlobByteLevelBPE(const std::string &vocab,
     vocab.data(), vocab.length(), merges.data(), merges.length(),
     added_tokens.data(), added_tokens.length()));
 }
+
+// True when the linked tokenizers_c actually carries the snapshot entry points.
+// They are weakly bound (see tokenizers_c.h), so an archive built before they
+// existed links fine and leaves the addresses null; that is not an error, it is
+// just one more way for the snapshot to be unavailable.
+static bool SnapshotSupported() {
+#if TOKENIZERS_C_SNAPSHOT_OPTIONAL
+  return tokenizers_new_from_snapshot != nullptr &&
+         tokenizers_snapshot_from_json != nullptr &&
+         tokenizers_snapshot_free != nullptr;
+#else
+  return true;
+#endif
+}
+
+std::unique_ptr<Tokenizer> Tokenizer::FromSnapshot(const std::string &blob) {
+  if (!SnapshotSupported()) {
+    return nullptr; // caller falls back to the JSON parse path
+  }
+  TokenizerHandle handle =
+    tokenizers_new_from_snapshot(blob.data(), blob.length());
+  if (handle == nullptr) {
+    return nullptr; // caller falls back to the JSON parse path
+  }
+  return std::make_unique<HFTokenizer>(handle);
+}
+
+std::string Tokenizer::SnapshotFromJSON(const std::string &json) {
+  if (!SnapshotSupported()) {
+    return {};
+  }
+  char *data = nullptr;
+  size_t len = 0;
+  tokenizers_snapshot_from_json(json.data(), json.length(), &data, &len);
+  if (data == nullptr || len == 0) {
+    return {};
+  }
+  std::string blob(data, len);
+  tokenizers_snapshot_free(data);
+  return blob;
+}
 } // namespace tokenizers
