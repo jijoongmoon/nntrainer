@@ -86,7 +86,9 @@ void ReshapedRMSNormLayer::incremental_forwarding(
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
 
-  bool is_prefill = !from;
+  // A chunked prefill calls this with from > 0 for every block after the first,
+  // so "prefill" is any multi-token call, not just the from==0 one.
+  bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
 

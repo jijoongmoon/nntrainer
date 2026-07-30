@@ -48,7 +48,9 @@ void PerLayerSliceLayer::forwarding(nntrainer::RunLayerContext &context,
 void PerLayerSliceLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  bool is_prefill = !from;
+  // A chunked prefill calls this with from > 0 for every block after the first,
+  // so "prefill" is any multi-token call, not just the from==0 one.
+  bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
 
