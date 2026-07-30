@@ -309,6 +309,7 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   }
 
   std::string prompt_ = system_prompt + prompt + tail_prompt;
+  ensureTokenizer(); // join the async tokenizer build before use
   auto _input = tokenizer->Encode(prompt_, true);
 
   std::vector<int64_t> init_input;
