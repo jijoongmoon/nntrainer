@@ -326,6 +326,7 @@ void Transformer::load_weight(const std::string &weight_path) {
       "initialize() before load_weight().");
   }
 
+  LOADED_WEIGHT_PATH = weight_path;
   try {
     model->load(weight_path, formatFromExtension(weight_path));
   } catch (const std::exception &e) {

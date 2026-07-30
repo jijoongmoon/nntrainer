@@ -12,6 +12,7 @@ cuda_sources = [
   'cuda_attention.cpp',
   'cuda_fc_qint4.cpp',
   'cuda_gemv_q6k.cpp',
+  'cuda_pack_cache.cpp',
   'cuda_blas_manager.cpp',
 ]
 
@@ -29,6 +30,7 @@ cuda_headers = [
   'cuda_attention.h',
   'cuda_fc_qint4.h',
   'cuda_gemv_q6k.h',
+  'cuda_pack_cache.h',
   'cuda_blas_manager.h',
 ]
 
