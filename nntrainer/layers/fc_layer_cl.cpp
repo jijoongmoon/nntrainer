@@ -84,10 +84,26 @@ void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
   context.setOutputDimensions(output_dims);
 
   /** set weight specifications */
-  TensorDim bias_dim(
-    1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
-    is_nchw ? 0b0001 : 0b0100);
+  /// @note Bias is un-quantized and added directly to the activation, so its
+  /// storage dtype must match how it is laid out on disk -- exactly the rule
+  /// the CPU FullyConnectedLayer and the RMSNorm gamma already follow
+  /// ("gamma is unquantized and stored as FP32 in the bin. Request it as FP32
+  /// regardless of the activation dtype; declaring it FP16 reinterprets the
+  /// on-disk FP32 bytes as FP16 and corrupts gamma"):
+  ///  - float weight (FP16/FP32): bias is stored in the activation dtype, so
+  ///    request it as such (no cast needed at the add site).
+  ///  - quantized weight (QS4CX/Q4_0/Q6_K/QINT*/...): bias is stored FP32 on
+  ///    disk; requesting it at the weight dtype makes the loader read the FP32
+  ///    bias bytes as packed quantized data. Request FP32 and cast to the
+  ///    activation dtype at the add site below.
+  const auto weight_dtype = context.getWeightDataType();
+  const bool weight_is_float = (weight_dtype == TensorDim::DataType::FP32 ||
+                                weight_dtype == TensorDim::DataType::FP16);
+  const auto bias_dtype = weight_is_float ? context.getActivationDataType()
+                                          : TensorDim::DataType::FP32;
+  TensorDim bias_dim(1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
+                     TensorDim::TensorType(context.getFormat(), bias_dtype),
+                     is_nchw ? 0b0001 : 0b0100);
 
   TensorDim weight_dim(
     1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
@@ -131,7 +147,14 @@ void FullyConnectedLayerCl::forwarding(RunLayerContext &context,
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
-    hidden_.add_i(bias);
+    // A quantized weight keeps its bias FP32 (see finalize()), so cast to the
+    // activation dtype here instead of at load time.
+    if (bias.getDataType() != hidden_.getDataType()) {
+      Tensor bias_cast = bias.clone(hidden_.getDataType());
+      hidden_.add_i(bias_cast);
+    } else {
+      hidden_.add_i(bias);
+    }
   }
 
   // Fused activation epilogue via the op table — same backend-neutral
@@ -183,7 +206,13 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
-    hidden_step.add_i(bias);
+    // Same FP32-bias cast as forwarding().
+    if (bias.getDataType() != hidden_step.getDataType()) {
+      Tensor bias_cast = bias.clone(hidden_step.getDataType());
+      hidden_step.add_i(bias_cast);
+    } else {
+      hidden_step.add_i(bias);
+    }
   }
 
   // Fused activation epilogue via the op table (see forwarding()).
