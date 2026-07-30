@@ -656,6 +656,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     prompt_ = system_prompt + prompt + tail_prompt;
   }
 
+  // Join the async tokenizer build before its first use. This point dominates
+  // every tokenizer touch in a run -- both Encode calls below and every later
+  // Decode / registerOutputs in the generation loop.
+  ensureTokenizer();
+
   ///@note This fallback has to count the cached rows with the SAME tokenization
   /// the save pass used to produce them: below, SAVE_KVCACHE encodes
   /// prompt_ == system_prompt with add_special_tokens=true and then stores
