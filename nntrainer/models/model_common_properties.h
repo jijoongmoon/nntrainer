@@ -239,6 +239,18 @@ public:
    */
   ModelTensorDataType(ModelTensorDataTypeInfo::Enum value =
                         ModelTensorDataTypeInfo::Enum::W32A32);
+
+  /**
+   * @brief set the weight/activation dtype pair, rejecting pairs this build
+   * has no kernel for
+   *
+   * @param value value to set
+   * @throw std::invalid_argument if no host GEMM in this build can multiply
+   * the activation dtype by the weight dtype. Accepting such a pair here only
+   * defers the failure to the first matmul, where it surfaces as
+   * "unsupported datatype" (or, worse, as a silently wrong result).
+   */
+  void set(const ModelTensorDataTypeInfo::Enum &value) override;
 };
 
 /**
