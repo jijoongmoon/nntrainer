@@ -1883,6 +1883,11 @@ public:
   void setFileOffset(size_t file_offset);
 
   /**
+   * @copydoc TensorBase::setOnDiskLegacyQint4(bool)
+   */
+  void setOnDiskLegacyQint4(bool v);
+
+  /**
    * @brief     get FileOffset of Tensor
    * @return    size_t fileOffset
    */

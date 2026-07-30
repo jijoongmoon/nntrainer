@@ -152,6 +152,74 @@ public:
   static size_t kaiNibblePayloadBytes(size_t rows_count, size_t columns_count);
 
   /**
+   * @brief Shared plain int4 container (engine-neutral, byte-compatible with
+   *        the upstream PR#3978 writer/reader):
+   *        record = [u16 qscheme = PER_CHANNEL_AFFINE (0x01)]
+   *                 [N x ceil(K/2) plain nibbles, row-major; even k in the
+   *                  low nibble; each stored uint4 = int4 + 8]
+   *                 [N fp32 per-channel scales at byte offset (N*(K+1))/2
+   *                  -- the PR writer/reader expression, which for even K
+   *                  leaves an N/2-byte zero gap after the nibbles]
+   *                 [zero pad to plainRecordPayloadBytes]
+   *        The pad mirrors the PR writer's KAI packed size for its
+   *        idx_variant=8 micro-kernel (nr=8) -- NOT the 4x4x32 (nr=4) family
+   *        above -- because the disk record must stay byte-identical to
+   *        PR#3978.
+   */
+  static constexpr const size_t PLAIN_KAI_NR = 8;
+
+  /// @brief Bytes of the plain nibble matrix: N * ceil(K/2).
+  static size_t plainNibbleBytes(size_t rows_count, size_t columns_count);
+
+  /// @brief Byte offset of the fp32 scales inside the plain payload.
+  static size_t plainScalesOffsetBytes(size_t rows_count, size_t columns_count);
+
+  /// @brief Full plain payload size (excluding the u16 qscheme header):
+  ///        ceil(N/8)*8 * (roundup(K,32)/2 + 12).
+  static size_t plainRecordPayloadBytes(size_t rows_count,
+                                        size_t columns_count);
+
+  /**
+   * @brief LOSSLESS inverse of packPlainToSectionA: de-permute a KAI Section A
+   *        nibble payload back into plain row-major
+   *        [rows_count(N)][ceil(K/2)] nibbles (uint4 = int4+8, no XOR),
+   *        byte-identical to the plain form that produced it. It does NOT
+   *        touch scales or dequantize -- it only re-lays-out the int4
+   *        nibbles, so a Section A weight becomes the canonical plain nibble
+   *        layout with its exact original values preserved.
+   * @param out_plain_nibbles caller-provided buffer of
+   *        plainNibbleBytes(rows_count, columns_count) bytes
+   */
+  static void sectionAToPlain(const uint8_t *section_a, size_t rows_count,
+                              size_t columns_count, uint8_t *out_plain_nibbles);
+
+  /**
+   * @brief Standalone reader for a legacy on-disk int4 weight record (the
+   *        deprecated QINT4 dtype) that materialises it in the canonical
+   *        QS4CX in-memory layout: plain nibbles + per-channel fp32 scales.
+   *
+   * Both recognised containers are handled, keyed off the record's u16
+   * qscheme header:
+   *  - 0x06 (KAI_QSI4CXP_4x4x32): Section A nibbles + per-channel fp16
+   *    scales. Nibbles are re-laid-out by sectionAToPlain and the scales are
+   *    widened fp16 -> fp32 (exact).
+   *  - 0x01 (PER_CHANNEL_AFFINE): the PR#3978 plain container. Its padded
+   *    nibbles are normalised to the canonical unpadded plain layout and its
+   *    fp32 scales are copied verbatim.
+   * Both paths are lossless in the int4 values and in the scale magnitudes.
+   *
+   * @param record            whole record, starting at the u16 qscheme header
+   * @param record_bytes      readable bytes at @a record (bounds-checked)
+   * @param rows_count        N (output channels)
+   * @param columns_count     K (input channels)
+   * @param out_plain_nibbles buffer of plainNibbleBytes(N, K) bytes
+   * @param out_fp32_scales   buffer of N floats
+   */
+  static void readLegacyQint4RecordToQs4cx(
+    const uint8_t *record, size_t record_bytes, size_t rows_count,
+    size_t columns_count, uint8_t *out_plain_nibbles, float *out_fp32_scales);
+
+  /**
    * @brief Reassemble Section A nibbles (quantizeAndPackKai's output) +
    *        per-channel fp16 scales into a full KAI rhs_packed buffer, ready
    *        for the qai8dxp_qsi4cxp matmul micro-kernels. Per super-row of

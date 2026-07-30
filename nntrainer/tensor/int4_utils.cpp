@@ -17,6 +17,7 @@
 #include "cpu_backend.h"
 #include "fp16.h"
 #include "nntrainer_error.h"
+#include "quantizer.h"
 #include "util_func.h"
 
 namespace nntrainer {
@@ -289,6 +290,146 @@ size_t Int4Utils::kaiNibblePayloadBytes(size_t rows_count,
     KAI_K_PAD_MULTIPLE;
   const size_t super_row_count = (rows_count + KAI_NR - 1) / KAI_NR;
   return super_row_count * KAI_NR * (k_internal / 2);
+}
+
+size_t Int4Utils::plainNibbleBytes(size_t rows_count, size_t columns_count) {
+  return rows_count * ((columns_count + 1) / 2);
+}
+
+size_t Int4Utils::plainScalesOffsetBytes(size_t rows_count,
+                                         size_t columns_count) {
+  // Mirrors the PR#3978 writer/reader expression `N * (K + 1) / 2` exactly
+  // (left-to-right integer math) -- for even K this lands N/2 bytes past the
+  // nibble end, leaving a zero gap that is part of the on-disk format.
+  return rows_count * (columns_count + 1) / 2;
+}
+
+size_t Int4Utils::plainRecordPayloadBytes(size_t rows_count,
+                                          size_t columns_count) {
+  // kai_get_rhs_packed_size_rhs_pack_nxk_qsi4cxp_qs4cxs1s0 for the PR
+  // writer's idx_variant=8 kernel: nr=8, k rounded up to 32, and a 12-byte
+  // per-channel trailer slot (fp32 sum + fp32 scale + fp32 bias).
+  const size_t k_internal =
+    ((columns_count + KAI_K_PAD_MULTIPLE - 1) / KAI_K_PAD_MULTIPLE) *
+    KAI_K_PAD_MULTIPLE;
+  const size_t n_rounded =
+    ((rows_count + PLAIN_KAI_NR - 1) / PLAIN_KAI_NR) * PLAIN_KAI_NR;
+  return n_rounded * (k_internal / 2 + 12);
+}
+
+void Int4Utils::sectionAToPlain(const uint8_t *section_a, size_t rows_count,
+                                size_t columns_count,
+                                uint8_t *out_plain_nibbles) {
+  // Exact inverse of packPlainToSectionA: walk the same Section A super-row /
+  // block iteration, un-XOR 0x88, and scatter each recovered nibble back to
+  // its plain [n][k] position. Padding entries (n >= rows_count,
+  // k >= columns_count) come from clamped / pad reads in the forward and carry
+  // no unique data, so they are skipped. A valid plain nibble may be produced
+  // by more than one Section A byte (the forward reads it as both a k0 and a
+  // k1); every such copy holds the same value, so writing with |= over a
+  // zeroed buffer is idempotent and reproduces the plain layout byte-for-byte.
+  const size_t rhs_row_bytes = (columns_count + 1) / 2;
+  std::memset(out_plain_nibbles, 0, rows_count * rhs_row_bytes);
+
+  const size_t k_internal =
+    ((columns_count + KAI_K_PAD_MULTIPLE - 1) / KAI_K_PAD_MULTIPLE) *
+    KAI_K_PAD_MULTIPLE;
+  const size_t super_row_count = (rows_count + KAI_NR - 1) / KAI_NR;
+  const size_t nibble_bytes_per_super_row = KAI_NR * (k_internal / 2);
+  const size_t block_length_in_bytes = KAI_KR / KAI_SR; // = 8
+
+  for (size_t dst_row_idx = 0; dst_row_idx < super_row_count; ++dst_row_idx) {
+    const uint8_t *src_row =
+      section_a + dst_row_idx * nibble_bytes_per_super_row;
+
+    for (size_t dst_byte_idx = 0; dst_byte_idx < nibble_bytes_per_super_row;
+         ++dst_byte_idx) {
+      const size_t block_idx = dst_byte_idx / block_length_in_bytes;
+      const size_t block_byte_idx = dst_byte_idx % block_length_in_bytes;
+      const size_t super_block_idx = block_idx / KAI_NR;
+      const size_t nr_idx = block_idx % KAI_NR;
+
+      const size_t k_adjustment =
+        ((block_byte_idx + super_block_idx * block_length_in_bytes) /
+         KAI_K_INTERLEAVE) *
+        KAI_K_INTERLEAVE;
+      const size_t k0_idx =
+        block_byte_idx + super_block_idx * block_length_in_bytes + k_adjustment;
+      const size_t k1_idx = k0_idx + KAI_K_INTERLEAVE;
+      const size_t n0_idx = dst_row_idx * KAI_NR + nr_idx;
+
+      if (n0_idx >= rows_count)
+        continue; // padding super-row (clamped in the forward)
+
+      const uint8_t qs0 = (uint8_t)(src_row[dst_byte_idx] ^ 0x88);
+      // nibble at (n0,k0)
+      const uint8_t src_x0_lo = (uint8_t)(qs0 & 0x0F);
+      // nibble at (n0,k1)
+      const uint8_t src_x0_hi = (uint8_t)((qs0 >> 4) & 0x0F);
+
+      if (k0_idx < columns_count) {
+        const size_t bi = n0_idx * rhs_row_bytes + (k0_idx / 2);
+        out_plain_nibbles[bi] |= (uint8_t)(src_x0_lo << ((k0_idx % 2) * 4));
+      }
+      if (k1_idx < columns_count) {
+        const size_t bi = n0_idx * rhs_row_bytes + (k1_idx / 2);
+        out_plain_nibbles[bi] |= (uint8_t)(src_x0_hi << ((k1_idx % 2) * 4));
+      }
+    }
+  }
+}
+
+void Int4Utils::readLegacyQint4RecordToQs4cx(
+  const uint8_t *record, size_t record_bytes, size_t rows_count,
+  size_t columns_count, uint8_t *out_plain_nibbles, float *out_fp32_scales) {
+  const size_t N = rows_count;
+  const size_t K = columns_count;
+  const size_t hdr = sizeof(uint16_t);
+
+  NNTR_THROW_IF(record_bytes < hdr, std::runtime_error)
+    << "[readLegacyQint4RecordToQs4cx] record too small for qscheme header";
+
+  uint16_t scheme = 0;
+  std::memcpy(&scheme, record, hdr);
+  const uint8_t *body = record + hdr;
+
+  if (scheme == static_cast<uint16_t>(QScheme::KAI_QSI4CXP_4x4x32)) {
+    // 0x06: Section A nibbles + per-channel fp16 scales.
+    const size_t nib = kaiNibblePayloadBytes(N, K);
+    NNTR_THROW_IF(record_bytes < hdr + nib + N * sizeof(uint16_t),
+                  std::runtime_error)
+      << "[readLegacyQint4RecordToQs4cx] Section A record truncated: have "
+      << record_bytes << " need " << (hdr + nib + N * sizeof(uint16_t));
+    // Lossless re-layout of the int4 values.
+    sectionAToPlain(body, N, K, out_plain_nibbles);
+    // Exact fp16 -> fp32 widening of the per-channel scales.
+    const uint8_t *scale_src = body + nib;
+    for (size_t n = 0; n < N; ++n) {
+      uint16_t h;
+      std::memcpy(&h, scale_src + n * sizeof(uint16_t), sizeof(uint16_t));
+      out_fp32_scales[n] = compute_fp16_to_fp32(h);
+    }
+  } else if (scheme == static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE)) {
+    // 0x01: PR#3978 plain container (padded plain nibbles + fp32 scales).
+    const size_t pay = plainRecordPayloadBytes(N, K);
+    NNTR_THROW_IF(record_bytes < hdr + pay, std::runtime_error)
+      << "[readLegacyQint4RecordToQs4cx] plain-container record truncated: "
+         "have "
+      << record_bytes << " need " << (hdr + pay);
+    // Normalize the padded plain nibbles to the canonical (unpadded) plain
+    // layout by round-tripping through Section A (drops the KAI nr=8 / K->32
+    // padding); both directions are lossless int4 re-layouts.
+    std::vector<uint8_t> sec_a(kaiNibblePayloadBytes(N, K));
+    packPlainToSectionA(body, N, K, sec_a.data());
+    sectionAToPlain(sec_a.data(), N, K, out_plain_nibbles);
+    // The plain container already stores fp32 scales -- copy verbatim.
+    std::memcpy(out_fp32_scales, body + plainScalesOffsetBytes(N, K),
+                N * sizeof(float));
+  } else {
+    NNTR_THROW_IF(true, std::runtime_error)
+      << "[readLegacyQint4RecordToQs4cx] unsupported on-disk qscheme 0x"
+      << std::hex << scheme << std::dec << " (N=" << N << " K=" << K << ")";
+  }
 }
 
 void Int4Utils::assembleKaiRhsPacked(const uint8_t *section_a,

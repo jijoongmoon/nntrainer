@@ -1608,6 +1608,8 @@ void Tensor::setFileOffset(const size_t file_offset) {
 
 size_t Tensor::getFileOffset() const { return itensor_->getFileOffset(); }
 
+void Tensor::setOnDiskLegacyQint4(bool v) { itensor_->setOnDiskLegacyQint4(v); }
+
 void Tensor::setName(const std::string &name_) { itensor_->setName(name_); }
 
 const std::string &Tensor::getName() const { return itensor_->getName(); }
