@@ -261,7 +261,7 @@ public:
         const auto &wd = weight.getDim();
         std::fprintf(
           stderr,
-          "[fc-divert] %s <- %s in[%ux%ux%ux%u %s] w[%ux%u %s] out[%s] "
+          "[fc-divert] %s <- %s in[%zux%zux%zux%zu %s] w[%zux%zu %s] out[%s] "
           "out_clmem=%d reason=%s\n",
           output.getName().c_str(), weight.getName().c_str(), id.batch(),
           id.channel(), id.height(), id.width(), dt_name(input.getDataType()),
