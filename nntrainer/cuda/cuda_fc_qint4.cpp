@@ -785,6 +785,19 @@ size_t g_i8_c_cap = 0;
 const void *g_last_quant_xh = nullptr;
 int g_last_quant_k = 0;
 
+/**
+ * @brief allocate the [K,N] int8 weight buffer for the cuBLAS IMMA GEMM.
+ * @note There are two builders for this exact buffer -- the lazy one below and
+ * the eager load-time one in cuda_fc_qs4cx_prewarm() -- feeding one consumer
+ * whose vectorized Tensor-Core loads run past the last element, so the
+ * FC_I8_TAIL_PAD must be identical in both. Allocate in one place so the two
+ * cannot drift apart.
+ */
+static cudaError_t alloc_i8_weight(signed char **w8, unsigned int N,
+                                   unsigned int K) {
+  return cudaMalloc(w8, (size_t)N * K + FC_I8_TAIL_PAD);
+}
+
 static DevWeightI8 *ensure_i8_cache_locked(const unsigned char *plain_w,
                                            unsigned int N, unsigned int K) {
   auto it = g_i8_weight_cache.find(plain_w);
@@ -798,7 +811,7 @@ static DevWeightI8 *ensure_i8_cache_locked(const unsigned char *plain_w,
   if (!krp || !krs)
     return nullptr;
   DevWeightI8 dw;
-  if (cudaMalloc(&dw.w8, (size_t)N * K + FC_I8_TAIL_PAD) != cudaSuccess)
+  if (alloc_i8_weight(&dw.w8, N, K) != cudaSuccess)
     return nullptr;
   if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
     cudaFree(dw.w8);
@@ -1399,7 +1412,7 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
     std::vector<signed char> w8(chunk_k * (size_t)N);
     std::vector<long> rs8(N, 0);
     DevWeightI8 dw8;
-    if (cudaMalloc(&dw8.w8, (size_t)K * N) == cudaSuccess &&
+    if (alloc_i8_weight(&dw8.w8, N, K) == cudaSuccess &&
         cudaMalloc(&dw8.rowsum, sizeof(int) * (size_t)N) == cudaSuccess) {
       for (size_t k0 = 0; k0 < K; k0 += chunk_k) {
         const size_t ks = std::min(chunk_k, (size_t)K - k0);
