@@ -119,3 +119,4 @@
 /usr/include/nntrainer/qkv_layer.h
 /usr/include/nntrainer/geglu_layer.h
 /usr/include/nntrainer/swiglu_layer.h
+/usr/include/nntrainer/rms_norm_layer.h
