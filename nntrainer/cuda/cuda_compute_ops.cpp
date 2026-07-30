@@ -343,11 +343,31 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
   if (wt == DT::QS4CX && M > 0 && N > 0 && K > 0 &&
       (int)weight.getDim().height() == K) {
     const uint8_t *W = weight.getData<uint8_t>();
+    // On a derived-cache HIT the dp4a and cuBLAS-i8 paths do not DEREFERENCE
+    // the plain payload: they use its pointer VALUE as the key of the device
+    // caches (packed int4 + rowsum; int8 [K,N]) that the load-time prewarm
+    // already built. So "the derived cache exists" is as good an entry ticket
+    // as device residency -- and it is the only one available under
+    // NNTR_QS4CX_HEAP_BYPASS, where the payload is ordinary heap and
+    // dev_accessible(W) is false by construction. Requiring residency there
+    // sent every QS4CX FC to the host dot() tail below, which with
+    // NNTR_CUDA_DROP_PLAIN reads pages that were discarded after the caches
+    // were built: zeros, hence silently wrong logits rather than a crash.
+    //
+    // A cache MISS is the opposite: both builders bind the payload into a
+    // device repack kernel (repack_plain_i4, repack_plain_i8_kn). The ticket
+    // below only proves the DP4A cache exists -- the i8 [K,N] cache is a
+    // separate map -- so the builders enforce device-readability themselves
+    // (plain_bindable() in cuda_fc_qint4.cpp) and report failure, which this
+    // chain's fall-through turns into a dp4a call that is a pure hit.
+    const bool w_cached = cuda::cuda_fc_qs4cx_has_cache(W);
+    // The NAIVE plain GEMM is the exception -- it binds W straight into the
+    // kernel, so it still needs real device residency.
+    const bool w_dev = nntrainer::cuda::dev_accessible(W);
     // The per-weight fp16 scale buffer the dequant kernel reads every call.
     const uint16_t *S = nullptr;
-    if (nntrainer::cuda::dev_accessible(W) &&
-        cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(weight.getScale<float>(),
-                                               (unsigned)N, &S)) {
+    if ((w_dev || w_cached) && cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+                                 weight.getScale<float>(), (unsigned)N, &S)) {
 #ifdef ENABLE_FP16
       if (at == DT::FP16 && output.getDataType() == DT::FP16) {
         auto *Xh =
@@ -366,8 +386,8 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
                 Xh, W, S, Yh, (unsigned)M, (unsigned)N, (unsigned)K)) ||
              cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(Xh, W, S, Yh, (unsigned)M,
                                                 (unsigned)N, (unsigned)K) ||
-             cuda::cuda_fc_qs4cx_gemm_fp16_naive(Xh, W, S, Yh, (unsigned)M,
-                                                 (unsigned)N, (unsigned)K)))
+             (w_dev && cuda::cuda_fc_qs4cx_gemm_fp16_naive(
+                         Xh, W, S, Yh, (unsigned)M, (unsigned)N, (unsigned)K))))
           return;
       }
 #endif
@@ -378,8 +398,8 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
         if (nntrainer::cuda::dev_accessible(X) &&
             (cuda::cuda_fc_qs4cx_dp4a_gemm_fp32(X, W, S, Y, (unsigned)M,
                                                 (unsigned)N, (unsigned)K) ||
-             cuda::cuda_fc_qs4cx_gemm_fp32(X, W, S, Y, (unsigned)M, (unsigned)N,
-                                           (unsigned)K)))
+             (w_dev && cuda::cuda_fc_qs4cx_gemm_fp32(
+                         X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K))))
           return;
       }
     }
@@ -408,6 +428,20 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
         (int)nntrainer::cuda::dev_accessible(input.getData<char>()));
     }
   }
+  // The host dot() READS the weight bytes. If this payload's pages were
+  // discarded (NNTR_CUDA_DROP_PLAIN, after the derived device caches were
+  // built) they now read back as zeros, so the dot would produce a zero-weight
+  // result -- correct-looking output, silently wrong numbers. Fail loudly
+  // instead: reaching here with a dropped payload means a device path that was
+  // supposed to be the only consumer of this weight declined the call.
+  if (wt == DT::QS4CX &&
+      cuda::cuda_fc_qs4cx_plain_dropped(weight.getData<uint8_t>()))
+    throw std::runtime_error(
+      "CudaComputeOps::fc: the QS4CX plain payload for this weight was "
+      "dropped (NNTR_CUDA_DROP_PLAIN) but the call fell through to the host "
+      "dot(), which would read zero-filled pages. Re-run with "
+      "NNTR_CUDA_DROP_PLAIN=0, and use NNTR_CUDA_FC_DBG=1 to see why the "
+      "device path declined.");
   cuda::StreamManager::Global().finishIfAsync();
   input.dot(weight, output, false, false);
 }
