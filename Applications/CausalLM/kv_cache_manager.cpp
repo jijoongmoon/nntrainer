@@ -178,8 +178,19 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   }
 #endif
 
+  // Byte width of one KV element, asked of the same authority that sizes the
+  // Tensor storage itself (TensorDim::getDataTypeSize()), so the pool and the
+  // Tensors placed into it cannot disagree by construction.
+  //
+  // A local `dtype == FP16 ? 2 : 4` test cannot answer this: the KV dtype on a
+  // build without ENABLE_FP16 is UINT16 (CausalLM::allocateAndBindKVCache
+  // picks it so mha_core's cache placeholders keep the same 2-byte layout),
+  // which is 2 bytes but falls into the `else` arm -- every K and V plane
+  // charged double, i.e. the whole SVM KV pool reserved exactly 2x the device
+  // memory it needs. Deriving the width instead of enumerating dtypes also
+  // keeps any future cache dtype correct without touching this file.
   const size_t elem_size =
-    (dtype == ml::train::TensorDim::DataType::FP16) ? 2u : 4u;
+    ml::train::TensorDim({1, 1, 1, 1}, {format, dtype}).getDataTypeSize();
 
   if (svm_alloc) {
     svm_pool_ = std::make_shared<nntrainer::MemoryPool>(svm_alloc);
