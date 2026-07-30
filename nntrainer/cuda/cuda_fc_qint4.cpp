@@ -1213,6 +1213,19 @@ static inline bool i8_jit_on() {
   return v;
 }
 
+// NNTR_FC_CUDA_CUBLAS: the int8-IMMA prefill GEMM. Default ON -- it is ~10x the
+// dp4a int-ALU GEMM and bit-identical -- with an explicit =0 opting out. The
+// test is VALUE-checked, not presence-checked, so =0 disables instead of
+// enabling; and it lives here, next to the path it governs, so every consumer
+// (the runtime dispatch and the load-time cache prewarm) reads one answer.
+static inline bool cublas_i8_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_FC_CUDA_CUBLAS");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return v;
+}
+
 // Tiled transpose-unpack: dp4a packed [N, Kh] (byte = plain^0x88, nibbles =
 // two's-complement signed 4-bit) -> int8 [K, N]. Reads coalesced along Kh,
 // writes coalesced along N via the shared tile.
@@ -1310,6 +1323,12 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
                                        const unsigned short *scales_fp16,
                                        unsigned short *Yh, unsigned int M,
                                        unsigned int N, unsigned int K) {
+  // NNTR_FC_CUDA_CUBLAS=0 opts this path out; report failure so the caller's
+  // fall-through chain (dp4a, then the naive GEMM) takes over. Enforcing the
+  // lever at the entry point covers every caller -- the runtime FC dispatch
+  // only knows the M>=32 prefill shape, not the lever.
+  if (!cublas_i8_on())
+    return false;
   if (M == 0 || N == 0 || K == 0)
     return true;
   auto kqh = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
@@ -1556,8 +1575,13 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
   // bit-exactly. Chunked along K ([k0,k1) rows of the [K,N] buffer are
   // contiguous on both sides); the per-channel rowsum accumulates across
   // chunks.
-  static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
-  if (_cb && _cb[0] != '0' && !i8_jit_on() &&
+  // Only build eagerly when the lever is explicitly set: with it unset the
+  // runtime path still uses cuBLAS but builds this [K,N] cache lazily, and an
+  // FC that never reaches the M>=32 gate would otherwise pay the VRAM for
+  // nothing (see g_i8_exempt). cublas_i8_on() supplies the =0 opt-out so the
+  // two consumers cannot disagree about what =0 means.
+  static const bool _cb_set = std::getenv("NNTR_FC_CUDA_CUBLAS") != nullptr;
+  if (_cb_set && cublas_i8_on() && !i8_jit_on() &&
       !g_i8_weight_cache.count(plain_w) && !g_i8_exempt.count(plain_w)) {
     const size_t chunk_k =
       std::max<size_t>(1, std::min<size_t>(K, PREWARM_CHUNK_BYTES / N));
