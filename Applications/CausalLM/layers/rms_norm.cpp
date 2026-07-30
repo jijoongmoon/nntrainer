@@ -28,17 +28,29 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
     skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
 
-  // gamma follows the model weight dtype (packed=false clamps it to the
-  // activation dtype). Quantized *-FP16 bins store the norm weights as FP16;
-  // hardcoding FP32 here positionally misloads every weight after the first
-  // gamma AND overruns the mmap'd file by 2 bytes/element (SIGSEGV in the
-  // parallel load worker). The multiply site carries a dtype-cast guard, so
-  // FP32-gamma bins (upstream's own layout) still load when the model weight
-  // dtype is FP32.
+  // gamma is never quantized, but it is not unconditionally FP32 either: a bin
+  // stores it at the model's FLOAT dtype, so an FP16-activation package holds
+  // 2 bytes per element. Ask for the context's weight dtype when that dtype is
+  // itself a float type, and FP32 otherwise -- see the note in the core
+  // nntrainer/layers/llm/rms_norm_layer.cpp, which this layer mirrors:
+  //   - a hard FP32 over-requests on an FP16 package and, because weights are
+  //     a packed stream in graph order, shifts every later offset until the
+  //     loader rejects the layout;
+  //   - a bare getWeightDataType() is only safe while every caller passes
+  //     packed=false (LayerNode::finalize() then sets tensor_type[1] =
+  //     tensor_type[2] before InitLayerContext exists); the float-type test
+  //     keeps a caller that forgets it from requesting a block-quantized
+  //     gamma.
+  // The FP16 forward path casts gamma down at the multiply site either way.
+  const auto norm_w_dtype = context.getWeightDataType();
+  const auto norm_dtype =
+    (norm_w_dtype == nntrainer::TensorDim::DataType::FP32 ||
+     norm_w_dtype == nntrainer::TensorDim::DataType::FP16)
+      ? norm_w_dtype
+      : nntrainer::TensorDim::DataType::FP32;
   nntrainer::TensorDim gamma_dim(
     1, 1, 1, dim[0].width(),
-    nntrainer::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()));
+    nntrainer::TensorDim::TensorType(context.getFormat(), norm_dtype));
   wt_idx[RMSParams::gamma] = context.requestWeight(
     gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
     nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);

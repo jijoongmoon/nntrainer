@@ -45,14 +45,22 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     << "feature size must be a divisor of width";
 
   if (use_gamma) {
-    // gamma follows the model weight dtype (packed=false clamps it to the
-    // activation dtype), matching what the quantizer wrote to the bin.
-    // Hardcoding FP32 misloads/overruns *-FP16 bins whose gammas are FP16;
-    // the multiply site's dtype-cast guard covers either stored dtype.
+    // gamma is never quantized, but a bin stores it at the model's FLOAT
+    // dtype, so an FP16-activation package holds 2 bytes per element. Ask for
+    // the context's weight dtype when that dtype is itself a float type, and
+    // FP32 otherwise -- the same rule as rms_norm.cpp and the core
+    // nntrainer/layers/llm/rms_norm_layer.cpp, which carries the full note.
+    // These q/k/v norms are counted in the same packed weight stream, so a
+    // constant FP32 here shifts every later offset on an FP16 package.
+    const auto norm_w_dtype = context.getWeightDataType();
+    const auto norm_dtype =
+      (norm_w_dtype == nntrainer::TensorDim::DataType::FP32 ||
+       norm_w_dtype == nntrainer::TensorDim::DataType::FP16)
+        ? norm_w_dtype
+        : nntrainer::TensorDim::DataType::FP32;
     nntrainer::TensorDim gamma_dim(
       1, 1, 1, feature_size,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       context.getWeightDataType()));
+      nntrainer::TensorDim::TensorType(context.getFormat(), norm_dtype));
     wt_idx[RMSParams::gamma] = context.requestWeight(
       gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
       nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
