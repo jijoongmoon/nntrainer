@@ -48,7 +48,10 @@ void GeGLULayer::forwarding(RunLayerContext &context, bool training) {
 void GeGLULayer::incremental_forwarding(RunLayerContext &context,
                                         unsigned int from, unsigned int to,
                                         bool training) {
-  if (skip_prefill && from == 0)
+  // Multi-token steps count as prefill, and the gate must run BEFORE the
+  // step-size assert below so a resumed or chunked multi-token prefill is
+  // skipped instead of throwing (same ordering as SwiGLULayer).
+  if (skip_prefill && (from == 0 || (to - from) > 1))
     return;
   Tensor &in1 = context.getInput(INPUT_IDX_1);
   Tensor &in2 = context.getInput(INPUT_IDX_2);
