@@ -26,6 +26,7 @@
 #include "model_common_properties.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstdint>
@@ -35,8 +36,14 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <thread>
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <activation_realizer.h>
 #include <adamw.h>
@@ -76,6 +83,128 @@
 namespace nntrainer {
 
 namespace {
+
+#if !defined(_WIN32)
+/**
+ * @brief Bounds the loader's staging-map double residency.
+ *
+ * The inference loaders below mmap the model file per node and copy the node's
+ * tensors out of that mapping into the weight pool. Every page a worker touches
+ * stays resident until its munmap, so while a large tensor is being copied the
+ * process holds both the destination pool bytes and the source file pages --
+ * measured as roughly +0.9 GB on a 35-layer decoder-only model whose largest
+ * single tensor is ~1 GB, and it scales with the concurrent worker count.
+ *
+ * Worse, the overlap is page-cache-state dependent, so the recorded peak is not
+ * reproducible run to run.
+ *
+ * This samples the resident size of the live staging maps (mincore) and, only
+ * once it exceeds a threshold, drops them with madvise(MADV_DONTNEED). The
+ * mappings are read-only MAP_PRIVATE, so dropping is always safe even while a
+ * worker is mid-copy: a dropped page simply re-faults from the page cache on
+ * the next touch and the bytes read are identical. The threshold is what keeps
+ * loads whose overlap is naturally small from paying any churn.
+ *
+ * NNTR_LOAD_REAP_MB sets the threshold in MiB; 0 (the default) disables the
+ * reaper entirely.
+ *
+ * It is opt-in because in this loader every worker maps the WHOLE file, so a
+ * single large tensor pushes one map over any sane threshold and dropping that
+ * map discards pages the other workers are still reading. Measured on a 2.8 GB
+ * model on a Qualcomm Adreno 840: peak RSS -714 MB, but load time +3.4 s, and
+ * the trade is nearly threshold-independent between 256 MB and 2 GiB. A loader
+ * that shares ONE mapping across the workers can reap cheaply; this one cannot,
+ * so the lever is left to the caller rather than turned on for everybody.
+ *
+ * NOTE posix_madvise(POSIX_MADV_DONTNEED) cannot be used for this: glibc
+ * documents it as a no-op, so the plain-POSIX spelling silently does nothing.
+ * madvise(MADV_DONTNEED) is required.
+ */
+class LoaderStagingMaps {
+public:
+  LoaderStagingMaps() : threshold_(readThreshold()) {
+    if (threshold_ == 0)
+      return;
+    reaper_ = std::thread([this]() { reap(); });
+  }
+
+  ~LoaderStagingMaps() {
+    stop_.store(true, std::memory_order_relaxed);
+    if (reaper_.joinable())
+      reaper_.join();
+  }
+
+  LoaderStagingMaps(const LoaderStagingMaps &) = delete;
+  LoaderStagingMaps &operator=(const LoaderStagingMaps &) = delete;
+
+  /** @brief registers a live staging map for the duration of one node read */
+  class Scope {
+  public:
+    Scope(LoaderStagingMaps &owner, void *addr, size_t len) :
+      owner_(owner), addr_(addr) {
+      if (owner_.threshold_ == 0)
+        return;
+      std::lock_guard<std::mutex> lk(owner_.mtx_);
+      owner_.live_.emplace_back(addr, len);
+    }
+    ~Scope() {
+      if (owner_.threshold_ == 0)
+        return;
+      std::lock_guard<std::mutex> lk(owner_.mtx_);
+      for (auto it = owner_.live_.begin(); it != owner_.live_.end(); ++it) {
+        if (it->first == addr_) {
+          owner_.live_.erase(it);
+          break;
+        }
+      }
+    }
+    Scope(const Scope &) = delete;
+    Scope &operator=(const Scope &) = delete;
+
+  private:
+    LoaderStagingMaps &owner_;
+    void *addr_;
+  };
+
+private:
+  static size_t readThreshold() {
+    const char *e = std::getenv("NNTR_LOAD_REAP_MB");
+    const size_t mb = e ? static_cast<size_t>(std::strtoul(e, nullptr, 10)) : 0;
+    return mb << 20;
+  }
+
+  void reap() {
+    const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    std::vector<unsigned char> incore;
+    while (!stop_.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      std::lock_guard<std::mutex> lk(mtx_);
+      // Each map is judged on its own residency. The live maps all cover the
+      // same file, so summing them would count one physical page once per
+      // worker and trip the threshold almost immediately -- which drops the
+      // whole file every interval and forces the other workers to re-fault
+      // everything they were still reading.
+      for (const auto &m : live_) {
+        const size_t npages = (m.second + page - 1) / page;
+        incore.assign(npages, 0);
+        if (::mincore(m.first, m.second, incore.data()) != 0)
+          continue;
+        size_t resident_pages = 0;
+        for (size_t i = 0; i < npages; ++i)
+          resident_pages += (incore[i] & 1);
+        if (resident_pages * page > threshold_)
+          (void)::madvise(m.first, m.second, MADV_DONTNEED);
+      }
+    }
+  }
+
+  const size_t threshold_;
+  std::mutex mtx_;
+  std::vector<std::pair<void *, size_t>> live_;
+  std::atomic<bool> stop_{false};
+  std::thread reaper_;
+};
+#endif
 
 Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   const unsigned int bytes = static_cast<unsigned int>(
@@ -1117,6 +1246,11 @@ void NeuralNetwork::load(const std::string &file_path,
 
       std::atomic<size_t> next_load_index{0};
 
+#if !defined(_WIN32)
+      // Bounds the source-file pages held while workers copy into the pool.
+      LoaderStagingMaps staging_maps;
+#endif
+
       auto load_worker = [&]() {
         for (size_t idx =
                next_load_index.fetch_add(1, std::memory_order_relaxed);
@@ -1173,17 +1307,30 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
               << "mmap failed";
 
-            // Hint: many model loads touch scattered regions -> RANDOM helps
-            // reduce readahead
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+            // Warm the mapping with readahead. RANDOM was actively harmful
+            // here: each worker reads its node's tensors as a sequential
+            // sub-range, so suppressing readahead made every 4 KB page fault
+            // individually -- and the reaper below drops pages mid-load, so
+            // those faults recur. WILLNEED lets the workers hit warm pages
+            // instead (measured on a 2.8 GB model: seconds of aggregate read
+            // time, versus a fraction of that for a sequential read of the
+            // same file).
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_WILLNEED);
 
             char *view = static_cast<char *>(mmap_ptr);
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+            {
+              LoaderStagingMaps::Scope reap_scope(staging_maps, mmap_ptr,
+                                                  f_size);
+              node->read(view, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            }
 
             // Early drop: pages no longer needed; helps lower peak RSS during
-            // overlap
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+            // overlap. madvise, not posix_madvise: glibc documents
+            // POSIX_MADV_DONTNEED as a no-op, so the POSIX spelling dropped
+            // nothing at all here.
+            (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
 
             ::munmap(mmap_ptr, f_size);
 #endif
@@ -1357,6 +1504,11 @@ void NeuralNetwork::load(const std::string &file_path,
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open safetensors file: " << f_path;
 
+#if !defined(_WIN32)
+      // Bounds the source-file pages held while workers copy into the pool.
+      LoaderStagingMaps staging_maps;
+#endif
+
       std::vector<std::thread> threads;
       threads.reserve(model_graph.size());
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
@@ -1408,13 +1560,24 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
               << "mmap failed for safetensors file: " << f_path;
 
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+            // WILLNEED, not RANDOM: see the note at the other loader -- the
+            // per-node reads are sequential sub-ranges, so suppressing
+            // readahead costs far more than it saves, especially with the
+            // reaper dropping pages mid-load.
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_WILLNEED);
 
             char *view = static_cast<char *>(mmap_ptr);
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+            {
+              LoaderStagingMaps::Scope reap_scope(staging_maps, mmap_ptr,
+                                                  f_size);
+              node->read(view, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            }
 
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+            // madvise, not posix_madvise: glibc documents POSIX_MADV_DONTNEED
+            // as a no-op, so the POSIX spelling dropped nothing at all here.
+            (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
             ::munmap(mmap_ptr, f_size);
 #endif
           }
