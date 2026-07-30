@@ -724,11 +724,19 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::Q6_K:
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
+// UNION NOTE: two host GEMMs answer this one case label, on disjoint ISAs --
+// ARM+i8mm goes through the KAI packed fp16 ukernel family, x86 widens to the
+// canonical fp32 QS4CX GEMM. NNTR_HAS_HOST_QS4CX_FP16_GEMM (half_tensor.h) is
+// the single written form of "this build can multiply FP16 x QS4CX at all", and
+// model_common_properties.cpp rejects model_tensor_type=QS4CX-FP16 when it is
+// 0. Keep exactly ONE `case Tdatatype::QS4CX` label: the ISA test below picks
+// the body, the macro decides whether the case exists.
+#if NNTR_HAS_HOST_QS4CX_FP16_GEMM
+  case Tdatatype::QS4CX: {
 #if (defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                       \
      defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||            \
      defined(_M_ARM64)) &&                                                     \
   defined(__ARM_FEATURE_MATMUL_INT8)
-  case Tdatatype::QS4CX: {
     // [KAI fp16 dispatch seam] Host fp16 GEMM for an upstream QS4CX weight —
     // e.g. an lm_head (N = vocab) that exceeds the GPU image cap and falls
     // back to host. The rhs is the qai8dxp4x8/qsi4cxp4x8-packed buffer built
@@ -757,15 +765,7 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     // transB=true: the KAI rhs-packed buffer is always row-major-as-transposed.
     nntr_gemm_qai8dxp_qsi4cxp_packed<_FP16>(
       M, N, K, (void *)data, (void *)kai_rhs, rdata, 3u, true, lb, ub);
-    break;
-  }
-// Same case label, mutually exclusive host ISAs: the ARM branch above needs the
-// KAI i8mm fp16 ukernel family; x86 has no fp16 QS4CX micro-kernel, so it takes
-// the canonical fp32 QS4CX GEMM with a widen/narrow around it. #elif (not a
-// second #if) so exactly one `case Tdatatype::QS4CX` ever reaches the compiler.
-#elif defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||            \
-  defined(__i386__)
-  case Tdatatype::QS4CX: {
+#else
     // x86 host fallback: there is no KAI fp16 micro-kernel here (ARM i8mm), so
     // an fp16-activation QS4CX FC that lands on the host (e.g. NNTR_ENGINE=cpu,
     // or a GPU path that bails) would otherwise kill the process with
@@ -830,9 +830,10 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
       pool.emplace_back(worker);
     for (auto &t : pool)
       t.join();
+#endif // ISA split inside the single QS4CX case
     break;
   }
-#endif
+#endif // NNTR_HAS_HOST_QS4CX_FP16_GEMM
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }

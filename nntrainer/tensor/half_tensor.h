@@ -21,6 +21,43 @@
 #define EXCEPT_WHEN_DEBUG noexcept
 #endif
 
+/**
+ * @brief 1 when this build has a host GEMM that can multiply an FP16
+ * activation by a QS4CX weight, i.e. when HalfTensor::dot() has a
+ * Tdatatype::QS4CX case.
+ *
+ * This is the ONLY place the condition is written down: HalfTensor::dot()
+ * guards its QS4CX case with this macro, and the model_tensor_type validation
+ * (nntrainer/models/model_common_properties.cpp) rejects "QS4CX-FP16" when it
+ * is 0, so that an unsupported build fails at property-set time with a
+ * message instead of at the first FC with "unsupported datatype".
+ *
+ * Two backends satisfy it in this tree, and the switch case carries both
+ * bodies behind the same ISA test:
+ *
+ *  - x86: the case widens the activation to FP32 and calls
+ *    gemm_qai8dxp_qsi4cxp_rhs_unpacked(), which consumes the plain (unpacked)
+ *    QS4CX blob x86 keeps in memory.
+ *  - ARM with i8mm (__ARM_FEATURE_MATMUL_INT8): the same weight is KAI
+ *    rhs-packed by Tensor::pack(), so the unpacked kernel cannot read it;
+ *    the packed fp16 KleidiAI qai8dxp/qsi4cxp ukernel family is dispatched
+ *    instead through nntr_gemm_qai8dxp_qsi4cxp_packed<_FP16>().
+ *
+ * ARM without i8mm has neither, and keeps the reject. When a backend gains a
+ * case, extend this macro and the switch case together.
+ */
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
+  defined(__i386__)
+#define NNTR_HAS_HOST_QS4CX_FP16_GEMM 1
+#elif (defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                     \
+       defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||          \
+       defined(_M_ARM64)) &&                                                   \
+  defined(__ARM_FEATURE_MATMUL_INT8)
+#define NNTR_HAS_HOST_QS4CX_FP16_GEMM 1
+#else
+#define NNTR_HAS_HOST_QS4CX_FP16_GEMM 0
+#endif
+
 namespace nntrainer {
 
 /**
