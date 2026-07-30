@@ -42,6 +42,7 @@
 #include <mha_core.h>
 #include <neuralnet.h>
 #include <nntrainer_error.h>
+#include <nntrainer_log.h>
 #include <residency_policy.h>
 #include <tensor.h>
 
@@ -927,9 +928,49 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     static bool s_cuda_prewarmed = false;
     if (!s_cuda_prewarmed && cuda_prewarm_on && causallm_engine() == "cuda") {
       s_cuda_prewarmed = true;
+      // --- [i8 length gate] ------------------------------------------------
+      // The eager cuBLAS-i8 [K,N] build is ~2/3 of this prewarm's cost (the
+      // int8 buffer is 2x the int4 payload) and its ONLY consumer is the
+      // dispatcher's M >= CUDA_FC_I8_PREFILL_MIN_M prefill branch. This turn's
+      // prompt is ALREADY TOKENIZED at this point, so the largest M any forward
+      // of this turn will see is known for free:
+      //
+      //   chunked prefill feeds ceil(input_len / prefill_chunk) forwards of at
+      //   most prefill_chunk rows, decode runs at M=1
+      //
+      // so when that maximum is below the gate, no FC can reach the i8 path and
+      // every byte of that cache is dead VRAM built on the user's critical
+      // path. The dp4a pack, the fp16 scale buffers, the split-KV scratch and
+      // the decode scratch are NOT gated -- those are what buys decode
+      // throughput, so the long-generation case keeps today's behaviour
+      // exactly.
+      //
+      // Safety: the gate only skips an EAGER build. The lazy in-path build
+      // still runs on first use (a device-side repack, no host transient), so a
+      // later turn with a long prompt self-heals; it costs that one prefill
+      // what it used to cost at load. NNTR_CUDA_PREWARM_I8=1 forces the full
+      // eager build regardless of length (pre-gate behaviour), =0 never builds
+      // it eagerly; unset = length-gated.
+      const unsigned int i8_chunk =
+        std::min<unsigned int>(effectivePrefillChunk(), INIT_SEQ_LEN);
+      const unsigned int max_prefill_m =
+        (i8_chunk > 0 && input_len > i8_chunk) ? i8_chunk : input_len;
+      static const char *_pwi8 = std::getenv("NNTR_CUDA_PREWARM_I8");
+      const bool i8_forced = _pwi8 && _pwi8[0] == '1';
+      const bool i8_disabled = _pwi8 && _pwi8[0] == '0';
+      const bool i8_reachable =
+        max_prefill_m >= nntrainer::cuda::CUDA_FC_I8_PREFILL_MIN_M;
+      const bool i8_eager = !i8_disabled && (i8_forced || i8_reachable);
+      ml_logi("[cuda prewarm] i8 gate: prefill M<=%u vs gate %u -> eager i8 "
+              "%s%s",
+              max_prefill_m, nntrainer::cuda::CUDA_FC_I8_PREFILL_MIN_M,
+              i8_eager ? "ON" : "OFF (lazy build self-heals)",
+              (i8_forced || i8_disabled) ? " (forced by NNTR_CUDA_PREWARM_I8)"
+                                         : "");
       std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
                          void *)>
-        fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &ctx, void *) {
+        fn = [i8_eager](ml::train::Layer &l, nntrainer::RunLayerContext &ctx,
+                        void *) {
           if (l.getType() != "fully_connected")
             return;
           for (unsigned int w = 0; w < ctx.getNumWeights(); ++w) {
@@ -949,7 +990,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             // the untied lm_head alone is hundreds of MiB) is dead VRAM.
             // Exempt them from the EAGER build; the lazy runtime build
             // remains as the self-healing fallback.
-            bool i8_dead = l.getName() == "output_of_causallm";
+            // [i8 length gate] when this turn's largest prefill M cannot
+            // reach the cuBLAS-i8 gate, EVERY FC is in that same position, so
+            // the per-layer test below is subsumed and the whole eager i8
+            // build is skipped.
+            bool i8_dead = !i8_eager || l.getName() == "output_of_causallm";
             if (!i8_dead) {
               try {
                 i8_dead = l.getProperty("skip_prefill") == "true";
