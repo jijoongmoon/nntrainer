@@ -724,8 +724,7 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::Q6_K:
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
-#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
-  defined(__i386__)
+#if NNTR_HAS_HOST_QS4CX_FP16_GEMM
   case Tdatatype::QS4CX: {
     // x86 host fallback: there is no KAI fp16 micro-kernel here (ARM i8mm), so
     // an fp16-activation QS4CX FC that lands on the host (e.g. NNTR_ENGINE=cpu,
