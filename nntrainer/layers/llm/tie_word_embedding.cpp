@@ -716,6 +716,11 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 
       const uint8_t *weight_data = weight.getData<uint8_t>();
 
+      // Set when a device GEMV has already written the logits. It records the
+      // fact instead of returning: returning from here would skip BOTH the
+      // common bias add at the end of the batch loop and every remaining batch
+      // element.
+      bool cuda_done = false;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       // engine=cuda GPU Q6_K lm_head: reads the device FP16 hidden + (managed)
       // Q6_K weight directly and writes FP16 logits to the device output -- no
@@ -730,98 +735,106 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
         const _FP16 *hin = input_step.getData<_FP16>();
         _FP16 *hout = hidden_step.getData<_FP16>();
         const bool dev = hin && nntrainer::cuda::dev_accessible(hin);
-        if (dev && nntrainer::cuda::lmhead_gemv_q6_k_cuda(
-                     weight_data, reinterpret_cast<const unsigned short *>(hin),
-                     reinterpret_cast<unsigned short *>(hout), (int)vocab_size,
-                     (int)hidden_size))
-          return;
+        cuda_done =
+          dev && nntrainer::cuda::lmhead_gemv_q6_k_cuda(
+                   weight_data, reinterpret_cast<const unsigned short *>(hin),
+                   reinterpret_cast<unsigned short *>(hout), (int)vocab_size,
+                   (int)hidden_size);
 #endif
       }
 #endif
 
-      // dtype-aware I/O (see Q4_0 path above): FP16 hidden -> fp32 row; logits
-      // written back as the output tensor's dtype.
-      std::vector<float> input_f32;
-      const float *input_data;
-      if (input_step.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+      // Host / OpenCL Q6_K lm_head. Skipped when the CUDA GEMV above already
+      // wrote the logits -- and, unlike an early return, it leaves the bias add
+      // and the rest of the batch loop reachable.
+      if (!cuda_done) {
+        // dtype-aware I/O (see Q4_0 path above): FP16 hidden -> fp32 row;
+        // logits written back as the output tensor's dtype.
+        std::vector<float> input_f32;
+        const float *input_data;
+        if (input_step.getDataType() == nntrainer::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-        const _FP16 *in16 = input_step.getData<_FP16>();
-        input_f32.resize(hidden_size);
-        for (unsigned int k = 0; k < hidden_size; ++k)
-          input_f32[k] = static_cast<float>(in16[k]);
-        input_data = input_f32.data();
+          const _FP16 *in16 = input_step.getData<_FP16>();
+          input_f32.resize(hidden_size);
+          for (unsigned int k = 0; k < hidden_size; ++k)
+            input_f32[k] = static_cast<float>(in16[k]);
+          input_data = input_f32.data();
 #else
-        throw std::invalid_argument("FP16 hidden requires ENABLE_FP16");
+          throw std::invalid_argument("FP16 hidden requires ENABLE_FP16");
 #endif
-      } else {
-        input_data = input_step.getData<float>();
-      }
-      const bool out_fp16 =
-        hidden_step.getDataType() == nntrainer::TensorDim::DataType::FP16;
-      float *logits = out_fp16 ? nullptr : hidden_step.getData<float>();
+        } else {
+          input_data = input_step.getData<float>();
+        }
+        const bool out_fp16 =
+          hidden_step.getDataType() == nntrainer::TensorDim::DataType::FP16;
+        float *logits = out_fp16 ? nullptr : hidden_step.getData<float>();
 #ifdef ENABLE_FP16
-      _FP16 *logits16 = out_fp16 ? hidden_step.getData<_FP16>() : nullptr;
+        _FP16 *logits16 = out_fp16 ? hidden_step.getData<_FP16>() : nullptr;
 #endif
 
-      // Decode lm_head on the GPU (gpu_native q6k_gemv_lmhead kernel): the
-      // host loop below streams the whole Q6_K table through the CPU every
-      // token — the dominant decode cost. Gated to GPU runs (the canonical
-      // NNTR_FC_INT8_GPU env) with NNTR_LMHEAD_GPU=0/1 as explicit
-      // kill-switch/opt-in; falls back to the host loop on any failure.
-      // Logits differ from the host loop only in fp32 summation order —
-      // greedy token-ID equality is the validation gate (G9).
-      static const int lmhead_gpu = []() {
-        if (const char *e = std::getenv("NNTR_LMHEAD_GPU"))
-          return std::atoi(e);
-        // [engine=gpu fold] track the FC_INT8 default-on (GPU FC path default):
-        // the GPU lm_head GEMV is the dominant decode op, so leaving it OFF
-        // when NNTR_FC_INT8_GPU is unset costs ~40% decode. Default-on; =0
-        // disables.
-        const char *fc = std::getenv("NNTR_FC_INT8_GPU");
-        return (!fc || std::atoi(fc) != 0) ? 1 : 0;
-      }();
-      bool gpu_done = false;
+        // Decode lm_head on the GPU (gpu_native q6k_gemv_lmhead kernel): the
+        // host loop below streams the whole Q6_K table through the CPU every
+        // token — the dominant decode cost. Gated to GPU runs (the canonical
+        // NNTR_FC_INT8_GPU env) with NNTR_LMHEAD_GPU=0/1 as explicit
+        // kill-switch/opt-in; falls back to the host loop on any failure.
+        // Logits differ from the host loop only in fp32 summation order —
+        // greedy token-ID equality is the validation gate (G9).
+        static const int lmhead_gpu = []() {
+          if (const char *e = std::getenv("NNTR_LMHEAD_GPU"))
+            return std::atoi(e);
+          // [engine=gpu fold] track the FC_INT8 default-on (GPU FC path
+          // default): the GPU lm_head GEMV is the dominant decode op, so
+          // leaving it OFF when NNTR_FC_INT8_GPU is unset costs ~40% decode.
+          // Default-on; =0 disables.
+          const char *fc = std::getenv("NNTR_FC_INT8_GPU");
+          return (!fc || std::atoi(fc) != 0) ? 1 : 0;
+        }();
+        bool gpu_done = false;
 #if defined(ENABLE_OPENCL)
-      // GPU Q6_K lm_head GEMV; falls through to the host loop (gpu_done=false)
-      // on the no-OpenCL build.
-      if (lmhead_gpu != 0 && (hidden_size % 256) == 0) {
-        std::vector<float> logits_f32(vocab_size);
-        gpu_done = nntrainer::lmhead_gemv_q6_k_cl(
-          weight_data, input_data, logits_f32.data(), vocab_size, hidden_size);
-        if (gpu_done) {
+        // GPU Q6_K lm_head GEMV; falls through to the host loop
+        // (gpu_done=false) on the no-OpenCL build.
+        if (lmhead_gpu != 0 && (hidden_size % 256) == 0) {
+          std::vector<float> logits_f32(vocab_size);
+          gpu_done = nntrainer::lmhead_gemv_q6_k_cl(weight_data, input_data,
+                                                    logits_f32.data(),
+                                                    vocab_size, hidden_size);
+          if (gpu_done) {
+#ifdef ENABLE_FP16
+            if (out_fp16) {
+              for (unsigned int v = 0; v < vocab_size; ++v)
+                logits16[v] = static_cast<_FP16>(logits_f32[v]);
+            } else
+#endif
+            {
+              std::memcpy(logits, logits_f32.data(),
+                          sizeof(float) * vocab_size);
+            }
+          }
+        }
+#endif
+        (void)lmhead_gpu;
+
+        if (!gpu_done) {
+          // Host fallback: fused Q6_K GEMV (upstream 049e31544 measured it 2x
+          // the per-row dequantize+sdot loop for decode on S26U). Called on raw
+          // pointers — Tensor::dot crashes on gpu-context-allocated tensors
+          // when this layer is registered on cl_context, so the free function
+          // is used directly, then cast to the dtype-aware logits output
+          // (upstream forces FP32 logits instead; our FP16 output contract
+          // stays).
+          std::vector<float> logits_f32(vocab_size);
+          nntrainer::gemm_q6_K(1, vocab_size, hidden_size, input_data,
+                               hidden_size, (void *)weight_data, vocab_size,
+                               logits_f32.data(), vocab_size);
 #ifdef ENABLE_FP16
           if (out_fp16) {
-            for (unsigned int v = 0; v < vocab_size; ++v)
-              logits16[v] = static_cast<_FP16>(logits_f32[v]);
+            for (unsigned int row = 0; row < vocab_size; ++row)
+              logits16[row] = static_cast<_FP16>(logits_f32[row]);
           } else
 #endif
           {
             std::memcpy(logits, logits_f32.data(), sizeof(float) * vocab_size);
           }
-        }
-      }
-#endif
-      (void)lmhead_gpu;
-
-      if (!gpu_done) {
-        // Host fallback: fused Q6_K GEMV (upstream 049e31544 measured it 2x
-        // the per-row dequantize+sdot loop for decode on S26U). Called on raw
-        // pointers — Tensor::dot crashes on gpu-context-allocated tensors when
-        // this layer is registered on cl_context, so the free function is used
-        // directly, then cast to the dtype-aware logits output (upstream
-        // forces FP32 logits instead; our FP16 output contract stays).
-        std::vector<float> logits_f32(vocab_size);
-        nntrainer::gemm_q6_K(1, vocab_size, hidden_size, input_data,
-                             hidden_size, (void *)weight_data, vocab_size,
-                             logits_f32.data(), vocab_size);
-#ifdef ENABLE_FP16
-        if (out_fp16) {
-          for (unsigned int row = 0; row < vocab_size; ++row)
-            logits16[row] = static_cast<_FP16>(logits_f32[row]);
-        } else
-#endif
-        {
-          std::memcpy(logits, logits_f32.data(), sizeof(float) * vocab_size);
         }
       }
     } else if (weight.getDataType() == nntrainer::TensorDim::DataType::FP32) {
