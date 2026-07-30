@@ -987,8 +987,15 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         nntrainer::Tensor cur_weight =
           weight_p->getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+        // Ask cur_weight, the row view this branch is about to read, rather
+        // than the whole-weight handle: the two always carry the same dtype,
+        // and cur_weight is the one name that survives a loader change to how
+        // the embedding weight is held (a raw Tensor here, a pointer that may
+        // be null on the sidecar path elsewhere). This block only compiles
+        // under -Denable-cuda=true, so a stale name here is invisible to every
+        // other build.
         if (emb_dev_only &&
-            weight.getDataType() == nntrainer::TensorDim::DataType::FP32) {
+            cur_weight.getDataType() == nntrainer::TensorDim::DataType::FP32) {
           // FP32 weight row -> FP16 device-only output: explicit narrowing
           // cast into the pinned staging (copyData would byte-copy 2x and the
           // host write would fault on the device-only buffer). Scale folded.
