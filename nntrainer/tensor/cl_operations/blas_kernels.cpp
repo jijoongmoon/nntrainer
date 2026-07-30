@@ -16,6 +16,7 @@
 
 #include "cl_tensor_view.h"
 #include "util_func.h"
+#include "v8c_pack_cache.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -2045,7 +2046,8 @@ void v8c_flush_pending_uploads() {
 
 std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   const uint8_t *plain_nibbles, const float *fp32_scales, unsigned int N,
-  unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_int4_buf) {
+  unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_int4_buf,
+  const char *cache_name) {
   if (K % 32 != 0)
     throw std::invalid_argument(
       "make_v8c_weight_backing_from_qs4cx: K must be a multiple of 32");
@@ -2104,6 +2106,52 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   std::vector<int32_t> row_sum_w_int4(N, 0);
   const size_t real_row_bytes = (size_t)K / 2;
   cl_command_queue cq = blas_cc->command_queue_inst_.GetCommandQueue();
+
+  // Cache hit: the permute and the row-sum fold are a deterministic pure
+  // function of the plain nibbles, so a validated record from a previous run
+  // is the same bytes this pass would produce. Upload it straight from the
+  // pack mapping -- no staging copy, no permute, no row-sum pass -- and drop
+  // the file pages per chunk, so the transient residency of the pack stays at
+  // one chunk instead of the whole payload.
+  bool from_cache = false;
+  if (!hostptr && cache_name != nullptr) {
+    v8c_pack::Hit hit;
+    if (v8c_pack::lookup(cache_name, N, K, v8c_row_bytes, total_bytes, hit)) {
+      constexpr size_t UP_CHUNK = 64u << 20;
+      cl_int werr = CL_SUCCESS;
+      for (size_t off = 0; off < total_bytes && werr == CL_SUCCESS;
+           off += UP_CHUNK) {
+        const size_t len = std::min(UP_CHUNK, total_bytes - off);
+        werr = clEnqueueWriteBuffer(cq, w_buf, CL_TRUE, off, len,
+                                    hit.payload + off, 0, nullptr, nullptr);
+        v8c_pack::Hit consumed;
+        consumed.payload = hit.payload + off;
+        consumed.payload_len = len;
+        v8c_pack::payload_consumed(consumed);
+      }
+      if (werr == CL_SUCCESS) {
+        std::memcpy(row_sum_w_int4.data(), hit.rowsum,
+                    (size_t)N * sizeof(int32_t));
+        from_cache = true;
+      }
+      // An upload error simply falls through to the derive below.
+    }
+  }
+
+  // Cache miss: tee each packed chunk to the pack's temp file as it is
+  // derived. The writes go to disjoint offsets, so loader workers deriving
+  // different weights stay independent, and the guard drops the record if
+  // anything below throws, so a half-derived weight is never indexed.
+  struct PackRecGuard {
+    v8c_pack::RecordWriter *rw = nullptr;
+    ~PackRecGuard() {
+      if (rw)
+        v8c_pack::abort_record(rw);
+    }
+  } pack_rec;
+  if (!from_cache && !hostptr && cache_name != nullptr)
+    pack_rec.rw =
+      v8c_pack::begin_record(cache_name, N, K, v8c_row_bytes, total_bytes);
 
   // hostptr: map the whole buffer once and build straight into it (no staging).
   uint8_t *map_ptr = nullptr;
@@ -2167,7 +2215,9 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   // weights keep the serial path (thread spin-up would dominate).
   constexpr size_t PAR_THRESHOLD_BYTES = 64u << 20;
   const size_t n_chunks = ((size_t)N + chunk_rows - 1) / chunk_rows;
-  if (!hostptr && total_bytes >= PAR_THRESHOLD_BYTES && n_chunks > 1) {
+  if (from_cache) {
+    // payload and row sums already came from the pack mapping above
+  } else if (!hostptr && total_bytes >= PAR_THRESHOLD_BYTES && n_chunks > 1) {
     unsigned int hw = std::thread::hardware_concurrency();
     if (hw == 0)
       hw = 4;
@@ -2188,6 +2238,8 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
           const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
           std::memset(staging.data(), 0, nrows * v8c_row_bytes);
           pack_rows(n0, nrows, staging.data());
+          v8c_pack::record_write(pack_rec.rw, n0 * v8c_row_bytes,
+                                 staging.data(), nrows * v8c_row_bytes);
           const cl_int werr = clEnqueueWriteBuffer(
             cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
             staging.data(), 0, nullptr, nullptr);
@@ -2229,6 +2281,8 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
         std::memset(dst, 0, nrows * v8c_row_bytes); // padding stays 0
       }
       pack_rows(n0, nrows, dst);
+      v8c_pack::record_write(pack_rec.rw, n0 * v8c_row_bytes, dst,
+                             nrows * v8c_row_bytes);
       if (!hostptr) {
         if (upload_async) {
           cl_event ev = nullptr;
@@ -2267,6 +2321,14 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     }
     clFinish(cq); // the unmap must land before the GEMM binds this weight
   }
+
+  // Derive finished: append the row sums, checksum the record and index it.
+  // A no-op when the guard holds no writer; commit_record owns the handle.
+  if (pack_rec.rw) {
+    v8c_pack::commit_record(pack_rec.rw, row_sum_w_int4.data(), N);
+    pack_rec.rw = nullptr;
+  }
+
   auto backing = std::make_unique<tv::TensorBacking>(
     ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, total_bytes,
     /** owned */ true);
