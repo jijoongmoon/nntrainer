@@ -268,15 +268,27 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
       return 0; // off
     return 32;  // decode-only default
   }();
-  if (dt == DT::FP16 && gt == DT::FP16 && out.getDataType() == DT::FP16 &&
-      (int)rows <= gpu_max_rows) {
+  if (dt == DT::FP16 && out.getDataType() == DT::FP16 &&
+      (gt == DT::FP16 || gt == DT::FP32) && (int)rows <= gpu_max_rows) {
     const unsigned short *xi =
       reinterpret_cast<const unsigned short *>(in.getData<_FP16>());
-    const unsigned short *gi =
-      reinterpret_cast<const unsigned short *>(gamma.getData<_FP16>());
     unsigned short *yi =
       reinterpret_cast<unsigned short *>(out.getData<_FP16>());
-    if (dev_ok(xi) && dev_ok(gi) && dev_ok(yi) &&
+    // gamma is unquantized FP32 on disk and the RMSNorm layers request it as
+    // FP32 for that reason, so an FP16 activation with an FP32 gamma is the
+    // normal case -- the host tail below handles it explicitly. Requiring
+    // gt == FP16 here therefore disabled the device norm outright instead of
+    // narrowing it; bind a converted, cached fp16 gamma instead.
+    const unsigned short *gi = nullptr;
+    bool gamma_ok;
+    if (gt == DT::FP16) {
+      gi = reinterpret_cast<const unsigned short *>(gamma.getData<_FP16>());
+      gamma_ok = dev_ok(gi);
+    } else {
+      gamma_ok =
+        cuda::cuda_rmsnorm_gamma_to_fp16(gamma.getData<float>(), width, &gi);
+    }
+    if (gamma_ok && dev_ok(xi) && dev_ok(yi) &&
         cuda::cuda_rmsnorm_fp16(xi, gi, yi, eps, rows, width))
       return;
   }

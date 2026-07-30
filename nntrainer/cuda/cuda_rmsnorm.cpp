@@ -14,6 +14,7 @@
 
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
+#include <cuda_fc_qint4.h> // cuda_fc_qs4cx_scales_to_uvm_fp16 (fp32 -> cached fp16)
 #include <cuda_stream_manager.h>
 
 #include <nntrainer_log.h>
@@ -179,6 +180,19 @@ bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
     return false;
   rms_maybe_finish(out);
   return true;
+}
+
+bool cuda_rmsnorm_gamma_to_fp16(const float *gamma_fp32, unsigned int width,
+                                const unsigned short **out_gamma) {
+  if (gamma_fp32 == nullptr || width == 0 || out_gamma == nullptr)
+    return false;
+  // Identical lifetime and coherence contract to the FC per-channel scale
+  // buffer: an fp32 vector belonging to a static weight, host-written once and
+  // device-read every call, cached by the fp32 pointer, and refused inside a
+  // graph capture (an allocation there invalidates the capture). Reuse that
+  // builder instead of keeping a second copy of the managed-vs-pinned
+  // (concurrentManagedAccess) selection logic in sync.
+  return cuda_fc_qs4cx_scales_to_uvm_fp16(gamma_fp32, width, out_gamma);
 }
 
 bool cuda_rms_reverse_norm_fp16(const unsigned short *in,
