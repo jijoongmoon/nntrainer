@@ -31,6 +31,7 @@
 #include <compute_ops.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -1148,6 +1149,58 @@ void NeuralNetwork::load(const std::string &file_path,
 
       std::atomic<size_t> next_load_index{0};
 
+      // Hand-out order for the shared cursor above.
+      //
+      // Walking the graph order hands a giant node out whenever the graph
+      // happens to mention it, and the worker that draws it then runs alone
+      // for the rest of the load while everybody else waits at the join: a
+      // single node's copy span becomes the join wall. Measured on a 35-layer
+      // decoder-only model whose packed per-layer embedding is ~1.3 GB, that
+      // one node took 300-340 ms on one worker, against a barrier idle sum of
+      // 1.9-3.6 s out of a 3.4-4.4 s busy sum and a worker-finish spread of
+      // 130-250 ms.
+      //
+      // Serve the few nodes big enough to set the tail on their own first,
+      // largest first, so they get the whole load as runway; everything else
+      // keeps the graph order. Sorting the WHOLE queue largest-first balances
+      // slightly better (~25 ms) but starts every fat payload at once, and the
+      // transient peak grew 0.5-1.1 GB because the staging maps then overlap;
+      // hence the threshold, which on every model measured selects 3-4 nodes
+      // (the packed embedding, an untied lm_head, the input embedding).
+      //
+      // This is scheduling only: each node is still read exactly once by the
+      // same worker body, so the bytes written and the file offsets read are
+      // untouched, and stable_partition + stable_sort keep the order
+      // deterministic for a given graph.
+      //
+      // NNTR_LOAD_LPT: 1 (default) giants first, 0 the legacy graph order,
+      // 2 a full largest-first sort (the A/B arm above, kept for measurement).
+      std::vector<size_t> load_order(num_load_nodes);
+      for (size_t i = 0; i < num_load_nodes; ++i)
+        load_order[i] = i;
+      const int load_lpt = []() {
+        const char *e = std::getenv("NNTR_LOAD_LPT");
+        return e ? std::atoi(e) : 1;
+      }();
+      if (load_lpt > 0) {
+        constexpr size_t GIANT_BYTES = 128u << 20;
+        std::vector<size_t> node_cost(num_load_nodes, 0);
+        for (size_t i = 0; i < num_load_nodes; ++i)
+          for (unsigned int w = 0; w < load_nodes[i]->getNumWeights(); ++w)
+            node_cost[i] += load_nodes[i]->getWeight(w).getMemoryBytes();
+        const auto bigger = [&node_cost](size_t a, size_t b) {
+          return node_cost[a] > node_cost[b];
+        };
+        if (load_lpt >= 2) {
+          std::stable_sort(load_order.begin(), load_order.end(), bigger);
+        } else {
+          auto giants_end = std::stable_partition(
+            load_order.begin(), load_order.end(),
+            [&node_cost](size_t i) { return node_cost[i] >= GIANT_BYTES; });
+          std::stable_sort(load_order.begin(), giants_end, bigger);
+        }
+      }
+
 #if !defined(_WIN32)
       // Bounds the source-file pages held while workers copy into the pool.
       LoaderStagingMaps staging_maps;
@@ -1158,7 +1211,7 @@ void NeuralNetwork::load(const std::string &file_path,
                next_load_index.fetch_add(1, std::memory_order_relaxed);
              idx < num_load_nodes;
              idx = next_load_index.fetch_add(1, std::memory_order_relaxed)) {
-          auto node = load_nodes[idx];
+          auto node = load_nodes[load_order[idx]];
 
           if (!MMAP_READ) {
             auto local_model_file = checkedOpenStream<std::ifstream>(
