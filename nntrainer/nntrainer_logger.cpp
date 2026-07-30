@@ -82,18 +82,21 @@ Logger::Logger() : ts_type(NNTRAINER_LOG_TIMESTAMP_SEC) {
      << now.tm_mday << std::setfill('0') << std::setw(2) << now.tm_hour
      << std::setfill('0') << std::setw(2) << now.tm_min << std::setfill('0')
      << std::setw(2) << now.tm_sec << ".out";
-  if (!std::filesystem::exists(logfile_dir)) {
-    std::filesystem::create_directories(logfile_dir);
+  // Non-throwing overloads, and no throw when the file cannot be opened: the
+  // log directory is relative to the working directory, which a packaged
+  // application does not choose and often cannot write. This constructor runs
+  // on the first log call of the process, from inside ml_log*(), which every
+  // caller treats as non-throwing -- including noexcept ones, where an
+  // escaping exception terminates the process. A missing log file must cost
+  // the log file, nothing else.
+  std::error_code ec;
+  if (!std::filesystem::exists(logfile_dir, ec)) {
+    std::filesystem::create_directories(logfile_dir, ec);
   }
   outputstream.open(logfile_dir + ss.str(), std::ios_base::app);
   if (!outputstream.good()) {
-    char buf[256] = {
-      0,
-    };
-    std::string cur_path = std::string(buf);
-    std::string err_msg =
-      "Unable to initialize the Logger on path(" + cur_path + ")";
-    throw std::runtime_error(err_msg);
+    std::cerr << "nntrainer: cannot open a log file under " << logfile_dir
+              << "; file logging is disabled for this process\n";
   }
 }
 
