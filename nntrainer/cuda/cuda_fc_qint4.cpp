@@ -11,6 +11,7 @@
  */
 
 #include "cuda_fc_qint4.h"
+#include "cuda_pack_cache.h"
 
 #include <cuda_blas_manager.h>
 #include <cuda_context.h>
@@ -20,9 +21,11 @@
 #include <nntrainer_log.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread_manager.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -772,6 +775,25 @@ std::unordered_map<const void *, DevWeightI8> g_i8_weight_cache;
 // int8 cache would be dead VRAM). The lazy runtime build self-heals if one is
 // ever reached anyway.
 std::unordered_set<const void *> g_i8_exempt;
+
+// --- prewarm cost accounting ----------------------------------------------
+// Split of the load-time prewarm lap into the parts a persistent pack cache
+// CAN remove (host derive: permute/unpack + row sums, and the miss-path tee)
+// and the part it CANNOT (the H2D upload, which happens either way). This is
+// what decides whether the disk cache is worth its bytes on this lane, so it
+// is permanent instrumentation, not a probe -- read via
+// cuda_fc_qs4cx_prewarm_stats().
+double g_prewarm_derive_ms = 0.0;
+double g_prewarm_upload_ms = 0.0;
+double g_prewarm_tee_ms = 0.0;
+double g_prewarm_hit_ms = 0.0;
+size_t g_prewarm_derive_bytes = 0;
+size_t g_prewarm_hit_bytes = 0;
+double g_stat_clock() {
+  return std::chrono::duration<double, std::milli>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+}
 int *g_i8_c = nullptr; // int32 GEMM output scratch [Mpad,N]
 size_t g_i8_c_cap = 0;
 // act-quant dedup (opt-in NNTR_QUANT_DEDUP): sibling FCs sharing an input
@@ -1306,7 +1328,7 @@ void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w) {
 }
 
 bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
-                           unsigned int K) {
+                           unsigned int K, const char *cache_name) {
   if (plain_w == nullptr || N == 0 || K == 0)
     return true;
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
@@ -1314,6 +1336,14 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
     return true; // already cached
   const size_t Kh = (K + 1u) / 2u;
   auto &tm = nntrainer::ThreadManager::Global();
+  const bool pack_cache = cuda_pack::enabled() && cache_name != nullptr;
+  // Record names are "<weight name>#<kind>"; the weight name comes from the
+  // graph, so it is stable across launches -- unlike the plain pointer, which
+  // is exactly what must never key a persistent cache.
+  const std::string rec_dp4a =
+    pack_cache ? std::string(cache_name) + "#dp4a" : std::string();
+  const std::string rec_i8 =
+    pack_cache ? std::string(cache_name) + "#i8" : std::string();
 
   // Build + upload in bounded chunks: a full host mirror of the untied
   // lm_head (N=262144) is ~350MB packed + ~700MB int8 and those transients
@@ -1330,14 +1360,46 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
     cudaFree(dw.plain);
     return false;
   }
-  {
+  // [pack-cache HIT] the permute + row-sum fold are a deterministic pure
+  // function of the plain nibbles, so a validated pack record can be uploaded
+  // straight from the pack mmap: no host permute, no staging vector, and the
+  // consumed file pages are dropped per chunk so residency stays at one chunk.
+  bool dp4a_from_cache = false;
+  if (pack_cache) {
+    cuda_pack::Hit hit;
+    if (cuda_pack::lookup(rec_dp4a.c_str(), N, K, Kh, (size_t)N * Kh, hit)) {
+      const double t0 = g_stat_clock();
+      bool ok = true;
+      for (size_t off = 0; off < hit.payload_len && ok;
+           off += PREWARM_CHUNK_BYTES) {
+        const size_t len = std::min(PREWARM_CHUNK_BYTES, hit.payload_len - off);
+        ok = cudaMemcpy(dw.plain + off, hit.payload + off, len,
+                        cudaMemcpyHostToDevice) == cudaSuccess;
+        cuda_pack::payload_consumed(hit.payload + off, len);
+      }
+      ok = ok && cudaMemcpy(dw.rowsum, hit.rowsum, sizeof(int) * (size_t)N,
+                            cudaMemcpyHostToDevice) == cudaSuccess;
+      if (ok) {
+        dp4a_from_cache = true;
+        g_prewarm_hit_ms += g_stat_clock() - t0;
+        g_prewarm_hit_bytes += hit.payload_len;
+      }
+      // upload error: fall through to the derive (silent fallback)
+    }
+  }
+  if (!dp4a_from_cache) {
     // packed int4 [N][Kh] in row chunks (rows are contiguous on both sides).
     const size_t chunk_rows =
       std::max<size_t>(1, std::min<size_t>(N, PREWARM_CHUNK_BYTES / Kh));
     std::vector<signed char> packed(chunk_rows * Kh);
     std::vector<int> rowsum(N, 0);
+    cuda_pack::RecordWriter *rw =
+      pack_cache
+        ? cuda_pack::begin_record(rec_dp4a.c_str(), N, K, Kh, (size_t)N * Kh)
+        : nullptr;
     for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
       const size_t rows = std::min(chunk_rows, (size_t)N - n0);
+      const double t0 = g_stat_clock();
       tm.parallel_for(0, rows, [&](size_t r) {
         const unsigned char *src = plain_w + (n0 + r) * Kh;
         signed char *prow = packed.data() + r * Kh;
@@ -1351,11 +1413,23 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
         }
         rowsum[n0 + r] = (int)acc;
       });
+      const double t1 = g_stat_clock();
+      // tee the derived chunk to the pack temp file (page-cache speed, no
+      // extra staging: the bytes are already in `packed`)
+      if (rw)
+        cuda_pack::record_write(rw, n0 * Kh, packed.data(), rows * Kh);
+      const double t2 = g_stat_clock();
       cudaMemcpy(dw.plain + n0 * Kh, packed.data(), rows * Kh,
                  cudaMemcpyHostToDevice);
+      g_prewarm_derive_ms += t1 - t0;
+      g_prewarm_tee_ms += t2 - t1;
+      g_prewarm_upload_ms += g_stat_clock() - t2;
+      g_prewarm_derive_bytes += rows * Kh;
     }
     cudaMemcpy(dw.rowsum, rowsum.data(), sizeof(int) * (size_t)N,
                cudaMemcpyHostToDevice);
+    if (rw)
+      cuda_pack::commit_record(rw, rowsum.data(), N);
   }
   g_dp4a_plain_cache.emplace(plain_w, dw);
 
@@ -1381,8 +1455,39 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
     DevWeightI8 dw8;
     if (alloc_i8_weight(&dw8.w8, N, K) == cudaSuccess &&
         cudaMalloc(&dw8.rowsum, sizeof(int) * (size_t)N) == cudaSuccess) {
-      for (size_t k0 = 0; k0 < K; k0 += chunk_k) {
+      // [pack-cache HIT] the [K,N] transpose-unpack is the most expensive
+      // derive on this path (column-strided writes) and is likewise a pure
+      // function of the plain nibbles.
+      bool i8_from_cache = false;
+      if (pack_cache) {
+        cuda_pack::Hit hit;
+        if (cuda_pack::lookup(rec_i8.c_str(), N, K, N, (size_t)K * N, hit)) {
+          const double t0 = g_stat_clock();
+          bool ok = true;
+          for (size_t off = 0; off < hit.payload_len && ok;
+               off += PREWARM_CHUNK_BYTES) {
+            const size_t len =
+              std::min(PREWARM_CHUNK_BYTES, hit.payload_len - off);
+            ok = cudaMemcpy(dw8.w8 + off, hit.payload + off, len,
+                            cudaMemcpyHostToDevice) == cudaSuccess;
+            cuda_pack::payload_consumed(hit.payload + off, len);
+          }
+          ok = ok && cudaMemcpy(dw8.rowsum, hit.rowsum, sizeof(int) * (size_t)N,
+                                cudaMemcpyHostToDevice) == cudaSuccess;
+          if (ok) {
+            i8_from_cache = true;
+            g_prewarm_hit_ms += g_stat_clock() - t0;
+            g_prewarm_hit_bytes += hit.payload_len;
+          }
+        }
+      }
+      cuda_pack::RecordWriter *rw =
+        (pack_cache && !i8_from_cache)
+          ? cuda_pack::begin_record(rec_i8.c_str(), N, K, N, (size_t)K * N)
+          : nullptr;
+      for (size_t k0 = 0; !i8_from_cache && k0 < K; k0 += chunk_k) {
         const size_t ks = std::min(chunk_k, (size_t)K - k0);
+        const double t0 = g_stat_clock();
         tm.parallel_for(0, (size_t)N, [&](size_t n) {
           const unsigned char *src = plain_w + n * Kh;
           long acc = 0;
@@ -1394,20 +1499,51 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
           }
           rs8[n] += acc;
         });
+        const double t1 = g_stat_clock();
+        if (rw)
+          cuda_pack::record_write(rw, k0 * (size_t)N, w8.data(),
+                                  ks * (size_t)N);
+        const double t2 = g_stat_clock();
         cudaMemcpy(dw8.w8 + k0 * N, w8.data(), ks * (size_t)N,
                    cudaMemcpyHostToDevice);
+        g_prewarm_derive_ms += t1 - t0;
+        g_prewarm_tee_ms += t2 - t1;
+        g_prewarm_upload_ms += g_stat_clock() - t2;
+        g_prewarm_derive_bytes += ks * (size_t)N;
       }
-      std::vector<int> rs8i(N);
-      for (size_t n = 0; n < N; ++n)
-        rs8i[n] = (int)rs8[n];
-      cudaMemcpy(dw8.rowsum, rs8i.data(), sizeof(int) * (size_t)N,
-                 cudaMemcpyHostToDevice);
+      if (!i8_from_cache) {
+        std::vector<int> rs8i(N);
+        for (size_t n = 0; n < N; ++n)
+          rs8i[n] = (int)rs8[n];
+        cudaMemcpy(dw8.rowsum, rs8i.data(), sizeof(int) * (size_t)N,
+                   cudaMemcpyHostToDevice);
+        if (rw)
+          cuda_pack::commit_record(rw, rs8i.data(), N);
+      }
       g_i8_weight_cache.emplace(plain_w, dw8);
     } else if (dw8.w8) {
       cudaFree(dw8.w8);
     }
   }
   return true;
+}
+
+void cuda_fc_qs4cx_prewarm_stats(double *derive_ms, double *upload_ms,
+                                 double *tee_ms, double *hit_ms,
+                                 size_t *derive_bytes, size_t *hit_bytes) {
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  if (derive_ms)
+    *derive_ms = g_prewarm_derive_ms;
+  if (upload_ms)
+    *upload_ms = g_prewarm_upload_ms;
+  if (tee_ms)
+    *tee_ms = g_prewarm_tee_ms;
+  if (hit_ms)
+    *hit_ms = g_prewarm_hit_ms;
+  if (derive_bytes)
+    *derive_bytes = g_prewarm_derive_bytes;
+  if (hit_bytes)
+    *hit_bytes = g_prewarm_hit_bytes;
 }
 
 bool cuda_fc_qint4_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
