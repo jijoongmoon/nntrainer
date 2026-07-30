@@ -28,15 +28,34 @@ void RMSNormLayer::finalize(InitLayerContext &context) {
   if (!std::get<props::SkipPrefill>(rms_props).empty())
     skip_prefill = std::get<props::SkipPrefill>(rms_props).get();
 
-  // gamma follows the model weight dtype: quantized bins with FP16 norm
-  // weights store gamma as FP16, and an FP32 hardcode here would positionally
-  // misread the packed weight file from this tensor onward. FP32-weight bins
-  // request FP32 gamma as before; a dtype mismatch against the activation is
-  // resolved inside the whole-op (gamma is cloned to the activation dtype at
-  // the multiply).
-  TensorDim gamma_dim(
-    1, 1, 1, dim[0].width(),
-    TensorDim::TensorType(context.getFormat(), context.getWeightDataType()));
+  // gamma is never quantized, but it is not unconditionally FP32 either: a bin
+  // stores it at the model's FLOAT dtype, so an FP16-activation package holds
+  // 2 bytes per element. Request the context's weight dtype when that dtype is
+  // itself a float type, and FP32 otherwise. Neither constant alone is right:
+  //
+  //  - A hard FP32 over-requests on an FP16 package. Weights are consumed as a
+  //    packed stream in graph order, so asking 4 bytes where 2 are stored
+  //    shifts every later offset and the loader rejects the layout outright
+  //    ("graph expects N bytes ... has only M"). Every rms_norm gamma in the
+  //    graph is charged the extra 2 bytes per element.
+  //  - A bare getWeightDataType() is only safe because every norm node is
+  //    created with packed=false, which makes LayerNode::finalize() set
+  //    tensor_type[1] = tensor_type[2] before InitLayerContext is built, i.e.
+  //    the context's weight dtype IS the activation dtype here. A caller that
+  //    forgets packed=false would otherwise get a BLOCK-QUANTIZED gamma
+  //    (Q4_0/Q6_K/QS4CX): a shorter record with a different encoding, which
+  //    desyncs the packed stream from that tensor onward. The float-type test
+  //    below is what keeps that caller correct.
+  //
+  // A dtype mismatch against the activation is resolved inside the whole-op
+  // (gamma is cloned to the activation dtype at the multiply).
+  const auto norm_w_dtype = context.getWeightDataType();
+  const auto norm_dtype = (norm_w_dtype == TensorDim::DataType::FP32 ||
+                           norm_w_dtype == TensorDim::DataType::FP16)
+                            ? norm_w_dtype
+                            : TensorDim::DataType::FP32;
+  TensorDim gamma_dim(1, 1, 1, dim[0].width(),
+                      TensorDim::TensorType(context.getFormat(), norm_dtype));
   wt_idx[RMSParams::gamma] =
     context.requestWeight(gamma_dim, props::InitializerInfo::Enum::NONE,
                           WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
