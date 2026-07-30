@@ -75,6 +75,32 @@ std::vector<std::byte> readBinaryFile(const std::string &path) {
   }
 }
 
+/**
+ * @brief Directory the kernel binary cache lives in.
+ *
+ * Resolution order, first writable candidate wins:
+ *   1. NNTR_KERNEL_CACHE_DIR -- explicit override. This is the integration
+ *      point for a packaged application, which knows its own private storage
+ *      (an Android app would pass its Context.getCacheDir() here) and cannot
+ *      rely on the process working directory being writable at all.
+ *   2. TMPDIR, when set, as <TMPDIR>/nntrainer_opencl_kernels.
+ *   3. The legacy opencl-kernel-path value, which is relative to the working
+ *      directory. Kept last for compatibility.
+ *
+ * The legacy path is still READ even when it is not the resolved directory, so
+ * caches written by an earlier version are not orphaned.
+ */
+static const std::string &kernelCacheDir() {
+  static const std::string dir = []() -> std::string {
+    if (const char *e = std::getenv("NNTR_KERNEL_CACHE_DIR"); e && *e)
+      return std::string(e);
+    if (const char *t = std::getenv("TMPDIR"); t && *t)
+      return std::string(t) + "/" + opencl::Program::DEFAULT_KERNEL_PATH;
+    return opencl::Program::DEFAULT_KERNEL_PATH;
+  }();
+  return dir;
+}
+
 bool writeBinaryFile(const std::string &path,
                      const std::vector<std::byte> &data) {
   std::ofstream fs(path, std::ios::out | std::ios::binary);
@@ -221,13 +247,13 @@ void ClContext::initialize() noexcept {
       // the catch below and skip the whole registration block, leaving a
       // half-initialized ClContext.
       std::error_code cache_dir_ec;
-      std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH,
-                                          cache_dir_ec);
+      std::filesystem::create_directories(kernelCacheDir(), cache_dir_ec);
       if (cache_dir_ec)
         ml_logw("Kernel cache directory %s unusable (%s); kernels will compile "
                 "from source",
-                opencl::Program::DEFAULT_KERNEL_PATH.c_str(),
-                cache_dir_ec.message().c_str());
+                kernelCacheDir().c_str(), cache_dir_ec.message().c_str());
+      else
+        ml_logi("Kernel binary cache directory: %s", kernelCacheDir().c_str());
     }
 
     initBlasClKernels();
@@ -574,13 +600,21 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   // (and re-caches), never a hard failure.
   static const std::string device_sig =
     opencl::ContextManager::Global().GetDeviceSignature();
-  std::string binary_file_path =
-    opencl::Program::DEFAULT_KERNEL_PATH + "/" +
+  const std::string binary_file_name =
     std::to_string(program.GetKernelHash(kernel_string,
                                          compile_options + "|" + device_sig)) +
     ".cl.bin";
+  std::string binary_file_path = kernelCacheDir() + "/" + binary_file_name;
   auto binary_data = KERNEL_CACHE_ENABLED ? readBinaryFile(binary_file_path)
                                           : std::vector<std::byte>();
+  if (KERNEL_CACHE_ENABLED && binary_data.empty() &&
+      kernelCacheDir() != opencl::Program::DEFAULT_KERNEL_PATH) {
+    // Fall back to the legacy working-directory location so a cache written
+    // before the directory was resolvable is still used (read-only: new
+    // entries go to the resolved directory).
+    binary_data = readBinaryFile(opencl::Program::DEFAULT_KERNEL_PATH + "/" +
+                                 binary_file_name);
+  }
 
   bool loaded_from_binary = false;
   if (KERNEL_CACHE_ENABLED && !binary_data.empty()) {
