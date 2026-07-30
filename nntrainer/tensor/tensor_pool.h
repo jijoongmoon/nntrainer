@@ -50,7 +50,7 @@ public:
    */
   TensorPool() :
     allocator_(std::make_shared<MemAllocator>()),
-    mem_pool(std::make_unique<MemoryPool>(allocator_)),
+    mem_pool(allocator_->makePool(allocator_)),
     cache_loader(nullptr) {}
 
   /**
@@ -66,7 +66,7 @@ public:
     ml::train::ExecutionMode execution_mode = ml::train::ExecutionMode::TRAIN,
     std::shared_ptr<MemAllocator> allocator =
       std::make_shared<MemAllocator>()) :
-    allocator_(std::move(allocator)) {
+    allocator_(std::move(allocator)), pool_name_(fsu_name) {
     if (enable_fsu) {
       auto cache_pool = std::make_shared<CachePool>(fsu_path, fsu_name,
                                                     execution_mode, allocator_);
@@ -90,10 +90,18 @@ public:
 
   /**
    * @brief     reinitialize TensorPool
+   * @note  The replacement pool comes from allocator_->makePool(), exactly as
+   *        in the constructor: the allocator -- not this class -- owns the
+   *        pool-KIND decision. Hardcoding MemoryPool here would silently
+   *        downgrade a device pool (ClSVMAllocator::makePool's ClBufferPool
+   *        under NNTR_GPU_CLMEM_POOL) to a host one, after which tensors keep
+   *        classifying as device-resident while their cl_mem handle is null.
+   *        The pool name is preserved because makePool keys the device-plane
+   *        decision on it (the weight pool opts out).
    */
   void reinitialize() {
     name_map.clear();
-    mem_pool = std::make_shared<MemoryPool>(allocator_);
+    mem_pool = allocator_->makePool(allocator_, pool_name_);
   }
 
   /**
@@ -109,7 +117,10 @@ public:
       throw std::runtime_error(
         "[TensorPool] cannot change allocator after allocation");
     allocator_ = std::move(allocator);
-    mem_pool = std::make_shared<MemoryPool>(allocator_);
+    // Same rule as reinitialize(): the NEW allocator decides the pool kind.
+    // Building a MemoryPool here would defeat the whole point of swapping in a
+    // device-capable allocator.
+    mem_pool = allocator_->makePool(allocator_, pool_name_);
   }
 
   /**
@@ -514,6 +525,12 @@ private:
                      CachePool. Stored on TensorPool so reinitialize()
                      can recreate the pool with the same backend
                      without re-resolving from the engine. */
+  /**
+   * pool identity handed to MemAllocator::makePool. Stored for the same reason
+   * as allocator_: a pool rebuilt by reinitialize()/setAllocator() must ask
+   * for the same pool KIND, and makePool decides that from this name.
+   */
+  std::string pool_name_;
   std::shared_ptr<MemoryPool> mem_pool;      /**< memory pool for the tensors */
   std::unique_ptr<CacheLoader> cache_loader; /**< memory pool for the tensors */
 
