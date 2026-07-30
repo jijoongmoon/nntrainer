@@ -127,7 +127,11 @@ void ScalarMultiplyLayer::forwarding(nntrainer::RunLayerContext &context,
 void ScalarMultiplyLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  bool is_prefill = !from;
+  // A multi-token step is a prefill step even when it does not start at 0: a
+  // resumed turn prefills from the KV cache position it left off at, and a
+  // chunked prefill issues every chunk after the first with from > 0. Testing
+  // only `!from` would run those blocks down the decode path.
+  bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
 

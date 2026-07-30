@@ -514,7 +514,13 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 void TieWordEmbedding::incremental_forwarding_lmhead(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  bool is_prefill = !from;
+  // A multi-token step is a prefill step even when it does not start at 0: a
+  // resumed turn prefills from the KV cache position it left off at, and a
+  // chunked prefill issues every chunk after the first with from > 0. Testing
+  // only `!from` leaves those blocks running the full vocab projection whose
+  // logits the caller then discards -- a skip_prefill driver seeds generation
+  // from the last prompt token and never reads prefill logits.
+  bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
 
