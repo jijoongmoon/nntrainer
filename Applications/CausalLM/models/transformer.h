@@ -431,6 +431,10 @@ protected:
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
+  /** path load_weight() actually consumed. The CUDA derive-once pack cache
+   *  keys its pack on this file's (size, mtime) identity -- a persistent cache
+   *  must be bound to the bytes it was derived from, never to a pointer. */
+  std::string LOADED_WEIGHT_PATH;
 
   /** untie lm_head from the input embedding (separate FC weight, not shared
    *  with the embedding table). Lives here (not CausalLM) because embedding0's
