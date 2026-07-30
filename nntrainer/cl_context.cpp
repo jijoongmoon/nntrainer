@@ -28,6 +28,7 @@
 #include <transpose_cl.h>
 
 #include <filesystem>
+#include <system_error>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -77,7 +78,20 @@ void ClContext::initialize() noexcept {
       return;
     }
     if (KERNEL_CACHE_ENABLED) {
-      std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH);
+      // Non-throwing overload on purpose: the cache directory is relative to
+      // the working directory by default (see the opencl-kernel-path option),
+      // so it can be uncreatable in a read-only or sandboxed CWD. That must
+      // cost the cache, not the context -- the throwing overload would land in
+      // the catch below and skip the whole registration block, leaving a
+      // half-initialized ClContext.
+      std::error_code cache_dir_ec;
+      std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH,
+                                          cache_dir_ec);
+      if (cache_dir_ec)
+        ml_logw("Kernel cache directory %s unusable (%s); kernels will compile "
+                "from source",
+                opencl::Program::DEFAULT_KERNEL_PATH.c_str(),
+                cache_dir_ec.message().c_str());
     }
 
     initBlasClKernels();
@@ -276,20 +290,37 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 
   opencl::Program program;
 
-  // reading binary
+  // Cache key: the source AND the compile options. A stored binary is only a
+  // valid substitute for the exact source it was built from with the exact
+  // options it was built with, so kernels that share one source but differ in
+  // compile options (e.g. an fp16 variant selected by a -D) must not collide
+  // on one cache entry.
   std::string binary_file_path =
     opencl::Program::DEFAULT_KERNEL_PATH + "/" +
-    std::to_string(program.GetKernelHash(kernel_string, "")) + ".cl.bin";
+    std::to_string(program.GetKernelHash(kernel_string, compile_options)) +
+    ".cl.bin";
   auto binary_data = KERNEL_CACHE_ENABLED ? readBinaryFile(binary_file_path)
                                           : std::vector<std::byte>();
 
+  bool loaded_from_binary = false;
   if (KERNEL_CACHE_ENABLED && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
             kernel_name.c_str(), binary_file_path.c_str());
-    result = program.CreateCLProgramWithBinary(
+    loaded_from_binary = program.CreateCLProgramWithBinary(
       opencl::ContextManager::Global().GetContext(),
       opencl::ContextManager::Global().GetDeviceId(), binary_data,
       binary_file_path, "");
+    // A binary is device- and driver-specific: one written by another GPU or
+    // before a driver update is rejected here. That is recoverable -- rebuild
+    // from source (and re-cache) rather than failing the kernel.
+    if (!loaded_from_binary)
+      ml_logw("Cached kernel binary %s rejected (stale device/driver?); "
+              "recompiling from source",
+              binary_file_path.c_str());
+  }
+
+  if (loaded_from_binary) {
+    result = true;
   } else {
     ml_logi("Binary for kernel %s not found, compiling from source...",
             kernel_name.c_str());
@@ -299,14 +330,18 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
                               kernel_string, compile_options);
 
     if (KERNEL_CACHE_ENABLED && result) {
+      // Persisting the binary is best effort: the freshly compiled program is
+      // already usable, so a read-only or full cache directory must not fail
+      // the kernel (and with it every GPU code path that needs it).
       auto binary = program.GetProgramBinary(
         opencl::ContextManager::Global().GetDeviceId());
 
       if (binary.empty()) {
-        ml_loge("Failed retrieving binary for kernel %s", kernel_name.c_str());
-        result = false;
-      } else {
-        result &= writeBinaryFile(binary_file_path, binary);
+        ml_logw("Failed retrieving binary for kernel %s; skipping cache write",
+                kernel_name.c_str());
+      } else if (!writeBinaryFile(binary_file_path, binary)) {
+        ml_logw("Failed writing kernel cache %s; continuing",
+                binary_file_path.c_str());
       }
     }
   }
