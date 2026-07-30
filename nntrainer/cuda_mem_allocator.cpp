@@ -86,7 +86,8 @@ bool CudaMemAllocator::consume_host_owned(void *ptr) {
   return host_owned.erase(ptr) > 0;
 }
 
-void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
+void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment,
+                             bool zero) {
   static const bool dbg = std::getenv("NNTR_UVM_DEBUG") != nullptr;
   if (size > 0) {
     void *dptr = nullptr;
@@ -123,7 +124,10 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
           // class): cudaHostAlloc gives no zero guarantee — the runtime may
           // recycle pinned blocks. 0x55 under NNTR_POISON_FILL=1
           // (uninit-consumer discriminator).
-          std::memset(hp, cuda_fill_byte(), size);
+          // ... unless the caller opted out (weight arena): the fill is then a
+          // dead store over a plane the loader rewrites in full.
+          if (zero)
+            std::memset(hp, cuda_fill_byte(), size);
           *ptr = hp;
           if (dbg)
             fprintf(stderr,
@@ -178,7 +182,16 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
       // both (legal on managed under WDDM cMA==0 — it is a DEVICE access);
       // weights are fully overwritten at load so the only lasting cost is a
       // one-time device fill at allocation. 0x55 under NNTR_POISON_FILL=1.
-      cudaMemset(dptr, cuda_fill_byte(), size);
+      //
+      // "the only lasting cost is a one-time device fill" was the hole: on a
+      // managed plane that fill is not cheap, because filling never-touched
+      // managed pages makes the driver POPULATE and migrate the whole plane
+      // before the loader then dirties it again from the host. zero == false
+      // (inference weight arena) drops it; the page faults are not saved, they
+      // move to the load that writes the bytes. Everything else (device-only
+      // activation pool, KV, derived caches) keeps the fill.
+      if (zero)
+        cudaMemset(dptr, cuda_fill_byte(), size);
       *ptr = dptr;
       if (dbg)
         fprintf(stderr, "[UVMDBG] %s %zu bytes -> %p OK\n",
@@ -194,7 +207,7 @@ void CudaMemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   }
   // size==0 or managed alloc failed -> host buffer (correctness > speed). The
   // matching free() consults host_owned to pick std::free vs cudaFree.
-  MemAllocator::alloc(ptr, size, alignment);
+  MemAllocator::alloc(ptr, size, alignment, zero);
   track_host_owned(*ptr);
 }
 

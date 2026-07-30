@@ -147,7 +147,12 @@ void CachePool::inActive(unsigned int order) {
   }
 }
 
-void CachePool::allocate() {
+// `zero` is accepted and deliberately not acted on: a CachePool hands out
+// swap-device-backed elements, not one contiguous allocator plane, so there is
+// no arena-wide fill here to skip. Signature parity only, so the override keeps
+// binding -- a de-virtualized CachePool::allocate would silently resurrect the
+// base MemoryPool path.
+void CachePool::allocate(bool /*zero*/) {
   NNTR_THROW_IF(swap_device->isOperating(), std::runtime_error)
     << "Cache pool is already allocated";
 

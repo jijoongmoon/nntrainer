@@ -34,7 +34,8 @@ public:
   QNNRpcManager();
   ~QNNRpcManager();
 
-  void alloc(void **ptr, size_t size, size_t alignment) override;
+  void alloc(void **ptr, size_t size, size_t alignment,
+             bool zero = true) override;
   void free(void *ptr) override;
 
   std::string getName() override { return "qnn"; }

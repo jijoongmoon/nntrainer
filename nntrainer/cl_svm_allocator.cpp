@@ -88,7 +88,8 @@ static unsigned char nntr_fill_byte() {
   return b;
 }
 
-void ClSVMAllocator::alloc(void **ptr, size_t size, size_t alignment) {
+void ClSVMAllocator::alloc(void **ptr, size_t size, size_t alignment,
+                           bool zero) {
   void *svm = ctx_.createSVMRegion(size);
   if (svm != nullptr) {
     // Honor MemAllocator's documented calloc semantics on the SVM path too
@@ -96,7 +97,14 @@ void ClSVMAllocator::alloc(void **ptr, size_t size, size_t alignment) {
     // zero guarantee: one driver may happen to hand kernel-zeroed pages while
     // another recycles non-zero pool pages — any consumer relying on the zero
     // contract then reads per-process garbage. One-time cost at allocation.
-    std::memset(svm, nntr_fill_byte(), size);
+    //
+    // zero == false means the caller has taken over that contract: the
+    // inference weight arena is overwritten in full from the model file before
+    // anything reads it, so the recycled-page hazard above has no window in
+    // which to matter. Every other pool (activations, KV cache, gradients)
+    // still arrives here with zero == true.
+    if (zero)
+      std::memset(svm, nntr_fill_byte(), size);
     *ptr = svm;
     return;
   }
@@ -104,7 +112,7 @@ void ClSVMAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   // fall back to a host buffer so the layer still runs (correctness >
   // speed). Caller is unaware; only the matching free() needs to pick
   // the right release path.
-  MemAllocator::alloc(ptr, size, alignment);
+  MemAllocator::alloc(ptr, size, alignment, zero);
   track_host_owned(*ptr);
 }
 

@@ -81,7 +81,13 @@ QNNRpcManager::~QNNRpcManager() {
 #endif
 }
 
-void QNNRpcManager::alloc(void **ptr, size_t size, size_t alignment) {
+// `zero` is accepted and deliberately not acted on: neither branch below has a
+// fill to skip. rpcmem_alloc() is handed out as-is (it never honored the calloc
+// contract -- pre-existing, and not this change's to alter), and the non-QNN
+// fallback is calloc(), i.e. unconditionally zeroed. So the weight-arena
+// opt-out is simply not taken on this backend; it is never mis-taken.
+void QNNRpcManager::alloc(void **ptr, size_t size, size_t alignment,
+                          bool /*zero*/) {
   assert(size > 0);
 #ifdef DEBUGPRINT
   std::cout << "QNN alloc size: " << size << std::endl;

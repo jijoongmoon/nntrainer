@@ -463,9 +463,10 @@ public:
   std::vector<void *> freed_ptrs;
   std::vector<size_t> allocated_sizes;
 
-  void alloc(void **ptr, size_t size, size_t alignment) override {
+  void alloc(void **ptr, size_t size, size_t alignment,
+             bool zero = true) override {
     alloc_count++;
-    nntrainer::MemAllocator::alloc(ptr, size, alignment);
+    nntrainer::MemAllocator::alloc(ptr, size, alignment, zero);
     allocated_ptrs.push_back(*ptr);
     allocated_sizes.push_back(size);
   }

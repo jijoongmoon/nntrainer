@@ -48,8 +48,16 @@ public:
    * Tries cudaMallocManaged first; on failure (or size==0) falls back to
    * MemAllocator::alloc and records the pointer as host-owned so free() picks
    * the right release path.
+   *
+   * `zero` is HONORED on all three plane flavors this allocator can return
+   * (pinned host-mapped, managed/device, host fallback). zero == false is the
+   * inference weight arena, whose every byte comes from the model file -- see
+   * MemAllocator::alloc. The pool that asks for it is the WEIGHT pool only; the
+   * device-only activation pool, the KV plane and every derived device cache
+   * still arrive with zero == true and keep the fill.
    */
-  void alloc(void **ptr, size_t size, size_t alignment) override;
+  void alloc(void **ptr, size_t size, size_t alignment,
+             bool zero = true) override;
 
   /**
    * @copydoc MemAllocator::free

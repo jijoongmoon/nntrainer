@@ -50,12 +50,23 @@ public:
    * @param[in]  alignment alignment in bytes (must be a power of two);
    *                       caller passes the page size or a smaller value
    *                       depending on the use case
+   * @param[in]  zero      honor the historical calloc contract (default). Pass
+   *                       false ONLY when the caller guarantees every byte of
+   *                       the region is written before any read -- today that
+   *                       is the inference weight arena alone, whose whole
+   *                       content comes from the model file (MemoryPool::
+   *                       allocate -> TensorPool::allocate(init=false) ->
+   *                       Manager::allocateWeights(exec_mode != INFERENCE)).
    *
    * The default implementation uses std::aligned_alloc and zero-fills.
-   * Subclasses (ClSVMAllocator, QNNRpcManager) override to plumb the
-   * vendor allocator instead.
+   * Subclasses (ClSVMAllocator, CudaMemAllocator, QNNRpcManager) override to
+   * plumb the vendor allocator instead. Every override MUST honor `zero` in
+   * both directions: fill when true (that is the recycled-page determinism
+   * contract, not a convenience) and skip when false (that is the whole point
+   * of the flag).
    */
-  virtual void alloc(void **ptr, size_t size, size_t alignment);
+  virtual void alloc(void **ptr, size_t size, size_t alignment,
+                     bool zero = true);
 
   /**
    * @brief Free memory previously returned by alloc().

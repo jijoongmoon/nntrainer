@@ -113,7 +113,7 @@ double MemoryPool::planLayout(const MemoryPlanner &planner) {
   return double(min_pool_size) / double(pool_size);
 }
 
-void MemoryPool::allocate() {
+void MemoryPool::allocate(bool zero) {
   if (pool_size == 0)
     throw std::runtime_error("Allocating memory pool with size 0");
 
@@ -145,7 +145,7 @@ void MemoryPool::allocate() {
     std::map<size_t, void *> offset_ptr;
     for (auto &entry : offset_size) {
       void *ptr = nullptr;
-      allocator_->alloc(&ptr, entry.second, alignment);
+      allocator_->alloc(&ptr, entry.second, alignment, zero);
       owned_buffers_.push_back(ptr);
       offset_ptr[entry.first] = ptr;
 #ifdef PROFILE
@@ -166,7 +166,7 @@ void MemoryPool::allocate() {
   // For ClSVMAllocator this returns SVM memory directly addressable
   // by both host and device; the base allocator returns page-aligned,
   // zero-initialised host memory.
-  allocator_->alloc(&mem_pool, pool_size, system_page_size());
+  allocator_->alloc(&mem_pool, pool_size, system_page_size(), zero);
   owned_buffers_.push_back(mem_pool);
 
   // Hand out per-token slices off the same buffer at planned offsets.
