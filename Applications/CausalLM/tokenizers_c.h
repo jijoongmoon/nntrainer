@@ -55,6 +55,20 @@ void tokenizers_token_to_id(TokenizerHandle handle, const char *token,
 
 void tokenizers_free(TokenizerHandle handle);
 
+// ---- tokenizer snapshot (persistent post-parse cache payload) ----
+// Build a snapshot payload from tokenizer.json bytes. On success *out_data
+// (malloc'd; free with tokenizers_snapshot_free) and *out_len are set; on ANY
+// failure (non-BPE model, unknown shape) both are zeroed.
+void tokenizers_snapshot_from_json(const char *json, size_t len,
+                                   char **out_data, size_t *out_len);
+
+void tokenizers_snapshot_free(char *data);
+
+// Rebuild a tokenizer from a snapshot payload. Returns NULL on ANY failure
+// (bad magic/version/bounds/deserialize) -- caller falls back to the JSON
+// parse path.
+TokenizerHandle tokenizers_new_from_snapshot(const char *data, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

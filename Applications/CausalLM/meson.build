@@ -1,6 +1,7 @@
 causallm_src = [
     meson.current_source_dir() / 'chat_template.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
+    meson.current_source_dir() / 'tokenizer_cache.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
