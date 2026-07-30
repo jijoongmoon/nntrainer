@@ -502,14 +502,41 @@ __device__ __forceinline__ float bs_wreduce(float v) {
     v += __shfl_xor_sync(0xffffffffu, v, off);
   return v;
 }
+// Vectorized K/V row-slice load (uint2 for VPL=4, uint4 pairs above). The
+// serial kernel's 16 scalar u16 loads per slice make the per-key dependent
+// chain latency-dominated (probe: the whole kernel is latency-bound at ~8
+// warps/SM, NOT bandwidth-bound -- a 4x shared-memory traffic cut measured
+// flat). Wide loads + the launch-bounds occupancy floor bought 1.9x on d512
+// in the standalone probe, with bit-identical partials (loads only; the FP
+// arithmetic order is untouched). Requires an 8B (VPL=4) / 16B (VPL>=8)
+// aligned K/V base -- verified by the host dispatch, which otherwise falls
+// back to the serial kernel.
+template <int VPL>
+__device__ __forceinline__ void bs_ldrow(const unsigned short *p,
+                                         unsigned short *h) {
+  if (VPL == 4) {
+    uint2 w = *(const uint2 *)p;
+    h[0] = (unsigned short)(w.x); h[1] = (unsigned short)(w.x >> 16);
+    h[2] = (unsigned short)(w.y); h[3] = (unsigned short)(w.y >> 16);
+  } else {
+#pragma unroll
+    for (int p4 = 0; p4 < VPL / 8; p4++) {
+      uint4 w = *(const uint4 *)(p + p4 * 8);
+      h[p4*8+0]=(unsigned short)(w.x); h[p4*8+1]=(unsigned short)(w.x>>16);
+      h[p4*8+2]=(unsigned short)(w.y); h[p4*8+3]=(unsigned short)(w.y>>16);
+      h[p4*8+4]=(unsigned short)(w.z); h[p4*8+5]=(unsigned short)(w.z>>16);
+      h[p4*8+6]=(unsigned short)(w.w); h[p4*8+7]=(unsigned short)(w.w>>16);
+    }
+  }
+}
 // Partial pass: block (blockIdx.x = slab-local tile, blockIdx.y = split sp).
 // Body identical to blockq_body except the key walk is clipped to split sp's
-// sub-range [sp*split_len, (sp+1)*split_len) and the result is written as
-// partial (m, l, acc) instead of the normalized output row. Empty sub-ranges
-// (fully masked / beyond the tile's causal end) write (-1e30, 0, 0) which the
-// reduce weights to zero. grp0 = first tile of this slab (scratch is sized
-// for a slab of tiles, not the whole grid -- a pure memory knob, slab
-// boundaries never touch numerics).
+// sub-range [sp*split_len, (sp+1)*split_len), K/V loads are vectorized (see
+// bs_ldrow), and the result is written as partial (m, l, acc) instead of the
+// normalized output row. Empty sub-ranges (fully masked / beyond the tile's
+// causal end) write (-1e30, 0, 0) which the reduce weights to zero. grp0 =
+// first tile of this slab (scratch is sized for a slab of tiles, not the
+// whole grid -- a pure memory knob, slab boundaries never touch numerics).
 template <int TM, int VPL>
 __device__ __forceinline__ void
 blockq_split_body(const unsigned short *q, const unsigned short *k,
@@ -552,10 +579,13 @@ blockq_split_body(const unsigned short *q, const unsigned short *k,
   for (int n = s_lo; n <= s_hi; ++n) {
     // [kv-window-ring] physical cache row = n % ring_cap (ring_cap<=0: linear).
     long pn = (ring_cap > 0) ? (long)(n % ring_cap) : (long)n;
-    long k_base = pn * HD_KV + (long)hkv * d;
+    long kv_base = pn * HD_KV + (long)hkv * d + lane0;
+    unsigned short kh[VPL], vh[VPL];
+    bs_ldrow<VPL>(k + kv_base, kh);
+    bs_ldrow<VPL>(v + kv_base, vh);
     float k_reg[VPL];
 #pragma unroll
-    for (int vv = 0; vv < VPL; vv++) k_reg[vv] = bs_h2f(k[k_base + lane0 + vv]);
+    for (int vv = 0; vv < VPL; vv++) k_reg[vv] = bs_h2f(kh[vv]);
     float sdot[TM];
 #pragma unroll
     for (int r = 0; r < TM; r++) {
@@ -564,10 +594,9 @@ blockq_split_body(const unsigned short *q, const unsigned short *k,
       for (int vv = 0; vv < VPL; vv++) p += q_reg[r][vv] * k_reg[vv];
       sdot[r] = bs_wreduce(p);
     }
-    long v_base = pn * HD_KV + (long)hkv * d;
     float v_reg[VPL];
 #pragma unroll
-    for (int vv = 0; vv < VPL; vv++) v_reg[vv] = bs_h2f(v[v_base + lane0 + vv]);
+    for (int vv = 0; vv < VPL; vv++) v_reg[vv] = bs_h2f(vh[vv]);
 #pragma unroll
     for (int r = 0; r < TM; r++) {
       int m = m0 + r + q_pos_off;
@@ -592,7 +621,7 @@ blockq_split_body(const unsigned short *q, const unsigned short *k,
       pacc[(sbase + r) * (long)d + lane0 + vv] = acc_reg[r][vv];
   }
 }
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(32, 24)
 attn_blockq_split_d128(const unsigned short *q, const unsigned short *k,
                        const unsigned short *v, float *pm, float *pl,
                        float *pacc, int HQ, int HKV, int N_q, int N_kv,
@@ -602,7 +631,7 @@ attn_blockq_split_d128(const unsigned short *q, const unsigned short *k,
                           cache_from, d, window, softcap, ring_cap, split_len,
                           n_splits, grp0);
 }
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(32, 16)
 attn_blockq_split_d256(const unsigned short *q, const unsigned short *k,
                        const unsigned short *v, float *pm, float *pl,
                        float *pacc, int HQ, int HKV, int N_q, int N_kv,
@@ -612,7 +641,7 @@ attn_blockq_split_d256(const unsigned short *q, const unsigned short *k,
                           cache_from, d, window, softcap, ring_cap, split_len,
                           n_splits, grp0);
 }
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(32, 12)
 attn_blockq_split_d512(const unsigned short *q, const unsigned short *k,
                        const unsigned short *v, float *pm, float *pl,
                        float *pacc, int HQ, int HKV, int N_q, int N_kv,
@@ -977,6 +1006,23 @@ bool attention_blockq_splitkv_prefill(
   }
   if (n_splits < 2)
     return false;
+  // The split kernels read K/V through uint2/uint4 slices (bs_ldrow). All
+  // in-row offsets are provably aligned (d and lane0*2B are multiples of the
+  // width) but the pool packs tensors by cumulative byte size with NO
+  // alignment padding, so the cache BASE can land misaligned -- verify here
+  // and let the caller fall back to the serial kernel otherwise.
+  const size_t amask = (d == 128) ? (size_t)7 : (size_t)15;
+  if ((((size_t)k | (size_t)v) & amask) != 0) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      fprintf(stderr,
+              "[cuda-splitkv] WARNING: K/V cache base not %zu-byte "
+              "aligned; keeping the serial prefill kernel\n",
+              amask + 1);
+    }
+    return false;
+  }
   const char *fn = (d == 256)   ? "attn_blockq_split_d256"
                    : (d == 512) ? "attn_blockq_split_d512"
                                 : "attn_blockq_split_d128";
