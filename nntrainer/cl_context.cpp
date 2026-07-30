@@ -17,6 +17,7 @@
 #include <addition_layer.h>
 #include <attention_kernels.h>
 #include <blas_kernel_interface.h>
+#include <blas_kernels.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
@@ -45,7 +46,9 @@
 #include <transpose_cl.h>
 
 #include <filesystem>
+#include <functional>
 #include <system_error>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -503,6 +506,20 @@ void ClContext::initAttentionClKernels() {
     v8c_prewarm_programs(*this);
   }
 #endif
+
+  // Programs that would otherwise be built on their first dispatch, i.e.
+  // inside the first prefill and the first decode step. Collected by the
+  // translation unit that owns their sources AND the compile options its
+  // dispatch passes, because a prewarm with the wrong options builds a
+  // program the hot path never looks up: it pays the compile twice and
+  // removes nothing from the critical path.
+  {
+    std::vector<std::function<void()>> lazy_tasks;
+    v8c_collect_lazy_program_tasks(*this, lazy_tasks);
+    for (auto &t : lazy_tasks)
+      t();
+  }
+
   attention_kernels_initialized = true;
 }
 
