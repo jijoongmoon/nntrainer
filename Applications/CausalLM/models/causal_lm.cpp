@@ -721,18 +721,12 @@ void CausalLM::registerCustomLayers() {
   // AppContext itself.
   (void)app_context;
 
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-  // RMSReverseNorm (the PLE post_norm of the reverse-norm model family) on
-  // the cuda context: engine=cuda graphs construct this layer on the cuda
-  // context, and its incremental_forwarding carries the device path for
-  // NNTR_CUDA_DEV_ACT device-only activation pools.
-  try {
-    ct_engine.registerLayerFactory(
-      "cuda", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
-  } catch (std::invalid_argument &e) {
-    // no "cuda" context or already registered -- both benign.
-  }
-#endif
+  // rms_reverse_norm (the PLE post_norm of the reverse-norm model family) is
+  // registered on EVERY backend the Engine brought up by
+  // Transformer::registerCustomLayers, called above. It used to be enumerated
+  // here one backend name at a time -- a lone "cuda" registration behind an
+  // #if -- which is exactly the shape that leaves every other brought-up
+  // backend without a factory for a type its graphs stamp engine= on.
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,

@@ -25,11 +25,13 @@
 #include <mha_core.h>
 #include <neuralnet.h>
 #include <nntrainer_log.h>
+#include <per_layer_slice.h>
 #include <per_layer_slice_gpu.h>
 #include <qs4cx_tensor.h>
 #include <reshaped_rms_norm.h>
 #include <rms_norm.h>
 #include <rms_norm_gpu.h>
+#include <rms_reverse_norm.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
@@ -696,6 +698,78 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   return ffn_down(act);
 }
 
+namespace {
+
+using LayerFactory = nntrainer::Context::PtrFactoryType<nntrainer::Layer>;
+
+/**
+ * @brief One device-routed custom layer type and the classes that serve it.
+ *
+ * @details `neutral` is the single class that works on any backend (it
+ *          dispatches internally on operand residency). `overrides` names the
+ *          contexts that still need a *different implementation class* for the
+ *          same type string.
+ *
+ *          An `overrides` entry is NOT a backend policy decision — the graph
+ *          alone decides where a node runs, via its engine= stamp (N3). It is a
+ *          record of remaining technical debt: a backend-specific fork of the
+ *          layer that has not yet been folded into the ComputeOps table. Every
+ *          entry here deletes itself when its type becomes "one neutral layer +
+ *          one whole-op" (N4), at which point this whole table collapses into
+ *          the neutral factory list.
+ */
+struct DeviceRoutedLayer {
+  std::string type;
+  LayerFactory neutral;
+  std::vector<std::pair<const char *, LayerFactory>> overrides;
+};
+
+/**
+ * @brief Register a custom layer on every context the Engine brought up.
+ *
+ * @details Registration coverage must follow the registry, not a hard-coded
+ *          list of backend names. A model graph may stamp engine= on any of
+ *          these nodes, and the engine it names is whichever backend the
+ *          process brought up — so a type that is constructible on some
+ *          backends but not others aborts graph construction with
+ *          "Key is not found for the object. Key: <type>". Asking the Engine
+ *          for its context set makes the coverage exhaustive by construction
+ *          and keeps every backend name out of this file except the override
+ *          table above.
+ *
+ *          Failures are per context: a throw on one backend must never skip
+ *          the rest. A single try around several registrations is how a
+ *          registration silently disappears, and a silently missing factory
+ *          only surfaces much later as "Key is not found for the object" at
+ *          graph build. The only expected throw is a duplicate key, which a
+ *          second model instance in one process produces legitimately.
+ */
+void registerOnEveryContext(const DeviceRoutedLayer &reg) {
+  const auto &ct_engine = nntrainer::Engine::Global();
+  for (const auto &ctx : ct_engine.getRegisteredContextNames()) {
+    LayerFactory factory = reg.neutral;
+    for (const auto &ov : reg.overrides) {
+      if (ctx == ov.first) {
+        factory = ov.second;
+        break;
+      }
+    }
+    if (factory == nullptr)
+      continue;
+    try {
+      ct_engine.registerLayerFactory(ctx, factory);
+    } catch (std::invalid_argument &e) {
+      // Visible, never fatal: a re-registration by a second model instance is
+      // benign, but a real collision (another class already holds this key on
+      // this context) must not vanish.
+      ml_logw("%s registration on the %s context was refused: %s",
+              reg.type.c_str(), ctx.c_str(), e.what());
+    }
+  }
+}
+
+} // namespace
+
 /**
  * @brief Register custom CausalLM layers in the nntrainer app context.
  */
@@ -716,30 +790,61 @@ void Transformer::registerCustomLayers() {
       nntrainer::createLayer<causallm::EmbeddingLayer>);
   });
 
-  // GPU variants: same type strings as the CPU classes but registered on the
-  // gpu context so engine=gpu createLayer routes there. The GPU classes use raw
-  // getData() pointers + GPU dispatches; they avoid any CPU-only Tensor ops
-  // (Tensor::multiply / add_i / dot) that crash on gpu-context tensors. Inert
-  // when there is no "gpu" context (CPU-only / NNTR_ENGINE=cpu builds).
+  // Device-routed custom layers: the types a model graph may stamp engine= on.
+  // ONE registration site for every model -- every backend the Engine brought
+  // up gets a factory for each of these types, so an engine= stamp can never
+  // land on a context that cannot construct the node. Per-model copies of this
+  // (the shape this replaces) is how the cuda context ended up able to build
+  // gemma2's graph and nothing else: gemma2 is the one model here whose graph
+  // stamps only types the core CudaContext registers by itself.
+  //
+  // rms_norm is deliberately absent: the cuda context is served by the CORE
+  // RMSNormLayer via CudaContext::add_default_object(), so a factory from here
+  // would collide with it. Its gpu fork is registered below on its own.
+  static const std::vector<DeviceRoutedLayer> device_routed = {
+    // Per-head q/k/v norms (gemma3, gemma4, qwen3, lfm2). One class for every
+    // backend: incremental_forwarding dispatches the rmsnorm kernels when the
+    // operands are device-resident and keeps the host pass otherwise, which is
+    // what lets a reshaped_rms_norm node carry engine= instead of sitting on
+    // the host between two device FCs.
+    {causallm::ReshapedRMSNormLayer::type,
+     nntrainer::createLayer<causallm::ReshapedRMSNormLayer>,
+     {}},
+    // Per-layer-embedding input slice (gemma4). The OpenCL fork keeps the
+    // slice on device (a host round-trip would break SVM residency); the
+    // neutral class serves cpu and cuda, where it dispatches
+    // cuda_slice_copy_fp16 or falls back to a host copy.
+    {causallm::PerLayerSliceLayer::type,
+     nntrainer::createLayer<causallm::PerLayerSliceLayer>,
+     {{"gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>}}},
+    // PLE post_norm of the reverse-norm model family. One class for every
+    // backend; its incremental_forwarding runs the reverse-norm as a device op
+    // so no host op sits inside the async device graph.
+    {causallm::RMSReverseNormLayer::type,
+     nntrainer::createLayer<causallm::RMSReverseNormLayer>,
+     {}},
+  };
+  for (const auto &reg : device_routed)
+    registerOnEveryContext(reg);
+
+  // rms_norm's OpenCL fork: uses raw getData() pointers + GPU dispatches and
+  // avoids the CPU-only Tensor ops (multiply / add_i / dot) that crash on
+  // gpu-context tensors. Registered on its own so a throw here cannot take the
+  // table above down with it, and probed first so a non-OpenCL run (a cuda or
+  // cpu engine leaves the gpu context un-brought-up on purpose) stays quiet
+  // instead of printing a registration failure it is not affected by.
   const auto &ct_engine = nntrainer::Engine::Global();
+  try {
+    ct_engine.getRegisteredContext("gpu");
+  } catch (std::invalid_argument &) {
+    return; // no OpenCL context in this process -- nothing to mirror.
+  }
   try {
     ct_engine.registerLayerFactory(
       "gpu", nntrainer::createLayer<causallm::RMSNormLayerGPU>);
-    // Gemma4 GPU-resident per_layer_slice: same type string as the CPU class,
-    // registered here so engine=gpu routes to the GPU kernel (no host
-    // round-trip that would break residency).
-    ct_engine.registerLayerFactory(
-      "gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
-    // Per-head q/k/v norms (Gemma4, Qwen3) on the gpu context. One class for
-    // both backends: its incremental_forwarding dispatches the rmsnorm kernels
-    // when the operands are SVM-resident and keeps the host pass otherwise, so
-    // registering it here is what lets a reshaped_rms_norm node carry engine=
-    // instead of sitting on the host between two device FCs.
-    ct_engine.registerLayerFactory(
-      "gpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register GPU-routed layer on gpu ctx: " << e.what()
-              << std::endl;
+    ml_logw("rms_norm gpu fork registration on the gpu context was refused: %s",
+            e.what());
   }
 }
 
