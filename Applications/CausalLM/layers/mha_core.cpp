@@ -827,8 +827,9 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     if (training)
       return;
     // Precondition: the internal cache is sized to max_timestep, and
-    // incremental_forwarding rejects to >= max_timestep, so the model must set
-    // max_timestep > prompt length (it already does: MAX_SEQ_LEN + new tokens).
+    // incremental_forwarding rejects to > max_timestep, so the model must set
+    // max_timestep >= prompt length (it already does: MAX_SEQ_LEN + new
+    // tokens).
     cache_index = 0;
     const unsigned int seq =
       (unsigned int)context.getInput(INOUT_INDEX::QUERY).height();
@@ -974,7 +975,14 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   unsigned int from = _from;
   unsigned int to = _to;
 
-  if (to >= max_timestep) {
+  // [from, to) is a HALF-OPEN row range: this call writes cache rows
+  // from..to-1, so to == max_timestep fills the last row of a cache that is
+  // exactly max_timestep rows tall and is perfectly legal. Rejecting it (>=)
+  // threw on the one step that completes the context -- e.g. a
+  // max_timestep=1024 model generating up to position 1023 died on its final
+  // token with "to shouldn't greater than max_timestep", and a prompt of
+  // exactly max_timestep tokens could not be prefilled at all.
+  if (to > max_timestep) {
     // initial forwarding
     if (!_from) {
       throw std::invalid_argument(
