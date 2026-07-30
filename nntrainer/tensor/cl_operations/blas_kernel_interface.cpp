@@ -437,6 +437,12 @@ struct V8cWeightEntry {
   // (weight_image == nullptr): on the buffer path the image is skipped for
   // every weight, and only this flag may route to the imageless lm_head GEMV.
   bool huge_n = false;
+  // Forward-pass generation this weight was last dispatched in. Used only to
+  // INFER a pass boundary for the shared-quant cache below (a weight is
+  // dispatched at most once per pass, so seeing it twice in one generation
+  // means a new pass began). The inference is incomplete -- see the LIMITATION
+  // note at the bump site in dotCl_v8c.
+  unsigned long long last_use_gen = 0;
 };
 
 // Buffer-path (NNTR_V8C_BUF): on Intel NEO the v8c GEMM uses the *_buf kernels
@@ -532,9 +538,20 @@ struct V8cScratch {
   // the first call populates act_i8/act_scale/act_zp/act_rs for that input,
   // the sibling calls skip the upload AND the quant kernel.
   //
-  // Cache key: (input data pointer, M, K, M_pad, dtype). Pointer identity is
-  // sufficient within one forward pass since the layer graph executes
-  // serially — the input buffer isn't aliased between dispatches.
+  // Cache key: (pass generation, input data pointer, M, K, M_pad, dtype).
+  // Pointer identity is sufficient within one forward pass since the layer
+  // graph executes serially — the input buffer isn't aliased between
+  // dispatches. It is NOT sufficient across passes: activations live in the
+  // tensor pool, whose addresses are recycled every pass, so the same
+  // (pointer, shape, dtype) tuple names DIFFERENT data one pass later. The
+  // generation below scopes a hit to the pass that produced it, but only as
+  // far as the pass boundary is detected: the boundary is inferred from
+  // repeated weight dispatch, so it is missed when the first v8c FC of a pass
+  // was not dispatched in the previous one (see the LIMITATION note in
+  // dotCl_v8c).
+  unsigned long long pass_gen = 1; /**< current forward-pass generation */
+  /** generation whose activation the cached int8 belongs to */
+  unsigned long long last_quant_gen = 0;
   const void *last_quant_in_ptr = nullptr;
   unsigned int last_quant_M = 0;
   unsigned int last_quant_K = 0;
@@ -1057,15 +1074,51 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   const int cur_dtype =
     (input.getDataType() == ml::train::TensorDim::DataType::FP16) ? 1 : 0;
   const void *cur_in_ptr = static_cast<const void *>(input.getData<uint8_t>());
+
+  // [pass boundary] The shared-quant cache below is keyed on the input
+  // ADDRESS, and activation addresses come from the tensor pool, which
+  // recycles them every forward pass. Pointer identity therefore only proves
+  // data identity WITHIN one pass; one pass later the same (pointer, M, K,
+  // M_pad, dtype) tuple names a freshly written activation while the cached
+  // int8 still holds the previous pass's values, and the GEMM would multiply
+  // the stale quant with no error and no log.
+  // The boundary is INFERRED here instead of being plumbed down from the model
+  // graph: every FC weight is dispatched at most once per forward pass, so
+  // meeting a weight for the second time in the same generation IS the next
+  // pass.
+  // LIMITATION. The generation is bumped only when a weight is met twice in
+  // the SAME generation, so the boundary is seen only if the first v8c FC of
+  // the new pass was ALSO dispatched in the previous pass. When the first v8c
+  // FC of a pass is a weight that was NOT dispatched in the previous pass --
+  // per-token MoE/expert routing, a conditionally skipped layer, a second
+  // graph sharing this process-global scratch, or any first-ever dispatch --
+  // no bump happens, last_quant_gen still equals pass_gen, and the stale
+  // cross-pass hit described above is still taken. This detector therefore
+  // closes the static-graph case the decode loop actually runs (one graph
+  // dispatching the same weights in the same order every pass) and errs safely
+  // in that direction (a weight legitimately dispatched twice in one pass pays
+  // one extra act quant); it does NOT make the cache safe for a graph whose
+  // dispatch set varies per pass. The complete fix bumps the generation at
+  // forward-pass entry, which needs a per-forward seam this backend does not
+  // have today.
+  // Coupling: pass_gen and last_use_gen are plain fields, safe only because
+  // the v8c_cache_mtx() lock_guard taken above spans the rest of dotCl_v8c.
+  // The huge_n lm_head GEMV path returns BEFORE that lock, so its weight never
+  // updates last_use_gen and never takes part in boundary detection.
+  if (w->last_use_gen == sc.pass_gen)
+    ++sc.pass_gen;
+  w->last_use_gen = sc.pass_gen;
+
   // Shared-quant cache. For host/SVM inputs the (data_ptr, shape, dtype)
   // tuple uniquely identifies the activation within one forward pass, so a
   // hit means the same data is already int8-quantized in sc.act_i8 and both
   // the staging copy and the quant kernel can be skipped (the wq/wk/wv and
   // gate/up sibling FCs).
   const bool quant_cache_hit =
-    sc.last_quant_in_ptr != nullptr && sc.last_quant_in_ptr == cur_in_ptr &&
-    sc.last_quant_M == M && sc.last_quant_K == K &&
-    sc.last_quant_M_pad == M_pad && sc.last_quant_dtype == cur_dtype;
+    sc.last_quant_gen == sc.pass_gen && sc.last_quant_in_ptr != nullptr &&
+    sc.last_quant_in_ptr == cur_in_ptr && sc.last_quant_M == M &&
+    sc.last_quant_K == K && sc.last_quant_M_pad == M_pad &&
+    sc.last_quant_dtype == cur_dtype;
   const bool skip_upload_and_quant = quant_cache_hit;
 
   // SVM-pool input: the activation lives in GPU-visible SVM (the default
@@ -1162,7 +1215,9 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
                                  act_zp_arg, act_rs_arg, M_pad, K);
       // Update cache key only after a successful quant. Record WHICH slot now
       // holds this input's int8 so a subsequent cache hit (wk/wv) reads the
-      // right per-fanout buffer, not whatever the ring last pointed at.
+      // right per-fanout buffer, not whatever the ring last pointed at, and
+      // WHICH pass generation it belongs to so the next pass cannot hit it.
+      sc.last_quant_gen = sc.pass_gen;
       sc.last_quant_in_ptr = cur_in_ptr;
       sc.last_quant_M = M;
       sc.last_quant_K = K;
