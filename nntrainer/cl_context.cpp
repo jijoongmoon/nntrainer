@@ -27,6 +27,7 @@
 #include <fc_layer_cl.h>
 #include <geglu_cl_op.h>
 #include <geglu_layer.h>
+#include <logit_softcapping.h>
 #include <mutex>
 #include <opencl_command_queue_manager.h>
 #include <opencl_context_manager.h>
@@ -303,6 +304,22 @@ void ClContext::add_default_object() {
     registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
                     SigmoidAddLayer::type, /*int_key=*/9002);
   }
+
+  // logit_softcapping: the SAME promoted, backend-neutral core layer AppContext
+  // (app_context.cpp) and CudaContext (cuda_context.cpp) already register. It
+  // was missing here alone, and a type that exists on two of three contexts is
+  // not a gap the graph can route around: an engine= stamp on it would have
+  // thrown, so gemma4's final soft-cap had to stay unstamped -- which is how
+  // the cpu op table got bound onto the lm_head logits of a device graph.
+  // ClComputeOps::softcap forwards to the CPU body, so the OpenCL numerics are
+  // the same host math this node already ran.
+  //
+  // LAST, with an EXPLICIT int_key, for the reason spelled out above the
+  // sigmoid gates: an auto int_key is str_map.size()+1, so anything inserted
+  // mid-list shifts every later auto-key into a possible collision with an
+  // explicit one.
+  registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
+                  LogitSoftCappingLayer::type, /*int_key=*/9003);
 }
 
 template <typename T>
