@@ -498,4 +498,57 @@ const std::string &ChatTemplate::sourcePath() const {
   return impl_->source_path;
 }
 
+nlohmann::json chatTemplateContext(const nlohmann::json &nntr_cfg) {
+  if (nntr_cfg.is_object() && nntr_cfg.contains("chat_template_context") &&
+      nntr_cfg["chat_template_context"].is_object())
+    return nntr_cfg["chat_template_context"];
+
+  return nlohmann::json::object();
+}
+
+nlohmann::json makeUserRequest(const std::string &user_text,
+                               const nlohmann::json &render_context) {
+  nlohmann::json request = nlohmann::json::object();
+  if (render_context.is_object())
+    request = render_context;
+
+  // The message list is ours to define; a render context may only supply
+  // sibling render keys (a thinking-channel flag, for instance), never the
+  // conversation itself.
+  request["messages"] =
+    nlohmann::json::array({{{"role", "user"}, {"content", user_text}}});
+  return request;
+}
+
+std::string buildPrompt(const ChatTemplate *tmpl, const nlohmann::json &request,
+                        PromptTemplateMode mode,
+                        const nlohmann::json &render_context) {
+  if (tmpl == nullptr || mode == PromptTemplateMode::Never)
+    return std::string();
+
+  // Package-supplied defaults fill only the keys the request left undefined:
+  // an explicit request is authoritative about its own render context.
+  if (render_context.is_object() && !render_context.empty() &&
+      request.is_object()) {
+    nlohmann::json merged = request;
+    for (auto it = render_context.begin(); it != render_context.end(); ++it) {
+      if (!merged.contains(it.key()))
+        merged[it.key()] = it.value();
+    }
+    return tmpl->apply(merged);
+  }
+
+  return tmpl->apply(request);
+}
+
+std::string buildUserPrompt(const ChatTemplate *tmpl,
+                            const std::string &user_text,
+                            PromptTemplateMode mode,
+                            const nlohmann::json &render_context) {
+  if (tmpl == nullptr || mode == PromptTemplateMode::Never)
+    return user_text;
+
+  return buildPrompt(tmpl, makeUserRequest(user_text, render_context), mode);
+}
+
 } // namespace causallm
