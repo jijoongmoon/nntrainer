@@ -2967,4 +2967,34 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
   return true;
 }
 
+void v8c_collect_lazy_program_tasks(ClContext &cc,
+                                    std::vector<std::function<void()>> &out) {
+  // Deadlock: this runs inside ClContext bring-up, so nothing here -- neither
+  // this function nor the tasks it produces -- may reach ClContext::Global().
+  // v8c_use_buffer_path() does, and calling it from here re-enters the
+  // context's one-time initialization and waits on itself. Derive the same
+  // decision from the same inputs, using the caps of the context being
+  // brought up.
+  const bool buf_path = [&cc]() {
+    if (const char *e = std::getenv("NNTR_V8C_BUF"))
+      return std::atoi(e) != 0;  // explicit override (set wins)
+    return !cc.caps().image_v8c; // Intel => buffer
+  }();
+
+  // The v8c GEMM/activation-quantization program, with the options its own
+  // dispatch passes on this device. It is the largest source in the set, so
+  // it is collected first.
+  const std::string v8c_copts = buf_path ? kV8cBufCompileOpts : "";
+  out.push_back([&cc, v8c_copts]() {
+    cc.registerClKernel(int8_int4_gemm_v8c_kernel, "v8c_act_quant_f16_par",
+                        v8c_copts);
+  });
+
+  // The untied lm_head int4 GEMV program. It is otherwise built on the first
+  // decode step -- past the first token, but still a stall a user sees.
+  out.push_back([&cc]() {
+    cc.registerClKernel(lmhead_int4_v8c_kernel, "lmhead_int4_v8c_gemv");
+  });
+}
+
 } // namespace nntrainer
