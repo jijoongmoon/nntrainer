@@ -278,6 +278,28 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # Prompt special-token policy: no model, no graph, no external assets -- the
+  # test builds its own BOS-prepending tokenizer.json blob, so it only needs the
+  # tokenizer backend.
+  unittest_prompt_special_tokens = executable(
+    'unittest_prompt_special_tokens',
+    [
+      meson.current_source_dir() / 'models' / 'unittest_prompt_special_tokens.cpp',
+      meson.current_source_dir() / 'huggingface_tokenizer.cpp',
+    ],
+    dependencies: [gtest_main_dep],
+    include_directories: causallm_inc,
+    link_args: tokenizer_link_args,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_prompt_special_tokens', unittest_prompt_special_tokens,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_prompt_special_tokens'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   unittest_cancel_api = executable(
     'unittest_cancel_api',
     [
