@@ -295,6 +295,14 @@ int main(int argc, char *argv[]) {
     } else {
       if (nntr_cfg.contains("chat_input")) {
         if (chat_template.has_value()) {
+          // UNION NOTE: the DECISION stays here (so a config-shape error is
+          // still raised before ~800 ms of model load); the RENDER is deferred
+          // past repack_weight() by the init-latency rung, and goes through
+          // causallm::buildPrompt() -- the one seam the SDK entry points use as
+          // well, so a prompt rendered by the CLI and the same prompt rendered
+          // through the API cannot drift apart. A literal argv[2] prompt stays
+          // untouched: callers that template their own input rely on those
+          // bytes arriving verbatim.
           render_chat_input = true;
         } else {
           std::cerr << "[Warning] 'chat_input' is set but support for model "
@@ -329,7 +337,10 @@ int main(int argc, char *argv[]) {
     // template (the template carries its own system turn) and must still
     // happen before run() -- it does, run() is below.
     if (render_chat_input) {
-      input_text = chat_template->apply(nntr_cfg["chat_input"]);
+      input_text = causallm::buildPrompt(&chat_template.value(),
+                                         nntr_cfg["chat_input"],
+                                         causallm::PromptTemplateMode::Auto,
+                                         causallm::chatTemplateContext(nntr_cfg));
       system_head_prompt.clear();
       system_tail_prompt.clear();
     }
