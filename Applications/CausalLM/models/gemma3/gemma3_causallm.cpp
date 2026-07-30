@@ -264,15 +264,9 @@ Tensor Gemma3Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
 }
 
 void Gemma3Transformer::registerCustomLayers() {
-  auto &ct_engine = nntrainer::Engine::Global();
-
-  try {
-    ct_engine.registerLayerFactory(
-      "cpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-  }
+  // reshaped_rms_norm comes from the device-routed layer table in
+  // Transformer::registerCustomLayers, which covers every backend the Engine
+  // brought up -- not just "cpu".
 }
 
 void Gemma3CausalLM::registerCustomLayers() {
