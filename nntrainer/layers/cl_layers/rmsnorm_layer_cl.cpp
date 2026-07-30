@@ -229,9 +229,14 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
 void RMSNormLayerCl::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
                                             bool training) {
-  // Gemma4 KV-shared layers skip compute during prefill (from==0); the live
-  // token is recomputed at decode. Matches the CPU layers' skip_prefill.
-  if (skip_prefill && from == 0)
+  // Gemma4 KV-shared layers skip compute during prefill; the live token is
+  // recomputed at decode. Matches the CPU layers' skip_prefill.
+  // [prefill-chunk] A chunked prefill arrives as a from>0 block call with
+  // to-from == the chunk length, so `from == 0` alone stops recognizing prefill
+  // from chunk 2 on. Multi-row steps are prefill too -- decode is the only
+  // single-row step. Same predicate as AdditionLayer / FullyConnectedLayerCl.
+  bool is_prefill = !from || (to - from) > 1;
+  if (skip_prefill && is_prefill)
     return;
   Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
