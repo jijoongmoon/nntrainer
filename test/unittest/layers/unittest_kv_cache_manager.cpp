@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <gtest/gtest.h>
 #include <string>
+#include <vector>
 
 #include <kv_cache_manager.h>
 #include <tensor.h>
@@ -313,6 +314,53 @@ TEST_F(KVCacheManagerTest, typical_inference_flow) {
   float *kd = k_full.getData<float>();
   EXPECT_FLOAT_EQ(kd[0], 0.0f); // l=0, b=0, i=0
   EXPECT_FLOAT_EQ(kd[1], 1.0f); // l=0, b=0, i=1
+}
+
+/**
+ * @brief The per-element byte width of a KV plane must come from
+ *        TensorDim::getDataTypeSize(), never from a local dtype test. The SVM
+ *        KV pool reserves batch * max_seq_len * kv_width * elem_size per K and
+ *        per V, and a hand-rolled `dtype == FP16 ? 2 : 4` charged the 2-byte
+ *        UINT16 cache dtype -- the one a build without ENABLE_FP16 uses -- four
+ *        bytes, reserving twice the device memory needed. These cases pin the
+ *        widths that arithmetic reads, on the host path (no device required).
+ */
+TEST(KVCacheManagerDtype, element_width_follows_the_dtype) {
+  struct Case {
+    ml::train::TensorDim::DataType dtype;
+    unsigned int expected_bytes;
+  };
+
+  const std::vector<Case> cases = {
+    // fp16-OFF builds carry the KV cache as UINT16: 2 bytes, not 4.
+    {ml::train::TensorDim::DataType::UINT16, 2u},
+    {ml::train::TensorDim::DataType::FP32, 4u},
+#ifdef ENABLE_FP16
+    {ml::train::TensorDim::DataType::FP16, 2u},
+#endif
+  };
+
+  constexpr unsigned int LAYERS = 2;
+  constexpr unsigned int BATCH = 1;
+  constexpr unsigned int SEQ = 16;
+  constexpr unsigned int HEADS_KV = 2;
+  constexpr unsigned int HEAD_D = 4;
+  constexpr size_t ROWS = static_cast<size_t>(BATCH) * SEQ;
+  constexpr size_t COLS = static_cast<size_t>(HEADS_KV) * HEAD_D;
+
+  for (const auto &c : cases) {
+    causallm::KVCacheManager m;
+    m.allocate(LAYERS, BATCH, SEQ, HEADS_KV, HEAD_D, c.dtype);
+
+    for (unsigned int l = 0; l < LAYERS; ++l) {
+      EXPECT_EQ(m.getKeyCache(l).getDim().getDataTypeSize(), c.expected_bytes)
+        << "layer=" << l;
+      EXPECT_EQ(m.getKeyCache(l).bytes(), ROWS * COLS * c.expected_bytes)
+        << "layer=" << l;
+      EXPECT_EQ(m.getValueCache(l).bytes(), ROWS * COLS * c.expected_bytes)
+        << "layer=" << l;
+    }
+  }
 }
 
 int main(int argc, char **argv) {
