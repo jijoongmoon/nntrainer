@@ -685,8 +685,14 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
     const float *fp32_scales = weight.getScale<float>();
     if (!fp32_scales)
       return nullptr;
-    e.backing =
-      make_v8c_weight_backing_from_qs4cx(nibbles, fp32_scales, N, K, &sb, &rsw);
+    // The pack cache's identity is the tensor NAME, which is stable across
+    // runs -- never the data pointer, which pool and SVM allocations recycle
+    // (a pointer-keyed derived-weight cache in this tree has served the wrong
+    // entry before). A weight with no name simply skips the cache.
+    const std::string &wname = weight.getName();
+    e.backing = make_v8c_weight_backing_from_qs4cx(
+      nibbles, fp32_scales, N, K, &sb, &rsw,
+      wname.empty() ? nullptr : wname.c_str());
   } catch (...) {
     return nullptr;
   }

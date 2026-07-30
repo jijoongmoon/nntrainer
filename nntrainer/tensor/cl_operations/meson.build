@@ -14,7 +14,8 @@ cl_op_sources = [
   'rms_reverse_norm_cl_op.cpp',
   'cl_tensor_view.cpp',
   'cl_tensor_backing_pool.cpp',
-  'cl_buffer_pool.cpp'
+  'cl_buffer_pool.cpp',
+  'v8c_pack_cache.cpp'
 ]
 
 cl_op_headers = [
@@ -27,7 +28,8 @@ cl_op_headers = [
   'sigmoid_add_cl_op.h',
   'cl_tensor_view.h',
   'cl_tensor_backing_pool.h',
-  'cl_buffer_pool.h'
+  'cl_buffer_pool.h',
+  'v8c_pack_cache.h'
 ]
 
 if get_option('enable-fp16')
