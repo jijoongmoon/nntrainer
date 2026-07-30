@@ -120,6 +120,30 @@ public:
    */
   static std::unique_ptr<Tokenizer>
   FromBlobRWKVWorld(const std::string &model_blob);
+
+  /**
+   * @brief Create HF tokenizer from a snapshot payload previously produced by
+   *        SnapshotFromJSON (persistent post-parse cache).
+   *
+   * Unlike FromBlobJSON this returns nullptr on ANY failure so the caller can
+   * fall back to the JSON parse path.
+   *
+   * @param blob The snapshot payload.
+   * @return The created tokenizer, or nullptr.
+   */
+  static std::unique_ptr<Tokenizer> FromSnapshot(const std::string &blob);
+
+  /**
+   * @brief Build a snapshot payload from tokenizer.json bytes.
+   *
+   * Only call after FromBlobJSON succeeded on the same bytes. Returns an
+   * empty string when the tokenizer shape cannot be snapshotted (non-BPE
+   * model, unknown fields) -- the caller then simply does not cache.
+   *
+   * @param json The tokenizer.json contents.
+   * @return The snapshot payload, or empty.
+   */
+  static std::string SnapshotFromJSON(const std::string &json);
 };
 
 } // namespace tokenizers

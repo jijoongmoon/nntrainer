@@ -18,6 +18,7 @@
 #include <model.h>
 
 #include <llm_util.hpp>
+#include <tokenizer_cache.h>
 #include <tokenizers_cpp.h>
 #include <transformer.h>
 
@@ -118,8 +119,14 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
       nntr_cfg["tokenizer_file"].is_null()) {
     tokenizer = nullptr; // No tokenizer for this model
   } else {
-    tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-      LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+    // Through the persistent snapshot cache (tokenizer_cache.cpp): a HIT
+    // rebuilds the BPE from the snapshot's vocab/merges tables instead of
+    // re-parsing ~32 MB of JSON; a miss / stale key / corrupt file parses
+    // exactly as before (same FromBlobJSON call, same bytes) and schedules a
+    // background, exit-joined rewrite. This parse is SYNCHRONOUS here, so
+    // everything it saves comes straight off time-to-first-token.
+    // NNTR_TOKENIZER_CACHE=0 opts out.
+    tokenizer = causallm::LoadTokenizerCached(nntr_cfg["tokenizer_file"]);
   }
 };
 
