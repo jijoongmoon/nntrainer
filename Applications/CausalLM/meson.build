@@ -284,6 +284,27 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # Prompt-preparation seam: no model, no backend, no tokenizer -- the shared
+  # chat-template source plus gtest, so it runs anywhere the app builds.
+  unittest_chat_template = executable(
+    'unittest_chat_template',
+    [
+      meson.current_source_dir() / 'unittest_chat_template.cpp',
+      meson.current_source_dir() / 'chat_template.cpp',
+    ],
+    dependencies: [gtest_main_dep],
+    include_directories: [causallm_inc, causallm_inc_minja_inc,
+                          causallm_inc_nlohmann_inc],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_chat_template', unittest_chat_template,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_chat_template'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   unittest_cancel_api = executable(
     'unittest_cancel_api',
     [

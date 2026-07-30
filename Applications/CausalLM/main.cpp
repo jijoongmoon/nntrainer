@@ -399,7 +399,19 @@ int main(int argc, char *argv[]) {
     } else {
       if (nntr_cfg.contains("chat_input")) {
         if (chat_template.has_value()) {
-          input_text = chat_template->apply(nntr_cfg["chat_input"]);
+          // The render goes through causallm::buildPrompt(), the one seam the
+          // SDK entry points use as well: a prompt rendered here and the same
+          // prompt rendered through the API cannot drift apart, because there
+          // is only one implementation to drift. A literal argv[2] prompt
+          // stays untouched -- callers that template their own input rely on
+          // those bytes arriving verbatim.
+          //
+          // Clearing the system prompts is part of the contract of using a
+          // chat template: the template carries its own system turn.
+          input_text = causallm::buildPrompt(
+            &chat_template.value(), nntr_cfg["chat_input"],
+            causallm::PromptTemplateMode::Auto,
+            causallm::chatTemplateContext(nntr_cfg));
           system_head_prompt.clear();
           system_tail_prompt.clear();
         } else {
