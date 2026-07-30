@@ -73,12 +73,12 @@ void ScalarMultiplyLayerGPU::finalize(nntrainer::InitLayerContext &context) {
 void ScalarMultiplyLayerGPU::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  // A multi-token step is a prefill step even when it does not start at 0: a
-  // resumed turn prefills from the KV cache position it left off at, and a
-  // chunked prefill issues every chunk after the first with from > 0. Keep this
-  // identical to the host ScalarMultiplyLayer, or the same graph skips a
-  // different set of layers depending on the engine it was stamped with.
-  if (skip_prefill && (from == 0 || (to - from) > 1))
+  // [prefill-chunk] A chunked prefill arrives as a from>0 block call with
+  // to-from == the chunk length, so `from == 0` alone stops recognizing prefill
+  // from chunk 2 on. Multi-row steps are prefill too -- decode is the only
+  // single-row step. Same predicate as AdditionLayer / FullyConnectedLayerCl.
+  bool is_prefill = !from || (to - from) > 1;
+  if (skip_prefill && is_prefill)
     return;
 
   bool use_weight = std::get<props::UseWeight>(scalar_props).get();

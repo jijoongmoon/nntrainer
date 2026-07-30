@@ -126,12 +126,10 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) {
   nntrainer::LayerProfScope _prof("lm_head", (to - from) == 1);
-  // A multi-token step is a prefill step even when it does not start at 0: a
-  // resumed turn prefills from the KV cache position it left off at, and a
-  // chunked prefill issues every chunk after the first with from > 0. Testing
-  // only `!from` leaves those blocks running the full vocab projection whose
-  // logits the caller then discards -- a skip_prefill driver seeds generation
-  // from the last prompt token and never reads prefill logits.
+  // [prefill-chunk] A chunked prefill arrives as a from>0 block call with
+  // to-from == the chunk length, so `!from` alone stops recognizing prefill
+  // from chunk 2 on. Multi-row steps are prefill too -- decode is the only
+  // single-row step. Same predicate as AdditionLayer / FullyConnectedLayer.
   bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
