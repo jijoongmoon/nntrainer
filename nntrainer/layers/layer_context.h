@@ -82,8 +82,21 @@ public:
    * @return Tensor DataType of the the Weight
    */
   TensorDim::DataType getWeightDataType() {
-    return str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
-      from_string(tensor_type[1]);
+    auto dt =
+      str_converter<enum_class_prop_tag,
+                    nntrainer::TensorDataTypeInfo>::from_string(tensor_type[1]);
+    // A QINT4 weight dtype -- whether inherited from a "QINT4-*"
+    // model_tensor_type graph default or set per layer -- is materialised as
+    // the canonical QS4CX class: both are the same KleidiAI qsi4cxp
+    // per-output-channel int4 format, and QS4CX is the one every compute path
+    // in this tree consumes. The on-disk bytes stay the legacy QINT4 record and
+    // are transcoded at read time (NeuralNetwork::load flags the tensor,
+    // QS4CX_Tensor::read does the re-layout), so existing QINT4 packages keep
+    // loading unchanged. This is the single point that makes the mapping
+    // universal across every model.
+    if (dt == TensorDim::DataType::QINT4)
+      return TensorDim::DataType::QS4CX;
+    return dt;
   };
 
   /**

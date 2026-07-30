@@ -214,6 +214,23 @@ public:
    */
   void pack() override;
 
+  /**
+   * @copydoc Tensor::read(std::ifstream &file, size_t, bool)
+   * @note When this tensor is flagged on-disk-legacy-QINT4
+   *   (setOnDiskLegacyQint4), the record is a legacy QINT4 (u16 header + KAI
+   *   Section A / plain container) and is transcoded losslessly to the QS4CX
+   *   in-memory layout via Int4Utils::readLegacyQint4RecordToQs4cx; otherwise a
+   *   plain TensorBase::read.
+   */
+  void read(std::ifstream &file, size_t start_offset = 0,
+            bool read_from_offset = false) override;
+
+  /**
+   * @copydoc Tensor::read(ReadSource, size_t, bool)
+   */
+  void read(ReadSource src, size_t start_offset = 0,
+            bool read_from_offset = false) override;
+
 private:
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is

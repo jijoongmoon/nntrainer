@@ -13,6 +13,14 @@
 #include <qs4cx_tensor.h>
 #include <tensor.h>
 
+#include <cstring>
+#include <functional>
+#include <limits>
+#include <vector>
+
+#include <int4_utils.h>
+#include <util_func.h>
+
 namespace nntrainer {
 
 namespace {
@@ -26,6 +34,50 @@ namespace {
 bool envOn(const char *name) {
   const char *e = std::getenv(name);
   return e != nullptr && e[0] != '\0' && e[0] != '0';
+}
+
+/**
+ * @brief Read a legacy on-disk int4 record (u16 qscheme header + KAI Section A
+ *   or plain container) via @a do_read and transcode it losslessly to the
+ *   canonical QS4CX in-memory layout (plain nibbles + fp32 scales). Shared by
+ *   the std::ifstream and ReadSource read() overloads.
+ */
+void readLegacyQint4ToQs4cx(
+  size_t N, size_t K, size_t start_offset,
+  const std::function<void(char *, std::streamsize, size_t)> &do_read,
+  uint8_t *out_nibbles, float *out_scales) {
+  uint16_t scheme = 0;
+  do_read(reinterpret_cast<char *>(&scheme), sizeof(uint16_t), start_offset);
+
+  size_t body_bytes;
+  if (scheme == static_cast<uint16_t>(QScheme::KAI_QSI4CXP_4x4x32))
+    body_bytes = Int4Utils::kaiNibblePayloadBytes(N, K) + N * sizeof(uint16_t);
+  else if (scheme == static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE))
+    body_bytes = Int4Utils::plainRecordPayloadBytes(N, K);
+  else
+    throw std::runtime_error(
+      "[QS4CX_Tensor::read] unsupported legacy on-disk qscheme");
+
+  std::vector<uint8_t> record(sizeof(uint16_t) + body_bytes);
+  std::memcpy(record.data(), &scheme, sizeof(uint16_t));
+  do_read(reinterpret_cast<char *>(record.data()) + sizeof(uint16_t),
+          static_cast<std::streamsize>(body_bytes),
+          start_offset + sizeof(uint16_t));
+
+  // The transcode is a PARTIAL writer of the payload: it fills
+  // plainNibbleBytes() = N*ceil(K/2) nibble bytes and the N fp32 scales at
+  // plainScalesOffsetBytes() = N*(K+1)/2, so for even K an N/2-byte gap
+  // between them is never written. That gap is part of the on-disk plain form
+  // and must read as zero, which the allocation no longer guarantees (see the
+  // "TRIPWIRE FOR FUTURE READERS" note above qs4cxAllocUninitialized()). Zero
+  // it explicitly instead of relying on the allocator.
+  const size_t nib = Int4Utils::plainNibbleBytes(N, K);
+  const size_t scales_off = Int4Utils::plainScalesOffsetBytes(N, K);
+  if (scales_off > nib)
+    std::memset(out_nibbles + nib, 0, scales_off - nib);
+
+  Int4Utils::readLegacyQint4RecordToQs4cx(record.data(), record.size(), N, K,
+                                          out_nibbles, out_scales);
 }
 
 /**
@@ -44,16 +96,14 @@ bool envOn(const char *name) {
  * the packed nibble+scale byte count) or by copy_qs4cx (scopy over size()).
  *
  * TRIPWIRE FOR FUTURE READERS. "Uninitialized is safe" holds only while EVERY
- * reader of this payload writes all size() bytes. It is true of every reader in
- * this tree today (TensorBase::read and copy_qs4cx, both above). It is NOT
- * automatically true of a partial writer, and one such reader exists in the
- * sibling trees: the legacy on-disk QINT4 -> QS4CX transcode. There, for even
- * K, the QS4CX scale offset is `N*(K+1)/2` evaluated left-to-right
- * (= N*K/2 + N/2) while the nibble region is only N*(K/2) bytes, so an
- * N/2-byte gap sits between them that the transcode never touches; it used to
- * be zero purely by virtue of the allocation. If that read path (or any other
- * partial writer) is ever added here, it MUST call setZero() before
- * transcoding, or the gap becomes uninitialized heap.
+ * reader of this payload writes all size() bytes. TensorBase::read and
+ * copy_qs4cx (both above) do. The legacy on-disk QINT4 -> QS4CX transcode
+ * (readLegacyQint4ToQs4cx, above) does NOT: for even K the QS4CX scale offset
+ * is `N*(K+1)/2` evaluated left-to-right (= N*K/2 + N/2) while the nibble
+ * region is only N*(K/2) bytes, so an N/2-byte gap sits between them that the
+ * transcode never touches. That reader therefore zeroes the gap itself instead
+ * of relying on the allocation. Any further partial writer added here must do
+ * the same, or the gap becomes uninitialized heap.
  *
  * Escape hatch: NNTR_QS4CX_ALLOC_ZERO=1 restores the old double zero-fill.
  */
@@ -205,5 +255,43 @@ void QS4CX_Tensor::print(std::ostream &out) const {
 }
 
 QScheme QS4CX_Tensor::q_scheme() const { return QScheme::QS4CX; }
+
+void QS4CX_Tensor::read(std::ifstream &file, size_t start_offset,
+                        bool read_from_offset) {
+  if (start_offset == std::numeric_limits<size_t>::max())
+    start_offset = file_offset;
+  if (!isOnDiskLegacyQint4()) {
+    TensorBase::read(file, start_offset, read_from_offset);
+    return;
+  }
+  readLegacyQint4ToQs4cx(
+    width(), height(), start_offset,
+    [&](char *dst, std::streamsize n, size_t off) {
+      checkedRead(file, dst, n, "[QS4CX_Tensor::read] legacy QINT4 read failed",
+                  off, read_from_offset);
+    },
+    reinterpret_cast<uint8_t *>(getData()),
+    reinterpret_cast<float *>(getScale()));
+  putData();
+}
+
+void QS4CX_Tensor::read(ReadSource src, size_t start_offset,
+                        bool read_from_offset) {
+  if (start_offset == std::numeric_limits<size_t>::max())
+    start_offset = file_offset;
+  if (!isOnDiskLegacyQint4()) {
+    TensorBase::read(src, start_offset, read_from_offset);
+    return;
+  }
+  readLegacyQint4ToQs4cx(
+    width(), height(), start_offset,
+    [&](char *dst, std::streamsize n, size_t off) {
+      checkedRead(src, dst, n, "[QS4CX_Tensor::read] legacy QINT4 read failed",
+                  off, read_from_offset);
+    },
+    reinterpret_cast<uint8_t *>(getData()),
+    reinterpret_cast<float *>(getScale()));
+  putData();
+}
 
 } // namespace nntrainer

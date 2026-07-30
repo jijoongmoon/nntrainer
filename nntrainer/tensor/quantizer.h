@@ -37,6 +37,14 @@ enum class QScheme : uint16_t {
   Q4_Kx8 = 0x03,
   Q6_K = 0x4,
   Q4_0 = 0x5,
+  /**
+   * @brief KAI qsi4cxp nibble Section A layout (nr=4, kr=16, sr=2), per-
+   * output-channel fp16 scale, no group. Written by the legacy QINT4 saver and
+   * consumed by Int4Utils::readLegacyQint4RecordToQs4cx. Same KleidiAI qsi4cxp
+   * scheme as QS4CX (both 0x6 = aliases); both names are kept because on-disk
+   * records carry this one.
+   */
+  KAI_QSI4CXP_4x4x32 = 0x06,
   QS4CX = 0x6,
   /** this is for custom use */
   CUSTOM_QUANTIZER_01 = 0x10,
