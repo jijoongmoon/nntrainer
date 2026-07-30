@@ -73,7 +73,12 @@ void ScalarMultiplyLayerGPU::finalize(nntrainer::InitLayerContext &context) {
 void ScalarMultiplyLayerGPU::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  if (skip_prefill && from == 0)
+  // A multi-token step is a prefill step even when it does not start at 0: a
+  // resumed turn prefills from the KV cache position it left off at, and a
+  // chunked prefill issues every chunk after the first with from > 0. Keep this
+  // identical to the host ScalarMultiplyLayer, or the same graph skips a
+  // different set of layers depending on the engine it was stamped with.
+  if (skip_prefill && (from == 0 || (to - from) > 1))
     return;
 
   bool use_weight = std::get<props::UseWeight>(scalar_props).get();
