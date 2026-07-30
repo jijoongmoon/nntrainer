@@ -20,7 +20,9 @@
 #include <opencl_buffer_manager.h>
 #include <opencl_kernel.h>
 
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace nntrainer {
 
@@ -580,6 +582,26 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
  * V8C_BUF cell.
  */
 bool v8c_use_buffer_path();
+
+/**
+ * @brief Collect eager-build tasks for the v8c programs that would otherwise
+ *        be compiled on their first dispatch, inside the first prefill and the
+ *        first decode step.
+ *
+ * This translation unit owns both their sources and the compile options their
+ * dispatch passes, so the prewarmed program keys match the hot path's exactly;
+ * a prewarm built with different options produces a program that is never
+ * looked up, paying the compile twice and saving nothing.
+ *
+ * @note Runs inside ClContext bring-up: nothing on this path may call
+ *       ClContext::Global() (v8c_use_buffer_path() does), which would re-enter
+ *       the context's one-time initialization and deadlock.
+ *
+ * @param cc context being brought up, whose caps decide the compile options
+ * @param out task list to append to
+ */
+void v8c_collect_lazy_program_tasks(ClContext &cc,
+                                    std::vector<std::function<void()>> &out);
 
 } // namespace nntrainer
 #endif /* __BLAS_KERNELS_H__ */
