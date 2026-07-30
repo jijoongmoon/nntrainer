@@ -41,7 +41,12 @@ void PerLayerSliceLayerGPU::finalize(nntrainer::InitLayerContext &context) {
 void PerLayerSliceLayerGPU::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  if (skip_prefill && from == 0)
+  // Same predicate as the host PerLayerSliceLayer: a multi-token step is a
+  // prefill step wherever it starts, because a resumed turn prefills from the
+  // KV cache position it left off at and a chunked prefill issues every chunk
+  // after the first with from > 0. Testing `from == 0` alone would make the GPU
+  // variant skip a different set of steps than the host layer it stands in for.
+  if (skip_prefill && (from == 0 || (to - from) > 1))
     return;
 
   auto &in = context.getInput(SINGLE_INOUT_IDX);
