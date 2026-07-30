@@ -356,6 +356,9 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
         // Prefill (M>=32): w4a8 on the INT8 Tensor Cores via cuBLAS (~10x the
         // dp4a int-ALU GEMM, bit-identical). Then the dp4a fast path, then
         // the naive plain GEMM -- each falls to the next on failure.
+        // This gate is the SHAPE only: the NNTR_FC_CUDA_CUBLAS=0 opt-out is
+        // enforced inside cuda_fc_qs4cx_cublas_i8_gemm_fp16(), which then
+        // reports failure and lets the dp4a path below take the call.
         const bool prefill = M >= 32;
         if (nntrainer::cuda::dev_accessible(Xh) &&
             ((prefill &&
