@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <mutex>
 #include <unordered_map>
 
@@ -1653,7 +1654,15 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
 
   // mirror the KV cache to the device if it is host-resident (engine=cuda KV
   // cache is not UVM). K/V are [N_kv, num_heads_KV*head_dim] interleaved.
-  const size_t kv_elems = (size_t)N_kv * num_heads_KV * head_dim;
+  //
+  // [kv-window-ring] N_kv is the LOGICAL key count. With the ring active the
+  // host cache holds only ring_cap rows and every kernel here modulo-maps
+  // (row = n % ring_cap), so the mirror must copy the PHYSICAL row count:
+  // copying N_kv rows reads past the end of the cache as soon as the context
+  // outgrows the window. Same rule the OpenCL path applies to its read view
+  // (min(cache_to, kv_ring_cap) in MHACore).
+  const int kv_rows = (ring_cap > 0) ? std::min(N_kv, ring_cap) : N_kv;
+  const size_t kv_elems = (size_t)kv_rows * num_heads_KV * head_dim;
   k_fp16 = mirror_kv(k_fp16, kv_elems);
   v_fp16 = mirror_kv(v_fp16, kv_elems);
   if (!k_fp16 || !v_fp16)
@@ -1697,7 +1706,13 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth
   // trying here -- opt-in via NNTR_CUDA_GEMM_ATTN, so other arches keep
   // block-Q.
-  if (gemm_attn_on && N_q > 1) {
+  // [kv-window-ring] attention_gemm_prefill_fp16 hands K/V straight to cuBLAS
+  // as dense [N_kv, d] matrices, so it can only be used while the ring has not
+  // wrapped (logical rows <= ring_cap). Past that the physical cache holds only
+  // ring_cap rows and a linear walk both reads past the mirror and pairs the
+  // wrong key with each query; fall through to the ring-mapping kernels below.
+  const bool ring_linear = (ring_cap <= 0) || (N_kv <= ring_cap);
+  if (gemm_attn_on && N_q > 1 && ring_linear) {
     if (attention_gemm_prefill_fp16(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
                                     num_heads_KV, N_q, N_kv, cache_from,
                                     head_dim, window, softcap)) {
