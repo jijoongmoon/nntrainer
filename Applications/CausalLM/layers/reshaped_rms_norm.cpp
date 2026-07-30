@@ -229,22 +229,13 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     // the gamma-free v_norm). Keeps q/k/v_norm on the device. Opt-in
     // NNTR_CUDA_QKNORM.
     if (!gpu_done &&
-        in_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
-        (!gamma ||
-         gamma->getDataType() == ml::train::TensorDim::DataType::FP16)) {
-      // The kernel reads gamma as fp16; this tree requests gamma at the model
-      // weight dtype, so a differently-typed gamma keeps the host cast path
-      // (same rule as gamma_bindable on the OpenCL branch above).
+        in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       static const bool gpu = nntr_env_on("NNTR_CUDA_QKNORM");
       if (gpu) {
         auto *ip =
           reinterpret_cast<const unsigned short *>(in_step.getData<_FP16>());
         auto *op =
           reinterpret_cast<unsigned short *>(out_step.getData<_FP16>());
-        const unsigned short *gp =
-          gamma
-            ? reinterpret_cast<const unsigned short *>(gamma->getData<_FP16>())
-            : nullptr;
         auto dev_ok = [](const void *p) {
           if (!p)
             return true;
@@ -255,7 +246,32 @@ void ReshapedRMSNormLayer::incremental_forwarding(
           cudaGetLastError();
           return ok;
         };
-        if (dev_ok(ip) && dev_ok(op) && dev_ok(gp) &&
+        // The kernel reads gamma in the activation dtype (fp16), but finalize()
+        // requests gamma as FP32 on purpose -- it is unquantized FP32 on disk
+        // and declaring it FP16 would reinterpret those bytes. So bind a
+        // converted fp16 copy (built once per gamma pointer, device-readable)
+        // rather than refusing the dispatch on the dtype mismatch: gating on
+        // gamma dtype == FP16 disabled this path for every gamma-bearing norm
+        // (q_norm, k_norm) and left only the gamma-free v_norm on the device.
+        // Rounding gamma to fp16 is what the host path below does too (it
+        // clones gamma to the output dtype before multiplying), and what the
+        // OpenCL branch above requires via gamma_bindable.
+        const unsigned short *gp = nullptr;
+        bool gamma_ok = true;
+        if (gamma) {
+          const auto gdt = gamma->getDataType();
+          if (gdt == ml::train::TensorDim::DataType::FP16) {
+            gp =
+              reinterpret_cast<const unsigned short *>(gamma->getData<_FP16>());
+            gamma_ok = dev_ok(gp);
+          } else if (gdt == ml::train::TensorDim::DataType::FP32) {
+            gamma_ok = nntrainer::cuda::cuda_rmsnorm_gamma_to_fp16(
+              gamma->getData<float>(), feature_size, &gp);
+          } else {
+            gamma_ok = false; // quantized gamma: keep the host cast path
+          }
+        }
+        if (gamma_ok && dev_ok(ip) && dev_ok(op) &&
             nntrainer::cuda::cuda_rmsnorm_fp16(ip, gp, op, epsilon, n_rows,
                                                feature_size))
           gpu_done = true;
