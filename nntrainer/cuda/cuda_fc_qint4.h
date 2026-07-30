@@ -18,6 +18,8 @@
 #ifndef __CUDA_FC_QINT4_H__
 #define __CUDA_FC_QINT4_H__
 
+#include <cstddef>
+
 namespace nntrainer::cuda {
 
 /**
@@ -151,13 +153,27 @@ bool cuda_fc_qs4cx_plain_dropped(const unsigned char *plain_w);
 
 /**
  * @brief Build the dp4a derived weight cache (packed int4 + rowsum) for one
- *        QS4CX plain payload at load time, off the first prefill. GPU repack,
- *        no host transient; idempotent (pointer-keyed). Returns false only on
- *        a device allocation / dispatch failure (the lazy in-path build then
- *        remains the fallback).
+ *        QS4CX plain payload at load time, off the first prefill. Host permute
+ *        + row-sum fold in bounded chunks, then H2D; idempotent (the in-memory
+ *        cache is pointer-keyed, process-local). Returns false only on a device
+ *        allocation / dispatch failure (the lazy in-path build then remains the
+ *        fallback).
+ * @param cache_name stable per-weight name for the derive-once pack disk cache
+ *        (cuda_pack_cache.h), or nullptr to derive without consulting/writing
+ *        it. NEVER the pointer -- the pack is keyed by (file identity, name).
  */
 bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
-                           unsigned int K);
+                           unsigned int K, const char *cache_name = nullptr);
+
+/**
+ * @brief Split of the load-time prewarm cost into the part a persistent pack
+ *        cache can remove (host derive + miss-path tee) and the part it cannot
+ *        (the H2D upload), plus what pack HITs actually cost. Any pointer may
+ *        be null. Milliseconds are summed over all prewarmed weights.
+ */
+void cuda_fc_qs4cx_prewarm_stats(double *derive_ms, double *upload_ms,
+                                 double *tee_ms, double *hit_ms,
+                                 size_t *derive_bytes, size_t *hit_bytes);
 
 /**
  * @brief Mark a weight exempt from the eager load-time cuBLAS-i8 [K,N] cache
