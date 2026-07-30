@@ -9,6 +9,11 @@
 
 #include "model_registry.h"
 
+// @note models/meson.build excludes the bert, xlm_roberta,
+// gpt_oss_cached_slim and qwen3_cached_slim_moe subdirs on Windows, so their
+// include dirs are not on the search path there. Every header out of those
+// four has to be guarded, together with the registration that uses it.
+
 #include <mutex>
 
 #include <factory.h>
@@ -27,7 +32,9 @@
 #endif
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
+#if !defined(_WIN32)
 #include "xlm_roberta.h"
+#endif
 #if !defined(_WIN32)
 #include "qwen3_cached_slim_moe_causallm.h"
 #endif
