@@ -255,6 +255,9 @@ public:
    * @brief Run prefill and return logits before token sampling
    */
   std::vector<float> prefillLogits(const std::string &prompt) override {
+    // The tokenizer is built off-thread; join before touching the member (the
+    // production callers do the same through CausalLM::run()).
+    this->ensureTokenizer();
     auto encoded = this->tokenizer->Encode(prompt);
     if (encoded.empty())
       throw std::invalid_argument("tiny CausalLM prompt encoded to no tokens");

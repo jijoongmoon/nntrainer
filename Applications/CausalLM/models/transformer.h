@@ -48,7 +48,10 @@
 
 #include "json.hpp"
 #include "performance_metrics.h"
+#include <exception> // std::exception_ptr (async tokenizer, sticky failure)
 #include <fstream>
+#include <future> // async tokenizer build
+#include <mutex>
 #include <tokenizers_c.h>
 #include <tokenizers_cpp.h>
 
@@ -253,7 +256,20 @@ public:
   /**
    * @brief Get tokenizer owned by this model, or nullptr if no tokenizer exists
    */
-  tokenizers::Tokenizer *getTokenizer() { return tokenizer.get(); }
+  tokenizers::Tokenizer *getTokenizer() {
+    ensureTokenizer();
+    return tokenizer.get();
+  }
+
+  /**
+   * @brief Join the async tokenizer build. The build runs on a side thread
+   *        started in the constructor, concurrent with graph compile + pool
+   *        commit + weight load; call this before ANY direct use of the
+   *        `tokenizer` member. Idempotent, thread-safe, and re-raises a worker
+   *        failure on every call (the failure is sticky, so a second caller
+   *        cannot observe a silently null tokenizer).
+   */
+  void ensureTokenizer();
 
   /**
    * @brief Attach a non-owning logits processor
@@ -357,6 +373,16 @@ protected:
 
   /** tokenizer */
   std::unique_ptr<tokenizers::Tokenizer> tokenizer;
+  /** Async build, joined by ensureTokenizer(). Invalid when the build ran
+   *  synchronously (NNTR_TOKENIZER_ASYNC=0), when the model has no tokenizer,
+   *  or once the join has already happened. */
+  std::future<std::unique_ptr<tokenizers::Tokenizer>> tokenizer_future_;
+  std::mutex tokenizer_join_mtx_; /**< ensureTokenizer() idempotence guard */
+  /** Sticky worker failure. std::future::get() invalidates the future even when
+   *  it throws, so the exception is latched here and re-raised on every later
+   *  ensureTokenizer() -- otherwise the second caller would proceed with a null
+   *  tokenizer and crash far from the real cause. */
+  std::exception_ptr tokenizer_error_;
 
   unsigned int NUM_VOCAB;
   int DIM;

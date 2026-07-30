@@ -10,8 +10,16 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <chrono>
 #include <fstream>
 #include <mutex>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h> // SetThreadPriority (async tokenizer build, below-normal)
+#endif
 
 #include <app_context.h>
 #include <engine.h>
@@ -123,10 +131,36 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
     // rebuilds the BPE from the snapshot's vocab/merges tables instead of
     // re-parsing ~32 MB of JSON; a miss / stale key / corrupt file parses
     // exactly as before (same FromBlobJSON call, same bytes) and schedules a
-    // background, exit-joined rewrite. This parse is SYNCHRONOUS here, so
-    // everything it saves comes straight off time-to-first-token.
-    // NNTR_TOKENIZER_CACHE=0 opts out.
-    tokenizer = causallm::LoadTokenizerCached(nntr_cfg["tokenizer_file"]);
+    // background, exit-joined rewrite. NNTR_TOKENIZER_CACHE=0 opts out.
+    //
+    // ... and it now runs OFF-THREAD. The snapshot cache made the build ~3x
+    // cheaper but left it fully EXPOSED: it ran here, in the constructor,
+    // BEFORE graph compile / pool commit / weight load, so every millisecond of
+    // it was still serial time-to-first-token. The build depends on nothing
+    // those phases produce, so start it on a side thread and join at first use
+    // (ensureTokenizer / getTokenizer). This COMPOSES with the snapshot cache
+    // rather than duplicating it: the worker calls exactly the same
+    // LoadTokenizerCached() entry point, so there is one parse and one cache
+    // decision either way -- only the thread that pays for it changes. A worker
+    // exception is not swallowed; it rides the future and is re-raised at the
+    // join (see ensureTokenizer).
+    // Escape hatch: NNTR_TOKENIZER_ASYNC=0 restores the synchronous build.
+    const std::string tok_path = nntr_cfg["tokenizer_file"];
+    const char *async_env = std::getenv("NNTR_TOKENIZER_ASYNC");
+    const bool want_async = !(async_env != nullptr && async_env[0] == '0');
+    if (!want_async) {
+      tokenizer = causallm::LoadTokenizerCached(tok_path);
+    } else {
+      // Below-normal priority where the OS offers it: the build's tail overlaps
+      // the parallel weight-load workers, so let those win contention -- the
+      // build still finishes long before its first use.
+      tokenizer_future_ = std::async(std::launch::async, [tok_path]() {
+#if defined(_WIN32)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+        return causallm::LoadTokenizerCached(tok_path);
+      });
+    }
   }
 };
 
@@ -207,6 +241,39 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
 
   return;
 };
+
+/**
+ * @brief Join the async tokenizer build, at most once.
+ */
+void Transformer::ensureTokenizer() {
+  std::lock_guard<std::mutex> lk(tokenizer_join_mtx_);
+  // A latched worker failure is re-raised on EVERY call: get() below has
+  // already invalidated the future, so without this a second caller would sail
+  // past with tokenizer == nullptr and fault somewhere unrelated to the real
+  // cause.
+  if (tokenizer_error_)
+    std::rethrow_exception(tokenizer_error_);
+  if (!tokenizer_future_.valid())
+    return;
+  // The async build is DEFERRED, not free: whatever did not fit in the overlap
+  // window lands right here, still inside time-to-first-token. A blocked time
+  // of ~0 means the build was fully absorbed by graph compile + pool commit +
+  // weight load; a non-zero one is the residue and is worth seeing.
+  const auto join_t0 = std::chrono::steady_clock::now();
+  try {
+    tokenizer = tokenizer_future_.get();
+  } catch (...) {
+    tokenizer_error_ = std::current_exception();
+    ml_loge("tokenizer async build FAILED -- rethrowing at join");
+    std::rethrow_exception(tokenizer_error_);
+  }
+  const double join_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - join_t0)
+                           .count();
+  ml_logd("tokenizer joined at first use, blocked %.1f ms "
+          "(0 => the build was fully overlapped)",
+          join_ms);
+}
 
 /**
  * @brief Build and compile the symbolic transformer graph.
