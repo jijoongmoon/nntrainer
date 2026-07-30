@@ -361,34 +361,51 @@ void Transformer::repack_weight() {
   }
 
   // The QS4CX weight repack (KAI rhs-pack) is only consumed by the ARM CPU
-  // (KAI) inference path; the "gpu" (OpenCL) and "cuda" engines consume the
-  // plain QS4CX blob directly. On a non-CPU run the whole loop is redundant
-  // single-threaded CPU work -- on a large model it can pin one core to a
-  // thermal shutdown -- so skip it unless the engine is CPU.
-  if (causallm_engine() != "cpu") {
-    ml_logd("repack_weight: skipped on %s engine (consumes plain QS4CX blob)",
-            causallm_engine().c_str());
-    return;
-  }
+  // (KAI) inference path, which reaches it through Tensor::getPackedData(); the
+  // "gpu" (OpenCL) and "cuda" engines consume the plain QS4CX blob directly. On
+  // a non-CPU layer the pack is redundant single-threaded CPU work -- on a
+  // large model it can pin one core to a thermal shutdown -- so decide per
+  // layer, keyed on the engine the graph actually resolved for that layer.
+  //
+  // @note Do NOT key this on causallm_engine(): that reports "gpu" for any
+  // ENABLE_OPENCL build whenever NNTR_ENGINE is unset, which says nothing about
+  // how the graph's layers were stamped. Skipping the whole loop on that basis
+  // left a CPU/KAI run on an OpenCL-enabled build with no packed weights at
+  // all, and it then died in QS4CX_Tensor::getPackedData() with "pack before
+  // run model" at the first token.
+  struct RepackTally {
+    unsigned int layers = 0;
+    unsigned int weights = 0;
+  } tally;
 
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+            void *user_data) {
       // repack FC layer only
       if (l.getType() != "fully_connected" &&
           l.getType() != "shared_fully_connected")
         return;
-
+      if (context.getRunComputeEngine() != ml::train::LayerComputeEngine::CPU)
+        return;
+      auto *tallied = static_cast<RepackTally *>(user_data);
+      ++tallied->layers;
       auto weights = context.getWeights();
       for (auto &w : weights) {
         if (w->getVariableRef().getDataType() ==
             ml::train::TensorDim::DataType::QS4CX) {
           w->getVariableRef().pack();
+          ++tallied->weights;
         }
       }
     };
   try {
-    model->forEachLayer(fn, nullptr);
-    ml_logd("QS4CX weights repacked successfully");
+    model->forEachLayer(fn, &tally);
+    // Log both counts and the process-wide engine default: a run that packs 0
+    // weights while the default says "gpu" is exactly the case that used to be
+    // silent until getPackedData() threw.
+    ml_logd("QS4CX repack: packed %u weight(s) across %u host-engine layer(s) "
+            "(process engine default: %s)",
+            tally.weights, tally.layers, causallm_engine().c_str());
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to repack weights: " +
                              std::string(e.what()));
