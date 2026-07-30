@@ -862,21 +862,13 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
 }
 
 void Gemma4Transformer::registerCustomLayers() {
-  auto &ct_engine = nntrainer::Engine::Global();
-
-  auto tryRegister = [&](auto factory_fn) {
-    try {
-      ct_engine.registerLayerFactory("cpu", factory_fn);
-    } catch (std::invalid_argument &e) {
-      std::cerr << "failed to register factory, reason: " << e.what()
-                << std::endl;
-    }
-  };
-
-  tryRegister(nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-  tryRegister(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
+  // reshaped_rms_norm / per_layer_slice are registered on EVERY backend the
+  // Engine brought up by Transformer::registerCustomLayers (the single
+  // device-routed layer table). Registering them again here -- on "cpu" only,
+  // as this did -- is what made gemma4's graph unbuildable on any other
+  // engine.
   // scalar_multiply / logit_softcapping are core layers now
-  // (nntrainer/layers/llm), registered by AppContext itself.
+  // (nntrainer/layers/llm), registered by each Context itself.
 }
 
 void Gemma4CausalLM::registerCustomLayers() {

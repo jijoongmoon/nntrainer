@@ -112,16 +112,10 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
 }
 
 void Qwen3Transformer::registerCustomLayers() {
-  ///
-  auto &ct_engine = nntrainer::Engine::Global();
-
-  try {
-    ct_engine.registerLayerFactory(
-      "cpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-  }
+  // reshaped_rms_norm (qwen3's per-head q/k norms) is registered on EVERY
+  // backend the Engine brought up by Transformer::registerCustomLayers. The
+  // "cpu"-only registration that used to live here is why qwen3's graph could
+  // not be built on the cuda engine.
 }
 
 void Qwen3CausalLM::registerCustomLayers() {
