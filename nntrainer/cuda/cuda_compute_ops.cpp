@@ -246,13 +246,16 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
         auto *Xh =
           reinterpret_cast<const unsigned short *>(input.getData<_FP16>());
         auto *Yh = reinterpret_cast<unsigned short *>(output.getData<_FP16>());
-        // Prefill (M>=32): w4a8 on the INT8 Tensor Cores via cuBLAS (~10x the
-        // dp4a int-ALU GEMM, bit-identical). Then the dp4a fast path, then
-        // the naive plain GEMM -- each falls to the next on failure.
+        // Prefill (M >= CUDA_FC_I8_PREFILL_MIN_M): w4a8 on the INT8 Tensor
+        // Cores via cuBLAS (~10x the dp4a int-ALU GEMM, bit-identical). Then
+        // the dp4a fast path, then the naive plain GEMM -- each falls to the
+        // next on failure. The threshold is the header constant, not a local
+        // literal, because the load-time prewarm decides whether to build the
+        // i8 [K,N] cache from the same number.
         // This gate is the SHAPE only: the NNTR_FC_CUDA_CUBLAS=0 opt-out is
         // enforced inside cuda_fc_qs4cx_cublas_i8_gemm_fp16(), which then
         // reports failure and lets the dp4a path below take the call.
-        const bool prefill = M >= 32;
+        const bool prefill = M >= (int)cuda::CUDA_FC_I8_PREFILL_MIN_M;
         if (nntrainer::cuda::dev_accessible(Xh) &&
             ((prefill &&
               cuda::cuda_fc_qs4cx_cublas_i8_gemm_fp16(

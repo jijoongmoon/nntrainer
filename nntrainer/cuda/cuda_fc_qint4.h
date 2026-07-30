@@ -21,6 +21,21 @@
 namespace nntrainer::cuda {
 
 /**
+ * @brief Smallest GEMM M for which the cuBLAS int8-IMMA FC path is selected.
+ *
+ * Below this the dp4a int-ALU GEMM wins (the IMMA path's per-call activation
+ * repack + cuBLAS launch overhead is not amortized), so the dispatcher only
+ * reaches cuda_fc_qs4cx_cublas_i8_gemm_fp16() at M >= this. It is therefore
+ * also the exact condition under which the i8 [K,N] weight cache can ever be
+ * READ: a turn whose largest prefill M stays below it never touches that
+ * cache, and building it eagerly is provably dead work. Single source of truth
+ * for both the dispatcher (cuda_compute_ops.cpp) and the load-time prewarm
+ * (causal_lm.cpp) -- they must not drift apart, or the prewarm builds caches
+ * nothing reads (or skips caches something reads).
+ */
+constexpr unsigned int CUDA_FC_I8_PREFILL_MIN_M = 32u;
+
+/**
  * @brief Build (and cache) the N-entry UVM fp16 per-channel scale buffer from
  *        the tensor's fp32 scales. The dequant kernels read the scale on device
  *        every call; the tensor stores fp32, so the fp16 copy is made once at
