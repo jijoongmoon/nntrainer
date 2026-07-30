@@ -25,6 +25,51 @@ namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
+namespace {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+/**
+ * @brief Is this pointer NOT dereferenceable by the host?
+ *
+ * @details True only for a plain cudaMalloc allocation. That is what the
+ *          activation pool becomes under NNTR_CUDA_DEV_ACT (auto-armed on a
+ *          discrete GPU with concurrentManagedAccess, cuda_context.cpp), and
+ *          the host copy below would fault on it. Managed/UVM and host
+ *          allocations both stay host-addressable and answer false.
+ */
+bool device_only(const void *p) {
+  if (p == nullptr)
+    return false;
+  cudaPointerAttributes a{};
+  const bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess;
+  cudaGetLastError(); // a non-CUDA host pointer sets an error; clear it
+  return ok && a.type == cudaMemoryTypeDevice;
+}
+#endif
+
+/**
+ * @brief Copy one contiguous slice row, wherever the two ends live.
+ *
+ * @details The fallback below is a pure copy, so it stays correct on a
+ *          device-only activation pool as long as the copy engine does it
+ *          instead of the CPU. std::memcpy on a cudaMalloc pointer is a
+ *          SIGSEGV, which is what any run with the device slice-copy declined
+ *          (NNTR_CUDA_ELTWISE=0) hit once this layer became constructible on
+ *          the cuda context.
+ */
+void slice_row_copy(void *dst, const void *src, size_t bytes,
+                    [[maybe_unused]] bool needs_device_copy) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  if (needs_device_copy) {
+    // cudaMemcpyDefault infers the direction from the unified address space,
+    // so this one call covers D2D / D2H / H2D without inspecting both ends.
+    cudaMemcpy(dst, src, bytes, cudaMemcpyDefault);
+    return;
+  }
+#endif
+  std::memcpy(dst, src, bytes);
+}
+} // namespace
+
 void PerLayerSliceLayer::finalize(nntrainer::InitLayerContext &context) {
   auto dims = context.getInputDimensions();
   auto in_dim = dims[0];
@@ -87,22 +132,30 @@ void PerLayerSliceLayer::incremental_forwarding(
       // Host memcpy slicing reads the GPU-produced UVM input on the CPU; sync
       // first in async mode (no-op in default sync mode).
       nntrainer::cuda::StreamManager::Global().finishIfAsync();
+      // BOTH ends must be probed: the output is a separate pool tensor, so an
+      // input-only probe (what the FP16 branch below used to do) misses the
+      // half that actually faults on a write.
+      const bool dev_copy = device_only(in_data) || device_only(out_data);
+#else
+      const bool dev_copy = false;
 #endif
       for (unsigned int t = 0; t < tokens; ++t) {
         const float *src =
           in_data + t * in_dim.width() + layer_index * feature_size;
         float *dst = out_data + t * feature_size;
-        std::memcpy(dst, src, sizeof(float) * feature_size);
+        slice_row_copy(dst, src, sizeof(float) * feature_size, dev_copy);
       }
 #ifdef ENABLE_FP16
     } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       _FP16 *in_data = in_step.getData<_FP16>();
       _FP16 *out_data = out_step.getData<_FP16>();
       bool done = false;
+      bool dev_copy = false;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       // GPU slice-copy: keep the packed per-layer embedding slice on-device
       // instead of the host memcpy loop. Opt-in (NNTR_CUDA_ELTWISE).
       static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
+      dev_copy = device_only(in_data) || device_only(out_data);
       if (gpu) {
         cudaPointerAttributes pa{};
         bool dev =
@@ -115,13 +168,16 @@ void PerLayerSliceLayer::incremental_forwarding(
                      in_dim.width(), layer_index * feature_size, feature_size))
           done = true;
       }
+      // The fallback reads whatever the device just produced.
+      if (!done)
+        nntrainer::cuda::StreamManager::Global().finishIfAsync();
 #endif
       if (!done)
         for (unsigned int t = 0; t < tokens; ++t) {
           const _FP16 *src =
             in_data + t * in_dim.width() + layer_index * feature_size;
           _FP16 *dst = out_data + t * feature_size;
-          std::memcpy(dst, src, sizeof(_FP16) * feature_size);
+          slice_row_copy(dst, src, sizeof(_FP16) * feature_size, dev_copy);
         }
 #endif
     } else {
