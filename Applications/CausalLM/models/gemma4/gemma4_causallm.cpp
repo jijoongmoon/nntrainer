@@ -879,10 +879,11 @@ void Gemma4CausalLM::registerCustomLayers() {
 std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
   auto [x, h] = Gemma4Transformer::constructModel();
 
-  // No engine= on the head or the final soft-cap: buildLmHeadOutput's types
-  // ("lm_head" untied, "tie_word_embeddings" tied) are the deferred rung
-  // 38de03c46 describes, and "logit_softcapping" is registered on the cpu and
-  // cuda contexts but NOT on the OpenCL one, so stamping it would throw.
+  // No engine= on the head: buildLmHeadOutput's types ("lm_head" untied,
+  // "tie_word_embeddings" tied) are the deferred half of the engine-stamping
+  // work and still resolve on the cpu context. The final soft-cap below DOES
+  // carry engine= now -- the OpenCL context registers logit_softcapping as of
+  // this change set, so the stamp no longer throws.
   // lm_head: shares CausalLM::buildLmHeadOutput, which honors LMHEAD_UNTIE
   // (untied FC head with its own weight record — the layout the
   // gemma4_qs4cx_fp16 packagings serialize). skip_prefill gates on
@@ -893,7 +894,16 @@ std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
     std::vector<std::string> final_softcap_props = {
       withKey("name", "output_of_causallm_softcapped"),
       withKey("activation_type", "tanh"), withKey("apply_rows", "1"),
-      withKey("softcap_value", std::to_string(FINAL_LOGIT_SOFTCAPPING))};
+      withKey("softcap_value", std::to_string(FINAL_LOGIT_SOFTCAPPING)),
+      // The soft-cap MUST carry the graph's engine.
+      // LayerNode::configureRunContext attaches the NODE's ContextData to the
+      // tensors it owns, and the logits are shared with the lm_head that
+      // produced them -- so an unstamped node here re-binds the cpu op table
+      // onto a device graph's output. On engine=cuda those logits live in the
+      // device-only activation pool (NNTR_CUDA_DEV_ACT), and
+      // CpuComputeOps::softcap's host copy then dereferences device memory:
+      // SIGSEGV inside __fallback_scopy.
+      withKey("engine", causallm_engine())};
     appendSkipPrefillIfNeeded(final_softcap_props, true);
     LayerHandle final_softcap(
       createLayer("logit_softcapping", final_softcap_props));
