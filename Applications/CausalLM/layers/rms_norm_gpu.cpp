@@ -121,12 +121,12 @@ static void rms_norm_host_fp32(const float *in, const float *gamma, float *out,
 void RMSNormLayerGPU::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  // Same predicate as the host RMSNormLayer: a multi-token step is a prefill
-  // step wherever it starts, because a resumed turn prefills from the KV cache
-  // position it left off at and a chunked prefill issues every chunk after the
-  // first with from > 0. Testing `from == 0` alone would make the GPU variant
-  // skip a different set of steps than the host layer it stands in for.
-  if (skip_prefill && (from == 0 || (to - from) > 1))
+  // [prefill-chunk] A chunked prefill arrives as a from>0 block call with
+  // to-from == the chunk length, so `from == 0` alone stops recognizing prefill
+  // from chunk 2 on. Multi-row steps are prefill too -- decode is the only
+  // single-row step. Same predicate as the CPU twin (ReshapedRMSNormLayer).
+  bool is_prefill = !from || (to - from) > 1;
+  if (skip_prefill && is_prefill)
     return;
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
