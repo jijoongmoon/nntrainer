@@ -35,6 +35,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <cstdint>
 #include <cstdlib>
 #include <layer.h>
 #include <map>
@@ -171,6 +172,55 @@ public:
               const std::map<std::string, ml::train::TensorDim::DataType>
                 &layer_dtype_map = {},
               ml::train::ISA target_isa = ml::train::ISA::DEFAULT);
+
+  /**
+   * @brief One embedding-table node of the compiled graph
+   * @note  This is the packaging tool's ONLY oracle for whether a table can
+   *        become an mmap sidecar. constructModel() -- not the packager --
+   *        owns the tie/untie rule, and it expresses that rule by choosing the
+   *        node type: an untied table is an "embedding_layer" (it holds a
+   *        lookup weight and reads a quantized_lut_path), a shared one is a
+   *        "tie_word_embeddings" (it does neither). Re-deriving the rule from
+   *        config keys in the packager is exactly how the two would drift.
+   */
+  struct EmbeddingTable {
+    std::string name;  /**< graph node name, e.g. "embedding0" */
+    std::string type;  /**< registered layer type of the node */
+    unsigned int rows; /**< table row count (in_dim), 0 if not a lookup table */
+    unsigned int size; /**< elements per row (out_dim), 0 if not a lookup */
+  };
+
+  /**
+   * @brief List the embedding-table nodes of the compiled graph
+   * @return every node whose type is "embedding_layer" or
+   *         "tie_word_embeddings", in graph order
+   * @note   requires initialize() -- the dimensions are read off the finalized
+   *         weight, not off the config
+   */
+  std::vector<EmbeddingTable> list_embedding_tables() const;
+
+  /**
+   * @brief Save the weight with type conversion, routing named layers into
+   *        their own files (mmap sidecar packaging)
+   * @param weight_path Path of the main (slim) weight file
+   * @param dtype Global target data type for all layers (NONE = keep original)
+   * @param layer_dtype_map Per-layer data type overrides (layer_name -> dtype)
+   * @param routed_layers layer_name -> payload file path; those layers are
+   *        written to their own file instead of into @a weight_path
+   * @param target_isa Target ISA for quantization (default: DEFAULT)
+   * @return layer_name -> bytes written into its payload file
+   * @note The union of the produced files is byte-for-byte the file
+   *       save_weight() would have written with the same arguments: the graph
+   *       order, the dtype resolution and the per-layer writer are the same,
+   *       only the destination stream differs.
+   */
+  virtual std::map<std::string, uint64_t>
+  save_weight_split(const std::string &weight_path,
+                    ml::train::TensorDim::DataType dtype,
+                    const std::map<std::string, ml::train::TensorDim::DataType>
+                      &layer_dtype_map,
+                    const std::map<std::string, std::string> &routed_layers,
+                    ml::train::ISA target_isa = ml::train::ISA::DEFAULT);
 
   /**
    * @brief run the Transformer model
