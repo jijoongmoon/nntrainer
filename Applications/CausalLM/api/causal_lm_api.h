@@ -141,6 +141,23 @@ typedef enum {
 
 /**
  * @brief Load a model
+ *
+ * Loading is idempotent. A call that asks for the model already in memory --
+ * same backend, same ::ModelType, same ::ModelQuantizationType, resolving to
+ * the same package directory -- keeps that model and returns
+ * ::CAUSAL_LM_ERROR_NONE without re-reading the weights. A caller may load
+ * before every request without paying for a reload, and without having to
+ * track whether it has loaded already.
+ *
+ * A call that asks for a DIFFERENT model does reload; it never quietly hands
+ * back the model already in memory. The replacement is built to completion
+ * first and only then swapped in, so a reload that fails leaves the
+ * previously loaded model loaded and runnable and returns the error.
+ *
+ * A reused load does not disturb the
+ * ::PerformanceMetrics::initialization_duration_ms of the model in memory: it
+ * keeps reporting what that model cost to build.
+ *
  * @param compute Backend compute type
  * @param modeltype Model type
  * @param quant_type Model quantization type
@@ -158,6 +175,11 @@ WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
  * runner can be pointed at one package and get one answer. This is the entry
  * point to use for any model that is not one of the built-in ::ModelType
  * values (that enum stays as it is for existing callers).
+ *
+ * Idempotent on the same package, and safe on a failed switch, exactly as
+ * ::loadModel is: same backend and same directory reuses the model already in
+ * memory, a different one reloads without losing the loaded model if the
+ * reload fails.
  *
  * @param compute   Backend compute type; selects the nntrainer engine and
  *                  must be chosen before the first load in the process.
