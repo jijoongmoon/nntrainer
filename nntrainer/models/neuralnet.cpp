@@ -688,12 +688,24 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   return forwarding(training);
 }
 
-// CUDA M2-B embed-only feed flag (decoupled from the OpenCL recq skip): true
-// while the single-capture replay re-runs ONLY the embedding nodes to refresh
-// the pinned staging buffer for the new token id; the forwarding_op below then
-// skips every other node's host forward (the GPU work comes from the replayed
-// graph).
+// CUDA M2-B embed-only feed flag: true while the single-capture replay re-runs
+// ONLY the embedding nodes to refresh the pinned staging buffer for the new
+// token id; the forwarding_op below then skips every other node's host forward
+// (the GPU work for those nodes comes from the replayed graph).
+//
+// Producer: CudaContext::runDecode, which brackets one incremental_forwarding()
+// call with setM2BSkipAll(true/false). Consumer: the graph walk below. Both
+// halves are required — with the flag set but unread, that bracketed call is a
+// FULL eager forward that the graph replay then repeats, i.e. strictly more
+// work per token than not using the graph at all.
 static bool g_m2b_skip_all = false;
+
+// The node names the feed pass must still run: the input embedding(s), which
+// produce the residual seed for this token. Everything downstream of them is
+// covered by the captured graph.
+static bool isM2BFeedNode(const std::string &nm) {
+  return nm == "embedding0" || nm == "per_layer_input_embedding";
+}
 
 void NeuralNetwork::setM2BSkipAll(bool v) { g_m2b_skip_all = v; }
 
@@ -764,6 +776,15 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     [this, from, to, stop_cb, fsu_mode,
      lookahead](std::shared_ptr<LayerNode> node, bool training) -> void {
     PROFILE_MEM_ANNOTATE("Forwarding for layer: " + node->getName());
+
+    // M2-B embed-only feed pass: run ONLY the input-embedding nodes (they
+    // refresh the residual seed for this token) and skip every other node's
+    // host forward, so the rest of the token's forward is supplied solely by
+    // the replayed CUDA graph. Inert everywhere else: g_m2b_skip_all is only
+    // ever set by CudaContext::runDecode around THIS walk, so CPU/OpenCL and
+    // every non-M2-B CUDA step take the same path as before.
+    if (g_m2b_skip_all && !isM2BFeedNode(node->getName()))
+      return;
 
     auto f = std::get<0>(node->getExecutionOrder());
     if (exec_mode == ExecutionMode::TRAIN or
