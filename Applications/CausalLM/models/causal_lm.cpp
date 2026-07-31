@@ -1137,6 +1137,22 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (log_output)
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
     allocateAndBindKVCache();
+    // Producer precondition for the KV write-locality invariant (see the guard
+    // in mha_core.cpp): this branch prefills the WHOLE system prompt as one
+    // unchunked block from absolute 0, so unlike the chunk loop below it does
+    // not split its writes on the absolute NNTR_PREFILL_CHUNK grid. That is
+    // only safe while no layer is ringed. Precomputed-cache save/load is
+    // already NYI with the ring (KVCacheManager::save refuses modulo-indexed
+    // rows, a few lines down), so refuse HERE for that reason instead of
+    // running NUM_LAYERS forwards first and surfacing it as a ring-seam error
+    // that blames the prefill producer.
+    NNTR_THROW_IF(std::find_if(kv_ring_caps_.begin(), kv_ring_caps_.end(),
+                               [](unsigned int c) { return c != 0; }) !=
+                    kv_ring_caps_.end(),
+                  std::runtime_error)
+      << "KVCacheManager: NYI -- precomputed KV cache save/load with the "
+         "sliding-window ring enabled (set NNTR_KV_WINDOW_RING=0 for "
+         "save_kvcache / use_kvcache runs)";
     setKVCachePosition(0);
     output = incrementalInference(BATCH_SIZE, input, input_len, 0, input_len);
 
@@ -1204,8 +1220,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // mod C, and the old "offset from from_pos" grid then straddled the seam
   // mid-prefill on a configuration that ran fine with the ring off.
   //
-  // Byte-identical to the previous schedule whenever from_pos % C == 0 and the
-  // chunk divides C -- i.e. every single-turn, no-system-prompt run.
+  // ! This re-tiling is a CONTRACT CHANGE ON A SHIPPED API SURFACE, not an
+  //   internal detail. Precisely: multi-turn (and precomputed-system-prompt)
+  //   PREFILL BITS CHANGE; ring-on == ring-off is preserved. The schedule is
+  //   byte-identical to the previous one whenever from_pos % C == 0 and the
+  //   chunk divides C -- i.e. every single-turn, no-system-prompt run, which is
+  //   what the 1K goldens measure -- but a second run() on one model object
+  //   re-tiles as soon as from_pos % C + n_tok > C, and a different chunk
+  //   size means different fp16 rounding, exactly as any chunk-size change
+  //   does. Every caller that reuses one model object is in that regime:
+  //   multi-turn chat, the resume-block prefill path, and a reset-and-rerun
+  //   SDK session. A two-turn transcript is therefore a REQUIRED gate row for
+  //   this file -- the single-turn goldens cannot see this at all.
   //
   // ring_grid is only ever read on a path guarded by prefill_chunk != 0, and
   // prefill_chunk is 0 whenever effectivePrefillChunk() is, so the modulo below
@@ -1228,6 +1254,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                                   from_pos + n_tok);
     }
     // Chunked forward prefill, on the absolute C grid.
+    //
+    // Chunk sizes are no longer non-increasing: the FIRST chunk is the short
+    // one (it stops at the next absolute multiple of C) and the ones after it
+    // are full. The refill below writes only rows [0, clen) of input_sample, so
+    // rows [clen, previous clen) keep the PREVIOUS chunk's token ids. Nothing
+    // reads them, and that is now load-bearing: the bound is the (from, to)
+    // pair, not the buffer -- every layer's incremental_forwarding slices
+    // to - from rows from row 0 (e.g. EmbeddingLayer: `int iter = to - from`),
+    // and the init_seq_len argument of incrementalInference is dropped by
+    // NeuralNetwork::incremental_inference. Feeding a chunk shorter than its
+    // predecessor without narrowing (from, to) in lockstep would silently
+    // prefill stale tokens.
     std::vector<float *> out;
     unsigned int o = 0;
     while (o < n_tok) {

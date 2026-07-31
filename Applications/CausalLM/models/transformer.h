@@ -601,6 +601,12 @@ inline unsigned int effectivePrefillChunk() {
  *  - there is no chunking (C == 0) -- the ring REQUIRES a bounded live span;
  *  - the derived cap would not shrink anything (cap >= max_seq).
  *
+ * ! 0 means "physical row == absolute position", NOT "unbounded": such a layer
+ *   still writes into a max_seq-row plane, and the absolute write position is
+ *   SYS_PROMP_LEN + global_token_len + offset, which a long system prompt or
+ *   enough turns on one model object walk past max_seq. Both cases are bounded
+ *   by the same guard (mha_assert_kv_write_fits in mha_core.cpp).
+ *
  * ! That last clause is a documented foot-gun. With the default C=4096 and
  *   an example W=1024 the derived cap is (1024/4096 + 2) * 4096 = 8192, so any
  *   package whose max_seq_len is <= 8192 silently runs ring-OFF. A 200+ run
