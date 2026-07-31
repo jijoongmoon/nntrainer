@@ -2857,7 +2857,8 @@ bool flash_attention_prefill_f16_cl(
   // coop/vec/skeleton variants (Qwen3 d=128, no softcap/window) don't declare
   // them, so only bind them for those paths. local_window<=0 or >=N_kv => no
   // window mask.
-  auto bind_all = [&](ClContext::SharedPtrClKernel &kk) -> bool {
+  auto bind_all = [&](ClContext::SharedPtrClKernel &kk,
+                      bool kk_is_xmx) -> bool {
     if (!kk->SetKernelSVMArguments(0, const_cast<uint16_t *>(Q_host)) ||
         !kk->SetKernelSVMArguments(1, const_cast<uint16_t *>(K_host)) ||
         !kk->SetKernelSVMArguments(2, const_cast<uint16_t *>(V_host)) ||
@@ -2873,6 +2874,19 @@ bool flash_attention_prefill_f16_cl(
         !kk->SetKernelArguments(11, &scale, sizeof(float)) ||
         !kk->SetKernelArguments(12, &k_stride, sizeof(int)))
       return false;
+    // Argument 15 of a Block-Q-family prefill kernel is the KV ring capacity:
+    // >0 means the K/V buffers hold only that many PHYSICAL rows while N_kv
+    // stays the logical key count, so the kernel reads row (n % cap).  This
+    // build has no ring, hence 0 (linear KV) -- but the XMX kernel still
+    // declares and binds the slot, because a caller that does supply a cap
+    // must not hit CL_INVALID_ARG_INDEX here: bind_all() would return false,
+    // the whole flash path would report failure and mha_core would silently
+    // fall back to host attention on every full-attention prefill call.
+    // Bound BEFORE the flash_blockq block on purpose, so that a build which
+    // binds a real capacity for the whole Block-Q family overrides it.
+    const int ring_cap_i = 0;
+    if (kk_is_xmx && !kk->SetKernelArguments(15, &ring_cap_i, sizeof(int)))
+      return false;
     if (flash_blockq) {
       if (!kk->SetKernelArguments(13, &attn_softcap, sizeof(float)) ||
           !kk->SetKernelArguments(14, &win_arg, sizeof(int)))
@@ -2880,7 +2894,7 @@ bool flash_attention_prefill_f16_cl(
     }
     return true;
   };
-  if (!bind_all(kp))
+  if (!bind_all(kp, use_xmx))
     return false;
 
   std::array<size_t, 1> gws;
@@ -2928,7 +2942,7 @@ bool flash_attention_prefill_f16_cl(
   std::vector<uint16_t> _xmx_ref;
   static int _xmx_check_done = 0;
   if (kp_ref && _xmx_check_done < flash_xmx_check) {
-    if (!bind_all(kp_ref))
+    if (!bind_all(kp_ref, /*kk_is_xmx=*/false))
       return false;
     const size_t TMr = (size_t)flash_blockq_tm;
     const size_t g_ref = (size_t)num_heads_Q * (((size_t)M + TMr - 1) / TMr);
