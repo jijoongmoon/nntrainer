@@ -35,6 +35,8 @@
 #include <compute_ops.h>
 #include <cpu_backend.h> // gemm_q4_0 (host route for CL-ineligible shapes)
 #include <geglu_cl_op.h>
+#include <nntrainer_log.h>
+#include <rms_reverse_norm_cl_op.h>
 #include <sigmoid_add_cl_op.h>
 #include <sigmoid_glu_cl_op.h>
 #include <swiglu_cl_op.h>
@@ -254,6 +256,45 @@ public:
   void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
                    unsigned int active_rows, unsigned int row_offset) override {
     nntrainer::sigmoid_add_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+
+  /**
+   * @brief PLE post_norm (reverse-RMSNorm) whole-op: the GPU kernel
+   * when the SVM residency contract holds; otherwise the SAME host FP32-temp
+   * math the cpu table runs — with the bounce NAMED (one-shot ml_logw plus
+   * per-call lines under NNTR_RRN_DIVERT_TRACE=1), never silent. The silent
+   * four-predicate fall-through this replaces is the shape that hid the model's
+   * all `-0` PLE post_norm (F-B): a host reader/writer interleaved with the
+   * in-order-but-undrained GPU queue. A host bounce is a defect to be NAMED,
+   * not hidden.
+   */
+  void rms_reverse_norm(Tensor &in, Tensor &out, const Tensor &weight,
+                        const Tensor &out_scale, float epsilon,
+                        unsigned int active_rows,
+                        unsigned int row_offset) override {
+    if (nntrainer::rms_reverse_norm_cl_op(in, out, weight, out_scale, epsilon,
+                                          active_rows, row_offset))
+      return;
+    const char *why = nntrainer::rms_reverse_norm_cl_last_reject_reason();
+    static bool warned_once = false;
+    if (!warned_once) {
+      warned_once = true; // benign race: worst case one extra log line
+      ml_logw("[rrn-divert] reverse-rms-norm '%s' left the GPU path: %s -- "
+              "running the host FP32-temp math (NNTR_RRN_DIVERT_TRACE=1 "
+              "traces every diverted call)",
+              out.getName().c_str(), why);
+    }
+    static const bool divert_trace = []() {
+      const char *e = std::getenv("NNTR_RRN_DIVERT_TRACE");
+      return e && e[0] != '0';
+    }();
+    if (divert_trace) {
+      std::fprintf(stderr, "[rrn-divert] %s reason=%s rows=%u off=%u\n",
+                   out.getName().c_str(), why, active_rows, row_offset);
+      std::fflush(stderr);
+    }
+    get_cpu_ops()->rms_reverse_norm(in, out, weight, out_scale, epsilon,
+                                    active_rows, row_offset);
   }
 
   /**
