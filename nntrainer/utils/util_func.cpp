@@ -95,11 +95,28 @@ void checkedRead(ReadSource src, char *array, std::streamsize size,
   if (auto f = std::get_if<std::ifstream *>(&src)) {
     if (read_from_offset) {
       (*f)->seekg(start_offset, std::ios::beg);
+      checkFile(**f, "failed to move offset");
     }
     (*f)->read(static_cast<char *>(array), static_cast<std::streamsize>(size));
-    // checkFile((*f), error_msg);
+    // The stream overload above has always checked this; here it was commented
+    // out, and the reason it had to be is that `*f` is an std::ifstream* -- the
+    // template would have deduced T = std::ifstream* and failed to compile on
+    // .bad(). Dereference once more. Without it a short read (a truncated or
+    // mis-offset weight file) leaves the destination holding whatever was in
+    // the buffer and the caller none the wiser; istream::read only sets eofbit
+    // when it extracted FEWER bytes than asked, so a read that lands exactly on
+    // EOF is still accepted.
+    checkFile(**f, error_msg);
   } else if (auto p = std::get_if<const char *>(&src)) {
     /// @todo use mmap instead memcpy to reduce peak memory
+    // NOTE: this branch cannot bound itself. A `const char *` mapping carries
+    // no length, so an over-long size or an out-of-range start_offset reads
+    // past the end of the mapping and SIGSEGVs on a load worker thread, ~300
+    // tensors away from whichever layer mis-sized itself. The guard for that
+    // lives one level up, in NeuralNetwork::load, which compares the graph's
+    // computed layout total against the real file size before any of these
+    // calls happen. Do not remove that check on the assumption this one is
+    // safe.
     if (read_from_offset) {
       std::memcpy(array, (*p) + start_offset, size);
     } else {
