@@ -1355,19 +1355,30 @@ void MHACoreLayer::one_batch_incremental_forwarding(
    */
 
   // Fail loud if a step write would straddle the ring seam.
-  // Wcap is a multiple of the prefill chunk C and cache_index is C-aligned
-  // (chunked prefill) or step==1 (decode), so cacheRow(cache_index)+step <=
-  // Wcap holds by construction. A violation means a misconfigured chunk --
-  // throw instead of silently corrupting the neighbouring allocation (the raw
+  // This is the LAST line of defence for the KV write-locality invariant: the
+  // write below is one contiguous slice at row cacheRow(cache_index), so it
+  // needs cacheRow(cache_index) + step <= Wcap. Wcap is a multiple of the
+  // prefill chunk C, so the invariant holds for ANY cache_index as long as the
+  // producer keeps a write inside one absolute C-aligned block --
+  // CausalLM::run's chunk loop does that (note that cache_index is the
+  // ABSOLUTE position, so it is C-aligned only when prefill started at a
+  // multiple of C). Decode (step == 1) holds trivially. A violation means a
+  // prefill producer that does not chunk on the absolute C grid -- throw
+  // instead of silently corrupting the neighbouring allocation (the raw
   // pointer writes below do not bounds-check). Applies to every cache-row write
   // in this function, which all share this cache_index.
   if (kv_ring_cap &&
       cacheRow(cache_index) + (size_t)cache_key_step_dim.height() >
         (size_t)kv_ring_cap) {
     throw std::runtime_error(
-      "mha_core kv-window-ring: step write straddles the ring seam "
-      "(NNTR_PREFILL_CHUNK must divide the window ring capacity; keep the "
-      "chunk a power-of-two <= the sliding window)");
+      "mha_core kv-window-ring: step write straddles the ring seam at absolute "
+      "position " +
+      std::to_string(cache_index) + " (ring cap " +
+      std::to_string(kv_ring_cap) + ", step " +
+      std::to_string(cache_key_step_dim.height()) +
+      "). The prefill producer must split its writes on the ABSOLUTE "
+      "NNTR_PREFILL_CHUNK grid; re-run with NNTR_KV_WINDOW_RING=0 for this "
+      "configuration.");
   }
 
   // Load Input Tensors of this batch : b_ denotes a Tensor for this batch

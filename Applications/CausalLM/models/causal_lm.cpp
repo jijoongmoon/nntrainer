@@ -1182,29 +1182,69 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     _prefill_chunking
       ? std::min<unsigned int>(effectivePrefillChunk(), INIT_SEQ_LEN)
       : 0u;
+  // [kv-window-ring] The KV write-locality invariant, and the only site that
+  // can uphold it.
+  //
+  //   A ringed layer stores absolute position p at physical row (p % Wcap) and
+  //   writes ONE contiguous slice per call, so every prefill call [p, p+L)
+  //   must satisfy (p % Wcap) + L <= Wcap -- it may not straddle the wrap seam.
+  //   Wcap (kvRingCap) is a multiple of C = effectivePrefillChunk(), so the
+  //   PHASE-INDEPENDENT sufficient condition is that a write never crosses an
+  //   absolute multiple of C: p / C == (p + L - 1) / C.
+  //
+  // The seam cannot be dodged by sizing Wcap instead: for any finite Wcap some
+  // p puts the slice across the seam, so only the producer's phase can uphold
+  // it. Chunk boundaries are therefore phased on the ABSOLUTE position, not on
+  // an offset from from_pos: the first chunk is shortened to the next multiple
+  // of C, every later one starts C-aligned.
+  //
+  // from_pos is 0 only for a first turn without a precomputed system prompt;
+  // it is SYS_PROMP_LEN + global_token_len, so a precomputed system-prompt KV
+  // cache or a second run() on the same object makes it an arbitrary residue
+  // mod C, and the old "offset from from_pos" grid then straddled the seam
+  // mid-prefill on a configuration that ran fine with the ring off.
+  //
+  // Byte-identical to the previous schedule whenever from_pos % C == 0 and the
+  // chunk divides C -- i.e. every single-turn, no-system-prompt run.
+  //
+  // ring_grid is only ever read on a path guarded by prefill_chunk != 0, and
+  // prefill_chunk is 0 whenever effectivePrefillChunk() is, so the modulo below
+  // cannot divide by zero.
+  const unsigned int ring_grid = effectivePrefillChunk();
   auto do_prefill = [&](unsigned int n_tok,
                         unsigned int from_pos) -> std::vector<float *> {
-    // Single block (default) when chunking is off or the prompt fits one chunk.
+    // Single block when chunking is off, or when the whole prompt already fits
+    // inside one C-aligned block (which is what n_tok <= prefill_chunk means
+    // for a C-aligned from_pos, the historical fast path).
     // NOTE: this must go through CausalLM::incrementalInference, not
     // NeuralNetwork::incremental_inference -- the wrapper feeds KVCacheManager
     // tensors as the REAL tensor so their isSVM() flag survives the per-call
     // fillPlaceholder/syncDependents (see its contract comment). Calling the
     // raw model method here drops attention to the host path.
-    if (prefill_chunk == 0 || n_tok <= prefill_chunk) {
+    if (prefill_chunk == 0 ||
+        (n_tok <= prefill_chunk &&
+         (from_pos % ring_grid) + n_tok <= ring_grid)) {
       return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
                                   from_pos + n_tok);
     }
-    // Chunked forward prefill.
+    // Chunked forward prefill, on the absolute C grid.
     std::vector<float *> out;
-    for (unsigned int o = 0; o < n_tok; o += prefill_chunk) {
-      const unsigned int clen = std::min(prefill_chunk, n_tok - o);
+    unsigned int o = 0;
+    while (o < n_tok) {
+      const unsigned int cf = from_pos + o;
+      // <= prefill_chunk (the activation buffer) and never past the next
+      // absolute multiple of C (the ring seam). All three terms are >= 1
+      // (cf % ring_grid < ring_grid, o < n_tok, prefill_chunk != 0 here), so
+      // the loop always advances.
+      const unsigned int clen =
+        std::min({prefill_chunk, n_tok - o, ring_grid - (cf % ring_grid)});
       for (unsigned int b = 0; b < BATCH_SIZE; ++b)
         for (unsigned int j = 0; j < clen; ++j)
           input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
             static_cast<float>(init_input[o + j]);
-      const unsigned int cf = from_pos + o;
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
-      if (o + clen < n_tok)
+      o += clen;
+      if (o < n_tok)
         for (auto &oo : so)
           delete[] oo;
       else

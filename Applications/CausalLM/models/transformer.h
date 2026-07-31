@@ -582,8 +582,16 @@ inline unsigned int effectivePrefillChunk() {
  * "no ring, keep full max_seq".
  *
  * Wcap is a multiple of C and >= W + C:
- *  - a multiple of C means a C-aligned chunk write never straddles the wrap
- *    seam, so one step write stays a single contiguous slice;
+ *  - a multiple of C means a write that does not cross an ABSOLUTE multiple of
+ *    C can never straddle the wrap seam either (p = aC + r with r + L <= C
+ *    gives p % Wcap + L <= Wcap for every p), so one step write stays a single
+ *    contiguous slice. It is the PRODUCER that has to keep writes inside one
+ *    C-aligned absolute block; CausalLM::run's chunk loop phases its
+ *    boundaries on the absolute position for exactly this reason, because
+ *    prefill starts at SYS_PROMP_LEN + global_token_len and is C-aligned only
+ *    on a first turn without a precomputed system prompt. Sizing cannot
+ *    replace that: for any finite Wcap some start position puts a slice across
+ *    the seam;
  *  - >= W + C means the live window [pos-W+1, pos+C) never self-collides
  *    mod Wcap.
  *
