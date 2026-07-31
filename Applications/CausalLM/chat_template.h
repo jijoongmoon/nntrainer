@@ -145,6 +145,50 @@ std::string buildUserPrompt(
   PromptTemplateMode mode = PromptTemplateMode::Auto,
   const nlohmann::json &render_context = nlohmann::json::object());
 
+/**
+ * @brief Byte extents of what the template itself wraps around the content.
+ *
+ * The rendered prompt is prefix + content + suffix, and the two affixes are
+ * not interchangeable with the content: the prefix opens the turn and the
+ * suffix carries the assistant-turn marker, which is what tells the model to
+ * answer rather than to keep writing the user's text. A consumer that has to
+ * shorten a rendered prompt needs to know which bytes those are, and only the
+ * seam can say -- it is what rendered them.
+ */
+struct PromptAffixes {
+  size_t prefix_bytes = 0; /**< bytes emitted before the content */
+  size_t suffix_bytes = 0; /**< bytes emitted after it, turn marker included */
+};
+
+/**
+ * @brief Measure the affixes @a tmpl puts around @a request's last message.
+ *
+ * Measured, not parsed: the same request is rendered twice with the last
+ * message's content replaced by two differing probe strings, so whatever the
+ * template emits around the content is identical in both renders. The common
+ * prefix therefore ends exactly where the content begins and the common
+ * suffix begins exactly where it ends. The two probe lengths must then
+ * reproduce the two render lengths exactly, which is what proves the render
+ * really is prefix + content + suffix; a template whose output depends on the
+ * content in some other way fails that check.
+ *
+ * @param tmpl  template loaded from the model package, or nullptr
+ * @param request the same chat request buildPrompt() is given, so the two
+ *                cannot describe different renders
+ * @param mode  Auto = measure when @a tmpl is present; Never = nothing applied
+ * @param render_context default render keys (see makeUserRequest)
+ * @return the two byte counts, or {0, 0} when nothing was applied, the request
+ *         has no substitutable last message, the probe render throws, or the
+ *         render is not a plain wrap. {0, 0} always means "no claim made" --
+ *         never "the template contributes nothing" -- so a caller must treat
+ *         it as an absence of information, not as a measurement.
+ * @see buildPrompt
+ */
+PromptAffixes
+promptAffixes(const ChatTemplate *tmpl, const nlohmann::json &request,
+              PromptTemplateMode mode = PromptTemplateMode::Auto,
+              const nlohmann::json &render_context = nlohmann::json::object());
+
 } // namespace causallm
 
 #endif // __CHAT_TEMPLATE_H__

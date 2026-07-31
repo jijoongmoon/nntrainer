@@ -141,6 +141,75 @@ TEST(ChatTemplateSeam, RequestKeysWinOverPackageContext) {
   EXPECT_EQ(rendered, "[user:hi][model:nothink]");
 }
 
+TEST(ChatTemplateSeam, AffixesFrameTheRenderedPrompt) {
+  TemplateDir dir(kTurnTemplate, "affixes");
+  auto tmpl = causallm::ChatTemplate::Load(dir.str());
+
+  const std::string content = "a document long enough to need shortening";
+  const auto request = causallm::makeUserRequest(content);
+  const std::string rendered = causallm::buildPrompt(&tmpl, request);
+  const auto affixes = causallm::promptAffixes(&tmpl, request);
+
+  EXPECT_EQ(affixes.prefix_bytes, std::string("[user:").size());
+  EXPECT_EQ(affixes.suffix_bytes, std::string("][model:nothink]").size());
+
+  // The contract the runner relies on: the two spans really are the template's
+  // own bytes, so what lies between them is the caller's content and nothing
+  // else. Whatever is dropped from there leaves the frame intact.
+  ASSERT_LE(affixes.prefix_bytes + affixes.suffix_bytes, rendered.size());
+  EXPECT_EQ(rendered.substr(0, affixes.prefix_bytes) + content +
+              rendered.substr(rendered.size() - affixes.suffix_bytes),
+            rendered);
+}
+
+TEST(ChatTemplateSeam, EarlierTurnsBelongToTheProtectedPrefix) {
+  TemplateDir dir(kTurnTemplate, "affixes_multi");
+  auto tmpl = causallm::ChatTemplate::Load(dir.str());
+
+  nlohmann::json request = nlohmann::json::object();
+  request["messages"] =
+    nlohmann::json::array({{{"role", "system"}, {"content", "S"}},
+                           {{"role", "user"}, {"content", "X"}}});
+
+  const auto affixes = causallm::promptAffixes(&tmpl, request);
+  // Only the last message is content; the system turn ahead of it is frame.
+  EXPECT_EQ(affixes.prefix_bytes, std::string("[system:S][user:").size());
+  EXPECT_EQ(affixes.suffix_bytes, std::string("][model:nothink]").size());
+}
+
+TEST(ChatTemplateSeam, NoAffixClaimWithoutATemplateOrAMessage) {
+  TemplateDir dir(kTurnTemplate, "affixes_none");
+  auto tmpl = causallm::ChatTemplate::Load(dir.str());
+
+  const auto request = causallm::makeUserRequest("hi");
+  // {0, 0} is "no claim made", and every one of these is such a case.
+  EXPECT_EQ(causallm::promptAffixes(nullptr, request).suffix_bytes, 0u);
+  EXPECT_EQ(
+    causallm::promptAffixes(&tmpl, request, causallm::PromptTemplateMode::Never)
+      .suffix_bytes,
+    0u);
+  EXPECT_EQ(
+    causallm::promptAffixes(&tmpl, nlohmann::json::array()).suffix_bytes, 0u);
+  EXPECT_EQ(
+    causallm::promptAffixes(&tmpl, nlohmann::json::object()).suffix_bytes, 0u);
+}
+
+TEST(ChatTemplateSeam, AContentSensitiveTemplateReportsNothing) {
+  // The content is emitted twice, so no fixed pair of affix spans describes
+  // this render. Reporting a pair anyway would have a caller keep bytes that
+  // are not the frame -- better to say nothing and let it fall back.
+  TemplateDir dir("{%- for m in messages -%}"
+                  "[{{ m['role'] }}:{{ m['content'] }}:{{ m['content'] }}]"
+                  "{%- endfor -%}",
+                  "affixes_twice");
+  auto tmpl = causallm::ChatTemplate::Load(dir.str());
+
+  const auto affixes =
+    causallm::promptAffixes(&tmpl, causallm::makeUserRequest("hi"));
+  EXPECT_EQ(affixes.prefix_bytes, 0u);
+  EXPECT_EQ(affixes.suffix_bytes, 0u);
+}
+
 TEST(ChatTemplateSeam, BrokenTemplateRaisesInsteadOfGoingRaw) {
   TemplateDir dir("{%- for m in messages -%}{{ m['role'] }}", "broken");
 

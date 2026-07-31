@@ -48,6 +48,96 @@
 
 namespace causallm {
 
+namespace {
+
+/**
+ * @brief Token spans of the rendered template affixes inside one encoding.
+ */
+struct AffixTokens {
+  unsigned int head = 0; /**< leading tokens covering the rendered prefix */
+  unsigned int tail = 0; /**< trailing tokens covering the rendered suffix */
+  bool located = false;  /**< both boundaries were found and verified */
+};
+
+/** @brief The next byte at or after @p at that starts a UTF-8 sequence. */
+size_t nextCharBoundary(const std::string &text, size_t at) {
+  ++at;
+  while (at < text.size() &&
+         (static_cast<unsigned char>(text[at]) & 0xC0) == 0x80)
+    ++at;
+  return at;
+}
+
+/**
+ * @brief Turn affix byte counts into token counts, verified against @p ids.
+ *
+ * A byte count is not a token count. A token may straddle the seam between an
+ * affix and the content -- a rendered prefix ending in a newline merges with a
+ * document that starts with one, which is what both templates measured on this
+ * tree do -- so the affix boundary need not be a token boundary at all.
+ *
+ * Each affix is therefore grown outward one character at a time until
+ * re-encoding it reproduces that end of @p ids exactly. Growing keeps a
+ * content byte that did not have to be kept, which costs a token of body;
+ * shrinking would cut into the turn marker, which costs the answer. The scan
+ * is bounded because a straddling token is a few bytes long: beyond that
+ * something else is going on, and reporting nothing is better than reporting a
+ * boundary that was never verified.
+ *
+ * @param tokenizer the tokenizer that produced @p ids
+ * @param text      the exact string that was encoded into @p ids
+ * @param ids       encoding of @p text
+ * @param prefix_bytes leading bytes of @p text to keep whole
+ * @param suffix_bytes trailing bytes of @p text to keep whole
+ * @return the two token counts with located == true, or a zeroed result
+ */
+AffixTokens locateAffixTokens(tokenizers::Tokenizer &tokenizer,
+                              const std::string &text,
+                              const std::vector<int32_t> &ids,
+                              size_t prefix_bytes, size_t suffix_bytes) {
+  constexpr int MAX_SEAM_SCAN = 16;
+
+  AffixTokens found;
+  if (suffix_bytes == 0 || prefix_bytes + suffix_bytes >= text.size())
+    return found;
+
+  size_t head_bytes = prefix_bytes;
+  for (int step = 0; step <= MAX_SEAM_SCAN && head_bytes < text.size();
+       ++step) {
+    const auto head_ids = tokenizer.Encode(text.substr(0, head_bytes));
+    if (!head_ids.empty() && head_ids.size() <= ids.size() &&
+        std::equal(head_ids.begin(), head_ids.end(), ids.begin())) {
+      found.head = static_cast<unsigned int>(head_ids.size());
+      break;
+    }
+    head_bytes = nextCharBoundary(text, head_bytes);
+  }
+  if (found.head == 0)
+    return found;
+
+  size_t tail_bytes = suffix_bytes;
+  for (int step = 0; step <= MAX_SEAM_SCAN && tail_bytes < text.size();
+       ++step) {
+    while (tail_bytes < text.size() &&
+           (static_cast<unsigned char>(text[text.size() - tail_bytes]) &
+            0xC0) == 0x80)
+      ++tail_bytes;
+
+    const auto tail_ids =
+      tokenizer.Encode(text.substr(text.size() - tail_bytes));
+    if (!tail_ids.empty() && tail_ids.size() <= ids.size() &&
+        std::equal(tail_ids.rbegin(), tail_ids.rend(), ids.rbegin())) {
+      found.tail = static_cast<unsigned int>(tail_ids.size());
+      found.located = true;
+      break;
+    }
+    ++tail_bytes;
+  }
+  return found;
+}
+
+} // namespace
+
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
   setupParameters(cfg, generation_cfg, nntr_cfg);
@@ -360,6 +450,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
   auto start_total = std::chrono::high_resolution_clock::now();
+
+  // Consume the affix declaration before anything can leave this function:
+  // it describes this request's prompt and no other. See setPromptAffixBytes.
+  const size_t affix_prefix_bytes = prompt_prefix_bytes_;
+  const size_t affix_suffix_bytes = prompt_suffix_bytes_;
+  prompt_prefix_bytes_ = 0;
+  prompt_suffix_bytes_ = 0;
+
   if (!is_initialized) {
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
@@ -437,27 +535,96 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   unsigned int _len = _input.size();
   unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
   unsigned int text_len = _len;
+  bool dropped_from_middle = false;
 
   if (_len > num_allow_str) {
     text_len = num_allow_str;
-    // Truncation drops tokens from the tail of the prompt, which is where
-    // instructions in "summarize this document"-style prompts live: a
-    // silently truncated prompt can make the model continue the body
-    // instead of following a dropped trailing instruction. Always warn
-    // with the exact counts.
-    std::cerr << "[CausalLM] WARNING: prompt (" << _len
-              << " tokens) exceeds the max allowed prefill length ("
-              << num_allow_str
-              << " = max_seq_len - num_to_generate); "
-                 "truncating "
-              << (_len - num_allow_str) << " tail tokens." << std::endl;
+
+    // Which bytes of prompt_ are frame rather than body. The rendered affixes
+    // are measured relative to `prompt`; a system prompt sits in front of them
+    // and a tail prompt behind them, and those are the caller's own framing,
+    // so they are kept too. A KV-cache save pass encodes the system prompt
+    // alone -- no rendered turn is in it -- so nothing is claimed there.
+    size_t protect_head_bytes = 0;
+    size_t protect_tail_bytes = 0;
+    if (affix_suffix_bytes > 0 && !(USE_KVCACHE && SAVE_KVCACHE)) {
+      protect_head_bytes =
+        (USE_KVCACHE ? 0 : system_prompt.size()) + affix_prefix_bytes;
+      protect_tail_bytes = affix_suffix_bytes + tail_prompt.size();
+    }
+
+    const AffixTokens affix = locateAffixTokens(
+      *tokenizer, prompt_, _input, protect_head_bytes, protect_tail_bytes);
+    const unsigned int affix_len = affix.head + affix.tail;
+
+    const char *no_middle_reason = nullptr;
+    if (protect_tail_bytes == 0)
+      no_middle_reason = "No chat template was applied to this prompt, so it "
+                         "has no rendered turn marker to preserve.";
+    else if (!affix.located)
+      no_middle_reason = "The rendered template affixes could not be matched "
+                         "to token boundaries of this prompt.";
+    else if (affix_len >= num_allow_str || affix_len >= _len)
+      no_middle_reason = "The rendered template affixes alone do not fit the "
+                         "allowed prefill length.";
+
+    if (no_middle_reason == nullptr) {
+      // Drop from the middle, not from the tail. The rendered prefix opens the
+      // turn and the rendered suffix carries the trailing instruction AND the
+      // assistant-turn marker, so a tail cut deletes the very bytes that say
+      // what to do and where to start saying it -- the model then continues
+      // the document instead of answering, or emits EOS with nothing to answer
+      // into. The document body is the one region whose loss is merely lossy.
+      // Both ends of the body are kept, because the opening and the closing of
+      // a document are what a summary is usually about.
+      const unsigned int body_budget = num_allow_str - affix_len;
+      const unsigned int body_head = body_budget - body_budget / 2;
+      const unsigned int body_tail = body_budget / 2;
+      const unsigned int keep_head = affix.head + body_head;
+      const unsigned int keep_tail = affix.tail + body_tail;
+
+      init_input.reserve(num_allow_str);
+      init_input.insert(init_input.end(), _input.begin(),
+                        _input.begin() + keep_head);
+      init_input.insert(init_input.end(), _input.end() - keep_tail,
+                        _input.end());
+      dropped_from_middle = true;
+
+      std::cerr << "[CausalLM] WARNING: prompt (" << _len
+                << " tokens) exceeds the max allowed prefill length ("
+                << num_allow_str
+                << " = max_seq_len - num_to_generate); dropping "
+                << (_len - num_allow_str)
+                << " tokens from the MIDDLE of the prompt body (kept "
+                << keep_head << " tokens before the cut and " << keep_tail
+                << " after it). The rendered chat-template prefix ("
+                << affix.head << " tokens) and its trailing " << affix.tail
+                << " tokens -- the closing instruction and the assistant-turn "
+                   "marker -- are preserved."
+                << std::endl;
+    } else {
+      // No frame was located, so there is nothing to preserve and the honest
+      // degradation is the historical tail cut -- with the hazard named.
+      std::cerr << "[CausalLM] WARNING: prompt (" << _len
+                << " tokens) exceeds the max allowed prefill length ("
+                << num_allow_str
+                << " = max_seq_len - num_to_generate); "
+                   "truncating "
+                << (_len - num_allow_str) << " tail tokens. "
+                << no_middle_reason
+                << " A dropped tail takes any trailing instruction with it, so "
+                   "the model may continue the prompt instead of answering it."
+                << std::endl;
+    }
   }
 
   // feed only available length
   // if _input is allowed, it feeds all of the _input
   // otherwise, feeds only a part of _input
-  for (unsigned int i = 0; i < text_len; ++i)
-    init_input.push_back(_input[i]);
+  if (!dropped_from_middle) {
+    for (unsigned int i = 0; i < text_len; ++i)
+      init_input.push_back(_input[i]);
+  }
 
   ///@todo currently, the whole sequence may not be fed into the model
   /// This should be handled later.

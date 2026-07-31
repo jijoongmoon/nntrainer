@@ -105,6 +105,31 @@ public:
   void setStreamer(::BaseStreamer *streamer) { streamer_ = streamer; }
 
   /**
+   * @brief Declare how many bytes of the next prompt are template affixes.
+   *
+   * A prompt that does not fit the prefill window has to lose tokens, and
+   * which tokens it loses is not a detail: the trailing bytes a chat template
+   * emits are the instruction and the assistant-turn marker, and a prompt that
+   * arrives without its turn marker is not a shortened request, it is a
+   * different one. run() cannot work this out for itself -- it is handed a
+   * string, and the structure was decided upstream by whoever rendered it --
+   * so the front end that called the template seam passes the two byte counts
+   * down here. See causallm::promptAffixes(), which measures them.
+   *
+   * Applies to the next run() only, and run() consumes it: a caller that
+   * templates one request and feeds the next one raw cannot have the first
+   * request's structure applied to the second. A raw prompt has no affixes to
+   * protect, and {0, 0} -- the default -- says exactly that.
+   *
+   * @param prefix_bytes leading bytes of @a prompt the template contributed
+   * @param suffix_bytes trailing bytes of @a prompt the template contributed
+   */
+  void setPromptAffixBytes(size_t prefix_bytes, size_t suffix_bytes) {
+    prompt_prefix_bytes_ = prefix_bytes;
+    prompt_suffix_bytes_ = suffix_bytes;
+  }
+
+  /**
    * @brief Cooperatively request the active generation loop to stop.
    */
   void requestStop() { stop_requested_.store(true, std::memory_order_release); }
@@ -185,6 +210,9 @@ protected:
   ::BaseStreamer *streamer_ = nullptr;
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> stop_prepared_for_run_{false};
+
+  size_t prompt_prefix_bytes_ = 0; /**< see setPromptAffixBytes() */
+  size_t prompt_suffix_bytes_ = 0; /**< see setPromptAffixBytes() */
 
   std::string LMHEAD_DTYPE; /** embedding dtype */
   std::vector<unsigned int> EOS_TOKEN_ID;
