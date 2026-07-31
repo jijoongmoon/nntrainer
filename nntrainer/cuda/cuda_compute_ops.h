@@ -103,10 +103,15 @@ public:
   /**
    * @brief Reverse-RMSNorm (per-layer-embedding post_norm) whole-op:
    *        y = (x*w / rms(x*w)) * out_scale, the per-feature weight folded
-   *        INSIDE the denominator. fp16 device kernel
-   *        (cuda_rms_reverse_norm_fp16, FP32 sum-of-squares) on
-   *        device-accessible operands, else the named guard / inherited host
-   *        body. Kill-switch NNTR_CUDA_RMS_REVERSE_NORM=0.
+   *        INSIDE the denominator. FP16-ONLY device kernel + guard:
+   *        cuda_rms_reverse_norm_fp16 (FP32 sum-of-squares) is the only kernel
+   *        that exists, so an FP32 ACTIVATION has no device path here and
+   *        takes the named guard / inherited host body. An FP32
+   *        weight/out_scale does NOT decline: it is bound through the cached
+   *        fp16 converter (the FP32-gamma case rms_norm had to be repaired
+   *        for -- a norm weight is unquantized, so a quantized package pairs
+   *        an FP16 activation with an FP32 weight).
+   *        Kill-switch NNTR_CUDA_RMS_REVERSE_NORM=0.
    *
    *        Without this override the op inherited CpuComputeOps' host
    *        FP32-temp math, which on the device-only activation pool faulted
@@ -123,10 +128,12 @@ public:
    *        The accumulate form is a fp16 device kernel (cuda_add_fp16) on
    *        device-accessible operands -- the inherited host body reaches
    *        Tensor::add_i -> ele_add_fp16, host math this table does not
-   *        override. The copy form delegates: Tensor::copy routes through
-   *        scopy_fp16, which IS device-aware here. Kill-switch
-   *        NNTR_CUDA_ELTWISE=0 (then the named guard refuses on a device-only
-   *        pool rather than faulting).
+   *        override. The copy form is gated on WHICH branch Tensor::copy will
+   *        take: the matching-shape branch routes through scopy_fp16, which IS
+   *        device-aware here, so it only drains; the mismatch branch host-reads
+   *        the source and swaps in a host backing store, so it is refused by
+   *        name. Kill-switch NNTR_CUDA_ELTWISE=0 (then the named guard refuses
+   *        on a device-only pool rather than faulting).
    */
   void residual_op(Tensor &hidden, const Tensor &input,
                    bool accumulate) override;

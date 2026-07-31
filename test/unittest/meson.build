@@ -57,7 +57,6 @@ endif
 test_target = [
   ['unittest_nntrainer_activations', []],
   ['unittest_nntrainer_cpu_backend', []],
-  ['unittest_compute_ops_dispatch', []],
   ['unittest_nntrainer_fallback', []],
   ['unittest_nntrainer_tensor_types', []],
   ['unittest_nntrainer_tensor_advanced', []],
@@ -126,6 +125,32 @@ foreach target: test_target
     suite: 'unittests'
   )
 endforeach
+
+# The op-table dispatch tests are defined standalone (the shared loop above
+# can't set per-target cpp_args): the CUDA whole-op census re-reads
+# compute_ops.h at run time to fail on a whole-op added to the base with no
+# CudaComputeOps override, so it needs that header's path. The test SKIPS that
+# half when the file is unreadable (e.g. an installed binary on a test runner),
+# so the define is a build convenience, not a requirement.
+unittest_compute_ops_dispatch_args = [
+  '-DNNTR_COMPUTE_OPS_HEADER="' +
+  (meson.source_root() / 'nntrainer' / 'tensor' / 'cpu_backend' /
+   'compute_ops.h') + '"'
+]
+unittest_compute_ops_dispatch_exe = executable(
+  'unittest_compute_ops_dispatch',
+  'unittest_compute_ops_dispatch.cpp',
+  cpp_args: unittest_compute_ops_dispatch_args,
+  include_directories: include_directories('models'),
+  dependencies: unittest_nntrainer_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_compute_ops_dispatch', unittest_compute_ops_dispatch_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_compute_ops_dispatch')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
 
 # DDTree core tests embed the golden vectors (ddtree_golden/build_golden.h), so
 # this target is defined standalone to add that directory to its include path

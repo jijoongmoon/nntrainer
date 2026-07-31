@@ -460,6 +460,245 @@ TEST_F(ComputeOpsDispatchTest,
   EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 1, 0), 0.0f);
 }
 
+/* ==========================================================================
+ * CUDA whole-op table completeness
+ *
+ * CudaComputeOps inherits CpuComputeOps, so a whole-op the CUDA table does NOT
+ * override silently runs the inherited HOST body. On a discrete GPU the CUDA
+ * context arms the device-only activation pool (NNTR_CUDA_DEV_ACT, set by the
+ * CudaContext constructor), where an activation is cudaMalloc memory the CPU
+ * cannot address -- so that inherited host body faults, several frames deep
+ * inside an AVX2 intrinsic, with nothing naming the op.
+ *
+ * INVARIANT: every whole-op declared on the ComputeOps base has a
+ * CudaComputeOps override (a device kernel, or a named guard, or both).
+ *
+ * The two tests below are complementary and BOTH are needed:
+ *   - HasCudaOverride  checks the ops this file knows about, at compile time.
+ *     It cannot see an op added to the base after this file was written.
+ *   - CensusCoversHeader  re-reads compute_ops.h and fails on any whole-op in
+ *     it that this file does not know about. That is the half that catches a
+ *     lane adding a whole-op without a CUDA override -- the way this gap was
+ *     opened in the first place.
+ * ========================================================================== */
+#ifdef ENABLE_CUDA
+
+#include <cuda_compute_ops.h>
+
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+namespace {
+
+/**
+ * @brief Deduce the class a member function was DECLARED in.
+ *
+ * The type of `&Derived::m` is "pointer to member of B" where B is the class
+ * that DECLARES m -- not the class named in the qualified-id. So when
+ * CudaComputeOps overrides an op, `&CudaComputeOps::op` is a
+ * `CudaComputeOps::*`; when it does not, name lookup finds the inherited
+ * declaration and the same expression is a `CpuComputeOps::*` (or
+ * `ComputeOps::*`). That difference is the override check, resolved entirely
+ * at compile time and without depending on vtable layout.
+ *
+ * Declared, never defined: used only inside decltype.
+ */
+template <typename R, typename C, typename... A>
+C *declaring_class(R (C::*)(A...));
+template <typename R, typename C, typename... A>
+C *declaring_class(R (C::*)(A...) const);
+
+/** @brief true iff CudaComputeOps declares its own @p op */
+#define CUDA_DECLARES(op)                                                      \
+  (std::is_same<decltype(declaring_class(&nntrainer::CudaComputeOps::op)),      \
+                nntrainer::CudaComputeOps *>::value)
+
+struct WholeOp {
+  const char *name;
+  bool cuda_override;
+};
+
+/**
+ * @brief The whole-op census. One row per whole-op on the ComputeOps base.
+ *
+ * Adding a row is not optional bookkeeping: CensusCoversHeader below fails if
+ * compute_ops.h declares a whole-op that has no row here.
+ */
+const WholeOp kWholeOps[] = {
+  {"geglu", CUDA_DECLARES(geglu)},
+  {"swiglu", CUDA_DECLARES(swiglu)},
+  {"sigmoid_glu", CUDA_DECLARES(sigmoid_glu)},
+  {"sigmoid_add", CUDA_DECLARES(sigmoid_add)},
+  {"rms_reverse_norm", CUDA_DECLARES(rms_reverse_norm)},
+  {"residual_op", CUDA_DECLARES(residual_op)},
+  {"fc", CUDA_DECLARES(fc)},
+  {"fc_prebuild_weight", CUDA_DECLARES(fc_prebuild_weight)},
+  {"apply_activation", CUDA_DECLARES(apply_activation)},
+  {"scalar_mul", CUDA_DECLARES(scalar_mul)},
+  {"softcap", CUDA_DECLARES(softcap)},
+  {"rms_norm", CUDA_DECLARES(rms_norm)},
+};
+
+/**
+ * @brief Ops exempt from the override requirement.
+ *
+ * Only the supports_*() capability predicates: they carry a safe default, take
+ * no Tensor, and run no math -- so they cannot dereference a device pointer.
+ * Any other exemption has to be argued in code, here.
+ */
+bool isExempt(const std::string &name) {
+  return name.rfind("supports_", 0) == 0;
+}
+
+/** @brief Strip // and block comments so they cannot be parsed as code. */
+std::string stripComments(const std::string &s) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size();) {
+    if (s[i] == '/' && i + 1 < s.size() && s[i + 1] == '/') {
+      while (i < s.size() && s[i] != '\n')
+        ++i;
+    } else if (s[i] == '/' && i + 1 < s.size() && s[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/'))
+        ++i;
+      i = std::min(i + 2, s.size());
+    } else {
+      out.push_back(s[i++]);
+    }
+  }
+  return out;
+}
+
+/**
+ * @brief Names of every `virtual ... name(` declaration in @p block.
+ *
+ * The name is the LAST identifier before the argument list, which is true for
+ * any spelling of a C++ declarator this header uses (and survives the
+ * declaration being wrapped across lines, since the block is scanned as one
+ * string).
+ */
+std::vector<std::string> declaredVirtuals(const std::string &block) {
+  std::vector<std::string> names;
+  const std::string kw = "virtual";
+  size_t pos = 0;
+  while ((pos = block.find(kw, pos)) != std::string::npos) {
+    const size_t after = pos + kw.size();
+    const bool word_start =
+      (pos == 0) || !(std::isalnum((unsigned char)block[pos - 1]) ||
+                      block[pos - 1] == '_');
+    const bool word_end = after < block.size() &&
+                          !(std::isalnum((unsigned char)block[after]) ||
+                            block[after] == '_');
+    const size_t open = block.find('(', after);
+    if (!word_start || !word_end || open == std::string::npos) {
+      pos = after;
+      continue;
+    }
+    std::string decl = block.substr(after, open - after);
+    size_t e = decl.size();
+    while (e > 0 && !(std::isalnum((unsigned char)decl[e - 1]) ||
+                      decl[e - 1] == '_'))
+      --e;
+    size_t b = e;
+    while (b > 0 &&
+           (std::isalnum((unsigned char)decl[b - 1]) || decl[b - 1] == '_'))
+      --b;
+    if (e > b)
+      names.push_back(decl.substr(b, e - b));
+    pos = open;
+  }
+  return names;
+}
+
+} // namespace
+
+/**
+ * @brief Every whole-op this file knows about is overridden by CudaComputeOps.
+ *
+ * A row that is false means the op falls through to the inherited CpuComputeOps
+ * body: host math on what may be a device-only pointer.
+ */
+TEST(CudaWholeOpTable, HasCudaOverride) {
+  for (const auto &op : kWholeOps) {
+    EXPECT_TRUE(op.cuda_override)
+      << "ComputeOps::" << op.name
+      << " has NO CudaComputeOps override -- it inherits the CpuComputeOps host"
+         " body, which dereferences operands the CPU cannot address when the"
+         " device-only activation pool (NNTR_CUDA_DEV_ACT) is armed. Add a"
+         " device implementation or a named guard in"
+         " nntrainer/cuda/cuda_compute_ops.{h,cpp}.";
+  }
+}
+
+/**
+ * @brief The census above covers EVERY whole-op the base actually declares.
+ *
+ * Re-reads compute_ops.h so that adding a whole-op to the base without giving
+ * CudaComputeOps an override (and without adding a row above) fails here
+ * instead of surfacing as a SIGSEGV in a CUDA decode months later.
+ */
+TEST(CudaWholeOpTable, CensusCoversHeader) {
+#ifndef NNTR_COMPUTE_OPS_HEADER
+  GTEST_SKIP() << "NNTR_COMPUTE_OPS_HEADER not defined by the build";
+#else
+  std::ifstream in(NNTR_COMPUTE_OPS_HEADER);
+  if (!in) {
+    GTEST_SKIP() << "compute_ops.h not readable at " << NNTR_COMPUTE_OPS_HEADER
+                 << " (installed test run); the compile-time half still ran";
+  }
+  std::ostringstream buf;
+  buf << in.rdbuf();
+  const std::string src = buf.str();
+
+  // The whole-op section runs from its banner to the class' `protected:`.
+  // Located on the RAW text: the banner is itself a comment, so the section
+  // must be carved out before comments are stripped from its body.
+  const size_t begin = src.find("Whole-op (Tensor-level) ops");
+  ASSERT_NE(begin, std::string::npos)
+    << "the whole-op section banner moved in compute_ops.h; this census can no"
+       " longer find the ops it must cover -- re-anchor it.";
+  const size_t end = src.find("protected:", begin);
+  ASSERT_NE(end, std::string::npos)
+    << "no `protected:` after the whole-op banner in compute_ops.h; re-anchor.";
+
+  const std::vector<std::string> declared =
+    declaredVirtuals(stripComments(src.substr(begin, end - begin)));
+  ASSERT_FALSE(declared.empty())
+    << "parsed zero virtuals out of the whole-op section -- the parser, not the"
+       " table, is broken.";
+
+  std::set<std::string> known;
+  for (const auto &op : kWholeOps)
+    known.insert(op.name);
+
+  std::set<std::string> seen;
+  for (const auto &name : declared) {
+    if (isExempt(name))
+      continue;
+    seen.insert(name);
+    EXPECT_EQ(known.count(name), 1u)
+      << "ComputeOps::" << name
+      << " is a whole-op on the base with NO row in kWholeOps, so nothing"
+         " checks whether CudaComputeOps overrides it. Add the row (and the"
+         " CudaComputeOps override it will then require).";
+  }
+  for (const auto &name : known)
+    EXPECT_EQ(seen.count(name), 1u)
+      << "kWholeOps lists '" << name
+      << "' but compute_ops.h no longer declares it in the whole-op section --"
+         " stale census row.";
+#endif
+}
+
+#endif // ENABLE_CUDA
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
