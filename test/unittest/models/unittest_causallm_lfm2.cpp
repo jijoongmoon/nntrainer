@@ -223,4 +223,246 @@ INSTANTIATE_TEST_SUITE_P(
     return info.param.name;
   });
 
+/**
+ * @brief Prompt-budget regime tests for the Lfm2CausalLM entry points
+ *
+ * The committed fixture (init_seq_len 4, max_seq_len 8, num_to_generate 1)
+ * gives min(INIT_SEQ_LEN = 4, promptTokenBudget(8, 1, 0, false) = 6) = 4, i.e.
+ * exactly the old INIT_SEQ_LEN-only clamp, so every test above exercises the
+ * UNCHANGED branch. These tests build the regime the clamp was changed for,
+ *
+ *   max_seq_len < init_seq_len + num_to_generate + 1
+ *
+ * which the class's own checks permit -- run_with_embeddings() rejects only
+ * n_tokens > INIT_SEQ_LEN and MAX_SEQ_LEN < INIT_SEQ_LEN -- and which no
+ * committed configuration reaches.
+ *
+ * Both entry points are covered: run(), whose clamp now yields one prompt
+ * token so the generation loop keeps its whole budget, and
+ * run_with_embeddings(), whose caller-chosen n_tokens is refused by name at
+ * the value that would otherwise write past the token-history row stride.
+ *
+ * These cases need USE_EMBEDDING = true (that is the only path on which
+ * Lfm2CausalLM::run() applies its own clamp; with it false, run() delegates
+ * straight to CausalLM::run()). Two consequences shape the fixture:
+ *
+ *  - embedding0 is then disconnected and pruned from the graph, so the fed
+ *    embeddings come only from embedding_bin_path. Its contents mirror
+ *    setupLfm2DeterministicWeights().
+ *  - tie_word_embeddings must be false. With it true AND USE_EMBEDDING true,
+ *    save_weight() omits the LM head's record (it still carries
+ *    shared_from = embedding0) while load_weight() expects it, and the
+ *    round-trip fails with a layout mismatch -- a pre-existing asymmetry of
+ *    that combination, unrelated to the budget. The untied head below is
+ *    given the tied head's values by hand, so the arithmetic is unchanged.
+ */
+
+/**
+ * @brief Write the FP32 embedding bin matching setupLfm2DeterministicWeights
+ *
+ * NUM_VOCAB x DIM row-major floats: embedding[1][0] = 1, embedding[4][0] = 2,
+ * every other entry zero. With all FC weights zero the residual carries the
+ * LAST position's embedding unchanged, so the LM head yields
+ * logit[j] = 8 * emb[j][0] and greedy decoding always selects token 4.
+ */
+std::filesystem::path
+writeTinyLfm2EmbeddingBin(const std::filesystem::path &dir) {
+  constexpr size_t vocab = 32;
+  constexpr size_t dim = 64;
+  std::vector<float> weights(vocab * dim, 0.0f);
+  weights[1 * dim + 0] = 1.0f;
+  weights[4 * dim + 0] = 2.0f;
+
+  const auto path = dir / "lfm2_tiny_embedding.bin";
+  std::ofstream file(path, std::ios::binary);
+  if (!file)
+    throw std::runtime_error("failed to open " + path.string());
+  file.write(reinterpret_cast<const char *>(weights.data()),
+             static_cast<std::streamsize>(weights.size() * sizeof(float)));
+  if (!file.good())
+    throw std::runtime_error("failed to write " + path.string());
+  return path;
+}
+
+/**
+ * @brief Deterministic weights for the untied, embedding-bypass LFM2 model
+ *
+ * Same as setupLfm2DeterministicWeights() except that the LM head is written
+ * explicitly instead of being tied: its weight is [DIM, NUM_VOCAB], and the
+ * normalized residual is [8, 0..0], so W[0][1] = 1 and W[0][4] = 2 reproduce
+ * logit[1] = 8 and logit[4] = 16 exactly as the tied head does.
+ */
+void setupLfm2UntiedDeterministicWeights(TinyLfm2CausalLM &model) {
+  model.forEachLayer(
+    [](ml::train::Layer &layer, nntrainer::RunLayerContext &context, void *) {
+      for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
+        auto &weight = context.getWeight(i);
+        if (weight.getDataType() != ml::train::TensorDim::DataType::FP32)
+          continue;
+
+        weight.setValue(0.0f);
+        if (layer.getType() == "rms_norm" ||
+            layer.getType() == "reshaped_rms_norm") {
+          weight.setValue(1.0f);
+        } else if (layer.getName() == "output_of_causallm") {
+          weight.setValue(0, 0, 0, 1, 1.0f);
+          weight.setValue(0, 0, 0, 4, 2.0f);
+        }
+      }
+    });
+}
+
+/**
+ * @brief Make an LFM2 case in a chosen (init, max, num_to_generate) regime
+ */
+causallm_test::TinyCausalLMCase
+makeLfm2BudgetCase(const std::string &name, unsigned int init_seq_len,
+                   unsigned int max_seq_len, int num_to_generate,
+                   const std::filesystem::path &embedding_bin) {
+  auto test_case = makeLfm2Case(causallm_test::makeTinyFp32DataType());
+  test_case.name = name;
+  test_case.make_model_config = []() {
+    auto cfg = makeTinyLfm2Config();
+    cfg["tie_word_embeddings"] = false;
+    return cfg;
+  };
+  test_case.setup_weights = [](causallm_test::TinyCausalLMRunner &runner) {
+    setupLfm2UntiedDeterministicWeights(
+      static_cast<TinyLfm2CausalLM &>(runner));
+  };
+  test_case.make_nntrainer_config =
+    [init_seq_len, max_seq_len, num_to_generate,
+     embedding_bin](const std::filesystem::path &tokenizer_path,
+                    const causallm_test::TinyCausalLMDataType &data_type) {
+      auto nntr_cfg =
+        causallm_test::makeTinyNntrainerConfig(tokenizer_path, data_type);
+      nntr_cfg["init_seq_len"] = init_seq_len;
+      nntr_cfg["max_seq_len"] = max_seq_len;
+      nntr_cfg["num_to_generate"] = num_to_generate;
+      nntr_cfg["use_embedding"] = true;
+      nntr_cfg["embedding_bin_path"] = embedding_bin.string();
+      return nntr_cfg;
+    };
+  return test_case;
+}
+
+/**
+ * @brief Build a deterministic LFM2 model with weights saved and re-loaded
+ *
+ * Mirrors the file-local makeLoadedDeterministicModel() of causallm_test_utils
+ * but returns the concrete adapter, so a test can reach run_with_embeddings()
+ * and getGeneratedIds() directly. The load is not optional here: it is what
+ * populates the lookupEmbedding() cache from embedding_bin_path.
+ */
+std::unique_ptr<TinyLfm2CausalLM>
+makeLoadedLfm2(const causallm_test::TinyCausalLMCase &test_case,
+               const causallm_test::TinyCausalLMFiles &files) {
+  auto source_config =
+    causallm_test::makeTinyCausalLMConfig(test_case, files.tokenizer_path);
+  auto source = std::make_unique<TinyLfm2CausalLM>(
+    source_config.model, source_config.generation, source_config.nntrainer);
+  source->initializeModel();
+  test_case.setup_weights(*source);
+  source->saveWeightWithDtype(
+    files.weight_path.string(),
+    test_case.make_layer_dtype_map(test_case.data_type));
+
+  auto loaded_config =
+    causallm_test::makeTinyCausalLMConfig(test_case, files.tokenizer_path);
+  auto loaded = std::make_unique<TinyLfm2CausalLM>(
+    loaded_config.model, loaded_config.generation, loaded_config.nntrainer);
+  loaded->initializeModel();
+  loaded->loadWeight(files.weight_path.string());
+  return loaded;
+}
+
+/**
+ * @brief run(): a window tighter than init + generate + 1 keeps the budget
+ *
+ * init_seq_len 4, max_seq_len 8, num_to_generate 4: 8 < 4 + 4 + 1, so
+ * promptTokenBudget(8, 4, 0, false) = 3, one below INIT_SEQ_LEN.
+ *
+ * The prompt "world hello tok4 hello tok5" is 5 tokens, longer than either
+ * clamp, so the two differ:
+ *
+ *   clamp                       prompt  loop start  loop end          emitted
+ *   INIT_SEQ_LEN = 4                 4           5   5 + min(3,4) = 8   1 + 3
+ *   min(INIT, budget) = 3            3           4   4 + min(4,4) = 8   1 + 4
+ *
+ * Both end at the same absolute position; yielding one prompt token is what
+ * turns 3 of the 4 requested generation steps into 4 of 4. Asserting the
+ * generated count asserts exactly the token the window clamp used to eat.
+ */
+TEST(Lfm2GenerationBudgetTest, TightWindowDeliversTheWholeGenerationBudget) {
+  const auto files = causallm_test::makeTinyCausalLMFiles(
+    "Lfm2GenerationBudgetTest", "TightWindowDeliversTheWholeGenerationBudget",
+    "LFM2_FP32");
+  const auto embedding_bin = writeTinyLfm2EmbeddingBin(files.dir);
+  const auto test_case =
+    makeLfm2BudgetCase("LFM2_budget_4_8_4", 4, 8, 4, embedding_bin);
+
+  auto model = makeLoadedLfm2(test_case, files);
+  ASSERT_NO_THROW(model->runPrompt("world hello tok4 hello tok5"));
+
+  // One token sampled by the prefill + the full num_to_generate loop.
+  EXPECT_EQ(model->getGeneratedIds().size(), 5u);
+  for (unsigned int id : model->getGeneratedIds())
+    EXPECT_EQ(id, 4u);
+
+  // The prompt was clamped to 3, so the first generated token sits at column 3
+  // and the loop fills 4..7: the row stride is used to the end and nothing is
+  // written past it.
+  EXPECT_EQ(model->tokenAt(0), 2u); // "world"
+  EXPECT_EQ(model->tokenAt(1), 1u); // "hello"
+  EXPECT_EQ(model->tokenAt(2), 4u); // "tok4"
+  for (size_t pos = 3; pos < 8; ++pos)
+    EXPECT_EQ(model->tokenAt(pos), 4u) << "at token-history column " << pos;
+}
+
+/**
+ * @brief run_with_embeddings(): n_tokens == INIT_SEQ_LEN == MAX_SEQ_LEN refused
+ *
+ * The class's own checks permit that configuration, and it makes the PREFILL
+ * store its sampled token at ids_history[MAX_SEQ_LEN] -- the next batch row,
+ * or past the end of the allocation for the last one. Refused by name at the
+ * entry point, before any work and before the over-budget warning, so the
+ * warning never promises a run that then throws.
+ */
+TEST(Lfm2GenerationBudgetTest, EmbeddingsAtTheRowStrideAreRefusedByName) {
+  const auto files = causallm_test::makeTinyCausalLMFiles(
+    "Lfm2GenerationBudgetTest", "EmbeddingsAtTheRowStrideAreRefusedByName",
+    "LFM2_FP32");
+  const auto embedding_bin = writeTinyLfm2EmbeddingBin(files.dir);
+  // init_seq_len == max_seq_len == 4, num_to_generate 2 = maxNumToGenerate(4,0)
+  const auto test_case =
+    makeLfm2BudgetCase("LFM2_budget_4_4_2", 4, 4, 2, embedding_bin);
+
+  auto model = makeLoadedLfm2(test_case, files);
+
+  constexpr size_t dim = 64;
+  std::vector<float> embeds(4 * dim, 0.0f);
+  embeds[3 * dim + 0] = 2.0f; // last position carries embedding[4]
+  const std::vector<int> seed_tokens{2, 1, 4, 4};
+
+  try {
+    model->run_with_embeddings(embeds.data(), 4, seed_tokens, false, false);
+    FAIL() << "run_with_embeddings accepted n_tokens == max_seq_len";
+  } catch (const std::invalid_argument &e) {
+    const std::string what(e.what());
+    EXPECT_NE(what.find("run_with_embeddings"), std::string::npos) << what;
+    EXPECT_NE(what.find("must be less than max_seq_len"), std::string::npos)
+      << what;
+  }
+
+  // One token below the stride is the degraded-but-completed band: it warns,
+  // runs to the end and emits only the token the prefill sampled, because
+  // generation_begin == 4 is already the window. That is what the warning
+  // says will happen, and now the run keeps that promise.
+  std::vector<float> shorter(3 * dim, 0.0f);
+  shorter[2 * dim + 0] = 2.0f;
+  ASSERT_NO_THROW(
+    model->run_with_embeddings(shorter.data(), 3, {2, 1, 4}, false, false));
+  EXPECT_EQ(model->getGeneratedIds().size(), 1u);
+  EXPECT_EQ(model->tokenAt(3), 4u);
+}
 } // namespace

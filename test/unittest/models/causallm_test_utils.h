@@ -255,12 +255,26 @@ public:
    * @brief Run prefill and return logits before token sampling
    */
   std::vector<float> prefillLogits(const std::string &prompt) override {
+    // The tokenizer is built on a side thread; `tokenizer` is null until the
+    // build is joined, so every direct member access has to join first (run()
+    // and run_with_embeddings() both do). Reaching straight for ->Encode() here
+    // dereferenced the null and took every prefill-logits test in this file
+    // down with SIGSEGV.
+    this->ensureTokenizer();
     auto encoded = this->tokenizer->Encode(prompt);
     if (encoded.empty())
       throw std::invalid_argument("tiny CausalLM prompt encoded to no tokens");
 
-    const unsigned int num_allow_str =
-      this->MAX_SEQ_LEN - this->NUM_TO_GENERATE;
+    // Must feed exactly the tokens CausalLM::run() would feed, so it uses the
+    // same single definition of the prompt budget rather than a local copy of
+    // the subtraction (the local copy said max_seq_len - num_to_generate,
+    // which is one slot more than run() reserves off the skip_prefill path).
+    const unsigned int num_allow_str = causallm::promptTokenBudget(
+      this->MAX_SEQ_LEN,
+      this->NUM_TO_GENERATE > 0
+        ? static_cast<unsigned int>(this->NUM_TO_GENERATE)
+        : 0u,
+      /*sys_prompt_len=*/0u, /*first_token_from_prompt=*/false);
     const unsigned int init_len = static_cast<unsigned int>(
       std::min<size_t>(encoded.size(), num_allow_str));
     std::vector<unsigned int> ids(encoded.begin(), encoded.begin() + init_len);

@@ -260,14 +260,31 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   }
   // The generation budget has to stay strictly inside the window just settled
   // above. CausalLM sizes its token history once as BATCH_SIZE * MAX_SEQ_LEN
-  // and indexes it as ids_history[b * MAX_SEQ_LEN + pos] with no bounds check,
-  // while run() derives the prompt budget as the *unsigned* difference
-  // MAX_SEQ_LEN - NUM_TO_GENERATE: with NUM_TO_GENERATE >= MAX_SEQ_LEN that
-  // difference wraps to ~4e9, the prompt-truncation branch is never taken and
-  // the whole prompt is written past the row stride of every batch row and off
-  // the end of the last one. The clamp above can produce exactly that relation
-  // -- a 512-position model driven with max_seq_len=2048, num_to_generate=1024
-  // keeps its 1024 budget against a 512 window.
+  // and indexes it as ids_history[b * MAX_SEQ_LEN + pos], while run() derives
+  // the prompt budget as an *unsigned* subtraction: a num_to_generate at or
+  // above the window would wrap it to ~4e9, skip the prompt-truncation branch
+  // entirely and write the whole prompt past the row stride of every batch row
+  // and off the end of the last one. The clamp above can produce exactly that
+  // relation -- a 512-position model driven with max_seq_len=2048,
+  // num_to_generate=1024 keeps its 1024 budget against a 512 window.
+  //
+  // The bound is maxNumToGenerate(), i.e. the INVERSE of the reservation
+  // promptTokenBudget() makes, not MAX_SEQ_LEN - 1. The warning below promises
+  // the prompt keeps at least one token; that promise is a statement about the
+  // budget, so it has to be computed from the budget or it silently stops being
+  // true the moment the reservation changes. MAX_SEQ_LEN - 1 used to satisfy
+  // the old budget (MAX_SEQ_LEN - num_to_generate = 1); against the real
+  // reservation, MAX_SEQ_LEN - (num_to_generate + 1 + sys_prompt_rows), it
+  // yields a budget of 0, and a prompt truncated to zero tokens is fatal, not
+  // degraded -- the prefill input is built at {1,1,1,init_len} and TensorDim
+  // rejects "value <=0". A package with num_to_generate 4096 against
+  // max_seq_len 2048 turns from an rc=0 run into that abort.
+  //
+  // sys_prompt_rows is the precomputed-KV-cache prefix, read here from the same
+  // config field CausalLM::setupParameters reads. When that field is absent
+  // CausalLM derives the length from the tokenizer at run() time instead, which
+  // is not knowable here; the budget's own floor of 1 keeps that case safe, and
+  // the generation loop's window clamp bounds the run.
   //
   // This belongs here, in the same function that (re-)reads num_to_generate,
   // so it holds after every call: a derived Transformer whose constructor calls
@@ -279,18 +296,25 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   // derive from Transformer and ship configs with
   // num_to_generate == max_seq_len == 512, where the field is inert and no
   // token history exists; they must neither be warned about nor rewritten.
+  unsigned int sys_prompt_rows = 0;
+  if (nntr_cfg.contains("system_prompt") &&
+      nntr_cfg["system_prompt"].contains("kvcache") &&
+      nntr_cfg["system_prompt"]["kvcache"].contains("sys_prompt_token_size"))
+    sys_prompt_rows =
+      nntr_cfg["system_prompt"]["kvcache"]["sys_prompt_token_size"]
+        .get<unsigned int>();
+  const unsigned int ntg_cap = maxNumToGenerate(MAX_SEQ_LEN, sys_prompt_rows);
   if (MODEL_TYPE == ModelType::CAUSALLM &&
       (NUM_TO_GENERATE < 0 ||
-       static_cast<unsigned int>(NUM_TO_GENERATE) >= MAX_SEQ_LEN)) {
-    const int fitted = (NUM_TO_GENERATE < 0 || MAX_SEQ_LEN == 0)
-                         ? 0
-                         : static_cast<int>(MAX_SEQ_LEN - 1);
+       static_cast<unsigned int>(NUM_TO_GENERATE) > ntg_cap)) {
+    const int fitted =
+      (NUM_TO_GENERATE < 0) ? 0 : static_cast<int>(ntg_cap);
     std::fprintf(stderr,
                  "[causallm] WARNING: num_to_generate=%d does not fit in the "
-                 "context window (max_seq_len=%u); clamping to %d so the "
-                 "prompt keeps at least one token and the token history stays "
-                 "inside its buffer.\n",
-                 NUM_TO_GENERATE, MAX_SEQ_LEN, fitted);
+                 "context window (max_seq_len=%u, sys_prompt rows=%u); "
+                 "clamping to %d so the prompt keeps at least one token and "
+                 "the token history stays inside its buffer.\n",
+                 NUM_TO_GENERATE, MAX_SEQ_LEN, sys_prompt_rows, fitted);
     NUM_TO_GENERATE = fitted;
   }
   if (cfg.contains("rope_theta")) {

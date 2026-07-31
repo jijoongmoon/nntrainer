@@ -35,6 +35,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <cstdint>
 #include <cstdlib>
 #include <layer.h>
 #include <map>
@@ -568,6 +569,98 @@ inline unsigned int effectivePrefillChunk() {
 #else
   return 4096u;
 #endif
+}
+
+/**
+ * Largest num_to_generate that still leaves the prompt a token, for a window
+ * of max_seq_len with a sys_prompt_len-row precomputed prefix.
+ *
+ * This is the inverse of promptTokenBudget() below and exists so the two can
+ * never drift: the config clamp in Transformer::setupParameters promises, in
+ * its own warning string, that the value it writes back "keeps at least one
+ * token" for the prompt. That promise is a statement ABOUT the budget, so it
+ * has to be computed FROM the budget. Solving
+ *
+ *   promptTokenBudget(M, G, S, false) = M - (G + 1 + S) >= 1
+ *
+ * for G gives G <= M - 2 - S, which is what this returns (floored at 0).
+ *
+ * The skip_prefill path is deliberately NOT considered here: it reserves one
+ * slot fewer, so a value fitted for the non-skip path fits it too. Fitting to
+ * the looser bound instead would let the clamp hand back a num_to_generate
+ * that leaves the non-skip path with a zero budget -- the failure this
+ * function exists to prevent.
+ */
+inline unsigned int maxNumToGenerate(unsigned int max_seq_len,
+                                     unsigned int sys_prompt_len) {
+  const uint64_t reserved = static_cast<uint64_t>(sys_prompt_len) + 2u;
+  return (static_cast<uint64_t>(max_seq_len) > reserved)
+           ? static_cast<unsigned int>(static_cast<uint64_t>(max_seq_len) -
+                                       reserved)
+           : 0u;
+}
+
+/**
+ * How many prompt tokens may be fed so that the whole run stays inside the
+ * token-history row stride -- the ONE definition of that reservation.
+ *
+ * The token history is allocated once as BATCH_SIZE * max_seq_len and indexed
+ * as ids_history[b * max_seq_len + pos], so every pos has to stay below
+ * max_seq_len. The generation phase does not start AT the prompt length, it
+ * starts one past it, so the budget has to reserve every slot the run will
+ * write and not merely num_to_generate of them. For a prompt of L tokens:
+ *
+ *   pos 0 .. L-1                     the (already truncated) prompt
+ *   pos L                            the token the PREFILL sampled
+ *   pos L+S+1 .. L+S+num_to_generate the generation loop, which runs from
+ *                                    input_len + 1 with input_len = L + S
+ *
+ * so the highest index touched is L + S + num_to_generate and the budget is
+ * max_seq_len - (num_to_generate + 1 + S). S = sys_prompt_len is the
+ * precomputed-KV-cache prefix that run() adds to input_len after the prefill;
+ * it is charged here because it shifts where the loop starts.
+ *
+ * @param first_token_from_prompt the skip_prefill path, which removes exactly
+ * the "+1": there the LAST PROMPT TOKEN is what the first generation step
+ * consumes, the prefill covers only L-1 tokens and init_len/input_len are
+ * decremented for it, so nothing is sampled into a slot of its own and the
+ * loop's first write lands on L itself. Passing false on that path costs one
+ * prompt token; passing true off it costs one generated token.
+ *
+ * Reserving one slot too few does not overflow the buffer -- the generation
+ * loop also clamps its end to the window -- it silently drops the last
+ * generated token instead. That is precisely why the two must agree: the clamp
+ * is the guard, this is the accounting.
+ *
+ * The result is FLOORED AT 1, never 0. A zero budget truncates the prompt to
+ * nothing, and an empty prompt is not a degraded run, it is a fatal one: the
+ * prefill builds its input at {1,1,1,init_len} and TensorDim rejects a zero
+ * dimension ("Trying to assign value <=0 to tensor dim"). One token still
+ * fits, because every caller is bounded by maxNumToGenerate() above, which is
+ * derived from this same formula; the floor is what makes the two agree even
+ * when a caller moves num_to_generate afterwards (setNumToGenerate()) without
+ * re-fitting it. The generation loop's own window clamp then bounds the run.
+ *
+ * The sum is formed in 64-bit on purpose. num_to_generate is already kept
+ * below max_seq_len by setupParameters, but sys_prompt_len comes straight from
+ * a config field; an unsigned wrap here would turn the budget into ~4e9, skip
+ * prompt truncation entirely and write the whole prompt past the row stride.
+ */
+inline unsigned int promptTokenBudget(unsigned int max_seq_len,
+                                      unsigned int num_to_generate,
+                                      unsigned int sys_prompt_len,
+                                      bool first_token_from_prompt) {
+  const uint64_t reserved = static_cast<uint64_t>(num_to_generate) +
+                            (first_token_from_prompt ? 0u : 1u) +
+                            static_cast<uint64_t>(sys_prompt_len);
+  if (static_cast<uint64_t>(max_seq_len) > reserved)
+    return static_cast<unsigned int>(static_cast<uint64_t>(max_seq_len) -
+                                     reserved);
+  // Floor, but never above the row stride itself: a max_seq_len of 0 has no
+  // slot to hand out, and returning 1 there would put the prompt's own write
+  // past a zero-length ids_history. Such a model cannot run anyway -- it keeps
+  // failing loudly on the empty prefill, exactly as before this floor existed.
+  return max_seq_len == 0u ? 0u : 1u;
 }
 
 /**
