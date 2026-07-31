@@ -28,6 +28,8 @@
 #ifndef __CUDA_COMPUTE_OPS_H__
 #define __CUDA_COMPUTE_OPS_H__
 
+#include <cstdint>
+
 #include <cpu_ops_table.h>
 
 namespace nntrainer {
@@ -129,11 +131,12 @@ public:
    *        device-accessible operands -- the inherited host body reaches
    *        Tensor::add_i -> ele_add_fp16, host math this table does not
    *        override. The copy form is gated on WHICH branch Tensor::copy will
-   *        take: the matching-shape branch routes through scopy_fp16, which IS
-   *        device-aware here, so it only drains; the mismatch branch host-reads
-   *        the source and swaps in a host backing store, so it is refused by
-   *        name. Kill-switch NNTR_CUDA_ELTWISE=0 (then the named guard refuses
-   *        on a device-only pool rather than faulting).
+   *        take AND on the element type: only a matching-shape copy of a dtype
+   *        whose ITensor::copy(const void *) lands exclusively in ops THIS
+   *        table overrides is device-aware, so only that drains; the mismatch
+   *        branch (host read + backing-store swap) and every other dtype are
+   *        refused by name. Kill-switch NNTR_CUDA_ELTWISE=0 (then the named
+   *        guard refuses on a device-only pool rather than faulting).
    */
   void residual_op(Tensor &hidden, const Tensor &input,
                    bool accumulate) override;
@@ -169,8 +172,66 @@ public:
   // real device memory; Tensor::copy() -> the CpuComputeOps host loop would
   // fault on it. Route contiguous device-only copies through a stream-ordered
   // cudaMemcpyAsync; host / host-coherent UVM keep the CPU path.
+  //
+  // The SAME invariant as the whole-ops above applies to this family, and it
+  // applies to ALL of it: an op left un-overridden here inherits the
+  // CpuComputeOps host element loop, which dereferences X and Y directly. The
+  // family splits three ways:
+  //
+  //   * byte-identical moves (scopy_fp32/fp16/u8/s8) -> device_copy(), a
+  //     stream-ordered cudaMemcpyAsync, dtype-agnostic and exact;
+  //   * fp32<->fp16 conversion -> staged through host temps (these are on live
+  //     paths: logits readback, activation dtype bridging);
+  //   * every other CONVERSION (int4/int8/int16 <-> float, float -> narrow) ->
+  //     NAMED REFUSAL. There is no device kernel for them, and the host bodies
+  //     they would have to reproduce have irregular extents that differ per
+  //     arch (e.g. scopy_int4_to_float32 reads N BYTES and writes 2N floats
+  //     while ignoring incX/incY; scopy_int8_to_fp32_* index X by incY and Y by
+  //     incX). Re-deriving that bug-compatibly for a staged copy, on paths no
+  //     in-tree consumer can reach with a device pointer, would be untested
+  //     code that can silently corrupt; the refusal cannot -- it fires only
+  //     where the inherited host body would have faulted on the next
+  //     instruction.
   void scopy_fp32(const unsigned int N, const float *X, const unsigned int incX,
                   float *Y, const unsigned int incY) override;
+  /**
+   * @brief Byte-identical uint8 move. Consumer: Uint4QTensor::copy(const void*)
+   *        (the packed-nibble payload). Device-aware via device_copy().
+   */
+  void scopy_u8(const unsigned int N, const uint8_t *X, const unsigned int incX,
+                uint8_t *Y, const unsigned int incY) override;
+  /**
+   * @brief Byte-identical int8 move. Consumers: CharTensor::copy(const void*)
+   *        and Int4QTensor::copy(const void*). Device-aware via device_copy().
+   *        This is the op that made a QINT8 residual copy pass the old
+   *        shape-only gate and then land in the host loop on device memory.
+   */
+  void scopy_s8(const unsigned int N, const int8_t *X, const unsigned int incX,
+                int8_t *Y, const unsigned int incY) override;
+
+  // Converting copies with no device kernel -- named refusal (see the block
+  // comment above). FP32 half of the family.
+  void scopy_int4_to_float32(const unsigned int N, const uint8_t *X,
+                             const unsigned int incX, float *Y,
+                             const unsigned int incY) override;
+  void scopy_int8_to_fp32_u(const unsigned int N, const uint8_t *X,
+                            const unsigned int incX, float *Y,
+                            const unsigned int incY) override;
+  void scopy_int8_to_fp32_s(const unsigned int N, const int8_t *X,
+                            const unsigned int incX, float *Y,
+                            const unsigned int incY) override;
+  void copy_s16_fp32(const unsigned int N, const int16_t *X,
+                     float *Y) override;
+  void copy_u16_fp32(const unsigned int N, const uint16_t *X,
+                     float *Y) override;
+  void copy_fp32_u32(const unsigned int N, const float *X,
+                     uint32_t *Y) override;
+  void copy_fp32_u16(const unsigned int N, const float *X,
+                     uint16_t *Y) override;
+  void copy_fp32_u8(const unsigned int N, const float *X, uint8_t *Y) override;
+  void copy_fp32_s16(const unsigned int N, const float *X,
+                     int16_t *Y) override;
+  void copy_fp32_s8(const unsigned int N, const float *X, int8_t *Y) override;
 #ifdef ENABLE_FP16
   void scopy_fp16(const unsigned int N, const _FP16 *X, const unsigned int incX,
                   _FP16 *Y, const unsigned int incY) override;
@@ -182,6 +243,16 @@ public:
   void scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
                           const unsigned int incX, float *Y,
                           const unsigned int incY) override;
+  // Converting copies with no device kernel -- named refusal. FP16 half.
+  void scopy_int4_to_float16(const unsigned int N, const uint8_t *X,
+                             const unsigned int incX, _FP16 *Y,
+                             const unsigned int incY) override;
+  void scopy_int8_to_float16_u(const unsigned int N, const uint8_t *X,
+                               const unsigned int incX, _FP16 *Y,
+                               const unsigned int incY) override;
+  void scopy_int8_to_float16_s(const unsigned int N, const int8_t *X,
+                               const unsigned int incX, _FP16 *Y,
+                               const unsigned int incY) override;
 #endif
 };
 

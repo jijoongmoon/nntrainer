@@ -480,6 +480,17 @@ TEST_F(ComputeOpsDispatchTest,
  *     it that this file does not know about. That is the half that catches a
  *     lane adding a whole-op without a CUDA override -- the way this gap was
  *     opened in the first place.
+ *
+ * TWO sections are censused, because the invariant has nothing to do with
+ * which banner an op sits under:
+ *   1. the whole-op (Tensor-level) section, and
+ *   2. the raw-pointer COPY family (scopy_* / copy_*), which is spread across
+ *      the "FP32 BLAS", "FP32 Data conversion / Copy", "Data conversion
+ *      (int8 -> FP32)", "FP16 BLAS" and "FP16 Data conversion" banners.
+ * Anchoring only on the whole-op banner left the entire copy family
+ * structurally outside the enforcement: `Tensor::copy` on a QINT8 activation
+ * dispatches ComputeOps::scopy_s8, which had no CUDA override and no row here,
+ * so nothing could have flagged it.
  * ========================================================================== */
 #ifdef ENABLE_CUDA
 
@@ -544,6 +555,75 @@ const WholeOp kWholeOps[] = {
   {"softcap", CUDA_DECLARES(softcap)},
   {"rms_norm", CUDA_DECLARES(rms_norm)},
 };
+
+/**
+ * @brief Placeholder for a row whose op does not exist in THIS build.
+ *
+ * The census reads compute_ops.h as TEXT, so it sees the ops declared inside
+ * `#ifdef ENABLE_FP16` whether or not this translation unit has FP16. The row
+ * must therefore exist unconditionally, while CUDA_DECLARES() on it can only
+ * be compiled when the member does. When it does not, there is no op to
+ * override and nothing to enforce -- the row is name-only.
+ */
+constexpr bool kOpAbsentInThisBuild = true;
+
+/**
+ * @brief The copy-family census. One row per scopy_* / copy_* op on the base.
+ *
+ * Same invariant as kWholeOps, one abstraction level down: these take raw
+ * pointers rather than Tensors, and an op with no CudaComputeOps override
+ * inherits a CpuComputeOps host element loop that dereferences X and Y --
+ * which on the device-only activation pool is exactly the fault this table
+ * exists to prevent. An override may be a device implementation (a
+ * stream-ordered cudaMemcpyAsync for the byte-identical moves, staging for the
+ * fp32<->fp16 converters) or a named refusal; it may not be absent.
+ */
+const WholeOp kCopyOps[] = {
+  {"scopy_fp32", CUDA_DECLARES(scopy_fp32)},
+  {"scopy_u8", CUDA_DECLARES(scopy_u8)},
+  {"scopy_s8", CUDA_DECLARES(scopy_s8)},
+  {"scopy_int4_to_float32", CUDA_DECLARES(scopy_int4_to_float32)},
+  {"copy_s16_fp32", CUDA_DECLARES(copy_s16_fp32)},
+  {"copy_u16_fp32", CUDA_DECLARES(copy_u16_fp32)},
+  {"copy_fp32_u32", CUDA_DECLARES(copy_fp32_u32)},
+  {"copy_fp32_u16", CUDA_DECLARES(copy_fp32_u16)},
+  {"copy_fp32_u8", CUDA_DECLARES(copy_fp32_u8)},
+  {"copy_fp32_s16", CUDA_DECLARES(copy_fp32_s16)},
+  {"copy_fp32_s8", CUDA_DECLARES(copy_fp32_s8)},
+  {"scopy_int8_to_fp32_u", CUDA_DECLARES(scopy_int8_to_fp32_u)},
+  {"scopy_int8_to_fp32_s", CUDA_DECLARES(scopy_int8_to_fp32_s)},
+#ifdef ENABLE_FP16
+  {"scopy_fp16", CUDA_DECLARES(scopy_fp16)},
+  {"scopy_fp32_to_fp16", CUDA_DECLARES(scopy_fp32_to_fp16)},
+  {"scopy_fp16_to_fp32", CUDA_DECLARES(scopy_fp16_to_fp32)},
+  {"scopy_int4_to_float16", CUDA_DECLARES(scopy_int4_to_float16)},
+  {"scopy_int8_to_float16_u", CUDA_DECLARES(scopy_int8_to_float16_u)},
+  {"scopy_int8_to_float16_s", CUDA_DECLARES(scopy_int8_to_float16_s)},
+#else
+  {"scopy_fp16", kOpAbsentInThisBuild},
+  {"scopy_fp32_to_fp16", kOpAbsentInThisBuild},
+  {"scopy_fp16_to_fp32", kOpAbsentInThisBuild},
+  {"scopy_int4_to_float16", kOpAbsentInThisBuild},
+  {"scopy_int8_to_float16_u", kOpAbsentInThisBuild},
+  {"scopy_int8_to_float16_s", kOpAbsentInThisBuild},
+#endif
+};
+
+/**
+ * @brief Is @p name a member of the copy family?
+ *
+ * Purely lexical, on purpose: the section this predicate filters is the whole
+ * raw-pointer half of the class, so a NEW copy op lands in the census by
+ * virtue of being named like one, wherever its author files it. (Every
+ * scopy_* / copy_* on the base today is a copy or a representation conversion;
+ * nothing else in that half carries either prefix.)
+ */
+bool isCopyOp(const std::string &name) {
+  return name.rfind("scopy_", 0) == 0 || name.rfind("copy_", 0) == 0;
+}
+
+/** @brief Every declaration in the section belongs to this census. */
+bool acceptAll(const std::string &) { return true; }
 
 /**
  * @brief Ops exempt from the override requirement.
@@ -617,6 +697,40 @@ std::vector<std::string> declaredVirtuals(const std::string &block) {
   return names;
 }
 
+/**
+ * @brief Reconcile the virtuals parsed out of a header section against a
+ *        census array, in BOTH directions.
+ *
+ * Forward: a declaration with no row means nothing checks it. Reverse: a row
+ * with no declaration is a stale census entry pointing at an op that moved or
+ * was deleted, which would otherwise keep passing forever.
+ *
+ * @param declared   names parsed from the header section
+ * @param known      names the census array carries
+ * @param census     census array's identifier, for the failure message
+ * @param accept     which declared names this census is responsible for
+ */
+void reconcile(const std::vector<std::string> &declared,
+               const std::set<std::string> &known, const char *census,
+               bool (*accept)(const std::string &)) {
+  std::set<std::string> seen;
+  for (const auto &name : declared) {
+    if (isExempt(name) || !accept(name))
+      continue;
+    seen.insert(name);
+    EXPECT_EQ(known.count(name), 1u)
+      << "ComputeOps::" << name << " is declared on the base with NO row in "
+      << census
+      << ", so nothing checks whether CudaComputeOps overrides it. Add the row"
+         " (and the CudaComputeOps override it will then require).";
+  }
+  for (const auto &name : known)
+    EXPECT_EQ(seen.count(name), 1u)
+      << census << " lists '" << name
+      << "' but compute_ops.h no longer declares it in the section this census"
+         " covers -- stale census row.";
+}
+
 } // namespace
 
 /**
@@ -678,22 +792,75 @@ TEST(CudaWholeOpTable, CensusCoversHeader) {
   for (const auto &op : kWholeOps)
     known.insert(op.name);
 
-  std::set<std::string> seen;
-  for (const auto &name : declared) {
-    if (isExempt(name))
-      continue;
-    seen.insert(name);
-    EXPECT_EQ(known.count(name), 1u)
-      << "ComputeOps::" << name
-      << " is a whole-op on the base with NO row in kWholeOps, so nothing"
-         " checks whether CudaComputeOps overrides it. Add the row (and the"
-         " CudaComputeOps override it will then require).";
+  reconcile(declared, known, "kWholeOps", acceptAll);
+#endif
+}
+
+/**
+ * @brief Every copy op this file knows about is overridden by CudaComputeOps.
+ *
+ * Exactly the whole-op requirement, applied to the raw-pointer copy family. A
+ * false row means the op inherits the CpuComputeOps element loop, which reads
+ * X and writes Y on the host -- undefined on a cudaMalloc pointer.
+ */
+TEST(CudaCopyOpTable, HasCudaOverride) {
+  for (const auto &op : kCopyOps) {
+    EXPECT_TRUE(op.cuda_override)
+      << "ComputeOps::" << op.name
+      << " has NO CudaComputeOps override -- it inherits the CpuComputeOps host"
+         " copy loop, which dereferences the source and destination the CPU"
+         " cannot address when the device-only activation pool"
+         " (NNTR_CUDA_DEV_ACT) is armed. Add a device implementation or a named"
+         " refusal in nntrainer/cuda/cuda_compute_ops.{h,cpp}.";
   }
-  for (const auto &name : known)
-    EXPECT_EQ(seen.count(name), 1u)
-      << "kWholeOps lists '" << name
-      << "' but compute_ops.h no longer declares it in the whole-op section --"
-         " stale census row.";
+}
+
+/**
+ * @brief kCopyOps covers EVERY copy op the base actually declares.
+ *
+ * The second anchored section. The whole-op census stops at the class'
+ * `protected:` AFTER the whole-op banner, so it reaches none of the copy
+ * family; this one takes the complementary region -- the class declaration up
+ * to that same banner, i.e. the entire raw-pointer half -- and holds every
+ * scopy_* / copy_* in it to the same rule, wherever the header files it (they
+ * are spread over five different banners today, two of them "BLAS").
+ */
+TEST(CudaCopyOpTable, CensusCoversCopyOps) {
+#ifndef NNTR_COMPUTE_OPS_HEADER
+  GTEST_SKIP() << "NNTR_COMPUTE_OPS_HEADER not defined by the build";
+#else
+  std::ifstream in(NNTR_COMPUTE_OPS_HEADER);
+  if (!in) {
+    GTEST_SKIP() << "compute_ops.h not readable at " << NNTR_COMPUTE_OPS_HEADER
+                 << " (installed test run); the compile-time half still ran";
+  }
+  std::ostringstream buf;
+  buf << in.rdbuf();
+  const std::string src = buf.str();
+
+  // Raw-pointer half: the class declaration through to the whole-op banner.
+  // Carved on the RAW text, like the whole-op census, because the end anchor
+  // is itself inside a comment.
+  const size_t begin = src.find("class ComputeOps {");
+  ASSERT_NE(begin, std::string::npos)
+    << "cannot find `class ComputeOps {` in compute_ops.h -- re-anchor this"
+       " census.";
+  const size_t end = src.find("Whole-op (Tensor-level) ops", begin);
+  ASSERT_NE(end, std::string::npos)
+    << "the whole-op section banner moved in compute_ops.h; the copy census"
+       " cannot delimit the raw-pointer half -- re-anchor it.";
+
+  const std::vector<std::string> declared =
+    declaredVirtuals(stripComments(src.substr(begin, end - begin)));
+  ASSERT_FALSE(declared.empty())
+    << "parsed zero virtuals out of the raw-pointer section -- the parser, not"
+       " the table, is broken.";
+
+  std::set<std::string> known;
+  for (const auto &op : kCopyOps)
+    known.insert(op.name);
+
+  reconcile(declared, known, "kCopyOps", isCopyOp);
 #endif
 }
 
