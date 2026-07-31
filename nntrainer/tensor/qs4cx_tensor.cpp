@@ -13,6 +13,11 @@
 #include <qs4cx_tensor.h>
 #include <tensor.h>
 
+#include <atomic>
+#include <mutex>
+#include <utility>
+#include <vector>
+
 namespace nntrainer {
 
 namespace {
@@ -193,5 +198,51 @@ void QS4CX_Tensor::print(std::ostream &out) const {
 }
 
 QScheme QS4CX_Tensor::q_scheme() const { return QScheme::QS4CX; }
+
+namespace {
+/**
+ * @brief Dropped plain-payload ranges, keyed by address span.
+ *
+ * Entry count is the number of int4 FC weights (order 10^2), and the vector is
+ * only ever consulted once `dropped_any` is set, so a linear scan is cheaper
+ * than a map and keeps the empty case free.
+ */
+std::mutex &qs4cx_dropped_mtx() {
+  static std::mutex m;
+  return m;
+}
+std::vector<std::pair<uintptr_t, uintptr_t>> &qs4cx_dropped_ranges() {
+  static std::vector<std::pair<uintptr_t, uintptr_t>> v;
+  return v;
+}
+std::atomic<bool> qs4cx_dropped_any{false};
+} // namespace
+
+void markQs4cxPayloadDropped(const void *base, size_t bytes) {
+  if (base == nullptr || bytes == 0)
+    return;
+  const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+  {
+    std::lock_guard<std::mutex> lock(qs4cx_dropped_mtx());
+    qs4cx_dropped_ranges().emplace_back(lo, lo + bytes);
+  }
+  // Release: the range must be visible to any thread that observes the flag.
+  qs4cx_dropped_any.store(true, std::memory_order_release);
+}
+
+bool anyQs4cxPayloadDropped() {
+  return qs4cx_dropped_any.load(std::memory_order_acquire);
+}
+
+bool isQs4cxPayloadDropped(const void *ptr) {
+  if (!anyQs4cxPayloadDropped() || ptr == nullptr)
+    return false;
+  const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+  std::lock_guard<std::mutex> lock(qs4cx_dropped_mtx());
+  for (const auto &r : qs4cx_dropped_ranges())
+    if (p >= r.first && p < r.second)
+      return true;
+  return false;
+}
 
 } // namespace nntrainer

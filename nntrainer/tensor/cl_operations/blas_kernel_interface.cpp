@@ -425,6 +425,7 @@ int aminCl(const Tensor &input) {
 #include <memory>
 #include <mutex>
 #include <network_graph.h> // resolveResidentEdge (cl_mem residency overlay)
+#include <qs4cx_tensor.h>  // markQs4cxPayloadDropped (DROP_PLAIN tripwire)
 #include <unordered_map>
 
 namespace nntrainer {
@@ -764,37 +765,41 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   }
   auto inserted = cache.emplace(key, std::move(e));
 
-  // [NNTR_V8C_DROP_PLAIN=1, x86-only, OPT-IN] The device backing + scale buf +
-  // row-sum built above are the only things the v8c GPU path reads from now
-  // on, so dropping the plain QS4CX pages after the build reclaims ~the whole
-  // FC weight footprint from host RSS. INWARD page alignment so pages shared
-  // with neighboring pool tensors are never touched. May silently no-op if the
-  // driver pinned the SVM pages (result is logged).
+  // [NNTR_V8C_DROP_PLAIN=1, OPT-IN] The device backing + scale buf + row-sum
+  // built above are the only things the v8c GPU path reads from now on, so
+  // dropping the plain QS4CX pages after the build reclaims ~the whole FC
+  // weight footprint. Measured on an Adreno 840 phone: the plain payload and
+  // its repacked device twin are BOTH resident otherwise, which is a ~1.97x
+  // weight plane (2,709.8 MiB of device-mapped residency against 1,372.9 MiB
+  // of weight-record content on a 2.7 GB package). INWARD page alignment so
+  // pages shared with neighboring pool tensors are never touched. May silently
+  // no-op if the driver pinned the pages (result is logged).
   //
-  // DANGEROUS, hence opt-in everywhere: dropped pages read back as ZEROS, and
-  // a live host consumer of the plain payload still exists on x86 -- the
-  // ClComputeOps QS4CX fallback calls Tensor::dot, and FloatTensor::dot
-  // dispatches QS4CX to dotQs4cx(), which reads exactly these nibbles plus the
-  // fp32 scale tail (float_tensor.cpp). That fallback is reachable: dotCl_v8c
-  // returns false from ~10 sites AFTER the weight has been built, cached and
-  // dropped (allocation failures, kernel-registration failures, and the huge_n
-  // untied-lm_head branch, which returns false unconditionally on an
-  // fp16-disabled build). The result would be a well-formed, entirely wrong
-  // output with no exception and no log. Re-enabling by default needs the
-  // fallback to fail loudly on a dropped weight first.
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
-  defined(_M_IX86)
+  // The pages are DROPPED, never freed: the v8c cache above is keyed on the
+  // plain payload's address, so the mapping has to stay valid even though it
+  // now reads back as zeros. That is also why this cannot be turned into a
+  // "never make the second copy" change without re-keying the cache.
+  //
+  // Dropped pages read back as ZEROS, and a live host consumer of the plain
+  // payload exists: the ClComputeOps QS4CX fallback calls Tensor::dot, and
+  // FloatTensor::dot dispatches QS4CX to dotQs4cx(), which reads exactly these
+  // nibbles plus the fp32 scale tail (float_tensor.cpp). That fallback is
+  // reachable -- dotCl_v8c returns false from ~10 sites AFTER the weight has
+  // been built, cached and dropped (allocation failures, kernel-registration
+  // failures, and the huge_n untied-lm_head branch). Left alone the result
+  // would be a well-formed, entirely wrong output with no exception and no
+  // log, so the drop is registered with markQs4cxPayloadDropped() and
+  // dotQs4cx() refuses a dropped weight by name. The failure mode is now a
+  // loud throw naming the env that restores the pages, not silent corruption.
+  //
+  // It stays OPT-IN regardless: refusing is not the same as working. A run
+  // that diverts even one FC to the host path aborts instead of finishing, so
+  // enabling this is a statement that the deployment's FCs all stay on the GPU
+  // path, which is a per-deployment fact and not ours to assume.
   {
     static const bool drop_plain = []() {
       const char *v = std::getenv("NNTR_V8C_DROP_PLAIN");
-      if (v != nullptr)
-        return v[0] == '1';
-      // Opt-in on every platform. DiscardVirtualMemory does work on the WDDM
-      // SVM host shadow (verified on every weight, goldens byte-identical),
-      // but the win is throughput/footprint while the failure mode is silent
-      // wrong output through the host fallback described above, so it must not
-      // be the default until that fallback rejects a dropped weight.
-      return false;
+      return v != nullptr && v[0] == '1';
     }();
     if (drop_plain) {
       const size_t payload = (size_t)N * (((size_t)K + 1) / 2) // nibbles
@@ -813,6 +818,12 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
         rc = ::madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED);
 #endif
       }
+      // Register the whole logical payload, not just the page-aligned interior
+      // that was dropped: a read starting anywhere inside it would still land
+      // on zeroed pages. Only on success -- a no-op drop leaves the payload
+      // intact and must not arm the tripwire.
+      if (rc == 0)
+        markQs4cxPayloadDropped(nibbles, payload);
       // Per-weight success spam is diagnostics, not production output (an
       // SDK run printed 423 of these): success only under NNTR_MEM_TRACE,
       // failures always.
@@ -825,7 +836,6 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
                      rc == 0 ? 0 : errno);
     }
   }
-#endif
   // [NNTR_MEM_TRACE] Working-set growth per v8c weight, against the bytes we
   // actually asked the runtime for. If WS climbs faster than the cl_mem bytes,
   // the driver is keeping more than the one copy we allocated.
@@ -1499,6 +1509,19 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   V8cWeightEntry *w = v8c_get_or_build_weight(weight, K, N);
   if (!w)
     V8C_REJECT("no v8c weight backing (shape / null scale / build threw)");
+  // [test-only] NNTR_V8C_FORCE_FALLBACK=1 diverts to the host path from HERE,
+  // i.e. after the weight has been built, cached and (under DROP_PLAIN)
+  // dropped. That is exactly the shape of the ~10 real post-build rejects
+  // below, and it is the only way to exercise the DROP_PLAIN tripwire on
+  // demand instead of waiting for an allocation or kernel-registration failure
+  // to produce it. Not a tuning knob: with DROP_PLAIN off it just forces the
+  // host FC, and with DROP_PLAIN on the run is expected to abort.
+  static const bool v8c_force_fallback = []() {
+    const char *e = std::getenv("NNTR_V8C_FORCE_FALLBACK");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (v8c_force_fallback)
+    V8C_REJECT("env NNTR_V8C_FORCE_FALLBACK=1 (test-only post-build divert)");
 
   // Imageless v8c weight (N > image2d height cap, e.g. the untied int4 lm_head
   // with N=vocab=262144): the image GEMM path cannot run, so dispatch the

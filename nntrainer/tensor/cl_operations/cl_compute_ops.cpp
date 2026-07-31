@@ -36,6 +36,7 @@
 #include <cpu_backend.h> // gemm_q4_0 (host route for CL-ineligible shapes)
 #include <geglu_cl_op.h>
 #include <nntrainer_log.h>
+#include <qs4cx_tensor.h>
 #include <rms_reverse_norm_cl_op.h>
 #include <sigmoid_add_cl_op.h>
 #include <sigmoid_glu_cl_op.h>
@@ -371,6 +372,28 @@ public:
       // rejection must not leave a GPU_CLMEM tensor's planes inconsistent.
       nntrainer::clmem_lower_cl(input, 0);
       auto wt = weight.getDataType();
+      // [DROP_PLAIN tripwire] This is the one boundary where a weight the v8c
+      // path already repacked can be handed to a HOST GEMM. If its plain
+      // nibble+scale pages were released (NNTR_V8C_DROP_PLAIN) the mapping is
+      // still valid -- the v8c cache is keyed on its address -- but it now
+      // reads back as ZEROS, so the host GEMM would return a well-formed,
+      // entirely wrong result with no exception and no log.
+      //
+      // The check sits here rather than in the host GEMMs because the
+      // activation dtype selects the implementation (FloatTensor::dotQs4cx for
+      // FP32, HalfTensor's QS4CX path for FP16, and this lane runs FP16), so
+      // this is the only single site that covers every one of them. Costs one
+      // relaxed atomic load when nothing was dropped, which is the default.
+      if (nntrainer::anyQs4cxPayloadDropped() &&
+          nntrainer::isQs4cxPayloadDropped(weight.getData<char>())) {
+        throw std::runtime_error(
+          "FC '" + weight.getName() +
+          "' diverted to the host path, but its QS4CX plain payload was "
+          "released by NNTR_V8C_DROP_PLAIN: the pages read back as zeros, so "
+          "the host GEMM would silently compute a wrong result. Re-run with "
+          "NNTR_V8C_DROP_PLAIN=0 to keep the payload resident; "
+          "NNTR_FC_DIVERT_TRACE=1 names the condition that diverted this FC.");
+      }
       if (wt == ml::train::TensorDim::DataType::QINT4 ||
           wt == ml::train::TensorDim::DataType::QS4CX ||
           wt == ml::train::TensorDim::DataType::Q4_0 ||
