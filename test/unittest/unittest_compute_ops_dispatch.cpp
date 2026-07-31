@@ -427,6 +427,9 @@ TEST_F(ComputeOpsDispatchTest, RmsNormDispatchesThroughAttachedContextOps) {
   // Row 2 is outside the active window: still the 0.0 sentinel.
   EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 2, 0), 0.0f);
   EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 2, 3), 0.0f);
+}
+
+/**
  * @brief The reverse-RMSNorm whole-op (PLE post_norm) dispatches
  *        through the attached ContextData ops — the dispatch seam the layer's
  *        former open-coded body structurally could not test — and the

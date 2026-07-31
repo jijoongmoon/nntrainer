@@ -684,6 +684,8 @@ bool v8c_use_buffer_path();
  *        command-queue manager.
  */
 bool svm_pool_default_on();
+
+/**
  * @brief Collect eager-build tasks for the v8c programs that would otherwise
  *        be compiled on their first dispatch, inside the first prefill and the
  *        first decode step.
