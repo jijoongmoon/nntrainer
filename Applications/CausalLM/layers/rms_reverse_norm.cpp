@@ -16,6 +16,11 @@
 
 #include "rms_reverse_norm.h"
 
+#include <memory_data.h>
+#if defined(ENABLE_OPENCL)
+#include <blas_kernels.h> // rms_reverse_norm_cl_fp16
+#endif
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -130,6 +135,41 @@ void RMSReverseNormLayer::incremental_forwarding(
       // TODO : Implement Fast Route for FP16
     } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
+#if defined(ENABLE_OPENCL)
+      // GPU-resident path: run the reverse-norm ON THE GPU (no host op inside
+      // the async GPU graph). The host FP32-temp path below is a host
+      // reader/writer interleaved with the in-order-but-undrained GPU queue: it
+      // reads the SVM shadow of an FC output the GPU has not written back yet
+      // (measured all-zero => an all -0 PLE post_norm) and then
+      // writes that result back over the residual stream. Running it as a GPU
+      // op (rms_reverse_norm_cl_fp16, fp32-accumulated, weight-before-norm +
+      // scalar out_scale) removes the host<->GPU boundary entirely, mirroring
+      // reshaped_rms_norm / rms_norm_gpu.
+      const auto in_md = in_step.getMemoryData();
+      const auto out_md = out_step.getMemoryData();
+      const auto w_md = weight.getMemoryData();
+      const auto os_md = out_scale.getMemoryData();
+      const bool gpu_svm =
+        in_md && in_md->isSVM() && out_md && out_md->isSVM() && w_md &&
+        w_md->isSVM() && os_md && os_md->isSVM() &&
+        weight.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        out_scale.getDataType() == ml::train::TensorDim::DataType::FP16;
+      if (gpu_svm) {
+        void *in_cl = (in_step.getOffset() == 0 && in_step.isClMem())
+                        ? in_step.getClMem()
+                        : nullptr;
+        void *out_cl = (out_step.getOffset() == 0 && out_step.isClMem())
+                         ? out_step.getClMem()
+                         : nullptr;
+        nntrainer::rms_reverse_norm_cl_fp16(
+          in_step.getData<_FP16>(), weight.getData<_FP16>(),
+          out_scale.getData<_FP16>()[0], out_step.getData<_FP16>(), epsilon,
+          in_step_dim.height(), in_step_dim.width(), /*use_svm=*/true, out_cl,
+          in_cl);
+        continue;
+      }
+#endif
+      // Host path (ARM CPU / non-GPU-resident): FP32-temp compute.
       ml::train::TensorDim instep_dim = in_step_dim;
       ml::train::TensorDim outstep_dim = out_step_dim;
 
