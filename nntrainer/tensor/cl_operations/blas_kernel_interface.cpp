@@ -757,12 +757,15 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   }
   auto inserted = cache.emplace(key, std::move(e));
 
-  // [NNTR_V8C_DROP_PLAIN=1, x86-only, OPT-IN] The device backing + scale buf +
-  // row-sum built above are the only things the v8c GPU path reads from now
-  // on, so dropping the plain QS4CX pages after the build reclaims ~the whole
-  // FC weight footprint from host RSS. INWARD page alignment so pages shared
-  // with neighboring pool tensors are never touched. May silently no-op if the
-  // driver pinned the SVM pages (result is logged).
+  // [NNTR_V8C_DROP_PLAIN=1, OPT-IN] The device backing + scale buf + row-sum
+  // built above are the only things the v8c GPU path reads from now on, so
+  // dropping the plain QS4CX pages after the build reclaims ~the whole FC
+  // weight footprint. Measured on an Adreno 840 phone: the plain payload and
+  // its repacked device twin are BOTH resident otherwise, which is a ~1.97x
+  // weight plane (2,709.8 MiB of device-mapped residency against 1,372.9 MiB
+  // of weight-record content on a 2.7 GB package). INWARD page alignment so
+  // pages shared with neighboring pool tensors are never touched. May silently
+  // no-op if the driver pinned the pages (result is logged).
   //
   // The pages are DROPPED, never freed: the v8c cache above is keyed on the
   // plain payload's address, so the mapping has to stay valid even though it
@@ -789,8 +792,10 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   // that diverts even one FC to the host path aborts instead of finishing, so
   // enabling this is a statement that the deployment's FCs all stay on the GPU
   // path, which is a per-deployment fact and not ours to assume.
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
-  defined(_M_IX86)
+  //
+  // The primitives are portable (DiscardVirtualMemory on Windows, madvise
+  // elsewhere), so the call site is not architecture-gated: on ARM64 the drop
+  // returns rc=0 on every weight.
   {
     static const bool drop_plain = []() {
       const char *v = std::getenv("NNTR_V8C_DROP_PLAIN");
@@ -831,7 +836,6 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
                      rc == 0 ? 0 : errno);
     }
   }
-#endif
   // [NNTR_MEM_TRACE] Working-set growth per v8c weight, against the bytes we
   // actually asked the runtime for. If WS climbs faster than the cl_mem bytes,
   // the driver is keeping more than the one copy we allocated.
