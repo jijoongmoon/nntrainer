@@ -64,7 +64,36 @@ endif
 include $(NNTRAINER_PREBUILT_MK)
 LOCAL_PATH := $(CAUSALLM_JNI_PATH)
 
-# Tokenizer library
+# Prerequisites that no commit can carry.
+#
+# Two inputs of an ndk build are untracked artifacts, so a fresh checkout has
+# neither, and a stale one is indistinguishable from a correct one until the
+# link fails. Check both here, where the message can name the step to run.
+#
+# json.hpp: third_party/nlohmann/json.hpp is only a shim that redirects to
+# ../../json.hpp, and that one is the downloaded nlohmann single header --
+# gitignored, and placed by jni/prepare_encoder.sh, which only the meson
+# configure path runs. Without it the build dies deep inside a translation unit
+# with "'json.hpp' file not found" and never says which setup step was skipped.
+CAUSALLM_JSON_HPP := $(LOCAL_PATH)/../json.hpp
+ifeq ($(wildcard $(CAUSALLM_JSON_HPP)),)
+$(error $(CAUSALLM_JSON_HPP) not found. Run jni/prepare_encoder.sh <dir> 0.2 from the repo root, or configure once with meson)
+endif
+
+# Tokenizer archive: .gitignore keeps only the x86 sibling lib/libtokenizers_c.a,
+# so this one does not travel with the tree. A rung that adds a C ABI entry
+# point refreshes the tracked x86 archive in the same commit and silently
+# leaves this one behind, and the next ndk-build dies on undefined tokenizers_*
+# references that read as an application bug. Probe for the newest ABI addition
+# so a stale archive is rejected instead of linking short.
+TOKENIZERS_ANDROID_LIB := $(LOCAL_PATH)/../lib/libtokenizers_android_c.a
+ifeq ($(wildcard $(TOKENIZERS_ANDROID_LIB)),)
+$(error $(TOKENIZERS_ANDROID_LIB) not found. Build it with Applications/CausalLM/build_tokenizer_android.sh)
+endif
+ifeq ($(shell grep -ac tokenizers_new_from_snapshot $(TOKENIZERS_ANDROID_LIB)),0)
+$(error $(TOKENIZERS_ANDROID_LIB) predates the tokenizer snapshot ABI (no tokenizers_new_from_snapshot). Rebuild it with Applications/CausalLM/build_tokenizer_android.sh)
+endif
+
 include $(CLEAR_VARS)
 LOCAL_MODULE := tokenizers_c
 LOCAL_SRC_FILES := ../lib/libtokenizers_android_c.a
@@ -108,6 +137,7 @@ LOCAL_SRC_FILES := \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
     ../layers/rms_norm_gpu.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
@@ -211,6 +241,8 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gpt_oss/gptoss_causallm.cpp \
     ../models/gpt_oss_cached_slim/gptoss_cached_slim_causallm.cpp \
     ../llm_util.cpp \
+    ../huggingface_tokenizer.cpp \
+    ../tokenizer_cache.cpp \
     ../layers/embedding_layer.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
@@ -223,6 +255,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
     ../layers/rms_norm_gpu.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
@@ -330,6 +363,7 @@ LOCAL_SRC_FILES := \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_embedding_gemma_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_tinybert_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_deberta_v2_reference.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_xlm_roberta_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_reference.cpp
 
