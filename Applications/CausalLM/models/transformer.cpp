@@ -381,7 +381,20 @@ void Transformer::repack_weight() {
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context,
             void *user_data) {
-      // repack FC layer only
+      // Two independent narrowings, and the pack needs BOTH.
+      //
+      // (1) Layer type. The QS4CX pack is only ever read back through
+      //     Tensor::getPackedData() from the fully-connected GEMM, so no other
+      //     layer type has a consumer for it. Packing them is wasted
+      //     single-threaded CPU work over the whole weight set.
+      // (2) Run engine. Even among FC layers, only the ones the graph resolved
+      //     onto the host CPU reach that GEMM; the "gpu" (OpenCL) and "cuda"
+      //     engines consume the plain QS4CX blob directly.
+      //
+      // Neither filter subsumes the other: (1) alone still packs every GPU FC
+      // (on a large model that is enough single-core work to walk into a
+      // thermal shutdown), and (2) alone still packs the non-FC QS4CX weights
+      // of a CPU graph, which nothing will ever read.
       if (l.getType() != "fully_connected" &&
           l.getType() != "shared_fully_connected")
         return;
