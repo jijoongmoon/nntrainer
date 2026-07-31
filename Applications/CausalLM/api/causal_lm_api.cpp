@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,6 +50,11 @@ static std::string g_architecture = "";
 static bool g_use_chat_template = false;
 static bool g_verbose = false;
 static std::string g_last_output = "";
+// How long it took to build the model that is in memory. A load that reuses
+// that model leaves this alone rather than reporting its own ~0 ms: the number
+// getPerformanceMetrics() publishes is the cost of initialising the model being
+// run, and overwriting it with 0 would tell a caller that polls after a
+// re-load that the model came up for free.
 static double g_initialization_duration_ms = 0.0;
 static std::unique_ptr<causallm::ChatTemplate> g_chat_template;
 // The loaded package's own chat render context ("chat_template_context" in
@@ -57,6 +63,53 @@ static json g_chat_template_context = json::object();
 // The loaded package's generation_config.json "do_sample"; runModelWithOptions
 // follows it unless the caller overrides it per call.
 static bool g_do_sample_default = false;
+
+/**
+ * @brief What a load request asked for.
+ *
+ * Everything that can change the model a load produces lives here, so two
+ * requests that compare equal are answered by the same weights:
+ *  - @c source is the entry point, because the two describe a model in
+ *    different terms and must not be read as each other's;
+ *  - @c compute selects the nntrainer engine the graph is built for;
+ *  - @c model_type and @c quant_type select the built-in configuration and
+ *    the quantization suffix of the package directory (loadModel() only);
+ *  - @c model_dir is the package directory itself, weakly canonicalised. It
+ *    is what loadModelFromPath() was handed, and for loadModel() it is the
+ *    directory the enums resolved to -- resolution is relative to the working
+ *    directory, so the enums alone do not pin down which weights were read.
+ *
+ * Not here: the ::Config options, which change how a prompt is fed to a model
+ * rather than which model is built, and are applied per run by setOptions().
+ */
+struct LoadRequest {
+  /** @brief The entry point that made the request. */
+  enum class Source { BuiltinType, PackageDirectory };
+
+  Source source;
+  BackendType compute;
+  ModelType model_type;
+  ModelQuantizationType quant_type;
+  std::string model_dir;
+
+  /** @brief Equality across every field that selects a model. */
+  bool operator==(const LoadRequest &rhs) const {
+    if (source != rhs.source || compute != rhs.compute ||
+        model_dir != rhs.model_dir)
+      return false;
+    if (source == Source::PackageDirectory)
+      return true; // the directory is the whole specification
+    return model_type == rhs.model_type && quant_type == rhs.quant_type;
+  }
+};
+
+/**
+ * @brief The request g_model answers; empty when no model is loaded.
+ *
+ * Written only while holding g_mutex, and only together with g_model, so it
+ * never describes a model that is not the one in memory.
+ */
+static std::optional<LoadRequest> g_loaded_request;
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
@@ -143,6 +196,33 @@ void resolveNntrConfigPath(json &nntr_cfg, const std::string &key,
   nntr_cfg[key] = (std::filesystem::path(model_dir_path) / path).string();
 }
 
+/**
+ * @brief Package directory in a form two spellings of one directory share.
+ *
+ * Weak canonicalisation, so a package that has since been moved away still
+ * normalises. A path that cannot be resolved at all falls back to its literal
+ * spelling: the only consequence is that one directory named two ways reloads
+ * instead of being reused, which costs time but never returns wrong weights.
+ */
+std::string canonical_model_dir(const std::string &model_dir) {
+  try {
+    return std::filesystem::weakly_canonical(std::filesystem::path(model_dir))
+      .string();
+  } catch (const std::exception &) {
+    return model_dir;
+  }
+}
+
+/**
+ * @brief Whether the model already in memory answers @p request.
+ * @note The caller must hold g_mutex; a load publishes g_model and
+ *       g_loaded_request together under it, so the two cannot disagree here.
+ */
+bool loaded_model_answers(const LoadRequest &request) {
+  return g_initialized.load(std::memory_order_acquire) && g_model != nullptr &&
+         g_loaded_request.has_value() && *g_loaded_request == request;
+}
+
 } // namespace
 
 #ifdef ENABLE_TEST
@@ -172,6 +252,9 @@ void setModelForTest(std::unique_ptr<causallm::Transformer> model,
   g_architecture = architecture;
   g_last_output.clear();
   g_chat_template.reset();
+  // An injected model answers no load request until a test says which one, so
+  // a later loadModel() cannot mistake it for the model it asked for.
+  g_loaded_request.reset();
 }
 
 void resetForTest() {
@@ -182,6 +265,7 @@ void resetForTest() {
   }
   g_model.reset();
   g_initialized.store(false, std::memory_order_release);
+  g_loaded_request.reset();
   g_architecture.clear();
   g_use_chat_template = false;
   g_verbose = false;
@@ -330,6 +414,47 @@ static std::string resolve_model_path(const std::string &model_key,
   return model_path;
 }
 
+/** @brief The request loadModel() answers for these arguments. */
+static LoadRequest builtin_load_request(BackendType compute,
+                                        ModelType modeltype,
+                                        ModelQuantizationType quant_type,
+                                        const std::string &model_name) {
+  return LoadRequest{
+    LoadRequest::Source::BuiltinType, compute, modeltype, quant_type,
+    canonical_model_dir(resolve_model_path(model_name, quant_type))};
+}
+
+/** @brief The request loadModelFromPath() answers for these arguments. */
+static LoadRequest package_load_request(BackendType compute,
+                                        const std::string &model_dir) {
+  // The enums say nothing about a package directory and operator== ignores
+  // them for this source; they are filled only because C++ gives these enums
+  // no "not applicable" enumerator.
+  return LoadRequest{LoadRequest::Source::PackageDirectory, compute,
+                     CAUSAL_LM_MODEL_QWEN3_0_6B, CAUSAL_LM_QUANTIZATION_UNKNOWN,
+                     canonical_model_dir(model_dir)};
+}
+
+#ifdef ENABLE_TEST
+namespace causal_lm_api_test {
+
+void setLoadedBuiltinRequestForTest(BackendType compute, ModelType model_type,
+                                    ModelQuantizationType quant_type) {
+  const char *model_name = get_model_name_from_type(model_type);
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_loaded_request = builtin_load_request(
+    compute, model_type, quant_type, model_name != nullptr ? model_name : "");
+}
+
+void setLoadedPackageRequestForTest(BackendType compute,
+                                    const std::string &model_dir) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_loaded_request = package_load_request(compute, model_dir);
+}
+
+} // namespace causal_lm_api_test
+#endif
+
 static bool check_file_exists(const std::string &path) {
   struct stat buffer;
   return (stat(path.c_str(), &buffer) == 0);
@@ -463,28 +588,40 @@ ErrorCode registerModel(const char *model_name, const char *arch_name,
  *       load_weight() (and so does the SDK facade); the API load path used to
  *       skip it, which left backends whose weights need a repack running a
  *       different weight layout than the runner for the same package.
+ *
+ * @note Nothing the caller can observe is written until the replacement model
+ *       is built and its weights are in memory. A load that fails -- by
+ *       returning or by throwing out of initialize()/load_weight() -- leaves
+ *       the previously loaded model loaded, runnable and described by its own
+ *       chat template and identity. The cost is that both models are resident
+ *       for the length of the swap, which is the price of not being left with
+ *       neither.
+ *
+ * @param request what the caller asked for; recorded with the model it
+ *                produced so a repeat of the same request can reuse it
  */
 static ErrorCode finish_load(json &cfg, json &generation_cfg, json &nntr_cfg,
-                             const std::string &model_dir_path) {
+                             const std::string &model_dir_path,
+                             const LoadRequest &request) {
   // Decoding policy is the package's to state, exactly as the runner reads it.
-  g_do_sample_default =
+  const bool do_sample_default =
     generation_cfg.is_object() && generation_cfg.value("do_sample", false);
 
   // The chat template and its render defaults belong to the model package.
-  g_chat_template_context = causallm::chatTemplateContext(nntr_cfg);
+  json chat_template_context = causallm::chatTemplateContext(nntr_cfg);
+  std::unique_ptr<causallm::ChatTemplate> chat_template;
   if (causallm::ChatTemplate::Exists(model_dir_path)) {
     try {
-      g_chat_template = std::make_unique<causallm::ChatTemplate>(
+      chat_template = std::make_unique<causallm::ChatTemplate>(
         causallm::ChatTemplate::Load(model_dir_path));
       std::cout << "[Info] Chat template loaded from "
-                << g_chat_template->sourcePath() << std::endl;
+                << chat_template->sourcePath() << std::endl;
     } catch (const std::exception &e) {
-      g_chat_template.reset();
+      chat_template.reset();
       std::cerr << "[Warning] Failed to load chat template: " << e.what()
                 << "; prompts will be fed as given." << std::endl;
     }
   } else {
-    g_chat_template.reset();
     std::cout << "[Info] No chat template in " << model_dir_path
               << "; prompts will be fed as given." << std::endl;
   }
@@ -528,24 +665,33 @@ static ErrorCode finish_load(json &cfg, json &generation_cfg, json &nntr_cfg,
     }
   }
 
+  // Build the replacement to completion before touching the live model.
+  auto next_model = causallm::Factory::Instance().create(
+    architecture, cfg, generation_cfg, nntr_cfg);
+  if (!next_model) {
+    std::cerr << "Unknown architecture: " << architecture << std::endl;
+    return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+  }
+
+  next_model->initialize();
+  next_model->load_weight(weight_file);
+  next_model->repack_weight();
+
+  // Runnable now, so publish it. g_mutex is held, so no run is in flight and
+  // g_active_model is already null; clearing it keeps that an invariant of the
+  // swap rather than an assumption about the caller.
   {
     std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
     g_active_model = nullptr;
   }
   g_initialized.store(false, std::memory_order_release);
-  g_model = causallm::Factory::Instance().create(architecture, cfg,
-                                                 generation_cfg, nntr_cfg);
-  if (!g_model) {
-    std::cerr << "Unknown architecture: " << architecture << std::endl;
-    return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
-  }
-
-  g_model->initialize();
-  g_model->load_weight(weight_file);
-  g_model->repack_weight();
-
-  g_initialized.store(true, std::memory_order_release);
+  g_model = std::move(next_model);
   g_architecture = architecture;
+  g_chat_template = std::move(chat_template);
+  g_chat_template_context = std::move(chat_template_context);
+  g_do_sample_default = do_sample_default;
+  g_loaded_request = request;
+  g_initialized.store(true, std::memory_order_release);
   return CAUSAL_LM_ERROR_NONE;
 }
 
@@ -578,6 +724,16 @@ ErrorCode loadModelFromPath(BackendType compute, const char *model_dir) {
   std::lock_guard<std::mutex> lock(g_mutex);
   try {
     const std::string model_dir_path(model_dir);
+
+    // Already serving this package: keep the weights that are in memory.
+    const LoadRequest request = package_load_request(compute, model_dir_path);
+    if (loaded_model_answers(request)) {
+      std::cout << "[Info] " << model_dir_path
+                << " is already loaded; reusing the model in memory."
+                << std::endl;
+      return CAUSAL_LM_ERROR_NONE;
+    }
+
     if (!std::filesystem::exists(std::filesystem::path(model_dir_path) /
                                  "config.json") ||
         !std::filesystem::exists(std::filesystem::path(model_dir_path) /
@@ -613,7 +769,7 @@ ErrorCode loadModelFromPath(BackendType compute, const char *model_dir) {
     resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_dir_path);
 
     const ErrorCode ec =
-      finish_load(cfg, generation_cfg, nntr_cfg, model_dir_path);
+      finish_load(cfg, generation_cfg, nntr_cfg, model_dir_path, request);
     if (ec != CAUSAL_LM_ERROR_NONE)
       return ec;
 
@@ -649,6 +805,19 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
   std::lock_guard<std::mutex> lock(g_mutex);
   try {
 
+    // Already serving this model: keep the weights that are in memory. Nothing
+    // below can produce a different model for the same request, so re-reading
+    // them would cost a full load to arrive back where we already are -- and
+    // the caller would lose a working model for the duration.
+    const LoadRequest request =
+      builtin_load_request(compute, modeltype, quant_type, target_model_name);
+    if (loaded_model_answers(request)) {
+      std::cout << "[Info] " << target_model_name
+                << " is already loaded; reusing the model in memory."
+                << std::endl;
+      return CAUSAL_LM_ERROR_NONE;
+    }
+
     // Check if it's a registered in-memory config
     std::string input_name = std::string(target_model_name);
     std::string input_name_upper = input_name;
@@ -677,7 +846,10 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     json cfg;
     json generation_cfg;
     json nntr_cfg;
-    std::string model_dir_path;
+    // Both branches below read the package from the same directory, and it is
+    // the directory the request identity was built from.
+    const std::string model_dir_path =
+      resolve_model_path(target_model_name, quant_type);
 
     // Check in-memory map first
     if (g_model_registry.find(lookup_name) != g_model_registry.end()) {
@@ -698,9 +870,6 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       }
       ModelArchConfig &ac = g_arch_config_map[rm.arch_name];
       ModelRuntimeConfig &rc = rm.config;
-
-      // Strategy: Resolve path to find the weight file
-      model_dir_path = resolve_model_path(target_model_name, quant_type);
 
       // Populate JSONs from Arch Struct
       cfg["vocab_size"] = ac.vocab_size;
@@ -775,7 +944,6 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       // The model type is registered (enum), but specific configuration for
       // this quantization is not in memory. We must load config.json and
       // nntr_config.json from the model directory
-      model_dir_path = resolve_model_path(target_model_name, quant_type);
 
       // Load configuration files
       cfg = causallm::LoadJsonFile(model_dir_path + "/config.json");
@@ -789,7 +957,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     }
 
     const ErrorCode ec =
-      finish_load(cfg, generation_cfg, nntr_cfg, model_dir_path);
+      finish_load(cfg, generation_cfg, nntr_cfg, model_dir_path, request);
     if (ec != CAUSAL_LM_ERROR_NONE)
       return ec;
 
