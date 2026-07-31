@@ -1009,7 +1009,8 @@ __kernel void flash_attention_prefill_f16_xmx(
     const int M, const int N_kv, const int d,
     const int HD_Q, const int HD_KV, const int gqa,
     const int is_causal, const float scale, const int k_stride,
-    const float softcap, const int local_window) {
+    const float softcap, const int local_window,
+    const int ring_cap) {              // >0: K/V physical row = n % ring_cap
   const int lane = get_sub_group_local_id();
   const int sg = get_sub_group_id();       // 0..FXA_NSG-1 (d-slice owner)
   const int dbase = sg * FXA_DSUB;
@@ -1080,7 +1081,9 @@ __kernel void flash_attention_prefill_f16_xmx(
       if (n0 <= n_last) {
         const int kt = min(FXA_KT, n_last - n0 + 1);
         const int nk = n0 + ((lane < kt) ? lane : (kt - 1));
-        const __global half *krow = K + k_head_base + (long)nk * k_row_stride;
+        // physical cache row; the causal / window masks keep the LOGICAL index
+        const long pnk = (ring_cap > 0) ? (long)(nk % ring_cap) : (long)nk;
+        const __global half *krow = K + k_head_base + pnk * k_row_stride;
         FXA_CV c8[FXA_FRAG];
 #pragma unroll
         for (int f = 0; f < FXA_FRAG; ++f)
@@ -1137,6 +1140,7 @@ __kernel void flash_attention_prefill_f16_xmx(
         continue;
       const int kt = min(FXA_KT, n_last - n0 + 1);
       const int nk = n0 + ((lane < kt) ? lane : (kt - 1));
+      const long pnk = (ring_cap > 0) ? (long)(nk % ring_cap) : (long)nk;
       float sc[FXA_TM];
 #if FXA_NSG > 1 && FXA_XRED
 #pragma unroll
@@ -1161,7 +1165,7 @@ __kernel void flash_attention_prefill_f16_xmx(
       // and reads only its own slice, so a sub_group barrier suffices)
       sub_group_barrier(CLK_LOCAL_MEM_FENCE); // protect from prev-tile reads
       {
-        const __global half *vrow = V + v_head_base + (long)nk * (long)HD_KV;
+        const __global half *vrow = V + v_head_base + pnk * (long)HD_KV;
 #pragma unroll
         for (int c8i = 0; c8i < FXA_DSUB / 8; ++c8i)
           vstore8(vload8(c8i, vrow + dbase), c8i,
