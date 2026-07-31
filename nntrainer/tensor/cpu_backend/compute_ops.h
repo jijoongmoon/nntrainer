@@ -421,6 +421,25 @@ public:
                            unsigned int active_rows, unsigned int row_offset);
 
   /**
+   * @brief Reverse RMS normalization over the `active_rows` rows
+   *        (channel*height flattened, width() elements each) starting at
+   *        `row_offset`: out = out_scale * normalize(in * weight), with the
+   *        per-feature weight [1,1,1,W] folded INSIDE the RMS denominator (it
+   *        couples all features — NOT expressible as rmsnorm*gamma), out_scale
+   *        a [1,1,1,1] post-norm scalar, and the sum-of-squares accumulated in
+   *        FP32. in/out share shape; weight/out_scale may carry the weight
+   *        dtype (FP16 on an enable-fp16 build), which need not equal the
+   *        activation dtype. `in` is non-const: the FP32 host impl folds the
+   *        weight into `in` in place (the layer's original math, preserved —
+   *        no graph consumer reads the reverse-norm input after this op).
+   *        PLE post_norm.
+   */
+  virtual void rms_reverse_norm(Tensor &in, Tensor &out, const Tensor &weight,
+                                const Tensor &out_scale, float epsilon,
+                                unsigned int active_rows,
+                                unsigned int row_offset);
+
+  /**
    * @brief One residual-add operand: hidden = input (accumulate=false, the
    *        first operand) or hidden += input (accumulate=true). The neutral
    *        AdditionLayer calls this per input so the GPU backend can keep the

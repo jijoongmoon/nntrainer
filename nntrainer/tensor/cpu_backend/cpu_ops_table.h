@@ -379,6 +379,13 @@ public:
   // out = sigmoid(gate) + emb over the live rows (fp32-accumulated).
   void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
                    unsigned int active_rows, unsigned int row_offset) override;
+  // out = out_scale * normalize(in * weight) over the live rows — the host
+  // math moved verbatim from RMSReverseNormLayer (FP32 in place; FP16 via the
+  // FP32-temp block). PLE post_norm.
+  void rms_reverse_norm(Tensor &in, Tensor &out, const Tensor &weight,
+                        const Tensor &out_scale, float epsilon,
+                        unsigned int active_rows,
+                        unsigned int row_offset) override;
   // hidden = input (copy) / hidden += input (add) via host Tensor ops.
   void residual_op(Tensor &hidden, const Tensor &input,
                    bool accumulate) override;

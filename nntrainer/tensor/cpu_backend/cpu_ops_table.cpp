@@ -164,6 +164,108 @@ void CpuComputeOps::sigmoid_add(const Tensor &in1, const Tensor &in2,
   }
 }
 
+// out = out_scale * normalize(in * weight) over the live rows — the
+// PLE post_norm (RMSReverseNormLayer) host math, moved VERBATIM out of the
+// layer body (N4). ReverseRMSNorm order: x * weight -> normalize ->
+// multiply by out_scale; the per-feature weight sits INSIDE the RMS
+// denominator, so this is not rmsnorm*gamma. The FP32 path folds the weight
+// into `in` in place (the layer's original math — the reverse-norm input has
+// no other consumer). The FP16 path computes in an FP32 temporary and upcasts
+// weight/out_scale first: multiplying the FP32 temp by the FP16 tensors
+// directly would reinterpret their bytes as FP32 (Tensor::multiply ->
+// apply_broadcast reads getData<float>()) -> garbage.
+void CpuComputeOps::rms_reverse_norm(Tensor &in, Tensor &out,
+                                     const Tensor &weight,
+                                     const Tensor &out_scale, float epsilon,
+                                     unsigned int active_rows,
+                                     unsigned int row_offset) {
+  // Rebuild the layer's per-step window as a flattened-row view (the layer
+  // passed {1, C, to-from, W} views; every consumer has C==1, for which
+  // {1, 1, active_rows, W} at the same element offset is the identical
+  // memory region and the identical per-width-row math).
+  ml::train::TensorDim in_step_dim = in.getDim();
+  in_step_dim.batch(1);
+  in_step_dim.channel(1);
+  in_step_dim.height(active_rows);
+  ml::train::TensorDim out_step_dim = out.getDim();
+  out_step_dim.batch(1);
+  out_step_dim.channel(1);
+  out_step_dim.height(active_rows);
+
+  const size_t elem_off = (size_t)row_offset * in.width();
+  Tensor in_step = in.getSharedDataTensor(in_step_dim, elem_off, true);
+  Tensor out_step = out.getSharedDataTensor(out_step_dim, elem_off, true);
+
+  if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    // ReverseRMSNorm order: x * weight → normalize → multiply by out_scale
+
+    // Step 1: Multiply input by weight (BEFORE normalization)
+    in_step.multiply_i(weight);
+
+    // Step 2: Compute RMS normalization
+    // rsqrt(average(x^2) + eps)
+    auto t = in_step.multiply(in_step).average(3).add(epsilon);
+    t.inv_sqrt_i();
+
+    // Step 3: Apply normalization
+    in_step.multiply(t, out_step);
+
+    // Step 4: Apply output scale (AFTER normalization)
+    out_step.multiply_i(out_scale);
+  } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    // Host path (ARM CPU / non-GPU-resident): FP32-temp compute.
+    ml::train::TensorDim instep_dim = in_step_dim;
+    ml::train::TensorDim outstep_dim = out_step_dim;
+
+    instep_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+    outstep_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+
+    Tensor in_step32(instep_dim, true);
+    Tensor out_step32(outstep_dim, true);
+
+    in_step32.copyData(in_step);
+
+    // weight/out_scale share the activation dtype (packed=false), which is
+    // FP16 on an enable-fp16 build. Upcast the scale tensors to FP32 so every
+    // multiply below is dtype-matched (see the function comment).
+    ml::train::TensorDim weight32_dim = weight.getDim();
+    weight32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+    Tensor weight32(weight32_dim, true);
+    weight32.copyData(weight);
+
+    ml::train::TensorDim out_scale32_dim = out_scale.getDim();
+    out_scale32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+    Tensor out_scale32(out_scale32_dim, true);
+    out_scale32.copyData(out_scale);
+
+    // ReverseRMSNorm order: x * weight → normalize → multiply by out_scale
+
+    // Step 1: Multiply input by weight (BEFORE normalization)
+    in_step32.multiply_i(weight32);
+
+    // Step 2: Compute RMS normalization
+    auto t = in_step32.multiply(in_step32).average(3).add(epsilon);
+    t.inv_sqrt_i();
+
+    // Step 3: Apply normalization
+    in_step32.multiply(t, out_step32);
+
+    // Step 4: Apply output scale (AFTER normalization)
+    out_step32.multiply_i(out_scale32);
+
+    out_step.copyData(out_step32);
+#else
+    throw std::invalid_argument("Error: enable-fp16 is not set");
+#endif
+  } else {
+    // Unreachable from the layer (activations are FP32/FP16 only); loud like
+    // the sibling whole-ops rather than the layer's old silent no-op.
+    throw std::invalid_argument(
+      "CpuComputeOps::rms_reverse_norm: unsupported data type");
+  }
+}
+
 // hidden = input (copy) or hidden += input (add) on the host buffer. Mirrors
 // the core AdditionLayer's per-input copy()/add_i() (correct for host and UVM).
 void CpuComputeOps::residual_op(Tensor &hidden, const Tensor &input,
