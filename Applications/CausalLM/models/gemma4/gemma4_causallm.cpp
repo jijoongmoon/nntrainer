@@ -863,12 +863,10 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
 
 void Gemma4Transformer::registerCustomLayers() {
   auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
   auto tryRegister = [&](auto factory_fn) {
     try {
-      app_context->registerFactory(factory_fn);
+      ct_engine.registerLayerFactory("cpu", factory_fn);
     } catch (std::invalid_argument &e) {
       std::cerr << "failed to register factory, reason: " << e.what()
                 << std::endl;
