@@ -42,7 +42,9 @@
 #include <mha_core.h>
 #include <neuralnet.h>
 #include <nntrainer_error.h>
+#include <nntrainer_log.h>
 #include <residency_policy.h>
+#include <rms_reverse_norm.h>
 #include <tensor.h>
 
 #include <causal_lm.h>
@@ -564,6 +566,29 @@ void CausalLM::registerCustomLayers() {
   // lm_head is a core layer now (nntrainer/layers/llm), registered by
   // AppContext itself.
   (void)app_context;
+
+  // PLE post_norm (RMSReverseNormLayer) on the GPU context: its
+  // incremental_forwarding runs the reverse-norm as a GPU op (no host op inside
+  // the async GPU graph). Same central-registration pattern as the reshaped
+  // norm in Transformer::registerCustomLayers; inert on CPU-only builds, where
+  // there is no "gpu" context to register on.
+  try {
+    ct_engine.getRegisteredContext("gpu"); // throws when absent: the ONE
+                                           // benign silent case (no OpenCL
+                                           // in this build)
+    try {
+      ct_engine.registerLayerFactory(
+        "gpu", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+    } catch (std::invalid_argument &e) {
+      // A real registration failure (key collision, null factory) must be
+      // VISIBLE -- a silent registration failure is catastrophic (the very
+      // defect class 878dc9f4b exists for). Not rethrown: a second model
+      // instance legitimately re-registers the same key.
+      ml_logw("rms_reverse_norm registration on gpu failed: %s", e.what());
+    }
+  } catch (std::invalid_argument &e) {
+    // no "gpu" context -- benign (CPU-only build).
+  }
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
