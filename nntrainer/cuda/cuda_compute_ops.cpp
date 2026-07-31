@@ -22,6 +22,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include <acti_func.h> // ActivationType (apply_activation's ACT_NONE no-op)
 #include <compute_ops.h>
 #include <env_compat.h>
 #include <tensor.h>
@@ -29,6 +30,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -40,6 +43,93 @@
 #include <cuda_stream_manager.h>
 
 namespace nntrainer {
+
+namespace {
+
+/**
+ * @brief The one place this table admits a host body, and the one place it
+ *        refuses.
+ *
+ * INVARIANT: no host math in this op table may dereference an operand that
+ * lives in the device-only activation pool (cudaMalloc, armed by default on a
+ * discrete GPU via NNTR_CUDA_DEV_ACT). Every override's fall-through to the
+ * inherited CpuComputeOps body calls this first, so a missing/declined device
+ * path surfaces as a named error naming the op AND the operand, instead of a
+ * SIGSEGV several frames deep inside an AVX2 intrinsic.
+ *
+ * It also carries the coherence half: a host body that IS allowed to run must
+ * see the last device write, hence the async drain (a no-op in the default
+ * sync mode, and off entirely when engine != cuda).
+ *
+ * This never turns a working run into a failing one: an operand that trips it
+ * is memory the CPU cannot address, so the host body it guards would have
+ * faulted on the very next instruction.
+ *
+ * @param op       op name for the message (no backend prefix; added here)
+ * @param operands operands the host body will dereference; nullptr entries and
+ *                 unallocated tensors are skipped
+ */
+/**
+ * @brief Is @p p memory the CPU cannot address (a cudaMalloc allocation)?
+ *
+ * Deliberately NOT cuda::dev_only(): that helper short-circuits to false
+ * unless NNTR_ENGINE=="cuda", which is the right gate for code that must not
+ * create a CUDA context, but the wrong one HERE -- this table only exists
+ * because a CudaContext was constructed, and the pool it armed is device-only
+ * regardless of what the env says. An env-conditional guard would be exactly
+ * the "fix the symptom" shape this file is trying to remove.
+ */
+bool host_unreachable(const void *p) {
+  if (p == nullptr)
+    return false;
+  cudaPointerAttributes a{};
+  const bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess;
+  cudaGetLastError(); // benign "invalid pointer" state for plain host pointers
+  return ok && a.type == cudaMemoryTypeDevice;
+}
+
+void host_math_gate(const char *op,
+                    std::initializer_list<const Tensor *> operands) {
+  // finishIfAsync (not cuda::drain_if_async) for the same reason as above: the
+  // context exists here, so Global() cannot create one, and the drain must not
+  // hinge on the env.
+  nntrainer::cuda::StreamManager::Global().finishIfAsync();
+  const Tensor *blocked = nullptr;
+  unsigned int blocked_idx = 0, idx = 0;
+  for (const Tensor *t : operands) {
+    const unsigned int here = idx++;
+    if (t == nullptr)
+      continue;
+    if (host_unreachable(t->getData<char>())) {
+      blocked = t;
+      blocked_idx = here;
+      break;
+    }
+  }
+  if (blocked == nullptr)
+    return;
+
+  // A window view (getSharedDataTensor) carries no name of its own, so fall
+  // back to the operand position -- an unnamed operand must still be located.
+  std::string who = blocked->getName();
+  if (who.empty()) {
+    std::ostringstream w;
+    w << "#" << blocked_idx;
+    who = w.str();
+  }
+  std::ostringstream ss;
+  ss << "CudaComputeOps::" << op
+     << ": the host fallback cannot run on the device-only activation pool -- "
+        "operand '"
+     << who
+     << "' is device memory the CPU cannot address. The device path for this "
+        "op declined the call (unsupported dtype or shape, or its kernel gate "
+        "is off). Re-run with NNTR_CUDA_DEV_ACT=0 for a host-coherent pool, "
+        "or give this op a device implementation.";
+  throw std::runtime_error(ss.str());
+}
+
+} // namespace
 
 void CudaComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
                             unsigned int active_rows, unsigned int row_offset) {
@@ -63,6 +153,7 @@ void CudaComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
       return;
   }
 #endif
+  host_math_gate("swiglu", {&in1, &in2, &out});
   CpuComputeOps::swiglu(in1, in2, out, active_rows, row_offset);
 }
 
@@ -96,9 +187,10 @@ void CudaComputeOps::geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
   }
 #endif
 
-  // Host gelu fallback: sync first so the host read of GPU-produced gate/up
-  // is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
-  nntrainer::cuda::drain_if_async();
+  // Host gelu fallback: the gate syncs first so the host read of GPU-produced
+  // gate/up is coherent under NNTR_CUDA_ASYNC (no-op in sync mode), and
+  // refuses by name if an operand is device-only.
+  host_math_gate("geglu", {&in1, &in2, &out});
   CpuComputeOps::geglu(in1, in2, out, active_rows, row_offset);
 }
 
@@ -132,7 +224,7 @@ void CudaComputeOps::sigmoid_glu(const Tensor &in1, const Tensor &in2,
     }
   }
 #endif
-  nntrainer::cuda::drain_if_async();
+  host_math_gate("sigmoid_glu", {&in1, &in2, &out});
   CpuComputeOps::sigmoid_glu(in1, in2, out, active_rows, row_offset);
 }
 
@@ -161,7 +253,7 @@ void CudaComputeOps::sigmoid_add(const Tensor &in1, const Tensor &in2,
     }
   }
 #endif
-  nntrainer::cuda::drain_if_async();
+  host_math_gate("sigmoid_add", {&in1, &in2, &out});
   CpuComputeOps::sigmoid_add(in1, in2, out, active_rows, row_offset);
 }
 
@@ -179,9 +271,10 @@ void CudaComputeOps::scalar_mul(const Tensor &in, Tensor &out, float scale) {
     }
   }
 #endif
-  // Host multiply reads the GPU-produced UVM input on the CPU; sync first
-  // in async mode (no-op in default sync mode).
-  nntrainer::cuda::drain_if_async();
+  // Host multiply reads the GPU-produced UVM input on the CPU; the gate syncs
+  // first in async mode (no-op in default sync mode) and refuses by name on a
+  // device-only operand.
+  host_math_gate("scalar_mul", {&in, &out});
   CpuComputeOps::scalar_mul(in, out, scale);
 }
 
@@ -221,6 +314,7 @@ void CudaComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
     cudaGetLastError();
   }
 #endif
+  host_math_gate("softcap", {&in, &out});
   CpuComputeOps::softcap(in, out, cap, act_type);
 }
 
@@ -293,9 +387,10 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
       return;
   }
 #endif
-  // Host rmsnorm fallback: sync first so the host read of GPU-produced input is
-  // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
-  cuda::StreamManager::Global().finishIfAsync();
+  // Host rmsnorm fallback: the gate syncs first so the host read of
+  // GPU-produced input is coherent under NNTR_CUDA_ASYNC (no-op in sync mode),
+  // and refuses by name if in/out live in the device-only pool.
+  host_math_gate("rms_norm", {&in, &out, &gamma});
   if (dt == DT::FP32 && gt == DT::FP32) {
     rmsnorm_rows(in.getData<float>(), gamma.getData<float>(),
                  out.getData<float>(), rows, width, eps);
@@ -335,6 +430,114 @@ void CudaComputeOps::rms_norm(const Tensor &in, Tensor &out,
     TensorDim(1, 1, active_rows, width, out.getDim().getTensorType()), elem_off,
     true);
   rmsnorm_dispatch(in_win, gamma, out_win, active_rows, width, epsilon);
+}
+
+// Reverse-RMSNorm (per-layer-embedding post_norm): y = (x*w / rms(x*w)) *
+// out_scale, the per-feature weight folded INSIDE the denominator and the
+// sum of squares accumulated in FP32. Mirrors ClComputeOps::rms_reverse_norm:
+// same signature, same window arithmetic (data + row_offset*width), same
+// dtype contract (fp16 activation + fp16 weight/out_scale), and like the CL
+// kernel it does NOT fold the weight into `in` in place -- the doc'd contract
+// says no graph consumer reads the reverse-norm input after this op, and the
+// device kernel recomputes x*w in registers instead.
+void CudaComputeOps::rms_reverse_norm(Tensor &in, Tensor &out,
+                                      const Tensor &weight,
+                                      const Tensor &out_scale, float epsilon,
+                                      unsigned int active_rows,
+                                      unsigned int row_offset) {
+#ifdef ENABLE_FP16
+  using DT = ml::train::TensorDim::DataType;
+  // Kill-switch, so a suspected numeric regression here is one env var away
+  // from a host-side A/B (with the device-only pool that A/B needs
+  // NNTR_CUDA_DEV_ACT=0 too -- the gate below says so by name).
+  static const bool gpu = []() {
+    const char *e = std::getenv("NNTR_CUDA_RMS_REVERSE_NORM");
+    return !(e && e[0] == '0');
+  }();
+  const unsigned int width = in.width();
+  if (gpu && active_rows > 0 && width > 0 && in.getDataType() == DT::FP16 &&
+      out.getDataType() == DT::FP16 && weight.getDataType() == DT::FP16 &&
+      out_scale.getDataType() == DT::FP16 && weight.width() == width &&
+      weight.size() == width && out_scale.size() == 1) {
+    const size_t elem_off = (size_t)row_offset * width;
+    auto *x =
+      reinterpret_cast<const unsigned short *>(in.getData<_FP16>() + elem_off);
+    auto *y =
+      reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+    auto *w = reinterpret_cast<const unsigned short *>(weight.getData<_FP16>());
+    auto *s =
+      reinterpret_cast<const unsigned short *>(out_scale.getData<_FP16>());
+    // All four operands must be device-readable: the activations come from the
+    // device-only (or managed) activation pool, the weight/out_scale from the
+    // managed weight pool. dev_accessible accepts Managed and pinned-mapped
+    // too, so this engages on integrated / WDDM pools as well.
+    if (nntrainer::cuda::dev_accessible(x) &&
+        nntrainer::cuda::dev_accessible(y) &&
+        nntrainer::cuda::dev_accessible(w) &&
+        nntrainer::cuda::dev_accessible(s) &&
+        nntrainer::cuda::cuda_rms_reverse_norm_fp16(x, w, s, y, epsilon,
+                                                    active_rows, width))
+      return;
+  }
+#endif
+  // FP32 activations, or a weight/out_scale dtype the kernel cannot bind: the
+  // inherited host FP32-temp math is the DESIGNED path there (same routing the
+  // OpenCL table takes), but it dereferences all four operands on the host.
+  host_math_gate("rms_reverse_norm", {&in, &out, &weight, &out_scale});
+  CpuComputeOps::rms_reverse_norm(in, out, weight, out_scale, epsilon,
+                                  active_rows, row_offset);
+}
+
+// One residual-add operand. hidden = input is a copy, and Tensor::copy routes
+// through scopy_fp16/scopy_fp32 -- overridden in this table, device-aware --
+// so the inherited body is already correct for it. hidden += input is NOT:
+// Tensor::add_i lands on ele_add_fp16, host math with no override here, which
+// faults on a device-only activation. Give the accumulate form its own device
+// kernel (the same cuda_add_fp16 the 2-input AdditionLayer fast path uses, so
+// the numerics are the ones this backend already ships) and gate the rest.
+void CudaComputeOps::residual_op(Tensor &hidden, const Tensor &input,
+                                 bool accumulate) {
+#ifdef ENABLE_FP16
+  using DT = ml::train::TensorDim::DataType;
+  if (accumulate && hidden.getDataType() == DT::FP16 &&
+      input.getDataType() == DT::FP16 && hidden.size() == input.size() &&
+      hidden.size() > 0) {
+    static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
+    if (gpu) {
+      auto *h = reinterpret_cast<unsigned short *>(hidden.getData<_FP16>());
+      auto *i = reinterpret_cast<const unsigned short *>(input.getData<_FP16>());
+      // In-place accumulate (dst aliases operand a): the kernel is pure
+      // element-wise, one read and one write per index, so aliasing is safe.
+      if (nntrainer::cuda::dev_accessible(h) &&
+          nntrainer::cuda::dev_accessible(i) &&
+          nntrainer::cuda::cuda_add_fp16(h, i, h, (unsigned int)hidden.size()))
+        return;
+    }
+  }
+#endif
+  if (accumulate) {
+    // add_i -> host ele_add_*: must not run on a device-only operand.
+    host_math_gate("residual_op", {&hidden, &input});
+  } else {
+    // copy -> scopy_* (device-aware in this table). Still drain so a
+    // host-coherent copy sees the last device write.
+    nntrainer::cuda::StreamManager::Global().finishIfAsync();
+  }
+  CpuComputeOps::residual_op(hidden, input, accumulate);
+}
+
+// Fused activation epilogue. No device kernel exists (and the LLM graphs never
+// set a fused activation on an FC), so this override exists purely to hold the
+// invariant: run the inherited host ActiFunc when the output is host
+// reachable, refuse by name when it is not.
+void CudaComputeOps::apply_activation(Tensor &out, int act_type) {
+  // ACT_NONE is a no-op in every impl -- it must stay one here too, or the
+  // guard would refuse a call that touches nothing. (Every in-tree caller
+  // already filters it out; this keeps the op's contract self-contained.)
+  if (static_cast<ActivationType>(act_type) == ActivationType::ACT_NONE)
+    return;
+  host_math_gate("apply_activation", {&out});
+  CpuComputeOps::apply_activation(out, act_type);
 }
 
 // FC GEMM: output = input * weight. QS4CX weight -> fused dequant-GEMM on
@@ -457,7 +660,11 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
       "dot(), which would read zero-filled pages. Re-run with "
       "NNTR_CUDA_DROP_PLAIN=0, and use NNTR_CUDA_FC_DBG=1 to see why the "
       "device path declined.");
-  cuda::StreamManager::Global().finishIfAsync();
+  // Same class of defect as the dropped payload above, one step earlier: the
+  // host dot() also READS input and WRITES output through host pointers, which
+  // is a fault (not silently wrong numbers) when the activation pool is
+  // device-only. Refuse by name; the gate also carries the async drain.
+  host_math_gate("fc", {&input, &output});
   input.dot(weight, output, false, false);
 }
 

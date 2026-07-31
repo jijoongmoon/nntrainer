@@ -14,9 +14,15 @@
  *          ComputeOps base): engine=cuda tensors are Unified Memory
  *          (host-coherent), so every op the CUDA backend does not accelerate
  *          runs correctly via the CPU implementation over the managed
- *          buffers. This class overrides only the element-wise decode ops
- *          (swiglu / scalar_mul / softcap); each override falls back to the
- *          inherited host body when its device contract is not met.
+ *          buffers -- but ONLY while the pool is managed. On a discrete GPU
+ *          the context auto-arms the device-only activation pool, and there an
+ *          inherited host body dereferences cudaMalloc memory.
+ *
+ *          INVARIANT this table enforces: every whole-op a layer dispatches
+ *          through ComputeOps either has a device implementation here, or
+ *          refuses at a NAMED guard (host_math_gate) -- it never silently runs
+ *          host math on a device-only pointer. Each override therefore ends in
+ *          host_math_gate() before delegating to the inherited body.
  */
 
 #ifndef __CUDA_COMPUTE_OPS_H__
@@ -93,6 +99,45 @@ public:
   void rms_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
                 float epsilon, unsigned int active_rows,
                 unsigned int row_offset) override;
+
+  /**
+   * @brief Reverse-RMSNorm (per-layer-embedding post_norm) whole-op:
+   *        y = (x*w / rms(x*w)) * out_scale, the per-feature weight folded
+   *        INSIDE the denominator. fp16 device kernel
+   *        (cuda_rms_reverse_norm_fp16, FP32 sum-of-squares) on
+   *        device-accessible operands, else the named guard / inherited host
+   *        body. Kill-switch NNTR_CUDA_RMS_REVERSE_NORM=0.
+   *
+   *        Without this override the op inherited CpuComputeOps' host
+   *        FP32-temp math, which on the device-only activation pool faulted
+   *        inside avx2::vcvt_f16_f32 -- the gap this table's invariant exists
+   *        to make impossible.
+   */
+  void rms_reverse_norm(Tensor &in, Tensor &out, const Tensor &weight,
+                        const Tensor &out_scale, float epsilon,
+                        unsigned int active_rows,
+                        unsigned int row_offset) override;
+
+  /**
+   * @brief One residual-add operand: hidden = input, or hidden += input.
+   *        The accumulate form is a fp16 device kernel (cuda_add_fp16) on
+   *        device-accessible operands -- the inherited host body reaches
+   *        Tensor::add_i -> ele_add_fp16, host math this table does not
+   *        override. The copy form delegates: Tensor::copy routes through
+   *        scopy_fp16, which IS device-aware here. Kill-switch
+   *        NNTR_CUDA_ELTWISE=0 (then the named guard refuses on a device-only
+   *        pool rather than faulting).
+   */
+  void residual_op(Tensor &hidden, const Tensor &input,
+                   bool accumulate) override;
+
+  /**
+   * @brief Fused activation epilogue. No device kernel: the LLM stack never
+   *        sets a fused activation on an FC, so this exists to hold the
+   *        invariant -- run the inherited host ActiFunc on a host-reachable
+   *        output, refuse by name on a device-only one.
+   */
+  void apply_activation(Tensor &out, int act_type) override;
 
   /**
    * @brief FC GEMM whole-op: output = input * weight. QS4CX weight -> fused
