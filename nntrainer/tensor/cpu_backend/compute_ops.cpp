@@ -430,6 +430,11 @@ void ComputeOps::sigmoid_add(const Tensor &, const Tensor &, Tensor &,
                              unsigned int, unsigned int) {
   NI(sigmoid_add);
 }
+void ComputeOps::rms_reverse_norm(Tensor &, Tensor &, const Tensor &,
+                                  const Tensor &, float, unsigned int,
+                                  unsigned int) {
+  NI(rms_reverse_norm);
+}
 void ComputeOps::residual_op(Tensor &, const Tensor &, bool) {
   NI(residual_op);
 }
