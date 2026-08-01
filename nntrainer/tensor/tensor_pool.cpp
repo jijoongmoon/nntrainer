@@ -296,10 +296,6 @@ void TensorPool::allocate(bool init) {
    */
   static const bool force_arena_zero = nntr_env_on("NNTR_WEIGHT_ARENA_ZERO");
   const bool arena_zero = init || force_arena_zero;
-  mem_pool->allocate(arena_zero);
-  if (!arena_zero)
-    ml_logd("TensorPool::allocate: weight-arena zero-fill SKIPPED (%zu B)",
-            minMemoryRequirement());
 
   /** S0: planner-decided static residency. The backend allocator (resolved
    * once) tells us whether GPU cl_mem residency is even possible. INERT: the
@@ -394,7 +390,15 @@ void TensorPool::allocate(bool init) {
   }
 #endif
 
-  mem_pool->allocate();
+  // ONE allocate() for this pool, and it happens HERE -- after the [kvi8-mem]
+  // pre-pass above, which must hand the ClBufferPool its SVM-only token set
+  // before the cl_mem plane is created. The zero-fill decision is taken above
+  // (arena_zero) and passed through; calling allocate() at the decision site
+  // as well throws "Memory pool is already allocated".
+  mem_pool->allocate(arena_zero);
+  if (!arena_zero)
+    ml_logd("TensorPool::allocate: weight-arena zero-fill SKIPPED (%zu B)",
+            minMemoryRequirement());
 
   /** set the pointers using the token for all the tensors */
   for (auto &spec : pool) {
