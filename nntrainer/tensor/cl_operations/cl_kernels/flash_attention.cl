@@ -656,6 +656,10 @@ __kernel void flash_attention_prefill_f16_blockq(
   // of each WI's fv_hsum partial (no LDS staging, no barriers). The reduce is
   // called uniformly across lanes (m0/n/M are WG-uniform, r is the loop var),
   // so the per-row causal `continue` does not break subgroup uniformity.
+  // UNION NOTE: the [window-skip] lower bound (n_lo) and the ring wrap compose.
+  // n_lo is in ABSOLUTE key space and only skips keys already masked for every
+  // row of this tile; the ring wrap only translates absolute n to the physical
+  // storage row. Neither observes the other.
   for (int n = n_lo; n <= n_last; ++n) {
     // Ring: physical cache row = n % ring_cap (ring_cap<=0: linear).
     // Only the STORAGE row is wrapped; the causal / window masks below keep

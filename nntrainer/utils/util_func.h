@@ -177,6 +177,118 @@ void checkedRead(ReadSource src, char *array, std::streamsize size,
                  const char *error_msg, size_t start_offset,
                  bool read_from_offset);
 
+#if !defined(_WIN32)
+/**
+ * @brief One read-only mapping of a model file, shared by every load worker,
+ *        whose resident size is bounded by construction.
+ *
+ * WHAT THIS REPLACES. The inference loaders used to mmap the WHOLE model file
+ * once per graph node, on up to eight workers, and munmap it when that node's
+ * read finished. Two costs: the address space is multiplied by the worker
+ * count (large models hit the per-process VA and map-count limits on Android,
+ * and the readahead advice is re-issued per node), and the staging peak tracks
+ * the largest single weight record, because every page a worker touched stays
+ * resident until its own munmap. Measured on a 3.2 GB package whose per-layer
+ * embedding is one 1838 MB record: the process's own reported peak was
+ * 2569 MB, of which ~1.6 GB was source-file staging.
+ *
+ * WHY NODE GRANULARITY IS NOT ENOUGH. "Drop the node's range when the node's
+ * read ends" is exactly what the per-node munmap already did, and 2569 MB is
+ * what it measures. A bound that is stated per record cannot bound a model
+ * whose largest record is 1838 MB. The bound has to hold WITHIN one record.
+ *
+ * HOW THIS BOUNDS IT. The single mmap -> weight-pool copy is checkedRead()'s
+ * `const char *` branch, one file below this declaration. While a copy is
+ * running inside the registered window it advances in chunks and releases each
+ * whole page STRICTLY BEHIND the copy cursor with madvise(MADV_DONTNEED).
+ * Therefore:
+ *
+ *   - staging residency <= concurrency * chunk, for every model, independent
+ *     of any record's size;
+ *   - every source page is faulted exactly once and released exactly once --
+ *     there is no re-fault, because nothing behind the cursor is read again;
+ *   - no sampling thread, no mincore sweep, no threshold to tune.
+ *
+ * A page is released only when it lies wholly behind the cursor, so a page
+ * that also holds bytes of the neighbouring record -- which another worker may
+ * be reading right now -- is never touched. At most the first and last partial
+ * page of each record stay resident until the whole mapping is dropped.
+ *
+ * WHY DROPPING IS SAFE. The mapping is PROT_READ MAP_PRIVATE over a file, so
+ * it owns no private copies; MADV_DONTNEED zaps the page-table entries and the
+ * next touch re-reads the same file bytes. (This is NOT true of private
+ * ANONYMOUS memory, where MADV_DONTNEED hands back zero pages -- do not copy
+ * this pattern to a heap buffer.)
+ *
+ * ONLY ONE WINDOW AT A TIME, AND IT IS KEYED ON THE POINTER. A process may
+ * have several loads running at once; the first to construct one of these
+ * registers the window and the others do not (they log and run without the
+ * release). checkedRead therefore decides per copy, by asking whether the
+ * SOURCE POINTER lies in [base, end) -- not whether some window is registered.
+ * Distinct mappings never overlap, so a source belonging to a different load,
+ * or to a caller-owned buffer, is outside the window by construction and takes
+ * the plain memcpy. Keying it on window presence instead makes every read of
+ * every other load throw, on a load worker, which is std::terminate.
+ *
+ * NNTR_LOAD_REAP_MB keeps its old name, units and meaning -- how many MiB of
+ * source staging the load may hold resident -- and only its enforcement
+ * changed, from a sampling sweep to this. It overrides the default budget; 0
+ * disables the release entirely and the mapping then keeps every page it
+ * touched until the load ends.
+ *
+ * NOTE posix_madvise(POSIX_MADV_DONTNEED) cannot be used for this: glibc
+ * documents it as a no-op, so the plain-POSIX spelling silently frees nothing.
+ * madvise(MADV_DONTNEED) is required.
+ */
+class LoaderStagingMap {
+public:
+  /**
+   * @brief maps @a length bytes of @a fd read-only and registers the mapping
+   *        as this process's load staging window
+   * @param fd file descriptor of the model file, kept open by the caller
+   * @param length bytes to map, normally the whole file
+   * @param concurrency number of workers that will read through this mapping;
+   *        the per-copy chunk is the staging budget divided by it
+   * @param what human readable name of the file, used in error messages
+   * @throw std::runtime_error if mmap fails. Constructing here rather than in
+   *        a worker is deliberate: the failure used to be thrown out of a
+   *        std::thread body with no handler, which is std::terminate.
+   */
+  LoaderStagingMap(int fd, size_t length, size_t concurrency, const char *what);
+
+  /**
+   * @brief releases the mapping's pages and unmaps it
+   */
+  ~LoaderStagingMap();
+
+  LoaderStagingMap(const LoaderStagingMap &) = delete;
+  LoaderStagingMap &operator=(const LoaderStagingMap &) = delete;
+
+  /**
+   * @brief the shared read-only view to hand to every load worker
+   * @return pointer to the first mapped byte
+   */
+  const char *view() const { return base_; }
+
+  /**
+   * @brief mapped length
+   * @return bytes mapped
+   */
+  size_t size() const { return length_; }
+
+  /**
+   * @brief staging budget, i.e. the source-file residency this load may hold
+   * @return budget in bytes; 0 means the per-chunk release is disabled
+   */
+  static size_t budgetBytes();
+
+private:
+  char *base_;      /**< first mapped byte */
+  size_t length_;   /**< mapped length in bytes */
+  bool registered_; /**< whether this map is the registered staging window */
+};
+#endif
+
 /**
  * @brief same as file.write except it checks if fail to write the file
  *

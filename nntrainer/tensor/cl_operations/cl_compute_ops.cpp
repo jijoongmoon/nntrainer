@@ -61,6 +61,10 @@ bool cl_q4_0_shape_eligible(unsigned int N, unsigned int K) {
 }
 } // namespace
 
+/**
+ * @brief OpenCL ComputeOps table: the accelerator-backed subset of the
+ *        ComputeOps interface, dispatched through ClContext's ContextData.
+ */
 class ClComputeOps : public ComputeOps {
 public:
   // ── Accelerator-only Q4_0 / INT4 GEMM/GEMV ────────────────
