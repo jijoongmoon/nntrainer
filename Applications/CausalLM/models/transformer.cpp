@@ -10,6 +10,7 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <cstdio>
 #include <fstream>
 #include <mutex>
 
@@ -101,6 +102,12 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
                              ", Config Type: " + config_model_type_str);
   }
 
+  // Record the role before any setupParameters() call so config parsing can
+  // key decoder-only behaviour off it. Transformer is a virtual base of every
+  // model, initialized once by the most-derived constructor, so this stays put
+  // for the whole construction sequence.
+  MODEL_TYPE = model_type;
+
   const bool skip_tokenizer = nntr_cfg.contains("skip_tokenizer") &&
                               nntr_cfg["skip_tokenizer"].get<bool>();
 
@@ -179,6 +186,61 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                              ? cfg["sliding_window_pattern"].get<unsigned int>()
                              : 1;
   MAX_POSITION_EMBEDDINGS = cfg["max_position_embeddings"].get<unsigned int>();
+  // The RoPE frequency tables are precomputed for positions
+  // [0, MAX_POSITION_EMBEDDINGS) (precompute_freqs in mha_core), so a runtime
+  // window past the model cap reads beyond the table -- SIGSEGV in
+  // compute_rotary_emb_value once prefill crosses that position. Clamp
+  // instead of crashing: positions past the trained range carry no value,
+  // and a genuine long-context model raises its config cap so the clamp
+  // adapts.
+  if (MAX_SEQ_LEN > MAX_POSITION_EMBEDDINGS ||
+      INIT_SEQ_LEN > MAX_POSITION_EMBEDDINGS) {
+    std::fprintf(stderr,
+                 "[causallm] WARNING: requested window (max_seq_len=%u, "
+                 "init_seq_len=%u) exceeds the model's "
+                 "max_position_embeddings=%u; clamping (RoPE tables only "
+                 "cover the model range).\n",
+                 MAX_SEQ_LEN, INIT_SEQ_LEN, MAX_POSITION_EMBEDDINGS);
+    if (MAX_SEQ_LEN > MAX_POSITION_EMBEDDINGS)
+      MAX_SEQ_LEN = MAX_POSITION_EMBEDDINGS;
+    if (INIT_SEQ_LEN > MAX_SEQ_LEN)
+      INIT_SEQ_LEN = MAX_SEQ_LEN;
+  }
+  // The generation budget has to stay strictly inside the window just settled
+  // above. CausalLM sizes its token history once as BATCH_SIZE * MAX_SEQ_LEN
+  // and indexes it as ids_history[b * MAX_SEQ_LEN + pos] with no bounds check,
+  // while run() derives the prompt budget as the *unsigned* difference
+  // MAX_SEQ_LEN - NUM_TO_GENERATE: with NUM_TO_GENERATE >= MAX_SEQ_LEN that
+  // difference wraps to ~4e9, the prompt-truncation branch is never taken and
+  // the whole prompt is written past the row stride of every batch row and off
+  // the end of the last one. The clamp above can produce exactly that relation
+  // -- a 512-position model driven with max_seq_len=2048, num_to_generate=1024
+  // keeps its 1024 budget against a 512 window.
+  //
+  // This belongs here, in the same function that (re-)reads num_to_generate,
+  // so it holds after every call: a derived Transformer whose constructor calls
+  // setupParameters() again once the CausalLM base is built (Gemma4Transformer
+  // does) reloads the raw value, which would silently drop a guard placed
+  // anywhere else.
+  //
+  // Decoders only. Encoder models (BertTransformer, XLMRobertaForMaskedLM) also
+  // derive from Transformer and ship configs with
+  // num_to_generate == max_seq_len == 512, where the field is inert and no
+  // token history exists; they must neither be warned about nor rewritten.
+  if (MODEL_TYPE == ModelType::CAUSALLM &&
+      (NUM_TO_GENERATE < 0 ||
+       static_cast<unsigned int>(NUM_TO_GENERATE) >= MAX_SEQ_LEN)) {
+    const int fitted = (NUM_TO_GENERATE < 0 || MAX_SEQ_LEN == 0)
+                         ? 0
+                         : static_cast<int>(MAX_SEQ_LEN - 1);
+    std::fprintf(stderr,
+                 "[causallm] WARNING: num_to_generate=%d does not fit in the "
+                 "context window (max_seq_len=%u); clamping to %d so the "
+                 "prompt keeps at least one token and the token history stays "
+                 "inside its buffer.\n",
+                 NUM_TO_GENERATE, MAX_SEQ_LEN, fitted);
+    NUM_TO_GENERATE = fitted;
+  }
   if (cfg.contains("rope_theta")) {
     ROPE_THETA = cfg["rope_theta"].get<unsigned int>();
   } else if (cfg.contains("rope_parameters") &&
