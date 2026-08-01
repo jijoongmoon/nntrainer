@@ -10,8 +10,10 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 
@@ -540,6 +542,131 @@ void Transformer::save_weight(
                              std::string(e.what()));
   }
 };
+
+/**
+ * @brief Report the embedding-table nodes of the compiled graph.
+ */
+std::vector<Transformer::EmbeddingTable>
+Transformer::list_embedding_tables() const {
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "Transformer model is not initialized. Please call "
+      "initialize() before list_embedding_tables().");
+  }
+
+  std::vector<EmbeddingTable> tables;
+  auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
+
+  for (const auto &node : nn->getFlatGraph()) {
+    const std::string type = node->getType();
+    if (type != EmbeddingLayer::type &&
+        type != nntrainer::TieWordEmbedding::type)
+      continue;
+
+    EmbeddingTable table{node->getName(), type, 0u, 0u};
+    // A lookup node that already reads a sidecar manifest requests no weight
+    // at all (EmbeddingLayer::finalize returns before requestWeight), so it
+    // carries no dimensions to report and nothing left to split.
+    if (type == EmbeddingLayer::type && node->getNumWeights() == 1) {
+      const auto dim = node->getWeight(0).getDim();
+      table.rows = dim.height();
+      table.size = dim.width();
+    }
+    tables.push_back(table);
+  }
+
+  return tables;
+}
+
+/**
+ * @brief Save model weights with dtype conversion, routing named layers into
+ *        their own files.
+ */
+std::map<std::string, uint64_t> Transformer::save_weight_split(
+  const std::string &weight_path, ml::train::TensorDim::DataType dtype,
+  const std::map<std::string, ml::train::TensorDim::DataType> &layer_dtype_map,
+  const std::map<std::string, std::string> &routed_layers,
+  ml::train::ISA target_isa) {
+
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "Transformer model is not initialized. Please call "
+      "initialize() before save_weight_split().");
+  }
+
+  // The .bin container is a bare concatenation of per-layer records in graph
+  // order, which is the only reason a per-layer split is well defined. The
+  // safetensors container carries a header/index that names every tensor it
+  // holds, so pulling records out of it is a different operation entirely.
+  NNTR_THROW_IF(formatFromExtension(weight_path) !=
+                  ml::train::ModelFormat::MODEL_FORMAT_BIN,
+                std::invalid_argument)
+    << "sidecar split is defined only for the .bin container, not for "
+    << weight_path;
+
+  auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
+
+  std::ofstream main_file(weight_path,
+                          std::ios::out | std::ios::binary | std::ios::trunc);
+  NNTR_THROW_IF(!main_file.is_open(), std::runtime_error)
+    << "Failed to open weight file for writing: " << weight_path;
+
+  std::map<std::string, std::ofstream> side_files;
+  for (const auto &[layer_name, payload_path] : routed_layers) {
+    std::ofstream payload(payload_path,
+                          std::ios::out | std::ios::binary | std::ios::trunc);
+    NNTR_THROW_IF(!payload.is_open(), std::runtime_error)
+      << "Failed to open sidecar payload for writing: " << payload_path;
+    side_files.emplace(layer_name, std::move(payload));
+  }
+
+  // Same traversal, same dtype resolution and same per-layer writer as the
+  // MODEL_FORMAT_BIN branch of NeuralNetwork::save -- only the destination
+  // stream differs, which is what makes the union of the files byte-for-byte
+  // the single-file save. INFERENCE is not a choice here: it is the mode
+  // initialize() compiled with, and it is also what suppresses the optimizer
+  // and epoch/iteration trailers that save() would otherwise append.
+  std::vector<std::string> routed_seen;
+  for (const auto &node : nn->getFlatGraph()) {
+    const std::string &name = node->getName();
+    const auto dtype_it = layer_dtype_map.find(name);
+    const auto target_dtype =
+      (dtype_it != layer_dtype_map.end()) ? dtype_it->second : dtype;
+
+    auto side = side_files.find(name);
+    if (side == side_files.end()) {
+      node->save(main_file, false, ml::train::ExecutionMode::INFERENCE,
+                 target_dtype, target_isa);
+    } else {
+      node->save(side->second, false, ml::train::ExecutionMode::INFERENCE,
+                 target_dtype, target_isa);
+      routed_seen.push_back(name);
+    }
+  }
+
+  main_file.close();
+  for (auto &[layer_name, payload] : side_files) {
+    payload.close();
+  }
+
+  // A routed name that matches no node writes an empty payload and a manifest
+  // the runtime loader rejects only when the package is finally run. Refuse
+  // here instead of shipping that package.
+  for (const auto &[layer_name, payload_path] : routed_layers) {
+    NNTR_THROW_IF(std::find(routed_seen.begin(), routed_seen.end(),
+                            layer_name) == routed_seen.end(),
+                  std::invalid_argument)
+      << "sidecar layer '" << layer_name
+      << "' is not a node of the compiled graph";
+  }
+
+  std::map<std::string, uint64_t> written;
+  for (const auto &[layer_name, payload_path] : routed_layers) {
+    written[layer_name] =
+      static_cast<uint64_t>(std::filesystem::file_size(payload_path));
+  }
+  return written;
+}
 
 /**
  * @brief Repack all QS4CX weights after loading.

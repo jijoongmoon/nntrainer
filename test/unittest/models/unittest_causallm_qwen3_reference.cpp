@@ -63,4 +63,18 @@ TEST(Qwen3DifferentialTest, Q40CloseToFP32Reference) {
   causallm_test::runQ40DifferentialChecks(qwen3Model());
 }
 
+/**
+ * @brief A generated mmap-sidecar package loads and answers like its twin
+ *
+ * The single-table case (embedding-0 only). The fixture is tied, so the check
+ * first derives an untied source package from it by appending the transposed
+ * embedding table as the lm_head record -- what the production Qwen3 converter
+ * writes for an untied checkpoint -- and re-proves the HF reference logits
+ * through it before anything is quantized.
+ */
+TEST(Qwen3DifferentialTest, SidecarPackageMatchesSingleFilePackage) {
+  causallm_test::runSidecarPackageChecks(
+    qwen3Model(), causallm_test::SidecarUntieStrategy::APPEND_TRANSPOSED_HEAD);
+}
+
 } // namespace

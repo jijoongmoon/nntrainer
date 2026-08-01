@@ -683,6 +683,47 @@ void runFp32EmbeddingDifferentialChecks(const DifferentialModel &model);
 void runQ40EmbeddingDifferentialChecks(const DifferentialModel &model);
 
 /**
+ * @brief How to derive an UNTIED source package from a tied fixture
+ *
+ * The mmap sidecar split needs an untied lookup table and every committed
+ * fixture is tied, so the check unties one: config.json's tie_word_embeddings
+ * goes false and the bin gains the transposed head record an untied graph
+ * reads. Whether that record has to be appended or replaced depends on what
+ * the fixture's generator already wrote, which is a per-fixture fact, so the
+ * choice is made at the test site rather than guessed from the data.
+ */
+enum class SidecarUntieStrategy {
+  /** The tied bin has no head record (Qwen-family converters skip it when
+      tied) -- append the transposed embedding table */
+  APPEND_TRANSPOSED_HEAD,
+  /** The tied bin ends with the embedding table saved UNTRANSPOSED, which only
+      a tied graph (which ignores it) can carry -- replace it with the
+      transpose (generate_gemma4_reference.py) */
+  REPLACE_TRAILING_HEAD,
+};
+
+/**
+ * @brief Run the mmap-sidecar package checks for a model against its fixture
+ *
+ * Derives an untied FP32 source package from the fixture, proves it is still
+ * the fixture's model against the same HF reference logits, then generates two
+ * packages from it with nntr_quantize -- the sidecar split and its
+ * --no-sidecar twin -- and verifies:
+ *   - the generated config names a manifest, and the twin's does not;
+ *   - every manifest's rows * row_bytes equals its payload size;
+ *   - the emitted files are a byte partition of the single-file package;
+ *   - both packages LOAD through this harness (which resolves package-relative
+ *     paths the way every runtime loader does) and produce identical logits.
+ *
+ * Skips when the fixture or NNTR_QUANTIZE_BIN are absent.
+ *
+ * @param model Differential model descriptor
+ * @param strategy How to untie the fixture (see SidecarUntieStrategy)
+ */
+void runSidecarPackageChecks(const DifferentialModel &model,
+                             SidecarUntieStrategy strategy);
+
+/**
  * @brief Make FP32 data type variant
  * @return Tiny FP32 data type descriptor
  */

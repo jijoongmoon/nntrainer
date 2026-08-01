@@ -76,4 +76,23 @@ TEST(Gemma4DifferentialTest, Q40CloseToFP32Reference) {
   causallm_test::runQ40DifferentialChecks(gemma4Model());
 }
 
+/**
+ * @brief The TWO-table mmap-sidecar package loads and answers like its twin
+ *
+ * Gemma4 is the architecture that carries both routed lookup tables --
+ * embedding-0 and per_layer_input_embedding -- so it is the only in-tree cover
+ * for the two-manifest emission, the three-way byte partition (payload ++
+ * head-of-bin ++ payload ++ tail-of-bin, because the PLE table is loaded from
+ * inside layer 0, not at the front) and the two config keys
+ * embedding_file_name / ple_file_name being resolved together.
+ * The fixture bin already ends with an output_of_causallm record, but
+ * generate_gemma4_reference.py writes the embedding table there untransposed
+ * -- harmless for the tied graph that ignores it, wrong for the untied graph
+ * that reads it -- so the untie replaces that record rather than appending.
+ */
+TEST(Gemma4DifferentialTest, TwoTableSidecarPackageMatchesSingleFilePackage) {
+  causallm_test::runSidecarPackageChecks(
+    gemma4Model(), causallm_test::SidecarUntieStrategy::REPLACE_TRAILING_HEAD);
+}
+
 } // namespace

@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -472,6 +473,51 @@ namespace {
 constexpr const char *QUANTIZE_BIN_ENV = "NNTR_QUANTIZE_BIN";
 
 /**
+ * @brief The path-valued keys of nntr_config.json
+ *
+ * INVARIANT (the contract every consumer of a package must reproduce):
+ * a package is RELOCATABLE -- nntr_quantize writes these keys as bare
+ * filenames relative to the package directory, never as absolute paths -- and
+ * NOTHING in the model layer resolves them. Transformer's constructor receives
+ * a json, not a directory, so it opens whatever string it is handed relative
+ * to the PROCESS CWD. Resolution is therefore the caller's job, and every
+ * caller that hands a loaded config to a model must do it:
+ *
+ *   Applications/CausalLM/main.cpp                (resolveNntrConfigPath)
+ *   Applications/CausalLM/api/causal_lm_api.cpp   (three load sites)
+ *   this file                                     (three load sites, below)
+ *
+ * Hand-absolutizing one key (as this file used to do for tokenizer_file only)
+ * is what hides the omission: a generated single-file package names no other
+ * path, so the harness passes -- until the package is a sidecar package, whose
+ * embedding_file_name / ple_file_name then resolve against the runner's CWD
+ * and the load dies on "Failed to open LUT manifest".
+ */
+constexpr const char *NNTR_CONFIG_PATH_KEYS[] = {
+  "tokenizer_file", "embedding_file_name", "ple_file_name",
+  "module_config_path"};
+
+/**
+ * @brief Resolve every relative path-valued key against the package directory
+ * @param nntr_cfg Loaded nntr_config.json
+ * @param dir Directory the config was loaded from
+ * @note Mirrors resolveNntrConfigPath() in main.cpp / causal_lm_api.cpp:
+ *       absolute and empty values are left alone, so it is idempotent.
+ */
+void resolvePackagePaths(json &nntr_cfg, const std::filesystem::path &dir) {
+  for (const char *key : NNTR_CONFIG_PATH_KEYS) {
+    if (!nntr_cfg.contains(key) || !nntr_cfg[key].is_string())
+      continue;
+
+    std::filesystem::path value = nntr_cfg[key].get<std::string>();
+    if (value.empty() || value.is_absolute())
+      continue;
+
+    nntr_cfg[key] = (dir / value).string();
+  }
+}
+
+/**
  * @brief nntrainer configs loaded from a fixture directory
  */
 struct FixtureConfigs {
@@ -484,8 +530,9 @@ struct FixtureConfigs {
 /**
  * @brief Load model/generation/nntrainer configs from a fixture directory
  *
- * Overrides tokenizer_file to the tokenizer shipped in the fixture directory
- * so the test is self-contained.
+ * Resolves every relative path key against @a dir, then pins tokenizer_file to
+ * the tokenizer shipped in that directory so the test is self-contained even
+ * when a generator baked an absolute tokenizer path into the fixture.
  */
 FixtureConfigs loadFixtureConfigs(const std::filesystem::path &dir) {
   FixtureConfigs fc;
@@ -494,6 +541,7 @@ FixtureConfigs loadFixtureConfigs(const std::filesystem::path &dir) {
     causallm::LoadJsonFile((dir / "generation_config.json").string());
   fc.nntr_cfg = causallm::LoadJsonFile((dir / "nntr_config.json").string());
 
+  resolvePackagePaths(fc.nntr_cfg, dir);
   fc.nntr_cfg["tokenizer_file"] = (dir / "tokenizer.json").string();
 
   std::string bin_name = fc.nntr_cfg["model_file_name"].get<std::string>();
@@ -506,9 +554,13 @@ FixtureConfigs loadFixtureConfigs(const std::filesystem::path &dir) {
  */
 bool runQuantize(const std::string &quantize_bin,
                  const std::filesystem::path &fp32_dir,
-                 const std::filesystem::path &out_dir) {
+                 const std::filesystem::path &out_dir,
+                 const std::string &extra_args = "") {
   std::string cmd = quantize_bin + " " + fp32_dir.string() + " -o " +
-                    out_dir.string() + " --fc_dtype Q4_0 2>&1";
+                    out_dir.string() + " --fc_dtype Q4_0";
+  if (!extra_args.empty())
+    cmd += " " + extra_args;
+  cmd += " 2>&1";
   int ret = std::system(cmd.c_str());
   return ret == 0;
 }
@@ -571,6 +623,142 @@ bool tryLoadEmbeddingFixture(const DifferentialModel &model,
     skip_reason = "Fixture reference_embedding.json is empty";
     return false;
   }
+  return true;
+}
+
+// ===========================================================================
+// mmap sidecar package helpers
+// ===========================================================================
+
+/**
+ * @brief Read a whole file into a byte string
+ */
+std::string readFileBytes(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file)
+    throw std::runtime_error("failed to open " + path.string());
+
+  std::ostringstream buffer;
+  buffer << file.rdbuf();
+  return buffer.str();
+}
+
+/**
+ * @brief config.json section that carries the model dimensions
+ * @note Gemma-family fixtures nest them under "text_config".
+ */
+const json &modelDimSection(const json &cfg) {
+  return cfg.contains("text_config") ? cfg["text_config"] : cfg;
+}
+
+/**
+ * @brief Bytes one quantized row occupies, mirroring loadGgmlManifest()
+ * @return 0 when @a datatype / @a size has no sidecar row-block encoding
+ */
+size_t sidecarRowBytes(const std::string &datatype, unsigned int size) {
+  if (datatype == "q4_0")
+    return (size % 32 == 0) ? static_cast<size_t>(size) / 32 * 18 : 0;
+  if (datatype == "q6_k")
+    return (size % 256 == 0) ? static_cast<size_t>(size) / 256 * 210 : 0;
+  return 0;
+}
+
+/**
+ * @brief Build an UNTIED FP32 source package from a committed fixture
+ *
+ * Every committed CausalLM fixture is tie_word_embeddings=true, and the mmap
+ * sidecar split is defined only for an UNTIED lookup table -- a tied
+ * embedding-0 is a "tie_word_embeddings" node, which structurally has no
+ * sidecar path -- so a sidecar package cannot be generated from a fixture as
+ * committed. Untying is config.json's tie_word_embeddings (the sole owner of
+ * the rule, for base Transformer and Gemma4 alike), plus one bin edit, because
+ * an untied graph reads a head record that a tied graph does not:
+ *
+ *   embedding0          "embedding_layer", weight [vocab, dim]
+ *   output_of_causallm  "lm_head",         weight [dim, vocab]  (transposed;
+ *                                          lm_head.cpp:92 "LMHead layer's
+ *                                          tensor dim is transposed dim")
+ *
+ * In a tied checkpoint lm_head.weight IS embed_tokens.weight, so the head
+ * record is the transpose of the embedding table -- exactly what the
+ * production converters write for an untied checkpoint
+ * (res/qwen3/qwen3-0.6b/weight_converter.py:108, transpose=True). Which edit
+ * that takes depends on what the fixture generator already put in the bin:
+ *
+ *  APPEND_TRANSPOSED_HEAD   the tied bin has no head record at all
+ *      (weight_converter.py:107 skips it when tied) -- append one.
+ *
+ *  REPLACE_TRAILING_HEAD    the tied bin ends with a head record that is the
+ *      embedding table saved UNTRANSPOSED (generate_gemma4_reference.py:217
+ *      writes embed_tokens.weight as-is). A tied graph never reads it, so the
+ *      orientation went unnoticed; an untied graph does, so replace the
+ *      trailing record with the transpose.
+ *
+ * Either way the result is numerically the fixture's own model, which the
+ * caller proves by re-running the fixture's HF reference logits through it
+ * before anything is quantized -- so a wrong edit here fails loudly instead of
+ * silently making the rest of the test agree with itself.
+ *
+ * @return false with @a reason set when the fixture cannot supply what the
+ *         chosen strategy needs
+ */
+bool makeUntiedSourcePackage(const std::filesystem::path &fixture_dir,
+                             const std::filesystem::path &out_dir,
+                             SidecarUntieStrategy strategy,
+                             std::string &reason) {
+  auto model_cfg =
+    causallm::LoadJsonFile((fixture_dir / "config.json").string());
+  auto nntr_cfg =
+    causallm::LoadJsonFile((fixture_dir / "nntr_config.json").string());
+
+  const std::string bin_name = nntr_cfg["model_file_name"].get<std::string>();
+  const auto src_bin = fixture_dir / bin_name;
+  if (!std::filesystem::exists(src_bin)) {
+    reason = "FP32 weight file absent: " + src_bin.string();
+    return false;
+  }
+
+  const json &dims = modelDimSection(model_cfg);
+  if (!dims.contains("vocab_size") || !dims.contains("hidden_size")) {
+    reason = "fixture config.json has no vocab_size / hidden_size";
+    return false;
+  }
+
+  const auto vocab = dims["vocab_size"].get<unsigned int>();
+  const auto dim = dims["hidden_size"].get<unsigned int>();
+  const size_t elements = static_cast<size_t>(vocab) * dim;
+  const size_t table_bytes = elements * sizeof(float);
+
+  std::string bytes = readFileBytes(src_bin);
+  if (bytes.size() < table_bytes) {
+    reason = "fixture bin is smaller than its embedding table";
+    return false;
+  }
+
+  std::vector<float> table(elements);
+  std::memcpy(table.data(), bytes.data(), table_bytes);
+
+  std::vector<float> transposed(elements);
+  for (unsigned int row = 0; row < vocab; ++row)
+    for (unsigned int col = 0; col < dim; ++col)
+      transposed[static_cast<size_t>(col) * vocab + row] =
+        table[static_cast<size_t>(row) * dim + col];
+
+  if (strategy == SidecarUntieStrategy::REPLACE_TRAILING_HEAD)
+    bytes.resize(bytes.size() - table_bytes);
+  bytes.append(reinterpret_cast<const char *>(transposed.data()), table_bytes);
+  model_cfg["tie_word_embeddings"] = false;
+
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::create_directories(out_dir);
+  for (const char *aux : {"generation_config.json", "tokenizer.json"})
+    std::filesystem::copy_file(
+      fixture_dir / aux, out_dir / aux,
+      std::filesystem::copy_options::overwrite_existing);
+
+  writeFile(out_dir / bin_name, bytes);
+  writeFile(out_dir / "config.json", model_cfg.dump(2));
+  writeFile(out_dir / "nntr_config.json", nntr_cfg.dump(2));
   return true;
 }
 
@@ -650,8 +838,12 @@ void runQ40DifferentialChecks(const DifferentialModel &model) {
     << "Q4_0 weight file not found: " << q4_bin_path;
 
   // --- Load Q4_0 model ---
+  // The generated config names its files relative to the package directory
+  // (see NNTR_CONFIG_PATH_KEYS): resolve them the way the runtime loaders do,
+  // then pin the tokenizer to the fixture copy.
   auto fc = loadFixtureConfigs(fixture_dir);
   auto q4_nntr_cfg = causallm::LoadJsonFile(q4_nntr_cfg_path.string());
+  resolvePackagePaths(q4_nntr_cfg, q4_dir);
   q4_nntr_cfg["tokenizer_file"] = (fixture_dir / "tokenizer.json").string();
 
   auto q4_model = model.make_model(fc.model_cfg, fc.gen_cfg, q4_nntr_cfg);
@@ -765,8 +957,10 @@ void runQ40EmbeddingDifferentialChecks(const DifferentialModel &model) {
     << "Q4_0 weight file not found: " << q4_bin_path;
 
   // --- Load Q4_0 model in embedding mode ---
+  // Same package-relative path contract as runQ40DifferentialChecks.
   auto fc = loadFixtureConfigs(fixture_dir);
   auto q4_nntr_cfg = causallm::LoadJsonFile(q4_nntr_cfg_path.string());
+  resolvePackagePaths(q4_nntr_cfg, q4_dir);
   q4_nntr_cfg["tokenizer_file"] = (fixture_dir / "tokenizer.json").string();
   q4_nntr_cfg["model_type"] = "Embedding";
   auto modules_path = fixture_dir / "modules.json";
@@ -803,6 +997,172 @@ void runQ40EmbeddingDifferentialChecks(const DifferentialModel &model) {
   // Q4_0 embedding vs nntrainer FP32 embedding
   expectEmbeddingNear(q4_got, fp32_got, fixture.embedding_atol_q40,
                       fixture.cosine_min_q40);
+}
+
+/**
+ * @brief Run the mmap-sidecar package checks for a model against its fixture
+ */
+void runSidecarPackageChecks(const DifferentialModel &model,
+                             SidecarUntieStrategy strategy) {
+  std::filesystem::path fixture_dir;
+  ReferenceFixture fixture;
+  std::string skip_reason;
+  if (!tryLoadFixture(model, fixture_dir, fixture, skip_reason))
+    GTEST_SKIP() << skip_reason;
+
+  const char *quantize_bin_env = std::getenv(QUANTIZE_BIN_ENV);
+  if (!quantize_bin_env || std::string(quantize_bin_env).empty())
+    GTEST_SKIP() << "NNTR_QUANTIZE_BIN not set — sidecar package test skipped";
+  const std::string quantize_bin(quantize_bin_env);
+
+  const auto tmp_dir = std::filesystem::temp_directory_path();
+  const auto src_dir =
+    tmp_dir / ("nntrainer_" + model.fixture_name + "_sidecar_src");
+  const auto side_dir =
+    tmp_dir / ("nntrainer_" + model.fixture_name + "_sidecar_pkg");
+  const auto single_dir =
+    tmp_dir / ("nntrainer_" + model.fixture_name + "_sidecar_single");
+
+  std::string reason;
+  if (!makeUntiedSourcePackage(fixture_dir, src_dir, strategy, reason))
+    GTEST_SKIP() << reason;
+
+  // --- (1) The untied source is the fixture's model -------------------------
+  // Without this the rest of the test could agree with itself on a
+  // mis-assembled package and prove nothing.
+  {
+    auto src_fc = loadFixtureConfigs(src_dir);
+    auto src_model =
+      model.make_model(src_fc.model_cfg, src_fc.gen_cfg, src_fc.nntr_cfg);
+    src_model->initializeModel();
+    src_model->loadWeight(src_fc.weight_path.string());
+
+    std::vector<float> src_logits;
+    ASSERT_NO_THROW(src_logits =
+                      src_model->prefillLogitsFromIds(fixture.input_ids));
+    expectLogitsNear(src_logits, fixture.reference_logits,
+                     fixture.logits_atol_fp32);
+  }
+
+  // --- (2) One source, two packages ----------------------------------------
+  for (const auto &dir : {side_dir, single_dir}) {
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+  }
+
+  ASSERT_TRUE(runQuantize(quantize_bin, src_dir, side_dir,
+                          "--embd_dtype Q4_0 --sidecar on"))
+    << "nntr_quantize --sidecar on failed on the untied source package";
+  ASSERT_TRUE(runQuantize(quantize_bin, src_dir, single_dir,
+                          "--embd_dtype Q4_0 --no-sidecar"))
+    << "nntr_quantize --no-sidecar failed on the untied source package";
+
+  auto side_cfg =
+    causallm::LoadJsonFile((side_dir / "nntr_config.json").string());
+  auto single_cfg =
+    causallm::LoadJsonFile((single_dir / "nntr_config.json").string());
+
+  // --- (3) The split happened, and the twin's did not -----------------------
+  ASSERT_TRUE(side_cfg.contains("embedding_file_name"))
+    << "--sidecar on produced a package with no embedding_file_name";
+  EXPECT_FALSE(single_cfg.contains("embedding_file_name"));
+  EXPECT_FALSE(single_cfg.contains("ple_file_name"));
+
+  // --- (4) Manifest arithmetic, and the byte partition ----------------------
+  // The union of the emitted files is byte-for-byte the file the single-file
+  // package holds: every payload occurs in it exactly once, and what remains
+  // once they are spliced out is the slim bin. This is the invariant the whole
+  // rung rests on, checked on real generated bytes rather than asserted.
+  const auto side_bin =
+    side_dir / side_cfg["model_file_name"].get<std::string>();
+  const auto single_bin =
+    single_dir / single_cfg["model_file_name"].get<std::string>();
+
+  const std::string slim = readFileBytes(side_bin);
+  const std::string single = readFileBytes(single_bin);
+  std::string residue = single;
+  size_t payload_total = 0;
+
+  for (const char *key : {"embedding_file_name", "ple_file_name"}) {
+    if (!side_cfg.contains(key))
+      continue;
+
+    const auto manifest_path =
+      side_dir / side_cfg[key].get<std::string>();
+    ASSERT_TRUE(std::filesystem::exists(manifest_path))
+      << "sidecar manifest named by " << key << " does not exist: "
+      << manifest_path;
+
+    auto manifest = causallm::LoadJsonFile(manifest_path.string());
+    const auto rows = manifest["rows"].get<unsigned int>();
+    const auto size = manifest["size"].get<unsigned int>();
+    const auto datatype = manifest["datatype"].get<std::string>();
+    const size_t row_bytes = sidecarRowBytes(datatype, size);
+    ASSERT_NE(row_bytes, 0u)
+      << "manifest datatype '" << datatype << "' with size " << size
+      << " has no row-block encoding the loader accepts";
+
+    const auto payload_path =
+      side_dir / manifest["lut-path"].get<std::string>();
+    ASSERT_TRUE(std::filesystem::exists(payload_path))
+      << "sidecar payload does not exist: " << payload_path;
+
+    const std::string payload = readFileBytes(payload_path);
+    EXPECT_EQ(payload.size(), static_cast<size_t>(rows) * row_bytes)
+      << "payload " << payload_path.filename() << " disagrees with rows("
+      << rows << ") * row_bytes(" << row_bytes << ")";
+    payload_total += payload.size();
+
+    const auto at = residue.find(payload);
+    ASSERT_NE(at, std::string::npos)
+      << "sidecar payload " << payload_path.filename()
+      << " does not occur in the single-file package";
+    residue.erase(at, payload.size());
+  }
+
+  EXPECT_EQ(slim.size() + payload_total, single.size());
+  EXPECT_TRUE(residue == slim)
+    << "the sidecar package is not a byte partition of the single-file package";
+
+  // --- (5) Both packages load, and answer identically ----------------------
+  // Loading goes through the same package-relative path resolution every
+  // runtime loader performs; the CWD here is the test runner's, never the
+  // package directory, so an unresolved embedding_file_name fails right here.
+  auto load_logits = [&](const std::filesystem::path &dir) {
+    auto cfg = causallm::LoadJsonFile((dir / "config.json").string());
+    auto gen_cfg =
+      causallm::LoadJsonFile((dir / "generation_config.json").string());
+    auto nntr_cfg = causallm::LoadJsonFile((dir / "nntr_config.json").string());
+    resolvePackagePaths(nntr_cfg, dir);
+    nntr_cfg["tokenizer_file"] = (dir / "tokenizer.json").string();
+
+    const auto bin =
+      dir / nntr_cfg["model_file_name"].get<std::string>();
+    auto runner = model.make_model(cfg, gen_cfg, nntr_cfg);
+    runner->initializeModel();
+    runner->loadWeight(bin.string());
+    return runner->prefillLogitsFromIds(fixture.input_ids);
+  };
+
+  std::vector<float> side_logits;
+  ASSERT_NO_THROW(side_logits = load_logits(side_dir))
+    << "the generated SIDECAR package failed to load from " << side_dir;
+
+  std::vector<float> single_logits;
+  ASSERT_NO_THROW(single_logits = load_logits(single_dir))
+    << "the generated single-file package failed to load from " << single_dir;
+
+  ASSERT_EQ(side_logits.size(), single_logits.size());
+  size_t differing = 0;
+  for (size_t i = 0; i < side_logits.size(); ++i)
+    if (side_logits[i] != single_logits[i])
+      ++differing;
+  EXPECT_EQ(differing, 0u)
+    << differing << " of " << side_logits.size()
+    << " logits differ between the sidecar package and its single-file twin";
+
+  expectLogitsNear(side_logits, fixture.reference_logits,
+                   fixture.logits_atol_q40);
 }
 
 } // namespace causallm_test
