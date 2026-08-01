@@ -15,12 +15,11 @@
 
 #include <atomic>
 #include <cstdint>
-#include <mutex>
-#include <utility>
-#include <vector>
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 #include <int4_utils.h>
@@ -305,6 +304,8 @@ bool isQs4cxPayloadDropped(const void *ptr) {
     if (p >= r.first && p < r.second)
       return true;
   return false;
+}
+
 void QS4CX_Tensor::read(std::ifstream &file, size_t start_offset,
                         bool read_from_offset) {
   if (start_offset == std::numeric_limits<size_t>::max())
