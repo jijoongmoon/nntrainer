@@ -295,6 +295,13 @@ void ClContext::initialize() noexcept {
         (active_engine == nullptr) || std::string(active_engine) == "gpu";
       constexpr uint32_t ADRENO_VENDOR_ID = 0x5143;
       if (opencl_is_active && caps_.vendor_id == DeviceCaps::VENDOR_INTEL) {
+        // XMX/DPAS GEMM default. Gated on the DPAS-specific extension
+        // (caps_.dpas), NOT the generic cl_intel_subgroups (present on every
+        // Intel GPU since Gen9, including matrix-engine-less Xe-LPG parts —
+        // defaulting XMX there ropes the device into software-emulated DPAS
+        // at a fraction of the dp4a fallback's speed).
+        if (caps_.dpas)
+          setenv("NNTR_FC_XMX", "1", 0);
         // GPU attention: with no host NEON on these hosts the GPU MHA path
         // wins outright, so default it on.
         setenv("NNTR_MHA_GPU", "1", 0);
