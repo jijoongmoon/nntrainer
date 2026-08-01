@@ -2268,8 +2268,23 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // (2..FLASH_MIN_PREFILL-1) does not fall to the host compute_kcaches path,
   // which faults on a device-only activation pool (NNTR_CUDA_DEV_ACT) and was
   // the short-prompt crash. OpenCL is unaffected (NNTR_CUDA_ATTN is cuda-only).
+  //
+  // NNTR_CUDA_ATTN reaches this route on its own. It used to be AND-ed with
+  // use_gemm_attention, which is a *layer property* -- and nothing in this
+  // tree ever sets it: props::UseGemmAttention defaults to false (mha_core.h)
+  // and the only writer is the transformer graph's
+  // withKey("use_gemm_attention", ...), which arrives with the flash-attention
+  // rung. So on a CUDA run the whole GPU attention block was unreachable,
+  // every attention step fell to the host kernel, and cuda_context's
+  // NNTR_CUDA_DEV_ACT auto-default (discrete + concurrentManagedAccess) handed
+  // that host kernel a cudaMalloc'd activation pool -> SIGSEGV inside
+  // nntrainer::compute_kcaches on a ThreadManager worker, on shipped defaults,
+  // for every model. The two gates are independent: use_gemm_attention is the
+  // host/OpenCL flash opt-in and keeps its prefill-length threshold, while
+  // _cuda_attn_on is the CUDA lane's own switch and must not be gated behind a
+  // property the CUDA lane never stamps.
   static const bool _cuda_attn_on = nntr_env_on("NNTR_CUDA_ATTN");
-  if (use_gemm_attention && (step_size >= FLASH_MIN_PREFILL || _cuda_attn_on)) {
+  if ((use_gemm_attention && step_size >= FLASH_MIN_PREFILL) || _cuda_attn_on) {
     // GPU two-1x1-conv attention path (paper section 3.7). Env-gated via
     // NNTR_MHA_GPU=1. FP16-Q + FP16-out only; K/V is FP16. Falls back to
     // the CPU path on any shape mismatch.

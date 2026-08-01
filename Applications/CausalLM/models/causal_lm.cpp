@@ -62,6 +62,7 @@
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_fc_qint4.h>
+#include <cuda_pack_cache.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -812,40 +813,12 @@ void CausalLM::registerCustomLayers() {
   // AppContext itself.
   (void)app_context;
 
-  // PLE post_norm (RMSReverseNormLayer) on the GPU context: its
-  // incremental_forwarding runs the reverse-norm as a GPU op (no host op inside
-  // the async GPU graph). Same central-registration pattern as the reshaped
-  // norm in Transformer::registerCustomLayers; inert on CPU-only builds, where
-  // there is no "gpu" context to register on.
-  try {
-    ct_engine.getRegisteredContext("gpu"); // throws when absent: the ONE
-                                           // benign silent case (no OpenCL
-                                           // in this build)
-    try {
-      ct_engine.registerLayerFactory(
-        "gpu", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
-    } catch (std::invalid_argument &e) {
-      // A real registration failure (key collision, null factory) must be
-      // VISIBLE -- a silent registration failure is catastrophic (the very
-      // defect class 878dc9f4b exists for). Not rethrown: a second model
-      // instance legitimately re-registers the same key.
-      ml_logw("rms_reverse_norm registration on gpu failed: %s", e.what());
-    }
-  } catch (std::invalid_argument &e) {
-    // no "gpu" context -- benign (CPU-only build).
-  }
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-  // RMSReverseNorm (the PLE post_norm of the reverse-norm model family) on
-  // the cuda context: engine=cuda graphs construct this layer on the cuda
-  // context, and its incremental_forwarding carries the device path for
-  // NNTR_CUDA_DEV_ACT device-only activation pools.
-  try {
-    ct_engine.registerLayerFactory(
-      "cuda", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
-  } catch (std::invalid_argument &e) {
-    // no "cuda" context or already registered -- both benign.
-  }
-#endif
+  // rms_reverse_norm (the PLE post_norm of the reverse-norm model family) is
+  // registered on EVERY backend the Engine brought up by
+  // Transformer::registerCustomLayers, called above. It used to be enumerated
+  // here one backend name at a time -- a lone "cuda" registration behind an
+  // #if -- which is exactly the shape that leaves every other brought-up
+  // backend without a factory for a type its graphs stamp engine= on.
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
@@ -1206,6 +1179,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
               i8_eager ? "ON" : "OFF (lazy build self-heals)",
               (i8_forced || i8_disabled) ? " (forced by NNTR_CUDA_PREWARM_I8)"
                                          : "");
+      // [pack-cache] bind the derive-once pack to the weight file that produced
+      // these bytes (size + mtime identity), then let each per-weight derive
+      // consult/tee its record. Opt-in (NNTR_CUDA_PACK_CACHE=1); a no-op
+      // otherwise, and a missing/stale/corrupt pack simply derives as before.
+      nntrainer::cuda_pack::set_source(LOADED_WEIGHT_PATH.c_str());
       std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
                          void *)>
         fn = [i8_eager](ml::train::Layer &l, nntrainer::RunLayerContext &ctx,
@@ -1216,6 +1194,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             nntrainer::Tensor &wt = ctx.getWeight(w);
             if (wt.getDataType() != ml::train::TensorDim::DataType::QS4CX)
               continue;
+            // Pack-cache record name: graph-stable (layer name + weight slot),
+            // so it means the same thing on every launch. The plain pointer --
+            // which keys the in-memory cache -- must never key the disk one.
+            const std::string pack_name = l.getName() + "." + std::to_string(w);
             // Build the fp16-scale UVM side buffer here too so the first
             // forward (and any CUDA-graph capture) is a pure cache hit. The
             // scale conversion host-READS the fp32 tail, so it must run
@@ -1244,11 +1226,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
               nntrainer::cuda::cuda_fc_qs4cx_prewarm_exempt_i8(
                 wt.getData<uint8_t>());
             nntrainer::cuda::cuda_fc_qs4cx_prewarm(wt.getData<uint8_t>(),
-                                                   wt.width(), wt.height());
+                                                   wt.width(), wt.height(),
+                                                   pack_name.c_str());
             // [pool-bypass] every derived cache for this weight now exists
             // (dp4a packed [+ cuBLAS int8] + fp16 scales) -- with the heap
             // bypass the plain pages are droppable in place, the same way the
-            // v8c path drops them after its backing build. Opt-in.
+            // v8c path drops them after its backing build. Opt-in. Runs after
+            // the pack-cache tee above, so a pack rewrite still sees the plain
+            // payload it derives from.
             static const bool cuda_drop = []() {
               const char *e = std::getenv("NNTR_CUDA_DROP_PLAIN");
               return e != nullptr && e[0] == '1';
@@ -1259,6 +1244,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
           }
         };
       model->forEachLayer(fn, nullptr);
+      // [pack-cache] every load-time derive is done: finalize a pending pack
+      // rewrite on the background (exit-joined) finalizer.
+      nntrainer::cuda_pack::load_complete();
+      // The split that decides whether persisting the packs can pay at all:
+      // only the derive (+ the miss-path tee) is cacheable, the H2D upload
+      // happens either way. Reported when the cache is in play.
+      if (nntrainer::cuda_pack::enabled()) {
+        double d = 0, u = 0, t = 0, h = 0;
+        size_t db = 0, hb = 0;
+        nntrainer::cuda::cuda_fc_qs4cx_prewarm_stats(&d, &u, &t, &h, &db, &hb);
+        ml_logi("[cuda prewarm] split: host derive %.1f ms (%zu MB) + H2D "
+                "%.1f ms + pack tee %.1f ms | pack HIT %.1f ms (%zu MB)",
+                d, db >> 20, u, t, h, hb >> 20);
+      }
       // Pre-grow the split-KV decode scratch so the M=1 flash-decode path
       // never cudaMallocs inside a CUDA-graph capture. 2*HEAD_DIM covers a
       // model whose global-attention head_dim doubles the base; the

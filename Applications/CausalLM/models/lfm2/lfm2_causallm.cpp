@@ -204,7 +204,9 @@ void Lfm2Transformer::registerCustomLayers() {
     }
   };
 
-  tryRegister(nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+  // reshaped_rms_norm comes from the device-routed layer table in
+  // Transformer::registerCustomLayers, which covers every backend the Engine
+  // brought up -- not just "cpu".
   tryRegister(nntrainer::createLayer<causallm::CustomMultiplyLayer>);
   tryRegister(nntrainer::createLayer<causallm::CausalConv1DLayer>);
 }
