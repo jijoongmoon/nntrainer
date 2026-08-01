@@ -5,6 +5,14 @@ cuda_sources = [
   'cuda_buffer_manager.cpp',
   'cuda_module.cpp',
   'cuda_kernel.cpp',
+  'cuda_elementwise.cpp',
+  'cuda_compute_ops.cpp',
+  'cuda_rmsnorm.cpp',
+  'cuda_rope.cpp',
+  'cuda_attention.cpp',
+  'cuda_fc_qint4.cpp',
+  'cuda_gemv_q6k.cpp',
+  'cuda_blas_manager.cpp',
 ]
 
 cuda_headers = [
@@ -33,6 +41,10 @@ cuda_headers = [
   'cuda_kernel.h',
   'cuda_elementwise.h',
   'cuda_rmsnorm.h',
+  'cuda_elementwise.h',
+  'cuda_rmsnorm.h',
+  'cuda_rope.h',
+  'cuda_attention.h',
   'cuda_fc_qint4.h',
   'cuda_gemv_q6k.h',
   'cuda_blas_manager.h',

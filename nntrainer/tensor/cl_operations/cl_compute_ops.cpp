@@ -42,6 +42,8 @@
 #include <sigmoid_glu_cl_op.h>
 #include <nntrainer_log.h>
 #include <rms_reverse_norm_cl_op.h>
+#include <sigmoid_add_cl_op.h>
+#include <sigmoid_glu_cl_op.h>
 #include <swiglu_cl_op.h>
 #include <tensor.h>
 

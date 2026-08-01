@@ -47,6 +47,7 @@
 #include <nntrainer_log.h>
 #include <residency_policy.h>
 #include <rms_reverse_norm.h>
+#include <residency_policy.h>
 #include <tensor.h>
 
 #include <causal_lm.h>
