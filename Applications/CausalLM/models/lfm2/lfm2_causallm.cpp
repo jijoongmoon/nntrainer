@@ -29,7 +29,7 @@
 #include <mha_core.h>
 #include <reshaped_rms_norm.h>
 #include <rms_norm.h>
-#include <swiglu.h>
+#include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
 using ml::train::Tensor;
@@ -728,7 +728,7 @@ void Lfm2CausalLM::setupParameters(json &cfg, json &generation_cfg,
                                    json &nntr_cfg) {
   // Delegate LFM2-specific parameter parsing to the shared method
   setupLfm2Parameters(cfg, generation_cfg, nntr_cfg,
-                      /*require_layer_types=*/true);
+                      /** require_layer_types */ true);
 }
 
 void Lfm2CausalLM::registerCustomLayers() {

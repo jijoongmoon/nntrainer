@@ -258,35 +258,120 @@ if get_option('enable-opencl')
   if get_option('platform') == 'android'
   endif
 
-  message ('OpenCL build is now enabled and will function only if an OpenCL-supported GPU is available. Using CLBlast as the OpenCL backend.')
   extra_defines += '-DENABLE_OPENCL=1'
   extra_defines += '-DCL_TARGET_OPENCL_VERSION=200'
-  clblast_options = cmake.subproject_options()
 
   if get_option('platform') == 'android'
     message('preparing opencl')
     run_command([meson.source_root() / 'jni' / 'prepare_opencl.sh', meson.build_root()], check: true)
-    clblast_root = subprojects_dir_absolute / 'CLBlast'
     opencl_root = meson.build_root() / 'opencl'
-    clblast_dep = declare_dependency()
-  else 
+  endif
+
+  if get_option('enable-clblast')
+    message ('OpenCL build is now enabled and will function only if an OpenCL-supported GPU is available. Using CLBlast as the OpenCL backend.')
+    extra_defines += '-DENABLE_CLBLAST=1'
     clblast_options = cmake.subproject_options()
-    clblast_options.add_cmake_defines({'CMAKE_POLICY_VERSION_MINIMUM': '3.10'})
-    clblast_options.add_cmake_defines({'CMAKE_CXX_STANDARD': '17'})
-    clblast_options.add_cmake_defines({'TUNERS': false})
-    clblast_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
-    if get_option('default_library') == 'static'
-      clblast_options.add_cmake_defines({'OVERRIDE_MSVC_FLAGS_TO_MT': false})
-      clblast_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
+    if get_option('platform') == 'android'
+      clblast_root = subprojects_dir_absolute / 'CLBlast'
+      clblast_dep = declare_dependency()
+    else
+      clblast_options = cmake.subproject_options()
+      clblast_options.add_cmake_defines({'CMAKE_POLICY_VERSION_MINIMUM': '3.10'})
+      clblast_options.add_cmake_defines({'CMAKE_CXX_STANDARD': '17'})
+      clblast_options.add_cmake_defines({'TUNERS': false})
+      clblast_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
+      if get_option('default_library') == 'static'
+        clblast_options.add_cmake_defines({'OVERRIDE_MSVC_FLAGS_TO_MT': false})
+        clblast_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
+      endif
+      clblast_proj = cmake.subproject('clblast', options: clblast_options, required: true)
+      clblast_dep = clblast_proj.dependency('clblast')
     endif
-    clblast_proj = cmake.subproject('clblast', options: clblast_options, required: true)
-    clblast_dep = clblast_proj.dependency('clblast')
+  else
+    message ('OpenCL build enabled WITHOUT CLBlast. Generic BLAS-via-OpenCL routes (clblast_interface.cpp callers) are stubbed; only the in-tree OpenCL kernels are functional.')
+    # Keep clblast_dep defined as an empty dependency for downstream use.
+    clblast_dep = declare_dependency()
+  endif
+
+  # On non-android platforms, link the host ICD loader directly so libnntrainer.so
+  # resolves clCreateContext/clBuildProgram/etc. (android links a staged libOpenCL).
+  if get_option('platform') != 'android'
+    opencl_loader_dep = cxx.find_library('OpenCL', required: true)
+  else
+    opencl_loader_dep = declare_dependency()
   endif
 endif
 
 if get_option('opencl-kernel-path') != ''
   message ('OpenCL kernel path set to: @0@'.format(get_option('opencl-kernel-path')))
   extra_defines += '-DOPENCL_KERNEL_PATH=@0@'.format(get_option('opencl-kernel-path'))
+endif
+
+# Additive NVIDIA CUDA backend. Mirrors the OpenCL wiring above but is fully
+# independent: when enable-cuda is false this block is skipped and the OpenCL /
+# CPU builds are byte-identical. Kernels are compiled at runtime via NVRTC, so
+# the library build only needs to link cudart/nvrtc/cublas + the driver API.
+if get_option('enable-cuda')
+  if get_option('platform') == 'android'
+    error('enable-cuda is only supported on desktop NVIDIA platforms, not android')
+  endif
+
+  extra_defines += '-DENABLE_CUDA=1'
+
+  cuda_path = get_option('cuda-path')
+  cuda_incdir = include_directories(cuda_path / 'include')
+  # Toolkit import/shared libs: Windows ships them in <cuda_path>\lib\x64,
+  # Linux in <cuda_path>/lib64. Import-lib base names (cudart/nvrtc/cublas/
+  # cublasLt/cuda) are identical on both; meson appends the platform suffix.
+  if host_machine.system() == 'windows'
+    cuda_libdir = cuda_path / 'lib' / 'x64'
+  else
+    cuda_libdir = cuda_path / 'lib64'
+  endif
+
+  cudart_dep   = cxx.find_library('cudart',   dirs: cuda_libdir, required: true)
+  nvrtc_dep    = cxx.find_library('nvrtc',    dirs: cuda_libdir, required: true)
+  cublas_dep   = cxx.find_library('cublas',   dirs: cuda_libdir, required: true)
+  cublaslt_dep = cxx.find_library('cublasLt', dirs: cuda_libdir, required: true)
+  # libcuda (driver API: cuModuleLoad/cuLaunchKernel) ships with the NVIDIA
+  # driver; fall back to the toolkit copy if the driver lib is not on the
+  # default search path. On Linux that copy is a stub under lib64/stubs; on
+  # Windows the real cuda.lib import library sits directly in lib/x64.
+  cudadrv_dep = cxx.find_library('cuda', required: false)
+  if not cudadrv_dep.found()
+    if host_machine.system() == 'windows'
+      cudadrv_dep = cxx.find_library('cuda', dirs: cuda_libdir, required: true)
+    else
+      cudadrv_dep = cxx.find_library('cuda', dirs: cuda_libdir / 'stubs', required: true)
+    endif
+  endif
+
+  # Windows delay-load: the unified binary import-links cublas/nvrtc, which
+  # maps ~245MB of CUDA DLL images into the working set of EVERY run —
+  # including pure OpenCL runs that never call CUDA. /DELAYLOAD defers the
+  # LoadLibrary to the first actual call: engine=gpu runs never load them,
+  # engine=cuda is unchanged. nvcuda.dll is the driver's own DLL (not a
+  # toolkit redistributable); without delay-loading it too, the unified
+  # binary would hard-fail to load on a machine with no NVIDIA driver at all
+  # — the backend auto-probe (cudaGetDeviceCount, cudart-only) must be
+  # callable before nvcuda is ever touched. DLL names track the toolkit
+  # major; a stale name only costs a benign LNK4199.
+  if host_machine.system() == 'windows'
+    cuda_delayload_args = ['/DELAYLOAD:cublas64_13.dll',
+                           '/DELAYLOAD:cublasLt64_13.dll',
+                           '/DELAYLOAD:nvrtc64_130_0.dll',
+                           '/DELAYLOAD:nvcuda.dll',
+                           'delayimp.lib']
+  else
+    cuda_delayload_args = []
+  endif
+
+  cuda_dep = declare_dependency(
+    include_directories: cuda_incdir,
+    link_args: cuda_delayload_args,
+    dependencies: [cudart_dep, nvrtc_dep, cublas_dep, cublaslt_dep, cudadrv_dep],
+  )
+  message('CUDA backend enabled. Toolkit: ' + cuda_path)
 endif
 
 if get_option('enable-biqgemm')

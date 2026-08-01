@@ -38,6 +38,14 @@
 
 namespace nntrainer {
 
+// Forward decls for the runDecode seam — kept as forward declarations so
+// context.h does NOT pull in the heavy tensor.h / neuralnet.h. The seam's
+// tensor type is sharedConstTensors == std::vector<std::shared_ptr<const
+// Tensor>>, which only needs Tensor to be *declared* (shared_ptr of an
+// incomplete type is fine).
+class NeuralNetwork;
+class Tensor;
+
 // ContextData lives in its own header so that layer_context.h / layer_node.h
 // can pull it in without triggering the context.h → layer_devel.h cycle.
 
@@ -81,10 +89,29 @@ struct DeviceCaps {
                           unit, so gating XMX on it silently ropes
                           non-DPAS Intel iGPUs into the DPAS kernel
                           (IGC emulates it — catastrophic slowdown). This
-                          is the real XMX-capability gate. Declared LAST
-                          so appending it leaves the other field offsets
+                          is the real XMX-capability gate. Appended after
+                          the pre-existing fields so their offsets stay
                           unmoved (ABI-safe for an app built against the
                           old DeviceCaps). */
+  bool svm_fine_grain = false; /**< CL_DEVICE_SVM_FINE_GRAIN_BUFFER: the device
+                                    keeps an SVM allocation coherent across a
+                                    kernel→kernel handoff on its own. A
+                                    coarse-grain device needs a host-side
+                                    drain between the producing and consuming
+                                    dispatch instead; the backend decides that
+                                    once at init from this field and pushes the
+                                    decision down. Appended last for the same
+                                    ABI reason as `dpas`. */
+
+  /**
+   * @brief OpenCL CL_DEVICE_VENDOR_ID of Intel parts.
+   *
+   * Kept here, beside the fields derived from it, so that backend plumbing
+   * (nntrainer/opencl/*) never has to name a vendor: a device quirk enters the
+   * codebase as a caps field, and only this seam knows which vendor implies
+   * it.
+   */
+  static constexpr uint32_t VENDOR_INTEL = 0x8086;
 
   /**
    * @brief One-line human-readable dump for the init-time log.
@@ -96,6 +123,7 @@ struct DeviceCaps {
        << std::hex << vendor_id << std::dec << ", integrated=" << integrated
        << ", unified_memory=" << unified_memory << ", subgroups=" << subgroups
        << ", image_v8c=" << image_v8c << ", dpas=" << dpas
+       << ", svm_fine_grain=" << svm_fine_grain
        << ", compute_units=" << compute_units
        << ", max_alloc_bytes=" << max_alloc_bytes << "}";
     return os.str();
@@ -387,6 +415,24 @@ public:
   virtual ml::train::LayerComputeEngine residencyEngine() const {
     return ml::train::LayerComputeEngine::CPU;
   }
+
+  /**
+   * @brief Run ONE decode/prefill forward step for the model — the
+   *        exec-engine seam. The base is a plain graph walk
+   *        (`nn.incremental_forwarding(...)`), so CPU and OpenCL are
+   *        byte-identical; a backend with its own decode engine (e.g. a
+   *        CUDA-graph capture/replay state machine) overrides it.
+   * @note  Appended at the vtable tail (its slot follows every pre-existing
+   *        one) so a rebuilt libnntrainer.so stays ABI-compatible with an
+   *        app/ccapi built against the old vtable.
+   * @note  Return/param type is `sharedConstTensors`
+   *        (std::vector<std::shared_ptr<const Tensor>>); spelled out to keep
+   *        context.h free of tensor.h. Defined out-of-line in neuralnet.cpp.
+   */
+  virtual std::vector<std::shared_ptr<const Tensor>>
+  runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
+            const std::vector<std::shared_ptr<const Tensor>> &input,
+            const std::vector<std::shared_ptr<const Tensor>> &label);
 
 private:
   /**

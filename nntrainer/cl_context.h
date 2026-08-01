@@ -119,6 +119,12 @@ public:
                             const int int_key = -1);
 
   /**
+   * @copydoc Context::registerLayerFactory
+   */
+  int registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                           const std::string &key, const int int_key) override;
+
+  /**
    * @brief Create an Object from the integer key
    *
    * @tparam T Type of Object, currently, Only Layer is supported
@@ -209,10 +215,16 @@ public:
    * @param kernel_string kernel implementation string
    * @param kernel_name kernel name
    * @return std::shared_ptr<opencl::Kernel>
+   * @note by-const-ref on purpose: kernel sources are tens of KB and the
+   *       previous by-value signature copied the full source on EVERY cached
+   *       lookup -- measured ~12ms per call on Adreno/Android (scudo
+   *       large-alloc), ~36ms host issue tax per layer in the attention hot
+   *       path alone.
    */
-  const SharedPtrClKernel registerClKernel(std::string kernel_string,
-                                           std::string kernel_name,
-                                           std::string compile_options = {});
+  const SharedPtrClKernel
+  registerClKernel(const std::string &kernel_string,
+                   const std::string &kernel_name,
+                   const std::string &compile_options = {});
 
   /**
    * @brief Initialize and register all blas OpenCl kernels
@@ -228,6 +240,19 @@ public:
    * @brief Get the name of the context
    */
   std::string getName() override { return "gpu"; }
+
+  /**
+   * @copydoc Context::residencyEngine
+   * @brief OpenCL GPU tensors live on the GPU residency plane.
+   */
+  ml::train::LayerComputeEngine residencyEngine() const override {
+    return ml::train::LayerComputeEngine::GPU;
+  }
+
+  /**
+   * @brief Device capability snapshot, probed once in initialize(). LOG-ONLY.
+   */
+  const DeviceCaps &caps() const override { return caps_; }
 
   /**
    * @brief Set the Mem Allocator object
@@ -250,9 +275,8 @@ private:
    *        without re-running (or reordering) the kernel builds.
    */
   struct DefaultKernelResults {
-    bool fully_connected = false;
-    bool addition = false;
     bool swiglu = false;
+    bool geglu = false;
     bool reshape = false;
     bool rmsnorm = false;
     bool concat = false;
@@ -296,6 +320,9 @@ private:
    * @param results per-helper success flags
    */
   void registerDefaultFactories(const DefaultKernelResults &results);
+
+  /** device capabilities probed once at initialize() (log-only) */
+  DeviceCaps caps_;
 
   // flag to check opencl commandqueue and context inititalization
   bool cl_initialized = false;

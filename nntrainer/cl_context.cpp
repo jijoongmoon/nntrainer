@@ -14,17 +14,29 @@
  * creates the OpenCL command queue and context.
  */
 
-#include <addition_layer_cl.h>
+#include <addition_layer.h>
+#include <attention_kernels.h>
+#include <blas_kernel_interface.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
 #include <compute_ops.h>
 #include <concat_cl.h>
+#include <cstdlib>
+#include <env_compat.h>
 #include <fc_layer_cl.h>
+#include <geglu_cl_op.h>
+#include <geglu_layer.h>
+#include <mutex>
+#include <opencl_command_queue_manager.h>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
-#include <swiglu_cl.h>
+#include <scalar_multiply_gpu.h>
+#include <string>
+#include <swiglu_cl_op.h>
+#include <swiglu_layer.h>
+#include <tie_word_embedding.h>
 #include <transpose_cl.h>
 
 #include <atomic>
@@ -207,6 +219,112 @@ void ClContext::initialize() noexcept {
       ml_loge("Error: ClContext::initialize() failed");
       return;
     }
+
+    // Probe device capabilities once (log-only: no decision site reads this
+    // yet). Values come from the existing DeviceInfo queries.
+    if (const auto *di = context_inst_.getDeviceInfo()) {
+      caps_.backend = "gpu";
+      caps_.device_name = di->getDeviceName();
+      // CL_DEVICE_NAME is stored sized to include the query's trailing NUL; an
+      // embedded NUL would truncate the %s log line, so strip trailing NUL/ws.
+      while (!caps_.device_name.empty()) {
+        const char c = caps_.device_name.back();
+        if (c == '\0' || c == ' ' || c == '\n' || c == '\r' || c == '\t')
+          caps_.device_name.pop_back();
+        else
+          break;
+      }
+      caps_.vendor_id = di->getDeviceVendorId();
+      caps_.compute_units = di->getDeviceMaxComputeUnits();
+      caps_.max_alloc_bytes = di->getDeviceMaxMemAllocSize();
+      caps_.unified_memory = di->getDeviceSVMCapabilities() != 0;
+      caps_.svm_fine_grain =
+        (di->getDeviceSVMCapabilities() & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
+      caps_.subgroups = di->getDeviceExtensions().find("cl_intel_subgroups") !=
+                        std::string::npos;
+      // cl_intel_subgroups is advertised by every Intel GPU since Gen9
+      // (including non-DPAS Xe-LPG parts), so it cannot gate a DPAS/XMX
+      // matrix-engine kernel. The matrix-multiply-accumulate extension is
+      // DPAS-specific, so it is the real capability signal.
+      caps_.dpas =
+        di->getDeviceExtensions().find(
+          "cl_intel_subgroup_matrix_multiply_accumulate") != std::string::npos;
+      // image_v8c: whether the device should prefer an image2d-based path over
+      // a cl_mem buffer path. No clean device query distinguishes the two
+      // (both report CL_DEVICE_IMAGE_SUPPORT); the practical split is that
+      // Intel NEO's compiler rejects integer-coordinate read_imageui kernels.
+      // Keyed off vendor_id -- a stable, queryable, vendor-wide attribute (the
+      // quirk is a compiler trait, not a per-model one), not the brittle
+      // device_name. Intel => buffer; others keep the image default.
+      caps_.image_v8c = (caps_.vendor_id != DeviceCaps::VENDOR_INTEL);
+      cl_bool host_unified = CL_FALSE;
+      caps_.integrated =
+        (clGetDeviceInfo(context_inst_.GetDeviceId(),
+                         CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(host_unified),
+                         &host_unified, nullptr) == CL_SUCCESS) &&
+        (host_unified == CL_TRUE);
+      ml_logi("[ClContext] %s", caps_.toString().c_str());
+
+      // Decide the SVM coherence drain HERE - after device enumeration, where
+      // the caps are known - and push it into the queue manager, rather than
+      // letting the queue manager resolve it lazily on first use (it can be
+      // reached before any device exists, and would then have to guess).
+      //
+      // An in-order queue on a device without fine-grain SVM does not keep a
+      // coarse-grain SVM allocation coherent across a kernel->kernel handoff,
+      // so the consuming dispatch needs a host-side drain first. Fine-grain
+      // devices are coherent on their own. Scoped to Intel because a
+      // coarse-grain Adreno is coherent in practice and would only lose
+      // throughput. NNTR_XE3_SYNC still overrides both ways.
+      const bool svm_drain =
+        (caps_.vendor_id == DeviceCaps::VENDOR_INTEL) && !caps_.svm_fine_grain;
+      opencl::CommandQueueManager::Global().setSvmCoherenceDrain(svm_drain);
+
+      // HW-derived env DEFAULT. setenv(..., overwrite=0) means an
+      // explicitly-set env ALWAYS wins (and =0 still disables for A/B), so
+      // this is a default layer, not a mandate. Vendor_id is a stable
+      // vendor-wide attribute (not a brittle device_name match).
+      //
+      // Apply ONLY when OpenCL is the ACTIVE compute engine: on a
+      // multi-backend build another engine's run still initializes this CL
+      // context for the kernels it links, but its defaults must not leak into
+      // that run. Skip unless NNTR_ENGINE is unset (OpenCL is the default) or
+      // explicitly "gpu".
+      const char *active_engine = std::getenv("NNTR_ENGINE");
+      const bool opencl_is_active =
+        (active_engine == nullptr) || std::string(active_engine) == "gpu";
+      constexpr uint32_t ADRENO_VENDOR_ID = 0x5143;
+      if (opencl_is_active && caps_.vendor_id == DeviceCaps::VENDOR_INTEL) {
+        // GPU attention: with no host NEON on these hosts the GPU MHA path
+        // wins outright, so default it on.
+        setenv("NNTR_MHA_GPU", "1", 0);
+        setenv("NNTR_GPU_CLMEM_POOL", "1",
+               0); // cl_mem device residency sub-pool
+        // Some Intel in-order-queue drivers do not give kernel->kernel
+        // coarse-grain SVM coherence for the v8c int8 FC GEMM (its SVM output
+        // is read stale by the next kernel), and the global NNTR_XE3_SYNC
+        // drain misses it. Drain after the FC GEMM instead
+        // (blas_kernel_interface.cpp) -- needed for small-M prefill
+        // coherence at ~negligible prefill cost. Override NNTR_XE3_FC_SYNC=0.
+        //
+        // Windows (WDDM) default-OFF: an extensive battery (cold-boot goldens,
+        // token-class A/B, long-context summarize, all with FC_SYNC=0) found
+        // no coherence failure attributable to skipping the drain there, and
+        // the drain costs ~15-25% decode on that stack. Linux keeps default-ON
+        // (the stale read reproduces there). Explicit env wins either way.
+#ifdef _WIN32
+        setenv("NNTR_XE3_FC_SYNC", "0", 0);
+#else
+        setenv("NNTR_XE3_FC_SYNC", "1", 0);
+#endif
+      } else if (opencl_is_active && caps_.vendor_id == ADRENO_VENDOR_ID) {
+        setenv("NNTR_MHA_GPU", "1", 0);     // GPU attention
+        setenv("NNTR_KV_IMG_ATTN", "1", 0); // image2d KV/attention path
+        setenv("NNTR_GPU_CLMEM_POOL", "1",
+               0); // cl_mem device residency sub-pool
+      }
+    }
+
     if (KERNEL_CACHE_ENABLED) {
       // Non-throwing overload on purpose: the cache directory is relative to
       // the working directory by default (see the opencl-kernel-path option),
@@ -285,23 +403,22 @@ void ClContext::collectDefaultObjectKernelTasks(
   // registerDefaultFactories(), so it must outlive the pool join.
   // Concat registers the most kernels of the set, so it goes first: the pool
   // should not end on it.
+  //
+  // FC and Addition are absent on purpose: both are backend-neutral now and
+  // dispatch through the op table (ClComputeOps::fc / ::residual_op), so they
+  // have no per-layer kernel set to build and nothing to gate on.
   out.push_back([this, &results]() {
     results.concat = ConcatLayerCl::registerClKernels(*this);
   });
   out.push_back([this, &results]() {
     results.rmsnorm = RMSNormLayerCl::registerClKernels(*this);
   });
-  out.push_back([this, &results]() {
-    results.swiglu = SwiGLULayerCl::registerClKernels(*this);
-  });
+  out.push_back(
+    [this, &results]() { results.swiglu = registerSwiGLUClKernels(*this); });
+  out.push_back(
+    [this, &results]() { results.geglu = registerGeGLUClKernels(*this); });
   out.push_back([this, &results]() {
     results.reshape = ReshapeLayerCl::registerClKernels(*this);
-  });
-  out.push_back([this, &results]() {
-    results.fully_connected = FullyConnectedLayerCl::registerClKernels(*this);
-  });
-  out.push_back([this, &results]() {
-    results.addition = AdditionLayerCL::registerClKernels(*this);
   });
   out.push_back([this, &results]() {
     results.transpose = TransposeLayerCl::registerClKernels(*this);
@@ -309,21 +426,42 @@ void ClContext::collectDefaultObjectKernelTasks(
 }
 
 void ClContext::registerDefaultFactories(const DefaultKernelResults &results) {
-  if (results.fully_connected) {
-    registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
-                    FullyConnectedLayerCl::type,
-                    ml::train::LayerType::LAYER_FC);
-  }
+  // The quantized FC layer is backend-neutral now: the GEMM dispatches
+  // through the op table (ClComputeOps::fc), so there is no per-layer kernel
+  // registration to gate on.
+  registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
+                  FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
 
-  if (results.addition) {
-    registerFactory(nntrainer::createLayer<AdditionLayerCL>,
-                    AdditionLayerCL::type,
-                    ml::train::LayerType::LAYER_ADDITION);
-  }
+  // The core AdditionLayer is backend-neutral: its per-input copy/add
+  // dispatches via ComputeOps::residual_op (the GPU residency body lives in
+  // ClComputeOps::residual_op). createLayer("addition", {engine=gpu}) routes
+  // here; the former AdditionLayerCL fork is deleted.
+  registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
+                  ml::train::LayerType::LAYER_ADDITION);
 
   if (results.swiglu) {
-    registerFactory(nntrainer::createLayer<SwiGLULayerCl>, SwiGLULayerCl::type,
+    // createLayer("swiglu", {engine=gpu}) routes to the backend-neutral
+    // SwiGLULayer, which dispatches via ClComputeOps::swiglu. (CPU/CUDA use
+    // the same neutral class registered on their contexts.)
+    registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type,
                     ml::train::LayerType::LAYER_SWIGLU);
+  }
+
+  if (results.geglu) {
+    // No dedicated LayerType enum for GeGLU; register by type string only
+    // (int_key auto-assigned). createLayer("geglu", {engine=gpu}) routes to
+    // the backend-neutral GeGLULayer, which dispatches via
+    // ClComputeOps::geglu.
+    registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+    // scalar_multiply GPU variant: the OpenCL-resident class for the
+    // "scalar_multiply" type on the gpu context (the CPU class stays on the
+    // cpu/cuda contexts).
+    registerFactory(nntrainer::createLayer<ScalarMultiplyLayerGPU>,
+                    ScalarMultiplyLayerGPU::type);
+    // tie_word_embedding: the lm_head (GPU Q6_K/Q4_0 GEMV on the gpu
+    // context, host loop otherwise). Same class on cpu/gpu/cuda.
+    registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                    TieWordEmbedding::type);
   }
 
   if (results.reshape) {
@@ -454,6 +592,40 @@ void ClContext::collectAttentionKernelTasks(
   out.push_back([this]() {
     registerClKernel(rotary_emb_fp16_kernel, "rotary_emb_cl_fp16");
   });
+
+  // Pre-build the prefill-critical PROGRAMS at context init (model load) so
+  // their one-time build/binary-load cost does not land inside the first
+  // timed prefill. One kernel per program suffices: the program cache in
+  // clCreateKernel makes sibling kernels of the same source free. Skipped
+  // under NNTR_V8C_BUF (Intel buffer path) where these programs use
+  // different compile options -- the hot path builds them on first use as
+  // before.
+  //
+  // These go through the same task list as everything else, so the prewarm is
+  // built on the pool rather than serially after it.
+  if (std::getenv("NNTR_V8C_BUF") == nullptr) {
+    out.push_back([this]() {
+      registerClKernel(two_conv_attention_kernel, "softmax_row_f16");
+    });
+    out.push_back([this]() {
+      registerClKernel(int8_int4_gemm_v8c_kernel, "v8c_act_quant_f16_par");
+    });
+    // rope/scatter program (file-local source in attention_kernels.cpp).
+    out.push_back([this]() { attention_prewarm_programs(*this); });
+    // Remaining first-use builds profiling shows inside the first prefill as
+    // one-time idle outliers: the fp16 norm program and the Q6_K lm_head
+    // GEMV program.
+    out.push_back([this]() {
+      registerClKernel(rmsnorm_fp16_kernel, "rmsnorm_cl_fp16_coop");
+    });
+    out.push_back([this]() {
+      registerClKernel(q6_k_sgemv_kernel, "kernel_mul_mv_q6_K_f32");
+    });
+    // v8c output-residency program (copy_h2h/add_h2h, file-local source in
+    // blas_kernel_interface.cpp) -- the rmsnorm->copy_h2h and gemm->copy_h2h
+    // first-call outliers.
+    out.push_back([this]() { v8c_prewarm_programs(*this); });
+  }
 #endif
 }
 
@@ -471,8 +643,9 @@ void ClContext::initAttentionClKernels() {
 }
 
 const ClContext::SharedPtrClKernel
-ClContext::registerClKernel(std::string kernel_string, std::string kernel_name,
-                            std::string compile_options) {
+ClContext::registerClKernel(const std::string &kernel_string,
+                            const std::string &kernel_name,
+                            const std::string &compile_options) {
   // The eager bring-up registers kernels from a build pool, so the map is
   // guarded. The lock is never held across a program build -- those take
   // hundreds of milliseconds on a cold cache -- so two threads may build the
@@ -480,6 +653,11 @@ ClContext::registerClKernel(std::string kernel_string, std::string kernel_name,
   // duplicate is dropped, which is correct because the two objects are
   // interchangeable. Uncontended locking here costs tens of nanoseconds, and
   // only on the registration path.
+  //
+  // The parameters are const references, NOT by value: the old by-value
+  // signature copied the multi-10KB kernel source on every cached lookup,
+  // measured at ~12ms per call on Adreno/Android (~36ms of host issue tax per
+  // layer in the attention path alone, with the GPU idle for exactly that).
   static std::mutex kernel_map_mutex;
   const std::string key = kernel_name + compile_options;
 
@@ -491,9 +669,11 @@ ClContext::registerClKernel(std::string kernel_string, std::string kernel_name,
       return it->second;
   }
 
-  // creating shared_ptr for kernel object
+  // creating shared_ptr for kernel object (cold path: copies are fine here,
+  // clCreateKernel takes mutable refs)
+  std::string ks = kernel_string, kn = kernel_name, co = compile_options;
   SharedPtrClKernel kernelPtr = std::make_shared<opencl::Kernel>();
-  if (!clCreateKernel(kernel_string, kernel_name, compile_options, kernelPtr)) {
+  if (!clCreateKernel(ks, kn, co, kernelPtr)) {
     ml_loge("Failed to register kernel %s", kernel_name.c_str());
     return nullptr;
   }
@@ -513,13 +693,37 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 
   opencl::Program program;
 
-  // Cache key: the source AND the compile options. A stored binary is only a
-  // valid substitute for the exact source it was built from with the exact
-  // options it was built with, so kernels that share one source but differ in
-  // compile options (e.g. an fp16 variant selected by a -D) must not collide
-  // on one cache entry.
+  // In-memory program cache: kernels that share one source+options reuse the
+  // built cl_program. Without this every kernel re-did its own binary-file
+  // read + clCreateProgramWithBinary (~300ms for the large sources on
+  // Adreno 840) -- e.g. 3 kernels of one program paid ~0.9s, all inside the
+  // first timed run (mis-read as a per-call issue tax).
+  static std::unordered_map<std::string, opencl::Program> program_cache;
+  static std::mutex program_cache_mtx;
+  const std::string pc_key =
+    std::to_string(program.GetKernelHash(kernel_string, "")) + "|" +
+    compile_options;
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    auto it = program_cache.find(pc_key);
+    if (it != program_cache.end())
+      return kernel_ptr_->CreateKernelFromProgram(it->second, kernel_name);
+  }
+
+  // On-disk kernel binary cache. The cache key folds in the per-kernel
+  // compile_options AND the device signature (name + driver version): a stored
+  // binary is only a valid substitute for the exact source it was built from
+  // with the exact options it was built with, and only on the same GPU/driver,
+  // so kernels that share one source but differ in compile options (e.g. an
+  // fp16 variant selected by a -D) must not collide on one cache entry, and a
+  // binary from another device or a driver update must never be loaded as-is.
+  // clCreateProgramWithBinary still validates and can reject a stale binary,
+  // so a load failure falls back to a source compile (and re-caches).
+  static const std::string device_sig =
+    opencl::ContextManager::Global().GetDeviceSignature();
   const std::string binary_file_name =
-    std::to_string(program.GetKernelHash(kernel_string, compile_options)) +
+    std::to_string(program.GetKernelHash(kernel_string,
+                                         compile_options + "|" + device_sig)) +
     ".cl.bin";
   std::string binary_file_path = kernelCacheDir() + "/" + binary_file_name;
   auto binary_data = KERNEL_CACHE_ENABLED ? readBinaryFile(binary_file_path)
@@ -566,7 +770,6 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
       // the kernel (and with it every GPU code path that needs it).
       auto binary = program.GetProgramBinary(
         opencl::ContextManager::Global().GetDeviceId());
-
       if (binary.empty()) {
         ml_logw("Failed retrieving binary for kernel %s; skipping cache write",
                 kernel_name.c_str());
@@ -581,6 +784,10 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
     return false;
   }
 
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    program_cache.emplace(pc_key, program);
+  }
   result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
 
   return result;
@@ -592,5 +799,13 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 template const int ClContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
+
+// Non-template seam (Context::registerLayerFactory override): forwards to the
+// per-class registerFactory<Layer> here in the same TU so the explicit
+// instantiation is used and no template crosses the .so boundary.
+int ClContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                                    const std::string &key, const int int_key) {
+  return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
 
 } // namespace nntrainer

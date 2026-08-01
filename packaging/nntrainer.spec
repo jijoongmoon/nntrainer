@@ -732,6 +732,19 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/optimizer_wrapped.h
 %{_includedir}/nntrainer/mem_allocator.h
 %{_includedir}/nntrainer/weight_layer.h
+# residency planner headers
+%{_includedir}/nntrainer/residency_policy.h
+%{_includedir}/nntrainer/residency_planner.h
+# LLM layer headers (promoted to core)
+%{_includedir}/nntrainer/layer_prof.h
+%{_includedir}/nntrainer/lm_head.h
+%{_includedir}/nntrainer/logit_softcapping.h
+%{_includedir}/nntrainer/scalar_multiply.h
+%{_includedir}/nntrainer/scalar_multiply_gpu.h
+%{_includedir}/nntrainer/tie_word_embedding.h
+%{_includedir}/nntrainer/qkv_layer.h
+%{_includedir}/nntrainer/geglu_layer.h
+%{_includedir}/nntrainer/swiglu_layer.h
 %if %{with gpu}
 %{_includedir}/nntrainer/CL/cl.h
 %{_includedir}/nntrainer/CL/cl_platform.h
