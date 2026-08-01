@@ -60,9 +60,9 @@ void ClBufferPool::allocate() {
   }
 
   // (2) Resolve CL_DEVICE_MEM_BASE_ADDR_ALIGN (reported in BITS by the spec).
-  //     Later stages pad each per-tensor sub-buffer offset up to this so
-  //     clCreateSubBuffer origins are valid; log it now to settle the value on
-  //     the live device.
+  //     Reported for the record and exposed via baseAddrAlign(); the per-offset
+  //     buffers below are standalone allocations (origin 0), so nothing pads an
+  //     offset to it -- see the identity note in (3).
   cl_uint align_bits = 0;
   if (clGetDeviceInfo(dev, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(align_bits),
                       &align_bits, nullptr) == CL_SUCCESS)
@@ -70,27 +70,36 @@ void ClBufferPool::allocate() {
   ml_logi("ClBufferPool: CL_DEVICE_MEM_BASE_ADDR_ALIGN = %u bits (%zu bytes)",
           align_bits, base_addr_align_);
 
-  // (3) Pad each per-token planner offset up to base_addr_align_ so a
-  //     clCreateSubBuffer origin is valid. Liveness reuse is preserved: tokens
-  //     the planner gave the SAME offset (non-overlapping lifetimes) round to
-  //     the same padded offset and so share one sub-buffer region. The cl_mem
-  //     plane is sized to the furthest padded slice.
-  const size_t align = base_addr_align_ ? base_addr_align_ : 128;
+  // (3) Take each token's RAW planner offset as its per-buffer IDENTITY. The
+  //     sharing rule is exactly the planner's: tokens the planner placed at the
+  //     SAME offset have disjoint lifetimes and share one cl_mem, tokens at
+  //     DISTINCT offsets may be live at the same time and must never share one.
+  //     The identity must therefore be injective in the offset. Rounding the
+  //     offset up to base_addr_align_ first is NOT: the planner packs
+  //     byte-contiguously with no alignment gaps, so any two distinct offsets
+  //     inside one align-sized ceiling bucket map to the same value (with a
+  //     128-byte align, 64 and 128 both become 128; 192 and 256 both become
+  //     256). Two simultaneously-live tensors -- gamma / scalar-sized weights
+  //     are exactly this size class -- then collapse onto ONE buffer sized to
+  //     max(sz) and overwrite each other from byte 0.
+  //     Alignment was only ever needed while these were clCreateSubBuffer
+  //     slices of one parent plane; each offset now owns a standalone cl_mem
+  //     whose origin is 0, so no padding is involved.
   auto &offsets = getMemoryOffset();
   auto &sizes = getMemorySize();
-  padded_offsets_.resize(offsets.size());
+  token_offsets_.resize(offsets.size());
   offset_maxsize_.clear();
   cl_pool_bytes_ = 0;
   for (size_t i = 0; i < offsets.size(); ++i) {
-    const size_t po = ((offsets[i] + align - 1) / align) * align;
-    padded_offsets_[i] = po;
+    const size_t off = offsets[i];
+    token_offsets_[i] = off;
     const size_t sz = (i < sizes.size()) ? sizes[i] : 0;
-    // One shared sub-buffer per padded offset must cover the LARGEST tensor the
+    // The one shared buffer per offset must cover the LARGEST tensor the
     // planner reused there (disjoint lifetimes, possibly different sizes).
-    auto it = offset_maxsize_.find(po);
+    auto it = offset_maxsize_.find(off);
     if (it == offset_maxsize_.end() || sz > it->second)
-      offset_maxsize_[po] = sz;
-    const size_t end = po + sz;
+      offset_maxsize_[off] = sz;
+    const size_t end = off + sz;
     if (end > cl_pool_bytes_)
       cl_pool_bytes_ = end;
   }
@@ -105,9 +114,8 @@ void ClBufferPool::allocate() {
   clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem),
                   &global_mem, nullptr);
 
-  // (5) Allocate ONE device cl_mem per DISTINCT padded offset, each sized to
-  // the
-  //     largest tensor the planner reused at that offset. A single whole-plane
+  // (5) Allocate ONE device cl_mem per DISTINCT planner offset, each sized to
+  //     the largest tensor the planner reused at that offset. A whole-plane
   //     cl_mem would exceed CL_DEVICE_MAX_MEM_ALLOC_SIZE for large models on
   //     Adreno -- a Qwen3-4B layer-graph plane is ~2 GB, past the 1.38 GB
   //     single-allocation cap, and clCreateBuffer fails with
@@ -123,10 +131,33 @@ void ClBufferPool::allocate() {
   //     Hard-fail (no SVM fallback) so a cl_mem-mode run never silently
   //     degrades to the corrupting hybrid.
   size_t alloc_total = 0, alloc_max = 0;
+  // [kvi8-mem] Offsets that need a device cl_mem = those bound by at least one
+  // GPU_CLMEM (non-SVM) token. An offset used ONLY by SVM-classified tokens
+  // (setSvmOnlyTokens) skips its cl_mem: it is read via SVM and the eager
+  // per-offset buffer is pure committed waste (e.g. a MAX_LIFESPAN int8 KV
+  // cache at long context can waste hundreds of MB this way). Default (no
+  // SVM-only tokens marked) -> every offset needs cl_mem = byte-identical to
+  // the always-allocate path.
+  static const bool _svm_skip = [] {
+    const char *e = std::getenv("NNTR_CLMEM_SVM_SKIP");
+    return !(e && e[0] == '0');
+  }();
+  const bool svm_skip_active = _svm_skip && !svm_only_tokens_.empty();
+  std::unordered_set<size_t> clmem_needed;
+  if (svm_skip_active) {
+    for (size_t i = 0; i < token_offsets_.size(); ++i)
+      if (!svm_only_tokens_.count(static_cast<unsigned int>(i + 1)))
+        clmem_needed.insert(token_offsets_[i]);
+  }
+  size_t svm_skipped_bytes = 0;
   for (const auto &kv : offset_maxsize_) {
     const size_t sz = kv.second;
     if (sz == 0)
       continue;
+    if (svm_skip_active && !clmem_needed.count(kv.first)) {
+      svm_skipped_bytes += sz; // SVM-only offset: no device cl_mem plane
+      continue;
+    }
     // A single tensor larger than the device single-allocation cap cannot be a
     // cl_mem at all (clCreateBuffer -> CL_INVALID_BUFFER_SIZE). The only tensor
     // that hits this is a host-resident quantized weight plane (e.g. Gemma4's
@@ -166,21 +197,29 @@ void ClBufferPool::allocate() {
 
   ml_logi("ClBufferPool: allocated %zu per-offset device cl_mem buffers "
           "(total %.1f MB, plane extent %.1f MB, largest single %.1f MB; "
-          "device MAX_MEM_ALLOC_SIZE %.1f MB, GLOBAL_MEM_SIZE %.1f MB)",
+          "device MAX_MEM_ALLOC_SIZE %.1f MB, GLOBAL_MEM_SIZE %.1f MB; "
+          "SVM-only skipped %.1f MB)",
           offset_sub_.size(), alloc_total / 1048576.0,
           cl_pool_bytes_ / 1048576.0, alloc_max / 1048576.0,
-          max_alloc / 1048576.0, global_mem / 1048576.0);
+          max_alloc / 1048576.0, global_mem / 1048576.0,
+          svm_skipped_bytes / 1048576.0);
+  if (std::getenv("NNTR_KVI8_MEMDIAG") != nullptr)
+    std::fprintf(stderr,
+                 "[clmem] %zu cl_mem buffers, total %.1f MB, SVM-only skipped "
+                 "%.1f MB\n",
+                 offset_sub_.size(), alloc_total / 1048576.0,
+                 svm_skipped_bytes / 1048576.0);
 }
 
 void ClBufferPool::ensureZeroFilled(unsigned int idx) {
   const size_t i = idx - 1;
-  if (i >= padded_offsets_.size())
+  if (i >= token_offsets_.size())
     return;
-  const size_t po = padded_offsets_[i];
-  if (zero_filled_.count(po))
+  const size_t off = token_offsets_[i];
+  if (zero_filled_.count(off))
     return;
-  auto hit = offset_sub_.find(po);
-  auto szit = offset_maxsize_.find(po);
+  auto hit = offset_sub_.find(off);
+  auto szit = offset_maxsize_.find(off);
   if (hit == offset_sub_.end() || hit->second == nullptr ||
       szit == offset_maxsize_.end() || szit->second == 0)
     return;
@@ -198,7 +237,7 @@ void ClBufferPool::ensureZeroFilled(unsigned int idx) {
                           nullptr) != CL_SUCCESS)
     throw std::runtime_error(
       "ClBufferPool: clEnqueueFillBuffer (lazy zero-init) failed");
-  zero_filled_.insert(po);
+  zero_filled_.insert(off);
 }
 
 std::shared_ptr<MemoryData> ClBufferPool::getMemory(unsigned int idx) {
@@ -208,16 +247,18 @@ std::shared_ptr<MemoryData> ClBufferPool::getMemory(unsigned int idx) {
 
   // Stamp the per-offset cl_mem (allocated up-front in allocate()) onto
   // device_mem. A GPU producer can write this buffer and a GPU consumer bind it
-  // (no SVM map). ONE handle per padded offset: tokens the planner reused at
+  // (no SVM map). ONE handle per planner offset: tokens the planner reused at
   // the same offset bind the SAME cl_mem handle (coherent on Adreno's
-  // per-handle cache). Stamp it but leave device_valid FALSE -- a tensor uses
+  // per-handle cache), and tokens at DIFFERENT offsets never do -- the offset
+  // is taken raw, so two live tensors can never land on one handle.
+  // Stamp it but leave device_valid FALSE -- a tensor uses
   // this cl_mem only when its static residency class is GPU_CLMEM (isClMem());
   // device_valid stays the runtime "producer wrote it this forward" signal.
   // SVM/HOST tensors get a handle stamped too but never bind it.
   const size_t i = idx - 1;
-  if (i < padded_offsets_.size()) {
-    const size_t po = padded_offsets_[i];
-    auto hit = offset_sub_.find(po);
+  if (i < token_offsets_.size()) {
+    const size_t off = token_offsets_[i];
+    auto hit = offset_sub_.find(off);
     if (hit != offset_sub_.end() && hit->second != nullptr)
       md->setDeviceValid(false, hit->second);
   }
@@ -236,7 +277,7 @@ void ClBufferPool::deallocate() {
     clReleaseMemObject(static_cast<cl_mem>(cl_pool_));
     cl_pool_ = nullptr;
   }
-  padded_offsets_.clear();
+  token_offsets_.clear();
   cl_pool_bytes_ = 0;
   MemoryPool::deallocate();
 }
