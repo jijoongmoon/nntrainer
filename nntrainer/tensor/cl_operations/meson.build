@@ -11,6 +11,8 @@ cl_op_sources = [
   'sigmoid_add_cl_op.cpp',
   # rms_reverse_norm_cl_op.h is deliberately NOT in cl_op_headers: the raw
   # kernel dispatch is private behind ComputeOps::rms_reverse_norm.
+  # rms_reverse_norm_cl_op.h is deliberately NOT in cl_op_headers: the raw
+  # kernel dispatch is private behind ComputeOps::rms_reverse_norm (N4).
   'rms_reverse_norm_cl_op.cpp',
   'cl_tensor_view.cpp',
   'cl_tensor_backing_pool.cpp',

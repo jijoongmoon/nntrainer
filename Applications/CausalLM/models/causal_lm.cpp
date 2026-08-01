@@ -42,6 +42,7 @@
 #include <mha_core.h>
 #include <neuralnet.h>
 #include <nntrainer_error.h>
+#include <nntrainer_log.h>
 #include <residency_policy.h>
 #include <nntrainer_log.h>
 #include <residency_policy.h>
