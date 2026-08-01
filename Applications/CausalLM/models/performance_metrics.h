@@ -68,6 +68,33 @@ inline size_t getPeakMemoryKb() {
 #endif
 }
 
+/**
+ * @brief Peak private commit (pagefile-backed) in KB, or 0 if unavailable.
+ * @note Complements getPeakMemoryKb() (peak working set). Working set counts
+ *  physically-resident pages INCLUDING shareable file-backed ones (mmap'd
+ *  weights, DLLs) and is trimmed by the OS under pressure; peak commit counts
+ *  only this process's private, committed VA and is what the system commit
+ *  limit charges. For memory-footprint questions (capacity sizing, leak
+ *  detection, KV-quantization savings) commit is the honest number -- large
+ *  coarse GPU-SVM/UVM slabs are only fractionally charged to working set, so
+ *  a KV-cache halving can be invisible in WS yet visible in commit. On
+ *  non-Windows peak commit is not exposed via getrusage -> returns 0.
+ */
+inline size_t getPeakCommitKb() {
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS_EX pmcx;
+  pmcx.cb = sizeof(pmcx);
+  if (GetProcessMemoryInfo(GetCurrentProcess(),
+                           reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&pmcx),
+                           sizeof(pmcx))) {
+    return (size_t)(pmcx.PeakPagefileUsage / 1024);
+  }
+  return 0;
+#else
+  return 0; // getrusage exposes peak RSS only, not peak commit
+#endif
+}
+
 #endif // __cplusplus
 
 #endif // __CAUSAL_LM_PERFORMANCE_METRICS_H__
