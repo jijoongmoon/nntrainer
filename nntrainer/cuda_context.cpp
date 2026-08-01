@@ -27,9 +27,16 @@
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
+// runDecode (T9): the CUDA-graph decode/prefill state machine, relocated
+// verbatim from neuralnet.cpp. Needs the model walk + graph-node access + the
+// CUDA graph API (cuda_context.h already pulls in StreamManager /
+// ContextManager).
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <layer_node.h>
+#include <neuralnet.h>
 
 namespace nntrainer {
 
@@ -87,9 +94,101 @@ void CudaContext::initialize() noexcept {
     // Default-on: keep the CUDA per-op drains (NNTR_CUDA_ASYNC=0) so decode is
     // reproducible; overwrite=0 lets an explicit NNTR_CUDA_ASYNC win.
     // NNTR_DETERMINISTIC=0 opts out (async submission allowed).
+    //
+    // MERGE ORDER: this block runs BEFORE the HW-class profile below on
+    // purpose. Both set NNTR_CUDA_ASYNC with overwrite=0, and the determinism
+    // contract is default-ON / opt-out, so the deterministic value must be the
+    // one that lands first; the profile's own ASYNC setenv is then inert unless
+    // NNTR_DETERMINISTIC=0 left this one unset.
     if (const char *det = std::getenv("NNTR_DETERMINISTIC");
         !(det && det[0] == '0'))
       setenv("NNTR_CUDA_ASYNC", "0", 0);
+
+    // HW-optimal CUDA env defaults (same rationale/semantics as ClContext):
+    // NNTR_ENGINE=cuda already selected this context (so no engine guard is
+    // needed here — this only runs on a CUDA run), fill the tuned GPU-op flag
+    // set so a bare CUDA run gets full-GPU residency without exporting ~15
+    // flags. setenv(..., 0): overwrite=0, so an explicit env ALWAYS wins (=0
+    // disables). These are the COMMON flags — "all models, both HW classes" —
+    // that move rope/attn/geglu/eltwise/qknorm/FC onto the GPU. Several of
+    // these gate app-side (rope/attn) or deferred (M2B just landed) paths, so
+    // they are inert until those consumers exist; harmless when unread.
+    setenv("NNTR_CUDA_ROPE", "1", 0);
+    setenv("NNTR_CUDA_ATTN", "1", 0);
+    setenv("NNTR_CUDA_KV_UVM", "1", 0);
+    setenv("NNTR_CUDA_GEGLU", "1", 0);
+    setenv("NNTR_CUDA_ELTWISE", "1", 0);
+    setenv("NNTR_CUDA_QKNORM", "1", 0);
+    setenv("NNTR_CUDA_FLASH_DECODE", "64", 0);
+    setenv("NNTR_CUDA_BLOCKQ", "1", 0);
+    setenv("NNTR_FC_CUDA_CUBLAS", "1", 0);
+    setenv("NNTR_CUDA_PREWARM", "1", 0);
+    if (!caps_.integrated && context_inst_.concurrentManagedAccess()) {
+      // Discrete (RTX/dGPU) residency + decode-CUDA-graph add-ons: device-only
+      // activations, prefill v-copy, ALL-rows CUDA RMSNorm (despite the env's
+      // name, "=all" RAISES the CUDA row cap to everything -- see
+      // cuda_rmsnorm_layer.cpp; a non-'a' value like =1 is what disables it),
+      // the M2-B decode graph, and async submission. On integrated
+      // (Tegra/Orin) these are skipped — managed activations are the right
+      // pool. Also skipped when concurrentManagedAccess==0 (Windows WDDM): each
+      // of these lets a HOST op touch managed/device pool memory around
+      // in-flight kernels (ASYNC drops the per-op drains outright;
+      // DEV_ACT+RMSNORM_OFF put host RMSNorm/staging reads mid-chain), which is
+      // only legal under cMA=1 — on WDDM the first such touch is a 0xC0000005
+      // host AV. The safe WDDM default is the base profile: managed pools +
+      // per-op drains.
+      // NNTR_CUDA_DEV_ACT is NOT auto-defaulted in this tree: it swaps the
+      // activation pool to device-only cudaMalloc (manager.h
+      // activationAllocator), which is only legal once the WHOLE forward
+      // chain runs device kernels. This tree still has host layer segments
+      // on the cuda context (reshaped_rms_norm q/k-norm, per_layer_slice,
+      // sigmoid gates, tie_word lm_head) -- any of them touching a
+      // device-only activation is a host SIGSEGV (measured: qwen3 faults in
+      // __fallback_rms_norm_wrt_width_fp16_intrinsic on the first q-norm).
+      // Managed (UVM) activations keep every host segment correct at
+      // cMA-coherent speed; NNTR_CUDA_DEV_ACT=1 remains an explicit opt-in
+      // for trees with a fully device-resident chain.
+      setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
+      setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+      // NNTR_CUDA_M2B is NOT auto-defaulted in this tree. The M2-B decode
+      // graph (c1fa0171e) shipped as opt-in with two hard correctness
+      // dependencies that are not present here: (a) the g_m2b_skip_all
+      // embed-only feed is set by runDecode but no graph-walk consumer was
+      // ported (neuralnet.cpp declares the flag; nothing reads it), so every
+      // replay token re-runs the full eager forward on top of the replayed
+      // graph; (b) the decode chain still has host/OpenCL segments (Q6_K
+      // tie_word lm_head -- trackC5e not ported), which read mid-capture UVM
+      // garbage while the stream is capturing. Measured on qwen3 (RTX 5060,
+      // 2026-07-30): M2B=1 -> deterministic decode garbage (" is is are you
+      // in"), M2B=0 -> coherent golden. Explicit NNTR_CUDA_M2B=1 remains an
+      // opt-in for trees that carry both halves.
+      // NNTR_DETERMINISTIC keeps the per-op drains: ASYNC removes them and
+      // is the one auto-set lever whose host/device overlap can turn a
+      // knife-edge logit into a run-to-run coin flip (measured).
+      {
+        const char *det = getenv("NNTR_DETERMINISTIC");
+        setenv("NNTR_CUDA_ASYNC", (det && det[0] == '1') ? "0" : "1", 0);
+      }
+    } else if (!caps_.integrated) {
+      // Windows WDDM (discrete, cMA==0): the per-token ~350-launch dispatch
+      // pays the WDDM submission tax (~94us/launch -> decode ~30 TPS on a
+      // 5070L). Default ON the same device-resident chain + M2-B decode
+      // graph as the cMA branch above -- all four are long field-proven on
+      // WDDM (the Windows a2 production stack) and the graph replay is ONE
+      // launch per token (measured 58-63 TPS, +93-100%, byte-identical,
+      // 6-run deterministic; packaged-SDK summary 30.6 -> 57.9). A FIXED
+      // replayed graph is deterministic by construction, so the
+      // default-determinism contract holds. Every setenv here is
+      // overwrite=0 and value-checked downstream, so =0 (or =1 for
+      // RMSNORM_CUDA_OFF) still opts out per lever. ASYNC stays off: drain
+      // removal is the measured knife-edge nondeterminism lever and adds
+      // nothing on top of the graph (58.5 vs 58.4 TPS).
+      // NNTR_CUDA_DEV_ACT / NNTR_CUDA_M2B: not auto-defaulted -- same
+      // missing-dependency rationale as the cMA branch above (host layer
+      // segments remain; no g_m2b_skip_all consumer, no CUDA lm_head).
+      setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
+      setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+    }
 
     add_default_object();
 
@@ -253,6 +352,276 @@ int CudaContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
                                       const std::string &key,
                                       const int int_key) {
   return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
+
+// SEAM-2 CUDA override (docs/ARCHITECTURE_REFACTOR.md §10 T9). Relocated
+// VERBATIM from neuralnet.cpp's incremental_inference #if ENABLE_CUDA block —
+// the only changes are the model walk (`nn.incremental_forwarding`), graph-node
+// access
+// (`nn.getLayerNode` / `nn.feedInputsLabels`), the M2-B skip flag
+// (`nn.setM2BSkipAll`), and the prefill-capture flag
+// (`nn.isPrefillCaptureDisabled()`). All decisions/env reads/static state are
+// unchanged, so engine=cuda decode is behaviorally identical.
+sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
+                                          unsigned int to,
+                                          const sharedConstTensors &input,
+                                          const sharedConstTensors &label) {
+  sharedConstTensors out;
+
+  // CUDA-graph capture of a whole DECODE forward (NNTR_CUDA_GRAPH, M1). A
+  // decode step issues ~1000 tiny kernels; the CPU launch/dispatch between them
+  // is the decode bottleneck (GPU ~30-47% utilized). Capturing the per-token
+  // forward into one graph and replaying it collapses that launch overhead. M1
+  // re-instantiates every step (still pays cudaGraphInstantiate) purely to
+  // prove capture+replay COHERENCE; M2 will cache the graphExec and patch
+  // params.
+  static const char *_cgraph_env = std::getenv("NNTR_CUDA_GRAPH");
+  static const bool cuda_graph_decode =
+    _cgraph_env != nullptr && _cgraph_env[0] == '1';
+  // PREFILL graph (W3): capture the M>1 prefill forward like decode. Default ON
+  // for INTEGRATED GPUs (Orin) when the graph path is enabled; discrete GPUs
+  // (RTX) keep eager-async prefill. Override: NNTR_CUDA_PREFILL_GRAPH=1/0.
+  static const bool cuda_graph_prefill = []() {
+    const char *e = std::getenv("NNTR_CUDA_PREFILL_GRAPH");
+    if (e != nullptr)
+      return e[0] != '0';
+    const char *g = std::getenv("NNTR_CUDA_GRAPH");
+    return g != nullptr && g[0] == '1' &&
+           nntrainer::cuda::ContextManager::Global().isIntegrated();
+  }();
+  static const bool cuda_graph_dbg =
+    std::getenv("NNTR_CUDA_GRAPH_DBG") != nullptr;
+  // Diagnostic: cache the exec from the first captured token and RE-LAUNCH it
+  // for subsequent tokens (incoherent; measures the pure cudaGraphLaunch+sync
+  // ceiling).
+  static const bool cuda_graph_replay =
+    std::getenv("NNTR_CUDA_GRAPH_REPLAY") != nullptr;
+  static cudaGraphExec_t _cg_cached_exec = nullptr;
+  static sharedConstTensors _cg_cached_out;
+  static unsigned long _cg_ok = 0, _cg_fallback = 0;
+  bool cuda_graph_captured = false;
+
+  // M2-B: single-capture COHERENT decode. Capture the full forward ONCE (first
+  // decode token); for every later token, refresh ONLY the embeddings on the
+  // host (g_m2b_skip_all feed pass), update the device position (cuda_set_pos),
+  // and REPLAY the cached graph -- skipping the ~350-op C++ dispatch.
+  // VALUE-checked (=0 disables): cuda_context auto-sets NNTR_CUDA_M2B=1 on
+  // discrete+cMA boxes (setenv overwrite=0), so a presence check made =0 a
+  // FRANKEN-state -- graph capture/replay here stayed ON while the mha_core
+  // slot-writes (nntr_env_on, value-checked) turned OFF: replay then rewrites
+  // K/V at the first captured slot every token = deterministic decode garbage
+  // (field 2026-07-10: Linux HOST_MAPPED mimic with M2B=0 looped "toasters,
+  // which in turned" -- the exact same env-check split we swept everywhere
+  // else; see env_compat.h).
+  static const bool cuda_m2b = nntr_env_on("NNTR_CUDA_M2B");
+  if (cuda_m2b && (from == 0 || (to - from) > 1) &&
+      _cg_cached_exec != nullptr) {
+    // Prefill boundary: a new sequence (from==0) OR a resumed-block prefill
+    // (from>0, M>1 — multi-turn / KV-restore under NNTR_RESUME_BLOCK). Drop
+    // the previous sequence's cached decode graph BEFORE the eager M>1
+    // forward: that forward may grow (free+realloc) the dp4a/i8/attention
+    // scratch the captured graph references, and replaying it afterwards
+    // launches with dangling device/pinned pointers (cudaGraphLaunch SEGV).
+    // The next decode recaptures against the fresh pointers anyway.
+    cudaGraphExecDestroy(_cg_cached_exec);
+    _cg_cached_exec = nullptr;
+    _cg_cached_out = {};
+  }
+  if (cuda_m2b && from != 0 && (to - from) == 1) {
+    auto &sm = nntrainer::cuda::StreamManager::Global();
+    if (_cg_cached_exec != nullptr) {
+      // subsequent token: embed-only feed (refresh emb_stage) -> set pos ->
+      // replay
+      static const bool m2b_light = nntr_env_on("NNTR_CUDA_M2B_LIGHT");
+      if (m2b_light) {
+        // lighter feed: set the new token input + run ONLY the two embedding
+        // nodes directly, bypassing the full ~350-node graph iteration.
+        nn.feedInputsLabels(input, label);
+        auto emb0 = nn.getLayerNode("embedding0");
+        auto ple = nn.getLayerNode("per_layer_input_embedding");
+        if (emb0)
+          emb0->incremental_forwarding(from, to, false);
+        if (ple)
+          ple->incremental_forwarding(from, to, false);
+      } else {
+        nn.setM2BSkipAll(true);
+        out = nn.incremental_forwarding(from, to, input, label, false);
+        nn.setM2BSkipAll(false);
+      }
+      nntrainer::cuda::cuda_set_pos((int)from, (int)from + 1);
+      cudaGraphLaunch(_cg_cached_exec, sm.GetStream());
+      cudaStreamSynchronize(sm.GetStream());
+      out = _cg_cached_out;
+      cuda_graph_captured = true;
+    } else if (sm.beginCapture()) {
+      // first decode token: set pos, capture the full forward, cache the exec
+      nntrainer::cuda::cuda_set_pos((int)from, (int)from + 1);
+      out = nn.incremental_forwarding(from, to, input, label, false);
+      cudaGraph_t graph = nullptr;
+      if (sm.endCapture(&graph) && graph != nullptr) {
+        if (cuda_graph_dbg) {
+          // Capture-fidelity forensics: how much of the ~1000-op forward
+          // actually landed in the graph, and (NNTR_CUDA_GRAPH_DOT=<path>)
+          // the full node dump for op-level diffing against the eager pass.
+          size_t n_nodes = 0;
+          cudaGraphGetNodes(graph, nullptr, &n_nodes);
+          std::fprintf(stderr, "[M2B] captured graph: %zu nodes\n", n_nodes);
+          if (const char *dot = std::getenv("NNTR_CUDA_GRAPH_DOT")) {
+            if (cudaGraphDebugDotPrint(
+                  graph, dot, cudaGraphDebugDotFlagsVerbose) == cudaSuccess)
+              std::fprintf(stderr, "[M2B] graph dot -> %s\n", dot);
+            cudaGetLastError();
+          }
+        }
+        if (cudaGraphInstantiate(&_cg_cached_exec, graph, 0) == cudaSuccess) {
+          cudaGraphLaunch(_cg_cached_exec, sm.GetStream());
+          cudaStreamSynchronize(sm.GetStream());
+          _cg_cached_out = out;
+          cuda_graph_captured = true;
+        }
+        cudaGraphDestroy(graph);
+      } else {
+        cudaGetLastError();
+      }
+    }
+    if (cuda_graph_dbg) {
+      static unsigned long _m2b_tok = 0;
+      if (++_m2b_tok <= 16)
+        std::fprintf(stderr, "[M2B] tok#%lu %s (exec=%p)\n", _m2b_tok,
+                     cuda_graph_captured ? "ok" : "FALLBACK",
+                     (void *)_cg_cached_exec);
+    }
+  }
+
+  if (!cuda_graph_captured && cuda_graph_decode && from != 0 &&
+      (to - from) == 1) {
+    auto &sm = nntrainer::cuda::StreamManager::Global();
+    const char *stage = "beginCapture";
+    cudaError_t cerr = cudaSuccess;
+    using _clk = std::chrono::high_resolution_clock;
+    auto _us = [](_clk::time_point a, _clk::time_point b) {
+      return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+        .count();
+    };
+    long t_rec = 0, t_inst = 0, t_rep = 0;
+    if (cuda_graph_replay && _cg_cached_exec != nullptr) {
+      // replay-only: relaunch the cached exec (timing ceiling, incoherent)
+      auto p2 = _clk::now();
+      cudaGraphLaunch(_cg_cached_exec, sm.GetStream());
+      cudaStreamSynchronize(sm.GetStream());
+      t_rep = _us(p2, _clk::now());
+      out = _cg_cached_out; // persistent output tensors, refilled by the replay
+      cuda_graph_captured = true;
+    } else if (sm.beginCapture()) {
+      auto p0 = _clk::now();
+      out = nn.incremental_forwarding(from, to, input, label, false);
+      cudaGraph_t graph = nullptr;
+      bool ended = sm.endCapture(&graph);
+      auto p1 = _clk::now();
+      t_rec = _us(p0, p1);
+      if (ended && graph != nullptr) {
+        cudaGraphExec_t exec = nullptr;
+        cerr = cudaGraphInstantiate(&exec, graph, 0);
+        auto p2 = _clk::now();
+        t_inst = _us(p1, p2);
+        if (cerr == cudaSuccess) {
+          cudaGraphLaunch(exec, sm.GetStream());
+          cudaStreamSynchronize(sm.GetStream());
+          t_rep = _us(p2, _clk::now());
+          if (cuda_graph_replay) {
+            _cg_cached_exec = exec; // keep for replay-only relaunch
+            _cg_cached_out = out;
+          } else {
+            cudaGraphExecDestroy(exec);
+          }
+          cuda_graph_captured = true;
+        } else {
+          stage = "cudaGraphInstantiate";
+        }
+        cudaGraphDestroy(graph);
+      } else {
+        // capture invalidated (e.g. a mid-capture cudaMalloc): record the error
+        // and clear the sticky flag so the eager fallback is not falsely
+        // flagged.
+        stage = "endCapture";
+        cerr = cudaGetLastError();
+      }
+    }
+    if (cuda_graph_captured)
+      ++_cg_ok;
+    else
+      ++_cg_fallback;
+    if (cuda_graph_dbg && (_cg_ok + _cg_fallback) <= 12) {
+      if (cuda_graph_captured)
+        std::fprintf(stderr,
+                     "[CUDA_GRAPH] tok#%lu %s  record=%ldus instantiate=%ldus "
+                     "replay+sync=%ldus\n",
+                     _cg_ok,
+                     t_rec ? "CAPTURED+REPLAYED" : "REPLAY-ONLY(cached)", t_rec,
+                     t_inst, t_rep);
+      else
+        std::fprintf(stderr,
+                     "[CUDA_GRAPH] fell back (captured=%lu fallback=%lu) "
+                     "stage=%s err=%d\n",
+                     _cg_ok, _cg_fallback, stage, (int)cerr);
+    }
+  }
+  // PREFILL graph capture (W3): same machinery as the decode M1 branch above,
+  // for the M>1 prefill (from==0). One beginCapture -> forward -> endCapture ->
+  // instantiate -> launch -> single sync, replacing the ~190 per-op drains.
+  if (!cuda_graph_captured && cuda_graph_prefill &&
+      !nn.isPrefillCaptureDisabled() && from == 0 && (to - from) > 1) {
+    auto &sm = nntrainer::cuda::StreamManager::Global();
+    using _clk = std::chrono::high_resolution_clock;
+    auto _us = [](_clk::time_point a, _clk::time_point b) {
+      return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+        .count();
+    };
+    long t_rec = 0, t_inst = 0, t_rep = 0;
+    const char *stage = "beginCapture";
+    cudaError_t cerr = cudaSuccess;
+    if (sm.beginCapture()) {
+      auto p0 = _clk::now();
+      out = nn.incremental_forwarding(from, to, input, label, false);
+      cudaGraph_t graph = nullptr;
+      bool ended = sm.endCapture(&graph);
+      auto p1 = _clk::now();
+      t_rec = _us(p0, p1);
+      if (ended && graph != nullptr) {
+        cudaGraphExec_t exec = nullptr;
+        cerr = cudaGraphInstantiate(&exec, graph, 0);
+        auto p2 = _clk::now();
+        t_inst = _us(p1, p2);
+        if (cerr == cudaSuccess) {
+          cudaGraphLaunch(exec, sm.GetStream());
+          cudaStreamSynchronize(sm.GetStream());
+          t_rep = _us(p2, _clk::now());
+          cudaGraphExecDestroy(exec);
+          cuda_graph_captured = true;
+        } else {
+          stage = "cudaGraphInstantiate";
+        }
+        cudaGraphDestroy(graph);
+      } else {
+        stage = "endCapture";
+        cerr = cudaGetLastError();
+      }
+    }
+    if (cuda_graph_dbg) {
+      static unsigned long _pf = 0;
+      std::fprintf(
+        stderr,
+        "[PREFILL_GRAPH] #%lu M=%u %s record=%ldus instantiate=%ldus "
+        "replay+sync=%ldus stage=%s err=%d\n",
+        ++_pf, (unsigned)(to - from),
+        cuda_graph_captured ? "CAPTURED" : "FALLBACK", t_rec, t_inst, t_rep,
+        stage, (int)cerr);
+    }
+  }
+  if (!cuda_graph_captured)
+    out = nn.incremental_forwarding(from, to, input, label, false);
+
+  return out;
 }
 
 } // namespace nntrainer
