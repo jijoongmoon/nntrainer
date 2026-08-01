@@ -254,6 +254,39 @@ private:
   std::unique_ptr<uint8_t[]> packed_data = nullptr;
 };
 
+/**
+ * @brief Record that a QS4CX weight's plain payload pages have been released.
+ *
+ * A GPU backend that repacks a QS4CX weight into a device-side form may drop
+ * the plain nibble+scale pages afterwards to reclaim the duplicate residency
+ * (see NNTR_V8C_DROP_PLAIN). Dropped pages are still mapped -- the address has
+ * to stay valid because the device-side weight caches are keyed on it -- but
+ * they read back as ZEROS. Any host consumer that reads the payload after the
+ * drop would therefore compute a well-formed, entirely wrong result.
+ *
+ * This registry is what lets those consumers refuse instead. It is written
+ * only by the dropping backend and read on the host GEMM path; when nothing
+ * has ever been dropped (the default) the query is a single relaxed atomic
+ * load, so the check costs nothing on the normal path.
+ *
+ * @param base  first byte of the plain payload (nibbles)
+ * @param bytes payload length (nibbles + fp32 scale tail)
+ */
+void markQs4cxPayloadDropped(const void *base, size_t bytes);
+
+/**
+ * @brief Has any QS4CX plain payload been dropped in this process?
+ * @note Cheap fast-path guard for the containment query below.
+ */
+bool anyQs4cxPayloadDropped();
+
+/**
+ * @brief Does @a ptr fall inside a QS4CX payload whose pages were dropped?
+ * @param ptr candidate payload base
+ * @retval true reading through @a ptr would return zeroed pages
+ */
+bool isQs4cxPayloadDropped(const void *ptr);
+
 } // namespace nntrainer
 
 #endif /* __cplusplus */
