@@ -21,6 +21,31 @@
 #define EXCEPT_WHEN_DEBUG noexcept
 #endif
 
+/**
+ * @brief 1 when this build has a host GEMM that can multiply an FP16
+ * activation by a QS4CX weight, i.e. when HalfTensor::dot() has a
+ * Tdatatype::QS4CX case.
+ *
+ * This is the ONLY place the condition is written down: HalfTensor::dot()
+ * guards its QS4CX case with this macro, and the model_tensor_type validation
+ * (nntrainer/models/model_common_properties.cpp) rejects "QS4CX-FP16" when it
+ * is 0, so that an unsupported build fails at property-set time with a
+ * message instead of at the first FC with "unsupported datatype".
+ *
+ * x86 only for now: the case widens the activation to FP32 and calls
+ * gemm_qai8dxp_qsi4cxp_rhs_unpacked(), which consumes the plain (unpacked)
+ * QS4CX blob x86 keeps in memory. On ARM the same weight is KAI rhs-packed
+ * (Tensor::pack()), so the unpacked kernel cannot read it and the packed
+ * FP16 KleidiAI micro-kernels are not dispatched yet. When a backend gains a
+ * case, extend this macro and the switch case together.
+ */
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
+  defined(__i386__)
+#define NNTR_HAS_HOST_QS4CX_FP16_GEMM 1
+#else
+#define NNTR_HAS_HOST_QS4CX_FP16_GEMM 0
+#endif
+
 namespace nntrainer {
 
 /**
