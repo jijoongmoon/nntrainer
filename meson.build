@@ -285,7 +285,24 @@ if get_option('enable-opencl')
         clblast_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
       endif
       clblast_proj = cmake.subproject('clblast', options: clblast_options, required: true)
-      clblast_dep = clblast_proj.dependency('clblast')
+      # Do NOT use clblast_proj.dependency('clblast') directly. Meson's CMake
+      # module forwards the CMake target's link interface verbatim, and for a
+      # shared CLBlast that interface contains a bare '-shared' (CLBlast's own
+      # CMAKE_SHARED_LINKER_FLAGS). Meson then appends that flag to *every*
+      # consumer link line, executables included, and ld tries to produce a
+      # shared object out of non-PIC objects:
+      #   relocation R_X86_64_PC32 against symbol ... can not be used when
+      #   making a shared object; recompile with -fPIC
+      #   final link failed: bad value
+      # libnntrainer.so itself survives (it is a shared object anyway), so the
+      # breakage only shows up when the first executable links -- i.e. every
+      # test binary and every Applications/ binary.
+      # Re-declare the dependency from the subproject's own target so only the
+      # headers and the library travel. The OpenCL ICD loader is linked
+      # separately just below (opencl_loader_dep), so nothing is lost.
+      clblast_dep = declare_dependency(
+        link_with: clblast_proj.target('clblast'),
+        include_directories: clblast_proj.include_directories('clblast'))
     endif
   else
     message ('OpenCL build enabled WITHOUT CLBlast. Generic BLAS-via-OpenCL routes (clblast_interface.cpp callers) are stubbed; only the in-tree OpenCL kernels are functional.')
