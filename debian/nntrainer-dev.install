@@ -119,3 +119,5 @@
 /usr/include/nntrainer/qkv_layer.h
 /usr/include/nntrainer/geglu_layer.h
 /usr/include/nntrainer/swiglu_layer.h
+/usr/include/nntrainer/sigmoid_glu_layer.h
+/usr/include/nntrainer/sigmoid_add_layer.h

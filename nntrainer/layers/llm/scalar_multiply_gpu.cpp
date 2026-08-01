@@ -47,10 +47,22 @@ void ScalarMultiplyLayerGPU::finalize(nntrainer::InitLayerContext &context) {
 
   bool use_weight = std::get<props::UseWeight>(scalar_props).get();
   if (use_weight) {
+    // @note Same contract as the CPU ScalarMultiplyLayer, and it must stay the
+    // same: the two variants share the "scalar_multiplier" name, so a dtype
+    // mismatch would change how many bytes the weight loader consumes for this
+    // slot. The multiplier is un-quantized but a bin stores it at the model's
+    // FLOAT dtype, so take the context's weight dtype when that dtype is
+    // itself a float type and FP32 otherwise. The read below dispatches on the
+    // dtype instead of assuming FP32.
+    const auto scalar_w_dtype = context.getWeightDataType();
+    const auto scalar_dtype =
+      (scalar_w_dtype == nntrainer::TensorDim::DataType::FP32 ||
+       scalar_w_dtype == nntrainer::TensorDim::DataType::FP16)
+        ? scalar_w_dtype
+        : nntrainer::TensorDim::DataType::FP32;
     nntrainer::TensorDim scalar_dim(
       1, 1, 1, 1,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       context.getWeightDataType()));
+      nntrainer::TensorDim::TensorType(context.getFormat(), scalar_dtype));
     wt_idx[0] = context.requestWeight(
       scalar_dim, nntrainer::props::InitializerInfo::Enum::NONE,
       nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "scalar_multiplier",
@@ -61,22 +73,28 @@ void ScalarMultiplyLayerGPU::finalize(nntrainer::InitLayerContext &context) {
 void ScalarMultiplyLayerGPU::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  if (skip_prefill && from == 0)
+  // A multi-token step is a prefill step even when it does not start at 0: a
+  // resumed turn prefills from the KV cache position it left off at, and a
+  // chunked prefill issues every chunk after the first with from > 0. Keep this
+  // identical to the host ScalarMultiplyLayer, or the same graph skips a
+  // different set of layers depending on the engine it was stamped with.
+  if (skip_prefill && (from == 0 || (to - from) > 1))
     return;
 
   bool use_weight = std::get<props::UseWeight>(scalar_props).get();
   float multiplier;
   if (use_weight) {
     nntrainer::Tensor &weight = context.getWeight(wt_idx[0]);
-    if (weight.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      multiplier = weight.getValue<float>(0, 0, 0, 0);
+    // Read at the dtype finalize() actually requested (the bin's float dtype).
+    // An unconditional float read on an FP16 slot reinterprets two packed FP16
+    // scalars as one FP32 and hands the graph a garbage multiplier.
 #ifdef ENABLE_FP16
-    } else if (weight.getDataType() == ml::train::TensorDim::DataType::FP16) {
-      multiplier = static_cast<float>(weight.getValue<_FP16>(0, 0, 0, 0));
+    multiplier = (weight.getDataType() == ml::train::TensorDim::DataType::FP16)
+                   ? static_cast<float>(weight.getValue<_FP16>(0, 0, 0, 0))
+                   : weight.getValue<float>(0, 0, 0, 0);
+#else
+    multiplier = weight.getValue<float>(0, 0, 0, 0);
 #endif
-    } else {
-      multiplier = weight.getValue<float>(0, 0, 0, 0);
-    }
   } else {
     multiplier = std::get<props::ScalarMultiplier>(scalar_props).get();
   }

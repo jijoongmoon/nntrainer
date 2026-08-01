@@ -68,11 +68,27 @@ void ScalarMultiplyLayer::finalize(nntrainer::InitLayerContext &context) {
   bool use_weight = std::get<props::UseWeight>(scalar_multiply_props).get();
 
   if (use_weight) {
-    // Request weight for scalar value (single element)
+    // Request weight for scalar value (single element).
+    // @note The multiplier is a single un-quantized coefficient, but a bin
+    // stores it at the model's FLOAT dtype, so an FP16-activation package
+    // holds 2 bytes here and a *-FP32 package 4. This slot is counted in the
+    // same packed weight stream as everything else, so a constant dtype makes
+    // the graph disagree with the file and the loader rejects the layout.
+    // Ask for the context's weight dtype when that dtype is itself a float
+    // type, and FP32 otherwise -- the float-type test is what keeps a caller
+    // that omits packed=false from requesting a block-quantized scalar
+    // (packed=false is what makes the context's weight dtype equal the
+    // activation dtype, in LayerNode::finalize()).
+    // The read site below dispatches on the dtype rather than assuming FP32.
+    const auto scalar_w_dtype = context.getWeightDataType();
+    const auto scalar_dtype =
+      (scalar_w_dtype == nntrainer::TensorDim::DataType::FP32 ||
+       scalar_w_dtype == nntrainer::TensorDim::DataType::FP16)
+        ? scalar_w_dtype
+        : nntrainer::TensorDim::DataType::FP32;
     nntrainer::TensorDim scalar_dim(
       1, 1, 1, 1,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       context.getWeightDataType()));
+      nntrainer::TensorDim::TensorType(context.getFormat(), scalar_dtype));
     wt_idx[0] = context.requestWeight(
       scalar_dim, nntrainer::props::InitializerInfo::Enum::NONE,
       nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "scalar_multiplier",
@@ -91,10 +107,9 @@ void ScalarMultiplyLayer::forwarding(nntrainer::RunLayerContext &context,
   float multiplier;
   if (use_weight) {
     nntrainer::Tensor &weight = context.getWeight(wt_idx[0]);
-    // dtype-aware scalar read: getValue<float> on an FP16 weight reads 4 bytes
-    // from the 2-byte cell (garbage). gemma4 layer_scalar / q_scale /
-    // model_proj_scale weights are FP16 in QINT4-FP16 models -> reading them as
-    // float gave a huge multiplier and overflowed the residual to +Inf.
+    // Read at the dtype finalize() actually requested (the bin's float dtype).
+    // An unconditional float read on an FP16 slot reinterprets two packed FP16
+    // scalars as one FP32 and hands the graph a garbage multiplier.
 #ifdef ENABLE_FP16
     multiplier = (weight.getDataType() == ml::train::TensorDim::DataType::FP16)
                    ? static_cast<float>(weight.getValue<_FP16>(0, 0, 0, 0))
@@ -112,7 +127,11 @@ void ScalarMultiplyLayer::forwarding(nntrainer::RunLayerContext &context,
 void ScalarMultiplyLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  bool is_prefill = !from;
+  // A multi-token step is a prefill step even when it does not start at 0: a
+  // resumed turn prefills from the KV cache position it left off at, and a
+  // chunked prefill issues every chunk after the first with from > 0. Testing
+  // only `!from` would run those blocks down the decode path.
+  bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
 
@@ -121,10 +140,9 @@ void ScalarMultiplyLayer::incremental_forwarding(
   float multiplier;
   if (use_weight) {
     nntrainer::Tensor &weight = context.getWeight(wt_idx[0]);
-    // dtype-aware scalar read: getValue<float> on an FP16 weight reads 4 bytes
-    // from the 2-byte cell (garbage). gemma4 layer_scalar / q_scale /
-    // model_proj_scale weights are FP16 in QINT4-FP16 models -> reading them as
-    // float gave a huge multiplier and overflowed the residual to +Inf.
+    // Read at the dtype finalize() actually requested (the bin's float dtype).
+    // An unconditional float read on an FP16 slot reinterprets two packed FP16
+    // scalars as one FP32 and hands the graph a garbage multiplier.
 #ifdef ENABLE_FP16
     multiplier = (weight.getDataType() == ml::train::TensorDim::DataType::FP16)
                    ? static_cast<float>(weight.getValue<_FP16>(0, 0, 0, 0))
