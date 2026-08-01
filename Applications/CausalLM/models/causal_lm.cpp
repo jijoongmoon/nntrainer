@@ -275,9 +275,11 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
 
   // allocate memory for the internal buffer
   // Row stride is MAX_SEQ_LEN, so every ids_history[b * MAX_SEQ_LEN + pos]
-  // write needs pos < MAX_SEQ_LEN. Transformer::setupParameters keeps
-  // NUM_TO_GENERATE inside [0, MAX_SEQ_LEN) for decoders, and run() caps the
-  // generation loop at the window on top of that.
+  // write needs pos < MAX_SEQ_LEN. Transformer::setupParameters fits
+  // NUM_TO_GENERATE to maxNumToGenerate() for decoders, run() sizes the prompt
+  // with the matching promptTokenBudget(), the generation loop caps itself at
+  // the window on top of that, and registerOutputs() rejects any pos that still
+  // escapes.
   ids_history = (unsigned int *)malloc(static_cast<size_t>(BATCH_SIZE) *
                                        MAX_SEQ_LEN * sizeof(unsigned int));
 
@@ -675,6 +677,25 @@ void CausalLM::registerOutputs(
   std::vector<unsigned int> ids, unsigned int pos,
   const std::vector<bool> &eos_list, bool log_output) {
 
+  // The token history is one BATCH_SIZE x MAX_SEQ_LEN block and `pos` is the
+  // column, so `pos` must stay below the row stride or the write lands in the
+  // next batch row (or off the end of the allocation for the last one). This is
+  // the only place a GENERATED token enters that buffer -- CausalLM::run() and
+  // Lfm2CausalLM::run_with_embeddings() both come through here, and lfm2's own
+  // ids_history store reuses the same `pos` immediately after the call -- so
+  // the stride invariant is enforced once here instead of at every caller.
+  //
+  // With the promptTokenBudget() reservation this is unreachable: the budget
+  // subtracts exactly the slots the generation phase occupies. It is kept as a
+  // hard failure so that any future divergence between the reservation and the
+  // loop shows up as a thrown error rather than as heap corruption -- the
+  // behaviour before the reservation was fixed was a real one-past write at
+  // ids_history[MAX_SEQ_LEN].
+  NNTR_THROW_IF(pos >= MAX_SEQ_LEN, std::out_of_range)
+    << "registerOutputs: token position " << pos
+    << " is outside the token-history row stride (max_seq_len = " << MAX_SEQ_LEN
+    << ")";
+
   static const std::vector<char> puncts{',', '!', ':', ';', '?'};
   for (size_t b = 0; b < ids.size(); ++b) {
     if (!eos_list[b]) {
@@ -958,17 +979,30 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   std::vector<int64_t> init_input;
   unsigned int _len = _input.size();
-  // Transformer::setupParameters keeps NUM_TO_GENERATE inside
-  // [0, MAX_SEQ_LEN) for decoders on every call, so this reservation is at
-  // most MAX_SEQ_LEN - 1. Spell the subtraction out in a form that cannot wrap
-  // anyway: MAX_SEQ_LEN is unsigned, so a budget at or above the window would
-  // otherwise turn the prompt budget into ~4e9, skip the truncation below and
-  // write the prompt past the ids_history row stride.
-  const unsigned int reserved_for_generation =
-    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u;
-  const unsigned int kv_budget = MAX_SEQ_LEN > reserved_for_generation
-                                   ? MAX_SEQ_LEN - reserved_for_generation
-                                   : 0u;
+  // The prompt budget has to reserve EVERY slot the rest of this run writes,
+  // not just NUM_TO_GENERATE of them; promptTokenBudget() carries the ledger.
+  // Reserving NUM_TO_GENERATE alone is one slot short of the generation loop,
+  // which starts at input_len + 1 -- the prefill has already sampled the token
+  // at input_len -- and the window clamp on generation_end then pays for the
+  // shortfall by dropping the LAST generated token, silently.
+  //
+  // Two terms are easy to miss:
+  //  * SYS_PROMP_LEN is added to input_len AFTER the prefill, so it shifts the
+  //    loop start and must be charged here. It is charged only when it will
+  //    really be added: the SAVE_KVCACHE pass returns before the generation
+  //    phase (and there the encode above is the system prompt itself). The
+  //    !USE_KVCACHE case needs no special-casing -- SYS_PROMP_LEN is only ever
+  //    assigned under USE_KVCACHE, so it is already 0 here, and the
+  //    `else SYS_PROMP_LEN = 0` further down is a no-op re-assertion.
+  //  * SKIP_PREFILL removes the "+1" instead of adding to it: on that path the
+  //    last prompt token IS the token the first generation step consumes, and
+  //    init_len/input_len are decremented for it, so nothing is sampled into a
+  //    slot of its own.
+  //
+  // Transformer::setupParameters fits NUM_TO_GENERATE to maxNumToGenerate(),
+  // the inverse of this call, so the budget is >= 1 by construction; the floor
+  // inside promptTokenBudget() covers a NUM_TO_GENERATE moved afterwards.
+  //
   // [prefill-chunk] One forward pass cannot process more than INIT_SEQ_LEN
   // query rows without overflowing the shared activation tensor (built at
   // {1,1,1,INIT_SEQ_LEN} in constructModel; resetInputDimension is disabled).
@@ -976,15 +1010,53 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // prefill is fed FORWARD in chunks of <= INIT_SEQ_LEN rows -- each chunk fits
   // the buffer -- so the prompt is bounded by the KV budget alone, and the
   // activation plane stays INIT_SEQ_LEN-sized regardless of prompt length.
+<<<<<<< HEAD
+||||||| ffa2147af
+  //
+  // UNION NOTE: the KV budget keeps the wrap-safe subtraction above; the
+  // chunking predicate only chooses whether INIT_SEQ_LEN also caps it.
+=======
+  //
+  // UNION NOTE: the KV budget keeps the wrap-safe subtraction above; the
+  // chunking predicate only chooses whether INIT_SEQ_LEN also caps it.
+  const unsigned int sys_prompt_rows = SAVE_KVCACHE ? 0u : SYS_PROMP_LEN;
+>>>>>>> origin/upstream-pr/trackCtx-generation-budget
   const bool _prefill_chunking = effectivePrefillChunk() > 0;
-  unsigned int num_allow_str =
-    _prefill_chunking ? kv_budget
+  const unsigned int _num_to_generate =
+    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u;
+  unsigned int kv_budget = 0;
+  unsigned int num_allow_str = 0;
+  auto reserve = [&](bool first_token_from_prompt) {
+    kv_budget = promptTokenBudget(MAX_SEQ_LEN, _num_to_generate,
+                                  sys_prompt_rows, first_token_from_prompt);
+    num_allow_str = _prefill_chunking
+                      ? kv_budget
                       : std::min<unsigned int>(INIT_SEQ_LEN, kv_budget);
+  };
+  // The skip_prefill reservation has to be decided on the SAME quantity the
+  // branch that takes it tests -- `SKIP_PREFILL && init_len > 1` below, where
+  // init_len is the TRUNCATED length min(_len, num_allow_str) -- and not on the
+  // raw prompt length. Deciding on _len disagrees whenever truncation lowers
+  // the length to 1, and then the run reserves one slot too few and the window
+  // clamp pays for it with the last generated token: the precise failure this
+  // reservation exists to remove.
+  //
+  // It is circular only in appearance. Reserve conservatively first (the
+  // non-skip ledger, which never over-grants), then re-decide on the length
+  // that reservation actually yields. That is a fixed point, not an iteration:
+  // the skip ledger reserves one slot FEWER, so its allowance is >= the
+  // conservative one, so the re-derived init_len is >= the one the predicate
+  // was just evaluated on and stays > 1. A predicate that came out false stays
+  // on the conservative reservation, which is the safe side.
+  reserve(/*first_token_from_prompt=*/false);
+  if (SKIP_PREFILL && std::min(_len, num_allow_str) > 1)
+    reserve(/*first_token_from_prompt=*/true);
   unsigned int text_len = _len;
   bool dropped_from_middle = false;
 
   if (_len > num_allow_str) {
     text_len = num_allow_str;
+<<<<<<< HEAD
 
     // Which bytes of prompt_ are frame rather than body. The rendered affixes
     // are measured relative to `prompt`; a system prompt sits in front of them
@@ -1062,6 +1134,33 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    "the model may continue the prompt instead of answering it."
                 << std::endl;
     }
+||||||| ffa2147af
+    // Truncation drops tokens from the tail of the prompt, which is where
+    // instructions in "summarize this document"-style prompts live: a
+    // silently truncated prompt can make the model continue the body
+    // instead of following a dropped trailing instruction. Always warn
+    // with the exact counts.
+    std::cerr << "[CausalLM] WARNING: prompt (" << _len
+              << " tokens) exceeds the max allowed prefill length ("
+              << num_allow_str
+              << " = max_seq_len - num_to_generate); "
+                 "truncating "
+              << (_len - num_allow_str) << " tail tokens." << std::endl;
+=======
+    // Truncation drops tokens from the tail of the prompt, which is where
+    // instructions in "summarize this document"-style prompts live: a
+    // silently truncated prompt can make the model continue the body
+    // instead of following a dropped trailing instruction. Always warn
+    // with the exact counts.
+    std::cerr << "[CausalLM] WARNING: prompt (" << _len
+              << " tokens) exceeds the max allowed prefill length ("
+              << num_allow_str << " = max_seq_len " << MAX_SEQ_LEN << " - the "
+              << (MAX_SEQ_LEN > kv_budget ? MAX_SEQ_LEN - kv_budget : 0u)
+              << " history slots the generation phase reserves"
+              << (_prefill_chunking ? "" : ", capped by init_seq_len")
+              << "); truncating " << (_len - num_allow_str) << " tail tokens."
+              << std::endl;
+>>>>>>> origin/upstream-pr/trackCtx-generation-budget
   }
 
   // feed only available length
@@ -1424,13 +1523,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   auto start_generation = std::chrono::high_resolution_clock::now();
 
-  // registerOutputs() writes ids_history[b * MAX_SEQ_LEN + idx] with no bounds
-  // check, so the loop index has to stay inside the row stride the buffer was
-  // allocated with. A budget that fits the window is not enough on its own: the
-  // loop starts one past input_len, and input_len carries SYS_PROMP_LEN (added
-  // just above) on top of the already-truncated prompt, so
-  // input_len + NUM_TO_GENERATE can still reach MAX_SEQ_LEN. Derive the end
-  // from the window too and stop at whichever comes first.
+  // The window clamp below is the GUARD, not the accounting. The accounting is
+  // promptTokenBudget() at the top of run(): it subtracts the "+1" start offset
+  // and SYS_PROMP_LEN from the prompt budget precisely so that
+  // generation_begin + NUM_TO_GENERATE <= MAX_SEQ_LEN holds here and the min()
+  // below selects the full budget. Keeping the clamp costs nothing on that
+  // path and still bounds the two inputs the budget cannot see -- a caller that
+  // moved NUM_TO_GENERATE with setNumToGenerate() after the prompt was sized,
+  // and the degenerate window where even a one-token prompt cannot fit the
+  // budget -- so the loop index can never leave the row stride.
+  //
+  // What must NOT happen again is this clamp silently absorbing a shortfall in
+  // the reservation: when it did, a full-window prompt cost exactly one
+  // generated token per run and nothing said so.
   const unsigned int generation_budget =
     NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u;
   const unsigned int generation_begin = input_len + 1;

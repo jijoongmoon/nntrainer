@@ -435,8 +435,19 @@ void Lfm2CausalLM::run(const WSTR prompt, bool do_sample,
   ensureTokenizer(); // join the async tokenizer build before use
   auto token_ids = tokenizer->Encode(full_prompt);
 
-  // Clamp to INIT_SEQ_LEN (the model's prefill capacity)
-  const size_t max_tokens = static_cast<size_t>(INIT_SEQ_LEN);
+  // Clamp to INIT_SEQ_LEN (the model's prefill capacity) AND to the prompt
+  // budget. INIT_SEQ_LEN alone bounds only the prefill: the generation loop in
+  // run_with_embeddings() starts at input_len + 1 and writes NUM_TO_GENERATE
+  // more token-history slots, so an INIT_SEQ_LEN-sized prompt in a window that
+  // is not INIT_SEQ_LEN + NUM_TO_GENERATE + 1 wide pushes the loop into the
+  // window clamp, which pays the difference by dropping generated tokens.
+  // Same single definition of the reservation as CausalLM::run().
+  const size_t max_tokens = std::min<size_t>(
+    static_cast<size_t>(INIT_SEQ_LEN),
+    promptTokenBudget(
+      MAX_SEQ_LEN,
+      NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u,
+      /*sys_prompt_len=*/0u, /*first_token_from_prompt=*/false));
   if (token_ids.size() > max_tokens)
     token_ids.resize(max_tokens);
 
@@ -495,6 +506,72 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
       "MAX_SEQ_LEN must be greater than or equal to INIT_SEQ_LEN");
   }
 
+  // run() sizes its prompt against promptTokenBudget(), but this is also a
+  // public entry point taking a caller-chosen n_tokens, and the INIT_SEQ_LEN
+  // check above does not imply the budget.
+  const unsigned int prompt_budget = promptTokenBudget(
+    MAX_SEQ_LEN,
+    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u,
+    /*sys_prompt_len=*/0u, /*first_token_from_prompt=*/false);
+
+  // HARD precondition, checked before any work and before the soft warning
+  // below. The PREFILL alone -- not the generation loop -- already stores a
+  // token at ids_history[input_len]: registerOutputs() takes input_len as its
+  // position, and the raw store right after it repeats that index. So
+  // input_len has to be a valid COLUMN of the BATCH_SIZE x MAX_SEQ_LEN token
+  // history, not merely a valid prefill length.
+  //
+  // The two checks above do not imply that. They permit
+  // n_tokens == INIT_SEQ_LEN == MAX_SEQ_LEN: :498 only rejects
+  // input_len > INIT_SEQ_LEN and :504 only rejects MAX_SEQ_LEN < INIT_SEQ_LEN.
+  // At that value ids_history[b * MAX_SEQ_LEN + MAX_SEQ_LEN] lands in the next
+  // batch row, and past the end of the allocation for the last one.
+  //
+  // Refuse it HERE, by name. Three alternatives were rejected:
+  //  * Clamping input_len would silently drop the tail of a caller-supplied
+  //    embedding buffer -- the same silent shortening the prompt budget exists
+  //    to remove, and worse here because the caller computed those embeddings.
+  //  * Leaving it to registerOutputs()'s row-stride check would let the
+  //    warning below promise a degraded-but-completed run and then throw
+  //    std::out_of_range from the middle of the prefill: warn-then-throw.
+  //  * Letting it run, as before the stride check existed, is the heap
+  //    corruption this is here to stop.
+  // Nothing is salvageable at this size in any case: generation_begin is
+  // input_len + 1, already past the window, so the run delivers zero generated
+  // tokens even if the store were in bounds.
+  //
+  // Reachable only at exact equality, since input_len <= INIT_SEQ_LEN <=
+  // MAX_SEQ_LEN holds by the two checks above. A max_seq_len of 1 also reaches
+  // it through run(), whose clamp bottoms out at the budget floor of 1; such a
+  // model has no slot for a generated token at all and was corrupting the heap
+  // before this refusal.
+  if (input_len >= MAX_SEQ_LEN) {
+    throw std::invalid_argument(
+      "Lfm2CausalLM::run_with_embeddings: n_tokens (" +
+      std::to_string(input_len) + ") must be less than max_seq_len (" +
+      std::to_string(MAX_SEQ_LEN) +
+      "): the prefill stores its own sampled token at ids_history[n_tokens], "
+      "so n_tokens must be a valid column of the token history. The prompt "
+      "budget for this window is " +
+      std::to_string(prompt_budget) + " (num_to_generate = " +
+      std::to_string(NUM_TO_GENERATE) + ").");
+  }
+
+  // Soft warning: over the budget but still inside the window. The run
+  // completes in bounds -- the generation loop clamps to the window -- but it
+  // yields fewer than NUM_TO_GENERATE tokens, so say so rather than shortening
+  // in silence. Unreachable together with the refusal above, so the promise
+  // this prints is one the rest of the function keeps.
+  if (input_len > prompt_budget) {
+    const unsigned int deliverable =
+      (input_len + 1 < MAX_SEQ_LEN) ? MAX_SEQ_LEN - (input_len + 1) : 0u;
+    std::cerr << "[Lfm2CausalLM] WARNING: n_tokens (" << input_len
+              << ") exceeds the prompt budget (" << prompt_budget
+              << "); generation will stop at the context window ("
+              << MAX_SEQ_LEN << ") after " << deliverable << " of "
+              << NUM_TO_GENERATE << " tokens." << std::endl;
+  }
+
   // Allocate the host-owned KV cache and bind it to mha_core's external cache
   // input slots. Idempotent: only the first call does work.
   allocateAndBindKVCache();
@@ -504,9 +581,18 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
     output_list.push_back("");
   }
 
-  // Store seed token IDs into ids_history for repetition penalty support
+  // Store seed token IDs into ids_history for repetition penalty support.
+  //
+  // seed_tokens is supplied by the caller and is NOT bounded by the n_tokens
+  // check above, so it is clamped to the row stride here: ids_history is one
+  // BATCH_SIZE x MAX_SEQ_LEN block, and a longer seed vector would write into
+  // the next batch row and past the end of the allocation for the last one.
+  // Only the first input_len entries are ever read back (the repetition
+  // penalty passes NUM_INPUT_IDS = input_len), so the clamp loses nothing.
+  const size_t n_seed =
+    std::min<size_t>(seed_tokens.size(), static_cast<size_t>(MAX_SEQ_LEN));
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-    for (size_t i = 0; i < seed_tokens.size(); ++i) {
+    for (size_t i = 0; i < n_seed; ++i) {
       ids_history[b * MAX_SEQ_LEN + i] =
         static_cast<unsigned int>(seed_tokens[i]);
     }
