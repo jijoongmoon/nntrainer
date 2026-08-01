@@ -215,11 +215,26 @@ if get_option('enable-fp16')
        error ('The compiler does not support -mfp16-format=ieee')
      endif
    elif arch == 'x86_64'
-     if cc.version().version_compare('>=12.1.0')
-       message ('Float16 for x86_64 enabled. Modern gcc-x64 generally supports float16 with _Float16.')
+     # Selection is capability-based, not compiler-name-based: use native
+     # _Float16 when the compiler can actually *do* half arithmetic, otherwise
+     # fall back to the uint16-backed nntrainer::Half wrapper (e.g. MSVC).
+     fp16_impl = get_option('fp16-impl')
+     fp16_probe = '''_Float16 mul(_Float16 a, _Float16 b){ return a * b; }
+int main(){ _Float16 x = (_Float16)1, y = (_Float16)2; return (int)mul(x, y); }'''
+     if fp16_impl == 'native'
+       fp16_native = true
+     elif fp16_impl == 'wrapper'
+       fp16_native = false
+     else # auto
+       fp16_native = cxx.compiles(fp16_probe, name: 'native _Float16 arithmetic')
+     endif
+     if fp16_native
+       message ('Float16 for x86_64 enabled: native _Float16 (GCC/clang, byte-identical).')
        extra_defines += '-DENABLE_FP16=1'
      else
-       warning ('Float16 for x86_64 enabled. However, software emulation is applied for fp16, making it slower and inconsistent. Use GCC 12+ for FP16 support. This build will probably fail unless you bring a compiler that supports fp16 for x64.')
+       message ('Float16 for x86_64 enabled: uint16-backed nntrainer::Half wrapper (no native _Float16).')
+       extra_defines += '-DENABLE_FP16=1'
+       extra_defines += '-DUSE_HALF_WRAPPER=1'
      endif
    elif arch == 'riscv64'
      error ('RISCV64 RVV support and fp16 support is not yet implemented.')
