@@ -17,6 +17,7 @@
 #include <addition_layer.h>
 #include <attention_kernels.h>
 #include <blas_kernel_interface.h>
+#include <blas_kernels.h> // v8c_collect_lazy_program_tasks (eager prewarm)
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>

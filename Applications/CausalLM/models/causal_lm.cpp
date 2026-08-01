@@ -171,6 +171,9 @@ AffixTokens locateAffixTokens(tokenizers::Tokenizer &tokenizer,
     ++tail_bytes;
   }
   return found;
+}
+
+/**
  * @brief Wrap an external host buffer as a Tensor of @p dim.
  *
  * Byte-for-byte the same dtype dispatch as neuralnet.cpp's file-local

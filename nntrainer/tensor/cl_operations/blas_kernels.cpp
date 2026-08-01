@@ -3661,6 +3661,8 @@ void cl_svm_unmap_force(void *ptr) {
   if (blas_cc && ptr)
     blas_cc->command_queue_inst_.enqueueSVMUnmap(ptr, nullptr,
                                                  /** force */ true);
+}
+
 void v8c_collect_lazy_program_tasks(ClContext &cc,
                                     std::vector<std::function<void()>> &out) {
   // Deadlock: this runs inside ClContext bring-up, so nothing here -- neither

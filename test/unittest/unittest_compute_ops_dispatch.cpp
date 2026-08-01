@@ -98,6 +98,7 @@ public:
     counters_->rms_reverse_norm++;
     real_->rms_reverse_norm(in, out, weight, out_scale, epsilon, active_rows,
                             row_offset);
+  }
   void scalar_mul(const nntrainer::Tensor &in, nntrainer::Tensor &out,
                   float scale) override {
     counters_->scalar_mul++;
@@ -385,6 +386,9 @@ TEST_F(ComputeOpsDispatchTest,
   EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, 3), 3.0f);
   // Row 1 sits outside active_rows=1 and must be untouched.
   EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 1, 0), 0.0f);
+}
+
+/**
  * @brief The scalar-multiply whole-op dispatches through the attached
  *        ContextData ops — the dispatch seam the layer's former open-coded
  *        body structurally could not test — and the Cpu impl computes the

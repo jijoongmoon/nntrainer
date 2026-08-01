@@ -41,6 +41,8 @@
 #include <fcntl.h>        // _O_RDONLY, _O_BINARY
 #include <io.h>           // _wopen, _close
 #include <mman_windows.h> // mmap/munmap (MapViewOfFile), PROT_READ, MAP_PRIVATE
+#endif
+
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_runtime.h>
@@ -871,6 +873,10 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         const uintptr_t start = reinterpret_cast<uintptr_t>(row) & pg_mask;
         const uintptr_t end = reinterpret_cast<uintptr_t>(row) + row_stride;
         ::madvise(reinterpret_cast<void *>(start), end - start, MADV_WILLNEED);
+      }
+    }
+#endif
+
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     // Device-only activation pool (NNTR_CUDA_DEV_ACT): the embedding output is
     // real device memory (not host-addressable). Dequant into a host staging
