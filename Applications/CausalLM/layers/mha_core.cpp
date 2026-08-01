@@ -450,16 +450,22 @@ MHACoreLayer::~MHACoreLayer() {
 // transformer.h. Replicated here so this layer TU does not have to pull in the
 // heavy model header (and so the layer keeps working when it is used outside
 // the CausalLM model wrappers). Always compiled (not FP16/x86 gated).
+//
+// It now really does match, statement for statement. It used to carry an extra
+// `NNTR_KV_WINDOW_RING=0 -> 0` early return that the canonical function does
+// not have, which made the "MUST match" contract above false while the rest of
+// this file leaned on it. That divergence was invisible only by luck: the sole
+// caller is mha_kv_ring_cap() below, which tests the same variable one line
+// earlier and returns 0 first, so the branch was dead. Each knob owns exactly
+// its own rung -- NNTR_KV_WINDOW_RING selects the ring, NNTR_PREFILL_CHUNK
+// selects the chunk -- and this function is the chunk one.
 static inline unsigned int mha_effective_chunk() {
   const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
   if (pc && pc[0])
-    return static_cast<unsigned int>(std::atoi(pc));
-  const char *ring = std::getenv("NNTR_KV_WINDOW_RING");
-  if (ring && ring[0] == '0')
-    return 0;
+    return static_cast<unsigned int>(std::atoi(pc)); // explicit override wins
 #if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) ||           \
   defined(_M_ARM)
-  return 0u;
+  return 0u; // Adreno V-mirror restride, see effectivePrefillChunk()
 #else
   return 4096u;
 #endif
@@ -501,6 +507,84 @@ static inline void mha_ring_assert_linear_read(unsigned int ring_cap,
     std::to_string(logical_rows) + " > ring cap " + std::to_string(ring_cap) +
     "). The ring is validated on the GPU flash path only. Re-run with "
     "NNTR_KV_WINDOW_RING=0 for this configuration.");
+}
+
+// A KV step write is ONE contiguous slice of `step` rows starting at physical
+// row `row`, so it must satisfy row + step <= `rows`, the physical row count of
+// the plane. This is the ONLY bound on that write, for BOTH kinds of layer:
+//
+//  - ringed layer (ring_cap != 0): `row` is cacheRow(p) = p % Wcap and a
+//    violation means the slice straddles the wrap seam. Wcap is a multiple of
+//    the prefill chunk C, so the invariant holds for ANY absolute position as
+//    long as the producer keeps one write inside one absolute C-aligned block.
+//
+//  - non-ringed layer (ring_cap == 0): cacheRow() is the identity, so `row` IS
+//    the absolute position and a violation simply runs off the end of the
+//    max_timestep plane. This needs no ring at all, and it is reachable:
+//    prefill writes start at SYS_PROMP_LEN + global_token_len and decode writes
+//    at token_generation_idx + global_token_len, while the prompt budget
+//    subtracts only NUM_TO_GENERATE from MAX_SEQ_LEN (causal_lm.cpp), so a
+//    precomputed system prompt plus the turns already on this model object walk
+//    the write position past the allocation.
+//
+// The b_cache_*_step views built from `row` do carry getSharedDataTensor's own
+// bound, but that one is inexact: dim_.getDataLen() + offset > dim.getDataLen()
+// reduces to row + step <= (B - batch) * height, so it is exact only for the
+// LAST batch -- for batch < B-1 an overrun lands silently in the NEXT batch's
+// rows instead of throwing -- and when it does fire it says only "Creating
+// shared tensor of size bigger than tensor memory", which names neither the
+// position nor the cause.
+//
+// `linear_index` distinguishes the two ringed callers, because they need
+// OPPOSITE remedies and only one of them can act on the chunk grid:
+//
+//  - false: `row` is cacheRow(p) = p % Wcap. A violation is a producer that
+//    let one write cross an absolute C-aligned block boundary, and re-tiling
+//    the prefill on the ABSOLUTE NNTR_PREFILL_CHUNK grid fixes it.
+//  - true: the caller writes at the ABSOLUTE row (`from`), not row % Wcap --
+//    the sink/gpt-oss overload does. No chunk size can fix that: the write is
+//    correct only before the first wrap, whatever C is. Telling that caller to
+//    "split on the absolute chunk grid" is advice it has already followed (it
+//    fails at step == C == 1) and cannot follow further; it must turn the ring
+//    off. Without this flag the write bound pre-empts
+//    mha_ring_assert_linear_read below -- both fire on the identical condition
+//    there, since to == from + step -- and replaces its accurate message with
+//    an impossible one.
+static inline void mha_assert_kv_write_fits(unsigned int ring_cap, size_t row,
+                                            size_t step, size_t rows,
+                                            unsigned int abs_pos,
+                                            bool linear_index,
+                                            const char *who) {
+  if (row + step <= rows)
+    return;
+  if (ring_cap && linear_index)
+    throw std::runtime_error(
+      std::string("mha_core kv-window-ring: '") + who +
+      "' indexes the KV cache linearly -- it writes at the ABSOLUTE row, not "
+      "row % cap -- and the step write at absolute position " +
+      std::to_string(abs_pos) + " (step " + std::to_string(step) +
+      ") runs past the ring cap " + std::to_string(ring_cap) +
+      ". Splitting the prefill on the NNTR_PREFILL_CHUNK grid cannot fix this: "
+      "this path is only correct before the first wrap, for any chunk size. "
+      "Re-run with NNTR_KV_WINDOW_RING=0 for this configuration.");
+  if (ring_cap)
+    throw std::runtime_error(
+      "mha_core kv-window-ring: step write straddles the ring seam at absolute "
+      "position " +
+      std::to_string(abs_pos) + " (ring cap " + std::to_string(ring_cap) +
+      ", step " + std::to_string(step) +
+      "). The prefill producer must split its writes on the ABSOLUTE "
+      "NNTR_PREFILL_CHUNK grid; re-run with NNTR_KV_WINDOW_RING=0 for this "
+      "configuration.");
+  throw std::runtime_error(
+    "mha_core: KV step write runs past the cache at absolute position " +
+    std::to_string(abs_pos) + " (step " + std::to_string(step) + ", cache " +
+    std::to_string(rows) +
+    " rows). A full-attention layer stores ABSOLUTE positions, and the write "
+    "position is SYS_PROMP_LEN + global_token_len + offset -- a precomputed "
+    "system prompt and every earlier turn on this model object consume rows of "
+    "the same max_seq_len budget, which the prompt truncation does not "
+    "subtract.");
 }
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
@@ -1354,20 +1438,61 @@ void MHACoreLayer::one_batch_incremental_forwarding(
    *  |<-------------b_cached_key--------------->|
    */
 
-  // Fail loud if a step write would straddle the ring seam.
-  // Wcap is a multiple of the prefill chunk C and cache_index is C-aligned
-  // (chunked prefill) or step==1 (decode), so cacheRow(cache_index)+step <=
-  // Wcap holds by construction. A violation means a misconfigured chunk --
-  // throw instead of silently corrupting the neighbouring allocation (the raw
-  // pointer writes below do not bounds-check). Applies to every cache-row write
+  // Fail loud if a step write would not fit the physical cache plane.
+  // This is the LAST line of defence for the KV write-locality invariant
+  // (mha_assert_kv_write_fits above derives it, for the ringed AND the
+  // full-attention layer, and explains why the getSharedDataTensor bound just
+  // below is not a substitute).
+  //
+  // The producers are every caller of NeuralNetwork::incremental_inference
+  // that can reach an mha_core layer -- swept, not assumed
+  // (`grep -rn 'incremental_inference(' Applications/CausalLM`):
+  //  - CausalLM::run's chunk loop keeps a prefill write inside one absolute
+  //    C-aligned block, which is what a ringed layer needs (cache_index is the
+  //    ABSOLUTE position, so it is C-aligned only when prefill started at a
+  //    multiple of C). That absolute phasing is applied only when the model
+  //    HAS a ringed layer (Transformer::hasRingedLayer); a model with no
+  //    sliding-window layer, and any run with NNTR_KV_WINDOW_RING=0, keeps the
+  //    historical from_pos-relative tiling bit-for-bit;
+  //  - CausalLM::run's SAVE_KVCACHE branch prefills one unchunked block from
+  //    absolute 0 and therefore refuses a ringed layer up front (precomputed
+  //    KV save/load is NYI with the ring);
+  //  - SentenceTransformer::encode -- the embedding/encoder entry point, which
+  //    EmbeddingGemma, Qwen2Embedding and Qwen3Embedding all inherit -- also
+  //    prefills one unchunked block from absolute 0, and its graph DOES carry
+  //    ringable layers: SentenceTransformer::constructModel() delegates to
+  //    Transformer::constructModel(), so its mha_core layers get
+  //    sliding_window = getLayerSlidingWindow(layer_id). It therefore refuses
+  //    a prompt longer than the ring cap up front, for the same reason;
+  //  - Lfm2CausalLM::run_with_embeddings also prefills one unchunked block,
+  //    and it is the one entry here that is CONFIG-DEPENDENT rather than
+  //    structural. Today's lfm2 configs carry no `sliding_window`, so
+  //    SLIDING_WINDOW stays UINT_MAX, kvRingCap returns 0 and only the
+  //    full-attention half of the bound applies. A package that DID set it
+  //    would ring, and this producer is the riskiest of the four: it starts at
+  //    an arbitrary absolute (prefill_from = global_token_len, not 0) and
+  //    Lfm2Transformer::createAttention gives every mha_core the scalar
+  //    SLIDING_WINDOW while the placeholders come from the pattern-strided
+  //    getLayerSlidingWindow(). It therefore carries its own up-front refusal
+  //    for both, in lfm2_causallm.cpp;
+  //  - TimmViTTransformer::run prefills all NUM_PATCHES at once and builds
+  //    mha_core WITHOUT a sliding_window property, so props::SlidingWindow
+  //    keeps its UINT_MAX default => kv_ring_cap is 0 => full-attention half
+  //    only, and its cache is sized to NUM_PATCHES + 1;
+  //  - DebertaV2::encode, MultilingualTinyBert::run and XLMRoberta::run have
+  //    the same one-block shape but build "deberta_attention" / their own
+  //    encoder blocks, not mha_core, so this bound never runs for them;
+  //  - decode (step == 1) holds trivially against the seam.
+  // Throw instead of silently corrupting the neighbouring allocation -- the raw
+  // pointer writes below do not bounds-check. Applies to every cache-row write
   // in this function, which all share this cache_index.
-  if (kv_ring_cap &&
-      cacheRow(cache_index) + (size_t)cache_key_step_dim.height() >
-        (size_t)kv_ring_cap) {
-    throw std::runtime_error(
-      "mha_core kv-window-ring: step write straddles the ring seam "
-      "(NNTR_PREFILL_CHUNK must divide the window ring capacity; keep the "
-      "chunk a power-of-two <= the sliding window)");
+  {
+    const size_t plane_rows =
+      std::min<size_t>(cache_key_dim.height(), cache_value_dim.height());
+    mha_assert_kv_write_fits(
+      kv_ring_cap, cacheRow(cache_index), (size_t)cache_key_step_dim.height(),
+      kv_ring_cap ? std::min<size_t>(kv_ring_cap, plane_rows) : plane_rows,
+      cache_index, /*linear_index=*/false, "mha_core cache write");
   }
 
   // Load Input Tensors of this batch : b_ denotes a Tensor for this batch
@@ -3531,6 +3656,30 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
    * **/
+  // Same write-locality bound as the non-sink overload
+  // (mha_assert_kv_write_fits derives it). This overload indexes the cache
+  // LINEARLY -- it writes at absolute row `from`, not cacheRow(from) -- so for
+  // a ringed layer it is only correct before the first wrap, and
+  // mha_ring_assert_linear_read below refuses it past that. Bound the WRITE
+  // here so the refusal precedes the corrupting write instead of following it,
+  // and so the full-attention half of the bound (absolute row past a
+  // max_timestep plane) covers this overload too.
+  //
+  // linear_index=true because of that: here `to == from + step`, so this bound
+  // and the mha_ring_assert_linear_read below fire on the IDENTICAL condition
+  // and this one always wins. It must therefore say what that one would have
+  // said -- the ring cannot be used past the first wrap on this path -- and not
+  // the non-sink remedy of re-tiling on the absolute NNTR_PREFILL_CHUNK grid,
+  // which is unreachable for a linear index (observed: it fires at step == 1,
+  // i.e. with the finest possible chunk grid already in force).
+  {
+    const size_t plane_rows =
+      std::min<size_t>(cache_key_dim.height(), cache_value_dim.height());
+    mha_assert_kv_write_fits(
+      kv_ring_cap, from, (size_t)cache_key_step_dim.height(),
+      kv_ring_cap ? std::min<size_t>(kv_ring_cap, plane_rows) : plane_rows,
+      from, /*linear_index=*/true, "host compute_kcaches (sink overload)");
+  }
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,
     batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);

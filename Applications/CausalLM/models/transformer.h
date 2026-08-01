@@ -359,10 +359,42 @@ protected:
    *        derived cap and whether the ring actually engaged -- a measurement
    *        must never have to ASSUME the ring is on.
    *
+   * ! It LOGS. Call it once per KV-cache allocation, never per request. The
+   *   quiet counterpart below exists for the per-request callers.
+   *
    * @param max_seq KV capacity the model was built with (MAX_SEQ_LEN)
    * @return per-layer capacity vector of size NUM_LAYERS
    */
   std::vector<unsigned int> computeKVRingCaps(unsigned int max_seq) const;
+
+  /**
+   * @brief Quiet counterpart of computeKVRingCaps(): the SAME per-layer
+   *        arithmetic, no "[kv-ring]" line. For callers that need the caps on
+   *        a per-request path (a producer precondition check), where the
+   *        one-per-model-load log contract would be violated.
+   *
+   * computeKVRingCaps() is implemented in terms of this, so the two cannot
+   * drift.
+   *
+   * @param max_seq KV capacity the model was built with (MAX_SEQ_LEN)
+   * @return per-layer capacity vector of size NUM_LAYERS
+   */
+  std::vector<unsigned int> kvRingCapsQuiet(unsigned int max_seq) const;
+
+  /**
+   * @brief Does THIS model have at least one ringed layer at max_seq?
+   *
+   * Derived from getLayerSlidingWindow() + kvRingCap() directly rather than
+   * from CausalLM::kv_ring_caps_, so it is correct no matter which
+   * allocateAndBindKVCache() override allocated the cache (Gemma4CausalLM has
+   * its own, SentenceTransformer has its own) and correct before any cache has
+   * been allocated at all. Same expression createKVCachePlaceholders() sizes
+   * the placeholders with, so it cannot disagree with the compiled graph.
+   *
+   * @param max_seq KV capacity the model was built with (MAX_SEQ_LEN)
+   * @return true iff some layer is modulo-indexed
+   */
+  bool hasRingedLayer(unsigned int max_seq) const;
 
   /**
    * @brief Setup the parameters for the Transformer model
@@ -724,8 +756,16 @@ inline unsigned int promptTokenBudget(unsigned int max_seq_len,
  * "no ring, keep full max_seq".
  *
  * Wcap is a multiple of C and >= W + C:
- *  - a multiple of C means a C-aligned chunk write never straddles the wrap
- *    seam, so one step write stays a single contiguous slice;
+ *  - a multiple of C means a write that does not cross an ABSOLUTE multiple of
+ *    C can never straddle the wrap seam either (p = aC + r with r + L <= C
+ *    gives p % Wcap + L <= Wcap for every p), so one step write stays a single
+ *    contiguous slice. It is the PRODUCER that has to keep writes inside one
+ *    C-aligned absolute block; CausalLM::run's chunk loop phases its
+ *    boundaries on the absolute position for exactly this reason, because
+ *    prefill starts at SYS_PROMP_LEN + global_token_len and is C-aligned only
+ *    on a first turn without a precomputed system prompt. Sizing cannot
+ *    replace that: for any finite Wcap some start position puts a slice across
+ *    the seam;
  *  - >= W + C means the live window [pos-W+1, pos+C) never self-collides
  *    mod Wcap.
  *
@@ -734,6 +774,12 @@ inline unsigned int promptTokenBudget(unsigned int max_seq_len,
  *  - the layer is full attention (W == 0 or W >= max_seq);
  *  - there is no chunking (C == 0) -- the ring REQUIRES a bounded live span;
  *  - the derived cap would not shrink anything (cap >= max_seq).
+ *
+ * ! 0 means "physical row == absolute position", NOT "unbounded": such a layer
+ *   still writes into a max_seq-row plane, and the absolute write position is
+ *   SYS_PROMP_LEN + global_token_len + offset, which a long system prompt or
+ *   enough turns on one model object walk past max_seq. Both cases are bounded
+ *   by the same guard (mha_assert_kv_write_fits in mha_core.cpp).
  *
  * ! That last clause is a documented foot-gun. With the default C=4096 and
  *   an example W=1024 the derived cap is (1024/4096 + 2) * 4096 = 8192, so any

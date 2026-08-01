@@ -817,9 +817,29 @@ unsigned int Transformer::getLayerSlidingWindow(int layer_id) const {
 }
 
 std::vector<unsigned int>
-Transformer::computeKVRingCaps(unsigned int max_seq) const {
+Transformer::kvRingCapsQuiet(unsigned int max_seq) const {
   const unsigned int n_layers = static_cast<unsigned int>(NUM_LAYERS);
   std::vector<unsigned int> caps(n_layers, 0u);
+  for (unsigned int i = 0; i < n_layers; ++i)
+    caps[i] = kvRingCap(getLayerSlidingWindow(static_cast<int>(i)), max_seq);
+  return caps;
+}
+
+bool Transformer::hasRingedLayer(unsigned int max_seq) const {
+  const unsigned int n_layers = static_cast<unsigned int>(NUM_LAYERS);
+  for (unsigned int i = 0; i < n_layers; ++i)
+    if (kvRingCap(getLayerSlidingWindow(static_cast<int>(i)), max_seq) != 0)
+      return true;
+  return false;
+}
+
+std::vector<unsigned int>
+Transformer::computeKVRingCaps(unsigned int max_seq) const {
+  const unsigned int n_layers = static_cast<unsigned int>(NUM_LAYERS);
+  // ONE arithmetic source: the caps themselves come from kvRingCapsQuiet(), so
+  // the logging and the non-logging entry point cannot drift. Everything below
+  // is derived statistics for the log line only.
+  std::vector<unsigned int> caps = kvRingCapsQuiet(max_seq);
 
   unsigned int n_sliding = 0, n_ringed = 0;
   unsigned int a_window = 0, a_cap = 0; // a representative W / Wcap for the log
@@ -830,7 +850,6 @@ Transformer::computeKVRingCaps(unsigned int max_seq) const {
       ++n_sliding;
       a_window = w;
     }
-    caps[i] = kvRingCap(w, max_seq);
     if (caps[i] != 0) {
       ++n_ringed;
       a_cap = caps[i];

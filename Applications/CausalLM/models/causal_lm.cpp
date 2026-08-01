@@ -1370,6 +1370,22 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (log_output)
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
     allocateAndBindKVCache();
+    // Producer precondition for the KV write-locality invariant (see the guard
+    // in mha_core.cpp): this branch prefills the WHOLE system prompt as one
+    // unchunked block from absolute 0, so unlike the chunk loop below it does
+    // not split its writes on the absolute NNTR_PREFILL_CHUNK grid. That is
+    // only safe while no layer is ringed. Precomputed-cache save/load is
+    // already NYI with the ring (KVCacheManager::save refuses modulo-indexed
+    // rows, a few lines down), so refuse HERE for that reason instead of
+    // running NUM_LAYERS forwards first and surfacing it as a ring-seam error
+    // that blames the prefill producer.
+    NNTR_THROW_IF(std::find_if(kv_ring_caps_.begin(), kv_ring_caps_.end(),
+                               [](unsigned int c) { return c != 0; }) !=
+                    kv_ring_caps_.end(),
+                  std::runtime_error)
+      << "KVCacheManager: NYI -- precomputed KV cache save/load with the "
+         "sliding-window ring enabled (set NNTR_KV_WINDOW_RING=0 for "
+         "save_kvcache / use_kvcache runs)";
     setKVCachePosition(0);
     output = incrementalInference(BATCH_SIZE, input, input_len, 0, input_len);
 
@@ -1415,29 +1431,135 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     _prefill_chunking
       ? std::min<unsigned int>(effectivePrefillChunk(), INIT_SEQ_LEN)
       : 0u;
+  // [kv-window-ring] The KV write-locality invariant, and the only site that
+  // can uphold it.
+  //
+  //   A ringed layer stores absolute position p at physical row (p % Wcap) and
+  //   writes ONE contiguous slice per call, so every prefill call [p, p+L)
+  //   must satisfy (p % Wcap) + L <= Wcap -- it may not straddle the wrap seam.
+  //   Wcap (kvRingCap) is a multiple of C = effectivePrefillChunk(), so the
+  //   PHASE-INDEPENDENT sufficient condition is that a write never crosses an
+  //   absolute multiple of C: p / C == (p + L - 1) / C.
+  //
+  // The seam cannot be dodged by sizing Wcap instead: for any finite Wcap some
+  // p puts the slice across the seam, so only the producer's phase can uphold
+  // it. When a layer is ringed, chunk boundaries are therefore phased on the
+  // ABSOLUTE position, not on an offset from from_pos: the first chunk is
+  // shortened to the next multiple of C, every later one starts C-aligned.
+  //
+  // from_pos is 0 only for a first turn without a precomputed system prompt;
+  // it is SYS_PROMP_LEN + global_token_len, so a precomputed system-prompt KV
+  // cache or a second run() on the same object makes it an arbitrary residue
+  // mod C, and the old "offset from from_pos" grid then straddled the seam
+  // mid-prefill on a configuration that ran fine with the ring off.
+  //
+  // ! The re-tiling is a CONTRACT CHANGE ON A SHIPPED API SURFACE, not an
+  //   internal detail: for the callers it applies to, multi-turn (and
+  //   precomputed-system-prompt) PREFILL BITS CHANGE. A different chunk
+  //   schedule means different fp16 rounding, exactly as any chunk-size change
+  //   does. It is therefore GATED on the model actually having a ringed layer
+  //   -- ring_grid is 0, and the tiling is the historical one verbatim, unless
+  //   some layer is modulo-indexed.
+  //
+  //   That gate is not cosmetic. Ungated, the re-tiling fires for callers that
+  //   have no seam to straddle -- every full-attention model, and every run
+  //   with NNTR_KV_WINDOW_RING=0 -- i.e. it perturbs configurations the ring
+  //   cannot possibly make wrong. MEASURED on exactly such a cell (Intel XMX
+  //   OpenCL, gemma2 QS4CX-FP16, max_seq_len 1024, precomputed 450-token system
+  //   prompt, C=64, NNTR_KV_WINDOW_RING=0 so nothing is ringed; turn 2 is 324
+  //   tokens starting at absolute 476, 476 % 64 = 28, so an ungated grid moves
+  //   64+64+64+64+64+4 -> 36+64+64+64+64+32). Turn-2 greedy completion:
+  //
+  //     ungated  "45674567456745674"
+  //     gated    "4 The quick brown fox jumps over the quiet river bank, while
+  //               a curious heron watches"
+  //
+  //   transcript md5: gated 514204262c0c == the pre-phasing baseline; ungated
+  //   6893035877df. The gated arm is byte-identical to the tree before this
+  //   whole series, so the ring-off half of the shipped API surface does not
+  //   move at all.
+  //
+  // ! For a model that IS ringed the re-tiling still applies, and there the
+  //   bits still change relative to a ring-off run of the same package -- that
+  //   is the price of the correctness fix, and it is the case that used to
+  //   throw mid-prefill. Same two turns on the same package with the ring ON
+  //   (gemma2 sliding_window 128, max_seq 1024, C=64 => cap 256): before the
+  //   phasing the second turn dies with "mha_core kv-window-ring: step write
+  //   straddles the ring seam"; with it the run completes, transcript md5
+  //   d25dd3330f8d, and the gate above does not touch that arm.
+  //
+  //   from_pos is SYS_PROMP_LEN + global_token_len, so a precomputed system
+  //   prompt or a second run() on the same object makes it an arbitrary residue
+  //   mod C; the old "offset from from_pos" grid then straddled the seam.
+  //   Callers in that regime: multi-turn chat, the resume-block prefill path, a
+  //   reset-and-rerun SDK session. A two-turn transcript on a RINGED package is
+  //   therefore a REQUIRED gate row for this file -- the single-turn 1K goldens
+  //   (from_pos == 0) cannot see it at all.
+  //
+  // hasRingedLayer() is deliberately NOT kv_ring_caps_: that member is filled
+  // by allocateAndBindKVCache(), which several models override, so reading it
+  // here would make the gate depend on which override ran. hasRingedLayer()
+  // recomputes kvRingCap(getLayerSlidingWindow(i), MAX_SEQ_LEN) -- literally
+  // the expression createKVCachePlaceholders() sized the graph with -- so it
+  // agrees with the compiled graph by construction.
+  //
+  // ring_grid == 0 selects the pre-ring tiling below (both use sites test it),
+  // and it is also 0 whenever effectivePrefillChunk() is, so no modulo below
+  // can divide by zero.
+  const unsigned int ring_grid =
+    hasRingedLayer(static_cast<unsigned int>(MAX_SEQ_LEN))
+      ? effectivePrefillChunk()
+      : 0u;
   auto do_prefill = [&](unsigned int n_tok,
                         unsigned int from_pos) -> std::vector<float *> {
-    // Single block (default) when chunking is off or the prompt fits one chunk.
+    // Single block when chunking is off, or when the whole prompt already fits
+    // inside one C-aligned block (which is what n_tok <= prefill_chunk means
+    // for a C-aligned from_pos, the historical fast path).
     // NOTE: this must go through CausalLM::incrementalInference, not
     // NeuralNetwork::incremental_inference -- the wrapper feeds KVCacheManager
     // tensors as the REAL tensor so their isSVM() flag survives the per-call
     // fillPlaceholder/syncDependents (see its contract comment). Calling the
     // raw model method here drops attention to the host path.
-    if (prefill_chunk == 0 || n_tok <= prefill_chunk) {
+    if (prefill_chunk == 0 ||
+        (n_tok <= prefill_chunk &&
+         (ring_grid == 0 || (from_pos % ring_grid) + n_tok <= ring_grid))) {
       return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
                                   from_pos + n_tok);
     }
-    // Chunked forward prefill.
+    // Chunked forward prefill, on the absolute C grid.
+    //
+    // Chunk sizes are no longer non-increasing: the FIRST chunk is the short
+    // one (it stops at the next absolute multiple of C) and the ones after it
+    // are full. The refill below writes only rows [0, clen) of input_sample, so
+    // rows [clen, previous clen) keep the PREVIOUS chunk's token ids. Nothing
+    // reads them, and that is now load-bearing: the bound is the (from, to)
+    // pair, not the buffer -- every layer's incremental_forwarding slices
+    // to - from rows from row 0 (e.g. EmbeddingLayer: `int iter = to - from`),
+    // and the init_seq_len argument of incrementalInference is dropped by
+    // NeuralNetwork::incremental_inference. Feeding a chunk shorter than its
+    // predecessor without narrowing (from, to) in lockstep would silently
+    // prefill stale tokens.
     std::vector<float *> out;
-    for (unsigned int o = 0; o < n_tok; o += prefill_chunk) {
-      const unsigned int clen = std::min(prefill_chunk, n_tok - o);
+    unsigned int o = 0;
+    while (o < n_tok) {
+      const unsigned int cf = from_pos + o;
+      // <= prefill_chunk (the activation buffer) and, when some layer is
+      // ringed, never past the next absolute multiple of C (the ring seam).
+      // All terms are >= 1 (cf % ring_grid < ring_grid, o < n_tok,
+      // prefill_chunk != 0 here), so the loop always advances. With no ringed
+      // layer (ring_grid == 0) this is the pre-ring `min(prefill_chunk,
+      // n_tok - o)` verbatim -- offsets from from_pos, no absolute phasing.
+      const unsigned int clen =
+        ring_grid == 0
+          ? std::min(prefill_chunk, n_tok - o)
+          : std::min({prefill_chunk, n_tok - o, ring_grid - (cf % ring_grid)});
       for (unsigned int b = 0; b < BATCH_SIZE; ++b)
         for (unsigned int j = 0; j < clen; ++j)
           input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
             static_cast<float>(init_input[o + j]);
-      const unsigned int cf = from_pos + o;
       auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
-      if (o + clen < n_tok)
+      o += clen;
+      if (o < n_tok)
         for (auto &oo : so)
           delete[] oo;
       else
