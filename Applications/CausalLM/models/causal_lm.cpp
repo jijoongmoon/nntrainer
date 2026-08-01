@@ -1210,9 +1210,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   //
   // The seam cannot be dodged by sizing Wcap instead: for any finite Wcap some
   // p puts the slice across the seam, so only the producer's phase can uphold
-  // it. Chunk boundaries are therefore phased on the ABSOLUTE position, not on
-  // an offset from from_pos: the first chunk is shortened to the next multiple
-  // of C, every later one starts C-aligned.
+  // it. When a layer is ringed, chunk boundaries are therefore phased on the
+  // ABSOLUTE position, not on an offset from from_pos: the first chunk is
+  // shortened to the next multiple of C, every later one starts C-aligned.
   //
   // from_pos is 0 only for a first turn without a precomputed system prompt;
   // it is SYS_PROMP_LEN + global_token_len, so a precomputed system-prompt KV
@@ -1220,37 +1220,63 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // mod C, and the old "offset from from_pos" grid then straddled the seam
   // mid-prefill on a configuration that ran fine with the ring off.
   //
-  // ! This re-tiling is a CONTRACT CHANGE ON A SHIPPED API SURFACE, not an
-  //   internal detail. Precisely: multi-turn (and precomputed-system-prompt)
-  //   PREFILL BITS CHANGE; ring-on == ring-off is preserved. The schedule is
-  //   byte-identical to the previous one whenever from_pos % C == 0 and the
-  //   chunk divides C -- i.e. every single-turn, no-system-prompt run, which is
-  //   what the 1K goldens measure -- but a second run() on one model object
-  //   re-tiles as soon as from_pos % C + n_tok > C, and a different chunk
-  //   size means different fp16 rounding, exactly as any chunk-size change
-  //   does. Every caller that reuses one model object is in that regime:
-  //   multi-turn chat, the resume-block prefill path, and a reset-and-rerun
-  //   SDK session. A two-turn transcript is therefore a REQUIRED gate row for
-  //   this file -- the single-turn goldens cannot see this at all.
+  // ! The re-tiling is a CONTRACT CHANGE ON A SHIPPED API SURFACE, not an
+  //   internal detail: for the callers it applies to, multi-turn (and
+  //   precomputed-system-prompt) PREFILL BITS CHANGE. A different chunk
+  //   schedule means different fp16 rounding, exactly as any chunk-size change
+  //   does. It is therefore GATED on the model actually having a ringed layer
+  //   -- ring_grid is 0, and the tiling is the historical one verbatim, unless
+  //   some layer is modulo-indexed.
   //
-  //   MEASURED, not asserted (Intel XMX OpenCL, gemma2 QS4CX-FP16, max_seq_len
-  //   1024, precomputed 450-token system prompt, C=64, ring OFF so the re-tiling
-  //   is the ONLY difference; turn 2 is 324 tokens starting at absolute 476,
-  //   476 % 64 = 28, so the grid moves 64+64+64+64+64+4 -> 36+64+64+64+64+32):
+  //   That gate is not cosmetic. Ungated, the re-tiling fires for callers that
+  //   have no seam to straddle -- every full-attention model, and every run
+  //   with NNTR_KV_WINDOW_RING=0 -- i.e. it perturbs configurations the ring
+  //   cannot possibly make wrong. MEASURED on exactly such a cell (Intel XMX
+  //   OpenCL, gemma2 QS4CX-FP16, max_seq_len 1024, precomputed 450-token system
+  //   prompt, C=64, NNTR_KV_WINDOW_RING=0 so nothing is ringed; turn 2 is 324
+  //   tokens starting at absolute 476, 476 % 64 = 28, so an ungated grid moves
+  //   64+64+64+64+64+4 -> 36+64+64+64+64+32). Turn-2 greedy completion:
   //
-  //     transcript md5   before (this change reverted)  514204262c0c
-  //                      after                          6893035877df
+  //     ungated  "45674567456745674"
+  //     gated    "4 The quick brown fox jumps over the quiet river bank, while
+  //               a curious heron watches"
   //
-  //   Turn 1 is byte-identical in both (it is one sub-chunk block). Turn 2 is
-  //   not, and the two completions are not small perturbations of each other --
-  //   they diverge into different token sequences within the first token. That
-  //   is what a chunk-size change does to a 16-token greedy continuation; it is
-  //   the reason this needs a gate row rather than a footnote.
+  //   transcript md5: gated 514204262c0c == the pre-phasing baseline; ungated
+  //   6893035877df. The gated arm is byte-identical to the tree before this
+  //   whole series, so the ring-off half of the shipped API surface does not
+  //   move at all.
   //
-  // ring_grid is only ever read on a path guarded by prefill_chunk != 0, and
-  // prefill_chunk is 0 whenever effectivePrefillChunk() is, so the modulo below
-  // cannot divide by zero.
-  const unsigned int ring_grid = effectivePrefillChunk();
+  // ! For a model that IS ringed the re-tiling still applies, and there the
+  //   bits still change relative to a ring-off run of the same package -- that
+  //   is the price of the correctness fix, and it is the case that used to
+  //   throw mid-prefill. Same two turns on the same package with the ring ON
+  //   (gemma2 sliding_window 128, max_seq 1024, C=64 => cap 256): before the
+  //   phasing the second turn dies with "mha_core kv-window-ring: step write
+  //   straddles the ring seam"; with it the run completes, transcript md5
+  //   d25dd3330f8d, and the gate above does not touch that arm.
+  //
+  //   from_pos is SYS_PROMP_LEN + global_token_len, so a precomputed system
+  //   prompt or a second run() on the same object makes it an arbitrary residue
+  //   mod C; the old "offset from from_pos" grid then straddled the seam.
+  //   Callers in that regime: multi-turn chat, the resume-block prefill path, a
+  //   reset-and-rerun SDK session. A two-turn transcript on a RINGED package is
+  //   therefore a REQUIRED gate row for this file -- the single-turn 1K goldens
+  //   (from_pos == 0) cannot see it at all.
+  //
+  // hasRingedLayer() is deliberately NOT kv_ring_caps_: that member is filled
+  // by allocateAndBindKVCache(), which several models override, so reading it
+  // here would make the gate depend on which override ran. hasRingedLayer()
+  // recomputes kvRingCap(getLayerSlidingWindow(i), MAX_SEQ_LEN) -- literally
+  // the expression createKVCachePlaceholders() sized the graph with -- so it
+  // agrees with the compiled graph by construction.
+  //
+  // ring_grid == 0 selects the pre-ring tiling below (both use sites test it),
+  // and it is also 0 whenever effectivePrefillChunk() is, so no modulo below
+  // can divide by zero.
+  const unsigned int ring_grid =
+    hasRingedLayer(static_cast<unsigned int>(MAX_SEQ_LEN))
+      ? effectivePrefillChunk()
+      : 0u;
   auto do_prefill = [&](unsigned int n_tok,
                         unsigned int from_pos) -> std::vector<float *> {
     // Single block when chunking is off, or when the whole prompt already fits
@@ -1263,7 +1289,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     // raw model method here drops attention to the host path.
     if (prefill_chunk == 0 ||
         (n_tok <= prefill_chunk &&
-         (from_pos % ring_grid) + n_tok <= ring_grid)) {
+         (ring_grid == 0 || (from_pos % ring_grid) + n_tok <= ring_grid))) {
       return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
                                   from_pos + n_tok);
     }
@@ -1284,12 +1310,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     unsigned int o = 0;
     while (o < n_tok) {
       const unsigned int cf = from_pos + o;
-      // <= prefill_chunk (the activation buffer) and never past the next
-      // absolute multiple of C (the ring seam). All three terms are >= 1
-      // (cf % ring_grid < ring_grid, o < n_tok, prefill_chunk != 0 here), so
-      // the loop always advances.
+      // <= prefill_chunk (the activation buffer) and, when some layer is
+      // ringed, never past the next absolute multiple of C (the ring seam).
+      // All terms are >= 1 (cf % ring_grid < ring_grid, o < n_tok,
+      // prefill_chunk != 0 here), so the loop always advances. With no ringed
+      // layer (ring_grid == 0) this is the pre-ring `min(prefill_chunk,
+      // n_tok - o)` verbatim -- offsets from from_pos, no absolute phasing.
       const unsigned int clen =
-        std::min({prefill_chunk, n_tok - o, ring_grid - (cf % ring_grid)});
+        ring_grid == 0
+          ? std::min(prefill_chunk, n_tok - o)
+          : std::min({prefill_chunk, n_tok - o, ring_grid - (cf % ring_grid)});
       for (unsigned int b = 0; b < BATCH_SIZE; ++b)
         for (unsigned int j = 0; j < clen; ++j)
           input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =

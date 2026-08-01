@@ -1450,7 +1450,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   //  - CausalLM::run's chunk loop keeps a prefill write inside one absolute
   //    C-aligned block, which is what a ringed layer needs (cache_index is the
   //    ABSOLUTE position, so it is C-aligned only when prefill started at a
-  //    multiple of C);
+  //    multiple of C). That absolute phasing is applied only when the model
+  //    HAS a ringed layer (Transformer::hasRingedLayer); a model with no
+  //    sliding-window layer, and any run with NNTR_KV_WINDOW_RING=0, keeps the
+  //    historical from_pos-relative tiling bit-for-bit;
   //  - CausalLM::run's SAVE_KVCACHE branch prefills one unchunked block from
   //    absolute 0 and therefore refuses a ringed layer up front (precomputed
   //    KV save/load is NYI with the ring);
@@ -1461,10 +1464,17 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   //    Transformer::constructModel(), so its mha_core layers get
   //    sliding_window = getLayerSlidingWindow(layer_id). It therefore refuses
   //    a prompt longer than the ring cap up front, for the same reason;
-  //  - LFM2Model::run also prefills one unchunked block, and has no
-  //    sliding-window layer (no `sliding_window` in its config =>
-  //    SLIDING_WINDOW stays UINT_MAX => kvRingCap returns 0), so only the
-  //    full-attention half of the bound applies to it;
+  //  - Lfm2CausalLM::run_with_embeddings also prefills one unchunked block,
+  //    and it is the one entry here that is CONFIG-DEPENDENT rather than
+  //    structural. Today's lfm2 configs carry no `sliding_window`, so
+  //    SLIDING_WINDOW stays UINT_MAX, kvRingCap returns 0 and only the
+  //    full-attention half of the bound applies. A package that DID set it
+  //    would ring, and this producer is the riskiest of the four: it starts at
+  //    an arbitrary absolute (prefill_from = global_token_len, not 0) and
+  //    Lfm2Transformer::createAttention gives every mha_core the scalar
+  //    SLIDING_WINDOW while the placeholders come from the pattern-strided
+  //    getLayerSlidingWindow(). It therefore carries its own up-front refusal
+  //    for both, in lfm2_causallm.cpp;
   //  - TimmViTTransformer::run prefills all NUM_PATCHES at once and builds
   //    mha_core WITHOUT a sliding_window property, so props::SlidingWindow
   //    keeps its UINT_MAX default => kv_ring_cap is 0 => full-attention half

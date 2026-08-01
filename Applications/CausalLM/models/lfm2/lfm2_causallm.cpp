@@ -495,6 +495,82 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
       "MAX_SEQ_LEN must be greater than or equal to INIT_SEQ_LEN");
   }
 
+  // [kv-window-ring] Producer precondition, the same up-front refusal
+  // SentenceTransformer::encode carries -- and this producer needs it more,
+  // for two independent reasons.
+  //
+  // 1. It prefills the WHOLE prompt as ONE unchunked block (the
+  //    incremental_inference(..., input_len, prefill_from, prefill_to, false)
+  //    below), and unlike encode() it starts at an ARBITRARY absolute:
+  //    prefill_from = global_token_len, so from turn 2 on it is whatever the
+  //    previous turn left. A ringed layer stores position % Wcap, so that
+  //    single contiguous write is only valid while
+  //    (prefill_from % Wcap) + input_len <= Wcap.
+  // 2. Lfm2Transformer::createAttention passes the SCALAR SLIDING_WINDOW to
+  //    EVERY mha_core, while the KV placeholders come from
+  //    Transformer::createKVCachePlaceholders, which sizes them from the
+  //    pattern-strided getLayerSlidingWindow(). With sliding_window set those
+  //    two disagree (with the default sliding_window_pattern = 1 they
+  //    disagree on every layer: getLayerSlidingWindow returns UINT_MAX for
+  //    all of them, so no placeholder is ringed, while every layer's mha_core
+  //    modulo-indexes). A layer that modulo-indexes into a plane sized for
+  //    absolute rows does not run off the end -- it silently overwrites live
+  //    rows and reads the wrong keys.
+  //
+  // Both are latent today: lfm2's config carries no "sliding_window", so
+  // SLIDING_WINDOW stays UINT_MAX, kvRingCap() returns 0 everywhere and
+  // neither branch below can fire. That is exactly why this entry is
+  // CONFIG-DEPENDENT rather than structural, and why it is a refusal and not
+  // a fix: an lfm2 package that does set sliding_window would need the
+  // per-layer window plumbed through createAttention first.
+  {
+    const unsigned int max_ts = static_cast<unsigned int>(MAX_SEQ_LEN);
+    const std::vector<unsigned int> placeholder_caps = kvRingCapsQuiet(max_ts);
+    const unsigned int layer_cap = kvRingCap(SLIDING_WINDOW, max_ts);
+    bool caps_agree = true;
+    unsigned int any_placeholder_cap = 0;
+    size_t first_disagreeing = 0;
+    for (size_t i = 0; i < placeholder_caps.size(); ++i) {
+      if (placeholder_caps[i] != 0)
+        any_placeholder_cap = placeholder_caps[i];
+      if (placeholder_caps[i] != layer_cap && caps_agree) {
+        caps_agree = false;
+        first_disagreeing = i;
+      }
+    }
+    if (layer_cap != 0 || any_placeholder_cap != 0) {
+      if (!caps_agree) {
+        throw std::runtime_error(
+          "Lfm2CausalLM: NYI -- the sliding-window ring is engaged but this "
+          "model's per-layer windows disagree: createAttention gives every "
+          "mha_core sliding_window=" +
+          std::to_string(SLIDING_WINDOW) + " (ring cap " +
+          std::to_string(layer_cap) + " rows) while layer " +
+          std::to_string(first_disagreeing) +
+          "'s KV placeholder was sized from the pattern-strided "
+          "getLayerSlidingWindow() (ring cap " +
+          std::to_string(placeholder_caps[first_disagreeing]) +
+          " rows). Re-run with NNTR_KV_WINDOW_RING=0 for this configuration.");
+      }
+      // prefill_from below is exactly global_token_len; read it here, before
+      // the buffers are built, so the refusal costs nothing. layer_cap is
+      // non-zero on this line: caps_agree means every placeholder cap equals
+      // layer_cap, so layer_cap == 0 would make any_placeholder_cap 0 too and
+      // the enclosing `if` false.
+      if ((global_token_len % layer_cap) + input_len > layer_cap) {
+        throw std::runtime_error(
+          "Lfm2CausalLM: NYI -- prefill of " + std::to_string(input_len) +
+          " tokens at absolute position " + std::to_string(global_token_len) +
+          " with the sliding-window ring enabled (ring cap " +
+          std::to_string(layer_cap) +
+          " rows). run_with_embeddings() prefills the whole prompt as one "
+          "unchunked block, so it cannot split its writes on the absolute "
+          "NNTR_PREFILL_CHUNK grid the ring requires. Re-run with "
+          "NNTR_KV_WINDOW_RING=0 for this configuration.");
+      }
+    }
+  }
+
   // Allocate the host-owned KV cache and bind it to mha_core's external cache
   // input slots. Idempotent: only the first call does work.
   allocateAndBindKVCache();

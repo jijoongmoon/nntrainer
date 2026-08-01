@@ -309,10 +309,42 @@ protected:
    *        derived cap and whether the ring actually engaged -- a measurement
    *        must never have to ASSUME the ring is on.
    *
+   * ! It LOGS. Call it once per KV-cache allocation, never per request. The
+   *   quiet counterpart below exists for the per-request callers.
+   *
    * @param max_seq KV capacity the model was built with (MAX_SEQ_LEN)
    * @return per-layer capacity vector of size NUM_LAYERS
    */
   std::vector<unsigned int> computeKVRingCaps(unsigned int max_seq) const;
+
+  /**
+   * @brief Quiet counterpart of computeKVRingCaps(): the SAME per-layer
+   *        arithmetic, no "[kv-ring]" line. For callers that need the caps on
+   *        a per-request path (a producer precondition check), where the
+   *        one-per-model-load log contract would be violated.
+   *
+   * computeKVRingCaps() is implemented in terms of this, so the two cannot
+   * drift.
+   *
+   * @param max_seq KV capacity the model was built with (MAX_SEQ_LEN)
+   * @return per-layer capacity vector of size NUM_LAYERS
+   */
+  std::vector<unsigned int> kvRingCapsQuiet(unsigned int max_seq) const;
+
+  /**
+   * @brief Does THIS model have at least one ringed layer at max_seq?
+   *
+   * Derived from getLayerSlidingWindow() + kvRingCap() directly rather than
+   * from CausalLM::kv_ring_caps_, so it is correct no matter which
+   * allocateAndBindKVCache() override allocated the cache (Gemma4CausalLM has
+   * its own, SentenceTransformer has its own) and correct before any cache has
+   * been allocated at all. Same expression createKVCachePlaceholders() sizes
+   * the placeholders with, so it cannot disagree with the compiled graph.
+   *
+   * @param max_seq KV capacity the model was built with (MAX_SEQ_LEN)
+   * @return true iff some layer is modulo-indexed
+   */
+  bool hasRingedLayer(unsigned int max_seq) const;
 
   /**
    * @brief Setup the parameters for the Transformer model

@@ -339,13 +339,22 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   // Only the writes that do not fit are refused. A ringed layer whose Wcap
   // covers the whole prompt never wraps -- every row index is n % Wcap == n --
   // so it stays exactly as correct, and as byte-identical to ring-off, as it
-  // is today. Note also that this class overrides allocateAndBindKVCache()
-  // without going through computeKVRingCaps(), so the "[kv-ring]" line never
-  // prints on this path: the ring is invisible here until it corrupts
-  // something, which is the other reason to name it explicitly.
+  // is today.
+  //
+  // ! kvRingCapsQuiet(), NOT computeKVRingCaps(). encode() is the PER-REQUEST
+  //   entry point of the embedding API (SentenceTransformer::run calls it once
+  //   per prompt), and computeKVRingCaps() ends in an unconditional
+  //   ml_logi("[kv-ring] ...") whose documented contract is one line per
+  //   KV-cache allocation, i.e. once per model load. Calling it here would turn
+  //   that into one line per request. The quiet overload is the same
+  //   arithmetic with no log. (This class also overrides
+  //   allocateAndBindKVCache() without calling computeKVRingCaps() at all, so
+  //   the "[kv-ring]" line genuinely never prints on this path -- the ring is
+  //   invisible here until it corrupts something, which is the other reason to
+  //   name it explicitly.)
   {
     const std::vector<unsigned int> ring_caps =
-      computeKVRingCaps(static_cast<unsigned int>(MAX_SEQ_LEN));
+      kvRingCapsQuiet(static_cast<unsigned int>(MAX_SEQ_LEN));
     for (size_t i = 0; i < ring_caps.size(); ++i) {
       if (ring_caps[i] != 0 && input_len > ring_caps[i]) {
         throw std::runtime_error(

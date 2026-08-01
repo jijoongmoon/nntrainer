@@ -942,8 +942,15 @@ void Gemma4CausalLM::allocateAndBindKVCache() {
     // sliding layers (gemma4 sliding blocks are the d=256 ones); the
     // full-attention blocks keep the linear max_seq cache. Same
     // getLayerSlidingWindow() hook the placeholders use.
+    //
+    // kv_ring_caps_ is set here as well as setLayerCaps(): it is the base
+    // class's record of the same fact, and every consumer of it lives in
+    // CausalLM (the SAVE_KVCACHE refusal in run()). This override used to
+    // leave it EMPTY, which silently disabled those consumers for the one
+    // model family that actually rings.
     const unsigned int max_ts = static_cast<unsigned int>(MAX_SEQ_LEN);
-    kv_cache.setLayerCaps(computeKVRingCaps(max_ts));
+    kv_ring_caps_ = computeKVRingCaps(max_ts);
+    kv_cache.setLayerCaps(kv_ring_caps_);
 
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE, max_ts,
                       kv_widths, cache_dtype);

@@ -230,6 +230,13 @@ protected:
    *        full-attention / ring-off layer. Kept so the bind step can enforce
    *        that a ringed layer's graph placeholder really was built at the same
    *        Wcap height. Empty until allocateAndBindKVCache() has allocated.
+   *
+   * ! EVERY allocateAndBindKVCache() override must fill this, not only call
+   *   KVCacheManager::setLayerCaps(). Leaving it empty does not fail loud, it
+   *   silently no-ops the guards that read it (run()'s SAVE_KVCACHE refusal,
+   *   the bind-time shape check). Do not use it to decide whether the model
+   *   rings at all -- Transformer::hasRingedLayer() answers that from
+   *   getLayerSlidingWindow() and needs no allocation to have happened.
    */
   std::vector<unsigned int> kv_ring_caps_;
 
