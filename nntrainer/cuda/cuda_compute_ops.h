@@ -14,13 +14,21 @@
  *          ComputeOps base): engine=cuda tensors are Unified Memory
  *          (host-coherent), so every op the CUDA backend does not accelerate
  *          runs correctly via the CPU implementation over the managed
- *          buffers. This class overrides only the element-wise decode ops
- *          (swiglu / scalar_mul / softcap); each override falls back to the
- *          inherited host body when its device contract is not met.
+ *          buffers -- but ONLY while the pool is managed. On a discrete GPU
+ *          the context auto-arms the device-only activation pool, and there an
+ *          inherited host body dereferences cudaMalloc memory.
+ *
+ *          INVARIANT this table enforces: every whole-op a layer dispatches
+ *          through ComputeOps either has a device implementation here, or
+ *          refuses at a NAMED guard (host_math_gate) -- it never silently runs
+ *          host math on a device-only pointer. Each override therefore ends in
+ *          host_math_gate() before delegating to the inherited body.
  */
 
 #ifndef __CUDA_COMPUTE_OPS_H__
 #define __CUDA_COMPUTE_OPS_H__
+
+#include <cstdint>
 
 #include <cpu_ops_table.h>
 
@@ -95,6 +103,53 @@ public:
                 unsigned int row_offset) override;
 
   /**
+   * @brief Reverse-RMSNorm (per-layer-embedding post_norm) whole-op:
+   *        y = (x*w / rms(x*w)) * out_scale, the per-feature weight folded
+   *        INSIDE the denominator. FP16-ONLY device kernel + guard:
+   *        cuda_rms_reverse_norm_fp16 (FP32 sum-of-squares) is the only kernel
+   *        that exists, so an FP32 ACTIVATION has no device path here and
+   *        takes the named guard / inherited host body. An FP32
+   *        weight/out_scale does NOT decline: it is bound through the cached
+   *        fp16 converter (the FP32-gamma case rms_norm had to be repaired
+   *        for -- a norm weight is unquantized, so a quantized package pairs
+   *        an FP16 activation with an FP32 weight).
+   *        Kill-switch NNTR_CUDA_RMS_REVERSE_NORM=0.
+   *
+   *        Without this override the op inherited CpuComputeOps' host
+   *        FP32-temp math, which on the device-only activation pool faulted
+   *        inside avx2::vcvt_f16_f32 -- the gap this table's invariant exists
+   *        to make impossible.
+   */
+  void rms_reverse_norm(Tensor &in, Tensor &out, const Tensor &weight,
+                        const Tensor &out_scale, float epsilon,
+                        unsigned int active_rows,
+                        unsigned int row_offset) override;
+
+  /**
+   * @brief One residual-add operand: hidden = input, or hidden += input.
+   *        The accumulate form is a fp16 device kernel (cuda_add_fp16) on
+   *        device-accessible operands -- the inherited host body reaches
+   *        Tensor::add_i -> ele_add_fp16, host math this table does not
+   *        override. The copy form is gated on WHICH branch Tensor::copy will
+   *        take AND on the element type: only a matching-shape copy of a dtype
+   *        whose ITensor::copy(const void *) lands exclusively in ops THIS
+   *        table overrides is device-aware, so only that drains; the mismatch
+   *        branch (host read + backing-store swap) and every other dtype are
+   *        refused by name. Kill-switch NNTR_CUDA_ELTWISE=0 (then the named
+   *        guard refuses on a device-only pool rather than faulting).
+   */
+  void residual_op(Tensor &hidden, const Tensor &input,
+                   bool accumulate) override;
+
+  /**
+   * @brief Fused activation epilogue. No device kernel: the LLM stack never
+   *        sets a fused activation on an FC, so this exists to hold the
+   *        invariant -- run the inherited host ActiFunc on a host-reachable
+   *        output, refuse by name on a device-only one.
+   */
+  void apply_activation(Tensor &out, int act_type) override;
+
+  /**
    * @brief FC GEMM whole-op: output = input * weight. QS4CX weight -> fused
    *        dequant-GEMM on device, consuming the PLAIN nibble payload in
    *        place (single weight copy, no UVM duplicate), else the inherited
@@ -117,8 +172,66 @@ public:
   // real device memory; Tensor::copy() -> the CpuComputeOps host loop would
   // fault on it. Route contiguous device-only copies through a stream-ordered
   // cudaMemcpyAsync; host / host-coherent UVM keep the CPU path.
+  //
+  // The SAME invariant as the whole-ops above applies to this family, and it
+  // applies to ALL of it: an op left un-overridden here inherits the
+  // CpuComputeOps host element loop, which dereferences X and Y directly. The
+  // family splits three ways:
+  //
+  //   * byte-identical moves (scopy_fp32/fp16/u8/s8) -> device_copy(), a
+  //     stream-ordered cudaMemcpyAsync, dtype-agnostic and exact;
+  //   * fp32<->fp16 conversion -> staged through host temps (these are on live
+  //     paths: logits readback, activation dtype bridging);
+  //   * every other CONVERSION (int4/int8/int16 <-> float, float -> narrow) ->
+  //     NAMED REFUSAL. There is no device kernel for them, and the host bodies
+  //     they would have to reproduce have irregular extents that differ per
+  //     arch (e.g. scopy_int4_to_float32 reads N BYTES and writes 2N floats
+  //     while ignoring incX/incY; scopy_int8_to_fp32_* index X by incY and Y by
+  //     incX). Re-deriving that bug-compatibly for a staged copy, on paths no
+  //     in-tree consumer can reach with a device pointer, would be untested
+  //     code that can silently corrupt; the refusal cannot -- it fires only
+  //     where the inherited host body would have faulted on the next
+  //     instruction.
   void scopy_fp32(const unsigned int N, const float *X, const unsigned int incX,
                   float *Y, const unsigned int incY) override;
+  /**
+   * @brief Byte-identical uint8 move. Consumer: Uint4QTensor::copy(const void*)
+   *        (the packed-nibble payload). Device-aware via device_copy().
+   */
+  void scopy_u8(const unsigned int N, const uint8_t *X, const unsigned int incX,
+                uint8_t *Y, const unsigned int incY) override;
+  /**
+   * @brief Byte-identical int8 move. Consumers: CharTensor::copy(const void*)
+   *        and Int4QTensor::copy(const void*). Device-aware via device_copy().
+   *        This is the op that made a QINT8 residual copy pass the old
+   *        shape-only gate and then land in the host loop on device memory.
+   */
+  void scopy_s8(const unsigned int N, const int8_t *X, const unsigned int incX,
+                int8_t *Y, const unsigned int incY) override;
+
+  // Converting copies with no device kernel -- named refusal (see the block
+  // comment above). FP32 half of the family.
+  void scopy_int4_to_float32(const unsigned int N, const uint8_t *X,
+                             const unsigned int incX, float *Y,
+                             const unsigned int incY) override;
+  void scopy_int8_to_fp32_u(const unsigned int N, const uint8_t *X,
+                            const unsigned int incX, float *Y,
+                            const unsigned int incY) override;
+  void scopy_int8_to_fp32_s(const unsigned int N, const int8_t *X,
+                            const unsigned int incX, float *Y,
+                            const unsigned int incY) override;
+  void copy_s16_fp32(const unsigned int N, const int16_t *X,
+                     float *Y) override;
+  void copy_u16_fp32(const unsigned int N, const uint16_t *X,
+                     float *Y) override;
+  void copy_fp32_u32(const unsigned int N, const float *X,
+                     uint32_t *Y) override;
+  void copy_fp32_u16(const unsigned int N, const float *X,
+                     uint16_t *Y) override;
+  void copy_fp32_u8(const unsigned int N, const float *X, uint8_t *Y) override;
+  void copy_fp32_s16(const unsigned int N, const float *X,
+                     int16_t *Y) override;
+  void copy_fp32_s8(const unsigned int N, const float *X, int8_t *Y) override;
 #ifdef ENABLE_FP16
   void scopy_fp16(const unsigned int N, const _FP16 *X, const unsigned int incX,
                   _FP16 *Y, const unsigned int incY) override;
@@ -130,6 +243,16 @@ public:
   void scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
                           const unsigned int incX, float *Y,
                           const unsigned int incY) override;
+  // Converting copies with no device kernel -- named refusal. FP16 half.
+  void scopy_int4_to_float16(const unsigned int N, const uint8_t *X,
+                             const unsigned int incX, _FP16 *Y,
+                             const unsigned int incY) override;
+  void scopy_int8_to_float16_u(const unsigned int N, const uint8_t *X,
+                               const unsigned int incX, _FP16 *Y,
+                               const unsigned int incY) override;
+  void scopy_int8_to_float16_s(const unsigned int N, const int8_t *X,
+                               const unsigned int incX, _FP16 *Y,
+                               const unsigned int incY) override;
 #endif
 };
 

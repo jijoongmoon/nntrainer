@@ -22,6 +22,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include <acti_func.h> // ActivationType (apply_activation's ACT_NONE no-op)
 #include <compute_ops.h>
 #include <env_compat.h>
 #include <tensor.h>
@@ -29,6 +30,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -40,6 +43,217 @@
 #include <cuda_stream_manager.h>
 
 namespace nntrainer {
+
+namespace {
+
+using nntrainer::cuda::host_unreachable;
+
+/**
+ * @brief The ONE stream-drain spelling in this file.
+ *
+ * Every entry point here is a CudaComputeOps virtual, and this table is only
+ * ever reached through a tensor whose ContextData carries it -- installed by
+ * CudaContext::initialize() after cudaInit() succeeded. So the CUDA context
+ * provably exists at every call: StreamManager::Global() cannot create one
+ * that was not going to exist anyway, and the engine_selected() short-circuit
+ * that cuda::drain_if_async() carries (it protects the SHARED layers, which
+ * DO run on non-cuda runs of the unified binary -- see cuda_context_manager.h,
+ * measured -55% XMX prefill) is dead weight here. Worse, it would make the
+ * drain env-conditional in exactly the way host_unreachable() exists to stop.
+ *
+ * @param full true for the terminal drain (finish), false for the
+ *             async-mode-only drain (finishIfAsync, a no-op in sync mode)
+ */
+void table_drain(bool full) {
+  auto &sm = nntrainer::cuda::StreamManager::Global();
+  if (full)
+    sm.finish();
+  else
+    sm.finishIfAsync();
+}
+
+/**
+ * @brief Is a copy of this ELEMENT TYPE carried end-to-end by ops this table
+ *        overrides?
+ *
+ * Tensor::copy's matching branch calls itensor_->copy(from), and each ITensor
+ * subclass spells that copy differently. Only some of those spellings go
+ * through ComputeOps virtuals that CudaComputeOps overrides; the rest reach
+ * free functions or raw memcpy, which no op table can make residency-aware.
+ * Swept subclass by subclass (nntrainer/tensor/*.cpp):
+ *
+ *   FP32   FloatTensor::copy      -> o->scopy_fp32                    covered
+ *   FP16   HalfTensor::copy       -> o->scopy_fp16                    covered
+ *   QINT8  CharTensor::copy       -> o->scopy_s8 + o->scopy_fp32      covered
+ *   QINT4  Int4QTensor::copy      -> scopy_s8 + scopy_fp32            covered
+ *   UINT4  Uint4QTensor::copy     -> scopy_u8 + scopy_fp32 + a RAW
+ *                                    memcpy of the zero points    NOT covered
+ *   QINT16 ShortTensor::copy      -> free copy_s16() (not the table) NOT cov.
+ *   UINT8/16/32 UIntTensor::copy  -> free copy_u16()/memcpy + free
+ *                                    scopy() + zero points        NOT covered
+ *   BCQ    BCQTensor::copy        -> raw uint32 host loop          NOT covered
+ *   Q4_0/Q6_K/QS4CX               -> free scopy(), not the table   NOT covered
+ *
+ * "NOT covered" does not mean broken: it means a device-only operand would be
+ * dereferenced on the host by code outside this table, so this table must
+ * refuse rather than wave it through.
+ */
+bool copy_dtype_is_device_aware(ml::train::TensorDim::DataType dt) {
+  using DT = ml::train::TensorDim::DataType;
+  switch (dt) {
+  case DT::FP32:
+  case DT::QINT8:
+  case DT::QINT4:
+#ifdef ENABLE_FP16
+  case DT::FP16:
+#endif
+    return true;
+  default:
+    return false;
+  }
+}
+
+/**
+ * @brief Will Tensor::copy(from) be carried entirely by device-aware ops?
+ *
+ * Two terms, and BOTH are needed.
+ *
+ * (1) An exact transcription of the branch condition in Tensor::copy
+ * (tensor/tensor.cpp). When it holds, the copy lands in itensor_->copy; when
+ * it does NOT, Tensor::copy instead builds a fresh Tensor from
+ * from.getData<char>() -- a plain HOST read -- and swaps that host allocation
+ * in as the destination's backing store: no residency awareness anywhere on
+ * that branch.
+ *
+ * Deliberately an exact copy of the predicate rather than a stricter proxy
+ * (e.g. getDim() equality): a stricter test would refuse copies Tensor::copy
+ * really does handle on device, which turns a working run into a failing one.
+ * It is coupled to Tensor::copy by construction -- if that branch condition
+ * changes, this must change with it.
+ *
+ * (2) The element type. Term (1) alone is shape/dtype-AGNOSTIC about where the
+ * copy lands: it says "the matching branch", not "an op this table overrode".
+ * A matching-shape CharTensor satisfies it, and CharTensor::copy(const void *)
+ * then dispatches scopy_s8 on a pointer the host cannot address. That is the
+ * hole this second term closes -- see copy_dtype_is_device_aware above for the
+ * per-subclass sweep it encodes.
+ */
+bool copy_takes_scopy(const Tensor &to, const Tensor &from) {
+  const bool matching_branch = from.size() != 0 && to.size() == from.size() &&
+                               to.scale_size() == from.scale_size() &&
+                               to.getDataType() == from.getDataType();
+  return matching_branch && copy_dtype_is_device_aware(to.getDataType());
+}
+
+/**
+ * @brief The one place this table admits a host body, and the one place it
+ *        refuses.
+ *
+ * INVARIANT: no host math in this op table may dereference an operand that
+ * lives in the device-only activation pool (cudaMalloc, armed by default on a
+ * discrete GPU via NNTR_CUDA_DEV_ACT). Every override's fall-through to the
+ * inherited CpuComputeOps body calls this first, so a missing/declined device
+ * path surfaces as a named error naming the op AND the operand, instead of a
+ * SIGSEGV several frames deep inside an AVX2 intrinsic.
+ *
+ * It also carries the coherence half: a host body that IS allowed to run must
+ * see the last device write, hence the drain (a no-op in the default sync
+ * mode).
+ *
+ * The residency probe is cuda::host_unreachable(), NOT cuda::dev_only(): the
+ * latter short-circuits to false unless NNTR_ENGINE=="cuda", which is the
+ * right gate for the shared layers (they must not boot cudart on a non-cuda
+ * run) but the wrong one here -- this table only exists because a CudaContext
+ * was constructed, and the pool that context armed is device-only regardless
+ * of what the env says.
+ *
+ * This never turns a working run into a failing one: an operand that trips it
+ * is memory the CPU cannot address, so the host body it guards would have
+ * faulted on the very next instruction.
+ *
+ * @param op       op name for the message (no backend prefix; added here)
+ * @param operands operands the host body will dereference; nullptr entries and
+ *                 unallocated tensors are skipped
+ */
+void host_math_gate(const char *op,
+                    std::initializer_list<const Tensor *> operands) {
+  table_drain(false);
+  const Tensor *blocked = nullptr;
+  unsigned int blocked_idx = 0, idx = 0;
+  for (const Tensor *t : operands) {
+    const unsigned int here = idx++;
+    if (t == nullptr)
+      continue;
+    if (host_unreachable(t->getData<char>())) {
+      blocked = t;
+      blocked_idx = here;
+      break;
+    }
+  }
+  if (blocked == nullptr)
+    return;
+
+  // A window view (getSharedDataTensor) carries no name of its own, so fall
+  // back to the operand position -- an unnamed operand must still be located.
+  std::string who = blocked->getName();
+  if (who.empty()) {
+    std::ostringstream w;
+    w << "#" << blocked_idx;
+    who = w.str();
+  }
+  std::ostringstream ss;
+  ss << "CudaComputeOps::" << op
+     << ": the host fallback cannot run on the device-only activation pool -- "
+        "operand '"
+     << who
+     << "' is device memory the CPU cannot address. The device path for this "
+        "op declined the call (unsupported dtype or shape, or its kernel gate "
+        "is off). Re-run with NNTR_CUDA_DEV_ACT=0 for a host-coherent pool, "
+        "or give this op a device implementation.";
+  throw std::runtime_error(ss.str());
+}
+
+/**
+ * @brief The raw-pointer sibling of host_math_gate(), for the copy family.
+ *
+ * Same invariant, different operand shape: the scopy_* / copy_* ops take bare
+ * pointers, so there is no Tensor name to report -- the message names the op
+ * and the ENDPOINT ("source" / "destination") instead, which is the whole
+ * locating information those signatures carry.
+ *
+ * Used by the converting copies that have no device kernel. It is a refusal,
+ * not a fallback: it fires only when an endpoint is memory the CPU cannot
+ * address, i.e. exactly where the inherited CpuComputeOps element loop would
+ * have faulted on its next dereference. On host / host-coherent UVM pointers
+ * it returns and the inherited body runs unchanged, so no working
+ * configuration changes behaviour.
+ *
+ * @param op   op name for the message (no backend prefix; added here)
+ * @param X    source pointer the host body will read
+ * @param Y    destination pointer the host body will write
+ */
+void host_copy_gate(const char *op, const void *X, const void *Y) {
+  table_drain(false);
+  const char *who = nullptr;
+  if (X != nullptr && host_unreachable(X))
+    who = "source";
+  else if (Y != nullptr && host_unreachable(Y))
+    who = "destination";
+  if (who == nullptr)
+    return;
+
+  std::ostringstream ss;
+  ss << "CudaComputeOps::" << op
+     << ": this converting copy has no device kernel, and its host element "
+        "loop cannot run on the device-only activation pool -- the "
+     << who
+     << " is device memory the CPU cannot address. Re-run with "
+        "NNTR_CUDA_DEV_ACT=0 for a host-coherent pool, or give this "
+        "conversion a device implementation.";
+  throw std::runtime_error(ss.str());
+}
+
+} // namespace
 
 void CudaComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
                             unsigned int active_rows, unsigned int row_offset) {
@@ -63,6 +277,7 @@ void CudaComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
       return;
   }
 #endif
+  host_math_gate("swiglu", {&in1, &in2, &out});
   CpuComputeOps::swiglu(in1, in2, out, active_rows, row_offset);
 }
 
@@ -96,9 +311,10 @@ void CudaComputeOps::geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
   }
 #endif
 
-  // Host gelu fallback: sync first so the host read of GPU-produced gate/up
-  // is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
-  nntrainer::cuda::drain_if_async();
+  // Host gelu fallback: the gate syncs first so the host read of GPU-produced
+  // gate/up is coherent under NNTR_CUDA_ASYNC (no-op in sync mode), and
+  // refuses by name if an operand is device-only.
+  host_math_gate("geglu", {&in1, &in2, &out});
   CpuComputeOps::geglu(in1, in2, out, active_rows, row_offset);
 }
 
@@ -132,7 +348,7 @@ void CudaComputeOps::sigmoid_glu(const Tensor &in1, const Tensor &in2,
     }
   }
 #endif
-  nntrainer::cuda::drain_if_async();
+  host_math_gate("sigmoid_glu", {&in1, &in2, &out});
   CpuComputeOps::sigmoid_glu(in1, in2, out, active_rows, row_offset);
 }
 
@@ -161,7 +377,7 @@ void CudaComputeOps::sigmoid_add(const Tensor &in1, const Tensor &in2,
     }
   }
 #endif
-  nntrainer::cuda::drain_if_async();
+  host_math_gate("sigmoid_add", {&in1, &in2, &out});
   CpuComputeOps::sigmoid_add(in1, in2, out, active_rows, row_offset);
 }
 
@@ -179,9 +395,10 @@ void CudaComputeOps::scalar_mul(const Tensor &in, Tensor &out, float scale) {
     }
   }
 #endif
-  // Host multiply reads the GPU-produced UVM input on the CPU; sync first
-  // in async mode (no-op in default sync mode).
-  nntrainer::cuda::drain_if_async();
+  // Host multiply reads the GPU-produced UVM input on the CPU; the gate syncs
+  // first in async mode (no-op in default sync mode) and refuses by name on a
+  // device-only operand.
+  host_math_gate("scalar_mul", {&in, &out});
   CpuComputeOps::scalar_mul(in, out, scale);
 }
 
@@ -191,10 +408,11 @@ void CudaComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
   // input is the first host-read point of the lm_head logits, so the
   // one-per-token GPU pipeline drains here. Per call (the layer chunks are
   // per batch/channel); the drain is idempotent and a no-op in default mode
-  // (every GPU op already drained). cuda runs only: StreamManager::Global()
-  // would CREATE the CUDA context.
-  if (nntrainer::cuda::engine_selected())
-    nntrainer::cuda::StreamManager::Global().finish();
+  // (every GPU op already drained). One spelling for the whole file
+  // (table_drain): the former engine_selected() guard here was the file's last
+  // env-conditional drain, and it cannot protect anything -- reaching this
+  // virtual already proves the CUDA context exists.
+  table_drain(true);
 #ifdef ENABLE_FP16
   // Device-only activation pool: the logits are real device memory; the host
   // Tensor ops in the fallback would fault. out = cap * tanh(in / cap) in one
@@ -210,8 +428,12 @@ void CudaComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
     // softcap to the host fallback -- which, inside a CUDA-graph capture,
     // reads the not-yet-run lm_head logits (stale) and is itself not
     // captured -> garbage output. Managed pointers run the GPU kernel fine.
-    if (nntrainer::cuda::engine_selected() &&
-        cudaPointerGetAttributes(&pa, ip) == cudaSuccess &&
+    // No engine_selected() term: the attribute probe below IS the gate (a
+    // plain host pointer reports cudaMemoryTypeUnregistered and falls
+    // through), and an env test here would send an SDK-path CudaContext --
+    // built without NNTR_ENGINE=cuda but with the device-only pool armed --
+    // straight into the host fallback on device logits.
+    if (cudaPointerGetAttributes(&pa, ip) == cudaSuccess &&
         (pa.type == cudaMemoryTypeDevice || pa.type == cudaMemoryTypeManaged) &&
         nntrainer::cuda::cuda_softcap_fp16(ip, op, (unsigned int)in.size(),
                                            cap)) {
@@ -221,6 +443,7 @@ void CudaComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
     cudaGetLastError();
   }
 #endif
+  host_math_gate("softcap", {&in, &out});
   CpuComputeOps::softcap(in, out, cap, act_type);
 }
 
@@ -293,9 +516,10 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
       return;
   }
 #endif
-  // Host rmsnorm fallback: sync first so the host read of GPU-produced input is
-  // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
-  cuda::StreamManager::Global().finishIfAsync();
+  // Host rmsnorm fallback: the gate syncs first so the host read of
+  // GPU-produced input is coherent under NNTR_CUDA_ASYNC (no-op in sync mode),
+  // and refuses by name if in/out live in the device-only pool.
+  host_math_gate("rms_norm", {&in, &out, &gamma});
   if (dt == DT::FP32 && gt == DT::FP32) {
     rmsnorm_rows(in.getData<float>(), gamma.getData<float>(),
                  out.getData<float>(), rows, width, eps);
@@ -335,6 +559,164 @@ void CudaComputeOps::rms_norm(const Tensor &in, Tensor &out,
     TensorDim(1, 1, active_rows, width, out.getDim().getTensorType()), elem_off,
     true);
   rmsnorm_dispatch(in_win, gamma, out_win, active_rows, width, epsilon);
+}
+
+// Reverse-RMSNorm (per-layer-embedding post_norm): y = (x*w / rms(x*w)) *
+// out_scale, the per-feature weight folded INSIDE the denominator and the
+// sum of squares accumulated in FP32. Mirrors ClComputeOps::rms_reverse_norm:
+// same signature, same window arithmetic (data + row_offset*width), and like
+// the CL kernel it does NOT fold the weight into `in` in place -- the doc'd
+// contract says no graph consumer reads the reverse-norm input after this op,
+// and the device kernel recomputes x*w in registers instead.
+//
+// The device kernel is FP16-ONLY (cuda_rms_reverse_norm_fp16 is the only one
+// that exists): an FP32 ACTIVATION has no device path here and takes the
+// inherited host body behind the named guard. What is NOT a reason to decline
+// is an FP32 weight/out_scale -- see the dtype note in the body.
+void CudaComputeOps::rms_reverse_norm(Tensor &in, Tensor &out,
+                                      const Tensor &weight,
+                                      const Tensor &out_scale, float epsilon,
+                                      unsigned int active_rows,
+                                      unsigned int row_offset) {
+#ifdef ENABLE_FP16
+  using DT = ml::train::TensorDim::DataType;
+  // Kill-switch, so a suspected numeric regression here is one env var away
+  // from a host-side A/B (with the device-only pool that A/B needs
+  // NNTR_CUDA_DEV_ACT=0 too -- the gate below says so by name).
+  static const bool gpu = []() {
+    const char *e = std::getenv("NNTR_CUDA_RMS_REVERSE_NORM");
+    return !(e && e[0] == '0');
+  }();
+  const unsigned int width = in.width();
+  const DT wdt = weight.getDataType();
+  const DT sdt = out_scale.getDataType();
+  // The FP32-gamma lesson from rmsnorm_dispatch above, carried across: a norm
+  // weight is unquantized on disk, so on a QUANTIZED package the layer resolves
+  // it to FP32 while the activation stays FP16 (rms_norm_layer.cpp picks
+  // getWeightDataType() only when that is itself a float type, else FP32).
+  // Requiring wdt == FP16 therefore does not narrow the device path, it
+  // DISABLES it for a whole class of packages -- exactly the defect the
+  // rms_norm gate had to be repaired for. Accept FP32 too and bind a
+  // converted, process-cached fp16 copy (same builder rms_norm uses; keyed on
+  // the fp32 pointer, refused inside a graph capture). The ACTIVATION dtype is
+  // the one real constraint: the kernel reads/writes fp16 only.
+  const bool wdt_ok = (wdt == DT::FP16 || wdt == DT::FP32);
+  const bool sdt_ok = (sdt == DT::FP16 || sdt == DT::FP32);
+  if (gpu && active_rows > 0 && width > 0 && in.getDataType() == DT::FP16 &&
+      out.getDataType() == DT::FP16 && wdt_ok && sdt_ok &&
+      weight.width() == width && weight.size() == width &&
+      out_scale.size() == 1) {
+    const size_t elem_off = (size_t)row_offset * width;
+    auto *x =
+      reinterpret_cast<const unsigned short *>(in.getData<_FP16>() + elem_off);
+    auto *y =
+      reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+    const unsigned short *w = nullptr;
+    const unsigned short *s = nullptr;
+    bool w_ok, s_ok;
+    if (wdt == DT::FP16) {
+      w = reinterpret_cast<const unsigned short *>(weight.getData<_FP16>());
+      w_ok = nntrainer::cuda::dev_accessible(w);
+    } else {
+      w_ok = cuda::cuda_rmsnorm_gamma_to_fp16(weight.getData<float>(), width,
+                                              &w);
+    }
+    if (sdt == DT::FP16) {
+      s = reinterpret_cast<const unsigned short *>(out_scale.getData<_FP16>());
+      s_ok = nntrainer::cuda::dev_accessible(s);
+    } else {
+      // out_scale is [1,1,1,1]; the same width-N converter with N = 1.
+      s_ok =
+        cuda::cuda_rmsnorm_gamma_to_fp16(out_scale.getData<float>(), 1u, &s);
+    }
+    // The activations must additionally be device-readable: they come from the
+    // device-only (or managed) activation pool. dev_accessible accepts Managed
+    // and pinned-mapped too, so this engages on integrated / WDDM pools as
+    // well. (The converter above already returns device-readable memory.)
+    if (w_ok && s_ok && nntrainer::cuda::dev_accessible(x) &&
+        nntrainer::cuda::dev_accessible(y) &&
+        nntrainer::cuda::cuda_rms_reverse_norm_fp16(x, w, s, y, epsilon,
+                                                    active_rows, width))
+      return;
+  }
+#endif
+  // FP32 activations (no device kernel), or a shape the kernel cannot bind:
+  // the inherited host FP32-temp math is the DESIGNED path there (same routing
+  // the OpenCL table takes), but it dereferences all four operands on the host.
+  host_math_gate("rms_reverse_norm", {&in, &out, &weight, &out_scale});
+  CpuComputeOps::rms_reverse_norm(in, out, weight, out_scale, epsilon,
+                                  active_rows, row_offset);
+}
+
+// One residual-add operand. hidden = input is a copy, and Tensor::copy routes
+// through scopy_fp16/scopy_fp32 -- overridden in this table, device-aware --
+// so the inherited body is already correct for it. hidden += input is NOT:
+// Tensor::add_i lands on ele_add_fp16, host math with no override here, which
+// faults on a device-only activation. Give the accumulate form its own device
+// kernel (the same cuda_add_fp16 the 2-input AdditionLayer fast path uses, so
+// the numerics are the ones this backend already ships) and gate the rest.
+void CudaComputeOps::residual_op(Tensor &hidden, const Tensor &input,
+                                 bool accumulate) {
+#ifdef ENABLE_FP16
+  using DT = ml::train::TensorDim::DataType;
+  if (accumulate && hidden.getDataType() == DT::FP16 &&
+      input.getDataType() == DT::FP16 && hidden.size() == input.size() &&
+      hidden.size() > 0) {
+    static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
+    if (gpu) {
+      auto *h = reinterpret_cast<unsigned short *>(hidden.getData<_FP16>());
+      auto *i = reinterpret_cast<const unsigned short *>(input.getData<_FP16>());
+      // In-place accumulate (dst aliases operand a): the kernel is pure
+      // element-wise, one read and one write per index, so aliasing is safe.
+      if (nntrainer::cuda::dev_accessible(h) &&
+          nntrainer::cuda::dev_accessible(i) &&
+          nntrainer::cuda::cuda_add_fp16(h, i, h, (unsigned int)hidden.size()))
+        return;
+    }
+  }
+#endif
+  if (accumulate) {
+    // add_i -> host ele_add_*: must not run on a device-only operand.
+    host_math_gate("residual_op", {&hidden, &input});
+  } else if (copy_takes_scopy(hidden, input)) {
+    // Tensor::copy's MATCHING branch AND an element type whose
+    // ITensor::copy(const void *) lands only in ops this table overrode. Only
+    // drain, so a host-coherent copy sees the last device write.
+    table_drain(false);
+  } else {
+    // Either of the two ways a copy escapes this table:
+    //
+    //  * Tensor::copy's MISMATCH branch, which builds
+    //    `Tensor t(from.getDim(), from.getData<char>())` -- a HOST read of the
+    //    source bytes -- and swaps that host allocation in as this tensor's
+    //    backing store. On a device-only operand that is a fault, and even when
+    //    it does not fault it silently replaces a pool tensor's storage with
+    //    plain host memory, so every later device op on `hidden` binds a
+    //    pointer no kernel can reach.
+    //
+    //  * the matching branch on an element type whose ITensor::copy reaches a
+    //    free function or a raw memcpy instead (QINT16, UINT*, BCQ, the GGUF
+    //    quants, and UINT4's zero-point block) -- host dereferences that no op
+    //    table can intercept.
+    //
+    // Refuse by name in both.
+    host_math_gate("residual_op", {&hidden, &input});
+  }
+  CpuComputeOps::residual_op(hidden, input, accumulate);
+}
+
+// Fused activation epilogue. No device kernel exists (and the LLM graphs never
+// set a fused activation on an FC), so this override exists purely to hold the
+// invariant: run the inherited host ActiFunc when the output is host
+// reachable, refuse by name when it is not.
+void CudaComputeOps::apply_activation(Tensor &out, int act_type) {
+  // ACT_NONE is a no-op in every impl -- it must stay one here too, or the
+  // guard would refuse a call that touches nothing. (Every in-tree caller
+  // already filters it out; this keeps the op's contract self-contained.)
+  if (static_cast<ActivationType>(act_type) == ActivationType::ACT_NONE)
+    return;
+  host_math_gate("apply_activation", {&out});
+  CpuComputeOps::apply_activation(out, act_type);
 }
 
 // FC GEMM: output = input * weight. QS4CX weight -> fused dequant-GEMM on
@@ -457,7 +839,21 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
       "dot(), which would read zero-filled pages. Re-run with "
       "NNTR_CUDA_DROP_PLAIN=0, and use NNTR_CUDA_FC_DBG=1 to see why the "
       "device path declined.");
-  cuda::StreamManager::Global().finishIfAsync();
+  // Same class of defect as the dropped payload above, one step earlier: the
+  // host dot() also READS input and WRITES output through host pointers, which
+  // is a fault (not silently wrong numbers) when the activation pool is
+  // device-only. Refuse by name; the gate also carries the async drain.
+  //
+  // `weight` is in the operand list too, and is NOT exempt: dot() dereferences
+  // the weight bytes on the host exactly as it does the activations. Weights
+  // normally live in the managed pool (host-addressable), so this term is
+  // expected never to fire -- but "expected" is not "enforced": the weight
+  // residency policy is a separate, moving lever (NNTR_CUDA_WPREFETCH migrates
+  // pages, NNTR_QS4CX_HEAP_BYPASS moves the payload out of the pool entirely),
+  // and a future device-only weight pool would otherwise reopen this exact gap
+  // silently. Probing it costs one cudaPointerGetAttributes on a path that is
+  // already the slow fallback.
+  host_math_gate("fc", {&input, &output, &weight});
   input.dot(weight, output, false, false);
 }
 
@@ -466,8 +862,24 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
 // real device memory; Tensor::copy() -> the CpuComputeOps host loop would
 // fault on it. Route contiguous device-only copies through a stream-ordered
 // cudaMemcpyAsync; host / host-coherent UVM keep the CPU path.
+//
+// The invariant covers the WHOLE family, not the four ops that happened to be
+// on a measured path: every scopy_* / copy_* on the base is either implemented
+// here (byte moves, and the fp32<->fp16 staged converters) or refused by name
+// (every other conversion). An un-overridden one silently inherits the host
+// element loop -- the same gap this table exists to close, one abstraction
+// level down. The census test enforces the list.
+//
+// Residency is probed with host_unreachable(), NOT cuda::dev_only(). Same
+// reason as host_math_gate: dev_only() answers false unless
+// NNTR_ENGINE=="cuda", while the device-only pool these ops exist for is armed
+// by the CudaContext CONSTRUCTOR (NNTR_CUDA_DEV_ACT, cuda_context.cpp) --
+// which also runs with NNTR_ENGINE unset on the library/SDK bring-up path. On
+// such a run every probe below answered false, so the host element loops at
+// the bottom of each op ran straight over cudaMalloc pointers: the very defect
+// this table was written to make impossible, still live in its own copy ops.
 static bool device_copy(const void *X, void *Y, size_t bytes, bool contiguous) {
-  if (!(cuda::dev_only(X) || cuda::dev_only(Y)))
+  if (!(host_unreachable(X) || host_unreachable(Y)))
     return false;
   if (!contiguous)
     throw std::runtime_error(
@@ -479,7 +891,7 @@ static bool device_copy(const void *X, void *Y, size_t bytes, bool contiguous) {
     throw std::runtime_error(
       "CudaComputeOps: device copy (cudaMemcpyAsync) failed");
   }
-  if (!cuda::dev_only(Y)) {
+  if (!host_unreachable(Y)) {
     if (sm.isCapturing())
       std::fprintf(
         stderr,
@@ -499,6 +911,105 @@ void CudaComputeOps::scopy_fp32(const unsigned int N, const float *X,
     Y[i * incY] = X[i * incX];
 }
 
+// Byte-identical narrow moves. Same shape as scopy_fp32 above -- a byte copy
+// needs no kernel, only the right extent -- and the same device_copy() helper.
+//
+// These are not hypothetical: Uint4QTensor / CharTensor / Int4QTensor spell
+// their copy(const void *) as "scopy_{u8,s8} for the payload, then scopy_fp32
+// for the scale block". Before this override the FIRST of those two calls
+// inherited the CpuComputeOps host loop and the SECOND was device-aware, so a
+// quantized activation copy tore in half on a device-only pool.
+void CudaComputeOps::scopy_u8(const unsigned int N, const uint8_t *X,
+                              const unsigned int incX, uint8_t *Y,
+                              const unsigned int incY) {
+  if (device_copy(X, Y, (size_t)N * sizeof(uint8_t), incX == 1 && incY == 1))
+    return;
+  for (unsigned int i = 0; i < N; ++i)
+    Y[i * incY] = X[i * incX];
+}
+
+void CudaComputeOps::scopy_s8(const unsigned int N, const int8_t *X,
+                              const unsigned int incX, int8_t *Y,
+                              const unsigned int incY) {
+  if (device_copy(X, Y, (size_t)N * sizeof(int8_t), incX == 1 && incY == 1))
+    return;
+  for (unsigned int i = 0; i < N; ++i)
+    Y[i * incY] = X[i * incX];
+}
+
+// ── Converting copies with no device kernel: named refusal ──────────────
+// Each of these is a per-element REPRESENTATION change, so unlike the moves
+// above there is no memcpy that implements it, and no CUDA kernel in this tree
+// does either. The inherited CpuComputeOps body is therefore the only
+// implementation -- correct on host / host-coherent UVM, a fault on the
+// device-only pool. host_copy_gate() makes that fault a named error and
+// changes nothing else: on host-reachable endpoints it returns and the
+// inherited body runs byte-for-byte as before.
+void CudaComputeOps::scopy_int4_to_float32(const unsigned int N,
+                                           const uint8_t *X,
+                                           const unsigned int incX, float *Y,
+                                           const unsigned int incY) {
+  host_copy_gate("scopy_int4_to_float32", X, Y);
+  CpuComputeOps::scopy_int4_to_float32(N, X, incX, Y, incY);
+}
+
+void CudaComputeOps::scopy_int8_to_fp32_u(const unsigned int N,
+                                          const uint8_t *X,
+                                          const unsigned int incX, float *Y,
+                                          const unsigned int incY) {
+  host_copy_gate("scopy_int8_to_fp32_u", X, Y);
+  CpuComputeOps::scopy_int8_to_fp32_u(N, X, incX, Y, incY);
+}
+
+void CudaComputeOps::scopy_int8_to_fp32_s(const unsigned int N, const int8_t *X,
+                                          const unsigned int incX, float *Y,
+                                          const unsigned int incY) {
+  host_copy_gate("scopy_int8_to_fp32_s", X, Y);
+  CpuComputeOps::scopy_int8_to_fp32_s(N, X, incX, Y, incY);
+}
+
+void CudaComputeOps::copy_s16_fp32(const unsigned int N, const int16_t *X,
+                                   float *Y) {
+  host_copy_gate("copy_s16_fp32", X, Y);
+  CpuComputeOps::copy_s16_fp32(N, X, Y);
+}
+
+void CudaComputeOps::copy_u16_fp32(const unsigned int N, const uint16_t *X,
+                                   float *Y) {
+  host_copy_gate("copy_u16_fp32", X, Y);
+  CpuComputeOps::copy_u16_fp32(N, X, Y);
+}
+
+void CudaComputeOps::copy_fp32_u32(const unsigned int N, const float *X,
+                                   uint32_t *Y) {
+  host_copy_gate("copy_fp32_u32", X, Y);
+  CpuComputeOps::copy_fp32_u32(N, X, Y);
+}
+
+void CudaComputeOps::copy_fp32_u16(const unsigned int N, const float *X,
+                                   uint16_t *Y) {
+  host_copy_gate("copy_fp32_u16", X, Y);
+  CpuComputeOps::copy_fp32_u16(N, X, Y);
+}
+
+void CudaComputeOps::copy_fp32_u8(const unsigned int N, const float *X,
+                                  uint8_t *Y) {
+  host_copy_gate("copy_fp32_u8", X, Y);
+  CpuComputeOps::copy_fp32_u8(N, X, Y);
+}
+
+void CudaComputeOps::copy_fp32_s16(const unsigned int N, const float *X,
+                                   int16_t *Y) {
+  host_copy_gate("copy_fp32_s16", X, Y);
+  CpuComputeOps::copy_fp32_s16(N, X, Y);
+}
+
+void CudaComputeOps::copy_fp32_s8(const unsigned int N, const float *X,
+                                  int8_t *Y) {
+  host_copy_gate("copy_fp32_s8", X, Y);
+  CpuComputeOps::copy_fp32_s8(N, X, Y);
+}
+
 #ifdef ENABLE_FP16
 void CudaComputeOps::scopy_fp16(const unsigned int N, const _FP16 *X,
                                 const unsigned int incX, _FP16 *Y,
@@ -509,11 +1020,12 @@ void CudaComputeOps::scopy_fp16(const unsigned int N, const _FP16 *X,
     Y[i * incY] = X[i * incX];
 }
 // Converting copies with a device-only endpoint: stage through host temps
-// (synchronous; these do not occur inside graph capture today).
+// (synchronous; these do not occur inside graph capture today). host_unreachable
+// (not dev_only) for the same reason as device_copy above.
 void CudaComputeOps::scopy_fp32_to_fp16(const unsigned int N, const float *X,
                                         const unsigned int incX, _FP16 *Y,
                                         const unsigned int incY) {
-  if (cuda::dev_only(X) || cuda::dev_only(Y)) {
+  if (host_unreachable(X) || host_unreachable(Y)) {
     if (incX != 1 || incY != 1)
       throw std::runtime_error(
         "CudaComputeOps: strided converting copy on device-only memory");
@@ -522,10 +1034,10 @@ void CudaComputeOps::scopy_fp32_to_fp16(const unsigned int N, const float *X,
                    "[CAP-AUDIT] converting scopy fp32->fp16 during capture: "
                    "N=%u (host convert frozen into graph)\n",
                    N);
-    cuda::StreamManager::Global().finish();
+    table_drain(true);
     std::vector<float> xs;
     const float *xp = X;
-    if (cuda::dev_only(X)) {
+    if (host_unreachable(X)) {
       xs.resize(N);
       cuda::copy_any(xs.data(), X, (size_t)N * sizeof(float));
       xp = xs.data();
@@ -533,7 +1045,7 @@ void CudaComputeOps::scopy_fp32_to_fp16(const unsigned int N, const float *X,
     std::vector<_FP16> ys(N);
     for (unsigned int i = 0; i < N; ++i)
       ys[i] = static_cast<_FP16>(xp[i]);
-    if (cuda::dev_only(Y))
+    if (host_unreachable(Y))
       cuda::copy_any(Y, ys.data(), (size_t)N * sizeof(_FP16));
     else
       std::memcpy(Y, ys.data(), (size_t)N * sizeof(_FP16));
@@ -545,7 +1057,7 @@ void CudaComputeOps::scopy_fp32_to_fp16(const unsigned int N, const float *X,
 void CudaComputeOps::scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
                                         const unsigned int incX, float *Y,
                                         const unsigned int incY) {
-  if (cuda::dev_only(X) || cuda::dev_only(Y)) {
+  if (host_unreachable(X) || host_unreachable(Y)) {
     if (incX != 1 || incY != 1)
       throw std::runtime_error(
         "CudaComputeOps: strided converting copy on device-only memory");
@@ -554,10 +1066,10 @@ void CudaComputeOps::scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
                    "[CAP-AUDIT] converting scopy fp16->fp32 during capture: "
                    "N=%u (host convert frozen into graph)\n",
                    N);
-    cuda::StreamManager::Global().finish();
+    table_drain(true);
     std::vector<_FP16> xs;
     const _FP16 *xp = X;
-    if (cuda::dev_only(X)) {
+    if (host_unreachable(X)) {
       xs.resize(N);
       cuda::copy_any(xs.data(), X, (size_t)N * sizeof(_FP16));
       xp = xs.data();
@@ -565,7 +1077,7 @@ void CudaComputeOps::scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
     std::vector<float> ys(N);
     for (unsigned int i = 0; i < N; ++i)
       ys[i] = static_cast<float>(xp[i]);
-    if (cuda::dev_only(Y))
+    if (host_unreachable(Y))
       cuda::copy_any(Y, ys.data(), (size_t)N * sizeof(float));
     else
       std::memcpy(Y, ys.data(), (size_t)N * sizeof(float));
@@ -573,6 +1085,32 @@ void CudaComputeOps::scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
   }
   for (unsigned int i = 0; i < N; ++i)
     Y[i * incY] = static_cast<float>(X[i * incX]);
+}
+
+// FP16 half of the no-device-kernel converting copies -- named refusal, same
+// reasoning as the FP32 half above.
+void CudaComputeOps::scopy_int4_to_float16(const unsigned int N,
+                                           const uint8_t *X,
+                                           const unsigned int incX, _FP16 *Y,
+                                           const unsigned int incY) {
+  host_copy_gate("scopy_int4_to_float16", X, Y);
+  CpuComputeOps::scopy_int4_to_float16(N, X, incX, Y, incY);
+}
+
+void CudaComputeOps::scopy_int8_to_float16_u(const unsigned int N,
+                                             const uint8_t *X,
+                                             const unsigned int incX, _FP16 *Y,
+                                             const unsigned int incY) {
+  host_copy_gate("scopy_int8_to_float16_u", X, Y);
+  CpuComputeOps::scopy_int8_to_float16_u(N, X, incX, Y, incY);
+}
+
+void CudaComputeOps::scopy_int8_to_float16_s(const unsigned int N,
+                                             const int8_t *X,
+                                             const unsigned int incX, _FP16 *Y,
+                                             const unsigned int incY) {
+  host_copy_gate("scopy_int8_to_float16_s", X, Y);
+  CpuComputeOps::scopy_int8_to_float16_s(N, X, incX, Y, incY);
 }
 #endif
 

@@ -154,12 +154,38 @@ void drain_if_async();
 bool dev_accessible(const void *p);
 
 /**
+ * @brief True iff @p p is memory the HOST cannot dereference (a plain
+ *        cudaMalloc allocation), with NO engine short-circuit.
+ *
+ * This is the raw residency fact, and it is the correct predicate for code
+ * that can only be reached BECAUSE a CudaContext already exists -- above all
+ * the CudaComputeOps table, which is installed by
+ * CudaContext::initialize() (cuda_context.cpp) onto that context's
+ * ContextData and is therefore never entered on a run that has no CUDA
+ * context. Such code must not ask NNTR_ENGINE: the device-only activation
+ * pool is armed by the CudaContext constructor itself (NNTR_CUDA_DEV_ACT),
+ * and that constructor also runs when the context is brought up WITHOUT
+ * NNTR_ENGINE=cuda -- NNTR_CUDA_EAGER_INIT=1, or an enable-opencl=false build
+ * with NNTR_ENGINE unset, i.e. the library/SDK embedding path. Deciding
+ * host-vs-device there from the env yields host loops on cudaMalloc pointers,
+ * which is exactly the class of defect the op table exists to remove.
+ *
+ * Cost note: this DOES call into cudart, so it must not be used by the shared
+ * layers -- see engine_selected() for why the first cudart call on a non-cuda
+ * run is expensive. Use dev_only() there.
+ */
+bool host_unreachable(const void *p);
+
+/**
  * @brief True iff the pointer is DEVICE-ONLY memory (cudaMalloc): the host
  *        cannot dereference it, so every host read/write must stage. False for
  *        managed/pinned/host memory. Companion of dev_accessible() for the
  *        device-resident activation/KV pools (opt-in) -- the
  *        gate for "auto-route to the GPU kernel / staged copy instead of the
  *        host fallback" decisions.
+ * @note  This is host_unreachable() AND engine_selected(); the engine gate is
+ *        what makes it safe for the SHARED (non-CUDA-context) call sites.
+ *        Code that only runs on a live CUDA context wants host_unreachable().
  */
 bool dev_only(const void *p);
 

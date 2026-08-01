@@ -259,15 +259,21 @@ bool dev_accessible(const void *p) {
   return false;
 }
 
-bool dev_only(const void *p) {
-  if (!engine_selected())
-    return false;
+bool host_unreachable(const void *p) {
   if (p == nullptr)
     return false;
   cudaPointerAttributes a{};
   const bool ok = cudaPointerGetAttributes(&a, p) == cudaSuccess;
-  cudaGetLastError();
+  cudaGetLastError(); // benign "invalid pointer" state for plain host pointers
   return ok && a.type == cudaMemoryTypeDevice;
+}
+
+bool dev_only(const void *p) {
+  // The engine gate is the ONLY difference from host_unreachable(): it keeps
+  // the shared (non-CUDA-context) callers from booting cudart mid-prefill.
+  if (!engine_selected())
+    return false;
+  return host_unreachable(p);
 }
 
 bool device_memset0(void *p, size_t bytes) {
