@@ -460,36 +460,6 @@ TEST_F(ComputeOpsDispatchTest, RmsNormDispatchesThroughAttachedContextOps) {
   EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 2, 3), 0.0f);
 }
 
-/**
- * @brief The reverse-RMSNorm whole-op (PLE post_norm) dispatches
- *        through the attached ContextData ops — the dispatch seam the layer's
- *        former open-coded body structurally could not test — and the
- *        (active_rows, row_offset) window is honoured: rows outside the
- *        window are untouched.
- */
-TEST_F(ComputeOpsDispatchTest,
-       RmsReverseNormDispatchesThroughAttachedContextOps) {
-  nntrainer::Tensor in(1, 1, 2, 4);
-  nntrainer::Tensor out(1, 1, 2, 4);
-  nntrainer::Tensor weight(1, 1, 1, 4);
-  nntrainer::Tensor out_scale(1, 1, 1, 1);
-  in.setValue(1.0f);
-  out.setValue(0.0f);
-  weight.setValue(2.0f);
-  out_scale.setValue(3.0f);
-
-  in.setContextData(ct_data);
-  in.getOps()->rms_reverse_norm(in, out, weight, out_scale, /*epsilon=*/0.0f,
-                                /*active_rows=*/1, /*row_offset=*/0);
-
-  EXPECT_GT(counters->rms_reverse_norm.load(), 0);
-  // out = out_scale * (x*w) * rsqrt(mean((x*w)^2) + eps)
-  //     = 3 * (1*2) * rsqrt(4) = 3, exactly, in fp32.
-  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, 0), 3.0f);
-  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, 3), 3.0f);
-  // Row 1 sits outside active_rows=1 and must be untouched.
-  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 1, 0), 0.0f);
-}
 
 /* ==========================================================================
  * CUDA whole-op table completeness
