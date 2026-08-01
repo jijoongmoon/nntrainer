@@ -1010,17 +1010,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // prefill is fed FORWARD in chunks of <= INIT_SEQ_LEN rows -- each chunk fits
   // the buffer -- so the prompt is bounded by the KV budget alone, and the
   // activation plane stays INIT_SEQ_LEN-sized regardless of prompt length.
-<<<<<<< HEAD
-||||||| ffa2147af
-  //
-  // UNION NOTE: the KV budget keeps the wrap-safe subtraction above; the
-  // chunking predicate only chooses whether INIT_SEQ_LEN also caps it.
-=======
   //
   // UNION NOTE: the KV budget keeps the wrap-safe subtraction above; the
   // chunking predicate only chooses whether INIT_SEQ_LEN also caps it.
   const unsigned int sys_prompt_rows = SAVE_KVCACHE ? 0u : SYS_PROMP_LEN;
->>>>>>> origin/upstream-pr/trackCtx-generation-budget
   const bool _prefill_chunking = effectivePrefillChunk() > 0;
   const unsigned int _num_to_generate =
     NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u;
@@ -1056,7 +1049,6 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   if (_len > num_allow_str) {
     text_len = num_allow_str;
-<<<<<<< HEAD
 
     // Which bytes of prompt_ are frame rather than body. The rendered affixes
     // are measured relative to `prompt`; a system prompt sits in front of them
@@ -1111,7 +1103,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       std::cerr << "[CausalLM] WARNING: prompt (" << _len
                 << " tokens) exceeds the max allowed prefill length ("
                 << num_allow_str
-                << " = max_seq_len - num_to_generate); dropping "
+                << " = max_seq_len " << MAX_SEQ_LEN << " - the "
+                << (MAX_SEQ_LEN > kv_budget ? MAX_SEQ_LEN - kv_budget : 0u)
+                << " history slots the generation phase reserves"
+                << (_prefill_chunking ? "" : ", capped by init_seq_len")
+                << "); dropping "
                 << (_len - num_allow_str)
                 << " tokens from the MIDDLE of the prompt body (kept "
                 << keep_head << " tokens before the cut and " << keep_tail
@@ -1125,42 +1121,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       // degradation is the historical tail cut -- with the hazard named.
       std::cerr << "[CausalLM] WARNING: prompt (" << _len
                 << " tokens) exceeds the max allowed prefill length ("
-                << num_allow_str
-                << " = max_seq_len - num_to_generate); "
-                   "truncating "
-                << (_len - num_allow_str) << " tail tokens. "
+                << num_allow_str << " = max_seq_len " << MAX_SEQ_LEN
+                << " - the "
+                << (MAX_SEQ_LEN > kv_budget ? MAX_SEQ_LEN - kv_budget : 0u)
+                << " history slots the generation phase reserves"
+                << (_prefill_chunking ? "" : ", capped by init_seq_len")
+                << "); truncating " << (_len - num_allow_str) << " tail tokens. "
                 << no_middle_reason
                 << " A dropped tail takes any trailing instruction with it, so "
                    "the model may continue the prompt instead of answering it."
                 << std::endl;
     }
-||||||| ffa2147af
-    // Truncation drops tokens from the tail of the prompt, which is where
-    // instructions in "summarize this document"-style prompts live: a
-    // silently truncated prompt can make the model continue the body
-    // instead of following a dropped trailing instruction. Always warn
-    // with the exact counts.
-    std::cerr << "[CausalLM] WARNING: prompt (" << _len
-              << " tokens) exceeds the max allowed prefill length ("
-              << num_allow_str
-              << " = max_seq_len - num_to_generate); "
-                 "truncating "
-              << (_len - num_allow_str) << " tail tokens." << std::endl;
-=======
-    // Truncation drops tokens from the tail of the prompt, which is where
-    // instructions in "summarize this document"-style prompts live: a
-    // silently truncated prompt can make the model continue the body
-    // instead of following a dropped trailing instruction. Always warn
-    // with the exact counts.
-    std::cerr << "[CausalLM] WARNING: prompt (" << _len
-              << " tokens) exceeds the max allowed prefill length ("
-              << num_allow_str << " = max_seq_len " << MAX_SEQ_LEN << " - the "
-              << (MAX_SEQ_LEN > kv_budget ? MAX_SEQ_LEN - kv_budget : 0u)
-              << " history slots the generation phase reserves"
-              << (_prefill_chunking ? "" : ", capped by init_seq_len")
-              << "); truncating " << (_len - num_allow_str) << " tail tokens."
-              << std::endl;
->>>>>>> origin/upstream-pr/trackCtx-generation-budget
   }
 
   // feed only available length
