@@ -2763,6 +2763,26 @@ bool flash_attention_prefill_f16_cl(
   // REGRESSIVE at NSG=2 (scb spill traffic, +14%/+55% at XB=2/4). Env kept
   // for tuning on other SKUs.
   int xmx_xb = (xmx_nsg > 1) ? (xmx_xb_env ? xmx_xb_env : 1) : 1;
+  // Exchange-reduction mode (NSG>1 only). The psum cross-subgroup round-trip
+  // is ~56% of the d512 full-attn kernel and is SLM-traffic-bound, not
+  // barrier-bound (isolated timing showed the WG barriers cost ~0 once the
+  // psum traffic is gone), which is exactly why FXA_XB batching -- it only
+  // cuts barrier frequency -- measured neutral. XRED=1 replaces the
+  // all-to-all reduction (every subgroup reads all NSG partials for all TM
+  // rows: NSG^2*TM*KT SLM reads/WG per tile) with a DISTRIBUTED one (each
+  // subgroup reduces only its own rows once and publishes the full score to
+  // a shared ssum buffer, all read back: ~2*NSG*TM*KT reads). The per-g sum
+  // order is preserved so the output is BIT-IDENTICAL (NNTR_FLASH_XMX_CHECK:
+  // same maxdiff, over_tol 0). Measured d512 attention bucket -31.5%
+  // (35.5->24.3ms/3 calls, +5.9% prefill TPS @1K where d512 is ~13% of wall;
+  // scales with its 76.5% share @32K). DEFAULT ON for NSG>1;
+  // NNTR_FLASH_XMX_XRED=0 forces the old all-to-all path (A/B).
+  static const int xmx_xred_env = []() {
+    const char *e = std::getenv("NNTR_FLASH_XMX_XRED");
+    return e ? (std::atoi(e) != 0 ? 1 : 0) : -1; // -1 = unset -> default
+  }();
+  const int xmx_xred =
+    (xmx_nsg > 1) ? (xmx_xred_env < 0 ? 1 : xmx_xred_env) : 0;
   // Guard: clamp XB so psum + vtile fit the per-WG SLM budget
   // (XB=4 + d=512 defaults previously exceeded it -> launch failure, no
   // fallback). Budget 64KB, the conservative Xe per-WG limit.
@@ -2812,7 +2832,8 @@ bool flash_attention_prefill_f16_cl(
       base += " -DFLASH_XMX=1 -DFXA_D=" + std::to_string((int)head_dim) +
               " -DFXA_TM=" + std::to_string(xmx_tm) +
               " -DFXA_NSG=" + std::to_string(xmx_nsg) +
-              " -DFXA_XB=" + std::to_string(xmx_xb);
+              " -DFXA_XB=" + std::to_string(xmx_xb) +
+              " -DFXA_XRED=" + std::to_string(xmx_xred);
     }
     return base;
   }();
