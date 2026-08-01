@@ -34,8 +34,11 @@
 #include <embedding_layer.h>
 #include <mha_core.h>
 #include <neuralnet.h>
+#include <per_layer_slice_gpu.h>
 #include <qs4cx_tensor.h>
+#include <reshaped_rms_norm.h>
 #include <rms_norm.h>
+#include <rms_norm_gpu.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
@@ -399,6 +402,10 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
   NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
                 std::invalid_argument)
     << "embedding_file_name requires untied embedding_layer";
+  // No engine= on embedding0: "embedding_layer" has no gpu-context
+  // registration, and createLayer on an unregistered type THROWS (it is not a
+  // silent cpu fallback), so an untied model would fail at graph build. The
+  // lookup is a gather, not a GEMM -- nothing to gain on the device.
   LayerHandle embedding(createLayer(
     embedding_type,
     buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM, EMBEDDING_DTYPE,
@@ -410,11 +417,15 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
     h = createTransformerDecoderBlock(i, h);
   }
 
-  // final rms_norm
+  // final rms_norm. NOTE: stays on CausalLM's custom RMSNormLayer ("rms_norm"
+  // type) so engine=gpu routes to RMSNormLayerGPU, registered on the gpu
+  // context by registerCustomLayers below. The nntrainer core RMSNormLayerCl
+  // uses type "rmsnorm" (a different key) and is not what this resolves to.
   LayerHandle out_norm(
     createLayer("rms_norm", {withKey("name", "output_norm"),
                              withKey("epsilon", std::to_string(NORM_EPS)),
-                             withKey("packed", "false")}));
+                             withKey("packed", "false"),
+                             withKey("engine", causallm_engine())}));
   h = out_norm(h);
 
   return {x, h};
@@ -508,13 +519,49 @@ void Transformer::repack_weight() {
       "Transformer model is not initialized. Please call "
       "initialize() before repack_weight().");
   }
+
+  // The QS4CX weight repack (KAI rhs-pack) is only consumed by the ARM CPU
+  // (KAI) inference path, which reaches it through Tensor::getPackedData(); the
+  // "gpu" (OpenCL) and "cuda" engines consume the plain QS4CX blob directly. On
+  // a non-CPU layer the pack is redundant single-threaded CPU work -- on a
+  // large model it can pin one core to a thermal shutdown -- so decide per
+  // layer, keyed on the engine the graph actually resolved for that layer.
+  //
+  // @note Do NOT key this on causallm_engine(): that reports "gpu" for any
+  // ENABLE_OPENCL build whenever NNTR_ENGINE is unset, which says nothing about
+  // how the graph's layers were stamped. Skipping the whole loop on that basis
+  // left a CPU/KAI run on an OpenCL-enabled build with no packed weights at
+  // all, and it then died in QS4CX_Tensor::getPackedData() with "pack before
+  // run model" at the first token.
+  struct RepackTally {
+    unsigned int layers = 0;
+    unsigned int weights = 0;
+  } tally;
+
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
-      // repack FC layer only
+    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+            void *user_data) {
+      // Two independent narrowings, and the pack needs BOTH.
+      //
+      // (1) Layer type. The QS4CX pack is only ever read back through
+      //     Tensor::getPackedData() from the fully-connected GEMM, so no other
+      //     layer type has a consumer for it. Packing them is wasted
+      //     single-threaded CPU work over the whole weight set.
+      // (2) Run engine. Even among FC layers, only the ones the graph resolved
+      //     onto the host CPU reach that GEMM; the "gpu" (OpenCL) and "cuda"
+      //     engines consume the plain QS4CX blob directly.
+      //
+      // Neither filter subsumes the other: (1) alone still packs every GPU FC
+      // (on a large model that is enough single-core work to walk into a
+      // thermal shutdown), and (2) alone still packs the non-FC QS4CX weights
+      // of a CPU graph, which nothing will ever read.
       if (l.getType() != "fully_connected" &&
           l.getType() != "shared_fully_connected")
         return;
-
+      if (context.getRunComputeEngine() != ml::train::LayerComputeEngine::CPU)
+        return;
+      auto *tallied = static_cast<RepackTally *>(user_data);
+      ++tallied->layers;
       auto weights = context.getWeights();
       for (auto &w : weights) {
         if (w->getVariableRef().getDataType() ==
@@ -526,6 +573,7 @@ void Transformer::repack_weight() {
           // (ARM packs, x86/GPU use the plain blob).
           try {
             w->getVariableRef().pack();
+            ++tallied->weights;
           } catch (const std::exception &e) {
             ml_logd("QS4CX pack skipped (engine consumes plain blob): %s",
                     e.what());
@@ -534,8 +582,13 @@ void Transformer::repack_weight() {
       }
     };
   try {
-    model->forEachLayer(fn, nullptr);
-    ml_logd("QS4CX weights repacked successfully");
+    model->forEachLayer(fn, &tally);
+    // Log both counts and the process-wide engine default: a run that packs 0
+    // weights while the default says "gpu" is exactly the case that used to be
+    // silent until getPackedData() threw.
+    ml_logd("QS4CX repack: packed %u weight(s) across %u host-engine layer(s) "
+            "(process engine default: %s)",
+            tally.weights, tally.layers, causallm_engine().c_str());
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to repack weights: " +
                              std::string(e.what()));
@@ -566,8 +619,8 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   LayerHandle attn_norm(createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+     withKey("engine", causallm_engine())}));
   Tensor normed = attn_norm(input);
 
   Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
@@ -575,21 +628,23 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
 
   LayerHandle decoder_add(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"),
+     withKey("engine", causallm_engine())}));
   Tensor residual = decoder_add({input, att_out});
 
   LayerHandle ffn_norm(createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+     withKey("engine", causallm_engine())}));
   Tensor ffn_normed = ffn_norm(residual);
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
 
   LayerHandle decoder_output(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
+     withKey("engine", causallm_engine())}));
   return decoder_output({residual, ffn_out});
 }
 
@@ -619,6 +674,9 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   const char *cache_dtype = "UINT16";
 #endif
 
+  // No engine= on the cache placeholders: "input" has no gpu-context
+  // registration, and their storage is host-owned by KVCacheManager and bound
+  // via setExternalTensors, so the graph's allocator never backs them.
   LayerHandle cache_k_input(createLayer(
     "input", {withKey("name", "cache_k_l" + std::to_string(layer_id)),
               withKey("input_shape", cache_shape),
@@ -643,7 +701,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
   // K layer
@@ -651,7 +710,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
   // V layer
@@ -659,14 +719,17 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor v = wv(value);
 
   // External KV cache placeholders (per-layer). Their actual storage is owned
   // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
   auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
 
-  // Attention core layer
+  // Attention core layer. No engine= here: "mha_core" is registered on the
+  // cpu context only, and mha_core dispatches its own GPU work internally
+  // (its kernels are selected per-path, not by the node's engine).
   LayerHandle mha(createLayer(
     "mha_core",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
@@ -686,7 +749,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   return wo(a);
 }
 
@@ -707,26 +771,30 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor gate = ffn_gate(input);
 
   LayerHandle ffn_up(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor up = ffn_up(input);
 
   LayerHandle swiglu(createLayer(
     "swiglu",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+     withKey("engine", causallm_engine())}));
   Tensor act = swiglu({gate, up});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   return ffn_down(act);
 }
 
@@ -749,6 +817,32 @@ void Transformer::registerCustomLayers() {
     app_context->registerFactory(
       nntrainer::createLayer<causallm::EmbeddingLayer>);
   });
+
+  // GPU variants: same type strings as the CPU classes but registered on the
+  // gpu context so engine=gpu createLayer routes there. The GPU classes use raw
+  // getData() pointers + GPU dispatches; they avoid any CPU-only Tensor ops
+  // (Tensor::multiply / add_i / dot) that crash on gpu-context tensors. Inert
+  // when there is no "gpu" context (CPU-only / NNTR_ENGINE=cpu builds).
+  const auto &ct_engine = nntrainer::Engine::Global();
+  try {
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::RMSNormLayerGPU>);
+    // Gemma4 GPU-resident per_layer_slice: same type string as the CPU class,
+    // registered here so engine=gpu routes to the GPU kernel (no host
+    // round-trip that would break residency).
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
+    // Per-head q/k/v norms (Gemma4, Qwen3) on the gpu context. One class for
+    // both backends: its incremental_forwarding dispatches the rmsnorm kernels
+    // when the operands are SVM-resident and keeps the host pass otherwise, so
+    // registering it here is what lets a reshaped_rms_norm node carry engine=
+    // instead of sitting on the host between two device FCs.
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+  } catch (std::invalid_argument &e) {
+    std::cerr << "failed to register GPU-routed layer on gpu ctx: " << e.what()
+              << std::endl;
+  }
 }
 
 } // namespace causallm

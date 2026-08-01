@@ -26,6 +26,7 @@ subdir('layers')
 # Add common layers to dependencies
 causallm_layer_dependencies += [
     causallm_rms_norm_dep,
+    causallm_rms_norm_gpu_dep,
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
     causallm_reshaped_rms_norm_dep,
@@ -405,6 +406,7 @@ if get_option('enable-test')
       'unittest_causallm_models',
       [
         meson.source_root() / 'test' / 'unittest' / 'models' / 'causallm_test_utils.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma2.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma3_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4.cpp',

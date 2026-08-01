@@ -14,7 +14,9 @@
 #ifndef __LLM_UTIL_HPP__
 #define __LLM_UTIL_HPP__ __LLM_UTIL_HPP__
 
+#include <cstdlib>
 #include <optional>
+#include <stdexcept>
 
 #include <base_properties.h>
 #include <common.h>
@@ -110,5 +112,73 @@ void applyBadWordsPenalty(float *logits, unsigned int *bad_words_ids,
  */
 unsigned int applyTKP(const float *logits, int len, float temperature,
                       unsigned int top_k, float top_p, std::mt19937 &rng);
+
+/**
+ * @brief Compute engine for CausalLM model layers.
+ * @return "gpu" by default (the v8c OpenCL inference path), or "cpu" when the
+ *         NNTR_ENGINE=cpu env var is set. engine=cpu runs the model on the
+ *         standard CPU layers + CpuComputeOps (e.g. Q4_0-FP32 host inference /
+ *         CPU-only deployment), instead of the engine=gpu Cl layers whose
+ *         ClComputeOps throws NI for plain CPU BLAS ops. An absent engine prop
+ *         already defaults to CPU in LayerNode; this keeps the explicit GPU
+ *         default for backward compatibility while making CPU one env away.
+ * @throw  std::invalid_argument when NNTR_ENGINE=gpu or NNTR_ENGINE=cuda is
+ *         requested but this binary was built without the matching backend
+ *         (ENABLE_OPENCL / ENABLE_CUDA). Only an explicit request fails; the
+ *         implicit default still degrades to cpu.
+ */
+[[maybe_unused]] static std::string causallm_engine() {
+  static const std::string eng = []() -> std::string {
+    const char *e = std::getenv("NNTR_ENGINE");
+    if (e != nullptr) {
+      const std::string s(e);
+      if (s == "cpu")
+        return "cpu";
+      if (s == "cuda") { // additive NVIDIA CUDA backend (engine=cuda)
+#if defined(ENABLE_CUDA)
+        return "cuda";
+#else
+        // Explicit CUDA request against a build that has no CUDA backend, so
+        // no "cuda" Context is registered. Returning "cuda" here would defer
+        // the failure to model build, where it surfaces as
+        // "[Engine] cuda Context is not registered" - a message about the
+        // engine registry that reads like a library bug rather than the build
+        // misconfiguration it actually is.
+        throw std::invalid_argument(
+          "NNTR_ENGINE=cuda was requested but this binary was built without "
+          "CUDA support (ENABLE_CUDA is not defined). Rebuild nntrainer with "
+          "-Denable-cuda=true, which is desktop NVIDIA only - the android "
+          "build rejects it - or select NNTR_ENGINE=gpu / NNTR_ENGINE=cpu.");
+#endif
+      }
+      if (s == "gpu") {
+#if defined(ENABLE_OPENCL)
+        return "gpu";
+#else
+        // Explicit GPU request against a build that has no OpenCL. Silently
+        // running the CPU fallbacks here costs ~10x throughput and looks like
+        // a GPU regression instead of a build misconfiguration - most often
+        // -DENABLE_OPENCL missing from this app's compile flags while
+        // libnntrainer itself was built with -Denable-opencl=true.
+        throw std::invalid_argument(
+          "NNTR_ENGINE=gpu was requested but this binary was built without "
+          "OpenCL support (ENABLE_OPENCL is not defined). Rebuild nntrainer "
+          "with -Denable-opencl=true; the android app inherits the define "
+          "from the generated android_build_result/Android.mk via "
+          "LOCAL_EXPORT_CFLAGS.");
+#endif
+      }
+    }
+#if defined(ENABLE_OPENCL)
+    return "gpu";
+#else
+    // No OpenCL "gpu" Context is registered in this build (e.g. the FP32 CPU
+    // reference / unittest build), so default to cpu instead of throwing
+    // "[Engine] gpu Context is not registered" at model build.
+    return "cpu";
+#endif
+  }();
+  return eng;
+}
 
 #endif // __LLM_UTIL_HPP__

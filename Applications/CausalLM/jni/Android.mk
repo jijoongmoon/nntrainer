@@ -34,6 +34,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/bert \
     $(LOCAL_PATH)/../models/timm_vit \
@@ -46,13 +47,16 @@ CAUSALLM_COMMON_INCLUDES := \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
-# (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
-# prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS.
+# (APP_CPPFLAGS); -march and the feature defines the prebuilts were built with
+# (ENABLE_FP16/USE__FP16/ENABLE_OPENCL/CL_TARGET_OPENCL_VERSION) are inherited
+# from the prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS. Do not
+# hardcode them here: a value that disagrees with the prebuilt silently either
+# breaks the ABI or drops this app's GPU code paths.
 CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math \
     -Wno-nan-infinity-disabled -Wno-deprecated-literal-operator
 
 # Prebuilt nntrainer libraries. The generated Android.mk exports the include
-# paths and the -march/FP16 cflags the prebuilts were built with.
+# paths and the -march/feature-define cflags the prebuilts were built with.
 NNTRAINER_PREBUILT_MK := $(NNTRAINER_ROOT)/builddir/android_build_result/Android.mk
 ifeq ($(wildcard $(NNTRAINER_PREBUILT_MK)),)
 $(error $(NNTRAINER_PREBUILT_MK) not found. Build nntrainer first (tools/package_android.sh))
@@ -96,16 +100,19 @@ LOCAL_SRC_FILES := \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
+    ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -208,16 +215,19 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
+    ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -245,6 +255,7 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/bert \
     $(LOCAL_PATH)/../models/deberta_v2 \
@@ -299,6 +310,7 @@ LOCAL_LDLIBS := -llog -landroid
 UNITTEST_MODELS_DIR := ../../../test/unittest/models
 LOCAL_SRC_FILES := \
     $(UNITTEST_MODELS_DIR)/causallm_test_utils.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_gemma2.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_gemma3.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_gemma3_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_gemma4.cpp \

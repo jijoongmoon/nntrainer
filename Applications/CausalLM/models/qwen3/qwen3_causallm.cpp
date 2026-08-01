@@ -40,15 +40,20 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
-  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape)))
+  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape))). Now stamped:
+  // ReshapedRMSNormLayer is registered on the gpu context too, and its
+  // incremental_forwarding runs the rmsnorm kernel when the operands are
+  // SVM-resident, so this is no longer a host hop between two device FCs.
   LayerHandle q_norm(createLayer(
     "reshaped_rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
      withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+     withKey("feature_size", std::to_string(head_dim)),
+     withKey("engine", causallm_engine())}));
   Tensor q_normed = q_norm(q);
 
   // K layer
@@ -56,7 +61,8 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
   // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
@@ -64,7 +70,8 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     "reshaped_rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
      withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+     withKey("feature_size", std::to_string(head_dim)),
+     withKey("engine", causallm_engine())}));
   Tensor k_normed = k_norm(k);
 
   // V layer
@@ -72,7 +79,8 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor v = wv(value);
 
   // External KV cache placeholders (per-layer). Storage is owned by the host
@@ -97,7 +105,8 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   return wo(a);
 }
 
