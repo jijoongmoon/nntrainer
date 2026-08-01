@@ -59,7 +59,7 @@ bool MemAllocator::supportsResidency(ResidencyClass cls) const {
   }
 }
 
-void MemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
+void MemAllocator::alloc(void **ptr, size_t size, size_t alignment, bool zero) {
   NNTR_THROW_IF(size == 0, std::invalid_argument)
     << "MemAllocator::alloc: zero-size allocation rejected";
   NNTR_THROW_IF(alignment == 0 || (alignment & (alignment - 1)) != 0,
@@ -81,7 +81,10 @@ void MemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   // MemoryPool callers historically expected zeroed buffers (calloc
   // semantics). Preserve that — kernels that read uninitialised
   // gradient slots would otherwise see garbage.
-  std::memset(*ptr, 0, aligned_size);
+  // ... except when the caller opts out because every byte of the region is
+  // about to be overwritten from the model file (the inference weight arena).
+  if (zero)
+    std::memset(*ptr, 0, aligned_size);
 }
 
 void MemAllocator::free(void *ptr) {

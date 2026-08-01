@@ -17,10 +17,12 @@
 #include <mutex>
 
 #include <addition_layer.h>
+#include <compute_ops.h>
 #include <cuda_mem_allocator.h>
 #include <fc_layer_cl.h>
 #include <geglu_layer.h>
 #include <logit_softcapping.h>
+#include <rms_norm_layer.h>
 #include <scalar_multiply.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
@@ -76,6 +78,19 @@ void CudaContext::initialize() noexcept {
     caps_.unified_memory = true; // cudaMallocManaged (UVM) is the default pool
     ml_logi("[CudaContext] %s", caps_.toString().c_str());
 
+    // NNTR_DETERMINISTIC keeps the CUDA per-op drains: the async-submission
+    // lever (NNTR_CUDA_ASYNC) is the one host/device-overlap knob whose overlap
+    // can turn a knife-edge logit into a run-to-run coin flip (measured),
+    // so the determinism contract pins it OFF. overwrite=0 keeps an explicit
+    // user NNTR_CUDA_ASYNC winning. The default path (env unset) is untouched —
+    // NNTR_CUDA_ASYNC keeps its normal default (sync / drains on).
+    // Default-on: keep the CUDA per-op drains (NNTR_CUDA_ASYNC=0) so decode is
+    // reproducible; overwrite=0 lets an explicit NNTR_CUDA_ASYNC win.
+    // NNTR_DETERMINISTIC=0 opts out (async submission allowed).
+    if (const char *det = std::getenv("NNTR_DETERMINISTIC");
+        !(det && det[0] == '0'))
+      setenv("NNTR_CUDA_ASYNC", "0", 0);
+
     add_default_object();
 
     // Unified-Memory allocator: MemoryPool buffers for engine=cuda tensors are
@@ -83,6 +98,13 @@ void CudaContext::initialize() noexcept {
     // analogue), so a tensor on this context is device-resident with no
     // separate copy step. Falls back to host memory if UVM is unavailable.
     setMemAllocator(std::make_shared<CudaMemAllocator>());
+
+    // Install the CUDA ComputeOps: the FC GEMM takes the device dequant-GEMM
+    // path (the QS4CX host dot is NYI on x86) and the element-wise decode ops
+    // (swiglu / scalar_mul / softcap) take their device kernels under the
+    // residency gates; everything else inherits the CpuComputeOps bodies,
+    // which are correct over the host-coherent UVM tensors.
+    getContextData()->setComputeOps(get_cuda_ops());
 
   } catch (std::exception &e) {
     ml_loge("cuda_context: initialization failed!!, reason: %s", e.what());
@@ -92,29 +114,41 @@ void CudaContext::initialize() noexcept {
 }
 
 void CudaContext::add_default_object() {
-  // FC: the backend-neutral FullyConnectedLayerCl dispatches its GEMM via
-  // CudaComputeOps::fc (cuda_fc_qint4 / cuBLAS / host dot). Same class as the
-  // gpu context.
+  // FC: the backend-neutral FullyConnectedLayerCl dispatches its GEMM through
+  // the installed CudaComputeOps table — CudaComputeOps::fc runs the QS4CX
+  // fused dequant-GEMM on device, else the inherited host dot on UVM. Same
+  // class as the gpu context.
   registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
                   FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
   // addition: the core CPU AdditionLayer is pure host Tensor ops -> correct on
   // the host-coherent UVM tensors (do NOT use the OpenCL AdditionLayerCL).
   registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
                   ml::train::LayerType::LAYER_ADDITION);
-  // geglu: the backend-neutral GeGLULayer dispatches via CudaComputeOps::geglu
-  // (device-resident fp16 kernel when available, else host-on-UVM).
+  // rms_norm: the backend-neutral RMSNormLayer dispatches via
+  // CudaComputeOps::rms_norm — the fp16 device kernel for decode-sized row
+  // counts, else this backend's fused host fallback. Both halves accumulate
+  // the sum of squares in FP32 (an fp16 activation with a large residual
+  // element squares past the fp16 max -> the row zeroes -> garbage).
+  registerFactory(nntrainer::createLayer<RMSNormLayer>, RMSNormLayer::type,
+                  ml::train::LayerType::LAYER_RMSNORM);
+  // geglu: the backend-neutral GeGLULayer dispatches via the installed table;
+  // no CUDA geglu override exists at this change, so it resolves to the
+  // inherited CpuComputeOps host body on UVM.
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
   // swiglu: the merged backend-neutral SwiGLULayer dispatches via
-  // CudaComputeOps::swiglu, with the device-resident fp16 one-kernel fast path
-  // (cuda_swiglu_fp16) for the qwen3 FFN. Replaces the app
-  // causallm::SwiGLULayer.
+  // CudaComputeOps::swiglu — the device-resident fp16 one-kernel decode fast
+  // path (cuda_swiglu_fp16) under its residency gates, else the inherited
+  // host body. Replaces the former app-side SwiGLU fork.
   registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
-  // logit_softcapping (promoted to core): host op on UVM-resident logits;
-  // the CUDA-only device-softcap path lives inside the layer (ENABLE_CUDA).
+  // logit_softcapping (promoted to core): dispatches via
+  // CudaComputeOps::softcap — the fp16 device kernel on device-accessible
+  // logits (carrying the terminal pipeline drain), else the inherited host
+  // body on UVM.
   registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
                   LogitSoftCappingLayer::type);
-  // scalar_multiply (promoted): host op on UVM (the CPU class on cuda, like
-  // the gemma4 tryRegister it replaces; the _gpu variant is OpenCL-only).
+  // scalar_multiply (promoted): dispatches via CudaComputeOps::scalar_mul —
+  // the opt-in (NNTR_CUDA_ELTWISE) fp16 device kernel, else the inherited
+  // host body on UVM (the _gpu variant is OpenCL-only).
   registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
                   ScalarMultiplyLayer::type);
   // tie_word_embedding (promoted): host lm_head on UVM (the GPU GEMV is the

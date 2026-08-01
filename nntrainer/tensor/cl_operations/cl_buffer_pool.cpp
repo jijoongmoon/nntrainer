@@ -22,7 +22,7 @@ namespace nntrainer {
 
 ClBufferPool::~ClBufferPool() { ClBufferPool::deallocate(); }
 
-void ClBufferPool::allocate() {
+void ClBufferPool::allocate(bool zero) {
   auto *cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   cl_context ctx = cc->context_inst_.GetContext();
@@ -56,7 +56,7 @@ void ClBufferPool::allocate() {
       size(), (unsigned long long)max_alloc_pre);
     MemoryPool::allocateFSU();
   } else {
-    MemoryPool::allocate();
+    MemoryPool::allocate(zero);
   }
 
   // (2) Resolve CL_DEVICE_MEM_BASE_ADDR_ALIGN (reported in BITS by the spec).

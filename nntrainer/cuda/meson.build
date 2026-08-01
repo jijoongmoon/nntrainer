@@ -15,6 +15,27 @@ cuda_headers = [
   'cuda_buffer_manager.h',
   'cuda_module.h',
   'cuda_kernel.h',
+  'cuda_elementwise.cpp',
+  'cuda_compute_ops.cpp',
+  'cuda_rmsnorm.cpp',
+  'cuda_fc_qint4.cpp',
+  'cuda_gemv_q6k.cpp',
+  'cuda_blas_manager.cpp',
+]
+
+cuda_headers = [
+  'cuda_common.h',
+  'cuda_context_manager.h',
+  'cuda_stream_manager.h',
+  'cuda_buffer.h',
+  'cuda_buffer_manager.h',
+  'cuda_module.h',
+  'cuda_kernel.h',
+  'cuda_elementwise.h',
+  'cuda_rmsnorm.h',
+  'cuda_fc_qint4.h',
+  'cuda_gemv_q6k.h',
+  'cuda_blas_manager.h',
 ]
 
 foreach s : cuda_sources

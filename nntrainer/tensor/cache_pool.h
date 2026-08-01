@@ -84,7 +84,7 @@ public:
    * @brief Do the allocation of cache
    *
    */
-  virtual void allocate() override;
+  virtual void allocate(bool zero = true) override;
 
   /**
    * @brief Free all the allocated cache

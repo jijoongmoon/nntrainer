@@ -29,6 +29,30 @@
 namespace nntrainer::opencl {
 
 namespace {
+// NNTR_CL_LOCKSTEP=1 (upper-bound discriminator): clFinish after
+// EVERY kernel enqueue — closes the sub-dispatch windows that per-op drains
+// (X4) and per-FC flush (B1b) leave open. If runs STILL diverge under this,
+// the submit/arg-rebind mechanism class is refuted outright. Diagnosis only
+// (brutal cost); not part of NNTR_DETERMINISTIC.
+inline bool cl_lockstep_on() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_CL_LOCKSTEP");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
+
+// Determinism probe: NNTR_CL_SYNC_IO=1 forces every host-I/O enqueue
+// (read/write/map buffer, SVM map) to block, exposing an async host-transfer
+// divergence class: kernel-side LOCKSTEP cannot order these.
+inline bool cl_sync_io_forced() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_CL_SYNC_IO");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
+
 /**
  * @brief Per-kernel GPU profiling registry entry, populated by
  * enqueueKernel when NNTR_OPENCL_PROFILING is set. Each entry owns one
@@ -196,7 +220,7 @@ bool CommandQueueManager::EnqueueReadBuffer(cl_mem buffer, size_t size_in_bytes,
                                             void *data, bool async) {
 
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
   // returns NULL with error code if fails
   auto error_code =
     clEnqueueReadBuffer(command_queue_, buffer, blocking, 0, size_in_bytes,
@@ -216,7 +240,7 @@ bool CommandQueueManager::EnqueueReadBufferRegion(
   size_t buffer_origin_offset, bool async) {
 
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
 
   // (x, y, z) offset in the memory region associated with buffer
   const size_t buffer_origin[] = {buffer_origin_offset, 0, 0};
@@ -260,7 +284,7 @@ bool CommandQueueManager::EnqueueWriteBuffer(cl_mem buffer,
                                              const void *data, bool async) {
 
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
   // returns NULL with error code if fails
   auto error_code =
     clEnqueueWriteBuffer(command_queue_, buffer, blocking, 0, size_in_bytes,
@@ -281,7 +305,7 @@ bool CommandQueueManager::EnqueueWriteBufferRegion(
   size_t host_origin_offset, size_t buffer_origin_offset, bool async) {
 
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
 
   // (x, y, z) offset in the memory region associated with buffer
   const size_t buffer_origin[] = {buffer_origin_offset, 0, 0};
@@ -330,7 +354,7 @@ void *CommandQueueManager::EnqueueMapBuffer(cl_mem buffer,
                                             bool read_only, bool async,
                                             cl_event *event) {
   // managing synchronization
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
   // managing read/write flags
   const cl_map_flags map_flag = read_only ? CL_MAP_READ : CL_MAP_WRITE;
 
@@ -403,7 +427,7 @@ bool CommandQueueManager::enqueueSVMMap(void *svm_ptr, size_t size,
   // unmap/kernel, AND when no host access of this region happens before that
   // next GPU op. Removes the per-op host stall that otherwise drains the queue
   // to idle. Default (false) keeps the original blocking behavior.
-  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+  const cl_bool blocking = (async && !cl_sync_io_forced()) ? CL_FALSE : CL_TRUE;
 
   cl_int error_code = clEnqueueSVMMap(command_queue_, blocking, map_flag,
                                       svm_ptr, size, 0, nullptr, event);
@@ -497,6 +521,11 @@ bool CommandQueueManager::DispatchCommand(
   }
   next_prof_label_.clear();
 
+  // NNTR_CL_LOCKSTEP (upper-bound discriminator): clFinish after
+  // every enqueue. Diagnosis only, default-off; not part of NNTR_DETERMINISTIC.
+  if (cl_lockstep_on())
+    clFinish(command_queue_);
+
   // A device without fine-grain SVM does not honor in-order kernel->kernel
   // memory consistency for GPU-resident SVM handoffs (see
   // needsSvmCoherenceDrain). Drain only after dispatches that bound an SVM
@@ -559,6 +588,11 @@ bool CommandQueueManager::DispatchCommand(
   }
   next_prof_label_.clear();
 
+  // NNTR_CL_LOCKSTEP (upper-bound discriminator): clFinish after
+  // every enqueue. Diagnosis only, default-off; not part of NNTR_DETERMINISTIC.
+  if (cl_lockstep_on())
+    clFinish(command_queue_);
+
   // A device without fine-grain SVM does not honor in-order kernel->kernel
   // memory consistency for GPU-resident SVM handoffs (see
   // needsSvmCoherenceDrain). Drain only after dispatches that bound an SVM
@@ -609,6 +643,11 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
       key += next_prof_label_;
     profRecs().push_back({std::move(key), local_evt});
   }
+  // NNTR_CL_LOCKSTEP (upper-bound discriminator): clFinish after
+  // every enqueue. Diagnosis only, default-off; not part of NNTR_DETERMINISTIC.
+  if (cl_lockstep_on())
+    clFinish(command_queue_);
+
   // SVM coherence drain, same policy as DispatchCommand. Kernels that dispatch
   // through enqueueKernel (not DispatchCommand) need the same flush to keep
   // their coarse-grain-SVM producer->consumer handoffs coherent. Flush only
