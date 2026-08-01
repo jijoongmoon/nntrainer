@@ -316,6 +316,51 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   unsigned int input_len =
     std::min((unsigned int)_input.size(), (unsigned int)MAX_SEQ_LEN);
 
+  // Producer precondition for the KV write-locality invariant (the bound is
+  // mha_assert_kv_write_fits() in layers/mha_core.cpp; this is the same kind of
+  // up-front refusal CausalLM::run's SAVE_KVCACHE branch carries).
+  //
+  // encode() prefills the WHOLE prompt as ONE unchunked block from absolute 0
+  // -- the incremental_inference(..., input_len, 0, input_len, false) below --
+  // so, unlike CausalLM::run's chunk loop, it cannot split its writes on the
+  // absolute NNTR_PREFILL_CHUNK grid. A ringed layer stores physical row
+  // position % Wcap, so that single write is one contiguous slice only while
+  // input_len <= Wcap; past that it straddles the wrap seam and mha_core
+  // throws mid-forward, telling the producer to re-tile on the chunk grid --
+  // advice this producer structurally cannot take.
+  //
+  // This IS reachable here: SentenceTransformer::constructModel() delegates to
+  // Transformer::constructModel(), so the encoder's mha_core layers carry
+  // sliding_window = getLayerSlidingWindow(layer_id) and are ringed exactly
+  // like a decoder's. EmbeddingGemma, Qwen2Embedding and Qwen3Embedding all
+  // inherit this encode(). (DebertaV2 overrides encode() and builds
+  // "deberta_attention", not mha_core, so it is out of scope.)
+  //
+  // Only the writes that do not fit are refused. A ringed layer whose Wcap
+  // covers the whole prompt never wraps -- every row index is n % Wcap == n --
+  // so it stays exactly as correct, and as byte-identical to ring-off, as it
+  // is today. Note also that this class overrides allocateAndBindKVCache()
+  // without going through computeKVRingCaps(), so the "[kv-ring]" line never
+  // prints on this path: the ring is invisible here until it corrupts
+  // something, which is the other reason to name it explicitly.
+  {
+    const std::vector<unsigned int> ring_caps =
+      computeKVRingCaps(static_cast<unsigned int>(MAX_SEQ_LEN));
+    for (size_t i = 0; i < ring_caps.size(); ++i) {
+      if (ring_caps[i] != 0 && input_len > ring_caps[i]) {
+        throw std::runtime_error(
+          "SentenceTransformer::encode: NYI -- prompt of " +
+          std::to_string(input_len) +
+          " tokens with the sliding-window ring enabled (layer " +
+          std::to_string(i) + " ring cap " + std::to_string(ring_caps[i]) +
+          " rows). encode() prefills the whole prompt as one unchunked block "
+          "from absolute 0, so it cannot split its writes on the absolute "
+          "NNTR_PREFILL_CHUNK grid the ring requires. Re-run with "
+          "NNTR_KV_WINDOW_RING=0 for this configuration.");
+      }
+    }
+  }
+
   // feed only available length
   for (unsigned int i = 0; i < input_len; ++i)
     init_input.push_back(_input[i]);

@@ -1233,6 +1233,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   //   SDK session. A two-turn transcript is therefore a REQUIRED gate row for
   //   this file -- the single-turn goldens cannot see this at all.
   //
+  //   MEASURED, not asserted (Intel XMX OpenCL, gemma2 QS4CX-FP16, max_seq_len
+  //   1024, precomputed 450-token system prompt, C=64, ring OFF so the re-tiling
+  //   is the ONLY difference; turn 2 is 324 tokens starting at absolute 476,
+  //   476 % 64 = 28, so the grid moves 64+64+64+64+64+4 -> 36+64+64+64+64+32):
+  //
+  //     transcript md5   before (this change reverted)  514204262c0c
+  //                      after                          6893035877df
+  //
+  //   Turn 1 is byte-identical in both (it is one sub-chunk block). Turn 2 is
+  //   not, and the two completions are not small perturbations of each other --
+  //   they diverge into different token sequences within the first token. That
+  //   is what a chunk-size change does to a 16-token greedy continuation; it is
+  //   the reason this needs a gate row rather than a footnote.
+  //
   // ring_grid is only ever read on a path guarded by prefill_chunk != 0, and
   // prefill_chunk is 0 whenever effectivePrefillChunk() is, so the modulo below
   // cannot divide by zero.
