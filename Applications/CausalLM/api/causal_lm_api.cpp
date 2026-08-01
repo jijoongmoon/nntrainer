@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,20 +27,9 @@
 #include "callback_streamer.h"
 #include "causal_lm.h"
 #include "chat_template.h"
-#include "gemma3_causallm.h"
-#if !defined(_WIN32)
-#include "gptoss_cached_slim_causallm.h"
-#endif
-#include "gptoss_causallm.h"
 #include "json.hpp"
 #include "model_config_internal.h"
-#include "qwen2_causallm.h"
-#if !defined(_WIN32)
-#include "qwen3_cached_slim_moe_causallm.h"
-#endif
-#include "qwen3_causallm.h"
-#include "qwen3_moe_causallm.h"
-#include "qwen3_slim_moe_causallm.h"
+#include "model_registry.h"
 #include <factory.h>
 #include <fstream>
 #include <sys/stat.h>
@@ -60,8 +50,66 @@ static std::string g_architecture = "";
 static bool g_use_chat_template = false;
 static bool g_verbose = false;
 static std::string g_last_output = "";
+// How long it took to build the model that is in memory. A load that reuses
+// that model leaves this alone rather than reporting its own ~0 ms: the number
+// getPerformanceMetrics() publishes is the cost of initialising the model being
+// run, and overwriting it with 0 would tell a caller that polls after a
+// re-load that the model came up for free.
 static double g_initialization_duration_ms = 0.0;
 static std::unique_ptr<causallm::ChatTemplate> g_chat_template;
+// The loaded package's own chat render context ("chat_template_context" in
+// nntr_config.json); per-call options are merged over it.
+static json g_chat_template_context = json::object();
+// The loaded package's generation_config.json "do_sample"; runModelWithOptions
+// follows it unless the caller overrides it per call.
+static bool g_do_sample_default = false;
+
+/**
+ * @brief What a load request asked for.
+ *
+ * Everything that can change the model a load produces lives here, so two
+ * requests that compare equal are answered by the same weights:
+ *  - @c source is the entry point, because the two describe a model in
+ *    different terms and must not be read as each other's;
+ *  - @c compute selects the nntrainer engine the graph is built for;
+ *  - @c model_type and @c quant_type select the built-in configuration and
+ *    the quantization suffix of the package directory (loadModel() only);
+ *  - @c model_dir is the package directory itself, weakly canonicalised. It
+ *    is what loadModelFromPath() was handed, and for loadModel() it is the
+ *    directory the enums resolved to -- resolution is relative to the working
+ *    directory, so the enums alone do not pin down which weights were read.
+ *
+ * Not here: the ::Config options, which change how a prompt is fed to a model
+ * rather than which model is built, and are applied per run by setOptions().
+ */
+struct LoadRequest {
+  /** @brief The entry point that made the request. */
+  enum class Source { BuiltinType, PackageDirectory };
+
+  Source source;
+  BackendType compute;
+  ModelType model_type;
+  ModelQuantizationType quant_type;
+  std::string model_dir;
+
+  /** @brief Equality across every field that selects a model. */
+  bool operator==(const LoadRequest &rhs) const {
+    if (source != rhs.source || compute != rhs.compute ||
+        model_dir != rhs.model_dir)
+      return false;
+    if (source == Source::PackageDirectory)
+      return true; // the directory is the whole specification
+    return model_type == rhs.model_type && quant_type == rhs.quant_type;
+  }
+};
+
+/**
+ * @brief The request g_model answers; empty when no model is loaded.
+ *
+ * Written only while holding g_mutex, and only together with g_model, so it
+ * never describes a model that is not the one in memory.
+ */
+static std::optional<LoadRequest> g_loaded_request;
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
@@ -148,6 +196,33 @@ void resolveNntrConfigPath(json &nntr_cfg, const std::string &key,
   nntr_cfg[key] = (std::filesystem::path(model_dir_path) / path).string();
 }
 
+/**
+ * @brief Package directory in a form two spellings of one directory share.
+ *
+ * Weak canonicalisation, so a package that has since been moved away still
+ * normalises. A path that cannot be resolved at all falls back to its literal
+ * spelling: the only consequence is that one directory named two ways reloads
+ * instead of being reused, which costs time but never returns wrong weights.
+ */
+std::string canonical_model_dir(const std::string &model_dir) {
+  try {
+    return std::filesystem::weakly_canonical(std::filesystem::path(model_dir))
+      .string();
+  } catch (const std::exception &) {
+    return model_dir;
+  }
+}
+
+/**
+ * @brief Whether the model already in memory answers @p request.
+ * @note The caller must hold g_mutex; a load publishes g_model and
+ *       g_loaded_request together under it, so the two cannot disagree here.
+ */
+bool loaded_model_answers(const LoadRequest &request) {
+  return g_initialized.load(std::memory_order_acquire) && g_model != nullptr &&
+         g_loaded_request.has_value() && *g_loaded_request == request;
+}
+
 } // namespace
 
 #ifdef ENABLE_TEST
@@ -177,6 +252,9 @@ void setModelForTest(std::unique_ptr<causallm::Transformer> model,
   g_architecture = architecture;
   g_last_output.clear();
   g_chat_template.reset();
+  // An injected model answers no load request until a test says which one, so
+  // a later loadModel() cannot mistake it for the model it asked for.
+  g_loaded_request.reset();
 }
 
 void resetForTest() {
@@ -187,12 +265,15 @@ void resetForTest() {
   }
   g_model.reset();
   g_initialized.store(false, std::memory_order_release);
+  g_loaded_request.reset();
   g_architecture.clear();
   g_use_chat_template = false;
   g_verbose = false;
   g_last_output.clear();
   g_initialization_duration_ms = 0.0;
   g_chat_template.reset();
+  g_chat_template_context = json::object();
+  g_do_sample_default = false;
   g_after_active_run_publish_hook = nullptr;
   g_after_active_run_publish_user_data = nullptr;
   g_before_cancel_request_hook = nullptr;
@@ -210,66 +291,21 @@ std::string resolveNntrConfigPathForTest(const std::string &value,
 } // namespace causal_lm_api_test
 #endif
 
-// Helper to register models (similar to main.cpp)
-// ensuring factory is populated.
-// @note: Factory registration is singleton and persistent, but we do it once
-// here to be sure. Since main.cpp is not linked, we must duplicate registration
-// or share it. Assuming this lib is used independently of main.cpp.
+/**
+ * @brief Populate the factory with every runnable model, once.
+ *
+ * Delegates to causallm::registerAllModels() -- the registry that exists so
+ * "alternative entry points (tests, SDK wrappers) register the same model set
+ * without duplicating the list". This function used to carry its own hand-kept
+ * list of nine architectures, which had already drifted: packages whose
+ * architecture the runner loads fine failed here with "Unknown architecture"
+ * purely because nobody added them in two places. Windows exclusions live in
+ * the registry too, so they stay honoured.
+ */
 static void register_models() {
   static std::once_flag flag;
   std::call_once(flag, []() {
-    causallm::Factory::Instance().registerModel(
-      "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
-                                                    nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen2CausalLM>(cfg, generation_cfg,
-                                                         nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3CausalLM>(cfg, generation_cfg,
-                                                         nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3MoECausalLM>(cfg, generation_cfg,
-                                                            nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3SlimMoeForCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3SlimMoECausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#if !defined(_WIN32)
-    causallm::Factory::Instance().registerModel(
-      "Qwen3CachedSlimMoeForCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3CachedSlimMoECausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#endif
-    causallm::Factory::Instance().registerModel(
-      "GptOssForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::GptOssForCausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#if !defined(_WIN32)
-    causallm::Factory::Instance().registerModel(
-      "GptOssCachedSlimCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::GptOssCachedSlimCausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#endif
-    causallm::Factory::Instance().registerModel(
-      "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
-                                                          nntr_cfg);
-      });
+    causallm::registerAllModels();
 
     // Register built-in configurations
     register_builtin_model_configs();
@@ -285,35 +321,56 @@ static const char *get_model_name_from_type(ModelType type) {
   }
 }
 
-static std::string apply_chat_template(const std::string &architecture,
-                                       const std::string &input) {
-  // Use dynamic chat template from tokenizer_config.json if available
-  if (g_chat_template) {
-    try {
-      nlohmann::json request =
-        nlohmann::json::array({{{"role", "user"}, {"content", input}}});
-      return g_chat_template->apply(request);
-    } catch (const std::exception &e) {
-      std::cerr << "[Warning] Failed to apply chat template: " << e.what()
-                << ". Falling back to hardcoded templates." << std::endl;
-    }
+/**
+ * @brief Render the prompt through the loaded package's chat template.
+ *
+ * Delegates to causallm::buildUserPrompt(), the same seam the runner uses, so
+ * one prompt plus one model package produces one prompt string on either
+ * front end.
+ *
+ * The per-architecture template table that used to live here is gone on
+ * purpose. It was a second template implementation keyed on the architecture
+ * string, and it could only ever be a guess: two packages of the same
+ * architecture legitimately carry different templates, so the table silently
+ * mis-templated them, and it hid a missing/broken template behind
+ * plausible-looking markers. The template belongs to the model package.
+ *
+ * @throw std::exception from the renderer -- the caller gets an error instead
+ *        of a quietly raw prompt.
+ */
+static std::string apply_chat_template(const std::string &input,
+                                       const json &call_context) {
+  if (!g_chat_template) {
+    std::cerr << "[Warning] No chat template in the loaded model package; "
+                 "feeding the prompt as given."
+              << std::endl;
+    return input;
   }
 
-  // Fallback: hardcoded per-architecture templates
-  if (architecture == "LlamaForCausalLM") {
-    // Llama 2/3 chat format: [INST] {prompt} [/INST]
-    return "[INST] " + input + " [/INST]";
-  } else if (architecture == "Qwen2ForCausalLM" ||
-             architecture == "Qwen3ForCausalLM" ||
-             architecture == "Qwen3MoeForCausalLM" ||
-             architecture == "Qwen3SlimMoeForCausalLM" ||
-             architecture == "Qwen3CachedSlimMoeForCausalLM") {
-    return "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
-  } else if (architecture == "Gemma3ForCausalLM") {
-    return "<start_of_turn>user\n" + input +
-           "<end_of_turn>\n<start_of_turn>model\n";
+  json context = g_chat_template_context;
+  if (call_context.is_object()) {
+    for (auto it = call_context.begin(); it != call_context.end(); ++it)
+      context[it.key()] = it.value();
   }
-  return input;
+
+  return causallm::buildUserPrompt(g_chat_template.get(), input,
+                                   causallm::PromptTemplateMode::Auto, context);
+}
+
+/**
+ * @brief Parse a caller-supplied render-context JSON object.
+ * @return the parsed object; an empty object when @p json_text is null/empty
+ * @throw std::runtime_error when it is not parseable as a JSON object
+ */
+static json parse_chat_context(const char *json_text) {
+  if (json_text == nullptr || json_text[0] == '\0')
+    return json::object();
+
+  json parsed = json::parse(json_text);
+  if (!parsed.is_object())
+    throw std::runtime_error("chat_context_json must be a JSON object");
+
+  return parsed;
 }
 
 static std::string get_quantization_suffix(ModelQuantizationType type) {
@@ -356,6 +413,47 @@ static std::string resolve_model_path(const std::string &model_key,
 
   return model_path;
 }
+
+/** @brief The request loadModel() answers for these arguments. */
+static LoadRequest builtin_load_request(BackendType compute,
+                                        ModelType modeltype,
+                                        ModelQuantizationType quant_type,
+                                        const std::string &model_name) {
+  return LoadRequest{
+    LoadRequest::Source::BuiltinType, compute, modeltype, quant_type,
+    canonical_model_dir(resolve_model_path(model_name, quant_type))};
+}
+
+/** @brief The request loadModelFromPath() answers for these arguments. */
+static LoadRequest package_load_request(BackendType compute,
+                                        const std::string &model_dir) {
+  // The enums say nothing about a package directory and operator== ignores
+  // them for this source; they are filled only because C++ gives these enums
+  // no "not applicable" enumerator.
+  return LoadRequest{LoadRequest::Source::PackageDirectory, compute,
+                     CAUSAL_LM_MODEL_QWEN3_0_6B, CAUSAL_LM_QUANTIZATION_UNKNOWN,
+                     canonical_model_dir(model_dir)};
+}
+
+#ifdef ENABLE_TEST
+namespace causal_lm_api_test {
+
+void setLoadedBuiltinRequestForTest(BackendType compute, ModelType model_type,
+                                    ModelQuantizationType quant_type) {
+  const char *model_name = get_model_name_from_type(model_type);
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_loaded_request = builtin_load_request(
+    compute, model_type, quant_type, model_name != nullptr ? model_name : "");
+}
+
+void setLoadedPackageRequestForTest(BackendType compute,
+                                    const std::string &model_dir) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_loaded_request = package_load_request(compute, model_dir);
+}
+
+} // namespace causal_lm_api_test
+#endif
 
 static bool check_file_exists(const std::string &path) {
   struct stat buffer;
@@ -478,6 +576,219 @@ ErrorCode registerModel(const char *model_name, const char *arch_name,
   return CAUSAL_LM_ERROR_NONE;
 }
 
+/**
+ * @brief Shared tail of every load path.
+ *
+ * Both load entry points end here, so they cannot drift in what they set up --
+ * above all the chat template and its render context, which the SDK has to
+ * establish exactly as the command line runner does for the two front ends to
+ * answer a prompt identically.
+ *
+ * @note repack_weight() runs here. The runner has always called it after
+ *       load_weight() (and so does the SDK facade); the API load path used to
+ *       skip it, which left backends whose weights need a repack running a
+ *       different weight layout than the runner for the same package.
+ *
+ * @note Nothing the caller can observe is written until the replacement model
+ *       is built and its weights are in memory. A load that fails -- by
+ *       returning or by throwing out of initialize()/load_weight() -- leaves
+ *       the previously loaded model loaded, runnable and described by its own
+ *       chat template and identity. The cost is that both models are resident
+ *       for the length of the swap, which is the price of not being left with
+ *       neither.
+ *
+ * @param request what the caller asked for; recorded with the model it
+ *                produced so a repeat of the same request can reuse it
+ */
+static ErrorCode finish_load(json &cfg, json &generation_cfg, json &nntr_cfg,
+                             const std::string &model_dir_path,
+                             const LoadRequest &request) {
+  // Decoding policy is the package's to state, exactly as the runner reads it.
+  const bool do_sample_default =
+    generation_cfg.is_object() && generation_cfg.value("do_sample", false);
+
+  // The chat template and its render defaults belong to the model package.
+  json chat_template_context = causallm::chatTemplateContext(nntr_cfg);
+  std::unique_ptr<causallm::ChatTemplate> chat_template;
+  if (causallm::ChatTemplate::Exists(model_dir_path)) {
+    try {
+      chat_template = std::make_unique<causallm::ChatTemplate>(
+        causallm::ChatTemplate::Load(model_dir_path));
+      std::cout << "[Info] Chat template loaded from "
+                << chat_template->sourcePath() << std::endl;
+    } catch (const std::exception &e) {
+      chat_template.reset();
+      std::cerr << "[Warning] Failed to load chat template: " << e.what()
+                << "; prompts will be fed as given." << std::endl;
+    }
+  } else {
+    std::cout << "[Info] No chat template in " << model_dir_path
+              << "; prompts will be fed as given." << std::endl;
+  }
+
+  // Construct weight file path
+  std::string weight_file_name;
+  if (nntr_cfg.contains("model_file_name")) {
+    weight_file_name = nntr_cfg["model_file_name"].get<std::string>();
+  } else {
+    weight_file_name = "pytorch_model.bin"; // Default fallback if not specified
+  }
+
+  const std::string weight_file = model_dir_path + "/" + weight_file_name;
+
+  // Architecture, in the runner's order of preference. Embedding packages are
+  // out of scope for a text-generation API and are rejected rather than
+  // silently mapped onto a generative architecture.
+  std::string architecture;
+  if (cfg.contains("architectures") && cfg["architectures"].is_array() &&
+      !cfg["architectures"].empty()) {
+    architecture = cfg["architectures"].get<std::vector<std::string>>()[0];
+  } else if (cfg.contains("architecture") && cfg["architecture"].is_string()) {
+    architecture = cfg["architecture"].get<std::string>();
+  } else if (cfg.contains("model_type") && cfg["model_type"].is_string()) {
+    architecture = cfg["model_type"].get<std::string>();
+  } else {
+    std::cerr << "config.json must contain 'architectures', 'architecture' or "
+                 "'model_type'"
+              << std::endl;
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  if (nntr_cfg.contains("model_type") && nntr_cfg["model_type"].is_string()) {
+    std::string model_type = nntr_cfg["model_type"].get<std::string>();
+    std::transform(model_type.begin(), model_type.end(), model_type.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (model_type == "embedding") {
+      std::cerr << "embedding models are out of scope for this API"
+                << std::endl;
+      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+    }
+  }
+
+  // Build the replacement to completion before touching the live model.
+  auto next_model = causallm::Factory::Instance().create(
+    architecture, cfg, generation_cfg, nntr_cfg);
+  if (!next_model) {
+    std::cerr << "Unknown architecture: " << architecture << std::endl;
+    return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+  }
+
+  next_model->initialize();
+  next_model->load_weight(weight_file);
+  next_model->repack_weight();
+
+  // Runnable now, so publish it. g_mutex is held, so no run is in flight and
+  // g_active_model is already null; clearing it keeps that an invariant of the
+  // swap rather than an assumption about the caller.
+  {
+    std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
+    g_active_model = nullptr;
+  }
+  g_initialized.store(false, std::memory_order_release);
+  g_model = std::move(next_model);
+  g_architecture = architecture;
+  g_chat_template = std::move(chat_template);
+  g_chat_template_context = std::move(chat_template_context);
+  g_do_sample_default = do_sample_default;
+  g_loaded_request = request;
+  g_initialized.store(true, std::memory_order_release);
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+/** @brief nntrainer engine name for a backend; empty when unsupported. */
+static const char *engine_of(BackendType compute) {
+  switch (compute) {
+  case CAUSAL_LM_BACKEND_CPU:
+    return "cpu";
+  case CAUSAL_LM_BACKEND_GPU:
+    return "gpu";
+  default:
+    return "";
+  }
+}
+
+ErrorCode loadModelFromPath(BackendType compute, const char *model_dir) {
+  if (model_dir == nullptr || model_dir[0] == '\0')
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+
+  const char *engine = engine_of(compute);
+  if (engine[0] == '\0') {
+    std::cerr << "Unsupported backend for loadModelFromPath" << std::endl;
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  auto start_init = std::chrono::high_resolution_clock::now();
+
+  register_models();
+
+  std::lock_guard<std::mutex> lock(g_mutex);
+  try {
+    const std::string model_dir_path(model_dir);
+
+    // Already serving this package: keep the weights that are in memory.
+    const LoadRequest request = package_load_request(compute, model_dir_path);
+    if (loaded_model_answers(request)) {
+      std::cout << "[Info] " << model_dir_path
+                << " is already loaded; reusing the model in memory."
+                << std::endl;
+      return CAUSAL_LM_ERROR_NONE;
+    }
+
+    if (!std::filesystem::exists(std::filesystem::path(model_dir_path) /
+                                 "config.json") ||
+        !std::filesystem::exists(std::filesystem::path(model_dir_path) /
+                                 "nntr_config.json")) {
+      std::cerr << model_dir_path
+                << " must contain config.json and nntr_config.json"
+                << std::endl;
+      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+    }
+
+    // The engine name is latched the first time nntrainer reads it, so it must
+    // be published before anything touches the global engine. An explicit
+    // backend argument is authoritative for this process.
+    if (!g_initialized.load(std::memory_order_acquire)) {
+#ifdef _WIN32
+      _putenv_s("NNTR_ENGINE", engine);
+#else
+      ::setenv("NNTR_ENGINE", engine, /*overwrite=*/1);
+#endif
+    }
+
+    json cfg = causallm::LoadJsonFile(model_dir_path + "/config.json");
+    json generation_cfg = json::object();
+    const std::string generation_config_path =
+      model_dir_path + "/generation_config.json";
+    if (std::filesystem::exists(generation_config_path))
+      generation_cfg = causallm::LoadJsonFile(generation_config_path);
+    json nntr_cfg =
+      causallm::LoadJsonFile(model_dir_path + "/nntr_config.json");
+
+    resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_dir_path);
+    resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_dir_path);
+    resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_dir_path);
+
+    const ErrorCode ec =
+      finish_load(cfg, generation_cfg, nntr_cfg, model_dir_path, request);
+    if (ec != CAUSAL_LM_ERROR_NONE)
+      return ec;
+
+    auto finish_init = std::chrono::high_resolution_clock::now();
+    g_initialization_duration_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(finish_init -
+                                                            start_init)
+        .count();
+  } catch (const std::exception &e) {
+    std::cerr << "Exception in loadModelFromPath: " << e.what() << std::endl;
+    return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+  } catch (...) {
+    std::cerr << "Unknown exception in loadModelFromPath" << std::endl;
+    return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
 ErrorCode loadModel(BackendType compute, ModelType modeltype,
                     ModelQuantizationType quant_type) {
 
@@ -493,6 +804,19 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
 
   std::lock_guard<std::mutex> lock(g_mutex);
   try {
+
+    // Already serving this model: keep the weights that are in memory. Nothing
+    // below can produce a different model for the same request, so re-reading
+    // them would cost a full load to arrive back where we already are -- and
+    // the caller would lose a working model for the duration.
+    const LoadRequest request =
+      builtin_load_request(compute, modeltype, quant_type, target_model_name);
+    if (loaded_model_answers(request)) {
+      std::cout << "[Info] " << target_model_name
+                << " is already loaded; reusing the model in memory."
+                << std::endl;
+      return CAUSAL_LM_ERROR_NONE;
+    }
 
     // Check if it's a registered in-memory config
     std::string input_name = std::string(target_model_name);
@@ -522,7 +846,10 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     json cfg;
     json generation_cfg;
     json nntr_cfg;
-    std::string model_dir_path;
+    // Both branches below read the package from the same directory, and it is
+    // the directory the request identity was built from.
+    const std::string model_dir_path =
+      resolve_model_path(target_model_name, quant_type);
 
     // Check in-memory map first
     if (g_model_registry.find(lookup_name) != g_model_registry.end()) {
@@ -543,9 +870,6 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       }
       ModelArchConfig &ac = g_arch_config_map[rm.arch_name];
       ModelRuntimeConfig &rc = rm.config;
-
-      // Strategy: Resolve path to find the weight file
-      model_dir_path = resolve_model_path(target_model_name, quant_type);
 
       // Populate JSONs from Arch Struct
       cfg["vocab_size"] = ac.vocab_size;
@@ -620,7 +944,6 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       // The model type is registered (enum), but specific configuration for
       // this quantization is not in memory. We must load config.json and
       // nntr_config.json from the model directory
-      model_dir_path = resolve_model_path(target_model_name, quant_type);
 
       // Load configuration files
       cfg = causallm::LoadJsonFile(model_dir_path + "/config.json");
@@ -633,64 +956,10 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_dir_path);
     }
 
-    // Load chat template from model directory if available
-    if (causallm::ChatTemplate::Exists(model_dir_path)) {
-      try {
-        g_chat_template = std::make_unique<causallm::ChatTemplate>(
-          causallm::ChatTemplate::Load(model_dir_path));
-        std::cout << "[Info] Chat template loaded from "
-                  << g_chat_template->sourcePath() << std::endl;
-      } catch (const std::exception &e) {
-        g_chat_template.reset();
-        std::cerr << "[Warning] Failed to load chat template: " << e.what()
-                  << ". Falling back to hardcoded templates." << std::endl;
-      }
-    } else {
-      g_chat_template.reset();
-      std::cerr << "[Warning] No chat template found in " << model_dir_path
-                << ". Using hardcoded templates." << std::endl;
-    }
-
-    // Construct weight file path
-    std::string weight_file_name;
-    if (nntr_cfg.contains("model_file_name")) {
-      weight_file_name = nntr_cfg["model_file_name"].get<std::string>();
-    } else {
-      weight_file_name =
-        "pytorch_model.bin"; // Default fallback if not specified
-    }
-
-    const std::string weight_file = model_dir_path + "/" + weight_file_name;
-
-    // Determine architecture from config or ModelType
-    // Priority: Config file architecture > ModelType mapping (fallback)
-    std::string architecture;
-    if (cfg.contains("architectures") && cfg["architectures"].is_array() &&
-        !cfg["architectures"].empty()) {
-      architecture = cfg["architectures"].get<std::vector<std::string>>()[0];
-    } else {
-      // No fallback mapping from specific ModelType instances to generic
-      // architecture strings for now, as specific types should have config or
-      // be loaded from valid file with config.json
-      return CAUSAL_LM_ERROR_INVALID_PARAMETER;
-    }
-
-    {
-      std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
-      g_active_model = nullptr;
-    }
-    g_initialized.store(false, std::memory_order_release);
-    g_model = causallm::Factory::Instance().create(architecture, cfg,
-                                                   generation_cfg, nntr_cfg);
-    if (!g_model) {
-      return CAUSAL_LM_ERROR_MODEL_LOAD_FAILED;
-    }
-
-    g_model->initialize();
-    g_model->load_weight(weight_file);
-
-    g_initialized.store(true, std::memory_order_release);
-    g_architecture = architecture;
+    const ErrorCode ec =
+      finish_load(cfg, generation_cfg, nntr_cfg, model_dir_path, request);
+    if (ec != CAUSAL_LM_ERROR_NONE)
+      return ec;
 
     auto finish_init = std::chrono::high_resolution_clock::now();
     auto init_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -708,13 +977,24 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
   return CAUSAL_LM_ERROR_NONE;
 }
 
-ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
+ErrorCode runModelWithOptions(const char *inputTextPrompt,
+                              const GenerationOptions *options,
+                              const char **outputText) {
   if (!g_initialized.load(std::memory_order_acquire)) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
   if (inputTextPrompt == nullptr || outputText == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
+
+  // NULL options = the documented defaults: template applied, package context.
+  const bool apply_template =
+    options == nullptr ? true : options->apply_chat_template;
+  const char *context_json =
+    options == nullptr ? nullptr : options->chat_context_json;
+  const bool do_sample = (options == nullptr || options->do_sample < 0)
+                           ? g_do_sample_default
+                           : options->do_sample > 0;
 
   try {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -726,8 +1006,8 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
 
     std::string input(inputTextPrompt);
 
-    if (g_use_chat_template) {
-      input = apply_chat_template(g_architecture, input);
+    if (apply_template) {
+      input = apply_chat_template(input, parse_chat_context(context_json));
     }
 
     if (causal_lm_model != nullptr)
@@ -736,7 +1016,7 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
     notifyAfterActiveRunPublishForTest();
 
     // We assume single batch request for this API.
-    g_model->run(input, false, "", "", g_verbose);
+    g_model->run(input, do_sample, "", "", g_verbose);
 
     g_last_output = ""; // Reset last output
     if (causal_lm_model) {
@@ -751,6 +1031,14 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
   }
 
   return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
+  // Unchanged contract: the global Config.use_chat_template still decides and
+  // decoding stays greedy, so an existing caller sees no behaviour change.
+  const GenerationOptions options{g_use_chat_template, nullptr,
+                                  /*do_sample=*/0};
+  return runModelWithOptions(inputTextPrompt, &options, outputText);
 }
 
 ErrorCode runModelStreaming(const char *inputTextPrompt,
@@ -778,7 +1066,7 @@ ErrorCode runModelStreaming(const char *inputTextPrompt,
     std::string input(inputTextPrompt);
 
     if (g_use_chat_template) {
-      input = apply_chat_template(g_architecture, input);
+      input = apply_chat_template(input, json::object());
     }
 
     CallbackStreamer streamer;

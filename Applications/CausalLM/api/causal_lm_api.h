@@ -74,6 +74,10 @@ typedef enum {
 
 /**
  * @brief Configuration structure
+ * @note  Unchanged surface: @c use_chat_template keeps its exact meaning for
+ *        every existing caller, including one that zero-initialises this
+ *        struct (false = feed the prompt raw). Per-call control lives in
+ *        ::GenerationOptions instead, so no field here changed its sense.
  */
 typedef struct {
   // Add configuration options here as needed
@@ -81,6 +85,41 @@ typedef struct {
   bool debug_mode; /// < @brief Check model file validity during initialization
   bool verbose;    /// < @brief Whether to print output during generation
 } Config;
+
+/**
+ * @brief Per-call generation options.
+ *
+ * Passing NULL wherever a @c GenerationOptions is accepted selects the
+ * documented defaults: the model package's chat template IS applied, and the
+ * package's own render context is used. That default is deliberate -- a caller
+ * hands this API a user turn, and a chat model needs its turn markers to answer
+ * instead of drift. A caller that has ALREADY templated its text (or wants a
+ * bare completion) sets @c apply_chat_template to false and gets its bytes
+ * through verbatim; nothing wraps an already-wrapped prompt.
+ */
+typedef struct {
+  /**
+   * @brief Apply the model package's chat template to the prompt.
+   *        Defaults to true when the options pointer is NULL.
+   */
+  bool apply_chat_template;
+  /**
+   * @brief Optional UTF-8 JSON object of extra template render keys, merged
+   *        over the model package's own "chat_template_context" defaults.
+   *        NULL (or empty) = use the package defaults unchanged.
+   */
+  const char *chat_context_json;
+  /**
+   * @brief Sampling policy: negative = follow the model package's
+   *        generation_config.json "do_sample" (the default, and what the
+   *        command line runner does), 0 = greedy, positive = sample.
+   *
+   * Following the package matters for front-end agreement: a package that
+   * asks for sampling decodes differently from a greedy run, so an SDK that
+   * forced greedy answered the same prompt differently than the runner did.
+   */
+  int do_sample;
+} GenerationOptions;
 
 /**
  * @brief Set global options
@@ -102,6 +141,23 @@ typedef enum {
 
 /**
  * @brief Load a model
+ *
+ * Loading is idempotent. A call that asks for the model already in memory --
+ * same backend, same ::ModelType, same ::ModelQuantizationType, resolving to
+ * the same package directory -- keeps that model and returns
+ * ::CAUSAL_LM_ERROR_NONE without re-reading the weights. A caller may load
+ * before every request without paying for a reload, and without having to
+ * track whether it has loaded already.
+ *
+ * A call that asks for a DIFFERENT model does reload; it never quietly hands
+ * back the model already in memory. The replacement is built to completion
+ * first and only then swapped in, so a reload that fails leaves the
+ * previously loaded model loaded and runnable and returns the error.
+ *
+ * A reused load does not disturb the
+ * ::PerformanceMetrics::initialization_duration_ms of the model in memory: it
+ * keeps reporting what that model cost to build.
+ *
  * @param compute Backend compute type
  * @param modeltype Model type
  * @param quant_type Model quantization type
@@ -109,6 +165,29 @@ typedef enum {
  */
 WIN_EXPORT ErrorCode loadModel(BackendType compute, ModelType modeltype,
                                ModelQuantizationType quant_type);
+
+/**
+ * @brief Load a model from a model-package directory.
+ *
+ * The directory owns the whole specification -- config.json,
+ * nntr_config.json, the weight file, the tokenizer and the chat template --
+ * exactly as the command line runner reads it, so an SDK consumer and the
+ * runner can be pointed at one package and get one answer. This is the entry
+ * point to use for any model that is not one of the built-in ::ModelType
+ * values (that enum stays as it is for existing callers).
+ *
+ * Idempotent on the same package, and safe on a failed switch, exactly as
+ * ::loadModel is: same backend and same directory reuses the model already in
+ * memory, a different one reloads without losing the loaded model if the
+ * reload fails.
+ *
+ * @param compute   Backend compute type; selects the nntrainer engine and
+ *                  must be chosen before the first load in the process.
+ * @param model_dir Path to the model package directory (UTF-8).
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode loadModelFromPath(BackendType compute,
+                                       const char *model_dir);
 
 /**
  * @brief Get performance metrics of the last run
@@ -125,6 +204,22 @@ WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
  */
 WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
                               const char **outputText);
+
+/**
+ * @brief Run inference with per-call options.
+ * @param inputTextPrompt Input prompt (UTF-8). A user turn when the chat
+ *        template is applied, otherwise the verbatim model input.
+ * @param options Per-call options, or NULL for the documented defaults
+ *        (chat template applied, package render context, package sampling
+ *        policy).
+ * @param outputText Buffer to store output text
+ * @return ErrorCode; CAUSAL_LM_ERROR_INFERENCE_FAILED when a chat template is
+ *         present but cannot render the prompt -- the prompt is never quietly
+ *         downgraded to raw text behind the caller's back.
+ */
+WIN_EXPORT ErrorCode runModelWithOptions(const char *inputTextPrompt,
+                                         const GenerationOptions *options,
+                                         const char **outputText);
 
 /**
  * @brief Run synchronous inference and stream decoded output deltas.

@@ -344,6 +344,54 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  unittest_load_api = executable(
+    'unittest_load_api',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_load_api.cpp',
+    ],
+    dependencies: [
+      nntrainer_dep,
+      nntrainer_ccapi_dep,
+      gtest_main_dep,
+      causallm_layer_dependencies,
+      causallm_dep
+    ],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_load_api', unittest_load_api,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_load_api'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  # Prompt-preparation seam: no model, no backend, no tokenizer -- the shared
+  # chat-template source plus gtest, so it runs anywhere the app builds.
+  # Appended after the last existing test block rather than inserted mid-list:
+  # a new executable()/test() pair added at the same anchor as another branch's
+  # merges as two interleaved conflicts (the block tails are identical text),
+  # which meson then rejects with "Expecting rparen got id".
+  unittest_chat_template = executable(
+    'unittest_chat_template',
+    [
+      meson.current_source_dir() / 'unittest_chat_template.cpp',
+      meson.current_source_dir() / 'chat_template.cpp',
+    ],
+    dependencies: [gtest_main_dep],
+    include_directories: [causallm_inc, causallm_inc_minja_inc,
+                          causallm_inc_nlohmann_inc],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_chat_template', unittest_chat_template,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_chat_template'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # Ubuntu native builds use platform=none.
   model_unittest_platforms = ['none', 'windows', 'android']
   platform = get_option('platform')

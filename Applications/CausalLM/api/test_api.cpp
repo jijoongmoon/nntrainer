@@ -14,6 +14,7 @@
 #include "causal_lm_api.h"
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -114,7 +115,75 @@ void printUsage(const char *program_name) {
 }
 } // namespace
 
+/**
+ * @brief Model-package mode: drive the API the way an SDK consumer does.
+ *
+ * Prints the generated text between two fixed markers and nothing else, so the
+ * result can be compared byte for byte against the command line runner's
+ * output for the same prompt and package -- the equivalence check that keeps
+ * the two front ends honest about prompt handling.
+ *
+ * Usage: test_api <model_dir> <prompt> [raw] [chat_context_json]
+ *   raw               "raw" feeds the prompt verbatim (template opt-out)
+ *   chat_context_json extra render keys, e.g. {"enable_thinking":false}
+ */
+int runModelPackage(int argc, char *argv[]) {
+  const char *model_dir = argv[1];
+  const char *prompt = (argc >= 3) ? argv[2] : "Hello, how are you?";
+  const bool raw = (argc >= 4) && std::string(argv[3]) == "raw";
+  const char *chat_context = (argc >= 5) ? argv[4] : nullptr;
+
+  Config config;
+  config.use_chat_template = !raw;
+  config.debug_mode = false;
+  config.verbose = false;
+  if (setOptions(config) != CAUSAL_LM_ERROR_NONE) {
+    std::cerr << "setOptions failed\n";
+    return 1;
+  }
+
+  ErrorCode err = loadModelFromPath(CAUSAL_LM_BACKEND_CPU, model_dir);
+  if (err != CAUSAL_LM_ERROR_NONE) {
+    std::cerr << "loadModelFromPath failed: " << static_cast<int>(err) << "\n";
+    return 1;
+  }
+
+  GenerationOptions options;
+  options.apply_chat_template = !raw;
+  options.chat_context_json = chat_context;
+  options.do_sample = -1; // follow the package, like the runner
+
+  const char *output = nullptr;
+  err = runModelWithOptions(prompt, &options, &output);
+  if (err != CAUSAL_LM_ERROR_NONE) {
+    std::cerr << "runModelWithOptions failed: " << static_cast<int>(err)
+              << "\n";
+    return 1;
+  }
+
+  std::cout << "\n===SDK_OUTPUT_BEGIN===\n"
+            << (output != nullptr ? output : "") << "\n===SDK_OUTPUT_END===\n";
+
+  PerformanceMetrics metrics;
+  if (getPerformanceMetrics(&metrics) == CAUSAL_LM_ERROR_NONE) {
+    std::cout << "prefill_tokens=" << metrics.prefill_tokens
+              << " prefill_ms=" << metrics.prefill_duration_ms
+              << " generation_tokens=" << metrics.generation_tokens
+              << " init_ms=" << metrics.initialization_duration_ms << "\n";
+  }
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
+  // An argument that names a model-package directory selects the
+  // SDK-consumer mode; anything else keeps the original built-in
+  // ::ModelType flow below. Probing for the package's config.json is the
+  // reliable test -- a package can be named by a relative path with no
+  // separator in it at all.
+  if (argc >= 2 &&
+      std::filesystem::exists(std::filesystem::path(argv[1]) / "config.json"))
+    return runModelPackage(argc, argv);
+
   printLogo();
 
   if (argc < 2) {
