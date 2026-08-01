@@ -439,6 +439,44 @@ void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
                             (uint8_t *)rhs_native_mtx_qs4c32);
 }
 
+// i8mm-gated, matching the loader-side contract this dispatch seam assumes
+// (see half_tensor.cpp): the KAI rhs-packed weight is packed once, ahead of
+// time, for the qai8dxp4x8/qsi4cxp4x8 pack family (nr=4 kr=16 sr=2). Locking
+// to that family (rather than also falling back to the dotprod-only
+// nr=4/kr=8/sr=2 family on non-i8mm ARM) avoids a silent pack-layout
+// mismatch — the loader-side packer does not exist in-tree yet (deferred to
+// the QS4CX-FP16 host-FC infra track), so there is nothing to confirm it
+// would target the other family too.
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+template <>
+void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
+                                      void *lhs_native_mtx_f16,
+                                      void *rhs_packed_mtx_qs4cx,
+                                      _FP16 *dst_act_mtx_f16,
+                                      uint32_t idx_variant, bool transB,
+                                      _FP16 lower_bound, _FP16 upper_bound) {
+  // Routes to the upstream qai8dxp/qsi4cxp f16 ukernel family
+  // (kleidiai_interface_f16_qai8dxp_qsi4cxp.cpp's ukernel_variants[]) — GEMV
+  // (idx 1: qai8dxp1x8_qsi4cxp4x8_1x4_neon_dotprod, mr=1) for a single-row
+  // decode step, GEMM (idx 3: qai8dxp4x8_qsi4cxp4x8_16x4_neon_i8mm, mr=4)
+  // otherwise. idx_variant is informational here, not a caller-selectable
+  // choice: both indices share nr=4 kr=16 sr=2, so rhs_packed_mtx_qs4cx —
+  // packed once at load for that {nr,kr,sr} family — is valid for either
+  // without repacking; only mr (the LHS pack block / compute microkernel)
+  // differs between them. transB is not part of
+  // __kai_gemm_f16_qai8dxp_qsi4cxp's contract: the packed rhs is always
+  // nxk-packed-as-transposed by construction.
+  (void)idx_variant;
+  (void)transB;
+  static constexpr uint32_t kGemvVariant = 1;
+  static constexpr uint32_t kGemmVariant = 3;
+  const uint32_t variant = (m == 1) ? kGemvVariant : kGemmVariant;
+  __kai_gemm_f16_qai8dxp_qsi4cxp(
+    m, n, k, lhs_native_mtx_f16, rhs_packed_mtx_qs4cx, dst_act_mtx_f16, variant,
+    static_cast<float>(lower_bound), static_cast<float>(upper_bound));
+}
+#endif // defined(__ARM_FEATURE_MATMUL_INT8)
+
 size_t nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(size_t n, size_t k,
                                                   uint32_t idx_variant,
                                                   bool transB) {

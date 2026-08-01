@@ -35,12 +35,25 @@
  * x86 only for now: the case widens the activation to FP32 and calls
  * gemm_qai8dxp_qsi4cxp_rhs_unpacked(), which consumes the plain (unpacked)
  * QS4CX blob x86 keeps in memory. On ARM the same weight is KAI rhs-packed
- * (Tensor::pack()), so the unpacked kernel cannot read it and the packed
- * FP16 KleidiAI micro-kernels are not dispatched yet. When a backend gains a
- * case, extend this macro and the switch case together.
+ * (Tensor::pack()), so the unpacked kernel cannot read it -- there the packed
+ * FP16 KleidiAI qai8dxp/qsi4cxp micro-kernels are dispatched instead, which is
+ * the second backend below. When a backend gains a case, extend this macro and
+ * the switch case together.
+ *
+ * Two backends carry a case today, and they are mutually exclusive by
+ * architecture:
+ *   - x86: widens the activation to FP32 and calls
+ *     gemm_qai8dxp_qsi4cxp_rhs_unpacked() on the plain (unpacked) QS4CX blob.
+ *   - ARM with i8mm: calls nntr_gemm_qai8dxp_qsi4cxp_packed<_FP16>() on the KAI
+ *     rhs-packed buffer, with no FP16<->FP32 cast pass.
  */
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||              \
   defined(__i386__)
+#define NNTR_HAS_HOST_QS4CX_FP16_GEMM 1
+#elif (defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                     \
+       defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||          \
+       defined(_M_ARM64)) &&                                                   \
+  defined(__ARM_FEATURE_MATMUL_INT8)
 #define NNTR_HAS_HOST_QS4CX_FP16_GEMM 1
 #else
 #define NNTR_HAS_HOST_QS4CX_FP16_GEMM 0
