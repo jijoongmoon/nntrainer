@@ -34,6 +34,7 @@
 #include <embedding_layer.h>
 #include <mha_core.h>
 #include <neuralnet.h>
+#include <nntrainer_log.h>
 #include <per_layer_slice_gpu.h>
 #include <qs4cx_tensor.h>
 #include <reshaped_rms_norm.h>
@@ -648,6 +649,78 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   return decoder_output({residual, ffn_out});
 }
 
+unsigned int Transformer::getLayerSlidingWindow(int layer_id) const {
+  // Mirrors the `sliding_window` property createAttention() sets below: every
+  // layer whose 1-based index is NOT a multiple of the pattern is a sliding
+  // layer. Models that read an explicit per-layer `layer_types` array from the
+  // config override this.
+  // Expression copied verbatim from createAttention() (unsigned modulo, as
+  // before) so this refactor is semantics-preserving.
+  return (layer_id + 1) % SLIDING_WINDOW_PATTERN ? SLIDING_WINDOW : UINT_MAX;
+}
+
+std::vector<unsigned int>
+Transformer::computeKVRingCaps(unsigned int max_seq) const {
+  const unsigned int n_layers = static_cast<unsigned int>(NUM_LAYERS);
+  std::vector<unsigned int> caps(n_layers, 0u);
+
+  unsigned int n_sliding = 0, n_ringed = 0;
+  unsigned int a_window = 0, a_cap = 0; // a representative W / Wcap for the log
+  for (unsigned int i = 0; i < n_layers; ++i) {
+    const unsigned int w = getLayerSlidingWindow(static_cast<int>(i));
+    const bool sliding = (w != 0 && w < max_seq);
+    if (sliding) {
+      ++n_sliding;
+      a_window = w;
+    }
+    caps[i] = kvRingCap(w, max_seq);
+    if (caps[i] != 0) {
+      ++n_ringed;
+      a_cap = caps[i];
+    }
+  }
+
+  // Observability line (one per KV-cache allocation, i.e. once per model load).
+  // A prior 200+ run matrix was measured believing
+  // the ring was on while kvRingCap() had silently collapsed to 0 (derived cap
+  // >= the package's max_seq_len), so print the resolved inputs AND the verdict
+  // unconditionally at model load -- never make a measurement assume.
+  {
+    const char *ring_env = std::getenv("NNTR_KV_WINDOW_RING");
+    const bool ring_off = (ring_env && ring_env[0] == '0');
+    const unsigned int C = effectivePrefillChunk();
+    char verdict[256];
+    if (ring_off)
+      std::snprintf(verdict, sizeof(verdict),
+                    "NOT ENGAGED -- NNTR_KV_WINDOW_RING=0 (explicit opt-out)");
+    else if (n_sliding == 0)
+      std::snprintf(verdict, sizeof(verdict),
+                    "NOT ENGAGED -- no sliding-window layer (full attention "
+                    "keeps the linear max_seq cache)");
+    else if (C == 0)
+      std::snprintf(verdict, sizeof(verdict),
+                    "NOT ENGAGED -- prefill chunk is 0, the ring needs chunked "
+                    "prefill to bound the live key span (set "
+                    "NNTR_PREFILL_CHUNK)");
+    else if (n_ringed == 0)
+      std::snprintf(verdict, sizeof(verdict),
+                    "NOT ENGAGED -- derived cap %u >= max_seq %u, so the ring "
+                    "would not shrink anything (LONG CONTEXT ONLY: raise "
+                    "max_seq_len or lower NNTR_PREFILL_CHUNK)",
+                    (a_window / C + 2u) * C, max_seq);
+    else
+      std::snprintf(verdict, sizeof(verdict),
+                    "ENGAGED cap=%u rows on %u/%u layers (saves %u rows/layer)",
+                    a_cap, n_ringed, n_layers, max_seq - a_cap);
+    ml_logi("[kv-ring] chunk=%u max_seq=%u layers=%u (%u sliding W=%u / "
+            "%u full): %s",
+            C, max_seq, n_layers, n_sliding, a_window, n_layers - n_sliding,
+            verdict);
+  }
+
+  return caps;
+}
+
 /**
  * @brief Create external KV-cache placeholder tensors for one layer.
  */
@@ -656,8 +729,17 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
   const unsigned int kv_width =
     static_cast<unsigned int>(HEAD_DIM * n_heads / GQA_SIZE);
+  // A sliding-window layer only needs a Wcap-row ring, not the
+  // full max_seq. The window comes from getLayerSlidingWindow(), the same hook
+  // that fills this layer's `sliding_window` property, so the placeholder, the
+  // KVCacheManager allocation and mha_core's modulo index cannot disagree.
+  // kvRingCap() returns 0 (=> keep max_seq) when the ring is off or would not
+  // shrink anything, so the default path is unchanged.
+  const unsigned int ring_cap =
+    kvRingCap(getLayerSlidingWindow(layer_id), max_timestep);
+  const unsigned int cache_rows = ring_cap ? ring_cap : max_timestep;
   const std::string cache_shape = std::to_string(BATCH_SIZE) +
-                                  ":1:" + std::to_string(max_timestep) + ":" +
+                                  ":1:" + std::to_string(cache_rows) + ":" +
                                   std::to_string(kv_width);
 
   // KV caches MUST be created as "input" layers (not plain Tensors). Plain
@@ -735,9 +817,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
      withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
      withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
-     withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
-                                 ? SLIDING_WINDOW
-                                 : UINT_MAX),
+     withKey("sliding_window", getLayerSlidingWindow(layer_id)),
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),

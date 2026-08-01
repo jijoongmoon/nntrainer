@@ -2493,7 +2493,8 @@ bool flash_attention_prefill_f16_cl(
   const uint16_t *Q_host, const uint16_t *K_host, const uint16_t *V_host,
   uint16_t *O_host, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
-  bool causal, bool svm_inputs, float attn_softcap, unsigned int local_window) {
+  bool causal, bool svm_inputs, float attn_softcap, unsigned int local_window,
+  unsigned int ring_cap) {
   if (num_heads_Q == 0 || num_heads_KV == 0 || head_dim == 0 || M == 0 ||
       N_kv == 0)
     return false;
@@ -2896,20 +2897,22 @@ bool flash_attention_prefill_f16_cl(
       return false;
     // Argument 15 of a Block-Q-family prefill kernel is the KV ring capacity:
     // >0 means the K/V buffers hold only that many PHYSICAL rows while N_kv
-    // stays the logical key count, so the kernel reads row (n % cap).  This
-    // build has no ring, hence 0 (linear KV) -- but the XMX kernel still
-    // declares and binds the slot, because a caller that does supply a cap
-    // must not hit CL_INVALID_ARG_INDEX here: bind_all() would return false,
-    // the whole flash path would report failure and mha_core would silently
-    // fall back to host attention on every full-attention prefill call.
-    // Bound BEFORE the flash_blockq block on purpose, so that a build which
-    // binds a real capacity for the whole Block-Q family overrides it.
-    const int ring_cap_i = 0;
+    // stays the logical key count, so the kernel reads row (n % cap). The
+    // window / causal masks stay in absolute space, which is why ring-on ==
+    // ring-off at a fixed chunk.
+    //
+    // The XMX kernel declares the slot too, and it MUST be bound there as
+    // well: a caller that supplies a cap would otherwise hit
+    // CL_INVALID_ARG_INDEX, bind_all() would return false, the whole flash
+    // path would report failure and mha_core would silently fall back to host
+    // attention on every full-attention prefill call.
+    const int ring_cap_i = (int)ring_cap;
     if (kk_is_xmx && !kk->SetKernelArguments(15, &ring_cap_i, sizeof(int)))
       return false;
     if (flash_blockq) {
       if (!kk->SetKernelArguments(13, &attn_softcap, sizeof(float)) ||
-          !kk->SetKernelArguments(14, &win_arg, sizeof(int)))
+          !kk->SetKernelArguments(14, &win_arg, sizeof(int)) ||
+          !kk->SetKernelArguments(15, &ring_cap_i, sizeof(int)))
         return false;
     }
     return true;
@@ -3076,7 +3079,8 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
                          unsigned int N_kv, unsigned int num_heads_Q,
                          unsigned int num_heads_KV, unsigned int head_dim,
                          unsigned int max_seq_len, bool svm_inputs,
-                         float attn_softcap, unsigned int local_window) {
+                         float attn_softcap, unsigned int local_window,
+                         unsigned int ring_cap) {
   if (num_heads_Q == 0 || num_heads_KV == 0 || head_dim == 0 || N_kv == 0)
     return false;
   if (num_heads_Q % num_heads_KV != 0)
@@ -3160,6 +3164,11 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
       !kp->SetKernelArguments(13, &ck, sizeof(int)) ||
       !kp->SetKernelArguments(14, &nc, sizeof(int)))
     return false;
+  {
+    int ring_cap_i = (int)ring_cap; // ring: physical row = n % cap
+    if (!kp->SetKernelArguments(15, &ring_cap_i, sizeof(int)))
+      return false;
+  }
   {
     std::array<size_t, 1> gws = {(size_t)num_heads_Q * (size_t)n_chunks *
                                  (size_t)lws};

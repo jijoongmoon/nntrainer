@@ -158,9 +158,17 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     tokens.reserve((size_t)num_layers * 2);
     // All caches are live for the whole run; BasicPlanner gives each its own
     // (non-overlapping) region so the total pool is the sum of them.
+    //
+    // [kv-window-ring] The row count is getLayerCap(i), NOT max_seq_len --
+    // exactly as in the host branch below. This path did not exist when the
+    // ring was written, so it used to size every layer at max_seq while
+    // Transformer::createKVCachePlaceholders shaped the sliding layers at
+    // Wcap; on the default GPU lane (NNTR_GPU_SVM_POOL=1) the bind then threw
+    // "allocateAndBindKVCache: shape mismatch for layer 0
+    //  (k placeholder 1:1:3072:256 vs cache 1:1:32768:256)".
     for (unsigned int i = 0; i < num_layers; ++i) {
       const size_t bytes =
-        (size_t)batch_size * max_seq_len * kv_widths_[i] * elem_size;
+        (size_t)batch_size * getLayerCap(i) * kv_widths_[i] * elem_size;
       tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // key
       tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // value
     }
@@ -169,7 +177,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
 
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
-        {batch_size, 1, max_seq_len, kv_widths_[i]}, {format, dtype});
+        {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
       layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
       layer_caches_[i].key_cache.setData(svm_pool_->getMemory(tokens[2 * i]), 0,
                                          false);
@@ -177,14 +185,52 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
       layer_caches_[i].value_cache.setData(
         svm_pool_->getMemory(tokens[2 * i + 1]), 0, false);
     }
+    reportWindowRing(num_layers, batch_size, max_seq_len, dtype, "svm-pool");
     return;
   }
 
   for (unsigned int i = 0; i < num_layers; ++i) {
-    ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_widths_[i]},
-                                   {format, dtype});
+    // getLayerCap(i) is Wcap for a ringed sliding-window layer
+    // and max_seq_len otherwise, so the default (no setLayerCaps call)
+    // allocates exactly what it always did.
+    ml::train::TensorDim cache_dim(
+      {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
     layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
     layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
+  }
+
+  reportWindowRing(num_layers, batch_size, max_seq_len, dtype, "host");
+}
+
+void KVCacheManager::reportWindowRing(unsigned int num_layers,
+                                      unsigned int batch_size,
+                                      unsigned int max_seq_len,
+                                      ml::train::TensorDim::DataType dtype,
+                                      const char *where) {
+  {
+    // one-time memory witness, only when the ring engaged:
+    // KV rows actually allocated vs the full-max_seq baseline.
+    bool ring_on = false;
+    for (auto c : layer_caps_)
+      if (c > 0) {
+        ring_on = true;
+        break;
+      }
+    if (ring_on) {
+      const size_t es =
+        (dtype == ml::train::TensorDim::DataType::FP16) ? 2u : 4u;
+      size_t rows = 0, bytes = 0;
+      for (unsigned int i = 0; i < num_layers; ++i) {
+        rows += getLayerCap(i);
+        bytes += (size_t)batch_size * getLayerCap(i) * kv_widths_[i] * es * 2u;
+      }
+      std::fprintf(stderr,
+                   "[kvcache] window-ring (%s): %u layers, KV rows %zu (vs %zu "
+                   "full), %.1f MB\n",
+                   where, num_layers, rows, (size_t)num_layers * max_seq_len,
+                   bytes / (1024.0 * 1024.0));
+      std::fflush(stderr);
+    }
   }
 }
 
@@ -227,6 +273,16 @@ nntrainer::Tensor KVCacheManager::getKeyCacheWriteView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheWriteView: invalid layer_idx");
   }
+  // These convenience views index the cache LINEARLY from
+  // cache_pos_ / row 0. They have no consumer today (mha_core writes through
+  // the bound graph placeholder and applies its own ring modulo), and they are
+  // NOT ring-aware -- fail loud rather than hand out a view that would run past
+  // a Wcap buffer.
+  if (getLayerCap(layer_idx) != max_seq_len_) {
+    throw std::runtime_error(
+      "KVCacheManager: NYI -- linear cache view requested for a "
+      "window-ring layer (see setLayerCaps / kvRingCap)");
+  }
   if (cache_pos_ + step_size > max_seq_len_) {
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheWriteView: would exceed max_seq_len");
@@ -246,6 +302,16 @@ nntrainer::Tensor KVCacheManager::getValueCacheWriteView(
   if (layer_idx >= layer_caches_.size()) {
     throw std::out_of_range(
       "KVCacheManager::getValueCacheWriteView: invalid layer_idx");
+  }
+  // These convenience views index the cache LINEARLY from
+  // cache_pos_ / row 0. They have no consumer today (mha_core writes through
+  // the bound graph placeholder and applies its own ring modulo), and they are
+  // NOT ring-aware -- fail loud rather than hand out a view that would run past
+  // a Wcap buffer.
+  if (getLayerCap(layer_idx) != max_seq_len_) {
+    throw std::runtime_error(
+      "KVCacheManager: NYI -- linear cache view requested for a "
+      "window-ring layer (see setLayerCaps / kvRingCap)");
   }
   if (cache_pos_ + step_size > max_seq_len_) {
     throw std::out_of_range(
@@ -268,6 +334,16 @@ nntrainer::Tensor KVCacheManager::getKeyCacheReadView(unsigned int layer_idx,
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheReadView: invalid layer_idx");
   }
+  // These convenience views index the cache LINEARLY from
+  // cache_pos_ / row 0. They have no consumer today (mha_core writes through
+  // the bound graph placeholder and applies its own ring modulo), and they are
+  // NOT ring-aware -- fail loud rather than hand out a view that would run past
+  // a Wcap buffer.
+  if (getLayerCap(layer_idx) != max_seq_len_) {
+    throw std::runtime_error(
+      "KVCacheManager: NYI -- linear cache view requested for a "
+      "window-ring layer (see setLayerCaps / kvRingCap)");
+  }
   if (read_len > max_seq_len_) {
     throw std::out_of_range(
       "KVCacheManager::getKeyCacheReadView: read_len exceeds max_seq_len");
@@ -288,6 +364,16 @@ nntrainer::Tensor KVCacheManager::getValueCacheReadView(unsigned int layer_idx,
   if (layer_idx >= layer_caches_.size()) {
     throw std::out_of_range(
       "KVCacheManager::getValueCacheReadView: invalid layer_idx");
+  }
+  // These convenience views index the cache LINEARLY from
+  // cache_pos_ / row 0. They have no consumer today (mha_core writes through
+  // the bound graph placeholder and applies its own ring modulo), and they are
+  // NOT ring-aware -- fail loud rather than hand out a view that would run past
+  // a Wcap buffer.
+  if (getLayerCap(layer_idx) != max_seq_len_) {
+    throw std::runtime_error(
+      "KVCacheManager: NYI -- linear cache view requested for a "
+      "window-ring layer (see setLayerCaps / kvRingCap)");
   }
   if (read_len > max_seq_len_) {
     throw std::out_of_range(
@@ -314,6 +400,18 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len) const {
   if (seq_len > max_seq_len_) {
     throw std::out_of_range(
       "KVCacheManager::save: seq_len exceeds max_seq_len");
+  }
+  // A ringed layer's rows are modulo-indexed, so a linear
+  // [0, seq_len) slice is not the logical prefix -- and seq_len may exceed the
+  // layer's physical Wcap. Precomputed-cache save/load is a full-cache feature;
+  // fail loud instead of writing/reading the wrong rows.
+  for (unsigned int i = 0; i < layer_caches_.size(); ++i) {
+    if (getLayerCap(i) != max_seq_len_) {
+      throw std::runtime_error(
+        "KVCacheManager: NYI -- precomputed KV cache save/load with the "
+        "sliding-window ring enabled (set NNTR_KV_WINDOW_RING=0 for "
+        "save_kvcache / use_kvcache runs)");
+    }
   }
 
   std::ofstream f(path, std::ios::binary);
@@ -342,6 +440,18 @@ void KVCacheManager::load(const std::string &path, unsigned int seq_len) {
   if (seq_len > max_seq_len_) {
     throw std::out_of_range(
       "KVCacheManager::load: seq_len exceeds max_seq_len");
+  }
+  // A ringed layer's rows are modulo-indexed, so a linear
+  // [0, seq_len) slice is not the logical prefix -- and seq_len may exceed the
+  // layer's physical Wcap. Precomputed-cache save/load is a full-cache feature;
+  // fail loud instead of writing/reading the wrong rows.
+  for (unsigned int i = 0; i < layer_caches_.size(); ++i) {
+    if (getLayerCap(i) != max_seq_len_) {
+      throw std::runtime_error(
+        "KVCacheManager: NYI -- precomputed KV cache save/load with the "
+        "sliding-window ring enabled (set NNTR_KV_WINDOW_RING=0 for "
+        "save_kvcache / use_kvcache runs)");
+    }
   }
 
   std::ifstream f(path, std::ios::binary);
