@@ -677,4 +677,90 @@ std::string buildUserPrompt(const ChatTemplate *tmpl,
   return buildPrompt(tmpl, makeUserRequest(user_text, render_context), mode);
 }
 
+namespace {
+
+/**
+ * @brief Copy @a request with the last message's content replaced.
+ * @return false when there is no single string content to substitute
+ */
+bool substituteLastContent(const nlohmann::json &request,
+                           const std::string &content, nlohmann::json &out) {
+  out = request;
+
+  nlohmann::json *messages = nullptr;
+  if (out.is_array())
+    messages = &out;
+  else if (out.is_object() && out.contains("messages") &&
+           out["messages"].is_array())
+    messages = &out["messages"];
+
+  if (messages == nullptr || messages->empty())
+    return false;
+
+  nlohmann::json &last = messages->back();
+  if (!last.is_object() || !last.contains("content") ||
+      !last["content"].is_string())
+    return false;
+
+  last["content"] = content;
+  return true;
+}
+
+} // namespace
+
+PromptAffixes promptAffixes(const ChatTemplate *tmpl,
+                            const nlohmann::json &request,
+                            PromptTemplateMode mode,
+                            const nlohmann::json &render_context) {
+  PromptAffixes affixes;
+  if (tmpl == nullptr || mode == PromptTemplateMode::Never)
+    return affixes;
+
+  // The probes differ in their first byte and in their length, so neither
+  // boundary can be found one byte too far by accident. Both are non-empty
+  // and printable: a template that branches on "content is empty" would
+  // otherwise be measured in a shape it never renders in practice.
+  nlohmann::json probe_short;
+  nlohmann::json probe_long;
+  if (!substituteLastContent(request, "a", probe_short) ||
+      !substituteLastContent(request, "bb", probe_long))
+    return affixes;
+
+  std::string rendered_short;
+  std::string rendered_long;
+  try {
+    rendered_short = buildPrompt(tmpl, probe_short, mode, render_context);
+    rendered_long = buildPrompt(tmpl, probe_long, mode, render_context);
+  } catch (const std::exception &) {
+    // A template that will not render a one-character turn says nothing about
+    // its affixes. Report "no claim" rather than a guess; the real render is
+    // still attempted by the caller, and still reports its own failure.
+    return affixes;
+  }
+
+  size_t prefix = 0;
+  while (prefix < rendered_short.size() && prefix < rendered_long.size() &&
+         rendered_short[prefix] == rendered_long[prefix])
+    ++prefix;
+
+  size_t suffix = 0;
+  while (suffix < rendered_short.size() - prefix &&
+         suffix < rendered_long.size() - prefix &&
+         rendered_short[rendered_short.size() - 1 - suffix] ==
+           rendered_long[rendered_long.size() - 1 - suffix])
+    ++suffix;
+
+  // prefix + 1 + suffix and prefix + 2 + suffix are the only lengths a plain
+  // wrap can produce for these two probes. Anything else -- content escaped,
+  // trimmed, counted, or emitted more than once -- means the affix bytes are
+  // not a fixed frame around the content, so there is nothing safe to report.
+  if (rendered_short.size() != prefix + 1 + suffix ||
+      rendered_long.size() != prefix + 2 + suffix)
+    return affixes;
+
+  affixes.prefix_bytes = prefix;
+  affixes.suffix_bytes = suffix;
+  return affixes;
+}
+
 } // namespace causallm

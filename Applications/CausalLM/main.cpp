@@ -290,6 +290,11 @@ int main(int argc, char *argv[]) {
     // RENDER failure moves later, and that is not discoverable without
     // rendering.
     bool render_chat_input = false;
+
+    // Byte extents of whatever the template wraps around the prompt. Stays
+    // {0, 0} for a literal argv[2] prompt and for a package with no template:
+    // there is no rendered frame to protect, so truncation stays as it was.
+    causallm::PromptAffixes prompt_affixes;
     if (argc >= 3) {
       input_text = argv[2];
     } else {
@@ -336,13 +341,24 @@ int main(int argc, char *argv[]) {
     // callers that template their own input rely on those bytes arriving
     // verbatim.
     if (render_chat_input) {
+      const json render_context = causallm::chatTemplateContext(nntr_cfg);
       input_text = causallm::buildPrompt(
         &chat_template.value(), nntr_cfg["chat_input"],
-        causallm::PromptTemplateMode::Auto,
-        causallm::chatTemplateContext(nntr_cfg));
+        causallm::PromptTemplateMode::Auto, render_context);
+      // Same request, same context: the frame measured here is the frame of
+      // the string above, not of some other render of the same input.
+      prompt_affixes = causallm::promptAffixes(
+        &chat_template.value(), nntr_cfg["chat_input"],
+        causallm::PromptTemplateMode::Auto, render_context);
       system_head_prompt.clear();
       system_tail_prompt.clear();
     }
+
+    // Let the runner keep the rendered frame if the prompt has to be shortened
+    // to fit the prefill window; see CausalLM::setPromptAffixBytes.
+    if (auto *causal_lm = dynamic_cast<causallm::CausalLM *>(model.get()))
+      causal_lm->setPromptAffixBytes(prompt_affixes.prefix_bytes,
+                                     prompt_affixes.suffix_bytes);
 
     bool do_sample = generation_cfg.value("do_sample", false);
 

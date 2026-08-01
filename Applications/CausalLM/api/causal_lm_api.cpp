@@ -322,11 +322,22 @@ static const char *get_model_name_from_type(ModelType type) {
 }
 
 /**
+ * @brief A rendered prompt together with the extents of the template's frame.
+ *
+ * The affixes travel with the bytes because the runner has to be able to
+ * shorten the prompt without deleting the assistant-turn marker, and by the
+ * time it sees the prompt the structure is gone -- it holds a string.
+ */
+struct RenderedPrompt {
+  std::string text;
+  causallm::PromptAffixes affixes;
+};
+
+/**
  * @brief Render the prompt through the loaded package's chat template.
  *
- * Delegates to causallm::buildUserPrompt(), the same seam the runner uses, so
- * one prompt plus one model package produces one prompt string on either
- * front end.
+ * Delegates to the same seam the runner uses, so one prompt plus one model
+ * package produces one prompt string on either front end.
  *
  * The per-architecture template table that used to live here is gone on
  * purpose. It was a second template implementation keyed on the architecture
@@ -338,13 +349,13 @@ static const char *get_model_name_from_type(ModelType type) {
  * @throw std::exception from the renderer -- the caller gets an error instead
  *        of a quietly raw prompt.
  */
-static std::string apply_chat_template(const std::string &input,
-                                       const json &call_context) {
+static RenderedPrompt apply_chat_template(const std::string &input,
+                                          const json &call_context) {
   if (!g_chat_template) {
     std::cerr << "[Warning] No chat template in the loaded model package; "
                  "feeding the prompt as given."
               << std::endl;
-    return input;
+    return RenderedPrompt{input, causallm::PromptAffixes{}};
   }
 
   json context = g_chat_template_context;
@@ -353,8 +364,18 @@ static std::string apply_chat_template(const std::string &input,
       context[it.key()] = it.value();
   }
 
-  return causallm::buildUserPrompt(g_chat_template.get(), input,
-                                   causallm::PromptTemplateMode::Auto, context);
+  // One request object renders the prompt and measures the template's own
+  // frame around it, so the two cannot end up describing different renders.
+  // This is what buildUserPrompt() does internally; it is spelled out only
+  // because the runner needs the frame as well as the bytes.
+  const json request = causallm::makeUserRequest(input, context);
+
+  RenderedPrompt rendered;
+  rendered.text = causallm::buildPrompt(g_chat_template.get(), request,
+                                        causallm::PromptTemplateMode::Auto);
+  rendered.affixes = causallm::promptAffixes(
+    g_chat_template.get(), request, causallm::PromptTemplateMode::Auto);
+  return rendered;
 }
 
 /**
@@ -1005,13 +1026,22 @@ ErrorCode runModelWithOptions(const char *inputTextPrompt,
     auto *causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
 
     std::string input(inputTextPrompt);
+    causallm::PromptAffixes affixes;
 
     if (apply_template) {
-      input = apply_chat_template(input, parse_chat_context(context_json));
+      RenderedPrompt rendered =
+        apply_chat_template(input, parse_chat_context(context_json));
+      input = std::move(rendered.text);
+      affixes = rendered.affixes;
     }
 
-    if (causal_lm_model != nullptr)
+    if (causal_lm_model != nullptr) {
+      // Zero when the caller opted out: a raw prompt has no frame to protect,
+      // and saying so is what keeps its truncation behaviour unchanged.
+      causal_lm_model->setPromptAffixBytes(affixes.prefix_bytes,
+                                           affixes.suffix_bytes);
       causal_lm_model->prepareForRun();
+    }
     ActiveRunGuard active_run_guard(causal_lm_model);
     notifyAfterActiveRunPublishForTest();
 
@@ -1064,10 +1094,15 @@ ErrorCode runModelStreaming(const char *inputTextPrompt,
     }
 
     std::string input(inputTextPrompt);
+    causallm::PromptAffixes affixes;
 
     if (g_use_chat_template) {
-      input = apply_chat_template(input, json::object());
+      RenderedPrompt rendered = apply_chat_template(input, json::object());
+      input = std::move(rendered.text);
+      affixes = rendered.affixes;
     }
+    causal_lm_model->setPromptAffixBytes(affixes.prefix_bytes,
+                                         affixes.suffix_bytes);
 
     CallbackStreamer streamer;
     callback_streamer_init(&streamer, callback, user_data);
