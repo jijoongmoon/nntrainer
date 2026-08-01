@@ -908,16 +908,28 @@ void Manager::flushCacheExcept(unsigned int order) {
 
 void Manager::finalizeTensorPool(TensorPool &pool, unsigned int start,
                                  unsigned int end) {
-  if (enable_optimizations) {
-    if (exec_mode == ExecutionMode::INFERENCE && enable_fsu) {
-      //@todo change V3 and validate
-      pool.finalize(OptimizedV1Planner(), start, end);
-    } else {
-      pool.finalize(OptimizedV1Planner(), start, end);
-    }
-  } else {
+  // NNTR_MEM_PLANNER=basic|v1|v2|v3 selects the layout planner (default v1,
+  // the long-standing behavior). v3 is the gap-fill best-fit planner the
+  // upstream '@todo change V3 and validate' at this site pointed at -- V1
+  // only reuses freed slots of the EXACT same size, so heterogeneous
+  // activation sizes fragment; v3 fits new requests into any large-enough
+  // vacant interval. Mis-packing fails loud either way:
+  // MemoryPool::planLayout() -> validateLayout() throws on any overlap.
+  // NOTE: none of the planners pad for alignment -- offsets land on byte
+  // sums of the preceding tensors -- so alignment-sensitive consumers must
+  // keep their own guards (e.g. the cuda kvi8 dp4a base-alignment check).
+  static const char *planner_env = std::getenv("NNTR_MEM_PLANNER");
+  const std::string planner = planner_env ? planner_env : "";
+  if (!enable_optimizations || planner == "basic") {
     pool.finalize(BasicPlanner(), start, end);
+    return;
   }
+  if (planner == "v3")
+    pool.finalize(OptimizedV3Planner(), start, end);
+  else if (planner == "v2")
+    pool.finalize(OptimizedV2Planner(), start, end);
+  else
+    pool.finalize(OptimizedV1Planner(), start, end);
 }
 
 unsigned int Manager::inActive(unsigned int order) {
