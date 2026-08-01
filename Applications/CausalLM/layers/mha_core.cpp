@@ -688,15 +688,14 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
 /************************************************************** */
 
-#ifdef ENABLE_FP16
 // The RoPE LUT only needs to cover positions [0, max sequence). Models expose
 // max_position_embeddings (the theoretical RoPE max, e.g. Gemma4 = 131072) but
-// the live KV cache is only max_seq_len (e.g. 1024); sizing/uploading the LUT
-// at 131072 is a 128x waste (the rope angle theta_j is position-independent, so
-// a shorter LUT is exact). Cap to MaxTimestep (the model's max sequence).
-// NNTR_ROPE_LUT_CAP overrides for experiments. (Capping the
+// the live KV cache is only max_seq_len (e.g. 1024); sizing the LUT at 131072
+// is a 128x waste (the rope angle theta_j is position-independent, so a shorter
+// LUT is exact). Cap to MaxTimestep (the model's max sequence).
+// NNTR_ROPE_LUT_CAP overrides for experiments. (Capping the FP16 GPU-LUT's
 // per-layer-transition re-upload from ~33-67MB to ~256-512KB was worth ~+500
-// TPS at M=1024.)
+// TPS at M=1024; the host FP32 table below is the same waste in host RAM.)
 unsigned int MHACoreLayer::rope_lut_positions() const {
   unsigned int cap =
     (unsigned int)std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
@@ -707,6 +706,7 @@ unsigned int MHACoreLayer::rope_lut_positions() const {
   return cap;
 }
 
+#ifdef ENABLE_FP16
 void MHACoreLayer::ensure_rope_flat_lut() {
   const unsigned int half_ = head_dim / 2;
   const unsigned int mp = rope_lut_positions();
@@ -3594,7 +3594,7 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
     if (cached_freqs_cos == nullptr || cached_freqs_sin == nullptr) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      unsigned int fr_positions = max_position_embeddings;
+      unsigned int fr_positions = rope_lut_positions();
       precompute_freqs(head_dim, fr_positions, theta, false);
       cached_freqs_cos = freqs_cos;
       cached_freqs_sin = freqs_sin;

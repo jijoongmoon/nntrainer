@@ -604,11 +604,12 @@ private:
    *        the GPU-RoPE hot path as the fallback.
    */
   void ensure_rope_flat_lut();
-  /** @brief positions the RoPE LUT must cover = min(max_position_embeddings,
-   *  MaxTimestep). Avoids sizing/uploading the LUT at the theoretical RoPE max
-   *  (e.g. 131072) when the live cache is only max_seq_len. */
-  unsigned int rope_lut_positions() const;
 #endif
+  /** @brief positions the RoPE LUT must cover = min(max_position_embeddings,
+   *  MaxTimestep). Avoids sizing the LUT at the theoretical RoPE max
+   *  (e.g. 131072) when the live cache is only max_seq_len. Not FP16-specific:
+   *  the host FP32 RoPE table is sized by it too. */
+  unsigned int rope_lut_positions() const;
 
   /**
    * @brief pre_compute frequencies for Rotary Embedding.
