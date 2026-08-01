@@ -39,7 +39,10 @@
  *     --output_format <fmt> Output container: 'bin' (default) or 'safetensors'
  *     --sidecar <mode>    mmap sidecar packaging of the embedding-0 and
  *                         per-layer-embedding lookup tables:
- *                         auto (default) | on | off
+ *                         auto (default) | on | off.
+ *                         Only an UNTIED table saved as Q4_0 / Q6_K can be
+ *                         split, so with the default --embd_dtype FP32 'auto'
+ *                         splits nothing and emits the single-file package.
  *
  *   Supported data types: FP32, FP16, Q4_0, Q4_K, Q6_K
  *
@@ -55,6 +58,9 @@
  *
  *     # Use a target nntr_config.json directly:
  *     nntr_quantize /path/to/qwen3-4b --config /path/to/target_nntr_config.json
+ *
+ *     # Require the mmap sidecar package (untied lookup table + Q4_0/Q6_K):
+ *     nntr_quantize /path/to/qwen3-4b --embd_dtype Q6_K --sidecar on
  */
 
 #include <algorithm>
@@ -244,9 +250,26 @@ std::string generateOutputBinName(const std::string &original_bin,
 // ===========================================================================
 // mmap sidecar packaging
 //
-// INVARIANT: a generated package carries its per-layer-embedding and
-// embedding-0 lookup tables as mmap'd sidecars unless explicitly asked not
-// to, and produces byte-identical output to the single-file form.
+// INVARIANT (stated as narrowly as the code actually guarantees it): when a
+// lookup table is ELIGIBLE, a generated package carries it as an mmap'd
+// sidecar unless explicitly asked not to, and the union of the emitted files
+// is byte-for-byte the single-file package. Eligible means all of:
+//
+//   * the table is one of the two the runtime has a config key for
+//     (embedding0 -> embedding_file_name, per_layer_input_embedding ->
+//     ple_file_name); and
+//   * it is an UNTIED "embedding_layer" graph node, not "tie_word_embeddings";
+//     and
+//   * it is saved in a row-block dtype the manifest loader reads --
+//     Q4_0 (out_dim % 32 == 0) or Q6_K (out_dim % 256 == 0), i.e.
+//     --embd_dtype Q4_0 / Q6_K; and
+//   * the output container is .bin.
+//
+// This is NARROWER than "the default package is now split": --embd_dtype
+// defaults to FP32, and FP32 has no row-block encoding, so a run that does not
+// ask for a quantized embedding still emits the single-file package under
+// `auto`. What flipped is the DEFAULT DECISION for eligible tables, not the
+// shape of every package.
 //
 // The runtime half has been in the tree for a while (embedding_layer.cpp reads
 // the manifests, transformer.cpp / gemma4_causallm.cpp consume the
@@ -340,7 +363,7 @@ struct SidecarPlan {
  * @brief Strip the container extension from an output weight filename
  */
 std::string stripWeightExtension(const std::string &name) {
-  for (const std::string ext :
+  for (const std::string &ext :
        {std::string(".safetensors"), std::string(".bin")}) {
     if (name.size() > ext.size() &&
         name.compare(name.size() - ext.size(), ext.size(), ext) == 0)
@@ -548,6 +571,14 @@ void printUsage(const char *prog) {
        "candidate\n"
     << "                                table cannot be split\n"
     << "                          off   emit the single-file package\n"
+    << "                        A table can be split only when it is UNTIED\n"
+    << "                        (an 'embedding_layer' node, not\n"
+    << "                        'tie_word_embeddings') AND saved as Q4_0 or\n"
+    << "                        Q6_K. --embd_dtype defaults to FP32, which has\n"
+    << "                        no sidecar row encoding, so 'auto' splits\n"
+    << "                        nothing unless --embd_dtype Q4_0 / Q6_K is\n"
+    << "                        also given. 'auto' prints the reason for every\n"
+    << "                        table it leaves in the bin.\n"
     << "  --no-sidecar          Alias for --sidecar off\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
@@ -573,6 +604,9 @@ void printUsage(const char *prog) {
     << "  # Use a target nntr_config.json:\n"
     << "  " << prog
     << " /path/to/qwen3-4b --config /path/to/target_nntr_config.json\n"
+    << "\n"
+    << "  # Require the mmap sidecar package (untied table + Q4_0/Q6_K):\n"
+    << "  " << prog << " /path/to/qwen3-4b --embd_dtype Q6_K --sidecar on\n"
     << "\n"
     << "  # Emit the single-file package (no mmap sidecars):\n"
     << "  " << prog << " /path/to/qwen3-4b --no-sidecar\n";
@@ -1013,12 +1047,18 @@ int main(int argc, char *argv[]) {
           continue; // this architecture has no such table -- not a blocker
 
         if (found->type != "embedding_layer") {
+          // Name the two knobs precisely: config.json's tie_word_embeddings is
+          // what EVERY model keys embedding-0 off (transformer.cpp:408), while
+          // lmhead_untie reaches embedding-0 only in Gemma4
+          // (gemma4_causallm.cpp:270 -- the base graph consults it for the
+          // head alone). Recommending the wrong one costs a full FP32 load.
           sidecar_blockers.emplace_back(
             std::string(candidate.layer_name) + " is a '" + found->type +
-            "' node: the sidecar path requires an UNTIED lookup table. Set "
-            "\"lmhead_untie\": true in nntr_config.json (models that support "
-            "it) or start from a checkpoint whose config.json has "
-            "\"tie_word_embeddings\": false.");
+            "' node: the sidecar path requires an UNTIED lookup table. Start "
+            "from a checkpoint whose config.json has "
+            "\"tie_word_embeddings\": false (works for every model), or -- for "
+            "Gemma4, the only architecture whose embedding-0 honours it -- set "
+            "\"lmhead_untie\": true in nntr_config.json.");
           continue;
         }
         if (found->rows == 0 || found->size == 0) {
