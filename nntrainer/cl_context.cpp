@@ -634,6 +634,17 @@ void ClContext::collectAttentionKernelTasks(
     out.push_back([this]() { v8c_prewarm_programs(*this); });
   }
 #endif
+
+  // Programs that would otherwise be built on their first dispatch, i.e.
+  // inside the first prefill and the first decode step. Collected by the
+  // translation unit that owns their sources AND the compile options its
+  // dispatch passes, because a prewarm with the wrong options builds a
+  // program the hot path never looks up: it pays the compile twice and
+  // removes nothing from the critical path.
+  //
+  // Appended to the SAME task list rather than run serially after it, so the
+  // build pool covers them too.
+  v8c_collect_lazy_program_tasks(*this, out);
 }
 
 void ClContext::initAttentionClKernels() {

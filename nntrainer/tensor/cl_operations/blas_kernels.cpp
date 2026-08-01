@@ -16,11 +16,14 @@
 
 #include "cl_tensor_view.h"
 #include "util_func.h"
+#include "v8c_pack_cache.h"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fp16.h>
+#include <thread>
 
 namespace nntrainer {
 
@@ -2495,9 +2498,90 @@ static bool v8c_hostptr_on() {
   return on;
 }
 
+// Submit-and-go weight uploads. The
+// blocking per-chunk write made every load worker pay a submit->wait round
+// trip per chunk even though the in-order queue already sequences all later
+// GEMMs after the writes — correctness needs NO barrier, only the staging
+// buffer's lifetime. Non-blocking writes hand their staging to this
+// registry; entries are freed once their event completes. Bounded: pushing
+// past the cap first drains everything queued so far.
+namespace {
+
+/**
+ * @brief One in-flight non-blocking weight upload: its completion event
+ *        plus the staging buffer that must outlive the transfer.
+ */
+struct V8cPendingUpload {
+  cl_event event = nullptr;
+  std::vector<uint8_t> staging;
+};
+
+std::mutex &v8c_pending_mtx() {
+  static std::mutex m;
+  return m;
+}
+std::vector<V8cPendingUpload> &v8c_pending_list() {
+  static std::vector<V8cPendingUpload> l;
+  return l;
+}
+std::atomic<size_t> v8c_pending_bytes{0};
+constexpr size_t V8C_PENDING_CAP_BYTES = 256u << 20;
+
+bool v8c_upload_async_on() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_V8C_UPLOAD_ASYNC");
+    return !(e && e[0] == '0'); // default ON; =0 restores blocking writes
+  }();
+  return on;
+}
+
+void v8c_wait_and_free(std::vector<V8cPendingUpload> &batch) {
+  for (auto &p : batch) {
+    if (p.event) {
+      clWaitForEvents(1, &p.event);
+      clReleaseEvent(p.event);
+    }
+  }
+  batch.clear();
+}
+
+void v8c_push_pending(cl_event ev, std::vector<uint8_t> &&staging) {
+  std::vector<V8cPendingUpload> overflow;
+  {
+    std::lock_guard<std::mutex> lock(v8c_pending_mtx());
+    auto &list = v8c_pending_list();
+    const size_t bytes = v8c_pending_bytes.load(std::memory_order_relaxed);
+    if (bytes + staging.size() > V8C_PENDING_CAP_BYTES) {
+      overflow.swap(list);
+      v8c_pending_bytes.store(0, std::memory_order_relaxed);
+    }
+    v8c_pending_bytes.fetch_add(staging.size(), std::memory_order_relaxed);
+    V8cPendingUpload p;
+    p.event = ev;
+    p.staging = std::move(staging);
+    list.push_back(std::move(p));
+  }
+  v8c_wait_and_free(overflow); // waits happen outside the lock
+}
+
+} // namespace
+
+void v8c_flush_pending_uploads() {
+  if (v8c_pending_bytes.load(std::memory_order_relaxed) == 0)
+    return;
+  std::vector<V8cPendingUpload> batch;
+  {
+    std::lock_guard<std::mutex> lock(v8c_pending_mtx());
+    batch.swap(v8c_pending_list());
+    v8c_pending_bytes.store(0, std::memory_order_relaxed);
+  }
+  v8c_wait_and_free(batch);
+}
+
 std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   const uint8_t *plain_nibbles, const float *fp32_scales, unsigned int N,
-  unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_int4_buf) {
+  unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_int4_buf,
+  const char *cache_name) {
   if (K % 32 != 0)
     throw std::invalid_argument(
       "make_v8c_weight_backing_from_qs4cx: K must be a multiple of 32");
@@ -2557,6 +2641,52 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   const size_t real_row_bytes = (size_t)K / 2;
   cl_command_queue cq = blas_cc->command_queue_inst_.GetCommandQueue();
 
+  // Cache hit: the permute and the row-sum fold are a deterministic pure
+  // function of the plain nibbles, so a validated record from a previous run
+  // is the same bytes this pass would produce. Upload it straight from the
+  // pack mapping -- no staging copy, no permute, no row-sum pass -- and drop
+  // the file pages per chunk, so the transient residency of the pack stays at
+  // one chunk instead of the whole payload.
+  bool from_cache = false;
+  if (!hostptr && cache_name != nullptr) {
+    v8c_pack::Hit hit;
+    if (v8c_pack::lookup(cache_name, N, K, v8c_row_bytes, total_bytes, hit)) {
+      constexpr size_t UP_CHUNK = 64u << 20;
+      cl_int werr = CL_SUCCESS;
+      for (size_t off = 0; off < total_bytes && werr == CL_SUCCESS;
+           off += UP_CHUNK) {
+        const size_t len = std::min(UP_CHUNK, total_bytes - off);
+        werr = clEnqueueWriteBuffer(cq, w_buf, CL_TRUE, off, len,
+                                    hit.payload + off, 0, nullptr, nullptr);
+        v8c_pack::Hit consumed;
+        consumed.payload = hit.payload + off;
+        consumed.payload_len = len;
+        v8c_pack::payload_consumed(consumed);
+      }
+      if (werr == CL_SUCCESS) {
+        std::memcpy(row_sum_w_int4.data(), hit.rowsum,
+                    (size_t)N * sizeof(int32_t));
+        from_cache = true;
+      }
+      // An upload error simply falls through to the derive below.
+    }
+  }
+
+  // Cache miss: tee each packed chunk to the pack's temp file as it is
+  // derived. The writes go to disjoint offsets, so loader workers deriving
+  // different weights stay independent, and the guard drops the record if
+  // anything below throws, so a half-derived weight is never indexed.
+  struct PackRecGuard {
+    v8c_pack::RecordWriter *rw = nullptr;
+    ~PackRecGuard() {
+      if (rw)
+        v8c_pack::abort_record(rw);
+    }
+  } pack_rec;
+  if (!from_cache && !hostptr && cache_name != nullptr)
+    pack_rec.rw =
+      v8c_pack::begin_record(cache_name, N, K, v8c_row_bytes, total_bytes);
+
   // hostptr: map the whole buffer once and build straight into it (no staging).
   uint8_t *map_ptr = nullptr;
   if (hostptr) {
@@ -2609,31 +2739,108 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     }
   };
 
-  // Pack into a bounded staging vector and upload with blocking writes; the
-  // in-order queue sequences later GEMMs after the writes. (The hostptr path
-  // packs straight into the mapped buffer.)
-  std::vector<uint8_t> packed;
-  if (!hostptr)
-    packed.assign(chunk_rows * v8c_row_bytes, 0);
-  for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
-    const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
-    uint8_t *dst;
-    if (hostptr) {
-      dst = map_ptr + n0 * v8c_row_bytes;
-    } else {
-      dst = packed.data();
-      std::memset(dst, 0, nrows * v8c_row_bytes); // padding stays 0
+  // For the big weights (in practice the untied lm_head,
+  // N=262144 -> 336MB) the single-threaded permute is the longest pole of
+  // model init even once the per-weight builds run concurrently (the map
+  // lock split in blas_kernel_interface.cpp). Pack+upload independent
+  // chunks from a small crew: staging stays bounded at workers x
+  // CHUNK_BYTES (4 x 16MB), blocking writes to disjoint offsets are
+  // thread-safe on the shared queue, and row_sum rows are disjoint. Small
+  // weights keep the serial path (thread spin-up would dominate).
+  constexpr size_t PAR_THRESHOLD_BYTES = 64u << 20;
+  const size_t n_chunks = ((size_t)N + chunk_rows - 1) / chunk_rows;
+  if (from_cache) {
+    // payload and row sums already came from the pack mapping above
+  } else if (!hostptr && total_bytes >= PAR_THRESHOLD_BYTES && n_chunks > 1) {
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0)
+      hw = 4;
+    const size_t n_workers =
+      std::min(std::min((size_t)hw, n_chunks), (size_t)4);
+    std::atomic<size_t> next_chunk{0};
+    std::atomic<cl_int> chunk_err{CL_SUCCESS};
+    std::vector<std::thread> crew;
+    crew.reserve(n_workers);
+    for (size_t t = 0; t < n_workers; ++t) {
+      crew.emplace_back([&]() {
+        std::vector<uint8_t> staging(chunk_rows * v8c_row_bytes);
+        for (;;) {
+          const size_t ci = next_chunk.fetch_add(1);
+          if (ci >= n_chunks || chunk_err.load() != CL_SUCCESS)
+            break;
+          const size_t n0 = ci * chunk_rows;
+          const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
+          std::memset(staging.data(), 0, nrows * v8c_row_bytes);
+          pack_rows(n0, nrows, staging.data());
+          v8c_pack::record_write(pack_rec.rw, n0 * v8c_row_bytes,
+                                 staging.data(), nrows * v8c_row_bytes);
+          const cl_int werr = clEnqueueWriteBuffer(
+            cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
+            staging.data(), 0, nullptr, nullptr);
+          if (werr != CL_SUCCESS)
+            chunk_err.store(werr);
+        }
+      });
     }
-    pack_rows(n0, nrows, dst);
-    if (!hostptr) {
-      const cl_int werr = clEnqueueWriteBuffer(
-        cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
-        packed.data(), 0, nullptr, nullptr);
-      if (werr != CL_SUCCESS) {
-        clReleaseMemObject(w_buf);
-        throw std::runtime_error(
-          "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
-          std::to_string(werr));
+    for (auto &th : crew)
+      th.join();
+    if (chunk_err.load() != CL_SUCCESS) {
+      clReleaseMemObject(w_buf);
+      throw std::runtime_error(
+        "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+        std::to_string(chunk_err.load()));
+    }
+  } else {
+    // Default: pack into a per-chunk staging vector,
+    // enqueue a NON-blocking write and hand the staging to the pending
+    // registry (freed on event completion). This removes the per-chunk
+    // submit->wait round trip from every load worker; the in-order queue
+    // sequences later GEMMs after the writes. NNTR_V8C_UPLOAD_ASYNC=0
+    // restores the blocking path (A/B lever).
+    const bool upload_async = !hostptr && v8c_upload_async_on();
+    std::vector<uint8_t> packed;
+    if (!hostptr && !upload_async)
+      packed.assign(chunk_rows * v8c_row_bytes, 0);
+    for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
+      const size_t nrows = std::min(chunk_rows, (size_t)N - n0);
+      std::vector<uint8_t> chunk_staging;
+      uint8_t *dst;
+      if (hostptr) {
+        dst = map_ptr + n0 * v8c_row_bytes;
+      } else if (upload_async) {
+        chunk_staging.assign(nrows * v8c_row_bytes, 0); // padding stays 0
+        dst = chunk_staging.data();
+      } else {
+        dst = packed.data();
+        std::memset(dst, 0, nrows * v8c_row_bytes); // padding stays 0
+      }
+      pack_rows(n0, nrows, dst);
+      v8c_pack::record_write(pack_rec.rw, n0 * v8c_row_bytes, dst,
+                             nrows * v8c_row_bytes);
+      if (!hostptr) {
+        if (upload_async) {
+          cl_event ev = nullptr;
+          const cl_int werr = clEnqueueWriteBuffer(
+            cq, w_buf, CL_FALSE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
+            chunk_staging.data(), 0, nullptr, &ev);
+          if (werr != CL_SUCCESS) {
+            clReleaseMemObject(w_buf);
+            throw std::runtime_error(
+              "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+              std::to_string(werr));
+          }
+          v8c_push_pending(ev, std::move(chunk_staging));
+        } else {
+          const cl_int werr = clEnqueueWriteBuffer(
+            cq, w_buf, CL_TRUE, n0 * v8c_row_bytes, nrows * v8c_row_bytes,
+            packed.data(), 0, nullptr, nullptr);
+          if (werr != CL_SUCCESS) {
+            clReleaseMemObject(w_buf);
+            throw std::runtime_error(
+              "make_v8c_weight_backing_from_qs4cx: chunk write failed: " +
+              std::to_string(werr));
+          }
+        }
       }
     }
   }
@@ -2648,6 +2855,14 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
     }
     clFinish(cq); // the unmap must land before the GEMM binds this weight
   }
+
+  // Derive finished: append the row sums, checksum the record and index it.
+  // A no-op when the guard holds no writer; commit_record owns the handle.
+  if (pack_rec.rw) {
+    v8c_pack::commit_record(pack_rec.rw, row_sum_w_int4.data(), N);
+    pack_rec.rw = nullptr;
+  }
+
   auto backing = std::make_unique<tv::TensorBacking>(
     ctx, w_buf, tv::Encoding::INT4_OFFSET, tv::Layout::ROW_MAJOR, total_bytes,
     /** owned */ true);
@@ -3377,6 +3592,34 @@ void cl_svm_unmap_force(void *ptr) {
   if (blas_cc && ptr)
     blas_cc->command_queue_inst_.enqueueSVMUnmap(ptr, nullptr,
                                                  /** force */ true);
+void v8c_collect_lazy_program_tasks(ClContext &cc,
+                                    std::vector<std::function<void()>> &out) {
+  // Deadlock: this runs inside ClContext bring-up, so nothing here -- neither
+  // this function nor the tasks it produces -- may reach ClContext::Global().
+  // v8c_use_buffer_path() does, and calling it from here re-enters the
+  // context's one-time initialization and waits on itself. Derive the same
+  // decision from the same inputs, using the caps of the context being
+  // brought up.
+  const bool buf_path = [&cc]() {
+    if (const char *e = std::getenv("NNTR_V8C_BUF"))
+      return std::atoi(e) != 0;  // explicit override (set wins)
+    return !cc.caps().image_v8c; // Intel => buffer
+  }();
+
+  // The v8c GEMM/activation-quantization program, with the options its own
+  // dispatch passes on this device. It is the largest source in the set, so
+  // it is collected first.
+  const std::string v8c_copts = buf_path ? kV8cBufCompileOpts : "";
+  out.push_back([&cc, v8c_copts]() {
+    cc.registerClKernel(int8_int4_gemm_v8c_kernel, "v8c_act_quant_f16_par",
+                        v8c_copts);
+  });
+
+  // The untied lm_head int4 GEMV program. It is otherwise built on the first
+  // decode step -- past the first token, but still a stall a user sees.
+  out.push_back([&cc]() {
+    cc.registerClKernel(lmhead_int4_v8c_kernel, "lmhead_int4_v8c_gemv");
+  });
 }
 
 } // namespace nntrainer

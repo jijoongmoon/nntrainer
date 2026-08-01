@@ -20,7 +20,9 @@
 #include <opencl_buffer_manager.h>
 #include <opencl_kernel.h>
 
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace nntrainer {
 
@@ -553,10 +555,26 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
  * the identical v8c backing/scale/row-sum the GEMM consumes.
  * @param[in] plain_nibbles QS4CX nibble payload (length N*((K+1)/2))
  * @param[in] fp32_scales   per-channel fp32 dequant scales (length N)
+ * @param[in] cache_name    stable weight identity (the tensor name) for the
+ *                          derive-once pack cache (v8c_pack_cache.h); nullptr
+ *                          disables caching for this build. On a validated hit
+ *                          the nibble permute and the row-sum fold are skipped
+ *                          and the upload streams from the mapped pack; on a
+ *                          miss the derive is teed to the pack writer. The
+ *                          result is byte-identical either way.
  */
 std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   const uint8_t *plain_nibbles, const float *fp32_scales, unsigned int N,
-  unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_int4_buf);
+  unsigned int K, cl_mem *out_scale_buf, cl_mem *out_row_sum_w_int4_buf,
+  const char *cache_name = nullptr);
+
+/**
+ * @brief Wait out and free any submit-and-go weight-upload staging queued by
+ *        make_v8c_weight_backing_from_qs4cx (NNTR_V8C_UPLOAD_ASYNC, default
+ *        on). Memory hygiene only: the in-order queue already sequences the
+ *        writes ahead of any later GEMM. Cheap no-op when nothing is pending.
+ */
+void v8c_flush_pending_uploads();
 
 /**
  * @brief 8/4/4 paper attention path: int8(act) × int8(weight) channel-wise
@@ -666,6 +684,24 @@ bool v8c_use_buffer_path();
  *        command-queue manager.
  */
 bool svm_pool_default_on();
+ * @brief Collect eager-build tasks for the v8c programs that would otherwise
+ *        be compiled on their first dispatch, inside the first prefill and the
+ *        first decode step.
+ *
+ * This translation unit owns both their sources and the compile options their
+ * dispatch passes, so the prewarmed program keys match the hot path's exactly;
+ * a prewarm built with different options produces a program that is never
+ * looked up, paying the compile twice and saving nothing.
+ *
+ * @note Runs inside ClContext bring-up: nothing on this path may call
+ *       ClContext::Global() (v8c_use_buffer_path() does), which would re-enter
+ *       the context's one-time initialization and deadlock.
+ *
+ * @param cc context being brought up, whose caps decide the compile options
+ * @param out task list to append to
+ */
+void v8c_collect_lazy_program_tasks(ClContext &cc,
+                                    std::vector<std::function<void()>> &out);
 
 } // namespace nntrainer
 #endif /* __BLAS_KERNELS_H__ */
