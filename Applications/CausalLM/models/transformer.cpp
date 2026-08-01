@@ -696,13 +696,13 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
-  LayerHandle ffn_up(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
-     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
-  Tensor up = ffn_up(input);
-
+  // Create gate BEFORE up: the model loader assigns file offsets in graph
+  // creation order (positional, not by name), and the converters write the
+  // FFN weights gate_proj -> up_proj -> down_proj (the HF convention). If up
+  // is created first, ffn_up loads the gate_proj bytes and ffn_gate loads the
+  // up_proj bytes, so swiglu computes silu(up)*gate instead of silu(gate)*up
+  // -- coherent-looking but wrong (the global gate/up swap; Gemma2/3/4 avoided
+  // it by overriding createMlp gate-first).
   LayerHandle ffn_gate(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
@@ -710,15 +710,17 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
      withKey("weight_initializer", "ones")}));
   Tensor gate = ffn_gate(input);
 
-  /// @note nntrainer binary stores mlp weights in up, gate order.
-  /// For backward compatibility,
-  /// * layers are in up, gate order
-  /// * swiglu input[0] = gate
-  /// * swiglu input[1] = up
+  LayerHandle ffn_up(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
+     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones")}));
+  Tensor up = ffn_up(input);
+
   LayerHandle swiglu(createLayer(
     "swiglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
-  Tensor act = swiglu({up, gate}, {1, 0});
+  Tensor act = swiglu({gate, up});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",

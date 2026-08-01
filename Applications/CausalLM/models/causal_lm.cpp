@@ -451,12 +451,55 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // Decode / registerOutputs in the generation loop.
   ensureTokenizer();
 
-  if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
-    SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
+  ///@note This fallback has to count the cached rows with the SAME tokenization
+  /// the save pass used to produce them: below, SAVE_KVCACHE encodes
+  /// prompt_ == system_prompt with add_special_tokens=true and then stores
+  /// SYS_PROMP_LEN = input_len. The 1-arg Encode drops the specials, so on a
+  /// BOS-prepending tokenizer this counted one row less than the cache
+  /// actually holds, and every absolute KV write derived from it
+  /// (prefill_from = SYS_PROMP_LEN + global_token_len) landed one slot early --
+  /// clobbering the last cached row and shifting every RoPE position by one.
+  ///
+  /// An EMPTY system prompt must not reach it either: Encode("", true) returns
+  /// the lone BOS on a BOS-prepending tokenizer (Gemma2: size 1), so deriving a
+  /// length from it fabricates a one-row prefix the cache never described --
+  /// load_kvcache() then restores one stale row, setKVCachePosition(1) shifts
+  /// every later position by one, and the prompt that really does open the
+  /// sequence loses its BOS at the same time. With no system prompt there is no
+  /// cached prefix to count, so the length stays 0 and load_kvcache(path, 0)
+  /// keeps failing loudly (TensorDim rejects a zero-height slice) on the
+  /// configuration that cannot be resolved here: sys_prompt_token_size unset,
+  /// a cache file present, and an empty system prompt.
+  if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0 &&
+      !system_prompt.empty())
+    SYS_PROMP_LEN =
+      tokenizer->Encode(system_prompt, /*add_special_tokens=*/true).size();
 
-  auto _input = tokenizer->Encode(prompt_);
-  ///@note insert bos token at the beginning of the input
-  // _input.insert(_input.begin(), BOS_TOKEN_ID);
+  ///@note Special tokens belong at sequence position 0 and nowhere else. This
+  /// encode produces the first tokens of the sequence when the cache is being
+  /// built from scratch (SAVE_KVCACHE) or when nothing has been written yet; it
+  /// is a CONTINUATION when a precomputed cache already supplies the first
+  /// SYS_PROMP_LEN rows, or when an earlier run() on this object wrote
+  /// global_token_len rows. Encoding a continuation with add_special_tokens
+  /// splices a mid-sequence BOS into the prompt for BOS-prepending tokenizers
+  /// (Gemma2: TemplateProcessing, add_bos_token=true) -- a token sequence the
+  /// model never saw in training, which also consumes one KV slot that real
+  /// prompt content needed.
+  const bool prompt_starts_sequence =
+    SAVE_KVCACHE || (SYS_PROMP_LEN + global_token_len) == 0;
+
+  ///@note add_special_tokens lets each model's OWN tokenizer decide
+  /// whether
+  /// to prepend a BOS, rather than hard-coding it. The 1-arg Encode skips
+  /// special tokens, so the leading BOS that Gemma2 (TemplateProcessing,
+  /// add_bos_token= true) needs was dropped -> short prompts degenerated into
+  /// pure repetition
+  /// ("The capital of France is" -> "is is is..."); long prompts masked it.
+  /// Verified to match HF add_special_tokens=True per model: Gemma2 gains its
+  /// BOS(2); models whose tokenizer adds no BOS (e.g. Qwen3 — ByteLevel post-
+  /// processor, add_bos_token=false) are byte-identical to the old behavior, so
+  /// they are unaffected. (sentence_transformer.cpp already encodes this way.)
+  auto _input = tokenizer->Encode(prompt_, prompt_starts_sequence);
 
   // | <------------------- MAX_SEQ_LEN -------------------> |
   //                       ||             ||
@@ -504,7 +547,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   unsigned int init_len = init_input.size();
   float *input_sample =
-    (float *)malloc(sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN);
+    (float *)calloc(BATCH_SIZE * MAX_SEQ_LEN, sizeof(float));
   std::vector<bool> eos_list(BATCH_SIZE, false);
 
   unsigned int input_len = init_len;
