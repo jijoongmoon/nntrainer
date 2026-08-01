@@ -42,13 +42,27 @@ enum LORAParams { loraA, loraB, loraTmp, loraOut };
 FullyConnectedLayer::FullyConnectedLayer() :
   LayerImpl(),
   lora_scaling(1.0f),
-  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha()),
+  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(),
+           props::FusedActivation()),
   quantizer(nullptr) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   lora_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
 void FullyConnectedLayer::finalize(InitLayerContext &context) {
+  // The fusion is a forward-only epilogue: calcDerivative()/calcGradient() do
+  // not chain the activation derivative. Reject it wherever a backward pass
+  // can run instead of silently dropping that term, the same posture the
+  // tflite exporter takes at its own boundary (node_exporter.cpp).
+  if (auto &fused_act = std::get<props::FusedActivation>(fc_props);
+      !fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
+    if (context.getExecutionMode() != ml::train::ExecutionMode::INFERENCE)
+      throw exception::not_supported(
+        "fused_activation on fully_connected is inference-only: the backward "
+        "pass does not chain the activation derivative. Use a standalone "
+        "activation layer for training.");
+  }
+
   auto &weight_regularizer =
     std::get<props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
@@ -249,6 +263,14 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
       hidden_.add_i(bias);
     }
   }
+
+  // Fused activation epilogue dispatched through the op table, so the
+  // fusion is backend-neutral: CpuComputeOps runs the host ActiFunc, a GPU
+  // ComputeOps can fuse it into the GEMM epilogue. Eliminates the separate
+  // ActivationLayer node; value-identical to it.
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+    hidden_.getOps()->apply_activation(hidden_, (int)fused_act.get());
 }
 
 void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
@@ -329,6 +351,14 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
         hidden_step.add_i(bias);
       }
     }
+
+    // Same fused activation epilogue as forwarding(), applied to this step's
+    // view only: hidden_ still holds the positions written by earlier
+    // incremental calls, so running it over the whole output would activate
+    // them a second time.
+    if (auto &fused_act = std::get<props::FusedActivation>(fc_props);
+        !fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+      hidden_step.getOps()->apply_activation(hidden_step, (int)fused_act.get());
   }
 }
 
