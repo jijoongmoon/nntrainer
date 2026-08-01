@@ -77,10 +77,6 @@ if get_option('enable-cuda')
   nntrainer_elements += 'cuda'
 endif
 
-if get_option('enable-cuda')
-  nntrainer_elements += 'cuda'
-endif
-
 if get_option('enable-npu')
   nntrainer_elements += 'qnn'
   # Note: qnn subdir is NOT processed here with the other elements.
