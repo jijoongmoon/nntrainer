@@ -244,7 +244,58 @@ private:
    */
   void initialize() noexcept override;
 
-  void add_default_object();
+  /**
+   * @brief Which of the default objects' kernel-registration helpers reported
+   *        success, so the layer factories can be registered afterwards
+   *        without re-running (or reordering) the kernel builds.
+   */
+  struct DefaultKernelResults {
+    bool fully_connected = false;
+    bool addition = false;
+    bool swiglu = false;
+    bool reshape = false;
+    bool rmsnorm = false;
+    bool concat = false;
+    bool transpose = false;
+  };
+
+  /**
+   * @brief Collect the eager kernel/program builds as independent tasks, so
+   *        initialize() can run all of them on one build pool.
+   *
+   * These three collectors are the single source of truth for the eager kernel
+   * set; initBlasClKernels() and initAttentionClKernels() are thin wrappers
+   * over them, and registerDefaultFactories() performs the layer-factory
+   * registration, which stays serial and in its original order because the
+   * auto-assigned integer keys depend on it.
+   *
+   * @param out task list to append to
+   */
+  void collectBlasKernelTasks(std::vector<std::function<void()>> &out);
+
+  /**
+   * @brief Collect the eager attention kernel builds as independent tasks
+   * @param out task list to append to
+   */
+  void collectAttentionKernelTasks(std::vector<std::function<void()>> &out);
+
+  /**
+   * @brief Collect the default objects' kernel builds as independent tasks
+   * @param out task list to append to
+   * @param results per-helper success flags, consumed by
+   *        registerDefaultFactories(); must outlive the pool join
+   */
+  void collectDefaultObjectKernelTasks(std::vector<std::function<void()>> &out,
+                                       DefaultKernelResults &results);
+
+  /**
+   * @brief Register the default layer factories for the helpers that reported
+   *        success. Serial and order-sensitive: the integer keys are assigned
+   *        by registration order.
+   *
+   * @param results per-helper success flags
+   */
+  void registerDefaultFactories(const DefaultKernelResults &results);
 
   // flag to check opencl commandqueue and context inititalization
   bool cl_initialized = false;

@@ -34,7 +34,7 @@ option('enable-npu', type: 'boolean', value: false)
 # See docs/backend_guide/QNN_BUILD.md for details.
 option('qnn-sdk-root', type: 'string', value: '')
 option('mmap-read', type: 'boolean', value: true)
-option('enable-kernel-caching', type: 'boolean', value: false)
+option('enable-kernel-caching', type: 'boolean', value: true)
 
 # dependency conflict resolution
 option('capi-ml-inference-actual', type: 'string', value: 'capi-ml-inference',

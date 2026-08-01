@@ -32,6 +32,17 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#include <fcntl.h>        // _O_RDONLY, _O_BINARY
+#include <io.h>           // _wopen, _close
+#include <mman_windows.h> // mmap/munmap (MapViewOfFile), PROT_READ, MAP_PRIVATE
+#endif
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -78,6 +89,59 @@ std::vector<uint8_t> readBinaryFile(const std::filesystem::path &path) {
   }
 
   return bytes;
+}
+
+/**
+ * @brief Attach the file's contents to the LUT — mmap'd read-only where
+ *        possible so the table pages in on demand instead of residing in
+ *        memory; falls back to a full read into lut.bytes.
+ */
+void attachPayload(QuantLut &lut, const std::filesystem::path &path) {
+#if !defined(_WIN32)
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd >= 0) {
+    struct stat st {};
+    if (::fstat(fd, &st) == 0 && st.st_size > 0) {
+      void *ptr = ::mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ,
+                         MAP_PRIVATE, fd, 0);
+      if (ptr != MAP_FAILED) {
+        // Token-id lookups are random access; don't let readahead pull the
+        // whole table into the page cache.
+        ::madvise(ptr, static_cast<size_t>(st.st_size), MADV_RANDOM);
+        ::close(fd); // mapping keeps its own reference
+        lut.mmap_ptr = ptr;
+        lut.mmap_len = static_cast<size_t>(st.st_size);
+        return;
+      }
+    }
+    ::close(fd);
+  }
+#else
+  // Windows: map the sidecar with MapViewOfFile via the mman shim
+  // (utils/mman_windows.h) instead of slurping it whole. MapViewOfFile faults
+  // pages on demand -- no whole-file readahead -- so the random token-id
+  // lookups keep only the touched rows resident, the same win MADV_RANDOM gives
+  // on POSIX (the shim has no madvise, and none is needed for that on-demand
+  // behaviour). Without this, readBinaryFile below pulled the entire sidecar
+  // into RAM (a large-vocab table can run to hundreds of MB), defeating the
+  // point of shipping it as a sidecar.
+  std::error_code ec;
+  const auto fsize = std::filesystem::file_size(path, ec);
+  if (!ec && fsize > 0) {
+    int fd = ::_wopen(path.wstring().c_str(), _O_RDONLY | _O_BINARY);
+    if (fd >= 0) {
+      void *ptr = ::mmap(nullptr, static_cast<size_t>(fsize), PROT_READ,
+                         MAP_PRIVATE, fd, 0);
+      ::_close(fd); // the view keeps its own file-mapping reference
+      if (ptr != MAP_FAILED) {
+        lut.mmap_ptr = ptr;
+        lut.mmap_len = static_cast<size_t>(fsize);
+        return;
+      }
+    }
+  }
+#endif
+  lut.bytes = readBinaryFile(path);
 }
 
 const nlohmann::json &requireJsonObjectField(const nlohmann::json &json,
@@ -150,12 +214,13 @@ void derivePacked4BitDimensions(QuantLut &lut,
     << ": 4-bit packed LUT requires even out_dim, got " << lut.out_dim;
 
   const size_t bytes_per_row = lut.out_dim / 2;
-  NNTR_THROW_IF(lut.bytes.empty() || lut.bytes.size() % bytes_per_row != 0,
+  NNTR_THROW_IF(lut.payload_size() == 0 ||
+                  lut.payload_size() % bytes_per_row != 0,
                 std::runtime_error)
-    << "LUT binary size " << lut.bytes.size()
+    << "LUT binary size " << lut.payload_size()
     << " is not consistent with out_dim=" << lut.out_dim;
 
-  lut.in_dim = lut.bytes.size() / bytes_per_row;
+  lut.in_dim = lut.payload_size() / bytes_per_row;
   NNTR_THROW_IF(lut.in_dim == 0, std::runtime_error)
     << "LUT binary has no rows: " << manifest_path;
 }
@@ -172,7 +237,7 @@ std::shared_ptr<QuantLut> loadUfixed8Manifest(const std::string &manifest_path,
   lut->offset = requireJsonIntField(quant_param, "offset", manifest_path);
   lut->is_raw_u16 = false;
   lut->is_signed4 = false;
-  lut->bytes = readBinaryFile(resolveLutPath(manifest_path, lut_path));
+  attachPayload(*lut, resolveLutPath(manifest_path, lut_path));
 
   derivePacked4BitDimensions(*lut, manifest_path);
   return lut;
@@ -193,7 +258,7 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
   lut->out_dim = requireJsonSizeField(json, "size", manifest_path);
   lut->is_raw_u16 = false;
   lut->is_signed4 = true;
-  lut->bytes = readBinaryFile(resolveLutPath(manifest_path, lut_path));
+  attachPayload(*lut, resolveLutPath(manifest_path, lut_path));
   lut->row_scales.reserve(quant_param.at("scale").size());
 
   for (const auto &scale : quant_param.at("scale")) {
@@ -208,6 +273,49 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
     << "sfixed4 row scale count " << lut->row_scales.size()
     << " does not match in_dim " << lut->in_dim << " for " << manifest_path;
 
+  return lut;
+}
+
+/**
+ * @brief GGML row-block sidecar: the payload is the byte-identical Q4_0/Q6_K
+ *        row table an in-bin embedding weight would hold, so decode reuses
+ *        dequantize_row_q{4_0,6_K} and the outputs match the in-bin path
+ *        bit-exactly. Manifest:
+ *          {"datatype": "q4_0"|"q6_k", "size": <out_dim>,
+ *           "rows": <in_dim, optional>, "lut-path": "<payload>"}
+ */
+std::shared_ptr<QuantLut> loadGgmlManifest(const std::string &manifest_path,
+                                           const nlohmann::json &json,
+                                           nntrainer::TensorDim::DataType dt) {
+  const auto lut_path = requireJsonStringField(json, "lut-path", manifest_path);
+
+  auto lut = std::make_shared<QuantLut>();
+  lut->out_dim = requireJsonSizeField(json, "size", manifest_path);
+  lut->ggml_dtype = dt;
+
+  const size_t block = (dt == nntrainer::TensorDim::DataType::Q6_K) ? 256 : 32;
+  const size_t block_bytes =
+    (dt == nntrainer::TensorDim::DataType::Q6_K) ? 210 : 18;
+  NNTR_THROW_IF(lut->out_dim % block != 0, std::invalid_argument)
+    << "Malformed LUT manifest " << manifest_path << ": size " << lut->out_dim
+    << " must be a multiple of the " << block << "-wide quant block";
+  lut->row_bytes = block_bytes * (lut->out_dim / block);
+
+  attachPayload(*lut, resolveLutPath(manifest_path, lut_path));
+  NNTR_THROW_IF(lut->payload_size() == 0 ||
+                  lut->payload_size() % lut->row_bytes != 0,
+                std::runtime_error)
+    << "LUT binary size " << lut->payload_size()
+    << " is not consistent with row stride " << lut->row_bytes << " for "
+    << manifest_path;
+  lut->in_dim = lut->payload_size() / lut->row_bytes;
+
+  if (json.contains("rows")) {
+    const size_t rows = requireJsonSizeField(json, "rows", manifest_path);
+    NNTR_THROW_IF(rows != lut->in_dim, std::invalid_argument)
+      << "LUT manifest " << manifest_path << " declares rows=" << rows
+      << " but payload holds " << lut->in_dim;
+  }
   return lut;
 }
 
@@ -238,10 +346,20 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
     return loadUfixed8Manifest(manifest_path, json);
   if (datatype == "sfixed4")
     return loadSfixed4Manifest(manifest_path, json);
+  if (datatype == "q4_0")
+    return loadGgmlManifest(manifest_path, json,
+                            nntrainer::TensorDim::DataType::Q4_0);
+  if (datatype == "q6_k")
+    return loadGgmlManifest(manifest_path, json,
+                            nntrainer::TensorDim::DataType::Q6_K);
 
   NNTR_THROW_IF(true, std::runtime_error)
     << "Unsupported LUT datatype '" << datatype << "' in " << manifest_path
-    << " (expected ufixed8 or sfixed4)";
+    << ": this sidecar loader supports 'ufixed8', 'sfixed4', 'q4_0', and "
+       "'q6_k' manifests (raw UINT16 tables use a non-.json path). A '"
+    << datatype
+    << "' sidecar needs the package regenerated with a supported LUT dtype, "
+       "or a loader extension for this payload format (not included here).";
   return nullptr;
 }
 
@@ -255,14 +373,13 @@ std::shared_ptr<QuantLut> loadRawU16(const std::string &path,
     << "Raw UINT16 LUT size overflows size_t for " << path;
 
   const size_t expected_size = in_dim_hint * out_dim_hint * sizeof(uint16_t);
-  auto bytes = readBinaryFile(path);
-  NNTR_THROW_IF(bytes.size() != expected_size, std::runtime_error)
-    << "Raw UINT16 LUT file size " << bytes.size()
+  auto lut = std::make_shared<QuantLut>();
+  attachPayload(*lut, path);
+  NNTR_THROW_IF(lut->payload_size() != expected_size, std::runtime_error)
+    << "Raw UINT16 LUT file size " << lut->payload_size()
     << " does not match in_dim*out_dim*2 (" << expected_size << ") for "
     << path;
 
-  auto lut = std::make_shared<QuantLut>();
-  lut->bytes = std::move(bytes);
   lut->in_dim = in_dim_hint;
   lut->out_dim = out_dim_hint;
   lut->is_raw_u16 = true;
@@ -342,7 +459,7 @@ void decodePacked4BitRowToFloatType(const QuantLut &lut, size_t token_idx,
     << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
 
   const size_t bytes_per_row = lut.out_dim / 2;
-  const uint8_t *row = lut.bytes.data() + token_idx * bytes_per_row;
+  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
 
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
@@ -354,6 +471,13 @@ void decodePacked4BitRowToFloatType(const QuantLut &lut, size_t token_idx,
 }
 
 } // namespace
+
+QuantLut::~QuantLut() {
+  // ::munmap resolves to the POSIX call or the mman_windows shim
+  // (UnmapViewOfFile) depending on platform; both accept (ptr, len).
+  if (mmap_ptr)
+    ::munmap(mmap_ptr, mmap_len);
+}
 
 std::shared_ptr<QuantLut> get_or_load_quant_lut(const std::string &path,
                                                 size_t in_dim_hint,
@@ -390,8 +514,8 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
   validateDecodeArgs(lut, token_idx, output_len);
 
   if (lut.is_raw_u16) {
-    const uint16_t *row = reinterpret_cast<const uint16_t *>(lut.bytes.data()) +
-                          token_idx * lut.out_dim;
+    const uint16_t *row =
+      reinterpret_cast<const uint16_t *>(lut.data()) + token_idx * lut.out_dim;
     std::memcpy(output, row, lut.out_dim * sizeof(uint16_t));
     return;
   }
@@ -400,7 +524,7 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
 
   const size_t bytes_per_row = lut.out_dim / 2;
-  const uint8_t *row = lut.bytes.data() + token_idx * bytes_per_row;
+  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
 
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
@@ -429,7 +553,7 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
 
   const size_t bytes_per_row = lut.out_dim / 2;
-  const uint8_t *row = lut.bytes.data() + token_idx * bytes_per_row;
+  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
 
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
@@ -531,6 +655,9 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
                                        unsigned int from, unsigned int to) {
   NNTR_THROW_IF(!quant_lut, std::runtime_error)
     << "Embedding sidecar LUT is not loaded";
+  NNTR_THROW_IF(quant_lut->ggml_dtype != nntrainer::TensorDim::DataType::NONE,
+                std::runtime_error)
+    << "GGML sidecar LUT must be decoded by incremental_forwarding";
   NNTR_THROW_IF(to < from, std::invalid_argument)
     << "Embedding incremental range is invalid";
 
@@ -617,7 +744,10 @@ void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
                                 bool training) {
   if (quant_lut) {
     nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
-    forwardSidecarLut(context, 0, input.width());
+    if (quant_lut->ggml_dtype != nntrainer::TensorDim::DataType::NONE)
+      incremental_forwarding(context, 0, input.width(), training);
+    else
+      forwardSidecarLut(context, 0, input.width());
   }
 }
 
@@ -633,17 +763,42 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                   : std::get<nntrainer::props::Scale>(embedding_props).get();
   unsigned int _from = from;
 
-  if (quant_lut) {
+  const bool ggml_lut =
+    quant_lut && quant_lut->ggml_dtype != nntrainer::TensorDim::DataType::NONE;
+  if (quant_lut && !ggml_lut) {
     forwardSidecarLut(context, from, to);
     return;
   }
 
-  nntrainer::Tensor &weight = context.getWeight(weight_idx);
+  // A GGML-format sidecar (q4_0/q6_k manifest) is decoded by this SAME loop
+  // as the in-bin weight -- identical row bytes, identical dequant -- so the
+  // sidecar output matches the monolithic path bit-exactly; only the row base
+  // pointer differs (mmap'd file vs weight tensor).
+  nntrainer::Tensor *weight_p =
+    ggml_lut ? nullptr : &context.getWeight(weight_idx);
   nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
   nntrainer::TensorDim out_tensor_dim =
     nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
+
+  const auto weight_dtype =
+    ggml_lut ? quant_lut->ggml_dtype : weight_p->getDataType();
+  const bool row_quant =
+    (weight_dtype == nntrainer::TensorDim::DataType::Q6_K ||
+     weight_dtype == nntrainer::TensorDim::DataType::Q4_0);
+  NNTR_THROW_IF(ggml_lut && !row_quant, std::runtime_error)
+    << "GGML sidecar LUT supports only Q4_0/Q6_K payloads";
+  // Base pointer + per-row stride of the quantized row table. For the in-bin
+  // weight the stride equals what the old per-branch num_blocks_per_row math
+  // produced (the weight width is out_dim, fixed in finalize).
+  const uint8_t *quant_table =
+    row_quant ? (ggml_lut ? quant_lut->data() : weight_p->getData<uint8_t>())
+              : nullptr;
+  const size_t row_stride =
+    (weight_dtype == nntrainer::TensorDim::DataType::Q6_K)
+      ? 210 * ((static_cast<size_t>(out_dim) + 255) / 256)
+      : 18 * ((static_cast<size_t>(out_dim) + 31) / 32);
 
   unsigned int b_size = input_.batch();
 
@@ -654,6 +809,28 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     int iter = to - from;
 
+#if !defined(_WIN32)
+    // Cold-start I/O for the mmap'd sidecar: MADV_RANDOM disabled readahead,
+    // so a ~1K-token prefill would otherwise pay ~1K synchronous major faults
+    // serialized inside the workers (measured ~100-160ms on NVMe on the
+    // reference tree). Ask the kernel to fault this batch's exact rows in
+    // asynchronously up front; out-of-range ids are skipped here and rejected
+    // in the compute loop.
+    if (ggml_lut && quant_lut->mmap_ptr && iter > 1) {
+      static const uintptr_t pg_mask =
+        ~static_cast<uintptr_t>(sysconf(_SC_PAGESIZE) - 1);
+      for (int pi = 0; pi < iter; ++pi) {
+        const size_t idx = static_cast<size_t>(in_data[pi]);
+        if (idx >= in_dim)
+          continue;
+        const uint8_t *row = quant_table + row_stride * idx;
+        const uintptr_t start = reinterpret_cast<uintptr_t>(row) & pg_mask;
+        const uintptr_t end = reinterpret_cast<uintptr_t>(row) + row_stride;
+        ::madvise(reinterpret_cast<void *>(start), end - start, MADV_WILLNEED);
+      }
+    }
+#endif
+
     auto &tm = nntrainer::ThreadManager::Global();
     tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
       size_t embed_idx = static_cast<size_t>(in_data[i]);
@@ -661,16 +838,13 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         throw std::invalid_argument("input word index is greater than in_dim");
       }
 
-      nntrainer::Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
       nntrainer::Tensor out_tensor =
         batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
-      if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
+      if (weight_dtype == nntrainer::TensorDim::DataType::Q6_K) {
         ///@note this should be replaced with quantizer operation
-        int num_blocks_per_row = (weight.width() + 256 - 1) / 256;
-        const void *src = (void *)((char *)weight.getData<uint8_t>() +
-                                   (210 * num_blocks_per_row) * embed_idx);
+        const void *src =
+          static_cast<const void *>(quant_table + row_stride * embed_idx);
         if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP32) {
           nntrainer::dequantize_row_q6_K(src, out_tensor.getData(), out_dim);
         } else {
@@ -686,11 +860,10 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           nntrainer::dequantize_row_q6_K(src, tmp.getData(), out_dim);
           out_tensor.copyData(tmp);
         }
-      } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
+      } else if (weight_dtype == nntrainer::TensorDim::DataType::Q4_0) {
         ///@note this should be replaced with quantizer operation
-        int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
-        const void *src = (void *)((char *)weight.getData<uint8_t>() +
-                                   (18 * num_blocks_per_row) * embed_idx);
+        const void *src =
+          static_cast<const void *>(quant_table + row_stride * embed_idx);
         if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP32) {
           nntrainer::dequantize_row_q4_0(src, out_tensor.getData(), out_dim);
         } else {
@@ -707,6 +880,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           out_tensor.copyData(tmp);
         }
       } else {
+        nntrainer::Tensor cur_weight =
+          weight_p->getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
         out_tensor.copyData(cur_weight);
       }
 
@@ -717,8 +892,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
 #ifdef DEBUG
     std::cout << context.getName() << " : "
-              << "\n input:" << input_ << "\n weight: " << weight
-              << "\n hidden: " << hidden_ << std::endl;
+              << "\n input:" << input_ << "\n hidden: " << hidden_ << std::endl;
 #endif
   }
 }
