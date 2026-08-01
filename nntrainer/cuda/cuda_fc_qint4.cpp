@@ -19,10 +19,20 @@
 
 #include <nntrainer_log.h>
 
+#include <cstdint>
+#if defined(_WIN32)
+#include <windows.h> // DiscardVirtualMemory
+#else
+#include <sys/mman.h> // madvise
+#endif
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <thread_manager.h>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <fp16.h>
@@ -753,11 +763,48 @@ std::mutex g_dp4a_mtx;
 // change a pure add. The __dp4a path itself does not over-read.
 static constexpr size_t FC_I8_TAIL_PAD = 256;
 
+/**
+ * @brief May a device kernel READ this plain QS4CX payload?
+ *
+ * Only a derived-cache HIT is a pure pointer-value lookup. Both builders below
+ * bind the plain payload straight into a device kernel on a cache MISS --
+ * ensure_dp4a_cache_locked() into repack_plain_i4, ensure_i8_cache_locked()
+ * into repack_plain_i8_kn -- so a miss must first prove the bytes are readable
+ * from the device: really device-accessible, and not a [pool-bypass] payload
+ * whose pages were discarded (those read back as zero-filled, silently).
+ *
+ * Refusing at the builder rather than at the dispatcher's entry gate covers
+ * every caller, present and future, and keeps the rule next to the kernel
+ * argument it protects.
+ */
+bool plain_bindable(const unsigned char *plain_w) {
+  const bool dev = dev_accessible(plain_w);
+  const bool dropped = cuda_fc_qs4cx_plain_dropped(plain_w);
+  if (dev && !dropped)
+    return true;
+  // Once per process: this is a configuration report, not a per-call event.
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    ml_logw("[CUDA] fc_qint4: a derived weight cache is missing for a payload "
+            "no kernel may read (device-accessible=%d, pages dropped=%d), so "
+            "the build is refused and the FC falls back to a path that needs "
+            "only the already-built cache. Build the caches at load time "
+            "(NNTR_CUDA_PREWARM=1) or keep the payload device-resident "
+            "(NNTR_QS4CX_HEAP_BYPASS=0 / NNTR_CUDA_DROP_PLAIN=0).",
+            (int)dev, (int)dropped);
+  }
+  return false;
+}
+
 DevWeightQ *ensure_dp4a_cache_locked(const unsigned char *plain_w,
                                      unsigned int N, unsigned int K) {
   auto it = g_dp4a_plain_cache.find(plain_w);
   if (it != g_dp4a_plain_cache.end())
     return &it->second;
+  // MISS: repack_plain_i4 below dereferences plain_w on the device.
+  if (!plain_bindable(plain_w))
+    return nullptr;
   const int n = (int)N, k = (int)K;
   const size_t Kh = (K + 1u) / 2u;
   auto kr = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
@@ -891,6 +938,11 @@ struct DevWeightI8 {
   int *rowsum = nullptr;     // per-channel sum of int8 weight [N]
 };
 std::unordered_map<const void *, DevWeightI8> g_i8_weight_cache;
+// FCs exempted from the EAGER cuBLAS-i8 cache build (skip_prefill towers /
+// untied lm_head decode at M=1 never reach the M>=32 cuBLAS gate; their [K,N]
+// int8 cache would be dead VRAM). The lazy runtime build self-heals if one is
+// ever reached anyway.
+std::unordered_set<const void *> g_i8_exempt;
 int *g_i8_c = nullptr; // int32 GEMM output scratch [Mpad,N]
 size_t g_i8_c_cap = 0;
 // act-quant dedup (opt-in NNTR_QUANT_DEDUP): sibling FCs sharing an input
@@ -898,11 +950,33 @@ size_t g_i8_c_cap = 0;
 const void *g_last_quant_xh = nullptr;
 int g_last_quant_k = 0;
 
+/**
+ * @brief allocate the [K,N] int8 weight buffer for the cuBLAS IMMA GEMM.
+ * @note There are two builders for this exact buffer -- the lazy one below and
+ * the eager load-time one in cuda_fc_qs4cx_prewarm() -- feeding one consumer
+ * whose vectorized Tensor-Core loads run past the last element, so the
+ * FC_I8_TAIL_PAD must be identical in both. Allocate in one place so the two
+ * cannot drift apart.
+ */
+static cudaError_t alloc_i8_weight(signed char **w8, unsigned int N,
+                                   unsigned int K) {
+  return cudaMalloc(w8, (size_t)N * K + FC_I8_TAIL_PAD);
+}
+
 static DevWeightI8 *ensure_i8_cache_locked(const unsigned char *plain_w,
                                            unsigned int N, unsigned int K) {
   auto it = g_i8_weight_cache.find(plain_w);
   if (it != g_i8_weight_cache.end())
     return &it->second;
+  // MISS: repack_plain_i8_kn below dereferences plain_w on the device. The i8
+  // [K,N] cache is a SEPARATE map from the dp4a one, so the dispatcher's
+  // "derived cache exists" entry ticket (cuda_fc_qs4cx_has_cache(), dp4a only)
+  // does NOT imply this entry exists. Refusing here makes
+  // cuda_fc_qs4cx_cublas_i8_gemm_fp16() report failure, and the caller's
+  // fall-through hands the call to dp4a -- which under that ticket IS a pure
+  // cache hit.
+  if (!plain_bindable(plain_w))
+    return nullptr;
   const int n = (int)N, k = (int)K, kh = (int)((K + 1u) / 2u);
   auto krp = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                       "repack_plain_i8_kn");
@@ -911,7 +985,7 @@ static DevWeightI8 *ensure_i8_cache_locked(const unsigned char *plain_w,
   if (!krp || !krs)
     return nullptr;
   DevWeightI8 dw;
-  if (cudaMalloc(&dw.w8, (size_t)N * K + FC_I8_TAIL_PAD) != cudaSuccess)
+  if (alloc_i8_weight(&dw.w8, N, K) != cudaSuccess)
     return nullptr;
   if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
     cudaFree(dw.w8);
@@ -1016,6 +1090,101 @@ bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
     return false;
   StreamManager::Global().maybeFinish();
   return true;
+}
+
+// [pool-bypass] True when the dp4a derived cache for this plain pointer
+// already exists -- the dispatch then only needs the pointer VALUE as a key,
+// so a host-heap (non-device-accessible) payload is fine and the host->device
+// weight staging can be skipped entirely.
+bool cuda_fc_qs4cx_has_cache(const unsigned char *plain_w) {
+  if (plain_w == nullptr)
+    return false;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  return g_dp4a_plain_cache.count(plain_w) != 0;
+}
+
+// [pool-bypass] Drop the plain payload's fully-owned pages after every derived
+// device cache (dp4a packed + cuBLAS int8 + fp16 scales) exists -- the CUDA
+// forward then only compares the pointer VALUE as a cache key, never
+// dereferencing the bytes. Only meaningful when the payload is ordinary heap
+// (NNTR_QS4CX_HEAP_BYPASS): madvise on a managed/UVM pool page fails EINVAL
+// harmlessly. Refuses to run when the naive diagnostic path is selected
+// (NNTR_FC_CUDA_DP4A=0 reads the plain payload per call). Inward page
+// alignment protects neighboring heap metadata. x86-only like the bypass.
+namespace {
+// Payloads whose pages this process has discarded. Reading them back gives
+// zero-filled pages, so the consumers that DO dereference the payload (the
+// derived-cache builders via plain_bindable(); the naive plain GEMM; the host
+// dot() tail in CudaComputeOps::fc) must be able to tell and refuse instead of
+// silently computing against zeros.
+//
+// LOCK ORDER: g_dp4a_mtx BEFORE g_dropped_mtx, never the reverse. The nesting
+// sites are plain_bindable() (called with g_dp4a_mtx held) and
+// cuda_fc_qs4cx_release_weight_caches() / cuda_fc_qs4cx_prewarm() (which hold
+// g_dp4a_mtx across their clear/erase). Nothing takes g_dropped_mtx first and
+// then g_dp4a_mtx: cuda_fc_qs4cx_plain_dropped() and
+// cuda_fc_qs4cx_drop_plain_pages() take g_dropped_mtx alone.
+std::unordered_set<const void *> g_dropped_plain;
+std::mutex g_dropped_mtx;
+
+// Forget a drop mark. Called when a payload at this address has just been read
+// successfully to (re)build its derived cache, so any mark left over from a
+// previous model generation that happened to land on the same heap address
+// describes bytes that no longer exist. Without this the mark is immortal and
+// the host-dot() refusal in CudaComputeOps::fc would abort a reloaded model
+// that is holding perfectly valid data.
+void forget_dropped_plain(const unsigned char *plain_w) {
+  if (plain_w == nullptr)
+    return;
+  std::lock_guard<std::mutex> lk(g_dropped_mtx);
+  g_dropped_plain.erase(plain_w);
+}
+} // namespace
+
+bool cuda_fc_qs4cx_plain_dropped(const unsigned char *plain_w) {
+  if (plain_w == nullptr)
+    return false;
+  std::lock_guard<std::mutex> lk(g_dropped_mtx);
+  return g_dropped_plain.count(plain_w) != 0;
+}
+
+bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
+                                    unsigned int N, unsigned int K) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return false;
+  static const bool naive = []() {
+    const char *e = std::getenv("NNTR_FC_CUDA_DP4A");
+    return e != nullptr && e[0] == '0';
+  }();
+  if (naive)
+    return false;
+  const size_t payload =
+    (size_t)N * (((size_t)K + 1) / 2) + (size_t)N * sizeof(float);
+  const size_t page = 4096;
+  uintptr_t lo = ((uintptr_t)plain_w + page - 1) & ~(page - 1);
+  uintptr_t hi = ((uintptr_t)plain_w + payload) & ~(page - 1);
+  if (hi <= lo)
+    return false;
+#if defined(_WIN32)
+  const bool dropped =
+    DiscardVirtualMemory((void *)lo, (SIZE_T)(hi - lo)) == ERROR_SUCCESS;
+#else
+  const bool dropped =
+    ::madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED) == 0;
+#endif
+  if (dropped) {
+    std::lock_guard<std::mutex> lk(g_dropped_mtx);
+    g_dropped_plain.insert(plain_w);
+  }
+  return dropped;
+#else
+  (void)plain_w;
+  (void)N;
+  (void)K;
+  return false;
+#endif
 }
 
 bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X, const unsigned char *plain_w,
@@ -1134,6 +1303,19 @@ static inline bool i8_jit_on() {
   return v;
 }
 
+// NNTR_FC_CUDA_CUBLAS: the int8-IMMA prefill GEMM. Default ON -- it is ~10x the
+// dp4a int-ALU GEMM and bit-identical -- with an explicit =0 opting out. The
+// test is VALUE-checked, not presence-checked, so =0 disables instead of
+// enabling; and it lives here, next to the path it governs, so every consumer
+// (the runtime dispatch and the load-time cache prewarm) reads one answer.
+static inline bool cublas_i8_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_FC_CUDA_CUBLAS");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return v;
+}
+
 // Tiled transpose-unpack: dp4a packed [N, Kh] (byte = plain^0x88, nibbles =
 // two's-complement signed 4-bit) -> int8 [K, N]. Reads coalesced along Kh,
 // writes coalesced along N via the shared tile.
@@ -1231,6 +1413,12 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
                                        const unsigned short *scales_fp16,
                                        unsigned short *Yh, unsigned int M,
                                        unsigned int N, unsigned int K) {
+  // NNTR_FC_CUDA_CUBLAS=0 opts this path out; report failure so the caller's
+  // fall-through chain (dp4a, then the naive GEMM) takes over. Enforcing the
+  // lever at the entry point covers every caller -- the runtime FC dispatch
+  // only knows the M>=32 prefill shape, not the lever.
+  if (!cublas_i8_on())
+    return false;
   if (M == 0 || N == 0 || K == 0)
     return true;
   auto kqh = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
@@ -1406,6 +1594,187 @@ bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
     return false;
   }
   return true;
+}
+
+// --- load-time prewarm + teardown lifecycle -------------------------------
+
+// Mark a weight exempt from the eager load-time cuBLAS-i8 [K,N] build (see
+// g_i8_exempt). Called at load time before the prewarm walk.
+void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w) {
+  g_i8_exempt.insert(plain_w);
+}
+
+bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
+                           unsigned int K) {
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return true;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  if (g_dp4a_plain_cache.count(plain_w))
+    return true; // already cached
+  const size_t Kh = (K + 1u) / 2u;
+  auto &tm = nntrainer::ThreadManager::Global();
+
+  // Build + upload in bounded chunks: a full host mirror of the untied
+  // lm_head (N=262144) is ~350MB packed + ~700MB int8 and those transients
+  // WERE the process peak RSS once the Section-A copy was gone (RSS timeline:
+  // a +1GB step right at the peak, late in load). ~64MB chunks keep the
+  // prewarm off the peak entirely; results are byte-identical (same values,
+  // same device offsets).
+  static constexpr size_t PREWARM_CHUNK_BYTES = 64u << 20;
+
+  DevWeightQ dw;
+  if (cudaMalloc(&dw.plain, (size_t)N * Kh) != cudaSuccess)
+    return false;
+  if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
+    cudaFree(dw.plain);
+    return false;
+  }
+  {
+    // packed int4 [N][Kh] in row chunks (rows are contiguous on both sides).
+    const size_t chunk_rows =
+      std::max<size_t>(1, std::min<size_t>(N, PREWARM_CHUNK_BYTES / Kh));
+    std::vector<signed char> packed(chunk_rows * Kh);
+    std::vector<int> rowsum(N, 0);
+    for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
+      const size_t rows = std::min(chunk_rows, (size_t)N - n0);
+      tm.parallel_for(0, rows, [&](size_t r) {
+        const unsigned char *src = plain_w + (n0 + r) * Kh;
+        signed char *prow = packed.data() + r * Kh;
+        long acc = 0;
+        for (size_t kb = 0; kb < Kh; ++kb) {
+          const unsigned char b = src[kb];
+          prow[kb] = (signed char)(b ^ 0x88);
+          // odd-K pad nibble is stored 8 (= int4 0), so it adds 0 here --
+          // same rowsum the old k1<K guard produced.
+          acc += ((int)(b & 0xF) - 8) + ((int)((b >> 4) & 0xF) - 8);
+        }
+        rowsum[n0 + r] = (int)acc;
+      });
+      cudaMemcpy(dw.plain + n0 * Kh, packed.data(), rows * Kh,
+                 cudaMemcpyHostToDevice);
+    }
+    cudaMemcpy(dw.rowsum, rowsum.data(), sizeof(int) * (size_t)N,
+               cudaMemcpyHostToDevice);
+  }
+  g_dp4a_plain_cache.emplace(plain_w, dw);
+  // The payload was just read successfully, so any drop mark on this address
+  // belongs to a previous model generation (see forget_dropped_plain).
+  forget_dropped_plain(plain_w);
+
+  // Also prewarm the cuBLAS int8 [K,N] weight cache when the cuBLAS prefill FC
+  // path is on: otherwise its one-time GPU repack (repack_plain_i8_kn, ~32% of
+  // cold prefill GPU time) runs on the first prefill instead of at load.
+  // Mirrors repack_plain_i8_kn (w8[k*N+n]=int4(n,k)) + weight_rowsum_kn
+  // bit-exactly. Chunked along K ([k0,k1) rows of the [K,N] buffer are
+  // contiguous on both sides); the per-channel rowsum accumulates across
+  // chunks.
+  // Only build eagerly when the lever is explicitly set: with it unset the
+  // runtime path still uses cuBLAS but builds this [K,N] cache lazily, and an
+  // FC that never reaches the M>=32 gate would otherwise pay the VRAM for
+  // nothing (see g_i8_exempt). cublas_i8_on() supplies the =0 opt-out so the
+  // two consumers cannot disagree about what =0 means.
+  static const bool _cb_set = std::getenv("NNTR_FC_CUDA_CUBLAS") != nullptr;
+  if (_cb_set && cublas_i8_on() && !i8_jit_on() &&
+      !g_i8_weight_cache.count(plain_w) && !g_i8_exempt.count(plain_w)) {
+    const size_t chunk_k =
+      std::max<size_t>(1, std::min<size_t>(K, PREWARM_CHUNK_BYTES / N));
+    std::vector<signed char> w8(chunk_k * (size_t)N);
+    std::vector<long> rs8(N, 0);
+    DevWeightI8 dw8;
+    if (alloc_i8_weight(&dw8.w8, N, K) == cudaSuccess &&
+        cudaMalloc(&dw8.rowsum, sizeof(int) * (size_t)N) == cudaSuccess) {
+      for (size_t k0 = 0; k0 < K; k0 += chunk_k) {
+        const size_t ks = std::min(chunk_k, (size_t)K - k0);
+        tm.parallel_for(0, (size_t)N, [&](size_t n) {
+          const unsigned char *src = plain_w + n * Kh;
+          long acc = 0;
+          for (size_t kk = k0; kk < k0 + ks; ++kk) {
+            const unsigned char b = src[kk >> 1];
+            const int v = (int)((kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF)) - 8;
+            w8[(kk - k0) * N + n] = (signed char)v;
+            acc += v;
+          }
+          rs8[n] += acc;
+        });
+        cudaMemcpy(dw8.w8 + k0 * N, w8.data(), ks * (size_t)N,
+                   cudaMemcpyHostToDevice);
+      }
+      std::vector<int> rs8i(N);
+      for (size_t n = 0; n < N; ++n)
+        rs8i[n] = (int)rs8[n];
+      cudaMemcpy(dw8.rowsum, rs8i.data(), sizeof(int) * (size_t)N,
+                 cudaMemcpyHostToDevice);
+      g_i8_weight_cache.emplace(plain_w, dw8);
+    } else {
+      // A failed EAGER build used to be silent and to leave the lazy in-path
+      // build as the ONLY builder for this weight -- and the lazy build runs
+      // after the load-time walk may have discarded the plain payload's pages,
+      // at which point plain_bindable() refuses it and the FC quietly loses the
+      // Tensor-Core prefill path. Say so, and mark the weight exempt so a
+      // later prewarm does not silently retry an allocation that just failed.
+      // Clear the sticky cudaMalloc error too: leaving it set makes the NEXT
+      // layer's cudaPointerGetAttributes() fail (see the dev_ok gates), which
+      // is how an allocation failure here turns into a host-path crash there.
+      if (dw8.w8)
+        cudaFree(dw8.w8);
+      cudaGetLastError();
+      g_i8_exempt.insert(plain_w);
+      ml_logw("[CUDA] fc_qint4: eager cuBLAS-i8 [K,N] weight cache alloc "
+              "failed for N=%u K=%u (%zu MiB); this FC keeps the dp4a int-ALU "
+              "GEMM at prefill. Exempted from further eager builds.",
+              N, K, ((size_t)N * K + FC_I8_TAIL_PAD) >> 20);
+    }
+  }
+  return true;
+}
+
+bool cuda_fc_qint4_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
+                                unsigned int maxN) {
+  // Pre-grow the activation-quant scratch (q8 + per-row scale/zero-point) to
+  // the given decode bounds so the M=1 decode FC never cudaMallocs inside a
+  // CUDA-graph capture (an in-capture malloc aborts the capture). maxN is
+  // accepted for signature stability with the prefill-side scratch but the
+  // decode dp4a path writes into the caller's output tensor -- there is no
+  // N-sized scratch to grow here; the in-path isCapturing() guards remain the
+  // safety net for anything outside these bounds.
+  (void)maxN;
+  if (maxM == 0 || maxK == 0)
+    return true;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  return dp4a_stage_scratch(maxM, maxK);
+}
+
+void cuda_fc_qs4cx_release_weight_caches() {
+  // Teardown for a model reload lifecycle: free every pointer-keyed derived
+  // weight cache (dp4a packed int4 + cuBLAS int8) so a reloaded model does not
+  // leak the previous generation's VRAM. The fp16-scale UVM side buffers stay
+  // by design -- their cache is documented process-lifetime (keyed by the fp32
+  // scale pointer, no erase).
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  for (auto &kv : g_dp4a_plain_cache) {
+    cudaFree(kv.second.plain);
+    cudaFree(kv.second.rowsum);
+  }
+  g_dp4a_plain_cache.clear();
+  for (auto &kv : g_i8_weight_cache) {
+    cudaFree(kv.second.w8);
+    cudaFree(kv.second.rowsum);
+  }
+  g_i8_weight_cache.clear();
+  // Drop marks describe pages of the generation being torn down. Keeping them
+  // would make cuda_fc_qs4cx_plain_dropped() answer true for a RELOADED
+  // model's fresh payload that happens to reuse the same heap address, and the
+  // host-dot() refusal in CudaComputeOps::fc would then abort a run holding
+  // valid bytes. Same lock order as everywhere else: g_dp4a_mtx (held) then
+  // g_dropped_mtx.
+  {
+    std::lock_guard<std::mutex> dlk(g_dropped_mtx);
+    g_dropped_plain.clear();
+  }
+  // The eager-build exemptions are per-generation too: a reloaded model gets
+  // fresh pointers, and a stale entry keyed on a recycled address would skip
+  // an eager build the new model wants.
+  g_i8_exempt.clear();
 }
 
 } // namespace nntrainer::cuda

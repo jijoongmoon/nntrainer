@@ -66,6 +66,105 @@ void CudaComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
   CpuComputeOps::swiglu(in1, in2, out, active_rows, row_offset);
 }
 
+// GeGLU: out = gelu_tanh(gate) * up. Device-resident fp16 kernel (opt-in via
+// NNTR_CUDA_GEGLU until the whole decode chain is on-GPU); otherwise the host
+// gelu loop on the host-coherent UVM tensors (CpuComputeOps::geglu).
+void CudaComputeOps::geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                           unsigned int active_rows, unsigned int row_offset) {
+  const unsigned int dim2 = in1.width();
+  const size_t elem_off = (size_t)row_offset * dim2;
+  const size_t n = (size_t)active_rows * dim2;
+  const auto dt = in1.getDataType();
+
+#ifdef ENABLE_FP16
+  // GPU geglu (device-resident fp16): one kernel instead of the host loop, so
+  // the FFN/PLE activation stays on the device. NNTR_CUDA_ASYNC governs the
+  // drain.
+  if (dt == ml::train::TensorDim::DataType::FP16) {
+    static const bool gpu = nntr_env_on("NNTR_CUDA_GEGLU");
+    if (gpu && n > 0) {
+      auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +
+                                                         elem_off);
+      auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>() +
+                                                         elem_off);
+      auto *o =
+        reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+      const bool dev = nntrainer::cuda::dev_accessible(a);
+      if (dev && nntrainer::cuda::cuda_geglu_fp16(a, b, o, (unsigned int)n))
+        return;
+    }
+  }
+#endif
+
+  // Host gelu fallback: sync first so the host read of GPU-produced gate/up
+  // is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+  nntrainer::cuda::drain_if_async();
+  CpuComputeOps::geglu(in1, in2, out, active_rows, row_offset);
+}
+
+// Fused sigmoid gates on cuda (mirror of geglu above). A device-resident
+// activation pool makes the DEVICE kernel the primary path (the base
+// CpuComputeOps host loop faults on a device-only activation in runDecode).
+// Host loop only for genuinely host tensors.
+// Kill-switch: NNTR_CUDA_SIGMOID_GATE=0.
+void CudaComputeOps::sigmoid_glu(const Tensor &in1, const Tensor &in2,
+                                 Tensor &out, unsigned int active_rows,
+                                 unsigned int row_offset) {
+  const unsigned int dim2 = in1.width();
+  const size_t elem_off = (size_t)row_offset * dim2;
+  const size_t n = (size_t)active_rows * dim2;
+#ifdef ENABLE_FP16
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 && n > 0) {
+    static const bool gpu = []() {
+      const char *e = std::getenv("NNTR_CUDA_SIGMOID_GATE");
+      return !(e && e[0] == '0');
+    }();
+    if (gpu) {
+      auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +
+                                                         elem_off);
+      auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>() +
+                                                         elem_off);
+      auto *o =
+        reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+      if (nntrainer::cuda::dev_accessible(a) &&
+          nntrainer::cuda::cuda_sigmoid_glu_fp16(a, b, o, (unsigned int)n))
+        return;
+    }
+  }
+#endif
+  nntrainer::cuda::drain_if_async();
+  CpuComputeOps::sigmoid_glu(in1, in2, out, active_rows, row_offset);
+}
+
+void CudaComputeOps::sigmoid_add(const Tensor &in1, const Tensor &in2,
+                                 Tensor &out, unsigned int active_rows,
+                                 unsigned int row_offset) {
+  const unsigned int dim2 = in1.width();
+  const size_t elem_off = (size_t)row_offset * dim2;
+  const size_t n = (size_t)active_rows * dim2;
+#ifdef ENABLE_FP16
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 && n > 0) {
+    static const bool gpu = []() {
+      const char *e = std::getenv("NNTR_CUDA_SIGMOID_GATE");
+      return !(e && e[0] == '0');
+    }();
+    if (gpu) {
+      auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +
+                                                         elem_off);
+      auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>() +
+                                                         elem_off);
+      auto *o =
+        reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+      if (nntrainer::cuda::dev_accessible(a) &&
+          nntrainer::cuda::cuda_sigmoid_add_fp16(a, b, o, (unsigned int)n))
+        return;
+    }
+  }
+#endif
+  nntrainer::cuda::drain_if_async();
+  CpuComputeOps::sigmoid_add(in1, in2, out, active_rows, row_offset);
+}
+
 void CudaComputeOps::scalar_mul(const Tensor &in, Tensor &out, float scale) {
 #ifdef ENABLE_FP16
   if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -159,17 +258,37 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
   // sum-of-squares. Used only for small row counts (decode, rows~1): the kernel
   // syncs per call, so for the wide prefill norm (rows=seq_len) the
   // multi-thread host norm wins -- gating by rows gives the decode speedup
-  // without a prefill regression.
-  static constexpr int gpu_max_rows = 32;
-  if (dt == DT::FP16 && gt == DT::FP16 && out.getDataType() == DT::FP16 &&
-      (int)rows <= gpu_max_rows) {
+  // without a prefill regression. NNTR_RMSNORM_CUDA_OFF disables; =all forces
+  // all rows.
+  static const int gpu_max_rows = []() {
+    const char *e = std::getenv("NNTR_RMSNORM_CUDA_OFF");
+    if (e && e[0] == 'a')
+      return 1 << 30; // "all"
+    if (e)
+      return 0; // off
+    return 32;  // decode-only default
+  }();
+  if (dt == DT::FP16 && out.getDataType() == DT::FP16 &&
+      (gt == DT::FP16 || gt == DT::FP32) && (int)rows <= gpu_max_rows) {
     const unsigned short *xi =
       reinterpret_cast<const unsigned short *>(in.getData<_FP16>());
-    const unsigned short *gi =
-      reinterpret_cast<const unsigned short *>(gamma.getData<_FP16>());
     unsigned short *yi =
       reinterpret_cast<unsigned short *>(out.getData<_FP16>());
-    if (dev_ok(xi) && dev_ok(gi) && dev_ok(yi) &&
+    // gamma is unquantized FP32 on disk and the RMSNorm layers request it as
+    // FP32 for that reason, so an FP16 activation with an FP32 gamma is the
+    // normal case -- the host tail below handles it explicitly. Requiring
+    // gt == FP16 here therefore disabled the device norm outright instead of
+    // narrowing it; bind a converted, cached fp16 gamma instead.
+    const unsigned short *gi = nullptr;
+    bool gamma_ok;
+    if (gt == DT::FP16) {
+      gi = reinterpret_cast<const unsigned short *>(gamma.getData<_FP16>());
+      gamma_ok = dev_ok(gi);
+    } else {
+      gamma_ok =
+        cuda::cuda_rmsnorm_gamma_to_fp16(gamma.getData<float>(), width, &gi);
+    }
+    if (gamma_ok && dev_ok(xi) && dev_ok(yi) &&
         cuda::cuda_rmsnorm_fp16(xi, gi, yi, eps, rows, width))
       return;
   }
@@ -236,28 +355,54 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
   if (wt == DT::QS4CX && M > 0 && N > 0 && K > 0 &&
       (int)weight.getDim().height() == K) {
     const uint8_t *W = weight.getData<uint8_t>();
+    // On a derived-cache HIT the dp4a and cuBLAS-i8 paths do not DEREFERENCE
+    // the plain payload: they use its pointer VALUE as the key of the device
+    // caches (packed int4 + rowsum; int8 [K,N]) that the load-time prewarm
+    // already built. So "the derived cache exists" is as good an entry ticket
+    // as device residency -- and it is the only one available under
+    // NNTR_QS4CX_HEAP_BYPASS, where the payload is ordinary heap and
+    // dev_accessible(W) is false by construction. Requiring residency there
+    // sent every QS4CX FC to the host dot() tail below, which with
+    // NNTR_CUDA_DROP_PLAIN reads pages that were discarded after the caches
+    // were built: zeros, hence silently wrong logits rather than a crash.
+    //
+    // A cache MISS is the opposite: both builders bind the payload into a
+    // device repack kernel (repack_plain_i4, repack_plain_i8_kn). The ticket
+    // below only proves the DP4A cache exists -- the i8 [K,N] cache is a
+    // separate map -- so the builders enforce device-readability themselves
+    // (plain_bindable() in cuda_fc_qint4.cpp) and report failure, which this
+    // chain's fall-through turns into a dp4a call that is a pure hit.
+    const bool w_cached = cuda::cuda_fc_qs4cx_has_cache(W);
+    // The NAIVE plain GEMM is the exception -- it binds W straight into the
+    // kernel, so it still needs real device residency.
+    const bool w_dev = nntrainer::cuda::dev_accessible(W);
     // The per-weight fp16 scale buffer the dequant kernel reads every call.
     const uint16_t *S = nullptr;
-    if (nntrainer::cuda::dev_accessible(W) &&
-        cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(weight.getScale<float>(),
-                                               (unsigned)N, &S)) {
+    if ((w_dev || w_cached) && cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+                                 weight.getScale<float>(), (unsigned)N, &S)) {
 #ifdef ENABLE_FP16
       if (at == DT::FP16 && output.getDataType() == DT::FP16) {
         auto *Xh =
           reinterpret_cast<const unsigned short *>(input.getData<_FP16>());
         auto *Yh = reinterpret_cast<unsigned short *>(output.getData<_FP16>());
-        // Prefill (M>=32): w4a8 on the INT8 Tensor Cores via cuBLAS (~10x the
-        // dp4a int-ALU GEMM, bit-identical). Then the dp4a fast path, then
-        // the naive plain GEMM -- each falls to the next on failure.
-        const bool prefill = M >= 32;
+        // Prefill (M >= CUDA_FC_I8_PREFILL_MIN_M): w4a8 on the INT8 Tensor
+        // Cores via cuBLAS (~10x the dp4a int-ALU GEMM, bit-identical). Then
+        // the dp4a fast path, then the naive plain GEMM -- each falls to the
+        // next on failure. The threshold is the header constant, not a local
+        // literal, because the load-time prewarm decides whether to build the
+        // i8 [K,N] cache from the same number.
+        // This gate is the SHAPE only: the NNTR_FC_CUDA_CUBLAS=0 opt-out is
+        // enforced inside cuda_fc_qs4cx_cublas_i8_gemm_fp16(), which then
+        // reports failure and lets the dp4a path below take the call.
+        const bool prefill = M >= (int)cuda::CUDA_FC_I8_PREFILL_MIN_M;
         if (nntrainer::cuda::dev_accessible(Xh) &&
             ((prefill &&
               cuda::cuda_fc_qs4cx_cublas_i8_gemm_fp16(
                 Xh, W, S, Yh, (unsigned)M, (unsigned)N, (unsigned)K)) ||
              cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(Xh, W, S, Yh, (unsigned)M,
                                                 (unsigned)N, (unsigned)K) ||
-             cuda::cuda_fc_qs4cx_gemm_fp16_naive(Xh, W, S, Yh, (unsigned)M,
-                                                 (unsigned)N, (unsigned)K)))
+             (w_dev && cuda::cuda_fc_qs4cx_gemm_fp16_naive(
+                         Xh, W, S, Yh, (unsigned)M, (unsigned)N, (unsigned)K))))
           return;
       }
 #endif
@@ -268,8 +413,8 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
         if (nntrainer::cuda::dev_accessible(X) &&
             (cuda::cuda_fc_qs4cx_dp4a_gemm_fp32(X, W, S, Y, (unsigned)M,
                                                 (unsigned)N, (unsigned)K) ||
-             cuda::cuda_fc_qs4cx_gemm_fp32(X, W, S, Y, (unsigned)M, (unsigned)N,
-                                           (unsigned)K)))
+             (w_dev && cuda::cuda_fc_qs4cx_gemm_fp32(
+                         X, W, S, Y, (unsigned)M, (unsigned)N, (unsigned)K))))
           return;
       }
     }
@@ -277,6 +422,41 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
 
   // Host fallback: the input is host-coherent UVM, so the CPU dot is correct.
   // Drain first in async mode so the host read sees the produced input.
+  // NNTR_CUDA_FC_DBG=1 prints WHY a call fell off the device fast paths --
+  // the fall-through above is silent by design (checklist B.15: a CUDA op
+  // falling to the host loop is invisible without a runtime trace).
+  static const bool fc_dbg = []() {
+    const char *e = std::getenv("NNTR_CUDA_FC_DBG");
+    return e && e[0] == '1';
+  }();
+  if (fc_dbg) {
+    static int n_prints = 0;
+    if (n_prints < 64) {
+      ++n_prints;
+      std::fprintf(
+        stderr,
+        "[CUDA-FC-DBG] host-dot fallback: wdt=%d adt=%d odt=%d M=%d N=%d "
+        "K=%d w_h=%d dev(W)=%d dev(X)=%d\n",
+        (int)wt, (int)at, (int)output.getDataType(), M, N, K,
+        (int)weight.getDim().height(),
+        (int)nntrainer::cuda::dev_accessible(weight.getData<uint8_t>()),
+        (int)nntrainer::cuda::dev_accessible(input.getData<char>()));
+    }
+  }
+  // The host dot() READS the weight bytes. If this payload's pages were
+  // discarded (NNTR_CUDA_DROP_PLAIN, after the derived device caches were
+  // built) they now read back as zeros, so the dot would produce a zero-weight
+  // result -- correct-looking output, silently wrong numbers. Fail loudly
+  // instead: reaching here with a dropped payload means a device path that was
+  // supposed to be the only consumer of this weight declined the call.
+  if (wt == DT::QS4CX &&
+      cuda::cuda_fc_qs4cx_plain_dropped(weight.getData<uint8_t>()))
+    throw std::runtime_error(
+      "CudaComputeOps::fc: the QS4CX plain payload for this weight was "
+      "dropped (NNTR_CUDA_DROP_PLAIN) but the call fell through to the host "
+      "dot(), which would read zero-filled pages. Re-run with "
+      "NNTR_CUDA_DROP_PLAIN=0, and use NNTR_CUDA_FC_DBG=1 to see why the "
+      "device path declined.");
   cuda::StreamManager::Global().finishIfAsync();
   input.dot(weight, output, false, false);
 }

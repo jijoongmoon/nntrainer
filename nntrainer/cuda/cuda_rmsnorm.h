@@ -39,6 +39,25 @@ bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
                        unsigned int width);
 
 /**
+ * @brief Bind an FP32 gamma to the fp16 kernel above.
+ *
+ * gamma is stored unquantized FP32 on disk and the RMSNorm layers request it
+ * that way on purpose -- declaring it FP16 would reinterpret the on-disk FP32
+ * bytes as FP16 and corrupt it. cuda_rmsnorm_fp16() reads gamma in the
+ * activation dtype, so an FP32 gamma needs a converted, device-readable copy.
+ * Built once per gamma pointer and cached for the process (gamma is a static
+ * weight), never inside a CUDA-graph capture.
+ *
+ * @param gamma_fp32 [width] FP32 gamma (host or UVM)
+ * @param width      feature size
+ * @param[out] out_gamma converted fp16 gamma, device-readable
+ * @return false if the conversion buffer could not be built (caller keeps its
+ *         host path)
+ */
+bool cuda_rmsnorm_gamma_to_fp16(const float *gamma_fp32, unsigned int width,
+                                const unsigned short **out_gamma);
+
+/**
  * @brief ReverseRMSNorm on device: y = ((x*w)/rms(x*w)) * out_scale[0].
  */
 bool cuda_rms_reverse_norm_fp16(const unsigned short *in,

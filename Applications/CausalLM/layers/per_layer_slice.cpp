@@ -10,8 +10,16 @@
  * @brief  Selects per-layer input chunk from packed per-layer embedding tensor.
  */
 
+#include <cstdlib>
 #include <cstring>
+#include <env_compat.h>
 #include <per_layer_slice.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
 
 namespace causallm {
 
@@ -40,6 +48,8 @@ void PerLayerSliceLayer::forwarding(nntrainer::RunLayerContext &context,
 void PerLayerSliceLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
+  // A chunked prefill calls this with from > 0 for every block after the first,
+  // so "prefill" is any multi-token call, not just the from==0 one.
   bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
@@ -73,6 +83,11 @@ void PerLayerSliceLayer::incremental_forwarding(
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       float *in_data = in_step.getData<float>();
       float *out_data = out_step.getData<float>();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Host memcpy slicing reads the GPU-produced UVM input on the CPU; sync
+      // first in async mode (no-op in default sync mode).
+      nntrainer::cuda::StreamManager::Global().finishIfAsync();
+#endif
       for (unsigned int t = 0; t < tokens; ++t) {
         const float *src =
           in_data + t * in_dim.width() + layer_index * feature_size;
@@ -83,12 +98,31 @@ void PerLayerSliceLayer::incremental_forwarding(
     } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       _FP16 *in_data = in_step.getData<_FP16>();
       _FP16 *out_data = out_step.getData<_FP16>();
-      for (unsigned int t = 0; t < tokens; ++t) {
-        const _FP16 *src =
-          in_data + t * in_dim.width() + layer_index * feature_size;
-        _FP16 *dst = out_data + t * feature_size;
-        std::memcpy(dst, src, sizeof(_FP16) * feature_size);
+      bool done = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // GPU slice-copy: keep the packed per-layer embedding slice on-device
+      // instead of the host memcpy loop. Opt-in (NNTR_CUDA_ELTWISE).
+      static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
+      if (gpu) {
+        cudaPointerAttributes pa{};
+        bool dev =
+          cudaPointerGetAttributes(&pa, in_data) == cudaSuccess &&
+          (pa.type == cudaMemoryTypeManaged || pa.type == cudaMemoryTypeDevice);
+        cudaGetLastError();
+        if (dev && nntrainer::cuda::cuda_slice_copy_fp16(
+                     reinterpret_cast<const unsigned short *>(in_data),
+                     reinterpret_cast<unsigned short *>(out_data), tokens,
+                     in_dim.width(), layer_index * feature_size, feature_size))
+          done = true;
       }
+#endif
+      if (!done)
+        for (unsigned int t = 0; t < tokens; ++t) {
+          const _FP16 *src =
+            in_data + t * in_dim.width() + layer_index * feature_size;
+          _FP16 *dst = out_data + t * feature_size;
+          std::memcpy(dst, src, sizeof(_FP16) * feature_size);
+        }
 #endif
     } else {
       throw std::invalid_argument(

@@ -21,6 +21,21 @@
 namespace nntrainer::cuda {
 
 /**
+ * @brief Smallest GEMM M for which the cuBLAS int8-IMMA FC path is selected.
+ *
+ * Below this the dp4a int-ALU GEMM wins (the IMMA path's per-call activation
+ * repack + cuBLAS launch overhead is not amortized), so the dispatcher only
+ * reaches cuda_fc_qs4cx_cublas_i8_gemm_fp16() at M >= this. It is therefore
+ * also the exact condition under which the i8 [K,N] weight cache can ever be
+ * READ: a turn whose largest prefill M stays below it never touches that
+ * cache, and building it eagerly is provably dead work. Single source of truth
+ * for both the dispatcher (cuda_compute_ops.cpp) and the load-time prewarm
+ * (causal_lm.cpp) -- they must not drift apart, or the prewarm builds caches
+ * nothing reads (or skips caches something reads).
+ */
+constexpr unsigned int CUDA_FC_I8_PREFILL_MIN_M = 32u;
+
+/**
  * @brief Build (and cache) the N-entry UVM fp16 per-channel scale buffer from
  *        the tensor's fp32 scales. The dequant kernels read the scale on device
  *        every call; the tensor stores fp32, so the fp16 copy is made once at
@@ -101,6 +116,71 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
  */
 bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
                                    unsigned int K);
+
+/**
+ * @brief [pool-bypass] Drop the plain payload's fully-owned pages once every
+ *        derived device cache exists (the forward only key-compares the
+ *        pointer). Meaningful with NNTR_QS4CX_HEAP_BYPASS (heap pages);
+ *        harmless EINVAL no-op on managed/pool memory. Refuses when
+ *        NNTR_FC_CUDA_DP4A=0 (the naive path reads the payload). x86 only.
+ * @return true if pages were dropped
+ */
+bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
+                                    unsigned int N, unsigned int K);
+
+/**
+ * @brief [pool-bypass] True when the dp4a derived cache exists for this
+ *        plain pointer -- dispatch may then treat the pointer as a pure key
+ *        (no device access, no staging needed).
+ * @note DP4A ONLY. The cuBLAS-i8 [K,N] cache is a separate map with its own
+ *       existence condition, so a true here does NOT license the i8 path to
+ *       assume a hit: on a miss that path binds the payload into
+ *       repack_plain_i8_kn, and it therefore checks device-readability itself
+ *       before building (and reports failure so the caller falls to dp4a).
+ */
+bool cuda_fc_qs4cx_has_cache(const unsigned char *plain_w);
+
+/**
+ * @brief [pool-bypass] True once cuda_fc_qs4cx_drop_plain_pages() has actually
+ *        discarded this payload's pages. Reading those bytes afterwards yields
+ *        zero-filled pages, so any path that would dereference the payload --
+ *        the naive plain GEMM, or the host dot() fallback -- must refuse rather
+ *        than compute against zeros.
+ */
+bool cuda_fc_qs4cx_plain_dropped(const unsigned char *plain_w);
+
+/**
+ * @brief Build the dp4a derived weight cache (packed int4 + rowsum) for one
+ *        QS4CX plain payload at load time, off the first prefill. GPU repack,
+ *        no host transient; idempotent (pointer-keyed). Returns false only on
+ *        a device allocation / dispatch failure (the lazy in-path build then
+ *        remains the fallback).
+ */
+bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
+                           unsigned int K);
+
+/**
+ * @brief Mark a weight exempt from the eager load-time cuBLAS-i8 [K,N] cache
+ *        build (skip_prefill towers / untied lm_head cannot reach the M>=32
+ *        cuBLAS gate -- their int8 cache is dead VRAM). Lazy build self-heals.
+ */
+void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w);
+
+/**
+ * @brief Pre-grow the dp4a activation-quant scratch to the given decode
+ *        bounds so the M=1 decode FC never cudaMallocs inside a CUDA-graph
+ *        capture. maxN is accepted for signature stability; the decode path
+ *        has no N-sized scratch.
+ */
+bool cuda_fc_qint4_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
+                                unsigned int maxN);
+
+/**
+ * @brief Free every pointer-keyed derived weight cache (dp4a packed int4 +
+ *        cuBLAS int8) -- the model-reload teardown. The fp16-scale UVM side
+ *        buffers are process-lifetime by design and are not freed.
+ */
+void cuda_fc_qs4cx_release_weight_caches();
 
 } // namespace nntrainer::cuda
 

@@ -24,6 +24,8 @@
 #include <logit_softcapping.h>
 #include <rms_norm_layer.h>
 #include <scalar_multiply.h>
+#include <sigmoid_add_layer.h>
+#include <sigmoid_glu_layer.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
@@ -137,17 +139,7 @@ void CudaContext::initialize() noexcept {
       // only legal under cMA=1 — on WDDM the first such touch is a 0xC0000005
       // host AV. The safe WDDM default is the base profile: managed pools +
       // per-op drains.
-      // NNTR_CUDA_DEV_ACT is NOT auto-defaulted in this tree: it swaps the
-      // activation pool to device-only cudaMalloc (manager.h
-      // activationAllocator), which is only legal once the WHOLE forward
-      // chain runs device kernels. This tree still has host layer segments
-      // on the cuda context (reshaped_rms_norm q/k-norm, per_layer_slice,
-      // sigmoid gates, tie_word lm_head) -- any of them touching a
-      // device-only activation is a host SIGSEGV (measured: qwen3 faults in
-      // __fallback_rms_norm_wrt_width_fp16_intrinsic on the first q-norm).
-      // Managed (UVM) activations keep every host segment correct at
-      // cMA-coherent speed; NNTR_CUDA_DEV_ACT=1 remains an explicit opt-in
-      // for trees with a fully device-resident chain.
+      setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
       // NNTR_CUDA_M2B is NOT auto-defaulted in this tree. The M2-B decode
@@ -183,11 +175,11 @@ void CudaContext::initialize() noexcept {
       // RMSNORM_CUDA_OFF) still opts out per lever. ASYNC stays off: drain
       // removal is the measured knife-edge nondeterminism lever and adds
       // nothing on top of the graph (58.5 vs 58.4 TPS).
-      // NNTR_CUDA_DEV_ACT / NNTR_CUDA_M2B: not auto-defaulted -- same
-      // missing-dependency rationale as the cMA branch above (host layer
-      // segments remain; no g_m2b_skip_all consumer, no CUDA lm_head).
+      setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+      // NNTR_CUDA_M2B: not auto-defaulted — same missing-dependency rationale
+      // as the cMA branch above (no g_m2b_skip_all consumer, no CUDA lm_head).
     }
 
     add_default_object();
@@ -255,6 +247,22 @@ void CudaContext::add_default_object() {
   // without OpenCL). Register unconditionally.
   registerFactory(nntrainer::createLayer<TieWordEmbedding>,
                   TieWordEmbedding::type);
+  // Fused sigmoid gates: sigmoid_glu (attn output gate = sigmoid(gate)*x) and
+  // sigmoid_add (PLE mix = sigmoid(gate)+emb). Backend-neutral layers whose
+  // getOps() dispatch lands on the inherited CpuComputeOps bodies here:
+  // engine=cuda tensors are host-coherent UVM, so the host loops are
+  // numerically correct (same host-class-on-cuda precedent as addition /
+  // scalar_multiply above). Without these factories any model that stamps
+  // engine= on a fused gate aborts at graph construction with
+  //   "Key is not found for the object. Key: sigmoid_glu".
+  // Registered LAST with EXPLICIT high int_keys (mirroring ClContext /
+  // AppContext): the auto int_key is str_map.size()+1, so a mid-list insertion
+  // shifts every later auto-key and can collide with an explicit key; explicit
+  // keys are collision-checked at registration.
+  registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                  SigmoidGluLayer::type, /*int_key=*/9001);
+  registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                  SigmoidAddLayer::type, /*int_key=*/9002);
 }
 
 template <typename T>
