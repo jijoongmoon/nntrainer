@@ -89,6 +89,7 @@ LOCAL_SRC_FILES := \
     ../models/gpt_oss/gptoss_causallm.cpp \
     ../models/gpt_oss_cached_slim/gptoss_cached_slim_causallm.cpp \
     ../huggingface_tokenizer.cpp \
+    ../tokenizer_cache.cpp \
     ../llm_util.cpp \
     ../layers/embedding_layer.cpp \
     ../layers/embedding_pooling_layer.cpp \
