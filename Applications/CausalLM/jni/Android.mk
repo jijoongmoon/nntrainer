@@ -89,6 +89,7 @@ LOCAL_SRC_FILES := \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
@@ -203,6 +204,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
