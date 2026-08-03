@@ -417,12 +417,11 @@ static inline unsigned int mha_effective_chunk() {
   const char *ring = std::getenv("NNTR_KV_WINDOW_RING");
   if (ring && ring[0] == '0')
     return 0;
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) ||           \
-  defined(_M_ARM)
-  return 0u;
-#else
+  // Kept identical to causallm::effectivePrefillChunk() -- the two MUST agree
+  // or the host and the kernels disagree about the ring. The former ARM=0
+  // special case is gone; see the note there (the V-mirror restride it existed
+  // for is fixed by sizing the mirror from the ring cap below).
   return 4096u;
-#endif
 }
 
 // Wcap (physical ring rows) for a sliding-window layer, or 0
@@ -647,14 +646,27 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       const char *e = std::getenv("NNTR_KV_MIRROR_CAP");
       return e ? (unsigned int)std::atoi(e) : 0u;
     }();
-    unsigned int S_max = (max_timestep + 7u) & ~7u;
+    // Ring-aware: a W-bounded layer stores only ring_cap rows, so mirroring
+    // max_timestep both over-allocates and (at 32K) fails clCreateImage
+    // outright -- which silently drops the whole process to the non-image
+    // path. Matches the sizing at the other mirror-init site, which derives
+    // S_max from the KV cache height (= the ring cap when ringed). Constant
+    // for the run, so the V-mirror stride never grows: no restride.
+    const unsigned int ring_rows =
+      mha_kv_ring_cap(static_cast<unsigned int>(local_window_size),
+                      static_cast<unsigned int>(max_timestep));
+    unsigned int S_max = ((ring_rows ? ring_rows : max_timestep) + 7u) & ~7u;
     if (mirror_cap >= 8 && mirror_cap < S_max)
       S_max = (mirror_cap + 7u) & ~7u;
     kv_mirror_S_max = S_max;
+    // Derived from max_timestep, NOT this layer's S_max: the kernels carry a
+    // single compile-time KIMG_GSH, so every K mirror in the process must be
+    // packed the same way. max_timestep is the one value all layers share.
+    kv_kimg_gsh = nntrainer::kimg_gsh_for(num_heads_KV, max_timestep);
     bool m_ok = nntrainer::create_ohwi_kv_mirror(
                   /** is_v */ false, num_heads_KV, head_dim, S_max,
                   reinterpret_cast<cl_mem *>(&k_buf_ohwi),
-                  reinterpret_cast<cl_mem *>(&k_image_ohwi)) &&
+                  reinterpret_cast<cl_mem *>(&k_image_ohwi), kv_kimg_gsh) &&
                 nntrainer::create_ohwi_kv_mirror(
                   /** is_v */ true, num_heads_KV, head_dim, S_max,
                   reinterpret_cast<cl_mem *>(&v_buf_ohwi),
@@ -2118,14 +2130,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             S_max = (mirror_cap + 7u) & ~7u;
           if (!kv_mirror_init) {
             kv_mirror_S_max = S_max;
-            bool m_ok = nntrainer::create_ohwi_kv_mirror(
-                          /** is_v */ false, num_heads_KV, head_dim, S_max,
-                          reinterpret_cast<cl_mem *>(&k_buf_ohwi),
-                          reinterpret_cast<cl_mem *>(&k_image_ohwi)) &&
-                        nntrainer::create_ohwi_kv_mirror(
-                          /** is_v */ true, num_heads_KV, head_dim, S_max,
-                          reinterpret_cast<cl_mem *>(&v_buf_ohwi),
-                          reinterpret_cast<cl_mem *>(&v_image_ohwi));
+            bool m_ok =
+              nntrainer::create_ohwi_kv_mirror(
+                /** is_v */ false, num_heads_KV, head_dim, S_max,
+                reinterpret_cast<cl_mem *>(&k_buf_ohwi),
+                reinterpret_cast<cl_mem *>(&k_image_ohwi), kv_kimg_gsh) &&
+              nntrainer::create_ohwi_kv_mirror(
+                /** is_v */ true, num_heads_KV, head_dim, S_max,
+                reinterpret_cast<cl_mem *>(&v_buf_ohwi),
+                reinterpret_cast<cl_mem *>(&v_image_ohwi));
             kv_mirror_init = m_ok;
             if (!m_ok)
               use_image_attn = 0; // permanent disable; flash takes over

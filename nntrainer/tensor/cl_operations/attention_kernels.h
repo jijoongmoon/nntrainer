@@ -357,9 +357,20 @@ void attention_prewarm_programs(ClContext &cc);
  *        mirror is filled by k_scatter_ohwi_cl / v_scatter_ohwi_t_cl.
  * @return true on success (*out_buf, *out_image set); false on failure.
  */
+/**
+ * @brief Packing shift for the OHWI K image view (see kimg_read in
+ *        two_conv_attention.cl). Returns the smallest s with
+ *        (num_heads_KV*max_S)>>s <= CL_DEVICE_IMAGE2D_MAX_HEIGHT, i.e. 0
+ *        whenever today's one-row-per-(head,seq) view already fits. Publishes
+ *        the value for tca_copts(), so ALL K mirrors and the kernels agree;
+ *        call it once with the largest max_S the run can reach.
+ */
+unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S);
+
 bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
                            unsigned int head_dim, unsigned int max_S,
-                           cl_mem *out_buf, cl_mem *out_image);
+                           cl_mem *out_buf, cl_mem *out_image,
+                           unsigned int k_gsh = 0);
 
 /**
  * @brief Release a cl_mem (buffer or image) created by create_ohwi_kv_mirror.
