@@ -185,6 +185,8 @@ LOCAL_LDLIBS := -llog -landroid
 LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
+    ../huggingface_tokenizer.cpp \
+    ../tokenizer_cache.cpp \
     ../models/sentence_transformer.cpp \
     ../kv_cache_manager.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
