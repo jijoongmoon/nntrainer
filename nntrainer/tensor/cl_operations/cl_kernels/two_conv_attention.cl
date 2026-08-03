@@ -200,6 +200,30 @@ __kernel void qk_matmul_f16_ohwi(
 // image-FREE attention kernels (qk_matmul_f16_ohwi / softmax_row_f16 /
 // sv_matmul_f16) used by the NNTR_OHWI_IMG=0 path could not register either.
 // Default (Adreno) builds with no option, keeping that path bit-identical.
+// [kimg-pack] The OHWI K mirror is an image2d VIEW over the [H_kv, S_max, d]
+// buffer. One image row per (head, seq) row makes the height H_kv*S_max, which
+// clears CL_DEVICE_IMAGE2D_MAX_HEIGHT (16384 on Adreno 840) only up to an 8K
+// window -- past that clCreateImage fails and the whole process silently drops
+// to the non-image path. Pack KIMG_G = 1<<KIMG_GSH consecutive sequence rows
+// into ONE image row instead: those rows are already contiguous in the buffer,
+// so only the view's aspect changes (width *= G, height /= G) -- no buffer
+// layout change, no extra traffic. KIMG_GSH == 0 reproduces the original
+// addressing instruction-for-instruction.
+#ifndef KIMG_GSH
+#define KIMG_GSH 0
+#endif
+static inline uint4 kimg_read(__read_only image2d_t img, const sampler_t s,
+                              int lin_row, int dt, int dtex) {
+#if KIMG_GSH == 0
+  (void)dtex;
+  return read_imageui(img, s, (int2)(dt, lin_row));
+#else
+  const int g = 1 << KIMG_GSH;
+  return read_imageui(
+    img, s, (int2)(((lin_row & (g - 1)) * dtex) + dt, lin_row >> KIMG_GSH));
+#endif
+}
+
 #ifndef TCA_BUFFER_ONLY
 __kernel void qk_matmul_f16_ohwi_img(
     __global const half *Q,            // [M, HD_Q] fp16, row-major
@@ -291,7 +315,7 @@ __kernel void qk_matmul_f16_ohwi_img(
     for (int j = 0; j < TN_QK; j++) {
       const int n = n0 + j;
       const int ny = (n < N_kv) ? n : 0;
-      const uint4 vv = read_imageui(K_img, smp, (int2)(dt, k_row_base + ny));
+      const uint4 vv = kimg_read(K_img, smp, k_row_base + ny, dt, d >> 3);
       const half8 hp = as_half8(vv);
       k_pack[j] = (n < N_kv) ? hp : (half8)((half)0.0h);
     }
@@ -1094,7 +1118,7 @@ __kernel void fused_row_attention_f16_ohwi_img(
   for (int n = lid; n <= n_last; n += FUSED_ATTN_LWS) {
     float acc = 0.0f;
     for (int dt = 0; dt < d_tex; dt++) {
-      const uint4 kv = read_imageui(K_img, smp, (int2)(dt, k_row_base + n));
+      const uint4 kv = kimg_read(K_img, smp, k_row_base + n, dt, d >> 3);
       const half8 kp = as_half8(kv);
       const float8 q8 = vload8(dt, q_sh);
       acc += dot(q8.s0123, convert_float4(kp.s0123)) +

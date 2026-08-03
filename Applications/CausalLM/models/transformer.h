@@ -507,24 +507,31 @@ inline json LoadJsonFile(const std::string &file_path) {
  *   and 8192's further +0.9%p costs another 1.1 GB; CUDA independently wants
  *   4096 for tensor-core-efficient prefill GEMMs.
  *
- * ARM/Adreno returns 0 (no auto-chunk): the per-layer OHWI V-mirror keeps a
- * texture-pitch-aligned image sized to the FIRST call's cache_to, and a second
- * chunk whose cache_to crosses that stride's rounding boundary re-scatters
- * EVERY already-cached KV row of EVERY layer. Measured on a packed-model
- * prompt_1p2k: auto-chunk splitting a 1073-token prompt into 1024+49 gave
- * 845 TPS against the single-block path's 1277 TPS (-34%). An explicit
- * NNTR_PREFILL_CHUNK is still always honoured (early return above).
+ * ARM/Adreno used to return 0 here. The reason was the per-layer OHWI V-mirror
+ * restride: the mirror was sized to the FIRST call's cache_to, so a second
+ * chunk crossing that stride's rounding boundary re-scattered EVERY cached KV
+ * row of EVERY layer (measured on prompt_1p2k: 1073 tokens split 1024+49 gave
+ * 845 TPS vs the single-block 1277 TPS, -34%).
+ *
+ * That was a mirror-sizing defect, not a property of chunking, and it is fixed
+ * at the source: MHACoreLayer::finalize now sizes the mirror from the ring cap
+ * (mha_kv_ring_cap), which is constant for the whole run, so the stride never
+ * grows and no restride can occur. Returning 0 here also disabled the KV ring
+ * transitively (kvRingCap needs C > 0), which is the far bigger cost: a
+ * W-bounded local-attention layer kept max_seq rows of KV, and at 32K the
+ * mirror allocation that implies fails outright -- image attention silently
+ * turns off and the fallback path is both ~8x slower and wrong. Chunking and
+ * the ring ship together, on every backend.
+ *
+ * Note the split threshold is min(C, INIT_SEQ_LEN), so the -34% case above was
+ * really INIT_SEQ_LEN=1024 splitting a 1073-token prompt; a package whose
+ * INIT_SEQ_LEN covers its prompt still takes the single-block path unchanged.
  */
 inline unsigned int effectivePrefillChunk() {
   const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
   if (pc && pc[0])
     return static_cast<unsigned int>(std::atoi(pc)); // explicit override wins
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) ||           \
-  defined(_M_ARM)
-  return 0u; // Adreno V-mirror restride, see above
-#else
   return 4096u;
-#endif
 }
 
 /**

@@ -450,6 +450,10 @@ private:
   void *v_image_ohwi = nullptr;
   bool kv_mirror_init = false;
   unsigned int kv_mirror_S_max = 0;
+  /** [kimg-pack] shift folded into the K image view; see kimg_gsh_for(). Set
+   *  once at finalize from max_timestep so every layer's K mirror and the
+   *  kernels (KIMG_GSH) agree. 0 = today's one-row-per-(head,seq) view. */
+  unsigned int kv_kimg_gsh = 0;
   int use_image_attn = -1;
 
   /**

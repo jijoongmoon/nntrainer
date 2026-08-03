@@ -112,14 +112,25 @@ inline std::mutex &tca_mtx() {
 // excluded (Intel NEO cannot compile integer-coord read_imageui; the whole
 // program build would otherwise fail, taking the image-FREE attention kernels
 // down with it). Default "" keeps the Adreno image path bit-identical.
-static const std::string &tca_copts() {
-  static const std::string opts = []() {
-    std::string o =
-      v8c_use_buffer_path() ? std::string("-DTCA_BUFFER_ONLY") : std::string();
-    return o;
-  }();
-  return opts;
+// Published by kimg_gsh_for() at layer finalize, read here when a program is
+// registered. NOT cached: the prewarm pass can register these kernels before
+// any layer has finalized, and a value frozen at 0 then would mismatch the
+// mirrors created afterwards. Registration is rare; rebuilding this string is
+// not on any hot path.
+unsigned int g_kimg_gsh = 0;
+
+static std::string tca_copts() {
+  std::string o =
+    v8c_use_buffer_path() ? std::string("-DTCA_BUFFER_ONLY") : std::string();
+  const unsigned int gsh = g_kimg_gsh;
+  if (gsh != 0) {
+    if (!o.empty())
+      o += " ";
+    o += "-DKIMG_GSH=" + std::to_string(gsh);
+  }
+  return o;
 }
+
 
 static bool tca_ensure(cl_context ctx, cl_mem *buf, size_t *cap, size_t bytes,
                        cl_mem_flags flags) {
@@ -882,9 +893,35 @@ bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
 //   pitch=d*2 V: reversed-OHWI [hKV, d, S_max]   -> image w=S_max/8, h=hKV*d,
 //   pitch=S_max*2
 // Returns false (and leaves *buf / *image null) on failure; caller falls back.
+unsigned int kimg_gsh_for(unsigned int num_heads_KV, unsigned int max_S) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc || num_heads_KV == 0 || max_S == 0)
+    return 0;
+  size_t max_h = 0, max_w = 0;
+  cl_device_id dev = blas_cc->context_inst_.GetDeviceId();
+  clGetDeviceInfo(dev, CL_DEVICE_IMAGE2D_MAX_HEIGHT, sizeof(max_h), &max_h,
+                  nullptr);
+  clGetDeviceInfo(dev, CL_DEVICE_IMAGE2D_MAX_WIDTH, sizeof(max_w), &max_w,
+                  nullptr);
+  if (max_h == 0 || max_w == 0)
+    return 0;
+  const size_t rows = (size_t)num_heads_KV * max_S;
+  unsigned int gsh = 0;
+  // Grow the shift until the height fits; stop if the width would overflow
+  // instead (then nothing can be served and the caller falls back as before).
+  while ((rows >> gsh) > max_h && gsh < 16u)
+    ++gsh;
+  if ((rows >> gsh) > max_h)
+    return 0;
+  g_kimg_gsh = gsh;
+  return gsh;
+}
+
 bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
                            unsigned int head_dim, unsigned int max_S,
-                           cl_mem *out_buf, cl_mem *out_image) {
+                           cl_mem *out_buf, cl_mem *out_image,
+                           unsigned int k_gsh) {
   *out_buf = nullptr;
   *out_image = nullptr;
   if (num_heads_KV == 0 || head_dim == 0 || max_S == 0)
@@ -919,9 +956,18 @@ bool create_ohwi_kv_mirror(bool is_v, unsigned int num_heads_KV,
     d.image_height = (size_t)num_heads_KV * head_dim;
     d.image_row_pitch = (size_t)max_S * sizeof(uint16_t);
   } else {
-    d.image_width = (size_t)head_dim / 8;
-    d.image_height = (size_t)num_heads_KV * max_S;
-    d.image_row_pitch = (size_t)head_dim * sizeof(uint16_t);
+    // [kimg-pack] Fold 1<<k_gsh consecutive (head, seq) rows into one image
+    // row. The rows are contiguous in the buffer, so this is a pure view
+    // change; k_gsh == 0 is the original descriptor byte for byte. Must match
+    // KIMG_GSH in the kernel -- both come from kimg_gsh_for().
+    const size_t g = (size_t)1u << k_gsh;
+    if (((size_t)num_heads_KV * max_S) % g != 0) {
+      clReleaseMemObject(buf);
+      return false;
+    }
+    d.image_width = ((size_t)head_dim / 8) * g;
+    d.image_height = ((size_t)num_heads_KV * max_S) / g;
+    d.image_row_pitch = (size_t)head_dim * sizeof(uint16_t) * g;
   }
   d.buffer = buf;
   cl_int ie = CL_SUCCESS;
