@@ -364,6 +364,73 @@ __global__ void attn_reduce(const float *pm, const float *pl, const float *pacc,
     orow[dd] = s_f2h(a * inv);
   }
 }
+// [reduce-tile] Wide-grid form of attn_reduce. The kernel above runs ONE block
+// per head and does the (m, l) merge in thread 0, so at 29K context 8 blocks --
+// 8 of the device's SMs -- walk 454 chunks, the first ~900 of those steps being
+// a single thread's dependent chain. Measured 35 GB/s on a 384 GB/s part.
+//
+// Three changes, none of which touches a summation order:
+//  - the grid gains a dim-tile axis, so every output dim gets its own thread
+//    and the block count scales with head_dim (each dim's chunk sum is
+//    independent, so which thread owns it is irrelevant);
+//  - the running max becomes a block tree-reduction (fmaxf is associative and
+//    commutative, so the result is the same float);
+//  - the per-chunk softmax weights are computed ONCE into shared memory instead
+//    of once per (dim, chunk); the serial l-sum then reads them, which takes
+//    the exp out of its dependent chain while keeping its chunk order.
+// The l-sum and the per-dim accumulation still run in the original chunk order,
+// so the output is bit-identical. Requires (B + max_n_chunks) floats of shared
+// memory; the host falls back to attn_reduce when that does not fit.
+__global__ void attn_reduce_t(const float *pm, const float *pl,
+                              const float *pacc, unsigned short *o, int HQ,
+                              int d, int n_chunks, const int *d_pos,
+                              int chunk_kv, int max_n_chunks, int window,
+                              int cache_from, int N_kv, int clip) {
+  int h = blockIdx.x;
+  int tid = threadIdx.x, B = blockDim.x;
+  int dd = blockIdx.y * B + tid;
+  // live chunk count: identical expression to attn_reduce (see there).
+  int cf = d_pos ? d_pos[0] : cache_from;
+  int nkv = d_pos ? d_pos[1] : (clip ? N_kv : (n_chunks * chunk_kv));
+  int live_nchunks;
+  if (clip) {
+    int j_lo_g = cf - window + 1; if (j_lo_g < 0) j_lo_g = 0;
+    int j_hi_g = cf; if (j_hi_g >= nkv) j_hi_g = nkv - 1;
+    int j_base = sk_jbase(cf, window, chunk_kv, clip);
+    live_nchunks = (j_hi_g >= j_base) ? ((j_hi_g - j_base) / chunk_kv + 1) : 0;
+  } else {
+    live_nchunks = d_pos ? (nkv + chunk_kv - 1) / chunk_kv : n_chunks;
+  }
+  int base = h * max_n_chunks;
+  extern __shared__ float sh[];
+  float *red = sh;      // [B] tree-reduction scratch
+  float *ew = sh + B;   // [live_nchunks] staged softmax weights
+  float loc = -1e30f;
+  for (int c = tid; c < live_nchunks; c += B) loc = fmaxf(loc, pm[base + c]);
+  red[tid] = loc; __syncthreads();
+  for (int s = B >> 1; s > 0; s >>= 1) {
+    if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+    __syncthreads();
+  }
+  const float M = red[0];
+  for (int c = tid; c < live_nchunks; c += B) ew[c] = __expf(pm[base + c] - M);
+  __syncthreads();
+  __shared__ float L;
+  // one thread, ORIGINAL chunk order; the other warps run the accumulation
+  // below meanwhile and only need L at the final scale.
+  if (tid == 0) {
+    float l = 0.f;
+    for (int c = 0; c < live_nchunks; ++c) l += pl[base + c] * ew[c];
+    L = l;
+  }
+  float a = 0.f;
+  if (dd < d)
+    for (int c = 0; c < live_nchunks; ++c)
+      a += pacc[((long)(base + c)) * d + dd] * ew[c];
+  __syncthreads();
+  const float inv = L > 0.f ? 1.f / L : 0.f;
+  if (dd < d) o[(long)h * d + dd] = s_f2h(a * inv);
+}
 }
 )CU";
 
@@ -1183,11 +1250,20 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
                         ATTN_SPLITKV_WARP_SRC, wname)
                     : CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC,
                                                                "attn_partial");
-  auto kr =
-    CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC, "attn_reduce");
+  const int B = 128;
+  // [reduce-tile] wide-grid merge (see attn_reduce_t). Needs (B + max_nc)
+  // floats of shared memory; anything larger falls back to the one-block-per-
+  // head attn_reduce, which NNTR_CUDA_ATTN_REDUCE_T=0 also restores.
+  static const bool reduce_tiled = []() {
+    const char *e = std::getenv("NNTR_CUDA_ATTN_REDUCE_T");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  const size_t rshmem = sizeof(float) * ((size_t)B + (size_t)max_nc);
+  const bool rt_ok = reduce_tiled && rshmem <= 32768u;
+  auto kr = CudaContext::Global().registerCudaKernel(
+    ATTN_SPLITKV_SRC, rt_ok ? "attn_reduce_t" : "attn_reduce");
   if (!kp || !kr)
     return false;
-  const int B = 128;
   kp->SetKernelArguments(0, &q, sizeof(q));
   kp->SetKernelArguments(1, &k, sizeof(k));
   kp->SetKernelArguments(2, &v, sizeof(v));
@@ -1231,9 +1307,10 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   kr->SetKernelArguments(11, &cache_from, sizeof(cache_from));
   kr->SetKernelArguments(12, &N_kv, sizeof(N_kv));
   kr->SetKernelArguments(13, &clip, sizeof(clip));
-  const int rg[3] = {HQ, 1, 1};
+  const int rg[3] = {HQ, rt_ok ? ((d + B - 1) / B) : 1, 1};
   const int rb[3] = {B, 1, 1};
-  if (!StreamManager::Global().DispatchCommand(*kr, rg, rb))
+  if (!StreamManager::Global().DispatchCommand(
+        *kr, rg, rb, rt_ok ? (unsigned int)rshmem : 0u))
     return false;
   return true;
 }
