@@ -58,6 +58,7 @@
 #include <cuda_attention.h>
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_fc_dense.h>
 #include <cuda_fc_qint4.h>
 #include <cuda_pack_cache.h>
 #include <cuda_runtime.h>
@@ -1218,6 +1219,15 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
         std::max(static_cast<unsigned int>(DIM),
                  static_cast<unsigned int>(INTERMEDIATE_SIZE)),
         std::max(NUM_VOCAB, static_cast<unsigned int>(INTERMEDIATE_SIZE)));
+      // Force cuBLAS to load its dense-GEMM modules now, if this model has a
+      // dense (unquantized) FC at all -- the per-weight prebuild only ARMED
+      // the request. Measured: 106 ms of cuLibraryLoadData that otherwise
+      // lands mid-prefill. It has to be here and not at the prebuild: that
+      // seam runs at the load-time RSS peak, and overlapping ~170 MB of
+      // cuBLAS module residency with it raised peak memory by the same amount
+      // for no steady-state gain. A fully quantized model armed nothing and
+      // this is a no-op.
+      nntrainer::cuda::cuda_fc_dense_warmup_run();
     }
   }
 #endif

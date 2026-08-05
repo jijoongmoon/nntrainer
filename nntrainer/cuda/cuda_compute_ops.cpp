@@ -37,6 +37,7 @@
 
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_fc_dense.h>
 #include <cuda_fc_qint4.h>
 #include <cuda_rmsnorm.h>
 #include <cuda_runtime.h>
@@ -812,6 +813,49 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
     }
   }
 
+  // Dense (unquantized) weight: one cuBLAS GEMM, same dtype in / out.
+  //
+  // This arm is not a performance nicety. The QS4CX chain above is the only
+  // device arm this op had, so a model that keeps a SINGLE dense FC -- a
+  // square mixing matrix small enough that quantizing it is not worth the
+  // accuracy -- sent that one layer to the host dot() below. Under the
+  // device-only activation pool that is a hard REFUSAL (host_math_gate), so
+  // one dense FC in an otherwise fully quantized model forced the entire run
+  // onto the host-coherent pool -- measured -22% prefill for the whole model
+  // to serve two layers.
+  //
+  // Residency is required on all three operands (not the pointer-keyed cache
+  // ticket the QS4CX arm can use): cuBLAS dereferences every one of them, and
+  // a weight that is ordinary heap -- NNTR_QS4CX_HEAP_BYPASS moves payloads
+  // out of the pool -- must fall through to the host dot rather than fault.
+  if (wt == at && wt == output.getDataType() && M > 0 && N > 0 && K > 0 &&
+      (int)weight.getDim().height() == K) {
+#ifdef ENABLE_FP16
+    if (wt == DT::FP16) {
+      const void *W = weight.getData<_FP16>();
+      const void *X = input.getData<_FP16>();
+      void *Y = output.getData<_FP16>();
+      if (nntrainer::cuda::dev_accessible(W) &&
+          nntrainer::cuda::dev_accessible(X) &&
+          nntrainer::cuda::dev_accessible(Y) &&
+          cuda::cuda_fc_dense_gemm_fp16(X, W, Y, (unsigned)M, (unsigned)N,
+                                        (unsigned)K))
+        return;
+    }
+#endif
+    if (wt == DT::FP32) {
+      const float *W = weight.getData<float>();
+      const float *X = input.getData<float>();
+      float *Y = output.getData<float>();
+      if (nntrainer::cuda::dev_accessible(W) &&
+          nntrainer::cuda::dev_accessible(X) &&
+          nntrainer::cuda::dev_accessible(Y) &&
+          cuda::cuda_fc_dense_gemm_fp32(X, W, Y, (unsigned)M, (unsigned)N,
+                                        (unsigned)K))
+        return;
+    }
+  }
+
   // Host fallback: the input is host-coherent UVM, so the CPU dot is correct.
   // Drain first in async mode so the host read sees the produced input.
   // NNTR_CUDA_FC_DBG=1 prints WHY a call fell off the device fast paths --
@@ -1134,7 +1178,17 @@ void CudaComputeOps::scopy_int8_to_float16_s(const unsigned int N,
 // managed pages to the device, never an invalidation; the pointer stays
 // host-accessible.
 void CudaComputeOps::fc_prebuild_weight(Tensor &w) {
-  if (w.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+  using DT = ml::train::TensorDim::DataType;
+  // Dense weight: nothing to derive (cuBLAS reads the weight as-is), but this
+  // is the right moment to make cuBLAS load its GEMM kernel modules -- they
+  // are lazy, and the first real call otherwise pays ~106ms of
+  // cuLibraryLoadData in the middle of the first prefill. Unconditional (no
+  // WPREFETCH gate below): it moves an existing cost, it does not add one, and
+  // it neither allocates persistent memory nor touches the weight.
+  if (w.getDataType() == DT::FP16 || w.getDataType() == DT::FP32)
+    cuda::cuda_fc_dense_warmup(w.getDataType() == DT::FP16, w.width(),
+                               w.height(), cuda::CUDA_FC_I8_PREFILL_MIN_M * 4u);
+  if (w.getDataType() != DT::QS4CX)
     return;
   // NNTR_CUDA_WPREFETCH >= 2 opts in; unset -> 0 (default off).
   static const int wpf = []() {
