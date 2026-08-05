@@ -17,83 +17,140 @@
 #ifndef __BLAS_KERNELS_TEMPLATES_H__
 #define __BLAS_KERNELS_TEMPLATES_H__
 
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+
 #include <blas_kernels.h>
 
 namespace nntrainer {
+
+/**
+ * @brief Name a hard OpenCL failure inside a dense BLAS primitive, then throw.
+ *
+ * Every step of these routines (staging write, argument bind, dispatch,
+ * read-back) used to `return;` on failure. The caller's contract is "the
+ * output is written", and there is no fallback behind these calls -- so a
+ * bare return leaves the output plane holding whatever was there before and
+ * the process keeps running on it. That is the "rc=0 but the text is garbage"
+ * failure mode: nothing in the log, exit status 0, wrong numbers. Name the op,
+ * the step and the shape on stderr and fail loudly instead.
+ *
+ * @param op     primitive + dtype, e.g. "sgemm_cl<fp16>"
+ * @param step   which OpenCL step refused
+ * @param d0d1d2 shape triple (M,N,K for gemm; dim1,dim2,lda for gemv)
+ */
+[[noreturn]] inline void clBlasFail(const char *op, const char *step,
+                                    unsigned int d0, unsigned int d1,
+                                    unsigned int d2) {
+  char msg[256];
+  std::snprintf(msg, sizeof(msg),
+                "[cl-blas] %s refused at '%s' (%u x %u x %u): the OpenCL call "
+                "failed and the output was left unwritten",
+                op, step, d0, d1, d2);
+  std::fprintf(stderr, "%s\n", msg);
+  std::fflush(stderr);
+  throw std::runtime_error(msg);
+}
+
+/**
+ * @brief Fail with clBlasFail() unless @a cond holds.
+ */
+#define NNTR_CL_BLAS_REQUIRE(cond, op, step, d0, d1, d2)                       \
+  do {                                                                         \
+    if (!(cond))                                                               \
+      clBlasFail((op), (step), (d0), (d1), (d2));                              \
+  } while (0)
+
+/**
+ * @brief GEMV on OpenCL.
+ *
+ * @note Each of A / X / Y is bound either as an SVM pointer (when the caller
+ * says the buffer lives in the SVM pool) or staged through the shared
+ * ClBufferManager buffers. The distinction is not cosmetic: a coarse-grained
+ * SVM pointer is a valid *source* for clEnqueueWriteBufferRect but NOT a valid
+ * *destination* for clEnqueueReadBufferRect -- the read reports CL_SUCCESS and
+ * never lands, so an SVM-resident output stayed at its previous contents. That
+ * is what broke every dense (non-quantized) FC on the OpenCL lane, whose
+ * activations all come from the SVM pool. Binding SVM directly also drops the
+ * host round-trip entirely (no dim1*dim2 upload per call).
+ */
 template <typename T = float>
 inline static void sgemv_cl_internal(ClContext::SharedPtrClKernel kernel,
                                      const T *matAdata, const T *vecXdata,
                                      T *vecYdata, unsigned int dim1,
-                                     unsigned int dim2, unsigned int lda) {
-  bool result = false;
-
+                                     unsigned int dim2, unsigned int lda,
+                                     const char *op, bool a_svm, bool x_svm,
+                                     bool y_svm) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   auto &clbuffInstance = ClBufferManager::Global();
+  auto &q = blas_cc->command_queue_inst_;
 
-  size_t dim1_size = sizeof(T) * dim1;
-  size_t dim2_size = sizeof(T) * dim2;
-  size_t dim1_dim2_size = sizeof(T) * dim1 * dim2;
+  const size_t dim1_size = sizeof(T) * dim1;
+  const size_t dim2_size = sizeof(T) * dim2;
+  const size_t dim1_dim2_size = sizeof(T) * dim1 * dim2;
 
-  result = clbuffInstance.getInBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, dim1_dim2_size, matAdata);
-  if (!result) {
-    return;
+  // A (dim1 x dim2)
+  if (a_svm) {
+    q.enqueueSVMUnmap(const_cast<T *>(matAdata));
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelSVMArguments(0, matAdata), op,
+                         "bind A (svm)", dim1, dim2, lda);
+  } else {
+    NNTR_CL_BLAS_REQUIRE(clbuffInstance.getInBufferA()->WriteDataRegion(
+                           q, dim1_dim2_size, matAdata),
+                         op, "stage A", dim1, dim2, lda);
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(
+                           0, clbuffInstance.getInBufferA(), sizeof(cl_mem)),
+                         op, "bind A", dim1, dim2, lda);
   }
 
-  result = clbuffInstance.getInBufferB()->WriteDataRegion(
-    blas_cc->command_queue_inst_, dim2_size, vecXdata);
-  if (!result) {
-    return;
+  // X (dim2)
+  if (x_svm) {
+    q.enqueueSVMUnmap(const_cast<T *>(vecXdata));
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelSVMArguments(1, vecXdata), op,
+                         "bind X (svm)", dim1, dim2, lda);
+  } else {
+    NNTR_CL_BLAS_REQUIRE(
+      clbuffInstance.getInBufferB()->WriteDataRegion(q, dim2_size, vecXdata),
+      op, "stage X", dim1, dim2, lda);
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(
+                           1, clbuffInstance.getInBufferB(), sizeof(cl_mem)),
+                         op, "bind X", dim1, dim2, lda);
   }
 
-  result = clbuffInstance.getOutBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, dim1_size, vecYdata);
-  if (!result) {
-    return;
+  // Y (dim1). Write-only for the kernel (it stores every Y[i]), so the old
+  // upload of Y's previous contents is dead work and is not reproduced here.
+  if (y_svm) {
+    q.enqueueSVMUnmap(vecYdata);
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelSVMArguments(2, vecYdata), op,
+                         "bind Y (svm)", dim1, dim2, lda);
+  } else {
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(
+                           2, clbuffInstance.getOutBufferA(), sizeof(cl_mem)),
+                         op, "bind Y", dim1, dim2, lda);
   }
 
-  result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
-
-  result = kernel->SetKernelArguments(1, clbuffInstance.getInBufferB(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
-
-  result = kernel->SetKernelArguments(2, clbuffInstance.getOutBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
-
-  result = kernel->SetKernelArguments(3, &dim2, sizeof(int));
-  if (!result) {
-    return;
-  }
-
-  result = kernel->SetKernelArguments(4, &lda, sizeof(int));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(3, &dim2, sizeof(int)), op,
+                       "bind dim2", dim1, dim2, lda);
+  NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(4, &lda, sizeof(int)), op,
+                       "bind lda", dim1, dim2, lda);
 
   const int work_groups_count[3] = {(int)dim1, 1, 1};
   const int work_group_size[3] = {1, 1, 1};
 
-  result = opencl::CommandQueueManager::Global().DispatchCommand(
-    kernel, work_groups_count, work_group_size);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(
+    q.DispatchCommand(kernel, work_groups_count, work_group_size), op,
+    "dispatch", dim1, dim2, lda);
 
-  result = clbuffInstance.getOutBufferA()->ReadDataRegion(
-    blas_cc->command_queue_inst_, dim1_size, vecYdata);
-  if (!result) {
-    return;
+  if (y_svm) {
+    // Re-map the GPU-written result for the host consumer (coarse-grained SVM;
+    // no-op under the resident mode gate inside enqueueSVMMap).
+    q.enqueueSVMMap(vecYdata, dim1_size, false);
+  } else {
+    NNTR_CL_BLAS_REQUIRE(
+      clbuffInstance.getOutBufferA()->ReadDataRegion(q, dim1_size, vecYdata),
+      op, "read back Y", dim1, dim2, lda);
   }
 }
 
@@ -166,73 +223,74 @@ T dot_cl_internal(ClContext::SharedPtrClKernel kernel, const T *vecAdata,
   return cl_ret;
 }
 
+/**
+ * @brief GEMM on OpenCL.
+ *
+ * @note See sgemv_cl_internal() for why each of A / B / C is bound either as
+ * an SVM pointer or through the shared staging buffers -- a coarse-grained SVM
+ * destination silently swallows the clEnqueueReadBufferRect read-back.
+ */
 template <typename T = float>
 inline static void
 sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
                   const T *A, const T *B, T *C, unsigned int M, unsigned int N,
                   unsigned int K, unsigned int lda, unsigned int ldb,
-                  unsigned int ldc) {
-  bool result = false;
-
+                  unsigned int ldc, const char *op, bool a_svm, bool b_svm,
+                  bool c_svm) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   auto &clbuffInstance = ClBufferManager::Global();
+  auto &q = blas_cc->command_queue_inst_;
 
   // sizes will be same for transpose
-  size_t m_k_size = M * K * sizeof(T);
-  size_t k_n_size = K * N * sizeof(T);
-  size_t m_n_size = M * N * sizeof(T);
+  const size_t m_k_size = (size_t)M * K * sizeof(T);
+  const size_t k_n_size = (size_t)K * N * sizeof(T);
+  const size_t m_n_size = (size_t)M * N * sizeof(T);
 
-  result = clbuffInstance.getInBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, m_k_size, A);
-  if (!result) {
-    return;
+  if (a_svm) {
+    q.enqueueSVMUnmap(const_cast<T *>(A));
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelSVMArguments(0, A), op,
+                         "bind A (svm)", M, N, K);
+  } else {
+    NNTR_CL_BLAS_REQUIRE(
+      clbuffInstance.getInBufferA()->WriteDataRegion(q, m_k_size, A), op,
+      "stage A", M, N, K);
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(
+                           0, clbuffInstance.getInBufferA(), sizeof(cl_mem)),
+                         op, "bind A", M, N, K);
   }
 
-  result = clbuffInstance.getInBufferB()->WriteDataRegion(
-    blas_cc->command_queue_inst_, k_n_size, B);
-  if (!result) {
-    return;
+  if (b_svm) {
+    q.enqueueSVMUnmap(const_cast<T *>(B));
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelSVMArguments(1, B), op,
+                         "bind B (svm)", M, N, K);
+  } else {
+    NNTR_CL_BLAS_REQUIRE(
+      clbuffInstance.getInBufferB()->WriteDataRegion(q, k_n_size, B), op,
+      "stage B", M, N, K);
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(
+                           1, clbuffInstance.getInBufferB(), sizeof(cl_mem)),
+                         op, "bind B", M, N, K);
   }
 
-  result = clbuffInstance.getOutBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, m_n_size, C);
-  if (!result) {
-    return;
+  // C is write-only for every kernel in this family (each stores C[m*N+n] for
+  // all valid m,n), so its previous contents are not uploaded.
+  if (c_svm) {
+    q.enqueueSVMUnmap(C);
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelSVMArguments(2, C), op,
+                         "bind C (svm)", M, N, K);
+  } else {
+    NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(
+                           2, clbuffInstance.getOutBufferA(), sizeof(cl_mem)),
+                         op, "bind C", M, N, K);
   }
 
-  result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
-
-  result = kernel->SetKernelArguments(1, clbuffInstance.getInBufferB(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
-
-  result = kernel->SetKernelArguments(2, clbuffInstance.getOutBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
-
-  result = kernel->SetKernelArguments(3, &M, sizeof(int));
-  if (!result) {
-    return;
-  }
-
-  result = kernel->SetKernelArguments(4, &N, sizeof(int));
-  if (!result) {
-    return;
-  }
-
-  result = kernel->SetKernelArguments(5, &K, sizeof(int));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(3, &M, sizeof(int)), op,
+                       "bind M", M, N, K);
+  NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(4, &N, sizeof(int)), op,
+                       "bind N", M, N, K);
+  NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(5, &K, sizeof(int)), op,
+                       "bind K", M, N, K);
 
   const int tiled_size = 16;
   const int work_groups_count[3] = {
@@ -241,16 +299,16 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
 
   const int work_group_size[3] = {tiled_size, tiled_size, 1}; // test-value
 
-  result = blas_cc->command_queue_inst_.DispatchCommand(
-    kernel, work_groups_count, work_group_size);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(
+    q.DispatchCommand(kernel, work_groups_count, work_group_size), op,
+    "dispatch", M, N, K);
 
-  result = clbuffInstance.getOutBufferA()->ReadDataRegion(
-    blas_cc->command_queue_inst_, m_n_size, C);
-  if (!result) {
-    return;
+  if (c_svm) {
+    q.enqueueSVMMap(C, m_n_size, false);
+  } else {
+    NNTR_CL_BLAS_REQUIRE(
+      clbuffInstance.getOutBufferA()->ReadDataRegion(q, m_n_size, C), op,
+      "read back C", M, N, K);
   }
 }
 

@@ -149,11 +149,17 @@ void sgemv_q6_k_cl(void *matAdata, float *vecXdata, float *vecYdata,
  * @param[in] dim1 number of A's columns
  * @param[in] dim2 number of A's rows
  * @param[in] lda number of X's columns
- * @param[in] context RunLayerContext reference
+ * @param[in] a_svm matAdata is an SVM-pool pointer (bind it to the kernel
+ * directly instead of staging it through the shared host buffers)
+ * @param[in] x_svm vecXdata is an SVM-pool pointer
+ * @param[in] y_svm vecYdata is an SVM-pool pointer. Required for correctness,
+ * not just speed: a coarse-grained SVM destination silently swallows the
+ * clEnqueueReadBufferRect read-back, so a staged Y would never be written.
  */
 void sgemv_cl(const float *matAdata, const float *vecXdata, float *vecYdata,
               bool TransA, unsigned int dim1, unsigned int dim2,
-              unsigned int lda);
+              unsigned int lda, bool a_svm = false, bool x_svm = false,
+              bool y_svm = false);
 
 /**
  * @brief     dot computation : sum of all X * Y
@@ -179,11 +185,17 @@ float dot_cl(const float *vecAdata, const float *vecXdata, unsigned int dim1);
  * @param[in] lda number of A's columns
  * @param[in] ldb number of B's columns
  * @param[in] ldc number of C's columns
- * @param[in] context RunLayerContext reference
+ * @param[in] a_svm A is an SVM-pool pointer (bind it to the kernel directly
+ * instead of staging it through the shared host buffers)
+ * @param[in] b_svm B is an SVM-pool pointer
+ * @param[in] c_svm C is an SVM-pool pointer. Required for correctness, not
+ * just speed: a coarse-grained SVM destination silently swallows the
+ * clEnqueueReadBufferRect read-back, so a staged C would never be written.
  */
 void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
               float *C, unsigned int M, unsigned int N, unsigned int K,
-              unsigned int lda, unsigned int ldb, unsigned int ldc);
+              unsigned int lda, unsigned int ldb, unsigned int ldc,
+              bool a_svm = false, bool b_svm = false, bool c_svm = false);
 
 /**
  * @brief     addition : sum of all input vectors
@@ -380,11 +392,14 @@ void transpose_32_16(float *data, int M, int K);
  * @param[in] dim1 number of A's columns
  * @param[in] dim2 number of A's rows
  * @param[in] lda number of X's columns
- * @param[in] context RunLayerContext reference
+ * @param[in] a_svm matAdata is an SVM-pool pointer (see the fp32 overload)
+ * @param[in] x_svm vecXdata is an SVM-pool pointer
+ * @param[in] y_svm vecYdata is an SVM-pool pointer
  */
 void sgemv_cl(const _FP16 *matAdata, const _FP16 *vecXdata, _FP16 *vecYdata,
               bool TransA, unsigned int dim1, unsigned int dim2,
-              unsigned int lda);
+              unsigned int lda, bool a_svm = false, bool x_svm = false,
+              bool y_svm = false);
 
 /**
  * @brief     fp16 dot computation : sum of all X * Y
@@ -410,11 +425,14 @@ _FP16 dot_cl(const _FP16 *vecAdata, const _FP16 *vecXdata, unsigned int dim1);
  * @param[in] lda number of A's columns
  * @param[in] ldb number of B's columns
  * @param[in] ldc number of C's columns
- * @param[in] context RunLayerContext reference
+ * @param[in] a_svm A is an SVM-pool pointer (see the fp32 overload)
+ * @param[in] b_svm B is an SVM-pool pointer
+ * @param[in] c_svm C is an SVM-pool pointer
  */
 void sgemm_cl(bool TransA, bool TransB, const _FP16 *A, const _FP16 *B,
               _FP16 *C, unsigned int M, unsigned int N, unsigned int K,
-              unsigned int lda, unsigned int ldb, unsigned int ldc);
+              unsigned int lda, unsigned int ldb, unsigned int ldc,
+              bool a_svm = false, bool b_svm = false, bool c_svm = false);
 
 /**
  * @brief     fp16 addition : sum of all input vectors

@@ -128,6 +128,28 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
   ldc =
     (input.getFormat() == Tformat::NHWC) ? result.channel() : result.width();
 
+  // Residency of each operand. On the OpenCL lane every pooled tensor is an
+  // SVM allocation (ClSVMAllocator), and an SVM pointer cannot be used as the
+  // destination of the clEnqueueReadBufferRect read-back inside the kernels
+  // below: the read reports success and never lands, so the result plane keeps
+  // its previous contents and the model runs on garbage with rc=0. Pass the
+  // residency down so each operand is bound to the kernel directly instead
+  // (which also removes the host round-trip for the weight).
+  auto is_svm = [](const Tensor &t) {
+    const auto md = t.getMemoryData();
+    return md != nullptr && md->isSVM();
+  };
+  const bool in_svm = is_svm(input);
+  const bool m_svm = is_svm(m);
+  const bool res_svm = is_svm(result);
+
+  // FP32 routed every NCHW case through CLBlast (dot_cl / gemv_cl / gemm_cl).
+  // With -Denable-clblast=false -- the default on this tree -- those are throw
+  // stubs, so a dense FP32 FC on the OpenCL lane had no implementation at all.
+  // The in-tree sgemv_cl / sgemm_cl kernels cover exactly these shapes (they
+  // are what the FP16 side has always used, and both dtypes share the same
+  // kernel indexing), so fall back to them instead of throwing. CLBlast builds
+  // keep their tuned routes.
   if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
     const float *data = input.getData();
     const float *mdata = m.getData();
@@ -141,27 +163,50 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
     /// (1 * K) X (1 * M) can be a case
     /// case1: (1 * K) X (K * 1)
     if (M == 1 && N == 1) {
-      // *rdata = dot_cl(data, mdata, K) + (*rdata);
+#ifdef ENABLE_CLBLAST
       *rdata = dot_cl(K, data, mdata) + (*rdata);
+#else
+      *rdata = dot_cl(data, mdata, K) + (*rdata);
+#endif
     }
     /// case2: (M * K) X (K * 1)
     else if (N == 1) {
+#ifdef ENABLE_CLBLAST
       gemv_cl(0, trans, dim1, dim2, 1.0f, data, lda, mdata, 0.0f, rdata, 1);
+#else
+      trans ? sgemv_cl(data, mdata, rdata, trans, dim2, dim1, lda, in_svm,
+                       m_svm, res_svm)
+            : sgemv_cl(data, mdata, rdata, trans, dim1, dim2, lda, in_svm,
+                       m_svm, res_svm);
+#endif
     }
     /// case3: (1 * K) X (K * N) = 1 * N = R
     /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
     /// Effectively a translation of sgemv
     else if (M == 1) {
+#ifdef ENABLE_CLBLAST
       gemv_cl(0, !trans_m, mdim1, mdim2, 1.0f, mdata, ldb, data, 0.0f, rdata,
               1);
+#else
+      trans_m ? sgemv_cl(mdata, data, rdata, !trans_m, mdim1, mdim2, ldb, m_svm,
+                         in_svm, res_svm)
+              : sgemv_cl(mdata, data, rdata, !trans_m, mdim2, mdim1, ldb, m_svm,
+                         in_svm, res_svm);
+#endif
     }
     /// case others: use gemm
     else {
       if (input.getFormat() == Tformat::NHWC) {
-        sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc);
+        sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc,
+                 in_svm, m_svm, res_svm);
       } else {
+#ifdef ENABLE_CLBLAST
         gemm_cl(0, trans, trans_m, M, N, K, 1.0f, data, (trans) ? M : K, mdata,
                 (trans_m) ? K : N, 1.0f, rdata, N);
+#else
+        sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc,
+                 in_svm, m_svm, res_svm);
+#endif
       }
     }
   } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -182,19 +227,24 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
     }
     /// case2: (M * K) X (K * 1)
     else if (N == 1) {
-      trans ? sgemv_cl(data, mdata, rdata, trans, dim2, dim1, lda)
-            : sgemv_cl(data, mdata, rdata, trans, dim1, dim2, lda);
+      trans ? sgemv_cl(data, mdata, rdata, trans, dim2, dim1, lda, in_svm,
+                       m_svm, res_svm)
+            : sgemv_cl(data, mdata, rdata, trans, dim1, dim2, lda, in_svm,
+                       m_svm, res_svm);
     }
     /// case3: (1 * K) X (K * N) = 1 * N = R
     /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
     /// Effectively a translation of sgemv
     else if (M == 1) {
-      trans_m ? sgemv_cl(mdata, data, rdata, !trans_m, mdim1, mdim2, ldb)
-              : sgemv_cl(mdata, data, rdata, !trans_m, mdim2, mdim1, ldb);
+      trans_m ? sgemv_cl(mdata, data, rdata, !trans_m, mdim1, mdim2, ldb, m_svm,
+                         in_svm, res_svm)
+              : sgemv_cl(mdata, data, rdata, !trans_m, mdim2, mdim1, ldb, m_svm,
+                         in_svm, res_svm);
     }
     /// case others: use sgemm
     else {
-      sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc);
+      sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc,
+               in_svm, m_svm, res_svm);
     }
 #else
     throw std::invalid_argument("Error: enable-fp16 is not enabled");
