@@ -1805,7 +1805,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           }
         }
       }
-      // apply rotary embedding for query
+      // apply rotary embedding for query.
+      //
+      // [skip-prefill] ...except on a KV-shared layer's prefill step. Such a
+      // layer returns below as soon as K/V are in its cache, because its
+      // attention output is unused, and the rotated query is read by NOTHING
+      // ELSE -- only that attention. So the rotation is pure waste there.
+      // Property-gated (skip_prefill) and prefill-only: no other layer, step
+      // or engine changes behaviour. K/V still rotate and scatter -- the cache
+      // is the whole point of the layer.
+      const bool skip_q_rope = skip_prefill && (to - from) > 1;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
       // GPU RoPE (decode, device-resident query): split-half rotation on the
       // device matching apply_rotary_emb_tensor_v2, keeping the query off the
@@ -1843,7 +1852,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 rope_lut_device(cached_freqs_cos_fp16, half);
               const unsigned short *sind =
                 rope_lut_device(cached_freqs_sin_fp16, half);
-              if (cosd && sind) {
+              if (cosd && sind && skip_q_rope) {
+                // [skip-prefill] everything above is warm-up that must keep
+                // happening on the prefill step -- the trig table build and
+                // its one-time device upload. Only the rotation itself is
+                // dropped, and only for this layer's dead prefill query.
+                q_rope_gpu = true;
+              } else if (cosd && sind) {
                 // M2-B: read the RoPE position from the device d_pos buffer so
                 // a captured decode graph stays valid across tokens. Set d_pos
                 // here only when NOT capturing (non-graph decode); under

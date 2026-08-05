@@ -589,12 +589,15 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   // sqrt(head_dim) to preserve Gemma4 semantics.
 
   // TODO : fix AVX kernel to not make it divide by 1/sqrt(head_dim) on gemma4
-  LayerHandle q_scale(createLayer(
-    "scalar_multiply",
-    {withKey("name", Q_scaled), withKey("packed", "false"),
-     withKey("multiplier",
-             std::to_string(std::sqrt(static_cast<float>(curr_head_dim)))),
-     withKey("engine", causallm_engine())}));
+  std::vector<std::string> q_scale_params = {
+    withKey("name", Q_scaled), withKey("packed", "false"),
+    withKey("multiplier",
+            std::to_string(std::sqrt(static_cast<float>(curr_head_dim)))),
+    withKey("engine", causallm_engine())};
+  // Same skip as q_norm right above: on a KV-shared layer the scaled query
+  // only feeds the attention, which skips the prefill big-step.
+  appendSkipPrefillIfNeeded(q_scale_params, is_kv_shared_layer);
+  LayerHandle q_scale(createLayer("scalar_multiply", q_scale_params));
   Tensor q_scaled = q_scale(q_normed);
 
   // One source of truth -- see getLayerSlidingWindow().
@@ -729,12 +732,15 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   // Gemma4TextAttention uses scaling=1.0 after q_norm/k_norm.
   // mha_core backend applies 1/sqrt(head_dim) to QK, so pre-scale Q by
   // sqrt(head_dim) to preserve Gemma4 semantics.
-  LayerHandle q_scale(createLayer(
-    "scalar_multiply",
-    {withKey("name", Q_scaled), withKey("packed", "false"),
-     withKey("multiplier",
-             std::to_string(std::sqrt(static_cast<float>(curr_head_dim)))),
-     withKey("engine", causallm_engine())}));
+  std::vector<std::string> q_scale_params = {
+    withKey("name", Q_scaled), withKey("packed", "false"),
+    withKey("multiplier",
+            std::to_string(std::sqrt(static_cast<float>(curr_head_dim)))),
+    withKey("engine", causallm_engine())};
+  // Same skip as q_norm right above: on a KV-shared layer the scaled query
+  // only feeds the attention, which skips the prefill big-step.
+  appendSkipPrefillIfNeeded(q_scale_params, is_kv_shared_layer);
+  LayerHandle q_scale(createLayer("scalar_multiply", q_scale_params));
   Tensor q_scaled = q_scale(q_normed);
 
   // k_norm on per-head projection [B, S, Nk*Dh]
