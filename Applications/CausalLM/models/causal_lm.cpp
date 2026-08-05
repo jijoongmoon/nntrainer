@@ -227,6 +227,14 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
     EOS_TOKEN_ID.clear();
     EOS_TOKEN_ID.push_back(generation_cfg["eos_token_id"].get<unsigned int>());
   }
+  if (EOS_TOKEN_ID.empty()) {
+    // Without an EOS id nothing can break the decode loop early, so a config
+    // with no explicit num_to_generate will always run to the context window.
+    std::cerr << "[CausalLM] WARNING: no eos_token_id in the config; "
+                 "generation can only stop at num_to_generate or at the end of "
+                 "the context window."
+              << std::endl;
+  }
   BOS_TOKEN_ID = generation_cfg["bos_token_id"].empty()
                    ? cfg["bos_token_id"].get<unsigned int>()
                    : generation_cfg["bos_token_id"].get<unsigned int>();
@@ -867,8 +875,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // anyway: MAX_SEQ_LEN is unsigned, so a budget at or above the window would
   // otherwise turn the prompt budget into ~4e9, skip the truncation below and
   // write the prompt past the ids_history row stride.
+  //
+  // NUM_TO_GENERATE <= 0 means "no explicit cap": generation runs until EOS or
+  // until the window is full, so nothing has to be held back for it beyond the
+  // single position the decode loop starts at (input_len + 1). Reserving 1
+  // keeps the prompt budget at MAX_SEQ_LEN - 1 and that loop in bounds.
+  const bool unlimited_generation = (NUM_TO_GENERATE <= 0);
   const unsigned int reserved_for_generation =
-    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u;
+    unlimited_generation ? 1u : static_cast<unsigned int>(NUM_TO_GENERATE);
   const unsigned int kv_budget = MAX_SEQ_LEN > reserved_for_generation
                                    ? MAX_SEQ_LEN - reserved_for_generation
                                    : 0u;
@@ -898,9 +912,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::cerr << "[CausalLM] WARNING: prompt (" << _len
               << " tokens) exceeds the max allowed prefill length ("
               << num_allow_str
-              << " = max_seq_len - num_to_generate); "
-                 "truncating "
-              << (_len - num_allow_str) << " tail tokens." << std::endl;
+              << (unlimited_generation
+                    ? " = max_seq_len - 1, generating until EOS)"
+                    : " = max_seq_len - num_to_generate)")
+              << "; truncating " << (_len - num_allow_str) << " tail tokens."
+              << std::endl;
   }
 
   // feed only available length
@@ -1268,8 +1284,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // just above) on top of the already-truncated prompt, so
   // input_len + NUM_TO_GENERATE can still reach MAX_SEQ_LEN. Derive the end
   // from the window too and stop at whichever comes first.
+  //
+  // Without an explicit cap (NUM_TO_GENERATE <= 0) the budget is the whole
+  // window; the std::min below is then what actually bounds the loop, so
+  // generation runs until EOS breaks out of it or the window is exhausted.
   const unsigned int generation_budget =
-    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u;
+    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE)
+                        : MAX_SEQ_LEN;
   const unsigned int generation_begin = input_len + 1;
   const unsigned int generation_end =
     generation_begin < MAX_SEQ_LEN

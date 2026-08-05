@@ -622,8 +622,13 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
   // one past input_len, so input_len + NUM_TO_GENERATE can reach MAX_SEQ_LEN
   // even when the budget fits the window. Derive the end from the window too
   // and stop at whichever comes first.
+  //
+  // Without an explicit cap (NUM_TO_GENERATE <= 0) the budget is the whole
+  // window; the std::min below is then what bounds the loop, so generation
+  // runs until EOS or until the window is exhausted.
   const unsigned int generation_budget =
-    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE) : 0u;
+    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE)
+                        : MAX_SEQ_LEN;
   const unsigned int generation_begin = input_len + 1;
   const unsigned int generation_end =
     generation_begin < MAX_SEQ_LEN

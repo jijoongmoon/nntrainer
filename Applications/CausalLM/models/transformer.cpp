@@ -188,7 +188,10 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"].get<std::string>();
   INIT_SEQ_LEN = nntr_cfg["init_seq_len"];
   MAX_SEQ_LEN = nntr_cfg["max_seq_len"];
-  NUM_TO_GENERATE = nntr_cfg["num_to_generate"];
+  // num_to_generate is optional: absent (or <= 0) means "no explicit cap",
+  // i.e. generate until EOS or until the context window runs out. 0 is the
+  // sentinel every consumer below tests for.
+  NUM_TO_GENERATE = nntr_cfg.value("num_to_generate", 0);
   MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"];
   MEMORY_SWAP = nntr_cfg.contains("fsu") ? nntr_cfg["fsu"].get<bool>() : false;
   FSU_LOOKAHEAD = nntr_cfg.contains("fsu_lookahead")
@@ -267,7 +270,9 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   // the whole prompt is written past the row stride of every batch row and off
   // the end of the last one. The clamp above can produce exactly that relation
   // -- a 512-position model driven with max_seq_len=2048, num_to_generate=1024
-  // keeps its 1024 budget against a 512 window.
+  // keeps its 1024 budget against a 512 window. The 0 sentinel ("no explicit
+  // cap") is safe by construction: run() then reserves a single token for the
+  // decoder and bounds the loop by the window itself.
   //
   // This belongs here, in the same function that (re-)reads num_to_generate,
   // so it holds after every call: a derived Transformer whose constructor calls
@@ -279,19 +284,24 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   // derive from Transformer and ship configs with
   // num_to_generate == max_seq_len == 512, where the field is inert and no
   // token history exists; they must neither be warned about nor rewritten.
-  if (MODEL_TYPE == ModelType::CAUSALLM &&
-      (NUM_TO_GENERATE < 0 ||
-       static_cast<unsigned int>(NUM_TO_GENERATE) >= MAX_SEQ_LEN)) {
-    const int fitted = (NUM_TO_GENERATE < 0 || MAX_SEQ_LEN == 0)
-                         ? 0
-                         : static_cast<int>(MAX_SEQ_LEN - 1);
-    std::fprintf(stderr,
-                 "[causallm] WARNING: num_to_generate=%d does not fit in the "
-                 "context window (max_seq_len=%u); clamping to %d so the "
-                 "prompt keeps at least one token and the token history stays "
-                 "inside its buffer.\n",
-                 NUM_TO_GENERATE, MAX_SEQ_LEN, fitted);
-    NUM_TO_GENERATE = fitted;
+  if (MODEL_TYPE == ModelType::CAUSALLM) {
+    if (NUM_TO_GENERATE < 0) {
+      // Any non-positive value is the supported "no explicit cap" request, not
+      // a misconfiguration: normalize it to the 0 sentinel without warning.
+      NUM_TO_GENERATE = 0;
+    } else if (NUM_TO_GENERATE > 0 &&
+               static_cast<unsigned int>(NUM_TO_GENERATE) >= MAX_SEQ_LEN) {
+      const int fitted =
+        (MAX_SEQ_LEN == 0) ? 0 : static_cast<int>(MAX_SEQ_LEN - 1);
+      std::fprintf(
+        stderr,
+        "[causallm] WARNING: num_to_generate=%d does not fit in the "
+        "context window (max_seq_len=%u); clamping to %d so the "
+        "prompt keeps at least one token and the token history stays "
+        "inside its buffer.\n",
+        NUM_TO_GENERATE, MAX_SEQ_LEN, fitted);
+      NUM_TO_GENERATE = fitted;
+    }
   }
   if (cfg.contains("rope_theta")) {
     ROPE_THETA = cfg["rope_theta"].get<unsigned int>();
