@@ -22,6 +22,7 @@
 
 #include <nntrainer_log.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -331,6 +332,180 @@ __global__ void attn_reduce(const float *pm, const float *pl, const float *pacc,
     orow[dd] = s_f2h(a * inv);
   }
 }
+}
+)CU";
+
+// Warp-level split-KV decode partial (replaces attn_partial above).
+//
+// attn_partial reduces EVERY key's d-dot through a 128-way shared-memory tree:
+// 7 __syncthreads for the tree plus 2 more around the scratch reuse, i.e. ~9
+// block barriers per key, with only ONE key in flight per block. nsys measured
+// it at ~7 GB/s effective on a 384 GB/s part (1/40 of peak) -- the kernel is
+// barrier/latency bound, not bandwidth bound, which is also why shrinking the
+// chunk (NNTR_CUDA_FLASH_DECODE=16) sped decode up: it only shortened the
+// serial dependent chain.
+//
+// Here the block's 4 warps each own a stride-NW subset of the chunk's keys and
+// run an INDEPENDENT register online-softmax. The per-key d-dot is one
+// __shfl_xor butterfly (lane owns VPL = head_dim/32 CONTIGUOUS dims, loaded
+// with uint2/uint4 vector loads like the split-prefill kernel), so the key loop
+// contains ZERO barriers and NW keys are in flight per block. A single
+// __syncthreads at the end merges the NW warp partials, in fixed warp order, to
+// exactly the (m, l, acc) triple attn_partial wrote -- so the scratch layout
+// (h * max_n_chunks + c), the M2-B d_pos/live-chunk contract and attn_reduce
+// are all untouched, and the launch geometry (grid HQ x max_n_chunks, block
+// 128) is bit-for-bit the same under graph capture.
+//
+// Numerics: same online-softmax, same fp32 accumulators, same key order per
+// chunk. Only the summation ORDER of the d-dot (32 lane partials of VPL
+// contiguous dims vs 128 thread partials of stride-128 dims) and the extra
+// per-warp renormalisation differ, so fp16 outputs may move by a rounding ulp.
+static const char *ATTN_SPLITKV_WARP_SRC = R"CU(
+__device__ __forceinline__ float wk_h2f(unsigned short h) {
+  float f;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+  return f;
+}
+__device__ __forceinline__ float wk_wreduce(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_xor_sync(0xffffffffu, v, off);
+  return v;
+}
+// Vectorized fp16 row-slice load: uint2 (8B) for VPL=4, uint4 (16B) above.
+// The host dispatch verifies the base alignment and falls back to attn_partial
+// otherwise.
+template <int VPL>
+__device__ __forceinline__ void wk_ldrow(const unsigned short *p,
+                                         unsigned short *h) {
+  if (VPL == 4) {
+    uint2 w = *(const uint2 *)p;
+    h[0] = (unsigned short)(w.x); h[1] = (unsigned short)(w.x >> 16);
+    h[2] = (unsigned short)(w.y); h[3] = (unsigned short)(w.y >> 16);
+  } else {
+#pragma unroll
+    for (int p4 = 0; p4 < VPL / 8; p4++) {
+      uint4 w = *(const uint4 *)(p + p4 * 8);
+      h[p4*8+0]=(unsigned short)(w.x); h[p4*8+1]=(unsigned short)(w.x>>16);
+      h[p4*8+2]=(unsigned short)(w.y); h[p4*8+3]=(unsigned short)(w.y>>16);
+      h[p4*8+4]=(unsigned short)(w.z); h[p4*8+5]=(unsigned short)(w.z>>16);
+      h[p4*8+6]=(unsigned short)(w.w); h[p4*8+7]=(unsigned short)(w.w>>16);
+    }
+  }
+}
+template <int VPL, int NW>
+__device__ __forceinline__ void
+splitkv_warp_body(const unsigned short *q, const unsigned short *k,
+                  const unsigned short *v, float *pm, float *pl, float *pacc,
+                  int HQ, int HKV, int N_kv, int cache_from, int d, int window,
+                  float softcap, int chunk_kv, int n_chunks, const int *d_pos,
+                  int max_n_chunks, int ring_cap) {
+  const int h = blockIdx.x, c = blockIdx.y;
+  // M2-B: live query position / key count from the device pos buffer; blocks
+  // past the live chunk count early-return without writing (identical gate to
+  // attn_partial, and the partial->reduce stride stays the FIXED max_n_chunks).
+  const int cf = d_pos ? d_pos[0] : cache_from;
+  const int nkv = d_pos ? d_pos[1] : N_kv;
+  const int live_nchunks = (nkv + chunk_kv - 1) / chunk_kv;
+  if (c >= live_nchunks) return;
+  const int gqa = HQ / HKV, hkv = h / gqa;
+  const int HD_KV = HKV * d;
+  const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+  const int lane0 = lane * VPL;
+  const float scale = rsqrtf((float)d);
+  const int i_abs = cf; // i = 0 (decode M=1)
+  int j_lo_g = i_abs - window + 1; if (j_lo_g < 0) j_lo_g = 0;
+  int j_hi_g = i_abs; if (j_hi_g >= nkv) j_hi_g = nkv - 1;
+  int j_lo = c * chunk_kv; if (j_lo < j_lo_g) j_lo = j_lo_g;
+  int j_hi = (c + 1) * chunk_kv - 1; if (j_hi > j_hi_g) j_hi = j_hi_g;
+
+  float q_reg[VPL], acc[VPL];
+  {
+    unsigned short qh[VPL];
+    wk_ldrow<VPL>(q + (long)h * d + lane0, qh);
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++) { q_reg[vv] = wk_h2f(qh[vv]); acc[vv] = 0.f; }
+  }
+  float mmax = -1e30f, l = 0.f;
+  // warp w walks keys j_lo+w, j_lo+w+NW, ... : NW keys in flight, no barriers
+  for (int j = j_lo + w; j <= j_hi; j += NW) {
+    // [kv-window-ring] physical cache row = j % ring_cap (ring_cap<=0: linear).
+    long pj = (ring_cap > 0) ? (long)(j % ring_cap) : (long)j;
+    long base = pj * HD_KV + (long)hkv * d + lane0;
+    unsigned short kh[VPL], vh[VPL];
+    wk_ldrow<VPL>(k + base, kh);
+    wk_ldrow<VPL>(v + base, vh);
+    float p = 0.f;
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++) p += q_reg[vv] * wk_h2f(kh[vv]);
+    float score = wk_wreduce(p) * scale;
+    if (softcap > 0.f) score = softcap * tanhf(score / softcap);
+    float mn = fmaxf(mmax, score), corr = __expf(mmax - mn), pp = __expf(score - mn);
+    l = l * corr + pp; mmax = mn;
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++) acc[vv] = acc[vv] * corr + pp * wk_h2f(vh[vv]);
+  }
+
+  // merge the NW warp partials in FIXED warp order (deterministic). Empty
+  // warps carry (-1e30, 0, 0) and weight to exactly zero.
+  extern __shared__ float sh[];
+  float *sacc = sh;                    // [NW][d]
+  float *sm = sh + (long)NW * d;       // [NW]
+  float *sl = sm + NW;                 // [NW]
+  if (lane == 0) { sm[w] = mmax; sl[w] = l; }
+#pragma unroll
+  for (int vv = 0; vv < VPL; vv++) sacc[(long)w * d + lane0 + vv] = acc[vv];
+  __syncthreads();
+  float M = -1e30f;
+#pragma unroll
+  for (int t = 0; t < NW; ++t) M = fmaxf(M, sm[t]);
+  float ew[NW];
+#pragma unroll
+  for (int t = 0; t < NW; ++t) ew[t] = __expf(sm[t] - M);
+  const int obase = h * max_n_chunks + c;
+  if (tid == 0) {
+    float L = 0.f;
+#pragma unroll
+    for (int t = 0; t < NW; ++t) L += sl[t] * ew[t];
+    pm[obase] = M; pl[obase] = L;
+  }
+  const int B = blockDim.x;
+  for (int dd = tid; dd < d; dd += B) {
+    float a = 0.f;
+#pragma unroll
+    for (int t = 0; t < NW; ++t) a += sacc[(long)t * d + dd] * ew[t];
+    pacc[(long)obase * d + dd] = a;
+  }
+}
+extern "C" __global__ void
+attn_partial_w128(const unsigned short *q, const unsigned short *k,
+                  const unsigned short *v, float *pm, float *pl, float *pacc,
+                  int HQ, int HKV, int N_kv, int cache_from, int d, int window,
+                  float softcap, int chunk_kv, int n_chunks, const int *d_pos,
+                  int max_n_chunks, int ring_cap) {
+  splitkv_warp_body<4, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv, cache_from, d,
+                          window, softcap, chunk_kv, n_chunks, d_pos,
+                          max_n_chunks, ring_cap);
+}
+extern "C" __global__ void
+attn_partial_w256(const unsigned short *q, const unsigned short *k,
+                  const unsigned short *v, float *pm, float *pl, float *pacc,
+                  int HQ, int HKV, int N_kv, int cache_from, int d, int window,
+                  float softcap, int chunk_kv, int n_chunks, const int *d_pos,
+                  int max_n_chunks, int ring_cap) {
+  splitkv_warp_body<8, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv, cache_from, d,
+                          window, softcap, chunk_kv, n_chunks, d_pos,
+                          max_n_chunks, ring_cap);
+}
+extern "C" __global__ void
+attn_partial_w512(const unsigned short *q, const unsigned short *k,
+                  const unsigned short *v, float *pm, float *pl, float *pacc,
+                  int HQ, int HKV, int N_kv, int cache_from, int d, int window,
+                  float softcap, int chunk_kv, int n_chunks, const int *d_pos,
+                  int max_n_chunks, int ring_cap) {
+  splitkv_warp_body<16, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv, cache_from, d,
+                           window, softcap, chunk_kv, n_chunks, d_pos,
+                           max_n_chunks, ring_cap);
 }
 )CU";
 
@@ -822,8 +997,26 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   std::lock_guard<std::mutex> lk(g_sk_mtx);
   if (!ensure_sk((size_t)HQ * max_nc, (size_t)HQ * max_nc * d))
     return false;
-  auto kp =
-    CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC, "attn_partial");
+  // [warp-decode] Single selection point for the partial kernel. The warp
+  // kernel (barrier-free key loop, see ATTN_SPLITKV_WARP_SRC) is the default;
+  // NNTR_CUDA_ATTN_LEGACY=1 restores the shared-memory tree-reduce
+  // attn_partial verbatim (kill switch). It needs head_dim in {128,256,512}
+  // (VPL = d/32 in {4,8,16}) and 8B/16B-aligned Q/K/V bases for the vector
+  // loads; anything else falls back to the legacy kernel automatically.
+  static const bool attn_legacy = nntr_env_on("NNTR_CUDA_ATTN_LEGACY");
+  const char *wname = (d == 128)   ? "attn_partial_w128"
+                      : (d == 256) ? "attn_partial_w256"
+                      : (d == 512) ? "attn_partial_w512"
+                                   : nullptr;
+  const size_t valign = (d == 128) ? 8u : 16u;
+  const bool warp_ok =
+    !attn_legacy && wname != nullptr &&
+    (((uintptr_t)q | (uintptr_t)k | (uintptr_t)v) % valign) == 0;
+  const int NW = 4; // warps per block in the warp kernel
+  auto kp = warp_ok ? CudaContext::Global().registerCudaKernel(
+                        ATTN_SPLITKV_WARP_SRC, wname)
+                    : CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC,
+                                                               "attn_partial");
   auto kr =
     CudaContext::Global().registerCudaKernel(ATTN_SPLITKV_SRC, "attn_reduce");
   if (!kp || !kr)
@@ -849,7 +1042,10 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   kp->SetKernelArguments(17, &ring_cap, sizeof(ring_cap));
   const int pg[3] = {HQ, max_nc, 1};
   const int pb[3] = {B, 1, 1};
-  const unsigned int shmem = (unsigned int)(sizeof(float) * ((size_t)d + B));
+  // legacy: Q row [d] + reduction scratch [B]; warp: NW acc rows [d] + (m, l).
+  const unsigned int shmem =
+    (unsigned int)(sizeof(float) * (warp_ok ? ((size_t)NW * d + 2 * NW)
+                                            : ((size_t)d + B)));
   if (!StreamManager::Global().DispatchCommand(*kp, pg, pb, shmem))
     return false;
   kr->SetKernelArguments(0, &g_pm, sizeof(g_pm));
