@@ -511,9 +511,19 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
       gamma_ok =
         cuda::cuda_rmsnorm_gamma_to_fp16(gamma.getData<float>(), width, &gi);
     }
-    if (gamma_ok && dev_ok(xi) && dev_ok(yi) &&
-        cuda::cuda_rmsnorm_fp16(xi, gi, yi, eps, rows, width))
-      return;
+    if (gamma_ok && dev_ok(xi) && dev_ok(yi)) {
+      // Decode fast path: the norm output feeds an int4 FC group whose first
+      // act is to quantize it to int8. Folding that quant into this launch
+      // (and letting the group's siblings consume the staging) removes two
+      // single-block kernels per norm from the decode graph. Bit-identical to
+      // the plain norm; falls through to it when the lever is off or the
+      // staging cannot be prepared.
+      if (cuda::cuda_fc_qs4cx_rmsnorm_prequant_fp16(xi, gi, yi, eps, rows,
+                                                    width))
+        return;
+      if (cuda::cuda_rmsnorm_fp16(xi, gi, yi, eps, rows, width))
+        return;
+    }
   }
 #endif
   // Host rmsnorm fallback: the gate syncs first so the host read of

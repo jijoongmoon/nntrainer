@@ -93,6 +93,39 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
                                   unsigned short *Yh, unsigned int M,
                                   unsigned int N, unsigned int K);
 
+/** @brief NNTR_CUDA_FUSED_NORMQ (default on, =0 opts out): whether the decode
+ *  RMSNorm may fold in the int8 activation quant of the FC group it feeds. */
+bool cuda_fc_qs4cx_fused_normq_enabled();
+
+/**
+ * @brief RMSNorm fused with the int8 activation quant its consumer FC needs.
+ *
+ * Writes the normed fp16 rows to @p y exactly as cuda_rmsnorm_fp16 would, and
+ * in the same launch stages the per-row asymmetric int8 quant of those rows in
+ * the dp4a activation scratch. The next FC on @p y then runs its GEMM without
+ * a quant launch of its own -- and so do its siblings (q/k/v share one norm,
+ * gate/up share another), which is where the decode launch count comes down.
+ * The staging is published under a pointer + width + stream-dispatch-sequence
+ * stamp, so an unrelated kernel writing a recycled buffer at the same address
+ * cannot be mistaken for it.
+ *
+ * Bit-identical to the split rmsnorm_fp16 + act_quant_i8_h pair (identical
+ * reduction order and identical rounding), so it needs no numerical waiver.
+ *
+ * @param x     [rows, width] fp16 input (device-accessible)
+ * @param gamma [width] fp16 per-feature scale, or nullptr
+ * @param y     [rows, width] fp16 output (device-accessible)
+ * @param eps   epsilon added to the mean of squares
+ * @param rows  row count (decode: 1)
+ * @param width feature size (== K of the consuming FC)
+ * @return false if the lever is off or the staging could not be prepared --
+ *         the caller must then run the plain norm (nothing was published).
+ */
+bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
+                                         const unsigned short *gamma,
+                                         unsigned short *y, float eps,
+                                         unsigned int rows, unsigned int width);
+
 /**
  * @brief w4a8 on the INT8 Tensor Cores via cuBLAS (prefill FC). Same quant
  *        scheme as the dp4a path (per-row asym int8 activation x symmetric int4

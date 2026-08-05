@@ -12,6 +12,7 @@
 
 #include "cuda_rmsnorm.h"
 
+#include <cuda_common.h> // cuda_vec4_rows_ok
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
 #include <cuda_fc_qint4.h> // cuda_fc_qs4cx_scales_to_uvm_fp16 (fp32 -> cached fp16)
@@ -120,6 +121,84 @@ __global__ void rmsnorm_fp16(const unsigned short *x, const unsigned short *gamm
     yr[k] = rms_f2h(rms_h2f(xr[k]) * inv * g);
   }
 }
+// Vectorized RMSNorm: 4 halves per load/store, hardware half<->float (one
+// instruction instead of the ~20-op software emulation above), and a
+// warp-shuffle reduction. Same math, but the sum of squares is accumulated in
+// a different ORDER (vector-of-4 per thread), so `inv` can move by an ulp --
+// the deliberate, gated deviation of the fused norm/quant lever. Requires
+// width % 4 == 0 and 8-byte-aligned rows; the caller checks both.
+__device__ __forceinline__ float rms_h2f_hw(unsigned short h) {
+  float f;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+  return f;
+}
+__device__ __forceinline__ unsigned short rms_f2h_hw(float f) {
+  unsigned short h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+  return h;
+}
+// gamma is a weight at an arbitrary 2-byte offset in the model blob, so it is
+// routinely NOT vector-aligned even when the activation rows are; four scalar
+// loads for it keep the activation traffic vectorized. has_gamma: 0 none,
+// 1 vector-aligned, 2 scalar.
+__device__ __forceinline__ float4 rms_gather4(const unsigned short *g) {
+  return make_float4(rms_h2f_hw(g[0]), rms_h2f_hw(g[1]), rms_h2f_hw(g[2]),
+                     rms_h2f_hw(g[3]));
+}
+__device__ __forceinline__ float4 rms_load4(uint2 r) {
+  return make_float4(rms_h2f_hw((unsigned short)(r.x & 0xFFFFu)),
+                     rms_h2f_hw((unsigned short)(r.x >> 16)),
+                     rms_h2f_hw((unsigned short)(r.y & 0xFFFFu)),
+                     rms_h2f_hw((unsigned short)(r.y >> 16)));
+}
+__global__ void rmsnorm_fp16_v4(const unsigned short *x,
+                                const unsigned short *gamma, unsigned short *y,
+                                int width, float eps, int has_gamma) {
+  int row = blockIdx.x;
+  const uint2 *xv = (const uint2 *)(x + (size_t)row * width);
+  const uint2 *gv = (const uint2 *)gamma;
+  uint2 *yv = (uint2 *)(y + (size_t)row * width);
+  const int nv = width >> 2;
+  __shared__ float ssq[32];
+  float4 carry[8];
+  int nc = 0;
+  float p = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = rms_load4(xv[i]);
+    if (nc < 8)
+      carry[nc++] = f;
+    p += f.x * f.x + f.y * f.y + f.z * f.z + f.w * f.w;
+  }
+  for (int o = 16; o > 0; o >>= 1)
+    p += __shfl_down_sync(0xffffffffu, p, o);
+  if ((threadIdx.x & 31) == 0)
+    ssq[threadIdx.x >> 5] = p;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float a = (threadIdx.x < (blockDim.x >> 5)) ? ssq[threadIdx.x] : 0.f;
+    for (int o = 16; o > 0; o >>= 1)
+      a += __shfl_down_sync(0xffffffffu, a, o);
+    if (threadIdx.x == 0)
+      ssq[0] = a;
+  }
+  __syncthreads();
+  const float inv = rsqrtf(ssq[0] / (float)width + eps);
+  nc = 0;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = (nc < 8) ? carry[nc++] : rms_load4(xv[i]);
+    float4 g = make_float4(1.f, 1.f, 1.f, 1.f);
+    if (has_gamma == 1)
+      g = rms_load4(gv[i]);
+    else if (has_gamma == 2)
+      g = rms_gather4(gamma + 4 * i);
+    uint2 o;
+    o.x = (unsigned int)rms_f2h_hw(f.x * inv * g.x) |
+          ((unsigned int)rms_f2h_hw(f.y * inv * g.y) << 16);
+    o.y = (unsigned int)rms_f2h_hw(f.z * inv * g.z) |
+          ((unsigned int)rms_f2h_hw(f.w * inv * g.w) << 16);
+    yv[i] = o;
+  }
+}
 // PLE post-norm (ReverseRMSNorm): t = x * w applied BEFORE the norm,
 // rms over t, then a SCALAR out_scale AFTER: y = (t / rms(t)) * out_scale.
 // Same 1-block-per-row FP32-accumulate reduction as rmsnorm_fp16 above;
@@ -159,14 +238,19 @@ bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
                        unsigned int width) {
   if (rows == 0 || width == 0)
     return true;
-  auto kernel =
-    CudaContext::Global().registerCudaKernel(RMSNORM_FP16_SRC, "rmsnorm_fp16");
+  const bool vec4 = cuda_vec4_rows_small(rows) &&
+                    cuda_vec4_rows_ok(width, in, out) &&
+                    cuda_fc_qs4cx_fused_normq_enabled();
+  auto kernel = CudaContext::Global().registerCudaKernel(
+    RMSNORM_FP16_SRC, vec4 ? "rmsnorm_fp16_v4" : "rmsnorm_fp16");
   if (!kernel) {
     ml_loge("[CUDA] rmsnorm_fp16: kernel registration failed");
     return false;
   }
   int w = (int)width;
-  int has_gamma = (gamma != nullptr) ? 1 : 0;
+  int has_gamma = (gamma == nullptr)                       ? 0
+                  : (!vec4 || cuda_vec4_rows_ok(4, gamma)) ? 1
+                                                           : 2;
   const unsigned short *gamma_ptr = gamma;
   kernel->SetKernelArguments(0, &in, sizeof(in));
   kernel->SetKernelArguments(1, &gamma_ptr, sizeof(gamma_ptr));
@@ -174,7 +258,7 @@ bool cuda_rmsnorm_fp16(const unsigned short *in, const unsigned short *gamma,
   kernel->SetKernelArguments(3, &w, sizeof(w));
   kernel->SetKernelArguments(4, &eps, sizeof(eps));
   kernel->SetKernelArguments(5, &has_gamma, sizeof(has_gamma));
-  const int block[3] = {256, 1, 1};
+  const int block[3] = {vec4 ? 512 : 256, 1, 1};
   const int grid[3] = {(int)rows, 1, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))
     return false;

@@ -13,6 +13,7 @@
 #include "cuda_fc_qint4.h"
 #include "cuda_pack_cache.h"
 
+#include <cuda_common.h> // cuda_vec4_rows_ok
 #include <cuda_blas_manager.h>
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
@@ -233,6 +234,270 @@ __global__ void act_quant_i8_h(const unsigned short *Xh, signed char *q8,
   }
   for (int k = threadIdx.x; k < K; k += blockDim.x) {
     int q = (int)rintf(dp4a_h2f(xr[k]) * scale_q) + zp;
+    q = max(-128, min(127, q));
+    q8[(long)m * K + k] = (signed char)q;
+  }
+}
+
+// Hardware half<->float conversion, reachable from NVRTC without cuda_fp16.h.
+//
+// The scalar software routines above are ~20 integer ops each; the hardware
+// instruction is one. On the DECODE row shapes (one block, a few thousand
+// elements) that difference is the whole kernel: measured on RTX 5060, the
+// row-at-a-time norm/quant kernels spend far more time converting than moving
+// their few KB. Verified bit-identical to dp4a_h2f / dp4a_f2h over all 65536
+// half patterns and 4M random floats, so the vectorized kernels below can use
+// them without changing any value.
+__device__ __forceinline__ float vq_h2f(unsigned short h) {
+  float f;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+  return f;
+}
+__device__ __forceinline__ unsigned short vq_f2h(float f) {
+  unsigned short h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+  return h;
+}
+// gamma is a weight at an arbitrary 2-byte offset in the model blob, so it is
+// routinely NOT vector-aligned even when the activation rows are. Reading it
+// with four scalar loads keeps the activation traffic vectorized instead of
+// dropping the whole row to the scalar kernel. (has_gamma: 0 none, 1 vector,
+// 2 scalar.)
+__device__ __forceinline__ float4 vq_gather4(const unsigned short *g) {
+  return make_float4(vq_h2f(g[0]), vq_h2f(g[1]), vq_h2f(g[2]), vq_h2f(g[3]));
+}
+__device__ __forceinline__ float4 vq_load4(uint2 r) {
+  return make_float4(vq_h2f((unsigned short)(r.x & 0xFFFFu)),
+                     vq_h2f((unsigned short)(r.x >> 16)),
+                     vq_h2f((unsigned short)(r.y & 0xFFFFu)),
+                     vq_h2f((unsigned short)(r.y >> 16)));
+}
+// Warp-shuffle reduce + one shared round over the warp results. blockDim.x
+// must be a multiple of 32 and at most 1024. IDENT pads the lanes past the
+// warp count in the final round, so it must be OP's identity.
+#define VQ_REDUCE(scratch, val, OP, IDENT)                                     \
+  do {                                                                         \
+    for (int _o = 16; _o > 0; _o >>= 1)                                        \
+      val = OP(val, __shfl_down_sync(0xffffffffu, val, _o));                   \
+    if ((threadIdx.x & 31) == 0)                                               \
+      scratch[threadIdx.x >> 5] = val;                                         \
+    __syncthreads();                                                           \
+    if (threadIdx.x < 32) {                                                    \
+      float _a =                                                               \
+        (threadIdx.x < (blockDim.x >> 5)) ? scratch[threadIdx.x] : (IDENT);    \
+      for (int _o = 16; _o > 0; _o >>= 1)                                      \
+        _a = OP(_a, __shfl_down_sync(0xffffffffu, _a, _o));                    \
+      if (threadIdx.x == 0)                                                    \
+        scratch[0] = _a;                                                       \
+    }                                                                          \
+    __syncthreads();                                                           \
+  } while (0)
+__device__ __forceinline__ float vq_add(float a, float b) { return a + b; }
+#define VQ_POSINF __int_as_float(0x7F800000)
+#define VQ_NEGINF __int_as_float((int)0xFF800000)
+
+// Per-thread carry of the decoded row: with 4 halves per slot and 512 threads
+// this covers K up to 16384 without a second global read; wider rows fall back
+// to re-reading (still correct, just one more pass over an L1-hot row).
+#define VQ_NCARRY 8
+
+// Vectorized per-row asymmetric int8 activation quant. BIT-IDENTICAL to
+// act_quant_i8_h: min/max are order-independent, the conversions are the same
+// values, and the rint/clamp is unchanged.
+__global__ void act_quant_i8_h_v4(const unsigned short *Xh, signed char *q8,
+                                  float *ascale, int *azp, int M, int K) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+  const uint2 *xv = (const uint2 *)(Xh + (long)m * K);
+  int *q32 = (int *)(q8 + (long)m * K);
+  const int nv = K >> 2;
+  __shared__ float smn[32];
+  __shared__ float smx[32];
+  float lmn = 0.f, lmx = 0.f;
+  float4 carry[VQ_NCARRY];
+  int nc = 0;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    if (nc < VQ_NCARRY)
+      carry[nc++] = f;
+    lmn = fminf(lmn, fminf(fminf(f.x, f.y), fminf(f.z, f.w)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(f.x, f.y), fmaxf(f.z, f.w)));
+  }
+  VQ_REDUCE(smn, lmn, fminf, VQ_POSINF);
+  VQ_REDUCE(smx, lmx, fmaxf, VQ_NEGINF);
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) {
+    ascale[m] = recip;
+    azp[m] = zp;
+  }
+  nc = 0;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = (nc < VQ_NCARRY) ? carry[nc++] : vq_load4(xv[i]);
+    int q0 = max(-128, min(127, (int)rintf(f.x * scale_q) + zp));
+    int q1 = max(-128, min(127, (int)rintf(f.y * scale_q) + zp));
+    int q2 = max(-128, min(127, (int)rintf(f.z * scale_q) + zp));
+    int q3 = max(-128, min(127, (int)rintf(f.w * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+}
+
+// Vectorized RMSNorm + int8 quant of the normed row (see rmsnorm_quant_i8_h
+// below for the fusion rationale). The sum of squares is reduced in a
+// different ORDER than the scalar kernels (vector-of-4 per thread, then warp
+// shuffles), so `inv` can differ by an ulp -- the one place this lever is not
+// bit-identical. Everything downstream of `inv` is.
+__global__ void rmsnorm_quant_i8_h_v4(const unsigned short *x,
+                                      const unsigned short *gamma,
+                                      unsigned short *y, signed char *q8,
+                                      float *ascale, int *azp, int M, int K,
+                                      float eps, int has_gamma) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+  const uint2 *xv = (const uint2 *)(x + (long)m * K);
+  const uint2 *gv = (const uint2 *)gamma;
+  uint2 *yv = (uint2 *)(y + (long)m * K);
+  int *q32 = (int *)(q8 + (long)m * K);
+  const int nv = K >> 2;
+  __shared__ float ssq[32];
+  __shared__ float smn[32];
+  __shared__ float smx[32];
+  float4 carry[VQ_NCARRY];
+  int nc = 0;
+  float p = 0.f;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 f = vq_load4(xv[i]);
+    if (nc < VQ_NCARRY)
+      carry[nc++] = f;
+    p += f.x * f.x + f.y * f.y + f.z * f.z + f.w * f.w;
+  }
+  VQ_REDUCE(ssq, p, vq_add, 0.f);
+  const float inv = rsqrtf(ssq[0] / (float)K + eps);
+
+  float lmn = 0.f, lmx = 0.f;
+  nc = 0;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    const int slot = (nc < VQ_NCARRY) ? nc++ : -1;
+    float4 f = (slot >= 0) ? carry[slot] : vq_load4(xv[i]);
+    float4 g = make_float4(1.f, 1.f, 1.f, 1.f);
+    if (has_gamma == 1)
+      g = vq_load4(gv[i]);
+    else if (has_gamma == 2)
+      g = vq_gather4(gamma + 4 * i);
+    unsigned short h0 = vq_f2h(f.x * inv * g.x), h1 = vq_f2h(f.y * inv * g.y);
+    unsigned short h2 = vq_f2h(f.z * inv * g.z), h3 = vq_f2h(f.w * inv * g.w);
+    uint2 o;
+    o.x = (unsigned int)h0 | ((unsigned int)h1 << 16);
+    o.y = (unsigned int)h2 | ((unsigned int)h3 << 16);
+    yv[i] = o;
+    // Quantize the ROUNDED output, exactly what a following act_quant would
+    // read back. The carry slot is recycled here: its input value is already
+    // consumed for this element.
+    float4 r = make_float4(vq_h2f(h0), vq_h2f(h1), vq_h2f(h2), vq_h2f(h3));
+    if (slot >= 0)
+      carry[slot] = r;
+    lmn = fminf(lmn, fminf(fminf(r.x, r.y), fminf(r.z, r.w)));
+    lmx = fmaxf(lmx, fmaxf(fmaxf(r.x, r.y), fmaxf(r.z, r.w)));
+  }
+  VQ_REDUCE(smn, lmn, fminf, VQ_POSINF);
+  VQ_REDUCE(smx, lmx, fmaxf, VQ_NEGINF);
+  float scale_q, recip;
+  int zp;
+  asym_qparams(smn[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) {
+    ascale[m] = recip;
+    azp[m] = zp;
+  }
+  nc = 0;
+  for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+    float4 r = (nc < VQ_NCARRY) ? carry[nc++] : vq_load4(yv[i]);
+    int q0 = max(-128, min(127, (int)rintf(r.x * scale_q) + zp));
+    int q1 = max(-128, min(127, (int)rintf(r.y * scale_q) + zp));
+    int q2 = max(-128, min(127, (int)rintf(r.z * scale_q) + zp));
+    int q3 = max(-128, min(127, (int)rintf(r.w * scale_q) + zp));
+    q32[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) |
+             ((q3 & 0xFF) << 24);
+  }
+}
+
+// RMSNorm fused with the int8 activation quant its consumer FC needs.
+//
+// The decode norm and the quant that follows it are two single-block kernels
+// over the same 1..8K-element row: at decode M=1 each is far below the launch
+// granularity of the GPU, so the pair costs about twice its own arithmetic.
+// Folding them removes one node per (norm -> FC-group) pair from the decode
+// graph.
+//
+// Deliberately BIT-IDENTICAL to rmsnorm_fp16 followed by act_quant_i8_h:
+//   - phase 1 reduces the sum of squares with the SAME per-thread stride and
+//     the SAME shared-memory pairing tree, so the fp32 accumulation order (and
+//     therefore `inv`) is unchanged;
+//   - phase 2 writes exactly rmsnorm_fp16's y, and tracks min/max of the
+//     ROUNDED fp16 it just stored -- the very values act_quant_i8_h would read
+//     back -- so the quant params come out of asym_qparams unchanged;
+//   - phase 3 re-reads those stores (each thread reads only its own) and
+//     applies the identical rint/clamp.
+// The equality is what lets the fused path be the default with a plain
+// killswitch: no golden movement to argue about.
+__global__ void rmsnorm_quant_i8_h(const unsigned short *x,
+                                   const unsigned short *gamma,
+                                   unsigned short *y, signed char *q8,
+                                   float *ascale, int *azp, int M, int K,
+                                   float eps, int has_gamma) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+  const unsigned short *xr = x + (long)m * K;
+  unsigned short *yr = y + (long)m * K;
+  __shared__ float sdata[256];
+  __shared__ float smx[256];
+  float partial = 0.f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    float v = dp4a_h2f(xr[k]);
+    partial += v * v;
+  }
+  sdata[threadIdx.x] = partial;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s)
+      sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    __syncthreads();
+  }
+  float inv = rsqrtf(sdata[0] / (float)K + eps);
+  __syncthreads(); // sdata[0] consumed; the arrays are reused below
+
+  float lmn = 0.f, lmx = 0.f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    float g = has_gamma ? dp4a_h2f(gamma[k]) : 1.0f;
+    unsigned short h = dp4a_f2h(dp4a_h2f(xr[k]) * inv * g);
+    yr[k] = h;
+    float v = dp4a_h2f(h);
+    lmn = fminf(lmn, v);
+    lmx = fmaxf(lmx, v);
+  }
+  sdata[threadIdx.x] = lmn;
+  smx[threadIdx.x] = lmx;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      sdata[threadIdx.x] = fminf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+      smx[threadIdx.x] = fmaxf(smx[threadIdx.x], smx[threadIdx.x + s]);
+    }
+    __syncthreads();
+  }
+  float scale_q, recip;
+  int zp;
+  asym_qparams(sdata[0], smx[0], scale_q, recip, zp);
+  if (threadIdx.x == 0) {
+    ascale[m] = recip;
+    azp[m] = zp;
+  }
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    int q = (int)rintf(dp4a_h2f(yr[k]) * scale_q) + zp;
     q = max(-128, min(127, q));
     q8[(long)m * K + k] = (signed char)q;
   }
@@ -967,10 +1232,45 @@ double g_stat_clock() {
 }
 int *g_i8_c = nullptr; // int32 GEMM output scratch [Mpad,N]
 size_t g_i8_c_cap = 0;
-// act-quant dedup (opt-in NNTR_QUANT_DEDUP): sibling FCs sharing an input
-// activation reuse the first's int8 quant in g_dp4a_q8.
+// act-quant handoff: whoever last filled g_dp4a_q8 records WHAT it quantized
+// (activation pointer + K) and the stream dispatch count at that moment. A
+// consumer FC may reuse the staged quant only if both still match -- the
+// pointer alone is forgeable by the activation pool (a recycled buffer reuses
+// the address), the sequence number is not: any kernel dispatched in between
+// bumps it and the FC re-quantizes. Written by the fused norm+quant producer,
+// by the dp4a decode path, and (under NNTR_QUANT_DEDUP) by the cuBLAS prefill
+// path.
 const void *g_last_quant_xh = nullptr;
 int g_last_quant_k = 0;
+unsigned long long g_last_quant_seq = 0;
+bool g_last_quant_valid = false;
+
+// NNTR_CUDA_FUSED_NORMQ: fold the decode RMSNorm and the int8 activation quant
+// of the FC group it feeds into one kernel, and let the sibling FCs of that
+// group consume the staged quant instead of recomputing it. Bit-identical to
+// the split path (see rmsnorm_quant_i8_h), so it is the DEFAULT; =0 restores
+// the separate rmsnorm_fp16 + act_quant_i8_h launches.
+bool fused_normq_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_CUDA_FUSED_NORMQ");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return v;
+}
+
+// Publish the staged quant as reusable by the very next FC on @p xh.
+void mark_quant_staged(const void *xh, int k) {
+  g_last_quant_xh = xh;
+  g_last_quant_k = k;
+  g_last_quant_seq = StreamManager::Global().dispatchSeq();
+  g_last_quant_valid = true;
+}
+
+// True when g_dp4a_q8 already holds the int8 quant of (xh, k).
+bool quant_staged_for(const void *xh, int k) {
+  return g_last_quant_valid && xh == g_last_quant_xh && k == g_last_quant_k &&
+         StreamManager::Global().dispatchSeq() == g_last_quant_seq;
+}
 
 /**
  * @brief allocate the [K,N] int8 weight buffer for the cuBLAS IMMA GEMM.
@@ -1209,6 +1509,54 @@ bool cuda_fc_qs4cx_drop_plain_pages(const unsigned char *plain_w,
 #endif
 }
 
+bool cuda_fc_qs4cx_fused_normq_enabled() { return fused_normq_on(); }
+
+bool cuda_fc_qs4cx_rmsnorm_prequant_fp16(const unsigned short *x,
+                                         const unsigned short *gamma,
+                                         unsigned short *y, float eps,
+                                         unsigned int rows,
+                                         unsigned int width) {
+  if (!fused_normq_on())
+    return false;
+  if (rows == 0 || width == 0)
+    return false;
+  const bool vec4 =
+    cuda_vec4_rows_small(rows) && cuda_vec4_rows_ok(width, x, y);
+  auto k = CudaContext::Global().registerCudaKernel(
+    FC_QINT4_DP4A_SRC, vec4 ? "rmsnorm_quant_i8_h_v4" : "rmsnorm_quant_i8_h");
+  if (!k)
+    return false;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  // Sizing the quant scratch is a cudaMalloc, which is illegal mid-capture --
+  // ensure_buf refuses there and we hand the row back to the plain norm. In
+  // practice prefill has already grown the scratch past a single decode row by
+  // the time the decode graph is captured, so this is a cold-start guard, not
+  // the steady state.
+  if (!dp4a_stage_scratch(rows, width))
+    return false;
+  int m = (int)rows, kk = (int)width;
+  int has_gamma = (gamma == nullptr)         ? 0
+                  : (!vec4 || cuda_vec4_rows_ok(4, gamma)) ? 1
+                                             : 2;
+  k->SetKernelArguments(0, &x, sizeof(x));
+  k->SetKernelArguments(1, &gamma, sizeof(gamma));
+  k->SetKernelArguments(2, &y, sizeof(y));
+  k->SetKernelArguments(3, &g_dp4a_q8, sizeof(g_dp4a_q8));
+  k->SetKernelArguments(4, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+  k->SetKernelArguments(5, &g_dp4a_azp, sizeof(g_dp4a_azp));
+  k->SetKernelArguments(6, &m, sizeof(m));
+  k->SetKernelArguments(7, &kk, sizeof(kk));
+  k->SetKernelArguments(8, &eps, sizeof(eps));
+  k->SetKernelArguments(9, &has_gamma, sizeof(has_gamma));
+  const int block[3] = {vec4 ? 512 : 256, 1, 1};
+  const int grid[3] = {(int)rows, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*k, grid, block))
+    return false;
+  mark_quant_staged(y, kk);
+  StreamManager::Global().maybeFinish();
+  return true;
+}
+
 bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X, const unsigned char *plain_w,
                                   const unsigned short *scales_fp16, float *Y,
                                   unsigned int M, unsigned int N,
@@ -1248,8 +1596,10 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
                                   unsigned int N, unsigned int K) {
   if (M == 0 || N == 0 || K == 0)
     return true;
-  auto kqh = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
-                                                      "act_quant_i8_h");
+  const bool q_vec4 = fused_normq_on() && cuda_vec4_rows_small(M) &&
+                      cuda_vec4_rows_ok(K, Xh);
+  auto kqh = CudaContext::Global().registerCudaKernel(
+    FC_QINT4_DP4A_SRC, q_vec4 ? "act_quant_i8_h_v4" : "act_quant_i8_h");
   auto kc =
     CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC, "cvt_f2h");
   if (!kqh || !kc) {
@@ -1288,17 +1638,25 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
   if (!dp4a_stage_scratch(M, K))
     return false;
   int m = (int)M, k = (int)K;
-  // 1) int8 activation quant from the fp16 input.
-  kqh->SetKernelArguments(0, &Xh, sizeof(Xh));
-  kqh->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
-  kqh->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
-  kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
-  kqh->SetKernelArguments(4, &m, sizeof(m));
-  kqh->SetKernelArguments(5, &k, sizeof(k));
-  const int qb[3] = {256, 1, 1};
-  const int qg[3] = {(int)M, 1, 1};
-  if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
-    return false;
+  // 1) int8 activation quant from the fp16 input -- unless g_dp4a_q8 already
+  // holds exactly this activation. That happens for every FC group fed by a
+  // norm (q/k/v off attention_norm, gate/up off ffn_norm): the fused
+  // norm+quant staged it, and the sibling FCs after the first one would
+  // otherwise recompute an identical buffer. The guard is pointer + K + "no
+  // kernel dispatched since", so a recycled pool address cannot impersonate
+  // the staged row.
+  if (!quant_staged_for(Xh, k)) {
+    kqh->SetKernelArguments(0, &Xh, sizeof(Xh));
+    kqh->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
+    kqh->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+    kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+    kqh->SetKernelArguments(4, &m, sizeof(m));
+    kqh->SetKernelArguments(5, &k, sizeof(k));
+    const int qb[3] = {q_vec4 ? 512 : 256, 1, 1};
+    const int qg[3] = {(int)M, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
+      return false;
+  }
   // 2) repack + GEMM writing fp16 directly: the float->fp16 conversion is
   // folded into the GEMM epilogue (out_fp16=1), removing the separate cvt_f2h
   // kernel + the FP32 staging buffer (one fewer kernel per FC -- a decode
@@ -1308,6 +1666,12 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
                             M, N, K,
                             /** out_fp16= */ 1))
     return false;
+  // Re-stamp the handoff past this FC's own dispatches so the NEXT sibling on
+  // the same activation still sees a valid staging (the GEMM bumped the
+  // sequence). With the lever off nothing is ever published, so no FC can
+  // skip its quant.
+  if (fused_normq_on())
+    mark_quant_staged(Xh, k);
   StreamManager::Global().maybeFinish();
   return true;
 }
@@ -1443,8 +1807,10 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
     return false;
   if (M == 0 || N == 0 || K == 0)
     return true;
-  auto kqh = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
-                                                      "act_quant_i8_h");
+  const bool q_vec4 = fused_normq_on() && cuda_vec4_rows_small(M) &&
+                      cuda_vec4_rows_ok(K, Xh);
+  auto kqh = CudaContext::Global().registerCudaKernel(
+    FC_QINT4_DP4A_SRC, q_vec4 ? "act_quant_i8_h_v4" : "act_quant_i8_h");
   auto kde = CudaContext::Global().registerCudaKernel(FC_QINT4_DP4A_SRC,
                                                       "dequant_i32_fp16");
   if (!kqh || !kde) {
@@ -1475,8 +1841,7 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
     const char *e = std::getenv("NNTR_QUANT_DEDUP");
     return e != nullptr && e[0] == '1';
   }();
-  const bool reuse_quant =
-    quant_dedup && Xh == g_last_quant_xh && k == g_last_quant_k;
+  const bool reuse_quant = quant_dedup && quant_staged_for(Xh, k);
   if (!reuse_quant) {
     kqh->SetKernelArguments(0, &Xh, sizeof(Xh));
     kqh->SetKernelArguments(1, &g_dp4a_q8, sizeof(g_dp4a_q8));
@@ -1484,12 +1849,10 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
     kqh->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
     kqh->SetKernelArguments(4, &m, sizeof(m));
     kqh->SetKernelArguments(5, &k, sizeof(k));
-    const int qb[3] = {256, 1, 1};
+    const int qb[3] = {q_vec4 ? 512 : 256, 1, 1};
     const int qg[3] = {(int)M, 1, 1};
     if (!StreamManager::Global().DispatchCommand(*kqh, qg, qb))
       return false;
-    g_last_quant_xh = Xh;
-    g_last_quant_k = k;
   }
 
   // 2) int8 weight [K,N] + per-channel rowsum. [i8-jit] JIT mode transpose-
@@ -1562,6 +1925,10 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
   const int dg[3] = {((int)N + 15) / 16, ((int)M + 15) / 16, 1};
   if (!StreamManager::Global().DispatchCommand(*kde, dg, db))
     return false;
+  // Re-stamp past this FC's own dispatches (the epilogue bumped the sequence)
+  // so a sibling prefill FC on the same activation can still reuse the quant.
+  if (quant_dedup)
+    mark_quant_staged(Xh, k);
   StreamManager::Global().maybeFinish();
   // Catch an ASYNC failure in the cuBLAS IMMA GEMM / epilogue (the sync cuBLAS
   // status was already checked). On Orin a large-M IMMA can fault at runtime

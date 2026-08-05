@@ -70,6 +70,9 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
     return false;
   }
   ContextManager::Global().EnsureCurrent();
+  // Counted before the launch so a caller that stamps dispatchSeq() AFTER its
+  // own dispatches sees a value no other dispatch can reproduce.
+  ++dispatch_seq_;
   auto params = kernel.getKernelParams();
   CUresult r = cuLaunchKernel(
     kernel.GetFunction(), (unsigned)grid[0], (unsigned)grid[1],
