@@ -100,6 +100,26 @@ namespace {
 std::mutex quant_lut_cache_mutex;
 std::unordered_map<std::string, std::weak_ptr<QuantLut>> quant_lut_cache;
 
+/**
+ * @brief Decode one QS4CX row: n nibbles (uint4 = int4 + 8, low nibble first)
+ *        times ONE per-row fp32 scale.
+ *
+ * Unlike Q4_0/Q6_K there are no sub-blocks and no per-block scale inside the
+ * row -- the whole row shares the scale the caller passes in, which is why
+ * QS4CX round-trips an int4-quantized embedding table exactly instead of
+ * re-quantizing it into 32-wide blocks.
+ */
+void dequantize_row_qs4cx(const uint8_t *row, float scale, float *out,
+                          size_t n) {
+  for (size_t k = 0; k + 1 < n; k += 2) {
+    const uint8_t b = row[k >> 1];
+    out[k] = (static_cast<int>(b & 0x0F) - 8) * scale;
+    out[k + 1] = (static_cast<int>(b >> 4) - 8) * scale;
+  }
+  if (n & 1u)
+    out[n - 1] = (static_cast<int>(row[(n - 1) >> 1] & 0x0F) - 8) * scale;
+}
+
 bool hasJsonExtension(const std::string &path) {
   return std::filesystem::path(path).extension() == ".json";
 }
@@ -365,6 +385,60 @@ std::shared_ptr<QuantLut> loadGgmlManifest(const std::string &manifest_path,
   return lut;
 }
 
+/**
+ * @brief QS4CX row sidecar: rows*(size+1)/2 nibbles followed by ONE contiguous
+ *        fp32 scale per row. Manifest:
+ *          {"datatype": "qs4cx", "size": <out_dim>,
+ *           "rows": <in_dim, optional>, "lut-path": "<payload>"}
+ *
+ * This is the SAME quantization the packager already applied to the embedding
+ * table upstream, so the sidecar is a byte copy and the decode is exact. The
+ * q4_0 sidecar, by contrast, has to re-quantize an already-int4 table into
+ * 32-wide blocks -- a second lossy step (measured 7.6% relative error) that
+ * buys nothing.
+ */
+std::shared_ptr<QuantLut> loadQs4cxManifest(const std::string &manifest_path,
+                                            const nlohmann::json &json) {
+  const auto lut_path = requireJsonStringField(json, "lut-path", manifest_path);
+
+  auto lut = std::make_shared<QuantLut>();
+  lut->out_dim = requireJsonSizeField(json, "size", manifest_path);
+  lut->ggml_dtype = nntrainer::TensorDim::DataType::QS4CX;
+  lut->row_bytes = (lut->out_dim + 1) / 2;
+  lut->qs4cx_groups =
+    json.contains("groups") ? requireJsonSizeField(json, "groups", manifest_path)
+                            : 1u;
+  NNTR_THROW_IF(lut->qs4cx_groups == 0 ||
+                  lut->out_dim % lut->qs4cx_groups != 0 ||
+                  (lut->out_dim / lut->qs4cx_groups) % 2 != 0,
+                std::invalid_argument)
+    << "Malformed LUT manifest " << manifest_path << ": groups "
+    << lut->qs4cx_groups << " must divide size " << lut->out_dim
+    << " into EVEN-width groups (a group boundary inside a nibble byte is not "
+       "addressable)";
+
+  attachPayload(*lut, resolveLutPath(manifest_path, lut_path));
+  // payload = rows * (row_bytes + groups*sizeof(float)): the scale block is
+  // part of the file, so the row count follows from the size and does not have
+  // to be trusted from the manifest.
+  const size_t per_row = lut->row_bytes + lut->qs4cx_groups * sizeof(float);
+  NNTR_THROW_IF(lut->payload_size() == 0 ||
+                  lut->payload_size() % per_row != 0,
+                std::runtime_error)
+    << "QS4CX LUT binary size " << lut->payload_size() << " is not rows*("
+    << lut->row_bytes << "+" << lut->qs4cx_groups << "*4) for "
+    << manifest_path;
+  lut->in_dim = lut->payload_size() / per_row;
+
+  if (json.contains("rows")) {
+    const size_t rows = requireJsonSizeField(json, "rows", manifest_path);
+    NNTR_THROW_IF(rows != lut->in_dim, std::invalid_argument)
+      << "LUT manifest " << manifest_path << " declares rows=" << rows
+      << " but payload holds " << lut->in_dim;
+  }
+  return lut;
+}
+
 std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
   std::ifstream file(manifest_path);
   NNTR_THROW_IF(!file.is_open(), std::runtime_error)
@@ -398,11 +472,13 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
   if (datatype == "q6_k")
     return loadGgmlManifest(manifest_path, json,
                             nntrainer::TensorDim::DataType::Q6_K);
+  if (datatype == "qs4cx")
+    return loadQs4cxManifest(manifest_path, json);
 
   NNTR_THROW_IF(true, std::runtime_error)
     << "Unsupported LUT datatype '" << datatype << "' in " << manifest_path
-    << ": this sidecar loader supports 'ufixed8', 'sfixed4', 'q4_0', and "
-       "'q6_k' manifests (raw UINT16 tables use a non-.json path). A '"
+    << ": this sidecar loader supports 'ufixed8', 'sfixed4', 'q4_0', 'q6_k' "
+       "and 'qs4cx' manifests (raw UINT16 tables use a non-.json path). A '"
     << datatype
     << "' sidecar needs the package regenerated with a supported LUT dtype, "
        "or a loader extension for this payload format (not included here).";
@@ -832,9 +908,18 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     ggml_lut ? quant_lut->ggml_dtype : weight_p->getDataType();
   const bool row_quant =
     (weight_dtype == nntrainer::TensorDim::DataType::Q6_K ||
-     weight_dtype == nntrainer::TensorDim::DataType::Q4_0);
+     weight_dtype == nntrainer::TensorDim::DataType::Q4_0 ||
+     weight_dtype == nntrainer::TensorDim::DataType::QS4CX);
   NNTR_THROW_IF(ggml_lut && !row_quant, std::runtime_error)
-    << "GGML sidecar LUT supports only Q4_0/Q6_K payloads";
+    << "Quantized sidecar LUT supports only Q4_0/Q6_K/QS4CX payloads";
+  // QS4CX keeps its per-row scales in one contiguous fp32 block after the
+  // whole nibble table, not inside each row like the GGML block formats, so
+  // it needs a second base pointer. Sidecar only: an in-bin QS4CX embedding
+  // record has a different (padded) extent and no validated reader here.
+  NNTR_THROW_IF(!ggml_lut &&
+                  weight_dtype == nntrainer::TensorDim::DataType::QS4CX,
+                std::runtime_error)
+    << "QS4CX embedding is supported as a sidecar LUT only";
   // Base pointer + per-row stride of the quantized row table. For the in-bin
   // weight the stride equals what the old per-branch num_blocks_per_row math
   // produced (the weight width is out_dim, fixed in finalize).
@@ -844,7 +929,16 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   const size_t row_stride =
     (weight_dtype == nntrainer::TensorDim::DataType::Q6_K)
       ? 210 * ((static_cast<size_t>(out_dim) + 255) / 256)
+    : (weight_dtype == nntrainer::TensorDim::DataType::QS4CX)
+      ? (static_cast<size_t>(out_dim) + 1) / 2
       : 18 * ((static_cast<size_t>(out_dim) + 31) / 32);
+  const float *row_scales =
+    (weight_dtype == nntrainer::TensorDim::DataType::QS4CX)
+      ? reinterpret_cast<const float *>(quant_table +
+                                        quant_lut->in_dim * row_stride)
+      : nullptr;
+  const size_t qs4cx_groups =
+    row_scales ? quant_lut->qs4cx_groups : static_cast<size_t>(1);
 
   unsigned int b_size = input_.batch();
 
@@ -877,7 +971,33 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
 #endif
 
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // True only on the CUDA device-only activation pool; declared for every
+    // build so the row loop below has ONE shape instead of two.
+    bool emb_dev_only = false;
+    void *&emb_stage = cuda_stage;
+    const auto act_dt = hidden_.getDataType();
+    const size_t act_esz =
+      (act_dt == nntrainer::TensorDim::DataType::FP32) ? 4u : 2u;
+    // The ONE spelling of "store this row into the staging". Every branch
+    // below used to open-code its own narrowing loop, which is exactly how the
+    // FP32 case went missing from all three of them.
+    auto stage_row = [&](size_t i, const float *src, float s) {
+      char *base = static_cast<char *>(emb_stage) + i * out_dim * act_esz;
+      if (act_dt == nntrainer::TensorDim::DataType::FP32) {
+        float *o = reinterpret_cast<float *>(base);
+        for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+          o[k] = src[k] * s;
+      }
+#ifdef ENABLE_FP16
+      else {
+        _FP16 *o = reinterpret_cast<_FP16 *>(base);
+        for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+          o[k] = static_cast<_FP16>(src[k] * s);
+      }
+#endif
+    };
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     // Device-only activation pool (NNTR_CUDA_DEV_ACT): the embedding output is
     // real device memory (not host-addressable). Dequant into a host staging
     // buffer and push it H2D on the backend stream. Persistent + PINNED host
@@ -890,29 +1010,47 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // both run this method, and a shared static let the PLE overwrite
     // embedding0's still-in-flight async copy. Grows monotonically (decode
     // iter==1; prefill iter<=max_seq_len); single sequence (b_size==1).
-    _FP16 *&emb_stage = *reinterpret_cast<_FP16 **>(&cuda_stage);
+    //
+    // Sized and written in BYTES, and armed for an FP32 activation as well as
+    // an FP16 one. It used to be typed _FP16 and gated on the output being
+    // FP16, which silently made the whole mechanism vanish under an FP32
+    // activation: the residency probe never ran, so every branch below took
+    // its host-write path straight into a cudaMalloc pointer. That is a
+    // segfault, not a slow path -- and it hid behind the fact that the shipped
+    // packages happen to be FP16. The same applies to an fp16-DISABLED build,
+    // where this block used to compile away entirely.
     size_t &emb_stage_cap = cuda_stage_cap;
-    bool emb_dev_only = false;
     if (nntrainer::cuda::engine_selected() &&
-        hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+        (act_dt == nntrainer::TensorDim::DataType::FP32 ||
+         act_dt == nntrainer::TensorDim::DataType::FP16)) {
       cudaPointerAttributes pa{};
       emb_dev_only =
-        cudaPointerGetAttributes(&pa, batchsliced_hidden.getData<_FP16>()) ==
+        cudaPointerGetAttributes(&pa, batchsliced_hidden.getData<char>()) ==
           cudaSuccess &&
         pa.type == cudaMemoryTypeDevice;
       cudaGetLastError();
+#ifndef ENABLE_FP16
+      // An FP16 activation cannot be staged by a build with no _FP16 type.
+      // Refuse by name rather than fall through to the host write that used to
+      // happen here.
+      NNTR_THROW_IF(emb_dev_only &&
+                      act_dt == nntrainer::TensorDim::DataType::FP16,
+                    std::runtime_error)
+        << "embedding: FP16 activation on the device-only CUDA pool needs an "
+           "fp16-enabled build";
+#endif
       if (emb_dev_only) {
         // Async-mode: the previous token's H2D from this pinned buffer may
         // still be in flight -- wait before the host rewrites or frees it.
         emb_stage_h2d_wait();
-        size_t need = (size_t)iter * out_dim;
+        size_t need = (size_t)iter * out_dim * act_esz;
         if (need > emb_stage_cap) {
           if (emb_stage)
             cudaFreeHost(emb_stage);
-          cudaHostAlloc((void **)&emb_stage, need * sizeof(_FP16),
-                        cudaHostAllocDefault);
+          cudaHostAlloc(&emb_stage, need, cudaHostAllocDefault);
           emb_stage_cap = need;
         }
+        emb_dev_only = (emb_stage != nullptr);
       }
     }
 #endif
@@ -927,98 +1065,70 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       nntrainer::Tensor out_tensor =
         batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
-      if (weight_dtype == nntrainer::TensorDim::DataType::Q6_K) {
+      if (row_quant) {
         ///@note this should be replaced with quantizer operation
-        const void *src =
-          static_cast<const void *>(quant_table + row_stride * embed_idx);
-        if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP32) {
-          nntrainer::dequantize_row_q6_K(src, out_tensor.getData(), out_dim);
-        } else {
-          // dequantize_row_* writes FP32; under a non-FP32 (e.g. FP16)
-          // activation, writing straight into out_tensor corrupts the embedding
-          // (and overruns the buffer by 2x). Dequantize into an FP32 temp then
-          // cast into the activation dtype.
-          nntrainer::TensorDim fp32_dim(
-            {1, 1, 1, out_dim}, nntrainer::TensorDim::TensorType(
-                                  out_tensor_dim.getFormat(),
-                                  nntrainer::TensorDim::DataType::FP32));
-          nntrainer::Tensor tmp(fp32_dim, true);
-          nntrainer::dequantize_row_q6_K(src, tmp.getData(), out_dim);
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
-          if (emb_dev_only) {
-            // device-only output: cast into the pinned staging (scale folded;
-            // the trailing multiply_i below is skipped on this path).
-            const float *tp = tmp.getData();
-            _FP16 *o = emb_stage + (size_t)i * out_dim;
-            for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
-              o[k] = static_cast<_FP16>(tp[k] * scale);
-          } else
-#endif
-            out_tensor.copyData(tmp);
+        const uint8_t *src = quant_table + row_stride * embed_idx;
+        // dequantize_row_* writes FP32. Writing it straight into out_tensor is
+        // only legal when the activation IS FP32 *and* the output is host
+        // memory; otherwise it either corrupts the row (a 2x buffer overrun
+        // under FP16) or faults (device-only pool). Everything else goes
+        // through an FP32 temp.
+        const bool direct =
+          !emb_dev_only &&
+          out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP32;
+        nntrainer::TensorDim fp32_dim(
+          {1, 1, 1, out_dim},
+          nntrainer::TensorDim::TensorType(
+            out_tensor_dim.getFormat(), nntrainer::TensorDim::DataType::FP32));
+        nntrainer::Tensor tmp;
+        if (!direct)
+          tmp = nntrainer::Tensor(fp32_dim, true);
+        float *dst = direct ? out_tensor.getData() : tmp.getData();
+        if (weight_dtype == nntrainer::TensorDim::DataType::Q6_K)
+          nntrainer::dequantize_row_q6_K(src, dst, out_dim);
+        else if (weight_dtype == nntrainer::TensorDim::DataType::Q4_0)
+          nntrainer::dequantize_row_q4_0(src, dst, out_dim);
+        else {
+          const size_t glen = out_dim / qs4cx_groups;
+          for (size_t g = 0; g < qs4cx_groups; ++g)
+            dequantize_row_qs4cx(src + g * (glen / 2),
+                                 row_scales[embed_idx * qs4cx_groups + g],
+                                 dst + g * glen, glen);
         }
-      } else if (weight_dtype == nntrainer::TensorDim::DataType::Q4_0) {
-        ///@note this should be replaced with quantizer operation
-        const void *src =
-          static_cast<const void *>(quant_table + row_stride * embed_idx);
-        if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP32) {
-          nntrainer::dequantize_row_q4_0(src, out_tensor.getData(), out_dim);
-        } else {
-          // dequantize_row_* writes FP32; under a non-FP32 (e.g. FP16)
-          // activation, writing straight into out_tensor corrupts the embedding
-          // (and overruns the buffer by 2x). Dequantize into an FP32 temp then
-          // cast into the activation dtype.
-          nntrainer::TensorDim fp32_dim(
-            {1, 1, 1, out_dim}, nntrainer::TensorDim::TensorType(
-                                  out_tensor_dim.getFormat(),
-                                  nntrainer::TensorDim::DataType::FP32));
-          nntrainer::Tensor tmp(fp32_dim, true);
-          nntrainer::dequantize_row_q4_0(src, tmp.getData(), out_dim);
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
-          if (emb_dev_only) {
-            const float *tp = tmp.getData();
-            _FP16 *o = emb_stage + (size_t)i * out_dim;
-            for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
-              o[k] = static_cast<_FP16>(tp[k] * scale);
-          } else
-#endif
-            out_tensor.copyData(tmp);
-        }
+        if (direct)
+          ; // scale applied by the multiply_i tail below
+        else if (emb_dev_only)
+          stage_row(i, dst, scale); // scale folded; skips the tail
+        else
+          out_tensor.copyData(tmp);
       } else {
         nntrainer::Tensor cur_weight =
           weight_p->getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
         // Ask cur_weight, the row view this branch is about to read, rather
         // than the whole-weight handle: the two always carry the same dtype,
         // and cur_weight is the one name that survives a loader change to how
         // the embedding weight is held (a raw Tensor here, a pointer that may
-        // be null on the sidecar path elsewhere). This block only compiles
-        // under -Denable-cuda=true, so a stale name here is invisible to every
-        // other build.
-        if (emb_dev_only &&
-            cur_weight.getDataType() == nntrainer::TensorDim::DataType::FP32) {
-          // FP32 weight row -> FP16 device-only output: explicit narrowing
-          // cast into the pinned staging (copyData would byte-copy 2x and the
-          // host write would fault on the device-only buffer). Scale folded.
-          const float *src = cur_weight.getData<float>();
-          _FP16 *o = emb_stage + (size_t)i * out_dim;
-          for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
-            o[k] = static_cast<_FP16>(src[k] * scale);
+        // be null on the sidecar path elsewhere).
+        if (emb_dev_only) {
+          NNTR_THROW_IF(cur_weight.getDataType() !=
+                          nntrainer::TensorDim::DataType::FP32,
+                        std::runtime_error)
+            << "embedding: staging an unquantized weight for the device-only "
+               "CUDA pool needs an FP32 weight record";
+          stage_row(i, cur_weight.getData<float>(), scale);
           return;
         }
-#endif
         out_tensor.copyData(cur_weight);
       }
 
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
       if (emb_dev_only)
         return; // scale already folded into the staging cast
-#endif
       if (scale != 1.0f) {
         out_tensor.multiply_i(scale);
       }
     });
 
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     // Push the host-dequantized rows into the device-only output on the
     // backend stream (ordered before the GPU consumer). Windows default is a
     // fully-synchronous upload (the async H2D under DEV_ACT was the measured
@@ -1034,15 +1144,13 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         return false;
 #endif
       }();
+      void *dst = batchsliced_hidden.getData<char>();
+      const size_t bytes = (size_t)iter * out_dim * act_esz;
       if (emb_synccopy &&
           !nntrainer::cuda::StreamManager::Global().isCapturing()) {
-        cudaMemcpy(batchsliced_hidden.getData<_FP16>(), emb_stage,
-                   (size_t)iter * out_dim * sizeof(_FP16),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpy(dst, emb_stage, bytes, cudaMemcpyHostToDevice);
       } else {
-        cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
-                        (size_t)iter * out_dim * sizeof(_FP16),
-                        cudaMemcpyHostToDevice,
+        cudaMemcpyAsync(dst, emb_stage, bytes, cudaMemcpyHostToDevice,
                         nntrainer::cuda::StreamManager::Global().GetStream());
         emb_stage_h2d_record();
       }

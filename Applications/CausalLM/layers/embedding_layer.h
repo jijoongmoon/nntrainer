@@ -92,6 +92,14 @@ struct QuantLut {
     nntrainer::TensorDim::DataType::NONE;
   size_t row_bytes = 0; ///< payload stride per row (ggml mode)
 
+  /// QS4CX only: how many equal-width scale groups a row is split into. 1 =
+  /// one scale for the whole row (a plain per-channel table). >1 is the packed
+  /// per-layer table, which is several independently quantized sub-tables
+  /// concatenated along the row -- each keeps its own scale, so the sidecar
+  /// stays an exact copy of what the packager quantized instead of being
+  /// re-quantized into a single-scale row.
+  size_t qs4cx_groups = 1;
+
   void *mmap_ptr = nullptr;
   size_t mmap_len = 0;
 
@@ -252,7 +260,7 @@ private:
   /// per_layer_input_embedding cannot overwrite each other's in-flight H2D.
   /// Grows monotonically; process lifetime (freed only on regrow).
   void *cuda_stage = nullptr;
-  size_t cuda_stage_cap = 0; ///< capacity in _FP16 elements
+  size_t cuda_stage_cap = 0; ///< capacity in BYTES (activation dtype varies)
 };
 } // namespace causallm
 
