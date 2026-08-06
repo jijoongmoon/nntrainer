@@ -485,6 +485,10 @@ TEST(blas_kernels, addition_i) {
   EXPECT_IN_RANGE((float)cosSim, 0.99, 1);
 }
 
+// nrm2Cl / asumCl are CLBlast-only wrapper routes: they exist only when the
+// CLBlast subproject is linked (-Denable-clblast=true, not the default), so
+// these two cases are compiled out of a clblast-free build.
+#ifdef ENABLE_CLBLAST
 TEST(blas_kernels, l2norm) {
   const int batch = 1;
   const int channel = 1;
@@ -544,6 +548,7 @@ TEST(blas_kernels, absolute_sum) {
 
   EXPECT_FLOAT_EQ(cpu_result, gpu_result);
 }
+#endif // ENABLE_CLBLAST
 
 TEST(blas_kernels, rmsnorm_fp32) {
   const int batch = 1;
@@ -914,6 +919,8 @@ TEST(blas_kernels, sgemv_3072_20120_noTrans) {
   EXPECT_IN_RANGE((float)cosSim, 0.99, 1);
 }
 
+// multiplyCl routes FP32 through CLBlast's scal_cl; compiled out with it.
+#ifdef ENABLE_CLBLAST
 TEST(blas_kernels, multiply_i) {
   const int batch = 1;
   const int channel = 1;
@@ -954,6 +961,7 @@ TEST(blas_kernels, multiply_i) {
   EXPECT_IN_RANGE(mseError, 0, epsilon);
   EXPECT_IN_RANGE(cosSim, 0.99, 1);
 }
+#endif // ENABLE_CLBLAST
 
 TEST(blas_kernels, dot_gemm_50_768_1024_noTrans_fp16) {
   const int batch = 1;

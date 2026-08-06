@@ -117,9 +117,21 @@ void ReshapeLayerCl::incremental_forwarding(RunLayerContext &context,
 
 void ReshapeLayerCl::ReshapeProcess(Tensor const &input, Tensor &output) {
   if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
+#ifdef ENABLE_CLBLAST
     const float *data = input.getData();
     float *rdata = output.getData();
     copy_cl(output.size(), data, rdata);
+#else
+    // The FP32 reshape copies through CLBlast's copy_cl, the only CLBlast
+    // dependency left in the layers. The layer stays registered (its
+    // availability is part of the GPU layer contract and the FP16 path uses an
+    // in-tree kernel), so the FP32 forward is what reports the missing route.
+    throw std::runtime_error(
+      "ReshapeLayerCl: the FP32 reshape copies through the CLBlast copy_cl "
+      "route, which this build excludes (-Denable-clblast=false, the default). "
+      "Re-build with -Denable-clblast=true, or use the FP16 path, which uses "
+      "the in-tree copy kernel.");
+#endif
   } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     unsigned int input_batch_size, input_height, input_width, input_channels;

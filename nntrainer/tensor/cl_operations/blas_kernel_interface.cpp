@@ -144,8 +144,9 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
   const bool res_svm = is_svm(result);
 
   // FP32 routed every NCHW case through CLBlast (dot_cl / gemv_cl / gemm_cl).
-  // With -Denable-clblast=false -- the default on this tree -- those are throw
-  // stubs, so a dense FP32 FC on the OpenCL lane had no implementation at all.
+  // With -Denable-clblast=false -- the default on every platform -- those are
+  // throw stubs, so a dense FP32 FC on the OpenCL lane had no implementation at
+  // all.
   // The in-tree sgemv_cl / sgemm_cl kernels cover exactly these shapes (they
   // are what the FP16 side has always used, and both dtypes share the same
   // kernel indexing), so fall back to them instead of throwing. CLBlast builds
@@ -252,6 +253,13 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
   }
 }
 
+#ifdef ENABLE_CLBLAST
+// The scal/copy/norm wrappers below are the last general-purpose
+// BLAS-on-OpenCL routes: their FP32 halves reach CLBlast (scal_cl / copy_cl /
+// nrm2_cl / asum_cl / amax_cl / amin_cl) and no layer or op in the tree calls
+// them. A clblast-free build compiles them out entirely rather than shipping
+// stubs, so a new consumer fails at compile time instead of silently pulling
+// CLBlast back into the link.
 void multiplyCl(Tensor &input, float const &value) {
   if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
     float *data = input.getData<float>();
@@ -268,6 +276,7 @@ void multiplyCl(Tensor &input, float const &value) {
 #endif
   }
 }
+#endif // ENABLE_CLBLAST
 
 void add_i_cl(Tensor &result, Tensor const &input) {
 
@@ -377,6 +386,9 @@ void transposeCl(const std::string &direction, Tensor const &in,
   }
 }
 
+#ifdef ENABLE_CLBLAST
+// See the note on multiplyCl above: CLBlast-only wrapper routes with no
+// in-tree consumer, compiled out of a clblast-free build.
 void copyCl(const Tensor &input, Tensor &result) {
   if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
     const float *data = input.getData();
@@ -455,6 +467,7 @@ int aminCl(const Tensor &input) {
 
   return result;
 }
+#endif // ENABLE_CLBLAST
 
 } // namespace nntrainer
 

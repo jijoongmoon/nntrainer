@@ -56,13 +56,17 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result,
 void dotBatchedCl(Tensor const &input, Tensor const &m, Tensor &result,
                   bool trans = false, bool trans_m = false);
 
+#ifdef ENABLE_CLBLAST
 /**
  * @brief Multiply value element by element immediately
  * @param[in] input Tensor
  * @param[in] value multiplier
  * @param[in] RunLayerContext reference
+ * @note CLBlast-only wrapper route (scal_cl); declared only when CLBlast is
+ * linked so a new consumer fails at compile time on a clblast-free build.
  */
 void multiplyCl(Tensor &input, float const &value);
+#endif // ENABLE_CLBLAST
 
 /**
  * @brief Process data and dimensions for add operation
@@ -144,11 +148,13 @@ bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes);
 void transposeCl(const std::string &direction, Tensor const &in,
                  Tensor &result);
 
+#ifdef ENABLE_CLBLAST
 /**
  * @brief Copy data from one tensor to another
  *
  * @param input Tensor
  * @param result Tensor
+ * @note CLBlast-only wrapper route (copy_cl); see multiplyCl above.
  */
 void copyCl(const Tensor &input, Tensor &result);
 
@@ -185,6 +191,7 @@ int amaxCl(const Tensor &input);
  * @note Not necessarily the first if there are multiple minimums.
  */
 int aminCl(const Tensor &input);
+#endif // ENABLE_CLBLAST
 
 /**
  * @brief v8c GPU path entry point — paper 8/4/4 (arXiv:2505.00232): int8

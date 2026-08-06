@@ -20,6 +20,16 @@ ARM_MARCH_FLAGS := $(ARM_MARCH_FLAGS)
 endif
 
 
+# CLBlast is optional and off by default, matching -Denable-clblast=false in
+# meson_options.txt. Only a build configured with -Denable-clblast=true leaves a
+# libclblast.a for the test executables to link, and jni/Android.mk.in gates the
+# same way (MESON_HAS_CLBLAST, substituted by jni/meson.build); set it in the
+# environment to match the nntrainer build being tested.
+ifndef MESON_HAS_CLBLAST
+MESON_HAS_CLBLAST := 0
+endif
+
+
 ML_API_COMMON_INCLUDES := ${NNTRAINER_ROOT}/ml_api_common/include
 NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/nntrainer \
 	$(NNTRAINER_ROOT)/nntrainer/dataset \
@@ -68,12 +78,14 @@ LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/jni/$(TARGET_ARCH_ABI)/libOpenCL.s
 
 include $(PREBUILT_SHARED_LIBRARY)
 
+ifeq ($(MESON_HAS_CLBLAST), 1)
 include $(CLEAR_VARS)
 
 LOCAL_MODULE := clblast
 LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/obj/local/$(TARGET_ARCH_ABI)/libclblast.a
 
 include $(PREBUILT_STATIC_LIBRARY)
+endif
 endif
 
 include $(CLEAR_VARS)
@@ -120,7 +132,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -143,7 +157,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -166,7 +182,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -190,7 +208,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -214,7 +234,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -238,7 +260,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -262,7 +286,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -285,7 +311,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -308,7 +336,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -331,7 +361,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -356,7 +388,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -378,7 +412,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -400,7 +436,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -422,7 +460,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -444,7 +484,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -466,7 +508,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -488,7 +532,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -512,7 +558,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -536,7 +584,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -562,7 +612,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -592,7 +644,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -662,7 +716,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -685,7 +741,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -707,7 +765,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -729,7 +789,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -752,7 +814,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -775,7 +839,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -797,7 +863,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -819,7 +887,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)
@@ -893,7 +963,9 @@ LOCAL_STATIC_LIBRARIES := googletest_main test_util
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 LOCAL_SHARED_LIBRARIES += opencl
+ifeq ($(MESON_HAS_CLBLAST), 1)
 LOCAL_STATIC_LIBRARIES += clblast
+endif
 endif
 
 include $(BUILD_EXECUTABLE)

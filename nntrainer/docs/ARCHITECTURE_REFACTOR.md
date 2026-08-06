@@ -1121,10 +1121,12 @@ parallel to the WDDM addendum above:
 1. **CLBlast fully retired from the LLM path** (commit `358aa4f66`): `enable-clblast` now defaults to
    **false on every platform** (Windows already did; Linux/Android now match) — no LLM-path op
    consumes it (`dotCl` dispatches the native CL kernels for both FP32 and FP16/v8c), and the
-   remaining call sites (`multiplyCl`/`copyCl`/`l2normCl`/`absolute*Cl`, `ReshapeLayerCl::copy_cl`)
-   are dead LLM-path wrappers now compiled as descriptive throwing stubs, not real consumers. This is
-   orthogonal to the op_table refactor above — it is a kernel-internal/build-config change, not a
-   dispatch-seam one.
+   remaining call sites (`multiplyCl`/`copyCl`/`nrm2Cl`/`asumCl`/`amaxCl`/`aminCl`,
+   `ReshapeLayerCl::copy_cl`) are dead LLM-path wrappers, not real consumers: they are compiled out
+   of a clblast-free build behind `#ifdef ENABLE_CLBLAST`, so a new consumer fails at compile time
+   instead of silently linking CLBlast back in (`ReshapeLayerCl`'s FP32 forward keeps its
+   registration and throws a named error). This is orthogonal to the op_table refactor above — it is
+   a kernel-internal/build-config change, not a dispatch-seam one.
 2. **OpenCL SVM read-back coherence hazard** (commit `141f5ec0a`) — the OpenCL sibling of the CUDA
    UVM/`isSVM()` findings above (item 1): the same bug *class*, a memory-plane assumption silently
    violated. Two independent silent-drop defects: CLBlast's FP32 `Gemm` returned `CL_SUCCESS`/`kSuccess`
