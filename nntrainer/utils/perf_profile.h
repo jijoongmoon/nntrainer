@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-// Minimal RAII timer + global bucket registry for FP16 vs FP32 path profiling.
-// Single-process, lock-protected (cheap: only outer-layer scopes are timed,
-// not inner parallel_for callbacks). Compiled into causallm_core; main.cpp
-// calls PerfBucket::dump() once at the end of generation to print sorted
-// totals.
+/**
+ * Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
+ *
+ * @file   perf_profile.h
+ * @date   22 May 2026
+ * @brief  Minimal RAII timer + global bucket registry for FP16 vs FP32 path
+ *         profiling.
+ * @see    https://github.com/nnstreamer/nntrainer
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug    No known bugs except for NYI items
+ *
+ * @note Single-process, lock-protected (cheap: only outer-layer scopes are
+ * timed, not inner parallel_for callbacks). Compiled into causallm_core;
+ * main.cpp calls PerfBucket::dump() once at the end of generation to print
+ * sorted totals.
+ */
 
 #ifndef __CAUSALLM_PERF_PROFILE_H__
 #define __CAUSALLM_PERF_PROFILE_H__
