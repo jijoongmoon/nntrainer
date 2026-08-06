@@ -1040,9 +1040,13 @@ void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
   std::string kernel_func_;
   std::string sgemm_cl_kernel_;
 
+  // Only the noTrans kernel is register-blocked; the transposing ones keep the
+  // one-output-per-work-item 16x16 tiling (see GemmTiling's default).
+  GemmTiling tiling;
   if (!TransA && !TransB) {
     kernel_func_ = "sgemm_cl_noTrans";
     sgemm_cl_kernel_ = sgemm_no_trans_kernel;
+    tiling = GemmTiling{64, 64, 4, 4};
   } else if (TransA && !TransB) {
     kernel_func_ = "sgemm_cl_transA";
     sgemm_cl_kernel_ = sgemm_trans_a_kernel;
@@ -1063,8 +1067,8 @@ void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
                        N, K);
 
   sgemm_cl_internal<float>(kernel_sgemm_ptr, TransA, TransB, A, B, C, M, N, K,
-                           lda, ldb, ldc, "sgemm_cl<fp32>", a_svm, b_svm,
-                           c_svm);
+                           lda, ldb, ldc, "sgemm_cl<fp32>", a_svm, b_svm, c_svm,
+                           tiling);
 }
 
 void addition_cl(const float *input, float *res, unsigned int size_input,

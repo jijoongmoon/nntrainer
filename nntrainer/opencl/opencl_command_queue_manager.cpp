@@ -76,6 +76,22 @@ bool profEnabled() {
 
 } // namespace
 
+// Give dumpProfile() a caller, so NNTR_OPENCL_PROFILING=1 actually reports.
+// Registering from CreateCommandQueue puts this after the CL context singleton
+// exists, so the handler runs BEFORE that singleton's destructor.
+static void registerProfileAtexitOnce() {
+  static const bool registered = []() {
+    // Touch the record store FIRST: its function-local static destructor is
+    // registered on first use, and exit runs the two lists in reverse
+    // registration order. Registering our handler before the store exists
+    // would destroy the store first and hash a freed std::string.
+    profRecs().reserve(1024);
+    std::atexit([]() { CommandQueueManager::Global().dumpProfile("ATEXIT"); });
+    return true;
+  }();
+  (void)registered;
+}
+
 void CommandQueueManager::setSvmCoherenceDrain(bool enable) {
   svm_coherence_drain_ = enable ? 1 : 0;
   ml_logi("[CL] SVM coherence drain %s", enable ? "ON" : "OFF");
@@ -147,6 +163,7 @@ bool CommandQueueManager::CreateCommandQueue() {
   // tax in production runs. Set NNTR_OPENCL_PROFILING=1 to enable.
   if (std::getenv("NNTR_OPENCL_PROFILING")) {
     qprops |= CL_QUEUE_PROFILING_ENABLE;
+    registerProfileAtexitOnce();
   }
   // returns NULL with error code if fails
   command_queue_ =

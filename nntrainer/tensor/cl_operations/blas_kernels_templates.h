@@ -63,6 +63,38 @@ namespace nntrainer {
   } while (0)
 
 /**
+ * @brief Number of work-items that cooperate on one GEMV output row.
+ *
+ * MUST equal KSPLIT in sgemv.cl / sgemv_no_trans.cl / hgemv.cl /
+ * hgemv_no_trans.cl: the kernels index their reduction scratch by
+ * get_local_id(1) and the host is what sizes that dimension.
+ */
+constexpr unsigned int GEMV_KSPLIT = 8;
+
+/**
+ * @brief Cap on the row-axis work-group size, matching MAXLWSX in those same
+ * kernels -- their reduction scratch is a fixed KSPLIT x MAXLWSX array.
+ */
+constexpr unsigned int GEMV_MAX_LWS_X = 32;
+
+/**
+ * @brief Largest row-axis work-group size that exactly divides @a n.
+ *
+ * The dense GEMV kernels are one-output-per-row-of-work-items and carry no
+ * bounds guard, so the global size must stay exactly @a n and the local size
+ * must divide it. Picking an exact divisor keeps that contract; a shape with no
+ * good divisor degrades to a single row per group rather than reading out of
+ * range.
+ */
+inline int selectGemvLws(unsigned int n, unsigned int cap = GEMV_MAX_LWS_X) {
+  for (unsigned int w = cap; w >= 2; w >>= 1) {
+    if (n % w == 0)
+      return (int)w;
+  }
+  return 1;
+}
+
+/**
  * @brief GEMV on OpenCL.
  *
  * @note Each of A / X / Y is bound either as an SVM pointer (when the caller
@@ -136,8 +168,18 @@ inline static void sgemv_cl_internal(ClContext::SharedPtrClKernel kernel,
   NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(4, &lda, sizeof(int)), op,
                        "bind lda", dim1, dim2, lda);
 
-  const int work_groups_count[3] = {(int)dim1, 1, 1};
-  const int work_group_size[3] = {1, 1, 1};
+  // Axis 0 walks the outputs, axis 1 splits the reduction GEMV_KSPLIT ways.
+  //
+  // The previous geometry was a flat {dim1,1,1} global over {1,1,1} groups:
+  // one work-item per output, each alone in its work-group. That runs one lane
+  // per hardware thread, leaves neighbouring outputs -- which the transposed
+  // kernel reads as CONSECUTIVE addresses -- in separate groups so nothing
+  // coalesces, and offers only dim1 work-items to hide memory latency with.
+  // Measured on a 2688x2688 dense FP16 FC on the Intel lane: 7.5 ms/call,
+  // ~1.9 GB/s, against a weight plane the quantized GEMV streams at ~66 GB/s.
+  const int lws_x = selectGemvLws(dim1);
+  const int work_groups_count[3] = {(int)dim1, (int)GEMV_KSPLIT, 1};
+  const int work_group_size[3] = {lws_x, (int)GEMV_KSPLIT, 1};
 
   NNTR_CL_BLAS_REQUIRE(
     q.DispatchCommand(kernel, work_groups_count, work_group_size), op,
@@ -224,11 +266,29 @@ T dot_cl_internal(ClContext::SharedPtrClKernel kernel, const T *vecAdata,
 }
 
 /**
+ * @brief Output tiling of one GEMM kernel, i.e. how it maps outputs to
+ * work-items. @a tile_m / @a tile_n are the output tile a work-group owns and
+ * @a wpt_m / @a wpt_n how many of those rows/cols each work-item computes, so
+ * the work-group is (tile_n/wpt_n) x (tile_m/wpt_m) work-items. The default is
+ * the one-output-per-work-item 16x16 tiling the transposing kernels use.
+ */
+struct GemmTiling {
+  unsigned int tile_m = 16;
+  unsigned int tile_n = 16;
+  unsigned int wpt_m = 1;
+  unsigned int wpt_n = 1;
+};
+
+/**
  * @brief GEMM on OpenCL.
  *
  * @note See sgemv_cl_internal() for why each of A / B / C is bound either as
  * an SVM pointer or through the shared staging buffers -- a coarse-grained SVM
  * destination silently swallows the clEnqueueReadBufferRect read-back.
+ *
+ * @note @a tiling must describe the kernel actually passed in: the tile sizes
+ * are compiled into the kernel source, and only the launch geometry is chosen
+ * here.
  */
 template <typename T = float>
 inline static void
@@ -236,7 +296,7 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
                   const T *A, const T *B, T *C, unsigned int M, unsigned int N,
                   unsigned int K, unsigned int lda, unsigned int ldb,
                   unsigned int ldc, const char *op, bool a_svm, bool b_svm,
-                  bool c_svm) {
+                  bool c_svm, GemmTiling tiling = {}) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   auto &clbuffInstance = ClBufferManager::Global();
@@ -292,12 +352,17 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
   NNTR_CL_BLAS_REQUIRE(kernel->SetKernelArguments(5, &K, sizeof(int)), op,
                        "bind K", M, N, K);
 
-  const int tiled_size = 16;
+  // Round the output up to whole tiles, then hand each work-item wpt_m x
+  // wpt_n of them (the kernel guards its stores, so the rounded-up edge is
+  // computed and dropped).
+  const unsigned int tiles_m = (M + tiling.tile_m - 1) / tiling.tile_m;
+  const unsigned int tiles_n = (N + tiling.tile_n - 1) / tiling.tile_n;
   const int work_groups_count[3] = {
-    (int)((N + tiled_size - 1) / tiled_size) * tiled_size,
-    (int)((M + tiled_size - 1) / tiled_size) * tiled_size, 1}; // test-value
+    (int)(tiles_n * (tiling.tile_n / tiling.wpt_n)),
+    (int)(tiles_m * (tiling.tile_m / tiling.wpt_m)), 1};
 
-  const int work_group_size[3] = {tiled_size, tiled_size, 1}; // test-value
+  const int work_group_size[3] = {(int)(tiling.tile_n / tiling.wpt_n),
+                                  (int)(tiling.tile_m / tiling.wpt_m), 1};
 
   NNTR_CL_BLAS_REQUIRE(
     q.DispatchCommand(kernel, work_groups_count, work_group_size), op,
