@@ -875,8 +875,8 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
 // cuBLAS fp16 GEMMs (QK^T -> softmax -> PV) is far faster and
 // head_dim-agnostic, so it also helps the head_dim=128 (qwen3/llama) case that
 // block-Q does not. Layout (interleaved fp16, column-major cuBLAS): per
-// query-head h (kv-head hkv=h/gqa) scores_cm[N_kv,N_q] = K_h^T@Q_h reads back
-// as row-major scores[N_q,N_kv]; then O_cm[d,N_q] = V_h@scores_cm.
+// query-head h (kv-head hkv=h/gqa) scores_cm[N_kv,N_q] = K_h^T * Q_h reads back
+// as row-major scores[N_q,N_kv]; then O_cm[d,N_q] = V_h * scores_cm.
 float *g_scores = nullptr;
 size_t g_scores_cap = 0;
 std::mutex g_ga_mtx;

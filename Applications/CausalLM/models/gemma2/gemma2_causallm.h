@@ -3,6 +3,7 @@
  * Copyright (C) 2025 Jijoong Moon <jijoong.moon@samsung.com>
  *
  * @file   gemma2_causallm.h
+ * @brief  Gemma2 causal language model implementation.
  * @date   08 Jun 2026
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
