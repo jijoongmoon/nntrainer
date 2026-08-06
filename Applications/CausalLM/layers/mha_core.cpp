@@ -1048,12 +1048,12 @@ namespace causallm {
 // derivatives used by S25/S26 Ultra; the target attribute pulls the
 // fp16fml ISA extension in only for this function so the rest of the TU
 // can stay on the build-wide -march flags.
-__attribute__((target(
-  "arch=armv8.2-a+fp16+fp16fml+dotprod+i8mm"))) static inline void
-mha_qk_fmlal_f16xf16_to_f32(
-  const __fp16 *A, const __fp16 *B, float *C, unsigned int M, unsigned int N,
-  unsigned int K, float alpha, unsigned int lda, unsigned int ldb,
-  unsigned int ldc) {
+__attribute__((
+  target("arch=armv8.2-a+fp16+fp16fml+dotprod+i8mm"))) static inline void
+mha_qk_fmlal_f16xf16_to_f32(const __fp16 *A, const __fp16 *B, float *C,
+                            unsigned int M, unsigned int N, unsigned int K,
+                            float alpha, unsigned int lda, unsigned int ldb,
+                            unsigned int ldc) {
   for (unsigned int m = 0; m < M; ++m) {
     const __fp16 *a_row = A + (size_t)m * lda;
     float *c_row = C + (size_t)m * ldc;

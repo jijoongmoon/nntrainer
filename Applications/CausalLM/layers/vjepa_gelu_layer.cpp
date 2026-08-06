@@ -65,9 +65,8 @@ static void gelu_parallel(const _FP16 *X, _FP16 *Y, size_t n) {
     chunk(0, n);
     return;
   }
-  tm.parallel_for(0, static_cast<size_t>(nt), [=](size_t t) {
-    chunk((n * t) / nt, (n * (t + 1)) / nt);
-  });
+  tm.parallel_for(0, static_cast<size_t>(nt),
+                  [=](size_t t) { chunk((n * t) / nt, (n * (t + 1)) / nt); });
 }
 #endif
 

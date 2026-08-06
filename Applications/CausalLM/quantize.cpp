@@ -390,11 +390,10 @@ void registerAllModels() {
         cfg, generation_cfg, nntr_cfg);
     });
 #endif
-  factory.registerModel("VJEPA2ViT",
-                        [](json cfg, json generation_cfg, json nntr_cfg) {
-                          return std::make_unique<causallm::VJEPA2ViT>(
-                            cfg, generation_cfg, nntr_cfg);
-                        });
+  factory.registerModel("VJEPA2ViT", [](json cfg, json generation_cfg,
+                                        json nntr_cfg) {
+    return std::make_unique<causallm::VJEPA2ViT>(cfg, generation_cfg, nntr_cfg);
+  });
 }
 
 /**

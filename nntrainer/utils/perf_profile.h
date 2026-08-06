@@ -74,12 +74,11 @@ private:
 
 class PerfScope {
 public:
-  explicit PerfScope(const char *name)
-    : name_(name), start_(std::chrono::steady_clock::now()) {}
+  explicit PerfScope(const char *name) :
+    name_(name), start_(std::chrono::steady_clock::now()) {}
   ~PerfScope() {
     auto end = std::chrono::steady_clock::now();
-    double ms =
-      std::chrono::duration<double, std::milli>(end - start_).count();
+    double ms = std::chrono::duration<double, std::milli>(end - start_).count();
     PerfBucket::global().add(name_, ms);
   }
 

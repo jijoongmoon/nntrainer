@@ -75,9 +75,8 @@ static void layernorm_parallel(const T *X, T *Y, const float *gamma,
       var *= invW;
       const float inv = 1.0f / std::sqrt(var + eps);
       for (unsigned int j = 0; j < W; ++j)
-        y[j] = static_cast<T>((static_cast<float>(x[j]) - mean) * inv *
-                                gamma[j] +
-                              beta[j]);
+        y[j] = static_cast<T>(
+          (static_cast<float>(x[j]) - mean) * inv * gamma[j] + beta[j]);
     }
   };
   if (nt <= 1 || num_rows < 4) {
@@ -149,7 +148,8 @@ void VjepaLayerNormLayer::incremental_forwarding(
                                   out.getData<_FP16>() + off, g, bt,
                                   rows_per_bc, W, eps);
 #else
-        throw std::invalid_argument("[vjepa_layernorm] enable-fp16 is not set!");
+        throw std::invalid_argument(
+          "[vjepa_layernorm] enable-fp16 is not set!");
 #endif
       }
     }

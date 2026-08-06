@@ -17,8 +17,8 @@
 #include <engine.h>
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
-#include <perf_profile.h>
 #include <nntr_ggml_impl_utils.h>
+#include <perf_profile.h>
 #include <string>
 #include <thread>
 #include <thread_manager.h>
