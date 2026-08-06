@@ -747,6 +747,9 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/qkv_layer.h
 %{_includedir}/nntrainer/geglu_layer.h
 %{_includedir}/nntrainer/swiglu_layer.h
+%{_includedir}/nntrainer/sigmoid_glu_layer.h
+%{_includedir}/nntrainer/sigmoid_add_layer.h
+%{_includedir}/nntrainer/rms_norm_layer.h
 %if %{with gpu}
 %{_includedir}/nntrainer/CL/cl.h
 %{_includedir}/nntrainer/CL/cl_platform.h
