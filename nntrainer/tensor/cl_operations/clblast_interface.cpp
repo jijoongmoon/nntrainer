@@ -33,6 +33,10 @@ void scal_cl(const unsigned int N, const float alpha, float *X,
   clblast::Scal<float>(N, alpha, clBuffManagerInst.getOutBufferA()->GetBuffer(),
                        0, incX, &command_queue);
 
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
+
   clBuffManagerInst.getOutBufferA()->ReadDataRegion(
     clblast_cc->command_queue_inst_, N * sizeof(float), X);
 }
@@ -50,6 +54,10 @@ void copy_cl(const unsigned int N, const float *X, float *Y, unsigned int incX,
   clblast::Copy<float>(N, clBuffManagerInst.getInBufferA()->GetBuffer(), 0,
                        incX, clBuffManagerInst.getOutBufferA()->GetBuffer(), 0,
                        incY, &command_queue);
+
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
 
   clBuffManagerInst.getOutBufferA()->ReadDataRegion(
     clblast_cc->command_queue_inst_, N * sizeof(float), Y);
@@ -71,6 +79,10 @@ void axpy_cl(const unsigned int N, const float alpha, const float *X, float *Y,
   clblast::Axpy<float>(N, alpha, clBuffManagerInst.getInBufferA()->GetBuffer(),
                        0, incX, clBuffManagerInst.getOutBufferA()->GetBuffer(),
                        0, incY, &command_queue);
+
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
 
   clBuffManagerInst.getOutBufferA()->ReadDataRegion(
     clblast_cc->command_queue_inst_, N * sizeof(float), Y);
@@ -95,6 +107,10 @@ float dot_cl(const unsigned int N, const float *X, const float *Y,
                       &command_queue);
 
   float result;
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
+
   clBuffManagerInst.getOutBufferA()->ReadDataRegion(
     clblast_cc->command_queue_inst_, sizeof(float), &result);
   return result;
@@ -114,6 +130,10 @@ float nrm2_cl(const unsigned int N, const float *X, unsigned int incX) {
                        &command_queue);
 
   float result;
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
+
   clBuffManagerInst.getOutBufferA()->ReadDataRegion(
     clblast_cc->command_queue_inst_, sizeof(float), &result);
 
@@ -134,6 +154,10 @@ float asum_cl(const unsigned int N, const float *X, unsigned int incX) {
                        &command_queue);
 
   float result;
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
+
   clBuffManagerInst.getOutBufferA()->ReadDataRegion(
     clblast_cc->command_queue_inst_, sizeof(float), &result);
 
@@ -154,6 +178,10 @@ int amax_cl(const unsigned int N, const float *X, unsigned int incX) {
                        &command_queue);
 
   int result;
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
+
   clBuffManagerInst.getOutBufferA()->ReadDataRegion(
     clblast_cc->command_queue_inst_, sizeof(int), &result);
 
@@ -174,6 +202,10 @@ int amin_cl(const unsigned int N, const float *X, unsigned int incX) {
                        &command_queue);
 
   int result;
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
+
   clBuffManagerInst.getOutBufferA()->ReadDataRegion(
     clblast_cc->command_queue_inst_, sizeof(int), &result);
 
@@ -211,7 +243,9 @@ void gemv_cl(const unsigned int layout, bool TransA, const unsigned int M,
     clBuffManagerInst.getInBufferB()->GetBuffer(), 0, incX, beta,
     clBuffManagerInst.getOutBufferA()->GetBuffer(), 0, incY, &command_queue);
 
-  opencl::clFinish(clblast_cc->command_queue_inst_.GetCommandQueue());
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
 
   opencl::clEnqueueReadBuffer(clblast_cc->command_queue_inst_.GetCommandQueue(),
                               clBuffManagerInst.getOutBufferA()->GetBuffer(),
@@ -251,6 +285,10 @@ void gemm_cl(const unsigned int layout, bool TransA, bool TransB,
     clBuffManagerInst.getOutBufferA()->GetBuffer(), 0, ldc, &command_queue);
 
   // Read the result back to C
+  // CLBlast enqueued its kernels on our out-of-order queue without handing
+  // back an event, so nothing orders the read-back after them.
+  clblast_cc->command_queue_inst_.enqueueBarrier();
+
   clBuffManagerInst.getOutBufferA()->ReadDataRegion(
     clblast_cc->command_queue_inst_, M * N * sizeof(float), C);
 }

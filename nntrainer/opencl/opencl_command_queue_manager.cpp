@@ -321,6 +321,18 @@ bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event) {
   return true;
 }
 
+bool CommandQueueManager::enqueueBarrier() {
+  const cl_int error_code =
+    clEnqueueBarrierWithWaitList(command_queue_, 0, nullptr, nullptr);
+  if (error_code != CL_SUCCESS) {
+    ml_loge(
+      "Failed to clEnqueueBarrierWithWaitList. OpenCL error code: %d : %s",
+      error_code, OpenCLErrorCodeToString(error_code));
+    return false;
+  }
+  return true;
+}
+
 /**
  * @brief Function to initiate execution of the command queue.
  *
@@ -363,6 +375,16 @@ bool CommandQueueManager::DispatchCommand(
     return false;
   }
 
+  // The queue is out of order. A launch that neither waits on an event nor
+  // hands one out has expressed no dependency at all, so nothing stops the
+  // read-back (or the next kernel) that follows it from running first. Every
+  // such caller in the tree consumes this kernel's output on the very next
+  // command, so close the launch with a barrier. Callers that do sequence
+  // themselves with events keep their overlap.
+  if (event == nullptr && events_to_wait.empty()) {
+    return enqueueBarrier();
+  }
+
   return true;
 }
 
@@ -395,6 +417,16 @@ bool CommandQueueManager::DispatchCommand(
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
     return false;
+  }
+
+  // The queue is out of order. A launch that neither waits on an event nor
+  // hands one out has expressed no dependency at all, so nothing stops the
+  // read-back (or the next kernel) that follows it from running first. Every
+  // such caller in the tree consumes this kernel's output on the very next
+  // command, so close the launch with a barrier. Callers that do sequence
+  // themselves with events keep their overlap.
+  if (event == nullptr && events_to_wait.empty()) {
+    return enqueueBarrier();
   }
 
   return true;

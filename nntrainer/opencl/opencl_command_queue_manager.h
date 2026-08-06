@@ -194,6 +194,19 @@ public:
                        std::vector<cl_event> events_to_wait = {});
 
   /**
+   * @brief Enqueue a barrier on the command queue.
+   *
+   * The queue is created with CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, so a
+   * command that carries no event dependency may run before, during or after
+   * any other command already enqueued. Everything enqueued after this barrier
+   * is ordered against everything enqueued before it. Use it whenever the next
+   * command consumes what the previous one produced.
+   *
+   * @return true if the barrier was enqueued, false otherwise
+   */
+  bool enqueueBarrier();
+
+  /**
    * @brief Get the OpenCL Command Queue object
    *
    * @return const cl_command_queue
