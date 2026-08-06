@@ -3664,6 +3664,17 @@ void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
   thetas.clear();
   if (rope_scaling_type == "yarn")
     _compute_yarn_parameters(head_dim, theta);
+  else if (rope_scaling_type == "default_partial")
+    // HF "default" rope + partial_rotary_factor (qwen3_5_moe / Qwen3-Next):
+    // same zeroed tail as proportional, but the exponent denominator is the
+    // ROTARY dim, not head_dim.
+    //
+    // MUST STAY AHEAD OF THE proportional CLAUSE. That clause also fires on
+    // `rope_partial_rotary_factor != 1.0f` regardless of the type string, so
+    // placing this after it would silently route qwen3_5_moe into the Gemma
+    // form -- and the warn-once fprintf lives in the unreachable else arm, so
+    // there would be no diagnostic at all, just a 4x-wrong theta.
+    _compute_default_partial_parameters(head_dim, theta);
   else if (rope_scaling_type == "proportional" ||
            rope_partial_rotary_factor != 1.0f)
     // Proportional rope (Gemma3n/Gemma4 E2B). Also routes here when a
@@ -3788,6 +3799,36 @@ void MHACoreLayer::_compute_proportional_parameters(int head_dim, float theta) {
   for (int i = 0; i < rope_angles; ++i)
     thetas.push_back(1.0f /
                      (std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
+  for (int i = rope_angles; i < half_dim; ++i)
+    thetas.push_back(0.0f);
+  for (auto &val : thetas)
+    val /= scale;
+}
+
+void MHACoreLayer::_compute_default_partial_parameters(int head_dim,
+                                                       float theta) {
+
+  // no attention scaling
+  attention_scaling = 1.0f;
+
+  // HF applies compute_default_rope_parameters with dim = rotary_dim, so the
+  // denominator below is rotary_dim -- the ONE difference from
+  // _compute_proportional_parameters (Gemma), which keeps head_dim. As there,
+  // only the first rope_angles frequencies are rotary; the rest are zeroed so
+  // cos=1/sin=0 and those channels pass through unrotated.
+  //
+  // NB this alone is not sufficient for HF parity: nntrainer pairs
+  // (k, k+head_dim/2) split-half while HF pairs (k, k+rotary_dim/2)
+  // contiguously, which the weight converter compensates for by permuting the
+  // head_dim rows of wq/wk and the q_norm/k_norm gammas. Either fix alone
+  // leaves ~0.47 error; together they give 3.8e-4.
+  const int half_dim = static_cast<int>(head_dim / 2);
+  const int rope_angles =
+    static_cast<int>((rope_partial_rotary_factor * head_dim) / 2.0f);
+  const float rotary_dim = rope_partial_rotary_factor * head_dim;
+  thetas.reserve(half_dim);
+  for (int i = 0; i < rope_angles; ++i)
+    thetas.push_back(1.0f / (std::pow(theta, (2 * i) / rotary_dim)));
   for (int i = rope_angles; i < half_dim; ++i)
     thetas.push_back(0.0f);
   for (auto &val : thetas)

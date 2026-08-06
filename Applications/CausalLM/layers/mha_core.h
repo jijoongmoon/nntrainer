@@ -639,6 +639,19 @@ private:
   void _compute_proportional_parameters(int head_dim, float theta);
 
   /**
+   * @brief _compute frequency parameters for HF "default" ROPE combined with a
+   *        partial_rotary_factor (qwen3_5_moe / Qwen3-Next).
+   *
+   * Identical to _compute_proportional_parameters EXCEPT the exponent
+   * denominator: HF's compute_default_rope_parameters is called with
+   * dim = int(head_dim * partial_rotary_factor), so the frequencies are
+   * base^(-2i/ROTARY_dim), whereas the proportional (Gemma) form keeps the full
+   * head_dim in the denominator. At head_dim=256 / rotary_dim=64 that is a 4x
+   * error in every exponent -- silently wrong logits, not a crash.
+   */
+  void _compute_default_partial_parameters(int head_dim, float theta);
+
+  /**
    * @brief     apply rotary embedding
    * @param[in] in input tensor
    * @param[out] out output tensor
