@@ -242,9 +242,17 @@ void ReshapedRMSNormLayer::incremental_forwarding(
           if (!p)
             return true;
           cudaPointerAttributes a{};
+          // Accept the pinned host-mapped (zero-copy) pool too: it reports Host
+          // but carries a valid devicePointer and is kernel-reachable. See
+          // cuda::dev_accessible (cuda_context_manager.cpp:248-254). Integrated
+          // GPUs with concurrentManagedAccess==0 (Tegra/Orin) use that pool for
+          // everything, so without this the q/k/v norms silently run on the host
+          // -- fatal inside a CUDA-graph capture, where a host op reads a
+          // not-yet-produced buffer and is itself never captured.
           bool ok =
             cudaPointerGetAttributes(&a, p) == cudaSuccess &&
-            (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice);
+            (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice ||
+             (a.type == cudaMemoryTypeHost && a.devicePointer != nullptr));
           cudaGetLastError();
           return ok;
         };

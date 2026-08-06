@@ -434,8 +434,13 @@ void CudaComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
     // through), and an env test here would send an SDK-path CudaContext --
     // built without NNTR_ENGINE=cuda but with the device-only pool armed --
     // straight into the host fallback on device logits.
+    // Pinned host-mapped (zero-copy) is the THIRD kernel-reachable case and
+    // hits the exact hazard described above: an integrated GPU with
+    // concurrentManagedAccess==0 (Tegra/Orin) allocates every pool with
+    // cudaHostAlloc(cudaHostAllocMapped), which reports Host, not Managed.
     if (cudaPointerGetAttributes(&pa, ip) == cudaSuccess &&
-        (pa.type == cudaMemoryTypeDevice || pa.type == cudaMemoryTypeManaged) &&
+        (pa.type == cudaMemoryTypeDevice || pa.type == cudaMemoryTypeManaged ||
+         (pa.type == cudaMemoryTypeHost && pa.devicePointer != nullptr)) &&
         nntrainer::cuda::cuda_softcap_fp16(ip, op, (unsigned int)in.size(),
                                            cap)) {
       cudaGetLastError();

@@ -96,9 +96,18 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
         auto *o =
           reinterpret_cast<unsigned short *>(hidden_step.getData<_FP16>());
         cudaPointerAttributes pa{};
+        // Pinned host-mapped (zero-copy) pool reports Host but carries a valid
+        // devicePointer (UVA) and IS kernel-reachable -- see
+        // cuda::dev_accessible (cuda_context_manager.cpp:248-254). Integrated
+        // GPUs with concurrentManagedAccess==0 (Tegra/Orin) allocate EVERY pool
+        // that way, so a Managed||Device-only test declines here and drops the
+        // whole residual chain onto the host. Inside a CUDA-graph capture that
+        // is not merely slow: the host op reads a buffer whose producing kernel
+        // has not run yet AND is never recorded into the graph -> garbage.
         bool dev =
           cudaPointerGetAttributes(&pa, a) == cudaSuccess &&
-          (pa.type == cudaMemoryTypeManaged || pa.type == cudaMemoryTypeDevice);
+          (pa.type == cudaMemoryTypeManaged || pa.type == cudaMemoryTypeDevice ||
+           (pa.type == cudaMemoryTypeHost && pa.devicePointer != nullptr));
         cudaGetLastError();
         if (dev &&
             cuda::cuda_add_fp16(a, bb, o, (unsigned int)hidden_step.size()))

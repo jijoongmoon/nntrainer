@@ -158,9 +158,16 @@ void PerLayerSliceLayer::incremental_forwarding(
       dev_copy = device_only(in_data) || device_only(out_data);
       if (gpu) {
         cudaPointerAttributes pa{};
+        // Pinned host-mapped (zero-copy) memory reports Host but is
+        // kernel-reachable via its devicePointer -- mirror cuda::dev_accessible
+        // (cuda_context_manager.cpp:248-254). On an integrated GPU with
+        // concurrentManagedAccess==0 (Tegra/Orin) every pool is allocated that
+        // way, so a Managed||Device-only test leaves one host memcpy per
+        // decoder layer inside the captured decode graph.
         bool dev =
           cudaPointerGetAttributes(&pa, in_data) == cudaSuccess &&
-          (pa.type == cudaMemoryTypeManaged || pa.type == cudaMemoryTypeDevice);
+          (pa.type == cudaMemoryTypeManaged || pa.type == cudaMemoryTypeDevice ||
+           (pa.type == cudaMemoryTypeHost && pa.devicePointer != nullptr));
         cudaGetLastError();
         if (dev && nntrainer::cuda::cuda_slice_copy_fp16(
                      reinterpret_cast<const unsigned short *>(in_data),

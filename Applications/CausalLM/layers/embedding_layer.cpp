@@ -1024,10 +1024,38 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         (act_dt == nntrainer::TensorDim::DataType::FP32 ||
          act_dt == nntrainer::TensorDim::DataType::FP16)) {
       cudaPointerAttributes pa{};
-      emb_dev_only =
+      // Which destinations MUST be written by a stream-ordered op instead of a
+      // plain host store?
+      //
+      //  * cudaMemoryTypeDevice -- the device-only pool: a host store there is
+      //    a fault. This is the case the staging was built for.
+      //
+      //  * pinned host-mapped (type == Host with a devicePointer) -- an
+      //    INTEGRATED GPU with concurrentManagedAccess == 0 (Tegra/Orin)
+      //    allocates every pool with cudaHostAlloc(cudaHostAllocMapped), which
+      //    reports Host, not Device. A host store there WORKS, so this gate
+      //    used to skip the staging and let the row loop write the output
+      //    directly -- and that is exactly the bug: a plain host store is
+      //    invisible to a CUDA-graph capture. The embedding node then
+      //    contributes NOTHING to the graph, while the pool (correctly) lets
+      //    later activations overlap its output buffer -- the per-layer-input
+      //    embedding's 4.4 MB output shares memory with layer0's wq/wk/wv/
+      //    attention/ffn tensors. On replay those captured kernels rewrite the
+      //    region before the 35 per_layer_input slice kernels read it, so
+      //    every layer from the first per-layer-input onward consumes garbage
+      //    (measured: prefill-graph decode diverged at token 4, KV bit-exact
+      //    at layer0 and wrong from layer1 on). Routing the write through the
+      //    pinned staging + a stream-ordered H2D puts the embedding INTO the
+      //    graph at its correct position, which is also what the M2-B decode
+      //    feed pass assumes ("persistent + pinned so the replay can copy from
+      //    it"). Same residency rule as cuda::dev_accessible().
+      const bool probe_ok =
         cudaPointerGetAttributes(&pa, batchsliced_hidden.getData<char>()) ==
-          cudaSuccess &&
-        pa.type == cudaMemoryTypeDevice;
+        cudaSuccess;
+      emb_dev_only =
+        probe_ok && (pa.type == cudaMemoryTypeDevice ||
+                     (pa.type == cudaMemoryTypeHost &&
+                      pa.devicePointer != nullptr));
       cudaGetLastError();
 #ifndef ENABLE_FP16
       // An FP16 activation cannot be staged by a build with no _FP16 type.
