@@ -128,8 +128,7 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
     /// (1 * K) X (1 * M) can be a case
     /// case1: (1 * K) X (K * 1)
     if (M == 1 && N == 1) {
-      // *rdata = dot_cl(data, mdata, K) + (*rdata);
-      *rdata = dot_cl(K, data, mdata) + (*rdata);
+      *rdata = dot_cl(K, data, mdata);
     }
     /// case2: (M * K) X (K * 1)
     else if (N == 1) {
@@ -165,7 +164,7 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
     /// (1 * K) X (1 * M) can be a case
     /// case1: (1 * K) X (K * 1)
     if (M == 1 && N == 1) {
-      *rdata = dot_cl(data, mdata, K) + (*rdata);
+      *rdata = dot_cl(data, mdata, K);
     }
     /// case2: (M * K) X (K * 1)
     else if (N == 1) {

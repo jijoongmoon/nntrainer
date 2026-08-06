@@ -146,7 +146,10 @@ T dot_cl_internal(ClContext::SharedPtrClKernel kernel, const T *vecAdata,
       break;
     }
 
-    const int work_groups_count[3] = {(int)dim1, 1, 1};
+    // The dot kernel is a whole-vector reduction: one work-item walks all dim1
+    // elements and stores the single result. Launching dim1 of them had every
+    // work-item redo the same reduction and race on the same output word.
+    const int work_groups_count[3] = {1, 1, 1};
     const int work_group_size[3] = {1, 1, 1};
 
     result = blas_cc->command_queue_inst_.DispatchCommand(
