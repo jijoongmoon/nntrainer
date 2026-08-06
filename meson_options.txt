@@ -65,8 +65,8 @@ option('enable-cuda', type: 'boolean', value: false,
        description: 'Build the additive NVIDIA CUDA GPU backend (NVRTC runtime kernel compilation + cudart + cuBLAS + driver API). Independent of and non-exclusive with enable-opencl; selected at runtime via engine=cuda. Desktop NVIDIA only (not android).')
 option('cuda-path', type: 'string', value: '/usr/local/cuda',
        description: 'CUDA toolkit root used when enable-cuda is set (expects include/ and lib64/).')
-option('enable-clblast', type: 'boolean', value: true,
-       description: 'Link the CLBlast subproject for general-purpose OpenCL BLAS routines. Disable when only the in-tree OpenCL kernels are needed — drops the multi-minute CLBlast compile.')
+option('enable-clblast', type: 'boolean', value: false,
+       description: 'Link the CLBlast subproject for general-purpose OpenCL BLAS routines. Default OFF on every platform (matching the Windows build): loading the library costs real memory, no LLM-path op consumes it anymore (dotCl dispatches the in-tree OpenCL kernels for FP32 and FP16 alike), and dropping it also drops the multi-minute CLBlast compile. Opt back in per build with -Denable-clblast=true.')
 option('enable-biqgemm', type: 'boolean', value: false)
 option('biqgemm-path', type: 'string', value: '../BiQGEMM')
 option('enable-benchmarks', type: 'boolean', value : false)
