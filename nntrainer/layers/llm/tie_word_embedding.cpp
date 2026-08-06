@@ -40,6 +40,13 @@
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 
+// The staging-buffer helpers below have exactly two callers, both inside
+// `ENABLE_CUDA && ENABLE_FP16` regions (the emb_stage dequant and its H2D
+// push), because the pinned staging buffer they guard is _FP16-typed. Their
+// definitions have to carry the same ENABLE_FP16 condition: on an
+// enable-cuda + fp16-off build they would otherwise be defined with no
+// caller, which is -Werror=unused-function in an anonymous namespace.
+#ifdef ENABLE_FP16
 namespace {
 // NNTR_CUDA_ASYNC guard for the pinned tie-embedding staging buffer: in async
 // mode nothing drains the stream per-op, so the NEXT token's host dequant can
@@ -80,7 +87,8 @@ void tie_emb_stage_h2d_wait() {
   g_tie_emb_h2d_pending = false;
 }
 } // namespace
-#endif
+#endif // ENABLE_FP16
+#endif // ENABLE_CUDA
 
 namespace nntrainer {
 

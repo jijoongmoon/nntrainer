@@ -37,6 +37,14 @@
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 
+// Same guard shape as the sibling helpers in nntrainer/layers/llm/
+// tie_word_embedding.cpp: both callers of the two functions below live in
+// `ENABLE_CUDA && ENABLE_FP16` regions (the emb_stage dequant and its H2D
+// push), because the pinned staging buffer they guard is _FP16-typed. Without
+// the same condition on the definitions, an enable-cuda + fp16-off build ends
+// up with two internal-linkage functions that have no caller, which is
+// -Werror=unused-function.
+#ifdef ENABLE_FP16
 namespace {
 // NNTR_CUDA_ASYNC guard for the pinned embedding staging buffers: in async
 // mode nothing drains the stream per-op, so the NEXT token's host dequant can
@@ -76,7 +84,8 @@ void emb_stage_h2d_wait() {
   g_emb_h2d_pending = false;
 }
 } // namespace
-#endif
+#endif // ENABLE_FP16
+#endif // ENABLE_CUDA
 
 namespace causallm {
 
