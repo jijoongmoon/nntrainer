@@ -483,12 +483,32 @@ public:
     if (outgoing_derivative.empty())
       outgoing_derivative = Tensor(t_out.getDim());
 
-    T tmp = static_cast<T>(1 / sqrt(2));
+    /// @note The derivative is accumulated in double and narrowed exactly
+    /// once, on the return. The 1/sqrt(2) factor used to live in T
+    /// (`T tmp = static_cast<T>(1 / sqrt(2))`), so `x * tmp` was a T-precision
+    /// product that the enclosing double expression merely widened afterwards
+    /// -- the rounding (and, for a product that leaves the range of T, the
+    /// overflow) has already happened by then, so the wider type buys nothing.
+    /// That is the shape CodeQL reports as "multiplication result converted to
+    /// a larger type". Both operands are double here, so the product is formed
+    /// in double; T appears only at the input widening and the final narrowing.
+    /// Keep it that way: geluPrime is instantiated for the fp16 activation
+    /// types too (activation_layer.cpp selects setActiFunc<_FP16>), and how
+    /// much of the erf/exp argument a T-precision product would keep there is
+    /// toolchain-dependent.
+    /// The two constants are also hoisted out of the per-element lambda
+    /// (sqrt(PI) was recomputed for every element), and pow(u, 2) is written
+    /// u * u -- bit-identical for a double u.
+    const double inv_sqrt2 = 1.0 / std::sqrt(2.0);
+    const double two_over_sqrt_pi = 2.0 / std::sqrt(PI);
+
     t_in.apply<T>(
       [&](T x) {
+        const double xd = static_cast<double>(x);
+        const double u = xd * inv_sqrt2;
         return static_cast<T>(
-          0.5 * (1 + erf(x * tmp) +
-                 x * ((2 / sqrt(PI)) * exp(-pow(x * tmp, 2))) * tmp));
+          0.5 * (1.0 + std::erf(u) +
+                 xd * (two_over_sqrt_pi * std::exp(-u * u)) * inv_sqrt2));
       },
       outgoing_derivative);
 
