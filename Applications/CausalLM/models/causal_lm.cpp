@@ -1210,12 +1210,29 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       // guard is the safety net if a model exceeds these bounds.
       nntrainer::cuda::cuda_attention_splitkv_prewarm(
         static_cast<int>(MAX_SEQ_LEN), NUM_HEADS, 2 * HEAD_DIM);
-      // Pre-grow the dp4a decode FC scratch: decode is M=1; K (the FC
-      // contraction dim) is bounded by max(hidden DIM, FFN intermediate) --
-      // the down-projection FC reads the FFN intermediate activation, so DIM
-      // alone under-sizes the activation-quant staging.
+      // Pre-grow the dp4a FC scratch. K (the FC contraction dim) is bounded by
+      // max(hidden DIM, FFN intermediate) -- the down-projection FC reads the
+      // FFN intermediate activation, so DIM alone under-sizes the
+      // activation-quant staging.
+      //
+      // M is NOT 1. With the PREFILL graph on -- the default for INTEGRATED
+      // GPUs whenever NNTR_CUDA_GRAPH=1 (cuda_context.cpp:396-406) -- the very
+      // first forward the process runs is already captured, and it is a PREFILL
+      // (M = prompt rows), not a decode. ensure_buf refuses to grow inside a
+      // capture (cuda_fc_qint4.cpp:995), so an M=1 prewarm makes every QS4CX FC
+      // decline its device arms and fall to the host dot(). That is not merely
+      // slow: the declined ops are never recorded, so the graph is instantiated
+      // MISSING every FC node and replays to garbage logits with no error.
+      //
+      // Size to the ARCHITECTURAL bound -- the largest M one forward can ever
+      // see -- not to this turn's prompt: the whole prewarm sits behind a
+      // one-shot `s_cuda_prewarmed` latch, so sizing to a short first prompt
+      // would re-open the hole on a later, longer turn. When chunking is off,
+      // that bound is INIT_SEQ_LEN (the activation plane height).
+      const unsigned int prewarm_m =
+        std::max(1u, i8_chunk > 0 ? i8_chunk : INIT_SEQ_LEN);
       nntrainer::cuda::cuda_fc_qint4_dp4a_prewarm(
-        1u,
+        prewarm_m,
         std::max(static_cast<unsigned int>(DIM),
                  static_cast<unsigned int>(INTERMEDIATE_SIZE)),
         std::max(NUM_VOCAB, static_cast<unsigned int>(INTERMEDIATE_SIZE)));
@@ -1326,6 +1343,68 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     }
     return out;
   };
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // [prefill-graph warmup] When the PREFILL CUDA graph is active (the default
+  // on an INTEGRATED GPU whenever NNTR_CUDA_GRAPH=1, cuda_context.cpp), the
+  // FIRST forward the process ever runs is already a CAPTURE. That is fatal for
+  // every lazily-allocated device resource on the forward path, because a
+  // cudaMalloc / synchronous cudaMemcpy issued inside a stream capture
+  // INVALIDATES it: from that point on every cuLaunchKernel on the stream fails
+  // with CUDA_ERROR_STREAM_CAPTURE_INVALIDATED, so the ops that follow silently
+  // decline their device paths and fall to host code that either produces
+  // garbage or throws.
+  //
+  // The load-time prewarm can only pre-size what it KNOWS about (the QS4CX
+  // weight caches, the dp4a/split-KV scratch). It cannot reach the resources
+  // that are owned by layers and derived from runtime shapes -- the RoPE
+  // cos/sin LUT device upload (mha_core.cpp rope_lut_device: cudaMalloc +
+  // cudaMemcpy on first use), the GEMM-attention score scratch, the cuBLAS
+  // algo/module selection, ... Enumerating them is a losing game; running the
+  // forward once is not.
+  //
+  // So: run ONE eager prefill of exactly the shape the real prefill will use,
+  // with capture explicitly disabled, and throw the result away. Every lazy
+  // allocation on the path is then already made when the real prefill captures.
+  // Once per process (a latch): the warmup is a full extra prefill, and the
+  // resources it materialises are process-lifetime.
+  {
+    static bool s_prefill_graph_warmed = false;
+    // Follows the prefill-graph decision by default (that is the only consumer
+    // of the warmup). NNTR_CUDA_PREFILL_WARMUP=1/0 forces it either way: =1
+    // buys the same lazy-allocation + cuBLAS-algo warmup for an EAGER prefill
+    // (measured 42 -> 147 TPS on Orin/gemma4 with the graph off), and =0
+    // re-creates the un-warmed state, which is how the capture self-policing
+    // below (StreamManager::markCaptureDoomed) gets exercised.
+    static const bool prefill_graph_on = []() {
+      const char *w = std::getenv("NNTR_CUDA_PREFILL_WARMUP");
+      if (w != nullptr)
+        return w[0] != '0';
+      const char *e = std::getenv("NNTR_CUDA_PREFILL_GRAPH");
+      if (e != nullptr)
+        return e[0] != '0';
+      const char *g = std::getenv("NNTR_CUDA_GRAPH");
+      return g != nullptr && g[0] == '1' &&
+             nntrainer::cuda::ContextManager::Global().isIntegrated();
+    }();
+    if (!s_prefill_graph_warmed && prefill_graph_on &&
+        causallm_engine() == "cuda" && init_len > 1) {
+      s_prefill_graph_warmed = true;
+      const unsigned int wlen =
+        (SKIP_PREFILL && init_len > 1) ? init_len - 1 : init_len;
+      auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
+      nn->setPrefillCaptureDisabled(true);
+      setKVCachePosition(prefill_from);
+      auto wout = do_prefill(wlen, prefill_from);
+      for (auto &o : wout)
+        delete[] o;
+      setKVCachePosition(prefill_from);
+      nn->setPrefillCaptureDisabled(false);
+      // The warmup is setup, not work: keep it out of the reported prefill.
+      start_prefill = std::chrono::high_resolution_clock::now();
+    }
+  }
+#endif
 
   if (SKIP_PREFILL && init_len > 1) {
     // Prefill only N-1 tokens; the last input token will be used as the first
