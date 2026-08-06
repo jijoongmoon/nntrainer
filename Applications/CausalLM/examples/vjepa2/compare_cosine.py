@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+## SPDX-License-Identifier: Apache-2.0
+## Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
+##
+## @file compare_cosine.py
+## @brief Compare an nntrainer VJEPA2ViT dump against the torch reference.
+## @author Jijoong Moon <jijoong.moon@samsung.com>
+##
 """Compare an nntrainer VJEPA2ViT dump against the torch reference output.
 
 The app dumps the **token-0** hidden state (DIM=768 float32) to
