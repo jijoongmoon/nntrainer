@@ -134,7 +134,14 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"].get<std::string>();
   INIT_SEQ_LEN = nntr_cfg["init_seq_len"];
   MAX_SEQ_LEN = nntr_cfg["max_seq_len"];
-  NUM_TO_GENERATE = nntr_cfg["num_to_generate"];
+  // num_to_generate is optional: absent (or <= 0) means "no explicit cap",
+  // i.e. generate until EOS or until the context window runs out. 0 is the
+  // sentinel every consumer tests for, so normalize negatives to it here --
+  // a negative value is a supported way to ask for "no cap", not a
+  // misconfiguration.
+  NUM_TO_GENERATE = nntr_cfg.value("num_to_generate", 0);
+  if (NUM_TO_GENERATE < 0)
+    NUM_TO_GENERATE = 0;
   MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"];
   MEMORY_SWAP = nntr_cfg.contains("fsu") ? nntr_cfg["fsu"].get<bool>() : false;
   FSU_LOOKAHEAD = nntr_cfg.contains("fsu_lookahead")

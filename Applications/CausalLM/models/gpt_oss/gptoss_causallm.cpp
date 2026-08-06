@@ -74,7 +74,11 @@ Tensor GptOssForCausalLM::createAttention(const int layer_id, int seq_len,
     "mha_core",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
      withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
-     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+     // KV-cache height and RoPE LUT extent: size it to the context window,
+     // as every other model in the tree does. INIT_SEQ_LEN + NUM_TO_GENERATE
+     // leaves every position past init_seq_len uncovered when
+     // num_to_generate carries no explicit cap.
+     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
      withKey("sliding_window", sliding_window),
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),

@@ -608,9 +608,20 @@ void Lfm2CausalLM::run_with_embeddings(const void *inputs_embeds,
 
   auto start_generation = std::chrono::high_resolution_clock::now();
 
-  for (unsigned int token_generation_idx = input_len + 1;
-       token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
-       ++token_generation_idx) {
+  // Same bound as CausalLM::run: NUM_TO_GENERATE <= 0 means "no explicit cap"
+  // (budget is the whole window), and the window itself bounds the loop either
+  // way so ids_history[b * MAX_SEQ_LEN + idx] stays inside its row.
+  const unsigned int generation_budget =
+    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE)
+                        : MAX_SEQ_LEN;
+  const unsigned int generation_begin = input_len + 1;
+  const unsigned int generation_end =
+    generation_begin < MAX_SEQ_LEN
+      ? std::min(generation_begin + generation_budget, MAX_SEQ_LEN)
+      : generation_begin;
+
+  for (unsigned int token_generation_idx = generation_begin;
+       token_generation_idx < generation_end; ++token_generation_idx) {
 
     // Look up embedding for the last generated token and fill gen_input
     std::fill(gen_input.begin(), gen_input.end(), 0.0f);
