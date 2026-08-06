@@ -981,18 +981,25 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // The ONE spelling of "store this row into the staging". Every branch
     // below used to open-code its own narrowing loop, which is exactly how the
     // FP32 case went missing from all three of them.
-    auto stage_row = [&](size_t i, const float *src, float s) {
+    // Generic in the SOURCE element type, not just float: the weight record
+    // may be FP16 as well (embedding_dtype: FP16), and on an integrated GPU
+    // this staging path is now taken unconditionally -- every pool there is
+    // pinned host-mapped, so the residency probe below is always true. A
+    // float-only signature made that combination throw at the first token.
+    // The accumulate is always widened to float first, so the FP32 case is
+    // numerically unchanged.
+    auto stage_row = [&](size_t i, const auto *src, float s) {
       char *base = static_cast<char *>(emb_stage) + i * out_dim * act_esz;
       if (act_dt == nntrainer::TensorDim::DataType::FP32) {
         float *o = reinterpret_cast<float *>(base);
         for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
-          o[k] = src[k] * s;
+          o[k] = static_cast<float>(src[k]) * s;
       }
 #ifdef ENABLE_FP16
       else {
         _FP16 *o = reinterpret_cast<_FP16 *>(base);
         for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
-          o[k] = static_cast<_FP16>(src[k] * s);
+          o[k] = static_cast<_FP16>(static_cast<float>(src[k]) * s);
       }
 #endif
     };
@@ -1138,13 +1145,28 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         // the embedding weight is held (a raw Tensor here, a pointer that may
         // be null on the sidecar path elsewhere).
         if (emb_dev_only) {
-          NNTR_THROW_IF(cur_weight.getDataType() !=
-                          nntrainer::TensorDim::DataType::FP32,
-                        std::runtime_error)
-            << "embedding: staging an unquantized weight for the device-only "
-               "CUDA pool needs an FP32 weight record";
-          stage_row(i, cur_weight.getData<float>(), scale);
-          return;
+          // Dispatch on the WEIGHT's dtype. This used to assert FP32, which was
+          // dead on an integrated GPU (emb_dev_only was false there) until the
+          // residency probe started accepting pinned host-mapped memory -- from
+          // then on every model on Orin took this branch, and one with an
+          // FP16 embedding table threw at its first token. The FP32-only
+          // requirement was an artifact of stage_row's old signature, never a
+          // property of the pool.
+          const auto wdt = cur_weight.getDataType();
+          if (wdt == nntrainer::TensorDim::DataType::FP32) {
+            stage_row(i, cur_weight.getData<float>(), scale);
+            return;
+          }
+#ifdef ENABLE_FP16
+          if (wdt == nntrainer::TensorDim::DataType::FP16) {
+            stage_row(i, cur_weight.getData<_FP16>(), scale);
+            return;
+          }
+#endif
+          NNTR_THROW_IF(true, std::runtime_error)
+            << "embedding: staging an unquantized weight for the CUDA pool "
+               "supports FP32 and FP16 weight records; got dtype "
+            << static_cast<int>(wdt);
         }
         out_tensor.copyData(cur_weight);
       }

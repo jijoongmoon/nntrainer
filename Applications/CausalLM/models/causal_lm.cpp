@@ -1371,11 +1371,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   {
     static bool s_prefill_graph_warmed = false;
     // Follows the prefill-graph decision by default (that is the only consumer
-    // of the warmup). NNTR_CUDA_PREFILL_WARMUP=1/0 forces it either way: =1
-    // buys the same lazy-allocation + cuBLAS-algo warmup for an EAGER prefill
-    // (measured 42 -> 147 TPS on Orin/gemma4 with the graph off), and =0
-    // re-creates the un-warmed state, which is how the capture self-policing
-    // below (StreamManager::markCaptureDoomed) gets exercised.
+    // of the warmup). NNTR_CUDA_PREFILL_WARMUP=1/0 forces it either way, and
+    // =0 re-creates the un-warmed state, which is how the capture self-policing
+    // (StreamManager::markCaptureDoomed) gets exercised.
+    //
+    // Do NOT force =1 with the graph OFF expecting a speedup. The warmup is
+    // strictly one extra prefill: without it turn 1 pays the lazy-allocation
+    // cost and turns 2+ are already warm, so on the wall clock it can only
+    // lose (measured on Orin/gemma4, 13 tokens: total 2112-2222 ms without vs
+    // 2229-2286 ms with -- no overlap). An earlier version of this comment
+    // claimed "42 -> 147 TPS with the graph off"; that gain was entirely the
+    // reported-prefill timer being restarted below, not wall clock.
+    // With the graph ON the warmup is a genuine net e2e win (1K prompt:
+    // ~5.9 s vs 8.1-10.8 s) because it is what lets the capture succeed.
     static const bool prefill_graph_on = []() {
       const char *w = std::getenv("NNTR_CUDA_PREFILL_WARMUP");
       if (w != nullptr)
@@ -1393,14 +1401,38 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       const unsigned int wlen =
         (SKIP_PREFILL && init_len > 1) ? init_len - 1 : init_len;
       auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
+      // Scope guard, not a straight-line pair: do_prefill can throw (an
+      // out-of-range token id, "to shouldn't greater than max_timestep", an
+      // allocation failure). On unwind a bare setter would leave
+      // prefill_capture_disabled_ stuck true, and cuda_context.cpp would then
+      // skip EVERY future prefill capture for the life of the process with no
+      // diagnostic -- while s_prefill_graph_warmed, already latched above,
+      // prevents any retry. A host that catches and retries would silently run
+      // un-graphed forever.
+      struct CaptureDisableGuard {
+        nntrainer::NeuralNetwork *nn;
+        ~CaptureDisableGuard() { nn->setPrefillCaptureDisabled(false); }
+      } guard{nn};
       nn->setPrefillCaptureDisabled(true);
       setKVCachePosition(prefill_from);
+      const auto warmup_t0 = std::chrono::high_resolution_clock::now();
       auto wout = do_prefill(wlen, prefill_from);
       for (auto &o : wout)
         delete[] o;
       setKVCachePosition(prefill_from);
-      nn->setPrefillCaptureDisabled(false);
-      // The warmup is setup, not work: keep it out of the reported prefill.
+      const auto warmup_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::high_resolution_clock::now() - warmup_t0)
+          .count();
+      // Restart the prefill clock so the reported prefill measures the real
+      // prefill rather than two of them -- but PRINT the warmup, because it is
+      // wall-clock time the user waits through on a cold process and it scales
+      // with prompt length (~0.5 s at 1K here, not a constant). Without this
+      // line the headline prefill TPS silently describes a warm process on a
+      // cold run, which is how a 3425 TPS figure coexists with a ~1 s
+      // time-to-first-token.
+      std::cout << "prefill warmup (once per process): " << warmup_ms << " ms"
+                << std::endl;
       start_prefill = std::chrono::high_resolution_clock::now();
     }
   }
