@@ -79,6 +79,12 @@ bool StreamManager::DispatchCommand(Kernel &kernel, const int (&grid)[3],
     (unsigned)grid[2], (unsigned)block[0], (unsigned)block[1],
     (unsigned)block[2], shared_bytes, reinterpret_cast<CUstream>(stream_),
     params.empty() ? nullptr : params.data(), nullptr);
+  if (r != CUDA_SUCCESS && capturing_) {
+    // Under capture a launch failure is normally CUDA_ERROR_STREAM_CAPTURE_
+    // INVALIDATED -- something earlier already broke the capture and THIS
+    // kernel is only the first victim. Either way the graph cannot be trusted.
+    markCaptureDoomed("a kernel launch failed inside the capture");
+  }
   return cuCheck(r, "cuLaunchKernel");
 }
 
@@ -183,6 +189,16 @@ void StreamManager::finishIfAsync() {
     finish();
 }
 
+void StreamManager::markCaptureDoomed(const char *why) {
+  if (!capturing_ || capture_doomed_)
+    return;
+  capture_doomed_ = true;
+  ml_logw("[CUDA] graph capture abandoned: %s. The op that reported this "
+          "DECLINED to run, so the graph would be missing it; the forward will "
+          "be re-run eagerly instead.",
+          why ? why : "an op declined to run under capture");
+}
+
 bool StreamManager::beginCapture() {
   if (!stream_)
     return false;
@@ -191,6 +207,7 @@ bool StreamManager::beginCapture() {
                  "cudaStreamBeginCapture"))
     return false;
   capturing_ = true;
+  capture_doomed_ = false;
   return true;
 }
 
@@ -198,8 +215,22 @@ bool StreamManager::endCapture(cudaGraph_t *graph) {
   capturing_ = false;
   if (!stream_ || graph == nullptr)
     return false;
-  return cudaCheck(cudaStreamEndCapture(stream_, graph),
-                   "cudaStreamEndCapture");
+  const bool ok = cudaCheck(cudaStreamEndCapture(stream_, graph),
+                            "cudaStreamEndCapture");
+  // A capture some op declined to join is WORSE than one the driver rejected:
+  // the driver hands back a perfectly instantiable graph that is simply missing
+  // work, and it replays to wrong numbers silently. Destroy it and report
+  // failure so the caller falls back to the eager forward.
+  if (ok && capture_doomed_) {
+    if (*graph != nullptr) {
+      cudaGraphDestroy(*graph);
+      *graph = nullptr;
+    }
+    capture_doomed_ = false;
+    return false;
+  }
+  capture_doomed_ = false;
+  return ok;
 }
 
 StreamManager::~StreamManager() {

@@ -108,6 +108,29 @@ public:
   bool isCapturing() const { return capturing_; }
 
   /**
+   * @brief Report that the capture in progress can no longer produce a FAITHFUL
+   *        graph, so endCapture() must refuse it.
+   *
+   * The driver only invalidates a capture for things IT can see (a synchronous
+   * API call on the captured stream). The dangerous case is the opposite one:
+   * an op that notices it may not run inside a capture (a scratch buffer that
+   * would have to grow, a side allocation that would need a cudaMalloc) and
+   * quietly DECLINES -- the capture stays "valid" and the graph is instantiated
+   * with that op simply MISSING. It then replays to wrong numbers with no error
+   * anywhere. Every such decline calls this instead, and endCapture() turns it
+   * into "no graph", which the graph callers already handle by re-running the
+   * forward eagerly. Correctness first; the lost graph costs one slow forward.
+   *
+   * @param why short reason, logged once per capture
+   */
+  void markCaptureDoomed(const char *why);
+
+  /**
+   * @brief True if markCaptureDoomed() was called since beginCapture().
+   */
+  bool captureDoomed() const { return capture_doomed_; }
+
+  /**
    * @brief Monotonic count of kernels dispatched on the backend stream.
    *
    * Producer/consumer ops that want to hand a derived buffer straight to the
@@ -134,6 +157,7 @@ protected:
 private:
   cudaStream_t stream_{nullptr};
   bool capturing_{false};
+  bool capture_doomed_{false};
   unsigned long long dispatch_seq_{0};
 };
 

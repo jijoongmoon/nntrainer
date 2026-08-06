@@ -320,6 +320,24 @@ rope_lut_device(std::vector<std::vector<_FP16>> *table, int half) {
   auto it = cache.find(table);
   if (it != cache.end())
     return it->second;
+  // MISS: the cudaMalloc + synchronous cudaMemcpy below INVALIDATE an in-flight
+  // CUDA-graph stream capture. The prefill IS captured on an integrated GPU
+  // (NNTR_CUDA_PREFILL_GRAPH, on by default there whenever NNTR_CUDA_GRAPH=1),
+  // and the very first forward a process runs is that capture -- so this
+  // one-time upload used to land inside it and break it, after which every
+  // cuLaunchKernel on the stream failed with CUDA_ERROR_STREAM_CAPTURE_
+  // INVALIDATED and the rest of the forward silently fell off its device paths
+  // (the attention output projection reached the host dot() and threw "pack
+  // before run model"). The load-time warmup prefill builds this table before
+  // any capture begins; if a miss still happens under capture, refuse and
+  // abandon the capture rather than corrupt it -- the caller falls back to the
+  // host RoPE for this pass and the graph is discarded at endCapture().
+  if (nntrainer::cuda::StreamManager::Global().isCapturing()) {
+    nntrainer::cuda::StreamManager::Global().markCaptureDoomed(
+      "the RoPE trig LUT is not yet on the device and cannot be uploaded under "
+      "capture");
+    return nullptr;
+  }
   const size_t npos = table->size();
   std::vector<unsigned short> flat(npos * (size_t)half);
   for (size_t p = 0; p < npos; ++p)

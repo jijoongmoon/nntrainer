@@ -912,6 +912,19 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
   // and a future device-only weight pool would otherwise reopen this exact gap
   // silently. Probing it costs one cudaPointerGetAttributes on a path that is
   // already the slow fallback.
+  // Inside a CUDA-graph capture the host dot() is never the right answer: it
+  // runs NOW (on operands the recorded kernels have not produced yet) and
+  // contributes nothing to the graph, so the replay would be missing this FC.
+  // On a QS4CX weight it is not even survivable -- QS4CXTensor::dot throws
+  // ("pack before run model"), which kills the process instead of falling back.
+  // Report the capture unusable and return without computing: the output holds
+  // stale bytes, the graph is discarded at endCapture(), and the caller re-runs
+  // the whole forward eagerly, which recomputes this FC correctly.
+  if (nntrainer::cuda::StreamManager::Global().isCapturing()) {
+    nntrainer::cuda::StreamManager::Global().markCaptureDoomed(
+      "an FC fell through to the host dot() inside the capture");
+    return;
+  }
   host_math_gate("fc", {&input, &output, &weight});
   input.dot(weight, output, false, false);
 }

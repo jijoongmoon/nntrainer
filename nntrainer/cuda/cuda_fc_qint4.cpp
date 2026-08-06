@@ -950,8 +950,14 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp16(const float *fp32_scales, unsigned int N,
   std::lock_guard<std::mutex> lk(mtx);
   auto it = cache.find(fp32_scales);
   if (it == cache.end()) {
-    if (StreamManager::Global().isCapturing())
+    if (StreamManager::Global().isCapturing()) {
+      // Declining here skips the WHOLE QS4CX arm of the FC dispatcher, so the
+      // captured graph would be missing this layer entirely.
+      StreamManager::Global().markCaptureDoomed(
+        "a QS4CX fp16 scale buffer was not prewarmed and cannot be allocated "
+        "under capture");
       return false;
+    }
     unsigned short *usc = nullptr;
     // [WDDM coherence] This buffer is host-WRITTEN once and device-READ every
     // FC call -- the pattern that is incoherent on cMA==0 managed memory. Use
@@ -991,9 +997,16 @@ bool ensure_buf(void **buf, size_t *cap, size_t bytes) {
   if (bytes <= *cap)
     return true;
   // cudaMalloc/cudaFree inside a CUDA-graph stream capture invalidates it; bail
-  // so the caller falls back rather than corrupting the graph.
-  if (StreamManager::Global().isCapturing())
+  // so the caller falls back rather than corrupting the graph. Refusing keeps
+  // the capture VALID, which is the dangerous part: the caller's op drops out
+  // and the graph is instantiated without it. Doom the capture so it is thrown
+  // away instead of replayed with a hole in it.
+  if (StreamManager::Global().isCapturing()) {
+    StreamManager::Global().markCaptureDoomed(
+      "an FC scratch buffer was under-sized by the prewarm and cannot grow "
+      "under capture");
     return false;
+  }
   if (*buf)
     cudaFree(*buf);
   if (cudaMalloc(buf, bytes) != cudaSuccess) {

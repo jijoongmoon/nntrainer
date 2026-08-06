@@ -1122,8 +1122,11 @@ bool ensure_sk(size_t mn, size_t acc) {
     // cuda_attention_splitkv_prewarm() so this branch must not run under
     // capture; if it ever would (an under-sized prewarm), bail so the caller
     // falls back rather than corrupting the graph.
-    if (StreamManager::Global().isCapturing())
+    if (StreamManager::Global().isCapturing()) {
+      StreamManager::Global().markCaptureDoomed(
+        "the split-KV attention scratch was under-sized by the prewarm");
       return false;
+    }
     if (g_pm)
       cudaFree(g_pm);
     if (g_pl)
@@ -1134,8 +1137,11 @@ bool ensure_sk(size_t mn, size_t acc) {
     g_pm_cap = mn;
   }
   if (acc > g_pacc_cap) {
-    if (StreamManager::Global().isCapturing())
+    if (StreamManager::Global().isCapturing()) {
+      StreamManager::Global().markCaptureDoomed(
+        "the split-KV attention accumulator was under-sized by the prewarm");
       return false;
+    }
     if (g_pacc)
       cudaFree(g_pacc);
     if (cudaMalloc(&g_pacc, acc * sizeof(float)) != cudaSuccess)
@@ -1343,6 +1349,19 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
   // scratch scores [N_q, N_kv] fp16 reused across heads (heads run serially).
   const size_t need = (size_t)N_q * N_kv;
   if (need > g_scores_cap) {
+    // This runs on the PREFILL path, which IS graph-captured on an integrated
+    // GPU. A cudaFree/cudaMalloc there does not merely fail -- it INVALIDATES
+    // the capture, and every later cuLaunchKernel on the stream then fails with
+    // CUDA_ERROR_STREAM_CAPTURE_INVALIDATED, so the rest of the forward falls
+    // off its device paths one op at a time (field: the attention output
+    // projection then took the host dot() and threw "pack before run model").
+    // The load-time warmup prefill grows this before any capture; if a later,
+    // longer prefill still needs more, refuse and abandon the capture instead.
+    if (StreamManager::Global().isCapturing()) {
+      StreamManager::Global().markCaptureDoomed(
+        "the GEMM-attention score scratch has to grow under capture");
+      return false;
+    }
     if (g_scores)
       cudaFree(g_scores);
     if (cudaMalloc(&g_scores, need * sizeof(unsigned short)) != cudaSuccess) {
@@ -1397,15 +1416,21 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
 
 // --- split-KV chunked-prefill scratch (partial m/l/acc, slab-sized) ---
 // Separate from the decode scratch (g_pm/...): that one is pre-sized by
-// cuda_attention_splitkv_prewarm under the M2-B fixed-stride contract; the
-// prefill path is never graph-captured, so plain lazy growth is fine here.
+// cuda_attention_splitkv_prewarm under the M2-B fixed-stride contract. This one
+// grows lazily -- which is fine only OUTSIDE a capture, and the prefill IS
+// captured on an integrated GPU (NNTR_CUDA_PREFILL_GRAPH, default on there).
+// The first prefill after the load-time warmup pass has already grown it; the
+// guards below cover the case where a later, longer prefill needs more.
 float *g_bs_pm = nullptr, *g_bs_pl = nullptr, *g_bs_pacc = nullptr;
 size_t g_bs_pm_cap = 0, g_bs_pacc_cap = 0;
 std::mutex g_bs_mtx;
 bool ensure_bs(size_t mn, size_t acc) {
   if (mn > g_bs_pm_cap) {
-    if (StreamManager::Global().isCapturing())
-      return false; // prefill is never captured; guard anyway (see ensure_sk)
+    if (StreamManager::Global().isCapturing()) {
+      StreamManager::Global().markCaptureDoomed(
+        "the chunked-prefill attention scratch has to grow under capture");
+      return false;
+    }
     if (g_bs_pm)
       cudaFree(g_bs_pm);
     if (g_bs_pl)
@@ -1419,8 +1444,11 @@ bool ensure_bs(size_t mn, size_t acc) {
     g_bs_pm_cap = mn;
   }
   if (acc > g_bs_pacc_cap) {
-    if (StreamManager::Global().isCapturing())
+    if (StreamManager::Global().isCapturing()) {
+      StreamManager::Global().markCaptureDoomed(
+        "the chunked-prefill attention accumulator has to grow under capture");
       return false;
+    }
     if (g_bs_pacc)
       cudaFree(g_bs_pacc);
     if (cudaMalloc(&g_bs_pacc, acc * sizeof(float)) != cudaSuccess) {
