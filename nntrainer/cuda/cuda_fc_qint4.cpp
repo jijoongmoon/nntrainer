@@ -606,23 +606,29 @@ __global__ void repack_plain_i4(const unsigned char *qw, signed char *packed,
 // Y[m,n] = recip[m]*w_scale[n]*(sum_k q8[m,k]*int4(n,k) - zp[m]*rowsum_w[n]),
 // the asymmetric-activation dequant (zp from act_quant, rowsum_w from the
 // weight). via __dp4a.
+// `raw` (launch-uniform): 1 = `plain` is the QS4CX payload itself, so the
+// offset-binary bias is removed here with an XOR and rowsum is accumulated in
+// this same pass instead of being read from the derived cache. See
+// dp4a_gemv_raw for why that cache is worth not building.
 __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
                           const float *ascale, const int *azp,
                           const int *wrowsum, const unsigned short *wscale,
-                          float *Y, int M, int N, int K, int out_fp16) {
+                          float *Y, int M, int N, int K, int out_fp16,
+                          int raw) {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   int m = blockIdx.y * blockDim.y + threadIdx.y;
   if (m >= M || n >= N)
     return;
   int Kh = (K + 1) >> 1;
+  const int xr = raw ? 0x88 : 0;
   const signed char *qrow = q8 + (long)m * K;
   const signed char *wrow = plain + (long)n * Kh;
-  int acc = 0, k = 0;
+  int acc = 0, rs = 0, k = 0;
   for (; k + 4 <= K; k += 4) {
     int a = *(const int *)(qrow + k); // lanes = act k,k+1,k+2,k+3
     int kb = k >> 1;
-    int b0 = (unsigned char)wrow[kb];     // k(low), k+1(high)
-    int b1 = (unsigned char)wrow[kb + 1]; // k+2(low), k+3(high)
+    int b0 = ((unsigned char)wrow[kb]) ^ xr;     // k(low), k+1(high)
+    int b1 = ((unsigned char)wrow[kb + 1]) ^ xr; // k+2(low), k+3(high)
     int w0 = ((int)(signed char)(b0 << 4)) >> 4;
     int w1 = ((int)(signed char)b0) >> 4;
     int w2 = ((int)(signed char)(b1 << 4)) >> 4;
@@ -630,15 +636,18 @@ __global__ void dp4a_gemm(const signed char *q8, const signed char *plain,
     int w = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |
             ((w3 & 0xFF) << 24);
     acc = __dp4a(a, w, acc);
+    rs = __dp4a(0x01010101, w, rs);
   }
   for (; k < K; ++k) { // tail (none when K%32==0)
     int kb = k >> 1;
-    int b = (unsigned char)wrow[kb];
+    int b = ((unsigned char)wrow[kb]) ^ xr;
     int wv = (k & 1) ? (((int)(signed char)b) >> 4)
                      : (((int)(signed char)(b << 4)) >> 4);
     acc += (int)qrow[k] * wv;
+    rs += wv;
   }
-  float r = (float)(acc - azp[m] * wrowsum[n]) * ascale[m] * dp4a_h2f(wscale[n]);
+  const int rsum = raw ? rs : wrowsum[n];
+  float r = (float)(acc - azp[m] * rsum) * ascale[m] * dp4a_h2f(wscale[n]);
   if (out_fp16)
     ((unsigned short *)Y)[(long)m * N + n] = dp4a_f2h(r);
   else
@@ -886,17 +895,27 @@ __global__ void dp4a_gemv_fused_h(const unsigned short *Xh,
 #define RB_BK 32
 #define RB_TM 4
 #define RB_TN 4
+// `raw` as in dp4a_gemm: the XOR moves onto the staging load below, and the
+// per-column rowsum is accumulated off `wf[j]`, which the inner loop already
+// holds in a register. Threads sharing a `tx` recompute the same rowsum, but
+// that is register arithmetic on data already staged -- no extra traffic.
 __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
                               const float *ascale, const int *azp,
                               const int *wrowsum, const unsigned short *wscale,
-                              float *Y, int M, int N, int K, int out_fp16) {
+                              float *Y, int M, int N, int K, int out_fp16,
+                              int raw) {
   __shared__ signed char As[RB_BM][RB_BK];
   __shared__ signed char Ws[RB_BN][RB_BK];
   int tx = threadIdx.x, ty = threadIdx.y; // 0..15 each
   int tid = ty * 16 + tx;
   int blockM = blockIdx.y * RB_BM, blockN = blockIdx.x * RB_BN;
   int Kh = (K + 1) >> 1;
+  const int xr = raw ? 0x88 : 0;
   int acc[RB_TM][RB_TN];
+  int rs[RB_TN];
+#pragma unroll
+  for (int j = 0; j < RB_TN; j++)
+    rs[j] = 0;
 #pragma unroll
   for (int i = 0; i < RB_TM; i++)
 #pragma unroll
@@ -913,7 +932,9 @@ __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
       int nn = blockN + i, kk = k0 + j;
       signed char wv = 0;
       if (nn < N && kk < K) {
-        unsigned char b = (unsigned char)plain[(long)nn * Kh + (kk >> 1)];
+        unsigned char b =
+          (unsigned char)(((unsigned char)plain[(long)nn * Kh + (kk >> 1)]) ^
+                          xr);
         wv = (kk & 1) ? (((signed char)b) >> 4)
                       : (((signed char)(b << 4)) >> 4);
       }
@@ -929,6 +950,11 @@ __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
 #pragma unroll
       for (int j = 0; j < RB_TN; j++)
         wf[j] = *(const int *)&Ws[tx * RB_TN + j][kk];
+      // rowsum off the SAME staged tile: Ws is zero where kk >= K, so this
+      // sums exactly k in [0,K) -- the range weight_rowsum uses.
+#pragma unroll
+      for (int j = 0; j < RB_TN; j++)
+        rs[j] = __dp4a(0x01010101, wf[j], rs[j]);
 #pragma unroll
       for (int i = 0; i < RB_TM; i++)
 #pragma unroll
@@ -948,8 +974,8 @@ __global__ void dp4a_gemm_reg(const signed char *q8, const signed char *plain,
     for (int j = 0; j < RB_TN; j++) {
       int col = blockN + tx * RB_TN + j;
       if (col < N) {
-        float r =
-          (float)(acc[i][j] - zp * wrowsum[col]) * as * dp4a_h2f(wscale[col]);
+        const int rsum = raw ? rs[j] : wrowsum[col];
+        float r = (float)(acc[i][j] - zp * rsum) * as * dp4a_h2f(wscale[col]);
         if (out_fp16)
           ((unsigned short *)Y)[(long)row * N + col] = dp4a_f2h(r);
         else
@@ -1235,7 +1261,11 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   // layer type "fully_connected" and the MoE node is "qwen_moe" -- so a
   // profile shows repack_plain_i4 + weight_rowsum as 18% of GPU time, and a
   // long prefill that touches all 30,720 experts pays it in full.
-  const bool raw = fc_nocache_on() && gemv && !fused;
+  // The GEMV needs its own kernel (it has no wrowsum parameter at all); the two
+  // GEMMs take a launch-uniform `raw` flag instead, so there is one code path
+  // rather than two copies of a register-blocked tile.
+  const bool nocache = fc_nocache_on() && !fused;
+  const bool raw = nocache && gemv;
   auto kg = CudaContext::Global().registerCudaKernel(
     FC_QINT4_DP4A_SRC, fused  ? "dp4a_gemv_fused_h"
                        : raw  ? "dp4a_gemv_raw"
@@ -1246,13 +1276,17 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
 
   signed char *plain = nullptr;
   int *wrowsum = nullptr;
-  if (!raw) {
+  if (!nocache) {
     DevWeightQ *dwp = ensure_dp4a_cache_locked(plain_w, N, K);
     if (!dwp)
       return false;
     plain = dwp->plain;
     wrowsum = dwp->rowsum;
   }
+  // When nocache, the kernel reads the payload itself and derives rowsum; the
+  // cache pointers stay null and are never dereferenced.
+  const void *w_arg = nocache ? (const void *)plain_w : (const void *)plain;
+  const int raw_i = nocache ? 1 : 0;
 
   const int mm = (int)M;
   if (raw) {
@@ -1284,7 +1318,7 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
                                                    (unsigned int)K);
   }
   kg->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
-  kg->SetKernelArguments(1, &plain, sizeof(plain));
+  kg->SetKernelArguments(1, &w_arg, sizeof(w_arg));
   kg->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
   kg->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
   kg->SetKernelArguments(4, &wrowsum, sizeof(wrowsum));
@@ -1305,6 +1339,7 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   kg->SetKernelArguments(8, &n, sizeof(n));
   kg->SetKernelArguments(9, &k, sizeof(k));
   kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
+  kg->SetKernelArguments(11, &raw_i, sizeof(raw_i));
   const int gb[3] = {16, 16, 1};
   const int tile = tiled ? 64 : 16;
   const int gg[3] = {((int)N + tile - 1) / tile, ((int)M + tile - 1) / tile, 1};
