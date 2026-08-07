@@ -56,6 +56,7 @@
 #include <int4_utils.h>
 #include <model_loader.h>
 #include <multiout_realizer.h>
+#include <layer_prof.h>
 #include <neuralnet.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -785,6 +786,14 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     // every non-M2-B CUDA step take the same path as before.
     if (g_m2b_skip_all && !isM2BFeedNode(node->getName()))
       return;
+
+    // NNTR_LAYER_PROFILE: one scope here covers EVERY node type, so a new
+    // layer never has to be instrumented by hand to show up in the table.
+    // Keyed by layer TYPE, not name, so the 40 repeats aggregate into one row.
+    // getType() returns BY VALUE, so the string must outlive the scope --
+    // declared first, hence destroyed last.
+    const std::string _node_type = node->getType();
+    LayerProfScope _node_prof(_node_type.c_str(), (to - from) == 1);
 
     auto f = std::get<0>(node->getExecutionOrder());
     if (exec_mode == ExecutionMode::TRAIN or
