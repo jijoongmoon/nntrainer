@@ -133,10 +133,15 @@ private:
   bool wcache_loaded = false;
   void ensureWeightCache(nntrainer::RunLayerContext &context);
 
-  /** naive prefill over seq_len tokens; when save_state, persists the final
-   *  recurrent state S + the last (conv_kernel-1) conv inputs for decode. */
+  /** prefill over seq_len tokens starting at INPUT ROW 0; when save_state,
+   *  persists the final recurrent state S + the last (conv_kernel-1) conv
+   *  inputs. When seed_state, S and the causal left-pad are RESUMED from those
+   *  persistent tensors instead of starting from zero -- that is what makes a
+   *  chunked prefill legal for a linear-attention layer, where (unlike causal
+   *  softmax attention) a later chunk cannot reconstruct its prefix from a KV
+   *  cache. */
   void runForward(nntrainer::RunLayerContext &context, int seq_len,
-                  bool save_state);
+                  bool save_state, bool seed_state = false);
   /** single-token decode step: decay-first delta update + conv-with-ring. */
   void runDecode(nntrainer::RunLayerContext &context);
   /** fp32-sgemm out_proj (normed [B*S,VAL] @ Wout -> output), dtype-aware

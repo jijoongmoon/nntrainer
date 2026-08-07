@@ -257,16 +257,24 @@ void GatedDeltaNetLayer::forwarding(nntrainer::RunLayerContext &context,
 void GatedDeltaNetLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool /*training*/) {
-  if (from == 0)
-    // prefill: process the ACTUAL prompt length (to), not the padded tensor
-    // height (INIT_SEQ_LEN); persist S + conv ring for decode.
-    runForward(context, (int)to, /*save_state=*/true);
+  // A chunk feeds its tokens at INPUT ROW 0 and carries its absolute position
+  // only in (from, to) -- see the [prefill-chunk] note in causal_lm.cpp. So the
+  // row count is (to - from), never `to`: using `to` for a resumed chunk would
+  // read past the rows that were actually written.
+  const unsigned int len = to - from;
+  if (len > 1)
+    // prefill, first chunk or a resumed one. Process the ACTUAL length, not the
+    // padded tensor height (INIT_SEQ_LEN); persist S + conv ring either way.
+    runForward(context, (int)len, /*save_state=*/true, /*seed_state=*/from > 0);
+  else if (from == 0)
+    runForward(context, 1, /*save_state=*/true, /*seed_state=*/false);
   else
     runDecode(context); // single-token decode using the persistent state
 }
 
 void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
-                                    int seq_len, bool save_state) {
+                                    int seq_len, bool save_state,
+                                    bool seed_state) {
   nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
 
@@ -361,12 +369,24 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
     if (!save_state)
       return;
     float *cs = context.getTensor(conv_state_idx).getData<float>();
+    // Snapshot first: when this chunk is SHORTER than the ring (S < KS-1) the
+    // oldest slots must carry over from the previous ring, and we are writing
+    // into the buffer we would be reading.
+    std::vector<float> prev;
+    if (seed_state && S < KS - 1)
+      prev.assign(cs, cs + (size_t)B * CONV * (KS - 1));
     for (int bi = 0; bi < B; ++bi)
       for (int c = 0; c < CONV; ++c)
         for (int j = 0; j < KS - 1; ++j) {
           const int ti = S - (KS - 1) + j; // position feeding ring slot j
-          cs[(bi * CONV + c) * (KS - 1) + j] =
-            (ti < 0) ? 0.0f : pq[(bi * S + ti) * CONV + c];
+          float v;
+          if (ti >= 0)
+            v = pq[(bi * S + ti) * CONV + c];
+          else if (!prev.empty())
+            v = prev[(bi * CONV + c) * (KS - 1) + (KS - 1 + ti)];
+          else
+            v = 0.0f;
+          cs[(bi * CONV + c) * (KS - 1) + j] = v;
         }
   };
 
@@ -390,8 +410,8 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
             wconv_f.data(), alog_f.data(), dtb_f.data(), wnorm_f.data(), st, rg,
             reinterpret_cast<unsigned short *>(output.getData<_FP16>()),
             (unsigned)T, (unsigned)H, (unsigned)NVH, (unsigned)NKH,
-            (unsigned)HKD, (unsigned)HVD, (unsigned)KS, eps,
-            /*seed_state=*/false, save_state)) {
+            (unsigned)HKD, (unsigned)HVD, (unsigned)KS, eps, seed_state,
+            save_state)) {
         if (gdn_gpu_p < 2) {
           save_ring();
           return;
@@ -414,7 +434,11 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   }
 #endif
 
-  // causal depthwise conv1d + SiLU (per sequence, left-pad K-1)
+  // causal depthwise conv1d + SiLU (per sequence, left-pad K-1). On a resumed
+  // chunk the left pad is the persistent ring, not zeros -- read before
+  // save_ring() overwrites it below.
+  const float *ring_in =
+    seed_state ? context.getTensor(conv_state_idx).getData<float>() : nullptr;
   std::vector<float> conv(T * CONV);
   for (int bi = 0; bi < B; ++bi)
     for (int c = 0; c < CONV; ++c)
@@ -422,8 +446,12 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
         float acc = 0.0f;
         for (int j = 0; j < KS; ++j) {
           int ti = t - (KS - 1) + j;
-          acc += wconv[c * KS + j] *
-                 (ti < 0 ? 0.0f : pq[(bi * S + ti) * CONV + c]);
+          const float xv =
+            (ti >= 0) ? pq[(bi * S + ti) * CONV + c]
+                      : (ring_in ? ring_in[(bi * CONV + c) * (KS - 1) +
+                                           (KS - 1 + ti)]
+                                 : 0.0f);
+          acc += wconv[c * KS + j] * xv;
         }
         conv[(bi * S + t) * CONV + c] = siluf(acc);
       }
@@ -460,13 +488,16 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   l2(k);
 
   // decay-first delta recurrence (per batch, per v-head)
-  float *state = save_state
+  float *state = (save_state || seed_state)
                    ? context.getTensor(state_idx).getData<float>()
                    : nullptr; // [B,NVH,HKD,HVD]
   std::vector<float> core(T * NVH * HVD, 0.0f);
   for (int bi = 0; bi < B; ++bi)
     for (int vh = 0; vh < NVH; ++vh) {
       std::vector<float> Sh(HKD * HVD, 0.0f);
+      if (seed_state && state) // resume the recurrence across chunks
+        std::memcpy(Sh.data(), &state[(bi * NVH + vh) * HKD * HVD],
+                    (size_t)HKD * HVD * sizeof(float));
       for (int t = 0; t < S; ++t) {
         const int tok = bi * S + t;
         const float gt = std::exp(gg[tok * NVH + vh]);
