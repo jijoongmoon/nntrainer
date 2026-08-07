@@ -57,6 +57,52 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
 bool cuda_gdn_prewarm(unsigned int H, unsigned int NVH, unsigned int NKH,
                       unsigned int HKD, unsigned int HVD);
 
+/**
+ * @brief Everything between the input projections and the layer output, for a
+ *        whole prefill of T tokens, on the device.
+ *
+ * conv1d(+SiLU) -> l2norm(q,k) + q.k -> decay-first delta scan -> gated
+ * RMSNorm -> out_proj. The caller supplies the four projection outputs (they
+ * are plain dense GEMMs and already go through cuBLAS) and gets the layer
+ * output back; nothing in between touches the host.
+ *
+ * The scan keeps the recurrent state S[HKD][HVD] entirely in REGISTERS -- 512
+ * threads x 32 floats each covers 128x128 exactly -- so a token costs ~96 FMAs
+ * per thread and NO memory traffic for S. Holding S in shared memory instead
+ * would cost ~256 KB of shared traffic per token per head, which at T=20000
+ * over 30 layers is ~1.9 s versus ~0.2 s. That is why HKD and HVD are pinned
+ * to 128 below rather than made general.
+ *
+ * @param p_qkv [T,CONV] fp32 in_proj_qkv output (device-accessible)
+ * @param p_z   [T,VAL]  fp32 in_proj_z output
+ * @param p_b   [T,NVH]  fp32 in_proj_b output
+ * @param p_a   [T,NVH]  fp32 in_proj_a output
+ * @param wout  [VAL,H]  fp16 out_proj weight
+ * @param h_wconv/h_alog/h_dtb/h_wnorm HOST fp32 per-layer params (uploaded
+ *        once per layer, cached on h_wconv as in cuda_gdn_decode_fp16)
+ * @param state [NVH,HKD,HVD] fp32 recurrent state; read when seed_state,
+ *        written when save_state (in-place)
+ * @param ring  [CONV,KS-1] fp32 conv ring; READ as the causal left-pad when
+ *        seed_state. Writing it back is left to the caller, which already
+ *        does so from p_qkv.
+ * @param out   [T,H] fp16 layer output
+ * @param seed_state resume a chunked prefill from the persistent state+ring
+ *        instead of starting from zero
+ * @return false on any unsupported dim / alloc / dispatch failure, having
+ *         mutated nothing the caller cannot recompute -- state is written only
+ *         on the success path.
+ */
+bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
+                           const float *p_b, const float *p_a,
+                           const unsigned short *wout, const float *h_wconv,
+                           const float *h_alog, const float *h_dtb,
+                           const float *h_wnorm, float *state,
+                           const float *ring, unsigned short *out,
+                           unsigned int T, unsigned int H, unsigned int NVH,
+                           unsigned int NKH, unsigned int HKD, unsigned int HVD,
+                           unsigned int KS, float eps, bool seed_state,
+                           bool save_state);
+
 } // namespace nntrainer::cuda
 
 #endif /* __CUDA_GDN_H__ */

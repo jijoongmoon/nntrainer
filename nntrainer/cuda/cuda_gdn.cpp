@@ -7,6 +7,7 @@
 
 #include <cuda_context.h>
 #include <cuda_context_manager.h>
+#include <cuda_fc_dense.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #include <cmath>
@@ -185,6 +186,151 @@ __global__ void gdn_delta_head(const float *conv, const float *z,
   const float inv = 1.0f/sqrtf(red[0]/(float)HVD + eps);
   normed[vh*HVD + b] = ob*inv*wnorm[b]*gdn_silu(z[vh*HVD + b]);
 }
+// ---------------------------------------------------------------- prefill --
+// causal depthwise conv1d + SiLU over the whole [T,CONV] plane. The left pad
+// comes from the persistent ring when this is a resumed chunk, zeros when it
+// is the first -- ring[c][j] holds the input at position t-(KS-1)+j, the same
+// convention gdn_conv_ring advances during decode.
+__global__ void gdn_conv_prefill(const float *qkv, const float *wconv,
+                                 const float *ring, float *conv, int T,
+                                 int CONV, int KS, int has_ring){
+  const long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
+  if (idx >= (long)T*CONV) return;
+  const int t = (int)(idx / CONV), c = (int)(idx - (long)t*CONV);
+  float acc = 0.0f;
+  for (int j = 0; j < KS; ++j) {
+    const int ti = t - (KS-1) + j;
+    float xv;
+    if (ti >= 0)         xv = qkv[(long)ti*CONV + c];
+    else if (has_ring)   xv = ring[(long)c*(KS-1) + (KS-1+ti)];
+    else                 xv = 0.0f;
+    acc += wconv[c*KS + j] * xv;
+  }
+  conv[idx] = gdn_silu(acc);
+}
+
+// In-place l2norm of the q and k slices of conv, per (token, k-head), and the
+// q.k dot the scan needs. Doing the dot here rather than inside the scan is
+// what keeps the scan's inner loop at ~96 FMAs: q.k is per (t, K-HEAD) and is
+// shared by the GQA group, so the scan would otherwise recompute a 128-long
+// reduction per v-head per token for a value it could have been handed.
+// blockDim.x == HKD, which the dispatch pins to 128.
+__global__ void gdn_l2norm_prefill(float *conv, float *qkdot, int CONV,
+                                   int KEY, int NKH, int HKD, float eps){
+  const int kh = blockIdx.x % NKH, t = blockIdx.x / NKH;
+  const int d = threadIdx.x;
+  __shared__ float red[128];
+  float *qr = conv + (long)t*CONV + kh*HKD;
+  float *kr = conv + (long)t*CONV + KEY + kh*HKD;
+  float qv = qr[d], kv = kr[d];
+  red[d] = qv*qv; __syncthreads();
+  for (int s = blockDim.x>>1; s > 0; s >>= 1){ if (d<s) red[d]+=red[d+s]; __syncthreads(); }
+  const float iq = 1.0f/sqrtf(red[0] + eps); __syncthreads();
+  red[d] = kv*kv; __syncthreads();
+  for (int s = blockDim.x>>1; s > 0; s >>= 1){ if (d<s) red[d]+=red[d+s]; __syncthreads(); }
+  const float ik = 1.0f/sqrtf(red[0] + eps); __syncthreads();
+  qv *= iq; kv *= ik;
+  qr[d] = qv; kr[d] = kv;
+  red[d] = qv*kv; __syncthreads();
+  for (int s = blockDim.x>>1; s > 0; s >>= 1){ if (d<s) red[d]+=red[d+s]; __syncthreads(); }
+  if (d == 0) qkdot[(long)t*NKH + kh] = red[0];
+}
+
+// The scan. ONE BLOCK PER V-HEAD, 512 threads, S[128][128] held entirely in
+// registers as 32 floats per thread -- thread (ag,b) owns S[ag*32+j][b].
+//
+// The recurrence is algebraically restructured so S is touched ONCE per token
+// instead of twice. With S'' = gt*S + k (x) dl:
+//     o = sum_a S''[a,b] q[a] = gt*(sum_a S[a,b] q[a]) + dl[b]*(sum_a k[a] q[a])
+// so one pass computing BOTH sum_a S[a,b]k[a] and sum_a S[a,b]q[a] off the old
+// state, plus the precomputed q.k, gives o without ever reading the updated S.
+// This is the same arithmetic as the host reference, regrouped; the summation
+// order per output stays ascending in a.
+#define GDN_APT 32   /* HKD*HVD / blockDim == 128*128/512 */
+__global__ __launch_bounds__(512, 2)
+void gdn_scan_prefill(const float *conv, const float *z, const float *pb,
+                      const float *pa, const float *qkdot, const float *alog,
+                      const float *dtb, const float *wnorm, float *state,
+                      unsigned short *normed, int T, int NVH, int NKH,
+                      int HKD, int HVD, int KEY, int CONV, int VAL,
+                      float scale, float eps, int seed_state, int save_state){
+  const int vh = blockIdx.x;
+  const int GQA = NVH/NKH, kh = vh/GQA;
+  const int tid = threadIdx.x;
+  const int b = tid & 127;      // HVD == 128
+  const int ag = tid >> 7;      // 0..3
+  const int a0 = ag*GDN_APT;
+
+  float S[GDN_APT];
+  #pragma unroll
+  for (int j = 0; j < GDN_APT; ++j)
+    S[j] = seed_state ? state[((long)vh*HKD + (a0+j))*HVD + b] : 0.0f;
+
+  __shared__ float qs[128], ks[128], vs[128], dls[128], os[128];
+  __shared__ float rk[4][128], rq[4][128], wred[4];
+
+  const float al = alog[vh], dbias = dtb[vh], wn = wnorm[b];
+
+  for (int t = 0; t < T; ++t) {
+    if (ag == 0) {
+      qs[b] = conv[(long)t*CONV + kh*HKD + b];
+      ks[b] = conv[(long)t*CONV + KEY + kh*HKD + b];
+      vs[b] = conv[(long)t*CONV + 2*KEY + vh*HVD + b];
+    }
+    __syncthreads();
+
+    const float aa = pa[(long)t*NVH + vh] + dbias;
+    const float sp = aa > 20.0f ? aa : log1pf(expf(aa));
+    const float gt = expf(-expf(al) * sp);
+    const float bt = 1.0f/(1.0f + expf(-pb[(long)t*NVH + vh]));
+    const float kq = qkdot[(long)t*NKH + kh];
+
+    float pk = 0.0f, pq = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < GDN_APT; ++j) {
+      const float s = S[j];
+      pk += s*ks[a0+j];
+      pq += s*qs[a0+j];
+    }
+    rk[ag][b] = pk; rq[ag][b] = pq;
+    __syncthreads();
+
+    if (ag == 0) {
+      const float PK = rk[0][b]+rk[1][b]+rk[2][b]+rk[3][b];
+      const float PQ = rq[0][b]+rq[1][b]+rq[2][b]+rq[3][b];
+      const float dv = (vs[b] - gt*PK) * bt;
+      dls[b] = dv;
+      os[b] = scale * (gt*PQ + dv*kq);
+    }
+    __syncthreads();
+
+    const float dv_b = dls[b];
+    #pragma unroll
+    for (int j = 0; j < GDN_APT; ++j) S[j] = gt*S[j] + ks[a0+j]*dv_b;
+
+    // gated RMSNorm over HVD, warp-shuffled: one barrier instead of the seven
+    // a shared-memory tree would need, and this loop runs T times.
+    float sq = (ag == 0) ? os[b]*os[b] : 0.0f;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sq += __shfl_down_sync(0xffffffffu, sq, o);
+    if (ag == 0 && (b & 31) == 0) wred[b >> 5] = sq;
+    __syncthreads();
+    if (ag == 0) {
+      const float ss = wred[0]+wred[1]+wred[2]+wred[3];
+      const float inv = 1.0f/sqrtf(ss/(float)HVD + eps);
+      const float zv = z[(long)t*VAL + vh*HVD + b];
+      normed[(long)t*VAL + vh*HVD + b] =
+        f2h(os[b]*inv*wn*gdn_silu(zv));
+    }
+    __syncthreads();
+  }
+
+  if (save_state) {
+    #pragma unroll
+    for (int j = 0; j < GDN_APT; ++j)
+      state[((long)vh*HKD + (a0+j))*HVD + b] = S[j];
+  }
+}
 } // extern "C"
 )CU";
 
@@ -201,6 +347,10 @@ float *g_qkv = nullptr, *g_z = nullptr, *g_pb = nullptr, *g_pa = nullptr;
 float *g_conv = nullptr, *g_normed = nullptr;
 size_t g_qkv_cap = 0, g_z_cap = 0, g_pb_cap = 0, g_pa_cap = 0;
 size_t g_conv_cap = 0, g_normed_cap = 0;
+// prefill scratch: sized by T, so kept apart from the decode buffers above
+float *g_pf_conv = nullptr, *g_pf_qkdot = nullptr;
+unsigned short *g_pf_normed = nullptr;
+size_t g_pf_conv_cap = 0, g_pf_qkdot_cap = 0, g_pf_normed_cap = 0;
 
 bool grow(void **p, size_t *cap, size_t need) {
   if (need <= *cap)
@@ -262,6 +412,127 @@ bool cuda_gdn_prewarm(unsigned int H, unsigned int NVH, unsigned int NKH,
     return true;
   std::lock_guard<std::mutex> lk(g_gdn_mtx);
   return ensure_scratch(2 * NKH * HKD + NVH * HVD, NVH * HVD, NVH);
+}
+
+bool cuda_gdn_prefill_fp16(const float *p_qkv, const float *p_z,
+                           const float *p_b, const float *p_a,
+                           const unsigned short *wout, const float *h_wconv,
+                           const float *h_alog, const float *h_dtb,
+                           const float *h_wnorm, float *state,
+                           const float *ring, unsigned short *out,
+                           unsigned int T, unsigned int H, unsigned int NVH,
+                           unsigned int NKH, unsigned int HKD, unsigned int HVD,
+                           unsigned int KS, float eps, bool seed_state,
+                           bool save_state) {
+  const unsigned int KEY = NKH * HKD, VAL = NVH * HVD;
+  const unsigned int CONV = 2 * KEY + VAL;
+  // The scan holds S in registers at exactly 512 threads x 32 floats, which
+  // covers 128x128 and nothing else. A general version would have to spill S
+  // to shared and give up the whole point (see the header).
+  if (T == 0 || HKD != 128 || HVD != 128 || NVH == 0 || NKH == 0 ||
+      NVH % NKH != 0 || KS < 2 || p_qkv == nullptr || out == nullptr)
+    return false;
+  std::lock_guard<std::mutex> lk(g_gdn_mtx);
+  if (!grow((void **)&g_pf_conv, &g_pf_conv_cap, (size_t)T * CONV * 4) ||
+      !grow((void **)&g_pf_qkdot, &g_pf_qkdot_cap, (size_t)T * NKH * 4) ||
+      !grow((void **)&g_pf_normed, &g_pf_normed_cap, (size_t)T * VAL * 2)) {
+    fprintf(stderr, "[cuda_gdn] prefill scratch alloc FAILED (T=%u): %s\n", T,
+            cudaGetErrorString(cudaGetLastError()));
+    return false;
+  }
+  auto &sm = StreamManager::Global();
+  cudaStream_t stream = sm.GetStream();
+  const DevParams *dp =
+    ensure_params(h_wconv, h_alog, h_dtb, h_wnorm, CONV, KS, NVH, HVD, stream);
+  if (!dp) {
+    fprintf(stderr, "[cuda_gdn] prefill param upload FAILED\n");
+    return false;
+  }
+  auto &ctx = CudaContext::Global();
+  auto kcv = ctx.registerCudaKernel(GDN_SRC, "gdn_conv_prefill");
+  auto kln = ctx.registerCudaKernel(GDN_SRC, "gdn_l2norm_prefill");
+  auto ksc = ctx.registerCudaKernel(GDN_SRC, "gdn_scan_prefill");
+  if (!kcv || !kln || !ksc) {
+    ml_loge("[CUDA] gdn: prefill kernel registration failed");
+    return false;
+  }
+  int iT = (int)T, iCONV = (int)CONV, iKS = (int)KS, iKEY = (int)KEY;
+  int iNVH = (int)NVH, iNKH = (int)NKH, iHKD = (int)HKD, iHVD = (int)HVD;
+  int iVAL = (int)VAL;
+  int has_ring = (seed_state && ring != nullptr) ? 1 : 0;
+  int i_seed = seed_state ? 1 : 0, i_save = save_state ? 1 : 0;
+  float scale = 1.0f / std::sqrt((float)HKD);
+
+  { // conv1d + SiLU over the whole plane
+    kcv->SetKernelArguments(0, &p_qkv, sizeof(p_qkv));
+    kcv->SetKernelArguments(1, &dp->wconv, sizeof(dp->wconv));
+    kcv->SetKernelArguments(2, &ring, sizeof(ring));
+    kcv->SetKernelArguments(3, &g_pf_conv, sizeof(g_pf_conv));
+    kcv->SetKernelArguments(4, &iT, sizeof(iT));
+    kcv->SetKernelArguments(5, &iCONV, sizeof(iCONV));
+    kcv->SetKernelArguments(6, &iKS, sizeof(iKS));
+    kcv->SetKernelArguments(7, &has_ring, sizeof(has_ring));
+    const long total = (long)T * CONV;
+    const int B2 = 256;
+    const int g[3] = {(int)((total + B2 - 1) / B2), 1, 1}, b3[3] = {B2, 1, 1};
+    if (!sm.DispatchCommand(*kcv, g, b3)) {
+      fprintf(stderr, "[cuda_gdn] prefill conv dispatch FAILED: %s\n",
+              cudaGetErrorString(cudaGetLastError()));
+      return false;
+    }
+  }
+  { // in-place l2norm(q,k) + the per-(token,k-head) q.k
+    kln->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    kln->SetKernelArguments(1, &g_pf_qkdot, sizeof(g_pf_qkdot));
+    kln->SetKernelArguments(2, &iCONV, sizeof(iCONV));
+    kln->SetKernelArguments(3, &iKEY, sizeof(iKEY));
+    kln->SetKernelArguments(4, &iNKH, sizeof(iNKH));
+    kln->SetKernelArguments(5, &iHKD, sizeof(iHKD));
+    kln->SetKernelArguments(6, &eps, sizeof(eps));
+    const int g[3] = {(int)(T * NKH), 1, 1}, b3[3] = {iHKD, 1, 1};
+    if (!sm.DispatchCommand(*kln, g, b3)) {
+      fprintf(stderr, "[cuda_gdn] prefill l2norm dispatch FAILED: %s\n",
+              cudaGetErrorString(cudaGetLastError()));
+      return false;
+    }
+  }
+  { // the sequential scan + fused gated RMSNorm
+    ksc->SetKernelArguments(0, &g_pf_conv, sizeof(g_pf_conv));
+    ksc->SetKernelArguments(1, &p_z, sizeof(p_z));
+    ksc->SetKernelArguments(2, &p_b, sizeof(p_b));
+    ksc->SetKernelArguments(3, &p_a, sizeof(p_a));
+    ksc->SetKernelArguments(4, &g_pf_qkdot, sizeof(g_pf_qkdot));
+    ksc->SetKernelArguments(5, &dp->alog, sizeof(dp->alog));
+    ksc->SetKernelArguments(6, &dp->dtb, sizeof(dp->dtb));
+    ksc->SetKernelArguments(7, &dp->wnorm, sizeof(dp->wnorm));
+    ksc->SetKernelArguments(8, &state, sizeof(state));
+    ksc->SetKernelArguments(9, &g_pf_normed, sizeof(g_pf_normed));
+    ksc->SetKernelArguments(10, &iT, sizeof(iT));
+    ksc->SetKernelArguments(11, &iNVH, sizeof(iNVH));
+    ksc->SetKernelArguments(12, &iNKH, sizeof(iNKH));
+    ksc->SetKernelArguments(13, &iHKD, sizeof(iHKD));
+    ksc->SetKernelArguments(14, &iHVD, sizeof(iHVD));
+    ksc->SetKernelArguments(15, &iKEY, sizeof(iKEY));
+    ksc->SetKernelArguments(16, &iCONV, sizeof(iCONV));
+    ksc->SetKernelArguments(17, &iVAL, sizeof(iVAL));
+    ksc->SetKernelArguments(18, &scale, sizeof(scale));
+    ksc->SetKernelArguments(19, &eps, sizeof(eps));
+    ksc->SetKernelArguments(20, &i_seed, sizeof(i_seed));
+    ksc->SetKernelArguments(21, &i_save, sizeof(i_save));
+    const int g[3] = {iNVH, 1, 1}, b3[3] = {512, 1, 1};
+    if (!sm.DispatchCommand(*ksc, g, b3)) {
+      fprintf(stderr, "[cuda_gdn] prefill scan dispatch FAILED: %s\n",
+              cudaGetErrorString(cudaGetLastError()));
+      return false;
+    }
+  }
+  // out_proj: [T,VAL] fp16 x [VAL,H] fp16 -> [T,H] fp16, fp32 accumulate.
+  // cuBLAS drains, so the host may read `out` immediately after this returns.
+  if (!cuda_fc_dense_gemm_fp16(g_pf_normed, wout, out, T, H, VAL)) {
+    fprintf(stderr, "[cuda_gdn] prefill out_proj FAILED\n");
+    return false;
+  }
+  return true;
 }
 
 bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,

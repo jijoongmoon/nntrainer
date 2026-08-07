@@ -301,6 +301,8 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   float *pa_w = context.getTensor(proj_a_idx).getData<float>();
 
   bool proj_gpu = false;
+  bool pf_cmp = false;
+  std::vector<float> pf_cmp_out, pf_cmp_state;
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
   static const int gdn_gpu_p = [] {
     const char *e = std::getenv("NNTR_CUDA_GDN");
@@ -352,6 +354,65 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   const float *pz = pz_w; // [T,VAL]
   const float *pb = pb_w;
   const float *pa = pa_w;
+
+  // The decode conv ring is written from the projection output either way, so
+  // it is a lambda rather than a tail: the device path below returns early.
+  auto save_ring = [&]() {
+    if (!save_state)
+      return;
+    float *cs = context.getTensor(conv_state_idx).getData<float>();
+    for (int bi = 0; bi < B; ++bi)
+      for (int c = 0; c < CONV; ++c)
+        for (int j = 0; j < KS - 1; ++j) {
+          const int ti = S - (KS - 1) + j; // position feeding ring slot j
+          cs[(bi * CONV + c) * (KS - 1) + j] =
+            (ti < 0) ? 0.0f : pq[(bi * S + ti) * CONV + c];
+        }
+  };
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  // Everything from the conv1d to out_proj, on the device. This is what makes
+  // a long prefill possible at all: the host code below is ~3e11 serial FMA
+  // for the scan alone at T=20000, plus 10 TFLOP of out_proj across the 30
+  // layers at a measured 5.6 GFLOPS.
+  if (proj_gpu && B == 1) {
+    const auto FP16D = ml::train::TensorDim::DataType::FP16;
+    nntrainer::Tensor &Wout = context.getWeight(w_out_proj);
+    float *st = context.getTensor(state_idx).getData<float>();
+    const float *rg = context.getTensor(conv_state_idx).getData<float>();
+    if (Wout.getDataType() == FP16D && output.getDataType() == FP16D &&
+        nntrainer::cuda::dev_accessible(Wout.getData<_FP16>()) &&
+        nntrainer::cuda::dev_accessible(output.getData<_FP16>()) &&
+        nntrainer::cuda::dev_accessible(st)) {
+      if (nntrainer::cuda::cuda_gdn_prefill_fp16(
+            pq_w, pz_w, pb_w, pa_w,
+            reinterpret_cast<const unsigned short *>(Wout.getData<_FP16>()),
+            wconv_f.data(), alog_f.data(), dtb_f.data(), wnorm_f.data(), st, rg,
+            reinterpret_cast<unsigned short *>(output.getData<_FP16>()),
+            (unsigned)T, (unsigned)H, (unsigned)NVH, (unsigned)NKH,
+            (unsigned)HKD, (unsigned)HVD, (unsigned)KS, eps,
+            /*seed_state=*/false, save_state)) {
+        if (gdn_gpu_p < 2) {
+          save_ring();
+          return;
+        }
+        // NNTR_CUDA_GDN=2: keep the device result and fall through to the host
+        // reference, then diff. The host scan always starts from S=0, so no
+        // state restore is needed; it overwrites both output and state with the
+        // reference values, which is what we want to keep.
+        pf_cmp_out.resize((size_t)T * H);
+        const _FP16 *o16 = output.getData<_FP16>();
+        for (size_t i = 0; i < (size_t)T * H; ++i)
+          pf_cmp_out[i] = static_cast<float>(o16[i]);
+        pf_cmp_state.assign(st, st + (size_t)NVH * HKD * HVD);
+        pf_cmp = true;
+      }
+      // A failure here mutated nothing the host path cannot recompute: the
+      // scan writes `state` only on its success path and `output` is fully
+      // rewritten below.
+    }
+  }
+#endif
 
   // causal depthwise conv1d + SiLU (per sequence, left-pad K-1)
   std::vector<float> conv(T * CONV);
@@ -460,16 +521,27 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   outProj(context, normed.data(), B, S, output);
 
   // persist the last (K-1) conv inputs (mixed_qkv) as the decode conv ring
-  if (save_state) {
-    float *cs = context.getTensor(conv_state_idx).getData<float>(); // [B,CONV,K-1]
-    for (int bi = 0; bi < B; ++bi)
-      for (int c = 0; c < CONV; ++c)
-        for (int j = 0; j < KS - 1; ++j) {
-          int ti = S - (KS - 1) + j; // sequence position feeding ring slot j
-          cs[(bi * CONV + c) * (KS - 1) + j] =
-            (ti < 0) ? 0.0f : pq[(bi * S + ti) * CONV + c];
-        }
+  save_ring();
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  if (pf_cmp) {
+    // Report BOTH the layer output and the recurrent state. The output alone
+    // is not enough: a scan that drifts only in S produces a fine-looking
+    // prefill and then wrong decode, which is the failure this whole path is
+    // most likely to have.
+    float md_o = 0.0f, md_s = 0.0f;
+    const _FP16 *o16 = output.getData<_FP16>();
+    for (size_t i = 0; i < (size_t)T * H; ++i)
+      md_o = std::max(md_o, std::fabs(pf_cmp_out[i] - static_cast<float>(o16[i])));
+    if (save_state && !pf_cmp_state.empty()) {
+      const float *st = context.getTensor(state_idx).getData<float>();
+      for (size_t i = 0; i < pf_cmp_state.size(); ++i)
+        md_s = std::max(md_s, std::fabs(pf_cmp_state[i] - st[i]));
+    }
+    fprintf(stderr, "[gdn_pf_cmp] %s T=%d max|gpu-host| out=%g state=%g\n",
+            context.getName().c_str(), T, md_o, md_s);
   }
+#endif
 }
 
 // single-token decode: input [B,1,1,hidden]; uses + updates the persistent
