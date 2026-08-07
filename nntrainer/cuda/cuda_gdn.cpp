@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -22,22 +23,26 @@ namespace nntrainer::cuda {
 // host outputs differ only by transcendental ulps.
 static const char *GDN_SRC = R"CU(
 extern "C" {
+// HARDWARE fp16<->fp32, as cuda_rmsnorm.cpp:132 and cuda_fc_qint4.cpp:253 do.
+// These replaced software bit-twiddling versions, and that was not a
+// micro-optimisation: the old h2f contained a data-dependent `while` loop for
+// denormals, which stopped the compiler unrolling ANY loop that called it. The
+// GEMV's k-loop therefore ran one unhidden global-memory round trip per
+// iteration (~890 cycles), which is why its runtime was INDEPENDENT of N --
+// 1.40 ms at N=32 and 2.03 ms at N=8192, a 256x work range in the same time.
+// fp16->fp32 is exact, and cvt.rn matches the old RNE rounding, so the numbers
+// are unchanged (verify with NNTR_CUDA_GDN=2).
 __device__ __forceinline__ float h2f(unsigned short h){
-  unsigned int s=(h&0x8000u)<<16, e=(h>>10)&0x1Fu, m=h&0x3FFu, b;
-  if(e==0){ if(m==0){b=s;} else { e=113u; while(!(m&0x400u)){m<<=1;e--;} m&=0x3FFu; b=s|(e<<23)|(m<<13);} }
-  else if(e==31){ b=s|0x7F800000u|(m<<13); }
-  else { b=s|((e+112u)<<23)|(m<<13); }
-  return __uint_as_float(b);
+  float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f;
 }
 __device__ __forceinline__ unsigned short f2h(float f){
-  unsigned int x=__float_as_uint(f);
-  unsigned int s=(x>>16)&0x8000u; int e=(int)((x>>23)&0xFFu)-127+15; unsigned int m=x&0x7FFFFFu;
-  if(e<=0){ if(e<-10) return (unsigned short)s; m|=0x800000u; int sh=14-e; unsigned int r=m>>sh;
-            if((m>>(sh-1))&1u) r++; return (unsigned short)(s|r); }
-  if(e>=31) return (unsigned short)(s|0x7C00u);
-  unsigned int hh=((unsigned int)e<<10)|(m>>13), rem=m&0x1FFFu;
-  if(rem>0x1000u||(rem==0x1000u&&(hh&1u))) hh++;
-  return (unsigned short)(s|hh);
+  unsigned short h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h;
+}
+__device__ __forceinline__ float4 gdn_load4(uint2 r){
+  return make_float4(h2f((unsigned short)(r.x & 0xFFFFu)),
+                     h2f((unsigned short)(r.x >> 16)),
+                     h2f((unsigned short)(r.y & 0xFFFFu)),
+                     h2f((unsigned short)(r.y >> 16)));
 }
 __device__ __forceinline__ float gdn_silu(float x){ return x/(1.0f+expf(-x)); }
 
@@ -64,6 +69,51 @@ __global__ void gdn_gemv_f_h(const float *x, const unsigned short *W,
   float acc = 0.0f;
   for (int k = 0; k < K; ++k) acc += xs[k] * h2f(W[(long)k*N + n]);
   out[n] = f2h(acc);
+}
+// Vector-4 forms of the two GEMVs above, used whenever N%4==0 and W is
+// 8-byte aligned (true for every real 35B shape: N is 8192/4096/2048/32).
+// Each thread owns FOUR consecutive n and issues one 64-bit load per k, with
+// the k loop unrolled 8x -- 8 independent loads in flight per thread against
+// the scalar version's one. Consecutive threads still read consecutive n, so a
+// warp fetches 256 contiguous bytes per iteration.
+// Accumulation stays strictly ascending in k per output index, matching
+// gated_delta_net_layer.cpp runDecode exactly, so this is a pure scheduling
+// change and NNTR_CUDA_GDN=2 must still report fp16-rounding-level agreement.
+__global__ void gdn_gemv_h_f4(const unsigned short *x, const unsigned short *W,
+                              float *out, int K, int N){
+  __shared__ float xs[4096];
+  for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = h2f(x[i]);
+  __syncthreads();
+  const int n0 = (blockIdx.x*blockDim.x + threadIdx.x)*4;
+  if (n0 >= N) return;
+  const uint2 *Wv = (const uint2 *)(W + n0);
+  const int st = N >> 2;                       // row stride in uint2 units
+  float a0=0.0f, a1=0.0f, a2=0.0f, a3=0.0f;
+  #pragma unroll 8
+  for (int k = 0; k < K; ++k) {
+    const float4 w = gdn_load4(Wv[(long)k*st]);
+    const float xv = xs[k];
+    a0 += xv*w.x; a1 += xv*w.y; a2 += xv*w.z; a3 += xv*w.w;
+  }
+  out[n0]=a0; out[n0+1]=a1; out[n0+2]=a2; out[n0+3]=a3;
+}
+__global__ void gdn_gemv_f_h4(const float *x, const unsigned short *W,
+                              unsigned short *out, int K, int N){
+  __shared__ float xs[4096];
+  for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const int n0 = (blockIdx.x*blockDim.x + threadIdx.x)*4;
+  if (n0 >= N) return;
+  const uint2 *Wv = (const uint2 *)(W + n0);
+  const int st = N >> 2;
+  float a0=0.0f, a1=0.0f, a2=0.0f, a3=0.0f;
+  #pragma unroll 8
+  for (int k = 0; k < K; ++k) {
+    const float4 w = gdn_load4(Wv[(long)k*st]);
+    const float xv = xs[k];
+    a0 += xv*w.x; a1 += xv*w.y; a2 += xv*w.z; a3 += xv*w.w;
+  }
+  out[n0]=f2h(a0); out[n0+1]=f2h(a1); out[n0+2]=f2h(a2); out[n0+3]=f2h(a3);
 }
 // causal depthwise conv1d (persistent ring) + SiLU; advances the ring.
 __global__ void gdn_conv_ring(const float *qkv, const float *wconv,
@@ -246,21 +296,32 @@ bool cuda_gdn_decode_fp16(const unsigned short *x, const unsigned short *wqkv,
   auto &ctx = CudaContext::Global();
   auto kg = ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_h_f");
   auto ko = ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_f_h");
+  auto kg4 = ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_h_f4");
+  auto ko4 = ctx.registerCudaKernel(GDN_SRC, "gdn_gemv_f_h4");
   auto kc = ctx.registerCudaKernel(GDN_SRC, "gdn_conv_ring");
   auto kd = ctx.registerCudaKernel(GDN_SRC, "gdn_delta_head");
-  if (!kg || !ko || !kc || !kd) {
+  if (!kg || !ko || !kg4 || !ko4 || !kc || !kd) {
     ml_loge("[CUDA] gdn: kernel registration failed");
     return false;
   }
   const int B = 256;
+  // Take the vector-4 kernel whenever the row is 4-wide and 8-byte aligned.
+  // Every real 35B shape qualifies (N = 8192/4096/2048/32); the scalar
+  // kernels remain as the general fallback rather than being deleted.
+  auto vec_ok = [](const unsigned short *W, int N) {
+    return (N % 4 == 0) && ((reinterpret_cast<uintptr_t>(W) & 7u) == 0);
+  };
   auto gemv_h = [&](const unsigned short *W, float *dst, int K, int N) {
-    kg->SetKernelArguments(0, &x, sizeof(x));
-    kg->SetKernelArguments(1, &W, sizeof(W));
-    kg->SetKernelArguments(2, &dst, sizeof(dst));
-    kg->SetKernelArguments(3, &K, sizeof(K));
-    kg->SetKernelArguments(4, &N, sizeof(N));
-    const int g[3] = {(N + B - 1) / B, 1, 1}, b[3] = {B, 1, 1};
-    return sm.DispatchCommand(*kg, g, b);
+    const bool v4 = vec_ok(W, N);
+    auto &kk = v4 ? *kg4 : *kg;
+    kk.SetKernelArguments(0, &x, sizeof(x));
+    kk.SetKernelArguments(1, &W, sizeof(W));
+    kk.SetKernelArguments(2, &dst, sizeof(dst));
+    kk.SetKernelArguments(3, &K, sizeof(K));
+    kk.SetKernelArguments(4, &N, sizeof(N));
+    const int lanes = v4 ? (N / 4) : N;
+    const int g[3] = {(lanes + B - 1) / B, 1, 1}, b[3] = {B, 1, 1};
+    return sm.DispatchCommand(kk, g, b);
   };
   // 1) projections
   if (!gemv_h(wqkv, g_qkv, (int)H, (int)CONV) ||
