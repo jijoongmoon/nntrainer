@@ -34,6 +34,10 @@
 #include <common_properties.h>
 #include <layer_impl.h>
 
+namespace nntrainer {
+class ComputeOps;
+}
+
 namespace causallm {
 
 /**
@@ -133,6 +137,18 @@ private:
   unsigned int router_logits_idx;
   unsigned int expert_mask_idx;
 
+  // Batched per-expert scratch. These MUST come from the tensor pool rather
+  // than the stack: on a CUDA run cuda::dev_accessible() is false for ordinary
+  // heap memory, so a stack-allocated intermediate makes every QS4CX arm of
+  // CudaComputeOps::fc decline (and, for the first projection, would hand a
+  // kernel an output pointer the device cannot write). Sized for the worst
+  // case, which is every token routed to one expert.
+  unsigned int gathered_in_idx;
+  unsigned int gate_out_idx;
+  unsigned int up_out_idx;
+  unsigned int acti_out_idx;
+  unsigned int expert_out_idx;
+
   /**
    * @brief expert forward computation without memory copies
    * @param input Input tensor (reshaped to [total_tokens, 1, 1, hidden_size])
@@ -166,6 +182,30 @@ private:
     const std::vector<std::pair<unsigned, float>> &token_assignments,
     const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
     const nntrainer::Tensor &down_proj, unsigned int hidden_size);
+
+  /**
+   * @brief one expert, all of its tokens, three GEMMs
+   *
+   * Gathers this expert's assigned rows into a contiguous {1,1,m,H} buffer,
+   * runs ONE projection per GEMM through the supplied ComputeOps, and scatters
+   * the weighted result back. The per-token variants above issue 3*m GEMVs
+   * instead, which at prefill is 24,576 dispatches per layer against 768 here
+   * -- and on a CUDA run every one of those dispatches would also have to
+   * re-enter the QS4CX dispatch ladder.
+   *
+   * @param ops dispatch table taken from the layer INPUT (which carries the
+   * node's ContextData); views do not reliably carry it.
+   * @param context run context, for the pooled scratch tensors
+   * @param input  input reshaped to [total_tokens, 1, 1, hidden_size]
+   * @param output output reshaped to [total_tokens, 1, 1, hidden_size]
+   * @param token_assignments (token index, routing weight) for this expert
+   */
+  void compute_expert_forward_batched(
+    nntrainer::ComputeOps *ops, nntrainer::RunLayerContext &context,
+    const nntrainer::Tensor &input, nntrainer::Tensor &output,
+    const std::vector<std::pair<unsigned, float>> &token_assignments,
+    nntrainer::Tensor &gate_proj, nntrainer::Tensor &up_proj,
+    nntrainer::Tensor &down_proj, unsigned int hidden_size);
 };
 } // namespace causallm
 

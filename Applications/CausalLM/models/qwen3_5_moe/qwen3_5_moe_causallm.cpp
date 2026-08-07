@@ -203,7 +203,8 @@ Tensor Qwen3_5MoeCausalLM::createMlp(const int layer_id, int dim, int hidden_dim
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", hidden_dim), withKey("num_experts", N_EXPERTS),
      withKey("num_experts_per_token", N_EXPERTS_PER_TOK),
-     withKey("moe_activation", "swish")}));
+     withKey("moe_activation", "swish"),
+     withKey("engine", causallm_engine())}));
   Tensor routed = moe(input);
 
   // Always-on shared expert: SwiGLU(shared_intermediate) gated by sigmoid(W·x).
@@ -296,6 +297,14 @@ void Qwen3_5MoeCausalLM::registerCustomLayers() {
                      nntrainer::createLayer<causallm::GatedDeltaNetLayer>);
   registerEverywhere(causallm::BroadcastMulLayer::type,
                      nntrainer::createLayer<causallm::BroadcastMulLayer>);
+  // MoELayer too: the base registers it on "cpu" only, which is why the
+  // qwen_moe node could not carry an engine= stamp. Without the stamp
+  // residencyEngine() is CPU, configureRunContext re-stamps the node's INPUT
+  // with the cpu ContextData (downgrading the producer's cuda stamp), and
+  // getOps() on that input resolves to the host table -- so the expert GEMMs
+  // could never reach CudaComputeOps::fc's QS4CX chain.
+  registerEverywhere(causallm::MoELayer::type,
+                     nntrainer::createLayer<causallm::MoELayer>);
 }
 
 } // namespace causallm

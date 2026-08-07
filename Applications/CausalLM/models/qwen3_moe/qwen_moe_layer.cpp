@@ -25,6 +25,10 @@
 #include <acti_func.h>
 #include <algorithm>
 #include <cmath>
+#include <compute_ops.h>
+#include <cstdio>
+#include <cstring>
+#include <layer_prof.h>
 #include <node_exporter.h>
 #include <qwen_moe_layer.h>
 #include <stdexcept>
@@ -164,6 +168,33 @@ void MoELayer::finalize(nntrainer::InitLayerContext &context) {
     context.requestTensor({num_experts, 1, topk, total_tokens}, "expert_mask",
                           nntrainer::Initializer::ZEROS, false,
                           nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+
+  // 7. Batched per-expert scratch, in the ACTIVATION dtype (the requestTensor
+  // brace-init overload above defaults to FP32, which is right for the router
+  // and wrong for these). Height is the worst case -- every token routed to a
+  // single expert -- because the pool cannot grow mid-forward, and on a CUDA
+  // run a late growth inside a graph capture is refused outright.
+  const auto act_tt = in_dim.getTensorType();
+  const nntrainer::TensorDim rows_hidden({1, 1, total_tokens, hidden_size},
+                                         act_tt);
+  const nntrainer::TensorDim rows_inter({1, 1, total_tokens, intermediate_size},
+                                        act_tt);
+
+  gathered_in_idx = context.requestTensor(
+    rows_hidden, "moe_gathered_in", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  gate_out_idx = context.requestTensor(
+    rows_inter, "moe_gate_out", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  up_out_idx = context.requestTensor(
+    rows_inter, "moe_up_out", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  acti_out_idx = context.requestTensor(
+    rows_inter, "moe_acti_out", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  expert_out_idx = context.requestTensor(
+    rows_hidden, "moe_expert_out", nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
 }
 
 void MoELayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
@@ -380,9 +411,173 @@ inline void MoELayer::compute_expert_forward_no_critical(
   }
 }
 
+namespace {
+
+/** @brief copy this expert's assigned rows into a contiguous [m, width] block */
+template <typename T>
+void gather_rows(const T *src, T *dst,
+                 const std::vector<std::pair<unsigned, float>> &assignments,
+                 unsigned int width) {
+  for (size_t i = 0; i < assignments.size(); ++i)
+    std::memcpy(dst + i * width,
+                src + static_cast<size_t>(assignments[i].first) * width,
+                static_cast<size_t>(width) * sizeof(T));
+}
+
+/**
+ * @brief scatter [m, width] back to the token rows, scaled and accumulated
+ * @note the accumulate is safe without an atomic only because one expert never
+ * sees the same token twice -- topK returns distinct indices within a row.
+ */
+template <typename T>
+void scatter_weighted_add(
+  const T *src, T *dst,
+  const std::vector<std::pair<unsigned, float>> &assignments,
+  unsigned int width) {
+  for (size_t i = 0; i < assignments.size(); ++i) {
+    const float w = assignments[i].second;
+    const T *s = src + i * width;
+    T *d = dst + static_cast<size_t>(assignments[i].first) * width;
+    for (unsigned int j = 0; j < width; ++j)
+      d[j] = static_cast<T>(static_cast<float>(d[j]) +
+                            static_cast<float>(s[j]) * w);
+  }
+}
+
+/**
+ * @brief NNTR_MOE_DBG=1: L2 norm + finite count of one tensor, first N calls.
+ * @note the 35B has no MoE golden at its own geometry and on Orin the CPU
+ * reference cannot run QINT4 experts at all, so this is the only way to see
+ * whether a stage is zero / NaN / exploded without a reference to diff against.
+ */
+void moe_dbg(const char *tag, const nntrainer::Tensor &t) {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_MOE_DBG");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (!on)
+    return;
+  static int n = 0;
+  if (n++ >= 24)
+    return;
+  const size_t len = t.size();
+  double sq = 0.0, amax = 0.0;
+  size_t bad = 0;
+  for (size_t i = 0; i < len; ++i) {
+    float v;
+    if (t.getDataType() == ml::train::TensorDim::DataType::FP32)
+      v = t.getData<float>()[i];
+#ifdef ENABLE_FP16
+    else if (t.getDataType() == ml::train::TensorDim::DataType::FP16)
+      v = static_cast<float>(t.getData<_FP16>()[i]);
+#endif
+    else
+      return;
+    if (!std::isfinite(v)) {
+      ++bad;
+      continue;
+    }
+    sq += (double)v * v;
+    if (std::fabs(v) > amax)
+      amax = std::fabs(v);
+  }
+  std::fprintf(stderr, "[MOE-DBG] %-12s n=%zu l2=%.6g max=%.6g nonfinite=%zu\n",
+               tag, len, std::sqrt(sq), amax, bad);
+}
+
+} // namespace
+
+void MoELayer::compute_expert_forward_batched(
+  nntrainer::ComputeOps *ops, nntrainer::RunLayerContext &context,
+  const nntrainer::Tensor &input, nntrainer::Tensor &output,
+  const std::vector<std::pair<unsigned, float>> &token_assignments,
+  nntrainer::Tensor &gate_proj, nntrainer::Tensor &up_proj,
+  nntrainer::Tensor &down_proj, unsigned int hidden_size) {
+
+  const unsigned int m = static_cast<unsigned int>(token_assignments.size());
+  if (m == 0)
+    return;
+
+  const unsigned int intermediate_size = gate_proj.width();
+  const auto tt = input.getTensorType();
+
+  // {1,1,m,*} views of the pooled scratch. The row count MUST sit in height():
+  // CudaComputeOps::fc reads M as batch*channel*height and HalfTensor::dot's
+  // QS4CX arm reads it as height() alone, so the {m,1,1,*} shape this layer
+  // reshapes its input to would compute M=1 on the host path and silently drop
+  // m-1 rows.
+  auto rows = [&](unsigned int idx, unsigned int width) {
+    return context.getTensor(idx).getSharedDataTensor(
+      nntrainer::TensorDim({1, 1, m, width}, tt), 0, true);
+  };
+
+  auto gathered = rows(gathered_in_idx, hidden_size);
+  auto gate_out = rows(gate_out_idx, intermediate_size);
+  auto up_out = rows(up_out_idx, intermediate_size);
+  auto acti_out = rows(acti_out_idx, intermediate_size);
+  auto expert_out = rows(expert_out_idx, hidden_size);
+
+  const auto dt = input.getDataType();
+  switch (dt) {
+  case ml::train::TensorDim::DataType::FP32:
+    gather_rows(input.getData<float>(), gathered.getData<float>(),
+                token_assignments, hidden_size);
+    break;
+#ifdef ENABLE_FP16
+  case ml::train::TensorDim::DataType::FP16:
+    gather_rows(input.getData<_FP16>(), gathered.getData<_FP16>(),
+                token_assignments, hidden_size);
+    break;
+#endif
+  default:
+    throw std::runtime_error("MoE: unsupported activation dtype for gather");
+  }
+
+  moe_dbg("gathered", gathered);
+  {
+    nntrainer::LayerProfScope _p("  moe:3x fc", m == 1);
+    ops->fc(gathered, gate_proj, gate_out);
+    moe_dbg("gate_out", gate_out);
+    ops->fc(gathered, up_proj, up_out);
+    moe_dbg("up_out", up_out);
+  }
+
+  // dtype-generic SwiGLU, as in the per-token path: the free nntrainer::swiglu()
+  // is FP32-only and reads its operands through an unchecked getData<float>().
+  {
+    nntrainer::LayerProfScope _p("  moe:swiglu(host)", m == 1);
+    acti_func.run_fn(gate_out, acti_out);
+    acti_out.multiply_i(up_out);
+  }
+  moe_dbg("swiglu", acti_out);
+
+  {
+    nntrainer::LayerProfScope _p("  moe:3x fc", m == 1);
+    ops->fc(acti_out, down_proj, expert_out);
+  }
+  moe_dbg("expert_out", expert_out);
+
+  switch (dt) {
+  case ml::train::TensorDim::DataType::FP32:
+    scatter_weighted_add(expert_out.getData<float>(), output.getData<float>(),
+                         token_assignments, hidden_size);
+    break;
+#ifdef ENABLE_FP16
+  case ml::train::TensorDim::DataType::FP16:
+    scatter_weighted_add(expert_out.getData<_FP16>(), output.getData<_FP16>(),
+                         token_assignments, hidden_size);
+    break;
+#endif
+  default:
+    throw std::runtime_error("MoE: unsupported activation dtype for scatter");
+  }
+}
+
 void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                       unsigned int from, unsigned int to,
                                       bool training) {
+
+  nntrainer::LayerProfScope _prof("qwen_moe(total)", (to - from) == 1);
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -424,6 +619,10 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     expert_mask.setZero();
 
     // routing
+    std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
+      num_experts);
+    {
+    nntrainer::LayerProfScope _pr("  moe:routing(host)", total_tokens == 1);
     nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
     // Routing is ALWAYS fp32: the gate weight and router_logits are FP32,
     // so an FP16 input makes HalfTensor::dot write FP16 bits into the FP32
@@ -452,8 +651,6 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
 
     // Pre-compute expert token assignments for better performance
-    std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
-      num_experts);
     for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
       for (int k = 0; k < static_cast<int>(topk); ++k) {
         unsigned expert_idx = indices_data[i * topk + k];
@@ -461,17 +658,18 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         expert_assignments[expert_idx].emplace_back(i, weight);
       }
     }
+    } // end routing scope
 
-    // Allocate per-expert output tensors
-    std::vector<nntrainer::Tensor> expert_outputs(num_experts);
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      if (!expert_assignments[expert_idx].empty()) {
-        expert_outputs[expert_idx] = nntrainer::Tensor(
-          total_tokens, 1, 1, hidden_size, output.getTensorType());
-        expert_outputs[expert_idx].setZero();
-      }
-    }
+    // One expert, all of its tokens, three GEMMs. The dispatch table is taken
+    // from the layer INPUT: that tensor carries the node's ContextData, while a
+    // getSharedDataTensor view does not reliably carry it, so resolving
+    // getOps() off `input` here would silently pick the host table.
+    //
+    // This also retires the old per-expert full-size temporaries, which
+    // allocated {total_tokens,1,1,hidden} for EVERY non-empty expert -- at
+    // prefill that is 256 x 4 MiB = ~1 GiB of alloc/free per layer per forward,
+    // almost all of it zero.
+    nntrainer::ComputeOps *ops = input_.getOps();
 
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
          ++expert_idx) {
@@ -479,19 +677,11 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       if (assignments.empty())
         continue;
 
-      compute_expert_forward_no_critical(
-        input, expert_outputs[expert_idx], assignments,
+      compute_expert_forward_batched(
+        ops, context, input, output, assignments,
         context.getWeight(expert_gate_proj_indices[expert_idx]),
         context.getWeight(expert_up_proj_indices[expert_idx]),
         context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-    }
-
-    // Combine expert outputs
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      if (!expert_assignments[expert_idx].empty()) {
-        output.add_i(expert_outputs[expert_idx]);
-      }
     }
 
     // reshape output: [B*S,1,1,H] -> [B,1,S,H]
