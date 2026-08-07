@@ -456,8 +456,39 @@ std::vector<float *> CausalLM::incrementalInference(
 #endif
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
-    const size_t buf_size =
-      static_cast<size_t>(batch_size) * out_t.getDim().getFeatureLen();
+    // [logits-row] Size the host buffer by what a consumer READS, not by the
+    // output tensor's ALLOCATED height.
+    //
+    // getFeatureLen() is channel*height*width, and height is INIT_SEQ_LEN
+    // whenever the lm_head is a full-height FC -- i.e. an untied head with
+    // skip_prefill OFF, since fc_layer_cl.cpp:74-79 collapses the plane to
+    // height=1 only in the skip_prefill case. So the old sizing scaled the
+    // allocation with the CONTEXT WINDOW on every call: at vocab 248320 that
+    // is 1.0 GB per call at init_seq_len 1024 and 19.9 GB in a single
+    // `new float[]` at 20000 -- on the PREFILL call and again on every DECODE
+    // call, whose one produced row is 1/INIT_SEQ_LEN of what it allocated.
+    //
+    // Nothing reads past the first row. Every consumer of the returned vector
+    // takes `batch_size * row_len` floats from the base pointer and stops:
+    //   - generate() reads NUM_VOCAB from the base and advances by NUM_VOCAB
+    //     per batch row (lines ~804/817 below), i.e. the head of the buffer;
+    //   - run() hands it output[0] / output_interval[0] verbatim (the prefill
+    //     sample and the decode loop);
+    //   - the SKIP_PREFILL prefill, the prefill-graph warmup and every
+    //     non-final chunk of a chunked prefill delete the buffer unread;
+    //   - the qwen3_5_moe GDN drivers read out[0][0, vocab).
+    // The copies below therefore still write a strict PREFIX of the bytes they
+    // used to write: every value any reader can observe is unchanged, only the
+    // never-read tail is gone. Row indices are untouched (row 0 is still at
+    // offset 0), so no caller's pointer arithmetic moves.
+    //
+    // row_len is derived as featureLen/height rather than width() so it holds
+    // for both layouts (NCHW puts the vocab in W, NHWC in C).
+    const auto &out_dim = out_t.getDim();
+    const size_t row_len = out_dim.height() > 0
+                             ? out_dim.getFeatureLen() / out_dim.height()
+                             : out_dim.getFeatureLen();
+    const size_t buf_size = static_cast<size_t>(batch_size) * row_len;
     float *last_out_buf_data = new float[buf_size];
 
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
