@@ -1254,6 +1254,15 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   // output, one launch fewer, no q8 scratch round-trip). Caller passes the
   // fp16 activation row instead of pre-staging g_dp4a_q8.
   const bool fused = gemv && Xh_fused != nullptr;
+  // MEASURED, do not "fix" this by occupancy. dp4a_gemm_reg's 64x64 tile gives
+  // only ceil(N/64)*ceil(M/64) = 8 blocks at the MoE prefill shape (M~42,
+  // N=512) on a 16-SM part, and it still beats the 16x16 dp4a_gemm's 96 blocks
+  // by 1.4x on the whole layer (qwen_moe 7,940 ms vs 11,104 ms over a
+  // 1,341-token prefill). The register-blocked tile stages coalesced tiles into
+  // shared memory and yields 16 outputs per thread; the 16x16 kernel is one
+  // output per thread with a serial K loop and strided weight reads. The tile
+  // shape is right -- what is missing is enough of them per launch, which is a
+  // grouped kernel (all experts in one grid), not a smaller tile.
   const bool tiled = (M >= 8);
   // NNTR_CUDA_FC_NOCACHE=1: skip the DevWeightQ cache entirely for the decode
   // GEMV and read the QS4CX payload in place. That cache is a byte-for-byte
