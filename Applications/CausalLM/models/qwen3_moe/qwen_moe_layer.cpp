@@ -31,6 +31,7 @@
 #include <layer_prof.h>
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
+#include <cuda_fc_qint4.h>
 #include <cuda_moe.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -492,6 +493,111 @@ void moe_dbg(const char *tag, const nntrainer::Tensor &t) {
 
 } // namespace
 
+bool MoELayer::runGroupedMoE(
+  nntrainer::RunLayerContext &context, const nntrainer::Tensor &input,
+  nntrainer::Tensor &output,
+  const std::vector<std::vector<std::pair<unsigned, float>>> &assign,
+  unsigned int total_tokens, unsigned int hidden_size) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  const unsigned int E = num_experts;
+
+  // The pointer table is filled ONCE. Weight pointers are stable for the run
+  // (the weight arena is allocate-once and FSU is off), and rebuilding it would
+  // mean 3*E scale-buffer map lookups per layer per token.
+  if (!moe_tbl_built) {
+    if (!nntrainer::cuda::cuda_moe_new_ptr_table(3 * E, &moe_wptr, &moe_wsc))
+      return false;
+    auto fill = [&](unsigned int base,
+                    const std::vector<unsigned int> &idx) -> bool {
+      for (unsigned int e = 0; e < E; ++e) {
+        auto &w = context.getWeight(idx[e]);
+        const unsigned short *sc = nullptr;
+        if (!nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+              w.getScale<float>(), w.getDim().width(), &sc))
+          return false;
+        moe_wptr[base + e] = w.getData<uint8_t>();
+        moe_wsc[base + e] = sc;
+      }
+      return true;
+    };
+    // PROJECTION-MAJOR, and the layer requests up/gate/down in that order.
+    // Swapping gate and up here yields silu(up)*gate: fluent garbage, no error.
+    if (!fill(0, expert_up_proj_indices) ||
+        !fill(E, expert_gate_proj_indices) ||
+        !fill(2 * E, expert_down_proj_indices))
+      return false;
+    moe_tbl_built = true;
+  }
+
+  unsigned int A = 0, Wmax = 0;
+  for (unsigned int e = 0; e < E; ++e) {
+    const unsigned int m = static_cast<unsigned int>(assign[e].size());
+    A += m;
+    Wmax += (m + 63) / 64;
+  }
+  if (A == 0 || Wmax == 0)
+    return false;
+
+  nntrainer::cuda::MoePlan plan{};
+  plan.wptr = moe_wptr;
+  plan.wsc = moe_wsc;
+  plan.off_up = 0;
+  plan.off_gate = E;
+  plan.off_down = 2 * E;
+  if (!nntrainer::cuda::cuda_moe_plan_stage(A, total_tokens, topk, E, Wmax,
+                                            &plan))
+    return false;
+
+  // Assignments expert-major (so a work item is one expert's contiguous rows),
+  // plus the inverse token->slot map the combine step needs.
+  for (size_t i = 0; i < (size_t)total_tokens * topk; ++i)
+    plan.slots[i] = -1;
+  std::vector<unsigned int> used(total_tokens, 0);
+  unsigned int a = 0, w = 0;
+  for (unsigned int e = 0; e < E; ++e) {
+    const auto &v = assign[e];
+    if (v.empty())
+      continue;
+    const unsigned int r0 = a;
+    for (const auto &pr : v) {
+      plan.rows[a] = static_cast<int>(pr.first);
+      plan.wts[a] = pr.second;
+      plan.slots[(size_t)pr.first * topk + used[pr.first]++] =
+        static_cast<int>(a);
+      ++a;
+    }
+    for (size_t t0 = 0; t0 < v.size(); t0 += 64) {
+      plan.wl_e[w] = static_cast<int>(e);
+      plan.wl_r0[w] = static_cast<int>(r0 + t0);
+      plan.wl_n[w] = static_cast<int>(std::min<size_t>(64, v.size() - t0));
+      ++w;
+    }
+  }
+
+  // intermediate_size is not a member; it is the gate/up weight's OUTPUT width
+  // (they are stored [in, out]), exactly as compute_expert_forward_batched
+  // reads it off gate_proj.
+  const unsigned int inter =
+    context.getWeight(expert_gate_proj_indices[0]).getDim().width();
+  if (!nntrainer::cuda::cuda_moe_expert_ffn_fp16(
+        reinterpret_cast<const unsigned short *>(input.getData<_FP16>()),
+        reinterpret_cast<unsigned short *>(output.getData<_FP16>()), plan, A, w,
+        total_tokens, topk, hidden_size, inter))
+    return false;
+  // The whole FFN is issued undrained; the graph reads `output` next.
+  nntrainer::cuda::StreamManager::Global().finish();
+  return true;
+#else
+  (void)context;
+  (void)input;
+  (void)output;
+  (void)assign;
+  (void)total_tokens;
+  (void)hidden_size;
+  return false;
+#endif
+}
+
 void MoELayer::compute_expert_forward_batched(
   nntrainer::ComputeOps *ops, nntrainer::RunLayerContext &context,
   const nntrainer::Tensor &input, nntrainer::Tensor &output,
@@ -719,6 +825,35 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // prefill that is 256 x 4 MiB = ~1 GiB of alloc/free per layer per forward,
     // almost all of it zero.
     nntrainer::ComputeOps *ops = input_.getOps();
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // NNTR_CUDA_MOE_GROUPED=1: one grid over ALL routed experts instead of one
+    // ops->fc per expert per projection. Opt-in until it is A/B'd against the
+    // per-expert path below, which is the measured one.
+    // MEASURED threshold, not a guess. The grouped kernel keeps
+    // dp4a_gemm_reg's 64-ROW tile, so it only pays when each expert actually
+    // has rows to fill it: mean m_e = total_tokens*topk/num_experts, and at
+    // total_tokens 512 that is 16 -- a quarter-full tile. Below it the tile is
+    // mostly zero padding and the per-expert path wins, badly:
+    //   19 tokens   (m_e~1)   qwen_moe decode 1,374 ms grouped vs 597 per-expert
+    //   1,341 tokens (m_e~32) prefill 120.7 TPS grouped vs 110.8 per-expert
+    // NNTR_CUDA_MOE_GROUPED=1 forces it on, =0 off.
+    static const int grouped_env = []() {
+      const char *e = std::getenv("NNTR_CUDA_MOE_GROUPED");
+      return e ? (e[0] == '0' ? 0 : 1) : -1;
+    }();
+    const bool grouped_on =
+      grouped_env >= 0 ? (grouped_env == 1) : (total_tokens >= 512);
+    static const bool moe_dbg_gate = std::getenv("NNTR_MOE_DBG") != nullptr;
+    if (grouped_on && !moe_dbg_gate &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        output.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        runGroupedMoE(context, input, output, expert_assignments, total_tokens,
+                      hidden_size)) {
+      output.reshape({batch_size, 1, seq_len, hidden_size});
+      return;
+    }
+#endif
 
     // Stage EVERY expert's row list once, in one buffer with per-expert
     // offsets, rather than reusing one buffer per expert: the drain is deferred

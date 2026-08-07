@@ -96,6 +96,19 @@ bool cuda_moe_plan_stage(unsigned int A, unsigned int T, unsigned int topk,
                          unsigned int E, unsigned int Wmax, MoePlan *out);
 
 /**
+ * @brief Allocate a per-LAYER mapped weight-pointer table of `n` entries each.
+ *
+ * Deliberately NOT part of cuda_moe_plan_stage's shared staging: that is reused
+ * every forward by every layer, and every layer has different experts, so a
+ * shared table would be overwritten by whichever layer ran last. This one is
+ * filled once (weight pointers are stable for the run -- the weight arena is
+ * allocate-once and there is no FSU here) and owned for the process lifetime;
+ * 40 layers x 768 pointers x 2 tables is ~500 KB.
+ */
+bool cuda_moe_new_ptr_table(unsigned int n, const unsigned char ***wp,
+                            const unsigned short ***ws);
+
+/**
  * @brief gather -> quant -> grouped gate/up -> SwiGLU -> quant -> grouped down
  *        -> token-major weighted combine, entirely on the device.
  *

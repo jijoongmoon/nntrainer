@@ -143,6 +143,13 @@ private:
   // CudaComputeOps::fc decline (and, for the first projection, would hand a
   // kernel an output pointer the device cannot write). Sized for the worst
   // case, which is every token routed to one expert.
+  // Per-layer device weight-pointer table for the grouped MoE kernel, filled
+  // once (weight pointers are stable for the run) and owned for the process
+  // lifetime. Per LAYER, not shared: each layer has its own experts.
+  const unsigned char **moe_wptr = nullptr;
+  const unsigned short **moe_wsc = nullptr;
+  bool moe_tbl_built = false;
+
   unsigned int gathered_in_idx;
   unsigned int gate_out_idx;
   unsigned int up_out_idx;
@@ -200,6 +207,17 @@ private:
    * @param output output reshaped to [total_tokens, 1, 1, hidden_size]
    * @param token_assignments (token index, routing weight) for this expert
    */
+  /**
+   * @brief The whole expert FFN for one layer in ~7 launches, all experts in
+   *        one grid. Returns false (having written nothing) if anything is
+   *        unavailable, so the caller falls through to the per-expert path.
+   */
+  bool runGroupedMoE(
+    nntrainer::RunLayerContext &context, const nntrainer::Tensor &input,
+    nntrainer::Tensor &output,
+    const std::vector<std::vector<std::pair<unsigned, float>>> &assign,
+    unsigned int total_tokens, unsigned int hidden_size);
+
   void compute_expert_forward_batched(
     nntrainer::ComputeOps *ops, nntrainer::RunLayerContext &context,
     const nntrainer::Tensor &input, nntrainer::Tensor &output,

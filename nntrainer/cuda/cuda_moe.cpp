@@ -238,9 +238,13 @@ std::mutex g_moe_mtx;
 int *g_rows = nullptr, *g_slots = nullptr;
 int *g_wl_e = nullptr, *g_wl_r0 = nullptr, *g_wl_n = nullptr;
 float *g_wts = nullptr;
-const unsigned char **g_wp = nullptr;
+const unsigned char **g_wp = nullptr; // unused since ptr tables went per-layer
 const unsigned short **g_ws = nullptr;
-size_t c_rows = 0, c_slots = 0, c_wl = 0, c_wts = 0, c_wp = 0, c_ws = 0;
+// One capacity per pointer. Sharing a single c_wl across the three work-list
+// arrays silently left two of them null: the first grow set the capacity and
+// the next two then saw need <= cap and returned true without allocating.
+size_t c_rows = 0, c_slots = 0, c_wts = 0;
+size_t c_wl_e = 0, c_wl_r0 = 0, c_wl_n = 0;
 // ... and device-only scratch.
 unsigned short *g_X = nullptr, *g_G = nullptr, *g_U = nullptr, *g_S = nullptr,
                *g_Y = nullptr;
@@ -358,20 +362,35 @@ bool cuda_moe_plan_stage(unsigned int A, unsigned int T, unsigned int topk,
   if (!grow_mapped((void **)&g_rows, &c_rows, (size_t)A * 4) ||
       !grow_mapped((void **)&g_wts, &c_wts, (size_t)A * 4) ||
       !grow_mapped((void **)&g_slots, &c_slots, (size_t)T * topk * 4) ||
-      !grow_mapped((void **)&g_wl_e, &c_wl, (size_t)Wmax * 4) ||
-      !grow_mapped((void **)&g_wl_r0, &c_wl, (size_t)Wmax * 4) ||
-      !grow_mapped((void **)&g_wl_n, &c_wl, (size_t)Wmax * 4) ||
-      !grow_mapped((void **)&g_wp, &c_wp, (size_t)E * 3 * sizeof(void *)) ||
-      !grow_mapped((void **)&g_ws, &c_ws, (size_t)E * 3 * sizeof(void *)))
+      !grow_mapped((void **)&g_wl_e, &c_wl_e, (size_t)Wmax * 4) ||
+      !grow_mapped((void **)&g_wl_r0, &c_wl_r0, (size_t)Wmax * 4) ||
+      !grow_mapped((void **)&g_wl_n, &c_wl_n, (size_t)Wmax * 4))
     return false;
+  (void)E;
   out->rows = g_rows;
   out->wts = g_wts;
   out->slots = g_slots;
   out->wl_e = g_wl_e;
   out->wl_r0 = g_wl_r0;
   out->wl_n = g_wl_n;
-  out->wptr = g_wp;
-  out->wsc = g_ws;
+  return true; // wptr/wsc are the CALLER's, per layer
+}
+
+bool cuda_moe_new_ptr_table(unsigned int n, const unsigned char ***wp,
+                            const unsigned short ***ws) {
+  void *a = nullptr, *b = nullptr;
+  const size_t sz = (size_t)n * sizeof(void *);
+  if (cudaHostAlloc(&a, sz, cudaHostAllocMapped) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (cudaHostAlloc(&b, sz, cudaHostAllocMapped) != cudaSuccess) {
+    cudaFreeHost(a);
+    cudaGetLastError();
+    return false;
+  }
+  *wp = (const unsigned char **)a;
+  *ws = (const unsigned short **)b;
   return true;
 }
 
