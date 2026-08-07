@@ -112,6 +112,14 @@ private:
   // persistent decode state (MAX_LIFESPAN): recurrent S + conv ring buffer
   unsigned int state_idx, conv_state_idx;
 
+  // Pooled fp32 prefill projection outputs. Two reasons they are pooled rather
+  // than the std::vectors they replace: (a) on CUDA they must be
+  // device-accessible for the cuBLAS arm to write them at all, and (b) the
+  // per-call heap versions were 3.6 GB of alloc/free per layer per prefill at
+  // T=20000, thirty times per request. FP32 because the conv1d / l2norm /
+  // recurrence chain below is the fp32 host reference these must agree with.
+  unsigned int proj_qkv_idx, proj_z_idx, proj_b_idx, proj_a_idx;
+
   // fp32 heap copies of ALL weights, converted once on first forward — the
   // GDN math is host-side fp32 regardless of the stored dtype (FP32 tiny
   // validation / FP16 35B deployment). The projections are cached too: the

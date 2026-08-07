@@ -118,6 +118,21 @@ bool cuda_fc_dense_gemm_fp16(const void *Xh, const void *Wh, void *Yh,
   return ok;
 }
 
+bool cuda_fc_dense_gemm_fp16_f32out(const void *Xh, const void *Wh, float *Y,
+                                    unsigned int M, unsigned int N,
+                                    unsigned int K) {
+  if (!dense_on() || Xh == nullptr || Wh == nullptr || Y == nullptr || M == 0 ||
+      N == 0 || K == 0)
+    return false;
+  // Same fp32 accumulate as the fp16 entry point, just not rounded back down
+  // on store. cublasGemmEx supports 16F/16F -> 32F with COMPUTE_32F directly,
+  // so this costs an output buffer, not a conversion pass.
+  const bool ok = gemm_ex((int)M, (int)N, (int)K, Xh, CUDA_R_16F, Wh, Y,
+                          CUDA_R_32F, CUBLAS_COMPUTE_32F);
+  trace("fp16->fp32", M, N, K, ok);
+  return ok;
+}
+
 bool cuda_fc_dense_gemm_fp32(const float *X, const float *W, float *Y,
                              unsigned int M, unsigned int N, unsigned int K) {
   if (!dense_on() || X == nullptr || W == nullptr || Y == nullptr || M == 0 ||

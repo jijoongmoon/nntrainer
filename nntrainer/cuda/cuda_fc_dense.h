@@ -52,6 +52,23 @@ bool cuda_fc_dense_gemm_fp32(const float *X, const float *W, float *Y,
                              unsigned int M, unsigned int N, unsigned int K);
 
 /**
+ * @brief fp16 in, fp32 OUT. Same layout contract as cuda_fc_dense_gemm_fp16().
+ *
+ * cublasGemmEx already accumulates these in fp32; this variant simply keeps
+ * that accumulator instead of rounding it back to fp16 on the way out. It
+ * exists for GDN, whose projections feed a conv1d / L2-norm / recurrence chain
+ * that the host reference computes entirely in fp32 -- writing fp16 here would
+ * make the device and host paths disagree for a reason unrelated to the GEMM.
+ *
+ * @param Xh device fp16 activation [M,K] row-major (ld=K)
+ * @param Wh device fp16 weight [K,N] row-major (ld=N)
+ * @param Y  device fp32 output [M,N] row-major (ld=N)
+ */
+bool cuda_fc_dense_gemm_fp16_f32out(const void *Xh, const void *Wh, float *Y,
+                                    unsigned int M, unsigned int N,
+                                    unsigned int K);
+
+/**
  * @brief Record that a dense weight of this dtype/shape exists, so a later
  *        cuda_fc_dense_warmup_run() can force cuBLAS to load its GEMM kernel
  *        libraries off the critical path. Does NO GPU work itself.

@@ -16,6 +16,7 @@
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cstdlib>
 #include <cuda_context_manager.h>
+#include <cuda_fc_dense.h>
 #include <cuda_gdn.h>
 #endif
 
@@ -165,6 +166,21 @@ void GatedDeltaNetLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorDim(B, 1, conv_dim, conv_kernel - 1, fp32),
     "gdn_conv_state", nntrainer::Initializer::ZEROS, false,
     nntrainer::TensorLifespan::MAX_LIFESPAN);
+
+  // Prefill projection outputs, pooled. Height is the ALLOCATED input height,
+  // not the prompt length -- runForward is handed the real length and writes a
+  // prefix. All 30 GDN layers request byte-identical shapes, so the planner
+  // hands them one set of slots rather than thirty.
+  const unsigned int T_alloc = in_dim.height();
+  auto reqProj = [&](unsigned int w, const std::string &n) {
+    return context.requestTensor(nntrainer::TensorDim(B, 1, T_alloc, w, fp32),
+                                 n, nntrainer::Initializer::NONE, false,
+                                 nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  };
+  proj_qkv_idx = reqProj(conv_dim, "gdn_proj_qkv");
+  proj_z_idx = reqProj(value_dim, "gdn_proj_z");
+  proj_b_idx = reqProj(num_v_heads, "gdn_proj_b");
+  proj_a_idx = reqProj(num_v_heads, "gdn_proj_a");
 }
 
 void GatedDeltaNetLayer::ensureWeightCache(
@@ -273,17 +289,69 @@ void GatedDeltaNetLayer::runForward(nntrainer::RunLayerContext &context,
   // projections: read only the T active input rows (B==1: rows 0..T-1; the
   // padded tail is skipped instead of multiplied), then fp32 sgemm over the
   // cached heap weights (see ensureWeightCache).
-  std::vector<float> xin_v;
-  readAsF32(input, (size_t)T * H, xin_v);
-  nntrainer::Tensor xin = wrapF32(xin_v.data(), T, H);
-  nntrainer::Tensor t_qkv = xin.dot(wrapF32(wqkv_f.data(), H, CONV));
-  nntrainer::Tensor t_z = xin.dot(wrapF32(wz_f.data(), H, VAL));
-  nntrainer::Tensor t_b = xin.dot(wrapF32(wb_f.data(), H, NVH));
-  nntrainer::Tensor t_a = xin.dot(wrapF32(wa_f.data(), H, NVH));
-  const float *pq = t_qkv.getData<float>(); // [T,CONV] token-major
-  const float *pz = t_z.getData<float>();   // [T,VAL]
-  const float *pb = t_b.getData<float>();
-  const float *pa = t_a.getData<float>();
+  // These four are the whole cost of GDN prefill. 25.3M params x 2 FLOP x T is
+  // 1.01 TFLOP per layer at T=20000, against a recurrence that is ~3.5 TFLOP
+  // for all 30 layers COMBINED -- so the scan being sequential matters far less
+  // than these being on the host. They are fp16 dense, which cuBLAS takes
+  // directly; the fp32-OUT variant keeps the accumulator cuBLAS already carries
+  // so everything below, which is the fp32 reference, sees what it saw before.
+  float *pq_w = context.getTensor(proj_qkv_idx).getData<float>();
+  float *pz_w = context.getTensor(proj_z_idx).getData<float>();
+  float *pb_w = context.getTensor(proj_b_idx).getData<float>();
+  float *pa_w = context.getTensor(proj_a_idx).getData<float>();
+
+  bool proj_gpu = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  static const int gdn_gpu_p = [] {
+    const char *e = std::getenv("NNTR_CUDA_GDN");
+    return e ? std::atoi(e) : 0;
+  }();
+  if (gdn_gpu_p > 0 &&
+      input.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    const auto FP16D = ml::train::TensorDim::DataType::FP16;
+    nntrainer::Tensor &Wqkv = context.getWeight(w_in_proj_qkv);
+    nntrainer::Tensor &Wz = context.getWeight(w_in_proj_z);
+    nntrainer::Tensor &Wb = context.getWeight(w_in_proj_b);
+    nntrainer::Tensor &Wa = context.getWeight(w_in_proj_a);
+    const void *xp = input.getData<_FP16>();
+    if (Wqkv.getDataType() == FP16D && Wz.getDataType() == FP16D &&
+        Wb.getDataType() == FP16D && Wa.getDataType() == FP16D &&
+        nntrainer::cuda::dev_accessible(xp) &&
+        nntrainer::cuda::dev_accessible(pq_w) &&
+        nntrainer::cuda::dev_accessible(pz_w) &&
+        nntrainer::cuda::dev_accessible(pb_w) &&
+        nntrainer::cuda::dev_accessible(pa_w)) {
+      using nntrainer::cuda::cuda_fc_dense_gemm_fp16_f32out;
+      const unsigned uT = (unsigned)T, uH = (unsigned)H;
+      // & not && on purpose: a partial failure must not leave some outputs
+      // written and others stale, and the host fallback rewrites all four.
+      proj_gpu =
+        (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wqkv.getData<_FP16>(), pq_w, uT,
+                                            (unsigned)CONV, uH) &
+        (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wz.getData<_FP16>(), pz_w, uT,
+                                            (unsigned)VAL, uH) &
+        (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wb.getData<_FP16>(), pb_w, uT,
+                                            (unsigned)NVH, uH) &
+        (int)cuda_fc_dense_gemm_fp16_f32out(xp, Wa.getData<_FP16>(), pa_w, uT,
+                                            (unsigned)NVH, uH);
+    }
+  }
+#endif
+  if (!proj_gpu) {
+    std::vector<float> xin_v;
+    readAsF32(input, (size_t)T * H, xin_v);
+    nntrainer::Tensor xin = wrapF32(xin_v.data(), T, H);
+    nntrainer::Tensor o_qkv = wrapF32(pq_w, T, CONV), o_z = wrapF32(pz_w, T, VAL);
+    nntrainer::Tensor o_b = wrapF32(pb_w, T, NVH), o_a = wrapF32(pa_w, T, NVH);
+    xin.dot(wrapF32(wqkv_f.data(), H, CONV), o_qkv);
+    xin.dot(wrapF32(wz_f.data(), H, VAL), o_z);
+    xin.dot(wrapF32(wb_f.data(), H, NVH), o_b);
+    xin.dot(wrapF32(wa_f.data(), H, NVH), o_a);
+  }
+  const float *pq = pq_w; // [T,CONV] token-major
+  const float *pz = pz_w; // [T,VAL]
+  const float *pb = pb_w;
+  const float *pa = pa_w;
 
   // causal depthwise conv1d + SiLU (per sequence, left-pad K-1)
   std::vector<float> conv(T * CONV);
