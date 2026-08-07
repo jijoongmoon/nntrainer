@@ -16,6 +16,7 @@
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cstdlib>
 #include <cuda_context_manager.h>
+#include <cuda_gdn.h>
 #endif
 
 // The retired lane's per-token GDN device kernel (nntrainer/cuda/cuda_gdn.*) is
@@ -27,7 +28,11 @@
 // bit-exactly. Until those kernels exist this layer is host-only, which is
 // correct-but-slow and, importantly, VISIBLE: it shows up in [CAP-AUDIT] rather
 // than silently producing wrong numbers inside a graph capture.
-#define NNTR_GDN_HAVE_CUDA_KERNELS 0
+// The call site below was ported to this base ahead of the kernel; cuda_gdn.cpp
+// has now been brought over too (it is FP16-dense throughout and touches none
+// of the int4/QS4CX payload machinery this base changed, so the "do not port
+// the retired lane's CUDA code" caveat does not apply to it).
+#define NNTR_GDN_HAVE_CUDA_KERNELS 1
 
 namespace causallm {
 
