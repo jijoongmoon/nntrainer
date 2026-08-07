@@ -137,8 +137,22 @@ void CudaContext::initialize() noexcept {
     // -- a flat 2x. Decode is unaffected (M=1 is under the cap either way).
     // Armed for integrated too; the discrete block keeps its own copy so the
     // cMA==0-on-WDDM case (integrated=false) still opts out.
-    if (caps_.integrated)
+    if (caps_.integrated) {
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+      // Same story, different flag: without it the PREFILL V-cache copy takes
+      // the host branch (mha_core.cpp -- the GPU copy needs height==1, or
+      // vcopy_prefill, or a device-only KV cache, and on an integrated GPU the
+      // KV cache IS host-addressable), which puts one host op per layer inside
+      // the prefill capture. Its own comment says the gate exists because "a
+      // host attention path could read the V cache unsynced" and is safe once
+      // GPU attention + a UVM KV cache are on -- both are armed unconditionally
+      // above. It is doubly safe here: the drain it protects is finishIfAsync,
+      // and cuda_async_mode() hard-returns false on integrated, so that drain
+      // was never doing anything on this hardware anyway.
+      // Measured on Orin/gemma4-e2b QS4CX, 1004-token prefill:
+      // [CAP-AUDIT] lines 32 -> 0, prefill 3498 -> 3560 TPS.
+      setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
+    }
     if (!caps_.integrated && context_inst_.concurrentManagedAccess()) {
       // Discrete (RTX/dGPU) residency + decode-CUDA-graph add-ons: device-only
       // activations, prefill v-copy, ALL-rows CUDA RMSNorm (despite the env's
