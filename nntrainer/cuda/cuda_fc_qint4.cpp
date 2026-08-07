@@ -724,6 +724,80 @@ __global__ void dp4a_gemv(const signed char *q8, const signed char *plain,
   }
 }
 
+// Same math as dp4a_gemv, reading the QS4CX payload DIRECTLY instead of the
+// derived DevWeightQ cache. The two things that cache precomputes are done
+// inline here, and both are nearly free on a bandwidth-bound kernel:
+//
+//   - offset-binary -> two's complement. repack_plain_i4 does this as
+//     `byte ^ 0x88` into a SECOND FULL COPY of every weight -- 15.1 GiB for
+//     this model's experts alone, to avoid one XOR per 16-bit load.
+//   - rowsum[n] = sum_k int4(n,k). weight_rowsum makes a whole separate pass
+//     over the same bytes this loop already has in registers; one extra
+//     __dp4a against 0x01010101 produces it in place.
+//
+// Both accumulators are int32 and cover exactly k in [0,K) -- the same range
+// weight_rowsum uses (it skips the odd-K pad nibble, and so does the tail
+// below) -- so dp4a's integer associativity makes this BIT-IDENTICAL to the
+// cached path, not merely equivalent.
+__global__ void dp4a_gemv_raw(const signed char *q8, const unsigned char *plain,
+                              const float *ascale, const int *azp,
+                              const unsigned short *wscale, float *Y, int N,
+                              int K, int out_fp16) {
+  const int warps_per_block = blockDim.x >> 5;
+  int n = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+  if (n >= N)
+    return;
+  const int lane = threadIdx.x & 31;
+  int Kh = (K + 1) >> 1;
+  const unsigned char *wrow = plain + (long)n * Kh;
+  int acc = 0, rs = 0;
+  const int K4 = K & ~3;
+  const bool wide_w = ((Kh & 1) == 0);
+  for (int k = lane * 4; k < K4; k += 32 * 4) {
+    int a = *(const int *)(q8 + k);
+    int kb = k >> 1;
+    int b0, b1;
+    if (wide_w) {
+      unsigned int w16 = (*(const unsigned short *)(wrow + kb)) ^ 0x8888u;
+      b0 = (int)(w16 & 0xFF);
+      b1 = (int)((w16 >> 8) & 0xFF);
+    } else {
+      b0 = (int)(((unsigned int)wrow[kb]) ^ 0x88u);
+      b1 = (int)(((unsigned int)wrow[kb + 1]) ^ 0x88u);
+    }
+    int w0 = ((int)(signed char)(b0 << 4)) >> 4;
+    int w1 = ((int)(signed char)b0) >> 4;
+    int w2 = ((int)(signed char)(b1 << 4)) >> 4;
+    int w3 = ((int)(signed char)b1) >> 4;
+    int w = (w0 & 0xFF) | ((w1 & 0xFF) << 8) | ((w2 & 0xFF) << 16) |
+            ((w3 & 0xFF) << 24);
+    acc = __dp4a(a, w, acc);
+    rs = __dp4a(0x01010101, w, rs);
+  }
+  {
+    int k = K4 + lane;
+    if (k < K) {
+      int b = (int)(((unsigned int)wrow[k >> 1]) ^ 0x88u);
+      int wv = (k & 1) ? (((int)(signed char)b) >> 4)
+                       : (((int)(signed char)(b << 4)) >> 4);
+      acc += (int)q8[k] * wv;
+      rs += wv;
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, o);
+    rs += __shfl_down_sync(0xffffffffu, rs, o);
+  }
+  if (lane == 0) {
+    float r = (float)(acc - azp[0] * rs) * ascale[0] * dp4a_h2f(wscale[n]);
+    if (out_fp16)
+      ((unsigned short *)Y)[n] = dp4a_f2h(r);
+    else
+      Y[n] = r;
+  }
+}
+
 // Fused decode GEMV: the per-row asym int8 activation quant folded into the
 // GEMV kernel itself (the ML Drift paper's 3.7 decode prescription: quantize
 // inside the operational kernel). Every block redundantly reduces the row's
@@ -1129,6 +1203,16 @@ DevWeightQ *ensure_dp4a_cache_locked(const unsigned char *plain_w,
   return &it->second;
 }
 
+/** NNTR_CUDA_FC_NOCACHE=1: read the QS4CX payload in place instead of the
+ *  derived DevWeightQ copy. Read once. */
+static bool fc_nocache_on() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_CUDA_FC_NOCACHE");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
+
 // repack (cached) + GEMM into a device float Y, using the already-staged
 // q8/ascale scratch. Caller holds g_dp4a_mtx and has run act-quant.
 bool dp4a_repack_and_gemm(const unsigned char *plain_w,
@@ -1143,20 +1227,48 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   // fp16 activation row instead of pre-staging g_dp4a_q8.
   const bool fused = gemv && Xh_fused != nullptr;
   const bool tiled = (M >= 8);
+  // NNTR_CUDA_FC_NOCACHE=1: skip the DevWeightQ cache entirely for the decode
+  // GEMV and read the QS4CX payload in place. That cache is a byte-for-byte
+  // XOR copy of the weights plus an N-int rowsum, so on this model it is 15.1
+  // GiB of the resident set spent avoiding one instruction per load. It is
+  // also built LAZILY for MoE experts -- the load-time prewarm walk filters on
+  // layer type "fully_connected" and the MoE node is "qwen_moe" -- so a
+  // profile shows repack_plain_i4 + weight_rowsum as 18% of GPU time, and a
+  // long prefill that touches all 30,720 experts pays it in full.
+  const bool raw = fc_nocache_on() && gemv && !fused;
   auto kg = CudaContext::Global().registerCudaKernel(
     FC_QINT4_DP4A_SRC, fused  ? "dp4a_gemv_fused_h"
+                       : raw  ? "dp4a_gemv_raw"
                        : gemv ? "dp4a_gemv"
                               : (tiled ? "dp4a_gemm_reg" : "dp4a_gemm"));
   if (!kg)
     return false;
 
-  DevWeightQ *dwp = ensure_dp4a_cache_locked(plain_w, N, K);
-  if (!dwp)
-    return false;
-  signed char *plain = dwp->plain;
-  int *wrowsum = dwp->rowsum;
+  signed char *plain = nullptr;
+  int *wrowsum = nullptr;
+  if (!raw) {
+    DevWeightQ *dwp = ensure_dp4a_cache_locked(plain_w, N, K);
+    if (!dwp)
+      return false;
+    plain = dwp->plain;
+    wrowsum = dwp->rowsum;
+  }
 
   const int mm = (int)M;
+  if (raw) {
+    kg->SetKernelArguments(0, &g_dp4a_q8, sizeof(g_dp4a_q8));
+    kg->SetKernelArguments(1, &plain_w, sizeof(plain_w));
+    kg->SetKernelArguments(2, &g_dp4a_ascale, sizeof(g_dp4a_ascale));
+    kg->SetKernelArguments(3, &g_dp4a_azp, sizeof(g_dp4a_azp));
+    kg->SetKernelArguments(4, &scales_fp16, sizeof(scales_fp16));
+    kg->SetKernelArguments(5, &Yf, sizeof(Yf));
+    kg->SetKernelArguments(6, &n, sizeof(n));
+    kg->SetKernelArguments(7, &k, sizeof(k));
+    kg->SetKernelArguments(8, &out_fp16, sizeof(out_fp16));
+    const int gvb[3] = {128, 1, 1};
+    const int gvg[3] = {((int)N + 3) / 4, 1, 1};
+    return StreamManager::Global().DispatchCommand(*kg, gvg, gvb);
+  }
   if (fused) {
     kg->SetKernelArguments(0, &Xh_fused, sizeof(Xh_fused));
     kg->SetKernelArguments(1, &plain, sizeof(plain));
