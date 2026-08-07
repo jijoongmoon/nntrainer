@@ -1229,12 +1229,14 @@ DevWeightQ *ensure_dp4a_cache_locked(const unsigned char *plain_w,
   return &it->second;
 }
 
-/** NNTR_CUDA_FC_NOCACHE=1: read the QS4CX payload in place instead of the
- *  derived DevWeightQ copy. Read once. */
+/** Do not BUILD the DevWeightQ cache in-path; read the QS4CX payload directly
+ *  instead. An already-built cache is still used (see the call site).
+ *  DEFAULT ON; NNTR_CUDA_FC_NOCACHE=0 restores the old always-build behaviour.
+ *  Read once. */
 static bool fc_nocache_on() {
   static const bool on = []() {
     const char *e = std::getenv("NNTR_CUDA_FC_NOCACHE");
-    return e && e[0] == '1';
+    return !(e && e[0] == '0');
   }();
   return on;
 }
@@ -1264,7 +1266,18 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   // The GEMV needs its own kernel (it has no wrowsum parameter at all); the two
   // GEMMs take a launch-uniform `raw` flag instead, so there is one code path
   // rather than two copies of a register-blocked tile.
-  const bool nocache = fc_nocache_on() && !fused;
+  //
+  // The flag means "do not BUILD the cache", not "do not use it". If one is
+  // already there we take it -- that is strictly better on both counts, and
+  // the distinction is measurable: gemma4's FCs are layer type
+  // "fully_connected" so the load-time walk prewarms every one of them, and
+  // forcing the raw path there cost 6.2% of decode (64.2 -> 60.2 TPS) while
+  // freeing nothing, because the cache had already been allocated. The 35B's
+  // experts are the opposite case -- never prewarmed, 15.1 GiB, built in-path.
+  // Same rule serves both.
+  const bool nocache = fc_nocache_on() && !fused &&
+                       g_dp4a_plain_cache.find(plain_w) ==
+                         g_dp4a_plain_cache.end();
   const bool raw = nocache && gemv;
   auto kg = CudaContext::Global().registerCudaKernel(
     FC_QINT4_DP4A_SRC, fused  ? "dp4a_gemv_fused_h"
