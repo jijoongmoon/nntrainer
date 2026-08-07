@@ -83,6 +83,20 @@ bool gemm_ex(int M, int N, int K, const void *A, cudaDataType a_type,
             N, K);
     return false;
   }
+  // Drain, exactly as every other device op does (cuda_fc_qint4.cpp:1601 and
+  // friends). The stream binding above only orders this GEMM against other
+  // DEVICE work; it says nothing about the HOST. On integrated hardware
+  // cuda_async_mode() hard-returns false, so maybeFinish() is a full finish()
+  // and that per-op drain is the entire mechanism this path relies on for
+  // host/device ordering -- the caller in CudaComputeOps::fc returns straight
+  // into the next op, which is frequently host code reading this UVM output.
+  //
+  // Omitting it was a live race, not a theoretical one: the real graph came out
+  // WRONG and DIFFERENT on every run (max|d| 5-11 against a 3.8e-4 CPU
+  // reference, argmax wandering) and went bit-identical the moment this arm was
+  // disabled. It is invisible to the host-op detectors -- the work IS on the
+  // device, it is just read too early.
+  StreamManager::Global().maybeFinish();
   return true;
 }
 
