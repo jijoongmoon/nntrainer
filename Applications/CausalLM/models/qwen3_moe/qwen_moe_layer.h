@@ -205,7 +205,8 @@ private:
     const nntrainer::Tensor &input, nntrainer::Tensor &output,
     const std::vector<std::pair<unsigned, float>> &token_assignments,
     nntrainer::Tensor &gate_proj, nntrainer::Tensor &up_proj,
-    nntrainer::Tensor &down_proj, unsigned int hidden_size);
+    nntrainer::Tensor &down_proj, unsigned int hidden_size,
+    const int *rows_dev = nullptr, const float *wts_dev = nullptr);
 };
 } // namespace causallm
 

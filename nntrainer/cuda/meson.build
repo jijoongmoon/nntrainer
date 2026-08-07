@@ -14,6 +14,7 @@ cuda_sources = [
   'cuda_fc_dense.cpp',
   'cuda_gemv_q6k.cpp',
   'cuda_gdn.cpp',
+  'cuda_moe.cpp',
   'cuda_pack_cache.cpp',
   'cuda_blas_manager.cpp',
 ]

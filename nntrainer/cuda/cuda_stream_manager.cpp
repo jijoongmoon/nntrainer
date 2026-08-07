@@ -140,6 +140,10 @@ static bool cuda_async_mode() {
 void StreamManager::maybeFinish() {
   if (capturing_)
     return;
+  // Inside a deferred-drain region the caller has taken responsibility for
+  // ordering (see pushDeferDrain in the header) and will finish() explicitly.
+  if (defer_drain_)
+    return;
   // NNTR_CUDA_PACE=<N> (default off): depth-N submission pacing -- the middle
   // ground between the full per-op drain (sync mode; WDDM decode ~29 TPS) and
   // no drain at all (no-drain modes corrupt on WDDM). Bounds the un-drained op

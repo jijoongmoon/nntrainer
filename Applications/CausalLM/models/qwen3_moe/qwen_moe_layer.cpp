@@ -29,6 +29,11 @@
 #include <cstdio>
 #include <cstring>
 #include <layer_prof.h>
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_moe.h>
+#include <cuda_stream_manager.h>
+#endif
 #include <node_exporter.h>
 #include <qwen_moe_layer.h>
 #include <stdexcept>
@@ -492,11 +497,17 @@ void MoELayer::compute_expert_forward_batched(
   const nntrainer::Tensor &input, nntrainer::Tensor &output,
   const std::vector<std::pair<unsigned, float>> &token_assignments,
   nntrainer::Tensor &gate_proj, nntrainer::Tensor &up_proj,
-  nntrainer::Tensor &down_proj, unsigned int hidden_size) {
+  nntrainer::Tensor &down_proj, unsigned int hidden_size,
+  const int *rows_dev, const float *wts_dev) {
 
   const unsigned int m = static_cast<unsigned int>(token_assignments.size());
   if (m == 0)
     return;
+  // rows_dev/wts_dev non-null means the caller staged this expert's row list on
+  // the device AND is holding a deferred-drain region open, so the gather, the
+  // SwiGLU and the scatter must all stay on the device -- a host touch of any
+  // of these buffers now would read work that has been issued and not drained.
+  const bool dev_path = (rows_dev != nullptr && wts_dev != nullptr);
 
   const unsigned int intermediate_size = gate_proj.width();
   const auto tt = input.getTensorType();
@@ -518,45 +529,83 @@ void MoELayer::compute_expert_forward_batched(
   auto expert_out = rows(expert_out_idx, hidden_size);
 
   const auto dt = input.getDataType();
-  switch (dt) {
-  case ml::train::TensorDim::DataType::FP32:
-    gather_rows(input.getData<float>(), gathered.getData<float>(),
-                token_assignments, hidden_size);
-    break;
-#ifdef ENABLE_FP16
-  case ml::train::TensorDim::DataType::FP16:
-    gather_rows(input.getData<_FP16>(), gathered.getData<_FP16>(),
-                token_assignments, hidden_size);
-    break;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  if (dev_path) {
+    nntrainer::cuda::cuda_moe_gather_fp16(
+      reinterpret_cast<const unsigned short *>(input.getData<_FP16>()),
+      reinterpret_cast<unsigned short *>(gathered.getData<_FP16>()), rows_dev,
+      m, hidden_size);
+  } else
 #endif
-  default:
-    throw std::runtime_error("MoE: unsupported activation dtype for gather");
+  {
+    switch (dt) {
+    case ml::train::TensorDim::DataType::FP32:
+      gather_rows(input.getData<float>(), gathered.getData<float>(),
+                  token_assignments, hidden_size);
+      break;
+#ifdef ENABLE_FP16
+    case ml::train::TensorDim::DataType::FP16:
+      gather_rows(input.getData<_FP16>(), gathered.getData<_FP16>(),
+                  token_assignments, hidden_size);
+      break;
+#endif
+    default:
+      throw std::runtime_error("MoE: unsupported activation dtype for gather");
+    }
   }
 
-  moe_dbg("gathered", gathered);
+  if (!dev_path)
+    moe_dbg("gathered", gathered);
   {
     nntrainer::LayerProfScope _p("  moe:3x fc", m == 1);
     ops->fc(gathered, gate_proj, gate_out);
-    moe_dbg("gate_out", gate_out);
     ops->fc(gathered, up_proj, up_out);
+  }
+  if (!dev_path) {
+    moe_dbg("gate_out", gate_out);
     moe_dbg("up_out", up_out);
   }
 
-  // dtype-generic SwiGLU, as in the per-token path: the free nntrainer::swiglu()
-  // is FP32-only and reads its operands through an unchecked getData<float>().
   {
-    nntrainer::LayerProfScope _p("  moe:swiglu(host)", m == 1);
-    acti_func.run_fn(gate_out, acti_out);
-    acti_out.multiply_i(up_out);
+    nntrainer::LayerProfScope _p(dev_path ? "  moe:swiglu(dev)"
+                                          : "  moe:swiglu(host)",
+                                 m == 1);
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    if (dev_path) {
+      nntrainer::cuda::cuda_moe_swiglu_fp16(
+        reinterpret_cast<const unsigned short *>(gate_out.getData<_FP16>()),
+        reinterpret_cast<const unsigned short *>(up_out.getData<_FP16>()),
+        reinterpret_cast<unsigned short *>(acti_out.getData<_FP16>()),
+        m * intermediate_size);
+    } else
+#endif
+    {
+      // dtype-generic SwiGLU, as in the per-token path: the free
+      // nntrainer::swiglu() is FP32-only and reads its operands through an
+      // unchecked getData<float>().
+      acti_func.run_fn(gate_out, acti_out);
+      acti_out.multiply_i(up_out);
+    }
   }
-  moe_dbg("swiglu", acti_out);
+  if (!dev_path)
+    moe_dbg("swiglu", acti_out);
 
   {
     nntrainer::LayerProfScope _p("  moe:3x fc", m == 1);
     ops->fc(acti_out, down_proj, expert_out);
   }
-  moe_dbg("expert_out", expert_out);
+  if (!dev_path)
+    moe_dbg("expert_out", expert_out);
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+  if (dev_path) {
+    nntrainer::cuda::cuda_moe_scatter_add_fp16(
+      reinterpret_cast<const unsigned short *>(expert_out.getData<_FP16>()),
+      reinterpret_cast<unsigned short *>(output.getData<_FP16>()), rows_dev,
+      wts_dev, m, hidden_size);
+    return;
+  }
+#endif
   switch (dt) {
   case ml::train::TensorDim::DataType::FP32:
     scatter_weighted_add(expert_out.getData<float>(), output.getData<float>(),
@@ -671,6 +720,49 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // almost all of it zero.
     nntrainer::ComputeOps *ops = input_.getOps();
 
+    // Stage EVERY expert's row list once, in one buffer with per-expert
+    // offsets, rather than reusing one buffer per expert: the drain is deferred
+    // below, so expert i's gather may not have run when the host would have
+    // overwritten the rows for expert i+1.
+    const int *rows_all = nullptr;
+    const float *wts_all = nullptr;
+    std::vector<size_t> expert_off(num_experts, 0);
+    bool moe_dev = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // NNTR_MOE_DBG reads these buffers on the host, which a deferred drain
+    // makes meaningless -- it forces the host path so the counters stay true.
+    static const bool moe_dbg_on = std::getenv("NNTR_MOE_DBG") != nullptr;
+    if (!moe_dbg_on &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        output.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      int *rp = nullptr;
+      float *wp = nullptr;
+      if (nntrainer::cuda::cuda_moe_stage(total_tokens * topk, &rp, &wp) &&
+          nntrainer::cuda::dev_accessible(input.getData<_FP16>()) &&
+          nntrainer::cuda::dev_accessible(output.getData<_FP16>()) &&
+          nntrainer::cuda::dev_accessible(rp)) {
+        size_t off = 0;
+        for (unsigned int e = 0; e < num_experts; ++e) {
+          expert_off[e] = off;
+          for (const auto &a : expert_assignments[e]) {
+            rp[off] = static_cast<int>(a.first);
+            wp[off] = a.second;
+            ++off;
+          }
+        }
+        rows_all = rp;
+        wts_all = wp;
+        moe_dev = true;
+      }
+    }
+    // One drain for the whole expert loop instead of one per fc. On integrated
+    // that is 24 full cudaStreamSynchronize per layer per token at decode, and
+    // 768 per layer per chunk at prefill; a 1,341-token prefill measured 61,440
+    // of them, ~92% of this layer's time against ~8% of actual GEMM.
+    if (moe_dev)
+      nntrainer::cuda::StreamManager::Global().pushDeferDrain();
+#endif
+
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
          ++expert_idx) {
       const auto &assignments = expert_assignments[expert_idx];
@@ -681,8 +773,18 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         ops, context, input, output, assignments,
         context.getWeight(expert_gate_proj_indices[expert_idx]),
         context.getWeight(expert_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size,
+        moe_dev ? rows_all + expert_off[expert_idx] : nullptr,
+        moe_dev ? wts_all + expert_off[expert_idx] : nullptr);
     }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    if (moe_dev) {
+      auto &sm = nntrainer::cuda::StreamManager::Global();
+      sm.popDeferDrain();
+      sm.finish(); // the region's single drain; `output` is host-read next
+    }
+#endif
 
     // reshape output: [B*S,1,1,H] -> [B,1,S,H]
     output.reshape({batch_size, 1, seq_len, hidden_size});

@@ -80,6 +80,35 @@ public:
   void finishIfAsync();
 
   /**
+   * @brief Suppress the per-op drain over a bounded region, RAII-style via
+   *        pushDeferDrain()/popDeferDrain().
+   *
+   * On an integrated GPU maybeFinish() is a full cudaStreamSynchronize, so a
+   * region that issues many small device ops back to back pays one pipeline
+   * flush per op. The MoE expert loop is the extreme case: 8 experts x 3
+   * projections per layer per token at decode, and 256 x 3 per layer per chunk
+   * at prefill -- 61,440 drains for a single 1,341-token prefill, which
+   * measured as ~92% of that layer's time against ~8% of actual GEMM.
+   *
+   * THE CONTRACT, and it is not a soft one: while deferred, NOTHING on the
+   * host may read a buffer any of those ops writes. The caller is responsible
+   * for having moved every such read onto the device first, and for calling
+   * finish() explicitly at the end of the region -- finish() itself is NOT
+   * suppressed, only maybeFinish(). Getting this wrong reproduces exactly the
+   * class of bug the missing drain in cuda_fc_dense::gemm_ex caused: work that
+   * IS on the device, read too early, wrong and different on every run, and
+   * invisible to both host-op detectors.
+   */
+  void pushDeferDrain() { ++defer_drain_; }
+  /** @brief End one deferred-drain region. */
+  void popDeferDrain() {
+    if (defer_drain_ > 0)
+      --defer_drain_;
+  }
+  /** @brief True while inside a deferred-drain region. */
+  bool drainDeferred() const { return defer_drain_ > 0; }
+
+  /**
    * @brief Ordering drain whose caller then runs a DEVICE kernel — the same
    *        sync as finish(), minus the [CAP-AUDIT] bookkeeping.
    *
@@ -175,6 +204,7 @@ protected:
 private:
   cudaStream_t stream_{nullptr};
   bool capturing_{false};
+  unsigned int defer_drain_{0};
   bool capture_doomed_{false};
   unsigned long long dispatch_seq_{0};
 };
