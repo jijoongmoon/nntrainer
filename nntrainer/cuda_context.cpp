@@ -125,6 +125,20 @@ void CudaContext::initialize() noexcept {
     setenv("NNTR_CUDA_BLOCKQ", "1", 0);
     setenv("NNTR_FC_CUDA_CUBLAS", "1", 0);
     setenv("NNTR_CUDA_PREWARM", "1", 0);
+    // "=all" RAISES the CUDA RMSNorm row cap to every row; unset leaves it at
+    // 32 (cuda_compute_ops.cpp gpu_max_rows), which sends EVERY prefill
+    // RMSNorm to the host. It is listed in the discrete block below as part of
+    // a bundle whose shared justification is "these let a HOST op touch pool
+    // memory around in-flight kernels" -- but this one is the opposite: it
+    // REMOVES host reads from the chain, which is exactly what an integrated
+    // GPU needs (there, a host op inside a CUDA-graph capture is a
+    // wrong-answer bug, not merely a slow one). Measured on Orin/gemma4-e2b,
+    // 1004-token prefill, 2 runs each: 3560/3535 TPS with, 1774/1765 without
+    // -- a flat 2x. Decode is unaffected (M=1 is under the cap either way).
+    // Armed for integrated too; the discrete block keeps its own copy so the
+    // cMA==0-on-WDDM case (integrated=false) still opts out.
+    if (caps_.integrated)
+      setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
     if (!caps_.integrated && context_inst_.concurrentManagedAccess()) {
       // Discrete (RTX/dGPU) residency + decode-CUDA-graph add-ons: device-only
       // activations, prefill v-copy, ALL-rows CUDA RMSNorm (despite the env's

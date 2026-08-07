@@ -473,11 +473,18 @@ std::vector<float *> CausalLM::incrementalInference(
         // Stash the device logits pointer (before the D2H copy) when
         // device-accessible, for generate()'s on-GPU argmax. batch_size==1
         // only (the argmax reduces a single [vocab] row).
+        // Residency probe via cuda::dev_accessible(), not an open-coded
+        // Managed||Device test: on an integrated GPU with
+        // concurrentManagedAccess==0 (Tegra/Orin) every pool is
+        // cudaHostAlloc(cudaHostAllocMapped) and reports cudaMemoryTypeHost,
+        // so the open-coded form was dead there -- every token fell back to a
+        // full-vocab host fp16->fp32 convert plus a host std::max_element.
+        // dev_accessible() accepts pinned host-mapped (Host + non-null
+        // devicePointer) and is the ONE spelling of this rule
+        // (cuda_context_manager.cpp:248-258). Its engine_selected() term is
+        // already satisfied: this whole block is inside causallm_engine()=="cuda".
         if (cuda_argmax_enabled() && first_output && batch_size == 1) {
-          cudaPointerAttributes pa0{};
-          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
-              (pa0.type == cudaMemoryTypeDevice ||
-               pa0.type == cudaMemoryTypeManaged)) {
+          if (nntrainer::cuda::dev_accessible(out_src)) {
             g_cuda_logits_dev = out_src;
             g_cuda_logits_fp16 = true;
             // Greedy last time -> generate() will read one index off the GPU
@@ -535,10 +542,10 @@ std::vector<float *> CausalLM::incrementalInference(
         // on-GPU argmax kernel and -- as the fallback -- the host memcpy.
         if (cuda_argmax_enabled() && first_output && batch_size == 1) {
           const float *out_src = out_t.getData();
-          cudaPointerAttributes pa0{};
-          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
-              (pa0.type == cudaMemoryTypeDevice ||
-               pa0.type == cudaMemoryTypeManaged)) {
+          // Same one-spelling residency rule as the fp16 stash above; see the
+          // comment there for why the open-coded Managed||Device test was dead
+          // on an integrated GPU.
+          if (nntrainer::cuda::dev_accessible(out_src)) {
             g_cuda_logits_dev = out_src;
             g_cuda_logits_fp16 = false;
             if (g_greedy_hint) {
