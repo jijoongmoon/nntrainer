@@ -43,6 +43,7 @@
 #include "qwen3_causallm.h"
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
+#include "qwen3_5_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include "timm_vit/timm_vit_transformer.h"
 
@@ -75,6 +76,21 @@ void registerAllModels() {
       "Qwen3MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::Qwen3MoECausalLM>(cfg, generation_cfg,
                                                             nntr_cfg);
+      });
+    // Qwen3.6-35B-A3B (Qwen3-Next). Both strings map to the same class: the
+    // "...ForConditionalGeneration" spelling is the multimodal wrapper's, and
+    // only the text LM is implemented here.
+    causallm::Factory::Instance().registerModel(
+      "Qwen3_5MoeForCausalLM", [](json cfg, json generation_cfg,
+                                  json nntr_cfg) {
+        return std::make_unique<causallm::Qwen3_5MoeCausalLM>(
+          cfg, generation_cfg, nntr_cfg);
+      });
+    causallm::Factory::Instance().registerModel(
+      "Qwen3_5MoeForConditionalGeneration",
+      [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::Qwen3_5MoeCausalLM>(
+          cfg, generation_cfg, nntr_cfg);
       });
     causallm::Factory::Instance().registerModel(
       "Qwen3SlimMoeForCausalLM",

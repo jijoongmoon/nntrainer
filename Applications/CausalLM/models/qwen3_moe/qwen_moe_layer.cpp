@@ -85,6 +85,14 @@ void MoELayer::finalize(nntrainer::InitLayerContext &context) {
     acti_func.setActiFunc<float>(
       std::get<props::MoEActivation>(moe_props).get());
     break;
+#ifdef ENABLE_FP16
+  case ml::train::TensorDim::DataType::FP16:
+    // An FP16-activation MoE is not exotic: every QINT4-FP16 package is one.
+    // Without this case finalize() threw at graph build for the whole family.
+    acti_func.setActiFunc<_FP16>(
+      std::get<props::MoEActivation>(moe_props).get());
+    break;
+#endif
   default:
     throw std::runtime_error("Unsupported activation data type for MoE layer");
   }
@@ -179,7 +187,16 @@ void MoELayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
 
   // routing
   nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
-  input.dot(gate_weights, router_logits);
+  // Routing is ALWAYS fp32: the gate weight and router_logits are FP32,
+  // so an FP16 input makes HalfTensor::dot write FP16 bits into the FP32
+  // logits buffer -- garbage top-k, no crash. Widen first on FP16 models.
+  if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    input.dot(gate_weights, router_logits);
+  } else {
+    nntrainer::Tensor input32 =
+      input.clone(ml::train::TensorDim::DataType::FP32);
+    input32.dot(gate_weights, router_logits);
+  }
   router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
   auto topk_result = router_logits.topK(topk);
   auto topk_values = std::get<0>(topk_result);
@@ -277,8 +294,11 @@ inline void MoELayer::compute_expert_forward(
     // Up projection using optimized dot operation
     token_input.dot(up_proj, up_out);
 
-    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
-                      gate_out.getData<float>(), up_out.getData<float>());
+    // dtype-generic SwiGLU. The free nntrainer::swiglu() is FP32-only and
+    // reads its operands through an unchecked getData<float>(), which on an
+    // FP16 tensor reinterprets the bits rather than converting them.
+    acti_func.run_fn(gate_out, acti_out);
+    acti_out.multiply_i(up_out);
 
     // Down projection using optimized dot operation
     nntrainer::Tensor token_expert_output(token_output_dim);
@@ -339,8 +359,11 @@ inline void MoELayer::compute_expert_forward_no_critical(
     // Up projection using optimized dot operation
     token_input.dot(up_proj, up_out);
 
-    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
-                      gate_out.getData<float>(), up_out.getData<float>());
+    // dtype-generic SwiGLU. The free nntrainer::swiglu() is FP32-only and
+    // reads its operands through an unchecked getData<float>(), which on an
+    // FP16 tensor reinterprets the bits rather than converting them.
+    acti_func.run_fn(gate_out, acti_out);
+    acti_out.multiply_i(up_out);
 
     // Down projection using optimized dot operation
     nntrainer::Tensor token_expert_output(token_output_dim);
@@ -402,7 +425,16 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     // routing
     nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
-    input.dot(gate_weights, router_logits);
+    // Routing is ALWAYS fp32: the gate weight and router_logits are FP32,
+    // so an FP16 input makes HalfTensor::dot write FP16 bits into the FP32
+    // logits buffer -- garbage top-k, no crash. Widen first on FP16 models.
+    if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      input.dot(gate_weights, router_logits);
+    } else {
+      nntrainer::Tensor input32 =
+        input.clone(ml::train::TensorDim::DataType::FP32);
+      input32.dot(gate_weights, router_logits);
+    }
     router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
     auto topk_result = router_logits.topK(topk);
     auto topk_values = std::get<0>(topk_result);
