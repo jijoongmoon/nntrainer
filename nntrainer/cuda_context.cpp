@@ -383,6 +383,39 @@ int CudaContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
   return registerFactory<nntrainer::Layer>(factory, key, int_key);
 }
 
+/**
+ * @brief Capture-fidelity forensics for a graph that was just captured.
+ *
+ * The node count is the cheapest detector for the failure mode that dominated
+ * the Orin bring-up: a device op silently declines mid-capture, the work runs
+ * on the host instead, and NOTHING is recorded -- so the graph instantiates and
+ * replays while quietly MISSING that op. Comparing the count against the
+ * expected op census is what makes that visible.
+ *
+ * Both capture sites call this. The decode site had it inline; the prefill site
+ * (default ON for integrated GPUs, cuda_graph_prefill above) printed nothing at
+ * all, which is exactly backwards -- on Orin the prefill graph is the FIRST
+ * graph the process ever captures.
+ *
+ * @param graph the captured graph (nullptr is a no-op)
+ * @param tag   log prefix, also appended to NNTR_CUDA_GRAPH_DOT so a prefill
+ *              dump and a decode dump coexist instead of clobbering each other
+ */
+static void cuda_graph_census(cudaGraph_t graph, const char *tag) {
+  if (graph == nullptr)
+    return;
+  size_t n_nodes = 0;
+  cudaGraphGetNodes(graph, nullptr, &n_nodes);
+  std::fprintf(stderr, "[%s] captured graph: %zu nodes\n", tag, n_nodes);
+  if (const char *dot = std::getenv("NNTR_CUDA_GRAPH_DOT")) {
+    const std::string path = std::string(dot) + "." + tag;
+    if (cudaGraphDebugDotPrint(graph, path.c_str(),
+                               cudaGraphDebugDotFlagsVerbose) == cudaSuccess)
+      std::fprintf(stderr, "[%s] graph dot -> %s\n", tag, path.c_str());
+    cudaGetLastError();
+  }
+}
+
 // SEAM-2 CUDA override (docs/ARCHITECTURE_REFACTOR.md §10 T9). Relocated
 // VERBATIM from neuralnet.cpp's incremental_inference #if ENABLE_CUDA block —
 // the only changes are the model walk (`nn.incremental_forwarding`), graph-node
@@ -488,20 +521,8 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
       out = nn.incremental_forwarding(from, to, input, label, false);
       cudaGraph_t graph = nullptr;
       if (sm.endCapture(&graph) && graph != nullptr) {
-        if (cuda_graph_dbg) {
-          // Capture-fidelity forensics: how much of the ~1000-op forward
-          // actually landed in the graph, and (NNTR_CUDA_GRAPH_DOT=<path>)
-          // the full node dump for op-level diffing against the eager pass.
-          size_t n_nodes = 0;
-          cudaGraphGetNodes(graph, nullptr, &n_nodes);
-          std::fprintf(stderr, "[M2B] captured graph: %zu nodes\n", n_nodes);
-          if (const char *dot = std::getenv("NNTR_CUDA_GRAPH_DOT")) {
-            if (cudaGraphDebugDotPrint(
-                  graph, dot, cudaGraphDebugDotFlagsVerbose) == cudaSuccess)
-              std::fprintf(stderr, "[M2B] graph dot -> %s\n", dot);
-            cudaGetLastError();
-          }
-        }
+        if (cuda_graph_dbg)
+          cuda_graph_census(graph, "M2B");
         if (cudaGraphInstantiate(&_cg_cached_exec, graph, 0) == cudaSuccess) {
           cudaGraphLaunch(_cg_cached_exec, sm.GetStream());
           cudaStreamSynchronize(sm.GetStream());
@@ -549,6 +570,8 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
       auto p1 = _clk::now();
       t_rec = _us(p0, p1);
       if (ended && graph != nullptr) {
+        if (cuda_graph_dbg)
+          cuda_graph_census(graph, "M1");
         cudaGraphExec_t exec = nullptr;
         cerr = cudaGraphInstantiate(&exec, graph, 0);
         auto p2 = _clk::now();
@@ -617,6 +640,8 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
       auto p1 = _clk::now();
       t_rec = _us(p0, p1);
       if (ended && graph != nullptr) {
+        if (cuda_graph_dbg)
+          cuda_graph_census(graph, "PREFILL_GRAPH");
         cudaGraphExec_t exec = nullptr;
         cerr = cudaGraphInstantiate(&exec, graph, 0);
         auto p2 = _clk::now();

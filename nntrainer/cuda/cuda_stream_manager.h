@@ -80,6 +80,24 @@ public:
   void finishIfAsync();
 
   /**
+   * @brief Ordering drain whose caller then runs a DEVICE kernel — the same
+   *        sync as finish(), minus the [CAP-AUDIT] bookkeeping.
+   *
+   * finish() and finishIfAsync() log a capture-time skip because their callers
+   * are host-fallback preambles: a hit there means a host op ran inside the
+   * graph, which on this hardware is a wrong-answer bug (the host op reads
+   * buffers whose producing kernels have not run, and is never recorded into
+   * the graph). This entry point is for the opposite case — an ordering barrier
+   * before a device kernel, where skipping under capture is not merely allowed
+   * but correct.
+   *
+   * Keeping it out of the audit is what lets "zero [CAP-AUDIT] lines" stand as
+   * a literal pass condition for the host-op-free requirement, instead of a
+   * count with one hand-explained false positive in it.
+   */
+  void drainPipeline();
+
+  /**
    * @brief Begin CUDA-graph stream capture on the backend stream (Relaxed mode,
    *        which allows the driver-API cuLaunchKernel + cuBLAS sub-launches).
    *        Drains the stream first (start from idle), then enters capture.

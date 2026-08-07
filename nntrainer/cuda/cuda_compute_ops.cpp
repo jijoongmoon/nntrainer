@@ -409,11 +409,17 @@ void CudaComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
   // input is the first host-read point of the lm_head logits, so the
   // one-per-token GPU pipeline drains here. Per call (the layer chunks are
   // per batch/channel); the drain is idempotent and a no-op in default mode
-  // (every GPU op already drained). One spelling for the whole file
-  // (table_drain): the former engine_selected() guard here was the file's last
-  // env-conditional drain, and it cannot protect anything -- reaching this
-  // virtual already proves the CUDA context exists.
-  table_drain(true);
+  // (every GPU op already drained). The former engine_selected() guard here was
+  // the file's last env-conditional drain, and it cannot protect anything --
+  // reaching this virtual already proves the CUDA context exists.
+  //
+  // drainPipeline(), not table_drain(true): this is an ORDERING barrier whose
+  // own continuation below is a device kernel, so a capture-time skip is
+  // correct. table_drain routes to finish(), which [CAP-AUDIT]-logs the skip
+  // because ITS callers are host fallbacks -- and this one unconditional call
+  // put a permanent false positive in that count, making "zero CAP-AUDIT lines"
+  // unusable as the pass condition for the host-op-free requirement.
+  nntrainer::cuda::StreamManager::Global().drainPipeline();
 #ifdef ENABLE_FP16
   // Device-only activation pool: the logits are real device memory; the host
   // Tensor ops in the fallback would fault. out = cap * tanh(in / cap) in one

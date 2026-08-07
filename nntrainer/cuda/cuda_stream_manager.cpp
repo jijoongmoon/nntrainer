@@ -189,6 +189,16 @@ void StreamManager::finishIfAsync() {
     finish();
 }
 
+void StreamManager::drainPipeline() {
+  // Deliberately NOT finish(): that one audit-logs a capture-time skip because
+  // its callers are host fallbacks. Here the caller proceeds to a device
+  // kernel, so skipping under capture is correct and must not read as a
+  // finding. See the header for why the distinction is load-bearing.
+  if (capturing_)
+    return;
+  finish();
+}
+
 void StreamManager::markCaptureDoomed(const char *why) {
   if (!capturing_ || capture_doomed_)
     return;
