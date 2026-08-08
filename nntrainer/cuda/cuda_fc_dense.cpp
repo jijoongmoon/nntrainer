@@ -13,6 +13,7 @@
 #include "cuda_fc_dense.h"
 
 #include "cuda_blas_manager.h"
+#include "cuda_context_manager.h"
 #include "cuda_stream_manager.h"
 
 #include <nntrainer_log.h>
@@ -75,13 +76,44 @@ bool gemm_ex(int M, int N, int K, const void *A, cudaDataType a_type,
   // sync. Re-bind anyway: a caller that switched streams since would otherwise
   // silently race, and the call is a few nanoseconds.
   cublasSetStream(h, StreamManager::Global().GetStream());
-  cublasStatus_t s =
-    cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, a_type, N, A,
-                 a_type, K, &beta, C, c_type, N, compute, CUBLAS_GEMM_DEFAULT);
-  if (s != CUBLAS_STATUS_SUCCESS) {
-    ml_loge("[CUDA] dense cublasGemmEx failed: %d (M=%d N=%d K=%d)", (int)s, M,
-            N, K);
-    return false;
+
+  // M-CHUNKING. cublasGemmEx FAILS (status 13, EXECUTION_FAILED, followed by a
+  // sticky illegal memory access that kills the context) on Orin/sm_87 for tall
+  // GEMMs at a degenerate N -- measured at M=2774 N=32 K=2048, which is the
+  // GDN in_proj_b / in_proj_a projection during a 4096-token prefill chunk. The
+  // same shape at M<=2048 is fine, and the geometry probe binds it at every
+  // shape, so this is an algo-selection failure at large M, not a caller error.
+  // It is the same class of sm_87 defect the int8 path already works around by
+  // chunking K (cuda_blas_manager.cpp), and the fix is the same shape: keep
+  // every call inside the regime that works.
+  //
+  // Row-slicing is free here, unlike the int8 K-chunk: A is [M,K] row-major and
+  // C is [M,N] row-major, so a row block of either is CONTIGUOUS. No repack, no
+  // accumulation -- each chunk writes its own disjoint rows of C with beta=0.
+  static const int mchunk = []() {
+    const char *e = std::getenv("NNTR_CUBLAS_MCHUNK");
+    if (e) {
+      int v = std::atoi(e);
+      return v > 0 ? v : (1 << 28);
+    }
+    // Discrete GPUs run the full-M call correctly; only integrated needs this.
+    return ContextManager::Global().isIntegrated() ? 2048 : (1 << 28);
+  }();
+  const size_t a_elem = (a_type == CUDA_R_16F) ? 2u : 4u;
+  const size_t c_elem = (c_type == CUDA_R_16F) ? 2u : 4u;
+  for (int m0 = 0; m0 < M; m0 += mchunk) {
+    const int mc = (M - m0 < mchunk) ? (M - m0) : mchunk;
+    const void *Ai =
+      static_cast<const char *>(A) + (size_t)m0 * (size_t)K * a_elem;
+    void *Ci = static_cast<char *>(C) + (size_t)m0 * (size_t)N * c_elem;
+    cublasStatus_t s = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, mc, K,
+                                    &alpha, B, a_type, N, Ai, a_type, K, &beta,
+                                    Ci, c_type, N, compute, CUBLAS_GEMM_DEFAULT);
+    if (s != CUBLAS_STATUS_SUCCESS) {
+      ml_loge("[CUDA] dense cublasGemmEx failed: %d (M=%d[%d..+%d] N=%d K=%d)",
+              (int)s, M, m0, mc, N, K);
+      return false;
+    }
   }
   // Drain, exactly as every other device op does (cuda_fc_qint4.cpp:1601 and
   // friends). The stream binding above only orders this GEMM against other

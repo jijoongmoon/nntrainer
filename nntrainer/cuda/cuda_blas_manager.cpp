@@ -117,17 +117,45 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
   // the proven contiguous k<=kchunk regime. A is [M,K] row-major: row m, cols
   // [k0,k0+kc) -> dst pitch kc, src pitch K.
   cudaStream_t stream = StreamManager::Global().GetStream();
+
+  // M-chunking, for the same reason and in the same shape as the K-chunking
+  // above: on Orin/sm_87 the int8 IMMA GEMM ALSO fails at large M, not just
+  // large K. Measured with the K-chunk already applied:
+  //   [IGEMM] cublasGemmEx int8 status=13 (M=2784 N=2048 K=4096 k0=0 kc=2048)
+  // while M<=2048 at the same N,K is fine. Status 13 is EXECUTION_FAILED, and
+  // it leaves a STICKY illegal memory access that kills the context -- so the
+  // caller's "clear the error and fall back to dp4a" guard cannot save it
+  // (cudaGetLastError clears the flag, not a corrupted context). It has to not
+  // fault in the first place.
+  //
+  // Row-slicing is free: A is [M,K] row-major and C is [M,N] row-major, so a
+  // row block of either is contiguous. INVARIANT: callers pass M already
+  // rounded up to a multiple of 32 (Mpad), and mchunk is a multiple of 32, so
+  // every mc stays a multiple of 32 -- which int8 IMMA requires.
+  static const int mchunk = []() {
+    const char *e = std::getenv("NNTR_CUBLAS_MCHUNK");
+    if (e) {
+      int v = atoi(e);
+      return v > 0 ? ((v + 31) / 32) * 32 : (1 << 28);
+    }
+    return ContextManager::Global().isIntegrated() ? 2048 : (1 << 28);
+  }();
+
+  for (int m0 = 0; m0 < M; m0 += mchunk) {
+    const int mc = (M - m0 < mchunk) ? (M - m0) : mchunk;
+    const signed char *Am = A + (size_t)m0 * (size_t)K;
+    int *Cm = C + (size_t)m0 * (size_t)N;
   for (int k0 = 0; k0 < K; k0 += kchunk) {
     const int kc = (K - k0 < kchunk) ? (K - k0) : kchunk;
     const int beta_c = (k0 == 0) ? 0 : 1;
-    const signed char *actB = A + (size_t)k0;
+    const signed char *actB = Am + (size_t)k0;
     int ldB = K;
     if (chunked) {
       // +256B tail pad: int8 IMMA reads the operand in wide vectorized tiles
       // that can run past the last element; an exactly-sized contiguous slice
       // then faults. (kc is a multiple of 32 for the e2b dims, so no per-chunk
       // dimension padding is needed; the tail pad covers the vectorized read.)
-      const size_t need = (size_t)kc * M + 256;
+      const size_t need = (size_t)kc * mc + 256;
       if (g_i8_bchunk_cap < need) {
         if (g_i8_bchunk)
           cudaFree(g_i8_bchunk);
@@ -137,27 +165,28 @@ bool BlasManager::igemmRowMajor(int M, int N, int K, const signed char *A,
           return false;
         g_i8_bchunk_cap = need;
       }
-      if (cudaMemcpy2DAsync(g_i8_bchunk, (size_t)kc, A + (size_t)k0, (size_t)K,
-                            (size_t)kc, (size_t)M, cudaMemcpyDeviceToDevice,
+      if (cudaMemcpy2DAsync(g_i8_bchunk, (size_t)kc, Am + (size_t)k0, (size_t)K,
+                            (size_t)kc, (size_t)mc, cudaMemcpyDeviceToDevice,
                             stream) != cudaSuccess)
         return false;
       actB = g_i8_bchunk;
       ldB = kc;
     }
     cublasStatus_t s =
-      cublasGemmEx(handle_, CUBLAS_OP_N, CUBLAS_OP_N, N, M, kc, &alpha,
+      cublasGemmEx(handle_, CUBLAS_OP_N, CUBLAS_OP_N, N, mc, kc, &alpha,
                    B + (size_t)k0 * N, CUDA_R_8I, N, actB, CUDA_R_8I, ldB,
-                   &beta_c, C, CUDA_R_32I, N, CUBLAS_COMPUTE_32I, igemm_algo);
+                   &beta_c, Cm, CUDA_R_32I, N, CUBLAS_COMPUTE_32I, igemm_algo);
     if (s != CUBLAS_STATUS_SUCCESS) {
       if (dbg)
         fprintf(stderr,
-                "[IGEMM] cublasGemmEx int8 status=%d (M=%d N=%d K=%d k0=%d "
-                "kc=%d)\n",
-                (int)s, M, N, K, k0, kc);
+                "[IGEMM] cublasGemmEx int8 status=%d (M=%d[%d..+%d] N=%d K=%d "
+                "k0=%d kc=%d)\n",
+                (int)s, M, m0, mc, N, K, k0, kc);
       ml_loge("[CUDA] cublasGemmEx int8 failed: %d", (int)s);
       return false;
     }
   }
+  } // m0
   if (dbg) {
     static int once = 0;
     if (once++ < 3)
