@@ -816,6 +816,148 @@ __global__ void dp4a_gemv_raw(const signed char *q8, const unsigned char *plain,
 // The activation row (K fp16, a few KB) re-reads from L2 per block; the win
 // is one launch (+ per-op drain) less per FC call and no q8/ascale/azp
 // global round-trip. M==1 only; dynamic shared = K bytes for the q8 row.
+// ------------------------------------------------------------------ IMMA --
+// Same tile, same staging, Tensor Cores instead of the int ALU.
+//
+// dp4a_gemm_reg already reads the PACKED int4 weight and unpacks it into
+// shared memory during staging, so nothing is ever materialised in global
+// memory -- the property that makes vLLM's Marlin fast. What it lacks is the
+// instruction: __dp4a is the int32 ALU at ~21 TOPS, while the same operands on
+// mma.sync.s8 are ~137 TOPS. So only the inner product changes here; the loads
+// above and the epilogue below are dp4a_gemm_reg's, untouched.
+//
+// That combination is strictly better than Marlin ON THIS HARDWARE: identical
+// weight DRAM traffic (K*N/2), HALF the activation traffic (int8 vs bf16), and
+// twice the math rate (IMMA s8 vs HMMA bf16).
+//
+// VALIDATION IS FREE: int32 accumulation is exact and associative, so a
+// correct fragment mapping is BIT-IDENTICAL to dp4a_gemm_reg. Any layout error
+// shows up immediately as wrong output; there is no silent-drift regime.
+//
+// Fragment layout for mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32, with
+// g = lane>>2 (0..7) and t = lane&3 (0..3), all per warp:
+//   A [16m x 32k] row-major, 4 regs: a0 = A[g][4t..+3], a1 = A[g+8][4t..+3],
+//                                    a2 = A[g][16+4t..+3], a3 = A[g+8][16+4t..+3]
+//   B [32k x 8n] col-major,  2 regs: b0 = B[4t..+3][g],   b1 = B[16+4t..+3][g]
+//   C [16m x 8n],            4 regs: c0,c1 = C[g][2t],C[g][2t+1]
+//                                    c2,c3 = C[g+8][2t], C[g+8][2t+1]
+// Ws is [n][k], i.e. contiguous in k for a fixed n -- which IS the col-major B
+// operand, so the B fragment is a straight 4-byte load with no transpose.
+//
+// 8 warps cover the 64x64 tile as 4 warp-rows (16 m each) x 2 warp-cols (32 n
+// each); each warp runs 4 mma per k-step, one per 8-wide n subtile.
+// Own tile constants: this kernel sits ahead of dp4a_gemm_reg's RB_* defines
+// in the source string. Same values -- the tile is deliberately identical, so
+// the two are directly comparable.
+#define IM_BM 64
+#define IM_BN 64
+#define IM_BK 32
+__global__ __launch_bounds__(256, 2)
+void imma_gemm_reg(const signed char *q8, const unsigned char *plain,
+                   const float *ascale, const int *azp, const int *wrowsum,
+                   const unsigned short *wscale, float *Y, int M, int N, int K,
+                   int out_fp16, int raw) {
+  __shared__ signed char As[IM_BM][IM_BK];
+  __shared__ signed char Ws[IM_BN][IM_BK];
+  const int tid = threadIdx.x;          // 256 threads, 1-D
+  const int lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 1, wn = warp & 1; // 4 x 2 warp grid over 64x64
+  const int g = lane >> 2, t = lane & 3;
+  const int blockM = blockIdx.y * IM_BM, blockN = blockIdx.x * IM_BN;
+  const int Kh = (K + 1) >> 1;
+  const int xr = raw ? 0x88 : 0;
+
+  int acc[4][4]; // [n subtile][c reg]
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+      acc[s][r] = 0;
+  int rs[4] = {0, 0, 0, 0}; // rowsum per n subtile, for the raw path
+
+  for (int k0 = 0; k0 < K; k0 += IM_BK) {
+    for (int q = tid; q < IM_BM * IM_BK; q += 256) {
+      int i = q / IM_BK, j = q % IM_BK;
+      int mm = blockM + i, kk = k0 + j;
+      As[i][j] = (mm < M && kk < K) ? q8[(long)mm * K + kk] : (signed char)0;
+    }
+    for (int q = tid; q < IM_BN * IM_BK; q += 256) {
+      int i = q / IM_BK, j = q % IM_BK;
+      int nn = blockN + i, kk = k0 + j;
+      signed char wv = 0;
+      if (nn < N && kk < K) {
+        unsigned char b =
+          (unsigned char)(((unsigned int)plain[(long)nn * Kh + (kk >> 1)]) ^ xr);
+        wv = (kk & 1) ? (((signed char)b) >> 4) : (((signed char)(b << 4)) >> 4);
+      }
+      Ws[i][j] = wv;
+    }
+    __syncthreads();
+
+    int a[4];
+    a[0] = *(const int *)&As[wm * 16 + g][4 * t];
+    a[1] = *(const int *)&As[wm * 16 + g + 8][4 * t];
+    a[2] = *(const int *)&As[wm * 16 + g][16 + 4 * t];
+    a[3] = *(const int *)&As[wm * 16 + g + 8][16 + 4 * t];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const int ncol = wn * 32 + s * 8 + g;
+      int b[2];
+      b[0] = *(const int *)&Ws[ncol][4 * t];
+      b[1] = *(const int *)&Ws[ncol][16 + 4 * t];
+      if (raw) {
+        rs[s] = __dp4a(0x01010101, b[0], rs[s]);
+        rs[s] = __dp4a(0x01010101, b[1], rs[s]);
+      }
+      asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32.satfinite "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=r"(acc[s][0]), "=r"(acc[s][1]), "=r"(acc[s][2]), "=r"(acc[s][3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+          "r"(acc[s][0]), "r"(acc[s][1]), "r"(acc[s][2]), "r"(acc[s][3]));
+    }
+    __syncthreads();
+  }
+
+  // Epilogue. Each lane owns C[g][2t], C[g][2t+1], C[g+8][2t], C[g+8][2t+1]
+  // of every 8-wide n subtile. The rowsum a lane accumulated belongs to column
+  // (wn*32 + s*8 + g), which is NOT one of the columns it writes, so it is
+  // exchanged through shared memory rather than used directly.
+  __shared__ int rsh[IM_BN];
+  if (raw) {
+    // Column ncol's rowsum is SPLIT across the four lanes that share g: lane
+    // (g,t) saw only k in {4t..4t+3, 16+4t..+3}. Those four are consecutive
+    // lanes, so a two-step shuffle-down leaves the full sum in t==0.
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      int v = rs[s];
+      v += __shfl_down_sync(0xffffffffu, v, 1);
+      v += __shfl_down_sync(0xffffffffu, v, 2);
+      if (t == 0)
+        rsh[wn * 32 + s * 8 + g] = v;
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int row = blockM + wm * 16 + g + ((r >> 1) ? 8 : 0);
+      const int col = blockN + wn * 32 + s * 8 + 2 * t + (r & 1);
+      if (row < M && col < N) {
+        const int rsum = raw ? rsh[wn * 32 + s * 8 + 2 * t + (r & 1)]
+                             : wrowsum[col];
+        float v = (float)(acc[s][r] - azp[row] * rsum) * ascale[row] *
+                  dp4a_h2f(wscale[col]);
+        if (out_fp16)
+          ((unsigned short *)Y)[(long)row * N + col] = dp4a_f2h(v);
+        else
+          Y[(long)row * N + col] = v;
+      }
+    }
+  }
+}
+
 __global__ void dp4a_gemv_fused_h(const unsigned short *Xh,
                                   const signed char *plain,
                                   const int *wrowsum,
@@ -1264,6 +1406,14 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   // shape is right -- what is missing is enough of them per launch, which is a
   // grouped kernel (all experts in one grid), not a smaller tile.
   const bool tiled = (M >= 8);
+  // NNTR_CUDA_IMMA_TILE=1: same tile, Tensor Cores instead of the int ALU.
+  // Opt-in until it is proven bit-identical (which it must be -- int32
+  // accumulation is exact and associative).
+  static const bool imma_tile = []() {
+    const char *e = std::getenv("NNTR_CUDA_IMMA_TILE");
+    return e != nullptr && e[0] == '1';
+  }();
+  const bool use_imma = imma_tile && tiled && !gemv && !fused;
   // NNTR_CUDA_FC_NOCACHE=1: skip the DevWeightQ cache entirely for the decode
   // GEMV and read the QS4CX payload in place. That cache is a byte-for-byte
   // XOR copy of the weights plus an N-int rowsum, so on this model it is 15.1
@@ -1289,10 +1439,11 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
                          g_dp4a_plain_cache.end();
   const bool raw = nocache && gemv;
   auto kg = CudaContext::Global().registerCudaKernel(
-    FC_QINT4_DP4A_SRC, fused  ? "dp4a_gemv_fused_h"
-                       : raw  ? "dp4a_gemv_raw"
-                       : gemv ? "dp4a_gemv"
-                              : (tiled ? "dp4a_gemm_reg" : "dp4a_gemm"));
+    FC_QINT4_DP4A_SRC, fused     ? "dp4a_gemv_fused_h"
+                       : raw     ? "dp4a_gemv_raw"
+                       : gemv    ? "dp4a_gemv"
+                       : use_imma ? "imma_gemm_reg"
+                                  : (tiled ? "dp4a_gemm_reg" : "dp4a_gemm"));
   if (!kg)
     return false;
 
@@ -1362,6 +1513,13 @@ bool dp4a_repack_and_gemm(const unsigned char *plain_w,
   kg->SetKernelArguments(9, &k, sizeof(k));
   kg->SetKernelArguments(10, &out_fp16, sizeof(out_fp16));
   kg->SetKernelArguments(11, &raw_i, sizeof(raw_i));
+  if (use_imma) {
+    // Same 64x64 tile as dp4a_gemm_reg, but 256 threads as a 1-D block: the
+    // warp, not the thread, is the unit that owns an mma fragment.
+    const int ib[3] = {256, 1, 1};
+    const int ig[3] = {((int)N + 63) / 64, ((int)M + 63) / 64, 1};
+    return StreamManager::Global().DispatchCommand(*kg, ig, ib);
+  }
   const int gb[3] = {16, 16, 1};
   const int tile = tiled ? 64 : 16;
   const int gg[3] = {((int)N + tile - 1) / tile, ((int)M + tile - 1) / tile, 1};
