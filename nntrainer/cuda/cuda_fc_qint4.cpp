@@ -2051,9 +2051,19 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
   // is not on the critical path -- the GEMM is), so default OFF; correct +
   // ready if a less-throttled host or a power budget makes the redundant
   // launches matter.
+  // DEFAULT ON since the 35B. The old default-off was measured on ATTENTION,
+  // where q/k/v share attention_norm and the saving is one act-quant in three
+  // across a handful of FCs per layer -- genuinely inside the thermal noise.
+  // A MoE layer is a different population: gate and up share the gathered
+  // activation for EVERY routed expert, so the dedup removes one launch in
+  // three out of 61,440 fc calls per prefill. Measured on an 8,353-token
+  // prefill at chunk 4096: 234.3 -> 238.7 TPS, qwen_moe 22,994 -> 22,409 ms,
+  // with act_quant_i8_h at 22,209 launches / 903 ms before. Output unchanged
+  // (the reuse is exact -- same buffer, same K, guarded by dispatchSeq).
+  // NNTR_QUANT_DEDUP=0 opts out.
   static const bool quant_dedup = []() {
     const char *e = std::getenv("NNTR_QUANT_DEDUP");
-    return e != nullptr && e[0] == '1';
+    return !(e != nullptr && e[0] == '0');
   }();
   const bool reuse_quant = quant_dedup && quant_staged_for(Xh, k);
   if (!reuse_quant) {
