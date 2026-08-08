@@ -830,20 +830,29 @@ void MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // NNTR_CUDA_MOE_GROUPED=1: one grid over ALL routed experts instead of one
     // ops->fc per expert per projection. Opt-in until it is A/B'd against the
     // per-expert path below, which is the measured one.
-    // MEASURED threshold, not a guess. The grouped kernel keeps
-    // dp4a_gemm_reg's 64-ROW tile, so it only pays when each expert actually
-    // has rows to fill it: mean m_e = total_tokens*topk/num_experts, and at
-    // total_tokens 512 that is 16 -- a quarter-full tile. Below it the tile is
-    // mostly zero padding and the per-expert path wins, badly:
-    //   19 tokens   (m_e~1)   qwen_moe decode 1,374 ms grouped vs 597 per-expert
-    //   1,341 tokens (m_e~32) prefill 120.7 TPS grouped vs 110.8 per-expert
-    // NNTR_CUDA_MOE_GROUPED=1 forces it on, =0 off.
+    // OFF BY DEFAULT, and the reason is measured, not stylistic.
+    //
+    // The grouped kernel calls dp4a directly. The per-expert path calls
+    // ops->fc, which at M >= 32 reaches the cuBLAS int8-IMMA arm -- the Tensor
+    // Cores. That arm is worth ~3x on this hardware (gemma4, same build:
+    // prefill 3,937 TPS with it vs 1,290 forced to dp4a), and no amount of
+    // grouping recovers 3x. Measured on an 8,353-token prefill at chunk 4096,
+    // i.e. m_e = 128, where the 64-row tile is TWO FULL TILES and the grouped
+    // kernel is at its best possible shape:
+    //   per-expert (ops->fc -> IMMA)  prefill 228.0 TPS  qwen_moe 23,998 ms
+    //   grouped    (dp4a direct)      prefill 195.8 TPS  qwen_moe 30,001 ms
+    // It also loses badly at decode (m_e = 1, tile 98% padding).
+    //
+    // So the grouping win is real but smaller than the Tensor-Core loss it
+    // pays for. Kept because it becomes the right answer the moment it can
+    // reach IMMA itself -- which needs the expert weights laid out as one
+    // contiguous [E,N,K] tensor so a single cuBLAS batched call can cover
+    // them, the way vLLM's fused MoE does. NNTR_CUDA_MOE_GROUPED=1 to measure.
     static const int grouped_env = []() {
       const char *e = std::getenv("NNTR_CUDA_MOE_GROUPED");
       return e ? (e[0] == '0' ? 0 : 1) : -1;
     }();
-    const bool grouped_on =
-      grouped_env >= 0 ? (grouped_env == 1) : (total_tokens >= 512);
+    const bool grouped_on = (grouped_env == 1);
     static const bool moe_dbg_gate = std::getenv("NNTR_MOE_DBG") != nullptr;
     if (grouped_on && !moe_dbg_gate &&
         input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
