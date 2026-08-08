@@ -1888,18 +1888,24 @@ static inline bool cublas_i8_on() {
 // two's-complement signed 4-bit) -> int8 [K, N]. Reads coalesced along Kh,
 // writes coalesced along N via the shared tile.
 static const char *I8_JIT_SRC = R"CU(
-extern "C" __global__ void i8_jit_unpack(const signed char *q4,
-                                         signed char *w8, int N, int K,
-                                         int Kh) {
+// Byte-granular fallback for shapes the _v4 tile cannot take. Same contract as
+// _v4: RAW payload in, int8 [K,N] and the per-channel rowsum out.
+extern "C" __global__ void i8_jit_unpack(const unsigned char *q4,
+                                         signed char *w8, int *rowsum, int N,
+                                         int K, int Kh) {
   __shared__ signed char t[32][65];
   int nn0 = blockIdx.y * 32, kh0 = blockIdx.x * 32;
   int nn = nn0 + threadIdx.y, kh = kh0 + threadIdx.x;
   if (nn < N && kh < Kh) {
-    unsigned char b = (unsigned char)q4[(long long)nn * Kh + kh];
-    t[threadIdx.y][2 * threadIdx.x] =
-      (signed char)((((b & 0xF) ^ 8) & 0xF) - 8);
-    t[threadIdx.y][2 * threadIdx.x + 1] =
-      (signed char)(((((b >> 4) & 0xF) ^ 8) & 0xF) - 8);
+    unsigned char b = q4[(long long)nn * Kh + kh];
+    int lo = (int)(b & 0xFu) - 8;
+    int hi = (int)((b >> 4) & 0xFu) - 8;
+    t[threadIdx.y][2 * threadIdx.x] = (signed char)lo;
+    t[threadIdx.y][2 * threadIdx.x + 1] = (signed char)hi;
+    // An odd-K pad nibble is stored as 8, i.e. int4 0, so it contributes
+    // nothing here and the sum matches weight_rowsum's k in [0,K) range.
+    if (rowsum && (lo + hi))
+      atomicAdd(&rowsum[nn], lo + hi);
   }
   __syncthreads();
   int k0 = kh0 * 2, wn = nn0 + threadIdx.x;
@@ -1914,28 +1920,47 @@ extern "C" __global__ void i8_jit_unpack(const signed char *q4,
 // 64n x 64k tile, 256 threads; uint (4-byte) global loads along Kh and int
 // (4-byte) coalesced global stores along N -- runs the ~1.8GB/prefill unpack
 // traffic at near-memcpy bandwidth instead of byte-granular transactions.
+// Reads the RAW QS4CX payload (offset-binary, value = int4 + 8), not the
+// XOR'd DevWeightQ copy -- so `repack_plain_i4` and its 15.1 GiB of derived
+// weights are not needed on this path at all. The decode is one subtraction
+// instead of the old `((b&0xF)^8)&0xF)-8`, which was undoing a XOR that only
+// existed because the input had already been XOR'd into a second buffer.
+//
+// It also emits the per-output-channel ROWSUM, which is the only other thing
+// the dp4a cache was being built for here. That is free: this kernel already
+// reads every weight byte. Block-local accumulation into shared memory first,
+// so the global traffic is 64 int atomics per block rather than 512. Integer
+// addition is exact and associative, so the atomics are deterministic in value
+// -- unlike an fp atomicAdd, which is why that was refused elsewhere.
 extern "C" __global__ void i8_jit_unpack_v4(const unsigned char *q4,
-                                            signed char *w8, int N, int K,
-                                            int Kh) {
+                                            signed char *w8, int *rowsum, int N,
+                                            int K, int Kh) {
   __shared__ signed char t[64][68]; // [k_local][n_local], row stride 68 (4B)
+  __shared__ int rs[64];            // partial rowsum for this tile's 64 n
   const int nn0 = blockIdx.y * 64;
   const int kh0 = blockIdx.x * 32; // bytes of Kh covered by this tile
   const int tid = threadIdx.x;     // 256 threads
+  if (tid < 64)
+    rs[tid] = 0;
+  __syncthreads();
   for (int rep = 0; rep < 2; ++rep) {
     int idx = tid + rep * 256;
     int nn = idx >> 3;   // 0..63
     int kb4 = idx & 7;   // which 4-byte group in the 32-byte span
     int n = nn0 + nn;
     int khb = kh0 + kb4 * 4;
+    int part = 0;
     if (n < N && khb + 3 < Kh) {
       unsigned int v = *reinterpret_cast<const unsigned int *>(
         q4 + (long long)n * Kh + khb);
       int kl = kb4 * 8;
       for (int j = 0; j < 4; ++j) {
         unsigned int b = (v >> (8 * j)) & 0xFFu;
-        t[kl + 2 * j][nn] = (signed char)((((b & 0xF) ^ 8) & 0xF) - 8);
-        t[kl + 2 * j + 1][nn] =
-          (signed char)(((((b >> 4) & 0xF) ^ 8) & 0xF) - 8);
+        int lo = (int)(b & 0xFu) - 8;
+        int hi = (int)((b >> 4) & 0xFu) - 8;
+        t[kl + 2 * j][nn] = (signed char)lo;
+        t[kl + 2 * j + 1][nn] = (signed char)hi;
+        part += lo + hi;
       }
     } else if (n < N) { // Kh tail (unused when K%8==0, kept for safety)
       for (int j = 0; j < 4; ++j) {
@@ -1943,13 +1968,20 @@ extern "C" __global__ void i8_jit_unpack_v4(const unsigned char *q4,
         if (kb < Kh) {
           unsigned char b = q4[(long long)n * Kh + kb];
           int kl = kb4 * 8 + 2 * j;
-          t[kl][nn] = (signed char)((((b & 0xF) ^ 8) & 0xF) - 8);
-          t[kl + 1][nn] = (signed char)(((((b >> 4) & 0xF) ^ 8) & 0xF) - 8);
+          int lo = (int)(b & 0xFu) - 8;
+          int hi = (int)((b >> 4) & 0xFu) - 8;
+          t[kl][nn] = (signed char)lo;
+          t[kl + 1][nn] = (signed char)hi;
+          part += lo + hi;
         }
       }
     }
+    if (n < N && part)
+      atomicAdd(&rs[nn], part);
   }
   __syncthreads();
+  if (rowsum && tid < 64 && nn0 + tid < N && rs[tid])
+    atomicAdd(&rowsum[nn0 + tid], rs[tid]);
   const int k0 = kh0 * 2;
   for (int rep = 0; rep < 4; ++rep) {
     int idx = tid + rep * 256;
@@ -2044,12 +2076,25 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
   signed char *w8src = nullptr;
   int *rowsum = nullptr;
   if (i8_jit_on()) {
-    DevWeightQ *dw4 = ensure_dp4a_cache_locked(plain_w, N, K);
-    if (!dw4)
+    // No DevWeightQ here. The unpack reads the RAW payload and emits the
+    // rowsum in the same pass, so this path never builds the derived cache --
+    // which a profile showed costing weight_rowsum 748 ms + repack_plain_i4
+    // 253 ms (15.3% of ALL GPU time) plus ~19,000 cudaMallocs on a 2,774-token
+    // prefill, because every routed expert misses it and every miss allocates
+    // twice. The payload must still be provably device-readable, which
+    // ensure_dp4a_cache_locked used to check on our behalf.
+    if (!plain_bindable(plain_w))
       return false;
     static signed char *jit_w8 = nullptr;
     static size_t jit_cap = 0;
-    if (!ensure_buf((void **)&jit_w8, &jit_cap, (size_t)K * N))
+    static int *jit_rs = nullptr;
+    static size_t jit_rs_cap = 0;
+    if (!ensure_buf((void **)&jit_w8, &jit_cap, (size_t)K * N) ||
+        !ensure_buf((void **)&jit_rs, &jit_rs_cap, sizeof(int) * (size_t)N))
+      return false;
+    // The rowsum is accumulated with atomics, so it must start at zero.
+    if (cudaMemsetAsync(jit_rs, 0, sizeof(int) * (size_t)N,
+                        StreamManager::Global().GetStream()) != cudaSuccess)
       return false;
     // Vectorized transpose for 8|K && 4|N (every eligible FC); byte-granular
     // fallback otherwise.
@@ -2059,18 +2104,19 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
     if (!ku)
       return false;
     const int khi = (int)((K + 1u) / 2u);
-    ku->SetKernelArguments(0, &dw4->plain, sizeof(dw4->plain));
+    ku->SetKernelArguments(0, &plain_w, sizeof(plain_w));
     ku->SetKernelArguments(1, &jit_w8, sizeof(jit_w8));
-    ku->SetKernelArguments(2, &n, sizeof(n));
-    ku->SetKernelArguments(3, &k, sizeof(k));
-    ku->SetKernelArguments(4, &khi, sizeof(khi));
+    ku->SetKernelArguments(2, &jit_rs, sizeof(jit_rs));
+    ku->SetKernelArguments(3, &n, sizeof(n));
+    ku->SetKernelArguments(4, &k, sizeof(k));
+    ku->SetKernelArguments(5, &khi, sizeof(khi));
     const int ub[3] = {vec_ok ? 256 : 32, vec_ok ? 1 : 32, 1};
     const int ug[3] = {(khi + 31) / 32,
                        vec_ok ? ((int)N + 63) / 64 : ((int)N + 31) / 32, 1};
     if (!StreamManager::Global().DispatchCommand(*ku, ug, ub))
       return false;
     w8src = jit_w8;
-    rowsum = dw4->rowsum;
+    rowsum = jit_rs;
   } else {
     // int8 weight [K,N] + per-channel rowsum from the persistent per-weight
     // cache (one-time unpack; weights are static).
