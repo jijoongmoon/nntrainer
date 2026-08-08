@@ -223,9 +223,15 @@ Tensor Qwen3_5MoeCausalLM::createMlp(const int layer_id, int dim, int hidden_dim
      withKey("weight_initializer", "ones"), withKey("engine", causallm_engine())}));
   Tensor su = sh_up(input);
 
+  // The `engine` stamp is NOT optional: without it getComputeEngineType()
+  // returns "cpu", network_graph binds CPU ContextData, and CudaComputeOps::
+  // swiglu is never entered even though both operands are UVM and the CUDA
+  // kernel exists. sh_up above and sh_down below both carry it; this node was
+  // the odd one out, and it cost 2,991 ms of a 45,260 ms 20K prefill.
   LayerHandle sh_swiglu(createLayer(
     "swiglu",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_shared_swiglu")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_shared_swiglu"),
+     withKey("engine", causallm_engine())}));
   Tensor sact = sh_swiglu({sg, su});
 
   LayerHandle sh_down(createLayer(

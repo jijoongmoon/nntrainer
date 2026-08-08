@@ -25,6 +25,7 @@
 
 #ifdef __cplusplus
 
+#include <cmath>
 #include <cstring>
 #include <regex>
 #include <sstream>
@@ -121,9 +122,38 @@ uint32_t ceilDiv(uint32_t a, uint32_t b);
 
 uint32_t align(uint32_t a, uint32_t b);
 
-#ifdef _WIN32
-#ifdef _Float16
-template <> _Float16 exp_util<_Float16>(_Float16 x) {
+/**
+ * @brief fp16 exp, computed in FLOAT.
+ *
+ * This specialization used to sit inside `#ifdef _WIN32` and, inside that,
+ * `#ifdef _Float16` -- and `_Float16` is a type keyword, not a macro, so the
+ * inner guard was never true and this compiled on NO platform. Without it
+ * `exp_util(_Float16)` instantiates the primary template, whose `exp(x)`
+ * promotes to `double exp(double)`: every fp16 sigmoid in the model went
+ * through the double-precision libm, one indirect call per element.
+ *
+ * Measured on a 20,463-token prefill: the two sigmoid `activation` nodes cost
+ * 8,983 ms over 210.4 M elements = 42.7 ns/element, against 7.13 ns for the
+ * same shape in float. That 6x is this.
+ *
+ * It must also specialize THE TYPE THE BUILD ACTUALLY USES. `_FP16` is a macro
+ * (api/ccapi/include/tensor_dim.h): `__fp16` when meson defines USE__FP16,
+ * which it does for aarch64 and armv7; `nntrainer::Half` for the wrapper
+ * build; `_Float16` only otherwise. Specializing `_Float16` on this box
+ * matches NOTHING -- the sigmoid instantiates `exp_util<__fp16>` and still
+ * lands on the primary template. That is the same mistake the dead
+ * `#ifdef _Float16` guard made, made a second time.
+ *
+ * `inline` is required: an explicit specialization of a function template is
+ * not implicitly inline, and this header has many includers.
+ */
+#ifdef ENABLE_FP16
+#ifdef USE__FP16
+template <> inline __fp16 exp_util<__fp16>(__fp16 x) {
+  return static_cast<__fp16>(std::exp(static_cast<float>(x)));
+}
+#elif !defined(USE_HALF_WRAPPER)
+template <> inline _Float16 exp_util<_Float16>(_Float16 x) {
   return static_cast<_Float16>(std::exp(static_cast<float>(x)));
 }
 #endif

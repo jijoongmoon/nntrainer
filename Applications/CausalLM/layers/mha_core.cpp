@@ -1012,7 +1012,16 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
-  nntrainer::LayerProfScope _prof("mha_core", (_to - _from) == 1);
+  // NOT "mha_core": neuralnet.cpp:796 already opens a LayerProfScope keyed by
+  // the NODE TYPE, which for this layer is also "mha_core". LayerProfScope
+  // accumulates by name, so a nested scope with the same key charged every
+  // attention forward TWICE -- which is why this row reported 100 calls where
+  // every other layer reported 50 (10 attention layers x 5 chunks), and why a
+  // 20K profile showed mha_core at 13,507 ms when the true figure is 6,754.
+  // It also made the whole profile un-summable, so it could not be sanity
+  // checked against the wall clock. Keep the inner scope -- it excludes this
+  // function's setup -- but under a name that cannot collide.
+  nntrainer::LayerProfScope _prof("  mha:core", (_to - _from) == 1);
   // External KV cache path: from/to are interpreted as the absolute write
   // position; route through forwarding() which reads cache_key/cache_value
   // from input slots 3/4. forwarding() advances cache_index internally.
